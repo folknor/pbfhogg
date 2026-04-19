@@ -3,9 +3,7 @@
 
 use crate::read::elements::MemberType;
 
-use super::compact::{
-    arena_append_node, arena_append_relation, arena_append_way, member_type_to_byte,
-};
+use super::compact::member_type_to_byte;
 use super::parse::CompactDiffOverlay;
 use super::ParseResult;
 
@@ -138,32 +136,13 @@ fn finalize_element(state: &mut ParserState, overlay: &mut CompactDiffOverlay) {
 
     match state.current_elem {
         CurrentElem::Node => {
-            let offset = arena_append_node(
-                &mut overlay.node_arena,
-                state.current_id,
-                state.current_lat,
-                state.current_lon,
-                &tags,
-            );
-            overlay.node_index.insert(state.current_id, offset);
+            overlay.push_node(state.current_id, state.current_lat, state.current_lon, &tags);
         }
         CurrentElem::Way => {
-            let offset = arena_append_way(
-                &mut overlay.way_arena,
-                state.current_id,
-                &state.refs,
-                &tags,
-            );
-            overlay.way_index.insert(state.current_id, offset);
+            overlay.push_way(state.current_id, &state.refs, &tags);
         }
         CurrentElem::Relation => {
-            let offset = arena_append_relation(
-                &mut overlay.relation_arena,
-                state.current_id,
-                &state.members,
-                &tags,
-            );
-            overlay.relation_index.insert(state.current_id, offset);
+            overlay.push_relation(state.current_id, &state.members, &tags);
         }
         CurrentElem::None => {}
     }
@@ -184,18 +163,9 @@ fn handle_elem_start(
 
     if state.section == Section::Delete {
         match elem_kind {
-            CurrentElem::Node => {
-                overlay.deleted_nodes.insert(id);
-                overlay.node_index.remove(&id);
-            }
-            CurrentElem::Way => {
-                overlay.deleted_ways.insert(id);
-                overlay.way_index.remove(&id);
-            }
-            CurrentElem::Relation => {
-                overlay.deleted_relations.insert(id);
-                overlay.relation_index.remove(&id);
-            }
+            CurrentElem::Node => overlay.delete_node(id),
+            CurrentElem::Way => overlay.delete_way(id),
+            CurrentElem::Relation => overlay.delete_relation(id),
             CurrentElem::None => {}
         }
         // For deletes, do not set current_elem (no child elements expected).
@@ -247,7 +217,7 @@ fn handle_tag_compact(
     }
     let k = parse_str_attr(e, b"k")?;
     let v = parse_str_attr(e, b"v")?;
-    let key_id = overlay.interner.intern(&k);
+    let key_id = overlay.intern(&k);
     state.tag_keys.push(key_id);
     state.tag_values.push(v);
     Ok(())
@@ -280,7 +250,7 @@ fn handle_member_compact(
     let ref_id = parse_i64_attr(e, b"ref")?;
     let role = parse_str_attr(e, b"role").unwrap_or_default();
     let type_byte = member_type_to_byte(member_type);
-    let role_id = overlay.interner.intern(&role);
+    let role_id = overlay.intern(&role);
     state.members.push((ref_id, type_byte, role_id));
     Ok(())
 }

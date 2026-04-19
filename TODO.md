@@ -59,15 +59,17 @@ at once - each split is a separate review surface):
 
 ### Follow-ups surfaced by the split work
 
-- [ ] **Encapsulate `CompactDiffOverlay` mutation.** Splitting `osc/parse.rs`
-  into `xml_parse.rs` forced seven fields of `CompactDiffOverlay` to
-  `pub(super)` - `node_arena`, `way_arena`, `relation_arena`, the three
-  `_index` maps, and `interner` - because the XML state machine pokes
-  at them directly. A mutator API on `CompactDiffOverlay`
-  (`push_node` / `push_way` / `push_relation` / `delete_node` / etc.,
-  plus an `interner_mut()` or `intern()` helper) would let those fields
-  go back to private. Not urgent but the current design relies on
-  same-file friend access that the split made explicit.
+- [x] ~~**Encapsulate `CompactDiffOverlay` mutation.**~~ Landed
+  2026-04-19. Added seven `pub(super)` mutator methods (`push_node`,
+  `push_way`, `push_relation`, `delete_node`, `delete_way`,
+  `delete_relation`, `intern`) on `CompactDiffOverlay` and demoted the
+  six former `pub(super)` fields (`node_arena`, `way_arena`,
+  `relation_arena`, the three `_index` maps, and `interner`) back to
+  private. Each mutator bundles the load-bearing pairing (arena write
+  + index insert, delete-set insert + index remove) so the XML state
+  machine can't accidentally break the invariant. The `deleted_*`
+  HashSets stay `pub` because they were already part of the public
+  API and are read from outside the module.
 
 ## Important: ignored tests
 

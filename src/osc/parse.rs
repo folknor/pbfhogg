@@ -14,6 +14,7 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use rustc_hash::FxHashMap;
 
+use super::compact::{arena_append_node, arena_append_relation, arena_append_way};
 use super::interner::StringInterner;
 use super::xml_parse::{
     handle_empty_event_compact, handle_end_event_compact, handle_start_event_compact, ParserState,
@@ -39,16 +40,16 @@ pub use super::compact::{
 /// This typically uses 40-60% less memory than the old `DiffOverlay` for
 /// real-world planet-scale diffs (millions of elements with repeated tag keys).
 pub struct CompactDiffOverlay {
-    pub(super) node_arena: Vec<u8>,
-    pub(super) way_arena: Vec<u8>,
-    pub(super) relation_arena: Vec<u8>,
-    pub(super) node_index: FxHashMap<i64, u32>,
-    pub(super) way_index: FxHashMap<i64, u32>,
-    pub(super) relation_index: FxHashMap<i64, u32>,
+    node_arena: Vec<u8>,
+    way_arena: Vec<u8>,
+    relation_arena: Vec<u8>,
+    node_index: FxHashMap<i64, u32>,
+    way_index: FxHashMap<i64, u32>,
+    relation_index: FxHashMap<i64, u32>,
     pub deleted_nodes: HashSet<i64>,
     pub deleted_ways: HashSet<i64>,
     pub deleted_relations: HashSet<i64>,
-    pub(super) interner: StringInterner,
+    interner: StringInterner,
 }
 
 impl CompactDiffOverlay {
@@ -178,6 +179,69 @@ impl CompactDiffOverlay {
         total += self.interner.heap_size_estimate();
 
         total
+    }
+
+    // -----------------------------------------------------------------------
+    // Mutators (crate-internal)
+    //
+    // Each add/delete pair maintains a load-bearing invariant: an arena write
+    // must be paired with the corresponding index insert, and a delete-set
+    // insert must be paired with an index remove. Exposing these as methods
+    // rather than `pub(super)` fields keeps callers (the XML state machine
+    // in `xml_parse.rs`) from having to remember the pairing.
+    // -----------------------------------------------------------------------
+
+    /// Append a node to the arena and register it in the node index.
+    #[inline]
+    pub(super) fn push_node(&mut self, id: i64, lat: i32, lon: i32, tags: &[(u32, &str)]) {
+        let offset = arena_append_node(&mut self.node_arena, id, lat, lon, tags);
+        self.node_index.insert(id, offset);
+    }
+
+    /// Append a way to the arena and register it in the way index.
+    #[inline]
+    pub(super) fn push_way(&mut self, id: i64, refs: &[i64], tags: &[(u32, &str)]) {
+        let offset = arena_append_way(&mut self.way_arena, id, refs, tags);
+        self.way_index.insert(id, offset);
+    }
+
+    /// Append a relation to the arena and register it in the relation index.
+    #[inline]
+    pub(super) fn push_relation(
+        &mut self,
+        id: i64,
+        members: &[(i64, u8, u32)],
+        tags: &[(u32, &str)],
+    ) {
+        let offset = arena_append_relation(&mut self.relation_arena, id, members, tags);
+        self.relation_index.insert(id, offset);
+    }
+
+    /// Mark a node as deleted and drop any live entry from the node index.
+    #[inline]
+    pub(super) fn delete_node(&mut self, id: i64) {
+        self.deleted_nodes.insert(id);
+        self.node_index.remove(&id);
+    }
+
+    /// Mark a way as deleted and drop any live entry from the way index.
+    #[inline]
+    pub(super) fn delete_way(&mut self, id: i64) {
+        self.deleted_ways.insert(id);
+        self.way_index.remove(&id);
+    }
+
+    /// Mark a relation as deleted and drop any live entry from the relation index.
+    #[inline]
+    pub(super) fn delete_relation(&mut self, id: i64) {
+        self.deleted_relations.insert(id);
+        self.relation_index.remove(&id);
+    }
+
+    /// Intern a tag key or relation member role, returning its interned ID.
+    #[inline]
+    pub(super) fn intern(&mut self, s: &str) -> u32 {
+        self.interner.intern(s)
     }
 }
 

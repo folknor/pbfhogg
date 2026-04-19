@@ -1,7 +1,7 @@
 //! XML-oriented owned element types for derive_changes, diff, merge_changes, and tags_filter_osc.
 //!
 //! Metadata fields are String-typed for direct XML attribute output.
-//! See `elements_pbf` for the PBF-oriented variant with native types.
+//! See `crate::owned` for the PBF-oriented variant with native types.
 
 use quick_xml::events::{BytesEnd, BytesStart, Event};
 use quick_xml::Writer;

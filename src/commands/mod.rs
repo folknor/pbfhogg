@@ -17,7 +17,6 @@ pub mod merge_pbf;
 pub mod node_stats;
 pub mod renumber;
 pub mod renumber_external;
-pub(crate) mod elements_pbf;
 pub(crate) mod elements_xml;
 pub mod sort;
 pub(crate) mod stream_merge;

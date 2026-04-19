@@ -25,7 +25,7 @@ use crate::file_writer::FileWriter;
 use crate::writer::{reframe_raw_with_index, Compression, PbfWriter};
 use crate::Element;
 
-use super::elements_pbf::{
+use crate::owned::{
     read_dense_node, read_node, read_relation, read_way, write_single_node, write_single_relation,
     write_single_way, OwnedNode, OwnedRelation, OwnedWay,
 };

@@ -6,8 +6,8 @@ use crate::block_builder::{BlockBuilder, MemberData, Metadata};
 use crate::file_writer::FileWriter;
 use crate::writer::PbfWriter;
 
-pub(crate) use super::elements_xml::OwnedMember;
-use super::Result;
+pub(crate) use crate::commands::elements_xml::OwnedMember;
+use crate::commands::Result;
 
 // ---------------------------------------------------------------------------
 // Owned element types - Vec fields are kept (not Box<[T]>) because these are
@@ -70,7 +70,7 @@ impl PartialOrd for OwnedNode {
 }
 impl Ord for OwnedNode {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        super::osm_id_cmp(self.id, other.id)
+        crate::commands::osm_id_cmp(self.id, other.id)
             .then_with(|| version_of(&self.metadata).cmp(&version_of(&other.metadata)))
     }
 }
@@ -84,7 +84,7 @@ impl PartialOrd for OwnedWay {
 }
 impl Ord for OwnedWay {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        super::osm_id_cmp(self.id, other.id)
+        crate::commands::osm_id_cmp(self.id, other.id)
             .then_with(|| version_of(&self.metadata).cmp(&version_of(&other.metadata)))
     }
 }
@@ -98,7 +98,7 @@ impl PartialOrd for OwnedRelation {
 }
 impl Ord for OwnedRelation {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        super::osm_id_cmp(self.id, other.id)
+        crate::commands::osm_id_cmp(self.id, other.id)
             .then_with(|| version_of(&self.metadata).cmp(&version_of(&other.metadata)))
     }
 }
@@ -268,7 +268,7 @@ pub(crate) fn write_single_node(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
-    super::ensure_node_capacity(bb, writer)?;
+    crate::commands::ensure_node_capacity(bb, writer)?;
     let meta = owned_to_metadata(node.metadata.as_ref());
     bb.add_node(
         node.id, node.decimicro_lat, node.decimicro_lon,
@@ -283,7 +283,7 @@ pub(crate) fn write_single_way(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
-    super::ensure_way_capacity(bb, writer)?;
+    crate::commands::ensure_way_capacity(bb, writer)?;
     let meta = owned_to_metadata(way.metadata.as_ref());
     bb.add_way(
         way.id,
@@ -299,7 +299,7 @@ pub(crate) fn write_single_relation(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
-    super::ensure_relation_capacity(bb, writer)?;
+    crate::commands::ensure_relation_capacity(bb, writer)?;
     let members: Vec<MemberData<'_>> = rel
         .members
         .iter()

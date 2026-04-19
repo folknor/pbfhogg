@@ -18,7 +18,7 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
-use super::elements_pbf::{
+use crate::owned::{
     OwnedElement, owned_to_metadata, read_dense_node, read_node, read_way, read_relation,
 };
 use super::{

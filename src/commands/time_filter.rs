@@ -250,6 +250,27 @@ fn time_filter_snapshot(
     Ok(stats)
 }
 
+// Per-rayon-thread BlockBuilder. rayon pools worker threads across
+// successive par_iter() calls, so a thread_local persists the same
+// BlockBuilder across all batches processed by that thread. This is
+// what lets the iter-4 BlockBufPool pay off: take_owned_swap installs
+// the pool-sized `swap` as encode_buf, and the *next* encode_block on
+// the same BlockBuilder writes into it directly (no cap-0 grow). With
+// map_init creating a fresh BlockBuilder per task, the next encode
+// never came and the pool Vecs went unused (measured iter 4).
+//
+// Safety / lifecycle: BlockBuilder::new() initialises to Vec::new() for
+// encode_buf; the first take_owned_swap on each thread still pays the
+// cap-0 -> block-size grow once, then subsequent encodes on that
+// thread reuse pool capacity. After filter_block_snapshot's final
+// flush_local_pooled, the BlockBuilder's internal accumulators are
+// reset by encode_block -> reset_block_state, so the thread_local can
+// safely span across time_filter invocations in the same process.
+thread_local! {
+    static SNAPSHOT_BB: std::cell::RefCell<BlockBuilder> =
+        std::cell::RefCell::new(BlockBuilder::new());
+}
+
 #[hotpath::measure]
 fn process_snapshot_batch(
     batch: &[PrimitiveBlock],
@@ -261,16 +282,15 @@ fn process_snapshot_batch(
     type BatchResult = std::result::Result<(Vec<OwnedBlockTriple>, TimeFilterStats), String>;
     let results: Vec<BatchResult> = batch
         .par_iter()
-        .map_init(
-            BlockBuilder::new,
-            |bb, block| {
+        .map(|block| {
+            SNAPSHOT_BB.with_borrow_mut(|bb| {
                 let mut output: Vec<OwnedBlockTriple> = Vec::new();
                 let block_stats =
                     filter_block_snapshot(block, cutoff_timestamp, bb, &mut output, pool)?;
                 flush_local_pooled(bb, &mut output, pool)?;
                 Ok((output, block_stats))
-            },
-        )
+            })
+        })
         .collect();
 
     // Pooled drain: forwards each OwnedBlock to the writer's pool-aware

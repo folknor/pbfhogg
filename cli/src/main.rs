@@ -2218,13 +2218,13 @@ fn run_merge_pbf(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let paths: Vec<&std::path::Path> = inputs.iter().map(AsRef::as_ref).collect();
-    let opts = pbfhogg::merge_pbf::MergePbfOptions {
+    let opts = pbfhogg::cat::dedupe::MergePbfOptions {
         compression,
         direct_io,
         io_uring,
         force,
     };
-    let stats = pbfhogg::merge_pbf::merge_pbf(&paths, output, &opts, overrides)?;
+    let stats = pbfhogg::cat::dedupe::merge_pbf(&paths, output, &opts, overrides)?;
     stats.print_summary();
     Ok(())
 }

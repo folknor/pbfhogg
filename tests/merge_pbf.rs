@@ -7,7 +7,7 @@ use common::{
     way_ids_id_only as way_ids, relation_ids_id_only as relation_ids,
     write_test_pbf_sorted, TestMember, TestNode, TestRelation, TestWay,
 };
-use pbfhogg::merge_pbf::{merge_pbf, MergePbfOptions};
+use pbfhogg::cat::dedupe::{merge_pbf, MergePbfOptions};
 use pbfhogg::writer::Compression;
 use pbfhogg::MemberId;
 use tempfile::TempDir;

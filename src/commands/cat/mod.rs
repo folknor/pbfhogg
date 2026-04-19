@@ -1,5 +1,7 @@
 //! Concatenate PBF files with optional type filtering. Equivalent to `osmium cat`.
 
+pub mod dedupe;
+
 use std::path::Path;
 
 use rayon::prelude::*;

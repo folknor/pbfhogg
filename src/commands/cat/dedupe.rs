@@ -29,10 +29,11 @@ use crate::owned::{
     read_dense_node, read_node, read_relation, read_way, write_single_node, write_single_relation,
     write_single_way, OwnedNode, OwnedRelation, OwnedWay,
 };
-use super::{
+use crate::commands::{
     build_output_header, flush_block, require_indexdata, require_sorted, writer_from_header_bytes,
-    HeaderOverrides, Result,
+    HeaderOverrides,
 };
+use crate::BoxResult as Result;
 
 /// Statistics from a multi-PBF merge operation.
 pub struct MergePbfStats {
@@ -152,7 +153,7 @@ pub fn merge_pbf(
     // Pass 1: Build blob index from all files
     eprintln!("Pass 1: indexing blobs...");
     let (header, mut entries) = build_blob_index(inputs, opts.direct_io)?;
-    super::warn_locations_on_ways_loss(&header);
+    crate::commands::warn_locations_on_ways_loss(&header);
     eprintln!(
         "  {} OSMData blobs indexed from {} files",
         entries.len(),
@@ -163,7 +164,7 @@ pub fn merge_pbf(
     entries.sort_by_key(|e| {
         (
             type_order(e.index.kind),
-            super::blob_osm_first_key(e.index.min_id, e.index.max_id),
+            crate::commands::blob_osm_first_key(e.index.min_id, e.index.max_id),
         )
     });
 
@@ -347,8 +348,8 @@ fn detect_overlaps(entries: &[BlobEntry]) -> Vec<bool> {
     let mut overlaps = vec![false; entries.len()];
     for i in 0..entries.len().saturating_sub(1) {
         if entries[i].index.kind == entries[i + 1].index.kind
-            && super::blob_osm_last_key(entries[i].index.min_id, entries[i].index.max_id)
-                >= super::blob_osm_first_key(
+            && crate::commands::blob_osm_last_key(entries[i].index.min_id, entries[i].index.max_id)
+                >= crate::commands::blob_osm_first_key(
                     entries[i + 1].index.min_id,
                     entries[i + 1].index.max_id,
                 )
@@ -484,7 +485,7 @@ fn sweep_merge_dedup<T: Ord + HasId>(
     let mut deduped: u64 = 0;
 
     for entry in entries {
-        flush_heap_below_dedup(&mut heap, super::blob_osm_first_id(entry.index.min_id, entry.index.max_id), &mut deduped, |elem| {
+        flush_heap_below_dedup(&mut heap, crate::commands::blob_osm_first_id(entry.index.min_id, entry.index.max_id), &mut deduped, |elem| {
             write_elem(&elem, bb, writer)?;
             count += 1;
             Ok(())
@@ -525,7 +526,7 @@ fn flush_heap_below_dedup<T: Ord + HasId>(
 ) -> Result<()> {
     while heap
         .peek()
-        .is_some_and(|Reverse(e)| super::osm_id_cmp(e.id(), below).is_lt())
+        .is_some_and(|Reverse(e)| crate::commands::osm_id_cmp(e.id(), below).is_lt())
     {
         if let Some(Reverse(element)) = heap.pop() {
             let eid = element.id();

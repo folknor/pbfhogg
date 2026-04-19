@@ -17,20 +17,22 @@ Measurement-first on every one: turn on `#[cfg(feature = "hotpath")]` counters (
 ## Split oversized source files (blocker for upcoming optimization work)
 
 Rank-ordered by urgency (measured in total lines and proximity to
-active optimization plans):
+active optimization plans). Refreshed 2026-04-19 after the source-tree
+restructure:
 
 | Lines | File | Active plan proximity |
 |------:|------|------|
-| 1689 | `src/write/block_builder.rs` | write-path work (Milestone 2) |
-| 1682 | `src/commands/add_locations_to_ways.rs` | ALTW external (active plan proximity) |
-| 1506 | `src/osc.rs` | - |
-| 1376 | `src/read/blob.rs` | - |
-| 1316 | `src/write/writer.rs` | write-path work |
-| 1295 | `src/commands/mod.rs` | - |
-| 1225 | `src/blob_index.rs` | - |
-| 1145 | `src/commands/altw/stage4.rs` | ALTW external (active plan proximity) |
-| 1136 | `src/commands/merge/rewrite.rs` | apply-changes (active plan proximity) |
-| 1110 | `src/commands/tags_filter.rs` | - |
+| 2525 | `cli/src/main.rs` | - |
+| 1712 | `src/write/block_builder.rs` | write-path work (Milestone 2) |
+| 1686 | `src/commands/altw/mod.rs` | ALTW external (active plan proximity) |
+| 1648 | `src/commands/apply_changes/rewrite.rs` | apply-changes (active plan proximity) |
+| 1506 | `src/osc/parse.rs` | - |
+| 1449 | `src/read/blob.rs` | - |
+| 1356 | `src/write/writer.rs` | write-path work |
+| 1231 | `src/commands/extract/mod.rs` | - |
+| 1225 | `src/blob_meta.rs` | - |
+| 1146 | `src/commands/tags_filter/mod.rs` | - |
+| 1146 | `src/commands/altw/external/stage4.rs` | ALTW external (active plan proximity) |
 | 1084 | `src/geocode_index/reader.rs` | - |
 
 Priority ordering for the split work (don't try to batch the whole list
@@ -41,7 +43,11 @@ at once - each split is a separate review surface):
 - Preserve `#[cfg_attr(feature = "hotpath", hotpath::measure)]` / marker
   / counter coverage verbatim. Cross-cutting audits assume the functions
   are findable by name.
-- Run `brokkr check` after each move to catch unused-import drift.
+- Run `brokkr check` after each move to catch errors. Intermediate commits
+  in a multi-split series may carry `unused_imports` warnings from
+  progressively-prunable imports - don't burn round-trips cleaning those
+  up between splits. Tighten to fully clean clippy on the final commit
+  of the series.
 - Update `notes/` cross-references if line numbers change substantially.
 
 ## Important: ignored tests

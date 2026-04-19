@@ -12,6 +12,7 @@
 
 mod classify;
 mod diff_ranges;
+mod element_writes;
 mod node_locations;
 mod rewrite;
 mod stats;

@@ -231,6 +231,7 @@ fn extract_delete_info(elem: &crate::Element<'_>, kind: ElemKind) -> Option<(&'s
 /// Stream changes using block-pair merge with borrowed elements.
 /// Only changed elements (~1.2% of typical daily diff) are materialized as owned,
 /// written to temp files immediately, then dropped.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn derive_changes_block_pair(
     old_path: &Path,
     new_path: &Path,
@@ -244,14 +245,39 @@ fn derive_changes_block_pair(
 
     let mut merge = BlockPairMergeState::new(old_reader, new_reader);
 
+    crate::debug::emit_marker("DERIVECHANGES_PHASE_NODE_START");
     collect_phase_block_pair(&mut merge, ElemKind::Node, sink)?;
-    collect_phase_block_pair(&mut merge, ElemKind::Way, sink)?;
-    collect_phase_block_pair(&mut merge, ElemKind::Relation, sink)?;
+    crate::debug::emit_marker("DERIVECHANGES_PHASE_NODE_END");
 
+    crate::debug::emit_marker("DERIVECHANGES_PHASE_WAY_START");
+    collect_phase_block_pair(&mut merge, ElemKind::Way, sink)?;
+    crate::debug::emit_marker("DERIVECHANGES_PHASE_WAY_END");
+
+    crate::debug::emit_marker("DERIVECHANGES_PHASE_REL_START");
+    collect_phase_block_pair(&mut merge, ElemKind::Relation, sink)?;
+    crate::debug::emit_marker("DERIVECHANGES_PHASE_REL_END");
+
+    emit_merge_stats_counters(&merge.stats);
     Ok(())
 }
 
+/// Emit `mergejoin_shadow_*` counters accumulated across all phases.
+/// Mirrors the helper in `diff/mod.rs` - both commands share
+/// `BlockPairMergeState` and benefit from the same shadow view.
+#[allow(clippy::cast_possible_wrap)]
+fn emit_merge_stats_counters(s: &crate::osc::merge_join::BlockPairMergeStats) {
+    crate::debug::emit_counter("mergejoin_shadow_pairs_byte_equal", s.pairs_byte_equal as i64);
+    crate::debug::emit_counter("mergejoin_shadow_elements_byte_equal", s.elements_byte_equal as i64);
+    crate::debug::emit_counter("mergejoin_shadow_pairs_overlapping_decoded", s.pairs_overlapping_decoded as i64);
+    crate::debug::emit_counter("mergejoin_shadow_elements_overlapping_decoded", s.elements_overlapping_decoded as i64);
+    crate::debug::emit_counter("mergejoin_shadow_blobs_old_only", s.blobs_old_only as i64);
+    crate::debug::emit_counter("mergejoin_shadow_elements_old_only", s.elements_old_only as i64);
+    crate::debug::emit_counter("mergejoin_shadow_blobs_new_only", s.blobs_new_only as i64);
+    crate::debug::emit_counter("mergejoin_shadow_elements_new_only", s.elements_new_only as i64);
+}
+
 /// Run one type phase of block-pair merge, streaming changed elements to temp files.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn collect_phase_block_pair(
     merge: &mut BlockPairMergeState,
     kind: ElemKind,
@@ -286,6 +312,7 @@ fn collect_phase_block_pair(
 
 /// Fallback path using element-level merge-join with owned elements.
 /// Streams changes directly to temp files via `ChangeSink`.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn derive_changes_element_stream(
     old_path: &Path,
     new_path: &Path,
@@ -301,6 +328,7 @@ fn derive_changes_element_stream(
     let ut = sink.update_timestamp;
 
     // Phase 1: Nodes
+    crate::debug::emit_marker("DERIVECHANGES_PHASE_NODE_START");
     {
         let (mut ob, mut nb): (Vec<OwnedNode>, Vec<OwnedNode>) = (Vec::new(), Vec::new());
         merge_join_phase(&mut old_src, &mut ob, &mut new_src, &mut nb, |action| {
@@ -316,7 +344,9 @@ fn derive_changes_element_stream(
             Ok(())
         })?;
     }
+    crate::debug::emit_marker("DERIVECHANGES_PHASE_NODE_END");
     // Phase 2: Ways
+    crate::debug::emit_marker("DERIVECHANGES_PHASE_WAY_START");
     {
         let (mut ob, mut nb): (Vec<OwnedWay>, Vec<OwnedWay>) = (Vec::new(), Vec::new());
         merge_join_phase(&mut old_src, &mut ob, &mut new_src, &mut nb, |action| {
@@ -332,7 +362,9 @@ fn derive_changes_element_stream(
             Ok(())
         })?;
     }
+    crate::debug::emit_marker("DERIVECHANGES_PHASE_WAY_END");
     // Phase 3: Relations
+    crate::debug::emit_marker("DERIVECHANGES_PHASE_REL_START");
     {
         let (mut ob, mut nb): (Vec<OwnedRelation>, Vec<OwnedRelation>) = (Vec::new(), Vec::new());
         merge_join_phase(&mut old_src, &mut ob, &mut new_src, &mut nb, |action| {
@@ -348,6 +380,7 @@ fn derive_changes_element_stream(
             Ok(())
         })?;
     }
+    crate::debug::emit_marker("DERIVECHANGES_PHASE_REL_END");
 
     Ok(())
 }

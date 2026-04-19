@@ -14,6 +14,8 @@ Four planet-scale command plans are in notes, each with a ranked set of opportun
 
 - [ ] **[notes/getid-include-optimization.md](notes/getid-include-optimization.md)** - `getid` include mode. Current: **43.7 s** at planet (UUID `5a44889d`, commit `aee7727`). Target: **<1 s** via pread-only header walk with `posix_fadvise(RANDOM)`. Blocker: the naive `BlobReader` swap doesn't work because the path is 100 % kernel-I/O-bound (88 GB sequential read, user CPU ≈ 0); a new pread-only header-walk primitive is required. Secondary finding: 32.5 s → 43.7 s regression between commits `8ffee59` (2026-03-29) and `aee7727` (2026-04-18) - bisect before landing.
 
+- [ ] **[notes/diff-snapshots-opportunities.md](notes/diff-snapshots-opportunities.md)** - `diff-snapshots` (both human-readable and `--format osc`). Current: **2151 s / 35m50s** at planet (UUID `42aedca1`, commit `7e9c2e9`). Target: **~8 min (~4.4× speedup)**. Primary bottleneck: single-threaded decode (avg cores = 1.0, peak_threads = 1) on a CPU-bound workload. Expected headline win from parallel two-reader decode pipelines feeding a reorder-buffered merge consumer. Shadow counters + phase markers + hotpath annotations landed 2026-04-19 (`mergejoin_shadow_*`, `DIFF_PHASE_*`, `DERIVECHANGES_PHASE_*`) - next step is a measured run to partition the 2107 s wall across phases and classify blob pairs before committing to the parallel-decode build. v3 "non-overlapping block skip" is one ranked item inside the plan, not a separate TODO.
+
 Measurement-first on every one: turn on `#[cfg(feature = "hotpath")]` counters (or add unconditional `*_ms` counters) to ground-truth the inferred per-phase breakdowns before committing to the order of landing items within a plan.
 
 ## Important: ignored tests
@@ -37,11 +39,6 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
 
 ## Next up (2026-04-13)
 
-- [ ] **diff v3: non-overlapping block skip** - use indexdata min/max
-  ID to skip decode for blocks entirely OldOnly or NewOnly (misaligned
-  boundaries). Additive on shipped v1+v2. Low risk. Note:
-  derive_changes must still decode OldOnly (needs element IDs for
-  OSC XML delete output).
 - [ ] **`--allow-missing` for apply-changes** - the single prerequisite
   for incremental extract (~10s vs 862s). Insert new elements that
   don't exist in the base PBF, then re-extract to filter to bbox.

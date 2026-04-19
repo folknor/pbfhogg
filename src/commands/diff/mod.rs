@@ -211,6 +211,7 @@ pub fn diff(
 /// Optimized diff path using block-pair merge with borrowed elements.
 /// Requires both inputs to have indexdata. Zero String allocation for
 /// unchanged elements (98.8%+ of typical daily diffs).
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn diff_block_pair(
     old_path: &Path,
     new_path: &Path,
@@ -233,16 +234,20 @@ fn diff_block_pair(
         deleted: 0,
     };
 
-    let phases: [(ElemKind, bool); 3] = [
-        (ElemKind::Node, filter.nodes),
-        (ElemKind::Way, filter.ways),
-        (ElemKind::Relation, filter.relations),
+    let phases: [(ElemKind, bool, &str); 3] = [
+        (ElemKind::Node, filter.nodes, "NODE"),
+        (ElemKind::Way, filter.ways, "WAY"),
+        (ElemKind::Relation, filter.relations, "REL"),
     ];
 
-    for (kind, enabled) in phases {
+    for (kind, enabled, tag) in phases {
         if !enabled {
             continue;
         }
+
+        let start_marker = format!("DIFF_PHASE_{tag}_START");
+        let end_marker = format!("DIFF_PHASE_{tag}_END");
+        crate::debug::emit_marker(&start_marker);
 
         block_pair_merge_phase(
             &mut merge,
@@ -314,13 +319,31 @@ fn diff_block_pair(
                 Ok(())
             },
         )?;
+        crate::debug::emit_marker(&end_marker);
     }
 
+    emit_merge_stats_counters(&merge.stats);
     Ok(stats)
+}
+
+/// Emit `mergejoin_shadow_*` counters accumulated across all phases.
+/// Shadow-only - no code-path change. See `BlockPairMergeStats` and the
+/// diff-snapshots opportunity plan for how these feed the v3 decision.
+#[allow(clippy::cast_possible_wrap)]
+fn emit_merge_stats_counters(s: &crate::osc::merge_join::BlockPairMergeStats) {
+    crate::debug::emit_counter("mergejoin_shadow_pairs_byte_equal", s.pairs_byte_equal as i64);
+    crate::debug::emit_counter("mergejoin_shadow_elements_byte_equal", s.elements_byte_equal as i64);
+    crate::debug::emit_counter("mergejoin_shadow_pairs_overlapping_decoded", s.pairs_overlapping_decoded as i64);
+    crate::debug::emit_counter("mergejoin_shadow_elements_overlapping_decoded", s.elements_overlapping_decoded as i64);
+    crate::debug::emit_counter("mergejoin_shadow_blobs_old_only", s.blobs_old_only as i64);
+    crate::debug::emit_counter("mergejoin_shadow_elements_old_only", s.elements_old_only as i64);
+    crate::debug::emit_counter("mergejoin_shadow_blobs_new_only", s.blobs_new_only as i64);
+    crate::debug::emit_counter("mergejoin_shadow_elements_new_only", s.elements_new_only as i64);
 }
 
 /// Fallback diff path using element-level merge-join with owned elements.
 /// Used when either input lacks indexdata.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn diff_element_stream(
     old_path: &Path,
     new_path: &Path,
@@ -340,6 +363,7 @@ fn diff_element_stream(
     };
 
     if filter.nodes {
+        crate::debug::emit_marker("DIFF_PHASE_NODE_START");
         let (mut ob, mut nb) = (Vec::new(), Vec::new());
         let mut ctx = DiffPhaseCtx {
             output,
@@ -354,11 +378,13 @@ fn diff_element_stream(
             &mut ctx,
             write_node_details,
         )?;
+        crate::debug::emit_marker("DIFF_PHASE_NODE_END");
     } else {
         drain_phase::<OwnedNode>(&mut old_src, &mut new_src)?;
     }
 
     if filter.ways {
+        crate::debug::emit_marker("DIFF_PHASE_WAY_START");
         let (mut ob, mut nb) = (Vec::new(), Vec::new());
         let mut ctx = DiffPhaseCtx {
             output,
@@ -373,11 +399,13 @@ fn diff_element_stream(
             &mut ctx,
             write_way_details,
         )?;
+        crate::debug::emit_marker("DIFF_PHASE_WAY_END");
     } else {
         drain_phase::<OwnedWay>(&mut old_src, &mut new_src)?;
     }
 
     if filter.relations {
+        crate::debug::emit_marker("DIFF_PHASE_REL_START");
         let (mut ob, mut nb) = (Vec::new(), Vec::new());
         let mut ctx = DiffPhaseCtx {
             output,
@@ -392,6 +420,7 @@ fn diff_element_stream(
             &mut ctx,
             write_relation_details,
         )?;
+        crate::debug::emit_marker("DIFF_PHASE_REL_END");
     } else {
         drain_phase::<OwnedRelation>(&mut old_src, &mut new_src)?;
     }

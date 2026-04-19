@@ -597,6 +597,36 @@ pub(crate) fn kind_type_char(kind: ElemKind) -> char {
     }
 }
 
+/// Shadow-mode counters for block-pair merge classification.
+///
+/// Accumulated across all phases of a single diff/derive_changes run.
+/// Feeds the `diff-snapshots` optimization decisions (see
+/// `notes/diff-snapshots-opportunities.md`): what fraction of blobs hit the
+/// v1 byte-equal fast path, how many get element-merged after decoding both
+/// sides, and how many are emitted as entirely single-sided (the v3
+/// opportunity - those decode paths could be skipped if consumers supported
+/// an indexdata-only single-sided variant).
+///
+/// Element counts come from blob indexdata (no per-element increments),
+/// so the overhead is a handful of u64 adds per blob.
+#[derive(Default, Debug, Clone, Copy)]
+pub(crate) struct BlockPairMergeStats {
+    /// Blob pairs that matched via v1 compressed-byte equality (no decode).
+    pub pairs_byte_equal: u64,
+    pub elements_byte_equal: u64,
+    /// Overlapping blob pairs that required decoding both sides for element merge.
+    pub pairs_overlapping_decoded: u64,
+    /// Sum of both sides' element counts for overlapping pairs.
+    pub elements_overlapping_decoded: u64,
+    /// Blobs emitted as BlobOldOnly (entirely single-sided, all code paths).
+    /// Covers fast-path non-overlap, EOF drain, and slow-path residuals.
+    pub blobs_old_only: u64,
+    pub elements_old_only: u64,
+    /// Blobs emitted as BlobNewOnly (entirely single-sided, all code paths).
+    pub blobs_new_only: u64,
+    pub elements_new_only: u64,
+}
+
 /// State for the block-pair merge engine (one per diff/derive_changes call).
 pub(crate) struct BlockPairMergeState {
     pub old_reader: crate::blob::BlobReader<crate::file_reader::FileReader>,
@@ -610,6 +640,8 @@ pub(crate) struct BlockPairMergeState {
     /// Stashed blob from a prior phase (consumed but belongs to a later kind).
     old_stash: Option<crate::blob::Blob>,
     new_stash: Option<crate::blob::Blob>,
+    /// Shadow counters accumulated across all phases of this merge run.
+    pub stats: BlockPairMergeStats,
 }
 
 impl BlockPairMergeState {
@@ -628,6 +660,7 @@ impl BlockPairMergeState {
             new_gr: Vec::new(),
             old_stash: None,
             new_stash: None,
+            stats: BlockPairMergeStats::default(),
         }
     }
 }
@@ -654,6 +687,7 @@ fn drain_remaining(
     is_old: bool,
     on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> BoxResult<()>,
 ) -> BoxResult<()> {
+    let stats = &mut state.stats;
     let (reader, buf, st, gr, stash) = if is_old {
         (&mut state.old_reader, &mut state.old_buf, &mut state.old_st, &mut state.old_gr, &mut state.old_stash)
     } else {
@@ -661,7 +695,7 @@ fn drain_remaining(
     };
     while let Some(p) = next_blob_for_kind(reader, kind, stash)? {
         let bs = decode_pending(p, buf, st, gr)?;
-        emit_block(&bs, is_old, on_action)?;
+        emit_block(&bs, is_old, on_action, stats)?;
     }
     Ok(())
 }
@@ -671,15 +705,20 @@ fn emit_block(
     bs: &BlockState,
     is_old: bool,
     on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> BoxResult<()>,
+    stats: &mut BlockPairMergeStats,
 ) -> BoxResult<()> {
     let remaining = bs.index.count.saturating_sub(bs.skip_count as u64);
     if is_old {
+        stats.blobs_old_only += 1;
+        stats.elements_old_only += remaining;
         on_action(BlockMergeAction::BlobOldOnly {
             block: &bs.block,
             count: remaining,
             skip: bs.skip_count,
         })
     } else {
+        stats.blobs_new_only += 1;
+        stats.elements_new_only += remaining;
         on_action(BlockMergeAction::BlobNewOnly {
             block: &bs.block,
             count: remaining,
@@ -730,6 +769,7 @@ fn merge_decoded_pair(
 /// bytes emit `BlobEqual(count)` without decompression (v1 optimization).
 /// Callers that need per-element output for unchanged elements (e.g., diff with
 /// `!suppress_common`) should pass `false`.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn block_pair_merge_phase(
     state: &mut BlockPairMergeState,
     kind: ElemKind,
@@ -751,36 +791,40 @@ pub(crate) fn block_pair_merge_phase(
                 (None, None) => break,
                 (Some(op), None) => {
                     let os = decode_pending(op, &mut state.old_buf, &mut state.old_st, &mut state.old_gr)?;
-                    emit_block(&os, true, on_action)?;
+                    emit_block(&os, true, on_action, &mut state.stats)?;
                     drain_remaining(state, kind, true, on_action)?;
                     break;
                 }
                 (None, Some(np)) => {
                     let ns = decode_pending(np, &mut state.new_buf, &mut state.new_st, &mut state.new_gr)?;
-                    emit_block(&ns, false, on_action)?;
+                    emit_block(&ns, false, on_action, &mut state.stats)?;
                     drain_remaining(state, kind, false, on_action)?;
                     break;
                 }
                 (Some(op), Some(np)) => {
                     if op.index.max_id < np.index.min_id {
                         let os = decode_pending(op, &mut state.old_buf, &mut state.old_st, &mut state.old_gr)?;
-                        emit_block(&os, true, on_action)?;
+                        emit_block(&os, true, on_action, &mut state.stats)?;
                         // Stash new blob undecoded - next iteration can try v1 byte comparison.
                         state.new_stash = Some(np.blob);
                         continue;
                     }
                     if np.index.max_id < op.index.min_id {
                         let ns = decode_pending(np, &mut state.new_buf, &mut state.new_st, &mut state.new_gr)?;
-                        emit_block(&ns, false, on_action)?;
+                        emit_block(&ns, false, on_action, &mut state.stats)?;
                         // Stash old blob undecoded - next iteration can try v1 byte comparison.
                         state.old_stash = Some(op.blob);
                         continue;
                     }
                     // Overlapping - try compressed byte comparison (v1).
                     if skip_equal_blobs && blobs_byte_equal(&op, &np) {
+                        state.stats.pairs_byte_equal += 1;
+                        state.stats.elements_byte_equal += op.index.count;
                         on_action(BlockMergeAction::BlobEqual(op.index.count))?;
                         continue;
                     }
+                    state.stats.pairs_overlapping_decoded += 1;
+                    state.stats.elements_overlapping_decoded += op.index.count + np.index.count;
                     old_decoded = Some(decode_pending(op, &mut state.old_buf, &mut state.old_st, &mut state.old_gr)?);
                     new_decoded = Some(decode_pending(np, &mut state.new_buf, &mut state.new_st, &mut state.new_gr)?);
                 }
@@ -799,21 +843,21 @@ pub(crate) fn block_pair_merge_phase(
             (None, None) => break,
             (Some(_), None) => {
                 let os = old_decoded.take().expect("checked");
-                emit_block(&os, true, on_action)?;
+                emit_block(&os, true, on_action, &mut state.stats)?;
             }
             (None, Some(_)) => {
                 let ns = new_decoded.take().expect("checked");
-                emit_block(&ns, false, on_action)?;
+                emit_block(&ns, false, on_action, &mut state.stats)?;
             }
             (Some(os), Some(ns)) => {
                 if os.index.max_id < ns.index.min_id {
                     let os = old_decoded.take().expect("checked");
-                    emit_block(&os, true, on_action)?;
+                    emit_block(&os, true, on_action, &mut state.stats)?;
                     continue;
                 }
                 if ns.index.max_id < os.index.min_id {
                     let ns = new_decoded.take().expect("checked");
-                    emit_block(&ns, false, on_action)?;
+                    emit_block(&ns, false, on_action, &mut state.stats)?;
                     continue;
                 }
                 merge_decoded_pair(&mut old_decoded, &mut new_decoded, type_char, on_action)?;

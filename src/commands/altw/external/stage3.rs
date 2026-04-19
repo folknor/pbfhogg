@@ -2,7 +2,7 @@
 //! pipeline (the flat coord_slots intermediate was retired 2026-04).
 
 #[cfg(feature = "linux-direct-io")]
-use super::super::external_radix::advise_dontneed_file;
+use super::radix::advise_dontneed_file;
 use super::super::Result;
 use super::coord_payloads::{
     encode_blob_payload_from_record, ManifestEntry, PerWayRcs, StraddlerSlot,

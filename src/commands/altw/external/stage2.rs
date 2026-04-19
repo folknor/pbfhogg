@@ -11,9 +11,9 @@
 use std::io::Write as _;
 use std::sync::Arc;
 
-use super::super::external_radix::{ScratchDir, NUM_BUCKETS};
+use super::radix::{ScratchDir, NUM_BUCKETS};
 #[cfg(feature = "linux-direct-io")]
-use super::super::external_radix::advise_dontneed_file;
+use super::radix::advise_dontneed_file;
 use crate::idset::IdSet;
 use crate::scan::node::{extract_node_tuples, NodeTuple};
 use super::super::Result;

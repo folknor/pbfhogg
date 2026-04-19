@@ -11,7 +11,7 @@ use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::Compression;
 use crate::{Element, PrimitiveBlock};
 
-use super::super::add_locations_to_ways::Stats;
+use super::super::Stats;
 use crate::idset::IdSet;
 use super::super::{
     dense_node_metadata, element_metadata,

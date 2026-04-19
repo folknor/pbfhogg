@@ -10,7 +10,7 @@
 use std::io::{BufWriter, Write as _};
 use std::path::Path;
 
-use super::super::external_radix::{ScratchDir, NUM_BUCKETS};
+use super::radix::{ScratchDir, NUM_BUCKETS};
 use crate::idset::IdSet;
 use super::super::Result;
 use super::blob_meta::BlobMeta;
@@ -400,7 +400,7 @@ pub(super) fn stage1_way_pass(
                             }
                         };
                         shard_writers.push(Some(BufWriter::with_capacity(
-                            super::super::external_radix::BUCKET_BUF_SIZE, f,
+                            super::radix::BUCKET_BUF_SIZE, f,
                         )));
                     }
 

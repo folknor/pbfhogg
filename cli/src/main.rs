@@ -1866,8 +1866,8 @@ fn run_add_locations_to_ways(
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
-    let index_type: pbfhogg::add_locations_to_ways::IndexType = index_type.parse()?;
-    let stats = pbfhogg::add_locations_to_ways::add_locations_to_ways(
+    let index_type: pbfhogg::altw::IndexType = index_type.parse()?;
+    let stats = pbfhogg::altw::add_locations_to_ways(
         file,
         output,
         keep_untagged_nodes,

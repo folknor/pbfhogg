@@ -1,9 +1,7 @@
-pub mod add_locations_to_ways;
+pub mod altw;
 pub mod cat;
-pub(crate) mod altw;
 #[cfg(feature = "commands")]
 pub mod check;
-pub(crate) mod external_radix;
 pub mod diff;
 #[cfg(feature = "commands")]
 pub mod extract;

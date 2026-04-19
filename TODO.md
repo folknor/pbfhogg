@@ -116,10 +116,6 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
 
 ## Next up (2026-04-13)
 
-- [ ] **Multi-extract way classify per-worker scratch** - line 868
-  uses `|| ()` init, allocates `vec![Vec::new(); n]` per block.
-  Node and relation phases already use per-worker state. Fix: change
-  init to `|| vec![Vec::<i64>::new(); n]`, clear between blocks.
 - [ ] **diff v3: non-overlapping block skip** - use indexdata min/max
   ID to skip decode for blocks entirely OldOnly or NewOnly (misaligned
   boundaries). Additive on shipped v1+v2. Low risk. Note:
@@ -138,40 +134,21 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   coverage sweep, brokkr `--probes`, backend migration) in
   [`notes/instrumentation-layering.md`](notes/instrumentation-layering.md).
 
-- [ ] **Audit callers for `IdSet::set_if_new` / `set_atomic_if_new` uplift** -
-  Two methods added during `verify_ids --full` parallel rewrite
-  ([commit `855b3b2`](src/idset.rs)) return whether a bit
-  was previously unset - one-cache-line duplicate/first-time detection
-  mirroring `RoaringTreemap::insert`'s return-bool semantics but at
-  `IdSet` speed. Useful anywhere code needs "have I seen this ID
-  before?" without a separate `get` + `set` pair.
-
-  Starting candidates to audit (each represents an `IdSet` caller
-  that might benefit):
-  - **`check_refs` missing-ref vecs** - currently `Vec<i64>` +
-    `sort_unstable` + `dedup` at end of pass. At planet these are tiny
-    (<1M entries typical), so streaming dedup via `set_if_new` would
-    trade a fixed ~1 GB extra pre-alloc against vec growth + final
-    sort. Probably not a win for check_refs but worth checking the cost
-    model at planet scale.
-  - **`merge_pbf` / `apply-changes`** - dedupe-on-collision patterns
-    (source blob already contains ID X) that currently use
-    sort-then-dedup or HashSet membership. `set_if_new` may replace
-    both with one cache-line touch per ID.
-  - **`extract` multi-region ID collection** - per-region `Vec<i64>`s
-    pushed under `way.refs().any(bbox_contains)`; if a way's refs include
-    duplicates (which they can) the same node ID gets pushed multiple
-    times. `set_if_new` on the per-region `IdSet` would dedupe
-    in-place.
-  - **`renumber_external` scan phases** - anywhere a "first time we see
-    this ID" branch exists that currently requires a preceding `get`.
-  - **`tags_filter` two-pass node-ref collection** - similar shape to
-    extract's multi-region.
-
-  Scope: read each caller, decide per-site whether the swap helps, land
-  a single follow-up commit with the uplifts that are clearly wins.
-  No measurement required for call-sites where the analysis is obvious
-  (one cache-line touch beats two).
+- [x] ~~**Audit callers for `IdSet::set_if_new` / `set_atomic_if_new` uplift**~~ -
+  Audited 2026-04-19 across the five candidates in the original entry
+  (`check_refs` missing-ref vecs, `merge_pbf`/`apply-changes` dedupe,
+  `extract` multi-region ID collection, `renumber_external` scan,
+  `tags_filter` two-pass node-ref collection). Only **`tags_filter`**
+  was a clean swap: a local `set_if_absent` helper was literally
+  `get()` + early-return + `set()`, with four call sites. Inlined to
+  `set_if_new` and deleted the helper. The other four sites don't
+  apply: `check_refs` reports both occurrence (pre-dedup vec length)
+  and unique counts and also carries structured `MissingRef { source,
+  id }` for `show_ids` mode, so it can't migrate to IdSet without
+  losing observable data; `apply-changes` uses `FxHashSet` on
+  different data; `extract` multi-region refs are already mostly
+  deduped by PBF structure; no `get`+`set` pair was found in
+  `renumber` pass1.
 
 - [ ] **Rayon alternatives for slice-based parallelism** - Wild linker discussion
   ([davidlattimore/wild#1072](https://github.com/davidlattimore/wild/discussions/1072)) surveys

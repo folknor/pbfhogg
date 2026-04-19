@@ -663,7 +663,7 @@ fn tags_filter_two_pass(
             }
             for (way_id, refs) in cr.matched_ways {
                 direct_way_ids.set(way_id);
-                if set_if_absent(&mut included_way_ids, way_id) {
+                if included_way_ids.set_if_new(way_id) {
                     has_included_way = true;
                 }
                 for r in refs {
@@ -672,7 +672,7 @@ fn tags_filter_two_pass(
             }
             for id in cr.matched_relations {
                 direct_relation_ids.set(id);
-                if set_if_absent(&mut included_relation_ids, id) {
+                if included_relation_ids.set_if_new(id) {
                     has_included_relation = true;
                 }
             }
@@ -933,15 +933,6 @@ fn tags_filter_two_pass(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Set an ID in the dense set and return whether it was newly inserted.
-fn set_if_absent(set: &mut IdSet, id: i64) -> bool {
-    if set.get(id) {
-        return false;
-    }
-    set.set(id);
-    true
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 struct RelationClosureSummary {
     has_way: bool,
@@ -1017,12 +1008,12 @@ fn collect_relation_member_closure(
                 relation_dep_node_ids.set(id);
             }
             for id in cr.way_ids {
-                if set_if_absent(included_way_ids, id) {
+                if included_way_ids.set_if_new(id) {
                     summary.has_way = true;
                 }
             }
             for id in cr.relation_ids {
-                if set_if_absent(included_relation_ids, id) {
+                if included_relation_ids.set_if_new(id) {
                     added_relations += 1;
                 }
             }

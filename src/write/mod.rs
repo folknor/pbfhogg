@@ -1,5 +1,6 @@
 pub mod block_builder;
 pub(crate) mod buf_pool;
+mod encode;
 pub mod header_builder;
 #[cfg(feature = "linux-direct-io")]
 pub mod direct_writer;

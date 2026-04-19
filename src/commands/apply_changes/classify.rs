@@ -69,7 +69,7 @@ pub(super) fn block_overlaps_diff(block: &PrimitiveBlock, ranges: &DiffRanges) -
             Element::Relation(r) => (&mut rel_cursor, &ranges.rel_ids[..], r.id()),
         };
         while *cursor < sorted.len()
-            && crate::commands::osm_id_cmp(sorted[*cursor], id) == Ordering::Less
+            && crate::osm_id::osm_id_cmp(sorted[*cursor], id) == Ordering::Less
         {
             *cursor += 1;
         }

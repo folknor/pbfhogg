@@ -164,7 +164,7 @@ pub fn merge_pbf(
     entries.sort_by_key(|e| {
         (
             type_order(e.index.kind),
-            crate::commands::blob_osm_first_key(e.index.min_id, e.index.max_id),
+            crate::osm_id::blob_osm_first_key(e.index.min_id, e.index.max_id),
         )
     });
 
@@ -348,8 +348,8 @@ fn detect_overlaps(entries: &[BlobEntry]) -> Vec<bool> {
     let mut overlaps = vec![false; entries.len()];
     for i in 0..entries.len().saturating_sub(1) {
         if entries[i].index.kind == entries[i + 1].index.kind
-            && crate::commands::blob_osm_last_key(entries[i].index.min_id, entries[i].index.max_id)
-                >= crate::commands::blob_osm_first_key(
+            && crate::osm_id::blob_osm_last_key(entries[i].index.min_id, entries[i].index.max_id)
+                >= crate::osm_id::blob_osm_first_key(
                     entries[i + 1].index.min_id,
                     entries[i + 1].index.max_id,
                 )
@@ -485,7 +485,7 @@ fn sweep_merge_dedup<T: Ord + HasId>(
     let mut deduped: u64 = 0;
 
     for entry in entries {
-        flush_heap_below_dedup(&mut heap, crate::commands::blob_osm_first_id(entry.index.min_id, entry.index.max_id), &mut deduped, |elem| {
+        flush_heap_below_dedup(&mut heap, crate::osm_id::blob_osm_first_id(entry.index.min_id, entry.index.max_id), &mut deduped, |elem| {
             write_elem(&elem, bb, writer)?;
             count += 1;
             Ok(())
@@ -526,7 +526,7 @@ fn flush_heap_below_dedup<T: Ord + HasId>(
 ) -> Result<()> {
     while heap
         .peek()
-        .is_some_and(|Reverse(e)| crate::commands::osm_id_cmp(e.id(), below).is_lt())
+        .is_some_and(|Reverse(e)| crate::osm_id::osm_id_cmp(e.id(), below).is_lt())
     {
         if let Some(Reverse(element)) = heap.pop() {
             let eid = element.id();

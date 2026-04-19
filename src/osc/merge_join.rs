@@ -314,7 +314,7 @@ pub(crate) fn merge_join_phase<T: MergeJoinElement>(
                 new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
             }
             (Some(o), Some(n)) => {
-                match crate::commands::osm_id_cmp(o.id(), n.id()) {
+                match crate::osm_id::osm_id_cmp(o.id(), n.id()) {
                     std::cmp::Ordering::Less => {
                         on_action(MergeJoinAction::OldOnly(o))?;
 
@@ -881,7 +881,7 @@ fn element_merge_pair(
                 let o_id = element_id(old_iter.peek().expect("checked"));
                 let n_id = element_id(new_iter.peek().expect("checked"));
 
-                match crate::commands::osm_id_cmp(o_id, n_id) {
+                match crate::osm_id::osm_id_cmp(o_id, n_id) {
                     std::cmp::Ordering::Less => {
                         let o = old_iter.next().expect("checked");
                         on_action(BlockMergeAction::ElementOldOnly(&o))?;

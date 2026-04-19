@@ -111,7 +111,7 @@ impl PartialOrd for OwnedNode {
 }
 impl Ord for OwnedNode {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        crate::commands::osm_id_cmp(self.id, other.id)
+        crate::osm_id::osm_id_cmp(self.id, other.id)
             .then_with(|| version_of(&self.metadata).cmp(&version_of(&other.metadata)))
     }
 }
@@ -125,7 +125,7 @@ impl PartialOrd for OwnedWay {
 }
 impl Ord for OwnedWay {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        crate::commands::osm_id_cmp(self.id, other.id)
+        crate::osm_id::osm_id_cmp(self.id, other.id)
             .then_with(|| version_of(&self.metadata).cmp(&version_of(&other.metadata)))
     }
 }
@@ -139,7 +139,7 @@ impl PartialOrd for OwnedRelation {
 }
 impl Ord for OwnedRelation {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        crate::commands::osm_id_cmp(self.id, other.id)
+        crate::osm_id::osm_id_cmp(self.id, other.id)
             .then_with(|| version_of(&self.metadata).cmp(&version_of(&other.metadata)))
     }
 }

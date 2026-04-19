@@ -730,7 +730,7 @@ fn rewrite_block_parallel(
         };
 
         // Emit creates (upsert IDs not in base block) before this element
-        while upsert_cursor < inline_upserts.len() && crate::commands::osm_id_cmp(inline_upserts[upsert_cursor], elem_id).is_lt() {
+        while upsert_cursor < inline_upserts.len() && crate::osm_id::osm_id_cmp(inline_upserts[upsert_cursor], elem_id).is_lt() {
             let cid = inline_upserts[upsert_cursor];
             upsert_cursor += 1;
             emit_create_local(cid, kind, diff, bb, &mut output, &mut stats, loc_map)?;
@@ -914,7 +914,7 @@ fn emit_gap_creates(
     loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
 ) -> Result<()> {
     let (cursor, upserts) = cursors.get_mut(blob_kind, ranges);
-    while *cursor < upserts.len() && crate::commands::osm_id_cmp(upserts[*cursor], min_id).is_lt() {
+    while *cursor < upserts.len() && crate::osm_id::osm_id_cmp(upserts[*cursor], min_id).is_lt() {
         emit_create_for_output(upserts[*cursor], blob_kind, diff, bb, writer, stats, loc_map)?;
         *cursor += 1;
     }
@@ -952,7 +952,7 @@ fn has_gap_creates(
     cursors: &UpsertCursors,
 ) -> bool {
     let (cursor, upserts) = cursors.get(blob_kind, ranges);
-    cursor < upserts.len() && crate::commands::osm_id_cmp(upserts[cursor], min_id).is_lt()
+    cursor < upserts.len() && crate::osm_id::osm_id_cmp(upserts[cursor], min_id).is_lt()
 }
 
 // ---------------------------------------------------------------------------
@@ -1155,10 +1155,10 @@ pub fn merge(
                 ClassifyResult::NeedsRewrite(block, index) => {
                     // Binary search for inline upserts in blob's OSM-order range
                     let upserts = ranges.upserts(index.kind);
-                    let first = crate::commands::blob_osm_first_key(index.min_id, index.max_id);
-                    let last = crate::commands::blob_osm_last_key(index.min_id, index.max_id);
-                    let start = upserts.partition_point(|&id| crate::commands::osm_id_key(id) < first);
-                    let end = upserts[start..].partition_point(|&id| crate::commands::osm_id_key(id) <= last) + start;
+                    let first = crate::osm_id::blob_osm_first_key(index.min_id, index.max_id);
+                    let last = crate::osm_id::blob_osm_last_key(index.min_id, index.max_id);
+                    let start = upserts.partition_point(|&id| crate::osm_id::osm_id_key(id) < first);
+                    let end = upserts[start..].partition_point(|&id| crate::osm_id::osm_id_key(id) <= last) + start;
 
                     let job_idx = rewrite_jobs.len();
                     rewrite_jobs.push(RewriteJob {
@@ -1245,7 +1245,7 @@ pub fn merge(
             last_type = Some(blob_kind);
 
             // Gap creates: emit upserts before this blob in OSM order
-            let osm_first = crate::commands::blob_osm_first_id(min_id, max_id);
+            let osm_first = crate::osm_id::blob_osm_first_id(min_id, max_id);
             let has_gap = has_gap_creates(blob_kind, osm_first, &ranges, &cursors);
             if has_gap {
                 flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
@@ -1387,9 +1387,9 @@ pub fn merge(
                     // output dropped here - RewriteOutput freed immediately
 
                     // Advance cursor past blob's OSM-last (inline upserts handled by rewrite)
-                    let last = crate::commands::blob_osm_last_key(min_id, max_id);
+                    let last = crate::osm_id::blob_osm_last_key(min_id, max_id);
                     let (cursor, upserts) = cursors.get_mut(blob_kind, &ranges);
-                    while *cursor < upserts.len() && crate::commands::osm_id_key(upserts[*cursor]) <= last {
+                    while *cursor < upserts.len() && crate::osm_id::osm_id_key(upserts[*cursor]) <= last {
                         *cursor += 1;
                     }
                 }

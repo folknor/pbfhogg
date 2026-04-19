@@ -104,7 +104,7 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderO
 
     // Sort by (type_order, min_id)
     entries.sort_by_key(|e| {
-        (type_order(e.index.kind), super::blob_osm_first_key(e.index.min_id, e.index.max_id))
+        (type_order(e.index.kind), crate::osm_id::blob_osm_first_key(e.index.min_id, e.index.max_id))
     });
 
     // Detect overlaps
@@ -308,8 +308,8 @@ fn detect_overlaps(entries: &[BlobEntry]) -> Vec<bool> {
     let mut overlaps = vec![false; entries.len()];
     for i in 0..entries.len().saturating_sub(1) {
         if entries[i].index.kind == entries[i + 1].index.kind
-            && super::blob_osm_last_key(entries[i].index.min_id, entries[i].index.max_id)
-                >= super::blob_osm_first_key(entries[i + 1].index.min_id, entries[i + 1].index.max_id)
+            && crate::osm_id::blob_osm_last_key(entries[i].index.min_id, entries[i].index.max_id)
+                >= crate::osm_id::blob_osm_first_key(entries[i + 1].index.min_id, entries[i + 1].index.max_id)
         {
             overlaps[i] = true;
             overlaps[i + 1] = true;
@@ -462,7 +462,7 @@ fn sweep_merge<T: Ord + HasId>(
     let mut count: u64 = 0;
 
     for entry in entries {
-        flush_heap_below(&mut heap, super::blob_osm_first_id(entry.index.min_id, entry.index.max_id), |elem| {
+        flush_heap_below(&mut heap, crate::osm_id::blob_osm_first_id(entry.index.min_id, entry.index.max_id), |elem| {
             write_elem(&elem, bb, writer)?;
             count += 1;
             Ok(())
@@ -490,7 +490,7 @@ fn flush_heap_below<T: Ord + HasId>(
     below: i64,
     mut emit: impl FnMut(T) -> Result<()>,
 ) -> Result<()> {
-    while heap.peek().is_some_and(|Reverse(e)| super::osm_id_cmp(e.id(), below).is_lt()) {
+    while heap.peek().is_some_and(|Reverse(e)| crate::osm_id::osm_id_cmp(e.id(), below).is_lt()) {
         if let Some(Reverse(element)) = heap.pop() {
             emit(element)?;
         }

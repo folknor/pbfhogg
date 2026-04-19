@@ -32,7 +32,7 @@ impl DiffRanges {
             .chain(diff.deleted_nodes.iter())
             .copied()
             .collect();
-        node_ids.sort_unstable_by(|a, b| super::super::osm_id_cmp(*a, *b));
+        node_ids.sort_unstable_by(|a, b| crate::osm_id::osm_id_cmp(*a, *b));
         node_ids.dedup();
 
         let mut way_ids: Vec<i64> = diff
@@ -40,7 +40,7 @@ impl DiffRanges {
             .chain(diff.deleted_ways.iter())
             .copied()
             .collect();
-        way_ids.sort_unstable_by(|a, b| super::super::osm_id_cmp(*a, *b));
+        way_ids.sort_unstable_by(|a, b| crate::osm_id::osm_id_cmp(*a, *b));
         way_ids.dedup();
 
         let mut rel_ids: Vec<i64> = diff
@@ -48,19 +48,19 @@ impl DiffRanges {
             .chain(diff.deleted_relations.iter())
             .copied()
             .collect();
-        rel_ids.sort_unstable_by(|a, b| super::super::osm_id_cmp(*a, *b));
+        rel_ids.sort_unstable_by(|a, b| crate::osm_id::osm_id_cmp(*a, *b));
         rel_ids.dedup();
 
         let mut node_upserts: Vec<i64> = diff.node_ids().copied().collect();
-        node_upserts.sort_unstable_by(|a, b| super::super::osm_id_cmp(*a, *b));
+        node_upserts.sort_unstable_by(|a, b| crate::osm_id::osm_id_cmp(*a, *b));
         node_upserts.dedup();
 
         let mut way_upserts: Vec<i64> = diff.way_ids().copied().collect();
-        way_upserts.sort_unstable_by(|a, b| super::super::osm_id_cmp(*a, *b));
+        way_upserts.sort_unstable_by(|a, b| crate::osm_id::osm_id_cmp(*a, *b));
         way_upserts.dedup();
 
         let mut rel_upserts: Vec<i64> = diff.relation_ids().copied().collect();
-        rel_upserts.sort_unstable_by(|a, b| super::super::osm_id_cmp(*a, *b));
+        rel_upserts.sort_unstable_by(|a, b| crate::osm_id::osm_id_cmp(*a, *b));
         rel_upserts.dedup();
 
         Self {
@@ -89,10 +89,10 @@ impl DiffRanges {
             return false;
         }
         // Binary search for the first ID >= blob's OSM-first in OSM order
-        let first = super::super::blob_osm_first_key(min_id, max_id);
-        let last = super::super::blob_osm_last_key(min_id, max_id);
-        let pos = ids.partition_point(|&id| super::super::osm_id_key(id) < first);
-        pos < ids.len() && super::super::osm_id_key(ids[pos]) <= last
+        let first = crate::osm_id::blob_osm_first_key(min_id, max_id);
+        let last = crate::osm_id::blob_osm_last_key(min_id, max_id);
+        let pos = ids.partition_point(|&id| crate::osm_id::osm_id_key(id) < first);
+        pos < ids.len() && crate::osm_id::osm_id_key(ids[pos]) <= last
     }
 
     /// Return the sorted upsert (create/modify) IDs for a given element kind.

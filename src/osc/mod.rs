@@ -15,5 +15,10 @@ mod interner;
 pub mod parse;
 pub(crate) mod write;
 pub(crate) mod merge_join;
+mod xml_parse;
+
+// Box<dyn Error> is intentional - OSC parsing is CLI-internal, callers only
+// display errors. String errors include the missing attribute name for context.
+type ParseResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 pub use parse::*;

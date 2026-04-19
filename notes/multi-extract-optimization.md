@@ -159,11 +159,35 @@ all-match gate vanishingly rare for ID-sorted PBFs.
 Multi-extract's geometry is different - region-contained blobs really
 do cluster (each region is a contiguous bbox, blobs span short ID
 ranges, containment is monotonic within a bbox). So the math probably
-comes out the other way here. But *measure it*: add a shadow counter
-in the classify worker that reports per-region `contained_blobs /
-total_blobs` before building the raw-write path. Unsafe gate for
-polygon regions (the existing TODO.md note) is a separate issue -
-confirm both the fraction and the safety gate before shipping.
+comes out the other way here. Unsafe gate for polygon regions (the
+existing TODO.md note) is a separate issue - confirm both the
+fraction and the safety gate before shipping.
+
+**Shadow counter landed 2026-04-19** in
+`emit_node_passthrough_shadow_counters` (called right after
+`MULTI_SCHEDULE_SCAN_END`). Run a multi-region multi-extract under a
+measured brokkr mode and inspect the counters via
+`brokkr sidecar <UUID> --counters --human`:
+
+- `multiextract_node_shadow_blobs_total` /
+  `multiextract_node_shadow_elements_total` - population
+- `multiextract_node_shadow_blobs_all_n_contained` - current fast path
+  (contained in ALL N regions, already raw-passed-through)
+- `multiextract_node_shadow_blobs_partial_contained` - **the
+  opportunity** (contained in some but not all regions - these go
+  through full decode+re-encode today)
+- `multiextract_node_shadow_blobs_none_contained` - not raw-eligible
+  under any gate
+- Per-region: `multiextract_node_shadow_region_<i>_blobs` /
+  `multiextract_node_shadow_region_<i>_elements` - how many blobs
+  would raw-pass to region `i` under a partial-passthrough
+  implementation
+
+The go/no-go rule mirrors tags-filter: if `partial_contained` is a
+meaningful fraction of `blobs_total` at Europe/planet scale, build
+the partial passthrough path. If it's vanishingly small (as
+tags-filter's equivalent was), the counters get reverted and this
+note becomes a load-bearing pin against re-attempting.
 
 The load-bearing pin against re-attempting tags-filter passthrough is
 the comment block in the pass-2 worker in

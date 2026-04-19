@@ -161,6 +161,18 @@ pub(super) fn try_extract_multi_single_pass(
     drop(scanner);
     crate::debug::emit_marker("MULTI_SCHEDULE_SCAN_END");
 
+    // Shadow counters: node-blob raw-passthrough eligibility per region.
+    // Precedent: tags-filter pass-2 shadow counters in commit a5c6854
+    // (reverted in 0ef4107 after producing the go/no-go decision).
+    // Rationale in notes/multi-extract-optimization.md item #5: NODE_WRITE
+    // is 52% of Europe wall under the current all-N-or-nothing
+    // passthrough gate. These counters quantify the some-but-not-all
+    // partial-contained population that would unlock with partial
+    // passthrough. Blobs with no indexdata fall into `none_contained`
+    // because we can't prove containment without decoding - matching the
+    // production code's conservative "include in all schedules" path.
+    emit_node_passthrough_shadow_counters(&node_blob_info, n);
+
     let shared_file = std::sync::Arc::new(
         std::fs::File::open(input)
             .map_err(|e| format!("failed to open {}: {e}", input.display()))?
@@ -459,6 +471,62 @@ struct NodeBlobInfo {
     frame_offset: u64,
     frame_size: usize,
     count: u64,
+}
+
+/// Emit `multiextract_node_shadow_*` counters summarising how node blobs
+/// partition across the current all-N-or-nothing passthrough gate plus
+/// per-region raw-passthrough eligibility. See the call site in
+/// `try_extract_multi_single_pass` for the rationale.
+#[allow(clippy::cast_possible_wrap)]
+fn emit_node_passthrough_shadow_counters(node_blob_info: &[NodeBlobInfo], n: usize) {
+    let total_blobs = node_blob_info.len();
+    let mut total_elements: u64 = 0;
+    let mut blobs_all_n: i64 = 0;
+    let mut elements_all_n: u64 = 0;
+    let mut blobs_partial: i64 = 0;
+    let mut elements_partial: u64 = 0;
+    let mut blobs_none: i64 = 0;
+    let mut elements_none: u64 = 0;
+    let mut per_region_blobs = vec![0i64; n];
+    let mut per_region_elements = vec![0u64; n];
+
+    for info in node_blob_info {
+        total_elements += info.count;
+        let k = info.contained_in.len();
+        if n > 0 && k == n {
+            blobs_all_n += 1;
+            elements_all_n += info.count;
+        } else if k > 0 {
+            blobs_partial += 1;
+            elements_partial += info.count;
+        } else {
+            blobs_none += 1;
+            elements_none += info.count;
+        }
+        for &i in &info.contained_in {
+            per_region_blobs[i] += 1;
+            per_region_elements[i] += info.count;
+        }
+    }
+
+    crate::debug::emit_counter("multiextract_node_shadow_blobs_total", total_blobs as i64);
+    crate::debug::emit_counter("multiextract_node_shadow_elements_total", total_elements as i64);
+    crate::debug::emit_counter("multiextract_node_shadow_blobs_all_n_contained", blobs_all_n);
+    crate::debug::emit_counter("multiextract_node_shadow_elements_all_n_contained", elements_all_n as i64);
+    crate::debug::emit_counter("multiextract_node_shadow_blobs_partial_contained", blobs_partial);
+    crate::debug::emit_counter("multiextract_node_shadow_elements_partial_contained", elements_partial as i64);
+    crate::debug::emit_counter("multiextract_node_shadow_blobs_none_contained", blobs_none);
+    crate::debug::emit_counter("multiextract_node_shadow_elements_none_contained", elements_none as i64);
+    for i in 0..n {
+        crate::debug::emit_counter(
+            &format!("multiextract_node_shadow_region_{i}_blobs"),
+            per_region_blobs[i],
+        );
+        crate::debug::emit_counter(
+            &format!("multiextract_node_shadow_region_{i}_elements"),
+            per_region_elements[i] as i64,
+        );
+    }
 }
 
 #[allow(clippy::too_many_lines)]

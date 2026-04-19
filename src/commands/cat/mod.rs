@@ -21,7 +21,8 @@ use crate::writer::{reframe_raw_with_index, Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
 use crate::writer::frame_blob_pipelined;
-use super::{flush_local, read_raw_frame, Result, BATCH_SIZE};
+use super::{flush_local, Result, BATCH_SIZE};
+use crate::read::raw_frame::read_raw_frame;
 
 /// Which metadata attributes to strip via `--clean`.
 #[derive(Clone, Copy, Default)]

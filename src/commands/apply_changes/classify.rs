@@ -9,7 +9,7 @@ use crate::{Element, PrimitiveBlock};
 use super::diff_ranges::DiffRanges;
 use super::stats::ClassifyCounters;
 
-use crate::commands::RawBlobFrame;
+use crate::read::raw_frame::RawBlobFrame;
 
 use std::sync::atomic::Ordering;
 

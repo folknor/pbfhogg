@@ -4,7 +4,7 @@
 use std::io::Read;
 use std::path::Path;
 
-use super::super::{read_blob_header_only, read_raw_frame};
+use crate::read::raw_frame::{read_blob_header_only, read_raw_frame};
 use super::super::Result;
 use super::types::{
     classify_block, is_standard_ordering, update_extended_for_element, BlockAccum, BlockInfo,
@@ -109,7 +109,7 @@ fn try_index_only_scan(
 /// Update accumulators from a single blob's index metadata (no decompression).
 fn accumulate_from_index(
     index: &crate::blob_meta::BlobIndex,
-    info: &super::super::BlobHeaderInfo,
+    info: &crate::read::raw_frame::BlobHeaderInfo,
     block_number: u32,
     state: &mut ScanState,
     accum: &mut BlockAccum,
@@ -272,7 +272,7 @@ fn full_decode_scan(
 
 /// Decompress, parse, and scan one OsmData blob. Updates all accumulators.
 fn scan_data_blob(
-    frame: &super::super::RawBlobFrame,
+    frame: &crate::read::raw_frame::RawBlobFrame,
     decompress_buf: &mut Vec<u8>,
     st_scratch: &mut Vec<(u32, u32)>,
     gr_scratch: &mut Vec<(u32, u32)>,

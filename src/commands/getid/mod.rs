@@ -278,7 +278,7 @@ fn filter_by_id(
 ) -> Result<GetidStats> {
     use crate::blob::{decode_blob_to_headerblock, BlobKind};
     use crate::file_reader::FileReader;
-    use super::read_raw_frame;
+    use crate::read::raw_frame::read_raw_frame;
 
     crate::debug::emit_marker("GETID_SCAN_START");
 

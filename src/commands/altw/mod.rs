@@ -22,8 +22,9 @@ use crate::{Element, ElementReader, MemberId, PrimitiveBlock};
 use super::{
     build_output_header, drain_batch_results, ensure_node_capacity_local,
     ensure_relation_capacity_local, ensure_way_capacity_local, flush_passthrough_buf,
-    read_raw_frame, require_indexdata, writer_from_header, HeaderOverrides, RawBlobFrame,
+    require_indexdata, writer_from_header, HeaderOverrides,
 };
+use crate::read::raw_frame::{read_raw_frame, RawBlobFrame};
 use crate::idset::IdSet;
 
 use super::{Result, BATCH_SIZE, BATCH_BYTE_BUDGET, BATCH_MIN_BLOBS, BATCH_MAX_BLOBS};

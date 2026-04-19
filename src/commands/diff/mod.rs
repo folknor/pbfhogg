@@ -64,7 +64,7 @@ pub(crate) fn check_sorted_and_indexed(path: &Path, direct_io: bool) -> Result<(
     let mut offset = 0u64;
     let mut indexed = false;
 
-    while let Some(info) = super::read_blob_header_only(&mut reader, &mut offset)? {
+    while let Some(info) = crate::read::raw_frame::read_blob_header_only(&mut reader, &mut offset)? {
         if matches!(info.blob_type, BlobKind::OsmData) {
             indexed = info.index.is_some();
             break;

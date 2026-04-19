@@ -391,7 +391,8 @@ pub(super) struct ExtractPass2IdSets<'a> {
     pub(super) matched_relation_ids: &'a IdSet,
 }
 
-use super::super::{clean_metadata, dense_node_metadata, element_metadata};
+use super::super::clean_metadata;
+use crate::owned::{dense_node_metadata, element_metadata};
 
 /// Process a single block for Pass 2 of complete-ways: write elements whose IDs
 /// were collected in Pass 1. Uses thread-local BlockBuilder and output buffer.

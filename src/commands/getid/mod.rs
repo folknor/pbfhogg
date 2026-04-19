@@ -7,10 +7,11 @@ use crate::idset::IdSet;
 use rayon::prelude::*;
 
 use super::{
-    dense_node_metadata, drain_batch_results, element_metadata, flush_local, require_indexdata,
+    drain_batch_results, flush_local, require_indexdata,
     for_each_primitive_block_batch, writer_from_header, ensure_node_capacity_local,
     ensure_way_capacity_local, ensure_relation_capacity_local, HeaderOverrides,
 };
+use crate::owned::{dense_node_metadata, element_metadata};
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};

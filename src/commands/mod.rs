@@ -21,7 +21,7 @@ use std::path::Path;
 
 use crate::blob::{parse_blob_header_with_index, BlobKind};
 use crate::blob_meta::BlobIndex;
-use crate::block_builder::{BlockBuilder, HeaderBuilder, Metadata, OwnedBlock, RawMetadata};
+use crate::block_builder::{BlockBuilder, HeaderBuilder, Metadata, OwnedBlock};
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
@@ -847,45 +847,6 @@ pub(crate) fn writer_from_header_bytes(
 }
 
 /// Map Osmosis sentinel -1 to 0 (protobuf default for absent) in dense node
-/// fields where the type is plain `i64` rather than `Option`.
-#[inline]
-fn map_sentinel(value: i64) -> i64 {
-    if value == -1 { 0 } else { value }
-}
-
-/// Extract [`Metadata`] from an [`Info`](crate::Info) (Node/Way/Relation).
-///
-/// Returns `None` if the info block has no version. On `user()` error (string
-/// table corruption), defaults to empty string.
-pub(crate) fn element_metadata<'a>(info: &crate::Info<'a>) -> Option<Metadata<'a>> {
-    info.version().map(|v| Metadata {
-        version: v,
-        timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-        changeset: info.changeset().unwrap_or(0),
-        uid: info.uid().unwrap_or(0),
-        user: info.user().and_then(std::result::Result::ok).unwrap_or(""),
-        visible: info.visible(),
-    })
-}
-
-/// Extract [`Metadata`] from a [`DenseNode`](crate::DenseNode).
-///
-/// Returns `None` if the node has no info block. On `user()` error (string
-/// table corruption), defaults to empty string - consistent with the
-/// Node/Way/Relation path.
-pub(crate) fn dense_node_metadata<'a>(dn: &'a crate::DenseNode<'a>) -> Option<Metadata<'a>> {
-    dn.info()
-        .filter(|info| info.version() != -1)
-        .map(|info| Metadata {
-            version: info.version(),
-            timestamp: info.milli_timestamp() / 1000,
-            changeset: map_sentinel(info.changeset()),
-            uid: info.uid(),
-            user: info.user().unwrap_or(""),
-            visible: info.visible(),
-        })
-}
-
 /// Apply per-attribute cleaning to metadata. Returns `None` if all attributes
 /// are cleaned or if the input has no metadata.
 pub(crate) fn clean_metadata<'a>(meta: Option<Metadata<'a>>, clean: &cat::CleanAttrs) -> Option<Metadata<'a>> {
@@ -900,34 +861,6 @@ pub(crate) fn clean_metadata<'a>(meta: Option<Metadata<'a>>, clean: &cat::CleanA
         if clean.user { m.user = ""; }
         m
     })
-}
-
-/// Extract [`RawMetadata`] from an [`Info`](crate::Info), preserving the raw
-/// string table index for the user name.
-pub(crate) fn element_raw_metadata(info: &crate::Info<'_>) -> Option<RawMetadata> {
-    info.version().map(|v| RawMetadata {
-        version: v,
-        timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-        changeset: info.changeset().unwrap_or(0),
-        uid: info.uid().unwrap_or(0),
-        user_sid: info.raw_user_sid().unwrap_or(0),
-        visible: info.visible(),
-    })
-}
-
-/// Extract [`RawMetadata`] from a [`DenseNode`](crate::DenseNode), preserving
-/// the raw string table index for the user name.
-pub(crate) fn dense_node_raw_metadata(dn: &crate::DenseNode<'_>) -> Option<RawMetadata> {
-    dn.info()
-        .filter(|info| info.version() != -1)
-        .map(|info| RawMetadata {
-            version: info.version(),
-            timestamp: info.milli_timestamp() / 1000,
-            changeset: map_sentinel(info.changeset()),
-            uid: info.uid(),
-            user_sid: info.raw_user_sid(),
-            visible: info.visible(),
-        })
 }
 
 /// Check for indexdata and return an error if missing (unless `force` is set).

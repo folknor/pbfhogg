@@ -1100,7 +1100,8 @@ fn write_output_decode_all(
 // Parallel batch processing
 // ---------------------------------------------------------------------------
 
-use super::{dense_node_metadata, element_metadata, flush_local};
+use super::flush_local;
+use crate::owned::{dense_node_metadata, element_metadata};
 
 
 // ---------------------------------------------------------------------------

@@ -543,7 +543,8 @@ struct ExtractPass3IdSets<'a> {
     matched_relation_ids: &'a IdSet,
 }
 
-use super::super::{clean_metadata, dense_node_metadata, element_metadata};
+use super::super::clean_metadata;
+use crate::owned::{dense_node_metadata, element_metadata};
 
 /// Process a single block for Pass 3 of smart extraction: write elements whose IDs
 /// were collected in Passes 1+2. Uses thread-local BlockBuilder and output buffer.

@@ -19,10 +19,11 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::owned::{
-    OwnedElement, owned_to_metadata, read_dense_node, read_node, read_way, read_relation,
+    OwnedElement, dense_node_metadata, element_metadata, owned_to_metadata, read_dense_node,
+    read_node, read_relation, read_way,
 };
 use super::{
-    BATCH_SIZE, HeaderOverrides, Result, dense_node_metadata, element_metadata,
+    BATCH_SIZE, HeaderOverrides, Result,
     for_each_primitive_block_batch_budgeted, require_sorted, warn_locations_on_ways_loss,
     writer_from_header,
 };

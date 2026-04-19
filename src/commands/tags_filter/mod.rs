@@ -9,10 +9,11 @@ use rayon::prelude::*;
 use crate::idset::IdSet;
 use crate::tag_expr::{tag_matches, parse_expressions, Expression, TagMatcher};
 use super::{
-    dense_node_metadata, drain_batch_results, element_metadata, flush_local, require_indexdata,
+    drain_batch_results, flush_local, require_indexdata,
     for_each_primitive_block_batch, writer_from_header, HeaderOverrides,
     ensure_node_capacity_local, ensure_way_capacity_local, ensure_relation_capacity_local,
 };
+use crate::owned::{dense_node_metadata, element_metadata};
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};

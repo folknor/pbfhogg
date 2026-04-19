@@ -17,13 +17,14 @@ use crate::writer::{Compression, PbfWriter};
 use crate::{Element, PrimitiveBlock};
 
 use crate::commands::{
-    build_output_header, dense_node_raw_metadata, element_raw_metadata,
+    build_output_header,
     ensure_node_capacity, ensure_node_capacity_local, ensure_relation_capacity,
     ensure_relation_capacity_local, ensure_way_capacity, ensure_way_capacity_local,
     flush_block, flush_local, flush_passthrough_buf, read_raw_frame,
     require_indexdata, writer_from_header_bytes, HeaderOverrides, RawBlobFrame,
     BATCH_MAX_BLOBS, BATCH_MIN_BLOBS,
 };
+use crate::owned::{dense_node_raw_metadata, element_raw_metadata};
 use crate::blob::parse_blob_header_with_index;
 use crate::reorder_buffer::ReorderBuffer;
 

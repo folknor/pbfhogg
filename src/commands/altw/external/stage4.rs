@@ -13,8 +13,8 @@ use crate::{Element, PrimitiveBlock};
 
 use super::super::Stats;
 use crate::idset::IdSet;
+use crate::owned::{dense_node_metadata, element_metadata};
 use super::super::{
-    dense_node_metadata, element_metadata,
     ensure_node_capacity_local, ensure_relation_capacity_local,
     flush_local, HeaderOverrides, Result, writer_from_header,
 };

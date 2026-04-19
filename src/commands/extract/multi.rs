@@ -15,7 +15,7 @@ use crate::idset::IdSet;
 use super::common::{BboxInt, relation_has_matched_member, spatial_blob_filter};
 use super::{ExtractSlot, ExtractStats, Region};
 
-use super::super::{dense_node_metadata, element_metadata};
+use crate::owned::{dense_node_metadata, element_metadata};
 
 /// Try single-pass multi-extract: read the PBF once, classify each element
 /// against all N regions, write to N output files. Returns `None` to fall

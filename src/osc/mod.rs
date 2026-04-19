@@ -10,6 +10,7 @@
 //! The public API is re-exported at this module level so consumers continue to
 //! use `pbfhogg::osc::CompactDiffOverlay`, `pbfhogg::osc::parse_osc_file`, etc.
 
+mod interner;
 pub mod parse;
 pub(crate) mod write;
 pub(crate) mod merge_join;

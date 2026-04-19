@@ -42,6 +42,7 @@ Dispatched on `header.has_historical_information()`:
 | `f45189e` | europe 35 GB | `--bench 1` | **95.1 s** | `a5d77c9a` | iter 2 at scale, peak anon 20 GB |
 | iter 3 | europe 35 GB | `--bench 1` | **94.7 s** | `8b676229` | budgeted batch 128 MB, peak anon **18.1 GB** (-10 %) |
 | iter 4 (pool landed) | europe 35 GB | `--bench 1 --force` | **94.3 s** | dirty | Vec pool + pre-grow 512 KB, peak anon **18.3 GB** (no-op vs iter 3) |
+| iter 5 (pool works) | europe 35 GB | `--bench 1` | **92.6 s** | `6683cb05` | thread_local BlockBuilder; peak anon **16.9 GB** (-15.5 % vs iter 2); alloc churn -87 % |
 
 Throughput at iter 2: ~370 MB/s input. `writer_reorder_high_water`
 jumped 4 → 64 (compression pool saturated).
@@ -153,43 +154,55 @@ only fire in the snapshot path). The next iteration is the lever
 that actually pays the pool off: make `BlockBuilder` persistent
 across rayon tasks.
 
+## Iter 5 notes (2026-04-19): pool pays off via thread_local BlockBuilder
+
+Replaced `batch.par_iter().map_init(BlockBuilder::new, ...)` with
+`batch.par_iter().map(|block| SNAPSHOT_BB.with_borrow_mut(...))`
+where `SNAPSHOT_BB` is a module-scope
+`thread_local!<RefCell<BlockBuilder>>`. Rayon reuses a fixed pool of
+worker threads across successive `par_iter()` calls, so a
+thread-local persists the same `BlockBuilder` across all batches
+processed by that thread. `take_owned_swap` now installs a pool-sized
+swap whose capacity survives to the next encode on the same
+BlockBuilder instead of dying with the per-task one.
+
+**Pool counter change (Japan):**
+
+|                         | iter 4  | iter 5  |
+|-------------------------|---------|---------|
+| gets_total              | 43,035  | 43,035  |
+| gets_hit                | 34,748  | 34,748  |
+| avg get capacity        | 136 KB  | 576 KB  |
+| avg put capacity        | 136 KB  | 576 KB  |
+| avg put len (block size)| 136 KB  | 140 KB  |
+
+**Alloc profile change (Japan, UUID `fed75758` -> `86db6ef6`):**
+
+| Function                              | iter 3 (no pool) | iter 5 (pool + TLS) |
+|---------------------------------------|------------------|---------------------|
+| `take_owned` / `take_owned_swap`      | 18.3 GB (75 %)   | **109 MB (1.7 %)**  |
+| `parse_and_inline_with_scratch`       | 4.1 GB (17 %)    | 4.4 GB (70 %)       |
+| `frame_blob_into`                     | 1.3 GB (5 %)     | 1.5 GB (24 %)       |
+| Total allocated                       | 48.7 GB          | **~6.3 GB**         |
+
+**Europe wall / RSS (UUID `6683cb05`):**
+
+- Wall 94.7 s -> **92.6 s** (-2.2 % vs iter 3).
+- Peak anon 18.1 GB -> **16.9 GB** (-15.5 % vs iter 2; -6.6 % vs
+  iter 3).
+- Avg cores 20.3 -> 20.5.
+
+Planet extrapolation (naive linear, Europe 16.9 GB at 35 GB input
+-> planet 92 GB at ~45 GB anon). Still over the 27 GB host ceiling,
+but comfortably within striking distance of opportunity #2 (raw blob
+passthrough for all-survive blocks) or finer in-flight-bytes
+tuning.
+
 ## Remaining opportunities (ranked)
 
-### 1. Persistent BlockBuilder across rayon tasks
+### 1. Pool `take_owned` output Vecs - LANDED iter 4
 
-**Prerequisite for the pool to pay off.** The iter 4 pool works
-mechanically but gets discarded by the short-lived per-task
-`BlockBuilder`. To cash in the recycled `Vec`s we need the
-`BlockBuilder` to span many blocks, so its `encode_buf` naturally
-retains grown capacity between calls and the pool's installed swap
-becomes the encode target on subsequent calls.
-
-Two candidate shapes:
-
-- **`thread_local!` BlockBuilder + pool handle.** Rayon reuses a
-  small fixed set of worker threads across batches; a thread-local
-  `RefCell<BlockBuilder>` plus pool handle gives each thread a
-  single `BlockBuilder` for the whole run. Closest adjacent pattern
-  is `PIPELINE_SCRATCH` in
-  [`src/write/writer.rs:30-ish`](../src/write/writer.rs) - same
-  shape, different payload.
-- **Hoist BlockBuilder out of `map_init` into `process_snapshot_batch`
-  scope.** Pre-allocate a `Vec<BlockBuilder>` sized to rayon's thread
-  count, carry it across batches in `time_filter_snapshot`'s closure
-  state. More explicit, more plumbing.
-
-Expected payoff: take_owned_swap's `encode_buf` starts cap-0 only on
-the first block seen by each thread, then retains pool capacity for
-the remaining thousands of blocks. Alloc attribution for
-`take_owned_swap` should collapse from 18.6 GB to near-zero; the
-downstream question is whether that translates to measurable anon
-RSS / wall on Europe and planet. Europe iter 3/4 suggests anon is
-dominated by in-flight working set, not alloc churn - so the win
-here may be bounded unless the allocator fragmentation story on
-planet is different. Measure first on Europe, then decide about
-planet.
-
-### 2. Pool `take_owned` output Vecs - LANDED iter 4
+### 2. Persistent BlockBuilder across rayon tasks - LANDED iter 5
 
 Biggest alloc target (75 % at Japan = 18.3 GB of churn; extrapolating
 Europe at ~4× element count gives ~70 GB of churn and explains the

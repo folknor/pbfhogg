@@ -20,7 +20,6 @@ pub mod renumber_external;
 pub(crate) mod elements_xml;
 pub mod sort;
 pub(crate) mod stream_merge;
-pub mod tag_expr;
 pub mod tags_count;
 pub mod tags_filter;
 pub mod tags_filter_osc;
@@ -117,41 +116,6 @@ where
 // ---------------------------------------------------------------------------
 // Element type filter
 // ---------------------------------------------------------------------------
-
-/// Boolean filter for which element types to include.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TypeFilter {
-    pub(crate) nodes: bool,
-    pub(crate) ways: bool,
-    pub(crate) relations: bool,
-}
-
-impl TypeFilter {
-    /// All types included.
-    pub(crate) fn all() -> Self {
-        Self { nodes: true, ways: true, relations: true }
-    }
-
-    /// Parse a comma-separated type list (e.g. "node,way,relation").
-    pub(crate) fn parse(s: &str) -> Self {
-        Self {
-            nodes: s.split(',').any(|t| t.trim() == "node"),
-            ways: s.split(',').any(|t| t.trim() == "way"),
-            relations: s.split(',').any(|t| t.trim() == "relation"),
-        }
-    }
-
-    /// Single type filter, or all types if `None`.
-    pub(crate) fn from_single(s: Option<&str>) -> Self {
-        match s {
-            None => Self::all(),
-            Some("node") => Self { nodes: true, ways: false, relations: false },
-            Some("way") => Self { nodes: false, ways: true, relations: false },
-            Some("relation") => Self { nodes: false, ways: false, relations: true },
-            Some(_) => Self { nodes: false, ways: false, relations: false },
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Shared raw blob frame reading (used by merge and add-locations-to-ways)

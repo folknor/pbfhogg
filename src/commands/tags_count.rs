@@ -4,8 +4,9 @@ use std::path::Path;
 
 use rustc_hash::FxHashMap;
 
-use super::tag_expr::{tag_matches, parse_expressions, Expression};
-use super::{require_indexdata, TypeFilter};
+use crate::tag_expr::{tag_matches, parse_expressions, Expression};
+use super::require_indexdata;
+use crate::owned::TypeFilter;
 use crate::{BlobFilter, Element, PrimitiveBlock};
 
 use super::Result;

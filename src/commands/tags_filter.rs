@@ -5,7 +5,7 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::idset::IdSet;
-use super::tag_expr::{tag_matches, parse_expressions, Expression, TagMatcher};
+use crate::tag_expr::{tag_matches, parse_expressions, Expression, TagMatcher};
 use super::{
     dense_node_metadata, drain_batch_results, element_metadata, flush_local, require_indexdata,
     for_each_primitive_block_batch, writer_from_header, HeaderOverrides,
@@ -1087,7 +1087,7 @@ fn collect_way_node_dependencies(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use super::super::TypeFilter;
+    use crate::owned::TypeFilter;
 
     #[test]
     fn element_matches_respects_type_filter() {

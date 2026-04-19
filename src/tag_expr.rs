@@ -5,7 +5,8 @@
 use std::io::BufRead;
 use std::path::Path;
 
-use super::{Result, TypeFilter};
+use crate::BoxResult;
+use crate::owned::TypeFilter;
 
 // ---------------------------------------------------------------------------
 // Expression types
@@ -53,7 +54,7 @@ fn parse_type_prefix(input: &str) -> (TypeFilter, &str) {
     (TypeFilter::all(), input)
 }
 
-fn parse_tag_matcher(input: &str) -> Result<TagMatcher> {
+fn parse_tag_matcher(input: &str) -> BoxResult<TagMatcher> {
     // Check != before = to avoid ambiguity
     if let Some(pos) = input.find("!=") {
         let key = &input[..pos];
@@ -99,7 +100,7 @@ fn parse_tag_matcher(input: &str) -> Result<TagMatcher> {
     })
 }
 
-pub(crate) fn parse_expression(input: &str) -> Result<Expression> {
+pub(crate) fn parse_expression(input: &str) -> BoxResult<Expression> {
     let (type_filter, tag_part) = parse_type_prefix(input);
     let matcher = parse_tag_matcher(tag_part)?;
     Ok(Expression {
@@ -108,7 +109,7 @@ pub(crate) fn parse_expression(input: &str) -> Result<Expression> {
     })
 }
 
-pub(crate) fn parse_expressions(inputs: &[String]) -> Result<Vec<Expression>> {
+pub(crate) fn parse_expressions(inputs: &[String]) -> BoxResult<Vec<Expression>> {
     inputs.iter().map(|s| parse_expression(s)).collect()
 }
 
@@ -118,7 +119,7 @@ pub(crate) fn parse_expressions(inputs: &[String]) -> Result<Vec<Expression>> {
 /// - Inline `#` comments are supported (everything from first `#` onward is stripped).
 /// - Blank lines are ignored.
 /// - Windows line endings (`\r\n`) are handled.
-pub fn read_expressions_file(path: &Path) -> Result<Vec<String>> {
+pub fn read_expressions_file(path: &Path) -> BoxResult<Vec<String>> {
     let file = std::fs::File::open(path)
         .map_err(|e| format!("could not open expressions file '{}': {e}", path.display()))?;
     let reader = std::io::BufReader::new(file);

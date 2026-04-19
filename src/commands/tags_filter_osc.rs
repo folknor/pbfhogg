@@ -11,7 +11,7 @@ use quick_xml::name::QName;
 use quick_xml::{Reader, Writer};
 
 use super::elements_xml::{format_coord, from_decimicro, OwnedMember, OwnedNode, OwnedRelation, OwnedWay};
-use super::tag_expr::{tag_matches, parse_expressions, Expression};
+use crate::tag_expr::{tag_matches, parse_expressions, Expression};
 use super::Result;
 use crate::{MemberId, MemberType};
 

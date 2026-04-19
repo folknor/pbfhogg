@@ -21,7 +21,8 @@ use super::stream_merge::{
     block_pair_merge_phase, merge_join_phase, BlockMergeAction, BlockPairMergeState,
     MergeJoinAction, MergeJoinElement, StreamingBlocks,
 };
-use super::{Result, TypeFilter};
+use super::Result;
+use crate::owned::TypeFilter;
 use crate::blob_meta::ElemKind;
 use crate::{Element, MemberType};
 

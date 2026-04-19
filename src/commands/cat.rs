@@ -6,10 +6,11 @@ use rayon::prelude::*;
 
 use super::{
     build_output_header, dense_node_metadata, element_metadata, require_indexdata,
-    for_each_primitive_block_batch_budgeted, writer_from_header, HeaderOverrides, TypeFilter,
+    for_each_primitive_block_batch_budgeted, writer_from_header, HeaderOverrides,
     ensure_node_capacity_local, ensure_way_capacity_local, ensure_relation_capacity_local,
     DECODE_BATCH_BYTE_BUDGET,
 };
+use crate::owned::TypeFilter;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::blob::{decode_blob_to_headerblock, decompress_blob_data_into, BlobKind};
 use crate::blob_meta::{scan_block_ids, scan_block_tags};

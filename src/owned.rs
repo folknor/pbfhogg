@@ -10,6 +10,47 @@ pub(crate) use crate::commands::elements_xml::OwnedMember;
 use crate::BoxResult;
 
 // ---------------------------------------------------------------------------
+// Element type filter (node | way | relation), used by tag_expr matchers and
+// command-side type narrowing flags.
+// ---------------------------------------------------------------------------
+
+/// Boolean filter for which element types to include.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TypeFilter {
+    pub(crate) nodes: bool,
+    pub(crate) ways: bool,
+    pub(crate) relations: bool,
+}
+
+impl TypeFilter {
+    /// All types included.
+    pub(crate) fn all() -> Self {
+        Self { nodes: true, ways: true, relations: true }
+    }
+
+    /// Parse a comma-separated type list (e.g. "node,way,relation").
+    pub(crate) fn parse(s: &str) -> Self {
+        Self {
+            nodes: s.split(',').any(|t| t.trim() == "node"),
+            ways: s.split(',').any(|t| t.trim() == "way"),
+            relations: s.split(',').any(|t| t.trim() == "relation"),
+        }
+    }
+
+    /// Single type filter, or all types if `None`.
+    pub(crate) fn from_single(s: Option<&str>) -> Self {
+        match s {
+            None => Self::all(),
+            Some("node") => Self { nodes: true, ways: false, relations: false },
+            Some("way") => Self { nodes: false, ways: true, relations: false },
+            Some("relation") => Self { nodes: false, ways: false, relations: true },
+            Some(_) => Self { nodes: false, ways: false, relations: false },
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------------------
 // Owned element types - Vec fields are kept (not Box<[T]>) because these are
 // transient allocations: decoded, processed, re-encoded per overlap run or
 // sweep-merge pass. They are not long-lived.

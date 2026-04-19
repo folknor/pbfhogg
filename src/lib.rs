@@ -126,6 +126,8 @@ pub(crate) mod idset;
 pub(crate) mod owned;
 pub(crate) mod reorder_buffer;
 pub(crate) mod scan;
+#[doc(hidden)]
+pub mod tag_expr;
 
 /// Boxed-error Result alias used by command implementations and lifted
 /// command-shared library code. Distinct from [`crate::Result`] (which is
@@ -179,7 +181,7 @@ pub use commands::HeaderOverrides;
 #[doc(hidden)]
 pub use commands::{
     add_locations_to_ways, cat, derive_changes, diff, getid, getparents, inspect, merge,
-    merge_changes, merge_pbf, node_stats, renumber, renumber_external, sort, tag_expr,
+    merge_changes, merge_pbf, node_stats, renumber, renumber_external, sort,
     tags_count, tags_filter, tags_filter_osc, time_filter,
 };
 #[cfg(feature = "commands")]

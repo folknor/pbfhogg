@@ -24,12 +24,18 @@ restructure:
 |------:|------|------|
 | 2525 | `cli/src/main.rs` | - |
 | 1231 | `src/commands/extract/mod.rs` | - |
-| 1225 | `src/blob_meta.rs` | - |
 | 1146 | `src/commands/tags_filter/mod.rs` | - |
 | 1146 | `src/commands/altw/external/stage4.rs` | ALTW external (active plan proximity) |
 | 1084 | `src/geocode_index/reader.rs` | - |
 | 1027 | `src/write/block_builder.rs` | write-path work (Milestone 2) |
 | 1000 | `src/write/writer.rs` | write-path work |
+
+Done:
+- `src/blob_meta.rs` (1225 -> 499 lines mod.rs, 2 commits, 2026-04-19)
+  split into scan_ids.rs, tag_index.rs. Each submodule owns its scanner
+  plus the type it produces (`BlobIndex` via scan_block_ids, `TagIndex`
+  via scan_block_tags); mod.rs keeps the shared types (`BlobBbox`,
+  `BlobIndex`, `ElemKind`) and the `BlobFilter` that composes them.
 
 Priority ordering for the split work (don't try to batch the whole list
 at once - each split is a separate review surface):

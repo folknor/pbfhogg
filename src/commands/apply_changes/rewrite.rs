@@ -5,43 +5,36 @@ use std::sync::mpsc;
 use std::sync::Arc;
 
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
 
 use crate::blob::{decode_blob_to_headerblock, BlobKind};
-use crate::blob_meta::{BlobIndex, ElemKind};
-use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
+use crate::blob_meta::ElemKind;
+use crate::block_builder::BlockBuilder;
 use crate::file_reader::FileReader;
-use crate::file_writer::FileWriter;
-use crate::osc::{parse_osc_file, CompactDiffOverlay};
-use crate::writer::{Compression, PbfWriter};
-use crate::{Element, PrimitiveBlock};
+use crate::osc::parse_osc_file;
+use crate::writer::Compression;
 
 use crate::commands::{
     build_output_header,
-    ensure_node_capacity, ensure_node_capacity_local, ensure_relation_capacity_local,
-    flush_block, flush_local, flush_passthrough_buf,
+    flush_block, flush_passthrough_buf,
     require_indexdata, writer_from_header_bytes, HeaderOverrides,
     BATCH_MAX_BLOBS, BATCH_MIN_BLOBS,
 };
 use crate::read::raw_frame::{read_raw_frame, RawBlobFrame};
-use crate::blob::parse_blob_header_with_index;
-use crate::reorder_buffer::ReorderBuffer;
 
 use super::classify::{
     classify_only, BatchSlot, ClassifyResult, RewriteJob,
 };
 use super::diff_ranges::{DiffRanges, UpsertCursors};
-use super::element_writes::{
-    write_base_dense_node_local, write_base_node_local, write_base_relation_local,
-    write_base_way_local, write_base_way_local_with_locations, write_osc_relation,
-    write_osc_way, write_osc_way_local,
-};
 use super::node_locations::NodeLocationIndex;
 use super::parallel_reader::spawn_parallel_reader;
 use super::rewrite_block::{rewrite_block_parallel, RewriteOutput};
 use super::stats::{ClassifyCounters, MergeStats, PhaseTimers, StallAccumulator};
 #[cfg(feature = "hotpath")]
 use super::stats::{PhaseRss, read_rss_kb};
+use super::stream_output::{
+    coalesce_passthrough, emit_create_for_output, emit_gap_creates,
+    flush_remaining_upserts, has_gap_creates,
+};
 
 use super::Result;
 
@@ -173,136 +166,6 @@ fn collect_batch(
         }
     }
     batch_bytes
-}
-
-// ---------------------------------------------------------------------------
-// Gap-create emitter for Phase 4 sequential output
-// ---------------------------------------------------------------------------
-
-/// Emit a single create element via PbfWriter (for gap creates and trailing creates).
-#[allow(clippy::too_many_arguments)]
-fn emit_create_for_output(
-    id: i64,
-    kind: ElemKind,
-    diff: &CompactDiffOverlay,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    stats: &mut MergeStats,
-    loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
-) -> Result<()> {
-    match kind {
-        ElemKind::Node => {
-            if let Some(osc) = diff.get_node(id) {
-                ensure_node_capacity(bb, writer)?;
-                bb.add_node(osc.id(), osc.decimicro_lat(), osc.decimicro_lon(), osc.tags(), None);
-                stats.diff_nodes += 1;
-            }
-        }
-        ElemKind::Way => {
-            if let Some(osc) = diff.get_way(id) {
-                write_osc_way(bb, writer, &osc, loc_map, stats)?;
-                stats.diff_ways += 1;
-            }
-        }
-        ElemKind::Relation => {
-            if let Some(osc) = diff.get_relation(id) {
-                write_osc_relation(bb, writer, &osc)?;
-                stats.diff_relations += 1;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Flush remaining upserts for the previous element type during a type
-/// transition. Also handles skipped types (e.g., Node -> Relation flushes
-/// all Way upserts).
-#[allow(clippy::too_many_arguments)]
-fn flush_remaining_upserts(
-    prev: ElemKind,
-    next: ElemKind,
-    ranges: &DiffRanges,
-    diff: &CompactDiffOverlay,
-    cursors: &mut UpsertCursors,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    stats: &mut MergeStats,
-    loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
-) -> Result<()> {
-    // Flush remaining creates of the previous type
-    let (cursor, upserts) = cursors.get_mut(prev, ranges);
-    while *cursor < upserts.len() {
-        emit_create_for_output(upserts[*cursor], prev, diff, bb, writer, stats, loc_map)?;
-        *cursor += 1;
-    }
-    flush_block(bb, writer)?;
-
-    // Handle skipped type: Node -> Relation (flush all Way upserts)
-    if prev == ElemKind::Node && next == ElemKind::Relation {
-        let (cursor, upserts) = cursors.get_mut(ElemKind::Way, ranges);
-        while *cursor < upserts.len() {
-            emit_create_for_output(upserts[*cursor], ElemKind::Way, diff, bb, writer, stats, loc_map)?;
-            *cursor += 1;
-        }
-        flush_block(bb, writer)?;
-    }
-
-    Ok(())
-}
-
-/// Emit gap creates: upsert IDs of the current type that fall before a blob's min_id.
-#[allow(clippy::too_many_arguments)]
-fn emit_gap_creates(
-    blob_kind: ElemKind,
-    min_id: i64,
-    ranges: &DiffRanges,
-    diff: &CompactDiffOverlay,
-    cursors: &mut UpsertCursors,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    stats: &mut MergeStats,
-    loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
-) -> Result<()> {
-    let (cursor, upserts) = cursors.get_mut(blob_kind, ranges);
-    while *cursor < upserts.len() && crate::osm_id::osm_id_cmp(upserts[*cursor], min_id).is_lt() {
-        emit_create_for_output(upserts[*cursor], blob_kind, diff, bb, writer, stats, loc_map)?;
-        *cursor += 1;
-    }
-    Ok(())
-}
-
-/// Append a passthrough blob's raw bytes to the coalescing buffer.
-/// For indexed blobs, moves frame_bytes via std::mem::take (zero copy).
-/// For non-indexed blobs, reframes with indexdata first.
-fn coalesce_passthrough(
-    frame: &mut RawBlobFrame,
-    index: &BlobIndex,
-    has_indexdata: bool,
-    chunks: &mut Vec<Vec<u8>>,
-) -> Result<()> {
-    if has_indexdata {
-        chunks.push(std::mem::take(&mut frame.frame_bytes));
-    } else {
-        let indexdata = index.serialize();
-        let reframed = crate::write::writer::reframe_raw_with_index(
-            frame.blob_bytes(),
-            &indexdata,
-            frame.tagdata.as_deref(),
-        )?;
-        chunks.push(reframed);
-    }
-    Ok(())
-}
-
-/// Check whether there are gap creates to emit before min_id (without mutating cursors).
-fn has_gap_creates(
-    blob_kind: ElemKind,
-    min_id: i64,
-    ranges: &DiffRanges,
-    cursors: &UpsertCursors,
-) -> bool {
-    let (cursor, upserts) = cursors.get(blob_kind, ranges);
-    cursor < upserts.len() && crate::osm_id::osm_id_cmp(upserts[cursor], min_id).is_lt()
 }
 
 // ---------------------------------------------------------------------------

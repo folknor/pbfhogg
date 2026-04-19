@@ -18,6 +18,7 @@ mod parallel_reader;
 mod rewrite;
 mod rewrite_block;
 mod stats;
+mod stream_output;
 
 pub use rewrite::{merge, MergeOptions};
 pub use stats::MergeStats;

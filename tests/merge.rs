@@ -891,6 +891,7 @@ fn compare_maps<V: std::fmt::Debug + PartialEq>(
 
 /// Helper: write a PBF with LocationsOnWays header feature and sorted flag.
 /// Ways are written with inline node coordinates via `add_way_with_locations`.
+#[allow(clippy::type_complexity)]
 fn write_test_pbf_with_locations(
     path: &Path,
     nodes: &[TestNode],

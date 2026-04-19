@@ -120,7 +120,7 @@ impl Region {
     /// regions, the bbox fast-rejection uses integers; only points passing the
     /// bbox test fall through to the f64 polygon ray-casting (with i32→f64
     /// conversion done only for those points).
-    pub(crate) fn contains_decimicro(&self, bbox_int: &common::BboxInt, lat: i32, lon: i32) -> bool {
+    fn contains_decimicro(&self, bbox_int: &common::BboxInt, lat: i32, lon: i32) -> bool {
         match self {
             Region::Bbox(_) => bbox_int.contains(lat, lon),
             Region::Polygon { polygons, .. } => {

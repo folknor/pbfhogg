@@ -333,6 +333,88 @@ timestamp metadata (merge-changes? extract history slices?). Big
 surface-area change - only worth it if time-filter becomes a hot
 command, and probably after (#4) since (#4) needs no format change.
 
+### 5. Tune in-flight depth + mallopt variants
+
+Smallest-scope post-iter-5 move. Two knobs sit above time-filter's
+code and hold peak anon above what the pool + thread_local already
+saved:
+
+- **3-stage pipelined reader's decode-ahead buffer depth** and
+  **writer's reorder / compression pool depth**. Both use defaults
+  today. Shrinking either trades wall parallelism for peak RSS. On
+  Europe iter 5 the writer's `reorder_high_water` reached 32; cut
+  that cap to 8 and the writer holds far fewer in-flight compressed
+  chunks. Similar thing on the reader side. Knob locations:
+  [`src/read/pipeline.rs`](../src/read/pipeline.rs) for the decode
+  pipeline capacity constants,
+  [`src/write/writer.rs`](../src/write/writer.rs) for the reorder /
+  permit pool.
+- **`mallopt(M_ARENA_MAX, K)` with K > 2.** Iter 3 tried K=2 and
+  regressed hard (wall +69 %, anon +24 %) because the malloc lock
+  became the bottleneck. K=4 or K=8 might sit in the middle: fewer
+  arenas than default (which the glibc heuristic chooses at runtime
+  based on core count, typically ~16) but more than 2 so lock
+  contention is manageable. One-line experiment, same single-commit
+  shape as the failed K=2 attempt; bench Europe `--bench 1` each.
+
+Expected win: low-single-digit GB of anon. Cheap to try. Do this
+before any planet attempt regardless of whether we continue the arc.
+
+### 6. Reader-side scratch cap
+
+Targets the largest remaining alloc contributor after iter 5: per-
+worker thread-local scratch Vecs in
+[`src/read/pipeline.rs:178-195`](../src/read/pipeline.rs) that grow
+to the max-block-size seen on each decode thread and never shrink.
+Iter 5 alloc profile: `parse_and_inline_with_scratch` = 4.4 GB, 70 %
+of total remaining alloc. The Explore agent's iter-4 Q2 confirmed
+this is **retained capacity across the run**, not per-call churn -
+so the hot-path cost is already minimal; the lever here is anon RSS
+for planet, not wall.
+
+Shapes to consider:
+
+- **Smaller retention cap per thread.** Right now each worker's
+  scratch grows to whatever the biggest blob it touches needs and
+  stays there. A Vec::shrink_to with a modest ceiling (e.g. 256 KB)
+  after each blob would bound retention at N_threads × 256 KB but
+  re-alloc on bigger blobs.
+- **Shared bounded pool instead of per-thread.** Same
+  `BlockBufPool`-style pattern as iter 4, applied to the reader's
+  scratch. Workers pull pre-grown scratch at the top of each decode,
+  return after. Bounds aggregate retention to `POOL_CAPACITY *
+  scratch_size` regardless of thread count. More refactor than the
+  shrink-on-loop path; roughly 2-3 commits.
+
+Do the shrink-on-loop version first; measure. If it lands close to
+its target, the pool shape is overkill. If it regresses wall (extra
+allocs on big blobs), fall back to the pool shape.
+
+### 7. Adaptive passthrough via shadow counter (iter 5 path)
+
+The iter-6 lesson in post-mortem form: measure the all-survive blob
+fraction **on the existing I/O architecture** before investing in a
+new one. Concrete shape:
+
+- Add a cheap scan inside iter 5's
+  [`filter_block_snapshot`](../src/commands/time_filter.rs) that
+  does the `ts <= cutoff && visible` predicate as a separate pass,
+  returns `(all_survive: bool, total)`. Counter at end of the phase
+  reports `timefilter_all_survive_blobs / timefilter_total_blobs`.
+- If reported fraction on a real workload is > ~20 %, re-investigate
+  passthrough - but from the pipelined-reader path (via
+  `raw_group_bytes` / `frame_raw_block` scaffolding in
+  `src/write/raw_passthrough.rs`), not a pread swap. The iter-6
+  I/O change was as big a loss as the low passthrough rate; any
+  future attempt needs to stay on the winning I/O architecture.
+- Narrow-cutoff workloads ("last week of edits on a 1-year
+  snapshot") are where the fraction clears the break-even bar. We
+  don't bench those today. This is a latent feature unlocked when a
+  user lands one.
+
+Cheap to land the counter (~20 lines). Measure first; decide
+second.
+
 ## Relationship to other documents
 
 - Hot-path & alloc methodology template: see the renumber_external

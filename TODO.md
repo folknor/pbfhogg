@@ -106,52 +106,12 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
 
 ## Performance
 
-- [ ] **Expose phase events as a proper Rust event/hook API** -
-  `crate::debug::emit_marker` and `emit_counter` are already `pub` and
-  emit unconditionally in release builds, but the sink is hard-wired to
-  a Unix FIFO keyed on the `BROKKR_MARKER_FIFO` env var
-  ([`src/debug.rs`](src/debug.rs)). A library user embedding pbfhogg
-  has no idiomatic way to subscribe to these events for progress UIs,
-  structured logs, or metrics export.
-
-  The idiomatic Rust story for this in 2026 is the `tracing` crate:
-  emit spans for `FOO_START` / `FOO_END` marker pairs, events for
-  point-in-time markers, and structured fields for counters /
-  mallinfo snapshots. Users install any `tracing_subscriber` they
-  already use (logging, OpenTelemetry, custom `Layer` for progress
-  bars via indicatif, etc.) and get pbfhogg's phase data for free.
-
-  Sketch of the migration:
-  - Replace the `emit_marker` / `emit_counter` / `emit_mallinfo2` call
-    sites with `tracing::info_span!` / `tracing::event!` at appropriate
-    levels. The existing `FOO_START` / `FOO_END` pairing convention
-    becomes a span entered/exited; the `WAIT_<CATEGORY>` stall
-    convention becomes spans with a `kind = "wait"` field.
-  - Keep the current brokkr FIFO sink as a separate `tracing_subscriber::Layer`
-    implementation - either inside pbfhogg behind an optional feature
-    gate, or moved into brokkr itself. Brokkr's sidecar protocol is
-    then just one subscriber among many, and the FIFO env var becomes
-    "install this layer when present" rather than a library-wide hard
-    dependency.
-  - Public documentation describes the emitted span / event names and
-    fields as the library's stable progress vocabulary, so external
-    consumers can parse generically.
-
-  Also needs a coverage audit: every long-running pipeline should
-  emit phase spans at natural boundaries (start/end, stage
-  transitions, I/O vs CPU vs write phases). Grep today: check_refs,
-  verify_ids (full mode), renumber_external, altw/*, geocode builder,
-  extract (several), cat, getid, tags_filter, apply-changes / merge -
-  most do some form of emission but coverage is uneven. Second-pass
-  check: counters that would matter as progress percentages (element
-  counts, blobs processed, bytes decompressed) should be emitted at
-  sensible intervals (not just at end-of-run), so a progress-bar
-  consumer has mid-run data to work with.
-
-  Scope: one design discussion, one API-surface commit, a brokkr-side
-  subscriber commit, then a coverage sweep per pipeline. Worth doing
-  once library usage grows past brokkr-plus-dev (PyO3 bindings,
-  notebook use, service embedding).
+- [ ] **Expose phase events as a proper Rust event/hook API** - wrap
+  every instrumentation call in per-command `probes` modules, then swap
+  the backend from the current FIFO sink to `tracing` spans/events so
+  library consumers can subscribe. Full rollout (call-site shape,
+  coverage sweep, brokkr `--probes`, backend migration) in
+  [`notes/instrumentation-layering.md`](notes/instrumentation-layering.md).
 
 - [ ] **Audit callers for `IdSetDense::set_if_new` / `set_atomic_if_new` uplift** -
   Two methods added during `verify_ids --full` parallel rewrite

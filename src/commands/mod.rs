@@ -418,18 +418,23 @@ pub(crate) fn ensure_relation_capacity_local(
 // Schedule building + parallel classification
 // ---------------------------------------------------------------------------
 
+/// One entry in a classification schedule: `(seq, data_offset, data_size)`.
+/// `seq` is a contiguous 0..n index local to the schedule; `data_offset` and
+/// `data_size` address the blob's payload in the input PBF.
+pub(crate) type ScheduleEntry = (usize, u64, usize);
+
 /// Build a classification schedule from a header-only scan, optionally
 /// filtering by element type. Returns `(schedule, shared_file)` ready for
 /// [`parallel_classify_phase`].
 ///
-/// Each schedule entry is `(seq, data_offset, data_size)`. Only OsmData blobs
-/// are included. When `kind_filter` is `Some`, only blobs whose indexdata
-/// matches the given element type (plus blobs without indexdata) are included.
+/// Only OsmData blobs are included. When `kind_filter` is `Some`, only blobs
+/// whose indexdata matches the given element type (plus blobs without
+/// indexdata) are included.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn build_classify_schedule(
     input: &std::path::Path,
     kind_filter: Option<crate::blob_index::ElemKind>,
-) -> Result<(Vec<(usize, u64, usize)>, std::sync::Arc<std::fs::File>)> {
+) -> Result<(Vec<ScheduleEntry>, std::sync::Arc<std::fs::File>)> {
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
     let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
     scanner.set_parse_indexdata(true);
@@ -438,7 +443,7 @@ pub(crate) fn build_classify_schedule(
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
 
     crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_START");
-    let mut schedule: Vec<(usize, u64, usize)> = Vec::new();
+    let mut schedule: Vec<ScheduleEntry> = Vec::new();
     let mut seq: usize = 0;
     while let Some(result_item) = scanner.next_header_with_data_offset() {
         let (hdr, _frame_offset, data_offset, data_size) = result_item?;
@@ -477,12 +482,13 @@ pub(crate) fn build_classify_schedule(
 /// Each schedule's `seq` is local to that schedule (so each is a valid
 /// contiguous 0..n range ready for `parallel_classify_phase`).
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
+#[allow(clippy::type_complexity)]
 pub(crate) fn build_classify_schedules_split(
     input: &std::path::Path,
 ) -> Result<(
-    Vec<(usize, u64, usize)>,
-    Vec<(usize, u64, usize)>,
-    Vec<(usize, u64, usize)>,
+    Vec<ScheduleEntry>,
+    Vec<ScheduleEntry>,
+    Vec<ScheduleEntry>,
     std::sync::Arc<std::fs::File>,
 )> {
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
@@ -493,9 +499,9 @@ pub(crate) fn build_classify_schedules_split(
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
 
     crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_START");
-    let mut nodes: Vec<(usize, u64, usize)> = Vec::new();
-    let mut ways: Vec<(usize, u64, usize)> = Vec::new();
-    let mut rels: Vec<(usize, u64, usize)> = Vec::new();
+    let mut nodes: Vec<ScheduleEntry> = Vec::new();
+    let mut ways: Vec<ScheduleEntry> = Vec::new();
+    let mut rels: Vec<ScheduleEntry> = Vec::new();
     while let Some(result_item) = scanner.next_header_with_data_offset() {
         let (hdr, _frame_offset, data_offset, data_size) = result_item?;
         if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
@@ -562,7 +568,7 @@ pub(crate) fn build_classify_schedules_split(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
     shared_file: &std::sync::Arc<std::fs::File>,
-    schedule: &[(usize, u64, usize)],
+    schedule: &[ScheduleEntry],
     worker_init: impl Fn() -> S + Send + Sync,
     classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> R + Send + Sync,
     mut merge: impl FnMut(usize, R),
@@ -575,7 +581,7 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
         .map(|n| n.get().saturating_sub(2).max(1))
         .unwrap_or(4);
 
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<ScheduleEntry>(16);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<(usize, crate::error::Result<R>)>(32);
 
@@ -667,7 +673,7 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn parallel_classify_accumulate<S: Send>(
     shared_file: &std::sync::Arc<std::fs::File>,
-    schedule: &[(usize, u64, usize)],
+    schedule: &[ScheduleEntry],
     worker_init: impl Fn() -> S + Send + Sync,
     classify: impl Fn(&crate::PrimitiveBlock, &mut S) + Send + Sync,
     mut merge: impl FnMut(S),
@@ -680,7 +686,7 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
         .map(|n| n.get().saturating_sub(2).max(1))
         .unwrap_or(4);
 
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<ScheduleEntry>(16);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<crate::error::Result<S>>(decode_threads);
 

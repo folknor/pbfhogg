@@ -257,6 +257,7 @@ pub(super) fn relation_r2d_assembly(
         drop(decoded_tx);
 
         // Consumer: reorder by seq, write to output in file order.
+        #[allow(clippy::type_complexity)]
         let mut reorder: crate::reorder_buffer::ReorderBuffer<
             std::result::Result<(Vec<u8>, crate::blob_index::BlobIndex, u64, u64), String>,
         > = crate::reorder_buffer::ReorderBuffer::with_capacity(64);

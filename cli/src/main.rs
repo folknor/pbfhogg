@@ -1460,7 +1460,7 @@ fn run_renumber(
         }
         _ => return Err("--start-id must be a single value or 3 comma-separated values (node,way,relation)".into()),
     };
-    let stats = pbfhogg::renumber_external::renumber_external(
+    let stats = pbfhogg::renumber::renumber_external(
         file, output, &opts, compression, direct_io, overrides,
     )?;
     stats.print_summary();

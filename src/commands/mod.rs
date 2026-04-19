@@ -13,7 +13,6 @@ pub mod inspect;
 pub mod apply_changes;
 pub mod merge_changes;
 pub mod renumber;
-pub mod renumber_external;
 pub mod sort;
 pub mod tags_count;
 pub mod tags_filter;

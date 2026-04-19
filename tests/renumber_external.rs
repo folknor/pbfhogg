@@ -6,8 +6,7 @@ use common::{
     assert_sorted_file, read_normalized, write_test_pbf_sorted,
     TestMember, TestNode, TestRelation, TestWay,
 };
-use pbfhogg::renumber::RenumberOptions;
-use pbfhogg::renumber_external::renumber_external;
+use pbfhogg::renumber::{renumber_external, RenumberOptions};
 use pbfhogg::writer::Compression;
 use pbfhogg::MemberId;
 use tempfile::TempDir;

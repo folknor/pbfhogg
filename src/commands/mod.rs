@@ -10,7 +10,7 @@ pub mod extract;
 pub mod getid;
 pub mod getparents;
 pub mod inspect;
-pub mod merge;
+pub mod apply_changes;
 pub mod merge_changes;
 pub mod renumber;
 pub mod renumber_external;

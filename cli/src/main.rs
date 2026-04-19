@@ -2195,14 +2195,14 @@ fn run_apply_changes(
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
-    let opts = pbfhogg::merge::MergeOptions {
+    let opts = pbfhogg::apply_changes::MergeOptions {
         compression,
         direct_io,
         io_uring,
         force,
         locations_on_ways,
     };
-    let stats = pbfhogg::merge::merge(base, changes, output, &opts, overrides)?;
+    let stats = pbfhogg::apply_changes::merge(base, changes, output, &opts, overrides)?;
     stats.print_summary();
     Ok(())
 }
@@ -2491,14 +2491,14 @@ fn run_bench_merge(
     drop(std::fs::remove_file(output));
 
     let start = Instant::now();
-    let opts = pbfhogg::merge::MergeOptions {
+    let opts = pbfhogg::apply_changes::MergeOptions {
         compression,
         direct_io: false,
         io_uring,
         force: true,
         locations_on_ways: false,
     };
-    let stats = pbfhogg::merge::merge(base, changes, output, &opts, &HeaderOverrides::default())?;
+    let stats = pbfhogg::apply_changes::merge(base, changes, output, &opts, &HeaderOverrides::default())?;
     let elapsed_ms = start.elapsed().as_millis();
 
     let output_mb = std::fs::metadata(output)

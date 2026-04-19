@@ -15,7 +15,7 @@ use common::{
 use flate2::write::GzEncoder;
 use pbfhogg::block_builder::{self, BlockBuilder};
 use pbfhogg::MemberId;
-use pbfhogg::merge::{merge, MergeOptions};
+use pbfhogg::apply_changes::{merge, MergeOptions};
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element, MemberType};
 use tempfile::TempDir;

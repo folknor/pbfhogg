@@ -245,7 +245,7 @@ The two downstream consumers are:
 - `Cargo.toml`: `pbfhogg = { path = "../pbfhogg" }` (default features = `commands`)
 - **Read path**: `ElementReader::from_path()` → `.for_each_pipelined(|element| ...)` - two-pass ingest
   - File: `~/Programs/nidhogg/src/ingest/mod.rs:72-324`
-- **Merge path**: delegates entirely to `pbfhogg::merge::merge(base, osc, output, &MergeOptions { .. })`
+- **Merge path**: delegates entirely to `pbfhogg::apply_changes::merge(base, osc, output, &MergeOptions { .. })`
   - File: `~/Programs/nidhogg/src/merge.rs:6`
   - Currently: zlib compression, no direct_io/io_uring, no locations_on_ways
   - TODO: enable `locations_on_ways: true` once the enriched PBF is bootstrapped

@@ -10,7 +10,7 @@ use common::{
 use pbfhogg::MemberId;
 use pbfhogg::block_builder::{self, BlockBuilder, Metadata};
 use pbfhogg::diff::derive::derive_changes;
-use pbfhogg::merge::{merge, MergeOptions};
+use pbfhogg::apply_changes::{merge, MergeOptions};
 use pbfhogg::writer::{Compression, PbfWriter};
 use std::io::Read;
 use tempfile::TempDir;

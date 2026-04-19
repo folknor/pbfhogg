@@ -152,7 +152,6 @@ fn prepare_bucket(
 pub(super) struct SharedSlotBuckets {
     writers: Vec<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>,
     entry_counts: Vec<std::sync::atomic::AtomicU64>,
-    paths: Vec<std::path::PathBuf>,
 }
 
 const BUCKET_BUF_SIZE: usize = 256 * 1024;
@@ -163,7 +162,6 @@ impl SharedSlotBuckets {
         slot_bucket_count: usize,
     ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
         let mut writers = Vec::with_capacity(slot_bucket_count);
-        let mut paths = Vec::with_capacity(slot_bucket_count);
         let mut entry_counts = Vec::with_capacity(slot_bucket_count);
 
         for i in 0..slot_bucket_count {
@@ -173,11 +171,10 @@ impl SharedSlotBuckets {
             writers.push(std::sync::Mutex::new(
                 std::io::BufWriter::with_capacity(BUCKET_BUF_SIZE, file),
             ));
-            paths.push(path);
             entry_counts.push(std::sync::atomic::AtomicU64::new(0));
         }
 
-        Ok(Self { writers, entry_counts, paths })
+        Ok(Self { writers, entry_counts })
     }
 
     pub(super) fn finish(&self) -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -201,11 +198,6 @@ impl SharedSlotBuckets {
         Ok(())
     }
 
-    fn entry_counts_snapshot(&self) -> Vec<u64> {
-        self.entry_counts.iter()
-            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-            .collect()
-    }
 }
 
 /// Parallel stage 2: N workers each claim rank buckets via atomic dispatch,
@@ -324,9 +316,7 @@ pub(super) fn stage2_node_join(
             scope.spawn(move || {
                 use std::sync::atomic::Ordering::Relaxed;
 
-                let mut loader = LoaderScratch {
-                    data_buf: Vec::new(), counts: Vec::new(), write_pos: Vec::new(),
-                };
+                let mut loader = LoaderScratch::new();
                 // Pre-size once to the per-bucket worst case (the nominal
                 // rank_range_size; the last bucket may be smaller but
                 // never larger). The slice is fully zeroed at the start

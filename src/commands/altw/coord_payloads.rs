@@ -153,6 +153,7 @@ impl PerWayRcs {
         self.offsets.len().saturating_sub(1)
     }
 
+    #[cfg(test)]
     pub(super) fn decode_blob_into<'a>(
         &self,
         blob_idx: usize,
@@ -181,6 +182,7 @@ fn scan_blob_record(cursor: &mut protohoggr::Cursor<'_>, blob_idx: usize) -> Res
     Ok(())
 }
 
+#[cfg(test)]
 fn decode_blob_record_into(
     record: &[u8],
     blob_idx: usize,
@@ -262,8 +264,7 @@ fn build_per_way_refcount_index(data: Vec<u8>, num_way_blobs: usize) -> Result<P
 }
 
 /// Parse the per-way refcount sidecar bytes into an indexed `PerWayRcs`.
-///
-/// Extracted as a pure function so both the file loader and tests can call it.
+#[cfg(test)]
 pub(super) fn parse_per_way_refcount_sidecar_bytes(
     data: &[u8],
     num_way_blobs: usize,
@@ -445,15 +446,10 @@ const _: () = {
     assert!(COORD_SLOT_SIZE == 8);
 };
 
-/// Delta-encode one blob's coord slice into `output`.
-///
-/// `coord_bytes.len() == 8 * sum(per_way_rcs)`. Within `coord_bytes`
-/// each 8-byte slot is `[i32 LE lat][i32 LE lon]`. For each way
-/// (refcount `rc` from `per_way_rcs`), consume `rc` consecutive slots
-/// and emit `2*rc` zigzag-varints into `output`: `lat_delta_0`,
-/// `lon_delta_0`, `lat_delta_1`, `lon_delta_1`, ... where
-/// `delta_0` is absolute (delta from 0), deltas reset per way.
-/// Bytes already in `output` are preserved; encoder appends.
+/// Delta-encode one blob's coord slice into `output` from a pre-decoded
+/// `per_way_rcs` slice. Reference implementation that tests assert against
+/// the production streaming `encode_blob_payload_from_record` path.
+#[cfg(test)]
 pub(super) fn encode_blob_payload(
     coord_bytes: &[u8],
     per_way_rcs: &[u32],

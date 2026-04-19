@@ -308,7 +308,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                     }
                 }
             }
-            ids.drain(..).collect::<Vec<i64>>()
+            std::mem::take(ids)
         },
         |_seq, ids| {
             for id in ids { bbox_node_ids.set(id); }
@@ -464,7 +464,7 @@ pub(super) fn extract_smart(
                     }
                 }
             }
-            scratch.drain(..).collect::<Vec<i64>>()
+            std::mem::take(scratch)
         },
         |_seq, refs| {
             for id in refs { extra_node_ids.set(id); }

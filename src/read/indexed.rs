@@ -6,7 +6,6 @@ use super::block::PrimitiveBlock;
 use super::elements::{Element, Way};
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{Read, Seek};
 use std::ops::RangeInclusive;
 use std::path::Path;
 

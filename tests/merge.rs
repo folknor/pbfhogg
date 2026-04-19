@@ -1388,7 +1388,6 @@ fn merge_basic_create_modify_delete_direct_io() {
         }
         Err(e) if common::is_einval(&*e) => {
             eprintln!("O_DIRECT not supported on this filesystem, skipping test");
-            return;
         }
         Err(e) => panic!("unexpected error: {e}"),
     }
@@ -1497,7 +1496,6 @@ fn merge_basic_create_modify_delete_uring() {
         }
         Err(e) if common::is_uring_unavailable(&*e) => {
             eprintln!("io_uring not available, skipping test");
-            return;
         }
         Err(e) => panic!("unexpected error: {e}"),
     }

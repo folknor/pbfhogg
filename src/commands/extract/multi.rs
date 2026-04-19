@@ -184,7 +184,7 @@ pub(super) fn try_extract_multi_single_pass(
                 block.decode_dense_columns(columns);
                 for v in scratch.iter_mut() { v.clear(); }
                 columns.collect_matching_ids_multi_bbox(&bboxes, scratch);
-                scratch.iter_mut().map(|v| v.drain(..).collect::<Vec<i64>>()).collect::<Vec<_>>()
+                scratch.iter_mut().map(std::mem::take).collect::<Vec<_>>()
             },
             |_seq, region_ids: Vec<Vec<i64>>| {
                 for (i, ids) in region_ids.into_iter().enumerate() {
@@ -222,7 +222,7 @@ pub(super) fn try_extract_multi_single_pass(
                         _ => {}
                     }
                 }
-                scratch.iter_mut().map(|v| v.drain(..).collect::<Vec<i64>>()).collect::<Vec<_>>()
+                scratch.iter_mut().map(std::mem::take).collect::<Vec<_>>()
             },
             |_seq, region_ids: Vec<Vec<i64>>| {
                 for (i, ids) in region_ids.into_iter().enumerate() {
@@ -300,7 +300,7 @@ pub(super) fn try_extract_multi_single_pass(
                     }
                 }
             }
-            scratch.iter_mut().map(|v| v.drain(..).collect::<Vec<i64>>()).collect::<Vec<_>>()
+            scratch.iter_mut().map(std::mem::take).collect::<Vec<_>>()
         },
         |_seq, region_ids| {
             for (i, ids) in region_ids.into_iter().enumerate() {
@@ -577,7 +577,7 @@ where
                             })?;
                         }
                         let taken: Vec<Vec<OwnedBlock>> = output.iter_mut()
-                            .map(|v| v.drain(..).collect())
+                            .map(std::mem::take)
                             .collect();
                         Ok((taken, counts))
                     })();
@@ -740,7 +740,7 @@ where
                             })?;
                         }
                         let taken: Vec<Vec<OwnedBlock>> = output.iter_mut()
-                            .map(|v| v.drain(..).collect())
+                            .map(std::mem::take)
                             .collect();
                         Ok((taken, counts))
                     })();

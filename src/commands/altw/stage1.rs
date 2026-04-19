@@ -454,9 +454,10 @@ pub(super) fn stage1_way_pass(
                             for (i, &node_id) in blob_node_ids.iter().enumerate() {
                                 let global_rank = node_id_set_ref.rank(node_id);
                                 #[allow(clippy::cast_possible_truncation)]
-                                let bucket = if rank_range == 0 { 0 } else {
-                                    (global_rank / rank_range) as usize
-                                }.min(NUM_BUCKETS - 1);
+                                let bucket = (global_rank
+                                    .checked_div(rank_range)
+                                    .unwrap_or(0) as usize)
+                                    .min(NUM_BUCKETS - 1);
                                 let bucket_rank_start = bucket as u64 * rank_range;
                                 #[allow(clippy::cast_possible_truncation)]
                                 let local_rank = (global_rank - bucket_rank_start) as u32;

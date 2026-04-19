@@ -664,7 +664,6 @@ fn basic_locations_added_direct_io() {
         }
         Err(e) if common::is_einval(&*e) => {
             eprintln!("O_DIRECT not supported on this filesystem, skipping test");
-            return;
         }
         Err(e) => panic!("unexpected error: {e}"),
     }

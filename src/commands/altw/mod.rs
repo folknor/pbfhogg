@@ -60,10 +60,10 @@ pub(super) const COORD_SLOT_SIZE: usize = 8;
 /// of referenced nodes it contains.
 ///
 /// Computed without decoding any blob - uses indexdata `(min_id, max_id)`
-/// + `IdSetDense::rank` queries. Adjacent blobs' ranges are non-overlapping
-/// and monotonic in rank (because the input PBF is sorted by node ID and
-/// rank is monotonic in ID). Each rank bucket maps to a contiguous run of
-/// blobs in this vector via binary search.
+/// plus `IdSetDense::rank` queries. Adjacent blobs' ranges are
+/// non-overlapping and monotonic in rank (because the input PBF is sorted
+/// by node ID and rank is monotonic in ID). Each rank bucket maps to a
+/// contiguous run of blobs in this vector via binary search.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct NodeBlobInfo {
     pub data_offset: u64,
@@ -122,8 +122,8 @@ impl ResolvedEntry {
     /// Uses floor division for `range_size` so the last bucket *absorbs*
     /// the remainder (and is wider than the others) instead of being
     /// truncated. This keeps every bucket's width ≥ `range_size`, which
-    /// - together with the `slot_bucket_count = total_slots / max_blob_slots`
-    /// floor in `external_join` - preserves the 2-piece straddler
+    /// (together with the `slot_bucket_count = total_slots / max_blob_slots`
+    /// floor in `external_join`) preserves the 2-piece straddler
     /// invariant for all input sizes. Out-of-range high slot_pos values
     /// (that would land past the nominal last bucket because the last
     /// is wider) get clamped to `slot_bucket_count - 1`.
@@ -261,19 +261,16 @@ pub fn external_join(
         })
         .max()
         .unwrap_or(0);
-    let slot_bucket_count = if max_blob_slots == 0 {
-        NUM_BUCKETS
-    } else {
-        // Each bucket must hold ≥ max_blob_slots so the SMALLEST bucket
-        // (which can be smaller than range_size when total_slots is not
-        // a multiple of bucket_count) still satisfies the 2-piece
-        // straddler invariant. Equivalently: bucket_count ≤
-        // total_slots / max_blob_slots, with floor division.
-        let max_useful_u64 = (total_slots / max_blob_slots).max(1);
-        #[allow(clippy::cast_possible_truncation)]
-        let max_useful = max_useful_u64.min(NUM_BUCKETS as u64) as usize;
-        max_useful
-    };
+    // Each bucket must hold ≥ max_blob_slots so the SMALLEST bucket
+    // (which can be smaller than range_size when total_slots is not
+    // a multiple of bucket_count) still satisfies the 2-piece
+    // straddler invariant. Equivalently: bucket_count ≤
+    // total_slots / max_blob_slots, with floor division.
+    #[allow(clippy::cast_possible_truncation)]
+    let slot_bucket_count = total_slots
+        .checked_div(max_blob_slots)
+        .map(|n| n.max(1).min(NUM_BUCKETS as u64) as usize)
+        .unwrap_or(NUM_BUCKETS);
     let total_rank_shard_files = num_shard_workers * NUM_BUCKETS;
     #[allow(clippy::cast_possible_wrap)]
     {
@@ -374,7 +371,7 @@ pub fn external_join(
     )?;
     let (s3_minflt_after, s3_majflt_after) = crate::debug::read_page_faults();
     for i in 0..slot_bucket_count {
-        drop(std::fs::remove_file(&scratch_dir.bucket_path("slot", i)));
+        drop(std::fs::remove_file(scratch_dir.bucket_path("slot", i)));
     }
     #[allow(clippy::cast_possible_wrap)]
     {

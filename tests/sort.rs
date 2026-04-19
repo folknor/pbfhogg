@@ -465,7 +465,6 @@ fn sort_overlapping_blobs_direct_io() {
         }
         Err(e) if common::is_einval(&*e) => {
             eprintln!("O_DIRECT not supported on this filesystem, skipping test");
-            return;
         }
         Err(e) => panic!("unexpected error: {e}"),
     }
@@ -524,7 +523,6 @@ fn sort_overlapping_blobs_uring() {
         }
         Err(e) if common::is_uring_unavailable(&*e) => {
             eprintln!("io_uring not available, skipping test");
-            return;
         }
         Err(e) => panic!("unexpected error: {e}"),
     }

@@ -75,7 +75,7 @@ fn scatter_bucket_entries(
     _bucket_end: u64,
     scatter_buf: &mut [u8],
 ) -> std::result::Result<u64, String> {
-    if data_buf.len() % RESOLVED_ENTRY_SIZE != 0 {
+    if !data_buf.len().is_multiple_of(RESOLVED_ENTRY_SIZE) {
         return Err(format!(
             "slot bucket {bucket_idx} has {} trailing bytes (entry size {})",
             data_buf.len() % RESOLVED_ENTRY_SIZE,

@@ -470,7 +470,6 @@ impl BlobVerifyResult {
 /// attribution in the sidecar.
 #[allow(clippy::too_many_lines)]
 fn verify_ids_full_parallel(path: &Path, opts: &VerifyIdsOptions<'_>) -> Result<VerifyIdsReport> {
-    use crate::blob_index::ElemKind;
     use crate::Element;
 
     crate::debug::emit_marker("VERIFYIDS_SCAN_START");

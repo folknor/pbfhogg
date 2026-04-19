@@ -15,12 +15,11 @@ use super::super::add_locations_to_ways::Stats;
 use super::super::id_set_dense::IdSetDense;
 use super::super::{
     dense_node_metadata, element_metadata,
-    ensure_node_capacity_local, ensure_relation_capacity_local, ensure_way_capacity_local,
+    ensure_node_capacity_local, ensure_relation_capacity_local,
     flush_local, HeaderOverrides, Result, writer_from_header,
 };
 
 use super::blob_meta::BlobMeta;
-use super::COORD_SLOT_SIZE;
 
 /// Blob descriptor for the stage 4 pre-scan schedule.
 struct BlobDescriptor {
@@ -421,10 +420,12 @@ pub(super) fn stage4_assembly(
                             reframe_output.reserve(taken.len());
                             output_blocks.push((taken, index, None));
 
-                            let mut block_stats = Stats::default();
-                            block_stats.ways_written = way_count;
-                            block_stats.missing_locations = missing;
-                            block_stats.blobs_decoded = 1;
+                            let block_stats = Stats {
+                                ways_written: way_count,
+                                missing_locations: missing,
+                                blobs_decoded: 1,
+                                ..Stats::default()
+                            };
                             #[allow(clippy::cast_possible_truncation)]
                             {
                                 let elapsed = t2.elapsed().as_millis() as u64;
@@ -867,8 +868,8 @@ impl WayReframeCounters {
         crate::debug::emit_counter("s4_way_messages_total", self.ways_total.load(Relaxed) as i64);
         let total_refs = self.refs_total.load(Relaxed);
         let total_ways = self.ways_total.load(Relaxed);
-        if total_ways > 0 {
-            crate::debug::emit_counter("s4_way_avg_refs_per_way", (total_refs / total_ways) as i64);
+        if let Some(avg) = total_refs.checked_div(total_ways) {
+            crate::debug::emit_counter("s4_way_avg_refs_per_way", avg as i64);
         }
     }
 }

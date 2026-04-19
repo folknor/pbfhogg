@@ -83,7 +83,7 @@ fn main() {
         let bitmaps: Vec<u64> = PARTITION_COUNTS
             .iter()
             .map(|&n| {
-                let range_size = (MAX_NODE_ID + n - 1) / n;
+                let range_size = MAX_NODE_ID.div_ceil(n);
                 let mut bitmap: u64 = 0;
                 for &node_id in &current_blob_refs {
                     let partition = (node_id as u64) / range_size;
@@ -103,7 +103,7 @@ fn main() {
         });
 
         blob_count += 1;
-        if blob_count % 10_000 == 0 {
+        if blob_count.is_multiple_of(10_000) {
             eprint!("\r  {} blobs scanned...", blob_count);
         }
     }
@@ -131,7 +131,7 @@ fn main() {
     println!();
 
     for (i, &n) in PARTITION_COUNTS.iter().enumerate() {
-        let range_size = (MAX_NODE_ID + n - 1) / n;
+        let range_size = MAX_NODE_ID.div_ceil(n);
         let index_per_partition_gb =
             (range_size as f64 * 8.0) / 1_000_000_000.0;
 
@@ -214,7 +214,7 @@ fn main() {
     println!("## Min/max ref range analysis (v1 metadata)");
     println!();
     for (i, &n) in PARTITION_COUNTS.iter().enumerate() {
-        let range_size = (MAX_NODE_ID + n - 1) / n;
+        let range_size = MAX_NODE_ID.div_ceil(n);
 
         // How many blobs would min/max skip vs bitmap skip?
         let minmax_single = blobs

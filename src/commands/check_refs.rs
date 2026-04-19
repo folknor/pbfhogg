@@ -3,7 +3,6 @@
 use std::path::Path;
 use std::time::Instant;
 
-use crate::blob_index::ElemKind;
 use crate::{Element, MemberId};
 
 use super::id_set_dense::IdSetDense;

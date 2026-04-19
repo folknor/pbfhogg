@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use crate::idset::IdSet;
-use super::Result;
+use crate::BoxResult as Result;
 use crate::owned::TypeFilter;
 use crate::ElementReader;
 

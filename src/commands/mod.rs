@@ -1,9 +1,9 @@
 pub mod add_locations_to_ways;
 pub mod cat;
 pub(crate) mod altw;
-pub(crate) mod external_radix;
 #[cfg(feature = "commands")]
-pub mod check_refs;
+pub mod check;
+pub(crate) mod external_radix;
 pub mod diff;
 #[cfg(feature = "commands")]
 pub mod extract;
@@ -18,8 +18,6 @@ pub mod sort;
 pub mod tags_count;
 pub mod tags_filter;
 pub mod time_filter;
-#[cfg(feature = "commands")]
-pub mod verify_ids;
 
 use std::io::Read;
 use std::path::Path;

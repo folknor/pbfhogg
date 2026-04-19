@@ -1211,14 +1211,14 @@ fn run_check(
 
     // Run checks and collect results
     let ids_report = if run_ids {
-        use pbfhogg::verify_ids::VerifyIdsOptions;
+        use pbfhogg::check::verify_ids::VerifyIdsOptions;
         let opts = VerifyIdsOptions {
             full,
             type_filter,
             max_errors,
             direct_io,
         };
-        let report = pbfhogg::verify_ids::verify_ids(path, &opts)?;
+        let report = pbfhogg::check::verify_ids::verify_ids(path, &opts)?;
         if !report.passed {
             failed = true;
         }
@@ -1228,7 +1228,7 @@ fn run_check(
     };
 
     let refs_result = if run_refs {
-        let result = pbfhogg::check_refs::check_refs(path, check_relations, show_ids, direct_io)?;
+        let result = pbfhogg::check::refs::check_refs(path, check_relations, show_ids, direct_io)?;
         if !result.is_valid() {
             failed = true;
         }

@@ -186,4 +186,4 @@ pub use commands::{
 };
 #[cfg(feature = "commands")]
 #[doc(hidden)]
-pub use commands::{check_refs, extract, verify_ids};
+pub use commands::{check, extract};

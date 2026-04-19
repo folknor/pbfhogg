@@ -493,13 +493,13 @@ fn classify_blob_filter_check(
     if let Some(idx) = hdr.index() {
         let dominated = matches!(
             idx.kind,
-            crate::blob_index::ElemKind::Node if !filter.want_nodes
+            crate::blob_meta::ElemKind::Node if !filter.want_nodes
         ) || matches!(
             idx.kind,
-            crate::blob_index::ElemKind::Way if !filter.want_ways
+            crate::blob_meta::ElemKind::Way if !filter.want_ways
         ) || matches!(
             idx.kind,
-            crate::blob_index::ElemKind::Relation if !filter.want_relations
+            crate::blob_meta::ElemKind::Relation if !filter.want_relations
         );
         if dominated { return (true, false); }
     }
@@ -962,7 +962,7 @@ fn collect_relation_member_closure(
 
     // Build schedule once - reused across convergence iterations.
     let (schedule, shared_file) = super::build_classify_schedule(
-        input, Some(crate::blob_index::ElemKind::Relation),
+        input, Some(crate::blob_meta::ElemKind::Relation),
     )?;
 
     struct ClosureResult {
@@ -1043,7 +1043,7 @@ fn collect_way_node_dependencies(
     relation_dep_node_ids: &mut IdSetDense,
 ) -> Result<()> {
     let (schedule, shared_file) = super::build_classify_schedule(
-        input, Some(crate::blob_index::ElemKind::Way),
+        input, Some(crate::blob_meta::ElemKind::Way),
     )?;
 
     super::parallel_classify_accumulate(

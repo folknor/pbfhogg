@@ -42,7 +42,7 @@ pub(super) fn build_way_schedule(blob_meta: &[BlobMeta]) -> Result<Vec<WayBlobTa
     let mut schedule: Vec<WayBlobTask> = Vec::new();
     let mut seq: u32 = 0;
     for meta in blob_meta {
-        if !matches!(meta.kind, crate::blob_index::ElemKind::Way) {
+        if !matches!(meta.kind, crate::blob_meta::ElemKind::Way) {
             continue;
         }
         schedule.push(WayBlobTask {
@@ -257,7 +257,7 @@ pub(super) fn build_node_blob_mapping(
     let mut blobs_with_zero_refs: u64 = 0;
 
     for meta in blob_meta {
-        if !matches!(meta.kind, crate::blob_index::ElemKind::Node) {
+        if !matches!(meta.kind, crate::blob_meta::ElemKind::Node) {
             continue;
         }
         // count_below() is the safe variant of rank() that handles IDs past

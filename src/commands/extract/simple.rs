@@ -285,7 +285,7 @@ fn extract_simple_single_pass(
     let node_schedule: Vec<&BlobDesc> = full_schedule.iter()
         .filter(|d| {
             match d.kind {
-                Some(crate::blob_index::ElemKind::Node) => {
+                Some(crate::blob_meta::ElemKind::Node) => {
                     // Apply spatial bbox filter to skip node blobs outside extract region.
                     if let Some(ref filter_bbox) = spatial_filter.node_bbox {
                         match d.bbox {
@@ -308,10 +308,10 @@ fn extract_simple_single_pass(
     // decompressed up to 3 times - acceptable since indexed PBFs (production
     // path) always have kind set and this path is only reachable via --force.
     let way_schedule: Vec<&BlobDesc> = full_schedule.iter()
-        .filter(|d| matches!(d.kind, Some(crate::blob_index::ElemKind::Way) | None))
+        .filter(|d| matches!(d.kind, Some(crate::blob_meta::ElemKind::Way) | None))
         .collect();
     let relation_schedule: Vec<&BlobDesc> = full_schedule.iter()
-        .filter(|d| matches!(d.kind, Some(crate::blob_index::ElemKind::Relation) | None))
+        .filter(|d| matches!(d.kind, Some(crate::blob_meta::ElemKind::Relation) | None))
         .collect();
 
     // Open writer.
@@ -553,7 +553,7 @@ fn extract_simple_single_pass(
     let mut matched_relation_ids = IdSetDense::new();
     {
         let (rel_classify_schedule, rel_classify_file) = super::super::build_classify_schedule(
-            input, Some(crate::blob_index::ElemKind::Relation),
+            input, Some(crate::blob_meta::ElemKind::Relation),
         )?;
         super::super::parallel_classify_accumulate(
             &rel_classify_file,

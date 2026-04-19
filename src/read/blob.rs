@@ -197,7 +197,7 @@ pub(crate) struct WireBlobHeader {
     pub blob_type: BlobKind,
     pub datasize: i32,
     /// Blob-level index: 42 bytes (v2) or 26 bytes (v1, zero-padded), stored inline.
-    pub indexdata: Option<[u8; crate::blob_index::INDEX_SIZE]>,
+    pub indexdata: Option<[u8; crate::blob_meta::INDEX_SIZE]>,
     /// Per-blob tag key index (BlobHeader field 4). Variable-length.
     pub tagdata: Option<Box<[u8]>>,
 }
@@ -218,7 +218,7 @@ impl WireBlobHeader {
         let mut cursor = Cursor::new(data);
         let mut blob_type = BlobKind::Unknown(String::new());
         let mut datasize: i32 = 0;
-        let mut indexdata: Option<[u8; crate::blob_index::INDEX_SIZE]> = None;
+        let mut indexdata: Option<[u8; crate::blob_meta::INDEX_SIZE]> = None;
         let mut tagdata: Option<Box<[u8]>> = None;
 
         while let Some((field, wire_type)) = cursor.read_tag()? {
@@ -239,8 +239,8 @@ impl WireBlobHeader {
                     // indexdata: bytes (len-delimited) - accept v1 (26) or v2 (42) sizes
                     let bytes = cursor.read_len_delimited()?;
                     let len = bytes.len();
-                    if len == crate::blob_index::INDEX_SIZE || len == 26 {
-                        let mut buf = [0u8; crate::blob_index::INDEX_SIZE];
+                    if len == crate::blob_meta::INDEX_SIZE || len == 26 {
+                        let mut buf = [0u8; crate::blob_meta::INDEX_SIZE];
                         buf[..len].copy_from_slice(bytes);
                         indexdata = Some(buf);
                     }
@@ -480,11 +480,11 @@ impl Blob {
     ///
     /// PBFs written by pbfhogg embed indexdata automatically. Third-party PBFs
     /// (Geofabrik, osmium) typically do not - this returns `None` for those.
-    pub(crate) fn index(&self) -> Option<crate::blob_index::BlobIndex> {
+    pub(crate) fn index(&self) -> Option<crate::blob_meta::BlobIndex> {
         self.header
             .indexdata
             .as_ref()
-            .and_then(|d| crate::blob_index::BlobIndex::deserialize(d))
+            .and_then(|d| crate::blob_meta::BlobIndex::deserialize(d))
     }
 
     /// Returns the compression kind and payload bytes for blob equality comparison.
@@ -505,11 +505,11 @@ impl Blob {
     ///
     /// PBFs written by pbfhogg embed tag key data automatically. Third-party PBFs
     /// do not - this returns `None` for those.
-    pub(crate) fn tag_index(&self) -> Option<crate::blob_index::TagIndex> {
+    pub(crate) fn tag_index(&self) -> Option<crate::blob_meta::TagIndex> {
         self.header
             .tagdata
             .as_ref()
-            .and_then(|d| crate::blob_index::TagIndex::deserialize(d))
+            .and_then(|d| crate::blob_meta::TagIndex::deserialize(d))
     }
 
     /// Decompress and construct PrimitiveBlock with inline string table entries,
@@ -559,19 +559,19 @@ impl BlobHeader {
     }
 
     /// Returns the blob-level index from the header's `indexdata` field, if present.
-    pub(crate) fn index(&self) -> Option<crate::blob_index::BlobIndex> {
+    pub(crate) fn index(&self) -> Option<crate::blob_meta::BlobIndex> {
         self.header
             .indexdata
             .as_ref()
-            .and_then(|d| crate::blob_index::BlobIndex::deserialize(d))
+            .and_then(|d| crate::blob_meta::BlobIndex::deserialize(d))
     }
 
     /// Returns the per-blob tag key index from the header's `tagdata` field, if present.
-    pub(crate) fn tag_index(&self) -> Option<crate::blob_index::TagIndex> {
+    pub(crate) fn tag_index(&self) -> Option<crate::blob_meta::TagIndex> {
         self.header
             .tagdata
             .as_ref()
-            .and_then(|d| crate::blob_index::TagIndex::deserialize(d))
+            .and_then(|d| crate::blob_meta::TagIndex::deserialize(d))
     }
 }
 
@@ -1172,7 +1172,7 @@ impl BlobReader<BufReader<File>> {
 #[allow(clippy::type_complexity)]
 pub(crate) fn parse_blob_header_with_index(
     header_bytes: &[u8],
-) -> Result<(BlobKind, usize, Option<[u8; crate::blob_index::INDEX_SIZE]>, Option<Box<[u8]>>)> {
+) -> Result<(BlobKind, usize, Option<[u8; crate::blob_meta::INDEX_SIZE]>, Option<Box<[u8]>>)> {
     let header = WireBlobHeader::parse(header_bytes, true, true)?;
     if header.datasize < 0 {
         return Err(new_blob_error(BlobError::InvalidDataSize {

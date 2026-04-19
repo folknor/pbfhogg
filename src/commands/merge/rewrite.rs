@@ -8,7 +8,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::blob::{decode_blob_to_headerblock, BlobKind};
-use crate::blob_index::{BlobIndex, ElemKind};
+use crate::blob_meta::{BlobIndex, ElemKind};
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;

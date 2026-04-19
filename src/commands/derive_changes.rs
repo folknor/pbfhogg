@@ -23,7 +23,7 @@ use super::stream_merge::{
     MergeJoinAction, StreamingBlocks,
 };
 use super::Result;
-use crate::blob_index::ElemKind;
+use crate::blob_meta::ElemKind;
 
 // ---------------------------------------------------------------------------
 // Stats

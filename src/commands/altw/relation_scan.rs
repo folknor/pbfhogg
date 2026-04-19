@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::block::PrimitiveBlock;
-use crate::blob_index::ElemKind;
+use crate::blob_meta::ElemKind;
 use crate::elements::{Element, MemberId};
 
 use super::super::id_set_dense::IdSetDense;

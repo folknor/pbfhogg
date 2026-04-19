@@ -324,11 +324,11 @@ fn filter_by_id(
             BlobKind::OsmData => {
                 if let Some(ref idx) = frame.index {
                     let has_match = match idx.kind {
-                        crate::blob_index::ElemKind::Node =>
+                        crate::blob_meta::ElemKind::Node =>
                             ids.node_ids.any_in_range(idx.min_id, idx.max_id),
-                        crate::blob_index::ElemKind::Way =>
+                        crate::blob_meta::ElemKind::Way =>
                             ids.way_ids.any_in_range(idx.min_id, idx.max_id),
-                        crate::blob_index::ElemKind::Relation =>
+                        crate::blob_meta::ElemKind::Relation =>
                             ids.relation_ids.any_in_range(idx.min_id, idx.max_id),
                     };
                     if include {
@@ -340,9 +340,9 @@ fn filter_by_id(
                     } else if !has_match {
                         // Invert mode: no matching IDs → raw passthrough.
                         match idx.kind {
-                            crate::blob_index::ElemKind::Node => stats.nodes_written += idx.count,
-                            crate::blob_index::ElemKind::Way => stats.ways_written += idx.count,
-                            crate::blob_index::ElemKind::Relation => stats.relations_written += idx.count,
+                            crate::blob_meta::ElemKind::Node => stats.nodes_written += idx.count,
+                            crate::blob_meta::ElemKind::Way => stats.ways_written += idx.count,
+                            crate::blob_meta::ElemKind::Relation => stats.relations_written += idx.count,
                         }
                         writer.write_raw_owned(std::mem::take(&mut frame.frame_bytes))?;
                         blobs_passthrough += 1;
@@ -407,7 +407,7 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions
         // Parallel classification: pread workers scan way blobs for matching
         // way IDs and collect their node refs.
         let (schedule, shared_file) = super::build_classify_schedule(
-            input, Some(crate::blob_index::ElemKind::Way),
+            input, Some(crate::blob_meta::ElemKind::Way),
         )?;
 
         super::parallel_classify_accumulate(

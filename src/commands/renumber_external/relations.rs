@@ -160,7 +160,7 @@ pub(super) fn relation_r2d_assembly(
         .min(6);
 
     // Each blob produces one OwnedBlock tuple + orphan count.
-    type R2dItem = (usize, std::result::Result<(Vec<u8>, crate::blob_index::BlobIndex, u64, u64), String>);
+    type R2dItem = (usize, std::result::Result<(Vec<u8>, crate::blob_meta::BlobIndex, u64, u64), String>);
     let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<R2dItem>(32);
 
     let rels_written = std::sync::atomic::AtomicU64::new(0);
@@ -196,7 +196,7 @@ pub(super) fn relation_r2d_assembly(
                     }
                     let task = &relation_schedule[idx];
 
-                    let result: std::result::Result<(Vec<u8>, crate::blob_index::BlobIndex, u64, u64), String> = (|| {
+                    let result: std::result::Result<(Vec<u8>, crate::blob_meta::BlobIndex, u64, u64), String> = (|| {
                         let t0 = std::time::Instant::now();
                         read_buf.resize(task.data_size, 0);
                         file.read_exact_at(&mut read_buf, task.data_offset)
@@ -232,8 +232,8 @@ pub(super) fn relation_r2d_assembly(
                         rw.fetch_add(blob_count, Relaxed);
                         r2d_cref.blobs.fetch_add(1, Relaxed);
 
-                        let index = crate::blob_index::BlobIndex {
-                            kind: crate::blob_index::ElemKind::Relation,
+                        let index = crate::blob_meta::BlobIndex {
+                            kind: crate::blob_meta::ElemKind::Relation,
                             min_id,
                             max_id,
                             count: blob_count,
@@ -259,7 +259,7 @@ pub(super) fn relation_r2d_assembly(
         // Consumer: reorder by seq, write to output in file order.
         #[allow(clippy::type_complexity)]
         let mut reorder: crate::reorder_buffer::ReorderBuffer<
-            std::result::Result<(Vec<u8>, crate::blob_index::BlobIndex, u64, u64), String>,
+            std::result::Result<(Vec<u8>, crate::blob_meta::BlobIndex, u64, u64), String>,
         > = crate::reorder_buffer::ReorderBuffer::with_capacity(64);
 
         loop {

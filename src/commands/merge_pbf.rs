@@ -18,7 +18,7 @@ use crate::blob::{
     decode_blob_to_headerblock, decode_blob_to_primitiveblock, decompress_blob_data_into,
     parse_blob_header_with_index, BlobKind,
 };
-use crate::blob_index::{BlobIndex, ElemKind, scan_block_ids};
+use crate::blob_meta::{BlobIndex, ElemKind, scan_block_ids};
 use crate::block_builder::BlockBuilder;
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;

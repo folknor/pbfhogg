@@ -6,7 +6,7 @@
 //! Handles string table construction, delta encoding, dense node packing,
 //! and block size limits (8000 entities per block, matching osmium).
 
-use crate::blob_index::{BlobIndex, ElemKind};
+use crate::blob_meta::{BlobIndex, ElemKind};
 use crate::PrimitiveBlock;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::io;
@@ -896,7 +896,7 @@ impl BlockBuilder {
             BlockType::Relations => ElemKind::Relation,
         };
         let bbox = if kind == ElemKind::Node && self.min_lat <= self.max_lat {
-            Some(crate::blob_index::BlobBbox::new(
+            Some(crate::blob_meta::BlobBbox::new(
                 self.min_lat,
                 self.max_lat,
                 self.min_lon,
@@ -959,7 +959,7 @@ impl BlockBuilder {
                 .map(|&idx| 2 + self.string_table.strings[idx as usize].len())
                 .sum::<usize>();
             let mut buf = Vec::with_capacity(total);
-            buf.push(crate::blob_index::TAG_INDEX_VERSION);
+            buf.push(crate::blob_meta::TAG_INDEX_VERSION);
             #[allow(clippy::cast_possible_truncation)]
             let count = self.tag_key_scratch.len() as u16;
             buf.extend_from_slice(&count.to_le_bytes());

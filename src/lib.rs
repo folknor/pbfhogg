@@ -119,7 +119,7 @@ pub mod commands;
 pub mod geo;
 pub mod geocode_index;  // format is always available; reader requires geocode-reader feature
 pub mod osc;
-pub(crate) mod blob_index;
+pub(crate) mod blob_meta;
 pub mod debug;
 mod error;
 pub(crate) mod reorder_buffer;
@@ -153,7 +153,7 @@ pub use read::elements::{
 };
 pub use read::indexed::{IdRanges, IndexedReader};
 pub use read::reader::{ElementReader, PipelinedBlocks};
-pub use blob_index::{BlobBbox, BlobFilter};
+pub use blob_meta::{BlobBbox, BlobFilter};
 pub use error::{BlobError, Error, ErrorKind, Result};
 
 // Module re-exports: short internal paths (`crate::blob`, `crate::block_builder`, etc.)

@@ -10,7 +10,7 @@
 //! parallel using rayon, with a dedicated writer thread that reorders results
 //! back into sequence order. Raw passthrough blobs bypass compression entirely.
 
-use crate::blob_index;
+use crate::blob_meta;
 use crate::write::file_writer::FileWriter;
 use crate::write::metrics::WRITER_METRICS;
 use protohoggr::{encode_bytes_field, encode_int32_field};
@@ -555,9 +555,9 @@ impl<W: Write> PbfWriter<W> {
             let tx = pipeline.tx.clone();
             let permit_tx = pipeline.permit_tx.clone();
             rayon::spawn(move || {
-                let indexdata = blob_index::scan_block_ids(&uncompressed)
+                let indexdata = blob_meta::scan_block_ids(&uncompressed)
                     .map(|idx| idx.serialize());
-                let tagdata = blob_index::scan_block_tags(&uncompressed)
+                let tagdata = blob_meta::scan_block_tags(&uncompressed)
                     .map(|ti| ti.serialize());
                 let result = PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
                     frame_blob_into(
@@ -591,9 +591,9 @@ impl<W: Write> PbfWriter<W> {
             });
             Ok(())
         } else {
-            let indexdata = blob_index::scan_block_ids(block_bytes)
+            let indexdata = blob_meta::scan_block_ids(block_bytes)
                 .map(|idx| idx.serialize());
-            let tagdata = blob_index::scan_block_tags(block_bytes)
+            let tagdata = blob_meta::scan_block_tags(block_bytes)
                 .map(|ti| ti.serialize());
             self.write_framed_blob(
                 "OSMData",
@@ -608,7 +608,7 @@ impl<W: Write> PbfWriter<W> {
     ///
     /// Like [`write_primitive_block`](Self::write_primitive_block) but moves
     /// the `Vec` into the pipeline closure instead of copying, and uses a
-    /// pre-computed [`BlobIndex`](crate::blob_index::BlobIndex) and optional
+    /// pre-computed [`BlobIndex`](crate::blob_meta::BlobIndex) and optional
     /// pre-serialized tagdata from
     /// [`BlockBuilder::take_owned`](crate::block_builder::BlockBuilder::take_owned)
     /// instead of rescanning the serialized bytes.
@@ -616,7 +616,7 @@ impl<W: Write> PbfWriter<W> {
     pub(crate) fn write_primitive_block_owned(
         &mut self,
         block_bytes: Vec<u8>,
-        index: blob_index::BlobIndex,
+        index: blob_meta::BlobIndex,
         tagdata: Option<&[u8]>,
     ) -> io::Result<()> {
         self.write_primitive_block_owned_inner(block_bytes, index, tagdata, None)
@@ -633,7 +633,7 @@ impl<W: Write> PbfWriter<W> {
     pub(crate) fn write_primitive_block_owned_pooled(
         &mut self,
         block_bytes: Vec<u8>,
-        index: blob_index::BlobIndex,
+        index: blob_meta::BlobIndex,
         tagdata: Option<&[u8]>,
         pool: std::sync::Arc<crate::write::buf_pool::BlockBufPool>,
     ) -> io::Result<()> {
@@ -643,7 +643,7 @@ impl<W: Write> PbfWriter<W> {
     fn write_primitive_block_owned_inner(
         &mut self,
         block_bytes: Vec<u8>,
-        index: blob_index::BlobIndex,
+        index: blob_meta::BlobIndex,
         tagdata: Option<&[u8]>,
         pool: Option<std::sync::Arc<crate::write::buf_pool::BlockBufPool>>,
     ) -> io::Result<()> {

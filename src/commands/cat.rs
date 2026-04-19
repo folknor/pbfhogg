@@ -12,7 +12,7 @@ use super::{
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::blob::{decode_blob_to_headerblock, decompress_blob_data_into, BlobKind};
-use crate::blob_index::{scan_block_ids, scan_block_tags};
+use crate::blob_meta::{scan_block_ids, scan_block_tags};
 use crate::file_reader::FileReader;
 use crate::writer::{reframe_raw_with_index, Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
@@ -151,7 +151,7 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
                             }
                         };
                         let tagdata = scan_block_tags(&decompress_buf);
-                        let tagdata_bytes = tagdata.as_ref().map(crate::blob_index::TagIndex::serialize);
+                        let tagdata_bytes = tagdata.as_ref().map(crate::blob_meta::TagIndex::serialize);
                         let reframed = reframe_raw_with_index(
                             blob_bytes,
                             &index.serialize(),

@@ -181,18 +181,18 @@ pub(super) fn build_pass2_schedules(
             continue;
         };
         match idx.kind {
-            crate::blob_index::ElemKind::Node => {
+            crate::blob_meta::ElemKind::Node => {
                 if idx.max_id > max_node_id {
                     max_node_id = idx.max_id;
                 }
                 node_schedule.push((node_seq, data_offset, data_size));
                 node_seq += 1;
             }
-            crate::blob_index::ElemKind::Way => {
+            crate::blob_meta::ElemKind::Way => {
                 way_schedule.push((way_seq, data_offset, data_size));
                 way_seq += 1;
             }
-            crate::blob_index::ElemKind::Relation => {}
+            crate::blob_meta::ElemKind::Relation => {}
         }
     }
 

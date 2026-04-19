@@ -1,7 +1,7 @@
 //! Shared types and small classification helpers used across the inspect
 //! submodules.
 
-use crate::blob_index::ElemKind;
+use crate::blob_meta::ElemKind;
 use crate::Element;
 
 // ---------------------------------------------------------------------------

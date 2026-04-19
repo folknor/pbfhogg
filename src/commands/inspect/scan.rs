@@ -11,7 +11,7 @@ use super::types::{
     BlockKind, HeaderMeta, InspectReport, OrderingSegment, ScanState,
 };
 use crate::blob::{decode_blob_to_headerblock, decompress_blob_data_into, BlobKind};
-use crate::blob_index::ElemKind;
+use crate::blob_meta::ElemKind;
 use crate::file_reader::FileReader;
 
 // ---------------------------------------------------------------------------
@@ -108,7 +108,7 @@ fn try_index_only_scan(
 
 /// Update accumulators from a single blob's index metadata (no decompression).
 fn accumulate_from_index(
-    index: &crate::blob_index::BlobIndex,
+    index: &crate::blob_meta::BlobIndex,
     info: &super::super::BlobHeaderInfo,
     block_number: u32,
     state: &mut ScanState,

@@ -126,7 +126,7 @@ pub(super) fn try_extract_multi_single_pass(
         if let Some(idx) = hdr.index() {
             if !spatial_filter.wants_index(&idx) { continue; }
             match idx.kind {
-                crate::blob_index::ElemKind::Node => {
+                crate::blob_meta::ElemKind::Node => {
                     // Raw passthrough is only sound for bbox regions - polygon
                     // regions can exclude nodes inside the bbox but outside the
                     // polygon boundary or inside holes.
@@ -146,8 +146,8 @@ pub(super) fn try_extract_multi_single_pass(
                     node_blob_info.push(NodeBlobInfo { contained_in, frame_offset, frame_size, count: idx.count });
                     node_schedule.push((seq, data_offset, data_size));
                 }
-                crate::blob_index::ElemKind::Way => way_schedule.push((seq, data_offset, data_size)),
-                crate::blob_index::ElemKind::Relation => relation_schedule.push((seq, data_offset, data_size)),
+                crate::blob_meta::ElemKind::Way => way_schedule.push((seq, data_offset, data_size)),
+                crate::blob_meta::ElemKind::Relation => relation_schedule.push((seq, data_offset, data_size)),
             }
         } else {
             // No indexdata - include in all schedules (conservative).

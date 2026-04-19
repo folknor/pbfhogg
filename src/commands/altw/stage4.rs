@@ -44,7 +44,7 @@ struct BlobDescriptor {
     /// header, which never reach stage 4 in practice (require_indexdata
     /// gates the whole pipeline) but the field stays optional to match
     /// the scanner API.
-    kind: Option<crate::blob_index::ElemKind>,
+    kind: Option<crate::blob_meta::ElemKind>,
     /// Element count from indexdata, used to populate Stats on the
     /// passthrough path (no decode available for a live count).
     count: u64,
@@ -143,13 +143,13 @@ pub(super) fn stage4_assembly(
     for meta in blob_meta {
         // Count blob types for diagnostics.
         match meta.kind {
-            crate::blob_index::ElemKind::Node => s4_node_blobs_total += 1,
-            crate::blob_index::ElemKind::Way => s4_way_blobs += 1,
-            crate::blob_index::ElemKind::Relation => s4_relation_blobs += 1,
+            crate::blob_meta::ElemKind::Node => s4_node_blobs_total += 1,
+            crate::blob_meta::ElemKind::Way => s4_way_blobs += 1,
+            crate::blob_meta::ElemKind::Relation => s4_relation_blobs += 1,
         }
 
         // P1b: skip node blobs with only untagged non-member nodes.
-        if !keep_untagged_nodes && matches!(meta.kind, crate::blob_index::ElemKind::Node) {
+        if !keep_untagged_nodes && matches!(meta.kind, crate::blob_meta::ElemKind::Node) {
             if !meta.has_tagindex {
                 s4_node_blobs_no_tagindex += 1;
             } else if !meta.has_tags {
@@ -171,7 +171,7 @@ pub(super) fn stage4_assembly(
         }
 
         // Way blobs consume sidecar entries for slot_start.
-        let (slot_start, way_blob_idx) = if matches!(meta.kind, crate::blob_index::ElemKind::Way) {
+        let (slot_start, way_blob_idx) = if matches!(meta.kind, crate::blob_meta::ElemKind::Way) {
             if way_sidecar_idx >= way_slot_starts.len() {
                 return Err("ref count sidecar has fewer entries than way blobs in PBF".into());
             }
@@ -183,15 +183,15 @@ pub(super) fn stage4_assembly(
             (0, 0)
         };
 
-        let is_way_blob = matches!(meta.kind, crate::blob_index::ElemKind::Way);
+        let is_way_blob = matches!(meta.kind, crate::blob_meta::ElemKind::Way);
         // Passthrough eligibility mirrors the dense-path rule in
         // write_output_passthrough (add_locations_to_ways.rs):
         //   - Relation blobs: always.
         //   - Node blobs: only when keep_untagged_nodes is set (no
         //     per-element filtering needed; the blob is kept as-is).
         //   - Ways: never (they need coord_payloads splicing).
-        let is_passthrough = matches!(meta.kind, crate::blob_index::ElemKind::Relation)
-            || (matches!(meta.kind, crate::blob_index::ElemKind::Node) && keep_untagged_nodes);
+        let is_passthrough = matches!(meta.kind, crate::blob_meta::ElemKind::Relation)
+            || (matches!(meta.kind, crate::blob_meta::ElemKind::Node) && keep_untagged_nodes);
 
         #[allow(clippy::cast_possible_truncation)]
         let frame_size = (meta.data_offset - meta.frame_offset) as usize + meta.data_size;
@@ -409,8 +409,8 @@ pub(super) fn stage4_assembly(
                                     crate::error::ErrorKind::Io(std::io::Error::other(e))
                                 ))?;
 
-                            let index = crate::blob_index::BlobIndex {
-                                kind: crate::blob_index::ElemKind::Way,
+                            let index = crate::blob_meta::BlobIndex {
+                                kind: crate::blob_meta::ElemKind::Way,
                                 min_id,
                                 max_id,
                                 count: way_count,
@@ -537,7 +537,7 @@ pub(super) fn stage4_assembly(
                 frame_offset: u64,
                 frame_size: usize,
                 count: u64,
-                kind: crate::blob_index::ElemKind,
+                kind: crate::blob_meta::ElemKind,
             },
         }
 
@@ -608,14 +608,14 @@ pub(super) fn stage4_assembly(
                         *s4_passthrough_blobs += 1;
                         total_stats.blobs_passthrough += 1;
                         match kind {
-                            crate::blob_index::ElemKind::Node => {
+                            crate::blob_meta::ElemKind::Node => {
                                 total_stats.nodes_read += count;
                                 total_stats.nodes_written += count;
                             }
-                            crate::blob_index::ElemKind::Relation => {
+                            crate::blob_meta::ElemKind::Relation => {
                                 total_stats.relations_written += count;
                             }
-                            crate::blob_index::ElemKind::Way => {
+                            crate::blob_meta::ElemKind::Way => {
                                 // Ways never pass through (they need
                                 // coord_payloads splicing). Fall through
                                 // without touching stats; unreachable in

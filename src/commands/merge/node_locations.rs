@@ -4,7 +4,7 @@ use std::path::Path;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::blob_index::ElemKind;
+use crate::blob_meta::ElemKind;
 use crate::osc::CompactDiffOverlay;
 
 /// Sparse node coordinate index for maintaining LocationsOnWays through merges.

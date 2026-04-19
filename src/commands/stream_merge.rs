@@ -5,7 +5,7 @@
 //! transparently. [`merge_join_phase`] runs a generic two-pointer merge-join
 //! over two cursors, used by `diff` and `derive_changes`.
 
-use crate::blob_index::ElemKind;
+use crate::blob_meta::ElemKind;
 use crate::{BlockType, Element, PrimitiveBlock};
 
 use super::elements_xml::{OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay};
@@ -505,7 +505,7 @@ pub(crate) enum BlockMergeAction<'a> {
 struct BlockState {
     block: PrimitiveBlock,
     skip_count: usize,
-    index: crate::blob_index::BlobIndex,
+    index: crate::blob_meta::BlobIndex,
 }
 
 /// Undecoded blob with its index - held between blob read and decompress.
@@ -513,7 +513,7 @@ struct BlockState {
 /// and optionally compare compressed bytes before deciding whether to decode.
 struct PendingBlob {
     blob: crate::blob::Blob,
-    index: crate::blob_index::BlobIndex,
+    index: crate::blob_meta::BlobIndex,
 }
 
 /// Read the next OsmData blob matching `kind` without decompressing it.

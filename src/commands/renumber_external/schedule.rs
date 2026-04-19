@@ -21,7 +21,7 @@ pub(super) struct BlobTask {
     /// Source blob's max element ID from indexdata.
     pub(super) max_id: i64,
     /// Source blob's spatial bbox (node blobs only).
-    pub(super) bbox: Option<crate::blob_index::BlobBbox>,
+    pub(super) bbox: Option<crate::blob_meta::BlobBbox>,
 }
 
 /// Header-only scan building a per-kind schedule with element counts.
@@ -60,9 +60,9 @@ pub(super) fn build_all_blob_schedules(
             );
         };
         let (sched, seq) = match idx.kind {
-            crate::blob_index::ElemKind::Node => (&mut nodes, &mut node_seq),
-            crate::blob_index::ElemKind::Way => (&mut ways, &mut way_seq),
-            crate::blob_index::ElemKind::Relation => (&mut relations, &mut rel_seq),
+            crate::blob_meta::ElemKind::Node => (&mut nodes, &mut node_seq),
+            crate::blob_meta::ElemKind::Way => (&mut ways, &mut way_seq),
+            crate::blob_meta::ElemKind::Relation => (&mut relations, &mut rel_seq),
         };
         sched.push(BlobTask {
             seq: *seq,

@@ -36,7 +36,7 @@ use std::io::Read;
 use std::path::Path;
 
 use crate::blob::{parse_blob_header_with_index, BlobKind};
-use crate::blob_index::BlobIndex;
+use crate::blob_meta::BlobIndex;
 use crate::block_builder::{BlockBuilder, HeaderBuilder, Metadata, OwnedBlock, RawMetadata};
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
@@ -433,7 +433,7 @@ pub(crate) type ScheduleEntry = (usize, u64, usize);
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn build_classify_schedule(
     input: &std::path::Path,
-    kind_filter: Option<crate::blob_index::ElemKind>,
+    kind_filter: Option<crate::blob_meta::ElemKind>,
 ) -> Result<(Vec<ScheduleEntry>, std::sync::Arc<std::fs::File>)> {
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
     let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
@@ -506,13 +506,13 @@ pub(crate) fn build_classify_schedules_split(
         let (hdr, _frame_offset, data_offset, data_size) = result_item?;
         if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
         match hdr.index().map(|i| i.kind) {
-            Some(crate::blob_index::ElemKind::Node) => {
+            Some(crate::blob_meta::ElemKind::Node) => {
                 nodes.push((nodes.len(), data_offset, data_size));
             }
-            Some(crate::blob_index::ElemKind::Way) => {
+            Some(crate::blob_meta::ElemKind::Way) => {
                 ways.push((ways.len(), data_offset, data_size));
             }
-            Some(crate::blob_index::ElemKind::Relation) => {
+            Some(crate::blob_meta::ElemKind::Relation) => {
                 rels.push((rels.len(), data_offset, data_size));
             }
             None => {

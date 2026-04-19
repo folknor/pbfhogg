@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use super::super::Result;
-use crate::blob_index::ElemKind;
+use crate::blob_meta::ElemKind;
 use crate::Element;
 
 /// Element type filter for `show_element`.

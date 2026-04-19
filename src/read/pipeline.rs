@@ -5,7 +5,7 @@
 
 use super::blob::{BlobReader, BlobType, DecompressPool};
 use super::block::PrimitiveBlock;
-use crate::blob_index::BlobFilter;
+use crate::blob_meta::BlobFilter;
 use crate::error::Result;
 use crate::reorder_buffer::ReorderBuffer;
 use std::cell::RefCell;

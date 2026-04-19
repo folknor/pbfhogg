@@ -194,7 +194,7 @@ pub fn node_stats(path: &Path, direct_io: bool, force: bool) -> Result<NodeStats
         let blob = blob_result?;
         if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
         if let Some(idx) = blob.index() {
-            if !matches!(idx.kind, crate::blob_index::ElemKind::Node) { continue; }
+            if !matches!(idx.kind, crate::blob_meta::ElemKind::Node) { continue; }
         }
         blob.decompress_into(&mut decompress_buf)?;
         let block = crate::block::PrimitiveBlock::from_vec_with_scratch(

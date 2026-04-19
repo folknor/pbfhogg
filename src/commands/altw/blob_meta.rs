@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use crate::blob_index::ElemKind;
+use crate::blob_meta::ElemKind;
 
 use super::super::Result;
 

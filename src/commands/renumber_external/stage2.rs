@@ -209,8 +209,8 @@ fn stage2d_worker(
             counters.reframe_ms.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
 
             // Build the OwnedBlock from the reframed bytes.
-            let index = crate::blob_index::BlobIndex {
-                kind: crate::blob_index::ElemKind::Way,
+            let index = crate::blob_meta::BlobIndex {
+                kind: crate::blob_meta::ElemKind::Way,
                 min_id: base_way_id,
                 #[allow(clippy::cast_possible_wrap)]
                 max_id: base_way_id + blob_way_count as i64 - 1,

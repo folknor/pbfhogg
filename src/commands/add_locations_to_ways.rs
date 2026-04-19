@@ -11,7 +11,7 @@ use crate::blob::{
     decode_blob_to_headerblock, decompress_blob, parse_blob_header_with_index,
     parse_primitive_block_from_bytes_owned, BlobKind, DecompressPool, WireBlob,
 };
-use crate::blob_index::{BlobIndex, ElemKind};
+use crate::blob_meta::{BlobIndex, ElemKind};
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_reader::FileReader;
 use crate::writer::{Compression, PbfWriter};
@@ -408,7 +408,7 @@ fn build_node_index_sparse(
             continue;
         }
         if let Some(idx) = blob.index() {
-            if !matches!(idx.kind, crate::blob_index::ElemKind::Node) {
+            if !matches!(idx.kind, crate::blob_meta::ElemKind::Node) {
                 continue;
             }
         }
@@ -892,7 +892,7 @@ fn build_node_index_dense(
         }
         // Skip non-node blobs using indexdata.
         if let Some(idx) = blob.index() {
-            if !matches!(idx.kind, crate::blob_index::ElemKind::Node) {
+            if !matches!(idx.kind, crate::blob_meta::ElemKind::Node) {
                 continue;
             }
         }
@@ -936,7 +936,7 @@ fn collect_way_referenced_node_ids(input: &Path, direct_io: bool) -> Result<IdSe
         let blob = blob_result?;
         if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
         if let Some(idx) = blob.index() {
-            if !matches!(idx.kind, crate::blob_index::ElemKind::Way) { continue; }
+            if !matches!(idx.kind, crate::blob_meta::ElemKind::Way) { continue; }
         }
         blob.decompress_into(&mut decompress_buf)?;
         super::way_scanner::scan_way_refs(&decompress_buf, &mut refs_buf, &mut group_starts, |_way_id, refs| {
@@ -968,7 +968,7 @@ pub(crate) fn collect_relation_member_node_ids(input: &Path, direct_io: bool) ->
         let blob = blob_result?;
         if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
         if let Some(idx) = blob.index() {
-            if !matches!(idx.kind, crate::blob_index::ElemKind::Relation) { continue; }
+            if !matches!(idx.kind, crate::blob_meta::ElemKind::Relation) { continue; }
         }
         blob.decompress_into(&mut decompress_buf)?;
         let block = crate::block::PrimitiveBlock::from_vec_with_scratch(

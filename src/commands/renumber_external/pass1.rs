@@ -188,8 +188,8 @@ fn pass1_worker(
             #[allow(clippy::cast_possible_truncation)]
             counters.reframe_ms.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
 
-            let index = crate::blob_index::BlobIndex {
-                kind: crate::blob_index::ElemKind::Node,
+            let index = crate::blob_meta::BlobIndex {
+                kind: crate::blob_meta::ElemKind::Node,
                 min_id: base_new_id,
                 #[allow(clippy::cast_possible_wrap)]
                 max_id: base_new_id + blob_node_count as i64 - 1,

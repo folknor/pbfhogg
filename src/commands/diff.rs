@@ -22,7 +22,7 @@ use super::stream_merge::{
     MergeJoinAction, MergeJoinElement, StreamingBlocks,
 };
 use super::{Result, TypeFilter};
-use crate::blob_index::ElemKind;
+use crate::blob_meta::ElemKind;
 use crate::{Element, MemberType};
 
 // ---------------------------------------------------------------------------

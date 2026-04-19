@@ -76,7 +76,7 @@ pub(super) struct BlobDesc {
     pub(super) frame_size: usize,
     pub(super) offset: u64,
     pub(super) size: usize,
-    pub(super) kind: Option<crate::blob_index::ElemKind>,
+    pub(super) kind: Option<crate::blob_meta::ElemKind>,
     /// Spatial bbox from indexdata (node blobs only, v2 format).
     pub(super) bbox: Option<crate::BlobBbox>,
     /// Element count from indexdata (for stats on raw passthrough blobs).
@@ -116,7 +116,7 @@ pub(super) fn build_blob_schedule_with_passthrough(
         // Tag node blobs for raw passthrough if fully contained in extract bbox.
         let raw_passthrough = extract_bbox.is_some_and(|ebbox| {
             idx.as_ref().is_some_and(|i|
-                matches!(i.kind, crate::blob_index::ElemKind::Node)
+                matches!(i.kind, crate::blob_meta::ElemKind::Node)
                 && i.bbox.as_ref().is_some_and(|bb| ebbox.contains(bb))
             )
         });

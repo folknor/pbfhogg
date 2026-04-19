@@ -1,6 +1,6 @@
 //! Diff ID ranges for fast overlap checking and per-type upsert cursor tracking.
 
-use crate::blob_index::ElemKind;
+use crate::blob_meta::ElemKind;
 use crate::osc::CompactDiffOverlay;
 
 /// Pre-computed sorted ID vectors from the diff, for fast overlap checks.

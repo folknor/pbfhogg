@@ -5,7 +5,7 @@ use super::block::{HeaderBlock, PrimitiveBlock};
 use super::elements::Element;
 use super::file_reader::FileReader;
 use super::pipeline::PipelineConfig;
-use crate::blob_index::BlobFilter;
+use crate::blob_meta::BlobFilter;
 use crate::error::{new_error, ErrorKind, Result};
 use rayon::prelude::*;
 use std::io::Read;

@@ -3,7 +3,7 @@
 use bytes::Bytes;
 
 use crate::blob::{decompress_blob_data_into, parse_primitive_block_from_bytes_owned};
-use crate::blob_index::{self, BlobIndex, ElemKind};
+use crate::blob_meta::{self, BlobIndex, ElemKind};
 use crate::{Element, PrimitiveBlock};
 
 use super::diff_ranges::DiffRanges;
@@ -166,7 +166,7 @@ pub(super) fn classify_only(
     // hits at planet. Skip the call entirely.
     let scan = if frame.index.is_none() {
         let t_scan = std::time::Instant::now();
-        let scan = blob_index::scan_block_ids(buf);
+        let scan = blob_meta::scan_block_ids(buf);
         counters.scan_ns.fetch_add(
             u64::try_from(t_scan.elapsed().as_nanos()).unwrap_or(u64::MAX),
             Ordering::Relaxed,

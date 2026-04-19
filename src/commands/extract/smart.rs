@@ -243,14 +243,14 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         });
         if let Some(idx) = idx {
             // Build full_way_schedule unconditionally for way blobs.
-            if matches!(idx.kind, crate::blob_index::ElemKind::Way) {
+            if matches!(idx.kind, crate::blob_meta::ElemKind::Way) {
                 full_way_schedule.push((seq, data_offset, data_size));
             }
             if !filter.wants_index(&idx) { continue; }
             match idx.kind {
-                crate::blob_index::ElemKind::Node => node_schedule.push((seq, data_offset, data_size)),
-                crate::blob_index::ElemKind::Way => way_schedule.push((seq, data_offset, data_size)),
-                crate::blob_index::ElemKind::Relation => relation_schedule.push((seq, data_offset, data_size)),
+                crate::blob_meta::ElemKind::Node => node_schedule.push((seq, data_offset, data_size)),
+                crate::blob_meta::ElemKind::Way => way_schedule.push((seq, data_offset, data_size)),
+                crate::blob_meta::ElemKind::Relation => relation_schedule.push((seq, data_offset, data_size)),
             }
         }
         seq += 1;
@@ -429,7 +429,7 @@ pub(super) fn extract_smart(
     crate::debug::emit_marker("SMART_PASS2_SCHEDULE_START");
     let pass1_way_schedule = std::mem::take(&mut result.way_schedule);
     let (way_schedule, shared_file) = if pass1_way_schedule.is_empty() {
-        super::super::build_classify_schedule(input, Some(crate::blob_index::ElemKind::Way))?
+        super::super::build_classify_schedule(input, Some(crate::blob_meta::ElemKind::Way))?
     } else {
         let shared_file = std::sync::Arc::new(
             std::fs::File::open(input)

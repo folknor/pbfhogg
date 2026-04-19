@@ -33,25 +33,27 @@ Built with LLMs. See [LLM.md](LLM.md).
 
 ## Planet scale
 
-Every command runs on the full planet on normal hardware. Measured on **plantasjen** (AMD Ryzen 9 5900X, 32 GB DDR4, NVMe SSD), ~28 GB available. Input: 87 GB indexed planet PBF, 11.6B elements.
+Every command listed below runs on the full planet on normal hardware. Measured on an AMD Ryzen 9 5900X, 32 GB DDR4 RAM, NVMe SSD, with ~28 GB available RAM. Input: 87 GB indexed planet PBF, 11.6B elements.
 
 | Command | Wall | Peak anon RSS | Notes |
 |---------|------|---------------|-------|
-| `cat --type way` (raw passthrough) | 45s | **10 MB** | zero decompression, indexdata blob filter |
+| `cat --type way` (raw passthrough) | 45s | 10 MB | zero decompression, indexdata blob filter |
 | `getid` | 44s | 833 MB | multi-blob ID resolution via indexdata |
 | `tags-filter -R highway=primary` | 52s | 688 MB | single-pass (`--omit-referenced`), parallel classify |
-| `check --ids --full` | **1m10s** | **2.22 GB** | monotonicity + type-order + per-type duplicate detection over 11.6B elements |
-| `check --refs` | **1m10s** | **2.17 GB** | referential integrity over 11.6B elements |
-| `cat` (indexdata generation) | **1m26s** | ~200 MB | rewrites BlobHeader without re-compressing |
+| `check --ids --full` | 1m10s | 2.22 GB | monotonicity + type-order + per-type duplicate detection over 11.6B elements |
+| `check --refs` | 1m10s | 2.17 GB | referential integrity over 11.6B elements |
+| `cat` (indexdata generation) | 1m26s | ~200 MB | rewrites BlobHeader without re-compressing |
 | `getid --invert` | 1m31s | 102 MB | raw-frame passthrough for non-intersecting blobs |
-| `renumber` | 3m25s | **3.3 GB** | wire-format rewriters, shared atomic IdSet |
+| `renumber` | 3m25s | 3.3 GB | wire-format rewriters, shared atomic IdSet |
 | `extract --smart` (Europe bbox) | 4m28s | 11.17 GB | three-pass, multipolygon-complete |
 | `add-locations-to-ways --index-type external` | 11m01s | 17.2 GB | rank-bucketed counting sort → per-blob delta-varint coord payloads, ~246 GB temp disk |
 | `apply-changes` (daily diff, zlib) | 12m36s | ~1.8 GB | 3.4M-change daily diff, 86% rewrite |
-| `build-geocode-index` | **7m12s** | ~25 GB | reverse geocoding index, S2 cells (pass-3 stage-B transient peak) |
-| `diff --format osc` (two independent 47-day-apart planets) | 37m06s | **55 MB** | streaming merge-join, full decode both sides, produces OSC changeset |
+| `build-geocode-index` | 7m12s | ~25 GB | reverse geocoding index, S2 cells (pass-3 stage-B transient peak) |
+| `diff --format osc` (two independent 47-day-apart planets) | 37m06s | 55 MB | streaming merge-join, full decode both sides, produces OSC changeset |
 
 Per-command phase breakdowns and optimization history are in [reference/performance.md](reference/performance.md). Note that recorded results always track the latest git head and may not match the released version.
+
+The goal for pbfhogg 1.0 is that every CLI command must be planet-scale safe on a 32GB RAM host (28-ish free GB.)
 
 ## Usage
 

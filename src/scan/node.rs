@@ -13,10 +13,13 @@
 //! # Known limitations
 //!
 //! - **DenseNodes only.** Only parses PrimitiveGroup field 2 (DenseNodes). Non-dense
-//!   Node messages (field 1) are silently skipped. All modern PBF writers (osmium,
-//!   pbfhogg, Planetiler, osm2pgsql) use dense encoding exclusively. Pre-2012 PBFs
-//!   or hand-crafted test files may use non-dense nodes - those would produce missing
-//!   coordinates without error.
+//!   Node messages (field 1) cause a wire-format error rather than silent data loss:
+//!   all modern PBF writers (osmium, pbfhogg, Planetiler, osm2pgsql) use dense
+//!   encoding exclusively, so hitting field 1 indicates either a pre-2012 archival
+//!   file or a hand-crafted producer - cases better surfaced as loud failures than
+//!   silently incomplete coordinate tables. Full non-dense support would add a
+//!   parallel code path for a case not seen in practice; error out instead and let
+//!   the caller decide.
 //!
 //! - **Sorted PBF assumption.** The indexdata-based blob skip (`ElemKind::Node` check)
 //!   relies on each blob containing exactly one element type, which is guaranteed by
@@ -41,7 +44,7 @@ pub(crate) struct NodeTuple {
 /// The caller owns the Vec and can clear+reuse it across blocks.
 ///
 /// Only parses DenseNodes (field 2 in PrimitiveGroup). Non-dense Node messages
-/// (field 1) are skipped - all modern PBFs use dense encoding exclusively.
+/// (PrimitiveGroup field 1) produce a wire-format error - see the module doc.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 pub(crate) fn extract_node_tuples(
     decompressed: &[u8],
@@ -77,11 +80,24 @@ pub(crate) fn extract_node_tuples(
         let mut gcursor = Cursor::new(group_data);
         let mut dense_data: Option<&[u8]> = None;
         while let Some((field, wire_type)) = gcursor.read_tag()? {
-            if field == 2 && wire_type == WIRE_LEN {
-                dense_data = Some(gcursor.read_len_delimited()?);
-                break;
+            match (field, wire_type) {
+                (1, WIRE_LEN) => {
+                    // PrimitiveGroup field 1 is non-dense Node messages. This
+                    // scanner only reads DenseNodes (field 2). Silently
+                    // skipping would yield incomplete bbox_node_ids and
+                    // downstream incorrect extract output. Error instead;
+                    // see the module doc.
+                    return Err(crate::error::new_wire_error(
+                        "PrimitiveGroup contains non-dense Node messages (field 1); \
+                         scan::node only supports DenseNodes (field 2)",
+                    ));
+                }
+                (2, WIRE_LEN) => {
+                    dense_data = Some(gcursor.read_len_delimited()?);
+                    break;
+                }
+                _ => { gcursor.skip_field(wire_type)?; }
             }
-            gcursor.skip_field(wire_type)?;
         }
 
         let Some(dd) = dense_data else { continue };

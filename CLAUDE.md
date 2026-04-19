@@ -5,7 +5,8 @@ Rust library and CLI tool for reading and writing OpenStreetMap PBF files.
 ## Rules
 
 ### General rules
-Dont use gremlins! Em-dash, en-dash, strange quotes, whatever - they're all verboten!
+- Dont use gremlins! Em-dash, en-dash, strange quotes, whatever - they're all verboten!
+- Dont remind the user of CLAUDE.md rules. They wrote them, so they know them.
 
 ### Memory rules
 Do not use your Memory functionality. Update CLAUDE.md instead. This project is developed across several hosts and several users. Memories do not transfer across hosts or users. CLAUDE.md does.

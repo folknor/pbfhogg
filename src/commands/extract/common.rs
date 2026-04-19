@@ -172,6 +172,13 @@ where
     // Shared file for pread. Uses buffered (non-O_DIRECT) I/O because O_DIRECT
     // requires aligned buffers for pread, which we don't have - our read buffers
     // are plain Vec<u8> without alignment guarantees.
+    //
+    // wontfix(fd-per-call): simple extract calls `pread_execute` three times
+    // (nodes, ways, relations) and each call opens a fresh fd. The cost is
+    // 1-5 us per open, 3-15 us total per run - invisible against the ~tens of
+    // seconds of pread+decode work. Hoisting to the caller is possible but
+    // buys nothing measurable; the local-scope Arc keeps the API simple.
+    // See TODO.md history 2026-04-19 for the investigation.
     let shared_file = std::sync::Arc::new(
         std::fs::File::open(input)
             .map_err(|e| format!("failed to open {}: {e}", input.display()))?

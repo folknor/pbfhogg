@@ -12,64 +12,9 @@ Four planet-scale command plans are in notes, each with a ranked set of opportun
 
 - [ ] **[notes/apply-changes-opportunities.md](notes/apply-changes-opportunities.md)** - `apply-changes --locations-on-ways`. Current: **762 s / 1.8 GB RSS** at planet under production `--compression none`. Target: **~9-10 min / same RSS**. Already mostly well-shaped; two incremental parallelizations remaining - `NodeLocationIndex::prefill_from_base` and the sequential reader thread. No reshape needed.
 
+- [ ] **[notes/getid-include-optimization.md](notes/getid-include-optimization.md)** - `getid` include mode. Current: **43.7 s** at planet (UUID `5a44889d`, commit `aee7727`). Target: **<1 s** via pread-only header walk with `posix_fadvise(RANDOM)`. Blocker: the naive `BlobReader` swap doesn't work because the path is 100 % kernel-I/O-bound (88 GB sequential read, user CPU ≈ 0); a new pread-only header-walk primitive is required. Secondary finding: 32.5 s → 43.7 s regression between commits `8ffee59` (2026-03-29) and `aee7727` (2026-04-18) - bisect before landing.
+
 Measurement-first on every one: turn on `#[cfg(feature = "hotpath")]` counters (or add unconditional `*_ms` counters) to ground-truth the inferred per-phase breakdowns before committing to the order of landing items within a plan.
-
-## Split oversized source files (blocker for upcoming optimization work)
-
-Rank-ordered by urgency (measured in total lines and proximity to
-active optimization plans). Refreshed 2026-04-19 after the source-tree
-restructure:
-
-| Lines | File | Active plan proximity |
-|------:|------|------|
-| 2525 | `cli/src/main.rs` | - |
-| 1231 | `src/commands/extract/mod.rs` | - |
-| 1146 | `src/commands/tags_filter/mod.rs` | - |
-| 1146 | `src/commands/altw/external/stage4.rs` | ALTW external (active plan proximity) |
-| 1084 | `src/geocode_index/reader.rs` | - |
-| 1027 | `src/write/block_builder.rs` | write-path work (Milestone 2) |
-
-Done:
-- `src/blob_meta.rs` (1225 -> 499 lines mod.rs, 2 commits, 2026-04-19)
-  split into scan_ids.rs, tag_index.rs. Each submodule owns its scanner
-  plus the type it produces (`BlobIndex` via scan_block_ids, `TagIndex`
-  via scan_block_tags); mod.rs keeps the shared types (`BlobBbox`,
-  `BlobIndex`, `ElemKind`) and the `BlobFilter` that composes them.
-- `src/write/writer.rs` (1000 -> 680 lines, 2 commits, 2026-04-19)
-  split into copy_range.rs (`copy_file_range` + pread fallback) and
-  pipeline.rs (ordered channel plumbing: `OutputChunk`, `FramedBlobParts`,
-  `PipelineItem`, `OutputSink`, `FileOutputSink`, `WritePipeline`,
-  permit pool, `writer_thread`). writer.rs now focuses on the `PbfWriter`
-  struct and its write API.
-
-Priority ordering for the split work (don't try to batch the whole list
-at once - each split is a separate review surface):
-
-- One file per commit. Don't bundle multiple splits.
-- No behavior changes in a split commit - pure move + module wiring.
-- Preserve `#[cfg_attr(feature = "hotpath", hotpath::measure)]` / marker
-  / counter coverage verbatim. Cross-cutting audits assume the functions
-  are findable by name.
-- Run `brokkr check` after each move to catch errors. Intermediate commits
-  in a multi-split series may carry `unused_imports` warnings from
-  progressively-prunable imports - don't burn round-trips cleaning those
-  up between splits. Tighten to fully clean clippy on the final commit
-  of the series.
-- Update `notes/` cross-references if line numbers change substantially.
-
-### Follow-ups surfaced by the split work
-
-- [x] ~~**Encapsulate `CompactDiffOverlay` mutation.**~~ Landed
-  2026-04-19. Added seven `pub(super)` mutator methods (`push_node`,
-  `push_way`, `push_relation`, `delete_node`, `delete_way`,
-  `delete_relation`, `intern`) on `CompactDiffOverlay` and demoted the
-  six former `pub(super)` fields (`node_arena`, `way_arena`,
-  `relation_arena`, the three `_index` maps, and `interner`) back to
-  private. Each mutator bundles the load-bearing pairing (arena write
-  + index insert, delete-set insert + index remove) so the XML state
-  machine can't accidentally break the invariant. The `deleted_*`
-  HashSets stay `pub` because they were already part of the public
-  API and are read from outside the module.
 
 ## Important: ignored tests
 
@@ -90,32 +35,6 @@ verifies the debug monotonicity assertion fires on unsorted nodes when `Sort.Typ
 is declared. Requires `debug_assertions` to be enabled in the test profile. Nightly 1.95
 (2026-02-25) has a regression where `debug_assertions` is off in test builds.
 
-## Open issues
-
-- [x] ~~**Finish the two planet rows still pending from 2026-04-18**~~ -
-  both re-benched at `ef6ce09` via `overnight.sh` round 2 (2026-04-18).
-  `check --ids --full`: **69.5 s / 1m10s** (UUID `c498fff0`),
-  down from the tainted 1m33s row - untainted, carries both the
-  `ca6711e` short-circuit and `aa3147c` seek-raw fixes.
-  `apply-changes --osc-seq 4920`: **756.3 s / 12m36s**
-  (UUID `8e940f71`), no meaningful drift vs the prior 753 s
-  buffered+zlib row. `build-geocode-index` was cleared separately
-  via the optimisation arc (432.9 s, commit `82db8ed`, UUID
-  `b4b25c05`) and never needed re-bench in this round.
-- [x] ~~**Add a planet `diff --format osc` row (two-independent-snapshots scenario) to `reference/performance.md`.**~~
-  Added 2026-04-18 as a new `## Diff between independent snapshots`
-  section: planet 47-day snapshot pair (UUIDs `42aedca1` default,
-  `53900d5f` --format osc), both at commit `7e9c2e9`, ~2150-2225 s /
-  35-37 min, tainted by the has_indexdata regression window. The prior
-  TODO cited "Denmark 73.1s at reference/performance.md:352" and a
-  "6245s / 104m planet" number - both incorrect. The 73.1 s row is in
-  the Japan CLI commands table (line 597), and the 6245 s planet
-  number doesn't match anything in results.db (nearest runs are the
-  ~2150-2225 s pair noted above). The pbfhogg CLI is `diff` (single
-  command); brokkr wraps it as either `brokkr diff` (apply-changes
-  fast-path) or `brokkr diff-snapshots` (full decode both sides) to
-  distinguish the two input shapes.
-
 ## Next up (2026-04-13)
 
 - [ ] **diff v3: non-overlapping block skip** - use indexdata min/max
@@ -135,22 +54,6 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   library consumers can subscribe. Full rollout (call-site shape,
   coverage sweep, brokkr `--probes`, backend migration) in
   [`notes/instrumentation-layering.md`](notes/instrumentation-layering.md).
-
-- [x] ~~**Audit callers for `IdSet::set_if_new` / `set_atomic_if_new` uplift**~~ -
-  Audited 2026-04-19 across the five candidates in the original entry
-  (`check_refs` missing-ref vecs, `merge_pbf`/`apply-changes` dedupe,
-  `extract` multi-region ID collection, `renumber_external` scan,
-  `tags_filter` two-pass node-ref collection). Only **`tags_filter`**
-  was a clean swap: a local `set_if_absent` helper was literally
-  `get()` + early-return + `set()`, with four call sites. Inlined to
-  `set_if_new` and deleted the helper. The other four sites don't
-  apply: `check_refs` reports both occurrence (pre-dedup vec length)
-  and unique counts and also carries structured `MissingRef { source,
-  id }` for `show_ids` mode, so it can't migrate to IdSet without
-  losing observable data; `apply-changes` uses `FxHashSet` on
-  different data; `extract` multi-region refs are already mostly
-  deduped by PBF structure; no `get`+`set` pair was found in
-  `renumber` pass1.
 
 - [ ] **Rayon alternatives for slice-based parallelism** - Wild linker discussion
   ([davidlattimore/wild#1072](https://github.com/davidlattimore/wild/discussions/1072)) surveys
@@ -272,16 +175,6 @@ knob is pure wall/interop trade-off, not a size trade-off.
   is the comment block in the pass-2 worker in
   `src/commands/tags_filter.rs`.
 
-- [ ] **`pread_execute` opens a new `Arc<File>` per call** - simple extract
-  calls it 3 times for the same input file. Could share the file handle
-  across phases. Minor (~1µs per open). Flagged by 1/10 reviewers.
-
-- [ ] **Simple extract phase 3 relation classify is sequential** - "needs
-  full PrimitiveBlock (member access)" comment at `extract.rs` ~line 1472.
-  Could use `parallel_classify_phase` like complete/smart phase 3.
-  Relations are ~2K blobs at Europe - small gain but inconsistent with
-  other strategies. Flagged by 1/10 reviewers.
-
 - [ ] **No `fadvise(DONTNEED)` after pread in `parallel_classify_phase`** -
   external join's stage 2 workers call fadvise per pread, classify
   workers don't. At Europe scale (~2 GB compressed) this is fine. At
@@ -289,20 +182,8 @@ knob is pure wall/interop trade-off, not a size trade-off.
   current planet-scale paths don't use `parallel_classify_phase` for
   heavy scans. Flagged by 1/10 reviewers.
 
-- [ ] **Simple extract node scanner skips non-dense Node messages** -
-  `src/scan/node.rs` only parses DenseNodes. On legacy
-  PBFs with field-1 Node messages, `bbox_node_ids` would be incomplete,
-  cascading into missing ways and relations. Not reachable in practice
-  (all modern PBFs use DenseNodes). Flagged by 1/10 reviewers.
-
 ### Smaller items
 
-- [ ] **getid include: pread skip for non-matching blobs** - the include
-  path now skips decompression via ID-range filtering (planet 71.5s →
-  32.5s), but still sequentially reads the entire file to check each
-  blob's header. A header-only scan + pread of only matching blobs
-  would reduce planet from 32.5s to under 1s (only 3-9 blobs need
-  reading). Low priority - 32.5s is already fast for planet-scale.
 - [ ] `tags_count.rs` parallel path - `parallel_classify_phase` with
   per-worker CountMap accumulation. Tag counting is order-independent,
   so the merge is straightforward. Would restore parallel decode for
@@ -341,13 +222,6 @@ input or --clean. Verified via `brokkr verify multi-extract`.
 See [notes/multi-extract-optimization.md](notes/multi-extract-optimization.md)
 for full analysis of 6 optimization opportunities.
 
-- [x] **Parallel decode** - write phases converted from sequential
-  BlobReader to pread-from-workers via `multi_extract_pread_write`.
-  Workers decode blobs in parallel, classify against N regions, produce
-  N × Vec<OwnedBlock>. Consumer routes to N sync-mode writers via
-  ReorderBuffer. Denmark 5-region: 6.7s → 2.0s (3.4x). Japan 5-region:
-  32.5s → 8.1s (4.0x). Single-pass now 2.7x faster than 5 sequential
-  extracts at Japan scale (8.1s vs 22s).
 - [ ] **Spatial index** - grid or R-tree over regions for O(1)
   per-element lookup instead of O(N). Required for 200+ regions where
   linear scan becomes the bottleneck. Simple grid (3600×1800 cells of
@@ -497,11 +371,6 @@ Milestone A, SIMD as Milestone B, huge pages and NUMA as Milestone C.
 
 `parse_and_inline` scratch is done (829 MB → 48 MB, -94%). The following
 per-iteration allocations remain across the codebase, ordered by impact:
-
-- [x] **`scan_block_ids` / `scan_block_tags` groups Vec** - NOT FEASIBLE.
-  `Vec<&[u8]>` borrows from function parameter `raw: &[u8]`, lifetime
-  changes each call. Cannot pass scratch from outer scope. Typically
-  1-3 entries - negligible allocation.
 
 - [ ] **Geocode pass 3 stage A par_iter** - per-way `Vec::new()` inside
   `flat_map_iter` closure (`builder.rs` ~line 1226). Hard to fix due to

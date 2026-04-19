@@ -24,8 +24,6 @@ restructure:
 |------:|------|------|
 | 2525 | `cli/src/main.rs` | - |
 | 1712 | `src/write/block_builder.rs` | write-path work (Milestone 2) |
-| 1686 | `src/commands/altw/mod.rs` | ALTW external (active plan proximity) |
-| 1648 | `src/commands/apply_changes/rewrite.rs` | apply-changes (active plan proximity) |
 | 1506 | `src/osc/parse.rs` | - |
 | 1449 | `src/read/blob.rs` | - |
 | 1356 | `src/write/writer.rs` | write-path work |
@@ -34,6 +32,12 @@ restructure:
 | 1146 | `src/commands/tags_filter/mod.rs` | - |
 | 1146 | `src/commands/altw/external/stage4.rs` | ALTW external (active plan proximity) |
 | 1084 | `src/geocode_index/reader.rs` | - |
+
+Done:
+- `src/commands/apply_changes/rewrite.rs` (1648 -> 859 lines, 4 commits, 2026-04-19)
+  split into element_writes.rs, parallel_reader.rs, rewrite_block.rs, stream_output.rs.
+- `src/commands/altw/mod.rs` (1686 -> 707 lines, 3 commits, 2026-04-19)
+  split into dense.rs, sparse.rs, passthrough.rs.
 
 Priority ordering for the split work (don't try to batch the whole list
 at once - each split is a separate review surface):

@@ -15,20 +15,20 @@ use crate::block::PrimitiveBlock;
 use crate::blob_meta::ElemKind;
 use crate::elements::{Element, MemberId};
 
-use super::super::id_set_dense::IdSetDense;
+use crate::idset::IdSet;
 use super::super::Result;
 use super::blob_meta::BlobMeta;
 
 pub(super) fn collect_relation_member_node_ids_indexed(
     input: &Path,
     blob_meta: &[BlobMeta],
-) -> Result<IdSetDense> {
+) -> Result<IdSet> {
     let file = Arc::new(
         std::fs::File::open(input)
             .map_err(|e| format!("open pbf for relation scan: {e}"))?,
     );
 
-    let mut ids = IdSetDense::new();
+    let mut ids = IdSet::new();
     let mut read_buf: Vec<u8> = Vec::new();
     let mut decompress_buf: Vec<u8> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use super::super::external_radix::{ScratchDir, NUM_BUCKETS};
 #[cfg(feature = "linux-direct-io")]
 use super::super::external_radix::advise_dontneed_file;
-use super::super::id_set_dense::IdSetDense;
+use crate::idset::IdSet;
 use super::super::node_scanner::{extract_node_tuples, NodeTuple};
 use super::super::Result;
 use super::{
@@ -221,7 +221,7 @@ pub(super) fn stage2_node_join(
     total_slots: u64,
     unique_nodes: u64,
     input_pbf: &Arc<std::fs::File>,
-    node_id_set: &IdSetDense,
+    node_id_set: &IdSet,
     node_blob_mapping: &[NodeBlobInfo],
 ) -> Result<u64> {
     let rank_range_size = unique_nodes.div_ceil(NUM_BUCKETS as u64);

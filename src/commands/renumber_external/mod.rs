@@ -2,28 +2,28 @@
 //!
 //! The in-memory `renumber` module allocates three `FxHashMap<i64, i64>`
 //! tables whose combined size on planet is ~278 GB, which OOM-kills any
-//! host under ~300 GB RAM. This module uses `IdSetDense` bitsets with
+//! host under ~300 GB RAM. This module uses `IdSet` bitsets with
 //! rank-based O(1) lookup for all three element types - no hash maps,
 //! no temp files, no mmaps.
 //!
 //! ## Architecture
 //!
 //! - **Pass 1**: parallel wire-format node rewriter (4 work-stealing
-//!   workers). Each worker builds a per-shard `IdSetDense`; shards are
+//!   workers). Each worker builds a per-shard `IdSet`; shards are
 //!   merged after pass 1 and a rank index built for O(1) new-id lookup.
 //! - **Stage 2d**: parallel wire-format way splice rewriter (6
 //!   work-stealing workers). Resolves way refs inline via
 //!   `node_id_set.rank()` during the splice - no intermediate files.
-//!   Per-worker `IdSetDense` for `way_id_set`, merged after stage 2d.
+//!   Per-worker `IdSet` for `way_id_set`, merged after stage 2d.
 //! - **R1**: sequential relation scan to collect all relation IDs into
-//!   a third `IdSetDense` bitset + rank index.
+//!   a third `IdSet` bitset + rank index.
 //! - **R2d**: parallel wire-format splice rewriter for relations.
 //!   Resolves node/way/relation member refs inline via `resolve()`.
 //!
 //! ## Orphan references
 //!
 //! Way refs and relation members whose old ID is not present in the
-//! corresponding `IdSetDense` (i.e. not seen in the input) pass through
+//! corresponding `IdSet` (i.e. not seen in the input) pass through
 //! with their old ID unchanged, matching the in-memory path's
 //! `unwrap_or(old_id)` behavior and osmium's semantics. Consumers that
 //! assume new IDs are dense starting at `start_*_id` must tolerate
@@ -108,9 +108,9 @@ impl StageCounters {
 ///
 /// Four phases: pass 1 rewrites nodes (parallel wire-format rewriter),
 /// stage 2d rewrites ways with resolved refs (parallel wire-format
-/// splice), R1 collects relation IDs into IdSetDense, R2d rewrites
+/// splice), R1 collects relation IDs into IdSet, R2d rewrites
 /// relations with resolved member refs (parallel wire-format splice).
-/// All ID lookups are O(1) via `IdSetDense::resolve()`. No temp files.
+/// All ID lookups are O(1) via `IdSet::resolve()`. No temp files.
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]
 pub fn renumber_external(
@@ -190,16 +190,16 @@ pub fn renumber_external(
     // ---- Pass 1: parallel node scan ----
     //
     // Work-stealing dispatch: workers claim blobs via AtomicUsize,
-    // write into a shared IdSetDense via AtomicU8::fetch_or. Workers
+    // write into a shared IdSet via AtomicU8::fetch_or. Workers
     // pread → decompress → wire-format reframe (replace only ID deltas,
     // copy everything else verbatim) → send Vec<OwnedBlock> through a
     // bounded channel. Main thread reorders by seq and writes output.
     let pass1_total_nodes: u64 = pass1_schedule.iter().map(|t| t.element_count).sum();
 
-    // Single shared IdSetDense - pre-allocate all chunks for the max
+    // Single shared IdSet - pre-allocate all chunks for the max
     // node ID so workers can use set_atomic(&self) concurrently.
     let max_node_id = pass1_schedule.last().map_or(0, |t| t.max_id);
-    let mut node_id_set = super::id_set_dense::IdSetDense::new();
+    let mut node_id_set = crate::idset::IdSet::new();
     node_id_set.pre_allocate(max_node_id);
 
     let nodes_written_atomic = std::sync::atomic::AtomicU64::new(0);
@@ -241,8 +241,8 @@ pub fn renumber_external(
     // Resolves way refs inline via node_id_set.rank() during
     // wire-format splice. No intermediate flat file or sidecar.
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2D_START");
-    let mut way_id_sets: Vec<super::id_set_dense::IdSetDense> = (0..STAGE2D_WORKERS)
-        .map(|_| super::id_set_dense::IdSetDense::new())
+    let mut way_id_sets: Vec<crate::idset::IdSet> = (0..STAGE2D_WORKERS)
+        .map(|_| crate::idset::IdSet::new())
         .collect();
     let stage2d_ways_atomic = std::sync::atomic::AtomicU64::new(0);
     let orphan_refs_atomic = std::sync::atomic::AtomicU64::new(0);
@@ -261,7 +261,7 @@ pub fn renumber_external(
     stats.orphan_refs += orphan_refs_atomic.load(std::sync::atomic::Ordering::Relaxed);
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2D_END");
 
-    // ---- R1: collect relation IDs into IdSetDense ----
+    // ---- R1: collect relation IDs into IdSet ----
     crate::debug::emit_marker("RENUMBER_EXT_R1_START");
 
     // Merge per-worker way_id_sets built during stage 2d.
@@ -277,7 +277,7 @@ pub fn renumber_external(
         crate::debug::emit_counter("renumber_ext_way_map_entries", way_id_set.total_count() as i64);
     }
 
-    let mut relation_id_set = super::id_set_dense::IdSetDense::new();
+    let mut relation_id_set = crate::idset::IdSet::new();
     relation_r1_collect_ids(
         &shared_file,
         &relation_schedule,

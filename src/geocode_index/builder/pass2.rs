@@ -99,7 +99,7 @@ struct PendingAddrPoint {
 /// Sync-safe wrapper around the `coord_mmap`'s raw pointer for Phase 2a
 /// workers. Workers write `(lat_e7, lon_e7)` pairs at disjoint rank
 /// offsets - the disjointness invariant follows from
-/// `IdSetDense::rank(id)` being a unique index per set ID, combined with
+/// `IdSet::rank(id)` being a unique index per set ID, combined with
 /// sorted PBF guaranteeing every node ID appears in at most one blob.
 /// No atomics needed because no two workers ever touch the same byte.
 ///
@@ -111,7 +111,7 @@ struct PendingAddrPoint {
 ///   the owning `MmapMut` on the stack across the Phase 2a scope).
 /// - Every `rank` value passed to `write_coord` satisfies
 ///   `rank * 8 + 8 <= len` - the per-blob `ref_rank_end` and
-///   `IdSetDense::total_count()` together bound this.
+///   `IdSet::total_count()` together bound this.
 /// - No two concurrent calls to `write_coord` pass the same `rank`.
 struct CoordMmapShared {
     ptr: *mut u8,
@@ -190,9 +190,9 @@ struct PendingInterp {
 fn classify_way_into(
     way: &crate::elements::Way<'_>,
     state: &mut WayBlobOut,
-    referenced_nodes: &crate::commands::id_set_dense::IdSetDense,
+    referenced_nodes: &crate::idset::IdSet,
     coord_slice: &[u8],
-    needed_admin_ways: &crate::commands::id_set_dense::IdSetDense,
+    needed_admin_ways: &crate::idset::IdSet,
 ) {
     if state.error.is_some() { return; }
 
@@ -354,8 +354,8 @@ pub(super) fn run_pass2(
     node_schedule: &[(usize, u64, usize)],
     way_schedule: &[(usize, u64, usize)],
     shared_file: &std::sync::Arc<std::fs::File>,
-    needed_admin_ways: crate::commands::id_set_dense::IdSetDense,
-    mut referenced_nodes: crate::commands::id_set_dense::IdSetDense,
+    needed_admin_ways: crate::idset::IdSet,
+    mut referenced_nodes: crate::idset::IdSet,
     strings: &mut StringPool,
 ) -> Result<Pass2Output> {
     let mut interp_ways: Vec<SlimInterpWay> = Vec::new();
@@ -420,7 +420,7 @@ pub(super) fn run_pass2(
                         let lon_e7 = node.decimicro_lon();
                         if let Some(rank) = referenced_ref.rank_if_set(node.id()) {
                             // SAFETY: disjoint ranks guaranteed by sorted PBF +
-                            // unique rank-per-id in IdSetDense. See CoordMmapShared docs.
+                            // unique rank-per-id in IdSet. See CoordMmapShared docs.
                             unsafe { coord_ref.write_coord(rank, lat_e7, lon_e7); }
                         }
                         let mut hn: Option<&str> = None;

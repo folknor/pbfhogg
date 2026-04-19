@@ -10,7 +10,7 @@ use super::super::{Result,
     flush_local, ensure_node_capacity_local, ensure_way_capacity_local,
     ensure_relation_capacity_local, HeaderOverrides,
 };
-use super::super::id_set_dense::IdSetDense;
+use crate::idset::IdSet;
 
 use super::common::{BboxInt, relation_has_matched_member, spatial_blob_filter};
 use super::{ExtractSlot, ExtractStats, Region};
@@ -94,9 +94,9 @@ pub(super) fn try_extract_multi_single_pass(
     }
 
     // Per-region ID sets and stats.
-    let mut bbox_node_ids: Vec<IdSetDense> = (0..n).map(|_| IdSetDense::new()).collect();
-    let mut matched_way_ids: Vec<IdSetDense> = (0..n).map(|_| IdSetDense::new()).collect();
-    let mut matched_relation_ids: Vec<IdSetDense> = (0..n).map(|_| IdSetDense::new()).collect();
+    let mut bbox_node_ids: Vec<IdSet> = (0..n).map(|_| IdSet::new()).collect();
+    let mut matched_way_ids: Vec<IdSet> = (0..n).map(|_| IdSet::new()).collect();
+    let mut matched_relation_ids: Vec<IdSet> = (0..n).map(|_| IdSet::new()).collect();
     let mut stats: Vec<ExtractStats> = (0..n).map(|_| ExtractStats {
         nodes_in_bbox: 0,
         nodes_from_ways: 0,
@@ -347,7 +347,7 @@ pub(super) fn try_extract_multi_single_pass(
     super::super::parallel_classify_accumulate(
         &shared_file,
         &relation_schedule,
-        || (0..n).map(|_| IdSetDense::new()).collect::<Vec<_>>(),
+        || (0..n).map(|_| IdSet::new()).collect::<Vec<_>>(),
         |block, region_ids| {
             for element in block.elements_skip_metadata() {
                 if let Element::Relation(r) = &element {

@@ -235,7 +235,7 @@ impl<R: BlobReaderSource + Send> IndexedReader<R> {
     /// For planet-scale files with broad way filters, this set can grow to
     /// billions of entries (~48 bytes each in `BTreeSet`), potentially exceeding
     /// available memory. For planet-scale extractions, prefer the `extract`
-    /// command which uses [`IdSetDense`](crate::commands::id_set_dense::IdSetDense)
+    /// command which uses [`IdSet`](crate::idset::IdSet)
     /// (1 bit per ID) and streaming passes.
     ///
     /// # Example

@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use super::id_set_dense::IdSetDense;
+use crate::idset::IdSet;
 
 use rayon::prelude::*;
 
@@ -23,11 +23,11 @@ use super::{Result, BATCH_SIZE};
 // ---------------------------------------------------------------------------
 
 /// Parsed element IDs grouped by type.
-/// Uses `IdSetDense` for O(1) membership testing at all scales.
-pub struct IdSet {
-    pub node_ids: IdSetDense,
-    pub way_ids: IdSetDense,
-    pub relation_ids: IdSetDense,
+/// Uses `IdSet` for O(1) membership testing at all scales.
+pub struct ElementIds {
+    pub node_ids: IdSet,
+    pub way_ids: IdSet,
+    pub relation_ids: IdSet,
 }
 
 /// Element type used as default when parsing bare numeric IDs.
@@ -80,7 +80,7 @@ fn parse_id_spec(spec: &str, default_type: Option<DefaultType>) -> Result<(char,
 }
 
 /// Parse ID specs from command-line arguments.
-pub fn parse_ids(specs: &[String]) -> Result<IdSet> {
+pub fn parse_ids(specs: &[String]) -> Result<ElementIds> {
     parse_ids_with_default_type(specs, None)
 }
 
@@ -88,11 +88,11 @@ pub fn parse_ids(specs: &[String]) -> Result<IdSet> {
 pub fn parse_ids_with_default_type(
     specs: &[String],
     default_type: Option<DefaultType>,
-) -> Result<IdSet> {
-    let mut set = IdSet {
-        node_ids: IdSetDense::new(),
-        way_ids: IdSetDense::new(),
-        relation_ids: IdSetDense::new(),
+) -> Result<ElementIds> {
+    let mut set = ElementIds {
+        node_ids: IdSet::new(),
+        way_ids: IdSet::new(),
+        relation_ids: IdSet::new(),
     };
     for spec in specs {
         let (prefix, id) = parse_id_spec(spec, default_type)?;
@@ -107,7 +107,7 @@ pub fn parse_ids_with_default_type(
 }
 
 /// Parse ID specs from a file (one per line, blank lines and `#` comments skipped).
-pub fn parse_ids_from_file(path: &Path) -> Result<IdSet> {
+pub fn parse_ids_from_file(path: &Path) -> Result<ElementIds> {
     parse_ids_from_file_with_default_type(path, None)
 }
 
@@ -115,7 +115,7 @@ pub fn parse_ids_from_file(path: &Path) -> Result<IdSet> {
 pub fn parse_ids_from_file_with_default_type(
     path: &Path,
     default_type: Option<DefaultType>,
-) -> Result<IdSet> {
+) -> Result<ElementIds> {
     let contents = std::fs::read_to_string(path)?;
     let specs: Vec<String> = contents
         .lines()
@@ -129,13 +129,13 @@ pub fn parse_ids_from_file_with_default_type(
 /// Collect all element IDs from a PBF file.
 ///
 /// Reads every node, way, and relation in the file and adds its ID to the
-/// returned `IdSet`. No member or reference IDs are collected - only
+/// returned `ElementIds`. No member or reference IDs are collected - only
 /// top-level element IDs (matching osmium's `--id-osm-file` behavior).
-pub fn parse_ids_from_pbf(path: &Path, _direct_io: bool) -> Result<IdSet> {
-    let mut set = IdSet {
-        node_ids: IdSetDense::new(),
-        way_ids: IdSetDense::new(),
-        relation_ids: IdSetDense::new(),
+pub fn parse_ids_from_pbf(path: &Path, _direct_io: bool) -> Result<ElementIds> {
+    let mut set = ElementIds {
+        node_ids: IdSet::new(),
+        way_ids: IdSet::new(),
+        relation_ids: IdSet::new(),
     };
 
     let (schedule, shared_file) = super::build_classify_schedule(path, None)?;
@@ -176,8 +176,8 @@ pub fn parse_ids_from_pbf(path: &Path, _direct_io: bool) -> Result<IdSet> {
     Ok(set)
 }
 
-/// Merge two `IdSet`s together (union).
-pub fn merge_id_sets(a: &mut IdSet, b: &IdSet) {
+/// Merge two `ElementIds`s together (union).
+pub fn merge_id_sets(a: &mut ElementIds, b: &ElementIds) {
     a.node_ids.merge_from(&b.node_ids);
     a.way_ids.merge_from(&b.way_ids);
     a.relation_ids.merge_from(&b.relation_ids);
@@ -226,7 +226,7 @@ impl GetidStats {
 pub fn getid(
     input: &Path,
     output: &Path,
-    ids: &IdSet,
+    ids: &ElementIds,
     opts: &GetidOptions,
     compression: Compression,
     direct_io: bool,
@@ -254,7 +254,7 @@ pub fn getid(
 
 /// Remove elements matching the given IDs (output everything else).
 #[hotpath::measure]
-pub fn removeid(input: &Path, output: &Path, ids: &IdSet, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<GetidStats> {
+pub fn removeid(input: &Path, output: &Path, ids: &ElementIds, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<GetidStats> {
     filter_by_id(input, output, ids, false, compression, direct_io, overrides)
 }
 
@@ -269,7 +269,7 @@ pub fn removeid(input: &Path, output: &Path, ids: &IdSet, compression: Compressi
 fn filter_by_id(
     input: &Path,
     output: &Path,
-    ids: &IdSet,
+    ids: &ElementIds,
     include: bool,
     compression: Compression,
     direct_io: bool,
@@ -390,17 +390,17 @@ fn filter_by_id(
 // Two-pass getid with --add-referenced
 // ---------------------------------------------------------------------------
 
-fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<GetidStats> {
+fn getid_with_refs(input: &Path, output: &Path, ids: &ElementIds, opts: &GetidOptions, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<GetidStats> {
     let mut stats = GetidStats {
         nodes_written: 0,
         ways_written: 0,
         relations_written: 0,
     };
 
-    // Pass 1: Collect ref node IDs from matching ways. Uses IdSetDense for O(1)
+    // Pass 1: Collect ref node IDs from matching ways. Uses IdSet for O(1)
     // lookups in pass 2 instead of BTreeSet's O(log n).
     crate::debug::emit_marker("GETID_PASS1_START");
-    let mut dep_node_ids = super::id_set_dense::IdSetDense::new();
+    let mut dep_node_ids = crate::idset::IdSet::new();
     let mut has_dep_nodes = false;
 
     if ids.way_ids.has_any() {
@@ -413,7 +413,7 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions
         super::parallel_classify_accumulate(
             &shared_file,
             &schedule,
-            super::id_set_dense::IdSetDense::new,
+            crate::idset::IdSet::new,
             |block, node_ids| {
                 for element in block.elements_skip_metadata() {
                     if let Element::Way(w) = &element
@@ -477,9 +477,9 @@ fn process_block(
     block: &PrimitiveBlock,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-    ids: &IdSet,
+    ids: &ElementIds,
     include: bool,
-    dep_node_ids: Option<&super::id_set_dense::IdSetDense>,
+    dep_node_ids: Option<&crate::idset::IdSet>,
     strip_tags: bool,
 ) -> std::result::Result<(u64, u64, u64), String> {
     let mut nodes: u64 = 0;
@@ -571,9 +571,9 @@ fn process_block(
 fn process_filter_batch(
     batch: &[PrimitiveBlock],
     writer: &mut PbfWriter<FileWriter>,
-    ids: &IdSet,
+    ids: &ElementIds,
     include: bool,
-    dep_node_ids: Option<&super::id_set_dense::IdSetDense>,
+    dep_node_ids: Option<&crate::idset::IdSet>,
     strip_tags: bool,
 ) -> Result<(u64, u64, u64)> {
     type BatchResult = std::result::Result<(Vec<OwnedBlock>, (u64, u64, u64)), String>;

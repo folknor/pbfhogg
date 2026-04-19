@@ -1524,7 +1524,7 @@ fn resolve_ids(
     default_type: Option<DefaultTypeArg>,
     ids: &[String],
     direct_io: bool,
-) -> Result<pbfhogg::getid::IdSet, Box<dyn std::error::Error>> {
+) -> Result<pbfhogg::getid::ElementIds, Box<dyn std::error::Error>> {
     let default_type = default_type.map(|kind| match kind {
         DefaultTypeArg::Node => pbfhogg::getid::DefaultType::Node,
         DefaultTypeArg::Way => pbfhogg::getid::DefaultType::Way,
@@ -1548,7 +1548,7 @@ fn resolve_ids(
     Ok(id_set)
 }
 
-fn print_requested_ids(ids: &pbfhogg::getid::IdSet) {
+fn print_requested_ids(ids: &pbfhogg::getid::ElementIds) {
     eprintln!("Requested IDs:");
     if ids.node_ids.has_any() {
         eprint!("  nodes:");
@@ -1575,7 +1575,7 @@ fn print_requested_ids(ids: &pbfhogg::getid::IdSet) {
 
 fn print_missing_ids(
     output: &std::path::Path,
-    requested: &pbfhogg::getid::IdSet,
+    requested: &pbfhogg::getid::ElementIds,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Scan the output PBF to find which requested IDs are present.

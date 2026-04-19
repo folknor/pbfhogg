@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use crate::{Element, MemberId};
 
-use super::id_set_dense::IdSetDense;
+use crate::idset::IdSet;
 use super::{build_classify_schedules_split, parallel_classify_phase, Result};
 
 /// A single missing reference entry (populated when `show_ids` is true).
@@ -102,7 +102,7 @@ struct RelBlobResult {
 /// through [`parallel_classify_phase`]: workers pread + decompress +
 /// decode + classify in parallel; the main thread merges per-blob results.
 ///
-/// Phase 1 (nodes) writes to `node_ids` via `IdSetDense::set_atomic`. Phase 2
+/// Phase 1 (nodes) writes to `node_ids` via `IdSet::set_atomic`. Phase 2
 /// (ways) reads `node_ids` to check refs, optionally writes to `way_ids`.
 /// Phase 3 (relations, only when `check_relations`) reads both and populates
 /// `relation_ids`. Forward relation-relation references are deferred to a
@@ -110,7 +110,7 @@ struct RelBlobResult {
 ///
 /// # Planet-scale memory usage
 ///
-/// Uses [`IdSetDense`] for all three ID sets, pre-allocated to OSM ID
+/// Uses [`IdSet`] for all three ID sets, pre-allocated to OSM ID
 /// ceilings. Memory is bounded by the ID space, not the population:
 /// ~1.6 GB for nodes (pre-allocated to 14 B), ~175 MB for ways (1.5 B),
 /// ~3 MB for relations (25 M).
@@ -146,12 +146,12 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
         libc::mallopt(libc::M_ARENA_MAX, 2);
     }
 
-    // IdSetDense pre-allocated to the current OSM ID ceilings. Required
+    // IdSet pre-allocated to the current OSM ID ceilings. Required
     // before any set_atomic call - set_atomic panics on unallocated chunks.
-    let mut node_ids = IdSetDense::new();
+    let mut node_ids = IdSet::new();
     node_ids.pre_allocate(14_000_000_000);
-    let mut way_ids = IdSetDense::new();
-    let mut relation_ids = IdSetDense::new();
+    let mut way_ids = IdSet::new();
+    let mut relation_ids = IdSet::new();
     if check_relations {
         way_ids.pre_allocate(1_500_000_000);
         relation_ids.pre_allocate(25_000_000);

@@ -11,7 +11,7 @@ use super::super::{Result, flush_local,
     ensure_node_capacity_local, ensure_way_capacity_local,
     ensure_relation_capacity_local,
 };
-use super::super::id_set_dense::IdSetDense;
+use crate::idset::IdSet;
 
 use super::{Bbox, ExtractStats};
 
@@ -385,10 +385,10 @@ where
 
 /// Read-only ID sets for Pass 2 of complete-ways strategy, shared across rayon threads.
 pub(super) struct ExtractPass2IdSets<'a> {
-    pub(super) bbox_node_ids: &'a IdSetDense,
-    pub(super) all_way_node_ids: &'a IdSetDense,
-    pub(super) matched_way_ids: &'a IdSetDense,
-    pub(super) matched_relation_ids: &'a IdSetDense,
+    pub(super) bbox_node_ids: &'a IdSet,
+    pub(super) all_way_node_ids: &'a IdSet,
+    pub(super) matched_way_ids: &'a IdSet,
+    pub(super) matched_relation_ids: &'a IdSet,
 }
 
 use super::super::{clean_metadata, dense_node_metadata, element_metadata};
@@ -480,8 +480,8 @@ pub(super) fn extract_block_pass2(
 /// Check if a relation has any member whose ID is in the matched node or way sets.
 pub(super) fn relation_has_matched_member(
     r: &crate::Relation,
-    node_ids: &IdSetDense,
-    way_ids: &IdSetDense,
+    node_ids: &IdSet,
+    way_ids: &IdSet,
 ) -> bool {
     r.members().any(|m| match m.id {
         MemberId::Node(id) => node_ids.get(id),

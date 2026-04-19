@@ -11,7 +11,6 @@ pub mod extract;
 pub mod getid;
 pub mod getparents;
 pub mod inspect;
-pub(crate) mod id_set_dense;
 pub(crate) mod node_scanner;
 pub(crate) mod way_scanner;
 pub mod merge;
@@ -655,7 +654,7 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
 /// closure members (~13 MB per worker). These are sparse paths where `S`
 /// is dominated by a small set of relation-local IDs or metadata.
 ///
-/// Borderline: per-worker `IdSetDense` accumulation of node IDs during
+/// Borderline: per-worker `IdSet` accumulation of node IDs during
 /// way classify (geocode Pass 1.5). A worker can legitimately touch node
 /// IDs across the full planet range via referenced-node unions, so the
 /// worst-case per-worker bitmap is ~1.3 GB at planet scale (10.4 B node

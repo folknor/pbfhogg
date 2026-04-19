@@ -12,7 +12,7 @@ use crate::writer::Compression;
 use crate::{Element, PrimitiveBlock};
 
 use super::super::add_locations_to_ways::Stats;
-use super::super::id_set_dense::IdSetDense;
+use crate::idset::IdSet;
 use super::super::{
     dense_node_metadata, element_metadata,
     ensure_node_capacity_local, ensure_relation_capacity_local,
@@ -109,7 +109,7 @@ pub(super) fn stage4_assembly(
     per_way_rcs: &super::coord_payloads::PerWayRcs,
     way_slot_starts: &[u64],
     keep_untagged_nodes: bool,
-    relation_member_node_ids: Option<&IdSetDense>,
+    relation_member_node_ids: Option<&IdSet>,
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
@@ -742,7 +742,7 @@ fn assemble_block(
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
     keep_untagged_nodes: bool,
-    relation_member_node_ids: Option<&IdSetDense>,
+    relation_member_node_ids: Option<&IdSet>,
 ) -> std::result::Result<Stats, String> {
     let mut stats = Stats::default();
 

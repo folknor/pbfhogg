@@ -60,7 +60,7 @@ pub(super) const COORD_SLOT_SIZE: usize = 8;
 /// of referenced nodes it contains.
 ///
 /// Computed without decoding any blob - uses indexdata `(min_id, max_id)`
-/// plus `IdSetDense::rank` queries. Adjacent blobs' ranges are
+/// plus `IdSet::rank` queries. Adjacent blobs' ranges are
 /// non-overlapping and monotonic in rank (because the input PBF is sorted
 /// by node ID and rank is monotonic in ID). Each rank bucket maps to a
 /// contiguous run of blobs in this vector via binary search.
@@ -205,7 +205,7 @@ pub fn external_join(
     crate::debug::emit_marker("EXTJOIN_META_SCAN_END");
 
     // Stage 1: produces total_slots, unique_nodes, rank_bucket_counts,
-    // num_shard_workers, the live IdSetDense (kept alive through stage 2
+    // num_shard_workers, the live IdSet (kept alive through stage 2
     // for inline coord resolution), and the per-blob rank mapping.
     crate::debug::emit_marker("EXTJOIN_STAGE1_START");
     let (s1_minflt_before, s1_majflt_before) = crate::debug::read_page_faults();
@@ -318,7 +318,7 @@ pub fn external_join(
     }
     crate::debug::emit_marker("EXTJOIN_STAGE2_END");
 
-    // Free the IdSetDense (~2 GB RSS at planet) and the per-blob mapping
+    // Free the IdSet (~2 GB RSS at planet) and the per-blob mapping
     // - both were stage 2 inputs only, nothing downstream reads them.
     drop(node_id_set);
     drop(node_blob_mapping);

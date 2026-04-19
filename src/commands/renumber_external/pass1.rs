@@ -1,11 +1,11 @@
 //! Pass 1: parallel node scan - worker pool with work-stealing dispatch.
 //!
 //! Workers (PASS1_WORKERS) claim blobs via `AtomicUsize::fetch_add` over
-//! the schedule. All workers share a single pre-allocated `IdSetDense`
+//! the schedule. All workers share a single pre-allocated `IdSet`
 //! via `set_atomic()`. Per-blob base new_id is pre-computed in a
 //! prefix-sum array so workers process blobs in any order.
 
-use super::super::id_set_dense::IdSetDense;
+use crate::idset::IdSet;
 use super::super::Result;
 use super::schedule::BlobTask;
 use super::wire_rewrite::reframe_dense_with_new_ids;
@@ -15,7 +15,7 @@ use crate::block_builder::OwnedBlock;
 /// Parallel pass 1: wire-format node rewriter with work-stealing dispatch.
 ///
 /// Workers (PASS1_WORKERS) claim blobs via `AtomicUsize::fetch_add`
-/// over the schedule. All workers share a single pre-allocated `IdSetDense`
+/// over the schedule. All workers share a single pre-allocated `IdSet`
 /// via `set_atomic()`. Per-blob base new_id is pre-computed in a
 /// prefix-sum array so workers process blobs in any order.
 ///
@@ -29,7 +29,7 @@ pub(super) fn pass1_parallel_scan(
     schedule: &[BlobTask],
     start_node_id: i64,
     shared_file: &std::sync::Arc<std::fs::File>,
-    node_id_set: &IdSetDense,
+    node_id_set: &IdSet,
     nodes_written: &std::sync::atomic::AtomicU64,
     writer: &mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
 ) -> Result<()> {
@@ -128,7 +128,7 @@ fn pass1_worker(
     next_idx: &std::sync::atomic::AtomicUsize,
     base_new_ids: &[i64],
     shared_file: &std::sync::Arc<std::fs::File>,
-    id_set: &IdSetDense,
+    id_set: &IdSet,
     nodes_written: &std::sync::atomic::AtomicU64,
     counters: &StageCounters,
     tx: &std::sync::mpsc::SyncSender<(usize, std::result::Result<Vec<OwnedBlock>, String>)>,

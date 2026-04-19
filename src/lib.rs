@@ -122,6 +122,7 @@ pub mod osc;
 pub(crate) mod blob_meta;
 pub mod debug;
 mod error;
+pub(crate) mod idset;
 pub(crate) mod reorder_buffer;
 
 // ---------------------------------------------------------------------------

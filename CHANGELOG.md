@@ -7,6 +7,7 @@
 - **`renumber --mode` flag removed.** External join is now the only implementation; the in-memory path is gone.
 - **`BlobReader::new_seekable<R>` and `IndexedReader::new<R>` bounds widened** from `R: Read + Seek + Send` to `R: BlobReaderSource + Send`. Downstream users with custom reader types add `impl BlobReaderSource for MyReader {}` - one line, picks up the correct-but-slow default.
 - **Geocode `FORMAT_VERSION` bumped to 2.** Indexes built with older versions must be rebuilt.
+- **`pbfhogg::getid::IdSet` renamed to `pbfhogg::getid::ElementIds`.** The struct bundles three per-type ID sets (`node_ids`, `way_ids`, `relation_ids`) and was misnamed as a single "set". External consumers must update type annotations; field accessors and method calls are unchanged.
 
 ### Commands
 

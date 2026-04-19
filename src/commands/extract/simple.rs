@@ -12,7 +12,7 @@ use crate::{BlockType, Element, PrimitiveBlock};
 use super::super::{Result, BATCH_SIZE,
     drain_batch_results, flush_local, writer_from_header, HeaderOverrides,
 };
-use super::super::id_set_dense::IdSetDense;
+use crate::idset::IdSet;
 
 use super::common::{
     BboxInt, BlobDesc, ExtractPass2IdSets, build_blob_schedule_with_passthrough,
@@ -40,9 +40,9 @@ fn classify_block_simple(
     block: &PrimitiveBlock,
     region: &Region,
     bbox_int: &BboxInt,
-    bbox_node_ids: &mut IdSetDense,
-    matched_way_ids: &mut IdSetDense,
-    matched_relation_ids: &mut IdSetDense,
+    bbox_node_ids: &mut IdSet,
+    matched_way_ids: &mut IdSet,
+    matched_relation_ids: &mut IdSet,
 ) -> bool {
     let mut matched = false;
     match block.block_type() {
@@ -157,9 +157,9 @@ pub(super) fn extract_simple(input: &Path, output: &Path, region: &Region, set_b
         strategy: "simple",
     };
 
-    let mut bbox_node_ids = IdSetDense::new();
-    let mut matched_way_ids = IdSetDense::new();
-    let mut matched_relation_ids = IdSetDense::new();
+    let mut bbox_node_ids = IdSet::new();
+    let mut matched_way_ids = IdSet::new();
+    let mut matched_relation_ids = IdSet::new();
 
     let bbox_int = BboxInt::from_bbox(region.bbox());
     let spatial_filter = spatial_blob_filter(&bbox_int);
@@ -186,7 +186,7 @@ pub(super) fn extract_simple(input: &Path, output: &Path, region: &Region, set_b
     crate::debug::emit_marker("SIMPLE_UNSORTED_PASS1_END");
 
     crate::debug::emit_marker("SIMPLE_UNSORTED_PASS2_START");
-    let all_way_node_ids = IdSetDense::new();
+    let all_way_node_ids = IdSet::new();
 
     let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
     blob_reader.set_parse_indexdata(true);
@@ -331,10 +331,10 @@ fn extract_simple_single_pass(
         hb.sorted()
     }, direct_io, false)?;
 
-    let mut bbox_node_ids = IdSetDense::new();
-    let mut matched_way_ids = IdSetDense::new();
-    let empty_relation_ids = IdSetDense::new(); // placeholder for node/way phases
-    let all_way_node_ids = IdSetDense::new();
+    let mut bbox_node_ids = IdSet::new();
+    let mut matched_way_ids = IdSet::new();
+    let empty_relation_ids = IdSet::new(); // placeholder for node/way phases
+    let all_way_node_ids = IdSet::new();
 
     // --- Phase 1: Classify nodes (parallel pread + scanner) ---
     // Workers pread node blobs, decompress, scan with node-only scanner,
@@ -550,7 +550,7 @@ fn extract_simple_single_pass(
     crate::debug::emit_marker("SIMPLE_WAY_WRITE_END");
     // --- Phase 3: Classify relations + write (pread-from-workers) ---
     crate::debug::emit_marker("SIMPLE_REL_CLASSIFY_START");
-    let mut matched_relation_ids = IdSetDense::new();
+    let mut matched_relation_ids = IdSet::new();
     {
         let (rel_classify_schedule, rel_classify_file) = super::super::build_classify_schedule(
             input, Some(crate::blob_meta::ElemKind::Relation),
@@ -558,7 +558,7 @@ fn extract_simple_single_pass(
         super::super::parallel_classify_accumulate(
             &rel_classify_file,
             &rel_classify_schedule,
-            IdSetDense::new,
+            IdSet::new,
             |block, ids| {
                 for element in block.elements_skip_metadata() {
                     if let Element::Relation(r) = &element {

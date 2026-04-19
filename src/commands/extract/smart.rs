@@ -10,7 +10,7 @@ use crate::{Element, MemberId, PrimitiveBlock};
 use super::super::{Result, writer_from_header, HeaderOverrides,
     ensure_node_capacity_local, ensure_way_capacity_local, ensure_relation_capacity_local,
 };
-use super::super::id_set_dense::IdSetDense;
+use crate::idset::IdSet;
 
 use super::common::{
     BboxInt, BlobDesc, pread_write_pass, pread_write_pass_with_schedule,
@@ -24,10 +24,10 @@ use super::{ExtractStats, Region};
 
 /// Output of pass 1 ID collection, shared between complete-ways and smart strategies.
 pub(super) struct Pass1Result {
-    pub(super) bbox_node_ids: IdSetDense,
-    pub(super) matched_way_ids: IdSetDense,
-    pub(super) all_way_node_ids: IdSetDense,
-    pub(super) matched_relation_ids: IdSetDense,
+    pub(super) bbox_node_ids: IdSet,
+    pub(super) matched_way_ids: IdSet,
+    pub(super) all_way_node_ids: IdSet,
+    pub(super) matched_relation_ids: IdSet,
     /// Unfiltered way blob schedule built during PASS1's manual scan, plumbed
     /// out so smart PASS2 can reuse it instead of calling
     /// `build_classify_schedule` again. Saves ~16% wall on Europe by avoiding
@@ -62,7 +62,7 @@ pub(super) trait RelationHandler {
     fn handle_relation(&mut self, r: &crate::Relation);
 
     /// Merge extra way/node IDs from parallel workers (sorted path phase 3).
-    fn merge_worker_extras(&mut self, extra_way_ids: IdSetDense, extra_node_ids: IdSetDense);
+    fn merge_worker_extras(&mut self, extra_way_ids: IdSet, extra_node_ids: IdSet);
 }
 
 pub(super) struct CompleteRelationHandler;
@@ -72,19 +72,19 @@ impl RelationHandler for CompleteRelationHandler {
 
     fn handle_relation(&mut self, _r: &crate::Relation) {}
 
-    fn merge_worker_extras(&mut self, _extra_way_ids: IdSetDense, _extra_node_ids: IdSetDense) {}
+    fn merge_worker_extras(&mut self, _extra_way_ids: IdSet, _extra_node_ids: IdSet) {}
 }
 
 struct SmartRelationHandler {
-    extra_way_ids: IdSetDense,
-    extra_node_ids: IdSetDense,
+    extra_way_ids: IdSet,
+    extra_node_ids: IdSet,
 }
 
 impl SmartRelationHandler {
     fn new() -> Self {
         Self {
-            extra_way_ids: IdSetDense::new(),
-            extra_node_ids: IdSetDense::new(),
+            extra_way_ids: IdSet::new(),
+            extra_node_ids: IdSet::new(),
         }
     }
 }
@@ -104,7 +104,7 @@ impl RelationHandler for SmartRelationHandler {
         }
     }
 
-    fn merge_worker_extras(&mut self, extra_way_ids: IdSetDense, extra_node_ids: IdSetDense) {
+    fn merge_worker_extras(&mut self, extra_way_ids: IdSet, extra_node_ids: IdSet) {
         self.extra_way_ids.merge(extra_way_ids);
         self.extra_node_ids.merge(extra_node_ids);
     }
@@ -129,10 +129,10 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     direct_io: bool,
     handler: &mut H,
 ) -> Result<Pass1Result> {
-    let mut bbox_node_ids = IdSetDense::new();
-    let mut matched_way_ids = IdSetDense::new();
-    let mut all_way_node_ids = IdSetDense::new();
-    let mut matched_relation_ids = IdSetDense::new();
+    let mut bbox_node_ids = IdSet::new();
+    let mut matched_way_ids = IdSet::new();
+    let mut all_way_node_ids = IdSet::new();
+    let mut matched_relation_ids = IdSet::new();
 
     // Sequential reader to avoid PrimitiveBlock cross-thread retention OOM.
     let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
@@ -348,7 +348,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     super::super::parallel_classify_accumulate(
         &shared_file,
         &relation_schedule,
-        || (IdSetDense::new(), IdSetDense::new(), IdSetDense::new()),
+        || (IdSet::new(), IdSet::new(), IdSet::new()),
         |block, (rel_ids, extra_way_ids, extra_node_ids)| {
             for element in block.elements_skip_metadata() {
                 if let Element::Relation(r) = &element {
@@ -442,7 +442,7 @@ pub(super) fn extract_smart(
     let extra_way_ids_ref = &handler.extra_way_ids;
     let matched_way_ids_ref = &result.matched_way_ids;
     // Per-blob send (not accumulate): extra_way_ids is relation-driven and
-    // can be wide + globally dispersed. Per-worker IdSetDense accumulate over
+    // can be wide + globally dispersed. Per-worker IdSet accumulate over
     // an unbounded node-ID set is the unsafe shape the helper doc warns
     // against, regardless of whether this specific workload triggers the
     // worst case. The fix improves PASS2 wall by ~23%; the planet-scale
@@ -535,12 +535,12 @@ pub(super) fn extract_smart(
 
 /// Read-only ID sets for Pass 3 of smart strategy, shared across rayon threads.
 struct ExtractPass3IdSets<'a> {
-    bbox_node_ids: &'a IdSetDense,
-    all_way_node_ids: &'a IdSetDense,
-    extra_node_ids: &'a IdSetDense,
-    matched_way_ids: &'a IdSetDense,
-    extra_way_ids: &'a IdSetDense,
-    matched_relation_ids: &'a IdSetDense,
+    bbox_node_ids: &'a IdSet,
+    all_way_node_ids: &'a IdSet,
+    extra_node_ids: &'a IdSet,
+    matched_way_ids: &'a IdSet,
+    extra_way_ids: &'a IdSet,
+    matched_relation_ids: &'a IdSet,
 }
 
 use super::super::{clean_metadata, dense_node_metadata, element_metadata};

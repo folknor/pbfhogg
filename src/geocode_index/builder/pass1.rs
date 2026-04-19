@@ -25,7 +25,7 @@ pub(super) fn run_pass1(
     input_path: &Path,
     direct_io: bool,
     strings: &mut StringPool,
-) -> Result<(Vec<RawAdminRelation>, crate::commands::id_set_dense::IdSetDense)> {
+) -> Result<(Vec<RawAdminRelation>, crate::idset::IdSet)> {
     let mut admin_relations: Vec<RawAdminRelation> = Vec::new();
     {
         let reader = ElementReader::open(input_path, direct_io)?;
@@ -88,7 +88,7 @@ pub(super) fn run_pass1(
     }
 
     // Build set of way IDs needed for admin boundary geometry
-    let mut needed_admin_ways = crate::commands::id_set_dense::IdSetDense::new();
+    let mut needed_admin_ways = crate::idset::IdSet::new();
     for r in &admin_relations {
         for &wid in &r.outer_way_ids { needed_admin_ways.set(wid); }
         for &wid in &r.inner_way_ids { needed_admin_ways.set(wid); }

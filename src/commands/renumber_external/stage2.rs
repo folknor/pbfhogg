@@ -4,7 +4,7 @@
 //! `node_id_set.rank()` and splices new IDs into the wire format.
 //! No intermediate flat file, no sidecar, no mmap.
 
-use super::super::id_set_dense::IdSetDense;
+use crate::idset::IdSet;
 use super::super::Result;
 use super::schedule::BlobTask;
 use super::wire_rewrite::reframe_ways_with_new_ids;
@@ -18,7 +18,7 @@ use crate::block_builder::OwnedBlock;
 /// No intermediate flat file, no sidecar, no mmap.
 ///
 /// Workers (STAGE2D_WORKERS) claim blobs via `AtomicUsize::fetch_add`.
-/// Each worker owns an `IdSetDense` shard for `way_id_set` and scratch
+/// Each worker owns an `IdSet` shard for `way_id_set` and scratch
 /// buffers. Workers pread → decompress → `reframe_ways_with_new_ids`
 /// (splice new way IDs + resolved refs) → send `Vec<OwnedBlock>` via
 /// bounded channel. Main thread reorders by seq and writes output.
@@ -31,9 +31,9 @@ use crate::block_builder::OwnedBlock;
 pub(super) fn stage2d_parallel_way_assembly(
     shared_file: &std::sync::Arc<std::fs::File>,
     writer: &mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
-    way_id_sets: &mut [IdSetDense],
+    way_id_sets: &mut [IdSet],
     way_schedule: &[BlobTask],
-    node_id_set: &IdSetDense,
+    node_id_set: &IdSet,
     start_node_id: i64,
     start_way_id: i64,
     ways_written: &std::sync::atomic::AtomicU64,
@@ -67,7 +67,7 @@ pub(super) fn stage2d_parallel_way_assembly(
 
     std::thread::scope(|scope| -> Result<()> {
         {
-            let mut remaining_sets: &mut [IdSetDense] = way_id_sets;
+            let mut remaining_sets: &mut [IdSet] = way_id_sets;
             for _ in 0..remaining_sets.len() {
                 let (is, it) = remaining_sets.split_at_mut(1);
                 remaining_sets = it;
@@ -144,9 +144,9 @@ fn stage2d_worker(
     next_idx: &std::sync::atomic::AtomicUsize,
     base_way_ids: &[i64],
     shared_file: &std::sync::Arc<std::fs::File>,
-    node_id_set: &IdSetDense,
+    node_id_set: &IdSet,
     start_node_id: i64,
-    way_id_set: &mut IdSetDense,
+    way_id_set: &mut IdSet,
     ways_written: &std::sync::atomic::AtomicU64,
     orphan_refs: &std::sync::atomic::AtomicU64,
     counters: &StageCounters,

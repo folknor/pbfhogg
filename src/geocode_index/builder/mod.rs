@@ -160,7 +160,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     // -----------------------------------------------------------------------
     // One header walk produces everything Pass 1.5 and Pass 2a need: the
     // way schedule (Pass 1.5), the node schedule (Pass 2a), the max node
-    // ID from indexdata (Pass 1.5's `IdSetDense::pre_allocate`), and a
+    // ID from indexdata (Pass 1.5's `IdSet::pre_allocate`), and a
     // single shared file handle reused by both phases' pread workers.
     // Previously two separate header walks: Pass 1.5's own walker and
     // Pass 2a's `build_classify_schedule(Node)` call. Consolidated walker

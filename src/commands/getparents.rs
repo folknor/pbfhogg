@@ -7,7 +7,7 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
-use super::getid::IdSet;
+use super::getid::ElementIds;
 use super::{
     dense_node_metadata, drain_batch_results, element_metadata, flush_local,
     for_each_primitive_block_batch, writer_from_header, HeaderOverrides,
@@ -47,7 +47,7 @@ impl GetparentsStats {
 pub fn getparents(
     input: &Path,
     output: &Path,
-    ids: &IdSet,
+    ids: &ElementIds,
     opts: &GetparentsOptions,
     compression: Compression,
     direct_io: bool,
@@ -88,7 +88,7 @@ fn process_block(
     block: &PrimitiveBlock,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-    ids: &IdSet,
+    ids: &ElementIds,
     add_self: bool,
 ) -> std::result::Result<(u64, u64, u64), String> {
     let mut nodes: u64 = 0;
@@ -160,7 +160,7 @@ fn process_block(
 fn process_batch(
     batch: &[PrimitiveBlock],
     writer: &mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
-    ids: &IdSet,
+    ids: &ElementIds,
     add_self: bool,
 ) -> Result<(u64, u64, u64)> {
     type BatchResult = std::result::Result<(Vec<OwnedBlock>, (u64, u64, u64)), String>;

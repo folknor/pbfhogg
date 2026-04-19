@@ -1,11 +1,11 @@
 //! Relation rewrite pipeline.
 //!
 //! - **R1**: sequential relation scan to collect all relation IDs into
-//!   an `IdSetDense` bitset + rank index.
+//!   an `IdSet` bitset + rank index.
 //! - **R2d**: parallel wire-format splice rewriter for relations.
 //!   Resolves node/way/relation member refs inline via `resolve()`.
 
-use super::super::id_set_dense::IdSetDense;
+use crate::idset::IdSet;
 use super::super::renumber::RenumberStats;
 use super::super::Result;
 use super::schedule::BlobTask;
@@ -34,14 +34,14 @@ fn reject_negative_id(id: i64, kind: &str) -> Result<()> {
 // R1: collect relation IDs
 // ---------------------------------------------------------------------------
 
-/// R1 pass: collect relation IDs into an `IdSetDense` bitset.
+/// R1 pass: collect relation IDs into an `IdSet` bitset.
 /// New IDs are derived via `start_relation_id + rank(old_id)` -
 /// no explicit mapping needed.
 #[hotpath::measure]
 pub(super) fn relation_r1_collect_ids(
     shared_file: &std::fs::File,
     relation_schedule: &[BlobTask],
-    relation_id_set: &mut IdSetDense,
+    relation_id_set: &mut IdSet,
 ) -> Result<()> {
     use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT};
 
@@ -141,11 +141,11 @@ pub(super) fn relation_r2d_assembly(
     shared_file: &std::sync::Arc<std::fs::File>,
     relation_schedule: &[BlobTask],
     writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,
-    node_id_set: &IdSetDense,
+    node_id_set: &IdSet,
     start_node_id: i64,
-    way_id_set: &IdSetDense,
+    way_id_set: &IdSet,
     start_way_id: i64,
-    relation_id_set: &IdSetDense,
+    relation_id_set: &IdSet,
     start_relation_id: i64,
     stats: &mut RenumberStats,
 ) -> Result<()> {

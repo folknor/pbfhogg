@@ -7,7 +7,7 @@
 //! ID + varint encode of new delta) plus verbatim byte-range copies for
 //! all other fields.
 
-use super::super::id_set_dense::IdSetDense;
+use crate::idset::IdSet;
 
 // ---------------------------------------------------------------------------
 // DenseNodes wire-format rewriter for pass 1
@@ -29,7 +29,7 @@ use super::super::id_set_dense::IdSetDense;
 pub(super) fn reframe_dense_with_new_ids(
     decompressed: &[u8],
     base_new_id: i64,
-    id_set: &IdSetDense,
+    id_set: &IdSet,
     check_negative_ids: bool,
     output: &mut Vec<u8>,
     // Reusable scratch buffers - hoisted to worker level.
@@ -174,9 +174,9 @@ pub(super) fn reframe_dense_with_new_ids(
 pub(super) fn reframe_ways_with_new_ids(
     decompressed: &[u8],
     base_new_way_id: i64,
-    node_id_set: &IdSetDense,
+    node_id_set: &IdSet,
     start_node_id: i64,
-    way_id_set: &mut IdSetDense,
+    way_id_set: &mut IdSet,
     output: &mut Vec<u8>,
     refs_scratch: &mut Vec<u8>,
     group_scratch: &mut Vec<u8>,
@@ -375,11 +375,11 @@ pub(super) fn reframe_ways_with_new_ids(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cast_possible_truncation)]
 pub(super) fn reframe_relations_with_new_ids(
     decompressed: &[u8],
-    relation_id_set: &IdSetDense,
+    relation_id_set: &IdSet,
     start_relation_id: i64,
-    node_id_set: &IdSetDense,
+    node_id_set: &IdSet,
     start_node_id: i64,
-    way_id_set: &IdSetDense,
+    way_id_set: &IdSet,
     start_way_id: i64,
     output: &mut Vec<u8>,
     memids_scratch: &mut Vec<u8>,

@@ -1,9 +1,9 @@
 //! Stage 1: Two-pass way scan + node-blob rank mapping.
 //!
-//!   Pass A: build IdSetDense of referenced node IDs (parallel).
+//!   Pass A: build IdSet of referenced node IDs (parallel).
 //!   Pass B: emit rank-bucketed (local_rank, slot_pos) records (parallel).
 //!   Node blob mapping: header-only walk of node blobs that records each
-//!     blob's referenced-rank range using IdSetDense::rank queries on the
+//!     blob's referenced-rank range using IdSet::rank queries on the
 //!     blob's indexdata `(min_id, max_id)`. Replaces the historical 82 GB
 //!     `coords_by_rank` file - stage 2 reads node blobs directly.
 
@@ -11,7 +11,7 @@ use std::io::{BufWriter, Write as _};
 use std::path::Path;
 
 use super::super::external_radix::{ScratchDir, NUM_BUCKETS};
-use super::super::id_set_dense::IdSetDense;
+use crate::idset::IdSet;
 use super::super::Result;
 use super::blob_meta::BlobMeta;
 use super::{MAX_NODE_ID, NodeBlobInfo, RANK_RECORD_SIZE, RankRecord};
@@ -23,7 +23,7 @@ pub(super) struct WayBlobTask {
     pub(super) data_size: usize,
 }
 
-/// Stage 1 output handed to stage 2. Owns the `IdSetDense` (kept alive
+/// Stage 1 output handed to stage 2. Owns the `IdSet` (kept alive
 /// because stage 2 needs `rank_if_set` for inline node-blob coord
 /// resolution) and the per-blob rank mapping.
 pub(super) struct Stage1Output {
@@ -31,7 +31,7 @@ pub(super) struct Stage1Output {
     pub unique_nodes: u64,
     pub rank_bucket_counts: Vec<u64>,
     pub num_shard_workers: usize,
-    pub node_id_set: IdSetDense,
+    pub node_id_set: IdSet,
     pub node_blob_mapping: Vec<NodeBlobInfo>,
 }
 
@@ -61,10 +61,10 @@ pub(super) fn build_way_schedule(blob_meta: &[BlobMeta]) -> Result<Vec<WayBlobTa
     Ok(schedule)
 }
 
-/// Pass A standalone: parallel way scan to build `IdSetDense` of all
+/// Pass A standalone: parallel way scan to build `IdSet` of all
 /// referenced node IDs and write the two ref-count sidecars in blob order.
 ///
-/// Returns `(total_refs, IdSetDense)` with `build_rank_index()` already
+/// Returns `(total_refs, IdSet)` with `build_rank_index()` already
 /// called. Used by `stage1_way_pass` as the entry into stage 1.
 #[hotpath::measure]
 #[allow(clippy::too_many_lines)]
@@ -74,7 +74,7 @@ pub(super) fn stage1_pass_a(
     num_workers: usize,
     ref_count_sidecar: &Path,
     per_way_refcount_sidecar: &Path,
-) -> Result<(u64, IdSetDense)> {
+) -> Result<(u64, IdSet)> {
     use std::os::unix::fs::FileExt as _;
 
     let shared_file = std::sync::Arc::new(
@@ -84,7 +84,7 @@ pub(super) fn stage1_pass_a(
 
     crate::debug::emit_marker("EXTJOIN_S1_PASS_A_START");
 
-    let mut node_id_set = IdSetDense::new();
+    let mut node_id_set = IdSet::new();
     // Pre-allocate for planet-scale node IDs (~13B max).
     #[allow(clippy::cast_possible_wrap)]
     node_id_set.pre_allocate(MAX_NODE_ID as i64);
@@ -242,13 +242,13 @@ pub(super) fn stage1_pass_a(
 ///
 /// Replaces the historical 82 GB `coords_by_rank` file. No decompression
 /// happens here - for each node blob we read its indexdata `(min_id, max_id)`
-/// and call `IdSetDense::rank` to compute the half-open referenced-rank range
+/// and call `IdSet::rank` to compute the half-open referenced-rank range
 /// `[ref_rank_start, ref_rank_end)`. Adjacent blobs' ranges are non-overlapping
 /// and monotonic in rank because the input PBF is sorted by node ID.
 #[hotpath::measure]
 pub(super) fn build_node_blob_mapping(
     blob_meta: &[BlobMeta],
-    node_id_set: &IdSetDense,
+    node_id_set: &IdSet,
 ) -> Result<Vec<NodeBlobInfo>> {
     crate::debug::emit_marker("EXTJOIN_S1_NODE_MAP_START");
     let t0 = std::time::Instant::now();
@@ -294,7 +294,7 @@ pub(super) fn build_node_blob_mapping(
 
 /// Two-pass stage 1 + node-blob mapping construction.
 ///
-/// **Pass A**: parallel way scan to build `IdSetDense` of all referenced
+/// **Pass A**: parallel way scan to build `IdSet` of all referenced
 /// node IDs + write sidecar ref counts.
 ///
 /// **Pass B**: rescan ways with rank index available. Emit `(local_rank, slot_pos)`
@@ -304,7 +304,7 @@ pub(super) fn build_node_blob_mapping(
 /// `NodeBlobInfo` table stage 2 uses to find blobs covering each rank
 /// bucket. Replaces the historical 82 GB `coords_by_rank` file.
 ///
-/// `IdSetDense` (~2 GB RSS at planet) is **kept alive** in `Stage1Output`
+/// `IdSet` (~2 GB RSS at planet) is **kept alive** in `Stage1Output`
 /// because stage 2 calls `rank_if_set` while resolving coordinates inline.
 #[hotpath::measure]
 #[allow(clippy::too_many_lines)]

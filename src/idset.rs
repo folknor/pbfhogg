@@ -12,7 +12,7 @@
 /// Memory: 1 bit per ID present in each allocated chunk, 4MB per chunk, zero
 /// for empty ranges. For Denmark's 52M nodes: 2 chunks = 8MB. For planet
 /// (12B node IDs): ~364 chunks = 1.5GB.
-pub struct IdSetDense {
+pub struct IdSet {
     chunks: Vec<Option<Box<[u8; CHUNK_SIZE]>>>,
     /// Rank index for O(1) rank queries. Built on demand via `build_rank_index()`.
     /// `chunk_prefix[cid]` = total set bits in chunks 0..cid.
@@ -25,7 +25,7 @@ pub struct IdSetDense {
 const CHUNK_BITS: usize = 22;
 const CHUNK_SIZE: usize = 1 << CHUNK_BITS;
 
-impl IdSetDense {
+impl IdSet {
     pub fn new() -> Self {
         Self { chunks: Vec::new(), rank_chunk_prefix: None, rank_block_prefix: None }
     }
@@ -193,7 +193,7 @@ impl IdSetDense {
                  covers up to {max_covered}. Most likely cause: the caller's \
                  `pre_allocate(max_id)` argument was derived from indexdata that \
                  understated the real maximum ID, or from a hard-coded cap that \
-                 planet growth has exceeded. See `IdSetDense::pre_allocate` docs."
+                 planet growth has exceeded. See `IdSet::pre_allocate` docs."
             );
         }
         match self.chunks[cid].as_ref() {
@@ -201,7 +201,7 @@ impl IdSetDense {
             None => panic!(
                 "{fn_name}: id {id} lands in chunk {cid} (within Vec length {}), \
                  but that chunk's slot is None. This means `pre_allocate()` was \
-                 never called on this IdSetDense - the `set_atomic*` methods \
+                 never called on this IdSet - the `set_atomic*` methods \
                  require explicit pre-allocation because they cannot grow under \
                  a shared `&self` borrow.",
                 self.chunks.len(),
@@ -283,7 +283,7 @@ impl IdSetDense {
     }
 
     /// Merge all set bits from `other` into `self` (union).
-    pub fn merge_from(&mut self, other: &IdSetDense) {
+    pub fn merge_from(&mut self, other: &IdSet) {
         if other.chunks.len() > self.chunks.len() {
             self.chunks.resize_with(other.chunks.len(), || None);
         }
@@ -571,7 +571,7 @@ impl IdSetDense {
         prefix[self.chunks.len()]
     }
 
-    /// Merge another IdSetDense into this one via bitwise OR.
+    /// Merge another IdSet into this one via bitwise OR.
     ///
     /// For non-overlapping chunks (common in sorted PBFs where each rayon thread
     /// processes a contiguous ID range), chunks are moved with zero copying.
@@ -603,7 +603,7 @@ mod tests {
 
     #[test]
     fn set_get_basic_ids() {
-        let mut s = IdSetDense::new();
+        let mut s = IdSet::new();
         s.set(1);
         s.set(100);
         s.set(1_000_000);
@@ -614,7 +614,7 @@ mod tests {
 
     #[test]
     fn get_returns_false_for_unset_ids() {
-        let mut s = IdSetDense::new();
+        let mut s = IdSet::new();
         s.set(5);
         assert!(!s.get(0));
         assert!(!s.get(4));
@@ -624,7 +624,7 @@ mod tests {
 
     #[test]
     fn chunk_boundary_ids() {
-        let mut s = IdSetDense::new();
+        let mut s = IdSet::new();
         // Chunk size is 1 << 22 bytes = 4MB = 33_554_432 bits.
         // IDs at and around the boundary cross chunks.
         let boundary: i64 = 33_554_432;
@@ -643,7 +643,7 @@ mod tests {
 
     #[test]
     fn any_in_range_hit_and_miss() {
-        let mut s = IdSetDense::new();
+        let mut s = IdSet::new();
         s.set(50);
         s.set(200);
 
@@ -666,11 +666,11 @@ mod tests {
 
     #[test]
     fn merge_two_sets() {
-        let mut a = IdSetDense::new();
+        let mut a = IdSet::new();
         a.set(10);
         a.set(20);
 
-        let mut b = IdSetDense::new();
+        let mut b = IdSet::new();
         b.set(20);
         b.set(30);
 
@@ -684,7 +684,7 @@ mod tests {
 
     #[test]
     fn rank_and_total_count() {
-        let mut s = IdSetDense::new();
+        let mut s = IdSet::new();
         s.set(5);
         s.set(10);
         s.set(15);
@@ -701,17 +701,17 @@ mod tests {
 
     #[test]
     fn has_any_empty_vs_nonempty() {
-        let empty = IdSetDense::new();
+        let empty = IdSet::new();
         assert!(!empty.has_any());
 
-        let mut s = IdSetDense::new();
+        let mut s = IdSet::new();
         s.set(42);
         assert!(s.has_any());
     }
 
     #[test]
     fn rank_if_set_parity_with_get_rank() {
-        let mut s = IdSetDense::new();
+        let mut s = IdSet::new();
         let ids = [0, 1, 5, 10, 15, 20, 100, 1_000_000, 33_554_432];
         for &id in &ids {
             s.set(id);
@@ -734,7 +734,7 @@ mod tests {
 
     #[test]
     fn count_in_range_basic() {
-        let mut s = IdSetDense::new();
+        let mut s = IdSet::new();
         for id in [5, 10, 15, 20, 100] {
             s.set(id);
         }
@@ -757,10 +757,10 @@ mod tests {
         // Regression test for the external join build_node_blob_mapping
         // path: a node blob's indexdata may report (min_id, max_id) where
         // max_id sits in a chunk past the highest allocated chunk in
-        // IdSetDense (because no referenced node has an ID that high).
+        // IdSet (because no referenced node has an ID that high).
         // rank() panics on chunks[cid] indexing in that case;
         // count_below() / count_in_range() must clamp to total_count.
-        let mut s = IdSetDense::new();
+        let mut s = IdSet::new();
         s.set(100);
         s.set(200);
         s.build_rank_index();
@@ -780,7 +780,7 @@ mod tests {
 
     #[test]
     fn count_below_negative_and_zero() {
-        let mut s = IdSetDense::new();
+        let mut s = IdSet::new();
         s.set(5);
         s.build_rank_index();
         assert_eq!(s.count_below(-1), 0);
@@ -791,7 +791,7 @@ mod tests {
 
     #[test]
     fn drop_rank_index_frees_metadata_but_keeps_bitmap() {
-        let mut s = IdSetDense::new();
+        let mut s = IdSet::new();
         s.set(5);
         s.set(10);
         s.build_rank_index();
@@ -807,7 +807,7 @@ mod tests {
 
     #[test]
     fn rank_if_set_without_rank_index_returns_none() {
-        let mut s = IdSetDense::new();
+        let mut s = IdSet::new();
         s.set(42);
         // No build_rank_index() - rank_if_set returns None because
         // rank prefix arrays are None.

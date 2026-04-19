@@ -18,10 +18,10 @@ pub(super) fn run_pass1_5(
     way_schedule: &[(usize, u64, usize)],
     max_node_id: i64,
     shared_file: &std::sync::Arc<std::fs::File>,
-    needed_admin_ways: &crate::commands::id_set_dense::IdSetDense,
-) -> Result<crate::commands::id_set_dense::IdSetDense> {
-    // One shared pre-allocated IdSetDense; workers write concurrently via
-    // `set_atomic`. Replaces the previous per-worker `IdSetDense`
+    needed_admin_ways: &crate::idset::IdSet,
+) -> Result<crate::idset::IdSet> {
+    // One shared pre-allocated IdSet; workers write concurrently via
+    // `set_atomic`. Replaces the previous per-worker `IdSet`
     // accumulation that grew to ~20 GB anon on Germany (~29.5 GB at planet)
     // because each worker allocated independent chunks across the full
     // planet ID range. Pattern follows `renumber_external/pass1.rs`
@@ -33,7 +33,7 @@ pub(super) fn run_pass1_5(
     // If a node blob lacks indexdata (-- force path only), the upper bound
     // is under-reported and `set_atomic` would panic via its diagnostic
     // path.
-    let mut referenced_nodes = crate::commands::id_set_dense::IdSetDense::new();
+    let mut referenced_nodes = crate::idset::IdSet::new();
     referenced_nodes.pre_allocate(max_node_id);
 
     // Custom worker pool that bypasses PrimitiveBlock construction
@@ -131,7 +131,7 @@ pub(super) fn run_pass1_5(
 /// Single header pass that produces everything Pass 1.5 and Pass 2a need to
 /// start: the way-blob schedule (for Pass 1.5 + unused by Pass 2a), the
 /// node-blob schedule (for Pass 2a), the max node ID from indexdata (so
-/// Pass 1.5 can `pre_allocate` the shared `IdSetDense`), and a single
+/// Pass 1.5 can `pre_allocate` the shared `IdSet`), and a single
 /// shared file handle reused across both phases' `pread_at` workers.
 ///
 /// Consolidates two previously-separate header walks (Pass 1.5's

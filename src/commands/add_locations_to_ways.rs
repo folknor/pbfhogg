@@ -22,7 +22,7 @@ use super::{
     ensure_relation_capacity_local, ensure_way_capacity_local, flush_passthrough_buf,
     read_raw_frame, require_indexdata, writer_from_header, HeaderOverrides, RawBlobFrame,
 };
-use super::id_set_dense::IdSetDense;
+use crate::idset::IdSet;
 
 use super::{Result, BATCH_SIZE, BATCH_BYTE_BUDGET, BATCH_MIN_BLOBS, BATCH_MAX_BLOBS};
 
@@ -364,7 +364,7 @@ fn build_node_index_sparse(
     input: &Path,
     direct_io: bool,
     scratch_dir: &Path,
-    referenced: &IdSetDense,
+    referenced: &IdSet,
 ) -> Result<SparseArrayIndex> {
     let mut offsets: Vec<u64> = Vec::new();
     let mut start_pad: Vec<u8> = Vec::new();
@@ -827,7 +827,7 @@ fn build_node_index(
     input: &Path,
     direct_io: bool,
     scratch_dir: &Path,
-    referenced: &IdSetDense,
+    referenced: &IdSet,
     index_type: IndexType,
 ) -> Result<NodeIndex> {
     match index_type {
@@ -854,7 +854,7 @@ fn build_node_index_dense(
     input: &Path,
     direct_io: bool,
     scratch_dir: &Path,
-    referenced: &IdSetDense,
+    referenced: &IdSet,
 ) -> Result<DenseMmapIndex> {
     let mut index = DenseMmapIndex::new(DENSE_INDEX_DEFAULT_CAPACITY, scratch_dir)?;
     let writer = SharedDenseWriter {
@@ -920,15 +920,15 @@ fn build_node_index_dense(
 /// ID that appears in any way's refs list. At planet scale (~2B unique node
 /// refs), this costs ~1.6 GB - far less than indexing all 10.4B nodes.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn collect_way_referenced_node_ids(input: &Path, direct_io: bool) -> Result<IdSetDense> {
+fn collect_way_referenced_node_ids(input: &Path, direct_io: bool) -> Result<IdSet> {
     // Way-ref scanner: bypasses PrimitiveBlock construction (no string table,
-    // no group_ranges). Only extracts way refs for IdSetDense population.
+    // no group_ranges). Only extracts way refs for IdSet population.
     let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
     blob_reader.set_parse_indexdata(true);
     blob_reader.next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
     let mut decompress_buf: Vec<u8> = Vec::new();
-    let mut referenced = IdSetDense::new();
+    let mut referenced = IdSet::new();
     let mut refs_buf: Vec<i64> = Vec::new();
     let mut group_starts: Vec<(usize, usize)> = Vec::new();
 
@@ -952,7 +952,7 @@ fn collect_way_referenced_node_ids(input: &Path, direct_io: bool) -> Result<IdSe
 
 /// Collect all node IDs referenced by relation members.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub(crate) fn collect_relation_member_node_ids(input: &Path, direct_io: bool) -> Result<IdSetDense> {
+pub(crate) fn collect_relation_member_node_ids(input: &Path, direct_io: bool) -> Result<IdSet> {
     // Sequential reader - only ~2K relation blobs at Europe scale, so retention
     // is negligible, but sequential is consistent with the other collection passes.
     let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
@@ -960,7 +960,7 @@ pub(crate) fn collect_relation_member_node_ids(input: &Path, direct_io: bool) ->
     blob_reader.next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
     let mut decompress_buf: Vec<u8> = Vec::new();
-    let mut member_node_ids = IdSetDense::new();
+    let mut member_node_ids = IdSet::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
@@ -1000,7 +1000,7 @@ fn write_output_checked(
     output: &Path,
     index: &NodeIndex,
     keep_untagged_nodes: bool,
-    relation_member_node_ids: Option<&IdSetDense>,
+    relation_member_node_ids: Option<&IdSet>,
     compression: Compression,
     direct_io: bool,
     indexdata_present: bool,
@@ -1042,7 +1042,7 @@ fn write_output_decode_all(
     output: &Path,
     index: &NodeIndex,
     keep_untagged_nodes: bool,
-    relation_member_node_ids: Option<&IdSetDense>,
+    relation_member_node_ids: Option<&IdSet>,
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
@@ -1189,7 +1189,7 @@ fn process_block(
     output: &mut Vec<OwnedBlock>,
     lookup: &LocationLookup<'_>,
     keep_untagged_nodes: bool,
-    relation_member_node_ids: Option<&IdSetDense>,
+    relation_member_node_ids: Option<&IdSet>,
     refs_buf: &mut Vec<i64>,
     locations_buf: &mut Vec<(i32, i32)>,
 ) -> std::result::Result<Stats, String> {
@@ -1274,7 +1274,7 @@ fn process_batch(
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     index: &NodeIndex,
     keep_untagged_nodes: bool,
-    relation_member_node_ids: Option<&IdSetDense>,
+    relation_member_node_ids: Option<&IdSet>,
 ) -> Result<Stats> {
     // For sparse index: resolve all way node coordinates upfront.
     let resolved_map;
@@ -1399,7 +1399,7 @@ fn write_output_passthrough(
     output: &Path,
     node_index: &NodeIndex,
     keep_untagged_nodes: bool,
-    relation_member_node_ids: Option<&IdSetDense>,
+    relation_member_node_ids: Option<&IdSet>,
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
@@ -1579,7 +1579,7 @@ fn process_slot_batch(
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     node_index: &NodeIndex,
     keep_untagged_nodes: bool,
-    relation_member_node_ids: Option<&IdSetDense>,
+    relation_member_node_ids: Option<&IdSet>,
 ) -> Result<Stats> {
     // For sparse: decompress first, resolve locations, then process.
     // For dense: decompress + process in one pass (original path).
@@ -1633,7 +1633,7 @@ fn process_slot_batch_dense(
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     node_index: &NodeIndex,
     keep_untagged_nodes: bool,
-    relation_member_node_ids: Option<&IdSetDense>,
+    relation_member_node_ids: Option<&IdSet>,
 ) -> Result<Stats> {
     type SlotResult = std::result::Result<(Vec<OwnedBlock>, Stats), String>;
     let lookup = LocationLookup::Index(node_index);

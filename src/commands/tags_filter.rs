@@ -4,7 +4,7 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
-use super::id_set_dense::IdSetDense;
+use crate::idset::IdSet;
 use super::tag_expr::{tag_matches, parse_expressions, Expression, TagMatcher};
 use super::{
     dense_node_metadata, drain_batch_results, element_metadata, flush_local, require_indexdata,
@@ -355,13 +355,13 @@ fn process_filter_batch(
 
 /// Read-only ID sets for Pass 2, shared across rayon threads.
 struct Pass2IdSets<'a> {
-    matched_node_ids: &'a IdSetDense,
-    direct_way_ids: &'a IdSetDense,
-    included_way_ids: &'a IdSetDense,
-    direct_relation_ids: &'a IdSetDense,
-    included_relation_ids: &'a IdSetDense,
-    way_dep_node_ids: &'a IdSetDense,
-    relation_dep_node_ids: &'a IdSetDense,
+    matched_node_ids: &'a IdSet,
+    direct_way_ids: &'a IdSet,
+    included_way_ids: &'a IdSet,
+    direct_relation_ids: &'a IdSet,
+    included_relation_ids: &'a IdSet,
+    way_dep_node_ids: &'a IdSet,
+    relation_dep_node_ids: &'a IdSet,
 }
 
 /// Process a single block in Pass 2: write elements whose IDs were collected in Pass 1.
@@ -535,22 +535,22 @@ fn tags_filter_two_pass(
     // --- Pass 1: Collect match results and way dependencies ---
     crate::debug::emit_marker("TAGSFILTER_PASS1_START");
     //
-    // IdSetDense: O(1) set/get, 1 bit per ID, ~1.5 GB max for planet-scale node IDs.
+    // IdSet: O(1) set/get, 1 bit per ID, ~1.5 GB max for planet-scale node IDs.
     // No sort/dedup step needed between passes (bitset deduplicates inherently).
-    let mut matched_node_ids = IdSetDense::new();
-    let mut direct_way_ids = IdSetDense::new();
-    let mut included_way_ids = IdSetDense::new();
-    let mut direct_relation_ids = IdSetDense::new();
-    let mut included_relation_ids = IdSetDense::new();
-    let mut way_dep_node_ids = IdSetDense::new();
-    let mut relation_dep_node_ids = IdSetDense::new();
+    let mut matched_node_ids = IdSet::new();
+    let mut direct_way_ids = IdSet::new();
+    let mut included_way_ids = IdSet::new();
+    let mut direct_relation_ids = IdSet::new();
+    let mut included_relation_ids = IdSet::new();
+    let mut way_dep_node_ids = IdSet::new();
+    let mut relation_dep_node_ids = IdSet::new();
     let mut has_included_way = false;
     let mut has_included_relation = false;
 
     // Pass 1: parallel classification via pread-from-workers.
     // Workers own the full PrimitiveBlock lifecycle (pread → decompress →
     // PrimitiveBlock → tag match → send compact results). Consumer merges
-    // matching IDs into the IdSetDense collections.
+    // matching IDs into the IdSet collections.
     {
     // Read header for locations-on-ways warning.
     let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
@@ -931,7 +931,7 @@ fn tags_filter_two_pass(
 // ---------------------------------------------------------------------------
 
 /// Set an ID in the dense set and return whether it was newly inserted.
-fn set_if_absent(set: &mut IdSetDense, id: i64) -> bool {
+fn set_if_absent(set: &mut IdSet, id: i64) -> bool {
     if set.get(id) {
         return false;
     }
@@ -954,9 +954,9 @@ struct RelationClosureSummary {
 fn collect_relation_member_closure(
     input: &Path,
     _direct_io: bool,
-    included_relation_ids: &mut IdSetDense,
-    included_way_ids: &mut IdSetDense,
-    relation_dep_node_ids: &mut IdSetDense,
+    included_relation_ids: &mut IdSet,
+    included_way_ids: &mut IdSet,
+    relation_dep_node_ids: &mut IdSet,
 ) -> Result<RelationClosureSummary> {
     let mut summary = RelationClosureSummary::default();
 
@@ -1038,9 +1038,9 @@ fn collect_relation_member_closure(
 fn collect_way_node_dependencies(
     input: &Path,
     _direct_io: bool,
-    included_way_ids: &IdSetDense,
-    skip_way_ids: Option<&IdSetDense>,
-    relation_dep_node_ids: &mut IdSetDense,
+    included_way_ids: &IdSet,
+    skip_way_ids: Option<&IdSet>,
+    relation_dep_node_ids: &mut IdSet,
 ) -> Result<()> {
     let (schedule, shared_file) = super::build_classify_schedule(
         input, Some(crate::blob_meta::ElemKind::Way),
@@ -1049,7 +1049,7 @@ fn collect_way_node_dependencies(
     super::parallel_classify_accumulate(
         &shared_file,
         &schedule,
-        IdSetDense::new,
+        IdSet::new,
         |block, node_ids| {
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element

@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use super::id_set_dense::IdSetDense;
+use crate::idset::IdSet;
 use super::{Result, TypeFilter};
 use crate::ElementReader;
 
@@ -12,7 +12,7 @@ use crate::ElementReader;
 
 /// Configuration for the `verify_ids` command.
 pub struct VerifyIdsOptions<'a> {
-    /// When true, use `IdSetDense` per type to detect duplicate IDs.
+    /// When true, use `IdSet` per type to detect duplicate IDs.
     /// Increases memory usage but catches duplicates that monotonicity alone cannot.
     pub full: bool,
     /// Filter by element type (comma-separated: "node", "way", "relation").
@@ -238,9 +238,9 @@ struct ScanState {
     total_violations: u64,
     max_errors: usize,
     type_filter: TypeFilter,
-    node_ids: Option<IdSetDense>,
-    way_ids: Option<IdSetDense>,
-    relation_ids: Option<IdSetDense>,
+    node_ids: Option<IdSet>,
+    way_ids: Option<IdSet>,
+    relation_ids: Option<IdSet>,
 }
 
 impl ScanState {
@@ -258,9 +258,9 @@ impl ScanState {
             total_violations: 0,
             max_errors: opts.max_errors,
             type_filter,
-            node_ids: if opts.full { Some(IdSetDense::new()) } else { None },
-            way_ids: if opts.full { Some(IdSetDense::new()) } else { None },
-            relation_ids: if opts.full { Some(IdSetDense::new()) } else { None },
+            node_ids: if opts.full { Some(IdSet::new()) } else { None },
+            way_ids: if opts.full { Some(IdSet::new()) } else { None },
+            relation_ids: if opts.full { Some(IdSet::new()) } else { None },
         }
     }
 
@@ -349,13 +349,13 @@ impl ScanState {
     }
 }
 
-/// Check for duplicate ID in the given `IdSetDense` (free function to avoid
+/// Check for duplicate ID in the given `IdSet` (free function to avoid
 /// borrow conflicts).
 ///
 /// When the set is `None` (streaming mode), this is a no-op. When `Some`,
 /// calls `set_if_new` and records a violation if the ID was already present.
 fn check_duplicate(
-    set: &mut Option<IdSetDense>,
+    set: &mut Option<IdSet>,
     violations: &mut Vec<IdViolation>,
     total_violations: &mut u64,
     max_errors: usize,
@@ -391,12 +391,12 @@ fn rank_to_name(rank: u8) -> &'static str {
 /// - **Streaming (default):** single pipelined pass via `for_each_pipelined`.
 ///   Constant memory. Monotonicity + type-order only - no duplicate detection.
 /// - **Full:** three-phase parallel scan via `parallel_classify_phase`. Each
-///   phase populates a shared `IdSetDense` using `set_atomic_if_new`; cross-blob
+///   phase populates a shared `IdSet` using `set_atomic_if_new`; cross-blob
 ///   monotonicity is resolved in the main-thread merge via seq-ordered buffering.
 ///
 /// # Planet-scale memory (full mode)
 ///
-/// Three `IdSetDense` pre-allocated to OSM ID ceilings (~1.6 GB for nodes,
+/// Three `IdSet` pre-allocated to OSM ID ceilings (~1.6 GB for nodes,
 /// 175 MB for ways, 3 MB for relations) when the corresponding `type_filter`
 /// bit is set. Pre-allocation is mandatory for `set_atomic_if_new` (workers
 /// panic on unallocated chunks). Total full-mode RSS at planet: ~1.8 GB.
@@ -444,7 +444,7 @@ struct BlobVerifyResult {
     count: u64,
     /// Non-monotonic violations observed *within* this blob.
     within_violations: Vec<IdViolation>,
-    /// IDs that were already set in the shared IdSetDense when this blob
+    /// IDs that were already set in the shared IdSet when this blob
     /// tried to insert them. One entry per collision (not deduplicated -
     /// distinct duplicate occurrences count separately, matching the
     /// pre-swap RoaringTreemap::insert-returns-false semantics).
@@ -490,10 +490,10 @@ fn verify_ids_full_parallel(path: &Path, opts: &VerifyIdsOptions<'_>) -> Result<
 
     let type_filter = opts.type_filter.map_or_else(TypeFilter::all, TypeFilter::parse);
 
-    // Pre-allocate IdSetDenses for the kinds we intend to verify.
-    let mut node_ids = IdSetDense::new();
-    let mut way_ids = IdSetDense::new();
-    let mut relation_ids = IdSetDense::new();
+    // Pre-allocate IdSets for the kinds we intend to verify.
+    let mut node_ids = IdSet::new();
+    let mut way_ids = IdSet::new();
+    let mut relation_ids = IdSet::new();
     if type_filter.nodes {
         node_ids.pre_allocate(14_000_000_000);
     }
@@ -608,7 +608,7 @@ fn verify_ids_full_parallel(path: &Path, opts: &VerifyIdsOptions<'_>) -> Result<
 fn verify_single_kind_parallel(
     shared_file: &std::sync::Arc<std::fs::File>,
     schedule: &[(usize, u64, usize)],
-    id_set: &IdSetDense,
+    id_set: &IdSet,
     elem_type: &'static str,
     max_errors_remaining: usize,
     extract_id: impl Fn(&crate::Element) -> Option<i64> + Send + Sync,

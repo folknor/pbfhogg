@@ -46,7 +46,7 @@ pub(super) fn run_pass1_5(
     crate::debug::emit_marker("GEOCODE_PASS1_5_SCAN_START");
     {
         let referenced_ref = &referenced_nodes;
-        let literals = crate::commands::way_scanner::GeocodeTagLiterals::standard();
+        let literals = crate::scan::way::GeocodeTagLiterals::standard();
         let literals_ref = &literals;
         let needed_admin_ways_ref = needed_admin_ways;
 
@@ -88,7 +88,7 @@ pub(super) fn run_pass1_5(
                             decompress_buf.clear();
                             crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
                                 .map_err(|e| e.to_string())?;
-                            crate::commands::way_scanner::scan_way_geocode_tagged_refs(
+                            crate::scan::way::scan_way_geocode_tagged_refs(
                                 &decompress_buf,
                                 literals_ref,
                                 &mut refs_buf,

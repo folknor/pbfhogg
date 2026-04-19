@@ -149,7 +149,7 @@ pub(super) fn stage1_pass_a(
                             let t2 = std::time::Instant::now();
                             let mut blob_node_ids: Vec<i64> = Vec::new();
                             let mut per_way_rcs: Vec<u32> = Vec::new();
-                            super::super::way_scanner::scan_way_refs(
+                            crate::scan::way::scan_way_refs(
                                 &decompress_buf, &mut refs_buf, &mut group_starts,
                                 |_way_id, refs| {
                                     blob_node_ids.extend_from_slice(refs);
@@ -437,7 +437,7 @@ pub(super) fn stage1_way_pass(
                             let t2 = std::time::Instant::now();
                             let slot_start = slot_starts_ref[task.seq as usize];
                             let mut blob_node_ids: Vec<i64> = Vec::new();
-                            super::super::way_scanner::scan_way_refs(
+                            crate::scan::way::scan_way_refs(
                                 &decompress_buf, &mut refs_buf, &mut group_starts,
                                 |_way_id, refs| {
                                     blob_node_ids.extend_from_slice(refs);

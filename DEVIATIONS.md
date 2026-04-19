@@ -19,7 +19,7 @@ the extra relation-scanning pass is negligible (relation blobs are a small
 fraction of the file, filtered via `BlobFilter::only_relations()`).
 
 **Implementation:** A third pass scans relation blobs to collect node IDs
-referenced as members into an `IdSetDense` bitset. During the write pass,
+referenced as members into an `IdSet` bitset. During the write pass,
 untagged nodes are kept if they appear in this set. The pass is skipped entirely
 when `--keep-untagged-nodes` is set (all nodes are kept anyway).
 
@@ -146,7 +146,7 @@ IDs are JOSM editor-local staging identifiers that are resolved before
 upload to OSM - they never appear in production planet extracts or
 Geofabrik downloads.
 
-**Rationale:** The renumber implementation uses `IdSetDense` bitsets indexed
+**Rationale:** The renumber implementation uses `IdSet` bitsets indexed
 by unsigned ID for O(1) rank-based lookup. Negative IDs would require
 either a separate data structure or offset mapping. Since negative IDs
 are never present in real-world inputs, the complexity isn't justified.

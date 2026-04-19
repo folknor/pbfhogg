@@ -275,7 +275,7 @@ Build a wire-format `scan_ids_refs_members(decompressed, callbacks)` that extrac
 
 Skip the `PrimitiveBlock::StringTable` entirely - we never resolve any key or value string in check_refs.
 
-Template: [`scan_way_refs`](../src/commands/way_scanner.rs#L24) is the existing shape for way refs; add node-ID and relation-member variants.
+Template: [`scan_way_refs`](../src/scan/way.rs#L24) is the existing shape for way refs; add node-ID and relation-member variants.
 
 **Expected**: cuts per-blob decode + parse cost roughly in half. Whether this matters depends on where #2 leaves things. If post-#2 wall is ~8 min evenly split between decompression and `PrimitiveBlock` parse, this saves ~2 min. If decompression dominates, this saves less.
 

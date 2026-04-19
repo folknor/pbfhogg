@@ -124,6 +124,7 @@ pub mod debug;
 mod error;
 pub(crate) mod idset;
 pub(crate) mod reorder_buffer;
+pub(crate) mod scan;
 
 // ---------------------------------------------------------------------------
 // Public API re-exports

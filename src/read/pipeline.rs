@@ -78,7 +78,7 @@ impl Default for PipelineConfig {
 /// **Mitigation patterns:**
 /// - **Sequential reader**: use `BlobReader` directly instead of this
 ///   pipeline. All alloc/free on one thread. Used by external join stages 2+4.
-/// - **Node-only scanner**: use `commands::node_scanner::extract_node_tuples`
+/// - **Node-only scanner**: use `scan::node::extract_node_tuples`
 ///   to bypass PrimitiveBlock entirely. Zero per-block heap allocations.
 ///   Used by external join stage 2 and ALTW dense/sparse pass 1.
 /// - **Batch-based consumers** (e.g., `for_each_primitive_block_batch` with

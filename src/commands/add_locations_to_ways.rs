@@ -399,7 +399,7 @@ fn build_node_index_sparse(
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
 
     let mut decompress_buf: Vec<u8> = Vec::new();
-    let mut tuples: Vec<super::node_scanner::NodeTuple> = Vec::new();
+    let mut tuples: Vec<crate::scan::node::NodeTuple> = Vec::new();
     let mut group_starts: Vec<(usize, usize)> = Vec::new();
 
     for blob_result in &mut blob_reader {
@@ -415,9 +415,9 @@ fn build_node_index_sparse(
 
         blob.decompress_into(&mut decompress_buf)?;
         tuples.clear();
-        super::node_scanner::extract_node_tuples(&decompress_buf, &mut tuples, &mut group_starts)?;
+        crate::scan::node::extract_node_tuples(&decompress_buf, &mut tuples, &mut group_starts)?;
 
-        for &super::node_scanner::NodeTuple { id, lat, lon } in &tuples {
+        for &crate::scan::node::NodeTuple { id, lat, lon } in &tuples {
             if !referenced.get(id) {
                 continue;
             }
@@ -882,7 +882,7 @@ fn build_node_index_dense(
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
 
     let mut decompress_buf: Vec<u8> = Vec::new();
-    let mut tuples: Vec<super::node_scanner::NodeTuple> = Vec::new();
+    let mut tuples: Vec<crate::scan::node::NodeTuple> = Vec::new();
     let mut group_starts: Vec<(usize, usize)> = Vec::new();
 
     for blob_result in &mut blob_reader {
@@ -899,7 +899,7 @@ fn build_node_index_dense(
 
         blob.decompress_into(&mut decompress_buf)?;
         tuples.clear();
-        super::node_scanner::extract_node_tuples(&decompress_buf, &mut tuples, &mut group_starts)?;
+        crate::scan::node::extract_node_tuples(&decompress_buf, &mut tuples, &mut group_starts)?;
 
         // Insert into mmap index. SharedDenseWriter is safe for concurrent access
         // (direct mmap slot writes to disjoint positions).
@@ -939,7 +939,7 @@ fn collect_way_referenced_node_ids(input: &Path, direct_io: bool) -> Result<IdSe
             if !matches!(idx.kind, crate::blob_meta::ElemKind::Way) { continue; }
         }
         blob.decompress_into(&mut decompress_buf)?;
-        super::way_scanner::scan_way_refs(&decompress_buf, &mut refs_buf, &mut group_starts, |_way_id, refs| {
+        crate::scan::way::scan_way_refs(&decompress_buf, &mut refs_buf, &mut group_starts, |_way_id, refs| {
             for &node_id in refs {
                 if node_id >= 0 {
                     referenced.set(node_id);

@@ -11,8 +11,6 @@ pub mod extract;
 pub mod getid;
 pub mod getparents;
 pub mod inspect;
-pub(crate) mod node_scanner;
-pub(crate) mod way_scanner;
 pub mod merge;
 pub mod merge_changes;
 pub mod merge_pbf;

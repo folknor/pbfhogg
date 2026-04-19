@@ -44,7 +44,7 @@ Every command runs on the full planet on normal hardware. Measured on **plantasj
 | `check --refs` | **1m10s** | **2.17 GB** | referential integrity over 11.6B elements |
 | `cat` (indexdata generation) | **1m26s** | ~200 MB | rewrites BlobHeader without re-compressing |
 | `getid --invert` | 1m31s | 102 MB | raw-frame passthrough for non-intersecting blobs |
-| `renumber` | 3m25s | **3.3 GB** | wire-format rewriters, shared atomic IdSetDense |
+| `renumber` | 3m25s | **3.3 GB** | wire-format rewriters, shared atomic IdSet |
 | `extract --smart` (Europe bbox) | 4m28s | 11.17 GB | three-pass, multipolygon-complete |
 | `add-locations-to-ways --index-type external` | 11m01s | 17.2 GB | rank-bucketed counting sort → per-blob delta-varint coord payloads, ~246 GB temp disk |
 | `apply-changes` (daily diff, zlib) | 12m36s | ~1.8 GB | 3.4M-change daily diff, 86% rewrite |

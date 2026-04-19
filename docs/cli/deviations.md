@@ -19,7 +19,7 @@ the extra relation-scanning pass is negligible (relation blobs are a small
 fraction of the file, filtered via `BlobFilter::only_relations()`).
 
 **Implementation:** A third pass scans relation blobs to collect node IDs
-referenced as members into an `IdSetDense` bitset. During the write pass,
+referenced as members into an `IdSet` bitset. During the write pass,
 untagged nodes are kept if they appear in this set. The pass is skipped entirely
 when `--keep-untagged-nodes` is set (all nodes are kept anyway).
 

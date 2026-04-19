@@ -217,7 +217,7 @@ fn extract_node_coords_parallel(
             scope.spawn(move || {
                 let mut read_buf: Vec<u8> = Vec::new();
                 let mut decompress_buf: Vec<u8> = Vec::new();
-                let mut tuples: Vec<crate::commands::node_scanner::NodeTuple> = Vec::new();
+                let mut tuples: Vec<crate::scan::node::NodeTuple> = Vec::new();
                 let mut group_starts: Vec<(usize, usize)> = Vec::new();
 
                 loop {
@@ -244,7 +244,7 @@ fn extract_node_coords_parallel(
                         tuples.clear();
                         group_starts.clear();
                         // Match sequential behaviour: swallow extract errors.
-                        if crate::commands::node_scanner::extract_node_tuples(
+                        if crate::scan::node::extract_node_tuples(
                             &decompress_buf,
                             &mut tuples,
                             &mut group_starts,

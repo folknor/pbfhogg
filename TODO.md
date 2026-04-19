@@ -113,15 +113,15 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   coverage sweep, brokkr `--probes`, backend migration) in
   [`notes/instrumentation-layering.md`](notes/instrumentation-layering.md).
 
-- [ ] **Audit callers for `IdSetDense::set_if_new` / `set_atomic_if_new` uplift** -
+- [ ] **Audit callers for `IdSet::set_if_new` / `set_atomic_if_new` uplift** -
   Two methods added during `verify_ids --full` parallel rewrite
-  ([commit `855b3b2`](src/commands/id_set_dense.rs)) return whether a bit
+  ([commit `855b3b2`](src/idset.rs)) return whether a bit
   was previously unset - one-cache-line duplicate/first-time detection
   mirroring `RoaringTreemap::insert`'s return-bool semantics but at
-  `IdSetDense` speed. Useful anywhere code needs "have I seen this ID
+  `IdSet` speed. Useful anywhere code needs "have I seen this ID
   before?" without a separate `get` + `set` pair.
 
-  Starting candidates to audit (each represents an `IdSetDense` caller
+  Starting candidates to audit (each represents an `IdSet` caller
   that might benefit):
   - **`check_refs` missing-ref vecs** - currently `Vec<i64>` +
     `sort_unstable` + `dedup` at end of pass. At planet these are tiny
@@ -136,7 +136,7 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   - **`extract` multi-region ID collection** - per-region `Vec<i64>`s
     pushed under `way.refs().any(bbox_contains)`; if a way's refs include
     duplicates (which they can) the same node ID gets pushed multiple
-    times. `set_if_new` on the per-region `IdSetDense` would dedupe
+    times. `set_if_new` on the per-region `IdSet` would dedupe
     in-place.
   - **`renumber_external` scan phases** - anywhere a "first time we see
     this ID" branch exists that currently requires a preceding `get`.
@@ -285,8 +285,8 @@ knob is pure wall/interop trade-off, not a size trade-off.
   current planet-scale paths don't use `parallel_classify_phase` for
   heavy scans. Flagged by 1/10 reviewers.
 
-- [ ] **Simple extract node_scanner skips non-dense Node messages** -
-  `node_scanner.rs` only parses DenseNodes (line 15, 43). On legacy
+- [ ] **Simple extract node scanner skips non-dense Node messages** -
+  `src/scan/node.rs` only parses DenseNodes. On legacy
   PBFs with field-1 Node messages, `bbox_node_ids` would be incomplete,
   cascading into missing ways and relations. Not reachable in practice
   (all modern PBFs use DenseNodes). Flagged by 1/10 reviewers.
@@ -320,7 +320,7 @@ the fastest one.
 Single-pass multi-extract shipped for simple strategy on sorted input
 (commit `542aad0`). Reads PBF once, classifies each element against N
 regions, writes to N sync-mode PbfWriters. 3-phase barrier (nodes →
-ways → relations) with per-region IdSetDense + BlockBuilder. Memory:
+ways → relations) with per-region IdSet + BlockBuilder. Memory:
 N × ~1.5 GB at planet scale. Falls back to sequential for unsorted
 input or --clean. Verified via `brokkr verify multi-extract`.
 
@@ -414,7 +414,7 @@ single-pass, tag expression and bbox filtering.
     in the reframe functions. Est. −2 to −3 s wall.
   - [ ] **Skip `way_id_set` if way rank derivable from schedule.** Sorted
     input means new way ID = `start_way_id + global_position`. Derive from
-    schedule prefix sums instead of building a full IdSetDense. Saves ~160 MB.
+    schedule prefix sums instead of building a full IdSet. Saves ~160 MB.
   - [ ] **Finer stage 2d reframe breakdown.** Split `reframe_ms` into
     parse/lookup/encode/frame to identify which sub-step dominates.
 

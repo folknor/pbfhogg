@@ -25,7 +25,7 @@
 //!
 //! See `notes/cross-pipeline-optimization-plan.md` for the full list of retrofit targets.
 
-use super::Result;
+use crate::Result;
 
 /// Compact node coordinate tuple. 16 bytes - id (i64) + lat (i32) + lon (i32).
 #[derive(Clone, Copy)]

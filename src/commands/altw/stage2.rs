@@ -15,7 +15,7 @@ use super::super::external_radix::{ScratchDir, NUM_BUCKETS};
 #[cfg(feature = "linux-direct-io")]
 use super::super::external_radix::advise_dontneed_file;
 use crate::idset::IdSet;
-use super::super::node_scanner::{extract_node_tuples, NodeTuple};
+use crate::scan::node::{extract_node_tuples, NodeTuple};
 use super::super::Result;
 use super::{
     slot_bucket_bounds, NodeBlobInfo, RANK_RECORD_SIZE, RESOLVED_ENTRY_SIZE, COORD_SLOT_SIZE,

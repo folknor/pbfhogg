@@ -83,7 +83,7 @@ Used by all commands that produce PBF output.
 
 ### Node-Only Wire Scanner
 
-`src/commands/node_scanner.rs` - parses `DenseNodes` directly from decompressed wire format, bypassing `PrimitiveBlock` construction. Zero per-block heap allocation. Extracts `(id, lat, lon)` tuples.
+`src/scan/node.rs` - parses `DenseNodes` directly from decompressed wire format, bypassing `PrimitiveBlock` construction. Zero per-block heap allocation. Extracts `(id, lat, lon)` tuples.
 
 Used internally by external join (stage 2), ALTW dense/sparse (pass 1), and merge `--locations-on-ways`.
 

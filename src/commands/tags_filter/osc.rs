@@ -12,7 +12,7 @@ use quick_xml::{Reader, Writer};
 
 use crate::osc::write::{format_coord, from_decimicro, OwnedMember, OwnedNode, OwnedRelation, OwnedWay};
 use crate::tag_expr::{tag_matches, parse_expressions, Expression};
-use super::Result;
+use crate::BoxResult as Result;
 use crate::{MemberId, MemberType};
 
 fn matches_any(expressions: &[Expression], tags: &[(String, String)], element_type: char) -> bool {

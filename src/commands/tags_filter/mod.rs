@@ -1,5 +1,7 @@
 //! Filter elements by tag expressions. Equivalent to `osmium tags-filter`.
 
+pub mod osc;
+
 use std::path::Path;
 
 use rayon::prelude::*;

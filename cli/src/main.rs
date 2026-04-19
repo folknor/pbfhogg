@@ -1513,7 +1513,7 @@ fn run_tags_filter_osc(
     if all_expressions.is_empty() {
         return Err("no filter expressions provided (use positional args or -e FILE)".into());
     }
-    let stats = pbfhogg::tags_filter_osc::tags_filter_osc(changes, output, &all_expressions)?;
+    let stats = pbfhogg::tags_filter::osc::tags_filter_osc(changes, output, &all_expressions)?;
     stats.print_summary();
     Ok(())
 }

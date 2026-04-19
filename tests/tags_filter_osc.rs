@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use pbfhogg::tags_filter_osc::tags_filter_osc;
+use pbfhogg::tags_filter::osc::tags_filter_osc;
 use tempfile::TempDir;
 
 fn exprs(strs: &[&str]) -> Vec<String> {

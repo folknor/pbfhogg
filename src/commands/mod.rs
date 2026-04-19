@@ -17,7 +17,6 @@ pub mod renumber_external;
 pub mod sort;
 pub mod tags_count;
 pub mod tags_filter;
-pub mod tags_filter_osc;
 pub mod time_filter;
 #[cfg(feature = "commands")]
 pub mod verify_ids;

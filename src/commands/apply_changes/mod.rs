@@ -14,6 +14,7 @@ mod classify;
 mod diff_ranges;
 mod element_writes;
 mod node_locations;
+mod parallel_reader;
 mod rewrite;
 mod stats;
 

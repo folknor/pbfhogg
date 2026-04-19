@@ -278,7 +278,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     // fall back to element-by-element iteration.
     crate::debug::emit_marker("PASS1_NODE_CLASSIFY_START");
     let use_columnar = matches!(region, Region::Bbox(_));
-    super::super::parallel_classify_phase(
+    crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &node_schedule,
         || (crate::read::columnar::DenseNodeColumns::new(), Vec::<i64>::new()),
@@ -318,7 +318,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
 
     // Phase 2: Classify ways by ref intersection with bbox nodes.
     crate::debug::emit_marker("PASS1_WAY_CLASSIFY_START");
-    super::super::parallel_classify_phase(
+    crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &way_schedule,
         || (),
@@ -345,7 +345,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     // Phase 3: Classify relations by member intersection.
     crate::debug::emit_marker("PASS1_RELATION_CLASSIFY_START");
     let collect_member_ids = H::COLLECT_MEMBER_IDS;
-    super::super::parallel_classify_accumulate(
+    crate::scan::classify::parallel_classify_accumulate(
         &shared_file,
         &relation_schedule,
         || (IdSet::new(), IdSet::new(), IdSet::new()),
@@ -429,7 +429,7 @@ pub(super) fn extract_smart(
     crate::debug::emit_marker("SMART_PASS2_SCHEDULE_START");
     let pass1_way_schedule = std::mem::take(&mut result.way_schedule);
     let (way_schedule, shared_file) = if pass1_way_schedule.is_empty() {
-        super::super::build_classify_schedule(input, Some(crate::blob_meta::ElemKind::Way))?
+        crate::scan::classify::build_classify_schedule(input, Some(crate::blob_meta::ElemKind::Way))?
     } else {
         let shared_file = std::sync::Arc::new(
             std::fs::File::open(input)
@@ -450,7 +450,7 @@ pub(super) fn extract_smart(
     // elsewhere (still under investigation, see
     // notes/parallel-classify-regression-2026-04-11-followup.md).
     crate::debug::emit_marker("SMART_PASS2_CLASSIFY_START");
-    super::super::parallel_classify_phase(
+    crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &way_schedule,
         Vec::<i64>::new,

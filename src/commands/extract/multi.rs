@@ -176,7 +176,7 @@ pub(super) fn try_extract_multi_single_pass(
         let bboxes: Vec<(i32, i32, i32, i32)> = bbox_ints.iter()
             .map(|bi| (bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon))
             .collect();
-        super::super::parallel_classify_phase(
+        crate::scan::classify::parallel_classify_phase(
             &shared_file,
             &node_schedule,
             || (crate::read::columnar::DenseNodeColumns::new(), vec![Vec::<i64>::new(); n]),
@@ -193,7 +193,7 @@ pub(super) fn try_extract_multi_single_pass(
             },
         )?;
     } else {
-        super::super::parallel_classify_phase(
+        crate::scan::classify::parallel_classify_phase(
             &shared_file,
             &node_schedule,
             || vec![Vec::<i64>::new(); n],
@@ -285,7 +285,7 @@ pub(super) fn try_extract_multi_single_pass(
     // instrumentation Japan 5-region bench showed this phase at 892 ms
     // with the prior `|| ()` + per-block `vec![Vec::new(); n]` allocation.
     crate::debug::emit_marker("MULTI_WAY_CLASSIFY_START");
-    super::super::parallel_classify_phase(
+    crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &way_schedule,
         || vec![Vec::<i64>::new(); n],
@@ -344,7 +344,7 @@ pub(super) fn try_extract_multi_single_pass(
 
     // Phase 3: Parallel relation classification → N matched_relation_ids.
     crate::debug::emit_marker("MULTI_REL_CLASSIFY_START");
-    super::super::parallel_classify_accumulate(
+    crate::scan::classify::parallel_classify_accumulate(
         &shared_file,
         &relation_schedule,
         || (0..n).map(|_| IdSet::new()).collect::<Vec<_>>(),

@@ -409,7 +409,7 @@ pub(super) fn run_pass2(
         };
         let coord_ref = &coord_shared;
         let mut merge_err: Option<std::io::Error> = None;
-        crate::commands::parallel_classify_phase(
+        crate::scan::classify::parallel_classify_phase(
             shared_file,
             node_schedule,
             NodeBlobOut::default,
@@ -496,7 +496,7 @@ pub(super) fn run_pass2(
         let needed_admin_ways_ref = &needed_admin_ways;
         let mut merge_err: Option<String> = None;
 
-        crate::commands::parallel_classify_phase(
+        crate::scan::classify::parallel_classify_phase(
             shared_file,
             way_schedule,
             WayBlobOut::default,

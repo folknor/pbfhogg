@@ -6,7 +6,7 @@ use std::time::Instant;
 use crate::{Element, MemberId};
 
 use crate::idset::IdSet;
-use crate::commands::{build_classify_schedules_split, parallel_classify_phase};
+use crate::scan::classify::{build_classify_schedules_split, parallel_classify_phase};
 use crate::BoxResult as Result;
 
 /// A single missing reference entry (populated when `show_ids` is true).

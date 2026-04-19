@@ -506,7 +506,7 @@ fn verify_ids_full_parallel(path: &Path, opts: &VerifyIdsOptions<'_>) -> Result<
     }
 
     let (node_schedule, way_schedule, rel_schedule, shared_file) =
-        crate::commands::build_classify_schedules_split(path)?;
+        crate::scan::classify::build_classify_schedules_split(path)?;
 
     // Accumulators for the report.
     let mut node_count: u64 = 0;
@@ -621,7 +621,7 @@ fn verify_single_kind_parallel(
     let mut per_blob: Vec<Option<BlobVerifyResult>> = (0..schedule.len()).map(|_| None).collect();
     let extract_ref = &extract_id;
 
-    crate::commands::parallel_classify_phase(
+    crate::scan::classify::parallel_classify_phase(
         shared_file,
         schedule,
         || (),

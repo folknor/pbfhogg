@@ -139,7 +139,7 @@ pub fn parse_ids_from_pbf(path: &Path, _direct_io: bool) -> Result<ElementIds> {
         relation_ids: IdSet::new(),
     };
 
-    let (schedule, shared_file) = super::build_classify_schedule(path, None)?;
+    let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(path, None)?;
 
     struct IdBatch {
         node_ids: Vec<i64>,
@@ -147,7 +147,7 @@ pub fn parse_ids_from_pbf(path: &Path, _direct_io: bool) -> Result<ElementIds> {
         relation_ids: Vec<i64>,
     }
 
-    super::parallel_classify_phase(
+    crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &schedule,
         || (),
@@ -407,11 +407,11 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &ElementIds, opts: &GetidOp
     if ids.way_ids.has_any() {
         // Parallel classification: pread workers scan way blobs for matching
         // way IDs and collect their node refs.
-        let (schedule, shared_file) = super::build_classify_schedule(
+        let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
             input, Some(crate::blob_meta::ElemKind::Way),
         )?;
 
-        super::parallel_classify_accumulate(
+        crate::scan::classify::parallel_classify_accumulate(
             &shared_file,
             &schedule,
             crate::idset::IdSet::new,

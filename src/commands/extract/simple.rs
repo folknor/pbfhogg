@@ -552,10 +552,10 @@ fn extract_simple_single_pass(
     crate::debug::emit_marker("SIMPLE_REL_CLASSIFY_START");
     let mut matched_relation_ids = IdSet::new();
     {
-        let (rel_classify_schedule, rel_classify_file) = super::super::build_classify_schedule(
+        let (rel_classify_schedule, rel_classify_file) = crate::scan::classify::build_classify_schedule(
             input, Some(crate::blob_meta::ElemKind::Relation),
         )?;
-        super::super::parallel_classify_accumulate(
+        crate::scan::classify::parallel_classify_accumulate(
             &rel_classify_file,
             &rel_classify_schedule,
             IdSet::new,

@@ -5,5 +5,6 @@
 //! cannot afford the string-table parsing and group allocation overhead of
 //! the standard read pipeline.
 
+pub(crate) mod classify;
 pub(crate) mod node;
 pub(crate) mod way;

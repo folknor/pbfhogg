@@ -611,7 +611,7 @@ fn tags_filter_two_pass(
         matched_relations: Vec<i64>,
     }
 
-    super::parallel_classify_phase(
+    crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &schedule,
         || (),
@@ -964,7 +964,7 @@ fn collect_relation_member_closure(
     let mut summary = RelationClosureSummary::default();
 
     // Build schedule once - reused across convergence iterations.
-    let (schedule, shared_file) = super::build_classify_schedule(
+    let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input, Some(crate::blob_meta::ElemKind::Relation),
     )?;
 
@@ -980,7 +980,7 @@ fn collect_relation_member_closure(
         // Classify phase: workers read included_relation_ids (immutable).
         // Results collected into a Vec - merge phase runs after with mutable access.
         let mut results: Vec<ClosureResult> = Vec::new();
-        super::parallel_classify_accumulate(
+        crate::scan::classify::parallel_classify_accumulate(
             &shared_file,
             &schedule,
             || ClosureResult {
@@ -1045,11 +1045,11 @@ fn collect_way_node_dependencies(
     skip_way_ids: Option<&IdSet>,
     relation_dep_node_ids: &mut IdSet,
 ) -> Result<()> {
-    let (schedule, shared_file) = super::build_classify_schedule(
+    let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input, Some(crate::blob_meta::ElemKind::Way),
     )?;
 
-    super::parallel_classify_accumulate(
+    crate::scan::classify::parallel_classify_accumulate(
         &shared_file,
         &schedule,
         IdSet::new,

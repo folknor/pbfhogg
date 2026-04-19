@@ -63,7 +63,6 @@ geocode-reader = ["dep:s2"]
 commands = ["dep:serde_json", "geocode-reader"]
 hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
-instrument = []
 linux-direct-io = []
 linux-io-uring = ["dep:io-uring"]
 

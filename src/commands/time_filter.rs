@@ -104,7 +104,15 @@ pub fn time_filter(
     };
 
     writer.flush()?;
-    probes::flush_stats(&stats, is_history);
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("timefilter_versions_seen", stats.versions_seen as i64);
+        crate::debug::emit_counter("timefilter_versions_before_cutoff", stats.versions_before_cutoff as i64);
+        crate::debug::emit_counter("timefilter_elements_written", stats.elements_written as i64);
+        crate::debug::emit_counter("timefilter_dropped_deleted", stats.dropped_deleted as i64);
+        crate::debug::emit_counter("timefilter_dropped_no_snapshot_version", stats.dropped_no_snapshot_version as i64);
+        crate::debug::emit_counter("timefilter_is_history_path", i64::from(is_history));
+    }
     Ok(stats)
 }
 
@@ -128,7 +136,6 @@ fn time_filter_history(
     };
     let mut pending: Option<PendingGroup> = None;
     let mut flush_error: Result<()> = Ok(());
-    let mut per_el_stats = probes::PerElementStats::default();
 
     crate::debug::emit_marker("TIMEFILTER_HISTORY_START");
     // Parallel decode via the 3-stage pipelined reader (IO -> rayon decode ->
@@ -137,16 +144,16 @@ fn time_filter_history(
     // depends on sorted traversal to know when a group ends. Re-encode and
     // group selection run sequentially on this thread.
     //
-    // Per-element Instant::now() is forbidden here: Japan scale is 344 M
-    // elements and the time-source overhead alone doubled wall in an
-    // earlier iteration of this instrumentation. Any per-element probe
-    // goes through `probes::per_element` (cfg-gated behind the
-    // `instrument` feature; empty twin on default builds).
+    // Hot-path timing lives in `#[cfg_attr(feature = "hotpath",
+    // hotpath::measure)]` on the inner helpers - run with `--hotpath` for a
+    // per-function breakdown. Release builds pay zero cost for that
+    // attribute. Don't re-add per-element Instant::now() here: Japan scale
+    // is 344 M elements and the time-source overhead alone doubled wall in
+    // an earlier iteration of this instrumentation.
     reader.for_each_pipelined(|element| {
         if flush_error.is_err() {
             return;
         }
-        probes::per_element(&mut per_el_stats, &element);
         let (kind, id, timestamp) = element_identity_and_timestamp(&element);
         stats.versions_seen += 1;
 
@@ -183,7 +190,6 @@ fn time_filter_history(
     if let Some((bytes, index, tagdata)) = bb.take_owned()? {
         writer.write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
     }
-    probes::flush_per_element(&per_el_stats);
     crate::debug::emit_marker("TIMEFILTER_HISTORY_END");
     Ok(stats)
 }
@@ -213,7 +219,6 @@ fn time_filter_snapshot(
         dropped_deleted: 0,
         dropped_no_snapshot_version: 0,
     };
-    let mut per_el_stats = probes::PerElementStats::default();
 
     // Shared free-list pool of Vec<u8> block buffers (cleared + retained
     // capacity). Workers pull via BlockBuilder::take_owned_swap; writer
@@ -232,7 +237,7 @@ fn time_filter_snapshot(
     // working set predictable regardless of input blob size.
     const SNAPSHOT_BATCH_MAX_BYTES: usize = 128 * 1024 * 1024;
     let mut process = |batch: &[PrimitiveBlock]| -> Result<()> {
-        process_snapshot_batch(batch, cutoff_timestamp, writer, &mut stats, &mut per_el_stats, &pool)
+        process_snapshot_batch(batch, cutoff_timestamp, writer, &mut stats, &pool)
     };
     for_each_primitive_block_batch_budgeted(
         reader.into_blocks_pipelined(),
@@ -241,7 +246,6 @@ fn time_filter_snapshot(
         &mut process,
     )?;
     pool.emit_counters("timefilter_snapshot_pool");
-    probes::flush_per_element(&per_el_stats);
     crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_END");
     Ok(stats)
 }
@@ -273,22 +277,18 @@ fn process_snapshot_batch(
     cutoff_timestamp: i64,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut TimeFilterStats,
-    per_el_stats: &mut probes::PerElementStats,
     pool: &std::sync::Arc<BlockBufPool>,
 ) -> Result<()> {
-    type BatchResult = std::result::Result<
-        (Vec<OwnedBlockTriple>, TimeFilterStats, probes::PerElementStats),
-        String,
-    >;
+    type BatchResult = std::result::Result<(Vec<OwnedBlockTriple>, TimeFilterStats), String>;
     let results: Vec<BatchResult> = batch
         .par_iter()
         .map(|block| {
             SNAPSHOT_BB.with_borrow_mut(|bb| {
                 let mut output: Vec<OwnedBlockTriple> = Vec::new();
-                let (block_stats, block_per_el) =
+                let block_stats =
                     filter_block_snapshot(block, cutoff_timestamp, bb, &mut output, pool)?;
                 flush_local_pooled(bb, &mut output, pool)?;
-                Ok((output, block_stats, block_per_el))
+                Ok((output, block_stats))
             })
         })
         .collect();
@@ -298,14 +298,13 @@ fn process_snapshot_batch(
     // rayon compression closure. Stats are accumulated as in
     // drain_batch_results.
     for result in results {
-        let (blocks, block_stats, block_per_el) =
+        let (blocks, block_stats) =
             result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         stats.versions_seen += block_stats.versions_seen;
         stats.versions_before_cutoff += block_stats.versions_before_cutoff;
         stats.elements_written += block_stats.elements_written;
         stats.dropped_deleted += block_stats.dropped_deleted;
         stats.dropped_no_snapshot_version += block_stats.dropped_no_snapshot_version;
-        per_el_stats.merge(&block_per_el);
         for (bytes, index, tagdata) in blocks {
             writer.write_primitive_block_owned_pooled(
                 bytes,
@@ -377,7 +376,7 @@ fn filter_block_snapshot(
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlockTriple>,
     pool: &BlockBufPool,
-) -> std::result::Result<(TimeFilterStats, probes::PerElementStats), String> {
+) -> std::result::Result<TimeFilterStats, String> {
     let mut stats = TimeFilterStats {
         versions_seen: 0,
         versions_before_cutoff: 0,
@@ -385,14 +384,12 @@ fn filter_block_snapshot(
         dropped_deleted: 0,
         dropped_no_snapshot_version: 0,
     };
-    let mut per_el_stats = probes::PerElementStats::default();
     let mut tags_buf: Vec<(&str, &str)> = Vec::new();
     let mut refs_buf: Vec<i64> = Vec::new();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 
     for element in block.elements() {
         stats.versions_seen += 1;
-        probes::per_element(&mut per_el_stats, &element);
         match &element {
             Element::DenseNode(dn) => {
                 let ts = dense_timestamp(dn);
@@ -485,7 +482,7 @@ fn filter_block_snapshot(
             }
         }
     }
-    Ok((stats, per_el_stats))
+    Ok(stats)
 }
 
 fn dense_visible(dn: &DenseNode<'_>) -> bool {
@@ -599,88 +596,4 @@ fn clone_owned_element(element: &Element<'_>) -> OwnedElement {
         Element::Way(w) => OwnedElement::Way(read_way(w)),
         Element::Relation(r) => OwnedElement::Relation(read_relation(r)),
     }
-}
-
-// Instrumentation probes. See notes/instrumentation-layering.md.
-//
-// Cfg-gated probes listed here:
-// - per_element / flush_per_element: PerElementStats, gated on
-//   feature = "instrument". Empty twin on default builds so the
-//   hot-loop call site disappears.
-mod probes {
-    use super::TimeFilterStats;
-    use crate::debug;
-
-    // Aggregated end-of-run stats. One call per time_filter invocation.
-    pub(super) fn flush_stats(stats: &TimeFilterStats, is_history: bool) {
-        #[allow(clippy::cast_possible_wrap)]
-        {
-            debug::emit_counter("timefilter_versions_seen", stats.versions_seen as i64);
-            debug::emit_counter("timefilter_versions_before_cutoff", stats.versions_before_cutoff as i64);
-            debug::emit_counter("timefilter_elements_written", stats.elements_written as i64);
-            debug::emit_counter("timefilter_dropped_deleted", stats.dropped_deleted as i64);
-            debug::emit_counter("timefilter_dropped_no_snapshot_version", stats.dropped_no_snapshot_version as i64);
-            debug::emit_counter("timefilter_is_history_path", i64::from(is_history));
-        }
-    }
-
-    // Per-element probe. ZST under default build so the hot-loop
-    // call site carries no runtime state.
-    #[cfg(feature = "instrument")]
-    #[derive(Default)]
-    pub(super) struct PerElementStats {
-        pub nodes: u64,
-        pub ways: u64,
-        pub relations: u64,
-        pub dense_nodes: u64,
-    }
-
-    #[cfg(not(feature = "instrument"))]
-    #[derive(Default)]
-    pub(super) struct PerElementStats {}
-
-    #[cfg(feature = "instrument")]
-    impl PerElementStats {
-        pub(super) fn merge(&mut self, other: &Self) {
-            self.nodes += other.nodes;
-            self.ways += other.ways;
-            self.relations += other.relations;
-            self.dense_nodes += other.dense_nodes;
-        }
-    }
-
-    #[cfg(not(feature = "instrument"))]
-    impl PerElementStats {
-        #[inline(always)]
-        pub(super) fn merge(&mut self, _: &Self) {}
-    }
-
-    #[cfg(feature = "instrument")]
-    #[inline(always)]
-    pub(super) fn per_element(stats: &mut PerElementStats, el: &crate::Element<'_>) {
-        match el {
-            crate::Element::DenseNode(_) => stats.dense_nodes += 1,
-            crate::Element::Node(_) => stats.nodes += 1,
-            crate::Element::Way(_) => stats.ways += 1,
-            crate::Element::Relation(_) => stats.relations += 1,
-        }
-    }
-
-    #[cfg(not(feature = "instrument"))]
-    #[inline(always)]
-    pub(super) fn per_element(_: &mut PerElementStats, _: &crate::Element<'_>) {}
-
-    #[cfg(feature = "instrument")]
-    pub(super) fn flush_per_element(stats: &PerElementStats) {
-        #[allow(clippy::cast_possible_wrap)]
-        {
-            debug::emit_counter("timefilter_per_element_nodes", stats.nodes as i64);
-            debug::emit_counter("timefilter_per_element_ways", stats.ways as i64);
-            debug::emit_counter("timefilter_per_element_relations", stats.relations as i64);
-            debug::emit_counter("timefilter_per_element_dense_nodes", stats.dense_nodes as i64);
-        }
-    }
-
-    #[cfg(not(feature = "instrument"))]
-    pub(super) fn flush_per_element(_: &PerElementStats) {}
 }

@@ -14,7 +14,7 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, Event};
 use quick_xml::name::QName;
 use quick_xml::{Reader, Writer};
 
-use super::elements_xml::{
+use crate::osc::write::{
     OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay,
     write_node_xml, write_way_xml, write_relation_xml, write_delete_xml,
 };

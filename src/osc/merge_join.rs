@@ -8,8 +8,8 @@
 use crate::blob_meta::ElemKind;
 use crate::{BlockType, Element, PrimitiveBlock};
 
-use super::elements_xml::{OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay};
-use super::Result;
+use super::write::{OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay};
+use crate::BoxResult;
 
 // ---------------------------------------------------------------------------
 // StreamingBlocks - block-level cursor with stashing
@@ -59,7 +59,7 @@ impl StreamingBlocks {
         Ok(Self { blocks: Box::new(iter), stashed: None })
     }
 
-    fn next_block(&mut self) -> Result<Option<PrimitiveBlock>> {
+    fn next_block(&mut self) -> BoxResult<Option<PrimitiveBlock>> {
         if let Some(b) = self.stashed.take() {
             return Ok(Some(b));
         }
@@ -91,7 +91,7 @@ fn fill_buffer<T>(
     buffer: &mut Vec<T>,
     is_phase_type: fn(BlockType) -> bool,
     convert: fn(&Element<'_>) -> Option<T>,
-) -> Result<bool> {
+) -> BoxResult<bool> {
     loop {
         let block = match source.next_block()? {
             Some(b) => b,
@@ -152,7 +152,7 @@ pub(crate) fn next_element<T>(
     buffer: &mut Vec<T>,
     is_phase_type: fn(BlockType) -> bool,
     convert: fn(&Element<'_>) -> Option<T>,
-) -> Result<Option<T>> {
+) -> BoxResult<Option<T>> {
     loop {
         if let Some(elem) = buffer.pop() {
             return Ok(Some(elem));
@@ -251,21 +251,21 @@ pub(crate) trait MergeJoinElement: Sized {
 impl MergeJoinElement for OwnedNode {
     fn id(&self) -> i64 { self.id }
     fn is_block_type(bt: BlockType) -> bool { is_node_block(bt) }
-    fn equal(a: &Self, b: &Self) -> bool { super::elements_xml::nodes_equal(a, b) }
+    fn equal(a: &Self, b: &Self) -> bool { super::write::nodes_equal(a, b) }
     fn convert(element: &Element<'_>) -> Option<Self> { convert_node(element) }
 }
 
 impl MergeJoinElement for OwnedWay {
     fn id(&self) -> i64 { self.id }
     fn is_block_type(bt: BlockType) -> bool { is_way_block(bt) }
-    fn equal(a: &Self, b: &Self) -> bool { super::elements_xml::ways_equal(a, b) }
+    fn equal(a: &Self, b: &Self) -> bool { super::write::ways_equal(a, b) }
     fn convert(element: &Element<'_>) -> Option<Self> { convert_way(element) }
 }
 
 impl MergeJoinElement for OwnedRelation {
     fn id(&self) -> i64 { self.id }
     fn is_block_type(bt: BlockType) -> bool { is_relation_block(bt) }
-    fn equal(a: &Self, b: &Self) -> bool { super::elements_xml::relations_equal(a, b) }
+    fn equal(a: &Self, b: &Self) -> bool { super::write::relations_equal(a, b) }
     fn convert(element: &Element<'_>) -> Option<Self> { convert_relation(element) }
 }
 
@@ -295,8 +295,8 @@ pub(crate) fn merge_join_phase<T: MergeJoinElement>(
     old_buf: &mut Vec<T>,
     new_src: &mut StreamingBlocks,
     new_buf: &mut Vec<T>,
-    mut on_action: impl FnMut(MergeJoinAction<'_, T>) -> Result<()>,
-) -> Result<()> {
+    mut on_action: impl FnMut(MergeJoinAction<'_, T>) -> BoxResult<()>,
+) -> BoxResult<()> {
     let mut old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
     let mut new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
 
@@ -314,7 +314,7 @@ pub(crate) fn merge_join_phase<T: MergeJoinElement>(
                 new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
             }
             (Some(o), Some(n)) => {
-                match super::osm_id_cmp(o.id(), n.id()) {
+                match crate::commands::osm_id_cmp(o.id(), n.id()) {
                     std::cmp::Ordering::Less => {
                         on_action(MergeJoinAction::OldOnly(o))?;
 
@@ -529,7 +529,7 @@ fn next_blob_for_kind(
     reader: &mut crate::blob::BlobReader<crate::file_reader::FileReader>,
     kind: ElemKind,
     stash: &mut Option<crate::blob::Blob>,
-) -> Result<Option<PendingBlob>> {
+) -> BoxResult<Option<PendingBlob>> {
     loop {
         let blob = if let Some(stashed) = stash.take() {
             stashed
@@ -567,7 +567,7 @@ fn decode_pending(
     buf: &mut Vec<u8>,
     st_scratch: &mut Vec<(u32, u32)>,
     gr_scratch: &mut Vec<(u32, u32)>,
-) -> Result<BlockState> {
+) -> BoxResult<BlockState> {
     pending.blob.decompress_into(buf)?;
     let block = PrimitiveBlock::from_vec_with_scratch(
         std::mem::take(buf), st_scratch, gr_scratch,
@@ -640,7 +640,7 @@ fn next_decoded_block(
     gr: &mut Vec<(u32, u32)>,
     kind: ElemKind,
     stash: &mut Option<crate::blob::Blob>,
-) -> Result<Option<BlockState>> {
+) -> BoxResult<Option<BlockState>> {
     match next_blob_for_kind(reader, kind, stash)? {
         Some(p) => Ok(Some(decode_pending(p, buf, st, gr)?)),
         None => Ok(None),
@@ -652,8 +652,8 @@ fn drain_remaining(
     state: &mut BlockPairMergeState,
     kind: ElemKind,
     is_old: bool,
-    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> Result<()>,
-) -> Result<()> {
+    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> BoxResult<()>,
+) -> BoxResult<()> {
     let (reader, buf, st, gr, stash) = if is_old {
         (&mut state.old_reader, &mut state.old_buf, &mut state.old_st, &mut state.old_gr, &mut state.old_stash)
     } else {
@@ -670,8 +670,8 @@ fn drain_remaining(
 fn emit_block(
     bs: &BlockState,
     is_old: bool,
-    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> Result<()>,
-) -> Result<()> {
+    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> BoxResult<()>,
+) -> BoxResult<()> {
     let remaining = bs.index.count.saturating_sub(bs.skip_count as u64);
     if is_old {
         on_action(BlockMergeAction::BlobOldOnly {
@@ -693,8 +693,8 @@ fn merge_decoded_pair(
     old_decoded: &mut Option<BlockState>,
     new_decoded: &mut Option<BlockState>,
     type_char: char,
-    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> Result<()>,
-) -> Result<()> {
+    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> BoxResult<()>,
+) -> BoxResult<()> {
     let mut os = old_decoded.take().expect("checked Some");
     let mut ns = new_decoded.take().expect("checked Some");
 
@@ -734,8 +734,8 @@ pub(crate) fn block_pair_merge_phase(
     state: &mut BlockPairMergeState,
     kind: ElemKind,
     skip_equal_blobs: bool,
-    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> Result<()>,
-) -> Result<()> {
+    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> BoxResult<()>,
+) -> BoxResult<()> {
     let type_char = kind_type_char(kind);
     let mut old_decoded: Option<BlockState> = None;
     let mut new_decoded: Option<BlockState> = None;
@@ -850,8 +850,8 @@ fn element_merge_pair(
     new_skip: usize,
     merge_up_to: i64,
     type_char: char,
-    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> Result<()>,
-) -> Result<(usize, usize)> {
+    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> BoxResult<()>,
+) -> BoxResult<(usize, usize)> {
     let mut old_iter = old_block.elements().skip(old_skip).peekable();
     let mut new_iter = new_block.elements().skip(new_skip).peekable();
     let mut old_consumed: usize = 0;
@@ -881,7 +881,7 @@ fn element_merge_pair(
                 let o_id = element_id(old_iter.peek().expect("checked"));
                 let n_id = element_id(new_iter.peek().expect("checked"));
 
-                match super::osm_id_cmp(o_id, n_id) {
+                match crate::commands::osm_id_cmp(o_id, n_id) {
                     std::cmp::Ordering::Less => {
                         let o = old_iter.next().expect("checked");
                         on_action(BlockMergeAction::ElementOldOnly(&o))?;

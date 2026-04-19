@@ -6,7 +6,7 @@ use crate::block_builder::{BlockBuilder, MemberData, Metadata};
 use crate::file_writer::FileWriter;
 use crate::writer::PbfWriter;
 
-pub(crate) use crate::commands::elements_xml::OwnedMember;
+pub(crate) use crate::osc::write::OwnedMember;
 use crate::BoxResult;
 
 // ---------------------------------------------------------------------------

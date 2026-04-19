@@ -10,7 +10,7 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, Event};
 use quick_xml::name::QName;
 use quick_xml::{Reader, Writer};
 
-use super::elements_xml::{format_coord, from_decimicro, OwnedMember, OwnedNode, OwnedRelation, OwnedWay};
+use crate::osc::write::{format_coord, from_decimicro, OwnedMember, OwnedNode, OwnedRelation, OwnedWay};
 use crate::tag_expr::{tag_matches, parse_expressions, Expression};
 use super::Result;
 use crate::{MemberId, MemberType};

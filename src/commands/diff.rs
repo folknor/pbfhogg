@@ -14,10 +14,10 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
-use super::elements_xml::{
+use crate::osc::write::{
     format_coord, from_decimicro, OwnedMember, OwnedNode, OwnedRelation, OwnedWay,
 };
-use super::stream_merge::{
+use crate::osc::merge_join::{
     block_pair_merge_phase, merge_join_phase, BlockMergeAction, BlockPairMergeState,
     MergeJoinAction, MergeJoinElement, StreamingBlocks,
 };
@@ -254,10 +254,10 @@ fn diff_block_pair(
                     BlockMergeAction::BlobOldOnly {
                         block, count, skip,
                     } => {
-                        let type_char = super::stream_merge::kind_type_char(kind);
+                        let type_char = crate::osc::merge_join::kind_type_char(kind);
                         for elem in block.elements().skip(skip) {
-                            let id = super::stream_merge::element_id(&elem);
-                            let ver = super::stream_merge::element_version(&elem);
+                            let id = crate::osc::merge_join::element_id(&elem);
+                            let ver = crate::osc::merge_join::element_version(&elem);
                             write_compact_line(output, '-', type_char, id, ver)?;
                         }
                         stats.deleted += count;
@@ -265,10 +265,10 @@ fn diff_block_pair(
                     BlockMergeAction::BlobNewOnly {
                         block, count, skip,
                     } => {
-                        let type_char = super::stream_merge::kind_type_char(kind);
+                        let type_char = crate::osc::merge_join::kind_type_char(kind);
                         for elem in block.elements().skip(skip) {
-                            let id = super::stream_merge::element_id(&elem);
-                            let ver = super::stream_merge::element_version(&elem);
+                            let id = crate::osc::merge_join::element_id(&elem);
+                            let ver = crate::osc::merge_join::element_version(&elem);
                             write_compact_line(output, '+', type_char, id, ver)?;
                         }
                         stats.created += count;
@@ -284,10 +284,10 @@ fn diff_block_pair(
                         stats.common += 1;
                     }
                     BlockMergeAction::ElementModified { old, new } => {
-                        let type_char = super::stream_merge::kind_type_char(kind);
-                        let id = super::stream_merge::element_id(old);
-                        let old_ver = super::stream_merge::element_version(old);
-                        let new_ver = super::stream_merge::element_version(new);
+                        let type_char = crate::osc::merge_join::kind_type_char(kind);
+                        let id = crate::osc::merge_join::element_id(old);
+                        let old_ver = crate::osc::merge_join::element_version(old);
+                        let new_ver = crate::osc::merge_join::element_version(new);
                         write_modified_line(output, type_char, id, old_ver, new_ver)?;
                         if options.verbose {
                             write_modified_details_borrowed(output, old, new)?;
@@ -295,16 +295,16 @@ fn diff_block_pair(
                         stats.modified += 1;
                     }
                     BlockMergeAction::ElementOldOnly(o) => {
-                        let type_char = super::stream_merge::kind_type_char(kind);
-                        let id = super::stream_merge::element_id(o);
-                        let ver = super::stream_merge::element_version(o);
+                        let type_char = crate::osc::merge_join::kind_type_char(kind);
+                        let id = crate::osc::merge_join::element_id(o);
+                        let ver = crate::osc::merge_join::element_version(o);
                         write_compact_line(output, '-', type_char, id, ver)?;
                         stats.deleted += 1;
                     }
                     BlockMergeAction::ElementNewOnly(n) => {
-                        let type_char = super::stream_merge::kind_type_char(kind);
-                        let id = super::stream_merge::element_id(n);
-                        let ver = super::stream_merge::element_version(n);
+                        let type_char = crate::osc::merge_join::kind_type_char(kind);
+                        let id = crate::osc::merge_join::element_id(n);
+                        let ver = crate::osc::merge_join::element_version(n);
                         write_compact_line(output, '+', type_char, id, ver)?;
                         stats.created += 1;
                     }

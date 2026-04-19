@@ -141,7 +141,7 @@ pub(crate) fn format_coord(buf: &mut String, deg: f64) {
 pub(crate) fn write_node_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     node: &OwnedNode,
-) -> super::Result<()> {
+) -> crate::BoxResult<()> {
     let mut elem = BytesStart::new("node");
     let id_str = node.id.to_string();
     let mut coord_buf = String::new();
@@ -168,7 +168,7 @@ pub(crate) fn write_node_xml<W: std::io::Write>(
 pub(crate) fn write_way_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     way: &OwnedWay,
-) -> super::Result<()> {
+) -> crate::BoxResult<()> {
     let mut elem = BytesStart::new("way");
     let id_str = way.id.to_string();
     elem.push_attribute(("id", id_str.as_str()));
@@ -195,7 +195,7 @@ pub(crate) fn write_way_xml<W: std::io::Write>(
 pub(crate) fn write_relation_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     rel: &OwnedRelation,
-) -> super::Result<()> {
+) -> crate::BoxResult<()> {
     let mut elem = BytesStart::new("relation");
     let id_str = rel.id.to_string();
     elem.push_attribute(("id", id_str.as_str()));
@@ -233,7 +233,7 @@ pub(crate) fn write_delete_xml<W: std::io::Write>(
     tag_name: &str,
     id: i64,
     metadata: Option<&OwnedMetadata>,
-) -> super::Result<()> {
+) -> crate::BoxResult<()> {
     let mut elem = BytesStart::new(tag_name);
     let id_str = id.to_string();
     elem.push_attribute(("id", id_str.as_str()));
@@ -247,7 +247,7 @@ pub(crate) fn write_delete_xml<W: std::io::Write>(
 pub(crate) fn write_tags_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     tags: &[(String, String)],
-) -> super::Result<()> {
+) -> crate::BoxResult<()> {
     for (k, v) in tags {
         let mut tag = BytesStart::new("tag");
         tag.push_attribute(("k", k.as_str()));
@@ -260,7 +260,7 @@ pub(crate) fn write_tags_xml<W: std::io::Write>(
 fn write_borrowed_tags_xml<'a, W: std::io::Write>(
     writer: &mut Writer<W>,
     tags: impl Iterator<Item = (&'a str, &'a str)>,
-) -> super::Result<()> {
+) -> crate::BoxResult<()> {
     for (k, v) in tags {
         let mut tag = BytesStart::new("tag");
         tag.push_attribute(("k", k));
@@ -281,7 +281,7 @@ pub(crate) fn write_element_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     elem: &crate::Element<'_>,
     coord_buf: &mut String,
-) -> super::Result<()> {
+) -> crate::BoxResult<()> {
     match elem {
         crate::Element::DenseNode(dn) => write_dense_node_xml(writer, dn, coord_buf),
         crate::Element::Node(n) => write_borrowed_node_xml(writer, n, coord_buf),
@@ -294,7 +294,7 @@ fn write_dense_node_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     node: &crate::dense::DenseNode<'_>,
     coord_buf: &mut String,
-) -> super::Result<()> {
+) -> crate::BoxResult<()> {
     let mut elem = BytesStart::new("node");
     let id_str = node.id().to_string();
     format_coord(coord_buf, from_decimicro(node.decimicro_lat()));
@@ -326,7 +326,7 @@ fn write_borrowed_node_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     node: &crate::elements::Node<'_>,
     coord_buf: &mut String,
-) -> super::Result<()> {
+) -> crate::BoxResult<()> {
     let mut elem = BytesStart::new("node");
     let id_str = node.id().to_string();
     format_coord(coord_buf, from_decimicro(node.decimicro_lat()));
@@ -354,7 +354,7 @@ fn write_borrowed_node_xml<W: std::io::Write>(
 fn write_borrowed_way_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     way: &crate::elements::Way<'_>,
-) -> super::Result<()> {
+) -> crate::BoxResult<()> {
     let mut elem = BytesStart::new("way");
     let id_str = way.id().to_string();
     elem.push_attribute(("id", id_str.as_str()));
@@ -384,7 +384,7 @@ fn write_borrowed_way_xml<W: std::io::Write>(
 fn write_borrowed_relation_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     rel: &crate::elements::Relation<'_>,
-) -> super::Result<()> {
+) -> crate::BoxResult<()> {
     let mut elem = BytesStart::new("relation");
     let id_str = rel.id().to_string();
     elem.push_attribute(("id", id_str.as_str()));

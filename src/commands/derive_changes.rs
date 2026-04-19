@@ -13,12 +13,12 @@ use flate2::write::GzEncoder;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
-use super::elements_xml::{
+use crate::osc::write::{
     OwnedMetadata,
     write_element_xml,
     write_node_xml, write_way_xml, write_relation_xml,
 };
-use super::stream_merge::{
+use crate::osc::merge_join::{
     block_pair_merge_phase, merge_join_phase, BlockMergeAction, BlockPairMergeState,
     MergeJoinAction, StreamingBlocks,
 };
@@ -292,7 +292,7 @@ fn derive_changes_element_stream(
     direct_io: bool,
     sink: &mut ChangeSink,
 ) -> Result<()> {
-    use super::elements_xml::{OwnedNode, OwnedWay, OwnedRelation};
+    use crate::osc::write::{OwnedNode, OwnedWay, OwnedRelation};
 
     let mut old_src = StreamingBlocks::new_sequential(old_path, direct_io)?;
     let mut new_src = StreamingBlocks::new_sequential(new_path, direct_io)?;

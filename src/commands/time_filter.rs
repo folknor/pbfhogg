@@ -245,6 +245,7 @@ fn time_filter_snapshot(
         Some(SNAPSHOT_BATCH_MAX_BYTES),
         &mut process,
     )?;
+    pool.emit_counters("timefilter_snapshot_pool");
     crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_END");
     Ok(stats)
 }

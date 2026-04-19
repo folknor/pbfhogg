@@ -23,7 +23,6 @@ restructure:
 | Lines | File | Active plan proximity |
 |------:|------|------|
 | 2525 | `cli/src/main.rs` | - |
-| 1712 | `src/write/block_builder.rs` | write-path work (Milestone 2) |
 | 1506 | `src/osc/parse.rs` | - |
 | 1449 | `src/read/blob.rs` | - |
 | 1356 | `src/write/writer.rs` | write-path work |
@@ -31,6 +30,7 @@ restructure:
 | 1225 | `src/blob_meta.rs` | - |
 | 1146 | `src/commands/tags_filter/mod.rs` | - |
 | 1146 | `src/commands/altw/external/stage4.rs` | ALTW external (active plan proximity) |
+| 1027 | `src/write/block_builder.rs` | write-path work (Milestone 2) |
 | 1084 | `src/geocode_index/reader.rs` | - |
 
 Done:
@@ -38,6 +38,10 @@ Done:
   split into element_writes.rs, parallel_reader.rs, rewrite_block.rs, stream_output.rs.
 - `src/commands/altw/mod.rs` (1686 -> 707 lines, 3 commits, 2026-04-19)
   split into dense.rs, sparse.rs, passthrough.rs.
+- `src/write/block_builder.rs` (1712 -> 1027 lines, 3 commits, 2026-04-19)
+  split into header_builder.rs, encode.rs, string_table.rs. block_builder.rs
+  is now just above the 1000-line threshold but stays in the table since
+  the write-path Milestone 2 work will touch it next.
 
 Priority ordering for the split work (don't try to batch the whole list
 at once - each split is a separate review surface):

@@ -6,7 +6,8 @@ use rustc_hash::FxHashSet;
 
 use protohoggr::{encode_bytes_field, encode_int64_field, encode_varint, zigzag_encode_64};
 
-use super::block_builder::{member_type_value, MemberData, Metadata, StringTable};
+use super::block_builder::{member_type_value, MemberData, Metadata};
+use super::string_table::StringTable;
 
 /// Encode an `int32` field unconditionally (even when value is 0).
 ///

@@ -23,7 +23,6 @@ restructure:
 | Lines | File | Active plan proximity |
 |------:|------|------|
 | 2525 | `cli/src/main.rs` | - |
-| 1449 | `src/read/blob.rs` | - |
 | 1356 | `src/write/writer.rs` | write-path work |
 | 1231 | `src/commands/extract/mod.rs` | - |
 | 1225 | `src/blob_meta.rs` | - |
@@ -43,6 +42,8 @@ Done:
   the write-path Milestone 2 work will touch it next.
 - `src/osc/parse.rs` (1506 -> 725 lines, 3 commits, 2026-04-19)
   split into interner.rs, compact.rs, xml_parse.rs.
+- `src/read/blob.rs` (1449 -> 920 lines, 2 commits, 2026-04-19)
+  split into decompress.rs, blob_wire.rs.
 
 Priority ordering for the split work (don't try to batch the whole list
 at once - each split is a separate review surface):

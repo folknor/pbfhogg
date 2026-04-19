@@ -11,7 +11,7 @@ use std::cell::RefCell;
 
 use crate::error::{new_blob_error, new_error, BlobError, ErrorKind, Result};
 
-use super::blob::{BlobData, WireBlob, MAX_BLOB_MESSAGE_SIZE};
+use super::blob_wire::{BlobData, WireBlob, MAX_BLOB_MESSAGE_SIZE};
 
 thread_local! {
     /// Per-thread reusable zlib decompressor state (~32 KB inflate tables).

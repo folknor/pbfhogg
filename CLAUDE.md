@@ -67,7 +67,7 @@ Both conventions are additive. The default phase summary already shows per-phase
 
 Requires clean git tree (except for `*.md` and `.brokkr/results.db`); `--force` overrides (results not stored).
 
-I/O flags (`--direct-io`, `--io-uring`) create named variants in results. `--force` is a top-level flag before the subcommand.
+I/O flags (`--direct-io`, `--io-uring`) create named variants in results. `--force` is a per-subcommand flag (`brokkr <cmd> --force ...`, not `brokkr --force <cmd> ...`).
 
 ### pbfhogg commands (every CLI command is a brokkr subcommand)
 

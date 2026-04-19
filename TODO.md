@@ -28,7 +28,6 @@ restructure:
 | 1146 | `src/commands/altw/external/stage4.rs` | ALTW external (active plan proximity) |
 | 1084 | `src/geocode_index/reader.rs` | - |
 | 1027 | `src/write/block_builder.rs` | write-path work (Milestone 2) |
-| 1000 | `src/write/writer.rs` | write-path work |
 
 Done:
 - `src/blob_meta.rs` (1225 -> 499 lines mod.rs, 2 commits, 2026-04-19)
@@ -36,6 +35,12 @@ Done:
   plus the type it produces (`BlobIndex` via scan_block_ids, `TagIndex`
   via scan_block_tags); mod.rs keeps the shared types (`BlobBbox`,
   `BlobIndex`, `ElemKind`) and the `BlobFilter` that composes them.
+- `src/write/writer.rs` (1000 -> 680 lines, 2 commits, 2026-04-19)
+  split into copy_range.rs (`copy_file_range` + pread fallback) and
+  pipeline.rs (ordered channel plumbing: `OutputChunk`, `FramedBlobParts`,
+  `PipelineItem`, `OutputSink`, `FileOutputSink`, `WritePipeline`,
+  permit pool, `writer_thread`). writer.rs now focuses on the `PbfWriter`
+  struct and its write API.
 
 Priority ordering for the split work (don't try to batch the whole list
 at once - each split is a separate review surface):

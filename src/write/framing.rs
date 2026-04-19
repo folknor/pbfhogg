@@ -20,7 +20,7 @@ use crate::write::metrics::WRITER_METRICS;
 use std::sync::atomic::Ordering::Relaxed;
 
 use super::compression::Compression;
-use super::writer::{elapsed_ns_u64, FramedBlobParts};
+use super::pipeline::{elapsed_ns_u64, FramedBlobParts};
 
 /// Per-thread reusable blob framing scratch: header/body/compression buffers
 /// plus lazy-initialized zlib/zstd compressors. Reused across blobs to keep

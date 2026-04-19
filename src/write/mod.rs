@@ -6,6 +6,7 @@ mod copy_range;
 mod encode;
 mod framing;
 pub mod header_builder;
+mod pipeline;
 mod string_table;
 #[cfg(feature = "linux-direct-io")]
 pub mod direct_writer;

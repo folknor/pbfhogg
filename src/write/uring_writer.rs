@@ -11,7 +11,7 @@
 
 use std::collections::VecDeque;
 
-use crate::write::writer::{OutputChunk, PipelineItem, WRITE_AHEAD};
+use crate::write::pipeline::{OutputChunk, PipelineItem, WRITE_AHEAD};
 use io_uring::opcode;
 use io_uring::types::Fixed;
 use io_uring::IoUring;

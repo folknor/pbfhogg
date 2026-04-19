@@ -4,7 +4,6 @@ pub(crate) mod altw;
 pub(crate) mod external_radix;
 #[cfg(feature = "commands")]
 pub mod check_refs;
-pub mod derive_changes;
 pub mod diff;
 #[cfg(feature = "commands")]
 pub mod extract;

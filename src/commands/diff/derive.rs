@@ -22,7 +22,7 @@ use crate::osc::merge_join::{
     block_pair_merge_phase, merge_join_phase, BlockMergeAction, BlockPairMergeState,
     MergeJoinAction, StreamingBlocks,
 };
-use super::Result;
+use crate::BoxResult as Result;
 use crate::blob_meta::ElemKind;
 
 // ---------------------------------------------------------------------------
@@ -70,10 +70,10 @@ pub fn derive_changes(
     update_timestamp: bool,
 ) -> Result<DeriveChangesStats> {
     // Single-pass: check sorted headers + indexdata from one file open each.
-    let (old_sorted, old_indexed) = super::diff::check_sorted_and_indexed(old_path, direct_io)?;
-    let (new_sorted, new_indexed) = super::diff::check_sorted_and_indexed(new_path, direct_io)?;
-    if !old_sorted { super::require_sorted_err(old_path, "Old PBF")?; }
-    if !new_sorted { super::require_sorted_err(new_path, "New PBF")?; }
+    let (old_sorted, old_indexed) = super::check_sorted_and_indexed(old_path, direct_io)?;
+    let (new_sorted, new_indexed) = super::check_sorted_and_indexed(new_path, direct_io)?;
+    if !old_sorted { crate::commands::require_sorted_err(old_path, "Old PBF")?; }
+    if !new_sorted { crate::commands::require_sorted_err(new_path, "New PBF")?; }
     let both_indexed = old_indexed && new_indexed;
 
     // Scratch directory for temp files (same as brokkr scratch).
@@ -432,7 +432,7 @@ fn write_delete_element<W: Write>(
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        let ts = super::format_epoch_secs(now.as_secs());
+        let ts = crate::commands::format_epoch_secs(now.as_secs());
         elem.push_attribute(("timestamp", ts.as_str()));
     }
     writer.write_event(Event::Empty(elem))?;

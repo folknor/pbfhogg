@@ -9,7 +9,7 @@ use common::{
 };
 use pbfhogg::MemberId;
 use pbfhogg::block_builder::{self, BlockBuilder, Metadata};
-use pbfhogg::derive_changes::derive_changes;
+use pbfhogg::diff::derive::derive_changes;
 use pbfhogg::merge::{merge, MergeOptions};
 use pbfhogg::writer::{Compression, PbfWriter};
 use std::io::Read;

@@ -11,6 +11,8 @@
 //! field (coordinates, tags, refs, members). This makes diff output deterministic regardless
 //! of whether metadata (version, timestamp, changeset, uid) is present, partial, or absent.
 
+pub mod derive;
+
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;

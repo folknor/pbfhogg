@@ -1658,7 +1658,7 @@ fn run_derive_changes(
     update_timestamp: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stats =
-        pbfhogg::derive_changes::derive_changes(old, new, output, direct_io, increment_version, update_timestamp)?;
+        pbfhogg::diff::derive::derive_changes(old, new, output, direct_io, increment_version, update_timestamp)?;
     stats.print_summary();
     Ok(())
 }

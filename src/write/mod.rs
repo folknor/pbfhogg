@@ -2,6 +2,7 @@ pub mod block_builder;
 pub(crate) mod buf_pool;
 pub mod compression;
 mod encode;
+mod framing;
 pub mod header_builder;
 mod string_table;
 #[cfg(feature = "linux-direct-io")]

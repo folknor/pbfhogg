@@ -7,7 +7,7 @@ use crate::file_writer::FileWriter;
 use crate::writer::PbfWriter;
 
 pub(crate) use crate::commands::elements_xml::OwnedMember;
-use crate::commands::Result;
+use crate::BoxResult;
 
 // ---------------------------------------------------------------------------
 // Owned element types - Vec fields are kept (not Box<[T]>) because these are
@@ -267,7 +267,7 @@ pub(crate) fn write_single_node(
     node: &OwnedNode,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-) -> Result<()> {
+) -> BoxResult<()> {
     crate::commands::ensure_node_capacity(bb, writer)?;
     let meta = owned_to_metadata(node.metadata.as_ref());
     bb.add_node(
@@ -282,7 +282,7 @@ pub(crate) fn write_single_way(
     way: &OwnedWay,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-) -> Result<()> {
+) -> BoxResult<()> {
     crate::commands::ensure_way_capacity(bb, writer)?;
     let meta = owned_to_metadata(way.metadata.as_ref());
     bb.add_way(
@@ -298,7 +298,7 @@ pub(crate) fn write_single_relation(
     rel: &OwnedRelation,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-) -> Result<()> {
+) -> BoxResult<()> {
     crate::commands::ensure_relation_capacity(bb, writer)?;
     let members: Vec<MemberData<'_>> = rel
         .members

@@ -39,9 +39,9 @@ use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
 use crate::PrimitiveBlock;
 
-// Box<dyn Error> is intentional - commands are CLI internals, callers only display
-// errors and exit. Typed error enums would add complexity with no matching benefit.
-pub(crate) type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+// Alias for crate::BoxResult kept for short `super::Result` imports inside command
+// implementations. The canonical definition (with rationale) is at the crate root.
+pub(crate) type Result<T> = crate::BoxResult<T>;
 
 /// Number of decoded `PrimitiveBlock`s collected before dispatching to rayon.
 pub(crate) const BATCH_SIZE: usize = 64;

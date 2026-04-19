@@ -127,6 +127,13 @@ pub(crate) mod owned;
 pub(crate) mod reorder_buffer;
 pub(crate) mod scan;
 
+/// Boxed-error Result alias used by command implementations and lifted
+/// command-shared library code. Distinct from [`crate::Result`] (which is
+/// over the typed [`crate::Error`]). The boxed flavor is used where
+/// callers only display the error and exit, so typed enums add complexity
+/// with no matching benefit.
+pub(crate) type BoxResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
 // ---------------------------------------------------------------------------
 // Public API re-exports
 //

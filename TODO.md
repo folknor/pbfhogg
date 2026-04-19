@@ -31,23 +31,6 @@ restructure:
 | 1027 | `src/write/block_builder.rs` | write-path work (Milestone 2) |
 | 1000 | `src/write/writer.rs` | write-path work |
 
-Done:
-- `src/commands/apply_changes/rewrite.rs` (1648 -> 859 lines, 4 commits, 2026-04-19)
-  split into element_writes.rs, parallel_reader.rs, rewrite_block.rs, stream_output.rs.
-- `src/commands/altw/mod.rs` (1686 -> 707 lines, 3 commits, 2026-04-19)
-  split into dense.rs, sparse.rs, passthrough.rs.
-- `src/write/block_builder.rs` (1712 -> 1027 lines, 3 commits, 2026-04-19)
-  split into header_builder.rs, encode.rs, string_table.rs. block_builder.rs
-  is now just above the 1000-line threshold but stays in the table since
-  the write-path Milestone 2 work will touch it next.
-- `src/osc/parse.rs` (1506 -> 725 lines, 3 commits, 2026-04-19)
-  split into interner.rs, compact.rs, xml_parse.rs.
-- `src/read/blob.rs` (1449 -> 920 lines, 2 commits, 2026-04-19)
-  split into decompress.rs, blob_wire.rs.
-- `src/write/writer.rs` (1356 -> 1000 lines, 2 commits, 2026-04-19)
-  split into compression.rs, framing.rs. Exactly at the 1000-line mark
-  but stays on the list since write-path Milestone 2 will touch it.
-
 Priority ordering for the split work (don't try to batch the whole list
 at once - each split is a separate review surface):
 
@@ -62,6 +45,18 @@ at once - each split is a separate review surface):
   up between splits. Tighten to fully clean clippy on the final commit
   of the series.
 - Update `notes/` cross-references if line numbers change substantially.
+
+### Follow-ups surfaced by the split work
+
+- [ ] **Encapsulate `CompactDiffOverlay` mutation.** Splitting `osc/parse.rs`
+  into `xml_parse.rs` forced seven fields of `CompactDiffOverlay` to
+  `pub(super)` - `node_arena`, `way_arena`, `relation_arena`, the three
+  `_index` maps, and `interner` - because the XML state machine pokes
+  at them directly. A mutator API on `CompactDiffOverlay`
+  (`push_node` / `push_way` / `push_relation` / `delete_node` / etc.,
+  plus an `interner_mut()` or `intern()` helper) would let those fields
+  go back to private. Not urgent but the current design relies on
+  same-file friend access that the split made explicit.
 
 ## Important: ignored tests
 

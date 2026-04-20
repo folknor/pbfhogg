@@ -284,3 +284,14 @@ seq = 4757
 file = "denmark-20260415-with-indexdata.osm.pbf"
 xxhash = "e2d812be0ec0d57ba1e351c50b50e269"
 seq = 4757
+
+[plantasjen.datasets.germany.snapshot.20260420]
+download_date = "2026-04-20"
+
+[plantasjen.datasets.germany.snapshot.20260420.pbf.raw]
+file = "germany-20260420.osm.pbf"
+xxhash = "e2b264f8761801f7a58c7eb8fc86d8fc"
+
+[plantasjen.datasets.germany.snapshot.20260420.pbf.indexed]
+file = "germany-20260420-with-indexdata.osm.pbf"
+xxhash = "b40b32fa9a4679a66d8bbe218c296b08"

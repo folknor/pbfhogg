@@ -108,17 +108,21 @@ single-threaded commands).
 The same include-mode workload regressed ~35 % between 2026-03-29 and
 2026-04-18:
 
-| UUID       | Commit  | Wall    | Date        |
-|------------|---------|---------|-------------|
-| `79100694` | `8ffee59` | 32.5 s | 2026-03-29 |
-| `5a44889d` | `aee7727` | 43.7 s | 2026-04-18 |
+| UUID       | Commit    | Wall    | Date        | Notes                    |
+|------------|-----------|---------|-------------|--------------------------|
+| `79100694` | `8ffee59` | 32.5 s  | 2026-03-29  | pre-regression, historical |
+| `5a44889d` | `aee7727` | 43.7 s  | 2026-04-18  | post-regression, current   |
+| `0bb2a3a8` | `8ffee59` | 36.0 s  | 2026-04-19  | pre-regression re-run, `--bench 1` |
 
 Same host, same dataset, same IDs. The TODO.md entry cites the 32.5 s
-figure; the current baseline is 43.7 s. This is orthogonal to the
-pread-walker work but worth bisecting before or alongside any include-
-path rework - the regression may already fix part of the gap for free,
-or it may reveal that the pread-walker win needs to land against a
-repaired baseline.
+figure; the current baseline is 43.7 s. The 2026-04-19 re-run at
+`8ffee59` landed at 36.0 s - between the historical 32.5 s (also at
+`8ffee59`) and the post-regression 43.7 s. The 3.5 s drift at the same
+commit is `--bench 1` variance; the 7.7 s gap to `aee7727` survives
+that, so the regression is still real. Worth bisecting before or
+alongside any include-path rework - the regression may already fix
+part of the gap for free, or it may reveal that the pread-walker win
+needs to land against a repaired baseline.
 
 Quick-win audit hypothesis: one of the read-path restructure commits
 between `8ffee59` and `aee7727` (source-tree moves, blob wire-format

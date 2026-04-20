@@ -14,7 +14,9 @@ Four planet-scale command plans are in notes, each with a ranked set of opportun
 
 - [ ] **[notes/getid-include-optimization.md](notes/getid-include-optimization.md)** - `getid` include mode. Current: **43.7 s** at planet (UUID `5a44889d`, commit `aee7727`). Target: **<1 s** via pread-only header walk with `posix_fadvise(RANDOM)`. Blocker: the naive `BlobReader` swap doesn't work because the path is 100 % kernel-I/O-bound (88 GB sequential read, user CPU ≈ 0); a new pread-only header-walk primitive is required. Secondary finding: 32.5 s → 43.7 s regression between commits `8ffee59` (2026-03-29) and `aee7727` (2026-04-18) - bisect before landing.
 
-- [ ] **[notes/diff-snapshots-opportunities.md](notes/diff-snapshots-opportunities.md)** - `diff-snapshots` (both human-readable and `--format osc`). Current: **2151 s / 35m50s** at planet (UUID `42aedca1`, commit `7e9c2e9`). Target: **~8 min (~4.4× speedup)**. Primary bottleneck: single-threaded decode (avg cores = 1.0, peak_threads = 1) on a CPU-bound workload. Expected headline win from parallel two-reader decode pipelines feeding a reorder-buffered merge consumer. Shadow counters + phase markers + hotpath annotations landed 2026-04-19 (`mergejoin_shadow_*`, `DIFF_PHASE_*`, `DERIVECHANGES_PHASE_*`) - next step is a measured run to partition the 2107 s wall across phases and classify blob pairs before committing to the parallel-decode build. v3 "non-overlapping block skip" is one ranked item inside the plan, not a separate TODO.
+- [ ] **[notes/diff-snapshots-opportunities.md](notes/diff-snapshots-opportunities.md)** - `diff-snapshots` (both human-readable and `--format osc`). Current: **2134 s / 35m34s** at planet (UUID `a9d430f2`, commit `052da8b`, 2026-04-19 `--bench 3` with phase markers). Target: **~8 min (aspirational, extrapolated from renumber's 18×)**. Measured phase split: NODE 1573 s (74 %), WAY 547 s (26 %), REL 14 s; all phases `avg_cores=1.0`, `peak_threads=1`, `user=0.9 kern=0.0`, 85 MB/s effective disk read on a 2+ GB/s NVMe. **Parallel two-reader decode is the entire path** - Amdahl ceiling 3.9× at 4 cores, 5.8× at 6, 7.6× at 8 before consumer-side merge becomes the new ceiling. v1 byte-equal (`pairs_byte_equal = 0`) and v3 single-sided skip (`blobs_old_only = 0`, `blobs_new_only = 440` ≈ 0.15 % of pairs) both closed out by the counter data - they target the wrong workload. Next step: land parallel decode on the node phase first.
+
+- [ ] **[notes/altw-structural-reports.md](notes/altw-structural-reports.md)** - `add-locations-to-ways --index-type external`. Current planet baseline: **661.2 s `--bench 3`** (UUID `a406d77e`, commit `aee7727`, 2026-04-18 post-regression-fix). Europe **291.6 s** after metadata-driven relation scan (`6d71053`). Doc consolidates six independent reviews into 11 ranked opportunities. Dominant theme: the stage 2 → stage 3 → stage 4 disk-seam chain, with ~80 GB rank shards + ~112 GB slot buckets + finalize. Stage-2 de-ranking and `BlobLocationRouter` already shipped (Europe 320.5 s → 291.6 s total). Measurement history + already-shipped context in [`notes/altw-optimization-history.md`](notes/altw-optimization-history.md); the failed in-RAM-coord-table reshape experiment is documented at [`notes/altw-as-renumber.md`](notes/altw-as-renumber.md) and does not invalidate the remaining ranked items.
 
 Measurement-first on every one: turn on `#[cfg(feature = "hotpath")]` counters (or add unconditional `*_ms` counters) to ground-truth the inferred per-phase breakdowns before committing to the order of landing items within a plan.
 
@@ -279,39 +281,16 @@ single-pass, tag expression and bbox filtering.
 - [ ] Migration guide from other tools - command mapping table, behavioral
   differences, indexdata workflow explanation. Build on existing
   `reference/osmium-parity.md`.
-- [ ] **`renumber` - minor optimization (current: 204.5 s / 3m25s, planet).**
-  Planet: 204.5 s at `aee7727` (`--bench 3`, UUID `abd74459`); historical
-  194 s measured at `cb99106` (also `--bench 3`). 3.3 GB peak anon, zero
-  temp disk. The +10 s drift is inside `--bench 3` variance but not
-  comfortably - worth a deliberate bisect if this becomes the critical
-  path; not today.
-  - [ ] **Varint encode lookup table.** 256-entry for single-byte varints
-    in the reframe functions. Est. −2 to −3 s wall.
-  - [ ] **Skip `way_id_set` if way rank derivable from schedule.** Sorted
-    input means new way ID = `start_way_id + global_position`. Derive from
-    schedule prefix sums instead of building a full IdSet. Saves ~160 MB.
-  - [ ] **Finer stage 2d reframe breakdown.** Split `reframe_ms` into
-    parse/lookup/encode/frame to identify which sub-step dominates.
-
-- [ ] **`add-locations-to-ways --index-type external`.** Active backlog,
-  dataset gates, prior-art / shelved-with-reasoning, and codebase patterns
-  live in
-  [`notes/altw-external-optimization-plan.md`](notes/altw-external-optimization-plan.md).
-  Measurement history (prototype, integration measurement, Stage 6
-  cleanup, NVMe-floor analysis that closed the structural-rearrangement
-  family) is in
-  [`notes/altw-optimization-history.md`](notes/altw-optimization-history.md).
-  Latest baselines: planet `4f059b67` 867.7 s, Europe `ffdf5f69` 375.9 s.
-
-  **Active backlog moved to the plan.** See
-  [`notes/altw-external-optimization-plan.md`](notes/altw-external-optimization-plan.md)
-  for ordered items, dataset gates, prior-art / shelved-with-reasoning,
-  and the appendix of bench / verify / pattern references.
+- [ ] **`renumber` - maintenance polish** (current: 204.5 s / 3m25s planet at `aee7727`,
+  historical 194 s at `cb99106`, 3.3 GB peak anon, zero temp disk).
+  Three candidate items (varint fast path, `way_id_set` vs schedule, reframe
+  breakdown instrumentation) captured in
+  [`notes/renumber-optimization.md`](notes/renumber-optimization.md) with
+  per-item regression analysis and disposition. Not today; revisit if
+  renumber becomes critical path or the +10 s drift vs `cb99106` grows.
 
 ### Ecosystem
 
-- [ ] crates.io version badge - `https://img.shields.io/crates/v/pbfhogg`
-- [ ] docs.rs badge - `https://img.shields.io/docsrs/pbfhogg`
 - [ ] CI status badge - `https://img.shields.io/github/actions/workflow/status/folknor/pbfhogg/ci.yml`
   (requires GitHub Actions CI workflow)
 - [ ] Add GitHub Actions CI - clippy, tests, rustfmt, doc build on Linux
@@ -498,10 +477,15 @@ per-iteration allocations remain across the codebase, ordered by impact:
   The codebase already does the most valuable composition (inline
   indexdata in all write paths). Multi-pass commands can't consume
   streams. See [notes/streaming-pipeline-composition.md](notes/streaming-pipeline-composition.md).
-- [ ] Zstd as default compression for internal pipelines - extremely
-  low priority. Investigated multiple times, production pipeline works.
 - [ ] Dense ALTW compact rank-indexed array (same pattern as geocode builder -
   better locality on hosts where dense currently works, reviewers split 1/8).
+  **Still relevant 2026-04-19**: dense is a fallback path (auto-select picks
+  External for sorted+indexed, dense only fires for non-canonical inputs),
+  but the rank-indexed layout is isomorphic to the geocode pass 2 pattern
+  (~16 GB contiguous vs scattered across 128 GB virtual) and would help
+  users with non-canonical PBFs. No current dense planet bench to measure
+  against; build and bench on a non-indexed/non-sorted planet variant if
+  prioritised.
 - [ ] Verify GeoJSON polygon format coverage for extract (does `--polygon`
   accept GeoJSON, or only .poly format?).
 - [ ] History-file support - decide in-scope or explicitly out-of-scope.
@@ -532,32 +516,3 @@ See `reference/performance.md` for consolidated baselines.
   `WireBlock`, `WireInfo`) accept untrusted input. `cargo-fuzz` targets
   for these entry points would catch panics, OOM, and logic errors on
   malformed data. Also fuzz the roundtrip path (write → read → compare).
-
-### Cross-pipeline optimization audit (commit `398b1a4`)
-
-Findings from code audit + outside review of transferring geocode builder
-optimizations (block-pipelined + skip_metadata, tag-first classification,
-FxHash, pass fusion, clone/alloc cleanup) to other commands.
-
-**getid** (moderate impact, low risk):
-- [ ] Audit pass fusion for `--add-referenced` / `--invert` flows - checked:
-  cannot fuse (pass 2 needs complete dep_node_ids before deciding which nodes
-  to emit). Two-pass structure is inherent to the data dependency.
-
-**extract --smart** (verified - already optimized):
-- [ ] Check for opportunities to reduce repeated full-file traversals in relation
-  closure expansion. (Inherent to transitive closure - may not be reducible.)
-
-**add-locations-to-ways** (verified - already optimized):
-- [ ] Tag-first rejection in rewrite phase: ALTW processes all ways unconditionally
-  (no tag-based filtering). Not applicable - every way gets location enrichment.
-- [ ] Clone/allocation in batch processing: passthrough coalescing uses raw bytes,
-  no cloning. Batch slot dispatch is enum-based. Already well optimized.
-
-**check_refs** (verified - no action):
-- Consumer-bound (RoaringTreemap insertions, decode workers idle at 1% CPU).
-  Block-pipelined + skip_metadata would not reduce wall time.
-- [ ] Re-evaluate if consumer bottleneck shifts after RoaringTreemap improvements.
-
-**sort, cat** (no action):
-- Already optimal - blob-level passthrough, single-pass, or need full metadata for output.

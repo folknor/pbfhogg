@@ -21,41 +21,92 @@ Planet 47-day snapshot pair (`base` vs `snapshot.20260411`), commit
 | `diff-snapshots` (human-readable)     | `42aedca1` | 2150.9 s (35m50s) |
 | `diff-snapshots --format osc`         | `53900d5f` | 2225.6 s (37m06s) |
 
-### Sidecar profile (`42aedca1`)
+## Measured phase breakdown (2026-04-19, `a9d430f2`)
+
+First run with the shadow counters + phase markers + hotpath
+annotations landed. Commit `052da8b`, `plantasjen`, `--bench 3`:
+
+**Wall: 2134.3 s (35m34s).** Within noise of the `42aedca1` baseline.
+
+| Phase                        | Duration  | % of wall | Avg Cores | Peak Anon | Disk Read |
+|------------------------------|-----------|-----------|-----------|-----------|-----------|
+| `DIFF_PHASE_NODE_START/END`  | 1572.6 s  | 73.7 %    | 1.0       | 41.4 MB   | 121.0 GB  |
+| `DIFF_PHASE_WAY_START/END`   |  547.5 s  | 25.7 %    | 1.0       | 37.8 MB   |  57.8 GB  |
+| `DIFF_PHASE_REL_START/END`   |   14.1 s  |  0.7 %    | 1.0       | 28.2 MB   |   1.7 GB  |
+
+All three phases: `user=0.9 kern=0.0`, `peak_threads=1`,
+`majflt=0`. Single core, userspace, nothing waiting on disk or
+page-faulting. Aggregate disk read 180.5 GB over 2134 s = ~85 MB/s
+effective, an order of magnitude below the NVMe ceiling.
+
+### Shadow counters
 
 ```
-Phase             Duration   Peak RSS  Peak Anon  Disk Read  Avg Cores
-DIFF_SCAN_START  2107.260s   42.5 MB    38.0 MB    227.2 GB       1.0
-                 user=0.9  kern=0.0  peak_threads=1
-                 minflt=328240  vol_cs=710199
+pairs_byte_equal               = 0
+elements_byte_equal            = 0
+pairs_overlapping_decoded      = 3
+elements_overlapping_decoded   = 546 473
+blobs_old_only                 = 0
+elements_old_only              = 0
+blobs_new_only                 = 440
+elements_new_only              = 109 463 424
+
+diff_common   = 11 587 352 039  (98.8 %)
+diff_created  =    109 478 210  (0.9 %)
+diff_deleted  =      9 139 976  (<0.1 %)
+diff_modified =     30 961 245  (0.3 %)
 ```
 
-Element counters:
-- common:  11,587,352,039 (98.8%)
-- created:    109,478,210 (0.9%)
-- modified:    30,961,245 (0.3%)
-- deleted:      9,139,976 (<0.1%)
+### What the measurement resolves
 
-### Key takeaways
+- **The entire wall is single-core user CPU across two reader streams.**
+  Disk is not the ceiling, memory is not the ceiling, context switches
+  are only vol_cs from channel waits. Decompress + protobuf decode +
+  the sequential merge loop saturate one core.
+- **v1 byte-equal fast path never fires.** `pairs_byte_equal = 0` across
+  the full run. Two independent PBFs with different compression metadata
+  mean no blob is literally byte-identical, even when its elements are.
+  The optimization does not apply to the `diff-snapshots` workload - it
+  was designed for the `diff` workload (apply-changes internally first,
+  then diff against the same input).
+- **v3 non-overlapping block skip is not a planet-relevant item.**
+  `blobs_old_only = 0` across all three phases. `blobs_new_only = 440`
+  (all concentrated in the trailing end of new-side node and way files).
+  440 out of ~300 K blob pairs ≈ 0.15 % of the population - skipping
+  these saves at most 0.15 % of the wall. Close the item.
+- **Type-phase split matches priority:** the node phase is 74 % of the
+  wall on its own. Any parallel-decode work should land there first;
+  way phase second; rel phase is a rounding error.
 
-- **Single-threaded.** `Avg Cores=1.0`, `peak_threads=1`. The whole
-  2107 s of real work runs on one main thread reading old, reading new,
-  comparing, and emitting.
-- **CPU-bound, not I/O-bound.** `user=0.9` (interpretation: ~90 % of
-  wall time in userspace CPU). Disk read is 227 GB over 2107 s =
-  ~108 MB/s effective, well under the ~2 GB/s NVMe ceiling. The
-  bottleneck is decompression and protobuf decode, not disk.
-- **Memory is comfortable.** 42 MB peak RSS. Plenty of headroom for
-  parallelism on a 30 GB host.
-- **98.8 % of element work is "common"** - bytes that pass through
-  unchanged. The v1 byte-equal fast path already skips decompress on
-  a fraction of that, but only on overlapping blob pairs.
+## Target: ~8 min (aspirational, not a costed plan)
 
-## Target: ~8 min (~4.4× speedup)
+8 min is extrapolated from the `renumber` 58 min → 3m14s result (18×),
+not derived from a known pipeline. The measured number below is the
+actual ceiling analysis.
 
-Four-plus cores on a single-socket box with comfortable RAM means
-parallel decode across two readers is the largest available win.
-Additional items compound on top of that.
+### Parallelism ceiling
+
+Pure Amdahl on the node phase (the 74 % dominator):
+
+| Effective decode-side cores | Node phase | Way phase | Rel | Total | vs baseline |
+|-----------------------------|------------|-----------|-----|-------|-------------|
+| 1 (today)                   | 1572 s     |  547 s    | 14 s | 2134 s | 1.0×        |
+| 4                           |  393 s     |  137 s    | 14 s |  544 s | 3.9×        |
+| 6                           |  262 s     |   91 s    | 14 s |  367 s | 5.8×        |
+| 8                           |  197 s     |   68 s    | 14 s |  279 s | 7.6×        |
+
+Assumes the merge consumer does not become the new bottleneck. In
+practice it will: the consumer still runs the sequential element-merge
+loop over decoded blocks. Consumer work per element is small (a borrowed
+`Equal` compare for 98.8 % of elements) but non-zero. Realistic 6-8 core
+ceiling is probably ~400-500 s (7-8 min), matching the aspirational target
+only if merge-consumer work stays ≤ 20 % of decode cost.
+
+**If the consumer becomes the ceiling**, the next move is parallelising
+the merge itself across disjoint ID ranges per type-phase - decoded blocks
+are already ID-sorted, so a range partitioner can hand each merge worker
+its own shard. That is a separate, harder plan; do not commit to it until
+the parallel-decode result forces the conversation.
 
 ## Measurement prerequisites
 
@@ -85,10 +136,11 @@ hotpath::measure)]` on `diff_block_pair`, `diff_element_stream`,
 `collect_phase_block_pair`, `block_pair_merge_phase`. `brokkr <cmd>
 --hotpath` attributes CPU time to these functions.
 
-Rerun before committing to any item below:
+First measured run: `a9d430f2` (commit `052da8b`, 2026-04-19, --bench 3).
+Rerun after any landed item:
 
 ```
-brokkr diff-snapshots --dataset planet --from base --to 20260411 --bench 1
+brokkr diff-snapshots --dataset planet --from base --to 20260411 --bench 3
 brokkr sidecar <UUID> --human
 brokkr sidecar <UUID> --durations
 brokkr sidecar <UUID> --counters --human
@@ -98,84 +150,137 @@ brokkr sidecar <UUID> --counters --human
 
 ### 1. Parallel two-reader decode (largest expected win)
 
-**Problem.** Today `block_pair_merge_phase` drives two sequential
-`BlobReader` iterators from one thread. Each loop iteration:
-reads old blob (waits I/O + decompress) → reads new blob (waits I/O +
-decompress) → compares → emits. No pipelining.
+**Problem.** Today `block_pair_merge_phase` (`src/osc/merge_join.rs:773`)
+drives two sequential `BlobReader` iterators from one thread. Each loop
+iteration: reads old blob (no decompress) → reads new blob (no
+decompress) → range/byte-equal classify → if overlapping, calls
+`decode_pending` on both sides synchronously → `element_merge_pair` →
+emits. Only `decode_pending` is expensive; everything else is cheap.
 
-**Shape.** Split decode into two worker pipelines (old + new), each
-producing a stream of decoded `BlockState`s. A merge consumer runs on
-its own thread, pulling one decoded block from each side and running
-the existing overlap/non-overlap/byte-equal logic.
+**Hot path cost.** Two `decode_pending` calls per overlapping blob
+pair. `decode_pending` = zlib decompress (~60 % of its cost) + protobuf
+parse + StringTable inline (~40 %). Measured: `pairs_overlapping_decoded`
+counter times 2 dominates the single-core 2134 s wall. The non-overlap
+fast path and the byte-equal gate are never the bottleneck:
+`pairs_byte_equal = 0`, `blobs_old_only + blobs_new_only ≈ 0.15 %` at
+planet scale for this workload.
 
-Decompression parallelizes across cores. At planet, ~300 K blob pairs
-need decoding; on 4-6 cores we should see close to linear scaling on
-the decompress phase. Peak RSS cost is the in-flight block buffer (~2
-MB per decoded block × pipeline depth × 2 sides). 128 MB at depth=32
-each side is fine on 30 GB hosts.
-
-**Risk.** Reorder and residual-block handling in the merge phase is
-stateful. Workers must deliver blocks in source order. Standard
-`ReorderBuffer` pattern (used in `write/pipeline.rs`, multi-extract
-consumer) applies.
-
-**Expected impact.** If CPU is ~60-80 % of the wall (disk accounts for
-the rest), parallel decode on 4 cores could bring 2107 s to ~700 s
-(3× speedup). On 6-8 cores, ~500-600 s. Gets us most of the way to
-the 8-minute target.
-
-### 2. v3 - skip decode for entirely single-sided blobs
-
-**Problem.** When a blob's ID range falls entirely before or after the
-other side's range (e.g., trailing new blobs in the newer snapshot),
-`block_pair_merge_phase` today decodes the blob purely to iterate its
-elements for the per-element output line. See `merge_join.rs:766` and
-`:773` (fast path) plus the slow-path residuals at `:801-817`.
-
-**Measurement gate.** Land the shadow counters (done), run
-`diff-snapshots` at planet, compute:
+**Chosen shape: pipelined prefetch with shared decode pool.**
 
 ```
-v3_opportunity_fraction =
-  (blobs_old_only + blobs_new_only) / (blobs_old_only + blobs_new_only
-                                        + pairs_byte_equal
-                                        + pairs_overlapping_decoded * 2)
+┌──────────────────────┐     ┌──────────────────────┐
+│  Old reader thread   │     │  New reader thread   │
+│  → sync_channel<Pending>    │  → sync_channel<Pending>
+└─────────┬────────────┘     └─────────┬────────────┘
+          │                            │
+          ▼                            ▼
+    ┌─────────────────────────────────────────────────┐
+    │  Consumer thread (existing merge control flow)  │
+    │  - pull next pending from both sides            │
+    │  - cheap classify: disjoint / byte-equal /      │
+    │    overlapping                                  │
+    │  - disjoint / byte-equal: fast path inline,     │
+    │    decode the single emitted side on-thread     │
+    │    (only fires on ~0.15 % of pairs at planet)   │
+    │  - overlapping: push decode task onto rayon     │
+    │    pool, keep a VecDeque<oneshot<BlockState>>   │
+    │    of in-flight tasks (depth D, e.g. 16)        │
+    │  - when the front of the deque resolves, run    │
+    │    element_merge_pair on that pair              │
+    └─────────────────────────────────────────────────┘
 ```
 
-Analytical prediction: OSM grew by ~10 M nodes in the 47-day window.
-At ~8000 nodes/blob that's ~1250 trailing new-only blobs in a ~300 K
-node-blob population ≈ 0.4 %. OldOnly is rarer (complete-blob
-deletes are uncommon). **Expected: < 1 % of blobs, < 1 % of wall.**
-If the counters confirm this, mark v3 a load-bearing pin and move on.
+Key properties:
+- **Preserves `PendingBlob` layer.** Reader threads emit undecoded
+  blobs with their `BlobIndex`, so the classify step still gets
+  range/count/kind without paying decode cost.
+- **Preserves the v1 byte-equal gate.** Still fires for the `diff`
+  workload (apply-changes-then-diff, where compressed bytes overlap).
+  `diff-snapshots` counters show it doesn't fire there, but cost is
+  zero if we're past the byte-compare - we don't lose the capability.
+- **Residual handling is unchanged.** Consumer still holds
+  `old_decoded` / `new_decoded` residual blocks in local scope; only
+  the *initial* decode of each pair is off-thread.
+- **Backpressure is natural.** Pending channel depth (8 per side) caps
+  reader run-ahead; decode deque depth (D ≈ 16) caps decode run-ahead.
+  Peak in-flight memory: `D × 2 × avg_decoded_block_size` ≈ 16 × 2 ×
+  2 MB = 64 MB. Comfortable vs the 27 GB available.
+- **Type-phase loop is untouched.** Each of the three phase calls
+  (NODE, WAY, REL) runs an independent pipeline with its own scoped
+  threads; shared decode pool persists across phases.
 
-**If the fraction is larger than expected**, the fix shape is:
-- Add a no-element variant (`BlobOldOnlyByIndex { min_id, max_id,
-  count, kind }`, symmetric for new) that callers can opt into.
-- For `diff` human-readable: emit a blob-level summary line instead
-  of per-element lines. User-visible change - gate behind a flag or
-  make it the default only under `--suppress-common`.
-- For `derive_changes`: BlobNewOnly cannot use this (needs full
-  element content for `<create>` XML). BlobOldOnly could, but only
-  needs id+version per element, and a lightweight scanner that reads
-  id+version without full decode is a separate primitive.
+**What changes in code:**
+1. New `src/osc/merge_join/parallel.rs` or in-module helpers that:
+   - Spawn two reader threads via `std::thread::scope` around
+     `block_pair_merge_phase`.
+   - Replace the synchronous `decode_pending` calls inside the loop
+     with a "submit + wait on front of deque" pattern backed by a
+     rayon pool.
+2. `decode_pending` itself is already pure (`blob → BlockState`) once
+   you hand it scratch buffers - it needs thread-local scratch like
+   `run_pipeline` uses (`thread_local! ST_SCRATCH/GR_SCRATCH`).
+3. `BlockPairMergeState` loses `old_buf`/`new_buf`/`old_st`/`new_st`/
+   `old_gr`/`new_gr` (they move into thread-local decode scratch); the
+   stash/readers/stats fields stay.
 
-### 3. Overlap BlobEqual checks could short-circuit earlier
+**Decode pool sizing.** Follow `run_pipeline`'s pattern:
+`available_parallelism().saturating_sub(3).max(1)` (subtract main
+consumer + 2 reader threads). On an 8-core host: 5 decode workers.
+Amdahl with the 74 % node phase dominator says ≥ 6 effective cores
+hits the aspirational 8 min target; 5 decode workers + 1 consumer +
+2 readers = 8 live threads is the right oversubscription.
 
-**Observation.** `blobs_byte_equal` (line 829) requires that
-`index.min_id`, `index.max_id`, `index.count` AND full compressed-byte
-equality all match. The equality check reads both blobs' compressed
-data through the underlying reader, which for a 64 KB blob is already
-a decompression-worthy amount of I/O. If the bytes differ by even one,
-we've paid that I/O and then still go to decode.
+**Where the merge-consumer ceiling shows up.** The consumer thread
+still runs `element_merge_pair` serially per pair. At ~6-8 decode
+workers it may start to starve: the deque front needs to process at
+consumer speed, and if consumer < decode aggregate, the deque fills
+up and decode workers stall on backpressure. First measurement
+afterward looks at `vol_cs` on the consumer thread to see if that's
+happening. If it is, item 5 (below) becomes real.
 
-**Opportunity.** Add a lightweight hash (XXH128 over compressed
-bytes) stored in a sidecar or computed lazily, compare hashes first,
-fall through to byte compare only on hash match. Saves the
-byte-compare memcmp work on the (small) no-match cases but doesn't
-skip the I/O. Probably not worth it unless counters show byte-compare
-itself is meaningful CPU.
+**Risk.** Reorder is automatic because we submit tasks to rayon in
+pair order and use a `VecDeque<oneshot<BlockState>>` per side -
+consumer waits on the *front* oneshot, not arbitrary completions.
+No reorder buffer needed at the pair level.
 
-Skip until measurement justifies.
+Stateful residual logic in `merge_decoded_pair` does not interact
+with the pipeline because it operates on already-decoded blocks
+owned by the consumer. We continue to carry residual blocks across
+loop iterations in `old_decoded`/`new_decoded` exactly as today.
+
+**Expected impact.** Measured wall is 100 % user CPU on 1 core across
+all three phases, so every effective decode-side core translates to
+near-linear speedup on decompress + protobuf decode. Amdahl table
+above: 4 cores → ~544 s (3.9×), 6 cores → ~367 s (5.8×), 8 cores →
+~279 s (7.6×) assuming the merge consumer stays below the decode-side
+cost. Realistic ceiling is probably 7-8 min on a 6-8 core host
+before consumer-side sequential work caps the win.
+
+The node phase (74 % of the wall) is the right first target; way
+phase (26 %) uses the same primitive; rel phase (0.7 %) is not worth
+touching.
+
+### 2. ~~v3 - skip decode for entirely single-sided blobs~~ CLOSED 2026-04-19
+
+Shadow counters on `a9d430f2`:
+- `blobs_old_only = 0`
+- `blobs_new_only = 440` (out of ~300 K blob pairs ≈ 0.15 %)
+
+Less than the 0.4 % analytical estimate. Skipping these saves at most
+0.15 % of the wall - not worth the new `BlobOldOnlyByIndex` /
+`BlobNewOnlyByIndex` variants, the opt-in callsite changes, or the
+user-visible behavior split on `diff` vs `derive_changes`. Kept here
+as a dead item so future reviewers don't re-propose it.
+
+### 3. ~~Overlap BlobEqual checks could short-circuit earlier~~ CLOSED 2026-04-19
+
+Shadow counters on `a9d430f2`:
+- `pairs_byte_equal = 0` across the full run.
+
+Two independent PBFs produced by different toolchains never share
+byte-identical blobs even when their element content is identical.
+The v1 byte-equal fast path is a `diff`-on-apply-changes optimization
+and has no signal for `diff-snapshots`. No work to sharpen here.
 
 ### 4. Element-merge allocation audit
 
@@ -209,17 +314,21 @@ dominating.
 
 1. ~~**Shadow counters + markers + hotpath annotations**~~ - landed
    2026-04-19.
-2. **Run a measured `diff-snapshots` at planet.** 35 minutes. Pass
-   through the counters, durations, and hotpath views. Partitions the
-   remaining items from "guess" to "data".
-3. **Parallel two-reader decode.** Expected headline win. Design
-   around `ReorderBuffer` and `thread::scope` - same shape as
-   multi-extract and external-join stage 4.
-4. **Re-measure.** Decide if the target is met or we need more.
-5. **v3 or skip.** Based on counter data from step 2. Plan shape
-   documented above - build if the fraction justifies, pin if not.
-6. **I/O primitive upgrade.** Only if step 4 shows I/O has become the
-   ceiling.
+2. ~~**Run a measured `diff-snapshots` at planet.**~~ - landed
+   2026-04-19 as `a9d430f2`. Results partition the remaining items:
+   parallel decode is the whole plan; v1 and v3 optimizations are
+   closed out.
+3. **Parallel two-reader decode.** The entire path to the target.
+   Design around `ReorderBuffer` and `thread::scope` - same shape as
+   multi-extract and external-join stage 4. Land node phase first
+   (74 % of wall), way phase second.
+4. **Re-measure on a 6-8 core host.** Decide if the consumer-side
+   merge loop has become the new ceiling.
+5. **Parallel merge across disjoint ID shards.** Only if step 4 shows
+   consumer saturation. Decoded blocks are already ID-sorted; a range
+   partitioner can fan them out to N merge workers per type phase.
+6. **I/O primitive upgrade.** Only if step 4 or 5 shows I/O wait
+   dominating (currently ~85 MB/s on a 2+ GB/s NVMe, nowhere close).
 
 ## Constraints
 

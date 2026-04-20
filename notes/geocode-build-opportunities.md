@@ -16,6 +16,15 @@ Planet: **1,255 s (20.9 min, TAINTED baseline `7e9c2e9`) -> 432.9 s
 Europe 344 s -> 183.4 s (-47 %). Germany 71 s -> 30.9 s (-57 %).
 Denmark 5.0 s -> 3.4 s (-32 %).
 
+**Further drop at 2026-04-19:** planet **432.9 s -> 383.7 s (-49.2 s,
+-11 %)** at commit `052da8b`, UUID `f832d3d6`, `--bench 1`. No
+build-geocode-index change landed between `82db8ed` and `052da8b`;
+the win came from cross-cutting read/write-path restructures (commits
+between `aee7727` and `052da8b` - blob wire-format split, raw-frame
+split, write framing/pipeline split). Worth a `--bench 3` confirm
+before treating this as the new baseline - single-sample at this
+scale sits inside run-to-run variance.
+
 Pass 1.5 peak anon 29.5 GB -> 3.0 GB at planet (-90 %), moving the
 governing peak out of the OOM-prone phase. Post-arc governing peak is
 ~25 GB at Pass 3 Stage B - comfortable on 27 GB hosts.

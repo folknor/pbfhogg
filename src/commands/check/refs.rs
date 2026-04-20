@@ -200,6 +200,7 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
         parallel_classify_phase(
             &shared_file,
             &node_schedule,
+            None,
             || (),
             |block, &mut ()| -> u64 {
                 let mut count: u64 = 0;
@@ -238,6 +239,7 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
         parallel_classify_phase(
             &shared_file,
             &way_schedule,
+            None,
             || (),
             |block, &mut ()| -> WayBlobResult {
                 let mut r = WayBlobResult::default();
@@ -294,6 +296,7 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
             parallel_classify_phase(
                 &shared_file,
                 &rel_schedule,
+                None,
                 || (),
                 |block, &mut ()| -> RelBlobResult {
                     let mut r = RelBlobResult::default();

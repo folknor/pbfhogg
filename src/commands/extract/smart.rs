@@ -281,6 +281,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &node_schedule,
+        None,
         || (crate::read::columnar::DenseNodeColumns::new(), Vec::<i64>::new()),
         |block, (columns, ids)| {
             ids.clear();
@@ -321,6 +322,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &way_schedule,
+        None,
         || (),
         |block, _s| {
             let mut way_ids = Vec::new();
@@ -348,6 +350,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     crate::scan::classify::parallel_classify_accumulate(
         &shared_file,
         &relation_schedule,
+        None,
         || (IdSet::new(), IdSet::new(), IdSet::new()),
         |block, (rel_ids, extra_way_ids, extra_node_ids)| {
             for element in block.elements_skip_metadata() {
@@ -453,6 +456,7 @@ pub(super) fn extract_smart(
     crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &way_schedule,
+        None,
         Vec::<i64>::new,
         |block, scratch| {
             scratch.clear();

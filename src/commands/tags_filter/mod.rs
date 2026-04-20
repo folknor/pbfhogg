@@ -614,6 +614,7 @@ fn tags_filter_two_pass(
     crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &schedule,
+        None,
         || (),
         |block, _s| {
             let mut result = ClassifyResult {
@@ -974,6 +975,7 @@ fn collect_relation_member_closure(
         crate::scan::classify::parallel_classify_accumulate(
             &shared_file,
             &schedule,
+            None,
             || ClosureResult {
                 node_ids: Vec::new(),
                 way_ids: Vec::new(),
@@ -1043,6 +1045,7 @@ fn collect_way_node_dependencies(
     crate::scan::classify::parallel_classify_accumulate(
         &shared_file,
         &schedule,
+        None,
         IdSet::new,
         |block, node_ids| {
             for element in block.elements_skip_metadata() {

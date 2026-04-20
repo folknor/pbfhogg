@@ -558,6 +558,7 @@ fn extract_simple_single_pass(
         crate::scan::classify::parallel_classify_accumulate(
             &rel_classify_file,
             &rel_classify_schedule,
+            None,
             IdSet::new,
             |block, ids| {
                 for element in block.elements_skip_metadata() {

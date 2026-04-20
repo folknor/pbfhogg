@@ -191,6 +191,7 @@ pub(super) fn try_extract_multi_single_pass(
         crate::scan::classify::parallel_classify_phase(
             &shared_file,
             &node_schedule,
+            None,
             || (crate::read::columnar::DenseNodeColumns::new(), vec![Vec::<i64>::new(); n]),
             |block, (columns, scratch)| {
                 block.decode_dense_columns(columns);
@@ -208,6 +209,7 @@ pub(super) fn try_extract_multi_single_pass(
         crate::scan::classify::parallel_classify_phase(
             &shared_file,
             &node_schedule,
+            None,
             || vec![Vec::<i64>::new(); n],
             |block, scratch| {
                 for v in scratch.iter_mut() { v.clear(); }
@@ -300,6 +302,7 @@ pub(super) fn try_extract_multi_single_pass(
     crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &way_schedule,
+        None,
         || vec![Vec::<i64>::new(); n],
         |block, scratch: &mut Vec<Vec<i64>>| {
             for v in scratch.iter_mut() { v.clear(); }
@@ -359,6 +362,7 @@ pub(super) fn try_extract_multi_single_pass(
     crate::scan::classify::parallel_classify_accumulate(
         &shared_file,
         &relation_schedule,
+        None,
         || (0..n).map(|_| IdSet::new()).collect::<Vec<_>>(),
         |block, region_ids| {
             for element in block.elements_skip_metadata() {

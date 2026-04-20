@@ -7,7 +7,7 @@ use rustc_hash::FxHashMap;
 use crate::tag_expr::{tag_matches, parse_expressions, Expression};
 use super::require_indexdata;
 use crate::owned::TypeFilter;
-use crate::{BlobFilter, Element, PrimitiveBlock};
+use crate::{Element, PrimitiveBlock};
 
 use super::Result;
 type CountMap = FxHashMap<String, FxHashMap<String, u64>>;
@@ -42,6 +42,9 @@ pub struct TagCountOptions<'a> {
     pub type_filter: Option<&'a str>,
     pub direct_io: bool,
     pub force: bool,
+    /// Parallel worker count. `0` picks from `available_parallelism()`;
+    /// higher values override that.
+    pub jobs: usize,
 }
 
 /// Count tag key=value frequencies in a PBF file.
@@ -53,19 +56,24 @@ pub struct TagCountOptions<'a> {
 /// If `expressions` is non-empty, only tags matching at least one
 /// expression are counted (same syntax as `tags-filter`).
 ///
-/// Uses sequential BlobReader to avoid cross-thread PrimitiveBlock
-/// retention at planet scale. Diagnostic command - single-threaded
-/// decode is acceptable.
+/// Parallel workers via `parallel_classify_accumulate`: each worker
+/// builds its own `CountMap` across the blobs it processes, merged at
+/// completion. Per-worker maps are bounded by the distinct tag
+/// (key, value) pairs a worker sees across its share of blobs; at
+/// planet the union cardinality is a few hundred MB worst-case,
+/// well inside the `parallel_classify_accumulate` safety envelope.
+/// The 256-blob schedule keeps each worker's share modest.
 #[hotpath::measure]
 pub fn tags_count(
     path: &Path,
     opts: &TagCountOptions<'_>,
 ) -> Result<Vec<TagCount>> {
-    if opts.type_filter.is_some() {
-        require_indexdata(path, opts.direct_io, opts.force,
-            "input PBF has no blob-level indexdata. Without indexdata, the type filter \
-             is a no-op - all blobs are decompressed (significantly slower).")?;
-    }
+    // Need indexdata either for the type-filter schedule or (when there
+    // is no type filter) simply for the all-kinds schedule the parallel
+    // path uses. `require_indexdata` gracefully accepts `force`.
+    require_indexdata(path, opts.direct_io, opts.force,
+        "input PBF has no blob-level indexdata. Without indexdata, the type filter \
+         is a no-op - all blobs are decompressed (significantly slower).")?;
 
     let expressions = if opts.expressions.is_empty() {
         None
@@ -73,40 +81,40 @@ pub fn tags_count(
         Some(parse_expressions(opts.expressions)?)
     };
 
-    // Sequential reader to avoid PrimitiveBlock cross-thread retention
-    // at planet scale (520K+ blobs). Diagnostic command - single-threaded
-    // decode is acceptable.
     let tf = TypeFilter::from_single(opts.type_filter);
-    let blob_filter = match opts.type_filter {
-        Some("node") => Some(BlobFilter::only_nodes()),
-        Some("way") => Some(BlobFilter::only_ways()),
-        Some("relation") => Some(BlobFilter::only_relations()),
+    let kind_filter = match opts.type_filter {
+        Some("node") => Some(crate::blob_meta::ElemKind::Node),
+        Some("way") => Some(crate::blob_meta::ElemKind::Way),
+        Some("relation") => Some(crate::blob_meta::ElemKind::Relation),
         _ => None,
     };
 
-    let mut blob_reader = crate::blob::BlobReader::open(path, opts.direct_io)?;
-    blob_reader.set_parse_indexdata(true);
-    blob_reader.next()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-    let mut counts: CountMap = FxHashMap::default();
-    let mut decompress_buf: Vec<u8> = Vec::new();
-    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
     crate::debug::emit_marker("TAGSCOUNT_START");
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
-        if let Some(ref filter) = blob_filter {
-            if let Some(idx) = blob.index() {
-                if !filter.wants_index(&idx) { continue; }
-            }
-        }
-        blob.decompress_into(&mut decompress_buf)?;
-        let block = PrimitiveBlock::from_vec_with_scratch(
-            std::mem::take(&mut decompress_buf), &mut st_scratch, &mut gr_scratch,
-        )?;
-        count_block_tags(&mut counts, &block, tf.nodes, tf.ways, tf.relations, &expressions);
-    }
+
+    let (schedule, shared_file) =
+        crate::scan::classify::build_classify_schedule(path, kind_filter)?;
+    let thread_override = (opts.jobs > 0).then_some(opts.jobs);
+    let mut counts: CountMap = FxHashMap::default();
+
+    crate::scan::classify::parallel_classify_accumulate(
+        &shared_file,
+        &schedule,
+        thread_override,
+        FxHashMap::<String, FxHashMap<String, u64>>::default,
+        |block, local_counts| {
+            count_block_tags(
+                local_counts,
+                block,
+                tf.nodes,
+                tf.ways,
+                tf.relations,
+                &expressions,
+            );
+        },
+        |worker_counts| {
+            merge_counts(&mut counts, worker_counts);
+        },
+    )?;
 
     let capacity: usize = counts.values().map(rustc_hash::FxHashMap::len).sum();
     let mut results: Vec<TagCount> = Vec::with_capacity(capacity);
@@ -229,5 +237,23 @@ fn increment_tag(counts: &mut CountMap, k: &str, v: &str) {
         let mut inner = FxHashMap::default();
         inner.insert(v.to_string(), 1);
         counts.insert(k.to_string(), inner);
+    }
+}
+
+/// Merge a per-worker CountMap into the global totals. Sums counts for
+/// keys present in both; moves unique entries across. Move-based for
+/// the inner maps to avoid re-hashing value strings.
+fn merge_counts(global: &mut CountMap, worker: CountMap) {
+    for (key, worker_inner) in worker {
+        match global.get_mut(&key) {
+            Some(global_inner) => {
+                for (value, count) in worker_inner {
+                    *global_inner.entry(value).or_insert(0) += count;
+                }
+            }
+            None => {
+                global.insert(key, worker_inner);
+            }
+        }
     }
 }

@@ -38,6 +38,7 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 |------|-------------|
 | `--indexed` | Check if PBF has blob-level indexdata (exit code 0 = yes, 1 = no) |
 | `--nodes` | Analyze node coordinate statistics for FOR compression sizing |
+| `-j, --jobs <N>` | Parallel worker count for `--nodes` (only). `0` auto-picks from `available_parallelism()`, `1` forces sequential, higher values cap the pool. Other inspect modes ignore this flag. |
 | `--blocks [N]` | Show per-block distribution stats and optional block listing (N limits to first/last N blocks) |
 | `--id-ranges` | Show min/max element IDs per type and monotonicity |
 | `--locations` | Show locations-on-ways diagnostics |
@@ -60,6 +61,7 @@ Count tag key=value frequencies (subcommand of `inspect`).
 | `-s, --sort <ORDER>` | Sort order: count-desc (default), count-asc, name-asc, name-desc |
 | `-e, --expressions <FILE>` | Read tag expressions from file (one per line, # comments) |
 | `-t, --type <TYPE>` | Filter by element type: node, way, or relation |
+| `-j, --jobs <N>` | Parallel worker count. `0` auto-picks from `available_parallelism()`, `1` forces sequential, higher values cap the pool. |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--force` | Proceed even if input lacks indexdata (slower fallback path) |
 
@@ -222,6 +224,7 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 | `-q, --quiet` | Exit-code only, suppress output (text only) |
 | `-o, --output <FILE>` | Write output to file (required for `--format osc`) |
 | `-t, --type <TYPE>` | Filter by element type (text only) |
+| `-j, --jobs <N>` | Parallel shard count. `1` (default) keeps the sequential merge-join; `0` auto-picks from `available_parallelism()`; higher values partition the ID space across N worker threads. Applies to both text and `--format osc`. |
 | `--increment-version` | Bump version of deleted elements by 1 (osc only) |
 | `--update-timestamp` | Set delete timestamp to current time (osc only) |
 | `--ignore-changeset` | Compatibility flag (already ignored by content-equality mode) |

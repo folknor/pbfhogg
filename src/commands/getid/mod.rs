@@ -150,6 +150,7 @@ pub fn parse_ids_from_pbf(path: &Path, _direct_io: bool) -> Result<ElementIds> {
     crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &schedule,
+        None,
         || (),
         |block, _s| {
             let mut batch = IdBatch {
@@ -424,6 +425,7 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &ElementIds, opts: &GetidOp
         crate::scan::classify::parallel_classify_accumulate(
             &shared_file,
             &schedule,
+            None,
             crate::idset::IdSet::new,
             |block, node_ids| {
                 for element in block.elements_skip_metadata() {

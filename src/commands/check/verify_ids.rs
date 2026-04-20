@@ -624,6 +624,7 @@ fn verify_single_kind_parallel(
     crate::scan::classify::parallel_classify_phase(
         shared_file,
         schedule,
+        None,
         || (),
         |block, _state| -> BlobVerifyResult {
             let mut r = BlobVerifyResult::empty();

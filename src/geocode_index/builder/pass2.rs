@@ -412,6 +412,7 @@ pub(super) fn run_pass2(
         crate::scan::classify::parallel_classify_phase(
             shared_file,
             node_schedule,
+            None,
             NodeBlobOut::default,
             |block, state: &mut NodeBlobOut| -> NodeBlobOut {
                 for element in block.elements_skip_metadata() {
@@ -499,6 +500,7 @@ pub(super) fn run_pass2(
         crate::scan::classify::parallel_classify_phase(
             shared_file,
             way_schedule,
+            None,
             WayBlobOut::default,
             |block, state: &mut WayBlobOut| -> WayBlobOut {
                 for element in block.elements_skip_metadata() {

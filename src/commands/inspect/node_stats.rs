@@ -157,97 +157,164 @@ fn print_histogram(label: &str, stats: &CoordStats) {
     }
 }
 
+/// Per-worker state for [`node_stats`]. Held across all blobs a worker
+/// processes and merged into the global report at completion.
+///
+/// `lat_block` / `lon_block` are the in-flight 128-value windows that
+/// feed [`CoordStats::record_block`]; they persist across blobs within a
+/// worker and are flushed once at merge time. Cross-blob carry is kept
+/// deliberately - the FOR block stat is about locality of consecutive
+/// coordinate values, not blob-level grouping, and matching the
+/// sequential behaviour of "only the last block is partial" keeps the
+/// output closest to the pre-parallel path. Ordering is still different
+/// in the parallel path (workers see blobs out of file order), so the
+/// final block distribution is not byte-identical between runs but the
+/// histogram shape is preserved.
+struct WorkerAccum {
+    node_count: u64,
+    min_lat: i32,
+    max_lat: i32,
+    min_lon: i32,
+    max_lon: i32,
+    lat_stats: CoordStats,
+    lon_stats: CoordStats,
+    lat_block: Vec<i32>,
+    lon_block: Vec<i32>,
+}
+
+impl WorkerAccum {
+    fn new() -> Self {
+        Self {
+            node_count: 0,
+            min_lat: i32::MAX,
+            max_lat: i32::MIN,
+            min_lon: i32::MAX,
+            max_lon: i32::MIN,
+            lat_stats: CoordStats::new(),
+            lon_stats: CoordStats::new(),
+            lat_block: Vec::with_capacity(BLOCK_SIZE),
+            lon_block: Vec::with_capacity(BLOCK_SIZE),
+        }
+    }
+
+    fn finalize(&mut self) {
+        if !self.lat_block.is_empty() {
+            self.lat_stats.record_block(&self.lat_block);
+            self.lon_stats.record_block(&self.lon_block);
+            self.lat_block.clear();
+            self.lon_block.clear();
+        }
+    }
+}
+
 /// Analyze node coordinate statistics from a PBF file.
 ///
-/// Streams through all nodes, collecting coordinate ranges and FOR block
-/// bit-width distributions. Runs in constant memory.
+/// Streams through all node blobs in parallel (pread workers via
+/// [`parallel_classify_accumulate`]), collecting coordinate ranges and
+/// FOR block bit-width distributions into per-worker accumulators that
+/// are merged at completion. Per-worker state is bounded
+/// (`CoordStats` + two 128-entry block buffers + scalar mins/maxes /
+/// counters ≈ ~1 KB), so the `parallel_classify_accumulate` safety
+/// envelope applies comfortably.
 #[hotpath::measure]
-pub fn node_stats(path: &Path, direct_io: bool, force: bool) -> Result<NodeStatsReport> {
+pub fn node_stats(
+    path: &Path,
+    direct_io: bool,
+    force: bool,
+    jobs: usize,
+) -> Result<NodeStatsReport> {
     require_indexdata(path, direct_io, force,
         "input PBF has no blob-level indexdata. Without indexdata, the node-only \
          filter is a no-op - all blobs are decompressed (significantly slower).")?;
 
-    // Sequential reader to avoid PrimitiveBlock cross-thread retention
-    // at planet scale (520K+ blobs). Diagnostic command - single-threaded
-    // decode is acceptable.
-    let mut blob_reader = crate::blob::BlobReader::open(path, direct_io)?;
-    blob_reader.set_parse_indexdata(true);
-    blob_reader.next()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-    let mut decompress_buf: Vec<u8> = Vec::new();
-
-    let mut node_count: u64 = 0;
-    let mut min_lat = i32::MAX;
-    let mut max_lat = i32::MIN;
-    let mut min_lon = i32::MAX;
-    let mut max_lon = i32::MIN;
-
-    let mut lat_stats = CoordStats::new();
-    let mut lon_stats = CoordStats::new();
-
-    let mut lat_block = Vec::with_capacity(BLOCK_SIZE);
-    let mut lon_block = Vec::with_capacity(BLOCK_SIZE);
-    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
-
     crate::debug::emit_marker("NODESTATS_START");
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
-        if let Some(idx) = blob.index() {
-            if !matches!(idx.kind, crate::blob_meta::ElemKind::Node) { continue; }
-        }
-        blob.decompress_into(&mut decompress_buf)?;
-        let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
-            std::mem::take(&mut decompress_buf), &mut st_scratch, &mut gr_scratch,
-        )?;
-        for element in block.elements_skip_metadata() {
-            let (lat_e7, lon_e7) = match &element {
-                Element::DenseNode(dn) => (dn.decimicro_lat(), dn.decimicro_lon()),
-                Element::Node(n) => (n.decimicro_lat(), n.decimicro_lon()),
-                _ => continue,
-            };
 
-            node_count += 1;
+    let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
+        path,
+        Some(crate::blob_meta::ElemKind::Node),
+    )?;
 
-            if lat_e7 < min_lat { min_lat = lat_e7; }
-            if lat_e7 > max_lat { max_lat = lat_e7; }
-            if lon_e7 < min_lon { min_lon = lon_e7; }
-            if lon_e7 > max_lon { max_lon = lon_e7; }
+    // `jobs == 0` means auto; `parallel_classify_accumulate` interprets
+    // `Some(0)` as auto too, so pass through unchanged.
+    let thread_override = (jobs > 0).then_some(jobs);
+    let mut global = WorkerAccum::new();
 
-            lat_block.push(lat_e7);
-            lon_block.push(lon_e7);
+    crate::scan::classify::parallel_classify_accumulate(
+        &shared_file,
+        &schedule,
+        thread_override,
+        WorkerAccum::new,
+        |block, accum| {
+            for element in block.elements_skip_metadata() {
+                let (lat_e7, lon_e7) = match &element {
+                    Element::DenseNode(dn) => (dn.decimicro_lat(), dn.decimicro_lon()),
+                    Element::Node(n) => (n.decimicro_lat(), n.decimicro_lon()),
+                    _ => continue,
+                };
 
-            if lat_block.len() == BLOCK_SIZE {
-                lat_stats.record_block(&lat_block);
-                lon_stats.record_block(&lon_block);
-                lat_block.clear();
-                lon_block.clear();
+                accum.node_count += 1;
+                if lat_e7 < accum.min_lat { accum.min_lat = lat_e7; }
+                if lat_e7 > accum.max_lat { accum.max_lat = lat_e7; }
+                if lon_e7 < accum.min_lon { accum.min_lon = lon_e7; }
+                if lon_e7 > accum.max_lon { accum.max_lon = lon_e7; }
+
+                accum.lat_block.push(lat_e7);
+                accum.lon_block.push(lon_e7);
+
+                if accum.lat_block.len() == BLOCK_SIZE {
+                    accum.lat_stats.record_block(&accum.lat_block);
+                    accum.lon_stats.record_block(&accum.lon_block);
+                    accum.lat_block.clear();
+                    accum.lon_block.clear();
+                }
             }
-        }
-    }
+        },
+        |mut worker| {
+            worker.finalize();
+            global.node_count += worker.node_count;
+            global.min_lat = global.min_lat.min(worker.min_lat);
+            global.max_lat = global.max_lat.max(worker.max_lat);
+            global.min_lon = global.min_lon.min(worker.min_lon);
+            global.max_lon = global.max_lon.max(worker.max_lon);
+            // CoordStats merge is additive on every field.
+            for (dst, src) in global
+                .lat_stats
+                .bucket_counts
+                .iter_mut()
+                .zip(worker.lat_stats.bucket_counts.iter())
+            {
+                *dst += src;
+            }
+            global.lat_stats.total_blocks += worker.lat_stats.total_blocks;
+            global.lat_stats.total_bits_weighted += worker.lat_stats.total_bits_weighted;
+            for (dst, src) in global
+                .lon_stats
+                .bucket_counts
+                .iter_mut()
+                .zip(worker.lon_stats.bucket_counts.iter())
+            {
+                *dst += src;
+            }
+            global.lon_stats.total_blocks += worker.lon_stats.total_blocks;
+            global.lon_stats.total_bits_weighted += worker.lon_stats.total_bits_weighted;
+        },
+    )?;
 
-    // Flush the last partial block
-    if !lat_block.is_empty() {
-        lat_stats.record_block(&lat_block);
-        lon_stats.record_block(&lon_block);
-    }
-
-    if node_count == 0 {
-        min_lat = 0;
-        max_lat = 0;
-        min_lon = 0;
-        max_lon = 0;
+    if global.node_count == 0 {
+        global.min_lat = 0;
+        global.max_lat = 0;
+        global.min_lon = 0;
+        global.max_lon = 0;
     }
 
     crate::debug::emit_marker("NODESTATS_END");
     Ok(NodeStatsReport {
-        node_count,
-        min_lat,
-        max_lat,
-        min_lon,
-        max_lon,
-        lat_stats,
-        lon_stats,
+        node_count: global.node_count,
+        min_lat: global.min_lat,
+        max_lat: global.max_lat,
+        min_lon: global.min_lon,
+        max_lon: global.max_lon,
+        lat_stats: global.lat_stats,
+        lon_stats: global.lon_stats,
     })
 }

@@ -26,6 +26,22 @@ use crate::BoxResult as Result;
 /// `data_size` address the blob's payload in the input PBF.
 pub(crate) type ScheduleEntry = (usize, u64, usize);
 
+/// Resolve a caller-supplied `threads: Option<usize>` override into a
+/// concrete decode-thread count. `None` (the default for every existing
+/// caller) picks `available_parallelism() - 2` clamped to ≥ 1, the
+/// convention established by the pipelined reader and matching the
+/// comment in `src/read/pipeline.rs::run_pipeline`. `Some(0)` is
+/// treated identically to `None` so CLI flags that map "0 = auto"
+/// pass through cleanly. `Some(n)` forces exactly `n` threads.
+fn resolve_thread_count(threads: Option<usize>) -> usize {
+    match threads {
+        Some(n) if n > 0 => n,
+        _ => std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(2).max(1))
+            .unwrap_or(4),
+    }
+}
+
 /// Build a classification schedule from a header-only scan, optionally
 /// filtering by element type. Returns `(schedule, shared_file)` ready for
 /// [`parallel_classify_phase`].
@@ -172,6 +188,7 @@ pub(crate) fn build_classify_schedules_split(
 pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
     shared_file: &std::sync::Arc<std::fs::File>,
     schedule: &[ScheduleEntry],
+    threads: Option<usize>,
     worker_init: impl Fn() -> S + Send + Sync,
     classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> R + Send + Sync,
     mut merge: impl FnMut(usize, R),
@@ -180,9 +197,7 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
 
     if schedule.is_empty() { return Ok(()); }
 
-    let decode_threads = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(4);
+    let decode_threads = resolve_thread_count(threads);
 
     let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<ScheduleEntry>(16);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
@@ -277,6 +292,7 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
 pub(crate) fn parallel_classify_accumulate<S: Send>(
     shared_file: &std::sync::Arc<std::fs::File>,
     schedule: &[ScheduleEntry],
+    threads: Option<usize>,
     worker_init: impl Fn() -> S + Send + Sync,
     classify: impl Fn(&crate::PrimitiveBlock, &mut S) + Send + Sync,
     mut merge: impl FnMut(S),
@@ -285,9 +301,7 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
 
     if schedule.is_empty() { return Ok(()); }
 
-    let decode_threads = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(4);
+    let decode_threads = resolve_thread_count(threads);
 
     let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<ScheduleEntry>(16);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));

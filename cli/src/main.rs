@@ -415,6 +415,11 @@ enum Command {
         /// Analyze node coordinate statistics for FOR compression sizing
         #[arg(long)]
         nodes: bool,
+        /// Parallel worker threads for `--nodes` (only). `1` forces sequential,
+        /// `0` auto-picks from `available_parallelism()`, higher values cap
+        /// the worker pool. Other inspect modes ignore this flag.
+        #[arg(short = 'j', long = "jobs", default_value = "0")]
+        jobs: usize,
         /// Show per-block distribution stats and optional block listing
         #[arg(long, num_args = 0..=1, default_missing_value = "0")]
         blocks: Option<usize>,
@@ -602,6 +607,11 @@ enum InspectCommand {
         /// Filter by element type: node, way, or relation
         #[arg(short = 't', long = "type")]
         type_filter: Option<String>,
+        /// Parallel worker threads. `1` forces sequential, `0` auto-picks
+        /// from `available_parallelism()`, higher values cap the worker
+        /// pool.
+        #[arg(short = 'j', long = "jobs", default_value = "0")]
+        jobs: usize,
         #[command(flatten)]
         io: DirectIoArg,
         #[command(flatten)]
@@ -1008,6 +1018,7 @@ fn main() -> process::ExitCode {
             file,
             indexed,
             nodes,
+            jobs,
             blocks,
             id_ranges,
             locations,
@@ -1027,6 +1038,7 @@ fn main() -> process::ExitCode {
                 expressions_file,
                 expressions,
                 type_filter,
+                jobs: tags_jobs,
                 io: tags_io,
                 force: tags_force,
             }) = subcommand
@@ -1039,6 +1051,7 @@ fn main() -> process::ExitCode {
                     expressions_file.as_deref(),
                     &expressions,
                     type_filter.as_deref(),
+                    tags_jobs,
                     tags_io.direct_io,
                     tags_force.force,
                 )
@@ -1051,6 +1064,7 @@ fn main() -> process::ExitCode {
                     &file,
                     indexed,
                     nodes,
+                    jobs,
                     blocks,
                     id_ranges,
                     locations,
@@ -1365,6 +1379,7 @@ fn run_check(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn run_tags_count(
     path: &std::path::Path,
     min_count: u64,
@@ -1373,6 +1388,7 @@ fn run_tags_count(
     expressions_file: Option<&std::path::Path>,
     expressions: &[String],
     type_filter: Option<&str>,
+    jobs: usize,
     direct_io: bool,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1392,6 +1408,7 @@ fn run_tags_count(
         type_filter,
         direct_io,
         force,
+        jobs,
     };
     let results = pbfhogg::tags_count::tags_count(path, &opts)?;
 
@@ -2096,10 +2113,12 @@ fn parse_element_spec(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn run_inspect(
     path: &std::path::Path,
     indexed: bool,
     nodes: bool,
+    jobs: usize,
     blocks: Option<usize>,
     id_ranges: bool,
     locations: bool,
@@ -2139,7 +2158,7 @@ fn run_inspect(
 
     // --nodes only: run node stats without full inspect
     if nodes && !indexed && !extended && !id_ranges && !locations && !anomalies && blocks.is_none() && get.is_none() {
-        let report = pbfhogg::inspect::node_stats::node_stats(path, direct_io, force)?;
+        let report = pbfhogg::inspect::node_stats::node_stats(path, direct_io, force, jobs)?;
         report.print_report();
         return Ok(());
     }
@@ -2217,7 +2236,7 @@ fn run_inspect(
 
     // --nodes combined with other flags: run node stats and print
     if nodes {
-        let node_report = pbfhogg::inspect::node_stats::node_stats(path, direct_io, force)?;
+        let node_report = pbfhogg::inspect::node_stats::node_stats(path, direct_io, force, jobs)?;
         node_report.print_report();
     }
 

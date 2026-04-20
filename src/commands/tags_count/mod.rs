@@ -56,13 +56,14 @@ pub struct TagCountOptions<'a> {
 /// If `expressions` is non-empty, only tags matching at least one
 /// expression are counted (same syntax as `tags-filter`).
 ///
-/// Parallel workers via `parallel_classify_accumulate`: each worker
-/// builds its own `CountMap` across the blobs it processes, merged at
-/// completion. Per-worker maps are bounded by the distinct tag
-/// (key, value) pairs a worker sees across its share of blobs; at
-/// planet the union cardinality is a few hundred MB worst-case,
-/// well inside the `parallel_classify_accumulate` safety envelope.
-/// The 256-blob schedule keeps each worker's share modest.
+/// Parallel workers via `parallel_classify_phase`: each worker emits a
+/// per-blob `CountMap` (bounded by the blob's ~8 000 elements); the
+/// consumer thread merges per-blob maps into a single global. The
+/// accumulate-style alternative (per-worker map held across every
+/// blob a worker sees) hit 26.8 GB peak anon at planet because every
+/// worker held roughly the global cardinality by the end. Per-blob
+/// emission keeps peak anon at a small multiple of one blob's
+/// distinct tags (~few MB) plus the single global map.
 #[hotpath::measure]
 pub fn tags_count(
     path: &Path,
@@ -96,23 +97,25 @@ pub fn tags_count(
     let thread_override = (opts.jobs > 0).then_some(opts.jobs);
     let mut counts: CountMap = FxHashMap::default();
 
-    crate::scan::classify::parallel_classify_accumulate(
+    crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &schedule,
         thread_override,
-        FxHashMap::<String, FxHashMap<String, u64>>::default,
-        |block, local_counts| {
+        || (),
+        |block, _s| {
+            let mut local: CountMap = FxHashMap::default();
             count_block_tags(
-                local_counts,
+                &mut local,
                 block,
                 tf.nodes,
                 tf.ways,
                 tf.relations,
                 &expressions,
             );
+            local
         },
-        |worker_counts| {
-            merge_counts(&mut counts, worker_counts);
+        |_seq, per_blob| {
+            merge_counts(&mut counts, per_blob);
         },
     )?;
 

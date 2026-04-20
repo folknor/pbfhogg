@@ -5,6 +5,22 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use pbfhogg::HeaderOverrides;
 use pbfhogg::writer::Compression;
 
+/// Non-fatal exit code carrier. Subcommands that need to signal a
+/// specific non-zero exit status (e.g. `diff` with differences found)
+/// return this via the error channel instead of calling `process::exit`.
+/// `process::exit` skips destructors, which prevents the hotpath guard
+/// in `main` from flushing its JSON report.
+#[derive(Debug)]
+struct ExitWithCode(u8);
+
+impl std::fmt::Display for ExitWithCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "exit with code {}", self.0)
+    }
+}
+
+impl std::error::Error for ExitWithCode {}
+
 #[derive(Parser)]
 #[command(name = "pbfhogg", about = "OpenStreetMap PBF toolkit", version)]
 struct Cli {
@@ -642,7 +658,7 @@ fn combine_expressions(
 }
 
 #[allow(clippy::too_many_lines)]
-fn main() {
+fn main() -> process::ExitCode {
     let _guard = hotpath::HotpathGuardBuilder::new("pbfhogg::main")
         .percentiles(&[50.0, 95.0, 99.0])
         .functions_limit(0)
@@ -1127,10 +1143,21 @@ fn main() {
         } => run_bench_merge(&base, &changes, &output.output, &compression, &io_mode),
     } })();
 
-    if let Err(e) = result {
-        eprintln!("Error: {e}");
-        process::exit(1);
+    match result {
+        Ok(()) => process::ExitCode::SUCCESS,
+        Err(e) => {
+            if let Some(exit) = e.downcast_ref::<ExitWithCode>() {
+                // Silent exit with a specific code (e.g. `diff` found
+                // differences). Not an error worth printing.
+                process::ExitCode::from(exit.0)
+            } else {
+                eprintln!("Error: {e}");
+                process::ExitCode::FAILURE
+            }
+        }
     }
+    // `_guard` drops here, flushing the hotpath JSON report before the
+    // returned `ExitCode` is converted to the process exit status.
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1323,7 +1350,7 @@ fn run_check(
     }
 
     if failed {
-        process::exit(1);
+        return Err(Box::new(ExitWithCode(1)));
     }
     Ok(())
 }
@@ -1644,7 +1671,7 @@ fn run_diff(
         }
     }
     if stats.has_differences() {
-        process::exit(1);
+        return Err(Box::new(ExitWithCode(1)));
     }
     Ok(())
 }
@@ -1992,7 +2019,7 @@ fn run_show_element(
     let found = pbfhogg::inspect::show_element(path, elem_type, id, direct_io)?;
     if !found {
         eprintln!("Element not found: {spec}");
-        process::exit(1);
+        return Err(Box::new(ExitWithCode(1)));
     }
     Ok(())
 }
@@ -2066,7 +2093,7 @@ fn run_inspect(
             println!("Indexed: no");
         }
         if !has_index {
-            process::exit(1);
+            return Err(Box::new(ExitWithCode(1)));
         }
         return Ok(());
     }
@@ -2177,7 +2204,7 @@ fn run_inspect(
     }
 
     if exit_not_indexed {
-        process::exit(1);
+        return Err(Box::new(ExitWithCode(1)));
     }
     Ok(())
 }

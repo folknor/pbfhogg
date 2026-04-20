@@ -196,7 +196,7 @@ stamped below when the run completes. Ages computed against
 | extract --complete (Europe bbox) | (no prior planet row - `cadc3e6` 164.9 s was Europe dataset) | - | - | - | `cc1051ac` / `1245cde` / 261.8 s; **post-extract-walk: `6095a4cc` / `26d1402` / 254.2 s (-2.9%)** |
 | extract --smart (Europe bbox) | `2d028196` / `07dcdae3` | `cadc3e6` | 279 s / 267.5 s | 9d | `1f3e2128` / `1245cde` / 278.7 s (flat vs 2d028196 same cli_args); **post-extract-walk: `4a166b6f` / `26d1402` / 283.5 s (+1.7%, noise)** |
 | extract --multi (5 regions) | - | - | - | - | `c79eac24` / `1245cde` / 1004.6 s; **post-multi-walk: `dad573cb` / `57b01f9` / 972.0 s (-3.2%)** |
-| tags-filter `w/highway=primary` (transitive) | (no matching prior - `f262f068` used `-R`) | - | - | - | `e447869f` / `1245cde` / 147.5 s; **post-Tier-S: `97767260` / `de8daf1` / 139.2 s (-5.6%)** |
+| tags-filter `w/highway=primary` (transitive) | (no matching prior - `f262f068` used `-R`) | - | - | - | `e447869f` / `1245cde` / 147.5 s; post-Tier-S: `97767260` / `de8daf1` / 139.2 s (-5.6%); **post-Tier-1: `af272213` / `8e3a0d1` / 119.9 s (cumulative -18.7% / -27.6 s)** |
 | check --refs | `64e9a394` | (2026-04-18) | 70.2 s | 2d | `cbcf27f8` / `1245cde` / 72.6 s; **post-Tier-S: `27ab8ef8` / `de8daf1` / 62.7 s (-13.7%)** |
 | check --ids --full | `c498fff0` | `ef6ce09` | 69.5 s | 3d | `5d77f174` / `1245cde` / 72.5 s; **post-Tier-S: `7949c553` / `de8daf1` / 63.2 s (-12.8%)** |
 | inspect --nodes -j 16 | `c5edebe7` | `b7d8aea` | 56.8 s | today | `a816ae6f` / `1245cde` / 58.1 s; **post-Tier-S: `eb060eaa` / `de8daf1` / 49.4 s (-15.0%)** |
@@ -204,8 +204,8 @@ stamped below when the run completes. Ages computed against
 | renumber | `abd74459` (--bench 3) | (2026-04-18) | 204.5 s | 2d | `84be312f` (--bench 1) / `1245cde` / 215.6 s; **post-renumber-walk: `f8500590` / `911ada6` / 219.3 s (+1.7%, within noise)** |
 | diff-snapshots text -j 16 | `b02d86bc` | `06628d8` | 208.6 s | today | `af5d53fd` / `1245cde` / 227.0 s (documented +8.8% wall for 74% RSS drop, `d207cea`) |
 | diff-snapshots --format osc -j 16 | `9b3fc2b9` | `06628d8` | 313.8 s | today | `ef254a69` / `1245cde` / 329.5 s (+5% drift, no OSC-path shape change between commits) |
-| build-geocode-index | `b4b25c05` | `82db8ed` | 432.9 s | 2d | `d139067d` / `1245cde` / 430.5 s (flat, same cli_args) |
-| add-locations-to-ways (external) | `a406d77e` (--bench 3) | `aee7727` | 661.2 s | 2d | `06924c29` (--bench 1) / `1245cde` / 684.0 s (+3.4% within sample-count drift) |
+| build-geocode-index | `b4b25c05` | `82db8ed` | 432.9 s | 2d | `d139067d` / `1245cde` / 430.5 s (flat, same cli_args); **post-Tier-1: `38565e43` / `8e3a0d1` / 434.9 s (+1%, noise)** |
+| add-locations-to-ways (external) | `a406d77e` (--bench 3) | `aee7727` | 661.2 s | 2d | `06924c29` (--bench 1) / `1245cde` / 684.0 s (+3.4% within sample-count drift); **post-Tier-1: `8f829264` / `8e3a0d1` / 673.6 s (-1.5%)** |
 | apply-changes --osc-seq 4920 | `8e940f71` | `ef6ce09` | 756.3 s | 3d | `59327f65` / `1245cde` / 577.0 s (-24%, intervening "lift/split" commits in apply_changes + osc - cause not obvious from commit messages); **post-prefill-walk: `8149b1b5` / `d925bc4` / 589.1 s (+2% vs pre, within --bench 1 noise for ~10-min command)** |
 
 Nothing in the doc should be implemented until the overnight run

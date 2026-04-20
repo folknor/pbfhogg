@@ -306,76 +306,98 @@ fn build_node_index(
 
 /// Collect all node IDs referenced by ways (pass 0).
 ///
-/// Scans only way blobs (via `BlobFilter`) and builds a bitset of every node
-/// ID that appears in any way's refs list. At planet scale (~2B unique node
-/// refs), this costs ~1.6 GB - far less than indexing all 10.4B nodes.
+/// Uses `build_classify_schedule(Way)` to obtain a way-only blob schedule
+/// via the pread-only `HeaderWalker`, then fans work out to
+/// `parallel_classify_phase` workers. Each worker decompresses one blob
+/// and emits the set of referenced node IDs; the main thread unions them
+/// into a single `IdSet`.
+///
+/// At planet scale (~2 B unique node refs) the union bitset costs ~1.6 GB.
+/// Per-blob refs are emitted into fresh `Vec<i64>`s that the main thread
+/// consumes and drops immediately after the union, so the transient
+/// worker-side memory stays bounded to per-blob refs (~8 k ways × ~20
+/// refs each × 8 B = ~1.3 MB) regardless of how many blobs have completed.
+///
+/// `direct_io` is intentionally dropped on this path: the blob bodies are
+/// pread from the shared file handle on worker threads, which is
+/// incompatible with `O_DIRECT`'s alignment requirements.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn collect_way_referenced_node_ids(input: &Path, direct_io: bool) -> Result<IdSet> {
-    // Way-ref scanner: bypasses PrimitiveBlock construction (no string table,
-    // no group_ranges). Only extracts way refs for IdSet population.
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    blob_reader.set_parse_indexdata(true);
-    blob_reader.next()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-    let mut decompress_buf: Vec<u8> = Vec::new();
+fn collect_way_referenced_node_ids(input: &Path, _direct_io: bool) -> Result<IdSet> {
+    let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
+        input,
+        Some(crate::blob_meta::ElemKind::Way),
+    )?;
     let mut referenced = IdSet::new();
-    let mut refs_buf: Vec<i64> = Vec::new();
-    let mut group_starts: Vec<(usize, usize)> = Vec::new();
-
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
-        if let Some(idx) = blob.index() {
-            if !matches!(idx.kind, crate::blob_meta::ElemKind::Way) { continue; }
-        }
-        blob.decompress_into(&mut decompress_buf)?;
-        crate::scan::way::scan_way_refs(&decompress_buf, &mut refs_buf, &mut group_starts, |_way_id, refs| {
-            for &node_id in refs {
-                if node_id >= 0 {
-                    referenced.set(node_id);
+    crate::scan::classify::parallel_classify_phase(
+        &shared_file,
+        &schedule,
+        None,
+        || (),
+        |block, _| {
+            let mut refs_vec: Vec<i64> = Vec::new();
+            for element in block.elements_skip_metadata() {
+                if let Element::Way(w) = element {
+                    for node_id in w.refs() {
+                        if node_id >= 0 {
+                            refs_vec.push(node_id);
+                        }
+                    }
                 }
             }
-        })?;
-    }
+            refs_vec
+        },
+        |_seq, refs_vec| {
+            for &node_id in &refs_vec {
+                referenced.set(node_id);
+            }
+        },
+    )?;
     Ok(referenced)
 }
 
 /// Collect all node IDs referenced by relation members.
+///
+/// Uses `build_classify_schedule(Relation)` plus
+/// `parallel_classify_accumulate` so each worker unions member-node IDs
+/// into its own `IdSet` across the whole scan; the main thread merges
+/// the per-worker bitsets at completion. Relation member-node-ID sets
+/// are sparse (only members with type=Node, and only those that are
+/// also node IDs rather than way/relation IDs), so per-worker `IdSet`
+/// memory stays bounded - the scan/classify.rs doc comment estimates
+/// ~68 MB per worker at planet scale.
+///
+/// `direct_io` is intentionally dropped on this path: blob bodies are
+/// pread from the shared file handle on worker threads, incompatible
+/// with `O_DIRECT` alignment requirements.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub(crate) fn collect_relation_member_node_ids(input: &Path, direct_io: bool) -> Result<IdSet> {
-    // Sequential reader - only ~2K relation blobs at Europe scale, so retention
-    // is negligible, but sequential is consistent with the other collection passes.
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    blob_reader.set_parse_indexdata(true);
-    blob_reader.next()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-    let mut decompress_buf: Vec<u8> = Vec::new();
+pub(crate) fn collect_relation_member_node_ids(input: &Path, _direct_io: bool) -> Result<IdSet> {
+    let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
+        input,
+        Some(crate::blob_meta::ElemKind::Relation),
+    )?;
     let mut member_node_ids = IdSet::new();
-    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
-
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
-        if let Some(idx) = blob.index() {
-            if !matches!(idx.kind, crate::blob_meta::ElemKind::Relation) { continue; }
-        }
-        blob.decompress_into(&mut decompress_buf)?;
-        let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
-            std::mem::take(&mut decompress_buf), &mut st_scratch, &mut gr_scratch,
-        )?;
-        for element in block.elements_skip_metadata() {
-            if let Element::Relation(r) = element {
-                for member in r.members() {
-                    if let MemberId::Node(id) = member.id
-                        && id >= 0
-                    {
-                        member_node_ids.set(id);
+    crate::scan::classify::parallel_classify_accumulate(
+        &shared_file,
+        &schedule,
+        None,
+        IdSet::new,
+        |block, set| {
+            for element in block.elements_skip_metadata() {
+                if let Element::Relation(r) = element {
+                    for member in r.members() {
+                        if let MemberId::Node(id) = member.id
+                            && id >= 0
+                        {
+                            set.set(id);
+                        }
                     }
                 }
             }
-        }
-    }
+        },
+        |worker_set| {
+            member_node_ids.merge_from(&worker_set);
+        },
+    )?;
     Ok(member_node_ids)
 }
 

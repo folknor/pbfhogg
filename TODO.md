@@ -12,9 +12,9 @@ Four planet-scale command plans are in notes, each with a ranked set of opportun
 
 - [ ] **[notes/apply-changes-opportunities.md](notes/apply-changes-opportunities.md)** - `apply-changes --locations-on-ways`. Current: **762 s / 1.8 GB RSS** at planet under production `--compression none`. Target: **~9-10 min / same RSS**. Already mostly well-shaped; two incremental parallelizations remaining - `NodeLocationIndex::prefill_from_base` and the sequential reader thread. No reshape needed.
 
-- [x] ~~**[notes/getid-include-optimization.md](notes/getid-include-optimization.md)**~~ - `getid` include mode. Landed 2026-04-20 via a shared `pread`-only `HeaderWalker` primitive (`src/read/header_walker.rs`). Planet **43.7 s → 7.0 s (6.2×)**, germany 200 ms, disk read 88 GB → 636 MB. Walker is now syscall-bound (~1.2 M preads at planet); going to <1 s would need a 1-pread-per-blob variant plus io_uring batching - not pursued.
+- [x] ~~**getid include mode**~~ - landed 2026-04-20 via a shared `pread`-only `HeaderWalker` primitive (`src/read/header_walker.rs`). Planet **43.7 s → 7.0 s (6.2×)**, germany 200 ms, disk read 88 GB → 636 MB. Walker is now syscall-bound (~1.2 M preads at planet); going to <1 s would need a 1-pread-per-blob variant plus io_uring batching - not pursued. Plan doc retired.
 
-- [ ] **[notes/diff-snapshots-opportunities.md](notes/diff-snapshots-opportunities.md)** - `diff-snapshots` (both human-readable and `--format osc`). Planet baseline **2134 s / 35m34s** (UUID `a9d430f2`, commit `052da8b`, 2026-04-19). **Shard-based parallel block-pair merge + pread walker landed 2026-04-20**: planet **219.4 s / 3m39s at `-j 16` (9.7× speedup)**, germany 103 s → 19 s at `-j 8` (5.4×). CLI flag `-j/--jobs N` on `pbfhogg diff` (default 1 sequential; 0 auto; >1 parallel). Utilization NODE 92 %, WAY 81 %, peak RSS 2.4 GB at planet. Beats the 8-min aspirational target. Remaining follow-ups: (1) generalise to `derive_changes` (`--format osc`) using the same shard plan, (2) decide whether to auto-enable parallel by default, (3) halve walker syscalls via 1-pread-per-blob (length+header in one call) if the ~15 s planet walker becomes a bottleneck. Items 3 (per-element cost reductions) and 4-7 (v3/byte-equal/alloc/io) in the plan remain closed/deferred - parallel blob-pair merge was the whole win.
+- [x] ~~**diff-snapshots (text and `--format osc`)**~~ - landed 2026-04-20. Planet baselines: text **2134 s / 35m34s**, osc **2225 s / 37m06s**. ID-range sharded parallel block-pair merge for both paths: text planet **208.6 s / 3m28s at `-j 16` (UUID `b02d86bc`, 10.2× speedup)**, osc planet **313.8 s / 5m13s at `-j 16` (UUID `9b3fc2b9`, 7.1× speedup)**. CLI flag `-j/--jobs N` on `pbfhogg diff`. Germany text 16.5 s, germany osc 20.4 s at `-j 8`. Peak RSS 2.29 GB (text; shards buffer output in memory) / 663 MB (osc; shards stream to per-shard scratch temp files) at planet; shard balance within 1.03× max/min. Both paths beat the 8-min aspirational target. OSC speedup is lower because the final `assemble_osc` (gzip + concat of ~45 GB of XML fragments) is single-threaded and runs 32.8 s. Remaining follow-ups (all small, below): auto-enable parallel by default, halve walker syscalls via 1-pread-per-blob, migrate `diff/parallel.rs::walk_file` onto the shared `HeaderWalker`, parallelise `assemble_osc` gzip, stream text shard output to per-shard temp files to drop the 2.29 GB peak. Plan doc retired.
 
 - [ ] **[notes/altw-structural-reports.md](notes/altw-structural-reports.md)** - `add-locations-to-ways --index-type external`. Current planet baseline: **661.2 s `--bench 3`** (UUID `a406d77e`, commit `aee7727`, 2026-04-18 post-regression-fix). Europe **291.6 s** after metadata-driven relation scan (`6d71053`). Doc consolidates six independent reviews into 11 ranked opportunities. Dominant theme: the stage 2 → stage 3 → stage 4 disk-seam chain, with ~80 GB rank shards + ~112 GB slot buckets + finalize. Stage-2 de-ranking and `BlobLocationRouter` already shipped (Europe 320.5 s → 291.6 s total). Measurement history + already-shipped context in [`notes/altw-optimization-history.md`](notes/altw-optimization-history.md); the failed in-RAM-coord-table reshape experiment is documented at [`notes/altw-as-renumber.md`](notes/altw-as-renumber.md) and does not invalidate the remaining ranked items.
 
@@ -46,6 +46,47 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   don't exist in the base PBF, then re-extract to filter to bbox.
 
 ## Performance
+
+- [ ] **Stream diff text shard output to temp files**. Today each
+  `diff` text shard buffers its formatted output in an in-memory
+  `Vec<u8>` until all workers finish. At planet `-j 16` this peaks
+  at ~2.29 GB anon RSS. Switch to per-shard scratch temp files
+  (same shape as the osc path already has) or pipe shard-ordered
+  output directly to stdout via a reorder buffer. Drops peak to
+  the osc-path level (~660 MB) and lets the parallel path run on
+  lower-memory hosts without trouble. Only relevant if someone
+  runs diff text at planet scale on a tight-memory box; current
+  27 GB envelope handles it comfortably.
+
+- [ ] **Parallelise `assemble_osc` gzip**. Final serial tail in
+  `diff --format osc -j 16` is 32.8 s at planet (10 % of wall;
+  gzip + concat of ~45 GB of per-shard XML fragment temp files).
+  Pigz-style parallel gzip or switching to a concurrent compressor
+  would recover most of that. Only matters if osc becomes a hot
+  workload.
+
+- [ ] **1-pread-per-blob header walker**. `HeaderWalker::next_header`
+  does two small preads per blob (4-byte length prefix, then the
+  header bytes). At planet scale that's ~1.2 M syscalls for either
+  `getid` (~6-7 s of walker time) or `diff` (~15 s). A single pread
+  of ~1 KB per blob covers length + header in one syscall for the
+  common case (headers ~100-200 B) with a fallback for the rare
+  >1020 B header. Halves syscalls, should cut walker wall by
+  roughly half. Applies to both the shared `src/read/header_walker.rs`
+  primitive and the similar inline walker in
+  `src/commands/diff/parallel.rs::walk_file`.
+
+- [ ] **Migrate `diff/parallel.rs::walk_file` onto `HeaderWalker`**.
+  Today the diff text path has its own inline copy of the pread
+  walker. The shared primitive supports it; this is a mechanical
+  refactor. Cleaner; avoids the 1-pread-per-blob fix needing two
+  implementations.
+
+- [ ] **Consider auto-enabling diff `-j`**. Currently `pbfhogg diff`
+  defaults to `-j 1` (sequential). `-j 0` maps to
+  `available_parallelism()`. Evaluate flipping the default from 1
+  to 0 once the parallel path has more field miles. Wait until
+  Milestone 3.
 
 - [ ] **Expose phase events as a proper Rust event/hook API** - wrap
   every instrumentation call in per-command `probes` modules, then swap

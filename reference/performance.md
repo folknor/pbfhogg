@@ -359,6 +359,42 @@ first round. All three have since been resolved:
   arc (commit `82db8ed`, UUID `b4b25c05`, **432.9 s / 7m12s**). Not
   part of the refresh round - the arc landed independently.
 
+#### Planet refresh (commit `06628d8`, 2026-04-20, plantasjen)
+
+Two commands picked up large wins in the 2026-04-20 batch via a shared
+`pread`-only header walker (`src/read/header_walker.rs::HeaderWalker`)
+and shard-based parallel merge-join (`-j/--jobs N` on `pbfhogg diff`).
+
+| Command | Mode | Wall | UUID | Row before (2026-04-18) | Δ |
+|---|---|---:|---|---:|---:|
+| getid (include mode) | `--bench 1 --force` | **7.0 s** | forced, dirty tree | 43.8 s | **−36.8 s (6.2×)** |
+| diff-snapshots text | `--bench 1 -j 16` | **208.6 s (3m28s)** | `b02d86bc` | 2150.9 s (35m51s, sequential) | **−1942 s (10.2×)** |
+| diff-snapshots --format osc | `--bench 1 -j 16` | **313.8 s (5m13s)** | `9b3fc2b9` | 2225.6 s (37m06s, sequential) | **−1912 s (7.1×)** |
+
+All three carry the 2026-04-18 `ca6711e` + `aa3147c` short-circuit +
+seek-raw fixes plus the 2026-04-20 patches:
+
+- `HeaderWalker` (shared): opens the fd with `posix_fadvise(POSIX_FADV_RANDOM)`
+  and walks blob headers via raw `pread` - two preads per blob (length
+  prefix + header bytes), no blob body read. Avoids the `BufReader`
+  amplification where data bytes that happen to sit inside the 256 KB
+  buffer window get read and discarded. Planet getid walker: 88 GB →
+  636 MB of disk read.
+- Shard-based parallel block-pair merge for `diff` text and osc. N-1
+  thresholds at old-blob boundaries; straddling new blobs are read
+  by both adjacent shards and each shard's element merge clips to its
+  own `(t_low, t_high]` window. Peak RSS 2.29 GB (text, shards buffer
+  output in memory) / 663 MB (osc, shards stream XML to scratch temp
+  files). Shard balance within 1.03× max/min on germany.
+
+`getid` is still syscall-bound on the ~1.2 M header preads (~6-7 s of
+pure syscall time); a 1-pread-per-blob variant would halve that. `diff`
+osc's lower speedup is the serial `assemble_osc` gzip + concat of
+~45 GB of XML fragment temp files (32.8 s / 10 % of wall).
+
+Previous-plan docs (`notes/diff-snapshots-opportunities.md`,
+`notes/getid-include-optimization.md`) are retired.
+
 #### Europe ALTW phase breakdown (the cleanest signal)
 
 `EXTJOIN_META_SCAN` is the only ALTW phase that walks blob headers; all
@@ -1088,25 +1124,52 @@ pbfhogg CLI underneath; different measurement.
 
 ### Planet (87 GB input, 93 GB output snapshot, 47-day apart)
 
-Commit `7e9c2e9`, plantasjen, `--bench 1`. `from=base` is the
-2026-02-23 planet; `to=20260411` is the corresponding April-11
-snapshot registered under the planet dataset's snapshot key.
+`from=base` is the 2026-02-23 planet; `to=20260411` is the
+corresponding April-11 snapshot registered under the planet dataset's
+snapshot key.
+
+**Sequential (pre-parallel landings).** Commit `7e9c2e9`, `--bench 1`.
+Both rows sit inside the 2026-04-18 TAINTED window
+(`4ce7e93..c0ae9a7`) - wall carries the `has_indexdata` O(N)
+all-blobs-scan cost that was fixed in `aa3147c`; RSS and sub-phase
+data are unaffected.
 
 | UUID | Args | Wall | Peak anon RSS |
 |---|---|---:|---:|
 | `42aedca1` | `--from base --to 20260411` (default text summary) | 2150.9 s (35m51s) | - |
 | `53900d5f` | `--from base --to 20260411 --format osc` | 2225.6 s (37m06s) | **54.9 MB** |
 
-`diff` is a streaming merge-join between the two sorted PBF readers -
-no bulk in-memory structures - so peak anon stays tiny (~55 MB)
-regardless of input size. Single-threaded at 1.0 avg cores; 229 GB
-disk read + 15 GB OSC output write. Safe on any host.
+The sequential path is a streaming merge-join between the two sorted
+PBF readers - no bulk in-memory structures - so peak anon stays tiny
+(~55 MB) regardless of input size. Single-threaded at 1.0 avg cores;
+229 GB disk read + 15 GB OSC output write. Safe on any host.
 
-Both runs are at commit `7e9c2e9`, which is inside the 2026-04-18
-TAINTED window (`4ce7e93..c0ae9a7`) - wall carries the unaccounted
-`has_indexdata` O(N) all-blobs-scan cost; RSS and sub-phase data are
-unaffected. Re-measure post-`aa3147c` when a fresh planet snapshot
-pair becomes interesting.
+**Post-parallel (shard-based block-pair merge).** Commit `06628d8`,
+2026-04-20, `--bench 1`. Opt-in via `-j/--jobs N` on `pbfhogg diff`;
+both text and `--format osc` paths are parallelised over the same
+ID-range shard plan.
+
+| UUID | Args | Wall | Peak anon RSS | vs sequential |
+|---|---|---:|---:|---:|
+| `b02d86bc` | `--from base --to 20260411 -j 16` (text) | **208.6 s (3m28s)** | 2.29 GB | **10.2× faster** |
+| `9b3fc2b9` | `--from base --to 20260411 --format osc -j 16` | **313.8 s (5m13s)** | 663 MB | **7.1× faster** |
+
+Peak anon diverges by design: text shards buffer their formatted
+output in an in-memory `Vec<u8>` until all workers finish, then the
+main thread concatenates to stdout. OSC shards stream XML fragments
+straight to per-shard scratch temp files (`BufWriter<File>`), so peak
+anon is just in-flight decoded blocks. OSC's serial `assemble_osc`
+(gzip + concat of ~45 GB of XML fragments) is 32.8 s / 10 % of wall
+and is the main reason its speedup is lower than text's.
+
+Phase split (post-parallel planet), both paths: NODE dominates
+(~73 %), WAY second (~26 %), REL rounding error. Walker phase is now
+~15 s (pread-only via `HeaderWalker` with `posix_fadvise(RANDOM)`;
+disk read dropped from 45 GB to 2.6 GB). Shard balance on germany is
+within 1.03× max/min across all three type phases.
+
+Avg cores (planet text `-j 16`): NODE 14.7, WAY 12.9, REL 14.5 out of
+16 (86-92 % utilization). Peak threads 17 = 16 workers + 1 main.
 
 ## `--direct-io` impact summary
 

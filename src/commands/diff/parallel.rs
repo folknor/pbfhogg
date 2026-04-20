@@ -6,10 +6,9 @@
 //! merge loop with pread from a shared File, and buffers output in an
 //! owned `Vec<u8>`. Main thread concatenates buffers in shard order.
 //!
-//! See `notes/diff-snapshots-opportunities.md` item 1 for the design
-//! rationale. Hardcoded to `diff` semantics for first landing; a
-//! generic version that also serves `derive_changes` is follow-up
-//! work.
+//! Hardcoded to `diff` text semantics; the `--format osc` path has
+//! its own parallel driver in `derive_parallel.rs` that mirrors the
+//! same shard plan but emits XML fragments to per-shard temp files.
 
 use std::io::Write;
 use std::os::unix::fs::FileExt as _;

@@ -606,12 +606,9 @@ pub(crate) fn kind_type_char(kind: ElemKind) -> char {
 /// Shadow-mode counters for block-pair merge classification.
 ///
 /// Accumulated across all phases of a single diff/derive_changes run.
-/// Feeds the `diff-snapshots` optimization decisions (see
-/// `notes/diff-snapshots-opportunities.md`): what fraction of blobs hit the
-/// v1 byte-equal fast path, how many get element-merged after decoding both
-/// sides, and how many are emitted as entirely single-sided (the v3
-/// opportunity - those decode paths could be skipped if consumers supported
-/// an indexdata-only single-sided variant).
+/// What fraction of blobs hit the v1 byte-equal fast path, how many
+/// get element-merged after decoding both sides, and how many are
+/// emitted as entirely single-sided.
 ///
 /// Element counts come from blob indexdata (no per-element increments),
 /// so the overhead is a handful of u64 adds per blob.

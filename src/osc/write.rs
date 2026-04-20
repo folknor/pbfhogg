@@ -363,13 +363,13 @@ fn write_borrowed_way_xml<W: std::io::Write>(
         elem.push_attribute(("version", v_str.as_str()));
     }
 
-    let refs: Vec<i64> = way.refs().collect();
+    let mut refs = way.refs().peekable();
     let mut tags = way.tags().peekable();
-    if refs.is_empty() && tags.peek().is_none() {
+    if refs.peek().is_none() && tags.peek().is_none() {
         writer.write_event(Event::Empty(elem))?;
     } else {
         writer.write_event(Event::Start(elem))?;
-        for r in &refs {
+        for r in refs {
             let mut nd = BytesStart::new("nd");
             let r_str = r.to_string();
             nd.push_attribute(("ref", r_str.as_str()));
@@ -393,13 +393,13 @@ fn write_borrowed_relation_xml<W: std::io::Write>(
         elem.push_attribute(("version", v_str.as_str()));
     }
 
-    let members: Vec<_> = rel.members().collect();
+    let mut members = rel.members().peekable();
     let mut tags = rel.tags().peekable();
-    if members.is_empty() && tags.peek().is_none() {
+    if members.peek().is_none() && tags.peek().is_none() {
         writer.write_event(Event::Empty(elem))?;
     } else {
         writer.write_event(Event::Start(elem))?;
-        for m in &members {
+        for m in members {
             let mut member = BytesStart::new("member");
             let type_str = match m.id {
                 crate::MemberId::Node(_) => "node",

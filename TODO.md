@@ -400,11 +400,6 @@ per-iteration allocations remain across the codebase, ordered by impact:
   (`rewrite_block.rs`, `element_writes.rs`) which builds fresh
   `Vec<MemberData>` per relation from OSC input with no reuse.
 
-- [ ] **Borrowed XML writer Vec elimination** - `write_borrowed_way_xml`
-  and `write_borrowed_relation_xml` in `elements_xml.rs` still collect
-  refs and members into `Vec`s. Could use `.peekable()` like tags to
-  iterate directly. Low priority (~8 refs/way, ~10 members/relation).
-
 - [x] **2. Columnar batch processing** - shipped for extract node
   classification. `DenseNodeColumns` decodes IDs/lats/lons into
   contiguous arrays. `collect_matching_ids_multi_bbox` does single-pass

@@ -826,10 +826,7 @@ fn main() -> process::ExitCode {
                 if type_filter.is_some() {
                     return Err("--type is not valid with --format osc".into());
                 }
-                if jobs != 1 {
-                    return Err("--jobs is not valid with --format osc yet (only the text path is parallelised)".into());
-                }
-                run_derive_changes(&old, &new, &output, io.direct_io, increment_version, update_timestamp)
+                run_derive_changes(&old, &new, &output, io.direct_io, increment_version, update_timestamp, jobs)
             }
             DiffFormat::Text => {
                 if increment_version {
@@ -1698,6 +1695,7 @@ fn run_diff(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_derive_changes(
     old: &std::path::Path,
     new: &std::path::Path,
@@ -1705,9 +1703,24 @@ fn run_derive_changes(
     direct_io: bool,
     increment_version: bool,
     update_timestamp: bool,
+    jobs: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stats =
-        pbfhogg::diff::derive::derive_changes(old, new, output, direct_io, increment_version, update_timestamp)?;
+    let jobs_resolved = if jobs == 0 {
+        std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+    } else {
+        jobs
+    };
+    let stats = pbfhogg::diff::derive::derive_changes(
+        old,
+        new,
+        output,
+        direct_io,
+        increment_version,
+        update_timestamp,
+        jobs_resolved,
+    )?;
     stats.print_summary();
     Ok(())
 }

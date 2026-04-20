@@ -37,7 +37,7 @@ fn identical_files_no_changes() {
     write_test_pbf_sorted(&old, &nodes, &ways, &[]);
     write_test_pbf_sorted(&new, &nodes, &ways, &[]);
 
-    let stats = derive_changes(&old, &new, &osc, false, false, false).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false, false, false, 1).expect("derive");
     assert_eq!(stats.creates, 0);
     assert_eq!(stats.modifies, 0);
     assert_eq!(stats.deletes, 0);
@@ -66,7 +66,7 @@ fn create_only() {
         &[],
     );
 
-    let stats = derive_changes(&old, &new, &osc, false, false, false).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false, false, false, 1).expect("derive");
     assert_eq!(stats.creates, 2); // node 2 + way 10
     assert_eq!(stats.modifies, 0);
     assert_eq!(stats.deletes, 0);
@@ -95,7 +95,7 @@ fn delete_only() {
         &[],
     );
 
-    let stats = derive_changes(&old, &new, &osc, false, false, false).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false, false, false, 1).expect("derive");
     assert_eq!(stats.creates, 0);
     assert_eq!(stats.modifies, 0);
     assert_eq!(stats.deletes, 2); // node 2 + way 10
@@ -121,7 +121,7 @@ fn modify_node_coords() {
         &[],
     );
 
-    let stats = derive_changes(&old, &new, &osc, false, false, false).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false, false, false, 1).expect("derive");
     assert_eq!(stats.creates, 0);
     assert_eq!(stats.modifies, 1);
     assert_eq!(stats.deletes, 0);
@@ -147,7 +147,7 @@ fn modify_node_tags() {
         &[],
     );
 
-    let stats = derive_changes(&old, &new, &osc, false, false, false).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false, false, false, 1).expect("derive");
     assert_eq!(stats.modifies, 1);
 }
 
@@ -171,7 +171,7 @@ fn modify_way_refs() {
         &[],
     );
 
-    let stats = derive_changes(&old, &new, &osc, false, false, false).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false, false, false, 1).expect("derive");
     assert_eq!(stats.modifies, 1);
 }
 
@@ -206,7 +206,7 @@ fn modify_relation_members() {
         }],
     );
 
-    let stats = derive_changes(&old, &new, &osc, false, false, false).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false, false, false, 1).expect("derive");
     assert_eq!(stats.modifies, 1);
 }
 
@@ -239,7 +239,7 @@ fn mixed_create_modify_delete() {
         &[],
     );
 
-    let stats = derive_changes(&old, &new, &osc, false, false, false).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false, false, false, 1).expect("derive");
     assert_eq!(stats.creates, 1);  // node 4
     assert_eq!(stats.modifies, 2); // node 1 + way 10
     assert_eq!(stats.deletes, 1);  // node 3
@@ -280,7 +280,7 @@ fn roundtrip_with_merge() {
     );
 
     // Derive changes
-    let stats = derive_changes(&old, &new, &osc, false, false, false).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false, false, false, 1).expect("derive");
     assert_eq!(stats.creates, 1);  // node 5
     assert_eq!(stats.modifies, 2); // node 1 (tags) + way 10 (refs + tags)
     assert_eq!(stats.deletes, 1);  // node 3
@@ -335,7 +335,7 @@ fn unsorted_input_rejected() {
         &[],
     );
 
-    let err = derive_changes(&old, &new, &osc, false, false, false)
+    let err = derive_changes(&old, &new, &osc, false, false, false, 1)
         .expect_err("should reject unsorted input");
     let msg = err.to_string();
     assert!(msg.contains("not sorted"), "error should mention 'not sorted', got: {msg}");
@@ -415,7 +415,7 @@ fn increment_version_bumps_delete_versions() {
         (1, 100_000_000, 200_000_000, 3),
     ], &[]);
 
-    let stats = derive_changes(&old, &new, &osc, false, true, false).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false, true, false, 1).expect("derive");
     assert_eq!(stats.deletes, 2); // node 2 + way 10
 
     let xml = read_osc(&osc);
@@ -442,7 +442,7 @@ fn no_increment_version_preserves_delete_versions() {
         (1, 100_000_000, 200_000_000, 3),
     ], &[]);
 
-    let stats = derive_changes(&old, &new, &osc, false, false, false).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false, false, false, 1).expect("derive");
     assert_eq!(stats.deletes, 1);
 
     let xml = read_osc(&osc);
@@ -467,7 +467,7 @@ fn increment_version_and_update_timestamp_combined() {
     write_versioned_pbf(&new, &[], &[]);
 
     // Both increment_version=true and update_timestamp=true
-    let stats = derive_changes(&old, &new, &osc, false, true, true).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false, true, true, 1).expect("derive");
     assert_eq!(stats.deletes, 2); // node 1 + way 10
 
     let xml = read_osc(&osc);

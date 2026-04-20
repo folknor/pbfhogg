@@ -60,6 +60,7 @@ impl DeriveChangesStats {
 ///
 /// Requires both inputs to declare `Sort.Type_then_ID` - returns an
 /// actionable error if either is unsorted.
+#[allow(clippy::too_many_arguments)]
 #[hotpath::measure]
 pub fn derive_changes(
     old_path: &Path,
@@ -68,6 +69,7 @@ pub fn derive_changes(
     direct_io: bool,
     increment_version: bool,
     update_timestamp: bool,
+    jobs: usize,
 ) -> Result<DeriveChangesStats> {
     // Single-pass: check sorted headers + indexdata from one file open each.
     let (old_sorted, old_indexed) = super::check_sorted_and_indexed(old_path, direct_io)?;
@@ -78,9 +80,34 @@ pub fn derive_changes(
 
     // Scratch directory for temp files (same as brokkr scratch).
     let scratch_dir = output.parent().unwrap_or(Path::new("."));
-    let mut sink = ChangeSink::new(scratch_dir, increment_version, update_timestamp)?;
 
     crate::debug::emit_marker("DERIVECHANGES_SCAN_START");
+
+    // Parallel shard-based path. Only valid when both inputs are indexed
+    // (same constraint as derive_changes_block_pair). Falls through to
+    // the sequential sink path otherwise.
+    if both_indexed && jobs > 1 {
+        let stats = super::derive_parallel::derive_changes_parallel(
+            old_path,
+            new_path,
+            output,
+            scratch_dir,
+            jobs,
+            increment_version,
+            update_timestamp,
+        )
+        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+        crate::debug::emit_marker("DERIVECHANGES_SCAN_END");
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            crate::debug::emit_counter("derivechanges_creates", stats.creates as i64);
+            crate::debug::emit_counter("derivechanges_modifies", stats.modifies as i64);
+            crate::debug::emit_counter("derivechanges_deletes", stats.deletes as i64);
+        }
+        return Ok(stats);
+    }
+
+    let mut sink = ChangeSink::new(scratch_dir, increment_version, update_timestamp)?;
 
     let result = (|| -> Result<DeriveChangesStats> {
         if both_indexed {
@@ -393,25 +420,45 @@ fn derive_changes_element_stream(
 /// Writes XML structure via quick_xml Writer, copies raw fragment bytes
 /// directly to the underlying GzEncoder (not through the XML writer).
 fn assemble_osc(output: &Path, sink: &ChangeSink) -> Result<()> {
+    assemble_osc_from_paths(
+        output,
+        &sink.creates_path,
+        &sink.modifies_path,
+        &sink.deletes_path,
+        sink.create_count,
+        sink.modify_count,
+        sink.delete_count,
+    )
+}
+
+/// Assemble the final `.osc.gz` from three external temp file fragments.
+/// Same logic as `assemble_osc` but takes the paths + counts directly,
+/// so non-`ChangeSink` callers (e.g. the parallel derive path) can
+/// produce fragments however they like and feed them in.
+pub(crate) fn assemble_osc_from_paths(
+    output: &Path,
+    creates_path: &Path,
+    modifies_path: &Path,
+    deletes_path: &Path,
+    create_count: u64,
+    modify_count: u64,
+    delete_count: u64,
+) -> Result<()> {
     let file = File::create(output)?;
     let gz = GzEncoder::new(io::BufWriter::new(file), flate2::Compression::fast());
     let mut writer = Writer::new_with_indent(gz, b' ', 2);
 
-    // XML declaration
     writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
     writer.write_event(Event::Text(BytesText::new("\n")))?;
 
-    // <osmChange version="0.6">
     let mut root = BytesStart::new("osmChange");
     root.push_attribute(("version", "0.6"));
     writer.write_event(Event::Start(root))?;
 
-    // Copy each non-empty temp file as a section
-    copy_section(&mut writer, "create", &sink.creates_path, sink.create_count)?;
-    copy_section(&mut writer, "modify", &sink.modifies_path, sink.modify_count)?;
-    copy_section(&mut writer, "delete", &sink.deletes_path, sink.delete_count)?;
+    copy_section(&mut writer, "create", creates_path, create_count)?;
+    copy_section(&mut writer, "modify", modifies_path, modify_count)?;
+    copy_section(&mut writer, "delete", deletes_path, delete_count)?;
 
-    // </osmChange>
     writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
 
     let gz = writer.into_inner();

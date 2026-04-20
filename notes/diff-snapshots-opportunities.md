@@ -479,25 +479,34 @@ io_uring matters. Not before. Closed for now.
    `e27c89e`. Baseline `22e4f65f` at 103.3 s. Use this instead of
    planet during the inner loop.
 5. ~~**Parallel blob-pair merge (item 1 above).**~~ landed 2026-04-20.
-   Shard-based, CLI `-j/--jobs N` on `pbfhogg diff`.
+   Shard-based (ID-range), CLI `-j/--jobs N` on `pbfhogg diff` for
+   both text and `--format osc`. Initial implementation used safe-
+   point sharding (shard boundary at clean blob gaps on both sides)
+   but that doesn't work for typical OSM data where old and new
+   blob ranges overlap continuously with no safe gaps mid-file -
+   collapsed to 1 shard for germany ways. Replaced with ID-range
+   sharding: thresholds placed at old-blob boundaries, straddling
+   new blobs are read by both adjacent shards, each shard clips its
+   element merge to its own `(t_low, t_high]` window so every
+   element is emitted exactly once. Germany 8-shard balance is
+   within 1.03× max/min blobs per shard across NODE/WAY/REL.
 6. ~~**Pread-only walker.**~~ landed 2026-04-20. Planet walker phase
    **32.9 s → 14.9 s** (45 GB → 2.6 GB read); now syscall-bound on
    ~600 K preads at planet scale.
 7. **Follow-ups (open).**
-   - **Generalise to `derive_changes` / `--format osc`.** The
-     parallel path today only implements `diff`. The OSC emit
-     logic (`<create>/<modify>/<delete>` XML) can follow the
-     same shard plan; the worker writes owned XML fragments
-     that main concatenates in shard order. CLI currently
-     rejects `-j > 1` when `--format osc`.
+   - ~~**Generalise to `derive_changes` / `--format osc`.**~~
+     landed 2026-04-20. Same ID-range shard plan; workers emit
+     per-shard XML fragments to temp files which main
+     concatenates in shard order before the outer
+     `assemble_osc_from_paths` wraps the OSC envelope.
    - **Auto-enable by default.** Evaluate flipping the default
      `-j` from `1` to `0` (auto from `available_parallelism()`)
      once we have experience with the parallel path in the wild.
    - **Halve walker syscalls.** One pread of (length_prefix +
-     header) per blob instead of two separate preads - reads 1 KB
-     (covers any reasonable header) at the blob offset, parses
-     length + header from the buffer. Cuts ~300 K syscalls at
-     planet, saving ~7 s.
+     header) per blob instead of two separate preads.
+   - **Migrate `diff/parallel.rs::walk_file` onto `HeaderWalker`.**
+     Today both paths have their own inline walker; the shared
+     primitive supports both.
 7. **Per-element cost reductions (item 3a, 3b from the ranked list).**
    Only if workloads with smaller blob counts (where the walker is
    proportionally larger, or the per-shard merge becomes very

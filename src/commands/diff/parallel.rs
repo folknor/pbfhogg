@@ -135,37 +135,33 @@ fn walk_file(path: &Path) -> Result<WalkedFile> {
 // Shard planner
 // ---------------------------------------------------------------------------
 
-/// One shard: range of old-side blobs + range of new-side blobs to merge.
-/// Ranges are half-open index ranges `[start, end)` into the per-kind
-/// `Vec<BlobDesc>`.
+/// One shard: an ID range `(t_low, t_high]` plus the index ranges of
+/// old and new blobs whose content intersects that ID range. Straddling
+/// blobs (those whose range crosses the shard boundary) are read by
+/// both adjacent shards; each shard's element merge clips to its own
+/// ID window so every element is emitted exactly once.
 #[derive(Debug, Clone, Copy)]
 struct Shard {
+    t_low: i64,
+    t_high: i64,
     old_start: usize,
     old_end: usize,
     new_start: usize,
     new_end: usize,
 }
 
-/// Split two per-kind blob lists into roughly-equal shards.
-///
-/// The partitioning is based on old-blob counts (the larger side). For
-/// each shard, the new-side range is selected so that no new-side blob
-/// crosses the shard boundary: new blobs whose `max_id` is strictly
-/// less than or equal to the previous-shard's last old `max_id` fall
-/// into that shard; new blobs whose `min_id` is strictly greater fall
-/// into the next shard.
-///
-/// Any new-side blob whose ID range straddles a shard boundary is
-/// pulled into the earlier shard - workers always take the entire
-/// straddling blob on one side and let the other side's merge loop
-/// emit `BlobNewOnly` for elements past the shard boundary.
+/// Plan N shards by ID range. Thresholds are placed at old-blob
+/// boundaries (N-1 evenly spaced). Old is clean by construction;
+/// straddling new blobs are absorbed by both adjacent shards.
 fn plan_shards(
     old_descs: &[BlobDesc],
     new_descs: &[BlobDesc],
     target_count: usize,
 ) -> Vec<Shard> {
-    if target_count <= 1 || old_descs.len() <= 1 {
+    if target_count <= 1 || old_descs.is_empty() {
         return vec![Shard {
+            t_low: i64::MIN,
+            t_high: i64::MAX,
             old_start: 0,
             old_end: old_descs.len(),
             new_start: 0,
@@ -173,43 +169,52 @@ fn plan_shards(
         }];
     }
 
-    let target = target_count.min(old_descs.len());
-    let chunk = old_descs.len().div_ceil(target);
-    let mut shards = Vec::with_capacity(target);
-    let mut old_cursor = 0;
-    let mut new_cursor = 0;
+    let n = target_count.min(old_descs.len()).max(1);
+    let mut thresholds: Vec<i64> = (1..n)
+        .map(|k| old_descs[(k * old_descs.len() / n) - 1].index.max_id)
+        .collect();
+    thresholds.dedup();
 
-    while old_cursor < old_descs.len() {
-        let old_end = (old_cursor + chunk).min(old_descs.len());
-        let boundary_max = old_descs[old_end - 1].index.max_id;
-
-        // Walk new blobs until we find the first blob whose min_id
-        // exceeds this shard's old boundary. Blobs with min_id <=
-        // boundary_max belong to this shard (they may extend past the
-        // boundary, in which case the worker emits the tail as
-        // new-only elements with no matching old side).
-        let mut new_end = new_cursor;
-        while new_end < new_descs.len() && new_descs[new_end].index.min_id <= boundary_max {
-            new_end += 1;
-        }
-        // Last shard: absorb any trailing new-side blobs that have no
-        // old overlap (purely appended new elements).
-        let is_last = old_end == old_descs.len();
-        if is_last {
-            new_end = new_descs.len();
-        }
-
-        shards.push(Shard {
-            old_start: old_cursor,
-            old_end,
-            new_start: new_cursor,
-            new_end,
-        });
-        old_cursor = old_end;
-        new_cursor = new_end;
+    let mut shards: Vec<Shard> = Vec::with_capacity(thresholds.len() + 1);
+    let mut t_low = i64::MIN;
+    for &t_high in &thresholds {
+        shards.push(build_shard(old_descs, new_descs, t_low, t_high));
+        t_low = t_high;
     }
-
+    shards.push(build_shard(old_descs, new_descs, t_low, i64::MAX));
     shards
+}
+
+fn build_shard(
+    old_descs: &[BlobDesc],
+    new_descs: &[BlobDesc],
+    t_low: i64,
+    t_high: i64,
+) -> Shard {
+    let old_start = old_descs
+        .iter()
+        .position(|b| b.index.max_id > t_low)
+        .unwrap_or(old_descs.len());
+    let old_end = old_descs
+        .iter()
+        .rposition(|b| b.index.min_id <= t_high)
+        .map_or(old_start, |i| i + 1);
+    let new_start = new_descs
+        .iter()
+        .position(|b| b.index.max_id > t_low)
+        .unwrap_or(new_descs.len());
+    let new_end = new_descs
+        .iter()
+        .rposition(|b| b.index.min_id <= t_high)
+        .map_or(new_start, |i| i + 1);
+    Shard {
+        t_low,
+        t_high,
+        old_start,
+        old_end: old_end.max(old_start),
+        new_start,
+        new_end: new_end.max(new_start),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -274,6 +279,8 @@ fn run_shard(
 
     let old_slice = &old_descs[shard.old_start..shard.old_end];
     let new_slice = &new_descs[shard.new_start..shard.new_end];
+    let t_low = shard.t_low;
+    let t_high = shard.t_high;
 
     let mut old_idx = 0usize;
     let mut new_idx = 0usize;
@@ -315,21 +322,21 @@ fn run_shard(
             (None, None) => break,
             (Some(_), None) => {
                 let os = old_decoded.take().expect("checked");
-                emit_side(&mut out, &os, true, type_char, &mut stats);
+                emit_side(&mut out, &os, true, type_char, t_low, t_high, &mut stats);
             }
             (None, Some(_)) => {
                 let ns = new_decoded.take().expect("checked");
-                emit_side(&mut out, &ns, false, type_char, &mut stats);
+                emit_side(&mut out, &ns, false, type_char, t_low, t_high, &mut stats);
             }
             (Some(os), Some(ns)) => {
                 if os.index.max_id < ns.index.min_id {
                     let os = old_decoded.take().expect("checked");
-                    emit_side(&mut out, &os, true, type_char, &mut stats);
+                    emit_side(&mut out, &os, true, type_char, t_low, t_high, &mut stats);
                     continue;
                 }
                 if ns.index.max_id < os.index.min_id {
                     let ns = new_decoded.take().expect("checked");
-                    emit_side(&mut out, &ns, false, type_char, &mut stats);
+                    emit_side(&mut out, &ns, false, type_char, t_low, t_high, &mut stats);
                     continue;
                 }
                 // Overlapping - merge element by element.
@@ -337,6 +344,8 @@ fn run_shard(
                     &mut old_decoded,
                     &mut new_decoded,
                     type_char,
+                    t_low,
+                    t_high,
                     options,
                     &mut out,
                     &mut stats,
@@ -348,19 +357,27 @@ fn run_shard(
     Ok(ShardOutput { text: out, stats })
 }
 
-/// Emit all (remaining) elements of a decoded block as either OldOnly
-/// or NewOnly lines (equivalent to the sequential path's `emit_block` +
-/// per-element emit in diff_block_pair).
+/// Emit elements of a decoded block (single-sided: all OldOnly or all
+/// NewOnly) clipped to the shard's ID window `(t_low, t_high]`.
+#[allow(clippy::too_many_arguments)]
 fn emit_side(
     out: &mut Vec<u8>,
     side: &Side,
     is_old: bool,
     type_char: char,
+    t_low: i64,
+    t_high: i64,
     stats: &mut DiffStats,
 ) {
     let prefix = if is_old { '-' } else { '+' };
     for elem in side.block.elements().skip(side.skip_count) {
         let id = crate::osc::merge_join::element_id(&elem);
+        if id <= t_low {
+            continue;
+        }
+        if id > t_high {
+            break;
+        }
         let version = crate::osc::merge_join::element_version(&elem);
         emit_element(out, prefix, type_char, id, version);
         if is_old {
@@ -372,10 +389,13 @@ fn emit_side(
 }
 
 /// Merge two overlapping decoded blocks, updating residuals in place.
+#[allow(clippy::too_many_arguments)]
 fn merge_decoded(
     old_decoded: &mut Option<Side>,
     new_decoded: &mut Option<Side>,
     type_char: char,
+    t_low: i64,
+    t_high: i64,
     options: &DiffOptions,
     out: &mut Vec<u8>,
     stats: &mut DiffStats,
@@ -383,13 +403,14 @@ fn merge_decoded(
     let mut os = old_decoded.take().expect("checked");
     let mut ns = new_decoded.take().expect("checked");
 
-    let merge_up_to = os.index.max_id.min(ns.index.max_id);
+    let merge_up_to = os.index.max_id.min(ns.index.max_id).min(t_high);
     let (old_consumed, new_consumed) = element_merge(
         &os.block,
         os.skip_count,
         &ns.block,
         ns.skip_count,
         merge_up_to,
+        t_low,
         type_char,
         options,
         out,
@@ -417,6 +438,7 @@ fn element_merge(
     new_block: &PrimitiveBlock,
     new_skip: usize,
     merge_up_to: i64,
+    t_low: i64,
     type_char: char,
     options: &DiffOptions,
     out: &mut Vec<u8>,
@@ -428,6 +450,18 @@ fn element_merge(
     let mut new_iter = new_block.elements().skip(new_skip).peekable();
     let mut old_consumed = 0usize;
     let mut new_consumed = 0usize;
+
+    // Skip elements whose ID is at or below t_low - those belong to
+    // the previous shard. Track the consumed count so the caller can
+    // update its skip_count if this blob remains as a residual.
+    while old_iter.peek().is_some_and(|e| element_id(e) <= t_low) {
+        old_iter.next();
+        old_consumed += 1;
+    }
+    while new_iter.peek().is_some_and(|e| element_id(e) <= t_low) {
+        new_iter.next();
+        new_consumed += 1;
+    }
 
     loop {
         let old_in_range = old_iter.peek().is_some_and(|e| element_id(e) <= merge_up_to);

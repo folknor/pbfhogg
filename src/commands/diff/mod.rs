@@ -12,6 +12,7 @@
 //! of whether metadata (version, timestamp, changeset, uid) is present, partial, or absent.
 
 pub mod derive;
+pub(crate) mod derive_parallel;
 pub(crate) mod parallel;
 
 use std::collections::{HashMap, HashSet};

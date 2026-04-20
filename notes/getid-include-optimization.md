@@ -130,20 +130,36 @@ split, BlobReader changes) disabled a fast path. Bisect with
 `brokkr getid --dataset planet --bench 1 --commit <hash>` over the
 ~25 commits in that range.
 
-## Decision
+## Outcome (2026-04-20)
 
-Not building this today. The actual payoff requires a new I/O
-primitive, not a quick call-site swap, so it belongs in Milestone 2
-(write-path / read-path throughput) rather than the "Smaller items"
-list where the current TODO.md entry sits. Document the findings here
-so future attempts start from the right premise.
+Landed. The shared `HeaderWalker` primitive (`src/read/header_walker.rs`)
+and the `filter_by_id` rewrite to use it replace the `BufReader` +
+`read_raw_frame` path with `pread`-only header reads and on-demand
+blob-body preads. The `HeaderWalker::open` constructor also sets
+`posix_fadvise(POSIX_FADV_RANDOM)` on the fd so the kernel stops the
+256 KB sequential readahead that was pulling in blob bodies.
 
-If someone picks this up:
+Planet baseline 43.7 s -> **7.0 s (6.2×)**. Disk read 88 GB ->
+**636 MB (140× reduction)**. Germany 200 ms (down from ~2 s
+projected linearly). Output byte-identical to osmium on
+`brokkr verify getid-removeid` (PASS).
 
-1. Bisect the 32.5 → 43.7 s regression first. Might shrink the gap
-   for free.
-2. Design the pread-only header walker as a small primitive with its
-   own measurement (benchmark header walk on planet, confirm ~140 MB
-   read not 88 GB).
-3. Then swap `filter_by_id`'s include path. Measure the full win
-   end-to-end. Likely extends to other single-threaded command paths.
+The primitive was designed to be reusable; the `diff` parallel
+shard walker can migrate onto it in a follow-up commit.
+
+Why not <1 s: at planet scale the walker does ~600 K blobs × 2
+preads/blob = ~1.2 M syscalls. At ~5-6 us/syscall that is
+~6-7 s of pure syscall overhead. A "1 pread of 1 KB per blob"
+variant (length prefix + header in one call) would halve the
+syscall count and bring this to ~3-4 s, probably; batching via
+io_uring would halve again. Not doing that today - the 6× win
+is already enough to move the CLI from "slow" to "fast" for
+interactive use.
+
+## Secondary finding (unchanged)
+
+The 32.5 s -> 43.7 s regression still stands at the sequential
+baseline commits. Not bisected - we jumped straight to the new
+primitive and the regression no longer matters for the fast path.
+If the sequential path becomes relevant again (e.g. a command that
+cannot use the header walker), revisit.

@@ -19,6 +19,7 @@
 - **getparents**: skip node-only blobs via `BlobFilter` when `--add-self` doesn't need nodes (~85% of blobs at planet scale).
 - **derive-changes**: streams output to temp files instead of buffering all changes in memory - constant memory regardless of diff size.
 - **diff**: shard-based parallel block-pair merge, opt-in via new `-j/--jobs N` flag on `pbfhogg diff`. Planet two-snapshot diff 2134s (35m34s) → 219s (3m39s) at `-j 16` (**9.7×**); Germany 103s → 19s at `-j 8` (5.4×). Pre-pass walks both files' indexdata via `pread` (header-only; skips data bytes) to partition the ID space into N independent shards, then `std::thread::scope` workers pread/decode/merge each shard and buffer formatted output; main thread concatenates shard outputs in order. `-j 0` auto-picks from `available_parallelism()`; `-j 1` (default) keeps the sequential path. Peak RSS 2.4 GB at planet. Only the `diff` (human-readable) path is parallelised; `diff --format osc` still uses the sequential `derive_changes` (`-j > 1` rejected).
+- **getid** include mode: pread-only header walk + on-demand blob-body pread via new shared `HeaderWalker` primitive. Planet `getid` 43.7s → **7.0s (6.2×)**; disk read 88 GB → 636 MB (140× I/O reduction). The walker opens the fd with `posix_fadvise(POSIX_FADV_RANDOM)` so the kernel no longer prefetches blob bodies behind the header scan, and only preads the data payload for blobs whose ID-range index actually matches. Invert mode (raw passthrough) is unchanged behaviourally; it still needs every frame, so it preads full frames via the walker too. Output byte-identical to osmium on `brokkr verify getid-removeid`.
 - **build-geocode-index**: hard-errors instead of silently truncating when per-cell or per-way counts exceed `u16::MAX`. Error names the offending cell/way and points at the `u32` + `FORMAT_VERSION` bump path.
 - **build-geocode-index**: parallel Pass 2 (nodes + ways) and parallel Pass 3 cell assignment; Pass 1.5 switched to shared-atomic `IdSetDense`. Planet 1,255s → 432.9s (7m12s, -65%); Europe 344s → 183.4s (-47%); Germany 71s → 31s (-57%). Pass 1.5 peak anon 29.5 GB → 3.0 GB (-90%); now fits comfortably on 27 GB hosts with governing peak at ~25 GB (Pass 3 Stage B).
 
@@ -49,7 +50,9 @@
 | check --ids --full | Europe 35 GB | 52.7s | -83% (5.9×) |
 | extract --smart | Europe 35 GB | 181s | -29% |
 | derive-changes | - | streaming | constant memory |
-| diff (two independent planet snapshots) | Planet 87 GB | 2225s (37m) | 55 MB peak, streaming merge-join |
+| diff `-j 16` (two independent planet snapshots, text) | Planet 87 GB | 219s (3m39s) | -90% (9.7×) |
+| diff `--format osc` (two independent planet snapshots) | Planet 87 GB | 2225s (37m) | unchanged (sequential) |
+| getid (include mode) | Planet 87 GB | 7.0s | -84% (6.2×) |
 
 ## 0.2.0 - 2026-04-09
 

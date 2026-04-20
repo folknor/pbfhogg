@@ -266,6 +266,7 @@ pub fn removeid(input: &Path, output: &Path, ids: &ElementIds, compression: Comp
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn filter_by_id(
     input: &Path,
@@ -277,27 +278,25 @@ fn filter_by_id(
     overrides: &HeaderOverrides,
 ) -> Result<GetidStats> {
     use crate::blob::{decode_blob_to_headerblock, BlobKind};
-    use crate::file_reader::FileReader;
-    use crate::read::raw_frame::read_raw_frame;
+    use crate::read::header_walker::HeaderWalker;
 
     crate::debug::emit_marker("GETID_SCAN_START");
 
-    let header_bytes = {
-        let mut reader = FileReader::open(input, direct_io)?;
-        let mut file_offset: u64 = 0;
-        let mut hdr_bytes = None;
-        while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
-            if frame.blob_type == BlobKind::OsmHeader {
-                let header = decode_blob_to_headerblock(frame.blob_bytes())?;
-                super::warn_locations_on_ways_loss(&header);
-                hdr_bytes = Some(super::build_output_header(&header, true, overrides, |hb| hb)?);
-                break;
-            }
-        }
-        hdr_bytes.ok_or("no OSMHeader blob found")?
-    };
-
-    let mut writer = super::writer_from_header_bytes(output, compression, &header_bytes, direct_io, false)?;
+    // Single pread-based pass over blob headers. Data bodies are only
+    // read (via pread) when the blob matters: OsmHeader (once, to emit
+    // the output header), OsmData-with-match in include mode, every
+    // OsmData in invert mode (the raw-passthrough path still needs the
+    // frame bytes). Include mode with a small ID set thus reads only
+    // the header index (~140 MB at planet) plus a handful of matching
+    // blob bodies.
+    let mut walker = HeaderWalker::open(input)?;
+    let mut data_buf: Vec<u8> = Vec::new();
+    let mut frame_buf: Vec<u8> = Vec::new();
+    let mut decompress_buf: Vec<u8> = Vec::new();
+    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut bb = BlockBuilder::new();
+    let mut output_blocks: Vec<crate::block_builder::OwnedBlock> = Vec::new();
     let mut stats = GetidStats {
         nodes_written: 0,
         ways_written: 0,
@@ -311,19 +310,25 @@ fn filter_by_id(
     let mut blobs_skipped: u64 = 0;
     let mut blobs_passthrough: u64 = 0;
 
-    let mut reader = FileReader::open(input, direct_io)?;
-    let mut file_offset: u64 = 0;
-    let mut decompress_buf: Vec<u8> = Vec::new();
-    let mut bb = BlockBuilder::new();
-    let mut output_blocks: Vec<crate::block_builder::OwnedBlock> = Vec::new();
-    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+    // Find and decode the leading OsmHeader blob to build the output header.
+    let mut writer: Option<PbfWriter<FileWriter>> = None;
 
-    while let Some(mut frame) = read_raw_frame(&mut reader, &mut file_offset)? {
-        match &frame.blob_type {
-            BlobKind::OsmHeader => {}
+    while let Some(meta) = walker.next_header()? {
+        match meta.blob_type {
+            BlobKind::OsmHeader => {
+                walker.pread_data(meta.data_offset, meta.data_size, &mut data_buf)?;
+                let header = decode_blob_to_headerblock(&data_buf)?;
+                super::warn_locations_on_ways_loss(&header);
+                let header_bytes =
+                    super::build_output_header(&header, true, overrides, |hb| hb)?;
+                writer = Some(super::writer_from_header_bytes(
+                    output, compression, &header_bytes, direct_io, false,
+                )?);
+            }
             BlobKind::OsmData => {
-                if let Some(ref idx) = frame.index {
+                let w = writer.as_mut().ok_or("no OSMHeader blob found before OsmData")?;
+
+                if let Some(ref idx) = meta.index {
                     let has_match = match idx.kind {
                         crate::blob_meta::ElemKind::Node =>
                             ids.node_ids.any_in_range(idx.min_id, idx.max_id),
@@ -333,27 +338,31 @@ fn filter_by_id(
                             ids.relation_ids.any_in_range(idx.min_id, idx.max_id),
                     };
                     if include {
-                        // Include mode: skip blob types with no matching IDs.
                         if !blob_filter.wants_index(idx) || !has_match {
                             blobs_skipped += 1;
                             continue;
                         }
                     } else if !has_match {
-                        // Invert mode: no matching IDs → raw passthrough.
+                        // Invert mode, no ID match: raw passthrough. We
+                        // need the full frame bytes (length prefix +
+                        // header + data) to write verbatim.
+                        walker.pread_data(meta.frame_start, meta.frame_size, &mut frame_buf)?;
                         match idx.kind {
                             crate::blob_meta::ElemKind::Node => stats.nodes_written += idx.count,
                             crate::blob_meta::ElemKind::Way => stats.ways_written += idx.count,
                             crate::blob_meta::ElemKind::Relation => stats.relations_written += idx.count,
                         }
-                        writer.write_raw_owned(std::mem::take(&mut frame.frame_bytes))?;
+                        w.write_raw_owned(std::mem::take(&mut frame_buf))?;
                         blobs_passthrough += 1;
                         continue;
                     }
                 }
-                // Blob might contain matching IDs: decode and filter.
-                let blob_bytes = frame.blob_bytes();
+                // Blob might contain matching IDs, or the blob carries no
+                // indexdata and we must decode to check. Pread the data
+                // and run the per-element filter.
+                walker.pread_data(meta.data_offset, meta.data_size, &mut data_buf)?;
                 decompress_buf.clear();
-                crate::blob::decompress_blob_data_into(blob_bytes, &mut decompress_buf)?;
+                crate::blob::decompress_blob_data_into(&data_buf, &mut decompress_buf)?;
                 let block = PrimitiveBlock::new_with_scratch(
                     std::mem::take(&mut decompress_buf).into(),
                     &mut st_scratch, &mut gr_scratch,
@@ -365,7 +374,7 @@ fn filter_by_id(
                 flush_local(&mut bb, &mut output_blocks)
                     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                 for (block_bytes, index, tagdata) in output_blocks.drain(..) {
-                    writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+                    w.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
                 }
                 stats.nodes_written += nodes;
                 stats.ways_written += ways;
@@ -375,6 +384,7 @@ fn filter_by_id(
         }
     }
 
+    let mut writer = writer.ok_or("no OSMHeader blob found")?;
     if blobs_skipped > 0 {
         eprintln!("[getid] {blobs_skipped} blobs skipped by ID range filter");
     }

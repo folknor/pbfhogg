@@ -141,7 +141,7 @@ Workers send `R` per blob, keep `S` across blobs. Two functions:
 | Way dep node refs (smart extract, `extract.rs:2813`) | IdSetDense | 1.5 GB+ (measured at Europe, see below) | **No** | Per-blob send |
 | Geocode referenced nodes | IdSetDense | 1.5 GB (estimated, not measured) | Likely No, untested | Measure before deciding |
 
-### Superseded - see notes/parallel-classify-regression.md
+### Superseded (2026-04-11 investigation, closed)
 
 The "Resolved" framing below (the per-call-site way-dep table, the
 chunk-spread model, the planet-blocker prediction) was the 2026-04-09
@@ -156,13 +156,10 @@ The architectural fix (`extract.rs:2813` → per-blob send, commit
 PASS2 wall by ~23%. The schedule-reuse pattern shipped in commits
 `d4ea760` (PASS2) and `0b085b1` (PASS3) eliminated the post-PASS1 header
 scans that triggered the worst residency cascades, producing a cumulative
-~29% wall improvement on Europe smart extract. The memory ceiling was
-not affected.
-
-For the full investigation summary, the mechanism explanation, the ruled-
-out hypotheses, the mallinfo2 evidence, the open planet-blocker question,
-and the lessons for future investigations, see
-[`notes/parallel-classify-regression.md`](parallel-classify-regression.md).
+~29% wall improvement on Europe smart extract. The planet measurement
+(commit `cadc3e6`, UUID `2d028196`, Europe bbox) came in at 11.17 GB
+peak anon / 279 s wall - comfortable on 27 GB hosts, so the investigation
+closed with "ship as-is" and no mitigation-menu item was needed.
 
 ### Future optimization (not needed now)
 

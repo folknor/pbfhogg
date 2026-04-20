@@ -60,13 +60,17 @@ ALTW node scan, geocode builder pass 2.
 autovectorize (push() prevents it). Explicit SIMD would help but
 the classify loop is only 2.8% of extract time.
 
-### Pipelined reader retention cleanup
+### Pipelined reader retention / oversubscription
 
-**Impact:** Prevents OOM on 30 GB hosts for specific commands.
-**Document:** [pipelined-reader-retention.md](pipelined-reader-retention.md)
-**What:** Convert `renumber` and `cat --type` to sequential BlobReader +
-DecompressPool. Mechanical - same pattern as node_stats/tags_count.
-6 remaining paths audited, 2 production-relevant.
+**Impact:** Originally framed as an OOM risk. The retention problem
+was solved by `DecompressPool` (commit `8f6999b`), which recycles
+decompression buffers instead of cross-thread-freeing them. The
+oversubscription concern (decode pool + global pool both running)
+remains but is not worth attacking: a sequential conversion of
+`getparents` (`c912e4d`) regressed 4.7× on Denmark and was reverted.
+Decompression dominates, not per-block work.
+**Reference:** [reference/pipelined-reader-paths.md](../reference/pipelined-reader-paths.md)
+(per-caller breakdown; the conversion rule is "don't").
 
 ### SIMD batch varint decode
 
@@ -104,6 +108,6 @@ Tag expression filtering, bbox filtering, property key selection.
 2. zlib-level-tuning.md - write path compression analysis
 3. multi-extract-optimization.md - 6 optimization opportunities
 4. columnar-integration.md - expansion beyond extract
-5. pipelined-reader-retention.md - cross-thread audit
+5. reference/pipelined-reader-paths.md - per-caller reference (was notes/pipelined-reader-retention.md, moved + rewritten)
 6. geojson-export-design.md - export v1 design
 7. performance-research-summary.md - this document

@@ -364,7 +364,7 @@ where
 /// instead of calling [`build_blob_schedule`]. Used by smart/complete extract
 /// to reuse the schedule built during PASS1's manual header scan, avoiding
 /// a third post-PASS1 file scan and its associated cold-arena-page residency
-/// cascade. See `notes/parallel-classify-regression-2026-04-11-round3.md`.
+/// cascade (commits `d4ea760`, `0b085b1`, 2026-04-10/11).
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn pread_write_pass_with_schedule<F>(
     input: &Path,

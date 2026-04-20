@@ -37,11 +37,10 @@ pub(super) struct Pass1Result {
     /// Full BlobDesc schedule for all OsmData blobs, built during PASS1's
     /// manual scan and used by smart/complete PASS3 instead of calling
     /// `build_blob_schedule` again. Eliminates a third post-PASS1 header scan
-    /// (~28 seconds on Europe). Empty for the unsorted-fallback path. See
-    /// notes/parallel-classify-regression-2026-04-11-round3.md for the
-    /// mechanism: post-PASS1 header scans cause cold-arena-page residency
-    /// cascades that don't show up in glibc's accounting but do show up
-    /// in anon RSS.
+    /// (~28 seconds on Europe). Empty for the unsorted-fallback path.
+    /// Post-PASS1 header scans trigger a cold-arena-page residency cascade
+    /// that doesn't show up in glibc's accounting but does show up in
+    /// anon RSS, so avoiding the rescan also helps peak memory at scale.
     pub(super) pass3_blob_schedule: Vec<BlobDesc>,
 }
 
@@ -450,8 +449,8 @@ pub(super) fn extract_smart(
     // against, regardless of whether this specific workload triggers the
     // worst case. The fix improves PASS2 wall by ~23%; the planet-scale
     // memory peak it was originally framed as fixing turned out to be
-    // elsewhere (still under investigation, see
-    // notes/parallel-classify-regression-2026-04-11-followup.md).
+    // elsewhere (cold-arena-page residency cascade, addressed by the
+    // PASS1 schedule-reuse commits `d4ea760` and `0b085b1`).
     crate::debug::emit_marker("SMART_PASS2_CLASSIFY_START");
     crate::scan::classify::parallel_classify_phase(
         &shared_file,

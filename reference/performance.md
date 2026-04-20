@@ -822,9 +822,15 @@ Plantasjen. Best of 3 runs (or single-sample where noted), indexed PBFs.
 
 † Planet smart extract: single-sample `--bench 1`, Europe bbox, UUID
 `2d028196`. Peak anon RSS 11.17 GB on 32 GB host (27.9 GB avail at run
-start, 16.7 GB headroom to the round-4 "ship as-is" threshold of
-~25 GB). See [notes/parallel-classify-regression.md](../notes/parallel-classify-regression.md)
-for the full planet measurement write-up and mechanism analysis.
+start, 16.7 GB headroom to the ~25 GB "ship as-is" threshold). Peak
+anon is dominated by PASS3 write work (bbox-sized), not by PASS1
+scanning the input file - the prior Europe×2.6 = 26-28 GB projection
+was wrong by ~2.4×. The mechanism identified during the 2026-04-10/11
+investigation was a cold-arena-page residency cascade triggered by
+post-PASS1 header scans touching pages glibc had reserved but not
+populated; fixed by plumbing the PASS1 schedule forward into PASS2
+and PASS3 via `Pass1Result::pass3_blob_schedule` and
+`pread_write_pass_with_schedule`.
 
 Denmark bbox `12.4,55.6,12.7,55.8`, Japan bbox `139.5,35.5,140.0,36.0`,
 Europe and Planet bbox `-25.0,34.0,45.0,72.0` (full-continent).
@@ -863,10 +869,7 @@ commit `cadc3e6` vs pre-investigation `fc17b51`:
 Complete benefits because `extract_complete_ways` PASS2 now also consumes
 `pass3_blob_schedule` via `pread_write_pass_with_schedule`. Simple benefits
 from shared instrumentation and scan-path improvements in the same commit
-range. See [notes/parallel-classify-regression.md](../notes/parallel-classify-regression.md)
-for the full investigation, including the cold-arena-page residency
-cascade mechanism analysis and the planet measurement that closed the
-round-4 mitigation menu.
+range.
 
 Europe simple phase breakdown (commit `b95e5ab`):
 - Node classify: 13s, Node write: 11s

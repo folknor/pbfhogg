@@ -110,7 +110,7 @@ rayon pools: decode + batch processing), not retention.
 See [notes/altw-optimization-history.md](notes/altw-optimization-history.md)
 for the complete plan: 20 items across 5 priority groups, covering infrastructure
 fixes, planet blockers, external join P2b/P2c, and all affected commands.
-See [notes/pipelined-reader-retention.md](notes/pipelined-reader-retention.md)
+See [reference/pipelined-reader-paths.md](reference/pipelined-reader-paths.md)
 for the April 2026 audit. Sequential conversion was attempted for
 getparents (commit `c912e4d`) and reverted - 4.7x regression on
 Denmark (1400ms vs 300ms). Decompression dominates, not per-block
@@ -398,7 +398,17 @@ per-iteration allocations remain across the codebase, ordered by impact:
   24 bytes = 3.4 GB cumulative at planet. All allocator fast-path, no
   RSS impact. Skipped during v0.1 review (4 planet reviewers: not worth
   the API complexity). Revisit only if allocator profiling shows it
-  matters after arena/columnar work.
+  matters after arena/columnar work. Shape of the fix (for when /
+  if it's ever needed): change `BlockBuilder::add_relation` from
+  `members: &[MemberData<'_>]` to `impl IntoIterator<Item = MemberData<'_>>`,
+  add three parallel packed scratches on the builder
+  (`member_roles_scratch`, `member_ids_scratch`, `member_types_scratch`)
+  so the single-pass iteration can write all three protobuf member
+  fields without re-scanning. Most callers already reuse a buffer
+  (`members_buf.clear(); members_buf.extend(...)`) so the saving is
+  small; the concentrated win is `apply-changes`
+  (`rewrite_block.rs`, `element_writes.rs`) which builds fresh
+  `Vec<MemberData>` per relation from OSC input with no reuse.
 
 - [ ] **Borrowed XML writer Vec elimination** - `write_borrowed_way_xml`
   and `write_borrowed_relation_xml` in `elements_xml.rs` still collect
@@ -433,10 +443,10 @@ per-iteration allocations remain across the codebase, ordered by impact:
   a recurring operation for bboxes > Europe, re-measure. Whole-planet
   bbox isn't a real workload - use `cat` passthrough.
 
-  See [notes/parallel-classify-regression.md](notes/parallel-classify-regression.md)
-  for the full investigation history, mechanism analysis (cold-arena-page
-  residency cascade), and the historical mitigation menu preserved
-  as reviewer-context rather than outstanding work.
+  Mechanism: cold-arena-page residency cascade. Post-PASS1 header
+  scans touched glibc's bloated free-list pages that were previously
+  reserved but not resident; the fix (commits `d4ea760`, `0b085b1`)
+  plumbs the PASS1 schedule forward so PASS2/PASS3 don't rescan.
 
 **Milestone B: vectorization (after columnar layout stabilizes)**
 

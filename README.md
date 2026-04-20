@@ -39,6 +39,8 @@ Every command listed below runs on the full planet on normal hardware. Measured 
 | Command | Wall | Peak anon RSS | Notes |
 |---------|------|---------------|-------|
 | `inspect` (default metadata, index-only) | 6.5s | 5 MB | pread-only blob-header scan with `fadvise(RANDOM)`, no body reads when every blob has indexdata |
+| `inspect --nodes -j 16` | 56.8s | 410 MB | parallel node-blob scan via `parallel_classify_accumulate`, per-worker scalar stats + FOR-block histograms merged at completion |
+| `inspect --tags -j 16` | 2m50s | 17.5 GB | parallel per-blob tag maps merged on main thread; peak is dominated by the global `(key, value)` map + glibc fragmentation |
 | `getid` (include, pread header walk) | 7s | 27 MB | pread-only blob-header scan with `fadvise(RANDOM)`, on-demand body preads |
 | `cat --type way` (raw passthrough) | 45s | 10 MB | zero decompression, indexdata blob filter |
 | `tags-filter -R highway=primary` | 52s | 688 MB | single-pass (`--omit-referenced`), parallel classify |

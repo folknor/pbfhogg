@@ -369,6 +369,8 @@ and shard-based parallel merge-join (`-j/--jobs N` on `pbfhogg diff`).
 |---|---|---:|---|---:|---:|
 | getid (include mode) | `--bench 1 --force` | **7.0 s** | forced, dirty tree | 43.8 s (2026-04-18) | **−36.8 s (6.2×)** |
 | inspect (default metadata, index-only) | `--bench 1 --force` | **6.5 s** | forced, dirty tree | 21.4 s (`c146f2bb`, partially-cached pre-migration) | **−14.9 s (3.3×)** |
+| inspect `--nodes -j 16` | `--bench 1` | **56.8 s** | `c5edebe7` | sequential (never stored; germany extrapolation ~370 s) | **~5-6× (new parallel path)** |
+| inspect `--tags -j 16` | `--bench 1` | **169.5 s (2m50s)** | `9d741341` | sequential (never stored; germany extrapolation ~800 s) | **~4-5× (new parallel path)** |
 | diff-snapshots text | `--bench 1 -j 16` | **208.6 s (3m28s)** | `b02d86bc` | 2150.9 s (35m51s, sequential) | **−1942 s (10.2×)** |
 | diff-snapshots --format osc | `--bench 1 -j 16` | **313.8 s (5m13s)** | `9b3fc2b9` | 2225.6 s (37m06s, sequential) | **−1912 s (7.1×)** |
 
@@ -396,6 +398,19 @@ seek-raw fixes plus the 2026-04-20 patches:
 halve that. `diff` osc's lower speedup is the serial `assemble_osc`
 gzip + concat of ~45 GB of XML fragment temp files (32.8 s / 10 % of
 wall).
+
+`inspect --nodes -j 16` hits `avg_cores 14.7 / 16` (92 %) on the
+decode + accumulate phase with peak anon 410 MB - per-worker state
+is just scalar stats + a 128-entry coord block buffer, trivially
+mergeable. `inspect --tags -j 16` hits `avg_cores 6.8 / 16` (42 %)
+because the main-thread global-map merge is the serialising step;
+peak anon 17.5 GB is the planet distinct-tag map plus glibc
+anon-page retention from the per-blob hashmap churn. A prior
+`parallel_classify_accumulate`-based shape pushed peak anon to
+26.8 GB (each of 16 workers held a full-cardinality accumulator by
+the end of the scan); the final `parallel_classify_phase` shape
+emits per-blob maps to a single main-thread merger and avoids that
+multiplier.
 
 Previous-plan docs (`notes/diff-snapshots-opportunities.md`,
 `notes/getid-include-optimization.md`) are retired.

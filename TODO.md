@@ -67,15 +67,6 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   would recover most of that. Only matters if osc becomes a hot
   workload.
 
-- [ ] **1-pread-per-blob header walker**. `HeaderWalker::next_header`
-  does two small preads per blob (4-byte length prefix, then the
-  header bytes). At planet scale that's ~1.2 M syscalls for either
-  `getid` (~6-7 s of walker time) or `diff` (~15 s). A single pread
-  of ~1 KB per blob covers length + header in one syscall for the
-  common case (headers ~100-200 B) with a fallback for the rare
-  >1020 B header. Halves syscalls, should cut walker wall by
-  roughly half.
-
 - [ ] **Consider auto-enabling diff `-j`**. Currently `pbfhogg diff`
   defaults to `-j 1` (sequential). `-j 0` maps to
   `available_parallelism()`. Evaluate flipping the default from 1
@@ -88,11 +79,6 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   library consumers can subscribe. Full rollout (call-site shape,
   coverage sweep, brokkr `--probes`, backend migration) in
   [`notes/instrumentation-layering.md`](notes/instrumentation-layering.md).
-
-- [ ] **Rayon alternatives for slice-based parallelism** - Wild linker discussion
-  ([davidlattimore/wild#1072](https://github.com/davidlattimore/wild/discussions/1072)) surveys
-  alternatives (`paralight`, `orx-parallel`, `chili`, `forte`, `spindle`).
-  Revisit only if rayon becomes a proven bottleneck.
 
 ## Cross-pipeline optimization
 
@@ -192,39 +178,6 @@ but the flag is right there for internal-pipeline users. Output
 file size stays within a few percent of zlib:6 at zstd:1, so the
 knob is pure wall/interop trade-off, not a size trade-off.
 
-### Reviewer findings (2026-03-29)
-
-**Do later:**
-
-- [x] ~~**Tags-filter raw passthrough via lightweight ID scanner**~~ -
-  **DISPROVEN 2026-04-18** via shadow counter at commit `a5c6854`
-  (reverted in `0ef4107`, planet `w/highway=primary`, UUID
-  `8c786794`): 0 / 50,364 pass-2 blobs would have qualified.
-  Per-element match rates of 0.34 % (ways) and 0.40 % (nodes) with
-  ~8,000 elements per blob make the all-match gate effectively
-  unreachable; ID-sorted PBFs destroy any geographic tag clustering
-  that might have rescued it. Any filter broad enough to actually
-  match 100 % of elements in 100 % of blobs is already caught by
-  blob-level type/tag-index filtering upstream. The load-bearing pin
-  is the comment block in the pass-2 worker in
-  `src/commands/tags_filter.rs`.
-
-- [ ] **No `fadvise(DONTNEED)` after pread in `parallel_classify_phase`** -
-  external join's stage 2 workers call fadvise per pread, classify
-  workers don't. At Europe scale (~2 GB compressed) this is fine. At
-  planet scale (~87 GB) could accumulate page cache. Low priority since
-  current planet-scale paths don't use `parallel_classify_phase` for
-  heavy scans. Flagged by 1/10 reviewers.
-
-### Smaller items
-
-- [ ] ALTW dense pass 2 decode-all fallback (`write_output_decode_all` in
-  `src/commands/add_locations_to_ways.rs` ~line 1045) - uses
-  `into_blocks_pipelined` processing all blobs. Retention solved by
-  DecompressPool. Only triggers with `--force` on non-indexed PBFs.
-  Pipelined decode + par_iter justified (heaviest per-block work).
-  See retention audit for details.
-
 ## Milestone 3: Beyond the benchmark
 
 Goal: the obvious choice for every OSM data processing task, not just
@@ -266,19 +219,6 @@ for full analysis of 6 optimization opportunities.
   fully-overlapping regions). Per-region passthrough for disjoint
   strips needs hybrid decode+raw consumer path - decode once, write
   raw to contained regions, route elements to non-contained regions.
-
-**Reviewer findings (2026-04-09):**
-
-- [ ] **Raw passthrough unsafe for polygon regions** - `contained_in`
-  is computed from each slot's bbox, not polygon geometry. For polygon
-  or multipolygon extracts, "blob bbox contained in region bbox" does
-  not prove every node is inside the polygon - can raw-copy
-  out-of-polygon nodes. Pre-existing issue, not introduced by the
-  allocation fixes. Flagged by sweep review (bugs/codex).
-- [ ] **O(workers × regions) scaling for large N** - each worker
-  allocates N BlockBuilders (~500 KB each). At N=50, ~200 MB across
-  8 workers. At N=100+, ~400 MB. Monitor but acceptable for typical
-  use (5-20 regions). Flagged by 2/6 reviewers.
 
 ### Export (GeoJSON/GeoPackage)
 

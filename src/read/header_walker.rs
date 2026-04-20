@@ -30,6 +30,12 @@ use crate::blob::{parse_blob_header_with_index, BlobKind};
 use crate::blob_meta::BlobIndex;
 use crate::error::Result;
 
+/// Size of the initial header probe `pread` per blob. One page covers the
+/// 4-byte length prefix plus the header bytes for essentially every blob
+/// in real PBFs; the fallback path in `next_header` handles the rare
+/// exception where a blob's header exceeds the probe window.
+const HEADER_PROBE_SIZE: usize = 4096;
+
 /// Per-blob metadata produced by [`HeaderWalker::next_header`].
 pub(crate) struct BlobHeaderMeta {
     pub blob_type: BlobKind,
@@ -108,9 +114,14 @@ impl HeaderWalker {
         &self.file
     }
 
-    /// Read the next blob's header via two small `pread`s (length prefix
-    /// then header bytes) and advance the internal offset past the data
-    /// payload without reading it. Returns `None` at EOF.
+    /// Read the next blob's header and advance the internal offset past the
+    /// data payload without reading it. Returns `None` at EOF.
+    ///
+    /// Issues a single probe `pread` of up to [`HEADER_PROBE_SIZE`] bytes
+    /// covering the 4-byte length prefix plus the blob header in the common
+    /// case (typical headers run ~100-200 B; indexed blobs with tagdata a
+    /// bit more). A second `pread` is only needed for the rare header that
+    /// extends past the probe window.
     pub(crate) fn next_header(&mut self) -> Result<Option<BlobHeaderMeta>> {
         use std::os::unix::fs::FileExt as _;
 
@@ -119,29 +130,49 @@ impl HeaderWalker {
         }
         let frame_start = self.offset;
 
-        let mut len_buf = [0u8; 4];
-        match self.file.read_exact_at(&mut len_buf, self.offset) {
+        // Probe: one pread covering length prefix + (usually) full header.
+        let remaining = self.file_size - self.offset;
+        let probe_len = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(HEADER_PROBE_SIZE);
+        if probe_len < 4 {
+            // Not enough bytes left to parse a length prefix; treat as
+            // clean EOF, matching prior UnexpectedEof-tolerant behavior.
+            return Ok(None);
+        }
+        self.header_buf.resize(probe_len, 0);
+        match self.file.read_exact_at(&mut self.header_buf, self.offset) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(crate::error::new_error(crate::error::ErrorKind::Io(e))),
         }
-        let header_len = u32::from_be_bytes(len_buf) as usize;
-        self.offset += 4;
 
-        self.header_buf.resize(header_len, 0);
-        self.file
-            .read_exact_at(&mut self.header_buf, self.offset)
-            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
-        self.offset += header_len as u64;
+        let header_len = u32::from_be_bytes([
+            self.header_buf[0],
+            self.header_buf[1],
+            self.header_buf[2],
+            self.header_buf[3],
+        ]) as usize;
+        let header_end = 4 + header_len;
+
+        if header_end > probe_len {
+            // Fallback: header extends past the probe window. Top up with a
+            // second pread for just the tail.
+            self.header_buf.resize(header_end, 0);
+            let tail_offset = self.offset + probe_len as u64;
+            self.file
+                .read_exact_at(&mut self.header_buf[probe_len..header_end], tail_offset)
+                .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+        }
 
         let (blob_type, data_size, raw_index, tagdata) =
-            parse_blob_header_with_index(&self.header_buf)?;
+            parse_blob_header_with_index(&self.header_buf[4..header_end])?;
         let index = raw_index
             .as_ref()
             .and_then(|b| BlobIndex::deserialize(b));
 
-        let data_offset = self.offset;
-        self.offset += data_size as u64;
+        let data_offset = self.offset + header_end as u64;
+        self.offset = data_offset + data_size as u64;
         let frame_size = 4 + header_len + data_size;
 
         Ok(Some(BlobHeaderMeta {

@@ -108,11 +108,14 @@ pub(super) fn try_extract_multi_single_pass(
     }).collect();
 
     // Build schedules by element type for parallel classification.
+    // Walk via the pread-only HeaderWalker so blob bodies stay out of the
+    // page cache during the scan - the per-kind classification passes open
+    // fresh fds and pread only the blobs they need.
     crate::debug::emit_marker("MULTI_SCHEDULE_SCAN_START");
-    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
-    scanner.set_parse_indexdata(true);
-    scanner.next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
+    let _ = walker
+        .next_header()?
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
 
     let mut node_schedule: Vec<(usize, u64, usize)> = Vec::new();
     let mut way_schedule: Vec<(usize, u64, usize)> = Vec::new();
@@ -120,11 +123,10 @@ pub(super) fn try_extract_multi_single_pass(
     // Per-node-blob passthrough metadata.
     let mut node_blob_info: Vec<NodeBlobInfo> = Vec::new();
     let mut seq: usize = 0;
-    while let Some(result_item) = scanner.next_header_with_data_offset() {
-        let (hdr, frame_offset, data_offset, data_size) = result_item?;
-        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
-        if let Some(idx) = hdr.index() {
-            if !spatial_filter.wants_index(&idx) { continue; }
+    while let Some(meta) = walker.next_header()? {
+        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) { continue; }
+        if let Some(idx) = meta.index.as_ref() {
+            if !spatial_filter.wants_index(idx) { continue; }
             match idx.kind {
                 crate::blob_meta::ElemKind::Node => {
                     // Raw passthrough is only sound for bbox regions - polygon
@@ -141,24 +143,31 @@ pub(super) fn try_extract_multi_single_pass(
                             }
                         }
                     }
-                    #[allow(clippy::cast_possible_truncation)]
-                    let frame_size = (data_offset - frame_offset) as usize + data_size;
-                    node_blob_info.push(NodeBlobInfo { contained_in, frame_offset, frame_size, count: idx.count });
-                    node_schedule.push((seq, data_offset, data_size));
+                    node_blob_info.push(NodeBlobInfo {
+                        contained_in,
+                        frame_offset: meta.frame_start,
+                        frame_size: meta.frame_size,
+                        count: idx.count,
+                    });
+                    node_schedule.push((seq, meta.data_offset, meta.data_size));
                 }
-                crate::blob_meta::ElemKind::Way => way_schedule.push((seq, data_offset, data_size)),
-                crate::blob_meta::ElemKind::Relation => relation_schedule.push((seq, data_offset, data_size)),
+                crate::blob_meta::ElemKind::Way => way_schedule.push((seq, meta.data_offset, meta.data_size)),
+                crate::blob_meta::ElemKind::Relation => relation_schedule.push((seq, meta.data_offset, meta.data_size)),
             }
         } else {
             // No indexdata - include in all schedules (conservative).
-            node_blob_info.push(NodeBlobInfo { contained_in: Vec::new(), frame_offset, frame_size: 0, count: 0 });
-            node_schedule.push((seq, data_offset, data_size));
-            way_schedule.push((seq, data_offset, data_size));
-            relation_schedule.push((seq, data_offset, data_size));
+            node_blob_info.push(NodeBlobInfo {
+                contained_in: Vec::new(),
+                frame_offset: meta.frame_start,
+                frame_size: 0,
+                count: 0,
+            });
+            node_schedule.push((seq, meta.data_offset, meta.data_size));
+            way_schedule.push((seq, meta.data_offset, meta.data_size));
+            relation_schedule.push((seq, meta.data_offset, meta.data_size));
         }
         seq += 1;
     }
-    drop(scanner);
     crate::debug::emit_marker("MULTI_SCHEDULE_SCAN_END");
 
     // Shadow counters: node-blob raw-passthrough eligibility per region.
@@ -173,10 +182,8 @@ pub(super) fn try_extract_multi_single_pass(
     // production code's conservative "include in all schedules" path.
     emit_node_passthrough_shadow_counters(&node_blob_info, n);
 
-    let shared_file = std::sync::Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
-    );
+    let shared_file = std::sync::Arc::clone(walker.shared_file());
+    drop(walker);
 
     // Phase 1: Parallel node classification → N bbox_node_ids.
     // For all-bbox regions, use columnar decode (batch IDs/lats/lons into

@@ -201,7 +201,7 @@ stamped below when the run completes. Ages computed against
 | check --ids --full | `c498fff0` | `ef6ce09` | 69.5 s | 3d | `5d77f174` / `1245cde` / 72.5 s; **post-Tier-S: `7949c553` / `de8daf1` / 63.2 s (-12.8%)** |
 | inspect --nodes -j 16 | `c5edebe7` | `b7d8aea` | 56.8 s | today | `a816ae6f` / `1245cde` / 58.1 s; **post-Tier-S: `eb060eaa` / `de8daf1` / 49.4 s (-15.0%)** |
 | inspect --tags -j 16 | `9d741341` | `6ea0d94` | 169.5 s | today | `7d69a958` / `1245cde` / 231.6 s (A8 anomaly, unexplained); **post-Tier-S: `00e00846` / `de8daf1` / 168.3 s - matches morning 169.5 s baseline, header-walk drowned in full decompression** |
-| renumber | `abd74459` (--bench 3) | (2026-04-18) | 204.5 s | 2d | `84be312f` (--bench 1) / `1245cde` / 215.6 s |
+| renumber | `abd74459` (--bench 3) | (2026-04-18) | 204.5 s | 2d | `84be312f` (--bench 1) / `1245cde` / 215.6 s; **post-renumber-walk: `f8500590` / `911ada6` / 219.3 s (+1.7%, within noise)** |
 | diff-snapshots text -j 16 | `b02d86bc` | `06628d8` | 208.6 s | today | `af5d53fd` / `1245cde` / 227.0 s (documented +8.8% wall for 74% RSS drop, `d207cea`) |
 | diff-snapshots --format osc -j 16 | `9b3fc2b9` | `06628d8` | 313.8 s | today | `ef254a69` / `1245cde` / 329.5 s (+5% drift, no OSC-path shape change between commits) |
 | build-geocode-index | `b4b25c05` | `82db8ed` | 432.9 s | 2d | `d139067d` / `1245cde` / 430.5 s (flat, same cli_args) |

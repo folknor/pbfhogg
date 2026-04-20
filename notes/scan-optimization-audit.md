@@ -148,26 +148,74 @@ flagged but the win is marginal.
 
 ## Suggested ordering
 
-1. **Migrate `build_classify_schedule` + `_split` to `HeaderWalker`**.
-   Highest leverage, single contained change, touches ~10 downstream
-   commands without per-caller edits. Do this first.
-2. **Per-command Tier 1 schedule builders** (eight sites listed
-   above). Mechanical migrations; each file gets a similar small
-   diff. Do in one commit per command area (extract / tags-filter /
-   geocode / altw / renumber / apply-changes) for clean `brokkr
-   verify` gating.
-3. **`collect_relation_member_node_ids` status check** - either
-   confirm it's already parallelised (if so, strike from this list)
-   or migrate to `_accumulate`.
-4. **`collect_way_referenced_node_ids` → `parallel_classify_phase`**.
-   Ships with measured planet impact from ALTW stage 1.
+1. **~~Migrate `build_classify_schedule` + `_split` to `HeaderWalker`~~**.
+   LANDED 2026-04-20 (`de8daf1`). Also removed now-dead
+   `BlobHeader::{index, tag_index}` and
+   `BlobReader::next_header_with_data_offset` downstream
+   (`8e3a0d1`).
+2. **~~Per-command Tier 1 schedule builders~~**. LANDED across five
+   commits on 2026-04-20: apply-changes prefill (`d925bc4`), extract
+   common+smart (`26d1402`), renumber (`911ada6`), multi-extract
+   (`57b01f9`), tags-filter + geocode + ALTW (`8e3a0d1`).
+3. **~~`collect_relation_member_node_ids`~~** - was still serial;
+   migrated to `parallel_classify_accumulate` in `01c67da` (dense
+   ALTW path).
+4. **~~`collect_way_referenced_node_ids` → `parallel_classify_phase`~~**.
+   LANDED in same `01c67da` commit. Trades the
+   `scan/way::scan_way_refs` wire-format fast path for
+   `PrimitiveBlock` iteration in exchange for 16x parallelism.
 5. **Dense node index parallel migration** if ALTW dense path is
    still a priority workload (today the external path is the
-   default; dense is legacy).
+   default; dense is legacy). **NOT DONE** - the `build_node_index_dense`
+   Tier 2 candidate has a correctness caveat (overwrite order
+   observable on duplicate / corrupt node IDs) and dense is
+   legacy. Revisit only if dense becomes hot again.
 6. **O(1) probes** (`check_sorted_and_indexed`, `has_indexdata`) -
-   opportunistic bundle only.
+   not done; bundle opportunistically only.
 7. **Unsorted extract paths** - skip unless non-sorted inputs become
    a real workload.
+
+## Measurement summary (2026-04-20)
+
+Planet `--bench 1` full-command walls (pre `1245cde` -> post `8e3a0d1`):
+
+| Command | Pre | Post | Δ |
+|---|---:|---:|---:|
+| check-refs | 72.6 s | 62.7 s | -13.7 % |
+| check-ids --full | 72.5 s | 63.2 s | -12.8 % |
+| tags-filter (transitive) | 147.5 s | 119.9 s | -18.7 % |
+| inspect --nodes -j 16 | 58.1 s | 49.4 s | -15.0 % |
+| inspect --tags -j 16 | 169.5 s | 168.3 s | -0.7 % |
+| extract --simple | 264.7 s | 247.3 s | -6.6 % |
+| extract --complete | 261.8 s | 254.2 s | -2.9 % |
+| extract --smart | 278.7 s | 283.5 s | +1.7 % (noise) |
+| extract --multi (5 regions) | 1004.6 s | 972.0 s | -3.2 % |
+| renumber | 215.6 s | 219.3 s | +1.7 % (noise) |
+| build-geocode-index | 430.5 s | 434.9 s | +1.0 % (noise) |
+| add-locations-to-ways (external) | 684.0 s | 673.6 s | -1.5 % |
+| apply-changes --osc-seq 4920 | 577.0 s | 589.1 s | +2.1 % (noise) |
+
+Single-sample planet benches have ±5 % run-to-run variance from
+cache state alone - treat anything inside that as noise.
+
+Europe `--bench 3` phase-only walls with `--stop <SCHEDULE_MARKER>`
+measure the pure header-walk cost:
+
+| Phase | Pre (BlobReader) | Post (HeaderWalker) | Speedup |
+|---|---:|---:|---:|
+| check-refs SCHEDULE_SCAN_LOOP | 24,684 ms | 432 ms | 57x |
+| tags-filter TAGSFILTER_SINGLE_PASS_SCHEDULE_SCAN | 25,050 ms | 994 ms | 25x |
+| extract EXTRACT_SCHEDULE_SCAN | 24,584 ms | 471 ms | 52x |
+
+The phase-level wins are large and consistent. Full-command europe
+walls are flat to slightly regressive because the old buffered
+header walk was accidentally prefetching blob bodies via the
+kernel's sequential readahead - the downstream decompression pass
+reused those warm pages. HeaderWalker's `posix_fadvise(RANDOM)`
+deliberately skips that prefetch. At planet scale the file is much
+larger than RAM so the prefetched pages would be evicted before
+decompression reused them anyway; header-walk savings dominate.
+At europe the two effects roughly cancel.
 
 ## Consolidating inline `HeaderWalker` copies
 

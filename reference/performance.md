@@ -419,6 +419,70 @@ multiplier.
 Previous-plan docs (`notes/diff-snapshots-opportunities.md`,
 `notes/getid-include-optimization.md`) are retired.
 
+#### Planet scan-audit refresh (commits `de8daf1`...`01c67da`, 2026-04-20, plantasjen)
+
+The earlier 06628d8 refresh landed `HeaderWalker` on `getid`, `inspect`
+default, and `diff` shards. The scan-audit sweep that follows pushes it
+through every other in-tree header walk: the shared
+`scan::classify::build_classify_schedule{,_split}` (Tier S - feeds
+check-refs, check-ids, tags-count, node_stats, getid, tags-filter
+expression path, extract Way fallback, geocode Pass 2 node schedule)
+plus eight per-command schedule builders that didn't route through the
+shared primitive (extract common + smart, multi-extract, renumber,
+tags-filter single-pass + pass-2, geocode `build_pass2_schedules`,
+ALTW external `scan_blob_metadata`, apply-changes `scan_node_blob_schedule`).
+Two pattern-2 migrations (sequential `BlobReader` → parallel) also
+landed for the dense ALTW path: `collect_way_referenced_node_ids`
+(`parallel_classify_phase`, trades the `scan_way_refs` wire-format
+fast path for 16× parallelism) and `collect_relation_member_node_ids`
+(`parallel_classify_accumulate`, per-worker IdSet bounded ~68 MB).
+
+Measured impact at the phase level, europe `--bench 3` with
+`--stop <PHASE>`:
+
+| Command | Phase | Pre (`1245cde`) | Post (`8e3a0d1`) | Δ |
+|---|---|---:|---:|---:|
+| check-refs | SCHEDULE_SCAN_LOOP | 24,684 ms | 432 ms | **57×** |
+| tags-filter | TAGSFILTER_SINGLE_PASS_SCHEDULE_SCAN | 25,050 ms | 994 ms | **25×** |
+| extract --simple | EXTRACT_SCHEDULE_SCAN | 24,584 ms | 471 ms | **52×** |
+
+Planet full-command walls (single-sample `--bench 1`, ±5 % run-to-run
+noise from cache state alone):
+
+| Command | Pre (`1245cde`) | Post (`8e3a0d1` / `01c67da`) | Δ |
+|---|---:|---:|---:|
+| tags-filter (transitive) | 147.5 s | **119.9 s** | -18.7 % |
+| inspect --nodes -j 16 | 58.1 s | **49.4 s** | -15.0 % |
+| check-refs | 72.6 s | **62.7 s** | -13.7 % |
+| check-ids --full | 72.5 s | **63.2 s** | -12.8 % |
+| extract --simple | 264.7 s | **247.3 s** | -6.6 % |
+| multi-extract (5 regions) | 1004.6 s | **972.0 s** | -3.2 % |
+| extract --complete | 261.8 s | **254.2 s** | -2.9 % |
+| add-locations-to-ways (external) | 684.0 s | **673.6 s** | -1.5 % |
+| build-geocode-index | 430.5 s | **434.9 s** | +1.0 % (noise) |
+| renumber | 215.6 s | **219.3 s** | +1.7 % (noise) |
+| extract --smart | 278.7 s | **283.5 s** | +1.7 % (noise) |
+| apply-changes --osc-seq 4920 | 577.0 s | **589.1 s** | +2.1 % (noise) |
+| inspect --tags -j 16 | 169.5 s | **168.3 s** | -0.7 % |
+
+Full-command wins shrink or disappear at europe scale because the old
+buffered header walk was accidentally prefetching blob bodies via the
+kernel's sequential readahead; the downstream decompression pass
+reused those warm pages. `HeaderWalker`'s `posix_fadvise(POSIX_FADV_RANDOM)`
+deliberately skips that prefetch. At planet the file is ~4× physical
+RAM so the prefetched pages would be evicted before decompression
+could reuse them anyway, and the header-walk savings land cleanly on
+the bottom line. At europe the two effects cancel.
+
+Three now-dead methods removed post-migration:
+`BlobHeader::{index, tag_index}` and
+`BlobReader::next_header_with_data_offset`.
+
+`notes/scan-optimization-audit.md` retires the high-leverage Tier 1
+items; dense node index Pattern 2 (`build_node_index_dense`), O(1)
+probes (`check_sorted_and_indexed`, `has_indexdata`), and unsorted
+extract paths are intentional non-goals per the audit doc itself.
+
 #### Europe ALTW phase breakdown (the cleanest signal)
 
 `EXTJOIN_META_SCAN` is the only ALTW phase that walks blob headers; all

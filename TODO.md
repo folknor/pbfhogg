@@ -18,7 +18,7 @@ Four planet-scale command plans are in notes, each with a ranked set of opportun
 
 - [ ] **[notes/altw-structural-reports.md](notes/altw-structural-reports.md)** - `add-locations-to-ways --index-type external`. Current planet baseline: **661.2 s `--bench 3`** (UUID `a406d77e`, commit `aee7727`, 2026-04-18 post-regression-fix). Europe **291.6 s** after metadata-driven relation scan (`6d71053`). Doc consolidates six independent reviews into 11 ranked opportunities. Dominant theme: the stage 2 → stage 3 → stage 4 disk-seam chain, with ~80 GB rank shards + ~112 GB slot buckets + finalize. Stage-2 de-ranking and `BlobLocationRouter` already shipped (Europe 320.5 s → 291.6 s total). Measurement history + already-shipped context in [`notes/altw-optimization-history.md`](notes/altw-optimization-history.md); the failed in-RAM-coord-table reshape experiment is documented at [`notes/altw-as-renumber.md`](notes/altw-as-renumber.md) and does not invalidate the remaining ranked items.
 
-- [ ] **[notes/scan-optimization-audit.md](notes/scan-optimization-audit.md)** - cross-command audit (2026-04-20) reconciling four reviews (two Explore subagents + two external reviews). Two patterns from today's session to apply more broadly: (1) buffered header walk → `HeaderWalker` pread+fadvise(RANDOM) primitive, (2) sequential `BlobReader` + per-blob work → `parallel_classify_phase` / `_accumulate`. Tier S pick: migrate the shared `scan::classify::build_classify_schedule` + `_split` to `HeaderWalker` internally - one change ripples to 10+ downstream commands (extract, tags-filter, check, inspect, geocode, apply-changes, renumber, ALTW, multi-extract). Tier 1: ~8 per-command schedule builders that don't go through the shared primitive. Pattern 2 Tier 1: `collect_way_referenced_node_ids` in ALTW stage 1. **Pre-audit planet baselines queued in `./overnight.sh` items A1-A15 (~75-80 min).** Do not land any migration until the overnight run fills in the post-audit UUIDs in the doc's baseline table.
+- [x] ~~**[notes/scan-optimization-audit.md](notes/scan-optimization-audit.md)**~~ - **LANDED 2026-04-20 (7 commits: `de8daf1`, `d925bc4`, `26d1402`, `911ada6`, `57b01f9`, `8e3a0d1`, `01c67da`).** Tier S `scan::classify::build_classify_schedule{,_split}` migrated to `HeaderWalker` plus all eight Tier 1 per-command schedule builders (apply-changes prefill, extract common+smart, renumber, multi-extract, tags-filter single+pass2, geocode pass2, ALTW external blob_meta). Pattern 2 Tier 1 also landed for the dense ALTW path (`collect_way_referenced_node_ids` → `parallel_classify_phase`, `collect_relation_member_node_ids` → `parallel_classify_accumulate`). Europe phase-only walls (`--stop SCHEDULE_SCAN_LOOP`): check-refs 24.7 s → 0.4 s (57×), tags-filter 25.1 s → 1.0 s (25×), extract 24.6 s → 0.5 s (52×). Planet full-command wins (single-sample, ±5 % noise): tags-filter -18.7 % (147.5 → 119.9 s), check-refs -13.7 % (72.6 → 62.7 s), check-ids -12.8 %, inspect --nodes -15.0 %, multi-extract -3.2 %. Also removed now-dead `BlobHeader::{index, tag_index}` and `BlobReader::next_header_with_data_offset`. Tier 2 / Tier 3 items (dense node index Pattern 2, O(1) probes, unsorted extract paths) are intentional non-goals per the audit doc.
 
 Measurement-first on every one: turn on `#[cfg(feature = "hotpath")]` counters (or add unconditional `*_ms` counters) to ground-truth the inferred per-phase breakdowns before committing to the order of landing items within a plan.
 
@@ -68,6 +68,22 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   library consumers can subscribe. Full rollout (call-site shape,
   coverage sweep, brokkr `--probes`, backend migration) in
   [`notes/instrumentation-layering.md`](notes/instrumentation-layering.md).
+
+- [ ] **Reclaim europe's lost prefetch win after scan-audit.** The
+  2026-04-20 scan-audit swap to `HeaderWalker` gave up ~14 s of
+  downstream decompression benefit at europe scale because the old
+  buffered header walk was accidentally warming blob-body pages via
+  the kernel's sequential readahead - pages the downstream phases
+  then reused. `posix_fadvise(POSIX_FADV_RANDOM)` deliberately skips
+  that. A deliberate `posix_fadvise(POSIX_FADV_WILLNEED)` over the
+  exact blob ranges that the scan result flagged for later pread
+  (`(data_offset, data_size)` for the schedule entries we're about
+  to hit) would reclaim the prefetch without re-introducing the old
+  walk's I/O waste. Only matters for mid-size workloads - planet is
+  larger than RAM so prefetched pages evict before reuse, and
+  germany is already fully cached. Measure on europe `check-refs` /
+  `tags-filter` / `extract --simple` where the phase-level win is
+  huge but the full-command wall is currently flat.
 
 ## Cross-pipeline optimization
 

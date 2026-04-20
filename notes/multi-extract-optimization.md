@@ -90,25 +90,40 @@ Commit `9f72bcf`. `multi_extract_pread_write` replaces sequential
 BlobReader in all 3 write phases. Denmark 5-region: 6.7s → 2.1s (3.2x).
 Japan 5-region: 32.5s → 8.1s (4.0x).
 
-### 5. Raw passthrough for fully-contained node blobs - OPEN
+### 5. Raw passthrough for fully-contained node blobs - CLOSED 2026-04-20
 
-Infrastructure is in place: `NodeBlobInfo` tracks per-region containment,
-`multi_extract_pread_write_nodes` handles passthrough via ReorderBuffer
-interleaving. Currently only fires when a blob is contained in ALL N
-regions (useful for N=1 or fully-overlapping regions).
+Shadow counter measurement (planet 5-region `--config --simple`, commit
+`57b01f9`, UUID `dad573cb`) shows **0 / 32,835** node blobs qualify for
+partial-passthrough. All 32,835 blobs (10.4 B elements) land in
+`none_contained`; the existing all-N-contained fast path also fires 0
+times at planet 5-region. The "high impact" prediction (90 %+ blobs
+interior to at least one region) was wrong.
 
-Per-region passthrough for disjoint strips needs a hybrid decode+raw
-consumer path: decode once, write raw to contained regions, route
-elements to non-contained regions.
+**Why the math is hostile:** PBF node blobs are ID-sorted, and OSM IDs
+are chronological rather than geographic. Nodes within an
+8,000-element blob scatter across the planet, so each blob's
+geographic bbox is ~planet-wide and cannot be contained in any
+sub-planet region under any bbox subdivision. Geography-sorted PBFs
+(Hilbert curve over lat/lon) would flip this, but that breaks
+`Sort.Type_then_ID` and is not what we ingest.
 
-**Impact:** High at planet scale. 90%+ of node blobs are interior to at
-least one region in a typical multi-extract configuration.
+Shadow counter (`emit_node_passthrough_shadow_counters` and the
+`multiextract_node_shadow_*` family) reverted on close. Load-bearing
+pin lives in `src/commands/extract/multi.rs::try_extract_multi_single_pass`
+just after `MULTI_SCHEDULE_SCAN_END`. Sister precedent in
+`src/commands/tags_filter/mod.rs` pass-2 worker.
 
-**Known issue from TODO.md reviewer findings (2026-04-09):** Raw
-passthrough is unsafe for polygon regions - `contained_in` is computed
-from each slot's bbox, not polygon geometry. For polygon or
-multipolygon extracts, "blob bbox contained in region bbox" does not
-prove every node is inside the polygon. Pre-existing issue.
+The existing all-N-contained passthrough path in
+`multi_extract_pread_write_nodes` is **kept** for its narrow but real
+niche: N=1 extracts and fully-overlapping regions. Don't remove it on
+the strength of the planet 5-region 0-count - planet multi-region is
+the hardest case, not the only one.
+
+The polygon-safety known issue (raw passthrough is unsafe for polygon
+regions because `contained_in` is computed from each slot's bbox, not
+polygon geometry) is moot now: there's no partial-passthrough path
+left to be unsafe with. The all-N-contained path already requires bbox
+regions in practice via the `all_bbox` gate.
 
 ### 6. Spatial index for large N - OPEN
 
@@ -131,9 +146,11 @@ multi-extract (5-20 regions), linear scan is fine.
 5. ~~**Instrumentation sweep**~~ - DONE (commit `1e8d37b`,
    2026-04-17: `MULTI_EXTRACT_START/END`, `MULTI_SCHEDULE_SCAN_START/END`,
    8 `multi_extract_*` counters)
-6. **Raw passthrough for contained blobs** (high impact now confirmed:
-   NODE_WRITE is 52 % of Europe wall, WAY_WRITE 40 %; polygon safety
-   issue still needs resolution first)
+6. ~~**Raw passthrough for contained blobs**~~ - CLOSED 2026-04-20 via
+   shadow counter (0 / 32,835 at planet 5-region). NODE_WRITE is still
+   52 % of Europe wall but cannot be attacked through this path; the
+   load-bearing pin lives in `src/commands/extract/multi.rs`. Item #5
+   above for the full post-mortem.
 7. **`BlobReader::seek_raw` BufReader-discard fix** (cross-cutting, but
    measurable 26 s at Europe in MULTI_SCHEDULE_SCAN - see TODO.md
    Performance section)
@@ -145,52 +162,46 @@ multi-extract (5-20 regions), linear scan is fine.
 - Known issues (strip-4 verify failure, polygon passthrough safety,
   O(workers × regions) scaling) → TODO.md multi-extract section
 
-### Before building raw passthrough here: measure the qualifying-blob fraction
+### Raw passthrough disproven (2026-04-20) - load-bearing record
 
-Item #6 in the priority order above (raw passthrough for contained
-blobs) has a methodology prerequisite. On 2026-04-18 the tags-filter
-raw-passthrough opportunity was disproven via a shadow counter: 0 /
-50,364 pass-2 blobs on planet `w/highway=primary` would have qualified
-under the "all elements in include set" gate (commit `a5c6854` added
-the counter, `0ef4107` removed it; UUID `8c786794`). ~8,000 elements
-per blob times any realistic per-element match rate makes the
-all-match gate vanishingly rare for ID-sorted PBFs.
+This section was originally a methodology prerequisite ("measure
+qualifying fraction before building"). The measurement has now landed,
+the result was zero, and the shadow counter has been reverted. Kept
+here as the historical record of what was measured and why the path
+is closed; the active load-bearing pin lives in
+`src/commands/extract/multi.rs::try_extract_multi_single_pass` (look
+for the long comment block right after `MULTI_SCHEDULE_SCAN_END`).
 
-Multi-extract's geometry is different - region-contained blobs really
-do cluster (each region is a contiguous bbox, blobs span short ID
-ranges, containment is monotonic within a bbox). So the math probably
-comes out the other way here. Unsafe gate for polygon regions (the
-existing TODO.md note) is a separate issue - confirm both the
-fraction and the safety gate before shipping.
+**Measurement:** shadow counter `emit_node_passthrough_shadow_counters`
+(landed 2026-04-19, reverted 2026-04-20) emitted
+`multiextract_node_shadow_*` counters classifying every node blob into
+`all_n_contained` / `partial_contained` / `none_contained`. Planet
+5-region `--config --simple` at commit `57b01f9`, UUID `dad573cb`:
 
-**Shadow counter landed 2026-04-19** in
-`emit_node_passthrough_shadow_counters` (called right after
-`MULTI_SCHEDULE_SCAN_END`). Run a multi-region multi-extract under a
-measured brokkr mode and inspect the counters via
-`brokkr sidecar <UUID> --counters --human`:
+| Counter | Value |
+|---|---:|
+| `blobs_total` | 32,835 |
+| `blobs_all_n_contained` | 0 |
+| `blobs_partial_contained` | **0** |
+| `blobs_none_contained` | 32,835 |
+| `elements_total` | 10,447,738,627 |
+| Per-region (i=0..4) blobs | 0 each |
 
-- `multiextract_node_shadow_blobs_total` /
-  `multiextract_node_shadow_elements_total` - population
-- `multiextract_node_shadow_blobs_all_n_contained` - current fast path
-  (contained in ALL N regions, already raw-passed-through)
-- `multiextract_node_shadow_blobs_partial_contained` - **the
-  opportunity** (contained in some but not all regions - these go
-  through full decode+re-encode today)
-- `multiextract_node_shadow_blobs_none_contained` - not raw-eligible
-  under any gate
-- Per-region: `multiextract_node_shadow_region_<i>_blobs` /
-  `multiextract_node_shadow_region_<i>_elements` - how many blobs
-  would raw-pass to region `i` under a partial-passthrough
-  implementation
+**Result:** vanishingly small, exactly like tags-filter's 0 / 50,364
+shadow result on planet `w/highway=primary` (commit `a5c6854` added,
+`0ef4107` removed; UUID `8c786794`).
 
-The go/no-go rule mirrors tags-filter: if `partial_contained` is a
-meaningful fraction of `blobs_total` at Europe/planet scale, build
-the partial passthrough path. If it's vanishingly small (as
-tags-filter's equivalent was), the counters get reverted and this
-note becomes a load-bearing pin against re-attempting.
+**Why the original "geometry is different" prediction was wrong:** the
+prediction assumed region-contained blobs would cluster because each
+region is a contiguous bbox. That confuses ID-range-monotonicity with
+geographic-bbox-monotonicity. PBF blobs are ID-sorted, and OSM IDs are
+chronological - a single 8,000-element blob spans the planet
+geographically. So a blob's geographic bbox is ~planet-wide and
+cannot be contained in a sub-planet region under any subdivision.
 
-The load-bearing pin against re-attempting tags-filter passthrough is
-the comment block in the pass-2 worker in
-`src/commands/tags_filter.rs`; the per-group scaffolding in
-`src/write/raw_passthrough.rs` is the design surface if multi-extract
-or anyone else needs partial-blob passthrough later.
+**Sister precedents.** Other "shadow-counter said zero, reverted with a
+pin" closures: `src/commands/tags_filter/mod.rs` pass-2 worker (the
+original tags-filter shadow). The per-group raw-passthrough scaffolding
+in `src/write/raw_passthrough.rs` is the design surface if any future
+caller (geography-sorted PBFs, single-region overlap configs) ever
+needs partial-blob passthrough.

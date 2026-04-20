@@ -612,12 +612,9 @@ Planet memory: peak 2.17 GB, p95 2.13 GB, p50 1.13 GB, 0 major page faults.
 Pre-allocated `IdSetDense` for 14 B node IDs (1.6 GB resident for the
 duration of phases 1+2) is the dominant contributor.
 
-Plan target was 6-10 min at planet (from the original
-[notes/check-refs-opportunities.md](../notes/check-refs-opportunities.md)
-post-step-#2 projection). Measured 1 min 12 s, ~5-8× under the plan floor.
-
-Full plan, hotpath attribution, alloc breakdown, and off-plan investigations
-live in [notes/check-refs-opportunities.md](../notes/check-refs-opportunities.md).
+Plan target was 6-10 min at planet (post-step-#2 projection). Measured
+1 min 12 s, ~5-8× under the plan floor. Step #3 (selective wire-format
+parser) was not needed at these numbers.
 
 ### check --ids --full (commits `855b3b2`, `0d71b3b`, 2026-04-17, plantasjen) [TAINTED]
 

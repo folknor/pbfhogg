@@ -8,7 +8,7 @@ Four planet-scale command plans are in notes, each with a ranked set of opportun
 
 - [x] ~~**[notes/geocode-build-opportunities.md](notes/geocode-build-opportunities.md)**~~ - `build-geocode-index`. **ARC LANDED 2026-04-18.** Planet 1,255 s (20.9 min, TAINTED baseline) -> **432.9 s (7m12s)**, -65 % / 2.9x. Pass 1.5 peak anon 29.5 GB -> 3.0 GB (-90 %); governing peak migrated to Pass 3 Stage B at ~25 GB, comfortable on 27 GB hosts. All 10 ranked items (#1 Phase 2a+2b, #2, #3, #4, #5, #6, #7, #8, plus header-walk consolidation and direct coord_mmap writes) shipped. Remaining follow-ups in the note: #4 "needs another pass" (fused Stage A delivered only 2.8 s at Europe vs the 40-60 s planet prediction), Pass 2 interp resolve still sequential at 30.6 s planet, interpolation endpoint CSR for RSS hygiene.
 
-- [ ] **[notes/check-refs-opportunities.md](notes/check-refs-opportunities.md)** - `check --refs`. Steps #1 + #2 landed (commits `8f0ccbb`, `053def6`, `fbf591c`, 2026-04-17). Japan 56.7 s → **2.1 s** (27×). Europe 426.2 s → **33.6 s** (12.7×). Planet **1225 s → 72.5 s (16.9×)** at UUID `862547e4`, ~5-8× better than the 6-10 min plan floor. Peak RSS 2.17 GB. Step #3 (selective wire-format parser) not needed at current numbers.
+- [x] ~~**check --refs**~~ - landed 2026-04-17 across commits `8f0ccbb` (step #1: `RoaringTreemap` → `IdSetDense`), `053def6` + `fbf591c` (step #2: three-phase parallel scan + one-pass schedule walk). Japan 56.7 s → **2.1 s** (27×). Europe 426.2 s → **33.6 s** (12.7×). Planet **1225 s → 72.5 s** (16.9×, UUID `862547e4`), ~5-8× better than the 6-10 min plan floor. Peak RSS 2.17 GB. Step #3 (selective wire-format parser) was predicated on decompression and parse landing roughly co-equal; actual post-parallel split is ~162 s decompress vs ~2 s parse at Europe, putting the selective-parser ceiling at fractions of a second - so the next lever for check-refs perf is decompression throughput (zstd, io_uring, direct I/O), not selective parse. Load-bearing pin in `src/commands/check/refs.rs::check_refs` doc comment. Plan doc retired.
 
 - [ ] **[notes/apply-changes-opportunities.md](notes/apply-changes-opportunities.md)** - `apply-changes --locations-on-ways`. Current: **762 s / 1.8 GB RSS** at planet under production `--compression none`. Target: **~9-10 min / same RSS**. Already mostly well-shaped; two incremental parallelizations remaining - `NodeLocationIndex::prefill_from_base` and the sequential reader thread. No reshape needed.
 
@@ -17,8 +17,6 @@ Four planet-scale command plans are in notes, each with a ranked set of opportun
 - [x] ~~**diff-snapshots (text and `--format osc`)**~~ - landed 2026-04-20. Planet baselines: text **2134 s / 35m34s**, osc **2225 s / 37m06s**. ID-range sharded parallel block-pair merge for both paths: text planet **227.5 s / 3m48s at `-j 16` (UUID `22a5eb55`, 9.5× speedup, temp-file shape, 586 MB peak anon)**, osc planet **313.8 s / 5m13s at `-j 16` (UUID `9b3fc2b9`, 7.1× speedup, 663 MB peak anon)**. CLI flag `-j/--jobs N` on `pbfhogg diff`. Germany text 16.5 s, germany osc 20.4 s at `-j 8`. Both paths now stream shard output to per-shard scratch temp files; an interim text-shape buffered each shard in a `Vec<u8>` (208.6 s, UUID `b02d86bc`, 2.29 GB peak anon) and was replaced with the temp-file shape for a 74 % RSS drop at a 10 % wall cost. Shard balance within 1.03× max/min. Both paths beat the 8-min aspirational target. OSC speedup is lower because the final `assemble_osc` (gzip + concat of ~45 GB of XML fragments) is single-threaded and runs 32.8 s. Remaining follow-ups (all small, below): auto-enable parallel by default, parallelise `assemble_osc` gzip. Plan doc retired.
 
 - [ ] **[notes/altw-structural-reports.md](notes/altw-structural-reports.md)** - `add-locations-to-ways --index-type external`. Current planet baseline: **661.2 s `--bench 3`** (UUID `a406d77e`, commit `aee7727`, 2026-04-18 post-regression-fix). Europe **291.6 s** after metadata-driven relation scan (`6d71053`). Doc consolidates six independent reviews into 11 ranked opportunities. Dominant theme: the stage 2 → stage 3 → stage 4 disk-seam chain, with ~80 GB rank shards + ~112 GB slot buckets + finalize. Stage-2 de-ranking and `BlobLocationRouter` already shipped (Europe 320.5 s → 291.6 s total). Measurement history + already-shipped context in [`notes/altw-optimization-history.md`](notes/altw-optimization-history.md); the failed in-RAM-coord-table reshape experiment is documented at [`notes/altw-as-renumber.md`](notes/altw-as-renumber.md) and does not invalidate the remaining ranked items.
-
-- [x] ~~**[notes/scan-optimization-audit.md](notes/scan-optimization-audit.md)**~~ - **LANDED 2026-04-20 (7 commits: `de8daf1`, `d925bc4`, `26d1402`, `911ada6`, `57b01f9`, `8e3a0d1`, `01c67da`).** Tier S `scan::classify::build_classify_schedule{,_split}` migrated to `HeaderWalker` plus all eight Tier 1 per-command schedule builders (apply-changes prefill, extract common+smart, renumber, multi-extract, tags-filter single+pass2, geocode pass2, ALTW external blob_meta). Pattern 2 Tier 1 also landed for the dense ALTW path (`collect_way_referenced_node_ids` → `parallel_classify_phase`, `collect_relation_member_node_ids` → `parallel_classify_accumulate`). Europe phase-only walls (`--stop SCHEDULE_SCAN_LOOP`): check-refs 24.7 s → 0.4 s (57×), tags-filter 25.1 s → 1.0 s (25×), extract 24.6 s → 0.5 s (52×). Planet full-command wins (single-sample, ±5 % noise): tags-filter -18.7 % (147.5 → 119.9 s), check-refs -13.7 % (72.6 → 62.7 s), check-ids -12.8 %, inspect --nodes -15.0 %, multi-extract -3.2 %. Also removed now-dead `BlobHeader::{index, tag_index}` and `BlobReader::next_header_with_data_offset`. Tier 2 / Tier 3 items (dense node index Pattern 2, O(1) probes, unsorted extract paths) are intentional non-goals per the audit doc.
 
 Measurement-first on every one: turn on `#[cfg(feature = "hotpath")]` counters (or add unconditional `*_ms` counters) to ground-truth the inferred per-phase breakdowns before committing to the order of landing items within a plan.
 
@@ -217,13 +215,17 @@ for full analysis of 6 optimization opportunities.
 - [ ] **Complete/smart strategies** - per-region way/relation ID
   tracking. Memory: N × ~3 GB (bbox_node_ids + all_way_node_ids per
   region). Feasible for ~10 regions on 30 GB host, ~40 on 128 GB.
-- [ ] **Raw passthrough** - infrastructure in place: `NodeBlobInfo`
-  tracks per-region containment, `multi_extract_pread_write_nodes`
-  handles passthrough via ReorderBuffer interleaving. Currently only
-  fires when a blob is contained in ALL N regions (useful for N=1 or
-  fully-overlapping regions). Per-region passthrough for disjoint
-  strips needs hybrid decode+raw consumer path - decode once, write
-  raw to contained regions, route elements to non-contained regions.
+- [x] ~~**Raw passthrough**~~ - CLOSED 2026-04-20 via shadow counter
+  (planet 5-region `--config --simple` at commit `57b01f9`, UUID
+  `dad573cb`): 0 / 32,835 node blobs qualify under any partial-passthrough
+  gate. Same outcome as tags-filter's earlier 0 / 50,364. Structural:
+  ID-sorted PBFs put chronologically-adjacent (geographically-scattered)
+  nodes in each blob, so a blob's geographic bbox is ~planet-wide and
+  cannot fit in a sub-planet region. The all-N-contained path stays
+  for the N=1 / fully-overlapping niche. Load-bearing pin in
+  `src/commands/extract/multi.rs::try_extract_multi_single_pass`;
+  full post-mortem in [notes/multi-extract-optimization.md](notes/multi-extract-optimization.md)
+  item #5.
 
 ### Export (GeoJSON/GeoPackage)
 

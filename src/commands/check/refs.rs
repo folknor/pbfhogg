@@ -125,10 +125,17 @@ struct RelBlobResult {
 /// Despite appearances, check_refs needs more than just element IDs:
 /// way node refs (`w.refs()`) and relation member IDs and types
 /// (`r.members()`). A selective wire-format parser that skips
-/// stringtable/tags/coords/metadata but keeps IDs + refs + members is
-/// the plan's step #3 - worth revisiting if decompression remains the
-/// bottleneck after this parallelization. See
-/// [notes/check-refs-opportunities.md](../../../notes/check-refs-opportunities.md).
+/// stringtable/tags/coords/metadata but keeps IDs + refs + members
+/// was on the original plan as step #3, predicated on a post-parallel
+/// landing with decompression and parse roughly co-equal. The actual
+/// landing put decompression overwhelmingly in front of parse at
+/// planet (Europe hotpath after step #2: `decompress_blob_raw` 162 s
+/// cumulative vs `parse_and_inline` 2.1 s), so a selective parser's
+/// measured ceiling is a fraction of a second at Europe and a few
+/// seconds at planet. The lever to pull for further gains is
+/// decompression throughput (zstd input format, io_uring, direct I/O),
+/// not selective parse. Revisit step #3 only if a future change makes
+/// parse a meaningful share of wall again.
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 #[hotpath::measure]
 pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io: bool) -> Result<RefCheckResult> {

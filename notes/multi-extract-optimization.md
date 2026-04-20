@@ -41,16 +41,36 @@ full breakdown after the 2026-04-17 instrumentation landing
 | **Total** | **799.4 s** | 100 % |
 
 Write phases dominate Europe: `NODE_WRITE` (52 %) + `WAY_WRITE` (40 %)
-= 92 % of wall. **Write-path optimization is the high-impact
-opportunity**, not classification. Within write, the obvious lever is
-**raw passthrough for fully-contained node blobs** (item #5 below) -
-eliminating decode+re-encode on ~90 % of node blobs at Europe could
-shave double-digit seconds from the 413 s `NODE_WRITE` phase.
+= 92 % of wall. The originally-hoped lever here was **raw passthrough
+for fully-contained node blobs** (item #5) - now **CLOSED 2026-04-20**
+by shadow-counter measurement showing 0 / 32,835 node blobs qualify at
+planet 5-region. The write-path phases are still the big buckets but
+the specific attack is closed; any future push on `NODE_WRITE` /
+`WAY_WRITE` wall will need a fresh diagnosis (e.g. shared BlockBuilder
+across regions, output-side compression tuning, SIMD re-encode) rather
+than the raw-passthrough plan.
 
-`SCHEDULE_SCAN`'s 26 s at Europe is the `BlobReader::seek_raw`
-BufReader-discard issue from TODO.md Performance section (the
-header-walk hot path does ~10× file-size amplification at the default
-256 KB buffer). Cross-cutting fix, not multi-extract specific.
+**Planet baseline (2026-04-20, commit `57b01f9`, UUID `dad573cb`,
+16m11s wall, 5-region `--config --simple`):**
+
+| Phase | Wall | % of total |
+|---|---:|---:|
+| MULTI_SCHEDULE_SCAN | 6.2 s | 0.6 % |
+| MULTI_NODE_CLASSIFY | 45.4 s | 4.7 % |
+| **MULTI_NODE_WRITE** | **523.9 s** | **53.9 %** |
+| MULTI_WAY_CLASSIFY | 34.1 s | 3.5 % |
+| **MULTI_WAY_WRITE** | **347.6 s** | **35.8 %** |
+| MULTI_REL_CLASSIFY | 1.5 s | 0.2 % |
+| MULTI_REL_WRITE | 12.9 s | 1.3 % |
+| **Total** | **971.7 s** | 100 % |
+
+`SCHEDULE_SCAN` is no longer a symptom: the prior 26 s Europe cost was
+the `BlobReader::seek_raw` BufReader-discard issue, fixed twice - via
+`aa3147c` 2026-04-18 (BlobReaderSource trait preserves the BufReader
+buffer across relative skips), then superseded by `57b01f9` 2026-04-20
+which migrated `try_extract_multi_single_pass` to HeaderWalker (pread
+with `POSIX_FADV_RANDOM`, no buffered scan on this path). Planet now
+6.2 s / 602 MB read.
 
 ## Investigated items
 
@@ -151,10 +171,16 @@ multi-extract (5-20 regions), linear scan is fine.
    52 % of Europe wall but cannot be attacked through this path; the
    load-bearing pin lives in `src/commands/extract/multi.rs`. Item #5
    above for the full post-mortem.
-7. **`BlobReader::seek_raw` BufReader-discard fix** (cross-cutting, but
-   measurable 26 s at Europe in MULTI_SCHEDULE_SCAN - see TODO.md
-   Performance section)
-8. **Spatial index** (only for N > 50, future)
+7. ~~**`BlobReader::seek_raw` BufReader-discard fix**~~ - landed twice.
+   First `aa3147c` 2026-04-18 (public `BlobReaderSource` trait;
+   `BufReader` impl routes through `seek_relative` instead of the
+   buffer-discarding stdlib `Seek` path). Then superseded by
+   `57b01f9` 2026-04-20 which migrated `try_extract_multi_single_pass`
+   to HeaderWalker - pread with `POSIX_FADV_RANDOM`, no buffered
+   scan on this path at all. Planet `MULTI_SCHEDULE_SCAN` is now
+   **6.2 s / 602 MB read** (UUID `dad573cb`) versus the prior
+   ~26 s Europe baseline at commit `b7cd0e4`.
+8. **Spatial index** (only for N > 50, future; not currently active)
 
 ## Relationship to other documents
 

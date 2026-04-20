@@ -1,40 +1,37 @@
 # `apply-changes --locations-on-ways` - optimization plan
 
-Target: `pbfhogg apply-changes --locations-on-ways` on planet with a daily OSC. Current: 12m33s (753 s, zlib) / 8m52s (532 s, none) wall, 1.8 GB peak RSS (commit `7e9c2e9`, 2026-04-17). Production uses `--compression none` (no zlib encode in the output path).
+Target: `pbfhogg apply-changes --locations-on-ways` on planet with a daily OSC, production default `--compression none`.
+
+## Current state (2026-04-20)
+
+- **Planet baseline:** **144.4 s wall, 1.8 GB peak RSS** at commit `52c2c4b`, UUID `e81a9316`, plantasjen (planet altw + OSC 4913, `--bench 1`).
+- **Diagnosis:** classify CPU is undersaturated (4.15 cores avg of 22 available). Two structural problems: (1) per-batch `par_iter().collect()` Amdahl barrier - heavy/cheap blob mix + slowest-blob-holds-the-batch = utilisation caps at ~5-6 cores regardless of batch size. (2) [`parallel_reader.rs`](../src/commands/apply_changes/parallel_reader.rs) preads full blob bodies for every blob, but at planet ~92% of blobs are fast-path passthrough where the body is never inspected and the kernel re-reads via `copy_file_range` anyway - so ~85 GB of body bytes are materialized per run for no benefit.
+- **Next move:** **descriptor-first streaming pipeline.** Scanner emits per-blob descriptors via [`HeaderWalker`](../src/read/header_walker.rs); non-overlap indexed blobs route directly from scanner to the ordered drain as `CopyRange` descriptors (never reach the worker pool); overlap candidates reach a long-lived worker pool that preads body, decompresses, parses, precise-checks, and either rewrites inline on a persistent `BlockBuilder` or emits a `CopyRange` descriptor (false positive). Drain actor owns `UpsertCursors`, gap creates, type transitions, passthrough coalescing, writer submission. `--locations-on-ways` prefill fuses into the node phase. One commit, no env-var gating, `copy_file_range` coalescing lands in the same commit.
+- **Target: 40-55 s wall at planet daily.** CPU-budget floor: 295 s classify CPU + 80 s rewrite CPU = 375 s / 22 cores ≈ 17 s fused wall floor; plus ~10 s OSC+setup + ~10-20 s writer I/O running concurrent with workers.
+- **Scope out of this plan:** internal API rewrites (`IdSetDense`, `PbfWriter`, `HeaderWalker` are correct as-is), compression-level tuning (production is `--compression none`; osmium-interop zlib is a separate workload), weekly-OSC parallel parse (separate workstream).
+- **Design detail:** see "Third review round + synthesis (2026-04-20)" below. That section supersedes the Q1-Q7 follow-up round on every item where they differ.
 
 ## Thesis
 
-Unlike ALTW, the geocode builder, and check-refs, apply-changes is **already mostly well-shaped**. There is no single structural mistake to point at. The merge pipeline is:
+Unlike ALTW, the geocode builder, and check-refs, apply-changes is **already mostly well-shaped**. The existing pipeline has:
 
-- single sequential pass over the base PBF
-- parallel classify (rayon `par_iter`)
+- parallel classify via rayon `par_iter`
 - pipelined writer with bounded channels
 - `Arc<NodeLocationIndex>` to avoid per-batch location-index cloning
 - per-rayon-task `PrimitiveBlock` drop after rewrite, for early memory release
 - coalesced passthrough writes (consecutive raw frames flush as a single `write_raw_owned` move)
 - raw-bytes pre-seeded string table path for base element rewrite (no re-parse, no re-intern)
 
-The 12m33s zlib / 8m52s none is the real cost of rewriting 70-90 % of a planet's blobs with locations preserved, not an artefact of a wrong shape.
-
-The wins fall in two phases. **Phase 1 (landed, infrastructure):** parallel `NodeLocationIndex::prefill_from_base`; streaming parallel reader; classify-path instrumentation. Took 154.9 s -> 140.3 s and surfaced the real bottleneck via measurement. **Phase 2 (pending, structural):** replace the per-batch `par_iter().collect()` + serial main-thread drain with a streaming pipeline that fuses classify + rewrite on the same worker; main thread off the critical path. See the "External review synthesis" section - two independent reviewers converged on 40-55 s wall at planet as the realistic floor. Compression-level tuning is out of scope here; production runs with `--compression none`.
-
-No internal API rewrites. `IdSetDense` is not used here (location index is a sparse HashMap keyed by node ID, which is right for the sparse-lookup pattern). `PbfWriter` is used correctly. `parallel_classify_accumulate` and `pass1_parallel_scan` are the patterns to reuse.
-
-Target after this plan: **~6-9 min at planet under `--compression none`**, RSS unchanged (~1.8-2.2 GB).
+The 144 s cost reflects the real work of rewriting ~40 % of a planet's blobs with locations preserved, not a wrong shape - but that cost sits on top of a per-batch barrier that leaves 3/4 of the rayon pool idle. Deleting the barrier is the work.
 
 ## Yardstick
 
 | Command | Wall | Peak RSS | Notes |
 |---|---:|---:|---|
-| `apply-changes --locations-on-ways` (pre-#2 baseline, `--compression none`) | 154.9 s | 1.8 GB | planet altw + OSC 4913, commit `b7ed0e1`, UUID `b91009ae` |
-| `apply-changes --locations-on-ways` (post-#2, `--compression none`) | **144.4 s** | 1.8 GB | parallel prefill, commit `52c2c4b`, UUID `e81a9316` |
-| `apply-changes --locations-on-ways` (current, `--compression zlib`) | 12m33s | 1.8 GB | historical: zlib encode (osmium-interop default), not re-measured |
+| `apply-changes --locations-on-ways` (pre-#2, `--compression none`) | 154.9 s | 1.8 GB | commit `b7ed0e1`, UUID `b91009ae`, sequential prefill |
+| `apply-changes --locations-on-ways` (post-#2, `--compression none`) | **144.4 s** | 1.8 GB | commit `52c2c4b`, UUID `e81a9316`, parallel prefill - current baseline |
 
-The two `--compression none` rows were measured on the same host
-(plantasjen), same dataset, same OSC, different commits. The older
-8m52s / 12m33s numbers from a prior host/commit combination are
-preserved below for historical continuity in the "Thesis" paragraph
-but superseded by the rows above for quantitative comparison.
+Historical `--compression zlib:6` number from commit `7e9c2e9` (2026-04-17, pre-parallel-prefill) was 12m33s; not re-measured under zlib since production runs `none`. A fresh A/B under both compression modes landed 2026-04-18 and is documented in "Zlib vs none" below (Europe, 46.1 vs 54.2 s).
 
 ## Measured: Europe altw + `--locations-on-ways --compression none`
 
@@ -230,7 +227,7 @@ at scale. Prefill has dropped from 13 % (Europe, pre-#2) to 4.6 %
 Note the `merge_loc_missing` ratio: 62 % of nodes referenced by OSC
 ways still aren't in either the base or the OSC. Missing refs fall
 back to `(0, 0)` coords per
-[rewrite.rs:67-70](../src/commands/merge/rewrite.rs#L67). Worth
+[element_writes.rs](../src/commands/apply_changes/element_writes.rs) (search for `locations.push((0, 0))`). Worth
 spot-checking that this matches osmium's semantics before claiming
 parity on `--locations-on-ways` output.
 
@@ -302,8 +299,9 @@ Signals:
   function are still fresh per call.
 - **`rewrite_block_parallel` at 2 MB per call × 41 k calls = 80.7 GB**
   is the largest single-callsite bucket. Per-call BlockBuilder (`task_bb`
-  at rewrite.rs:958), output `Vec<OwnedBlock>`, stats - all per-task
-  greenfield. This is the biggest arena / scratch pool target.
+  in the `rayon::spawn` closure inside `merge()`'s batch loop), output
+  `Vec<OwnedBlock>`, stats - all per-task greenfield. This is the biggest
+  arena / scratch pool target.
 - **`classify_only` at 83 KB per call × 514 k calls = 41 GB** adds up
   from the per-call decompress buffer + wire scan scratch. Already
   uses `map_init` with a reusable buffer for decompress; the 41 GB
@@ -357,28 +355,40 @@ for this workstream since production already runs with `none`.
 
 ## Current architecture (reference)
 
-Entry: `merge()` at [rewrite.rs:702](../src/commands/merge/rewrite.rs#L702). The public command name is `apply-changes`; the internal module is called `merge`.
+Entry: `merge()` in [`apply_changes/rewrite.rs`](../src/commands/apply_changes/rewrite.rs) (at line ~197 as of 2026-04-20; all line numbers in this section may drift, treat as starting points). The public command name is `apply-changes`; the module was renamed from `merge` to `apply_changes` after the counter names (`merge_*_ms`) were locked in, so the counter/counter-prefix vocabulary still reads as `merge_*`. Hotpath labels in older measurement tables below (`merge::classify::...`) are historical from the pre-rename runs.
+
+The module is split across several files:
+
+- [`rewrite.rs`](../src/commands/apply_changes/rewrite.rs) - `merge()` entry + main batch loop + counter emission
+- [`classify.rs`](../src/commands/apply_changes/classify.rs) - `classify_only` (fast/scan/parse/precise paths), `ClassifyResult`, `BatchSlot`, `RewriteJob`, `block_overlaps_diff`
+- [`rewrite_block.rs`](../src/commands/apply_changes/rewrite_block.rs) - `rewrite_block_parallel` (the per-blob rewrite the streaming worker would inline)
+- [`parallel_reader.rs`](../src/commands/apply_changes/parallel_reader.rs) - header-only schedule + pread workers + reorder pump (replaces the old sequential reader thread)
+- [`node_locations.rs`](../src/commands/apply_changes/node_locations.rs) - `NodeLocationIndex::build_from_diff` and `prefill_from_base` (parallel as of `52c2c4b`)
+- [`stream_output.rs`](../src/commands/apply_changes/stream_output.rs) - `coalesce_passthrough`, `emit_gap_creates`, `flush_remaining_upserts`, `has_gap_creates`, `emit_create_for_output` (reorder-actor helpers, already extracted)
+- [`element_writes.rs`](../src/commands/apply_changes/element_writes.rs) - `write_base_*_local`, `write_osc_way_local`, etc.
+- [`diff_ranges.rs`](../src/commands/apply_changes/diff_ranges.rs) - `DiffRanges` (sorted ID vecs), `UpsertCursors`
+- [`stats.rs`](../src/commands/apply_changes/stats.rs) - `MergeStats`, `PhaseTimers`, `StallAccumulator`, `ClassifyCounters`
 
 **Setup phase**:
 
-1. Parse OSC → `CompactDiffOverlay` ([rewrite.rs:719](../src/commands/merge/rewrite.rs#L719)).
-2. Build `DiffRanges` - sorted upsert + delete ID vecs per type ([rewrite.rs:746](../src/commands/merge/rewrite.rs#L746)).
-3. If `--locations-on-ways`: build `NodeLocationIndex` ([rewrite.rs:756](../src/commands/merge/rewrite.rs#L756)):
-   - `NodeLocationIndex::build_from_diff` collects all node IDs referenced by OSC ways, seeds coords from OSC nodes, leaves the rest in `needed_set` ([node_locations.rs:31](../src/commands/merge/node_locations.rs#L31)).
-   - `NodeLocationIndex::prefill_from_base` walks the base PBF sequentially, decompressing node blobs whose ID range overlaps needed IDs, extracting tuples, filling `locations` ([node_locations.rs:94](../src/commands/merge/node_locations.rs#L94)).
+1. Parse OSC → `CompactDiffOverlay`.
+2. Build `DiffRanges` - sorted upsert + delete ID vecs per type.
+3. If `--locations-on-ways`: build `NodeLocationIndex`:
+   - `NodeLocationIndex::build_from_diff` collects all node IDs referenced by OSC ways, seeds coords from OSC nodes, leaves the rest in `needed_set`.
+   - `NodeLocationIndex::prefill_from_base` drives a parallel work-stealing pread/decode over node blobs whose ID range overlaps `needed_set` (landed `52c2c4b` 2026-04-18).
 4. Read header, create pipelined writer.
-5. Spawn reader thread: single-threaded sequential scan via `FileReader`, producing `RawBlobFrame`s on a 128-deep `sync_channel` ([rewrite.rs:297](../src/commands/merge/rewrite.rs#L297)).
+5. `spawn_parallel_reader` - header-only schedule scan + pread worker pool + reorder pump on a manager thread, feeding a 128-deep `sync_channel<RawBlobFrame>` back to the main loop in file order.
 
-**Main batch loop** ([rewrite.rs:814](../src/commands/merge/rewrite.rs#L814)):
+**Main batch loop** (in `merge()`):
 
 For each byte-budgeted batch of raw frames (from `collect_batch`):
 
-- **Phase 1 (parallel classify)**: `classify_only` per frame via rayon. Returns `Passthrough`, `FalsePositive`, or `NeedsRewrite(PrimitiveBlock, BlobIndex)` ([rewrite.rs:823](../src/commands/merge/rewrite.rs#L823)).
-- **Phase 2 (sequential inline assignment)**: for each `NeedsRewrite` slot, binary-search the sorted upsert vec for IDs landing in the blob's OSM range. O(log n) per blob ([rewrite.rs:840](../src/commands/merge/rewrite.rs#L840)).
-- **Phase 3 (parallel rewrite)**: `rayon::spawn` per `RewriteJob`, each emitting to an `mpsc::sync_channel` sized to `num_threads.min(rewrite_count)` ([rewrite.rs:882](../src/commands/merge/rewrite.rs#L882)). Jobs own their `PrimitiveBlock` and drop it after completion.
-- **Phase 4 (streaming output)**: main thread processes slots in file order; passthrough slots flow into a coalescing buffer (`write_raw_owned`); rewrite slots block waiting for their job's result ([rewrite.rs:917](../src/commands/merge/rewrite.rs#L917)).
+- **Phase 1 (parallel classify)**: `classify_only` per frame via rayon `par_iter().map_init(...).collect()`. Returns `Passthrough`, `FalsePositive`, or `NeedsRewrite(PrimitiveBlock, BlobIndex)`.
+- **Phase 2 (sequential inline assignment)**: for each `NeedsRewrite` slot, binary-search the sorted upsert vec for IDs landing in the blob's OSM range. O(log n) per blob.
+- **Phase 3 (parallel rewrite)**: `rayon::spawn` per `RewriteJob`, each emitting to an `mpsc::sync_channel` sized to `num_threads.min(rewrite_count)`. Jobs own their `PrimitiveBlock` and drop it after completion.
+- **Phase 4 (streaming output)**: main thread processes slots in file order; passthrough slots flow into a coalescing buffer (`write_raw_owned` via `stream_output::coalesce_passthrough`); rewrite slots use a try_recv/blocking-recv pattern with a `WAIT_REWRITE_RESULT` marker pair on the blocking path.
 
-**Teardown**: flush remaining upserts per type, writer flush.
+**Teardown**: flush remaining upserts per type (`types_to_flush` match on `last_type`), writer flush.
 
 ## Opportunities, ranked
 
@@ -398,7 +408,7 @@ the full `PrimitiveBlock` construction that helper does. Retained for
 historical context as a record of the planning/measurement/landed
 arc.
 
-[node_locations.rs:112-144](../src/commands/merge/node_locations.rs#L112) is a straight sequential loop over node blobs:
+[node_locations.rs:112-144](../src/commands/apply_changes/node_locations.rs#L112) is a straight sequential loop over node blobs:
 
 ```rust
 for blob_result in &mut reader {
@@ -415,7 +425,7 @@ for blob_result in &mut reader {
 }
 ```
 
-`overlaps_needed` ([node_locations.rs:73](../src/commands/merge/node_locations.rs#L73)) is effective at skipping blobs that contain zero needed IDs. But every overlapping blob is decompressed on the main thread, serially, before the main pipeline even starts. For a daily diff touching ~10 M referenced nodes spread across the node ID space, probably 30-50 % of node blobs overlap, giving ~20-30 GB of compressed node data to decompress. At ~500 MB/s single-threaded, 40-60 s. On 6 cores: 10-15 s.
+`overlaps_needed` ([node_locations.rs:73](../src/commands/apply_changes/node_locations.rs#L73)) is effective at skipping blobs that contain zero needed IDs. But every overlapping blob is decompressed on the main thread, serially, before the main pipeline even starts. For a daily diff touching ~10 M referenced nodes spread across the node ID space, probably 30-50 % of node blobs overlap, giving ~20-30 GB of compressed node data to decompress. At ~500 MB/s single-threaded, 40-60 s. On 6 cores: 10-15 s.
 
 The shape matches [`parallel_classify_accumulate`](../src/commands/mod.rs#L571) exactly - it's the same pattern the geocode builder uses in Pass 1.5 for a dense-decode accumulator ([geocode_index/builder.rs:498](../src/geocode_index/builder.rs#L498)). Reuse it:
 
@@ -432,9 +442,13 @@ The shape matches [`parallel_classify_accumulate`](../src/commands/mod.rs#L571) 
 
 **Risk**: low. Pattern is already used in the codebase. Correctness is straightforward (merge is commutative + idempotent for sparse location lookups).
 
-### #3 - Replace the sequential reader thread with parallel pread schedule
+### #3 - Replace the sequential reader thread with parallel pread schedule - **LANDED 2026-04-18 (commit `c97d6b5`)**
 
-[rewrite.rs:297-327](../src/commands/merge/rewrite.rs#L297): `spawn_reader_thread` runs one thread that opens a `FileReader` and streams `RawBlobFrame`s through a 128-deep `sync_channel`. That thread is the only reader. The batch loop decouples reader from workers but does not parallelize the read itself.
+**Landed-result.** Parallel reader (header-only schedule + pread worker pool + reorder pump) lives at [`apply_changes/parallel_reader.rs`](../src/commands/apply_changes/parallel_reader.rs). Net-zero wall change vs the old sequential reader thread at planet - but kept as infrastructure because the streaming pipeline (next planned move, see External Review Synthesis section) builds on its schedule-and-dispatch shape. Reader is no longer the bottleneck; the per-batch Amdahl barrier is. Historical rationale and design notes preserved below for reviewer context.
+
+---
+
+Historical context (pre-landing): the original `spawn_reader_thread` ran one thread that opened a `FileReader` and streamed `RawBlobFrame`s through a 128-deep `sync_channel`. That thread was the only reader. The batch loop decoupled reader from workers but did not parallelize the read itself.
 
 At sequential BufReader + blob-header-parse overhead, realistic throughput is ~500 MB/s - 1 GB/s. 87 GB is 90-180 s. Parallel `pread` on NVMe reaches 3-5 GB/s, dropping to 17-30 s.
 
@@ -446,8 +460,8 @@ At sequential BufReader + blob-header-parse overhead, realistic throughput is ~5
 
 **Two wrinkles**:
 
-- **`copy_file_range` path** ([rewrite.rs:790-795](../src/commands/merge/rewrite.rs#L790)) needs `frame.file_offset`. That survives cleanly - the schedule entry has both `frame_offset` (for raw passthrough) and `data_offset` (for pread of the compressed body). Include both in the tuple.
-- **Raw-frame ownership** for the zero-copy passthrough move (`write_raw_owned(std::mem::take(&mut frame.frame_bytes))` at [rewrite.rs:938](../src/commands/merge/rewrite.rs#L938)). Workers already own their pread buffer; move it out the same way. The concept of `RawBlobFrame` survives; the difference is *when* the frame bytes are read (worker pread) versus *who* read them (reader thread today).
+- **`copy_file_range` path** (in `merge()`, gated on `use_copy_range`) needs `frame.file_offset`. That survives cleanly - the schedule entry has both `frame_offset` (for raw passthrough) and `data_offset` (for pread of the compressed body). Include both in the tuple.
+- **Raw-frame ownership** for the zero-copy passthrough move (`std::mem::take(&mut frame.frame_bytes)` inside `coalesce_passthrough`). Workers already own their pread buffer; move it out the same way. The concept of `RawBlobFrame` survives; the difference is *when* the frame bytes are read (worker pread) versus *who* read them (reader thread today).
 - **Reader-thread backpressure semantics.** The current `sync_channel(128)` gives 128 blobs of read-ahead. Parallel pread gives `num_workers × per-worker-batch` blobs of concurrent in-flight reads, which is similar or slightly higher. Page cache pressure is the same (reading the same bytes). No new RSS concern.
 
 **Expected win**: ~50-100 s at planet on NVMe. Smaller on spinning disk.
@@ -458,7 +472,7 @@ At sequential BufReader + blob-header-parse overhead, realistic throughput is ~5
 
 Classify is now the biggest bucket at planet: **70.9 s / 144.4 s = 49 % of wall** (post-#2). It's main-thread wall, not cumulative CPU - the per-batch pipeline is serial on the main thread (classify -> inline-assign -> rewrite-spawn -> rewrite-recv), so classify and rewrite-recv wall add directly. Together they're 79 % of wall.
 
-The classifier runs three paths per blob (see [classify.rs:129](../src/commands/merge/classify.rs#L129)):
+The classifier runs three paths per blob (see [classify.rs:129](../src/commands/apply_changes/classify.rs#L129)):
 
 1. **Fast path** - indexdata present + range miss -> `Passthrough` without decompress. Should be nanoseconds per call.
 2. **Scan path** - indexdata range overlapped or absent. Decompress, then `scan_block_ids` for a tighter range. If that range misses -> `Passthrough`. Decompress cost only.
@@ -534,7 +548,7 @@ Under `--compression none` at planet:
 - Scan-skip + sorted-merge: landed (`da1c45e`), ~-2 s wall (mostly variance).
 - Parallel reader + merge batch budget: landed (`c97d6b5`, `bfac63b`), net zero wall. Kept as infrastructure for the streaming rewrite.
 
-Updated primary target after the **external-review-driven streaming pipeline + fuse classify+rewrite** (next planned move): **40-55 s wall at planet daily OSC** (`--compression none`), from the current 140.3 s. CPU-budget floor from reviewer 2: classify CPU 270 s / 22 cores = 12.3 s classify wall under the streaming shape, plus ~3-4 s rewrite, plus pre-loop phases (~10 s) and writer wall-bound work running in parallel (~30 s). See "External review synthesis" section above.
+Updated primary target after the **external-review-driven streaming pipeline + fuse classify+rewrite** (next planned move): **40-55 s wall at planet daily OSC** (`--compression none`), from the current 144.4 s baseline. CPU-budget floor from reviewer 2: classify CPU 270 s / 22 cores = 12.3 s classify wall under the streaming shape, plus ~3-4 s rewrite, plus pre-loop phases (~10 s) and writer wall-bound work running in parallel (~30 s). See "External review synthesis" section above. The 140.3 s figure in the review-synthesis section is from an interim measurement window; the current post-#2 `--bench 1` is 144.4 s on the same commit, within run-to-run noise.
 
 **Weekly OSC end-state estimate (reviewer 2):** **70-90 s wall at planet weekly OSC** with streaming + worker-emits-framed (Q2) + prefill fusion (Q4) + parallel OSC parse (Q7). Current weekly (linear scaling of serial phases) probably ~250 s+.
 
@@ -545,7 +559,16 @@ Updated primary target after the **external-review-driven streaming pipeline + f
 - Splice-in-place for low-touch rewrites: ~1.5-2 s daily; less valuable at weekly.
 - Parallel OSC parse: only matters at weekly scale (20-30 s).
 
-## External review synthesis (2026-04-18)
+## External review synthesis (2026-04-18) - HISTORICAL
+
+> **Superseded by the "Third review round + synthesis (2026-04-20)" section below** on every item where they differ. Notable stale content preserved here for historical record:
+> - RawBlobFrame-first pipeline shape (R3 replaced with descriptor-first).
+> - 12.3 s classify floor (R3 corrected to 13.4 s; fused classify+rewrite floor ~17 s).
+> - "Worker-emits-framed-bytes in v1" - R3 explicitly deferred to P1.5.
+> - "PbfWriter pre-ordered input entry point in P1" - R3 deferred to post-P1 measurement.
+> - Q1-Q7 follow-ups preserved below for context but the Q4/Q6 positions are folded into P1's design rather than landing separately.
+>
+> Read the R3 synthesis first; refer back here only for the original ranked-item context.
 
 Two independent reviewers (`perf` / `arch` / `planet` archetypes) converged strongly on the same diagnosis and next move after seeing the planet post-parallel-reader plateau at 140.3 s. Their writeups are extensive; this section folds the claims, reasoning, and follow-up ideas into one place so we don't lose them.
 
@@ -640,7 +663,7 @@ Only relevant if the standard pipeline processes a week of OSCs in one run. Sing
 
 #### Splice-in-place for low-touch rewrites (reviewer 2)
 
-In `rewrite_block_parallel` ([rewrite.rs:710-826](../src/commands/merge/rewrite.rs#L710)), every `NeedsRewrite` blob is **fully decoded and fully re-encoded**, even if only one of its ~8 000 elements is touched by the diff. At planet with a daily OSC, the modal "needs rewrite" blob has 1-3 affected elements out of 8 000.
+In [`rewrite_block_parallel`](../src/commands/apply_changes/rewrite_block.rs) (own file), every `NeedsRewrite` blob is **fully decoded and fully re-encoded**, even if only one of its ~8 000 elements is touched by the diff. At planet with a daily OSC, the modal "needs rewrite" blob has 1-3 affected elements out of 8 000.
 
 **The change.** For blobs where the precise check finds `<=K` affected elements (say K=64), splice: walk the raw decompressed wire bytes for the `DenseNodes` / `Ways` / `Relations` `PrimitiveGroup`, emit runs of unaffected elements raw (via the existing raw-group passthrough scaffolding at [`src/read/block.rs:507`](../src/read/block.rs#L507) + [`src/write/raw_passthrough.rs`](../src/write/raw_passthrough.rs#L1)), and only decode+re-encode the affected ones.
 
@@ -652,7 +675,7 @@ In `rewrite_block_parallel` ([rewrite.rs:710-826](../src/commands/merge/rewrite.
 
 #### Steal `copy_file_range` coalescing from ALTW (reviewer 1)
 
-`add_locations_to_ways` already coalesces contiguous `copy_file_range` runs at [`src/commands/add_locations_to_ways.rs:1331`](../src/commands/add_locations_to_ways.rs#L1331). Merge still does per-blob `copy_file_range` writes at [rewrite.rs:1266](../src/commands/merge/rewrite.rs#L1266). Useful, secondary.
+ALTW's passthrough module already coalesces contiguous `copy_file_range` runs in [`src/commands/altw/passthrough.rs`](../src/commands/altw/passthrough.rs) (`coalesce_passthrough` helper + the contiguous-range extension pattern). `apply-changes` still does per-blob `copy_file_range` writes in `rewrite.rs` (search for `write_raw_copy`). Useful, secondary.
 
 #### Use the existing alloc-optimised parse path (reviewer 1)
 
@@ -660,7 +683,7 @@ In `rewrite_block_parallel` ([rewrite.rs:710-826](../src/commands/merge/rewrite.
 
 #### Exact-membership metadata or sidecar (reviewer 1, conditional)
 
-Current on-disk metadata gives per-blob type + ID range only ([`src/blob_index.rs:56`](../src/blob_index.rs#L56)), so pure creates inside an existing blob range force slow-path decode - this is the documented FalsePositive case at [`src/commands/merge/classify.rs:48`](../src/commands/merge/classify.rs#L48).
+Current on-disk metadata gives per-blob type + ID range only ([`src/blob_index.rs:56`](../src/blob_index.rs#L56)), so pure creates inside an existing blob range force slow-path decode - this is the documented FalsePositive case at [`src/commands/apply_changes/classify.rs:48`](../src/commands/apply_changes/classify.rs#L48).
 
 **Only worth pursuing if FalsePositives are a material share of slow-path work.** At planet today: 15 224 FalsePositive blobs / 92 677 slow-path = 16 %. Not negligible, but small next to the 77 453 rewrites that fundamentally need the slow path. A format/index project, not a quick cleanup.
 
@@ -695,7 +718,7 @@ After the initial reports, a follow-up round probed seven targeted questions abo
 
 Both reviewers: **measure before optimising.** The existing writer stack is already well-shaped.
 
-Reviewer 1: "The existing writer stack is good enough to let the streaming rewrite land first, but only if rewritten blobs stop going through `write_primitive_block_owned`." The plumbing already has the right shapes: buffered/direct/io_uring selection in [`src/commands/mod.rs:864`](../src/commands/mod.rs#L864), bounded write-ahead + dispatch permits in [`src/write/writer.rs:31`](../src/write/writer.rs#L31), and an io_uring backend aimed at `Compression::None` on fast storage in [`src/write/writer.rs:408`](../src/write/writer.rs#L408) and [`src/write/uring_writer.rs:1`](../src/write/uring_writer.rs#L1). If the writer *does* become the new floor, the next pass in order: (1) preframed rewrite output (Q2), (2) contiguous passthrough `copy_file_range` coalescing like [`src/commands/add_locations_to_ways.rs:1331`](../src/commands/add_locations_to_ways.rs#L1331), (3) benchmark buffered vs io_uring on target NVMe. **Do not start with "bigger internal queues"** - if disk bandwidth is the wall, queue depth is rarely the real lever.
+Reviewer 1: "The existing writer stack is good enough to let the streaming rewrite land first, but only if rewritten blobs stop going through `write_primitive_block_owned`." The plumbing already has the right shapes: buffered/direct/io_uring selection in [`src/commands/mod.rs:864`](../src/commands/mod.rs#L864), bounded write-ahead + dispatch permits in [`src/write/writer.rs:31`](../src/write/writer.rs#L31), and an io_uring backend aimed at `Compression::None` on fast storage in [`src/write/writer.rs:408`](../src/write/writer.rs#L408) and [`src/write/uring_writer.rs:1`](../src/write/uring_writer.rs#L1). If the writer *does* become the new floor, the next pass in order: (1) preframed rewrite output (Q2), (2) contiguous passthrough `copy_file_range` coalescing like [`src/commands/altw/passthrough.rs`](../src/commands/altw/passthrough.rs), (3) benchmark buffered vs io_uring on target NVMe. **Do not start with "bigger internal queues"** - if disk bandwidth is the wall, queue depth is rarely the real lever.
 
 Reviewer 2: NVMe ceiling gives 20-30 s for the 92 GB write. The `sync_channel(WRITE_AHEAD=32)` → writer_thread → `BufWriter(256 KB, File)` path is fine until the write queue is actually the bottleneck, which would show up as `pipeline_send_wait_ns` blowing up. If `bytes_written/s` sits near the NVMe ceiling after streaming lands, we're done for the `--compression none` case. If not, flip to `to_path_uring` (infrastructure is already there: `uring_writer.rs`, 64x256 KB registered buffers + `O_DIRECT`) before anything else. Bigger internal queues are a symptom-fix.
 
@@ -733,7 +756,7 @@ This is the one place the reviewers give different recommendations. Both agree t
 
 #### Q4: Prefill overlap - **one fake win, one real win**
 
-Reviewer 1: don't overlap `prefill_from_base` with OSC parse. The skip logic at [`src/commands/merge/node_locations.rs:73`](../src/commands/merge/node_locations.rs#L73) needs a *complete, sorted* `needed_sorted` set, and the scan is one-way through the node section ([`node_locations.rs:121`](../src/commands/merge/node_locations.rs#L121)) - starting early with an incomplete set risks skipping a node blob that later turns out to be required, which is unrecoverable without a rescan. With multiple diffs it gets worse because later diffs overwrite earlier state ([`src/osc.rs:979`](../src/osc.rs#L979)). If parse time matters, the right move is upstream: squash diffs before merge, not overlap inside it.
+Reviewer 1: don't overlap `prefill_from_base` with OSC parse. The skip logic at [`src/commands/apply_changes/node_locations.rs:73`](../src/commands/apply_changes/node_locations.rs#L73) needs a *complete, sorted* `needed_sorted` set, and the scan is one-way through the node section ([`node_locations.rs:121`](../src/commands/apply_changes/node_locations.rs#L121)) - starting early with an incomplete set risks skipping a node blob that later turns out to be required, which is unrecoverable without a rescan. With multiple diffs it gets worse because later diffs overwrite earlier state ([`src/osc.rs:979`](../src/osc.rs#L979)). If parse time matters, the right move is upstream: squash diffs before merge, not overlap inside it.
 
 Reviewer 2: agrees the "overlap with OSC parse" framing is a ~1 s fake win. **But there's a larger, real win in a different shape** - *fuse prefill into the streaming pipeline's node phase*. In a sorted PBF, all node blobs precede all way blobs. The streaming pipeline decompresses every node blob that overlaps the diff anyway. Today prefill separately decompresses a subset of node blobs (those overlapping `needed_set`) purely to extract coordinates for LOW. The two passes read overlapping data.
 
@@ -755,9 +778,9 @@ Reviewer 2: agrees the "overlap with OSC parse" framing is a ~1 s fake win. **Bu
 
 #### Q5: Trailing creates - no special case, both reviewers agree
 
-The reorder actor owns `UpsertCursors` and treats end-of-stream as the current trailing-create block at [`rewrite.rs:1435`](../src/commands/merge/rewrite.rs#L1435): once the last blob has been emitted, flush the remaining upserts for the current and later kinds.
+The reorder actor owns `UpsertCursors` and treats end-of-stream as the current trailing-create block (search `merge()` for `MERGE_TRAILING_CREATES_START` marker): once the last blob has been emitted, flush the remaining upserts for the current and later kinds.
 
-Reviewer 1 and reviewer 2 both note the existing `types_to_flush` match at [`rewrite.rs:1440-1453`](../src/commands/merge/rewrite.rs#L1440) already encodes the cases: `None` → flush all three, `Some(Node)` → flush Node+Way+Rel, etc. Port it verbatim to the actor's post-loop.
+Reviewer 1 and reviewer 2 both note the existing `types_to_flush` match (in the same block, keyed on `last_type: Option<ElemKind>`) already encodes the cases: `None` → flush all three, `Some(Node)` → flush Node+Way+Rel, etc. Port it verbatim to the actor's post-loop.
 
 **Testing target (reviewer 2):** an empty-base-PBF case where `last_type` stays `None` and the actor has to emit gap/trailing creates for all three kinds with no frames ever seen. Today's code handles this via the `None` arm; the actor needs to preserve it. Write a test for it.
 
@@ -792,7 +815,7 @@ Both reviewers: **streaming pipeline is still the right first move at weekly sca
 
 **Reviewer 2's concrete changes from daily to weekly:**
 
-1. **OSC parse becomes a real phase.** Single-threaded XML + gzip at 7x data: probably 30-40 s serial. Today's 5 s hides; weekly's 35 s doesn't. [`load_all_diffs`](../src/osc.rs#L1036) parses files sequentially into one overlay - that sequential loop becomes a bottleneck. **Parallelise it:** parse each OSC concurrently into its own overlay, then merge overlays with newer-wins semantics. Each OSC is independent work. Merge pass is a few seconds over the combined overlays. Same story for `write_streaming` in [`merge_changes.rs:184`](../src/commands/merge_changes.rs#L184). This is a real target at weekly scale, separate from the streaming pipeline work. **Primitive for the merge step:** [`IdSetDense::set_atomic_if_new`](../src/commands/id_set_dense.rs#L163) (pre-allocated per element type via `pre_allocate(max_id)`) is the concrete shape for newer-wins duplicate detection - walk overlays newest-first, call `set_atomic_if_new(id)` per element, keep the element only when the call returns `true`. The `_if_new` flavour returns `true` the first time a bit is set (atomic fetch-or under shared `&self`), which is exactly the primitive. `set_if_new` is the non-atomic variant for single-threaded paths. Built originally for `verify_ids --full` parallel rewrite; reuse here.
+1. **OSC parse becomes a real phase.** Single-threaded XML + gzip at 7x data: probably 30-40 s serial. Today's 5 s hides; weekly's 35 s doesn't. [`load_all_diffs`](../src/osc.rs#L1036) parses files sequentially into one overlay - that sequential loop becomes a bottleneck. **Parallelise it:** parse each OSC concurrently into its own overlay, then merge overlays with newer-wins semantics. Each OSC is independent work. Merge pass is a few seconds over the combined overlays. Same story for `write_streaming` in [`merge_changes::write_streaming`](../src/commands/merge_changes/mod.rs). This is a real target at weekly scale, separate from the streaming pipeline work. **Primitive for the merge step:** [`IdSetDense::set_atomic_if_new`](../src/commands/id_set_dense.rs#L163) (pre-allocated per element type via `pre_allocate(max_id)`) is the concrete shape for newer-wins duplicate detection - walk overlays newest-first, call `set_atomic_if_new(id)` per element, keep the element only when the call returns `true`. The `_if_new` flavour returns `true` the first time a bit is set (atomic fetch-or under shared `&self`), which is exactly the primitive. `set_if_new` is the non-atomic variant for single-threaded paths. Built originally for `verify_ids --full` parallel rewrite; reuse here.
 2. **`DiffRanges` scales linearly.** Sort-dedup of ~7x more IDs; still fast. Not a new bottleneck.
 3. **Passthrough-to-rewrite ratio shifts downward.** Today ~60 % passthrough at planet. Weekly planet: probably ~70-80 % passthrough blobs at most, but higher *rewrite* share per affected blob. More rewrites, fewer passthroughs, bigger rewrite CPU. The 4.1-core classify plateau gets proportionally worse (more heavy blobs per batch). **Case for streaming gets stronger** at weekly.
 4. **Prefill `needed_set` is ~7x larger.** More node blobs to scan, more `FxHashMap` pressure. **This is where Q4's fusion becomes critical** - prefill as a separate pass could balloon from 5 s to 30+ s, but fused into the pipeline's node phase it costs approximately nothing.
@@ -811,17 +834,234 @@ Both reviewers: **streaming pipeline is still the right first move at weekly sca
 
 **Reviewer 2's revised end-state estimate for weekly planet:** **70-90 s wall** with streaming + parallel OSC parse + prefill fusion + worker-framing. Current weekly (linear scaling of serial phases) probably ~250 s+.
 
+## Third review round + synthesis (2026-04-20)
+
+After the Q1-Q7 round, commissioned two fresh reviews with explicit context about what the prior rounds had already covered (to avoid rehash) and with the findings from our own code read (which the Q1-Q7 round didn't have). Both reviewers have full tree access. Each produced an initial review, then rebutted the other's review after we confronted both with the disagreements. This round is the design we're actually going to build.
+
+### R3 reviewer one - initial headline
+
+- Affirms the core move: delete the batch loop, fuse classify+rewrite, one drain actor, commit in one change.
+- CPU-budget floor refined: 295 s classify / 22 cores = 13.4 s (not the Q1-Q7 round's 12.3 s). Fused classify+rewrite ~375 s CPU / 22 cores ≈ 17 s wall floor.
+- Q1 state concentration: "concentrated but not splittable" - keep single drain actor, the happens-before edges are too tight.
+- Q3 memory: `PrimitiveBlock` shares Bytes with the decompress buffer via refcount, so per-worker steady state is ~3 MB × 22 ≈ 66 MB, not the 160-200 MB Q3 worried about. The concern dissolves.
+- Q4 backpressure under pathologically slow rewrite: bounded queues ~4× workers hold the slow blob; other workers keep producing past it within capacity.
+- Q5 sequencing: "do it in one commit" - decomposition doesn't buy measurability because the batch barrier is the thing being deleted.
+- Proposed priorities:
+  - P1: streaming pipeline + fused workers (one commit).
+  - P2: merge worker-pool output reorder with `PbfWriter`'s reorder via a "pre-ordered input" entry point on the writer.
+  - P3: kill per-task `BlockBuilder::new()`, use thread-local `BlockBuilder`s (folded into P1 as a design point).
+  - P4: use `IndexedReader` schedule instead of header walk (save ~15s startup).
+  - P5: prefill folds into P1's worker pool.
+  - P6: per-group raw-byte splice for low-modification rewrite blobs (follow-up).
+  - P7: eliminate double-classify of unindexed blobs (low value, `--force` only).
+
+### R3 reviewer two - initial headline
+
+- Confirms the core move.
+- Corrects R2's own earlier 12.3 s floor to 13.4 s; fused floor ~17 s.
+- **Sharpens the reshape: descriptor-first, not RawBlobFrame-first.** The scanner emits per-blob descriptors `(seq, frame_start, frame_len, data_offset, data_size, index, tagdata)`. Workers pread body bytes only for actual overlap candidates. `parallel_reader.rs` in its current RawBlobFrame-first shape gets deleted, not wrapped - it is the wrong boundary type.
+- `IndexedReader` is not a shortcut: [`src/read/indexed.rs`](../src/read/indexed.rs) walks headers sequentially and stores only blob offsets + decoded ID ranges, not the frame/data/tagdata schedule descriptor-first needs. [`src/read/header_walker.rs::HeaderWalker`](../src/read/header_walker.rs) is the right primitive.
+- Don't bundle a `PbfWriter` rewrite into this commit - "pre-ordered input" entry point is a reasonable follow-up after streaming lands, not part of the main landing.
+- "80.7 GB churn goes away" is too strong: persistent `BlockBuilder`s eliminate per-task builder allocation, but `Vec<OwnedBlock>`, encode buffers, framing allocations still exist unless you also pool those boundaries.
+- Channels are not the problem in the abstract. Removing mpsc is a design consequence of removing batch barriers, not a goal in itself. A good streaming design still needs bounded queues + explicit backpressure.
+- **Optimize unapologetically for indexed input**, treat `--force` / no-indexdata as a fallback path. Don't warp one universal pipeline around both modes.
+- **Cursor-rule invariant is a silent-break risk**: `rewrite.rs`'s rewrite slot advances the cursor past `blob_osm_last_key(min_id, max_id)` only for Rewrite slots (inline upserts are emitted as elements during the rewrite). Passthrough/FalsePositive slots don't touch the cursor so inline upserts in that ID range become gap creates on the next same-type blob. A uniform cursor-advance rule under streaming silently breaks the contract.
+- Byte-budget backpressure, not count - CopyRange descriptors are tiny (~32 bytes), rewritten payloads are large (~500 KB).
+- Local fix worth landing: `classify_only()` currently does Vec → `Bytes::from` → `PrimitiveBlock::new` which copies again; switch to `from_vec_with_scratch` / `from_vec_pooled_with_scratch`.
+
+### R1 responds to R2 (concessions + pushbacks)
+
+**Large concessions:**
+
+- Descriptor-first is correct. R1 admits conflating "body is preread" with "batch barrier" as one problem when they're two. ~85 GB of wasted pread+memcpy per run on a 92 GB input at planet is the body-pread cost that descriptor-first eliminates.
+- Byte-budget reorder, not count - conceded without argument.
+- Cursor-rule invariant is a silent-break risk - upgrade to explicit property-test target.
+- Prefill folding promoted from P5 to P2 - matches R2's framing.
+- "Optimize unapologetically for indexed input" - agrees, drops their P4 (`IndexedReader`) since R2 pointed out it doesn't have the schedule shape anyway.
+- `classify.rs` framing softened: `Bytes::from(Vec<u8>)` is O(1) refcount bump, not a literal second copy. Real fix is scratch reuse via `from_vec_with_scratch`, not copy elimination. Both reviewers converged on the fix.
+
+**New design constraint R1 caught that R2 didn't address:**
+
+- **`--direct-io` output is incompatible with `copy_file_range`.** On the `--direct-io` path, the drain side still needs body bytes because the kernel-space splice isn't available. Descriptor-first is correct on default buffered / io_uring; on `--direct-io` the drain must tell workers to pread the body and the payload flows through the worker → drain channel. This is a drain-side policy asymmetry, not a reader-side one.
+
+**Pushback R1 maintains:**
+
+- **Worker-emits-framed-bytes under `--compression none`**: R2 says defer; R1 says the current chain under `--compression none` is worker → drain → `write_primitive_block_owned` → `rayon::spawn` → `frame_blob_into` (memcpy) → writer_thread reorder → sink. That's two thread hops and one useless rayon spawn per rewritten blob for a memcpy. Once the drain is the ordered delivery point, calling back into the writer's reorder is redundant. R1's concession: land P1 without it, measure, add as P1.5 if writer chain shows as next ceiling; R1 bets it will.
+- **`copy_file_range` coalescing must land in same commit as P1**, not as a follow-up. Without coalescing, descriptor-first issues ~120k individual `write_raw_copy` calls at planet; the whole point of descriptor-first is making `copy_file_range` efficient. Port the contiguous-range coalescer from [`src/commands/altw/passthrough.rs`](../src/commands/altw/passthrough.rs).
+
+### R2 responds to R1 (convergences + remaining disagreements)
+
+**Convergences confirmed:**
+
+- Batch loop is the real floor, not the batch size.
+- Drain actor should stay single-threaded - one ordered state machine, not two.
+- No halfway version preserving the batch barrier is worth landing.
+
+**Remaining R2 positions after R1's rebuttal:**
+
+- **Descriptor-first means the scanner itself fast-paths non-overlap indexed blobs into the ordered stream** - they never reach the worker pool at all. R1's revised sketch had workers pread body only for overlap candidates but still routed all descriptors through workers; R2 is more explicit that passthrough descriptors bypass the worker pool entirely. At ~92% passthrough ratio at planet, this puts most of the blob traffic straight from scanner to drain without any worker touching them.
+- **`IndexedReader` is not a shortcut** - this is a factual correction, not a preference. The schedule shape R1 envisioned doesn't exist in `indexed.rs`; `HeaderWalker` is the right primitive.
+- **Don't rewrite the writer pipeline in this commit.** R1's "pre-ordered input" entry point on `PbfWriter` is a reasonable follow-up; not a first-landing item. Feed the existing `PbfWriter` as-is from the drain actor; if writer ordering becomes the new floor after the rewrite, add pre-ordered mode then.
+- **"80.7 GB churn goes away" is too strong.** Persistent `BlockBuilder`s help, but `Vec<OwnedBlock>` output in [`rewrite_block.rs`](../src/commands/apply_changes/rewrite_block.rs), block encode buffers in [`block_builder.rs`](../src/write/block_builder.rs), and framing allocations still exist unless you also pool those boundaries. Plan for reduction, not elimination.
+- **Channels are not the problem in the abstract.** A good streaming design still needs bounded queues + explicit backpressure; removing mpsc is a consequence of removing batch barriers, not a goal.
+
+### Synthesized design (the one we're going to build)
+
+Convergence after both rebuttals is ~95%. The design below is what we commit.
+
+**Scanner** (single thread, driven by [`HeaderWalker`](../src/read/header_walker.rs)):
+- Emits one descriptor per OsmData blob: `(seq, frame_start, frame_len, data_offset, data_size, index, tagdata, kind, id_range)`.
+- Does NOT read blob bodies.
+- **Scanner fast-path**: for blobs with indexdata whose `id_range` doesn't overlap the diff, emit the descriptor as a `Passthrough(CopyRange)` variant routed directly into the ordered drain stream. Never reaches the worker pool. At planet ~92% of blobs qualify.
+- Overlap candidates emit as `Candidate` and go to the worker pool via a bounded dispatch channel.
+
+**Worker pool** (long-lived, `nproc - 2`):
+- Each worker owns thread-local `BlockBuilder` + decompress scratch + parse scratch. No per-blob `BlockBuilder::new()`.
+- Per-blob work: pread body → decompress (scratch reuse) → parse via `from_vec_with_scratch` (no extra copy) → precise check.
+  - **False positive**: drop the body, emit a `Passthrough(CopyRange)` to the drain.
+  - **Actual overlap**: rewrite inline using the persistent `BlockBuilder`, emit `Rewritten(blocks)` (or framed bytes if P1.5 lands) to the drain.
+- For `--locations-on-ways`, workers decompressing node blobs opportunistically extract coords for `needed_set` IDs into per-worker `FxHashMap<i64, (i32, i32)>` accumulators.
+
+**Drain actor** (single thread):
+- Byte-budget reorder buffer keyed by global seq. Start ~128 slots + byte permits; tune after measuring.
+- Owns `UpsertCursors`, `last_type`, gap-create `BlockBuilder`, passthrough coalescer, `MergeStats`, writer handle.
+- Pulls items in seq order. For each item:
+  - Type transition (`last_type != item.kind`): flush passthrough coalescer, call `flush_remaining_upserts` (existing logic in [`stream_output.rs`](../src/commands/apply_changes/stream_output.rs) ports verbatim).
+  - Gap creates (`cursor` has upserts with `id < item.min_id`): flush coalescer, call `emit_gap_creates`.
+  - `Passthrough(CopyRange)`: extend the contiguous-range coalescer; flush when a non-passthrough item arrives or when a gap/transition forces it.
+  - `Rewritten(blocks)`: flush coalescer, then hand each block to the writer via the existing output-side path.
+  - **Cursor advancement**: only on Rewrite items (matching current behavior). Passthrough/FalsePositive items do NOT touch the cursor - inline upserts in the blob's ID range correctly become gap creates on the next same-type blob.
+- Merges per-worker coord maps into `Arc<loc_map>` at the node→way boundary; signals the scanner to begin dispatching way-blob descriptors only after the merge publishes (see "Node→way barrier ownership" below).
+
+**Node→way barrier ownership** (explicit, scanner-side):
+
+- The scanner, not the drain, enforces the barrier. As soon as the scanner sees its first way-blob descriptor, it stops dispatching to the worker pool and buffers subsequent way/relation descriptors in a pending queue. It continues emitting already-seen node-blob descriptors to the worker pool.
+- When the last node-blob descriptor's result has been drained, the drain merges the per-worker coord maps and publishes `Arc<loc_map>`; it then signals the scanner (via a `nodes_done` atomic flip or a `oneshot::Sender<Arc<loc_map>>` depending on shape).
+- The scanner receives the signal, swaps in the published `loc_map`, and begins flushing its buffered way/relation descriptors to the worker pool.
+- **Why scanner-side and not drain-side:** relying on the drain "noticing" the `blob.kind` transition in the seq stream allows a way-blob worker to start classify concurrently with a still-in-flight node-blob worker, because the drain sees blobs in seq order but workers start them as soon as the dispatcher emits them. The barrier has to sit ahead of dispatch, not behind it. Ownership is in the scanner/dispatch path because that's the only place that can withhold work from the worker pool.
+- At channel close, runs the existing `types_to_flush` match for trailing creates.
+
+**`copy_file_range` coalescing** (ported from [`altw/passthrough.rs`](../src/commands/altw/passthrough.rs)):
+- Drain actor accumulates a contiguous byte range from consecutive `Passthrough(CopyRange)` items.
+- Flushes as a single `write_raw_copy(input_fd, range_start, range_len)` when the range is broken (non-passthrough item, different kind, gap create, or buffer cap).
+- Without this, descriptor-first issues ~120k individual `write_raw_copy` calls at planet and underperforms. **Lands in the same commit as P1.**
+
+**`--direct-io` fallback** (drain-side policy):
+- When the output backend can't splice (direct-io output, `use_copy_range == false`), the scanner tags passthrough descriptors as "needs-pread" based on the output-backend decision made at `merge()` setup time. Tagged descriptors are routed to a dedicated pread helper (the worker pool, or a small dedicated helper pool) that preads the **full framed bytes** from `(frame_start, frame_len)` - not just the blob body. Workers emit `Passthrough(OwnedBytes(Vec<u8>))` carrying the complete frame.
+- Rationale for full-frame pread (R3R2, 2026-04-20): preads only the body, the drain would have to re-assemble the frame header before writing, re-encoding tagdata / indexdata / length prefix. Preading the full frame preserves the exact on-disk bytes and the drain path becomes `write_raw_owned(frame_bytes)` with zero byte reconstruction. Same work, simpler shape.
+- Drain writes via `write_raw_owned` or the coalescing passthrough buffer (`write_raw_chunks`) as appropriate.
+- Preserved asymmetry: one scanner shape, two drain-side output paths (CopyRange on splice-capable backends, OwnedBytes of full frames on direct-io).
+
+**`--force` / no-indexdata fallback**:
+- Descriptors have `index: None`. Scanner fast-path can't fire (no range info). All descriptors flow to the worker pool.
+- Workers decompress to scan (existing `scan_block_ids` path), then precise check / rewrite.
+- Reduced fast-path coverage, same correctness.
+
+**`--compression zlib:6` path**:
+- Works unchanged under the design. Rewritten blocks go through the existing writer compression pipeline. Writer-side compression contention may show as the new floor at zlib:6 scale; P1.5 worker-emits-framed-bytes addresses it but is deferred.
+
+### Remaining live disagreements
+
+1. **`copy_file_range` coalescing in the first commit or as a follow-up?** R1 says same commit (without coalescing, descriptor-first issues ~120k individual write_raw_copy calls at planet). R2 listed it as a local change. **Resolution: same commit.** R1's concrete argument wins on the merits and the coalescer is a straight port from ALTW.
+2. **Worker-emits-framed-bytes in v1 or P1.5?** R1 bets it's needed under `--compression none`; R2 says defer until measurement confirms. **Resolution: land P1 without it; if post-landing bench shows writer chain dominating, add as P1.5.** Measurement decides, same commit boundary either way.
+
+### New correctness invariants surfaced this round
+
+Added to the "Correctness invariants" section:
+
+- **Cursor-rule advancement difference** (silent-break risk). Rewrite slots advance the cursor past `blob_osm_last_key(min_id, max_id)` inside the rewrite. Passthrough/FalsePositive slots do NOT touch the cursor - inline upserts in that ID range become gap creates on the next same-type blob. A uniform cursor-advance rule under streaming silently breaks the contract.
+- **`--direct-io` fallback**: workers pread body bytes when the output backend can't splice. Drain-side policy, not reader-side.
+- **Scanner fast-path correctness**: passthrough descriptors for non-overlap indexed blobs never decompress the body. The descriptor must carry enough metadata (kind, id_range, frame_start, frame_len, index, tagdata) for the drain actor's type-transition, gap-create, and coalescing logic without referring back to the body.
+- **Node→way transition barrier** (under prefill fusion): no way-blob classify work may execute before the per-worker coord maps are merged into `Arc<loc_map>`. Ownership is **scanner-side**: the scanner holds way/relation descriptors in a pending queue after the first way-blob is seen, and only begins dispatching them once the drain publishes the merged `loc_map` and signals ready. See "Node→way barrier ownership" in the Synthesized design.
+
+### Scope estimate (updated)
+
+Not the Q1-Q7 round's "~300 lines deleted / ~400 added" estimate. With descriptor-first and scanner-level fast-path:
+
+- **Delete:** [`parallel_reader.rs`](../src/commands/apply_changes/parallel_reader.rs) entirely (~330 lines); the batch loop inside `rewrite.rs::merge()` (~320 lines); `node_locations.rs::prefill_from_base` (~50 lines, the whole extra scan).
+- **Add:** new `scanner.rs` module with `HeaderWalker` descriptor emission + fast-path routing (~120 lines); new `streaming.rs` with worker pool + dispatch (~180 lines); new `drain.rs` with the ordered drain actor (~300 lines, most of gap-create / type-transition / coalescing logic ports verbatim from `stream_output.rs`); descriptor types (~50 lines).
+- **Modify:** `rewrite.rs::merge()` becomes a thin orchestrator (setup + spawn scanner + spawn workers + spawn drain + join, ~100 lines); `classify.rs::classify_only` loses its fast-path branch (scanner owns it now) and becomes slow-path-only - decompress + parse + precise check + rewrite dispatch; switches to `from_vec_with_scratch` for the parse.
+
+Net scope: ~650-700 lines added, ~700 deleted. Larger delta than the Q1-Q7 synthesis estimated, because descriptor-first deletes `parallel_reader.rs` outright and splits the design across new modules. Net LOC roughly flat; architecture change is load-bearing.
+
+### Cross-validation plan
+
+- **Denmark**: `brokkr verify merge --dataset denmark` must pass byte-for-byte against current main output.
+- **Europe**: byte-for-byte against current main output on 38 GB altw + OSC 4715, plus hash compare.
+- **Planet**: `--bench 1` first; if result lands in 40-55 s range, `--bench 3` for tighter numbers.
+- **Property tests** (new, added before landing):
+  - **Cursor-rule**: passthrough blob whose ID range contains an upsert that should become a gap create on the next same-type blob. Output-diff vs current implementation.
+  - **Empty-base-PBF**: `last_type == None` forever; trailing creates flush all three kinds per existing `types_to_flush` match.
+  - **`--direct-io` parity**: output identical to buffered path on Denmark.
+  - **`--force`**: output identical to indexed path on Denmark (the scanner fast-path hit-rate differs but that doesn't affect output).
+  - **`--locations-on-ways` prefill fusion**: way-blob with OSC-created way referencing both in-base and in-diff node IDs; coords resolve correctly from the fused loc_map.
+
+### Abort / pivot plan (R3R1)
+
+The 40-55 s target rests on the batch-barrier-as-bottleneck hypothesis. If the first planet `--bench 1` after P1 lands and the wall doesn't drop anywhere near 40-55 s, the hypothesis is falsified and something other than the batch barrier is limiting classify throughput. **Concrete abort threshold: if planet `--bench 1` at P1 lands at >80 s wall, stop and diagnose before iterating.** The diagnostic to read first: `merge_classify_decompress_ns` cumulative in the new shape.
+
+- Decompress is **70% of classify CPU today** (206 s of 295 s measured at `e49b6182`, per the #4 section below). If `merge_classify_decompress_ns` in the new shape is still ~206 s cumulative, the worker pool is saturating cores with decompress work and the theoretical floor is ~206/22 ≈ 9.4 s wall - the 17 s fused floor is consistent with that. If post-P1 wall sits near the floor, descriptor-first + fused worker dispatched decompress efficiently.
+- If `merge_classify_decompress_ns` in the new shape has *not* dropped proportionally with wall (i.e. decompress CPU is the same but workers aren't saturating), worker dispatch isn't feeding the pool evenly - the scanner's fast-path/slow-path split is leaving cores idle on the slow-path side. Look at per-worker CPU counters; rebalance dispatch.
+- If `merge_classify_decompress_ns` has dropped but wall still hasn't, something downstream of classify (drain actor contention, writer chain, scanner throughput, reorder buffer starvation) is the new bottleneck. The byte high-water counters on the new queues (see Memory budget section) tell us which channel is starving.
+
+**Revert criterion:** if after one round of targeted diagnosis and tuning the wall is still >80 s on planet, revert P1 cleanly and escalate to another review round. Don't let the branch sit at a regression while we speculate.
+
+### Architectural value vs wall-clock value at planet daily `--compression none` (R3R1 honesty pass)
+
+Worth naming explicitly because the plan's framing can read as "descriptor-first saves 85 GB of IO." It does, in the sense that those 85 GB of body bytes no longer traverse the userspace pipeline - but:
+
+- `merge_reader_blocked_sends = 0.92%` and `merge_consumer_recv_wait_us = 3.1%` at planet today. The reader isn't the bottleneck. Skipping the 85 GB userspace body read reduces IO+memcpy wall by "maybe a few seconds" (R3R1) - not the apparent ~85 GB / NVMe-bandwidth headline.
+- Potential downside: skipping the userspace pre-read may cost page-cache warmth for the subsequent kernel-side `copy_file_range`. Unquantified; measurement will tell.
+- **The real value of descriptor-first at planet daily `--compression none` is architectural**: it's the correct boundary type once the scanner-fast-path bypass is in place; it makes contiguous `copy_file_range` coalescing clean to express; and it collapses the worker pool's load to only the ~8% of blobs that need it, which is what unlocks the fused classify+rewrite floor.
+- Under `--compression zlib:6` or at weekly OSC scale, body reads would be on the critical path and descriptor-first's IO reduction becomes real wall-clock savings. At planet daily `--compression none`, it's about design correctness enabling the other wins, not direct IO savings on this workload.
+
+Acknowledging this honestly doesn't change the plan; it does change the headline attribution. Post-landing, if the wall is at ~45 s, most of the 100 s of savings is from removing the batch barrier + fused rewrite, not from skipping body reads.
+
+### Estimated outcomes
+
+- **Wall at planet daily, `--compression none`**: 144.4 s → **40-55 s** (both reviewers' estimate; CPU-budget floor ~17 s fused, plus ~10 s OSC+prefill+setup, plus ~10-20 s writer I/O running concurrent with workers).
+- **Peak RSS**: ~2.0-2.7 GB. Lower than today's batch-wide retention pattern because workers hold only single blob state, not batch-wide `PrimitiveBlock` + job + received vectors. Per-worker steady state ~7-10 MB (not ~3 MB - see Memory budget section for the R3R1 correction on rewrite-side allocations).
+- **Alloc churn**: significant reduction (persistent `BlockBuilder` eliminates the 80.7 GB per-run churn bucket) but not elimination (`Vec<OwnedBlock>`, encode buffers, framing allocations remain unless also pooled - defer to post-landing if RSS matters).
+- **Weekly OSC**: ~70-90 s with streaming + prefill fusion + parallel OSC parse (the last one is a separate workstream, not part of P1). Current weekly estimate ~250 s+.
+
+### What this round changed vs the Q1-Q7 synthesis
+
+| Item | Q1-Q7 position | R3 synthesized position |
+|---|---|---|
+| Scanner shape | Wrap existing `parallel_reader.rs`, swap consumer | Delete `parallel_reader.rs`; descriptor-first HeaderWalker scanner |
+| Blob body handling | Workers pread every blob body | Workers pread only overlap candidates (~8% at planet); passthrough bypasses worker pool |
+| Boundary type | `RawBlobFrame` carries bytes everywhere | `Descriptor` carries metadata; bytes carried only when needed (overlap worker, `--direct-io` fallback) |
+| `PbfWriter` reorder | Consider "pre-ordered input" entry point | Keep as-is; revisit only if writer shows as new floor |
+| `copy_file_range` coalescing | Listed as opportunistic follow-up | **Same commit as P1** (R1's argument wins) |
+| Alloc churn claim | "80.7 GB vanishes" | Significant reduction, not elimination (R2's pushback) |
+| Reorder capacity | ~4× workers, count-based | ~128 slots + byte permits (CopyRange tiny, Rewritten large) |
+| Cursor invariants | "port `types_to_flush` verbatim" | Explicit property-test target for Rewrite vs Passthrough/FalsePositive advancement difference |
+| `--direct-io` fallback | not addressed | Drain-side policy: workers pread body when output can't splice |
+| Prefill fusion | Q4 follow-up after streaming | P2, part of P1 worker pool (both reviewers converged) |
+| `classify_only` parse copy | not noticed | Switch to `from_vec_with_scratch` inside P1's worker |
+
 ## What to leave alone
 
-- **The rewrite hot path** (`rewrite_block_parallel`, `emit_create_local`, `write_base_*_local` family). Already uses `pre_seed_string_table` to avoid re-interning, `add_way_raw_bytes_with_locations` to forward raw fields 9/10 byte-for-byte, and `add_relation_raw_bytes` to skip re-parsing members. This path is tightly written.
-- **The pipelined writer** (`PbfWriter` + rayon compression + 64 permits). Under `--compression none` the rayon tasks become near-passthrough, but the structure is still correct and sized.
-- **The coalescing passthrough buffer** ([rewrite.rs:812](../src/commands/merge/rewrite.rs#L812)). Collapses consecutive raw-frame writes into single sends. Correct at 70-90 % rewrite ratio (small fraction of bytes, but the collapse still matters for channel send overhead).
-- **`NodeLocationIndex.locations` as `FxHashMap<i64, (i32, i32)>`.** Lookups are only for OSC ways (few million at daily scale), not base-way refs. Base ways forward their existing fields 9/10 via `write_base_way_local_with_locations`. HashMap at ~240 MB for 10 M entries is the right shape for sparse lookup.
-- **`DiffRanges` sorted vecs + `partition_point`.** Already the right shape for range-overlap and inline upsert assignment.
-- **`CompactDiffOverlay` / OSC parse.** Single-threaded but small (100-500 MB input, ~1-5 s); not on the critical path.
-- **`UpsertCursors` + gap-create / trailing-create logic.** Complex but correct; sequential constraints are fundamental to preserving OSM ID order across passthrough boundaries.
-- **Per-rayon-task `PrimitiveBlock` drop** ([rewrite.rs:905](../src/commands/merge/rewrite.rs#L905)). Already frees memory eagerly. No change.
-- **`#[cfg(feature = "hotpath")]` phase timers.** Existing measurement scaffolding. Flip them on for the first post-#2 / post-#3 measurement runs.
+These are the parts of today's code that survive P1 unchanged. The batch-loop machinery itself does *not* survive; it's on the delete list inside P1.
+
+- **The rewrite hot path** (`rewrite_block_parallel`, `emit_create_local`, `write_base_*_local` family). Already uses `pre_seed_string_table` to avoid re-interning, `add_way_raw_bytes_with_locations` to forward raw fields 9/10 byte-for-byte, and `add_relation_raw_bytes` to skip re-parsing members. This path is tightly written. P1's workers call `rewrite_block_parallel` directly from inside the worker loop with a thread-local `BlockBuilder` instead of a fresh per-task builder.
+- **The pipelined writer** (`PbfWriter` + rayon compression + 64 permits). Under `--compression none` the rayon tasks become near-passthrough, but the structure is still correct and sized. R1's "pre-ordered input" entry point on `PbfWriter` is explicitly deferred to P1.5 / follow-up; P1 feeds the existing writer as-is.
+- **The coalescing logic in [`stream_output.rs`](../src/commands/apply_changes/stream_output.rs)** - `coalesce_passthrough`, `emit_gap_creates`, `flush_remaining_upserts`, `has_gap_creates`, `emit_create_for_output`. Ports to the drain actor near-verbatim; these functions *are* the drain actor's state machine.
+- **`NodeLocationIndex.locations` as `FxHashMap<i64, (i32, i32)>`.** Lookups are only for OSC ways (few million at daily scale). HashMap at ~240 MB for 10 M entries is the right shape for sparse lookup. Under P1 the map is populated by fused extraction in the worker pool (prefill phase deleted) but the map shape survives.
+- **`DiffRanges` sorted vecs + `partition_point`.** Already the right shape for range-overlap (scanner uses it) and inline upsert assignment (worker uses it).
+- **`CompactDiffOverlay` / OSC parse.** Single-threaded but small (100-500 MB input, ~1-5 s); not on the critical path at daily scale. Weekly scale needs parallel OSC parse but that's a separate workstream.
+- **`UpsertCursors` + gap-create / trailing-create logic.** Complex but correct. Moves to the drain actor under P1; the sequential constraints are fundamental to preserving OSM ID order across passthrough boundaries.
+- **`#[cfg(feature = "hotpath")]` phase timers.** Existing measurement scaffolding. Keep enabled through the P1 measurement runs.
+
+### Parts that explicitly DO NOT survive P1
+
+- **The batch loop in `merge()`** (~320 lines from `rewrite.rs:329-640`). Deleted.
+- **[`parallel_reader.rs`](../src/commands/apply_changes/parallel_reader.rs)** (the whole file, ~330 lines). The RawBlobFrame-first boundary type is wrong under descriptor-first.
+- **`NodeLocationIndex::prefill_from_base`** (~50 lines). Fused into the P1 worker pool's node phase; the separate pass is deleted.
+- **`classify.rs::classify_only`'s fast-path branch** (lines checking `frame.index` for range-overlap). Scanner owns the fast-path now; the worker-side classify becomes slow-path only.
+- **`collect_batch` + `BATCH_MAX_BLOBS` + `MERGE_BATCH_BYTE_BUDGET`.** Gone - no batches.
+- **The per-batch `rayon::spawn` rewrite dispatch** (the whole `for (job_idx, job) in rewrite_jobs.into_iter().enumerate()` loop). Gone - workers hold persistent `BlockBuilder`s and rewrite inline.
+- **The per-batch `received: Vec<Option<RewriteOutput>>` reorder buffer.** Gone - replaced by a single global byte-budget reorder buffer in the drain actor, keyed by global seq not per-batch slot.
 
 ## Plan of attack
 
@@ -832,19 +1072,49 @@ Both reviewers: **streaming pipeline is still the right first move at weekly sca
 5. ~~**Bump classify batch size**~~ **Landed 2026-04-18 (`bfac63b`) - 512 MB merge batch budget.** Raised average batch from ~13 to ~18 overlap blobs but classify wall was unchanged (72.5 s vs 70.3 s). **Diagnosis from external review: the plateau is structural to the batch barrier, not fixable with batch-size knobs** - see "External review synthesis" section.
 6. ~~**Parallel reader (#3)**~~ **Landed 2026-04-18 (`c97d6b5` streaming variant)**. Net-zero wall change vs sequential reader. Kept as infrastructure for the streaming pipeline below.
 7. ~~**Cheap disambiguation experiment**~~ **Attempted + reverted 2026-04-18.** `rayon::scope` + per-batch spawn + mpsc + ReorderBuffer regressed from ~140 s to 10 min+ at planet (Denmark verify passed). See "Cheap disambiguation experiment" subsection for post-mortem. Doesn't disprove the plateau hypothesis, but rules out this form of cheap check. **Going direct to streaming pipeline instead.**
-8. **Streaming pipeline + fuse classify+rewrite.** Delete the batch loop; replace with reader -> classifier-pool (fused decompress + precise + rewrite) -> reorder/gap-create actor -> writer. Main thread off the critical path. Estimated **40-55 s wall at planet daily** (from 140 s). See "Primary rewrite: streaming pipeline" subsection for risk inventory and CPU-budget walk.
-9. **Worker-emits-framed-bytes.** Small high-confidence commit after the streaming rewrite: change worker output from `Vec<OwnedBlock>` to `Vec<Vec<u8>>` framed via [`frame_blob_pipelined`](../src/write/writer.rs#L1102) on the worker. Frees the `PIPELINE_DISPATCH_PERMITS=64` cap; removes the writer's second rayon dispatch. See Q2 follow-up subsection.
-10. **Prefill fusion into streaming pipeline's node phase.** Classifier workers opportunistically extract coords for `needed_set` IDs while decompressing node blobs; reorder actor barriers the node→way transition and finalises `Arc<loc_map>`. Deletes prefill phase. Estimated **-5 s daily, -30 s+ weekly**. See Q4 follow-up subsection.
-11. **(weekly OSC only) Parallel OSC parse.** Parse each OSC concurrently into its own overlay; merge overlays newer-wins using [`IdSetDense::set_atomic_if_new`](../src/commands/id_set_dense.rs#L163) (walk newest-first, keep on `true`). Current [`load_all_diffs`](../src/osc.rs#L1036) serialises this. Estimated **-20-30 s wall at weekly scale**; no win at daily.
-12. **Splice-in-place for low-touch rewrites.** Follow-up to the streaming rewrite: for `NeedsRewrite` blobs with `<=K` affected elements, splice via raw-group passthrough instead of full decode + re-encode. Estimated **~1.5-2 s wall** at daily. Less valuable at weekly (more elements touched per rewrite blob).
-13. **`copy_file_range` coalescing from ALTW**, **alloc-optimised parse path** via [`src/read/block.rs:432`](../src/read/block.rs#L432). Opportunistic local shaves.
-14. **Writer path tuning** (direct-io vs `to_path_uring`). Only if post-streaming bench points there. Infrastructure is already wired in [`src/commands/mod.rs:864`](../src/commands/mod.rs#L864) + [`src/write/uring_writer.rs:1`](../src/write/uring_writer.rs#L1); flip the variant, don't grow queues.
-15. **Exact-membership metadata / sidecar.** Only if FalsePositives remain material after the streaming rewrite. Currently 16 % of slow-path blobs; not negligible but not headline either. Format/index project, not a quick cleanup.
-16. **Diff squashing as a formal upstream stage (reviewer 1, weekly only).** Consider making "squash N diffs to one final overlay / binary delta" a separate command that runs once per cadence and emits a single pre-merged diff that apply-changes then consumes as a daily. Shares the [`IdSetDense::set_atomic_if_new`](../src/commands/id_set_dense.rs#L163) newer-wins primitive with the in-pipeline parallel OSC merge (item 11). Orthogonal to the streaming rewrite but may be the right long-term shape if weekly is standard.
+8. **Descriptor-first streaming pipeline (P1, single commit).** See "Third review round + synthesis" above for full design. Headline bundle in one commit:
+   - New `scanner.rs` module: `HeaderWalker`-driven descriptor emission. Non-overlap indexed blobs routed as `CopyRange` descriptors **directly to drain**; overlap candidates routed to worker pool.
+   - New `streaming.rs` module: long-lived worker pool (`nproc - 2`), persistent thread-local `BlockBuilder` + scratch, slow-path only (decompress + parse via `from_vec_with_scratch` + precise check + rewrite inline or emit CopyRange for false positives).
+   - New `drain.rs` module (or extend `stream_output.rs`): single-threaded ordered drain actor. Owns `UpsertCursors`, `last_type`, gap-create `BlockBuilder`, passthrough coalescer (contiguous `copy_file_range` runs, ALTW pattern), stats accumulator, writer handle. Byte-budget reorder buffer keyed by global seq.
+   - Prefill fusion: workers extract coords into per-worker maps during node phase; scanner holds way/relation dispatch pending until drain publishes merged `Arc<loc_map>` (barrier is scanner-side, not drain-side; see "Node→way barrier ownership" in the Synthesized design). [`node_locations.rs::prefill_from_base`](../src/commands/apply_changes/node_locations.rs) deleted.
+   - `--direct-io` fallback: drain-side policy - workers pread body bytes when output can't splice; payload flows through worker → drain channel.
+   - `--force` fallback: descriptors have `index: None`; scanner cannot fast-path; all descriptors flow through worker pool.
+   - Delete [`parallel_reader.rs`](../src/commands/apply_changes/parallel_reader.rs), the batch loop in `merge()`, and the classify fast-path branch in [`classify_only`](../src/commands/apply_changes/classify.rs) (scanner owns fast-path now).
+   - `merge()` becomes a thin orchestrator (setup + spawn scanner + spawn workers + spawn drain + join).
+   - Property tests before landing: cursor-rule invariant (Rewrite vs Passthrough/FalsePositive advancement), empty-base-PBF trailing creates, `--direct-io` parity, `--force` parity.
+   - Cross-validation: Denmark `brokkr verify merge` byte-equal; Europe byte-equal + hash compare; planet `--bench 1` then `--bench 3`.
+   - **Target: 40-55 s wall at planet daily**, from 144.4 s baseline.
 
-Cross-validation: `brokkr verify merge --dataset denmark` (note: name is `merge`, not `apply-changes` - the subcommand in `brokkr verify` predates the rename). Otherwise: identical output PBF byte-for-byte after the primary merge batch; tail creates that get out-of-order under the existing implementation would be the same out-of-order set. Element-level diff (decompress, compare per-blob element lists sorted by ID) is the fallback.
+9. **P1.5 - Worker-emits-framed-bytes (conditional on post-P1 measurement).** R1 expects the writer chain becomes the new ceiling under `--compression none` after P1. R2 says measure first. Same commit boundary either way: land P1, measure, add worker-framed output (`frame_blob_pipelined` on the worker, drain hands framed bytes directly to `write_raw_owned`) if bench shows writer chain dominating. Two thread hops + one `rayon::spawn` per rewritten blob for a memcpy becomes one thread hop.
 
-## Memory budget (planet, post-#2 + #3)
+10. **(weekly OSC only) Parallel OSC parse.** Parse each OSC concurrently into its own overlay; merge overlays newer-wins using [`IdSetDense::set_atomic_if_new`](../src/commands/id_set_dense.rs) (walk newest-first, keep on `true`). Current [`load_all_diffs`](../src/osc.rs) serialises this. Estimated **-20-30 s wall at weekly scale**; no win at daily.
+
+11. **Splice-in-place for low-touch rewrites (follow-up).** For `NeedsRewrite` blobs with ≤K affected elements (K~64), splice the raw wire bytes for unmodified element runs instead of full decode+re-encode. Estimated ~1.5-2 s wall at daily, less valuable at weekly. Raw-group passthrough scaffolding in [`src/write/raw_passthrough.rs`](../src/write/raw_passthrough.rs) is the design surface.
+
+12. **Writer path tuning** (direct-io vs `to_path_uring`). Only if post-P1 bench points there. Infrastructure already wired in [`src/commands/mod.rs`](../src/commands/mod.rs) + [`src/write/uring_writer.rs`](../src/write/uring_writer.rs); flip the variant, don't grow queues.
+
+13. **Exact-membership metadata / sidecar.** Only if FalsePositives remain material after P1. Currently 16 % of slow-path blobs; not negligible but not headline either. Format/index project, not a quick cleanup.
+
+14. **Diff squashing as a formal upstream stage (weekly only).** Consider making "squash N diffs to one final overlay / binary delta" a separate command that runs once per cadence and emits a single pre-merged diff that apply-changes then consumes as a daily. Shares the `IdSetDense::set_atomic_if_new` newer-wins primitive with in-pipeline parallel OSC merge (item 10). Orthogonal to P1.
+
+### Items folded into P1 (no longer separate)
+
+The following Q1-Q7 items are subsumed into the P1 single commit and do not land separately:
+
+- Q2 worker-framing: *not* folded; explicitly deferred to P1.5 based on measurement.
+- Q4 prefill fusion: folded into P1's worker pool.
+- Q5 trailing creates: port the existing `types_to_flush` match verbatim to the drain actor.
+- Q6 bounded backpressure: byte-budget reorder buffer + bounded channels in the P1 design.
+- `copy_file_range` coalescing: folded into P1 (R1's same-commit argument won).
+- Thread-local `BlockBuilder`: folded into P1 worker pool as a design point.
+- `classify_only` parse via `from_vec_with_scratch`: folded into P1 worker slow-path (no separate commit).
+- `scan_block_ids` skip when indexdata present: already landed `da1c45e`; scanner fast-path at scanner level further obsoletes the in-worker branch.
+
+Cross-validation harness: `brokkr verify merge --dataset denmark` (note: name is `merge`, not `apply-changes` - the subcommand in `brokkr verify` predates the rename). P1 cross-validation plan is in the "Third review round + synthesis" section above; element-level diff (decompress, compare per-blob element lists sorted by ID) is the fallback when byte-equality fails due to blob boundary shifts.
+
+## Memory budget
+
+### Current (planet, post-#2, commit `52c2c4b`)
 
 | Component | Size |
 |---|---:|
@@ -852,46 +1122,74 @@ Cross-validation: `brokkr verify merge --dataset denmark` (note: name is `merge`
 | `NodeLocationIndex.locations` | ~200-500 MB |
 | `DiffRanges` sorted vecs | ~50-100 MB |
 | Per-worker pread + decompress buffers × ~6 | ~200-400 MB |
-| Per-worker prefill `FxHashMap` (transient, phase #2 only) | ~50-300 MB |
 | Writer pipeline + reorder buffer | ~200-500 MB |
-| **Total** | **~1.8-2.5 GB** |
+| **Measured total** | **~1.8 GB** |
 
-Unchanged from current 1.8 GB, or slightly higher during phase #2 merge. Host budget: irrelevant under 30 GB ceiling.
+### Projected (post-P1 descriptor-first)
 
-**Sizing robustness note.** None of the structures above scale with `unique_referenced_nodes` the way the failed [altw-as-renumber](altw-as-renumber.md) `coord_table` did. `NodeLocationIndex` scales with the OSC's own node-ref set (daily-diff-sized, bounded), not with the base PBF's population. No structure here depends on an estimate of the planet-scale referenced-node count. That is why this plan's recommendations survive the 2026-04-16 ALTW reshape failure unchanged.
+The Q1-Q7 round's carve-up assumed RawBlobFrame-first (every blob carries compressed body bytes through the worker pool). Descriptor-first changes the picture: ~92% of blobs flow from scanner directly to drain as ~32-byte CopyRange descriptors without ever visiting a worker. Workers only ever hold slow-path blobs (~8% of traffic).
 
-### Memory budget (projected, post-streaming rewrite)
-
-Reviewer 2's carve-up of the ~1 GB in-flight pipeline budget (copy of the table from the Q6 follow-up subsection, duplicated here for discoverability):
-
-| Stage | Channel | Capacity | Per-item UB | Budget |
+| Stage | Item | Capacity | Per-item UB | Budget |
 |---|---|---:|---|---:|
-| Reader → Classifier | `(seq, RawBlobFrame)` | 64 | ~1 MB compressed | 64 MB |
-| Classifier workers in flight | decompress buf + `PrimitiveBlock` + rewrite scratch | 22 | ~20 MB | 440 MB |
-| Classifier → Reorder | `(seq, ClassifiedItem)` | 64 | ~4 MB rewritten / 1 MB passthrough | ~128 MB |
-| Reorder → Writer | `PipelineItem` | `WRITE_AHEAD=32` | ~4 MB | 128 MB |
-| Writer buffered | `BufWriter` + uring buffers | - | - | ~16 MB |
-| **Pipeline total** | | | | **~780 MB** |
+| Scanner → Drain (fast-path) | `CopyRange` descriptor | byte-budget ~16 MB | ~32 bytes | ~16 MB |
+| Scanner → Workers (slow-path) | `Candidate` descriptor | byte-budget ~2 MB | ~32 bytes | ~2 MB |
+| Workers in flight | decompress buf + parsed `PrimitiveBlock` + thread-local `BlockBuilder` + output `Vec<OwnedBlock>` | 22 workers × ~7-10 MB (see below) | ~7-10 MB | ~220 MB |
+| Workers → Drain | `CopyRange` or `Rewritten(blocks)` | byte-budget ~128 MB | ~32 B or ~4 MB | ~128 MB |
+| Drain internal | reorder buffer + passthrough coalescer + gap-create `BlockBuilder` | byte-budget keyed | mixed | ~64 MB |
+| `PbfWriter` (existing, unchanged) | `BufWriter` + uring buffers + internal reorder | - | - | ~16 MB |
+| Pre-loop phases | OSC overlay + DiffRanges + NodeLocationIndex | - | - | ~1.0-1.6 GB |
+| **Pipeline total projection** | | | | **~1.5-2.1 GB** |
 
-Plus the pre-loop phase structures above (OSC overlay, DiffRanges, NodeLocationIndex.locations): **~1.5-2.3 GB**. Plus pipeline **~780 MB**. Total projected RSS under streaming: **~2.3-3.1 GB**. Well under 28 GB host limit.
+**Per-worker RSS correction (R3R1, 2026-04-20):** the ~3 MB/worker initial estimate (Bytes refcount sharing between decompress buffer and parsed `PrimitiveBlock`) under-counts the rewrite side. The thread-local `BlockBuilder` carries its own `StringTable`, dense accumulators (DenseNodes id/lat/lon deltas, Way refs, Relation member_ids/types/roles), tag-key `FxHashSet`, and tag-key scratch buffers - all of which grow to blob-size. The rewrite path also produces `Vec<OwnedBlock>` output (block-bytes + indexdata + tagdata per output block, typically 2-3 per rewritten input blob). Realistic per-worker steady state under a rewrite blob: **~7-10 MB**, not ~3 MB. 22 workers × 10 MB ≈ 220 MB in flight. Still safe under 28 GB, but the reorder byte-budget should be sized from this number, not the optimistic one.
+
+### Trust measurement, not estimates (R3R2)
+
+The budget table above is a sizing check, not a contract. Add **byte high-water counters on every new queue and the reorder buffer** before the first planet bench:
+
+- `merge_scanner_to_drain_bytes_high_water` (CopyRange descriptor channel, fast-path)
+- `merge_scanner_to_workers_bytes_high_water` (Candidate descriptor channel, slow-path)
+- `merge_worker_inflight_bytes_high_water` (per-worker decompress + block + builder, summed)
+- `merge_workers_to_drain_bytes_high_water` (mixed CopyRange + Rewritten)
+- `merge_reorder_buffer_bytes_high_water` (drain's reorder, keyed by global seq)
+- `merge_passthrough_coalescer_bytes_high_water` (contiguous `copy_file_range` run in flight)
+
+Name the counters after the channel/structure that owns the bytes, not after an abstract "stage." When the first planet `--bench 1` lands, reading these against the table above tells us whether the estimates held or whether a channel is over/under-sized. Tune on evidence.
+
+Pipeline in-flight state is lower than the Q1-Q7 round's ~780 MB estimate because most blobs never touch a worker; per-worker working set is higher than the initial R3 estimate because rewrite allocations were under-counted. Net: ~450 MB in-flight state projection (~220 MB workers + ~130 MB worker→drain channel + ~80 MB drain internal + scanner channels ~20 MB), not ~280 MB.
+
+**Sizing robustness.** None of the structures above scale with `unique_referenced_nodes` the way the failed [altw-as-renumber](altw-as-renumber.md) `coord_table` did. `NodeLocationIndex` scales with the OSC's own node-ref set (daily-diff-sized, bounded), not with the base PBF's population.
 
 ## Correctness invariants
 
-- **OSM ID ordering.** The main batch loop emits passthrough blobs in file order, rewrite blobs in file order (via the reorder buffer on the rayon mpsc channel), and gap creates before their matching blob's `min_id`. Any parallelization of reader or prefill must preserve file-order output. Phase #3's refactor must keep the reorder buffer intact.
+- **OSM ID ordering.** Output emits passthrough blobs in file order, rewrite blobs in file order (via the reorder buffer keyed by global seq), and gap creates before their matching blob's `min_id`. Any parallelization of reader, scanner, or workers must preserve file-order output via the drain actor's reorder buffer.
 - **`LocationsOnWays` preservation on base ways.** `write_base_way_local_with_locations` forwards raw `lat_data()` + `lon_data()` verbatim. Do not touch this path. Under `--locations-on-ways`, every base way must produce fields 9/10 in the output; the existing logic does this by calling the `_with_locations` variant whenever `loc_map.is_some()`.
-- **Zero-coord fallback for missing node refs in OSC ways.** [rewrite.rs:67-70](../src/commands/merge/rewrite.rs#L67): `match locs.get(&node_id) { Some(&loc) => ..., None => locations.push((0, 0)) }`. Preserved under parallel prefill - the merged locations map has the same entries the sequential version would produce.
+- **Zero-coord fallback for missing node refs in OSC ways.** [element_writes.rs](../src/commands/apply_changes/element_writes.rs) (search for `locations.push((0, 0))`): `match locs.get(&node_id) { Some(&loc) => ..., None => locations.push((0, 0)) }`. Preserved under parallel prefill *and* under prefill fusion - the merged locations map (whether from a separate prefill phase or the fused worker-pool extraction) must have the same entries the original sequential prefill would produce.
 - **Straight `needed_set.contains` replaces `remove` in parallel prefill.** `contains` is cheaper than `remove`, and parallel workers cannot safely mutate a shared `FxHashSet`. Merge-at-end dedup covers the uniqueness semantic (a node hit by multiple workers will just insert the same `(lat, lon)` twice; last write wins, both values are identical).
-- **Early-exit via `all_found()`.** Currently lets the sequential pass stop once all needed IDs are resolved. Under parallel prefill, all workers will have already claimed blobs from the schedule by the time the last needed ID is found. Either drop the early-exit (workers complete their claimed blobs; filters at schedule-construction time have already pruned most non-overlapping blobs) or add an atomic "remaining-needed" counter polled every N tuples. Probably not worth the complexity - the `overlaps_needed` filter already prunes aggressively.
-- **`copy_file_range` path** on passthrough blobs ([rewrite.rs:960-970](../src/commands/merge/rewrite.rs#L960)). Under #3 the file offset must still be correct in the replacement schedule. The existing `frame.file_offset` field corresponds to `frame_offset` in the header-only scan - preserve this.
-- **Reader-thread graceful shutdown.** The current reader joins at [rewrite.rs:1063](../src/commands/merge/rewrite.rs#L1063). Under #3 there is no separate reader thread to join; the schedule is consumed by the workers themselves, and shutdown is when all workers exit their claim loop.
-- **Streaming-pipeline invariants (pending).** Under the streaming rewrite, the reorder actor becomes the owner of: file-order output emission, `UpsertCursors`, gap-create ordering (emit gap creates with `id < item.min_id` before the item), type-transition flush (when `last_type != current_item.kind`, flush remaining upserts of prev type), trailing-create flush on channel close (flush all kinds still not flushed, per existing [`rewrite.rs:1440-1453`](../src/commands/merge/rewrite.rs#L1440) match). Empty-base-PBF edge case (`last_type == None` forever) is covered by the existing `None` arm of `types_to_flush`; port it verbatim and write a test.
-- **Backpressure propagates to the scanner (pending).** Every channel in the streaming pipeline must be bounded. If writer stalls, its receiver fills → reorder actor send blocks → classifier-to-reorder send fills → workers stop pulling → reader channel fills → pread workers stop → scanner's dispatch send blocks → scanner stops. Any unbounded channel or `par_iter().collect()` introduction defeats the chain.
-- **Node→way transition barrier (pending, only if prefill fusion lands).** Under Q4 fusion, no way-blob worker may run before the per-worker coord maps are merged into `Arc<loc_map>`. The reorder actor detects `blob.kind` flipping from Node to Way in the seq-ordered stream and publishes the merged map atomically before releasing any way-blob classify work.
+- **`copy_file_range` path** on passthrough blobs (drain-side, gated on `use_copy_range`). Under descriptor-first, the file offset comes from the `CopyRange { frame_start, frame_len }` descriptor that the scanner emits directly. The drain actor coalesces consecutive contiguous ranges into a single `write_raw_copy` call (ALTW pattern). Preserve correct frame-boundary alignment.
+- **Cursor-rule advancement difference (silent-break risk, R3R2).** Rewrite slots advance `UpsertCursors` past `blob_osm_last_key(min_id, max_id)` because inline upserts in that range were already emitted as elements during the rewrite. Passthrough/FalsePositive slots do NOT touch the cursor - inline upserts in their ID range correctly become gap creates on the next same-type blob. A uniform cursor-advance rule under streaming silently breaks the contract. **Property test target before landing P1**: passthrough blob whose ID range contains an upsert; output must produce gap-create on the next same-type blob, byte-identical to current implementation.
+- **`--direct-io` fallback (drain-side policy, R3R1).** When the output backend can't splice (`copy_file_range` unavailable under direct-io output), workers must pread body bytes for descriptors that would otherwise become `CopyRange` and emit `Passthrough(OwnedBytes(Vec<u8>))` instead. Drain writes via the existing `write_raw_owned` / coalescing-passthrough path. Asymmetry: one scanner shape, two drain-side output paths. Property test: `--direct-io` parity vs buffered output on Denmark.
+- **Scanner fast-path correctness (R3R2).** Passthrough descriptors for non-overlap indexed blobs never decompress the body. The descriptor must carry enough metadata (`kind`, `id_range`, `frame_start`, `frame_len`, `index`, `tagdata`) for the drain actor's type-transition, gap-create, and coalescing logic without referring back to the body. The scanner's range-overlap check uses the same `DiffRanges::range_overlaps` predicate as today's classify fast-path.
+- **`--force` / no-indexdata fallback.** Descriptors have `index: None`. Scanner cannot fast-path; all descriptors flow through the worker pool. Workers decompress to scan (existing `scan_block_ids` path), then precise check. Reduced fast-path coverage, same correctness contract. Property test: `--force` parity vs indexed path on Denmark.
+- **Trailing creates** (port verbatim from current `merge()`'s `types_to_flush` match). Drain actor on channel close runs the existing match: `None | Some(Node)` → flush all three; `Some(Way)` → flush Way+Relation; `Some(Relation)` → flush Relation. Property test: empty-base-PBF case where `last_type == None` forever; trailing creates flush all three kinds.
+- **Backpressure propagates to the scanner.** Every channel in the streaming pipeline must be bounded by a byte budget (not count - CopyRange descriptors are tiny, Rewritten payloads are large). If writer stalls, drain receiver fills → worker→drain send blocks → workers stop pulling → scanner→workers dispatch fills → scanner blocks. Any unbounded channel or `par_iter().collect()` introduction defeats the chain.
+- **Node→way transition barrier (under prefill fusion).** No way-blob classify work may execute before the per-worker coord maps are merged into `Arc<loc_map>`. Drain actor detects `blob.kind` flipping from Node to Way in the seq-ordered stream and publishes the merged map atomically before releasing any way-blob dispatch.
+- **Scanner graceful shutdown.** Scanner emits a sentinel "end-of-input" marker on both fast-path and dispatch channels; drain finishes draining its reorder buffer; workers exit when dispatch closes. No worker may complete after drain receives the end-of-input marker for its slot.
 
 ## Open questions
 
-- **Actual current phase breakdown.** The numbers in this doc are inferred. First step (measurement) either confirms the ordering of #2 and #3 or flips it. If the reader thread is not actually I/O-bound at production NVMe speeds, #3's payoff shrinks.
-- **Does `overlaps_needed` prune as aggressively under a daily diff as estimated?** The 30-50 % overlap estimate is heuristic. If the actual overlap ratio is 70-80 %, prefill is genuinely most of a minute of serial work and #2 matters more. If it's 10-20 %, the serial cost is already small and #2 is marginal.
-- **Does `--compression none` leave phase 4 measurably free?** Under zstd or zlib, the writer pipeline's rayon compression tasks can dominate. Under `none`, they're near-passthrough. Worth confirming that phase 4 is not still a bottleneck under production settings (e.g. due to output file writes being synchronous to disk rather than to page cache).
-- **Does the prefill pre-pass RSS behave under parallel decompress?** Sequential prefill reuses one decompress buffer; parallel prefill needs one per worker (~16-32 MB × 6 = ~100-200 MB transient). Fine under 30 GB, but document the per-worker overhead for completeness.
-- **Interaction with `--io-uring`.** Current `spawn_reader_thread` uses `FileReader` (BufReader + File). Under #3's pread-schedule model, workers use `pread` directly; `--io-uring` would need to be plumbed into the worker's read path rather than the reader thread's. Check whether the existing io_uring integration is on the reader side or the writer side; if reader, #3 needs to preserve it.
+Items resolved by R3 + measurement are removed from this list. The remaining live questions are:
+
+- **Will worker-emits-framed-bytes be needed under `--compression none`?** R1 expects yes (the writer chain becomes the new ceiling); R2 says wait for measurement. Resolution path: land P1 without it, run planet `--bench 1`, look at writer counters. If the writer chain dominates remaining wall, add as P1.5 (~50-line change once the worker exists).
+- **Will the post-P1 wall actually land in 40-55 s, or will writer I/O become the dominant phase?** Both reviewers' CPU-budget walks assume writer I/O runs concurrent with workers and finishes inside the same wall window. ~92 GB output at NVMe write ceiling (~3 GB/s) is ~30 s wall - hidden behind the worker pool if pipelining is clean, exposed if not. Measurement question, not design question.
+- **What's the actual overlap-blob ratio at planet under different OSC sizes?** Plan-doc estimates ~8% for daily; needs confirmation post-P1 because it's the load on the worker pool. At 20% the worker pool needs more cores; at 4% the scanner's fast-path dominates and the worker pool is mostly idle.
+- **What's the right initial value for the byte-budget reorder capacity?** R2 suggested ~128 slots + byte permits. If under-sized, workers block on slow rewrites; if over-sized, RSS spikes during straggler tails. Tune after first planet measurement.
+- **Does the scanner's HeaderWalker keep up with worker throughput?** At 1.37 M headers on planet, walker emits one descriptor every ~15 µs; worker pool consumes ~22 candidates per ~1 ms. If walker emits faster than workers consume, dispatch backs up and we apply backpressure to scanner (fine). If walker is the slow side, workers idle (problem). Measurement.
+
+### Items resolved this round (closed)
+
+- ~~Phase breakdown is inferred~~ - confirmed by measurement (`e81a9316`, planet phase distribution table above).
+- ~~Reader thread I/O-bound at NVMe speeds?~~ - parallel reader landed; reader is not the bottleneck.
+- ~~Overlaps_needed prune ratio for prefill?~~ - prefill landed parallel and is now 4.6% of wall; no longer load-bearing.
+- ~~--compression none leaves writer free?~~ - measured: writer is not the dominant phase at `--compression none`. Under zlib it is.
+- ~~Prefill RSS under parallel decompress?~~ - measured ~5 GB transient, fine under 28 GB.
+- ~~--io-uring integration site (reader vs writer)?~~ - writer side; descriptor-first design preserves it (drain hands framed/copy bytes to existing PbfWriter, which dispatches to its uring backend).

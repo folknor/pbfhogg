@@ -11,6 +11,7 @@
 //! for a separate pass to collect modification IDs and compute create lists.
 
 mod classify;
+mod descriptor;
 mod diff_ranges;
 mod element_writes;
 mod node_locations;

@@ -18,6 +18,8 @@ Four planet-scale command plans are in notes, each with a ranked set of opportun
 
 - [ ] **[notes/altw-structural-reports.md](notes/altw-structural-reports.md)** - `add-locations-to-ways --index-type external`. Current planet baseline: **661.2 s `--bench 3`** (UUID `a406d77e`, commit `aee7727`, 2026-04-18 post-regression-fix). Europe **291.6 s** after metadata-driven relation scan (`6d71053`). Doc consolidates six independent reviews into 11 ranked opportunities. Dominant theme: the stage 2 → stage 3 → stage 4 disk-seam chain, with ~80 GB rank shards + ~112 GB slot buckets + finalize. Stage-2 de-ranking and `BlobLocationRouter` already shipped (Europe 320.5 s → 291.6 s total). Measurement history + already-shipped context in [`notes/altw-optimization-history.md`](notes/altw-optimization-history.md); the failed in-RAM-coord-table reshape experiment is documented at [`notes/altw-as-renumber.md`](notes/altw-as-renumber.md) and does not invalidate the remaining ranked items.
 
+- [ ] **[notes/scan-optimization-audit.md](notes/scan-optimization-audit.md)** - cross-command audit (2026-04-20) reconciling four reviews (two Explore subagents + two external reviews). Two patterns from today's session to apply more broadly: (1) buffered header walk → `HeaderWalker` pread+fadvise(RANDOM) primitive, (2) sequential `BlobReader` + per-blob work → `parallel_classify_phase` / `_accumulate`. Tier S pick: migrate the shared `scan::classify::build_classify_schedule` + `_split` to `HeaderWalker` internally - one change ripples to 10+ downstream commands (extract, tags-filter, check, inspect, geocode, apply-changes, renumber, ALTW, multi-extract). Tier 1: ~8 per-command schedule builders that don't go through the shared primitive. Pattern 2 Tier 1: `collect_way_referenced_node_ids` in ALTW stage 1. **Pre-audit planet baselines queued in `./overnight.sh` items A1-A15 (~75-80 min).** Do not land any migration until the overnight run fills in the post-audit UUIDs in the doc's baseline table.
+
 Measurement-first on every one: turn on `#[cfg(feature = "hotpath")]` counters (or add unconditional `*_ms` counters) to ground-truth the inferred per-phase breakdowns before committing to the order of landing items within a plan.
 
 ## Important: ignored tests
@@ -72,15 +74,7 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   of ~1 KB per blob covers length + header in one syscall for the
   common case (headers ~100-200 B) with a fallback for the rare
   >1020 B header. Halves syscalls, should cut walker wall by
-  roughly half. Applies to both the shared `src/read/header_walker.rs`
-  primitive and the similar inline walker in
-  `src/commands/diff/parallel.rs::walk_file`.
-
-- [ ] **Migrate `diff/parallel.rs::walk_file` onto `HeaderWalker`**.
-  Today the diff text path has its own inline copy of the pread
-  walker. The shared primitive supports it; this is a mechanical
-  refactor. Cleaner; avoids the 1-pread-per-blob fix needing two
-  implementations.
+  roughly half.
 
 - [ ] **Consider auto-enabling diff `-j`**. Currently `pbfhogg diff`
   defaults to `-j 1` (sequential). `-j 0` maps to
@@ -224,10 +218,6 @@ knob is pure wall/interop trade-off, not a size trade-off.
 
 ### Smaller items
 
-- [ ] `tags_count.rs` parallel path - `parallel_classify_phase` with
-  per-worker CountMap accumulation. Tag counting is order-independent,
-  so the merge is straightforward. Would restore parallel decode for
-  unfiltered `inspect tags` on planet. Low priority.
 - [ ] ALTW dense pass 2 decode-all fallback (`write_output_decode_all` in
   `src/commands/add_locations_to_ways.rs` ~line 1045) - uses
   `into_blocks_pipelined` processing all blobs. Retention solved by

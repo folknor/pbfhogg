@@ -249,12 +249,7 @@ fn run_shard(
     let file = std::fs::File::create(&text_path).map_err(io_err)?;
     let mut out = BufWriter::new(file);
 
-    let mut stats = DiffStats {
-        common: 0,
-        created: 0,
-        modified: 0,
-        deleted: 0,
-    };
+    let mut stats = DiffStats::default();
 
     let old_slice = &old_descs[shard.old_start..shard.old_end];
     let new_slice = &new_descs[shard.new_start..shard.new_end];
@@ -651,12 +646,7 @@ pub(crate) fn diff_block_pair_parallel(
     // `--format osc` sibling driver makes for its shard fragments).
     let scratch_dir = old_path.parent().unwrap_or(Path::new("."));
 
-    let mut total = DiffStats {
-        common: 0,
-        created: 0,
-        modified: 0,
-        deleted: 0,
-    };
+    let mut total = DiffStats::default();
 
     struct PhaseSlot<'a> {
         kind: ElemKind,

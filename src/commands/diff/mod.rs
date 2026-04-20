@@ -102,7 +102,7 @@ pub struct DiffOptions {
 }
 
 /// Statistics from a diff operation.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct DiffStats {
     pub common: u64,
     pub created: u64,
@@ -244,12 +244,7 @@ fn diff_block_pair(
 
     let mut merge = BlockPairMergeState::new(old_reader, new_reader);
 
-    let mut stats = DiffStats {
-        common: 0,
-        created: 0,
-        modified: 0,
-        deleted: 0,
-    };
+    let mut stats = DiffStats::default();
 
     let phases: [(ElemKind, bool, &str); 3] = [
         (ElemKind::Node, filter.nodes, "NODE"),
@@ -372,12 +367,7 @@ fn diff_element_stream(
     let mut old_src = StreamingBlocks::new_sequential(old_path, direct_io)?;
     let mut new_src = StreamingBlocks::new_sequential(new_path, direct_io)?;
 
-    let mut stats = DiffStats {
-        common: 0,
-        created: 0,
-        modified: 0,
-        deleted: 0,
-    };
+    let mut stats = DiffStats::default();
 
     if filter.nodes {
         crate::debug::emit_marker("DIFF_PHASE_NODE_START");

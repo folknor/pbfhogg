@@ -371,7 +371,7 @@ and shard-based parallel merge-join (`-j/--jobs N` on `pbfhogg diff`).
 | inspect (default metadata, index-only) | `--bench 1 --force` | **6.5 s** | forced, dirty tree | 21.4 s (`c146f2bb`, partially-cached pre-migration) | **−14.9 s (3.3×)** |
 | inspect `--nodes -j 16` | `--bench 1` | **56.8 s** | `c5edebe7` | sequential (never stored; germany extrapolation ~370 s) | **~5-6× (new parallel path)** |
 | inspect `--tags -j 16` | `--bench 1` | **169.5 s (2m50s)** | `9d741341` | sequential (never stored; germany extrapolation ~800 s) | **~4-5× (new parallel path)** |
-| diff-snapshots text | `--bench 1 -j 16` | **229.4 s (3m49s)** | forced, dirty tree (temp-file shape) | 2150.9 s (35m51s, sequential) | **−1921 s (9.3×)** |
+| diff-snapshots text | `--bench 1 -j 16` | **227.5 s (3m48s)** | `22a5eb55` (2026-04-20, temp-file shape) | 2150.9 s (35m51s, sequential) | **−1923 s (9.5×)** |
 | diff-snapshots --format osc | `--bench 1 -j 16` | **313.8 s (5m13s)** | `9b3fc2b9` | 2225.6 s (37m06s, sequential) | **−1912 s (7.1×)** |
 
 All four carry the 2026-04-18 `ca6711e` + `aa3147c` short-circuit +

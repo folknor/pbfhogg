@@ -52,7 +52,7 @@
 | check --ids --full | Europe 35 GB | 52.7s | -83% (5.9×) |
 | extract --smart | Europe 35 GB | 181s | -29% |
 | derive-changes | - | streaming | constant memory |
-| diff `-j 16` (two independent planet snapshots, text) | Planet 87 GB | 229s (3m49s) | -89% (9.3×) |
+| diff `-j 16` (two independent planet snapshots, text) | Planet 87 GB | 228s (3m48s) | -89% (9.5×) |
 | diff `--format osc -j 16` (two independent planet snapshots) | Planet 87 GB | 314s (5m13s) | -86% (7.1×) |
 | getid (include mode) | Planet 87 GB | 6.1s | -86% (7.2×) |
 | inspect (default metadata, index-only) | Planet 87 GB | 6.5s | -70% (3.3×) |

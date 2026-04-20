@@ -32,27 +32,30 @@ pub(super) struct BlobTask {
 /// `brokkr cat` / indexed datasets.
 /// Scan all blob headers once and build per-kind schedules.
 /// Returns `(node_schedule, way_schedule, relation_schedule)`.
+///
+/// Walks via the pread-only `HeaderWalker` + `posix_fadvise(RANDOM)` so
+/// blob bodies stay out of the page cache during this scan - renumber's
+/// downstream pread workers open separate fds and touch only the blobs
+/// they rewrite.
 #[hotpath::measure]
 pub(super) fn build_all_blob_schedules(
     input: &Path,
 ) -> Result<(Vec<BlobTask>, Vec<BlobTask>, Vec<BlobTask>)> {
-    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
-    scanner.set_parse_indexdata(true);
-    scanner
-        .next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
+    let _ = walker
+        .next_header()?
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
     let mut nodes: Vec<BlobTask> = Vec::new();
     let mut ways: Vec<BlobTask> = Vec::new();
     let mut relations: Vec<BlobTask> = Vec::new();
     let mut node_seq: usize = 0;
     let mut way_seq: usize = 0;
     let mut rel_seq: usize = 0;
-    while let Some(result) = scanner.next_header_with_data_offset() {
-        let (hdr, _frame_offset, data_offset, data_size) = result?;
-        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) {
+    while let Some(meta) = walker.next_header()? {
+        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
         }
-        let Some(idx) = hdr.index() else {
+        let Some(idx) = meta.index else {
             return Err(
                 "renumber requires an indexed PBF - run `pbfhogg cat` to add \
                  indexdata or use the indexed variant"
@@ -66,8 +69,8 @@ pub(super) fn build_all_blob_schedules(
         };
         sched.push(BlobTask {
             seq: *seq,
-            data_offset,
-            data_size,
+            data_offset: meta.data_offset,
+            data_size: meta.data_size,
             element_count: idx.count,
             min_id: idx.min_id,
             max_id: idx.max_id,

@@ -192,9 +192,9 @@ stamped below when the run completes. Ages computed against
 
 | Command | Prior UUID | Commit | Wall | Age | Post-audit UUID |
 |---|---|---:|---:|---:|---|
-| extract --simple (Europe bbox) | (no prior planet row) | - | - | - | `e8d36564` / `1245cde` / 264.7 s |
-| extract --complete (Europe bbox) | (no prior planet row - `cadc3e6` 164.9 s was Europe dataset) | - | - | - | `cc1051ac` / `1245cde` / 261.8 s |
-| extract --smart (Europe bbox) | `2d028196` / `07dcdae3` | `cadc3e6` | 279 s / 267.5 s | 9d | `1f3e2128` / `1245cde` / 278.7 s (flat vs 2d028196 same cli_args) |
+| extract --simple (Europe bbox) | (no prior planet row) | - | - | - | `e8d36564` / `1245cde` / 264.7 s; **post-extract-walk: `b0a9e1cc` / `26d1402` / 247.3 s (-6.6%)** |
+| extract --complete (Europe bbox) | (no prior planet row - `cadc3e6` 164.9 s was Europe dataset) | - | - | - | `cc1051ac` / `1245cde` / 261.8 s; **post-extract-walk: `6095a4cc` / `26d1402` / 254.2 s (-2.9%)** |
+| extract --smart (Europe bbox) | `2d028196` / `07dcdae3` | `cadc3e6` | 279 s / 267.5 s | 9d | `1f3e2128` / `1245cde` / 278.7 s (flat vs 2d028196 same cli_args); **post-extract-walk: `4a166b6f` / `26d1402` / 283.5 s (+1.7%, noise)** |
 | extract --multi (5 regions) | - | - | - | - | `c79eac24` / `1245cde` / 1004.6 s |
 | tags-filter `w/highway=primary` (transitive) | (no matching prior - `f262f068` used `-R`) | - | - | - | `e447869f` / `1245cde` / 147.5 s; **post-Tier-S: `97767260` / `de8daf1` / 139.2 s (-5.6%)** |
 | check --refs | `64e9a394` | (2026-04-18) | 70.2 s | 2d | `cbcf27f8` / `1245cde` / 72.6 s; **post-Tier-S: `27ab8ef8` / `de8daf1` / 62.7 s (-13.7%)** |

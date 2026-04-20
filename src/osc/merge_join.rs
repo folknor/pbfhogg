@@ -525,6 +525,7 @@ struct PendingBlob {
 /// (later) kind, this phase is done. We must NOT consume that blob
 /// because the next phase needs it. We store it in `stash` for the
 /// next phase to pick up.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn next_blob_for_kind(
     reader: &mut crate::blob::BlobReader<crate::file_reader::FileReader>,
     kind: ElemKind,
@@ -561,13 +562,18 @@ fn next_blob_for_kind(
 }
 
 /// Decompress a pending blob into a decoded BlockState.
+///
+/// Returns `crate::error::Result` (not `BoxResult`) so the result is `Send` -
+/// required by `rayon::join` in the parallel overlapping-decode path.
+/// `Box<dyn Error>` is not `Send` by default.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::needless_pass_by_value)] // consumes blob to drop compressed bytes after decode
 fn decode_pending(
     pending: PendingBlob,
     buf: &mut Vec<u8>,
     st_scratch: &mut Vec<(u32, u32)>,
     gr_scratch: &mut Vec<(u32, u32)>,
-) -> BoxResult<BlockState> {
+) -> crate::error::Result<BlockState> {
     pending.blob.decompress_into(buf)?;
     let block = PrimitiveBlock::from_vec_with_scratch(
         std::mem::take(buf), st_scratch, gr_scratch,
@@ -681,6 +687,7 @@ fn next_decoded_block(
 }
 
 /// Drain all remaining blobs of `kind` from one side of a merge.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn drain_remaining(
     state: &mut BlockPairMergeState,
     kind: ElemKind,
@@ -701,6 +708,7 @@ fn drain_remaining(
 }
 
 /// Emit a decoded block as BlobOldOnly or BlobNewOnly, accounting for skip.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn emit_block(
     bs: &BlockState,
     is_old: bool,
@@ -728,6 +736,7 @@ fn emit_block(
 }
 
 /// Merge a pair of decoded overlapping blocks, tracking residuals.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn merge_decoded_pair(
     old_decoded: &mut Option<BlockState>,
     new_decoded: &mut Option<BlockState>,
@@ -887,6 +896,7 @@ fn blobs_byte_equal(a: &PendingBlob, b: &PendingBlob) -> bool {
 ///
 /// Returns `(old_consumed, new_consumed)` - the number of elements consumed
 /// from each side, so the caller can update skip counts without re-scanning.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn element_merge_pair(
     old_block: &PrimitiveBlock,
     old_skip: usize,

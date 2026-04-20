@@ -488,12 +488,18 @@ fn filter_block_pass2(
 /// Classify-phase blob filter. Returns `(skip, tag_skip)`: `skip=true` means
 /// the caller should skip the blob; `tag_skip=true` means the skip was driven
 /// by the tag-index filter (the caller should bump its tag-skip counter).
+///
+/// Takes the already-parsed `BlobIndex` and raw `tagdata` bytes so callers
+/// can feed it from either a `BlobHeader` (via `hdr.index()` / `hdr.tag_index()`
+/// materialisation) or a `HeaderWalker` `BlobHeaderMeta` (which already
+/// parses `index` up-front and holds raw `tagdata` bytes).
 fn classify_blob_filter_check(
-    hdr: &crate::blob::BlobHeader,
+    index: Option<&crate::blob_meta::BlobIndex>,
+    tagdata: Option<&[u8]>,
     filter: Option<&BlobFilter>,
 ) -> (bool, bool) {
     let Some(filter) = filter else { return (false, false); };
-    if let Some(idx) = hdr.index() {
+    if let Some(idx) = index {
         let dominated = matches!(
             idx.kind,
             crate::blob_meta::ElemKind::Node if !filter.want_nodes
@@ -506,7 +512,11 @@ fn classify_blob_filter_check(
         );
         if dominated { return (true, false); }
     }
-    if filter.has_tag_filter() && let Some(tag_idx) = hdr.tag_index() && !filter.wants_tag_index(&tag_idx) {
+    if filter.has_tag_filter()
+        && let Some(bytes) = tagdata
+        && let Some(tag_idx) = crate::blob_meta::TagIndex::deserialize(bytes)
+        && !filter.wants_tag_index(&tag_idx)
+    {
         return (true, true);
     }
     (false, false)
@@ -563,34 +573,37 @@ fn tags_filter_two_pass(
     super::warn_locations_on_ways_loss(&header_blob.to_headerblock()?);
     drop(header_reader);
 
-    // Build schedule from header-only scan.
+    // Build schedule from header-only scan via the pread-only HeaderWalker.
+    // Avoids pulling blob bodies into the page cache for blobs we'll decide
+    // to skip on the tag-index filter anyway.
     crate::debug::emit_marker("TAGSFILTER_SINGLE_PASS_SCHEDULE_SCAN_START");
-    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
-    scanner.set_parse_indexdata(true);
-    scanner.set_parse_tagdata(true);
-    scanner.next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
+    let _ = walker
+        .next_header()?
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
 
     let expr_filter = if invert { None } else { blob_filter_from_expressions(expressions) };
 
     let mut schedule: Vec<(usize, u64, usize)> = Vec::new();
     let mut blobs_skipped_by_tag: u64 = 0;
     let mut seq: usize = 0;
-    while let Some(result_item) = scanner.next_header_with_data_offset() {
-        let (hdr, _frame_offset, data_offset, data_size) = result_item?;
-        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
-        let (skip, tag_skip) = classify_blob_filter_check(&hdr, expr_filter.as_ref());
+    while let Some(meta) = walker.next_header()? {
+        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) { continue; }
+        let (skip, tag_skip) = classify_blob_filter_check(
+            meta.index.as_ref(),
+            meta.tagdata.as_deref(),
+            expr_filter.as_ref(),
+        );
         if skip {
             if tag_skip { blobs_skipped_by_tag += 1; }
             continue;
         }
-        schedule.push((seq, data_offset, data_size));
+        schedule.push((seq, meta.data_offset, meta.data_size));
         seq += 1;
     }
     if blobs_skipped_by_tag > 0 {
         eprintln!("[tags-filter] {blobs_skipped_by_tag} blobs skipped by tag index");
     }
-    drop(scanner);
     crate::debug::emit_marker("TAGSFILTER_SINGLE_PASS_SCHEDULE_SCAN_END");
 
     #[allow(clippy::cast_possible_wrap)]
@@ -599,10 +612,8 @@ fn tags_filter_two_pass(
         crate::debug::emit_counter("tagsfilter_single_pass_tagidx_skipped_blobs", blobs_skipped_by_tag as i64);
     }
 
-    let shared_file = std::sync::Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
-    );
+    let shared_file = std::sync::Arc::clone(walker.shared_file());
+    drop(walker);
 
     /// Per-blob classification result from a worker.
     struct ClassifyResult {
@@ -734,33 +745,31 @@ fn tags_filter_two_pass(
     };
 
     crate::debug::emit_marker("TAGSFILTER_PASS2_SCHEDULE_SCAN_START");
-    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
-    scanner.set_parse_indexdata(true);
-    scanner.set_parse_tagdata(true);
-    scanner.next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
+    let _ = walker
+        .next_header()?
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
 
     let mut schedule: Vec<(u64, usize)> = Vec::new(); // (data_offset, data_size)
     let mut blobs_skipped: u64 = 0;
-    while let Some(result_item) = scanner.next_header_with_data_offset() {
-        let (hdr, _frame_offset, data_offset, data_size) = result_item?;
-        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
+    while let Some(meta) = walker.next_header()? {
+        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) { continue; }
 
         // Type-only filter: skip blob types not needed (no tag index filtering
         // in pass 2 - elements can be included via relation closure without
         // having the matching tag key).
         if let Some(ref filter) = blob_filter {
-            if let Some(idx) = hdr.index() {
-                if !filter.wants_index(&idx) {
+            if let Some(idx) = meta.index.as_ref() {
+                if !filter.wants_index(idx) {
                     blobs_skipped += 1;
                     continue;
                 }
             }
         }
 
-        schedule.push((data_offset, data_size));
+        schedule.push((meta.data_offset, meta.data_size));
     }
-    drop(scanner);
+    drop(walker);
     crate::debug::emit_marker("TAGSFILTER_PASS2_SCHEDULE_SCAN_END");
 
     #[allow(clippy::cast_possible_wrap)]

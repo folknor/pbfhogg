@@ -234,21 +234,6 @@ impl BlobHeader {
         self.header.datasize
     }
 
-    /// Returns the blob-level index from the header's `indexdata` field, if present.
-    pub(crate) fn index(&self) -> Option<crate::blob_meta::BlobIndex> {
-        self.header
-            .indexdata
-            .as_ref()
-            .and_then(|d| crate::blob_meta::BlobIndex::deserialize(d))
-    }
-
-    /// Returns the per-blob tag key index from the header's `tagdata` field, if present.
-    pub(crate) fn tag_index(&self) -> Option<crate::blob_meta::TagIndex> {
-        self.header
-            .tagdata
-            .as_ref()
-            .and_then(|d| crate::blob_meta::TagIndex::deserialize(d))
-    }
 }
 
 /// Underlying source for [`BlobReader`] that supports seeking.
@@ -753,52 +738,6 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
         Some(Ok((BlobHeader::new(header), prev_offset)))
     }
 
-    /// Like [`next_header_skip_blob`], but also returns the file offset where the
-    /// blob data begins and its size. Used by parallel pipelines where workers
-    /// `pread` blob data themselves from a shared file descriptor.
-    ///
-    /// Returns `(BlobHeader, blob_data_offset, blob_data_size)`.
-    /// Returns `(BlobHeader, frame_offset, data_offset, data_size)`.
-    /// `frame_offset` is the start of the 4-byte length prefix (for raw frame passthrough).
-    /// `data_offset` is the start of the Blob protobuf (for pread workers).
-    #[hotpath::measure]
-    pub(crate) fn next_header_with_data_offset(&mut self) -> Option<Result<(BlobHeader, u64, u64, usize)>> {
-        if !self.last_blob_ok {
-            return None;
-        }
-
-        // Frame starts at current offset (before 4-byte length prefix).
-        let frame_offset = self.offset.map(|o| o.0).unwrap_or(0);
-
-        let header = match self.read_blob_header() {
-            Some(Ok(header)) => header,
-            Some(Err(err)) => return Some(Err(err)),
-            None => return None,
-        };
-
-        // After read_blob_header, self.offset points to the start of blob data.
-        let data_offset = match self.offset {
-            Some(o) => o.0,
-            None => {
-                self.last_blob_ok = false;
-                return Some(Err(new_blob_error(BlobError::InvalidDataSize {
-                    size: header.datasize,
-                })));
-            }
-        };
-        #[allow(clippy::cast_sign_loss)]
-        let data_size = header.datasize as usize;
-
-        // Skip blob body via skip_relative-aware helper (preserves BufReader
-        // buffer when in-range; falls back to Seek::seek otherwise).
-        #[allow(clippy::cast_sign_loss)]
-        if let Err(err) = self.skip_blob_body(header.datasize as u64) {
-            self.last_blob_ok = false;
-            return Some(Err(err));
-        }
-
-        Some(Ok((BlobHeader::new(header), frame_offset, data_offset, data_size)))
-    }
 }
 
 impl BlobReader<BufReader<File>> {

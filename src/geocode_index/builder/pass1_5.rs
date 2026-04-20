@@ -158,25 +158,24 @@ pub(super) fn build_pass2_schedules(
     i64,                        // max_node_id
     std::sync::Arc<std::fs::File>,
 )> {
-    let mut scanner = crate::blob::BlobReader::seekable_from_path(input_path)?;
-    scanner.set_parse_indexdata(true);
-    scanner.next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input_path)?;
+    let _ = walker
+        .next_header()?
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
 
     let mut node_schedule: Vec<(usize, u64, usize)> = Vec::new();
     let mut way_schedule: Vec<(usize, u64, usize)> = Vec::new();
     let mut node_seq: usize = 0;
     let mut way_seq: usize = 0;
     let mut max_node_id: i64 = 0;
-    while let Some(result_item) = scanner.next_header_with_data_offset() {
-        let (hdr, _frame_offset, data_offset, data_size) = result_item?;
-        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
-        let Some(idx) = hdr.index() else {
+    while let Some(meta) = walker.next_header()? {
+        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) { continue; }
+        let Some(idx) = meta.index.as_ref() else {
             // No indexdata: conservatively include in both schedules so
             // neither phase silently drops data from a --force run.
-            node_schedule.push((node_seq, data_offset, data_size));
+            node_schedule.push((node_seq, meta.data_offset, meta.data_size));
             node_seq += 1;
-            way_schedule.push((way_seq, data_offset, data_size));
+            way_schedule.push((way_seq, meta.data_offset, meta.data_size));
             way_seq += 1;
             continue;
         };
@@ -185,22 +184,19 @@ pub(super) fn build_pass2_schedules(
                 if idx.max_id > max_node_id {
                     max_node_id = idx.max_id;
                 }
-                node_schedule.push((node_seq, data_offset, data_size));
+                node_schedule.push((node_seq, meta.data_offset, meta.data_size));
                 node_seq += 1;
             }
             crate::blob_meta::ElemKind::Way => {
-                way_schedule.push((way_seq, data_offset, data_size));
+                way_schedule.push((way_seq, meta.data_offset, meta.data_size));
                 way_seq += 1;
             }
             crate::blob_meta::ElemKind::Relation => {}
         }
     }
 
-    drop(scanner);
-    let shared_file = std::sync::Arc::new(
-        std::fs::File::open(input_path)
-            .map_err(|e| format!("failed to open {}: {e}", input_path.display()))?,
-    );
+    let shared_file = std::sync::Arc::clone(walker.shared_file());
+    drop(walker);
 
     #[allow(clippy::cast_possible_wrap)]
     {

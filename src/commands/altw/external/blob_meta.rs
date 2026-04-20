@@ -23,30 +23,37 @@ pub(super) struct BlobMeta {
 }
 
 /// Scan all OsmData blob headers once and retain only the metadata ALTW
-/// external join actually reuses later.
+/// external join actually reuses later. Walks via the pread-only
+/// `HeaderWalker` so blob bodies stay out of the page cache during the
+/// scan - stage 1 / stage 4 open their own fds and pread the bodies they
+/// need.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn scan_blob_metadata(
     input: &Path,
     parse_tagdata: bool,
 ) -> Result<Vec<BlobMeta>> {
     crate::debug::emit_marker("ALTW_BLOB_META_SCAN_START");
-    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
-    scanner.set_parse_indexdata(true);
-    scanner.set_parse_tagdata(parse_tagdata);
-    scanner.next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
+    let _ = walker
+        .next_header()?
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
 
     let mut metas = Vec::new();
     let mut node_blobs: u64 = 0;
     let mut way_blobs: u64 = 0;
     let mut relation_blobs: u64 = 0;
-    while let Some(result) = scanner.next_header_with_data_offset() {
-        let (hdr, frame_offset, data_offset, data_size) = result?;
-        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) {
+    while let Some(meta) = walker.next_header()? {
+        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
         }
-        let idx = hdr.index().ok_or("external join metadata scan: OsmData blob missing indexdata")?;
-        let tag_index = if parse_tagdata { hdr.tag_index() } else { None };
+        let idx = meta.index.as_ref()
+            .ok_or("external join metadata scan: OsmData blob missing indexdata")?;
+        let tag_index = if parse_tagdata {
+            meta.tagdata.as_deref()
+                .and_then(crate::blob_meta::TagIndex::deserialize)
+        } else {
+            None
+        };
         let has_tagindex = tag_index.is_some();
         let has_tags = if parse_tagdata {
             tag_index.is_none_or(|ti| !ti.keys_empty())
@@ -59,9 +66,9 @@ pub(super) fn scan_blob_metadata(
             ElemKind::Relation => relation_blobs += 1,
         }
         metas.push(BlobMeta {
-            frame_offset,
-            data_offset,
-            data_size,
+            frame_offset: meta.frame_start,
+            data_offset: meta.data_offset,
+            data_size: meta.data_size,
             kind: idx.kind,
             min_id: idx.min_id,
             max_id: idx.max_id,

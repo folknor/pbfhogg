@@ -50,10 +50,9 @@ pub(crate) struct BlobHeaderMeta {
     pub data_size: usize,
     /// Parsed indexdata, if the blob carried any.
     pub index: Option<BlobIndex>,
-    /// Raw tagdata bytes from the BlobHeader, if present. Exposed for
-    /// callers that need per-blob tag-index filtering; the first consumer
-    /// (getid) does not.
-    #[allow(dead_code)]
+    /// Raw tagdata bytes from the BlobHeader, if present. Callers that
+    /// need per-blob tag-index filtering (e.g. `tags-filter`'s two-pass
+    /// schedule scans) deserialise these into a `TagIndex` on demand.
     pub tagdata: Option<Box<[u8]>>,
     /// Total frame size: 4 + header_len + data_size.
     pub frame_size: usize,

@@ -49,40 +49,45 @@ fn resolve_thread_count(threads: Option<usize>) -> usize {
 /// Only OsmData blobs are included. When `kind_filter` is `Some`, only blobs
 /// whose indexdata matches the given element type (plus blobs without
 /// indexdata) are included.
+///
+/// Walks headers via [`HeaderWalker`](crate::read::header_walker::HeaderWalker)
+/// so blob bodies are not dragged into the page cache during the scan. The
+/// shared `Arc<File>` handed back for `pread`-based body reads is the
+/// walker's own file handle (opened with `posix_fadvise(RANDOM)`),
+/// reused to avoid a second `open` at scan end.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn build_classify_schedule(
     input: &std::path::Path,
     kind_filter: Option<crate::blob_meta::ElemKind>,
 ) -> Result<(Vec<ScheduleEntry>, std::sync::Arc<std::fs::File>)> {
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
-    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
-    scanner.set_parse_indexdata(true);
-    scanner.next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
+    // Consume the first blob (expected OSMHeader). Bug-for-bug equivalent
+    // to the prior `next_header_skip_blob` call: on an empty file return
+    // MissingHeader; on non-empty files the first blob is dropped without
+    // kind validation (subsequent non-OsmData blobs are filtered below).
+    let _ = walker.next_header()?
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
 
     crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_START");
     let mut schedule: Vec<ScheduleEntry> = Vec::new();
     let mut seq: usize = 0;
-    while let Some(result_item) = scanner.next_header_with_data_offset() {
-        let (hdr, _frame_offset, data_offset, data_size) = result_item?;
-        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
+    while let Some(meta) = walker.next_header()? {
+        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) { continue; }
         if let Some(filter_kind) = kind_filter {
-            if let Some(idx) = hdr.index() {
+            if let Some(idx) = &meta.index {
                 if idx.kind != filter_kind { continue; }
             }
         }
-        schedule.push((seq, data_offset, data_size));
+        schedule.push((seq, meta.data_offset, meta.data_size));
         seq += 1;
     }
     crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_END");
 
     crate::debug::emit_marker("SCHEDULE_SCANNER_DROP_START");
-    drop(scanner);
-    let shared_file = std::sync::Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
-    );
+    let shared_file = std::sync::Arc::clone(walker.shared_file());
+    drop(walker);
     crate::debug::emit_marker("SCHEDULE_SCANNER_DROP_END");
 
     #[allow(clippy::cast_possible_wrap)]
@@ -111,46 +116,41 @@ pub(crate) fn build_classify_schedules_split(
     std::sync::Arc<std::fs::File>,
 )> {
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
-    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
-    scanner.set_parse_indexdata(true);
-    scanner.next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
+    let _ = walker.next_header()?
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
 
     crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_START");
     let mut nodes: Vec<ScheduleEntry> = Vec::new();
     let mut ways: Vec<ScheduleEntry> = Vec::new();
     let mut rels: Vec<ScheduleEntry> = Vec::new();
-    while let Some(result_item) = scanner.next_header_with_data_offset() {
-        let (hdr, _frame_offset, data_offset, data_size) = result_item?;
-        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
-        match hdr.index().map(|i| i.kind) {
+    while let Some(meta) = walker.next_header()? {
+        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) { continue; }
+        match meta.index.as_ref().map(|i| i.kind) {
             Some(crate::blob_meta::ElemKind::Node) => {
-                nodes.push((nodes.len(), data_offset, data_size));
+                nodes.push((nodes.len(), meta.data_offset, meta.data_size));
             }
             Some(crate::blob_meta::ElemKind::Way) => {
-                ways.push((ways.len(), data_offset, data_size));
+                ways.push((ways.len(), meta.data_offset, meta.data_size));
             }
             Some(crate::blob_meta::ElemKind::Relation) => {
-                rels.push((rels.len(), data_offset, data_size));
+                rels.push((rels.len(), meta.data_offset, meta.data_size));
             }
             None => {
                 // Unindexed: visible to every kind filter in the legacy path,
                 // so replicate to all three schedules here.
-                nodes.push((nodes.len(), data_offset, data_size));
-                ways.push((ways.len(), data_offset, data_size));
-                rels.push((rels.len(), data_offset, data_size));
+                nodes.push((nodes.len(), meta.data_offset, meta.data_size));
+                ways.push((ways.len(), meta.data_offset, meta.data_size));
+                rels.push((rels.len(), meta.data_offset, meta.data_size));
             }
         }
     }
     crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_END");
 
     crate::debug::emit_marker("SCHEDULE_SCANNER_DROP_START");
-    drop(scanner);
-    let shared_file = std::sync::Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
-    );
+    let shared_file = std::sync::Arc::clone(walker.shared_file());
+    drop(walker);
     crate::debug::emit_marker("SCHEDULE_SCANNER_DROP_END");
 
     #[allow(clippy::cast_possible_wrap)]

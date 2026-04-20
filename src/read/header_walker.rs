@@ -108,8 +108,8 @@ impl HeaderWalker {
     /// Shared `Arc<File>` for worker threads to `pread` data bodies.
     /// Used when the walker is handed off as a plan producer and the
     /// actual body reads happen on rayon workers (e.g. the diff
-    /// parallel shard path). Single-threaded callers ignore this.
-    #[allow(dead_code)]
+    /// parallel shard path, or the shared `scan::classify`
+    /// schedule builders). Single-threaded callers ignore this.
     pub(crate) fn shared_file(&self) -> &Arc<std::fs::File> {
         &self.file
     }

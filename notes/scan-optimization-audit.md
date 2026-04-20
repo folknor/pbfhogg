@@ -192,21 +192,21 @@ stamped below when the run completes. Ages computed against
 
 | Command | Prior UUID | Commit | Wall | Age | Post-audit UUID |
 |---|---|---:|---:|---:|---|
-| extract --simple (Europe bbox) | (no planet row) | `cadc3e6` | ≈96.3 s | 9d | *pending overnight* |
-| extract --complete (Europe bbox) | (no planet row) | `cadc3e6` | ≈164.9 s | 9d | *pending overnight* |
-| extract --smart (Europe bbox) | `2d028196` / `07dcdae3` | `cadc3e6` | 279 s / 267.5 s | 9d | *pending overnight* |
-| extract --multi (5 regions) | - | - | - | - | *pending overnight* |
-| tags-filter `-R w/highway=primary` | `f262f068` | (2026-04-18) | 51.8 s | 2d | *pending overnight* |
-| check --refs | `64e9a394` | (2026-04-18) | 70.2 s | 2d | *pending overnight* |
-| check --ids --full | `c498fff0` | `ef6ce09` | 69.5 s | 3d | *pending overnight* |
-| inspect --nodes -j 16 | `c5edebe7` | `b7d8aea` | 56.8 s | today | *pending overnight* |
-| inspect --tags -j 16 | `9d741341` | `6ea0d94` | 169.5 s | today | *pending overnight* |
-| renumber | `abd74459` | (2026-04-18) | 204.5 s | 2d | *pending overnight* |
-| diff-snapshots text -j 16 | `b02d86bc` | `06628d8` | 208.6 s | today | *pending overnight* |
-| diff-snapshots --format osc -j 16 | `9b3fc2b9` | `06628d8` | 313.8 s | today | *pending overnight* |
-| build-geocode-index | `b4b25c05` | `82db8ed` | 432.9 s | 2d | *pending overnight* |
-| add-locations-to-ways (external) | `a406d77e` | `aee7727` | 661.2 s | 2d | *pending overnight* |
-| apply-changes --osc-seq 4920 | `8e940f71` | `ef6ce09` | 756.3 s | 3d | *pending overnight* |
+| extract --simple (Europe bbox) | (no prior planet row) | - | - | - | `e8d36564` / `1245cde` / 264.7 s |
+| extract --complete (Europe bbox) | (no prior planet row - `cadc3e6` 164.9 s was Europe dataset) | - | - | - | `cc1051ac` / `1245cde` / 261.8 s |
+| extract --smart (Europe bbox) | `2d028196` / `07dcdae3` | `cadc3e6` | 279 s / 267.5 s | 9d | `1f3e2128` / `1245cde` / 278.7 s (flat vs 2d028196 same cli_args) |
+| extract --multi (5 regions) | - | - | - | - | `c79eac24` / `1245cde` / 1004.6 s |
+| tags-filter `w/highway=primary` (transitive) | (no matching prior - `f262f068` used `-R`) | - | - | - | `e447869f` / `1245cde` / 147.5 s |
+| check --refs | `64e9a394` | (2026-04-18) | 70.2 s | 2d | `cbcf27f8` / `1245cde` / 72.6 s |
+| check --ids --full | `c498fff0` | `ef6ce09` | 69.5 s | 3d | `5d77f174` / `1245cde` / 72.5 s |
+| inspect --nodes -j 16 | `c5edebe7` | `b7d8aea` | 56.8 s | today | `a816ae6f` / `1245cde` / 58.1 s |
+| inspect --tags -j 16 | `9d741341` | `6ea0d94` | 169.5 s | today | `7d69a958` / `1245cde` / 231.6 s (36% delta, no code path changed - flagged for investigation) |
+| renumber | `abd74459` (--bench 3) | (2026-04-18) | 204.5 s | 2d | `84be312f` (--bench 1) / `1245cde` / 215.6 s |
+| diff-snapshots text -j 16 | `b02d86bc` | `06628d8` | 208.6 s | today | `af5d53fd` / `1245cde` / 227.0 s (documented +8.8% wall for 74% RSS drop, `d207cea`) |
+| diff-snapshots --format osc -j 16 | `9b3fc2b9` | `06628d8` | 313.8 s | today | `ef254a69` / `1245cde` / 329.5 s (+5% drift, no OSC-path shape change between commits) |
+| build-geocode-index | `b4b25c05` | `82db8ed` | 432.9 s | 2d | `d139067d` / `1245cde` / 430.5 s (flat, same cli_args) |
+| add-locations-to-ways (external) | `a406d77e` (--bench 3) | `aee7727` | 661.2 s | 2d | `06924c29` (--bench 1) / `1245cde` / 684.0 s (+3.4% within sample-count drift) |
+| apply-changes --osc-seq 4920 | `8e940f71` | `ef6ce09` | 756.3 s | 3d | `59327f65` / `1245cde` / 577.0 s (-24%, intervening "lift/split" commits in apply_changes + osc - cause not obvious from commit messages) |
 
 Nothing in the doc should be implemented until the overnight run
 fills in the right-hand column - the 9-day-old extract rows in

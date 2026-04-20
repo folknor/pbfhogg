@@ -12,6 +12,7 @@
 //! of whether metadata (version, timestamp, changeset, uid) is present, partial, or absent.
 
 pub mod derive;
+pub(crate) mod parallel;
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -190,7 +191,25 @@ pub fn diff(
 
     crate::debug::emit_marker("DIFF_SCAN_START");
 
-    let stats = if both_indexed {
+    // Parallel shard-based path opt-in via env var. See
+    // `notes/diff-snapshots-opportunities.md` item 1. Only valid when
+    // both inputs are indexed (same constraint as diff_block_pair).
+    let parallel_shards: usize = std::env::var("PBFHOGG_DIFF_SHARDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+
+    let stats = if both_indexed && parallel_shards > 1 {
+        parallel::diff_block_pair_parallel(
+            old_path,
+            new_path,
+            output,
+            options,
+            direct_io,
+            &filter,
+            parallel_shards,
+        )?
+    } else if both_indexed {
         diff_block_pair(old_path, new_path, output, options, direct_io, &filter)?
     } else {
         diff_element_stream(old_path, new_path, output, options, direct_io, &filter)?
@@ -492,7 +511,7 @@ fn drain_phase<T: MergeJoinElement>(
 // Output formatting -- compact lines
 // ---------------------------------------------------------------------------
 
-fn write_compact_line(
+pub(super) fn write_compact_line(
     output: &mut impl Write,
     prefix: char,
     type_char: char,
@@ -506,7 +525,7 @@ fn write_compact_line(
     Ok(())
 }
 
-fn write_modified_line(
+pub(super) fn write_modified_line(
     output: &mut impl Write,
     type_char: char,
     id: i64,
@@ -664,7 +683,7 @@ fn write_member_diff(
 // ---------------------------------------------------------------------------
 
 /// Write verbose modification details using borrowed element references.
-fn write_modified_details_borrowed(
+pub(super) fn write_modified_details_borrowed(
     output: &mut dyn Write,
     old: &Element<'_>,
     new: &Element<'_>,

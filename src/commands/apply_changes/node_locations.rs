@@ -140,27 +140,28 @@ impl NodeLocationIndex {
         Ok((nodes_found, blobs_scanned))
     }
 
-    /// Phase A: header-only walk.
+    /// Phase A: header-only walk via the pread-only `HeaderWalker` so the
+    /// scan doesn't drag blob bodies into the page cache - prefill only
+    /// needs headers to filter by kind and id range, and the actual body
+    /// reads happen on phase B's worker threads.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn scan_node_blob_schedule(
         &self,
         base_pbf: &Path,
     ) -> super::Result<NodeBlobSchedule> {
-        let mut scanner = crate::blob::BlobReader::seekable_from_path(base_pbf)?;
-        scanner.set_parse_indexdata(true);
-        scanner
-            .next_header_skip_blob()
-            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+        let mut walker = crate::read::header_walker::HeaderWalker::open(base_pbf)?;
+        let _ = walker
+            .next_header()?
+            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
 
         let mut schedule: Vec<(u64, usize)> = Vec::new();
         let mut blobs_skipped_non_node: u64 = 0;
         let mut blobs_skipped_range: u64 = 0;
-        while let Some(result_item) = scanner.next_header_with_data_offset() {
-            let (hdr, _frame_offset, data_offset, data_size) = result_item?;
-            if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) {
+        while let Some(meta) = walker.next_header()? {
+            if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
                 continue;
             }
-            if let Some(idx) = hdr.index() {
+            if let Some(idx) = &meta.index {
                 if idx.kind != ElemKind::Node {
                     // Sorted PBF: once past nodes, no more node blobs.
                     blobs_skipped_non_node += 1;
@@ -171,7 +172,7 @@ impl NodeLocationIndex {
                     continue;
                 }
             }
-            schedule.push((data_offset, data_size));
+            schedule.push((meta.data_offset, meta.data_size));
         }
         Ok(NodeBlobSchedule { schedule, blobs_skipped_non_node, blobs_skipped_range })
     }

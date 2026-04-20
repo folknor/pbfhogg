@@ -196,11 +196,11 @@ stamped below when the run completes. Ages computed against
 | extract --complete (Europe bbox) | (no prior planet row - `cadc3e6` 164.9 s was Europe dataset) | - | - | - | `cc1051ac` / `1245cde` / 261.8 s |
 | extract --smart (Europe bbox) | `2d028196` / `07dcdae3` | `cadc3e6` | 279 s / 267.5 s | 9d | `1f3e2128` / `1245cde` / 278.7 s (flat vs 2d028196 same cli_args) |
 | extract --multi (5 regions) | - | - | - | - | `c79eac24` / `1245cde` / 1004.6 s |
-| tags-filter `w/highway=primary` (transitive) | (no matching prior - `f262f068` used `-R`) | - | - | - | `e447869f` / `1245cde` / 147.5 s |
-| check --refs | `64e9a394` | (2026-04-18) | 70.2 s | 2d | `cbcf27f8` / `1245cde` / 72.6 s |
-| check --ids --full | `c498fff0` | `ef6ce09` | 69.5 s | 3d | `5d77f174` / `1245cde` / 72.5 s |
-| inspect --nodes -j 16 | `c5edebe7` | `b7d8aea` | 56.8 s | today | `a816ae6f` / `1245cde` / 58.1 s |
-| inspect --tags -j 16 | `9d741341` | `6ea0d94` | 169.5 s | today | `7d69a958` / `1245cde` / 231.6 s (36% delta, no code path changed - flagged for investigation) |
+| tags-filter `w/highway=primary` (transitive) | (no matching prior - `f262f068` used `-R`) | - | - | - | `e447869f` / `1245cde` / 147.5 s; **post-Tier-S: `97767260` / `de8daf1` / 139.2 s (-5.6%)** |
+| check --refs | `64e9a394` | (2026-04-18) | 70.2 s | 2d | `cbcf27f8` / `1245cde` / 72.6 s; **post-Tier-S: `27ab8ef8` / `de8daf1` / 62.7 s (-13.7%)** |
+| check --ids --full | `c498fff0` | `ef6ce09` | 69.5 s | 3d | `5d77f174` / `1245cde` / 72.5 s; **post-Tier-S: `7949c553` / `de8daf1` / 63.2 s (-12.8%)** |
+| inspect --nodes -j 16 | `c5edebe7` | `b7d8aea` | 56.8 s | today | `a816ae6f` / `1245cde` / 58.1 s; **post-Tier-S: `eb060eaa` / `de8daf1` / 49.4 s (-15.0%)** |
+| inspect --tags -j 16 | `9d741341` | `6ea0d94` | 169.5 s | today | `7d69a958` / `1245cde` / 231.6 s (A8 anomaly, unexplained); **post-Tier-S: `00e00846` / `de8daf1` / 168.3 s - matches morning 169.5 s baseline, header-walk drowned in full decompression** |
 | renumber | `abd74459` (--bench 3) | (2026-04-18) | 204.5 s | 2d | `84be312f` (--bench 1) / `1245cde` / 215.6 s |
 | diff-snapshots text -j 16 | `b02d86bc` | `06628d8` | 208.6 s | today | `af5d53fd` / `1245cde` / 227.0 s (documented +8.8% wall for 74% RSS drop, `d207cea`) |
 | diff-snapshots --format osc -j 16 | `9b3fc2b9` | `06628d8` | 313.8 s | today | `ef254a69` / `1245cde` / 329.5 s (+5% drift, no OSC-path shape change between commits) |

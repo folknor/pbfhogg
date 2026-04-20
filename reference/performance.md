@@ -365,13 +365,14 @@ Two commands picked up large wins in the 2026-04-20 batch via a shared
 `pread`-only header walker (`src/read/header_walker.rs::HeaderWalker`)
 and shard-based parallel merge-join (`-j/--jobs N` on `pbfhogg diff`).
 
-| Command | Mode | Wall | UUID | Row before (2026-04-18) | Δ |
+| Command | Mode | Wall | UUID | Row before | Δ |
 |---|---|---:|---|---:|---:|
-| getid (include mode) | `--bench 1 --force` | **7.0 s** | forced, dirty tree | 43.8 s | **−36.8 s (6.2×)** |
+| getid (include mode) | `--bench 1 --force` | **7.0 s** | forced, dirty tree | 43.8 s (2026-04-18) | **−36.8 s (6.2×)** |
+| inspect (default metadata, index-only) | `--bench 1 --force` | **6.5 s** | forced, dirty tree | 21.4 s (`c146f2bb`, partially-cached pre-migration) | **−14.9 s (3.3×)** |
 | diff-snapshots text | `--bench 1 -j 16` | **208.6 s (3m28s)** | `b02d86bc` | 2150.9 s (35m51s, sequential) | **−1942 s (10.2×)** |
 | diff-snapshots --format osc | `--bench 1 -j 16` | **313.8 s (5m13s)** | `9b3fc2b9` | 2225.6 s (37m06s, sequential) | **−1912 s (7.1×)** |
 
-All three carry the 2026-04-18 `ca6711e` + `aa3147c` short-circuit +
+All four carry the 2026-04-18 `ca6711e` + `aa3147c` short-circuit +
 seek-raw fixes plus the 2026-04-20 patches:
 
 - `HeaderWalker` (shared): opens the fd with `posix_fadvise(POSIX_FADV_RANDOM)`
@@ -379,7 +380,10 @@ seek-raw fixes plus the 2026-04-20 patches:
   prefix + header bytes), no blob body read. Avoids the `BufReader`
   amplification where data bytes that happen to sit inside the 256 KB
   buffer window get read and discarded. Planet getid walker: 88 GB →
-  636 MB of disk read.
+  636 MB of disk read. Planet inspect default path: 36.3 GB → 14.2 GB
+  disk read (the remaining 14 GB is kernel page-granularity fetches at
+  2 preads × ~4 KB × ~600K blobs plus some residual readahead despite
+  `fadvise(RANDOM)`).
 - Shard-based parallel block-pair merge for `diff` text and osc. N-1
   thresholds at old-blob boundaries; straddling new blobs are read
   by both adjacent shards and each shard's element merge clips to its
@@ -387,10 +391,11 @@ seek-raw fixes plus the 2026-04-20 patches:
   output in memory) / 663 MB (osc, shards stream XML to scratch temp
   files). Shard balance within 1.03× max/min on germany.
 
-`getid` is still syscall-bound on the ~1.2 M header preads (~6-7 s of
-pure syscall time); a 1-pread-per-blob variant would halve that. `diff`
-osc's lower speedup is the serial `assemble_osc` gzip + concat of
-~45 GB of XML fragment temp files (32.8 s / 10 % of wall).
+`getid` and `inspect` are syscall-bound on the ~1.2 M header preads
+(~6-7 s of pure syscall time each); a 1-pread-per-blob variant would
+halve that. `diff` osc's lower speedup is the serial `assemble_osc`
+gzip + concat of ~45 GB of XML fragment temp files (32.8 s / 10 % of
+wall).
 
 Previous-plan docs (`notes/diff-snapshots-opportunities.md`,
 `notes/getid-include-optimization.md`) are retired.

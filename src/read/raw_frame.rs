@@ -87,14 +87,15 @@ pub(crate) fn read_raw_frame<R: Read>(
 
 /// Parsed blob header without the blob data payload.
 ///
-/// Used by the index-only inspect path. The caller must either read
-/// or skip `data_size` bytes from the reader after receiving this.
+/// Used by lightweight header-only probes (`check_sorted_and_indexed`,
+/// indexed-check short-circuit). For random-access pread-based header
+/// walks use `crate::read::header_walker::HeaderWalker` instead - it
+/// skips the `BufReader` buffer-passthrough amplification on cold
+/// caches.
 pub(crate) struct BlobHeaderInfo {
     pub blob_type: BlobKind,
     pub data_size: usize,
     pub index: Option<BlobIndex>,
-    /// Total frame size: 4 + header_len + data_size.
-    pub frame_size: usize,
 }
 
 /// Read the next blob header without reading the blob data payload.
@@ -126,12 +127,10 @@ pub(crate) fn read_blob_header_only(
     let index = raw_index.and_then(|ref data| BlobIndex::deserialize(data));
 
     *file_offset += (4 + header_len) as u64;
-    let frame_size = 4 + header_len + data_size;
 
     Ok(Some(BlobHeaderInfo {
         blob_type,
         data_size,
         index,
-        frame_size,
     }))
 }

@@ -38,6 +38,7 @@ Every command listed below runs on the full planet on normal hardware. Measured 
 
 | Command | Wall | Peak anon RSS | Notes |
 |---------|------|---------------|-------|
+| `inspect` (default metadata, index-only) | 6.5s | 5 MB | pread-only blob-header scan with `fadvise(RANDOM)`, no body reads when every blob has indexdata |
 | `getid` (include, pread header walk) | 7s | 27 MB | pread-only blob-header scan with `fadvise(RANDOM)`, on-demand body preads |
 | `cat --type way` (raw passthrough) | 45s | 10 MB | zero decompression, indexdata blob filter |
 | `tags-filter -R highway=primary` | 52s | 688 MB | single-pass (`--omit-referenced`), parallel classify |

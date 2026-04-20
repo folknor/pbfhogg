@@ -1,10 +1,9 @@
 //! PBF scanning: index-only fast path and full-decode fallback. Produces an
 //! `InspectReport` that the report/json modules later render.
 
-use std::io::Read;
 use std::path::Path;
 
-use crate::read::raw_frame::{read_blob_header_only, read_raw_frame};
+use crate::read::raw_frame::read_raw_frame;
 use super::super::Result;
 use super::types::{
     classify_block, is_standard_ordering, update_extended_for_element, BlockAccum, BlockInfo,
@@ -13,6 +12,7 @@ use super::types::{
 use crate::blob::{decode_blob_to_headerblock, decompress_blob_data_into, BlobKind};
 use crate::blob_meta::ElemKind;
 use crate::file_reader::FileReader;
+use crate::read::header_walker::HeaderWalker;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -46,11 +46,23 @@ pub fn inspect(
 
 /// Attempt an index-only scan. Returns `None` if any OsmData blob lacks indexdata,
 /// signalling the caller to fall back to full decode.
+///
+/// Uses the shared pread-only `HeaderWalker` primitive: headers are read via
+/// small per-blob `pread`s and blob data payloads are skipped by advancing
+/// the file offset, not by pulling bytes through a buffered reader. Avoids
+/// the `BufReader::seek_relative` amplification that pulled ~40-50% of file
+/// size into the page cache on cold-cache planet runs (21 s / 36 GB read
+/// before the migration on a half-cached planet).
+///
+/// `direct_io` is intentionally ignored on the fast path - `HeaderWalker`
+/// sets `posix_fadvise(POSIX_FADV_RANDOM)` on the fd, and O_DIRECT's
+/// page-alignment requirements are incompatible with the tiny header
+/// reads. The full-decode fallback still honours `direct_io`.
 fn try_index_only_scan(
     path: &Path,
     show_blocks: bool,
     show_id_ranges: bool,
-    direct_io: bool,
+    _direct_io: bool,
 ) -> Result<Option<InspectReport>> {
     let meta = std::fs::metadata(path)?;
     let file_name = path
@@ -58,39 +70,39 @@ fn try_index_only_scan(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
 
-    let mut reader = FileReader::open(path, direct_io)?;
-    let mut offset = 0u64;
+    let mut walker = HeaderWalker::open(path)?;
     let mut header_meta = HeaderMeta::default();
+    let mut data_buf: Vec<u8> = Vec::new();
 
     let mut accum = BlockAccum::new(show_blocks);
     let mut block_number = 0u32;
     let mut state = ScanState::new(show_id_ranges, false, false);
     let mut total_data_blobs = 0u64;
 
-    while let Some(info) = read_blob_header_only(&mut reader, &mut offset)? {
-        match info.blob_type {
+    while let Some(header) = walker.next_header()? {
+        match header.blob_type {
             BlobKind::OsmHeader => {
-                let mut blob_bytes = vec![0u8; info.data_size];
-                reader.read_exact(&mut blob_bytes)?;
-                offset += info.data_size as u64;
-                let header = decode_blob_to_headerblock(&blob_bytes)?;
-                header_meta = extract_header_metadata(&header);
+                walker.pread_data(header.data_offset, header.data_size, &mut data_buf)?;
+                let block = decode_blob_to_headerblock(&data_buf)?;
+                header_meta = extract_header_metadata(&block);
             }
             BlobKind::OsmData => {
                 total_data_blobs += 1;
-                let Some(index) = info.index else {
+                let Some(index) = header.index else {
                     return Ok(None); // fallback to full decode
                 };
                 block_number += 1;
                 accumulate_from_index(
-                    &index, &info, block_number, &mut state, &mut accum,
+                    &index,
+                    header.data_size,
+                    header.frame_size,
+                    block_number,
+                    &mut state,
+                    &mut accum,
                 );
-                reader.skip(info.data_size as u64)?;
-                offset += info.data_size as u64;
             }
             BlobKind::Unknown(_) => {
-                reader.skip(info.data_size as u64)?;
-                offset += info.data_size as u64;
+                // Already skipped by the walker's offset advance.
             }
         }
     }
@@ -109,7 +121,8 @@ fn try_index_only_scan(
 /// Update accumulators from a single blob's index metadata (no decompression).
 fn accumulate_from_index(
     index: &crate::blob_meta::BlobIndex,
-    info: &crate::read::raw_frame::BlobHeaderInfo,
+    data_size: usize,
+    frame_size: usize,
     block_number: u32,
     state: &mut ScanState,
     accum: &mut BlockAccum,
@@ -141,7 +154,7 @@ fn accumulate_from_index(
         BlockKind::Mixed => &mut accum.mixed_type,
     };
     stats.block_count += 1;
-    stats.frame_bytes += info.frame_size as u64;
+    stats.frame_bytes += frame_size as u64;
     stats.element_count += index.count;
 
     // Ordering segments
@@ -161,7 +174,7 @@ fn accumulate_from_index(
             number: block_number,
             kind,
             elements: index.count,
-            compressed: info.data_size,
+            compressed: data_size,
             raw: None,
         });
     }

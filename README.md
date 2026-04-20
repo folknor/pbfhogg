@@ -41,7 +41,7 @@ Every command listed below runs on the full planet on normal hardware. Measured 
 | `inspect` (default metadata, index-only) | 6.5s | 5 MB | pread-only blob-header scan with `fadvise(RANDOM)`, no body reads when every blob has indexdata |
 | `inspect --nodes -j 16` | 56.8s | 410 MB | parallel node-blob scan via `parallel_classify_accumulate`, per-worker scalar stats + FOR-block histograms merged at completion |
 | `inspect --tags -j 16` | 2m50s | 17.5 GB | parallel per-blob tag maps merged on main thread; peak is dominated by the global `(key, value)` map + glibc fragmentation |
-| `getid` (include, pread header walk) | 7s | 27 MB | pread-only blob-header scan with `fadvise(RANDOM)`, on-demand body preads |
+| `getid` (include, pread header walk) | 6.1s | 27 MB | pread-only blob-header scan with `fadvise(RANDOM)`, one 4 KB probe per blob, on-demand body preads |
 | `cat --type way` (raw passthrough) | 45s | 10 MB | zero decompression, indexdata blob filter |
 | `tags-filter -R highway=primary` | 52s | 688 MB | single-pass (`--omit-referenced`), parallel classify |
 | `check --ids --full` | 1m10s | 2.22 GB | monotonicity + type-order + per-type duplicate detection over 11.6B elements |
@@ -49,7 +49,7 @@ Every command listed below runs on the full planet on normal hardware. Measured 
 | `cat` (indexdata generation) | 1m26s | ~200 MB | rewrites BlobHeader without re-compressing |
 | `getid --invert` | 1m31s | 102 MB | raw-frame passthrough for non-intersecting blobs |
 | `renumber` | 3m25s | 3.3 GB | wire-format rewriters, shared atomic IdSet |
-| `diff -j 16` (two independent 47-day-apart planets, text) | 3m28s | 2.29 GB | ID-range shard plan, parallel block-pair merge, 10.2× vs sequential |
+| `diff -j 16` (two independent 47-day-apart planets, text) | 3m49s | 586 MB | ID-range shard plan, parallel block-pair merge, per-shard temp files, 9.3× vs sequential |
 | `extract --smart` (Europe bbox) | 4m28s | 11.17 GB | three-pass, multipolygon-complete |
 | `add-locations-to-ways --index-type external` | 11m01s | 17.2 GB | rank-bucketed counting sort → per-blob delta-varint coord payloads, ~246 GB temp disk |
 | `apply-changes` (daily diff, zlib) | 12m36s | ~1.8 GB | 3.4M-change daily diff, 86% rewrite |

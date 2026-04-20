@@ -3,16 +3,19 @@
 //! Splits the ID space into N shards and runs an independent block-pair
 //! merge per shard on a worker thread. Each shard is self-contained:
 //! it owns its slice of old-side blobs and new-side blobs, runs its
-//! merge loop with pread from a shared File, and buffers output in an
-//! owned `Vec<u8>`. Main thread concatenates buffers in shard order.
+//! merge loop with pread from a shared File, and streams output to a
+//! per-shard scratch temp file. Main thread concatenates those temp
+//! files to the caller's output in shard order.
 //!
-//! Hardcoded to `diff` text semantics; the `--format osc` path has
-//! its own parallel driver in `derive_parallel.rs` that mirrors the
-//! same shard plan but emits XML fragments to per-shard temp files.
+//! The temp-file output shape keeps steady-state anon RSS flat; an
+//! earlier in-memory `Vec<u8>` shape buffered the full per-shard text
+//! until join, peaking at ~2.3 GB on a planet diff at `-j 16`. The
+//! sibling `--format osc` driver in `derive_parallel.rs` already used
+//! per-shard temp files for the same reason.
 
-use std::io::Write;
+use std::io::{self, BufWriter, Write};
 use std::os::unix::fs::FileExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::blob_meta::{BlobIndex, ElemKind};
@@ -22,6 +25,10 @@ use crate::read::header_walker::HeaderWalker;
 use crate::{Element, PrimitiveBlock};
 
 use super::{DiffOptions, DiffStats};
+
+fn io_err(e: io::Error) -> crate::error::Error {
+    crate::error::new_error(crate::error::ErrorKind::Io(e))
+}
 
 // ---------------------------------------------------------------------------
 // Blob descriptor walker
@@ -181,8 +188,10 @@ fn build_shard(
 
 /// What one shard worker produces.
 struct ShardOutput {
-    /// Formatted diff output text (to be written to stdout in shard order).
-    text: Vec<u8>,
+    /// Path to the per-shard scratch temp file holding this shard's
+    /// formatted diff text. The driver streams it in shard order to the
+    /// caller's output and then removes it.
+    text_path: PathBuf,
     /// Per-shard stats, aggregated into the caller's `DiffStats`.
     stats: DiffStats,
 }
@@ -210,24 +219,36 @@ struct Side {
     index: BlobIndex,
 }
 
-/// Run one shard's block-pair merge. Returns formatted text + stats.
+/// Run one shard's block-pair merge. Streams formatted text to a
+/// per-shard scratch temp file and returns its path + stats.
 ///
 /// This is a self-contained reimplementation of the `block_pair_merge_phase`
 /// control flow, scoped to the shard's blob index ranges. It assumes both
 /// inputs are sorted and that the blob lists carry indexdata (established
 /// by the walker).
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_shard(
     shard: Shard,
+    shard_idx: usize,
     old_descs: &[BlobDesc],
     new_descs: &[BlobDesc],
     old_file: &std::fs::File,
     new_file: &std::fs::File,
     kind: ElemKind,
     options: &DiffOptions,
+    scratch_dir: &Path,
 ) -> Result<ShardOutput> {
     let type_char = kind_type_char(kind);
-    let mut out = Vec::<u8>::new();
+    let kind_tag = match kind {
+        ElemKind::Node => "n",
+        ElemKind::Way => "w",
+        ElemKind::Relation => "r",
+    };
+    let pid = std::process::id();
+    let text_path = scratch_dir.join(format!("diff-par-{pid}-{kind_tag}-{shard_idx}.txt.tmp"));
+    let file = std::fs::File::create(&text_path).map_err(io_err)?;
+    let mut out = BufWriter::new(file);
+
     let mut stats = DiffStats {
         common: 0,
         created: 0,
@@ -280,21 +301,21 @@ fn run_shard(
             (None, None) => break,
             (Some(_), None) => {
                 let os = old_decoded.take().expect("checked");
-                emit_side(&mut out, &os, true, type_char, t_low, t_high, &mut stats);
+                emit_side(&mut out, &os, true, type_char, t_low, t_high, &mut stats)?;
             }
             (None, Some(_)) => {
                 let ns = new_decoded.take().expect("checked");
-                emit_side(&mut out, &ns, false, type_char, t_low, t_high, &mut stats);
+                emit_side(&mut out, &ns, false, type_char, t_low, t_high, &mut stats)?;
             }
             (Some(os), Some(ns)) => {
                 if os.index.max_id < ns.index.min_id {
                     let os = old_decoded.take().expect("checked");
-                    emit_side(&mut out, &os, true, type_char, t_low, t_high, &mut stats);
+                    emit_side(&mut out, &os, true, type_char, t_low, t_high, &mut stats)?;
                     continue;
                 }
                 if ns.index.max_id < os.index.min_id {
                     let ns = new_decoded.take().expect("checked");
-                    emit_side(&mut out, &ns, false, type_char, t_low, t_high, &mut stats);
+                    emit_side(&mut out, &ns, false, type_char, t_low, t_high, &mut stats)?;
                     continue;
                 }
                 // Overlapping - merge element by element.
@@ -312,21 +333,24 @@ fn run_shard(
         }
     }
 
-    Ok(ShardOutput { text: out, stats })
+    // BufWriter::into_inner propagates any deferred flush error; dropping
+    // the unwrapped File closes it and the main thread reopens the path.
+    let _ = out.into_inner().map_err(|e| io_err(e.into_error()))?;
+    Ok(ShardOutput { text_path, stats })
 }
 
 /// Emit elements of a decoded block (single-sided: all OldOnly or all
 /// NewOnly) clipped to the shard's ID window `(t_low, t_high]`.
 #[allow(clippy::too_many_arguments)]
 fn emit_side(
-    out: &mut Vec<u8>,
+    out: &mut impl Write,
     side: &Side,
     is_old: bool,
     type_char: char,
     t_low: i64,
     t_high: i64,
     stats: &mut DiffStats,
-) {
+) -> Result<()> {
     let prefix = if is_old { '-' } else { '+' };
     for elem in side.block.elements().skip(side.skip_count) {
         let id = crate::osc::merge_join::element_id(&elem);
@@ -337,13 +361,14 @@ fn emit_side(
             break;
         }
         let version = crate::osc::merge_join::element_version(&elem);
-        emit_element(out, prefix, type_char, id, version);
+        emit_element(out, prefix, type_char, id, version)?;
         if is_old {
             stats.deleted += 1;
         } else {
             stats.created += 1;
         }
     }
+    Ok(())
 }
 
 /// Merge two overlapping decoded blocks, updating residuals in place.
@@ -355,7 +380,7 @@ fn merge_decoded(
     t_low: i64,
     t_high: i64,
     options: &DiffOptions,
-    out: &mut Vec<u8>,
+    out: &mut impl Write,
     stats: &mut DiffStats,
 ) -> Result<()> {
     let mut os = old_decoded.take().expect("checked");
@@ -399,7 +424,7 @@ fn element_merge(
     t_low: i64,
     type_char: char,
     options: &DiffOptions,
-    out: &mut Vec<u8>,
+    out: &mut impl Write,
     stats: &mut DiffStats,
 ) -> Result<(usize, usize)> {
     use crate::osc::merge_join::{element_id, element_version};
@@ -429,13 +454,13 @@ fn element_merge(
             (false, false) => break,
             (true, false) => {
                 let o = old_iter.next().expect("checked peek");
-                emit_element(out, '-', type_char, element_id(&o), element_version(&o));
+                emit_element(out, '-', type_char, element_id(&o), element_version(&o))?;
                 stats.deleted += 1;
                 old_consumed += 1;
             }
             (false, true) => {
                 let n = new_iter.next().expect("checked peek");
-                emit_element(out, '+', type_char, element_id(&n), element_version(&n));
+                emit_element(out, '+', type_char, element_id(&n), element_version(&n))?;
                 stats.created += 1;
                 new_consumed += 1;
             }
@@ -445,13 +470,13 @@ fn element_merge(
                 match crate::osm_id::osm_id_cmp(o_id, n_id) {
                     std::cmp::Ordering::Less => {
                         let o = old_iter.next().expect("checked");
-                        emit_element(out, '-', type_char, element_id(&o), element_version(&o));
+                        emit_element(out, '-', type_char, element_id(&o), element_version(&o))?;
                         stats.deleted += 1;
                         old_consumed += 1;
                     }
                     std::cmp::Ordering::Greater => {
                         let n = new_iter.next().expect("checked");
-                        emit_element(out, '+', type_char, element_id(&n), element_version(&n));
+                        emit_element(out, '+', type_char, element_id(&n), element_version(&n))?;
                         stats.created += 1;
                         new_consumed += 1;
                     }
@@ -468,13 +493,13 @@ fn element_merge(
                                     type_char,
                                     o_id,
                                     element_version(&o),
-                                );
+                                )?;
                             }
                             stats.common += 1;
                         } else {
                             let old_ver = element_version(&o);
                             let new_ver = element_version(&n);
-                            emit_modified(out, type_char, o_id, old_ver, new_ver);
+                            emit_modified(out, type_char, o_id, old_ver, new_ver)?;
                             // Verbose details are not supported on the parallel
                             // path yet. Callers that need verbose should use the
                             // sequential `diff_block_pair` (parallel shards are
@@ -564,35 +589,36 @@ fn kind_type_char(kind: ElemKind) -> char {
     }
 }
 
-fn emit_element(out: &mut Vec<u8>, prefix: char, type_char: char, id: i64, version: Option<i32>) {
+fn emit_element(
+    out: &mut impl Write,
+    prefix: char,
+    type_char: char,
+    id: i64,
+    version: Option<i32>,
+) -> Result<()> {
     match version {
-        Some(v) => {
-            writeln!(out, "{prefix}{type_char}{id} v{v}")
-                .expect("writing to Vec<u8> never fails in practice");
-        }
-        None => {
-            writeln!(out, "{prefix}{type_char}{id}")
-                .expect("writing to Vec<u8> never fails in practice");
-        }
+        Some(v) => writeln!(out, "{prefix}{type_char}{id} v{v}"),
+        None => writeln!(out, "{prefix}{type_char}{id}"),
     }
+    .map_err(io_err)
 }
 
 fn emit_modified(
-    out: &mut Vec<u8>,
+    out: &mut impl Write,
     type_char: char,
     id: i64,
     old_version: Option<i32>,
     new_version: Option<i32>,
-) {
-    let r = match (old_version, new_version) {
+) -> Result<()> {
+    match (old_version, new_version) {
         (Some(ov), Some(nv)) if ov != nv => {
             writeln!(out, "*{type_char}{id} v{ov} -> v{nv}")
         }
         (_, Some(v)) => writeln!(out, "*{type_char}{id} v{v}"),
         (Some(v), None) => writeln!(out, "*{type_char}{id} v{v}"),
         (None, None) => writeln!(out, "*{type_char}{id}"),
-    };
-    r.expect("writing to Vec<u8> never fails in practice");
+    }
+    .map_err(io_err)
 }
 
 // ---------------------------------------------------------------------------
@@ -619,6 +645,11 @@ pub(crate) fn diff_block_pair_parallel(
     // re-emit here.
     let old = walk_file(old_path)?;
     let new = walk_file(new_path)?;
+
+    // Scratch temp files live alongside the old input (its parent is assumed
+    // to be on a writable, fast filesystem; this is the same assumption the
+    // `--format osc` sibling driver makes for its shard fragments).
+    let scratch_dir = old_path.parent().unwrap_or(Path::new("."));
 
     let mut total = DiffStats {
         common: 0,
@@ -681,18 +712,20 @@ pub(crate) fn diff_block_pair_parallel(
 
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(shards.len());
-            for shard in shards.iter().copied() {
+            for (shard_idx, shard) in shards.iter().copied().enumerate() {
                 let old_file = Arc::clone(&old.file);
                 let new_file = Arc::clone(&new.file);
                 let h = s.spawn(move || {
                     run_shard(
                         shard,
+                        shard_idx,
                         old_descs,
                         new_descs,
                         &old_file,
                         &new_file,
                         kind,
                         options,
+                        scratch_dir,
                     )
                 });
                 handles.push(h);
@@ -706,12 +739,11 @@ pub(crate) fn diff_block_pair_parallel(
             }
         });
 
-        // Emit shard outputs in shard order.
+        // Emit shard outputs in shard order: stream each per-shard temp file
+        // to the caller's output, then remove it.
         for slot in shard_outputs {
             let shard_out = slot.expect("all slots filled")?;
-            output
-                .write_all(&shard_out.text)
-                .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+            append_and_cleanup(output, &shard_out.text_path)?;
             total.common += shard_out.stats.common;
             total.created += shard_out.stats.created;
             total.modified += shard_out.stats.modified;
@@ -722,4 +754,14 @@ pub(crate) fn diff_block_pair_parallel(
     }
 
     Ok(total)
+}
+
+/// Copy a shard's scratch temp file to the caller's output writer and then
+/// remove it. Mirrors `derive_parallel::append_and_cleanup`.
+fn append_and_cleanup(out: &mut impl Write, src: &Path) -> Result<()> {
+    let mut f = std::fs::File::open(src).map_err(io_err)?;
+    io::copy(&mut f, out).map_err(io_err)?;
+    drop(f);
+    drop(std::fs::remove_file(src));
+    Ok(())
 }

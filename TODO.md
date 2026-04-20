@@ -12,9 +12,9 @@ Four planet-scale command plans are in notes, each with a ranked set of opportun
 
 - [ ] **[notes/apply-changes-opportunities.md](notes/apply-changes-opportunities.md)** - `apply-changes --locations-on-ways`. Current: **762 s / 1.8 GB RSS** at planet under production `--compression none`. Target: **~9-10 min / same RSS**. Already mostly well-shaped; two incremental parallelizations remaining - `NodeLocationIndex::prefill_from_base` and the sequential reader thread. No reshape needed.
 
-- [x] ~~**getid include mode**~~ - landed 2026-04-20 via a shared `pread`-only `HeaderWalker` primitive (`src/read/header_walker.rs`). Planet **43.7 s → 7.0 s (6.2×)**, germany 200 ms, disk read 88 GB → 636 MB. Walker is now syscall-bound (~1.2 M preads at planet); going to <1 s would need a 1-pread-per-blob variant plus io_uring batching - not pursued. Plan doc retired.
+- [x] ~~**getid include mode**~~ - landed 2026-04-20 via a shared `pread`-only `HeaderWalker` primitive (`src/read/header_walker.rs`). Planet **43.7 s → 6.1 s (7.2×, UUID `24362e36`)**, germany 200 ms, disk read 88 GB → 601 MB. Initial HeaderWalker landing hit 7.0 s with two preads per blob; the follow-up 1-pread probe walker (commit `d263d76`) trimmed a further 0.9 s (-13 %). Walker is syscall-bound; going lower would need io_uring batching - not pursued. Plan doc retired.
 
-- [x] ~~**diff-snapshots (text and `--format osc`)**~~ - landed 2026-04-20. Planet baselines: text **2134 s / 35m34s**, osc **2225 s / 37m06s**. ID-range sharded parallel block-pair merge for both paths: text planet **208.6 s / 3m28s at `-j 16` (UUID `b02d86bc`, 10.2× speedup)**, osc planet **313.8 s / 5m13s at `-j 16` (UUID `9b3fc2b9`, 7.1× speedup)**. CLI flag `-j/--jobs N` on `pbfhogg diff`. Germany text 16.5 s, germany osc 20.4 s at `-j 8`. Peak RSS 2.29 GB (text; shards buffer output in memory) / 663 MB (osc; shards stream to per-shard scratch temp files) at planet; shard balance within 1.03× max/min. Both paths beat the 8-min aspirational target. OSC speedup is lower because the final `assemble_osc` (gzip + concat of ~45 GB of XML fragments) is single-threaded and runs 32.8 s. Remaining follow-ups (all small, below): auto-enable parallel by default, halve walker syscalls via 1-pread-per-blob, migrate `diff/parallel.rs::walk_file` onto the shared `HeaderWalker`, parallelise `assemble_osc` gzip, stream text shard output to per-shard temp files to drop the 2.29 GB peak. Plan doc retired.
+- [x] ~~**diff-snapshots (text and `--format osc`)**~~ - landed 2026-04-20. Planet baselines: text **2134 s / 35m34s**, osc **2225 s / 37m06s**. ID-range sharded parallel block-pair merge for both paths: text planet **229.4 s / 3m49s at `-j 16` (9.3× speedup, temp-file shape, 586 MB peak anon)**, osc planet **313.8 s / 5m13s at `-j 16` (UUID `9b3fc2b9`, 7.1× speedup, 663 MB peak anon)**. CLI flag `-j/--jobs N` on `pbfhogg diff`. Germany text 16.5 s, germany osc 20.4 s at `-j 8`. Both paths now stream shard output to per-shard scratch temp files; an interim text-shape buffered each shard in a `Vec<u8>` (208.6 s, UUID `b02d86bc`, 2.29 GB peak anon) and was replaced with the temp-file shape for a 74 % RSS drop at a 10 % wall cost. Shard balance within 1.03× max/min. Both paths beat the 8-min aspirational target. OSC speedup is lower because the final `assemble_osc` (gzip + concat of ~45 GB of XML fragments) is single-threaded and runs 32.8 s. Remaining follow-ups (all small, below): auto-enable parallel by default, parallelise `assemble_osc` gzip. Plan doc retired.
 
 - [ ] **[notes/altw-structural-reports.md](notes/altw-structural-reports.md)** - `add-locations-to-ways --index-type external`. Current planet baseline: **661.2 s `--bench 3`** (UUID `a406d77e`, commit `aee7727`, 2026-04-18 post-regression-fix). Europe **291.6 s** after metadata-driven relation scan (`6d71053`). Doc consolidates six independent reviews into 11 ranked opportunities. Dominant theme: the stage 2 → stage 3 → stage 4 disk-seam chain, with ~80 GB rank shards + ~112 GB slot buckets + finalize. Stage-2 de-ranking and `BlobLocationRouter` already shipped (Europe 320.5 s → 291.6 s total). Measurement history + already-shipped context in [`notes/altw-optimization-history.md`](notes/altw-optimization-history.md); the failed in-RAM-coord-table reshape experiment is documented at [`notes/altw-as-renumber.md`](notes/altw-as-renumber.md) and does not invalidate the remaining ranked items.
 
@@ -48,17 +48,6 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   don't exist in the base PBF, then re-extract to filter to bbox.
 
 ## Performance
-
-- [ ] **Stream diff text shard output to temp files**. Today each
-  `diff` text shard buffers its formatted output in an in-memory
-  `Vec<u8>` until all workers finish. At planet `-j 16` this peaks
-  at ~2.29 GB anon RSS. Switch to per-shard scratch temp files
-  (same shape as the osc path already has) or pipe shard-ordered
-  output directly to stdout via a reorder buffer. Drops peak to
-  the osc-path level (~660 MB) and lets the parallel path run on
-  lower-memory hosts without trouble. Only relevant if someone
-  runs diff text at planet scale on a tight-memory box; current
-  27 GB envelope handles it comfortably.
 
 - [ ] **Parallelise `assemble_osc` gzip**. Final serial tail in
   `diff --format osc -j 16` is 32.8 s at planet (10 % of wall;

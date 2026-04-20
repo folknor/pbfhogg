@@ -229,6 +229,13 @@ enum Command {
         /// Filter by element type (comma-separated: node, way, relation)
         #[arg(short = 't', long = "type")]
         type_filter: Option<String>,
+        /// Number of parallel shards for the block-pair merge. `1` (default)
+        /// keeps the sequential path; `0` auto-picks from available cores;
+        /// higher values partition the ID space across that many worker
+        /// threads. Only applies when both inputs are indexed and when
+        /// --format is text (not osc).
+        #[arg(short = 'j', long = "jobs", default_value = "1")]
+        jobs: usize,
         /// Output format: text (default) or osc
         #[arg(long, default_value = "text")]
         format: DiffFormat,
@@ -796,6 +803,7 @@ fn main() -> process::ExitCode {
             quiet,
             output,
             type_filter,
+            jobs,
             format,
             increment_version,
             update_timestamp,
@@ -818,6 +826,9 @@ fn main() -> process::ExitCode {
                 if type_filter.is_some() {
                     return Err("--type is not valid with --format osc".into());
                 }
+                if jobs != 1 {
+                    return Err("--jobs is not valid with --format osc yet (only the text path is parallelised)".into());
+                }
                 run_derive_changes(&old, &new, &output, io.direct_io, increment_version, update_timestamp)
             }
             DiffFormat::Text => {
@@ -836,6 +847,7 @@ fn main() -> process::ExitCode {
                     quiet,
                     output.as_deref(),
                     type_filter.as_deref(),
+                    jobs,
                     io.direct_io,
                 )
             }
@@ -1640,15 +1652,25 @@ fn run_diff(
     quiet: bool,
     output_path: Option<&std::path::Path>,
     type_filter: Option<&str>,
+    jobs: usize,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
+
+    let jobs_resolved = if jobs == 0 {
+        std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+    } else {
+        jobs
+    };
 
     let options = pbfhogg::diff::DiffOptions {
         suppress_common,
         verbose,
         summary,
         type_filter: type_filter.map(String::from),
+        jobs: jobs_resolved,
     };
     let stats = if quiet {
         let mut sink = std::io::sink();

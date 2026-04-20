@@ -93,6 +93,11 @@ pub struct DiffOptions {
     pub summary: bool,
     /// Comma-separated type filter (e.g. "node,way").
     pub type_filter: Option<String>,
+    /// Number of parallel shards for the block-pair merge. `1` runs the
+    /// sequential path (default); `>=2` dispatches N shards across
+    /// worker threads. The caller is responsible for resolving `0` =
+    /// auto before passing this in.
+    pub jobs: usize,
 }
 
 /// Statistics from a diff operation.
@@ -191,15 +196,7 @@ pub fn diff(
 
     crate::debug::emit_marker("DIFF_SCAN_START");
 
-    // Parallel shard-based path opt-in via env var. See
-    // `notes/diff-snapshots-opportunities.md` item 1. Only valid when
-    // both inputs are indexed (same constraint as diff_block_pair).
-    let parallel_shards: usize = std::env::var("PBFHOGG_DIFF_SHARDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
-
-    let stats = if both_indexed && parallel_shards > 1 {
+    let stats = if both_indexed && options.jobs > 1 {
         parallel::diff_block_pair_parallel(
             old_path,
             new_path,
@@ -207,7 +204,7 @@ pub fn diff(
             options,
             direct_io,
             &filter,
-            parallel_shards,
+            options.jobs,
         )?
     } else if both_indexed {
         diff_block_pair(old_path, new_path, output, options, direct_io, &filter)?

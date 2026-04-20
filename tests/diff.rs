@@ -26,6 +26,7 @@ fn default_options() -> DiffOptions {
         verbose: false,
         summary: false,
         type_filter: None,
+        jobs: 1,
     }
 }
 

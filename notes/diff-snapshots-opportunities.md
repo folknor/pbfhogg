@@ -479,23 +479,25 @@ io_uring matters. Not before. Closed for now.
    `e27c89e`. Baseline `22e4f65f` at 103.3 s. Use this instead of
    planet during the inner loop.
 5. ~~**Parallel blob-pair merge (item 1 above).**~~ landed 2026-04-20.
-   Shard-based. Opt-in via `PBFHOGG_DIFF_SHARDS=N` env var. Below.
-6. **Follow-ups (open).**
-   - **Promote env var to CLI flag.** `pbfhogg diff --shards N`
-     (and `pbfhogg diff-snapshots` entry point inherits).
-   - **pread-only walker.** Cold walker reads ~45 GB of blob data
-     sequentially just to locate headers (warm cache reduces this
-     to a few MB). Switching to pread of header bytes only should
-     drop the walker phase from 33 s to ~3 s on planet.
+   Shard-based, CLI `-j/--jobs N` on `pbfhogg diff`.
+6. ~~**Pread-only walker.**~~ landed 2026-04-20. Planet walker phase
+   **32.9 s → 14.9 s** (45 GB → 2.6 GB read); now syscall-bound on
+   ~600 K preads at planet scale.
+7. **Follow-ups (open).**
    - **Generalise to `derive_changes` / `--format osc`.** The
      parallel path today only implements `diff`. The OSC emit
      logic (`<create>/<modify>/<delete>` XML) can follow the
      same shard plan; the worker writes owned XML fragments
-     that main concatenates in shard order.
-   - **Auto-enable by default.** Pick shard count from
-     `std::thread::available_parallelism()` when the user doesn't
-     set one. Gate on `both_indexed` so non-indexed inputs fall
-     through to the element-stream path.
+     that main concatenates in shard order. CLI currently
+     rejects `-j > 1` when `--format osc`.
+   - **Auto-enable by default.** Evaluate flipping the default
+     `-j` from `1` to `0` (auto from `available_parallelism()`)
+     once we have experience with the parallel path in the wild.
+   - **Halve walker syscalls.** One pread of (length_prefix +
+     header) per blob instead of two separate preads - reads 1 KB
+     (covers any reasonable header) at the blob offset, parses
+     length + header from the buffer. Cuts ~300 K syscalls at
+     planet, saving ~7 s.
 7. **Per-element cost reductions (item 3a, 3b from the ranked list).**
    Only if workloads with smaller blob counts (where the walker is
    proportionally larger, or the per-shard merge becomes very
@@ -508,13 +510,17 @@ io_uring matters. Not before. Closed for now.
 Commit landing series ending at `a3795c2` (cli ExitCode fix) with
 `src/commands/diff/parallel.rs` as the new path.
 
-| Dataset | Shards | Wall        | Speedup vs baseline | Utilization (NODE) |
+| Dataset | -j     | Wall        | Speedup vs baseline | Utilization (NODE) |
 |---------|-------:|-------------|---------------------|--------------------|
 | Germany |    1   | 103.3 s     | 1.0× (baseline)     | `avg_cores=1.0`    |
 | Germany |    4   |  34.8 s     | 3.0×                | `avg_cores=3.6`    |
 | Germany |    8   |  17.0 s     | 6.1×                | `avg_cores=6.9`    |
+| Germany |    8*  |  18.9 s     | 5.5×                | `avg_cores=6.7`    |
 | Planet  |    1   | 2134.3 s    | 1.0× (baseline)     | `avg_cores=1.0`    |
-| Planet  |   16   |  234.7 s    | **9.1×**            | `avg_cores=14.7`   |
+| Planet  |   16   |  234.7 s    |  9.1×               | `avg_cores=14.7`   |
+| Planet  |   16*  |  219.4 s    | **9.7×**            | `avg_cores=14.6`   |
+
+`*` = pread walker (later in the session, commit TBD).
 
 Planet `avg_cores=14.7` out of 16 shards in the NODE phase (92 %
 utilization). Peak RSS 2.4 GB (comfortable on 27 GB hosts). Walker

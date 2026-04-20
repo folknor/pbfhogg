@@ -44,30 +44,73 @@ struct WalkedFile {
     file: Arc<std::fs::File>,
 }
 
-/// Walk a PBF file's blob headers and collect per-kind `BlobDesc` lists.
-/// Requires each OsmData blob to carry indexdata; returns an error if
-/// any OsmData blob lacks it (same contract as the sequential path).
+/// Walk a PBF file's blob headers via `pread`, collecting per-kind
+/// `BlobDesc` lists. Requires each OsmData blob to carry indexdata;
+/// returns an error if any OsmData blob lacks it.
+///
+/// Header-only walk: each blob costs two small `pread` syscalls
+/// (4-byte length prefix + header_len bytes, typically ~150 B) and
+/// then an offset advance past the data (no read). Avoids the
+/// `BufReader::seek_relative` amplification where data bytes that
+/// happen to fall inside the 256 KB buffer are read and then
+/// discarded; the sequential walker was landing at roughly 50 % of
+/// file size in disk reads, i.e. ~45 GB on planet for a 33 s phase.
+/// This version reads ~20 MB on planet for a handful of seconds.
 fn walk_file(path: &Path) -> Result<WalkedFile> {
-    let mut scanner = crate::blob::BlobReader::seekable_from_path(path)?;
-    scanner.set_parse_indexdata(true);
-    scanner
-        .next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let file = std::fs::File::open(path).map_err(|e| {
+        crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
+            format!("failed to open {}: {e}", path.display()),
+        )))
+    })?;
+    let file_size = file
+        .metadata()
+        .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?
+        .len();
 
     let mut nodes: Vec<BlobDesc> = Vec::new();
     let mut ways: Vec<BlobDesc> = Vec::new();
     let mut rels: Vec<BlobDesc> = Vec::new();
 
-    while let Some(result_item) = scanner.next_header_with_data_offset() {
-        let (hdr, _frame_offset, data_offset, data_size) = result_item?;
-        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) {
+    let mut offset: u64 = 0;
+    let mut header_buf: Vec<u8> = Vec::new();
+    let mut len_buf = [0u8; 4];
+    let mut first = true;
+
+    while offset < file_size {
+        // 4-byte BE length prefix.
+        file.read_exact_at(&mut len_buf, offset)
+            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+        let header_len = u32::from_be_bytes(len_buf) as usize;
+        offset += 4;
+
+        // Header bytes.
+        header_buf.resize(header_len, 0);
+        file.read_exact_at(&mut header_buf, offset)
+            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+        offset += header_len as u64;
+
+        let (blob_type, data_size, raw_index, _tagdata) =
+            crate::read::blob_wire::parse_blob_header_with_index(&header_buf)?;
+        let data_offset = offset;
+        offset += data_size as u64;
+
+        // Skip the required leading OsmHeader blob; every subsequent
+        // OsmData blob must carry indexdata for the parallel path.
+        if first {
+            first = false;
             continue;
         }
-        let index = hdr.index().ok_or_else(|| {
-            crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
-                "block-pair merge requires indexdata but blob has none",
-            )))
-        })?;
+        if !matches!(blob_type, crate::read::blob_wire::BlobKind::OsmData) {
+            continue;
+        }
+        let index = raw_index
+            .as_ref()
+            .and_then(|b| crate::blob_meta::BlobIndex::deserialize(b))
+            .ok_or_else(|| {
+                crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
+                    "block-pair merge requires indexdata but blob has none",
+                )))
+            })?;
         let desc = BlobDesc {
             data_offset,
             data_size,
@@ -80,18 +123,11 @@ fn walk_file(path: &Path) -> Result<WalkedFile> {
         }
     }
 
-    drop(scanner);
-    let file = Arc::new(std::fs::File::open(path).map_err(|e| {
-        crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
-            format!("failed to open {}: {e}", path.display()),
-        )))
-    })?);
-
     Ok(WalkedFile {
         nodes,
         ways,
         relations: rels,
-        file,
+        file: Arc::new(file),
     })
 }
 

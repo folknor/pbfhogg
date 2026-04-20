@@ -94,40 +94,47 @@ pub(super) fn build_blob_schedule(input: &Path) -> Result<Vec<BlobDesc>> {
 
 /// Build a blob schedule, optionally tagging node blobs eligible for raw passthrough.
 /// A node blob is eligible if its bbox is fully contained in the extract bbox.
+///
+/// Walks via the pread-only `HeaderWalker` so blob bodies stay out of the
+/// page cache during the scan - extract's later `pread_execute` pass opens
+/// a fresh fd and reads only the blobs it actually needs.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn build_blob_schedule_with_passthrough(
     input: &Path,
     extract_bbox: Option<&crate::BlobBbox>,
 ) -> Result<Vec<BlobDesc>> {
     crate::debug::emit_marker("EXTRACT_SCHEDULE_SCAN_START");
-    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
-    scanner.set_parse_indexdata(true);
-    scanner.next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
+    let _ = walker
+        .next_header()?
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
 
     let mut schedule = Vec::new();
     let mut passthrough_node_blobs: u64 = 0;
-    while let Some(result_item) = scanner.next_header_with_data_offset() {
-        let (hdr, frame_offset, data_offset, data_size) = result_item?;
-        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
-        let idx = hdr.index();
-        let kind = idx.as_ref().map(|i| i.kind);
+    while let Some(meta) = walker.next_header()? {
+        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) { continue; }
+        let idx = meta.index.as_ref();
+        let kind = idx.map(|i| i.kind);
 
         // Tag node blobs for raw passthrough if fully contained in extract bbox.
         let raw_passthrough = extract_bbox.is_some_and(|ebbox| {
-            idx.as_ref().is_some_and(|i|
+            idx.is_some_and(|i|
                 matches!(i.kind, crate::blob_meta::ElemKind::Node)
                 && i.bbox.as_ref().is_some_and(|bb| ebbox.contains(bb))
             )
         });
         if raw_passthrough { passthrough_node_blobs += 1; }
 
-        let bbox = idx.as_ref().and_then(|i| i.bbox);
-        let count = idx.as_ref().map_or(0, |i| i.count);
+        let bbox = idx.and_then(|i| i.bbox);
+        let count = idx.map_or(0, |i| i.count);
 
-        #[allow(clippy::cast_possible_truncation)]
-        let frame_size = (data_offset - frame_offset) as usize + data_size;
-        schedule.push(BlobDesc { frame_offset, frame_size, offset: data_offset, size: data_size, kind, bbox, count, raw_passthrough });
+        schedule.push(BlobDesc {
+            frame_offset: meta.frame_start,
+            frame_size: meta.frame_size,
+            offset: meta.data_offset,
+            size: meta.data_size,
+            kind, bbox, count, raw_passthrough,
+        });
     }
     crate::debug::emit_marker("EXTRACT_SCHEDULE_SCAN_END");
 

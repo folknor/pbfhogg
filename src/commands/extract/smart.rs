@@ -195,12 +195,12 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     drop(blob_reader);
     drop(decompress_buf);
 
-    // Build per-type schedules from header-only scan.
+    // Build per-type schedules from header-only scan via pread-only HeaderWalker.
     crate::debug::emit_marker("SMART_PASS1_SCHEDULE_SCAN_START");
-    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
-    scanner.set_parse_indexdata(true);
-    scanner.next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
+    let _ = walker
+        .next_header()?
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
 
     let mut node_schedule: Vec<(usize, u64, usize)> = Vec::new();
     let mut way_schedule: Vec<(usize, u64, usize)> = Vec::new();
@@ -217,24 +217,21 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     // residency cascade.
     let mut pass3_blob_schedule: Vec<BlobDesc> = Vec::new();
     let mut seq: usize = 0;
-    while let Some(result_item) = scanner.next_header_with_data_offset() {
-        let (hdr, frame_offset, data_offset, data_size) = result_item?;
-        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
-        let idx = hdr.index();
+    while let Some(meta) = walker.next_header()? {
+        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) { continue; }
+        let idx = meta.index.as_ref();
         // Build pass3_blob_schedule unconditionally for all OsmData blobs.
         // Mirrors build_blob_schedule's behavior (no kind/spatial filter,
         // raw_passthrough=false since smart/complete don't use the
         // passthrough optimization).
-        let bbox = idx.as_ref().and_then(|i| i.bbox);
-        let count = idx.as_ref().map_or(0, |i| i.count);
-        let kind_for_blob = idx.as_ref().map(|i| i.kind);
-        #[allow(clippy::cast_possible_truncation)]
-        let frame_size = (data_offset - frame_offset) as usize + data_size;
+        let bbox = idx.and_then(|i| i.bbox);
+        let count = idx.map_or(0, |i| i.count);
+        let kind_for_blob = idx.map(|i| i.kind);
         pass3_blob_schedule.push(BlobDesc {
-            frame_offset,
-            frame_size,
-            offset: data_offset,
-            size: data_size,
+            frame_offset: meta.frame_start,
+            frame_size: meta.frame_size,
+            offset: meta.data_offset,
+            size: meta.data_size,
             kind: kind_for_blob,
             bbox,
             count,
@@ -243,18 +240,17 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         if let Some(idx) = idx {
             // Build full_way_schedule unconditionally for way blobs.
             if matches!(idx.kind, crate::blob_meta::ElemKind::Way) {
-                full_way_schedule.push((seq, data_offset, data_size));
+                full_way_schedule.push((seq, meta.data_offset, meta.data_size));
             }
-            if !filter.wants_index(&idx) { continue; }
+            if !filter.wants_index(idx) { continue; }
             match idx.kind {
-                crate::blob_meta::ElemKind::Node => node_schedule.push((seq, data_offset, data_size)),
-                crate::blob_meta::ElemKind::Way => way_schedule.push((seq, data_offset, data_size)),
-                crate::blob_meta::ElemKind::Relation => relation_schedule.push((seq, data_offset, data_size)),
+                crate::blob_meta::ElemKind::Node => node_schedule.push((seq, meta.data_offset, meta.data_size)),
+                crate::blob_meta::ElemKind::Way => way_schedule.push((seq, meta.data_offset, meta.data_size)),
+                crate::blob_meta::ElemKind::Relation => relation_schedule.push((seq, meta.data_offset, meta.data_size)),
             }
         }
         seq += 1;
     }
-    drop(scanner);
     crate::debug::emit_marker("SMART_PASS1_SCHEDULE_SCAN_END");
 
     #[allow(clippy::cast_possible_wrap)]
@@ -266,10 +262,8 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         crate::debug::emit_counter("smart_pass1_pass3_blobs", pass3_blob_schedule.len() as i64);
     }
 
-    let shared_file = std::sync::Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
-    );
+    let shared_file = std::sync::Arc::clone(walker.shared_file());
+    drop(walker);
 
     // Phase 1: Classify nodes by region containment.
     // For bbox-only regions, use columnar decode (batch IDs/lats/lons into

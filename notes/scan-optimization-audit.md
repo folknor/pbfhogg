@@ -206,7 +206,7 @@ stamped below when the run completes. Ages computed against
 | diff-snapshots --format osc -j 16 | `9b3fc2b9` | `06628d8` | 313.8 s | today | `ef254a69` / `1245cde` / 329.5 s (+5% drift, no OSC-path shape change between commits) |
 | build-geocode-index | `b4b25c05` | `82db8ed` | 432.9 s | 2d | `d139067d` / `1245cde` / 430.5 s (flat, same cli_args) |
 | add-locations-to-ways (external) | `a406d77e` (--bench 3) | `aee7727` | 661.2 s | 2d | `06924c29` (--bench 1) / `1245cde` / 684.0 s (+3.4% within sample-count drift) |
-| apply-changes --osc-seq 4920 | `8e940f71` | `ef6ce09` | 756.3 s | 3d | `59327f65` / `1245cde` / 577.0 s (-24%, intervening "lift/split" commits in apply_changes + osc - cause not obvious from commit messages) |
+| apply-changes --osc-seq 4920 | `8e940f71` | `ef6ce09` | 756.3 s | 3d | `59327f65` / `1245cde` / 577.0 s (-24%, intervening "lift/split" commits in apply_changes + osc - cause not obvious from commit messages); **post-prefill-walk: `8149b1b5` / `d925bc4` / 589.1 s (+2% vs pre, within --bench 1 noise for ~10-min command)** |
 
 Nothing in the doc should be implemented until the overnight run
 fills in the right-hand column - the 9-day-old extract rows in

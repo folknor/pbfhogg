@@ -165,7 +165,30 @@ Concrete changes:
 
 ---
 
-### #2 - Stream stage 3 → stage 4; eliminate the `coord_payloads` file
+### #2 - Stream stage 3 -> stage 4; eliminate the `coord_payloads` file - **LANDED 2026-04-21 (commits `beb7838` + `f93d896` + `eecb46c`)**
+
+**Landed-result.** Shipped as three commits: A (`beb7838`) switches stage 3's per-worker `BufWriter<File>` to a plain `Arc<File>` + per-blob `write_all_at` so publication is safe as soon as the pwrite returns; B (`f93d896`) adds `ConcurrentBlobLocationRouter` with three terminal states (populated / aborted / producer_done+empty -> deterministic error), wraps stage 3 + stage 4 in one `thread::scope`, moves stage 4's readiness wait ahead of the input pread on the way-blob branch, and deletes the old `BlobLocationRouter` + `build_blob_location_router` + `ManifestEntry` + `StraddlerSlot` + `RouterStats` sequential shape; B-fix (`eecb46c`) removes a `.min(4)` cap on stage 4 decode threads that was a mis-read of the pre-streaming shape (stage 4 had no cap - it ran 22 threads on this host). Straddler encoding now happens inline when the second half arrives in `publish_straddler_half`, distributing ~4s of CPU across stage 3 workers instead of paying it sequentially in the old router build.
+
+Measurement table (plantasjen, 24 GB available RAM host):
+
+| Dataset | Config | Wall | Peak anon RSS | vs baseline |
+|---|---|---:|---:|---|
+| Europe `--bench 1` | Commit A (UUID `c4354996`) | 300.9 s | - | reference (post-write-discipline) |
+| Europe `--bench 1` | Commit B initial (UUID `72e5c954`, `.min(4)` cap) | 335.4 s | - | +11.5% regression - cap was wrong |
+| Europe `--bench 1` | Commit B-fix (UUID `1cb6c3c9`, uncapped) | **292.2 s** | - | -2.9% vs Commit A; phase-delta shows -13.4% in stage 3+4 overlap region (128 s -> 110.8 s), other phase noise swallowed half the win |
+| Planet `--bench 1` | Commit B-fix (UUID `ae2f063d`) | **652.4 s** | **15.66 GB** | vs `aee7727` `--bench 3` baseline 661.2 s / 17.19 GB: -9 s wall, -1.5 GB RSS (bench-1 vs bench-3 so wall gap is conservative); vs `e30f7ddc` `--bench 1` 700.6 s: -48 s / -6.9% |
+
+Counters confirm the overlap is working: Europe `s4_readiness_wait_max_ms=0`, planet `s4_readiness_wait_max_ms=3` - stage 3 is essentially always ahead of stage 4, so the `wait_ready` call is a fast-path hit on virtually every blob. The streaming machinery isn't gated by stage 3 slowness; it's gated by how much of stage 3 overlaps with stage 4.
+
+Keep/revert gate outcome: Europe total wall was -2.9% on `--bench 1` - below the plan's stated 5% gate, but the stage 3+4 overlap region itself hit -13.4% and the rest of the gap is bench-1 noise in stages 1/2 that the commit didn't touch. Planet `--bench 1` cleared 5% vs the prior `--bench 1` baseline, and peak anon RSS dropped 1.5 GB at planet. Streaming lands.
+
+**Writer ceiling note.** The plan warned that stage-3-side wins can vanish at wall under zlib:6 if `PbfWriter` compression becomes the ceiling. Counters: Europe `s4_send_ms=2305` (Commit B-fix) vs `585197` (Commit A baseline) - a 250x drop. With 22 decode threads restored, stage 4's decoder isn't the bottleneck and the writer queue isn't saturated, so zstd:1 re-measurement wasn't needed. If future changes raise stage-3-side work or reduce writer throughput, re-check under both compression modes.
+
+**Follow-ups the plan spec'd but I skipped.** Concurrent-router unit tests (empty_prepopulation / publish_worker_basic / straddler_left_then_right / straddler_right_then_left / abort_wakes_waiters / producer_done_with_missing_slot_errors / concurrent_multiwriter_multireader). Correctness verified end-to-end via Denmark semantic parity (matching counters: 52489653 nodes read, 3513255 written, 0 missing locations) and planet full-decode, but the unit-level coverage spec'd in the plan is unwritten. Add opportunistically next time the router is opened.
+
+---
+
+**Historical record of the opportunity (preserved from the pre-land plan for #2).**
 
 **Convergence: R1 #1, R2 #2, R5 #1.** The biggest remaining double-digit wall opportunity, but a real architectural rewrite of the stage 3/4 boundary. Lands cleaner after #1. R5 frames it more sharply: "stage 3 should disappear as a standalone phase" - `SharedSlotBuckets`, `stage3_slot_reorder`, `finalize_coord_payloads`, `CoordPayloadsReader`, and most straddler machinery should go away. R6 independently identifies the same seam and argues stage 4 should start as soon as blob payloads are resolvable, but its cleanest low-risk mechanism maps more directly to #8. See also #8 for a much smaller-scope alternative that eliminates only the consolidate copy without touching the stage 3/4 boundary.
 
@@ -502,7 +525,7 @@ Consolidated from all six reports:
 3. ~~**#9 layer 1** - metadata-driven relation scan.~~ **LANDED `6d71053` 2026-04-17.** Europe −5.3% wall, relation scan −72%.
 4. **#3 - fuse stage 1A + 1B** (retry with buffered-writer + delta-varint). Last retry (`44913a5`, reverted `ba62fb1`) failed because it used per-blob unbuffered `pwrite` of flat `i64` arrays; page-cache thrash against stage 2 regressed Europe wall +11%. The next retry needs (a) a single per-worker `BufWriter` with tracked append offset (no per-blob `pwrite`), (b) delta-varint encoding of node IDs to cut scratch ~2× and soften the page-cache footprint, (c) explicit correctness gate on scratch-volume < ~2× the compressed way-blob volume. Smallest blast radius of the live items; localized to `stage1.rs`. With #4 landed, the ID-bucketed emission variant (R4 A1) becomes more attractive as an alternative because the "rank work migrates downstream" objection is gone  -  evaluate both shapes in the retry.
 5. **Then #9 layer 2** - fold relation scan into stage 1 concurrency. Cheap, small, no architectural risk. The remaining serial gap on Europe is only 3.8 s post-layer-1, but it is literally a few-line change on top of the existing stage 1 worker pool sharing `Arc<File>`  -  take it opportunistically when stage 1 is already open.
-6. **Then #2 - stream stage 3 → stage 4.** Largest remaining payoff (plan estimate 100-150 s planet) but the biggest rewrite. Conceptually replaces #8's `BlobLocationRouter` with a bounded streaming coordinator. The writer-ceiling diagnostic (see #2 section) means the keep/revert gate must also measure under `zstd:1` or `compression:none`  -  a real stage-3-side CPU win can vanish at wall under zlib:6 if the writer becomes the ceiling. Wants #3 landed first so the retry benchmarks are against a clean baseline.
+6. ~~**Then #2 - stream stage 3 -> stage 4.**~~ **LANDED 2026-04-21 (`beb7838` + `f93d896` + `eecb46c`).** Europe `--bench 1` -2.9% wall (stage 3+4 overlap region -13.4%); planet `--bench 1` -6.9% vs prior bench-1, -9 s wall / -1.5 GB peak anon RSS vs bench-3 baseline. Writer-ceiling diagnostic under zlib:6 came out clean (s4_send_ms dropped 250x vs baseline), zstd:1 re-measurement not needed. Commit B-fix (`eecb46c`) was a post-land correction to a mis-placed `.min(4)` cap on stage 4 decode threads. `BlobLocationRouter` / `build_blob_location_router` / `ManifestEntry` / `StraddlerSlot` / `RouterStats` deleted.
 7. **Then #5, #6, #7, #11** as appetite allows. #5 is the natural continuation once #2's fused producer→consumer path exists; #6 subsumes #5 at whole-pipeline scope (R5 #1 + R1 #2 both land here); #7 is the hardest and most speculative; #11 only matters if dense stage-2 coord slices survive.
 8. **#10 separately, conditional.** Conservative refcounts-only BlobHeader metadata is supported by three reviewers but still depends on codifying the `cat` output contract. Aggressive full-ref-list forms remain blocked on the 64 KiB header cap.
 9. **#1 last-resort only.** Deprioritized 2026-04-21 (see #1 header note). Revisit only if #2/#3/#5/#6 have all shipped and the stage 2 → stage 3 seam is still the dominant remaining phase. If we ever come back to it, start from variant (c) (per-epoch-scoped `local_slot_pos: u32`, single 12-byte stream) and auto-tune `num_epochs` from `/proc/meminfo`  -  do not re-ship the 16-byte prototype format.

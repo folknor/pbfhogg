@@ -11,6 +11,7 @@ use super::blob_bucket_index::{classify_blobs_in_bucket, BlobBucketIntersection}
 use super::{RESOLVED_ENTRY_SIZE, COORD_SLOT_SIZE};
 
 /// Lightweight reference to slot bucket paths + counts for stage 3.
+#[allow(dead_code)]
 pub(super) struct SlotBucketRef {
     pub(super) paths: Vec<std::path::PathBuf>,
     pub(super) entry_counts: Vec<u64>,
@@ -25,6 +26,7 @@ pub(super) struct IntegratedInputs<'a> {
 }
 
 /// Manifests produced by stage 3 workers in the integrated path.
+#[allow(dead_code)]
 pub(super) struct IntegratedResult {
     pub worker_manifests: Vec<Vec<ManifestEntry>>,
 }
@@ -68,7 +70,7 @@ fn merge_straddler(
     Ok(())
 }
 
-fn scatter_bucket_entries(
+pub(super) fn scatter_bucket_entries(
     data_buf: &[u8],
     bucket_idx: usize,
     _bucket_start: u64,
@@ -107,7 +109,7 @@ fn scatter_bucket_entries(
 /// by the OS). Empty buckets need no explicit zero-write - the file is
 /// already zeroed.
 #[hotpath::measure]
-#[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+#[allow(clippy::cast_possible_truncation, clippy::too_many_lines, dead_code)]
 pub(super) fn stage3_slot_reorder(
     slot_buckets: &SlotBucketRef,
     slot_bucket_count: usize,
@@ -386,7 +388,7 @@ pub(super) fn stage3_slot_reorder(
 /// Emit integrated intersections for one bucket into the worker's temp file
 /// and straddler staging.
 #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
-fn emit_integrated_intersections(
+pub(super) fn emit_integrated_intersections(
     intersections: &[BlobBucketIntersection],
     scatter_buf: &[u8],
     bucket_start: u64,

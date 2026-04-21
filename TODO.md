@@ -10,7 +10,7 @@ Four planet-scale command plans are in notes, each with a ranked set of opportun
 
 - [x] ~~**check --refs**~~ - landed 2026-04-17 across commits `8f0ccbb` (step #1: `RoaringTreemap` → `IdSetDense`), `053def6` + `fbf591c` (step #2: three-phase parallel scan + one-pass schedule walk). Japan 56.7 s → **2.1 s** (27×). Europe 426.2 s → **33.6 s** (12.7×). Planet **1225 s → 72.5 s** (16.9×, UUID `862547e4`), ~5-8× better than the 6-10 min plan floor. Peak RSS 2.17 GB. Step #3 (selective wire-format parser) was predicated on decompression and parse landing roughly co-equal; actual post-parallel split is ~162 s decompress vs ~2 s parse at Europe, putting the selective-parser ceiling at fractions of a second - so the next lever for check-refs perf is decompression throughput (zstd, io_uring, direct I/O), not selective parse. Load-bearing pin in `src/commands/check/refs.rs::check_refs` doc comment. Plan doc retired.
 
-- [ ] **[notes/apply-changes-opportunities.md](notes/apply-changes-opportunities.md)** - `apply-changes --locations-on-ways`. **P1 + P1.5 landed 2026-04-21 (`719f306`)** + writer backends `--io-uring` and `--parallel-writer` (POOL_SIZE=16) fully matrixed. **Planet best: 80.9 s with `--parallel-writer` + cross-disk + zstd:1** (-44 % vs 144.4 s pre-flip baseline). Cross-disk `--compression none` + `--io-uring`: 93.0 s. Same-disk zstd:1 + `--io-uring`: 99.4 s. Writer-backend rule: io_uring wins same-disk (IOPS-limited, queue-depth batching) and at `--compression none`; parallel-writer wins cross-disk + zstd:1 (bandwidth-limited, parallel pwrite saturates disk). Remaining open items: splice-in-place (#11, deferred - doesn't reduce output bytes on compressed output), multi-file output / RAID-0 (unlanded and lower priority given 80.9 s is comfortably inside any realistic production budget).
+- [ ] **[notes/apply-changes-opportunities.md](notes/apply-changes-opportunities.md)** - `apply-changes --locations-on-ways`. **P1 + P1.5 landed 2026-04-21 (`719f306`)**; parallel writer made the default 2026-04-21 (buffered path removed, `--parallel-writer` flag deleted). **Planet best: 80.9 s cross-disk + zstd:1** (-44 % vs 144.4 s pre-flip baseline). Cross-disk `--compression none` + `--io-uring`: 93.0 s. Same-disk zstd:1 + `--io-uring`: 99.4 s. Germany + europe same/cross-disk matrix bench 2026-04-21 confirmed parallel-writer wins or ties the non-io-uring column at every scale; io-uring stays opt-in for users with `RLIMIT_MEMLOCK` raised. Remaining open items: splice-in-place (#11, deferred - doesn't reduce output bytes on compressed output), multi-file output / RAID-0 (unlanded and lower priority given 80.9 s is comfortably inside any realistic production budget).
 
 - [x] ~~**getid include mode**~~ - landed 2026-04-20 via a shared `pread`-only `HeaderWalker` primitive (`src/read/header_walker.rs`). Planet **43.7 s → 6.1 s (7.2×, UUID `24362e36`)**, germany 200 ms, disk read 88 GB → 601 MB. Initial HeaderWalker landing hit 7.0 s with two preads per blob; the follow-up 1-pread probe walker (commit `d263d76`) trimmed a further 0.9 s (-13 %). Walker is syscall-bound; going lower would need io_uring batching - not pursued. Plan doc retired.
 
@@ -19,9 +19,9 @@ Four planet-scale command plans are in notes, each with a ranked set of opportun
 - [ ] **[notes/altw-structural-reports.md](notes/altw-structural-reports.md)** - `add-locations-to-ways --index-type external`. Current planet baseline: **661.2 s `--bench 3`** (UUID `a406d77e`, commit `aee7727`, 2026-04-18 post-regression-fix). Europe **291.6 s** after metadata-driven relation scan (`6d71053`). Doc consolidates six independent reviews into 11 ranked opportunities. Dominant theme: the stage 2 → stage 3 → stage 4 disk-seam chain, with ~80 GB rank shards + ~112 GB slot buckets + finalize. Stage-2 de-ranking and `BlobLocationRouter` already shipped (Europe 320.5 s → 291.6 s total). Measurement history + already-shipped context in [`notes/altw-optimization-history.md`](notes/altw-optimization-history.md); the failed in-RAM-coord-table reshape experiment is documented at [`notes/altw-as-renumber.md`](notes/altw-as-renumber.md) and does not invalidate the remaining ranked items.
 
   **Apply-changes work that might transfer (speculative, 2026-04-21, no deep ALTW research):**
-  - **`--parallel-writer` backend wiring.** Apply-changes landed it as a new writer backend (16-thread pwrite pool on shared fd). Best-guess transfer cost is small (CLI flag + threading through ALTW's Stage 4 PbfWriter setup), expected win 5-15% at planet *if* ALTW Stage 4's writer is currently the visible ceiling. Conditional on profiling Stage 4's `writer_pipeline_send_wait_ns` — if it's already low, the win evaporates.
+  - **`--parallel-writer` backend wiring.** Apply-changes landed it as a new writer backend (16-thread pwrite pool on shared fd). Best-guess transfer cost is small (CLI flag + threading through ALTW's Stage 4 PbfWriter setup), expected win 5-15% at planet *if* ALTW Stage 4's writer is currently the visible ceiling. Conditional on profiling Stage 4's `writer_pipeline_send_wait_ns` - if it's already low, the win evaporates.
   - **Worker-emits-framed-bytes (P1.5 pattern).** If ALTW Stage 4 still dispatches framing via `rayon::spawn` per output block and funnels through `write_primitive_block_owned`, moving framing inline into the worker (call `frame_blob_pipelined` directly, ship the framed `Vec<u8>` to the writer thread via `write_raw_owned`) would save the same `writer_pipeline_send_wait_ns` we shaved in apply-changes (-86% at planet `--compression none`). Pattern transfers cleanly; trigger is whether that counter is large in ALTW.
-  - **Cross-disk scratch (no code, pure config).** Apply-changes planet dropped 31% just by moving bench output to a different physical NVMe (single-NVMe read+write contention removed). Worth a single `brokkr.toml` edit + bench to see if ALTW's 661 s shows similar shape — if so, it's an immediate runtime recommendation rather than code work.
+  - **Cross-disk scratch (no code, pure config).** Apply-changes planet dropped 31% just by moving bench output to a different physical NVMe (single-NVMe read+write contention removed). Worth a single `brokkr.toml` edit + bench to see if ALTW's 661 s shows similar shape - if so, it's an immediate runtime recommendation rather than code work.
   - **`zstd:1` for internal pipelines.** Already documented in apply-changes plan doc and in the ALTW notes (`notes/altw-optimization-history.md` mentions `--compression zstd:1` Europe 419 s → 379 s, -9.5%). Confirmed the same mechanism in apply-changes (workers parallelize zstd cheaply; smaller bytes → less writer wall). Should lift to ALTW Stage 4's writer config without changes.
 
   **Probably doesn't transfer:**
@@ -37,94 +37,6 @@ Four planet-scale command plans are in notes, each with a ranked set of opportun
   Rough prioritization if a day were available: cross-disk bench first (10 min, tells us where the ALTW ceiling actually lives), then `--parallel-writer` + worker-framed-bytes if Stage 4 is writer-bound.
 
 Measurement-first on every one: turn on `#[cfg(feature = "hotpath")]` counters (or add unconditional `*_ms` counters) to ground-truth the inferred per-phase breakdowns before committing to the order of landing items within a plan.
-
-## apply-changes writer backend: complete the matrix + decide on default
-
-Three writer backends shipped (buffered, `--io-uring`, `--parallel-writer`),
-three compression modes (`none`, `zlib:6`, `zstd:1`), two disk
-topologies (source+output on one NVMe vs output on a separate NVMe) =
-**18 cells, all benched as of 2026-04-21.** Overnight run filled the
-three same-disk holes (`afcdcbb4`, `2fecc14b`, `f11e0097`); follow-up
-filled the two cross-disk `zlib:6` cells (134.9 s / 127.9 s, forced
-runs with Booty scratch, not in DB).
-
-Planet LOW altw + OSC 4913, `--bench 1`, plantasjen, commit `80b37df`
-(cross-disk row for `none` / `zstd:1`) / `6117021` (all other cells):
-
-| Disk | Compression | Buffered | `--io-uring` | `--parallel-writer` |
-|---|---|---:|---:|---:|
-| Same | none | 135.5 s | 108.6 s | 116.0 s |
-| Same | zlib:6 | 143.7 s | 137.1 s | 140.8 s |
-| Same | zstd:1 | 121.2 s | 99.4 s | 104.5 s |
-| Cross | none | 95.4 s | 93.0 s | 99.0 s |
-| Cross | zlib:6 | 134.9 s | 127.9 s | 117.4 s |
-| Cross | zstd:1 | 87.1 s | 82.8 s | **80.9 s** |
-
-Writer-backend rule, now covering the whole matrix:
-
-- **Same-disk** (every compression level): `--io-uring` wins. IOPS-bound;
-  queue-depth batching trumps per-syscall parallelism.
-- **Cross-disk** + compressed output (`zlib:6` / `zstd:1`):
-  `--parallel-writer` wins. Parallel pwrite saturates the second
-  disk's write bandwidth; the compressed byte volume leaves enough
-  headroom that extra writer threads help.
-- **Cross-disk** + `--compression none`: `--io-uring` wins. Uncompressed
-  119 GB is close enough to NVMe peak that queue depth beats thread
-  count.
-
-Cross-disk gains over same-disk are largest on the `--parallel-writer`
-column: zlib:6 drops 23.4 s (140.8 → 117.4), zstd:1 drops 23.6 s
-(104.5 → 80.9). Buffered and io-uring save only 7-10 s from the same
-swap. Makes sense - parallel-writer's whole value proposition is
-saturating write bandwidth, which only exists when reads aren't
-competing for the same disk.
-
-Open questions the full matrix should answer:
-
-1. **What should the default writer backend be?** Currently it's
-   buffered (no flag). Data so far suggests `--parallel-writer` wins
-   zstd:1 unambiguously at both disk topologies. io_uring wins same-disk
-   `none` and cross-disk `none`. Decision criteria:
-   - If `--compression none` is the production default, io_uring should
-     be the default writer backend at planet scale. But io_uring needs
-     `RLIMIT_MEMLOCK ≥ 16 MB` which isn't universal, so it can't be a
-     silent default.
-   - If `--compression zstd:1` becomes the internal-pipeline
-     recommendation (notes/apply-changes-opportunities.md #15), then
-     `--parallel-writer` should default-on alongside.
-2. **Should the default change based on observed disk topology?** A
-   one-time `statfs` at startup can detect whether input and output
-   live on the same filesystem / device. If different → prefer
-   `--parallel-writer` for zstd:1; if same → prefer `--io-uring` when
-   available.
-3. **What's the default if io_uring isn't available (RLIMIT too low,
-   kernel too old, non-Linux)?** `--parallel-writer` everywhere. It
-   beats buffered at every non-io-uring cell in the matrix (same-disk
-   `none` 116.0 vs 135.5, same-disk `zlib:6` 140.8 vs 143.7,
-   same-disk `zstd:1` 104.5 vs 121.2, cross-disk `none` 99.0 vs 95.4
-   (buffered narrowly wins), cross-disk `zlib:6` 117.4 vs 134.9,
-   cross-disk `zstd:1` 80.9 vs 87.1). The one exception is cross-disk
-   `none`, where buffered's 95.4 s is 3.6 s ahead of parallel-writer's
-   99.0 s. Rule: **without io-uring, default to `--parallel-writer`**;
-   the cross-disk `none` case is close enough to ignore.
-4. **Does the answer change at smaller scales?** All benches above are
-   planet (92 GB). Germany (~1 GB output) might not benefit from any
-   of these at all; the pipeline overhead could dominate. Should the
-   default be scale-aware or is "always use the best planet backend"
-   safe on smaller inputs too? Quick bench at germany or europe for
-   each backend answers this.
-5. **Is there a POOL_SIZE that's universally good for
-   `--parallel-writer`?** Empirically 16 wins on plantasjen's Samsung
-   990 PRO. A single-NVMe laptop might be better at 4 or 8. Could be a
-   CLI flag (`--parallel-writer-threads N`) or derived from
-   `available_parallelism()` with a cap. Today it's a hard-coded
-   constant in `src/write/parallel_writer.rs`.
-
-Outcome wanted: a `notes/apply-changes-writer-backends.md` with the
-complete 18-cell table + a one-paragraph "use X by default, Y when you
-have zstd:1 + cross-disk" rule that lives in the README's usage
-section. Then the `--parallel-writer` flag can be considered for
-removal / rename / default-on.
 
 ## Known issue: io_uring writer corrupts very small outputs
 

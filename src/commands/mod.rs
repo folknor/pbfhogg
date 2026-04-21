@@ -384,27 +384,37 @@ pub(crate) fn writer_from_header_bytes(
     }
 }
 
-/// Variant of [`writer_from_header_bytes`] that takes the parallel
-/// writer flag. apply-changes uses this when `--parallel-writer` is
-/// set; other commands keep the existing two-bool API.
-pub(crate) fn writer_from_header_bytes_with_parallel(
+/// Open an output writer for `apply-changes`. Parallel writer is the
+/// default (winning or tying across the writer-backend matrix at
+/// germany / europe / planet); `--io-uring` and `--direct-io` remain
+/// as opt-in overrides.
+pub(crate) fn writer_for_apply_changes(
     output: &Path,
     compression: Compression,
     header_bytes: &[u8],
     direct_io: bool,
     io_uring: bool,
-    parallel_writer: bool,
 ) -> Result<PbfWriter<FileWriter>> {
-    if parallel_writer {
-        if direct_io || io_uring {
-            return Err(
-                "--parallel-writer is not currently combinable with --direct-io or --io-uring"
-                    .into(),
-            );
+    if io_uring {
+        #[cfg(feature = "linux-io-uring")]
+        {
+            Ok(PbfWriter::to_path_uring(output, compression, header_bytes)?)
         }
-        Ok(PbfWriter::to_path_parallel(output, compression, header_bytes)?)
+        #[cfg(not(feature = "linux-io-uring"))]
+        {
+            Err("--io-uring requires the linux-io-uring feature".into())
+        }
+    } else if direct_io {
+        #[cfg(feature = "linux-direct-io")]
+        {
+            Ok(PbfWriter::to_path_direct(output, compression, header_bytes)?)
+        }
+        #[cfg(not(feature = "linux-direct-io"))]
+        {
+            Err("--direct-io requires the linux-direct-io feature".into())
+        }
     } else {
-        writer_from_header_bytes(output, compression, header_bytes, direct_io, io_uring)
+        Ok(PbfWriter::to_path_parallel(output, compression, header_bytes)?)
     }
 }
 

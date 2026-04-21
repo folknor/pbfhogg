@@ -13,8 +13,7 @@ use crate::osc::parse_osc_file;
 use crate::writer::Compression;
 
 use crate::commands::{
-    build_output_header, require_indexdata, writer_from_header_bytes_with_parallel,
-    HeaderOverrides,
+    build_output_header, require_indexdata, writer_for_apply_changes, HeaderOverrides,
 };
 use crate::read::raw_frame::read_raw_frame;
 
@@ -50,9 +49,6 @@ pub struct MergeOptions {
     pub io_uring: bool,
     pub force: bool,
     pub locations_on_ways: bool,
-    /// Enable the experimental parallel writer (plan item #17).
-    /// Mutually exclusive with `direct_io` and `io_uring` for now.
-    pub parallel_writer: bool,
 }
 
 #[allow(clippy::redundant_closure_for_method_calls)]
@@ -140,7 +136,6 @@ pub fn merge(
         io_uring,
         force,
         locations_on_ways,
-        parallel_writer,
     } = *opts;
     require_indexdata(
         base_pbf,
@@ -200,13 +195,12 @@ pub fn merge(
     let header_read_ms = header_start.elapsed().as_millis().try_into().unwrap_or(i64::MAX);
 
     let writer_setup_start = std::time::Instant::now();
-    let mut writer = writer_from_header_bytes_with_parallel(
+    let mut writer = writer_for_apply_changes(
         output_pbf,
         compression,
         &header_bytes,
         direct_io,
         io_uring,
-        parallel_writer,
     )?;
     let writer_setup_ms = writer_setup_start.elapsed().as_millis().try_into().unwrap_or(i64::MAX);
 

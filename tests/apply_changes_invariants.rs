@@ -55,7 +55,7 @@ fn run_merge(base: &Path, osc: &Path, output: &Path) {
             direct_io: false,
             io_uring: false,
             force: true,
-            locations_on_ways: false, parallel_writer: false,
+            locations_on_ways: false,
         },
         &pbfhogg::HeaderOverrides::default(),
     )

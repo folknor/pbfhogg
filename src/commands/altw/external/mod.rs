@@ -471,15 +471,18 @@ pub fn external_join(
     // lockstep - a mismatch means stage 3 workers index past the end
     // of the router's file array.
     //
-    // Cap: .min(6) matches the pre-streaming stage 3 cap. The #6
-    // downstream landing started at .min(4) (conservative, from the
-    // #2 "worker budgets under overlap" section) and starved stage 4
-    // (s4_readiness_wait_ms=1_313_000 cumulative on UUID 4bb48b25).
-    // Bumping two steps back to .min(6) is the minimal correction.
+    // Uncapped: the pre-#6 cap (.min(6)) existed because stage 3's
+    // per-slot-bucket scatter_buf could be ~380 MB/worker at planet
+    // and straddler classification produced cross-bucket contention.
+    // Post-#6 the scatter buffer is per-blob-group (s3_max_group_coord_bytes
+    // measured 147 MB on Europe, ~380 MB at planet worst case), groups
+    // are independent, and #6-cap-6 measured stage-4 starving on stage-3
+    // publication (s4_readiness_wait_ms=462_884 cumulative = ~21 s/thread
+    // wall blocked). Matching stage 4's `avail - 2` gives both sides
+    // equal parallelism budget.
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(4)
-        .min(6);
+        .unwrap_or(4);
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("s3_worker_count", num_workers as i64);
 

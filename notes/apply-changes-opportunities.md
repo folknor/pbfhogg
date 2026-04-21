@@ -2,12 +2,32 @@
 
 Target: `pbfhogg apply-changes --locations-on-ways` on planet with a daily OSC, production default `--compression none`.
 
-## Current state (2026-04-21, post-flip landing `719f306`)
+## Current state (2026-04-21, post-flip landing `719f306` + io_uring writer + cross-disk experiment)
 
-- **Planet walls (LOW + altw + OSC 4913, `--bench 1`, plantasjen):**
-  - `--compression none` (production): **135.5 s** (pre-flip `52c2c4b` was 144.4 s)
-  - `--compression zlib:6` (ecosystem default): **143.7 s** (pre-flip estimate ~170 s)
-  - `--compression zstd:1`: **121.2 s** (new configuration)
+- **Best planet wall measured: 82.8 s** (LOW + altw + OSC 4913 + `--compression zstd:1` + `--io-uring` + scratch on different physical NVMe). Pre-flip baseline was 144.4 s on same hardware: **-43% wall**. Plan target was 40-55 s; the remaining ~30 s gap is now the single-thread writer (~64 s `writer_write_ns` at 1.5 GB/s), addressable only by a parallel writer or higher-bandwidth target storage (RAID-0 across NVMes).
+- **Planet matrix at commit `2a43702`:**
+
+| Config | Buffered writer | `--io-uring` writer | Δ |
+|---|---:|---:|---:|
+| Same-disk (source+output on Banan/nvme1n1), `--compression none` | 135.5 s | 108.6 s | -27 s |
+| Same-disk, `--compression zlib:6` | 143.7 s | not benched | - |
+| Same-disk, `--compression zstd:1` | 121.2 s | 99.4 s | -22 s |
+| Cross-disk (output on Booty/nvme0n1p3), `--compression none` | 95.4 s | 93.0 s | -2 s |
+| Cross-disk, `--compression zstd:1` | 87.1 s | **82.8 s** | -4 s |
+
+- **Diagnosis of the 82.8 s ceiling** (cross-disk + io_uring + zstd:1):
+  - `writer_write_ns = 64 s`, single-thread writer at 1.49 GB/s (95.6 GB output / 64 s). NVMe sequential peak is ~5 GB/s, so the writer thread is at ~30 % of disk peak even with io_uring batching.
+  - `writer_pipeline_send_wait_ns = 81.5 s` cumulative on drain - drain is still 98 % blocked on send, but those blocks are short and let progress through (cumulative > wall is plausible given the channel-send-wait counter is per-call).
+  - Worker CPU floor: `merge_streaming_(decompress+rewrite+frame+precise+coord_extract)_ns / 22 ≈ 35 s` wall. Far below the writer ceiling.
+  - Workers avg 10.7 cores out of 22; capped by drain backpressure on the writer pipeline channel.
+- **Why same-disk loses ~30 s of headroom**: source and target on the same NVMe contend on read+write. Cross-disk separation alone gave -31 % wall (138 s → 95 s) at `--compression none` even before io_uring.
+- **Why io_uring is decisive on same-disk but marginal cross-disk**: same-disk's writer is fighting reads for IOPS, so batching syscalls helps a lot (`writer_write_ns` 120 s → 67 s). Cross-disk's writer wasn't IOPS-bound, so io_uring's per-syscall savings are absorbed.
+- **Why zstd:1 wins**: workers parallelize compression cheaply (`merge_streaming_frame_ns` 205 s cumulative ≈ 9 s wall at 22 cores) and the ~20 % output-byte reduction shrinks writer time proportionally. zlib:6 gives similar output size but costs 6.5× more CPU (1352 s cumulative frame_ns), so its smaller writer time is offset by classify/rewrite competing for cores.
+
+- **Production configurations measured (LOW + altw + OSC 4913, `--bench 1`):**
+  - `--compression none` (osmium-interop default for production pipeline): **135.5 s** same-disk, **93.0 s** cross-disk + io_uring.
+  - `--compression zlib:6` (ecosystem default): **143.7 s** same-disk; cross-disk variant not benched.
+  - `--compression zstd:1` (recommended for internal pipelines): **121.2 s** same-disk, **82.8 s** cross-disk + io_uring.
 - **Europe walls (LOW + altw + OSC 4715, `--bench 3`):**
   - `--compression none`: 49.8 s (pre-flip `b4f45ff` was 46.1 s)
   - `--compression zlib:6`: 53.8 s (pre-flip was 54.2 s, UUID `570dfa69`)
@@ -1293,7 +1313,7 @@ These are the parts of today's code that survive P1 unchanged. The batch-loop ma
 
 11. **Splice-in-place for low-touch rewrites (follow-up, not yet landed).** For `NeedsRewrite` blobs with ≤K affected elements (K~64), splice the raw wire bytes for unmodified element runs instead of full decode+re-encode. Estimated ~1.5-2 s wall at daily, less valuable at weekly. Raw-group passthrough scaffolding in [`src/write/raw_passthrough.rs`](../src/write/raw_passthrough.rs) is the design surface. **Post-P1 re-evaluation (2026-04-21):** the planet wall is now HDD-writer-bound (`writer_write_ns = 120 s`, 89 % of wall at `--compression none`), not CPU-bound. Splice-in-place saves classify+rewrite CPU but does not reduce output bytes, so it's unlikely to move the wall on HDD targets. Value deferred until we have measurements on a faster target disk.
 
-12. **Writer path tuning** (direct-io vs `to_path_uring`). Infrastructure already wired in [`src/commands/mod.rs`](../src/commands/mod.rs) + [`src/write/uring_writer.rs`](../src/write/uring_writer.rs); flip the variant, don't grow queues. **Blocked on RLIMIT_MEMLOCK (2026-04-21):** io_uring requires ≥16 MB locked memory on plantasjen; current limit is 8 MB. Fix: `sudo prlimit --pid=$$ --memlock=unlimited:unlimited` before running. Once unblocked, bench planet `--io-uring` to see if the writer thread can bypass page-cache throttling on the HDD target.
+12. ~~**Writer path tuning** (`--io-uring` writer).~~ **Measured 2026-04-21.** With `RLIMIT_MEMLOCK` raised to unlimited on plantasjen, `--io-uring` at planet `--compression none` same-disk: 135.5 s → 108.6 s (-20 %). At `--compression zstd:1` same-disk: 121.2 s → 99.4 s (-18 %). Cross-disk gains are smaller (-2 s / -4 s) because read+write contention is no longer the bottleneck there. Best measured: `--io-uring` + cross-disk + zstd:1 = **82.8 s** at planet. Writer disk throughput jumps from ~830 MB/s (buffered) to 1.49 GB/s (io_uring). Setup is a one-shot `sudo prlimit --pid=$$ --memlock=unlimited:unlimited` before running.
 
 13. **Exact-membership metadata / sidecar.** Only if FalsePositives remain material after P1. Currently 16 % of slow-path blobs; not negligible but not headline either. Format/index project, not a quick cleanup.
 
@@ -1301,7 +1321,13 @@ These are the parts of today's code that survive P1 unchanged. The batch-loop ma
 
 15. **`zstd:1` as a compression recommendation for internal pipelines (new, 2026-04-21).** Measured at planet: `--compression zstd:1` delivers 121.2 s wall (vs 135.5 s for `none` and 143.7 s for `zlib:6`), because workers parallelize zstd cheaply and the ~20 % output-byte reduction relieves the HDD writer bottleneck. Already gated behind a flag; consider documenting as the default for pbfhogg-internal pipelines (consumers that don't require osmium interop) in [`reference/performance.md`](../reference/performance.md) and README.
 
-16. **Target-disk experiment (new, 2026-04-21).** The plan's 40-55 s CPU-budget floor assumed writer I/O would run concurrent with workers and finish inside the same wall window. Measured on plantasjen (target=hdd), the writer wall (~120 s at planet) is the new ceiling. Before declaring the pipeline architecture has hit its limit, run one planet bench with a brokkr.toml target override pointing at NVMe (sustained 3+ GB/s on the same host) to measure the actual post-flip floor. If that run lands at 40-55 s, the plan's hypothesis is confirmed and splice-in-place / writer path tuning become the real next levers. If not, the remaining ceiling is elsewhere and warrants a fresh round of measurement.
+16. ~~**Target-disk experiment (new, 2026-04-21).**~~ **Measured 2026-04-21.** Source (Banan/nvme1n1) + output (Booty/nvme0n1p3, different physical NVMe) dropped planet `--compression none` from 138 s (direct invocation, same-disk) to 95.4 s cross-disk (-31 %). zstd:1 cross-disk: 121.2 s → 87.1 s (-29 %). This confirms the bottleneck on same-disk was read+write contention on one NVMe, not a software issue. The `target=hdd` label in the brokkr.toml was misleading: brokkr actually writes bench output to `scratch`, which symlinks to Banan (NVMe). The "hdd" classification was for an unrelated dir (cargo build output). Corrected in the Current state section.
+
+17. **Parallel writer for the `--compression none` production case (new, 2026-04-21).** At 82.8 s (best planet config: `--io-uring` + cross-disk + zstd:1), `writer_write_ns` = 64 s is the dominant floor. Single-thread writer on NVMe peaks at ~1.5 GB/s despite the drive's ~5 GB/s sequential-write headroom. Options:
+    - **Multi-file output with stitch at end**: N writer threads write to N separate files (different file offsets or different files), then a final concat / single-writer merge-pass assembles the output PBF. Works on any filesystem; concat phase is sequential (~20 s at 5 GB/s for 95 GB). Should push writer floor to ~13 s wall at 22 cores, putting planet apply-changes at ~50 s (worker CPU floor + writer floor + setup). Matches the plan's 40-55 s target.
+    - **pwrite-based parallel writer on one file**: N writer threads each own a disjoint file region, use `pwrite` with explicit offsets. Requires knowing output size in advance, or padding + truncate at end. Cleaner than multi-file but harder to size under compression.
+    - **RAID-0 storage**: two NVMes striped as target doubles per-thread bandwidth without code changes. Not a code lever.
+    Recommended next: multi-file output with stitch, since it's the one fully under our control.
 
 ### Items folded into P1 (no longer separate)
 

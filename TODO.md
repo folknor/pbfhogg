@@ -10,7 +10,7 @@ Four planet-scale command plans are in notes, each with a ranked set of opportun
 
 - [x] ~~**check --refs**~~ - landed 2026-04-17 across commits `8f0ccbb` (step #1: `RoaringTreemap` → `IdSetDense`), `053def6` + `fbf591c` (step #2: three-phase parallel scan + one-pass schedule walk). Japan 56.7 s → **2.1 s** (27×). Europe 426.2 s → **33.6 s** (12.7×). Planet **1225 s → 72.5 s** (16.9×, UUID `862547e4`), ~5-8× better than the 6-10 min plan floor. Peak RSS 2.17 GB. Step #3 (selective wire-format parser) was predicated on decompression and parse landing roughly co-equal; actual post-parallel split is ~162 s decompress vs ~2 s parse at Europe, putting the selective-parser ceiling at fractions of a second - so the next lever for check-refs perf is decompression throughput (zstd, io_uring, direct I/O), not selective parse. Load-bearing pin in `src/commands/check/refs.rs::check_refs` doc comment. Plan doc retired.
 
-- [ ] **[notes/apply-changes-opportunities.md](notes/apply-changes-opportunities.md)** - `apply-changes --locations-on-ways`. **P1 + P1.5 landed 2026-04-21 (`719f306`):** descriptor-first scanner + worker pool + drain pipeline replaces the per-batch rayon barrier; workers emit framed bytes inline so the drain bypasses the writer's rayon-spawn-per-block dispatch. Planet `--compression none` 144.4 s → **135.5 s** (-6%); zlib:6 ~170 s (est) → **143.7 s** (-15%); `--compression zstd:1` **121.2 s** (new low). `writer_pipeline_send_wait_ns` cumulative 859 s → 117 s (-86%). Peak RSS 1.63 GB → 3.29 GB (+2.0×, inside host envelope); involuntary context switches -70%. Plan's 40-55 s CPU-budget floor not achieved at planet because `writer_write_ns = 120 s` (HDD sustained-write ceiling on `target=hdd`) is now the wall floor, not classify/rewrite CPU (~31 s at 22 cores). Remaining open items (all in the plan doc): splice-in-place (#11, deferred - doesn't reduce output bytes on HDD), writer path tuning (#12, blocked on `RLIMIT_MEMLOCK` for io_uring), target-disk experiment (#16, config-change only to point `target` at NVMe for the true non-HDD-bound wall).
+- [ ] **[notes/apply-changes-opportunities.md](notes/apply-changes-opportunities.md)** - `apply-changes --locations-on-ways`. **P1 + P1.5 landed 2026-04-21 (`719f306`):** descriptor-first scanner + worker pool + drain pipeline; workers emit framed bytes inline, drain bypasses the writer's rayon-spawn-per-block dispatch. **Extended bench matrix (cross-disk + `--io-uring`, commit `2a43702`):** planet best case is `zstd:1` + `--io-uring` + cross-disk at **82.8 s** (-43 % vs 144.4 s pre-flip baseline). Same-disk `--compression none` + `--io-uring`: 108.6 s. Cross-disk `--compression none` buffered: 95.4 s. `writer_write_ns` drops from 120 s (buffered same-disk) to 64 s (io_uring cross-disk); writer disk throughput jumps from ~830 MB/s to 1.49 GB/s. Plan's 40-55 s target now bounded by single-thread writer throughput; the ~30 s remaining gap points at parallel writer (#17) or RAID-0 target storage. Remaining open items: splice-in-place (#11, deferred), parallel writer (#17, new).
 
 - [x] ~~**getid include mode**~~ - landed 2026-04-20 via a shared `pread`-only `HeaderWalker` primitive (`src/read/header_walker.rs`). Planet **43.7 s → 6.1 s (7.2×, UUID `24362e36`)**, germany 200 ms, disk read 88 GB → 601 MB. Initial HeaderWalker landing hit 7.0 s with two preads per blob; the follow-up 1-pread probe walker (commit `d263d76`) trimmed a further 0.9 s (-13 %). Walker is syscall-bound; going lower would need io_uring batching - not pursued. Plan doc retired.
 
@@ -19,6 +19,21 @@ Four planet-scale command plans are in notes, each with a ranked set of opportun
 - [ ] **[notes/altw-structural-reports.md](notes/altw-structural-reports.md)** - `add-locations-to-ways --index-type external`. Current planet baseline: **661.2 s `--bench 3`** (UUID `a406d77e`, commit `aee7727`, 2026-04-18 post-regression-fix). Europe **291.6 s** after metadata-driven relation scan (`6d71053`). Doc consolidates six independent reviews into 11 ranked opportunities. Dominant theme: the stage 2 → stage 3 → stage 4 disk-seam chain, with ~80 GB rank shards + ~112 GB slot buckets + finalize. Stage-2 de-ranking and `BlobLocationRouter` already shipped (Europe 320.5 s → 291.6 s total). Measurement history + already-shipped context in [`notes/altw-optimization-history.md`](notes/altw-optimization-history.md); the failed in-RAM-coord-table reshape experiment is documented at [`notes/altw-as-renumber.md`](notes/altw-as-renumber.md) and does not invalidate the remaining ranked items.
 
 Measurement-first on every one: turn on `#[cfg(feature = "hotpath")]` counters (or add unconditional `*_ms` counters) to ground-truth the inferred per-phase breakdowns before committing to the order of landing items within a plan.
+
+## Known issue: io_uring writer corrupts very small outputs
+
+Surfaced 2026-04-21 when `RLIMIT_MEMLOCK` was raised to unlimited and
+the previously-skipped `merge_basic_create_modify_delete_uring` test
+actually ran. `merge()` returns `Ok`, but the resulting PBF file panics
+on read with "failed to fill whole buffer" - looks like the writer
+finalizes too early or truncates before the last frames flush. Confirmed
+present at pre-flip commit `383a2eb`, so not introduced by P1+P1.5 (the
+test had been silently skipping via the `is_uring_unavailable` helper).
+Test marked `#[ignore]` with a comment pointing here. Planet-scale
+io_uring runs (137-148 GB outputs) appear to produce valid PBFs - the
+bug is specific to very small outputs. Likely candidate: `flush_final`
+in `src/write/uring_writer.rs` interaction with the `set_len` truncate
+when `logical_size < page_aligned`.
 
 ## Important: ignored tests
 

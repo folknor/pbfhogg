@@ -28,6 +28,47 @@ Target: `pbfhogg apply-changes --locations-on-ways` on planet with a daily OSC, 
   - `--compression none` (osmium-interop default for production pipeline): **135.5 s** same-disk, **93.0 s** cross-disk + io_uring.
   - `--compression zlib:6` (ecosystem default): **143.7 s** same-disk; cross-disk variant not benched.
   - `--compression zstd:1` (recommended for internal pipelines): **121.2 s** same-disk, **82.8 s** cross-disk + io_uring.
+
+### Full bench log (all permutations run this session, planet LOW + altw + OSC 4913, `--bench 1`, plantasjen)
+
+Hardware for reference:
+- Banan = `/dev/nvme1n1p1` on Samsung 990 PRO 4TB NVMe, mounted at `/media/folk/Banan`, linked as `data/` in the project. Source + OSC live here.
+- Booty = `/dev/nvme0n1p3` on Samsung 970 EVO Plus 1TB NVMe, mounted at `/media/folk/Booty`. Used only as the cross-disk target for the experiment.
+
+| Run | Compression | Writer | Output target | Wall | writer_bytes_written | writer_write_ns | writer_pipeline_send_wait_ns | Avg cores (way phase) | Peak RSS | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---|
+| Pre-flip baseline, commit `52c2c4b` UUID `e81a9316` | none | buffered | Banan | **144.4 s** | 119 GB | ~100 s (est) | ~85 s (est) | 4.1 | 1.63 GB | The wall to beat. Classify 4.15 cores avg (plan's batch-Amdahl diagnosis). |
+| Post-flip (brokkr), run 1 | none | buffered | Banan | **135.5 s** | 119 GB | 120 s | 859 s cumulative (pre-P1.5) | 4.6 | 3.29 GB | Right after the flip. Writer chain saturated per plan's R1 prediction. |
+| Post-flip + P1.5 (brokkr), run 1 | none | buffered | Banan | 135.5 s | 119 GB | 120 s | 117 s | 4.8 | 3.29 GB | P1.5 dropped pipeline_send_wait 859→117 s (-86 %) but wall flat (HDD-bandwidth-perceived but actually single-NVMe contention). |
+| Post-flip + P1.5 (brokkr), run 2 | none | buffered | Banan | 148.7 s | 119 GB | - | - | - | - | Variance sample from the second `--bench 1`; shows ±7 % run-to-run band. |
+| Post-flip + P1.5 `WRITE_AHEAD=64` (reverted) | none | buffered | Banan | 132.6 s | 119 GB | 107 s | 104 s | - | - | Bump tested; -2.9 s wall, -13 % write_ns, -11 % send_wait. Inside variance band; reverted since it affects unrelated writers (altw/extract). |
+| Post-flip + P1.5 `WRITE_AHEAD=64` (reverted) | zstd:1 | buffered | Banan | 126.7 s | 95 GB | - | - | - | - | +5.5 s vs default on zstd:1 at same settings; net: WRITE_AHEAD bump is noise. |
+| Post-flip + P1.5 | zlib:6 | buffered | Banan | **143.7 s** | 93 GB | 104 s | 91 s | - | - | Default ecosystem compression. writer_compress_ns/frame_ns across workers = 1352 s cumulative (~62 s at 22 cores). |
+| Post-flip + P1.5 | zstd:1 | buffered | Banan | **121.2 s** | 95 GB | 94 s | 92 s | - | - | Best same-disk result. frame_ns 205 s cumulative (~9 s at 22 cores) - 6.5× less worker CPU than zlib:6 for same output size. |
+| Post-flip + P1.5 (direct invocation, no brokkr) | none | buffered | Banan | **137.96 s** | 114 GB | - | - | 5.1 (from `time -v` 510 % CPU) | 3.03 GB | Confirms brokkr overhead is ~1.5 % at this scale. User CPU 622 s, sys 82 s. FS outputs 222 GB (2× data due to ext4 journaling). |
+| Post-flip + P1.5 (direct invocation, cross-disk) | none | buffered | Booty | **95.4 s** | 114 GB | - | - | 8.17 (from 817 % CPU) | 4.37 GB | -42.6 s / -31 % vs same-disk. First proof that single-NVMe read+write contention, not software, was the ceiling. Major faults 48210→2316. |
+| Post-flip + P1.5 (direct invocation, cross-disk) | zstd:1 | buffered | Booty | **85.8 s** | 92 GB | - | - | 10.7 (from 1068 % CPU) | 2.86 GB | zstd:1 stays the wall winner even cross-disk. |
+| Post-flip + P1.5 (brokkr, cross-disk, hotpath mode) | zstd:1 | buffered | Booty | **87.1 s** | 95 GB | 100 s | 97 s | 6.0 | 2.64 GB | Same config through brokkr's instrumentation - ~1.5 % overhead vs direct. |
+| Post-flip + P1.5 + io_uring | none | io_uring | Banan | **108.6 s** | 119 GB | 66.6 s | 43.4 s | - | - | io_uring on same-disk: -27 s vs buffered. Writer disk throughput 991 MB/s → 1.79 GB/s. `writer_recv_wait_ns = 35.7 s` - writer now occasionally waits for drain (role reversed). |
+| Post-flip + P1.5 + io_uring | zstd:1 | io_uring | Banan | **99.4 s** | 95 GB | - | - | - | - | io_uring + zstd:1 same-disk: -21.8 s vs buffered. |
+| Post-flip + P1.5 + io_uring (cross-disk) | none | io_uring | Booty | **93.0 s** | 119 GB | 75 s | 89 s | - | - | io_uring gain collapses cross-disk (-2 s only) - read+write was the same-disk ceiling, not writer IOPS. |
+| Post-flip + P1.5 + io_uring (cross-disk) | zstd:1 | io_uring | Booty | **82.8 s** | 95 GB | 64.2 s | 81.5 s | - | 2.86 GB | **Best result**: -43 % vs 144.4 s pre-flip. Writer thread still ~64 s / 30 % of NVMe headroom - single-thread writer is the remaining ceiling. |
+
+Europe LOW altw + OSC 4715, `--bench 3` (reference):
+
+| Run | Compression | Writer | Output | Wall |
+|---|---|---|---|---:|
+| Pre-flip (commit `b4f45ff`), UUID `f0af4170` | none | buffered | Banan | 46.1 s |
+| Pre-flip (commit `b4f45ff`), UUID `570dfa69` | zlib:6 | buffered | Banan | 54.2 s |
+| Post-flip + P1.5 | none | buffered | Banan | 49.8 s |
+| Post-flip + P1.5 | zlib:6 | buffered | Banan | 53.8 s |
+
+### Methodology notes
+- All planet runs are `--bench 1` (single sample). Variance band ±7 % observed. Multiple runs at the same config confirm the direction of each optimisation's effect even though individual wall numbers move within the band.
+- `RLIMIT_MEMLOCK` must be ≥16 MB for io_uring to register its 64×256 KB buffer pool. Plantasjen defaults to 8 MB; raise with `sudo prlimit --pid=$$ --memlock=unlimited:unlimited` in the bench shell.
+- Cross-disk experiments used a temporary `brokkr.toml` edit of `[plantasjen].scratch` from `data/bench-tmp` (Banan) to `/media/folk/Booty/pbfhogg-bench-tmp` (Booty). Reverted post-bench. The `[plantasjen.drives].target = "hdd"` label in the toml is separately misleading: brokkr writes bench output to `scratch`, not to `target`, so the "hdd" classification referred to the cargo build dir on Oioioi/sdc (unrelated to the bench).
+- Counter values in the table above are cumulative across threads except where noted. Drain is single-threaded, so `writer_pipeline_send_wait_ns` there is near-linear with wall-time blocked on send.
+- `writer_write_ns` correlates with writer disk throughput: at same-disk 119 GB / 120 s = 991 MB/s buffered (IOPS-limited by read+write contention); cross-disk 95 GB / 64 s = 1.49 GB/s with io_uring (single-thread writer syscall ceiling).
 - **Europe walls (LOW + altw + OSC 4715, `--bench 3`):**
   - `--compression none`: 49.8 s (pre-flip `b4f45ff` was 46.1 s)
   - `--compression zlib:6`: 53.8 s (pre-flip was 54.2 s, UUID `570dfa69`)

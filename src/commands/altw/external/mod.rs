@@ -308,9 +308,13 @@ pub fn external_join(
     // worker_manifests consumable directly by build_blob_location_router,
     // no intermediate consolidated coord_payloads file.
     //
-    // num_epochs hardcoded at 4 initially; plan doc anticipates promoting
-    // to auto-compute from /proc/meminfo once the path is validated.
-    let num_epochs = 4;
+    // num_epochs: 8 gives a good balance of in-memory scatter win vs
+    // peak RSS. At E=8 the epoch-0 scatter_bufs occupy 1/8 of total_slots
+    // (vs 1/4 at E=4), keeping the planet projection under the 30 GB host
+    // envelope. Historical measurement favored E=8 over E=4. Plan doc
+    // anticipates promoting to auto-compute from /proc/meminfo once the
+    // wider workload matrix is characterized.
+    let num_epochs = 8;
     let input_pbf = std::sync::Arc::new(
         std::fs::File::open(input)
             .map_err(|e| format!("open input pbf for stage 2: {e}"))?,

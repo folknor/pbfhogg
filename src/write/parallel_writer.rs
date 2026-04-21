@@ -48,10 +48,10 @@ use crate::write::metrics::WRITER_METRICS;
 use crate::write::pipeline::{OutputChunk, PipelineItem, WRITE_AHEAD};
 
 /// Number of worker threads doing `pwrite`s / `copy_file_range`s in
-/// parallel. 4 is a reasonable default for NVMe (saturates queue depth
-/// without over-contending for the device's internal parallelism).
+/// parallel. 8 saturates NVMe queue depth on the plantasjen bench
+/// host (measured 2026-04-21); 4 leaves disk bandwidth on the table.
 /// Could become a CLI flag later.
-pub(crate) const POOL_SIZE: usize = 4;
+pub(crate) const POOL_SIZE: usize = 16;
 
 /// Per-worker channel capacity. Kept small so the writer thread's
 /// dispatch doesn't outrun the pool; each WriteOp holds a full owned

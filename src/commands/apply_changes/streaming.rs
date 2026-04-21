@@ -1,0 +1,523 @@
+//! Worker pool for the descriptor-first streaming pipeline.
+//!
+//! Spawns `worker_count` long-lived threads that pull [`ScannedBlob`]
+//! candidates from the scanner over `candidate_rx` and emit
+//! [`WorkerOutput`] to the drain over `output_tx`. Each worker owns a
+//! thread-local [`BlockBuilder`], decompress and parse scratch buffers,
+//! and (under `--locations-on-ways`) a private `FxHashMap` accumulator
+//! published into a per-worker `Arc<Mutex<_>>` slot for the drain to
+//! merge at the node→way barrier.
+//!
+//! ## Per-blob worker logic
+//!
+//! - [`ScannedBlob::Candidate`]: pread the Blob protobuf body via
+//!   `(frame_start + blob_offset, data_size)`, decompress through the
+//!   thread-local scratch, opportunistically extract node coords if the
+//!   blob is a Node and `--locations-on-ways` is active, parse via
+//!   [`PrimitiveBlock::from_vec_with_scratch`], precise-check via
+//!   [`block_overlaps_diff`]. False positives emit
+//!   [`WorkerOutput::FalsePositive`] (carrying the original descriptor so
+//!   the drain can `copy_file_range` the raw frame). True overlaps compute
+//!   the inline-upsert range from the descriptor's `id_range` against the
+//!   diff's sorted upsert vector and call [`rewrite_block_parallel`] on the
+//!   worker's persistent `BlockBuilder`, emitting
+//!   [`WorkerOutput::Rewritten`].
+//! - [`ScannedBlob::Passthrough`]: only routed through workers under
+//!   `--direct-io` output (where the drain can't `copy_file_range`).
+//!   Workers pread the **full framed bytes** via
+//!   `(frame_start, frame_len)` and emit
+//!   [`WorkerOutput::OwnedPassthrough`].
+//!
+//! Plan doc: `notes/apply-changes-opportunities.md`, "Synthesized design"
+//! → "Worker pool" and "`--direct-io` fallback" sections.
+
+#![allow(dead_code)]
+
+use std::os::unix::fs::FileExt as _;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+
+use rustc_hash::FxHashMap;
+
+use crate::blob::decompress_blob_raw;
+use crate::blob_meta::ElemKind;
+use crate::block_builder::BlockBuilder;
+use crate::error::{Error, ErrorKind, Result, new_error};
+
+use super::classify::block_overlaps_diff;
+use super::descriptor::{BlobDescriptor, DrainItem, ScannedBlob, WorkerOutput};
+use super::diff_ranges::DiffRanges;
+use super::rewrite_block::rewrite_block_parallel;
+
+use crate::osc::CompactDiffOverlay;
+
+/// One worker's shared coord accumulator. Workers hold their own; the
+/// drain holds clones of every slot.
+pub(super) type CoordSlot = Arc<Mutex<FxHashMap<i64, (i32, i32)>>>;
+
+/// Per-worker shared coord accumulator slots. The drain holds clones of
+/// every slot; each worker writes only into its own. At the node→way
+/// barrier the drain acquires every mutex, drains the maps, merges into
+/// `Arc<loc_map>`, and signals the scanner.
+pub(super) type CoordSlots = Vec<CoordSlot>;
+
+/// Streaming pool configuration. Channels are passed separately so this
+/// struct can be `Clone` cheaply across worker startup.
+pub(super) struct StreamingConfig {
+    pub base_pbf: Box<Path>,
+    pub ranges: Arc<DiffRanges>,
+    pub diff: Arc<CompactDiffOverlay>,
+    /// Number of worker threads. Should be `nproc - 2` (one each for the
+    /// scanner and drain).
+    pub worker_count: usize,
+    /// `--locations-on-ways` mode. Workers extract node coords during
+    /// the node phase only if true.
+    pub locations_on_ways: bool,
+    /// Sized to `worker_count`. Each worker writes into `slots[worker_id]`;
+    /// the drain merges all slots at the node→way barrier. `None` when
+    /// `locations_on_ways` is false.
+    pub coord_slots: Option<CoordSlots>,
+}
+
+/// Channels owned by the streaming pool.
+pub(super) struct StreamingChannels {
+    /// Candidate descriptors from the scanner. Closed when the scanner
+    /// finishes (which signals workers to drain and exit).
+    pub candidate_rx: mpsc::Receiver<ScannedBlob>,
+    /// Drain inputs. Workers convert their `WorkerOutput` to `DrainItem`
+    /// at send time so the drain has one unified input stream (the
+    /// scanner's fast-path `DrainItem::CopyRange` and worker outputs
+    /// merge into the same byte-budget reorder buffer keyed by global
+    /// seq).
+    pub drain_tx: mpsc::SyncSender<DrainItem>,
+}
+
+/// Atomic counters surfaced as sidecar counters at end of `merge()`.
+pub(super) struct WorkerCounters {
+    pub blobs_processed: AtomicU64,
+    pub blobs_rewritten: AtomicU64,
+    pub blobs_false_positive: AtomicU64,
+    pub blobs_owned_passthrough: AtomicU64,
+    /// Decompress wall summed across all workers (cumulative ns).
+    pub decompress_ns: AtomicU64,
+    /// Parse wall summed across all workers.
+    pub parse_ns: AtomicU64,
+    /// Precise-check wall summed across all workers.
+    pub precise_ns: AtomicU64,
+    /// Rewrite wall summed across all workers.
+    pub rewrite_ns: AtomicU64,
+    /// Coord-extraction wall summed across all workers (LOW only).
+    pub coord_extract_ns: AtomicU64,
+    /// Node coord pairs extracted across all workers (LOW only).
+    pub coord_pairs_extracted: AtomicU64,
+}
+
+impl WorkerCounters {
+    pub(super) fn new() -> Self {
+        Self {
+            blobs_processed: AtomicU64::new(0),
+            blobs_rewritten: AtomicU64::new(0),
+            blobs_false_positive: AtomicU64::new(0),
+            blobs_owned_passthrough: AtomicU64::new(0),
+            decompress_ns: AtomicU64::new(0),
+            parse_ns: AtomicU64::new(0),
+            precise_ns: AtomicU64::new(0),
+            rewrite_ns: AtomicU64::new(0),
+            coord_extract_ns: AtomicU64::new(0),
+            coord_pairs_extracted: AtomicU64::new(0),
+        }
+    }
+
+    pub(super) fn emit(&self) {
+        macro_rules! emit {
+            ($name:literal, $field:ident) => {
+                let v = self.$field.load(Ordering::Relaxed);
+                crate::debug::emit_counter($name, i64::try_from(v).unwrap_or(i64::MAX));
+            };
+        }
+        emit!("merge_streaming_blobs_processed", blobs_processed);
+        emit!("merge_streaming_blobs_rewritten", blobs_rewritten);
+        emit!("merge_streaming_blobs_false_positive", blobs_false_positive);
+        emit!("merge_streaming_blobs_owned_passthrough", blobs_owned_passthrough);
+        emit!("merge_streaming_decompress_ns", decompress_ns);
+        emit!("merge_streaming_parse_ns", parse_ns);
+        emit!("merge_streaming_precise_ns", precise_ns);
+        emit!("merge_streaming_rewrite_ns", rewrite_ns);
+        emit!("merge_streaming_coord_extract_ns", coord_extract_ns);
+        emit!("merge_streaming_coord_pairs_extracted", coord_pairs_extracted);
+    }
+}
+
+/// Run the worker pool to completion. Returns once the candidate channel
+/// is closed and every worker has exited.
+///
+/// The `drain_tx` clone owned by this function is dropped on return;
+/// downstream drain sees `Disconnected` once every worker's clone is
+/// also dropped.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(super) fn run_workers(
+    cfg: StreamingConfig,
+    channels: StreamingChannels,
+    counters: &WorkerCounters,
+) -> Result<()> {
+    let StreamingConfig {
+        base_pbf,
+        ranges,
+        diff,
+        worker_count,
+        locations_on_ways,
+        coord_slots,
+    } = cfg;
+    let StreamingChannels { candidate_rx, drain_tx } = channels;
+
+    if locations_on_ways {
+        let slots_len = coord_slots.as_ref().map_or(0, Vec::len);
+        if slots_len != worker_count {
+            return Err(new_error(ErrorKind::Io(std::io::Error::other(format!(
+                "streaming: locations_on_ways requires coord_slots.len()={worker_count}, got {slots_len}",
+            )))));
+        }
+    }
+
+    crate::debug::emit_marker("MERGE_STREAMING_START");
+
+    let shared_file = std::fs::File::open(&*base_pbf).map_err(|e| {
+        new_error(ErrorKind::Io(std::io::Error::other(format!(
+            "streaming: failed to open {}: {e}",
+            base_pbf.display(),
+        ))))
+    })?;
+
+    // mpsc::Receiver isn't Sync, so workers serialize their `recv()` calls
+    // through this Mutex. The lock is only held for the duration of one
+    // `recv()` (microseconds); workers spend their time in pread +
+    // decompress + parse, not queued on the receiver lock.
+    let candidate_rx = Mutex::new(candidate_rx);
+    let first_err: Mutex<Option<Error>> = Mutex::new(None);
+
+    std::thread::scope(|scope| {
+        for worker_id in 0..worker_count {
+            let drain_tx = drain_tx.clone();
+            let coord_slot = coord_slots.as_ref().map(|s| Arc::clone(&s[worker_id]));
+            let file = &shared_file;
+            let candidate_rx = &candidate_rx;
+            let first_err = &first_err;
+            let ranges = &*ranges;
+            let diff = &*diff;
+
+            scope.spawn(move || {
+                let result = worker_loop(
+                    worker_id,
+                    file,
+                    candidate_rx,
+                    &drain_tx,
+                    counters,
+                    ranges,
+                    diff,
+                    locations_on_ways,
+                    coord_slot.as_ref(),
+                );
+                if let Err(e) = result {
+                    let mut slot =
+                        first_err.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if slot.is_none() {
+                        *slot = Some(e);
+                    }
+                }
+            });
+        }
+    });
+
+    // Drop our SyncSender clone explicitly so the drain sees end-of-input
+    // once every worker's clone is also dropped.
+    drop(drain_tx);
+
+    crate::debug::emit_marker("MERGE_STREAMING_END");
+    counters.emit();
+
+    if let Some(e) = first_err
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Per-worker hot loop. Pulls candidates until the channel closes; for
+/// each candidate dispatches to the appropriate handler.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn worker_loop(
+    worker_id: usize,
+    file: &std::fs::File,
+    candidate_rx: &Mutex<mpsc::Receiver<ScannedBlob>>,
+    drain_tx: &mpsc::SyncSender<DrainItem>,
+    counters: &WorkerCounters,
+    ranges: &DiffRanges,
+    diff: &CompactDiffOverlay,
+    locations_on_ways: bool,
+    coord_slot: Option<&CoordSlot>,
+) -> Result<()> {
+    let mut read_buf: Vec<u8> = Vec::new();
+    let mut decompress_buf: Vec<u8> = Vec::new();
+    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut bb = BlockBuilder::new();
+
+    // Per-worker coord accumulator: gathered locally then flushed to the
+    // shared slot in batches to amortise the mutex acquire. Empty when
+    // `locations_on_ways` is false.
+    let mut local_coords: FxHashMap<i64, (i32, i32)> = FxHashMap::default();
+    let mut tuples_scratch: Vec<crate::scan::node::NodeTuple> = Vec::new();
+    let mut group_starts_scratch: Vec<(usize, usize)> = Vec::new();
+
+    loop {
+        let item = {
+            let rx = candidate_rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            match rx.recv() {
+                Ok(item) => item,
+                Err(_) => break, // channel closed by scanner
+            }
+        };
+
+        match item {
+            ScannedBlob::Candidate(desc) => {
+                handle_candidate(
+                    file,
+                    &desc,
+                    drain_tx,
+                    counters,
+                    ranges,
+                    diff,
+                    &mut bb,
+                    &mut read_buf,
+                    &mut decompress_buf,
+                    &mut st_scratch,
+                    &mut gr_scratch,
+                    locations_on_ways,
+                    &mut local_coords,
+                    &mut tuples_scratch,
+                    &mut group_starts_scratch,
+                )?;
+            }
+            ScannedBlob::Passthrough(desc) => {
+                // Only seen here under --direct-io output (scanner routes
+                // splice-capable passthroughs straight to the drain).
+                handle_owned_passthrough(file, &desc, drain_tx, counters, &mut read_buf)?;
+            }
+        }
+    }
+
+    // Final flush of this worker's coord accumulator into the shared slot.
+    // Safe regardless of whether the drain has merged yet - drain holds
+    // the same Arc and acquires when ready.
+    if locations_on_ways && !local_coords.is_empty()
+        && let Some(slot) = coord_slot
+    {
+        flush_local_coords(slot, &mut local_coords);
+    }
+
+    let _ = worker_id; // reserved for per-worker counter slots later
+    Ok(())
+}
+
+/// Slow-path candidate: pread body, decompress, opportunistic coord
+/// extraction (Node + LOW), parse, precise check, false-positive or
+/// rewrite.
+#[allow(clippy::too_many_arguments)]
+fn handle_candidate(
+    file: &std::fs::File,
+    desc: &BlobDescriptor,
+    drain_tx: &mpsc::SyncSender<DrainItem>,
+    counters: &WorkerCounters,
+    ranges: &DiffRanges,
+    diff: &CompactDiffOverlay,
+    bb: &mut BlockBuilder,
+    read_buf: &mut Vec<u8>,
+    decompress_buf: &mut Vec<u8>,
+    st_scratch: &mut Vec<(u32, u32)>,
+    gr_scratch: &mut Vec<(u32, u32)>,
+    locations_on_ways: bool,
+    local_coords: &mut FxHashMap<i64, (i32, i32)>,
+    tuples_scratch: &mut Vec<crate::scan::node::NodeTuple>,
+    group_starts_scratch: &mut Vec<(usize, usize)>,
+) -> Result<()> {
+    counters.blobs_processed.fetch_add(1, Ordering::Relaxed);
+
+    let body_offset = desc.frame_start + desc.blob_offset as u64;
+    pread_into(file, read_buf, body_offset, desc.data_size).map_err(io_err)?;
+
+    let t_decompress = std::time::Instant::now();
+    decompress_blob_raw(read_buf, decompress_buf).map_err(io_err)?;
+    counters
+        .decompress_ns
+        .fetch_add(elapsed_ns(t_decompress), Ordering::Relaxed);
+
+    if locations_on_ways && desc.kind == ElemKind::Node {
+        let t_extract = std::time::Instant::now();
+        tuples_scratch.clear();
+        group_starts_scratch.clear();
+        // Match node_locations.rs prefill semantics: errors on extraction
+        // are swallowed (some blobs may have non-dense Node messages,
+        // which the tuple extractor rejects).
+        if crate::scan::node::extract_node_tuples(
+            decompress_buf,
+            tuples_scratch,
+            group_starts_scratch,
+        )
+        .is_ok()
+        {
+            for t in tuples_scratch.iter() {
+                local_coords.insert(t.id, (t.lat, t.lon));
+            }
+            counters
+                .coord_pairs_extracted
+                .fetch_add(tuples_scratch.len() as u64, Ordering::Relaxed);
+        }
+        counters
+            .coord_extract_ns
+            .fetch_add(elapsed_ns(t_extract), Ordering::Relaxed);
+    }
+
+    let t_parse = std::time::Instant::now();
+    let raw = std::mem::take(decompress_buf);
+    let block =
+        crate::PrimitiveBlock::from_vec_with_scratch(raw, st_scratch, gr_scratch).map_err(io_err)?;
+    counters
+        .parse_ns
+        .fetch_add(elapsed_ns(t_parse), Ordering::Relaxed);
+
+    let t_precise = std::time::Instant::now();
+    let overlaps = block_overlaps_diff(&block, ranges);
+    counters
+        .precise_ns
+        .fetch_add(elapsed_ns(t_precise), Ordering::Relaxed);
+
+    if !overlaps {
+        counters.blobs_false_positive.fetch_add(1, Ordering::Relaxed);
+        return send_drain(drain_tx, WorkerOutput::FalsePositive(desc.clone()).into_drain_item());
+    }
+
+    // Compute the inline-upsert slice for this blob's ID range
+    // (mirrors Phase 2 in the current batch loop at rewrite.rs:370-374).
+    let (min_id, max_id) = desc.id_range.unwrap_or((i64::MAX, i64::MIN));
+    let inline_upserts = upsert_slice(ranges, desc.kind, min_id, max_id);
+
+    // The current loc_map is published by the drain at the node→way
+    // barrier. Workers processing way blobs after the barrier read it via
+    // an Arc clone wired through the worker spawn (TODO: wire the
+    // post-barrier loc_map handle when drain.rs lands; until then, pass
+    // None and rely on the existing classify path).
+    let loc_map: Option<&FxHashMap<i64, (i32, i32)>> = None;
+
+    let t_rewrite = std::time::Instant::now();
+    let output = rewrite_block_parallel(&block, diff, bb, inline_upserts, desc.kind, loc_map)
+        .map_err(|e| new_error(ErrorKind::Io(std::io::Error::other(e.to_string()))))?;
+    counters
+        .rewrite_ns
+        .fetch_add(elapsed_ns(t_rewrite), Ordering::Relaxed);
+
+    counters.blobs_rewritten.fetch_add(1, Ordering::Relaxed);
+    let id_range = desc.id_range.unwrap_or((0, 0));
+    send_drain(
+        drain_tx,
+        DrainItem::Rewritten {
+            seq: desc.seq,
+            blocks: output.blocks,
+            kind: desc.kind,
+            id_range,
+        },
+    )
+}
+
+/// `--direct-io` passthrough: pread the **full framed bytes** so the
+/// drain can `write_raw_owned` without re-framing.
+fn handle_owned_passthrough(
+    file: &std::fs::File,
+    desc: &BlobDescriptor,
+    drain_tx: &mpsc::SyncSender<DrainItem>,
+    counters: &WorkerCounters,
+    read_buf: &mut Vec<u8>,
+) -> Result<()> {
+    counters.blobs_processed.fetch_add(1, Ordering::Relaxed);
+    counters
+        .blobs_owned_passthrough
+        .fetch_add(1, Ordering::Relaxed);
+
+    pread_into(file, read_buf, desc.frame_start, desc.frame_len).map_err(io_err)?;
+
+    // Move the bytes into the DrainItem; reset read_buf for the next
+    // pread without keeping the per-blob allocation alive.
+    let frame_bytes = std::mem::take(read_buf);
+    let id_range = desc.id_range.unwrap_or((0, 0));
+
+    send_drain(
+        drain_tx,
+        DrainItem::OwnedBytes {
+            seq: desc.seq,
+            frame_bytes,
+            kind: desc.kind,
+            id_range,
+        },
+    )
+}
+
+/// Resize `buf` to `len` and pread `len` bytes at `offset`.
+fn pread_into(
+    file: &std::fs::File,
+    buf: &mut Vec<u8>,
+    offset: u64,
+    len: usize,
+) -> std::io::Result<()> {
+    buf.resize(len, 0);
+    file.read_exact_at(buf, offset)
+}
+
+/// Compute the inline-upsert slice for one blob: upserts whose OSM ID
+/// key falls in `[blob_osm_first(min,max), blob_osm_last(min,max)]`.
+fn upsert_slice(ranges: &DiffRanges, kind: ElemKind, min_id: i64, max_id: i64) -> &[i64] {
+    let upserts = ranges.upserts(kind);
+    let first = crate::osm_id::blob_osm_first_key(min_id, max_id);
+    let last = crate::osm_id::blob_osm_last_key(min_id, max_id);
+    let start = upserts.partition_point(|&id| crate::osm_id::osm_id_key(id) < first);
+    let end = upserts[start..].partition_point(|&id| crate::osm_id::osm_id_key(id) <= last) + start;
+    &upserts[start..end]
+}
+
+/// Drain `local` into the worker's shared coord slot. Acquires the mutex
+/// for the duration of the merge; the drain reads via the same Arc so
+/// the publish is atomic from its perspective.
+fn flush_local_coords(
+    slot: &Arc<Mutex<FxHashMap<i64, (i32, i32)>>>,
+    local: &mut FxHashMap<i64, (i32, i32)>,
+) {
+    if local.is_empty() {
+        return;
+    }
+    let mut shared = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if shared.is_empty() {
+        std::mem::swap(&mut *shared, local);
+    } else {
+        shared.extend(local.drain());
+    }
+}
+
+/// Send to the drain. Returns `Err` only if the drain has already exited
+/// (channel closed) - treat as graceful shutdown.
+fn send_drain(drain_tx: &mpsc::SyncSender<DrainItem>, item: DrainItem) -> Result<()> {
+    drain_tx.send(item).map_err(|_| {
+        new_error(ErrorKind::Io(std::io::Error::other(
+            "streaming: drain closed worker→drain channel",
+        )))
+    })
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn io_err<E: std::fmt::Display>(e: E) -> Error {
+    new_error(ErrorKind::Io(std::io::Error::other(e.to_string())))
+}
+
+fn elapsed_ns(t: std::time::Instant) -> u64 {
+    u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}

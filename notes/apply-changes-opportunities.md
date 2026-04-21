@@ -11,6 +11,137 @@ Target: `pbfhogg apply-changes --locations-on-ways` on planet with a daily OSC, 
 - **Scope out of this plan:** internal API rewrites (`IdSetDense`, `PbfWriter`, `HeaderWalker` are correct as-is), compression-level tuning (production is `--compression none`; osmium-interop zlib is a separate workload), weekly-OSC parallel parse (separate workstream).
 - **Design detail:** see "Third review round + synthesis (2026-04-20)" below. That section supersedes the Q1-Q7 follow-up round on every item where they differ.
 
+## Implementation progress (2026-04-20)
+
+Tracking what's landed vs pending inside the P1 rewrite. The plan's
+"one commit" framing applies to the *big rewrite* (delete batch loop,
+fuse classify+rewrite, wire scanner + workers + drain). Pure-additive
+scaffolding (types, property tests) can land separately as prep so
+that a revert of the rewrite keeps the safety net.
+
+**Committed prep scaffolding (`a2a0567`, 2026-04-20):**
+
+- `src/commands/apply_changes/descriptor.rs` - the four types the
+  pipeline exchanges: `BlobDescriptor`, `ScannedBlob` (Candidate |
+  Passthrough), `WorkerOutput` (FalsePositive | Rewritten |
+  OwnedPassthrough for `--direct-io` fallback), `DrainItem`
+  (CopyRange | OwnedBytes | Rewritten). Includes a `byte_cost()`
+  accessor for the reorder buffer's byte-budget backpressure.
+- `tests/apply_changes_invariants.rs` - six property tests against
+  current main's behavior, locking in the contract the rewrite must
+  preserve: two cursor-rule tests (FalsePositive blob with upsert in
+  range produces output at blob-tail, not OSM-sorted interleaved),
+  two empty-base-PBF tests (all-kinds trailing flush, empty-diff
+  noop), two trailing-create interleave tests. `--locations-on-ways`
+  invariants are not exercised here (fixture needs ALTW-enriched
+  base PBF; coverage moved to Denmark byte-equal cross-validation).
+- Plan doc updates (this file + multi-extract).
+
+**Committed prep scaffolding part 2** (descriptor-first pipeline pieces,
+all behind `#![allow(dead_code)]` until the merge() flip lands):
+
+- `src/commands/apply_changes/scanner.rs` - `HeaderWalker`-driven
+  descriptor emission with the scanner-side node→way barrier and
+  `use_copy_range` routing fork. Splice fast-path emits `DrainItem`
+  directly into a dedicated drain channel; `--direct-io` and
+  overlap-candidate descriptors route through the worker pool as
+  `ScannedBlob`. Emits these markers/counters on the scanner path:
+  - Markers: `MERGE_SCANNER_START/END`,
+    `MERGE_SCANNER_BARRIER_WAIT_START/END`.
+  - Counters: `merge_scanner_blobs_emitted`,
+    `merge_scanner_to_drain_bytes_high_water`,
+    `merge_scanner_to_workers_bytes_high_water`.
+- `src/commands/apply_changes/streaming.rs` - long-lived worker pool
+  driven by `std::thread::scope`. Workers each own a thread-local
+  `BlockBuilder` + scratches, pread the Blob body for `Candidate`
+  descriptors, decompress, opportunistically extract Node coords
+  during the node phase into per-worker `Arc<Mutex<FxHashMap>>`
+  slots, parse via `from_vec_with_scratch`, precise-check, then emit
+  `DrainItem::Rewritten` or convert false positives to
+  `DrainItem::CopyRange`. Under `--direct-io`, workers also handle
+  `Passthrough` descriptors: pread the **full framed bytes** and emit
+  `DrainItem::OwnedBytes`. Emits:
+  - Markers: `MERGE_STREAMING_START/END`.
+  - Counters: `merge_streaming_blobs_processed`,
+    `merge_streaming_blobs_rewritten`,
+    `merge_streaming_blobs_false_positive`,
+    `merge_streaming_blobs_owned_passthrough`,
+    `merge_streaming_decompress_ns`, `merge_streaming_parse_ns`,
+    `merge_streaming_precise_ns`, `merge_streaming_rewrite_ns`,
+    `merge_streaming_coord_extract_ns`,
+    `merge_streaming_coord_pairs_extracted`.
+- `src/commands/apply_changes/drain.rs` - single-threaded ordered drain
+  actor. Consumes a unified `DrainItem` stream from scanner + workers
+  via `mpsc::Receiver<DrainItem>`. `BTreeMap<seq, DrainItem>` reorder
+  buffer keyed by global seq; advances through contiguous seqs after
+  each insert. Owns `UpsertCursors`, `last_type`, gap-create
+  `BlockBuilder`, contiguous-range `copy_file_range` coalescer (port
+  of ALTW's pattern), `OwnedBytes` chunk coalescer, `MergeStats`
+  accumulator. Detects node→way transition; merges `streaming::CoordSlots`
+  into the published `LocMapHandle = Arc<OnceLock<Arc<FxHashMap>>>`
+  before signalling the scanner over `barrier_tx`. Trailing-creates
+  port verbatim from `rewrite.rs`'s `types_to_flush` match. Includes
+  property-tested cursor-rule invariant: Rewrite advances the cursor
+  past `blob_osm_last_key`; CopyRange/OwnedBytes do NOT (silent-break
+  risk surfaced in the R3R2 review). Emits:
+  - Markers: `MERGE_DRAIN_START/END`,
+    `MERGE_DRAIN_BARRIER_START/END`,
+    `MERGE_TRAILING_CREATES_START/END`.
+  - Counters: `merge_drain_items_processed`,
+    `merge_drain_copy_range_calls`,
+    `merge_drain_copy_range_coalesced_items`,
+    `merge_drain_passthrough_chunks_flushed`,
+    `merge_drain_rewrite_blocks_written`,
+    `merge_drain_gap_creates_emitted`,
+    `merge_drain_trailing_creates_emitted`,
+    `merge_drain_reorder_buffer_high_water_count`,
+    `merge_drain_reorder_buffer_high_water_bytes`,
+    `merge_drain_barrier_loc_map_size`,
+    `merge_drain_reorder_gap_wait_ns`.
+- `descriptor.rs` exposes conversion helpers
+  `BlobDescriptor::into_drain_copy_range` and
+  `WorkerOutput::into_drain_item` so scanner and workers both emit
+  `DrainItem` directly into the unified drain channel.
+
+**Pending inside P1 (must land as a single commit with the batch-loop
+deletion to avoid a half-rewritten tree on main):**
+
+- Modifications to `merge()` in `rewrite.rs`: delete batch loop,
+  become a thin orchestrator (spawn scanner + worker pool + drain on
+  dedicated threads, join, surface counters).
+- Modifications to `classify.rs::classify_only`: drop the fast-path
+  branch (scanner owns it), switch parse to `from_vec_with_scratch`.
+- Wire the post-barrier `Arc<FxHashMap>` loc_map handle through to
+  workers processing way blobs (currently passes `None` - the
+  scaffold's TODO comment in `streaming.rs::handle_candidate`).
+- Deletions: `parallel_reader.rs`, `node_locations.rs::prefill_from_base`.
+
+**Cross-validation not yet run** (expected only after the rewrite
+commit): Denmark byte-equal, Europe byte-equal + `--bench 1`, Planet
+`--bench 1` against the 40-55 s target + abort/pivot plan.
+
+**Session learnings worth noting (found during scaffolding):**
+
+- The classify/rewrite contract for false-positive blobs produces
+  blob-tail ordering `[1, 2, 10, 5]`, not OSM-sorted interleave
+  `[1, 2, 5, 10]`. The property tests assert the current shape
+  verbatim, not an idealised OSM-sorted form. This was implicit in
+  the `classify.rs::block_overlaps_diff` doc comment but the plan
+  doc hadn't stated it as an asserted-on invariant.
+- `HeaderWalker::next_header` returns frame_start + data_offset +
+  data_size per blob, perfectly matching the descriptor shape. The
+  scanner's integration is a straight port of the walker's output
+  into `BlobDescriptor`.
+- `OwnedBlock` is a type alias `(Vec<u8>, BlobIndex, Option<Vec<u8>>)`,
+  not a struct - keep this in mind when accessing the encoded bytes
+  (tuple indexing in destructure).
+- `std::sync::mpsc::SyncSender::send` takes `&self`, so a shared
+  `Arc<SyncSender>` or by-value in a destructure both work for the
+  scanner → drain / scanner → workers channels. Destructuring the
+  ScannerConfig inside `run_scanner` is preferred over `&cfg` so
+  clippy sees the channels being consumed at scanner exit (which is
+  what signals end-of-input to downstream).
+
 ## Thesis
 
 Unlike ALTW, the geocode builder, and check-refs, apply-changes is **already mostly well-shaped**. The existing pipeline has:
@@ -1072,18 +1203,31 @@ These are the parts of today's code that survive P1 unchanged. The batch-loop ma
 5. ~~**Bump classify batch size**~~ **Landed 2026-04-18 (`bfac63b`) - 512 MB merge batch budget.** Raised average batch from ~13 to ~18 overlap blobs but classify wall was unchanged (72.5 s vs 70.3 s). **Diagnosis from external review: the plateau is structural to the batch barrier, not fixable with batch-size knobs** - see "External review synthesis" section.
 6. ~~**Parallel reader (#3)**~~ **Landed 2026-04-18 (`c97d6b5` streaming variant)**. Net-zero wall change vs sequential reader. Kept as infrastructure for the streaming pipeline below.
 7. ~~**Cheap disambiguation experiment**~~ **Attempted + reverted 2026-04-18.** `rayon::scope` + per-batch spawn + mpsc + ReorderBuffer regressed from ~140 s to 10 min+ at planet (Denmark verify passed). See "Cheap disambiguation experiment" subsection for post-mortem. Doesn't disprove the plateau hypothesis, but rules out this form of cheap check. **Going direct to streaming pipeline instead.**
-8. **Descriptor-first streaming pipeline (P1, single commit).** See "Third review round + synthesis" above for full design. Headline bundle in one commit:
-   - New `scanner.rs` module: `HeaderWalker`-driven descriptor emission. Non-overlap indexed blobs routed as `CopyRange` descriptors **directly to drain**; overlap candidates routed to worker pool.
-   - New `streaming.rs` module: long-lived worker pool (`nproc - 2`), persistent thread-local `BlockBuilder` + scratch, slow-path only (decompress + parse via `from_vec_with_scratch` + precise check + rewrite inline or emit CopyRange for false positives).
-   - New `drain.rs` module (or extend `stream_output.rs`): single-threaded ordered drain actor. Owns `UpsertCursors`, `last_type`, gap-create `BlockBuilder`, passthrough coalescer (contiguous `copy_file_range` runs, ALTW pattern), stats accumulator, writer handle. Byte-budget reorder buffer keyed by global seq.
-   - Prefill fusion: workers extract coords into per-worker maps during node phase; scanner holds way/relation dispatch pending until drain publishes merged `Arc<loc_map>` (barrier is scanner-side, not drain-side; see "Node→way barrier ownership" in the Synthesized design). [`node_locations.rs::prefill_from_base`](../src/commands/apply_changes/node_locations.rs) deleted.
-   - `--direct-io` fallback: drain-side policy - workers pread body bytes when output can't splice; payload flows through worker → drain channel.
+8. **Descriptor-first streaming pipeline (P1).** See "Third review round + synthesis" above for full design. See "Implementation progress" above for current status. Phase-by-phase breakdown:
+
+   **Prep scaffolding** (committed separately, `a2a0567` 2026-04-20 - pure additions, can be kept across a revert):
+   - [x] ~~`src/commands/apply_changes/descriptor.rs`~~ - type definitions. Landed.
+   - [x] ~~`tests/apply_changes_invariants.rs`~~ - 6 property tests against current main. Pass on current main; contract locked in. Landed.
+
+   **Pipeline rewrite** (must land as ONE commit since each piece depends on the others; partial landings leave the batch loop broken):
+   - [x] ~~`src/commands/apply_changes/scanner.rs`~~ - `HeaderWalker`-driven descriptor emission with scanner-side node→way barrier and `use_copy_range` routing fork. **In working tree, uncommitted.**
+   - [x] ~~`src/commands/apply_changes/streaming.rs`~~ - long-lived worker pool driven by `std::thread::scope`. Persistent thread-local `BlockBuilder` + scratches, decompress + parse via `from_vec_with_scratch` + precise check + rewrite inline (`rewrite_block_parallel`) or `DrainItem::CopyRange` for false positives. Per-worker coord extraction into `Arc<Mutex<FxHashMap>>` slots under `--locations-on-ways`. `--direct-io` passthrough handler preads full frame and emits `DrainItem::OwnedBytes`. Open: post-barrier `Arc<loc_map>` handle for way-blob workers (currently passes `None`); drain.rs scaffold wires the handle but the worker side still needs the merge-orchestrator wiring.
+   - [x] ~~`src/commands/apply_changes/drain.rs`~~ - single-threaded ordered drain actor with `BTreeMap<seq, DrainItem>` reorder buffer, `copy_file_range` coalescer, `OwnedBytes` chunk coalescer, type-transition + gap-create + trailing-create handlers, `CoordSlots` merge into `LocMapHandle = Arc<OnceLock<Arc<FxHashMap>>>` at the node→way barrier with scanner signal, and the cursor-rule invariant (Rewrite advances; CopyRange/OwnedBytes do NOT). Cross-validation deferred to merge() flip.
+   - [ ] Modify `merge()` in `rewrite.rs`: delete batch loop (~320 lines); become a thin orchestrator (setup + spawn scanner + spawn workers + spawn drain + join).
+   - [ ] Modify `classify.rs::classify_only`: drop the fast-path branch (scanner owns it now); switch parse to `from_vec_with_scratch`.
+   - [ ] Delete `parallel_reader.rs` entirely.
+   - [ ] Delete `node_locations.rs::prefill_from_base` (workers extract coords during node phase).
+
+   **Invariants to preserve** (see "Correctness invariants" below):
+   - Cursor-rule: Rewrite slots advance the cursor past their range; Passthrough/FalsePositive do NOT (silent-break risk, property-tested).
+   - `--direct-io` fallback: drain-side routing policy, workers pread full frames.
    - `--force` fallback: descriptors have `index: None`; scanner cannot fast-path; all descriptors flow through worker pool.
-   - Delete [`parallel_reader.rs`](../src/commands/apply_changes/parallel_reader.rs), the batch loop in `merge()`, and the classify fast-path branch in [`classify_only`](../src/commands/apply_changes/classify.rs) (scanner owns fast-path now).
-   - `merge()` becomes a thin orchestrator (setup + spawn scanner + spawn workers + spawn drain + join).
-   - Property tests before landing: cursor-rule invariant (Rewrite vs Passthrough/FalsePositive advancement), empty-base-PBF trailing creates, `--direct-io` parity, `--force` parity.
-   - Cross-validation: Denmark `brokkr verify merge` byte-equal; Europe byte-equal + hash compare; planet `--bench 1` then `--bench 3`.
-   - **Target: 40-55 s wall at planet daily**, from 144.4 s baseline.
+   - Node→way barrier: scanner-side ownership (not drain-side).
+   - Trailing creates: port `types_to_flush` match verbatim.
+
+   **Cross-validation**: Denmark `brokkr verify merge` byte-equal; Europe byte-equal + hash compare; planet `--bench 1` then `--bench 3`.
+
+   **Target: 40-55 s wall at planet daily**, from 144.4 s baseline. Abort threshold >80 s planet `--bench 1` (see "Abort / pivot plan" under the Third review round + synthesis section).
 
 9. **P1.5 - Worker-emits-framed-bytes (conditional on post-P1 measurement).** R1 expects the writer chain becomes the new ceiling under `--compression none` after P1. R2 says measure first. Same commit boundary either way: land P1, measure, add worker-framed output (`frame_blob_pipelined` on the worker, drain hands framed bytes directly to `write_raw_owned`) if bench shows writer chain dominating. Two thread hops + one `rayon::spawn` per rewritten blob for a memcpy becomes one thread hop.
 

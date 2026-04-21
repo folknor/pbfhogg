@@ -13,13 +13,16 @@
 mod classify;
 mod descriptor;
 mod diff_ranges;
+mod drain;
 mod element_writes;
 mod node_locations;
 mod parallel_reader;
 mod rewrite;
 mod rewrite_block;
+mod scanner;
 mod stats;
 mod stream_output;
+mod streaming;
 
 pub use rewrite::{merge, MergeOptions};
 pub use stats::MergeStats;

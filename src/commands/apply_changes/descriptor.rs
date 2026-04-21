@@ -158,6 +158,69 @@ pub(super) enum DrainItem {
     },
 }
 
+impl BlobDescriptor {
+    /// Convert this descriptor into a [`DrainItem::CopyRange`] for the
+    /// scanner's fast-path. Returns `None` when the descriptor lacks
+    /// indexdata (only indexed blobs can take the splice fast-path).
+    pub(super) fn into_drain_copy_range(self) -> Option<DrainItem> {
+        let index = self.index?;
+        let id_range = self.id_range.unwrap_or((index.min_id, index.max_id));
+        Some(DrainItem::CopyRange {
+            seq: self.seq,
+            frame_start: self.frame_start,
+            frame_len: self.frame_len,
+            kind: self.kind,
+            id_range,
+            index,
+            tagdata: self.tagdata,
+        })
+    }
+}
+
+impl WorkerOutput {
+    /// Convert this worker output into a [`DrainItem`] for the unified
+    /// drain stream. False positives become CopyRange (drain splices the
+    /// raw frame); rewrites and direct-io passthroughs map directly.
+    pub(super) fn into_drain_item(self) -> DrainItem {
+        match self {
+            WorkerOutput::FalsePositive(desc) => {
+                // FalsePositive only fires for indexed Candidate blobs
+                // (under --force the worker still has indexdata via scan
+                // result). The fallback `(min_id, max_id) == (0, 0)`
+                // path keeps drain from panicking if the descriptor is
+                // mis-shaped, but the production path always has Some.
+                let seq = desc.seq;
+                let frame_start = desc.frame_start;
+                let frame_len = desc.frame_len;
+                let kind = desc.kind;
+                let id_range = desc.id_range.unwrap_or((0, 0));
+                let index = desc.index.unwrap_or(crate::blob_meta::BlobIndex {
+                    kind,
+                    min_id: id_range.0,
+                    max_id: id_range.1,
+                    count: 0,
+                    bbox: None,
+                });
+                DrainItem::CopyRange {
+                    seq,
+                    frame_start,
+                    frame_len,
+                    kind,
+                    id_range,
+                    index,
+                    tagdata: desc.tagdata,
+                }
+            }
+            WorkerOutput::Rewritten { seq, blocks, kind, id_range } => {
+                DrainItem::Rewritten { seq, blocks, kind, id_range }
+            }
+            WorkerOutput::OwnedPassthrough { seq, frame_bytes, kind, id_range } => {
+                DrainItem::OwnedBytes { seq, frame_bytes, kind, id_range }
+            }
+        }
+    }
+}
+
 impl DrainItem {
     /// The seq this item is keyed on in the reorder buffer.
     pub(super) fn seq(&self) -> u64 {

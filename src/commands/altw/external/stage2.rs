@@ -18,7 +18,7 @@ use crate::idset::IdSet;
 use crate::scan::node::{extract_node_tuples, NodeTuple};
 use super::super::Result;
 use super::{
-    NodeBlobInfo, RANK_RECORD_SIZE, RESOLVED_ENTRY_SIZE, COORD_SLOT_SIZE,
+    slot_bucket_bounds, NodeBlobInfo, RANK_RECORD_SIZE, RESOLVED_ENTRY_SIZE, COORD_SLOT_SIZE,
     ResolvedEntry,
 };
 
@@ -39,11 +39,7 @@ impl LoaderScratch {
 }
 
 struct PreparedBucket {
-    /// Packed `(blob_idx << 32) | blob_local_slot` per rank-bucket
-    /// entry. Same 8-byte storage as the pre-#6 `slot_pos: u64`, just
-    /// re-decomposed so the resolve loop can route entries to blob
-    /// groups without a binary search on `way_slot_starts`.
-    grouped_record: Vec<u64>,
+    grouped_slot_pos: Vec<u64>,
     group_offsets: Vec<u64>,
     bucket_rank_start: u64,
     local_range: usize,
@@ -127,63 +123,54 @@ fn prepare_bucket(
     }
     let prepare_prefix_ms = t_prefix.elapsed().as_millis() as u64;
 
-    // Scatter pass: place `(blob_idx, blob_local_slot)` into rank-grouped
-    // order. Packed as `(blob_idx << 32) | blob_local_slot` so the
-    // grouped buffer stays one u64 per occurrence (same size as the
-    // pre-#6 `grouped_slot_pos` layout).
+    // Scatter pass: place slot_pos values into rank-grouped order.
     let t_scatter = std::time::Instant::now();
     let total = group_offsets[local_range] as usize;
-    let mut grouped_record = vec![0u64; total];
+    let mut grouped_slot_pos = vec![0u64; total];
     loader.write_pos.clear();
     loader.write_pos.extend_from_slice(&group_offsets[..local_range]);
     for chunk in loader.data_buf.chunks_exact(RANK_RECORD_SIZE) {
         let local_rank = u32::from_le_bytes([
             chunk[0], chunk[1], chunk[2], chunk[3],
         ]) as usize;
-        let blob_idx = u32::from_le_bytes([
+        let slot_pos = u64::from_le_bytes([
             chunk[4], chunk[5], chunk[6], chunk[7],
-        ]);
-        let blob_local_slot = u32::from_le_bytes([
             chunk[8], chunk[9], chunk[10], chunk[11],
         ]);
-        let packed = (u64::from(blob_idx) << 32) | u64::from(blob_local_slot);
         let pos = loader.write_pos[local_rank] as usize;
-        grouped_record[pos] = packed;
+        grouped_slot_pos[pos] = slot_pos;
         loader.write_pos[local_rank] += 1;
     }
     let prepare_scatter_ms = t_scatter.elapsed().as_millis() as u64;
 
     Ok(PreparedBucket {
-        grouped_record, group_offsets, bucket_rank_start, local_range,
+        grouped_slot_pos, group_offsets, bucket_rank_start, local_range,
         prepare_count_ms, prepare_prefix_ms, prepare_scatter_ms,
         open_calls, stat_calls, fadvise_calls, fadvise_bytes,
     })
 }
 
-/// Shared blob-group writers protected by per-group mutexes.
-/// `blob_group_count` files total regardless of worker count. A single
-/// way blob's refs span multiple rank buckets (and so multiple stage 2
-/// workers), but all those refs land in the same blob group - the
-/// per-group mutex serializes the N:1 write fan-in.
-pub(super) struct SharedBlobGroups {
+/// Shared slot bucket writers protected by per-bucket mutexes.
+/// `slot_bucket_count` files total regardless of worker count.
+pub(super) struct SharedSlotBuckets {
     writers: Vec<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>,
     entry_counts: Vec<std::sync::atomic::AtomicU64>,
 }
 
 const BUCKET_BUF_SIZE: usize = 256 * 1024;
 
-impl SharedBlobGroups {
+impl SharedSlotBuckets {
     pub(super) fn create(
         scratch: &ScratchDir,
-        blob_group_count: usize,
+        slot_bucket_count: usize,
     ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
-        let mut writers = Vec::with_capacity(blob_group_count);
-        let mut entry_counts = Vec::with_capacity(blob_group_count);
+        let mut writers = Vec::with_capacity(slot_bucket_count);
+        let mut entry_counts = Vec::with_capacity(slot_bucket_count);
 
-        for i in 0..blob_group_count {
-            let path = scratch.bucket_path("group", i);
+        for i in 0..slot_bucket_count {
+            let path = scratch.bucket_path("slot", i);
             let file = std::fs::File::create(&path)
-                .map_err(|e| format!("failed to create blob group {}: {e}", path.display()))?;
+                .map_err(|e| format!("failed to create slot bucket {}: {e}", path.display()))?;
             writers.push(std::sync::Mutex::new(
                 std::io::BufWriter::with_capacity(BUCKET_BUF_SIZE, file),
             ));
@@ -229,8 +216,9 @@ pub(super) fn stage2_node_join(
     scratch: &ScratchDir,
     rank_bucket_counts: &[u64],
     num_shard_workers: usize,
-    blob_groups: &SharedBlobGroups,
-    blob_group_map: &super::BlobGroupMap,
+    slot_buckets: &SharedSlotBuckets,
+    slot_bucket_count: usize,
+    total_slots: u64,
     unique_nodes: u64,
     input_pbf: &Arc<std::fs::File>,
     node_id_set: &IdSet,
@@ -304,8 +292,6 @@ pub(super) fn stage2_node_join(
     let node_blobs_ref = &s2_node_blobs_read;
     let node_straddler_ref = &s2_node_straddler_blobs;
     let mapping_ref = node_blob_mapping;
-    let group_map_ref = blob_group_map;
-    let blob_group_count = blob_group_map.group_count;
     let id_set_ref = node_id_set;
     let resolve_ref = &s2_resolve_ms;
     let load_ref = &s2_bucket_load_ms;
@@ -354,11 +340,11 @@ pub(super) fn stage2_node_join(
 
                 // Per-slot-bucket local buffers. Flushed when any buffer
                 // exceeds FLUSH_THRESHOLD, and at the end of each rank bucket.
-                // 256 KB per buffer × blob_group_count = 64 MB max per worker
+                // 256 KB per buffer × slot_bucket_count = 64 MB max per worker
                 // at full 256-bucket scale, scales down for small inputs.
                 const FLUSH_THRESHOLD: usize = 256 * 1024;
-                let mut group_bufs: Vec<Vec<u8>> = (0..blob_group_count).map(|_| Vec::new()).collect();
-                let mut group_counts: Vec<u64> = vec![0; blob_group_count];
+                let mut slot_bufs: Vec<Vec<u8>> = (0..slot_bucket_count).map(|_| Vec::new()).collect();
+                let mut slot_counts: Vec<u64> = vec![0; slot_bucket_count];
 
                 loop {
                     if err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
@@ -547,34 +533,28 @@ pub(super) fn stage2_node_join(
                             // contract ever changes.
                             let is_resolved = lat != 0 || lon != 0;
 
-                            for &packed in &bkt.grouped_record[start..end] {
-                                #[allow(clippy::cast_possible_truncation)]
-                                let blob_idx = (packed >> 32) as u32;
-                                #[allow(clippy::cast_possible_truncation)]
-                                let blob_local_slot = packed as u32;
-                                let entry = ResolvedEntry {
-                                    blob_idx,
-                                    blob_local_slot,
-                                    lat,
-                                    lon,
-                                };
-                                let bucket = group_map_ref.group_of_blob[blob_idx as usize] as usize;
-                                entry.write_to(&mut entry_buf);
-                                group_bufs[bucket].extend_from_slice(&entry_buf);
-                                group_counts[bucket] += 1;
+                            for &slot_pos in &bkt.grouped_slot_pos[start..end] {
+                                let entry = ResolvedEntry { slot_pos, lat, lon };
+                                let bucket = entry.slot_bucket(total_slots, slot_bucket_count);
+                                let (bucket_start, bucket_end) =
+                                    slot_bucket_bounds(total_slots, slot_bucket_count, bucket);
+                                debug_assert!(bucket_end - bucket_start <= u32::MAX as u64);
+                                entry.write_to(bucket_start, &mut entry_buf);
+                                slot_bufs[bucket].extend_from_slice(&entry_buf);
+                                slot_counts[bucket] += 1;
                                 if is_resolved {
                                     local_resolved += 1;
                                 }
-                                if group_bufs[bucket].len() >= FLUSH_THRESHOLD {
+                                if slot_bufs[bucket].len() >= FLUSH_THRESHOLD {
                                     let t_lock = std::time::Instant::now();
-                                    let mut w = blob_groups.writers[bucket]
+                                    let mut w = slot_buckets.writers[bucket]
                                         .lock()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                                     #[allow(clippy::cast_possible_truncation)]
                                     flush_lock_ref.fetch_add(t_lock.elapsed().as_millis() as u64, Relaxed);
                                     let t_wr = std::time::Instant::now();
-                                    let flush_bytes = group_bufs[bucket].len() as u64;
-                                    w.write_all(&group_bufs[bucket])
+                                    let flush_bytes = slot_bufs[bucket].len() as u64;
+                                    w.write_all(&slot_bufs[bucket])
                                         .map_err(|e| format!("write slot bucket: {e}"))?;
                                     drop(w);
                                     #[allow(clippy::cast_possible_truncation)]
@@ -594,10 +574,10 @@ pub(super) fn stage2_node_join(
                                             }
                                         }
                                     }
-                                    blob_groups.entry_counts[bucket]
-                                        .fetch_add(group_counts[bucket], Relaxed);
-                                    group_bufs[bucket].clear();
-                                    group_counts[bucket] = 0;
+                                    slot_buckets.entry_counts[bucket]
+                                        .fetch_add(slot_counts[bucket], Relaxed);
+                                    slot_bufs[bucket].clear();
+                                    slot_counts[bucket] = 0;
                                 }
                             }
                         }
@@ -612,7 +592,7 @@ pub(super) fn stage2_node_join(
                                 + node_decompress_buf.capacity() as u64
                                 + (node_tuples.capacity() * std::mem::size_of::<NodeTuple>()) as u64
                                 + (node_group_starts.capacity() * std::mem::size_of::<(usize, usize)>()) as u64
-                                + group_bufs.iter().map(|b| b.capacity() as u64).sum::<u64>();
+                                + slot_bufs.iter().map(|b| b.capacity() as u64).sum::<u64>();
                             let mut current = max_worker_buf_ref.load(Relaxed);
                             while worker_bytes > current {
                                 match max_worker_buf_ref.compare_exchange_weak(
@@ -626,28 +606,28 @@ pub(super) fn stage2_node_join(
 
                         // Flush non-empty local buffers to shared writers.
                         let mut nonempty_count: u64 = 0;
-                        for sb in 0..blob_group_count {
-                            if group_bufs[sb].is_empty() { continue; }
+                        for sb in 0..slot_bucket_count {
+                            if slot_bufs[sb].is_empty() { continue; }
                             nonempty_count += 1;
                             let t_lock = std::time::Instant::now();
-                            let mut w = blob_groups.writers[sb]
+                            let mut w = slot_buckets.writers[sb]
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             #[allow(clippy::cast_possible_truncation)]
                             flush_lock_ref.fetch_add(t_lock.elapsed().as_millis() as u64, Relaxed);
                             let t_wr = std::time::Instant::now();
-                            let flush_bytes = group_bufs[sb].len() as u64;
-                            w.write_all(&group_bufs[sb])
+                            let flush_bytes = slot_bufs[sb].len() as u64;
+                            w.write_all(&slot_bufs[sb])
                                 .map_err(|e| format!("write slot bucket: {e}"))?;
                             drop(w);
                             #[allow(clippy::cast_possible_truncation)]
                             flush_write_ref.fetch_add(t_wr.elapsed().as_millis() as u64, Relaxed);
                             slot_bytes_ref.fetch_add(flush_bytes, Relaxed);
                             flush_calls_ref.fetch_add(1, Relaxed);
-                            blob_groups.entry_counts[sb]
-                                .fetch_add(group_counts[sb], Relaxed);
-                            group_bufs[sb].clear();
-                            group_counts[sb] = 0;
+                            slot_buckets.entry_counts[sb]
+                                .fetch_add(slot_counts[sb], Relaxed);
+                            slot_bufs[sb].clear();
+                            slot_counts[sb] = 0;
                         }
                         nonempty_ref.fetch_add(nonempty_count, Relaxed);
 
@@ -710,3 +690,4 @@ pub(super) fn stage2_node_join(
     Ok(resolved_count)
 }
 
+pub(super) type SlotBuckets = SharedSlotBuckets;

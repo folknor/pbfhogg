@@ -28,6 +28,7 @@ use super::Stats;
 use crate::commands::{require_indexdata, HeaderOverrides};
 use crate::BoxResult as Result;
 
+mod blob_bucket_index;
 mod blob_meta;
 mod coord_payloads;
 mod radix;
@@ -40,8 +41,8 @@ mod stage4;
 use radix::{ScratchDir, NUM_BUCKETS};
 
 use stage1::stage1_way_pass;
-use stage2::{stage2_node_join, SharedBlobGroups};
-use stage3::{stage3_blob_group_emit, IntegratedInputs, BlobGroupRef};
+use stage2::{stage2_node_join, SlotBuckets};
+use stage3::{stage3_slot_reorder, IntegratedInputs, SlotBucketRef};
 use stage4::stage4_assembly;
 
 /// Maximum node ID in current OSM data. Used to compute bucket ranges.
@@ -51,13 +52,8 @@ pub(super) const MAX_NODE_ID: u64 = 14_000_000_000;
 /// Size of a rank-occurrence record: `(local_rank: u32, slot_pos: u64)` = 12 bytes.
 pub(super) const RANK_RECORD_SIZE: usize = 12;
 
-/// Size of a resolved entry: `(blob_idx: u32, blob_local_slot: u32, lat: i32, lon: i32)` = 16 bytes.
-///
-/// Post-#6: this is the stage-2-to-stage-3 record written to blob-group
-/// files. 16 bytes (up from the pre-#6 12-byte slot-bucket record)
-/// because we carry `blob_idx` explicitly so stage 3 can group entries
-/// by blob without a binary search on `way_slot_starts` per record.
-pub(super) const RESOLVED_ENTRY_SIZE: usize = 16;
+/// Size of a resolved entry: `(local_slot_pos: u32, lat: i32, lon: i32)` = 12 bytes.
+pub(super) const RESOLVED_ENTRY_SIZE: usize = 12;
 
 /// Size of a coordinate slot: `(lat: i32, lon: i32)` = 8 bytes.
 pub(super) const COORD_SLOT_SIZE: usize = 8;
@@ -88,138 +84,76 @@ impl NodeBlobInfo {
 /// A rank-bucketed occurrence record. `local_rank` is the rank offset
 /// within the bucket (`global_rank - bucket_rank_start`), stored as u32
 /// (max ~40M entries per bucket at planet, well under u32::MAX).
+/// `slot_pos` is the linear position within the conceptual flat coord
+/// stream (way_order × ref_order); stage 3 emits these as per-blob
+/// delta-varint payloads in `coord_payloads` rather than a flat array.
 ///
-/// Post-#6 downstream re-keying: the record carries
-/// `(blob_idx, blob_local_slot)` instead of `slot_pos`. Same 12-byte
-/// size as the pre-#6 `(local_rank, slot_pos)` layout - we're
-/// decomposing `slot_pos` into its natural `(blob_idx, blob_local_slot)`
-/// form so stage 2 can route resolved entries to blob groups without
-/// a binary search on `way_slot_starts`. `slot_pos` is reconstructable
-/// as `way_slot_starts[blob_idx] + blob_local_slot` if ever needed
-/// downstream, but the rewrite path consumes `blob_idx` directly.
+/// 12 bytes instead of 16: 25% I/O reduction across stages 1B and 2.
 #[derive(Clone, Copy)]
 pub(super) struct RankRecord {
     local_rank: u32,
-    blob_idx: u32,
-    blob_local_slot: u32,
+    slot_pos: u64,
 }
 
 impl RankRecord {
     fn write_to(&self, buf: &mut [u8; RANK_RECORD_SIZE]) {
         buf[..4].copy_from_slice(&self.local_rank.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.blob_idx.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.blob_local_slot.to_le_bytes());
+        buf[4..12].copy_from_slice(&self.slot_pos.to_le_bytes());
     }
 }
 
-/// A resolved coordinate ready to be scattered into a blob group for
-/// stage 3's per-blob coord_payloads emission. 16 bytes on disk (vs
-/// the pre-#6 12-byte slot-bucket record): carries `blob_idx`
-/// explicitly so stage 3 can group by blob without re-deriving it.
+/// A resolved coordinate ready to be scattered into a slot bucket for
+/// stage 3's coord_payloads emission.
 #[derive(Clone, Copy)]
 pub(super) struct ResolvedEntry {
-    blob_idx: u32,
-    blob_local_slot: u32,
+    slot_pos: u64,
     lat: i32,
     lon: i32,
 }
 
 impl ResolvedEntry {
-    fn write_to(&self, buf: &mut [u8; RESOLVED_ENTRY_SIZE]) {
-        buf[..4].copy_from_slice(&self.blob_idx.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.blob_local_slot.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.lat.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.lon.to_le_bytes());
+    fn write_to(&self, bucket_start: u64, buf: &mut [u8; RESOLVED_ENTRY_SIZE]) {
+        #[allow(clippy::cast_possible_truncation)]
+        let local_slot_pos = (self.slot_pos - bucket_start) as u32;
+        buf[..4].copy_from_slice(&local_slot_pos.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.lat.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.lon.to_le_bytes());
     }
 
-}
-
-/// Default blob-group count for the stage-2-to-stage-3 intermediate.
-/// Separate from `radix::NUM_BUCKETS` (the rank-bucket count for stage
-/// 1's output) - they happen to share a value today but mean different
-/// things. Revisit via the `s3_group_*` balance counters if tuning.
-pub(super) const BLOB_GROUP_COUNT: usize = 256;
-
-/// Precomputed blob-to-group mapping. Blobs are assigned to contiguous
-/// groups based on cumulative slot count rather than raw blob-index
-/// count, so each group carries roughly equal stage-2 output bytes /
-/// stage-3 encode work even when per-blob ref counts are wildly
-/// uneven (a real concern at planet scale where some way blobs are
-/// densely populated and others are nearly empty).
-///
-/// `group_of_blob[blob_idx]` is the group a given blob belongs to
-/// (O(1) lookup at stage 2's emission hot loop). `group_blob_lo[g]`
-/// is the first `blob_idx` in group `g`; `group_blob_lo[g + 1]` is
-/// the exclusive end.
-pub(super) struct BlobGroupMap {
-    pub(super) group_of_blob: Vec<u32>,
-    pub(super) group_blob_lo: Vec<u32>,
-    pub(super) group_count: usize,
-}
-
-impl BlobGroupMap {
-    /// Walk `way_slot_starts` and assign each blob to the current
-    /// group until the cumulative slot count crosses `(g + 1) *
-    /// target_per_group`. The last group absorbs the remainder.
+    /// Bucket index for slot-pos partitioning.
+    ///
+    /// Uses floor division for `range_size` so the last bucket *absorbs*
+    /// the remainder (and is wider than the others) instead of being
+    /// truncated. This keeps every bucket's width ≥ `range_size`, which
+    /// (together with the `slot_bucket_count = total_slots / max_blob_slots`
+    /// floor in `external_join`) preserves the 2-piece straddler
+    /// invariant for all input sizes. Out-of-range high slot_pos values
+    /// (that would land past the nominal last bucket because the last
+    /// is wider) get clamped to `slot_bucket_count - 1`.
     #[allow(clippy::cast_possible_truncation)]
-    pub(super) fn build(
-        way_slot_starts: &[u64],
-        total_slots: u64,
-        group_count: usize,
-    ) -> Self {
-        let num_blobs = way_slot_starts.len() as u32;
-        if num_blobs == 0 || group_count == 0 {
-            return Self {
-                group_of_blob: Vec::new(),
-                group_blob_lo: vec![0; group_count.saturating_add(1)],
-                group_count,
-            };
+    fn slot_bucket(&self, total_slots: u64, slot_bucket_count: usize) -> usize {
+        let range_size = total_slots / slot_bucket_count as u64;
+        if range_size == 0 {
+            return 0;
         }
-        let target = total_slots.div_ceil(group_count as u64).max(1);
-        let mut group_of_blob: Vec<u32> = vec![0; num_blobs as usize];
-        let mut group_blob_lo: Vec<u32> = Vec::with_capacity(group_count + 1);
-        group_blob_lo.push(0);
-
-        let mut cur_group: u32 = 0;
-        let mut next_boundary = target; // exclusive upper bound on cumulative slots for cur_group
-
-        for blob_idx in 0..num_blobs {
-            let blob_end_slots = way_slot_starts
-                .get(blob_idx as usize + 1)
-                .copied()
-                .unwrap_or(total_slots);
-            // Advance group if we've crossed the boundary AND there's
-            // at least one blob already in the current group, AND we
-            // still have groups left to assign.
-            while cur_group + 1 < group_count as u32
-                && blob_end_slots > next_boundary
-                && group_blob_lo.len() > cur_group as usize
-                && blob_idx > *group_blob_lo.last().unwrap_or(&0)
-            {
-                cur_group += 1;
-                group_blob_lo.push(blob_idx);
-                next_boundary = next_boundary.saturating_add(target);
-            }
-            group_of_blob[blob_idx as usize] = cur_group;
-        }
-        // Finalize: pad group_blob_lo out to group_count + 1 with the
-        // remainder assigned to whatever the last cur_group became, so
-        // all reserved group slots point somewhere sensible.
-        while group_blob_lo.len() <= group_count {
-            group_blob_lo.push(num_blobs);
-        }
-        Self {
-            group_of_blob,
-            group_blob_lo,
-            group_count,
-        }
+        let bucket = self.slot_pos / range_size;
+        (bucket as usize).min(slot_bucket_count - 1)
     }
+}
 
-    pub(super) fn blob_range(&self, group_idx: usize) -> (u32, u32) {
-        let lo = self.group_blob_lo[group_idx];
-        let hi = self.group_blob_lo[group_idx + 1];
-        (lo, hi)
-    }
+pub(super) fn slot_bucket_bounds(
+    total_slots: u64,
+    slot_bucket_count: usize,
+    bucket_idx: usize,
+) -> (u64, u64) {
+    let range_size = total_slots / slot_bucket_count as u64;
+    let bucket_start = bucket_idx as u64 * range_size;
+    let bucket_end = if bucket_idx == slot_bucket_count - 1 {
+        total_slots
+    } else {
+        ((bucket_idx as u64 + 1) * range_size).min(total_slots)
+    };
+    (bucket_start, bucket_end)
 }
 
 /// Run the full external join pipeline for add-locations-to-ways.
@@ -364,64 +298,47 @@ pub fn external_join(
     // through the hot decode loop.
     node_id_set.drop_rank_index();
 
-    // Post-#6: blob-group partitioning replaces slot-bucket partitioning.
-    // `BlobGroupMap` assigns each blob to a contiguous group based on
-    // cumulative slot count so each group carries roughly equal stage-2
-    // output bytes. No max_blob_slots / straddler constraint any more -
-    // blobs are wholly contained in one group by construction.
+    // Compute slot_bucket_count: scale down from NUM_BUCKETS so that
+    // every bucket can fit at least one full blob's slot range. This
+    // keeps the 2-piece straddler invariant (a blob spans at most two
+    // adjacent buckets) for both planet-scale inputs and tiny test
+    // fixtures where total_slots / NUM_BUCKETS would otherwise be < 1.
     let way_slot_starts =
         stage4::load_ref_count_sidecar(&ref_count_sidecar, total_slots)?;
-    let blob_group_map = BlobGroupMap::build(
-        &way_slot_starts,
-        total_slots,
-        BLOB_GROUP_COUNT,
-    );
+    let max_blob_slots: u64 = (0..way_slot_starts.len())
+        .map(|i| {
+            let end = if i + 1 < way_slot_starts.len() {
+                way_slot_starts[i + 1]
+            } else {
+                total_slots
+            };
+            end - way_slot_starts[i]
+        })
+        .max()
+        .unwrap_or(0);
+    // Each bucket must hold ≥ max_blob_slots so the SMALLEST bucket
+    // (which can be smaller than range_size when total_slots is not
+    // a multiple of bucket_count) still satisfies the 2-piece
+    // straddler invariant. Equivalently: bucket_count ≤
+    // total_slots / max_blob_slots, with floor division.
+    #[allow(clippy::cast_possible_truncation)]
+    let slot_bucket_count = total_slots
+        .checked_div(max_blob_slots)
+        .map(|n| n.max(1).min(NUM_BUCKETS as u64) as usize)
+        .unwrap_or(NUM_BUCKETS);
     let total_rank_shard_files = num_shard_workers * NUM_BUCKETS;
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("extjoin_rank_bucket_count", NUM_BUCKETS as i64);
-        crate::debug::emit_counter("extjoin_blob_group_count", BLOB_GROUP_COUNT as i64);
-        crate::debug::emit_counter("extjoin_num_way_blobs", way_slot_starts.len() as i64);
+        crate::debug::emit_counter("extjoin_slot_bucket_count", slot_bucket_count as i64);
+        crate::debug::emit_counter("extjoin_max_blob_slots", max_blob_slots as i64);
         crate::debug::emit_counter("extjoin_num_shard_workers", num_shard_workers as i64);
         crate::debug::emit_counter("extjoin_total_rank_shard_files", total_rank_shard_files as i64);
-
-        // Balance diagnostic: min / max blobs per group + min / max
-        // cumulative slots per group. Wide spreads indicate the
-        // cumulative-slot-based partition collapsed on some skew in
-        // `way_slot_starts` - e.g., a single very fat blob that
-        // dominates a whole group. Preserved across runs via the
-        // sidecar so regressions in BlobGroupMap::build are visible
-        // in `brokkr sidecar --counters` without re-running.
-        let mut min_blobs = u32::MAX;
-        let mut max_blobs = 0u32;
-        let mut min_slots = u64::MAX;
-        let mut max_slots = 0u64;
-        for g in 0..BLOB_GROUP_COUNT {
-            let (lo, hi) = blob_group_map.blob_range(g);
-            let blobs = hi.saturating_sub(lo);
-            min_blobs = min_blobs.min(blobs);
-            max_blobs = max_blobs.max(blobs);
-            let slot_lo = way_slot_starts
-                .get(lo as usize)
-                .copied()
-                .unwrap_or(total_slots);
-            let slot_hi = way_slot_starts
-                .get(hi as usize)
-                .copied()
-                .unwrap_or(total_slots);
-            let slots = slot_hi.saturating_sub(slot_lo);
-            min_slots = min_slots.min(slots);
-            max_slots = max_slots.max(slots);
-        }
-        crate::debug::emit_counter("s2_group_min_blobs", i64::from(min_blobs));
-        crate::debug::emit_counter("s2_group_max_blobs", i64::from(max_blobs));
-        crate::debug::emit_counter("s2_group_min_slots", min_slots as i64);
-        crate::debug::emit_counter("s2_group_max_slots", max_slots as i64);
     }
 
     crate::debug::emit_marker("EXTJOIN_STAGE2_START");
     let (s2_minflt_before, s2_majflt_before) = crate::debug::read_page_faults();
-    let blob_groups = SharedBlobGroups::create(&scratch_dir, BLOB_GROUP_COUNT)?;
+    let slot_buckets = SlotBuckets::create(&scratch_dir, slot_bucket_count)?;
     let input_pbf = std::sync::Arc::new(
         std::fs::File::open(input)
             .map_err(|e| format!("open input pbf for stage 2: {e}"))?,
@@ -430,14 +347,15 @@ pub fn external_join(
         &scratch_dir,
         &rank_bucket_counts,
         num_shard_workers,
-        &blob_groups,
-        &blob_group_map,
+        &slot_buckets,
+        slot_bucket_count,
+        total_slots,
         unique_nodes,
         &input_pbf,
         &node_id_set,
         &node_blob_mapping,
     )?;
-    blob_groups.finish()?;
+    slot_buckets.finish()?;
     let (s2_minflt_after, s2_majflt_after) = crate::debug::read_page_faults();
     for worker_id in 0..num_shard_workers {
         for bucket_idx in 0..NUM_BUCKETS {
@@ -465,24 +383,14 @@ pub fn external_join(
         &per_way_refcount_sidecar,
         way_slot_starts.len(),
     )?;
-    // Single source of truth for stage-3 worker count. Threaded through
-    // to `stage3_blob_group_emit` and used here to size the worker tmp
-    // file table and the router's `worker_files` index. Keep them in
-    // lockstep - a mismatch means stage 3 workers index past the end
-    // of the router's file array.
-    //
-    // Uncapped: the pre-#6 cap (.min(6)) existed because stage 3's
-    // per-slot-bucket scatter_buf could be ~380 MB/worker at planet
-    // and straddler classification produced cross-bucket contention.
-    // Post-#6 the scatter buffer is per-blob-group (s3_max_group_coord_bytes
-    // measured 147 MB on Europe, ~380 MB at planet worst case), groups
-    // are independent, and #6-cap-6 measured stage-4 starving on stage-3
-    // publication (s4_readiness_wait_ms=462_884 cumulative = ~21 s/thread
-    // wall blocked). Matching stage 4's `avail - 2` gives both sides
-    // equal parallelism budget.
+    // Worker count: back off from the pre-streaming `.min(6)` because
+    // stage 3 and stage 4 worker buffers are now both resident at the
+    // same time (they overlap). See notes/altw-structural-reports.md #2
+    // "Worker budgets under overlap".
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(4);
+        .unwrap_or(4)
+        .min(4);
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("s3_worker_count", num_workers as i64);
 
@@ -507,25 +415,20 @@ pub fn external_join(
         })
         .collect::<std::result::Result<_, String>>()?;
 
-    // Post-#6: stage 3 reads blob-group files (256 of them) each
-    // covering a contiguous blob_idx range; no slot-bucket files any
-    // more. Stage 3 iterates all blobs in its assigned group's range,
-    // allocates per-blob coord_slices, scatters entries, delta-varint-
-    // encodes, and publishes to the router.
-    let group_entry_counts: Vec<u64> = (0..BLOB_GROUP_COUNT)
+    let slot_entry_counts: Vec<u64> = (0..slot_bucket_count)
         .map(|i| {
-            let path = scratch_dir.bucket_path("group", i);
+            let path = scratch_dir.bucket_path("slot", i);
             std::fs::metadata(&path)
                 .map(|m| m.len() / RESOLVED_ENTRY_SIZE as u64)
                 .unwrap_or(0)
         })
         .collect();
-    let group_paths: Vec<std::path::PathBuf> = (0..BLOB_GROUP_COUNT)
-        .map(|i| scratch_dir.bucket_path("group", i))
+    let slot_paths: Vec<std::path::PathBuf> = (0..slot_bucket_count)
+        .map(|i| scratch_dir.bucket_path("slot", i))
         .collect();
-    let blob_group_ref = BlobGroupRef {
-        paths: group_paths,
-        entry_counts: group_entry_counts,
+    let slot_bucket_ref = SlotBucketRef {
+        paths: slot_paths,
+        entry_counts: slot_entry_counts,
     };
 
     // The streaming router: pre-populates `Empty` entries for zero-ref
@@ -555,8 +458,7 @@ pub fn external_join(
     let blob_meta_ref = &blob_meta;
     let way_slot_starts_ref = way_slot_starts.as_slice();
     let rel_ids_ref = relation_member_node_ids.as_ref();
-    let blob_group_ref_ref = &blob_group_ref;
-    let blob_group_map_ref = &blob_group_map;
+    let slot_bucket_ref_ref = &slot_bucket_ref;
 
     // Closures return Result<_, String> because BoxResult's error type
     // (Box<dyn Error>) is not Send and thread::scope requires Send
@@ -568,13 +470,11 @@ pub fn external_join(
                 way_slot_starts: way_slot_starts_ref,
                 per_way_rcs: per_way_rcs_ref,
                 router: router_ref,
-                blob_group_map: blob_group_map_ref,
             };
-            let result = stage3_blob_group_emit(
-                blob_group_ref_ref,
-                BLOB_GROUP_COUNT,
+            let result = stage3_slot_reorder(
+                slot_bucket_ref_ref,
+                slot_bucket_count,
                 total_slots,
-                num_workers,
                 &integrated,
             )
             .map_err(|e| e.to_string());
@@ -619,8 +519,8 @@ pub fn external_join(
     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     let (s3_minflt_after, s3_majflt_after) = crate::debug::read_page_faults();
-    for i in 0..BLOB_GROUP_COUNT {
-        drop(std::fs::remove_file(scratch_dir.bucket_path("group", i)));
+    for i in 0..slot_bucket_count {
+        drop(std::fs::remove_file(scratch_dir.bucket_path("slot", i)));
     }
     #[allow(clippy::cast_possible_wrap)]
     {
@@ -631,23 +531,28 @@ pub fn external_join(
     crate::debug::emit_marker("EXTJOIN_STAGE3_END");
     crate::debug::emit_marker("EXTJOIN_STREAMING_END");
 
-    // Emit router stats. Post-#6: no straddler counts (blobs are fully
-    // contained in one group by construction).
+    // Emit router stats that the deleted `build_blob_location_router`
+    // used to report.
     {
         let s = router.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         #[allow(clippy::cast_possible_wrap)]
         {
             crate::debug::emit_counter("s3_router_num_worker", s.num_worker as i64);
+            crate::debug::emit_counter("s3_router_num_straddlers", s.num_straddlers as i64);
             crate::debug::emit_counter("s3_router_num_empty", s.num_empty as i64);
             crate::debug::emit_counter("s3_router_worker_bytes", s.worker_bytes as i64);
+            crate::debug::emit_counter("s3_router_straddler_bytes", s.straddler_bytes as i64);
+            crate::debug::emit_counter("s3_straddler_encode_ms", (s.straddler_encode_ns / 1_000_000) as i64);
         }
         eprintln!(
-            "[coord_payloads] streaming router {} way blobs ({} worker / {} empty), \
-             {} MB in worker tmps",
+            "[coord_payloads] streaming router {} way blobs ({} worker / {} straddler / {} empty), \
+             {} MB in worker tmps + {} KB straddler bytes in RAM",
             router.num_blobs(),
             s.num_worker,
+            s.num_straddlers,
             s.num_empty,
             s.worker_bytes / 1_000_000,
+            s.straddler_bytes / 1_000,
         );
     }
 

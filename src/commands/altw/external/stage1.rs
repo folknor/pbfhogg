@@ -450,15 +450,7 @@ pub(super) fn stage1_way_pass(
 
                             let t3 = std::time::Instant::now();
                             let rank_range = unique_nodes_u64.div_ceil(NUM_BUCKETS as u64);
-                            // Post-#6: rank records carry (blob_idx,
-                            // blob_local_slot) instead of slot_pos, same
-                            // 12-byte size. `slot_start` is no longer
-                            // needed for record emission but is kept on
-                            // the Pass B input interface for now since
-                            // the refcount-sidecar load happens above.
-                            let _ = slot_start;
-                            let blob_idx: u32 = task.seq;
-                            let mut ranked: Vec<(u32, usize, u32)> = Vec::with_capacity(blob_node_ids.len());
+                            let mut ranked: Vec<(u32, usize, u64)> = Vec::with_capacity(blob_node_ids.len());
                             for (i, &node_id) in blob_node_ids.iter().enumerate() {
                                 let global_rank = node_id_set_ref.rank(node_id);
                                 #[allow(clippy::cast_possible_truncation)]
@@ -469,9 +461,8 @@ pub(super) fn stage1_way_pass(
                                 let bucket_rank_start = bucket as u64 * rank_range;
                                 #[allow(clippy::cast_possible_truncation)]
                                 let local_rank = (global_rank - bucket_rank_start) as u32;
-                                #[allow(clippy::cast_possible_truncation)]
-                                let blob_local_slot = i as u32;
-                                ranked.push((local_rank, bucket, blob_local_slot));
+                                let slot_pos = slot_start + i as u64;
+                                ranked.push((local_rank, bucket, slot_pos));
                             }
                             #[allow(clippy::cast_possible_truncation)]
                             s1b_rank_ref.fetch_add(t3.elapsed().as_millis() as u64, Relaxed);
@@ -479,8 +470,8 @@ pub(super) fn stage1_way_pass(
                             let t4 = std::time::Instant::now();
                             let mut blob_bytes: u64 = 0;
                             let mut blob_writes: u64 = 0;
-                            for &(local_rank, bucket, blob_local_slot) in &ranked {
-                                let rec = RankRecord { local_rank, blob_idx, blob_local_slot };
+                            for &(local_rank, bucket, slot_pos) in &ranked {
+                                let rec = RankRecord { local_rank, slot_pos };
                                 rec.write_to(&mut rec_buf);
                                 if let Some(w) = shard_writers[bucket].as_mut() {
                                     w.write_all(&rec_buf)

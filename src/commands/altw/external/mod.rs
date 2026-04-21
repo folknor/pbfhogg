@@ -465,14 +465,21 @@ pub fn external_join(
         &per_way_refcount_sidecar,
         way_slot_starts.len(),
     )?;
-    // Worker count: back off from the pre-streaming `.min(6)` because
-    // stage 3 and stage 4 worker buffers are now both resident at the
-    // same time (they overlap). See notes/altw-structural-reports.md #2
-    // "Worker budgets under overlap".
+    // Single source of truth for stage-3 worker count. Threaded through
+    // to `stage3_blob_group_emit` and used here to size the worker tmp
+    // file table and the router's `worker_files` index. Keep them in
+    // lockstep - a mismatch means stage 3 workers index past the end
+    // of the router's file array.
+    //
+    // Cap: .min(6) matches the pre-streaming stage 3 cap. The #6
+    // downstream landing started at .min(4) (conservative, from the
+    // #2 "worker budgets under overlap" section) and starved stage 4
+    // (s4_readiness_wait_ms=1_313_000 cumulative on UUID 4bb48b25).
+    // Bumping two steps back to .min(6) is the minimal correction.
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))
         .unwrap_or(4)
-        .min(4);
+        .min(6);
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("s3_worker_count", num_workers as i64);
 
@@ -564,6 +571,7 @@ pub fn external_join(
                 blob_group_ref_ref,
                 BLOB_GROUP_COUNT,
                 total_slots,
+                num_workers,
                 &integrated,
             )
             .map_err(|e| e.to_string());

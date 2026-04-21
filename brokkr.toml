@@ -18,15 +18,15 @@ consumer_features = ["commands"]
 
 [plantasjen]
 data = "data"
-scratch = "data/bench-tmp"
-# Cross-disk / second-NVMe bench scratch. Uncomment the line below (and
-# comment out the `scratch = "data/bench-tmp"` line above) to run
+#scratch = "data/bench-tmp"
+# Cross-disk / second-NVMe bench scratch. Swap with the line above to run
 # writer-backend benches with bench byproducts (output PBFs, sidecar
 # FIFOs, hotpath reports) landing on a physically separate NVMe, so
-# input reads and output writes don't contend for the same disk. Remember
-# to revert before committing. Dirty brokkr.toml means bench runs need
-# `--force` (and results won't be stored in .brokkr/results.db).
-#scratch = "/media/folk/Booty/pbfhogg-bench-tmp"
+# input reads and output writes don't contend for the same disk. Revert
+# after the bench pass. Either commit the swap (clean tree, results go
+# to .brokkr/results.db) or run benches with `--force` (results NOT
+# stored).
+scratch = "/media/folk/Booty/pbfhogg-bench-tmp"
 target = "target"
 features = ["linux-direct-io", "linux-io-uring"]
 

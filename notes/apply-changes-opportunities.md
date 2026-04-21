@@ -944,9 +944,11 @@ Highest-confidence follow-up after the streaming rewrite. Moves compression + fr
 
 Classifier workers decompressing node blobs opportunistically extract coords for IDs in `needed_set` into thread-local maps. Reorder actor detects the node→way transition and merges per-worker maps into `Arc<loc_map>` before gating way-blob workers. Details in Q4 follow-up subsection above. **Deletes the prefill phase entirely:** ~5 s at daily, ~30 s+ at weekly scale.
 
-#### Parallel OSC parse (reviewer 2, Q7 follow-up, weekly only)
+#### Parallel OSC parse (moved 2026-04-21)
 
-Only relevant if the standard pipeline processes a week of OSCs in one run. Single-threaded [`load_all_diffs`](../src/osc.rs#L1036) parse scales linearly with OSC count; at 7x it becomes a 30-40 s serial phase. Shape: parse each OSC concurrently into its own overlay, then merge overlays with newer-wins semantics using [`IdSetDense::set_atomic_if_new`](../src/commands/id_set_dense.rs#L163) as the per-element-type dedupe primitive (walk overlays newest-first; keep the element iff the call returns `true`). Each OSC is independent work. Estimated 20-30 s wall at weekly scale.
+Factored out to [`merge-changes.md`](merge-changes.md). Applies to
+`merge-changes` directly (any consumer that squashes N > 1 OSCs),
+not weekly-apply-changes specifically.
 
 #### Splice-in-place for low-touch rewrites (reviewer 2)
 
@@ -1117,7 +1119,11 @@ Both reviewers: **streaming pipeline is still the right first move at weekly sca
 - Parallel OSC parse: **a new priority** that doesn't exist at daily. Plausibly 20-30 s of headline wall to recover.
 - Splice-near-passthrough rewrites: **less valuable at weekly** - rewrite blobs touch more elements per blob, so the near-passthrough population shrinks. Demote.
 
-**Reviewer 1 note on weekly:** diff-squashing becomes genuinely interesting as a **formal upstream stage** rather than paying XML parse + overwrite churn inside the critical path every run. "Squash diffs to one final overlay / binary delta" can be a separate command that runs once per week and emits a single pre-merged diff file that apply-changes then consumes as if it were a daily. Orthogonal to the streaming rewrite but may be the right long-term shape if weekly is the standard cadence. **Primitive:** same [`IdSetDense::set_atomic_if_new`](../src/commands/id_set_dense.rs#L163) shape as the in-pipeline parallel OSC merge above - walk overlays newest-first across parallel workers, dedupe per element type against a pre-allocated bitmap.
+**Reviewer 1 note on weekly (moved 2026-04-21):** factored out to
+[`merge-changes.md`](merge-changes.md). The short version:
+"diff squashing as a formal upstream stage" already exists as
+`merge-changes`; the open items are measuring its current wall and
+documenting the `merge-changes → apply-changes` pipeline pattern.
 
 **Reviewer 2's revised end-state estimate for weekly planet:** **70-90 s wall** with streaming + parallel OSC parse + prefill fusion + worker-framing. Current weekly (linear scaling of serial phases) probably ~250 s+.
 
@@ -1363,7 +1369,9 @@ These are the parts of today's code that survive P1 unchanged. The batch-loop ma
 
 9. ~~**P1.5 - Worker-emits-framed-bytes.**~~ **Landed in the same commit as P1.** Workers call `frame_blob_pipelined` inline and ship framed `Vec<u8>` chunks to drain via `DrainItem::Rewritten.framed_chunks`; drain uses `write_raw_owned` per chunk. `writer_pipeline_send_wait_ns` at planet `--compression none`: 859 s cumulative → 117 s (-86%). Measurement confirmed R1's prediction that the writer chain would become the new ceiling under `--compression none` post-P1.
 
-10. **(weekly OSC only) Parallel OSC parse.** Parse each OSC concurrently into its own overlay; merge overlays newer-wins using [`IdSetDense::set_atomic_if_new`](../src/commands/id_set_dense.rs) (walk newest-first, keep on `true`). Current [`load_all_diffs`](../src/osc.rs) serialises this. Estimated **-20-30 s wall at weekly scale**; no win at daily.
+10. **Parallel OSC parse (moved 2026-04-21).** Factored out to
+    [`merge-changes.md`](merge-changes.md) - applies to `merge-changes`
+    whenever it takes N > 1 OSCs, not weekly-apply-changes specifically.
 
 11. **Splice-in-place for low-touch rewrites (follow-up, not yet landed).** For `NeedsRewrite` blobs with ≤K affected elements (K~64), splice the raw wire bytes for unmodified element runs instead of full decode+re-encode. Estimated ~1.5-2 s wall at daily, less valuable at weekly. Raw-group passthrough scaffolding in [`src/write/raw_passthrough.rs`](../src/write/raw_passthrough.rs) is the design surface. **Post-P1 re-evaluation (2026-04-21):** the planet wall is now HDD-writer-bound (`writer_write_ns = 120 s`, 89 % of wall at `--compression none`), not CPU-bound. Splice-in-place saves classify+rewrite CPU but does not reduce output bytes, so it's unlikely to move the wall on HDD targets. Value deferred until we have measurements on a faster target disk.
 
@@ -1371,7 +1379,10 @@ These are the parts of today's code that survive P1 unchanged. The batch-loop ma
 
 13. **Exact-membership metadata / sidecar.** Only if FalsePositives remain material after P1. Currently 16 % of slow-path blobs; not negligible but not headline either. Format/index project, not a quick cleanup.
 
-14. **Diff squashing as a formal upstream stage (weekly only).** Consider making "squash N diffs to one final overlay / binary delta" a separate command that runs once per cadence and emits a single pre-merged diff that apply-changes then consumes as a daily. Shares the `IdSetDense::set_atomic_if_new` newer-wins primitive with in-pipeline parallel OSC merge (item 10). Orthogonal to P1.
+14. **Diff squashing as a formal upstream stage (moved 2026-04-21).**
+    Factored out to [`merge-changes.md`](merge-changes.md) - already
+    shipped as the `merge-changes` command; the remaining items are
+    measurement + documentation, not engineering.
 
 15. **`zstd:1` as a compression recommendation for internal pipelines (new, 2026-04-21).** Measured at planet: `--compression zstd:1` delivers 121.2 s wall (vs 135.5 s for `none` and 143.7 s for `zlib:6`), because workers parallelize zstd cheaply and the ~20 % output-byte reduction relieves the HDD writer bottleneck. Already gated behind a flag; consider documenting as the default for pbfhogg-internal pipelines (consumers that don't require osmium interop) in [`reference/performance.md`](../reference/performance.md) and README.
 

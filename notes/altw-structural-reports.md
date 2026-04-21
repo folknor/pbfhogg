@@ -110,6 +110,8 @@ Any rewrite preserves these or explicitly replaces them:
 
 ### #1 - Promote epoch-spill to default; delete the disk slot-bucket path
 
+**DEPRIORITIZED to last-resort 2026-04-21.** After the failed port on 2026-04-21 (see measurement table below), the expected-payoff math for #1 is materially worse than the plan originally estimated: the ~68 s "eliminated finalize" component no longer exists post-#8, and the remaining epoch-0-in-memory saving at planet E=4 works out to roughly ~14 s of net disk-I/O delta against the current 12-byte slot-bucket path - comfortably inside bench noise. Every other live item in this document (notably #3 retry with buffered-writer + delta-varint, #2 streaming, and #9 layer 2) now looks like a better bet per unit of implementation risk. Leave #1 as the fallback to revisit only if #2/#3/#5/#6 have all been attempted and the stage 2 → stage 3 disk seam is still the dominant remaining phase. The measurement record, revert history, and retry-shape analysis below are preserved for that future visit - do not re-read this as "the recommended next step."
+
 **Attempted 2026-04-21 and reverted (commits `4601cbf` + `207357e`, source files reverted while `.brokkr/results.db` retained the measurement history).** Resurrected the 2026-04-15 prototype (deleted at `3ae1052`) into [src/commands/altw/external/stage23_epoch.rs](/home/folk/Programs/pbfhogg/src/commands/altw/external/stage23_epoch.rs); adapted the resolver inner loop to the post-#4 blob-local-counter shape (stage2.rs:459-492 pattern), switched the emit tail to feed `build_blob_location_router` directly instead of `finalize_coord_payloads`, restored `pub(super)` visibility on the shared helpers. Passed `brokkr check` and Denmark smoke.
 
 Measurement record (plantasjen, 30 GB RAM host):
@@ -122,12 +124,12 @@ Measurement record (plantasjen, 30 GB RAM host):
 | Planet baseline `--bench 3` | `aee7727` (UUID `a406d77e`) | 661.2 s | ~5-8 GB | - |
 | Planet E=8 `--bench 1` | `207357e` (UUID `edf662b4`) | **741 s** | **25.2 GB** | **+10 % wall, +18 GB RSS** |
 
-**Why it failed.** The port preserved the prototype's 16-byte spill record format `(slot_pos: u64 LE, lat: i32 LE, lon: i32 LE)` because spill entries must survive cross-bucket routing at drain time. This matches R2's assumption. But the *current* disk slot-bucket path already uses 12-byte records (post-`fcd4fa2`, `local_slot_pos: u32` + lat + lon). So the spill path writes 33 % more bytes per entry than the path it replaces, and the ~12.5-25 % in-memory epoch-0 saving does not offset the spill inflation. Additionally, the plan-doc's ~68 s "eliminated finalize as a separate phase" saving no longer applies — the current main-line already eliminated `finalize_coord_payloads` at #8 (`BlobLocationRouter`), so #1 has no finalize-savings to cash in on. Planet EPOCH0_PRODUCER 271 s vs pre-port STAGE2 208 s is the bulk of the regression; epochs 1-7 drain+emit totals 84 s vs pre-port STAGE3 89 s was a wash.
+**Why it failed.** The port preserved the prototype's 16-byte spill record format `(slot_pos: u64 LE, lat: i32 LE, lon: i32 LE)` because spill entries must survive cross-bucket routing at drain time. This matches R2's assumption. But the *current* disk slot-bucket path already uses 12-byte records (post-`fcd4fa2`, `local_slot_pos: u32` + lat + lon). So the spill path writes 33 % more bytes per entry than the path it replaces, and the ~12.5-25 % in-memory epoch-0 saving does not offset the spill inflation. Additionally, the plan-doc's ~68 s "eliminated finalize as a separate phase" saving no longer applies  -  the current main-line already eliminated `finalize_coord_payloads` at #8 (`BlobLocationRouter`), so #1 has no finalize-savings to cash in on. Planet EPOCH0_PRODUCER 271 s vs pre-port STAGE2 208 s is the bulk of the regression; epochs 1-7 drain+emit totals 84 s vs pre-port STAGE3 89 s was a wash.
 
 **What a retry needs.** The R3 12-byte spill format, which the plan doc estimated at 84 GB planet spill (vs R2's 112 GB and what I shipped). Compact-spill options:
 
 - (a) Per-bucket-per-epoch spill files: at planet E=8, that's `~64 buckets × 7 epochs × 6 workers ≈ 2700` files and ~700 BufWriters resident per worker. File-handle pressure likely prohibitive.
-- (b) Split-stream format: one entry stream (12 bytes per record, `local_slot_pos: u32` scoped to the *epoch*, lat, lon — u32 fits epoch-wide slot counts at planet) plus a sidecar bucket-index stream for drain. Drain reads both, recovers bucket within the epoch, writes to scatter. Requires the epoch's slot range fit in u32 (at planet E=8 epoch-span ≈ 1.2 B slots, well inside u32::MAX = 4.3 B).
+- (b) Split-stream format: one entry stream (12 bytes per record, `local_slot_pos: u32` scoped to the *epoch*, lat, lon  -  u32 fits epoch-wide slot counts at planet) plus a sidecar bucket-index stream for drain. Drain reads both, recovers bucket within the epoch, writes to scatter. Requires the epoch's slot range fit in u32 (at planet E=8 epoch-span ≈ 1.2 B slots, well inside u32::MAX = 4.3 B).
 - (c) Per-epoch `local_slot_pos: u32` scoped to `[epoch_slot_start, epoch_slot_end)` and drain recomputes bucket from `epoch_slot_start + local_slot_pos`. Single 12-byte stream. Simplest of the three. Costs one extra arithmetic op per drain record.
 
 (c) is the right shape for any retry. Also: auto-tune `num_epochs` from `/proc/meminfo` so Europe picks E=2-3 (tighter in-memory ratio) while planet picks E=4-6 (bounded scatter_bufs). Hardcoding E=4 loses at europe; hardcoding E=8 loses at planet.
@@ -493,33 +495,39 @@ Consolidated from all six reports:
 
 ## Recommendation
 
-**Sequence (revised after the sixth-review follow-up and the explicit 30 GB-RAM planet constraint).**
+**Sequence (revised 2026-04-21 after the failed #1 port  -  #1 is now a last-resort item).**
 
 1. ~~**#4** - stage-2 de-ranking.~~ **LANDED `f1a4ada` 2026-04-17.** Europe −3.9% wall, stage-3 peak anon −1.55 GB, stage-2 peak anon −530 MB. Measure planet when convenient; hypothesis is a larger wall win there since tuple count scales ~10×.
 2. ~~**#8** - `BlobLocationRouter` finalize deletion.~~ **LANDED `e497e54` 2026-04-16.**
-3. ~~**#9 layer 1** - metadata-driven relation scan.~~ **LANDED `6d71053` 2026-04-17.** Europe −5.3% wall, relation scan −72%. Layer 2 (fold into stage 1 concurrency) deferred - the serial gap is now only 3.8 s on Europe, probably not worth the complexity.
-4. **#1 - promote epoch-spill.** Was described as "delete + promote" but `stage23_epoch.rs` was deleted in `3ae1052` (2026-04-15), so in practice this is resurrect-from-history + port to the current `BlobLocationRouter` and blob-local-rank-counter shapes + promote. Treat as a real rewrite. Clean keep/revert candidate if benched rigorously.
-5. **Then #3 - fuse stage 1A + 1B.** Under the 30 GB host constraint, discard all-RAM buffer/sweep forms. With #4 landed, the ID-bucketed emission variant becomes more attractive: the old "rank work migrates downstream" objection is gone because stage 2 no longer does per-node rank queries.
-6. **Then #2 - stream stage 3 → stage 4.** Largest remaining payoff, but the biggest rewrite; wants #1 landed first and bounded backpressure discipline from the start. #2 would conceptually replace #8's `BlobLocationRouter` with a streaming coordinator.
-7. **Then #5, #6, #7, #11** as appetite allows. #5 is the natural continuation of #1's fused path; #6 subsumes #5 at whole-pipeline scope (and R5 #1 + R1 #2 both land here); #7 is the hardest and most speculative; #11 only matters if dense stage-2 coord slices survive.
-8. **#10 separately, conditional.** Conservative refcounts-only BlobHeader metadata is now supported by three reviewers, but it still depends on codifying the `cat` output contract. Aggressive full-ref-list forms remain blocked on the 64 KiB header cap.
+3. ~~**#9 layer 1** - metadata-driven relation scan.~~ **LANDED `6d71053` 2026-04-17.** Europe −5.3% wall, relation scan −72%.
+4. **#3 - fuse stage 1A + 1B** (retry with buffered-writer + delta-varint). Last retry (`44913a5`, reverted `ba62fb1`) failed because it used per-blob unbuffered `pwrite` of flat `i64` arrays; page-cache thrash against stage 2 regressed Europe wall +11%. The next retry needs (a) a single per-worker `BufWriter` with tracked append offset (no per-blob `pwrite`), (b) delta-varint encoding of node IDs to cut scratch ~2× and soften the page-cache footprint, (c) explicit correctness gate on scratch-volume < ~2× the compressed way-blob volume. Smallest blast radius of the live items; localized to `stage1.rs`. With #4 landed, the ID-bucketed emission variant (R4 A1) becomes more attractive as an alternative because the "rank work migrates downstream" objection is gone  -  evaluate both shapes in the retry.
+5. **Then #9 layer 2** - fold relation scan into stage 1 concurrency. Cheap, small, no architectural risk. The remaining serial gap on Europe is only 3.8 s post-layer-1, but it is literally a few-line change on top of the existing stage 1 worker pool sharing `Arc<File>`  -  take it opportunistically when stage 1 is already open.
+6. **Then #2 - stream stage 3 → stage 4.** Largest remaining payoff (plan estimate 100-150 s planet) but the biggest rewrite. Conceptually replaces #8's `BlobLocationRouter` with a bounded streaming coordinator. The writer-ceiling diagnostic (see #2 section) means the keep/revert gate must also measure under `zstd:1` or `compression:none`  -  a real stage-3-side CPU win can vanish at wall under zlib:6 if the writer becomes the ceiling. Wants #3 landed first so the retry benchmarks are against a clean baseline.
+7. **Then #5, #6, #7, #11** as appetite allows. #5 is the natural continuation once #2's fused producer→consumer path exists; #6 subsumes #5 at whole-pipeline scope (R5 #1 + R1 #2 both land here); #7 is the hardest and most speculative; #11 only matters if dense stage-2 coord slices survive.
+8. **#10 separately, conditional.** Conservative refcounts-only BlobHeader metadata is supported by three reviewers but still depends on codifying the `cat` output contract. Aggressive full-ref-list forms remain blocked on the 64 KiB header cap.
+9. **#1 last-resort only.** Deprioritized 2026-04-21 (see #1 header note). Revisit only if #2/#3/#5/#6 have all shipped and the stage 2 → stage 3 seam is still the dominant remaining phase. If we ever come back to it, start from variant (c) (per-epoch-scoped `local_slot_pos: u32`, single 12-byte stream) and auto-tune `num_epochs` from `/proc/meminfo`  -  do not re-ship the 16-byte prototype format.
 
 ### Benchmark plan for #4 (stage-2 de-ranking) - **EXECUTED, landed `f1a4ada`**
 
 See the landed-result note in #4 above. Europe `--bench 3` (UUID `10f4587d`) [TAINTED]: wall 320.5 s → 308.0 s (−3.9%). Stage-2 wall flat because Europe stage 2 is pread/decompress-bound - the rank walk was never the hot cost on Europe. The benefit shows up as peak-anon drops (stage 3 −1.55 GB, stage 2 −530 MB) because the rank-prefix metadata is freed before stage 2 starts. Debug asserts cover monotonic tuple IDs and `next_rank == ref_rank_end` per blob. Denmark external byte-identical to dense/sparse (accepted osmium deviation is ALTW-wide, not introduced here).
 
-### Benchmark plan for #1 (epoch-spill default)
+### Benchmark plan for #3 retry (scratch-spool with buffered-writer + delta-varint)
 
-1. Remove `parse_epoch_env()`. Auto-compute `num_epochs` from `/proc/meminfo`, or hardcode `num_epochs = 4` initially. Delete `SlotBuckets`, `SharedSlotBuckets`, `stage2_node_join`, and the disk-path `else` branch in `mod.rs`. Keep `prepare_bucket` and `LoaderScratch`.
-2. Correctness gate: semantic Denmark parity, not MD5-only parity. Use direct output comparison / semantic diff as the primary gate; `brokkr verify add-locations-to-ways --dataset denmark` is optional extra signal only, because ALTW has accepted deviations from `osmium` and the verify harness is expensive.
-3. Europe is the real gate (not Japan): `brokkr add-locations-to-ways --dataset europe --index-type external --bench 3` against current main via `brokkr results --compare`.
-4. Key metrics: total wall, peak RSS, scratch disk usage, per-stage marker durations, old downstream slice equivalence, new `s4_send_ms`, eliminated `s3_integrated_finalize_*`, eliminated `s4_coord_payload_pread_ms`, new payload reorder-depth/high-water.
-5. **Keep if** Europe total wall improves clearly - thresholds from the three reviewers: ≥5% Europe wall (R1), ≥10s wall (R2), improves-or-neutral with peak RSS ≤ ~10 GB (R3). If flat or worse, check whether auto-tuned epoch count is suboptimal - try manual E=2 for Europe as a diagnostic before reverting. If structurally broken, revert cleanly with diagnostic data.
-6. If Europe wins, run one planet confirmation.
+1. Per-worker `BufWriter` (64 KiB buffer) opened once per stage-1 worker; pass A appends each blob's node IDs as `(blob_seq: u32, len: u32, delta_varint_bytes...)` and records `(worker_id, file_offset, byte_length)` per blob. No per-blob `pwrite`  -  sequential append only.
+2. Pass B sequentially reads worker scratch files in blob-seq order, decodes varint node IDs, continues the pass-B emission loop as today. The read can be `BufReader` over the already-built worker tmp fd; no `pread`.
+3. Diagnostic counters: `s1_scratch_bytes_per_blob` min/max/mean, `s1_scratch_write_ms`, `s1_scratch_read_ms`, `s1_passb_varint_decode_ms`.
+4. Correctness gate: Denmark semantic parity (byte-identical vs current external output). Debug-assert that per-blob decoded ID count matches the pass-A recorded `len`.
+5. Europe `--bench 3` is the keep/revert gate. Thresholds: ≥5% stage 1 wall improvement (plan estimate 20-30% of stage 1) AND total wall improvement or flat  -  regression on total wall forces revert even if stage 1 wins, because that means we moved page-cache cost into stage 2 (last retry's failure mode).
+6. If Europe wins, planet `--bench 3` confirmation.
+7. Sanity side-by-side: if appetite allows, also prototype the R4 A1 ID-bucketed single-pass variant on a parallel branch; since #4 is landed the rank-objection is gone, and a head-to-head bench is cheaper than guessing.
 
 ### Benchmark plan for #2 (streaming stage 3 → stage 4)
 
 Same shape, scaled for a bigger rewrite. Implement the full coordinator path on a branch with no env-var default. Denmark semantic correctness/parity first. Europe `--bench 3`. Keep only if Europe total wall improves clearly, or the old `stage3 + finalize + stage4` slice drops materially with no RSS/scratch blow-up - roughly **≥5% Europe wall** for a rewrite of this size. Planet confirmation if Europe wins. Revert cleanly if flat or worse. Evaluate under `zstd:1` (or `compression:none`) as well - see writer-ceiling diagnostic.
+
+### Benchmark plan for #1 (epoch-spill default)  -  DEFERRED / last-resort
+
+See the #1 header note. If we ever return to this: start from variant (c) (per-epoch-scoped `local_slot_pos: u32`, single 12-byte stream; drain recomputes bucket within the epoch), and auto-tune `num_epochs` from `/proc/meminfo` so Europe picks E=2-3 and planet picks E=4-6. Keep/revert gate remains ≥5% Europe wall or ≥10 s wall with peak RSS ≤ ~10 GB. Do not re-ship the 16-byte prototype format. Entire section is preserved only because a future revisit will want the measurement record, not because it is the next step.
 
 ---
 

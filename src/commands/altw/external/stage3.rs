@@ -171,7 +171,6 @@ pub(super) fn stage3_slot_reorder(
         let mut handles = Vec::with_capacity(num_workers);
         for worker_id in 0..num_workers {
             let handle = scope.spawn(move || -> std::result::Result<Vec<ManifestEntry>, String> {
-                use std::io::Write as _;
                 use std::sync::atomic::Ordering::Relaxed;
 
                 let mut data_buf: Vec<u8> = Vec::new();
@@ -186,7 +185,6 @@ pub(super) fn stage3_slot_reorder(
                     .truncate(true)
                     .open(&ctx.worker_tmp_paths[worker_id])
                     .map_err(|e| format!("create worker tmp {worker_id}: {e}"))?;
-                let mut tmp_writer = std::io::BufWriter::with_capacity(512 * 1024, tmp_file);
 
                 loop {
                     if err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
@@ -221,7 +219,7 @@ pub(super) fn stage3_slot_reorder(
                             emit_integrated_intersections(
                                 &intersections, &scatter_buf, bucket_start,
                                 total_slots, ctx, &mut encode_scratch, &mut manifest,
-                                &mut tmp_byte_pos, &mut tmp_writer,
+                                &mut tmp_byte_pos, &tmp_file,
                                 s3_integ_encode_ref, s3_integ_straddler_copy_ref,
                                 s3_integ_worker_tmp_bytes_ref,
                             )?;
@@ -301,7 +299,7 @@ pub(super) fn stage3_slot_reorder(
                         emit_integrated_intersections(
                             &intersections, &scatter_buf, bucket_start,
                             total_slots, ctx, &mut encode_scratch, &mut manifest,
-                            &mut tmp_byte_pos, &mut tmp_writer,
+                            &mut tmp_byte_pos, &tmp_file,
                             s3_integ_encode_ref, s3_integ_straddler_copy_ref,
                             s3_integ_worker_tmp_bytes_ref,
                         )?;
@@ -314,8 +312,6 @@ pub(super) fn stage3_slot_reorder(
                         return Err(e);
                     }
                 }
-
-                tmp_writer.flush().map_err(|e| format!("flush worker {worker_id} tmp: {e}"))?;
 
                 Ok(manifest)
             });
@@ -395,16 +391,15 @@ fn emit_integrated_intersections(
     encode_scratch: &mut Vec<u8>,
     manifest: &mut Vec<ManifestEntry>,
     tmp_byte_pos: &mut u64,
-    tmp_writer: &mut std::io::BufWriter<std::fs::File>,
+    tmp_file: &std::fs::File,
     s3_integ_encode_ref: &std::sync::atomic::AtomicU64,
     s3_integ_straddler_copy_ref: &std::sync::atomic::AtomicU64,
     s3_integ_worker_tmp_bytes_ref: &std::sync::atomic::AtomicU64,
 ) -> std::result::Result<(), String> {
-    use std::io::Write as _;
+    use std::os::unix::fs::FileExt as _;
     use std::sync::atomic::Ordering::Relaxed;
 
     let bucket_bytes = scatter_buf.len();
-    let writer = tmp_writer;
 
     for intersection in intersections {
         match intersection {
@@ -432,8 +427,8 @@ fn emit_integrated_intersections(
 
                 let byte_offset = *tmp_byte_pos;
                 let byte_length = encode_scratch.len() as u64;
-                writer
-                    .write_all(encode_scratch)
+                tmp_file
+                    .write_all_at(encode_scratch, byte_offset)
                     .map_err(|e| format!("write worker tmp blob {blob_idx}: {e}"))?;
                 *tmp_byte_pos += byte_length;
                 s3_integ_worker_tmp_bytes_ref.fetch_add(byte_length, Relaxed);

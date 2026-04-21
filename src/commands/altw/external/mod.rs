@@ -210,16 +210,68 @@ pub fn external_join(
     // Stage 1: produces total_slots, unique_nodes, rank_bucket_counts,
     // num_shard_workers, the live IdSet (kept alive through stage 2
     // for inline coord resolution), and the per-blob rank mapping.
+    //
+    // #9 layer 2: relation member-id scan runs concurrently with stage 1.
+    // The scan reads relation blobs only (via blob_meta) and shares no
+    // state with stage 1 - both read from the same input PBF via pread
+    // (`File: Sync` on Unix) with no locking. On Europe the scan takes
+    // ~4 s; it fits entirely inside stage 1's ~43 s wall, so the serial
+    // gap the scan used to create between stage 2 and stage 4 goes away.
     crate::debug::emit_marker("EXTJOIN_STAGE1_START");
     let (s1_minflt_before, s1_majflt_before) = crate::debug::read_page_faults();
-    let stage1_out = stage1_way_pass(
-        &blob_meta,
-        input,
-        direct_io,
-        &scratch_dir,
-        &ref_count_sidecar,
-        &per_way_refcount_sidecar,
-    )?;
+
+    let input_ref_parallel: &Path = input;
+    let blob_meta_ref_parallel = &blob_meta;
+    let (stage1_out, relation_member_node_ids) = std::thread::scope(
+        |scope| -> std::result::Result<(super::external::stage1::Stage1Output, Option<crate::idset::IdSet>), String> {
+            let s1_handle = scope.spawn(|| {
+                stage1_way_pass(
+                    blob_meta_ref_parallel,
+                    input_ref_parallel,
+                    direct_io,
+                    &scratch_dir,
+                    &ref_count_sidecar,
+                    &per_way_refcount_sidecar,
+                )
+                .map_err(|e| e.to_string())
+            });
+            let rel_handle = if keep_untagged_nodes {
+                None
+            } else {
+                crate::debug::emit_marker("EXTJOIN_RELATION_SCAN_START");
+                Some(scope.spawn(move || {
+                    let t_relscan = std::time::Instant::now();
+                    let ids = relation_scan::collect_relation_member_node_ids_indexed(
+                        input_ref_parallel,
+                        blob_meta_ref_parallel,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+                    crate::debug::emit_counter(
+                        "extjoin_relation_member_collect_ms",
+                        t_relscan.elapsed().as_millis() as i64,
+                    );
+                    crate::debug::emit_marker("EXTJOIN_RELATION_SCAN_END");
+                    Ok::<_, String>(ids)
+                }))
+            };
+
+            let s1_res = s1_handle
+                .join()
+                .map_err(|_| "stage 1 thread panicked".to_string())??;
+            let rel_res = match rel_handle {
+                Some(handle) => Some(
+                    handle
+                        .join()
+                        .map_err(|_| "relation scan thread panicked".to_string())??,
+                ),
+                None => None,
+            };
+            Ok((s1_res, rel_res))
+        },
+    )
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
     let (s1_minflt_after, s1_majflt_after) = crate::debug::read_page_faults();
     let total_coo: u64 = stage1_out.rank_bucket_counts.iter().sum();
     #[allow(clippy::cast_possible_wrap)]
@@ -387,22 +439,9 @@ pub fn external_join(
         worker_files.clone(),
     )?;
 
-    let relation_member_node_ids = if keep_untagged_nodes {
-        None
-    } else {
-        crate::debug::emit_marker("EXTJOIN_RELATION_SCAN_START");
-        let t_relscan = std::time::Instant::now();
-        let ids = relation_scan::collect_relation_member_node_ids_indexed(
-            input, &blob_meta,
-        )?;
-        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-        crate::debug::emit_counter(
-            "extjoin_relation_member_collect_ms",
-            t_relscan.elapsed().as_millis() as i64,
-        );
-        crate::debug::emit_marker("EXTJOIN_RELATION_SCAN_END");
-        Some(ids)
-    };
+    // (#9 layer 2: relation scan already ran in parallel with stage 1
+    // above; `relation_member_node_ids` is already bound. No serial
+    // scan between stage 2 and stage 4.)
 
     // Streaming stage 3 + stage 4: run concurrently via a single
     // `thread::scope`. Stage 3 publishes per-blob entries to the router

@@ -358,19 +358,57 @@ This deletes `rank_if_set()` from stage 2 entirely. `build_node_blob_mapping()` 
 
 ### #6 - Blob-group downstream rewrite: re-key around way blobs, not global slot buckets
 
+**ATTEMPTED 2026-04-22 AND REVERTED.** Downstream-only half implemented (commits `1ef0474` / `ed86839` / `a97b6ab` / `80ed3d7`, reverted in a single commit on top). Stage 1 minimally touched (rank record decomposed to `(local_rank, blob_idx, blob_local_slot)` at the same 12-byte size); stage 2 rerouted resolved entries to blob-group files via a cumulative-slot-weighted `BlobGroupMap`; stage 3 rewritten to read group files, scatter into a per-group coord buffer sized to the group's slot span, encode per-blob, and publish; `blob_bucket_index.rs` deleted; router's `Straddler` variant + `publish_straddler_half` removed by construction (each blob fully contained in one group).
+
+**Measurement record (plantasjen, Europe `--bench 1`):**
+
+| Commit | Compression | Stage 2 wall | Streaming wall | Total wall | Notes |
+|---|---|---:|---:|---:|---|
+| #9L2 (`bad6571`) | zlib:6 | 93.8 s | 111.9 s | **279.6 s** | pre-#6 baseline |
+| #6 initial cap-4 (`1ef0474`) | zlib:6 | 102.6 s | 144.1 s | 321.7 s | stage 3 starved stage 4 |
+| #6 cap-6 (`a97b6ab`) | zlib:6 | 104.2 s | 121.1 s | 288.2 s | heavy paging (majflt 20 940/sample avg, max 81 162) |
+| #6 uncapped (`80ed3d7`) | zlib:6 | 101.5 s | 124.1 s | **289.7 s** | starvation cured, wall unchanged |
+| #9L2 (`bad6571`) | none | 92.0 s | 86.6 s | **246.8 s** | baseline-at-no-compression |
+| #6 uncapped (`80ed3d7`) | none | 104.5 s | 98.6 s | **269.9 s** | +23.1 s vs #9L2-at-no-compression |
+
+The zlib:6 results already said #6 was +10 s worse, but we wanted to rule out the writer ceiling - the notes specifically warn stage-3-side wins can vanish at wall under zlib:6. Removing compression **widened** the gap from +10 s / +3.6 % to +23 s / +9.4 %. So compression was partially masking the #6 regression, not hiding a latent #6 win. The design tax is real and compression-independent.
+
+**Why #6 downstream loses on this hardware:**
+
+1. Stage 2 intermediate record grows from 12 bytes (pre-#6 slot-bucket `(local_slot_pos u32, lat, lon)`) to 16 bytes (post-#6 `(blob_idx u32, blob_local_slot u32, lat, lon)`). The reviewer-proposed narrower 14-byte `(blob_idx u32, blob_local_slot u16, lat, lon)` form is not viable: real data has `blob_local_slot` up to 69 552 (observed at Europe blob 826), exceeding `u16::MAX`. Stage 2 wall tax: +7.7 s (zlib:6) / +12.5 s (none).
+2. Stage 3 reads 75 GB of group files at Europe (vs slot-bucket's 56 GB), allocates a per-group dense coord buffer sized to the group's slot span (`s3_max_group_coord_bytes` 147 MB on Europe, projecting ~380 MB at planet worst case), scatters per-entry, encodes. More disk + more scratch allocation than the straddler-based path. Streaming wall tax: +12 s (both compression modes).
+
+**Worker-count tuning alone does not rescue it.** The scaling search, controlled for everything but stage 3 worker count:
+- `cap-4`: stage 4 starved, `s4_readiness_wait_ms=1 313 000` cumulative / 22 threads = ~60 s per stage-4 thread blocked.
+- `cap-6`: stage 4 still starved (`s4_readiness_wait_ms=462 884`), **and** heavy major-faulting (avg 20 940 `majflt`/sample, max 81 162). The slow stage 3 holds group-file page cache long enough to evict stage 4's input-PBF working set. Wall comparable to uncapped because the faults happened alongside useful work, but the memory behaviour was pathological.
+- `uncapped` (22 workers): stage 4 no longer starved (`s4_readiness_wait_max_ms=5`, cumulative 36 ms), `majflt` flat (max 3, avg 0.4), peak RSS unchanged at ~8.6 GB. Disk/CPU work of the larger intermediate still dominates.
+
+**Cross-disk experiment aborted.** The second NVMe on plantasjen (Samsung 970 EVO Plus 1 TB at `/media/folk/Booty`) is materially slower than the primary (Samsung 990 PRO 4 TB). Moving scratch to Booty regressed Europe wall `+87 s` / `+30 %` - the drive-speed delta dominated any potential read/write contention reduction. Without a second 990 PRO this probe is infeasible on current hardware.
+
+**Why the "collapse the round-trip" shapes in this document don't help either.** The user raised the obvious follow-up: can we replace the stage 2 write -> stage 3 reread with a direct in-RAM handoff? Re-reading the live proposals:
+- **#5** per-blob sparse accumulators. Planet working set = 10 B entries x 10 B = ~100 GB. Does not fit 25 GB RAM. The #5 note itself pairs it with epoch partitioning (#1), and #1 is dead on this hardware.
+- **#1** fused epoch path, variant (c). Dead on this hardware (`notes/altw-structural-reports.md` #1 header).
+- **R4 A3** in-RAM per-bucket `Vec<Vec<u8>>` + completion counter. Its "4 GB resident" claim relies on stage 3 draining parallel with stage 2, but completion can't fire until **all** rank-bucket contributions to a group are done - which in practice is end-of-stage-2, so the resident set is the whole intermediate (~75 GB Europe, ~300 GB planet at #6 record size). Same RAM blowup as #5.
+
+All three variants need a larger RAM envelope than plantasjen has. On 25 GB available RAM, the disk round-trip for the stage 2 -> stage 3 intermediate is structurally necessary.
+
+**What stays deletable from #6's code simplification.** The straddler apparatus (`classify_blobs_in_bucket`, `emit_integrated_intersections`'s left/right-half branches, `router.publish_straddler_half`, `BlobLocation::Straddler`, `blob_bucket_index.rs`) is really only there to survive the slot-bucket key choice. If a future attempt finds a way to collapse the round-trip, the straddler code goes away with it. Until then, the 3-9 % wall tax is the price of avoiding that collapse, and the straddler code stays.
+
+**Original framing below; preserved as the design-space record for any future revisit.**
+
 **Convergence: R1 #2, R5 #1.** R5 explicitly endorses this framing ("re-key the downstream path around way blobs/blob groups and stream directly into stage 4") and names the artifacts to delete: `SharedSlotBuckets`, `stage3_slot_reorder`, `finalize_coord_payloads`, `CoordPayloadsReader`, and most straddler machinery. The structurally cleanest answer, at the cost of rewriting stages 1-4.
 
 **Bottleneck.** Stage 1 emits global `slot_pos` records; stage 2 routes every resolved coordinate into shared global slot buckets; stage 3 rebuilds dense bucket-local slot images and then classifies blob/bucket intersections and straddlers ([stage3.rs:292](/home/folk/Programs/pbfhogg/src/commands/altw/stage3.rs:292), [:386](/home/folk/Programs/pbfhogg/src/commands/altw/stage3.rs:386)). The entire `slot_bucket_count` and 2-piece straddler apparatus at [mod.rs:238](/home/folk/Programs/pbfhogg/src/commands/altw/mod.rs:238) exists only to survive this key choice.
 
 **Why the structure causes it.** Blob ownership is thrown away at [stage1.rs:451](/home/folk/Programs/pbfhogg/src/commands/altw/stage1.rs:451) and only reconstructed downstream. Every subsequent stage rebuilds it, in a different ownership domain.
 
-**Redesign.** Change the downstream key from `slot_pos` to `way_blob_idx + blob_local_slot` (or a blob-group-local equivalent). Partition contiguous way blobs into bounded blob groups. Stage 2 emits resolved records to blob-group files. Stage 3 scatters and encodes directly within those blob-aligned groups. This deletes blob/bucket classification, straddler staging, and most of finalize **by construction**.
+**Redesign (original).** Change the downstream key from `slot_pos` to `way_blob_idx + blob_local_slot` (or a blob-group-local equivalent). Partition contiguous way blobs into bounded blob groups. Stage 2 emits resolved records to blob-group files. Stage 3 scatters and encodes directly within those blob-aligned groups. This deletes blob/bucket classification, straddler staging, and most of finalize **by construction**.
 
-**Payoff.** The cleanest way to stop rebuilding the same coordinate stream in three ownership domains. Also makes #2 (streaming 3→4) much cleaner - payloads are produced already in blob-aligned order, and straddlers vanish.
+**Payoff (original prediction).** The cleanest way to stop rebuilding the same coordinate stream in three ownership domains. Also makes #2 (streaming 3→4) much cleaner - payloads are produced already in blob-aligned order, and straddlers vanish.
 
-**Risks.** Real rewrite of stages 1-4. The fundamental rank-order vs blob-order mismatch does not go away; a bad blob-group design can preserve most of the scatter cost while adding new bookkeeping.
+**Risks (original).** Real rewrite of stages 1-4. The fundamental rank-order vs blob-order mismatch does not go away; a bad blob-group design can preserve most of the scatter cost while adding new bookkeeping. **This risk materialized at measurement time** - see the attempt post-mortem above.
 
-**Conviction: medium** (high structural payoff, high implementation risk). **Scope: very large.**
+**Conviction (revised 2026-04-22): low on this hardware.** The downstream-only half was implemented and measured; the design tax is a bigger-than-the-simplification-benefit ~3-9 % wall regression. A future revisit would need to collapse the round-trip (requires RAM we don't have) or use a measurably faster second NVMe to split the stage-2-write / stage-3-read contention. Until either changes, leave this item as tried-and-shelved.
 
 ---
 
@@ -547,9 +585,12 @@ Consolidated from all six reports:
 4. ~~**#3 - fuse stage 1A + 1B** (retry with buffered-writer + delta-varint).~~ **DEAD ON THIS HARDWARE 2026-04-21.** Second attempt (`e8d4f06` + `b034dc5`) did everything the plan prescribed - per-worker BufWriter + bulk-read fixed-prefix + protohoggr Cursor fast-path decode + post-pass unlink - and still regressed stage 1 wall `+17%` on Europe. Root cause: zlib-rs decompresses way blobs faster than we can reread 23 GB of scratch from a partially-cached disk. See #3 section for the measurement table. A future retry would have to be a true single-pass stage 1 (R4 A1 ID-bucketed emission - no scratch round-trip between passes); do not try the scratch-spool shape again.
 5. ~~**#9 layer 2** - fold relation scan into stage 1 concurrency.~~ **LANDED 2026-04-21 (commit `3b6b409`).** Europe `--bench 1` 279.6 s vs 292.2 s baseline = -12.6 s / -4.3%; planet `--bench 1` 614.2 s vs 652.4 s = -38.2 s / -5.9% (structural saving ~6.5 s relation scan absorbed into stage 1, rest bench-1 noise). Relation scan at planet is 16.5 s wall, running fully inside stage 1's 114 s window. Peak anon RSS regressed +2.4 GB at planet (15.66 -> 18.1 GB) because `relation_member_node_ids` now lives from stage 1 onwards instead of only from stage 4; still has headroom on the 25 GB-available host. If memory becomes a concern, followup: tear down the relation IdSet sooner by passing through a channel to stage 4 rather than keeping it resident.
 6. ~~**Then #2 - stream stage 3 -> stage 4.**~~ **LANDED 2026-04-21 (`beb7838` + `f93d896` + `eecb46c`).** Europe `--bench 1` -2.9% wall (stage 3+4 overlap region -13.4%); planet `--bench 1` -6.9% vs prior bench-1, -9 s wall / -1.5 GB peak anon RSS vs bench-3 baseline. Writer-ceiling diagnostic under zlib:6 came out clean (s4_send_ms dropped 250x vs baseline), zstd:1 re-measurement not needed. Commit B-fix (`eecb46c`) was a post-land correction to a mis-placed `.min(4)` cap on stage 4 decode threads. `BlobLocationRouter` / `build_blob_location_router` / `ManifestEntry` / `StraddlerSlot` / `RouterStats` deleted.
-7. **Then #5, #6, #7, #11** as appetite allows. #5 is the natural continuation once #2's fused producer→consumer path exists; #6 subsumes #5 at whole-pipeline scope (R5 #1 + R1 #2 both land here); #7 is the hardest and most speculative; #11 only matters if dense stage-2 coord slices survive.
-8. **#10 separately, conditional.** Conservative refcounts-only BlobHeader metadata is supported by three reviewers but still depends on codifying the `cat` output contract. Aggressive full-ref-list forms remain blocked on the 64 KiB header cap.
-9. **#1 last-resort only.** Deprioritized 2026-04-21 (see #1 header note). Revisit only if #2/#3/#5/#6 have all shipped and the stage 2 → stage 3 seam is still the dominant remaining phase. If we ever come back to it, start from variant (c) (per-epoch-scoped `local_slot_pos: u32`, single 12-byte stream) and auto-tune `num_epochs` from `/proc/meminfo`  -  do not re-ship the 16-byte prototype format.
+7. ~~**Then #6 - blob-group downstream rewrite.**~~ **ATTEMPTED 2026-04-22 AND REVERTED.** Downstream-only half implemented and measured; Europe wall +3.6 % at zlib:6, +9.4 % at `--compression none` (widens without the writer ceiling masking). The larger 16-byte intermediate record + extra stage-3 scatter phase is the design tax; collapsing the stage 2 -> stage 3 round-trip needs RAM we don't have (see #6 section). Cross-disk scratch probe also infeasible on this hardware (second NVMe is a slower model). **#6 is shelved on plantasjen-class hardware.**
+8. **#5, #7, #11 effectively blocked on #6's outcome.** #5 (per-blob accumulators) requires RAM sized for all blob accumulators, same memory envelope as #6 needed - blocked for the same reason. #7 (single-decode node path) is the hardest remaining item and the notes already flagged its writer-ceiling risk. #11 (presence bitmap) is reverted and moot unless dense stage-2 coord slices get revived.
+9. **#10 separately, conditional.** Conservative refcounts-only BlobHeader metadata is supported by three reviewers but still depends on codifying the `cat` output contract. Aggressive full-ref-list forms remain blocked on the 64 KiB header cap.
+10. **#1 last-resort only.** Deprioritized 2026-04-21 (see #1 header note). Revisit only if #2/#3/#5/#6 have all shipped and the stage 2 -> stage 3 seam is still the dominant remaining phase. If we ever come back to it, start from variant (c) (per-epoch-scoped `local_slot_pos: u32`, single 12-byte stream) and auto-tune `num_epochs` from `/proc/meminfo` - do not re-ship the 16-byte prototype format.
+
+**State of the plan as of 2026-04-22.** Everything that lands cleanly on this hardware (25 GB available RAM, one fast NVMe + one slower NVMe) has now landed: #4 (blob-local rank counter), #8 (BlobLocationRouter), #9 layer 1 (metadata-driven relation scan), #2 (streaming stage 3 -> stage 4 overlap), #9 layer 2 (parallel relation scan). The remaining items (#3 retry, #5, #6, #7, #1) are all blocked by either (a) RAM (#5/#6/#1 all need more than we have) or (b) disk round-trip cost that zlib-rs decompress beats (#3). #7 is available in principle but its note calls out writer-ceiling risk. #10 is platform work conditional on pinning the `cat` output contract. No obvious next-live structural item; further wins would require either a hardware upgrade, a measurably faster second NVMe for #6's cross-disk shape, or a new design that isn't in this document.
 
 ### Benchmark plan for #4 (stage-2 de-ranking) - **EXECUTED, landed `f1a4ada`**
 

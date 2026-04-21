@@ -134,6 +134,92 @@ more blobs reach the precise `block_overlaps_diff` check (which decodes all
 elements to test IDs against the diff). Skipping metadata decode saves ~1s
 across ~11K precise-check invocations.
 
+### Descriptor-first streaming pipeline (P1 + P1.5 + parallel-writer, 2026-04-21, commits `719f306` → `80b37df`)
+
+Three-stage pipeline replacing the per-batch rayon barrier:
+
+- Scanner walks blob headers via `HeaderWalker`; non-overlap indexed
+  blobs route to the drain as `DrainItem::CopyRange` (never reach the
+  worker pool); overlap candidates go to a long-lived worker pool.
+- Workers pread body, decompress, precise-check; under
+  `--locations-on-ways` they extract node coords during the node phase
+  into per-worker `Arc<Mutex<FxHashMap>>` slots. Drain merges slots at
+  the node→way barrier, publishes via `LocMapHandle`, signals the
+  scanner. Way-phase workers read the published map to resolve OSC way
+  refs.
+- P1.5: workers call `frame_blob_pipelined` inline and attach framed
+  `Vec<u8>` chunks to `DrainItem::Rewritten`; drain uses
+  `write_raw_owned` per chunk (avoids the writer's
+  rayon-spawn-per-block dispatch).
+
+Planet LOW altw + OSC 4913, `--bench 1`, plantasjen (source on
+Banan/nvme1n1; cross-disk scratch on Booty/nvme0n1p3 for the
+separate-drives experiment):
+
+| Config | Buffered | `--io-uring` | `--parallel-writer` (POOL_SIZE=16) |
+|---|---:|---:|---:|
+| Same-disk, `--compression none` | 135.5 s | 108.6 s | not benched |
+| Same-disk, `--compression zlib:6` | 143.7 s | - | - |
+| Same-disk, `--compression zstd:1` | 121.2 s | 99.4 s | 104.5 s |
+| Cross-disk, `--compression none` | 95.4 s | 93.0 s | 99.0 s |
+| Cross-disk, `--compression zlib:6` | - | - | 117.4 s |
+| Cross-disk, `--compression zstd:1` | 87.1 s | 82.8 s | **80.9 s** |
+
+Pre-flip baseline (commit `52c2c4b`, UUID `e81a9316`): 144.4 s.
+Best post-flip: **80.9 s** (-44 %) at zstd:1 + cross-disk +
+`--parallel-writer`.
+
+Writer-backend rule:
+
+- **Same-disk**: `--io-uring` wins at every compression level. Same-disk
+  is IOPS-bound (reads compete with writes on one NVMe); io_uring's
+  queue-depth batching alleviates contention more than multiple
+  per-syscall pwrites.
+- **Cross-disk** + zstd:1: `--parallel-writer` wins. Disk has write
+  bandwidth headroom; parallel pwrite saturates it faster than a
+  single-thread writer can.
+- **Cross-disk** + `--compression none`: `--io-uring` wins. The 119 GB
+  output is close enough to NVMe peak that queue-depth tuning beats
+  per-syscall parallelism.
+
+Pool-size sweep at cross-disk zstd:1 (plantasjen, Samsung 990 PRO):
+4 → 89.2 s, 8 → 83.4 s, 16 → **80.9-82.1 s** (two runs), 32 → 82.2 s.
+POOL_SIZE=16 is hard-coded in
+[`src/write/parallel_writer.rs`](../src/write/parallel_writer.rs); the
+comment explains the measurement. Over-contends above 16.
+
+Memory + runtime shape at planet (buffered same-disk, `--compression
+none`, commit `719f306`):
+
+| Metric | Legacy `52c2c4b` | Post-flip `719f306` | Δ |
+|---|---:|---:|---:|
+| Wall | 144.4 s | 135.5 s | -6 % |
+| Peak RSS | 1.63 GB | 3.29 GB | +2.0× |
+| Peak threads | 27 | 50 | +85 % |
+| Involuntary context switches (max sample) | 7,214 | 2,134 | **-70 %** |
+| Major faults (max sample) | 52,659 | 67,858 | +29 % |
+
+Per-worker thread-local `BlockBuilder` + scratches × 22 ≈ 220 MB,
+per-worker coord slots, framed-chunk buffering at the drain (~800 KB
+per rewrite blob in-flight), and the `BTreeMap<seq, DrainItem>`
+reorder buffer account for most of the RSS delta.
+
+Setup notes:
+
+- `RLIMIT_MEMLOCK` must be ≥16 MB for `--io-uring` to register its
+  64×256 KB buffer pool. Raise with
+  `sudo prlimit --pid=$$ --memlock=unlimited:unlimited` in the bench
+  shell before running.
+- Cross-disk benches override `[plantasjen].scratch` in `brokkr.toml`
+  from the default `data/bench-tmp` to a path on the secondary NVMe.
+  Reverted post-bench.
+- The `[plantasjen.drives].target = "hdd"` label in the toml is
+  separately misleading: brokkr writes bench output to `scratch`, not
+  to `target`. The "hdd" classification refers to an unrelated cargo
+  build dir.
+- Full plan + synthesis + measurement log in
+  [notes/apply-changes-opportunities.md](../notes/apply-changes-opportunities.md).
+
 ## Add-locations-to-ways
 
 Dense mmap index: 16B slots × 8 bytes = 128 GB virtual address space.

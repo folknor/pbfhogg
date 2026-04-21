@@ -18,7 +18,185 @@ Four planet-scale command plans are in notes, each with a ranked set of opportun
 
 - [ ] **[notes/altw-structural-reports.md](notes/altw-structural-reports.md)** - `add-locations-to-ways --index-type external`. Current planet baseline: **661.2 s `--bench 3`** (UUID `a406d77e`, commit `aee7727`, 2026-04-18 post-regression-fix). Europe **291.6 s** after metadata-driven relation scan (`6d71053`). Doc consolidates six independent reviews into 11 ranked opportunities. Dominant theme: the stage 2 → stage 3 → stage 4 disk-seam chain, with ~80 GB rank shards + ~112 GB slot buckets + finalize. Stage-2 de-ranking and `BlobLocationRouter` already shipped (Europe 320.5 s → 291.6 s total). Measurement history + already-shipped context in [`notes/altw-optimization-history.md`](notes/altw-optimization-history.md); the failed in-RAM-coord-table reshape experiment is documented at [`notes/altw-as-renumber.md`](notes/altw-as-renumber.md) and does not invalidate the remaining ranked items.
 
+  **Apply-changes work that might transfer (speculative, 2026-04-21, no deep ALTW research):**
+  - **`--parallel-writer` backend wiring.** Apply-changes landed it as a new writer backend (16-thread pwrite pool on shared fd). Best-guess transfer cost is small (CLI flag + threading through ALTW's Stage 4 PbfWriter setup), expected win 5-15% at planet *if* ALTW Stage 4's writer is currently the visible ceiling. Conditional on profiling Stage 4's `writer_pipeline_send_wait_ns` — if it's already low, the win evaporates.
+  - **Worker-emits-framed-bytes (P1.5 pattern).** If ALTW Stage 4 still dispatches framing via `rayon::spawn` per output block and funnels through `write_primitive_block_owned`, moving framing inline into the worker (call `frame_blob_pipelined` directly, ship the framed `Vec<u8>` to the writer thread via `write_raw_owned`) would save the same `writer_pipeline_send_wait_ns` we shaved in apply-changes (-86% at planet `--compression none`). Pattern transfers cleanly; trigger is whether that counter is large in ALTW.
+  - **Cross-disk scratch (no code, pure config).** Apply-changes planet dropped 31% just by moving bench output to a different physical NVMe (single-NVMe read+write contention removed). Worth a single `brokkr.toml` edit + bench to see if ALTW's 661 s shows similar shape — if so, it's an immediate runtime recommendation rather than code work.
+  - **`zstd:1` for internal pipelines.** Already documented in apply-changes plan doc and in the ALTW notes (`notes/altw-optimization-history.md` mentions `--compression zstd:1` Europe 419 s → 379 s, -9.5%). Confirmed the same mechanism in apply-changes (workers parallelize zstd cheaply; smaller bytes → less writer wall). Should lift to ALTW Stage 4's writer config without changes.
+
+  **Probably doesn't transfer:**
+  - **Descriptor-first scanner + drain shape.** ALTW external is multi-pass external-sort; the design premise (reader/classify/rewrite in one pass) doesn't match.
+  - **Node→way barrier + coord fusion.** Apply-changes-specific (coords needed mid-run to resolve OSC way refs); ALTW's whole job IS the coord scatter.
+  - **BTreeMap seq reorder buffer at drain.** ALTW Stage 4 has its own output ordering.
+
+  **Already shared:**
+  - **HeaderWalker** (scan-audit round migrated both commands).
+  - **`copy_file_range` coalescing** (apply-changes drain *ported from* `altw/passthrough.rs`, so the flow direction already ran).
+  - **`IdSetDense::set_atomic_if_new`** primitive (used by both for parallel set-membership).
+
+  Rough prioritization if a day were available: cross-disk bench first (10 min, tells us where the ALTW ceiling actually lives), then `--parallel-writer` + worker-framed-bytes if Stage 4 is writer-bound.
+
 Measurement-first on every one: turn on `#[cfg(feature = "hotpath")]` counters (or add unconditional `*_ms` counters) to ground-truth the inferred per-phase breakdowns before committing to the order of landing items within a plan.
+
+## apply-changes writer backend: complete the matrix + decide on default
+
+Three writer backends shipped (buffered, `--io-uring`, `--parallel-writer`),
+three compression modes (`none`, `zlib:6`, `zstd:1`), two disk
+topologies (source+output on one NVMe vs output on a separate NVMe) =
+**18 cells**. Only 13 benched during the P1/P1.5/parallel-writer
+investigation on 2026-04-21. Need to fill the remaining 5, then pick a
+default (or an auto-selection rule) so users don't have to memorise
+the table.
+
+Planet LOW altw + OSC 4913, `--bench 1`, plantasjen, commit `80b37df`:
+
+| Disk | Compression | Buffered | `--io-uring` | `--parallel-writer` |
+|---|---|---:|---:|---:|
+| Same | none | 135.5 s | 108.6 s | **not benched** |
+| Same | zlib:6 | 143.7 s | **not benched** | **not benched** |
+| Same | zstd:1 | 121.2 s | 99.4 s | 104.5 s |
+| Cross | none | 95.4 s | 93.0 s | 99.0 s |
+| Cross | zlib:6 | **not benched** | **not benched** | 117.4 s |
+| Cross | zstd:1 | 87.1 s | 82.8 s | **80.9 s** |
+
+Missing cells to bench (cost: 5 × ~90-145 s at planet + build/setup =
+~15-20 min total):
+
+- [ ] Same-disk + `--compression none` + `--parallel-writer`
+- [ ] Same-disk + `--compression zlib:6` + `--io-uring`
+- [ ] Same-disk + `--compression zlib:6` + `--parallel-writer`
+- [ ] Cross-disk + `--compression zlib:6` + buffered
+- [ ] Cross-disk + `--compression zlib:6` + `--io-uring`
+
+Open questions the full matrix should answer:
+
+1. **What should the default writer backend be?** Currently it's
+   buffered (no flag). Data so far suggests `--parallel-writer` wins
+   zstd:1 unambiguously at both disk topologies. io_uring wins same-disk
+   `none` and cross-disk `none`. Decision criteria:
+   - If `--compression none` is the production default, io_uring should
+     be the default writer backend at planet scale. But io_uring needs
+     `RLIMIT_MEMLOCK ≥ 16 MB` which isn't universal, so it can't be a
+     silent default.
+   - If `--compression zstd:1` becomes the internal-pipeline
+     recommendation (notes/apply-changes-opportunities.md #15), then
+     `--parallel-writer` should default-on alongside.
+2. **Should the default change based on observed disk topology?** A
+   one-time `statfs` at startup can detect whether input and output
+   live on the same filesystem / device. If different → prefer
+   `--parallel-writer` for zstd:1; if same → prefer `--io-uring` when
+   available.
+3. **What's the default if io_uring isn't available (RLIMIT too low,
+   kernel too old, non-Linux)?** Probably `--parallel-writer` at zstd:1
+   and buffered at `none`. Needs the missing cells to confirm.
+4. **Does the answer change at smaller scales?** All benches above are
+   planet (92 GB). Germany (~1 GB output) might not benefit from any
+   of these at all; the pipeline overhead could dominate. Should the
+   default be scale-aware or is "always use the best planet backend"
+   safe on smaller inputs too? Quick bench at germany or europe for
+   each backend answers this.
+5. **Is there a POOL_SIZE that's universally good for
+   `--parallel-writer`?** Empirically 16 wins on plantasjen's Samsung
+   990 PRO. A single-NVMe laptop might be better at 4 or 8. Could be a
+   CLI flag (`--parallel-writer-threads N`) or derived from
+   `available_parallelism()` with a cap. Today it's a hard-coded
+   constant in `src/write/parallel_writer.rs`.
+
+Outcome wanted: a `notes/apply-changes-writer-backends.md` with the
+complete 18-cell table + a one-paragraph "use X by default, Y when you
+have zstd:1 + cross-disk" rule that lives in the README's usage
+section. Then the `--parallel-writer` flag can be considered for
+removal / rename / default-on.
+
+## apply-changes at weekly scale (7 OSCs)
+
+All measured apply-changes walls in this repo are daily: single OSC,
+`--osc-seq 4913`. The production user running a weekly batch (7
+accumulated diffs) is **completely unmeasured**. The plan doc's Q7
+section flags this and projects ~70-90 s with the full stack (parallel
+OSC parse + prefill fusion + worker-framing) vs ~250 s+ without -
+those are Reviewer 2's estimates, not measurements.
+
+Three steps to close the gap:
+
+### 1. brokkr feature: accept a range of OSCs on `apply-changes`
+
+Current state: `brokkr apply-changes --osc-seq N` is clap-limited to
+a single value (`the argument '--osc-seq' cannot be used multiple
+times` confirmed 2026-04-21). Needed: a way to specify 7+ OSCs for a
+weekly bench.
+
+Two shapes fit existing brokkr convention:
+
+- **`--osc-range LO..HI`** (preferred). `merge-changes` already uses
+  this pattern and produces `+range-LO-HI` variant suffixes in stored
+  results. Extending `apply-changes` symmetrically keeps the CLI
+  consistent.
+- `--osc-seq` as repeatable (clap `ArgAction::Append`) is the fallback
+  if non-contiguous ranges matter.
+
+Implementation shape on the brokkr side:
+1. Accept the range flag.
+2. Expand it against `[datasets.<region>.osc.<seq>]` entries in
+   brokkr.toml.
+3. Internally run `pbfhogg merge-changes` on the expanded list to
+   produce a squashed OSC in `scratch/`, then invoke
+   `pbfhogg apply-changes` with that single path.
+4. Bench wall includes the squash phase (honest full-pipeline cost).
+5. Stored result carries the `+range-LO-HI` variant suffix so a
+   `brokkr results --grep range-4913-4919` query finds all weekly
+   runs.
+
+This is brokkr-only work - no pbfhogg changes required since the
+crate's `apply-changes` CLI still sees one file.
+
+### 2. pbfhogg side (conditional, probably not needed yet)
+
+If the squash phase's wall becomes a meaningful fraction of the weekly
+bench and merits removal, pbfhogg could grow a multi-OSC entry
+(`apply-changes --changes <p1> --changes <p2> ...` or a
+`--changes-dir`). `osc::load_all_diffs` already exists at the library
+level and does the serial-merge internally; wiring it through the CLI
+is straightforward once we know the cost is worth it. Not doing
+this pre-emptively - measurement first.
+
+### 3. Once brokkr has the range flag, bench these
+
+Planet apply-changes LOW altw at weekly scale (OSC 4913..4919 = 7
+daily diffs), same-disk `--compression none`, bench 1:
+
+- [ ] Buffered writer baseline.
+- [ ] `--io-uring` writer.
+- [ ] `--parallel-writer` (POOL_SIZE=16).
+
+Same three at cross-disk (Booty scratch) and at `--compression zstd:1`
+once the daily-matrix is complete so we can see whether the
+writer-backend ordering is the same at weekly as at daily or whether
+something flips. Expected results from Q7 reasoning:
+
+- OSC parse + squash phase is larger (serial XML + gzip at 7×).
+  merge-changes wall at 7 inputs is a side-product of this bench.
+- `needed_set` grows from 6.8 M (daily) to ~45 M (weekly). Per-worker
+  `FxHashMap` coord accumulator memory grows correspondingly.
+- Rewrite ratio shifts up (more blobs touch some affected element).
+- Writer bytes don't scale 7× - most unchanged elements still pass
+  through.
+
+Rough gut estimate at the current best daily config (80.9 s,
+cross-disk + zstd:1 + parallel-writer): **~120-130 s weekly**,
+assuming serial OSC parse adds ~30 s and CPU/writer grow modestly.
+Could be higher if `needed_set` RSS pressure trips something.
+
+### Follow-on decisions the weekly bench should unblock
+
+- **Do we ship parallel OSC parse (plan item #10)?** Only matters at
+  weekly; estimated -20-30 s wall. Decision blocked on measuring how
+  big the serial `load_all_diffs` phase actually is at 7 inputs.
+- **Is the `--parallel-writer` default-on story the same weekly?**
+  Different rewrite ratios could shift the writer-backend ordering.
+- **Is there a weekly-specific doc recommendation?** e.g. "for weekly
+  batches, use `brokkr apply-changes --osc-range 4913..4919 --parallel-writer
+  --compression zstd:1` and expect X-Y s wall."
 
 ## Known issue: io_uring writer corrupts very small outputs
 

@@ -52,7 +52,7 @@ Every command listed below runs on the full planet on normal hardware. Measured 
 | `diff -j 16` (two independent 47-day-apart planets, text) | 3m48s | 586 MB | ID-range shard plan, parallel block-pair merge, per-shard temp files, 9.5× vs sequential |
 | `extract --smart` (Europe bbox) | 4m28s | 11.17 GB | three-pass, multipolygon-complete |
 | `add-locations-to-ways --index-type external` | 11m01s | 17.2 GB | rank-bucketed counting sort → per-blob delta-varint coord payloads, ~246 GB temp disk |
-| `apply-changes` (daily diff, zlib) | 12m36s | ~1.8 GB | 3.4M-change daily diff, 86% rewrite |
+| `apply-changes --locations-on-ways` (daily diff) | 2m15s | ~3.3 GB | 3.4M-change daily diff, 56% rewrite. Production `--compression none`, same-disk. `--io-uring` drops to 1m49s; `--parallel-writer + zstd:1` on separate-NVMe scratch drops to **1m21s**. |
 | `build-geocode-index` | 7m12s | ~25 GB | reverse geocoding index, S2 cells (pass-3 stage-B transient peak) |
 | `diff --format osc -j 16` (two independent 47-day-apart planets) | 5m13s | 663 MB | ID-range shard plan, per-shard XML fragment temp files, serial assemble_osc (gzip + concat), 7.1× vs sequential |
 

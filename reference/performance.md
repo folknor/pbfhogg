@@ -158,11 +158,11 @@ separate-drives experiment):
 
 | Config | Buffered | `--io-uring` | `--parallel-writer` (POOL_SIZE=16) |
 |---|---:|---:|---:|
-| Same-disk, `--compression none` | 135.5 s | 108.6 s | not benched |
-| Same-disk, `--compression zlib:6` | 143.7 s | - | - |
+| Same-disk, `--compression none` | 135.5 s | 108.6 s | 116.0 s |
+| Same-disk, `--compression zlib:6` | 143.7 s | 137.1 s | 140.8 s |
 | Same-disk, `--compression zstd:1` | 121.2 s | 99.4 s | 104.5 s |
 | Cross-disk, `--compression none` | 95.4 s | 93.0 s | 99.0 s |
-| Cross-disk, `--compression zlib:6` | - | - | 117.4 s |
+| Cross-disk, `--compression zlib:6` | 134.9 s | 127.9 s | 117.4 s |
 | Cross-disk, `--compression zstd:1` | 87.1 s | 82.8 s | **80.9 s** |
 
 Pre-flip baseline (commit `52c2c4b`, UUID `e81a9316`): 144.4 s.
@@ -175,9 +175,11 @@ Writer-backend rule:
   is IOPS-bound (reads compete with writes on one NVMe); io_uring's
   queue-depth batching alleviates contention more than multiple
   per-syscall pwrites.
-- **Cross-disk** + zstd:1: `--parallel-writer` wins. Disk has write
-  bandwidth headroom; parallel pwrite saturates it faster than a
-  single-thread writer can.
+- **Cross-disk** + zstd:1 / zlib:6: `--parallel-writer` wins (80.9 s
+  at zstd:1, 117.4 s at zlib:6). Disk has write bandwidth headroom;
+  parallel pwrite saturates it faster than a single-thread writer can.
+  Compressed-output rule: cross-disk favours `--parallel-writer` at
+  every compressed level measured.
 - **Cross-disk** + `--compression none`: `--io-uring` wins. The 119 GB
   output is close enough to NVMe peak that queue-depth tuning beats
   per-syscall parallelism.

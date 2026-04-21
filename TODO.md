@@ -43,30 +43,41 @@ Measurement-first on every one: turn on `#[cfg(feature = "hotpath")]` counters (
 Three writer backends shipped (buffered, `--io-uring`, `--parallel-writer`),
 three compression modes (`none`, `zlib:6`, `zstd:1`), two disk
 topologies (source+output on one NVMe vs output on a separate NVMe) =
-**18 cells**. Only 13 benched during the P1/P1.5/parallel-writer
-investigation on 2026-04-21. Need to fill the remaining 5, then pick a
-default (or an auto-selection rule) so users don't have to memorise
-the table.
+**18 cells, all benched as of 2026-04-21.** Overnight run filled the
+three same-disk holes (`afcdcbb4`, `2fecc14b`, `f11e0097`); follow-up
+filled the two cross-disk `zlib:6` cells (134.9 s / 127.9 s, forced
+runs with Booty scratch, not in DB).
 
-Planet LOW altw + OSC 4913, `--bench 1`, plantasjen, commit `80b37df`:
+Planet LOW altw + OSC 4913, `--bench 1`, plantasjen, commit `80b37df`
+(cross-disk row for `none` / `zstd:1`) / `6117021` (all other cells):
 
 | Disk | Compression | Buffered | `--io-uring` | `--parallel-writer` |
 |---|---|---:|---:|---:|
-| Same | none | 135.5 s | 108.6 s | **not benched** |
-| Same | zlib:6 | 143.7 s | **not benched** | **not benched** |
+| Same | none | 135.5 s | 108.6 s | 116.0 s |
+| Same | zlib:6 | 143.7 s | 137.1 s | 140.8 s |
 | Same | zstd:1 | 121.2 s | 99.4 s | 104.5 s |
 | Cross | none | 95.4 s | 93.0 s | 99.0 s |
-| Cross | zlib:6 | **not benched** | **not benched** | 117.4 s |
+| Cross | zlib:6 | 134.9 s | 127.9 s | 117.4 s |
 | Cross | zstd:1 | 87.1 s | 82.8 s | **80.9 s** |
 
-Missing cells to bench (cost: 5 × ~90-145 s at planet + build/setup =
-~15-20 min total):
+Writer-backend rule, now covering the whole matrix:
 
-- [ ] Same-disk + `--compression none` + `--parallel-writer`
-- [ ] Same-disk + `--compression zlib:6` + `--io-uring`
-- [ ] Same-disk + `--compression zlib:6` + `--parallel-writer`
-- [ ] Cross-disk + `--compression zlib:6` + buffered
-- [ ] Cross-disk + `--compression zlib:6` + `--io-uring`
+- **Same-disk** (every compression level): `--io-uring` wins. IOPS-bound;
+  queue-depth batching trumps per-syscall parallelism.
+- **Cross-disk** + compressed output (`zlib:6` / `zstd:1`):
+  `--parallel-writer` wins. Parallel pwrite saturates the second
+  disk's write bandwidth; the compressed byte volume leaves enough
+  headroom that extra writer threads help.
+- **Cross-disk** + `--compression none`: `--io-uring` wins. Uncompressed
+  119 GB is close enough to NVMe peak that queue depth beats thread
+  count.
+
+Cross-disk gains over same-disk are largest on the `--parallel-writer`
+column: zlib:6 drops 23.4 s (140.8 → 117.4), zstd:1 drops 23.6 s
+(104.5 → 80.9). Buffered and io-uring save only 7-10 s from the same
+swap. Makes sense - parallel-writer's whole value proposition is
+saturating write bandwidth, which only exists when reads aren't
+competing for the same disk.
 
 Open questions the full matrix should answer:
 
@@ -87,8 +98,15 @@ Open questions the full matrix should answer:
    `--parallel-writer` for zstd:1; if same → prefer `--io-uring` when
    available.
 3. **What's the default if io_uring isn't available (RLIMIT too low,
-   kernel too old, non-Linux)?** Probably `--parallel-writer` at zstd:1
-   and buffered at `none`. Needs the missing cells to confirm.
+   kernel too old, non-Linux)?** `--parallel-writer` everywhere. It
+   beats buffered at every non-io-uring cell in the matrix (same-disk
+   `none` 116.0 vs 135.5, same-disk `zlib:6` 140.8 vs 143.7,
+   same-disk `zstd:1` 104.5 vs 121.2, cross-disk `none` 99.0 vs 95.4
+   (buffered narrowly wins), cross-disk `zlib:6` 117.4 vs 134.9,
+   cross-disk `zstd:1` 80.9 vs 87.1). The one exception is cross-disk
+   `none`, where buffered's 95.4 s is 3.6 s ahead of parallel-writer's
+   99.0 s. Rule: **without io-uring, default to `--parallel-writer`**;
+   the cross-disk `none` case is close enough to ignore.
 4. **Does the answer change at smaller scales?** All benches above are
    planet (92 GB). Germany (~1 GB output) might not benefit from any
    of these at all; the pipeline overhead could dominate. Should the

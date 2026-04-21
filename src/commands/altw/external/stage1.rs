@@ -7,7 +7,7 @@
 //!     blob's indexdata `(min_id, max_id)`. Replaces the historical 82 GB
 //!     `coords_by_rank` file - stage 2 reads node blobs directly.
 
-use std::io::{BufReader, BufWriter, Write as _};
+use std::io::{BufWriter, Write as _};
 use std::path::Path;
 
 use super::radix::{ScratchDir, NUM_BUCKETS};
@@ -15,42 +15,6 @@ use crate::idset::IdSet;
 use super::super::Result;
 use super::blob_meta::BlobMeta;
 use super::{MAX_NODE_ID, NodeBlobInfo, RANK_RECORD_SIZE, RankRecord};
-
-/// Pass-A-to-Pass-B scratch entry header. One per way blob, fixed 12
-/// bytes LE so Pass B can `read_exact` it in one shot before bulk-
-/// reading the payload. Varint-in-the-header would cost 4.7B trait-
-/// method calls at planet for no real saving.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct ScratchBlobHeader {
-    blob_seq: u32,
-    ref_count: u32,
-    payload_bytes: u32,
-}
-
-const SCRATCH_BLOB_HEADER_LEN: usize = 12;
-
-impl ScratchBlobHeader {
-    fn write_to(&self, buf: &mut [u8; SCRATCH_BLOB_HEADER_LEN]) {
-        buf[0..4].copy_from_slice(&self.blob_seq.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.ref_count.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.payload_bytes.to_le_bytes());
-    }
-
-    fn read_from(buf: &[u8; SCRATCH_BLOB_HEADER_LEN]) -> Self {
-        Self {
-            blob_seq: u32::from_le_bytes(buf[0..4].try_into().unwrap_or([0; 4])),
-            ref_count: u32::from_le_bytes(buf[4..8].try_into().unwrap_or([0; 4])),
-            payload_bytes: u32::from_le_bytes(buf[8..12].try_into().unwrap_or([0; 4])),
-        }
-    }
-}
-
-/// Per-worker Pass-A-to-Pass-B scratch path. Each Pass A worker owns
-/// one of these files; Pass B worker with the same worker_id reads it.
-fn nodeids_scratch_path(scratch: &ScratchDir, worker_id: usize) -> std::path::PathBuf {
-    scratch.file_path(&format!("nodeids-W{worker_id}"))
-}
 
 /// Way-blob schedule entry for the parallel way scans.
 pub(super) struct WayBlobTask {
@@ -110,7 +74,6 @@ pub(super) fn stage1_pass_a(
     num_workers: usize,
     ref_count_sidecar: &Path,
     per_way_refcount_sidecar: &Path,
-    scratch: &ScratchDir,
 ) -> Result<(u64, IdSet)> {
     use std::os::unix::fs::FileExt as _;
 
@@ -129,9 +92,6 @@ pub(super) fn stage1_pass_a(
     let s1a_pread_ms = std::sync::atomic::AtomicU64::new(0);
     let s1a_decompress_ms = std::sync::atomic::AtomicU64::new(0);
     let s1a_scan_way_refs_ms = std::sync::atomic::AtomicU64::new(0);
-    // Scratch volume written for the fused Pass B (item #3). Sum across
-    // workers; useful for sizing the RAM-vs-page-cache tradeoff.
-    let s1a_scratch_bytes = std::sync::atomic::AtomicU64::new(0);
     let s1a_idset_set_ms = std::sync::atomic::AtomicU64::new(0);
     let s1a_bytes_read = std::sync::atomic::AtomicU64::new(0);
     let s1a_pread_calls = std::sync::atomic::AtomicU64::new(0);
@@ -154,37 +114,16 @@ pub(super) fn stage1_pass_a(
         let s1a_per_way_bytes_ref = &s1a_per_way_sidecar_bytes;
 
         std::thread::scope(|scope| -> Result<()> {
-            // Per-worker Pass-A-to-Pass-B scratch writers. Each worker
-            // streams its blobs' node-ID lists as varints so Pass B can
-            // skip pread+decompress+scan_way_refs entirely. Flushed at
-            // closure exit via explicit flush + drop; Pass B opens the
-            // same path fresh for reading.
-            for worker_id in 0..num_workers {
+            for _ in 0..num_workers {
                 let file = std::sync::Arc::clone(&shared_file);
                 let tx = tx.clone();
                 let node_id_set_ref = &node_id_set;
-                let scratch_path = nodeids_scratch_path(scratch, worker_id);
-                let scratch_bytes_ref = &s1a_scratch_bytes;
                 scope.spawn(move || {
                     use std::sync::atomic::Ordering::Relaxed;
                     let mut read_buf: Vec<u8> = Vec::new();
                     let mut decompress_buf: Vec<u8> = Vec::new();
                     let mut refs_buf: Vec<i64> = Vec::new();
                     let mut group_starts: Vec<(usize, usize)> = Vec::new();
-                    let mut scratch_buf: Vec<u8> = Vec::with_capacity(8 * 1024);
-
-                    // Per-worker scratch writer for the fused Pass B.
-                    let scratch_file = match std::fs::File::create(&scratch_path) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            drop(tx.send((
-                                0u32,
-                                Err(format!("pass A scratch create {scratch_path:?}: {e}")),
-                            )));
-                            return;
-                        }
-                    };
-                    let mut scratch_writer = BufWriter::with_capacity(256 * 1024, scratch_file);
 
                     loop {
                         let idx = next_ref.fetch_add(1, Relaxed);
@@ -228,54 +167,10 @@ pub(super) fn stage1_pass_a(
                             #[allow(clippy::cast_possible_truncation)]
                             s1a_idset_ref.fetch_add(t3.elapsed().as_millis() as u64, Relaxed);
 
-                            // Fused #3: write this blob's node-ID list
-                            // to the per-worker scratch so Pass B can
-                            // skip pread+decompress+scan. Layout:
-                            //   [fixed ScratchBlobHeader 12 bytes LE]
-                            //   [ref_count x u64-varint absolute IDs]
-                            // Fixed header + varint payload lets Pass B
-                            // `read_exact` the header and bulk-load the
-                            // payload, then decode with the tight
-                            // `protohoggr::Cursor` fast paths. Byte-at-
-                            // a-time BufRead decoding was ~35% of Pass
-                            // B wall on Europe; this moves it to bulk
-                            // memcpy + tight-loop varint decode.
-                            scratch_buf.clear();
-                            for &node_id in &blob_node_ids {
-                                #[allow(clippy::cast_sign_loss)]
-                                protohoggr::encode_varint(&mut scratch_buf, node_id as u64);
-                            }
-                            #[allow(clippy::cast_possible_truncation)]
-                            let header = ScratchBlobHeader {
-                                blob_seq: task.seq,
-                                ref_count: blob_node_ids.len() as u32,
-                                payload_bytes: scratch_buf.len() as u32,
-                            };
-                            let mut header_bytes = [0u8; SCRATCH_BLOB_HEADER_LEN];
-                            header.write_to(&mut header_bytes);
-                            scratch_writer
-                                .write_all(&header_bytes)
-                                .map_err(|e| format!("pass A scratch write header: {e}"))?;
-                            scratch_writer
-                                .write_all(&scratch_buf)
-                                .map_err(|e| format!("pass A scratch write payload: {e}"))?;
-                            #[allow(clippy::cast_possible_truncation)]
-                            scratch_bytes_ref
-                                .fetch_add((SCRATCH_BLOB_HEADER_LEN + scratch_buf.len()) as u64, Relaxed);
-
                             Ok((blob_node_ids.len() as u64, per_way_rcs))
                         })();
 
                         if tx.send((task.seq, result)).is_err() { break; }
-                    }
-
-                    // Flush + drop BufWriter so Pass B can open the
-                    // scratch file fresh and read a consistent stream.
-                    if let Err(e) = scratch_writer.flush() {
-                        drop(tx.send((
-                            u32::MAX,
-                            Err(format!("pass A scratch flush {scratch_path:?}: {e}")),
-                        )));
                     }
                 });
             }
@@ -331,7 +226,6 @@ pub(super) fn stage1_pass_a(
         crate::debug::emit_counter("s1a_pread_ms", s1a_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_decompress_ms", s1a_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_scan_way_refs_ms", s1a_scan_way_refs_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1a_scratch_bytes", s1a_scratch_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_idset_set_ms", s1a_idset_set_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_bytes_read", s1a_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_pread_calls", s1a_pread_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
@@ -422,6 +316,8 @@ pub(super) fn stage1_way_pass(
     ref_count_sidecar: &Path,
     per_way_refcount_sidecar: &Path,
 ) -> Result<Stage1Output> {
+    use std::os::unix::fs::FileExt as _;
+
     let schedule = build_way_schedule(blob_meta)?;
 
     let num_workers = std::thread::available_parallelism()
@@ -430,32 +326,33 @@ pub(super) fn stage1_way_pass(
 
     let (total_refs, node_id_set) = stage1_pass_a(
         input, &schedule, num_workers, ref_count_sidecar, per_way_refcount_sidecar,
-        scratch,
     )?;
     let unique_nodes_u64 = node_id_set.total_count();
+
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+    );
 
     // Load sidecar prefix sums for slot_pos computation in pass B.
     let slot_starts = super::stage4::load_ref_count_sidecar(ref_count_sidecar, total_refs)?;
 
     // ---- Pass B: emit rank-bucketed (local_rank, slot_pos) records ----
-    //
-    // Item #3: Pass B no longer re-preads + re-decompresses the input
-    // PBF. Each worker reads its own `nodeids-W{worker_id}` scratch
-    // file streamed by Pass A (absolute varints: [blob_seq] [ref_count]
-    // [N ID varints], looped to EOF) via BufReader, then does the same
-    // rank lookup + shard-emit work as before. Saves one full zlib
-    // decompression + protobuf parse of all way blobs.
     crate::debug::emit_marker("EXTJOIN_S1_PASS_B_START");
 
-    let s1b_scratch_read_ms = std::sync::atomic::AtomicU64::new(0);
+    let s1b_pread_ms = std::sync::atomic::AtomicU64::new(0);
+    let s1b_decompress_ms = std::sync::atomic::AtomicU64::new(0);
+    let s1b_scan_ms = std::sync::atomic::AtomicU64::new(0);
     let s1b_rank_ms = std::sync::atomic::AtomicU64::new(0);
     let s1b_encode_write_ms = std::sync::atomic::AtomicU64::new(0);
     let s1b_flush_ms = std::sync::atomic::AtomicU64::new(0);
     let s1b_refs_total = std::sync::atomic::AtomicU64::new(0);
     let s1b_bytes_written = std::sync::atomic::AtomicU64::new(0);
-    let s1b_scratch_bytes_read = std::sync::atomic::AtomicU64::new(0);
+    let s1b_bytes_read = std::sync::atomic::AtomicU64::new(0);
     let s1b_shard_write_calls = std::sync::atomic::AtomicU64::new(0);
-    let s1b_blobs_processed = std::sync::atomic::AtomicU64::new(0);
+    let s1b_pread_calls = std::sync::atomic::AtomicU64::new(0);
+
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
 
     let worker_counts: std::sync::Mutex<Vec<Vec<u64>>> = std::sync::Mutex::new(Vec::new());
     let actual_num_workers: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -463,24 +360,28 @@ pub(super) fn stage1_way_pass(
     let pass_b_error: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
     {
+        let schedule_ref = &schedule;
+        let next_ref = &next_idx;
         let node_id_set_ref = &node_id_set;
         let slot_starts_ref = &slot_starts;
         let worker_counts_ref = &worker_counts;
         let actual_ref = &actual_num_workers;
-        let s1b_scratch_read_ref = &s1b_scratch_read_ms;
+        let s1b_pread_ref = &s1b_pread_ms;
+        let s1b_decompress_ref = &s1b_decompress_ms;
+        let s1b_scan_ref = &s1b_scan_ms;
         let s1b_rank_ref = &s1b_rank_ms;
         let s1b_encode_write_ref = &s1b_encode_write_ms;
         let s1b_flush_ref = &s1b_flush_ms;
         let s1b_refs_total_ref = &s1b_refs_total;
         let s1b_bytes_written_ref = &s1b_bytes_written;
-        let s1b_scratch_bytes_read_ref = &s1b_scratch_bytes_read;
+        let s1b_bytes_read_ref = &s1b_bytes_read;
         let s1b_shard_write_calls_ref = &s1b_shard_write_calls;
-        let s1b_blobs_processed_ref = &s1b_blobs_processed;
+        let s1b_pread_calls_ref = &s1b_pread_calls;
         let err_ref = &pass_b_error;
 
         std::thread::scope(|scope| -> Result<()> {
             for worker_id in 0..num_workers {
-                let scratch_path = nodeids_scratch_path(scratch, worker_id);
+                let file = std::sync::Arc::clone(&shared_file);
                 scope.spawn(move || {
                     use std::sync::atomic::Ordering::Relaxed;
 
@@ -503,95 +404,49 @@ pub(super) fn stage1_way_pass(
                         )));
                     }
 
-                    // Open this worker's Pass A scratch for sequential
-                    // reading. Workers only read their own scratch, so
-                    // there is no cross-worker contention.
-                    let scratch_file = match std::fs::File::open(&scratch_path) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                Some(format!(
-                                    "pass B scratch open {}: {e}",
-                                    scratch_path.display()
-                                ));
-                            return;
-                        }
-                    };
-                    let mut scratch_reader =
-                        BufReader::with_capacity(256 * 1024, scratch_file);
-
+                    let mut read_buf: Vec<u8> = Vec::new();
+                    let mut decompress_buf: Vec<u8> = Vec::new();
+                    let mut refs_buf: Vec<i64> = Vec::new();
+                    let mut group_starts: Vec<(usize, usize)> = Vec::new();
                     let mut rec_buf = [0u8; RANK_RECORD_SIZE];
-                    let mut blob_node_ids: Vec<i64> = Vec::new();
-                    let mut payload_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
-                    let mut header_buf = [0u8; SCRATCH_BLOB_HEADER_LEN];
 
                     loop {
                         if err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
                             break;
                         }
-
-                        let t_read = std::time::Instant::now();
-                        // Read fixed 12-byte header. A read of 0 bytes
-                        // is clean EOF; a partial read is a truncation
-                        // error.
-                        use std::io::Read as _;
-                        match scratch_reader.read(&mut header_buf) {
-                            Ok(0) => break, // clean EOF
-                            Ok(SCRATCH_BLOB_HEADER_LEN) => {}
-                            Ok(partial) => {
-                                // Grab the rest of the header; the
-                                // normal case is `read` returns the
-                                // whole 12 bytes on the first call
-                                // because BufReader's internal buffer
-                                // is > 12 bytes. But we may be at the
-                                // exact boundary where only the first
-                                // N bytes were available; read_exact
-                                // handles that.
-                                if let Err(e) =
-                                    scratch_reader.read_exact(&mut header_buf[partial..])
-                                {
-                                    *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                        Some(format!("pass B scratch read header tail: {e}"));
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                    Some(format!("pass B scratch read header: {e}"));
-                                break;
-                            }
-                        }
-                        let header = ScratchBlobHeader::read_from(&header_buf);
-                        let blob_seq = header.blob_seq;
-                        let ref_count = header.ref_count;
-                        let payload_bytes = header.payload_bytes as usize;
+                        let idx = next_ref.fetch_add(1, Relaxed);
+                        if idx >= schedule_ref.len() { break; }
+                        let task = &schedule_ref[idx];
 
                         let blob_result: std::result::Result<(), String> = (|| {
-                            payload_buf.resize(payload_bytes, 0);
-                            scratch_reader
-                                .read_exact(&mut payload_buf)
-                                .map_err(|e| {
-                                    format!("pass B scratch read payload blob {blob_seq}: {e}")
-                                })?;
-                            blob_node_ids.clear();
-                            blob_node_ids.reserve(ref_count as usize);
-                            let mut cur = protohoggr::Cursor::new(&payload_buf);
-                            for _ in 0..ref_count {
-                                let v = cur.read_varint().map_err(|e| {
-                                    format!("pass B varint decode blob {blob_seq}: {e}")
-                                })?;
-                                #[allow(clippy::cast_possible_wrap)]
-                                blob_node_ids.push(v as i64);
-                            }
+                            let t0 = std::time::Instant::now();
+                            read_buf.resize(task.data_size, 0);
+                            file.read_exact_at(&mut read_buf, task.data_offset)
+                                .map_err(|e| format!("pass B pread: {e}"))?;
                             #[allow(clippy::cast_possible_truncation)]
-                            s1b_scratch_read_ref
-                                .fetch_add(t_read.elapsed().as_millis() as u64, Relaxed);
-                            s1b_scratch_bytes_read_ref
-                                .fetch_add((SCRATCH_BLOB_HEADER_LEN + payload_bytes) as u64, Relaxed);
+                            s1b_pread_ref.fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
+                            s1b_bytes_read_ref.fetch_add(task.data_size as u64, Relaxed);
+                            s1b_pread_calls_ref.fetch_add(1, Relaxed);
 
-                            let slot_start = slot_starts_ref[blob_seq as usize];
-                            s1b_refs_total_ref.fetch_add(blob_node_ids.len() as u64, Relaxed);
-                            s1b_blobs_processed_ref.fetch_add(1, Relaxed);
+                            let t1 = std::time::Instant::now();
+                            crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
+                                .map_err(|e| format!("pass B decompress: {e}"))?;
+                            #[allow(clippy::cast_possible_truncation)]
+                            s1b_decompress_ref.fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
+
+                            let t2 = std::time::Instant::now();
+                            let slot_start = slot_starts_ref[task.seq as usize];
+                            let mut blob_node_ids: Vec<i64> = Vec::new();
+                            crate::scan::way::scan_way_refs(
+                                &decompress_buf, &mut refs_buf, &mut group_starts,
+                                |_way_id, refs| {
+                                    blob_node_ids.extend_from_slice(refs);
+                                },
+                            ).map_err(|e| e.to_string())?;
+                            #[allow(clippy::cast_possible_truncation)]
+                            s1b_scan_ref.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
+                            let blob_ref_count = blob_node_ids.len() as u64;
+                            s1b_refs_total_ref.fetch_add(blob_ref_count, Relaxed);
 
                             let t3 = std::time::Instant::now();
                             let rank_range = unique_nodes_u64.div_ceil(NUM_BUCKETS as u64);
@@ -680,28 +535,21 @@ pub(super) fn stage1_way_pass(
 
     #[allow(clippy::cast_possible_wrap)]
     {
-        crate::debug::emit_counter("s1b_scratch_read_ms", s1b_scratch_read_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s1b_pread_ms", s1b_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s1b_decompress_ms", s1b_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s1b_scan_ms", s1b_scan_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1b_rank_ms", s1b_rank_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1b_encode_write_ms", s1b_encode_write_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1b_flush_ms", s1b_flush_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1b_refs_total", s1b_refs_total.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1b_bytes_written", s1b_bytes_written.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1b_scratch_bytes_read", s1b_scratch_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s1b_bytes_read", s1b_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1b_shard_write_calls", s1b_shard_write_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1b_blobs_processed", s1b_blobs_processed.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s1b_pread_calls", s1b_pread_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1b_blobs", schedule.len() as i64);
         crate::debug::emit_counter("s1b_actual_workers", num_actual_workers as i64);
     }
     crate::debug::emit_marker("EXTJOIN_S1_PASS_B_END");
-
-    // Remove Pass A -> Pass B scratch files - large on planet (~50 GB
-    // per run) and only live for the duration of Pass B. fadvise-dontneed
-    // on close via remove_file lets the kernel reclaim page cache so
-    // stage 2 doesn't compete with leftover scratch residency.
-    for worker_id in 0..num_workers {
-        let path = nodeids_scratch_path(scratch, worker_id);
-        drop(std::fs::remove_file(&path));
-    }
 
     // Build the per-blob rank mapping (header-only walk + rank queries -
     // no decompression).

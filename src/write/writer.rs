@@ -159,6 +159,65 @@ impl PbfWriter<FileWriter> {
         })
     }
 
+    /// Create a pipelined `PbfWriter` that fans disk writes out across
+    /// a pool of pwrite-based worker threads on one shared file
+    /// descriptor.
+    ///
+    /// Suited to the production `--compression none` + zstd:1 case
+    /// where the single-threaded writer is the observed ceiling even
+    /// with `--io-uring` (~1.49 GB/s of ~5 GB/s NVMe peak). The
+    /// writer-thread still reorders items in global seq order; each
+    /// WriteOp carries its final offset so pool workers run
+    /// `pwrite` / `copy_file_range(out_offset)` independently.
+    pub fn to_path_parallel(
+        path: &Path,
+        compression: Compression,
+        header_block_bytes: &[u8],
+    ) -> io::Result<Self> {
+        use crate::write::parallel_writer;
+
+        let framed_header = frame_blob("OSMHeader", header_block_bytes, &compression, None)?;
+
+        let (init_tx, init_rx) = sync_channel(1);
+        let (tx, rx) = sync_channel(WRITE_AHEAD);
+        let path_owned = path.to_path_buf();
+        let handle = std::thread::spawn(move || {
+            parallel_writer::parallel_writer_thread(rx, path_owned, framed_header, init_tx)
+        });
+
+        // Propagate init errors eagerly - mirrors to_path_uring.
+        match init_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                drop(tx);
+                drop(handle.join());
+                return Err(e);
+            }
+            Err(_) => {
+                drop(tx);
+                return Err(match handle.join() {
+                    Ok(Ok(())) => io::Error::other("parallel writer thread exited without init signal"),
+                    Ok(Err(e)) => e,
+                    Err(_) => io::Error::other("parallel writer thread panicked during init"),
+                });
+            }
+        }
+
+        let (permit_tx, permit_rx) = new_permit_pool();
+        Ok(PbfWriter {
+            writer: None,
+            compression,
+            pipeline: Some(WritePipeline {
+                tx,
+                seq: 0,
+                join_handle: Some(handle),
+                permit_tx,
+                permit_rx,
+            }),
+            scratch: FrameScratch::new(),
+        })
+    }
+
     /// Shared pipelined setup: write header, spawn writer thread.
     fn start_pipeline(
         mut writer: FileWriter,

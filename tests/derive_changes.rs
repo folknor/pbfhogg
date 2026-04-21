@@ -288,7 +288,7 @@ fn roundtrip_with_merge() {
     // Apply changes back to old → should produce equivalent of new
     merge(&old, &osc, &result, &MergeOptions {
         compression: pbfhogg::writer::Compression::default(),
-        direct_io: false, io_uring: false, force: true, locations_on_ways: false,
+        direct_io: false, io_uring: false, force: true, locations_on_ways: false, parallel_writer: false,
     }, &pbfhogg::HeaderOverrides::default()).expect("merge");
 
     let result_contents = read_all_elements(&result);

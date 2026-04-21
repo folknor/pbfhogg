@@ -463,6 +463,11 @@ enum Command {
         io: DirectIoArg,
         #[command(flatten)]
         uring: UringArg,
+        /// Use the parallel writer: one coordinator thread + N pwrite
+        /// workers on a shared file descriptor. Mutually exclusive with
+        /// --direct-io and --io-uring.
+        #[arg(long)]
+        parallel_writer: bool,
         #[command(flatten)]
         force: ForceArg,
         /// Preserve and update way-node locations through the merge.
@@ -1085,6 +1090,7 @@ fn main() -> process::ExitCode {
             force,
             io,
             uring,
+            parallel_writer,
             locations_on_ways,
             header,
         } => run_apply_changes(
@@ -1094,6 +1100,7 @@ fn main() -> process::ExitCode {
             &compression.compression,
             io.direct_io,
             uring.io_uring,
+            parallel_writer,
             force.force,
             locations_on_ways,
             &HeaderOverrides::parse(header.generator, &header.output_headers)?,
@@ -2264,6 +2271,7 @@ fn run_inspect(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn run_apply_changes(
     base: &std::path::Path,
     changes: &std::path::Path,
@@ -2271,6 +2279,7 @@ fn run_apply_changes(
     compression: &str,
     direct_io: bool,
     io_uring: bool,
+    parallel_writer: bool,
     force: bool,
     locations_on_ways: bool,
     overrides: &HeaderOverrides,
@@ -2282,6 +2291,7 @@ fn run_apply_changes(
         io_uring,
         force,
         locations_on_ways,
+        parallel_writer,
     };
     let stats = pbfhogg::apply_changes::merge(base, changes, output, &opts, overrides)?;
     stats.print_summary();
@@ -2578,6 +2588,7 @@ fn run_bench_merge(
         io_uring,
         force: true,
         locations_on_ways: false,
+        parallel_writer: false,
     };
     let stats = pbfhogg::apply_changes::merge(base, changes, output, &opts, &HeaderOverrides::default())?;
     let elapsed_ms = start.elapsed().as_millis();

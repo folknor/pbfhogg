@@ -384,6 +384,30 @@ pub(crate) fn writer_from_header_bytes(
     }
 }
 
+/// Variant of [`writer_from_header_bytes`] that takes the parallel
+/// writer flag. apply-changes uses this when `--parallel-writer` is
+/// set; other commands keep the existing two-bool API.
+pub(crate) fn writer_from_header_bytes_with_parallel(
+    output: &Path,
+    compression: Compression,
+    header_bytes: &[u8],
+    direct_io: bool,
+    io_uring: bool,
+    parallel_writer: bool,
+) -> Result<PbfWriter<FileWriter>> {
+    if parallel_writer {
+        if direct_io || io_uring {
+            return Err(
+                "--parallel-writer is not currently combinable with --direct-io or --io-uring"
+                    .into(),
+            );
+        }
+        Ok(PbfWriter::to_path_parallel(output, compression, header_bytes)?)
+    } else {
+        writer_from_header_bytes(output, compression, header_bytes, direct_io, io_uring)
+    }
+}
+
 /// Map Osmosis sentinel -1 to 0 (protobuf default for absent) in dense node
 /// Apply per-attribute cleaning to metadata. Returns `None` if all attributes
 /// are cleaned or if the input has no metadata.

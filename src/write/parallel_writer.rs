@@ -91,6 +91,20 @@ pub(crate) fn parallel_writer_thread(
     framed_header: Vec<u8>,
     init_tx: SyncSender<io::Result<()>>,
 ) -> io::Result<()> {
+    let result = parallel_writer_thread_inner(rx, path, framed_header, init_tx);
+    if let Err(ref e) = result {
+        eprintln!("[parallel_writer] thread exit: {e}");
+    }
+    result
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn parallel_writer_thread_inner(
+    rx: Receiver<PipelineItem>,
+    path: PathBuf,
+    framed_header: Vec<u8>,
+    init_tx: SyncSender<io::Result<()>>,
+) -> io::Result<()> {
     let file = match File::create(&path) {
         Ok(f) => f,
         Err(e) => {
@@ -344,7 +358,22 @@ fn copy_range_to_fd(
             )
         };
         if ret < 0 {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EXDEV) {
+                // Cross-device copy: kernel-side splice isn't available
+                // between the source and target filesystems. Fall back
+                // to pread → pwrite in userspace for the remaining
+                // range, using explicit offsets so parallel workers
+                // don't race on the output fd's position.
+                return copy_range_fallback_pwrite(
+                    out,
+                    in_fd,
+                    src_offset,
+                    out_offset,
+                    remaining,
+                );
+            }
+            return Err(err);
         }
         if ret == 0 {
             return Err(io::Error::new(
@@ -358,6 +387,44 @@ fn copy_range_to_fd(
         src_offset += advanced;
         out_offset += advanced;
         remaining -= advanced;
+    }
+    Ok(())
+}
+
+/// Cross-device copy fallback using `pread` + `pwrite` with explicit
+/// offsets. Safe to call concurrently from pool workers because
+/// `pwrite` doesn't touch the fd's file position.
+#[cfg(feature = "linux-direct-io")]
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+fn copy_range_fallback_pwrite(
+    out: &File,
+    in_fd: RawFd,
+    mut src_offset: u64,
+    mut out_offset: u64,
+    mut remaining: u64,
+) -> io::Result<()> {
+    let mut buf = vec![0u8; 256 * 1024];
+    while remaining > 0 {
+        let chunk = buf.len().min(remaining as usize);
+        let n = unsafe {
+            libc::pread(in_fd, buf.as_mut_ptr().cast(), chunk, src_offset as i64)
+        };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "pread returned 0 during cross-device copy",
+            ));
+        }
+        let n_u = usize::try_from(n).map_err(|_| {
+            io::Error::other("pread returned negative")
+        })?;
+        out.write_all_at(&buf[..n_u], out_offset)?;
+        src_offset += n_u as u64;
+        out_offset += n_u as u64;
+        remaining -= n_u as u64;
     }
     Ok(())
 }

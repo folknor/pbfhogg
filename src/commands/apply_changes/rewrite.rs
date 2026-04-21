@@ -13,7 +13,8 @@ use crate::osc::parse_osc_file;
 use crate::writer::Compression;
 
 use crate::commands::{
-    build_output_header, require_indexdata, writer_from_header_bytes, HeaderOverrides,
+    build_output_header, require_indexdata, writer_from_header_bytes_with_parallel,
+    HeaderOverrides,
 };
 use crate::read::raw_frame::read_raw_frame;
 
@@ -42,13 +43,16 @@ const DRAIN_CHANNEL_CAPACITY: usize = 256;
 /// workers fed during scanner pauses.
 const CANDIDATE_CHANNEL_CAPACITY: usize = 64;
 
-/// Public command options - unchanged signature so the CLI stays as-is.
+/// Public command options.
 pub struct MergeOptions {
     pub compression: Compression,
     pub direct_io: bool,
     pub io_uring: bool,
     pub force: bool,
     pub locations_on_ways: bool,
+    /// Enable the experimental parallel writer (plan item #17).
+    /// Mutually exclusive with `direct_io` and `io_uring` for now.
+    pub parallel_writer: bool,
 }
 
 #[allow(clippy::redundant_closure_for_method_calls)]
@@ -130,7 +134,14 @@ pub fn merge(
     opts: &MergeOptions,
     overrides: &HeaderOverrides,
 ) -> Result<MergeStats> {
-    let MergeOptions { compression, direct_io, io_uring, force, locations_on_ways } = *opts;
+    let MergeOptions {
+        compression,
+        direct_io,
+        io_uring,
+        force,
+        locations_on_ways,
+        parallel_writer,
+    } = *opts;
     require_indexdata(
         base_pbf,
         direct_io,
@@ -189,8 +200,14 @@ pub fn merge(
     let header_read_ms = header_start.elapsed().as_millis().try_into().unwrap_or(i64::MAX);
 
     let writer_setup_start = std::time::Instant::now();
-    let mut writer =
-        writer_from_header_bytes(output_pbf, compression, &header_bytes, direct_io, io_uring)?;
+    let mut writer = writer_from_header_bytes_with_parallel(
+        output_pbf,
+        compression,
+        &header_bytes,
+        direct_io,
+        io_uring,
+        parallel_writer,
+    )?;
     let writer_setup_ms = writer_setup_start.elapsed().as_millis().try_into().unwrap_or(i64::MAX);
 
     // copy_file_range fd setup. Mirrors the legacy path so direct-io

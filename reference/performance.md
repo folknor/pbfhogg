@@ -134,7 +134,7 @@ more blobs reach the precise `block_overlaps_diff` check (which decodes all
 elements to test IDs against the diff). Skipping metadata decode saves ~1s
 across ~11K precise-check invocations.
 
-### Descriptor-first streaming pipeline (P1 + P1.5 + parallel-writer, 2026-04-21, commits `719f306` → `80b37df`)
+### Descriptor-first streaming pipeline (P1 + P1.5 + parallel pwrite, 2026-04-21, commits `719f306` → `80b37df`)
 
 Three-stage pipeline replacing the per-batch rayon barrier:
 
@@ -156,7 +156,11 @@ Planet LOW altw + OSC 4913, `--bench 1`, plantasjen (source on
 Banan/nvme1n1; cross-disk scratch on Booty/nvme0n1p3 for the
 separate-drives experiment):
 
-| Config | Buffered | `--io-uring` | `--parallel-writer` (POOL_SIZE=16) |
+Parallel pwrite is now the default writer backend for `apply-changes`
+(buffered fallback removed from that path on 2026-04-21); the columns
+below show the three backends as measured during the decision.
+
+| Config | Buffered (removed) | `--io-uring` | Parallel pwrite (default, POOL_SIZE=16) |
 |---|---:|---:|---:|
 | Same-disk, `--compression none` | 135.5 s | 108.6 s | 116.0 s |
 | Same-disk, `--compression zlib:6` | 143.7 s | 137.1 s | 140.8 s |
@@ -166,20 +170,22 @@ separate-drives experiment):
 | Cross-disk, `--compression zstd:1` | 87.1 s | 82.8 s | **80.9 s** |
 
 Pre-flip baseline (commit `52c2c4b`, UUID `e81a9316`): 144.4 s.
-Best post-flip: **80.9 s** (-44 %) at zstd:1 + cross-disk +
-`--parallel-writer`.
+Best post-flip: **80.9 s** (-44 %) at zstd:1 + cross-disk + parallel
+pwrite.
 
-Writer-backend rule:
+Writer-backend rule (the reasoning that landed parallel pwrite as the
+default, with `--io-uring` kept as an opt-in override for IOPS-bound
+topologies):
 
 - **Same-disk**: `--io-uring` wins at every compression level. Same-disk
   is IOPS-bound (reads compete with writes on one NVMe); io_uring's
   queue-depth batching alleviates contention more than multiple
   per-syscall pwrites.
-- **Cross-disk** + zstd:1 / zlib:6: `--parallel-writer` wins (80.9 s
-  at zstd:1, 117.4 s at zlib:6). Disk has write bandwidth headroom;
+- **Cross-disk** + zstd:1 / zlib:6: parallel pwrite wins (80.9 s at
+  zstd:1, 117.4 s at zlib:6). Disk has write bandwidth headroom;
   parallel pwrite saturates it faster than a single-thread writer can.
-  Compressed-output rule: cross-disk favours `--parallel-writer` at
-  every compressed level measured.
+  Compressed-output rule: cross-disk favours parallel pwrite at every
+  compressed level measured.
 - **Cross-disk** + `--compression none`: `--io-uring` wins. The 119 GB
   output is close enough to NVMe peak that queue-depth tuning beats
   per-syscall parallelism.

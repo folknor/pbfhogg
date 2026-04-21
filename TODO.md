@@ -2,7 +2,9 @@
 
 ## Active optimization plans (high priority)
 
-Four planet-scale command plans are in notes, each with a ranked set of opportunities and a plan of attack. Read the plan before touching the command.
+Five planet-scale command plans are in notes, each with a ranked set of opportunities and a plan of attack. Read the plan before touching the command.
+
+- [ ] **[notes/merge-changes.md](notes/merge-changes.md)** - `merge-changes` (squash N OSCs → 1). **Unmeasured at planet scale.** Two serial-across-inputs shapes (`merge_changes::write_streaming` at CLI level, `osc::load_all_diffs` at library level) parallelize cleanly via `IdSetDense::set_atomic_if_new` newer-wins dedupe; estimated ~20-30 s saved at 7-OSC planet per reviewer Q7 speculation, unconfirmed until a baseline exists. No win at 1-OSC scale. Prerequisites before shipping: (1) run `brokkr merge-changes --dataset planet --osc-range 4914..4920 --bench 1` to store a wall + RSS baseline in `.brokkr/results.db`; (2) add per-input `MERGE_CHANGES_PARSE_START/END` markers so parallel-parse can be compared against the per-OSC share of serial wall; (3) confirm `load_all_diffs` call-site scope (only `merge-changes` + `apply-changes` today?). Content factored out of `apply-changes-opportunities.md` 2026-04-21 - these items were filed under "weekly apply-changes" but apply scale-independently to any consumer that squashes N > 1 OSCs.
 
 - [x] ~~**[notes/altw-as-renumber.md](notes/altw-as-renumber.md)**~~ - **EXPERIMENT FAILED (2026-04-16).** Implemented as `src/commands/altw_v2.rs`, OOM-killed at Europe. Measured unique-referenced count was 3.6 B → 29 GB coord table (plan estimated 2 B / 16 GB at planet; real planet ~10 B / ~80 GB). The in-RAM-coord-table thesis is disproven for Europe+; the existing 4-stage external-sort shape is load-bearing and correct. See the plan document's top-of-file notice for the post-mortem. **Active ALTW work moves to** [notes/altw-structural-reports.md](notes/altw-structural-reports.md) **(specific-seam items).**
 
@@ -19,7 +21,6 @@ Four planet-scale command plans are in notes, each with a ranked set of opportun
 - [ ] **[notes/altw-structural-reports.md](notes/altw-structural-reports.md)** - `add-locations-to-ways --index-type external`. Current planet baseline: **661.2 s `--bench 3`** (UUID `a406d77e`, commit `aee7727`, 2026-04-18 post-regression-fix). Europe **291.6 s** after metadata-driven relation scan (`6d71053`). Doc consolidates six independent reviews into 11 ranked opportunities. Dominant theme: the stage 2 → stage 3 → stage 4 disk-seam chain, with ~80 GB rank shards + ~112 GB slot buckets + finalize. Stage-2 de-ranking and `BlobLocationRouter` already shipped (Europe 320.5 s → 291.6 s total). Measurement history + already-shipped context in [`notes/altw-optimization-history.md`](notes/altw-optimization-history.md); the failed in-RAM-coord-table reshape experiment is documented at [`notes/altw-as-renumber.md`](notes/altw-as-renumber.md) and does not invalidate the remaining ranked items.
 
   **Apply-changes work that might transfer (speculative, 2026-04-21, no deep ALTW research):**
-  - **`--parallel-writer` backend wiring.** Apply-changes landed it as a new writer backend (16-thread pwrite pool on shared fd). Best-guess transfer cost is small (CLI flag + threading through ALTW's Stage 4 PbfWriter setup), expected win 5-15% at planet *if* ALTW Stage 4's writer is currently the visible ceiling. Conditional on profiling Stage 4's `writer_pipeline_send_wait_ns` - if it's already low, the win evaporates.
   - **Worker-emits-framed-bytes (P1.5 pattern).** If ALTW Stage 4 still dispatches framing via `rayon::spawn` per output block and funnels through `write_primitive_block_owned`, moving framing inline into the worker (call `frame_blob_pipelined` directly, ship the framed `Vec<u8>` to the writer thread via `write_raw_owned`) would save the same `writer_pipeline_send_wait_ns` we shaved in apply-changes (-86% at planet `--compression none`). Pattern transfers cleanly; trigger is whether that counter is large in ALTW.
   - **Cross-disk scratch (no code, pure config).** Apply-changes planet dropped 31% just by moving bench output to a different physical NVMe (single-NVMe read+write contention removed). Worth a single `brokkr.toml` edit + bench to see if ALTW's 661 s shows similar shape - if so, it's an immediate runtime recommendation rather than code work.
   - **`zstd:1` for internal pipelines.** Already documented in apply-changes plan doc and in the ALTW notes (`notes/altw-optimization-history.md` mentions `--compression zstd:1` Europe 419 s → 379 s, -9.5%). Confirmed the same mechanism in apply-changes (workers parallelize zstd cheaply; smaller bytes → less writer wall). Should lift to ALTW Stage 4's writer config without changes.
@@ -34,7 +35,7 @@ Four planet-scale command plans are in notes, each with a ranked set of opportun
   - **`copy_file_range` coalescing** (apply-changes drain *ported from* `altw/passthrough.rs`, so the flow direction already ran).
   - **`IdSetDense::set_atomic_if_new`** primitive (used by both for parallel set-membership).
 
-  Rough prioritization if a day were available: cross-disk bench first (10 min, tells us where the ALTW ceiling actually lives), then `--parallel-writer` + worker-framed-bytes if Stage 4 is writer-bound.
+  Rough prioritization if a day were available: cross-disk bench first (10 min, tells us where the ALTW ceiling actually lives), then worker-framed-bytes if Stage 4 is writer-bound.
 
 Measurement-first on every one: turn on `#[cfg(feature = "hotpath")]` counters (or add unconditional `*_ms` counters) to ground-truth the inferred per-phase breakdowns before committing to the order of landing items within a plan.
 
@@ -74,9 +75,17 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
 
 ## Next up (2026-04-13)
 
-- [ ] **`--allow-missing` for apply-changes** - the single prerequisite
-  for incremental extract (~10s vs 862s). Insert new elements that
-  don't exist in the base PBF, then re-extract to filter to bbox.
+- [x] ~~**`--allow-missing` for apply-changes**~~ - **not needed (2026-04-21).**
+  Audit confirmed every missing-element case is already tolerated silently:
+  modify-on-missing inserts, delete-on-missing is a no-op, create-on-existing
+  overwrites, and way/relation refs to absent nodes get `(0, 0)` under
+  `--locations-on-ways` with a `loc_missing` counter in the summary.
+  Documented in
+  [DEVIATIONS.md](DEVIATIONS.md#apply-changes-permissive-missing-element-semantics);
+  three new invariants in `tests/apply_changes_invariants.rs` pin the
+  behaviour. Incremental extract works against current `apply-changes`
+  with no flag. The related stretch item below ("Incremental extract
+  update") is already unblocked.
 
 ## Performance
 
@@ -476,8 +485,9 @@ per-iteration allocations remain across the codebase, ordered by impact:
 - [ ] Incremental extract update (`extract --apply-changes` - base extract + OSC +
   region → updated extract without re-reading planet).
   Recommended: compose two existing commands - `apply-changes` on
-  the region extract (with `--allow-missing` for new elements not in
-  the base), then `extract` to re-filter to the bbox. ~10s vs 862s
+  the region extract (current apply-changes already tolerates OSC ops
+  referencing elements outside the region; see DEVIATIONS.md), then
+  `extract` to re-filter to the bbox. ~10s vs 862s
   for the full-planet pipeline. Works for simple strategy immediately.
   Complete/smart strategies need planet access for newly referenced
   elements outside the bbox.

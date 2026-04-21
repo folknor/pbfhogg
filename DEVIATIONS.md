@@ -38,6 +38,54 @@ forces every user to discover and pass `--ignore-missing-nodes`, which is the
 right behavior in virtually all cases. The substituted `(0, 0)` is consistent
 with the Null Island sentinel used by `DenseMmapIndex` (see CORRECTNESS.md).
 
+## apply-changes: permissive missing-element semantics
+
+**osmium behavior:** `osmium apply-changes` validates that OSC operations
+reference elements consistent with the base PBF. Modify on an absent ID and
+way refs to absent nodes are user-facing errors unless explicitly overridden.
+
+**pbfhogg behavior:** Every missing-element case is tolerated silently. No
+flag needed.
+
+| OSC op | Element state in base | pbfhogg outcome |
+|---|---|---|
+| `<create>` on existing ID | present | Silent overwrite (treated as modify). Base record is replaced with the OSC record. |
+| `<modify>` on absent ID | absent | Silent insert (treated as create). OSC record is written. |
+| `<delete>` on absent ID | absent | Silent no-op. |
+| way/relation ref to absent node | absent from base AND from OSC | Under `--locations-on-ways`: `(0, 0)` sentinel coord and the `loc_missing` counter in the summary increments. Without `--locations-on-ways`: the ref is written bare, no coordinate lookup attempted. |
+
+**Rationale:** Identical to the ALTW entry above. The motivating
+workload is incremental-extract - region-extracted base PBF plus a
+full-planet daily OSC, then re-extract by bbox. Such pipelines
+routinely reference OSC elements (nodes outside the region, ways
+whose refs extend outside the region) that are not in the base.
+Failing by default would force every such user to discover and pass
+an opt-out flag, which is the right behavior in virtually all cases.
+
+The `(0, 0)` coordinate sentinel under `--locations-on-ways` is
+consistent with the Null Island convention used elsewhere in the
+codebase (see CORRECTNESS.md "Null Island ambiguity in dense mmap
+index"); ways referencing nodes exactly at Null Island are
+indistinguishable from ways referencing absent nodes. This affects
+zero real-world nodes (nearest land ~570 km).
+
+**Implementation:** Upsert semantics are anchored in
+`src/commands/apply_changes/rewrite_block.rs` (the walker treats
+`diff.get_node/way/relation(id)` hits as replacements regardless of
+whether the ID was in base). Delete no-ops arise naturally - the
+`deleted_nodes` / `deleted_ways` / `deleted_relations` sets are only
+consulted while walking base elements, so a delete of an absent ID
+has nothing to skip. The `(0, 0)` fallback under
+`--locations-on-ways` is at
+`src/commands/apply_changes/element_writes.rs` (search
+`locations.push((0, 0))`); the corresponding counter is
+`MergeStats::loc_missing` in `src/commands/apply_changes/stats.rs`.
+
+**Test coverage:** `tests/apply_changes_invariants.rs` pins the
+three non-ALTW scenarios (create-on-existing, modify-on-missing,
+delete-on-missing). The ALTW `(0, 0)` fallback is covered by the
+Denmark byte-equal cross-validation against osmium.
+
 ## diff: content equality vs version ordering
 
 **osmium behavior:** Uses version/timestamp ordering to determine which element is

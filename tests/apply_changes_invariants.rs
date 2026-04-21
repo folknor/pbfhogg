@@ -353,6 +353,133 @@ fn trailing_creates_after_node_blob_flush_way_and_relation() {
     assert_eq!(c.relations.iter().map(|r| r.0).collect::<Vec<_>>(), vec![1000]);
 }
 
+// ---------------------------------------------------------------------------
+// Permissive missing-element semantics (see DEVIATIONS.md):
+// - <modify> on absent ID silently inserts
+// - <delete> on absent ID is a silent no-op
+// - <create> on existing ID silently overwrites
+// These tests pin the behaviour so any future tightening must be deliberate.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn modify_on_missing_id_silently_inserts() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &base,
+        &[TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![] }],
+        &[],
+        &[],
+    );
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="42" lat="55.0" lon="12.0" version="3"/>
+  </modify>
+</osmChange>"#,
+    );
+
+    run_merge(&base, &osc, &output);
+    let c = read_all_elements(&output);
+
+    let node_ids: Vec<i64> = c.nodes.iter().map(|n| n.0).collect();
+    assert_eq!(
+        node_ids,
+        vec![1, 42],
+        "modify on absent ID is treated as an insert (DEVIATIONS.md: \
+         apply-changes permissive missing-element semantics). If this \
+         changes, update DEVIATIONS.md."
+    );
+}
+
+#[test]
+fn delete_on_missing_id_is_noop() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &base,
+        &[TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![] }],
+        &[],
+        &[],
+    );
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <delete>
+    <node id="42" version="1"/>
+  </delete>
+</osmChange>"#,
+    );
+
+    run_merge(&base, &osc, &output);
+    let c = read_all_elements(&output);
+
+    assert_eq!(
+        c.nodes.iter().map(|n| n.0).collect::<Vec<_>>(),
+        vec![1],
+        "delete on absent ID is a silent no-op (DEVIATIONS.md: \
+         apply-changes permissive missing-element semantics). Base \
+         node 1 untouched; nothing else emitted."
+    );
+    assert!(c.ways.is_empty());
+    assert!(c.relations.is_empty());
+}
+
+#[test]
+fn create_on_existing_id_overwrites_base() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &base,
+        &[TestNode { id: 42, lat: 100_000_000, lon: 100_000_000, tags: vec![] }],
+        &[],
+        &[],
+    );
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <node id="42" lat="20.0" lon="20.0" version="2"/>
+  </create>
+</osmChange>"#,
+    );
+
+    run_merge(&base, &osc, &output);
+    let c = read_all_elements(&output);
+
+    assert_eq!(
+        c.nodes.len(),
+        1,
+        "create on existing ID must not duplicate: exactly one node \
+         with id=42 in output (DEVIATIONS.md: apply-changes permissive \
+         missing-element semantics)."
+    );
+    let n = &c.nodes[0];
+    assert_eq!(n.0, 42);
+    // OSC record wins: lat=20.0deg = 200_000_000 decimicrodegrees.
+    assert_eq!(
+        (n.1, n.2),
+        (200_000_000, 200_000_000),
+        "create on existing ID replaces base record (OSC wins)."
+    );
+}
+
 #[test]
 fn trailing_creates_after_way_blob_flush_relation_only() {
     // Base has node + way blobs. OSC creates a relation only.

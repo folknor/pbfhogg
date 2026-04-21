@@ -26,8 +26,6 @@
 //! Plan doc: `notes/apply-changes-opportunities.md`, "Synthesized design"
 //! section and "Node→way barrier ownership" block.
 
-#![allow(dead_code)]
-
 use std::path::Path;
 use std::sync::mpsc;
 

@@ -1,13 +1,6 @@
 //! Types shared between the scanner, worker pool, and drain actor of the
 //! descriptor-first streaming pipeline.
 //!
-//! These types are consumed by `scanner.rs`, `streaming.rs`, and `drain.rs`
-//! (pending implementation). `#[allow(dead_code)]` at the module level
-//! keeps the scaffold quiet until those modules land; remove it once all
-//! variants and methods are referenced.
-
-#![allow(dead_code)]
-//!
 //! The scanner emits one [`BlobDescriptor`] per OsmData blob via a
 //! [`ScannedBlob`] message, tagging each as either a fast-path passthrough
 //! (bypasses the worker pool entirely - drain receives it directly) or an
@@ -83,43 +76,19 @@ pub(super) enum ScannedBlob {
     Passthrough(BlobDescriptor),
 }
 
-/// Worker output, sent to the drain.
+/// Worker output for the false-positive path. Workers construct
+/// [`DrainItem::Rewritten`] (P1.5: framed inline) and
+/// [`DrainItem::OwnedBytes`] (`--direct-io` passthrough) directly at
+/// send time; only the false-positive descriptor reuses this wrapper
+/// so `into_drain_item` can fold the `BlobDescriptor`'s index/tagdata
+/// fields into a `DrainItem::CopyRange` for the drain's splice path.
 pub(super) enum WorkerOutput {
     /// The blob had a loose range overlap but no element actually matched
-    /// the diff. Emit as passthrough (CopyRange under splice-capable
-    /// backends, OwnedPassthrough under `--direct-io`).
-    ///
-    /// The worker has already decompressed the body to do the precise
+    /// the diff. Worker has already decompressed the body for the precise
     /// check; on splice-capable backends the decompressed bytes are
     /// discarded and the drain re-reads the raw frame via
     /// `copy_file_range`.
     FalsePositive(BlobDescriptor),
-    /// Rewritten blob, with each output block already framed by the
-    /// worker via `frame_blob_pipelined`. Workers carry the framed
-    /// chunks (not raw `OwnedBlock`s) so the drain side is a single
-    /// `write_raw_owned` per chunk and avoids the writer's rayon
-    /// dispatch path (P1.5 mitigation for the writer-pipeline
-    /// backpressure measured at planet).
-    Rewritten {
-        seq: u64,
-        framed_chunks: Vec<Vec<u8>>,
-        kind: ElemKind,
-        id_range: (i64, i64),
-        /// Per-blob `MergeStats` produced by `rewrite_block_parallel`.
-        /// Drain calls `MergeStats::merge_from(&stats)` to fold these
-        /// into the run's accumulator (deleted / diff_* / base_* /
-        /// bytes counters).
-        stats: super::stats::MergeStats,
-    },
-    /// `--direct-io` fallback: worker pread the full frame for a
-    /// passthrough descriptor because `copy_file_range` isn't available.
-    /// Drain writes via `write_raw_owned(frame_bytes)`.
-    OwnedPassthrough {
-        seq: u64,
-        frame_bytes: Vec<u8>,
-        kind: ElemKind,
-        id_range: (i64, i64),
-    },
 }
 
 /// Unified drain input. Arrives from two sources:
@@ -191,9 +160,10 @@ impl BlobDescriptor {
 }
 
 impl WorkerOutput {
-    /// Convert this worker output into a [`DrainItem`] for the unified
-    /// drain stream. False positives become CopyRange (drain splices the
-    /// raw frame); rewrites and direct-io passthroughs map directly.
+    /// Convert the false-positive wrapper into a [`DrainItem::CopyRange`]
+    /// for the unified drain stream. The drain splices the raw frame
+    /// via `copy_file_range`; the descriptor's index/tagdata carry the
+    /// frame boundaries forward.
     pub(super) fn into_drain_item(self) -> DrainItem {
         match self {
             WorkerOutput::FalsePositive(desc) => {
@@ -223,12 +193,6 @@ impl WorkerOutput {
                     index,
                     tagdata: desc.tagdata,
                 }
-            }
-            WorkerOutput::Rewritten { seq, framed_chunks, kind, id_range, stats } => {
-                DrainItem::Rewritten { seq, framed_chunks, kind, id_range, stats }
-            }
-            WorkerOutput::OwnedPassthrough { seq, frame_bytes, kind, id_range } => {
-                DrainItem::OwnedBytes { seq, frame_bytes, kind, id_range }
             }
         }
     }

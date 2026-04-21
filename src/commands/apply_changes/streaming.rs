@@ -31,8 +31,6 @@
 //! Plan doc: `notes/apply-changes-opportunities.md`, "Synthesized design"
 //! → "Worker pool" and "`--direct-io` fallback" sections.
 
-#![allow(dead_code)]
-
 use std::os::unix::fs::FileExt as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};

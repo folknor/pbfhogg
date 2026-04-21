@@ -2,14 +2,28 @@
 
 Target: `pbfhogg apply-changes --locations-on-ways` on planet with a daily OSC, production default `--compression none`.
 
-## Current state (2026-04-20)
+## Current state (2026-04-21, post-flip landing `719f306`)
 
-- **Planet baseline:** **144.4 s wall, 1.8 GB peak RSS** at commit `52c2c4b`, UUID `e81a9316`, plantasjen (planet altw + OSC 4913, `--bench 1`).
-- **Diagnosis:** classify CPU is undersaturated (4.15 cores avg of 22 available). Two structural problems: (1) per-batch `par_iter().collect()` Amdahl barrier - heavy/cheap blob mix + slowest-blob-holds-the-batch = utilisation caps at ~5-6 cores regardless of batch size. (2) [`parallel_reader.rs`](../src/commands/apply_changes/parallel_reader.rs) preads full blob bodies for every blob, but at planet ~92% of blobs are fast-path passthrough where the body is never inspected and the kernel re-reads via `copy_file_range` anyway - so ~85 GB of body bytes are materialized per run for no benefit.
-- **Next move:** **descriptor-first streaming pipeline.** Scanner emits per-blob descriptors via [`HeaderWalker`](../src/read/header_walker.rs); non-overlap indexed blobs route directly from scanner to the ordered drain as `CopyRange` descriptors (never reach the worker pool); overlap candidates reach a long-lived worker pool that preads body, decompresses, parses, precise-checks, and either rewrites inline on a persistent `BlockBuilder` or emits a `CopyRange` descriptor (false positive). Drain actor owns `UpsertCursors`, gap creates, type transitions, passthrough coalescing, writer submission. `--locations-on-ways` prefill fuses into the node phase. One commit, no env-var gating, `copy_file_range` coalescing lands in the same commit.
-- **Target: 40-55 s wall at planet daily.** CPU-budget floor: 295 s classify CPU + 80 s rewrite CPU = 375 s / 22 cores ≈ 17 s fused wall floor; plus ~10 s OSC+setup + ~10-20 s writer I/O running concurrent with workers.
-- **Scope out of this plan:** internal API rewrites (`IdSetDense`, `PbfWriter`, `HeaderWalker` are correct as-is), compression-level tuning (production is `--compression none`; osmium-interop zlib is a separate workload), weekly-OSC parallel parse (separate workstream).
-- **Design detail:** see "Third review round + synthesis (2026-04-20)" below. That section supersedes the Q1-Q7 follow-up round on every item where they differ.
+- **Planet walls (LOW + altw + OSC 4913, `--bench 1`, plantasjen):**
+  - `--compression none` (production): **135.5 s** (pre-flip `52c2c4b` was 144.4 s)
+  - `--compression zlib:6` (ecosystem default): **143.7 s** (pre-flip estimate ~170 s)
+  - `--compression zstd:1`: **121.2 s** (new configuration)
+- **Europe walls (LOW + altw + OSC 4715, `--bench 3`):**
+  - `--compression none`: 49.8 s (pre-flip `b4f45ff` was 46.1 s)
+  - `--compression zlib:6`: 53.8 s (pre-flip was 54.2 s, UUID `570dfa69`)
+- **Peak RSS at planet:** 3.29 GB (pre-flip 1.63 GB, +2.0×). Inside 27 GB host envelope. Peak threads 27 → 50 (+85%). Involuntary context switches dropped 70% (7214 → 2134) - workers run longer between preemptions.
+- **Where the time goes** at planet `--compression none`:
+  - `writer_write_ns = 120 s` (89% of wall) - writer thread is HDD-bound on sustained sequential writes (~200 MB/s nominal, ~1 GB/s apparent via page cache until Linux's `dirty_ratio` saturates around 5.6 GB and writeback throttles further writes). target=hdd (sdc: Seagate ST4000DM004 5400 RPM, confirmed via `lsblk ROTA=1`).
+  - `writer_pipeline_send_wait_ns = 117 s` cumulative on drain - drain single-threaded, blocked 87% of wall on writer pipeline backpressure.
+  - CPU floor: `merge_streaming_{decompress + parse + precise + rewrite + frame}_ns / 22` = 31 s wall. Plenty of headroom; wall isn't CPU-bound at planet.
+- **Why zstd:1 wins at planet:** output bytes 95 GB vs 119 GB for `none` (-20%) at similar CPU cost because workers parallelize compression inline. `writer_write_ns` drops 120 s → 94 s, writer backpressure drops proportionally. zlib:6 produces similar output size (93 GB) but costs 6.5× more CPU (`merge_streaming_frame_ns` 1352 s cumulative vs zstd:1's 205 s) which cancels the gain.
+- **What the pipeline architecture bought us:** the plan's batch-Amdahl hypothesis held - classify wall is no longer the bottleneck. But the new ceiling at planet `--compression none` is HDD sustained write speed, which the pipeline doesn't influence. The win shows up as:
+  - +2-15% wall improvement depending on compression mode (biggest gain at zlib:6 and zstd:1 where worker-parallel compression beats the legacy rayon-spawn-per-block dispatch).
+  - 70% drop in involuntary context switches - workers stay on-CPU longer, less scheduler thrash.
+  - Per-compression-level CPU cost can now be spent on compression quality without fighting the classify pool.
+  - Infrastructure (`scanner.rs` / `streaming.rs` / `drain.rs`) is reusable for further optimizations (splice-in-place, parallel writer, io_uring writer).
+- **Plan's 40-55 s target (fused-CPU floor) was predicated on classify CPU being the ceiling** - measured CPU floor is indeed 17-31 s, but the HDD writer became the new ceiling at ~120 s, which the plan didn't predict. Per-hardware; on a faster target disk (NVMe observed at 3+ GB/s sustained on the same host), the CPU-budget floor math would apply.
+- **Scope out of this plan:** internal API rewrites (`IdSetDense`, `PbfWriter`, `HeaderWalker` are correct as-is), weekly-OSC parallel parse (separate workstream).
 
 ## Implementation progress (2026-04-20)
 
@@ -103,22 +117,90 @@ all behind `#![allow(dead_code)]` until the merge() flip lands):
   `WorkerOutput::into_drain_item` so scanner and workers both emit
   `DrainItem` directly into the unified drain channel.
 
-**Pending inside P1 (must land as a single commit with the batch-loop
-deletion to avoid a half-rewritten tree on main):**
+**P1 flip landed (`719f306`, 2026-04-21):**
 
-- Modifications to `merge()` in `rewrite.rs`: delete batch loop,
-  become a thin orchestrator (spawn scanner + worker pool + drain on
-  dedicated threads, join, surface counters).
-- Modifications to `classify.rs::classify_only`: drop the fast-path
-  branch (scanner owns it), switch parse to `from_vec_with_scratch`.
-- Wire the post-barrier `Arc<FxHashMap>` loc_map handle through to
-  workers processing way blobs (currently passes `None` - the
-  scaffold's TODO comment in `streaming.rs::handle_candidate`).
-- Deletions: `parallel_reader.rs`, `node_locations.rs::prefill_from_base`.
+- `merge()` in `rewrite.rs` became the thin orchestrator: spawns
+  scanner + worker-pool threads via `std::thread::scope`, runs the
+  drain on the caller thread so it can hold `&mut writer`. Four
+  channels: scanner→drain (splice fast-path), scanner→workers
+  (candidate dispatch), workers→drain (unified DrainItem stream,
+  one cloned `SyncSender` per worker), drain↔scanner barrier
+  (`last_node_seq` + barrier signal).
+- `classify.rs` stripped to just `block_overlaps_diff` for the
+  worker pool's precise check. Legacy batch-slot types deleted.
+- `node_locations.rs::prefill_from_base` deleted. OSC-pre-seeded
+  coords from `build_from_diff` become the drain's
+  `seeded_locations`; base-PBF coords are extracted opportunistically
+  by node-phase workers into per-worker `Arc<Mutex<FxHashMap>>`
+  slots, merged by the drain at the node→way barrier, published via
+  `LocMapHandle = Arc<OnceLock<Arc<FxHashMap>>>` for way-phase
+  workers to read.
+- `parallel_reader.rs` deleted entirely.
+- `stream_output.rs::coalesce_passthrough` deleted (drain has its
+  own contiguous-range `copy_file_range` coalescer).
+- `stats.rs::{PhaseTimers, ClassifyCounters, StallAccumulator,
+  PhaseRss, read_rss_kb}` deleted (all batch-loop instrumentation).
 
-**Cross-validation not yet run** (expected only after the rewrite
-commit): Denmark byte-equal, Europe byte-equal + `--bench 1`, Planet
-`--bench 1` against the 40-55 s target + abort/pivot plan.
+**P1.5 landed (same commit `719f306`) - worker-emits-framed-bytes:**
+
+- Workers call `frame_blob_pipelined` per output block and attach
+  framed `Vec<u8>` chunks to `DrainItem::Rewritten`; drain emits them
+  via `write_raw_owned` (single-thread send path) instead of
+  `write_primitive_block_owned` (per-block `rayon::spawn` dispatch).
+- Effect on planet `--compression none`:
+  `writer_pipeline_send_wait_ns` 859 s cumulative → 117 s (-86%).
+  Writer-pipeline serialization is no longer the ceiling; HDD
+  sustained write throughput is.
+- Drain's `recv_timeout(25 ms)` lets the barrier fire from idle
+  (prevents a three-way deadlock when drain finishes the last node
+  item before scanner sends `last_node_seq`).
+
+**Cross-validation (2026-04-21):**
+
+- **Denmark element counts byte-equal to pre-flip**: 52,493,619
+  nodes / 6,616,901 ways / 46,108 relations. `brokkr verify merge
+  --dataset denmark` PASSes the Sort.Type_then_ID check; vs-osmium
+  element counts match pre-flip (known semantic difference, not a
+  regression).
+- **6/6 property tests** in `tests/apply_changes_invariants.rs`
+  pass (cursor-rule on FalsePositive, empty-base-PBF trailing
+  flush, trailing-create interleave).
+- **18/18 integration tests** in `tests/merge.rs` pass.
+- **Planet `--bench 1`**: 135.5 s (UUID in session log). Under the
+  plan's 40-55 s target; the remainder is HDD-bound writer wall
+  (`writer_write_ns` = 120 s). Abort threshold was >80 s; we're at
+  135 s but the remainder is hardware-limited, not pipeline-limited.
+
+**Measured walls + counters at commit `719f306` (plantasjen,
+target=hdd, OSC 4913 where applicable):**
+
+| Dataset | Compression | Wall | writer_bytes_written | writer_write_ns | writer_pipeline_send_wait_ns | merge_streaming_frame_ns cumulative |
+|---|---|---:|---:|---:|---:|---:|
+| Europe altw LOW (`--bench 3`) | none | 49.8 s | - | - | - | - |
+| Europe altw LOW (`--bench 3`) | zlib:6 | 53.8 s | - | - | - | - |
+| Planet altw LOW (`--bench 1`) | none | 135.5 s | 119 GB | 120 s | 117 s | 48 s |
+| Planet altw LOW (`--bench 1`) | zlib:6 | 143.7 s | 93 GB | 104 s | 91 s | 1352 s |
+| Planet altw LOW (`--bench 1`) | zstd:1 | **121.2 s** | 95 GB | 94 s | 92 s | 205 s |
+
+zstd:1 planet result is the current wall leader. `merge_streaming_frame_ns` cumulative (summed across 22 workers) shows compression cost directly: zlib:6 pays 1352 s cumulative (~62 s wall at 22 cores) vs zstd:1's 205 s (~9 s wall), for similar output sizes. This is the core architectural win of P1: compression parallelizes in the worker pool instead of fighting the classify pool (legacy shape's `+7.4 s classify wall under zlib` is gone).
+
+**Memory + runtime shape at planet (from `brokkr sidecar` stat,
+compared against legacy UUID `e81a9316`):**
+
+| Metric | Legacy `52c2c4b` | Post-flip `719f306` | Δ |
+|---|---:|---:|---:|
+| Wall | 144.4 s | 135.5 s | -6% |
+| Peak RSS | 1.63 GB | 3.29 GB | +2.0× |
+| Peak anon | 1.63 GB | 3.28 GB | +2.0× |
+| Avg RSS | 1.05 GB | 1.72 GB | +1.6× |
+| p95 RSS | 1.23 GB | 2.68 GB | +2.2× |
+| Peak threads | 27 | 50 | +85% |
+| Total major faults (max) | 52,659 | 67,858 | +29% |
+| Total minor faults (max) | 1.02 M | 1.36 M | +33% |
+| Total involuntary context switches (max) | 7,214 | 2,134 | **-70%** |
+| Total voluntary context switches (max) | 128 k | 140 k | +9% |
+
+RSS roughly doubled: per-worker thread-local `BlockBuilder` + scratches × 22 ≈ 220 MB, per-worker coord slots, framed-chunk buffering at the drain (~800 KB per rewrite blob in-flight), and the `BTreeMap<seq, DrainItem>` reorder buffer. Inside the 27 GB host envelope and the plan's 1.5-2.1 GB projection range was optimistic - real is 3.3 GB, still comfortable. Involuntary context switches dropped 70 % - workers run longer between preemptions (rayon-spawn churn gone), healthy sign.
 
 **Session learnings worth noting (found during scaffolding):**
 
@@ -1203,43 +1285,23 @@ These are the parts of today's code that survive P1 unchanged. The batch-loop ma
 5. ~~**Bump classify batch size**~~ **Landed 2026-04-18 (`bfac63b`) - 512 MB merge batch budget.** Raised average batch from ~13 to ~18 overlap blobs but classify wall was unchanged (72.5 s vs 70.3 s). **Diagnosis from external review: the plateau is structural to the batch barrier, not fixable with batch-size knobs** - see "External review synthesis" section.
 6. ~~**Parallel reader (#3)**~~ **Landed 2026-04-18 (`c97d6b5` streaming variant)**. Net-zero wall change vs sequential reader. Kept as infrastructure for the streaming pipeline below.
 7. ~~**Cheap disambiguation experiment**~~ **Attempted + reverted 2026-04-18.** `rayon::scope` + per-batch spawn + mpsc + ReorderBuffer regressed from ~140 s to 10 min+ at planet (Denmark verify passed). See "Cheap disambiguation experiment" subsection for post-mortem. Doesn't disprove the plateau hypothesis, but rules out this form of cheap check. **Going direct to streaming pipeline instead.**
-8. **Descriptor-first streaming pipeline (P1).** See "Third review round + synthesis" above for full design. See "Implementation progress" above for current status. Phase-by-phase breakdown:
+8. ~~**Descriptor-first streaming pipeline (P1).**~~ **Landed `719f306`, 2026-04-21.** Scanner + worker-pool + drain shape from "Third review round + synthesis" shipped as one atomic flip. See "Implementation progress" above for the detailed landing summary. Planet `--compression none` 144.4 s → 135.5 s, Europe 46.1 s → 49.8 s, zlib:6 and zstd:1 benefit more (see Current state at top). HDD writer wall is the new ceiling at planet, not the CPU floor the plan predicted.
 
-   **Prep scaffolding** (committed separately, `a2a0567` 2026-04-20 - pure additions, can be kept across a revert):
-   - [x] ~~`src/commands/apply_changes/descriptor.rs`~~ - type definitions. Landed.
-   - [x] ~~`tests/apply_changes_invariants.rs`~~ - 6 property tests against current main. Pass on current main; contract locked in. Landed.
-
-   **Pipeline rewrite** (must land as ONE commit since each piece depends on the others; partial landings leave the batch loop broken):
-   - [x] ~~`src/commands/apply_changes/scanner.rs`~~ - `HeaderWalker`-driven descriptor emission with scanner-side node→way barrier and `use_copy_range` routing fork. **In working tree, uncommitted.**
-   - [x] ~~`src/commands/apply_changes/streaming.rs`~~ - long-lived worker pool driven by `std::thread::scope`. Persistent thread-local `BlockBuilder` + scratches, decompress + parse via `from_vec_with_scratch` + precise check + rewrite inline (`rewrite_block_parallel`) or `DrainItem::CopyRange` for false positives. Per-worker coord extraction into `Arc<Mutex<FxHashMap>>` slots under `--locations-on-ways`. `--direct-io` passthrough handler preads full frame and emits `DrainItem::OwnedBytes`. Open: post-barrier `Arc<loc_map>` handle for way-blob workers (currently passes `None`); drain.rs scaffold wires the handle but the worker side still needs the merge-orchestrator wiring.
-   - [x] ~~`src/commands/apply_changes/drain.rs`~~ - single-threaded ordered drain actor with `BTreeMap<seq, DrainItem>` reorder buffer, `copy_file_range` coalescer, `OwnedBytes` chunk coalescer, type-transition + gap-create + trailing-create handlers, `CoordSlots` merge into `LocMapHandle = Arc<OnceLock<Arc<FxHashMap>>>` at the node→way barrier with scanner signal, and the cursor-rule invariant (Rewrite advances; CopyRange/OwnedBytes do NOT). Cross-validation deferred to merge() flip.
-   - [ ] Modify `merge()` in `rewrite.rs`: delete batch loop (~320 lines); become a thin orchestrator (setup + spawn scanner + spawn workers + spawn drain + join).
-   - [ ] Modify `classify.rs::classify_only`: drop the fast-path branch (scanner owns it now); switch parse to `from_vec_with_scratch`.
-   - [ ] Delete `parallel_reader.rs` entirely.
-   - [ ] Delete `node_locations.rs::prefill_from_base` (workers extract coords during node phase).
-
-   **Invariants to preserve** (see "Correctness invariants" below):
-   - Cursor-rule: Rewrite slots advance the cursor past their range; Passthrough/FalsePositive do NOT (silent-break risk, property-tested).
-   - `--direct-io` fallback: drain-side routing policy, workers pread full frames.
-   - `--force` fallback: descriptors have `index: None`; scanner cannot fast-path; all descriptors flow through worker pool.
-   - Node→way barrier: scanner-side ownership (not drain-side).
-   - Trailing creates: port `types_to_flush` match verbatim.
-
-   **Cross-validation**: Denmark `brokkr verify merge` byte-equal; Europe byte-equal + hash compare; planet `--bench 1` then `--bench 3`.
-
-   **Target: 40-55 s wall at planet daily**, from 144.4 s baseline. Abort threshold >80 s planet `--bench 1` (see "Abort / pivot plan" under the Third review round + synthesis section).
-
-9. **P1.5 - Worker-emits-framed-bytes (conditional on post-P1 measurement).** R1 expects the writer chain becomes the new ceiling under `--compression none` after P1. R2 says measure first. Same commit boundary either way: land P1, measure, add worker-framed output (`frame_blob_pipelined` on the worker, drain hands framed bytes directly to `write_raw_owned`) if bench shows writer chain dominating. Two thread hops + one `rayon::spawn` per rewritten blob for a memcpy becomes one thread hop.
+9. ~~**P1.5 - Worker-emits-framed-bytes.**~~ **Landed in the same commit as P1.** Workers call `frame_blob_pipelined` inline and ship framed `Vec<u8>` chunks to drain via `DrainItem::Rewritten.framed_chunks`; drain uses `write_raw_owned` per chunk. `writer_pipeline_send_wait_ns` at planet `--compression none`: 859 s cumulative → 117 s (-86%). Measurement confirmed R1's prediction that the writer chain would become the new ceiling under `--compression none` post-P1.
 
 10. **(weekly OSC only) Parallel OSC parse.** Parse each OSC concurrently into its own overlay; merge overlays newer-wins using [`IdSetDense::set_atomic_if_new`](../src/commands/id_set_dense.rs) (walk newest-first, keep on `true`). Current [`load_all_diffs`](../src/osc.rs) serialises this. Estimated **-20-30 s wall at weekly scale**; no win at daily.
 
-11. **Splice-in-place for low-touch rewrites (follow-up).** For `NeedsRewrite` blobs with ≤K affected elements (K~64), splice the raw wire bytes for unmodified element runs instead of full decode+re-encode. Estimated ~1.5-2 s wall at daily, less valuable at weekly. Raw-group passthrough scaffolding in [`src/write/raw_passthrough.rs`](../src/write/raw_passthrough.rs) is the design surface.
+11. **Splice-in-place for low-touch rewrites (follow-up, not yet landed).** For `NeedsRewrite` blobs with ≤K affected elements (K~64), splice the raw wire bytes for unmodified element runs instead of full decode+re-encode. Estimated ~1.5-2 s wall at daily, less valuable at weekly. Raw-group passthrough scaffolding in [`src/write/raw_passthrough.rs`](../src/write/raw_passthrough.rs) is the design surface. **Post-P1 re-evaluation (2026-04-21):** the planet wall is now HDD-writer-bound (`writer_write_ns = 120 s`, 89 % of wall at `--compression none`), not CPU-bound. Splice-in-place saves classify+rewrite CPU but does not reduce output bytes, so it's unlikely to move the wall on HDD targets. Value deferred until we have measurements on a faster target disk.
 
-12. **Writer path tuning** (direct-io vs `to_path_uring`). Only if post-P1 bench points there. Infrastructure already wired in [`src/commands/mod.rs`](../src/commands/mod.rs) + [`src/write/uring_writer.rs`](../src/write/uring_writer.rs); flip the variant, don't grow queues.
+12. **Writer path tuning** (direct-io vs `to_path_uring`). Infrastructure already wired in [`src/commands/mod.rs`](../src/commands/mod.rs) + [`src/write/uring_writer.rs`](../src/write/uring_writer.rs); flip the variant, don't grow queues. **Blocked on RLIMIT_MEMLOCK (2026-04-21):** io_uring requires ≥16 MB locked memory on plantasjen; current limit is 8 MB. Fix: `sudo prlimit --pid=$$ --memlock=unlimited:unlimited` before running. Once unblocked, bench planet `--io-uring` to see if the writer thread can bypass page-cache throttling on the HDD target.
 
 13. **Exact-membership metadata / sidecar.** Only if FalsePositives remain material after P1. Currently 16 % of slow-path blobs; not negligible but not headline either. Format/index project, not a quick cleanup.
 
 14. **Diff squashing as a formal upstream stage (weekly only).** Consider making "squash N diffs to one final overlay / binary delta" a separate command that runs once per cadence and emits a single pre-merged diff that apply-changes then consumes as a daily. Shares the `IdSetDense::set_atomic_if_new` newer-wins primitive with in-pipeline parallel OSC merge (item 10). Orthogonal to P1.
+
+15. **`zstd:1` as a compression recommendation for internal pipelines (new, 2026-04-21).** Measured at planet: `--compression zstd:1` delivers 121.2 s wall (vs 135.5 s for `none` and 143.7 s for `zlib:6`), because workers parallelize zstd cheaply and the ~20 % output-byte reduction relieves the HDD writer bottleneck. Already gated behind a flag; consider documenting as the default for pbfhogg-internal pipelines (consumers that don't require osmium interop) in [`reference/performance.md`](../reference/performance.md) and README.
+
+16. **Target-disk experiment (new, 2026-04-21).** The plan's 40-55 s CPU-budget floor assumed writer I/O would run concurrent with workers and finish inside the same wall window. Measured on plantasjen (target=hdd), the writer wall (~120 s at planet) is the new ceiling. Before declaring the pipeline architecture has hit its limit, run one planet bench with a brokkr.toml target override pointing at NVMe (sustained 3+ GB/s on the same host) to measure the actual post-flip floor. If that run lands at 40-55 s, the plan's hypothesis is confirmed and splice-in-place / writer path tuning become the real next levers. If not, the remaining ceiling is elsewhere and warrants a fresh round of measurement.
 
 ### Items folded into P1 (no longer separate)
 

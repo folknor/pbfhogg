@@ -45,8 +45,6 @@
 //! "Synthesized design" → "Drain actor" + "Cursor rule" + "Node→way
 //! barrier ownership" + "`--direct-io` fallback" sections.
 
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
@@ -93,6 +91,7 @@ pub(super) struct DrainConfig<'a> {
     /// kernel-space splice. Ignored when `use_copy_range == false`.
     /// Type is `i32` rather than `RawFd` so the field exists under
     /// non-Linux builds; it just isn't used.
+    #[cfg_attr(not(feature = "linux-direct-io"), allow(dead_code))]
     pub input_fd: i32,
     /// `--locations-on-ways` mode is on. Drain merges `CoordSlots` at
     /// the node→way barrier and signals the scanner.

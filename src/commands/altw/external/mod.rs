@@ -35,14 +35,14 @@ mod radix;
 mod relation_scan;
 mod stage1;
 mod stage2;
-mod stage23_epoch;
 mod stage3;
 mod stage4;
 
 use radix::{ScratchDir, NUM_BUCKETS};
 
 use stage1::stage1_way_pass;
-use stage23_epoch::{stage23_epoch_fused, Stage23EpochInputs};
+use stage2::{stage2_node_join, SlotBuckets};
+use stage3::{stage3_slot_reorder, IntegratedInputs, SlotBucketRef};
 use stage4::stage4_assembly;
 
 /// Maximum node ID in current OSM data. Used to compute bucket ranges.
@@ -284,8 +284,49 @@ pub fn external_join(
         crate::debug::emit_counter("extjoin_total_rank_shard_files", total_rank_shard_files as i64);
     }
 
-    // Prepare coord_payloads artifacts used by both the fused stage 2/3
-    // epoch path below and the downstream router + stage 4 consumers.
+    crate::debug::emit_marker("EXTJOIN_STAGE2_START");
+    let (s2_minflt_before, s2_majflt_before) = crate::debug::read_page_faults();
+    let slot_buckets = SlotBuckets::create(&scratch_dir, slot_bucket_count)?;
+    let input_pbf = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("open input pbf for stage 2: {e}"))?,
+    );
+    let resolved_count = stage2_node_join(
+        &scratch_dir,
+        &rank_bucket_counts,
+        num_shard_workers,
+        &slot_buckets,
+        slot_bucket_count,
+        total_slots,
+        unique_nodes,
+        &input_pbf,
+        &node_id_set,
+        &node_blob_mapping,
+    )?;
+    slot_buckets.finish()?;
+    let (s2_minflt_after, s2_majflt_after) = crate::debug::read_page_faults();
+    for worker_id in 0..num_shard_workers {
+        for bucket_idx in 0..NUM_BUCKETS {
+            let path = scratch_dir
+                .path
+                .join(format!("rank-W{worker_id}-{bucket_idx:03}"));
+            drop(std::fs::remove_file(&path));
+        }
+    }
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("extjoin_resolved_count", resolved_count as i64);
+        crate::debug::emit_counter("s2_minflt_delta", (s2_minflt_after - s2_minflt_before) as i64);
+        crate::debug::emit_counter("s2_majflt_delta", (s2_majflt_after - s2_majflt_before) as i64);
+    }
+    crate::debug::emit_marker("EXTJOIN_STAGE2_END");
+
+    // Free the IdSet (~2 GB RSS at planet) and the per-blob mapping
+    // - both were stage 2 inputs only, nothing downstream reads them.
+    drop(node_id_set);
+    drop(node_blob_mapping);
+
+    // Prepare integrated coord_payloads artifacts for stage 3.
     let per_way_rcs = coord_payloads::load_per_way_refcount_sidecar_indexed(
         &per_way_refcount_sidecar,
         way_slot_starts.len(),
@@ -302,64 +343,49 @@ pub fn external_join(
             .map(|_| std::sync::Mutex::new(None))
             .collect();
 
-    // Fused stage 2 + stage 3 via epoch-spill. Epoch 0 scatters directly
-    // to in-memory buffers (zero disk I/O for 1/N of entries); epochs
-    // 1..N-1 spill to per-worker files and drain on later passes. Emits
-    // worker_manifests consumable directly by build_blob_location_router,
-    // no intermediate consolidated coord_payloads file.
-    //
-    // num_epochs: 8 gives a good balance of in-memory scatter win vs
-    // peak RSS. At E=8 the epoch-0 scatter_bufs occupy 1/8 of total_slots
-    // (vs 1/4 at E=4), keeping the planet projection under the 30 GB host
-    // envelope. Historical measurement favored E=8 over E=4. Plan doc
-    // anticipates promoting to auto-compute from /proc/meminfo once the
-    // wider workload matrix is characterized.
-    let num_epochs = 8;
-    let input_pbf = std::sync::Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| format!("open input pbf for stage 2: {e}"))?,
-    );
-    let epoch_out = stage23_epoch_fused(Stage23EpochInputs {
-        scratch: &scratch_dir,
-        num_shard_workers,
-        rank_bucket_counts: &rank_bucket_counts,
-        slot_bucket_count,
-        total_slots,
-        unique_nodes,
-        input_pbf,
-        node_id_set: &node_id_set,
-        node_blob_mapping: &node_blob_mapping,
+    crate::debug::emit_marker("EXTJOIN_STAGE3_START");
+    let (s3_minflt_before, s3_majflt_before) = crate::debug::read_page_faults();
+    let slot_entry_counts: Vec<u64> = (0..slot_bucket_count)
+        .map(|i| {
+            let path = scratch_dir.bucket_path("slot", i);
+            std::fs::metadata(&path)
+                .map(|m| m.len() / RESOLVED_ENTRY_SIZE as u64)
+                .unwrap_or(0)
+        })
+        .collect();
+    let slot_paths: Vec<std::path::PathBuf> = (0..slot_bucket_count)
+        .map(|i| scratch_dir.bucket_path("slot", i))
+        .collect();
+    let slot_bucket_ref = SlotBucketRef {
+        paths: slot_paths,
+        entry_counts: slot_entry_counts,
+    };
+    let integrated_inputs = IntegratedInputs {
         way_slot_starts: way_slot_starts.as_slice(),
         per_way_rcs: &per_way_rcs,
-        worker_tmp_paths: &worker_tmp_paths,
-        straddler_slots: &straddler_slots,
-        num_epochs,
-    })?;
-    let resolved_count = epoch_out.resolved_count;
-
-    // Free the IdSet (~2 GB RSS at planet) and the per-blob mapping
-    // - both were stage 2 inputs only, nothing downstream reads them.
-    drop(node_id_set);
-    drop(node_blob_mapping);
-
-    // Rank-shard cleanup (produced by stage 1 pass B, consumed by the
-    // epoch producer's prepare_bucket calls).
-    for worker_id in 0..num_shard_workers {
-        for bucket_idx in 0..NUM_BUCKETS {
-            let path = scratch_dir
-                .path
-                .join(format!("rank-W{worker_id}-{bucket_idx:03}"));
-            drop(std::fs::remove_file(&path));
-        }
+        worker_tmp_paths: worker_tmp_paths.as_slice(),
+        straddler_slots: straddler_slots.as_slice(),
+    };
+    let s3_result = stage3_slot_reorder(
+        &slot_bucket_ref,
+        slot_bucket_count,
+        total_slots,
+        &integrated_inputs,
+    )?;
+    let (s3_minflt_after, s3_majflt_after) = crate::debug::read_page_faults();
+    for i in 0..slot_bucket_count {
+        drop(std::fs::remove_file(scratch_dir.bucket_path("slot", i)));
     }
     #[allow(clippy::cast_possible_wrap)]
     {
-        crate::debug::emit_counter("extjoin_resolved_count", resolved_count as i64);
+        crate::debug::emit_counter("s3_minflt_delta", (s3_minflt_after - s3_minflt_before) as i64);
+        crate::debug::emit_counter("s3_majflt_delta", (s3_majflt_after - s3_majflt_before) as i64);
     }
+    crate::debug::emit_marker("EXTJOIN_STAGE3_END");
 
     let (coord_router, router_stats) = coord_payloads::build_blob_location_router(
         &per_way_rcs,
-        epoch_out.worker_manifests,
+        s3_result.worker_manifests,
         &worker_tmp_paths,
         straddler_slots,
     )?;

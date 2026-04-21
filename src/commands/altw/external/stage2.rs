@@ -26,36 +26,36 @@ use super::{
 // Stage 2: Parallel node join - coord slice lookup
 // ---------------------------------------------------------------------------
 
-pub(super) struct LoaderScratch {
-    pub(super) data_buf: Vec<u8>,
-    pub(super) counts: Vec<u64>,
-    pub(super) write_pos: Vec<u64>,
+struct LoaderScratch {
+    data_buf: Vec<u8>,
+    counts: Vec<u64>,
+    write_pos: Vec<u64>,
 }
 
 impl LoaderScratch {
-    pub(super) fn new() -> Self {
+    fn new() -> Self {
         Self { data_buf: Vec::new(), counts: Vec::new(), write_pos: Vec::new() }
     }
 }
 
-pub(super) struct PreparedBucket {
-    pub(super) grouped_slot_pos: Vec<u64>,
-    pub(super) group_offsets: Vec<u64>,
-    pub(super) bucket_rank_start: u64,
-    pub(super) local_range: usize,
+struct PreparedBucket {
+    grouped_slot_pos: Vec<u64>,
+    group_offsets: Vec<u64>,
+    bucket_rank_start: u64,
+    local_range: usize,
     /// Sub-phase timings (ms): counting pass, prefix sum, scatter pass.
-    pub(super) prepare_count_ms: u64,
-    pub(super) prepare_prefix_ms: u64,
-    pub(super) prepare_scatter_ms: u64,
+    prepare_count_ms: u64,
+    prepare_prefix_ms: u64,
+    prepare_scatter_ms: u64,
     /// I/O accounting from shard loading.
-    pub(super) open_calls: u64,
-    pub(super) stat_calls: u64,
-    pub(super) fadvise_calls: u64,
-    pub(super) fadvise_bytes: u64,
+    open_calls: u64,
+    stat_calls: u64,
+    fadvise_calls: u64,
+    fadvise_bytes: u64,
 }
 
 #[allow(clippy::cast_possible_truncation)]
-pub(super) fn prepare_bucket(
+fn prepare_bucket(
     bucket_idx: usize,
     scratch: &ScratchDir,
     num_shard_workers: usize,
@@ -152,11 +152,6 @@ pub(super) fn prepare_bucket(
 
 /// Shared slot bucket writers protected by per-bucket mutexes.
 /// `slot_bucket_count` files total regardless of worker count.
-// Disk-backed slot-bucket handoff for the pre-epoch-spill stage 2/3 path.
-// Kept behind `#[allow(dead_code)]` so the epoch path's keep/revert gate
-// can flip back by re-importing these in mod.rs. Scheduled for deletion
-// in a follow-up commit once the epoch path's planet bench validates.
-#[allow(dead_code)]
 pub(super) struct SharedSlotBuckets {
     writers: Vec<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>,
     entry_counts: Vec<std::sync::atomic::AtomicU64>,
@@ -164,7 +159,6 @@ pub(super) struct SharedSlotBuckets {
 
 const BUCKET_BUF_SIZE: usize = 256 * 1024;
 
-#[allow(dead_code)]
 impl SharedSlotBuckets {
     pub(super) fn create(
         scratch: &ScratchDir,
@@ -217,7 +211,7 @@ impl SharedSlotBuckets {
 ///
 /// Returns resolved_count.
 #[hotpath::measure]
-#[allow(clippy::too_many_lines, clippy::too_many_arguments, dead_code)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(super) fn stage2_node_join(
     scratch: &ScratchDir,
     rank_bucket_counts: &[u64],
@@ -696,5 +690,4 @@ pub(super) fn stage2_node_join(
     Ok(resolved_count)
 }
 
-#[allow(dead_code)]
 pub(super) type SlotBuckets = SharedSlotBuckets;

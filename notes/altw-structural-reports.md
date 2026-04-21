@@ -110,7 +110,29 @@ Any rewrite preserves these or explicitly replaces them:
 
 ### #1 - Promote epoch-spill to default; delete the disk slot-bucket path
 
-**Convergence: R2 #1, R3 #1.** R4 A3 attacks the same stage 2→3 seam with a different mechanism (per-bucket `Vec<Vec<u8>>` append + per-slot-bucket completion counters instead of `scatter_buf`+epochs); see "Mechanism alternative" below. The code for the epoch-spill mechanism already exists in [src/commands/altw/stage23_epoch.rs](/home/folk/Programs/pbfhogg/src/commands/altw/stage23_epoch.rs) as an env-var-gated prototype. This is delete + promote, not greenfield. R6 did not evaluate it because the prototype was not part of the mainline code read.
+**Attempted 2026-04-21 and reverted (commits `4601cbf` + `207357e`, source files reverted while `.brokkr/results.db` retained the measurement history).** Resurrected the 2026-04-15 prototype (deleted at `3ae1052`) into [src/commands/altw/external/stage23_epoch.rs](/home/folk/Programs/pbfhogg/src/commands/altw/external/stage23_epoch.rs); adapted the resolver inner loop to the post-#4 blob-local-counter shape (stage2.rs:459-492 pattern), switched the emit tail to feed `build_blob_location_router` directly instead of `finalize_coord_payloads`, restored `pub(super)` visibility on the shared helpers. Passed `brokkr check` and Denmark smoke.
+
+Measurement record (plantasjen, 30 GB RAM host):
+
+| Dataset | Config | Wall | Peak RSS | vs baseline |
+|---|---|---:|---:|---:|
+| Europe baseline `--bench 3` | pre-port `ee5f776` (UUID `296a0edf`) | 296.0 s | ~9-10 GB | - |
+| Europe E=4 `--bench 3` | `4601cbf` (UUID `1a340da5`) | 292.1 s | ~16 GB | -1.3 % wall, +6 GB RSS |
+| Europe E=8 `--bench 1` | `207357e` (UUID `ea856988`) | 303.6 s | 11.5 GB | +2.6 % wall, +1.5 GB RSS |
+| Planet baseline `--bench 3` | `aee7727` (UUID `a406d77e`) | 661.2 s | ~5-8 GB | - |
+| Planet E=8 `--bench 1` | `207357e` (UUID `edf662b4`) | **741 s** | **25.2 GB** | **+10 % wall, +18 GB RSS** |
+
+**Why it failed.** The port preserved the prototype's 16-byte spill record format `(slot_pos: u64 LE, lat: i32 LE, lon: i32 LE)` because spill entries must survive cross-bucket routing at drain time. This matches R2's assumption. But the *current* disk slot-bucket path already uses 12-byte records (post-`fcd4fa2`, `local_slot_pos: u32` + lat + lon). So the spill path writes 33 % more bytes per entry than the path it replaces, and the ~12.5-25 % in-memory epoch-0 saving does not offset the spill inflation. Additionally, the plan-doc's ~68 s "eliminated finalize as a separate phase" saving no longer applies — the current main-line already eliminated `finalize_coord_payloads` at #8 (`BlobLocationRouter`), so #1 has no finalize-savings to cash in on. Planet EPOCH0_PRODUCER 271 s vs pre-port STAGE2 208 s is the bulk of the regression; epochs 1-7 drain+emit totals 84 s vs pre-port STAGE3 89 s was a wash.
+
+**What a retry needs.** The R3 12-byte spill format, which the plan doc estimated at 84 GB planet spill (vs R2's 112 GB and what I shipped). Compact-spill options:
+
+- (a) Per-bucket-per-epoch spill files: at planet E=8, that's `~64 buckets × 7 epochs × 6 workers ≈ 2700` files and ~700 BufWriters resident per worker. File-handle pressure likely prohibitive.
+- (b) Split-stream format: one entry stream (12 bytes per record, `local_slot_pos: u32` scoped to the *epoch*, lat, lon — u32 fits epoch-wide slot counts at planet) plus a sidecar bucket-index stream for drain. Drain reads both, recovers bucket within the epoch, writes to scatter. Requires the epoch's slot range fit in u32 (at planet E=8 epoch-span ≈ 1.2 B slots, well inside u32::MAX = 4.3 B).
+- (c) Per-epoch `local_slot_pos: u32` scoped to `[epoch_slot_start, epoch_slot_end)` and drain recomputes bucket from `epoch_slot_start + local_slot_pos`. Single 12-byte stream. Simplest of the three. Costs one extra arithmetic op per drain record.
+
+(c) is the right shape for any retry. Also: auto-tune `num_epochs` from `/proc/meminfo` so Europe picks E=2-3 (tighter in-memory ratio) while planet picks E=4-6 (bounded scatter_bufs). Hardcoding E=4 loses at europe; hardcoding E=8 loses at planet.
+
+**Convergence: R2 #1, R3 #1.** R4 A3 attacks the same stage 2→3 seam with a different mechanism (per-bucket `Vec<Vec<u8>>` append + per-slot-bucket completion counters instead of `scatter_buf`+epochs); see "Mechanism alternative" below. The epoch-spill mechanism now exists only in git history (`4601cbf..207357e`) and the commit message narrates what was preserved vs changed from the 2026-04-15 prototype. R6 did not evaluate it because the prototype was not part of the mainline code read.
 
 **Bottleneck.** The stage 2 → stage 3 handoff materializes the largest intermediate in the pipeline - ~112 GB of slot bucket files, which stage 3 then reads cold, scatters, and encodes.
 

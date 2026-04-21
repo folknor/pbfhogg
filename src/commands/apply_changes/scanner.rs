@@ -73,6 +73,14 @@ pub(super) struct ScannerConfig<'a> {
     /// Drain sends one unit value after it has processed the last node
     /// blob and published the merged `Arc<loc_map>`.
     pub barrier_rx: Option<mpsc::Receiver<()>>,
+    /// Scanner → drain signal carrying the seq of the last node blob
+    /// emitted (or `u64::MAX` if no node blobs were ever emitted, which
+    /// the drain treats as "publish now"). Sent at the first non-node
+    /// descriptor or at EOF, so the drain knows when to merge
+    /// `CoordSlots` and publish `Arc<loc_map>` without needing a way
+    /// item to trigger the transition. Present when `locations_on_ways`
+    /// is true.
+    pub last_node_seq_tx: Option<mpsc::SyncSender<u64>>,
 }
 
 /// Run the scanner to completion. Returns the number of OsmData
@@ -93,6 +101,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>) -> Result<u64> {
         locations_on_ways,
         channels,
         barrier_rx,
+        last_node_seq_tx,
     } = cfg;
 
     crate::debug::emit_marker("MERGE_SCANNER_START");
@@ -103,6 +112,11 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>) -> Result<u64> {
     let mut barrier_open = !locations_on_ways; // open by default when not --locations-on-ways
     let mut bytes_high_water_fastpath: usize = 0;
     let mut bytes_high_water_slowpath: usize = 0;
+    // Tracks the seq of the most recently emitted Node descriptor.
+    // Used to send `last_node_seq` to the drain at the node→way
+    // transition (or at EOF if no way blobs exist).
+    let mut last_node_seq: Option<u64> = None;
+    let mut last_node_seq_sent = false;
 
     while let Some(meta) = walker.next_header()? {
         // Skip OsmHeader - merge() reads it separately during setup.
@@ -141,8 +155,16 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>) -> Result<u64> {
         // indexdata AND the range doesn't overlap the diff. Otherwise
         // slow-path. Under `--direct-io`, the splice fast-path is
         // unavailable and passthroughs are routed through workers.
+        //
+        // Under `--locations-on-ways`, Node blobs CANNOT take the
+        // splice fast-path: workers must decompress them to extract
+        // coord tuples for the barrier merge, even when the blob
+        // doesn't overlap the diff. Way/Relation blobs are still
+        // eligible for the splice fast-path under LOW.
+        let low_node_must_decompress = locations_on_ways && matches!(kind, ElemKind::Node);
         let is_fastpath = has_indexdata
             && use_copy_range
+            && !low_node_must_decompress
             && !ranges.range_overlaps(
                 kind,
                 id_range.map_or(0, |r| r.0),
@@ -165,7 +187,8 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>) -> Result<u64> {
                         ))
                     })?,
             )
-        } else if has_indexdata
+        } else if !low_node_must_decompress
+            && has_indexdata
             && !ranges.range_overlaps(
                 kind,
                 id_range.map_or(0, |r| r.0),
@@ -174,7 +197,9 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>) -> Result<u64> {
         {
             // No-overlap indexed blob under --direct-io: route through
             // the worker pool so a worker can pread the full frame and
-            // emit `WorkerOutput::OwnedPassthrough`.
+            // emit `WorkerOutput::OwnedPassthrough`. Skipped for Node
+            // blobs under LOW - those route as `Candidate` below so
+            // workers decompress and extract coords.
             ScannerEmit::Candidate(ScannedBlob::Passthrough(descriptor))
         } else {
             ScannerEmit::Candidate(ScannedBlob::Candidate(descriptor))
@@ -189,9 +214,28 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>) -> Result<u64> {
         // descriptors are buffered once seen until the drain signals
         // loc_map ready. Node descriptors always emit immediately.
         if !barrier_open && matches!(kind, ElemKind::Way | ElemKind::Relation) {
+            // First non-Node descriptor: tell the drain how many Node
+            // outputs to expect before it merges CoordSlots and signals
+            // back. Send happens before the buffer push so the drain
+            // can pre-receive even while workers are still processing
+            // queued Node candidates.
+            if !last_node_seq_sent
+                && let Some(tx) = last_node_seq_tx.as_ref()
+            {
+                let payload = last_node_seq.unwrap_or(u64::MAX);
+                tx.send(payload).map_err(send_err)?;
+                last_node_seq_sent = true;
+            }
             pending_post_barrier.push(item);
             seq += 1;
             continue;
+        }
+
+        // Track the seq of every dispatched Node descriptor (including
+        // those routed through the worker pool and those emitted on the
+        // splice fast-path) so we can report `last_node_seq` to the drain.
+        if matches!(kind, ElemKind::Node) {
+            last_node_seq = Some(seq);
         }
 
         dispatch_item(
@@ -213,6 +257,20 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>) -> Result<u64> {
         {
             barrier_open = true;
         }
+    }
+
+    // End of input. If --locations-on-ways and we never sent
+    // last_node_seq (i.e., the file had no Way/Relation blobs at all),
+    // tell the drain now so it can publish `loc_map` for the trailing-
+    // creates path. The drain signals back via barrier_rx.
+    if locations_on_ways
+        && !last_node_seq_sent
+        && let Some(tx) = last_node_seq_tx.as_ref()
+    {
+        let payload = last_node_seq.unwrap_or(u64::MAX);
+        tx.send(payload).map_err(send_err)?;
+        // last_node_seq_sent is set here for symmetry; not read after.
+        let _ = last_node_seq_sent;
     }
 
     // End of input. If we buffered way/relation descriptors under the

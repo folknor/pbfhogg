@@ -4,11 +4,10 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::blob_meta::{BlobIndex, ElemKind};
+use crate::blob_meta::ElemKind;
 use crate::block_builder::BlockBuilder;
 use crate::file_writer::FileWriter;
 use crate::osc::CompactDiffOverlay;
-use crate::read::raw_frame::RawBlobFrame;
 use crate::writer::PbfWriter;
 
 use crate::commands::{ensure_node_capacity, flush_block};
@@ -106,29 +105,6 @@ pub(super) fn emit_gap_creates(
     while *cursor < upserts.len() && crate::osm_id::osm_id_cmp(upserts[*cursor], min_id).is_lt() {
         emit_create_for_output(upserts[*cursor], blob_kind, diff, bb, writer, stats, loc_map)?;
         *cursor += 1;
-    }
-    Ok(())
-}
-
-/// Append a passthrough blob's raw bytes to the coalescing buffer.
-/// For indexed blobs, moves frame_bytes via std::mem::take (zero copy).
-/// For non-indexed blobs, reframes with indexdata first.
-pub(super) fn coalesce_passthrough(
-    frame: &mut RawBlobFrame,
-    index: &BlobIndex,
-    has_indexdata: bool,
-    chunks: &mut Vec<Vec<u8>>,
-) -> Result<()> {
-    if has_indexdata {
-        chunks.push(std::mem::take(&mut frame.frame_bytes));
-    } else {
-        let indexdata = index.serialize();
-        let reframed = crate::write::writer::reframe_raw_with_index(
-            frame.blob_bytes(),
-            &indexdata,
-            frame.tagdata.as_deref(),
-        )?;
-        chunks.push(reframed);
     }
     Ok(())
 }

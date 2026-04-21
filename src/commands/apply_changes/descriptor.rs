@@ -25,7 +25,6 @@
 //! passthrough stream + worker outputs merged into a byte-budget reorder
 //! buffer keyed by global seq) and produces the output PBF in file order.
 
-use crate::block_builder::OwnedBlock;
 use crate::blob_meta::{BlobIndex, ElemKind};
 
 /// Per-blob metadata produced by the scanner from a single `HeaderWalker`
@@ -95,13 +94,22 @@ pub(super) enum WorkerOutput {
     /// discarded and the drain re-reads the raw frame via
     /// `copy_file_range`.
     FalsePositive(BlobDescriptor),
-    /// Rewritten blob. The worker applied the OSC overlay element-by-
-    /// element and re-encoded using its thread-local `BlockBuilder`.
+    /// Rewritten blob, with each output block already framed by the
+    /// worker via `frame_blob_pipelined`. Workers carry the framed
+    /// chunks (not raw `OwnedBlock`s) so the drain side is a single
+    /// `write_raw_owned` per chunk and avoids the writer's rayon
+    /// dispatch path (P1.5 mitigation for the writer-pipeline
+    /// backpressure measured at planet).
     Rewritten {
         seq: u64,
-        blocks: Vec<OwnedBlock>,
+        framed_chunks: Vec<Vec<u8>>,
         kind: ElemKind,
         id_range: (i64, i64),
+        /// Per-blob `MergeStats` produced by `rewrite_block_parallel`.
+        /// Drain calls `MergeStats::merge_from(&stats)` to fold these
+        /// into the run's accumulator (deleted / diff_* / base_* /
+        /// bytes counters).
+        stats: super::stats::MergeStats,
     },
     /// `--direct-io` fallback: worker pread the full frame for a
     /// passthrough descriptor because `copy_file_range` isn't available.
@@ -148,13 +156,18 @@ pub(super) enum DrainItem {
         kind: ElemKind,
         id_range: (i64, i64),
     },
-    /// Rewritten blocks. Drain writes via
-    /// `writer.write_primitive_block_owned` per block.
+    /// Rewritten blob, with each output block already framed by the
+    /// worker (compression + protobuf framing applied in-line via
+    /// `frame_blob_pipelined`). Drain calls `write_raw_owned` per
+    /// chunk - this bypasses the writer's per-block `rayon::spawn`
+    /// dispatch and the associated `writer_pipeline_send_wait_ns`
+    /// spike (P1.5 in the plan). Stats merge as before.
     Rewritten {
         seq: u64,
-        blocks: Vec<OwnedBlock>,
+        framed_chunks: Vec<Vec<u8>>,
         kind: ElemKind,
         id_range: (i64, i64),
+        stats: super::stats::MergeStats,
     },
 }
 
@@ -211,8 +224,8 @@ impl WorkerOutput {
                     tagdata: desc.tagdata,
                 }
             }
-            WorkerOutput::Rewritten { seq, blocks, kind, id_range } => {
-                DrainItem::Rewritten { seq, blocks, kind, id_range }
+            WorkerOutput::Rewritten { seq, framed_chunks, kind, id_range, stats } => {
+                DrainItem::Rewritten { seq, framed_chunks, kind, id_range, stats }
             }
             WorkerOutput::OwnedPassthrough { seq, frame_bytes, kind, id_range } => {
                 DrainItem::OwnedBytes { seq, frame_bytes, kind, id_range }
@@ -265,16 +278,9 @@ impl DrainItem {
             DrainItem::OwnedBytes { frame_bytes, .. } => {
                 DESCRIPTOR_OVERHEAD + frame_bytes.len()
             }
-            DrainItem::Rewritten { blocks, .. } => {
-                // OwnedBlock is (Vec<u8>, BlobIndex, Option<Vec<u8>>):
-                // (block_bytes, index, tagdata).
+            DrainItem::Rewritten { framed_chunks, .. } => {
                 DESCRIPTOR_OVERHEAD
-                    + blocks
-                        .iter()
-                        .map(|(block_bytes, _, tagdata)| {
-                            block_bytes.len() + tagdata.as_ref().map_or(0, Vec::len)
-                        })
-                        .sum::<usize>()
+                    + framed_chunks.iter().map(Vec::len).sum::<usize>()
             }
         }
     }

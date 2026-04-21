@@ -38,16 +38,18 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::blob::decompress_blob_raw;
 use crate::blob_meta::ElemKind;
 use crate::block_builder::BlockBuilder;
 use crate::error::{Error, ErrorKind, Result, new_error};
+use crate::writer::{Compression, frame_blob_pipelined};
 
 use super::classify::block_overlaps_diff;
 use super::descriptor::{BlobDescriptor, DrainItem, ScannedBlob, WorkerOutput};
 use super::diff_ranges::DiffRanges;
+use super::drain::LocMapHandle;
 use super::rewrite_block::rewrite_block_parallel;
 
 use crate::osc::CompactDiffOverlay;
@@ -78,6 +80,21 @@ pub(super) struct StreamingConfig {
     /// the drain merges all slots at the node→way barrier. `None` when
     /// `locations_on_ways` is false.
     pub coord_slots: Option<CoordSlots>,
+    /// Drain → workers post-barrier `loc_map`. `None` when
+    /// `locations_on_ways` is false. Workers reading way/relation
+    /// blobs check `get()` on this; the scanner barrier protocol
+    /// guarantees the lock is set before any way descriptor is
+    /// dispatched.
+    pub loc_map_handle: Option<LocMapHandle>,
+    /// Set of node IDs the workers need to extract coords for. Workers
+    /// filter `extract_node_tuples` output against this so we don't
+    /// blow per-worker RSS by capturing every coord in the file.
+    /// `None` when `locations_on_ways` is false.
+    pub needed_set: Option<Arc<FxHashSet<i64>>>,
+    /// Output compression. Workers frame each rewrite output via
+    /// `frame_blob_pipelined` so the drain side avoids the writer's
+    /// `rayon::spawn`-per-block dispatch (P1.5).
+    pub compression: Compression,
 }
 
 /// Channels owned by the streaming pool.
@@ -111,6 +128,9 @@ pub(super) struct WorkerCounters {
     pub coord_extract_ns: AtomicU64,
     /// Node coord pairs extracted across all workers (LOW only).
     pub coord_pairs_extracted: AtomicU64,
+    /// In-line framing wall summed across all workers (P1.5: avoids
+    /// the writer's rayon-spawn-per-block dispatch).
+    pub frame_ns: AtomicU64,
 }
 
 impl WorkerCounters {
@@ -126,6 +146,7 @@ impl WorkerCounters {
             rewrite_ns: AtomicU64::new(0),
             coord_extract_ns: AtomicU64::new(0),
             coord_pairs_extracted: AtomicU64::new(0),
+            frame_ns: AtomicU64::new(0),
         }
     }
 
@@ -146,6 +167,7 @@ impl WorkerCounters {
         emit!("merge_streaming_rewrite_ns", rewrite_ns);
         emit!("merge_streaming_coord_extract_ns", coord_extract_ns);
         emit!("merge_streaming_coord_pairs_extracted", coord_pairs_extracted);
+        emit!("merge_streaming_frame_ns", frame_ns);
     }
 }
 
@@ -168,6 +190,9 @@ pub(super) fn run_workers(
         worker_count,
         locations_on_ways,
         coord_slots,
+        loc_map_handle,
+        needed_set,
+        compression,
     } = cfg;
     let StreamingChannels { candidate_rx, drain_tx } = channels;
 
@@ -200,6 +225,8 @@ pub(super) fn run_workers(
         for worker_id in 0..worker_count {
             let drain_tx = drain_tx.clone();
             let coord_slot = coord_slots.as_ref().map(|s| Arc::clone(&s[worker_id]));
+            let loc_map_handle = loc_map_handle.as_ref().map(Arc::clone);
+            let needed_set = needed_set.as_ref().map(Arc::clone);
             let file = &shared_file;
             let candidate_rx = &candidate_rx;
             let first_err = &first_err;
@@ -217,6 +244,9 @@ pub(super) fn run_workers(
                     diff,
                     locations_on_ways,
                     coord_slot.as_ref(),
+                    loc_map_handle.as_ref(),
+                    needed_set.as_deref(),
+                    &compression,
                 );
                 if let Err(e) = result {
                     let mut slot =
@@ -258,6 +288,9 @@ fn worker_loop(
     diff: &CompactDiffOverlay,
     locations_on_ways: bool,
     coord_slot: Option<&CoordSlot>,
+    loc_map_handle: Option<&LocMapHandle>,
+    needed_set: Option<&FxHashSet<i64>>,
+    compression: &Compression,
 ) -> Result<()> {
     let mut read_buf: Vec<u8> = Vec::new();
     let mut decompress_buf: Vec<u8> = Vec::new();
@@ -299,6 +332,10 @@ fn worker_loop(
                     &mut local_coords,
                     &mut tuples_scratch,
                     &mut group_starts_scratch,
+                    coord_slot,
+                    loc_map_handle,
+                    needed_set,
+                    compression,
                 )?;
             }
             ScannedBlob::Passthrough(desc) => {
@@ -342,6 +379,10 @@ fn handle_candidate(
     local_coords: &mut FxHashMap<i64, (i32, i32)>,
     tuples_scratch: &mut Vec<crate::scan::node::NodeTuple>,
     group_starts_scratch: &mut Vec<(usize, usize)>,
+    coord_slot: Option<&CoordSlot>,
+    loc_map_handle: Option<&LocMapHandle>,
+    needed_set: Option<&FxHashSet<i64>>,
+    compression: &Compression,
 ) -> Result<()> {
     counters.blobs_processed.fetch_add(1, Ordering::Relaxed);
 
@@ -368,12 +409,21 @@ fn handle_candidate(
         )
         .is_ok()
         {
+            let mut hits = 0u64;
             for t in tuples_scratch.iter() {
+                // Filter to needed_set so the per-worker map doesn't
+                // grow with the whole base PBF's coord population.
+                if let Some(ns) = needed_set
+                    && !ns.contains(&t.id)
+                {
+                    continue;
+                }
                 local_coords.insert(t.id, (t.lat, t.lon));
+                hits += 1;
             }
             counters
                 .coord_pairs_extracted
-                .fetch_add(tuples_scratch.len() as u64, Ordering::Relaxed);
+                .fetch_add(hits, Ordering::Relaxed);
         }
         counters
             .coord_extract_ns
@@ -394,6 +444,18 @@ fn handle_candidate(
         .precise_ns
         .fetch_add(elapsed_ns(t_precise), Ordering::Relaxed);
 
+    // Sync per-worker coords into the shared slot before emitting the
+    // DrainItem. This guarantees the drain's barrier merge (which fires
+    // once `next_seq > last_node_seq`) sees coords for every node blob
+    // whose output has been processed - the `local_coords` map is
+    // private and the drain reads only the shared `CoordSlot`s. For
+    // non-Node blobs `local_coords` is empty so this is a no-op.
+    if let Some(slot) = coord_slot
+        && !local_coords.is_empty()
+    {
+        flush_local_coords(slot, local_coords);
+    }
+
     if !overlaps {
         counters.blobs_false_positive.fetch_add(1, Ordering::Relaxed);
         return send_drain(drain_tx, WorkerOutput::FalsePositive(desc.clone()).into_drain_item());
@@ -404,12 +466,16 @@ fn handle_candidate(
     let (min_id, max_id) = desc.id_range.unwrap_or((i64::MAX, i64::MIN));
     let inline_upserts = upsert_slice(ranges, desc.kind, min_id, max_id);
 
-    // The current loc_map is published by the drain at the node→way
-    // barrier. Workers processing way blobs after the barrier read it via
-    // an Arc clone wired through the worker spawn (TODO: wire the
-    // post-barrier loc_map handle when drain.rs lands; until then, pass
-    // None and rely on the existing classify path).
-    let loc_map: Option<&FxHashMap<i64, (i32, i32)>> = None;
+    // The drain publishes `loc_map` at the node→way barrier; for
+    // way/relation blobs after the barrier, read it via the shared
+    // OnceLock. The scanner barrier protocol guarantees the lock is
+    // set before any non-node descriptor is dispatched to workers.
+    let loc_arc = if locations_on_ways && desc.kind != ElemKind::Node {
+        loc_map_handle.and_then(|h| h.get().cloned())
+    } else {
+        None
+    };
+    let loc_map: Option<&FxHashMap<i64, (i32, i32)>> = loc_arc.as_deref();
 
     let t_rewrite = std::time::Instant::now();
     let output = rewrite_block_parallel(&block, diff, bb, inline_upserts, desc.kind, loc_map)
@@ -418,15 +484,37 @@ fn handle_candidate(
         .rewrite_ns
         .fetch_add(elapsed_ns(t_rewrite), Ordering::Relaxed);
 
+    // P1.5: frame each output block in-line via per-thread scratch so the
+    // drain side can `write_raw_owned` without the writer's
+    // `rayon::spawn`-per-block dispatch (which was the dominant
+    // contributor to `writer_pipeline_send_wait_ns` at planet).
+    let t_frame = std::time::Instant::now();
+    let mut framed_chunks: Vec<Vec<u8>> = Vec::with_capacity(output.blocks.len());
+    for (block_bytes, index, tagdata) in output.blocks {
+        let indexdata = index.serialize();
+        let parts = frame_blob_pipelined(
+            &block_bytes,
+            compression,
+            Some(&indexdata),
+            tagdata.as_deref(),
+        )
+        .map_err(io_err)?;
+        framed_chunks.push(parts.into_vec());
+    }
+    counters
+        .frame_ns
+        .fetch_add(elapsed_ns(t_frame), Ordering::Relaxed);
+
     counters.blobs_rewritten.fetch_add(1, Ordering::Relaxed);
     let id_range = desc.id_range.unwrap_or((0, 0));
     send_drain(
         drain_tx,
         DrainItem::Rewritten {
             seq: desc.seq,
-            blocks: output.blocks,
+            framed_chunks,
             kind: desc.kind,
             id_range,
+            stats: output.stats,
         },
     )
 }

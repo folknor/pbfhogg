@@ -29,9 +29,13 @@ pub(crate) struct RawBlobFrame {
     /// Blob-level index from BlobHeader indexdata, if present.
     pub(crate) index: Option<BlobIndex>,
     /// Per-blob tag key data from BlobHeader field 4, if present.
+    /// Populated by `read_raw_frame` for downstream callers; current
+    /// readers (extract, cat, diff, etc.) don't access it directly,
+    /// but it's part of the wire-correct frame snapshot.
+    #[allow(dead_code)]
     pub(crate) tagdata: Option<Box<[u8]>>,
     /// Byte offset of this frame in the input file (for copy_file_range).
-    #[cfg_attr(not(feature = "linux-direct-io"), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) file_offset: u64,
 }
 

@@ -74,6 +74,11 @@ use super::streaming::CoordSlots;
 /// the published `Arc<FxHashMap>` to resolve OSC way refs.
 pub(super) type LocMapHandle = Arc<OnceLock<Arc<FxHashMap<i64, (i32, i32)>>>>;
 
+/// OSC-pre-seeded coords surrendered to the drain at setup time.
+/// Wrapped in a `Mutex<Option<...>>` so the drain can take ownership at
+/// the barrier through an immutable `&DrainConfig` borrow.
+pub(super) type SeededLocations = std::sync::Mutex<Option<FxHashMap<i64, (i32, i32)>>>;
+
 /// Drain configuration. The writer is passed separately to `run_drain`
 /// (it needs `&mut`, which doesn't compose with the immutable borrows
 /// of the rest of the config in the inner item-processing functions).
@@ -96,6 +101,13 @@ pub(super) struct DrainConfig<'a> {
     /// node→way barrier and merges into `loc_map_out`. `None` when
     /// `locations_on_ways == false`.
     pub coord_slots: Option<CoordSlots>,
+    /// OSC-pre-seeded coords (from `NodeLocationIndex::build_from_diff`).
+    /// Consumed at the barrier merge: drain extends this with every
+    /// worker slot before publishing the merged map. Wrapped in a
+    /// `Mutex<Option<...>>` so the drain can take ownership at the
+    /// barrier even though `cfg` is borrowed immutably elsewhere.
+    /// `None` when `locations_on_ways == false`.
+    pub seeded_locations: Option<SeededLocations>,
     /// Drain → scanner barrier signal. Drain sends a single unit value
     /// after merging coord slots and publishing `loc_map_out`.
     /// `None` when `locations_on_ways == false`.
@@ -111,6 +123,12 @@ pub(super) struct DrainChannels {
     /// Unified DrainItem stream from scanner (fast-path CopyRange) and
     /// workers (Rewritten / converted FalsePositive CopyRange / OwnedBytes).
     pub drain_rx: mpsc::Receiver<DrainItem>,
+    /// Scanner → drain signal carrying the seq of the last Node
+    /// descriptor emitted (or `u64::MAX` if there were no node blobs).
+    /// Drain triggers the `CoordSlots` merge + `loc_map` publish + scanner
+    /// barrier signal as soon as `state.next_seq > last_node_seq`.
+    /// `None` when `locations_on_ways == false`.
+    pub last_node_seq_rx: Option<mpsc::Receiver<u64>>,
 }
 
 /// Atomic counters surfaced as sidecar counters at end of `merge()`.
@@ -183,60 +201,129 @@ pub(super) fn run_drain(
 ) -> Result<MergeStats> {
     crate::debug::emit_marker("MERGE_DRAIN_START");
 
-    let DrainChannels { drain_rx } = channels;
+    let DrainChannels { drain_rx, last_node_seq_rx } = channels;
 
     let mut state = DrainState::new();
     let mut stats = MergeStats::new();
+    let mut last_node_seq: Option<u64> = None;
 
-    // Main loop: pull items, insert into reorder buffer, drain in seq
-    // order. Loop exits when channel closes.
+    // Recv timeout for the main loop. Drain blocks up to this long on
+    // an empty `drain_rx` before polling `last_node_seq_rx` and the
+    // barrier-ready condition. The polling matters under
+    // `--locations-on-ways`: if drain consumes the last node DrainItem
+    // and then blocks on `recv()` *before* scanner sends
+    // `last_node_seq`, both sides deadlock (drain blocks on items, but
+    // workers can't emit any until scanner releases way descriptors,
+    // which scanner won't do until drain signals the barrier). The
+    // timeout breaks the cycle by letting drain re-poll `last_node_seq`
+    // and fire the barrier from idle.
+    //
+    // 25 ms is a tradeoff: tighter polling adds CPU at very small
+    // dataset sizes; looser polling adds latency at the moment of
+    // node→way transition. At planet, the transition fires once per
+    // run, so even 100 ms total polling latency is invisible against
+    // ~100 s wall.
+    let recv_timeout = std::time::Duration::from_millis(25);
+
+    // Main loop: pull items (or timeout), reorder, advance, fire
+    // barrier when ready. Exits when `drain_rx` disconnects AND the
+    // reorder buffer is empty.
+    let mut drain_disconnected = false;
     loop {
         let recv_start = std::time::Instant::now();
-        let item = match drain_rx.recv() {
-            Ok(item) => item,
-            Err(_) => break,
+        let item_opt = if drain_disconnected {
+            None
+        } else {
+            match drain_rx.recv_timeout(recv_timeout) {
+                Ok(item) => Some(item),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    drain_disconnected = true;
+                    None
+                }
+            }
         };
         let wait_ns = u64::try_from(recv_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        // Only count the wait if the buffer was empty when we recv'd
-        // (i.e., we were genuinely blocked on the producer). Otherwise
-        // recv() returns immediately and wait_ns is microseconds at
-        // most.
         if state.buffer.is_empty() {
             counters
                 .reorder_gap_wait_ns
                 .fetch_add(wait_ns, Ordering::Relaxed);
         }
 
-        let seq = item.seq();
-        let cost = item.byte_cost();
-        state.buffer.insert(seq, item);
-        state.bytes_in_buffer += cost;
+        if let Some(item) = item_opt {
+            let seq = item.seq();
+            let cost = item.byte_cost();
+            state.buffer.insert(seq, item);
+            state.bytes_in_buffer += cost;
 
-        // Track high-water marks.
-        let buf_count = state.buffer.len() as u64;
-        let prev_count = counters
-            .reorder_buffer_high_water_count
-            .load(Ordering::Relaxed);
-        if buf_count > prev_count {
-            counters
+            // Track high-water marks.
+            let buf_count = state.buffer.len() as u64;
+            let prev_count = counters
                 .reorder_buffer_high_water_count
-                .store(buf_count, Ordering::Relaxed);
-        }
-        let buf_bytes = state.bytes_in_buffer as u64;
-        let prev_bytes = counters
-            .reorder_buffer_high_water_bytes
-            .load(Ordering::Relaxed);
-        if buf_bytes > prev_bytes {
-            counters
+                .load(Ordering::Relaxed);
+            if buf_count > prev_count {
+                counters
+                    .reorder_buffer_high_water_count
+                    .store(buf_count, Ordering::Relaxed);
+            }
+            let buf_bytes = state.bytes_in_buffer as u64;
+            let prev_bytes = counters
                 .reorder_buffer_high_water_bytes
-                .store(buf_bytes, Ordering::Relaxed);
+                .load(Ordering::Relaxed);
+            if buf_bytes > prev_bytes {
+                counters
+                    .reorder_buffer_high_water_bytes
+                    .store(buf_bytes, Ordering::Relaxed);
+            }
         }
 
-        // Try to advance through contiguous seqs.
+        // Pick up the scanner's `last_node_seq` if it's been sent
+        // (try_recv is cheap; sub-microsecond per iteration). Polled
+        // every loop iteration, including after a recv timeout, so the
+        // barrier-ready check below fires even when no items are
+        // arriving.
+        if cfg.locations_on_ways
+            && last_node_seq.is_none()
+            && let Some(rx) = last_node_seq_rx.as_ref()
+            && let Ok(n) = rx.try_recv()
+        {
+            last_node_seq = Some(n);
+        }
+
+        // Advance through contiguous seqs.
         while let Some(item) = state.buffer.remove(&state.next_seq) {
             state.bytes_in_buffer = state.bytes_in_buffer.saturating_sub(item.byte_cost());
             process_item(item, &cfg, &mut state, writer, &mut stats, counters)?;
             state.next_seq += 1;
+
+            // Barrier check after each processed item: if all node
+            // items have been processed and the barrier hasn't fired
+            // yet, fire it now.
+            if cfg.locations_on_ways
+                && !state.barrier_done
+                && let Some(n) = last_node_seq
+                && (n == u64::MAX || state.next_seq > n)
+            {
+                barrier_publish_loc_map(&cfg, &mut state, counters)?;
+            }
+        }
+
+        // Idle barrier fire: if drain has nothing in the buffer but
+        // the barrier is ready (e.g., the last node item was
+        // processed before scanner sent `last_node_seq`), fire it now
+        // so scanner unblocks. Without this, drain blocks on
+        // recv_timeout, scanner blocks on barrier_rx, workers block
+        // on candidate_rx -> three-way deadlock.
+        if cfg.locations_on_ways
+            && !state.barrier_done
+            && let Some(n) = last_node_seq
+            && (n == u64::MAX || state.next_seq > n)
+        {
+            barrier_publish_loc_map(&cfg, &mut state, counters)?;
+        }
+
+        if drain_disconnected && state.buffer.is_empty() {
+            break;
         }
     }
 
@@ -524,24 +611,31 @@ fn dispatch_variant(
         }
         DrainItem::Rewritten {
             seq: _,
-            blocks,
+            framed_chunks,
             kind,
             id_range,
+            stats: per_blob_stats,
         } => {
             flush_copy_range(state, cfg, writer, counters)?;
             flush_passthrough_buf(&mut state.passthrough_chunks, writer).map_err(io_err)?;
             let mut rewrite_bytes: u64 = 0;
-            for (block_bytes, index, tagdata) in blocks {
-                rewrite_bytes += block_bytes.len() as u64;
-                writer
-                    .write_primitive_block_owned(block_bytes, index, tagdata.as_deref())
-                    .map_err(io_err)?;
+            // P1.5: workers already framed each chunk. Drain ships
+            // them through `write_raw_owned` so the writer's
+            // rayon-spawn-per-block path (and its
+            // `pipeline_send_wait_ns` blowup) is bypassed entirely.
+            for chunk in framed_chunks {
+                rewrite_bytes += chunk.len() as u64;
+                writer.write_raw_owned(chunk).map_err(io_err)?;
                 counters
                     .rewrite_blocks_written
                     .fetch_add(1, Ordering::Relaxed);
             }
             stats.bytes_rewritten += rewrite_bytes;
             stats.blobs_rewritten += 1;
+            // Merge per-blob counters (deleted, diff_*, base_*) into
+            // the run accumulator. This preserves the legacy stats
+            // shape that callers + tests assert on.
+            stats.merge_from(&per_blob_stats);
 
             // Cursor-rule invariant (see the Correctness invariants
             // section in the plan doc): Rewrite advances the cursor
@@ -623,7 +717,20 @@ fn barrier_publish_loc_map(
         )))
     })?;
 
-    let mut merged: FxHashMap<i64, (i32, i32)> = FxHashMap::default();
+    // Seed with OSC pre-seeded coords (from
+    // `NodeLocationIndex::build_from_diff`'s `locations`) before
+    // extending with per-worker accumulators. Take ownership via the
+    // Mutex so subsequent calls (defensive; barrier should fire once)
+    // see an empty map.
+    let mut merged: FxHashMap<i64, (i32, i32)> = cfg
+        .seeded_locations
+        .as_ref()
+        .and_then(|m| {
+            m.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+        })
+        .unwrap_or_default();
     for slot in slots {
         let mut local = slot
             .lock()

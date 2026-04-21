@@ -16,7 +16,6 @@ mod diff_ranges;
 mod drain;
 mod element_writes;
 mod node_locations;
-mod parallel_reader;
 mod rewrite;
 mod rewrite_block;
 mod scanner;

@@ -16,38 +16,34 @@ use super::super::Result;
 use super::blob_meta::BlobMeta;
 use super::{MAX_NODE_ID, NodeBlobInfo, RANK_RECORD_SIZE, RankRecord};
 
-/// Read one varint from a BufRead source. Returns `Ok(None)` on clean
-/// EOF at the start of a varint; `Ok(Some(v))` otherwise.
-///
-/// Used by Pass B to stream the per-blob node-ID lists written by Pass A.
-/// A clean EOF between blobs is how Pass B knows its scratch file is
-/// exhausted; truncated varints (EOF mid-varint) are errors.
-fn read_varint_from<R: std::io::BufRead>(r: &mut R) -> std::io::Result<Option<u64>> {
-    let mut result: u64 = 0;
-    let mut shift: u32 = 0;
-    for byte_idx in 0..10 {
-        let buf = r.fill_buf()?;
-        if buf.is_empty() {
-            if byte_idx == 0 {
-                return Ok(None);
-            }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "truncated varint in pass B scratch",
-            ));
-        }
-        let b = buf[0];
-        r.consume(1);
-        result |= u64::from(b & 0x7F) << shift;
-        if b & 0x80 == 0 {
-            return Ok(Some(result));
-        }
-        shift += 7;
+/// Pass-A-to-Pass-B scratch entry header. One per way blob, fixed 12
+/// bytes LE so Pass B can `read_exact` it in one shot before bulk-
+/// reading the payload. Varint-in-the-header would cost 4.7B trait-
+/// method calls at planet for no real saving.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ScratchBlobHeader {
+    blob_seq: u32,
+    ref_count: u32,
+    payload_bytes: u32,
+}
+
+const SCRATCH_BLOB_HEADER_LEN: usize = 12;
+
+impl ScratchBlobHeader {
+    fn write_to(&self, buf: &mut [u8; SCRATCH_BLOB_HEADER_LEN]) {
+        buf[0..4].copy_from_slice(&self.blob_seq.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.ref_count.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.payload_bytes.to_le_bytes());
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        "varint exceeded 10 bytes",
-    ))
+
+    fn read_from(buf: &[u8; SCRATCH_BLOB_HEADER_LEN]) -> Self {
+        Self {
+            blob_seq: u32::from_le_bytes(buf[0..4].try_into().unwrap_or([0; 4])),
+            ref_count: u32::from_le_bytes(buf[4..8].try_into().unwrap_or([0; 4])),
+            payload_bytes: u32::from_le_bytes(buf[8..12].try_into().unwrap_or([0; 4])),
+        }
+    }
 }
 
 /// Per-worker Pass-A-to-Pass-B scratch path. Each Pass A worker owns
@@ -234,24 +230,38 @@ pub(super) fn stage1_pass_a(
 
                             // Fused #3: write this blob's node-ID list
                             // to the per-worker scratch so Pass B can
-                            // skip pread+decompress+scan. Absolute
-                            // unsigned varints (simplest; delta-varint
-                            // is a follow-up). Self-describing: Pass B
-                            // reads blob_seq, ref_count, then that many
-                            // ID varints, looping to EOF.
+                            // skip pread+decompress+scan. Layout:
+                            //   [fixed ScratchBlobHeader 12 bytes LE]
+                            //   [ref_count x u64-varint absolute IDs]
+                            // Fixed header + varint payload lets Pass B
+                            // `read_exact` the header and bulk-load the
+                            // payload, then decode with the tight
+                            // `protohoggr::Cursor` fast paths. Byte-at-
+                            // a-time BufRead decoding was ~35% of Pass
+                            // B wall on Europe; this moves it to bulk
+                            // memcpy + tight-loop varint decode.
                             scratch_buf.clear();
-                            protohoggr::encode_varint(&mut scratch_buf, u64::from(task.seq));
-                            #[allow(clippy::cast_possible_truncation)]
-                            protohoggr::encode_varint(&mut scratch_buf, blob_node_ids.len() as u64);
                             for &node_id in &blob_node_ids {
                                 #[allow(clippy::cast_sign_loss)]
                                 protohoggr::encode_varint(&mut scratch_buf, node_id as u64);
                             }
+                            #[allow(clippy::cast_possible_truncation)]
+                            let header = ScratchBlobHeader {
+                                blob_seq: task.seq,
+                                ref_count: blob_node_ids.len() as u32,
+                                payload_bytes: scratch_buf.len() as u32,
+                            };
+                            let mut header_bytes = [0u8; SCRATCH_BLOB_HEADER_LEN];
+                            header.write_to(&mut header_bytes);
+                            scratch_writer
+                                .write_all(&header_bytes)
+                                .map_err(|e| format!("pass A scratch write header: {e}"))?;
                             scratch_writer
                                 .write_all(&scratch_buf)
-                                .map_err(|e| format!("pass A scratch write: {e}"))?;
+                                .map_err(|e| format!("pass A scratch write payload: {e}"))?;
                             #[allow(clippy::cast_possible_truncation)]
-                            scratch_bytes_ref.fetch_add(scratch_buf.len() as u64, Relaxed);
+                            scratch_bytes_ref
+                                .fetch_add((SCRATCH_BLOB_HEADER_LEN + scratch_buf.len()) as u64, Relaxed);
 
                             Ok((blob_node_ids.len() as u64, per_way_rcs))
                         })();
@@ -512,6 +522,8 @@ pub(super) fn stage1_way_pass(
 
                     let mut rec_buf = [0u8; RANK_RECORD_SIZE];
                     let mut blob_node_ids: Vec<i64> = Vec::new();
+                    let mut payload_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+                    let mut header_buf = [0u8; SCRATCH_BLOB_HEADER_LEN];
 
                     loop {
                         if err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
@@ -519,71 +531,63 @@ pub(super) fn stage1_way_pass(
                         }
 
                         let t_read = std::time::Instant::now();
-                        // Read next blob entry from scratch: blob_seq,
-                        // ref_count, then ref_count ID varints.
-                        let blob_seq = match read_varint_from(&mut scratch_reader) {
-                            Ok(Some(v)) => {
-                                #[allow(clippy::cast_possible_truncation)]
-                                { v as u32 }
+                        // Read fixed 12-byte header. A read of 0 bytes
+                        // is clean EOF; a partial read is a truncation
+                        // error.
+                        use std::io::Read as _;
+                        match scratch_reader.read(&mut header_buf) {
+                            Ok(0) => break, // clean EOF
+                            Ok(SCRATCH_BLOB_HEADER_LEN) => {}
+                            Ok(partial) => {
+                                // Grab the rest of the header; the
+                                // normal case is `read` returns the
+                                // whole 12 bytes on the first call
+                                // because BufReader's internal buffer
+                                // is > 12 bytes. But we may be at the
+                                // exact boundary where only the first
+                                // N bytes were available; read_exact
+                                // handles that.
+                                if let Err(e) =
+                                    scratch_reader.read_exact(&mut header_buf[partial..])
+                                {
+                                    *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                        Some(format!("pass B scratch read header tail: {e}"));
+                                    break;
+                                }
                             }
-                            Ok(None) => break, // clean EOF
                             Err(e) => {
                                 *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                    Some(format!("pass B scratch read blob_seq: {e}"));
+                                    Some(format!("pass B scratch read header: {e}"));
                                 break;
                             }
-                        };
-                        let ref_count = match read_varint_from(&mut scratch_reader) {
-                            Ok(Some(v)) => v,
-                            Ok(None) => {
-                                *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                    Some(format!(
-                                        "pass B scratch eof after blob_seq {blob_seq}"
-                                    ));
-                                break;
-                            }
-                            Err(e) => {
-                                *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                    Some(format!("pass B scratch read ref_count: {e}"));
-                                break;
-                            }
-                        };
+                        }
+                        let header = ScratchBlobHeader::read_from(&header_buf);
+                        let blob_seq = header.blob_seq;
+                        let ref_count = header.ref_count;
+                        let payload_bytes = header.payload_bytes as usize;
 
                         let blob_result: std::result::Result<(), String> = (|| {
+                            payload_buf.resize(payload_bytes, 0);
+                            scratch_reader
+                                .read_exact(&mut payload_buf)
+                                .map_err(|e| {
+                                    format!("pass B scratch read payload blob {blob_seq}: {e}")
+                                })?;
                             blob_node_ids.clear();
-                            #[allow(clippy::cast_possible_truncation)]
                             blob_node_ids.reserve(ref_count as usize);
-                            let mut scratch_byte_count: u64 = 0;
+                            let mut cur = protohoggr::Cursor::new(&payload_buf);
                             for _ in 0..ref_count {
-                                match read_varint_from(&mut scratch_reader) {
-                                    Ok(Some(v)) => {
-                                        #[allow(clippy::cast_possible_wrap)]
-                                        blob_node_ids.push(v as i64);
-                                        // Estimate scratch bytes read
-                                        // as ~ref_count * 4 bytes on
-                                        // average; precise measurement
-                                        // would need the fill_buf
-                                        // position, which BufRead hides.
-                                        scratch_byte_count += 1;
-                                    }
-                                    Ok(None) => {
-                                        return Err(format!(
-                                            "pass B scratch eof inside blob {blob_seq} \
-                                             after {} / {ref_count} ids",
-                                            blob_node_ids.len()
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        return Err(format!(
-                                            "pass B scratch read id in blob {blob_seq}: {e}"
-                                        ));
-                                    }
-                                }
+                                let v = cur.read_varint().map_err(|e| {
+                                    format!("pass B varint decode blob {blob_seq}: {e}")
+                                })?;
+                                #[allow(clippy::cast_possible_wrap)]
+                                blob_node_ids.push(v as i64);
                             }
                             #[allow(clippy::cast_possible_truncation)]
                             s1b_scratch_read_ref
                                 .fetch_add(t_read.elapsed().as_millis() as u64, Relaxed);
-                            s1b_scratch_bytes_read_ref.fetch_add(scratch_byte_count, Relaxed);
+                            s1b_scratch_bytes_read_ref
+                                .fetch_add((SCRATCH_BLOB_HEADER_LEN + payload_bytes) as u64, Relaxed);
 
                             let slot_start = slot_starts_ref[blob_seq as usize];
                             s1b_refs_total_ref.fetch_add(blob_node_ids.len() as u64, Relaxed);

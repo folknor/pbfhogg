@@ -240,13 +240,13 @@ pub(super) fn stage4_assembly(
 
     let decode_threads = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(4)
-        // Streaming cap (item #2): stage 3 and stage 4 worker buffers
-        // are now both resident concurrently. Back off from the
-        // pre-streaming cap so peak anon RSS doesn't balloon on a 30 GB
-        // planet host. See notes/altw-structural-reports.md #2 "Worker
-        // budgets under overlap".
-        .min(4);
+        .unwrap_or(4);
+    // Pre-streaming baseline had no cap (ran 22 threads on a 24-core
+    // host); the initial Commit B run capped at .min(4) and measured a
+    // +11.5% Europe regression because stage 4 decode throughput fell
+    // off a cliff. The streaming overlap's readiness wait is
+    // effectively zero-cost (s4_readiness_wait_max_ms=0 on Europe), so
+    // stage 4 is still CPU/writer-bound. Keep uncapped.
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("s4_decode_thread_count", decode_threads as i64);
 

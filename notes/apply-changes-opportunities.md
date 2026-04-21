@@ -4,16 +4,22 @@ Target: `pbfhogg apply-changes --locations-on-ways` on planet with a daily OSC, 
 
 ## Current state (2026-04-21, post-flip landing `719f306` + io_uring writer + cross-disk experiment)
 
-- **Best planet wall measured: 82.8 s** (LOW + altw + OSC 4913 + `--compression zstd:1` + `--io-uring` + scratch on different physical NVMe). Pre-flip baseline was 144.4 s on same hardware: **-43% wall**. Plan target was 40-55 s; the remaining ~30 s gap is now the single-thread writer (~64 s `writer_write_ns` at 1.5 GB/s), addressable only by a parallel writer or higher-bandwidth target storage (RAID-0 across NVMes).
-- **Planet matrix at commit `2a43702`:**
+- **Best planet wall measured: 80.9 s** (LOW + altw + OSC 4913 + `--compression zstd:1` + `--parallel-writer` + scratch on different physical NVMe). Pre-flip baseline was 144.4 s on same hardware: **-44% wall**. Plan target was 40-55 s; the remaining ~30 s gap is now the CPU floor + pipeline send-wait, addressable only by further parallelism (more pool workers don't help beyond 16) or lifting the drain's single-thread send bottleneck.
+- **Planet matrix at commit `80b37df`:**
 
-| Config | Buffered writer | `--io-uring` writer | Δ |
+| Config | Buffered | `--io-uring` | `--parallel-writer` (POOL_SIZE=16) |
 |---|---:|---:|---:|
-| Same-disk (source+output on Banan/nvme1n1), `--compression none` | 135.5 s | 108.6 s | -27 s |
-| Same-disk, `--compression zlib:6` | 143.7 s | not benched | - |
-| Same-disk, `--compression zstd:1` | 121.2 s | 99.4 s | -22 s |
-| Cross-disk (output on Booty/nvme0n1p3), `--compression none` | 95.4 s | 93.0 s | -2 s |
-| Cross-disk, `--compression zstd:1` | 87.1 s | **82.8 s** | -4 s |
+| Same-disk (source+output on Banan/nvme1n1), `--compression none` | 135.5 s | 108.6 s | not benched |
+| Same-disk, `--compression zlib:6` | 143.7 s | not benched | not benched |
+| Same-disk, `--compression zstd:1` | 121.2 s | 99.4 s | 104.5 s |
+| Cross-disk (output on Booty/nvme0n1p3), `--compression none` | 95.4 s | 93.0 s | 99.0 s |
+| Cross-disk, `--compression zlib:6` | not benched | not benched | 117.4 s |
+| Cross-disk, `--compression zstd:1` | 87.1 s | 82.8 s | **80.9 s** |
+
+- **Writer-backend choice by disk configuration:**
+  - **Same-disk**: io_uring wins at every compression level. Same-disk is IOPS-bound (reads compete with writes on the one NVMe); io_uring's queue-depth batching alleviates IOPS contention more than parallel `pwrite` threads, which each issue their own syscalls.
+  - **Cross-disk**: `--parallel-writer` wins at zstd:1 (our most-compressed path). io_uring still wins at `--compression none` cross-disk. Parallel pool saturates NVMe write bandwidth when there's headroom; io_uring is near-optimal when the disk is already near max throughput.
+  - **Pool size**: measured 4 → 89 s, 8 → 83 s, 16 → 81 s, 32 → 82 s at planet zstd:1 cross-disk. 16 is the sweet spot on plantasjen (Samsung 990 PRO NVMe); pool above 16 over-contends on the device's internal parallelism.
 
 - **Diagnosis of the 82.8 s ceiling** (cross-disk + io_uring + zstd:1):
   - `writer_write_ns = 64 s`, single-thread writer at 1.49 GB/s (95.6 GB output / 64 s). NVMe sequential peak is ~5 GB/s, so the writer thread is at ~30 % of disk peak even with io_uring batching.
@@ -52,7 +58,14 @@ Hardware for reference:
 | Post-flip + P1.5 + io_uring | none | io_uring | Banan | **108.6 s** | 119 GB | 66.6 s | 43.4 s | - | - | io_uring on same-disk: -27 s vs buffered. Writer disk throughput 991 MB/s → 1.79 GB/s. `writer_recv_wait_ns = 35.7 s` - writer now occasionally waits for drain (role reversed). |
 | Post-flip + P1.5 + io_uring | zstd:1 | io_uring | Banan | **99.4 s** | 95 GB | - | - | - | - | io_uring + zstd:1 same-disk: -21.8 s vs buffered. |
 | Post-flip + P1.5 + io_uring (cross-disk) | none | io_uring | Booty | **93.0 s** | 119 GB | 75 s | 89 s | - | - | io_uring gain collapses cross-disk (-2 s only) - read+write was the same-disk ceiling, not writer IOPS. |
-| Post-flip + P1.5 + io_uring (cross-disk) | zstd:1 | io_uring | Booty | **82.8 s** | 95 GB | 64.2 s | 81.5 s | - | 2.86 GB | **Best result**: -43 % vs 144.4 s pre-flip. Writer thread still ~64 s / 30 % of NVMe headroom - single-thread writer is the remaining ceiling. |
+| Post-flip + P1.5 + io_uring (cross-disk) | zstd:1 | io_uring | Booty | 82.8 s | 95 GB | 64.2 s | 81.5 s | - | 2.86 GB | Writer thread at ~64 s / 30 % of NVMe headroom - single-thread writer was the ceiling. |
+| Post-flip + P1.5 + parallel-writer POOL_SIZE=4 (cross-disk) | zstd:1 | parallel (4 workers) | Booty | 89.2 s | 95 GB | 223 s cumulative | 62 s | - | - | Scaffold attempt before tuning pool size. |
+| Post-flip + P1.5 + parallel-writer POOL_SIZE=8 (cross-disk) | zstd:1 | parallel (8 workers) | Booty | 83.4 s | 95 GB | - | - | - | - | Halfway between 4 and 16. |
+| Post-flip + P1.5 + parallel-writer POOL_SIZE=16 (cross-disk) | zstd:1 | parallel (16 workers) | Booty | **80.9 s** | 95 GB | - | - | - | - | **Best overall result**: -44 % vs 144.4 s pre-flip. Ties with io_uring cross-disk at current best configuration. |
+| Post-flip + P1.5 + parallel-writer POOL_SIZE=32 (cross-disk) | zstd:1 | parallel (32 workers) | Booty | 82.2 s | 95 GB | - | - | - | - | Regresses vs POOL_SIZE=16; NVMe queue saturated around 16. |
+| Post-flip + P1.5 + parallel-writer POOL_SIZE=16 (same-disk) | zstd:1 | parallel (16 workers) | Banan | 104.5 s | 95 GB | - | - | - | - | Same-disk: io_uring (99.4 s) beats parallel, IOPS contention dominates. |
+| Post-flip + P1.5 + parallel-writer POOL_SIZE=16 (cross-disk) | none | parallel (16 workers) | Booty | 99.0 s | 119 GB | - | - | - | - | zstd:1 still wins at cross-disk despite higher CPU cost. |
+| Post-flip + P1.5 + parallel-writer POOL_SIZE=16 (cross-disk) | zlib:6 | parallel (16 workers) | Booty | 117.4 s | 93 GB | - | - | - | - | zlib:6's higher compression CPU costs more than its smaller output saves. |
 
 Europe LOW altw + OSC 4715, `--bench 3` (reference):
 
@@ -1364,11 +1377,7 @@ These are the parts of today's code that survive P1 unchanged. The batch-loop ma
 
 16. ~~**Target-disk experiment (new, 2026-04-21).**~~ **Measured 2026-04-21.** Source (Banan/nvme1n1) + output (Booty/nvme0n1p3, different physical NVMe) dropped planet `--compression none` from 138 s (direct invocation, same-disk) to 95.4 s cross-disk (-31 %). zstd:1 cross-disk: 121.2 s → 87.1 s (-29 %). This confirms the bottleneck on same-disk was read+write contention on one NVMe, not a software issue. The `target=hdd` label in the brokkr.toml was misleading: brokkr actually writes bench output to `scratch`, which symlinks to Banan (NVMe). The "hdd" classification was for an unrelated dir (cargo build output). Corrected in the Current state section.
 
-17. **Parallel writer for the `--compression none` production case (new, 2026-04-21).** At 82.8 s (best planet config: `--io-uring` + cross-disk + zstd:1), `writer_write_ns` = 64 s is the dominant floor. Single-thread writer on NVMe peaks at ~1.5 GB/s despite the drive's ~5 GB/s sequential-write headroom. Options:
-    - **Multi-file output with stitch at end**: N writer threads write to N separate files (different file offsets or different files), then a final concat / single-writer merge-pass assembles the output PBF. Works on any filesystem; concat phase is sequential (~20 s at 5 GB/s for 95 GB). Should push writer floor to ~13 s wall at 22 cores, putting planet apply-changes at ~50 s (worker CPU floor + writer floor + setup). Matches the plan's 40-55 s target.
-    - **pwrite-based parallel writer on one file**: N writer threads each own a disjoint file region, use `pwrite` with explicit offsets. Requires knowing output size in advance, or padding + truncate at end. Cleaner than multi-file but harder to size under compression.
-    - **RAID-0 storage**: two NVMes striped as target doubles per-thread bandwidth without code changes. Not a code lever.
-    Recommended next: multi-file output with stitch, since it's the one fully under our control.
+17. ~~**Parallel writer** (new, 2026-04-21).~~ **Landed `4ec3589` + tuned `80b37df`.** `PbfWriter::to_path_parallel` spawns a writer thread that round-robins (offset, bytes) WriteOps across a pool of `POOL_SIZE=16` pwrite-based workers on a shared file descriptor. Writer thread reorders incoming items via the existing WRITE_AHEAD ReorderBuffer, computes offsets serially, dispatches to the pool. Workers run `pwrite` (for Raw / Framed / RawChunks) or `copy_file_range` (for CopyRange) at the pre-computed offset; cross-device copy_file_range (EXDEV) falls back to pread+pwrite with explicit offsets. CLI flag: `pbfhogg apply-changes --parallel-writer` (mutually exclusive with `--direct-io` / `--io-uring` in the current implementation). Pool size 16 chosen empirically (see matrix in Current state). Best planet wall: **80.9 s** cross-disk zstd:1, ties/beats io_uring depending on configuration.
 
 ### Items folded into P1 (no longer separate)
 

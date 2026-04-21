@@ -354,7 +354,7 @@ fn trailing_creates_after_node_blob_flush_way_and_relation() {
 }
 
 // ---------------------------------------------------------------------------
-// Permissive missing-element semantics (see DEVIATIONS.md):
+// Permissive missing-element semantics (see reference/osmium-parity.md):
 // - <modify> on absent ID silently inserts
 // - <delete> on absent ID is a silent no-op
 // - <create> on existing ID silently overwrites
@@ -392,9 +392,9 @@ fn modify_on_missing_id_silently_inserts() {
     assert_eq!(
         node_ids,
         vec![1, 42],
-        "modify on absent ID is treated as an insert (DEVIATIONS.md: \
+        "modify on absent ID is treated as an insert (reference/osmium-parity.md: \
          apply-changes permissive missing-element semantics). If this \
-         changes, update DEVIATIONS.md."
+         changes, update reference/osmium-parity.md."
     );
 }
 
@@ -428,7 +428,7 @@ fn delete_on_missing_id_is_noop() {
     assert_eq!(
         c.nodes.iter().map(|n| n.0).collect::<Vec<_>>(),
         vec![1],
-        "delete on absent ID is a silent no-op (DEVIATIONS.md: \
+        "delete on absent ID is a silent no-op (reference/osmium-parity.md: \
          apply-changes permissive missing-element semantics). Base \
          node 1 untouched; nothing else emitted."
     );
@@ -467,7 +467,7 @@ fn create_on_existing_id_overwrites_base() {
         c.nodes.len(),
         1,
         "create on existing ID must not duplicate: exactly one node \
-         with id=42 in output (DEVIATIONS.md: apply-changes permissive \
+         with id=42 in output (reference/osmium-parity.md: apply-changes permissive \
          missing-element semantics)."
     );
     let n = &c.nodes[0];

@@ -79,13 +79,17 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   Audit confirmed every missing-element case is already tolerated silently:
   modify-on-missing inserts, delete-on-missing is a no-op, create-on-existing
   overwrites, and way/relation refs to absent nodes get `(0, 0)` under
-  `--locations-on-ways` with a `loc_missing` counter in the summary.
-  Documented in
-  [DEVIATIONS.md](DEVIATIONS.md#apply-changes-permissive-missing-element-semantics);
-  three new invariants in `tests/apply_changes_invariants.rs` pin the
-  behaviour. Incremental extract works against current `apply-changes`
-  with no flag. The related stretch item below ("Incremental extract
-  update") is already unblocked.
+  `--locations-on-ways` with a `loc_missing` count in the summary.
+  Independent-reader verification against the vendored
+  `research/osmium-tool/src/command_apply_changes.cpp` confirmed osmium
+  matches this permissive behaviour (not a deviation - positive parity),
+  so the scenario table lives in
+  [reference/osmium-parity.md](reference/osmium-parity.md#apply-changes-permissive-missing-element-semantics-parity)
+  alongside osmium file:line anchors. Three new invariants in
+  `tests/apply_changes_invariants.rs` pin the pbfhogg behaviour.
+  Incremental extract works against current `apply-changes` with no flag.
+  The related stretch item below ("Incremental extract update") is
+  already unblocked.
 
 ## Performance
 
@@ -486,7 +490,7 @@ per-iteration allocations remain across the codebase, ordered by impact:
   region → updated extract without re-reading planet).
   Recommended: compose two existing commands - `apply-changes` on
   the region extract (current apply-changes already tolerates OSC ops
-  referencing elements outside the region; see DEVIATIONS.md), then
+  referencing elements outside the region; see reference/osmium-parity.md), then
   `extract` to re-filter to the bbox. ~10s vs 862s
   for the full-planet pipeline. Works for simple strategy immediately.
   Complete/smart strategies need planet access for newly referenced

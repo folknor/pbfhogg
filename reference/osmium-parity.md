@@ -212,6 +212,80 @@ These osmium flags have no pbfhogg equivalent:
 | `create-locations-index` / `query-locations-index` | Not needed. pbfhogg builds indexes in-memory via anonymous mmap. |
 | `show` | Implemented via `inspect --show <TYPE_ID>` |
 
+## apply-changes: permissive missing-element semantics (parity)
+
+Both tools silently tolerate every missing-element edge case in
+`apply-changes`. This is positive parity, not a deviation - users
+migrating from osmium can rely on the same behaviour. No flag is
+required in either tool.
+
+| OSC op | Element state in base | Outcome (both tools) |
+|---|---|---|
+| `<create>` on existing ID | present | Silent overwrite (treated as modify). Base record is replaced with the OSC record. |
+| `<modify>` on absent ID | absent | Silent insert (treated as create). OSC record is written. |
+| `<delete>` on absent ID | absent | Silent no-op. |
+| way/relation ref to absent node | absent from base AND from OSC | pbfhogg under `--locations-on-ways`: `(0, 0)` sentinel coord; missing-node count is reported in the summary as `loc_missing` (derived post-hoc from `needed - resolved`, not per-site incremented). pbfhogg without `--locations-on-ways`: the ref is written bare, no coordinate lookup. osmium with `--locations-on-ways`: identical `(0, 0)` fallback via `location_index.get_noexcept` + `if (location)` guard; no warning. |
+
+**Rationale (applies to both projects).** The motivating workload is
+incremental-extract - region-extracted base PBF plus a full-planet
+daily OSC, then re-extract by bbox. Such pipelines routinely
+reference OSC elements (nodes outside the region, ways whose refs
+extend outside the region) that are not in the base. Failing by
+default would force every such user to pass an opt-out flag that is
+the right behaviour in virtually all cases.
+
+The `(0, 0)` coordinate sentinel under `--locations-on-ways` is
+consistent with the Null Island convention used elsewhere in pbfhogg
+(see [CORRECTNESS.md](../CORRECTNESS.md) "Null Island ambiguity in
+dense mmap index"); ways referencing nodes exactly at Null Island
+are indistinguishable from ways referencing absent nodes. This
+affects zero real-world nodes (nearest land ~570 km).
+
+**pbfhogg implementation anchors:**
+
+- Upsert semantics: `src/commands/apply_changes/rewrite_block.rs`
+  (the walker treats `diff.get_node/way/relation(id)` hits as
+  replacements regardless of whether the ID was in base).
+- Delete no-ops: arise naturally - the `deleted_nodes` /
+  `deleted_ways` / `deleted_relations` sets are only consulted while
+  walking base elements, so a delete of an absent ID has nothing to
+  skip.
+- `(0, 0)` fallback under `--locations-on-ways`:
+  `src/commands/apply_changes/element_writes.rs` (search
+  `locations.push((0, 0))`).
+- `loc_missing` counter: defined in
+  `src/commands/apply_changes/stats.rs`, computed in
+  `src/commands/apply_changes/rewrite.rs` via
+  `loc_stats_pre.2.saturating_sub(extracted)`, and reported in the
+  summary line by `MergeStats::print_summary`.
+
+**osmium implementation anchors** (vendored under
+[`research/osmium-tool/`](../research/osmium-tool/) and
+[`research/libosmium/`](../research/libosmium/)):
+
+- `research/osmium-tool/src/command_apply_changes.cpp`:
+  `copy_first_with_id` + `std::set_union` over reverse-version-sorted
+  inputs (lines ~174-181 for the dedup by ID, ~363-368 for the
+  merge). The write is gated on `obj.visible()`.
+- `research/libosmium/include/osmium/io/detail/xml_input_format.hpp`
+  around line 281: `<delete>` entries arrive with `visible=false`, so
+  `copy_first_with_id` skips them on absent IDs - no error path.
+- `update_nodes_if_way` in `command_apply_changes.cpp` (~lines
+  185-196): `location_index.get_noexcept(...)`, then
+  `if (location) set_location(...)` - missing nodes fall through
+  silently.
+
+No `throw`, `std::cerr` warning, or validation is raised on any of
+the four scenarios in the osmium apply-changes code path.
+
+**Test coverage (pbfhogg):** `tests/apply_changes_invariants.rs`
+pins the three non-ALTW scenarios as regression anchors:
+`modify_on_missing_id_silently_inserts`,
+`delete_on_missing_id_is_noop`,
+`create_on_existing_id_overwrites_base`. The ALTW `(0, 0)` fallback
+is exercised end-to-end by the Denmark byte-equal cross-validation
+against osmium (`brokkr verify apply-changes`).
+
 ## Indexdata
 
 pbfhogg can embed blob-level indexdata into PBF files, enabling fast

@@ -5,7 +5,8 @@
 use super::radix::advise_dontneed_file;
 use super::super::Result;
 use super::coord_payloads::{
-    encode_blob_payload_from_record, ManifestEntry, PerWayRcs, StraddlerSlot,
+    encode_blob_payload_from_record, AbortOnDrop, ConcurrentBlobLocationRouter, PerWayRcs,
+    StraddlerSide,
 };
 use super::blob_bucket_index::{classify_blobs_in_bucket, BlobBucketIntersection};
 use super::{RESOLVED_ENTRY_SIZE, COORD_SLOT_SIZE};
@@ -16,56 +17,16 @@ pub(super) struct SlotBucketRef {
     pub(super) entry_counts: Vec<u64>,
 }
 
-/// Inputs needed for the integrated dual-emit path.
+/// Inputs needed for the integrated dual-emit path. In the streaming
+/// design (Commit B of #2), stage 3 publishes directly to the
+/// `ConcurrentBlobLocationRouter` instead of returning manifests; the
+/// `worker_tmp_paths` and `straddler_slots` members of the pre-streaming
+/// shape are gone - worker tmp files live as `Arc<File>` inside the
+/// router, and straddler halves are staged by `router.publish_straddler_half`.
 pub(super) struct IntegratedInputs<'a> {
     pub way_slot_starts: &'a [u64],
     pub per_way_rcs: &'a PerWayRcs,
-    pub worker_tmp_paths: &'a [std::path::PathBuf],
-    pub straddler_slots: &'a [std::sync::Mutex<Option<StraddlerSlot>>],
-}
-
-/// Manifests produced by stage 3 workers in the integrated path.
-pub(super) struct IntegratedResult {
-    pub worker_manifests: Vec<Vec<ManifestEntry>>,
-}
-
-/// Left or right half of a straddler blob.
-enum HalfSide {
-    Left,
-    Right,
-}
-
-/// Update the straddler staging for `blob_idx` with one raw-byte half.
-fn merge_straddler(
-    straddler_slots: &[std::sync::Mutex<Option<StraddlerSlot>>],
-    blob_idx: usize,
-    side: HalfSide,
-    bytes: Vec<u8>,
-) -> std::result::Result<(), String> {
-    let mut guard = straddler_slots[blob_idx]
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let new = match (guard.take(), side) {
-        (None, HalfSide::Left) => StraddlerSlot::Left(bytes),
-        (None, HalfSide::Right) => StraddlerSlot::Right(bytes),
-        (Some(StraddlerSlot::Left(left)), HalfSide::Right) => {
-            StraddlerSlot::Both { left, right: bytes }
-        }
-        (Some(StraddlerSlot::Right(right)), HalfSide::Left) => {
-            StraddlerSlot::Both { left: bytes, right }
-        }
-        (Some(StraddlerSlot::Left(_)), HalfSide::Left) => {
-            return Err(format!("blob {blob_idx}: duplicate left half"));
-        }
-        (Some(StraddlerSlot::Right(_)), HalfSide::Right) => {
-            return Err(format!("blob {blob_idx}: duplicate right half"));
-        }
-        (Some(StraddlerSlot::Both { .. }), _) => {
-            return Err(format!("blob {blob_idx}: third straddler half impossible"));
-        }
-    };
-    *guard = Some(new);
-    Ok(())
+    pub router: &'a ConcurrentBlobLocationRouter,
 }
 
 fn scatter_bucket_entries(
@@ -113,7 +74,7 @@ pub(super) fn stage3_slot_reorder(
     slot_bucket_count: usize,
     total_slots: u64,
     integrated: &IntegratedInputs<'_>,
-) -> Result<IntegratedResult> {
+) -> Result<()> {
     // Floor division: every bucket is `range_size` slots wide except
     // the LAST, which extends to `total_slots` and may be wider. This
     // keeps the smallest-bucket-width = range_size, which the caller
@@ -122,10 +83,15 @@ pub(super) fn stage3_slot_reorder(
     // `ResolvedEntry::slot_bucket` for the matching routing logic.)
     let range_size = total_slots / slot_bucket_count as u64;
 
+    // Streaming cap (item #2): stage 3 and stage 4 worker buffers are
+    // now both resident concurrently. Back off from the pre-streaming
+    // `.min(6)` so peak anon RSS doesn't balloon on a 30 GB planet host.
+    // See notes/altw-structural-reports.md #2 "Worker budgets under overlap".
+    // Must match the worker tmp file count allocated by mod.rs.
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))
         .unwrap_or(4)
-        .min(6);
+        .min(4);
 
     let next_idx = std::sync::atomic::AtomicUsize::new(0);
     let s3_open_ms = std::sync::atomic::AtomicU64::new(0);
@@ -166,28 +132,34 @@ pub(super) fn stage3_slot_reorder(
     let s3_integ_worker_tmp_bytes_ref = &s3_integ_worker_tmp_bytes;
 
     let ctx = integrated;
+    let router = ctx.router;
 
-    let worker_manifests: Vec<Vec<ManifestEntry>> = std::thread::scope(|scope| {
+    std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(num_workers);
         for worker_id in 0..num_workers {
-            let handle = scope.spawn(move || -> std::result::Result<Vec<ManifestEntry>, String> {
+            let handle = scope.spawn(move || -> std::result::Result<(), String> {
                 use std::sync::atomic::Ordering::Relaxed;
+
+                // Panic-safety: if this closure unwinds before `disarm`,
+                // the Drop impl calls `router.abort(...)`, waking every
+                // stage-4 wait_ready caller. Without this, a panicking
+                // worker would leave stage 4 blocked indefinitely.
+                let abort_guard = AbortOnDrop::new(router, "stage 3 worker");
 
                 let mut data_buf: Vec<u8> = Vec::new();
                 let mut scatter_buf: Vec<u8> = Vec::new();
                 let mut encode_scratch: Vec<u8> = Vec::new();
-                let mut manifest: Vec<ManifestEntry> = Vec::new();
                 let mut tmp_byte_pos: u64 = 0;
 
-                let tmp_file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&ctx.worker_tmp_paths[worker_id])
-                    .map_err(|e| format!("create worker tmp {worker_id}: {e}"))?;
+                let tmp_file = router.worker_file(worker_id);
 
                 loop {
-                    if err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
+                    if router.is_aborted()
+                        || err_ref
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .is_some()
+                    {
                         break;
                     }
                     let bucket_idx = next_ref.fetch_add(1, Relaxed);
@@ -218,8 +190,10 @@ pub(super) fn stage3_slot_reorder(
                             scatter_buf.resize(bucket_bytes, 0);
                             emit_integrated_intersections(
                                 &intersections, &scatter_buf, bucket_start,
-                                total_slots, ctx, &mut encode_scratch, &mut manifest,
-                                &mut tmp_byte_pos, &tmp_file,
+                                total_slots, ctx, &mut encode_scratch,
+                                #[allow(clippy::cast_possible_truncation)]
+                                { worker_id as u32 },
+                                &mut tmp_byte_pos, tmp_file,
                                 s3_integ_encode_ref, s3_integ_straddler_copy_ref,
                                 s3_integ_worker_tmp_bytes_ref,
                             )?;
@@ -298,8 +272,10 @@ pub(super) fn stage3_slot_reorder(
                         ).map_err(|e| format!("classify bucket {bucket_idx}: {e}"))?;
                         emit_integrated_intersections(
                             &intersections, &scatter_buf, bucket_start,
-                            total_slots, ctx, &mut encode_scratch, &mut manifest,
-                            &mut tmp_byte_pos, &tmp_file,
+                            total_slots, ctx, &mut encode_scratch,
+                            #[allow(clippy::cast_possible_truncation)]
+                            { worker_id as u32 },
+                            &mut tmp_byte_pos, tmp_file,
                             s3_integ_encode_ref, s3_integ_straddler_copy_ref,
                             s3_integ_worker_tmp_bytes_ref,
                         )?;
@@ -308,29 +284,29 @@ pub(super) fn stage3_slot_reorder(
                     })();
 
                     if let Err(e) = result {
-                        *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e.clone());
+                        *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(e.clone());
+                        router.abort(format!("stage 3 worker {worker_id} error: {e}"));
                         return Err(e);
                     }
                 }
 
-                Ok(manifest)
+                abort_guard.disarm();
+                Ok(())
             });
             handles.push(handle);
         }
 
-        // Collect all manifests; if any worker returned Err or panicked,
-        // propagate the first such failure as a normal command error (do not
-        // abort the process).
-        let mut all_manifests: Vec<Vec<ManifestEntry>> = Vec::with_capacity(num_workers);
+        // Propagate first worker error or panic. No manifests to collect -
+        // each worker published directly to the router.
         let mut first_err: Option<String> = None;
         for handle in handles {
             match handle.join() {
-                Ok(Ok(m)) => all_manifests.push(m),
+                Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     if first_err.is_none() {
                         first_err = Some(e);
                     }
-                    all_manifests.push(Vec::new());
                 }
                 Err(payload) => {
                     let msg = if let Some(s) = payload.downcast_ref::<&str>() {
@@ -343,15 +319,12 @@ pub(super) fn stage3_slot_reorder(
                     if first_err.is_none() {
                         first_err = Some(msg);
                     }
-                    all_manifests.push(Vec::new());
                 }
             }
         }
         if let Some(e) = first_err {
-            // Overwrite shared error so the outer check picks it up.
             *s3_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
         }
-        all_manifests
     });
 
     if let Some(e) = s3_error.into_inner().unwrap_or(None) {
@@ -376,11 +349,14 @@ pub(super) fn stage3_slot_reorder(
         crate::debug::emit_counter("s3_worker_tmp_bytes", s3_integ_worker_tmp_bytes.load(Relaxed) as i64);
     }
 
-    Ok(IntegratedResult { worker_manifests })
+    Ok(())
 }
 
-/// Emit integrated intersections for one bucket into the worker's temp file
-/// and straddler staging.
+/// Emit integrated intersections for one bucket. Fully-contained blobs
+/// are encoded, pwritten to this worker's tmp file, and published to the
+/// router as `BlobLocation::Worker`. Straddler halves are published via
+/// `router.publish_straddler_half`; the worker that lands the second
+/// half also encodes and transitions the slot to `Straddler`.
 #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
 fn emit_integrated_intersections(
     intersections: &[BlobBucketIntersection],
@@ -389,7 +365,7 @@ fn emit_integrated_intersections(
     total_slots: u64,
     ctx: &IntegratedInputs<'_>,
     encode_scratch: &mut Vec<u8>,
-    manifest: &mut Vec<ManifestEntry>,
+    worker_id: u32,
     tmp_byte_pos: &mut u64,
     tmp_file: &std::fs::File,
     s3_integ_encode_ref: &std::sync::atomic::AtomicU64,
@@ -400,6 +376,7 @@ fn emit_integrated_intersections(
     use std::sync::atomic::Ordering::Relaxed;
 
     let bucket_bytes = scatter_buf.len();
+    let router = ctx.router;
 
     for intersection in intersections {
         match intersection {
@@ -432,11 +409,13 @@ fn emit_integrated_intersections(
                     .map_err(|e| format!("write worker tmp blob {blob_idx}: {e}"))?;
                 *tmp_byte_pos += byte_length;
                 s3_integ_worker_tmp_bytes_ref.fetch_add(byte_length, Relaxed);
-                manifest.push(ManifestEntry {
-                    blob_idx: blob_idx as u32,
-                    byte_offset,
-                    byte_length,
-                });
+                // Publish immediately: the pwrite has durably landed the
+                // bytes in the kernel page cache at [byte_offset, +byte_length),
+                // so stage 4's pread via the router's worker_files[worker_id]
+                // will see them.
+                router
+                    .publish_worker(blob_idx, worker_id, byte_offset, byte_length)
+                    .map_err(|e| format!("publish blob {blob_idx}: {e}"))?;
             }
             BlobBucketIntersection::LeftHalf { blob_idx } => {
                 let blob_idx = *blob_idx;
@@ -449,7 +428,15 @@ fn emit_integrated_intersections(
                 let bytes = slice.to_vec();
                 #[allow(clippy::cast_possible_truncation)]
                 s3_integ_straddler_copy_ref.fetch_add(t_copy.elapsed().as_millis() as u64, Relaxed);
-                merge_straddler(ctx.straddler_slots, blob_idx, HalfSide::Left, bytes)?;
+                router
+                    .publish_straddler_half(
+                        blob_idx,
+                        StraddlerSide::Left,
+                        bytes,
+                        ctx.per_way_rcs,
+                        encode_scratch,
+                    )
+                    .map_err(|e| format!("straddler left blob {blob_idx}: {e}"))?;
             }
             BlobBucketIntersection::RightHalf { blob_idx } => {
                 let blob_idx = *blob_idx;
@@ -462,7 +449,15 @@ fn emit_integrated_intersections(
                 let bytes = slice.to_vec();
                 #[allow(clippy::cast_possible_truncation)]
                 s3_integ_straddler_copy_ref.fetch_add(t_copy.elapsed().as_millis() as u64, Relaxed);
-                merge_straddler(ctx.straddler_slots, blob_idx, HalfSide::Right, bytes)?;
+                router
+                    .publish_straddler_half(
+                        blob_idx,
+                        StraddlerSide::Right,
+                        bytes,
+                        ctx.per_way_rcs,
+                        encode_scratch,
+                    )
+                    .map_err(|e| format!("straddler right blob {blob_idx}: {e}"))?;
             }
         }
     }

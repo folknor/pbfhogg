@@ -326,25 +326,43 @@ pub fn external_join(
     drop(node_id_set);
     drop(node_blob_mapping);
 
-    // Prepare integrated coord_payloads artifacts for stage 3.
+    // Prepare inputs for the streaming stage 3 + stage 4 handoff.
     let per_way_rcs = coord_payloads::load_per_way_refcount_sidecar_indexed(
         &per_way_refcount_sidecar,
         way_slot_starts.len(),
     )?;
+    // Worker count: back off from the pre-streaming `.min(6)` because
+    // stage 3 and stage 4 worker buffers are now both resident at the
+    // same time (they overlap). See notes/altw-structural-reports.md #2
+    // "Worker budgets under overlap".
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))
         .unwrap_or(4)
-        .min(6);
+        .min(4);
+    #[allow(clippy::cast_possible_wrap)]
+    crate::debug::emit_counter("s3_worker_count", num_workers as i64);
+
+    // Worker tmp files opened once here with read + write, wrapped in
+    // Arc<File> so stage 3 can `write_all_at` and stage 4 can
+    // `read_exact_at` on the same `&File`. `File` is `Sync` on Unix for
+    // pread/pwrite so no extra locking is needed.
     let worker_tmp_paths: Vec<std::path::PathBuf> = (0..num_workers)
         .map(|i| scratch_dir.file_path(&format!("payloads-W{i}")))
         .collect();
-    let straddler_slots: Vec<std::sync::Mutex<Option<coord_payloads::StraddlerSlot>>> =
-        (0..way_slot_starts.len())
-            .map(|_| std::sync::Mutex::new(None))
-            .collect();
+    let worker_files: Vec<std::sync::Arc<std::fs::File>> = worker_tmp_paths
+        .iter()
+        .map(|p| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(p)
+                .map(std::sync::Arc::new)
+                .map_err(|e| format!("open worker tmp {p:?}: {e}"))
+        })
+        .collect::<std::result::Result<_, String>>()?;
 
-    crate::debug::emit_marker("EXTJOIN_STAGE3_START");
-    let (s3_minflt_before, s3_majflt_before) = crate::debug::read_page_faults();
     let slot_entry_counts: Vec<u64> = (0..slot_bucket_count)
         .map(|i| {
             let path = scratch_dir.bucket_path("slot", i);
@@ -360,47 +378,14 @@ pub fn external_join(
         paths: slot_paths,
         entry_counts: slot_entry_counts,
     };
-    let integrated_inputs = IntegratedInputs {
-        way_slot_starts: way_slot_starts.as_slice(),
-        per_way_rcs: &per_way_rcs,
-        worker_tmp_paths: worker_tmp_paths.as_slice(),
-        straddler_slots: straddler_slots.as_slice(),
-    };
-    let s3_result = stage3_slot_reorder(
-        &slot_bucket_ref,
-        slot_bucket_count,
-        total_slots,
-        &integrated_inputs,
-    )?;
-    let (s3_minflt_after, s3_majflt_after) = crate::debug::read_page_faults();
-    for i in 0..slot_bucket_count {
-        drop(std::fs::remove_file(scratch_dir.bucket_path("slot", i)));
-    }
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("s3_minflt_delta", (s3_minflt_after - s3_minflt_before) as i64);
-        crate::debug::emit_counter("s3_majflt_delta", (s3_majflt_after - s3_majflt_before) as i64);
-    }
-    crate::debug::emit_marker("EXTJOIN_STAGE3_END");
 
-    let (coord_router, router_stats) = coord_payloads::build_blob_location_router(
+    // The streaming router: pre-populates `Empty` entries for zero-ref
+    // way blobs so stage 4 never waits on a blob that stage 3 would
+    // never publish.
+    let router = coord_payloads::ConcurrentBlobLocationRouter::new(
         &per_way_rcs,
-        s3_result.worker_manifests,
-        &worker_tmp_paths,
-        straddler_slots,
+        worker_files.clone(),
     )?;
-    eprintln!(
-        "[coord_payloads] router {} ms, {} way blobs ({} worker / {} straddler / {} empty), \
-         {} MB in worker tmps + {} KB straddler bytes in RAM",
-        router_stats.build_ms,
-        router_stats.num_way_blobs,
-        router_stats.num_worker,
-        router_stats.num_straddlers,
-        router_stats.num_empty,
-        router_stats.worker_bytes / 1_000_000,
-        router_stats.straddler_bytes / 1_000,
-    );
-    let stage4_per_way_rcs = per_way_rcs;
 
     let relation_member_node_ids = if keep_untagged_nodes {
         None
@@ -419,28 +404,118 @@ pub fn external_join(
         Some(ids)
     };
 
+    // Streaming stage 3 + stage 4: run concurrently via a single
+    // `thread::scope`. Stage 3 publishes per-blob entries to the router
+    // as it encodes them; stage 4 workers block on `router.wait_ready`
+    // ahead of any input pread so they never hold decompressed state
+    // while waiting.
+    crate::debug::emit_marker("EXTJOIN_STREAMING_START");
+    crate::debug::emit_marker("EXTJOIN_STAGE3_START");
     crate::debug::emit_marker("EXTJOIN_STAGE4_START");
-    let (s4_minflt_before, s4_majflt_before) = crate::debug::read_page_faults();
-    let mut stats = stage4_assembly(
-        input,
-        output,
-        &blob_meta,
-        &coord_router,
-        &stage4_per_way_rcs,
-        way_slot_starts.as_slice(),
-        keep_untagged_nodes,
-        relation_member_node_ids.as_ref(),
-        compression,
-        direct_io,
-        overrides,
-    )?;
-    let (s4_minflt_after, s4_majflt_after) = crate::debug::read_page_faults();
+    let (s3_minflt_before, s3_majflt_before) = crate::debug::read_page_faults();
+
+    let router_ref = &router;
+    let per_way_rcs_ref = &per_way_rcs;
+    let blob_meta_ref = &blob_meta;
+    let way_slot_starts_ref = way_slot_starts.as_slice();
+    let rel_ids_ref = relation_member_node_ids.as_ref();
+    let slot_bucket_ref_ref = &slot_bucket_ref;
+
+    // Closures return Result<_, String> because BoxResult's error type
+    // (Box<dyn Error>) is not Send and thread::scope requires Send
+    // return values. Errors are stringified at the scope boundary and
+    // converted back to BoxResult outside.
+    let mut stats = std::thread::scope(|scope| -> std::result::Result<Stats, String> {
+        let s3_handle = scope.spawn(move || -> std::result::Result<(), String> {
+            let integrated = IntegratedInputs {
+                way_slot_starts: way_slot_starts_ref,
+                per_way_rcs: per_way_rcs_ref,
+                router: router_ref,
+            };
+            let result = stage3_slot_reorder(
+                slot_bucket_ref_ref,
+                slot_bucket_count,
+                total_slots,
+                &integrated,
+            )
+            .map_err(|e| e.to_string());
+            // Signal the router that no more publishes are coming. Must
+            // run whether stage 3 succeeded or errored - otherwise stage
+            // 4 waiters on unpublished slots would hang. On error the
+            // worker has already called `router.abort`, but
+            // mark_producer_done is idempotent with abort and cheap.
+            router_ref.mark_producer_done();
+            result
+        });
+        let s4_handle = scope.spawn(move || -> std::result::Result<Stats, String> {
+            stage4_assembly(
+                input,
+                output,
+                blob_meta_ref,
+                router_ref,
+                per_way_rcs_ref,
+                way_slot_starts_ref,
+                keep_untagged_nodes,
+                rel_ids_ref,
+                compression,
+                direct_io,
+                overrides,
+            )
+            .map_err(|e| e.to_string())
+        });
+
+        let s3_res = s3_handle
+            .join()
+            .map_err(|_| "stage 3 thread panicked".to_string())?;
+        let s4_res = s4_handle
+            .join()
+            .map_err(|_| "stage 4 thread panicked".to_string())?;
+
+        // Prefer the stage 3 error if both failed (it's usually the root
+        // cause - stage 4 typically errors only because of an abort that
+        // stage 3 or the writer raised).
+        s3_res?;
+        s4_res
+    })
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    let (s3_minflt_after, s3_majflt_after) = crate::debug::read_page_faults();
+    for i in 0..slot_bucket_count {
+        drop(std::fs::remove_file(scratch_dir.bucket_path("slot", i)));
+    }
     #[allow(clippy::cast_possible_wrap)]
     {
-        crate::debug::emit_counter("s4_minflt_delta", (s4_minflt_after - s4_minflt_before) as i64);
-        crate::debug::emit_counter("s4_majflt_delta", (s4_majflt_after - s4_majflt_before) as i64);
+        crate::debug::emit_counter("s3_minflt_delta", (s3_minflt_after - s3_minflt_before) as i64);
+        crate::debug::emit_counter("s3_majflt_delta", (s3_majflt_after - s3_majflt_before) as i64);
     }
     crate::debug::emit_marker("EXTJOIN_STAGE4_END");
+    crate::debug::emit_marker("EXTJOIN_STAGE3_END");
+    crate::debug::emit_marker("EXTJOIN_STREAMING_END");
+
+    // Emit router stats that the deleted `build_blob_location_router`
+    // used to report.
+    {
+        let s = router.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            crate::debug::emit_counter("s3_router_num_worker", s.num_worker as i64);
+            crate::debug::emit_counter("s3_router_num_straddlers", s.num_straddlers as i64);
+            crate::debug::emit_counter("s3_router_num_empty", s.num_empty as i64);
+            crate::debug::emit_counter("s3_router_worker_bytes", s.worker_bytes as i64);
+            crate::debug::emit_counter("s3_router_straddler_bytes", s.straddler_bytes as i64);
+            crate::debug::emit_counter("s3_straddler_encode_ms", (s.straddler_encode_ns / 1_000_000) as i64);
+        }
+        eprintln!(
+            "[coord_payloads] streaming router {} way blobs ({} worker / {} straddler / {} empty), \
+             {} MB in worker tmps + {} KB straddler bytes in RAM",
+            router.num_blobs(),
+            s.num_worker,
+            s.num_straddlers,
+            s.num_empty,
+            s.worker_bytes / 1_000_000,
+            s.straddler_bytes / 1_000,
+        );
+    }
 
     stats.missing_locations = total_slots.saturating_sub(resolved_count);
 

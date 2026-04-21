@@ -45,30 +45,13 @@ use super::COORD_SLOT_SIZE;
 // Integrated path types
 // ---------------------------------------------------------------------------
 
-/// Two-piece state for a straddler blob in the integrated stage 3 path.
-///
-/// Invariant: transitions `None → Some(Left|Right) → Some(Both)`.
-/// Workers never delta-encode straddler pieces - raw slot bytes only.
-pub(super) enum StraddlerSlot {
-    Left(Vec<u8>),
-    Right(Vec<u8>),
-    Both { left: Vec<u8>, right: Vec<u8> },
-}
-
-/// Per-worker manifest entry produced during stage 3 for a fully-contained blob.
-pub(super) struct ManifestEntry {
-    pub blob_idx: u32,
-    pub byte_offset: u64,
-    pub byte_length: u64,
-}
-
-/// Location of one way blob's encoded coord payload.
-///
-/// Replaces the consolidated `coord_payloads` file. Fully-contained blobs
-/// live in a per-worker tmp file (`Worker`); straddler blobs are encoded
-/// into RAM at router-build time (`Straddler`); zero-ref blobs have no
-/// payload at all (`Empty`). Stage 4 preads directly from the right
-/// worker tmp fd or reads the straddler bytes in-place.
+/// Location of one way blob's encoded coord payload. Written by stage 3
+/// into a `ConcurrentBlobLocationRouter` slot; read by stage 4 via
+/// `pread_blob_payload`. `Worker` variants point at a pwrite-durable
+/// offset in the per-worker tmp file; `Straddler` variants hold the
+/// fully-encoded bytes in RAM (only ~hundreds at planet scale);
+/// `Empty` is pre-populated at router construction for zero-ref blobs
+/// so stage 4 never waits on a slot that will never be published.
 pub(super) enum BlobLocation {
     Worker {
         worker_id: u32,
@@ -81,37 +64,364 @@ pub(super) enum BlobLocation {
     Empty,
 }
 
-/// Dispatch table keyed by `blob_idx`. Replaces `CoordPayloadsReader`
-/// + the consolidated `coord_payloads` file produced by finalize.
-///
-/// Owns the open worker tmp `File` handles; stage 4 borrows `&Self` and
-/// calls [`BlobLocationRouter::pread_blob_payload`] per blob.
-pub(super) struct BlobLocationRouter {
-    worker_files: Vec<std::fs::File>,
-    locations: Vec<BlobLocation>,
+// ====================================================================
+// ConcurrentBlobLocationRouter - streaming variant for item #2
+// ====================================================================
+//
+// Stage 3 publishes per-blob entries as it produces them; stage 4 workers
+// call `wait_ready(blob_idx)` before preading the input PBF way blob, so a
+// stalled decode thread never holds a decompressed block + StringTable
+// resident while waiting. The sequential `build_blob_location_router`
+// phase is gone.
+//
+// Three terminal states: populated (serve), aborted (return recorded
+// error), producer_done with empty slot (return deterministic missing-
+// publication error - matches the current build_blob_location_router
+// "non-zero refs but no entry" check at coord_payloads.rs:398).
+
+/// Side of a straddler this worker is contributing.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum StraddlerSide {
+    Left,
+    Right,
 }
 
-impl BlobLocationRouter {
-    /// Read blob `blob_idx`'s encoded payload into `buf` (resized to exact length).
-    /// Drop-in replacement for the old `CoordPayloadsReader::pread_blob_payload`.
+/// In-flight straddler state (only populated for the few hundred way blobs
+/// that actually straddle a slot-bucket boundary).
+enum StraddlerPartial {
+    Left(Vec<u8>),
+    Right(Vec<u8>),
+}
+
+/// Blob-ordered concurrent router. Stage 3 producers publish; stage 4
+/// consumers wait.
+pub(super) struct ConcurrentBlobLocationRouter {
+    worker_files: Vec<std::sync::Arc<std::fs::File>>,
+    slots: Vec<std::sync::Mutex<Option<BlobLocation>>>,
+    // Partial-straddler staging. Only indices that actually straddle
+    // touch these; the vec is sized for all way blobs for O(1) indexed
+    // access without a hash map.
+    straddler_partials: Vec<std::sync::Mutex<Option<StraddlerPartial>>>,
+    // Single global Condvar. `notify_all` is cheap at our scale (<=6
+    // stage-4 waiters at any moment) and avoids per-slot Condvar
+    // allocation at planet (~57K blobs would be ~3 MB of Condvars).
+    notify: std::sync::Condvar,
+    // Dummy mutex paired with `notify` for Condvar::wait. Waiters lock
+    // the slot mutex to check the predicate, release it, then lock this
+    // dummy to wait. This is OK because Condvar::wait only requires
+    // *some* mutex, not the one guarding the predicate state.
+    notify_mu: std::sync::Mutex<()>,
+    aborted: std::sync::atomic::AtomicBool,
+    producer_done: std::sync::atomic::AtomicBool,
+    abort_error: std::sync::Mutex<Option<String>>,
+    // Counters emitted by mod.rs after the scope joins.
+    pub(super) stats: std::sync::Mutex<ConcurrentRouterStats>,
+}
+
+#[derive(Default)]
+pub(super) struct ConcurrentRouterStats {
+    pub num_worker: u64,
+    pub num_straddlers: u64,
+    pub num_empty: u64,
+    pub worker_bytes: u64,
+    pub straddler_bytes: u64,
+    pub straddler_encode_ns: u64,
+}
+
+impl ConcurrentBlobLocationRouter {
+    /// Build the router, pre-populating `Empty` entries for every zero-ref
+    /// way blob. After construction, call `publish_worker` /
+    /// `publish_straddler_half` as stage 3 produces entries, and
+    /// `mark_producer_done` after stage 3 joins.
+    pub(super) fn new(
+        per_way_rcs: &PerWayRcs,
+        worker_files: Vec<std::sync::Arc<std::fs::File>>,
+    ) -> Result<Self> {
+        let num_way_blobs = per_way_rcs.num_blobs();
+        let mut slots: Vec<std::sync::Mutex<Option<BlobLocation>>> =
+            Vec::with_capacity(num_way_blobs);
+        let mut num_empty: u64 = 0;
+        for blob_idx in 0..num_way_blobs {
+            if per_way_rcs.blob_has_nonzero_refs(blob_idx)? {
+                slots.push(std::sync::Mutex::new(None));
+            } else {
+                slots.push(std::sync::Mutex::new(Some(BlobLocation::Empty)));
+                num_empty += 1;
+            }
+        }
+        let straddler_partials: Vec<std::sync::Mutex<Option<StraddlerPartial>>> =
+            (0..num_way_blobs).map(|_| std::sync::Mutex::new(None)).collect();
+        let stats = ConcurrentRouterStats {
+            num_empty,
+            ..Default::default()
+        };
+        Ok(Self {
+            worker_files,
+            slots,
+            straddler_partials,
+            notify: std::sync::Condvar::new(),
+            notify_mu: std::sync::Mutex::new(()),
+            aborted: std::sync::atomic::AtomicBool::new(false),
+            producer_done: std::sync::atomic::AtomicBool::new(false),
+            abort_error: std::sync::Mutex::new(None),
+            stats: std::sync::Mutex::new(stats),
+        })
+    }
+
+    /// Total way-blob count (for caller diagnostics).
+    pub(super) fn num_blobs(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Shared write/read handle for a stage-3 worker's tmp file. Stage 3
+    /// workers call `write_all_at` on this; stage 4 workers' preads
+    /// come through `pread_blob_payload` on the same `&File`.
+    pub(super) fn worker_file(&self, worker_id: usize) -> &std::sync::Arc<std::fs::File> {
+        &self.worker_files[worker_id]
+    }
+
+    /// Publish a fully-contained blob's payload location. Called by
+    /// stage 3 workers right after the payload bytes have been `pwrite`d.
+    pub(super) fn publish_worker(
+        &self,
+        blob_idx: usize,
+        worker_id: u32,
+        byte_offset: u64,
+        byte_length: u64,
+    ) -> Result<()> {
+        let mut guard = self.slots[blob_idx]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_some() {
+            return Err(format!(
+                "router publish_worker: blob {blob_idx} already has a location \
+                 (likely duplicate emission across workers)"
+            )
+            .into());
+        }
+        *guard = Some(BlobLocation::Worker {
+            worker_id,
+            byte_offset,
+            byte_length,
+        });
+        drop(guard);
+        {
+            let mut s = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.num_worker += 1;
+            s.worker_bytes += byte_length;
+        }
+        self.notify.notify_all();
+        Ok(())
+    }
+
+    /// Publish one half of a straddler. When the second half arrives, the
+    /// caller's `encode_scratch` is used to inline-encode the full payload
+    /// via `encode_blob_payload_from_record`, and the slot transitions to
+    /// `Straddler { bytes }`.
+    pub(super) fn publish_straddler_half(
+        &self,
+        blob_idx: usize,
+        side: StraddlerSide,
+        raw_bytes: Vec<u8>,
+        per_way_rcs: &PerWayRcs,
+        encode_scratch: &mut Vec<u8>,
+    ) -> Result<()> {
+        let mut guard = self.straddler_partials[blob_idx]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (left_bytes, right_bytes) = match (guard.take(), side) {
+            (None, StraddlerSide::Left) => {
+                *guard = Some(StraddlerPartial::Left(raw_bytes));
+                return Ok(());
+            }
+            (None, StraddlerSide::Right) => {
+                *guard = Some(StraddlerPartial::Right(raw_bytes));
+                return Ok(());
+            }
+            (Some(StraddlerPartial::Left(left)), StraddlerSide::Right) => (left, raw_bytes),
+            (Some(StraddlerPartial::Right(right)), StraddlerSide::Left) => (raw_bytes, right),
+            (Some(StraddlerPartial::Left(_)), StraddlerSide::Left) => {
+                return Err(
+                    format!("router straddler blob {blob_idx}: duplicate left half").into(),
+                );
+            }
+            (Some(StraddlerPartial::Right(_)), StraddlerSide::Right) => {
+                return Err(
+                    format!("router straddler blob {blob_idx}: duplicate right half").into(),
+                );
+            }
+        };
+        // Both halves present - encode inline and publish.
+        drop(guard);
+        let t_enc = std::time::Instant::now();
+        let mut coord_bytes = left_bytes;
+        coord_bytes.extend_from_slice(&right_bytes);
+        encode_scratch.clear();
+        encode_blob_payload_from_record(
+            &coord_bytes,
+            per_way_rcs.blob_record(blob_idx),
+            blob_idx,
+            encode_scratch,
+        )
+        .map_err(|e| format!("router straddler encode blob {blob_idx}: {e}"))?;
+        #[allow(clippy::cast_possible_truncation)]
+        let encode_ns = t_enc.elapsed().as_nanos() as u64;
+        let bytes = std::mem::take(encode_scratch);
+        let byte_len = bytes.len() as u64;
+        let mut slot_guard = self.slots[blob_idx]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot_guard.is_some() {
+            return Err(format!(
+                "router straddler blob {blob_idx}: slot already populated at encode time"
+            )
+            .into());
+        }
+        *slot_guard = Some(BlobLocation::Straddler { bytes });
+        drop(slot_guard);
+        {
+            let mut s = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.num_straddlers += 1;
+            s.straddler_bytes += byte_len;
+            s.straddler_encode_ns += encode_ns;
+        }
+        self.notify.notify_all();
+        Ok(())
+    }
+
+    /// Signal that stage 3 has finished producing. Any `wait_ready` caller
+    /// whose slot is still empty after this will return a deterministic
+    /// missing-publication error.
+    pub(super) fn mark_producer_done(&self) {
+        self.producer_done
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_all();
+    }
+
+    /// Signal a terminal failure. Wakes all waiters; subsequent waits and
+    /// preads observe the recorded error.
+    pub(super) fn abort(&self, msg: String) {
+        {
+            let mut guard = self
+                .abort_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.is_none() {
+                *guard = Some(msg);
+            }
+        }
+        self.aborted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_all();
+    }
+
+    pub(super) fn is_aborted(&self) -> bool {
+        self.aborted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Block until `blob_idx`'s slot is populated, the router is aborted,
+    /// or the producer is done with the slot still empty. Returns `Ok(())`
+    /// when the slot is known to be populated; returns `Err` on abort or
+    /// missing-publication.
+    pub(super) fn wait_ready(&self, blob_idx: usize) -> Result<()> {
+        // Fast path: slot already populated.
+        {
+            let guard = self.slots[blob_idx]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.is_some() {
+                return Ok(());
+            }
+        }
+        // Slow path: wait on the global Condvar, re-checking predicates.
+        loop {
+            let mu_guard = self
+                .notify_mu
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Re-check predicates under the notify mutex to avoid a missed
+            // wakeup. Publishers take slot-mu, set slot, drop slot-mu,
+            // then notify_all. Waiters check slot-mu first, release it,
+            // then lock notify-mu and re-check - so if the publisher
+            // notified between our slot check and our notify-mu acquire,
+            // we see the populated slot on the re-check. If it notified
+            // after we acquire notify-mu, wait picks up the notification.
+            if self.aborted.load(std::sync::atomic::Ordering::SeqCst) {
+                drop(mu_guard);
+                let err = self
+                    .abort_error
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+                    .unwrap_or_else(|| "router aborted (no message recorded)".to_string());
+                return Err(err.into());
+            }
+            {
+                let guard = self.slots[blob_idx]
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if guard.is_some() {
+                    return Ok(());
+                }
+                if self.producer_done.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(format!(
+                        "router: no publication for blob {blob_idx} after producer finished"
+                    )
+                    .into());
+                }
+            }
+            drop(
+                self.notify
+                    .wait(mu_guard)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+        }
+    }
+
+    /// Read blob `blob_idx`'s encoded payload. Callers that have already
+    /// awaited via `wait_ready` take the fast path; callers that come in
+    /// cold also work (fast-path hits if the slot is ready, else blocks
+    /// via `wait_ready`).
     pub(super) fn pread_blob_payload(&self, blob_idx: usize, buf: &mut Vec<u8>) -> Result<()> {
+        self.wait_ready(blob_idx)?;
         use std::os::unix::fs::FileExt as _;
-        match &self.locations[blob_idx] {
-            BlobLocation::Worker { worker_id, byte_offset, byte_length } => {
+        let loc = {
+            let guard = self.slots[blob_idx]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Cloning here avoids holding the slot lock while we pread;
+            // the clone is cheap for Worker (pod) and moderate for
+            // Straddler (one Vec<u8> clone of the encoded bytes).
+            match &*guard {
+                Some(loc) => loc.clone(),
+                None => {
+                    return Err(format!(
+                        "router pread_blob_payload: slot {blob_idx} empty after wait_ready"
+                    )
+                    .into());
+                }
+            }
+        };
+        match loc {
+            BlobLocation::Worker {
+                worker_id,
+                byte_offset,
+                byte_length,
+            } => {
                 #[allow(clippy::cast_possible_truncation)]
-                let len = *byte_length as usize;
+                let len = byte_length as usize;
                 buf.resize(len, 0);
                 if len > 0 {
-                    self.worker_files[*worker_id as usize]
-                        .read_exact_at(buf, *byte_offset)
-                        .map_err(|e| format!(
-                            "router pread worker {worker_id} blob {blob_idx}: {e}"
-                        ))?;
+                    self.worker_files[worker_id as usize]
+                        .read_exact_at(buf, byte_offset)
+                        .map_err(|e| {
+                            format!("router pread worker {worker_id} blob {blob_idx}: {e}")
+                        })?;
                 }
             }
             BlobLocation::Straddler { bytes } => {
                 buf.clear();
-                buf.extend_from_slice(bytes);
+                buf.extend_from_slice(&bytes);
             }
             BlobLocation::Empty => {
                 buf.clear();
@@ -121,16 +431,60 @@ impl BlobLocationRouter {
     }
 }
 
-/// Stats from `build_blob_location_router`.
-#[derive(Debug, Default)]
-pub(super) struct RouterStats {
-    pub num_way_blobs: u64,
-    pub num_straddlers: u64,
-    pub num_worker: u64,
-    pub num_empty: u64,
-    pub straddler_bytes: u64,
-    pub worker_bytes: u64,
-    pub build_ms: u64,
+impl Clone for BlobLocation {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Worker {
+                worker_id,
+                byte_offset,
+                byte_length,
+            } => Self::Worker {
+                worker_id: *worker_id,
+                byte_offset: *byte_offset,
+                byte_length: *byte_length,
+            },
+            Self::Straddler { bytes } => Self::Straddler {
+                bytes: bytes.clone(),
+            },
+            Self::Empty => Self::Empty,
+        }
+    }
+}
+
+/// Panic-safe bilateral cancellation guard. Stage 3 and stage 4 workers
+/// build one at closure entry and call `disarm` on normal exit. If the
+/// worker panics instead, the `Drop` impl fires `router.abort`, which
+/// wakes every `wait_ready` caller on the other side via `notify_all`.
+pub(super) struct AbortOnDrop<'a> {
+    router: &'a ConcurrentBlobLocationRouter,
+    label: &'static str,
+    armed: std::cell::Cell<bool>,
+}
+
+impl<'a> AbortOnDrop<'a> {
+    pub(super) fn new(
+        router: &'a ConcurrentBlobLocationRouter,
+        label: &'static str,
+    ) -> Self {
+        Self {
+            router,
+            label,
+            armed: std::cell::Cell::new(true),
+        }
+    }
+
+    pub(super) fn disarm(&self) {
+        self.armed.set(false);
+    }
+}
+
+impl Drop for AbortOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed.get() {
+            self.router
+                .abort(format!("{} panicked (AbortOnDrop guard fired)", self.label));
+        }
+    }
 }
 
 /// Indexed per-way ref-count sidecar.
@@ -282,165 +636,6 @@ pub(super) fn load_per_way_refcount_sidecar_indexed(
     build_per_way_refcount_index(data, num_way_blobs)
 }
 
-/// Build the blob-location routing table from stage-3 outputs.
-///
-/// Replaces the old `finalize_coord_payloads` consolidation pass. Instead of
-/// pwrite-copying ~55 GB of worker-tmp bytes + encoded straddler bytes into a
-/// single consolidated `coord_payloads` file (which stage 4 then pread from),
-/// keep the worker tmps open and route stage 4's per-blob pread directly to
-/// the correct fd (or to an in-RAM buffer for straddlers).
-///
-/// Walks blobs in `blob_idx` order. For straddlers (`StraddlerSlot::Both`),
-/// encodes the coord payload in-place (same encoding path the old finalize
-/// used for straddlers) and stashes the bytes in the returned router. For
-/// fully-contained blobs, records `(worker_id, byte_offset, byte_length)`
-/// from the per-worker manifest. For zero-ref blobs, records `Empty`.
-///
-/// Worker tmp files are opened once as plain `File` handles held by the
-/// router; `File: Sync` on Unix via `FileExt::read_exact_at` (pread-backed),
-/// so `&BlobLocationRouter` can be shared across stage-4 worker threads.
-#[allow(clippy::needless_pass_by_value, clippy::cast_possible_truncation, clippy::too_many_lines)]
-pub(super) fn build_blob_location_router(
-    per_way_rcs: &PerWayRcs,
-    worker_manifests: Vec<Vec<ManifestEntry>>,
-    worker_tmp_paths: &[std::path::PathBuf],
-    straddler_slots: Vec<std::sync::Mutex<Option<StraddlerSlot>>>,
-) -> Result<(BlobLocationRouter, RouterStats)> {
-    use std::time::Instant;
-
-    crate::debug::emit_marker("COORD_PAYLOADS_ROUTER_BUILD_START");
-    let t_all = Instant::now();
-
-    let num_way_blobs = per_way_rcs.num_blobs();
-
-    // Fold worker manifests into a single per-blob lookup. Verify no
-    // blob appears in multiple worker manifests.
-    let mut blob_in_worker: Vec<Option<(u32, u64, u64)>> = vec![None; num_way_blobs];
-    for (worker_id, manifest) in worker_manifests.iter().enumerate() {
-        for entry in manifest {
-            let idx = entry.blob_idx as usize;
-            if idx >= num_way_blobs {
-                return Err(format!(
-                    "worker {worker_id} manifest entry blob_idx {idx} out of range (num_way_blobs={num_way_blobs})"
-                ).into());
-            }
-            if blob_in_worker[idx].is_some() {
-                return Err(format!("blob {idx} appears in multiple worker manifests").into());
-            }
-            blob_in_worker[idx] = Some((worker_id as u32, entry.byte_offset, entry.byte_length));
-        }
-    }
-
-    // Mutual-exclusivity check: a blob must not be in both worker manifests
-    // and straddler staging.
-    for (idx, slot) in straddler_slots.iter().enumerate() {
-        let guard = slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if guard.is_some() && blob_in_worker[idx].is_some() {
-            return Err(format!(
-                "blob {idx} appears in both a worker manifest and straddler staging"
-            )
-            .into());
-        }
-    }
-
-    let mut locations: Vec<BlobLocation> = Vec::with_capacity(num_way_blobs);
-    let mut encode_scratch: Vec<u8> = Vec::with_capacity(1024 * 1024);
-    let mut stats = RouterStats {
-        num_way_blobs: num_way_blobs as u64,
-        ..Default::default()
-    };
-
-    for blob_idx in 0..num_way_blobs {
-        let straddler_taken = straddler_slots[blob_idx]
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-
-        let location = match straddler_taken {
-            Some(StraddlerSlot::Both { left, right }) => {
-                let mut coord_bytes = left;
-                coord_bytes.extend_from_slice(&right);
-                encode_scratch.clear();
-                encode_blob_payload_from_record(
-                    &coord_bytes,
-                    per_way_rcs.blob_record(blob_idx),
-                    blob_idx,
-                    &mut encode_scratch,
-                )
-                .map_err(|e| format!("router straddler encode blob {blob_idx}: {e}"))?;
-                stats.num_straddlers += 1;
-                stats.straddler_bytes += encode_scratch.len() as u64;
-                BlobLocation::Straddler {
-                    bytes: std::mem::take(&mut encode_scratch),
-                }
-            }
-            Some(StraddlerSlot::Left(_)) => {
-                return Err(format!("blob {blob_idx}: straddler missing right half").into());
-            }
-            Some(StraddlerSlot::Right(_)) => {
-                return Err(format!("blob {blob_idx}: straddler missing left half").into());
-            }
-            None => match blob_in_worker[blob_idx] {
-                Some((worker_id, byte_offset, byte_length)) => {
-                    stats.num_worker += 1;
-                    stats.worker_bytes += byte_length;
-                    BlobLocation::Worker {
-                        worker_id,
-                        byte_offset,
-                        byte_length,
-                    }
-                }
-                None => {
-                    // Zero-ref blob: no manifest entry and no straddler. Any
-                    // non-zero ref count here means stage 3 lost the blob.
-                    if per_way_rcs.blob_has_nonzero_refs(blob_idx)? {
-                        return Err(format!(
-                            "blob {blob_idx} has non-zero ref counts but no worker manifest \
-                             entry and no straddler staging - upstream bug"
-                        )
-                        .into());
-                    }
-                    stats.num_empty += 1;
-                    BlobLocation::Empty
-                }
-            },
-        };
-        locations.push(location);
-    }
-
-    // Open worker tmps once; they live as long as the router does. Stage 4
-    // shares `&BlobLocationRouter` across worker threads; plain `&File` is
-    // Sync via pread (`FileExt::read_exact_at`) on Unix, no `Arc` needed.
-    let worker_files: Vec<std::fs::File> = worker_tmp_paths
-        .iter()
-        .map(|path| {
-            std::fs::File::open(path).map_err(|e| -> Box<dyn std::error::Error> {
-                format!("open worker tmp {}: {e}", path.display()).into()
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    #[allow(clippy::cast_possible_truncation)]
-    {
-        stats.build_ms = t_all.elapsed().as_millis() as u64;
-    }
-
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("s3_router_build_ms", stats.build_ms as i64);
-        crate::debug::emit_counter("s3_router_num_way_blobs", stats.num_way_blobs as i64);
-        crate::debug::emit_counter("s3_router_num_straddlers", stats.num_straddlers as i64);
-        crate::debug::emit_counter("s3_router_num_worker", stats.num_worker as i64);
-        crate::debug::emit_counter("s3_router_num_empty", stats.num_empty as i64);
-        crate::debug::emit_counter("s3_router_straddler_bytes", stats.straddler_bytes as i64);
-        crate::debug::emit_counter("s3_router_worker_bytes", stats.worker_bytes as i64);
-    }
-    crate::debug::emit_marker("COORD_PAYLOADS_ROUTER_BUILD_END");
-
-    Ok((BlobLocationRouter { worker_files, locations }, stats))
-}
 
 const _: () = {
     assert!(COORD_SLOT_SIZE == 8);
@@ -756,111 +951,4 @@ mod tests {
         parse_per_way_refcount_sidecar_bytes(&sidecar, blobs.len()).expect("make_per_way_rcs")
     }
 
-    #[test]
-    fn router_build_happy_path() {
-        // 4 blobs:
-        //   blob 0: 2 ways [2,1] refs - fully-contained in worker 0
-        //   blob 1: 1 way [3] refs   - fully-contained in worker 1
-        //   blob 2: 1 way [2] refs   - straddler (Both)
-        //   blob 3: 0 ways           - zero-ref, no manifest, no straddler
-        let coords_b0: &[(i32, i32)] = &[(10, 20), (30, 40), (50, 60)];
-        let coords_b1: &[(i32, i32)] = &[(100, 200), (300, 400), (500, 600)];
-        let coords_b2: &[(i32, i32)] = &[(1, 2), (3, 4)];
-
-        let rcs_b0: &[u32] = &[2, 1];
-        let rcs_b1: &[u32] = &[3];
-        let rcs_b2: &[u32] = &[2];
-
-        let per_way_rcs = make_per_way_rcs(&[rcs_b0, rcs_b1, rcs_b2, &[]]);
-
-        let tmp_dir = tempfile::tempdir().expect("tempdir");
-
-        // Build worker 0 tmp file (blob 0).
-        let w0_path = tmp_dir.path().join("payloads-W0");
-        let mut encoded_b0: Vec<u8> = Vec::new();
-        encode_blob_payload(&make_coord_bytes(coords_b0), rcs_b0, &mut encoded_b0).expect("enc b0");
-        std::fs::write(&w0_path, &encoded_b0).expect("write w0");
-
-        // Build worker 1 tmp file (blob 1).
-        let w1_path = tmp_dir.path().join("payloads-W1");
-        let mut encoded_b1: Vec<u8> = Vec::new();
-        encode_blob_payload(&make_coord_bytes(coords_b1), rcs_b1, &mut encoded_b1).expect("enc b1");
-        std::fs::write(&w1_path, &encoded_b1).expect("write w1");
-
-        let worker_manifests: Vec<Vec<ManifestEntry>> = vec![
-            vec![ManifestEntry { blob_idx: 0, byte_offset: 0, byte_length: encoded_b0.len() as u64 }],
-            vec![ManifestEntry { blob_idx: 1, byte_offset: 0, byte_length: encoded_b1.len() as u64 }],
-        ];
-
-        // Straddler blob 2: split raw slot bytes at an arbitrary midpoint.
-        let raw_b2 = make_coord_bytes(coords_b2);
-        let split = 8; // first coord (8 bytes) in left half, second in right half
-        let left_bytes = raw_b2[..split].to_vec();
-        let right_bytes = raw_b2[split..].to_vec();
-
-        let straddler_slots: Vec<std::sync::Mutex<Option<StraddlerSlot>>> = (0..4)
-            .map(|i| {
-                if i == 2 {
-                    std::sync::Mutex::new(Some(StraddlerSlot::Both {
-                        left: left_bytes.clone(),
-                        right: right_bytes.clone(),
-                    }))
-                } else {
-                    std::sync::Mutex::new(None)
-                }
-            })
-            .collect();
-
-        let (router, stats) = build_blob_location_router(
-            &per_way_rcs,
-            worker_manifests,
-            &[w0_path, w1_path],
-            straddler_slots,
-        )
-        .expect("router build");
-        assert_eq!(stats.num_way_blobs, 4);
-        assert_eq!(stats.num_straddlers, 1);
-        assert_eq!(stats.num_worker, 2);
-        assert_eq!(stats.num_empty, 1);
-
-        let mut buf: Vec<u8> = Vec::new();
-
-        router.pread_blob_payload(0, &mut buf).expect("pread 0");
-        assert_eq!(reconstruct_coords(&buf, rcs_b0), coords_b0);
-
-        router.pread_blob_payload(1, &mut buf).expect("pread 1");
-        assert_eq!(reconstruct_coords(&buf, rcs_b1), coords_b1);
-
-        router.pread_blob_payload(2, &mut buf).expect("pread 2");
-        assert_eq!(reconstruct_coords(&buf, rcs_b2), coords_b2);
-
-        // blob 3: zero refs - payload is empty.
-        router.pread_blob_payload(3, &mut buf).expect("pread 3");
-        assert!(buf.is_empty(), "zero-ref blob payload must be empty");
-    }
-
-    #[test]
-    fn router_build_missing_half_error() {
-        let per_way_rcs = make_per_way_rcs(&[&[1]]);
-        let tmp_dir = tempfile::tempdir().expect("tempdir");
-        let w0_path = tmp_dir.path().join("payloads-W0");
-        std::fs::write(&w0_path, b"").expect("write w0");
-
-        let straddler_slots: Vec<std::sync::Mutex<Option<StraddlerSlot>>> = vec![
-            std::sync::Mutex::new(Some(StraddlerSlot::Left(vec![0u8; 8]))),
-        ];
-
-        let result = build_blob_location_router(
-            &per_way_rcs,
-            vec![vec![]],
-            &[w0_path],
-            straddler_slots,
-        );
-        let err = match result {
-            Ok(_) => panic!("expected Err for missing right half"),
-            Err(e) => e,
-        };
-        let msg = format!("{err}");
-        assert!(msg.contains("missing right half"), "error message: {msg}");
-    }
 }

@@ -105,7 +105,7 @@ pub(super) fn stage4_assembly(
     input: &Path,
     output: &Path,
     blob_meta: &[BlobMeta],
-    coord_payloads_reader: &super::coord_payloads::BlobLocationRouter,
+    coord_payloads_reader: &super::coord_payloads::ConcurrentBlobLocationRouter,
     per_way_rcs: &super::coord_payloads::PerWayRcs,
     way_slot_starts: &[u64],
     keep_untagged_nodes: bool,
@@ -240,7 +240,15 @@ pub(super) fn stage4_assembly(
 
     let decode_threads = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(4);
+        .unwrap_or(4)
+        // Streaming cap (item #2): stage 3 and stage 4 worker buffers
+        // are now both resident concurrently. Back off from the
+        // pre-streaming cap so peak anon RSS doesn't balloon on a 30 GB
+        // planet host. See notes/altw-structural-reports.md #2 "Worker
+        // budgets under overlap".
+        .min(4);
+    #[allow(clippy::cast_possible_wrap)]
+    crate::debug::emit_counter("s4_decode_thread_count", decode_threads as i64);
 
     // Split schedule: passthrough-eligible blobs (relations always; node
     // blobs when keep_untagged_nodes=true) are handled by the consumer
@@ -277,6 +285,13 @@ pub(super) fn stage4_assembly(
     let s4_max_worker_buf_bytes = std::sync::atomic::AtomicU64::new(0);
     let s4_coord_payload_pread_ms = std::sync::atomic::AtomicU64::new(0);
     let s4_coord_payload_bytes = std::sync::atomic::AtomicU64::new(0);
+    // Streaming-router readiness-wait counters (item #2).
+    // `wait_ready` is called at the top of the way-blob branch, ahead of
+    // the input pread, so a decode worker never holds a decompressed
+    // block + StringTable resident while blocked.
+    let s4_readiness_wait_ns = std::sync::atomic::AtomicU64::new(0);
+    let s4_readiness_wait_blobs = std::sync::atomic::AtomicU64::new(0);
+    let s4_readiness_wait_max_ns = std::sync::atomic::AtomicU64::new(0);
     // Channel depth high-water (workers ++ before send, consumer --
     // after recv). Reaching `decoded_tx` capacity means the channel
     // was the binding queue at some point; staying well below capacity
@@ -302,6 +317,9 @@ pub(super) fn stage4_assembly(
     let s4_max_worker_buf_ref = &s4_max_worker_buf_bytes;
     let s4_coord_payload_pread_ref = &s4_coord_payload_pread_ms;
     let s4_coord_payload_bytes_ref = &s4_coord_payload_bytes;
+    let s4_readiness_wait_ns_ref = &s4_readiness_wait_ns;
+    let s4_readiness_wait_blobs_ref = &s4_readiness_wait_blobs;
+    let s4_readiness_wait_max_ns_ref = &s4_readiness_wait_max_ns;
     let s4_channel_depth_ref = &s4_channel_depth;
     let s4_channel_high_water_ref = &s4_channel_high_water;
     let way_reframe_counters = WayReframeCounters::new();
@@ -353,6 +371,29 @@ pub(super) fn stage4_assembly(
                     };
 
                     let result: crate::error::Result<(Vec<OwnedBlock>, Stats)> = (|| {
+                        // For way blobs: block on the router's readiness
+                        // BEFORE the input pread/decompress so a stalled
+                        // decode thread never holds an already-expanded
+                        // block + StringTable resident. Non-way blobs skip
+                        // this entirely - they never consume a coord payload.
+                        if desc.is_way_blob {
+                            let t_wait = std::time::Instant::now();
+                            coord_payloads_reader
+                                .wait_ready(desc.way_blob_idx)
+                                .map_err(|e| crate::error::new_error(
+                                    crate::error::ErrorKind::Io(std::io::Error::other(
+                                        e.to_string(),
+                                    )),
+                                ))?;
+                            #[allow(clippy::cast_possible_truncation)]
+                            let wait_ns = t_wait.elapsed().as_nanos() as u64;
+                            if wait_ns > 0 {
+                                s4_readiness_wait_ns_ref.fetch_add(wait_ns, Relaxed);
+                                s4_readiness_wait_blobs_ref.fetch_add(1, Relaxed);
+                                s4_readiness_wait_max_ns_ref.fetch_max(wait_ns, Relaxed);
+                            }
+                        }
+
                         let t0 = std::time::Instant::now();
                         read_buf.resize(desc.data_size, 0);
                         file.read_exact_at(&mut read_buf, desc.data_offset)
@@ -706,6 +747,18 @@ pub(super) fn stage4_assembly(
         crate::debug::emit_counter("s4_max_worker_buf_bytes", s4_max_worker_buf_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_coord_payload_pread_ms", s4_coord_payload_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_coord_payload_bytes", s4_coord_payload_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter(
+            "s4_readiness_wait_ms",
+            (s4_readiness_wait_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000) as i64,
+        );
+        crate::debug::emit_counter(
+            "s4_readiness_wait_blobs",
+            s4_readiness_wait_blobs.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s4_readiness_wait_max_ms",
+            (s4_readiness_wait_max_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000) as i64,
+        );
         crate::debug::emit_counter("s4_passthrough_blobs", s4_passthrough_blobs as i64);
         crate::debug::emit_counter("s4_passthrough_pread_ms", s4_passthrough_pread_ms as i64);
         crate::debug::emit_counter("s4_passthrough_bytes", s4_passthrough_bytes as i64);

@@ -19,14 +19,11 @@ non-indexed PBFs. Remaining 24.1 GB alloc is protobuf parsing - v1
 compressed byte comparison would skip decode for matching blocks.
 **Affects:** `diff`, `derive_changes` (both use `stream_merge.rs`)
 
-### Multi-extract parallel decode
+### Multi-extract parallel decode - LANDED
 
-**Impact:** Removes the single-threaded decode bottleneck in write phases.
-**Document:** [multi-extract-optimization.md](multi-extract-optimization.md)
-**What:** Convert sequential BlobReader to pread-from-workers in the
-3 write phases. Workers decode in parallel, consumer routes to N writers.
-Reuses existing `pread_execute` infrastructure from single-extract.
-**Risk:** Low - same pattern already proven in single-extract.
+Shipped in commit `9f72bcf`: `multi_extract_pread_write` replaces the
+sequential BlobReader in all three write phases. Denmark 5-region
+6.7 s → 2.1 s (3.2x); Japan 5-region 32.5 s → 8.1 s (4.0x).
 
 ## Tier 2: Moderate impact, benchmarks needed
 
@@ -40,13 +37,16 @@ better for internal use (3-5x faster decompress).
 **Action:** Benchmark `zlib:1` vs `zlib:6` vs `zstd:3` on Denmark/Europe
 with `brokkr cat --compression <mode> --bench`.
 
-### Multi-extract raw passthrough
+### Multi-extract raw passthrough - CLOSED 2026-04-20
 
-**Impact:** Skip decode+re-encode for node blobs fully inside a region.
-**Document:** [multi-extract-optimization.md](multi-extract-optimization.md)
-**What:** Per-blob per-region containment check. Blobs inside a region's
-bbox are written as raw compressed frames to that region's writer.
-**Prerequisite:** Blob-level spatial index (bbox from indexdata).
+Disproven at planet 5-region via shadow counter (UUID `dad573cb`):
+0 / 32,835 node blobs qualify for any containment gate. PBFs are
+ID-sorted and OSM IDs are chronological, so an 8,000-element blob
+scatters across the planet geographically and can never fit in a
+sub-planet region. Load-bearing pin at
+`src/commands/extract/multi.rs::try_extract_multi_single_pass` (right
+after the `MULTI_SCHEDULE_SCAN_END` marker). Sister disproof:
+tags-filter, 0 / 50,364 at `w/highway=primary` on planet.
 
 ## Tier 3: Research / low priority
 
@@ -103,10 +103,10 @@ Tag expression filtering, bbox filtering, property key selection.
 - Dead code removal (260 lines): superseded raw passthrough scaffolding
 - jemalloc/mimalloc features removed (fix CLI `--all-features` build)
 
-### Research documents (7 new)
+### Research documents
 1. fill-buffer-optimization.md - block-pair merge-join design
 2. zlib-level-tuning.md - write path compression analysis
-3. multi-extract-optimization.md - 6 optimization opportunities
+3. ~~multi-extract-optimization.md~~ - retired 2026-04-21; all six ranked items DONE or CLOSED (raw passthrough disproven at planet 5-region). Load-bearing pin in `src/commands/extract/multi.rs`.
 4. columnar-integration.md - expansion beyond extract
 5. reference/pipelined-reader-paths.md - per-caller reference (was notes/pipelined-reader-retention.md, moved + rewritten)
 6. geojson-export-design.md - export v1 design

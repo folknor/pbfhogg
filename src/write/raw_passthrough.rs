@@ -21,11 +21,28 @@
 //!    boundary-blob count - acceptable if boundary blobs are a small
 //!    fraction of the output.
 //!
-//! **Measure first.** The tags-filter blob-level scanner was disproven on
-//! 2026-04-18 (0 / 50,364 planet blobs qualified); the same class of
-//! shadow-counter measurement - "how many blobs would actually qualify
-//! under this gate, on a real workload" - is the prerequisite for building
-//! either of the per-group shapes above.
+//! **Measure first.** The same class of shadow-counter measurement - "how
+//! many blobs would actually qualify under this gate, on a real workload" -
+//! is the prerequisite for building either of the per-group shapes above.
+//! Two such measurements have already disproven blob-level gates in
+//! different commands at planet scale:
+//!
+//! - **tags-filter** (2026-04-18, UUID `8c786794`, `w/highway=primary` on
+//!   planet): 0 / 50,364 pass-2 blobs qualified for "all-elements-included"
+//!   blob passthrough. Load-bearing pin in
+//!   `src/commands/tags_filter/mod.rs` pass-2 worker.
+//! - **multi-extract** (2026-04-20, UUID `dad573cb`, planet 5-region
+//!   `--config --simple`): 0 / 32,835 node blobs qualified for
+//!   all-N-contained or partial-contained passthrough. Load-bearing pin
+//!   in `src/commands/extract/multi.rs::try_extract_multi_single_pass`.
+//!
+//! Both measurements are structural, not workload-specific: PBF blobs are
+//! ID-sorted and OSM IDs are chronological rather than geographic or
+//! tag-coherent, so an 8,000-element blob scatters across the planet in
+//! both dimensions. Per-element match rates stay low, per-blob
+//! "all-elements-qualify" rates are effectively zero. Any new consumer of
+//! this scaffolding should shadow-count first and prove the qualifying
+//! fraction is non-trivial on a real workload before building.
 
 use protohoggr::{encode_bytes_field_always, encode_varint};
 

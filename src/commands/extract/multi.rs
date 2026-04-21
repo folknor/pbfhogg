@@ -172,8 +172,8 @@ pub(super) fn try_extract_multi_single_pass(
 
     // DO NOT add per-region partial raw passthrough here (decode once,
     // write raw to contained regions, route elements to non-contained
-    // regions). It was on the notes/multi-extract-optimization.md item
-    // #5 priority list for "high impact at planet scale" based on the
+    // regions). It was a "high impact at planet scale" item on the
+    // multi-extract optimization plan for a while, resting on the
     // heuristic that region-contained blobs would cluster under
     // contiguous-bbox regions.
     //

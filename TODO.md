@@ -251,8 +251,6 @@ input or --clean. Verified via `brokkr verify multi-extract`.
   not a pbfhogg bug. Pre-existing since multi-extract shipped.
 
 **v2 improvements:**
-See [notes/multi-extract-optimization.md](notes/multi-extract-optimization.md)
-for full analysis of 6 optimization opportunities.
 
 - [ ] **Spatial index** - grid or R-tree over regions for O(1)
   per-element lookup instead of O(N). Required for 200+ regions where
@@ -269,9 +267,7 @@ for full analysis of 6 optimization opportunities.
   nodes in each blob, so a blob's geographic bbox is ~planet-wide and
   cannot fit in a sub-planet region. The all-N-contained path stays
   for the N=1 / fully-overlapping niche. Load-bearing pin in
-  `src/commands/extract/multi.rs::try_extract_multi_single_pass`;
-  full post-mortem in [notes/multi-extract-optimization.md](notes/multi-extract-optimization.md)
-  item #5.
+  `src/commands/extract/multi.rs::try_extract_multi_single_pass`.
 
 ### Export (GeoJSON/GeoPackage)
 

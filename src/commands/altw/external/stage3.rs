@@ -49,14 +49,20 @@ pub(super) fn stage3_blob_group_emit(
     total_slots: u64,
     integrated: &IntegratedInputs<'_>,
 ) -> Result<()> {
-    // Worker count matches stage 4's (both run concurrently under the
-    // #2 streaming scope). Bounded at min(4) - each worker's per-group
-    // coord buffer can be a few hundred MB at planet, and stage 4 is
-    // already holding its own decoded blocks concurrently.
+    // Worker count: match stage 4's uncapped parallelism. Groups are
+    // independent (no cross-group contention now that straddlers are
+    // gone), and `s3_max_group_coord_bytes` stays well below 200 MB at
+    // Europe (worst case ~380 MB at planet); 22 workers x 380 MB =
+    // ~8 GB peak from stage 3 scatter, which fits the budget on this
+    // 25 GB-available host alongside stage 4 state.
+    //
+    // A min(4) cap regressed Europe wall +15 % on the initial #6 port
+    // because stage 4's 22 decode threads starved waiting for a
+    // 4-worker stage 3 to publish
+    // (s4_readiness_wait_ms=1_313_000 cumulative on UUID 4bb48b25).
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(4)
-        .min(4);
+        .unwrap_or(4);
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("s3_worker_count", num_workers as i64);
 

@@ -670,9 +670,9 @@ its own commit.
 ### Known correctness gaps surfaced by parity tests (2026-04-22)
 
 Pinned as `#[ignore]` regression tests in
-`tests/non_indexed_parity.rs` and
-`tests/apply_changes_invariants.rs` - remove the ignore attribute to
-reproduce.
+`tests/non_indexed_parity.rs`,
+`tests/apply_changes_invariants.rs`, and
+`tests/derive_changes.rs` - remove the ignore attribute to reproduce.
 
 - [ ] **`extract --strategy simple --force` on non-indexed input
   double-emits elements.** Parity test ran the same logical input
@@ -759,8 +759,13 @@ reproduce.
   written`, `Base: 6 nodes, 6 ways` for the same logical roundtrip.
   This looks like stats/reporting drift or feature-gated counting
   semantics rather than data corruption, but if these counters are
-  user-visible they need a parity pin. First step: add a dedicated
-  stats-parity test around `MergeStats` / summary accounting.
+  user-visible they need a parity pin. That pin now exists as
+  `tests/derive_changes.rs::merge_stats_match_output_counts_after_roundtrip`
+  and fails exactly this way in the consumer sweep. The same wrong
+  16-element / 6-node / 6-way accounting also shows up in
+  `tests/apply_changes_invariants.rs::merge_jobs_parity_without_locations_on_ways`,
+  which means the drift is broader than the separate
+  `--locations-on-ways` CopyRange bug.
 
 - [ ] **`check --ids` (`verify_ids`) reports spurious TypeOrder
   violations on non-indexed input.** `check_type_order` in

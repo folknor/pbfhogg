@@ -75,6 +75,62 @@ fn run_merge_with_jobs(
     .expect("merge")
 }
 
+fn write_merge_jobs_fixture(base: &Path, osc: &Path) {
+    let mut nodes = generate_nodes(24, 1);
+    for (i, node) in nodes.iter_mut().enumerate() {
+        if i % 4 == 0 {
+            node.tags = vec![("name", "base")];
+        }
+    }
+
+    let mut ways = generate_ways(10, 1_000, 3, 1);
+    for (i, way) in ways.iter_mut().enumerate() {
+        let start = 1 + i as i64 * 2;
+        way.refs = vec![start, start + 1, start + 2];
+        way.tags = if i % 2 == 0 {
+            vec![("highway", "residential")]
+        } else {
+            vec![("highway", "service")]
+        };
+    }
+
+    write_multi_block_test_pbf(base, &nodes, &ways, &[], 4);
+
+    write_osc(
+        osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <node id="30" lat="0.3000000" lon="0.6000000" version="1">
+      <tag k="created" v="yes"/>
+    </node>
+    <way id="2000" version="1">
+      <nd ref="5"/>
+      <nd ref="30"/>
+      <nd ref="6"/>
+      <tag k="highway" v="primary"/>
+    </way>
+  </create>
+  <modify>
+    <node id="5" lat="0.5555555" lon="0.4444444" version="2">
+      <tag k="name" v="modified"/>
+    </node>
+    <way id="1003" version="2">
+      <nd ref="7"/>
+      <nd ref="5"/>
+      <nd ref="30"/>
+      <tag k="highway" v="secondary"/>
+      <tag k="surface" v="gravel"/>
+    </way>
+  </modify>
+  <delete>
+    <node id="23" version="1"/>
+    <way id="1007" version="1"/>
+  </delete>
+</osmChange>"#,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Cursor rule: Passthrough / FalsePositive slots must NOT advance the cursor.
 // ---------------------------------------------------------------------------
@@ -252,25 +308,7 @@ fn merge_jobs_parity_on_multiblob_input() {
     let out_seq = dir.path().join("out_seq.osm.pbf");
     let out_par = dir.path().join("out_par.osm.pbf");
 
-    let mut nodes = generate_nodes(24, 1);
-    for (i, node) in nodes.iter_mut().enumerate() {
-        if i % 4 == 0 {
-            node.tags = vec![("name", "base")];
-        }
-    }
-
-    let mut ways = generate_ways(10, 1_000, 3, 1);
-    for (i, way) in ways.iter_mut().enumerate() {
-        let start = 1 + i as i64 * 2;
-        way.refs = vec![start, start + 1, start + 2];
-        way.tags = if i % 2 == 0 {
-            vec![("highway", "residential")]
-        } else {
-            vec![("highway", "service")]
-        };
-    }
-
-    write_multi_block_test_pbf(&base_raw, &nodes, &ways, &[], 4);
+    write_merge_jobs_fixture(&base_raw, &osc);
     add_locations_to_ways(
         &base_raw,
         &base,
@@ -283,42 +321,32 @@ fn merge_jobs_parity_on_multiblob_input() {
     )
     .expect("bootstrap locations-on-ways base");
 
-    write_osc(
-        &osc,
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<osmChange version="0.6">
-  <create>
-    <node id="30" lat="0.3000000" lon="0.6000000" version="1">
-      <tag k="created" v="yes"/>
-    </node>
-    <way id="2000" version="1">
-      <nd ref="5"/>
-      <nd ref="30"/>
-      <nd ref="6"/>
-      <tag k="highway" v="primary"/>
-    </way>
-  </create>
-  <modify>
-    <node id="5" lat="0.5555555" lon="0.4444444" version="2">
-      <tag k="name" v="modified"/>
-    </node>
-    <way id="1003" version="2">
-      <nd ref="7"/>
-      <nd ref="5"/>
-      <nd ref="30"/>
-      <tag k="highway" v="secondary"/>
-      <tag k="surface" v="gravel"/>
-    </way>
-  </modify>
-  <delete>
-    <node id="23" version="1"/>
-    <way id="1007" version="1"/>
-  </delete>
-</osmChange>"#,
-    );
-
     let seq = run_merge_with_jobs(&base, &osc, &out_seq, Some(1), true);
     let par = run_merge_with_jobs(&base, &osc, &out_par, Some(4), true);
+
+    assert_eq!(seq.base_nodes, par.base_nodes);
+    assert_eq!(seq.base_ways, par.base_ways);
+    assert_eq!(seq.base_relations, par.base_relations);
+    assert_eq!(seq.diff_nodes, par.diff_nodes);
+    assert_eq!(seq.diff_ways, par.diff_ways);
+    assert_eq!(seq.diff_relations, par.diff_relations);
+    assert_eq!(seq.deleted, par.deleted);
+
+    assert_elements_equivalent(&out_seq, &out_par);
+}
+
+#[test]
+fn merge_jobs_parity_without_locations_on_ways() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let out_seq = dir.path().join("out_seq.osm.pbf");
+    let out_par = dir.path().join("out_par.osm.pbf");
+
+    write_merge_jobs_fixture(&base, &osc);
+
+    let seq = run_merge_with_jobs(&base, &osc, &out_seq, Some(1), false);
+    let par = run_merge_with_jobs(&base, &osc, &out_par, Some(4), false);
 
     assert_eq!(seq.base_nodes, par.base_nodes);
     assert_eq!(seq.base_ways, par.base_ways);

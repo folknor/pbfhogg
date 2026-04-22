@@ -750,16 +750,7 @@ fn increment_version_and_update_timestamp_combined() {
     );
 }
 
-#[test]
-fn derive_changes_jobs_parity_roundtrips_to_same_output() {
-    let dir = TempDir::new().expect("tempdir");
-    let old = dir.path().join("old.osm.pbf");
-    let new = dir.path().join("new.osm.pbf");
-    let osc_seq = dir.path().join("changes_seq.osc.gz");
-    let osc_par = dir.path().join("changes_par.osc.gz");
-    let out_seq = dir.path().join("result_seq.osm.pbf");
-    let out_par = dir.path().join("result_par.osm.pbf");
-
+fn write_roundtrip_multiblob_pair(old: &std::path::Path, new: &std::path::Path) {
     let mut old_nodes = generate_nodes(24, 1);
     for (i, node) in old_nodes.iter_mut().enumerate() {
         if i % 4 == 0 {
@@ -823,8 +814,21 @@ fn derive_changes_jobs_parity_roundtrips_to_same_output() {
         meta: None,
     });
 
-    write_multi_block_test_pbf(&old, &old_nodes, &old_ways, &[], 4);
-    write_multi_block_test_pbf(&new, &new_nodes, &new_ways, &[], 4);
+    write_multi_block_test_pbf(old, &old_nodes, &old_ways, &[], 4);
+    write_multi_block_test_pbf(new, &new_nodes, &new_ways, &[], 4);
+}
+
+#[test]
+fn derive_changes_jobs_parity_roundtrips_to_same_output() {
+    let dir = TempDir::new().expect("tempdir");
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+    let osc_seq = dir.path().join("changes_seq.osc.gz");
+    let osc_par = dir.path().join("changes_par.osc.gz");
+    let out_seq = dir.path().join("result_seq.osm.pbf");
+    let out_par = dir.path().join("result_par.osm.pbf");
+
+    write_roundtrip_multiblob_pair(&old, &new);
 
     let seq = derive_changes(&old, &new, &osc_seq, false, false, false, 1).expect("derive seq");
     let par = derive_changes(&old, &new, &osc_par, false, false, false, 4).expect("derive par");
@@ -867,4 +871,69 @@ fn derive_changes_jobs_parity_roundtrips_to_same_output() {
     assert_elements_equivalent(&out_seq, &out_par);
     assert_elements_equivalent(&out_seq, &new);
     assert_elements_equivalent(&out_par, &new);
+}
+
+// KNOWN FAILURE, 2026-04-22. This passes under the all-features sweep
+// but fails in the consumer feature sweep (`--no-default-features
+// --features commands`): `MergeStats::total_elements()` reports 16
+// while the merged output actually contains 34 elements. Output
+// correctness still holds; the bug is in stats/accounting, not the
+// merge result. Keep the invariant test in-tree but ignored until the
+// consumer accounting path is fixed.
+#[test]
+#[ignore = "consumer sweep: MergeStats totals drift from actual output counts (see TODO.md)"]
+fn merge_stats_match_output_counts_after_roundtrip() {
+    let dir = TempDir::new().expect("tempdir");
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+    let osc = dir.path().join("changes.osc.gz");
+    let result = dir.path().join("result.osm.pbf");
+
+    write_roundtrip_multiblob_pair(&old, &new);
+
+    derive_changes(&old, &new, &osc, false, false, false, 1).expect("derive");
+    let stats = merge(
+        &old,
+        &osc,
+        &result,
+        &MergeOptions {
+            compression: Compression::default(),
+            direct_io: false,
+            io_uring: false,
+            force: true,
+            locations_on_ways: false,
+            jobs: None,
+        },
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("merge");
+
+    assert_elements_equivalent(&result, &new);
+
+    let result_contents = read_all_elements(&result);
+    let result_nodes = u64::try_from(result_contents.nodes.len()).expect("node count fits in u64");
+    let result_ways = u64::try_from(result_contents.ways.len()).expect("way count fits in u64");
+    let result_relations =
+        u64::try_from(result_contents.relations.len()).expect("relation count fits in u64");
+
+    assert_eq!(
+        stats.total_elements(),
+        result_nodes + result_ways + result_relations,
+        "MergeStats::total_elements must equal actual output element count"
+    );
+    assert_eq!(
+        stats.base_nodes + stats.diff_nodes,
+        result_nodes,
+        "node stats must partition the output node set"
+    );
+    assert_eq!(
+        stats.base_ways + stats.diff_ways,
+        result_ways,
+        "way stats must partition the output way set"
+    );
+    assert_eq!(
+        stats.base_relations + stats.diff_relations,
+        result_relations,
+        "relation stats must partition the output relation set"
+    );
 }

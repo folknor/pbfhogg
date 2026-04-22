@@ -58,6 +58,73 @@ verifies the debug monotonicity assertion fires on unsorted nodes when `Sort.Typ
 is declared. Requires `debug_assertions` to be enabled in the test profile. Nightly 1.95
 (2026-02-25) has a regression where `debug_assertions` is off in test builds.
 
+## Planet-scale validation coverage
+
+README's planet table is the source of truth for "this command runs
+cleanly on the 32 GB-RAM reference host". `overnight.sh` fills most
+of the reachable gaps as bench runs (produces
+`.brokkr/results.db` entries that get promoted into the README once
+they land). This section tracks the remaining axes and dataset gaps
+that are not currently driven by `overnight.sh`.
+
+### Blocked on pbfhogg CLI changes
+
+Need a pbfhogg CLI flag to exist before brokkr can forward it:
+
+- [ ] **`tags-filter -j N`** - the `parallel_classify_phase` workers
+  axis. pbfhogg tags-filter has no `-j` flag today. If we want to
+  measure threading scaling (similar to `inspect --nodes -j`), pbfhogg
+  has to add it first, then brokkr forwards it.
+- [ ] **`merge-changes -j N`** - parallel-parse axis the
+  [`notes/merge-changes.md`](notes/merge-changes.md) plan will
+  eventually deliver. Not a gap today; will appear when the feature
+  lands.
+
+### Blocked on dataset / config
+
+- [ ] **History PBF for `time-filter`**. pbfhogg supports per-element
+  version history and visibility, but `brokkr.toml` has no history
+  variant on any dataset. `time-filter` benches on a regular PBF
+  record near-no-op walls (every timestamp compare decides keep).
+  Configure a history PBF variant (planet history is ~120 GB; europe
+  history is more realistic for iteration) to unlock the actual
+  workload.
+- [ ] **Additional planet snapshots** for `diff-snapshots`. Current
+  `brokkr.toml` has only one alternate (`snapshot.20260411`), so the
+  snapshot-range axis is a single pairing. Downloading another
+  snapshot 2-4 weeks away would let us measure diff-wall vs
+  snapshot-delta-size empirically.
+- [ ] **Multi-OSC merge-changes at europe / germany**. Those datasets
+  currently have exactly one OSC each, so multi-OSC benches only run
+  at planet (7-OSC range 4914..4920). `brokkr download <region>
+  --osc-seq <N>` can pull additional sequences for faster iteration.
+
+### Un-benched permutations (low priority)
+
+Known to work, no performance question open, but not in the results DB:
+
+- [ ] **Custom ID set distributions for `getid` / `getparents`**.
+  brokkr's ID set is baked in; no way to test different distributions
+  (sparse vs dense, forward vs spread across the ID range, cold-cache
+  vs hot-cache). Add a CLI pass-through if ID-set shape becomes a
+  perf question. Not needed for general validation.
+- [ ] **`--direct-io` at planet for commands beyond apply-changes**.
+  `apply-changes` has coverage. Every other command supporting
+  `--direct-io` (cat, sort, extract, add-locations, merge-changes
+  where applicable, ...) has no `--direct-io` planet number. Only
+  matters if direct-io becomes a default on any of them.
+- [ ] **`renumber` with non-default flags**. Has no non-default flags
+  in pbfhogg today (just the one variant since the in-memory path
+  was retired). If a future variant adds flags this reopens.
+- [ ] **`bench-read` / `bench-write` / `bench-merge` at planet**.
+  Synthetic benchmarks, intentionally excluded from the README user
+  surface. Periodically-useful diagnostic tools; not a validation
+  target.
+- [ ] **`tags-filter --invert-match` / `-t --remove-tags`** -
+  two genuinely-unexposed tags-filter code paths that brokkr could
+  forward but doesn't yet. Move to `overnight.sh` once brokkr
+  exposes both flags.
+
 ## Next up (2026-04-13)
 
 - [x] ~~**`--allow-missing` for apply-changes**~~ - **not needed (2026-04-21).**

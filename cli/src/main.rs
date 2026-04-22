@@ -469,6 +469,12 @@ enum Command {
         /// Requires the base PBF to have LocationsOnWays and be sorted.
         #[arg(long)]
         locations_on_ways: bool,
+        /// Worker-pool size for the descriptor-first pipeline.
+        /// `0` (default) uses the `nproc - 2` heuristic (leaves two
+        /// cores for the scanner + drain threads, min 1). Pass a
+        /// specific N to measure scaling or constrain CPU use.
+        #[arg(short = 'j', long = "jobs", default_value_t = 0)]
+        jobs: usize,
         #[command(flatten)]
         header: HeaderOverrideArg,
     },
@@ -1086,6 +1092,7 @@ fn main() -> process::ExitCode {
             io,
             uring,
             locations_on_ways,
+            jobs,
             header,
         } => run_apply_changes(
             &base,
@@ -1096,6 +1103,7 @@ fn main() -> process::ExitCode {
             uring.io_uring,
             force.force,
             locations_on_ways,
+            jobs,
             &HeaderOverrides::parse(header.generator, &header.output_headers)?,
         ),
         Command::MergeChanges {
@@ -2273,6 +2281,7 @@ fn run_apply_changes(
     io_uring: bool,
     force: bool,
     locations_on_ways: bool,
+    jobs: usize,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
@@ -2282,6 +2291,7 @@ fn run_apply_changes(
         io_uring,
         force,
         locations_on_ways,
+        jobs: if jobs == 0 { None } else { Some(jobs) },
     };
     let stats = pbfhogg::apply_changes::merge(base, changes, output, &opts, overrides)?;
     stats.print_summary();
@@ -2578,6 +2588,7 @@ fn run_bench_merge(
         io_uring,
         force: true,
         locations_on_ways: false,
+        jobs: None,
     };
     let stats = pbfhogg::apply_changes::merge(base, changes, output, &opts, &HeaderOverrides::default())?;
     let elapsed_ms = start.elapsed().as_millis();

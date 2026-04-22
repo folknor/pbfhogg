@@ -49,6 +49,10 @@ pub struct MergeOptions {
     pub io_uring: bool,
     pub force: bool,
     pub locations_on_ways: bool,
+    /// Override the worker-pool size used by the descriptor-first
+    /// pipeline. `None` (or `Some(0)`) keeps the default `nproc - 2`
+    /// heuristic (leaves two cores for scanner + drain, min 1).
+    pub jobs: Option<usize>,
 }
 
 #[allow(clippy::redundant_closure_for_method_calls)]
@@ -136,6 +140,7 @@ pub fn merge(
         io_uring,
         force,
         locations_on_ways,
+        jobs,
     } = *opts;
     require_indexdata(
         base_pbf,
@@ -215,10 +220,17 @@ pub fn merge(
     #[cfg(not(feature = "linux-direct-io"))]
     let (input_fd, use_copy_range) = (0i32, false);
 
-    // Worker count: nproc - 2 (leave room for scanner + drain), min 1.
-    let worker_count = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(4);
+    // Worker count: `-j N` override if supplied (non-zero), else the
+    // default `nproc - 2` heuristic (leaves two cores for the scanner
+    // and drain threads, min 1).
+    let worker_count = match jobs {
+        Some(n) if n > 0 => n,
+        _ => std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(2).max(1))
+            .unwrap_or(4),
+    };
+    #[allow(clippy::cast_possible_wrap)]
+    crate::debug::emit_counter("merge_worker_count", worker_count as i64);
 
     // Channels.
     let (drain_tx, drain_rx) = mpsc::sync_channel::<DrainItem>(DRAIN_CHANNEL_CAPACITY);

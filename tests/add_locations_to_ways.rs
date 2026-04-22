@@ -4,7 +4,10 @@ mod common;
 
 use std::path::Path;
 
-use common::{TestNode, TestWay};
+use common::{
+    TestMember, TestNode, TestRelation as CommonTestRelation, TestWay, assert_elements_equivalent,
+    generate_nodes, generate_ways, write_multi_block_test_pbf,
+};
 use pbfhogg::altw::add_locations_to_ways;
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
 use pbfhogg::writer::{Compression, PbfWriter};
@@ -31,7 +34,9 @@ fn write_test_pbf(path: &Path, nodes: &[TestNode], ways: &[TestWay], relations: 
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new().build().expect("build header");
+    let header = block_builder::HeaderBuilder::new()
+        .build()
+        .expect("build header");
     writer.write_header(&header).expect("write header");
 
     let mut bb = BlockBuilder::new();
@@ -137,7 +142,17 @@ fn basic_locations_added_to_ways() {
 
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
 
-    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false, true, &pbfhogg::HeaderOverrides::default(), pbfhogg::altw::IndexType::default()).expect("add locations");
+    let stats = add_locations_to_ways(
+        &input,
+        &output,
+        true,
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+        pbfhogg::altw::IndexType::default(),
+    )
+    .expect("add locations");
     assert_eq!(stats.ways_written, 1);
     assert_eq!(stats.missing_locations, 0);
 
@@ -177,7 +192,17 @@ fn header_has_locations_on_ways_feature() {
     let output = dir.path().join("output.osm.pbf");
 
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
-    add_locations_to_ways(&input, &output, true, Compression::default(), false, true, &pbfhogg::HeaderOverrides::default(), pbfhogg::altw::IndexType::default()).expect("add locations");
+    add_locations_to_ways(
+        &input,
+        &output,
+        true,
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+        pbfhogg::altw::IndexType::default(),
+    )
+    .expect("add locations");
 
     let reader = BlobReader::from_path(&output).expect("open output");
     for blob in reader {
@@ -206,7 +231,17 @@ fn drop_untagged_nodes() {
 
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
 
-    let stats = add_locations_to_ways(&input, &output, false, Compression::default(), false, true, &pbfhogg::HeaderOverrides::default(), pbfhogg::altw::IndexType::default()).expect("add locations");
+    let stats = add_locations_to_ways(
+        &input,
+        &output,
+        false,
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+        pbfhogg::altw::IndexType::default(),
+    )
+    .expect("add locations");
 
     // Node 2 has no tags → dropped
     assert_eq!(stats.nodes_read, 3);
@@ -239,7 +274,17 @@ fn keep_untagged_nodes() {
 
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
 
-    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false, true, &pbfhogg::HeaderOverrides::default(), pbfhogg::altw::IndexType::default()).expect("add locations");
+    let stats = add_locations_to_ways(
+        &input,
+        &output,
+        true,
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+        pbfhogg::altw::IndexType::default(),
+    )
+    .expect("add locations");
 
     assert_eq!(stats.nodes_read, 3);
     assert_eq!(stats.nodes_written, 3);
@@ -269,7 +314,17 @@ fn missing_node_refs_get_zero_coordinates() {
 
     write_test_pbf(&input, &nodes, &ways, &[]);
 
-    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false, true, &pbfhogg::HeaderOverrides::default(), pbfhogg::altw::IndexType::default()).expect("add locations");
+    let stats = add_locations_to_ways(
+        &input,
+        &output,
+        true,
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+        pbfhogg::altw::IndexType::default(),
+    )
+    .expect("add locations");
     assert_eq!(stats.missing_locations, 1);
 
     // Verify the missing ref got (0, 0)
@@ -306,7 +361,17 @@ fn relations_preserved() {
 
     write_test_pbf(&input, &test_nodes(), &test_ways(), &relations);
 
-    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false, true, &pbfhogg::HeaderOverrides::default(), pbfhogg::altw::IndexType::default()).expect("add locations");
+    let stats = add_locations_to_ways(
+        &input,
+        &output,
+        true,
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+        pbfhogg::altw::IndexType::default(),
+    )
+    .expect("add locations");
     assert_eq!(stats.relations_written, 1);
 
     // Verify relation exists in output
@@ -333,9 +398,18 @@ fn relations_preserved() {
 ///
 /// Uses the pipelined writer which automatically embeds indexdata via
 /// `scan_block_ids` during blob framing.
-fn write_test_pbf_indexed(path: &Path, nodes: &[TestNode], ways: &[TestWay], relations: &[TestRelation]) {
-    let header = block_builder::HeaderBuilder::new().sorted().build().expect("build header");
-    let mut writer = PbfWriter::to_path(path, Compression::default(), &header).expect("create writer");
+fn write_test_pbf_indexed(
+    path: &Path,
+    nodes: &[TestNode],
+    ways: &[TestWay],
+    relations: &[TestRelation],
+) {
+    let header = block_builder::HeaderBuilder::new()
+        .sorted()
+        .build()
+        .expect("build header");
+    let mut writer =
+        PbfWriter::to_path(path, Compression::default(), &header).expect("create writer");
 
     let mut bb = BlockBuilder::new();
 
@@ -397,7 +471,17 @@ fn passthrough_basic_with_indexdata() {
 
     write_test_pbf_indexed(&input, &test_nodes(), &test_ways(), &[]);
 
-    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false, true, &pbfhogg::HeaderOverrides::default(), pbfhogg::altw::IndexType::default()).expect("add locations");
+    let stats = add_locations_to_ways(
+        &input,
+        &output,
+        true,
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+        pbfhogg::altw::IndexType::default(),
+    )
+    .expect("add locations");
     assert_eq!(stats.ways_written, 1);
     assert_eq!(stats.missing_locations, 0);
     assert!(stats.blobs_passthrough > 0, "expected passthrough blobs");
@@ -445,9 +529,22 @@ fn passthrough_relations_preserved() {
 
     write_test_pbf_indexed(&input, &test_nodes(), &test_ways(), &relations);
 
-    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false, true, &pbfhogg::HeaderOverrides::default(), pbfhogg::altw::IndexType::default()).expect("add locations");
+    let stats = add_locations_to_ways(
+        &input,
+        &output,
+        true,
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+        pbfhogg::altw::IndexType::default(),
+    )
+    .expect("add locations");
     assert_eq!(stats.relations_written, 1);
-    assert!(stats.blobs_passthrough >= 2, "expected node + relation passthrough");
+    assert!(
+        stats.blobs_passthrough >= 2,
+        "expected node + relation passthrough"
+    );
 
     // Verify relation exists in output
     let reader = BlobReader::from_path(&output).expect("open output");
@@ -473,7 +570,17 @@ fn passthrough_drop_untagged_nodes() {
 
     write_test_pbf_indexed(&input, &test_nodes(), &test_ways(), &[]);
 
-    let stats = add_locations_to_ways(&input, &output, false, Compression::default(), false, true, &pbfhogg::HeaderOverrides::default(), pbfhogg::altw::IndexType::default()).expect("add locations");
+    let stats = add_locations_to_ways(
+        &input,
+        &output,
+        false,
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+        pbfhogg::altw::IndexType::default(),
+    )
+    .expect("add locations");
 
     // Node 2 has no tags → dropped
     assert_eq!(stats.nodes_read, 3);
@@ -491,7 +598,17 @@ fn passthrough_keep_untagged_nodes() {
 
     write_test_pbf_indexed(&input, &test_nodes(), &test_ways(), &[]);
 
-    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false, true, &pbfhogg::HeaderOverrides::default(), pbfhogg::altw::IndexType::default()).expect("add locations");
+    let stats = add_locations_to_ways(
+        &input,
+        &output,
+        true,
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+        pbfhogg::altw::IndexType::default(),
+    )
+    .expect("add locations");
 
     assert_eq!(stats.nodes_read, 3);
     assert_eq!(stats.nodes_written, 3);
@@ -534,7 +651,17 @@ fn drop_untagged_keeps_relation_member_nodes() {
     }];
 
     write_test_pbf(&input, &nodes, &ways, &relations);
-    let stats = add_locations_to_ways(&input, &output, false, Compression::default(), false, true, &pbfhogg::HeaderOverrides::default(), pbfhogg::altw::IndexType::default()).expect("add locations");
+    let stats = add_locations_to_ways(
+        &input,
+        &output,
+        false,
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+        pbfhogg::altw::IndexType::default(),
+    )
+    .expect("add locations");
 
     assert_eq!(stats.nodes_read, 2);
     assert_eq!(stats.nodes_written, 2);
@@ -555,7 +682,10 @@ fn drop_untagged_keeps_relation_member_nodes() {
         }
     }
     assert!(node_ids.contains(&1));
-    assert!(node_ids.contains(&2), "untagged relation-member node was dropped");
+    assert!(
+        node_ids.contains(&2),
+        "untagged relation-member node was dropped"
+    );
 }
 
 #[test]
@@ -593,7 +723,17 @@ fn passthrough_drop_untagged_keeps_relation_member_nodes() {
     }];
 
     write_test_pbf_indexed(&input, &nodes, &ways, &relations);
-    let stats = add_locations_to_ways(&input, &output, false, Compression::default(), false, true, &pbfhogg::HeaderOverrides::default(), pbfhogg::altw::IndexType::default()).expect("add locations");
+    let stats = add_locations_to_ways(
+        &input,
+        &output,
+        false,
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+        pbfhogg::altw::IndexType::default(),
+    )
+    .expect("add locations");
 
     assert_eq!(stats.nodes_read, 2);
     assert_eq!(stats.nodes_written, 2);
@@ -614,7 +754,10 @@ fn passthrough_drop_untagged_keeps_relation_member_nodes() {
         }
     }
     assert!(node_ids.contains(&1));
-    assert!(node_ids.contains(&2), "untagged relation-member node was dropped");
+    assert!(
+        node_ids.contains(&2),
+        "untagged relation-member node was dropped"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -693,7 +836,17 @@ fn basic_locations_added_sparse() {
 
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
 
-    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false, true, &pbfhogg::HeaderOverrides::default(), pbfhogg::altw::IndexType::Sparse).expect("add locations");
+    let stats = add_locations_to_ways(
+        &input,
+        &output,
+        true,
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+        pbfhogg::altw::IndexType::Sparse,
+    )
+    .expect("add locations");
     assert_eq!(stats.ways_written, 1);
     assert_eq!(stats.missing_locations, 0);
 
@@ -726,6 +879,99 @@ fn basic_locations_added_sparse() {
 }
 
 #[test]
+fn backend_parity_dense_sparse_external_auto() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let out_dense = dir.path().join("out_dense.osm.pbf");
+    let out_sparse = dir.path().join("out_sparse.osm.pbf");
+    let out_external = dir.path().join("out_external.osm.pbf");
+    let out_auto = dir.path().join("out_auto.osm.pbf");
+
+    let mut nodes = generate_nodes(18, 1);
+    for idx in [0_usize, 3, 6, 9, 12, 15] {
+        nodes[idx].tags = vec![("name", "kept")];
+    }
+
+    let mut ways = generate_ways(5, 1_000, 3, 1);
+    for (i, way) in ways.iter_mut().enumerate() {
+        let start = 1 + i as i64 * 3;
+        way.refs = vec![start, start + 1, start + 2];
+        way.tags = if i % 2 == 0 {
+            vec![("highway", "primary")]
+        } else {
+            vec![("highway", "service")]
+        };
+    }
+
+    let relations = vec![CommonTestRelation {
+        id: 300,
+        members: vec![
+            TestMember {
+                id: MemberId::Way(1_000),
+                role: "outer",
+            },
+            TestMember {
+                id: MemberId::Node(18),
+                role: "label",
+            },
+        ],
+        tags: vec![("type", "site")],
+        meta: None,
+    }];
+
+    write_multi_block_test_pbf(&input, &nodes, &ways, &relations, 5);
+
+    add_locations_to_ways(
+        &input,
+        &out_dense,
+        false,
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+        pbfhogg::altw::IndexType::Dense,
+    )
+    .expect("dense backend");
+    add_locations_to_ways(
+        &input,
+        &out_sparse,
+        false,
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+        pbfhogg::altw::IndexType::Sparse,
+    )
+    .expect("sparse backend");
+    add_locations_to_ways(
+        &input,
+        &out_external,
+        false,
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+        pbfhogg::altw::IndexType::External,
+    )
+    .expect("external backend");
+    add_locations_to_ways(
+        &input,
+        &out_auto,
+        false,
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+        pbfhogg::altw::IndexType::Auto,
+    )
+    .expect("auto backend");
+
+    assert_elements_equivalent(&out_dense, &out_sparse);
+    assert_elements_equivalent(&out_dense, &out_external);
+    assert_elements_equivalent(&out_external, &out_auto);
+}
+
+#[test]
 fn passthrough_basic_with_indexdata_sparse() {
     let dir = TempDir::new().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");
@@ -733,7 +979,17 @@ fn passthrough_basic_with_indexdata_sparse() {
 
     write_test_pbf_indexed(&input, &test_nodes(), &test_ways(), &[]);
 
-    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false, true, &pbfhogg::HeaderOverrides::default(), pbfhogg::altw::IndexType::Sparse).expect("add locations");
+    let stats = add_locations_to_ways(
+        &input,
+        &output,
+        true,
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+        pbfhogg::altw::IndexType::Sparse,
+    )
+    .expect("add locations");
     assert_eq!(stats.ways_written, 1);
     assert_eq!(stats.missing_locations, 0);
     assert!(stats.blobs_passthrough > 0, "expected passthrough blobs");
@@ -781,7 +1037,17 @@ fn missing_node_refs_get_zero_coordinates_sparse() {
     }];
     write_test_pbf(&input, &test_nodes(), &ways, &[]);
 
-    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false, true, &pbfhogg::HeaderOverrides::default(), pbfhogg::altw::IndexType::Sparse).expect("add locations");
+    let stats = add_locations_to_ways(
+        &input,
+        &output,
+        true,
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+        pbfhogg::altw::IndexType::Sparse,
+    )
+    .expect("add locations");
     assert_eq!(stats.missing_locations, 1);
 
     let reader = BlobReader::from_path(&output).expect("open output");

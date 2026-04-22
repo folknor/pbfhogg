@@ -21,9 +21,9 @@
 mod common;
 
 use common::{
-    assert_elements_equivalent, assert_indexed, assert_non_indexed, generate_nodes,
-    generate_ways, write_test_pbf_non_indexed, write_test_pbf_sorted, TestMember, TestNode,
-    TestRelation, TestWay,
+    TestMember, TestNode, TestRelation, TestWay, assert_elements_equivalent, assert_indexed,
+    assert_non_indexed, generate_nodes, generate_ways, write_test_pbf_non_indexed,
+    write_test_pbf_sorted,
 };
 use pbfhogg::MemberId;
 use pbfhogg::writer::Compression;
@@ -61,7 +61,10 @@ fn shared_ways() -> Vec<TestWay> {
 fn shared_relations() -> Vec<TestRelation> {
     vec![TestRelation {
         id: 100,
-        members: vec![TestMember { id: MemberId::Way(1_000), role: "outer" }],
+        members: vec![TestMember {
+            id: MemberId::Way(1_000),
+            role: "outer",
+        }],
         tags: vec![("type", "multipolygon")],
         meta: None,
     }]
@@ -71,6 +74,95 @@ fn write_both(indexed: &Path, non_indexed: &Path) {
     let nodes = shared_nodes();
     let ways = shared_ways();
     let relations = shared_relations();
+    write_test_pbf_sorted(indexed, &nodes, &ways, &relations);
+    write_test_pbf_non_indexed(non_indexed, &nodes, &ways, &relations);
+    assert_indexed(indexed);
+    assert_non_indexed(non_indexed);
+}
+
+fn write_smart_both(indexed: &Path, non_indexed: &Path) {
+    let nodes = vec![
+        TestNode {
+            id: 1,
+            lat: 557_000_000,
+            lon: 125_000_000,
+            tags: vec![("name", "inside-a")],
+            meta: None,
+        },
+        TestNode {
+            id: 2,
+            lat: 540_000_000,
+            lon: 125_000_000,
+            tags: vec![("name", "south")],
+            meta: None,
+        },
+        TestNode {
+            id: 3,
+            lat: 556_500_000,
+            lon: 125_500_000,
+            tags: vec![("name", "inside-b")],
+            meta: None,
+        },
+        TestNode {
+            id: 4,
+            lat: 557_000_000,
+            lon: 140_000_000,
+            tags: vec![("name", "east")],
+            meta: None,
+        },
+    ];
+    let ways = vec![
+        TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "primary")],
+            meta: None,
+        },
+        TestWay {
+            id: 11,
+            refs: vec![2, 4],
+            tags: vec![("natural", "coastline")],
+            meta: None,
+        },
+        TestWay {
+            id: 12,
+            refs: vec![1, 3],
+            tags: vec![("boundary", "administrative")],
+            meta: None,
+        },
+    ];
+    let relations = vec![
+        TestRelation {
+            id: 300,
+            members: vec![
+                TestMember {
+                    id: MemberId::Way(10),
+                    role: "outer",
+                },
+                TestMember {
+                    id: MemberId::Way(11),
+                    role: "inner",
+                },
+            ],
+            tags: vec![("type", "multipolygon")],
+            meta: None,
+        },
+        TestRelation {
+            id: 301,
+            members: vec![
+                TestMember {
+                    id: MemberId::Way(12),
+                    role: "outer",
+                },
+                TestMember {
+                    id: MemberId::Node(4),
+                    role: "admin_centre",
+                },
+            ],
+            tags: vec![("type", "boundary"), ("boundary", "administrative")],
+            meta: None,
+        },
+    ];
     write_test_pbf_sorted(indexed, &nodes, &ways, &relations);
     write_test_pbf_non_indexed(non_indexed, &nodes, &ways, &relations);
     assert_indexed(indexed);
@@ -96,10 +188,20 @@ fn sort_non_indexed_parity() {
         io_uring: false,
         force: true,
     };
-    pbfhogg::commands::sort::sort(&in_idx, &out_idx, &opts, &pbfhogg::HeaderOverrides::default())
-        .expect("sort indexed");
-    pbfhogg::commands::sort::sort(&in_non, &out_non, &opts, &pbfhogg::HeaderOverrides::default())
-        .expect("sort non-indexed");
+    pbfhogg::commands::sort::sort(
+        &in_idx,
+        &out_idx,
+        &opts,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("sort indexed");
+    pbfhogg::commands::sort::sort(
+        &in_non,
+        &out_non,
+        &opts,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("sort non-indexed");
 
     assert_elements_equivalent(&out_idx, &out_non);
 }
@@ -128,10 +230,20 @@ fn tags_filter_non_indexed_parity() {
         force: true,
         jobs: None,
     };
-    pbfhogg::tags_filter::tags_filter(&in_idx, &out_idx, &opts, &pbfhogg::HeaderOverrides::default())
-        .expect("tags_filter indexed");
-    pbfhogg::tags_filter::tags_filter(&in_non, &out_non, &opts, &pbfhogg::HeaderOverrides::default())
-        .expect("tags_filter non-indexed");
+    pbfhogg::tags_filter::tags_filter(
+        &in_idx,
+        &out_idx,
+        &opts,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("tags_filter indexed");
+    pbfhogg::tags_filter::tags_filter(
+        &in_non,
+        &out_non,
+        &opts,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("tags_filter non-indexed");
 
     assert_elements_equivalent(&out_idx, &out_non);
 }
@@ -162,8 +274,7 @@ fn extract_simple_non_indexed_parity() {
     // A bbox that clips about half the nodes - generate_nodes walks
     // coords 1000..=10_000 decimicrodegrees on both axes, so a bbox
     // clipping at 5000 catches ids 1..=5.
-    let bbox = pbfhogg::commands::extract::parse_bbox("0.0,0.0,0.0006,0.0006")
-        .expect("parse bbox");
+    let bbox = pbfhogg::commands::extract::parse_bbox("0.0,0.0,0.0006,0.0006").expect("parse bbox");
     let region = pbfhogg::commands::extract::Region::Bbox(bbox);
 
     let extract = |input: &Path, output: &Path| {
@@ -205,14 +316,35 @@ fn getid_include_non_indexed_parity() {
         .map(ToString::to_string)
         .collect::<Vec<_>>();
     let id_set = pbfhogg::getid::parse_ids(&ids_vec).expect("parse ids");
-    let opts = pbfhogg::getid::GetidOptions { add_referenced: false, remove_tags: false };
+    let opts = pbfhogg::getid::GetidOptions {
+        add_referenced: false,
+        remove_tags: false,
+    };
     let compression = Compression::default();
     let hdr = pbfhogg::HeaderOverrides::default();
 
-    pbfhogg::getid::getid(&in_idx, &out_idx, &id_set, &opts, compression, false, true, &hdr)
-        .expect("getid indexed");
-    pbfhogg::getid::getid(&in_non, &out_non, &id_set, &opts, compression, false, true, &hdr)
-        .expect("getid non-indexed");
+    pbfhogg::getid::getid(
+        &in_idx,
+        &out_idx,
+        &id_set,
+        &opts,
+        compression,
+        false,
+        true,
+        &hdr,
+    )
+    .expect("getid indexed");
+    pbfhogg::getid::getid(
+        &in_non,
+        &out_non,
+        &id_set,
+        &opts,
+        compression,
+        false,
+        true,
+        &hdr,
+    )
+    .expect("getid non-indexed");
 
     assert_elements_equivalent(&out_idx, &out_non);
 }
@@ -273,10 +405,22 @@ fn apply_changes_non_indexed_parity() {
         locations_on_ways: false,
         jobs: None,
     };
-    pbfhogg::apply_changes::merge(&in_idx, &osc, &out_idx, &opts, &pbfhogg::HeaderOverrides::default())
-        .expect("merge indexed");
-    pbfhogg::apply_changes::merge(&in_non, &osc, &out_non, &opts, &pbfhogg::HeaderOverrides::default())
-        .expect("merge non-indexed");
+    pbfhogg::apply_changes::merge(
+        &in_idx,
+        &osc,
+        &out_idx,
+        &opts,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("merge indexed");
+    pbfhogg::apply_changes::merge(
+        &in_non,
+        &osc,
+        &out_non,
+        &opts,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("merge non-indexed");
 
     assert_elements_equivalent(&out_idx, &out_non);
 }
@@ -300,16 +444,25 @@ fn check_refs_non_indexed_parity() {
     let in_non = dir.path().join("in_non.osm.pbf");
     write_both(&in_idx, &in_non);
 
-    let idx = pbfhogg::check::refs::check_refs(&in_idx, true, false, false)
-        .expect("check_refs indexed");
+    let idx =
+        pbfhogg::check::refs::check_refs(&in_idx, true, false, false).expect("check_refs indexed");
     let non = pbfhogg::check::refs::check_refs(&in_non, true, false, false)
         .expect("check_refs non-indexed");
 
     assert_eq!(idx.node_count, non.node_count, "node_count parity");
     assert_eq!(idx.way_count, non.way_count, "way_count parity");
-    assert_eq!(idx.relation_count, non.relation_count, "relation_count parity");
-    assert_eq!(idx.missing_node_refs, non.missing_node_refs, "missing_node_refs parity");
-    assert_eq!(idx.missing_way_refs, non.missing_way_refs, "missing_way_refs parity");
+    assert_eq!(
+        idx.relation_count, non.relation_count,
+        "relation_count parity"
+    );
+    assert_eq!(
+        idx.missing_node_refs, non.missing_node_refs,
+        "missing_node_refs parity"
+    );
+    assert_eq!(
+        idx.missing_way_refs, non.missing_way_refs,
+        "missing_way_refs parity"
+    );
     assert_eq!(
         idx.missing_node_members, non.missing_node_members,
         "missing_node_members parity"
@@ -338,23 +491,32 @@ fn show_element_non_indexed_parity() {
     let in_non = dir.path().join("in_non.osm.pbf");
     write_both(&in_idx, &in_non);
 
-    use pbfhogg::inspect::{show_element, ShowElementType};
+    use pbfhogg::inspect::{ShowElementType, show_element};
 
     // Hit: node 5 exists in the fixture.
-    let idx_hit = show_element(&in_idx, ShowElementType::Node, 5, false).expect("show node indexed");
-    let non_hit = show_element(&in_non, ShowElementType::Node, 5, false).expect("show node non-indexed");
+    let idx_hit =
+        show_element(&in_idx, ShowElementType::Node, 5, false).expect("show node indexed");
+    let non_hit =
+        show_element(&in_non, ShowElementType::Node, 5, false).expect("show node non-indexed");
     assert!(idx_hit, "node 5 must be found on indexed fixture");
     assert!(non_hit, "node 5 must be found on non-indexed fixture");
 
     // Miss: no node at id 999.
-    let idx_miss = show_element(&in_idx, ShowElementType::Node, 999, false).expect("show miss indexed");
-    let non_miss = show_element(&in_non, ShowElementType::Node, 999, false).expect("show miss non-indexed");
+    let idx_miss =
+        show_element(&in_idx, ShowElementType::Node, 999, false).expect("show miss indexed");
+    let non_miss =
+        show_element(&in_non, ShowElementType::Node, 999, false).expect("show miss non-indexed");
     assert!(!idx_miss, "node 999 must NOT be found on indexed fixture");
-    assert!(!non_miss, "node 999 must NOT be found on non-indexed fixture");
+    assert!(
+        !non_miss,
+        "node 999 must NOT be found on non-indexed fixture"
+    );
 
     // Hit on a way.
-    let idx_way = show_element(&in_idx, ShowElementType::Way, 1_000, false).expect("show way indexed");
-    let non_way = show_element(&in_non, ShowElementType::Way, 1_000, false).expect("show way non-indexed");
+    let idx_way =
+        show_element(&in_idx, ShowElementType::Way, 1_000, false).expect("show way indexed");
+    let non_way =
+        show_element(&in_non, ShowElementType::Way, 1_000, false).expect("show way non-indexed");
     assert!(idx_way, "way 1000 must be found on indexed fixture");
     assert!(non_way, "way 1000 must be found on non-indexed fixture");
 }
@@ -390,18 +552,25 @@ fn check_ids_non_indexed_parity() {
         direct_io: false,
     };
     let idx = pbfhogg::check::verify_ids::verify_ids(&in_idx, &opts).expect("verify_ids indexed");
-    let non = pbfhogg::check::verify_ids::verify_ids(&in_non, &opts).expect("verify_ids non-indexed");
+    let non =
+        pbfhogg::check::verify_ids::verify_ids(&in_non, &opts).expect("verify_ids non-indexed");
 
     // `indexed` field deliberately WILL differ - that's its whole point.
     // All other report fields must match.
     assert!(idx.indexed, "indexed fixture must self-report as indexed");
-    assert!(!non.indexed, "non-indexed fixture must self-report as non-indexed");
+    assert!(
+        !non.indexed,
+        "non-indexed fixture must self-report as non-indexed"
+    );
 
     assert_eq!(idx.header_sorted, non.header_sorted, "header_sorted parity");
     assert_eq!(idx.full, non.full, "full parity");
     assert_eq!(idx.node_count, non.node_count, "node_count parity");
     assert_eq!(idx.way_count, non.way_count, "way_count parity");
-    assert_eq!(idx.relation_count, non.relation_count, "relation_count parity");
+    assert_eq!(
+        idx.relation_count, non.relation_count,
+        "relation_count parity"
+    );
     assert_eq!(
         idx.total_violations, non.total_violations,
         "total_violations parity"
@@ -455,10 +624,12 @@ fn derive_changes_non_indexed_parity() {
     let osc_nn = dir.path().join("nn.osc.gz");
     write_derive_pair(&old_idx, &old_non, &new_idx, &new_non);
 
-    let stats_ii = pbfhogg::diff::derive::derive_changes(&old_idx, &new_idx, &osc_ii, false, false, false, 1)
-        .expect("derive_changes indexed");
-    let stats_nn = pbfhogg::diff::derive::derive_changes(&old_non, &new_non, &osc_nn, false, false, false, 1)
-        .expect("derive_changes non-indexed");
+    let stats_ii =
+        pbfhogg::diff::derive::derive_changes(&old_idx, &new_idx, &osc_ii, false, false, false, 1)
+            .expect("derive_changes indexed");
+    let stats_nn =
+        pbfhogg::diff::derive::derive_changes(&old_non, &new_non, &osc_nn, false, false, false, 1)
+            .expect("derive_changes non-indexed");
 
     assert_eq!(stats_ii.creates, stats_nn.creates, "creates parity");
     assert_eq!(stats_ii.modifies, stats_nn.modifies, "modifies parity");
@@ -506,7 +677,10 @@ fn renumber_external_rejects_non_indexed() {
         &pbfhogg::HeaderOverrides::default(),
     )
     .expect("renumber must accept indexed input");
-    assert!(stats_idx.nodes_written > 0, "sanity: indexed renumber produced nodes");
+    assert!(
+        stats_idx.nodes_written > 0,
+        "sanity: indexed renumber produced nodes"
+    );
 
     // Non-indexed input is rejected with an actionable error message.
     let err = pbfhogg::commands::renumber::renumber_external(
@@ -550,10 +724,10 @@ fn extract_multi_complete_ways_non_indexed_parity() {
     write_both(&in_idx, &in_non);
 
     let make_slots = |suffix: &str| -> Vec<pbfhogg::commands::extract::ExtractSlot> {
-        let bbox_a = pbfhogg::commands::extract::parse_bbox("0.0,0.0,0.0006,0.0006")
-            .expect("parse bbox a");
-        let bbox_b = pbfhogg::commands::extract::parse_bbox("0.0,0.0,0.002,0.002")
-            .expect("parse bbox b");
+        let bbox_a =
+            pbfhogg::commands::extract::parse_bbox("0.0,0.0,0.0006,0.0006").expect("parse bbox a");
+        let bbox_b =
+            pbfhogg::commands::extract::parse_bbox("0.0,0.0,0.002,0.002").expect("parse bbox b");
         vec![
             pbfhogg::commands::extract::ExtractSlot {
                 region: pbfhogg::commands::extract::Region::Bbox(bbox_a),
@@ -597,6 +771,56 @@ fn extract_multi_complete_ways_non_indexed_parity() {
     assert_elements_equivalent(&slots_idx[1].output, &slots_non[1].output);
 }
 
+// KNOWN FAILURE, 2026-04-22. `extract --strategy smart` with
+// `force: true` on a non-indexed input produces an empty output on the
+// smart fixture below (indexed output: 4 nodes; non-indexed: 0). This
+// looks like the same missing element-level pass-1 fallback already
+// pinned for CompleteWays, but with smart relation-member expansion on
+// top. Parked in TODO.md; keep the regression test in-tree via
+// `#[ignore]`.
+#[test]
+#[ignore = "extract --smart non-indexed produces empty output (see TODO.md)"]
+fn extract_smart_non_indexed_parity() {
+    let dir = TempDir::new().expect("tempdir");
+    let in_idx = dir.path().join("in_idx.osm.pbf");
+    let in_non = dir.path().join("in_non.osm.pbf");
+    let out_idx = dir.path().join("out_idx.osm.pbf");
+    let out_non = dir.path().join("out_non.osm.pbf");
+    write_smart_both(&in_idx, &in_non);
+
+    let bbox = pbfhogg::commands::extract::parse_bbox("12.4,55.6,12.7,55.8").expect("parse bbox");
+    let region = pbfhogg::commands::extract::Region::Bbox(bbox);
+
+    pbfhogg::commands::extract::extract(
+        &in_idx,
+        &out_idx,
+        &region,
+        pbfhogg::commands::extract::ExtractStrategy::Smart,
+        true,
+        &pbfhogg::cat::CleanAttrs::default(),
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("extract indexed");
+    pbfhogg::commands::extract::extract(
+        &in_non,
+        &out_non,
+        &region,
+        pbfhogg::commands::extract::ExtractStrategy::Smart,
+        true,
+        &pbfhogg::cat::CleanAttrs::default(),
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("extract non-indexed");
+
+    assert_elements_equivalent(&out_idx, &out_non);
+}
+
 // ---------------------------------------------------------------------------
 // merge_pbf (cat --dedupe)
 // ---------------------------------------------------------------------------
@@ -634,12 +858,25 @@ fn write_disjoint_pair(path_a: &Path, path_b: &Path) {
         })
         .collect();
     let b_ways = vec![
-        TestWay { id: 1_000, refs: vec![6, 7], tags: vec![("highway", "primary")], meta: None },
-        TestWay { id: 1_001, refs: vec![8, 9, 10], tags: vec![("building", "yes")], meta: None },
+        TestWay {
+            id: 1_000,
+            refs: vec![6, 7],
+            tags: vec![("highway", "primary")],
+            meta: None,
+        },
+        TestWay {
+            id: 1_001,
+            refs: vec![8, 9, 10],
+            tags: vec![("building", "yes")],
+            meta: None,
+        },
     ];
     let b_rels = vec![TestRelation {
         id: 100,
-        members: vec![TestMember { id: MemberId::Way(1_000), role: "outer" }],
+        members: vec![TestMember {
+            id: MemberId::Way(1_000),
+            role: "outer",
+        }],
         tags: vec![("type", "multipolygon")],
         meta: None,
     }];
@@ -680,12 +917,25 @@ fn merge_pbf_non_indexed_parity() {
         })
         .collect();
     let b_ways = vec![
-        TestWay { id: 1_000, refs: vec![6, 7], tags: vec![("highway", "primary")], meta: None },
-        TestWay { id: 1_001, refs: vec![8, 9, 10], tags: vec![("building", "yes")], meta: None },
+        TestWay {
+            id: 1_000,
+            refs: vec![6, 7],
+            tags: vec![("highway", "primary")],
+            meta: None,
+        },
+        TestWay {
+            id: 1_001,
+            refs: vec![8, 9, 10],
+            tags: vec![("building", "yes")],
+            meta: None,
+        },
     ];
     let b_rels = vec![TestRelation {
         id: 100,
-        members: vec![TestMember { id: MemberId::Way(1_000), role: "outer" }],
+        members: vec![TestMember {
+            id: MemberId::Way(1_000),
+            role: "outer",
+        }],
         tags: vec![("type", "multipolygon")],
         meta: None,
     }];
@@ -726,8 +976,14 @@ fn merge_pbf_non_indexed_parity() {
     assert_elements_equivalent(&out_idx, &out_non);
 
     // Sanity: we produced an actual union (no silent passthrough bug).
-    assert_eq!(stats_idx.nodes, 10, "union must contain both disjoint node sets");
+    assert_eq!(
+        stats_idx.nodes, 10,
+        "union must contain both disjoint node sets"
+    );
     assert_eq!(stats_idx.ways, 2, "union must contain b's ways");
     assert_eq!(stats_idx.relations, 1, "union must contain b's relation");
-    assert_eq!(stats_idx.duplicates_removed, 0, "no overlap -> no duplicates");
+    assert_eq!(
+        stats_idx.duplicates_removed, 0,
+        "no overlap -> no duplicates"
+    );
 }

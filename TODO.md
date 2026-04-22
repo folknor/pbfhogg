@@ -669,8 +669,9 @@ its own commit.
 
 ### Known correctness gaps surfaced by parity tests (2026-04-22)
 
-Both gated as `#[ignore]` integration tests in
-`tests/non_indexed_parity.rs` - uncomment the ignore attribute to
+Pinned as `#[ignore]` regression tests in
+`tests/non_indexed_parity.rs` and
+`tests/apply_changes_invariants.rs` - remove the ignore attribute to
 reproduce.
 
 - [ ] **`extract --strategy simple --force` on non-indexed input
@@ -726,6 +727,41 @@ reproduce.
   scanner do element-level bbox testing when `blob.index()` is
   None. Same root cause likely affects `ExtractStrategy::Smart`.
 
+- [ ] **`extract --strategy smart --force` on non-indexed input
+  produces empty output.** Parity test used the existing smart
+  multipolygon + boundary fixture: indexed output had the expected 4
+  nodes, 3 ways, and 2 relations; non-indexed output was empty
+  (0 nodes). This strongly suggests the same root cause as
+  complete-ways - pass 1 relies on per-blob bbox/indexdata to seed
+  `bbox_node_ids`, so matched ways never materialize and the smart
+  relation-member expansion has nothing to build on. First fix to
+  try: make the non-indexed pass-1 fallback do element-level bbox
+  testing before relation handling.
+
+- [ ] **`apply-changes -j N --locations-on-ways` consumer build trips
+  the drain/copy-range invariant.** New jobs-parity test
+  (`tests/apply_changes_invariants.rs::merge_jobs_parity_on_multiblob_input`)
+  bootstraps a multi-blob indexed base through
+  `add-locations-to-ways`, then compares `jobs=1` vs `jobs=4` on a
+  create/modify/delete OSC. All-features sweep passes. Consumer
+  sweep (`--no-default-features --features commands`) fails before
+  parity assertions with `drain: received CopyRange item but
+  use_copy_range is false`. That means the scanner/drain contract is
+  inconsistent in that feature set: `CopyRange` items are still
+  reaching the drain while copy-range output is disabled.
+
+- [ ] **`merge` summary/stat counters diverge between all-features and
+  consumer builds on the same fixture.** While running
+  `tests/derive_changes.rs::derive_changes_jobs_parity_roundtrips_to_same_output`,
+  both sweeps produced element-equivalent outputs, but the merge
+  summaries differed sharply. All-features reported `34 elements
+  written`, `Base: 22 nodes, 8 ways`; consumer reported `16 elements
+  written`, `Base: 6 nodes, 6 ways` for the same logical roundtrip.
+  This looks like stats/reporting drift or feature-gated counting
+  semantics rather than data corruption, but if these counters are
+  user-visible they need a parity pin. First step: add a dedicated
+  stats-parity test around `MergeStats` / summary accounting.
+
 - [ ] **`check --ids` (`verify_ids`) reports spurious TypeOrder
   violations on non-indexed input.** `check_type_order` in
   `src/commands/check/verify_ids.rs` validates that
@@ -740,8 +776,42 @@ reproduce.
   offset-based check on `indexed == true`, or swap to an
   element-kind-based ordering check that decodes blob contents.
 
-- [ ] **Fuzz testing** - PBF parsing (`PrimitiveBlock::from_vec`), OSC
-  parsing (`parse_osc_file`), and wire-format decoders (`Cursor`,
-  `WireBlock`, `WireInfo`) accept untrusted input. `cargo-fuzz` targets
-  for these entry points would catch panics, OOM, and logic errors on
-  malformed data. Also fuzz the roundtrip path (write → read → compare).
+- [ ] **Property-based testing via `proptest`** *(recommended first
+  pass before any `cargo-fuzz` investment)*. Same class of bugs the
+  fuzz targets below would catch - parse crashes, boundary
+  violations, roundtrip asymmetries - but runs inside `cargo test`
+  in seconds, no corpus directory to gitignore, no long-running
+  campaigns. Shrinks failing inputs to minimal reproducers. Rough
+  targets (one `#[proptest]` fn each):
+    - `PrimitiveBlock::from_vec(bytes)` over arbitrary `Vec<u8>` -
+      must return `Err` or `Ok`, never panic. Same shape for
+      `parse_osc_file(bytes)`, `Cursor::parse_*`, `WireBlock::parse`,
+      `WireInfo::parse`.
+    - `generate_nodes(n, start)` / `generate_ways` / etc -> write
+      -> read -> `assert_elements_equivalent` over arbitrary
+      element counts and start ids.
+    - `apply_changes(base, derive_changes(base, modified))
+      element-equivalent to modified` over arbitrary-shape
+      modifications to a baseline fixture (add/remove/modify N
+      elements for arbitrary N).
+    - Header flag combinations: `sorted`, `bbox`, writing program,
+      `required_features` - round-trip equality.
+  ~100-200 lines across one new `tests/proptests.rs` file. Add
+  `proptest = "1"` to `[dev-dependencies]`. Runs in the normal
+  `brokkr check` sweep; no separate workflow.
+
+- [ ] **Fuzz testing via `cargo-fuzz`** *(optional follow-up to
+  proptest above; only worth the setup if someone wants to run
+  weekend campaigns)*. PBF parsing (`PrimitiveBlock::from_vec`),
+  OSC parsing (`parse_osc_file`), and wire-format decoders
+  (`Cursor`, `WireBlock`, `WireInfo`) accept untrusted input.
+  `cargo-fuzz` targets for these entry points would catch panics,
+  OOM, and logic errors on malformed data. Also fuzz the roundtrip
+  path (write → read → compare). **Cost to manage:** `fuzz/corpus/`
+  grows to hundreds of MB-low GB per target over long campaigns
+  and `fuzz/target/` is ~500 MB-1 GB of build artifacts - both
+  must be gitignored, and a developer running the fuzzer locally
+  needs that space. **Schedule:** smoke runs (60 s) only verify
+  the harness; real bug-hunting needs hours to days per target
+  ("weekend campaign" cadence). Skip until proptest exposes a gap
+  that only coverage-guided fuzzing can fill.

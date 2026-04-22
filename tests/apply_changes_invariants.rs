@@ -30,11 +30,13 @@ use std::io::Write;
 use std::path::Path;
 
 use common::{
-    read_all_elements_with_coords as read_all_elements,
-    write_test_pbf_sorted, TestNode, TestWay,
+    TestNode, TestWay, assert_elements_equivalent, generate_nodes, generate_ways,
+    read_all_elements_with_coords as read_all_elements, write_multi_block_test_pbf,
+    write_test_pbf_sorted,
 };
 use flate2::write::GzEncoder;
-use pbfhogg::apply_changes::{merge, MergeOptions};
+use pbfhogg::altw::add_locations_to_ways;
+use pbfhogg::apply_changes::{MergeOptions, MergeStats, merge};
 use pbfhogg::writer::Compression;
 use tempfile::TempDir;
 
@@ -46,6 +48,16 @@ fn write_osc(path: &Path, xml: &str) {
 }
 
 fn run_merge(base: &Path, osc: &Path, output: &Path) {
+    let _ = run_merge_with_jobs(base, osc, output, None, false);
+}
+
+fn run_merge_with_jobs(
+    base: &Path,
+    osc: &Path,
+    output: &Path,
+    jobs: Option<usize>,
+    locations_on_ways: bool,
+) -> MergeStats {
     merge(
         base,
         osc,
@@ -55,12 +67,12 @@ fn run_merge(base: &Path, osc: &Path, output: &Path) {
             direct_io: false,
             io_uring: false,
             force: true,
-            locations_on_ways: false,
-            jobs: None,
+            locations_on_ways,
+            jobs,
         },
         &pbfhogg::HeaderOverrides::default(),
     )
-    .expect("merge");
+    .expect("merge")
 }
 
 // ---------------------------------------------------------------------------
@@ -97,13 +109,34 @@ fn cursor_rule_false_positive_blob_emits_create_after() {
     write_test_pbf_sorted(
         &base,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 200_000_000, lon: 200_000_000, tags: vec![], meta: None },
-            TestNode { id: 10, lat: 300_000_000, lon: 300_000_000, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 100_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 200_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 10,
+                lat: 300_000_000,
+                lon: 300_000_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
-        &[
-            TestWay { id: 100, refs: vec![1, 2, 10], tags: vec![], meta: None },
-        ],
+        &[TestWay {
+            id: 100,
+            refs: vec![1, 2, 10],
+            tags: vec![],
+            meta: None,
+        }],
         &[],
     );
 
@@ -141,10 +174,7 @@ fn cursor_rule_false_positive_blob_emits_create_after() {
     );
 
     // Base way is untouched.
-    assert_eq!(
-        c.ways.iter().map(|w| w.0).collect::<Vec<_>>(),
-        vec![100],
-    );
+    assert_eq!(c.ways.iter().map(|w| w.0).collect::<Vec<_>>(), vec![100],);
 }
 
 #[test]
@@ -162,8 +192,20 @@ fn cursor_rule_false_positive_blob_emits_create_at_tail() {
     write_test_pbf_sorted(
         &base,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![], meta: None },
-            TestNode { id: 10, lat: 300_000_000, lon: 300_000_000, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 100_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 10,
+                lat: 300_000_000,
+                lon: 300_000_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[],
         &[],
@@ -192,6 +234,101 @@ fn cursor_rule_false_positive_blob_emits_create_at_tail() {
         vec![1, 10, 5],
         "Trailing-create after FalsePositive blob: blob-tail order [1, 10, 5]"
     );
+}
+
+// KNOWN FAILURE, 2026-04-22. This passes under the all-features sweep
+// but fails in the consumer feature sweep (`--no-default-features
+// --features commands`) with:
+// `drain: received CopyRange item but use_copy_range is false`.
+// The bug is in product code, not this fixture; keep the parity pin in
+// tree but ignored until the drain/copy-range contract is fixed.
+#[test]
+#[ignore = "consumer sweep: drain receives CopyRange while use_copy_range=false (see TODO.md)"]
+fn merge_jobs_parity_on_multiblob_input() {
+    let dir = TempDir::new().expect("tempdir");
+    let base_raw = dir.path().join("base_raw.osm.pbf");
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let out_seq = dir.path().join("out_seq.osm.pbf");
+    let out_par = dir.path().join("out_par.osm.pbf");
+
+    let mut nodes = generate_nodes(24, 1);
+    for (i, node) in nodes.iter_mut().enumerate() {
+        if i % 4 == 0 {
+            node.tags = vec![("name", "base")];
+        }
+    }
+
+    let mut ways = generate_ways(10, 1_000, 3, 1);
+    for (i, way) in ways.iter_mut().enumerate() {
+        let start = 1 + i as i64 * 2;
+        way.refs = vec![start, start + 1, start + 2];
+        way.tags = if i % 2 == 0 {
+            vec![("highway", "residential")]
+        } else {
+            vec![("highway", "service")]
+        };
+    }
+
+    write_multi_block_test_pbf(&base_raw, &nodes, &ways, &[], 4);
+    add_locations_to_ways(
+        &base_raw,
+        &base,
+        true,
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+        pbfhogg::altw::IndexType::Dense,
+    )
+    .expect("bootstrap locations-on-ways base");
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <node id="30" lat="0.3000000" lon="0.6000000" version="1">
+      <tag k="created" v="yes"/>
+    </node>
+    <way id="2000" version="1">
+      <nd ref="5"/>
+      <nd ref="30"/>
+      <nd ref="6"/>
+      <tag k="highway" v="primary"/>
+    </way>
+  </create>
+  <modify>
+    <node id="5" lat="0.5555555" lon="0.4444444" version="2">
+      <tag k="name" v="modified"/>
+    </node>
+    <way id="1003" version="2">
+      <nd ref="7"/>
+      <nd ref="5"/>
+      <nd ref="30"/>
+      <tag k="highway" v="secondary"/>
+      <tag k="surface" v="gravel"/>
+    </way>
+  </modify>
+  <delete>
+    <node id="23" version="1"/>
+    <way id="1007" version="1"/>
+  </delete>
+</osmChange>"#,
+    );
+
+    let seq = run_merge_with_jobs(&base, &osc, &out_seq, Some(1), true);
+    let par = run_merge_with_jobs(&base, &osc, &out_par, Some(4), true);
+
+    assert_eq!(seq.base_nodes, par.base_nodes);
+    assert_eq!(seq.base_ways, par.base_ways);
+    assert_eq!(seq.base_relations, par.base_relations);
+    assert_eq!(seq.diff_nodes, par.diff_nodes);
+    assert_eq!(seq.diff_ways, par.diff_ways);
+    assert_eq!(seq.diff_relations, par.diff_relations);
+    assert_eq!(seq.deleted, par.deleted);
+
+    assert_elements_equivalent(&out_seq, &out_par);
 }
 
 // ---------------------------------------------------------------------------
@@ -324,7 +461,13 @@ fn trailing_creates_after_node_blob_flush_way_and_relation() {
 
     write_test_pbf_sorted(
         &base,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![], meta: None }],
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 100_000_000,
+            tags: vec![],
+            meta: None,
+        }],
         &[],
         &[],
     );
@@ -351,7 +494,10 @@ fn trailing_creates_after_node_blob_flush_way_and_relation() {
 
     assert_eq!(c.nodes.iter().map(|n| n.0).collect::<Vec<_>>(), vec![1, 2]);
     assert_eq!(c.ways.iter().map(|w| w.0).collect::<Vec<_>>(), vec![100]);
-    assert_eq!(c.relations.iter().map(|r| r.0).collect::<Vec<_>>(), vec![1000]);
+    assert_eq!(
+        c.relations.iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![1000]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -371,7 +517,13 @@ fn modify_on_missing_id_silently_inserts() {
 
     write_test_pbf_sorted(
         &base,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![], meta: None }],
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 100_000_000,
+            tags: vec![],
+            meta: None,
+        }],
         &[],
         &[],
     );
@@ -408,7 +560,13 @@ fn delete_on_missing_id_is_noop() {
 
     write_test_pbf_sorted(
         &base,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![], meta: None }],
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 100_000_000,
+            tags: vec![],
+            meta: None,
+        }],
         &[],
         &[],
     );
@@ -446,7 +604,13 @@ fn create_on_existing_id_overwrites_base() {
 
     write_test_pbf_sorted(
         &base,
-        &[TestNode { id: 42, lat: 100_000_000, lon: 100_000_000, tags: vec![], meta: None }],
+        &[TestNode {
+            id: 42,
+            lat: 100_000_000,
+            lon: 100_000_000,
+            tags: vec![],
+            meta: None,
+        }],
         &[],
         &[],
     );
@@ -493,8 +657,19 @@ fn trailing_creates_after_way_blob_flush_relation_only() {
 
     write_test_pbf_sorted(
         &base,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![], meta: None }],
-        &[TestWay { id: 10, refs: vec![1], tags: vec![], meta: None }],
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 100_000_000,
+            tags: vec![],
+            meta: None,
+        }],
+        &[TestWay {
+            id: 10,
+            refs: vec![1],
+            tags: vec![],
+            meta: None,
+        }],
         &[],
     );
 
@@ -515,5 +690,8 @@ fn trailing_creates_after_way_blob_flush_relation_only() {
 
     assert_eq!(c.nodes.iter().map(|n| n.0).collect::<Vec<_>>(), vec![1]);
     assert_eq!(c.ways.iter().map(|w| w.0).collect::<Vec<_>>(), vec![10]);
-    assert_eq!(c.relations.iter().map(|r| r.0).collect::<Vec<_>>(), vec![500]);
+    assert_eq!(
+        c.relations.iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![500]
+    );
 }

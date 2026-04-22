@@ -34,7 +34,15 @@ fn snapshot_keeps_latest_version_at_cutoff() {
     let output = dir.path().join("snapshot.osm.pbf");
 
     write_history_input(&input);
-    time_filter(&input, &output, 250, Compression::default(), false, &pbfhogg::HeaderOverrides::default()).expect("time-filter");
+    time_filter(
+        &input,
+        &output,
+        250,
+        Compression::default(),
+        false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("time-filter");
 
     let nodes = read_nodes_with_metadata(&output);
     assert_eq!(
@@ -61,7 +69,15 @@ fn snapshot_omits_objects_deleted_at_cutoff() {
     let output = dir.path().join("snapshot.osm.pbf");
 
     write_history_input(&input);
-    time_filter(&input, &output, 350, Compression::default(), false, &pbfhogg::HeaderOverrides::default()).expect("time-filter");
+    time_filter(
+        &input,
+        &output,
+        350,
+        Compression::default(),
+        false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("time-filter");
 
     let nodes = read_nodes_with_metadata(&output);
     assert_eq!(
@@ -81,11 +97,86 @@ fn output_header_replication_timestamp_is_cutoff() {
     let output = dir.path().join("snapshot.osm.pbf");
 
     write_history_input(&input);
-    time_filter(&input, &output, 123, Compression::default(), false, &pbfhogg::HeaderOverrides::default()).expect("time-filter");
+    time_filter(
+        &input,
+        &output,
+        123,
+        Compression::default(),
+        false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("time-filter");
 
     let header = read_header(&output);
     assert_eq!(header.osmosis_replication_timestamp(), Some(123));
     assert!(header.is_sorted(), "sorted flag should be preserved");
+}
+
+#[test]
+fn snapshot_path_filters_non_history_input() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("snapshot_input.osm.pbf");
+    let output = dir.path().join("snapshot_output.osm.pbf");
+
+    write_snapshot_input(&input);
+    let stats = time_filter(
+        &input,
+        &output,
+        250,
+        Compression::default(),
+        false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("time-filter");
+
+    assert_eq!(stats.versions_seen, 8);
+    assert_eq!(stats.versions_before_cutoff, 6);
+    assert_eq!(stats.elements_written, 4);
+    assert_eq!(stats.dropped_deleted, 2);
+    assert_eq!(stats.dropped_no_snapshot_version, 2);
+
+    let nodes = read_nodes_with_metadata(&output);
+    assert_eq!(
+        nodes,
+        vec![
+            NodeSnapshot {
+                id: 1,
+                version: 1,
+                timestamp: 100,
+            },
+            NodeSnapshot {
+                id: 4,
+                version: 2,
+                timestamp: 250,
+            },
+        ]
+    );
+
+    let (ways, relations) = read_ways_and_relations(&output);
+    assert_eq!(
+        ways,
+        vec![WaySnapshot {
+            id: 10,
+            version: 3,
+            refs: vec![1, 4],
+        }]
+    );
+    assert_eq!(
+        relations,
+        vec![RelationSnapshot {
+            id: 100,
+            version: 2,
+            member_count: 1,
+        }]
+    );
+
+    let header = read_header(&output);
+    assert_eq!(header.osmosis_replication_timestamp(), Some(250));
+    assert!(header.is_sorted(), "sorted flag should be preserved");
+    assert!(
+        !header.has_historical_information(),
+        "snapshot-path output must stay non-historical"
+    );
 }
 
 fn write_history_input(path: &std::path::Path) {
@@ -145,6 +236,107 @@ fn write_history_input(path: &std::path::Path) {
     writer.flush().expect("flush");
 }
 
+fn snapshot_meta(version: i32, timestamp: i64, visible: bool) -> Metadata<'static> {
+    Metadata {
+        version,
+        timestamp,
+        changeset: 10_000 + version as i64,
+        uid: 7,
+        user: "snapshot",
+        visible,
+    }
+}
+
+fn write_snapshot_input(path: &std::path::Path) {
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .sorted()
+        .replication_timestamp(9_999)
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+
+    bb.add_node(
+        1,
+        10,
+        10,
+        [("name", "keep")],
+        Some(&snapshot_meta(1, 100, true)),
+    );
+    bb.add_node(
+        2,
+        20,
+        20,
+        [("name", "too-new")],
+        Some(&snapshot_meta(1, 260, true)),
+    );
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    bb.add_node(
+        3,
+        30,
+        30,
+        [("name", "deleted")],
+        Some(&snapshot_meta(1, 200, false)),
+    );
+    bb.add_node(
+        4,
+        40,
+        40,
+        [("name", "edge")],
+        Some(&snapshot_meta(2, 250, true)),
+    );
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    bb.add_way(
+        10,
+        [("highway", "service")],
+        &[1, 4],
+        Some(&snapshot_meta(3, 200, true)),
+    );
+    bb.add_way(
+        11,
+        [("highway", "residential")],
+        &[2, 4],
+        Some(&snapshot_meta(1, 300, true)),
+    );
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    bb.add_relation(
+        100,
+        [("type", "multipolygon")],
+        &[MemberData {
+            id: MemberId::Way(10),
+            role: "outer",
+        }],
+        Some(&snapshot_meta(2, 225, true)),
+    );
+    bb.add_relation(
+        101,
+        [("type", "site")],
+        &[MemberData {
+            id: MemberId::Node(3),
+            role: "label",
+        }],
+        Some(&snapshot_meta(1, 240, false)),
+    );
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    writer.flush().expect("flush");
+}
+
 fn read_nodes_with_metadata(path: &std::path::Path) -> Vec<NodeSnapshot> {
     let reader = BlobReader::from_path(path).expect("open pbf");
     let mut out = Vec::new();
@@ -184,7 +376,15 @@ fn snapshot_ways_and_relations() {
     let output = dir.path().join("snapshot.osm.pbf");
 
     write_history_with_ways_and_relations(&input);
-    time_filter(&input, &output, 250, Compression::default(), false, &pbfhogg::HeaderOverrides::default()).expect("time-filter");
+    time_filter(
+        &input,
+        &output,
+        250,
+        Compression::default(),
+        false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("time-filter");
 
     let (ways, relations) = read_ways_and_relations(&output);
     assert_eq!(
@@ -247,7 +447,12 @@ fn write_history_with_ways_and_relations(path: &std::path::Path) {
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");
     }
-    bb.add_way(10, std::iter::empty::<(&str, &str)>(), &[1, 2, 3], Some(&w2));
+    bb.add_way(
+        10,
+        std::iter::empty::<(&str, &str)>(),
+        &[1, 2, 3],
+        Some(&w2),
+    );
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");
     }
@@ -280,9 +485,7 @@ fn write_history_with_ways_and_relations(path: &std::path::Path) {
     writer.flush().expect("flush");
 }
 
-fn read_ways_and_relations(
-    path: &std::path::Path,
-) -> (Vec<WaySnapshot>, Vec<RelationSnapshot>) {
+fn read_ways_and_relations(path: &std::path::Path) -> (Vec<WaySnapshot>, Vec<RelationSnapshot>) {
     let reader = BlobReader::from_path(path).expect("open pbf");
     let mut ways = Vec::new();
     let mut relations = Vec::new();

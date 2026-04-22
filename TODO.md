@@ -71,10 +71,6 @@ that are not currently driven by `overnight.sh`.
 
 Need a pbfhogg CLI flag to exist before brokkr can forward it:
 
-- [ ] **`tags-filter -j N`** - the `parallel_classify_phase` workers
-  axis. pbfhogg tags-filter has no `-j` flag today. If we want to
-  measure threading scaling (similar to `inspect --nodes -j`), pbfhogg
-  has to add it first, then brokkr forwards it.
 - [ ] **`merge-changes -j N`** - parallel-parse axis the
   [`notes/merge-changes.md`](notes/merge-changes.md) plan will
   eventually deliver. Not a gap today; will appear when the feature
@@ -94,10 +90,12 @@ Need a pbfhogg CLI flag to exist before brokkr can forward it:
   snapshot-range axis is a single pairing. Downloading another
   snapshot 2-4 weeks away would let us measure diff-wall vs
   snapshot-delta-size empirically.
-- [ ] **Multi-OSC merge-changes at europe / germany**. Those datasets
-  currently have exactly one OSC each, so multi-OSC benches only run
-  at planet (7-OSC range 4914..4920). `brokkr download <region>
-  --osc-seq <N>` can pull additional sequences for faster iteration.
+- [x] ~~**Multi-OSC merge-changes at europe / germany**~~ - landed
+  2026-04-22. europe now carries OSCs 4715..4722 (8 entries), germany
+  carries 4705..4712 (8 entries). 7-OSC ranges (4716..4722 and
+  4706..4712 respectively) match planet's 4914..4920 shape so the
+  parallel-parse plan can iterate at smaller scales. `overnight.sh`
+  queues both ranges (streaming + `--simplify` paths).
 
 ### Un-benched permutations (low priority)
 
@@ -120,11 +118,6 @@ Known to work, no performance question open, but not in the results DB:
   Synthetic benchmarks, intentionally excluded from the README user
   surface. Periodically-useful diagnostic tools; not a validation
   target.
-- [ ] **`tags-filter --invert-match` / `-t --remove-tags`** -
-  two genuinely-unexposed tags-filter code paths that brokkr could
-  forward but doesn't yet. Move to `overnight.sh` once brokkr
-  exposes both flags.
-
 ## Next up (2026-04-13)
 
 - [x] ~~**`--allow-missing` for apply-changes**~~ - **not needed (2026-04-21).**

@@ -303,3 +303,59 @@ xxhash = "e2b264f8761801f7a58c7eb8fc86d8fc"
 [plantasjen.datasets.germany.snapshot.20260420.pbf.indexed]
 file = "germany-20260420-with-indexdata.osm.pbf"
 xxhash = "b40b32fa9a4679a66d8bbe218c296b08"
+
+[plantasjen.datasets.europe.osc.4716]
+file = "europe-20260422-seq4716.osc.gz"
+xxhash = "4aca83cbf4b4edc675d1339bdf581108"
+
+[plantasjen.datasets.europe.osc.4717]
+file = "europe-20260422-seq4717.osc.gz"
+xxhash = "485e36ac2098ae0bc14194e595c6dbce"
+
+[plantasjen.datasets.europe.osc.4718]
+file = "europe-20260422-seq4718.osc.gz"
+xxhash = "75fe55ecad8668098efb0d8dbf279fa3"
+
+[plantasjen.datasets.europe.osc.4719]
+file = "europe-20260422-seq4719.osc.gz"
+xxhash = "e8c00a6a95e30fd76c0d7aed66f68d70"
+
+[plantasjen.datasets.europe.osc.4720]
+file = "europe-20260422-seq4720.osc.gz"
+xxhash = "e95aeaf41799b4f3979ad65f72f25ad8"
+
+[plantasjen.datasets.europe.osc.4721]
+file = "europe-20260422-seq4721.osc.gz"
+xxhash = "a5da91d3c6c8fa46ede081e91b258210"
+
+[plantasjen.datasets.europe.osc.4722]
+file = "europe-20260422-seq4722.osc.gz"
+xxhash = "fb78761bbd734dccb7fe2a9e2f23ee6a"
+
+[plantasjen.datasets.germany.osc.4706]
+file = "germany-20260422-seq4706.osc.gz"
+xxhash = "08f81477e9a526eb3153682e5fc78dda"
+
+[plantasjen.datasets.germany.osc.4707]
+file = "germany-20260422-seq4707.osc.gz"
+xxhash = "88b227c9f4b67d8abf3af53399d1fabe"
+
+[plantasjen.datasets.germany.osc.4708]
+file = "germany-20260422-seq4708.osc.gz"
+xxhash = "a8876302e4dab71805e1593905ece28f"
+
+[plantasjen.datasets.germany.osc.4709]
+file = "germany-20260422-seq4709.osc.gz"
+xxhash = "fd271d2c26074a03c17a1fe1a4464626"
+
+[plantasjen.datasets.germany.osc.4710]
+file = "germany-20260422-seq4710.osc.gz"
+xxhash = "3675f62637d6d819ac671002174e5da3"
+
+[plantasjen.datasets.germany.osc.4711]
+file = "germany-20260422-seq4711.osc.gz"
+xxhash = "7a2b58bc1586ed717a787b12be20ed9c"
+
+[plantasjen.datasets.germany.osc.4712]
+file = "germany-20260422-seq4712.osc.gz"
+xxhash = "0d63b3878e137489f9a3942d844e9432"

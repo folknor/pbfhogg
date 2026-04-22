@@ -1,9 +1,238 @@
-//! Integration tests for the reverse geocoding index builder and reader.
-//!
-//! Requires Denmark PBF with indexdata. Skipped if the file doesn't exist.
-//! Run with: `cargo test --test geocode_index -- --ignored`
+//! Reverse-geocode coverage: default synthetic smoke tests plus ignored
+//! Denmark-scale integration tests.
+
+mod common;
 
 use std::path::Path;
+
+use common::{TestMember, TestNode, TestRelation, TestWay, write_test_pbf_sorted};
+use pbfhogg::MemberId;
+use tempfile::TempDir;
+
+fn write_synthetic_indexed_input(path: &Path) {
+    write_test_pbf_sorted(
+        path,
+        &[
+            TestNode { id: 1, lat: 557_000_000, lon: 125_000_000, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 557_000_000, lon: 125_010_000, tags: vec![], meta: None },
+            TestNode {
+                id: 3,
+                lat: 557_000_500,
+                lon: 125_005_000,
+                tags: vec![
+                    ("addr:housenumber", "10"),
+                    ("addr:street", "Main Street"),
+                    ("addr:postcode", "1234"),
+                ],
+                meta: None,
+            },
+        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "residential"), ("name", "Main Street")],
+            meta: None,
+        }],
+        &[],
+    );
+}
+
+fn write_synthetic_admin_input(path: &Path) {
+    write_test_pbf_sorted(
+        path,
+        &[
+            TestNode { id: 10, lat: 556_990_000, lon: 124_990_000, tags: vec![], meta: None },
+            TestNode { id: 11, lat: 556_990_000, lon: 125_020_000, tags: vec![], meta: None },
+            TestNode { id: 12, lat: 557_010_000, lon: 125_020_000, tags: vec![], meta: None },
+            TestNode { id: 13, lat: 557_010_000, lon: 124_990_000, tags: vec![], meta: None },
+        ],
+        &[TestWay {
+            id: 20,
+            refs: vec![10, 11, 12, 13, 10],
+            tags: vec![],
+            meta: None,
+        }],
+        &[TestRelation {
+            id: 30,
+            members: vec![TestMember { id: MemberId::Way(20), role: "outer" }],
+            tags: vec![
+                ("type", "boundary"),
+                ("boundary", "administrative"),
+                ("admin_level", "2"),
+                ("name", "Syntheticland"),
+                ("ISO3166-1:alpha2", "SL"),
+            ],
+            meta: None,
+        }],
+    );
+}
+
+#[test]
+fn synthetic_build_query_and_api_equivalence() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+
+    write_synthetic_indexed_input(&input);
+
+    let stats = pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir.clone(),
+            force: false,
+            ..Default::default()
+        },
+    )
+    .expect("build should succeed");
+
+    assert_eq!(stats.addr_points, 1, "synthetic fixture has one address node");
+    assert_eq!(stats.street_ways, 1, "synthetic fixture has one named street way");
+    assert_eq!(stats.interp_ways, 0, "synthetic fixture has no interpolation ways");
+    assert_eq!(stats.admin_polygons, 0, "synthetic fixture has no admin relations");
+
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
+        .expect("reader should open");
+
+    let result = reader.query(55.70005, 12.5005);
+    let addr = result.address.as_ref().expect("query should find the address");
+    assert_eq!(addr.house_number, "10");
+    assert_eq!(addr.street, "Main Street");
+    assert_eq!(addr.postcode, Some("1234"));
+    let street = result.street.as_ref().expect("query should find the street");
+    assert_eq!(street.name, "Main Street");
+    assert!(result.interpolation.is_none(), "fixture has no interpolation data");
+    assert!(result.admin.is_empty(), "fixture has no admin polygons");
+
+    let via_candidates = reader.candidates(55.70005, 12.5005).into_result(&reader);
+    let cand_addr = via_candidates.address.as_ref().expect("candidates should find the address");
+    assert_eq!(cand_addr.house_number, "10");
+    assert_eq!(cand_addr.street, "Main Street");
+    assert_eq!(cand_addr.postcode, Some("1234"));
+    let cand_street = via_candidates.street.as_ref().expect("candidates should find the street");
+    assert_eq!(cand_street.name, "Main Street");
+    assert!(via_candidates.interpolation.is_none(), "fixture has no interpolation data");
+    assert!(
+        via_candidates.admin.is_empty(),
+        "fixture has no admin polygons"
+    );
+
+    let far = reader.query(0.0, 0.0);
+    assert!(far.address.is_none(), "far-away query must not invent an address");
+    assert!(far.street.is_none(), "far-away query must not invent a street");
+    assert!(
+        far.interpolation.is_none(),
+        "far-away query must not invent interpolation"
+    );
+    assert!(far.admin.is_empty(), "far-away query must not invent admin");
+}
+
+#[test]
+fn coarse_fallback_recovers_hits_outside_fine_radius() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let no_fallback_dir = dir.path().join("index_no_fallback");
+    let coarse_fallback_dir = dir.path().join("index_with_fallback");
+
+    write_synthetic_indexed_input(&input);
+
+    for (output_dir, coarse_search_radius_m) in [
+        (&no_fallback_dir, 1.0_f32),
+        (&coarse_fallback_dir, 100.0_f32),
+    ] {
+        pbfhogg::geocode_index::builder::build_geocode_index(
+            &pbfhogg::geocode_index::builder::BuildConfig {
+                input_path: input.clone(),
+                output_dir: output_dir.clone(),
+                force: false,
+                fine_search_radius_m: 1.0,
+                coarse_search_radius_m,
+                ..Default::default()
+            },
+        )
+        .expect("build should succeed");
+    }
+
+    let query_lat = 55.7002;
+    let query_lon = 12.5005;
+
+    let no_fallback = pbfhogg::geocode_index::reader::Reader::open(&no_fallback_dir)
+        .expect("reader should open");
+    let no_fallback_result = no_fallback.query(query_lat, query_lon);
+    assert!(
+        no_fallback_result.address.is_none(),
+        "1m fine radius should miss the address"
+    );
+    assert!(
+        no_fallback_result.street.is_none(),
+        "1m fine radius should miss the street"
+    );
+
+    let with_fallback = pbfhogg::geocode_index::reader::Reader::open(&coarse_fallback_dir)
+        .expect("reader should open");
+    let with_fallback_result = with_fallback.query(query_lat, query_lon);
+    let addr = with_fallback_result
+        .address
+        .as_ref()
+        .expect("coarse fallback should recover the nearby address");
+    assert_eq!(addr.house_number, "10");
+    assert_eq!(addr.street, "Main Street");
+    let street = with_fallback_result
+        .street
+        .as_ref()
+        .expect("coarse fallback should recover the nearby street");
+    assert_eq!(street.name, "Main Street");
+    assert!(
+        with_fallback_result.admin.is_empty(),
+        "fixture has no admin polygons"
+    );
+}
+
+#[test]
+fn synthetic_admin_polygon_query_returns_country_match() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+
+    write_synthetic_admin_input(&input);
+
+    let stats = pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir.clone(),
+            force: false,
+            ..Default::default()
+        },
+    )
+    .expect("build should succeed");
+
+    assert_eq!(stats.addr_points, 0, "admin-only fixture has no address points");
+    assert_eq!(stats.street_ways, 0, "admin-only fixture has no street ways");
+    assert_eq!(stats.admin_polygons, 1, "fixture has one admin boundary");
+
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
+        .expect("reader should open");
+
+    let inside = reader.query(55.7000, 12.5005);
+    assert!(inside.address.is_none(), "admin-only fixture has no addresses");
+    assert!(inside.street.is_none(), "admin-only fixture has no streets");
+    assert!(
+        inside.interpolation.is_none(),
+        "admin-only fixture has no interpolation"
+    );
+    let country = inside
+        .admin
+        .iter()
+        .find(|admin| admin.admin_level == 2)
+        .expect("query inside the polygon should return the country boundary");
+    assert_eq!(country.name, "Syntheticland");
+    assert_eq!(country.country_code, Some("SL"));
+
+    let outside = reader.query(55.7020, 12.5005);
+    assert!(
+        outside.admin.is_empty(),
+        "query outside the polygon must not match the country boundary"
+    );
+}
 
 fn denmark_indexed_path() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("PBFHOGG_TEST_PBF_INDEXED") {

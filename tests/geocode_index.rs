@@ -67,6 +67,133 @@ fn write_synthetic_admin_input(path: &Path) {
     );
 }
 
+fn write_synthetic_nested_admin_same_level_input(path: &Path) {
+    write_test_pbf_sorted(
+        path,
+        &[
+            TestNode { id: 40, lat: 556_980_000, lon: 124_980_000, tags: vec![], meta: None },
+            TestNode { id: 41, lat: 556_980_000, lon: 125_030_000, tags: vec![], meta: None },
+            TestNode { id: 42, lat: 557_020_000, lon: 125_030_000, tags: vec![], meta: None },
+            TestNode { id: 43, lat: 557_020_000, lon: 124_980_000, tags: vec![], meta: None },
+            TestNode { id: 44, lat: 556_995_000, lon: 124_995_000, tags: vec![], meta: None },
+            TestNode { id: 45, lat: 556_995_000, lon: 125_015_000, tags: vec![], meta: None },
+            TestNode { id: 46, lat: 557_005_000, lon: 125_015_000, tags: vec![], meta: None },
+            TestNode { id: 47, lat: 557_005_000, lon: 124_995_000, tags: vec![], meta: None },
+        ],
+        &[
+            TestWay { id: 50, refs: vec![40, 41, 42, 43, 40], tags: vec![], meta: None },
+            TestWay { id: 51, refs: vec![44, 45, 46, 47, 44], tags: vec![], meta: None },
+        ],
+        &[
+            TestRelation {
+                id: 60,
+                members: vec![TestMember { id: MemberId::Way(50), role: "outer" }],
+                tags: vec![
+                    ("type", "boundary"),
+                    ("boundary", "administrative"),
+                    ("admin_level", "8"),
+                    ("name", "Bigshire"),
+                ],
+                meta: None,
+            },
+            TestRelation {
+                id: 61,
+                members: vec![TestMember { id: MemberId::Way(51), role: "outer" }],
+                tags: vec![
+                    ("type", "boundary"),
+                    ("boundary", "administrative"),
+                    ("admin_level", "8"),
+                    ("name", "Smallshire"),
+                ],
+                meta: None,
+            },
+        ],
+    );
+}
+
+fn write_synthetic_interpolation_input(path: &Path) {
+    write_test_pbf_sorted(
+        path,
+        &[
+            TestNode {
+                id: 100,
+                lat: 557_000_000,
+                lon: 125_000_000,
+                tags: vec![("addr:housenumber", "10"), ("addr:street", "Interp Street")],
+                meta: None,
+            },
+            TestNode {
+                id: 101,
+                lat: 557_000_000,
+                lon: 125_060_000,
+                tags: vec![("addr:housenumber", "30"), ("addr:street", "Interp Street")],
+                meta: None,
+            },
+        ],
+        &[TestWay {
+            id: 200,
+            refs: vec![100, 101],
+            tags: vec![("addr:interpolation", "even"), ("addr:street", "Interp Street")],
+            meta: None,
+        }],
+        &[],
+    );
+}
+
+fn write_synthetic_unresolved_interpolation_input(path: &Path) {
+    write_test_pbf_sorted(
+        path,
+        &[
+            TestNode {
+                id: 110,
+                lat: 557_000_000,
+                lon: 125_000_000,
+                tags: vec![("addr:housenumber", "10"), ("addr:street", "Missing End Street")],
+                meta: None,
+            },
+            TestNode { id: 111, lat: 557_000_000, lon: 125_060_000, tags: vec![], meta: None },
+        ],
+        &[TestWay {
+            id: 210,
+            refs: vec![110, 111],
+            tags: vec![
+                ("addr:interpolation", "all"),
+                ("addr:street", "Missing End Street"),
+            ],
+            meta: None,
+        }],
+        &[],
+    );
+}
+
+fn write_synthetic_postal_boundary_input(path: &Path) {
+    write_test_pbf_sorted(
+        path,
+        &[
+            TestNode { id: 300, lat: 556_990_000, lon: 124_990_000, tags: vec![], meta: None },
+            TestNode { id: 301, lat: 556_990_000, lon: 125_020_000, tags: vec![], meta: None },
+            TestNode { id: 302, lat: 557_010_000, lon: 125_020_000, tags: vec![], meta: None },
+            TestNode { id: 303, lat: 557_010_000, lon: 124_990_000, tags: vec![], meta: None },
+        ],
+        &[TestWay {
+            id: 310,
+            refs: vec![300, 301, 302, 303, 300],
+            tags: vec![],
+            meta: None,
+        }],
+        &[TestRelation {
+            id: 320,
+            members: vec![TestMember { id: MemberId::Way(310), role: "outer" }],
+            tags: vec![
+                ("type", "boundary"),
+                ("boundary", "postal_code"),
+                ("postal_code", "4242"),
+            ],
+            meta: None,
+        }],
+    );
+}
+
 #[test]
 fn synthetic_build_query_and_api_equivalence() {
     let dir = TempDir::new().expect("tempdir");
@@ -231,6 +358,288 @@ fn synthetic_admin_polygon_query_returns_country_match() {
     assert!(
         outside.admin.is_empty(),
         "query outside the polygon must not match the country boundary"
+    );
+}
+
+#[test]
+fn nested_same_level_admin_prefers_smallest_polygon() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+
+    write_synthetic_nested_admin_same_level_input(&input);
+
+    let stats = pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir.clone(),
+            force: false,
+            ..Default::default()
+        },
+    )
+    .expect("build should succeed");
+
+    assert_eq!(stats.admin_polygons, 2, "fixture has two admin polygons at the same level");
+
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
+        .expect("reader should open");
+
+    let query_lat = 55.7000;
+    let query_lon = 12.5005;
+
+    let raw_candidates = reader.candidates(query_lat, query_lon);
+    let raw_level8: Vec<_> = raw_candidates
+        .admin
+        .iter()
+        .filter(|admin| admin.admin_level == 8)
+        .map(|admin| admin.name)
+        .collect();
+    assert_eq!(raw_level8.len(), 2, "raw candidates should expose both containing polygons");
+    assert!(raw_level8.contains(&"Bigshire"));
+    assert!(raw_level8.contains(&"Smallshire"));
+
+    let collapsed = reader.query(query_lat, query_lon);
+    let collapsed_level8: Vec<_> = collapsed
+        .admin
+        .iter()
+        .filter(|admin| admin.admin_level == 8)
+        .collect();
+    assert_eq!(collapsed_level8.len(), 1, "query() should collapse same-level admin matches");
+    assert_eq!(collapsed_level8[0].name, "Smallshire");
+
+    let via_into_result = reader.candidates(query_lat, query_lon).into_result(&reader);
+    let into_result_level8: Vec<_> = via_into_result
+        .admin
+        .iter()
+        .filter(|admin| admin.admin_level == 8)
+        .collect();
+    assert_eq!(
+        into_result_level8.len(),
+        1,
+        "candidates().into_result() should also collapse same-level admin matches"
+    );
+    assert_eq!(into_result_level8[0].name, "Smallshire");
+}
+
+#[test]
+fn synthetic_interpolation_query_resolves_even_house_number() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+
+    write_synthetic_interpolation_input(&input);
+
+    let stats = pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir.clone(),
+            force: false,
+            coarse_search_radius_m: 1.0,
+            ..Default::default()
+        },
+    )
+    .expect("build should succeed");
+
+    assert_eq!(stats.addr_points, 2, "fixture has two endpoint address nodes");
+    assert_eq!(stats.street_ways, 0, "fixture has no named street way");
+    assert_eq!(stats.interp_ways, 1, "fixture has one interpolation way");
+
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
+        .expect("reader should open");
+
+    let query_lat = 55.7000;
+    let query_lon = 12.5030;
+    let result = reader.query(query_lat, query_lon);
+    assert!(
+        result.address.is_none(),
+        "midpoint query should stay outside the fine address radius"
+    );
+    assert!(result.street.is_none(), "fixture has no street geometry");
+    let interp = result
+        .interpolation
+        .as_ref()
+        .expect("query should resolve the interpolation");
+    assert_eq!(interp.street, "Interp Street");
+    assert_eq!(interp.house_number, 20, "midpoint on the interpolation should resolve to 20");
+    assert!(result.admin.is_empty(), "fixture has no admin polygons");
+
+    let candidates = reader.candidates(query_lat, query_lon);
+    assert!(
+        !candidates.interpolations.is_empty(),
+        "candidates should expose the raw interpolation hit"
+    );
+    let via_candidates = reader.candidates(query_lat, query_lon).into_result(&reader);
+    let cand_interp = via_candidates
+        .interpolation
+        .as_ref()
+        .expect("candidates().into_result() should resolve the interpolation");
+    assert_eq!(cand_interp.street, "Interp Street");
+    assert_eq!(cand_interp.house_number, 20);
+}
+
+#[test]
+fn unresolved_interpolation_stays_hidden_behind_zero_sentinel() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+
+    write_synthetic_unresolved_interpolation_input(&input);
+
+    let stats = pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir.clone(),
+            force: false,
+            coarse_search_radius_m: 1.0,
+            ..Default::default()
+        },
+    )
+    .expect("build should succeed");
+
+    assert_eq!(stats.addr_points, 1, "fixture has only one matching endpoint address");
+    assert_eq!(stats.interp_ways, 1, "fixture still writes one interpolation way");
+
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
+        .expect("reader should open");
+
+    let query_lat = 55.7000;
+    let query_lon = 12.5030;
+    let result = reader.query(query_lat, query_lon);
+    assert!(result.address.is_none(), "midpoint query should not hit the lone endpoint address");
+    assert!(
+        result.interpolation.is_none(),
+        "unresolved endpoints stay at 0/0 and must not surface as an interpolation result"
+    );
+
+    let candidates = reader.candidates(query_lat, query_lon);
+    let candidate = candidates
+        .interpolations
+        .iter()
+        .min_by(|a, b| a.distance_m.partial_cmp(&b.distance_m).unwrap_or(std::cmp::Ordering::Equal))
+        .expect("raw candidates should still expose the interpolation segment");
+    assert!(
+        reader.interpolate(candidate).is_none(),
+        "reader.interpolate() should hide unresolved 0/0 interpolation endpoints"
+    );
+    assert!(
+        reader
+            .candidates(query_lat, query_lon)
+            .into_result(&reader)
+            .interpolation
+            .is_none(),
+        "candidates().into_result() should also hide unresolved interpolation"
+    );
+}
+
+#[test]
+fn coarse_fallback_recovers_interpolation_outside_fine_radius() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let no_fallback_dir = dir.path().join("index_no_fallback");
+    let coarse_fallback_dir = dir.path().join("index_with_fallback");
+
+    write_synthetic_interpolation_input(&input);
+
+    for (output_dir, coarse_search_radius_m) in [
+        (&no_fallback_dir, 1.0_f32),
+        (&coarse_fallback_dir, 100.0_f32),
+    ] {
+        pbfhogg::geocode_index::builder::build_geocode_index(
+            &pbfhogg::geocode_index::builder::BuildConfig {
+                input_path: input.clone(),
+                output_dir: output_dir.clone(),
+                force: false,
+                fine_search_radius_m: 1.0,
+                coarse_search_radius_m,
+                ..Default::default()
+            },
+        )
+        .expect("build should succeed");
+    }
+
+    let query_lat = 55.7002;
+    let query_lon = 12.5030;
+
+    let no_fallback = pbfhogg::geocode_index::reader::Reader::open(&no_fallback_dir)
+        .expect("reader should open");
+    let no_fallback_result = no_fallback.query(query_lat, query_lon);
+    assert!(
+        no_fallback_result.address.is_none(),
+        "fine-only lookup should miss the endpoint addresses"
+    );
+    assert!(
+        no_fallback_result.street.is_none(),
+        "fixture has no street geometry"
+    );
+    assert!(
+        no_fallback_result.interpolation.is_none(),
+        "1m fine radius should miss the interpolation segment"
+    );
+
+    let with_fallback = pbfhogg::geocode_index::reader::Reader::open(&coarse_fallback_dir)
+        .expect("reader should open");
+    let with_fallback_result = with_fallback.query(query_lat, query_lon);
+    assert!(
+        with_fallback_result.address.is_none(),
+        "coarse interpolation fallback should not invent an endpoint address"
+    );
+    assert!(
+        with_fallback_result.street.is_none(),
+        "fixture has no street geometry"
+    );
+    let interp = with_fallback_result
+        .interpolation
+        .as_ref()
+        .expect("coarse fallback should recover the interpolation");
+    assert_eq!(interp.street, "Interp Street");
+    assert_eq!(interp.house_number, 20);
+
+    let candidates = with_fallback.candidates(query_lat, query_lon);
+    assert!(
+        !candidates.interpolations.is_empty(),
+        "coarse candidates should expose the raw interpolation hit"
+    );
+}
+
+#[test]
+fn synthetic_postal_boundary_query_returns_level_11_match() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+
+    write_synthetic_postal_boundary_input(&input);
+
+    let stats = pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir.clone(),
+            force: false,
+            ..Default::default()
+        },
+    )
+    .expect("build should succeed");
+
+    assert_eq!(stats.admin_polygons, 1, "fixture has one postal boundary polygon");
+
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
+        .expect("reader should open");
+
+    let inside = reader.query(55.7000, 12.5005);
+    let postal = inside
+        .admin
+        .iter()
+        .find(|admin| admin.admin_level == 11)
+        .expect("query inside the polygon should return the postal-code boundary");
+    assert_eq!(postal.name, "4242");
+    assert_eq!(
+        postal.country_code, None,
+        "postal-code boundaries should not fabricate a country code"
+    );
+
+    let outside = reader.query(55.7020, 12.5005);
+    assert!(
+        outside.admin.iter().all(|admin| admin.admin_level != 11),
+        "query outside the polygon must not match the postal boundary"
     );
 }
 

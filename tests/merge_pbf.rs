@@ -229,6 +229,60 @@ fn merge_empty_files() {
     assert_eq!(stats.duplicates_removed, 0);
 }
 
+#[test]
+#[ignore = "merge_pbf([A, A]) drops ways and relations (see TODO.md)"]
+fn merge_same_input_preserves_ways_and_relations() {
+    let dir = TempDir::new().expect("tempdir");
+    let a = dir.path().join("a.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &a,
+        &[
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "n1")], meta: None },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "n2")], meta: None },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![("name", "n3")], meta: None },
+            TestNode { id: 4, lat: 130_000_000, lon: 230_000_000, tags: vec![("name", "n4")], meta: None },
+            TestNode { id: 5, lat: 140_000_000, lon: 240_000_000, tags: vec![("name", "n5")], meta: None },
+            TestNode { id: 6, lat: 150_000_000, lon: 250_000_000, tags: vec![("name", "n6")], meta: None },
+            TestNode { id: 7, lat: 160_000_000, lon: 260_000_000, tags: vec![("name", "n7")], meta: None },
+            TestNode { id: 8, lat: 170_000_000, lon: 270_000_000, tags: vec![("name", "n8")], meta: None },
+            TestNode { id: 9, lat: 180_000_000, lon: 280_000_000, tags: vec![("name", "n9")], meta: None },
+            TestNode { id: 10, lat: 190_000_000, lon: 290_000_000, tags: vec![("name", "n10")], meta: None },
+        ],
+        &[
+            TestWay { id: 100, refs: vec![1, 2, 3], tags: vec![("highway", "residential")], meta: None },
+            TestWay { id: 101, refs: vec![3, 4, 5], tags: vec![("highway", "service")], meta: None },
+            TestWay { id: 102, refs: vec![5, 6, 7], tags: vec![("waterway", "stream")], meta: None },
+            TestWay { id: 103, refs: vec![7, 8, 9, 10], tags: vec![("landuse", "meadow")], meta: None },
+        ],
+        &[
+            TestRelation {
+                id: 1000,
+                members: vec![
+                    TestMember { id: MemberId::Way(100), role: "outer" },
+                    TestMember { id: MemberId::Way(101), role: "inner" },
+                    TestMember { id: MemberId::Way(102), role: "subarea" },
+                    TestMember { id: MemberId::Way(103), role: "label" },
+                ],
+                tags: vec![("type", "multipolygon"), ("name", "fixture")],
+                meta: None,
+            },
+        ],
+    );
+
+    let inputs: Vec<&std::path::Path> = vec![a.as_path(), a.as_path()];
+    let stats = merge_pbf(&inputs, &output, &default_opts(), &pbfhogg::HeaderOverrides::default()).expect("merge_pbf");
+    let merged = read_all_elements(&output);
+
+    assert_eq!(node_ids(&merged), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(way_ids(&merged), vec![100, 101, 102, 103]);
+    assert_eq!(relation_ids(&merged), vec![1000]);
+    assert_eq!(stats.nodes, 10);
+    assert_eq!(stats.ways, 4);
+    assert_eq!(stats.relations, 1);
+}
+
 /// F60: Three files with overlapping ID ranges - exercises 3-way heap merge.
 #[test]
 fn merge_three_files_overlapping_ids() {

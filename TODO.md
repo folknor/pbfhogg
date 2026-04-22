@@ -672,7 +672,8 @@ its own commit.
 Pinned as `#[ignore]` regression tests in
 `tests/non_indexed_parity.rs`,
 `tests/apply_changes_invariants.rs`, and
-`tests/derive_changes.rs` - remove the ignore attribute to reproduce.
+`tests/derive_changes.rs`, and
+`tests/merge_pbf.rs` - remove the ignore attribute to reproduce.
 
 - [ ] **`extract --strategy simple --force` on non-indexed input
   double-emits elements.** Parity test ran the same logical input
@@ -711,7 +712,9 @@ Pinned as `#[ignore]` regression tests in
   across input files as "same blob already emitted" without
   considering that both blobs exist in the input list. The
   subsequent parity test in `non_indexed_parity.rs` uses disjoint
-  inputs and passes. Real-world `cat --dedupe` on regional PBFs
+  inputs and passes. Pinned as
+  `merge_same_input_preserves_ways_and_relations` in
+  `tests/merge_pbf.rs`. Real-world `cat --dedupe` on regional PBFs
   would be affected only if two inputs carry byte-identical way
   blobs - unlikely in practice but latent.
 

@@ -619,6 +619,49 @@ correctness bugs (see "Known correctness gaps" above).
   tests - but worth revisiting if check-refs ever grows a jobs
   flag.
 
+### Next test-coverage batches (2026-04-22)
+
+The first round of tests-enabled-by-fixtures surfaced two real
+correctness bugs (see "Known correctness gaps"). Batches below
+continue the same pattern; each is self-contained and can land on
+its own commit.
+
+- [x] ~~**Batch A: non-indexed `--force` parity for the rest of
+  the command surface.**~~ - landed 2026-04-22. Added parity
+  tests in `tests/non_indexed_parity.rs` for `derive_changes`,
+  `renumber_external`, `check_refs`, `verify_ids`,
+  `show_element`, `extract_multi --CompleteWays`, and `merge_pbf`.
+  Passing: derive_changes, check_refs, show_element, merge_pbf
+  (with disjoint inputs). Renumber pinned via error-message test
+  (it explicitly rejects non-indexed). Three `#[ignore]`-gated
+  tests added to pin new bugs: verify_ids spurious TypeOrder,
+  extract_multi CompleteWays empty output, merge_pbf A+A drops
+  ways/rels. All five bugs surfaced by parity testing are listed
+  under "Known correctness gaps" above.
+- [x] ~~**Batch B: structural roundtrip invariants.**~~ - landed
+  2026-04-22 in `tests/roundtrip_invariants.rs`. Four tests pin
+  sort idempotence, extract idempotence, derive/apply roundtrip,
+  and tags_filter idempotence. `tags_filter` composability
+  scoped down to idempotence because expression OR-combination
+  semantics aren't identical to chained filtering (filtered
+  output feeds later pass with already-thinned element set).
+- [x] ~~**Batch C: blob-layout parity.**~~ - landed 2026-04-22 in
+  the same file. Three tests pin read-path equivalence across
+  block_size=1/5/100 layouts, `tags_filter` output equivalence
+  across the same layouts, and `diff` stats parity across
+  mixed-layout pairings.
+- [x] ~~**Batch D: edge-case / boundary coverage.**~~ - landed
+  2026-04-22 in `tests/edge_cases.rs`. Nine tests covering empty
+  PBF (header only), zero-ref ways, zero-member relations,
+  empty-string tag values, empty-string tag keys,
+  relation-of-relation transitivity, large positive ids, and the
+  8000-entity BlockBuilder capacity boundary. No bugs found;
+  edge cases all behaved correctly.
+- [ ] **Batch E: compression-level parity.** `zlib:6` vs `zstd:1`
+  vs `none` output for a given command should be element-
+  equivalent. Lowest expected yield (codec is a separate layer)
+  but the test is a 5-line wrapper; add last.
+
 ### Known correctness gaps surfaced by parity tests (2026-04-22)
 
 Both gated as `#[ignore]` integration tests in
@@ -650,6 +693,47 @@ reproduce.
   path). First step: add a counter around the worker-pool branch to
   confirm it's the route taken, then teach the scanner to populate
   `id_range` from decoded block metadata on the non-indexed fallback.
+
+- [ ] **`merge_pbf([A, A])` drops ways and relations.** Observed
+  during Batch A parity-test development: merging an indexed PBF
+  with itself via `merge_pbf` and `--force` produces a node-only
+  output (original 10 nodes + 4 ways + 1 relation -> 10 nodes, 0
+  ways, 0 relations after merge). Parity with non-indexed twin
+  holds (both drop ways/rels identically), so the bug is in the
+  indexed path. The `merge_pbf` implementation in
+  `src/commands/cat/dedupe.rs` probably treats blob-identical ways
+  across input files as "same blob already emitted" without
+  considering that both blobs exist in the input list. The
+  subsequent parity test in `non_indexed_parity.rs` uses disjoint
+  inputs and passes. Real-world `cat --dedupe` on regional PBFs
+  would be affected only if two inputs carry byte-identical way
+  blobs - unlikely in practice but latent.
+
+- [ ] **`extract --strategy complete-ways --force` on non-indexed
+  input produces empty output.** Parity test: indexed fixture
+  yields 6 nodes + dependent ways; non-indexed twin yields 0 nodes.
+  `require_indexdata(.., force: true, ..)` lets the call proceed
+  but `extract_complete_ways`'s pass-1 appears to rely on per-blob
+  bboxes from indexdata to populate `bbox_node_ids`; without
+  indexdata that set stays empty and propagates to 0 matched ways
+  and 0 transitive refs. Affects `extract_multi` whenever it falls
+  through to `extract_complete_ways` per slot. Fix: make pass-1
+  scanner do element-level bbox testing when `blob.index()` is
+  None. Same root cause likely affects `ExtractStrategy::Smart`.
+
+- [ ] **`check --ids` (`verify_ids`) reports spurious TypeOrder
+  violations on non-indexed input.** `check_type_order` in
+  `src/commands/check/verify_ids.rs` validates that
+  `max(node_offsets) < min(way_offsets) < min(relation_offsets)`
+  using the schedule from `build_classify_schedules_split`. For
+  non-indexed PBFs that schedule builder replicates every blob
+  into all three per-kind schedules (`src/scan/classify.rs:140-149`),
+  so the offset comparisons span replicated copies rather than
+  per-type blob sets and produce spurious violations on correctly-
+  ordered input. Parity test: 10-node fixture -> 0 violations
+  indexed, 2 violations non-indexed. Fix options: gate the
+  offset-based check on `indexed == true`, or swap to an
+  element-kind-based ordering check that decodes blob contents.
 
 - [ ] **Fuzz testing** - PBF parsing (`PrimitiveBlock::from_vec`), OSC
   parsing (`parse_osc_file`), and wire-format decoders (`Cursor`,

@@ -718,6 +718,132 @@ fn roundtrip_pipelined_direct_io() {
     }
 }
 
+/// Distinguish "io_uring unavailable on this host" from real writer bugs.
+#[cfg(feature = "linux-io-uring")]
+fn is_uring_init_unavailable(err: &std::io::Error) -> bool {
+    let os = err.raw_os_error();
+    let kind = err.kind();
+    let msg = err.to_string();
+    matches!(kind, std::io::ErrorKind::Unsupported)
+        || os == Some(libc::ENOSYS)
+        || os == Some(libc::EPERM)
+        || os == Some(libc::ENOMEM)
+        || msg.contains("RLIMIT_MEMLOCK")
+        || msg.contains("kernel does not support")
+}
+
+/// Write a tiny PBF (single node) via io_uring, read back, verify content.
+/// The file will be well under one PAGE_SIZE, so this exercises the
+/// `flush_final` padding + `set_len` truncation code path.
+#[cfg(feature = "linux-io-uring")]
+#[test]
+fn roundtrip_uring_tiny_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("uring_tiny.osm.pbf");
+
+    let header = block_builder::HeaderBuilder::new().build().unwrap();
+    let mut writer = match PbfWriter::to_path_uring(&path, Compression::default(), &header) {
+        Ok(w) => w,
+        Err(e) if is_uring_init_unavailable(&e) => {
+            eprintln!("io_uring not available, skipping: {e}");
+            return;
+        }
+        Err(e) => panic!("unexpected io_uring open error: {e}"),
+    };
+
+    let mut bb = BlockBuilder::new();
+    bb.add_node(42, 123_456_789, -987_654_321, std::iter::empty::<(&str, &str)>(), None);
+    let bytes = bb.take().unwrap().unwrap();
+    writer.write_primitive_block(bytes).unwrap();
+
+    writer.flush().unwrap();
+
+    // File must be strictly smaller than PAGE_SIZE to exercise the
+    // sub-page set_len truncation path.
+    let meta = std::fs::metadata(&path).unwrap();
+    assert!(meta.len() > 0, "file should not be empty");
+    assert!(
+        meta.len() < 4096,
+        "tiny output should fit under PAGE_SIZE, got {} bytes",
+        meta.len(),
+    );
+
+    let reader = BlobReader::from_path(&path).unwrap();
+    let blobs: Vec<_> = reader.map(|b| b.unwrap()).collect();
+    assert_eq!(blobs.len(), 2, "header + data");
+
+    let prim = match blobs[1].decode().unwrap() {
+        BlobDecode::OsmData(p) => p,
+        _ => panic!("expected OsmData"),
+    };
+    let elements: Vec<_> = prim.elements().collect();
+    assert_eq!(elements.len(), 1);
+    match &elements[0] {
+        Element::DenseNode(dn) => {
+            assert_eq!(dn.id(), 42);
+            assert_eq!(dn.decimicro_lat(), 123_456_789);
+            assert_eq!(dn.decimicro_lon(), -987_654_321);
+        }
+        _ => panic!("expected DenseNode"),
+    }
+}
+
+/// Sweep several small output sizes around PAGE_SIZE (4 KB) and the
+/// registered buffer size (256 KB) to catch truncation / padding / submit
+/// edge cases in the io_uring writer.
+#[cfg(feature = "linux-io-uring")]
+#[test]
+fn roundtrip_uring_small_size_sweep() {
+    let node_counts = [1usize, 10, 100, 500, 2_000, 8_000, 16_000];
+    for &n in &node_counts {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("uring_sweep_{n}.osm.pbf"));
+
+        let header = block_builder::HeaderBuilder::new().build().unwrap();
+        let mut writer = match PbfWriter::to_path_uring(&path, Compression::default(), &header) {
+            Ok(w) => w,
+            Err(e) if is_uring_init_unavailable(&e) => {
+                eprintln!("io_uring not available, skipping: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected io_uring open error: {e}"),
+        };
+
+        // BlockBuilder splits at 8000 entities/block, so 16000 = 2 blobs.
+        let mut bb = BlockBuilder::new();
+        for i in 0..n {
+            #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+            let id = i as i64 + 1;
+            bb.add_node(id, 100_000_000, 200_000_000, std::iter::empty::<(&str, &str)>(), None);
+            if let Some(bytes) = bb.take().unwrap() {
+                writer.write_primitive_block(bytes).unwrap();
+            }
+        }
+        if let Some(bytes) = bb.take().unwrap() {
+            writer.write_primitive_block(bytes).unwrap();
+        }
+        writer.flush().unwrap();
+
+        let reader = BlobReader::from_path(&path).unwrap();
+        let mut read_ids = Vec::new();
+        for blob in reader {
+            let blob = blob.unwrap();
+            if let BlobDecode::OsmData(prim) = blob.decode().unwrap() {
+                for element in prim.elements() {
+                    if let Element::DenseNode(dn) = element {
+                        read_ids.push(dn.id());
+                    }
+                }
+            }
+        }
+        assert_eq!(read_ids.len(), n, "n={n}: element count mismatch");
+        #[allow(clippy::cast_possible_wrap)]
+        for (i, id) in read_ids.iter().enumerate() {
+            assert_eq!(*id, i as i64 + 1, "n={n}: id at index {i} mismatch");
+        }
+    }
+}
+
 /// Write a PBF with zstd compression, read it back, verify the data survives the roundtrip.
 #[test]
 fn roundtrip_zstd() {

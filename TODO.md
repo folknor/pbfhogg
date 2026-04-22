@@ -39,21 +39,6 @@ Five planet-scale command plans are in notes, each with a ranked set of opportun
 
 Measurement-first on every one: turn on `#[cfg(feature = "hotpath")]` counters (or add unconditional `*_ms` counters) to ground-truth the inferred per-phase breakdowns before committing to the order of landing items within a plan.
 
-## Known issue: io_uring writer corrupts very small outputs
-
-Surfaced 2026-04-21 when `RLIMIT_MEMLOCK` was raised to unlimited and
-the previously-skipped `merge_basic_create_modify_delete_uring` test
-actually ran. `merge()` returns `Ok`, but the resulting PBF file panics
-on read with "failed to fill whole buffer" - looks like the writer
-finalizes too early or truncates before the last frames flush. Confirmed
-present at pre-flip commit `383a2eb`, so not introduced by P1+P1.5 (the
-test had been silently skipping via the `is_uring_unavailable` helper).
-Test marked `#[ignore]` with a comment pointing here. Planet-scale
-io_uring runs (137-148 GB outputs) appear to produce valid PBFs - the
-bug is specific to very small outputs. Likely candidate: `flush_final`
-in `src/write/uring_writer.rs` interaction with the `set_len` truncate
-when `logical_size < page_aligned`.
-
 ## Important: ignored tests
 
 `roundtrip_denmark` in `tests/roundtrip_real.rs` is `#[ignore]` - it roundtrips the entire

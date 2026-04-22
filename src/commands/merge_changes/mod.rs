@@ -166,32 +166,61 @@ pub fn merge_changes(inputs: &[&Path], output: &Path, simplify: bool) -> Result<
     }
 
     crate::debug::emit_marker("MERGECHANGES_START");
-    if simplify {
+    #[allow(clippy::cast_possible_wrap)]
+    crate::debug::emit_counter("merge_changes_files", inputs.len() as i64);
+    let total_bytes_in: u64 = inputs
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+    #[allow(clippy::cast_possible_wrap)]
+    crate::debug::emit_counter("merge_changes_total_bytes_in", total_bytes_in as i64);
+
+    let (changes_in, changes_out) = if simplify {
         let mut stream = ChangeStream::default();
         for path in inputs {
-            parse_osc_into(path, &mut stream)?;
+            parse_one_into_stream(path, &mut stream)?;
         }
         let changes_in = stream.changes.len() as u64;
         let changes_out = write_simplified(output, stream)? as u64;
-        crate::debug::emit_marker("MERGECHANGES_END");
-        Ok(MergeChangesStats {
-            files: inputs.len(),
-            changes_in,
-            changes_out,
-            simplified: true,
-        })
+        (changes_in, changes_out)
     } else {
         let changes_out = write_streaming(inputs, output)?;
-        crate::debug::emit_marker("MERGECHANGES_END");
-        Ok(MergeChangesStats {
-            files: inputs.len(),
-            changes_in: changes_out,
-            changes_out,
-            simplified: false,
-        })
+        (changes_out, changes_out)
+    };
+
+    #[allow(clippy::cast_possible_wrap)]
+    crate::debug::emit_counter("merge_changes_changes_out", changes_out as i64);
+    if let Ok(meta) = std::fs::metadata(output) {
+        #[allow(clippy::cast_possible_wrap)]
+        crate::debug::emit_counter("merge_changes_total_bytes_out", meta.len() as i64);
     }
+    crate::debug::emit_marker("MERGECHANGES_END");
+
+    Ok(MergeChangesStats {
+        files: inputs.len(),
+        changes_in,
+        changes_out,
+        simplified: simplify,
+    })
 }
 
+/// Wrap `parse_osc_into` in the `MERGECHANGES_PARSE_{START,END}` pair so
+/// `brokkr sidecar --durations` can measure each input's parse wall and
+/// the parallel-parse opportunity can be sized against the per-OSC share
+/// of serial wall (the plan prerequisite in TODO.md / notes/merge-changes.md).
+fn parse_one_into_stream(path: &Path, stream: &mut ChangeStream) -> Result<()> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        #[allow(clippy::cast_possible_wrap)]
+        crate::debug::emit_counter("merge_changes_input_bytes", meta.len() as i64);
+    }
+    crate::debug::emit_marker("MERGECHANGES_PARSE_START");
+    let result = parse_osc_into(path, stream);
+    crate::debug::emit_marker("MERGECHANGES_PARSE_END");
+    result
+}
+
+#[hotpath::measure]
 fn parse_osc_into(path: &Path, stream: &mut ChangeStream) -> Result<()> {
     let mut file = File::open(path)?;
     let mut magic = [0u8; 2];
@@ -443,18 +472,27 @@ impl OscWriter {
     }
 }
 
+#[hotpath::measure]
 fn write_streaming(inputs: &[&Path], output: &Path) -> Result<u64> {
+    crate::debug::emit_marker("MERGECHANGES_WRITE_OPEN_START");
     let mut writer = OscWriter::new(output)?;
 
     writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
     let mut root = BytesStart::new("osmChange");
     root.push_attribute(("version", "0.6"));
     writer.write_event(Event::Start(root))?;
+    crate::debug::emit_marker("MERGECHANGES_WRITE_OPEN_END");
 
     let mut open_action: Option<Action> = None;
     let mut count = 0u64;
     for path in inputs {
+        if let Ok(meta) = std::fs::metadata(path) {
+            #[allow(clippy::cast_possible_wrap)]
+            crate::debug::emit_counter("merge_changes_input_bytes", meta.len() as i64);
+        }
+        crate::debug::emit_marker("MERGECHANGES_PARSE_START");
         parse_osc_streaming(path, &mut writer, &mut open_action, &mut count)?;
+        crate::debug::emit_marker("MERGECHANGES_PARSE_END");
     }
 
     if let Some(prev) = open_action {
@@ -462,11 +500,14 @@ fn write_streaming(inputs: &[&Path], output: &Path) -> Result<u64> {
     }
 
     writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
+    crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_START");
     writer.finish()?;
+    crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_END");
 
     Ok(count)
 }
 
+#[hotpath::measure]
 fn parse_osc_streaming(
     path: &Path,
     writer: &mut OscWriter,
@@ -638,7 +679,11 @@ fn emit_change(
     write_change_to(writer, change)
 }
 
+#[hotpath::measure]
 fn write_simplified(output: &Path, stream: ChangeStream) -> Result<usize> {
+    crate::debug::emit_marker("MERGECHANGES_SIMPLIFY_START");
+    #[allow(clippy::cast_possible_wrap)]
+    crate::debug::emit_counter("merge_changes_changes_in", stream.changes.len() as i64);
     let mut last_by_object: BTreeMap<(u8, i64), Change> = BTreeMap::new();
     for change in stream.changes {
         last_by_object.insert(change.element.key(), change);
@@ -654,13 +699,16 @@ fn write_simplified(output: &Path, stream: ChangeStream) -> Result<usize> {
             Action::Delete => deletes.push(change),
         }
     }
+    crate::debug::emit_marker("MERGECHANGES_SIMPLIFY_END");
 
+    crate::debug::emit_marker("MERGECHANGES_WRITE_OPEN_START");
     let mut writer = OscWriter::new(output)?;
 
     writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
     let mut root = BytesStart::new("osmChange");
     root.push_attribute(("version", "0.6"));
     writer.write_event(Event::Start(root))?;
+    crate::debug::emit_marker("MERGECHANGES_WRITE_OPEN_END");
 
     if !creates.is_empty() {
         writer.write_event(Event::Start(BytesStart::new("create")))?;
@@ -687,7 +735,9 @@ fn write_simplified(output: &Path, stream: ChangeStream) -> Result<usize> {
     }
 
     writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
+    crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_START");
     writer.finish()?;
+    crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_END");
 
     Ok(creates.len() + modifies.len() + deletes.len())
 }

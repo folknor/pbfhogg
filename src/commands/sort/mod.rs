@@ -95,21 +95,34 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderO
         "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
          decompressed to scan element IDs (significantly slower).")?;
 
+    #[allow(clippy::cast_possible_wrap)]
+    if let Ok(meta) = std::fs::metadata(input) {
+        crate::debug::emit_counter("sort_total_bytes_in", meta.len() as i64);
+    }
+
     // Pass 1: Build blob index
     crate::debug::emit_marker("SORT_PASS1_START");
     eprintln!("Pass 1: indexing blobs...");
+    crate::debug::emit_marker("SORT_INDEX_BUILD_START");
     let (header, mut entries) = build_blob_index(input, direct_io)?;
+    crate::debug::emit_marker("SORT_INDEX_BUILD_END");
     super::warn_locations_on_ways_loss(&header);
     eprintln!("  {} OSMData blobs indexed", entries.len());
+    #[allow(clippy::cast_possible_wrap)]
+    crate::debug::emit_counter("sort_blobs_total", entries.len() as i64);
 
     // Sort by (type_order, min_id)
+    crate::debug::emit_marker("SORT_OVERLAP_DETECT_START");
     entries.sort_by_key(|e| {
         (type_order(e.index.kind), crate::osm_id::blob_osm_first_key(e.index.min_id, e.index.max_id))
     });
 
     // Detect overlaps
     let overlaps = detect_overlaps(&entries);
+    crate::debug::emit_marker("SORT_OVERLAP_DETECT_END");
     let overlap_count = overlaps.iter().filter(|&&b| b).count();
+    #[allow(clippy::cast_possible_wrap)]
+    crate::debug::emit_counter("sort_blobs_overlap", overlap_count as i64);
     if overlap_count > 0 {
         eprintln!("  {overlap_count} blobs in overlap runs (decode + re-encode)");
     }
@@ -119,6 +132,7 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderO
     // Pass 2: Write in sorted order
     crate::debug::emit_marker("SORT_PASS2_START");
     eprintln!("Pass 2: writing sorted output...");
+    crate::debug::emit_marker("SORT_WRITER_SETUP_START");
     #[allow(clippy::redundant_closure_for_method_calls)]
     let header_bytes = build_output_header(&header, false, overrides, |hb| hb.sorted())?;
     let mut writer = writer_from_header_bytes(
@@ -128,6 +142,7 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderO
         direct_io,
         io_uring,
     )?;
+    crate::debug::emit_marker("SORT_WRITER_SETUP_END");
 
     // Open input for random-access reads
     let mut input_file = File::open(input)?;
@@ -156,6 +171,7 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderO
     let mut bb = BlockBuilder::new();
     let mut frame_buf: Vec<u8> = Vec::new();
 
+    crate::debug::emit_marker("SORT_WRITE_LOOP_START");
     let mut i = 0;
     while i < entries.len() {
         if overlaps[i] {
@@ -185,7 +201,21 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderO
         }
     }
 
+    crate::debug::emit_marker("SORT_WRITE_LOOP_END");
+
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("sort_blobs_passthrough", stats.blobs_passthrough as i64);
+        crate::debug::emit_counter("sort_blobs_rewritten", stats.blobs_rewritten as i64);
+    }
+
+    crate::debug::emit_marker("SORT_FLUSH_START");
     writer.flush()?;
+    crate::debug::emit_marker("SORT_FLUSH_END");
+    #[allow(clippy::cast_possible_wrap)]
+    if let Ok(meta) = std::fs::metadata(output) {
+        crate::debug::emit_counter("sort_total_bytes_out", meta.len() as i64);
+    }
     crate::debug::emit_marker("SORT_PASS2_END");
     Ok(stats)
 }
@@ -199,6 +229,7 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderO
 /// Reads sequentially, extracting element type + ID range for each OSMData
 /// blob. Blobs with indexdata are classified without decompression; others
 /// are decompressed and scanned with `scan_block_ids`.
+#[hotpath::measure]
 fn build_blob_index(
     input: &Path,
     direct_io: bool,
@@ -323,6 +354,7 @@ fn detect_overlaps(entries: &[BlobEntry]) -> Vec<bool> {
 // ---------------------------------------------------------------------------
 
 /// Write a non-overlapping blob as raw bytes, adding indexdata if missing.
+#[hotpath::measure]
 #[allow(unused_variables)]
 fn write_passthrough_blob(
     entry: &BlobEntry,

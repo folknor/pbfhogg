@@ -9,6 +9,7 @@ use common::{
 use pbfhogg::block_builder::{self, BlockBuilder, Metadata};
 use pbfhogg::sort::SortOptions;
 use pbfhogg::writer::{Compression, PbfWriter};
+use pbfhogg::{BlobDecode, BlobReader, Element};
 
 /// Write a PBF with deliberately overlapping node blobs.
 ///
@@ -118,6 +119,61 @@ fn assert_sorted(contents: &PbfContentsWithCoords) {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawNodeMeta {
+    id: i64,
+    version: Option<i32>,
+    changeset: Option<i64>,
+    uid: Option<i32>,
+    user: Option<String>,
+    visible: Option<bool>,
+}
+
+fn read_raw_node_meta(path: &Path) -> Vec<RawNodeMeta> {
+    let reader = BlobReader::from_path(path).expect("open pbf");
+    let mut metas = Vec::new();
+
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") {
+            for element in block.elements() {
+                match element {
+                    Element::DenseNode(dn) => {
+                        let info = dn.info();
+                        metas.push(RawNodeMeta {
+                            id: dn.id(),
+                            version: info.as_ref().map(|i| i.version()),
+                            changeset: info.as_ref().map(|i| i.changeset()),
+                            uid: info.as_ref().map(|i| i.uid()),
+                            user: info
+                                .as_ref()
+                                .map(|i| i.user().unwrap_or("").to_string()),
+                            visible: info.as_ref().map(|i| i.visible()),
+                        });
+                    }
+                    Element::Node(n) => {
+                        let info = n.info();
+                        metas.push(RawNodeMeta {
+                            id: n.id(),
+                            version: info.version(),
+                            changeset: info.changeset(),
+                            uid: info.uid(),
+                            user: info
+                                .user()
+                                .and_then(std::result::Result::ok)
+                                .map(ToString::to_string),
+                            visible: Some(info.visible()),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    metas
+}
+
 /// Sort a PBF with overlapping node blobs (forces rewrite path).
 /// Verify output is correctly sorted and all elements are preserved.
 #[test]
@@ -183,6 +239,99 @@ fn sort_wrong_type_order() {
         .map(|(_, _, tags)| tags[0].1.as_str())
         .collect();
     assert_eq!(way_tags, vec!["residential", "primary"]);
+}
+
+#[test]
+fn sort_overlap_rewrite_normalizes_dense_node_changeset_minus_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let file = std::fs::File::create(&input).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = block_builder::HeaderBuilder::new().build().expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let meta = Metadata {
+        version: 5,
+        timestamp: 1_700_000_000,
+        changeset: -1,
+        uid: 9,
+        user: "osmosis",
+        visible: false,
+    };
+
+    let mut bb = BlockBuilder::new();
+    for id in [1_i64, 3] {
+        bb.add_node(
+            id,
+            id as i32 * 1_000_000,
+            id as i32 * 2_000_000,
+            [("name", "sentinel")],
+            Some(&meta),
+        );
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    bb.add_node(
+        2,
+        2_000_000,
+        4_000_000,
+        [("name", "sentinel")],
+        Some(&meta),
+    );
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+    writer.flush().expect("flush");
+
+    pbfhogg::commands::sort::sort(
+        &input,
+        &output,
+        &SortOptions {
+            compression: Compression::default(),
+            direct_io: false,
+            io_uring: false,
+            force: true,
+        },
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("sort");
+
+    let nodes = read_raw_node_meta(&output);
+    assert_eq!(nodes.len(), 3);
+    assert_eq!(
+        nodes,
+        vec![
+            RawNodeMeta {
+                id: 1,
+                version: Some(5),
+                changeset: Some(0),
+                uid: Some(9),
+                user: Some("osmosis".to_string()),
+                visible: Some(false),
+            },
+            RawNodeMeta {
+                id: 2,
+                version: Some(5),
+                changeset: Some(0),
+                uid: Some(9),
+                user: Some("osmosis".to_string()),
+                visible: Some(false),
+            },
+            RawNodeMeta {
+                id: 3,
+                version: Some(5),
+                changeset: Some(0),
+                uid: Some(9),
+                user: Some("osmosis".to_string()),
+                visible: Some(false),
+            },
+        ]
+    );
 }
 
 /// Sort an already-sorted PBF (passthrough path).

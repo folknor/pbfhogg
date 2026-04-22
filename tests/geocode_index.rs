@@ -111,6 +111,40 @@ fn write_synthetic_nested_admin_same_level_input(path: &Path) {
     );
 }
 
+fn write_synthetic_admin_with_hole_input(path: &Path) {
+    write_test_pbf_sorted(
+        path,
+        &[
+            TestNode { id: 70, lat: 556_990_000, lon: 124_990_000, tags: vec![], meta: None },
+            TestNode { id: 71, lat: 556_990_000, lon: 125_020_000, tags: vec![], meta: None },
+            TestNode { id: 72, lat: 557_010_000, lon: 125_020_000, tags: vec![], meta: None },
+            TestNode { id: 73, lat: 557_010_000, lon: 124_990_000, tags: vec![], meta: None },
+            TestNode { id: 74, lat: 556_997_000, lon: 124_997_000, tags: vec![], meta: None },
+            TestNode { id: 75, lat: 556_997_000, lon: 125_013_000, tags: vec![], meta: None },
+            TestNode { id: 76, lat: 557_003_000, lon: 125_013_000, tags: vec![], meta: None },
+            TestNode { id: 77, lat: 557_003_000, lon: 124_997_000, tags: vec![], meta: None },
+        ],
+        &[
+            TestWay { id: 80, refs: vec![70, 71, 72, 73, 70], tags: vec![], meta: None },
+            TestWay { id: 81, refs: vec![74, 75, 76, 77, 74], tags: vec![], meta: None },
+        ],
+        &[TestRelation {
+            id: 90,
+            members: vec![
+                TestMember { id: MemberId::Way(80), role: "outer" },
+                TestMember { id: MemberId::Way(81), role: "inner" },
+            ],
+            tags: vec![
+                ("type", "boundary"),
+                ("boundary", "administrative"),
+                ("admin_level", "6"),
+                ("name", "Holeland"),
+            ],
+            meta: None,
+        }],
+    );
+}
+
 fn write_synthetic_interpolation_input(path: &Path) {
     write_test_pbf_sorted(
         path,
@@ -192,6 +226,75 @@ fn write_synthetic_postal_boundary_input(path: &Path) {
             meta: None,
         }],
     );
+}
+
+fn generate_nonzero_nodes(count: usize, start_id: i64) -> Vec<TestNode> {
+    (0..count)
+        .map(|i| TestNode {
+            id: start_id + i as i64,
+            lat: 557_000_000 + (i % 1000) as i32,
+            lon: 125_000_000 + (i / 1000) as i32,
+            tags: vec![],
+            meta: None,
+        })
+        .collect()
+}
+
+fn write_oversized_street_input(path: &Path) {
+    let node_count = 65_536;
+    let nodes = generate_nonzero_nodes(node_count, 1);
+    let refs: Vec<i64> = (1..=node_count).map(|id| id as i64).collect();
+
+    write_test_pbf_sorted(
+        path,
+        &nodes,
+        &[TestWay {
+            id: 400,
+            refs,
+            tags: vec![("highway", "residential"), ("name", "Huge Street")],
+            meta: None,
+        }],
+        &[],
+    );
+}
+
+fn write_oversized_interpolation_input(path: &Path) {
+    let node_count = 65_536;
+    let nodes = generate_nonzero_nodes(node_count, 1);
+    let refs: Vec<i64> = (1..=node_count).map(|id| id as i64).collect();
+
+    write_test_pbf_sorted(
+        path,
+        &nodes,
+        &[TestWay {
+            id: 410,
+            refs,
+            tags: vec![
+                ("addr:interpolation", "all"),
+                ("addr:street", "Huge Interp Street"),
+            ],
+            meta: None,
+        }],
+        &[],
+    );
+}
+
+fn write_addr_cell_overflow_input(path: &Path) {
+    let node_count = 65_536;
+    let nodes: Vec<TestNode> = (0..node_count)
+        .map(|i| TestNode {
+            id: 1 + i as i64,
+            lat: 557_000_000,
+            lon: 125_000_000,
+            tags: vec![
+                ("addr:housenumber", "1"),
+                ("addr:street", "Dense Address Cell"),
+            ],
+            meta: None,
+        })
+        .collect();
+
+    write_test_pbf_sorted(path, &nodes, &[], &[]);
 }
 
 #[test]
@@ -422,6 +525,50 @@ fn nested_same_level_admin_prefers_smallest_polygon() {
 }
 
 #[test]
+fn admin_polygon_hole_excludes_queries_inside_the_hole() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+
+    write_synthetic_admin_with_hole_input(&input);
+
+    let stats = pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir.clone(),
+            force: false,
+            ..Default::default()
+        },
+    )
+    .expect("build should succeed");
+
+    assert_eq!(stats.admin_polygons, 1, "fixture has one admin polygon with one hole");
+
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
+        .expect("reader should open");
+
+    let shell = reader.query(55.6992, 12.4992);
+    let shell_admin = shell
+        .admin
+        .iter()
+        .find(|admin| admin.admin_level == 6)
+        .expect("query inside the shell should match the admin polygon");
+    assert_eq!(shell_admin.name, "Holeland");
+
+    let hole = reader.query(55.7000, 12.5005);
+    assert!(
+        hole.admin.iter().all(|admin| admin.admin_level != 6),
+        "query inside the inner ring must not match the polygon"
+    );
+
+    let raw_hole = reader.candidates(55.7000, 12.5005);
+    assert!(
+        raw_hole.admin.iter().all(|admin| admin.admin_level != 6),
+        "candidates() must also respect admin holes"
+    );
+}
+
+#[test]
 fn synthetic_interpolation_query_resolves_even_house_number() {
     let dir = TempDir::new().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");
@@ -640,6 +787,85 @@ fn synthetic_postal_boundary_query_returns_level_11_match() {
     assert!(
         outside.admin.iter().all(|admin| admin.admin_level != 11),
         "query outside the polygon must not match the postal boundary"
+    );
+}
+
+#[test]
+fn build_rejects_street_way_coord_count_over_u16_max() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+
+    write_oversized_street_input(&input);
+
+    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir,
+            force: false,
+            ..Default::default()
+        },
+    )
+    .expect_err("builder should hard-error on street node_count overflow");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("street way: 65536 coords exceeds u16::MAX"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn build_rejects_interpolation_way_coord_count_over_u16_max() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+
+    write_oversized_interpolation_input(&input);
+
+    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir,
+            force: false,
+            ..Default::default()
+        },
+    )
+    .expect_err("builder should hard-error on interpolation node_count overflow");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("interp way: 65536 coords exceeds u16::MAX"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn build_rejects_addr_entry_count_over_u16_max_for_one_cell() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+
+    write_addr_cell_overflow_input(&input);
+
+    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir,
+            force: false,
+            ..Default::default()
+        },
+    )
+    .expect_err("builder should hard-error on per-cell addr entry overflow");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("has 65536 addr entries, exceeds u16::MAX"),
+        "unexpected error: {msg}"
+    );
+    assert!(
+        msg.contains("geocode Stage B: cell"),
+        "unexpected error: {msg}"
     );
 }
 

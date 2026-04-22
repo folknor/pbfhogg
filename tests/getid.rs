@@ -5,11 +5,12 @@ mod common;
 use common::{
     generate_nodes, generate_ways, node_ids_id_only as node_ids,
     read_all_elements_id_only as read_all_elements, relation_ids_id_only as relation_ids,
-    way_ids_id_only as way_ids, write_multi_block_test_pbf, write_test_pbf, TestNode,
-    TestRelation, TestWay,
+    way_ids_id_only as way_ids, write_multi_block_test_pbf, write_test_pbf, TestMeta,
+    TestNode, TestRelation, TestWay,
 };
 use pbfhogg::getid::{getid, parse_ids, removeid, GetidOptions};
 use pbfhogg::writer::Compression;
+use pbfhogg::{BlobDecode, BlobReader, Element};
 use tempfile::TempDir;
 
 fn ids(strs: &[&str]) -> Vec<String> {
@@ -22,6 +23,100 @@ fn default_opts() -> GetidOptions {
 
 fn add_ref_opts() -> GetidOptions {
     GetidOptions { add_referenced: true, remove_tags: false }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawNodeMeta {
+    id: i64,
+    version: Option<i32>,
+    changeset: Option<i64>,
+    uid: Option<i32>,
+    user: Option<String>,
+    visible: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawWayMeta {
+    id: i64,
+    version: Option<i32>,
+    changeset: Option<i64>,
+    uid: Option<i32>,
+    user: Option<String>,
+    visible: Option<bool>,
+}
+
+fn read_raw_node_meta(path: &std::path::Path) -> Vec<RawNodeMeta> {
+    let reader = BlobReader::from_path(path).expect("open pbf");
+    let mut metas = Vec::new();
+
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") {
+            for element in block.elements() {
+                match element {
+                    Element::DenseNode(dn) => {
+                        let info = dn.info();
+                        metas.push(RawNodeMeta {
+                            id: dn.id(),
+                            version: info.as_ref().map(|i| i.version()),
+                            changeset: info.as_ref().map(|i| i.changeset()),
+                            uid: info.as_ref().map(|i| i.uid()),
+                            user: info
+                                .as_ref()
+                                .map(|i| i.user().unwrap_or("").to_string()),
+                            visible: info.as_ref().map(|i| i.visible()),
+                        });
+                    }
+                    Element::Node(n) => {
+                        let info = n.info();
+                        metas.push(RawNodeMeta {
+                            id: n.id(),
+                            version: info.version(),
+                            changeset: info.changeset(),
+                            uid: info.uid(),
+                            user: info
+                                .user()
+                                .and_then(std::result::Result::ok)
+                                .map(ToString::to_string),
+                            visible: Some(info.visible()),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    metas
+}
+
+fn read_raw_way_meta(path: &std::path::Path) -> Vec<RawWayMeta> {
+    let reader = BlobReader::from_path(path).expect("open pbf");
+    let mut metas = Vec::new();
+
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") {
+            for element in block.elements() {
+                if let Element::Way(w) = element {
+                    let info = w.info();
+                    metas.push(RawWayMeta {
+                        id: w.id(),
+                        version: info.version(),
+                        changeset: info.changeset(),
+                        uid: info.uid(),
+                        user: info
+                            .user()
+                            .and_then(std::result::Result::ok)
+                            .map(ToString::to_string),
+                        visible: Some(info.visible()),
+                    });
+                }
+            }
+        }
+    }
+
+    metas
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +331,226 @@ fn getid_preserves_tags() {
             ("name".to_string(), "test".to_string()),
             ("amenity".to_string(), "bench".to_string()),
         ]
+    );
+}
+
+#[test]
+fn getid_normalizes_dense_node_version_minus_one_to_absent_metadata() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(
+        &input,
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![("name", "sentinel")],
+            meta: Some(TestMeta {
+                version: -1,
+                timestamp: 0,
+                changeset: -1,
+                uid: 0,
+                user: "",
+                visible: true,
+            }),
+        }],
+        &[],
+        &[],
+    );
+
+    let id_set = parse_ids(&ids(&["n1"])).expect("parse ids");
+    getid(
+        &input,
+        &output,
+        &id_set,
+        &default_opts(),
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("getid");
+
+    let nodes = read_raw_node_meta(&output);
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(
+        nodes[0],
+        RawNodeMeta {
+            id: 1,
+            version: None,
+            changeset: None,
+            uid: None,
+            user: None,
+            visible: None,
+        }
+    );
+}
+
+#[test]
+fn getid_normalizes_dense_node_changeset_minus_one_to_zero() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(
+        &input,
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![("name", "sentinel")],
+            meta: Some(TestMeta {
+                version: 7,
+                timestamp: 1_700_000_000,
+                changeset: -1,
+                uid: 42,
+                user: "mapper",
+                visible: false,
+            }),
+        }],
+        &[],
+        &[],
+    );
+
+    let id_set = parse_ids(&ids(&["n1"])).expect("parse ids");
+    getid(
+        &input,
+        &output,
+        &id_set,
+        &default_opts(),
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("getid");
+
+    let nodes = read_raw_node_meta(&output);
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(
+        nodes[0],
+        RawNodeMeta {
+            id: 1,
+            version: Some(7),
+            changeset: Some(0),
+            uid: Some(42),
+            user: Some("mapper".to_string()),
+            visible: Some(false),
+        }
+    );
+}
+
+#[test]
+fn getid_normalizes_way_version_minus_one_to_absent_metadata() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(
+        &input,
+        &[
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
+        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "service")],
+            meta: Some(TestMeta {
+                version: -1,
+                timestamp: 0,
+                changeset: -1,
+                uid: 0,
+                user: "",
+                visible: true,
+            }),
+        }],
+        &[],
+    );
+
+    let id_set = parse_ids(&ids(&["w10"])).expect("parse ids");
+    getid(
+        &input,
+        &output,
+        &id_set,
+        &default_opts(),
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("getid");
+
+    let ways = read_raw_way_meta(&output);
+    assert_eq!(ways.len(), 1);
+    assert_eq!(
+        ways[0],
+        RawWayMeta {
+            id: 10,
+            version: None,
+            changeset: None,
+            uid: None,
+            user: None,
+            visible: Some(true),
+        }
+    );
+}
+
+#[test]
+fn getid_normalizes_way_changeset_minus_one_to_zero() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(
+        &input,
+        &[
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
+        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "service")],
+            meta: Some(TestMeta {
+                version: 4,
+                timestamp: 1_700_000_000,
+                changeset: -1,
+                uid: 9,
+                user: "osmosis",
+                visible: false,
+            }),
+        }],
+        &[],
+    );
+
+    let id_set = parse_ids(&ids(&["w10"])).expect("parse ids");
+    getid(
+        &input,
+        &output,
+        &id_set,
+        &default_opts(),
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("getid");
+
+    let ways = read_raw_way_meta(&output);
+    assert_eq!(ways.len(), 1);
+    assert_eq!(
+        ways[0],
+        RawWayMeta {
+            id: 10,
+            version: Some(4),
+            changeset: Some(0),
+            uid: Some(9),
+            user: Some("osmosis".to_string()),
+            visible: Some(false),
+        }
     );
 }
 

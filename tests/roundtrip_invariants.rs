@@ -388,3 +388,110 @@ fn diff_blob_layout_independence() {
         assert_eq!(s.deleted, 0, "{label}: same-content diff must have no deleted");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Compression-level parity (Batch E)
+// ---------------------------------------------------------------------------
+//
+// The compression layer (`none` / `zlib:N` / `zstd:N`) wraps blob
+// payloads independently of element encoding. Changing the codec
+// must not perturb the element set that a reader subsequently sees.
+// These tests produce three outputs per command with identical
+// logical input and distinct codecs, then assert all three outputs
+// are element-equivalent.
+
+#[test]
+fn sort_compression_level_parity() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    sample_fixture(&input);
+
+    let outputs = [
+        ("none", Compression::None, dir.path().join("none.osm.pbf")),
+        ("zlib6", Compression::Zlib(6), dir.path().join("zlib6.osm.pbf")),
+        ("zstd3", Compression::Zstd(3), dir.path().join("zstd3.osm.pbf")),
+    ];
+
+    for (_label, compression, path) in &outputs {
+        let opts = pbfhogg::sort::SortOptions {
+            compression: *compression,
+            direct_io: false,
+            io_uring: false,
+            force: true,
+        };
+        pbfhogg::commands::sort::sort(&input, path, &opts, &pbfhogg::HeaderOverrides::default())
+            .expect("sort");
+    }
+
+    // All three outputs must round-trip to element-equivalent sets.
+    assert_elements_equivalent(&outputs[0].2, &outputs[1].2);
+    assert_elements_equivalent(&outputs[1].2, &outputs[2].2);
+}
+
+#[test]
+fn tags_filter_compression_level_parity() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    sample_fixture(&input);
+
+    let exprs = vec!["w/building=yes".to_string()];
+    let outputs = [
+        ("none", Compression::None, dir.path().join("none.osm.pbf")),
+        ("zlib6", Compression::Zlib(6), dir.path().join("zlib6.osm.pbf")),
+        ("zstd3", Compression::Zstd(3), dir.path().join("zstd3.osm.pbf")),
+    ];
+
+    for (_label, compression, path) in &outputs {
+        let opts = pbfhogg::tags_filter::TagsFilterOptions {
+            expression_strs: &exprs,
+            omit_referenced: false,
+            invert: false,
+            remove_tags: false,
+            compression: *compression,
+            direct_io: false,
+            force: true,
+            jobs: None,
+        };
+        pbfhogg::tags_filter::tags_filter(&input, path, &opts, &pbfhogg::HeaderOverrides::default())
+            .expect("tags_filter");
+    }
+
+    assert_elements_equivalent(&outputs[0].2, &outputs[1].2);
+    assert_elements_equivalent(&outputs[1].2, &outputs[2].2);
+}
+
+/// `Compression::None` emits raw uncompressed blob payloads. That
+/// code path is rarely exercised by test fixtures (the writer
+/// default is Zlib(6)). Pin that a None-compressed output reads
+/// back identically to a zlib-compressed twin.
+#[test]
+fn none_compression_reads_back_identical() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let out_none = dir.path().join("out_none.osm.pbf");
+    let out_zlib = dir.path().join("out_zlib.osm.pbf");
+    sample_fixture(&input);
+
+    for (compression, output) in [
+        (Compression::None, &out_none),
+        (Compression::Zlib(6), &out_zlib),
+    ] {
+        let opts = pbfhogg::sort::SortOptions {
+            compression,
+            direct_io: false,
+            io_uring: false,
+            force: true,
+        };
+        pbfhogg::commands::sort::sort(&input, output, &opts, &pbfhogg::HeaderOverrides::default())
+            .expect("sort");
+    }
+
+    assert_elements_equivalent(&out_none, &out_zlib);
+
+    // Byte-size comparison would be a nice sanity check but fixture
+    // size is far below zlib's framing-overhead breakeven (2 KB-ish),
+    // so on a 10-node fixture None often lands smaller than Zlib by
+    // virtue of zlib's DEFLATE + wrapper bytes. Skip the size check
+    // here; the element-equivalence assertion already pins that both
+    // codecs serialize and deserialize the same logical content.
+}

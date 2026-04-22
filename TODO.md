@@ -657,10 +657,15 @@ its own commit.
   relation-of-relation transitivity, large positive ids, and the
   8000-entity BlockBuilder capacity boundary. No bugs found;
   edge cases all behaved correctly.
-- [ ] **Batch E: compression-level parity.** `zlib:6` vs `zstd:1`
-  vs `none` output for a given command should be element-
-  equivalent. Lowest expected yield (codec is a separate layer)
-  but the test is a 5-line wrapper; add last.
+- [x] ~~**Batch E: compression-level parity.**~~ - landed
+  2026-04-22 in `tests/roundtrip_invariants.rs`. Three tests
+  pin that `sort` and `tags_filter` outputs are element-
+  equivalent across `Compression::None`, `Compression::Zlib(6)`,
+  and `Compression::Zstd(3)`, plus a dedicated None-vs-Zlib
+  read-back pin. No bugs found - codec is correctly isolated
+  from element encoding. Byte-size comparisons deliberately
+  omitted; on a 10-node fixture None often lands smaller than
+  Zlib by virtue of DEFLATE framing overhead.
 
 ### Known correctness gaps surfaced by parity tests (2026-04-22)
 

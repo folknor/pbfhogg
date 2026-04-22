@@ -9,7 +9,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use rustc_hash::FxHashMap;
@@ -261,7 +261,7 @@ impl Default for CompactDiffOverlay {
 /// overlay to accumulate multiple diff files (later diffs win for conflicts).
 pub fn parse_osc_file_into(path: &Path, overlay: &mut CompactDiffOverlay) -> ParseResult<()> {
     let file = File::open(path)?;
-    let decoder = GzDecoder::new(file);
+    let decoder = MultiGzDecoder::new(file);
     let buf_reader = BufReader::new(decoder);
     let mut reader = Reader::from_reader(buf_reader);
     reader.config_mut().trim_text(true);

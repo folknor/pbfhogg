@@ -8,7 +8,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Seek, Write};
 use std::path::Path;
 
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, Event};
 use quick_xml::name::QName;
@@ -228,7 +228,7 @@ fn parse_osc_into(path: &Path, stream: &mut ChangeStream) -> Result<()> {
     file.seek(io::SeekFrom::Start(0))?;
 
     let reader: Reader<BufReader<Box<dyn io::Read>>> = if magic == [0x1f, 0x8b] {
-        Reader::from_reader(BufReader::new(Box::new(GzDecoder::new(file))))
+        Reader::from_reader(BufReader::new(Box::new(MultiGzDecoder::new(file))))
     } else {
         Reader::from_reader(BufReader::new(Box::new(file)))
     };
@@ -520,7 +520,7 @@ fn parse_osc_streaming(
     file.seek(io::SeekFrom::Start(0))?;
 
     let reader: Reader<BufReader<Box<dyn io::Read>>> = if magic == [0x1f, 0x8b] {
-        Reader::from_reader(BufReader::new(Box::new(GzDecoder::new(file))))
+        Reader::from_reader(BufReader::new(Box::new(MultiGzDecoder::new(file))))
     } else {
         Reader::from_reader(BufReader::new(Box::new(file)))
     };

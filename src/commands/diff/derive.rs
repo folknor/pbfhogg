@@ -9,7 +9,6 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 
-use flate2::write::GzEncoder;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
@@ -418,7 +417,8 @@ fn derive_changes_element_stream(
 
 /// Assemble the final `.osc.gz` from temp file fragments.
 /// Writes XML structure via quick_xml Writer, copies raw fragment bytes
-/// directly to the underlying GzEncoder (not through the XML writer).
+/// directly to the underlying parallel gzip writer (not through the XML
+/// writer).
 fn assemble_osc(output: &Path, sink: &ChangeSink) -> Result<()> {
     assemble_osc_from_paths(
         output,
@@ -444,8 +444,20 @@ pub(crate) fn assemble_osc_from_paths(
     modify_count: u64,
     delete_count: u64,
 ) -> Result<()> {
+    use crate::write::parallel_gzip::{ParallelGzipWriter, DEFAULT_CHUNK_SIZE};
+
     let file = File::create(output)?;
-    let gz = GzEncoder::new(io::BufWriter::new(file), flate2::Compression::fast());
+    let buf = io::BufWriter::new(file);
+
+    // Gzip member count = ceil(total_uncompressed_bytes / chunk_size).
+    // At planet scale (~45 GB of XML across the three temp files) that's
+    // ~23k 2 MB members; the 18 B per-member framing is ~400 KB of
+    // overhead, and the per-chunk dictionary reset costs ~1-3% on the
+    // ratio. See `notes/...` or the CHANGELOG for measured wall wins.
+    let worker_count = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4);
+    let gz = ParallelGzipWriter::new(buf, DEFAULT_CHUNK_SIZE, worker_count);
     let mut writer = Writer::new_with_indent(gz, b' ', 2);
 
     writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
@@ -462,7 +474,9 @@ pub(crate) fn assemble_osc_from_paths(
     writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
 
     let gz = writer.into_inner();
-    gz.finish()?;
+    let buf = gz.finish()?;
+    let file = buf.into_inner().map_err(io::IntoInnerError::into_error)?;
+    file.sync_all()?;
     Ok(())
 }
 

@@ -78,12 +78,15 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
 
 ## Performance
 
-- [ ] **Parallelise `assemble_osc` gzip**. Final serial tail in
-  `diff --format osc -j 16` is 32.8 s at planet (10 % of wall;
-  gzip + concat of ~45 GB of per-shard XML fragment temp files).
-  Pigz-style parallel gzip or switching to a concurrent compressor
-  would recover most of that. Only matters if osc becomes a hot
-  workload.
+- [x] ~~**Parallelise `assemble_osc` gzip**~~ - landed. New
+  `ParallelGzipWriter` (`src/write/parallel_gzip.rs`) buffers 2 MB
+  chunks, dispatches each to a worker-pool for independent gzip,
+  writes concatenated RFC-1952 multi-member output. Three in-crate
+  `.osc.gz` readers (`osc::parse`, `merge-changes`, `tags_filter
+  --osc`) migrated to `MultiGzDecoder` in the same commit so
+  cross-command composition stays intact. Planet `diff --format osc
+  -j 16` wall to be remeasured (prior baseline UUID `9b3fc2b9`,
+  313.8 s with a 32.8 s single-threaded `assemble_osc` tail).
 
 - [ ] **Consider auto-enabling diff `-j`**. Currently `pbfhogg diff`
   defaults to `-j 1` (sequential). `-j 0` maps to

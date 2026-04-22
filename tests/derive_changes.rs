@@ -350,9 +350,13 @@ fn unsorted_input_rejected() {
 }
 
 /// Read gzipped OSC file and return the decompressed XML string.
+/// Uses `MultiGzDecoder` so the parallel-gzip writer's concatenated
+/// multi-member output (see `src/write/parallel_gzip.rs`) decodes as
+/// a single logical stream. `MultiGzDecoder` is a strict superset of
+/// `GzDecoder` - it handles single-member files identically.
 fn read_osc(path: &std::path::Path) -> String {
     let file = std::fs::File::open(path).expect("open osc");
-    let mut gz = flate2::read::GzDecoder::new(file);
+    let mut gz = flate2::read::MultiGzDecoder::new(file);
     let mut xml = String::new();
     gz.read_to_string(&mut xml).expect("decompress osc");
     xml

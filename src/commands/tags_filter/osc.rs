@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Write};
 use std::path::Path;
 
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, Event};
 use quick_xml::name::QName;
@@ -158,7 +158,7 @@ fn parse_and_filter_osc(
     expressions: &[Expression],
 ) -> Result<(FilteredOsc, TagsFilterOscStats)> {
     let file = File::open(input)?;
-    let decoder = GzDecoder::new(file);
+    let decoder = MultiGzDecoder::new(file);
     let mut reader = Reader::from_reader(BufReader::new(decoder));
     reader.config_mut().trim_text(true);
 

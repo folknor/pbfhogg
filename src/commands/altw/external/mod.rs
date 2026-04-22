@@ -385,8 +385,8 @@ pub fn external_join(
     )?;
     // Worker count: back off from the pre-streaming `.min(6)` because
     // stage 3 and stage 4 worker buffers are now both resident at the
-    // same time (they overlap). See notes/altw-structural-reports.md #2
-    // "Worker budgets under overlap".
+    // same time (streaming stage 3 -> 4 landed in `beb7838` + `f93d896`
+    // + `eecb46c`).
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))
         .unwrap_or(4)

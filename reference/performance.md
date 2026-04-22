@@ -326,8 +326,8 @@ header-only walks in stage 1 and stage 4.
 
 The finalize phase is replaced by an in-RAM routing table: worker tmp
 files stay open and stage 4 preads directly from the right fd. No more
-consolidated `coord_payloads` file. See `notes/altw-structural-reports.md`
-item #8.
+consolidated `coord_payloads` file. Shipped at commit `e497e54`
+(`BlobLocationRouter`); see `notes/altw-optimization-history.md`.
 
 | Phase | Time | RSS (anon) | Description |
 |-------|------|-----------|-------------|
@@ -1146,9 +1146,10 @@ Steady state: `apply-changes --locations-on-ways` (daily diffs).
 
 ### ALTW external optimization arc (post-3d977a0)
 
-Cumulative effect of the four landed seam deletions in
-`notes/altw-structural-reports.md` (#8 router, #4 stage-2 de-ranking,
-#9 L1 metadata-driven relation scan, plus their predecessors).
+Cumulative effect of the landed seam deletions (#8 `BlobLocationRouter`
+`e497e54`, #4 stage-2 de-ranking `f1a4ada`, #9 L1 metadata-driven
+relation scan `6d71053`, plus their predecessors; see
+`notes/altw-optimization-history.md`).
 
 | Commit | Change | Europe | Planet |
 |--------|--------|-------:|-------:|

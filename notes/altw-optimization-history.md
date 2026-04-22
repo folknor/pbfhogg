@@ -222,6 +222,24 @@ perf-codex) were both wrong because they extrapolated from cumulative
 `s1b_encode_write_ms` without accounting for BufWriter already amortizing
 the syscall cost.
 
+**Stage-1 vector-fusion pair (tried and reverted 2026-04-14, commits
+`5e05b54` and `ec365d3`)**:
+
+1. `5e05b54` fused pass A's `set_atomic()` into the way-scan callback, deleting
+   the blob-local `blob_node_ids` staging vector and the second walk over it.
+   Europe best-of-available compare (`61ba023` → `5e05b54`): 385.2 s →
+   394.8 s (**+2.5%**). The commit message notes pass-A itself improved, but
+   total Europe wall still regressed under the project's non-regression rule.
+2. `ec365d3` then reverted the pass-A fusion from `5e05b54` and tried the
+   analogous pass-B fusion: compute rank/bucket/local-rank/slot-pos and encode
+   the shard record directly in the write loop instead of building a per-blob
+   ranked vector first. Europe compare (`5e05b54` → `ec365d3`): 394.8 s →
+   399.8 s (**+1.3%**), leaving the stack worse than the `61ba023` baseline.
+
+Lesson: deleting short-lived stage-1 vectors was not enough to move wall on
+this shape. The surrounding decompress / protobuf / shard-write costs still
+dominated, and the measured Europe gate rejected both micro-fusions.
+
 **Stage 2+3 fuse ideas evaluated 2026-04-14 (desk analysis only, not
 measured)**: after the stage 1B batching regression, three stage 2+3
 ideas were analyzed on paper and either rejected or downgraded. No
@@ -525,3 +543,294 @@ Peak temp disk: ~112 GB (Europe). After cleanup: 37 GB (coord slots only).
 `src/commands/external_join.rs`. Correctness verified identical to dense output
 on Denmark (10,175,884 elements, 0 differences) and cross-validated against
 osmium via `brokkr verify add-locations-to-ways`.
+
+---
+
+## Structural-reports experiments (2026-04-15 to 2026-04-22)
+
+After `3d977a0` shipped the coord_payloads default, a six-reviewer plan round
+produced an opportunity list that was triaged into the live leads now in
+`altw-external.md` plus the attempt record below. Five items landed on
+`main`: #4 blob-local rank counter (`f1a4ada`), #8 `BlobLocationRouter`
+(`e497e54`), #9 layer 1 metadata-driven relation scan (`6d71053`), #9 layer
+2 parallel relation scan (`3b6b409`), and #2 streaming stage 3 -> stage 4
+(`beb7838` + `f93d896` + `eecb46c`). The remaining items either reverted on
+measurement or were never attempted. Everything *tried* is recorded below
+with UUIDs, numbers, and root cause.
+
+Current baseline at the end of this sprint: planet **661.2 s** (`aee7727`,
+`--bench 3`, UUID `a406d77e`), europe **291.6 s**.
+
+### altw_v2: in-RAM coord-table thesis (failed 2026-04-16)
+
+Implemented as `src/commands/altw_v2.rs`. Thesis: replace the four-stage
+external sort with a three-pass in-RAM form mirroring `renumber_external`,
+under the assumption that the planet coord table for unique-referenced
+nodes would fit in ~16 GB (~2 B * 8 bytes).
+
+| Dataset | Unique referenced | Coord table | Outcome |
+|---|---:|---:|---|
+| Denmark | 49 M | 394 MB | 3.5 s (2.8x vs existing external 9.7 s) |
+| Europe | 3.6 B | 29 GB | OOM-killed at Phase 2 coord_table alloc (30 GB host) |
+| Planet (projected) | ~10 B | ~80 GB | not attempted |
+
+Root cause: the unique-referenced estimate was off by 4-5x at every scale.
+Memory-before-design would have caught it; the plan's step-1 caveat
+("measure `unique_referenced_nodes` on planet before committing to 16 GB
+coord_table sizing") was correct and was skipped.
+
+Lesson: when a plan rests on an in-RAM sizing assumption that scales with
+input data, measure the real size at the target scale before writing code.
+
+### #3 scratch-spool: flat i64 (reverted 2026-04-17)
+
+Commit `44913a5` landed, `ba62fb1` reverted. Per-worker scratch file holds
+each blob's node IDs at tracked offsets; pass B `read_exact_at`s the
+payload and skips pread + decompress + way-scan.
+
+Europe `--bench 1` UUID `b29877e2`: wall 291.6 s -> 324.2 s (**+11.2%**).
+Pass A 7.3 s -> 15.0 s (+7.7 s scratch-write tax). Pass B 30.0 s -> 44.9 s
+(worse, not better). Stage 2 89 s -> 95 s (page-cache contention from
+2.4 GB scratch competing with stage 2 working set).
+
+Root cause: per-blob `write_all_at` / `read_exact_at` = ~9.5 K unbuffered
+pwrites per worker at ~42 KB average; scratch bytes thrashed page cache.
+
+### #11 presence bitmap (reverted 2026-04-17)
+
+Commit `631f284`. Per-worker `Vec<u64>` bitmap, one bit per local rank;
+set the bit on coord write, check it in the resolve loop, zero only the
+bitmap prefix at each bucket boundary.
+
+Europe `--bench 1` UUID `85464a37`: wall 291.6 s -> 293.1 s (+0.5%,
+essentially flat). Stage 2 89.3 s -> 95.2 s (+6 s).
+
+Root cause: per-slot bitmap OR in the fill loop and bitmap bit-test in
+the resolve loop cost more than the saved per-bucket zero-fill. Europe
+`local_range` ~780 K = 6.2 MB coord-slice zero per bucket, which modern
+memset moves in a few ms. Europe stage 2 is pread/decompress-bound; no
+headroom for bitmap overhead to hide.
+
+### #1 epoch-spill: promote fused stage-2+3 to default (reverted 2026-04-21)
+
+Commits `4601cbf` + `207357e`. Resurrected the 2026-04-15 prototype into
+`src/commands/altw/external/stage23_epoch.rs`, adapted to the post-#4
+blob-local-counter shape, switched emit to feed `build_blob_location_router`
+directly.
+
+Historical prelude: the **original env-gated epoch-spill prototype** landed at
+`96b6451` (`PBFHOGG_ALTW_SLOT_EPOCHS=N`) and got one bounded-drain follow-up at
+`211e585`. Denmark was within noise / byte-identical; Europe initially
+regressed (`bdf838d` → `96b6451`: 474.7 s → 492.0 s, **+3.6%**), then the
+bounded-drain follow-up recovered to a slight Europe win (`172e527` →
+`211e585`: 384.2 s → 380.4 s, **−1.0%**). But at planet scale the prototype
+never graduated: E=4 OOMed, E=8 fit but lost to the normal path. That is why
+the 2026-04-21 port existed at all - it was the attempt to turn the prototype
+into a production-worthy default rather than an env-var curiosity.
+
+| Dataset | Config | UUID | Wall | Peak RSS | vs baseline |
+|---|---|---|---:|---:|---:|
+| Europe baseline `ee5f776` (`--bench 3`) | - | `296a0edf` | 296.0 s | ~9-10 GB | - |
+| Europe E=4 `4601cbf` (`--bench 3`) | - | `1a340da5` | 292.1 s | ~16 GB | -1.3% wall, +6 GB RSS |
+| Europe E=8 `207357e` (`--bench 1`) | - | `ea856988` | 303.6 s | 11.5 GB | +2.6% wall, +1.5 GB RSS |
+| Planet baseline `aee7727` (`--bench 3`) | - | `a406d77e` | 661.2 s | ~5-8 GB | - |
+| Planet E=8 `207357e` (`--bench 1`) | - | `edf662b4` | **741 s** | **25.2 GB** | **+10% wall, +18 GB RSS** |
+
+Root cause: port preserved the prototype's 16-byte spill record
+`(slot_pos: u64 LE, lat: i32 LE, lon: i32 LE)`. The current main-line
+slot-bucket path uses 12-byte records (post-`fcd4fa2`, `local_slot_pos: u32`
++ lat + lon). Spill path wrote 33% more bytes per entry than the path it
+replaced; the ~12.5-25% in-memory epoch-0 saving did not offset. The ~68 s
+"eliminated finalize" component the original plan counted on had already
+been claimed by #8 `BlobLocationRouter` (`e497e54`), so there was no
+finalize savings to cash in on. Planet EPOCH0_PRODUCER 271 s vs pre-port
+STAGE2 208 s dominated the regression.
+
+A future retry needs variant (c): per-epoch-scoped `local_slot_pos: u32`
+(drain recomputes bucket from `epoch_slot_start + local_slot_pos`), single
+12-byte stream, auto-tune `num_epochs` from `/proc/meminfo`. Preserved as
+last-resort in `altw-external.md` L16.
+
+### #3 scratch-spool: BufWriter + delta-varint retry (reverted 2026-04-21)
+
+Commits `e8d4f06` + `b034dc5`. Addressed both flat-i64 failure modes:
+per-worker `BufWriter<File>` (256 KB) replaced per-blob pwrite; absolute
+unsigned varints (~50% scratch reduction) replaced flat i64; fixed 12-byte
+blob header let pass B `read_exact` the header and bulk-load the payload;
+`protohoggr::Cursor::read_varint` fast paths replaced byte-at-a-time
+BufRead decode; post-Pass-B `remove_file` freed page cache.
+
+| Variant | UUID | Wall | Stage 1 (A+B) | Pass B cumulative |
+|---|---|---:|---:|---|
+| Baseline (no #3) | `1cb6c3c9` | 292.2 s | 42.6 s (8.2+34.3) | 350 s (pread 301 + decompress 43 + scan 6) |
+| v1 BufRead `read_varint_from` | `590c2304` | 289.5 s | 48.6 s (14.2+34.7) | `s1b_scratch_read_ms=466 s` |
+| v2 fixed header + Cursor | `a8fa4215` | 292.4 s | 49.8 s (13.9+35.9) | `s1b_scratch_read_ms=450 s` |
+
+Root cause: baseline pass B cumulative work (350 s) is already less than
+scratch reread cumulative work (450 s). zlib-rs decompresses at
+~1 GB/s/thread; Europe's ~12.5 GB of compressed way blobs takes ~350 s
+cumulative across 22 workers = ~16 s wall of decompression plus scan.
+Scratch reread at ~23 GB on a partially-cached 25 GB-RAM host preads from
+NVMe at ~100 MB/s per-thread-effective = ~10 s wall minimum on top of
+varint decode. Scratch path is bandwidth-limited on reread; decompress
+path is CPU-limited; zlib-rs is fast enough that scratch loses.
+
+Conclusion: scratch-spool as a shape is **dead on this hardware**. A future
+#3 retry must be a true single-pass stage 1 (R4 A1 ID-bucketed emission,
+no disk round-trip between passes). Preserved as `altw-external.md` L3.
+
+### #6 blob-group downstream rewrite (reverted 2026-04-22)
+
+Commits `1ef0474` + `ed86839` + `a97b6ab` + `80ed3d7`, reverted in a
+single commit on top. Stage 1 minimally touched (rank record decomposed
+to `(local_rank, blob_idx, blob_local_slot)` at the same 12-byte size);
+stage 2 rerouted resolved entries to blob-group files via cumulative-
+slot-weighted `BlobGroupMap`; stage 3 rewritten to read group files,
+scatter into per-group coord buffer sized to the group's slot span,
+encode per-blob, publish; `blob_bucket_index.rs` deleted; router's
+`Straddler` variant removed by construction.
+
+Scaling search to rule out worker-count tuning, Europe `--bench 1`:
+
+| Commit | Compression | Stage 2 | Streaming | Total | Notes |
+|---|---|---:|---:|---:|---|
+| #9L2 `bad6571` | zlib:6 | 93.8 s | 111.9 s | **279.6 s** | pre-#6 baseline |
+| cap-4 `1ef0474` | zlib:6 | 102.6 s | 144.1 s | 321.7 s | stage 3 starved stage 4 (`s4_readiness_wait_ms=1,313,000`) |
+| cap-6 `a97b6ab` | zlib:6 | 104.2 s | 121.1 s | 288.2 s | heavy paging (majflt avg 20940/sample, max 81162) |
+| uncapped `80ed3d7` | zlib:6 | 101.5 s | 124.1 s | **289.7 s** | starvation cured, wall unchanged |
+| #9L2 `bad6571` | none | 92.0 s | 86.6 s | **246.8 s** | baseline at no compression |
+| uncapped `80ed3d7` | none | 104.5 s | 98.6 s | **269.9 s** | **+23.1 s / +9.4%** vs #9L2 none |
+
+Removing compression **widened** the regression from +3.6% to +9.4%,
+confirming the design tax was real and compression-independent, not a
+writer-ceiling artifact masking a latent win.
+
+Root cause: stage-2 intermediate record grew from 12 bytes
+`(local_slot_pos u32, lat, lon)` to 16 bytes `(blob_idx u32,
+blob_local_slot u32, lat, lon)`. The narrower 14-byte form
+`(blob_idx u32, blob_local_slot u16, lat, lon)` is not viable: real data
+has `blob_local_slot` up to 69,552 (observed at Europe blob 826),
+exceeds `u16::MAX`. Stage 3 reads 75 GB of group files at Europe (vs
+slot-bucket's 56 GB), allocates a per-group dense coord buffer sized to
+the group's slot span (`s3_max_group_coord_bytes` 147 MB on Europe,
+projecting ~380 MB at planet worst case). More disk + more scratch
+allocation than the straddler-based path.
+
+**Cross-disk probe aborted.** Second NVMe on plantasjen (Samsung 970
+EVO Plus 1 TB at `/media/folk/Booty`) materially slower than primary
+(Samsung 990 PRO 4 TB): moving scratch to it regressed Europe wall
++87 s / +30%. Drive-speed delta dominated any potential I/O-contention
+win. Cross-disk probe is infeasible until a second drive matching the
+primary arrives.
+
+Conclusion: #6 is **shelved on plantasjen-class hardware**. A future
+revisit needs either collapsing the stage 2 -> stage 3 round-trip
+(requires RAM not available) or a measurably faster second NVMe.
+Preserved as `altw-external.md` L14.
+
+### Stage-4 wire-format DenseNodes filter (shelved 2026-04-14)
+
+Probe `4910fd9`. Filter DenseNodes at wire-format level on the non-way
+passthrough path, bypassing BlockBuilder re-encode.
+
+| Dataset | Mode | Subcounter | Stage 4 | Total |
+|---|---|---|---:|---:|
+| Europe `7ab12b2a` vs `d0ffd614` | zlib:6 | `s4_nonway_assemble_ms` 78.5 s -> 36.9 s (-53%); `s4_assemble_ms` 520947 ms -> 426199 ms (-18%) | 122.7 s -> 127.6 s | - |
+| Europe `e3f3ec1b` vs `774fe74b` | zstd:1 | `s4_nonway_assemble_ms` -13% | -1.3% | 5m40s -> 5m48s |
+
+Root cause under zlib:6: `s4_send_ms` cumulative 561 s -> 672 s. Freed
+decoder CPU refilled the writer queue. This is the writer-ceiling
+diagnostic kept as load-bearing evidence: real stage-4-local CPU wins
+are invisible on wall under a writer-bound output mode.
+
+Could be re-measured under `compression:none` or `zstd:1` for
+internal-pipeline users. Preserved as `altw-external.md` L9.
+
+### Rank-bucket count sweep beyond 256 (reverted)
+
+Implementation `2168a7e`. Japan stage 2+3+finalize slice:
+
+| Buckets | UUID | Slice | `s2_open_calls` | `s2_node_straddler_blobs` | `s3_integrated_straddler_count` |
+|---:|---|---:|---:|---:|---:|
+| 256 | `6453221b` | 9116 ms | 5632 | 510 | 255 |
+| 384 | `800de5c2` | 9711 ms (+6.5%) | 8448 | 766 | 383 |
+| 512 | `d3a320de` | 10377 ms (+13.8%) | 11264 | 1022 | 511 |
+
+Stage 1 flat across the sweep (3307 -> 3342 -> 3229 ms). Reopens and
+straddlers grow faster than cache-fit gains. Keep `NUM_BUCKETS = 256`.
+
+### Per-worker local IdSetDense in pass A (shelved)
+
+Europe: `s1a_idset_local_chunks = 8932` vs `s1a_idset_final_chunks = 406`.
+Excessive per-worker fragmentation without pooling across workers.
+
+### Stage-1B grouped-by-local-rank emission (reverted)
+
+Japan: normal `3b5fcc08` vs grouped `856a7bb9`.
+
+- `s2_prepare_scatter_ms`: 3761 ms -> 3629 ms (-3.5%, below 20% gate)
+- `EXTJOIN_STAGE1`: 3212 ms -> 4239 ms (+31.9%)
+- Combined stage 1+2: 9221 ms -> 9840 ms (+6.7%)
+- `s1b_bytes_written`: 4.25 GB -> 5.31 GB (+25%)
+- `s1b_shard_write_calls`: 354 M -> 664 M
+- `s1b_grouped_headers`: 310 M
+
+Root cause: per-group headers did not pay back; most emitted runs were
+too short to amortize the header cost. Distinct from the stage-1B
+per-blob bucket-staging attempt (`e16674b`, documented above).
+
+### Stage-2 hot-loop batch (shelved)
+
+Implementation `237cb2e`. Japan UUID `36615411`: `EXTJOIN_STAGE2` 5900 ms
+-> 5922 ms (flat). Subcounters shuffled (`s2_coord_fill_ms` -16%,
+`s2_resolve_ms` -19%, `s2_node_extract_ns` down, `s2_node_rank_ns` up
+correspondingly). Attribution shuffle without wall movement.
+
+### Relation-member node wire scanner (shelved)
+
+Implementation `603b1043`. Denmark byte-identical
+(MD5 `2d3c901a40eec6bf3bfb2084641519f4`). Europe
+`EXTJOIN_RELATION_SCAN`: 14294 ms -> 15172 ms (worse). Parsing only
+relation memids/types arrays was not enough to beat the existing
+full-block path. Superseded by #9 layer 1 metadata-driven relation scan
+(`6d71053`, landed) which preads only relation blobs using `blob_meta`
+instead of running a full blob scan.
+
+---
+
+## Lessons that anchor `altw-external.md`
+
+1. **Desk estimates on this code path are systematically optimistic.**
+   Stage-1B batching predicted -6 s, measured +22.9 s. Stage-2+3 fuse
+   sketches contradicted by desk analysis by an order of magnitude.
+   altw_v2 unique-referenced estimate off by 4-5x. Bound estimates with
+   micro-benchmarks or skip to small-dataset measurement.
+
+2. **Writer ceiling diagnostic.** Real stage-4 CPU wins are invisible on
+   wall under zlib:6 because freed decoder CPU refills the writer queue.
+   Always measure keep/revert under both `zlib:6` and `zstd:1` (or
+   `compression:none`) for any stage-4-side item.
+
+3. **Physical NVMe floor.** Stage 4 coord read is 720 MB/s * 37 GB
+   = ~51 s at Europe; total stage-4 floor is ~141 s. Designs that do not
+   reduce bytes-read cannot beat that floor.
+
+4. **In-RAM coord-table does not fit past Denmark.** 3.6 B unique
+   referenced at Europe (29 GB); projected ~10 B at planet (~80 GB).
+   External-sort architecture is load-bearing on a 30-GB-class host.
+
+5. **Intermediate-record size window is narrow.** 12-byte slot-bucket is
+   a local optimum. Shrinking (`631f284` presence bitmap) and widening
+   (`207357e` epoch 16-byte, `80ed3d7` blob-group 16-byte) both regressed.
+   Any change to intermediate record layout needs to be measurement-first,
+   not deduction-first.
+
+6. **Scratch round-trip cost >= zlib decompression cost on this hardware.**
+   zlib-rs at ~1 GB/s/thread means any reshape that trades a decompression
+   pass for a disk reread of comparable volume will regress. Scratch-spool
+   attempts (`44913a5`, `e8d4f06`, `b034dc5`) are all instances of this.
+
+7. **Second NVMe on this host is materially slower than the primary.**
+   Cross-disk scratch probes for #6 and any related stage-2/3 seam will
+   regress +30% until a second 990-PRO-class drive is available. Design
+   choices that assume symmetric NVMe throughput cannot be benched here.

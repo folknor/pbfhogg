@@ -83,10 +83,10 @@ pub(super) fn stage3_slot_reorder(
     // `ResolvedEntry::slot_bucket` for the matching routing logic.)
     let range_size = total_slots / slot_bucket_count as u64;
 
-    // Streaming cap (item #2): stage 3 and stage 4 worker buffers are
-    // now both resident concurrently. Back off from the pre-streaming
-    // `.min(6)` so peak anon RSS doesn't balloon on a 30 GB planet host.
-    // See notes/altw-structural-reports.md #2 "Worker budgets under overlap".
+    // Streaming cap: stage 3 and stage 4 worker buffers are now both
+    // resident concurrently (streaming stage 3 -> 4 landed in `beb7838`
+    // + `f93d896` + `eecb46c`). Back off from the pre-streaming `.min(6)`
+    // so peak anon RSS doesn't balloon on a 30 GB planet host.
     // Must match the worker tmp file count allocated by mod.rs.
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))

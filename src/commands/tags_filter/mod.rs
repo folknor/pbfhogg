@@ -149,6 +149,15 @@ pub struct TagsFilterOptions<'a> {
     pub compression: Compression,
     pub direct_io: bool,
     pub force: bool,
+    /// Override the worker-pool size for the parallel classify passes
+    /// in two-pass mode (`parallel_classify_phase` for blob scanning
+    /// plus two `parallel_classify_accumulate` calls for relation
+    /// closure + way-node deps). `None` uses the rayon default
+    /// (`available_parallelism()`). Ignored in single-pass mode
+    /// (`-R`, which uses the pipelined reader rather than
+    /// `parallel_classify_*`); the CLI rejects that combination
+    /// upfront.
+    pub jobs: Option<usize>,
 }
 
 /// Filter a PBF file by tag expressions.
@@ -170,6 +179,11 @@ pub fn tags_filter(
              filters are no-ops - all blobs are decompressed (significantly slower).")?;
     }
 
+    if let Some(n) = opts.jobs {
+        #[allow(clippy::cast_possible_wrap)]
+        crate::debug::emit_counter("tagsfilter_worker_count", n as i64);
+    }
+
     let expressions = parse_expressions(opts.expression_strs)?;
     if opts.omit_referenced {
         let result = tags_filter_single_pass(input, output, &expressions, opts.invert, opts.compression, opts.direct_io, overrides)?;
@@ -181,7 +195,7 @@ pub fn tags_filter(
         }
         Ok(result)
     } else {
-        let result = tags_filter_two_pass(input, output, &expressions, opts.invert, opts.remove_tags, opts.compression, opts.direct_io, overrides)?;
+        let result = tags_filter_two_pass(input, output, &expressions, opts.invert, opts.remove_tags, opts.compression, opts.direct_io, opts.jobs, overrides)?;
         #[allow(clippy::cast_possible_wrap)]
         {
             crate::debug::emit_counter("tagsfilter_matched_nodes", result.nodes_matched as i64);
@@ -533,6 +547,7 @@ fn tags_filter_two_pass(
     remove_tags: bool,
     compression: Compression,
     direct_io: bool,
+    jobs: Option<usize>,
     overrides: &HeaderOverrides,
 ) -> Result<TagsFilterStats> {
     let mut stats = TagsFilterStats {
@@ -625,7 +640,7 @@ fn tags_filter_two_pass(
     crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &schedule,
-        None,
+        jobs,
         || (),
         |block, _s| {
             let mut result = ClassifyResult {
@@ -705,6 +720,7 @@ fn tags_filter_two_pass(
             &mut included_relation_ids,
             &mut included_way_ids,
             &mut relation_dep_node_ids,
+            jobs,
         )?;
         has_included_way |= closure.has_way;
         has_included_relation |= closure.has_relation;
@@ -719,6 +735,7 @@ fn tags_filter_two_pass(
         &included_way_ids,
         Some(&direct_way_ids),
         &mut relation_dep_node_ids,
+        jobs,
     )?;
     crate::debug::emit_marker("TAGSFILTER_WAYDEPS_END");
 
@@ -961,6 +978,7 @@ fn collect_relation_member_closure(
     included_relation_ids: &mut IdSet,
     included_way_ids: &mut IdSet,
     relation_dep_node_ids: &mut IdSet,
+    jobs: Option<usize>,
 ) -> Result<RelationClosureSummary> {
     let mut summary = RelationClosureSummary::default();
 
@@ -984,7 +1002,7 @@ fn collect_relation_member_closure(
         crate::scan::classify::parallel_classify_accumulate(
             &shared_file,
             &schedule,
-            None,
+            jobs,
             || ClosureResult {
                 node_ids: Vec::new(),
                 way_ids: Vec::new(),
@@ -1046,6 +1064,7 @@ fn collect_way_node_dependencies(
     included_way_ids: &IdSet,
     skip_way_ids: Option<&IdSet>,
     relation_dep_node_ids: &mut IdSet,
+    jobs: Option<usize>,
 ) -> Result<()> {
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input, Some(crate::blob_meta::ElemKind::Way),
@@ -1054,7 +1073,7 @@ fn collect_way_node_dependencies(
     crate::scan::classify::parallel_classify_accumulate(
         &shared_file,
         &schedule,
-        None,
+        jobs,
         IdSet::new,
         |block, node_ids| {
             for element in block.elements_skip_metadata() {

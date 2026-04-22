@@ -26,6 +26,7 @@ fn run_filter(
         compression: Compression::default(),
         direct_io: false,
         force: true,
+        jobs: None,
     };
     tags_filter(input, output, &opts, &pbfhogg::HeaderOverrides::default()).expect("filter")
 }
@@ -522,6 +523,7 @@ fn run_filter_opts(
         compression: Compression::default(),
         direct_io: false,
         force: true,
+        jobs: None,
     };
     tags_filter(input, output, &opts, &pbfhogg::HeaderOverrides::default()).expect("filter")
 }

@@ -198,6 +198,11 @@ enum Command {
         io: DirectIoArg,
         #[command(flatten)]
         force: ForceArg,
+        /// Worker-pool size for the parallel classify phases.
+        /// `0` (default) uses rayon's `available_parallelism()`.
+        /// Pass a specific N to measure scaling or constrain CPU use.
+        #[arg(short = 'j', long = "jobs", default_value_t = 0)]
+        jobs: usize,
         #[command(flatten)]
         header: HeaderOverrideArg,
     },
@@ -779,6 +784,7 @@ fn main() -> process::ExitCode {
             compression,
             force,
             io,
+            jobs,
             header,
         } => {
             let kind = input_kind.unwrap_or_else(|| detect_input_kind(&file));
@@ -793,7 +799,13 @@ fn main() -> process::ExitCode {
                     if remove_tags {
                         return Err("-t/--remove-tags is not valid in OSC mode".into());
                     }
+                    if jobs != 0 {
+                        return Err("-j/--jobs is not valid in OSC mode (OSC parse is single-threaded)".into());
+                    }
                     run_tags_filter_osc(&file, &output.output, expressions_file.as_deref(), &expressions)
+                }
+                InputKind::Pbf if omit_referenced && jobs != 0 => {
+                    Err("-j/--jobs has no effect with -R/--omit-referenced (single-pass mode uses the pipelined reader, not the parallel classify path). Drop -R or drop -j.".into())
                 }
                 InputKind::Pbf => run_tags_filter(
                     &file,
@@ -806,6 +818,7 @@ fn main() -> process::ExitCode {
                     &compression.compression,
                     io.direct_io,
                     force.force,
+                    jobs,
                     &HeaderOverrides::parse(header.generator, &header.output_headers)?,
                 ),
             }
@@ -1529,6 +1542,7 @@ fn run_renumber(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn run_tags_filter(
     file: &std::path::Path,
     output: &std::path::Path,
@@ -1540,6 +1554,7 @@ fn run_tags_filter(
     compression: &str,
     direct_io: bool,
     force: bool,
+    jobs: usize,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
@@ -1558,6 +1573,7 @@ fn run_tags_filter(
         compression,
         direct_io,
         force,
+        jobs: if jobs == 0 { None } else { Some(jobs) },
     };
     let stats = pbfhogg::tags_filter::tags_filter(file, output, &opts, overrides)?;
     stats.print_summary();

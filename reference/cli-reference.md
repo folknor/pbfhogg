@@ -199,6 +199,7 @@ pbfhogg tags-filter [OPTIONS] --output <OUTPUT> <FILE> [EXPRESSIONS]...
 | `-i, --invert-match` | Invert match: exclude matching objects, keep non-matching (PBF only) |
 | `-t, --remove-tags` | Remove tags from referenced objects not directly matched (use without -R; PBF only) |
 | `-e, --expressions <FILE>` | Read filter expressions from file (one per line, # comments) |
+| `-j, --jobs <N>` | Worker-pool size for the parallel classify phases. `0` (default) uses rayon's `available_parallelism()`. Two-pass mode only: the single-pass `-R` path uses the pipelined reader and ignores `-j` (CLI rejects the combination). |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--force` | Proceed even if input lacks indexdata |
@@ -337,6 +338,7 @@ pbfhogg apply-changes [OPTIONS] --output <OUTPUT> <BASE> <CHANGES>
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `--locations-on-ways` | Preserve and update way-node locations through the merge (requires base PBF with LocationsOnWays) |
+| `-j, --jobs <N>` | Worker-pool size for the descriptor-first pipeline. `0` (default) uses the `nproc - 2` heuristic (leaves two cores for scanner + drain, min 1). Pass a specific N to measure scaling or constrain CPU use. |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--io-uring` | Use io_uring for output I/O |

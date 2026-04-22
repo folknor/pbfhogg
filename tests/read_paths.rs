@@ -4,12 +4,16 @@
 //! operations work correctly on BlobReader.
 #![allow(clippy::unwrap_used, clippy::cognitive_complexity, clippy::too_many_lines)]
 
+mod common;
+
 use std::io::SeekFrom;
 use std::path::Path;
 
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
 use pbfhogg::writer::{Compression, PbfWriter};
-use pbfhogg::{BlobReader, BlobType, ByteOffset, Element, ElementReader, MemberId};
+use pbfhogg::{
+    BlobFilter, BlobReader, BlobType, ByteOffset, Element, ElementReader, IndexedReader, MemberId,
+};
 use tempfile::TempDir;
 
 /// Write a multi-block PBF to the given path.
@@ -469,4 +473,149 @@ fn sorted_flag_but_unsorted_nodes_panics() {
 
     let reader = ElementReader::from_path(&path).unwrap();
     reader.for_each(|_| {}).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// BlobFilter conservative pass-through on non-indexed PBFs
+// ---------------------------------------------------------------------------
+//
+// `should_skip_blob` in `src/read/pipeline.rs:20-33` short-circuits to
+// `false` (do not skip) when `blob.index()` is `None`. The doc comment
+// calls this out: "Blobs without indexdata or tagdata always pass
+// through (conservative)." The consequence is that a filter like
+// `BlobFilter::only_ways()` skips node blobs on an indexed PBF but
+// does NOT on a non-indexed one - every blob is decompressed and every
+// element is delivered to the caller's closure.
+//
+// The element-level delivery path does not apply any element-type
+// filter downstream of the pipeline, so on non-indexed input an
+// only_ways filter will silently hand the caller every element type.
+// That's the contract these tests pin.
+
+#[test]
+fn blobfilter_only_ways_skips_node_blobs_on_indexed_input() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("indexed.osm.pbf");
+    common::write_test_pbf_sorted(
+        &path,
+        &common::generate_nodes(10, 1),
+        &common::generate_ways(5, 1_000, 2, 1),
+        &[],
+    );
+    common::assert_indexed(&path);
+
+    let reader = ElementReader::from_path(&path)
+        .unwrap()
+        .with_blob_filter(BlobFilter::only_ways());
+
+    let mut saw_nodes = 0u64;
+    let mut saw_ways = 0u64;
+    reader
+        .for_each_pipelined(|element| match element {
+            Element::Node(_) | Element::DenseNode(_) => saw_nodes += 1,
+            Element::Way(_) => saw_ways += 1,
+            _ => {}
+        })
+        .unwrap();
+
+    assert_eq!(saw_nodes, 0, "only_ways filter must skip node blobs on indexed input");
+    assert_eq!(saw_ways, 5, "only_ways filter must deliver all ways on indexed input");
+}
+
+#[test]
+fn blobfilter_only_ways_passes_through_on_non_indexed_input() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("non_indexed.osm.pbf");
+    common::write_test_pbf_non_indexed(
+        &path,
+        &common::generate_nodes(10, 1),
+        &common::generate_ways(5, 1_000, 2, 1),
+        &[],
+    );
+    common::assert_non_indexed(&path);
+
+    let reader = ElementReader::from_path(&path)
+        .unwrap()
+        .with_blob_filter(BlobFilter::only_ways());
+
+    let mut saw_nodes = 0u64;
+    let mut saw_ways = 0u64;
+    reader
+        .for_each_pipelined(|element| match element {
+            Element::Node(_) | Element::DenseNode(_) => saw_nodes += 1,
+            Element::Way(_) => saw_ways += 1,
+            _ => {}
+        })
+        .unwrap();
+
+    // Node blobs are NOT skipped because the filter's blob-level
+    // decision requires indexdata. All 10 nodes reach the closure.
+    assert_eq!(
+        saw_nodes, 10,
+        "BlobFilter on non-indexed input must NOT drop node blobs - callers get every element"
+    );
+    assert_eq!(saw_ways, 5, "ways still delivered");
+}
+
+// ---------------------------------------------------------------------------
+// IndexedReader on non-indexed input
+// ---------------------------------------------------------------------------
+//
+// `IndexedReader::create_index` walks only blob headers (not bodies),
+// so it does not itself depend on `BlobHeader.indexdata`. The per-blob
+// `id_ranges` used by `ways_available` / `node_range_included` are
+// populated lazily from decoded blocks via `update_element_id_ranges`
+// (src/read/indexed.rs:184) - the same code path runs whether or not
+// the input carries indexdata. This test pins that contract: the
+// output of `read_ways_and_deps` on a non-indexed PBF must match the
+// output on its indexed twin.
+
+#[test]
+fn indexed_reader_output_matches_on_indexed_and_non_indexed_twins() {
+    let dir = TempDir::new().unwrap();
+    let indexed = dir.path().join("indexed.osm.pbf");
+    let non_indexed = dir.path().join("non_indexed.osm.pbf");
+
+    // 8 nodes + 4 ways; each way refs two consecutive nodes. "building"
+    // tag on odd-numbered ways so read_ways_and_deps has a meaningful
+    // filter and node-dependency resolution.
+    let nodes = common::generate_nodes(8, 1);
+    let mut ways = common::generate_ways(4, 1_000, 2, 1);
+    for (i, w) in ways.iter_mut().enumerate() {
+        if i % 2 == 0 {
+            w.tags = vec![("building", "yes")];
+        }
+    }
+
+    common::write_test_pbf_sorted(&indexed, &nodes, &ways, &[]);
+    common::write_test_pbf_non_indexed(&non_indexed, &nodes, &ways, &[]);
+    common::assert_indexed(&indexed);
+    common::assert_non_indexed(&non_indexed);
+
+    let collect = |path: &Path| -> (Vec<i64>, Vec<i64>) {
+        let mut reader = IndexedReader::from_path(path).unwrap();
+        let mut way_ids = Vec::new();
+        let mut node_ids = Vec::new();
+        reader
+            .read_ways_and_deps(
+                |w| w.tags().any(|(k, v)| k == "building" && v == "yes"),
+                |element| match element {
+                    Element::Way(w) => way_ids.push(w.id()),
+                    Element::Node(n) => node_ids.push(n.id()),
+                    Element::DenseNode(n) => node_ids.push(n.id()),
+                    _ => {}
+                },
+            )
+            .unwrap();
+        way_ids.sort_unstable();
+        node_ids.sort_unstable();
+        (way_ids, node_ids)
+    };
+
+    let (ways_idx, nodes_idx) = collect(&indexed);
+    let (ways_non, nodes_non) = collect(&non_indexed);
+
+    assert_eq!(ways_idx, ways_non, "way set diverges on non-indexed input");
+    assert_eq!(nodes_idx, nodes_non, "node dep set diverges on non-indexed input");
+    assert!(!ways_idx.is_empty(), "filter must match at least one way");
 }

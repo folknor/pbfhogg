@@ -570,20 +570,86 @@ per-iteration allocations remain across the codebase, ordered by impact:
 
 See `reference/performance.md` for consolidated baselines.
 
-- [ ] **Diff element_stream fallback path untested** - all test PBFs are
-  indexed because `PbfWriter::write_primitive_block` unconditionally adds
-  indexdata. The `diff_element_stream` fallback (non-indexed inputs) has
-  no direct coverage. Needs a `write_test_pbf_non_indexed` helper that
-  either strips indexdata post-write or uses `write_blob` directly.
+- [x] ~~**Diff element_stream fallback path untested**~~ - landed
+  2026-04-22. `PbfWriter::write_primitive_block_no_indexdata` added as
+  public library API (bypasses the `scan_block_ids` / `scan_block_tags`
+  path that populates `BlobHeader.indexdata` / `.tagdata`). New
+  `write_test_pbf_non_indexed` helper in `tests/common/mod.rs` drives
+  the three `diff_element_stream` pairings (old non-indexed, new
+  non-indexed, both non-indexed) plus a parity test that asserts the
+  fallback path produces identical text + stats to the optimized
+  `diff_block_pair` on the same logical input. Verbose mode pinned
+  separately.
 
-- [ ] **Test fixture infrastructure** - current `write_test_pbf` /
-  `write_test_pbf_sorted` helpers create minimal PBFs (1-3 elements per
-  type, single block). Needed: (1) a sorted+indexed fixture generator
-  for commands that require indexdata (merge, extract, diff, ALTW),
-  (2) larger multi-block fixtures (~100 elements, 3-5 blocks) to exercise
-  batch boundaries, blob classification, and passthrough coalescing,
-  (3) a fixture with metadata (version, changeset, timestamp, uid, user)
-  for CleanAttrs / time_filter / diff verbose testing.
+- [x] ~~**Test fixture infrastructure**~~ - landed 2026-04-22.
+  `TestNode` / `TestWay` / `TestRelation` extended with
+  `meta: Option<TestMeta>` (default `None`); ~428 struct literals across
+  14 test files migrated via a one-shot migration script (script
+  deleted post-migration - the migration is idempotent and the
+  literals are now the source of truth). New
+  `write_multi_block_test_pbf(path, nodes, ways, rels, block_size)`
+  forces block flushes every N elements to produce multi-blob fixtures
+  without needing 8000+ elements per type. `generate_nodes` /
+  `generate_ways` / `generate_relations` emit sequential id-sorted
+  vectors straight into the writer. `assert_indexed` and
+  `assert_non_indexed` expose the existing `has_indexdata` probe for
+  blob-header assertions. All covered by
+  [`tests/fixture_helpers.rs`](tests/fixture_helpers.rs) smoke tests.
+
+### Tests enabled by the new fixtures - landed 2026-04-22
+
+Eight gaps surfaced by parallel reviewer-agent sweeps after the
+fixture work. All landed as integration tests across `tests/cat.rs`,
+`tests/diff.rs`, `tests/extract.rs`, `tests/getid.rs`,
+`tests/read_paths.rs`, `tests/inspect.rs`, `tests/tags_filter.rs`,
+new files `tests/tags_count.rs` and `tests/non_indexed_parity.rs`.
+Two of the eight landed with `#[ignore]`-gated tests pinning real
+correctness bugs (see "Known correctness gaps" above).
+
+- [ ] **Parallel classify correctness for `check --refs`.** The
+  other three parallel-classify commands (`inspect --nodes`,
+  `tags-filter` two-pass, `tags-count`) got `jobs=1` vs `jobs=4`
+  parity tests via their `jobs: Option<usize>` / `jobs: usize`
+  library APIs. `check_refs` has no equivalent override in its
+  public signature (`src/commands/check/refs.rs:141`), so a parity
+  test has to either exercise the CLI via `cli/tests/cli.rs` (hard
+  to observe worker count from outside) or wait for a plumbed
+  `jobs` argument. Not urgent - the worker-count-independent
+  correctness is implicitly covered by the existing single-blob
+  tests - but worth revisiting if check-refs ever grows a jobs
+  flag.
+
+### Known correctness gaps surfaced by parity tests (2026-04-22)
+
+Both gated as `#[ignore]` integration tests in
+`tests/non_indexed_parity.rs` - uncomment the ignore attribute to
+reproduce.
+
+- [ ] **`extract --strategy simple --force` on non-indexed input
+  double-emits elements.** Parity test ran the same logical input
+  through indexed + non-indexed twins with `force: true`, bbox
+  clipping about half the 10-node fixture. Indexed output: 6 nodes
+  (correct). Non-indexed output: 18 nodes - a 3x multiplier, which
+  matches the "non-indexed blobs are decompressed up to 3 times"
+  comment in `src/commands/extract/simple.rs::extract_simple_single_pass`.
+  Leading hypothesis: the passthrough schedule silently no-ops on
+  blobs without indexdata and then the same decoded block flows
+  through the output three times via the type-split phases. First
+  step: confirm hypothesis with a counter / trace, then gate the
+  pass-2/pass-3 emits on "already emitted this blob".
+
+- [ ] **`apply-changes --force` on non-indexed input off-by-one on
+  delete.** Parity test ran a `modify n2, delete n3, create n100`
+  OSC against indexed + non-indexed twins of the same 10-node base.
+  Indexed output: 10 nodes (1,2,4..=10,100 - delete applied).
+  Non-indexed output: 11 nodes (one extra, likely n3 survived the
+  delete because the scanner's descriptor routing at
+  `src/commands/apply_changes/scanner.rs:129-204` falls into the
+  worker-pool-unconditional branch with placeholder `kind` and
+  `id_range: None`, and the delete match by id doesn't fire in that
+  path). First step: add a counter around the worker-pool branch to
+  confirm it's the route taken, then teach the scanner to populate
+  `id_range` from decoded block metadata on the non-indexed fallback.
 
 - [ ] **Fuzz testing** - PBF parsing (`PrimitiveBlock::from_vec`), OSC
   parsing (`parse_osc_file`), and wire-format decoders (`Cursor`,

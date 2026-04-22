@@ -28,7 +28,47 @@ use pbfhogg::{BlobDecode, BlobReader, Element, ElementReader, MemberId};
 // convenience.
 // ---------------------------------------------------------------------------
 
-/// A test node with id, coordinates (in decimicrodegrees), and tags.
+/// Optional test-side element metadata. Every field mirrors
+/// [`pbfhogg::block_builder::Metadata`] but uses `&'static str` for `user` so
+/// struct literals stay cheap. `Default` gives a valid, stable set of values
+/// suitable for tests that just want "some metadata" (version 1, epoch 0,
+/// changeset 0, uid 0, user "", visible).
+#[derive(Clone, Copy, Debug)]
+pub struct TestMeta {
+    pub version: i32,
+    pub timestamp: i64,
+    pub changeset: i64,
+    pub uid: i32,
+    pub user: &'static str,
+    pub visible: bool,
+}
+
+impl Default for TestMeta {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            timestamp: 0,
+            changeset: 0,
+            uid: 0,
+            user: "",
+            visible: true,
+        }
+    }
+}
+
+fn to_block_meta(m: &TestMeta) -> block_builder::Metadata<'_> {
+    block_builder::Metadata {
+        version: m.version,
+        timestamp: m.timestamp,
+        changeset: m.changeset,
+        uid: m.uid,
+        user: m.user,
+        visible: m.visible,
+    }
+}
+
+/// A test node with id, coordinates (in decimicrodegrees), tags, and
+/// optional metadata.
 pub struct TestNode {
     pub id: i64,
     /// Latitude in decimicrodegrees (10^-7 degrees).
@@ -36,16 +76,20 @@ pub struct TestNode {
     /// Longitude in decimicrodegrees (10^-7 degrees).
     pub lon: i32,
     pub tags: Vec<(&'static str, &'static str)>,
+    /// Optional per-element metadata (version/timestamp/changeset/uid/user/visible).
+    /// `None` writes a node with no OSM metadata - the default for most tests.
+    pub meta: Option<TestMeta>,
 }
 
-/// A test way with id, node references, and tags.
+/// A test way with id, node references, tags, and optional metadata.
 pub struct TestWay {
     pub id: i64,
     pub refs: Vec<i64>,
     pub tags: Vec<(&'static str, &'static str)>,
+    pub meta: Option<TestMeta>,
 }
 
-/// A test relation with id, members, and tags.
+/// A test relation with id, members, tags, and optional metadata.
 ///
 /// Members use the [`TestMember`] struct which pairs a [`MemberId`] with a role
 /// string.
@@ -53,6 +97,7 @@ pub struct TestRelation {
     pub id: i64,
     pub members: Vec<TestMember>,
     pub tags: Vec<(&'static str, &'static str)>,
+    pub meta: Option<TestMeta>,
 }
 
 /// A single member of a test relation: a typed member id plus a role string.
@@ -70,9 +115,15 @@ pub struct TestMember {
 /// Creates a header blob followed by one or more primitive blocks. Elements are
 /// written in order (all nodes, then all ways, then all relations) and the
 /// builder is flushed between element types and whenever a block reaches its
-/// capacity limit (8000 entities).
+/// capacity limit (8000 entities by default).
 ///
 /// When `sorted` is true, the header declares `Sort.Type_then_ID`.
+///
+/// `block_size_override` forces a block flush every N elements within each
+/// type section instead of waiting for the 8000-entity cap. Use this to
+/// produce multi-block fixtures that exercise batch boundaries, blob
+/// classification, and passthrough coalescing without allocating thousands
+/// of elements. `None` keeps the natural 8000/block behaviour.
 ///
 /// This is the canonical test PBF writer shared across most integration tests.
 /// The `add_locations_to_ways` tests use a local variant because their
@@ -83,6 +134,7 @@ pub fn write_test_pbf_impl(
     ways: &[TestWay],
     relations: &[TestRelation],
     sorted: bool,
+    block_size_override: Option<usize>,
 ) {
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
@@ -93,43 +145,56 @@ pub fn write_test_pbf_impl(
     writer.write_header(&header).expect("write header");
 
     let mut bb = BlockBuilder::new();
+    let mut batch_count = 0usize;
 
     // Nodes
     for n in nodes {
-        if !bb.can_add_node()
+        let hit_override = matches!(block_size_override, Some(s) if batch_count >= s);
+        if (!bb.can_add_node() || hit_override)
             && let Some(bytes) = bb.take().expect("take")
         {
             writer.write_primitive_block(bytes).expect("write block");
+            batch_count = 0;
         }
-        bb.add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), None);
+        let meta = n.meta.as_ref().map(to_block_meta);
+        bb.add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), meta.as_ref());
+        batch_count += 1;
     }
     if !bb.is_empty()
         && let Some(bytes) = bb.take().expect("take")
     {
         writer.write_primitive_block(bytes).expect("write block");
     }
+    batch_count = 0;
 
     // Ways
     for w in ways {
-        if !bb.can_add_way()
+        let hit_override = matches!(block_size_override, Some(s) if batch_count >= s);
+        if (!bb.can_add_way() || hit_override)
             && let Some(bytes) = bb.take().expect("take")
         {
             writer.write_primitive_block(bytes).expect("write block");
+            batch_count = 0;
         }
-        bb.add_way(w.id, w.tags.iter().copied(), &w.refs, None);
+        let meta = w.meta.as_ref().map(to_block_meta);
+        bb.add_way(w.id, w.tags.iter().copied(), &w.refs, meta.as_ref());
+        batch_count += 1;
     }
     if !bb.is_empty()
         && let Some(bytes) = bb.take().expect("take")
     {
         writer.write_primitive_block(bytes).expect("write block");
     }
+    batch_count = 0;
 
     // Relations
     for r in relations {
-        if !bb.can_add_relation()
+        let hit_override = matches!(block_size_override, Some(s) if batch_count >= s);
+        if (!bb.can_add_relation() || hit_override)
             && let Some(bytes) = bb.take().expect("take")
         {
             writer.write_primitive_block(bytes).expect("write block");
+            batch_count = 0;
         }
         let members: Vec<MemberData<'_>> = r
             .members
@@ -139,7 +204,9 @@ pub fn write_test_pbf_impl(
                 role: m.role,
             })
             .collect();
-        bb.add_relation(r.id, r.tags.iter().copied(), &members, None);
+        let meta = r.meta.as_ref().map(to_block_meta);
+        bb.add_relation(r.id, r.tags.iter().copied(), &members, meta.as_ref());
+        batch_count += 1;
     }
     if !bb.is_empty()
         && let Some(bytes) = bb.take().expect("take")
@@ -157,7 +224,7 @@ pub fn write_test_pbf(
     ways: &[TestWay],
     relations: &[TestRelation],
 ) {
-    write_test_pbf_impl(path, nodes, ways, relations, false);
+    write_test_pbf_impl(path, nodes, ways, relations, false, None);
 }
 
 /// Write a test PBF with `Sort.Type_then_ID` header flag. See [`write_test_pbf_impl`].
@@ -167,7 +234,251 @@ pub fn write_test_pbf_sorted(
     ways: &[TestWay],
     relations: &[TestRelation],
 ) {
-    write_test_pbf_impl(path, nodes, ways, relations, true);
+    write_test_pbf_impl(path, nodes, ways, relations, true, None);
+}
+
+/// Write a sorted test PBF that forces a block flush every `block_size`
+/// elements within each type section. Produces a multi-block fixture with
+/// a small, predictable number of blobs, useful for exercising batch
+/// boundaries, blob classification, passthrough coalescing, and
+/// merge-join block-pair logic without needing ~8000+ elements per type.
+///
+/// Example: `write_multi_block_test_pbf(path, &nodes_100, &ways_20, &rels_5, 25)`
+/// lays the nodes out as four blocks of 25 (or 24+24+24+28 tail), ways as one
+/// block, relations as one block - seven data blobs total.
+pub fn write_multi_block_test_pbf(
+    path: &Path,
+    nodes: &[TestNode],
+    ways: &[TestWay],
+    relations: &[TestRelation],
+    block_size: usize,
+) {
+    assert!(block_size > 0, "block_size must be > 0");
+    write_test_pbf_impl(path, nodes, ways, relations, true, Some(block_size));
+}
+
+/// Write a sorted test PBF whose OsmData blobs lack the `indexdata`
+/// `BlobHeader` field. Use this to exercise read paths (most visibly
+/// `diff_element_stream` in `commands::diff`) that only fire when one
+/// or both inputs are non-indexed. The `PrimitiveBlock` payload is
+/// identical to `write_test_pbf_sorted`; only the outer blob header
+/// differs. The header declares `Sort.Type_then_ID` so consumers that
+/// require sorted inputs still accept the output.
+pub fn write_test_pbf_non_indexed(
+    path: &Path,
+    nodes: &[TestNode],
+    ways: &[TestWay],
+    relations: &[TestRelation],
+) {
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .sorted()
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+
+    for n in nodes {
+        if !bb.can_add_node()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer
+                .write_primitive_block_no_indexdata(bytes)
+                .expect("write block");
+        }
+        let meta = n.meta.as_ref().map(to_block_meta);
+        bb.add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), meta.as_ref());
+    }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer
+            .write_primitive_block_no_indexdata(bytes)
+            .expect("write block");
+    }
+
+    for w in ways {
+        if !bb.can_add_way()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer
+                .write_primitive_block_no_indexdata(bytes)
+                .expect("write block");
+        }
+        let meta = w.meta.as_ref().map(to_block_meta);
+        bb.add_way(w.id, w.tags.iter().copied(), &w.refs, meta.as_ref());
+    }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer
+            .write_primitive_block_no_indexdata(bytes)
+            .expect("write block");
+    }
+
+    for r in relations {
+        if !bb.can_add_relation()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer
+                .write_primitive_block_no_indexdata(bytes)
+                .expect("write block");
+        }
+        let members: Vec<MemberData<'_>> = r
+            .members
+            .iter()
+            .map(|m| MemberData {
+                id: m.id,
+                role: m.role,
+            })
+            .collect();
+        let meta = r.meta.as_ref().map(to_block_meta);
+        bb.add_relation(r.id, r.tags.iter().copied(), &members, meta.as_ref());
+    }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer
+            .write_primitive_block_no_indexdata(bytes)
+            .expect("write block");
+    }
+
+    writer.flush().expect("flush");
+}
+
+// ---------------------------------------------------------------------------
+// Fixture generation helpers
+// ---------------------------------------------------------------------------
+//
+// These produce sequential, id-sorted element vectors intended to be paired
+// with `write_multi_block_test_pbf` when a test wants to exercise multi-blob
+// paths without hand-writing dozens of literals. Coordinates are chosen to
+// stay inside the WGS84 range and to produce visibly distinct lat/lon per
+// element so failures aren't hidden by coordinate collisions.
+
+/// Generate `count` nodes with ids `start_id..start_id+count`.
+///
+/// Latitudes and longitudes are a deterministic function of **id**, not
+/// of the position in the returned vector: `lat = lon = 1000 * (id %
+/// 10_000)` decimicrodegrees. Keying off id means two `generate_nodes`
+/// calls that produce the same id (even with different `count` /
+/// `start_id` windows) agree on the coord - important for tests that
+/// splice overlapping id ranges between old/new fixtures and rely on
+/// element-equality semantics (diff, merge). Coordinates wrap every
+/// 10 000 ids to stay inside the WGS84 range for arbitrarily large
+/// inputs. No tags, no metadata - map over the result when a test
+/// needs specific tags.
+pub fn generate_nodes(count: usize, start_id: i64) -> Vec<TestNode> {
+    (0..count)
+        .map(|i| {
+            let id_offset = i64::try_from(i).expect("node count fits in i64");
+            let id = start_id + id_offset;
+            // decimicrodegrees = 1e-7 degrees, so 1e-4° = 1000 decimicrodegrees.
+            let step = 1000_i32;
+            let wrap = i32::try_from(id.rem_euclid(10_000)).expect("id mod 10_000 fits in i32");
+            let coord = step.saturating_mul(wrap);
+            TestNode {
+                id,
+                lat: coord,
+                lon: coord,
+                tags: vec![],
+                meta: None,
+            }
+        })
+        .collect()
+}
+
+/// Generate `count` ways with ids `start_id..start_id+count`, each
+/// referencing `refs_per_way` consecutive node ids starting at
+/// `node_start_id`. Useful for testing blob classification on ways whose
+/// refs point into a specific node-id range.
+pub fn generate_ways(
+    count: usize,
+    start_id: i64,
+    refs_per_way: usize,
+    node_start_id: i64,
+) -> Vec<TestWay> {
+    (0..count)
+        .map(|i| {
+            let id_offset = i64::try_from(i).expect("way count fits in i64");
+            let refs: Vec<i64> = (0..refs_per_way)
+                .map(|r| {
+                    let r = i64::try_from(r).expect("refs_per_way fits in i64");
+                    node_start_id + r
+                })
+                .collect();
+            TestWay {
+                id: start_id + id_offset,
+                refs,
+                tags: vec![],
+                meta: None,
+            }
+        })
+        .collect()
+}
+
+/// Generate `count` relations with ids `start_id..start_id+count`, each
+/// containing `members_per_rel` way members starting at `way_start_id`
+/// with the role `"outer"`.
+pub fn generate_relations(
+    count: usize,
+    start_id: i64,
+    members_per_rel: usize,
+    way_start_id: i64,
+) -> Vec<TestRelation> {
+    (0..count)
+        .map(|i| {
+            let id_offset = i64::try_from(i).expect("relation count fits in i64");
+            let members: Vec<TestMember> = (0..members_per_rel)
+                .map(|m| {
+                    let m = i64::try_from(m).expect("members_per_rel fits in i64");
+                    TestMember {
+                        id: MemberId::Way(way_start_id + m),
+                        role: "outer",
+                    }
+                })
+                .collect();
+            TestRelation {
+                id: start_id + id_offset,
+                members,
+                tags: vec![],
+                meta: None,
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Indexdata assertions
+// ---------------------------------------------------------------------------
+
+/// Assert the PBF's first OsmData blob carries indexdata. Matches the
+/// representativeness assumption of `pbfhogg::has_indexdata`: the first
+/// data blob is trusted to speak for the rest of the file. `write_test_pbf`
+/// and friends always emit indexed blobs, so this is a fast smoke check
+/// that a helper hasn't accidentally dropped indexdata.
+pub fn assert_indexed(path: &Path) {
+    let indexed = pbfhogg::has_indexdata(path, false).expect("probe indexdata");
+    assert!(
+        indexed,
+        "expected {} to carry indexdata on its first data blob",
+        path.display()
+    );
+}
+
+/// Assert the PBF's first OsmData blob has no indexdata. Pair with
+/// `write_test_pbf_non_indexed` (see the non-indexed writer helper) to
+/// confirm the blob really landed without the indexdata field.
+pub fn assert_non_indexed(path: &Path) {
+    let indexed = pbfhogg::has_indexdata(path, false).expect("probe indexdata");
+    assert!(
+        !indexed,
+        "expected {} to have no indexdata on its first data blob",
+        path.display()
+    );
 }
 
 // ---------------------------------------------------------------------------

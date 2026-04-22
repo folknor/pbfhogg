@@ -35,8 +35,8 @@ fn merge_disjoint_node_files() {
     write_test_pbf_sorted(
         &a,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "a")] },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "a")], meta: None },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
         ],
         &[],
         &[],
@@ -44,8 +44,8 @@ fn merge_disjoint_node_files() {
     write_test_pbf_sorted(
         &b,
         &[
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![("name", "c")] },
-            TestNode { id: 4, lat: 130_000_000, lon: 230_000_000, tags: vec![] },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![("name", "c")], meta: None },
+            TestNode { id: 4, lat: 130_000_000, lon: 230_000_000, tags: vec![], meta: None },
         ],
         &[],
         &[],
@@ -71,9 +71,9 @@ fn merge_overlapping_nodes_dedup() {
     write_test_pbf_sorted(
         &a,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "shared")] },
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "shared")], meta: None },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![], meta: None },
         ],
         &[],
         &[],
@@ -81,9 +81,9 @@ fn merge_overlapping_nodes_dedup() {
     write_test_pbf_sorted(
         &b,
         &[
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "shared")] },
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![] },
-            TestNode { id: 4, lat: 130_000_000, lon: 230_000_000, tags: vec![] },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "shared")], meta: None },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![], meta: None },
+            TestNode { id: 4, lat: 130_000_000, lon: 230_000_000, tags: vec![], meta: None },
         ],
         &[],
         &[],
@@ -108,21 +108,21 @@ fn merge_with_ways_and_relations() {
     write_test_pbf_sorted(
         &a,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
         ],
         &[
-            TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")] },
+            TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")], meta: None },
         ],
         &[],
     );
     write_test_pbf_sorted(
         &b,
         &[
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![] },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![], meta: None },
         ],
         &[
-            TestWay { id: 20, refs: vec![3], tags: vec![("highway", "secondary")] },
+            TestWay { id: 20, refs: vec![3], tags: vec![("highway", "secondary")], meta: None },
         ],
         &[
             TestRelation {
@@ -132,6 +132,7 @@ fn merge_with_ways_and_relations() {
                     TestMember { id: MemberId::Way(20), role: "inner" },
                 ],
                 tags: vec![("type", "multipolygon")],
+                meta: None,
             },
         ],
     );
@@ -157,8 +158,8 @@ fn merge_single_file() {
     write_test_pbf_sorted(
         &a,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
         ],
         &[],
         &[],
@@ -183,19 +184,19 @@ fn merge_three_files() {
 
     write_test_pbf_sorted(
         &a,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] }],
+        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None }],
         &[],
         &[],
     );
     write_test_pbf_sorted(
         &b,
-        &[TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] }],
+        &[TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None }],
         &[],
         &[],
     );
     write_test_pbf_sorted(
         &c_file,
-        &[TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![] }],
+        &[TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![], meta: None }],
         &[],
         &[],
     );
@@ -243,9 +244,9 @@ fn merge_three_files_overlapping_ids() {
     write_test_pbf_sorted(
         &a,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("src", "a")] },
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![("src", "a")] },
-            TestNode { id: 5, lat: 140_000_000, lon: 240_000_000, tags: vec![("src", "a")] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("src", "a")], meta: None },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![("src", "a")], meta: None },
+            TestNode { id: 5, lat: 140_000_000, lon: 240_000_000, tags: vec![("src", "a")], meta: None },
         ],
         &[],
         &[],
@@ -253,9 +254,9 @@ fn merge_three_files_overlapping_ids() {
     write_test_pbf_sorted(
         &b,
         &[
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("src", "b")] },
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![("src", "b")] },
-            TestNode { id: 4, lat: 130_000_000, lon: 230_000_000, tags: vec![("src", "b")] },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("src", "b")], meta: None },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![("src", "b")], meta: None },
+            TestNode { id: 4, lat: 130_000_000, lon: 230_000_000, tags: vec![("src", "b")], meta: None },
         ],
         &[],
         &[],
@@ -263,9 +264,9 @@ fn merge_three_files_overlapping_ids() {
     write_test_pbf_sorted(
         &c_file,
         &[
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![("src", "c")] },
-            TestNode { id: 5, lat: 140_000_000, lon: 240_000_000, tags: vec![("src", "c")] },
-            TestNode { id: 6, lat: 150_000_000, lon: 250_000_000, tags: vec![("src", "c")] },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![("src", "c")], meta: None },
+            TestNode { id: 5, lat: 140_000_000, lon: 240_000_000, tags: vec![("src", "c")], meta: None },
+            TestNode { id: 6, lat: 150_000_000, lon: 250_000_000, tags: vec![("src", "c")], meta: None },
         ],
         &[],
         &[],

@@ -45,18 +45,19 @@ fn merge_basic_create_modify_delete() {
     write_test_pbf(
         &base,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "one")] },
-            TestNode { id: 2, lat: 300_000_000, lon: 400_000_000, tags: vec![("name", "two")] },
-            TestNode { id: 3, lat: 500_000_000, lon: 600_000_000, tags: vec![("name", "three")] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "one")], meta: None },
+            TestNode { id: 2, lat: 300_000_000, lon: 400_000_000, tags: vec![("name", "two")], meta: None },
+            TestNode { id: 3, lat: 500_000_000, lon: 600_000_000, tags: vec![("name", "three")], meta: None },
         ],
         &[
-            TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "road")] },
+            TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "road")], meta: None },
         ],
         &[
             TestRelation {
                 id: 100,
                 members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
                 tags: vec![("type", "multipolygon")],
+                meta: None,
             },
         ],
     );
@@ -127,9 +128,9 @@ fn merge_create_between_existing_ids() {
     write_test_pbf(
         &base,
         &[
-            TestNode { id: 10, lat: 0, lon: 0, tags: vec![] },
-            TestNode { id: 20, lat: 0, lon: 0, tags: vec![] },
-            TestNode { id: 30, lat: 0, lon: 0, tags: vec![] },
+            TestNode { id: 10, lat: 0, lon: 0, tags: vec![], meta: None },
+            TestNode { id: 20, lat: 0, lon: 0, tags: vec![], meta: None },
+            TestNode { id: 30, lat: 0, lon: 0, tags: vec![], meta: None },
         ],
         &[],
         &[],
@@ -172,9 +173,9 @@ fn merge_create_beyond_max_id() {
     write_test_pbf(
         &base,
         &[
-            TestNode { id: 1, lat: 0, lon: 0, tags: vec![] },
-            TestNode { id: 2, lat: 0, lon: 0, tags: vec![] },
-            TestNode { id: 3, lat: 0, lon: 0, tags: vec![] },
+            TestNode { id: 1, lat: 0, lon: 0, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 0, lon: 0, tags: vec![], meta: None },
+            TestNode { id: 3, lat: 0, lon: 0, tags: vec![], meta: None },
         ],
         &[],
         &[],
@@ -295,13 +296,13 @@ fn merge_nodes_only_diff_ways_passthrough() {
     write_test_pbf(
         &base,
         &[
-            TestNode { id: 1, lat: 0, lon: 0, tags: vec![] },
-            TestNode { id: 2, lat: 100_000_000, lon: 100_000_000, tags: vec![("old", "tag")] },
-            TestNode { id: 3, lat: 0, lon: 0, tags: vec![] },
+            TestNode { id: 1, lat: 0, lon: 0, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 100_000_000, lon: 100_000_000, tags: vec![("old", "tag")], meta: None },
+            TestNode { id: 3, lat: 0, lon: 0, tags: vec![], meta: None },
         ],
         &[
-            TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "path")] },
-            TestWay { id: 20, refs: vec![3, 2, 1], tags: vec![("building", "yes")] },
+            TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "path")], meta: None },
+            TestWay { id: 20, refs: vec![3, 2, 1], tags: vec![("building", "yes")], meta: None },
         ],
         &[],
     );
@@ -341,13 +342,13 @@ fn merge_ways_only_diff() {
     write_test_pbf(
         &base,
         &[
-            TestNode { id: 1, lat: 0, lon: 0, tags: vec![] },
-            TestNode { id: 2, lat: 0, lon: 0, tags: vec![] },
+            TestNode { id: 1, lat: 0, lon: 0, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 0, lon: 0, tags: vec![], meta: None },
         ],
         &[
-            TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "road")] },
-            TestWay { id: 20, refs: vec![2, 1], tags: vec![("name", "delete me")] },
-            TestWay { id: 30, refs: vec![1, 2, 1], tags: vec![("building", "yes")] },
+            TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "road")], meta: None },
+            TestWay { id: 20, refs: vec![2, 1], tags: vec![("name", "delete me")], meta: None },
+            TestWay { id: 30, refs: vec![1, 2, 1], tags: vec![("building", "yes")], meta: None },
         ],
         &[],
     );
@@ -388,18 +389,20 @@ fn merge_relations_only_diff() {
 
     write_test_pbf(
         &base,
-        &[TestNode { id: 1, lat: 0, lon: 0, tags: vec![] }],
-        &[TestWay { id: 10, refs: vec![1], tags: vec![] }],
+        &[TestNode { id: 1, lat: 0, lon: 0, tags: vec![], meta: None }],
+        &[TestWay { id: 10, refs: vec![1], tags: vec![], meta: None }],
         &[
             TestRelation {
                 id: 100,
                 members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
                 tags: vec![("type", "multipolygon")],
+                meta: None,
             },
             TestRelation {
                 id: 200,
                 members: vec![TestMember { id: MemberId::Node(1), role: "stop" }],
                 tags: vec![("type", "route")],
+                meta: None,
             },
         ],
     );
@@ -455,23 +458,25 @@ fn merge_all_types() {
     write_test_pbf(
         &base,
         &[
-            TestNode { id: 1, lat: 0, lon: 0, tags: vec![] },
-            TestNode { id: 2, lat: 0, lon: 0, tags: vec![] },
+            TestNode { id: 1, lat: 0, lon: 0, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 0, lon: 0, tags: vec![], meta: None },
         ],
         &[
-            TestWay { id: 10, refs: vec![1, 2], tags: vec![("delete", "me")] },
-            TestWay { id: 20, refs: vec![2, 1], tags: vec![("keep", "me")] },
+            TestWay { id: 10, refs: vec![1, 2], tags: vec![("delete", "me")], meta: None },
+            TestWay { id: 20, refs: vec![2, 1], tags: vec![("keep", "me")], meta: None },
         ],
         &[
             TestRelation {
                 id: 100,
                 members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
                 tags: vec![("old", "tags")],
+                meta: None,
             },
             TestRelation {
                 id: 200,
                 members: vec![],
                 tags: vec![("type", "site")],
+                meta: None,
             },
         ],
     );
@@ -594,18 +599,19 @@ fn merge_stats_accuracy() {
     write_test_pbf(
         &base,
         &[
-            TestNode { id: 1, lat: 0, lon: 0, tags: vec![] },
-            TestNode { id: 2, lat: 0, lon: 0, tags: vec![] },
-            TestNode { id: 3, lat: 0, lon: 0, tags: vec![] },
+            TestNode { id: 1, lat: 0, lon: 0, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 0, lon: 0, tags: vec![], meta: None },
+            TestNode { id: 3, lat: 0, lon: 0, tags: vec![], meta: None },
         ],
         &[
-            TestWay { id: 10, refs: vec![1, 2], tags: vec![] },
+            TestWay { id: 10, refs: vec![1, 2], tags: vec![], meta: None },
         ],
         &[
             TestRelation {
                 id: 100,
                 members: vec![],
                 tags: vec![],
+                meta: None,
             },
         ],
     );
@@ -996,9 +1002,9 @@ fn merge_locations_on_ways_basic() {
     write_test_pbf_with_locations(
         &base,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
-            TestNode { id: 2, lat: 300_000_000, lon: 400_000_000, tags: vec![] },
-            TestNode { id: 3, lat: 500_000_000, lon: 600_000_000, tags: vec![] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 300_000_000, lon: 400_000_000, tags: vec![], meta: None },
+            TestNode { id: 3, lat: 500_000_000, lon: 600_000_000, tags: vec![], meta: None },
         ],
         &[
             (10, vec![1, 2], vec![(100_000_000, 200_000_000), (300_000_000, 400_000_000)], vec![("highway", "road")]),
@@ -1084,8 +1090,8 @@ fn merge_locations_on_ways_osc_node_coords() {
     write_test_pbf_with_locations(
         &base,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
-            TestNode { id: 2, lat: 300_000_000, lon: 400_000_000, tags: vec![] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 300_000_000, lon: 400_000_000, tags: vec![], meta: None },
         ],
         &[
             (10, vec![1, 2], vec![(100_000_000, 200_000_000), (300_000_000, 400_000_000)], vec![]),
@@ -1136,7 +1142,7 @@ fn merge_locations_on_ways_requires_base_feature() {
     // Write a normal sorted PBF (no LocationsOnWays)
     common::write_test_pbf_sorted(
         &base,
-        &[TestNode { id: 1, lat: 0, lon: 0, tags: vec![] }],
+        &[TestNode { id: 1, lat: 0, lon: 0, tags: vec![], meta: None }],
         &[],
         &[],
     );
@@ -1304,18 +1310,19 @@ fn merge_basic_create_modify_delete_direct_io() {
     write_test_pbf(
         &base,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "one")] },
-            TestNode { id: 2, lat: 300_000_000, lon: 400_000_000, tags: vec![("name", "two")] },
-            TestNode { id: 3, lat: 500_000_000, lon: 600_000_000, tags: vec![("name", "three")] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "one")], meta: None },
+            TestNode { id: 2, lat: 300_000_000, lon: 400_000_000, tags: vec![("name", "two")], meta: None },
+            TestNode { id: 3, lat: 500_000_000, lon: 600_000_000, tags: vec![("name", "three")], meta: None },
         ],
         &[
-            TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "road")] },
+            TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "road")], meta: None },
         ],
         &[
             TestRelation {
                 id: 100,
                 members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
                 tags: vec![("type", "multipolygon")],
+                meta: None,
             },
         ],
     );
@@ -1413,18 +1420,19 @@ fn merge_basic_create_modify_delete_uring() {
     write_test_pbf(
         &base,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "one")] },
-            TestNode { id: 2, lat: 300_000_000, lon: 400_000_000, tags: vec![("name", "two")] },
-            TestNode { id: 3, lat: 500_000_000, lon: 600_000_000, tags: vec![("name", "three")] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "one")], meta: None },
+            TestNode { id: 2, lat: 300_000_000, lon: 400_000_000, tags: vec![("name", "two")], meta: None },
+            TestNode { id: 3, lat: 500_000_000, lon: 600_000_000, tags: vec![("name", "three")], meta: None },
         ],
         &[
-            TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "road")] },
+            TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "road")], meta: None },
         ],
         &[
             TestRelation {
                 id: 100,
                 members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
                 tags: vec![("type", "multipolygon")],
+                meta: None,
             },
         ],
     );
@@ -1524,13 +1532,13 @@ fn merge_gap_creates_between_blobs() {
     write_test_pbf(
         &base,
         &[
-            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
-            TestNode { id: 20, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
-            TestNode { id: 30, lat: 120_000_000, lon: 220_000_000, tags: vec![] },
+            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
+            TestNode { id: 20, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
+            TestNode { id: 30, lat: 120_000_000, lon: 220_000_000, tags: vec![], meta: None },
         ],
         &[
-            TestWay { id: 100, refs: vec![10, 20], tags: vec![("highway", "road")] },
-            TestWay { id: 200, refs: vec![20, 30], tags: vec![("highway", "path")] },
+            TestWay { id: 100, refs: vec![10, 20], tags: vec![("highway", "road")], meta: None },
+            TestWay { id: 200, refs: vec![20, 30], tags: vec![("highway", "path")], meta: None },
         ],
         &[],
     );
@@ -1603,8 +1611,8 @@ fn merge_type_transition_node_to_relation_skipping_ways() {
     write_test_pbf(
         &base,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
         ],
         &[],
         &[
@@ -1612,6 +1620,7 @@ fn merge_type_transition_node_to_relation_skipping_ways() {
                 id: 100,
                 members: vec![TestMember { id: MemberId::Node(1), role: "label" }],
                 tags: vec![("type", "boundary")],
+                meta: None,
             },
         ],
     );

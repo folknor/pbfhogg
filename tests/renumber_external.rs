@@ -34,9 +34,9 @@ fn renumber_nodes_sequentially() {
     write_test_pbf_sorted(
         &input,
         &[
-            TestNode { id: 100, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "a")] },
-            TestNode { id: 200, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
-            TestNode { id: 300, lat: 120_000_000, lon: 220_000_000, tags: vec![("name", "c")] },
+            TestNode { id: 100, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "a")], meta: None },
+            TestNode { id: 200, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
+            TestNode { id: 300, lat: 120_000_000, lon: 220_000_000, tags: vec![("name", "c")], meta: None },
         ],
         &[],
         &[],
@@ -73,8 +73,8 @@ fn renumber_custom_start_node_id() {
     write_test_pbf_sorted(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
         ],
         &[],
         &[],
@@ -112,13 +112,13 @@ fn renumber_preserves_sorted_header_and_type_order() {
     write_test_pbf_sorted(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![], meta: None },
         ],
         &[
-            TestWay { id: 10, refs: vec![1, 2], tags: vec![] },
-            TestWay { id: 20, refs: vec![2, 3], tags: vec![] },
+            TestWay { id: 10, refs: vec![1, 2], tags: vec![], meta: None },
+            TestWay { id: 20, refs: vec![2, 3], tags: vec![], meta: None },
         ],
         &[
             TestRelation {
@@ -128,6 +128,7 @@ fn renumber_preserves_sorted_header_and_type_order() {
                     TestMember { id: MemberId::Way(10), role: "b" },
                 ],
                 tags: vec![("type", "route")],
+                meta: None,
             },
         ],
     );
@@ -155,11 +156,11 @@ fn renumber_relations_end_to_end() {
     write_test_pbf_sorted(
         &input,
         &[
-            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
-            TestNode { id: 20, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
+            TestNode { id: 20, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
         ],
         &[
-            TestWay { id: 100, refs: vec![10, 20], tags: vec![("highway", "road")] },
+            TestWay { id: 100, refs: vec![10, 20], tags: vec![("highway", "road")], meta: None },
         ],
         &[
             TestRelation {
@@ -169,6 +170,7 @@ fn renumber_relations_end_to_end() {
                     TestMember { id: MemberId::Way(100), role: "outer" },
                 ],
                 tags: vec![("type", "multipolygon")],
+                meta: None,
             },
             TestRelation {
                 id: 600,
@@ -177,6 +179,7 @@ fn renumber_relations_end_to_end() {
                     TestMember { id: MemberId::Node(20), role: "label" },
                 ],
                 tags: vec![("type", "boundary")],
+                meta: None,
             },
         ],
     );
@@ -223,7 +226,7 @@ fn renumber_relation_forward_ref() {
     write_test_pbf_sorted(
         &input,
         &[
-            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
         ],
         &[],
         &[
@@ -233,6 +236,7 @@ fn renumber_relation_forward_ref() {
                     TestMember { id: MemberId::Relation(600), role: "subarea" },
                 ],
                 tags: vec![("type", "boundary")],
+                meta: None,
             },
             TestRelation {
                 id: 600,
@@ -240,6 +244,7 @@ fn renumber_relation_forward_ref() {
                     TestMember { id: MemberId::Node(10), role: "label" },
                 ],
                 tags: vec![("type", "boundary")],
+                meta: None,
             },
         ],
     );
@@ -272,6 +277,7 @@ fn renumber_relation_self_reference() {
                     TestMember { id: MemberId::Relation(42), role: "self" },
                 ],
                 tags: vec![("type", "loop")],
+                meta: None,
             },
         ],
     );
@@ -300,13 +306,13 @@ fn renumber_relation_mixed_member_types_interleaved() {
     write_test_pbf_sorted(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![], meta: None },
         ],
         &[
-            TestWay { id: 10, refs: vec![1, 2], tags: vec![] },
-            TestWay { id: 20, refs: vec![2, 3], tags: vec![] },
+            TestWay { id: 10, refs: vec![1, 2], tags: vec![], meta: None },
+            TestWay { id: 20, refs: vec![2, 3], tags: vec![], meta: None },
         ],
         &[
             TestRelation {
@@ -320,6 +326,7 @@ fn renumber_relation_mixed_member_types_interleaved() {
                     TestMember { id: MemberId::Node(3), role: "e" },
                 ],
                 tags: vec![("type", "mixed")],
+                meta: None,
             },
             TestRelation {
                 id: 200,
@@ -328,6 +335,7 @@ fn renumber_relation_mixed_member_types_interleaved() {
                     TestMember { id: MemberId::Node(3), role: "tail" },
                 ],
                 tags: vec![],
+                meta: None,
             },
         ],
     );
@@ -363,15 +371,15 @@ fn renumber_nodes_and_ways_end_to_end() {
     write_test_pbf_sorted(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "a")] },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![("amenity", "cafe")] },
-            TestNode { id: 4, lat: 130_000_000, lon: 230_000_000, tags: vec![] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "a")], meta: None },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![("amenity", "cafe")], meta: None },
+            TestNode { id: 4, lat: 130_000_000, lon: 230_000_000, tags: vec![], meta: None },
         ],
         &[
-            TestWay { id: 100, refs: vec![1, 2, 2], tags: vec![("highway", "stop")] },
-            TestWay { id: 200, refs: vec![2, 3], tags: vec![] },
-            TestWay { id: 300, refs: vec![3, 4, 1], tags: vec![("barrier", "gate")] },
+            TestWay { id: 100, refs: vec![1, 2, 2], tags: vec![("highway", "stop")], meta: None },
+            TestWay { id: 200, refs: vec![2, 3], tags: vec![], meta: None },
+            TestWay { id: 300, refs: vec![3, 4, 1], tags: vec![("barrier", "gate")], meta: None },
         ],
         &[],
     );
@@ -414,12 +422,12 @@ fn renumber_custom_start_ids() {
     write_test_pbf_sorted(
         &input,
         &[
-            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
-            TestNode { id: 20, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
-            TestNode { id: 30, lat: 120_000_000, lon: 220_000_000, tags: vec![] },
+            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
+            TestNode { id: 20, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
+            TestNode { id: 30, lat: 120_000_000, lon: 220_000_000, tags: vec![], meta: None },
         ],
         &[
-            TestWay { id: 500, refs: vec![10, 20, 30], tags: vec![("name", "line")] },
+            TestWay { id: 500, refs: vec![10, 20, 30], tags: vec![("name", "line")], meta: None },
         ],
         &[],
     );
@@ -456,7 +464,7 @@ fn renumber_rejects_negative_node_id() {
     write_test_pbf_sorted(
         &input,
         &[
-            TestNode { id: -5, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: -5, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
         ],
         &[],
         &[],
@@ -482,11 +490,11 @@ fn renumber_rejects_negative_way_ref() {
     write_test_pbf_sorted(
         &input,
         &[
-            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
-            TestNode { id: 20, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
+            TestNode { id: 20, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
         ],
         &[
-            TestWay { id: 100, refs: vec![10, -1, 20], tags: vec![] },
+            TestWay { id: 100, refs: vec![10, -1, 20], tags: vec![], meta: None },
         ],
         &[],
     );
@@ -517,11 +525,11 @@ fn renumber_orphan_way_ref_preserves_old_id() {
     write_test_pbf_sorted(
         &input,
         &[
-            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
-            TestNode { id: 20, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
+            TestNode { id: 20, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
         ],
         &[
-            TestWay { id: 100, refs: vec![10, 99999, 20], tags: vec![] },
+            TestWay { id: 100, refs: vec![10, 99999, 20], tags: vec![], meta: None },
         ],
         &[],
     );

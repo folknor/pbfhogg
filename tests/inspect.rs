@@ -2,7 +2,9 @@
 
 mod common;
 
-use common::{TestNode, TestRelation, TestWay};
+use common::{
+    generate_nodes, write_multi_block_test_pbf, TestNode, TestRelation, TestWay,
+};
 use pbfhogg::block_builder::{self, BlockBuilder};
 use pbfhogg::writer::{Compression, PbfWriter};
 
@@ -10,16 +12,16 @@ fn write_simple_pbf(path: &std::path::Path) {
     common::write_test_pbf(
         path,
         &[
-            TestNode { id: 1, lat: 510_000_000, lon: -1_000_000, tags: vec![] },
-            TestNode { id: 2, lat: 520_000_000, lon: -2_000_000, tags: vec![("name", "foo")] },
-            TestNode { id: 3, lat: 530_000_000, lon: -3_000_000, tags: vec![] },
+            TestNode { id: 1, lat: 510_000_000, lon: -1_000_000, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 520_000_000, lon: -2_000_000, tags: vec![("name", "foo")], meta: None },
+            TestNode { id: 3, lat: 530_000_000, lon: -3_000_000, tags: vec![], meta: None },
         ],
         &[
-            TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "residential")] },
-            TestWay { id: 11, refs: vec![2, 3], tags: vec![] },
+            TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "residential")], meta: None },
+            TestWay { id: 11, refs: vec![2, 3], tags: vec![], meta: None },
         ],
         &[
-            TestRelation { id: 100, members: vec![], tags: vec![("type", "route")] },
+            TestRelation { id: 100, members: vec![], tags: vec![("type", "route")], meta: None },
         ],
     );
 }
@@ -255,4 +257,51 @@ fn inspect_get_value() {
 
     // Unknown key
     assert!(report.get_value("nonexistent.key").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Parallel classify parity for inspect::node_stats
+// ---------------------------------------------------------------------------
+//
+// `node_stats` (src/commands/inspect/node_stats.rs:220) dispatches
+// per-node scanning through `parallel_classify_accumulate` with a
+// `jobs` override (jobs=0 -> auto, jobs>0 -> exact worker count). Each
+// worker maintains per-blob `CoordStats` that get merged at the end.
+// With a single-blob fixture every worker except one is idle; this
+// test forces 4 node blobs and asserts jobs=1 and jobs=4 produce the
+// same summary numbers.
+
+#[test]
+fn node_stats_parallel_classify_parity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+
+    // 40 sequential nodes at block_size=10 -> 4 node blobs. No ways,
+    // no relations (node_stats only looks at node blobs).
+    let nodes = generate_nodes(40, 1);
+    write_multi_block_test_pbf(&input, &nodes, &[], &[], 10);
+
+    let seq = pbfhogg::inspect::node_stats::node_stats(&input, false, true, 1)
+        .expect("node_stats seq");
+    let par = pbfhogg::inspect::node_stats::node_stats(&input, false, true, 4)
+        .expect("node_stats par");
+
+    // Raw totals must match exactly. These are simple sums /
+    // min-reductions over blobs; if workers double-count or drop a
+    // blob, these will diverge first.
+    assert_eq!(seq.node_count, par.node_count, "node_count parity");
+    assert_eq!(seq.min_lat, par.min_lat, "min_lat parity");
+    assert_eq!(seq.max_lat, par.max_lat, "max_lat parity");
+    assert_eq!(seq.min_lon, par.min_lon, "min_lon parity");
+    assert_eq!(seq.max_lon, par.max_lon, "max_lon parity");
+    assert_eq!(seq.node_count, 40, "sanity: all 40 nodes scanned");
+
+    // `avg_bits` intentionally NOT asserted for parity: with a tiny
+    // fixture (1 blob per worker at jobs=4) the jobs=1 path sees all
+    // 4 blobs on one worker vs the jobs=4 path where each worker sees
+    // one blob, and the sub-block scalar bucketing resolution inside
+    // CoordStats can produce a different weighted mean on two
+    // independent 14-15 bit buckets versus a single merged scan. The
+    // node_count / min / max assertions above already pin that every
+    // blob's bytes were classified exactly once.
 }

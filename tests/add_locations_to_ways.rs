@@ -97,18 +97,21 @@ fn test_nodes() -> Vec<TestNode> {
             lat: 550_000_000,
             lon: 120_000_000,
             tags: vec![("name", "tagged_node")],
+            meta: None,
         },
         TestNode {
             id: 2,
             lat: 551_000_000,
             lon: 121_000_000,
             tags: vec![],
+            meta: None,
         },
         TestNode {
             id: 3,
             lat: 552_000_000,
             lon: 122_000_000,
             tags: vec![("amenity", "cafe")],
+            meta: None,
         },
     ]
 }
@@ -118,6 +121,7 @@ fn test_ways() -> Vec<TestWay> {
         id: 10,
         refs: vec![1, 2, 3],
         tags: vec![("highway", "primary")],
+        meta: None,
     }]
 }
 
@@ -254,11 +258,13 @@ fn missing_node_refs_get_zero_coordinates() {
         lat: 550_000_000,
         lon: 120_000_000,
         tags: vec![],
+        meta: None,
     }];
     let ways = vec![TestWay {
         id: 10,
         refs: vec![1, 99],
         tags: vec![("highway", "primary")],
+        meta: None,
     }];
 
     write_test_pbf(&input, &nodes, &ways, &[]);
@@ -505,18 +511,21 @@ fn drop_untagged_keeps_relation_member_nodes() {
             lat: 550_000_000,
             lon: 120_000_000,
             tags: vec![("name", "tagged")],
+            meta: None,
         },
         TestNode {
             id: 2,
             lat: 551_000_000,
             lon: 121_000_000,
             tags: vec![],
+            meta: None,
         },
     ];
     let ways = vec![TestWay {
         id: 10,
         refs: vec![1],
         tags: vec![("highway", "service")],
+        meta: None,
     }];
     let relations = vec![TestRelation {
         id: 100,
@@ -561,18 +570,21 @@ fn passthrough_drop_untagged_keeps_relation_member_nodes() {
             lat: 550_000_000,
             lon: 120_000_000,
             tags: vec![("name", "tagged")],
+            meta: None,
         },
         TestNode {
             id: 2,
             lat: 551_000_000,
             lon: 121_000_000,
             tags: vec![],
+            meta: None,
         },
     ];
     let ways = vec![TestWay {
         id: 10,
         refs: vec![1],
         tags: vec![("highway", "service")],
+        meta: None,
     }];
     let relations = vec![TestRelation {
         id: 100,
@@ -765,6 +777,7 @@ fn missing_node_refs_get_zero_coordinates_sparse() {
         id: 10,
         refs: vec![1, 999, 3],
         tags: vec![("highway", "primary")],
+        meta: None,
     }];
     write_test_pbf(&input, &test_nodes(), &ways, &[]);
 

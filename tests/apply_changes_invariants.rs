@@ -97,12 +97,12 @@ fn cursor_rule_false_positive_blob_emits_create_after() {
     write_test_pbf_sorted(
         &base,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![] },
-            TestNode { id: 2, lat: 200_000_000, lon: 200_000_000, tags: vec![] },
-            TestNode { id: 10, lat: 300_000_000, lon: 300_000_000, tags: vec![] },
+            TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 200_000_000, lon: 200_000_000, tags: vec![], meta: None },
+            TestNode { id: 10, lat: 300_000_000, lon: 300_000_000, tags: vec![], meta: None },
         ],
         &[
-            TestWay { id: 100, refs: vec![1, 2, 10], tags: vec![] },
+            TestWay { id: 100, refs: vec![1, 2, 10], tags: vec![], meta: None },
         ],
         &[],
     );
@@ -162,8 +162,8 @@ fn cursor_rule_false_positive_blob_emits_create_at_tail() {
     write_test_pbf_sorted(
         &base,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![] },
-            TestNode { id: 10, lat: 300_000_000, lon: 300_000_000, tags: vec![] },
+            TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![], meta: None },
+            TestNode { id: 10, lat: 300_000_000, lon: 300_000_000, tags: vec![], meta: None },
         ],
         &[],
         &[],
@@ -324,7 +324,7 @@ fn trailing_creates_after_node_blob_flush_way_and_relation() {
 
     write_test_pbf_sorted(
         &base,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![] }],
+        &[TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![], meta: None }],
         &[],
         &[],
     );
@@ -371,7 +371,7 @@ fn modify_on_missing_id_silently_inserts() {
 
     write_test_pbf_sorted(
         &base,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![] }],
+        &[TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![], meta: None }],
         &[],
         &[],
     );
@@ -408,7 +408,7 @@ fn delete_on_missing_id_is_noop() {
 
     write_test_pbf_sorted(
         &base,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![] }],
+        &[TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![], meta: None }],
         &[],
         &[],
     );
@@ -446,7 +446,7 @@ fn create_on_existing_id_overwrites_base() {
 
     write_test_pbf_sorted(
         &base,
-        &[TestNode { id: 42, lat: 100_000_000, lon: 100_000_000, tags: vec![] }],
+        &[TestNode { id: 42, lat: 100_000_000, lon: 100_000_000, tags: vec![], meta: None }],
         &[],
         &[],
     );
@@ -493,8 +493,8 @@ fn trailing_creates_after_way_blob_flush_relation_only() {
 
     write_test_pbf_sorted(
         &base,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![] }],
-        &[TestWay { id: 10, refs: vec![1], tags: vec![] }],
+        &[TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![], meta: None }],
+        &[TestWay { id: 10, refs: vec![1], tags: vec![], meta: None }],
         &[],
     );
 

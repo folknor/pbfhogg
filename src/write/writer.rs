@@ -355,6 +355,67 @@ impl<W: Write> PbfWriter<W> {
         }
     }
 
+    /// Write an `OSMData` blob without the `indexdata` / `tagdata`
+    /// `BlobHeader` fields.
+    ///
+    /// `write_primitive_block` always scans the serialized block for the
+    /// id range and present tag keys and emits both `indexdata` (field 2,
+    /// 42-byte v2 blob index) and `tagdata` (field 3, tag bloom). Some
+    /// consumers want to produce byte-for-byte PBFs matching third-party
+    /// tools that do not emit either field, or to exercise read paths
+    /// (`diff_element_stream`, `ElementReader` fallback) that only fire
+    /// on non-indexed inputs. This method is the opt-out.
+    ///
+    /// The `PrimitiveBlock` payload itself is unchanged - only the outer
+    /// `BlobHeader` differs. Readers that skip missing optional fields
+    /// treat the output identically to an indexed blob.
+    #[hotpath::measure]
+    pub fn write_primitive_block_no_indexdata(&mut self, block_bytes: &[u8]) -> io::Result<()> {
+        if let Some(ref mut pipeline) = self.pipeline {
+            let t_permit = std::time::Instant::now();
+            pipeline.permit_rx.recv().map_err(|_| {
+                io::Error::other("pipelined writer permit pool disconnected")
+            })?;
+            WRITER_METRICS
+                .permit_wait_ns
+                .fetch_add(elapsed_ns_u64(t_permit), Relaxed);
+            let seq = pipeline.seq;
+            pipeline.seq += 1;
+            let compression = self.compression;
+            let uncompressed = block_bytes.to_vec();
+            let tx = pipeline.tx.clone();
+            let permit_tx = pipeline.permit_tx.clone();
+            rayon::spawn(move || {
+                let result = PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
+                    frame_blob_into(
+                        "OSMData",
+                        &uncompressed,
+                        &compression,
+                        None,
+                        None,
+                        scratch,
+                    )
+                });
+                if let Ok(ref parts) = result {
+                    WRITER_METRICS.payload_framed_items.fetch_add(1, Relaxed);
+                    WRITER_METRICS
+                        .payload_framed_bytes
+                        .fetch_add(parts.total_len(), Relaxed);
+                }
+                let t_send = std::time::Instant::now();
+                drop(tx.send(PipelineItem {
+                    seq,
+                    data: result.map(OutputChunk::Framed),
+                }));
+                record_send_wait(t_send);
+                permit_tx.send(()).ok();
+            });
+            Ok(())
+        } else {
+            self.write_framed_blob("OSMData", block_bytes, None, None)
+        }
+    }
+
     /// Write an `OSMData` blob, taking ownership of the serialized bytes.
     ///
     /// Like [`write_primitive_block`](Self::write_primitive_block) but moves

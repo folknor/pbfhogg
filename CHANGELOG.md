@@ -41,6 +41,10 @@
 - **Geocode `simplify_ring` Douglas-Peucker divergence.** `dp_count_range` was using unclamped perpendicular distance to the infinite line while `dp_mark` used clamped segment projection - the binary search could converge to a different epsilon and exceed `max_vertices`. Both now use the same clamped projection.
 - **io_uring writer corrupted output on the `CopyRange` fast-path.** `apply-changes --io-uring` on indexed input produced structurally-broken PBFs: `apply-changes` exited Ok but the output failed to parse, with the header followed by a page of zeros where the next OSMData blob header should have been. Root cause: `handle_copy_range_uring` flushed a partial accumulator buffer via `submit_current` before each CopyRange run, padding the `WriteFixed` to the next page boundary on disk. `logical_size` only tracked real bytes, so the padding became zero-filled gaps mid-file that `set_len(logical_size)` could not remove. Fixed by routing CopyRange bytes through the normal accumulator: `pread` reads directly into the current registered buffer at `current_len`, and only full (BUF_SIZE = page-aligned) buffers are submitted mid-stream. Preserves the writer's core invariant that only the final `flush_final` SQE is partial. Denmark `apply-changes --io-uring` output is now byte-identical to the buffered/parallel writer.
 
+### Library
+
+- **`PbfWriter::write_primitive_block_no_indexdata`.** New public method that writes an `OSMData` blob without the `BlobHeader.indexdata` / `BlobHeader.tagdata` fields. Useful for producing byte-for-byte fixtures matching third-party tools (osmium, osmosis) that don't emit these fields, and for exercising the `diff_element_stream` read-side fallback that only runs when at least one input is non-indexed. The `PrimitiveBlock` payload itself is unchanged; only the outer `BlobHeader` differs.
+
 ### Dependencies
 
 - **`roaring` removed.** Both remaining consumers (`check --refs`, `check --ids --full`) migrated to `IdSetDense`. One fewer transitive dependency for library users.

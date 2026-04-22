@@ -27,11 +27,11 @@ fn identical_files_no_changes() {
     let osc = dir.path().join("changes.osc.gz");
 
     let nodes = [
-        TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "a")] },
-        TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+        TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "a")], meta: None },
+        TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
     ];
     let ways = [
-        TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")] },
+        TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")], meta: None },
     ];
 
     write_test_pbf_sorted(&old, &nodes, &ways, &[]);
@@ -52,17 +52,17 @@ fn create_only() {
 
     write_test_pbf_sorted(
         &old,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] }],
+        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None }],
         &[],
         &[],
     );
     write_test_pbf_sorted(
         &new,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "new")] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "new")], meta: None },
         ],
-        &[TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")] }],
+        &[TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")], meta: None }],
         &[],
     );
 
@@ -82,15 +82,15 @@ fn delete_only() {
     write_test_pbf_sorted(
         &old,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
         ],
-        &[TestWay { id: 10, refs: vec![1, 2], tags: vec![] }],
+        &[TestWay { id: 10, refs: vec![1, 2], tags: vec![], meta: None }],
         &[],
     );
     write_test_pbf_sorted(
         &new,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] }],
+        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None }],
         &[],
         &[],
     );
@@ -110,13 +110,13 @@ fn modify_node_coords() {
 
     write_test_pbf_sorted(
         &old,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] }],
+        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None }],
         &[],
         &[],
     );
     write_test_pbf_sorted(
         &new,
-        &[TestNode { id: 1, lat: 150_000_000, lon: 250_000_000, tags: vec![] }],
+        &[TestNode { id: 1, lat: 150_000_000, lon: 250_000_000, tags: vec![], meta: None }],
         &[],
         &[],
     );
@@ -136,13 +136,13 @@ fn modify_node_tags() {
 
     write_test_pbf_sorted(
         &old,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "old")] }],
+        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "old")], meta: None }],
         &[],
         &[],
     );
     write_test_pbf_sorted(
         &new,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "new")] }],
+        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "new")], meta: None }],
         &[],
         &[],
     );
@@ -161,13 +161,13 @@ fn modify_way_refs() {
     write_test_pbf_sorted(
         &old,
         &[],
-        &[TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")] }],
+        &[TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")], meta: None }],
         &[],
     );
     write_test_pbf_sorted(
         &new,
         &[],
-        &[TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "primary")] }],
+        &[TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "primary")], meta: None }],
         &[],
     );
 
@@ -190,6 +190,7 @@ fn modify_relation_members() {
             id: 100,
             members: vec![TestMember { id: MemberId::Node(1), role: "stop" }],
             tags: vec![("type", "route")],
+            meta: None,
         }],
     );
     write_test_pbf_sorted(
@@ -203,6 +204,7 @@ fn modify_relation_members() {
                 TestMember { id: MemberId::Way(2), role: "outer" },
             ],
             tags: vec![("type", "route")],
+            meta: None,
         }],
     );
 
@@ -220,22 +222,22 @@ fn mixed_create_modify_delete() {
     write_test_pbf_sorted(
         &old,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "one")] },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "one")], meta: None },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![], meta: None },
         ],
-        &[TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "primary")] }],
+        &[TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "primary")], meta: None }],
         &[],
     );
     write_test_pbf_sorted(
         &new,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "ONE")] }, // modified tag
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] }, // unchanged
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "ONE")], meta: None }, // modified tag
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None }, // unchanged
             // node 3 deleted
-            TestNode { id: 4, lat: 130_000_000, lon: 230_000_000, tags: vec![] }, // created
+            TestNode { id: 4, lat: 130_000_000, lon: 230_000_000, tags: vec![], meta: None }, // created
         ],
-        &[TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")] }], // modified refs
+        &[TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")], meta: None }], // modified refs
         &[],
     );
 
@@ -257,24 +259,24 @@ fn roundtrip_with_merge() {
     write_test_pbf_sorted(
         &old,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "one")] },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![("to_delete", "yes")] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "one")], meta: None },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![("to_delete", "yes")], meta: None },
         ],
         &[
-            TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")] },
+            TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")], meta: None },
         ],
         &[],
     );
     write_test_pbf_sorted(
         &new,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "ONE")] },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
-            TestNode { id: 5, lat: 140_000_000, lon: 240_000_000, tags: vec![("new", "yes")] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "ONE")], meta: None },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
+            TestNode { id: 5, lat: 140_000_000, lon: 240_000_000, tags: vec![("new", "yes")], meta: None },
         ],
         &[
-            TestWay { id: 10, refs: vec![1, 2, 5], tags: vec![("highway", "secondary")] },
+            TestWay { id: 10, refs: vec![1, 2, 5], tags: vec![("highway", "secondary")], meta: None },
         ],
         &[],
     );
@@ -325,13 +327,13 @@ fn unsorted_input_rejected() {
     // Write old without sorted header, new with sorted header.
     write_test_pbf(
         &old,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] }],
+        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None }],
         &[],
         &[],
     );
     write_test_pbf_sorted(
         &new,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] }],
+        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None }],
         &[],
         &[],
     );

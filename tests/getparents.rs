@@ -34,14 +34,14 @@ fn ways_referencing_node() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![], meta: None },
         ],
         &[
-            TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")] },
-            TestWay { id: 11, refs: vec![2, 3], tags: vec![("highway", "secondary")] },
-            TestWay { id: 12, refs: vec![3], tags: vec![] },
+            TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")], meta: None },
+            TestWay { id: 11, refs: vec![2, 3], tags: vec![("highway", "secondary")], meta: None },
+            TestWay { id: 12, refs: vec![3], tags: vec![], meta: None },
         ],
         &[],
     );
@@ -68,8 +68,8 @@ fn relations_referencing_way() {
         &input,
         &[],
         &[
-            TestWay { id: 10, refs: vec![1, 2], tags: vec![] },
-            TestWay { id: 11, refs: vec![2, 3], tags: vec![] },
+            TestWay { id: 10, refs: vec![1, 2], tags: vec![], meta: None },
+            TestWay { id: 11, refs: vec![2, 3], tags: vec![], meta: None },
         ],
         &[
             TestRelation {
@@ -78,6 +78,7 @@ fn relations_referencing_way() {
                     TestMember { id: MemberId::Way(10), role: "outer" },
                 ],
                 tags: vec![("type", "multipolygon")],
+                meta: None,
             },
             TestRelation {
                 id: 101,
@@ -85,6 +86,7 @@ fn relations_referencing_way() {
                     TestMember { id: MemberId::Way(11), role: "inner" },
                 ],
                 tags: vec![("type", "multipolygon")],
+                meta: None,
             },
         ],
     );
@@ -108,11 +110,11 @@ fn add_self_includes_queried_objects() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "test")] },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "test")], meta: None },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
         ],
         &[
-            TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")] },
+            TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")], meta: None },
         ],
         &[],
     );
@@ -139,16 +141,17 @@ fn no_transitive_relations() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
         ],
         &[
-            TestWay { id: 10, refs: vec![1], tags: vec![] },
+            TestWay { id: 10, refs: vec![1], tags: vec![], meta: None },
         ],
         &[
             TestRelation {
                 id: 100,
                 members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
                 tags: vec![("type", "multipolygon")],
+                meta: None,
             },
         ],
     );
@@ -174,10 +177,10 @@ fn empty_result() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
         ],
         &[
-            TestWay { id: 10, refs: vec![1], tags: vec![] },
+            TestWay { id: 10, refs: vec![1], tags: vec![], meta: None },
         ],
         &[],
     );

@@ -196,10 +196,10 @@ fn sort_already_sorted() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "a")] },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "b")] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "a")], meta: None },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "b")], meta: None },
         ],
-        &[TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "path")] }],
+        &[TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "path")], meta: None }],
         &[TestRelation {
             id: 20,
             members: vec![common::TestMember {
@@ -207,6 +207,7 @@ fn sort_already_sorted() {
                 role: "outer",
             }],
             tags: vec![("type", "multipolygon")],
+            meta: None,
         }],
     );
 

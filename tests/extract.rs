@@ -5,9 +5,9 @@ mod common;
 
 use common::{
     node_ids_id_only as node_ids, read_all_elements_id_only as read_all_elements,
-    way_ids_id_only as way_ids, relation_ids_id_only as relation_ids,
-    read_header, write_test_pbf, write_test_pbf_sorted, TestMember, TestNode, TestRelation,
-    TestWay,
+    read_header, relation_ids_id_only as relation_ids, way_ids_id_only as way_ids,
+    write_multi_block_test_pbf, write_test_pbf, write_test_pbf_sorted, TestMember, TestNode,
+    TestRelation, TestWay,
 };
 use pbfhogg::cat::CleanAttrs;
 use pbfhogg::extract::{extract, parse_bbox, parse_geojson, ExtractStrategy, PolygonRings, Region};
@@ -38,18 +38,18 @@ const BBOX_STR: &str = "12.4,55.6,12.7,55.8";
 
 fn test_nodes() -> Vec<TestNode> {
     vec![
-        TestNode { id: 1, lat: 557_000_000, lon: 125_000_000, tags: vec![("name", "inside1")] },
-        TestNode { id: 2, lat: 540_000_000, lon: 125_000_000, tags: vec![("name", "outside_south")] },
-        TestNode { id: 3, lat: 556_500_000, lon: 125_500_000, tags: vec![("name", "inside2")] },
-        TestNode { id: 4, lat: 557_000_000, lon: 140_000_000, tags: vec![("name", "outside_east")] },
+        TestNode { id: 1, lat: 557_000_000, lon: 125_000_000, tags: vec![("name", "inside1")], meta: None },
+        TestNode { id: 2, lat: 540_000_000, lon: 125_000_000, tags: vec![("name", "outside_south")], meta: None },
+        TestNode { id: 3, lat: 556_500_000, lon: 125_500_000, tags: vec![("name", "inside2")], meta: None },
+        TestNode { id: 4, lat: 557_000_000, lon: 140_000_000, tags: vec![("name", "outside_east")], meta: None },
     ]
 }
 
 fn test_ways() -> Vec<TestWay> {
     vec![
-        TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")] },
-        TestWay { id: 11, refs: vec![2, 4], tags: vec![("highway", "secondary")] },
-        TestWay { id: 12, refs: vec![1, 3], tags: vec![("highway", "tertiary")] },
+        TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")], meta: None },
+        TestWay { id: 11, refs: vec![2, 4], tags: vec![("highway", "secondary")], meta: None },
+        TestWay { id: 12, refs: vec![1, 3], tags: vec![("highway", "tertiary")], meta: None },
     ]
 }
 
@@ -59,11 +59,13 @@ fn test_relations() -> Vec<TestRelation> {
             id: 100,
             members: vec![TestMember { id: MemberId::Node(1), role: "stop" }],
             tags: vec![("type", "route")],
+            meta: None,
         },
         TestRelation {
             id: 101,
             members: vec![TestMember { id: MemberId::Node(4), role: "stop" }],
             tags: vec![("type", "route")],
+            meta: None,
         },
     ]
 }
@@ -177,6 +179,7 @@ fn simple_includes_relations_with_matched_ways() {
         id: 200,
         members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
         tags: vec![("type", "multipolygon")],
+        meta: None,
     }];
 
     write_test_pbf(&input, &test_nodes(), &test_ways(), &relations);
@@ -412,6 +415,7 @@ fn smart_includes_multipolygon_way_members() {
             TestMember { id: MemberId::Way(11), role: "inner" },
         ],
         tags: vec![("type", "multipolygon")],
+        meta: None,
     }];
 
     write_test_pbf(&input, &test_nodes(), &test_ways(), &relations);
@@ -444,6 +448,7 @@ fn smart_includes_boundary_node_members() {
             TestMember { id: MemberId::Node(4), role: "admin_centre" },
         ],
         tags: vec![("type", "boundary"), ("boundary", "administrative")],
+        meta: None,
     }];
 
     write_test_pbf(&input, &test_nodes(), &test_ways(), &relations);
@@ -473,6 +478,7 @@ fn smart_ignores_non_qualifying_relations() {
             TestMember { id: MemberId::Way(11), role: "backward" },
         ],
         tags: vec![("type", "route")],
+        meta: None,
     }];
 
     write_test_pbf(&input, &test_nodes(), &test_ways(), &relations);
@@ -662,6 +668,7 @@ fn simple_sorted_includes_relations_with_matched_ways() {
         id: 200,
         members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
         tags: vec![("type", "multipolygon")],
+        meta: None,
     }];
 
     write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &relations);
@@ -832,4 +839,78 @@ fn multi_extract_from_config_file() {
     let cb = read_all_elements(&slots[1].output);
     assert_eq!(node_ids(&cb), vec![4]);
     assert_eq!(all_stats[1].nodes_in_bbox, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-blob raw passthrough for `extract --strategy simple`
+// ---------------------------------------------------------------------------
+//
+// `extract_simple` at `src/commands/extract/simple.rs:276-284` tags
+// node blobs for raw passthrough when the region is a bbox, `--clean`
+// is a no-op, and the blob's per-blob bbox (from indexdata) is fully
+// contained in the extract bbox. With a single-blob fixture every
+// node shares one bbox, so the raw-passthrough path only ever fires
+// all-or-nothing. This test forces multiple node blobs where the
+// first is fully inside and the second is fully outside the extract
+// bbox, proving the per-blob classification picks the right blobs.
+//
+// `ExtractStats` does not expose a blob-level passthrough counter, so
+// the assertion is correctness-based: all inside-bbox nodes must
+// survive exactly once, no outside-bbox node escapes. A bug in the
+// classify/passthrough path would surface as a wrong node set.
+
+#[test]
+fn simple_multi_blob_bbox_partitioning() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    // Extract bbox: lon 12.4..12.7, lat 55.6..55.8. 10 "inside" nodes
+    // stay in (lon 12.5, lat 55.65..55.79); 10 "outside" nodes are far
+    // south (lat 40.0) in a distinct longitude. With block_size=10
+    // these land in two separate node blobs - exactly the split the
+    // passthrough path is supposed to classify.
+    let mut all_nodes: Vec<TestNode> = (0_i32..10)
+        .map(|i| TestNode {
+            id: i64::from(i) + 1,
+            lat: 556_500_000 + i * 100_000,
+            lon: 125_000_000,
+            tags: vec![],
+            meta: None,
+        })
+        .collect();
+    all_nodes.extend((0_i32..10).map(|i| TestNode {
+        id: i64::from(i) + 100,
+        lat: 400_000_000,
+        lon: 500_000_000,
+        tags: vec![],
+        meta: None,
+    }));
+
+    write_multi_block_test_pbf(&input, &all_nodes, &[], &[], 10);
+
+    let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
+    let region = Region::Bbox(bbox);
+    let stats = extract(
+        &input,
+        &output,
+        &region,
+        ExtractStrategy::Simple,
+        true,
+        &CleanAttrs::default(),
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("extract");
+
+    let c = read_all_elements(&output);
+    // Exactly the inside blob's nodes survive; outside blob entirely
+    // absent.
+    let got: Vec<i64> = node_ids(&c);
+    let want: Vec<i64> = (1..=10).collect();
+    assert_eq!(got, want, "wrong node set survived the per-blob classify");
+    assert_eq!(stats.nodes_in_bbox, 10);
+    assert_eq!(stats.nodes_from_ways, 0);
 }

@@ -803,19 +803,18 @@ Pinned as `#[ignore]` regression tests in
   `merge_type_transition_node_to_relation_skipping_ways` now pass
   in both sweeps.
 
-- [ ] **`check --ids` (`verify_ids`) reports spurious TypeOrder
-  violations on non-indexed input.** `check_type_order` in
-  `src/commands/check/verify_ids.rs` validates that
-  `max(node_offsets) < min(way_offsets) < min(relation_offsets)`
-  using the schedule from `build_classify_schedules_split`. For
-  non-indexed PBFs that schedule builder replicates every blob
-  into all three per-kind schedules (`src/scan/classify.rs:140-149`),
-  so the offset comparisons span replicated copies rather than
-  per-type blob sets and produce spurious violations on correctly-
-  ordered input. Parity test: 10-node fixture -> 0 violations
-  indexed, 2 violations non-indexed. Fix options: gate the
-  offset-based check on `indexed == true`, or swap to an
-  element-kind-based ordering check that decodes blob contents.
+- [x] ~~**`check --ids` (`verify_ids`) reports spurious TypeOrder
+  violations on non-indexed input.**~~ - landed 2026-04-23. Fixed
+  by gating the offset-based `check_type_order` in
+  `verify_ids_full_parallel` on `indexed`. Non-indexed `--full`
+  runs lose the offset-based pre-check; the sequential (non-
+  `--full`) path already has an element-level type-order check
+  that works correctly on any input, so users who need actual
+  type-ordering verification on non-indexed input have a path.
+  `check_ids_non_indexed_parity` unignored. A richer solution
+  (emit per-blob kind from the phase decoders and reconstruct
+  per-kind offset ranges) is possible but not worth the
+  complexity for the `--force` path today.
 
 - [ ] **Property-based testing via `proptest`** *(recommended first
   pass before any `cargo-fuzz` investment)*. Same class of bugs the

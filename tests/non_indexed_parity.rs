@@ -524,20 +524,17 @@ fn show_element_non_indexed_parity() {
 // check --ids (verify_ids)
 // ---------------------------------------------------------------------------
 //
-// KNOWN FAILURE, 2026-04-22. The `check_type_order` function compares
-// max(node_offsets) vs min(way_offsets) vs min(relation_offsets) from
-// the schedule built by `build_classify_schedules_split`. For
-// non-indexed PBFs the builder replicates every blob into all three
-// per-kind schedules, so those comparisons span replicated copies
-// rather than the actual per-type blob sets - producing spurious
-// TypeOrder violations even when the underlying file is correctly
-// ordered. Verified: 10-node fixture reports 0 violations indexed,
-// 2 violations non-indexed. Fix: gate the offset-based type-order
-// check on indexed input, or swap to an element-kind-based ordering
-// check that decodes blob contents.
+// Pins parity between indexed and non-indexed `check --ids --full`
+// reports. The earlier regression fired spurious `TypeOrder`
+// violations on non-indexed input because the parallel path's
+// `check_type_order` compared max/min offsets across the per-kind
+// schedules, and `build_classify_schedules_split` replicates every
+// non-indexed blob into all three schedules. Fixed 2026-04-23 by
+// gating the offset-based check on `indexed`; non-indexed `--full`
+// runs skip it and rely on the sequential element-level check for
+// the non-`--full` path.
 
 #[test]
-#[ignore = "check --ids fires spurious TypeOrder violations on non-indexed schedules (see TODO.md)"]
 fn check_ids_non_indexed_parity() {
     let dir = TempDir::new().expect("tempdir");
     let in_idx = dir.path().join("in_idx.osm.pbf");

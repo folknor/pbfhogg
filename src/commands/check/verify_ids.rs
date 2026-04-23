@@ -520,7 +520,20 @@ fn verify_ids_full_parallel(path: &Path, opts: &VerifyIdsOptions<'_>) -> Result<
     // max(way_offsets) < min(relation_offsets). Uses the schedule directly
     // (no extra I/O); relies on build_classify_schedules_split delivering
     // offsets in file order, which it does.
-    check_type_order(&node_schedule, &way_schedule, &rel_schedule, &mut violations, &mut total_violations, opts.max_errors);
+    //
+    // Non-indexed inputs: skip. `build_classify_schedules_split`
+    // replicates every blob into all three per-kind schedules when
+    // indexdata is missing (there's no cheap way to know a blob's
+    // element kind from headers alone), so the offset comparisons
+    // above span the same offset set three times and produce spurious
+    // violations on correctly-ordered files. The sequential
+    // (non-full) path's element-level `check_type_order` still runs
+    // when users need actual type-ordering verification on
+    // non-indexed input; `--full` under `--force` just loses the
+    // offset-based pre-check.
+    if indexed {
+        check_type_order(&node_schedule, &way_schedule, &rel_schedule, &mut violations, &mut total_violations, opts.max_errors);
+    }
 
     // Phase 1 - nodes
     if type_filter.nodes {

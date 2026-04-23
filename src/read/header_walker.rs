@@ -122,6 +122,15 @@ impl HeaderWalker {
         &self.file
     }
 
+    /// Total file size captured at `open()` time. Callers can use this
+    /// to validate per-blob `data_offset + data_size <= file_size`
+    /// before handing a schedule to parallel pread workers, catching
+    /// truncation / corrupt-header cases up front rather than at
+    /// `read_exact_at`.
+    pub(crate) fn file_size(&self) -> u64 {
+        self.file_size
+    }
+
     /// Read the next blob's header and advance the internal offset past the
     /// data payload without reading it. Returns `None` at EOF.
     ///

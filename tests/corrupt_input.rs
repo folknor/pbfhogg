@@ -213,6 +213,52 @@ fn cat_rejects_oversized_header_length() {
     );
 }
 
+/// `build_classify_schedule*` rejects a schedule entry whose blob
+/// body extends past EOF, rather than accepting the entry and then
+/// failing at `read_exact_at` in a pread worker much later. The fix
+/// adds an explicit `meta.data_offset + meta.data_size <= file_size`
+/// check in both schedule builders. This test drives the check via
+/// `check_refs`, which routes through `build_classify_schedules_split`.
+#[cfg(feature = "commands")]
+#[test]
+fn check_refs_rejects_schedule_entry_past_eof() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("truncated.osm.pbf");
+
+    // Write a valid header-only PBF plus one data blob, then truncate
+    // in the middle of the data blob's body. The walker still parses
+    // the BlobHeader (which claims the full data_size), so the
+    // schedule builder sees a `(data_offset, data_size)` pair whose
+    // end lies past the truncated EOF.
+    let full = write_one_block_pbf();
+    // `write_one_block_pbf` always produces a file > 60 bytes (header
+    // blob + data blob); cutting the last 20 bytes puts EOF squarely
+    // inside the data blob's body rather than on a clean blob boundary.
+    assert!(full.len() > 60);
+    let truncated = &full[..full.len() - 20];
+    std::fs::write(&input, truncated).unwrap();
+
+    // `check --refs` routes through `build_classify_schedules_split`.
+    // Pre-fix: the schedule gets built cleanly, workers fail later
+    // with an opaque `read_exact_at` UnexpectedEof. Post-fix: the
+    // schedule builder catches the mismatch up front.
+    let result = pbfhogg::check::refs::check_refs(
+        &input,
+        false, // check_relations
+        false, // show_ids
+        false, // direct_io
+    );
+    let err = match result {
+        Ok(_) => panic!("expected check_refs to error on truncated PBF"),
+        Err(e) => e,
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("data_size") || msg.contains("file is only"),
+        "expected schedule-builder truncation error, got: {msg}",
+    );
+}
+
 /// `HeaderWalker::next_header` (via `inspect`'s index-only fast path)
 /// rejects an oversized length prefix with HeaderTooBig rather than
 /// attempting a huge allocation on the two-pread fallback.

@@ -71,6 +71,7 @@ pub(crate) fn build_classify_schedule(
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
 
     crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_START");
+    let file_size = walker.file_size();
     let mut schedule: Vec<ScheduleEntry> = Vec::new();
     let mut seq: usize = 0;
     while let Some(meta) = walker.next_header()? {
@@ -79,6 +80,19 @@ pub(crate) fn build_classify_schedule(
             if let Some(idx) = &meta.index {
                 if idx.kind != filter_kind { continue; }
             }
+        }
+        // Reject bogus blob-header data_size before it flows to pread
+        // workers: a truncated file or a corrupt BlobHeader advertising
+        // a data_size that extends past EOF would otherwise fail much
+        // later in `read_exact_at` with an opaque UnexpectedEof, after
+        // workers have already accepted the schedule. Cheap integer
+        // check here catches the whole family.
+        if meta.data_offset + meta.data_size as u64 > file_size {
+            return Err(format!(
+                "blob at offset {} claims data_size {} but file is only {} bytes",
+                meta.data_offset, meta.data_size, file_size,
+            )
+            .into());
         }
         schedule.push((seq, meta.data_offset, meta.data_size));
         seq += 1;
@@ -122,11 +136,23 @@ pub(crate) fn build_classify_schedules_split(
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
 
     crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_START");
+    let file_size = walker.file_size();
     let mut nodes: Vec<ScheduleEntry> = Vec::new();
     let mut ways: Vec<ScheduleEntry> = Vec::new();
     let mut rels: Vec<ScheduleEntry> = Vec::new();
     while let Some(meta) = walker.next_header()? {
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) { continue; }
+        // See `build_classify_schedule` for the rationale: reject
+        // past-EOF blob bodies before the schedule is handed to pread
+        // workers. Replicated across both schedule builders since they
+        // share the same downstream consumer pattern.
+        if meta.data_offset + meta.data_size as u64 > file_size {
+            return Err(format!(
+                "blob at offset {} claims data_size {} but file is only {} bytes",
+                meta.data_offset, meta.data_size, file_size,
+            )
+            .into());
+        }
         match meta.index.as_ref().map(|i| i.kind) {
             Some(crate::blob_meta::ElemKind::Node) => {
                 nodes.push((nodes.len(), meta.data_offset, meta.data_size));

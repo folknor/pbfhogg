@@ -41,21 +41,11 @@ sequential path would have left unchanged.
 
 **Rule: do not convert any pipelined path to sequential decode.**
 If the 4.7× regression didn't flip for the lightest workload
-(getparents - mostly `IdSetDense::get`), it won't flip for anything
+(getparents - mostly `IdSet::get`), it won't flip for anything
 heavier. Adding to the list of pipelined callers is fine; removing
 from it is not.
 
 ## Callers
-
-### `renumber`
-
-- **Path:** `src/commands/renumber/*`, `reader.into_blocks_pipelined()`
-- **Scale:** 11.6 B elements / 600 K blocks at planet; sequential
-  ID-remap on the consumer side
-- **Per-block work:** light (lookup + rewrite); decode dominates
-- **Status:** being rewritten as an external-join architecture
-  (`src/commands/renumber/` module). When that lands, renumber will
-  no longer be a pipelined caller.
 
 ### `getid --add-referenced` pass 2
 
@@ -63,7 +53,7 @@ from it is not.
 - **Scale:** niche. The single-pass include / invert path is the
   common one and uses `HeaderWalker` + raw-frame reads, no pipelined
   decode at all.
-- **Per-block work:** light - `IdSetDense::get` per element, most
+- **Per-block work:** light - `IdSet::get` per element, most
   skipped, a few re-encoded through `BlockBuilder`
 
 ### `tags-filter -R <expr>` single-pass
@@ -115,6 +105,24 @@ from it is not.
   reverted - 4.7× regression on Denmark. This result is the
   load-bearing evidence for the "do not convert" rule above.
 
+### `time-filter`
+
+- **Path:** `src/commands/time_filter/mod.rs` - both history mode
+  (`for_each_pipelined`) and snapshot mode (`into_blocks_pipelined`
+  + batch dispatch)
+- **Scale:** whole-file scan; every element touched
+- **Per-block work:** medium - timestamp compare, `PendingGroup`
+  latest-version tracking, re-encode survivors through `BlockBuilder`
+
+### `check --ids` streaming default
+
+- **Path:** `src/commands/check/verify_ids.rs`,
+  `reader.for_each_pipelined(...)`
+- **Scale:** whole-file scan
+- **Per-block work:** light (ID ordering + uniqueness check)
+- **Related:** `--full` (bitmap duplicate detection) switches to
+  `parallel_classify_phase`; see the list below.
+
 ## Callers that use something else (deliberately not pipelined)
 
 These paths were evaluated and chose non-pipelined primitives, and
@@ -127,12 +135,17 @@ should stay that way:
 - `check --refs`, `check --ids --full` - `parallel_classify_phase`
 - `tags-filter` two-pass - pread workers
 - `extract` (simple / complete / smart / multi) - pread workers
-- `sort`, `merge` - direct pread per blob
+- `sort` - direct pread per blob
 - `diff`, `derive_changes` (aka `diff --format osc`) - `StreamingBlocks`
-  for the sequential path; shard-based pread for the `-j N` parallel
-  path
-- `apply-changes` - pread with a classify schedule
-- `external_join` / ALTW stages 2-4 - pread workers
+  for the sequential path; shard-based pread for the parallel path
+  (`DiffOptions::num_shards >= 2`)
+- `apply-changes` - descriptor-first scanner + worker pool, pread
+  per blob (`src/commands/apply_changes/`)
+- `renumber` - external-join style stages (`pass1.rs`, `stage2.rs`,
+  `wire_rewrite.rs`, `relations.rs`). Previously a pipelined caller;
+  converted to pread workers when the external-join rewrite landed.
+- ALTW external stages 1-4 (`src/commands/altw/external/`) -
+  pread workers
 - `getid` single-pass (include / invert) - `HeaderWalker` +
   raw-frame reads
 

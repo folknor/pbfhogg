@@ -111,19 +111,21 @@ Two-pass blob-level permutation sort.
 
 ### apply-changes (merge)
 
-Single-pass batch pipeline applying an OSC diff to a sorted PBF. OSC parsed into `CompactDiffOverlay` (arena-packed, `FxHashMap` index). `DiffRanges` enables O(log n) overlap checks.
+Descriptor-first streaming pipeline applying an OSC diff to a sorted PBF (`src/commands/apply_changes/`). OSC parsed into `CompactDiffOverlay` (arena-packed, `FxHashMap` index, defined in `src/osc/parse.rs`). `DiffRanges` (`diff_ranges.rs`) enables O(log n) overlap checks.
 
-3 phases per batch:
-1. **Parallel classify** (rayon) - indexdata fast-path skips ~92% of blobs at Denmark scale
-2. **Sequential assign** - passthrough / false-positive / rewrite decision per blob
-3. **Streaming rewrite + output** - rayon tasks own their `PrimitiveBlock`, results reordered for sequential output. Gap creates interleaved at sorted positions.
+Stages:
+1. **Scanner** (`scanner.rs`) - walks blob headers, emits a `BlobDescriptor` per blob classified as `Passthrough` or `Candidate` using indexdata + `DiffRanges`. Indexdata fast-path skips ~92% of blobs at Denmark scale.
+2. **Workers** (`rewrite.rs`, `rewrite_block.rs`) - pull candidate descriptors, perform precise overlap check, emit rewritten `OwnedBlock`s or demote to false-positive passthrough.
+3. **Drain / stream output** (`drain.rs`, `stream_output.rs`, `streaming.rs`) - results reordered to file order; consecutive passthroughs coalesced; gap creates interleaved at sorted positions.
 
-Optional `--locations-on-ways`: preserves/updates inline way-node coordinates through the merge.
+Optional `--locations-on-ways` (`node_locations.rs`): preserves/updates inline way-node coordinates through the merge.
 
 ### diff / derive-changes
 
-Two-pointer merge-join over two sorted PBFs via `StreamingBlocks` (sequential readers). Three phases per element type (nodes, ways, relations). Each element compared by content equality (coordinates, tags, refs, members).
+Two-pointer merge-join over two sorted PBFs. Three phases per element type (nodes, ways, relations). Each element compared by content equality (coordinates, tags, refs, members).
 
+- Sequential path (`diff/mod.rs`, `derive.rs`): `StreamingBlocks` merge-join on the calling thread.
+- Sharded parallel path (`diff/parallel.rs`, `derive_parallel.rs`): `DiffOptions::num_shards >= 2` partitions the ID space across shards and dispatches per-shard merge-joins in parallel.
 - `diff` → text or summary output
 - `diff --format osc` (derive-changes) → OSC XML output
 
@@ -155,7 +157,7 @@ Also supports `--input-kind osc` for filtering OSC change files.
 
 Embeds node coordinates in ways. Three index strategies:
 
-**Dense** (default): file-backed mmap, direct addressing by node ID. Pass 0 builds `IdSetDense` of way-referenced nodes, pass 1 populates index via node-only scanner (lock-free parallel writes), pass 2 enriches ways.
+**Dense** (default): file-backed mmap, direct addressing by node ID. Pass 0 builds an `IdSet` of way-referenced nodes, pass 1 populates index via node-only scanner (lock-free parallel writes), pass 2 enriches ways.
 
 **Sparse**: chunk-indexed sparse array (~540 MB RAM). Batched sorted access converts random I/O to sequential scans.
 
@@ -169,7 +171,10 @@ Bounded memory (<2 GB), all sequential I/O, uses temp disk (~4 GB Denmark, ~112 
 
 ### renumber
 
-Single-pass sequential: 3 `FxHashMap` (node/way/relation) for old→new ID mapping. Remaps cross-references in way node refs and relation members.
+Multi-stage parallel rewrite using rank-indexed `IdSet` bitsets (not hashmaps) for old→new ID mapping (`src/commands/renumber/`):
+1. **Pass 1** (`pass1.rs`) - parallel wire-format node rewriter across work-stealing workers; each shard populates an `IdSet` of seen node IDs.
+2. **Stage 2** (`stage2.rs`, `wire_rewrite.rs`) - parallel way assembly; builds a separate `IdSet` for ways and remaps node refs via rank-indexed lookup.
+3. **Relations** (`relations.rs`) - sequential collect of relation IDs, then parallel rewrite remapping member refs across all three kinds.
 
 ### time-filter
 
@@ -182,13 +187,13 @@ Header-only scan (fast path on indexed PBFs - reads blob headers without decompr
 ### check
 
 - `--ids`: sequential scan checking ID uniqueness and ordering. Optional `--full` bitmap for duplicate detection.
-- `--refs`: referential integrity via `IdSetDense` (roaring bitmap). Optional `--check-relations`.
+- `--refs`: referential integrity via `IdSet` (custom chunked bitset, `src/idset.rs`). Optional `--check-relations`.
 
 ### build-geocode-index
 
 4-pass build pipeline:
 1. Relations (admin boundaries)
-2. Referenced node collection (`IdSetDense`)
+2. Referenced node collection (`IdSet`)
 3. Nodes + ways fused scan (compact rank-indexed coord array, streaming data files)
 4. Bucketed S2 cell assignment (256 temp-file buckets per level)
 

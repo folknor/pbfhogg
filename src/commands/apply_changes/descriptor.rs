@@ -117,13 +117,20 @@ pub(super) enum DrainItem {
         index: BlobIndex,
         tagdata: Option<Box<[u8]>>,
     },
-    /// Owned frame bytes from a `--direct-io` passthrough pread. Drain
-    /// writes via `write_raw_owned`, no re-framing needed.
+    /// Owned frame bytes from a passthrough pread. Drain writes via
+    /// `write_raw_owned`, no re-framing needed. Emitted by the scanner
+    /// passthrough path under `--direct-io` and (since 2026-04-23) by
+    /// the consumer-build false-positive path where `use_copy_range`
+    /// is false. `count` is the element count the blob contributes to
+    /// the output - the drain credits it to `base_<kind>` so merge
+    /// stats match all-features parity regardless of which
+    /// passthrough path the blob took.
     OwnedBytes {
         seq: u64,
         frame_bytes: Vec<u8>,
         kind: ElemKind,
         id_range: (i64, i64),
+        count: u64,
     },
     /// Rewritten blob, with each output block already framed by the
     /// worker (compression + protobuf framing applied in-line via
@@ -164,14 +171,16 @@ impl WorkerOutput {
     /// for the unified drain stream. The drain splices the raw frame
     /// via `copy_file_range`; the descriptor's index/tagdata carry the
     /// frame boundaries forward.
-    pub(super) fn into_drain_item(self) -> DrainItem {
+    ///
+    /// `fallback_count` is used only when the descriptor has no
+    /// indexdata (non-indexed blob under `--force`) - the worker
+    /// supplies the element count walked from the already-parsed
+    /// block so the drain can credit `base_<kind>` correctly (merge
+    /// stats parity). For indexed blobs this value is ignored in
+    /// favour of `desc.index.count`.
+    pub(super) fn into_drain_item(self, fallback_count: u64) -> DrainItem {
         match self {
             WorkerOutput::FalsePositive(desc) => {
-                // FalsePositive only fires for indexed Candidate blobs
-                // (under --force the worker still has indexdata via scan
-                // result). The fallback `(min_id, max_id) == (0, 0)`
-                // path keeps drain from panicking if the descriptor is
-                // mis-shaped, but the production path always has Some.
                 let seq = desc.seq;
                 let frame_start = desc.frame_start;
                 let frame_len = desc.frame_len;
@@ -181,7 +190,7 @@ impl WorkerOutput {
                     kind,
                     min_id: id_range.0,
                     max_id: id_range.1,
-                    count: 0,
+                    count: fallback_count,
                     bbox: None,
                 });
                 DrainItem::CopyRange {

@@ -350,7 +350,11 @@ fn worker_loop(
             ScannedBlob::Passthrough(desc) => {
                 // Only seen here under --direct-io output (scanner routes
                 // splice-capable passthroughs straight to the drain).
-                handle_owned_passthrough(file, &desc, drain_tx, counters, &mut read_buf)?;
+                // Scanner only emits Passthrough for indexed blobs
+                // (`scanner.rs::is_fastpath` requires `has_indexdata`),
+                // so `desc.index.count` is authoritative.
+                let count = desc.index.as_ref().map_or(0, |i| i.count);
+                handle_owned_passthrough(file, &desc, drain_tx, counters, &mut read_buf, count)?;
             }
         }
     }
@@ -468,10 +472,19 @@ fn handle_candidate(
 
     if !overlaps {
         counters.blobs_false_positive.fetch_add(1, Ordering::Relaxed);
+        // The drain needs an element count for per-kind `base_*` stats
+        // (gap #7). Indexed blobs carry it in `desc.index.count`; for
+        // non-indexed blobs (-force path) we walk the already-parsed
+        // block. Counting is cheap next to the decompress + parse we
+        // just did.
+        let blob_count = desc
+            .index
+            .as_ref()
+            .map_or_else(|| count_block_elements(&block), |i| i.count);
         if use_copy_range {
             return send_drain(
                 drain_tx,
-                WorkerOutput::FalsePositive(desc.clone()).into_drain_item(),
+                WorkerOutput::FalsePositive(desc.clone()).into_drain_item(blob_count),
             );
         }
         // Consumer build (no `linux-direct-io` feature) or `--direct-io`
@@ -480,7 +493,7 @@ fn handle_candidate(
         // (pread the full frame, ship the bytes via
         // `DrainItem::OwnedBytes`). `handle_owned_passthrough` does
         // exactly that for the scanner-side passthrough case.
-        return handle_owned_passthrough(file, desc, drain_tx, counters, read_buf);
+        return handle_owned_passthrough(file, desc, drain_tx, counters, read_buf, blob_count);
     }
 
     // For indexed blobs, trust the indexdata-derived kind + range. For
@@ -552,6 +565,13 @@ fn handle_candidate(
     )
 }
 
+/// Count the elements in an already-parsed block. Used on the
+/// non-indexed false-positive path to supply a `base_<kind>` count to
+/// the drain when `desc.index.count` is unavailable (gap #7 parity).
+fn count_block_elements(block: &crate::PrimitiveBlock) -> u64 {
+    u64::try_from(block.elements_skip_metadata().count()).unwrap_or(u64::MAX)
+}
+
 /// Recover a non-indexed blob's dominant element kind and (min, max)
 /// id range by walking the already-parsed block. Used on the --force
 /// path where the scanner has to emit a placeholder `kind=Node` and
@@ -614,14 +634,18 @@ fn infer_kind_and_range(block: &crate::PrimitiveBlock) -> (ElemKind, i64, i64) {
     }
 }
 
-/// `--direct-io` passthrough: pread the **full framed bytes** so the
-/// drain can `write_raw_owned` without re-framing.
+/// `--direct-io` (or consumer-build false-positive) passthrough: pread
+/// the **full framed bytes** so the drain can `write_raw_owned` without
+/// re-framing. `count` is the blob's element count; the drain uses it
+/// to credit `base_<kind>` stats and must not be zero on the indexed
+/// path or per-kind merge totals drift (gap #7).
 fn handle_owned_passthrough(
     file: &std::fs::File,
     desc: &BlobDescriptor,
     drain_tx: &mpsc::SyncSender<DrainItem>,
     counters: &WorkerCounters,
     read_buf: &mut Vec<u8>,
+    count: u64,
 ) -> Result<()> {
     counters.blobs_processed.fetch_add(1, Ordering::Relaxed);
     counters
@@ -642,6 +666,7 @@ fn handle_owned_passthrough(
             frame_bytes,
             kind: desc.kind,
             id_range,
+            count,
         },
     )
 }

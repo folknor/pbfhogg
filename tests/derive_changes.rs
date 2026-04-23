@@ -873,15 +873,15 @@ fn derive_changes_jobs_parity_roundtrips_to_same_output() {
     assert_elements_equivalent(&out_par, &new);
 }
 
-// KNOWN FAILURE, 2026-04-22. This passes under the all-features sweep
-// but fails in the consumer feature sweep (`--no-default-features
-// --features commands`): `MergeStats::total_elements()` reports 16
-// while the merged output actually contains 34 elements. Output
-// correctness still holds; the bug is in stats/accounting, not the
-// merge result. Keep the invariant test in-tree but ignored until the
-// consumer accounting path is fixed.
+// Pins the merge-stats parity contract between the all-features and
+// consumer feature sweeps. Previously the consumer build routed every
+// passthrough through `DrainItem::OwnedBytes`, whose drain arm did
+// not credit per-kind `base_*` counters (only `CopyRange` did), so
+// `MergeStats::total_elements()` was short by the passthrough count
+// in that build. Fixed 2026-04-23 by giving `OwnedBytes` an explicit
+// element-count field and having the drain's `OwnedBytes` arm bump
+// `base_<kind>` by it (see `drain.rs::dispatch_variant`).
 #[test]
-#[ignore = "consumer sweep: MergeStats totals drift from actual output counts (see TODO.md)"]
 fn merge_stats_match_output_counts_after_roundtrip() {
     let dir = TempDir::new().expect("tempdir");
     let old = dir.path().join("old.osm.pbf");

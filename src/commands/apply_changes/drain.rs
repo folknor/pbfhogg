@@ -596,8 +596,9 @@ fn dispatch_variant(
         DrainItem::OwnedBytes {
             seq: _,
             frame_bytes,
-            kind: _,
+            kind,
             id_range: _,
+            count,
         } => {
             // Flush the copy_range coalescer so on-disk order is right.
             flush_copy_range(state, cfg, writer, counters)?;
@@ -607,6 +608,19 @@ fn dispatch_variant(
             stats.blobs_passthrough += 1;
             #[allow(clippy::cast_possible_truncation)]
             stats.blob_sizes.push(frame_len as u32);
+            // Credit per-kind base_* stats the same way the CopyRange arm
+            // above does. Before this line `OwnedBytes` dropped per-kind
+            // counts entirely, so any merge that routed passthroughs
+            // through this arm (consumer build, `--direct-io`, or a
+            // false-positive under `use_copy_range=false`) reported
+            // `base_nodes=base_ways=base_relations=0` for the
+            // passthrough portion even though the output contained the
+            // elements correctly.
+            match kind {
+                ElemKind::Node => stats.base_nodes += count,
+                ElemKind::Way => stats.base_ways += count,
+                ElemKind::Relation => stats.base_relations += count,
+            }
         }
         DrainItem::Rewritten {
             seq: _,

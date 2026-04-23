@@ -775,22 +775,29 @@ Pinned as `#[ignore]` regression tests in
   (only `CopyRange` does) - that's squarely gap #7 (merge stats
   drift) and tracked separately.
 
-- [ ] **`merge` summary/stat counters diverge between all-features and
-  consumer builds on the same fixture.** While running
-  `tests/derive_changes.rs::derive_changes_jobs_parity_roundtrips_to_same_output`,
-  both sweeps produced element-equivalent outputs, but the merge
-  summaries differed sharply. All-features reported `34 elements
-  written`, `Base: 22 nodes, 8 ways`; consumer reported `16 elements
-  written`, `Base: 6 nodes, 6 ways` for the same logical roundtrip.
-  This looks like stats/reporting drift or feature-gated counting
-  semantics rather than data corruption, but if these counters are
-  user-visible they need a parity pin. That pin now exists as
-  `tests/derive_changes.rs::merge_stats_match_output_counts_after_roundtrip`
-  and fails exactly this way in the consumer sweep. The same wrong
-  16-element / 6-node / 6-way accounting also shows up in
-  `tests/apply_changes_invariants.rs::merge_jobs_parity_without_locations_on_ways`,
-  which means the drift is broader than the separate
-  `--locations-on-ways` CopyRange bug.
+- [x] ~~**`merge` summary/stat counters diverge between all-features
+  and consumer builds on the same fixture.**~~ - landed 2026-04-23.
+  Root cause was narrow: the drain's `DrainItem::OwnedBytes` arm
+  (`drain.rs::dispatch_variant`) did not credit per-kind `base_*`
+  counters, only bumping `blobs_passthrough` / `bytes_passthrough`.
+  Only the `CopyRange` arm bumped `base_<kind> += index.count`.
+  Consumer builds force `use_copy_range=false` (no `linux-direct-io`
+  feature), so every passthrough flowed through `OwnedBytes` and the
+  per-kind counters stayed at zero. `--direct-io` runs were
+  similarly affected. Fix: add `count: u64` to
+  `DrainItem::OwnedBytes`; drain's `OwnedBytes` arm now mirrors
+  `CopyRange`'s per-kind match. Both producers thread the count
+  through: the scanner-passthrough worker branch reads
+  `desc.index.count`; the worker false-positive branch reads
+  `desc.index.count` (indexed) or walks the already-parsed block
+  via a new `count_block_elements` helper (non-indexed `--force`).
+  `WorkerOutput::into_drain_item` gained a matching `fallback_count`
+  parameter for the non-indexed `--force` CopyRange fast-path. The
+  pinned `merge_stats_match_output_counts_after_roundtrip` is
+  unignored; `merge_stats_accuracy`,
+  `merge_gap_creates_between_blobs`, and
+  `merge_type_transition_node_to_relation_skipping_ways` now pass
+  in both sweeps.
 
 - [ ] **`check --ids` (`verify_ids`) reports spurious TypeOrder
   violations on non-indexed input.** `check_type_order` in

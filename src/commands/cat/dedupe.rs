@@ -210,7 +210,19 @@ pub fn merge_pbf(
     while i < entries.len() {
         if overlaps[i] {
             let start = i;
-            while i < entries.len() && overlaps[i] {
+            let run_kind = entries[i].index.kind;
+            // Overlap runs must contain exactly one element kind.
+            // `detect_overlaps` only sets `overlaps[j]` based on same-kind
+            // adjacency, so the only way a kind boundary lands mid-run
+            // here is when two same-kind overlap-runs sit adjacent in
+            // file order (e.g. a node overlap-pair followed immediately
+            // by a way overlap-pair). Grouping those into one
+            // `write_overlap_run` call hands `entries[0].index.kind` to
+            // `sweep_merge_dedup`, whose kind-gated extract closure then
+            // silently drops every element whose kind doesn't match -
+            // the exact shape of the `merge_pbf([A, A])` regression
+            // where ways and relations disappeared.
+            while i < entries.len() && overlaps[i] && entries[i].index.kind == run_kind {
                 i += 1;
             }
             write_overlap_run(

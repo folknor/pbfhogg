@@ -711,22 +711,26 @@ Pinned as `#[ignore]` regression tests in
   emission. Indexed blobs skip the walk (trust indexdata).
   `apply_changes_non_indexed_parity` unignored.
 
-- [ ] **`merge_pbf([A, A])` drops ways and relations.** Observed
-  during Batch A parity-test development: merging an indexed PBF
-  with itself via `merge_pbf` and `--force` produces a node-only
-  output (original 10 nodes + 4 ways + 1 relation -> 10 nodes, 0
-  ways, 0 relations after merge). Parity with non-indexed twin
-  holds (both drop ways/rels identically), so the bug is in the
-  indexed path. The `merge_pbf` implementation in
-  `src/commands/cat/dedupe.rs` probably treats blob-identical ways
-  across input files as "same blob already emitted" without
-  considering that both blobs exist in the input list. The
-  subsequent parity test in `non_indexed_parity.rs` uses disjoint
-  inputs and passes. Pinned as
-  `merge_same_input_preserves_ways_and_relations` in
-  `tests/merge_pbf.rs`. Real-world `cat --dedupe` on regional PBFs
-  would be affected only if two inputs carry byte-identical way
-  blobs - unlikely in practice but latent.
+- [x] ~~**`merge_pbf([A, A])` drops ways and relations.**~~ - landed
+  2026-04-23. Original diagnosis was off. The bug wasn't in how
+  blob-identical inputs were deduplicated; it was in how the
+  pass-2 loop *grouped* blobs into overlap runs. `detect_overlaps`
+  correctly sets `overlaps[j]=true` only between same-kind
+  adjacent blobs (nodes with nodes, ways with ways). But the outer
+  loop that walks consecutive `overlaps[i]=true` entries didn't
+  check kind, so when a node overlap-pair sat immediately before a
+  way overlap-pair in file order, both pairs merged into one
+  `write_overlap_run` call. That call took `entries[0].index.kind`
+  and handed it to `sweep_merge_dedup`'s kind-gated extract
+  closure, which silently dropped every element whose kind didn't
+  match - i.e. every way and relation when the first entry was a
+  node. Fix: add `entries[i].index.kind == run_kind` to the
+  overlap-run walker in `cat/dedupe.rs`.
+  `merge_same_input_preserves_ways_and_relations` unignored.
+  Real-world exposure was broader than the original pin suggested:
+  any `cat --dedupe` or `merge_pbf` run where same-kind overlap
+  pairs sat adjacent across kind boundaries would have silently
+  lost one side of the boundary.
 
 - [x] ~~**`extract --strategy complete-ways --force` on non-indexed
   input produces empty output.**~~ - landed 2026-04-23. Same fix

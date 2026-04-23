@@ -229,8 +229,16 @@ fn merge_empty_files() {
     assert_eq!(stats.duplicates_removed, 0);
 }
 
+// Pins that `merge_pbf` with the same input file supplied twice
+// preserves every element type. The earlier regression dropped ways
+// and relations because `cat/dedupe.rs`'s pass-2 loop grouped
+// consecutive `overlaps[i]=true` entries into one `write_overlap_run`
+// call without checking that the run stayed within a single element
+// kind. Two back-to-back same-kind overlap pairs (node|node, way|way)
+// merged into one run, which then inherited `entries[0].index.kind`
+// and dropped elements of every other kind. Fixed 2026-04-23 by
+// requiring the overlap-run walker to also match `index.kind`.
 #[test]
-#[ignore = "merge_pbf([A, A]) drops ways and relations (see TODO.md)"]
 fn merge_same_input_preserves_ways_and_relations() {
     let dir = TempDir::new().expect("tempdir");
     let a = dir.path().join("a.osm.pbf");

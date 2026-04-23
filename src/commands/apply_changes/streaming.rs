@@ -352,9 +352,12 @@ fn worker_loop(
                 // splice-capable passthroughs straight to the drain).
                 // Scanner only emits Passthrough for indexed blobs
                 // (`scanner.rs::is_fastpath` requires `has_indexdata`),
-                // so `desc.index.count` is authoritative.
+                // so `desc.index.count` is authoritative and
+                // desc.kind/id_range are authoritative (no override).
                 let count = desc.index.as_ref().map_or(0, |i| i.count);
-                handle_owned_passthrough(file, &desc, drain_tx, counters, &mut read_buf, count)?;
+                handle_owned_passthrough(
+                    file, &desc, drain_tx, counters, &mut read_buf, count, None,
+                )?;
             }
         }
     }
@@ -486,10 +489,27 @@ fn handle_candidate(
             .index
             .as_ref()
             .map_or_else(|| count_block_elements(&block), |i| i.count);
+        // On the --force path the scanner fills `desc` with a
+        // placeholder `kind=Node` and `id_range=None` because it can't
+        // distinguish blob kinds without decompressing. Recover both
+        // from the parsed block so the drain credits `base_*` on the
+        // real kind and type-transition logic doesn't fire spurious
+        // Way->Node/Relation->Node flushes that would drain remaining
+        // upserts as trailing creates. Indexed descriptors carry
+        // authoritative values already.
+        let (effective_kind, effective_id_range) = if desc.index.is_some() {
+            (desc.kind, desc.id_range.unwrap_or((0, 0)))
+        } else {
+            let (k, min_id, max_id) = infer_kind_and_range(&block);
+            (k, (min_id, max_id))
+        };
         if use_copy_range {
+            let mut patched = desc.clone();
+            patched.kind = effective_kind;
+            patched.id_range = Some(effective_id_range);
             return send_drain(
                 drain_tx,
-                WorkerOutput::FalsePositive(desc.clone()).into_drain_item(blob_count),
+                WorkerOutput::FalsePositive(patched).into_drain_item(blob_count),
             );
         }
         // Consumer build (no `linux-direct-io` feature) or `--direct-io`
@@ -498,7 +518,15 @@ fn handle_candidate(
         // (pread the full frame, ship the bytes via
         // `DrainItem::OwnedBytes`). `handle_owned_passthrough` does
         // exactly that for the scanner-side passthrough case.
-        return handle_owned_passthrough(file, desc, drain_tx, counters, read_buf, blob_count);
+        return handle_owned_passthrough(
+            file,
+            desc,
+            drain_tx,
+            counters,
+            read_buf,
+            blob_count,
+            Some((effective_kind, effective_id_range)),
+        );
     }
 
     // For indexed blobs, trust the indexdata-derived kind + range. For
@@ -650,6 +678,12 @@ fn infer_kind_and_range(block: &crate::PrimitiveBlock) -> (ElemKind, i64, i64) {
 /// re-framing. `count` is the blob's element count; the drain uses it
 /// to credit `base_<kind>` stats and must not be zero on the indexed
 /// path or per-kind merge totals drift (gap #7).
+///
+/// `override_kind_range`: scanner-side passthrough (indexed blob) leaves
+/// this `None` and lets desc's authoritative kind + range flow through.
+/// Worker-side false-positive on a non-indexed blob supplies the kind +
+/// range walked from the parsed block, overriding desc's placeholder
+/// `kind=Node` and `id_range=None` so the drain routes on the real kind.
 fn handle_owned_passthrough(
     file: &std::fs::File,
     desc: &BlobDescriptor,
@@ -657,6 +691,7 @@ fn handle_owned_passthrough(
     counters: &WorkerCounters,
     read_buf: &mut Vec<u8>,
     count: u64,
+    override_kind_range: Option<(ElemKind, (i64, i64))>,
 ) -> Result<()> {
     counters.blobs_processed.fetch_add(1, Ordering::Relaxed);
     counters
@@ -668,14 +703,15 @@ fn handle_owned_passthrough(
     // Move the bytes into the DrainItem; reset read_buf for the next
     // pread without keeping the per-blob allocation alive.
     let frame_bytes = std::mem::take(read_buf);
-    let id_range = desc.id_range.unwrap_or((0, 0));
+    let (kind, id_range) = override_kind_range
+        .unwrap_or_else(|| (desc.kind, desc.id_range.unwrap_or((0, 0))));
 
     send_drain(
         drain_tx,
         DrainItem::OwnedBytes {
             seq: desc.seq,
             frame_bytes,
-            kind: desc.kind,
+            kind,
             id_range,
             count,
         },

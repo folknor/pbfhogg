@@ -400,6 +400,7 @@ fn mixed_create_modify_delete() {
 }
 
 /// Full roundtrip: old → derive_changes → osc → merge(old, osc) → result ≈ new
+#[allow(clippy::too_many_lines)]
 #[test]
 fn roundtrip_with_merge() {
     let dir = TempDir::new().expect("tempdir");
@@ -750,6 +751,7 @@ fn increment_version_and_update_timestamp_combined() {
     );
 }
 
+#[allow(clippy::cast_possible_wrap)]
 fn write_roundtrip_multiblob_pair(old: &std::path::Path, new: &std::path::Path) {
     let mut old_nodes = generate_nodes(24, 1);
     for (i, node) in old_nodes.iter_mut().enumerate() {

@@ -241,6 +241,7 @@ fn sort_wrong_type_order() {
     assert_eq!(way_tags, vec!["residential", "primary"]);
 }
 
+#[allow(clippy::cast_possible_truncation)]
 #[test]
 fn sort_overlap_rewrite_normalizes_dense_node_changeset_minus_one() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -496,6 +497,96 @@ fn sort_many_overlapping_blobs() {
     }
 
     assert!(read_header(&output).is_sorted(), "output missing Sort.Type_then_ID");
+}
+
+/// Regression: overlap-runs must not cross element-kind boundaries.
+///
+/// Fixture layout (four blobs, two adjacent same-kind overlap pairs
+/// separated by a kind boundary):
+///   blob 0: Nodes ids 1,3,5,7,9     (odd)
+///   blob 1: Nodes ids 2,4,6,8,10    (even, overlaps blob 0)
+///   blob 2: Ways  ids 101,103,105   (odd)
+///   blob 3: Ways  ids 102,104,106   (even, overlaps blob 2)
+///
+/// `detect_overlaps` is kind-gated, so only (0,1) and (2,3) overlap.
+/// But the pass-2 walker that builds overlap runs used to consume
+/// consecutive `overlaps[i]=true` entries without checking kind, and
+/// `write_overlap_run` then took `entries[0].index.kind` and handed
+/// the whole slice to a kind-gated sweep. Result: ways got silently
+/// dropped because the extract closure's `_ => {}` arm ate every
+/// way element when the run was classified as Node.
+///
+/// Twin of the `cat::dedupe::merge_pbf` bug fixed in commit `486d4d1`.
+#[test]
+fn sort_overlap_runs_scoped_to_single_kind() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("kind_boundary.osm.pbf");
+    let output = dir.path().join("sorted.osm.pbf");
+
+    let file = std::fs::File::create(&input).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = block_builder::HeaderBuilder::new().build().expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+
+    // Blob 0: nodes with odd ids 1,3,5,7,9.
+    for id in (1..=9).step_by(2) {
+        bb.add_node(id, 0, 0, std::iter::empty::<(&str, &str)>(), None);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    // Blob 1: nodes with even ids 2,4,6,8,10. Overlaps blob 0.
+    for id in (2..=10).step_by(2) {
+        bb.add_node(id, 0, 0, std::iter::empty::<(&str, &str)>(), None);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    // Blob 2: ways with odd ids 101,103,105.
+    for id in (101..=105).step_by(2) {
+        bb.add_way(id, std::iter::empty::<(&str, &str)>(), &[1, 2], None);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    // Blob 3: ways with even ids 102,104,106. Overlaps blob 2.
+    for id in (102..=106).step_by(2) {
+        bb.add_way(id, std::iter::empty::<(&str, &str)>(), &[1, 2], None);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    writer.flush().expect("flush");
+
+    pbfhogg::commands::sort::sort(
+        &input,
+        &output,
+        &SortOptions {
+            compression: Compression::default(),
+            direct_io: false,
+            io_uring: false,
+            force: true,
+        },
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("sort");
+
+    let result = read_all_elements_with_coords(&output);
+    assert_eq!(result.nodes.len(), 10, "expected 10 nodes, got {}", result.nodes.len());
+    assert_eq!(result.ways.len(), 6, "expected 6 ways, got {}", result.ways.len());
+    assert_sorted(&result);
+
+    let node_ids: Vec<i64> = result.nodes.iter().map(|(id, _, _, _)| *id).collect();
+    assert_eq!(node_ids, (1..=10).collect::<Vec<_>>());
+    let way_ids: Vec<i64> = result.ways.iter().map(|w| w.0).collect();
+    assert_eq!(way_ids, (101..=106).collect::<Vec<_>>());
 }
 
 #[test]

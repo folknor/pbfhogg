@@ -376,6 +376,11 @@ fn worker_loop(
 /// extraction (Node + LOW), parse, precise check, false-positive or
 /// rewrite.
 #[allow(clippy::too_many_arguments)]
+// Sequential slow-path handler - the stages (pread, decompress, coord
+// extract, parse, precise check, rewrite) share enough scratch state
+// (read_buf, decompress_buf, tuple scratches, local_coords) that a split
+// would fragment the descriptor pipeline without clarifying it.
+#[allow(clippy::too_many_lines)]
 fn handle_candidate(
     file: &std::fs::File,
     desc: &BlobDescriptor,

@@ -1006,7 +1006,7 @@ Findings from a multi-agent Opus audit of 0.3.0 high-churn areas before the rele
 - smaller commands: 2 HIGH (sort/mod.rs:178 direct parallel of dedupe fix, show_element.rs:53 missing is_sorted check), 1 MEDIUM (getid removeid missing require_indexdata gate)
 
 **Headline items worth landing first (cross-verified, real-effect, clear fix shape):**
-1. `commands/sort/mod.rs:178-181` - direct parallel of the already-fixed `cat::dedupe` kind-boundary bug. Add `&& entries[i].index.kind == run_kind` guard.
+1. ~~`commands/sort/mod.rs:178-181` - direct parallel of the already-fixed `cat::dedupe` kind-boundary bug. Add `&& entries[i].index.kind == run_kind` guard.~~ **LANDED.** Regression `sort_overlap_runs_scoped_to_single_kind` in `tests/sort.rs` pins the fix.
 2. `read/header_walker.rs:149-164` + `read/raw_frame.rs:65-67,124-127` - missing MAX_BLOB_HEADER_SIZE caps. Real DoS/OOM vector on adversarial input; add the same guard `BlobReader::read_blob_header` has.
 3. `apply_changes/scanner.rs:162,188` - under `--force --locations-on-ways` non-indexed, LocationsOnWays is silently stripped from base ways. Gate the combination at setup, or fix the barrier to recover from placeholder kinds.
 4. `commands/inspect/show_element.rs:53-57` - missing `is_sorted()` check produces false negatives on history/unsorted PBFs.
@@ -1247,7 +1247,7 @@ Findings from a multi-agent Opus audit of 0.3.0 high-churn areas before the rele
 
 ### Smaller commands
 
-- [ ] **`commands/sort/mod.rs:178-181` - HIGH.** The overlap-run extension loop `while i < entries.len() && overlaps[i] { i += 1; }` is missing the same `&& entries[i].index.kind == run_kind` guard that was added to `cat::dedupe::merge_pbf` at `dedupe.rs:225` this cycle. Two adjacent same-kind overlap-runs at a type boundary (a node overlap-pair followed immediately by a way overlap-pair, both `overlaps[i]=true`) merge into a single `write_overlap_run` call; `write_overlap_run` uses `entries[0].index.kind` and the kind-gated extract closure silently drops every element whose kind doesn't match. **Direct parallel of the already-fixed dedupe bug, in its twin command.** Trigger: `sort` on a PBF where the last node blob overlaps its neighbor, the first way blob also has an overlap, and both overlap-runs are adjacent in sort order.
+- [x] ~~**`commands/sort/mod.rs:178-181` - HIGH.**~~ *(landed 2026-04-23; same fix shape as `cat::dedupe` commit `486d4d1`, regression `sort_overlap_runs_scoped_to_single_kind` in `tests/sort.rs` pre-fix 0 ways out of 6 → post-fix 10/10 nodes + 6/6 ways preserved in both all-features and consumer sweeps.)*
 
 - [ ] **`commands/inspect/show_element.rs:53-57` - HIGH.** Early-exit `if idx.min_id > target_id { return Ok(false); }` assumes same-kind blobs are ID-sorted, but the function never checks `header().is_sorted()`. On unsorted or history PBFs the target can live in a later same-kind blob whose `min_id` is lower than a preceding blob with `min_id > target_id` - `show_element` returns "not found" for elements that exist. Trigger: `inspect --show n<id>` on a non-sorted PBF where the target node sits after a blob with a higher `min_id` in file order.
 

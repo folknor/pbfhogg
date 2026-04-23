@@ -176,7 +176,19 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderO
     while i < entries.len() {
         if overlaps[i] {
             let start = i;
-            while i < entries.len() && overlaps[i] {
+            let run_kind = entries[i].index.kind;
+            // Overlap runs must contain exactly one element kind.
+            // `detect_overlaps` only sets `overlaps[j]` based on
+            // same-kind adjacency, but two same-kind overlap-runs
+            // can sit adjacent in file order (e.g. a node/node
+            // overlap pair immediately followed by a way/way
+            // overlap pair, both with overlaps[i]=true). Walking
+            // them into one `write_overlap_run` call hands
+            // `entries[0].index.kind` to the kind-gated sweep,
+            // whose extract closure then silently drops every
+            // off-kind element. Twin of the `cat::dedupe::merge_pbf`
+            // bug fixed in `486d4d1`.
+            while i < entries.len() && overlaps[i] && entries[i].index.kind == run_kind {
                 i += 1;
             }
             write_overlap_run(

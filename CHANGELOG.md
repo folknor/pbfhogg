@@ -35,6 +35,7 @@
 - **Geocode `simplify_ring` Douglas-Peucker divergence** could exceed `max_vertices` because the cost and marking passes used different distance metrics. Both now use clamped segment projection.
 - **io_uring writer corrupted output on the `CopyRange` fast-path.** `apply-changes --io-uring` on indexed input produced structurally-broken PBFs (zero-filled gap mid-file). Output is now byte-identical to the buffered and parallel-pwrite writers.
 - **`cat --dedupe` silently dropped elements at kind boundaries** when same-kind overlap pairs sat adjacent to a kind transition.
+- **`sort` silently dropped elements at kind boundaries**, twin of the `cat --dedupe` bug above. The pass-2 overlap-run walker grouped consecutive `overlaps[i]=true` entries without checking kind; a node/node overlap pair followed immediately by a way/way overlap pair merged into one run and `write_overlap_run`'s kind-gated sweep silently discarded the off-kind elements.
 - **Concurrent pbfhogg processes against the same scratch directory** could collide on temp file names; names now include the PID.
 - **Temp files leaked on assembly error paths.** Cleanup now runs on every exit path.
 

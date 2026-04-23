@@ -75,6 +75,7 @@ fn run_merge_with_jobs(
     .expect("merge")
 }
 
+#[allow(clippy::cast_possible_wrap)]
 fn write_merge_jobs_fixture(base: &Path, osc: &Path) {
     let mut nodes = generate_nodes(24, 1);
     for (i, node) in nodes.iter_mut().enumerate() {

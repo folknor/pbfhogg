@@ -878,6 +878,7 @@ fn basic_locations_added_sparse() {
     assert!(found_way, "way not found in output");
 }
 
+#[allow(clippy::cast_possible_wrap)]
 #[test]
 fn backend_parity_dense_sparse_external_auto() {
     let dir = TempDir::new().expect("tempdir");

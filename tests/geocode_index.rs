@@ -228,6 +228,7 @@ fn write_synthetic_postal_boundary_input(path: &Path) {
     );
 }
 
+#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
 fn generate_nonzero_nodes(count: usize, start_id: i64) -> Vec<TestNode> {
     (0..count)
         .map(|i| TestNode {
@@ -240,6 +241,7 @@ fn generate_nonzero_nodes(count: usize, start_id: i64) -> Vec<TestNode> {
         .collect()
 }
 
+#[allow(clippy::cast_possible_wrap)]
 fn write_oversized_street_input(path: &Path) {
     let node_count = 65_536;
     let nodes = generate_nonzero_nodes(node_count, 1);
@@ -258,6 +260,7 @@ fn write_oversized_street_input(path: &Path) {
     );
 }
 
+#[allow(clippy::cast_possible_wrap)]
 fn write_oversized_interpolation_input(path: &Path) {
     let node_count = 65_536;
     let nodes = generate_nonzero_nodes(node_count, 1);

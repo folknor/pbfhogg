@@ -176,7 +176,6 @@ fn pass1_worker(
                 &decompress_buf,
                 base_new_id,
                 id_set,
-                task.min_id < 0,
                 &mut reframe_buf,
                 &mut group_ranges_scratch,
                 &mut scalar_fields_scratch,

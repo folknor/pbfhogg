@@ -30,7 +30,6 @@ pub(super) fn reframe_dense_with_new_ids(
     decompressed: &[u8],
     base_new_id: i64,
     id_set: &IdSet,
-    check_negative_ids: bool,
     output: &mut Vec<u8>,
     // Reusable scratch buffers - hoisted to worker level.
     group_ranges_scratch: &mut Vec<(usize, usize)>,
@@ -123,7 +122,14 @@ pub(super) fn reframe_dense_with_new_ids(
         while id_cursor.remaining() > 0 {
             let delta = id_cursor.read_sint64().map_err(|e| e.to_string())?;
             old_id += delta;
-            if check_negative_ids && old_id < 0 {
+            // Unconditional check: trusting indexdata `min_id >= 0` to
+            // skip this gate was a bug - stale or hand-edited indexdata
+            // that understates the real range lets a negative id flow
+            // into `set_atomic`, which panics in `chunk_for_atomic` with
+            // an opaque "pre_allocate only covers..." message rather
+            // than the clear error users expect. See
+            // DEVIATIONS.md > renumber for the policy rationale.
+            if old_id < 0 {
                 return Err(format!(
                     "renumber requires non-negative input ids. \
                      Input contains node id {old_id}. \
@@ -181,7 +187,6 @@ pub(super) fn reframe_ways_with_new_ids(
     refs_scratch: &mut Vec<u8>,
     group_scratch: &mut Vec<u8>,
     reframed_way_scratch: &mut Vec<u8>,
-    check_negative_ids: bool,
     group_ranges_scratch: &mut Vec<(usize, usize)>,
     scalar_fields_scratch: &mut Vec<u8>,
 ) -> std::result::Result<(u64, u64), String> {
@@ -261,7 +266,12 @@ pub(super) fn reframe_ways_with_new_ids(
                     }
                 }
 
-                if check_negative_ids && old_way_id < 0 {
+                // Unconditional check: see the node-side rationale above.
+                // A negative way id here that slipped past stale indexdata
+                // would be silently dropped by `way_id_set.set` (which
+                // guards `id < 0`), producing phantom orphan refs in
+                // relations that still point at the old negative id.
+                if old_way_id < 0 {
                     return Err(format!(
                         "renumber requires non-negative input ids. \
                          Input contains way id {old_way_id}. \

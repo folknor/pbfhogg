@@ -201,7 +201,6 @@ fn stage2d_worker(
                 &mut refs_scratch,
                 &mut group_scratch,
                 &mut reframed_way_scratch,
-                task.min_id < 0,
                 &mut way_group_ranges,
                 &mut way_scalar_fields,
             )?;

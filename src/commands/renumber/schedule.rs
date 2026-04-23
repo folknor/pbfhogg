@@ -15,10 +15,8 @@ pub(super) struct BlobTask {
     pub(super) data_offset: u64,
     pub(super) data_size: usize,
     pub(super) element_count: u64,
-    /// Source blob's min element ID from indexdata. Used for per-block
-    /// negative-id skip: if min_id >= 0, all IDs are non-negative.
-    pub(super) min_id: i64,
-    /// Source blob's max element ID from indexdata.
+    /// Source blob's max element ID from indexdata. Used to compute
+    /// per-stage id-space offsets before decode.
     pub(super) max_id: i64,
     /// Source blob's spatial bbox (node blobs only).
     pub(super) bbox: Option<crate::blob_meta::BlobBbox>,
@@ -72,7 +70,6 @@ pub(super) fn build_all_blob_schedules(
             data_offset: meta.data_offset,
             data_size: meta.data_size,
             element_count: idx.count,
-            min_id: idx.min_id,
             max_id: idx.max_id,
             bbox: idx.bbox,
         });

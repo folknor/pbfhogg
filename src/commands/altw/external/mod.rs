@@ -171,12 +171,35 @@ pub fn external_join(
     force: bool,
     overrides: &HeaderOverrides,
 ) -> Result<Stats> {
-    require_indexdata(
+    let has_indexdata = require_indexdata(
         input,
         direct_io,
         force,
         "external join requires indexdata for efficient blob filtering",
     )?;
+
+    // External-join cannot function without indexdata: the stage-1/2
+    // rank-based bucket ranges are computed from per-blob `(min_id,
+    // max_id)` derived from indexdata, and `scan_blob_metadata` hard-
+    // errors if any OsmData blob lacks it. Under `--force` the
+    // indexdata check upstream returns `Ok(false)` instead of a clear
+    // error, which previously let the command proceed and then fail
+    // at `blob_meta.rs:50` with an opaque "OsmData blob missing
+    // indexdata" message. Reject the combination up front with a
+    // clear migration hint.
+    if !has_indexdata {
+        return Err(
+            "add-locations-to-ways --index-type external requires indexed input; \
+             --force is not supported on this path because the rank-based bucket \
+             ranges depend on per-blob indexdata.\n\n\
+             Generate an indexed PBF first:\n\n\
+             \x20 pbfhogg cat <input.osm.pbf> -o indexed.osm.pbf\n\n\
+             Then run add-locations-to-ways against the indexed output, or use \
+             --index-type dense or sparse (which decode every blob anyway and \
+             therefore tolerate --force)."
+                .into(),
+        );
+    }
 
     {
         let reader = ElementReader::open(input, direct_io)?;

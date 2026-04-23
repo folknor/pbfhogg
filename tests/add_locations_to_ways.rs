@@ -1077,3 +1077,57 @@ fn missing_node_refs_get_zero_coordinates_sparse() {
     }
     assert!(found_way, "way not found in output");
 }
+
+/// Regression: `--index-type external --force` against a non-indexed
+/// PBF must reject the combination up front with a clear migration
+/// hint, rather than accept `--force` at `require_indexdata` and then
+/// fail much later at `scan_blob_metadata` with an opaque
+/// "OsmData blob missing indexdata" error. External join depends on
+/// per-blob indexdata to compute rank-based bucket ranges, so
+/// `--force` cannot meaningfully apply to this path.
+#[test]
+fn altw_external_rejects_force_on_non_indexed() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    common::write_test_pbf_non_indexed(
+        &input,
+        &[
+            TestNode { id: 1, lat: 550_000_000, lon: 120_000_000, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 551_000_000, lon: 121_000_000, tags: vec![], meta: None },
+            TestNode { id: 3, lat: 552_000_000, lon: 122_000_000, tags: vec![], meta: None },
+        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2, 3],
+            tags: vec![("highway", "residential")],
+            meta: None,
+        }],
+        &[],
+    );
+
+    let result = add_locations_to_ways(
+        &input,
+        &output,
+        true,
+        Compression::default(),
+        false,
+        true, // force
+        &pbfhogg::HeaderOverrides::default(),
+        pbfhogg::altw::IndexType::External,
+    );
+    let err = match result {
+        Ok(_) => panic!("expected external-join to reject --force on non-indexed PBF"),
+        Err(e) => e,
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("external") && msg.contains("indexed"),
+        "expected setup-time rejection mentioning external + indexed, got: {msg}",
+    );
+    assert!(
+        msg.contains("pbfhogg cat"),
+        "error should point at the indexed-generation workflow, got: {msg}",
+    );
+}

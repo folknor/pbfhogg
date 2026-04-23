@@ -90,12 +90,6 @@ Need a pbfhogg CLI flag to exist before brokkr can forward it:
   snapshot-range axis is a single pairing. Downloading another
   snapshot 2-4 weeks away would let us measure diff-wall vs
   snapshot-delta-size empirically.
-- [x] ~~**Multi-OSC merge-changes at europe / germany**~~ - landed
-  2026-04-22. europe now carries OSCs 4715..4722 (8 entries), germany
-  carries 4705..4712 (8 entries). 7-OSC ranges (4716..4722 and
-  4706..4712 respectively) match planet's 4914..4920 shape so the
-  parallel-parse plan can iterate at smaller scales. `overnight.sh`
-  queues both ranges (streaming + `--simplify` paths).
 
 ### Un-benched permutations (low priority)
 
@@ -118,35 +112,8 @@ Known to work, no performance question open, but not in the results DB:
   Synthetic benchmarks, intentionally excluded from the README user
   surface. Periodically-useful diagnostic tools; not a validation
   target.
-## Next up (2026-04-13)
-
-- [x] ~~**`--allow-missing` for apply-changes**~~ - **not needed (2026-04-21).**
-  Audit confirmed every missing-element case is already tolerated silently:
-  modify-on-missing inserts, delete-on-missing is a no-op, create-on-existing
-  overwrites, and way/relation refs to absent nodes get `(0, 0)` under
-  `--locations-on-ways` with a `loc_missing` count in the summary.
-  Independent-reader verification against the vendored
-  `research/osmium-tool/src/command_apply_changes.cpp` confirmed osmium
-  matches this permissive behaviour (not a deviation - positive parity),
-  so the scenario table lives in
-  [reference/osmium-parity.md](reference/osmium-parity.md#apply-changes-permissive-missing-element-semantics-parity)
-  alongside osmium file:line anchors. Three new invariants in
-  `tests/apply_changes_invariants.rs` pin the pbfhogg behaviour.
-  Incremental extract works against current `apply-changes` with no flag.
-  The related stretch item below ("Incremental extract update") is
-  already unblocked.
 
 ## Performance
-
-- [x] ~~**Parallelise `assemble_osc` gzip**~~ - landed. New
-  `ParallelGzipWriter` (`src/write/parallel_gzip.rs`) buffers 2 MB
-  chunks, dispatches each to a worker-pool for independent gzip,
-  writes concatenated RFC-1952 multi-member output. Three in-crate
-  `.osc.gz` readers (`osc::parse`, `merge-changes`, `tags_filter
-  --osc`) migrated to `MultiGzDecoder` in the same commit so
-  cross-command composition stays intact. Planet `diff --format osc
-  -j 16` wall to be remeasured (prior baseline UUID `9b3fc2b9`,
-  313.8 s with a 32.8 s single-threaded `assemble_osc` tail).
 
 - [ ] **Consider auto-enabling diff `-j`**. Currently `pbfhogg diff`
   defaults to `-j 1` (sequential). `-j 0` maps to
@@ -570,17 +537,6 @@ per-iteration allocations remain across the codebase, ordered by impact:
 
 See `reference/performance.md` for consolidated baselines.
 
-- [x] ~~**Diff element_stream fallback path untested**~~ - landed
-  2026-04-22. `PbfWriter::write_primitive_block_no_indexdata` added as
-  public library API (bypasses the `scan_block_ids` / `scan_block_tags`
-  path that populates `BlobHeader.indexdata` / `.tagdata`). New
-  `write_test_pbf_non_indexed` helper in `tests/common/mod.rs` drives
-  the three `diff_element_stream` pairings (old non-indexed, new
-  non-indexed, both non-indexed) plus a parity test that asserts the
-  fallback path produces identical text + stats to the optimized
-  `diff_block_pair` on the same logical input. Verbose mode pinned
-  separately.
-
 - [x] ~~**Test fixture infrastructure**~~ - landed 2026-04-22.
   `TestNode` / `TestWay` / `TestRelation` extended with
   `meta: Option<TestMeta>` (default `None`); ~428 struct literals across
@@ -598,14 +554,6 @@ See `reference/performance.md` for consolidated baselines.
 
 ### Tests enabled by the new fixtures - landed 2026-04-22
 
-Eight gaps surfaced by parallel reviewer-agent sweeps after the
-fixture work. All landed as integration tests across `tests/cat.rs`,
-`tests/diff.rs`, `tests/extract.rs`, `tests/getid.rs`,
-`tests/read_paths.rs`, `tests/inspect.rs`, `tests/tags_filter.rs`,
-new files `tests/tags_count.rs` and `tests/non_indexed_parity.rs`.
-Two of the eight landed with `#[ignore]`-gated tests pinning real
-correctness bugs (see "Known correctness gaps" above).
-
 - [ ] **Parallel classify correctness for `check --refs`.** The
   other three parallel-classify commands (`inspect --nodes`,
   `tags-filter` two-pass, `tags-count`) got `jobs=1` vs `jobs=4`
@@ -619,140 +567,13 @@ correctness bugs (see "Known correctness gaps" above).
   tests - but worth revisiting if check-refs ever grows a jobs
   flag.
 
-### Next test-coverage batches (2026-04-22)
-
-The first round of tests-enabled-by-fixtures surfaced two real
-correctness bugs (see "Known correctness gaps"). Batches below
-continue the same pattern; each is self-contained and can land on
-its own commit.
-
-- [x] ~~**Batch A: non-indexed `--force` parity for the rest of
-  the command surface.**~~ - landed 2026-04-22. Added parity
-  tests in `tests/non_indexed_parity.rs` for `derive_changes`,
-  `renumber_external`, `check_refs`, `verify_ids`,
-  `show_element`, `extract_multi --CompleteWays`, and `merge_pbf`.
-  Passing: derive_changes, check_refs, show_element, merge_pbf
-  (with disjoint inputs). Renumber pinned via error-message test
-  (it explicitly rejects non-indexed). Three `#[ignore]`-gated
-  tests added to pin new bugs: verify_ids spurious TypeOrder,
-  extract_multi CompleteWays empty output, merge_pbf A+A drops
-  ways/rels. All five bugs surfaced by parity testing are listed
-  under "Known correctness gaps" above.
-- [x] ~~**Batch B: structural roundtrip invariants.**~~ - landed
-  2026-04-22 in `tests/roundtrip_invariants.rs`. Four tests pin
-  sort idempotence, extract idempotence, derive/apply roundtrip,
-  and tags_filter idempotence. `tags_filter` composability
-  scoped down to idempotence because expression OR-combination
-  semantics aren't identical to chained filtering (filtered
-  output feeds later pass with already-thinned element set).
-- [x] ~~**Batch C: blob-layout parity.**~~ - landed 2026-04-22 in
-  the same file. Three tests pin read-path equivalence across
-  block_size=1/5/100 layouts, `tags_filter` output equivalence
-  across the same layouts, and `diff` stats parity across
-  mixed-layout pairings.
-- [x] ~~**Batch D: edge-case / boundary coverage.**~~ - landed
-  2026-04-22 in `tests/edge_cases.rs`. Nine tests covering empty
-  PBF (header only), zero-ref ways, zero-member relations,
-  empty-string tag values, empty-string tag keys,
-  relation-of-relation transitivity, large positive ids, and the
-  8000-entity BlockBuilder capacity boundary. No bugs found;
-  edge cases all behaved correctly.
-- [x] ~~**Batch E: compression-level parity.**~~ - landed
-  2026-04-22 in `tests/roundtrip_invariants.rs`. Three tests
-  pin that `sort` and `tags_filter` outputs are element-
-  equivalent across `Compression::None`, `Compression::Zlib(6)`,
-  and `Compression::Zstd(3)`, plus a dedicated None-vs-Zlib
-  read-back pin. No bugs found - codec is correctly isolated
-  from element encoding. Byte-size comparisons deliberately
-  omitted; on a 10-node fixture None often lands smaller than
-  Zlib by virtue of DEFLATE framing overhead.
-
 ### Known correctness gaps surfaced by parity tests (2026-04-22)
 
-Pinned as `#[ignore]` regression tests in
-`tests/non_indexed_parity.rs`,
-`tests/apply_changes_invariants.rs`, and
-`tests/derive_changes.rs`, and
-`tests/merge_pbf.rs` - remove the ignore attribute to reproduce.
-
-- [x] ~~**`extract --strategy simple --force` on non-indexed input
-  double-emits elements.**~~ - landed 2026-04-23. Root cause: simple's
-  sorted single-pass writer runs three phases (nodes, ways, relations)
-  and every non-indexed blob is in all three per-kind schedules (kind
-  unknown until decompress). Each phase called the kind-agnostic
-  `extract_block_pass2`, which emits elements whose ids are in the
-  monotonically-growing id sets - so one non-indexed blob emitted
-  nodes 3x, ways 2x, relations 1x (matching the 18 vs 6 observation).
-  Fix: added `phase_kind: Option<ElemKind>` to `extract_block_pass2`
-  (`src/commands/extract/common.rs`); simple passes `Some(Node)` /
-  `Some(Way)` / `Some(Relation)` for the three phase writes and
-  `None` for its unsorted-fallback batch; complete passes `None`
-  (single-pass write). For indexed PBFs the filter is a no-op
-  (blobs are homogeneous and pre-routed to their phase).
-  `extract_simple_non_indexed_parity` unignored.
-
-- [x] ~~**`apply-changes --force` on non-indexed input off-by-one on
-  delete.**~~ - landed 2026-04-23. Misdiagnosed in the original
-  pin - node 3 was actually being deleted correctly; the extra node
-  was node 2 (the modify) being re-emitted once as a trailing create.
-  Root cause: the scanner assigned non-indexed blobs a placeholder
-  `kind=Node` + `id_range=None` (`scanner.rs:129-132`) and the
-  worker passed those unchanged into `DrainItem::Rewritten`
-  (`id_range: (0, 0)` on the wire). The drain's cursor-advance rule
-  at `drain.rs:644-649` uses `blob_osm_last_key(0, 0) = (0, 0)`
-  which is less than every real upsert key, so the per-kind upsert
-  cursor never advanced. The trailing-creates loop at end-of-stream
-  then re-emitted every modify that the worker had already handled
-  inline via `diff.get_node/way/relation`. Fix: new
-  `streaming.rs::infer_kind_and_range` walks the already-parsed
-  block to recover the true `(kind, min_id, max_id)` for non-indexed
-  blobs, and the worker uses those recovered values for both
-  `upsert_slice` and the `DrainItem::Rewritten { kind, id_range }`
-  emission. Indexed blobs skip the walk (trust indexdata).
-  `apply_changes_non_indexed_parity` unignored.
-
-- [x] ~~**`merge_pbf([A, A])` drops ways and relations.**~~ - landed
-  2026-04-23. Original diagnosis was off. The bug wasn't in how
-  blob-identical inputs were deduplicated; it was in how the
-  pass-2 loop *grouped* blobs into overlap runs. `detect_overlaps`
-  correctly sets `overlaps[j]=true` only between same-kind
-  adjacent blobs (nodes with nodes, ways with ways). But the outer
-  loop that walks consecutive `overlaps[i]=true` entries didn't
-  check kind, so when a node overlap-pair sat immediately before a
-  way overlap-pair in file order, both pairs merged into one
-  `write_overlap_run` call. That call took `entries[0].index.kind`
-  and handed it to `sweep_merge_dedup`'s kind-gated extract
-  closure, which silently dropped every element whose kind didn't
-  match - i.e. every way and relation when the first entry was a
-  node. Fix: add `entries[i].index.kind == run_kind` to the
-  overlap-run walker in `cat/dedupe.rs`.
-  `merge_same_input_preserves_ways_and_relations` unignored.
-  Real-world exposure was broader than the original pin suggested:
-  any `cat --dedupe` or `merge_pbf` run where same-kind overlap
-  pairs sat adjacent across kind boundaries would have silently
-  lost one side of the boundary.
-
-- [x] ~~**`extract --strategy complete-ways --force` on non-indexed
-  input produces empty output.**~~ - landed 2026-04-23. Same fix
-  closes the smart case below. Root cause: the sorted-path header
-  walker in `smart.rs::collect_pass1_generic` only populated
-  `node_schedule` / `way_schedule` / `relation_schedule` /
-  `full_way_schedule` from blobs with indexdata, so on a fully
-  non-indexed input all four schedules stayed empty - pass-1
-  produced empty id sets and the pass-2 writer emitted nothing.
-  Fix: replicate non-indexed blobs (`idx.is_none()`) into every
-  per-kind schedule; the classify closures already kind-filter via
-  `match element`, so mismatched blobs no-op at the element level.
-  Mirrors the pattern in `scan::classify::build_classify_schedules_split`
-  and `multi::try_extract_multi_single_pass`.
-  `extract_multi_complete_ways_non_indexed_parity` unignored.
-
-- [x] ~~**`extract --strategy smart --force` on non-indexed input
-  produces empty output.**~~ - landed 2026-04-23. Closed by the
-  same `smart.rs::collect_pass1_generic` change as the complete-ways
-  case above; smart's relation-member expansion rides on the same
-  id sets that pass 1 now populates correctly for non-indexed input.
-  `extract_smart_non_indexed_parity` unignored.
+`#[ignore]` regression tests:
+- test/add_locations_to_ways.rs: backend_parity_dense_sparse_external_auto
+  `FAILED backend_parity_dense_sparse_external_auto tests/add_locations_to_ways.rs:957:6 external backend: "create rank shard /tmp/.tmpGS3gav/.pbfhogg-external-join-3778146/rank-W6-216: Too many open files (os error 24)"`
+- tests/apply_changes_invariants.rs: merge_jobs_parity_on_multiblob_input
+  I think this one can be enabled now?
 
 - [x] ~~**`apply-changes -j N --locations-on-ways` consumer build trips
   the drain/copy-range invariant.**~~ - landed 2026-04-23 alongside
@@ -778,43 +599,6 @@ Pinned as `#[ignore]` regression tests in
   `DrainItem::OwnedBytes` does not credit per-kind `base_*` counts
   (only `CopyRange` does) - that's squarely gap #7 (merge stats
   drift) and tracked separately.
-
-- [x] ~~**`merge` summary/stat counters diverge between all-features
-  and consumer builds on the same fixture.**~~ - landed 2026-04-23.
-  Root cause was narrow: the drain's `DrainItem::OwnedBytes` arm
-  (`drain.rs::dispatch_variant`) did not credit per-kind `base_*`
-  counters, only bumping `blobs_passthrough` / `bytes_passthrough`.
-  Only the `CopyRange` arm bumped `base_<kind> += index.count`.
-  Consumer builds force `use_copy_range=false` (no `linux-direct-io`
-  feature), so every passthrough flowed through `OwnedBytes` and the
-  per-kind counters stayed at zero. `--direct-io` runs were
-  similarly affected. Fix: add `count: u64` to
-  `DrainItem::OwnedBytes`; drain's `OwnedBytes` arm now mirrors
-  `CopyRange`'s per-kind match. Both producers thread the count
-  through: the scanner-passthrough worker branch reads
-  `desc.index.count`; the worker false-positive branch reads
-  `desc.index.count` (indexed) or walks the already-parsed block
-  via a new `count_block_elements` helper (non-indexed `--force`).
-  `WorkerOutput::into_drain_item` gained a matching `fallback_count`
-  parameter for the non-indexed `--force` CopyRange fast-path. The
-  pinned `merge_stats_match_output_counts_after_roundtrip` is
-  unignored; `merge_stats_accuracy`,
-  `merge_gap_creates_between_blobs`, and
-  `merge_type_transition_node_to_relation_skipping_ways` now pass
-  in both sweeps.
-
-- [x] ~~**`check --ids` (`verify_ids`) reports spurious TypeOrder
-  violations on non-indexed input.**~~ - landed 2026-04-23. Fixed
-  by gating the offset-based `check_type_order` in
-  `verify_ids_full_parallel` on `indexed`. Non-indexed `--full`
-  runs lose the offset-based pre-check; the sequential (non-
-  `--full`) path already has an element-level type-order check
-  that works correctly on any input, so users who need actual
-  type-ordering verification on non-indexed input have a path.
-  `check_ids_non_indexed_parity` unignored. A richer solution
-  (emit per-blob kind from the phase decoders and reconstruct
-  per-kind offset ranges) is possible but not worth the
-  complexity for the `--force` path today.
 
 ### Test-shape gaps surfaced by the 0.3.0 bug sweep (2026-04-23)
 
@@ -1019,10 +803,6 @@ Remaining open findings from a multi-agent Opus audit of 0.3.0 high-churn areas.
 
 ### apply-changes pipeline
 
-- [x] ~~**`apply_changes/drain.rs:537` / `streaming.rs:633` - HIGH.**~~ *(landed 2026-04-23; drain-side `process_item` now guards `handle_gap_creates` on `min_id <= max_id` so the reversed-range sentinel `(i64::MAX, i64::MIN)` that `infer_kind_and_range` emits for a malformed non-indexed block - wire-tag homogeneous classification disagreeing with actual element kinds - no longer propagates through `blob_osm_first_id`. Comments at both sides cross-reference the invariant. No regression test: reproducing the trigger requires hand-crafted wire bytes that lie about block type, which we don't have fixture infrastructure for; the well-formed non-indexed path is already covered by `apply_changes_non_indexed_parity`.)*
-
-- [x] ~~**`apply_changes/streaming.rs:496` - HIGH.**~~ *(landed 2026-04-23; the false-positive path now walks the parsed block to recover the true (kind, id_range) before handing off. Both the CopyRange fast-path (`WorkerOutput::FalsePositive` now patches the cloned descriptor) and the owned-passthrough path (`handle_owned_passthrough` takes an optional override) propagate the real kind, so drain-side `base_*` credits go to the real kind and `handle_type_transition` no longer fires spurious Node<->Way/Relation flushes that would drain upsert cursors ahead of real blobs. Indexed descriptors continue to carry authoritative values; the scanner-side Passthrough call site is the only other caller and passes None.)*
-
 - [ ] **`apply_changes/rewrite.rs:244` - MEDIUM (diagnostic-quality)** *(verified 2026-04-23)*. If the scanner errors out mid-stream after sending some items but before all candidates are dispatched, some seqs never get produced; the drain hits its "channel closed with items still in reorder buffer" check at drain.rs:332 and returns an error whose diagnostic (`next_seq` vs smallest remaining) misleads away from the real upstream failure. Not a correctness bug - error surfaces, just two errors for one fault with the misleading one first. The true scanner error is surfaced separately via the scope join at rewrite.rs:337. Trigger: corrupted PBF header mid-stream. NOTE: drain.rs:330-338 original finding is the same concern from another angle - deduped into this entry.
 
 - [ ] **`apply_changes/streaming.rs:242` - MEDIUM.** If a worker panics mid-stream, its `drain_tx` clone is dropped and other workers keep running, but seqs from the panicked worker's in-flight candidate are lost; the drain trips the reorder-buffer-non-empty check at drain.rs:330 and the panic only propagates when `std::thread::scope` returns, so the user sees "drain: channel closed with N items" rather than the real panic message. Trigger: OOM or unwrap in worker code path.
@@ -1034,12 +814,6 @@ Remaining open findings from a multi-agent Opus audit of 0.3.0 high-churn areas.
 ### Write path (parallel-pwrite, io_uring, parallel gzip)
 
 - [ ] **`write/parallel_gzip.rs:188-213` - LOW (downgraded 2026-04-23)** *(verified: not a live failure mode today)*. `compress_one` at :216 uses `GzEncoder::new(Vec::with_capacity(...), ...)`. `Vec<u8>` `Write` impl is infallible; flate2 doesn't return Err for OOM (it panics). So the `Err(_) => return` arm at :207 is effectively unreachable in current code. A worker panic unwinds rather than running the `return`, so this path does not reach the described hang via normal io::Error. The original trigger "flate2 OOM" is wrong. The hang is only reachable via (a) a future sink change to a fallible writer, or (b) a panic-caught-and-converted-to-Err path. Keep as a latent defensive-coding note; fix shape is still "on worker error/panic, poison the writer_loop channel or close it with a sentinel" but urgency drops with no live trigger.
-
-- [x] ~~**`write/parallel_gzip.rs:170-184` - MEDIUM.**~~ *(closed 2026-04-23 via documentation only. The RAII-plus-file-sink case is a real hazard but the only in-tree caller (`diff/derive.rs::assemble_osc`) already calls `finish()?` on the success path, so the Drop silent-flush only fires on error-propagation bail-outs (primary error dominates), panics, or tests. Strengthened the Drop comment to spell out the contract explicitly so a future RAII consumer doesn't discover this the hard way. A `debug_assert!` in Drop was considered and rejected because it would false-positive on every legitimate `?`-bail.)*
-
-- [x] ~~**`write/uring_writer.rs:324-340` - MEDIUM.**~~ *(landed 2026-04-23; `self.pool.release(buf_idx)` moved ahead of the error-propagation branches so it runs unconditionally for every CQE. Writer still tears down on error; this keeps the pool accounting consistent so any observer/continuation sees a sane state.)*
-
-- [x] ~~**`write/writer.rs:736-746` - MEDIUM.**~~ *(closed 2026-04-23 via documentation only. Standard Rust RAII pattern: `Drop` can't surface errors; `flush()` exists precisely to route the writer-thread join result (which carries `sync_all` and uring `set_len` errors) through `?`. In-tree callers all call `flush()` on the success path. Strengthened Drop comment to name the specific deferred operations (sync_all / set_len) so a library consumer knows what they're losing if they skip `flush()`.)*
 
 - [ ] **`write/parallel_writer.rs:399-430` - MEDIUM.** `copy_range_fallback_pwrite` loops via pread+pwrite but does not handle pread EINTR: a signal-interrupted pread returns `-1`/EINTR and the function errors immediately instead of retrying. Trigger: SIGWINCH or other signal delivered during a cross-device passthrough copy.
 
@@ -1066,8 +840,6 @@ Remaining open findings from a multi-agent Opus audit of 0.3.0 high-churn areas.
 - [ ] **`renumber/mod.rs:308-311` - LOW.** Way `id_sets` are merged by removing element 0 and folding the rest with `merge` (takes ownership); if `STAGE2D_WORKERS = 0` in a future tweak, `remove(0)` panics. Current constant is 6 but the shape is fragile - `merge_from` on a default-constructed set would be safer. Trigger: future refactor.
 
 ### altw external
-
-- [x] ~~**`altw/external/stage2.rs:534` / `mod.rs:582` - HIGH (documented-accepted).**~~ *(closed 2026-04-23 without code change. Existing inline comment at stage2.rs:522-533 and CORRECTNESS.md "Null Island ambiguity in dense mmap index" already explain the accepted limitation; added a short cross-link comment at the `missing_locations` site in mod.rs so the invariant is visible where the counter is published, not just where the sentinel is tested. Affects zero real-world nodes; fix shape remains a separate occupancy bitmap if a user case ever surfaces.)*
 
 - [ ] **`altw/external/stage1.rs:269-273` + `stage2.rs:459-493` - MEDIUM.** Stage 2's blob-local rank counter (`next_rank = blob.ref_rank_start`, incremented per referenced tuple) is correct only if indexdata `(min_id, max_id)` tightly brackets actual node IDs in the blob. A producer with loose bounds plus the `debug_assert_eq!` at stage2.rs:488 passes in release and silently produces skewed ranks, scrambling the join. Trigger: input PBF with sloppy indexdata ranges from a third-party writer.
 
@@ -1098,12 +870,6 @@ Remaining open findings from a multi-agent Opus audit of 0.3.0 high-churn areas.
 - [ ] **`diff/derive_parallel.rs:240-248` - LOW.** Per-shard scratch filenames are `derive-par-{creates|modifies|deletes}-{pid}-{kind_tag}-{shard_idx}.xml.tmp`; two `pbfhogg` processes with the same PID running concurrently in the same `scratch_dir` (container restart recycling PID) collide. Sequential `ChangeSink` has the same exposure - pre-existing latent class. Add random suffix for 0.4.0. Trigger: PID collision.
 
 ### geocode builder v2
-
-- [x] ~~**`geocode_index/builder/admin.rs:127-143` - HIGH.**~~ *(landed 2026-04-23; `write_admin_data` now checks `p.vertices.len() -> u32` (vertex_count), `p.vertices.len().checked_mul(NODE_COORD_SIZE)` (step), `u32::try_from(step)` (step-u32 fits), and `offset.checked_add(step_u32)` (cumulative fits). Each failure mode returns a descriptive error with a widen-to-u64 + bump FORMAT_VERSION pointer, matching the sibling u16::MAX guard at `write_admin_index`.)*
-
-- [x] ~~**`geocode_index/builder/admin.rs:152-189` - MEDIUM.**~~ *(landed 2026-04-23; `byte_off += 2`/`+= 4` replaced with `checked_add` at both sites with a descriptive widen-to-u64 + bump FORMAT_VERSION error. Sister of the HIGH vertex_offset fix, same pattern.)*
-
-- [x] ~~**`geocode_index/builder/admin.rs:182` - MEDIUM.**~~ *(landed 2026-04-23; `write_admin_index` now hard-errors if `e.poly_index & INTERIOR_FLAG != 0` before the OR, naming the offending poly_index and cid. Reachable only past 2^31 admin polygons - we're many orders of magnitude from that, but the defensive guard costs nothing and pre-empts a silent corruption if the counter ever crosses.)*
 
 - [ ] **`geocode_index/builder/pass3.rs:152-167` - MEDIUM.** `parse_bucket_file` silently truncates any trailing bytes that don't form a complete 15-byte record (`count = data.len() / BUCKET_RECORD_SIZE`); if a bucket-writer flush fails partway (ENOSPC), the partial tail is silently dropped at Stage B with no diagnostic. Trigger: ENOSPC during Stage A writes.
 

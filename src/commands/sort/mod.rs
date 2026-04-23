@@ -14,12 +14,12 @@ use std::path::Path;
 
 use crate::blob::{
     decode_blob_to_headerblock, decode_blob_to_primitiveblock, decompress_blob_data_into,
-    parse_blob_header_with_index, BlobKind,
+    BlobKind,
 };
 use crate::blob_meta::{BlobIndex, ElemKind, scan_block_ids};
 use crate::block_builder::BlockBuilder;
-use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
+use crate::read::header_walker::HeaderWalker;
 use crate::writer::{reframe_raw_with_index, Compression, PbfWriter};
 use crate::Element;
 
@@ -257,87 +257,59 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderO
 
 /// Build a blob-level index of the input file.
 ///
-/// Reads sequentially, extracting element type + ID range for each OSMData
-/// blob. Blobs with indexdata are classified without decompression; others
-/// are decompressed and scanned with `scan_block_ids`.
+/// Walks blob headers via `HeaderWalker` (pread-only, `fadvise(RANDOM)`).
+/// Blobs with indexdata are classified without touching payload bytes;
+/// non-indexed blobs take a fallback path that preads + decompresses the
+/// payload and scans element IDs. `direct_io` is accepted for signature
+/// stability but unused here - the walker opens its own buffered fd.
+/// Twin of the migration done for `inspect/scan.rs::try_index_only_scan`
+/// (planet pass 1 was 21 s / 36 GB read through the buffered reader's
+/// readahead; the walker's per-header preads avoid pulling payloads into
+/// the page cache entirely).
 #[hotpath::measure]
 fn build_blob_index(
     input: &Path,
-    direct_io: bool,
+    _direct_io: bool,
 ) -> Result<(crate::HeaderBlock, Vec<BlobEntry>)> {
-    let mut reader = FileReader::open(input, direct_io)?;
+    let mut walker = HeaderWalker::open(input)?;
     let mut entries = Vec::new();
     let mut header: Option<crate::HeaderBlock> = None;
-    let mut file_offset: u64 = 0;
+    let mut data_buf: Vec<u8> = Vec::new();
     let mut decompress_buf: Vec<u8> = Vec::new();
-    let mut header_buf: Vec<u8> = Vec::new();
-    let mut blob_buf: Vec<u8> = Vec::new();
 
-    loop {
-        let frame_start = file_offset;
-
-        // Read 4-byte header length
-        let mut len_buf = [0u8; 4];
-        match reader.read_exact(&mut len_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
-        }
-        #[allow(clippy::cast_possible_truncation)]
-        let header_len = u32::from_be_bytes(len_buf) as usize;
-
-        // Read BlobHeader (reuse buffer)
-        header_buf.resize(header_len, 0);
-        reader.read_exact(&mut header_buf)?;
-
-        let (blob_type, data_size, raw_index, tagdata) =
-            parse_blob_header_with_index(&header_buf)?;
-        let index = raw_index.as_ref().and_then(|d| BlobIndex::deserialize(d));
-        let has_indexdata = index.is_some();
-
-        let frame_len = (4 + header_len + data_size) as u64;
-        file_offset += frame_len;
-
-        match &blob_type {
+    while let Some(meta) = walker.next_header()? {
+        match meta.blob_type {
             BlobKind::OsmHeader if header.is_none() => {
-                blob_buf.resize(data_size, 0);
-                reader.read_exact(&mut blob_buf)?;
-                header = Some(decode_blob_to_headerblock(&blob_buf)?);
-            }
-            BlobKind::OsmData if has_indexdata => {
-                // Indexdata already in BlobHeader - skip blob payload entirely
-                reader.skip(data_size as u64)?;
-                #[allow(clippy::unwrap_used)]
-                entries.push(BlobEntry {
-                    file_offset: frame_start,
-                    frame_len,
-                    index: index.unwrap(),
-                    has_indexdata,
-                    tagdata,
-                });
+                walker.pread_data(meta.data_offset, meta.data_size, &mut data_buf)?;
+                header = Some(decode_blob_to_headerblock(&data_buf)?);
             }
             BlobKind::OsmData => {
-                // No indexdata - must decompress and scan for element IDs
-                blob_buf.resize(data_size, 0);
-                reader.read_exact(&mut blob_buf)?;
-                decompress_blob_data_into(&blob_buf, &mut decompress_buf)?;
-                let blob_index = scan_block_ids(&decompress_buf).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "failed to scan block IDs",
-                    )
-                })?;
+                let has_indexdata = meta.index.is_some();
+                let index = match meta.index {
+                    Some(idx) => idx,
+                    None => {
+                        // No indexdata - pread payload, decompress, scan IDs.
+                        walker.pread_data(meta.data_offset, meta.data_size, &mut data_buf)?;
+                        decompress_blob_data_into(&data_buf, &mut decompress_buf)?;
+                        scan_block_ids(&decompress_buf).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "failed to scan block IDs",
+                            )
+                        })?
+                    }
+                };
                 entries.push(BlobEntry {
-                    file_offset: frame_start,
-                    frame_len,
-                    index: blob_index,
+                    file_offset: meta.frame_start,
+                    frame_len: meta.frame_size as u64,
+                    index,
                     has_indexdata,
-                    tagdata,
+                    tagdata: meta.tagdata,
                 });
             }
             _ => {
-                // Unknown or duplicate header blob - skip payload
-                reader.skip(data_size as u64)?;
+                // Duplicate OsmHeader or unknown blob kind: walker has
+                // already advanced past the payload.
             }
         }
     }

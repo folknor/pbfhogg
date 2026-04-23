@@ -252,17 +252,15 @@ fn tags_filter_non_indexed_parity() {
 // extract --strategy simple
 // ---------------------------------------------------------------------------
 //
-// KNOWN FAILURE, 2026-04-22. `extract --strategy simple` with
-// `force: true` on a non-indexed input produces a node count that
-// diverges substantially from the indexed twin (observed 18 vs 6 on a
-// 10-node fixture - looks like the non-indexed single-pass path
-// double-emits decompressed blocks). The test below is written to
-// pin the correctness contract once the underlying bug is fixed; it
-// is `#[ignore]`-gated so CI stays green while the investigation is
-// parked in TODO.md.
+// Pins the non-indexed parity contract for `extract --strategy simple`
+// under `force: true`. The earlier regression double-emitted elements
+// (3x on nodes, 2x on ways, 1x on relations) because simple's three
+// sorted-path write phases fed the same non-indexed blob through each
+// phase and the kind-agnostic writer re-emitted matching elements as
+// the id sets grew. Fixed 2026-04-23 by kind-scoping the pass-2 writer
+// (see `extract_block_pass2`'s `phase_kind` parameter).
 
 #[test]
-#[ignore = "extract --simple non-indexed fallback produces wrong node count (see TODO.md)"]
 fn extract_simple_non_indexed_parity() {
     let dir = TempDir::new().expect("tempdir");
     let in_idx = dir.path().join("in_idx.osm.pbf");
@@ -703,20 +701,18 @@ fn renumber_external_rejects_non_indexed() {
 // extract_multi (CompleteWays strategy)
 // ---------------------------------------------------------------------------
 //
-// KNOWN FAILURE, 2026-04-22. `extract_multi` with CompleteWays on
-// non-indexed input produces an empty output file (0 nodes) while
-// the indexed twin produces the expected 6 nodes on a 10-node
-// fixture. `require_indexdata(.., force: true, ..)` lets the call
-// proceed but `extract_complete_ways` appears to silently no-op
-// because its pass-1 probably relies on per-blob bboxes from
-// indexdata to populate `bbox_node_ids`, and on non-indexed input
-// that set stays empty, propagating to 0 matched ways and 0
-// transitive refs. Fix: make the pass-1 scanner fall back to
-// element-level bbox testing when `blob.index()` is None. Test is
-// `#[ignore]`-gated with this diagnosis logged in TODO.md.
+// Pins the non-indexed parity contract for `extract_multi` under
+// the `CompleteWays` strategy. The earlier regression emitted an
+// empty file because `collect_pass1_generic`'s sorted path only
+// populated per-kind schedules from blobs with indexdata, so on
+// a fully non-indexed input all three schedules stayed empty and
+// the pass-2 writer emitted nothing. Fixed 2026-04-23 by
+// replicating non-indexed blobs into every per-kind schedule
+// (see `smart.rs::collect_pass1_generic`); the classify closures
+// already kind-filter at the element level, so mismatched blobs
+// safely no-op.
 
 #[test]
-#[ignore = "extract_multi CompleteWays non-indexed produces empty output (see TODO.md)"]
 fn extract_multi_complete_ways_non_indexed_parity() {
     let dir = TempDir::new().expect("tempdir");
     let in_idx = dir.path().join("in_idx.osm.pbf");
@@ -771,15 +767,12 @@ fn extract_multi_complete_ways_non_indexed_parity() {
     assert_elements_equivalent(&slots_idx[1].output, &slots_non[1].output);
 }
 
-// KNOWN FAILURE, 2026-04-22. `extract --strategy smart` with
-// `force: true` on a non-indexed input produces an empty output on the
-// smart fixture below (indexed output: 4 nodes; non-indexed: 0). This
-// looks like the same missing element-level pass-1 fallback already
-// pinned for CompleteWays, but with smart relation-member expansion on
-// top. Parked in TODO.md; keep the regression test in-tree via
-// `#[ignore]`.
+// Pins the non-indexed parity contract for `extract --strategy smart`
+// under `force: true`, including smart's relation-member expansion.
+// Shares a root cause with the CompleteWays case above - the sorted
+// pass-1 scheduler dropped non-indexed blobs on the floor - and was
+// fixed by the same change in `smart.rs::collect_pass1_generic`.
 #[test]
-#[ignore = "extract --smart non-indexed produces empty output (see TODO.md)"]
 fn extract_smart_non_indexed_parity() {
     let dir = TempDir::new().expect("tempdir");
     let in_idx = dir.path().join("in_idx.osm.pbf");

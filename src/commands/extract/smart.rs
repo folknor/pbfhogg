@@ -248,6 +248,18 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                 crate::blob_meta::ElemKind::Way => way_schedule.push((seq, meta.data_offset, meta.data_size)),
                 crate::blob_meta::ElemKind::Relation => relation_schedule.push((seq, meta.data_offset, meta.data_size)),
             }
+        } else {
+            // Non-indexed blob (force-flag path). Without indexdata we cannot
+            // determine the blob's kind or bbox up front, so replicate into
+            // every per-kind schedule; classify closures below already
+            // kind-filter via `match element`, so blobs of the wrong kind
+            // no-op at the element level. Mirrors the same replication
+            // pattern in `scan::classify::build_classify_schedules_split`
+            // and `multi::try_extract_multi_single_pass`.
+            node_schedule.push((seq, meta.data_offset, meta.data_size));
+            way_schedule.push((seq, meta.data_offset, meta.data_size));
+            relation_schedule.push((seq, meta.data_offset, meta.data_size));
+            full_way_schedule.push((seq, meta.data_offset, meta.data_size));
         }
         seq += 1;
     }

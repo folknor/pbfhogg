@@ -410,11 +410,21 @@ use crate::owned::{dense_node_metadata, element_metadata};
 
 /// Process a single block for Pass 2 of complete-ways: write elements whose IDs
 /// were collected in Pass 1. Uses thread-local BlockBuilder and output buffer.
+///
+/// `phase_kind` scopes which element kinds this call may emit. `None` emits
+/// every matching element in the block (single-pass write: complete, smart,
+/// simple-unsorted-fallback). `Some(kind)` emits only that kind, needed by
+/// simple's 3-phase sorted single-pass write where the same non-indexed blob
+/// is fed to every phase: without the filter, the monotonically-growing id
+/// sets would cause nodes to be emitted 3x, ways 2x, relations 1x from one
+/// non-indexed blob. For indexed PBFs the filter is a no-op (each blob is
+/// homogeneous by type, pre-routed to its phase).
 #[hotpath::measure]
 pub(super) fn extract_block_pass2(
     block: &PrimitiveBlock,
     ids: &ExtractPass2IdSets<'_>,
     clean: &CleanAttrs,
+    phase_kind: Option<crate::blob_meta::ElemKind>,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
 ) -> std::result::Result<ExtractStats, String> {
@@ -430,9 +440,13 @@ pub(super) fn extract_block_pass2(
     let mut refs_buf: Vec<i64> = Vec::new();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 
+    let emit_nodes = phase_kind.is_none_or(|k| matches!(k, crate::blob_meta::ElemKind::Node));
+    let emit_ways = phase_kind.is_none_or(|k| matches!(k, crate::blob_meta::ElemKind::Way));
+    let emit_rels = phase_kind.is_none_or(|k| matches!(k, crate::blob_meta::ElemKind::Relation));
+
     for element in block.elements() {
         match &element {
-            Element::DenseNode(dn) => {
+            Element::DenseNode(dn) if emit_nodes => {
                 let in_bbox = ids.bbox_node_ids.get(dn.id());
                 let from_way = ids.all_way_node_ids.get(dn.id());
                 if in_bbox || from_way {
@@ -446,7 +460,7 @@ pub(super) fn extract_block_pass2(
                     }
                 }
             }
-            Element::Node(n) => {
+            Element::Node(n) if emit_nodes => {
                 let in_bbox = ids.bbox_node_ids.get(n.id());
                 let from_way = ids.all_way_node_ids.get(n.id());
                 if in_bbox || from_way {
@@ -460,29 +474,26 @@ pub(super) fn extract_block_pass2(
                     }
                 }
             }
-            Element::Way(w) => {
-                if ids.matched_way_ids.get(w.id()) {
-                    ensure_way_capacity_local(bb, output)?;
-                    refs_buf.clear();
-                    refs_buf.extend(w.refs());
-                    let meta = clean_metadata(element_metadata(&w.info()), clean);
-                    bb.add_way(w.id(), w.tags(), &refs_buf, meta.as_ref());
-                    stats.ways_written += 1;
-                }
+            Element::Way(w) if emit_ways && ids.matched_way_ids.get(w.id()) => {
+                ensure_way_capacity_local(bb, output)?;
+                refs_buf.clear();
+                refs_buf.extend(w.refs());
+                let meta = clean_metadata(element_metadata(&w.info()), clean);
+                bb.add_way(w.id(), w.tags(), &refs_buf, meta.as_ref());
+                stats.ways_written += 1;
             }
-            Element::Relation(r) => {
-                if ids.matched_relation_ids.get(r.id()) {
-                    ensure_relation_capacity_local(bb, output)?;
-                    members_buf.clear();
-                    members_buf.extend(r.members().map(|m| MemberData {
-                        id: m.id,
-                        role: m.role().unwrap_or(""),
-                    }));
-                    let meta = clean_metadata(element_metadata(&r.info()), clean);
-                    bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
-                    stats.relations_written += 1;
-                }
+            Element::Relation(r) if emit_rels && ids.matched_relation_ids.get(r.id()) => {
+                ensure_relation_capacity_local(bb, output)?;
+                members_buf.clear();
+                members_buf.extend(r.members().map(|m| MemberData {
+                    id: m.id,
+                    role: m.role().unwrap_or(""),
+                }));
+                let meta = clean_metadata(element_metadata(&r.info()), clean);
+                bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
+                stats.relations_written += 1;
             }
+            _ => {}
         }
     }
     Ok(stats)

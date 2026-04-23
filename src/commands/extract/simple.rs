@@ -439,7 +439,7 @@ fn extract_simple_single_pass(
             matched_relation_ids: &empty_relation_ids,
         };
         pread_execute(input, &node_descs, &mut writer, &mut stats, |block, bb, output| {
-            let s = extract_block_pass2(block, &ids, clean, bb, output)?;
+            let s = extract_block_pass2(block, &ids, clean, Some(crate::blob_meta::ElemKind::Node), bb, output)?;
             flush_local(bb, output)?;
             Ok(s)
         })?;
@@ -541,7 +541,7 @@ fn extract_simple_single_pass(
             matched_relation_ids: &empty_relation_ids,
         };
         pread_execute(input, &way_descs, &mut writer, &mut stats, |block, bb, output| {
-            let s = extract_block_pass2(block, &ids, clean, bb, output)?;
+            let s = extract_block_pass2(block, &ids, clean, Some(crate::blob_meta::ElemKind::Way), bb, output)?;
             flush_local(bb, output)?;
             Ok(s)
         })?;
@@ -587,7 +587,7 @@ fn extract_simple_single_pass(
             matched_relation_ids: &matched_relation_ids,
         };
         pread_execute(input, &rel_descs, &mut writer, &mut stats, |block, bb, output| {
-            let s = extract_block_pass2(block, &ids, clean, bb, output)?;
+            let s = extract_block_pass2(block, &ids, clean, Some(crate::blob_meta::ElemKind::Relation), bb, output)?;
             flush_local(bb, output)?;
             Ok(s)
         })?;
@@ -614,7 +614,7 @@ fn process_extract_pass2_batch(
             BlockBuilder::new,
             |bb, block| {
                 let mut output: Vec<OwnedBlock> = Vec::new();
-                let block_stats = extract_block_pass2(block, ids, clean, bb, &mut output)?;
+                let block_stats = extract_block_pass2(block, ids, clean, None, bb, &mut output)?;
                 flush_local(bb, &mut output)?;
                 Ok((output, block_stats))
             },

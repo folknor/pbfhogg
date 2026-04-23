@@ -73,11 +73,11 @@ pub(super) fn extract_complete_ways(input: &Path, output: &Path, region: &Region
     // post-PASS1 header scan and its cold-arena-page residency cascade.
     if pass1_blob_schedule.is_empty() {
         pread_write_pass(input, &mut writer, &mut stats, |block, bb, output_blocks| {
-            extract_block_pass2(block, &ids, clean, bb, output_blocks)
+            extract_block_pass2(block, &ids, clean, None, bb, output_blocks)
         })?;
     } else {
         pread_write_pass_with_schedule(input, &pass1_blob_schedule, &mut writer, &mut stats, |block, bb, output_blocks| {
-            extract_block_pass2(block, &ids, clean, bb, output_blocks)
+            extract_block_pass2(block, &ids, clean, None, bb, output_blocks)
         })?;
     }
     crate::debug::emit_marker("COMPLETE_PASS2_WRITE_END");

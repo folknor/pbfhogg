@@ -675,18 +675,21 @@ Pinned as `#[ignore]` regression tests in
 `tests/derive_changes.rs`, and
 `tests/merge_pbf.rs` - remove the ignore attribute to reproduce.
 
-- [ ] **`extract --strategy simple --force` on non-indexed input
-  double-emits elements.** Parity test ran the same logical input
-  through indexed + non-indexed twins with `force: true`, bbox
-  clipping about half the 10-node fixture. Indexed output: 6 nodes
-  (correct). Non-indexed output: 18 nodes - a 3x multiplier, which
-  matches the "non-indexed blobs are decompressed up to 3 times"
-  comment in `src/commands/extract/simple.rs::extract_simple_single_pass`.
-  Leading hypothesis: the passthrough schedule silently no-ops on
-  blobs without indexdata and then the same decoded block flows
-  through the output three times via the type-split phases. First
-  step: confirm hypothesis with a counter / trace, then gate the
-  pass-2/pass-3 emits on "already emitted this blob".
+- [x] ~~**`extract --strategy simple --force` on non-indexed input
+  double-emits elements.**~~ - landed 2026-04-23. Root cause: simple's
+  sorted single-pass writer runs three phases (nodes, ways, relations)
+  and every non-indexed blob is in all three per-kind schedules (kind
+  unknown until decompress). Each phase called the kind-agnostic
+  `extract_block_pass2`, which emits elements whose ids are in the
+  monotonically-growing id sets - so one non-indexed blob emitted
+  nodes 3x, ways 2x, relations 1x (matching the 18 vs 6 observation).
+  Fix: added `phase_kind: Option<ElemKind>` to `extract_block_pass2`
+  (`src/commands/extract/common.rs`); simple passes `Some(Node)` /
+  `Some(Way)` / `Some(Relation)` for the three phase writes and
+  `None` for its unsorted-fallback batch; complete passes `None`
+  (single-pass write). For indexed PBFs the filter is a no-op
+  (blobs are homogeneous and pre-routed to their phase).
+  `extract_simple_non_indexed_parity` unignored.
 
 - [ ] **`apply-changes --force` on non-indexed input off-by-one on
   delete.** Parity test ran a `modify n2, delete n3, create n100`
@@ -718,28 +721,27 @@ Pinned as `#[ignore]` regression tests in
   would be affected only if two inputs carry byte-identical way
   blobs - unlikely in practice but latent.
 
-- [ ] **`extract --strategy complete-ways --force` on non-indexed
-  input produces empty output.** Parity test: indexed fixture
-  yields 6 nodes + dependent ways; non-indexed twin yields 0 nodes.
-  `require_indexdata(.., force: true, ..)` lets the call proceed
-  but `extract_complete_ways`'s pass-1 appears to rely on per-blob
-  bboxes from indexdata to populate `bbox_node_ids`; without
-  indexdata that set stays empty and propagates to 0 matched ways
-  and 0 transitive refs. Affects `extract_multi` whenever it falls
-  through to `extract_complete_ways` per slot. Fix: make pass-1
-  scanner do element-level bbox testing when `blob.index()` is
-  None. Same root cause likely affects `ExtractStrategy::Smart`.
+- [x] ~~**`extract --strategy complete-ways --force` on non-indexed
+  input produces empty output.**~~ - landed 2026-04-23. Same fix
+  closes the smart case below. Root cause: the sorted-path header
+  walker in `smart.rs::collect_pass1_generic` only populated
+  `node_schedule` / `way_schedule` / `relation_schedule` /
+  `full_way_schedule` from blobs with indexdata, so on a fully
+  non-indexed input all four schedules stayed empty - pass-1
+  produced empty id sets and the pass-2 writer emitted nothing.
+  Fix: replicate non-indexed blobs (`idx.is_none()`) into every
+  per-kind schedule; the classify closures already kind-filter via
+  `match element`, so mismatched blobs no-op at the element level.
+  Mirrors the pattern in `scan::classify::build_classify_schedules_split`
+  and `multi::try_extract_multi_single_pass`.
+  `extract_multi_complete_ways_non_indexed_parity` unignored.
 
-- [ ] **`extract --strategy smart --force` on non-indexed input
-  produces empty output.** Parity test used the existing smart
-  multipolygon + boundary fixture: indexed output had the expected 4
-  nodes, 3 ways, and 2 relations; non-indexed output was empty
-  (0 nodes). This strongly suggests the same root cause as
-  complete-ways - pass 1 relies on per-blob bbox/indexdata to seed
-  `bbox_node_ids`, so matched ways never materialize and the smart
-  relation-member expansion has nothing to build on. First fix to
-  try: make the non-indexed pass-1 fallback do element-level bbox
-  testing before relation handling.
+- [x] ~~**`extract --strategy smart --force` on non-indexed input
+  produces empty output.**~~ - landed 2026-04-23. Closed by the
+  same `smart.rs::collect_pass1_generic` change as the complete-ways
+  case above; smart's relation-member expansion rides on the same
+  id sets that pass 1 now populates correctly for non-indexed input.
+  `extract_smart_non_indexed_parity` unignored.
 
 - [ ] **`apply-changes -j N --locations-on-ways` consumer build trips
   the drain/copy-range invariant.** New jobs-parity test

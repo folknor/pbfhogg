@@ -305,3 +305,52 @@ fn node_stats_parallel_classify_parity() {
     // node_count / min / max assertions above already pin that every
     // blob's bytes were classified exactly once.
 }
+
+/// Regression: `show_element` must not early-exit on `idx.min_id > target_id`
+/// unless the header declares `Sort.Type_then_ID`.
+///
+/// On an unsorted PBF, a later same-kind blob can legitimately have a
+/// smaller `min_id` than an earlier blob. The pre-fix early-exit at
+/// show_element.rs:53-57 assumed sorted layout unconditionally and
+/// returned "not found" as soon as it saw a blob whose `min_id`
+/// exceeded the target, skipping every later blob - including the one
+/// actually containing the target.
+///
+/// Fixture layout (unsorted by design, no `Sort.Type_then_ID`):
+///   blob 0: nodes 100, 101 (min=100)
+///   blob 1: nodes  50,  51 (min= 50, overlaps/precedes blob 0)
+/// Target: node 51 - pre-fix: returns false; post-fix: returns true.
+#[test]
+fn show_element_unsorted_pbf_finds_target_in_later_blob() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("unsorted.osm.pbf");
+
+    // Emit nodes in order 100, 101, 50, 51 with block_size=2 and the
+    // `sorted=false` header so the writer produces two 2-node blobs
+    // without declaring `Sort.Type_then_ID` - a layout that's legal
+    // for non-canonical PBFs (hand-edited fixtures, extract outputs
+    // before sort, etc.) but would wrongly trigger `show_element`'s
+    // min_id-based early-exit.
+    let nodes = vec![
+        TestNode { id: 100, lat: 0, lon: 0, tags: vec![], meta: None },
+        TestNode { id: 101, lat: 0, lon: 0, tags: vec![], meta: None },
+        TestNode { id: 50,  lat: 0, lon: 0, tags: vec![], meta: None },
+        TestNode { id: 51,  lat: 0, lon: 0, tags: vec![], meta: None },
+    ];
+    common::write_test_pbf_impl(&input, &nodes, &[], &[], false, Some(2));
+
+    use pbfhogg::inspect::{ShowElementType, show_element};
+    let found =
+        show_element(&input, ShowElementType::Node, 51, false).expect("show_element");
+    assert!(found, "node 51 lives in the second blob; must be found on unsorted PBF");
+
+    // Sanity: also find 100 (first blob).
+    let found100 =
+        show_element(&input, ShowElementType::Node, 100, false).expect("show_element 100");
+    assert!(found100, "node 100 is in the first blob");
+
+    // Miss path still works: id 999 doesn't exist anywhere.
+    let miss = show_element(&input, ShowElementType::Node, 999, false).expect("show miss");
+    assert!(!miss, "node 999 shouldn't exist");
+}
+

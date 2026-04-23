@@ -1009,7 +1009,7 @@ Findings from a multi-agent Opus audit of 0.3.0 high-churn areas before the rele
 1. ~~`commands/sort/mod.rs:178-181` - direct parallel of the already-fixed `cat::dedupe` kind-boundary bug. Add `&& entries[i].index.kind == run_kind` guard.~~ **LANDED.** Regression `sort_overlap_runs_scoped_to_single_kind` in `tests/sort.rs` pins the fix.
 2. ~~`read/header_walker.rs:149-164` + `read/raw_frame.rs:65-67,124-127` - missing MAX_BLOB_HEADER_SIZE caps. Real DoS/OOM vector on adversarial input; add the same guard `BlobReader::read_blob_header` has.~~ **LANDED.** Three regression tests in `tests/corrupt_input.rs` pin the guards via the `has_indexdata`, `cat`, and `inspect` entry points.
 3. `apply_changes/scanner.rs:162,188` - under `--force --locations-on-ways` non-indexed, LocationsOnWays is silently stripped from base ways. Gate the combination at setup, or fix the barrier to recover from placeholder kinds.
-4. `commands/inspect/show_element.rs:53-57` - missing `is_sorted()` check produces false negatives on history/unsorted PBFs.
+4. ~~`commands/inspect/show_element.rs:53-57` - missing `is_sorted()` check produces false negatives on history/unsorted PBFs.~~ **LANDED.** Regression `show_element_unsorted_pbf_finds_target_in_later_blob` in `tests/inspect.rs` pins the fix on an unsorted fixture where the target lives in a later blob with a smaller `min_id`.
 5. `renumber/pass1.rs:179` + `wire_rewrite.rs:272` - negative-ID guards bypassed by stale indexdata; results in loud panic (pass1) or phantom orphans (wire_rewrite).
 6. `write/parallel_writer.rs:191-206` + `uring_writer.rs:588-655` - silent truncation when an upstream framer panics with items still held in the reorder buffer.
 
@@ -1249,7 +1249,7 @@ Findings from a multi-agent Opus audit of 0.3.0 high-churn areas before the rele
 
 - [x] ~~**`commands/sort/mod.rs:178-181` - HIGH.**~~ *(landed 2026-04-23; same fix shape as `cat::dedupe` commit `486d4d1`, regression `sort_overlap_runs_scoped_to_single_kind` in `tests/sort.rs` pre-fix 0 ways out of 6 → post-fix 10/10 nodes + 6/6 ways preserved in both all-features and consumer sweeps.)*
 
-- [ ] **`commands/inspect/show_element.rs:53-57` - HIGH.** Early-exit `if idx.min_id > target_id { return Ok(false); }` assumes same-kind blobs are ID-sorted, but the function never checks `header().is_sorted()`. On unsorted or history PBFs the target can live in a later same-kind blob whose `min_id` is lower than a preceding blob with `min_id > target_id` - `show_element` returns "not found" for elements that exist. Trigger: `inspect --show n<id>` on a non-sorted PBF where the target node sits after a blob with a higher `min_id` in file order.
+- [x] ~~**`commands/inspect/show_element.rs:53-57` - HIGH.**~~ *(landed 2026-04-23; gated the min_id early-exit on `HeaderBlock::is_sorted()` by decoding the OsmHeader blob up front. Regression `show_element_unsorted_pbf_finds_target_in_later_blob` in `tests/inspect.rs` passes in both feature sweeps.)*
 
 - [ ] **`commands/getid/mod.rs:259` - MEDIUM.** `removeid` (invert mode) reaches `filter_by_id` without any `require_indexdata` / `--force` gate. On a non-indexed PBF, the raw-passthrough fast path at 332-360 is unreachable (branch is conditional on `meta.index.is_some()`), so every blob falls into the full-decode path at 364 with no user warning. Correct output but silently slow, and inconsistent with `getid` at line 238 which gates on indexdata. Trigger: `removeid` on a non-indexed PBF.
 

@@ -37,10 +37,22 @@ pub fn show_element(
         ShowElementType::Relation => ElemKind::Relation,
     };
 
+    // The `min_id > target_id` early-exit below is only sound when the
+    // PBF declares `Sort.Type_then_ID`; on an unsorted PBF a later
+    // same-kind blob can have a smaller `min_id` than an earlier blob.
+    // Decode the header blob once up front to establish the invariant.
+    let mut is_sorted = false;
+
     for blob_result in &mut reader {
         let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
-            continue;
+        match blob.get_type() {
+            crate::blob::BlobType::OsmHeader => {
+                let header = blob.to_headerblock()?;
+                is_sorted = header.is_sorted();
+                continue;
+            }
+            crate::blob::BlobType::OsmData => {}
+            _ => continue,
         }
 
         // Skip blobs that cannot contain the target element.
@@ -51,8 +63,10 @@ pub fn show_element(
             }
             // Target ID outside this blob's range.
             if target_id < idx.min_id || target_id > idx.max_id {
-                // On sorted PBFs, if min_id > target_id we're past it.
-                if idx.min_id > target_id {
+                // Sorted PBFs: once past the target, no later blob can
+                // contain it. Unsorted PBFs: must keep scanning - a
+                // later blob can carry a smaller `min_id`.
+                if is_sorted && idx.min_id > target_id {
                     return Ok(false);
                 }
                 continue;

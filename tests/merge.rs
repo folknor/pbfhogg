@@ -1659,3 +1659,67 @@ fn merge_type_transition_node_to_relation_skipping_ways() {
     assert_eq!(stats.diff_ways, 2);
     assert_eq!(stats.base_relations, 1);
 }
+
+/// Regression: `apply-changes --force --locations-on-ways` against a
+/// non-indexed base PBF must reject the combination up front rather
+/// than silently strip LocationsOnWays from base ways.
+///
+/// Under `--force` the scanner tags every blob as a placeholder `Node`
+/// (real kind is only known after decompress), which defeats the
+/// Node->Way barrier. Way workers then run without a loc_map handle
+/// and the per-block rewriter falls back to `write_base_way_local`
+/// (strips LoW) instead of `write_base_way_local_with_locations`.
+/// Detecting this at setup produces a clean error and points the
+/// user at the indexed-generation workflow.
+#[test]
+fn merge_rejects_force_with_locations_on_ways_on_non_indexed() {
+    use common::write_test_pbf_non_indexed;
+
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_non_indexed(
+        &base,
+        &[
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 300_000_000, lon: 400_000_000, tags: vec![], meta: None },
+        ],
+        &[
+            TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "road")], meta: None },
+        ],
+        &[],
+    );
+
+    // Minimal (empty) OSC - the rejection should fire before any
+    // blob work happens, so the diff content is irrelevant.
+    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6"></osmChange>"#);
+
+    let result = merge(
+        &base, &osc, &output,
+        &MergeOptions {
+            compression: Compression::default(),
+            direct_io: false,
+            io_uring: false,
+            force: true,
+            locations_on_ways: true,
+            jobs: None,
+        },
+        &pbfhogg::HeaderOverrides::default(),
+    );
+    let err = match result {
+        Ok(_) => panic!("must reject --force --locations-on-ways on non-indexed PBF"),
+        Err(e) => e,
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("--force") && msg.contains("--locations-on-ways"),
+        "expected setup-time rejection message, got: {msg}",
+    );
+    assert!(
+        msg.contains("pbfhogg cat"),
+        "error should point at the indexed-generation workflow, got: {msg}",
+    );
+}

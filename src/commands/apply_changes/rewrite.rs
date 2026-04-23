@@ -142,13 +142,34 @@ pub fn merge(
         locations_on_ways,
         jobs,
     } = *opts;
-    require_indexdata(
+    let has_base_indexdata = require_indexdata(
         base_pbf,
         direct_io,
         force,
         "base PBF has no blob-level indexdata. Without indexdata, every blob must be \
          decompressed to classify elements (significantly slower).",
     )?;
+
+    // --force --locations-on-ways on a non-indexed base PBF is unsound:
+    // under --force the scanner tags every blob as a placeholder `Node`
+    // (real kind is not known until decompress), which defeats the
+    // Node->Way barrier that would otherwise gate the worker pool
+    // until the node-coord loc_map is published. The consequence is
+    // that way workers run without a loc_map and `rewrite_block_local`
+    // silently falls back to `write_base_way_local` (stripping
+    // LocationsOnWays from every base way). Reject the combination up
+    // front with a clear migration path rather than produce a silently
+    // lossy output.
+    if force && locations_on_ways && !has_base_indexdata {
+        return Err(
+            "apply-changes --force --locations-on-ways on a non-indexed PBF would \
+             silently strip LocationsOnWays data from base ways. Generate an indexed \
+             PBF first:\n\n\
+             \x20 pbfhogg cat <input.osm.pbf> -o indexed.osm.pbf\n\n\
+             Then run apply-changes against the indexed output."
+                .into(),
+        );
+    }
 
     let osc_start = std::time::Instant::now();
     eprintln!("Parsing OSC diff: {}", osc_file.display());

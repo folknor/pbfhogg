@@ -99,6 +99,19 @@ pub(super) fn run_pass1_5(
                                         || flags.is_interp || is_admin
                                     {
                                         for &r in refs {
+                                            // Guard: `IdSet::set_atomic` casts
+                                            // `i64` to `u64` and indexes via
+                                            // `chunk_for_atomic`, which panics
+                                            // if the resulting chunk falls
+                                            // outside the pre-allocated range.
+                                            // A corrupt / hand-edited PBF
+                                            // containing a negative way ref
+                                            // would take out the whole parallel
+                                            // Pass 1.5 scan. Non-atomic
+                                            // `IdSet::set` silently skips
+                                            // negatives; match that here
+                                            // rather than panic.
+                                            if r < 0 { continue; }
                                             referenced_ref.set_atomic(r);
                                         }
                                     }

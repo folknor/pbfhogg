@@ -1185,7 +1185,7 @@ Findings from a multi-agent Opus audit of 0.3.0 high-churn areas before the rele
 
 - [ ] **`geocode_index/builder/admin.rs:127-143` - HIGH.** `write_admin_data` accumulates `vertex_offset: u32` by adding `p.vertices.len() * NODE_COORD_SIZE` with no overflow check; past 4 GiB the offset silently wraps and subsequent polygons point to wrong vertices. No hard-error unlike the sibling u16::MAX overflows this cycle fixed. Trigger: planet-scale admin boundary geometry near the 4 GiB total-vertex-bytes boundary.
 
-- [ ] **`geocode_index/builder/pass1_5.rs:102` - MEDIUM.** `set_atomic(r)` is called on raw way refs without filtering negative IDs; unlike `IdSet::set`, `set_atomic` does not guard `id < 0` and computes a chunk index from a huge u64 cast, panicking via `chunk_for_atomic`. Kills the whole parallel Pass 1.5 scan with a panic instead of a clean error. Trigger: corrupted PBF or test fixture containing a negative node ref in a way.
+- [x] ~~**`geocode_index/builder/pass1_5.rs:102` - MEDIUM.**~~ *(landed 2026-04-23; added an `if r < 0 { continue; }` guard at the call site, matching the silent-skip behaviour of the non-atomic `IdSet::set`. Defensive fix - no standalone regression test since the fix is aligning with existing `IdSet::set` semantics and any positive-behaviour assertion would need a synthetic negative-ref fixture that isn't in the test fixtures yet.)*
 
 - [ ] **`geocode_index/builder/admin.rs:152-189` - MEDIUM.** `write_admin_index` tracks `byte_off: u32` for admin-entries file position with no overflow guard on `+= 2` / `+= 4` accumulators; past 4 GiB the offset wraps and cells after that point read garbage entries. Unlikely at today's scales but not rejected. Trigger: enough admin entries to exceed 4 GiB of entries data.
 

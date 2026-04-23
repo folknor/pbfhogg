@@ -998,7 +998,7 @@ Remaining open findings from a multi-agent Opus audit of 0.3.0 high-churn areas.
 - write path: 5 MEDIUM, 2 LOW
 - read path: 1 MEDIUM, 2 LOW
 - renumber: 6 MEDIUM, 2 LOW
-- altw external: 1 HIGH (Null Island, documented-accepted per CORRECTNESS.md), 5 MEDIUM, 3 LOW
+- altw external: 5 MEDIUM, 3 LOW
 - diff / derive-parallel: 3 MEDIUM latent (mixed-sign numeric compare; production PBFs are positive-only), 2 LOW
 - geocode: 1 HIGH (admin.rs u32 vertex_offset overflow), 5 MEDIUM, 3 LOW
 - smaller commands: 1 MEDIUM, 2 LOW
@@ -1067,7 +1067,7 @@ Remaining open findings from a multi-agent Opus audit of 0.3.0 high-churn areas.
 
 ### altw external
 
-- [ ] **`altw/external/stage2.rs:534` / `mod.rs:559` - HIGH (documented-accepted)** *(verified 2026-04-23, matches CORRECTNESS.md)*. Stage-2 uses `(lat == 0 && lon == 0)` as the missing-coord sentinel. Confirmed: sentinel still lives at stage2.rs:534 with an explicit block-comment at :522-533 cross-linking to the geocode counterpart. Already documented-accepted per CORRECTNESS.md "Null Island ambiguity in dense mmap index" - affects zero real-world nodes. Keep as-is until a real-world case surfaces; fix shape is a separate occupancy bitmap or explicit valid-bit track.
+- [x] ~~**`altw/external/stage2.rs:534` / `mod.rs:582` - HIGH (documented-accepted).**~~ *(closed 2026-04-23 without code change. Existing inline comment at stage2.rs:522-533 and CORRECTNESS.md "Null Island ambiguity in dense mmap index" already explain the accepted limitation; added a short cross-link comment at the `missing_locations` site in mod.rs so the invariant is visible where the counter is published, not just where the sentinel is tested. Affects zero real-world nodes; fix shape remains a separate occupancy bitmap if a user case ever surfaces.)*
 
 - [ ] **`altw/external/stage1.rs:269-273` + `stage2.rs:459-493` - MEDIUM.** Stage 2's blob-local rank counter (`next_rank = blob.ref_rank_start`, incremented per referenced tuple) is correct only if indexdata `(min_id, max_id)` tightly brackets actual node IDs in the blob. A producer with loose bounds plus the `debug_assert_eq!` at stage2.rs:488 passes in release and silently produces skewed ranks, scrambling the join. Trigger: input PBF with sloppy indexdata ranges from a third-party writer.
 

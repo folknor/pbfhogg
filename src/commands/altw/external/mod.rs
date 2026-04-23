@@ -579,6 +579,12 @@ pub fn external_join(
         );
     }
 
+    // `resolved_count` counts slots whose coord tuple is `!= (0, 0)`. A
+    // real OSM node at exactly 0.0000000, 0.0000000 is indistinguishable
+    // from an unresolved slot (zero-initialized scratch) and gets
+    // counted as missing. Accepted limitation; see
+    // `stage2.rs` `is_resolved` comment and CORRECTNESS.md
+    // "Null Island ambiguity in dense mmap index" for the rationale.
     stats.missing_locations = total_slots.saturating_sub(resolved_count);
 
     drop(scratch_dir);

@@ -49,8 +49,59 @@ use stage4::stage4_assembly;
 /// 14B gives headroom above the current ~13B maximum.
 pub(super) const MAX_NODE_ID: u64 = 14_000_000_000;
 
+/// Outcome of the `RLIMIT_NOFILE` self-raise attempt.
+pub(super) enum FdRaiseStatus {
+    /// `getrlimit` failed; caller is using the conservative fallback.
+    ProbeFailed,
+    /// Soft limit was already at the hard cap; nothing to raise.
+    AlreadyAtCap,
+    /// Soft raised from `from` up to the hard cap.
+    Raised { from: u64 },
+    /// Soft limit is below the hard cap but `setrlimit` rejected the
+    /// raise. Rare: unprivileged soft-raise to hard cap should always
+    /// succeed on Linux, but seccomp or LSM policies can block it.
+    RaiseFailed,
+}
+
+/// Result of probing + raising `RLIMIT_NOFILE`. `Display` prints a
+/// compact one-line summary suitable for stderr narration.
+pub(super) struct FdBudget {
+    /// Effective soft limit after the raise attempt, clamped to a sane
+    /// ceiling if the kernel reports `RLIM_INFINITY`.
+    pub(super) effective_soft: u64,
+    pub(super) status: FdRaiseStatus,
+}
+
+impl std::fmt::Display for FdBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.status {
+            FdRaiseStatus::ProbeFailed => write!(
+                f,
+                "RLIMIT_NOFILE: probe failed; assuming {}",
+                self.effective_soft
+            ),
+            FdRaiseStatus::AlreadyAtCap => write!(
+                f,
+                "RLIMIT_NOFILE: {} (already at hard cap; no adjustment)",
+                self.effective_soft
+            ),
+            FdRaiseStatus::Raised { from } => write!(
+                f,
+                "RLIMIT_NOFILE: {from} -> {} (soft raised to hard cap)",
+                self.effective_soft
+            ),
+            FdRaiseStatus::RaiseFailed => write!(
+                f,
+                "RLIMIT_NOFILE: {} (raise to hard cap rejected; still at soft cap)",
+                self.effective_soft
+            ),
+        }
+    }
+}
+
 /// Self-raise `RLIMIT_NOFILE` soft limit to the current hard cap and
-/// report the effective soft limit.
+/// report both the effective soft limit and the narrative of what
+/// happened.
 ///
 /// External join's stage 1 pass B holds `num_workers * NUM_BUCKETS`
 /// (up to ~4096 on a 17-core host) rank-shard files open concurrently.
@@ -61,9 +112,9 @@ pub(super) const MAX_NODE_ID: u64 = 14_000_000_000;
 /// soft-raise up to hard cap is the standard pattern for servers
 /// (PostgreSQL, Redis, nginx).
 ///
-/// Returns 1024 as a conservative fallback if the probe itself fails,
-/// so callers can still compute a sensible cap.
-pub(super) fn raise_nofile_to_hard_cap() -> u64 {
+/// Returns 1024 as a conservative fallback `effective_soft` if the
+/// probe itself fails, so callers can still compute a sensible cap.
+pub(super) fn raise_nofile_to_hard_cap() -> FdBudget {
     // SAFETY: `getrlimit`/`setrlimit` are pure-data FFI calls. The
     // rlimit struct is fully initialised before being passed as
     // `&mut`, and we don't share it across threads.
@@ -73,25 +124,44 @@ pub(super) fn raise_nofile_to_hard_cap() -> u64 {
             rlim_max: 0,
         };
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
-            return 1024;
-        }
-        if rlim.rlim_cur < rlim.rlim_max {
-            let target = libc::rlimit {
-                rlim_cur: rlim.rlim_max,
-                rlim_max: rlim.rlim_max,
+            return FdBudget {
+                effective_soft: 1024,
+                status: FdRaiseStatus::ProbeFailed,
             };
-            // Unprivileged soft-raise up to hard cap always succeeds on
-            // Linux; ignore the return and re-probe to see what stuck.
-            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &target);
-            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
-                return 1024;
+        }
+        let soft_before: u64 = rlim.rlim_cur;
+        let hard: u64 = rlim.rlim_max;
+        if soft_before >= hard {
+            // `rlim_cur` can be `RLIM_INFINITY` (= `u64::MAX` on
+            // Linux); clamp so downstream arithmetic doesn't overflow.
+            return FdBudget {
+                effective_soft: soft_before.min(1 << 30),
+                status: FdRaiseStatus::AlreadyAtCap,
+            };
+        }
+        let target = libc::rlimit {
+            rlim_cur: hard,
+            rlim_max: hard,
+        };
+        let raise_ok = libc::setrlimit(libc::RLIMIT_NOFILE, &target) == 0;
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
+            return FdBudget {
+                effective_soft: 1024,
+                status: FdRaiseStatus::ProbeFailed,
+            };
+        }
+        let effective: u64 = rlim.rlim_cur.min(1 << 30);
+        if raise_ok {
+            FdBudget {
+                effective_soft: effective,
+                status: FdRaiseStatus::Raised { from: soft_before },
+            }
+        } else {
+            FdBudget {
+                effective_soft: effective,
+                status: FdRaiseStatus::RaiseFailed,
             }
         }
-        // `rlim_cur` can be `RLIM_INFINITY` (= `u64::MAX` on Linux);
-        // clamp to a sane ceiling so downstream arithmetic doesn't
-        // overflow on systems that report unlimited.
-        let current: u64 = rlim.rlim_cur;
-        current.min(1 << 30)
     }
 }
 

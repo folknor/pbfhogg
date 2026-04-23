@@ -14,12 +14,41 @@ pipeline primitives documented in
 
 ## Current state (2026-04-23)
 
-No `.brokkr/results.db` rows at planet scale yet.
-`overnight.sh:272-275` runs `brokkr sort --dataset planet --bench 1`,
-`--io-uring --bench 1`, `--hotpath`, `--alloc` tonight, so the
-baseline lands morning of 2026-04-24. Denmark (indexed, sorted) 366 ms,
-Japan (indexed, sorted) 1.33 s,
+Europe baseline landed today (commit `b891514`, host `plantasjen`):
+
+| mode    | uuid       | wall    | notes |
+|---------|------------|---------|-------|
+| bench   | `043cf4b6` | 53.0 s  | `--bench 1`, buffered writer |
+| alloc   | `99c58e53` | 54.7 s  | alloc-instrumented |
+| hotpath | `fd2ef4e7` | 64.7 s  | hotpath-instrumented |
+
+Planet baseline still pending; `overnight.sh:272-275` runs
+`brokkr sort --dataset planet --bench 1`, `--io-uring --bench 1`,
+`--hotpath`, `--alloc` tonight, lands morning of 2026-04-24. Denmark
+(indexed, sorted) 366 ms, Japan (indexed, sorted) 1.33 s,
 [`reference/performance.md:774`](../reference/performance.md#L774).
+
+Europe `043cf4b6` phase split:
+
+- `SORT_INDEX_BUILD` 16.39 s (30.9 %)
+- `SORT_OVERLAP_DETECT` 30 ms
+- `SORT_WRITE_LOOP` 35.01 s (66.1 %)
+- `SORT_FLUSH` 905 ms
+
+Counters confirm the already-sorted path: `sort_blobs_passthrough =
+522168`, `sort_blobs_overlap = 0`, `sort_blobs_rewritten = 0`, 35.26
+GB in = 35.26 GB out. The writer issues **522 168 single-blob
+`copy_file_range` calls** (`writer_payload_copy_range_items`), one
+per blob, with `writer_write_ns = 34.72 s` accounting for essentially
+all of pass 2. `SORT_WRITE_LOOP` averages 0.3 cores with 519 k
+voluntary context switches: syscall-bound, not CPU-bound.
+
+Hotpath confirms the shape: `write_passthrough_blob` is 64.4 % of
+wall (522 168 calls, avg 79.7 µs / p50 13.6 µs / p95 316.7 µs),
+`build_blob_index` 29.6 %, `blob_wire::parse` 0.41 %. Alloc profile:
+`blob_wire::parse` owns 834.9 MB across 522 171 calls (~1.6 KB each,
+short-lived, net diff 78.6 MB); `write_passthrough_blob` is zero-byte
+exclusive. No allocator pressure worth chasing.
 
 **The production scenario is already-sorted input.** Geofabrik and
 planet PBFs ship in `Sort.Type_then_ID`; every pbfhogg pipeline step
@@ -52,14 +81,23 @@ blob, with the buffered writer that's one `write_raw_copy` per blob.
 Neither coalesces consecutive passthrough frames from the same input
 file.
 
+Europe `043cf4b6` quantifies the baseline: 522 168
+`copy_file_range` calls for one contiguous 35 GB passthrough run.
+`SORT_WRITE_LOOP` at 0.3 avg cores and 519 k voluntary context
+switches is consistent with one context switch per `copy_file_range`
+syscall.
+
 `apply-changes`'s drain path already coalesces adjacent passthrough
 frames into single `copy_file_range` spans (see `drain.rs` and
 `streaming.rs` coalescer logic). Transplanting that pattern to sort's
 write loop reduces syscall / SQE count by the run length, which on
 already-sorted inputs is the entire file.
 
-Estimated 1.1-1.5x on the already-sorted planet case via syscall
-reduction. Directly benefits the production scenario.
+Sized against europe: `copy_file_range` caps at ~2 GB per call
+(kernel-side chunking), so a single 35 GB run coalesces into ~18
+calls rather than 522 168. Expected 1.3-2x on the already-sorted
+europe wall via syscall reduction; planet's 85 GB becomes ~43 calls.
+Directly benefits the production scenario.
 
 Hours scope. No risk beyond matching the existing pattern's
 boundary-flush discipline (flush on overlap run start, type change,
@@ -123,9 +161,11 @@ Minutes scope. Land only as part of a sweep of related changes.
 
 ## Prerequisites before shipping anything
 
-1. **Planet baseline** scheduled for `overnight.sh:272-275` tonight.
-   Baseline lands 2026-04-24. That's already-sorted planet; covers
-   the production path and opportunity #1.
+1. **Europe baseline landed** (commit `b891514`, uuid `043cf4b6`,
+   53.0 s). Planet baseline still scheduled for
+   `overnight.sh:272-275` tonight, lands 2026-04-24. Europe alone is
+   enough to exercise and measure opportunity #1; planet will
+   confirm the scaling.
 2. **Unsorted-input dataset** for opportunities #2 and #3. None in
    `brokkr.toml` today; would need configuring (or a synthetic
    fixture) before those opportunities can be sized.

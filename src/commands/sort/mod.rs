@@ -172,9 +172,17 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderO
     let mut frame_buf: Vec<u8> = Vec::new();
 
     crate::debug::emit_marker("SORT_WRITE_LOOP_START");
+    // Passthrough coalescer: adjacent blobs contiguous in the input file
+    // collapse into one `copy_file_range` call. On already-sorted input this
+    // is the entire file, cutting syscall count from O(blobs) to O(1).
+    // Mirrors the apply_changes drain coalescer (drain.rs:408-410).
+    let mut copy_run: Option<(u64, u64)> = None;
+    let mut copy_run_calls: u64 = 0;
+    let mut copy_run_coalesced: u64 = 0;
     let mut i = 0;
     while i < entries.len() {
         if overlaps[i] {
+            flush_copy_run(&mut copy_run, &mut writer, input_fd, &mut copy_run_calls)?;
             let start = i;
             let run_kind = entries[i].index.kind;
             // Overlap runs must contain exactly one element kind.
@@ -199,19 +207,28 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderO
                 &mut stats,
             )?;
         } else {
-            write_passthrough_blob(
-                &entries[i],
-                &mut input_file,
-                &mut writer,
-                &mut frame_buf,
-                input_fd,
+            let entry = &entries[i];
+            match try_extend_copy_run(
+                &mut copy_run,
+                entry,
                 use_copy_range,
-            )?;
-            count_entry(&entries[i], &mut stats);
+                &mut writer,
+                input_fd,
+                &mut copy_run_calls,
+            )? {
+                CopyRunStep::Extended => copy_run_coalesced += 1,
+                CopyRunStep::Started => {}
+                CopyRunStep::Fallback => {
+                    flush_copy_run(&mut copy_run, &mut writer, input_fd, &mut copy_run_calls)?;
+                    write_passthrough_blob(entry, &mut input_file, &mut writer, &mut frame_buf)?;
+                }
+            }
+            count_entry(entry, &mut stats);
             stats.blobs_passthrough += 1;
             i += 1;
         }
     }
+    flush_copy_run(&mut copy_run, &mut writer, input_fd, &mut copy_run_calls)?;
 
     crate::debug::emit_marker("SORT_WRITE_LOOP_END");
 
@@ -219,6 +236,8 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderO
     {
         crate::debug::emit_counter("sort_blobs_passthrough", stats.blobs_passthrough as i64);
         crate::debug::emit_counter("sort_blobs_rewritten", stats.blobs_rewritten as i64);
+        crate::debug::emit_counter("sort_copy_range_calls", copy_run_calls as i64);
+        crate::debug::emit_counter("sort_copy_range_coalesced", copy_run_coalesced as i64);
     }
 
     crate::debug::emit_marker("SORT_FLUSH_START");
@@ -365,33 +384,99 @@ fn detect_overlaps(entries: &[BlobEntry]) -> Vec<bool> {
 // Pass 2: Passthrough write
 // ---------------------------------------------------------------------------
 
-/// Write a non-overlapping blob as raw bytes, adding indexdata if missing.
+/// Fallback passthrough path: buffered read + reframe (when indexdata is
+/// missing) or raw `write_raw` (when present but `copy_file_range` isn't
+/// usable for this blob - e.g. O_DIRECT output).
 #[hotpath::measure]
-#[allow(unused_variables)]
 fn write_passthrough_blob(
     entry: &BlobEntry,
     input_file: &mut File,
     writer: &mut PbfWriter<FileWriter>,
     frame_buf: &mut Vec<u8>,
-    input_fd: i32,
-    use_copy_range: bool,
 ) -> Result<()> {
     if entry.has_indexdata {
-        // Already has indexdata - pure passthrough
-        #[cfg(feature = "linux-direct-io")]
-        if use_copy_range {
-            writer.write_raw_copy(input_fd, entry.file_offset, entry.frame_len)?;
-            return Ok(());
-        }
         read_frame_into(input_file, entry, frame_buf)?;
         writer.write_raw(frame_buf)?;
     } else {
-        // Reframe with indexdata before writing
+        // Reframe with indexdata before writing.
         read_frame_into(input_file, entry, frame_buf)?;
         let blob_bytes = extract_blob_bytes(frame_buf)?;
         let reframed = reframe_raw_with_index(blob_bytes, &entry.index.serialize(), entry.tagdata.as_deref())?;
         writer.write_raw(&reframed)?;
     }
+    Ok(())
+}
+
+/// Outcome of offering a blob to the `copy_file_range` coalescer.
+#[allow(dead_code)] // `Extended`/`Started` only constructed under `linux-direct-io`.
+enum CopyRunStep {
+    /// Blob extended an in-flight run (contiguous with the current tail).
+    Extended,
+    /// Blob started a new run; any prior run was flushed.
+    Started,
+    /// Blob can't go through the copy path - missing indexdata or
+    /// `copy_file_range` unavailable. Caller flushes + uses the fallback.
+    Fallback,
+}
+
+/// Try to fold `entry` into an in-flight `copy_file_range` run.
+#[allow(unused_variables)]
+fn try_extend_copy_run(
+    run: &mut Option<(u64, u64)>,
+    entry: &BlobEntry,
+    use_copy_range: bool,
+    writer: &mut PbfWriter<FileWriter>,
+    input_fd: i32,
+    calls: &mut u64,
+) -> Result<CopyRunStep> {
+    if !(entry.has_indexdata && use_copy_range) {
+        return Ok(CopyRunStep::Fallback);
+    }
+    #[cfg(feature = "linux-direct-io")]
+    {
+        match *run {
+            Some((start, end)) if end == entry.file_offset => {
+                *run = Some((start, end + entry.frame_len));
+                Ok(CopyRunStep::Extended)
+            }
+            _ => {
+                flush_copy_run(run, writer, input_fd, calls)?;
+                *run = Some((entry.file_offset, entry.file_offset + entry.frame_len));
+                Ok(CopyRunStep::Started)
+            }
+        }
+    }
+    #[cfg(not(feature = "linux-direct-io"))]
+    Ok(CopyRunStep::Fallback)
+}
+
+/// Emit any in-flight `copy_file_range` run as a single `write_raw_copy`
+/// call and clear the run state. No-op when no run is in flight.
+#[cfg(feature = "linux-direct-io")]
+fn flush_copy_run(
+    run: &mut Option<(u64, u64)>,
+    writer: &mut PbfWriter<FileWriter>,
+    input_fd: std::os::unix::io::RawFd,
+    calls: &mut u64,
+) -> Result<()> {
+    if let Some((start, end)) = run.take() {
+        writer.write_raw_copy(input_fd, start, end - start)?;
+        *calls += 1;
+    }
+    Ok(())
+}
+
+/// No-op stub: without `linux-direct-io`, `try_extend_copy_run` never
+/// populates `run`, so this only ever sees `None`.
+#[cfg(not(feature = "linux-direct-io"))]
+fn flush_copy_run(
+    run: &mut Option<(u64, u64)>,
+    _writer: &mut PbfWriter<FileWriter>,
+    _input_fd: i32,
+    _calls: &mut u64,
+) -> Result<()> {
+    debug_assert!(run.is_none(), "copy_file_range run set without linux-direct-io feature");
+    run.take();
     Ok(())
 }
 

@@ -2,9 +2,13 @@
 
 ## Active optimization plans (high priority)
 
-Five planet-scale command plans are in notes, each with a ranked set of opportunities and a plan of attack. Read the plan before touching the command.
+Planet-scale command plan docs live in [notes/](notes/). Each has a current-state header, a ranked opportunity list, and cross-references. Read the plan before touching the command.
 
-- [ ] **[notes/merge-changes.md](notes/merge-changes.md)** - `merge-changes` (squash N OSCs → 1). **Unmeasured at planet scale.** Two serial-across-inputs shapes (`merge_changes::write_streaming` at CLI level, `osc::load_all_diffs` at library level) parallelize cleanly via `IdSetDense::set_atomic_if_new` newer-wins dedupe; estimated ~20-30 s saved at 7-OSC planet per reviewer Q7 speculation, unconfirmed until a baseline exists. No win at 1-OSC scale. Prerequisites before shipping: (1) run `brokkr merge-changes --dataset planet --osc-range 4914..4920 --bench 1` to store a wall + RSS baseline in `.brokkr/results.db`; (2) add per-input `MERGE_CHANGES_PARSE_START/END` markers so parallel-parse can be compared against the per-OSC share of serial wall; (3) confirm `load_all_diffs` call-site scope (only `merge-changes` + `apply-changes` today?). Content factored out of `apply-changes-opportunities.md` 2026-04-21 - these items were filed under "weekly apply-changes" but apply scale-independently to any consumer that squashes N > 1 OSCs.
+- [ ] **[notes/merge-changes.md](notes/merge-changes.md)** - `merge-changes` (squash N OSCs → 1). The serial-across-inputs CLI shape `merge_changes::write_streaming` parallelizes cleanly via `IdSet::set_atomic_if_new` newer-wins dedupe; estimated ~20-30 s saved at 7-OSC planet per reviewer Q7 speculation. No win at 1-OSC scale. **All prerequisites landed**: per-input `MERGECHANGES_PARSE_{START,END}` markers (commit `4e3c7ea`) on both the streaming and `--simplify` paths with `merge_changes_input_bytes` counter inside the span for per-OSC size distribution; overnight.sh already runs `brokkr merge-changes --dataset planet --osc-range 4914..4920 --bench 1` + `--hotpath` (overnight.sh:246-247) so the 2026-04-24 morning sidecar gives serial wall + per-OSC parse wall + hotpath breakdown. Library-level `osc::load_all_diffs` has no markers but is **unused in production** (only `#[cfg(test)]` call sites); apply-changes takes a single OSC via `parse_osc_file` so the "per-input" axis doesn't apply there. After tomorrow's baseline lands, size the parallel-parse win against the per-OSC share of serial wall and implement the rayon-scoped parse-fan-out if it's worth the complexity. Content factored out of `apply-changes-opportunities.md` 2026-04-21 - these items were filed under "weekly apply-changes" but apply scale-independently to any consumer that squashes N > 1 OSCs.
+
+- [ ] **[notes/sort.md](notes/sort.md)** - `sort` (repair unsorted PBFs into `Sort.Type_then_ID`). Drafted 2026-04-23. **Production reality**: Geofabrik / planet input is already sorted, so the overlap-count is ~zero and pass 2 is pure raw passthrough. The headline opportunity that helps the production case is **`copy_file_range` coalescing for passthrough runs** (hours-scope, transplant from apply-changes drain, 1.1-1.5x via syscall reduction). The bigger theoretical wins - parallel overlap-rewrite in pass 2 (1.5-3x) and HeaderWalker-based pass 1 (1.2-2x on non-indexed input) - only fire on genuinely-unsorted input, which has no dataset configured in `brokkr.toml` today. Planet baseline scheduled for tonight's `overnight.sh:272-275`; lands 2026-04-24. Anti-conversion rule (pipelined → sequential) explicitly off the table per `reference/pipelined-reader-paths.md:138`.
+
+- [ ] **[notes/getparents.md](notes/getparents.md)** - `getparents` (whole-file scan listing ways / relations referencing a given ID set). Drafted 2026-04-23. **Already uses modern primitives** (pipelined decode, `BlobFilter` node-only-blob skip per CHANGELOG's ~85 % claim, `IdSet` chunked sparse bitset); not "never optimized". Headline opportunity is a **`HeaderWalker` + `IdSet::any_in_range()` blob-level fast path** mirroring `getid`'s include mode (planet 44 s → 7 s, 6.2x); estimated 4-8x at planet, 1-2 days scope, requires indexdata with a fallback. `parallel_classify_phase` substitution is bench-gated (10-20 % or neutral; keeps the c912e4d Denmark 4.7× sequential-decode regression explicitly off the table - that rule targets sequential-decode conversions, not pread-worker substitutions). Planet baseline scheduled for tonight's `overnight.sh:276-278` + `--alloc`; lands 2026-04-24.
 
 - [x] ~~**altw-as-renumber (in-RAM coord-table thesis)**~~ - **EXPERIMENT FAILED (2026-04-16).** Implemented as `src/commands/altw_v2.rs`, OOM-killed at Europe. Measured unique-referenced count was 3.6 B → 29 GB coord table (plan estimated 2 B / 16 GB at planet; real planet ~10 B / ~80 GB). The in-RAM-coord-table thesis is disproven for Europe+; the existing 4-stage external-sort shape is load-bearing and correct. Post-mortem and numbers now live in [notes/altw-optimization-history.md](notes/altw-optimization-history.md). **Active ALTW work moves to** [notes/altw-external.md](notes/altw-external.md) **(live leads).**
 
@@ -309,6 +313,55 @@ single-pass, tag expression and bbox filtering.
   Three commands have known diffs: extract (relation inclusion criteria),
   diff (14-element version comparison), check-refs (occurrences vs unique).
   See `brokkr verify all` output and README cross-validation section.
+- [ ] **CLI UX: scratch dir + mode naming, unified across the CLI** (raised
+  2026-04-23, unresolved). Two related decisions, both of which should be
+  applied uniformly across every command that carries the pattern, not
+  one-off per command.
+
+  (A) **Scratch-dir argument presence.** Today `add-locations-to-ways
+  --index-type external` infers scratch as `output.parent()` with a `.`
+  fallback (silent cwd footgun at 112-224 GB scale; see the `altw/external/mod.rs:191`
+  bug-sweep entry). Dense/sparse follow the same pattern. Other large-scratch
+  paths (extract complete/smart, geocode builder, renumber stage 2d) need
+  auditing: do they infer scratch the same way, and would a unified policy
+  apply to all of them?
+
+  Three postures for the unified policy, from least to most strict:
+  1. **Fail-on-unsafe-default.** Infer from output.parent(); error cleanly
+     if the derivation falls back to `.`. Catches the footgun, no new flag,
+     no friction for the common "output on big disk" case.
+  2. **Balanced: add a `--scratch DIR` override everywhere.** Default to
+     output.parent(). Error on bare filename without `--scratch`. Gives
+     users who want scratch on a different disk than output an explicit
+     lever. Same footgun protection as (1).
+  3. **Strict: require `--scratch` on every large-scratch command.**
+     Self-documenting; every invocation names the scratch dir. Script-
+     breaking for existing users; friction even when the inference would
+     have been right.
+
+  Pick one posture, apply to altw (all three backends) + extract complete/smart
+  + geocode builder + any other commands that land >1 GB of scratch. The
+  per-command bug-sweep LOW ticket for altw folds in once the posture
+  is picked.
+
+  (B) **Rename `--index-type` to `--mode`, and unify mode-like flag naming
+  across the CLI.** Today we have:
+  - `add-locations-to-ways --index-type` (dense/sparse/external/auto)
+  - `extract --strategy` (simple/complete/smart)
+  - `bench-read --mode`, `bench-write --mode`, `bench-write --io-mode`
+  - `diff --format` (text/osc) - semantically "output shape", different concept
+
+  `--index-type` is misnamed (external isn't really an index), `--strategy`
+  and `--mode` are synonyms picked inconsistently, and `bench-*` already
+  uses `--mode`. Unifying on `--mode` across add-locations-to-ways,
+  extract, and the bench subcommands would make the CLI more regular at
+  the cost of a breaking rename on two user-facing commands. `--format`
+  for output shape (diff, and potential future geojson/csv exports) is
+  a different axis and should stay `--format`.
+
+  Both decisions are breaking CLI changes; batch them into a single
+  release note when we land them. No urgency - 0.3.0 ships with the
+  current names.
 - [ ] Auto-selection: `--index-type auto` exists (dense vs external).
   Extend to other decisions: sequential vs pread-from-workers based on
   available RAM and blob count; compression level based on output target;
@@ -859,7 +912,7 @@ Remaining open findings from a multi-agent Opus audit of 0.3.0 high-churn areas.
 
 - [ ] **`altw/external/stage4.rs:645` - MEDIUM (perf)** *(verified 2026-04-23)*. Passthrough path takes `frame_read_buf` via `std::mem::take`; next iteration's `frame_read_buf.resize(frame_size, 0)` on the now-empty Vec forces a fresh allocation. Buffer reuse intent is defeated. Fix: use `std::mem::replace(&mut frame_read_buf, Vec::with_capacity(frame_size))` or pass by reference.
 
-- [ ] **`altw/external/mod.rs:191` - LOW.** `ScratchDir::new` uses `output.parent().unwrap_or(Path::new("."))` - if `output` is a bare filename with no parent component, scratch files land in the current working directory. A user running from `/` or a tmpfs cwd while outputting to a large disk can land ~224 GB of scratch on the wrong filesystem. The dense path has the same pattern. Trigger: running external-join from a small-fs cwd.
+- [ ] **`altw/external/mod.rs:191` - LOW.** `ScratchDir::new` uses `output.parent().unwrap_or(Path::new("."))` - if `output` is a bare filename with no parent component, scratch files land in the current working directory. A user running from `/` or a tmpfs cwd while outputting to a large disk can land ~224 GB of scratch on the wrong filesystem. The dense path has the same pattern. Trigger: running external-join from a small-fs cwd. See "CLI UX: scratch dir + mode naming" under Milestone 3 > Command surface for the broader design question this finding folds into.
 
 - [x] ~~**`altw/external/stage2.rs:488-493`**~~ - landed 2026-04-23. Promoted `debug_assert_eq!` to an always-on `return Err(...)` with blob offset + expected/actual rank range in the error message. Negligible cost (once per blob, not per tuple).
 

@@ -212,21 +212,9 @@ per-worker coord slots, framed-chunk buffering at the drain (~800 KB
 per rewrite blob in-flight), and the `BTreeMap<seq, DrainItem>`
 reorder buffer account for most of the RSS delta.
 
-Setup notes:
-
-- `RLIMIT_MEMLOCK` must be ≥16 MB for `--io-uring` to register its
-  64×256 KB buffer pool. Raise with
-  `sudo prlimit --pid=$$ --memlock=unlimited:unlimited` in the bench
-  shell before running.
-- Cross-disk benches override `[plantasjen].scratch` in `brokkr.toml`
-  from the default `data/bench-tmp` to a path on the secondary NVMe.
-  Reverted post-bench.
-- The `[plantasjen.drives].target = "hdd"` label in the toml is
-  separately misleading: brokkr writes bench output to `scratch`, not
-  to `target`. The "hdd" classification refers to an unrelated cargo
-  build dir.
-- Full plan + synthesis + measurement log in
-  [notes/apply-changes-opportunities.md](../notes/apply-changes-opportunities.md).
+Full plan, bench setup (`RLIMIT_MEMLOCK` for `--io-uring`, cross-disk
+scratch toml override, etc.), and measurement log in
+[notes/apply-changes-opportunities.md](../notes/apply-changes-opportunities.md).
 
 ## Add-locations-to-ways
 
@@ -295,21 +283,13 @@ three whole-file header-oriented scans into one shared metadata pass.
 (~16 GB) exceeds available RAM, causing thrashing. External's sequential
 I/O stays bounded.
 
-### External join stage breakdown (Europe, commit `3d977a0`, plantasjen)
-
-| Stage | Time | RSS (anon) | Description |
-|-------|------|-----------|-------------|
-| Stage 1 (way pass) | 79s | 3.6 GB peak | Pass A (per-way refcount sidecar) + pass B (rank records) + coord pass |
-| Stage 2 (node join) | 90s | 7.1 GB peak | Parallel counting-sort per rank bucket, coord slice pread |
-| Stage 3 (slot reorder) | 42.5s | 7.8 GB peak | Delta-varint encodes per-blob coord_payloads; no coord_slots written |
-| Finalize | 26.5s | 7.9 GB peak | Sequential concat of worker temps + encoded straddlers |
-| Stage 4 (assembly) | 129s | 3.1 GB peak | Per-blob pread of coord_payloads; de-interleave into PBF wire format |
-| **Total** | **400s** | | |
-
 ### External join stage breakdown (Europe, commit `d3e13ed`, plantasjen)
 
-Shared blob-metadata scan is now explicit and replaces the old repeated
-header-only walks in stage 1 and stage 4.
+Shared blob-metadata pass replaced three earlier separate scans
+(`s1_way_schedule_build_ms` 24.8 s → 0.08 s,
+`s1_node_map_build_ms` 30.9 s → 0.12 s,
+`s4_schedule_scan_ms` 31.5 s → 0.14 s), collapsing ~87 s of repeated
+work into ~31 s of shared scan.
 
 | Phase | Time | RSS (anon) | Description |
 |-------|------|-----------|-------------|
@@ -322,39 +302,13 @@ header-only walks in stage 1 and stage 4.
 | Stage 4 (assembly) | 90.6s | 3.25 GB peak | Way reframe + node decode/filter + relation passthrough |
 | **Total** | **333s** | | |
 
-### External join stage breakdown (Europe, commit `e497e54`, plantasjen) [TAINTED]
-
-The finalize phase is replaced by an in-RAM routing table: worker tmp
-files stay open and stage 4 preads directly from the right fd. No more
-consolidated `coord_payloads` file. Shipped at commit `e497e54`
-(`BlobLocationRouter`); see `notes/altw-optimization-history.md`.
-
-| Phase | Time | RSS (anon) | Description |
-|-------|------|-----------|-------------|
-| Meta scan | 28.5s | 16 MB peak | Single reusable blob-metadata pass |
-| Stage 1 (way pass) | 36.9s | 3.66 GB peak | Pass A + pass B; unchanged from `d3e13ed` |
-| Stage 2 (node join) | 91.0s | 7.57 GB peak | unchanged; overall RSS peak |
-| Stage 3 (slot reorder) | 33.6s | 7.50 GB peak | unchanged; emits per-worker tmps (not finalized into a single file) |
-| **Router build** | **0.163s** | 3.07 GB peak | Replaces finalize: walks manifests + straddler staging, encodes straddlers into RAM |
-| Relation scan | 21.0s | 3.14 GB peak | `collect_relation_member_node_ids()` - single-sample variance vs baseline |
-| Stage 4 (assembly) | 91.7s | 3.40 GB peak | `BlobLocationRouter::pread_blob_payload` routes to worker tmps or in-RAM straddlers |
-| **Total** | **320.5s** [TAINTED] | | −12.5 s vs `d3e13ed` on single `--bench 1` sample (UUID `4268196a`) |
-
-Direct phase saving is unambiguous: `18.3 s → 0.163 s` on finalize. Single-sample
-wall delta is smaller than the phase saving because relation-scan and stage-4 wobble
-±a few seconds between runs. Router stats: 56,692 way blobs → 56,437 worker /
-255 straddler / 0 empty; 95 MB encoded straddler bytes held in RAM; 20.7 GB of
-worker tmps kept open for stage-4 pread (no longer consolidated into a separate file).
-
-The shared metadata pass replaced three separate scans on Europe:
-
-- `s1_way_schedule_build_ms`: `24.8s -> 0.08s`
-- `s1_node_map_build_ms`: `30.9s -> 0.12s`
-- `s4_schedule_scan_ms`: `31.5s -> 0.14s`
-- new `extjoin_meta_scan_ms`: `30.9s`
-
-Net: about **87s** of repeated scan work collapsed to about **31s**, which is
-why stage 1 dropped `91.4s -> 36.0s` and stage 4 dropped `122.7s -> 90.6s`.
+Later at `e497e54` ([TAINTED]) the finalize phase was replaced by an
+in-RAM `BlobLocationRouter` routing table (finalize 18.3 s → 0.163 s on
+a single-sample bench), trading a consolidated `coord_payloads` file
+for 95 MB of encoded straddler bytes in RAM plus ~21 GB of worker
+tmps kept open across stage 4. See
+[notes/altw-optimization-history.md](../notes/altw-optimization-history.md)
+for the superseded `3d977a0` and `e497e54` breakdowns.
 
 ### `seek_raw` BufReader-discard fix (2026-04-18, commit `aa3147c`)
 
@@ -393,189 +347,80 @@ variance.
 unclear whether real or noise without `--bench 3` repeat. Not a
 regression in any case.
 
-#### Planet refresh (commit `aee7727`, 2026-04-18, plantasjen)
+#### Current planet baselines (commits `aee7727` → `01c67da`, 2026-04-18 to 2026-04-20, plantasjen)
 
-Post-fix snapshot of every planet-capable command that was re-benched.
-All rows carry the `ca6711e` short-circuit fix and the `aa3147c`
-`BlobReaderSource` header-walk fix. Numbers are the current ground
-truth for the README table; historical README rows (most from before
-the regression window) are retained in the per-command sections below
-for cross-reference.
+Post-TAINTED-window ground truth, consolidating three refresh rounds
+after the `ca6711e` short-circuit fix, `aa3147c` `BlobReaderSource`
+header-walk fix, `HeaderWalker` adoption across every in-tree header
+scan (`de8daf1`..`01c67da`), and the `d263d76` 1-pread probe
+refinement. All rows re-measured after the fixes; historical
+per-command sections below carry the pre-regression numbers for
+cross-reference.
 
-| Command | Mode | Wall | UUID | README row before | Δ |
-|---|---|---:|---|---:|---:|
-| cat --type way | `--bench 3` | 45.3 s | `2fe62148` | 44 s | +1 s (noise) |
-| getid | `--bench 1` | 43.8 s | `5a44889d` | 66 s | **−22 s** |
-| getid --invert | `--bench 1` | 91.0 s | `40f5bd52` | 83 s | +8 s (noise) |
-| check --refs | `--bench 1` | 70.2 s | `64e9a394` | 72 s | −2 s (noise) |
-| tags-filter -R | `--bench 1` | 51.8 s | `f262f068` | 52 s | - |
-| extract --smart (Europe bbox) | `--bench 1` | 267.5 s | `07dcdae3` | 282 s | **−14 s** |
-| cat (indexdata generation) | `--bench 1` | 86.5 s | `5d90623f` | 497 s | **−410 s (5.8×)** |
-| add-locations-to-ways --index-type external | `--bench 3` | 661.2 s | `a406d77e` | 698 s | **−37 s** |
-| renumber | `--bench 3` | 204.5 s | `abd74459` | 194 s | +10 s (see note) |
+| Command | Mode | Wall | UUID | vs pre-fix |
+|---|---|---:|---|---:|
+| cat (indexdata generation) | `--bench 1` | **86.5 s** | `5d90623f` | 497 s → **5.8×** |
+| check --refs | `--bench 1` | **62.7 s** | post-`01c67da` | 72 s → −13.7 % |
+| check --ids --full | `--bench 1` | **63.2 s** | post-`01c67da` | 72.5 s → −12.8 % |
+| getid (include mode) | `--bench 1` | **6.1 s** | `24362e36` | 44 s → **7.2×** |
+| getid --invert | `--bench 1` | 91.0 s | `40f5bd52` | 83 s (noise) |
+| inspect default (index-only) | `--bench 1` | **6.5 s** | `c146f2bb` | 21.4 s → **3.3×** |
+| inspect --nodes `-j 16` | `--bench 1` | **49.4 s** | post-`01c67da` | sequential (never stored) |
+| inspect --tags `-j 16` | `--bench 1` | **168.3 s** | `9d741341` / post-`01c67da` | sequential (never stored) |
+| tags-filter -R | `--bench 1` | 51.8 s | `f262f068` | 52 s (noise) |
+| tags-filter (transitive) | `--bench 1` | **119.9 s** | post-`01c67da` | 147.5 s → −18.7 % |
+| extract --simple (Europe bbox) | `--bench 1` | **247.3 s** | post-`01c67da` | 264.7 s → −6.6 % |
+| extract --complete (Europe bbox) | `--bench 1` | **254.2 s** | post-`01c67da` | 261.8 s → −2.9 % |
+| extract --smart (Europe bbox) | `--bench 1` | 267.5 s | `07dcdae3` | 282 s → −14 s |
+| multi-extract (5 regions) | `--bench 1` | 972.0 s | post-`01c67da` | 1004.6 s → −3.2 % |
+| cat --type way | `--bench 3` | 45.3 s | `2fe62148` | 44 s (noise) |
+| add-locations-to-ways `--index-type external` | `--bench 3` | **661.2 s** | `a406d77e` (pre scan-audit) / 673.6 s post | 698 s → −37 s |
+| apply-changes (daily diff, `--osc-seq 4920`) | `--bench 1` | 756.3 s | `8e940f71` | 753 s (noise) |
+| renumber | `--bench 3` | 204.5 s | `abd74459` | 194 s (+10 s, see below) |
+| diff-snapshots text `-j 16` | `--bench 1` | **227.5 s** | `22a5eb55` | 2151 s → **9.5×** |
+| diff-snapshots osc `-j 16` | `--bench 1` | **313.8 s** | `9b3fc2b9` | 2226 s → **7.1×** |
+| build-geocode-index | `--bench 1` | **432.9 s** | `b4b25c05` (commit `82db8ed`) | independent optimisation arc |
 
-The headline is the unfiltered `cat` row: the 497 s → 86.5 s drop is
-the user-visible shape of the two header-walk fixes compounding on a
-command that does nothing but walk headers + rewrite BlobHeader. The
-old 497 s measurement was taken at `69a127f` (pre-regression), so this
-isn't only a regression rollback - the post-fix path is substantially
-faster than the pre-regression path too, because `seek_raw` was
-shedding buffer on every blob long before the `has_indexdata` bug
-shipped.
+Headline landings:
 
-`getid` fell 22 s at the same time, which is in the right ballpark for
-the `check_sorted_and_indexed` short-circuit saving ~20 s on
-`has_indexdata`-gated subcommands - a second independent confirmation
-of the short-circuit fix at planet scale.
+- **`cat` 497 s → 86.5 s** (5.8×) is the compounding
+  `has_indexdata` short-circuit + `seek_raw` `BufReader`-discard fix
+  on a command that does nothing but walk headers. Old measurement at
+  `69a127f` pre-regression, so this is both a regression rollback and
+  a substantial improvement on the pre-regression path.
+- **`HeaderWalker` (shared, one-pread probe after `d263d76`)** opens
+  the fd with `posix_fadvise(POSIX_FADV_RANDOM)` and reads blob
+  headers via `pread`. Planet getid walker: 88 GB → 601 MB of disk
+  read; planet inspect default: 36.3 GB → 14.2 GB. Full-command
+  header-walk wins shrink at europe scale because the old buffered
+  walk was accidentally prefetching blob bodies via kernel
+  sequential readahead, which downstream decompression reused;
+  `POSIX_FADV_RANDOM` deliberately skips that prefetch. At planet the
+  file is ~4× physical RAM so prefetched pages evict before reuse and
+  the savings land cleanly.
+- **Shard-based parallel `diff` / `diff --format osc`** (new
+  `-j/--jobs N`): N-1 thresholds at old-blob boundaries, per-shard
+  scratch temp files, peak anon ~586 MB (text) / ~663 MB (osc) at
+  planet. Osc's lower speedup is the serial `assemble_osc` gzip +
+  concat of ~45 GB of XML fragment temp files (32.8 s / 10 % of
+  wall).
+- **`inspect --tags -j 16`** peak anon 17.5 GB is the planet
+  distinct-tag map plus glibc anon-page retention from per-blob
+  hashmap churn. A prior `parallel_classify_accumulate` shape
+  reached 26.8 GB (each of 16 workers held a full-cardinality
+  accumulator); the final `parallel_classify_phase` shape emits
+  per-blob maps to a single main-thread merger and avoids the
+  multiplier.
+- **Renumber +10 s (194 → 204.5 s)** is the only row pointing the
+  wrong way; both `--bench 3`, several dozen unrelated commits
+  in-between, ~5 % is inside variance but not comfortably. Not a
+  release blocker and not steady-state critical; shelved.
 
-Renumber's +10 s (194 s → 204.5 s) is the only row pointing the wrong
-way. Both are `--bench 3`; the older 194 s was at `cb99106`, this is
-at `aee7727`, so several dozen commits of unrelated churn sit
-in-between. 5 % is inside `--bench 3` variance but not comfortably
-inside - a deliberate bisect would tell us whether something landed
-that genuinely costs. Not a release blocker and not in the critical
-planet-pipeline path (once-per-schema renumber, not a steady-state
-command), so shelving for now.
-
-Three planet rows in the README table (`check --ids --full`,
-`apply-changes`, `build-geocode-index`) were not re-benched in the
-first round. All three have since been resolved:
-
-- `check --ids --full`: re-benched at `ef6ce09` (`c498fff0`,
-  `--bench 1`), **69.5 s / 1m10s**, down from the old tainted 1m33s
-  row. Untainted - carries both post-fix short-circuit + seek-raw
-  patches. See the `check --ids --full` section below for the
-  post-fix row.
-- `apply-changes` (daily diff, `--osc-seq 4920`): re-benched at
-  `ef6ce09` (`8e940f71`, `--bench 1`), **756.3 s / 12m36s**, inside
-  noise of the prior 753 s buffered+zlib planet row. No drift.
-- `build-geocode-index`: cleared separately via the full optimisation
-  arc (commit `82db8ed`, UUID `b4b25c05`, **432.9 s / 7m12s**). Not
-  part of the refresh round - the arc landed independently.
-
-#### Planet refresh (commit `06628d8`, 2026-04-20, plantasjen)
-
-Two commands picked up large wins in the 2026-04-20 batch via a shared
-`pread`-only header walker (`src/read/header_walker.rs::HeaderWalker`)
-and shard-based parallel merge-join (`-j/--jobs N` on `pbfhogg diff`).
-
-| Command | Mode | Wall | UUID | Row before | Δ |
-|---|---|---:|---|---:|---:|
-| getid (include mode) | `--bench 1` | **6.1 s** | `24362e36` (2026-04-20, 1-pread walker) | 43.8 s (2026-04-18) | **−37.7 s (7.2×)** |
-| inspect (default metadata, index-only) | `--bench 1 --force` | **6.5 s** | forced, dirty tree | 21.4 s (`c146f2bb`, partially-cached pre-migration) | **−14.9 s (3.3×)** |
-| inspect `--nodes -j 16` | `--bench 1` | **56.8 s** | `c5edebe7` | sequential (never stored; germany extrapolation ~370 s) | **~5-6× (new parallel path)** |
-| inspect `--tags -j 16` | `--bench 1` | **169.5 s (2m50s)** | `9d741341` | sequential (never stored; germany extrapolation ~800 s) | **~4-5× (new parallel path)** |
-| diff-snapshots text | `--bench 1 -j 16` | **227.5 s (3m48s)** | `22a5eb55` (2026-04-20, temp-file shape) | 2150.9 s (35m51s, sequential) | **−1923 s (9.5×)** |
-| diff-snapshots --format osc | `--bench 1 -j 16` | **313.8 s (5m13s)** | `9b3fc2b9` | 2225.6 s (37m06s, sequential) | **−1912 s (7.1×)** |
-
-All four carry the 2026-04-18 `ca6711e` + `aa3147c` short-circuit +
-seek-raw fixes plus the 2026-04-20 patches:
-
-- `HeaderWalker` (shared): opens the fd with `posix_fadvise(POSIX_FADV_RANDOM)`
-  and walks blob headers via raw `pread`. Initial implementation did
-  two preads per blob (length prefix + header); the 2026-04-20
-  `d263d76` refinement collapses those to one 4 KB probe pread that
-  covers the length prefix and the full header in the common case
-  (real headers run ~100-200 B), with a tail-fallback pread only for
-  the rare oversized header. Avoids the `BufReader` amplification
-  where data bytes that happen to sit inside the 256 KB buffer window
-  get read and discarded. Planet getid walker: 88 GB → 601 MB of disk
-  read. Planet inspect default path: 36.3 GB → 14.2 GB disk read (the
-  remaining 14 GB is kernel page-granularity fetches plus some
-  residual readahead despite `fadvise(RANDOM)`).
-- Shard-based parallel block-pair merge for `diff` text and osc. N-1
-  thresholds at old-blob boundaries; straddling new blobs are read
-  by both adjacent shards and each shard's element merge clips to its
-  own `(t_low, t_high]` window. Both paths stream shard output to
-  per-shard scratch temp files and concatenate in shard order; peak
-  anon RSS ~586 MB (text) / ~663 MB (osc) at planet. Shard balance
-  within 1.03× max/min on germany.
-
-`getid` is walker-syscall-bound; the 2026-04-20 1-pread refinement
-trimmed planet include-mode from 7.0 s to 6.1 s (-13 %, UUID
-`24362e36`). The syscall floor remains the dominant cost. `diff`
-osc's lower speedup is the serial `assemble_osc` gzip + concat of
-~45 GB of XML fragment temp files (32.8 s / 10 % of wall).
-
-`inspect --nodes -j 16` hits `avg_cores 14.7 / 16` (92 %) on the
-decode + accumulate phase with peak anon 410 MB - per-worker state
-is just scalar stats + a 128-entry coord block buffer, trivially
-mergeable. `inspect --tags -j 16` hits `avg_cores 6.8 / 16` (42 %)
-because the main-thread global-map merge is the serialising step;
-peak anon 17.5 GB is the planet distinct-tag map plus glibc
-anon-page retention from the per-blob hashmap churn. A prior
-`parallel_classify_accumulate`-based shape pushed peak anon to
-26.8 GB (each of 16 workers held a full-cardinality accumulator by
-the end of the scan); the final `parallel_classify_phase` shape
-emits per-blob maps to a single main-thread merger and avoids that
-multiplier.
-
-Previous-plan docs (`notes/diff-snapshots-opportunities.md`,
-`notes/getid-include-optimization.md`) are retired.
-
-#### Planet scan-audit refresh (commits `de8daf1`...`01c67da`, 2026-04-20, plantasjen)
-
-The earlier 06628d8 refresh landed `HeaderWalker` on `getid`, `inspect`
-default, and `diff` shards. The scan-audit sweep that follows pushes it
-through every other in-tree header walk: the shared
-`scan::classify::build_classify_schedule{,_split}` (Tier S - feeds
-check-refs, check-ids, tags-count, node_stats, getid, tags-filter
-expression path, extract Way fallback, geocode Pass 2 node schedule)
-plus eight per-command schedule builders that didn't route through the
-shared primitive (extract common + smart, multi-extract, renumber,
-tags-filter single-pass + pass-2, geocode `build_pass2_schedules`,
-ALTW external `scan_blob_metadata`, apply-changes `scan_node_blob_schedule`).
-Two pattern-2 migrations (sequential `BlobReader` → parallel) also
-landed for the dense ALTW path: `collect_way_referenced_node_ids`
-(`parallel_classify_phase`, trades the `scan_way_refs` wire-format
-fast path for 16× parallelism) and `collect_relation_member_node_ids`
-(`parallel_classify_accumulate`, per-worker IdSet bounded ~68 MB).
-
-Measured impact at the phase level, europe `--bench 3` with
-`--stop <PHASE>`:
-
-| Command | Phase | Pre (`1245cde`) | Post (`8e3a0d1`) | Δ |
-|---|---|---:|---:|---:|
-| check-refs | SCHEDULE_SCAN_LOOP | 24,684 ms | 432 ms | **57×** |
-| tags-filter | TAGSFILTER_SINGLE_PASS_SCHEDULE_SCAN | 25,050 ms | 994 ms | **25×** |
-| extract --simple | EXTRACT_SCHEDULE_SCAN | 24,584 ms | 471 ms | **52×** |
-
-Planet full-command walls (single-sample `--bench 1`, ±5 % run-to-run
-noise from cache state alone):
-
-| Command | Pre (`1245cde`) | Post (`8e3a0d1` / `01c67da`) | Δ |
-|---|---:|---:|---:|
-| tags-filter (transitive) | 147.5 s | **119.9 s** | -18.7 % |
-| inspect --nodes -j 16 | 58.1 s | **49.4 s** | -15.0 % |
-| check-refs | 72.6 s | **62.7 s** | -13.7 % |
-| check-ids --full | 72.5 s | **63.2 s** | -12.8 % |
-| extract --simple | 264.7 s | **247.3 s** | -6.6 % |
-| multi-extract (5 regions) | 1004.6 s | **972.0 s** | -3.2 % |
-| extract --complete | 261.8 s | **254.2 s** | -2.9 % |
-| add-locations-to-ways (external) | 684.0 s | **673.6 s** | -1.5 % |
-| build-geocode-index | 430.5 s | **434.9 s** | +1.0 % (noise) |
-| renumber | 215.6 s | **219.3 s** | +1.7 % (noise) |
-| extract --smart | 278.7 s | **283.5 s** | +1.7 % (noise) |
-| apply-changes --osc-seq 4920 | 577.0 s | **589.1 s** | +2.1 % (noise) |
-| inspect --tags -j 16 | 169.5 s | **168.3 s** | -0.7 % |
-
-Full-command wins shrink or disappear at europe scale because the old
-buffered header walk was accidentally prefetching blob bodies via the
-kernel's sequential readahead; the downstream decompression pass
-reused those warm pages. `HeaderWalker`'s `posix_fadvise(POSIX_FADV_RANDOM)`
-deliberately skips that prefetch. At planet the file is ~4× physical
-RAM so the prefetched pages would be evicted before decompression
-could reuse them anyway, and the header-walk savings land cleanly on
-the bottom line. At europe the two effects cancel.
-
-Three now-dead methods removed post-migration:
-`BlobHeader::{index, tag_index}` and
-`BlobReader::next_header_with_data_offset`.
-
-`notes/scan-optimization-audit.md` retires the high-leverage Tier 1
-items; dense node index Pattern 2 (`build_node_index_dense`), O(1)
-probes (`check_sorted_and_indexed`, `has_indexdata`), and unsorted
-extract paths are intentional non-goals per the audit doc itself.
+Retired plan docs post-landing: `notes/diff-snapshots-opportunities.md`,
+`notes/getid-include-optimization.md`, `notes/scan-optimization-audit.md`
+(Tier 1 items landed; dense node index Pattern 2, O(1)
+`check_sorted_and_indexed`/`has_indexdata` probes, and unsorted
+extract paths remain intentional non-goals).
 
 #### Europe ALTW phase breakdown (the cleanest signal)
 
@@ -630,19 +475,14 @@ Phase breakdown (UUID `e30f7ddc`):
 
 ### External join optimization history
 
-| Version | Denmark | Europe | Planet | Commit |
-|---------|---------|--------|--------|--------|
-| Original (256x re-read) | 302s | - | - | `034422c` |
-| Single-pass merge | 25s | 2,060s | - | `a334c72` |
-| + fadvise + mmap coord_slots | 22s | 1,824s | - | `165cbb2` |
-| Node-only scanner + scatter buffer | 14s | 921s | - | `ee9b19f` |
-| + blob skip + pool reuse | 14s | ~901s | - | `d272b49` |
-| P2b/P2c parallel assembly | - | 608s | - | `6b09796` |
-| External radix permutation (full) | 14s | 422s | 1,462s | `b0a5fb8` |
-| Stage 1B overlap + misc | - | 392s | 1,075s | `091fc5b` |
-| **coord_payloads integrated** | **7.4s** | **400s** | **953s** | **`3d977a0`** |
-| **+ shared blob metadata scan** | - | **333s** | - | **`d3e13ed`** |
-| **+ BlobLocationRouter (no finalize consolidation)** | - | **320.5s** | - | **`e497e54`** |
+Planet `024422c..e30f7ddc`: original 256× re-read shape on Denmark was
+302 s; current planet baseline is in the phase breakdown above. Europe
+traced 2,060 s → 320 s across the intermediate landings (single-pass
+merge, scatter buffer, P2b/P2c parallel assembly, external radix,
+coord_payloads integration, shared blob metadata scan,
+BlobLocationRouter). Full per-commit arc with measured
+Denmark/Europe/planet wall at each step in
+[notes/altw-optimization-history.md](../notes/altw-optimization-history.md).
 
 The coord_payloads integration (2026-04-14) was pursued primarily for
 non-wall benefits. Planet measured −29 s wall as a pleasant surprise;
@@ -850,12 +690,6 @@ Allocation profiling (same commit):
 | merge zlib | 293 MB | 29.6 GB | rewrite_block_parallel 17.3 GB, read_raw_frame 4.4 GB |
 | merge none | 293 MB | 31.7 GB | same pattern, RSS under 300 MB |
 
-Previous commit data (commit `46f7388`):
-
-| Command | Time |
-|---------|------|
-| add-locations-to-ways | 64.5s |
-
 ### vs osmium (Denmark, commit `23862d1`)
 
 | Command | pbfhogg | osmium | speedup |
@@ -885,69 +719,26 @@ defaults to zlib:1. `mallopt(M_ARENA_MAX, 2)` inside
 
 ### Planet (87.7 GB indexed, 11.6B elements, plantasjen)
 
-Commit `6165394`, dirty `--force --bench 1`. Single-sample.
-
-| Phase | Duration | Peak Anon | Share |
-|---|---:|---:|---:|
-| PASS1 nodes | **169 s** | 610 MB | 15.5% |
-| STAGE2A way emit | **119 s** | 934 MB | 10.9% |
-| STAGE2B node merge-join | **381 s** | **7.32 GB** | 34.9% |
-| STAGE2C slot reorder | **146 s** | 3.03 GB | 13.4% |
-| STAGE2D way assembly | **129 s** | 809 MB | 11.8% |
-| R1+R2A fused | 29 s | 1.04 GB | 2.7% |
-| R2B rel merge-join | 68 s | 2.03 GB | 6.2% |
-| R2C + R2D | 34 s | 1.04 GB | 3.1% |
-| **TOTAL** | **1,092 s (18.2 min)** | **7.32 GB** | - |
-
-Stage 2b breakdown (cumulative across 2 workers):
-  load_way_refs 276 s, radix_sort 243 s, load_node_map 101 s,
-  merge_join 130 s. Stage 2b is the #1 remaining target.
-
-Element counts: 10,447,738,627 nodes / 1,165,589,744 ways / 14,124,889
-relations / 12,435,459,911 way refs. All match the first-measurement
-baseline (`c5d00c22`) exactly.
+Element counts: 10,447,738,627 nodes / 1,165,589,744 ways /
+14,124,889 relations / 12,435,459,911 way refs (stable across
+optimization arc). The intermediate `6165394` breakdown with
+stages 2a/2b/2c that totaled 1,092 s / 18.2 min is preserved in
+[notes/renumber-optimization.md](../notes/renumber-optimization.md) -
+its architecture was collapsed by `IdSetDense` rank fusion and no
+longer matches the code.
 
 ### Optimization history
 
-| Commit | Change | Planet Time |
-|--------|--------|-------------|
-| `e156e97` | First planet measurement (sequential all stages) | **3,456 s (57.6 min)** |
-| `cc80442` | Stage 2b LSD radix sort | - (Denmark only) |
-| `a478ae8` | Halve map-bucket format (drop new_id field) | - |
-| `37ff902` | Stage 2b 2-worker bucket parallelism | - |
-| `8ec298c` | Pass 1 parallel decode (worker pool) | - |
-| `34a6b7c` | Stage 2d parallel decode (worker pool) | - |
-| `e7219f0` | Stage 2a parallel scan (worker pool) | - (OOM on planet, see below) |
-| `9695ad5` | Writer backpressure (permit pool) | - (still OOM) |
-| `f607842` | Work-stealing dispatch for pass 1 + stage 2d | **2,033 s (33.9 min)** |
-| `d3da65f` | Two-cursor merge + PrimitiveBlock copy fix | **1,901 s (31.7 min)** |
-| `dc13a7b` | DenseNodes wire-format rewriter + 4 workers + mallopt | **1,468 s (24.5 min)** |
-| `48183b5` | Way wire-format rewriter for stage 2d | **1,334 s (22.2 min)** |
-| `dc13a7b` | DenseNodes rewriter + 4 workers + mallopt | **1,468 s (24.5 min)** |
-| `d11166b` | Stage 2d 4 workers | **1,325 s (22.1 min)** |
-| `6165394` | 14-opt batch: splice, parallel 2c, schedule reuse, batch writes | **1,092 s (18.2 min)** |
-| `7839303` | Stage 2b/2c 4 workers + radix 4 passes | **960 s (16.0 min)** |
-| `9ec5eda` | IdSetDense rank fusion (eliminates stage 2a+2b+2c) | **505 s (8.4 min)** |
-| `c5c0e08` | Build way_id_set during stage 2d | **479 s (8.0 min)** |
-| `ae45fd6` | Eliminate way_map files + mmap R2B scatter | **442 s (7.4 min)** |
-| `94bf351` | Pass 1 back to 4 workers, fuse R1+R2A+R2B | **442 s (7.4 min)** |
-| `cbffb45` | Wire-format splice rewriter for R2d relations | **412 s (6.9 min)** |
-| `71bb548` | Parallel R2d (work-stealing + member-count sidecar) | **401 s (6.7 min)** |
-| `dd3f477` | zlib:1 output + IdSetDense::resolve() combined lookup | - |
-| `1b171f0` | Inline IdSetDense::set() during reframe, eliminate old_ids_out | - |
-| `fefd357` | Cache blob schedules across all phases | **360 s (6.0 min)** |
-| `b71bae9` | Fuse relation resolve into R2d, eliminate all temp files, zero scratch disk | - |
-| `feb3099` | Denser rank() blocks (64B instead of 256B) + respect compression flag | - |
-| `6acb9eb` | Replace relation_map FxHashMap with IdSetDense (~500 MB → ~20 MB) | - |
-| `db49c92` | Open input file once, reuse fd across all phases | - |
-| `67c7960` | Atomic index dispatch + reframe_buf pre-reserve | **209 s (3m29s)** |
-| `cb99106` | Shared atomic IdSetDense (−54% memory), wire-format R1 scanner | **194 s (3m14s)** |
-
-**−3,262 s (−94%)** from baseline. Each commit verified on Denmark
-(`brokkr verify renumber`, 306-relation orphan delta preserved exactly).
-Two intermediate planet runs OOM-killed at ~26 GB anon RSS due to
-reorder-buffer backlog from range-split dispatch and glibc arena
-fragmentation - resolved by work-stealing dispatch + `MALLOC_ARENA_MAX=2`.
+Planet **3,456 s → 194 s (-94 %)** across ~30 commits from `e156e97`
+to `cb99106`. Key landings: work-stealing dispatch (resolved two
+intermediate OOM kills at ~26 GB anon RSS), DenseNodes + way
+wire-format rewriters, `IdSetDense` rank fusion (collapsed stages
+2a+2b+2c), fused R2A/R2B/R2d relation pipeline, atomic index
+dispatch, shared-atomic `IdSetDense` with concurrent `AtomicU8::fetch_or`
+pass 1 writes. Each commit verified on Denmark via
+`brokkr verify renumber` (306-relation orphan delta preserved
+exactly). Full per-commit arc in
+[notes/renumber-optimization.md](../notes/renumber-optimization.md).
 
 ### Memory
 
@@ -1311,48 +1102,33 @@ pbfhogg CLI underneath; different measurement.
 corresponding April-11 snapshot registered under the planet dataset's
 snapshot key.
 
-**Sequential (pre-parallel landings).** Commit `7e9c2e9`, `--bench 1`.
-Both rows sit inside the 2026-04-18 TAINTED window
-(`4ce7e93..c0ae9a7`) - wall carries the `has_indexdata` O(N)
-all-blobs-scan cost that was fixed in `aa3147c`; RSS and sub-phase
-data are unaffected.
-
-| UUID | Args | Wall | Peak anon RSS |
-|---|---|---:|---:|
-| `42aedca1` | `--from base --to 20260411` (default text summary) | 2150.9 s (35m51s) | - |
-| `53900d5f` | `--from base --to 20260411 --format osc` | 2225.6 s (37m06s) | **54.9 MB** |
-
-The sequential path is a streaming merge-join between the two sorted
-PBF readers - no bulk in-memory structures - so peak anon stays tiny
-(~55 MB) regardless of input size. Single-threaded at 1.0 avg cores;
-229 GB disk read + 15 GB OSC output write. Safe on any host.
-
-**Post-parallel (shard-based block-pair merge).** Commit `06628d8`,
-2026-04-20, `--bench 1`. Opt-in via `-j/--jobs N` on `pbfhogg diff`;
-both text and `--format osc` paths are parallelised over the same
-ID-range shard plan.
+Shard-based block-pair merge (opt-in via `-j/--jobs N`, commit
+`06628d8` 2026-04-20, `--bench 1`). Both text and `--format osc`
+paths parallelise over the same ID-range shard plan.
 
 | UUID | Args | Wall | Peak anon RSS | vs sequential |
 |---|---|---:|---:|---:|
-| `b02d86bc` | `--from base --to 20260411 -j 16` (text) | **208.6 s (3m28s)** | 2.29 GB | **10.2× faster** |
-| `9b3fc2b9` | `--from base --to 20260411 --format osc -j 16` | **313.8 s (5m13s)** | 663 MB | **7.1× faster** |
+| `22a5eb55` | `-j 16` (text, temp-file shape) | **227.5 s (3m48s)** | 586 MB | **9.5×** |
+| `9b3fc2b9` | `-j 16 --format osc` | **313.8 s (5m13s)** | 663 MB | **7.1×** |
 
-Peak anon diverges by design: text shards buffer their formatted
-output in an in-memory `Vec<u8>` until all workers finish, then the
-main thread concatenates to stdout. OSC shards stream XML fragments
-straight to per-shard scratch temp files (`BufWriter<File>`), so peak
-anon is just in-flight decoded blocks. OSC's serial `assemble_osc`
-(gzip + concat of ~45 GB of XML fragments) is 32.8 s / 10 % of wall
-and is the main reason its speedup is lower than text's.
+Sequential baselines (now superseded) were 2150.9 s text / 2225.6 s
+osc, both inside the 2026-04-18 TAINTED window (wall carried the
+`has_indexdata` O(N) scan cost fixed in `aa3147c`; RSS unaffected).
+An interim text shape buffered each shard in `Vec<u8>` at 208.6 s /
+2.29 GB peak anon (UUID `b02d86bc`) before being replaced by the
+temp-file shape above - 74 % RSS drop at a 10 % wall cost.
 
-Phase split (post-parallel planet), both paths: NODE dominates
-(~73 %), WAY second (~26 %), REL rounding error. Walker phase is now
-~15 s (pread-only via `HeaderWalker` with `posix_fadvise(RANDOM)`;
-disk read dropped from 45 GB to 2.6 GB). Shard balance on germany is
-within 1.03× max/min across all three type phases.
+Both paths stream shard output to per-shard scratch temp files
+(`BufWriter<File>`) and concatenate in shard order; peak anon is just
+in-flight decoded blocks. OSC's lower speedup is the serial
+`assemble_osc` gzip + concat of ~45 GB of XML fragments (32.8 s,
+~10 % of wall).
 
-Avg cores (planet text `-j 16`): NODE 14.7, WAY 12.9, REL 14.5 out of
-16 (86-92 % utilization). Peak threads 17 = 16 workers + 1 main.
+Phase split (planet, both paths): NODE ~73 %, WAY ~26 %, REL rounding
+error. Walker phase ~15 s (pread-only via `HeaderWalker` with
+`posix_fadvise(RANDOM)`; disk read 45 GB → 2.6 GB). Shard balance on
+germany within 1.03× max/min. Avg cores on planet text `-j 16`: NODE
+14.7, WAY 12.9, REL 14.5 out of 16 (86-92 %).
 
 ## `--direct-io` impact summary
 

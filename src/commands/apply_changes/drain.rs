@@ -539,8 +539,17 @@ fn process_item(
     }
     state.last_type = Some(item_kind);
 
-    let osm_first = crate::osm_id::blob_osm_first_id(min_id, max_id);
-    handle_gap_creates(item_kind, osm_first, cfg, state, writer, stats, counters)?;
+    // Skip gap-creates for the reversed-range sentinel `(i64::MAX, i64::MIN)`
+    // that `infer_kind_and_range` emits when a --force non-indexed block's
+    // `block_type()` classification disagrees with its actual elements
+    // (streaming.rs:633-639). Without this guard, `blob_osm_first_id` would
+    // return `i64::MAX` and `has_gap_creates` would emit every remaining
+    // upsert of `item_kind` as a gap-create. The dispatch below still writes
+    // the rewritten blob; trailing-creates picks up any legitimate upserts.
+    if min_id <= max_id {
+        let osm_first = crate::osm_id::blob_osm_first_id(min_id, max_id);
+        handle_gap_creates(item_kind, osm_first, cfg, state, writer, stats, counters)?;
+    }
 
     dispatch_variant(item, cfg, state, writer, stats, counters)
 }

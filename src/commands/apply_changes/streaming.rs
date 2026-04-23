@@ -632,9 +632,15 @@ fn infer_kind_and_range(block: &crate::PrimitiveBlock) -> (ElemKind, i64, i64) {
 
     match kind {
         Some(k) => (k, min_id, max_id),
-        // Empty block: return Node with a sentinel range so upstream
-        // upsert slicing produces an empty slice and the drain advances
-        // no cursors. Any upserts of any kind get trailing-created.
+        // Empty block (or homogeneous-classified block whose elements are
+        // all a different kind): return the reversed sentinel range
+        // `(i64::MAX, i64::MIN)`. `upsert_slice` keys on
+        // `blob_osm_first_key`/`blob_osm_last_key` and yields an empty
+        // slice. The drain-side `process_item` detects `min > max` and
+        // skips `handle_gap_creates`; without that guard,
+        // `blob_osm_first_id` would return `i64::MAX` and gap-creates
+        // would fire for every remaining upsert of `kind`. Any upserts
+        // of any kind get trailing-created.
         None => (ElemKind::Node, i64::MAX, i64::MIN),
     }
 }

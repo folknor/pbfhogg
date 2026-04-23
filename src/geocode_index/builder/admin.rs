@@ -195,6 +195,11 @@ pub(super) fn write_admin_index(dir: &Path, entries: &mut [super::pass3::AdminCe
 
     let mut entries_out = BufWriter::new(std::fs::File::create(dir.join(FILE_ADMIN_ENTRIES))?);
     let mut cells_out = BufWriter::new(std::fs::File::create(dir.join(FILE_ADMIN_CELLS))?);
+    // `entries_offset` is a u32 byte-offset into admin_entries.bin (see
+    // `AdminCell.entries_offset` in format.rs). Hard-error on overflow
+    // rather than silently wrapping; a wrap would make every
+    // subsequent cell read entries from the wrong byte range. Widen to
+    // u64 and bump FORMAT_VERSION if this fires.
     let mut byte_off: u32 = 0;
     let mut i = 0;
 
@@ -215,11 +220,33 @@ pub(super) fn write_admin_index(dir: &Path, entries: &mut [super::pass3::AdminCe
              Bump on-disk count to u32 and increment FORMAT_VERSION."
         ))?;
         entries_out.write_all(&count.to_le_bytes())?;
-        byte_off += 2;
+        byte_off = byte_off.checked_add(2).ok_or_else(|| format!(
+            "write_admin_index: admin-entries byte offset overflows u32 at cell {cid} \
+             (current {byte_off}; total exceeds 4 GiB). Widen AdminCell.entries_offset \
+             to u64 and increment FORMAT_VERSION."
+        ))?;
         for e in &entries[start..i] {
+            // INTERIOR_FLAG (= 0x8000_0000) ORs into the high bit of
+            // poly_index. If `poly_index >= 0x8000_0000` (>2.1 B admin
+            // polygons) the OR silently collides with existing bits
+            // and the decoded poly_index would be wrong. Guard here
+            // rather than at the upstream counter.
+            if e.poly_index & INTERIOR_FLAG != 0 {
+                return Err(format!(
+                    "write_admin_index: poly_index {} in cell {cid} has the INTERIOR_FLAG bit set; \
+                     admin polygon count has exceeded 2^31 - 1. Split INTERIOR_FLAG into a \
+                     separate byte or grow AdminEntry to u64 and increment FORMAT_VERSION.",
+                    e.poly_index
+                )
+                .into());
+            }
             let val = if e.is_interior { e.poly_index | INTERIOR_FLAG } else { e.poly_index };
             entries_out.write_all(&val.to_le_bytes())?;
-            byte_off += 4;
+            byte_off = byte_off.checked_add(4).ok_or_else(|| format!(
+                "write_admin_index: admin-entries byte offset overflows u32 at cell {cid} \
+                 (current {byte_off}; total exceeds 4 GiB). Widen AdminCell.entries_offset \
+                 to u64 and increment FORMAT_VERSION."
+            ))?;
         }
     }
     cells_out.flush()?;

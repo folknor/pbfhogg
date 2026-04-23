@@ -1000,7 +1000,7 @@ Remaining open findings from a multi-agent Opus audit of 0.3.0 high-churn areas.
 - renumber: 6 MEDIUM, 2 LOW
 - altw external: 5 MEDIUM, 3 LOW
 - diff / derive-parallel: 3 MEDIUM latent (mixed-sign numeric compare; production PBFs are positive-only), 2 LOW
-- geocode: 5 MEDIUM, 3 LOW
+- geocode: 3 MEDIUM, 3 LOW
 - smaller commands: 1 MEDIUM, 2 LOW
 
 **Cross-cutting patterns still present:**
@@ -1101,9 +1101,9 @@ Remaining open findings from a multi-agent Opus audit of 0.3.0 high-churn areas.
 
 - [x] ~~**`geocode_index/builder/admin.rs:127-143` - HIGH.**~~ *(landed 2026-04-23; `write_admin_data` now checks `p.vertices.len() -> u32` (vertex_count), `p.vertices.len().checked_mul(NODE_COORD_SIZE)` (step), `u32::try_from(step)` (step-u32 fits), and `offset.checked_add(step_u32)` (cumulative fits). Each failure mode returns a descriptive error with a widen-to-u64 + bump FORMAT_VERSION pointer, matching the sibling u16::MAX guard at `write_admin_index`.)*
 
-- [ ] **`geocode_index/builder/admin.rs:152-189` - MEDIUM.** `write_admin_index` tracks `byte_off: u32` for admin-entries file position with no overflow guard on `+= 2` / `+= 4` accumulators; past 4 GiB the offset wraps and cells after that point read garbage entries. Unlikely at today's scales but not rejected. Trigger: enough admin entries to exceed 4 GiB of entries data.
+- [x] ~~**`geocode_index/builder/admin.rs:152-189` - MEDIUM.**~~ *(landed 2026-04-23; `byte_off += 2`/`+= 4` replaced with `checked_add` at both sites with a descriptive widen-to-u64 + bump FORMAT_VERSION error. Sister of the HIGH vertex_offset fix, same pattern.)*
 
-- [ ] **`geocode_index/builder/admin.rs:182` - MEDIUM.** `val = e.poly_index | INTERIOR_FLAG` corrupts `poly_index` silently when `poly_index >= 0x8000_0000`; interior-flagged entries lose their high bit and point to the wrong polygon. No guard on `admin_polygon_count`, `AdminPolygon` stored in `u32`. Trigger: more than 2,147,483,647 admin polygons (far future).
+- [x] ~~**`geocode_index/builder/admin.rs:182` - MEDIUM.**~~ *(landed 2026-04-23; `write_admin_index` now hard-errors if `e.poly_index & INTERIOR_FLAG != 0` before the OR, naming the offending poly_index and cid. Reachable only past 2^31 admin polygons - we're many orders of magnitude from that, but the defensive guard costs nothing and pre-empts a silent corruption if the counter ever crosses.)*
 
 - [ ] **`geocode_index/builder/pass3.rs:152-167` - MEDIUM.** `parse_bucket_file` silently truncates any trailing bytes that don't form a complete 15-byte record (`count = data.len() / BUCKET_RECORD_SIZE`); if a bucket-writer flush fails partway (ENOSPC), the partial tail is silently dropped at Stage B with no diagnostic. Trigger: ENOSPC during Stage A writes.
 

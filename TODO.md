@@ -1157,9 +1157,9 @@ Findings from a multi-agent Opus audit of 0.3.0 high-churn areas before the rele
 
 - [ ] **`diff/parallel.rs:384` / `derive_parallel.rs:429` - MEDIUM (latent)** *(verified 2026-04-23 - same class as #1 above; collapses to correct bound for positive-only inputs).*
 
-- [ ] **`diff/parallel.rs:735` / `derive_parallel.rs:854-856` - MEDIUM.** When `slot?` propagates a worker error in the main-thread concatenate loop, remaining already-successful `ShardOutput` slots are never visited, so their per-shard `.txt.tmp` / `.xml.tmp` files are never removed. The outer `derive_parallel` temp files have the same lifecycle gap. Trigger: any shard worker returning `Err` (decompression failure, short read) or phase error after earlier phase populated `scratch_dir`.
+- [x] ~~**`diff/parallel.rs:735` / `derive_parallel.rs:854-856` - MEDIUM.**~~ *(landed 2026-04-23; both drivers now partition `shard_outputs` into (Ok list, first Err) and, on any error, unlink every successful shard's temp files plus every possible path that a panicked shard could have left behind before returning. New `shard_text_path`/`shard_xml_paths` helpers let the caller enumerate expected paths without touching the worker's `ShardOutput`.)*
 
-- [ ] **`diff/parallel.rs:700-730` / `derive_parallel.rs:817-850` - MEDIUM.** `std::thread::scope` panic handling: if a worker panics after creating scratch files, `h.join()` returns `Err` (converted to `io::Error::other("shard worker panicked")`) but the scratch files are never cleaned up - `scratch_dir` grows a `derive-par-*-{pid}-*` set on every failed run. Same class as above. Trigger: worker panic mid-shard.
+- [x] ~~**`diff/parallel.rs:700-730` / `derive_parallel.rs:817-850` - MEDIUM.**~~ *(landed 2026-04-23 alongside the sibling item above; the same cleanup pass handles both error propagation and panic-converted errors, plus the no-`ShardOutput` case where a panicked worker created the temp file before crashing.)*
 
 - [x] ~~**`diff/parallel.rs:686` / `derive_parallel.rs:782` - LOW.**~~ *(verified 2026-04-23 - marker skip is observability-only, not correctness. Deleted.)*
 

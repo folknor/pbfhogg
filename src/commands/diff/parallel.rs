@@ -252,13 +252,7 @@ fn run_shard(
     scratch_dir: &Path,
 ) -> Result<ShardOutput> {
     let type_char = kind_type_char(kind);
-    let kind_tag = match kind {
-        ElemKind::Node => "n",
-        ElemKind::Way => "w",
-        ElemKind::Relation => "r",
-    };
-    let pid = std::process::id();
-    let text_path = scratch_dir.join(format!("diff-par-{pid}-{kind_tag}-{shard_idx}.txt.tmp"));
+    let text_path = shard_text_path(scratch_dir, kind, shard_idx);
     let file = std::fs::File::create(&text_path).map_err(io_err)?;
     let mut out = BufWriter::new(file);
 
@@ -597,6 +591,16 @@ fn kind_type_char(kind: ElemKind) -> char {
     }
 }
 
+fn shard_text_path(scratch_dir: &Path, kind: ElemKind, shard_idx: usize) -> PathBuf {
+    let kind_tag = match kind {
+        ElemKind::Node => "n",
+        ElemKind::Way => "w",
+        ElemKind::Relation => "r",
+    };
+    let pid = std::process::id();
+    scratch_dir.join(format!("diff-par-{pid}-{kind_tag}-{shard_idx}.txt.tmp"))
+}
+
 fn emit_element(
     out: &mut impl Write,
     prefix: char,
@@ -639,6 +643,7 @@ fn emit_modified(
 /// Preserves diff semantics for the `-c` (suppress-common) and verbose
 /// cases; drops the v1 byte-equal fast path (always zero fires on
 /// `diff-snapshots`, where this path is intended to be used).
+#[allow(clippy::too_many_lines)] // phase-orchestrator over 3 element kinds
 pub(crate) fn diff_block_pair_parallel(
     old_path: &Path,
     new_path: &Path,
@@ -742,10 +747,39 @@ pub(crate) fn diff_block_pair_parallel(
             }
         });
 
-        // Emit shard outputs in shard order: stream each per-shard temp file
-        // to the caller's output, then remove it.
+        // Partition shard outputs into (successful, first error). If any
+        // shard errored or panicked, clean up every possible per-shard
+        // temp file - including ones that completed successfully as well
+        // as any that a panicked worker left behind - before returning.
+        // Without this pass, `scratch_dir` accumulates `diff-par-*-{pid}-*`
+        // files on every failed run.
+        let mut outputs: Vec<ShardOutput> = Vec::with_capacity(shard_outputs.len());
+        let mut first_err: Option<crate::error::Error> = None;
         for slot in shard_outputs {
-            let shard_out = slot.expect("all slots filled")?;
+            match slot.expect("all slots filled") {
+                Ok(out) => outputs.push(out),
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            for out in &outputs {
+                drop(std::fs::remove_file(&out.text_path));
+            }
+            // Also sweep any files a panicked shard created before crashing;
+            // the `ShardOutput` for such shards is absent from `outputs`.
+            for shard_idx in 0..shards.len() {
+                drop(std::fs::remove_file(shard_text_path(scratch_dir, kind, shard_idx)));
+            }
+            return Err(e);
+        }
+
+        // All successful: emit shard outputs in shard order, streaming each
+        // per-shard temp file to the caller's output and removing it.
+        for shard_out in outputs {
             append_and_cleanup(output, &shard_out.text_path)?;
             total.common += shard_out.stats.common;
             total.created += shard_out.stats.created;

@@ -202,6 +202,27 @@ struct ShardOutput {
     delete_count: u64,
 }
 
+/// Compute the three per-shard scratch paths that `run_shard` would
+/// create. Exposed so the caller can clean up leftover files from
+/// panicked / errored shards whose `ShardOutput` is unavailable.
+fn shard_xml_paths(
+    scratch_dir: &Path,
+    kind: ElemKind,
+    shard_idx: usize,
+) -> (PathBuf, PathBuf, PathBuf) {
+    let pid = std::process::id();
+    let kind_tag = match kind {
+        ElemKind::Node => "n",
+        ElemKind::Way => "w",
+        ElemKind::Relation => "r",
+    };
+    (
+        scratch_dir.join(format!("derive-par-creates-{pid}-{kind_tag}-{shard_idx}.xml.tmp")),
+        scratch_dir.join(format!("derive-par-modifies-{pid}-{kind_tag}-{shard_idx}.xml.tmp")),
+        scratch_dir.join(format!("derive-par-deletes-{pid}-{kind_tag}-{shard_idx}.xml.tmp")),
+    )
+}
+
 fn pread_decode(
     file: &File,
     desc: BlobDesc,
@@ -237,15 +258,7 @@ fn run_shard(
     increment_version: bool,
     update_timestamp: bool,
 ) -> Result<ShardOutput> {
-    let pid = std::process::id();
-    let kind_tag = match kind {
-        ElemKind::Node => "n",
-        ElemKind::Way => "w",
-        ElemKind::Relation => "r",
-    };
-    let cp = scratch_dir.join(format!("derive-par-creates-{pid}-{kind_tag}-{shard_idx}.xml.tmp"));
-    let mp = scratch_dir.join(format!("derive-par-modifies-{pid}-{kind_tag}-{shard_idx}.xml.tmp"));
-    let dp = scratch_dir.join(format!("derive-par-deletes-{pid}-{kind_tag}-{shard_idx}.xml.tmp"));
+    let (cp, mp, dp) = shard_xml_paths(scratch_dir, kind, shard_idx);
 
     let mut creates_w = Writer::new(BufWriter::new(
         File::create(&cp).map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?,
@@ -849,10 +862,44 @@ pub(crate) fn derive_changes_parallel(
             }
         });
 
-        // Concatenate this phase's per-shard outputs into the three outer
-        // temp files in shard order, then delete the per-shard files.
+        // Partition shard outputs into (successful, first error). If any
+        // shard errored or panicked, clean up every possible per-shard
+        // temp file - including ones that completed successfully as well
+        // as any that a panicked worker left behind - before returning.
+        // Without this pass, `scratch_dir` accumulates
+        // `derive-par-{creates,modifies,deletes}-{pid}-*` on every failed
+        // run.
+        let mut outputs: Vec<ShardOutput> = Vec::with_capacity(shard_outputs.len());
+        let mut first_err: Option<crate::error::Error> = None;
         for slot in shard_outputs {
-            let shard_out = slot.expect("all slots filled")?;
+            match slot.expect("all slots filled") {
+                Ok(out) => outputs.push(out),
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            for out in &outputs {
+                drop(std::fs::remove_file(&out.creates_path));
+                drop(std::fs::remove_file(&out.modifies_path));
+                drop(std::fs::remove_file(&out.deletes_path));
+            }
+            for shard_idx in 0..shards.len() {
+                let (cp, mp, dp) = shard_xml_paths(scratch_dir, kind, shard_idx);
+                drop(std::fs::remove_file(cp));
+                drop(std::fs::remove_file(mp));
+                drop(std::fs::remove_file(dp));
+            }
+            return Err(e);
+        }
+
+        // All successful: concatenate this phase's per-shard outputs into
+        // the three outer temp files in shard order, then delete the
+        // per-shard files.
+        for shard_out in outputs {
             append_and_cleanup(&mut outer_creates_w, &shard_out.creates_path)?;
             append_and_cleanup(&mut outer_modifies_w, &shard_out.modifies_path)?;
             append_and_cleanup(&mut outer_deletes_w, &shard_out.deletes_path)?;

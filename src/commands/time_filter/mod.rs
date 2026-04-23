@@ -176,6 +176,14 @@ fn time_filter_history(
             });
         }
 
+        // Unconditional overwrite on each matching version is correct
+        // under the OSM history-file convention: versions within a
+        // `(kind, id)` group arrive in ascending-version order (the
+        // same convention PBF history files ship with). The "latest
+        // element whose timestamp <= cutoff" is therefore the last one
+        // we see during the forward scan. A malformed history file
+        // with out-of-order versions would violate this, but that is
+        // out of spec.
         if timestamp <= cutoff_timestamp {
             stats.versions_before_cutoff += 1;
             if let Some(group) = pending.as_mut() {

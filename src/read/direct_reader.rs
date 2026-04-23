@@ -141,6 +141,13 @@ impl DirectReader {
         #[allow(clippy::cast_possible_truncation)] // buffered <= buf capacity (usize)
         self.buf.consume(buffered as usize);
 
+        // `stream_position` returns the fd's absolute offset after the
+        // last aligned read, i.e. the byte immediately past the end of
+        // the data in `self.buf`. After the `consume(buffered)` above
+        // the buffer is logically at `current_pos - 0`, so adding
+        // `past_buf` gives the absolute target. Load-bearing: if this
+        // is ever refactored to use a non-page-aligned reader, the
+        // `current_pos` meaning shifts and the arithmetic below breaks.
         use std::io::{Seek, SeekFrom};
         let current_pos = self.file.stream_position()?;
         let target = current_pos + past_buf;

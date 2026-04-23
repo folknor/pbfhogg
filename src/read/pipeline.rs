@@ -146,6 +146,13 @@ where
         //   of which are CPU-bound. Maximizing the thread count here directly
         //   reduces wall-clock time for large files.
         let dispatch_tx = decoded_tx.clone();
+        // `move` captures `raw_rx` into the stage-2 closure. On early
+        // return from pool-build failure below, `raw_rx` drops with
+        // the closure's locals and `sync_channel::send` in stage 1
+        // wakes blocked senders with `Err`, letting stage 1 exit
+        // cleanly. Do not refactor this into a form where `raw_rx`
+        // outlives an error return from this closure: the reader
+        // thread will block forever on a full channel.
         scope.spawn(move || {
             let decode_threads = decode_thread_count.unwrap_or_else(|| {
                 std::thread::available_parallelism()

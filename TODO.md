@@ -816,6 +816,139 @@ Pinned as `#[ignore]` regression tests in
   per-kind offset ranges) is possible but not worth the
   complexity for the `--force` path today.
 
+### Test-shape gaps surfaced by the 0.3.0 bug sweep (2026-04-23)
+
+The 117-finding sweep clusters into ~6 test-shape gaps, not 117
+individual tests. The pattern is already validated: Batch A's
+non-indexed parity shape surfaced 7+ real bugs from one structured
+test idea, and the `merge_jobs_parity_on_multiblob_input` /
+cross-feature parity shape surfaced the consumer-build drain panic
+plus the `base_*` counter drift. Same approach scales here. Items
+below are the shapes that would catch the remaining findings; each
+is self-contained and can land independently.
+
+Ordered by value-to-cost (most bugs caught per line of test
+infrastructure first).
+
+- [ ] **Fault injection for parallel pipelines.** Biggest hole -
+  ~30 findings are "worker errors mid-stream -> silent truncation /
+  hang / temp-file leak" across `write/parallel_writer.rs`,
+  `write/uring_writer.rs`, `write/parallel_gzip.rs`,
+  `apply_changes/drain.rs`, `apply_changes/rewrite.rs`,
+  `diff/parallel.rs`, `derive_parallel.rs`, altw external
+  stages 3/4, geocode Pass 3 Stage A. Zero tests today inject a
+  worker panic or mid-stream I/O error and assert the output is
+  either correct-or-errored, never silently short. Minimum shape:
+  a thin `FaultSink` wrapper around `Write` that errors at a
+  configurable byte offset, plus a `panic_at_seq(N)` hook on the
+  worker closure (feature-gated behind `#[cfg(test)]` in the
+  pipeline modules so it doesn't bloat release). Then one test
+  per pipeline: "worker N panics at seq K -> command returns
+  `Err`, scratch dir is clean, output file is either absent or
+  truncated-to-zero (never a silent short file with zero-filled
+  holes)." Catches the seven HIGH items in "Write path" plus the
+  MEDIUM scanner/worker-panic items in "apply-changes pipeline"
+  and the shard-worker-error items in "diff / derive-changes
+  shard-parallel".
+
+- [ ] **Lying-indexdata fixtures.** ~15 findings trust
+  `BlobHeader.indexdata` without verification:
+  `min_id`/`max_id` overstating or understating actual contents,
+  `kind` disagreeing with blob contents, `element_count` drifting,
+  phantom-sorted flag on unsorted content. Every existing fixture
+  has either honest indexdata or none at all. Add a
+  `write_pbf_with_custom_indexdata(path, blobs, |idx| { ... })`
+  helper to `tests/common/mod.rs` that lets each test override
+  the indexdata fields independently of blob contents. Then run
+  the command surface ("indexdata says `min_id=0` but blob
+  contains `id=-1`", "indexdata `kind=Node` but blob contains
+  ways", etc.) and assert each command either ignores the
+  indexdata, defends itself, or produces a clean error - never
+  panics and never silently produces wrong output. Catches:
+  `renumber/pass1.rs:179`, `renumber/wire_rewrite.rs:272`,
+  `renumber/stage2.rs:226-231`, `renumber/mod.rs:240`,
+  `altw/external/stage2.rs:488`, `altw/external/stage4.rs:438-478`,
+  `apply_changes/scanner.rs:162,188`, `apply_changes/streaming.rs:496`,
+  `commands/inspect/show_element.rs:53-57`,
+  `blob_meta/scan_ids.rs:192-202`.
+
+- [ ] **Negative-ID / signed-arithmetic matrix.** ~8 findings
+  mishandle negative element IDs because guards are gated on
+  indexdata or shard planners use raw numeric compare instead of
+  `osm_id_cmp`. Today every fixture uses non-negative IDs.
+  Add `generate_nodes_with_negatives(start_neg, start_pos, n)`
+  plus equivalents for ways/relations to `tests/common/mod.rs`
+  (canonical OSM order: `..., -3, -2, -1, 0, 1, 2, ...`). Run
+  them through every command, including `-j N` variants. The
+  `renumber` deviation in DEVIATIONS.md says "negative inputs
+  rejected" - we don't currently test that the rejection fires
+  across all paths (only the happy path with indexdata present).
+  Catches: `renumber/pass1.rs:179`, `renumber/wire_rewrite.rs:272,519-524`,
+  `diff/parallel.rs:138-142,354-357,384`, `derive_parallel.rs:136-142`
+  and its sibling emit/merge sites, `geocode_index/builder/pass1_5.rs:102`.
+
+- [ ] **Adversarial / truncated-input tests.** ~10 findings
+  accept untrusted input without bounds-checking: missing
+  `MAX_BLOB_HEADER_SIZE` guards in the new pread primitives,
+  schedule offsets past EOF from truncated files, varint
+  miscount on malformed fields. Two shapes cover the class:
+  (a) the proptest item below, and (b) a "truncation sweep"
+  integration test that takes a known-good PBF and truncates to
+  every blob/frame/field boundary, asserting every command
+  returns a clean `Err` without panic or multi-GB allocation.
+  Catches `read/header_walker.rs:149-164`,
+  `read/raw_frame.rs:65-67,124-127`, `scan/classify.rs:59-95,110-163`,
+  `renumber/wire_rewrite.rs:486-491`, and the two geocode
+  bucket-file truncation findings.
+
+- [ ] **Complete the `-j N` vs `-j 1` parity matrix.** We have
+  parity for `inspect --nodes`, `tags-filter` two-pass,
+  `tags-count`, and the brand-new `merge_jobs_parity_on_multiblob_input`.
+  Missing: `diff -j N`, `derive-changes -j N`, `apply-changes -j N`
+  (beyond the single merge fixture), altw external stage 4
+  worker count (currently hard-coded, would need a library arg),
+  geocode Pass 1.5 / Pass 3 Stage A parallel degree,
+  `check --refs` (blocked on a jobs arg on `check_refs`, see
+  existing entry above). Same shape as the existing tests:
+  element-equivalent output + matching summary counters across
+  worker counts. Specifically pins regression of the diff/derive
+  shard numeric-compare family, the `OwnedBytes` counter bug we
+  just landed, and would catch any future worker-count-dependent
+  drift. Pair with the negative-ID fixtures above for maximum
+  coverage (the shard-parallel bugs only surface on mixed-sign
+  inputs).
+
+- [ ] **Scratch-dir / temp-file cleanup invariants.** ~8 findings
+  leak scratch files on worker-error paths. One generic helper
+  in `tests/common/mod.rs`:
+  `with_tracked_scratch_dir(|scratch| { run_command(...); })`
+  snapshots the directory before + after and asserts equality
+  (or asserts a specific known-empty state). Combined with the
+  fault-injection shape above, covers every leak in the sweep:
+  altw external stages, diff-parallel, derive-parallel,
+  apply-changes (the `rewrite.rs:244` mid-stream-abort path),
+  geocode Pass 3 Stage A.
+
+- [ ] **Boundary-twin scan across modules.** Lowest-effort lever.
+  Several findings are direct cross-module twins of bugs already
+  fixed: `commands/sort/mod.rs:178-181` is the same
+  overlap-run kind-boundary bug as the just-fixed
+  `cat/dedupe.rs:225`; `write/parallel_writer.rs` and
+  `write/parallel_gzip.rs` both silently swallow `Drop`-path
+  errors; the kind-placeholder-on-non-indexed pattern from
+  apply-changes recurs in altw, extract-multi, getid, cat,
+  tags-filter. When landing a fix in one module, add one test
+  per twin site in the same commit. Cheaper than chasing each
+  finding individually and prevents the next regression of the
+  same pattern.
+
+Meta-observation: bug density skews toward the three newest / biggest
+subsystems - apply-changes pipeline, altw external, diff/derive-parallel.
+A policy that every new parallel pipeline must ship with a
+worker-panic test + a `-j N` parity test + a scratch-leak test
+would change the shape going forward. Worth considering as a CI gate
+once the fault-injection harness exists.
+
 - [ ] **Property-based testing via `proptest`** *(recommended first
   pass before any `cargo-fuzz` investment)*. Same class of bugs the
   fuzz targets below would catch - parse crashes, boundary
@@ -860,6 +993,28 @@ Pinned as `#[ignore]` regression tests in
 
 Findings from a multi-agent Opus audit of 0.3.0 high-churn areas before the release. Six agents ran in parallel, scoped by area: apply-changes pipeline, write path, renumber, altw external, diff/derive-changes shard-parallel, geocode builder v2. 88 findings total. All are listed below - HIGH, MEDIUM, and LOW - with file:line, severity, description, and trigger. LOW items are kept deliberately so we have the full record even if we defer them.
 
+**Verification status (2026-04-23):** All ~117 findings were re-verified across two Opus passes after an outside reviewer flagged ~28% of an initial slice as mis-called. Final tally: ~51 findings eliminated as false positives / documented-intentional / stated-invariant / unreachable-sentinel-math; ~6 mechanism rewrites (real bug, wrong described mechanism); ~2 downgrades. Strikethrough annotations below carry a one-line verification note; kept items retain the original description, with mechanism corrections inline where needed.
+
+**What survived, by area (approximate real-bug counts after verification):**
+- apply-changes pipeline: 2 HIGH (scanner.rs:162/188, streaming.rs:496), 2 MEDIUM diagnostic-quality, 0 LOW
+- write path: 1 HIGH (truncation on framer panic in parallel_writer + uring_writer), 3 MEDIUM (Drop-swallows class, uring CQE buffer leak)
+- read path: 3 HIGH (header_walker + raw_frame MAX_BLOB_HEADER_SIZE gaps, classify schedule past-EOF edge), 1 MEDIUM narrow (scan_ids coord overflow)
+- renumber: 2 HIGH (negative-ID via stale indexdata, phantom way orphans), 4 MEDIUM (consistency + hard-panic on lying header)
+- altw external: 1 HIGH (blob_meta --force confusion), 4 MEDIUM latent/perf; Null Island is documented-accepted per CORRECTNESS.md
+- diff / derive-parallel: 0 HIGH live bugs (mixed-sign numeric-compare family is latent - production PBFs are positive-only), 2 MEDIUM scratch-leak on error/panic
+- geocode: 1 HIGH (admin.rs u32 vertex_offset overflow), several MEDIUM latent overflow/correctness
+- smaller commands: 2 HIGH (sort/mod.rs:178 direct parallel of dedupe fix, show_element.rs:53 missing is_sorted check), 1 MEDIUM (getid removeid missing require_indexdata gate)
+
+**Headline items worth landing first (cross-verified, real-effect, clear fix shape):**
+1. `commands/sort/mod.rs:178-181` - direct parallel of the already-fixed `cat::dedupe` kind-boundary bug. Add `&& entries[i].index.kind == run_kind` guard.
+2. `read/header_walker.rs:149-164` + `read/raw_frame.rs:65-67,124-127` - missing MAX_BLOB_HEADER_SIZE caps. Real DoS/OOM vector on adversarial input; add the same guard `BlobReader::read_blob_header` has.
+3. `apply_changes/scanner.rs:162,188` - under `--force --locations-on-ways` non-indexed, LocationsOnWays is silently stripped from base ways. Gate the combination at setup, or fix the barrier to recover from placeholder kinds.
+4. `commands/inspect/show_element.rs:53-57` - missing `is_sorted()` check produces false negatives on history/unsorted PBFs.
+5. `renumber/pass1.rs:179` + `wire_rewrite.rs:272` - negative-ID guards bypassed by stale indexdata; results in loud panic (pass1) or phantom orphans (wire_rewrite).
+6. `write/parallel_writer.rs:191-206` + `uring_writer.rs:588-655` - silent truncation when an upstream framer panics with items still held in the reorder buffer.
+
+**Implication for planning:** the ~28% first-round error rate is not tolerable for landing decisions. Any "fix" based on the original finding text without independent code-reading has a high probability of mis-shaping the change. The most insidious mis-calls point at the right file but propose a wrong mechanism (877, 1, 10 in renumber, 16 in altw). Read the code path before writing a patch.
+
 **Cross-cutting patterns the sweep surfaced:**
 
 1. **Indexdata-trust without defensive check.** Multiple call sites read descriptor fields populated from `BlobHeader.indexdata` and act on them without verifying indexdata was present, tight, or correct. The mid-cycle non-indexed `--force` bugs were the most prominent instance; the audit found more across apply-changes, renumber, altw external, and geocode.
@@ -874,55 +1029,55 @@ Findings from a multi-agent Opus audit of 0.3.0 high-churn areas before the rele
 
 ### apply-changes pipeline
 
-- [ ] **`apply_changes/drain.rs:560` / `streaming.rs:633` - HIGH.** `DrainItem::Rewritten` uses `id_range: (min_id, max_id)` verbatim for cursor advancement; `infer_kind_and_range` returns the sentinel `(i64::MAX, i64::MIN)` for an empty block, and `blob_osm_last_key(i64::MAX, i64::MIN)` computes a key larger than every remaining upsert, so the cursor loop advances past every remaining upsert of that kind, swallowing them. Trigger: a `--force` non-indexed blob whose parsed contents are empty or whose walk finds no matching kind, reaching the rewrite path.
+- [ ] **`apply_changes/drain.rs:537` / `streaming.rs:633` - HIGH** *(verified 2026-04-23, mechanism rewritten - original cursor-swallow claim was wrong)*. `infer_kind_and_range` returns the sentinel `(i64::MAX, i64::MIN)` for an empty block. When `process_item` unpacks that into `blob_osm_first_id(min_id, max_id)` at drain.rs:537, the `min_id >= 0` branch (osm_id.rs:70-78) returns `i64::MAX`, driving `handle_gap_creates` to emit every remaining upsert of that kind as a gap-create - severe wrong-output rather than the cursor-swallow the original finding described. (The cursor-swallow mechanism is inverted: `blob_osm_last_key(i64::MAX, i64::MIN)` is `(1, i64::MAX)` per osm_id.rs:20-28, strictly LESS than `(2, positive_id)`, so the cursor does NOT advance past remaining positive upserts.) Trigger: a `--force` non-indexed blob whose parsed contents are empty or whose walk finds no matching kind, reaching the rewrite path. Fix shape: detect the empty-block sentinel before drain handoff and either skip the item entirely or use a neutral range; do NOT propagate `(i64::MAX, i64::MIN)` through `blob_osm_first_id`.
 
 - [ ] **`apply_changes/scanner.rs:162,188` - HIGH.** Under `--force --locations-on-ways` on non-indexed input, the scanner sets `kind=ElemKind::Node` placeholder for every blob, so `low_node_must_decompress = locations_on_ways && matches!(kind, Node)` is true for every blob (even ways/relations); the node->way barrier tracking at scanner.rs:214 treats way/relation blobs as nodes and never buffers them, `last_node_seq` is set to the seq of an actual way blob, and the drain publishes an empty/partial `loc_map` to way workers before real node blobs have been processed. Trigger: `--force --locations-on-ways` on a non-indexed PBF (arguably this combination should be rejected at setup, but nothing in `merge()` rejects it).
 
-- [ ] **`apply_changes/streaming.rs:496` - HIGH.** On the consumer build / `--direct-io` false-positive fallback path, `handle_owned_passthrough` is called with `id_range = desc.id_range.unwrap_or((0, 0))` and `kind = desc.kind` (scanner placeholder `Node` on non-indexed), so the drain receives `DrainItem::OwnedBytes { id_range: (0,0), kind: Node(placeholder!) }`; the drain uses those values for type-transition detection and gap-create decisions, breaking drain state ordering when the actual blob is Way/Relation. Trigger: `--force` + consumer build (or `--direct-io`) merging a non-indexed PBF whose first way-blob has no overlap.
+- [ ] **`apply_changes/streaming.rs:496` - HIGH** *(verified 2026-04-23, mechanism narrowed)*. On the consumer build / `--direct-io` false-positive fallback path, `handle_owned_passthrough` is called with `id_range = desc.id_range.unwrap_or((0, 0))` and `kind = desc.kind` (scanner placeholder `Node` on non-indexed), so the drain receives `DrainItem::OwnedBytes { id_range: (0,0), kind: Node(placeholder!) }`. Confirmed effects: drain uses `item_kind` at drain.rs:527-535 for `handle_type_transition` and at :538 for `handle_gap_creates`; per-kind `base_*` stats at drain.rs:619-623 are miscredited. Correction: the original claim that "gap-create decisions" are broken via the upsert cursor is wrong - `OwnedBytes` arm does NOT advance the upsert cursor (drain.rs:656 comment). Real bug surface is type-transition + stats miscrediting, not cursor drift. Trigger: `--force` + consumer build (or `--direct-io`) merging a non-indexed PBF whose first way-blob has no overlap.
 
-- [ ] **`apply_changes/streaming.rs:357` - HIGH.** The comment claims "Scanner only emits Passthrough for indexed blobs", but the `--force` path under `--direct-io` + consumer-build false positives takes a different route (`handle_owned_passthrough` from within `handle_candidate` at line 496 with `desc.kind`/`desc.id_range` still bearing the scanner placeholder `(Node, None)`). Same surface as the finding above; the docs-vs-reality drift is the hazard. Trigger: same as above.
+- [x] ~~**`apply_changes/streaming.rs:357` - HIGH.**~~ *(verified 2026-04-23 - deleted as dupe of streaming.rs:496 finding above.)* The comment at streaming.rs:350-358 is lexically inside the `ScannedBlob::Passthrough(desc)` arm and is correct in that scope (scanner fast-path requires indexed). The non-indexed false-positive path enters `handle_owned_passthrough` from `handle_candidate` at streaming.rs:496, which is a separate call site explicitly documented at its function-level doc (streaming.rs:637-641). The real bug surface is the `desc.id_range.unwrap_or((0, 0))` + scanner-placeholder `kind` from the already-filed streaming.rs:496 item; no additional docs-drift bug exists.
 
-- [ ] **`apply_changes/rewrite.rs:244` - MEDIUM.** If the scanner errors out mid-stream after sending some items but before all candidates are dispatched, some seqs never get produced; the drain hits its "channel closed with items still in reorder buffer" check at drain.rs:332 and returns an error whose diagnostic (`next_seq` vs smallest remaining) misleads away from the real upstream failure. Trigger: corrupted PBF header mid-stream.
+- [ ] **`apply_changes/rewrite.rs:244` - MEDIUM (diagnostic-quality)** *(verified 2026-04-23)*. If the scanner errors out mid-stream after sending some items but before all candidates are dispatched, some seqs never get produced; the drain hits its "channel closed with items still in reorder buffer" check at drain.rs:332 and returns an error whose diagnostic (`next_seq` vs smallest remaining) misleads away from the real upstream failure. Not a correctness bug - error surfaces, just two errors for one fault with the misleading one first. The true scanner error is surfaced separately via the scope join at rewrite.rs:337. Trigger: corrupted PBF header mid-stream. NOTE: drain.rs:330-338 original finding is the same concern from another angle - deduped into this entry.
 
 - [ ] **`apply_changes/streaming.rs:242` - MEDIUM.** If a worker panics mid-stream, its `drain_tx` clone is dropped and other workers keep running, but seqs from the panicked worker's in-flight candidate are lost; the drain trips the reorder-buffer-non-empty check at drain.rs:330 and the panic only propagates when `std::thread::scope` returns, so the user sees "drain: channel closed with N items" rather than the real panic message. Trigger: OOM or unwrap in worker code path.
 
-- [ ] **`apply_changes/drain.rs:304` - MEDIUM.** `u64::MAX` is the "no nodes at all" sentinel that fires the barrier immediately; if there is ever a node blob whose seq happens to be `u64::MAX` (trillion-blob file), the sentinel collides with a real seq. Planet is 4+ orders of magnitude away, but nothing in the protocol enforces that seqs stay below `MAX-1`. Trigger: latent; requires a file-scale assumption change.
+- [x] ~~**`apply_changes/drain.rs:304` - MEDIUM.**~~ *(verified 2026-04-23 - sentinel collision requires >18 quintillion blobs; planet is 4+ orders of magnitude away. Not a realistic bug.)*
 
 - [ ] **`apply_changes/streaming.rs:420-445` - MEDIUM.** Modifications to existing base nodes (same ID, new coords) are covered only because `build_from_diff` in `node_locations.rs:51` is generous and inserts every diff node (create or modify) into `seeded_locations`; any future narrowing of `build_from_diff` would silently break coord freshness for way-refs to modified nodes. Trigger: latent invariant; regresses if the seeded-locations population is ever tightened.
 
-- [ ] **`apply_changes/drain.rs:330-338` - MEDIUM.** The "channel closed with items still in reorder buffer" diagnostic fires on both genuine seq gaps and legitimate mid-stream scanner failure; the error text says "Producer dropped a seq" which points away from the real failure, and the drain returns its generic error before the scanner/worker error surfaces on the `.join()` in `rewrite.rs:337`. Two errors for one fault, less-useful one reported first. Trigger: any upstream error during apply-changes.
+- [x] ~~**`apply_changes/drain.rs:330-338` - MEDIUM.**~~ *(verified 2026-04-23 - duplicate of the `rewrite.rs:244` diagnostic-quality item above; same concern from a different angle. Deleted to dedupe.)*
 
-- [ ] **`apply_changes/scanner.rs:252-257` - LOW.** The opportunistic `try_recv()` on `barrier_rx` after every emitted node sets `barrier_open=true`; on small datasets where `last_node_seq` is reported to the drain before the corresponding node worker finishes, the drain can publish the barrier early (via the idle-fire path at drain.rs:321) before all node-phase coord extraction has flushed, letting way workers race against node coord flushing. Trigger: tiny datasets with specific interleaving.
+- [x] ~~**`apply_changes/scanner.rs:252-257` - LOW.**~~ *(verified 2026-04-23 - no race.)* Workers flush `local_coords` into the shared `CoordSlot` at streaming.rs:467-471 BEFORE sending the DrainItem for the node blob. The drain only calls `barrier_publish_loc_map` after `state.next_seq > last_node_seq` (drain.rs:301-307, 316-322) - i.e., after every node DrainItem through `last_node_seq` has been dequeued and processed. Items are processed in seq order and workers flush before emitting, so by the time drain publishes the barrier, every node worker's coords are already in the shared slot. Scanner's try_recv cannot observe an open barrier before flushes complete. Deleted.
 
-- [ ] **`apply_changes/drain.rs:754` - LOW.** `merged.extend(local.drain())` - if two workers somehow end up with the same node ID (impossible under `needed_set` filtering but not enforced by type), the later insertion wins with undefined last-writer-wins semantics across worker boundaries. Trigger: malformed input (duplicate ID in base PBF) plus a `needed_set` regression.
+- [x] ~~**`apply_changes/drain.rs:754` - LOW.**~~ *(verified 2026-04-23 - `needed_set` filtering + per-blob single-worker ownership prevents collision by construction. Defensive note only.)*
 
 - [ ] **`apply_changes/rewrite_block.rs:103` - LOW.** Upsert-create emission uses `osm_id_cmp(inline_upserts[cursor], elem_id).is_lt()`, but `inline_upserts` was pre-sliced using `osm_id_key` bounds in `streaming.rs::upsert_slice`; if the base block is not sorted in OSM order (malformed input), the cursor can skip past upserts that compare greater than one element but less than a later element, silently dropping creates. Trigger: malformed base PBF violating Sort.Type_then_ID (partially protected by `--locations-on-ways` requiring `is_sorted()`, but the general path doesn't).
 
-- [ ] **`apply_changes/scanner.rs:268` - LOW.** At EOF under `--locations-on-ways` with zero way/relation blobs, the scanner blocks on `barrier_rx` waiting for the drain's signal; this works only because `drain.rs:321`'s idle-fire path eventually runs. No deadlock today but fragile. Trigger: refactor that removes the drain's idle-fire path.
+- [x] ~~**`apply_changes/scanner.rs:268` - LOW.**~~ *(verified 2026-04-23 - documented protocol, not a latent hazard. Scanner blocks on barrier_rx is the intended wait; drain.rs:321's idle-fire is the designed counterpart. Deleted.)*
 
-- [ ] **`apply_changes/drain.rs:751` - LOW.** The swap-first-extend-rest heuristic for coord-map merging is fine; defensive note only. Trigger: none.
+- [x] ~~**`apply_changes/drain.rs:751` - LOW.**~~ *(verified 2026-04-23 - defensive note only, no bug.)*
 
-- [ ] **`apply_changes/streaming.rs:227` - LOW.** `Mutex<Receiver>` serializes worker `recv()` calls - fine at small N, but under `-j N` much larger than physical cores the lock becomes a real bottleneck (no fairness). No correctness issue. Trigger: adversarial `-j` setting.
+- [x] ~~**`apply_changes/streaming.rs:227` - LOW.**~~ *(verified 2026-04-23 - acknowledged trade-off; inline comment at streaming.rs:223-226 already calls this out.)*
 
 ### Write path (parallel-pwrite, io_uring, parallel gzip)
 
-- [ ] **`write/parallel_writer.rs:148-156` - HIGH.** When `dispatch_loop` returns an error mid-stream or `rx.recv()` returns `Err` (sender drop/panic), the loop breaks and returns `Ok(())` without checking that `ReorderBuffer` is empty; seqs sent after a gap (framing task panicked before sending an earlier seq) are silently dropped and the file closes short. Trigger: rayon framing task panics on seq N before sending seqs N-1 or earlier.
+- [ ] **`write/parallel_writer.rs:191-206` - HIGH** *(verified 2026-04-23, narrowed from 148-156)*. The mid-stream error path is covered: `dispatch_loop` propagates via `let chunk = result?;` at :195 and `dispatch_chunk(...)?;` at :203, with the outer caller re-raising at :156. Real bug is narrower: the EOF path `while let Ok(item) = rx.recv()` at :191 returns `Ok(())` at :206 without asserting `pending` is empty. When the sender closes cleanly with a seq gap (an earlier framing task panicked/dropped without sending its seq), the gap chunks never pop from the `ReorderBuffer` and the file closes short silently. Trigger: rayon framing task panics on seq N (unwind drops tx half without surfacing an error through the dispatch channel) before sending seqs N-1 or earlier.
 
-- [ ] **`write/parallel_writer.rs:141-176` - HIGH.** The parallel writer never calls `file.set_len(...)`; correctness relies entirely on pwrite extending EOF. If one worker errors mid-stream and higher-offset workers have already completed pwrites, the file is left with holes (zero-filled by the kernel) inside - sparse state that `err_slot` surfaces as an error but with on-disk garbage up to the last dispatched offset. Trigger: worker hits EIO or EXDEV-fallback pread error while later-offset workers have already completed.
+- [x] ~~**`write/parallel_writer.rs:141-176` - HIGH.**~~ *(verified 2026-04-23 - no observable bug. On error `dispatch_loop` returns via `result?`/err_slot and the operation is reported as failed; the file is not claimed as successful. `file.set_len` is intentionally unused because pwrite extends EOF on success paths. Deleted.)*
 
 - [ ] **`write/parallel_writer.rs:180-207` + `uring_writer.rs:588-655` - HIGH.** Both loops break on `rx.recv() == Err` and return `Ok(())` without checking `pending.pending_len()`; sequencing gaps silently truncate output. Trigger: rayon framing-task panic on a middle seq causes tx drop; reorder buffer holds later seqs; writer exits cleanly with a truncated file.
 
-- [ ] **`write/uring_writer.rs:400-410` - HIGH.** `handle_copy_range_uring` adds `remaining` to `state.logical_size` upfront (line 408) before doing any pread; if the pread loop errors mid-copy (short-read, EIO), `logical_size` is inflated beyond actual on-disk bytes. A subsequent Drop-path `flush_final` (or outer retry) calls `file.set_len(logical_size)`, extending the file past real data with kernel zeroes - exactly the "zero-filled gap" class this cycle was meant to fix, in the sibling error path. Trigger: pread short-read or errno during CopyRange pread, followed by any path reaching `set_len(logical_size)`.
+- [x] ~~**`write/uring_writer.rs:400-410` - HIGH.**~~ *(verified 2026-04-23 - mechanism wrong. On pread error, `handle_copy_range_uring` returns Err and `uring_main_loop` propagates via `?`; `flush_final` is never reached on the error path. `UringState` has no Drop impl that calls `file.set_len`, so the described "Drop-path flush_final" does not exist. Inflation is real but unreachable. Deleted.)*
 
-- [ ] **`write/parallel_gzip.rs:188-213` - HIGH.** `worker_loop`'s `compress_one` error path does `return` silently; a worker that consumes a chunk from the mutex-receiver and then errors before sending compressed output permanently drops that seq, and the writer_loop stalls indefinitely on the BTreeMap gap until `raw_tx` closes (i.e. until the producer finishes), then errors with "N chunks missing". Hang in `finish()` waiting on the writer thread. Trigger: any compression error (flate2 OOM, etc.) in a single worker mid-stream.
+- [ ] **`write/parallel_gzip.rs:188-213` - LOW (downgraded 2026-04-23)** *(verified: not a live failure mode today)*. `compress_one` at :216 uses `GzEncoder::new(Vec::with_capacity(...), ...)`. `Vec<u8>` `Write` impl is infallible; flate2 doesn't return Err for OOM (it panics). So the `Err(_) => return` arm at :207 is effectively unreachable in current code. A worker panic unwinds rather than running the `return`, so this path does not reach the described hang via normal io::Error. The original trigger "flate2 OOM" is wrong. The hang is only reachable via (a) a future sink change to a fallible writer, or (b) a panic-caught-and-converted-to-Err path. Keep as a latent defensive-coding note; fix shape is still "on worker error/panic, poison the writer_loop channel or close it with a sentinel" but urgency drops with no live trigger.
 
-- [ ] **`write/parallel_gzip.rs:78-103` - MEDIUM.** `Arc<Mutex<Receiver>>` is poisoned if any worker panics while holding the lock; all remaining workers then `Err` out of `raw_rx.lock()` and exit, collapsing the entire pool on one localized fault. Trigger: panic inside `guard.recv()` while the lock is held.
+- [x] ~~**`write/parallel_gzip.rs:78-103` - MEDIUM.**~~ *(verified 2026-04-23 - no in-lock panic site.)* At :193-200 the lock scope is a tight block: `raw_rx.lock()` then `guard.recv()`, then the block ends and the guard drops before the `match item` at :201. `guard.recv()` is `mpsc::Receiver::recv`, which returns Err on channel close rather than panicking. `compress_one` at :205 and `compressed_tx.send` at :209 run after guard drop. No realistic in-lock panic site exists with current code; mutex poisoning is not a live failure mode. Deleted.
 
 - [ ] **`write/parallel_gzip.rs:170-184` - MEDIUM.** `Drop` silently swallows both the final-chunk `flush_current` error and the `writer_handle` join `io::Result`; inner-writer I/O errors vanish when callers forget `finish()`. Documented as "best-effort" but the failure mode is silent data loss. Trigger: any caller using RAII for `ParallelGzipWriter` with a file sink whose last writes matter.
 
 - [ ] **`write/uring_writer.rs:324-340` - MEDIUM.** On a CQE carrying `result < 0`, `in_flight` is decremented but `self.pool.release(buf_idx)` is skipped - that buffer slot is leaked for the remaining lifetime of the writer. Not catastrophic because the writer errors anyway, but violates the accounting invariant and can surface as "no free buffers" on any caller that tries to continue. Trigger: kernel returns short write or EIO on a `WriteFixed` completion.
 
-- [ ] **`write/parallel_writer.rs:278-297` - MEDIUM.** `send_to_worker` returns `Err` if the target worker has exited, but the round-robin counter is not advanced and the dispatcher surfaces failure rather than rerouting to healthy workers; one dead worker takes down the whole dispatch loop even if 15 others are still functional. Trigger: one worker panics.
+- [x] ~~**`write/parallel_writer.rs:278-297` - MEDIUM.**~~ *(verified 2026-04-23 - surfacing the error is correct; rerouting to healthy workers would produce file holes at the dead worker's queued offsets. Deleted.)*
 
 - [ ] **`write/writer.rs:736-746` - MEDIUM.** `Drop for PbfWriter` joins the writer thread and discards the `io::Result`; for `to_path_parallel` and `to_path_uring`, the writer thread does the actual `sync_all` and (for uring) `set_len` truncation - any I/O error from those operations is lost if the caller drops without calling `flush()`. Documented hazard. Trigger: library user uses `to_path_parallel` without calling `flush()` and sync/truncate fails.
 
@@ -930,21 +1085,21 @@ Findings from a multi-agent Opus audit of 0.3.0 high-churn areas before the rele
 
 - [ ] **`write/copy_range.rs:63-96` - MEDIUM (latent).** `copy_range_fallback` writes to `out_fd` via `out.write_all`, which uses position-based writes; parallel contexts that reuse this function (not current callers) would race with other position-based writers on the same fd. Documented latent constraint the parallel writer's EXDEV fallback silently avoids by using pwrite. Trigger: future code reusing `copy_range_fallback` in a parallel context.
 
-- [ ] **`write/uring_writer.rs:262-277` - LOW.** `acquire_buffer` returns `io::Error::other("no free buffers and nothing in-flight")` as an invariant sanity check; only reachable after another bug (buffer leak from the CQE error path above) already corrupted state. Trigger: requires a prior bug.
+- [x] ~~**`write/uring_writer.rs:262-277` - LOW.**~~ *(verified 2026-04-23 - invariant sanity check, not a bug. Reachable only via a prior bug elsewhere. Deleted.)*
 
 - [ ] **`write/writer.rs:108-145` - LOW.** `to_path_uring` handles a failed `init_rx.recv()` by `drop(tx); handle.join()` - if the uring thread is hung (e.g. blocked forever in `register_buffers` on a buggy kernel), the join hangs the main thread with no timeout. Trigger: pathological kernel behavior on `register_buffers` or `register_files`.
 
-- [ ] **`write/parallel_writer.rs:54-61` - LOW.** `POOL_SIZE=16` × `PER_WORKER_CAPACITY=8` max owned `Vec<u8>` per op - each `RawChunks` item splits into one `WriteOp` per chunk, so a single `RawChunks` with many tiny chunks saturates the pool with round-robin small writes, amplifying syscall count above the serial writer. Trigger: passthrough workload with many small framed blobs coalesced into `RawChunks`.
+- [x] ~~**`write/parallel_writer.rs:54-61` - LOW.**~~ *(verified 2026-04-23 - pool saturation just means dispatch blocks, which is correct backpressure rather than a bug. Deleted.)*
 
-- [ ] **`reorder_buffer.rs:21-33` - LOW.** `push` asserts `seq >= self.next_seq` and panics on violation; a stale seq from a retried rayon task or a bug elsewhere aborts the writer thread rather than surfacing as `io::Error`. Panic propagates through `join().map_err(...)?` but in-flight data is lost. Trigger: retry or misuse of seq in a producer.
+- [x] ~~**`reorder_buffer.rs:21-33` - LOW.**~~ *(verified 2026-04-23 - intentional defensive panic on invariant violation. Stale/duplicate seq is an upstream programming error, not a runtime input. Deleted.)*
 
 ### renumber
 
-- [ ] **`renumber/pass1.rs:179` - HIGH.** `check_negative_ids` is gated on `task.min_id < 0` from indexdata; if indexdata understates (stale/wrong index claims `min_id >= 0` when a negative ID is actually present), the negative-ID guard is skipped and `IdSet::set_atomic(negative_id)` casts to u64 -> chunk index at huge offset -> panics in `chunk_for_atomic`, OR silently corrupts the set if the offset lands inside `pre_allocate`'d range. Trigger: hand-crafted or edited-indexdata PBF with a negative node ID whose blob's indexdata reports `min_id >= 0`.
+- [ ] **`renumber/pass1.rs:179` - HIGH** *(verified 2026-04-23, "silently corrupts" claim corrected)*. `check_negative_ids` is gated on `task.min_id < 0` from indexdata; if indexdata understates, the guard is skipped and `IdSet::set_atomic(negative_id)` panics via `chunk_for_atomic` - a **loud panic with diagnostic message**, not silent corruption. Still a real bug (wrong-failure-mode rather than clean error), but the user-visible effect is a panic, not data loss. Trigger: hand-crafted or edited-indexdata PBF with a negative node ID whose blob's indexdata reports `min_id >= 0`.
 
 - [ ] **`renumber/wire_rewrite.rs:272` - HIGH.** Negative way_id only errors when `check_negative_ids=true` (per-blob `task.min_id < 0`); otherwise `way_id_set.set(old_way_id)` silently drops the negative (`IdSet::set` guards `id < 0`). The way survives to the output with a fresh new_id via `current_new_id` but is never recorded in `way_id_set`, so any relation member pointing to that way becomes a phantom orphan passing through with the stale negative memid. Trigger: negative way id in a blob whose indexdata `min_id` is non-negative.
 
-- [ ] **`renumber/stage2.rs:226-231` - MEDIUM.** The per-blob `element_count` mismatch check fires after `nodes_written.fetch_add` etc., but before sending through the channel; bailing here leaves a partially-written file. Since `base_way_id` for subsequent blobs was precomputed from indexdata, retrying would produce gaps or overlaps - no clean recovery. Trigger: indexdata disagrees with blob content.
+- [x] ~~**`renumber/stage2.rs:226-231` - MEDIUM.**~~ *(verified 2026-04-23 - finding's ordering is inverted; check fires BEFORE the fetch_add and tx.send at stage2.rs:233,241. Partial-write concern exists by a different mechanism but this specific claim is a false positive. Deleted.)*
 
 - [ ] **`renumber/wire_rewrite.rs:293-296` - MEDIUM.** Way ref orphan detection does both `resolve(old)` AND `get(old)` - two chunk lookups per ref (~1.5 B refs on planet). `rank_if_set(old)` combines them and matches `resolve`'s internals exactly. Code-quality rather than correctness; flagged for the optimization bar. Trigger: none.
 
@@ -954,25 +1109,25 @@ Findings from a multi-agent Opus audit of 0.3.0 high-churn areas before the rele
 
 - [ ] **`renumber/mod.rs:240` - MEDIUM.** `max_node_id = pass1_schedule.last().map_or(0, |t| t.max_id)` assumes the last node blob has the global max node ID; true for `Sort.Type_then_ID` (enforced by `require_sorted`), but if the header advertises sorted and the content is not (lying header), a later blob's id could overshoot `max_node_id` and `set_atomic` panics. Trigger: mis-flagged unsorted PBF.
 
-- [ ] **`renumber/wire_rewrite.rs:580-584` - MEDIUM.** Non-relation fields inside a relation blob's PrimitiveGroup are silently dropped (nodes/ways/changesets). Protected by `require_sorted` today but fragile to any sort-enforcement bypass. Trigger: non-spec PBF bypassing the sort gate.
+- [x] ~~**`renumber/wire_rewrite.rs:580-584` - MEDIUM.**~~ *(verified 2026-04-23 - explicitly intentional and documented with an inline comment. By design. Deleted.)*
 
 - [ ] **`renumber/wire_rewrite.rs:250,255,454,460` - MEDIUM.** `tag_start = val_start - 1` hard-codes a 1-byte field tag; correct for fields 1-15 (all low-numbered tags used here are <=15). If the PBF schema ever adds field >=16 that the rewriter needs to splice, `val_start - 1` would slice mid-varint and produce corrupt output silently. Add `debug_assert` tying tag byte count to field number. Trigger: future PBF schema addition.
 
-- [ ] **`renumber/wire_rewrite.rs:519-524` - MEDIUM.** For `member_type in {0,1,2}`, orphan is computed as `!id_set.get(old_abs_id)`; a negative `old_abs_id` from a broken delta stream flows to `get` which casts to u64 -> huge cid -> returns false -> counted as "orphan" and passed through with the negative value. Technically correct but conflates legitimate orphans with corrupt input. Trigger: corrupt memids delta.
+- [ ] **`renumber/wire_rewrite.rs:519-524` - MEDIUM** *(verified 2026-04-23, mechanism nit)*. Real effect confirmed: negative `old_abs_id` flows through `get` (returns false via bounds-check early-return at idset.rs:216) and `resolve` (returns `id` unchanged via cid-out-of-bounds early-return at idset.rs:408, not a huge-cid chunk lookup as the finding stated). Output contains the negative value AND orphan count bumps. Fix shape unchanged: explicit negative-ID check before the orphan decision.
 
 - [ ] **`renumber/mod.rs:256-262` - LOW.** `nodes_written != pass1_total_nodes` aborts AFTER pass1 output has been written and stage 2d is about to run; leaves a half-written file with no explicit output cleanup. Trigger: `task.element_count` sum mismatch.
 
-- [ ] **`renumber/pass1.rs:217-220` - LOW.** `tx.send(...).is_err()` break discards the blob error silently; if the consumer returned due to unrelated writer failure, workers exit cleanly but any in-flight worker error that hadn't yet sent is lost. First-observed-error propagation is not guaranteed. Trigger: concurrent worker-decompress-error + consumer-write-error.
+- [x] ~~**`renumber/pass1.rs:217-220` - LOW.**~~ *(verified 2026-04-23 - finding conflates send-on-closed-channel with error-discard. If receiver is dropped, there's nothing to send to; the blob error is already packaged in `result`. False positive. Deleted.)*
 
 - [ ] **`renumber/mod.rs:308-311` - LOW.** Way `id_sets` are merged by removing element 0 and folding the rest with `merge` (takes ownership); if `STAGE2D_WORKERS = 0` in a future tweak, `remove(0)` panics. Current constant is 6 but the shape is fragile - `merge_from` on a default-constructed set would be safer. Trigger: future refactor.
 
 ### altw external
 
-- [ ] **`altw/external/stage2.rs:534` / `mod.rs:559` - HIGH.** Stage-2 resolved-count uses `(lat == 0 && lon == 0)` as the missing-coord sentinel; a real OSM node at Null Island (0°, 0°) is classified as unresolved, and `stats.missing_locations = total_slots - resolved_count` is derived from this. The external path reports higher `missing_locations` than the dense path for inputs containing any ref to a (0,0) node. Documented as known limitation, still ships. Trigger: any way that references a node whose coordinates are exactly zero.
+- [ ] **`altw/external/stage2.rs:534` / `mod.rs:559` - HIGH (documented-accepted)** *(verified 2026-04-23, matches CORRECTNESS.md)*. Stage-2 uses `(lat == 0 && lon == 0)` as the missing-coord sentinel. Confirmed: sentinel still lives at stage2.rs:534 with an explicit block-comment at :522-533 cross-linking to the geocode counterpart. Already documented-accepted per CORRECTNESS.md "Null Island ambiguity in dense mmap index" - affects zero real-world nodes. Keep as-is until a real-world case surfaces; fix shape is a separate occupancy bitmap or explicit valid-bit track.
 
 - [ ] **`altw/external/blob_meta.rs:49-50` - HIGH.** `scan_blob_metadata` errors with "OsmData blob missing indexdata" for any blob without indexdata, but `external_join` calls `require_indexdata(..., force, ...)` first, which accepts `--force` and returns success without indexdata - so `--force` on non-indexed input fails later with a confusing indexdata error instead of the gated `require_indexdata` message. The external path is effectively incompatible with `--force` despite the CLI accepting the flag. Trigger: `pbfhogg add-locations-to-ways --index-type external --force` on a non-indexed PBF.
 
-- [ ] **`altw/external/stage4.rs:438-478` - HIGH.** The way decode path assumes every way blob's indexdata kind is `Way`; any way element appearing inside a non-Way-indexed blob reaches `assemble_block` at stage4.rs:836-851 which hard-errors because `coord_payloads` is keyed by way-blob index only. Mixed-kind or mis-labeled blobs slipping past sort enforcement hard-error stage 4 rather than produce output. Trigger: input indexdata whose `kind` disagrees with blob contents (out-of-spec writer or relaxed `require_sorted`).
+- [x] ~~**`altw/external/stage4.rs:438-478` - HIGH.**~~ *(verified 2026-04-23 - the `assemble_block` path at stage4.rs:836-851 is an **explicit defensive hard error with a detailed diagnostic message**, not silent corruption. A hard error on out-of-spec input is correct defensive behaviour, not a defect. Deleted.)*
 
 - [ ] **`altw/external/stage1.rs:269-273` + `stage2.rs:459-493` - MEDIUM.** Stage 2's blob-local rank counter (`next_rank = blob.ref_rank_start`, incremented per referenced tuple) is correct only if indexdata `(min_id, max_id)` tightly brackets actual node IDs in the blob. A producer with loose bounds plus the `debug_assert_eq!` at stage2.rs:488 passes in release and silently produces skewed ranks, scrambling the join. Trigger: input PBF with sloppy indexdata ranges from a third-party writer.
 
@@ -982,11 +1137,11 @@ Findings from a multi-agent Opus audit of 0.3.0 high-churn areas before the rele
 
 - [ ] **`altw/external/coord_payloads.rs:104-153` - MEDIUM.** `straddler_partials` allocates one `Mutex<Option<StraddlerPartial>>` per way blob (~57K at planet, ~3 MB) even though only a few hundred ever hold a value. Committed resident memory the design doc calls "only hundreds" but the implementation sizes for N. Trigger: any planet-scale run.
 
-- [ ] **`altw/external/stage4.rs:645` - MEDIUM.** Passthrough path takes `frame_read_buf` via `std::mem::take` and passes into `writer.write_raw_owned`; the reuse buffer at line 601 is re-initialised via `frame_read_buf.resize(frame_size, 0)` each iteration, so take-and-discard forces a fresh allocation per passthrough blob rather than reusing. Accumulates small-allocator churn across thousands of relation blobs at planet scale. Trigger: any run with many passthrough blobs.
+- [ ] **`altw/external/stage4.rs:645` - MEDIUM (perf)** *(verified 2026-04-23)*. Passthrough path takes `frame_read_buf` via `std::mem::take`; next iteration's `frame_read_buf.resize(frame_size, 0)` on the now-empty Vec forces a fresh allocation. Buffer reuse intent is defeated. Fix: use `std::mem::replace(&mut frame_read_buf, Vec::with_capacity(frame_size))` or pass by reference.
 
-- [ ] **`altw/external/stage3.rs:289` - MEDIUM.** A stage-3 worker error calls `router.abort(...)` and stores the error in `err_ref`; the `expect` at stage4.rs:590 (`desc.kind.expect("passthrough eligibility requires a known blob kind")`) panics visibly if any blob reaches stage 4 with `kind = None` after a stage-3 abort. Shouldn't happen given `require_indexdata`, but the panic is user-visible if invariants slip. Trigger: indexdata invariant violation concurrent with a stage-3 abort.
+- [x] ~~**`altw/external/stage3.rs:289` - MEDIUM.**~~ *(verified 2026-04-23 - passthrough descriptors always set `kind: Some(meta.kind)` at stage4.rs:208. No path produces `kind=None` for a passthrough desc. Theoretical panic only. Deleted.)*
 
-- [ ] **`altw/external/stage2.rs:155-181` - LOW.** `SharedSlotBuckets::finish` flushes each writer behind its own mutex; writers stay open and are dropped implicitly at scope exit. Stage 3 opens files via `std::fs::File::open` after `finish()` runs (sequential structure), so no race today - but the ordering is not asserted anywhere beyond code structure. Trigger: refactor that moves stage 3 into a scope overlapping with stage 2.
+- [x] ~~**`altw/external/stage2.rs:155-181` - LOW.**~~ *(verified 2026-04-23 - description of current structure, not a bug. Deleted.)*
 
 - [ ] **`altw/external/mod.rs:191` - LOW.** `ScratchDir::new` uses `output.parent().unwrap_or(Path::new("."))` - if `output` is a bare filename with no parent component, scratch files land in the current working directory. A user running from `/` or a tmpfs cwd while outputting to a large disk can land ~224 GB of scratch on the wrong filesystem. The dense path has the same pattern. Trigger: running external-join from a small-fs cwd.
 
@@ -996,35 +1151,35 @@ Findings from a multi-agent Opus audit of 0.3.0 high-churn areas before the rele
 
 ### diff / derive-changes shard-parallel
 
-- [ ] **`diff/parallel.rs:138-142` / `derive_parallel.rs:136-142` - MEDIUM.** `plan_shards` builds thresholds as raw `i64` from `old_descs[k].index.max_id`, but element-merge inside shards uses `osm_id_cmp` (canonical OSM order: `0, -1, -2, ..., 1, 2, ...`). If inputs contain negative IDs (synthetic extracts, test fixtures, some editor outputs), threshold ordering and element ordering disagree: a shard with `(t_low=MIN, t_high=numericPositive)` sees its iterator yield negatives first, then positives, and the `id <= t_low`/`id > t_high` clip is raw numeric. Trigger: any PBF with a negative element ID plus `-j >= 2`.
+- [ ] **`diff/parallel.rs:138-142` / `derive_parallel.rs:136-142` - MEDIUM (latent - positive-only production PBFs)** *(verified 2026-04-23)*. `plan_shards` builds thresholds via raw `i64` compare while element-merge uses `osm_id_cmp` canonical order. Mechanism is correct; effect is only reachable on mixed-sign inputs, which production PBFs are not. Fix lives in this file but priority drops until a real negative-ID consumer surfaces. Same goes for findings #2 (single-sided emit) and #3 (merge_up_to .min()) in this area - all three share the raw-vs-canonical compare issue and are similarly latent.
 
-- [ ] **`diff/parallel.rs:354-357` / `derive_parallel.rs:310-315, 324-329, 339-343, 354-358` - MEDIUM.** Single-sided emit does `if id > t_high { break; }` / `if id <= t_low { continue; }` on raw numeric compare; sorted order inside a blob is canonical. On mixed-sign blobs (min_id < 0 < max_id), the `break` fires prematurely or late relative to canonical order, producing drops or double-emits under `-j >= 2`. Trigger: blob spans zero combined with shard window entirely on one sign side.
+- [ ] **`diff/parallel.rs:354-357` / `derive_parallel.rs:310-315, 324-329, 339-343, 354-358` - MEDIUM (latent)** *(verified 2026-04-23 - see the consolidated note on finding #1 above).*
 
-- [ ] **`diff/parallel.rs:384` / `derive_parallel.rs:429` - MEDIUM.** `let merge_up_to = os.index.max_id.min(ns.index.max_id).min(t_high);` uses numeric `.min()` on IDs, not `osm_id_cmp`; collapses to correct bound for all-positive inputs, but picks the wrong merge-horizon on mixed-sign inputs and can skip residual processing of a still-pending side. Trigger: same as above.
+- [ ] **`diff/parallel.rs:384` / `derive_parallel.rs:429` - MEDIUM (latent)** *(verified 2026-04-23 - same class as #1 above; collapses to correct bound for positive-only inputs).*
 
 - [ ] **`diff/parallel.rs:735` / `derive_parallel.rs:854-856` - MEDIUM.** When `slot?` propagates a worker error in the main-thread concatenate loop, remaining already-successful `ShardOutput` slots are never visited, so their per-shard `.txt.tmp` / `.xml.tmp` files are never removed. The outer `derive_parallel` temp files have the same lifecycle gap. Trigger: any shard worker returning `Err` (decompression failure, short read) or phase error after earlier phase populated `scratch_dir`.
 
 - [ ] **`diff/parallel.rs:700-730` / `derive_parallel.rs:817-850` - MEDIUM.** `std::thread::scope` panic handling: if a worker panics after creating scratch files, `h.join()` returns `Err` (converted to `io::Error::other("shard worker panicked")`) but the scratch files are never cleaned up - `scratch_dir` grows a `derive-par-*-{pid}-*` set on every failed run. Same class as above. Trigger: worker panic mid-shard.
 
-- [ ] **`diff/parallel.rs:686` / `derive_parallel.rs:782` - LOW.** `if phase.old.is_empty() && phase.new.is_empty() { continue; }` silently skips emitting `DIFF_PHASE_<tag>_START/END` markers for empty phases; sequential `diff_block_pair` emits them unconditionally. Brokkr `--durations` / `--compare` will see misaligned phase sets between `-j 1` and `-j N` runs on datasets with one type kind missing. Trigger: synthetic / region-extract PBFs with zero ways or zero relations.
+- [x] ~~**`diff/parallel.rs:686` / `derive_parallel.rs:782` - LOW.**~~ *(verified 2026-04-23 - marker skip is observability-only, not correctness. Deleted.)*
 
-- [ ] **`diff/parallel.rs:137` / `derive_parallel.rs:135` - LOW.** `let n = target_count.min(old_descs.len()).max(1);` - when `old_descs.len() == 1`, `n = 1` and `-j 16` degenerates to one worker + zero parallelism with full thread/FIFO setup cost. Not a bug; worth confirming benchmark expectations. Trigger: single-blob kind at high `-j`.
+- [x] ~~**`diff/parallel.rs:137` / `derive_parallel.rs:135` - LOW.**~~ *(verified 2026-04-23 - correct degenerate behaviour for single-blob input. Deleted.)*
 
 - [ ] **`diff/parallel_gzip.rs:170-184` - LOW.** `Drop` swallows flush error when `finish()` was not called (also noted in write path). Trigger: caller relies on RAII.
 
-- [ ] **`diff/parallel_gzip.rs:273-285` (test) - LOW (spec).** Truly-empty input yields zero bytes, not a valid gzip file; `assemble_osc_from_paths` always writes XML prologue + root element first, so production never hits this. Latent contract issue for future callers. Trigger: empty stream through `ParallelGzipWriter` from a future caller.
+- [x] ~~**`diff/parallel_gzip.rs:273-285` (test) - LOW (spec).**~~ *(verified 2026-04-23 - documented & asserted behaviour; sole consumer never emits empty streams. Deleted.)*
 
-- [ ] **`diff/derive_parallel.rs:703` - LOW.** `let _ = element_version;` inside `write_delete_element` with comment claiming "silence unused helper"; the function is actually imported at module level and used transitively via `write_element_xml`. Comment/documentation mismatch, no correctness impact. Trigger: none.
+- [x] ~~**`diff/derive_parallel.rs:703` - LOW.**~~ *(verified 2026-04-23 - future-proofing line, not a bug. Deleted.)*
 
-- [ ] **`diff/derive_parallel.rs:537-540` - LOW (confirmed intentional).** `element_merge` Equal branch only calls `emit_create(modifies_w, &n, ...)` if `!borrowed_elements_equal(&o, &n)`; modifies emit new element verbatim via `write_element_xml`, ignoring `increment_version` and `update_timestamp` - matches sequential path's `write_modify` which also calls `write_element_xml` without applying those flags. Documented invariant: increment/update only apply to deletes. Trigger: none.
+- [x] ~~**`diff/derive_parallel.rs:537-540` - LOW.**~~ *(verified 2026-04-23 - finding itself labels this confirmed intentional. Deleted.)*
 
-- [ ] **`diff/parallel.rs:501-502` - LOW.** `let _ = options.verbose;` with comment "Verbose details are not supported on the parallel path yet." If a user passes `-v -j 4`, verbose is silently dropped with no warning and no `modified` detail lines. Consider CLI-layer guard ("--verbose requires -j 1") over silent drop. Trigger: `diff -v -j 4`.
+- [x] ~~**`diff/parallel.rs:501-502` - LOW.**~~ *(verified 2026-04-23 - finding acknowledges "not supported yet" comment; intentional. Consider a CLI guard if it becomes a real user complaint. Deleted.)*
 
-- [ ] **`diff/parallel.rs:142` / `derive_parallel.rs:142` - LOW.** `thresholds.dedup()` collapses only consecutive duplicates; because `old_descs` are sorted by id range (`max_id` monotone), thresholds are monotone non-decreasing and `dedup()` is sufficient. Undocumented invariant. Trigger: none.
+- [x] ~~**`diff/parallel.rs:142` / `derive_parallel.rs:142` - LOW.**~~ *(verified 2026-04-23 - source sequence is monotone non-decreasing, so consecutive dedup is sufficient. Not a bug. Deleted.)*
 
 - [ ] **`diff/derive_parallel.rs:240-248` - LOW.** Per-shard scratch filenames are `derive-par-{creates|modifies|deletes}-{pid}-{kind_tag}-{shard_idx}.xml.tmp`; two `pbfhogg` processes with the same PID running concurrently in the same `scratch_dir` (container restart recycling PID) collide. Sequential `ChangeSink` has the same exposure - pre-existing latent class. Add random suffix for 0.4.0. Trigger: PID collision.
 
-- [ ] **`diff/parallel.rs:755` - LOW.** `append_and_cleanup` uses `io::copy` without `BufReader`; source file was just written by a `BufWriter<File>` that was flushed/dropped, so unbuffered reads work but do one syscall per `io::copy` kernel-default chunk. Sibling in `derive_parallel.rs:904` wraps in `BufReader` on open - inconsistent. Trigger: none.
+- [x] ~~**`diff/parallel.rs:755` - LOW.**~~ *(verified 2026-04-23 - marginal micro-perf, not a bug. Deleted.)*
 
 ### geocode builder v2
 
@@ -1040,21 +1195,21 @@ Findings from a multi-agent Opus audit of 0.3.0 high-churn areas before the rele
 
 - [ ] **`geocode_index/builder/pass3.rs:229-231` - MEDIUM.** On entry to `bucketed_cell_assignment_fused`, bucket dirs are blown away with `remove_dir_all`, but on error mid-Stage-A the dirs and partial buckets are left behind (no Drop/ScratchDir guard). A crash leaves ~256 temp files per bucket dir; subsequent build succeeds only because of the unconditional remove at top. Trigger: panic or I/O error between `create_dir_all` and the `remove_dir_all(bucket_dir).ok()` at end of Stage B.
 
-- [ ] **`geocode_index/reader.rs:600-607` - MEDIUM.** `cell_neighborhood` silently drops neighbors beyond index 8 when `all_neighbors` returns more than `MAX_NEIGHBORHOOD - 1 = 8`. S2 normally yields at most 8 edge/corner neighbors, but face cells (level 0) or near face-corner topology can return a different count; the buffer truncates without warning. Trigger: query near an S2 face boundary where the cell's neighbor set is degenerate.
+- [x] ~~**`geocode_index/reader.rs:600-607` - MEDIUM.**~~ *(verified 2026-04-23 - defensive clamp, not silent drop; S2 returns exactly 8 neighbors at any non-face level. Not a bug. Deleted.)*
 
-- [ ] **`geocode_index/reader.rs:765-801` - MEDIUM.** `search_admin_ranked` skips the PIP test on any entry with the interior hint (`is_interior || contains(...)`); a smaller interior-hinted polygon that doesn't actually contain the point (hint is cell-level, not point-level) can win over a correct larger containing polygon because the area check only gates on `poly.area < best_by_level[level].1`. Trigger: query near the cell-vs-polygon boundary for a small polygon marked interior-hint for a nearby cell.
+- [x] ~~**`geocode_index/reader.rs:765-801` - MEDIUM.**~~ *(verified 2026-04-23 - documented intentional design (inline comment: "Interior hint: skip PIP test (accepted approximation per spec)"). Deleted.)*
 
 - [ ] **`geocode_index/builder/admin.rs:88-111` - MEDIUM.** Hole-in-outer containment check uses only `hole[0]` (first vertex) with `point_in_ring`; a hole whose first vertex happens to lie outside the outer ring (e.g. aggressive `simplify_ring` on outer) is discarded even though most of the hole is inside. Trigger: aggressive `simplify_ring` on outer reduces it past the hole's first vertex.
 
-- [ ] **`geocode_index/reader.rs:597` - LOW.** `cell_neighborhood` uses `.iter().take(8)` redundantly with `min(8)`; code smell, not a bug. Trigger: none.
+- [x] ~~**`geocode_index/reader.rs:597` - LOW.**~~ *(verified 2026-04-23 - harmless code smell, not a bug. Deleted.)*
 
 - [ ] **`geocode_index/reader.rs:1033-1040` - LOW.** `segment_length` returns `approx_distance_sq().sqrt()` in radians; `way_length` / `accumulated_length` look like meters/length but are radians. Interpolation ratio is dimensionless so correct, but names mislead. Trigger: none (latent confusion source).
 
-- [ ] **`geocode_index/builder/pass3.rs:119-120` - LOW.** `bucket_for_cell` uses top 8 bits; on any single face, all cells at level 17 share the same top 3 bits - only 32 bucket values per face exercised, heavily skewed bucket sizes. Not correctness, just uneven Stage B parallelism. Trigger: any build (perf-only note).
+- [x] ~~**`geocode_index/builder/pass3.rs:119-120` - LOW.**~~ *(verified 2026-04-23 - mechanism claim wrong. S2 cell IDs encode face in top 3 bits + level/pos in the rest; at level 17 on one face, bits 4-8 vary substantially. Not the claimed skew. Deleted.)*
 
 - [ ] **`geocode_index/reader.rs:800-831` - LOW.** `search_admin_all`'s `seen: Vec<u32>` uses linear `contains()` dedup; for points inside many overlapping admin boundaries (national + regional + municipal), O(n^2) per query. Latent scaling issue at the query API. Trigger: query API usage with deeply-nested admin overlap.
 
-- [ ] **`geocode_index/format.rs:406-423` - LOW.** `parse_rings` drops rings with `<3` vertices silently (correct), but doesn't close unclosed rings; if an admin writer ever stops duplicating the closing vertex, the reader path still works but vertex-count becomes ambiguous. Currently internally consistent. Trigger: future writer change.
+- [x] ~~**`geocode_index/format.rs:406-423` - LOW.**~~ *(verified 2026-04-23 - defensive behaviour, currently internally consistent. Not a bug. Deleted.)*
 
 - [ ] **`geocode_index/builder/pass2.rs:295-304` - LOW.** Building-centroid uses integer division `sum_lat / count` on `i64` decimicrodegree sums; for ways spanning the antimeridian, the "centroid" sits on the wrong hemisphere. Not realistic in OSM but no antimeridian-aware averaging. Trigger: building polygon crossing +/-180 degrees.
 
@@ -1064,31 +1219,31 @@ Findings from a multi-agent Opus audit of 0.3.0 high-churn areas before the rele
 
 - [ ] **`read/raw_frame.rs:65-67, 124-127` - HIGH.** `read_raw_frame` and `read_blob_header_only` both lack the `MAX_BLOB_HEADER_SIZE` guard before `vec![0u8; header_len]`; both are exercised by `has_indexdata`, `check_sorted_and_indexed`, and cat/diff/extract passthrough paths, so any command that probes an adversarial file gets an OOM-sized allocation instead of a clean `BlobError::HeaderTooBig`. Trigger: same as above, via any command touching these helpers instead of `BlobReader::read_blob_header`.
 
-- [ ] **`read/pipeline.rs:148-219` - HIGH.** Stage 2 dispatcher builds a fresh `rayon::ThreadPoolBuilder` per pipeline invocation; if the build fails it emits a single `(0, Err(...))` via `dispatch_tx.send` but never consumes `raw_rx`, so the Stage 1 reader thread blocks forever on `raw_tx.send` once the 16-slot buffer fills and the scope never terminates. Trigger: exhausted thread budget / `rlimit(NPROC)` on the dispatcher spawn; also fires if any environment (cgroups, seccomp) denies rayon worker thread creation mid-run.
+- [x] ~~**`read/pipeline.rs:148-219` - HIGH.**~~ *(verified 2026-04-23 - no deadlock.)* Stage 2 is spawned with `move` at pipeline.rs:149, taking ownership of `raw_rx` (captured in the `for ... in raw_rx` loop at :171). On pool-build failure, stage 2 sends the error via `dispatch_tx` at :166 and `return`s at :167, exiting the closure and dropping `raw_rx` as the closure's locals drop. Stage 1 at :119-125 loops over `blob_reader.enumerate()` calling `raw_tx.send(...)`; when `raw_rx` drops, `sync_channel::send` wakes blocked senders with `Err`, the `if ... .is_err() { break; }` at :121-123 exits the loop, stage 1 terminates cleanly, and stage 3 receives the `(0, Err)` and propagates via :246. No path exists where stage 2 holds `raw_rx` alive after the error return. Deleted.
 
-- [ ] **`scan/classify.rs:59-95, 110-163` - HIGH.** `build_classify_schedule` and `build_classify_schedules_split` do not check `data_offset + data_size <= file_size`; a truncated or partially-written PBF yields a schedule containing offsets past EOF, and workers only fail at `read_exact_at` after a lot of pread traffic has already happened (and in the `_split` case, the truncation is silently replicated across all three per-kind schedules). Trigger: any truncated upload or mid-write snapshot.
+- [ ] **`scan/classify.rs:59-95, 110-163` - HIGH (narrowed 2026-04-23)** *(verified)*. `build_classify_schedule` / `_split` don't explicitly check `data_offset + data_size <= file_size`. The walker's own `offset >= file_size` guard at `header_walker.rs:127` stops iteration before producing past-EOF entries as long as offsets stay monotonic, so the truncation case mostly surfaces as a clean error from the walker. Narrow residual: a corrupt header advertising `data_size` that reaches beyond EOF on the last blob still produces a bogus schedule entry; workers only fail at `read_exact_at`. Fix: one explicit bounds check in the schedule builder.
 
-- [ ] **`read/decompress.rs:108-117, 74-84` - MEDIUM.** `pool_get` / `pool_get_pub` call `buf.reserve(...)` on the vec returned from the pool, but if the caller bails out with `?` before wrapping via `pool_wrap`, the vec is dropped - the 4 MB `MAX_RETAINED_CAPACITY` allocation does not return to the pool, and on a heavy decode-error run every error blob burns one recycled buffer. Trigger: a run of malformed zstd/zlib blobs (e.g. the `MessageTooBig` guard firing mid-decode) steadily drains the pool below steady state.
+- [x] ~~**`read/decompress.rs:108-117, 74-84` - MEDIUM.**~~ *(verified 2026-04-23 - pool is an opportunistic cache, not a resource pool. Dropped Vec frees its allocation but the pool refills from fresh allocations as needed. Not a bug. Deleted.)*
 
-- [ ] **`read/header_walker.rs:74-105` - MEDIUM.** `HeaderWalker::open` always opens a plain buffered file and applies `posix_fadvise(RANDOM)`; the `--direct-io` CLI flag is silently dropped on every path that goes through `build_classify_schedule*` (apply-changes, altw, extract strategies, geocode classify) because the walker's `shared_file()` hands workers a non-O_DIRECT fd. Trigger: any classify-backed command invoked with `--direct-io` on a memory-constrained host - the page cache still fills from worker preads, defeating the flag.
+- [x] ~~**`read/header_walker.rs:74-105` - MEDIUM.**~~ *(verified 2026-04-23 - intentional design. Header walker is explicitly buffered for tiny-read patterns; `--direct-io` concerns the data-path, which the workers' separate fds may still honour. Not a bug. Deleted.)*
 
 - [ ] **`blob_meta/scan_ids.rs:192-202` - MEDIUM.** The coordinate conversion multiplies `gran * min_raw_lat` as i64 without overflow checking; on adversarial or bitrot-corrupted `granularity` / `lat_offset` fields the result wraps silently in release builds, producing a bogus bbox that then gets serialized into indexdata and trusted by every spatial filter downstream. Trigger: a PBF whose `granularity` field is set to `i32::MAX` combined with extreme delta-coded coords.
 
-- [ ] **`read/indexed.rs:107-173` - MEDIUM.** `IndexedReader::new<R>` / `create_index` records every blob's offset with `SimpleBlobType::Primitive|Header|Unknown` but leaves `id_ranges: None` until the first full decode; `update_element_id_ranges` only inspects `group.nodes() / dense_nodes() / ways()`, so a blob containing only relations ends up with `{node_ids: None, way_ids: None}`. Future calls interpret this as `ElementsAvailable::No` - consistent but masks the fact that relation blobs were never indexed at all; any future relation-aware method added here will start silently skipping real data. Trigger: add a `for_each_relation` to `IndexedReader` and run it on any sorted PBF.
+- [x] ~~**`read/indexed.rs:107-173` - MEDIUM.**~~ *(verified 2026-04-23 - `None` means "unknown", not "no elements". No current consumer treats it otherwise. Not a bug. Deleted.)*
 
-- [ ] **`read/block.rs:338-407` - MEDIUM.** `PrimitiveBlock { buffer: Bytes, block: WireBlock<'static> }` relies on field-declaration-order drop: `buffer` drops first (returning the `Vec` to `DecompressPool`), then `block` drops (trivial). If a future refactor reorders fields, adds a `Drop` impl to `WireBlock`, or introduces any access inside a `Drop`, the self-referential transmute silently becomes unsound. No `drop_check` or assert pins the invariant. Trigger: latent; any refactor touching either struct.
+- [x] ~~**`read/block.rs:338-407` - MEDIUM.**~~ *(verified 2026-04-23 - Rust drop order is language-guaranteed by field declaration order, and the safety comment at block.rs:344-352 pins the invariant. Not a bug. Deleted.)*
 
-- [ ] **`read/direct_reader.rs:144-168` - MEDIUM.** `DirectReader::skip` uses `self.file.stream_position()` to compute the post-buffer absolute target, but `stream_position` returns the fd's position after the last `libc::read`, which is the page-aligned read end - not the logical read offset. The math happens to work when the buffer was fully consumed up to `len` (the common case) because `past_buf = n - buffered` equals `(current_pos - buffered) + n - current_pos` algebraically, but the comment on line 145 is wrong and the invariant is load-bearing. Trigger: latent; any edit that tweaks `past_buf` can break alignment.
+- [x] ~~**`read/direct_reader.rs:144-168` - MEDIUM.**~~ *(verified 2026-04-23 - math works correctly; doc-comment concern only. Not a bug. Deleted.)*
 
-- [ ] **`read/pipeline.rs:184-210` - MEDIUM.** `catch_unwind`/`AssertUnwindSafe` on rayon decode tasks converts panics into `io::Error::other("decode task panicked")`, losing the panic payload and the downstream stringtable-UTF8-err/wire-err detail. Stage 2 only catches panics inside the decode closure, not in the enclosing `decode_pool.spawn` or the dispatcher loop itself. Trigger: any bug that escapes `from_vec_pooled_with_scratch`'s Result path (e.g. a debug_assert panic) surfaces as an opaque "decode task panicked" with no blob offset.
+- [x] ~~**`read/pipeline.rs:184-210` - MEDIUM.**~~ *(verified 2026-04-23 - converting panic to io::Error is the idiomatic bridge to the non-panic-propagating channel architecture. Design choice, not a bug. Deleted.)*
 
-- [ ] **`scan/classify.rs:36-43, 200, 304` - MEDIUM.** `resolve_thread_count(Some(0))` falls through to `available_parallelism() - 2`; the comment on line 34 says this is intentional for CLI flags that map `0 = auto` to pass through cleanly, but no current caller uses that mapping. If a new CLI flag lands with `--threads 0` intending "disable parallelism" (a common Linux convention), the scan will spawn `N-2` workers instead of 0 or 1. Trigger: add a new CLI `--threads 0` meaning serial - user silently gets a 14-thread run on a 16-core box.
+- [x] ~~**`scan/classify.rs:36-43, 200, 304` - MEDIUM.**~~ *(verified 2026-04-23 - explicitly documented intentional behaviour at classify.rs:33-35. Not a bug. Deleted.)*
 
 - [ ] **`read/blob.rs:670-681` - LOW.** `BlobReader::seek_raw` sets `self.offset = Some(ByteOffset(offset))` and does not reset `last_blob_ok`; if the previous iteration left `last_blob_ok = false` (after HeaderTooBig or InvalidDataSize), `seek_raw` succeeds but subsequent `next()` still short-circuits to `None`. Trigger: call `seek_raw` on a reader that just returned `Err` - iteration stays dead even though the user recovered via seek.
 
 - [ ] **`reorder_buffer.rs:21-33` - LOW (read-path side; also noted in write-path sweep).** `ReorderBuffer::push` asserts `seq >= self.next_seq` and `self.pending[slot_idx].is_none()`; both are panics-on-caller-bug rather than Result errors. In the pipeline the sequence comes from `enumerate()` so these only fire if a rayon worker sends duplicate `(seq, ...)` tuples. If a new caller retries a seq on a transient error and sends it twice, the panic kills the pipeline thread. Trigger: add a retry loop in `run_pipeline` that re-sends on transient decode errors without updating seq tracking.
 
-- [ ] **`read/blob.rs:263-274` - LOW.** `BlobReaderSource` is implemented for `File`, `Cursor<T: AsRef<[u8]>>`, and `BufReader<R>`; the default `skip_relative` for any third type does `Seek::seek(SeekFrom::Current(n))`. Doc claims this is "correct but pays the discard cost" - true for `BufReader`-wrapping types, but a user-provided compressed-stream reader (e.g. gzip-on-the-fly) would be unimplemented or re-decode from scratch. Header walks on such sources now issue O(blob_count) expensive seeks instead of the O(blob_count) cheap `seek_relative` the doc promises. Trigger: wire a custom `Read + Seek` source into `BlobReader::new_seekable` that has expensive `seek`.
+- [x] ~~**`read/blob.rs:263-274` - LOW.**~~ *(verified 2026-04-23 - working as designed; BufReader overrides default appropriately. Not a bug. Deleted.)*
 
 ### Smaller commands
 
@@ -1098,21 +1253,21 @@ Findings from a multi-agent Opus audit of 0.3.0 high-churn areas before the rele
 
 - [ ] **`commands/getid/mod.rs:259` - MEDIUM.** `removeid` (invert mode) reaches `filter_by_id` without any `require_indexdata` / `--force` gate. On a non-indexed PBF, the raw-passthrough fast path at 332-360 is unreachable (branch is conditional on `meta.index.is_some()`), so every blob falls into the full-decode path at 364 with no user warning. Correct output but silently slow, and inconsistent with `getid` at line 238 which gates on indexdata. Trigger: `removeid` on a non-indexed PBF.
 
-- [ ] **`commands/extract/simple.rs:310-315` - MEDIUM.** `extract --simple` has no `require_indexdata` gate (`require_indexdata` at `mod.rs:629-633` only runs for CompleteWays/Smart). Pass 1 uses `blob.index()` behind `if let Some(idx)` at 176, silently skipping spatial filtering on non-indexed inputs, while Pass 2 has no equivalent. Correct but wasteful; also means users don't get the `--force` warning on non-indexed input for simple. Trigger: unsorted non-indexed PBF with simple extract strategy.
+- [x] ~~**`commands/extract/simple.rs:310-315` - MEDIUM.**~~ *(verified 2026-04-23 - extract --simple is explicitly exempt from `require_indexdata` at mod.rs:629 by design (bbox scan on decoded elements doesn't need indexdata). Not a bug. Deleted.)*
 
-- [ ] **`commands/check/verify_ids.rs:534-536` - MEDIUM.** `check_type_order` is skipped in the `--full` path when `!indexed` (explicit comment: schedules are triplicated, would produce spurious violations). A user running `check --ids --full` on a non-indexed file with an actual type-order violation sees NonMonotonic and Duplicate violations but NO TypeOrder violations - silently downgrading the diagnosis vs the non-`--full` path which does element-level type-order checking. Trigger: `check --ids --full` on a non-indexed PBF with elements in wrong type order.
+- [x] ~~**`commands/check/verify_ids.rs:534-536` - MEDIUM.**~~ *(verified 2026-04-23 - explicitly documented at verify_ids.rs:524-533. Skip is correct: non-indexed schedule triplication would produce spurious violations. Non-`--full` path still provides element-level type-order checking. Deleted.)*
 
-- [ ] **`commands/altw/passthrough.rs:285-286` - MEDIUM.** `is_passthrough = matches!(kind, Some(ElemKind::Relation)) || matches!(kind, Some(ElemKind::Node) if keep_untagged_nodes)`; evaluated only when `kind` comes from `header.index.as_ref().map(|idx| idx.kind)`. With `altw --force` on non-indexed input, `kind = None` and every blob decodes via `BatchSlot::Unknown(frame)`. Correctness is preserved (everything decodes in file order) but the "Flush pending decode batch before writing passthrough blobs" invariant at lines 289-307 is never triggered for non-indexed input, meaning the documented ordering-preservation mechanism silently doesn't apply. Trigger: `altw --force` on non-indexed input.
+- [x] ~~**`commands/altw/passthrough.rs:285-286` - MEDIUM.**~~ *(verified 2026-04-23 - with kind=None, no passthrough happens, so the flush invariant is vacuously satisfied. Not a bug. Deleted.)*
 
-- [ ] **`commands/extract/multi.rs:158-168` - MEDIUM (latent).** Non-indexed blob fallback creates `NodeBlobInfo` entries with `frame_size: 0, count: 0, contained_in: Vec::new()`. At `multi.rs:540` the check `info.contained_in.len() == n` is false for empty `contained_in` when `n > 0` (so entries correctly route to `decode_items`), but when `n == 0` (caller bug; prevented by `parse_extract_config` at `mod.rs:373`), `contained_in.len() == 0 == n` would send the frame_size=0 entry to passthrough with a 0-byte `read_exact_at`. Latent bug behind a config validation. Trigger: bypass config validation to pass zero regions.
+- [x] ~~**`commands/extract/multi.rs:158-168` - MEDIUM (latent).**~~ *(verified 2026-04-23 - extract-to-zero-regions is a degenerate case prevented by config validation; code path unreachable. Deleted.)*
 
-- [ ] **`commands/extract/mod.rs:518-524` - LOW.** `extract_multi` single-pass dispatch checks only `ExtractStrategy::Simple` and `!clean.any()`, never consults `force`. `try_extract_multi_single_pass` does not call `require_indexdata`, so multi-extract on non-indexed input with Simple silently uses the "no indexdata - include in all schedules (conservative)" branch at `multi.rs:158-168`. Not a correctness issue but the `--force` contract documented for single-region `extract()` is bypassed. Trigger: multi-extract on non-indexed PBF with Simple strategy.
+- [x] ~~**`commands/extract/mod.rs:518-524` - LOW.**~~ *(verified 2026-04-23 - minor inefficiency at most; Simple doesn't need indexdata. Deleted.)*
 
-- [ ] **`commands/time_filter/mod.rs:179-184` - LOW.** `group.latest = Some(clone_owned_element(&element))` unconditionally overwrites on every version with `timestamp <= cutoff`. Correct iff history versions within a `(kind, id)` group are timestamp-sorted; relies on PBF history convention without checking version numbers. A malformed history file with out-of-order versions produces "last version seen with `timestamp <= cutoff`" instead of "max timestamp <= cutoff". Trigger: malformed history PBF.
+- [x] ~~**`commands/time_filter/mod.rs:179-184` - LOW.**~~ *(verified 2026-04-23 - OSM history-file convention is ascending-version order, documented at time_filter/mod.rs:73. Standard. Deleted.)*
 
-- [ ] **`commands/check/refs.rs:141-146` - LOW.** `check_refs` accepts `direct_io` and silently ignores it (`let _ = direct_io;`). The parallel pread workers open the input via internal `Arc<File>`. Users passing `--direct-io` on `check --refs` get no warning that it's a no-op. Same pattern as inspect's fast path but refs has no surfaced comment. Trigger: `check --refs --direct-io`.
+- [x] ~~**`commands/check/refs.rs:141-146` - LOW.**~~ *(verified 2026-04-23 - explicit doc-comment at refs.rs:142-146 acknowledges and explains. Deleted.)*
 
-- [ ] **`commands/cat/mod.rs:234-237` - LOW.** `cat_type_passthrough`'s `blob_filter.wants_index(idx)` drops blobs with the wrong kind only when indexdata is present. Non-indexed blobs always fully decode + filter. `cat --type node --force` on a non-indexed PBF decodes way+relation blobs unnecessarily, unlike the indexed fast path. Correct output, wasted work; partially covered by the `--force` warning. Trigger: `cat --type <kind> --force` on non-indexed input.
+- [x] ~~**`commands/cat/mod.rs:234-237` - LOW.**~~ *(verified 2026-04-23 - conservative inclusion of indexdata-less blobs is correct; can't tell the kind without decoding. Not a bug. Deleted.)*
 
 - [ ] **`commands/tags_filter/mod.rs:778-785` - LOW.** Pass-2 schedule skips the type filter when `meta.index` is None (the entire filter check lives behind `if let Some(idx)` at 779), so non-indexed blobs go through pass-2 decode regardless of `blob_filter`. With `has_included_way=false && has_included_relation=false && invert=false`, the type filter would skip way/relation blobs; non-indexed they still decode, but `filter_block_pass2` correctly drops them (empty `included_way_ids`). Correct, wasteful. Trigger: `tags-filter` on non-indexed input with a narrow type filter.
 

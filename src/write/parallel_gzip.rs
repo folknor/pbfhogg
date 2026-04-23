@@ -185,6 +185,13 @@ impl<W: Write + Send + 'static> Drop for ParallelGzipWriter<W> {
 
 /// Worker: pull raw chunks, gzip them, send compressed chunks with the
 /// original seq so the writer thread can reorder.
+///
+/// Lock scope is intentionally narrow: only `guard.recv()` runs while
+/// the mutex is held, and `mpsc::Receiver::recv` returns `Err` on
+/// close rather than panicking. `compress_one` and the downstream
+/// `compressed_tx.send` both run after the guard is dropped, so a
+/// worker panic in either path cannot poison this mutex and take
+/// down the rest of the pool.
 fn worker_loop(
     raw_rx: &std::sync::Mutex<Receiver<(u64, Vec<u8>)>>,
     compressed_tx: &SyncSender<(u64, Vec<u8>)>,
@@ -213,6 +220,14 @@ fn worker_loop(
 }
 
 /// Compress one chunk as a standalone gzip member.
+///
+/// The `io::Result` return type is nominal: the inner writer is a
+/// `Vec<u8>` whose `Write` impl is infallible, and flate2 does not
+/// return `Err` for allocation failure (it panics/aborts). So the
+/// `?` at `write_all` and the `Err` arm of `finish()` are effectively
+/// unreachable today. Kept fallible as defensive coding in case the
+/// sink is ever swapped for a fallible writer; callers (particularly
+/// `worker_loop` above) must continue to handle `Err` as a real error.
 fn compress_one(raw: &[u8]) -> io::Result<Vec<u8>> {
     let mut enc = GzEncoder::new(Vec::with_capacity(raw.len() / 2), compression_level());
     enc.write_all(raw)?;

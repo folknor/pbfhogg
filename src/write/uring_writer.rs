@@ -141,6 +141,13 @@ struct UringState {
     /// Physical write offset (always advances by page-aligned amounts).
     write_offset: u64,
     /// Logical file size (actual data bytes, for ftruncate).
+    ///
+    /// Intentionally has no `Drop` impl that calls `file.set_len`.
+    /// `logical_size` is only consumed by `flush_final`, which is
+    /// called on the explicit success path. On any error, the surrounding
+    /// `uring_main_loop` propagates via `?` before `flush_final` runs,
+    /// so a partially-inflated `logical_size` cannot reach a `set_len`
+    /// call and extend the file past real bytes with kernel zeroes.
     logical_size: u64,
     /// Number of submitted but not yet completed SQEs.
     in_flight: u32,

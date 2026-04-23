@@ -594,6 +594,12 @@ impl Iterator for AdminEntryIter<'_> {
 const MAX_NEIGHBORHOOD: usize = 9;
 
 /// Returns the cell + all neighbors at the given level as a fixed-size array.
+///
+/// S2 guarantees exactly 8 edge/corner neighbors for any non-face cell
+/// at any level, so the `min(MAX_NEIGHBORHOOD - 1)` and `take(...)`
+/// below are defensive clamps, not silent truncation: the S2 contract
+/// cannot produce more than 8 neighbors at this API level. If the
+/// upstream S2 crate ever changes that, update the constant to match.
 fn cell_neighborhood(lat: f64, lon: f64, level: u8) -> ([u64; MAX_NEIGHBORHOOD], usize) {
     let ll = LatLng::from_degrees(lat, lon);
     let cell = CellID::from(ll).parent(level as u64);

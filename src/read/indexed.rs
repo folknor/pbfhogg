@@ -45,6 +45,14 @@ pub struct IdRanges {
 }
 
 /// A part of the index that stores information about a specific blob.
+///
+/// `id_ranges: None` means the blob has not been fully decoded yet -
+/// it is distinct from `Some(IdRanges { node_ids: None, .. })` which
+/// means the blob was decoded and contained no nodes. The
+/// `ElementsAvailable::{Yes, No, Unknown}` return of the helpers
+/// below encodes this three-valued state explicitly; callers must
+/// not collapse `None`/`Unknown` into "no elements", or relation-only
+/// blobs and not-yet-decoded blobs become indistinguishable.
 #[derive(Debug)]
 struct BlobInfo {
     offset: ByteOffset,

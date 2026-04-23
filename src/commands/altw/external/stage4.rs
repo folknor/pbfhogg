@@ -586,6 +586,16 @@ pub(super) fn stage4_assembly(
             crate::reorder_buffer::ReorderBuffer::with_capacity(32);
 
         // Pre-seed passthrough items at their global seq positions.
+        //
+        // The `expect` is load-bearing on a stage-4 invariant: every
+        // descriptor pushed onto `passthrough_items` is constructed
+        // above with `kind: Some(meta.kind)` from indexdata. External
+        // join requires indexdata (enforced upstream via
+        // `require_indexdata`), so `meta.kind` is always populated
+        // and the `None` branch cannot be reached. If the external
+        // path ever grows a non-indexed `--force` mode, passthrough
+        // descriptor construction must be audited before removing
+        // this expect.
         for desc in &passthrough_items {
             let kind = desc.kind.expect(
                 "passthrough eligibility requires a known blob kind",

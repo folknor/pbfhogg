@@ -84,6 +84,13 @@ type ErrSlot = Arc<Mutex<Option<io::Error>>>;
 /// Writer-thread entry point. Opens the output file, writes the header
 /// synchronously at offset 0, spawns `POOL_SIZE` workers, then loops
 /// reading pipeline items in seq order and dispatching per-worker work.
+///
+/// We intentionally do not call `file.set_len(...)` anywhere on the
+/// success path: workers `pwrite` at absolute offsets and the kernel
+/// extends EOF to cover the highest offset written. On any worker or
+/// dispatch error, `result?` / `err_slot` propagate a failure to the
+/// caller - we never claim success with an under-written file, so no
+/// truncation is required.
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn parallel_writer_thread(
     rx: Receiver<PipelineItem>,
@@ -275,6 +282,13 @@ fn dispatch_chunk(
 /// Send `op` to `worker_txs[*next_worker]`, then advance round-robin.
 /// If the target worker's channel is closed (worker panicked or
 /// returned), surface the first deferred error.
+///
+/// Deliberately does NOT reroute a dead worker's `op` to a healthy
+/// worker: each `op` carries the absolute file offset it must pwrite
+/// to, and earlier `op`s routed to the now-dead worker cover the
+/// offsets immediately before this one. Rerouting would leave a hole
+/// in the file at those earlier offsets. Surfacing the worker's
+/// captured error is the correct response.
 fn send_to_worker(
     worker_txs: &[SyncSender<WriteOp>],
     next_worker: &mut usize,

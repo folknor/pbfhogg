@@ -18,6 +18,14 @@ impl<T> ReorderBuffer<T> {
     }
 
     /// Insert an item at sequence number `seq`.
+    ///
+    /// The stale-seq and duplicate-seq asserts panic deliberately:
+    /// seqs originate from `enumerate()` in the producer, so hitting
+    /// either condition is an upstream programming error (retry loop
+    /// re-sending a seq, wrong seq source, etc.), not a recoverable
+    /// runtime condition. A panic kills the writer thread and surfaces
+    /// via `join().map_err(...)?` so the caller sees a hard failure
+    /// rather than silent drift.
     pub(crate) fn push(&mut self, seq: usize, item: T) {
         assert!(
             seq >= self.next_seq,

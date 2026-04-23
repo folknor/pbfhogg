@@ -275,6 +275,13 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>) -> Result<u64> {
     // barrier, wait for the drain's signal now (all node descriptors
     // are emitted; drain can finish node-kind processing and publish
     // loc_map).
+    //
+    // At EOF with zero way/relation blobs this blocks on barrier_rx
+    // unconditionally; the drain's idle-fire path (see drain.rs's
+    // "Idle barrier fire" block) is the designed counterpart that
+    // unblocks us when the drain has no buffered items but the
+    // barrier condition is met. Do not remove the idle-fire without
+    // also rewriting this wait.
     if !barrier_open
         && let Some(ref rx) = barrier_rx
     {

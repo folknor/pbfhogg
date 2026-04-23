@@ -118,6 +118,15 @@ struct Shard {
 /// Plan N shards by ID range. Thresholds are placed at old-blob
 /// boundaries (N-1 evenly spaced). Old is clean by construction;
 /// straddling new blobs are absorbed by both adjacent shards.
+///
+/// Threshold comparison is raw numeric (`i64`) while the element
+/// merge inside shards uses `osm_id_cmp` (canonical order:
+/// `0, -1, -2, ..., 1, 2, ...`). These disagree on mixed-sign
+/// inputs, but production PBFs are positive-only (see osm_id.rs
+/// commentary), so the raw compare is safe in practice. If
+/// negative IDs ever enter production, this planner and every
+/// `id > t_high`/`id <= t_low` clip in `emit_side` must be
+/// rewritten against `osm_id_cmp`.
 fn plan_shards(
     old_descs: &[BlobDesc],
     new_descs: &[BlobDesc],
@@ -135,6 +144,10 @@ fn plan_shards(
     }
 
     let n = target_count.min(old_descs.len()).max(1);
+    // `old_descs` are sorted by id range (max_id monotone
+    // non-decreasing), so the mapped thresholds are monotone
+    // non-decreasing and duplicates only appear consecutively -
+    // consecutive-dedup is sufficient, no sort needed.
     let mut thresholds: Vec<i64> = (1..n)
         .map(|k| old_descs[(k * old_descs.len() / n) - 1].index.max_id)
         .collect();

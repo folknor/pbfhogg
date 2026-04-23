@@ -71,6 +71,15 @@ pub(crate) struct HeaderWalker {
 impl HeaderWalker {
     /// Open `path` and hint `posix_fadvise(RANDOM)` to the kernel.
     /// Errors if the file cannot be opened or metadata read.
+    ///
+    /// Intentionally opens a plain buffered fd regardless of whether
+    /// the CLI caller passed `--direct-io`. Header walking is a
+    /// tiny-read pattern where direct I/O would mean one aligned
+    /// page-sized pread per header; buffered reads amortise that
+    /// overhead. Callers that want direct I/O for the data-path
+    /// body reads open their own worker fds alongside the walker's
+    /// `shared_file()`, rather than flowing `--direct-io` through
+    /// this helper.
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path).map_err(|e| {
             crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(

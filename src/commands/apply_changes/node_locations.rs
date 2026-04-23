@@ -47,6 +47,12 @@ impl NodeLocationIndex {
             FxHashMap::with_capacity_and_hasher(all_needed.len(), Default::default());
         let mut still_needed: FxHashSet<i64> = FxHashSet::default();
 
+        // Load-bearing: `diff.get_node` must return both created AND
+        // modified OSC nodes here. Way refs pointing to modified base
+        // nodes need the fresh coords; a narrower lookup (creates only)
+        // would silently propagate stale base-PBF coords to the rewritten
+        // ways. Any future tightening of the OSC node_index must preserve
+        // "every diff node visible to this lookup" for the LoW path.
         for &node_id in &all_needed {
             if let Some(node) = diff.get_node(node_id) {
                 locations.insert(node_id, (node.decimicro_lat(), node.decimicro_lon()));

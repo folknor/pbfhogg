@@ -282,6 +282,12 @@ pub(super) fn write_output_passthrough(
         }
 
         let kind = header.index.as_ref().map(|idx| idx.kind);
+        // `kind == None` happens on `--force` against non-indexed input.
+        // Both match arms below require `Some(...)`, so `is_passthrough`
+        // is false and the blob falls into the decode batch path below,
+        // where ordering is preserved implicitly (file-order decode).
+        // The "flush before passthrough" invariant is therefore
+        // vacuously satisfied for the non-indexed --force case.
         let is_passthrough = matches!(kind, Some(ElemKind::Relation))
             || matches!(kind, Some(ElemKind::Node) if keep_untagged_nodes);
 

@@ -127,6 +127,11 @@ pub(super) struct DrainChannels {
     /// Drain triggers the `CoordSlots` merge + `loc_map` publish + scanner
     /// barrier signal as soon as `state.next_seq > last_node_seq`.
     /// `None` when `locations_on_ways == false`.
+    ///
+    /// The `u64::MAX` sentinel cannot collide with a real seq: blob seqs
+    /// are assigned by `enumerate()` on the scanner's pread stream, and
+    /// a realistic PBF tops out ~6 orders of magnitude below 2^44 blobs
+    /// let alone 2^64.
     pub last_node_seq_rx: Option<mpsc::Receiver<u64>>,
 }
 

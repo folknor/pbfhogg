@@ -146,6 +146,95 @@ fn truncated_blob_data() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Raw-frame and HeaderWalker MAX_BLOB_HEADER_SIZE guards
+//
+// `BlobReader::read_blob_header` at blob.rs:390 has always had a
+// MAX_BLOB_HEADER_SIZE cap, but `read_raw_frame` / `read_blob_header_only`
+// (raw_frame.rs) and `HeaderWalker::next_header` (header_walker.rs) did
+// not. Without the cap, an adversarial 4-byte file (length prefix of
+// `u32::MAX`) triggers a multi-GB `vec![0u8; header_len]` allocation -
+// an OOM / process-abort DoS vector on every command that routes
+// through these primitives (cat passthrough, getid raw passthrough,
+// has_indexdata, check_sorted_and_indexed, apply-changes / altw /
+// extract strategies / geocode classify via HeaderWalker).
+// ---------------------------------------------------------------------------
+
+/// `read_blob_header_only` (via `has_indexdata`) rejects an oversized
+/// length prefix with HeaderTooBig rather than attempting a huge
+/// allocation.
+#[test]
+fn has_indexdata_rejects_oversized_header_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("adversarial.osm.pbf");
+    // 4-byte length prefix only, value = MAX_BLOB_HEADER_SIZE (64 KiB).
+    // The file has no header payload; pre-fix the function would
+    // allocate 64 KiB, read_exact would return UnexpectedEof. Post-fix
+    // the guard trips first and returns HeaderTooBig. We use the
+    // minimum value that trips the `>=` check so the test doesn't
+    // depend on allocator behaviour for very large sizes.
+    std::fs::write(&path, 65536u32.to_be_bytes()).unwrap();
+
+    let err = pbfhogg::has_indexdata(&path, false).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("header") && (msg.contains("too big") || msg.contains("65536")),
+        "expected HeaderTooBig surface, got: {msg}",
+    );
+}
+
+/// `read_raw_frame` (via `cat`) rejects an oversized length prefix
+/// with HeaderTooBig rather than attempting a huge allocation.
+#[test]
+fn cat_rejects_oversized_header_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("adversarial.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    std::fs::write(&input, 65536u32.to_be_bytes()).unwrap();
+
+    let result = pbfhogg::cat::cat(
+        &[input.as_path()],
+        &output,
+        None,
+        &pbfhogg::cat::CleanAttrs::default(),
+        Compression::default(),
+        false,
+        false,
+        &pbfhogg::HeaderOverrides::default(),
+    );
+    let err = match result {
+        Ok(_) => panic!("expected cat() to error on adversarial file"),
+        Err(e) => e,
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("header") && (msg.contains("too big") || msg.contains("65536")),
+        "expected HeaderTooBig surface, got: {msg}",
+    );
+}
+
+/// `HeaderWalker::next_header` (via `inspect`'s index-only fast path)
+/// rejects an oversized length prefix with HeaderTooBig rather than
+/// attempting a huge allocation on the two-pread fallback.
+#[cfg(feature = "commands")]
+#[test]
+fn inspect_rejects_oversized_header_length_via_walker() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("adversarial.osm.pbf");
+    std::fs::write(&path, 65536u32.to_be_bytes()).unwrap();
+
+    let result = pbfhogg::inspect::inspect(&path, false, false, false, false, false);
+    let err = match result {
+        Ok(_) => panic!("expected inspect() to error on adversarial file"),
+        Err(e) => e,
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("header") && (msg.contains("too big") || msg.contains("65536")),
+        "expected HeaderTooBig surface, got: {msg}",
+    );
+}
+
 /// After an error, BlobReader stops iteration (returns None on subsequent calls).
 #[test]
 fn iteration_stops_after_error() {

@@ -1007,7 +1007,7 @@ Findings from a multi-agent Opus audit of 0.3.0 high-churn areas before the rele
 
 **Headline items worth landing first (cross-verified, real-effect, clear fix shape):**
 1. ~~`commands/sort/mod.rs:178-181` - direct parallel of the already-fixed `cat::dedupe` kind-boundary bug. Add `&& entries[i].index.kind == run_kind` guard.~~ **LANDED.** Regression `sort_overlap_runs_scoped_to_single_kind` in `tests/sort.rs` pins the fix.
-2. `read/header_walker.rs:149-164` + `read/raw_frame.rs:65-67,124-127` - missing MAX_BLOB_HEADER_SIZE caps. Real DoS/OOM vector on adversarial input; add the same guard `BlobReader::read_blob_header` has.
+2. ~~`read/header_walker.rs:149-164` + `read/raw_frame.rs:65-67,124-127` - missing MAX_BLOB_HEADER_SIZE caps. Real DoS/OOM vector on adversarial input; add the same guard `BlobReader::read_blob_header` has.~~ **LANDED.** Three regression tests in `tests/corrupt_input.rs` pin the guards via the `has_indexdata`, `cat`, and `inspect` entry points.
 3. `apply_changes/scanner.rs:162,188` - under `--force --locations-on-ways` non-indexed, LocationsOnWays is silently stripped from base ways. Gate the combination at setup, or fix the barrier to recover from placeholder kinds.
 4. `commands/inspect/show_element.rs:53-57` - missing `is_sorted()` check produces false negatives on history/unsorted PBFs.
 5. `renumber/pass1.rs:179` + `wire_rewrite.rs:272` - negative-ID guards bypassed by stale indexdata; results in loud panic (pass1) or phantom orphans (wire_rewrite).
@@ -1215,9 +1215,9 @@ Findings from a multi-agent Opus audit of 0.3.0 high-churn areas before the rele
 
 ### Read path infrastructure
 
-- [ ] **`read/header_walker.rs:149-164` - HIGH.** `HeaderWalker::next_header` trusts the 4-byte length prefix without any `MAX_BLOB_HEADER_SIZE` cap; a corrupt or malicious file can force a multi-GB `Vec` resize on the fallback path (`self.header_buf.resize(header_end, 0)` on line 160 is unchecked). The old `BlobReader::read_blob_header` rejected this via `HeaderTooBig` but the new pread-only primitive lost the guard. Trigger: feed any PBF where the first four bytes of some blob frame encode `0x7FFFFFFF`.
+- [x] ~~**`read/header_walker.rs:149-164` - HIGH.**~~ *(landed 2026-04-23; `MAX_BLOB_HEADER_SIZE` cap added to `HeaderWalker::next_header`, returns `BlobError::HeaderTooBig` cleanly. Regression `inspect_rejects_oversized_header_length_via_walker` pins it.)*
 
-- [ ] **`read/raw_frame.rs:65-67, 124-127` - HIGH.** `read_raw_frame` and `read_blob_header_only` both lack the `MAX_BLOB_HEADER_SIZE` guard before `vec![0u8; header_len]`; both are exercised by `has_indexdata`, `check_sorted_and_indexed`, and cat/diff/extract passthrough paths, so any command that probes an adversarial file gets an OOM-sized allocation instead of a clean `BlobError::HeaderTooBig`. Trigger: same as above, via any command touching these helpers instead of `BlobReader::read_blob_header`.
+- [x] ~~**`read/raw_frame.rs:65-67, 124-127` - HIGH.**~~ *(landed 2026-04-23; `MAX_BLOB_HEADER_SIZE` caps added to both `read_raw_frame` and `read_blob_header_only`. Regressions `has_indexdata_rejects_oversized_header_length` + `cat_rejects_oversized_header_length` in `tests/corrupt_input.rs` pin them.)*
 
 - [x] ~~**`read/pipeline.rs:148-219` - HIGH.**~~ *(verified 2026-04-23 - no deadlock.)* Stage 2 is spawned with `move` at pipeline.rs:149, taking ownership of `raw_rx` (captured in the `for ... in raw_rx` loop at :171). On pool-build failure, stage 2 sends the error via `dispatch_tx` at :166 and `return`s at :167, exiting the closure and dropping `raw_rx` as the closure's locals drop. Stage 1 at :119-125 loops over `blob_reader.enumerate()` calling `raw_tx.send(...)`; when `raw_rx` drops, `sync_channel::send` wakes blocked senders with `Err`, the `if ... .is_err() { break; }` at :121-123 exits the loop, stage 1 terminates cleanly, and stage 3 receives the `(0, Err)` and propagates via :246. No path exists where stage 2 holds `raw_rx` alive after the error return. Deleted.
 

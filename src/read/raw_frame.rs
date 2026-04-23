@@ -11,7 +11,7 @@
 
 use std::io::Read;
 
-use crate::blob::{parse_blob_header_with_index, BlobKind};
+use crate::blob::{parse_blob_header_with_index, BlobKind, MAX_BLOB_HEADER_SIZE};
 use crate::blob_meta::BlobIndex;
 use crate::file_reader::FileReader;
 use crate::BoxResult as Result;
@@ -63,6 +63,16 @@ pub(crate) fn read_raw_frame<R: Read>(
         Err(e) => return Err(e.into()),
     }
     let header_len = u32::from_be_bytes(len_buf) as usize;
+    // Match BlobReader's MAX_BLOB_HEADER_SIZE guard (blob.rs:390).
+    // Without this cap, an adversarial or corrupted length prefix
+    // forces the `vec![0u8; header_len]` allocation below into a
+    // multi-GB alloc that aborts the process.
+    if header_len as u64 >= MAX_BLOB_HEADER_SIZE {
+        return Err(crate::error::new_blob_error(
+            crate::error::BlobError::HeaderTooBig { size: header_len as u64 },
+        )
+        .into());
+    }
 
     let mut header_bytes = vec![0u8; header_len];
     reader.read_exact(&mut header_bytes)?;
@@ -122,6 +132,14 @@ pub(crate) fn read_blob_header_only(
         Err(e) => return Err(e.into()),
     }
     let header_len = u32::from_be_bytes(len_buf) as usize;
+    // Match BlobReader's MAX_BLOB_HEADER_SIZE guard (blob.rs:390).
+    // See `read_raw_frame` above for the same guard's rationale.
+    if header_len as u64 >= MAX_BLOB_HEADER_SIZE {
+        return Err(crate::error::new_blob_error(
+            crate::error::BlobError::HeaderTooBig { size: header_len as u64 },
+        )
+        .into());
+    }
 
     let mut header_bytes = vec![0u8; header_len];
     reader.read_exact(&mut header_bytes)?;

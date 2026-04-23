@@ -26,7 +26,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::blob::{parse_blob_header_with_index, BlobKind};
+use crate::blob::{parse_blob_header_with_index, BlobKind, MAX_BLOB_HEADER_SIZE};
 use crate::blob_meta::BlobIndex;
 use crate::error::Result;
 
@@ -161,6 +161,15 @@ impl HeaderWalker {
             self.header_buf[2],
             self.header_buf[3],
         ]) as usize;
+        // Match BlobReader's MAX_BLOB_HEADER_SIZE guard (blob.rs:390).
+        // Without this cap, an adversarial or corrupted length prefix
+        // forces `header_buf.resize(header_end, 0)` below to attempt a
+        // multi-GB allocation on the fallback path.
+        if header_len as u64 >= MAX_BLOB_HEADER_SIZE {
+            return Err(crate::error::new_blob_error(
+                crate::error::BlobError::HeaderTooBig { size: header_len as u64 },
+            ));
+        }
         let header_end = 4 + header_len;
 
         if header_end > probe_len {

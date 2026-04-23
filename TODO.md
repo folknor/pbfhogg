@@ -1000,7 +1000,7 @@ Remaining open findings from a multi-agent Opus audit of 0.3.0 high-churn areas.
 - renumber: 6 MEDIUM, 2 LOW
 - altw external: 5 MEDIUM, 3 LOW
 - diff / derive-parallel: 3 MEDIUM latent (mixed-sign numeric compare; production PBFs are positive-only), 2 LOW
-- geocode: 1 HIGH (admin.rs u32 vertex_offset overflow), 5 MEDIUM, 3 LOW
+- geocode: 5 MEDIUM, 3 LOW
 - smaller commands: 1 MEDIUM, 2 LOW
 
 **Cross-cutting patterns still present:**
@@ -1099,7 +1099,7 @@ Remaining open findings from a multi-agent Opus audit of 0.3.0 high-churn areas.
 
 ### geocode builder v2
 
-- [ ] **`geocode_index/builder/admin.rs:127-143` - HIGH.** `write_admin_data` accumulates `vertex_offset: u32` by adding `p.vertices.len() * NODE_COORD_SIZE` with no overflow check; past 4 GiB the offset silently wraps and subsequent polygons point to wrong vertices. No hard-error unlike the sibling u16::MAX overflows this cycle fixed. Trigger: planet-scale admin boundary geometry near the 4 GiB total-vertex-bytes boundary.
+- [x] ~~**`geocode_index/builder/admin.rs:127-143` - HIGH.**~~ *(landed 2026-04-23; `write_admin_data` now checks `p.vertices.len() -> u32` (vertex_count), `p.vertices.len().checked_mul(NODE_COORD_SIZE)` (step), `u32::try_from(step)` (step-u32 fits), and `offset.checked_add(step_u32)` (cumulative fits). Each failure mode returns a descriptive error with a widen-to-u64 + bump FORMAT_VERSION pointer, matching the sibling u16::MAX guard at `write_admin_index`.)*
 
 - [ ] **`geocode_index/builder/admin.rs:152-189` - MEDIUM.** `write_admin_index` tracks `byte_off: u32` for admin-entries file position with no overflow guard on `+= 2` / `+= 4` accumulators; past 4 GiB the offset wraps and cells after that point read garbage entries. Unlikely at today's scales but not rejected. Trigger: enough admin entries to exceed 4 GiB of entries data.
 

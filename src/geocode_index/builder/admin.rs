@@ -124,13 +124,27 @@ fn assemble_one_relation(
 pub(super) fn write_admin_data(dir: &Path, polygons: &[AssembledPolygon]) -> Result<()> {
     let mut poly_out = BufWriter::new(std::fs::File::create(dir.join(FILE_ADMIN_POLYGONS))?);
     let mut vert_out = BufWriter::new(std::fs::File::create(dir.join(FILE_ADMIN_VERTICES))?);
+    // `vertex_offset` is a u32 byte-offset into admin_vertices.bin (see
+    // `AdminPolygon.vertex_offset` in format.rs). Hard-error on
+    // overflow rather than silently wrapping; a wrap would make every
+    // subsequent polygon point at the wrong vertex span. If this fires,
+    // widen `vertex_offset` to u64 and bump FORMAT_VERSION. Matches the
+    // sibling u16::MAX hard-error at `write_admin_index` for
+    // admin-entry counts.
     let mut offset: u32 = 0;
     for p in polygons {
-        #[allow(clippy::cast_possible_truncation)]
+        let vertex_count = u32::try_from(p.vertices.len()).map_err(|_| -> Box<dyn std::error::Error> {
+            format!(
+                "write_admin_data: polygon has {} vertices, exceeds u32::MAX. \
+                 Widen AdminPolygon.vertex_count to u64 and increment FORMAT_VERSION.",
+                p.vertices.len()
+            )
+            .into()
+        })?;
         let rec = AdminPolygon {
             area: p.area,
             vertex_offset: offset,
-            vertex_count: p.vertices.len() as u32,
+            vertex_count,
             name_offset: p.name_offset,
             country_code_offset: p.country_code_offset,
             admin_level: p.admin_level,
@@ -139,8 +153,32 @@ pub(super) fn write_admin_data(dir: &Path, polygons: &[AssembledPolygon]) -> Res
         for v in &p.vertices {
             vert_out.write_all(&v.to_bytes())?;
         }
-        #[allow(clippy::cast_possible_truncation)]
-        { offset += (p.vertices.len() * NODE_COORD_SIZE) as u32; }
+        let step_bytes = p.vertices.len().checked_mul(NODE_COORD_SIZE).ok_or_else(
+            || -> Box<dyn std::error::Error> {
+                format!(
+                    "write_admin_data: polygon vertex bytes overflow usize ({} * {NODE_COORD_SIZE}).",
+                    p.vertices.len(),
+                )
+                .into()
+            },
+        )?;
+        let step_u32 = u32::try_from(step_bytes).map_err(|_| -> Box<dyn std::error::Error> {
+            format!(
+                "write_admin_data: one polygon contributes {step_bytes} vertex bytes, \
+                 exceeds u32::MAX. Widen AdminPolygon.vertex_offset to u64 and increment FORMAT_VERSION."
+            )
+            .into()
+        })?;
+        offset = offset.checked_add(step_u32).ok_or_else(
+            || -> Box<dyn std::error::Error> {
+                format!(
+                    "write_admin_data: cumulative admin-vertex byte offset overflows u32 \
+                     (current {offset}, step {step_u32}; total exceeds 4 GiB). Widen \
+                     AdminPolygon.vertex_offset to u64 and increment FORMAT_VERSION."
+                )
+                .into()
+            },
+        )?;
     }
     poly_out.flush()?;
     vert_out.flush()?;

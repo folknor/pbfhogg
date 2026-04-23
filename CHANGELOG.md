@@ -14,6 +14,7 @@
 
 - **renumber**: complete rewrite to an external-join architecture. Planet 3m25s, 3.3 GB peak RSS, zero temp disk. Negative input IDs are now rejected. Orphan refs (way refs / relation members absent from the input) are counted and surfaced in the summary.
 - **apply-changes**: new descriptor-first streaming pipeline and new parallel-pwrite writer backend (now the default). `-j/--jobs N` worker-count override. Planet daily diff 762s → 81s with the default backend; 135s with `--compression none`. `io_uring` and `--direct-io` remain opt-in. The buffered writer is no longer used on this path.
+- **build-geocode-index**: hard-errors when the cumulative admin-vertex byte offset would overflow `AdminPolygon.vertex_offset` (u32, ~4 GiB of admin-vertex data). Previously the accumulator silently wrapped, making every subsequent polygon's `vertex_offset` point at garbage. Error names the current offset and the step that would overflow, with a pointer to bump `vertex_offset` to u64 and increment `FORMAT_VERSION`. Sibling per-polygon `vertex_count` guard also added.
 - **check --refs**: parallel three-phase scan. Planet 1,225s → 70s (17.5×); Europe 426s → 34s (12.7×). Peak RSS 2.17 GB.
 - **check --ids --full**: parallel three-phase scan. Europe 313s → 53s (5.9×). Streaming (non-`--full`) mode unchanged.
 - **diff** / **diff --format osc**: new `-j/--jobs N` for shard-parallel merge. Planet text 35m → 3m30s at `-j 16` (10.2×); `--format osc` 37m → 5m13s (7.1×). `-j 1` (default) keeps the sequential path.

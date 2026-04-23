@@ -320,9 +320,44 @@ pub(super) fn stage1_way_pass(
 
     let schedule = build_way_schedule(blob_meta)?;
 
-    let num_workers = std::thread::available_parallelism()
+    // Cap num_workers against the file descriptor budget. Pass B below
+    // holds `num_workers * NUM_BUCKETS` rank-shard files open
+    // concurrently (see `stage1.rs` Pass B loop at lines 385-405). On a
+    // host with default soft ulimit (1024) this blows past RLIMIT_NOFILE
+    // at ~4 workers, so we self-raise to the hard cap first and then
+    // floor the worker count to what actually fits.
+    let cpu_cap = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))
         .unwrap_or(4);
+    let fd_budget = super::raise_nofile_to_hard_cap();
+    // Headroom for input PBF, scratch dir, sidecars, stdin/stdout/stderr,
+    // mpsc channel fds, rayon worker fds, page-cache probe fds, etc.
+    const HEADROOM_FDS: u64 = 64;
+    let buckets_per_worker = NUM_BUCKETS as u64;
+    if fd_budget < HEADROOM_FDS + buckets_per_worker {
+        let min_needed = HEADROOM_FDS + buckets_per_worker;
+        return Err(format!(
+            "altw external: file descriptor limit too low \
+             (RLIMIT_NOFILE = {fd_budget}, need >= {min_needed} \
+             for even a single shard worker). Raise with \
+             `ulimit -n {min_needed}` (or higher) and retry."
+        )
+        .into());
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let fd_cap = ((fd_budget - HEADROOM_FDS) / buckets_per_worker) as usize;
+    let num_workers = cpu_cap.min(fd_cap).max(1);
+    crate::debug::emit_counter(
+        "extjoin_nofile_soft_cap",
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            fd_budget as i64
+        },
+    );
+    #[allow(clippy::cast_possible_wrap)]
+    crate::debug::emit_counter("extjoin_cpu_cap_workers", cpu_cap as i64);
+    #[allow(clippy::cast_possible_wrap)]
+    crate::debug::emit_counter("extjoin_fd_cap_workers", fd_cap as i64);
 
     let (total_refs, node_id_set) = stage1_pass_a(
         input, &schedule, num_workers, ref_count_sidecar, per_way_refcount_sidecar,

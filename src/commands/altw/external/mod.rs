@@ -49,6 +49,52 @@ use stage4::stage4_assembly;
 /// 14B gives headroom above the current ~13B maximum.
 pub(super) const MAX_NODE_ID: u64 = 14_000_000_000;
 
+/// Self-raise `RLIMIT_NOFILE` soft limit to the current hard cap and
+/// report the effective soft limit.
+///
+/// External join's stage 1 pass B holds `num_workers * NUM_BUCKETS`
+/// (up to ~4096 on a 17-core host) rank-shard files open concurrently.
+/// Linux default soft ulimit is 1024 on many distros; some still cap
+/// hard at 4096. Without this raise, `add-locations-to-ways
+/// --index-type external` fails with EMFILE on a default-ulimit shell
+/// even though the hard cap is usually high enough. The unprivileged
+/// soft-raise up to hard cap is the standard pattern for servers
+/// (PostgreSQL, Redis, nginx).
+///
+/// Returns 1024 as a conservative fallback if the probe itself fails,
+/// so callers can still compute a sensible cap.
+pub(super) fn raise_nofile_to_hard_cap() -> u64 {
+    // SAFETY: `getrlimit`/`setrlimit` are pure-data FFI calls. The
+    // rlimit struct is fully initialised before being passed as
+    // `&mut`, and we don't share it across threads.
+    unsafe {
+        let mut rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
+            return 1024;
+        }
+        if rlim.rlim_cur < rlim.rlim_max {
+            let target = libc::rlimit {
+                rlim_cur: rlim.rlim_max,
+                rlim_max: rlim.rlim_max,
+            };
+            // Unprivileged soft-raise up to hard cap always succeeds on
+            // Linux; ignore the return and re-probe to see what stuck.
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &target);
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
+                return 1024;
+            }
+        }
+        // `rlim_cur` can be `RLIM_INFINITY` (= `u64::MAX` on Linux);
+        // clamp to a sane ceiling so downstream arithmetic doesn't
+        // overflow on systems that report unlimited.
+        let current: u64 = rlim.rlim_cur;
+        current.min(1 << 30)
+    }
+}
+
 /// Size of a rank-occurrence record: `(local_rank: u32, slot_pos: u64)` = 12 bytes.
 pub(super) const RANK_RECORD_SIZE: usize = 12;
 

@@ -567,21 +567,21 @@ See `reference/performance.md` for consolidated baselines.
   tests - but worth revisiting if check-refs ever grows a jobs
   flag.
 
-### altw external fd footprint (latent, not currently reproducing)
-
-Stage 1B holds `num_workers * NUM_BUCKETS` rank-shard files open
-concurrently (see `src/commands/altw/external/mod.rs:352`
-`extjoin_total_rank_shard_files` counter). With 16 workers at planet
-scale that's 4096 fds for shards alone, plus the input PBF, index,
-scratch dir, etc. On hosts with a default `ulimit -n` of 1024-4096
-and multiple external-backend tests running concurrently under
-`cargo test -- --include-ignored`, this can hit EMFILE - the
-`backend_parity_dense_sparse_external_auto` test caught this on
-2026-04-22 but the failure is no longer reproducible on the dev host
-(ulimit 524288). The architectural fix - open shards on demand
-instead of upfront, or cap concurrent open count per worker - is
-0.3.x scope. Surfaces as `create rank shard ...: Too many open
-files (os error 24)` from `stage1.rs:398`.
+- [x] ~~**altw external fd footprint**~~ - landed 2026-04-23.
+  Stage 1 pass B was holding `num_workers * NUM_BUCKETS` rank-shard
+  files open concurrently (~4352 fds at 17 workers). Linux default
+  soft ulimit of 1024 (some distros cap hard at 4096) made
+  `add-locations-to-ways --index-type external` fail with EMFILE
+  on any fresh shell. Fix: self-raise `RLIMIT_NOFILE` soft to hard
+  cap at the top of `stage1_way_pass` (unprivileged, free), then
+  cap `num_workers` at `(fd_budget - 64_headroom) / NUM_BUCKETS`
+  so the worker fleet never requests more shards than can be held
+  open. If even 1 worker's 256-shard budget can't fit, fail clean
+  with a `ulimit -n N` hint. New counters:
+  `extjoin_nofile_soft_cap`, `extjoin_cpu_cap_workers`,
+  `extjoin_fd_cap_workers`. The
+  `backend_parity_dense_sparse_external_auto` test is un-ignored
+  and passes under default ulimit in both feature sweeps.
 
 - [x] ~~**`apply-changes -j N --locations-on-ways` consumer build trips
   the drain/copy-range invariant.**~~ - landed 2026-04-23 alongside

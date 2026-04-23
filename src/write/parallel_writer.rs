@@ -210,6 +210,19 @@ fn dispatch_loop(
             )?;
         }
     }
+    // Channel closed cleanly. If the reorder buffer still holds items
+    // that never popped, an upstream framer panicked or was dropped
+    // with a seq gap still pending. Returning `Ok(())` here would
+    // silently truncate the output; surface it as an error instead
+    // so the caller closes with a non-Ok result and the user sees a
+    // hard failure rather than a short file claimed as success.
+    if pending.pending_len() > 0 {
+        return Err(io::Error::other(format!(
+            "parallel writer: channel closed with {} item(s) still in reorder buffer; \
+             an upstream framer dropped without sending an earlier seq",
+            pending.pending_len(),
+        )));
+    }
     Ok(())
 }
 
@@ -493,5 +506,42 @@ mod tests {
         }
         assert_eq!(actual, expected);
         Ok(())
+    }
+
+    /// Regression: when the pipeline channel closes cleanly but the
+    /// reorder buffer still holds items blocked on a missing earlier
+    /// seq (an upstream framer panicked / was dropped), `dispatch_loop`
+    /// must surface the gap as an error instead of returning `Ok(())`
+    /// and producing a silently-truncated file.
+    ///
+    /// Simulates the failure mode by sending a single item with
+    /// `seq=2` (no seq=0 or seq=1) and immediately dropping the
+    /// sender. With `seq=2` alone, `pop_ready` cannot advance and
+    /// the item sits in `pending` indefinitely; the channel-close
+    /// `recv` error then drops us out of the outer loop.
+    #[test]
+    fn dispatch_loop_surfaces_gap_at_channel_close() {
+        use std::sync::{Arc, Mutex};
+
+        let (tx, rx) = sync_channel::<PipelineItem>(4);
+        tx.send(PipelineItem {
+            seq: 2,
+            data: Ok(OutputChunk::Raw(vec![0u8; 8])),
+        })
+        .expect("send seq=2");
+        drop(tx);
+
+        // Empty worker_txs is fine: seq=2 can't pop (gap at 0,1) so
+        // dispatch_chunk is never called.
+        let worker_txs: Vec<SyncSender<WriteOp>> = Vec::new();
+        let err_slot: ErrSlot = Arc::new(Mutex::new(None));
+
+        let result = dispatch_loop(&rx, &worker_txs, &err_slot, 0);
+        let err = result.expect_err("gap at channel close must surface as Err");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reorder buffer"),
+            "error should name the reorder-buffer state, got: {msg}",
+        );
     }
 }

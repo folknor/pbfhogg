@@ -659,6 +659,18 @@ fn uring_main_loop(
         state.reap_cqes(false)?;
     }
 
+    // Channel closed. If the reorder buffer still holds items blocked
+    // on a missing earlier seq, an upstream framer panicked / was
+    // dropped. Mirror the parallel-pwrite writer: surface the gap as
+    // an error so the caller sees a hard failure rather than a
+    // silently-truncated file.
+    if pending.pending_len() > 0 {
+        return Err(io::Error::other(format!(
+            "uring writer: channel closed with {} item(s) still in reorder buffer; \
+             an upstream framer dropped without sending an earlier seq",
+            pending.pending_len(),
+        )));
+    }
     Ok(())
 }
 

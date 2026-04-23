@@ -691,18 +691,25 @@ Pinned as `#[ignore]` regression tests in
   (blobs are homogeneous and pre-routed to their phase).
   `extract_simple_non_indexed_parity` unignored.
 
-- [ ] **`apply-changes --force` on non-indexed input off-by-one on
-  delete.** Parity test ran a `modify n2, delete n3, create n100`
-  OSC against indexed + non-indexed twins of the same 10-node base.
-  Indexed output: 10 nodes (1,2,4..=10,100 - delete applied).
-  Non-indexed output: 11 nodes (one extra, likely n3 survived the
-  delete because the scanner's descriptor routing at
-  `src/commands/apply_changes/scanner.rs:129-204` falls into the
-  worker-pool-unconditional branch with placeholder `kind` and
-  `id_range: None`, and the delete match by id doesn't fire in that
-  path). First step: add a counter around the worker-pool branch to
-  confirm it's the route taken, then teach the scanner to populate
-  `id_range` from decoded block metadata on the non-indexed fallback.
+- [x] ~~**`apply-changes --force` on non-indexed input off-by-one on
+  delete.**~~ - landed 2026-04-23. Misdiagnosed in the original
+  pin - node 3 was actually being deleted correctly; the extra node
+  was node 2 (the modify) being re-emitted once as a trailing create.
+  Root cause: the scanner assigned non-indexed blobs a placeholder
+  `kind=Node` + `id_range=None` (`scanner.rs:129-132`) and the
+  worker passed those unchanged into `DrainItem::Rewritten`
+  (`id_range: (0, 0)` on the wire). The drain's cursor-advance rule
+  at `drain.rs:644-649` uses `blob_osm_last_key(0, 0) = (0, 0)`
+  which is less than every real upsert key, so the per-kind upsert
+  cursor never advanced. The trailing-creates loop at end-of-stream
+  then re-emitted every modify that the worker had already handled
+  inline via `diff.get_node/way/relation`. Fix: new
+  `streaming.rs::infer_kind_and_range` walks the already-parsed
+  block to recover the true `(kind, min_id, max_id)` for non-indexed
+  blobs, and the worker uses those recovered values for both
+  `upsert_slice` and the `DrainItem::Rewritten { kind, id_range }`
+  emission. Indexed blobs skip the walk (trust indexdata).
+  `apply_changes_non_indexed_parity` unignored.
 
 - [ ] **`merge_pbf([A, A])` drops ways and relations.** Observed
   during Batch A parity-test development: merging an indexed PBF
@@ -743,17 +750,30 @@ Pinned as `#[ignore]` regression tests in
   id sets that pass 1 now populates correctly for non-indexed input.
   `extract_smart_non_indexed_parity` unignored.
 
-- [ ] **`apply-changes -j N --locations-on-ways` consumer build trips
-  the drain/copy-range invariant.** New jobs-parity test
-  (`tests/apply_changes_invariants.rs::merge_jobs_parity_on_multiblob_input`)
-  bootstraps a multi-blob indexed base through
-  `add-locations-to-ways`, then compares `jobs=1` vs `jobs=4` on a
-  create/modify/delete OSC. All-features sweep passes. Consumer
-  sweep (`--no-default-features --features commands`) fails before
-  parity assertions with `drain: received CopyRange item but
-  use_copy_range is false`. That means the scanner/drain contract is
-  inconsistent in that feature set: `CopyRange` items are still
-  reaching the drain while copy-range output is disabled.
+- [x] ~~**`apply-changes -j N --locations-on-ways` consumer build trips
+  the drain/copy-range invariant.**~~ - landed 2026-04-23 alongside
+  the non-indexed delete fix. Root cause was wider than the original
+  pin suggested: the worker's false-positive path
+  (`streaming.rs::handle_candidate`'s `!overlaps` branch) emits
+  `WorkerOutput::FalsePositive` which unconditionally becomes
+  `DrainItem::CopyRange` via `WorkerOutput::into_drain_item()`. The
+  consumer build compiles out the `linux-direct-io` feature and
+  forces `use_copy_range=false` (`rewrite.rs:220-221`), so the drain
+  rejects every such item with "drain: received CopyRange item but
+  use_copy_range is false" - affecting any consumer-build merge with
+  a false-positive blob, not just `-j N --locations-on-ways`. Fix:
+  thread `use_copy_range` through `StreamingConfig` → worker; when
+  false, route the false-positive through the same path used for
+  `--direct-io` (`handle_owned_passthrough` - pread the full frame,
+  emit `DrainItem::OwnedBytes`). `merge_jobs_parity_on_multiblob_input`
+  now passes in both feature sets. The three `merge.rs` stats tests
+  that were also blocked by this panic
+  (`merge_gap_creates_between_blobs`, `merge_stats_accuracy`,
+  `merge_type_transition_node_to_relation_skipping_ways`) now run to
+  completion in consumer; they still fail stats assertions because
+  `DrainItem::OwnedBytes` does not credit per-kind `base_*` counts
+  (only `CopyRange` does) - that's squarely gap #7 (merge stats
+  drift) and tracked separately.
 
 - [ ] **`merge` summary/stat counters diverge between all-features and
   consumer builds on the same fixture.** While running

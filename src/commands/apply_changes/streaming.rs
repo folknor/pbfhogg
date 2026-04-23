@@ -93,6 +93,13 @@ pub(super) struct StreamingConfig {
     /// `frame_blob_pipelined` so the drain side avoids the writer's
     /// `rayon::spawn`-per-block dispatch (P1.5).
     pub compression: Compression,
+    /// True when the output backend supports `copy_file_range` (so the
+    /// drain accepts `DrainItem::CopyRange`). When false (consumer
+    /// build without the `linux-direct-io` feature, or when
+    /// `--direct-io` is selected), false-positive candidates must be
+    /// routed through the owned-passthrough path instead - the drain
+    /// rejects `CopyRange` items up front.
+    pub use_copy_range: bool,
 }
 
 /// Channels owned by the streaming pool.
@@ -191,6 +198,7 @@ pub(super) fn run_workers(
         loc_map_handle,
         needed_set,
         compression,
+        use_copy_range,
     } = cfg;
     let StreamingChannels { candidate_rx, drain_tx } = channels;
 
@@ -245,6 +253,7 @@ pub(super) fn run_workers(
                     loc_map_handle.as_ref(),
                     needed_set.as_deref(),
                     &compression,
+                    use_copy_range,
                 );
                 if let Err(e) = result {
                     let mut slot =
@@ -289,6 +298,7 @@ fn worker_loop(
     loc_map_handle: Option<&LocMapHandle>,
     needed_set: Option<&FxHashSet<i64>>,
     compression: &Compression,
+    use_copy_range: bool,
 ) -> Result<()> {
     let mut read_buf: Vec<u8> = Vec::new();
     let mut decompress_buf: Vec<u8> = Vec::new();
@@ -334,6 +344,7 @@ fn worker_loop(
                     loc_map_handle,
                     needed_set,
                     compression,
+                    use_copy_range,
                 )?;
             }
             ScannedBlob::Passthrough(desc) => {
@@ -381,6 +392,7 @@ fn handle_candidate(
     loc_map_handle: Option<&LocMapHandle>,
     needed_set: Option<&FxHashSet<i64>>,
     compression: &Compression,
+    use_copy_range: bool,
 ) -> Result<()> {
     counters.blobs_processed.fetch_add(1, Ordering::Relaxed);
 
@@ -456,19 +468,43 @@ fn handle_candidate(
 
     if !overlaps {
         counters.blobs_false_positive.fetch_add(1, Ordering::Relaxed);
-        return send_drain(drain_tx, WorkerOutput::FalsePositive(desc.clone()).into_drain_item());
+        if use_copy_range {
+            return send_drain(
+                drain_tx,
+                WorkerOutput::FalsePositive(desc.clone()).into_drain_item(),
+            );
+        }
+        // Consumer build (no `linux-direct-io` feature) or `--direct-io`
+        // output: the drain rejects `DrainItem::CopyRange` up front, so
+        // route the false-positive through the owned-passthrough path
+        // (pread the full frame, ship the bytes via
+        // `DrainItem::OwnedBytes`). `handle_owned_passthrough` does
+        // exactly that for the scanner-side passthrough case.
+        return handle_owned_passthrough(file, desc, drain_tx, counters, read_buf);
     }
 
-    // Compute the inline-upsert slice for this blob's ID range
-    // (mirrors Phase 2 in the current batch loop at rewrite.rs:370-374).
-    let (min_id, max_id) = desc.id_range.unwrap_or((i64::MAX, i64::MIN));
-    let inline_upserts = upsert_slice(ranges, desc.kind, min_id, max_id);
+    // For indexed blobs, trust the indexdata-derived kind + range. For
+    // non-indexed blobs (the --force path), the scanner had to emit a
+    // placeholder `kind=Node` with `id_range=None` because it walks
+    // headers only; recover the true kind + range from the parsed block
+    // so the rewrite slice lookup, create dispatch, and the drain's
+    // cursor advancement (`drain.rs::dispatch_variant` Rewritten arm)
+    // and type-transition routing all see correct values. Without this,
+    // non-indexed blobs emit `DrainItem::Rewritten { id_range: (0, 0) }`
+    // and the drain never advances its per-kind upsert cursor, so
+    // upserts already handled inline (modifies to base elements) get
+    // re-emitted as trailing creates at end-of-stream.
+    let (effective_kind, effective_min_id, effective_max_id) = match desc.id_range {
+        Some((min, max)) => (desc.kind, min, max),
+        None => infer_kind_and_range(&block),
+    };
+    let inline_upserts = upsert_slice(ranges, effective_kind, effective_min_id, effective_max_id);
 
     // The drain publishes `loc_map` at the node→way barrier; for
     // way/relation blobs after the barrier, read it via the shared
     // OnceLock. The scanner barrier protocol guarantees the lock is
     // set before any non-node descriptor is dispatched to workers.
-    let loc_arc = if locations_on_ways && desc.kind != ElemKind::Node {
+    let loc_arc = if locations_on_ways && effective_kind != ElemKind::Node {
         loc_map_handle.and_then(|h| h.get().cloned())
     } else {
         None
@@ -476,7 +512,7 @@ fn handle_candidate(
     let loc_map: Option<&FxHashMap<i64, (i32, i32)>> = loc_arc.as_deref();
 
     let t_rewrite = std::time::Instant::now();
-    let output = rewrite_block_parallel(&block, diff, bb, inline_upserts, desc.kind, loc_map)
+    let output = rewrite_block_parallel(&block, diff, bb, inline_upserts, effective_kind, loc_map)
         .map_err(|e| new_error(ErrorKind::Io(std::io::Error::other(e.to_string()))))?;
     counters
         .rewrite_ns
@@ -504,17 +540,78 @@ fn handle_candidate(
         .fetch_add(elapsed_ns(t_frame), Ordering::Relaxed);
 
     counters.blobs_rewritten.fetch_add(1, Ordering::Relaxed);
-    let id_range = desc.id_range.unwrap_or((0, 0));
     send_drain(
         drain_tx,
         DrainItem::Rewritten {
             seq: desc.seq,
             framed_chunks,
-            kind: desc.kind,
-            id_range,
+            kind: effective_kind,
+            id_range: (effective_min_id, effective_max_id),
             stats: output.stats,
         },
     )
+}
+
+/// Recover a non-indexed blob's dominant element kind and (min, max)
+/// id range by walking the already-parsed block. Used on the --force
+/// path where the scanner has to emit a placeholder `kind=Node` and
+/// `id_range=None` because it runs off the blob header alone; the
+/// values it returns are authoritative for drain cursor advancement.
+///
+/// For homogeneous blobs (the usual shape for writers that emit one
+/// kind per block - our own `PbfWriter` included) `block.block_type()`
+/// is the dominant kind and the walk returns tight (min, max) id
+/// bounds for that kind. For mixed blocks this picks the first-seen
+/// element's kind and its own min/max - other-kind elements are
+/// ignored by the range, leaving their upserts to the drain's
+/// trailing-creates path. Empty blocks return a degenerate sentinel
+/// range that the upsert cursor computation treats as "no range".
+fn infer_kind_and_range(block: &crate::PrimitiveBlock) -> (ElemKind, i64, i64) {
+    use crate::{BlockType, Element};
+
+    let primary = match block.block_type() {
+        BlockType::DenseNodes | BlockType::Nodes => Some(ElemKind::Node),
+        BlockType::Ways => Some(ElemKind::Way),
+        BlockType::Relations => Some(ElemKind::Relation),
+        BlockType::Mixed | BlockType::Empty => None,
+    };
+
+    let mut kind: Option<ElemKind> = primary;
+    let mut min_id = i64::MAX;
+    let mut max_id = i64::MIN;
+
+    for element in block.elements_skip_metadata() {
+        let (elem_kind, id) = match &element {
+            Element::DenseNode(dn) => (ElemKind::Node, dn.id()),
+            Element::Node(n) => (ElemKind::Node, n.id()),
+            Element::Way(w) => (ElemKind::Way, w.id()),
+            Element::Relation(r) => (ElemKind::Relation, r.id()),
+        };
+        match kind {
+            Some(k) if k == elem_kind => {
+                min_id = min_id.min(id);
+                max_id = max_id.max(id);
+            }
+            Some(_) => {
+                // Different kind in a block whose block_type() said
+                // homogeneous - ignore for the range (trailing-creates
+                // handle other-kind upserts).
+            }
+            None => {
+                kind = Some(elem_kind);
+                min_id = id;
+                max_id = id;
+            }
+        }
+    }
+
+    match kind {
+        Some(k) => (k, min_id, max_id),
+        // Empty block: return Node with a sentinel range so upstream
+        // upsert slicing produces an empty slice and the drain advances
+        // no cursors. Any upserts of any kind get trailing-created.
+        None => (ElemKind::Node, i64::MAX, i64::MIN),
+    }
 }
 
 /// `--direct-io` passthrough: pread the **full framed bytes** so the

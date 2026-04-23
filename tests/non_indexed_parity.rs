@@ -351,13 +351,15 @@ fn getid_include_non_indexed_parity() {
 // apply-changes (`merge`)
 // ---------------------------------------------------------------------------
 //
-// KNOWN FAILURE, 2026-04-22. Running the same OSC against the
-// indexed and non-indexed twins produces off-by-one node counts
-// (observed 10 vs 11 on a delete + modify + create OSC). Likely the
-// non-indexed scanner routes blob descriptors through the unconditional
-// worker-pool branch without the fast-path splice and some element
-// emerges with duplicated or missing state. `#[ignore]`-gated as a
-// pinned regression target; details logged in TODO.md.
+// Pins the non-indexed parity contract for `apply-changes --force`.
+// The earlier regression over-emitted one node: the scanner emitted
+// non-indexed blobs as `DrainItem::Rewritten` carrying the placeholder
+// `kind=Node` and `id_range=None` (→ (0, 0) on the wire), so the
+// drain's per-kind upsert cursor never advanced past any id. At
+// end-of-stream the trailing-creates loop re-emitted every modify the
+// worker had already handled inline. Fixed 2026-04-23 by recovering
+// the true `(kind, min_id, max_id)` from the parsed block before
+// routing it into the drain (`streaming.rs::infer_kind_and_range`).
 
 fn write_osc_gz(path: &Path, xml: &str) {
     let file = File::create(path).expect("create osc.gz");
@@ -367,7 +369,6 @@ fn write_osc_gz(path: &Path, xml: &str) {
 }
 
 #[test]
-#[ignore = "apply-changes non-indexed fallback off-by-one on delete (see TODO.md)"]
 fn apply_changes_non_indexed_parity() {
     let dir = TempDir::new().expect("tempdir");
     let in_idx = dir.path().join("in_idx.osm.pbf");

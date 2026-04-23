@@ -294,6 +294,7 @@ pub fn merge(
         loc_map_handle: loc_map_handle.as_ref().map(Arc::clone),
         needed_set: needed_set.as_ref().map(Arc::clone),
         compression,
+        use_copy_range,
     };
     let streaming_channels = StreamingChannels {
         candidate_rx,

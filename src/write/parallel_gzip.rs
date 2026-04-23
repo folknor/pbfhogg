@@ -170,8 +170,16 @@ impl<W: Write + Send + 'static> Write for ParallelGzipWriter<W> {
 impl<W: Write + Send + 'static> Drop for ParallelGzipWriter<W> {
     fn drop(&mut self) {
         // Best-effort: ship the final partial chunk if the writer was
-        // not explicitly finished. Errors are swallowed - callers that
-        // care about durability must call `finish()`.
+        // not explicitly finished. Errors are swallowed - any caller
+        // whose last writes matter (file sinks, network sinks) MUST
+        // call `finish()` on the success path to route the final
+        // chunk's I/O result and the writer thread's join result
+        // through `?`. This Drop only fires reliably for:
+        //   - Error bail-outs that propagate an earlier error via `?`
+        //     and drop the writer unfinished (primary error dominates;
+        //     missing final chunk is moot because the operation failed).
+        //   - Panics.
+        //   - Tests and throwaway code where durability doesn't matter.
         drop(self.flush_current());
         self.raw_tx = None;
         for h in std::mem::take(&mut self.worker_handles) {

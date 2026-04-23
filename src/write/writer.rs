@@ -737,8 +737,14 @@ impl<W: Write> Drop for PbfWriter<W> {
         if let Some(mut pipeline) = self.pipeline.take() {
             drop(pipeline.tx);
             if let Some(handle) = pipeline.join_handle.take() {
-                // Best-effort join - errors can't be propagated from Drop.
-                // Callers should call flush() explicitly to get errors.
+                // Best-effort join. Any I/O error from the writer thread -
+                // including the deferred `sync_all` and (for uring)
+                // `set_len` truncation - is silently discarded here;
+                // Drop can't surface errors. Callers that care about
+                // durability MUST call `flush()` on the success path so
+                // the join result is routed through `?`. Reaching Drop
+                // unflushed means either a panic or an earlier-error
+                // `?`-bailout; the primary error dominates.
                 drop(handle.join());
             }
         }

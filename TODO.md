@@ -995,7 +995,7 @@ Remaining open findings from a multi-agent Opus audit of 0.3.0 high-churn areas.
 
 **Open counts by area:**
 - apply-changes pipeline: 3 MEDIUM, 1 LOW
-- write path: 5 MEDIUM, 2 LOW
+- write path: 2 MEDIUM, 2 LOW
 - read path: 1 MEDIUM, 2 LOW
 - renumber: 6 MEDIUM, 2 LOW
 - altw external: 5 MEDIUM, 3 LOW
@@ -1035,11 +1035,11 @@ Remaining open findings from a multi-agent Opus audit of 0.3.0 high-churn areas.
 
 - [ ] **`write/parallel_gzip.rs:188-213` - LOW (downgraded 2026-04-23)** *(verified: not a live failure mode today)*. `compress_one` at :216 uses `GzEncoder::new(Vec::with_capacity(...), ...)`. `Vec<u8>` `Write` impl is infallible; flate2 doesn't return Err for OOM (it panics). So the `Err(_) => return` arm at :207 is effectively unreachable in current code. A worker panic unwinds rather than running the `return`, so this path does not reach the described hang via normal io::Error. The original trigger "flate2 OOM" is wrong. The hang is only reachable via (a) a future sink change to a fallible writer, or (b) a panic-caught-and-converted-to-Err path. Keep as a latent defensive-coding note; fix shape is still "on worker error/panic, poison the writer_loop channel or close it with a sentinel" but urgency drops with no live trigger.
 
-- [ ] **`write/parallel_gzip.rs:170-184` - MEDIUM.** `Drop` silently swallows both the final-chunk `flush_current` error and the `writer_handle` join `io::Result`; inner-writer I/O errors vanish when callers forget `finish()`. Documented as "best-effort" but the failure mode is silent data loss. Trigger: any caller using RAII for `ParallelGzipWriter` with a file sink whose last writes matter.
+- [x] ~~**`write/parallel_gzip.rs:170-184` - MEDIUM.**~~ *(closed 2026-04-23 via documentation only. The RAII-plus-file-sink case is a real hazard but the only in-tree caller (`diff/derive.rs::assemble_osc`) already calls `finish()?` on the success path, so the Drop silent-flush only fires on error-propagation bail-outs (primary error dominates), panics, or tests. Strengthened the Drop comment to spell out the contract explicitly so a future RAII consumer doesn't discover this the hard way. A `debug_assert!` in Drop was considered and rejected because it would false-positive on every legitimate `?`-bail.)*
 
-- [ ] **`write/uring_writer.rs:324-340` - MEDIUM.** On a CQE carrying `result < 0`, `in_flight` is decremented but `self.pool.release(buf_idx)` is skipped - that buffer slot is leaked for the remaining lifetime of the writer. Not catastrophic because the writer errors anyway, but violates the accounting invariant and can surface as "no free buffers" on any caller that tries to continue. Trigger: kernel returns short write or EIO on a `WriteFixed` completion.
+- [x] ~~**`write/uring_writer.rs:324-340` - MEDIUM.**~~ *(landed 2026-04-23; `self.pool.release(buf_idx)` moved ahead of the error-propagation branches so it runs unconditionally for every CQE. Writer still tears down on error; this keeps the pool accounting consistent so any observer/continuation sees a sane state.)*
 
-- [ ] **`write/writer.rs:736-746` - MEDIUM.** `Drop for PbfWriter` joins the writer thread and discards the `io::Result`; for `to_path_parallel` and `to_path_uring`, the writer thread does the actual `sync_all` and (for uring) `set_len` truncation - any I/O error from those operations is lost if the caller drops without calling `flush()`. Documented hazard. Trigger: library user uses `to_path_parallel` without calling `flush()` and sync/truncate fails.
+- [x] ~~**`write/writer.rs:736-746` - MEDIUM.**~~ *(closed 2026-04-23 via documentation only. Standard Rust RAII pattern: `Drop` can't surface errors; `flush()` exists precisely to route the writer-thread join result (which carries `sync_all` and uring `set_len` errors) through `?`. In-tree callers all call `flush()` on the success path. Strengthened Drop comment to name the specific deferred operations (sync_all / set_len) so a library consumer knows what they're losing if they skip `flush()`.)*
 
 - [ ] **`write/parallel_writer.rs:399-430` - MEDIUM.** `copy_range_fallback_pwrite` loops via pread+pwrite but does not handle pread EINTR: a signal-interrupted pread returns `-1`/EINTR and the function errors immediately instead of retrying. Trigger: SIGWINCH or other signal delivered during a cross-device passthrough copy.
 

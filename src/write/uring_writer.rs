@@ -335,6 +335,15 @@ impl UringState {
             let result = cqe.result();
             self.in_flight -= 1;
 
+            // Release the buffer slot on every CQE, success or failure.
+            // Previously only the success path ran release, so a
+            // kernel-level error or short write leaked the slot. The
+            // writer typically tears down on error anyway, but keep the
+            // pool accounting consistent so any code path that tries to
+            // observe `pool.free_count()` or continue past an error
+            // sees a sane state.
+            self.pool.release(buf_idx);
+
             if result < 0 {
                 return Err(io::Error::from_raw_os_error(-result));
             }
@@ -343,7 +352,6 @@ impl UringState {
                     "io_uring short write: expected {expected_len} bytes, got {result}"
                 )));
             }
-            self.pool.release(buf_idx);
         }
         Ok(())
     }

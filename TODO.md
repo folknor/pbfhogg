@@ -567,13 +567,21 @@ See `reference/performance.md` for consolidated baselines.
   tests - but worth revisiting if check-refs ever grows a jobs
   flag.
 
-### Known correctness gaps surfaced by parity tests (2026-04-22)
+### altw external fd footprint (latent, not currently reproducing)
 
-`#[ignore]` regression tests:
-- test/add_locations_to_ways.rs: backend_parity_dense_sparse_external_auto
-  `FAILED backend_parity_dense_sparse_external_auto tests/add_locations_to_ways.rs:957:6 external backend: "create rank shard /tmp/.tmpGS3gav/.pbfhogg-external-join-3778146/rank-W6-216: Too many open files (os error 24)"`
-- tests/apply_changes_invariants.rs: merge_jobs_parity_on_multiblob_input
-  I think this one can be enabled now?
+Stage 1B holds `num_workers * NUM_BUCKETS` rank-shard files open
+concurrently (see `src/commands/altw/external/mod.rs:352`
+`extjoin_total_rank_shard_files` counter). With 16 workers at planet
+scale that's 4096 fds for shards alone, plus the input PBF, index,
+scratch dir, etc. On hosts with a default `ulimit -n` of 1024-4096
+and multiple external-backend tests running concurrently under
+`cargo test -- --include-ignored`, this can hit EMFILE - the
+`backend_parity_dense_sparse_external_auto` test caught this on
+2026-04-22 but the failure is no longer reproducible on the dev host
+(ulimit 524288). The architectural fix - open shards on demand
+instead of upfront, or cap concurrent open count per worker - is
+0.3.x scope. Surfaces as `create rank shard ...: Too many open
+files (os error 24)` from `stage1.rs:398`.
 
 - [x] ~~**`apply-changes -j N --locations-on-ways` consumer build trips
   the drain/copy-range invariant.**~~ - landed 2026-04-23 alongside
@@ -853,7 +861,7 @@ Remaining open findings from a multi-agent Opus audit of 0.3.0 high-churn areas.
 
 - [ ] **`altw/external/mod.rs:191` - LOW.** `ScratchDir::new` uses `output.parent().unwrap_or(Path::new("."))` - if `output` is a bare filename with no parent component, scratch files land in the current working directory. A user running from `/` or a tmpfs cwd while outputting to a large disk can land ~224 GB of scratch on the wrong filesystem. The dense path has the same pattern. Trigger: running external-join from a small-fs cwd.
 
-- [ ] **`altw/external/stage2.rs:488-493` - LOW.** The `debug_assert_eq!(next_rank, blob.ref_rank_end, ...)` runs only in debug builds; in release a drifted rank counter silently produces wrong coord slice assignments. Promote to an always-on `return Err(...)` at negligible cost (once per blob, not per tuple). Trigger: upstream indexdata or node-scan regression.
+- [x] ~~**`altw/external/stage2.rs:488-493`**~~ - landed 2026-04-23. Promoted `debug_assert_eq!` to an always-on `return Err(...)` with blob offset + expected/actual rank range in the error message. Negligible cost (once per blob, not per tuple).
 
 - [ ] **`altw/external/stage4.rs:573-600` - LOW.** The consumer pre-seeds passthrough items with `reorder.push(desc.seq, ...)` for every passthrough descriptor before looping on decode results; if `passthrough_items` is very large (planet: ~5K relations + up to 40K nodes if `keep_untagged_nodes=true`), `ReorderBuffer` with initial capacity 32 grows to hold all of them plus the decode-in-flight set. Acceptable cost but the buffer is now effectively sized by `len(passthrough_items)`. Trigger: large relation/node-passthrough counts.
 

@@ -485,12 +485,18 @@ pub(super) fn stage2_node_join(
                                 coord_slice[off..off + 4].copy_from_slice(&lat.to_le_bytes());
                                 coord_slice[off + 4..off + 8].copy_from_slice(&lon.to_le_bytes());
                             }
-                            debug_assert_eq!(
-                                next_rank, blob.ref_rank_end,
-                                "blob-local rank drift: expected {} hits, got {}",
-                                blob.ref_count(),
-                                next_rank - blob.ref_rank_start,
-                            );
+                            if next_rank != blob.ref_rank_end {
+                                return Err(format!(
+                                    "stage2 blob-local rank drift at blob (data_offset={}, data_size={}): expected {} referenced hits in [{}, {}), got {}. \
+                                     Indexdata min/max_id may not tightly bracket the node IDs actually present in this blob.",
+                                    blob.data_offset,
+                                    blob.data_size,
+                                    blob.ref_count(),
+                                    blob.ref_rank_start,
+                                    blob.ref_rank_end,
+                                    next_rank - blob.ref_rank_start,
+                                ));
+                            }
                             #[allow(clippy::cast_possible_truncation)]
                             node_rank_ref.fetch_add(t_rk.elapsed().as_millis() as u64, Relaxed);
                             #[allow(clippy::cast_possible_truncation)]

@@ -293,14 +293,7 @@ fn cursor_rule_false_positive_blob_emits_create_at_tail() {
     );
 }
 
-// KNOWN FAILURE, 2026-04-22. This passes under the all-features sweep
-// but fails in the consumer feature sweep (`--no-default-features
-// --features commands`) with:
-// `drain: received CopyRange item but use_copy_range is false`.
-// The bug is in product code, not this fixture; keep the parity pin in
-// tree but ignored until the drain/copy-range contract is fixed.
 #[test]
-#[ignore = "consumer sweep: drain receives CopyRange while use_copy_range=false (see TODO.md)"]
 fn merge_jobs_parity_on_multiblob_input() {
     let dir = TempDir::new().expect("tempdir");
     let base_raw = dir.path().join("base_raw.osm.pbf");

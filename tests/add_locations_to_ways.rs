@@ -880,7 +880,6 @@ fn basic_locations_added_sparse() {
 
 #[allow(clippy::cast_possible_wrap)]
 #[test]
-#[ignore]
 fn backend_parity_dense_sparse_external_auto() {
     let dir = TempDir::new().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");

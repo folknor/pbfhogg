@@ -51,6 +51,7 @@
 - **Truncated or corrupt-header PBFs produced past-EOF entries in classify schedules** built by `check --refs`, `extract --simple`, and the HeaderWalker-backed smart-extract paths, then failed much later inside pread workers with an opaque `read_exact_at` UnexpectedEof. Both `build_classify_schedule` and `build_classify_schedules_split` now explicitly validate `data_offset + data_size <= file_size` up front and return a descriptive error naming the offending offset and declared data_size, so the caller sees a clean setup-time failure.
 - **Concurrent pbfhogg processes against the same scratch directory** could collide on temp file names; names now include the PID.
 - **Temp files leaked on assembly error paths.** Cleanup now runs on every exit path.
+- **`add-locations-to-ways --index-type external` could silently produce wrong coordinates on PBFs with loose blob indexdata.** Stage 2's blob-local rank counter assumes `(min_id, max_id)` in blob indexdata tightly brackets the node IDs actually present in the blob. A producer with sloppy bounds would drift the per-blob rank assignment in release builds (the existing `debug_assert_eq!` only fired in debug), scattering coords across the wrong slice positions and silently corrupting way coordinates downstream. Now surfaces as a hard error naming the blob offset and the expected vs. actual rank range, so the miscompute fails loud instead of quiet.
 
 ### Library
 

@@ -238,7 +238,7 @@ fn removeid_nodes() {
     );
 
     let id_set = parse_ids(&ids(&["n2"])).expect("parse ids");
-    let stats = removeid(&input, &output, &id_set, Compression::default(), false, &pbfhogg::HeaderOverrides::default()).expect("removeid");
+    let stats = removeid(&input, &output, &id_set, Compression::default(), false, true, &pbfhogg::HeaderOverrides::default()).expect("removeid");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 3]);
@@ -268,7 +268,7 @@ fn removeid_mixed_types() {
     );
 
     let id_set = parse_ids(&ids(&["n1", "w11", "r100"])).expect("parse ids");
-    let stats = removeid(&input, &output, &id_set, Compression::default(), false, &pbfhogg::HeaderOverrides::default()).expect("removeid");
+    let stats = removeid(&input, &output, &id_set, Compression::default(), false, true, &pbfhogg::HeaderOverrides::default()).expect("removeid");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![2]);
@@ -708,6 +708,7 @@ fn removeid_multi_blob_passthrough() {
         &id_set,
         Compression::default(),
         false,
+        true,
         &pbfhogg::HeaderOverrides::default(),
     )
     .expect("removeid");

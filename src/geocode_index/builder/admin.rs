@@ -85,11 +85,20 @@ fn assemble_one_relation(
             });
         }
 
-        // Add inner rings (holes) that fall inside this outer ring
+        // Add inner rings (holes) that fall inside this outer ring.
+        //
+        // Test containment against the *original* `outer_f64`, not the
+        // Douglas-Peucker-simplified `simplified`. Aggressive simplification
+        // on the outer can shift the boundary by up to the DP tolerance,
+        // and a hole whose `hole[0]` lies near the original boundary can
+        // end up outside `simplified` even though the hole is topologically
+        // inside. "Which outer owns this hole" is about original topology;
+        // the rendered geometry we store in `vertices` is still the
+        // simplified form.
         for hole in &inner_rings {
             if hole.is_empty() { continue; }
             let hp = (hole[0].1 as f64 * 1e-7, hole[0].0 as f64 * 1e-7);
-            if !crate::geo::point_in_ring(hp.0, hp.1, &simplified) { continue; }
+            if !crate::geo::point_in_ring(hp.0, hp.1, &outer_f64) { continue; }
 
             let hole_f64: Vec<(f64, f64)> = hole.iter()
                 .map(|&(lat, lon)| (lon as f64 * 1e-7, lat as f64 * 1e-7))

@@ -9,6 +9,20 @@
 
 use crate::idset::IdSet;
 
+/// Single-lookup `resolve`-equivalent: returns `(new_id, is_orphan)`.
+/// On hit, `new_id = start_id + rank`. On miss, passes the old id through
+/// unchanged (matches `IdSet::resolve`'s orphan return). Used by the
+/// way-ref and relation-member-ref renumber hot loops to avoid the
+/// `resolve(id) + get(id)` double chunk lookup.
+#[inline]
+#[allow(clippy::cast_possible_wrap)]
+fn resolve_with_orphan(set: &IdSet, old_id: i64, start_id: i64) -> (i64, bool) {
+    match set.rank_if_set(old_id) {
+        Some(r) => (start_id + r as i64, false),
+        None => (old_id, true),
+    }
+}
+
 /// Count varints in `data`, erroring on a truncated trailing varint or a
 /// malformed mid-stream byte. Counting continuation-bit-clear bytes is
 /// faster but silently accepts truncation (no terminator means the last
@@ -325,8 +339,10 @@ pub(super) fn reframe_ways_with_new_ids(
                              processing."
                         ));
                     }
-                    let new_ref = node_id_set.resolve(old_node_id, start_node_id);
-                    if !node_id_set.get(old_node_id) {
+                    // Single chunk lookup per ref via `resolve_with_orphan`.
+                    let (new_ref, is_orphan) =
+                        resolve_with_orphan(node_id_set, old_node_id, start_node_id);
+                    if is_orphan {
                         orphan_refs += 1;
                     }
                     protohoggr::encode_varint(
@@ -588,11 +604,12 @@ pub(super) fn reframe_relations_with_new_ids(
                             ));
                         }
 
-                        // Look up new absolute id by member type.
+                        // Look up new absolute id by member type. Single
+                        // chunk lookup per ref via `resolve_with_orphan`.
                         let (new_abs_id, is_orphan) = match member_type {
-                            0 => (node_id_set.resolve(old_abs_id, start_node_id), !node_id_set.get(old_abs_id)),
-                            1 => (way_id_set.resolve(old_abs_id, start_way_id), !way_id_set.get(old_abs_id)),
-                            2 => (relation_id_set.resolve(old_abs_id, start_relation_id), !relation_id_set.get(old_abs_id)),
+                            0 => resolve_with_orphan(node_id_set, old_abs_id, start_node_id),
+                            1 => resolve_with_orphan(way_id_set, old_abs_id, start_way_id),
+                            2 => resolve_with_orphan(relation_id_set, old_abs_id, start_relation_id),
                             _ => (old_abs_id, false), // unknown type - preserve
                         };
                         if is_orphan {

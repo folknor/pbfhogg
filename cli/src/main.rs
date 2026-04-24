@@ -895,9 +895,6 @@ fn main() -> process::ExitCode {
             header,
         } => {
             if invert {
-                if force.force {
-                    eprintln!("Warning: --force has no effect with --invert (removeid does not use indexdata)");
-                }
                 run_removeid(
                     &file,
                     &output.output,
@@ -907,6 +904,7 @@ fn main() -> process::ExitCode {
                     &ids,
                     &compression.compression,
                     io.direct_io,
+                    force.force,
                     &HeaderOverrides::parse(header.generator, &header.output_headers)?,
                 )
             } else {
@@ -1844,11 +1842,12 @@ fn run_removeid(
     ids: &[String],
     compression: &str,
     direct_io: bool,
+    force: bool,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, direct_io)?;
-    let stats = pbfhogg::getid::removeid(file, output, &id_set, compression, direct_io, overrides)?;
+    let stats = pbfhogg::getid::removeid(file, output, &id_set, compression, direct_io, force, overrides)?;
     stats.print_summary();
     Ok(())
 }

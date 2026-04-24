@@ -775,6 +775,15 @@ fn tags_filter_two_pass(
         // Type-only filter: skip blob types not needed (no tag index filtering
         // in pass 2 - elements can be included via relation closure without
         // having the matching tag key).
+        //
+        // The `if let Some(idx) = meta.index.as_ref()` gate means non-indexed
+        // blobs fall through unskipped and decode fully in pass 2. This is
+        // only reachable when the upstream `require_indexdata` at :177 was
+        // waived by `opts.force` or `opts.invert` - both explicit slow-path
+        // opt-ins where the user accepts full decode. If that upstream gate
+        // is ever relaxed, this site needs tightening: either bail out
+        // earlier for non-indexed blobs, or decode-to-check the blob's kind
+        // before admitting it to the schedule.
         if let Some(ref filter) = blob_filter {
             if let Some(idx) = meta.index.as_ref() {
                 if !filter.wants_index(idx) {

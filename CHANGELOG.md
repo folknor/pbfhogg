@@ -9,6 +9,7 @@
 - **Geocode `FORMAT_VERSION` bumped to 2.** Indexes built with older versions must be rebuilt.
 - **`IdSetDense` renamed to `IdSet`** and moved from `getid` to the top-level `pbfhogg::idset` module.
 - **`pbfhogg::getid::IdSet` renamed to `pbfhogg::getid::ElementIds`.** The struct bundles three per-type ID sets and was misnamed as a single "set". Field accessors and method calls unchanged.
+- **`pbfhogg::getid::removeid` signature adds `force: bool`** (positional, between `direct_io` and `overrides`). Library callers must pass `false` to require indexdata (matches CLI default), or `true` to permit non-indexed input.
 
 ### Commands
 
@@ -62,6 +63,9 @@
 - Parallel-pwrite cross-device passthrough copy could fail on a signal-interrupted `pread` instead of retrying, surfacing as a spurious I/O error when a signal (e.g. SIGWINCH) arrived during an EXDEV fallback. Fixed.
 - Parallel `derive-changes` scratch filenames could collide across concurrent `pbfhogg` processes when PIDs recycled in the same scratch directory (container restart). Process-lifetime random tag now included in the path.
 - `BlobReader::seek_raw` left iteration permanently stuck after a prior `next()` returned an error: the sticky `last_blob_ok` flag was never reset on successful seek, so `next()` returned `None` even though the user had recovered by seeking past the bad bytes. A successful `seek_raw` now clears the flag.
+- `removeid` (`getid --invert`) on a non-indexed PBF silently fell through to full decode + re-encode for every blob instead of using the raw-passthrough fast path (which is unreachable without indexdata). Now errors up front with a specific message unless `--force` is passed, matching `getid` include-mode behaviour. The previous `Warning: --force has no effect with --invert` message was incorrect - `--force` is the gate on this path - and has been removed.
+- `build-geocode-index` could drop admin inner rings (holes) on multi-outer relations when aggressive Douglas-Peucker simplification on the outer ring shifted the simplified boundary past the hole's first vertex. Hole-in-outer containment now tests against the original (unsimplified) outer polygon; rendered geometry stored on disk is unchanged (still simplified).
+- `inspect --direct-io` on an indexed PBF silently ignored the flag when the header-only fast path applied. Now prints a one-line stderr notice explaining that `HeaderWalker`'s `posix_fadvise(POSIX_FADV_RANDOM)` provides equivalent cache-avoidance on the fast path, and that the full-decode fallback still honours `--direct-io`.
 
 ### Library
 

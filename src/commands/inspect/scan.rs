@@ -62,8 +62,16 @@ fn try_index_only_scan(
     path: &Path,
     show_blocks: bool,
     show_id_ranges: bool,
-    _direct_io: bool,
+    direct_io: bool,
 ) -> Result<Option<InspectReport>> {
+    if direct_io {
+        eprintln!(
+            "[inspect] --direct-io not used on the index-only fast path; \
+             HeaderWalker avoids page-cache pollution via \
+             posix_fadvise(POSIX_FADV_RANDOM). If any blob lacks indexdata \
+             this scan falls back to full decode and honours --direct-io there."
+        );
+    }
     let meta = std::fs::metadata(path)?;
     let file_name = path
         .file_name()

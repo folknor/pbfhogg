@@ -255,8 +255,18 @@ pub fn getid(
 }
 
 /// Remove elements matching the given IDs (output everything else).
+///
+/// Requires blob-level indexdata so the invert-mode raw-passthrough fast
+/// path at `filter_by_id` can skip re-encoding non-matching blobs. On a
+/// non-indexed PBF the fast path is unreachable and every blob would
+/// decode-and-re-encode silently; `--force` overrides.
+#[allow(clippy::too_many_arguments)]
 #[hotpath::measure]
-pub fn removeid(input: &Path, output: &Path, ids: &ElementIds, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<GetidStats> {
+pub fn removeid(input: &Path, output: &Path, ids: &ElementIds, compression: Compression, direct_io: bool, force: bool, overrides: &HeaderOverrides) -> Result<GetidStats> {
+    require_indexdata(input, direct_io, force,
+        "input PBF has no blob-level indexdata. Without indexdata, the \
+         invert-mode raw-passthrough fast path is unreachable and every \
+         blob is decompressed and re-encoded (significantly slower).")?;
     filter_by_id(input, output, ids, false, compression, direct_io, overrides)
 }
 

@@ -1,9 +1,15 @@
 # `repack` - command design
 
 New subcommand: re-encode a PBF with a configurable element-count cap
-per blob. Motivated by `reference/blob-density.md` - we need a way to
-produce same-corpus-different-encoding pairs so benchmarks can control
-for blob-count effects independent of byte size.
+per blob. Motivated by [`reference/blob-density.md`](../reference/blob-density.md) -
+we need a way to produce same-corpus-different-encoding pairs so
+benchmarks can control for blob-count effects independent of byte size.
+
+**Blocking consumer:** the `getparents` `HeaderWalker` experiment in
+commit `783970a` is europe-regressing / planet-winning by the
+blob-density asymmetry. Deciding revert vs threshold-dispatch vs
+accept requires measuring the crossover on a same-corpus pair, which
+needs this command. See [`notes/getparents.md`](getparents.md).
 
 Drafted 2026-04-24 as scaffolding before implementation. Will drift.
 

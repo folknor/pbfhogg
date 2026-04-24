@@ -40,8 +40,12 @@ with the Null Island sentinel used by `DenseMmapIndex` (see CORRECTNESS.md).
 
 ## diff: content equality vs version ordering
 
-**osmium behavior:** Uses version/timestamp ordering to determine which element is
-"newer." Can produce wrong output when inputs have mismatched or absent metadata
+**osmium behavior:** Matches elements by `(type, id, version, timestamp)` ordering,
+so same-id elements with different versions are reported as separate left/right
+entries rather than as a modification. When two elements do match, equality is a
+CRC over content plus `timestamp` (always) and `changeset/uid/user` (unless
+`--ignore-attrs-*` flags are passed). Both behaviors can produce spurious diff
+output when inputs have mismatched or absent metadata
 ([osmium-tool#93](https://github.com/osmcode/osmium-tool/issues/93)).
 
 **pbfhogg behavior:** Compares elements field by field - coordinates, tags, refs,

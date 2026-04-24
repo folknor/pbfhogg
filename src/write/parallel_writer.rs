@@ -433,12 +433,19 @@ fn copy_range_fallback_pwrite(
     let mut buf = vec![0u8; 256 * 1024];
     while remaining > 0 {
         let chunk = buf.len().min(remaining as usize);
-        let n = unsafe {
-            libc::pread(in_fd, buf.as_mut_ptr().cast(), chunk, src_offset as i64)
+        let n = loop {
+            let ret = unsafe {
+                libc::pread(in_fd, buf.as_mut_ptr().cast(), chunk, src_offset as i64)
+            };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(err);
+            }
+            break ret;
         };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,

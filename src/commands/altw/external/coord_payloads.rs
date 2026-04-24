@@ -98,10 +98,13 @@ enum StraddlerPartial {
 pub(super) struct ConcurrentBlobLocationRouter {
     worker_files: Vec<std::sync::Arc<std::fs::File>>,
     slots: Vec<std::sync::Mutex<Option<BlobLocation>>>,
-    // Partial-straddler staging. Only indices that actually straddle
-    // touch these; the vec is sized for all way blobs for O(1) indexed
-    // access without a hash map.
-    straddler_partials: Vec<std::sync::Mutex<Option<StraddlerPartial>>>,
+    // Partial-straddler staging. Only way-blob indices that actually
+    // straddle a slot-bucket boundary appear in this map (a few hundred
+    // at planet scale). A single global Mutex is fine: publish count is
+    // O(straddlers) not O(way_blobs), so lock contention is negligible
+    // compared to the earlier per-blob-Mutex Vec sized for all way blobs
+    // (~3 MB committed at planet for <1% live entries).
+    straddler_partials: std::sync::Mutex<rustc_hash::FxHashMap<usize, StraddlerPartial>>,
     // Single global Condvar. `notify_all` is cheap at our scale (<=6
     // stage-4 waiters at any moment) and avoids per-slot Condvar
     // allocation at planet (~57K blobs would be ~3 MB of Condvars).
@@ -149,8 +152,8 @@ impl ConcurrentBlobLocationRouter {
                 num_empty += 1;
             }
         }
-        let straddler_partials: Vec<std::sync::Mutex<Option<StraddlerPartial>>> =
-            (0..num_way_blobs).map(|_| std::sync::Mutex::new(None)).collect();
+        let straddler_partials: std::sync::Mutex<rustc_hash::FxHashMap<usize, StraddlerPartial>> =
+            std::sync::Mutex::new(rustc_hash::FxHashMap::default());
         let stats = ConcurrentRouterStats {
             num_empty,
             ..Default::default()
@@ -226,16 +229,17 @@ impl ConcurrentBlobLocationRouter {
         per_way_rcs: &PerWayRcs,
         encode_scratch: &mut Vec<u8>,
     ) -> Result<()> {
-        let mut guard = self.straddler_partials[blob_idx]
+        let mut map = self
+            .straddler_partials
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (left_bytes, right_bytes) = match (guard.take(), side) {
+        let (left_bytes, right_bytes) = match (map.remove(&blob_idx), side) {
             (None, StraddlerSide::Left) => {
-                *guard = Some(StraddlerPartial::Left(raw_bytes));
+                map.insert(blob_idx, StraddlerPartial::Left(raw_bytes));
                 return Ok(());
             }
             (None, StraddlerSide::Right) => {
-                *guard = Some(StraddlerPartial::Right(raw_bytes));
+                map.insert(blob_idx, StraddlerPartial::Right(raw_bytes));
                 return Ok(());
             }
             (Some(StraddlerPartial::Left(left)), StraddlerSide::Right) => (left, raw_bytes),
@@ -252,7 +256,7 @@ impl ConcurrentBlobLocationRouter {
             }
         };
         // Both halves present - encode inline and publish.
-        drop(guard);
+        drop(map);
         let t_enc = std::time::Instant::now();
         let mut coord_bytes = left_bytes;
         coord_bytes.extend_from_slice(&right_bytes);

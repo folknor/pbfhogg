@@ -582,8 +582,14 @@ pub(super) fn stage4_assembly(
             },
         }
 
+        // Pre-size to fit the full passthrough seed plus one in-flight decode
+        // result per worker. Without this the default-capacity buffer (32)
+        // grows as every passthrough descriptor is pushed below, and planet
+        // runs with `keep_untagged_nodes=true` seed ~40K entries.
         let mut reorder: crate::reorder_buffer::ReorderBuffer<ConsumerItem> =
-            crate::reorder_buffer::ReorderBuffer::with_capacity(32);
+            crate::reorder_buffer::ReorderBuffer::with_capacity(
+                passthrough_items.len() + decode_threads,
+            );
 
         // Pre-seed passthrough items at their global seq positions.
         //
@@ -652,7 +658,10 @@ pub(super) fn stage4_assembly(
                         let t_w = std::time::Instant::now();
                         *s4_bytes_written += frame_size as u64;
                         *s4_write_calls += 1;
-                        writer.write_raw_owned(std::mem::take(&mut frame_read_buf))?;
+                        writer.write_raw_owned(std::mem::replace(
+                            &mut frame_read_buf,
+                            Vec::with_capacity(frame_size),
+                        ))?;
                         #[allow(clippy::cast_possible_truncation)]
                         { *s4_write_ms += t_w.elapsed().as_millis() as u64; }
 

@@ -202,6 +202,22 @@ struct ShardOutput {
     delete_count: u64,
 }
 
+/// Process-lifetime random tag for scratch filenames. PID alone collides
+/// when two `pbfhogg` processes share a PID in the same scratch dir
+/// (container restart recycling PID); adding this tag dodges that.
+fn process_scratch_tag() -> &'static str {
+    static TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TAG.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        #[allow(clippy::cast_possible_truncation)]
+        let lo = nanos as u32;
+        format!("{lo:08x}")
+    })
+}
+
 /// Compute the three per-shard scratch paths that `run_shard` would
 /// create. Exposed so the caller can clean up leftover files from
 /// panicked / errored shards whose `ShardOutput` is unavailable.
@@ -211,15 +227,22 @@ fn shard_xml_paths(
     shard_idx: usize,
 ) -> (PathBuf, PathBuf, PathBuf) {
     let pid = std::process::id();
+    let tag = process_scratch_tag();
     let kind_tag = match kind {
         ElemKind::Node => "n",
         ElemKind::Way => "w",
         ElemKind::Relation => "r",
     };
     (
-        scratch_dir.join(format!("derive-par-creates-{pid}-{kind_tag}-{shard_idx}.xml.tmp")),
-        scratch_dir.join(format!("derive-par-modifies-{pid}-{kind_tag}-{shard_idx}.xml.tmp")),
-        scratch_dir.join(format!("derive-par-deletes-{pid}-{kind_tag}-{shard_idx}.xml.tmp")),
+        scratch_dir.join(format!(
+            "derive-par-creates-{pid}-{tag}-{kind_tag}-{shard_idx}.xml.tmp"
+        )),
+        scratch_dir.join(format!(
+            "derive-par-modifies-{pid}-{tag}-{kind_tag}-{shard_idx}.xml.tmp"
+        )),
+        scratch_dir.join(format!(
+            "derive-par-deletes-{pid}-{tag}-{kind_tag}-{shard_idx}.xml.tmp"
+        )),
     )
 }
 

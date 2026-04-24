@@ -81,9 +81,12 @@ Three paths, undecided:
 Option (2) is what `blob-density.md` points at as the honest call
 but we have no measurement yet of what the threshold should be.
 Deferred until `repack` produces an 8k-packed planet so we can
-measure the crossover directly. Once `repack` lands, this file
-will be updated with the committed experiment's hash for easy
-revert if option (1) wins.
+measure the crossover directly.
+
+**Experiment commit: `783970a`.** If option (1) wins after
+`repack`-measured data lands, revert with `git revert 783970a`
+(or cherry-pick the parts of that commit worth keeping and drop
+the `src/commands/getparents/mod.rs` rewrite).
 
 Architecture today:
 

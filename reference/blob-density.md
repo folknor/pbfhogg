@@ -64,10 +64,25 @@ PBF, the same header scan is ~40x cheaper.
 - `sort` pass 1, commit `1f97fae`: europe +21 % wall regression,
   planet -9 % wall win. The "planet wins" framing silently assumes
   50 k blobs.
-- `getparents` `HeaderWalker` path (commit TBD): planet -46 % wall
+- `getparents` `HeaderWalker` path, commit `783970a`: planet -46 % wall
   (44.8 s → 24.4 s), europe +68 % wall (26.4 s → 44.2 s). Same encoder
   asymmetry, bigger magnitude because getparents has no pass-2
   cache-warmth offset.
+
+### The pattern we kept seeing
+
+Blob density retroactively explains a repeating observation from
+prior optimization work: "change X regressed europe wall but won on
+planet, probably an I/O or memory effect". Every one of those prior
+cases involved a `HeaderWalker`-style per-blob code path. The win on
+planet and the regression on europe were the *same* effect viewed
+from opposite sides of the ~40x blob-count ratio - not two
+independent phenomena being reconciled, but one phenomenon with a
+two-scale blind spot in our measurement setup.
+
+Recognising this up-front changes how we size future changes: a
+"planet-only" win claim should be read as "win on low-blob-density
+input, unknown on high-blob-density input" until both are measured.
 
 ### Rule
 
@@ -80,6 +95,15 @@ planet) would behave very differently for header-walk-dominated
 commands.
 
 ## Consequences for the codebase
+
+### Upstream reference implementation
+
+Osmium (the reference C++ OSM/PBF library) takes no blob-density-aware
+action either. The writer hardcodes `max_entities_per_block = 8000` with
+no configuration knob; the reader submits each blob to a thread pool
+without branching on blob count, size, or density. The 40x asymmetry is
+a blind spot in the reference implementation too, which means
+threshold-based dispatch here is new ground.
 
 ### Silently-wrong documentation
 

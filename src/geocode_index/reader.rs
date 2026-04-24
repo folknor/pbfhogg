@@ -360,11 +360,11 @@ impl Reader {
         if iw.start_number == 0 || iw.end_number == 0 {
             return None;
         }
-        let total_len = self.way_length(&self.interp_nodes, iw.node_offset, iw.node_count);
+        let total_len = self.way_length_radians(&self.interp_nodes, iw.node_offset, iw.node_count);
         if total_len < 1e-15 {
             return None;
         }
-        let acc_len = self.accumulated_length(
+        let acc_len = self.accumulated_length_radians(
             &self.interp_nodes,
             iw.node_offset,
             candidate.segment_index,
@@ -942,11 +942,11 @@ impl Reader {
         if iw.start_number == 0 || iw.end_number == 0 {
             return None;
         }
-        let total_len = self.way_length(&self.interp_nodes, iw.node_offset, iw.node_count);
+        let total_len = self.way_length_radians(&self.interp_nodes, iw.node_offset, iw.node_count);
         if total_len < 1e-15 {
             return None;
         }
-        let acc_len = self.accumulated_length(
+        let acc_len = self.accumulated_length_radians(
             &self.interp_nodes, iw.node_offset, seg_idx, snap_lat, snap_lon,
         );
         let t = acc_len / total_len;
@@ -965,7 +965,7 @@ impl Reader {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    fn way_length(&self, nodes_mmap: &Mmap, node_offset: u64, node_count: u16) -> f64 {
+    fn way_length_radians(&self, nodes_mmap: &Mmap, node_offset: u64, node_count: u16) -> f64 {
         let mut total = 0.0;
         let base = node_offset as usize;
         for i in 0..(node_count as usize).saturating_sub(1) {
@@ -974,14 +974,14 @@ impl Reader {
             let b = read_record::<NODE_COORD_SIZE>(nodes_mmap, base + (i + 1) * NODE_COORD_SIZE)
                 .map(NodeCoord::from_bytes);
             if let (Some(a), Some(b)) = (a, b) {
-                total += segment_length(&a, &b);
+                total += segment_length_radians(&a, &b);
             }
         }
         total
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    fn accumulated_length(
+    fn accumulated_length_radians(
         &self,
         nodes_mmap: &Mmap,
         node_offset: u64,
@@ -997,7 +997,7 @@ impl Reader {
             let b = read_record::<NODE_COORD_SIZE>(nodes_mmap, base + (i + 1) * NODE_COORD_SIZE)
                 .map(NodeCoord::from_bytes);
             if let (Some(a), Some(b)) = (a, b) {
-                acc += segment_length(&a, &b);
+                acc += segment_length_radians(&a, &b);
             }
         }
         // Partial segment to snap point
@@ -1006,7 +1006,7 @@ impl Reader {
         ) {
             let seg_start = NodeCoord::from_bytes(rec);
             let snap = NodeCoord { lat_e7: snap_lat, lon_e7: snap_lon };
-            acc += segment_length(&seg_start, &snap);
+            acc += segment_length_radians(&seg_start, &snap);
         }
         acc
     }
@@ -1036,7 +1036,7 @@ fn two_node_distance(ctx: &QueryContext, nodes_mmap: &Mmap, byte_offset: usize) 
     (snap_lat, snap_lon, dist_sq)
 }
 
-fn segment_length(a: &NodeCoord, b: &NodeCoord) -> f64 {
+fn segment_length_radians(a: &NodeCoord, b: &NodeCoord) -> f64 {
     geo::approx_distance_sq(
         geo::e7_to_rad(a.lat_e7), geo::e7_to_rad(a.lon_e7),
         geo::e7_to_rad(b.lat_e7), geo::e7_to_rad(b.lon_e7),

@@ -125,6 +125,7 @@ mod error;
 pub(crate) mod idset;
 pub(crate) mod osm_id;
 pub(crate) mod owned;
+pub(crate) mod path_guard;
 pub(crate) mod reorder_buffer;
 pub(crate) mod scan;
 #[doc(hidden)]

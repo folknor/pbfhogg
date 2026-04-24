@@ -201,6 +201,11 @@ pub fn renumber_external(
     let mut writer = writer_from_header(output, effective_compression, &header, true, overrides, |hb| {
         hb.sorted()
     }, direct_io, false)?;
+    // On any mid-stream error below (pass1 count mismatch, stage 2d
+    // failure, relation rewrite failure, final flush) the partially
+    // written output must not survive. Guard removes it on Drop unless
+    // `commit()` is called at the end of the success path.
+    let output_guard = crate::path_guard::PathGuard::file(output.to_path_buf());
 
     let mut stats = RenumberStats {
         nodes_written: 0,
@@ -352,6 +357,9 @@ pub fn renumber_external(
     writer.flush()?;
 
     crate::debug::emit_marker("RENUMBER_EXT_END");
+
+    // Output is fully written; release the guard so the file survives.
+    output_guard.commit();
 
     Ok(stats)
 }

@@ -44,6 +44,9 @@
 - Adversarial or truncated blob-header length prefix could abort the process via a multi-GB allocation. Fixed.
 - `inspect --show` returned "not found" on unsorted PBFs when the target element lived in a later blob with a smaller `min_id` than a preceding blob. Fixed.
 - `renumber` could panic or produce phantom orphans on PBFs containing negative IDs (via stale indexdata understating the range, or via inconsistent input whose relation member refs carry negatives while nodes/ways do not). Now hard-rejects at every `IdSet` entry point, with an error naming the offending element and the enclosing context.
+- `renumber` left a partial output file on disk when an error surfaced mid-stream (pass1 count mismatch, stage 2d failure, relation rewrite failure, final flush). The output file is now removed on any error path.
+- Geocode builder Pass 3 leaked ~256 temp files per bucket directory on a mid-Stage-A panic or I/O error; the next build would sweep them via an unconditional remove at entry. Now cleaned up on every error path as well.
+- Geocode builder Pass 3 Stage B silently truncated trailing partial records when a Stage A bucket file write was interrupted (ENOSPC, SIGKILL during write), dropping real cell assignments with no diagnostic. Now errors with a message naming the incomplete file length.
 - `apply-changes --force --locations-on-ways` on a non-indexed PBF silently stripped LocationsOnWays data from base ways. Now rejected up front with a migration hint.
 - Parallel and io_uring writers could silently truncate output on upstream framer panic. Fixed.
 - `add-locations-to-ways --index-type external --force` on a non-indexed PBF failed with a confusing error deep inside the metadata scan. Now rejected up front with a migration hint.

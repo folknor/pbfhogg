@@ -149,7 +149,21 @@ struct ParsedBucketEntry {
     segment: u16,
 }
 
-fn parse_bucket_file(data: &[u8]) -> Vec<ParsedBucketEntry> {
+fn parse_bucket_file(data: &[u8]) -> std::io::Result<Vec<ParsedBucketEntry>> {
+    // A partial trailing record means Stage A was interrupted mid-flush
+    // (ENOSPC, SIGKILL during write). Silently truncating would drop
+    // real assignments with no diagnostic; error loudly instead.
+    if !data.len().is_multiple_of(BUCKET_RECORD_SIZE) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "geocode bucket file has partial trailing record ({} bytes, \
+                 not a multiple of {BUCKET_RECORD_SIZE}); Stage A write was \
+                 likely interrupted (ENOSPC or crash)",
+                data.len(),
+            ),
+        ));
+    }
     let count = data.len() / BUCKET_RECORD_SIZE;
     let mut entries = Vec::with_capacity(count);
     for i in 0..count {
@@ -163,7 +177,7 @@ fn parse_bucket_file(data: &[u8]) -> Vec<ParsedBucketEntry> {
         let segment = u16::from_le_bytes([data[off+13], data[off+14]]);
         entries.push(ParsedBucketEntry { cell_id, etype, index, segment });
     }
-    entries
+    Ok(entries)
 }
 
 /// Parameters for the fused fine + coarse bucketed cell assignment
@@ -223,13 +237,19 @@ pub(super) fn bucketed_cell_assignment_fused(p: &FusedCellAssignmentParams<'_>) 
     let fine_level = *fine_level;
     let coarse_level = *coarse_level;
 
-    // Create two bucket directories (one per level).
+    // Create two bucket directories (one per level). The stale-dir sweep
+    // handles the case of a prior build that was SIGKILLed before any
+    // Drop could run; the PathGuards below handle every in-run error
+    // path (mid-Stage-A panic, Stage B error, etc.) so ~256 temp files
+    // per bucket dir don't leak to the next invocation.
     let fine_bucket_dir = output_dir.join(format!(".buckets-level{fine_level}"));
     let coarse_bucket_dir = output_dir.join(format!(".buckets-level{coarse_level}"));
     for dir in [&fine_bucket_dir, &coarse_bucket_dir] {
         if dir.exists() { std::fs::remove_dir_all(dir)?; }
         std::fs::create_dir_all(dir)?;
     }
+    let fine_guard = crate::path_guard::PathGuard::dir(fine_bucket_dir.clone());
+    let coarse_guard = crate::path_guard::PathGuard::dir(coarse_bucket_dir.clone());
 
     // Two sets of bucket writers (lazy).
     let mut fine_writers: Vec<Option<BufWriter<std::fs::File>>> = (0..NUM_BUCKETS)
@@ -402,13 +422,17 @@ pub(super) fn bucketed_cell_assignment_fused(p: &FusedCellAssignmentParams<'_>) 
     drop(fine_writers);
     drop(coarse_writers);
 
-    // Stage B, twice - once per bucket tree.
+    // Stage B, twice - once per bucket tree. Drop the per-tree guard
+    // as soon as the tree is consumed so the bucket files are freed
+    // before the second tree's Stage B runs (disk pressure at planet
+    // scale).
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEB_FINE_START");
     let fine_count = run_stage_b(
         output_dir, &fine_bucket_dir,
         fine_cells_file, fine_street_entries_file,
         fine_addr_entries_file, fine_interp_entries_file,
     )?;
+    drop(fine_guard);
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEB_FINE_END");
 
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEB_COARSE_START");
@@ -417,6 +441,7 @@ pub(super) fn bucketed_cell_assignment_fused(p: &FusedCellAssignmentParams<'_>) 
         coarse_cells_file, coarse_street_entries_file,
         coarse_addr_entries_file, coarse_interp_entries_file,
     )?;
+    drop(coarse_guard);
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEB_COARSE_END");
 
     Ok((fine_count, coarse_count))
@@ -460,7 +485,7 @@ fn run_stage_b(
             let data = std::fs::read(&bucket_path)?;
             std::fs::remove_file(&bucket_path)?;
             if data.is_empty() { return Ok(Vec::new()); }
-            let mut entries = parse_bucket_file(&data);
+            let mut entries = parse_bucket_file(&data)?;
             drop(data);
             entries.sort_unstable_by_key(|e| e.cell_id);
             Ok(entries)
@@ -579,7 +604,10 @@ fn run_stage_b(
     addr_out.flush()?;
     interp_out.flush()?;
 
-    std::fs::remove_dir_all(bucket_dir).ok();
+    // Bucket-dir cleanup is handled by the PathGuard at the
+    // bucketed_cell_assignment_fused caller: on success the caller
+    // `drop`s the guard right after this function returns; on error
+    // the guard's Drop runs via ? propagation.
 
     Ok(total_cells)
 }

@@ -176,7 +176,6 @@ pub(super) fn relation_r2d_assembly(
             let tx = decoded_tx.clone();
             let rid_set = relation_id_set;
             let start_rid = start_relation_id;
-            let rw = &rels_written;
             scope.spawn(move || {
                 use std::os::unix::fs::FileExt as _;
                 use std::sync::atomic::Ordering::Relaxed;
@@ -229,7 +228,6 @@ pub(super) fn relation_r2d_assembly(
                         #[allow(clippy::cast_possible_truncation)]
                         r2d_cref.reframe_ms.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
 
-                        rw.fetch_add(blob_count, Relaxed);
                         r2d_cref.blobs.fetch_add(1, Relaxed);
 
                         let index = crate::blob_meta::BlobIndex {
@@ -276,9 +274,8 @@ pub(super) fn relation_r2d_assembly(
             };
             reorder.push(seq_num, item);
             while let Some(result) = reorder.pop_ready() {
-                let (block_bytes, index, _count, blob_orphans) =
+                let (block_bytes, index, blob_count, blob_orphans) =
                     result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                r2d_orphans.fetch_add(blob_orphans, std::sync::atomic::Ordering::Relaxed);
                 if index.count > 0 {
                     let t0 = std::time::Instant::now();
                     writer.write_primitive_block_owned(block_bytes, index, None)?;
@@ -288,6 +285,13 @@ pub(super) fn relation_r2d_assembly(
                         std::sync::atomic::Ordering::Relaxed,
                     );
                 }
+                // Bump summary counters after the successful write so that
+                // on a mid-stream error both relations_written and
+                // orphan_refs reflect only output actually emitted. Empty
+                // blobs (blob_count == 0 && index.count == 0) contribute
+                // zero on either side and so don't need a guard.
+                rels_written.fetch_add(blob_count, std::sync::atomic::Ordering::Relaxed);
+                r2d_orphans.fetch_add(blob_orphans, std::sync::atomic::Ordering::Relaxed);
             }
         }
         Ok(())

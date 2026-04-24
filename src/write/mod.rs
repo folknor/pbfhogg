@@ -34,6 +34,16 @@ pub mod parallel_gzip_test_hooks {
         PANIC_AT_POOL_OP_COUNT, POOL_OP_COUNT, reset,
     };
 }
+
+// Under the `test-hooks` feature, expose the uring_writer hooks.
+// Test arms `PANIC_AT_DISPATCH_COUNT` before invoking any code path
+// that constructs a `PbfWriter::to_path_uring`.
+#[cfg(all(feature = "test-hooks", feature = "linux-io-uring"))]
+pub mod uring_writer_test_hooks {
+    pub use super::uring_writer::test_hooks::{
+        PANIC_AT_DISPATCH_COUNT, DISPATCH_COUNT, reset,
+    };
+}
 #[cfg(feature = "linux-io-uring")]
 pub mod uring_writer;
 pub(crate) mod metrics;

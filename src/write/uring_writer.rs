@@ -33,6 +33,35 @@ fn elapsed_ns_u64(start: std::time::Instant) -> u64 {
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
+// Fault-injection hooks for tests. Gated behind the `test-hooks`
+// Cargo feature; release builds don't compile this module at all.
+// Same process-global static shape as `parallel_writer::test_hooks` /
+// `parallel_gzip::test_hooks`. The uring writer is single-threaded
+// (one submitter thread, no worker pool), so "op count" here is the
+// count of items popped from the reorder buffer and dispatched to
+// `UringState::write` - same granularity as a parallel_writer
+// dispatch. Tests serialize access via `--test-threads=1`.
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Dispatch count at which the writer thread panics. `u64::MAX` =
+    /// disarmed (default). Call [`reset`] at the start AND end of any
+    /// test that arms this so sibling tests don't inherit state.
+    pub static PANIC_AT_DISPATCH_COUNT: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    /// Monotonic count of items dispatched by the uring writer thread.
+    /// Incremented once per pop from the reorder buffer, before the
+    /// `state.write(...)` call.
+    pub static DISPATCH_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    /// Disarm and zero the counters.
+    pub fn reset() {
+        PANIC_AT_DISPATCH_COUNT.store(u64::MAX, Ordering::Relaxed);
+        DISPATCH_COUNT.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Registered file descriptor index for the output file.
 const OUT_FD_IDX: u32 = 0;
 
@@ -618,6 +647,20 @@ fn uring_main_loop(
         // Drain consecutive ready items from the front.
         while let Some(result) = pending.pop_ready() {
             let chunk = result?;
+
+            // Test-only: arm via `test_hooks::PANIC_AT_DISPATCH_COUNT`.
+            // Simulates a mid-stream panic in the uring writer thread;
+            // `to_path_uring`'s `handle.join()` path surfaces it as an
+            // `io::Error`. Release builds compile this out entirely.
+            #[cfg(feature = "test-hooks")]
+            {
+                use std::sync::atomic::Ordering;
+                let n = test_hooks::DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == test_hooks::PANIC_AT_DISPATCH_COUNT.load(Ordering::Relaxed) {
+                    panic!("test-hooks: uring_writer dispatch #{n} panicking");
+                }
+            }
+
             match chunk {
                 OutputChunk::Framed(parts) => {
                     // io_uring backend flattens at the backend boundary

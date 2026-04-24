@@ -75,7 +75,9 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
 (2026-02-25) has a regression where `debug_assertions` is off in test builds.
 
 `fault_injection_parallel_writer_pool_panic_surfaces_error` in
-`tests/apply_changes_invariants.rs` and `fault_injection_parallel_gzip_*` in
+`tests/apply_changes_invariants.rs` and
+`fault_injection_parallel_gzip_worker_panic_surfaces_via_finish` /
+`fault_injection_uring_writer_dispatch_panic_surfaces_via_flush` in
 `tests/fault_injection.rs` are `#[ignore]`d because their fault-injection hooks are
 **process-global static atomics** that race with any concurrently-running test that
 uses the same pipeline (most apply-changes / derive-changes tests do). They require
@@ -84,6 +86,16 @@ always adds `--test-threads=1`) or `cargo test -- --ignored --test-threads=1`. T
 canonical `fault_injection_worker_panic_surfaces_error_and_leaves_scratch_clean` test
 in the same file is **not** ignored because its hook is per-instance
 (`MergeOptions::panic_at_blob_seq`) and has no shared-state hazard.
+
+The uring fault-injection test additionally skips gracefully on hosts whose
+`RLIMIT_MEMLOCK` soft limit is below 16 MB (needed for io_uring's registered
+buffers). To actually exercise it on a dev host, raise the limit system-wide
+via `/etc/security/limits.conf`:
+
+    @<your-group>    -    memlock    unlimited
+
+then log out/in. The same limit constrains the existing
+`roundtrip_uring_*` tests (they also skip when MEMLOCK is too low).
 
 ## Planet-scale validation coverage
 
@@ -713,28 +725,33 @@ infrastructure first).
   worker to drain `candidate_rx`); tracked below as a separate
   invariant gap.
 
-  `write/parallel_writer.rs` and `write/parallel_gzip.rs` landed
-  2026-04-24 using a different hook shape: static atomics
+  `write/parallel_writer.rs`, `write/parallel_gzip.rs`, and
+  `write/uring_writer.rs` landed 2026-04-24 using static atomics
   (`parallel_writer_test_hooks::PANIC_AT_POOL_OP_COUNT`,
-  `parallel_gzip_test_hooks::PANIC_AT_POOL_OP_COUNT`) set
-  process-globally by the test, rather than per-instance
-  `MergeOptions` fields. Justified because pool workers are spawned
-  deep inside `parallel_writer_thread_inner` / `ParallelGzipWriter::new`
-  and threading a config through every entry point would be invasive.
-  Their canonical tests (`fault_injection_parallel_writer_pool_panic_surfaces_error`
-  and `fault_injection_parallel_gzip_worker_panic_surfaces_via_finish`)
+  `parallel_gzip_test_hooks::PANIC_AT_POOL_OP_COUNT`,
+  `uring_writer_test_hooks::PANIC_AT_DISPATCH_COUNT`). Hook shape
+  differs from apply-changes' per-instance field because pool
+  workers / submitter threads are spawned deep inside the
+  backend constructors and threading a config through every entry
+  point would be invasive. Their canonical tests
+  (`fault_injection_parallel_writer_pool_panic_surfaces_error`,
+  `fault_injection_parallel_gzip_worker_panic_surfaces_via_finish`,
+  `fault_injection_uring_writer_dispatch_panic_surfaces_via_flush`)
   are `#[ignore]`d because static atomics race with sibling tests
   using the same pipeline; run via `brokkr test <name>` which forces
-  `--test-threads=1`. Both confirm a pool-worker panic surfaces
-  through the public `join()` / `finish()` path as an `Err`, never
-  a silent success.
+  `--test-threads=1`. Each confirms a mid-stream writer-thread
+  panic surfaces through the public `join()` / `finish()` /
+  `flush()` path as an `Err`, never a silent success. The uring
+  test gracefully skips on hosts with insufficient
+  `RLIMIT_MEMLOCK` (needs 16 MB; dev hosts default to 8 MB) so
+  it stays clean under environments it can't exercise.
 
-  Remaining pipelines to cover: `write/uring_writer.rs`,
-  `diff/parallel.rs`, `derive_parallel.rs`, altw external stages
-  3/4, geocode Pass 3 Stage A. Hook-shape picker: per-instance
-  field when the pipeline has a public config struct on its entry
-  path, static atomics otherwise. Scratch tracking helpers:
-  `common::snapshot_dir` and `common::assert_scratch_unchanged`.
+  Remaining pipelines to cover: `diff/parallel.rs`,
+  `derive_parallel.rs`, altw external stages 3/4, geocode Pass 3
+  Stage A. Hook-shape picker: per-instance field when the pipeline
+  has a public config struct on its entry path, static atomics
+  otherwise. Scratch tracking helpers: `common::snapshot_dir` and
+  `common::assert_scratch_unchanged`.
 
 - [ ] **`jobs == 1` apply-changes worker-panic deadlock.** With a
   single worker and a worker panic, the scanner blocks on a full

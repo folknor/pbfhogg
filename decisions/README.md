@@ -107,3 +107,7 @@ would benefit from the adjacent context.
 - [ADR-0003](0003-error-path-hygiene-via-pathguard.md) - Error path
   hygiene via a shared `PathGuard` RAII primitive plus a
   counters-after-write rule.
+- [ADR-0004](0004-defensive-input-errors-and-fixtures.md) -
+  Defensive handling of adversarial or malformed input: promote
+  five indexdata/varint/sortedness-trust sites to hard errors at
+  once-per-blob boundaries, seed a lying-input test fixture suite.

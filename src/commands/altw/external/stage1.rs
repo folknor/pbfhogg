@@ -260,6 +260,22 @@ pub(super) fn build_node_blob_mapping(
         if !matches!(meta.kind, crate::blob_meta::ElemKind::Node) {
             continue;
         }
+        // Sanity-check the indexdata range itself. A blob whose metadata
+        // advertises max_id < min_id is malformed (adversarial, bitrot,
+        // or a producer bug). count_below() with such bounds would
+        // produce a reversed rank range and silently feed stage 2 a
+        // negative-length slice via `ref_rank_end - ref_rank_start`;
+        // the tail drift check at stage2.rs:488 would fire eventually,
+        // but with a less specific diagnostic. Error here at the
+        // boundary instead.
+        if meta.max_id < meta.min_id {
+            return Err(format!(
+                "altw stage 1: blob at data_offset={} has reversed \
+                 indexdata range [min_id={}, max_id={}]",
+                meta.data_offset, meta.min_id, meta.max_id,
+            )
+            .into());
+        }
         // count_below() is the safe variant of rank() that handles IDs past
         // the highest allocated chunk (which can happen when a node blob's
         // max_id sits in a chunk that contains no referenced nodes - rank()

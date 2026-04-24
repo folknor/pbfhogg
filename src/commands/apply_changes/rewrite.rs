@@ -61,18 +61,29 @@ fn build_header_bytes(
     locations_on_ways: bool,
     overrides: &HeaderOverrides,
 ) -> Result<Vec<u8>> {
+    // apply-changes requires Sort.Type_then_ID on the base PBF
+    // regardless of --locations-on-ways: the upsert slicing in
+    // `streaming::upsert_slice` computes per-block `osm_id_key`
+    // bounds that assume canonical ordering, and
+    // `rewrite_block.rs::rewrite_block` advances its `upsert_cursor`
+    // using `osm_id_cmp` against the iterating element, which only
+    // produces correct output if elements arrive in canonical order.
+    // Previously the check only fired for --locations-on-ways; the
+    // general path silently dropped creates on malformed unsorted
+    // input.
+    if !header.is_sorted() {
+        return Err(
+            "apply-changes requires a sorted base PBF (Sort.Type_then_ID). \
+             All nodes must precede all ways, and elements within a kind \
+             must be ordered by ID."
+                .into(),
+        );
+    }
     if locations_on_ways {
         if !header.has_locations_on_ways() {
             return Err(
                 "merge --locations-on-ways requires the base PBF to have LocationsOnWays. \
                  Run add-locations-to-ways first to bootstrap coordinates."
-                    .into(),
-            );
-        }
-        if !header.is_sorted() {
-            return Err(
-                "merge --locations-on-ways requires a sorted base PBF (Sort.Type_then_ID). \
-                 All nodes must precede all ways in the file."
                     .into(),
             );
         }

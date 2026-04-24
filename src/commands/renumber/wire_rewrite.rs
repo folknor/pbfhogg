@@ -9,6 +9,22 @@
 
 use crate::idset::IdSet;
 
+/// Count varints in `data`, erroring on a truncated trailing varint or a
+/// malformed mid-stream byte. Counting continuation-bit-clear bytes is
+/// faster but silently accepts truncation (no terminator means the last
+/// byte is missed; extra `0x80` bytes after the last terminator are
+/// silently ignored). A full walk catches both classes at the boundary.
+fn count_varints_strict(data: &[u8]) -> std::result::Result<usize, String> {
+    use protohoggr::Cursor;
+    let mut cursor = Cursor::new(data);
+    let mut count = 0_usize;
+    while cursor.remaining() > 0 {
+        cursor.read_varint().map_err(|e| e.to_string())?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 // ---------------------------------------------------------------------------
 // DenseNodes wire-format rewriter for pass 1
 // ---------------------------------------------------------------------------
@@ -497,8 +513,23 @@ pub(super) fn reframe_relations_with_new_ids(
 
                 if !old_memids_data.is_empty() || !types_data.is_empty() {
                     // Validate: both must have the same varint count.
-                    let memids_count = old_memids_data.iter().filter(|&&b| b & 0x80 == 0).count();
-                    let types_count = types_data.iter().filter(|&&b| b & 0x80 == 0).count();
+                    //
+                    // Counting continuation-bit-clear bytes is a proxy for
+                    // the varint count that silently miscounts on truncated
+                    // input (a trailing varint with no terminator, or
+                    // extraneous bytes after the last terminator, both pass
+                    // the proxy but break the decode loop below). A full
+                    // varint walk catches every malformation here, at the
+                    // boundary, rather than letting it surface as a
+                    // misaligned decode further in.
+                    let memids_count = count_varints_strict(old_memids_data)
+                        .map_err(|e| format!(
+                            "reframe_relations: relation {old_rel_id} memids: {e}"
+                        ))?;
+                    let types_count = count_varints_strict(types_data)
+                        .map_err(|e| format!(
+                            "reframe_relations: relation {old_rel_id} types: {e}"
+                        ))?;
                     if memids_count != types_count {
                         return Err(format!(
                             "reframe_relations: relation {old_rel_id} has {memids_count} memids \

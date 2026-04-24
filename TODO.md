@@ -708,26 +708,30 @@ infrastructure first).
   and the shard-worker-error items in "diff / derive-changes
   shard-parallel".
 
-- [ ] **Lying-indexdata fixtures.** ~15 findings trust
-  `BlobHeader.indexdata` without verification:
-  `min_id`/`max_id` overstating or understating actual contents,
-  `kind` disagreeing with blob contents, `element_count` drifting,
-  phantom-sorted flag on unsorted content. Every existing fixture
-  has either honest indexdata or none at all. Add a
-  `write_pbf_with_custom_indexdata(path, blobs, |idx| { ... })`
-  helper to `tests/common/mod.rs` that lets each test override
-  the indexdata fields independently of blob contents. Then run
-  the command surface ("indexdata says `min_id=0` but blob
-  contains `id=-1`", "indexdata `kind=Node` but blob contains
-  ways", etc.) and assert each command either ignores the
-  indexdata, defends itself, or produces a clean error - never
-  panics and never silently produces wrong output. Catches:
-  `renumber/pass1.rs:179`, `renumber/wire_rewrite.rs:272`,
-  `renumber/stage2.rs:226-231`, `renumber/mod.rs:240`,
-  `altw/external/stage2.rs:488`, `altw/external/stage4.rs:438-478`,
+- [ ] **Lying-indexdata fixtures (extended coverage).** Partial
+  progress 2026-04-24: cluster 2's landing (see
+  [decisions/0004](decisions/0004-defensive-input-errors-and-fixtures.md))
+  closed the runtime half of this test-shape - five fixes
+  promoting `debug_assert` / unchecked arithmetic / silent-truncation
+  to hard errors - and added `tests/cluster2_defensive_input.rs`
+  with two tests covering the out-of-order-sort-claim and
+  unsorted-header fixes. What remains is the byte-level fixture
+  helper itself: `tests/common/adversarial.rs` with
+  `mutate_blob_header_indexdata(pbf_bytes, blob_idx, f)` and
+  `mutate_blob_payload(pbf_bytes, blob_idx, f)` primitives so a
+  test can inject reversed / overshooting indexdata ranges,
+  truncated varints in relation memids, and DenseNodes with
+  adversarial granularity without hand-rolling wire-format
+  manipulation per test. Three fixes landed in cluster 2 still
+  lack direct regression tests (`scan_ids.rs` overflow,
+  `wire_rewrite.rs::count_varints_strict`, `stage1.rs` reversed
+  range) and will be covered once those primitives exist.
+  Covers the fixes landed 2026-04-24 plus additional indexdata-
+  trust sites not in cluster 2: `renumber/pass1.rs:179`,
+  `renumber/wire_rewrite.rs:272`, `renumber/stage2.rs:226-231`,
+  `altw/external/stage4.rs:438-478`,
   `apply_changes/scanner.rs:162,188`, `apply_changes/streaming.rs:496`,
-  `commands/inspect/show_element.rs:53-57`,
-  `blob_meta/scan_ids.rs:192-202`.
+  `commands/inspect/show_element.rs:53-57`.
 
 - [ ] **Negative-ID / signed-arithmetic matrix.** ~8 findings
   mishandle negative element IDs because guards are gated on
@@ -880,17 +884,17 @@ Remaining open findings from a multi-agent Opus audit of 0.3.0 high-churn areas.
 
 ### Cluster 2: Defensive handling of adversarial or malformed input
 
-Several read-side sites trust producer-side invariants (tight indexdata, well-formed varints, sane granularity). **Decision needed:** (a) defend every read; (b) promote release-mode `debug_asserts` to hard errors where cheap; (c) document "must be tight" invariants and rely on the "lying-indexdata fixtures" test-shape listed under Release prep > Test-shape gaps. Precedent: `altw/external/stage2.rs:488-493` landed 2026-04-23 promoting its `debug_assert_eq!` to a hard `Err`.
+**Decision landed 2026-04-24: option (d) - promote the five findings to hard errors at once-per-blob or once-per-transition checkpoints, AND build lying-indexdata test fixtures so future sites are caught by CI rather than individual read-audits.** Zero perf cost on happy-path inputs (checks are all at boundary transitions, not per-element hot paths). See [decisions/0004](decisions/0004-defensive-input-errors-and-fixtures.md) for the full decision record. The fixture infrastructure landed in a narrow form (two tests covering two of the five fixes); extended coverage for byte-level malformations tracked below under "Lying-indexdata fixtures (extended coverage)".
 
-- [ ] **`renumber/mod.rs:240` - MEDIUM.** `max_node_id = pass1_schedule.last().map_or(0, |t| t.max_id)` assumes the last node blob has the global max node ID; true for `Sort.Type_then_ID` (enforced by `require_sorted`), but if the header advertises sorted and the content is not (lying header), a later blob's id could overshoot `max_node_id` and `set_atomic` panics. Trigger: mis-flagged unsorted PBF.
+- [x] ~~**`renumber/mod.rs:240`**~~ - landed 2026-04-24. Replaced `max_node_id = pass1_schedule.last().max_id` with `pass1_schedule.iter().map(|t| t.max_id).max()`. O(N) once at startup; correct regardless of blob ordering. Regression test: `tests/cluster2_defensive_input.rs::renumber_survives_lying_sorted_header_out_of_order_blobs`.
 
-- [ ] **`altw/external/stage1.rs:269-273` + `stage2.rs:459-493` - MEDIUM.** Stage 2's blob-local rank counter (`next_rank = blob.ref_rank_start`, incremented per referenced tuple) is correct only if indexdata `(min_id, max_id)` tightly brackets actual node IDs in the blob. A producer with loose bounds plus the `debug_assert_eq!` at stage2.rs:488 passes in release and silently produces skewed ranks, scrambling the join. Trigger: input PBF with sloppy indexdata ranges from a third-party writer.
+- [x] ~~**`altw/external/stage1.rs:269-273` + `stage2.rs:459-493`**~~ - landed 2026-04-24. Added `max_id < min_id` sanity check at stage 1 blob-mapping entry (`build_node_blob_mapping`); the pre-existing stage 2 tail check promoted to hard `Err` on 2026-04-23 (`ab01438`) already covered the loose-bounds case.
 
-- [ ] **`blob_meta/scan_ids.rs:192-202` - MEDIUM.** The coordinate conversion multiplies `gran * min_raw_lat` as i64 without overflow checking; on adversarial or bitrot-corrupted `granularity` / `lat_offset` fields the result wraps silently in release builds, producing a bogus bbox that then gets serialized into indexdata and trusted by every spatial filter downstream. Trigger: a PBF whose `granularity` field is set to `i32::MAX` combined with extreme delta-coded coords.
+- [x] ~~**`blob_meta/scan_ids.rs:192-202`**~~ - landed 2026-04-24. Replaced the unchecked `gran * raw` chain with `checked_mul` + `checked_add` throughout. On overflow the blob's bbox is dropped (rather than silently wrapping into indexdata); id-range coverage is retained so spatial filters fall back to full-decode for that blob only.
 
-- [ ] **`renumber/wire_rewrite.rs:486-491` - MEDIUM.** `memids_count` / `types_count` are derived by counting varint-terminator bytes in raw field data; correct only for well-formed varints, and a malformed trailing varint (missing continuation) would miscount and cause misalignment in the decode loop rather than clean error. Trigger: truncated/corrupt memids field.
+- [x] ~~**`renumber/wire_rewrite.rs:486-491`**~~ - landed 2026-04-24. Replaced terminator-byte counting with a `count_varints_strict` helper that walks `read_varint()` over the data and errors on truncated varints mid-stream or at the tail. Cost bump (~2-3x per byte in the count phase) is negligible: counts run once per relation, not per element.
 
-- [ ] **`apply_changes/rewrite_block.rs:103` - LOW.** Upsert-create emission uses `osm_id_cmp(inline_upserts[cursor], elem_id).is_lt()`, but `inline_upserts` was pre-sliced using `osm_id_key` bounds in `streaming.rs::upsert_slice`; if the base block is not sorted in OSM order (malformed input), the cursor can skip past upserts that compare greater than one element but less than a later element, silently dropping creates. Trigger: malformed base PBF violating Sort.Type_then_ID (partially protected by `--locations-on-ways` requiring `is_sorted()`, but the general path doesn't).
+- [x] ~~**`apply_changes/rewrite_block.rs:103`**~~ - landed 2026-04-24. Promoted the `header.is_sorted()` check in `rewrite.rs::build_header_bytes` from the `--locations-on-ways` branch to unconditional. The general path now also rejects unsorted base PBFs with a specific error. Regression test: `tests/cluster2_defensive_input.rs::apply_changes_rejects_unsorted_header`. Merge tests updated to use `write_test_pbf_sorted`.
 
 - [x] ~~**`altw/external/stage2.rs:488-493`**~~ - landed 2026-04-23. Promoted `debug_assert_eq!` to an always-on `return Err(...)` with blob offset + expected/actual rank range in the error message. Negligible cost (once per blob, not per tuple).
 

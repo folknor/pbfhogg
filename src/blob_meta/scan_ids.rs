@@ -182,27 +182,34 @@ fn scan_dense_nodes(
 
     // Process coordinates (optional - v1-only files may lack them in theory,
     // but in practice all DenseNodes have lat/lon).
-    let bbox = if let (Some(lats), Some(lons)) = (lat_data, lon_data) {
+    //
+    // Use checked arithmetic throughout: `granularity` and the `*_offset`
+    // fields are attacker-controllable (the spec allows any i32 for
+    // granularity and any i64 for offsets), and unchecked `gran * raw`
+    // wraps silently in release builds. A wrapped bbox would be
+    // serialized into indexdata and trusted by every spatial filter
+    // downstream. On overflow, drop the bbox for this blob rather than
+    // the whole BlobIndex - the caller still gets id-range coverage,
+    // spatial filters fall back to full decode for this blob.
+    let bbox = lat_data.zip(lon_data).and_then(|(lats, lons)| {
         let gran = i64::from(granularity);
         let (min_raw_lat, max_raw_lat) = scan_packed_sint64_minmax(lats)?;
         let (min_raw_lon, max_raw_lon) = scan_packed_sint64_minmax(lons)?;
 
-        // Convert to decimicrodegrees: (offset + gran * raw) / 100
-        // Floor for min, ceil for max (conservative bounds).
-        let min_nano_lat = lat_offset + gran * min_raw_lat;
-        let max_nano_lat = lat_offset + gran * max_raw_lat;
-        let min_nano_lon = lon_offset + gran * min_raw_lon;
-        let max_nano_lon = lon_offset + gran * max_raw_lon;
+        let min_nano_lat = lat_offset.checked_add(gran.checked_mul(min_raw_lat)?)?;
+        let max_nano_lat = lat_offset.checked_add(gran.checked_mul(max_raw_lat)?)?;
+        let min_nano_lon = lon_offset.checked_add(gran.checked_mul(min_raw_lon)?)?;
+        let max_nano_lon = lon_offset.checked_add(gran.checked_mul(max_raw_lon)?)?;
 
+        // Convert nanodegrees to decimicrodegrees (floor for min, ceil
+        // for max to keep the bbox conservative).
         Some(BlobBbox {
-            min_lat: floor_div(min_nano_lat, 100) as i32,
-            max_lat: ceil_div(max_nano_lat, 100) as i32,
-            min_lon: floor_div(min_nano_lon, 100) as i32,
-            max_lon: ceil_div(max_nano_lon, 100) as i32,
+            min_lat: i32::try_from(floor_div(min_nano_lat, 100)).ok()?,
+            max_lat: i32::try_from(ceil_div(max_nano_lat, 100)).ok()?,
+            min_lon: i32::try_from(floor_div(min_nano_lon, 100)).ok()?,
+            max_lon: i32::try_from(ceil_div(max_nano_lon, 100)).ok()?,
         })
-    } else {
-        None
-    };
+    });
 
     Some(BlobIndex { kind: ElemKind::Node, min_id, max_id, count, bbox })
 }

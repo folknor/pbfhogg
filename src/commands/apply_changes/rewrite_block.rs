@@ -103,9 +103,10 @@ pub(super) fn rewrite_block_parallel(
         // The `osm_id_cmp` here is coherent with the `osm_id_key` bounds used
         // to slice `inline_upserts` in `streaming::upsert_slice` ONLY if the
         // base block iterates in canonical OSM order. Apply-changes enforces
-        // this via the `is_sorted()` precondition in `rewrite.rs`; any future
-        // caller that bypasses the sort gate must re-establish the invariant
-        // or the cursor may skip past upserts and drop creates.
+        // this via the unconditional `is_sorted()` precondition in
+        // `rewrite.rs::build_header_bytes`; any future caller that bypasses
+        // the sort gate must re-establish the invariant or the cursor may
+        // skip past upserts and drop creates.
         while upsert_cursor < inline_upserts.len() && crate::osm_id::osm_id_cmp(inline_upserts[upsert_cursor], elem_id).is_lt() {
             let cid = inline_upserts[upsert_cursor];
             upsert_cursor += 1;

@@ -10,7 +10,7 @@ use std::path::Path;
 use common::{
     node_ids_with_coords as node_ids, read_all_elements_with_coords as read_all_elements,
     way_ids_with_coords as way_ids, relation_ids_with_coords as relation_ids,
-    write_test_pbf, TestMember, TestNode, TestRelation, TestWay,
+    write_test_pbf_sorted, TestMember, TestNode, TestRelation, TestWay,
 };
 use flate2::write::GzEncoder;
 use pbfhogg::block_builder::{self, BlockBuilder};
@@ -42,7 +42,7 @@ fn merge_basic_create_modify_delete() {
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &base,
         &[
             TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "one")], meta: None },
@@ -125,7 +125,7 @@ fn merge_create_between_existing_ids() {
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &base,
         &[
             TestNode { id: 10, lat: 0, lon: 0, tags: vec![], meta: None },
@@ -170,7 +170,7 @@ fn merge_create_beyond_max_id() {
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &base,
         &[
             TestNode { id: 1, lat: 0, lon: 0, tags: vec![], meta: None },
@@ -213,7 +213,7 @@ fn merge_multi_block_partial_rewrite() {
         let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
         let mut writer = PbfWriter::new(buf, Compression::default());
         let header =
-            block_builder::HeaderBuilder::new().build().expect("build header");
+            block_builder::HeaderBuilder::new().sorted().build().expect("build header");
         writer.write_header(&header).expect("write header");
         let mut bb = BlockBuilder::new();
 
@@ -293,7 +293,7 @@ fn merge_nodes_only_diff_ways_passthrough() {
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &base,
         &[
             TestNode { id: 1, lat: 0, lon: 0, tags: vec![], meta: None },
@@ -339,7 +339,7 @@ fn merge_ways_only_diff() {
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &base,
         &[
             TestNode { id: 1, lat: 0, lon: 0, tags: vec![], meta: None },
@@ -387,7 +387,7 @@ fn merge_relations_only_diff() {
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &base,
         &[TestNode { id: 1, lat: 0, lon: 0, tags: vec![], meta: None }],
         &[TestWay { id: 10, refs: vec![1], tags: vec![], meta: None }],
@@ -455,7 +455,7 @@ fn merge_all_types() {
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &base,
         &[
             TestNode { id: 1, lat: 0, lon: 0, tags: vec![], meta: None },
@@ -537,7 +537,7 @@ fn merge_delete_entire_block() {
         let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
         let mut writer = PbfWriter::new(buf, Compression::default());
         let header =
-            block_builder::HeaderBuilder::new().build().expect("build header");
+            block_builder::HeaderBuilder::new().sorted().build().expect("build header");
         writer.write_header(&header).expect("write header");
         let mut bb = BlockBuilder::new();
 
@@ -596,7 +596,7 @@ fn merge_stats_accuracy() {
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &base,
         &[
             TestNode { id: 1, lat: 0, lon: 0, tags: vec![], meta: None },
@@ -659,7 +659,7 @@ fn merge_metadata_preservation() {
         let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
         let mut writer = PbfWriter::new(buf, Compression::default());
         let header =
-            block_builder::HeaderBuilder::new().build().expect("build header");
+            block_builder::HeaderBuilder::new().sorted().build().expect("build header");
         writer.write_header(&header).expect("write header");
         let mut bb = BlockBuilder::new();
 
@@ -1307,7 +1307,7 @@ fn merge_basic_create_modify_delete_direct_io() {
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &base,
         &[
             TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "one")], meta: None },
@@ -1417,7 +1417,7 @@ fn merge_basic_create_modify_delete_uring() {
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &base,
         &[
             TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "one")], meta: None },
@@ -1529,7 +1529,7 @@ fn merge_gap_creates_between_blobs() {
     let output = dir.path().join("output.osm.pbf");
 
     // Base: nodes 10, 20, 30 and ways 100, 200
-    write_test_pbf(
+    write_test_pbf_sorted(
         &base,
         &[
             TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
@@ -1608,7 +1608,7 @@ fn merge_type_transition_node_to_relation_skipping_ways() {
     let output = dir.path().join("output.osm.pbf");
 
     // Base: nodes + relations, NO ways
-    write_test_pbf(
+    write_test_pbf_sorted(
         &base,
         &[
             TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },

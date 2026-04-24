@@ -242,7 +242,19 @@ pub fn renumber_external(
 
     // Single shared IdSet - pre-allocate all chunks for the max
     // node ID so workers can use set_atomic(&self) concurrently.
-    let max_node_id = pass1_schedule.last().map_or(0, |t| t.max_id);
+    //
+    // Scan the full schedule for max_id rather than trusting "last
+    // blob's max_id == global max" (which holds only for a truthful
+    // Sort.Type_then_ID header). A header that falsely advertises
+    // sorted with content that is not would otherwise let a later
+    // blob's id overshoot the pre-allocated bitset and panic in
+    // `IdSet::set_atomic` with an opaque "pre_allocate only covers..."
+    // message. O(N) in schedule length, called once at startup.
+    let max_node_id = pass1_schedule
+        .iter()
+        .map(|t| t.max_id)
+        .max()
+        .unwrap_or(0);
     let mut node_id_set = crate::idset::IdSet::new();
     node_id_set.pre_allocate(max_node_id);
 

@@ -26,6 +26,27 @@ use crate::{Element, PrimitiveBlock};
 
 use super::{DiffOptions, DiffStats};
 
+// Fault-injection hooks for tests. Gated behind the `test-hooks`
+// Cargo feature; release builds don't compile this module at all.
+// Static atomics rather than per-instance config because the hook
+// wants to fire on a specific shard index, inside the per-shard
+// scope.spawn closure, and threading a config through every entry
+// point would be invasive. Tests serialize via `--test-threads=1`.
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Shard index at which `run_shard` panics. `usize::MAX` =
+    /// disarmed (default). Call [`reset`] at the start AND end of
+    /// any test that arms this so sibling tests don't inherit state.
+    pub static PANIC_AT_SHARD_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+    /// Disarm the hook.
+    pub fn reset() {
+        PANIC_AT_SHARD_IDX.store(usize::MAX, Ordering::Relaxed);
+    }
+}
+
 fn io_err(e: io::Error) -> crate::error::Error {
     crate::error::new_error(crate::error::ErrorKind::Io(e))
 }
@@ -264,6 +285,19 @@ fn run_shard(
     options: &DiffOptions,
     scratch_dir: &Path,
 ) -> Result<ShardOutput> {
+    // Test-only: arm via `test_hooks::PANIC_AT_SHARD_IDX`. Simulates a
+    // mid-phase shard crash. The caller's `scope.spawn(...).join()`
+    // path turns the panic into an `Err("shard worker panicked")` and
+    // the surrounding cleanup pass sweeps every possible per-shard
+    // scratch file. Release builds compile this out entirely.
+    #[cfg(feature = "test-hooks")]
+    {
+        use std::sync::atomic::Ordering;
+        if test_hooks::PANIC_AT_SHARD_IDX.load(Ordering::Relaxed) == shard_idx {
+            panic!("test-hooks: diff/parallel shard {shard_idx} panicking");
+        }
+    }
+
     let type_char = kind_type_char(kind);
     let text_path = shard_text_path(scratch_dir, kind, shard_idx);
     let file = std::fs::File::create(&text_path).map_err(io_err)?;

@@ -77,14 +77,15 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
 `fault_injection_parallel_writer_pool_panic_surfaces_error` in
 `tests/apply_changes_invariants.rs` and
 `fault_injection_parallel_gzip_worker_panic_surfaces_via_finish` /
-`fault_injection_uring_writer_dispatch_panic_surfaces_via_flush` in
+`fault_injection_uring_writer_dispatch_panic_surfaces_via_flush` /
+`fault_injection_diff_parallel_shard_panic_surfaces_and_sweeps_scratch` in
 `tests/fault_injection.rs` are `#[ignore]`d because their fault-injection hooks are
 **process-global static atomics** that race with any concurrently-running test that
-uses the same pipeline (most apply-changes / derive-changes tests do). They require
-single-threaded execution to be deterministic. Run via `brokkr test <name>` (which
-always adds `--test-threads=1`) or `cargo test -- --ignored --test-threads=1`. The
-canonical `fault_injection_worker_panic_surfaces_error_and_leaves_scratch_clean` test
-in the same file is **not** ignored because its hook is per-instance
+uses the same pipeline (most apply-changes / derive-changes / diff tests do). They
+require single-threaded execution to be deterministic. Run via `brokkr test <name>`
+(which always adds `--test-threads=1`) or `cargo test -- --ignored --test-threads=1`.
+The canonical `fault_injection_worker_panic_surfaces_error_and_leaves_scratch_clean`
+test in the same file is **not** ignored because its hook is per-instance
 (`MergeOptions::panic_at_blob_seq`) and has no shared-state hazard.
 
 The uring fault-injection test additionally skips gracefully on hosts whose
@@ -746,12 +747,34 @@ infrastructure first).
   `RLIMIT_MEMLOCK` (needs 16 MB; dev hosts default to 8 MB) so
   it stays clean under environments it can't exercise.
 
-  Remaining pipelines to cover: `diff/parallel.rs`,
-  `derive_parallel.rs`, altw external stages 3/4, geocode Pass 3
-  Stage A. Hook-shape picker: per-instance field when the pipeline
-  has a public config struct on its entry path, static atomics
-  otherwise. Scratch tracking helpers: `common::snapshot_dir` and
+  `diff/parallel.rs` landed 2026-04-24: `PANIC_AT_SHARD_IDX`
+  atomic, check at the top of `run_shard`. Canonical test
+  (`fault_injection_diff_parallel_shard_panic_surfaces_and_sweeps_scratch`)
+  confirms a shard panic propagates via `thread::scope`'s join
+  into `scope.spawn(...).join().unwrap_or_else(|_| Err(...))`,
+  the post-join cleanup pass sweeps every per-shard scratch file,
+  and `diff()` returns `Err`. Also verifies no unexpected files
+  remain under the scratch dir after the panic path - pins the
+  existing cleanup logic in place.
+
+  Remaining pipelines to cover: `derive_parallel.rs`,
+  altw external stages 3/4, geocode Pass 3 Stage A. Hook-shape
+  picker: per-instance field when the pipeline has a public config
+  struct on its entry path, static atomics otherwise. Scratch
+  tracking helpers: `common::snapshot_dir` and
   `common::assert_scratch_unchanged`.
+
+  **Consolidation opportunity (deferred):** the four static-atomic
+  `test_hooks` submodules (`parallel_writer`, `parallel_gzip`,
+  `uring_writer`, and the coming shard-parallel / external-sort
+  entries) are structurally identical - a `PANIC_AT_*` + `*_COUNT`
+  pair plus `reset()`. If the underlying pipelines converge in a
+  later refactor (writer-pool abstraction, unified shard
+  dispatcher, etc.) these hooks should fold into a shared
+  `write::test_hooks` or similar. For now, keep them per-module
+  so each test is explicit about which pipeline it's injecting
+  into. Revisit once we have >= 5 static-atomic hooks and
+  see obvious grouping in the underlying code.
 
 - [ ] **`jobs == 1` apply-changes worker-panic deadlock.** With a
   single worker and a worker panic, the scanner blocks on a full

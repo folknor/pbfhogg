@@ -15,6 +15,14 @@ pub mod derive;
 pub(crate) mod derive_parallel;
 pub(crate) mod parallel;
 
+// Under the `test-hooks` feature, expose the shard-panic hook so
+// integration tests can arm it. The rest of `parallel` stays
+// crate-private.
+#[cfg(feature = "test-hooks")]
+pub mod parallel_test_hooks {
+    pub use super::parallel::test_hooks::{PANIC_AT_SHARD_IDX, reset};
+}
+
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;

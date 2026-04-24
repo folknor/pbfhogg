@@ -401,14 +401,22 @@ requirement) surfaces:
    primitive level; single-threaded call-site; preserves
    `fadvise(RANDOM)`. Days; would also benefit `getid`,
    `apply_changes::scanner`, `inspect/scan.rs` if generalised.
-3. **Streaming `posix_fadvise(DONTNEED)` on the BufReader path.**
-   Revert to `FileReader` + `fadvise(SEQUENTIAL)` (keeps the fast
-   walk), but call `posix_fadvise(DONTNEED)` on each consumed 256 MB
-   region as pass 1 progresses. Total IO stays at 34 GB but resident
-   cache stays bounded - stops polluting the page cache for
-   concurrent workloads. Zero wall impact on europe-to-HDD (pass 2
-   doesn't reuse the cache) but harmless there; likely positive on
-   hosts with concurrent memory pressure. Hours.
+3. **Streaming `posix_fadvise(DONTNEED)` on the BufReader path
+   [TRIED 2026-04-24, REJECTED - zero-sum trade].** Implemented
+   as `BufReader<File>` + `fadvise(SEQUENTIAL)` walk with
+   `posix_fadvise(DONTNEED)` at 64 MB intervals, on top of commit
+   `1f97fae`. Measured on europe (`53.8 s`, honest second run
+   after cache drained): beat walker's 68.0 s by -21 %, matched
+   pre-walker baseline 56.3 s. Cache-hygiene property worked:
+   cleanup majflt 35 k → 0, no `SORT_PASS2_END` thrashing.
+   Measured on planet: **136.3 s, +11 % regression vs walker**.
+   M3 gives up the walker's pass-1 IO reduction (20 s BufReader
+   vs 6.7 s walker on planet), which the europe win doesn't
+   compensate for at the scale that matters. Summed across
+   europe + planet, M3 total wall ≈ walker total wall; walker
+   wins the tiebreaker because planet is production. First
+   europe M3 run logged 45.4 s - cache-warm artifact from
+   earlier session runs, not the honest number.
 4. **`HeaderWalker` with `fadvise(SEQUENTIAL)` on the fd.** Opt-in
    flag on the walker primitive to use SEQUENTIAL instead of RANDOM.
    Restores async readahead pipelining for the monotonic
@@ -416,9 +424,9 @@ requirement) surfaces:
    essentially BufReader semantics with a different code path.
    Collapses back to the pre-walker behavior; not a distinct win.
 
-If the europe regression later matters: #1 or #2 recover wall,
-#3 is a cheap halfway point (keep BufReader's wall, lose only the
-cache pollution).
+If the europe regression later matters: #1 or #2 recover wall
+without giving up the planet walker win. #3 proven not worth it
+(zero-sum trade). #4 is a non-distinct variant of pre-walker.
 
 Recent instrumentation: commit `4e3c7ea` (2026-04-22) added phase
 markers (`SORT_INDEX_BUILD`, `SORT_OVERLAP_DETECT`,

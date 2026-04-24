@@ -3,79 +3,20 @@
 Date: 2026-04-24
 Status: Accepted
 
-## Context
-
-Cluster 2 of the 0.3.0 bug sweep consolidated five findings where
-pbfhogg trusts producer-side invariants on hostile or corrupt input:
-
-- `renumber/mod.rs:240` - `max_node_id = pass1_schedule.last().max_id`
-  assumes the last node blob has the global max ID. True under
-  `Sort.Type_then_ID`; on a header that lies about sortedness, a
-  later blob's ID can overshoot the pre-allocated `IdSet` and
-  `set_atomic` panics in `chunk_for_atomic` with "pre_allocate only
-  covers...".
-- `altw/external/stage1.rs:269-273` + `stage2.rs:459-493` - the stage
-  2 blob-local rank counter trusts indexdata `(min_id, max_id)` to
-  tightly bracket actual node IDs. Loose bounds in release silently
-  produced skewed ranks, scrambling the join. (The tail check at
-  stage2.rs:488 was promoted to hard `Err` on 2026-04-23 in commit
-  `ab01438`, closing most of this; stage 1 still needed a
-  sanity-check on `max_id < min_id`.)
-- `blob_meta/scan_ids.rs:192-202` - the decimicrodegree bbox
-  conversion multiplies `granularity * raw_lat` as `i64` without
-  overflow checking. Adversarial `granularity` (e.g. `i32::MAX`)
-  combined with extreme deltas wraps silently in release and
-  serializes a bogus bbox into indexdata that every spatial filter
-  downstream trusts.
-- `renumber/wire_rewrite.rs:486-491` - `memids_count` and
-  `types_count` were derived by counting varint-terminator bytes.
-  A malformed trailing varint or extraneous trailing byte miscounts
-  and causes the subsequent decode loop to misalign rather than
-  error cleanly.
-- `apply_changes/rewrite_block.rs:103` - upsert slicing assumes
-  `Sort.Type_then_ID` order. The `is_sorted()` check fired only for
-  `--locations-on-ways`; the general path silently accepted
-  unsorted headers and could drop creates whose IDs crossed block
-  boundaries in an unexpected order.
-
-An osmium audit (ADR-0002 context) also surfaced that osmium's own
-`derive-changes` has a symmetric defensive gap at
-`command_derive_changes.cpp:184`. The class of bug - "trust the
-producer, fail obscurely when the producer lies" - is ecosystem-wide,
-not pbfhogg-specific.
-
-Four options were on the table:
-
-- **(a) Defend every read.** Check every producer invariant
-  unconditionally on the read side.
-- **(b) Promote `debug_assert` -> hard `Err` where cheap.** Target
-  only sites where the check is once-per-blob or once-per-transition.
-- **(c) Document "inputs must be tight" and invest in the test-shape
-  gap.** Keep runtime behavior as-is; build the fixture
-  infrastructure so CI catches regressions.
-- **(d) Hybrid of (b) + (c).** Promote the five findings AND build
-  the fixtures.
-
 ## Decision
 
-Option **(d)**. Promote each of the five findings to a hard error at
-the earliest once-per-blob or once-per-transition checkpoint, AND
-introduce `tests/cluster2_defensive_input.rs` as the seed for a
-lying-input fixture suite.
+When a site reads a producer-controlled field that drives a
+pre-allocation, a pointer-arithmetic step, or a structural
+assumption, verify it at the boundary and surface a specific error
+naming the offending field and blob. `debug_assert!` is fine for
+per-element invariants where release-mode cost would be visible; it
+is *not* fine for per-blob or one-shot invariants where the
+release-mode failure mode is silent data corruption.
 
-Code rule going forward: when a site reads a producer-controlled
-field that drives a pre-allocation, a pointer-arithmetic step, or a
-structural assumption, verify it at the boundary and surface a
-specific error naming the offending field and blob. `debug_assert!`
-is fine for per-element invariants where release-mode cost would be
-visible; it is not fine for per-blob or one-shot invariants where
-the release-mode failure is silent data corruption.
-
-Fixture rule going forward: when a new defensive check is added, a
-regression test exercising the malformation pattern lands in the
-same commit if feasible, or an entry is added to
-`tests/cluster2_defensive_input.rs`'s TODO list if byte-level
-mutation is required and the helper doesn't yet exist.
+When a new defensive check lands, a regression test exercising the
+malformation pattern lands in the same commit if feasible; otherwise
+an entry is added to `tests/cluster2_defensive_input.rs`'s TODO list
+for the byte-level fixture helper that would make the test writable.
 
 ## Alternatives considered
 

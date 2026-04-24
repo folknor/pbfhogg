@@ -265,14 +265,23 @@ pub(super) fn reframe_ways_with_new_ids(
 
                 let mut way_cursor = Cursor::new(way_bytes);
                 while let Some((wf, wt)) = way_cursor.read_tag().map_err(|e| e.to_string())? {
-                    // tag_start = position before read_raw_field consumed the value
+                    // tag_start = position before read_raw_field consumed the value.
+                    // The `val_start - 1` single-byte tag is only correct for
+                    // protobuf field numbers <= 15 (tag byte continuation-bit
+                    // clear). If a future PBF schema adds a field >= 16 the
+                    // rewriter has to splice here, the debug_assert traps the
+                    // class in test rather than letting it splice mid-varint.
                     let val_start = way_bytes.len() - way_cursor.remaining();
                     if wf == 1 && wt == WIRE_VARINT {
+                        debug_assert!(way_bytes[val_start - 1] < 0x80,
+                            "way field 1 tag byte has continuation bit set; field >= 16 schema extension?");
                         let tag_start = val_start - 1; // field 1 varint tag = 1 byte
                         old_way_id = way_cursor.read_varint_i64().map_err(|e| e.to_string())?;
                         let val_end = way_bytes.len() - way_cursor.remaining();
                         id_range = Some((tag_start, val_end));
                     } else if wf == 8 && wt == WIRE_LEN {
+                        debug_assert!(way_bytes[val_start - 1] < 0x80,
+                            "way field 8 tag byte has continuation bit set; field >= 16 schema extension?");
                         let tag_start = val_start - 1; // field 8 varint tag = 1 byte
                         old_refs_data = way_cursor.read_len_delimited().map_err(|e| e.to_string())?;
                         let val_end = way_bytes.len() - way_cursor.remaining();
@@ -474,15 +483,21 @@ pub(super) fn reframe_relations_with_new_ids(
 
                 let mut rel_cursor = Cursor::new(rel_bytes);
                 while let Some((rf, rt)) = rel_cursor.read_tag().map_err(|e| e.to_string())? {
+                    // Same single-byte-tag invariant as the way branch above:
+                    // `val_start - 1` is only correct for field numbers <= 15.
                     let val_start = rel_bytes.len() - rel_cursor.remaining();
                     match (rf, rt) {
                         (1, WIRE_VARINT) => {
+                            debug_assert!(rel_bytes[val_start - 1] < 0x80,
+                                "relation field 1 tag byte has continuation bit set; field >= 16 schema extension?");
                             let tag_start = val_start - 1; // field 1 tag = 0x08, 1 byte
                             old_rel_id = rel_cursor.read_varint_i64().map_err(|e| e.to_string())?;
                             let val_end = rel_bytes.len() - rel_cursor.remaining();
                             id_range = Some((tag_start, val_end));
                         }
                         (9, WIRE_LEN) => {
+                            debug_assert!(rel_bytes[val_start - 1] < 0x80,
+                                "relation field 9 tag byte has continuation bit set; field >= 16 schema extension?");
                             let tag_start = val_start - 1; // field 9 tag = 0x4A, 1 byte
                             old_memids_data = rel_cursor.read_len_delimited().map_err(|e| e.to_string())?;
                             let val_end = rel_bytes.len() - rel_cursor.remaining();

@@ -104,6 +104,18 @@ impl PbfWriter<FileWriter> {
     /// when the pipeline is I/O-bound (e.g. `Compression::None` on fast storage).
     ///
     /// Requires the `linux-io-uring` feature and Linux 5.1+.
+    ///
+    /// # Latent blocking scenario
+    ///
+    /// Startup waits on `init_rx.recv()` until the writer thread either
+    /// sends an init result or drops its sender. If a buggy kernel left
+    /// the writer thread wedged inside a uring setup syscall
+    /// (`register_buffers`, `register_files`) without ever returning, this
+    /// recv blocks indefinitely. Not reached on any observed kernel; the
+    /// correct remediation, if ever needed, is `recv_timeout` - but
+    /// picking a value is fraught (too short kills slow-init on a loaded
+    /// host, too long doesn't help the wedged-kernel case) and should be
+    /// driven by a real reproducer rather than speculation.
     #[cfg(feature = "linux-io-uring")]
     pub fn to_path_uring(
         path: &Path,

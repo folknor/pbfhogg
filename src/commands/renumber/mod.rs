@@ -94,6 +94,9 @@ use stage2::stage2d_parallel_way_assembly;
 // ---------------------------------------------------------------------------
 
 pub(super) const PASS1_WORKERS: usize = 4;
+/// Parallel way-assembly workers in stage 2d. Must be >= 1; the per-worker
+/// `IdSet` merge at the R1 boundary calls `way_id_sets.remove(0)` which
+/// panics on an empty vec.
 pub(super) const STAGE2D_WORKERS: usize = 6;
 
 // ---------------------------------------------------------------------------
@@ -322,6 +325,10 @@ pub fn renumber_external(
 
     // Merge per-worker way_id_sets built during stage 2d.
     let t_way_merge = std::time::Instant::now();
+    debug_assert!(
+        STAGE2D_WORKERS >= 1 && !way_id_sets.is_empty(),
+        "STAGE2D_WORKERS must be >= 1: way_id_sets.remove(0) panics on an empty vec"
+    );
     let mut way_id_set = way_id_sets.remove(0);
     for other in way_id_sets {
         way_id_set.merge(other);

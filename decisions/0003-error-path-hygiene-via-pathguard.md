@@ -3,52 +3,14 @@
 Date: 2026-04-24
 Status: Accepted
 
-## Context
-
-Cluster 3 of the 0.3.0 bug sweep consolidated four findings that all
-shared a root cause: on a mid-stream error, pbfhogg's recorded state
-(summary counters, output artifacts, scratch directories) diverged
-from the work actually emitted to the user.
-
-- `renumber/relations.rs:297-298` - counter drift: `rels_written`
-  bumped in the worker before `tx.send`, while `r2d_orphans` bumped
-  in the consumer after reorder. A mid-stream error left the two
-  counters inconsistent with each other and with output.
-- `renumber/mod.rs:256-262` - half-written output: the
-  `nodes_written != pass1_total_nodes` check aborted *after* pass 1
-  output had been written and stage 2d was about to run, leaving a
-  partial file on disk with no cleanup.
-- `geocode_index/builder/pass3.rs:229-231` - bucket-dir leak:
-  bucket dirs were blown away on *entry* but not on mid-Stage-A
-  error; a crash left ~256 temp files per bucket dir, only swept by
-  the *next* build's entry-time `remove_dir_all`.
-- `geocode_index/builder/pass3.rs:152-167` - silent truncation:
-  `parse_bucket_file` divided file size by record size, silently
-  truncating any trailing partial record. A Stage A `ENOSPC` or
-  SIGKILL mid-flush produced a partial file that Stage B accepted
-  silently, dropping real cell assignments.
-
-Two cross-cutting patterns: **counter drift on error** (fix: move
-counter bumps to the consumer, after successful write) and
-**partial-artifact cleanup on abort** (fix: RAII guard on every
-final-output and scratch path).
-
-Four options were on the table:
-
-- **(a) Shared primitive + shared rule.**
-- **(b) Fix each site with its own bespoke shape.**
-- **(c) Narrow scope to corruption-class only** (items 3 and 4 are
-  actual correctness hazards; close items 1 and 2 with a
-  documented "counters are best-effort on error paths" note).
-- **(d) Close the entire cluster as documented-accepted** (minor
-  severity on error paths that are already user-visible via a
-  returned error).
-
 ## Decision
 
-Option **(a)**: a shared RAII primitive plus a counter-ordering
-rule. No hot-path cost; every future command with file output or
-scratch inherits the pattern by following the checklist below.
+On a mid-stream error, pbfhogg's recorded state (summary counters,
+output artifacts, scratch directories) must not diverge from work
+actually emitted. Enforce via a shared RAII primitive plus a
+counter-ordering rule. No hot-path cost; every future command with
+file output or scratch inherits the pattern by following the
+checklist below.
 
 **Primitive:** `src/path_guard.rs::PathGuard`. Wraps a `PathBuf` and
 removes the pointed-at file or directory on Drop, unless `commit()`
@@ -137,4 +99,5 @@ user-facing summary counters must match output.
 ## Cross-references
 
 - `src/path_guard.rs` - the primitive.
-- Commit `a1e16d9` (2026-04-24) - the Cluster 3 landing.
+- Commit `a1e16d9` (2026-04-24) - the PathGuard primitive and
+  counter-ordering landing.

@@ -34,11 +34,18 @@ Don't add one when:
 ## File naming and numbering
 
 `decisions/NNNN-short-kebab-title.md`, zero-padded to four digits.
-Numbers are monotonic and never reused. When an ADR is superseded, the
+Numbers are monotonic and never reused. Filenames must be *timeless* -
+no version numbers, release labels, or calendar dates. An ADR is a
+permanent decision or it isn't an ADR. When an ADR is superseded, the
 old one stays in place with status `Superseded by NNNN` and the new one
 links back with `Supersedes NNNN`.
 
 ## Skeleton
+
+The document is read top-to-bottom by someone with no conversational
+context. Lead with the decision, not the backstory. Assume the reader
+hasn't read the bug sweep, the ticket, or the email thread that led
+here. Minimise preamble.
 
 ```markdown
 # ADR-NNNN: Short title (imperative mood)
@@ -46,15 +53,12 @@ links back with `Supersedes NNNN`.
 Date: YYYY-MM-DD
 Status: Accepted | Superseded by NNNN | Rejected
 
-## Context
-
-What situation or findings motivated this decision. Link to relevant
-code, TODO items, external references. Keep it tight: enough for a
-future reader with no prior context to understand the problem.
-
 ## Decision
 
-What we decided, stated as a rule or convention. One short paragraph.
+What we decided, stated as a rule or convention the reader can apply
+immediately. One short paragraph. No history, no options survey, no
+walk through how we got here - just the rule. If the decision needs
+framing, one sentence of scope is enough.
 
 ## Alternatives considered
 
@@ -78,6 +82,12 @@ or code that enforces the decision. Optional; include when a reader
 would benefit from the adjacent context.
 ```
 
+Note: a `Context` section is deliberately omitted from the skeleton.
+If the Decision section needs a sentence of framing to stand alone,
+put it right under the Decision heading. Don't narrate the situation
+that led to the decision - that's what git log and the linked bug
+sweep are for.
+
 ## Interaction with other docs
 
 - **`DEVIATIONS.md`** owns the "how we differ from osmium" comparison
@@ -93,14 +103,15 @@ would benefit from the adjacent context.
   establishes a coding rule, a one-liner in `CLAUDE.md` can mirror it
   with a pointer to the ADR.
 - **`TODO.md`** cites ADRs from decision paragraphs at the top of each
-  cluster; the ADR cites TODO.md back only if the follow-up list is
-  substantial.
+  bug-sweep cluster; the ADR cites `TODO.md` back only if the follow-up
+  list is substantial. An ADR should not name a specific bug-sweep
+  cluster or release label in its title or filename; cluster labels
+  live in `TODO.md` and evolve, the ADR stays.
 
 ## Index
 
-- [ADR-0001](0001-recluster-0.3.0-sweep-by-policy-question.md) -
-  Organize the 0.3.0 pre-release bug sweep by policy cluster, not
-  subsystem.
+- [ADR-0001](0001-organize-bug-sweep-by-policy-cluster.md) -
+  Organize bug-sweep residue by policy cluster, not subsystem.
 - [ADR-0002](0002-negative-ids-rejected-project-wide.md) - Negative
   input IDs rejected project-wide; hard reject in renumber,
   `debug_assert` in diff / derive shard planners.
@@ -109,5 +120,9 @@ would benefit from the adjacent context.
   counters-after-write rule.
 - [ADR-0004](0004-defensive-input-errors-and-fixtures.md) -
   Defensive handling of adversarial or malformed input: promote
-  five indexdata/varint/sortedness-trust sites to hard errors at
+  indexdata/varint/sortedness-trust sites to hard errors at
   once-per-blob boundaries, seed a lying-input test fixture suite.
+- [ADR-0005](0005-latent-invariant-debug-asserts.md) - Cheap
+  insurance for latent-only invariants: triage rule of
+  `debug_assert` + comment / doc-only / drop-from-triage, no
+  blanket sweep.

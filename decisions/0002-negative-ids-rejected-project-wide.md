@@ -3,52 +3,20 @@
 Date: 2026-04-24
 Status: Accepted
 
-## Context
-
-Cluster 1 of the 0.3.0 bug sweep consolidated four findings about
-negative OSM IDs:
-
-- `renumber/wire_rewrite.rs:519-524` - the relation-member-ref path
-  lets a negative ref flow through `resolve` unchanged and bumps the
-  orphan counter, rather than rejecting like the node and way paths
-  already do (commit `ab01438`).
-- `diff/parallel.rs:138-142` + `derive_parallel.rs:136-142` - the
-  shard planner builds thresholds via raw `i64` compare while the
-  element-merge hot path uses canonical `osm_id_cmp` ordering;
-  mixed-sign inputs would silently mis-shard.
-- Two sibling findings in the same files for single-sided emit and
-  `merge_up_to` bounds, same root cause.
-
-`DEVIATIONS.md` already claimed pbfhogg "rejects negative input IDs"
-as an intentional osmium divergence, with the rationale that renumber
-uses `IdSet` bitsets indexed by unsigned IDs and supporting negatives
-would need new data structure work. But the claim overstated coverage:
-the reject only applied at the renumber node and way entry points.
-
-An audit of libosmium and osmium-tool confirmed osmium goes the other
-direction - negatives are affirmatively supported as JOSM-staging IDs
-via a canonical `id_order` (`0 -> negatives by abs value -> positives
-by abs value`) documented in `include/osmium/osm/object_comparisons.hpp`
-and `osmium-tool`'s `renumber` / `sort` man pages.
-
-Three options were on the table:
-
-- **(a) Reject at input boundaries everywhere** - reject negatives
-  wherever they enter the pipeline, not just at `IdSet` sites.
-- **(b) Full osmium-style support** - adopt canonical `id_order`,
-  split / widen `IdSet`, interleave renumbered output per osmium's
-  convention.
-- **(c) Document positive-only project-wide, hard-reject at `IdSet`
-  entry points, `debug_assert` at shard-planner sites.**
-
 ## Decision
 
-Option **(c)**. Treat "all production PBFs are positive-only" as a
-project-wide invariant. Enforce it with a hard reject at every site
-where a negative ID could flow into `IdSet` (renumber node / way /
-relation-member paths); gate the latent shard-planner sites with
-`debug_assert!` on descriptor `min_id >= 0` at planner entry. Do not
-redesign `IdSet` or canonicalize the shard-planner compares today.
+Treat "all production PBFs are positive-only" as a project-wide
+invariant. Enforce it with a hard reject at every site where a
+negative ID could flow into `IdSet` (renumber node / way /
+relation-member paths); gate latent shard-planner sites in `diff` and
+`derive-changes` with `debug_assert!` on descriptor `min_id >= 0` at
+planner entry. Do not redesign `IdSet` or canonicalize the
+shard-planner compares today.
+
+osmium goes the other way - negatives are affirmatively supported as
+JOSM-staging IDs via a canonical `id_order` (0 → negatives by abs
+value → positives by abs value). We diverge because `IdSet` is
+unsigned-indexed and no user has asked for JOSM interop.
 
 ## Alternatives considered
 
@@ -91,7 +59,8 @@ redesign `IdSet` or canonicalize the shard-planner compares today.
 - `CHANGELOG.md` - broadened the pre-existing `renumber` negative-ID
   bug entry to cover both triggers (stale indexdata; inconsistent
   input with negative relation member refs).
-- `TODO.md` - all four Cluster 1 items marked landed.
+- `TODO.md` - all four negative-ID findings in the policy-clustered
+  bug sweep marked landed.
 - **Follow-up triggered by:** any user report of needing JOSM
   staging-file interop. If that lands, reopen this ADR as
   `Superseded by NNNN` and migrate to (b).
@@ -103,4 +72,4 @@ redesign `IdSet` or canonicalize the shard-planner compares today.
   path.
 - Commit `ab01438` (2026-04-23) - the earlier unconditional-reject
   landing this ADR builds on.
-- Commit `f6834de` (2026-04-24) - the Cluster 1 landing.
+- Commit `f6834de` (2026-04-24) - negative-ID enforcement landing.

@@ -667,10 +667,15 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
     /// pattern of "skip the just-read blob body forward", use the internal
     /// `skip_blob_body` helper which routes through [`BlobReaderSource::skip_relative`]
     /// to preserve the buffer when possible.
+    ///
+    /// A successful seek clears the sticky error state set by a previous
+    /// failing `next()`, so callers that recover from a parse error by
+    /// seeking past the bad blob can resume iteration.
     pub fn seek_raw(&mut self, pos: SeekFrom) -> Result<u64> {
         match self.reader.seek(pos) {
             Ok(offset) => {
                 self.offset = Some(ByteOffset(offset));
+                self.last_blob_ok = true;
                 Ok(offset)
             }
             Err(e) => {

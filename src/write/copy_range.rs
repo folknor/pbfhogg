@@ -59,6 +59,14 @@ pub(crate) fn copy_range(
 }
 
 /// Fallback for cross-device copies: pread from `in_fd` at `offset`, write to `out_fd`.
+///
+/// **Single-threaded output only.** Uses position-based `write_all`, which
+/// advances `out_fd`'s file position. Parallel writers that call
+/// `pwrite`/`write_at` on the same `out_fd` concurrently with this helper
+/// would race on the implicit position and produce a torn output.
+/// `parallel_writer::copy_range_fallback_pwrite` is the pwrite-based
+/// sibling for parallel contexts; new parallel callers should use that
+/// primitive rather than reaching for this one.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn copy_range_fallback(
     in_fd: RawFd,

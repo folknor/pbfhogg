@@ -61,6 +61,7 @@
 - `add-locations-to-ways --index-type external` hit `EMFILE` on a default-ulimit shell. Fixed.
 - Parallel-pwrite cross-device passthrough copy could fail on a signal-interrupted `pread` instead of retrying, surfacing as a spurious I/O error when a signal (e.g. SIGWINCH) arrived during an EXDEV fallback. Fixed.
 - Parallel `derive-changes` scratch filenames could collide across concurrent `pbfhogg` processes when PIDs recycled in the same scratch directory (container restart). Process-lifetime random tag now included in the path.
+- `BlobReader::seek_raw` left iteration permanently stuck after a prior `next()` returned an error: the sticky `last_blob_ok` flag was never reset on successful seek, so `next()` returned `None` even though the user had recovered by seeking past the bad bytes. A successful `seek_raw` now clears the flag.
 
 ### Library
 

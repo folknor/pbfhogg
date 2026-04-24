@@ -306,6 +306,38 @@ fn blobreader_seek_raw() {
     assert!(reader.next().is_none());
 }
 
+/// seek_raw success clears the sticky error state left by a previous failing
+/// `next()`, so callers that recover by seeking past bad bytes can resume.
+#[test]
+fn blobreader_seek_raw_clears_error_state() {
+    // Bytes layout: [oversized blob header length | good PBF].
+    //  - The first 4 bytes claim a blob header of ~4 GB, tripping the
+    //    MAX_BLOB_HEADER_SIZE guard on the very first `next()` call.
+    //  - After the failure, `last_blob_ok = false` makes the reader sticky.
+    //  - Seeking past the 4 sentinel bytes should reset the state and let
+    //    iteration resume on the good PBF that follows.
+    let dir = TempDir::new().unwrap();
+    let good_path = dir.path().join("good.osm.pbf");
+    write_test_pbf(&good_path);
+    let good_bytes = std::fs::read(&good_path).unwrap();
+
+    let mut bytes = vec![0xFFu8, 0xFF, 0xFF, 0xFF]; // claimed header length = 0xFFFFFFFF
+    bytes.extend_from_slice(&good_bytes);
+
+    let mut reader = BlobReader::new(std::io::Cursor::new(bytes));
+
+    // First call: HeaderTooBig error; reader becomes sticky.
+    assert!(reader.next().unwrap().is_err());
+    assert!(reader.next().is_none(), "reader must stay dead until seek");
+
+    // Seek past the sentinel; state must clear.
+    reader.seek_raw(SeekFrom::Start(4)).unwrap();
+
+    // Iteration resumes on the good PBF.
+    let blob = reader.next().unwrap().unwrap();
+    assert_eq!(blob.get_type(), BlobType::OsmHeader);
+}
+
 /// next_header_skip_blob scans all headers without decoding blob content.
 #[test]
 fn blobreader_next_header_skip_blob() {

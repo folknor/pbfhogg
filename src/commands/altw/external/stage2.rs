@@ -69,7 +69,17 @@ fn prepare_bucket(
     } else {
         ((bucket_idx as u64 + 1) * rank_range_size).min(unique_nodes)
     };
-    let local_range = (bucket_rank_end - bucket_rank_start) as usize;
+    // `bucket_rank_start > unique_nodes` can only occur when the input has
+    // `unique_nodes < NUM_BUCKETS`, which today is blocked upstream by the
+    // `rank_bucket_counts[bucket_idx] == 0` early-continue in the caller
+    // (see stage2.rs::apply_slot_resolution). Using `saturating_sub` keeps
+    // the arithmetic safe if that guard is ever removed, and the
+    // `debug_assert` surfaces the invariant in test.
+    debug_assert!(
+        bucket_rank_start <= bucket_rank_end,
+        "bucket_rank_start {bucket_rank_start} > bucket_rank_end {bucket_rank_end} (bucket_idx={bucket_idx}, unique_nodes={unique_nodes}, rank_range_size={rank_range_size}); caller must skip empty buckets"
+    );
+    let local_range = bucket_rank_end.saturating_sub(bucket_rank_start) as usize;
 
     loader.counts.clear();
     loader.counts.resize(local_range, 0);

@@ -4,16 +4,96 @@ Live tracker for pbfhogg's test infrastructure and coverage. Cross-ref
 `reference/performance.md` for perf baselines and TODO.md's "Important:
 ignored tests" section for the runbook on tests that don't run by default.
 
+See [`testing-audit.md`](testing-audit.md) for the 2026-04-24 import
+surface audit that drove the reorg plan below.
+
 ## Status summary
 
-- **Test fixture infrastructure:** landed (2026-04-22). See [Landed](#landed) below.
-- **Fault-injection harness:** **complete across all 8 parallel pipelines**
-  (apply-changes streaming, parallel_writer, parallel_gzip, uring_writer,
-  diff/parallel, derive_parallel, altw external stage 3, geocode Pass 3
-  Stage A). Caught one real deadlock (apply-changes drain) and one real
-  scratch leak (derive_parallel outer temp files); both fixed along the way.
-- **Open work:** 10 items (T01-T10), loosely prioritized. Real-bug items
-  first, then high-leverage test-shape infrastructure, then opt-in.
+- **Test fixture infrastructure:** landed (2026-04-22).
+- **CliInvoker** for CLI-driven integration tests: landed (2026-04-24),
+  `tests/common/cli.rs`, smoke test in `tests/fixture_helpers.rs`. Zero
+  new dev-deps.
+- **Fault-injection harness:** complete across all 8 parallel pipelines.
+  Caught one real deadlock (apply-changes drain) and one real scratch
+  leak (derive_parallel outer temp files); both fixed along the way.
+  Eight tests still `#[ignore]`d due to shared-state races - the reorg
+  un-ignores them by splitting into per-binary files.
+- **CLI-decoupled test reorg:** plan below. Motivation: internal module
+  rewrites (ALTW stages, geocode passes, apply-changes pipeline) should
+  not break integration tests. Today 18 of 30 `tests/*.rs` import
+  internal command entrypoints or nested submodules and would need
+  edits under any such rewrite. Conversion in progress.
+
+## Reorg: CLI-decoupled integration tests
+
+**Thesis.** Integration tests in `tests/*.rs` must only touch the
+stable library allowlist (fixture builders, `BlobReader`,
+`ElementReader`, `PbfWriter`, `Element`, `MemberId`) or drive the
+`pbfhogg` binary via `CliInvoker`. Internal-module tests live inline
+in `src/**/*.rs` `#[cfg(test)] mod tests`, where they die with the
+module on rewrite - which is correct.
+
+**Five test layers end-to-end:**
+
+| Layer | Where | What it tests | Survives internal rewrites? |
+|---|---|---|---|
+| 1. Inline unit | `src/**/*.rs` `#[cfg(test)]` | Module internals, invariants on the code right next to it | Dies with the module (intentional) |
+| 2. Stable-API integration | `tests/roundtrip.rs`, `read_paths.rs`, `edge_cases.rs`, etc. | Public library API contracts (`PbfWriter`, `BlobReader`, `ElementReader`, ...) | Yes - stable allowlist only |
+| 3. CLI integration | `tests/cli_*.rs` | Command behavior: input PBF + flags → output PBF; internal modules invisible | Yes - drives binary |
+| 4. Fault injection | `tests/fault_*.rs` (one test per binary) | Error paths, panic recovery, scratch-dir cleanup in parallel pipelines | Partially - per-instance hooks on stable configs survive; static-atomic hooks on internals don't (acceptable: these tests are intentionally architecture-tied) |
+| 5. Cross-validation | `brokkr verify` | Output equivalence vs osmium/osmosis/osmconvert on real datasets | Yes - process-level |
+
+**Invocation:**
+
+| Command | Runs | When |
+|---|---|---|
+| `brokkr check` | Layers 1-4, excludes `#[ignore]`d | Every edit |
+| `brokkr check -- --include-ignored` | Adds `roundtrip_real` + `geocode_index` + the nightly-regression `sorted_flag_but_unsorted_nodes_panics` | Before release |
+| `brokkr test <name>` | Single test by substring | Debugging |
+| `brokkr verify all` | Layer 5 across every CLI command | Before release |
+
+**Stable allowlist** - imports from this set do not couple the test to
+an internal module shape:
+
+- `pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData, Metadata}`
+- `pbfhogg::writer::{PbfWriter, Compression}`
+- `pbfhogg::{BlobDecode, BlobError, BlobReader, BlobType, Element, ElementReader, ErrorKind, HeaderOverrides, MemberId, MemberType}`
+
+Everything else is non-stable and requires CLI conversion.
+
+**Conversion priority** (by rewrite-coupling × test count; see the
+audit doc for full reasoning):
+
+1. `cli_apply_changes.rs` - absorbs `merge.rs` + `apply_changes_invariants.rs` + `cluster2_defensive_input.rs` + `derive_changes.rs`. 51 tests, highest-traffic rewrite surface.
+2. `cli_diff.rs` + `cli_derive_changes.rs` - split for file size. 45 tests combined.
+3. `cli_extract.rs` - 27 tests, 9 non-stable symbols imported today.
+4. `cli_altw.rs` - 18 tests. Blocks ALTW rewrite (the motivating example).
+5. `cli_sort.rs`, `cli_cat.rs`, `cli_getid.rs`, `cli_tags_filter.rs`, `cli_merge_changes.rs`, `cli_renumber.rs`, `cli_tags_count.rs`, `cli_time_filter.rs` - 126 tests across 11 existing files, mechanical applications of the pattern once #1 is landed.
+
+**Known harness gap:** CLI binary feature parity across test sweeps
+is a brokkr-side concern, not a pbfhogg one. See
+[`testing-cli-feature-parity.md`](testing-cli-feature-parity.md) for
+the problem statement + proposed fix. Blocks feature-missing error
+tests for every CLI-gated flag (`--direct-io`, `--io-uring`) across
+all commands. Until the fix lands, the recommended fallback is
+inline unit tests in `src/commands/mod.rs` under
+`#[cfg(all(test, not(feature = "...")))]`.
+
+**Fault-injection split** - un-ignores all 8 tests, independent of
+the CLI conversion work:
+
+- Split `tests/fault_injection.rs` (+ the `apply-changes` panic test
+  currently in `apply_changes_invariants.rs`) into eight binaries:
+  `fault_apply_changes.rs`, `fault_parallel_writer.rs`,
+  `fault_parallel_gzip.rs`, `fault_uring_writer.rs`,
+  `fault_diff_parallel.rs`, `fault_derive_parallel.rs`,
+  `fault_altw_stage3.rs`, `fault_geocode_pass3.rs`. Each cargo
+  integration test file compiles to its own binary, so the
+  `PANIC_AT_*` static atomics are per-process and race-free without
+  `#[ignore]` or `--test-threads=1`.
+- Hook-consolidation note below becomes "explicitly don't consolidate"
+  - per-binary isolation relies on the atomics being distinct symbols
+  in distinct binaries.
 
 ## Conventions
 
@@ -24,31 +104,49 @@ ignored tests" section for the runbook on tests that don't run by default.
   by apply-changes via `MergeOptions::panic_at_blob_seq`; race-free with
   sibling tests) vs. process-global static atomics (used by writer-pool
   and shard-parallel pipelines whose workers are spawned deep inside
-  constructors; tests `#[ignore]`d to force single-threaded execution).
-  Picker: per-instance when the pipeline has a public config struct on
-  its entry path, static atomics otherwise.
+  constructors). Picker: per-instance when the pipeline has a public
+  config struct on its entry path, static atomics otherwise. Once the
+  fault-injection split lands, static-atomic hooks don't need
+  `#[ignore]` either - the per-binary isolation makes them race-free.
+- **CliInvoker for CLI-driven tests.** `tests/common/cli.rs`. Every
+  new `tests/cli_*.rs` goes through it. The binary is found via
+  `CARGO_TARGET_DIR` (or `CARGO_MANIFEST_DIR/target`) + debug/release
+  from `cfg!(debug_assertions)`. `brokkr check` and `brokkr test` both
+  build the binary as part of the workspace test run, so it exists by
+  the time a CLI test starts.
 - **Scratch tracking.** `tests/common/mod.rs` exports `snapshot_dir` and
   `assert_scratch_unchanged` for before/after comparisons around error
   paths.
-- **Hook consolidation (deferred).** The static-atomic submodules across
-  parallel_writer / parallel_gzip / uring_writer / diff-parallel /
-  derive-parallel / altw-stage3 / geocode-pass3 are structurally
-  identical (`PANIC_AT_*` + `*_COUNT` + `reset()`). If the underlying
-  pipelines converge in a later refactor, fold these into a shared
-  module. Not worth it yet - keep each per-module so tests are explicit
-  about which pipeline they're injecting into.
+- **Hook consolidation (explicitly don't).** The static-atomic
+  submodules across parallel_writer / parallel_gzip / uring_writer /
+  diff-parallel / derive-parallel / altw-stage3 / geocode-pass3 are
+  structurally identical (`PANIC_AT_*` + `*_COUNT` + `reset()`), but
+  must stay per-module. The fault-injection split depends on each
+  binary owning its own copy of the atomics; folding into a shared
+  module would re-introduce the cross-test races the split solves.
 - **Policy proposal (not-yet-adopted).** Every new parallel pipeline
-  should ship with three tests: a worker-panic test, a `-j N` vs `-j 1`
+  should ship with three tests: a worker-panic test, a `-j N` vs `-j 2`
   parity test, and a scratch-leak test. Bug density in the sweep skewed
   hard toward the three newest / biggest parallel subsystems, and T05 +
   T06 + T09 exist precisely because earlier pipelines didn't have this
   discipline from the start. Worth considering as a CI gate once the
-  harness matures.
+  reorg lands.
 
 ## Open work
 
 Work item IDs are fixed and stable. Cite by ID in commits / ADRs /
 other notes.
+
+**Reshape under the reorg:** T02 and T03 are still standalone
+infrastructure items - they produce fixture primitives the cli_*.rs
+tests consume. T04, T05, T06 become *patterns applied inside each
+cli_*.rs file* rather than standalone integration tests: a
+truncation sweep, a `-j N` parity matrix, and a
+`with_tracked_scratch_dir` assertion are natural per-command
+concerns, not separate test files. Their item text below still
+describes the correct sites and shapes; the surface is just
+cli_*.rs instead of tests/command_name.rs. T07, T08, T09, T10 are
+unchanged by the reorg.
 
 ### T02 - Lying-indexdata fixture primitives (extended coverage)
 
@@ -232,74 +330,3 @@ locally needs that space.
 bug-hunting needs hours to days per target ("weekend campaign"
 cadence). Skip until T07 exposes a gap that only coverage-guided
 fuzzing can fill.
-
-## Landed
-
-Chronological, for context on what's already solved. Not a work
-backlog.
-
-- **Test fixture infrastructure** (2026-04-22). `TestNode` / `TestWay` /
-  `TestRelation` extended with `meta: Option<TestMeta>` (default
-  `None`); ~428 struct literals across 14 test files migrated via a
-  one-shot script (script deleted post-migration - migration is
-  idempotent; literals are the source of truth). New helpers:
-  `write_multi_block_test_pbf(path, nodes, ways, rels, block_size)`
-  for multi-blob fixtures without needing 8000+ elements per type,
-  `generate_nodes` / `generate_ways` / `generate_relations` for
-  sequential id-sorted vectors, `assert_indexed` /
-  `assert_non_indexed` for blob-header assertions. Smoke-tested in
-  [`tests/fixture_helpers.rs`](../tests/fixture_helpers.rs).
-
-- **altw external fd footprint** (2026-04-23). Stage 1 pass B held
-  `num_workers * NUM_BUCKETS` rank-shard files open concurrently
-  (~4352 fds at 17 workers), tripping Linux default soft ulimit
-  (1024; some distros cap hard at 4096) with `EMFILE`. Fix:
-  self-raise `RLIMIT_NOFILE` soft to hard cap at the top of
-  `stage1_way_pass` (unprivileged, free), then cap `num_workers` at
-  `(fd_budget - 64_headroom) / NUM_BUCKETS`. If even one worker's
-  256-shard budget can't fit, fails clean with a `ulimit -n N` hint.
-  New counters: `extjoin_nofile_soft_cap`, `extjoin_cpu_cap_workers`,
-  `extjoin_fd_cap_workers`. `backend_parity_dense_sparse_external_auto`
-  un-ignored and passes under default ulimit in both feature sweeps.
-
-- **apply-changes `-j N --locations-on-ways` consumer-build drain
-  invariant** (2026-04-23). The false-positive path unconditionally
-  emits `DrainItem::CopyRange`, which the consumer build (no
-  `linux-direct-io`, `use_copy_range=false`) rejects. Fix: thread
-  `use_copy_range` through `StreamingConfig` → worker; when false,
-  route false-positives through the owned-passthrough path
-  (`handle_owned_passthrough`, pread the full frame, emit
-  `DrainItem::OwnedBytes`). `merge_jobs_parity_on_multiblob_input`
-  now passes in both feature sets. Three merge.rs stats tests
-  (`merge_gap_creates_between_blobs`, `merge_stats_accuracy`,
-  `merge_type_transition_node_to_relation_skipping_ways`) now run to
-  completion in consumer; they still fail stats assertions because
-  `DrainItem::OwnedBytes` does not credit per-kind `base_*` counts
-  (only `CopyRange` does) - tracked as a separate stats-drift gap.
-
-- **Fault-injection harness** (2026-04-24, eight commits). Hook
-  infrastructure + one canonical test per parallel pipeline.
-
-  | Pipeline | Hook shape | Canonical test | Bug surfaced? |
-  |---|---|---|---|
-  | apply-changes streaming | Per-instance (`MergeOptions::panic_at_blob_seq`) | `fault_injection_worker_panic_surfaces_error_and_leaves_scratch_clean` | **Yes** - drain deadlock (loop only exited when reorder buffer empty; panic left stuck seqs). Fixed by breaking on channel-disconnect unconditionally. |
-  | parallel_writer | Static atomic (`PANIC_AT_POOL_OP_COUNT`) | `fault_injection_parallel_writer_pool_panic_surfaces_error` | No |
-  | parallel_gzip | Static atomic (`PANIC_AT_POOL_OP_COUNT`) | `fault_injection_parallel_gzip_worker_panic_surfaces_via_finish` | No |
-  | uring_writer | Static atomic (`PANIC_AT_DISPATCH_COUNT`) | `fault_injection_uring_writer_dispatch_panic_surfaces_via_flush` | No; test gracefully skips on hosts with `RLIMIT_MEMLOCK < 16 MB` |
-  | diff/parallel | Static atomic (`PANIC_AT_SHARD_IDX`) | `fault_injection_diff_parallel_shard_panic_surfaces_and_sweeps_scratch` | No |
-  | derive_parallel | Static atomic (`PANIC_AT_SHARD_IDX`) | `fault_injection_derive_parallel_shard_panic_surfaces_and_sweeps_scratch` | **Yes** - outer aggregate temp files (`derive-par-{creates,modifies,deletes}-{pid}.xml.tmp`) not cleaned up on error-path early-returns. Fixed via `PathGuard::file()` wrappers per ADR-0003. |
-  | altw external stage 3 | Static atomic (`PANIC_AT_BUCKET_IDX`) | `fault_injection_altw_stage3_bucket_panic_surfaces_and_cleans_scratch` | No; stage 3 panic also exercises stage-4 recovery via router abort |
-  | geocode Pass 3 Stage A | Static atomic (`PANIC_AT_STREETS_WAY_IDX`) | `fault_injection_geocode_pass3_streets_panic_sweeps_bucket_dirs` | No |
-
-- **apply-changes `jobs == 1` deadlock** (T01, 2026-04-24). A single
-  worker panicking mid-stream left the scanner blocked on a full
-  `candidate_rx` with nobody draining, deadlocking the pipeline.
-  Fixed by rejecting `MergeOptions::jobs == Some(1)` up front with a
-  clear error and clamping the default's minimum to 2 workers on
-  low-core systems. Single-threaded apply-changes has no production
-  use case (strictly slower than 2+ workers on every host), so hard
-  reject is honest rather than silently clamping. Regression test:
-  `tests/merge.rs::merge_rejects_jobs_equal_one`. The two existing
-  `merge_jobs_parity_*` tests updated to use `jobs: Some(2)` as the
-  low-end baseline; the invariant they lock ("output is
-  worker-count-independent") still holds at 2-vs-4.

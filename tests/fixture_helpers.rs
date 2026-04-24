@@ -188,3 +188,21 @@ fn assert_indexed_passes_for_standard_fixture() {
     }
     assert!(saw_data, "expected at least one decodeable data blob");
 }
+
+// ---------------------------------------------------------------------------
+// CliInvoker
+// ---------------------------------------------------------------------------
+
+/// Smoke test for the CliInvoker helper - confirms it can find the
+/// compiled `pbfhogg` binary and that stdout capture / assertion
+/// helpers work on a trivial invocation. If this test fails with a
+/// "binary not found" panic, the workspace build did not produce the
+/// CLI binary before tests ran; see the panic message in
+/// `tests/common/cli.rs::pbfhogg_bin` for the recovery recipe.
+#[test]
+fn cli_invoker_runs_version_command() {
+    let out = common::cli::CliInvoker::new()
+        .arg("--version")
+        .assert_success();
+    out.assert_stdout_contains("pbfhogg");
+}

@@ -14,6 +14,14 @@
 //!   merge and derive_changes tests that verify coordinate values.
 //! - [`PbfContentsIdOnly`] / [`read_all_elements_id_only`]: used by extract,
 //!   getid, and tags_filter tests that only need element IDs and tags.
+//!
+//! [`cli`] hosts [`CliInvoker`] for tests that drive the pbfhogg
+//! binary via `std::process::Command` instead of calling into the
+//! library directly.
+//!
+//! [`CliInvoker`]: cli::CliInvoker
+
+pub mod cli;
 
 use std::collections::BTreeMap;
 use std::path::Path;

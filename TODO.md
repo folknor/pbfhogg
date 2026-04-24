@@ -79,7 +79,8 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
 `fault_injection_parallel_gzip_worker_panic_surfaces_via_finish` /
 `fault_injection_uring_writer_dispatch_panic_surfaces_via_flush` /
 `fault_injection_diff_parallel_shard_panic_surfaces_and_sweeps_scratch` /
-`fault_injection_derive_parallel_shard_panic_surfaces_and_sweeps_scratch` in
+`fault_injection_derive_parallel_shard_panic_surfaces_and_sweeps_scratch` /
+`fault_injection_altw_stage3_bucket_panic_surfaces_and_cleans_scratch` in
 `tests/fault_injection.rs` are `#[ignore]`d because their fault-injection hooks are
 **process-global static atomics** that race with any concurrently-running test that
 uses the same pipeline (most apply-changes / derive-changes / diff tests do). They
@@ -769,11 +770,26 @@ infrastructure first).
   removal retains its role. CHANGELOG entry added for the user-
   visible leak fix.
 
-  Remaining pipelines to cover: altw external stages 3/4,
-  geocode Pass 3 Stage A. Hook-shape picker: per-instance field
-  when the pipeline has a public config struct on its entry
-  path, static atomics otherwise. Scratch tracking helpers:
-  `common::snapshot_dir` and `common::assert_scratch_unchanged`.
+  `altw/external/stage3.rs` landed 2026-04-24:
+  `PANIC_AT_BUCKET_IDX` atomic, fired at the top of the stage 3
+  worker loop after `next_ref.fetch_add(1)`. Re-exported as
+  `altw::external_test_hooks::stage3`. Canonical test
+  `fault_injection_altw_stage3_bucket_panic_surfaces_and_cleans_scratch`
+  confirms the existing `AbortOnDrop` guard + `ScratchDir::drop`
+  shape works: the panic wakes stage 4 waiters via
+  `router.abort(...)`, altw returns `Err`, and the
+  `external-join-*` scratch tree is gone after the call. No bug
+  found this time - the existing recovery design is sound.
+
+  Stage 4 is not yet covered; the stage 3 panic already exercises
+  the full stage-3-panics-stage-4-recovers path since stage 4
+  waits on the router.
+
+  Remaining pipelines to cover: geocode Pass 3 Stage A.
+  Hook-shape picker: per-instance field when the pipeline has a
+  public config struct on its entry path, static atomics
+  otherwise. Scratch tracking helpers: `common::snapshot_dir` and
+  `common::assert_scratch_unchanged`.
 
   **Consolidation opportunity (deferred):** the four static-atomic
   `test_hooks` submodules (`parallel_writer`, `parallel_gzip`,

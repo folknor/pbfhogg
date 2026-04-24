@@ -1,6 +1,13 @@
 //! Embed node coordinates in ways. Equivalent to `osmium add-locations-to-ways`.
 
 pub mod external;
+
+// Under the `test-hooks` feature, expose external-join fault-injection
+// hooks so integration tests can arm them.
+#[cfg(feature = "test-hooks")]
+pub mod external_test_hooks {
+    pub use super::external::test_hooks::stage3 as stage3;
+}
 mod dense;
 mod passthrough;
 mod sparse;

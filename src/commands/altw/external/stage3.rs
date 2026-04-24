@@ -4,6 +4,29 @@
 #[cfg(feature = "linux-direct-io")]
 use super::radix::advise_dontneed_file;
 use super::super::Result;
+
+// Fault-injection hooks for tests. Gated behind the `test-hooks`
+// Cargo feature; release builds don't compile this module at all.
+// Static atomics (same shape as `diff/parallel::test_hooks`): fire
+// at a specific bucket index inside the stage 3 worker loop.
+// Verifies the `AbortOnDrop` panic-safety pattern propagates to
+// stage 4 waiters and that `ScratchDir`'s Drop cleans up on the
+// error path.
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Bucket index at which the stage 3 worker that claims it
+    /// panics. `usize::MAX` = disarmed (default). Call [`reset`] at
+    /// the start AND end of any test that arms this so sibling
+    /// tests don't inherit state.
+    pub static PANIC_AT_BUCKET_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+    /// Disarm the hook.
+    pub fn reset() {
+        PANIC_AT_BUCKET_IDX.store(usize::MAX, Ordering::Relaxed);
+    }
+}
 use super::coord_payloads::{
     encode_blob_payload_from_record, AbortOnDrop, ConcurrentBlobLocationRouter, PerWayRcs,
     StraddlerSide,
@@ -164,6 +187,19 @@ pub(super) fn stage3_slot_reorder(
                     }
                     let bucket_idx = next_ref.fetch_add(1, Relaxed);
                     if bucket_idx >= slot_bucket_count { break; }
+
+                    // Test-only: arm via `test_hooks::PANIC_AT_BUCKET_IDX`.
+                    // Simulates a mid-phase stage 3 worker crash. The
+                    // surrounding `AbortOnDrop` guard calls
+                    // `router.abort(...)` on unwind, waking stage 4
+                    // waiters; `ScratchDir::drop` cleans up the scratch
+                    // tree. Release builds compile this out entirely.
+                    #[cfg(feature = "test-hooks")]
+                    if test_hooks::PANIC_AT_BUCKET_IDX.load(Relaxed) == bucket_idx {
+                        panic!(
+                            "test-hooks: altw stage 3 worker {worker_id} panicking at bucket {bucket_idx}"
+                        );
+                    }
 
                     let bucket_start = bucket_idx as u64 * range_size;
                     let bucket_end = if bucket_idx == slot_bucket_count - 1 {

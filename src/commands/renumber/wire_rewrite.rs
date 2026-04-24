@@ -525,6 +525,23 @@ pub(super) fn reframe_relations_with_new_ids(
                         prev_old_id += delta;
                         let old_abs_id = prev_old_id;
 
+                        // Unconditional reject: same policy as the node and
+                        // way rewriter entry points. A negative member ref
+                        // that slipped past the node / way paths (e.g.
+                        // inconsistent input where nodes/ways are positive
+                        // but relation members are not, or a malformed PBF)
+                        // would otherwise flow through `resolve` unchanged
+                        // (cid-out-of-bounds early-return) and land in
+                        // output as a phantom orphan ref.
+                        if old_abs_id < 0 {
+                            return Err(format!(
+                                "renumber requires non-negative input ids. \
+                                 Input contains relation {old_rel_id} with \
+                                 member ref {old_abs_id}. Resolve JOSM-style \
+                                 negative staging IDs before renumbering.",
+                            ));
+                        }
+
                         // Look up new absolute id by member type.
                         let (new_abs_id, is_orphan) = match member_type {
                             0 => (node_id_set.resolve(old_abs_id, start_node_id), !node_id_set.get(old_abs_id)),

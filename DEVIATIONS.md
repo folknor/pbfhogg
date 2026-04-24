@@ -139,22 +139,95 @@ presentational - pbfhogg distinguishes "how many distinct IDs are missing" from
 the two tools should be aware that osmium's count corresponds to pbfhogg's
 occurrence (parenthesized) count, not the primary count.
 
-## renumber: negative input IDs rejected
+## Negative input IDs rejected project-wide
 
-**osmium behavior:** Handles negative IDs (JOSM editor-local staging
-identifiers) transparently, assigning them new sequential IDs like any
-other element.
+**osmium behavior:** Treats negative IDs as first-class. libosmium
+defines a canonical `id_order` comparator
+(`include/osmium/osm/object_comparisons.hpp:87-110`) with the order
+`0 → negatives by absolute value → positives by absolute value` and
+documents it as "the same ordering JOSM uses"
+(`include/osmium/osm/object.hpp:494`). `osmium renumber`'s man page
+(`osmium-tool/man/osmium-renumber.md:23`) explicitly states
+*"Negative IDs are allowed, they must be ordered before the positive
+IDs"*; `osmium sort`'s man page documents the same negative-first
+output order. The libosmium CHANGELOG calls out: *"These changes
+extend this ordering to negative IDs which are sometimes used for
+objects that have not been uploaded to the OSM server yet."* JOSM
+interop is a designed feature, not a tolerated edge case.
 
-**pbfhogg behavior:** Rejects negative input IDs with an error. Negative
-IDs are JOSM editor-local staging identifiers that are resolved before
-upload to OSM - they never appear in production planet extracts or
-Geofabrik downloads.
+**pbfhogg behavior:** Rejects negative input IDs project-wide.
+Production PBFs (planet, Geofabrik extracts, applied OSC streams) are
+positive-only, and several code paths rely on that invariant.
 
-**Rationale:** The renumber implementation uses `IdSet` bitsets indexed
-by unsigned ID for O(1) rank-based lookup. Negative IDs would require
-either a separate data structure or offset mapping. Since negative IDs
-are never present in real-world inputs, the complexity isn't justified.
+**Sites enforcing the invariant:**
 
-**Impact:** Users with JOSM-local staging data must resolve negative IDs
-before renumbering. This affects only hand-edited files that haven't been
-uploaded.
+- `renumber` - **hard reject** at every entry point where a negative
+  id could flow into an unsigned `IdSet` operation. The node path
+  checks `old_id < 0` before `set_atomic`
+  (`src/commands/renumber/wire_rewrite.rs` `reframe_dense_with_new_ids`),
+  the way path checks `old_way_id < 0` before `set`
+  (`reframe_ways_with_new_ids`), and the relation-member-ref path
+  checks `old_abs_id < 0` before `resolve`
+  (`rewrite_relations_with_new_ids`). All three return an error
+  naming the offending id. The check is unconditional, not
+  indexdata-gated: a PBF whose per-blob indexdata advertises
+  `min_id >= 0` while the payload contains negatives still errors
+  cleanly rather than panicking in `chunk_for_atomic` or silently
+  dropping bits.
+- `diff` / `derive-changes` parallel shard planners
+  (`src/commands/diff/parallel.rs::plan_shards`,
+  `src/commands/diff/derive_parallel.rs::plan_shards`) -
+  **`debug_assert!` only**. Threshold comparisons inside the
+  planner and the shard hot path (`emit_side`, `merge_decoded`,
+  `merge_up_to`) are raw `i64` compares rather than `osm_id_cmp`.
+  For positive-only inputs the two agree; mixed-sign inputs would
+  silently mis-shard. Release builds rely on the upstream chain
+  (read → renumber/apply-changes → diff) never producing a
+  mixed-sign PBF; debug builds flag the violation at planner entry.
+
+**Rationale:** `IdSet` is the load-bearing data structure in
+renumber - a bitmap indexed by unsigned id supporting `O(1)`
+rank-based lookup and `O(n/64)` cross-worker merges. Supporting
+negatives would mean either splitting each bitmap by sign (double
+the bookkeeping, double the merge cost) or widening to a signed
+offset-mapped index (extra indirection on the hot path). Neither
+pays off against the actual demand, which is zero: no user has asked
+for JOSM-staged input, and the canonical workflow for such data is
+"upload to OSM, then re-extract." The shard-planner invariant
+piggy-backs on the same justification: production upstreams never
+introduce negatives, so the planners can use raw `i64` compare
+without a canonical-compare layer.
+
+**Migration path to osmium-style support.** If a consumer does need
+JOSM-interop, the work is:
+
+1. Introduce an `osm_id_cmp` (canonical `id_order`: 0 → negatives by
+   abs value → positives by abs value) used everywhere an ordering
+   decision is made; current uses of raw `<` / `>` / `!=` on `i64`
+   ids audited and switched.
+2. `IdSet` either split into `positives` / `negatives` sub-bitmaps
+   routed by sign at every call site, or widened to a signed index
+   with the capacity cost that implies.
+3. Renumber output numbering interleaves per `id_order` so the
+   emitted sequence matches osmium's expectations.
+4. Shard planners drop their `debug_assert` and switch threshold
+   compares to `osm_id_cmp`.
+5. DEVIATIONS.md entry inverts: claim alignment with osmium instead
+   of deviation.
+
+This is ~several days of work plus thorough regression testing
+against JOSM sample files. Reverse the decision only on a real user
+ask.
+
+**Osmium's own gap.** `osmium derive-changes` has a symmetric latent
+bug at `osmium-tool/src/command_derive_changes.cpp:184`: after
+ordering-based merging by `operator<` (which is canonical), the
+"same id?" check uses raw `it1->id() != it2->id()` rather than the
+absolute-value comparator. Mixed-sign inputs can mis-trigger there
+too. Our debug_assert at least catches the violation loudly; osmium
+does not. The pbfhogg finding is not pbfhogg-unique - it's an
+ecosystem-wide gap.
+
+**Impact:** Users with JOSM-local staging data must resolve negative
+IDs before running pbfhogg commands that touch the invariant sites.
+This affects only hand-edited files that haven't been uploaded.

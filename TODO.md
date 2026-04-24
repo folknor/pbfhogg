@@ -868,15 +868,15 @@ Remaining open findings from a multi-agent Opus audit of 0.3.0 high-churn areas.
 
 ### Cluster 1: Negative-ID / mixed-sign handling policy
 
-DEVIATIONS.md says renumber rejects negative IDs, but several paths still accept or propagate them. **Decision needed:** (a) reject at input boundaries everywhere; (b) support properly via `osm_id_cmp` throughout; (c) document "positive-only production" and gate latent paths with `debug_assert`. Production PBFs are positive-only today, so the items below are all latent.
+**Decision landed 2026-04-24: option (c) - document positive-only project-wide and gate latent paths with `debug_assert`.** Context from osmium audit: osmium supports negatives affirmatively via its canonical `id_order` (0 → negatives by abs value → positives by abs value) and documents JOSM interop as a designed feature. pbfhogg instead treats positive-only as a hard invariant because `IdSet` (the load-bearing data structure in renumber) is unsigned-indexed, and no user has asked for JOSM-staged input. Full rationale, site list, and migration path if we ever reverse the decision are now in DEVIATIONS.md > "Negative input IDs rejected project-wide."
 
-- [ ] **`renumber/wire_rewrite.rs:519-524` - MEDIUM** *(verified 2026-04-23, mechanism nit)*. Real effect confirmed: negative `old_abs_id` flows through `get` (returns false via bounds-check early-return at idset.rs:216) and `resolve` (returns `id` unchanged via cid-out-of-bounds early-return at idset.rs:408, not a huge-cid chunk lookup as the finding stated). Output contains the negative value AND orphan count bumps. Fix shape unchanged: explicit negative-ID check before the orphan decision.
+- [x] ~~**`renumber/wire_rewrite.rs:519-524`**~~ - landed 2026-04-24. Added unconditional `old_abs_id < 0` reject at the relation-member-ref path, mirroring the node and way entry points from `ab01438`. Error names the enclosing relation id plus the offending member ref.
 
-- [ ] **`diff/parallel.rs:138-142` / `derive_parallel.rs:136-142` - MEDIUM (latent - positive-only production PBFs)** *(verified 2026-04-23)*. `plan_shards` builds thresholds via raw `i64` compare while element-merge uses `osm_id_cmp` canonical order. Mechanism is correct; effect is only reachable on mixed-sign inputs, which production PBFs are not. Fix lives in this file but priority drops until a real negative-ID consumer surfaces. Same goes for findings #2 (single-sided emit) and #3 (merge_up_to .min()) in this area - all three share the raw-vs-canonical compare issue and are similarly latent.
+- [x] ~~**`diff/parallel.rs:138-142` / `derive_parallel.rs:115-125`**~~ - landed 2026-04-24. Added `debug_assert!(all descriptors have min_id >= 0)` at the top of `plan_shards` in both files, with a comment pointing at DEVIATIONS.md for the policy rationale. Covers the threshold-build site.
 
-- [ ] **`diff/parallel.rs:354-357` / `derive_parallel.rs:310-315, 324-329, 339-343, 354-358` - MEDIUM (latent)** *(verified 2026-04-23 - see the consolidated note on finding #1 above).*
+- [x] ~~**`diff/parallel.rs:354-357` / `derive_parallel.rs:310-315, 324-329, 339-343, 354-358`**~~ - landed 2026-04-24. Downstream of the `plan_shards` invariant: if all descriptor `min_id >= 0`, all thresholds and all ids inside `emit_side` / single-sided emit are non-negative, so the raw `i64` compares agree with `osm_id_cmp`. The planner-entry assert covers all four sites in one check.
 
-- [ ] **`diff/parallel.rs:384` / `derive_parallel.rs:429` - MEDIUM (latent)** *(verified 2026-04-23 - same class as #1 above; collapses to correct bound for positive-only inputs).*
+- [x] ~~**`diff/parallel.rs:384` / `derive_parallel.rs:429`**~~ - landed 2026-04-24. Same argument as #3: the `merge_up_to(.min())` bound is correct for positive-only ids via the `plan_shards` invariant.
 
 ### Cluster 2: Defensive handling of adversarial or malformed input
 

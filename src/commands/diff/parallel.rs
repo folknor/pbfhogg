@@ -132,6 +132,19 @@ fn plan_shards(
     new_descs: &[BlobDesc],
     target_count: usize,
 ) -> Vec<Shard> {
+    // Positive-only input invariant (DEVIATIONS.md > renumber: negative
+    // input IDs rejected). Threshold comparisons in this planner and in
+    // the shard hot path are raw i64 compares rather than `osm_id_cmp`;
+    // mixed-sign inputs would mis-shard silently. Production PBFs are
+    // positive-only, but a debug-mode audit catches misuse in tests.
+    debug_assert!(
+        old_descs
+            .iter()
+            .chain(new_descs.iter())
+            .all(|d| d.index.min_id >= 0),
+        "plan_shards requires positive-only IDs",
+    );
+
     if target_count <= 1 || old_descs.is_empty() {
         return vec![Shard {
             t_low: i64::MIN,

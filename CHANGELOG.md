@@ -43,7 +43,7 @@
 - `apply-changes --force` on non-indexed input could silently drop upsert modifications. Fixed.
 - Adversarial or truncated blob-header length prefix could abort the process via a multi-GB allocation. Fixed.
 - `inspect --show` returned "not found" on unsorted PBFs when the target element lived in a later blob with a smaller `min_id` than a preceding blob. Fixed.
-- `renumber` could panic or produce phantom orphans on PBFs with stale indexdata containing negative IDs. Fixed.
+- `renumber` could panic or produce phantom orphans on PBFs containing negative IDs (via stale indexdata understating the range, or via inconsistent input whose relation member refs carry negatives while nodes/ways do not). Now hard-rejects at every `IdSet` entry point, with an error naming the offending element and the enclosing context.
 - `apply-changes --force --locations-on-ways` on a non-indexed PBF silently stripped LocationsOnWays data from base ways. Now rejected up front with a migration hint.
 - Parallel and io_uring writers could silently truncate output on upstream framer panic. Fixed.
 - `add-locations-to-ways --index-type external --force` on a non-indexed PBF failed with a confusing error deep inside the metadata scan. Now rejected up front with a migration hint.

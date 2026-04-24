@@ -23,6 +23,11 @@ pub mod parallel_test_hooks {
     pub use super::parallel::test_hooks::{PANIC_AT_SHARD_IDX, reset};
 }
 
+#[cfg(feature = "test-hooks")]
+pub mod derive_parallel_test_hooks {
+    pub use super::derive_parallel::test_hooks::{PANIC_AT_SHARD_IDX, reset};
+}
+
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;

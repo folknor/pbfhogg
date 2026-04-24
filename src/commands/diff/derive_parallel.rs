@@ -27,6 +27,26 @@ use crate::{Element, PrimitiveBlock};
 
 use super::derive::DeriveChangesStats;
 
+// Fault-injection hooks for tests. Gated behind the `test-hooks`
+// Cargo feature; release builds don't compile this module at all.
+// Mirror of `parallel::test_hooks`. Could unify in the future when
+// the shard planning infrastructure is hoisted into a shared
+// module (see the duplication note below).
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Shard index at which `run_shard` panics. `usize::MAX` =
+    /// disarmed (default). Call [`reset`] at the start AND end of
+    /// any test that arms this so sibling tests don't inherit state.
+    pub static PANIC_AT_SHARD_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+    /// Disarm the hook.
+    pub fn reset() {
+        PANIC_AT_SHARD_IDX.store(usize::MAX, Ordering::Relaxed);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shard planning (duplicated from parallel.rs for now; will be unified in a
 // follow-up commit that hoists walk_file + plan_shards into a shared module)
@@ -294,6 +314,20 @@ fn run_shard(
     increment_version: bool,
     update_timestamp: bool,
 ) -> Result<ShardOutput> {
+    // Test-only: arm via `test_hooks::PANIC_AT_SHARD_IDX`. Simulates
+    // a mid-phase shard crash; the caller's `scope.spawn(...).join()`
+    // turns the panic into an `Err("derive shard worker panicked")`
+    // and the post-join cleanup sweeps every possible per-shard
+    // scratch file (creates / modifies / deletes). Release builds
+    // compile this out entirely.
+    #[cfg(feature = "test-hooks")]
+    {
+        use std::sync::atomic::Ordering;
+        if test_hooks::PANIC_AT_SHARD_IDX.load(Ordering::Relaxed) == shard_idx {
+            panic!("test-hooks: derive_parallel shard {shard_idx} panicking");
+        }
+    }
+
     let (cp, mp, dp) = shard_xml_paths(scratch_dir, kind, shard_idx);
 
     let mut creates_w = Writer::new(BufWriter::new(
@@ -773,7 +807,12 @@ pub(crate) fn derive_changes_parallel(
     let old = walk_file(old_path)?;
     let new = walk_file(new_path)?;
 
-    // Outer temp files that `assemble_osc_raw` consumes.
+    // Outer temp files that `assemble_osc_raw` consumes. Wrap each in
+    // a `PathGuard` (see `decisions/0003-*`) so any early return
+    // (shard panic, sweep error, flush failure) removes them instead
+    // of leaking into scratch. Guards are `commit()`ed after the
+    // assemble step reads them, just before they'd be removed
+    // manually anyway.
     let pid = std::process::id();
     let outer_creates = scratch_dir.join(format!("derive-par-creates-{pid}.xml.tmp"));
     let outer_modifies = scratch_dir.join(format!("derive-par-modifies-{pid}.xml.tmp"));
@@ -791,14 +830,17 @@ pub(crate) fn derive_changes_parallel(
         File::create(&outer_creates)
             .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?,
     );
+    let outer_creates_guard = crate::path_guard::PathGuard::file(outer_creates.clone());
     let mut outer_modifies_w = BufWriter::new(
         File::create(&outer_modifies)
             .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?,
     );
+    let outer_modifies_guard = crate::path_guard::PathGuard::file(outer_modifies.clone());
     let mut outer_deletes_w = BufWriter::new(
         File::create(&outer_deletes)
             .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?,
     );
+    let outer_deletes_guard = crate::path_guard::PathGuard::file(outer_deletes.clone());
 
     struct PhaseSlot<'a> {
         kind: ElemKind,
@@ -973,7 +1015,13 @@ pub(crate) fn derive_changes_parallel(
     .map_err(map_emit_err)?;
     crate::debug::emit_marker("DERIVECHANGES_WRITE_END");
 
-    // Clean up outer temp files.
+    // Clean up outer temp files. Explicit `commit()` first so the
+    // guards know the happy path handled the cleanup; their Drop
+    // would otherwise try to remove-already-removed files (harmless
+    // but this is cleaner and silences the unused-variable warning).
+    drop(outer_creates_guard.commit());
+    drop(outer_modifies_guard.commit());
+    drop(outer_deletes_guard.commit());
     drop(std::fs::remove_file(&outer_creates));
     drop(std::fs::remove_file(&outer_modifies));
     drop(std::fs::remove_file(&outer_deletes));

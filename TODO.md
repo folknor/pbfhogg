@@ -78,7 +78,8 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
 `tests/apply_changes_invariants.rs` and
 `fault_injection_parallel_gzip_worker_panic_surfaces_via_finish` /
 `fault_injection_uring_writer_dispatch_panic_surfaces_via_flush` /
-`fault_injection_diff_parallel_shard_panic_surfaces_and_sweeps_scratch` in
+`fault_injection_diff_parallel_shard_panic_surfaces_and_sweeps_scratch` /
+`fault_injection_derive_parallel_shard_panic_surfaces_and_sweeps_scratch` in
 `tests/fault_injection.rs` are `#[ignore]`d because their fault-injection hooks are
 **process-global static atomics** that race with any concurrently-running test that
 uses the same pipeline (most apply-changes / derive-changes / diff tests do). They
@@ -757,12 +758,22 @@ infrastructure first).
   remain under the scratch dir after the panic path - pins the
   existing cleanup logic in place.
 
-  Remaining pipelines to cover: `derive_parallel.rs`,
-  altw external stages 3/4, geocode Pass 3 Stage A. Hook-shape
-  picker: per-instance field when the pipeline has a public config
-  struct on its entry path, static atomics otherwise. Scratch
-  tracking helpers: `common::snapshot_dir` and
-  `common::assert_scratch_unchanged`.
+  `diff/derive_parallel.rs` landed 2026-04-24: same hook shape.
+  Test `fault_injection_derive_parallel_shard_panic_surfaces_and_sweeps_scratch`
+  surfaced a real leak - the three outer aggregate temp files
+  (`derive-par-{creates,modifies,deletes}-{pid}.xml.tmp`, opened
+  at the top of `derive_changes_parallel` before phase iteration)
+  were not cleaned up on error-path early-returns. Fixed by
+  wrapping each in `PathGuard::file()` per ADR-0003; guards Drop
+  on any error path, `commit()`ed on the happy path so manual
+  removal retains its role. CHANGELOG entry added for the user-
+  visible leak fix.
+
+  Remaining pipelines to cover: altw external stages 3/4,
+  geocode Pass 3 Stage A. Hook-shape picker: per-instance field
+  when the pipeline has a public config struct on its entry
+  path, static atomics otherwise. Scratch tracking helpers:
+  `common::snapshot_dir` and `common::assert_scratch_unchanged`.
 
   **Consolidation opportunity (deferred):** the four static-atomic
   `test_hooks` submodules (`parallel_writer`, `parallel_gzip`,

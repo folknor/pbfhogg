@@ -11,14 +11,79 @@ the modern pipeline primitives documented in
 [`reference/pipeline.md`](../reference/pipeline.md) and
 [`reference/pipelined-reader-paths.md`](../reference/pipelined-reader-paths.md).
 
-## Current state (2026-04-23)
+## Current state (2026-04-24)
 
-No `.brokkr/results.db` rows at planet scale yet.
-`overnight.sh:276-278` runs `brokkr getparents --dataset planet
---bench 1`, `--hotpath`, `--alloc` tonight, so the baseline lands
-morning of 2026-04-24. Denmark 400 ms, Japan 2.06 s
-([`reference/performance.md:776`](../reference/performance.md#L776),
-line 812).
+Europe bench `aa5dcf26` (commit `b891514`, yesterday): 26.4 s wall.
+Hotpath `dc0e0998`: 19.3 s with 25 % in decompression, 7 % in block
+parse, remaining 68 % in `run_pipeline` machinery (I/O wait + thread
+scheduling - the pipelined reader pulls all blob bytes even when
+`BlobFilter` then skips their decompression).
+
+Planet baseline on current HEAD `68e1ba0`: **44.8 s** (`70df6046`).
+Stale 2026-04-16 planet bench on `7e9c2e9` was 51.9 s. Both run a
+3-ID query (`n115722 n115723 w2080`).
+
+Disk read on the 44.8 s planet baseline: 74.8 GB of a 92 GB file -
+we pay for node-blob body reads that `BlobFilter` then discards
+at decompress time.
+
+## Opportunity #1 landed as experiment (2026-04-24)
+
+Rewrote the primary path to `HeaderWalker` + `parallel_classify_phase`.
+Schedule covers only the blob kinds whose bodies can contribute
+matches (ways for node-ref queries, relations for any non-empty
+query, nodes only under `--add-self`). Workers pread + decompress +
+scan; a `ReorderBuffer` delivers owned blocks to the writer in file
+order.
+
+Measured results vs baselines above:
+
+| scale | baseline | new      | wall      | disk read            | peak RSS          |
+|-------|----------|----------|-----------|----------------------|-------------------|
+| planet| 44.8 s   | **24.4 s** | **-46 %** | 74.8 GB → **30 GB**  | 4.3 GB → **532 MB** |
+| europe| 26.4 s   | **44.2 s** | **+68 %** | 26.1 GB → 16.5 GB    | 1.20 GB → 108 MB    |
+
+Planet win anatomy (run `dirty` sidecar):
+
+- Schedule scan (`HeaderWalker` header preads): 6.68 s, 669 MB disk
+  read (headers only).
+- Decode phase (`parallel_classify_phase` preads + decompress):
+  17.69 s, 29 GB disk read, 19.7 avg cores.
+- 17 981 blobs in schedule, 32 835 node blobs skipped (65 %).
+
+Europe regression anatomy (same layout):
+
+- Schedule scan: **38.57 s**, 522 197 vol_cs, single core. This is
+  the cold-cache QD=1 pread cost: europe has 522 168 blobs (~67 KB
+  avg) vs planet's 50 816 (~1.8 MB avg). Same pattern as `sort`
+  pass 1 on europe.
+- Decode: 6.84 s, 12.4 GB disk read, 19 avg cores. Fast.
+
+**This regression is rooted in the europe encoder packing 40x more
+blobs per byte than the planet encoder.** See
+[`reference/blob-density.md`](../reference/blob-density.md) for the
+cross-cutting insight and affected-command audit.
+
+### Open question: revert, threshold-dispatch, or accept?
+
+Three paths, undecided:
+
+1. **Revert** - drop the HeaderWalker path, stay on the pipelined
+   reader. Planet regresses to 44.8 s but europe stays at 26.4 s.
+2. **Threshold-dispatch** - branch on blob count (or byte size):
+   `HeaderWalker` path on large-blob PBFs (planet.osm.org style,
+   ~50 k blobs), pipelined path on small-blob PBFs (Geofabrik style,
+   500 k+ blobs). Keeps both paths alive; one `if` at entry.
+3. **Accept** - ship the HeaderWalker path as-is. Planet wins,
+   europe regresses. Matches the `sort` pass-1 precedent where
+   the europe regression was deemed the price of the planet win.
+
+Option (2) is what `blob-density.md` points at as the honest call
+but we have no measurement yet of what the threshold should be.
+Deferred until `repack` produces an 8k-packed planet so we can
+measure the crossover directly. Once `repack` lands, this file
+will be updated with the committed experiment's hash for easy
+revert if option (1) wins.
 
 Architecture today:
 
@@ -50,36 +115,38 @@ not pread-worker parallelism* - see opportunity #2 below.
 
 Ranked by expected headline impact.
 
-### 1. `HeaderWalker` + `any_in_range()` blob-level fast path
+### 1. `HeaderWalker` blob-level fast path [EXPERIMENT LANDED 2026-04-24]
 
-Current: every way and relation blob is decompressed, every element
-scanned, `IdSet::get` per ref. Most blobs contribute no matches.
+See the "Current state" section above for the implemented and
+measured version. Summary of the deltas from this original plan:
 
-Proposed: walk blob headers first with
-[`HeaderWalker`](../src/read/header_walker.rs), use indexdata
-`(min_id, max_id)` to pre-screen each blob against the query set via
-`IdSet::any_in_range(min, max)`, and only pread + decompress blobs
-that can contain a ref. Non-matching way / relation blobs are
-skipped entirely.
+- **Blob-range pre-screening (`IdSet::any_in_range`) does not apply.**
+  The notes' mental model assumed getid's pattern would transplant
+  directly - it doesn't. Blob indexdata stores `(min_id, max_id)` of
+  the elements in the blob (way IDs for way blobs), not the ref/member
+  IDs the query actually cares about. The typical getparents query
+  ("find ways that reference query nodes") can't pre-screen way blobs
+  by way-ID range - every way's refs could be any node ID, and
+  indexdata doesn't capture a refs-range.
+- **The real win is IO reduction, not blob skipping.** The
+  implemented path skips only the blob kinds structurally incapable of
+  producing matches (node blobs unless `--add-self`, way blobs unless
+  node IDs present, etc). That alone cuts planet disk read from 74.8 GB
+  to 30 GB.
+- **Headline win is ~1.8x at planet, not 4-8x.** The original estimate
+  assumed getid-style range pre-screening which turned out not to
+  apply.
+- **Europe regresses 1.7x** due to the 40x blob-count asymmetry
+  between europe (522 k blobs) and planet (50 k blobs). Blob-density
+  discovery lives in
+  [`reference/blob-density.md`](../reference/blob-density.md).
 
-This is exactly the pattern
-[`getid`](../src/commands/getid/) shipped in 0.3.0 for its include
-mode: planet `44 s → 7 s`, a 6.2x win. The per-element work in
-`getparents` is lighter than `getid`'s (ID-set lookup only, no
-re-encode except for matched-parent output), so the proportional
-win could be as large or larger.
+Original estimate (4-8x) was based on applying getid's pattern
+directly. Actual win comes from IO byte reduction, not blob skipping.
 
 Requires indexdata. Non-indexed input falls back to the existing
 pipelined-decode path (or is rejected behind `--force`, matching
 getid's shape).
-
-Estimated **4-8x at planet**, gated on the overnight baseline
-landing tomorrow.
-
-1-2 days scope: adapt `getid`'s
-[`src/commands/getid/mod.rs`](../src/commands/getid/mod.rs) walker
-+ range-overlap logic, wire the match set into the existing
-element-scan callback, keep the non-indexed fallback.
 
 ### 2. `parallel_classify_phase` instead of pipelined decode
 

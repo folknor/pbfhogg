@@ -194,6 +194,41 @@ europe's +21 % and likely small enough to accept as the price of the
 IO reduction. A `drop_caches` planet bench on `1f97fae` would close
 this out; parked as future work, not blocking.
 
+### `SORT_PASS2_END` majflt variability on planet
+
+The "cleanup phase vanishes" bullet above came from `bb392a17`
+(walker baseline), which showed `SORT_PASS2_END` as 0 ms / 0 majflt.
+Later planet runs on `68e1ba0` (post-opp-#3) show the cleanup phase
+back at **~2 s and ~31 000 majflt** - effectively the pre-walker
+shutdown cost returning.
+
+This is **not** opp #3's doing: planet has zero overlap runs, the
+rayon par_iter short-circuits (`sort_overlap_runs=0`), and the
+main pass-2 loop is structurally identical to the pre-opp-#3
+commit. All counters (`sort_copy_range_calls=1`,
+`writer_payload_copy_range_items=1`, `writer_flush_ns≈115 s`,
+`writer_write_ns≈114 s`) match bb392a17 within run-to-run noise.
+The `SORT_PASS2_END` region runs entirely after `writer.flush()`
+has already completed and fsynced - it's process teardown, not
+sort work.
+
+Most likely it's cache-state timing: bb392a17's "no cleanup
+cost" was a favourable cache window where process code pages
+happened to survive pass-2's 92 GB of buffered-write pressure.
+`68e1ba0` runs hit the unlucky case where pass-2 evicted some
+of the pbfhogg code region and exit-time closers page them
+back in. The walker commit's claim that HeaderWalker's
+bounded cache footprint eliminates shutdown thrashing isn't
+reliably true at planet scale - it's a probabilistic win that
+depends on what else is in the page cache at end-of-pass-2.
+
+Action: none right now. Watch the counter on future planet
+runs; if it stays in the ~30 k range, consider amending the
+opp #4 takeaway (walker as "net win") to reflect the
+probabilistic cache-hygiene property. If a future change
+drives it back to zero reliably, that's the genuine
+improvement.
+
 ### NVMe target correction (2026-04-24)
 
 Earlier drafts of this note described pass 2 as "HDD-EXDEV

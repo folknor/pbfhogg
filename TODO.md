@@ -1,5 +1,17 @@
 # pbfhogg TODO
 
+## Active work items (top priority, 2026-04-24)
+
+Three new docs capturing a cross-cutting insight and two new commands that fall out of it. All scaffolding-level; details drift as work lands.
+
+- [ ] **[reference/blob-density.md](reference/blob-density.md)** - the insight: Geofabrik-style PBFs (~8k elements/blob, ~522 k blobs on europe) scale very differently from `planet.openstreetmap.org`-style PBFs (~300k elements/blob, ~50 k blobs on planet). Every `HeaderWalker`-based command (`sort`, `getid`, `getparents`, `inspect`, `apply-changes::scanner`, `check --refs`, `extract --smart`, `tags-filter`, `build-geocode-index`, `renumber_external`) has an implicit blob-count scaling dependency silently shaped by the encoder on the producer side. README's "Planet scale" table and all `notes/*.md` "N seconds at planet" predictions are measured on the sparse-blob encoding. Needs same-corpus-different-encoding measurements once `repack` exists.
+
+- [ ] **[notes/repack.md](notes/repack.md)** - new command: re-encode a PBF with a configurable `--elements-per-blob N` cap. Primary consumer: the measurement matrix in `blob-density.md`. Reuses `ElementReader` + `BlockBuilder` + `PbfWriter`. Small extension to `BlockBuilder` if its element cap isn't already caller-configurable. v1 scope: `--elements-per-blob`, `--compression`. 1-2 days.
+
+- [ ] **[notes/degrade.md](notes/degrade.md)** - new command: adversarial-test tool for producing valid-but-harder PBFs. v1 flags: `--unsort` (exercises `sort`'s overlap-rewrite path, which landed in commit `68e1ba0` without a planet bench), `--strip-locations` (for `add-locations-to-ways`), `--strip-indexdata` (for `--force`/non-indexed fallbacks). Deferred: `--strip-tagdata`, `--strip-bbox`, `--recompress`, `--drop-ids`. Flags compose; order of effects documented in the doc. 1-2 days for v1.
+
+**Open decision on `getparents`** (see [notes/getparents.md](notes/getparents.md) current state): uncommitted `HeaderWalker` path is +68 % on europe / -46 % on planet. Revert, threshold-dispatch, or accept? Deferred until `repack` produces an 8k-packed planet so the crossover point can be measured directly.
+
 ## Active optimization plans (high priority)
 
 Planet-scale command plan docs live in [notes/](notes/). Each has a current-state header, a ranked opportunity list, and cross-references. Read the plan before touching the command.

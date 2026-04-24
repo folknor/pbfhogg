@@ -36,25 +36,28 @@ Built with LLMs. See [LLM.md](LLM.md).
 
 Every command listed below runs on the full planet on normal hardware. Measured on an AMD Ryzen 9 5900X, 32 GB DDR4 RAM, NVMe SSD, with ~28 GB available RAM. Input: 87 GB indexed planet PBF, 11.6B elements.
 
-| Command | Wall | Peak anon RSS | Notes |
-|---------|------|---------------|-------|
-| `add-locations-to-ways --index-type external` | 10m14s | 18.1 GB | rank-bucketed counting sort, streaming stage 3 -> stage 4 overlap, relation scan parallel with stage 1, per-blob delta-varint coord payloads, ~246 GB temp disk |
-| `apply-changes --locations-on-ways` (daily diff) | 2m15s | ~3.3 GB | 3.4M-change daily diff, 56% rewrite. |
-| `build-geocode-index` | 7m12s | ~25 GB | reverse geocoding index, S2 cells (pass-3 stage-B transient peak) |
-| `cat` (indexdata generation) | 1m26s | ~200 MB | rewrites BlobHeader without re-compressing |
-| `cat --type way` (raw passthrough) | 45s | 10 MB | zero decompression, indexdata blob filter |
-| `check --ids --full` | 1m10s | 2.22 GB | monotonicity + type-order + per-type duplicate detection over 11.6B elements |
-| `check --refs` | 1m10s | 2.17 GB | referential integrity over 11.6B elements |
-| `diff -j 16` (two independent 47-day-apart planets, text) | 3m48s | 586 MB | ID-range shard plan, parallel block-pair merge, per-shard temp files, 9.5× vs sequential |
-| `diff --format osc -j 16` (two independent 47-day-apart planets) | 5m13s | 663 MB | ID-range shard plan, per-shard XML fragment temp files, serial assemble_osc (gzip + concat), 7.1× vs sequential |
-| `extract --smart` (Europe bbox) | 4m28s | 11.17 GB | three-pass, multipolygon-complete |
-| `getid` (include, pread header walk) | 6.1s | 27 MB | pread-only blob-header scan with `fadvise(RANDOM)`, one 4 KB probe per blob, on-demand body preads |
-| `getid --invert` | 1m31s | 102 MB | raw-frame passthrough for non-intersecting blobs |
-| `inspect` (default metadata, index-only) | 6.5s | 5 MB | pread-only blob-header scan with `fadvise(RANDOM)`, no body reads when every blob has indexdata |
-| `inspect --nodes -j 16` | 56.8s | 410 MB | parallel node-blob scan via `parallel_classify_accumulate`, per-worker scalar stats + FOR-block histograms merged at completion |
-| `inspect --tags -j 16` | 2m50s | 17.5 GB | parallel per-blob tag maps merged on main thread; peak is dominated by the global `(key, value)` map + glibc fragmentation |
-| `renumber` | 3m25s | 3.3 GB | wire-format rewriters, shared atomic IdSet |
-| `tags-filter -R highway=primary` | 52s | 688 MB | single-pass (`--omit-referenced`), parallel classify |
+| Command | Wall | Peak anon RSS |
+|---------|------|---------------|
+| `add-locations-to-ways --index-type external` | 10m14s | 18.1 GB |
+| `apply-changes --locations-on-ways` (daily diff) | 2m15s | ~3.3 GB |
+| `build-geocode-index` | 7m12s | ~25 GB |
+| `cat` (indexdata generation) | 1m26s | ~200 MB |
+| `cat --type way` (raw passthrough) | 45s | 10 MB |
+| `check --ids --full` | 1m10s | 2.22 GB |
+| `check --refs` | 1m10s | 2.17 GB |
+| `diff -j 16` (two independent 47-day-apart planets, text) | 3m48s | 586 MB |
+| `diff --format osc -j 16` (two independent 47-day-apart planets) | 5m13s | 663 MB |
+| `extract --smart` (Europe bbox) | 4m28s | 11.17 GB |
+| `getid` | 6.1s | 27 MB |
+| `getid --invert` | 1m31s | 102 MB |
+| `inspect` | 6.5s | 5 MB |
+| `inspect --nodes -j 16` | 56.8s | 410 MB |
+| `inspect --tags -j 16` | 2m50s | 17.5 GB |
+| `renumber` | 3m25s | 3.3 GB |
+| `sort` (already-sorted input) | 2m04s | 476 MB |
+| `tags-filter -R highway=primary` | 52s | 688 MB |
+
+Three commands write temp files to the output's parent directory: `add-locations-to-ways --index-type external` (~246 GB), `diff -j 16` (~30 GB text shards), `diff --format osc -j 16` (~45 GB XML shards). The others are scratch-free.
 
 Per-command phase breakdowns and optimization history are in [reference/performance.md](reference/performance.md). Note that recorded results always track the latest git head and may not match the released version.
 

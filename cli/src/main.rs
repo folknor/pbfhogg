@@ -2606,6 +2606,8 @@ fn run_bench_merge(
         force: true,
         locations_on_ways: false,
         jobs: None,
+        #[cfg(feature = "test-hooks")]
+        panic_at_blob_seq: None,
     };
     let stats = pbfhogg::apply_changes::merge(base, changes, output, &opts, &HeaderOverrides::default())?;
     let elapsed_ms = start.elapsed().as_millis();

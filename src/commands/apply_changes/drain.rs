@@ -326,7 +326,14 @@ pub(super) fn run_drain(
             barrier_publish_loc_map(&cfg, &mut state, counters)?;
         }
 
-        if drain_disconnected && state.buffer.is_empty() {
+        // Exit as soon as all senders have closed. If the buffer is
+        // empty we're done cleanly; if it still has items, a producer
+        // dropped a seq (worker panic) and the post-loop check below
+        // surfaces the specific error. The previous
+        // `&& buffer.is_empty()` gate spun forever on worker panic
+        // because the buffer holds seqs ahead of the missing one and
+        // the reorder loop can't advance past the gap.
+        if drain_disconnected {
             break;
         }
     }

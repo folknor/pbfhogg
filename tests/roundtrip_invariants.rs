@@ -197,6 +197,8 @@ fn derive_then_apply_roundtrip() {
         force: true,
         locations_on_ways: false,
         jobs: None,
+        #[cfg(feature = "test-hooks")]
+        panic_at_blob_seq: None,
     };
     pbfhogg::apply_changes::merge(&base, &osc, &reconstructed, &opts, &pbfhogg::HeaderOverrides::default())
         .expect("apply_changes");

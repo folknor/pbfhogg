@@ -53,6 +53,47 @@ pub struct MergeOptions {
     /// pipeline. `None` (or `Some(0)`) keeps the default `nproc - 2`
     /// heuristic (leaves two cores for scanner + drain, min 1).
     pub jobs: Option<usize>,
+    /// Test-only: panic in the worker loop when a blob with this seq
+    /// is dequeued, to exercise the worker-panic → scope-join →
+    /// scratch-cleanup recovery path. Only compiled when the
+    /// `test-hooks` feature is enabled. Set via
+    /// `MergeOptions::with_panic_at_blob_seq` from tests; production
+    /// callers never touch this field (and never see it on non-
+    /// `test-hooks` builds).
+    #[cfg(feature = "test-hooks")]
+    pub panic_at_blob_seq: Option<u64>,
+}
+
+// clippy `derivable_impls` only holds when `test-hooks` is off. With the
+// feature enabled the `panic_at_blob_seq` field is present and the
+// derive would also need to default it - which Default *does* handle
+// for Option, but we keep the manual impl for symmetry across feature
+// configurations.
+#[allow(clippy::derivable_impls)]
+impl Default for MergeOptions {
+    fn default() -> Self {
+        Self {
+            compression: Compression::default(),
+            direct_io: false,
+            io_uring: false,
+            force: false,
+            locations_on_ways: false,
+            jobs: None,
+            #[cfg(feature = "test-hooks")]
+            panic_at_blob_seq: None,
+        }
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl MergeOptions {
+    /// Arm the worker-panic hook at the given seq. Only available with
+    /// the `test-hooks` feature. See field docs on `panic_at_blob_seq`.
+    #[must_use]
+    pub fn with_panic_at_blob_seq(mut self, seq: u64) -> Self {
+        self.panic_at_blob_seq = Some(seq);
+        self
+    }
 }
 
 #[allow(clippy::redundant_closure_for_method_calls)]
@@ -152,6 +193,8 @@ pub fn merge(
         force,
         locations_on_ways,
         jobs,
+        #[cfg(feature = "test-hooks")]
+        panic_at_blob_seq,
     } = *opts;
     let has_base_indexdata = require_indexdata(
         base_pbf,
@@ -327,6 +370,8 @@ pub fn merge(
         needed_set: needed_set.as_ref().map(Arc::clone),
         compression,
         use_copy_range,
+        #[cfg(feature = "test-hooks")]
+        panic_at_blob_seq,
     };
     let streaming_channels = StreamingChannels {
         candidate_rx,

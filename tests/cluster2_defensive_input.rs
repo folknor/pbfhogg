@@ -185,6 +185,8 @@ fn apply_changes_rejects_unsorted_header() {
         force: false,
         locations_on_ways: false,
         jobs: None,
+        #[cfg(feature = "test-hooks")]
+        panic_at_blob_seq: None,
     };
     let result = merge(&base, &diff, &output, &opts, &HeaderOverrides::default());
     let err = result.err().expect("merge should reject unsorted base header");

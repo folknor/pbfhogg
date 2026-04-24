@@ -100,6 +100,10 @@ pub(super) struct StreamingConfig {
     /// routed through the owned-passthrough path instead - the drain
     /// rejects `CopyRange` items up front.
     pub use_copy_range: bool,
+    /// Test-only: panic in the worker loop when the dequeued blob's
+    /// `seq` matches. Only compiled under the `test-hooks` feature.
+    #[cfg(feature = "test-hooks")]
+    pub panic_at_blob_seq: Option<u64>,
 }
 
 /// Channels owned by the streaming pool.
@@ -199,6 +203,8 @@ pub(super) fn run_workers(
         needed_set,
         compression,
         use_copy_range,
+        #[cfg(feature = "test-hooks")]
+        panic_at_blob_seq,
     } = cfg;
     let StreamingChannels { candidate_rx, drain_tx } = channels;
 
@@ -263,6 +269,8 @@ pub(super) fn run_workers(
                     needed_set.as_deref(),
                     &compression,
                     use_copy_range,
+                    #[cfg(feature = "test-hooks")]
+                    panic_at_blob_seq,
                 );
                 if let Err(e) = result {
                     let mut slot =
@@ -308,6 +316,7 @@ fn worker_loop(
     needed_set: Option<&FxHashSet<i64>>,
     compression: &Compression,
     use_copy_range: bool,
+    #[cfg(feature = "test-hooks")] panic_at_blob_seq: Option<u64>,
 ) -> Result<()> {
     let mut read_buf: Vec<u8> = Vec::new();
     let mut decompress_buf: Vec<u8> = Vec::new();
@@ -330,6 +339,22 @@ fn worker_loop(
                 Err(_) => break, // channel closed by scanner
             }
         };
+
+        // Test-only: arm this from `MergeOptions::with_panic_at_blob_seq`
+        // to trigger a mid-stream worker panic at a deterministic point,
+        // exercising the worker-panic -> scope-join -> scratch-cleanup
+        // recovery path. Production builds don't compile this block.
+        #[cfg(feature = "test-hooks")]
+        {
+            let seq = match &item {
+                ScannedBlob::Candidate(d) | ScannedBlob::Passthrough(d) => d.seq,
+            };
+            if panic_at_blob_seq == Some(seq) {
+                panic!(
+                    "test-hooks: panic_at_blob_seq={seq} triggered in worker {worker_id}"
+                );
+            }
+        }
 
         match item {
             ScannedBlob::Candidate(desc) => {

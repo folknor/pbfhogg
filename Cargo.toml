@@ -65,6 +65,11 @@ hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 linux-direct-io = []
 linux-io-uring = ["dep:io-uring"]
+# Test-only fault-injection hooks for the parallel pipelines (worker
+# panic / IO error at a named blob seq). Release builds never enable
+# this; the hook fields and checks compile out entirely. Turned on by
+# `brokkr check` via `--all-features`.
+test-hooks = []
 
 [dependencies]
 protohoggr = "0.4.0"

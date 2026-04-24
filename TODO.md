@@ -687,26 +687,41 @@ is self-contained and can land independently.
 Ordered by value-to-cost (most bugs caught per line of test
 infrastructure first).
 
-- [ ] **Fault injection for parallel pipelines.** Biggest hole -
-  ~30 findings are "worker errors mid-stream -> silent truncation /
-  hang / temp-file leak" across `write/parallel_writer.rs`,
-  `write/uring_writer.rs`, `write/parallel_gzip.rs`,
-  `apply_changes/drain.rs`, `apply_changes/rewrite.rs`,
-  `diff/parallel.rs`, `derive_parallel.rs`, altw external
-  stages 3/4, geocode Pass 3 Stage A. Zero tests today inject a
-  worker panic or mid-stream I/O error and assert the output is
-  either correct-or-errored, never silently short. Minimum shape:
-  a thin `FaultSink` wrapper around `Write` that errors at a
-  configurable byte offset, plus a `panic_at_seq(N)` hook on the
-  worker closure (feature-gated behind `#[cfg(test)]` in the
-  pipeline modules so it doesn't bloat release). Then one test
-  per pipeline: "worker N panics at seq K -> command returns
-  `Err`, scratch dir is clean, output file is either absent or
-  truncated-to-zero (never a silent short file with zero-filled
-  holes)." Catches the seven HIGH items in "Write path" plus the
-  MEDIUM scanner/worker-panic items in "apply-changes pipeline"
-  and the shard-worker-error items in "diff / derive-changes
-  shard-parallel".
+- [ ] **Fault injection for parallel pipelines.** Harness landed
+  2026-04-24 for apply-changes streaming. Feature-gated `test-hooks`
+  flag (zero production overhead; off by default, on under
+  `--all-features`). `MergeOptions::panic_at_blob_seq` + a
+  one-line check at the top of the worker loop. First canonical
+  test (`fault_injection_worker_panic_surfaces_error_and_leaves_scratch_clean`
+  in `tests/apply_changes_invariants.rs`) surfaced a real drain
+  deadlock on worker panic - the drain loop only exited when the
+  reorder buffer was empty, so stuck seqs spun the loop forever.
+  Fix: break on channel-disconnect unconditionally; the post-loop
+  "items stuck" error surfaces the real diagnostic. Also found:
+  `jobs: Some(1)` worker-panic hangs the scanner (no surviving
+  worker to drain `candidate_rx`); tracked below as a separate
+  invariant gap.
+
+  Remaining pipelines to cover by transplanting the same
+  feature-gated hook shape + one test per pipeline:
+  `write/parallel_writer.rs`, `write/uring_writer.rs`,
+  `write/parallel_gzip.rs`, `diff/parallel.rs`, `derive_parallel.rs`,
+  altw external stages 3/4, geocode Pass 3 Stage A. Harness
+  template: see `MergeOptions::panic_at_blob_seq` +
+  `streaming::worker_loop` + the canonical test. Scratch tracking
+  helpers: `common::snapshot_dir` and `common::assert_scratch_unchanged`.
+
+- [ ] **`jobs == 1` apply-changes worker-panic deadlock.** With a
+  single worker and a worker panic, the scanner blocks on a full
+  `candidate_rx` because no one is consuming, the drain blocks
+  waiting on senders, and the command hangs forever. The fault-
+  injection test currently uses `jobs: Some(2)` to sidestep this.
+  Fix shape: plumb a "scope unwinding" shutdown signal that the
+  scanner polls between sends (a single `Arc<AtomicBool>` would
+  do), set it from the worker scope's drop path. Not fixed in the
+  initial harness landing because it requires real engineering
+  across scope boundaries; parked here as a follow-up the harness
+  will catch again once re-armed with `jobs == 1`.
 
 - [ ] **Lying-indexdata fixtures (extended coverage).** Partial
   progress 2026-04-24: cluster 2's landing (see

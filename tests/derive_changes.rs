@@ -494,6 +494,8 @@ fn roundtrip_with_merge() {
             force: true,
             locations_on_ways: false,
             jobs: None,
+            #[cfg(feature = "test-hooks")]
+            panic_at_blob_seq: None,
         },
         &pbfhogg::HeaderOverrides::default(),
     )
@@ -850,6 +852,8 @@ fn derive_changes_jobs_parity_roundtrips_to_same_output() {
             force: true,
             locations_on_ways: false,
             jobs: None,
+            #[cfg(feature = "test-hooks")]
+            panic_at_blob_seq: None,
         },
         &pbfhogg::HeaderOverrides::default(),
     )
@@ -865,6 +869,8 @@ fn derive_changes_jobs_parity_roundtrips_to_same_output() {
             force: true,
             locations_on_ways: false,
             jobs: None,
+            #[cfg(feature = "test-hooks")]
+            panic_at_blob_seq: None,
         },
         &pbfhogg::HeaderOverrides::default(),
     )
@@ -905,6 +911,8 @@ fn merge_stats_match_output_counts_after_roundtrip() {
             force: true,
             locations_on_ways: false,
             jobs: None,
+            #[cfg(feature = "test-hooks")]
+            panic_at_blob_seq: None,
         },
         &pbfhogg::HeaderOverrides::default(),
     )

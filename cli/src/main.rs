@@ -2307,6 +2307,8 @@ fn run_apply_changes(
         force,
         locations_on_ways,
         jobs: if jobs == 0 { None } else { Some(jobs) },
+        #[cfg(feature = "test-hooks")]
+        panic_at_blob_seq: None,
     };
     let stats = pbfhogg::apply_changes::merge(base, changes, output, &opts, overrides)?;
     stats.print_summary();

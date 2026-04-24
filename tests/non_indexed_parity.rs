@@ -403,6 +403,8 @@ fn apply_changes_non_indexed_parity() {
         force: true,
         locations_on_ways: false,
         jobs: None,
+        #[cfg(feature = "test-hooks")]
+        panic_at_blob_seq: None,
     };
     pbfhogg::apply_changes::merge(
         &in_idx,

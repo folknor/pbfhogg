@@ -21,6 +21,10 @@ hotpath = ["pbfhogg/hotpath"]
 hotpath-alloc = ["pbfhogg/hotpath-alloc"]
 linux-direct-io = ["pbfhogg/linux-direct-io"]
 linux-io-uring = ["pbfhogg/linux-io-uring"]
+# Re-exports pbfhogg's test-only fault-injection hooks so the CLI
+# compiles cleanly under `cargo ... --all-features`. Production
+# builds don't enable this.
+test-hooks = ["pbfhogg/test-hooks"]
 
 [dependencies]
 pbfhogg = { version = "0.2", path = "..", default-features = false, features = ["commands"] }

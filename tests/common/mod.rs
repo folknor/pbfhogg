@@ -1030,3 +1030,59 @@ pub fn is_uring_unavailable(err: &(dyn std::error::Error + 'static)) -> bool {
     }
     false
 }
+
+// ---------------------------------------------------------------------------
+// Scratch-dir tracking (fault-injection test support).
+//
+// Snapshot a directory's recursive contents before and after a command
+// runs; the test asserts no leaked temp files on the error path. Pairs
+// with the `test-hooks` fault-injection harness in the pipeline modules.
+// ---------------------------------------------------------------------------
+
+/// Recursive listing of all regular-file paths under `root`, relative
+/// to `root`. Directories are included as keys in the set so a removed
+/// empty subdir also shows up in the diff.
+pub fn snapshot_dir(root: &Path) -> std::collections::BTreeSet<std::path::PathBuf> {
+    let mut out = std::collections::BTreeSet::new();
+    snapshot_dir_inner(root, root, &mut out);
+    out
+}
+
+fn snapshot_dir_inner(
+    base: &Path,
+    dir: &Path,
+    out: &mut std::collections::BTreeSet<std::path::PathBuf>,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let rel = path.strip_prefix(base).unwrap_or(&path).to_path_buf();
+        out.insert(rel);
+        if path.is_dir() {
+            snapshot_dir_inner(base, &path, out);
+        }
+    }
+}
+
+/// Assert that a post-run scratch snapshot matches the pre-run snapshot.
+/// Panics with a diff listing added / removed entries if not equal.
+/// Use around commands that manage scratch files internally: any
+/// difference indicates a leaked temp file on the test's execution
+/// path (typically an error-path leak the cleanup rule missed).
+pub fn assert_scratch_unchanged(
+    before: &std::collections::BTreeSet<std::path::PathBuf>,
+    after: &std::collections::BTreeSet<std::path::PathBuf>,
+) {
+    let added: Vec<_> = after.difference(before).collect();
+    let removed: Vec<_> = before.difference(after).collect();
+    if !added.is_empty() || !removed.is_empty() {
+        panic!(
+            "scratch directory changed across command invocation\n\
+             added (leaked): {added:?}\n\
+             removed (stolen): {removed:?}"
+        );
+    }
+}

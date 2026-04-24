@@ -7,6 +7,11 @@
 //!
 //! Happy-path cost is a single `Option::take`; the actual filesystem
 //! work only runs on the error path.
+//!
+//! See `decisions/0003-error-path-hygiene-via-pathguard.md` for the
+//! policy context: when to use this primitive, the "counters bump
+//! after successful write" rule that accompanies it, and the
+//! checklist for adding a new command.
 
 use std::fs;
 use std::path::PathBuf;

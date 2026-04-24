@@ -141,6 +141,11 @@ occurrence (parenthesized) count, not the primary count.
 
 ## Negative input IDs rejected project-wide
 
+See [decisions/0002](decisions/0002-negative-ids-rejected-project-wide.md)
+for the decision record (rationale, alternatives considered, migration
+path). This section documents the resulting behavior difference from
+osmium.
+
 **osmium behavior:** Treats negative IDs as first-class. libosmium
 defines a canonical `id_order` comparator
 (`include/osmium/osm/object_comparisons.hpp:87-110`) with the order

@@ -310,6 +310,41 @@ Not worth adding for opp #2 sizing - the wall-clock counters
 already localise the 115 s to a known code region. Annotate only
 if we need per-chunk timing distribution inside the copy loop.
 
+### ext4 CFR concurrency probe (2026-04-24)
+
+Ran a minimal probe before committing to opp #2's parallel-writer
+chunking: `os.copy_file_range` (same syscall as
+`parallel_writer::copy_range_to_fd`) of the planet PBF (86 GB) to
+one output vs two concurrent outputs on the same NVMe ext4
+partition. Probe script was `probe_ext4_cfr.py` at repo root,
+deleted after use.
+
+| configuration       | wall     | per-thread | aggregate |
+|---------------------|----------|------------|-----------|
+| 1 thread            | 110.75 s | 792 MB/s   | 792 MB/s  |
+| 2 threads concurrent | 188.49 s | 466 MB/s   | **931 MB/s** |
+
+**Aggregate speedup: 1.18x.** The 792 MB/s figure matches sort's
+measured in-kernel CFR throughput (800 MB/s on `bb392a17`) to
+within noise - so the sort writer is already hitting ext4's
+single-thread CFR ceiling, and concurrent CFR from two threads
+only adds 18 % aggregate. Per-thread throughput drops from
+792 to 466 MB/s under contention, showing the second thread is
+contending for *something* below the syscall layer (ext4 journal,
+block layer queue, NVMe controller - this probe can't localise
+further, and it doesn't need to).
+
+The probe is **optimistic** for opp #2: it copies to two
+different inodes, whereas parallel-writer chunking would target
+the same output file at different offsets - same inode, single
+extent allocator, likely more contention. So real-world opp #2
+scaling would be ≤1.18x.
+
+Conclusion: opp #2 parks. ~21 s theoretical wall savings on
+planet (116 s pass 2 → ~95 s) is not worth days of code that
+restructures `parallel_writer.rs` dispatch. Bigger wins live
+elsewhere - see opp #6.
+
 ### Takeaway
 
 - **Opportunity #1** (coalescer) is mechanically correct and landed:
@@ -328,12 +363,16 @@ if we need per-chunk timing distribution inside the copy loop.
 - The europe regression stands but is a non-production-scale
   artifact. Not worth clawing back unless a separate europe-scale
   consumer surfaces.
-- **Current wall is single-thread-writer-bound.** Planet post-walker
-  buffered is 123.3 s, `--io-uring` is 118.1 s (-4 %). Both cap at
-  ~800-830 MB/s sustained because one pool worker holds the
-  coalesced CFR op. The NVMe device can do several GB/s; breaking
-  the per-thread ceiling (opp #2) is the only code-level lever
-  left on the already-sorted path.
+- **Current wall is storage-stack-bound, not software-bound.**
+  Planet post-walker buffered is 123.3 s, `--io-uring` is 118.1 s
+  (-4 %). Both cap at ~800-830 MB/s because that's ext4's
+  single-thread CFR ceiling on this NVMe (confirmed by the
+  concurrency probe, 1.18x scaling at 2 threads). Opp #2 parks:
+  parallel-writer chunking would buy ≤18 % wall (~21 s on planet)
+  for days of code. On this ext4+NVMe setup the sort writer floor
+  is structural; only opp #6 (reflink fast-path for zero-overlap
+  sorted input on a reflink-capable output fs) offers further
+  code-level wins.
 - **io_uring is not a drop-in upgrade.** It buys 4 % wall at the
   cost of reintroducing page-cache thrashing on shutdown (the
   exact cleanup cost the post-walker buffered path eliminated).
@@ -408,27 +447,29 @@ in-kernel CFR bandwidth - see "Takeaway" and "NVMe target
 correction" above. Remains useful for any future change that
 unpins the writer (e.g. parallel-writer chunking, opportunity #2).
 
-### 2. Writer-side throughput on already-sorted input [top priority]
+### 2. Writer-side throughput on already-sorted input [PARKED - storage-stack bound]
 
 With the producer doing one syscall, the writer is doing all the
 wall. At planet scale that's 116 s of in-kernel ext4 CFR on NVMe
 at ~800 MB/s (buffered) or 111 s of uring ReadFixed+WriteFixed at
 ~830 MB/s - both **single-thread-bound** (see "io_uring anatomy"
-above). Options worth sizing:
+above). Measured 2026-04-24 that this ceiling is not a pbfhogg
+architecture problem but an ext4+NVMe storage-stack limit; see
+"ext4 CFR concurrency probe" below. All three sub-bullets resolved
+as parked or downgraded:
 
-- **Parallel writer on large CFR [highest-value remaining lever]**:
-  today `parallel_writer.rs` round-robins `OutputChunk::CopyRange`
-  ops to workers, so one giant coalesced op goes to a single worker
-  (see `parallel_writer.rs:276-289`). Pre-coalesce, 522 k ops were
-  round-robined across the pool. Chunking a coalesced run back into
-  N pieces at dispatch time would restore pipelining - 4 concurrent
-  CFR issuers against ext4 could approach the NVMe device's raw
-  bandwidth (several GB/s) rather than the single-thread 800 MB/s
-  ceiling. If the cap is per-worker-thread, this could be a 2-4x
-  win on planet pass 2; if ext4 journal-serialises the CFRs, less.
-  Cheap disambiguation before writing code: run two concurrent
-  `cp` of identical files on the same fs, see if aggregate
-  bandwidth goes up. Days of code either way, but de-risk first.
+- **Parallel writer on large CFR [PARKED - probe says 1.18x max]**:
+  `probe_ext4_cfr.py` (deleted after use) ran 1 vs 2 concurrent
+  `os.copy_file_range` into different output files on the same
+  NVMe ext4 partition. Single thread: 792 MB/s (matches sort's
+  measured 800 MB/s). Two concurrent threads: 931 MB/s aggregate
+  (466 MB/s per thread). 1.18x scaling - ~18 % theoretical ceiling
+  on planet, or ~21 s wall savings. The probe was optimistic
+  (different inodes = less contention than same-file at different
+  offsets), so real-world scaling would be worse. Days of code
+  for <18 % wall on planet: not worth it. Something below the
+  syscall layer (ext4 journal, block layer queue, NVMe controller)
+  serialises. See "ext4 CFR concurrency probe" below.
 - **io_uring passthrough [measured -4 %, not a default swap]**:
   `--io-uring --bench 1` on planet post-walker (`7f6288c0`) is
   118.1 s vs 123.3 s buffered. 4 % faster, but reintroduces
@@ -441,8 +482,11 @@ above). Options worth sizing:
   a code change - fs migration, out of scope for sort-level
   optimisation but worth noting as the theoretical ceiling.
 
-Days scope for the parallel-writer bullet. Disambiguate the
-ext4-journal-serialisation risk with a `cp` probe first (minutes).
+Net: on ext4+NVMe the planet sort writer-side wall floor is ~115 s.
+Further wins on this storage stack are not available at the
+`parallel_writer.rs` layer. See opportunity #6 for a code-level
+path that sidesteps the copy entirely on reflink-capable output
+filesystems.
 
 ### 3. Parallel overlap-rewrite in pass 2
 
@@ -491,6 +535,43 @@ current blob counts.
 
 Minutes scope. Land only as part of a sweep of related changes.
 
+### 6. Reflink fast-path for zero-overlap sorted input
+
+When pass 1 finds the input is already sorted with zero overlap
+runs (the production case) and the output filesystem supports
+reflinks (btrfs, xfs with `reflink=1`), skip pass 2's per-byte
+copy and issue a single `FICLONE` / `FICLONERANGE` ioctl instead.
+On reflink-capable fs this completes in O(1) metadata time
+regardless of file size - planet sort would drop from 123 s
+(post-walker) to ~7 s (pass 1 only) with no bytes physically
+copied.
+
+The fs check is `copy_file_range` behaviour: on reflink-capable
+fs it already collapses to metadata; on ext4 it does a real
+in-kernel copy. Alternatively, `FICLONE` ioctl returns EOPNOTSUPP
+on non-reflink fs and can be the explicit probe.
+
+Semantics: sort's contract today is "verify-and-reframe" -
+output bytes may differ from input even when ordering is
+preserved (e.g. re-compressed blobs, header rewrite with
+`sorted=true` hint). A reflink fast-path would skip reframing
+entirely when input is already optimally ordered, which is a
+semantic change worth flagging:
+- The `Sort.Type_then_ID` header hint might not be set on the
+  input even when the data is sorted - refusing to reflink in
+  that case keeps the existing behaviour. Or reflink + patch the
+  header in place via a tiny write to update the sort hint.
+- Callers expecting a freshly-framed output (e.g. downstream
+  tools that depend on specific compression parameters) would
+  get the input's framing instead.
+
+Conditional fast-path (opt-in flag or auto-detect + opt-out)
+keeps the default safe. Days scope: reflink syscall plumbing,
+header-hint patching, conditional dispatch, and an
+integration test covering both "reflink taken" and "reflink
+declined" paths. Largest remaining opportunity for the
+already-sorted production path on a reflink-capable fs.
+
 ## Things that deliberately do not change
 
 - **Pipelined decode is not adopted.** `sort` uses direct pread per
@@ -527,10 +608,15 @@ Minutes scope. Land only as part of a sweep of related changes.
 6. **Cold-cache planet bench (`drop_caches` on `1f97fae`)** to close
    out the warm-cache caveat on the -65 % pass-1 wall win. Parked
    as future work, not blocking.
-7. **ext4-journal-serialisation probe** (two concurrent `cp` on
-   same fs) before committing to the parallel-writer-chunking
-   code change in opportunity #2. Minutes.
-8. **Unsorted-input dataset** for opportunity #3. None in
+7. **ext4 CFR concurrency probe landed** (`probe_ext4_cfr.py`,
+   deleted after use). 1 vs 2 concurrent `os.copy_file_range` on
+   planet: 792 MB/s → 931 MB/s aggregate, 1.18x scaling.
+   Closes opp #2 as not worth the days. See "ext4 CFR concurrency
+   probe" above.
+8. **Reflink-capable output fs probe** (for opp #6): verify
+   `FICLONE`/`FICLONERANGE` behaviour on btrfs and xfs-with-reflink
+   to size the fast-path. Prereq for shipping opp #6; not landed.
+9. **Unsorted-input dataset** for opportunity #3. None in
    `brokkr.toml` today; would need configuring (or a synthetic
    fixture) before that opportunity can be sized.
 

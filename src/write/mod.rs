@@ -13,6 +13,27 @@ pub mod direct_writer;
 pub mod file_writer;
 pub(crate) mod parallel_gzip;
 pub(crate) mod parallel_writer;
+
+// Under the `test-hooks` feature, expose the static fault-injection
+// hooks so integration tests can arm them. The rest of
+// `parallel_writer` stays crate-private.
+#[cfg(feature = "test-hooks")]
+pub mod parallel_writer_test_hooks {
+    pub use super::parallel_writer::test_hooks::{
+        PANIC_AT_POOL_OP_COUNT, POOL_OP_COUNT, reset,
+    };
+}
+
+// Under the `test-hooks` feature, expose the parallel_gzip hooks and
+// the `ParallelGzipWriter` type so integration tests can drive the
+// writer directly.
+#[cfg(feature = "test-hooks")]
+pub mod parallel_gzip_test_hooks {
+    pub use super::parallel_gzip::{ParallelGzipWriter, DEFAULT_CHUNK_SIZE};
+    pub use super::parallel_gzip::test_hooks::{
+        PANIC_AT_POOL_OP_COUNT, POOL_OP_COUNT, reset,
+    };
+}
 #[cfg(feature = "linux-io-uring")]
 pub mod uring_writer;
 pub(crate) mod metrics;

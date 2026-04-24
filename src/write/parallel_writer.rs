@@ -81,6 +81,38 @@ enum WriteOp {
 /// stores it here; the writer thread checks before returning success.
 type ErrSlot = Arc<Mutex<Option<io::Error>>>;
 
+// Fault-injection hooks for tests. Gated behind the `test-hooks`
+// Cargo feature; release builds don't compile this module at all.
+// Plumbed via process-global atomics rather than a per-instance
+// config because pool workers are spawned deep inside
+// `parallel_writer_thread_inner` - threading a config field through
+// every entry point (PbfWriter::to_path_parallel, merge(), etc.)
+// would be invasive. Tests serialize access via `--test-threads=1`
+// (enforced by `brokkr test`).
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Pool op count at which the acting worker panics. `u64::MAX` =
+    /// disarmed (default). Set to a target count before invoking the
+    /// pipeline; reset via [`reset`] once the test has finished so
+    /// sibling tests don't inherit the hook.
+    pub static PANIC_AT_POOL_OP_COUNT: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    /// Monotonic total of `WriteOp`s dispatched across the pool. Each
+    /// worker does a `fetch_add(1)` immediately after popping an op;
+    /// when the resulting (post-increment) count equals
+    /// `PANIC_AT_POOL_OP_COUNT`, that worker panics.
+    pub static POOL_OP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    /// Disarm and zero the counters. Call at the start AND end of any
+    /// test that touches these hooks.
+    pub fn reset() {
+        PANIC_AT_POOL_OP_COUNT.store(u64::MAX, Ordering::Relaxed);
+        POOL_OP_COUNT.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Writer-thread entry point. Opens the output file, writes the header
 /// synchronously at offset 0, spawns `POOL_SIZE` workers, then loops
 /// reading pipeline items in seq order and dispatching per-worker work.
@@ -333,6 +365,19 @@ fn worker_loop(rx: Receiver<WriteOp>, file: &File, err_slot: &ErrSlot) {
             Ok(op) => op,
             Err(_) => return,
         };
+
+        // Test-only: arm via `test_hooks::PANIC_AT_POOL_OP_COUNT`.
+        // Fires when the (post-increment) op count across the pool
+        // matches; simulates an OOM or internal unwrap inside a pool
+        // worker. Release builds compile this block out entirely.
+        #[cfg(feature = "test-hooks")]
+        {
+            let n = test_hooks::POOL_OP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == test_hooks::PANIC_AT_POOL_OP_COUNT.load(Ordering::Relaxed) {
+                panic!("test-hooks: parallel_writer pool op #{n} panicking");
+            }
+        }
+
         let t = std::time::Instant::now();
         let result = match op {
             WriteOp::Write { offset, bytes } => file.write_all_at(&bytes, offset),

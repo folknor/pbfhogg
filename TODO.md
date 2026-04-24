@@ -74,6 +74,17 @@ verifies the debug monotonicity assertion fires on unsorted nodes when `Sort.Typ
 is declared. Requires `debug_assertions` to be enabled in the test profile. Nightly 1.95
 (2026-02-25) has a regression where `debug_assertions` is off in test builds.
 
+`fault_injection_parallel_writer_pool_panic_surfaces_error` in
+`tests/apply_changes_invariants.rs` and `fault_injection_parallel_gzip_*` in
+`tests/fault_injection.rs` are `#[ignore]`d because their fault-injection hooks are
+**process-global static atomics** that race with any concurrently-running test that
+uses the same pipeline (most apply-changes / derive-changes tests do). They require
+single-threaded execution to be deterministic. Run via `brokkr test <name>` (which
+always adds `--test-threads=1`) or `cargo test -- --ignored --test-threads=1`. The
+canonical `fault_injection_worker_panic_surfaces_error_and_leaves_scratch_clean` test
+in the same file is **not** ignored because its hook is per-instance
+(`MergeOptions::panic_at_blob_seq`) and has no shared-state hazard.
+
 ## Planet-scale validation coverage
 
 README's planet table is the source of truth for "this command runs
@@ -702,14 +713,28 @@ infrastructure first).
   worker to drain `candidate_rx`); tracked below as a separate
   invariant gap.
 
-  Remaining pipelines to cover by transplanting the same
-  feature-gated hook shape + one test per pipeline:
-  `write/parallel_writer.rs`, `write/uring_writer.rs`,
-  `write/parallel_gzip.rs`, `diff/parallel.rs`, `derive_parallel.rs`,
-  altw external stages 3/4, geocode Pass 3 Stage A. Harness
-  template: see `MergeOptions::panic_at_blob_seq` +
-  `streaming::worker_loop` + the canonical test. Scratch tracking
-  helpers: `common::snapshot_dir` and `common::assert_scratch_unchanged`.
+  `write/parallel_writer.rs` and `write/parallel_gzip.rs` landed
+  2026-04-24 using a different hook shape: static atomics
+  (`parallel_writer_test_hooks::PANIC_AT_POOL_OP_COUNT`,
+  `parallel_gzip_test_hooks::PANIC_AT_POOL_OP_COUNT`) set
+  process-globally by the test, rather than per-instance
+  `MergeOptions` fields. Justified because pool workers are spawned
+  deep inside `parallel_writer_thread_inner` / `ParallelGzipWriter::new`
+  and threading a config through every entry point would be invasive.
+  Their canonical tests (`fault_injection_parallel_writer_pool_panic_surfaces_error`
+  and `fault_injection_parallel_gzip_worker_panic_surfaces_via_finish`)
+  are `#[ignore]`d because static atomics race with sibling tests
+  using the same pipeline; run via `brokkr test <name>` which forces
+  `--test-threads=1`. Both confirm a pool-worker panic surfaces
+  through the public `join()` / `finish()` path as an `Err`, never
+  a silent success.
+
+  Remaining pipelines to cover: `write/uring_writer.rs`,
+  `diff/parallel.rs`, `derive_parallel.rs`, altw external stages
+  3/4, geocode Pass 3 Stage A. Hook-shape picker: per-instance
+  field when the pipeline has a public config struct on its entry
+  path, static atomics otherwise. Scratch tracking helpers:
+  `common::snapshot_dir` and `common::assert_scratch_unchanged`.
 
 - [ ] **`jobs == 1` apply-changes worker-panic deadlock.** With a
   single worker and a worker panic, the scanner blocks on a full

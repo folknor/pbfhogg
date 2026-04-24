@@ -25,6 +25,34 @@ use std::thread::JoinHandle;
 
 use flate2::write::GzEncoder;
 
+// Fault-injection hooks for tests. Gated behind the `test-hooks`
+// Cargo feature; release builds don't compile this module at all.
+// Same shape as `parallel_writer::test_hooks`: process-global
+// atomics rather than per-instance config because pool workers are
+// spawned deep inside `ParallelGzipWriter::new`. Tests serialize
+// access via `--test-threads=1`.
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Pool op count at which the acting worker panics. `u64::MAX` =
+    /// disarmed (default). Call [`reset`] at the start AND end of
+    /// any test that arms this so sibling tests don't inherit state.
+    pub static PANIC_AT_POOL_OP_COUNT: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    /// Monotonic total of compress ops dispatched across the pool.
+    /// Each worker `fetch_add(1)` immediately after dequeuing a chunk;
+    /// the (post-increment) count is compared to
+    /// `PANIC_AT_POOL_OP_COUNT`.
+    pub static POOL_OP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    /// Disarm and zero the counters.
+    pub fn reset() {
+        PANIC_AT_POOL_OP_COUNT.store(u64::MAX, Ordering::Relaxed);
+        POOL_OP_COUNT.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Default chunk size: 2 MB uncompressed per gzip member. Larger chunks
 /// amortize the 18-byte per-member framing and let DEFLATE find more
 /// cross-sequence matches; smaller chunks expose more parallelism at
@@ -217,6 +245,19 @@ fn worker_loop(
             Ok(v) => v,
             Err(_) => return, // channel closed, producer done
         };
+
+        // Test-only: arm via `test_hooks::PANIC_AT_POOL_OP_COUNT`.
+        // Simulates an OOM or internal unwrap inside a compress
+        // worker. Release builds compile this block out entirely.
+        #[cfg(feature = "test-hooks")]
+        {
+            use std::sync::atomic::Ordering;
+            let n = test_hooks::POOL_OP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == test_hooks::PANIC_AT_POOL_OP_COUNT.load(Ordering::Relaxed) {
+                panic!("test-hooks: parallel_gzip pool op #{n} (seq {seq}) panicking");
+            }
+        }
+
         let compressed = match compress_one(&raw) {
             Ok(v) => v,
             Err(_) => return, // writer thread will see an incomplete stream and error

@@ -12,23 +12,28 @@ pipeline primitives documented in
 [`reference/pipeline.md`](../reference/pipeline.md) and
 [`reference/pipelined-reader-paths.md`](../reference/pipelined-reader-paths.md).
 
-## Current state (2026-04-23)
+## Current state (2026-04-24)
 
-Europe runs landed today (host `plantasjen`, `target=hdd` output per
-`brokkr env`):
+Host `plantasjen`, I/O paths both on `/dev/nvme1n1p1` (ext4) - the
+`target=hdd` drive label in `brokkr env` is misleading for these
+benches, see "NVMe target correction" below.
 
-| mode    | uuid       | commit    | wall    | notes |
-|---------|------------|-----------|---------|-------|
-| bench   | `043cf4b6` | `b891514` | 53.0 s  | baseline, pre-coalesce |
-| alloc   | `99c58e53` | `b891514` | 54.7 s  | alloc-instrumented |
-| hotpath | `fd2ef4e7` | `b891514` | 64.7 s  | hotpath-instrumented |
-| bench   | `740ed14f` | `244c6ec` | 56.3 s  | **post-coalesce**, `--bench 1` |
+| scale  | mode    | uuid       | commit    | wall    | notes |
+|--------|---------|------------|-----------|---------|-------|
+| europe | bench   | `043cf4b6` | `b891514` | 53.0 s  | baseline, pre-coalesce |
+| europe | alloc   | `99c58e53` | `b891514` | 54.7 s  | alloc-instrumented |
+| europe | hotpath | `fd2ef4e7` | `b891514` | 64.7 s  | hotpath-instrumented |
+| europe | bench   | `740ed14f` | `244c6ec` | 56.3 s  | post-coalesce, `--bench 1` |
+| europe | bench   | `25d71ce7` | `1f97fae` | 68.0 s  | post-walker, europe-scale regression (+21 %) |
+| planet | bench   | `1aef9d9c` | `244c6ec` | 135.1 s | pre-walker, planet baseline |
+| planet | bench   | `bb392a17` | `1f97fae` | **123.3 s** | **post-walker, -9 % vs pre-walker** |
+| planet | bench   | `7f6288c0` | `1f97fae` | **118.1 s** | post-walker `--io-uring`, -4 % vs buffered |
+| planet | hotpath | `e42b0c8c` | `1f97fae` | 119.3 s | post-walker hotpath, main thread blocked 80 % on writer |
 
-Planet baseline still pending; `overnight.sh:272-275` runs
-`brokkr sort --dataset planet --bench 1`, `--io-uring --bench 1`,
-`--hotpath`, `--alloc` tonight on `244c6ec`, lands morning of
-2026-04-24. Denmark (indexed, sorted) 366 ms, Japan (indexed, sorted)
-1.33 s,
+Europe shows a +21 % wall regression on `1f97fae`; planet shows a
+-9 % wall *improvement* on the same commit. The walker is
+net-positive at production scale. Denmark (indexed, sorted) 366 ms,
+Japan (indexed, sorted) 1.33 s,
 [`reference/performance.md:774`](../reference/performance.md#L774).
 
 ### Baseline anatomy (`043cf4b6`, pre-coalesce)
@@ -98,25 +103,283 @@ already the writer thread - `pipeline_send_wait = 34.97 s` over a
 35.00 s WRITE_LOOP proves the channel was full continuously, so
 collapsing the producer's 522 k sends into one shifts time from
 `SORT_WRITE_LOOP` to `SORT_FLUSH` without making either thread's real
-work shorter. On the HDD-EXDEV fallback path (`copy_range_fallback`,
-256 KB pread+write), the writer's throughput ceiling is sequential
-HDD bandwidth, not syscall overhead.
+work shorter. The writer's throughput ceiling here is in-kernel ext4
+`copy_file_range` on NVMe at ~600-800 MB/s - not syscall overhead,
+not HDD bandwidth (see "NVMe target correction" below).
 
 Peak RSS also moved +100 MB (805 → 911 MB pass 1; 817 → 913 MB pass
 2) with no obvious code reason. Most likely allocator watermark under
 a different request pattern - worth watching on planet, not worth
 chasing on europe.
 
+### Post-walker anatomy (`25d71ce7`, commit `1f97fae`) - europe regression
+
+After migrating pass 1 to `HeaderWalker` (opportunity #4, below):
+
+- `SORT_INDEX_BUILD` **27.41 s** (from 18.42 s, **+49 %**)
+- `SORT_FLUSH` 38.38 s (unchanged from 37.74 s)
+- Total wall **68.0 s** (from 56.3 s, **+21 %**)
+
+IO profile shifted as intended:
+
+- pass 1 disk read: **2.86 GB** (from 28.19 GB / 34.10 GB on the two
+  earlier runs - a 10-12x reduction, exactly what `fadvise(RANDOM)` +
+  pread-only headers should produce)
+- pass 1 vol_cs: 365 653 (from 103 530 / 123 170 - ~3x more because
+  each pread blocks at queue depth 1 where BufReader's readahead
+  batches amortise sync waits across 256 KB)
+
+The migration eliminated page-cache pollution (35 GB of payload
+never touched) at the cost of wall: 522 168 serial 4 KB preads at
+~50 µs each of NVMe random-read latency = ~26 s of unhidden sync
+waits, vs BufReader + `fadvise(SEQUENTIAL)`'s ~16 s of overlapped
+readahead for the same walk.
+
+Pass 2 did **not** get faster from the freed page cache. Pass 2
+uses in-kernel `copy_file_range` on ext4, which bypasses the user
+page cache for the copy itself, and even if it did reuse cached
+pages the 30 GB RAM host has long since evicted pass 1's readahead
+by the time pass 2 reaches them. So the IO-reduction win is pure
+cost on this europe benchmark: more wall, same pass-2 time.
+
+### Planet anatomy (`1aef9d9c` → `bb392a17`) - walker wins at scale
+
+Same A/B on the planet dataset (92 GB input):
+
+| phase                    | pre-walker `244c6ec` | post-walker `1f97fae` | delta |
+|--------------------------|----------------------|-----------------------|-------|
+| `SORT_INDEX_BUILD`       | 18.94 s              | **6.73 s**            | **-65 %** |
+| pass 1 disk read         | 31.94 GB             | **674 MB**            | **-98 %** |
+| pass 1 vol_cs            | 87 191               | 90 990                | flat |
+| `SORT_FLUSH`             | 113.60 s             | 116.43 s              | +2.5 % (noise) |
+| `SORT_PASS2_END` cleanup | 2.56 s, 32 788 majflt | **absent**            | **vanished** |
+| total wall               | 135.1 s              | **123.3 s**           | **-9 %** |
+
+Three things moved cleanly in the right direction:
+
+- **Pass 1 IO:** 32 GB → 674 MB. Bigger ratio than europe (-98 % vs
+  -91 %) because planet has a higher blob-count-to-bytes ratio and
+  the walker reads only headers.
+- **Pass 1 wall:** 18.94 s → 6.73 s, *down*, not up. The europe
+  regression model (QD=1 pread latency losing to BufReader readahead)
+  predicted roughly +40 s on planet extrapolating europe's per-blob
+  cost linearly. That didn't happen. Two factors plausibly combine:
+  (i) page cache for the planet header regions was warm from
+  indexdata generation earlier in the session - 674 MB of physical
+  disk read for ~1.3 M blobs × 4 KB pages = ~17 % of blob-header
+  pages actually faulted, the rest hit cache at ~µs latency;
+  (ii) SORT_INDEX_BUILD is walltime, not CPU - pre-walker's 18.94 s
+  already included plenty of BufReader-imposed stall, so the absolute
+  headroom for pread to lose was smaller than europe suggested.
+- **`SORT_PASS2_END` cleanup vanished:** the 32 788 majflt and 2.56 s
+  of shutdown cost in the pre-walker run - process pages evicted by
+  the pass-2 write loop's page-cache fill - disappeared entirely in
+  post-walker. Exactly what notes predicted for europe but didn't
+  see there; on planet at 3x the byte volume the effect shows up
+  plainly.
+
+Pass 2 (`SORT_FLUSH`) is flat at ~115 s - bandwidth-limited by
+in-kernel ext4 `copy_file_range` on NVMe (see "NVMe target
+correction" below), insensitive to what pass 1 did with the page
+cache.
+
+Caveat on warm-cache influence: the 674 MB figure is consistent with
+~17 % of header pages faulting, so cache state accounts for part of
+the pass-1 win. A cold-cache planet run would land pass 1 closer to
+25-35 s (scaling europe's per-blob miss cost), so the *warm-cache*
+post-walker is ~20 s faster than a cold-cache one would be. Even at
+the pessimistic end (pass 1 = 35 s), total planet wall would be
+~152 s vs 135 s pre-walker - a ~13 % regression, still smaller than
+europe's +21 % and likely small enough to accept as the price of the
+IO reduction. A `drop_caches` planet bench on `1f97fae` would close
+this out; parked as future work, not blocking.
+
+### NVMe target correction (2026-04-24)
+
+Earlier drafts of this note described pass 2 as "HDD-EXDEV
+bandwidth-limited" - based on `brokkr env` reporting
+`target=hdd`. That was wrong. The actual bench paths are:
+
+- input: `data/planet-...osm.pbf` → `/dev/nvme1n1p1`
+- output: `data/bench-tmp/bench-sort-output.osm.pbf` → `/dev/nvme1n1p1`
+
+Same NVMe ext4 partition. `copy_file_range` stays in-kernel; EXDEV
+fallback (`copy_range_fallback_pwrite`, 256 KB pread+write) never
+triggers. The `target=hdd` drive label in `brokkr env` corresponds
+to the `target/` directory (cargo build artifacts on HDD) and is
+not the scratch path the bench uses. The scratch drive label
+(`scratch=nvme`) is the one that matters for sort I/O.
+
+Writer counters on `bb392a17` confirm: `writer_payload_copy_range_items=1`
+accepting 92 GB, `writer_write_ns=114.94 s`, all channel-wait
+counters near-zero. 92 GB / 114.9 s ≈ **800 MB/s in-kernel ext4 CFR**
+- that's the bandwidth the writer actually saw. No EXDEV, no HDD.
+
+Implications for opportunity #2 ("Writer-side throughput"):
+- The NVMe→NVMe comparison listed there is *this* bench. No need
+  to re-bench on different storage.
+- The 800 MB/s ceiling is an ext4 CFR characteristic, not pbfhogg
+  code. ext4 CFR does in-kernel copy (no reflink support). A
+  reflink-capable fs (btrfs, xfs with `reflink=1`) would collapse
+  the same op to O(1) metadata and pass 2 would drop to <1 s -
+  but that's an fs migration, not a code change.
+- Parallel writer chunking (round-robin the coalesced CFR across N
+  workers) still has theoretical upside: one giant CFR pins one
+  worker thread; chunking lets 4 workers issue CFRs concurrently,
+  potentially approaching the NVMe device's raw bandwidth (several
+  GB/s) rather than the single-thread ext4 CFR ceiling. Size
+  against an actual measurement before committing days.
+
+### io_uring anatomy (`7f6288c0`, commit `1f97fae`)
+
+Planet post-walker with `--io-uring`:
+
+| phase             | buffered `bb392a17` | io_uring `7f6288c0` | delta |
+|-------------------|---------------------|---------------------|-------|
+| `SORT_INDEX_BUILD`| 6.73 s              | 5.05 s              | -1.7 s |
+| `SORT_FLUSH`      | 116.43 s            | **111.23 s**        | -5.2 s |
+| `SORT_PASS2_END`  | absent              | 1.65 s, 25 478 majflt | **+1.65 s, thrashing returns** |
+| total wall        | 123.3 s             | **118.1 s**         | **-4 %** |
+| peak threads in FLUSH | 2               | 67                  | uring SQPOLL / kernel threads |
+
+Writer counters on `7f6288c0`:
+- `writer_uring_submit_calls` = 350 993
+- `writer_uring_submit_and_wait_calls` = 14 009
+- `writer_uring_submit_ns` = 406 ms
+- `writer_uring_cq_wait_ns` = 1.09 s
+- `writer_write_ns` = 111.2 s (≈ `flush_ns`)
+- `writer_payload_copy_range_items` = 1 (accepts op) but
+  `handle_copy_range_uring` internally chunks to 256 KB
+  ReadFixed+WriteFixed pairs - no `copy_file_range` syscall issued
+- `SORT_FLUSH` disk read = 87 GB (confirms the uring path reads
+  input bytes through the device, unlike ext4 in-kernel CFR which
+  bypasses the read_bytes counter)
+
+So io_uring saturates the NVMe differently: ~92 GB / 111.2 s ≈
+**827 MB/s** aggregate, marginally above the buffered path's
+~800 MB/s. Both paths are single-thread-bottlenecked (one pool
+worker holds the sole `OutputChunk::CopyRange`), io_uring just
+gets slightly better per-thread throughput via registered buffers
+and sq/cq overlap.
+
+Trade-off: io_uring reintroduces the `SORT_PASS2_END` page-cache
+thrashing cost (25 478 majflt, 1.65 s) that the post-walker
+buffered path eliminated - because uring reads planet payload
+bytes through the page cache (87 GB Disk Read in SORT_FLUSH),
+whereas ext4 in-kernel CFR bypasses the user page cache entirely.
+Net win is 4 %, but the "cleaner cache behaviour" property of
+post-walker buffered is partly given back.
+
+### Hotpath anatomy (`e42b0c8c`, commit `1f97fae`)
+
+Planet post-walker with `--hotpath --no-mem-check` (2x input
+memory preflight rejects planet; the bench doesn't actually need
+it, sort is O(num_blobs) memory).
+
+Wall 119.3 s. Top annotated frames:
+
+| frame                          | calls | total    | % wall |
+|--------------------------------|-------|----------|--------|
+| `pbfhogg::main`                | 1     | 119.24 s | 100 %  |
+| `sort::sort`                   | 1     | 119.24 s | 100 %  |
+| `sort::build_blob_index`       | 1     | 4.31 s   | 3.6 %  |
+| `read::blob_wire::parse`       | 50 819| 111 ms   | 0.09 % |
+| `write::framing::frame_blob_into` | 1 | 71 µs    | ~0 %   |
+
+The remaining ~96 % (≈115 s) is outside any `#[hotpath::measure]`
+annotation - specifically, inside the pool worker's
+`copy_range_to_fd` in `parallel_writer.rs:364`, which isn't
+annotated. `writer.flush()` itself isn't annotated either.
+
+Thread view: main thread status **Blocked 20 % avg CPU** (peak
+64 % during pass 1), the rest waiting on the writer channel
+drain. This confirms what the metrics already showed
+(`writer_flush_ns = 116.4 s`, main thread spending nearly all its
+time in `writer.flush()`). Hotpath adds no new information here -
+the hot frame is in the worker thread and isn't decorated.
+
+If we want hotpath-level granularity inside the writer, candidates
+to annotate:
+- `copy_range_to_fd` (`parallel_writer.rs:364`)
+- `copy_range_fallback_pwrite` (only active on EXDEV - not this
+  bench)
+- `handle_copy_range_uring` (`uring_writer.rs:416`)
+- `PbfWriter::flush` (`writer.rs`)
+
+Not worth adding for opp #2 sizing - the wall-clock counters
+already localise the 115 s to a known code region. Annotate only
+if we need per-chunk timing distribution inside the copy loop.
+
 ### Takeaway
 
-Opportunity #1 is **mechanically correct and landed**: the producer
-is now O(runs) syscalls instead of O(blobs), and the accounting
-(vol_cs, majflt at shutdown, send-wait) reflects that cleanly. The
-wall-time thesis ("syscalls are the bottleneck") was wrong for this
-target: the writer was already drain-limited. The new lever for
-wall-time work is the writer side, not the producer side. Planet
-tonight (on `244c6ec`) will settle whether coalescing pays off once
-the target filesystem is NVMe rather than HDD-EXDEV.
+- **Opportunity #1** (coalescer) is mechanically correct and landed:
+  producer is now O(runs) syscalls instead of O(blobs), and the
+  accounting (vol_cs, majflt at shutdown, send-wait) reflects that
+  cleanly. Wall didn't move on europe because the writer was already
+  drain-limited (`pipeline_send_wait = 34.97 s` over a 35.00 s
+  WRITE_LOOP); planet confirms the same shape (`SORT_FLUSH` flat at
+  ~115 s either side of the walker change).
+- **Opportunity #4** (`HeaderWalker` pass 1) is landed. At europe
+  scale it's +21 % wall (regression). At planet scale it's -9 %
+  wall, because the `SORT_PASS2_END` page-cache-thrashing shutdown
+  cost (32 788 majflt, 2.56 s) vanishes and pass 1 is fast enough
+  that QD=1 latency doesn't dominate. Production scale = planet
+  scale, so the walker is a net win in the scenario that matters.
+- The europe regression stands but is a non-production-scale
+  artifact. Not worth clawing back unless a separate europe-scale
+  consumer surfaces.
+- **Current wall is single-thread-writer-bound.** Planet post-walker
+  buffered is 123.3 s, `--io-uring` is 118.1 s (-4 %). Both cap at
+  ~800-830 MB/s sustained because one pool worker holds the
+  coalesced CFR op. The NVMe device can do several GB/s; breaking
+  the per-thread ceiling (opp #2) is the only code-level lever
+  left on the already-sorted path.
+- **io_uring is not a drop-in upgrade.** It buys 4 % wall at the
+  cost of reintroducing page-cache thrashing on shutdown (the
+  exact cleanup cost the post-walker buffered path eliminated).
+  Keep the buffered path as default; use `--io-uring` only when
+  the 4 % wall matters more than cleaner cache residency.
+
+### Mitigations (parked - not justified by planet data)
+
+Originally scoped to claw back the pass-1 wall regression on europe.
+Planet data shows the walker is net positive at production scale,
+so these are parked. Retained here for reference in case a
+different consumer (europe-scale pipeline, cold-cache measurement
+requirement) surfaces:
+
+1. **Parallel walker (file-split + scan-forward).** Split the file
+   into N byte-ranges. Each worker scans forward from its start to
+   the next valid BlobHeader boundary (BlobHeader is self-delimiting:
+   4-byte length prefix + parseable header type/size), then walks its
+   region serially. Reassemble the per-worker `Vec<BlobEntry>`s in
+   file-offset order at the end. Gives NVMe queue-depth parallelism;
+   preserves `fadvise(RANDOM)` on each worker fd. No existing
+   "sync to next BlobHeader" primitive in the tree - needs one. Days.
+2. **io_uring batch-pread walker.** New primitive next to
+   `HeaderWalker` that submits K header probes in flight, harvests
+   completions, submits more. Recovers NVMe concurrency at the
+   primitive level; single-threaded call-site; preserves
+   `fadvise(RANDOM)`. Days; would also benefit `getid`,
+   `apply_changes::scanner`, `inspect/scan.rs` if generalised.
+3. **Streaming `posix_fadvise(DONTNEED)` on the BufReader path.**
+   Revert to `FileReader` + `fadvise(SEQUENTIAL)` (keeps the fast
+   walk), but call `posix_fadvise(DONTNEED)` on each consumed 256 MB
+   region as pass 1 progresses. Total IO stays at 34 GB but resident
+   cache stays bounded - stops polluting the page cache for
+   concurrent workloads. Zero wall impact on europe-to-HDD (pass 2
+   doesn't reuse the cache) but harmless there; likely positive on
+   hosts with concurrent memory pressure. Hours.
+4. **`HeaderWalker` with `fadvise(SEQUENTIAL)` on the fd.** Opt-in
+   flag on the walker primitive to use SEQUENTIAL instead of RANDOM.
+   Restores async readahead pipelining for the monotonic
+   walk - but pulls payload pages into cache too, so it's
+   essentially BufReader semantics with a different code path.
+   Collapses back to the pre-walker behavior; not a distinct win.
+
+If the europe regression later matters: #1 or #2 recover wall,
+#3 is a cheap halfway point (keep BufReader's wall, lose only the
+cache pollution).
 
 Recent instrumentation: commit `4e3c7ea` (2026-04-22) added phase
 markers (`SORT_INDEX_BUILD`, `SORT_OVERLAP_DETECT`,
@@ -140,38 +403,46 @@ collapses into a single run.
 Measured on europe (`740ed14f`): `sort_copy_range_calls = 1`,
 `sort_copy_range_coalesced = 522 167`, `writer_pipeline_send_wait`
 35 s → 2.65 µs. Did not move wall (53.0 s → 56.3 s, single-sample)
-because the writer thread was already drain-limited - see "Takeaway"
-above. Remains potentially useful on NVMe-target production
-(no EXDEV fallback) and for any future change that unpins the
-writer.
+because the writer thread was already drain-limited by ext4
+in-kernel CFR bandwidth - see "Takeaway" and "NVMe target
+correction" above. Remains useful for any future change that
+unpins the writer (e.g. parallel-writer chunking, opportunity #2).
 
-### 2. Writer-side throughput on already-sorted input [new top priority]
+### 2. Writer-side throughput on already-sorted input [top priority]
 
-With the producer now doing one syscall, the writer is doing all the
-wall. Options worth sizing:
+With the producer doing one syscall, the writer is doing all the
+wall. At planet scale that's 116 s of in-kernel ext4 CFR on NVMe
+at ~800 MB/s (buffered) or 111 s of uring ReadFixed+WriteFixed at
+~830 MB/s - both **single-thread-bound** (see "io_uring anatomy"
+above). Options worth sizing:
 
-- **Parallel writer on large CFR**: today `parallel_writer.rs`
-  round-robins `OutputChunk::CopyRange` ops to workers, so one giant
-  coalesced op goes to a single worker (see
-  `parallel_writer.rs:276-289`). Pre-coalesce, 522 k ops
+- **Parallel writer on large CFR [highest-value remaining lever]**:
+  today `parallel_writer.rs` round-robins `OutputChunk::CopyRange`
+  ops to workers, so one giant coalesced op goes to a single worker
+  (see `parallel_writer.rs:276-289`). Pre-coalesce, 522 k ops were
   round-robined across the pool. Chunking a coalesced run back into
-  N pieces at dispatch time would restore pipelining. For the HDD
-  target this may or may not help (seek contention); for NVMe it
-  should.
-- **io_uring passthrough**: the uring writer's `handle_copy_range_uring`
-  already chunks into 256 KB WriteFixed ops (`uring_writer.rs:416`).
-  Benchmark pending whether the io_uring variant beats the buffered
-  variant on an already-sorted planet.
-- **Target filesystem**: benches hit HDD scratch (`target=hdd`).
-  Real production targets NVMe; `copy_file_range` stays in-kernel
-  (reflink on btrfs/xfs, copy-offload elsewhere) rather than falling
-  through to userspace pread+write. A single NVMe→NVMe bench on
-  europe would clarify how much of the baseline 53 s is EXDEV tax
-  vs. genuine work.
+  N pieces at dispatch time would restore pipelining - 4 concurrent
+  CFR issuers against ext4 could approach the NVMe device's raw
+  bandwidth (several GB/s) rather than the single-thread 800 MB/s
+  ceiling. If the cap is per-worker-thread, this could be a 2-4x
+  win on planet pass 2; if ext4 journal-serialises the CFRs, less.
+  Cheap disambiguation before writing code: run two concurrent
+  `cp` of identical files on the same fs, see if aggregate
+  bandwidth goes up. Days of code either way, but de-risk first.
+- **io_uring passthrough [measured -4 %, not a default swap]**:
+  `--io-uring --bench 1` on planet post-walker (`7f6288c0`) is
+  118.1 s vs 123.3 s buffered. 4 % faster, but reintroduces
+  page-cache thrashing on cleanup (25 k majflt, 1.65 s). The
+  buffered path is still the cleanest default. See "io_uring
+  anatomy" for full numbers. Not worth further work on this
+  bullet in isolation.
+- **Reflink-capable fs (btrfs, xfs with `reflink=1`)**: `copy_file_range`
+  becomes an O(1) metadata op. Pass 2 drops from 116 s to <1 s. Not
+  a code change - fs migration, out of scope for sort-level
+  optimisation but worth noting as the theoretical ceiling.
 
-Hours-to-days scope depending on how much writer-side restructuring
-this wants. Size against planet overnight data (`2026-04-24`) before
-picking a specific path.
+Days scope for the parallel-writer bullet. Disambiguate the
+ext4-journal-serialisation risk with a `cp` probe first (minutes).
 
 ### 3. Parallel overlap-rewrite in pass 2
 
@@ -188,22 +459,28 @@ dataset or injection would be a prerequisite).
 
 Hours scope once the write path accepts out-of-order completions.
 
-### 4. `HeaderWalker`-based pass 1 on non-indexed input
+### 4. `HeaderWalker`-based pass 1 [LANDED 1f97fae, planet net positive]
 
-Pass 1 currently decompresses non-indexed blobs to recover their
-`(kind, min_id, max_id)`.
-[`HeaderWalker`](../src/read/header_walker.rs) + pread workers do the
-same with header reads only, falling back to decompress only where
-indexdata is missing.
+Migrated pass 1 from `FileReader` (BufReader + `fadvise(SEQUENTIAL)`)
+to `HeaderWalker` (pread + `fadvise(RANDOM)`). Mirrors
+`inspect/scan.rs::try_index_only_scan`. `direct_io` now ignored
+inside pass 1 (walker owns the fd; non-indexed fallback uses
+`walker.pread_data`).
 
-Estimated 1.2-2x pass 1 time on non-indexed input. Indexed input
-already skips the decompress via the existing fast path, so this
-only helps inputs without indexdata, which the production pipeline
-never has.
+Europe (`25d71ce7`): pass 1 disk read 2.86 GB (from ~34 GB, **-91 %**),
+pass 1 wall 27.4 s (from 16-18 s, **+49 %**), total wall 68.0 s
+(from 56.3 s, **+21 %**) - regression.
 
-Days scope - adapting the HeaderWalker + pread pattern from
-`getid` / `apply-changes::scanner`. Deprioritise until an
-unsorted-input benchmark exists to size the win.
+Planet (`bb392a17` vs `1aef9d9c`): pass 1 disk read 0.67 GB (from
+32 GB, **-98 %**), pass 1 wall 6.73 s (from 18.94 s, **-65 %**),
+total wall 123.3 s (from 135.1 s, **-9 %**) - win. `SORT_PASS2_END`
+cleanup (2.56 s + 32 788 majflt from page-cache thrashing)
+vanishes completely.
+
+Planet is the production scale, so the migration is a net positive
+in the scenario that matters. See "Mitigations" above for notes on
+clawing back the europe regression if a europe-scale consumer ever
+surfaces; currently parked.
 
 ### 5. Frame buffer hoisting (micro)
 
@@ -231,18 +508,31 @@ Minutes scope. Land only as part of a sweep of related changes.
 
 ## Prerequisites before shipping anything
 
-1. **Europe baseline + post-coalesce run landed** (`043cf4b6` and
-   `740ed14f`). Planet baseline still scheduled for
-   `overnight.sh:272-275` tonight, lands 2026-04-24 on commit
-   `244c6ec`. That will tell us whether coalescing pays off when the
-   workload scales and whether the `target=hdd` quirk explains the
-   europe wall-flat result.
-2. **NVMe→NVMe europe bench** to isolate the EXDEV-fallback cost in
-   the writer from the genuine copy work. Prereq for sizing
-   opportunity #2 ("Writer-side throughput").
-3. **Unsorted-input dataset** for opportunities #3 and #4. None in
+1. **Europe runs landed** (`043cf4b6` pre-coalesce, `740ed14f`
+   post-coalesce, `25d71ce7` post-walker).
+2. **Planet runs landed** (`1aef9d9c` pre-walker 135.1 s,
+   `bb392a17` post-walker 123.3 s). Walker confirmed net positive
+   at production scale; europe regression confirmed a
+   non-production-scale artifact.
+3. **NVMe→NVMe measurement** obtained - the existing europe and
+   planet benches already run NVMe→NVMe on the same ext4 partition
+   (see "NVMe target correction"). No separate bench needed; the
+   800 MB/s in-kernel ext4 CFR ceiling is what the writer sees.
+4. **Planet `--io-uring` bench landed** (`7f6288c0`, 118.1 s, -4 %
+   vs buffered). See "io_uring anatomy" - marginal win, not worth
+   defaulting to.
+5. **Planet hotpath landed** (`e42b0c8c`, 119.3 s). Confirms main
+   thread blocked on writer; annotated frames cover only 4 % of
+   wall. See "Hotpath anatomy".
+6. **Cold-cache planet bench (`drop_caches` on `1f97fae`)** to close
+   out the warm-cache caveat on the -65 % pass-1 wall win. Parked
+   as future work, not blocking.
+7. **ext4-journal-serialisation probe** (two concurrent `cp` on
+   same fs) before committing to the parallel-writer-chunking
+   code change in opportunity #2. Minutes.
+8. **Unsorted-input dataset** for opportunity #3. None in
    `brokkr.toml` today; would need configuring (or a synthetic
-   fixture) before those opportunities can be sized.
+   fixture) before that opportunity can be sized.
 
 ## Cross-references
 

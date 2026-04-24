@@ -241,7 +241,13 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderO
     }
 
     crate::debug::emit_marker("SORT_FLUSH_START");
+    // WAIT_WRITER spans the main thread's wait on the writer worker
+    // to drain the coalesced `copy_file_range` (or its uring / EXDEV
+    // fallback equivalent). On already-sorted input this is ~94 %
+    // of wall, so --stalls attributes it as WAIT_WRITER.
+    crate::debug::emit_marker("WAIT_WRITER_START");
     writer.flush()?;
+    crate::debug::emit_marker("WAIT_WRITER_END");
     crate::debug::emit_marker("SORT_FLUSH_END");
     #[allow(clippy::cast_possible_wrap)]
     if let Ok(meta) = std::fs::metadata(output) {

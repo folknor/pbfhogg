@@ -625,6 +625,7 @@ impl<W: Write> PbfWriter<W> {
     /// In pipelined mode, this joins the writer thread and propagates any
     /// deferred compression or I/O errors. After flush, the pipeline is
     /// stopped and subsequent writes go through the direct (non-pipelined) path.
+    #[hotpath::measure]
     pub fn flush(&mut self) -> io::Result<()> {
         let t_flush = std::time::Instant::now();
         if let Some(mut pipeline) = self.pipeline.take() {

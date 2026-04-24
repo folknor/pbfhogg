@@ -19,6 +19,28 @@ use super::pass2::SlimInterpWay;
 
 use super::super::format::*;
 
+// Fault-injection hooks for tests. Gated behind the `test-hooks`
+// Cargo feature; release builds don't compile this module at all.
+// Static atomic fired inside the rayon streets par_iter closure on
+// a matching way_idx. Verifies that the `PathGuard::dir()` bucket
+// cleanup (see ADR-0003) fires correctly when a rayon worker
+// panics during Pass 3 Stage A.
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Way index at which the streets Stage A rayon worker panics.
+    /// `u32::MAX` = disarmed (default). Call [`reset`] at the start
+    /// AND end of any test that arms this so sibling tests don't
+    /// inherit state.
+    pub static PANIC_AT_STREETS_WAY_IDX: AtomicU32 = AtomicU32::new(u32::MAX);
+
+    /// Disarm the hook.
+    pub fn reset() {
+        PANIC_AT_STREETS_WAY_IDX.store(u32::MAX, Ordering::Relaxed);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cell entry types
 // ---------------------------------------------------------------------------
@@ -275,6 +297,23 @@ pub(super) fn bucketed_cell_assignment_fused(p: &FusedCellAssignmentParams<'_>) 
         let entries: Vec<(u64, Option<u64>, u32, u16)> = (chunk_start..chunk_end)
             .into_par_iter()
             .flat_map_iter(|way_idx| {
+                // Test-only: arm via
+                // `test_hooks::PANIC_AT_STREETS_WAY_IDX`. Simulates a
+                // mid-Stage-A crash inside a rayon worker. Rayon
+                // propagates the panic to the `.collect()` call site
+                // on the main thread; the `PathGuard::dir()` wrappers
+                // around `fine_bucket_dir` / `coarse_bucket_dir`
+                // (ADR-0003) sweep the scratch trees on the unwind.
+                // Release builds compile this out entirely.
+                #[cfg(feature = "test-hooks")]
+                if test_hooks::PANIC_AT_STREETS_WAY_IDX
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    == way_idx
+                {
+                    panic!(
+                        "test-hooks: geocode pass3 stage A streets way {way_idx} panicking"
+                    );
+                }
                 let offset = way_idx as usize * STREET_WAY_SIZE;
                 let rec = street_ways_mmap.get(offset..offset + STREET_WAY_SIZE)
                     .and_then(|b| <&[u8; STREET_WAY_SIZE]>::try_from(b).ok())

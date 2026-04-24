@@ -18,6 +18,14 @@ mod admin;
 mod interp;
 mod pass3;
 
+// Under the `test-hooks` feature, expose Pass 3 Stage A fault-
+// injection hooks so integration tests can arm them. The rest of
+// `pass3` stays crate-private.
+#[cfg(feature = "test-hooks")]
+pub mod pass3_test_hooks {
+    pub use super::pass3::test_hooks::{PANIC_AT_STREETS_WAY_IDX, reset};
+}
+
 use strings::StringPool;
 
 pub(super) type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;

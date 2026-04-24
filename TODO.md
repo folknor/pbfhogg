@@ -80,7 +80,8 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
 `fault_injection_uring_writer_dispatch_panic_surfaces_via_flush` /
 `fault_injection_diff_parallel_shard_panic_surfaces_and_sweeps_scratch` /
 `fault_injection_derive_parallel_shard_panic_surfaces_and_sweeps_scratch` /
-`fault_injection_altw_stage3_bucket_panic_surfaces_and_cleans_scratch` in
+`fault_injection_altw_stage3_bucket_panic_surfaces_and_cleans_scratch` /
+`fault_injection_geocode_pass3_streets_panic_sweeps_bucket_dirs` in
 `tests/fault_injection.rs` are `#[ignore]`d because their fault-injection hooks are
 **process-global static atomics** that race with any concurrently-running test that
 uses the same pipeline (most apply-changes / derive-changes / diff tests do). They
@@ -785,10 +786,27 @@ infrastructure first).
   the full stage-3-panics-stage-4-recovers path since stage 4
   waits on the router.
 
-  Remaining pipelines to cover: geocode Pass 3 Stage A.
-  Hook-shape picker: per-instance field when the pipeline has a
-  public config struct on its entry path, static atomics
-  otherwise. Scratch tracking helpers: `common::snapshot_dir` and
+  `geocode_index/builder/pass3.rs` Stage A landed 2026-04-24:
+  `PANIC_AT_STREETS_WAY_IDX` atomic, fired inside the rayon
+  `par_iter().flat_map_iter(|way_idx| ...)` closure that
+  processes streets. Re-exported as
+  `geocode_index::builder::pass3_test_hooks`. Canonical test
+  `fault_injection_geocode_pass3_streets_panic_sweeps_bucket_dirs`
+  confirms the rayon worker panic propagates to the `.collect()`
+  call on the main thread, the `PathGuard::dir()` wrappers
+  around `fine_bucket_dir` / `coarse_bucket_dir` (landed under
+  ADR-0003) sweep the `.buckets-levelN` scratch trees on the
+  unwind, and `build_geocode_index` returns `Err`. No bug
+  surfaced; the existing PathGuard pattern works correctly under
+  rayon panic propagation.
+
+  **All planned pipelines covered.** Harness is complete for
+  apply-changes, parallel_writer, parallel_gzip, uring_writer,
+  diff/parallel, derive_parallel, altw external stage 3, and
+  geocode Pass 3 Stage A. Hook-shape picker (kept for future
+  pipelines): per-instance field when the pipeline has a public
+  config struct on its entry path, static atomics otherwise.
+  Scratch tracking helpers: `common::snapshot_dir` and
   `common::assert_scratch_unchanged`.
 
   **Consolidation opportunity (deferred):** the four static-atomic

@@ -1735,3 +1735,52 @@ fn merge_rejects_force_with_locations_on_ways_on_non_indexed() {
         "error should point at the indexed-generation workflow, got: {msg}",
     );
 }
+
+/// `MergeOptions::jobs = Some(1)` is rejected at `merge()` entry.
+/// A single worker has a deadlock hazard on mid-stream worker panic
+/// (scanner blocks on a full candidate channel with no one draining);
+/// the library refuses up front rather than accept the footgun.
+/// `jobs: None`, `Some(0)`, and `Some(2+)` all remain valid.
+#[test]
+fn merge_rejects_jobs_equal_one() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("out.osm.pbf");
+
+    write_test_pbf_sorted(
+        &base,
+        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None }],
+        &[],
+        &[],
+    );
+
+    // Minimal OSC; the rejection fires at worker_count computation
+    // before any blob work.
+    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6"></osmChange>"#);
+
+    let result = merge(
+        &base, &osc, &output,
+        &MergeOptions {
+            compression: Compression::default(),
+            direct_io: false,
+            io_uring: false,
+            force: true,
+            locations_on_ways: false,
+            jobs: Some(1),
+            #[cfg(feature = "test-hooks")]
+            panic_at_blob_seq: None,
+        },
+        &pbfhogg::HeaderOverrides::default(),
+    );
+    let err = match result {
+        Ok(_) => panic!("must reject jobs=Some(1)"),
+        Err(e) => e,
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("at least 2") || msg.contains(">= 2"),
+        "error should name the minimum worker count, got: {msg}",
+    );
+}

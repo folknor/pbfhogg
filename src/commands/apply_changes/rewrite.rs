@@ -51,7 +51,10 @@ pub struct MergeOptions {
     pub locations_on_ways: bool,
     /// Override the worker-pool size used by the descriptor-first
     /// pipeline. `None` (or `Some(0)`) keeps the default `nproc - 2`
-    /// heuristic (leaves two cores for scanner + drain, min 1).
+    /// heuristic (leaves two cores for scanner + drain, minimum 2
+    /// workers). `Some(1)` is rejected at runtime - a single worker
+    /// has a deadlock hazard on mid-stream worker panic and no
+    /// production use case (2+ workers is strictly faster).
     pub jobs: Option<usize>,
     /// Test-only: panic in the worker loop when a blob with this seq
     /// is dequeued, to exercise the worker-panic → scope-join →
@@ -297,11 +300,35 @@ pub fn merge(
 
     // Worker count: `-j N` override if supplied (non-zero), else the
     // default `nproc - 2` heuristic (leaves two cores for the scanner
-    // and drain threads, min 1).
+    // and drain threads).
+    //
+    // Minimum is 2 workers, not 1. With a single worker, a worker
+    // panic mid-stream deadlocks the pipeline: the scanner blocks on
+    // a full `candidate_rx` with no one draining, and the drain
+    // blocks waiting on senders that never drop. With 2+ workers the
+    // surviving one keeps draining `candidate_rx`, the scanner
+    // finishes normally, and the drain surfaces a clean error.
+    // Rejecting `-j 1` explicitly is loud but honest; silently
+    // bumping to 2 would mask a user's intent without benefit
+    // (single-threaded apply-changes has no production use case -
+    // it's strictly slower than 2+ workers on every host).
     let worker_count = match jobs {
-        Some(n) if n > 0 => n,
+        Some(1) => {
+            return Err(
+                "apply-changes requires at least 2 worker threads \
+                 (`--jobs N` with N >= 2, or omit `--jobs` for the \
+                 default). A single worker has a deadlock hazard on \
+                 mid-stream worker panic (scanner blocks on a full \
+                 candidate channel with no one draining). \
+                 Single-threaded operation has no production use \
+                 case here - 2 workers is strictly faster on every \
+                 host."
+                    .into(),
+            );
+        }
+        Some(n) if n > 1 => n,
         _ => std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(2).max(1))
+            .map(|n| n.get().saturating_sub(2).max(2))
             .unwrap_or(4),
     };
     #[allow(clippy::cast_possible_wrap)]

@@ -317,7 +317,11 @@ fn merge_jobs_parity_on_multiblob_input() {
     )
     .expect("bootstrap locations-on-ways base");
 
-    let seq = run_merge_with_jobs(&base, &osc, &out_seq, Some(1), true);
+    // Parity baseline is jobs=2 (the minimum accepted by merge since
+    // the T01 deadlock reject landed; `jobs=1` is rejected up front).
+    // The invariant under test is "output doesn't depend on worker
+    // count" - still verifiable at the 2-vs-4 boundary.
+    let seq = run_merge_with_jobs(&base, &osc, &out_seq, Some(2), true);
     let par = run_merge_with_jobs(&base, &osc, &out_par, Some(4), true);
 
     assert_eq!(seq.base_nodes, par.base_nodes);
@@ -341,7 +345,8 @@ fn merge_jobs_parity_without_locations_on_ways() {
 
     write_merge_jobs_fixture(&base, &osc);
 
-    let seq = run_merge_with_jobs(&base, &osc, &out_seq, Some(1), false);
+    // Parity baseline is jobs=2 (T01: jobs=1 rejected up front).
+    let seq = run_merge_with_jobs(&base, &osc, &out_seq, Some(2), false);
     let par = run_merge_with_jobs(&base, &osc, &out_par, Some(4), false);
 
     assert_eq!(seq.base_nodes, par.base_nodes);
@@ -773,13 +778,11 @@ fn fault_injection_worker_panic_surfaces_error_and_leaves_scratch_clean() {
     // Arm the hook at blob seq 3 (an arbitrary early-middle blob that
     // corresponds to a Candidate dispatched to the worker pool).
     //
-    // `jobs: Some(2)` rather than `Some(1)`: with a single worker, its
-    // panic leaves no one draining `candidate_rx`, the scanner blocks
-    // forever on a full channel, and the command deadlocks. The
-    // surviving worker in the 2-worker case keeps consuming so the
-    // scanner can finish, the drain then hits its "channel closed
-    // with items" path, and the scope surfaces the panic. The
-    // `jobs == 1` deadlock is tracked as a separate invariant gap.
+    // `jobs: Some(2)`: two workers so the surviving one keeps
+    // draining `candidate_rx` when the other panics. `Some(1)` is
+    // now rejected up front by `merge()` (the deadlock would fire
+    // if it weren't); see the companion test
+    // `merge_rejects_jobs_equal_one`.
     let opts = MergeOptions {
         compression: Compression::default(),
         direct_io: false,

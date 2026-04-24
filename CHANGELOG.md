@@ -10,6 +10,7 @@
 - **`IdSetDense` renamed to `IdSet`** and moved from `getid` to the top-level `pbfhogg::idset` module.
 - **`pbfhogg::getid::IdSet` renamed to `pbfhogg::getid::ElementIds`.** The struct bundles three per-type ID sets and was misnamed as a single "set". Field accessors and method calls unchanged.
 - **`pbfhogg::getid::removeid` signature adds `force: bool`** (positional, between `direct_io` and `overrides`). Library callers must pass `false` to require indexdata (matches CLI default), or `true` to permit non-indexed input.
+- **`apply-changes --jobs 1` (`MergeOptions::jobs = Some(1)`) now rejected** with a clear error at setup. A single worker has a deadlock hazard on mid-stream worker panic and no production use case (2+ workers is strictly faster on every host). Pass `--jobs 2` or omit `--jobs` for the default. The default's minimum is also bumped to 2 for low-core hosts.
 
 ### Commands
 

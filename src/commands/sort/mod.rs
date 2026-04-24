@@ -23,12 +23,15 @@ use crate::read::header_walker::HeaderWalker;
 use crate::writer::{reframe_raw_with_index, Compression, PbfWriter};
 use crate::Element;
 
+use crate::block_builder::OwnedBlock;
 use crate::owned::{
-    read_dense_node, read_node, read_relation, read_way, write_single_node, write_single_relation,
-    write_single_way, OwnedNode, OwnedRelation, OwnedWay,
+    read_dense_node, read_node, read_relation, read_way,
+    write_single_node_local, write_single_relation_local, write_single_way_local,
+    OwnedNode, OwnedRelation, OwnedWay,
 };
+use rayon::prelude::*;
 use super::{
-    build_output_header, flush_block, require_indexdata, HeaderOverrides, Result,
+    build_output_header, require_indexdata, HeaderOverrides, Result,
     writer_from_header_bytes,
 };
 
@@ -168,8 +171,42 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderO
         blobs_total: entries.len() as u64,
     };
 
-    let mut bb = BlockBuilder::new();
     let mut frame_buf: Vec<u8> = Vec::new();
+
+    // Collect kind-bounded overlap-run spans upfront so they can be
+    // processed in parallel before the serial write loop. `detect_overlaps`
+    // marks `overlaps[i]` based on same-kind adjacency, but two same-kind
+    // overlap-runs can sit adjacent in file order (e.g. a node/node
+    // overlap pair immediately followed by a way/way overlap pair, both
+    // with overlaps[i]=true). Splitting at kind boundaries mirrors the
+    // `cat::dedupe::merge_pbf` bugfix in 486d4d1 - handing mixed-kind
+    // entries to a kind-gated sweep would silently drop off-kind
+    // elements.
+    let overlap_runs: Vec<(usize, usize, ElemKind)> = collect_overlap_runs(&entries, &overlaps);
+    #[allow(clippy::cast_possible_wrap)]
+    crate::debug::emit_counter("sort_overlap_runs", overlap_runs.len() as i64);
+
+    // Parallel overlap rewrite: each rayon worker decodes its run, runs the
+    // sweep-merge, and emits owned blocks into a local `Vec<OwnedBlock>`.
+    // The main thread drains the results in input order below, interleaved
+    // with passthrough CFR operations. Memory cost: buffered output for all
+    // overlap runs. For typical "mostly sorted" input (few small runs)
+    // this is small; for pathologically unsorted input it can approach the
+    // input size.
+    let overlap_outputs: Vec<(Vec<OwnedBlock>, OverlapCounts)> = if overlap_runs.is_empty() {
+        Vec::new()
+    } else {
+        crate::debug::emit_marker("SORT_OVERLAP_PARALLEL_START");
+        let results: std::result::Result<Vec<_>, String> = overlap_runs
+            .par_iter()
+            .map(|(start, end, kind)| {
+                compute_overlap_run_local(&entries[*start..*end], *kind, input)
+            })
+            .collect();
+        let out = results.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        crate::debug::emit_marker("SORT_OVERLAP_PARALLEL_END");
+        out
+    };
 
     crate::debug::emit_marker("SORT_WRITE_LOOP_START");
     // Passthrough coalescer: adjacent blobs contiguous in the input file
@@ -179,33 +216,26 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderO
     let mut copy_run: Option<(u64, u64)> = None;
     let mut copy_run_calls: u64 = 0;
     let mut copy_run_coalesced: u64 = 0;
+    let mut overlap_iter = overlap_outputs.into_iter();
     let mut i = 0;
     while i < entries.len() {
         if overlaps[i] {
             flush_copy_run(&mut copy_run, &mut writer, input_fd, &mut copy_run_calls)?;
             let start = i;
             let run_kind = entries[i].index.kind;
-            // Overlap runs must contain exactly one element kind.
-            // `detect_overlaps` only sets `overlaps[j]` based on
-            // same-kind adjacency, but two same-kind overlap-runs
-            // can sit adjacent in file order (e.g. a node/node
-            // overlap pair immediately followed by a way/way
-            // overlap pair, both with overlaps[i]=true). Walking
-            // them into one `write_overlap_run` call hands
-            // `entries[0].index.kind` to the kind-gated sweep,
-            // whose extract closure then silently drops every
-            // off-kind element. Twin of the `cat::dedupe::merge_pbf`
-            // bug fixed in `486d4d1`.
             while i < entries.len() && overlaps[i] && entries[i].index.kind == run_kind {
                 i += 1;
             }
-            write_overlap_run(
-                &entries[start..i],
-                &mut input_file,
-                &mut bb,
-                &mut writer,
-                &mut stats,
-            )?;
+            let (blocks, counts) = overlap_iter
+                .next()
+                .ok_or_else(|| io::Error::other("overlap output iterator drained"))?;
+            for (block_bytes, index, tagdata) in blocks {
+                writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+            }
+            stats.nodes += counts.nodes;
+            stats.ways += counts.ways;
+            stats.relations += counts.relations;
+            stats.blobs_rewritten += (i - start) as u64;
         } else {
             let entry = &entries[i];
             match try_extend_copy_run(
@@ -229,6 +259,7 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderO
         }
     }
     flush_copy_run(&mut copy_run, &mut writer, input_fd, &mut copy_run_calls)?;
+    debug_assert!(overlap_iter.next().is_none(), "overlap outputs not fully drained");
 
     crate::debug::emit_marker("SORT_WRITE_LOOP_END");
 
@@ -503,100 +534,152 @@ fn count_entry(entry: &BlobEntry, stats: &mut SortStats) {
 }
 
 // ---------------------------------------------------------------------------
-// Pass 2: Overlap run rewrite
+// Pass 2: Parallel overlap run rewrite
 // ---------------------------------------------------------------------------
 
-/// Decode all blobs in an overlap run and write elements in sorted order.
+/// Per-overlap-run stats, merged into the main `SortStats` by the write loop.
+#[derive(Default)]
+struct OverlapCounts {
+    nodes: u64,
+    ways: u64,
+    relations: u64,
+}
+
+/// Collect kind-bounded overlap-run spans from `entries` + `overlaps`.
 ///
-/// Uses a streaming sweep merge: walks entries by min_id, maintains a min-heap,
-/// and flushes elements when their ID is guaranteed to be in final position
-/// (i.e. smaller than all future blobs' min_id). Memory is O(overlap_depth)
-/// rather than O(total_elements_in_run).
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn write_overlap_run(
+/// Each returned `(start, end, kind)` describes a contiguous slice of
+/// same-kind overlap entries. Kind boundaries split runs even when
+/// `overlaps[i]` is set across them - a node/node overlap-pair followed
+/// by a way/way overlap-pair must stay in separate runs, otherwise a
+/// kind-gated sweep handed the combined slice would silently drop
+/// off-kind elements (same pattern as `cat::dedupe::merge_pbf` in
+/// 486d4d1).
+fn collect_overlap_runs(entries: &[BlobEntry], overlaps: &[bool]) -> Vec<(usize, usize, ElemKind)> {
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < entries.len() {
+        if overlaps[i] {
+            let start = i;
+            let run_kind = entries[i].index.kind;
+            while i < entries.len() && overlaps[i] && entries[i].index.kind == run_kind {
+                i += 1;
+            }
+            runs.push((start, i, run_kind));
+        } else {
+            i += 1;
+        }
+    }
+    runs
+}
+
+/// Decode one overlap run on a rayon worker and emit owned blocks into a
+/// local `Vec<OwnedBlock>`. Each worker opens its own input fd so there
+/// is no shared reader state; results are collected by the main thread
+/// and drained in input order.
+fn compute_overlap_run_local(
     entries: &[BlobEntry],
-    input_file: &mut File,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    stats: &mut SortStats,
-) -> Result<()> {
-    // All entries in an overlap run have the same kind (entries are sorted by
-    // type_order first, and detect_overlaps only marks adjacent same-type).
-    let kind = entries[0].index.kind;
+    kind: ElemKind,
+    input_path: &Path,
+) -> std::result::Result<(Vec<OwnedBlock>, OverlapCounts), String> {
+    let mut input_file = File::open(input_path).map_err(|e| e.to_string())?;
+    let mut bb = BlockBuilder::new();
+    let mut output: Vec<OwnedBlock> = Vec::new();
+    let mut counts = OverlapCounts::default();
     match kind {
         ElemKind::Node => {
-            stats.nodes += sweep_merge(entries, input_file, bb, writer,
+            counts.nodes = sweep_merge_local(
+                entries,
+                &mut input_file,
+                &mut bb,
+                &mut output,
                 |e, heap| match e {
                     Element::DenseNode(dn) => heap.push(Reverse(read_dense_node(dn))),
                     Element::Node(n) => heap.push(Reverse(read_node(n))),
                     _ => {}
                 },
-                write_single_node,
+                write_single_node_local,
             )?;
         }
         ElemKind::Way => {
-            stats.ways += sweep_merge(entries, input_file, bb, writer,
-                |e, heap| { if let Element::Way(w) = e { heap.push(Reverse(read_way(w))); } },
-                write_single_way,
+            counts.ways = sweep_merge_local(
+                entries,
+                &mut input_file,
+                &mut bb,
+                &mut output,
+                |e, heap| {
+                    if let Element::Way(w) = e {
+                        heap.push(Reverse(read_way(w)));
+                    }
+                },
+                write_single_way_local,
             )?;
         }
         ElemKind::Relation => {
-            stats.relations += sweep_merge(entries, input_file, bb, writer,
-                |e, heap| { if let Element::Relation(r) = e { heap.push(Reverse(read_relation(r))); } },
-                write_single_relation,
+            counts.relations = sweep_merge_local(
+                entries,
+                &mut input_file,
+                &mut bb,
+                &mut output,
+                |e, heap| {
+                    if let Element::Relation(r) = e {
+                        heap.push(Reverse(read_relation(r)));
+                    }
+                },
+                write_single_relation_local,
             )?;
         }
     };
-    stats.blobs_rewritten += entries.len() as u64;
-    Ok(())
+    Ok((output, counts))
 }
 
 // ---------------------------------------------------------------------------
-// Sweep merge per element type
+// Local sweep merge (rayon-worker-friendly)
 // ---------------------------------------------------------------------------
 
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn sweep_merge<T: Ord + HasId>(
+fn sweep_merge_local<T: Ord + HasId>(
     entries: &[BlobEntry],
     input_file: &mut File,
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
+    output: &mut Vec<OwnedBlock>,
     mut extract: impl FnMut(&Element<'_>, &mut BinaryHeap<Reverse<T>>),
-    mut write_elem: impl FnMut(&T, &mut BlockBuilder, &mut PbfWriter<FileWriter>) -> Result<()>,
-) -> Result<u64> {
+    mut write_elem: impl FnMut(&T, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> std::result::Result<(), String>,
+) -> std::result::Result<u64, String> {
     let mut heap: BinaryHeap<Reverse<T>> = BinaryHeap::new();
     let mut frame_buf: Vec<u8> = Vec::new();
     let mut count: u64 = 0;
 
     for entry in entries {
-        flush_heap_below(&mut heap, crate::osm_id::blob_osm_first_id(entry.index.min_id, entry.index.max_id), |elem| {
-            write_elem(&elem, bb, writer)?;
-            count += 1;
-            Ok(())
-        })?;
+        flush_heap_below_local(
+            &mut heap,
+            crate::osm_id::blob_osm_first_id(entry.index.min_id, entry.index.max_id),
+            |elem| {
+                write_elem(&elem, bb, output)?;
+                count += 1;
+                Ok(())
+            },
+        )?;
 
-        read_frame_into(input_file, entry, &mut frame_buf)?;
-        let blob_bytes = extract_blob_bytes(&frame_buf)?;
-        let block = decode_blob_to_primitiveblock(blob_bytes)?;
+        read_frame_into(input_file, entry, &mut frame_buf).map_err(|e| e.to_string())?;
+        let blob_bytes = extract_blob_bytes(&frame_buf).map_err(|e| e.to_string())?;
+        let block = decode_blob_to_primitiveblock(blob_bytes).map_err(|e| e.to_string())?;
         for element in block.elements() {
             extract(&element, &mut heap);
         }
     }
 
     while let Some(Reverse(elem)) = heap.pop() {
-        write_elem(&elem, bb, writer)?;
+        write_elem(&elem, bb, output)?;
         count += 1;
     }
-    flush_block(bb, writer)?;
+    crate::commands::flush_local(bb, output)?;
     Ok(count)
 }
 
-/// Flush all elements from the min-heap whose ID is below `below`.
-fn flush_heap_below<T: Ord + HasId>(
+fn flush_heap_below_local<T: Ord + HasId>(
     heap: &mut BinaryHeap<Reverse<T>>,
     below: i64,
-    mut emit: impl FnMut(T) -> Result<()>,
-) -> Result<()> {
+    mut emit: impl FnMut(T) -> std::result::Result<(), String>,
+) -> std::result::Result<(), String> {
     while heap.peek().is_some_and(|Reverse(e)| crate::osm_id::osm_id_cmp(e.id(), below).is_lt()) {
         if let Some(Reverse(element)) = heap.pop() {
             emit(element)?;

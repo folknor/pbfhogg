@@ -496,20 +496,52 @@ Further wins on this storage stack are not available at the
 path that sidesteps the copy entirely on reflink-capable output
 filesystems.
 
-### 3. Parallel overlap-rewrite in pass 2
+### 3. Parallel overlap-rewrite in pass 2 [LANDED 2026-04-24]
 
-Overlap runs are currently processed sequentially: per-run
-decompress → binary heap merge → re-encode. Each overlap run is
-self-contained within one element type, so runs parallelise cleanly
-with rayon `par_iter` + a reorder buffer into the writer.
+Overlap runs used to be processed sequentially: per-run
+decompress → binary heap merge → re-encode, one run at a time,
+blocking the main pass-2 write loop. Each run is self-contained
+within one element type, so runs parallelise cleanly. The pattern
+copies `altw/passthrough.rs` - produce `Vec<OwnedBlock>` in a
+rayon worker, hand back to the main writer thread.
 
-Estimated 1.5-3x on overlap runs. Only exercised by genuinely
-unsorted input, so this does not move the production benchmark.
-Worth picking up only if overnight data on unsorted-input scenarios
-lands (no such dataset configured in `brokkr.toml` today - new
-dataset or injection would be a prerequisite).
+**Implementation:**
+- `collect_overlap_runs(entries, overlaps)` -> `Vec<(start, end, kind)>`
+  enumerates kind-bounded overlap spans upfront.
+- `compute_overlap_run_local(entries, kind, input_path)` runs on a
+  rayon worker: opens its own input fd, runs `sweep_merge_local`,
+  emits `Vec<OwnedBlock>` + per-kind counts.
+- Main sort() invokes `overlap_runs.par_iter().map(...).collect()`
+  *before* the pass-2 write loop, buffering all overlap outputs in
+  memory (marker pair `SORT_OVERLAP_PARALLEL_START/END`).
+- Main loop drains the outputs in order via `writer.write_primitive_block_owned`,
+  interleaved with passthrough CFR runs.
+- Zero-cost on already-sorted input (the `overlap_runs.is_empty()`
+  check short-circuits the par_iter entirely) - planet and already-
+  sorted europe unchanged.
+- Local writer helpers `write_single_{node,way,relation}_local`
+  added to `src/owned.rs` mirroring the existing `write_single_*`
+  but targeting `Vec<OwnedBlock>` via the
+  `ensure_*_capacity_local` / `flush_local` pattern.
 
-Hours scope once the write path accepts out-of-order completions.
+**Memory:** buffered output for all overlap runs accumulates in
+memory before the serial write loop drains them. For typical
+"mostly sorted" input (few small runs) this is small; for
+pathologically unsorted input it can approach the input size. No
+cap today - if this bites in the wild, the fix is a bounded rayon
+pipeline with reorder buffer instead of collect().
+
+**Correctness:** existing overlap tests (`sort_overlapping_blobs`,
+`sort_overlap_rewrite_normalizes_dense_node_changeset_minus_one`,
+`sort_overlap_runs_scoped_to_single_kind`, plus direct-io and
+uring variants) all pass. Kind boundaries are preserved:
+`collect_overlap_runs` splits at element-type transitions, same
+invariant the old serial path had.
+
+**Perf:** no planet-scale benchmark exists (production input is
+already sorted, zero overlap runs). Predicted 1.5-3x on overlap
+work based on rayon pool size vs serial baseline; unverified until
+an unsorted dataset is added to `brokkr.toml`.
 
 ### 4. `HeaderWalker`-based pass 1 [LANDED 1f97fae, planet net positive]
 
@@ -534,14 +566,18 @@ in the scenario that matters. See "Mitigations" above for notes on
 clawing back the europe regression if a europe-scale consumer ever
 surfaces; currently parked.
 
-### 5. Frame buffer hoisting (micro)
+### 5. Frame buffer hoisting (micro) [SUBSUMED BY #3 2026-04-24]
 
-`sweep_merge` allocates a fresh `Vec<u8>` per overlap run. Hoist to
-the outer write loop and reuse. Estimated <1 % wall; matters only
-if profile shows allocator pressure, which is unlikely at the
-current blob counts.
+The original concern: `sweep_merge` allocated a fresh `Vec<u8>`
+per overlap run. The #3 refactor moved the sweep into worker-local
+`sweep_merge_local`, where `frame_buf` is a local `Vec::new()`
+once per worker invocation = once per run. `Vec::resize` reuses
+capacity across entries within a run, so within-run reuse is
+already in place.
 
-Minutes scope. Land only as part of a sweep of related changes.
+Across-run reuse (rayon thread-local state via `map_init`) is a
+further ~0 % improvement (one Vec allocation per run is rounding
+error next to the I/O and decode work). Not implemented.
 
 ### 6. Reflink fast-path for zero-overlap sorted input
 

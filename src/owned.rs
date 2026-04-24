@@ -2,7 +2,7 @@
 //!
 //! Used by sort, merge_pbf, and time_filter for overlap-run and sweep-merge operations.
 
-use crate::block_builder::{BlockBuilder, MemberData, Metadata, RawMetadata};
+use crate::block_builder::{BlockBuilder, MemberData, Metadata, OwnedBlock, RawMetadata};
 use crate::file_writer::FileWriter;
 use crate::writer::PbfWriter;
 
@@ -414,6 +414,63 @@ pub(crate) fn write_single_relation(
     writer: &mut PbfWriter<FileWriter>,
 ) -> BoxResult<()> {
     crate::commands::ensure_relation_capacity(bb, writer)?;
+    let members: Vec<MemberData<'_>> = rel
+        .members
+        .iter()
+        .map(|m| MemberData { id: m.id, role: &m.role })
+        .collect();
+    let meta = owned_to_metadata(rel.metadata.as_ref());
+    bb.add_relation(
+        rel.id,
+        rel.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        &members,
+        meta.as_ref(),
+    );
+    Ok(())
+}
+
+// Local-output variants (emit into `Vec<OwnedBlock>`) for rayon worker
+// threads. Mirror the `write_single_*` functions above but call the
+// `ensure_*_capacity_local` / `flush_local` helpers so no writer thread
+// is touched from the worker.
+
+pub(crate) fn write_single_node_local(
+    node: &OwnedNode,
+    bb: &mut BlockBuilder,
+    output: &mut Vec<OwnedBlock>,
+) -> std::result::Result<(), String> {
+    crate::commands::ensure_node_capacity_local(bb, output)?;
+    let meta = owned_to_metadata(node.metadata.as_ref());
+    bb.add_node(
+        node.id, node.decimicro_lat, node.decimicro_lon,
+        node.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        meta.as_ref(),
+    );
+    Ok(())
+}
+
+pub(crate) fn write_single_way_local(
+    way: &OwnedWay,
+    bb: &mut BlockBuilder,
+    output: &mut Vec<OwnedBlock>,
+) -> std::result::Result<(), String> {
+    crate::commands::ensure_way_capacity_local(bb, output)?;
+    let meta = owned_to_metadata(way.metadata.as_ref());
+    bb.add_way(
+        way.id,
+        way.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        &way.refs,
+        meta.as_ref(),
+    );
+    Ok(())
+}
+
+pub(crate) fn write_single_relation_local(
+    rel: &OwnedRelation,
+    bb: &mut BlockBuilder,
+    output: &mut Vec<OwnedBlock>,
+) -> std::result::Result<(), String> {
+    crate::commands::ensure_relation_capacity_local(bb, output)?;
     let members: Vec<MemberData<'_>> = rel
         .members
         .iter()

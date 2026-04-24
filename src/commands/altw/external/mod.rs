@@ -395,6 +395,17 @@ pub fn external_join(
                 }))
             };
 
+            // Error ordering: `s1_handle.join()??` short-circuits before
+            // joining the relation-scan handle, but `thread::scope` still
+            // waits for `rel_handle` to run to completion before the scope
+            // returns. A stage-1 failure while the relation scan is
+            // running therefore delays error reporting by up to the
+            // scan's wall time (~4 s Europe, longer at planet). Accepted
+            // as diagnostic-quality: stage-1 failures are rare (only fire
+            // on adversarial or malformed input, mostly closed by the
+            // defensive-input checks in ADR-0004), and cancelling the
+            // relation scan would require plumbing a shutdown signal we
+            // don't otherwise need.
             let s1_res = s1_handle
                 .join()
                 .map_err(|_| "stage 1 thread panicked".to_string())??;

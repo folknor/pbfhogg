@@ -858,13 +858,11 @@ Remaining open findings from a multi-agent Opus audit of 0.3.0 high-churn areas.
 
 1. **Indexdata-trust without defensive check.** Call sites read descriptor fields populated from `BlobHeader.indexdata` and act on them without verifying indexdata was present, tight, or correct. The --force headline fixes closed the worst cases; residue remains across apply-changes, renumber, altw external, and geocode.
 
-2. **Silent data loss on Drop-swallows-error paths.** `ParallelGzipWriter::drop` and `PbfWriter::drop` still discard `io::Result` from final flushes/joins when callers forget to call `finish()` / `flush()`.
+2. **Temp-file leaks on worker-error paths.** altw external, apply-changes, and geocode Pass 3 Stage A still leak scratch files on worker error (diff-parallel landed).
 
-3. **Temp-file leaks on worker-error paths.** altw external, apply-changes, and geocode Pass 3 Stage A still leak scratch files on worker error (diff-parallel landed).
+3. **Null Island (0,0) sentinel.** altw external uses `(lat==0 && lon==0)` as the missing-coord sentinel; documented-accepted.
 
-4. **Null Island (0,0) sentinel.** altw external uses `(lat==0 && lon==0)` as the missing-coord sentinel; documented-accepted.
-
-5. **Negative-ID and signed-arithmetic hazards.** diff shard planner uses raw numeric compare while element merge uses canonical `osm_id_cmp`; latent for positive-only production PBFs.
+4. **Negative-ID and signed-arithmetic hazards.** diff shard planner uses raw numeric compare while element merge uses canonical `osm_id_cmp`; latent for positive-only production PBFs.
 
 **Planning note:** the ~28% first-round error rate from the original sweep was not tolerable for landing decisions. Any "fix" based on a finding's text without independent code-reading has a high probability of mis-shaping the change. The most insidious mis-calls pointed at the right file but proposed a wrong mechanism. Read the code path before writing a patch.
 
@@ -909,28 +907,6 @@ Remaining open findings from a multi-agent Opus audit of 0.3.0 high-churn areas.
 - [x] ~~**`geocode_index/builder/pass3.rs:152-167`**~~ - landed 2026-04-24. `parse_bucket_file` now returns `io::Result<Vec<...>>` and errors on `data.len() % BUCKET_RECORD_SIZE != 0` with a diagnostic naming the incomplete file length. A Stage A ENOSPC mid-flush is now a loud Stage B failure rather than silent data loss.
 
 - [x] ~~**`renumber/mod.rs:256-262`**~~ - landed 2026-04-24. Wrapped the output path in `PathGuard::file()` right after `writer_from_header` succeeds; `output_guard.commit()` fires at the end of the success path (after final `writer.flush()`). On any mid-stream error (pass1 count mismatch, stage 2d failure, relation rewrite failure, final flush) the partial output file is now removed.
-
-### Cluster 4: Panic propagation in parallel pipelines
-
-Worker panics surface as misleading downstream diagnostics; real cause only emerges when `thread::scope` returns. **Decision needed:** wait for the fault-injection harness in Release prep > Test-shape gaps to land first and patch these as test cases, or patch each pipeline one at a time now.
-
-- [ ] **`apply_changes/streaming.rs:242` - MEDIUM.** If a worker panics mid-stream, its `drain_tx` clone is dropped and other workers keep running, but seqs from the panicked worker's in-flight candidate are lost; the drain trips the reorder-buffer-non-empty check at drain.rs:330 and the panic only propagates when `std::thread::scope` returns, so the user sees "drain: channel closed with N items" rather than the real panic message. Trigger: OOM or unwrap in worker code path.
-
-- [ ] **`write/parallel_gzip.rs:188-213` - LOW (downgraded 2026-04-23)** *(verified: not a live failure mode today)*. `compress_one` at :216 uses `GzEncoder::new(Vec::with_capacity(...), ...)`. `Vec<u8>` `Write` impl is infallible; flate2 doesn't return Err for OOM (it panics). So the `Err(_) => return` arm at :207 is effectively unreachable in current code. A worker panic unwinds rather than running the `return`, so this path does not reach the described hang via normal io::Error. The original trigger "flate2 OOM" is wrong. The hang is only reachable via (a) a future sink change to a fallible writer, or (b) a panic-caught-and-converted-to-Err path. Keep as a latent defensive-coding note; fix shape is still "on worker error/panic, poison the writer_loop channel or close it with a sentinel" but urgency drops with no live trigger.
-
-### Cluster 5: Drop-path error swallowing
-
-Cross-cutting pattern #2 above. **Decision needed:** force callers to call `finish()` explicitly (panic on drop-without-finish in debug, log-and-best-effort in release), or continue silently best-effort as today?
-
-- [ ] **`diff/parallel_gzip.rs:170-184` - LOW.** `Drop` swallows flush error when `finish()` was not called (also noted in write path). Trigger: caller relies on RAII.
-
-### Cluster 6: Error ordering - downstream error masks root cause
-
-Two sites where the user sees a misleading error before or instead of the root cause. **Decision needed:** accept "first error wins" and rely on the scope-join to surface the real cause post hoc, or plumb a root-cause mechanism (e.g. an atomic "first cause" slot shared across the scope)?
-
-- [ ] **`apply_changes/rewrite.rs:244` - MEDIUM (diagnostic-quality)** *(verified 2026-04-23)*. If the scanner errors out mid-stream after sending some items but before all candidates are dispatched, some seqs never get produced; the drain hits its "channel closed with items still in reorder buffer" check at drain.rs:332 and returns an error whose diagnostic (`next_seq` vs smallest remaining) misleads away from the real upstream failure. Not a correctness bug - error surfaces, just two errors for one fault with the misleading one first. The true scanner error is surfaced separately via the scope join at rewrite.rs:337. Trigger: corrupted PBF header mid-stream. NOTE: drain.rs:330-338 original finding is the same concern from another angle - deduped into this entry.
-
-- [ ] **`altw/external/mod.rs:225-273` - MEDIUM.** If stage 1 returns an error, the scope closure short-circuits via `??` on `s1_handle.join()` before joining the relation-scan handle; `thread::scope` waits for `rel_handle` to finish, delaying error reporting by up to the scan's wall time (~4s Europe, longer planet). Trigger: any stage-1 failure while relation scan is running.
 
 ### Cluster 7: Latent-only-on-future-refactor or pathological-input items
 

@@ -66,45 +66,44 @@ Bulleted list of the options that were on the table. For each, one
 sentence on why it wasn't chosen. This is the most important section
 for posterity: it documents the *rejected* options so future work
 doesn't re-argue them from scratch.
-
-## Consequences
-
-What changes as a result of this decision. Usually:
-- Code changes that landed (with file:line pins or commit hashes).
-- Project-wide rules or invariants established.
-- Known limitations or follow-up work the decision creates.
-- Migration path if we ever reverse the decision.
-
-## Cross-references
-
-Pointers to related ADRs, `DEVIATIONS.md` sections, `reference/` docs,
-or code that enforces the decision. Optional; include when a reader
-would benefit from the adjacent context.
 ```
 
-Note: a `Context` section is deliberately omitted from the skeleton.
-If the Decision section needs a sentence of framing to stand alone,
-put it right under the Decision heading. Don't narrate the situation
-that led to the decision - that's what git log and the linked bug
-sweep are for.
+The skeleton has exactly two sections. `Context`, `Consequences`, and
+`Cross-references` are deliberately omitted:
+
+- **No Context:** if the Decision needs a sentence of framing to
+  stand alone, put it right under the Decision heading. Don't
+  narrate the situation that led here.
+- **No Consequences:** user-visible outcomes belong in
+  `CHANGELOG.md`; commit history captures what landed; nobody will
+  care about the rest in six months. If the decision creates a
+  migration path or a conditional trigger for reversing the
+  decision, put that single sentence at the bottom of the Decision
+  section.
+- **No Cross-references:** when another ADR or doc is relevant to
+  the decision, reference it *inline* in the Decision or
+  Alternatives where it's load-bearing - not in a footer that
+  duplicates what the reader already has context for.
 
 ## Interaction with other docs
 
 - **`DEVIATIONS.md`** owns the "how we differ from osmium" comparison
   tables. When a decision is *about* an osmium divergence, the ADR
-  captures the decision and the DEVIATIONS entry captures the behavior
-  comparison. Cross-reference both ways.
+  captures the rule and the DEVIATIONS entry captures the behavior
+  comparison. The ADR references DEVIATIONS.md inline where it's
+  load-bearing (usually a sentence in the Decision section).
 - **`reference/`** owns architectural and behavioral reality (blob
   encoding, pipeline shapes, performance topology). ADRs reference
-  these; they don't duplicate them.
+  these inline when relevant; they don't duplicate them.
 - **`CHANGELOG.md`** owns user-visible release notes. ADRs are for the
   *why*, not the *what shipped*.
 - **`CLAUDE.md`** owns rules for AI-assisted work. When an ADR
   establishes a coding rule, a one-liner in `CLAUDE.md` can mirror it
   with a pointer to the ADR.
 - **`TODO.md`** cites ADRs from decision paragraphs at the top of each
-  bug-sweep cluster; the ADR cites `TODO.md` back only if the follow-up
-  list is substantial. An ADR should not name a specific bug-sweep
+  bug-sweep cluster. The ADR does *not* link back to `TODO.md` - the
+  ADR is the permanent decision, the TODO cluster is a transient
+  organizing artifact. An ADR also must not name a specific bug-sweep
   cluster or release label in its title or filename; cluster labels
   live in `TODO.md` and evolve, the ADR stays.
 

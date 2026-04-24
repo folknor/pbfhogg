@@ -332,6 +332,18 @@ pub(super) fn run_drain(
     }
 
     // Channel closed. Reorder buffer should be empty.
+    //
+    // Two root causes can reach this error. First, a genuine producer bug
+    // (a worker dropped a seq) - the message points there. Second, a worker
+    // thread panicked mid-stream; its `drain_tx` clone drops unwound, the
+    // drain sees the channel close, and the reorder buffer still holds
+    // seqs from other workers. In that case the real panic surfaces
+    // separately through `thread::scope`'s join in
+    // `rewrite::merge_with_overrides`, which runs after the drain returns.
+    // The user sees two errors for one fault with the misleading one first;
+    // the real cause lands via the scope join. Accepted as diagnostic
+    // quality: the failure mode is rare (requires OOM or an internal
+    // `unwrap` in a worker) and both errors do surface.
     if !state.buffer.is_empty() {
         let first_remaining = state.buffer.keys().next().copied().unwrap_or(0);
         return Err(new_error(ErrorKind::Io(std::io::Error::other(format!(

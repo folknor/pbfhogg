@@ -16,7 +16,9 @@ shard-planner compares today.
 osmium goes the other way - negatives are affirmatively supported as
 JOSM-staging IDs via a canonical `id_order` (0 → negatives by abs
 value → positives by abs value). We diverge because `IdSet` is
-unsigned-indexed and no user has asked for JOSM interop.
+unsigned-indexed and no user has asked for JOSM interop. The full
+behavior comparison, `IdSet` rationale, and reversal migration path
+live in `DEVIATIONS.md > "Negative input IDs rejected project-wide"`.
 
 ## Alternatives considered
 
@@ -40,36 +42,5 @@ unsigned-indexed and no user has asked for JOSM interop.
   `debug_assert` catches misuse in tests; release builds trust the
   upstream chain.
 
-## Consequences
-
-- `renumber/wire_rewrite.rs` - added an unconditional `old_abs_id <
-  0` reject at the relation-member-ref path, mirroring the node and
-  way checks from commit `ab01438`.
-- `diff/parallel.rs::plan_shards` and
-  `derive_parallel.rs::plan_shards` - added `debug_assert!` on
-  descriptor `min_id >= 0` at planner entry. One assertion subsumes
-  the four downstream raw-compare sites (threshold build,
-  single-sided emit, merge_up_to bound) because all of them are
-  correct for positive-only inputs.
-- `DEVIATIONS.md` - section renamed to "Negative input IDs rejected
-  project-wide" and expanded with osmium's `id_order` design,
-  pbfhogg's two enforcement classes, the `IdSet` rationale, the
-  migration path if we ever reverse to (b), and osmium's own
-  symmetric gap at `command_derive_changes.cpp:184`.
-- `CHANGELOG.md` - broadened the pre-existing `renumber` negative-ID
-  bug entry to cover both triggers (stale indexdata; inconsistent
-  input with negative relation member refs).
-- `TODO.md` - all four negative-ID findings in the policy-clustered
-  bug sweep marked landed.
-- **Follow-up triggered by:** any user report of needing JOSM
-  staging-file interop. If that lands, reopen this ADR as
-  `Superseded by NNNN` and migrate to (b).
-
-## Cross-references
-
-- `DEVIATIONS.md` > "Negative input IDs rejected project-wide" -
-  full behavior comparison with osmium, `IdSet` rationale, migration
-  path.
-- Commit `ab01438` (2026-04-23) - the earlier unconditional-reject
-  landing this ADR builds on.
-- Commit `f6834de` (2026-04-24) - negative-ID enforcement landing.
+If a real ask for JOSM staging-file interop surfaces, reopen this
+ADR as `Superseded by NNNN` and migrate to alternative (b).

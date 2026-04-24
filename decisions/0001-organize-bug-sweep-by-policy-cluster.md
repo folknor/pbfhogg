@@ -31,19 +31,3 @@ items with a clear fix direction and no open policy question; a
 - **Split into two documents.** Subsystem-indexed bug list plus
   policy-indexed decision list. Doubled surface for no obvious gain.
 
-## Consequences
-
-- Bug-sweep sections in `TODO.md` are organized by policy cluster,
-  not subsystem. Each cluster names its policy question at the top
-  and links to the ADR that answered it.
-- Landing commits for each cluster cite the cluster by number and
-  the policy option selected, making the git log searchable by
-  policy call.
-- "Straight fixes" and "Per-site items" sections absorb the residue
-  that doesn't fit a cluster, so clusters stay focused on their
-  policy question.
-
-## Cross-references
-
-- `TODO.md` - the live bug-sweep section is organized to this
-  pattern.

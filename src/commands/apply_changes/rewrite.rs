@@ -354,6 +354,19 @@ pub fn merge(
 
     // Drain runs in this (the merge() caller's) thread because it owns
     // `&mut writer`. Scanner and worker pool run in scoped threads.
+    //
+    // Error ordering on a mid-stream fault: if the scanner errors out
+    // after sending some candidates but before all are dispatched, the
+    // drain will hit its "channel closed with N items in reorder buffer"
+    // path first and the `?` below surfaces *that* error before the
+    // scanner's real cause surfaces via `scanner_handle.join()` further
+    // down. A similar pattern applies to a worker-pool panic. The user
+    // sees two errors for one fault with the misleading one first; the
+    // true cause lands via the scope join. Accepted as diagnostic-quality
+    // - the failure mode is rare (corrupt PBF header mid-stream or an
+    // internal `unwrap` on the worker path), both errors surface, and
+    // plumbing a shared "first cause" slot is engineering we haven't
+    // needed in practice.
     let stats = std::thread::scope(|scope| -> Result<MergeStats> {
         let scanner_handle = scope.spawn(move || scanner::run_scanner(scanner_cfg));
         let workers_counters_inner = Arc::clone(&worker_counters);

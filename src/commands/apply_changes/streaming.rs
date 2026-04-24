@@ -225,6 +225,15 @@ pub(super) fn run_workers(
     // `recv()` (microseconds); workers spend their time in pread +
     // decompress + parse, not queued on the receiver lock.
     let candidate_rx = Mutex::new(candidate_rx);
+
+    // `first_err` captures a worker's *returned* Err (e.g. a bubbled
+    // `Result::Err`). Worker *panics* unwind past the `if let Err(e) =
+    // result` arm without ever touching `first_err`; they surface through
+    // `scope.spawn(...).join()` in the calling `rewrite::merge_with_overrides`
+    // scope instead. A panicking worker's dropped `drain_tx` can cause the
+    // drain to trip its "channel closed with items" diagnostic before the
+    // outer scope joins and reports the real panic; see `drain.rs` for the
+    // deliberate acceptance of that double-error pattern.
     let first_err: Mutex<Option<Error>> = Mutex::new(None);
 
     std::thread::scope(|scope| {

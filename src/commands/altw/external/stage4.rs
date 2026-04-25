@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
-use crate::writer::{Compression, frame_blob_pipelined};
+use crate::writer::Compression;
 use crate::{Element, PrimitiveBlock};
 
 use super::super::Stats;
@@ -20,25 +20,6 @@ use super::super::{
 };
 
 use super::blob_meta::BlobMeta;
-
-/// Output emission shape from a stage 4 decode worker.
-///
-/// A2's milestone 1 (way workers emit framed bytes; nodes still go
-/// through the rayon frame pool) introduces this two-variant emission
-/// so the consumer can dispatch each block to the right writer entry
-/// point. `Framed` blocks land at `PbfWriter::write_raw_owned` (no
-/// permit, no rayon dispatch); `Uncompressed` blocks keep going
-/// through `write_primitive_block_owned` until milestone 2 moves the
-/// node decode path too.
-enum OutputBlock {
-    /// Already framed and compressed by the worker via
-    /// `frame_blob_pipelined` - ready for `write_raw_owned`.
-    Framed(Vec<u8>),
-    /// Uncompressed `PrimitiveBlock` bytes plus pre-scanned index +
-    /// optional tagdata. The writer's rayon frame pool handles
-    /// compression. Used by the filtered-node decode path.
-    Uncompressed(OwnedBlock),
-}
 
 /// Blob descriptor for the stage 4 pre-scan schedule.
 struct BlobDescriptor {
@@ -278,7 +259,7 @@ pub(super) fn stage4_assembly(
     let (decode_items, passthrough_items): (Vec<BlobDescriptor>, Vec<BlobDescriptor>) =
         schedule.into_iter().partition(|d| !d.is_passthrough);
 
-    type DecodedItem = (usize, crate::error::Result<(Vec<OutputBlock>, Stats)>);
+    type DecodedItem = (usize, crate::error::Result<(Vec<OwnedBlock>, Stats)>);
     let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<BlobDescriptor>(16);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
     // Channel capacity 32 - the 256-depth A/B probe confirmed that
@@ -294,11 +275,6 @@ pub(super) fn stage4_assembly(
     let s4_decompress_ms = std::sync::atomic::AtomicU64::new(0);
     let s4_assemble_ms = std::sync::atomic::AtomicU64::new(0);
     let s4_way_reframe_ms = std::sync::atomic::AtomicU64::new(0);
-    // Cumulative wall in `frame_blob_pipelined` per way worker, stored
-    // as ns and emitted as ms to avoid per-blob truncation.
-    // Tracks how much frame+compress work moved from the writer's
-    // rayon pool into stage 4's worker pool (A2 milestone 1).
-    let s4_way_frame_compress_ns = std::sync::atomic::AtomicU64::new(0);
     let s4_nonway_assemble_ms = std::sync::atomic::AtomicU64::new(0);
     let s4_way_blobs_processed = std::sync::atomic::AtomicU64::new(0);
     let s4_nonway_blobs_processed = std::sync::atomic::AtomicU64::new(0);
@@ -331,8 +307,6 @@ pub(super) fn stage4_assembly(
     let s4_decompress_ref = &s4_decompress_ms;
     let s4_assemble_ref = &s4_assemble_ms;
     let s4_way_reframe_ref = &s4_way_reframe_ms;
-    let s4_way_frame_compress_ref = &s4_way_frame_compress_ns;
-    let compression_ref = &compression;
     let s4_nonway_assemble_ref = &s4_nonway_assemble_ms;
     let s4_way_blobs_ref = &s4_way_blobs_processed;
     let s4_nonway_blobs_ref = &s4_nonway_blobs_processed;
@@ -396,7 +370,7 @@ pub(super) fn stage4_assembly(
                         }
                     };
 
-                    let result: crate::error::Result<(Vec<OutputBlock>, Stats)> = (|| {
+                    let result: crate::error::Result<(Vec<OwnedBlock>, Stats)> = (|| {
                         // For way blobs: block on the router's readiness
                         // BEFORE the input pread/decompress so a stalled
                         // decode thread never holds an already-expanded
@@ -483,62 +457,9 @@ pub(super) fn stage4_assembly(
                                 count: way_count,
                                 bbox: None,
                             };
-
-                            #[allow(clippy::cast_possible_truncation)]
-                            {
-                                let elapsed = t2.elapsed().as_millis() as u64;
-                                s4_assemble_ref.fetch_add(elapsed, Relaxed);
-                                s4_way_reframe_ref.fetch_add(elapsed, Relaxed);
-                            }
-
-                            // A2 milestone 1: frame + compress in this
-                            // worker (replaces the writer-thread rayon
-                            // spawn). Reframe_output is borrowed, then
-                            // cleared so its allocation is reused on the
-                            // next way blob.
-                            let t_frame = std::time::Instant::now();
-                            let indexdata = index.serialize();
-                            let parts = frame_blob_pipelined(
-                                &reframe_output,
-                                compression_ref,
-                                Some(&indexdata),
-                                None,
-                            )
-                            .map_err(|e| {
-                                crate::error::new_error(
-                                    crate::error::ErrorKind::Io(e),
-                                )
-                            })?;
-                            let framed_bytes = parts.into_vec();
-                            reframe_output.clear();
-                            #[allow(clippy::cast_possible_truncation)]
-                            s4_way_frame_compress_ref.fetch_add(
-                                t_frame.elapsed().as_nanos() as u64,
-                                Relaxed,
-                            );
-
-                            // Track peak per-worker memory including
-                            // the framed Vec<u8> (about to be moved
-                            // into the channel).
-                            {
-                                let worker_bytes = read_buf.capacity() as u64
-                                    + decompress_buf.capacity() as u64
-                                    + reframe_output.capacity() as u64
-                                    + coord_payload_buf.capacity() as u64
-                                    + framed_bytes.capacity() as u64;
-                                let mut current = s4_max_worker_buf_ref.load(Relaxed);
-                                while worker_bytes > current {
-                                    match s4_max_worker_buf_ref.compare_exchange_weak(
-                                        current,
-                                        worker_bytes,
-                                        Relaxed,
-                                        Relaxed,
-                                    ) {
-                                        Ok(_) => break,
-                                        Err(actual) => current = actual,
-                                    }
-                                }
-                            }
+                            let taken = std::mem::take(&mut reframe_output);
+                            reframe_output.reserve(taken.len());
+                            output_blocks.push((taken, index, None));
 
                             let block_stats = Stats {
                                 ways_written: way_count,
@@ -546,9 +467,15 @@ pub(super) fn stage4_assembly(
                                 blobs_decoded: 1,
                                 ..Stats::default()
                             };
+                            #[allow(clippy::cast_possible_truncation)]
+                            {
+                                let elapsed = t2.elapsed().as_millis() as u64;
+                                s4_assemble_ref.fetch_add(elapsed, Relaxed);
+                                s4_way_reframe_ref.fetch_add(elapsed, Relaxed);
+                            }
                             s4_blobs_ref.fetch_add(1, Relaxed);
                             s4_way_blobs_ref.fetch_add(1, Relaxed);
-                            return Ok((vec![OutputBlock::Framed(framed_bytes)], block_stats));
+                            return Ok((std::mem::take(&mut output_blocks), block_stats));
                         }
 
                         // Non-way blobs: full PrimitiveBlock decode + BlockBuilder.
@@ -584,11 +511,7 @@ pub(super) fn stage4_assembly(
 
                         s4_blobs_ref.fetch_add(1, Relaxed);
 
-                        let emission: Vec<OutputBlock> = std::mem::take(&mut output_blocks)
-                            .into_iter()
-                            .map(OutputBlock::Uncompressed)
-                            .collect();
-                        Ok((emission, block_stats))
+                        Ok((std::mem::take(&mut output_blocks), block_stats))
                     })();
 
                     // Track max live buffer bytes for this worker.
@@ -650,7 +573,7 @@ pub(super) fn stage4_assembly(
         // reorder buffer. `write_raw_owned` hands the pre-framed bytes to
         // the writer thread verbatim.
         enum ConsumerItem {
-            Decoded(crate::error::Result<(Vec<OutputBlock>, Stats)>),
+            Decoded(crate::error::Result<(Vec<OwnedBlock>, Stats)>),
             Passthrough {
                 frame_offset: u64,
                 frame_size: usize,
@@ -710,27 +633,15 @@ pub(super) fn stage4_assembly(
                     ConsumerItem::Decoded(result) => {
                         let (blocks, block_stats) = result?;
                         total_stats.merge(&block_stats);
-                        for block in blocks {
-                            match block {
-                                OutputBlock::Uncompressed((block_bytes, index, tagdata)) => {
-                                    *s4_bytes_written += block_bytes.len() as u64;
-                                    *s4_write_calls += 1;
-                                    let t_w = std::time::Instant::now();
-                                    writer.write_primitive_block_owned(
-                                        block_bytes, index, tagdata.as_deref(),
-                                    )?;
-                                    #[allow(clippy::cast_possible_truncation)]
-                                    { *s4_write_ms += t_w.elapsed().as_millis() as u64; }
-                                }
-                                OutputBlock::Framed(framed_bytes) => {
-                                    *s4_bytes_written += framed_bytes.len() as u64;
-                                    *s4_write_calls += 1;
-                                    let t_w = std::time::Instant::now();
-                                    writer.write_raw_owned(framed_bytes)?;
-                                    #[allow(clippy::cast_possible_truncation)]
-                                    { *s4_write_ms += t_w.elapsed().as_millis() as u64; }
-                                }
-                            }
+                        for (block_bytes, index, tagdata) in blocks {
+                            *s4_bytes_written += block_bytes.len() as u64;
+                            *s4_write_calls += 1;
+                            let t_w = std::time::Instant::now();
+                            writer.write_primitive_block_owned(
+                                block_bytes, index, tagdata.as_deref(),
+                            )?;
+                            #[allow(clippy::cast_possible_truncation)]
+                            { *s4_write_ms += t_w.elapsed().as_millis() as u64; }
                         }
                     }
                     ConsumerItem::Passthrough { frame_offset, frame_size, count, kind } => {
@@ -843,10 +754,6 @@ pub(super) fn stage4_assembly(
         crate::debug::emit_counter("s4_decompress_ms", s4_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_assemble_ms", s4_assemble_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_way_reframe_ms", s4_way_reframe_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter(
-            "s4_way_frame_compress_ms",
-            (s4_way_frame_compress_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000) as i64,
-        );
         crate::debug::emit_counter("s4_nonway_assemble_ms", s4_nonway_assemble_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_way_blobs_processed", s4_way_blobs_processed.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_nonway_blobs_processed", s4_nonway_blobs_processed.load(std::sync::atomic::Ordering::Relaxed) as i64);

@@ -506,11 +506,26 @@ pub(super) const COORD_SLOT_SIZE: usize = 8;
 pub(super) struct NodeBlobInfo {
     pub data_offset: u64,
     pub data_size: usize,
+    /// Rank-index path bookkeeping. Unused after A1 step 3 - stage 2
+    /// reads min_id/max_id instead. Step 4 deletes these along with
+    /// pass B and the rank machinery.
+    #[allow(dead_code)]
     pub ref_rank_start: u64,
+    #[allow(dead_code)]
     pub ref_rank_end: u64,
+    /// Indexdata-advertised id range, copied straight from blob_meta.
+    /// Used by stage 2 (A1 step 3+) to find blobs intersecting an ID
+    /// bucket. Validated at construction (`max_id >= min_id`,
+    /// `min_id >= 0`); pass A's `BucketLayout` is derived from the
+    /// per-run max of `max_id` across node blobs.
+    pub min_id: i64,
+    pub max_id: i64,
 }
 
 impl NodeBlobInfo {
+    /// Rank-index-derived ref count. Unused after A1 step 3; deleted
+    /// in step 4 alongside the rank fields.
+    #[allow(dead_code)]
     pub fn ref_count(&self) -> u64 {
         self.ref_rank_end - self.ref_rank_start
     }
@@ -848,8 +863,12 @@ pub fn external_join(
     crate::debug::emit_marker("EXTJOIN_STAGE1_END");
 
     let total_slots = stage1_out.total_slots;
-    let unique_nodes = stage1_out.unique_nodes;
-    let rank_bucket_counts = stage1_out.rank_bucket_counts;
+    // Step 4 deletes pass B; until then we still log unique_nodes /
+    // rank_bucket_counts via the existing counters but stage 2 reads
+    // id_bucket_counts.
+    let _unique_nodes = stage1_out.unique_nodes;
+    let _rank_bucket_counts = stage1_out.rank_bucket_counts;
+    let id_bucket_counts = stage1_out.id_bucket_counts;
     let num_shard_workers = stage1_out.num_shard_workers;
     let mut node_id_set = stage1_out.node_id_set;
     let node_blob_mapping = stage1_out.node_blob_mapping;
@@ -908,14 +927,14 @@ pub fn external_join(
     );
     let resolved_count = stage2_node_join(
         &scratch_dir,
-        &rank_bucket_counts,
+        &id_bucket_counts,
         num_shard_workers,
+        bucket_layout_ref,
+        &way_slot_starts,
         &slot_buckets,
         slot_bucket_count,
         total_slots,
-        unique_nodes,
         &input_pbf,
-        &node_id_set,
         &node_blob_mapping,
     )?;
     slot_buckets.finish()?;

@@ -33,6 +33,13 @@ pub(super) struct Stage1Output {
     pub total_slots: u64,
     pub unique_nodes: u64,
     pub rank_bucket_counts: Vec<u64>,
+    /// Per-(id-bucket) IdRecord counts produced by pass A. Used by
+    /// stage 2 (A1 step 3+) to skip empty buckets without a probe.
+    /// Same length as `rank_bucket_counts`. Populated alongside the
+    /// existing rank-bucket emission for the duration of the dual-path
+    /// window (A1 steps 2-3); step 4 deletes `rank_bucket_counts`.
+    #[allow(dead_code)] // wired up in step 3 (stage 2 ID-bucket consumer).
+    pub id_bucket_counts: Vec<u64>,
     pub num_shard_workers: usize,
     pub node_id_set: IdSet,
     pub node_blob_mapping: Vec<NodeBlobInfo>,
@@ -67,8 +74,11 @@ pub(super) fn build_way_schedule(blob_meta: &[BlobMeta]) -> Result<Vec<WayBlobTa
 /// Pass A standalone: parallel way scan to build `IdSet` of all
 /// referenced node IDs and write the two ref-count sidecars in blob order.
 ///
-/// Returns `(total_refs, IdSet)` with `build_rank_index()` already
-/// called. Used by `stage1_way_pass` as the entry into stage 1.
+/// Returns `(total_refs, IdSet, id_bucket_counts)` with
+/// `build_rank_index()` already called. Used by `stage1_way_pass` as
+/// the entry into stage 1. `id_bucket_counts[k]` is the number of
+/// IdRecords pass A wrote to ID-bucket `k` across all workers; stage
+/// 2 reads it to skip empty buckets.
 #[hotpath::measure]
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
@@ -80,7 +90,7 @@ pub(super) fn stage1_pass_a(
     layout: &BucketLayout,
     ref_count_sidecar: &Path,
     per_way_refcount_sidecar: &Path,
-) -> Result<(u64, IdSet)> {
+) -> Result<(u64, IdSet, Vec<u64>)> {
     use std::os::unix::fs::FileExt as _;
 
     let shared_file = std::sync::Arc::new(
@@ -117,6 +127,10 @@ pub(super) fn stage1_pass_a(
     let s1a_id_shard_bytes_written = std::sync::atomic::AtomicU64::new(0);
     let s1a_id_shard_flush_err: std::sync::Mutex<Option<String>> =
         std::sync::Mutex::new(None);
+    // Per-(id-bucket) record counts. Stage 2 reads these via the
+    // `Stage1Output` field to skip empty buckets without a probe.
+    let s1a_id_bucket_counts: Vec<std::sync::atomic::AtomicU64> =
+        (0..NUM_BUCKETS).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
     {
         type PassAItem = (u32, std::result::Result<(u64, Vec<u32>), String>);
         let (tx, rx) = std::sync::mpsc::sync_channel::<PassAItem>(32);
@@ -134,6 +148,8 @@ pub(super) fn stage1_pass_a(
         let s1a_id_skipped_ref = &s1a_id_records_skipped;
         let s1a_id_bytes_ref = &s1a_id_shard_bytes_written;
         let s1a_id_flush_err_ref = &s1a_id_shard_flush_err;
+        let s1a_id_bucket_counts_ref: &[std::sync::atomic::AtomicU64] =
+            &s1a_id_bucket_counts;
         let layout_ref = layout;
         let scratch_ref = scratch;
 
@@ -243,6 +259,8 @@ pub(super) fn stage1_pass_a(
                                     writer.write_all(&id_rec_buf).map_err(|e| {
                                         format!("write id shard W{worker_id}: {e}")
                                     })?;
+                                    s1a_id_bucket_counts_ref[bucket_idx]
+                                        .fetch_add(1, Relaxed);
                                     blob_emitted += 1;
                                     blob_bytes += ID_RECORD_SIZE as u64;
                                 } else {
@@ -385,7 +403,12 @@ pub(super) fn stage1_pass_a(
     }
     crate::debug::emit_marker("EXTJOIN_S1_PASS_A_END");
 
-    Ok((total_refs, node_id_set))
+    let id_bucket_counts: Vec<u64> = s1a_id_bucket_counts
+        .iter()
+        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        .collect();
+
+    Ok((total_refs, node_id_set, id_bucket_counts))
 }
 
 /// Header-only walk of node blobs that builds the `NodeBlobInfo` mapping
@@ -446,6 +469,8 @@ pub(super) fn build_node_blob_mapping(
             data_size: meta.data_size,
             ref_rank_start,
             ref_rank_end,
+            min_id: meta.min_id,
+            max_id: meta.max_id,
         });
     }
 
@@ -542,7 +567,7 @@ pub(super) fn stage1_way_pass(
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("extjoin_fd_cap_workers", fd_cap as i64);
 
-    let (total_refs, node_id_set) = stage1_pass_a(
+    let (total_refs, node_id_set, id_bucket_counts) = stage1_pass_a(
         input,
         &schedule,
         num_workers,
@@ -783,6 +808,7 @@ pub(super) fn stage1_way_pass(
         total_slots: total_refs,
         unique_nodes: unique_nodes_u64,
         rank_bucket_counts: merged_counts,
+        id_bucket_counts,
         num_shard_workers: num_actual_workers,
         node_id_set,
         node_blob_mapping,

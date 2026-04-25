@@ -98,7 +98,16 @@ audit doc for full reasoning):
 2. `cli_diff.rs` + `cli_derive_changes.rs` - split for file size. 45 tests combined.
 3. `cli_extract.rs` - 27 tests, 9 non-stable symbols imported today.
 4. `cli_altw.rs` - 18 tests. Blocks ALTW rewrite (the motivating example).
-5. `cli_sort.rs`, `cli_cat.rs`, `cli_getid.rs`, `cli_tags_filter.rs`, `cli_merge_changes.rs`, `cli_renumber.rs`, `cli_tags_count.rs`, `cli_time_filter.rs` - 126 tests across 11 existing files. Convert them after the tier split is clear; do not blindly mirror every old test in Tier 1.
+5. `cli_sort.rs` (landed), `cli_time_filter.rs` (landed 2026-04-25),
+   `cli_cat.rs`, `cli_getid.rs`, `cli_tags_filter.rs`, `cli_merge_changes.rs`,
+   `cli_renumber.rs`, `cli_tags_count.rs` - 126 tests across 11 existing
+   files. Convert them after the tier split is clear; do not blindly
+   mirror every old test in Tier 1. Note that text-output commands
+   (`tags-count`, `getid`, `inspect --tags`) have a different test
+   shape from PBF-output commands: their library-internal-invariant
+   tests should move inline (`#[cfg(test)] mod tests` in `src/`)
+   rather than being CLI-converted, with a separate small
+   `cli_<command>.rs` for the CLI-contract surface.
 
 **CLI conversion policy.** Continue the `CliInvoker` direction, but do
 not convert old test files wholesale into always-on `cli_*.rs` files.
@@ -131,11 +140,12 @@ same shape.
 
 **Known harness gap:** CLI binary feature parity across test sweeps
 is a brokkr-side concern, not a pbfhogg one. See
-[`testing-cli-feature-parity.md`](testing-cli-feature-parity.md) for
-the problem statement + proposed fix. Blocks feature-missing error
-tests for every CLI-gated flag (`--direct-io`, `--io-uring`) across
-all commands. Until the fix lands, the recommended fallback is
-inline unit tests in `src/commands/mod.rs` under
+[`testing-cli-feature-parity.md`](testing-cli-feature-parity.md)
+(the brokkr feature-requests handoff doc, request 2) for the problem
+statement + proposed fix. Blocks feature-missing error tests for
+every CLI-gated flag (`--direct-io`, `--io-uring`) across all
+commands. Until the fix lands, the recommended fallback is inline
+unit tests in `src/commands/mod.rs` under
 `#[cfg(all(test, not(feature = "...")))]`.
 
 **Fault-injection split** - landed 2026-04-25. Each cargo integration
@@ -601,5 +611,7 @@ Landed 2026-04-25. `tests/common/cli.rs` now provides:
   switched to these helpers as the precedent for new `cli_*.rs` files.
 
 Still open: feature-surface assertions stay out of CLI tests until
-the feature-parity issue in `testing-cli-feature-parity.md` is fixed
-(or covered by inline unit tests on the library-side CLI plumbing).
+the feature-parity issue documented in
+[`testing-cli-feature-parity.md`](testing-cli-feature-parity.md)
+(brokkr-side, request 2) is fixed - or covered by inline unit tests
+on the library-side CLI plumbing.

@@ -1,8 +1,24 @@
+//! CLI-driven integration tests for `pbfhogg time-filter`.
+//!
+//! Replaces the library-API `tests/time_filter.rs`. Fixture PBFs
+//! are built with the stable-allowlist writer helpers; the
+//! `time-filter` command runs via the compiled `pbfhogg` binary
+//! through `CliInvoker`; output is verified by reading the
+//! resulting PBF with the stable-allowlist reader helpers, with
+//! the stats summary inspected through stderr (the CLI emits it
+//! via `eprintln!`). No imports from `pbfhogg::time_filter::*` -
+//! a rewrite of `src/commands/time_filter/` cannot break these
+//! tests by type changes alone.
+
+#![allow(clippy::unwrap_used)]
+
 mod common;
 
+use std::path::Path;
+
+use common::cli::CliInvoker;
 use common::read_header;
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData, Metadata};
-use pbfhogg::time_filter::time_filter;
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element, MemberId};
 
@@ -27,6 +43,20 @@ struct RelationSnapshot {
     member_count: usize,
 }
 
+/// Invoke `pbfhogg time-filter <input> -o <output> <cutoff>` and
+/// assert success. Returns the captured stderr (which carries the
+/// stats summary line) so the caller can pin counter values.
+fn run_time_filter(input: &Path, output: &Path, cutoff: i64) -> String {
+    let out = CliInvoker::new()
+        .arg("time-filter")
+        .arg(input)
+        .arg("-o")
+        .arg(output)
+        .arg(cutoff.to_string())
+        .assert_success();
+    out.stderr_str()
+}
+
 #[test]
 fn snapshot_keeps_latest_version_at_cutoff() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -34,15 +64,7 @@ fn snapshot_keeps_latest_version_at_cutoff() {
     let output = dir.path().join("snapshot.osm.pbf");
 
     write_history_input(&input);
-    time_filter(
-        &input,
-        &output,
-        250,
-        Compression::default(),
-        false,
-        &pbfhogg::HeaderOverrides::default(),
-    )
-    .expect("time-filter");
+    run_time_filter(&input, &output, 250);
 
     let nodes = read_nodes_with_metadata(&output);
     assert_eq!(
@@ -69,15 +91,7 @@ fn snapshot_omits_objects_deleted_at_cutoff() {
     let output = dir.path().join("snapshot.osm.pbf");
 
     write_history_input(&input);
-    time_filter(
-        &input,
-        &output,
-        350,
-        Compression::default(),
-        false,
-        &pbfhogg::HeaderOverrides::default(),
-    )
-    .expect("time-filter");
+    run_time_filter(&input, &output, 350);
 
     let nodes = read_nodes_with_metadata(&output);
     assert_eq!(
@@ -97,15 +111,7 @@ fn output_header_replication_timestamp_is_cutoff() {
     let output = dir.path().join("snapshot.osm.pbf");
 
     write_history_input(&input);
-    time_filter(
-        &input,
-        &output,
-        123,
-        Compression::default(),
-        false,
-        &pbfhogg::HeaderOverrides::default(),
-    )
-    .expect("time-filter");
+    run_time_filter(&input, &output, 123);
 
     let header = read_header(&output);
     assert_eq!(header.osmosis_replication_timestamp(), Some(123));
@@ -119,21 +125,31 @@ fn snapshot_path_filters_non_history_input() {
     let output = dir.path().join("snapshot_output.osm.pbf");
 
     write_snapshot_input(&input);
-    let stats = time_filter(
-        &input,
-        &output,
-        250,
-        Compression::default(),
-        false,
-        &pbfhogg::HeaderOverrides::default(),
-    )
-    .expect("time-filter");
+    let stderr = run_time_filter(&input, &output, 250);
 
-    assert_eq!(stats.versions_seen, 8);
-    assert_eq!(stats.versions_before_cutoff, 6);
-    assert_eq!(stats.elements_written, 4);
-    assert_eq!(stats.dropped_deleted, 2);
-    assert_eq!(stats.dropped_no_snapshot_version, 2);
+    // The CLI emits the TimeFilterStats summary on stderr via
+    // `print_summary`. Pin the substrings for the five counters
+    // the library test pinned by direct field access.
+    assert!(
+        stderr.contains("8 versions scanned"),
+        "stats line missing 'versions_seen=8'; stderr =\n{stderr}",
+    );
+    assert!(
+        stderr.contains("6 <= cutoff"),
+        "stats line missing 'versions_before_cutoff=6'; stderr =\n{stderr}",
+    );
+    assert!(
+        stderr.contains("4 elements written"),
+        "stats line missing 'elements_written=4'; stderr =\n{stderr}",
+    );
+    assert!(
+        stderr.contains("2 deleted at cutoff"),
+        "stats line missing 'dropped_deleted=2'; stderr =\n{stderr}",
+    );
+    assert!(
+        stderr.contains("2 without version <= cutoff"),
+        "stats line missing 'dropped_no_snapshot_version=2'; stderr =\n{stderr}",
+    );
 
     let nodes = read_nodes_with_metadata(&output);
     assert_eq!(
@@ -179,7 +195,39 @@ fn snapshot_path_filters_non_history_input() {
     );
 }
 
-fn write_history_input(path: &std::path::Path) {
+#[test]
+fn snapshot_ways_and_relations() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("history.osm.pbf");
+    let output = dir.path().join("snapshot.osm.pbf");
+
+    write_history_with_ways_and_relations(&input);
+    run_time_filter(&input, &output, 250);
+
+    let (ways, relations) = read_ways_and_relations(&output);
+    assert_eq!(
+        ways,
+        vec![WaySnapshot {
+            id: 10,
+            version: 2,
+            refs: vec![1, 2, 3],
+        }]
+    );
+    assert_eq!(
+        relations,
+        vec![RelationSnapshot {
+            id: 100,
+            version: 1,
+            member_count: 1,
+        }]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fixture builders (allowlist-only)
+// ---------------------------------------------------------------------------
+
+fn write_history_input(path: &Path) {
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
@@ -240,14 +288,14 @@ fn snapshot_meta(version: i32, timestamp: i64, visible: bool) -> Metadata<'stati
     Metadata {
         version,
         timestamp,
-        changeset: 10_000 + version as i64,
+        changeset: 10_000 + i64::from(version),
         uid: 7,
         user: "snapshot",
         visible,
     }
 }
 
-fn write_snapshot_input(path: &std::path::Path) {
+fn write_snapshot_input(path: &Path) {
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
@@ -337,75 +385,7 @@ fn write_snapshot_input(path: &std::path::Path) {
     writer.flush().expect("flush");
 }
 
-fn read_nodes_with_metadata(path: &std::path::Path) -> Vec<NodeSnapshot> {
-    let reader = BlobReader::from_path(path).expect("open pbf");
-    let mut out = Vec::new();
-    for blob in reader {
-        let blob = blob.expect("read blob");
-        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
-            for element in block.elements() {
-                match element {
-                    Element::DenseNode(dn) => {
-                        let info = dn.info().expect("dense info");
-                        out.push(NodeSnapshot {
-                            id: dn.id(),
-                            version: info.version(),
-                            timestamp: info.milli_timestamp() / 1000,
-                        });
-                    }
-                    Element::Node(n) => {
-                        let info = n.info();
-                        out.push(NodeSnapshot {
-                            id: n.id(),
-                            version: info.version().unwrap_or(0),
-                            timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-                        });
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    out
-}
-
-#[test]
-fn snapshot_ways_and_relations() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let input = dir.path().join("history.osm.pbf");
-    let output = dir.path().join("snapshot.osm.pbf");
-
-    write_history_with_ways_and_relations(&input);
-    time_filter(
-        &input,
-        &output,
-        250,
-        Compression::default(),
-        false,
-        &pbfhogg::HeaderOverrides::default(),
-    )
-    .expect("time-filter");
-
-    let (ways, relations) = read_ways_and_relations(&output);
-    assert_eq!(
-        ways,
-        vec![WaySnapshot {
-            id: 10,
-            version: 2,
-            refs: vec![1, 2, 3],
-        }]
-    );
-    assert_eq!(
-        relations,
-        vec![RelationSnapshot {
-            id: 100,
-            version: 1,
-            member_count: 1,
-        }]
-    );
-}
-
-fn write_history_with_ways_and_relations(path: &std::path::Path) {
+fn write_history_with_ways_and_relations(path: &Path) {
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
@@ -485,7 +465,43 @@ fn write_history_with_ways_and_relations(path: &std::path::Path) {
     writer.flush().expect("flush");
 }
 
-fn read_ways_and_relations(path: &std::path::Path) -> (Vec<WaySnapshot>, Vec<RelationSnapshot>) {
+// ---------------------------------------------------------------------------
+// Allowlist readers
+// ---------------------------------------------------------------------------
+
+fn read_nodes_with_metadata(path: &Path) -> Vec<NodeSnapshot> {
+    let reader = BlobReader::from_path(path).expect("open pbf");
+    let mut out = Vec::new();
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
+            for element in block.elements() {
+                match element {
+                    Element::DenseNode(dn) => {
+                        let info = dn.info().expect("dense info");
+                        out.push(NodeSnapshot {
+                            id: dn.id(),
+                            version: info.version(),
+                            timestamp: info.milli_timestamp() / 1000,
+                        });
+                    }
+                    Element::Node(n) => {
+                        let info = n.info();
+                        out.push(NodeSnapshot {
+                            id: n.id(),
+                            version: info.version().unwrap_or(0),
+                            timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    out
+}
+
+fn read_ways_and_relations(path: &Path) -> (Vec<WaySnapshot>, Vec<RelationSnapshot>) {
     let reader = BlobReader::from_path(path).expect("open pbf");
     let mut ways = Vec::new();
     let mut relations = Vec::new();

@@ -559,10 +559,7 @@ or `mod serial` populations yet - the fault-injection split made
 serial tests per-binary and race-free, and tier-2 matrices grow when
 commands actually need them rather than preemptively.
 
-The landed `brokkr.toml` lives at the project root; final shape and
-notes on deviations from earlier drafts in
-[`testing-cli-feature-parity.md`](testing-cli-feature-parity.md)
-("Landed `brokkr.toml` shape").
+The landed `brokkr.toml` lives at the project root.
 
 Command surface:
 
@@ -589,8 +586,8 @@ Landed 2026-04-25. `tests/common/cli.rs` now provides:
   not support` / `not supported` for io_uring). `tests/cli_sort.rs`
   switched to these helpers as the precedent for new `cli_*.rs` files.
 
-Still open: feature-surface assertions stay out of CLI tests until
-the feature-parity issue documented in
-[`testing-cli-feature-parity.md`](testing-cli-feature-parity.md)
-(brokkr-side, request 2) is fixed - or covered by inline unit tests
-on the library-side CLI plumbing.
+Feature-surface assertions in CLI tests are now possible:
+brokkr's `build_packages` (commit `f7a96b7`) plus
+`BROKKR_TEST_BIN_DIR` (commit `b3aa444`) close the binary/library
+feature-parity gap. The two `feature_missing_error` tests in
+`tests/cli_sort.rs` are the canonical precedent.

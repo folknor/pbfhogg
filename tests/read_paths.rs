@@ -475,10 +475,15 @@ fn sorted_pbf_no_assertion_failure() {
 /// Debug assertion fires on unsorted nodes when Sort.Type_then_ID is declared.
 ///
 /// Requires `debug_assertions` to be enabled in the test profile.
-/// Nightly 1.95 (2026-02-25) has a regression where `debug_assertions` is off
-/// in test builds, so this test is ignored until the regression is fixed.
+/// Nightly 1.95 (2026-02-25) has a regression where `debug_assertions` is
+/// off in test builds, so the test compiles to nothing in our environment.
+/// `cfg(debug_assertions)` is the correct gate: the test is only
+/// meaningful when the runtime assertion can fire, and `include_ignored`
+/// can't resurrect a compile-excluded item (which `#[ignore]` alone left
+/// vulnerable - tier 3 / `--profile full` in brokkr.toml runs ignored
+/// tests and hit the unfireable-panic case).
+#[cfg(debug_assertions)]
 #[test]
-#[ignore]
 #[should_panic(expected = "Sort.Type_then_ID violated")]
 fn sorted_flag_but_unsorted_nodes_panics() {
     let dir = TempDir::new().unwrap();

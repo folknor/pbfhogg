@@ -84,8 +84,8 @@ I/O flags (`--direct-io`, `--io-uring`) create named variants in results. `--for
 
 ### Utility commands
 
-- `brokkr check [-- args]` - clippy + tests. Supports `--features`, `--no-default-features`, `-p`. Output minified: one-line summaries with file:line.
-- `brokkr test <FILE> <NAME> [-N repeat] [-j jobs] [--raw]` - run one integration test by exact name, always release + `--include-ignored` + `--nocapture` + single-threaded. Runs the all-features sweep and (if configured) a second consumer-features sweep. Footer prints `[test] PASS/FAIL` with wall time per sweep; `NO MATCH` indicates the name filter matched zero tests under that sweep (useful when a test is `#[cfg]`-gated behind a feature absent from the consumer build). `--raw` streams the unfiltered cargo output. Example: `brokkr test merge merge_basic_create_modify_delete_uring`.
+- `brokkr check [--profile <name>] [-- args]` - clippy + tests across every `[[check]]` sweep in `brokkr.toml`. Default profile is `tier1` (fast contracts; skips `tier2::`/`tier3::`/`platform::`/`serial::` modules). Other profiles: `full` (tier 3, includes ignored tests), `platform` (`--direct-io`/`--io-uring` tests), `serial` (`--test-threads=1`), `sort` (per-command tier-2 precedent). Each sweep rebuilds `pbfhogg-cli` with matching features via `build_packages`; `BROKKR_TEST_BIN_DIR` is exported so test code finds the right binary. Output minified: one-line summaries with file:line.
+- `brokkr test <FILE> <NAME> [-N repeat] [-j jobs] [--raw]` - run one integration test by exact name, always release + `--include-ignored` + `--nocapture` + single-threaded. Runs every `[[check]]` sweep configured in `brokkr.toml` (today: `all` + `consumer`). Footer prints `[test] PASS/FAIL` with wall time per sweep; `NO MATCH` indicates the name filter matched zero tests under that sweep (useful when a test is `#[cfg]`-gated behind a feature absent from the consumer build). `--raw` streams the unfiltered cargo output. Example: `brokkr test merge merge_basic_create_modify_delete_uring`.
 - `brokkr env` - hostname, kernel, governor, memory, drives, datasets. Also computes missing hashes.
 - `brokkr results` - table of the last 20 results. `brokkr results [UUID]` - specific result.
 - `brokkr results [--commit X] [--compare A B] [--command CMD] [--mode M] [--grep STR] [--dataset D] [--meta K=V] [-n N] [--top N]` - query/compare from SQLite. `--command` exact-matches the bare subcommand id (no `bench `/`hotpath ` prefix); `--mode` filters by measurement mode (`bench`/`hotpath`/`alloc`); `--grep STR` substring-matches against both `cli_args` and `brokkr_args` (use it to find runs by flag/axis, e.g. `--grep zstd:1` or `--grep snap-20260411`); `--dataset` substring match on input file; `--meta` exact match, composable with AND.
@@ -165,9 +165,11 @@ Do not use the `review` tool without asking the user first.
 Subagents must NOT run any shell commands. They write code only. Integration, building, and testing is done in the main conversation.
 
 ## Workspace
-Cargo workspace: **`pbfhogg`** (root, library) + **`pbfhogg-cli`** (`cli/`, binary, produces `pbfhogg`). Library users: `default-features = false` skips `commands` feature. CLI integration tests in `cli/tests/cli.rs`.
+Cargo workspace: **`pbfhogg`** (root, library) + **`pbfhogg-cli`** (`cli/`, binary, produces `pbfhogg`). Library users: `default-features = false` skips `commands` feature. `pbfhogg-cli` carries a no-op `commands` feature so brokkr can apply `--features commands` symmetrically across both crates - the CLI's lib dep already always pulls in `pbfhogg/commands`.
 
-`cargo clippy --all-targets` can cache and miss CLI crate violations. After changing `cli/src/main.rs`, verify with `brokkr check --package pbfhogg-cli`.
+CLI-driven integration tests live in `tests/cli_*.rs` and drive the compiled `pbfhogg` binary via `CliInvoker` (`tests/common/cli.rs`). The CliInvoker resolves the binary via `BROKKR_TEST_BIN_DIR` first (set by brokkr per sweep), falling back to `CARGO_TARGET_DIR + cfg!(debug_assertions)` for plain `cargo test` runs.
+
+`cargo clippy --all-targets` can cache and miss CLI crate violations. After changing `cli/src/main.rs`, verify with `brokkr check` (the `all` sweep includes `pbfhogg-cli` via `build_packages`).
 
 ## Architecture
 **Read path:** `BlobReader` (blob.rs) → `PrimitiveBlock` (block.rs) → `Element` (elements.rs)
@@ -189,7 +191,7 @@ Cargo workspace: **`pbfhogg`** (root, library) + **`pbfhogg-cli`** (`cli/`, bina
 - Strict clippy: `unwrap_used = "deny"`, `cognitive_complexity = "deny"`.
 - Coordinates: decimicrodegrees (10^-7 degrees) for node I/O.
 - Errors: `error.rs`, boxed ErrorKind pattern. `MissingHeader` if no OsmHeader blob.
-- Tests: `tests/` (21 files) + `cli/tests/cli.rs` + inline unit tests.
+- Tests: `tests/` (~30 files: `cli_*.rs` CLI-driven, stable-API integration tests, `fault_*.rs` per-binary fault injection) + `cli/tests/cli.rs` + inline unit tests in `src/**/*.rs`. Validation tier model in [`notes/testing.md`](notes/testing.md): tier 1 at file root, tier 2/3 in `mod tier2`/`mod tier3` submodules, platform-gated tests in `mod platform`, serial in `mod serial`. New `cli_*.rs` files use `CliInvoker` and the stable allowlist (`block_builder`, `writer`, `BlobReader`, `Element`, etc.) so internal-module rewrites don't force test edits.
 
 ## Features (library crate)
 - `commands` (default): `check_refs`, `extract`, geocode builder + deps (`roaring`, `serde_json`, `s2`)

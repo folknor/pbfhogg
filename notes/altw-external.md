@@ -33,6 +33,185 @@ Meta-lessons worth pinning before picking an item:
   on this hardware; total stage-4 floor is ~141 s. Designs that do not reduce
   bytes-read cannot beat that floor.
 
+## Current-code architectural review, 2026-04-25
+
+This review ignores earlier attempts and reads the current external path as
+it stands. The strongest conclusion: the next big win is not a generic writer
+cleanup and not preservation of existing stage seams. It is deleting invented
+intermediate orderings and letting the command use ALTW-specific dataflow.
+
+Current structure, by hot phase:
+
+- `external_join` first walks blob metadata, then runs stage 1 plus optional
+  relation scan, then stage 2, then streams stage 3 and stage 4 concurrently.
+- Stage 1 scans every way blob once to build a planet-scale `IdSet`, writes
+  refcount sidecars, builds the rank index, then scans every way blob again
+  to emit rank-bucket records.
+- Stage 2 groups rank-bucket records by local rank, decodes intersecting node
+  blobs, resolves coordinates, and writes 12-byte slot-bucket records.
+- Stage 3 rereads slot-bucket records, scatters them into dense bucket-wide
+  coordinate buffers, emits per-way-blob coord payloads, and coordinates
+  straddler blobs with stage 4.
+- Stage 4 waits for per-way coord payloads, reframes way blobs with custom
+  wire logic, but sends uncompressed blocks back through the generic
+  `PbfWriter` pipeline. Passthrough blobs are copied through userspace.
+
+### A1. Full rewrite: rankless node-ID bucketed join
+
+This is the highest-conviction remaining architectural opportunity.
+
+**Bottleneck.** Stage 1 pays a second full way pread/decompress/scan and keeps
+the large `IdSet` rank machinery alive so that refs can be transformed from
+node IDs into dense ranks. Stage 2 then has to preserve rank semantics for
+node-blob intersection and coordinate lookup.
+
+**Why the current structure causes it.** Rank is an internal convenience key,
+not a natural property of either input stream. Pass A exists to discover the
+referenced-node set; pass B exists because the current record format cannot be
+emitted until ranks exist. The code spends a lot of work inventing and then
+maintaining that ordering.
+
+**Stronger redesign.** Delete rank from the external join, and treat the
+whole stage-1-through-stage-3 dataflow as replaceable:
+
+- In the first and only way pass, emit `(local_node_id: u32, slot_pos: u64)`
+  into node-ID buckets while still writing the refcount sidecars stage 4 needs.
+- Derive bucket width from metadata max node ID, rather than relying on a
+  permanent hard `MAX_NODE_ID` cap.
+- In stage 2, group bucket records by `local_node_id`; decode node blobs whose
+  indexed ID range intersects that node-ID bucket; resolve all pending slot
+  positions for matching node IDs.
+- Full end state: do not assume the current slot-bucket seam survives. Once
+  node-ID buckets own the first join, the downstream permutation can be
+  redesigned around way-blob groups, slot windows, or direct coord-payload
+  assembly if that is the cleaner throughput shape.
+- Benchmark isolation shape: keeping the current 12-byte stage-2 output into
+  slot buckets is useful only as a way to measure the rankless join by itself.
+  It is not a design constraint.
+
+**Why it is plausibly high-payoff.** This removes one complete way pass, the
+atomic `IdSet` population pressure, `build_rank_index`, per-ref rank lookup,
+`count_below`-derived node-blob rank mapping, and a large chunk of rank-state
+RSS. The record stays 12 bytes if the bucket-local ID is `u32`, so this does
+not buy CPU by inflating the largest scratch stream.
+
+**Risks.** Dense histograms over node-ID buckets can be wider than referenced
+rank buckets, so the bucket count and count/offset widths matter. Node-ID
+sparsity can waste zeroing/prefix time. The implementation must validate the
+indexed node min/max metadata tightly enough to avoid silent misses.
+
+**Classification.** Full coherent stage 1+2 rewrite, with permission to grow
+into a stage 1-3 rewrite. Do this before micro-optimizing the existing rank
+path.
+
+### A2. Full rewrite: ALTW-specific final output executor
+
+**Bottleneck.** Stage 4 already performs ALTW-specific way reframe work, but
+then hands uncompressed blocks to `PbfWriter::write_primitive_block_owned`,
+which schedules another framing/compression task and serializes through the
+generic writer pipeline. Raw passthrough blobs are read into userspace and
+written back out.
+
+**Why the current structure causes it.** The ownership chain is longer than
+the command needs: worker -> decoded channel -> ordered consumer -> writer API
+-> Rayon frame task -> writer thread -> file sink. The generic API is useful
+elsewhere, but here it obscures the fact that ALTW workers can produce final
+framed output chunks directly.
+
+**Stronger redesign.**
+
+- Replace the stage-4 writer path with a command-specific output executor.
+- Way workers reframe and frame/compress in the same worker, using the known
+  indexdata/tagdata.
+- Filtered node workers do the same once the node path is specialized.
+- Passthrough blobs become copy-range descriptors where the platform supports
+  it, with userspace copy only as fallback.
+- A small ordered coordinator assigns final output offsets and dispatches
+  pwrite/copy work to a pool.
+
+**Why it is plausibly high-payoff.** Stage 4 is the final full-output pass.
+Removing handoffs raises the writer ceiling, reduces queueing overhead, and
+lets passthrough-heavy or low-compression modes use the storage device more
+directly. The existing parallel writer shape is a useful reference, but the
+end state should be ALTW-specific if the generic abstraction gets in the way.
+
+**Risks.** Ordered offset assignment must be exact. Decode/compress/write
+queues need explicit bounds. Copy-range support is platform-sensitive.
+Failure handling must be stricter than a convenience writer path.
+
+**Classification.** Full coherent stage 4/output rewrite. A smaller local
+probe is to switch ALTW to the existing parallel writer path and use raw-copy
+output where available, but that is not the final architecture.
+
+### A3. Full rewrite/local hybrid: wire-format DenseNodes filter
+
+**Bottleneck.** Way blobs use a specialized wire reframe path, but filtered
+node blobs still go through generic `PrimitiveBlock` construction, element
+iteration, string-table lookup, `BlockBuilder` packing, and compression of
+new 8000-entity blocks.
+
+**Why the current structure causes it.** The non-way path is inherited from a
+generic assembly abstraction. It is correct, but it is the wrong level of
+abstraction for the last full output pass of this command.
+
+**Stronger redesign.**
+
+- Parse PrimitiveBlock and DenseNodes wire fields directly.
+- Preserve the string table wholesale; unused strings are acceptable unless a
+  later exact-size cleanup proves worthwhile.
+- Decode packed IDs, coordinates, `keys_vals`, and DenseInfo columns in lock
+  step.
+- Keep nodes that have tags or relation membership.
+- Emit one filtered DenseNodes blob per input node blob and build fresh
+  indexdata/tagdata for kept entities.
+
+**Why it is plausibly high-payoff.** It removes the last major generic
+decode/rebuild path from stage 4, preserves input blob density, and avoids
+`BlockBuilder` chunking overhead. The current node scanner and way reframe
+logic already prove that direct wire parsing is viable in this codebase.
+
+**Risks.** DenseInfo alignment is easy to break. Exact tagdata recomputation
+needs care. Non-DenseNodes groups need an explicit fallback or hard error.
+
+**Classification.** Intrusive local-to-stage-4 rewrite. High conviction if
+stage-4 non-way work remains visible after the output executor is fixed.
+
+### A4. Later rewrite: stage-2 -> stage-3 materialization
+
+**Bottleneck.** Stage 2 writes one 12-byte resolved-coordinate record per ref
+to slot-bucket files. Stage 3 rereads those files, zeroes dense slot buffers,
+scatters records by local slot, then encodes per-way coord payloads.
+
+**Why not preserve it by default.** This seam is real because the command must
+permute from node-oriented resolution to way/blob/ref-oriented output. But the
+current 12-byte slot-bucket stream is only the current implementation of that
+permutation, not an API or invariant. If a full rewrite can make the
+permutation happen in way-blob groups, bounded slot windows, or direct
+coord-payload assembly without violating RSS safety, it should replace this
+seam.
+
+**Coherent redesigns worth considering later.**
+
+- Route stage-2 output by way-blob group and assemble payloads per blob group.
+- Or process bounded slot windows directly, with stage 2 feeding a window's
+  dense slot buffer and stage 3 encoding that window before moving on.
+
+**Classification.** Real architectural target. It is lower confidence than
+A1/A2 only because the permutation is fundamental; the current slot-bucket
+files are not sacred. Revisit as a complete replacement design, not as tiny
+gated probes.
+
+### Medium-value local changes from the current-code read
+
+- Make ALTW use the parallel writer path immediately as a contained benchmark,
+  and use copy-range passthrough where available.
+- Replace the blob metadata scan with a sequential exact-header scanner for
+  high-blob-count inputs, or fold schedule construction into the first pass.
+- If the generic node path remains, use the existing buffer-reuse path instead
+  of repeatedly consuming fresh owned buffers from `BlockBuilder`.
+- Do not micro-optimize stage-1 vector churn unless the rankless rewrite is
+  rejected; A1 removes the larger reason that churn exists.
+
 ---
 
 ## Tier 1: actionable now (platform decisions + design work)
@@ -73,24 +252,43 @@ header cap. Two design paths documented but not explored:
 - Blockers: same cat-contract decision as L1, plus a concrete size-cap design.
 - Scope: moderate-to-large. Needs the header/side-table framing decision first.
 
-### L3. #3 R4 A1: single-pass ID-bucketed stage 1 `[hist]`
+### L3. Rankless node-ID bucketed stage 1+2
 
-Instead of the reverted scratch-spool retry, fuse stage 1A + 1B by changing
-the stage-1B partition key from rank to node-ID high bits. Each pass-A worker
-simultaneously (a) calls `set_atomic` on `IdSetDense` and (b) emits
-`(node_id: u64, slot_pos: u64)` 16-byte records into 256 ID-bucketed shard
-files. Pass B disappears entirely. Stage 2 radix-sorts by
-`(node_id - bucket_id_low) as u32` instead of counting-sorting by rank.
+Supersedes the older "single-pass ID-bucketed stage 1" shape. Do not keep
+`IdSetDense` rank machinery in the design just because the current stage 2
+knows how to consume ranks.
 
-- Plan explicitly calls this "the only live variant" for #3 after the
-  scratch-spool retries failed. The main objection (extra downstream
-  rank work) was dissolved by #4 landing.
-- Scratch grows planet 175 GB -> 234 GB (+33%). Extra 60 GB at multi-GB/s NVMe
-  is sub-minute; saved decompression is CPU-minutes at planet.
-- Blocker: needs a contained branch + Europe `--bench 3` keep-gate. Head-to-head
-  against the current shape is cheaper than more speculation.
-- Scope: larger than scratch-spool (stage 2's `prepare_bucket` needs a
-  sort-by-ID path instead of counting-sort-by-rank).
+Rewrite the external join around node-ID buckets:
+
+- One way pass emits refcount sidecars and `(local_node_id: u32, slot_pos:
+  u64)` records into node-ID bucket shards. The local ID is bucket-relative,
+  so the record remains 12 bytes when bucket width fits in `u32`.
+- Stage 2 groups each bucket by local node ID, decodes intersecting node blobs
+  by indexed ID range, and resolves all pending slot positions for matching
+  node IDs.
+- `IdSetDense`, `build_rank_index`, `rank()`, `count_below()`, and the
+  node-blob rank mapping disappear from this path.
+- Full end state may also replace the current stage-2 -> stage-3 slot-bucket
+  seam. Keeping that seam is only a benchmark-isolation tactic for measuring
+  the rankless join by itself.
+
+Why this is now the top live item:
+
+- Deletes a complete way pread/decompress/scan.
+- Deletes the invented rank ordering and its RSS/memory-traffic cost.
+- Avoids growing the largest scratch stream to 16 bytes/record.
+- Aligns the join key with the node stream's natural key.
+
+Risks:
+
+- Dense per-bucket histograms may cost more zeroing/prefix work than rank
+  buckets. Use metadata-derived bucket width and explicit validation.
+- Node-ID sparsity can skew work. Fix with the bucket design, not with
+  env-var probes.
+
+Scope: full coherent stage 1+2 rewrite, potentially stage 1-3 if the cleanest
+shape deletes the downstream seam too. Benchmark as an intrusive branch and
+keep/revert based on end-to-end throughput.
 
 ### L4. Stage 1B grouped-by-local-rank, segmented variant `[hist]`
 
@@ -129,9 +327,10 @@ under per-bucket lock). Distinct from the two previously-regressed 1B shard
 experiments: fewer files and less buffer memory, rather than reshaping
 emission.
 
-- R4 itself said "the contention concern goes away if A1 + A3 are done
-  (records flow through memory, not files)" - so this is fallback territory
-  relative to L3. But if L3 is not pursued, this is a cheaper contained probe.
+- R4's original note said "the contention concern goes away if A1 + A3 are
+  done (records flow through memory, not files)" - so this is fallback
+  territory relative to L3. But if L3 is not pursued, this is a cheaper
+  contained probe.
 - Scope: small-to-moderate. Keep-gate: flat-or-better Europe wall plus a
   drop in resident `BufWriter` allocation.
 
@@ -139,21 +338,25 @@ emission.
 
 ## Tier 2: speculative, worth a measurement
 
-### L7. Worker-emits-framed-bytes in stage 4 `[tr]`
+### L7. ALTW-specific output executor / worker-emits-framed-bytes `[tr]`
 
-Pattern transfer from apply-changes P1.5 (`719f306`, 2026-04-21). If ALTW
-stage 4 still dispatches framing via `rayon::spawn` per output block and
-funnels through `write_primitive_block_owned`, move framing inline into the
-decoder worker: call `frame_blob_pipelined` directly, ship the framed
-`Vec<u8>` to the writer thread via `write_raw_owned`. Apply-changes saw
-`writer_pipeline_send_wait_ns` drop 86% at planet `--compression none`.
+The small version is the old transfer pattern: if ALTW stage 4 still dispatches
+framing via `rayon::spawn` per output block and funnels through
+`write_primitive_block_owned`, move framing inline into the decoder worker:
+call `frame_blob_pipelined` directly and ship final framed bytes onward.
 
-- Trigger condition: check `s4_send_ms` / `writer_pipeline_send_wait_ns` on
-  the current 661 s baseline. If large, the pattern transfers; if tiny,
-  it doesn't.
-- Applies against the writer ceiling diagnostic: this is the way to
-  *raise* the ceiling, not evade it.
-- Zero-cost probe: just read counters from the existing bench database.
+The stronger current-code version is A2 above: replace the stage-4 writer path
+with an ALTW-specific ordered output executor. Workers produce final chunks;
+passthrough blobs become copy-range descriptors where supported; a coordinator
+assigns output offsets and dispatches pwrite/copy work to a pool.
+
+- Trigger condition for the small version: check `s4_send_ms` /
+  `writer_pipeline_send_wait_ns` on the current baseline. If large, the
+  pattern transfers; if tiny, it doesn't.
+- Applies against the writer ceiling diagnostic: this is the way to *raise*
+  the ceiling, not evade it.
+- Preferred implementation if spending real engineering time: do A2 as a full
+  coherent output rewrite, not an env-var-routed writer experiment.
 
 ### L8. zstd:1 for internal ALTW pipeline `[tr]` `[hist]`
 
@@ -169,7 +372,7 @@ users running an internal pipeline that controls both ends.
 - Composes with L7 and with any other stage-4-side item that would otherwise
   be masked by the zlib writer ceiling.
 
-### L9. Stage 4 wire-format DenseNodes filter (re-measured non-zlib) `[hist]`
+### L9. Stage 4 wire-format DenseNodes filter `[hist]`
 
 Shelved at `4910fd9` because the wall win was consumed by the zlib writer
 ceiling. Europe `s4_nonway_assemble_ms` dropped 53% (78.5 s -> 36.9 s) under
@@ -177,10 +380,12 @@ zlib:6, but `EXTJOIN_STAGE4` went 122.7 -> 127.6 s as freed decoder CPU
 refilled the writer queue. Not re-measured after #2 landed (which uncapped
 stage-4 decode threads to 22).
 
-- If zstd:1 (L8) or `compression:none` is adopted as the internal default,
-  retrying wire-format DenseNodes filter under that output mode could cash
-  in the real CPU win that was invisible before.
-- Blocker: L8 decision first, then a small re-measurement branch.
+- A3 is the stronger current-code framing: implement this as the permanent
+  DenseNodes output path, not as a generic-assembly side branch.
+- Best paired after L7/A2 or measured under zstd:1 / `compression:none`, so
+  the zlib writer ceiling does not hide the CPU win again.
+- Preserve string tables wholesale initially; exact string-table pruning is an
+  afterwards cleanup if the rewrite wins.
 
 ### L10. Coord payload redesign: beyond 1.81x and/or wire-format-ready `[hist]`
 
@@ -336,7 +541,7 @@ Preserved as negative results so these do not get re-proposed:
 - #3 scratch-spool in any buffered/varint form (2026-04-17 flat-i64 attempt
   and 2026-04-21 BufWriter + delta-varint + Cursor fast-path attempt both
   regressed). zlib-rs decompresses way blobs faster than we can reread the
-  scratch. Only L3 (R4 A1) is live.
+  scratch. Only L3's rankless node-ID-bucketed rewrite is live.
 - #5 per-blob accumulators on plantasjen-class RAM (~100 GB working set;
   25 GB RAM host; see L17 for the reopen condition).
 - In-RAM coord-table form (altw_v2 experiment, OOM-killed on europe at
@@ -356,18 +561,22 @@ Preserved as negative results so these do not get re-proposed:
 
 If someone picks this doc up cold and wants a sequence:
 
-1. **L7** counter inspection (zero-cost, disqualifies half the remaining
-   ideas if writer queue is not the bottleneck).
-2. **L8** as a recommendation / CLI hint (documentation, not code).
-3. **L1** BlobHeader refcount extension (platform decision; if production
-   uses cat-in, this is uncomplicated). Then L2 design exploration on top.
-4. **L5** boundary-blob cache or **L3** R4 A1 as the next contained bench.
-   L5 is smaller; L3 is bigger but attacks the larger seam.
-5. **L10** coord format compression if stage 4 is still the governing
-   phase after the above land.
-6. **L17** only if a materially larger-RAM host becomes available or L16's
-   epoch-style downstream path is revived.
-7. Everything else on demand.
+1. **L3 / A1** rankless node-ID-bucketed stage 1+2. This is the first
+   structural rewrite to try because it deletes a complete way pass and the
+   rank machinery without widening the main scratch record.
+2. **L7 / A2** ALTW-specific output executor. The smaller benchmark is
+   switching ALTW to the parallel writer path; the target design is workers
+   producing final chunks plus ordered pwrite/copy-range output.
+3. **L9 / A3** wire-format DenseNodes filter, preferably after L7/A2 or under
+   zstd:1 / `compression:none` so the writer ceiling does not hide the win.
+4. **L1/L2** only if the production pipeline contract allows ALTW to assume
+   `pbfhogg cat`-produced inputs or side tables.
+5. **L10** coord format compression if stage 4 remains the governing phase
+   after the join and output rewrites.
+6. **A4 / L16 / L17** only after the clearer wins are measured; the
+   stage-2 -> stage-3 seam is a real permutation and deserves a full rewrite,
+   not small gated probes.
+7. Hardware-gated items on demand.
 
 "No obvious next-live structural item" was true for the ranked-seam items in
 the structural reports. It is not true across the union of all four docs.
@@ -385,11 +594,12 @@ for the live leads above, not optional.
   adjacent slot buckets. `slot_bucket_count` is chosen so every bucket width
   is at least `max_blob_slots`. Constrains L14 (blob-group rewrite) and any
   layout change to slot buckets.
-- **Zero-coord sentinel.** Stage 2's `coord_slice` uses `(lat==0, lon==0)`
-  as the unresolved sentinel; the slice is fully zeroed at the start of each
-  rank bucket. Any redesign that removes zeroing (L17 per-blob accumulators
-  skipping empty slots, L12 explicit presence bitmap) must replace the
-  sentinel with an explicit presence signal.
+- **Zero-coord sentinel.** Current stage 2's `coord_slice` uses
+  `(lat==0, lon==0)` as the unresolved sentinel; the slice is fully zeroed at
+  the start of each rank bucket. Any redesign that removes zeroing (L3
+  node-ID grouping, L17 per-blob accumulators skipping empty slots, L12
+  explicit presence bitmap) must replace the sentinel with an explicit
+  presence signal.
 - **Per-way refcount ordering.** The stage-1 per-way refcount sidecar is
   written in PBF blob order and consumed in PBF blob order by stage-4
   reframe. Any stage-1 reshape (L3, L4, L6) preserves this ordering.
@@ -398,17 +608,20 @@ for the live leads above, not optional.
   weaken to `Option<(Vec<u8>, Vec<u8>)>`. The streaming coordinator that
   landed in #2 (`beb7838` + `f93d896` + `eecb46c`) preserves this; any
   future rewrite of the stage 3 -> stage 4 handoff must too.
-- **Blob-local rank monotonicity.** For sorted PBFs, `extract_node_tuples()`
-  yields node tuples in ascending ID order, and referenced nodes inside a
-  blob occupy the contiguous rank interval `[ref_rank_start, ref_rank_end)`.
-  This invariant is what made the landed #4 (`f1a4ada`) blob-local rank
-  counter correct; any future stage-2 reshape (L3, L17) that changes how
-  ranks are assigned inherits the same precondition.
-- **`build_rank_index()` discipline.** `IdSetDense` requires the rank index
-  built after all `set_atomic` calls and kept until the last rank consumer
-  is gone. L3's R4 A1 must finish populating `IdSetDense` during pass A
-  before `build_rank_index()`; if pass B disappears, the stage-1 boundary
-  becomes the rank-metadata drop point.
+- **Current rank-path monotonicity.** For sorted PBFs,
+  `extract_node_tuples()` yields node tuples in ascending ID order, and
+  referenced nodes inside a blob occupy the contiguous rank interval
+  `[ref_rank_start, ref_rank_end)`. Existing rank-path edits inherit this.
+  L3 deliberately replaces the rank invariant with node-ID bucket coverage.
+- **Node-ID bucket coverage for L3.** Every referenced node ID must map to
+  exactly one bucket, and each decoded node blob whose indexed ID range
+  intersects that bucket must be considered. Bucket width must be derived
+  from metadata max ID or have an explicit overflow path; silent truncation
+  of `local_node_id` is forbidden.
+- **`build_rank_index()` discipline for legacy rank consumers.** If any rank
+  consumer remains, `IdSetDense` still requires the rank index built after all
+  `set_atomic` calls and kept until the last rank consumer is gone. The L3
+  target is to remove this discipline from the external join entirely.
 
 ---
 

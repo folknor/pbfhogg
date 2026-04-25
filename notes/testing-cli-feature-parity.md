@@ -1,13 +1,13 @@
-# CLI binary feature parity in `brokkr test`
+# CLI binary feature parity in brokkr test profiles
 
 ## Problem
 
 Under the CLI-decoupled test reorg (see [`testing.md`](testing.md))
 integration tests in `tests/cli_*.rs` drive the compiled `pbfhogg`
-binary via `CliInvoker`. `brokkr test` runs two sweeps:
+binary via `CliInvoker`. Today `brokkr test` runs two sweeps:
 
-- **all-features** — `cargo test --release --all-features -p pbfhogg`
-- **consumer**     — `cargo test --release --no-default-features --features commands -p pbfhogg`
+- **all-features** - `cargo test --release --all-features -p pbfhogg`
+- **consumer**     - `cargo test --release --no-default-features --features commands -p pbfhogg`
 
 The `-p pbfhogg` restricts the build target to the library crate.
 `pbfhogg-cli` is a separate workspace member; cargo does not rebuild
@@ -22,6 +22,21 @@ consumer-sweep test fires.
 `--direct-io` support are decoupled. The test is gated by the
 library's feature set; the binary it invokes is governed by whatever
 was built last.
+
+## Tiering impact
+
+The fix below is still needed, but it should not be used as a reason
+to put every CLI feature-surface test into the default edit loop.
+
+After the tiering course correction in `testing.md`:
+
+- Tier 1 CLI tests should focus on fast command contracts that do not
+  depend on the binary's Cargo feature surface.
+- Platform-specific tests (`--direct-io`, `--io-uring`) and negative
+  feature-missing tests belong in an explicit platform/profile tier.
+- Until this parity bug is fixed, feature-off behavior is better pinned
+  by inline unit tests around the library-side CLI plumbing than by
+  `CliInvoker` tests that may invoke a stale binary.
 
 ## Symptoms observed
 
@@ -84,19 +99,43 @@ complexity.
 Recommended: **B**. The explicit rebuild is cheap, self-documenting,
 and avoids edge cases in cargo's workspace feature resolver.
 
+## Profile interaction
+
+The validation-profile design in `testing.md` should own this rebuild
+behavior. A profile sweep that runs CLI tests should declare both the
+library test feature set and the matching CLI binary build:
+
+```toml
+[test.sweeps.all]
+features = "all"
+build_packages = ["pbfhogg-cli"]
+
+[test.sweeps.consumer]
+no_default_features = true
+features = ["commands"]
+build_packages = ["pbfhogg-cli"]
+```
+
+When brokkr executes a sweep, it should build each listed binary package
+with the same feature selection before invoking the profile's test
+steps. That keeps `CliInvoker` tests honest without requiring each
+individual test to understand Cargo workspace feature resolution.
+
 ## What this unblocks
 
 Once brokkr guarantees binary/library feature parity per sweep:
 
 - Restore the two `feature_missing_error` tests in `cli_sort.rs`
   (negative tests: `--direct-io` must fail with a clear message when
-  the feature is absent).
+  the feature is absent), but place them in the platform/profile tier
+  rather than the default Tier 1 sweep.
 - Same pattern becomes safe for every other command with
   feature-gated flags: `cli_apply_changes.rs`, `cli_altw.rs`,
   `cli_cat.rs`, etc.
 - The positive `_direct_io` / `_uring` tests (`sort_overlapping_blobs_*`
   and equivalents) become genuinely correct instead of
-  accidentally-correct.
+  accidentally-correct. They still need deterministic skip handling for
+  unsupported filesystems, kernels, and MEMLOCK limits.
 
 ## Fallback without brokkr changes
 

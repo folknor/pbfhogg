@@ -23,6 +23,12 @@ surface audit that drove the reorg plan below.
   not break integration tests. Today 18 of 30 `tests/*.rs` import
   internal command entrypoints or nested submodules and would need
   edits under any such rewrite. Conversion in progress.
+- **Validation tiering:** open design item. The `cli_sort.rs` pilot proves
+  the CLI boundary works, but wholesale conversion of every old test into
+  the default `brokkr check` sweep is the wrong scaling model. Keep the
+  decoupled boundary; split fast command contracts from exhaustive,
+  platform-specific, and planet-scale gates. External cross-validation
+  lives in `brokkr verify`, not the in-tree test suite.
 
 ## Reorg: CLI-decoupled integration tests
 
@@ -43,14 +49,27 @@ module on rewrite - which is correct.
 | 4. Fault injection | `tests/fault_*.rs` (one test per binary) | Error paths, panic recovery, scratch-dir cleanup in parallel pipelines | Partially - per-instance hooks on stable configs survive; static-atomic hooks on internals don't (acceptable: these tests are intentionally architecture-tied) |
 | 5. Cross-validation | `brokkr verify` | Output equivalence vs osmium/osmosis/osmconvert on real datasets | Yes - process-level |
 
-**Invocation:**
+**Validation tiers:**
 
-| Command | Runs | When |
+`#[ignore]` is only a Cargo mechanism, not the tiering model. Some
+ignored tests are slow real-dataset tests, some are serial-only fault
+injection, and some are platform-gated. Brokkr should expose semantic
+profiles over those mechanics.
+
+| Tier | Command shape | Runs | When |
 |---|---|---|
-| `brokkr check` | Layers 1-4, excludes `#[ignore]`d | Every edit |
-| `brokkr check -- --include-ignored` | Adds `roundtrip_real` + `geocode_index` + the nightly-regression `sorted_flag_but_unsorted_nodes_panics` | Before release |
-| `brokkr test <name>` | Single test by substring | Debugging |
-| `brokkr verify all` | Layer 5 across every CLI command | Before release |
+| 1. Edit loop | `brokkr check` | Fast inline unit tests, stable-API tests, and small-fixture CLI command-contract tests. No real datasets, no external tools, no long fault-injection tests. | Every edit |
+| 2. Command slice | `brokkr check --command <name>` or equivalent | Expanded in-project tests for one command family: adversarial fixtures, `-j` parity, scratch cleanup, and command-specific fault injection. | While working on that command |
+| 3. Full in-project | `brokkr check --full` or equivalent | All in-project correctness tests, including slow/serial fault injection and real-Denmark/geocode tests. | Before merge/release, after broad library changes |
+| 4. Scale/perf | `brokkr bench`, `brokkr suite`, overnight jobs | Planet-scale safety, performance, sidecar analysis, README table refreshes. | Performance work, release evidence |
+
+External reference-tool cross-validation runs through `brokkr verify`,
+which is a separate workflow rather than a tier. See "External
+cross-validation" below.
+
+Until brokkr has first-class Tier 2/3 profiles, use `brokkr test <name>`
+for targeted debugging and keep expensive tests out of Tier 1 with
+`#[ignore]` plus a clear runbook.
 
 **Stable allowlist** - imports from this set do not couple the test to
 an internal module shape:
@@ -68,7 +87,31 @@ audit doc for full reasoning):
 2. `cli_diff.rs` + `cli_derive_changes.rs` - split for file size. 45 tests combined.
 3. `cli_extract.rs` - 27 tests, 9 non-stable symbols imported today.
 4. `cli_altw.rs` - 18 tests. Blocks ALTW rewrite (the motivating example).
-5. `cli_sort.rs`, `cli_cat.rs`, `cli_getid.rs`, `cli_tags_filter.rs`, `cli_merge_changes.rs`, `cli_renumber.rs`, `cli_tags_count.rs`, `cli_time_filter.rs` - 126 tests across 11 existing files, mechanical applications of the pattern once #1 is landed.
+5. `cli_sort.rs`, `cli_cat.rs`, `cli_getid.rs`, `cli_tags_filter.rs`, `cli_merge_changes.rs`, `cli_renumber.rs`, `cli_tags_count.rs`, `cli_time_filter.rs` - 126 tests across 11 existing files. Convert them after the tier split is clear; do not blindly mirror every old test in Tier 1.
+
+**CLI conversion policy.** Continue the `CliInvoker` direction, but do
+not convert old test files wholesale into always-on `cli_*.rs` files.
+Each command should be split by test intent:
+
+- **Tier 1 CLI contract tests**: small fixtures, deterministic, no
+  external tools, no platform-specific features unless they are cheap
+  and reliable on the reference host.
+- **Tier 2 command-slice tests**: larger per-command matrices, `-j`
+  parity, truncation/adversarial sweeps, scratch assertions, and
+  command-specific fault injection.
+- **Platform tests**: `--direct-io`, `--io-uring`, MEMLOCK-dependent
+  paths, and feature-missing CLI behavior. Keep out of Tier 1 until
+  binary/library feature parity is fixed and the host behavior is
+  deterministic.
+- **External comparisons**: tests that invoke `osmium`, `osmosis`, or
+  `osmconvert` belong in `brokkr verify`, not the in-tree test suite.
+  See "External cross-validation" below for the offload rationale and
+  migration plan.
+
+`tests/cli_sort.rs` is the pilot, not the final template. Its fast
+sort fixtures are valid Tier 1 material. The osmium cross-check,
+platform variants, and ignored io_uring case should be split out before
+copying the pattern to apply-changes, diff, extract, or ALTW.
 
 **Known harness gap:** CLI binary feature parity across test sweeps
 is a brokkr-side concern, not a pbfhogg one. See
@@ -94,6 +137,48 @@ the CLI conversion work:
 - Hook-consolidation note below becomes "explicitly don't consolidate"
   - per-binary isolation relies on the atomics being distinct symbols
   in distinct binaries.
+
+## External cross-validation: brokkr-side
+
+External cross-validation (`pbfhogg sort` vs `osmium sort`,
+`pbfhogg merge` vs `osmium apply-changes`, etc.) lives in `brokkr verify`,
+not the in-tree test crate. The decision and rationale:
+
+- The `VerifyHarness` template (`run_pbfhogg`, `run_tool`, `diff_pbfs`,
+  `check_sorted`, dataset config, variant matrix, results storage) already
+  exists. Each new comparison is `verify_<command>.rs`, ~50 lines, same
+  shape every time. Growth is bounded.
+- External tools (osmium, osmosis, osmconvert) are operationally a
+  brokkr concern, not a pbfhogg test-crate dependency. Contributors do
+  not need osmium installed to get a clean `brokkr check`.
+- An in-tree `mod external` tier would duplicate brokkr's verify
+  machinery in cargo profiles and act as a gravity well: every new
+  in-tree osmium test invites the next contributor to add another
+  in-tree osmium test rather than a `verify_*.rs` entry.
+
+**Two existing in-tree tests are migration candidates:**
+
+1. `tests/merge.rs::merge_cross_validate_osmium` - real Denmark data,
+   same inputs as `brokkr verify merge`. Retire once we confirm
+   `verify_merge.rs` handles the version-vs-unconditional-delete
+   tolerance that `tests/merge.rs:1271-1295` does explicitly (osmium
+   uses version-based deletes; pbfhogg/osmosis/osmconvert delete
+   unconditionally, so osmium-only elements that fall in the OSC
+   delete set are not real failures).
+2. `tests/cli_sort.rs::sort_cross_validate_osmium` - handcrafted
+   overlapping-blob fixture; `brokkr verify sort` runs against real
+   data only and so does not exercise the streaming sweep merge's
+   overlap-run path. Migration requires `brokkr verify <command>
+   --input <path>` plus an `examples/overlapping_fixture.rs` (or
+   equivalent) builder, then move the comparison into `verify_sort.rs`.
+   Until that brokkr feature lands, the in-tree test stays as-is,
+   guarded by the `osmium --version` skip it already has.
+
+**Escape hatch.** If a contributor mid-PR wants to write an osmium
+check next to a fixture for the duration of that PR, that is
+`#[ignore = "external"]` in-tree with a runbook comment, then converted
+to a `verify_*.rs` PR against brokkr afterward. This is a permitted
+exception, not a tier - it should not survive across many PRs.
 
 ## Conventions
 
@@ -330,3 +415,169 @@ locally needs that space.
 bug-hunting needs hours to days per target ("weekend campaign"
 cadence). Skip until T07 exposes a gap that only coverage-guided
 fuzzing can fill.
+
+### T11 - Brokkr validation profiles
+
+`brokkr check` is becoming too broad as the in-project test suite
+grows. Add explicit profiles that map to the validation tiers above
+instead of relying on Cargo's raw `#[ignore]` switch:
+
+- Tier 1 stays `brokkr check` and must keep a hard developer-loop wall
+  budget.
+- Tier 2 should run one command family by name, so command rewrites can
+  ask for the relevant expanded suite without paying for every other
+  command.
+- Tier 3 should replace "run all ignored tests" with a named
+  full-in-project gate that includes slow/serial tests intentionally.
+
+This is brokkr work, not pbfhogg library work. Until it lands, new
+slow, platform-specific, or real-dataset tests should not be added to
+the default sweep just because they are integration tests. New
+external-tool comparisons should not be added to the in-tree suite
+at all - see "External cross-validation" above.
+
+#### Proposed brokkr-facing model
+
+Use normal Rust test module paths as the annotation surface. Do not add
+pbfhogg-specific custom attributes, and do not treat `#[ignore]` as the
+tier label. `#[ignore]` should remain a libtest execution mechanic for
+tests that must never run accidentally, such as serial fault-injection
+or platform-only cases.
+
+Tier 1 tests may live at the integration-test root or in a `tier1`
+module. Non-default tests should carry one of these module-path markers:
+
+```rust
+#[test]
+fn sort_basic_cli_contract() {}
+
+mod tier2 {
+    #[test]
+    fn sort_many_blob_boundaries() {}
+}
+
+mod tier3 {
+    #[test]
+    fn sort_large_fixture_roundtrip() {}
+}
+
+mod platform {
+    #[test]
+    fn sort_direct_io_alignment() {}
+}
+
+mod serial {
+    #[test]
+    #[ignore = "run through brokkr profile serial/fault"]
+    fn injected_write_failure_is_atomic() {}
+}
+```
+
+For command-family CLI tests, keep the current `tests/cli_<command>.rs`
+shape and split intent inside the file:
+
+- Root or `tier1` module: small CLI contracts that belong in
+  `brokkr check`.
+- `tier2`: expanded in-project command matrices, adversarial fixtures,
+  `-j` parity, scratch cleanup, and command-local fault injection.
+- `tier3`: slow but self-contained correctness checks, including larger
+  in-repo or configured local fixtures.
+- `platform`: direct I/O, io_uring, MEMLOCK, filesystem, and
+  feature-surface checks.
+- `serial`: tests that require `--test-threads=1` or static
+  fault-injection state.
+
+The brokkr implementation should translate named profiles into ordinary
+Cargo/libtest arguments: `--test cli_sort`, substring filters,
+`--skip`, `--include-ignored`, `--test-threads=1`, feature sweeps,
+environment variables, prerequisite-tool checks, and explicit CLI
+binary builds. That keeps the model transparent to other Rust projects
+instead of baking pbfhogg internals into brokkr.
+
+#### Proposed `brokkr.toml` shape
+
+Do not add these keys to the live config until brokkr supports them.
+This is the intended target shape:
+
+```toml
+[test]
+default_package = "pbfhogg"
+default_profile = "tier1"
+
+[test.sweeps.all]
+features = "all"
+build_packages = ["pbfhogg-cli"]
+
+[test.sweeps.consumer]
+no_default_features = true
+features = ["commands"]
+build_packages = ["pbfhogg-cli"]
+
+[test.profiles.tier1]
+description = "Fast edit loop used by brokkr check"
+sweeps = ["all", "consumer"]
+skip = ["tier2::", "tier3::", "platform::", "serial::"]
+include_ignored = false
+
+[test.profiles.sort]
+description = "Expanded sort command tests"
+extends = "tier1"
+tests = ["cli_sort"]
+skip = ["platform::", "serial::"]
+
+[test.profiles.tier2]
+description = "All expanded in-project command tests"
+sweeps = ["all", "consumer"]
+only = ["tier2::"]
+include_ignored = false
+
+[test.profiles.full]
+description = "All in-project correctness tests"
+sweeps = ["all"]
+skip = ["platform::"]
+include_ignored = true
+
+[test.profiles.platform]
+description = "Platform-sensitive tests"
+sweeps = ["all"]
+only = ["platform::"]
+include_ignored = true
+env = { BROKKR_TEST_PLATFORM = "1" }
+
+[test.profiles.serial]
+description = "Serial/fault-injection tests"
+sweeps = ["all"]
+only = ["serial::"]
+include_ignored = true
+test_threads = 1
+```
+
+The command surface should stay generic:
+
+```text
+brokkr check
+brokkr check --profile sort
+brokkr check --profile tier2
+brokkr check --profile full
+brokkr verify
+```
+
+`brokkr check` uses `test.default_profile`. Command slices can be
+implemented as profiles (`sort`, `extract`, `add-locations-to-ways`) or
+as `--command <name>` sugar that resolves to a profile. The underlying
+mechanism should remain profile selection so non-pbfhogg projects can
+name their own slices.
+
+### T12 - CliInvoker robustness before wider conversion
+
+Before converting the large command surfaces (`apply-changes`, `diff`,
+`extract`, ALTW), harden `tests/common/cli.rs`:
+
+- Add a process timeout so a hung command fails the test cleanly instead
+  of wedging `brokkr check`.
+- Add helpers for expected platform skips (`O_DIRECT` EINVAL, io_uring
+  unavailable/MEMLOCK) so each `cli_*.rs` file does not hand-roll string
+  matching.
+- Keep feature-surface assertions out of CLI tests until the feature
+  parity issue in `testing-cli-feature-parity.md` is fixed, or cover
+  them with inline unit tests on the library-side CLI plumbing.

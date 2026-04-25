@@ -106,7 +106,10 @@ audit doc for full reasoning):
    - Stage 4: `cli_derive_changes.rs` (15 tests from
      `derive_changes.rs`, derive→apply roundtrip via
      `pbfhogg diff --format osc` + `pbfhogg apply-changes`).
-2. `cli_diff.rs` + `cli_derive_changes.rs` - split for file size. 45 tests combined.
+2. `cli_diff.rs` (landed 2026-04-25) + `cli_derive_changes.rs`
+   (landed under priority 1 stage 4). 45 tests combined: 30
+   text-format diff tests in `cli_diff.rs`, 15 derive-changes /
+   roundtrip tests in `cli_derive_changes.rs`.
 3. `cli_extract.rs` - landed (2026-04-25). 27 tests converted; 9
    non-stable symbols (Region, ExtractStrategy, PolygonRings,
    ExtractSlot, etc.) replaced by --bbox/--polygon/--config CLI

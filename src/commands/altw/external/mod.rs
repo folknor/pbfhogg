@@ -57,6 +57,115 @@ use stage4::stage4_assembly;
 /// 14B gives headroom above the current ~13B maximum.
 pub(super) const MAX_NODE_ID: u64 = 14_000_000_000;
 
+/// Width (in node-id space) of one ID bucket.
+///
+/// `bucket_width = ceil(max_node_id / num_buckets)`, with a floor of 1
+/// so empty inputs (`max_node_id = 0`) still produce a usable mapping.
+/// The `div_ceil` rounds up so every node id in `[0, max_node_id]` maps
+/// strictly into the first `num_buckets` buckets when paired with the
+/// `min(num_buckets - 1)` clamp in `bucket_for`.
+///
+/// Stage-1 pass A computes `local_node_id = (node_id - bucket_lo) as u32`
+/// per emitted record; the assertion at bucket-init time pins
+/// `bucket_width <= u32::MAX` so the cast is lossless. At planet
+/// (max_node_id ~= 14e9, 256 buckets) `bucket_width ~= 55M`, six orders
+/// of magnitude under 2^32.
+#[allow(dead_code)] // wired up in step 2 of A1 (pass-A IdRecord emission).
+pub(super) fn bucket_width(max_node_id: u64, num_buckets: usize) -> u64 {
+    debug_assert!(num_buckets > 0, "num_buckets must be > 0");
+    max_node_id.div_ceil(num_buckets as u64).max(1)
+}
+
+/// Bucket index for a given node id. Last bucket absorbs any
+/// `node_id > (num_buckets - 1) * bucket_width`, which can happen when
+/// `max_node_id` isn't a multiple of `num_buckets` and the last bucket
+/// is therefore wider than `bucket_width`.
+#[allow(dead_code)] // wired up in step 2 of A1 (pass-A IdRecord emission).
+pub(super) fn bucket_for(node_id: u64, bucket_width: u64, num_buckets: usize) -> usize {
+    debug_assert!(bucket_width > 0, "bucket_width must be > 0");
+    debug_assert!(num_buckets > 0, "num_buckets must be > 0");
+    #[allow(clippy::cast_possible_truncation)]
+    let idx = (node_id / bucket_width) as usize;
+    idx.min(num_buckets - 1)
+}
+
+#[cfg(test)]
+mod bucket_math_tests {
+    use super::{bucket_for, bucket_width};
+
+    #[test]
+    fn bucket_width_handles_zero_max() {
+        assert_eq!(bucket_width(0, 256), 1);
+    }
+
+    #[test]
+    fn bucket_width_handles_small_max() {
+        assert_eq!(bucket_width(5, 256), 1);
+        assert_eq!(bucket_width(255, 256), 1);
+        assert_eq!(bucket_width(256, 256), 1);
+        assert_eq!(bucket_width(257, 256), 2);
+    }
+
+    #[test]
+    fn bucket_width_rounds_up() {
+        assert_eq!(bucket_width(1000, 256), 4);
+        assert_eq!(bucket_width(14_000_000_000, 256), 54_687_500);
+    }
+
+    #[test]
+    fn bucket_for_clamps_last_bucket() {
+        let bw = bucket_width(1000, 4);
+        assert_eq!(bw, 250);
+        assert_eq!(bucket_for(0, bw, 4), 0);
+        assert_eq!(bucket_for(249, bw, 4), 0);
+        assert_eq!(bucket_for(250, bw, 4), 1);
+        assert_eq!(bucket_for(999, bw, 4), 3);
+        assert_eq!(bucket_for(1000, bw, 4), 3);
+        assert_eq!(bucket_for(u64::MAX, bw, 4), 3);
+    }
+
+    #[test]
+    fn bucket_for_handles_zero_max() {
+        let bw = bucket_width(0, 256);
+        for id in 0..512 {
+            assert!(bucket_for(id, bw, 256) < 256);
+        }
+    }
+
+    #[test]
+    fn every_referenced_id_maps_to_one_bucket() {
+        let max = 12_345_678u64;
+        let bw = bucket_width(max, 256);
+        for id in (0..=max).step_by(50_000) {
+            let b = bucket_for(id, bw, 256);
+            assert!(b < 256, "id={id} -> bucket={b}");
+        }
+        assert!(bucket_for(0, bw, 256) <= bucket_for(max, bw, 256));
+    }
+
+    #[test]
+    fn bucket_boundaries_are_exclusive_below_inclusive_above() {
+        let bw = bucket_width(10_000, 10);
+        assert_eq!(bw, 1000);
+        for k in 0u64..10 {
+            let lo = k * 1000;
+            let hi = (k + 1) * 1000 - 1;
+            let expected = usize::try_from(k).expect("k fits in usize");
+            assert_eq!(bucket_for(lo, bw, 10), expected, "lo={lo}");
+            assert_eq!(bucket_for(hi, bw, 10), expected, "hi={hi}");
+        }
+    }
+
+    #[test]
+    fn bucket_width_fits_in_u32_at_planet_scale() {
+        let bw = bucket_width(14_000_000_000, 256);
+        assert!(
+            bw <= u64::from(u32::MAX),
+            "bucket_width {bw} exceeds u32::MAX",
+        );
+    }
+}
+
 /// Outcome of the `RLIMIT_NOFILE` self-raise attempt.
 pub(super) enum FdRaiseStatus {
     /// `getrlimit` failed; caller is using the conservative fallback.

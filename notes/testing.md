@@ -96,7 +96,10 @@ audit doc for full reasoning):
 
 1. `cli_apply_changes.rs` - absorbs `merge.rs` + `apply_changes_invariants.rs` + `cluster2_defensive_input.rs` + `derive_changes.rs`. 51 tests, highest-traffic rewrite surface.
 2. `cli_diff.rs` + `cli_derive_changes.rs` - split for file size. 45 tests combined.
-3. `cli_extract.rs` - 27 tests, 9 non-stable symbols imported today.
+3. `cli_extract.rs` - landed (2026-04-25). 27 tests converted; 9
+   non-stable symbols (Region, ExtractStrategy, PolygonRings,
+   ExtractSlot, etc.) replaced by --bbox/--polygon/--config CLI
+   surface.
 4. `cli_altw.rs` - 18 tests. Blocks ALTW rewrite (the motivating example).
 5. `cli_sort.rs` (landed), `cli_time_filter.rs` (landed 2026-04-25),
    `cli_merge_changes.rs` (landed 2026-04-25), `cli_cat.rs`

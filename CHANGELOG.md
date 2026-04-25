@@ -4,6 +4,15 @@
 
 ### Breaking changes
 
+- **`pbfhogg diff --summary` renamed to `--osmium-summary`.** The flag
+  flips the stderr stats line from pbfhogg format
+  (`{total} differences: ... created, ... modified, ... deleted (...)`)
+  to osmium format (`Summary: left=N right=N same=N different=N`).
+  The pbfhogg-format summary always fires unless `--quiet`, so the old
+  `--summary` name was misleading - the flag controls *format*, not
+  whether output is shown. The `-s` short form is unchanged. Migration:
+  `pbfhogg diff --summary` -> `pbfhogg diff --osmium-summary`, or use
+  `-s` (works either way).
 - **`renumber --mode` flag removed.** External join is now the only implementation.
 - **`BlobReader::new_seekable<R>` and `IndexedReader::new<R>` bounds widened** from `R: Read + Seek + Send` to `R: BlobReaderSource + Send`. Downstream users with custom reader types add `impl BlobReaderSource for MyReader {}`.
 - **Geocode `FORMAT_VERSION` bumped to 2.** Indexes built with older versions must be rebuilt.

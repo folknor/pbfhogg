@@ -210,7 +210,7 @@ pbfhogg tags-filter [OPTIONS] --output <OUTPUT> <FILE> [EXPRESSIONS]...
 
 Compare two PBF files and show differences. Uses content equality (coordinates, tags, refs, members) rather than version/timestamp ordering - deterministic regardless of metadata completeness (see [DEVIATIONS](DEVIATIONS.md#diff-content-equality-vs-version-ordering)).
 
-With `--format osc`, generates an OSC diff file instead of text output. Text-only flags (`-c`, `-v`, `-s`, `-q`, `-t`) are not valid with `--format osc`. OSC-only flags (`--increment-version`, `--update-timestamp`) are not valid with `--format text`.
+With `--format osc`, generates an OSC diff file instead of text output. Text-only flags (`-c`, `-v`, `-s`/`--osmium-summary`, `-q`, `-t`) are not valid with `--format osc`. OSC-only flags (`--increment-version`, `--update-timestamp`) are not valid with `--format text`.
 
 ```
 pbfhogg diff [OPTIONS] <OLD> <NEW>
@@ -221,7 +221,7 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 | `--format <FORMAT>` | Output format: `text` (default) or `osc` |
 | `-c, --suppress-common` | Hide unchanged elements (text only) |
 | `-v, --verbose` | Show detailed changes for modified elements (text only) |
-| `-s, --summary` | Show summary on stderr (text only) |
+| `-s, --osmium-summary` | Print osmium-style summary (`Summary: left=N right=N same=N different=N`) on stderr instead of the default pbfhogg-format summary. Both formats fire on stderr unless `--quiet` (text only) |
 | `-q, --quiet` | Exit-code only, suppress output (text only) |
 | `-o, --output <FILE>` | Write output to file (required for `--format osc`) |
 | `-t, --type <TYPE>` | Filter by element type (text only) |

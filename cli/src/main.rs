@@ -222,9 +222,13 @@ enum Command {
         /// Show detailed changes for modified elements
         #[arg(short = 'v', long)]
         verbose: bool,
-        /// Show summary on stderr (left/right/same/different counts)
-        #[arg(short = 's', long)]
-        summary: bool,
+        /// Print osmium-style summary (left/right/same/different
+        /// counts) to stderr instead of the default pbfhogg-format
+        /// summary. The pbfhogg-format summary always fires on
+        /// stderr unless `--quiet` - this flag only swaps the
+        /// format, it does not control whether a summary is shown.
+        #[arg(short = 's', long = "osmium-summary")]
+        osmium_summary: bool,
         /// Exit-code only, suppress diff output and summary
         #[arg(short = 'q', long, conflicts_with = "output")]
         quiet: bool,
@@ -828,7 +832,7 @@ fn main() -> process::ExitCode {
             new,
             suppress_common,
             verbose,
-            summary,
+            osmium_summary,
             quiet,
             output,
             type_filter,
@@ -846,8 +850,8 @@ fn main() -> process::ExitCode {
                 if verbose {
                     return Err("--verbose is not valid with --format osc".into());
                 }
-                if summary {
-                    return Err("--summary is not valid with --format osc".into());
+                if osmium_summary {
+                    return Err("--osmium-summary is not valid with --format osc".into());
                 }
                 if quiet {
                     return Err("--quiet is not valid with --format osc".into());
@@ -869,7 +873,7 @@ fn main() -> process::ExitCode {
                     &new,
                     suppress_common,
                     verbose,
-                    summary,
+                    osmium_summary,
                     quiet,
                     output.as_deref(),
                     type_filter.as_deref(),
@@ -1684,7 +1688,7 @@ fn run_diff(
     new: &std::path::Path,
     suppress_common: bool,
     verbose: bool,
-    summary: bool,
+    osmium_summary: bool,
     quiet: bool,
     output_path: Option<&std::path::Path>,
     type_filter: Option<&str>,
@@ -1704,7 +1708,7 @@ fn run_diff(
     let options = pbfhogg::diff::DiffOptions {
         suppress_common,
         verbose,
-        summary,
+        summary: osmium_summary,
         type_filter: type_filter.map(String::from),
         jobs: jobs_resolved,
     };
@@ -1722,7 +1726,7 @@ fn run_diff(
         pbfhogg::diff::diff(old, new, &mut stdout, &options, direct_io)?
     };
     if !quiet {
-        if summary {
+        if osmium_summary {
             stats.print_osmium_summary();
         } else {
             stats.print_summary();

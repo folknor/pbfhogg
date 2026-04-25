@@ -350,6 +350,35 @@ single-pass, tag expression and bbox filtering.
   Three commands have known diffs: extract (relation inclusion criteria),
   diff (14-element version comparison), check-refs (occurrences vs unique).
   See `brokkr verify all` output and README cross-validation section.
+- [x] ~~**`pbfhogg diff --summary` flips stats format rather than enabling
+  output**~~ - resolved 2026-04-25. Renamed to `--osmium-summary`. The
+  `-s` short form is unchanged. The pbfhogg-format summary always
+  fires on stderr unless `--quiet`; the renamed flag now accurately
+  describes what it does (swap the format, not gate visibility).
+  CHANGELOG entry under "Unreleased > Breaking changes". Migration
+  is `--summary` -> `--osmium-summary`, or use `-s` (works either
+  way).
+- [ ] **`hotpath::HotpathGuardBuilder` banner contaminates stdout for
+  stdout-output commands under `--all-features` test runs** (surfaced
+  2026-04-25 during the cli_diff.rs conversion in commit `792421f`).
+  `cli/src/main.rs:690` builds a `HotpathGuardBuilder` whose drop
+  at `main` exit emits "`[hotpath] N.NNms | timing, alloc, threads
+  (CPU baseline avg: ...)`" to stdout. Stdout-output commands like
+  `pbfhogg diff` (when `-o` is omitted) interleave this banner with
+  their actual output, breaking shell piping (`pbfhogg diff a b
+  | ...`) and integration tests that read stdout as the data plane.
+  The cli_diff.rs conversion worked around it by always passing
+  `-o <file>` and ignoring stdout. **Resolution path: brokkr-side
+  feature selection.** `brokkr check` currently passes
+  `--all-features`, which turns on the `hotpath` feature for test
+  runs that have no business with profiling. Switching brokkr to
+  pass an explicit feature set (`test-hooks,linux-direct-io,linux-io-uring,commands`)
+  instead of `--all-features` makes the `#[hotpath::measure]` macros
+  compile-time no-ops during test runs and no banner emerges. No
+  pbfhogg change needed; production users who build with
+  `--features hotpath` deliberately keep getting banner output as
+  intended. brokkr's `--hotpath` measurement mode is unaffected
+  because it already builds with hotpath explicitly enabled.
 - [ ] **CLI UX: scratch dir + mode naming, unified across the CLI** (raised
   2026-04-23, unresolved). Two related decisions, both of which should be
   applied uniformly across every command that carries the pattern, not

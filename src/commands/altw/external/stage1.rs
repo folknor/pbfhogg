@@ -258,8 +258,28 @@ pub(super) fn stage1_pass_a(
                             s1a_id_skipped_ref.fetch_add(blob_skipped, Relaxed);
                             s1a_id_bytes_ref.fetch_add(blob_bytes, Relaxed);
 
+                            // Populate IdSet for the legacy rank path
+                            // (still consumed by pass B / stage 2 until
+                            // step 4). Apply the same locate-based skip
+                            // filter as IdRecord emission so negative
+                            // refs (which would land near u64::MAX after
+                            // an `i64 as u64` cast and panic the
+                            // pre_allocate'd IdSet) and out-of-range
+                            // refs are handled consistently across both
+                            // paths. The end result for skipped refs is
+                            // identical: stage 4 fills zero coords. Cost
+                            // of the double `locate` is bounded - it's a
+                            // pair of integer ops on u64, dwarfed by the
+                            // pread/decompress phases.
                             let t3 = std::time::Instant::now();
                             for &node_id in &blob_node_ids {
+                                if node_id < 0 {
+                                    continue;
+                                }
+                                #[allow(clippy::cast_sign_loss)]
+                                if layout_ref.locate(node_id as u64).is_none() {
+                                    continue;
+                                }
                                 node_id_set_ref.set_atomic(node_id);
                             }
                             #[allow(clippy::cast_possible_truncation)]

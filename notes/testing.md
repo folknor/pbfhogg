@@ -12,7 +12,11 @@ surface audit that drove the reorg plan below.
 - **Test fixture infrastructure:** landed (2026-04-22).
 - **CliInvoker** for CLI-driven integration tests: landed (2026-04-24),
   `tests/common/cli.rs`, smoke test in `tests/fixture_helpers.rs`. Zero
-  new dev-deps.
+  new dev-deps. Hardened (2026-04-25, T12) with a 60 s default
+  wall-clock timeout and platform-skip predicates
+  (`is_o_direct_unsupported`, `is_uring_unsupported`); `cli_sort.rs`
+  retrofitted to the predicates as the precedent for future
+  `cli_*.rs`.
 - **Fault-injection harness:** complete across all 8 parallel pipelines.
   Caught one real deadlock (apply-changes drain) and one real scratch
   leak (derive_parallel outer temp files); both fixed along the way.
@@ -576,14 +580,19 @@ name their own slices.
 
 ### T12 - CliInvoker robustness before wider conversion
 
-Before converting the large command surfaces (`apply-changes`, `diff`,
-`extract`, ALTW), harden `tests/common/cli.rs`:
+Landed 2026-04-25. `tests/common/cli.rs` now provides:
 
-- Add a process timeout so a hung command fails the test cleanly instead
-  of wedging `brokkr check`.
-- Add helpers for expected platform skips (`O_DIRECT` EINVAL, io_uring
-  unavailable/MEMLOCK) so each `cli_*.rs` file does not hand-roll string
-  matching.
-- Keep feature-surface assertions out of CLI tests until the feature
-  parity issue in `testing-cli-feature-parity.md` is fixed, or cover
-  them with inline unit tests on the library-side CLI plumbing.
+- Wall-clock timeout (default 60 s, override via `.timeout(Duration)`).
+  Hung commands fail their test with a clear "timed out" panic instead
+  of wedging `brokkr check`. Implemented via background drainer threads
+  on stdout/stderr plus a polling `try_wait` loop that `kill()`s the
+  child on expiry.
+- `CliOutput::is_o_direct_unsupported` / `is_uring_unsupported`
+  predicates that match the CLI's actual error strings (`Invalid
+  argument` / `EINVAL` for O_DIRECT; `RLIMIT_MEMLOCK` / `kernel does
+  not support` / `not supported` for io_uring). `tests/cli_sort.rs`
+  switched to these helpers as the precedent for new `cli_*.rs` files.
+
+Still open: feature-surface assertions stay out of CLI tests until
+the feature-parity issue in `testing-cli-feature-parity.md` is fixed
+(or covered by inline unit tests on the library-side CLI plumbing).

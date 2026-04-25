@@ -649,14 +649,15 @@ fn sort_overlapping_blobs_direct_io() {
         .arg("--force")
         .run();
 
-    if !run.status.success() {
-        let msg = run.stderr_str();
-        if msg.contains("Invalid argument") || msg.contains("EINVAL") {
-            eprintln!("O_DIRECT not supported on this filesystem, skipping test");
-            return;
-        }
-        panic!("sort --direct-io failed unexpectedly; stderr:\n{msg}");
+    if run.is_o_direct_unsupported() {
+        eprintln!("O_DIRECT not supported on this filesystem, skipping test");
+        return;
     }
+    assert!(
+        run.status.success(),
+        "sort --direct-io failed unexpectedly; stderr:\n{}",
+        run.stderr_str(),
+    );
 
     let contents = read_all_elements_with_coords(&output);
     assert_eq!(contents.nodes.len(), 10);
@@ -698,17 +699,15 @@ fn sort_overlapping_blobs_uring() {
         .arg("--force")
         .run();
 
-    if !run.status.success() {
-        let msg = run.stderr_str();
-        if msg.contains("RLIMIT_MEMLOCK")
-            || msg.contains("kernel does not support")
-            || msg.contains("not supported")
-        {
-            eprintln!("io_uring not available, skipping test");
-            return;
-        }
-        panic!("sort --io-uring failed unexpectedly; stderr:\n{msg}");
+    if run.is_uring_unsupported() {
+        eprintln!("io_uring not available, skipping test");
+        return;
     }
+    assert!(
+        run.status.success(),
+        "sort --io-uring failed unexpectedly; stderr:\n{}",
+        run.stderr_str(),
+    );
 
     let contents = read_all_elements_with_coords(&output);
     assert_eq!(contents.nodes.len(), 10);

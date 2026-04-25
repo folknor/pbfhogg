@@ -16,24 +16,59 @@
 //!
 //! No external crate dependency - kept deliberately small to match
 //! the project's minimal dev-dep posture.
+//!
+//! ## Timeout
+//!
+//! Every invocation has a wall-clock timeout (default 60 s,
+//! [`CliInvoker::timeout`] overrides). On expiry the child is sent
+//! `SIGKILL` and the test panics with a clear "timed out" message
+//! instead of wedging the test runner. This is load-bearing for
+//! `brokkr check`: a hung CLI test would block every subsequent test
+//! in the binary indefinitely.
+//!
+//! ## Platform skips
+//!
+//! [`CliOutput::is_o_direct_unsupported`] and
+//! [`CliOutput::is_uring_unsupported`] match the CLI's error strings
+//! for the two platform-dependent flags pbfhogg exposes. Tests that
+//! exercise `--direct-io` or `--io-uring` should consult these
+//! before asserting success - tmpfs / overlayfs and hosts with low
+//! `RLIMIT_MEMLOCK` are common.
 
 use std::ffi::OsStr;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+
+/// Default wall-clock timeout applied to every [`CliInvoker`] that
+/// doesn't override via [`CliInvoker::timeout`]. Sized for Tier 1 /
+/// Tier 2 fixtures; tests that exercise real datasets should bump
+/// it explicitly.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Polling cadence for [`std::process::Child::try_wait`] inside the
+/// timeout loop. 20 ms is fast enough that test wall-time isn't
+/// noticeably padded; slow enough that the loop doesn't burn CPU on
+/// a long-running command.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Invokes the `pbfhogg` binary with a set of arguments, captures
 /// stdout/stderr, returns a [`CliOutput`] that assertions read from.
 pub struct CliInvoker {
     cmd: Command,
     stdin: Option<Vec<u8>>,
+    timeout: Duration,
 }
 
 impl CliInvoker {
-    /// Start a new invocation.
+    /// Start a new invocation. Default timeout is
+    /// [`DEFAULT_TIMEOUT`]; override via [`Self::timeout`].
     pub fn new() -> Self {
         Self {
             cmd: Command::new(pbfhogg_bin()),
             stdin: None,
+            timeout: DEFAULT_TIMEOUT,
         }
     }
 
@@ -59,8 +94,17 @@ impl CliInvoker {
         self
     }
 
+    /// Override the wall-clock timeout. On expiry the child is
+    /// `SIGKILL`ed and the test panics. Use a generous value for
+    /// real-dataset tests; the default is sized for small fixtures.
+    pub fn timeout(mut self, t: Duration) -> Self {
+        self.timeout = t;
+        self
+    }
+
     /// Run the binary, capture output, return a [`CliOutput`].
     /// Does NOT assert on exit status - the caller does that.
+    /// Panics on timeout (see [`Self::timeout`]).
     pub fn run(mut self) -> CliOutput {
         if self.stdin.is_some() {
             self.cmd.stdin(Stdio::piped());
@@ -77,11 +121,54 @@ impl CliInvoker {
             drop(stdin);
         }
 
-        let out = child.wait_with_output().expect("wait for pbfhogg binary");
+        // Drain stdout/stderr in background threads so a chatty
+        // child can't block on a full pipe buffer while we poll
+        // `try_wait`. `Child::wait_with_output` does this for us
+        // but consumes the child by value, which we can't afford -
+        // we need to keep `child` available so the timeout path can
+        // call `kill()`.
+        let mut stdout = child.stdout.take().expect("stdout piped");
+        let mut stderr = child.stderr.take().expect("stderr piped");
+
+        let stdout_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            stdout.read_to_end(&mut buf).ok();
+            buf
+        });
+        let stderr_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            stderr.read_to_end(&mut buf).ok();
+            buf
+        });
+
+        let start = Instant::now();
+        let status: ExitStatus = loop {
+            match child.try_wait() {
+                Ok(Some(s)) => break s,
+                Ok(None) => {
+                    if start.elapsed() > self.timeout {
+                        child.kill().ok();
+                        child.wait().ok();
+                        let stderr_buf = stderr_thread.join().unwrap_or_default();
+                        panic!(
+                            "pbfhogg timed out after {:?}; stderr:\n{}",
+                            self.timeout,
+                            String::from_utf8_lossy(&stderr_buf),
+                        );
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+                Err(e) => panic!("error waiting for pbfhogg child: {e}"),
+            }
+        };
+
+        let stdout_buf = stdout_thread.join().unwrap_or_default();
+        let stderr_buf = stderr_thread.join().unwrap_or_default();
+
         CliOutput {
-            status: out.status,
-            stdout: out.stdout,
-            stderr: out.stderr,
+            status,
+            stdout: stdout_buf,
+            stderr: stderr_buf,
         }
     }
 
@@ -154,6 +241,32 @@ impl CliOutput {
             "stdout did not contain {needle:?}; stdout was:\n{haystack}",
         );
         self
+    }
+
+    /// True when the command failed with stderr matching the
+    /// O_DIRECT-unsupported pattern (typical on tmpfs / overlayfs /
+    /// some CI filesystems that reject `O_DIRECT` with `EINVAL`).
+    /// Pure check; the caller logs and returns when it sees true.
+    pub fn is_o_direct_unsupported(&self) -> bool {
+        if self.status.success() {
+            return false;
+        }
+        let msg = self.stderr_str();
+        msg.contains("Invalid argument") || msg.contains("EINVAL")
+    }
+
+    /// True when the command failed with stderr matching the
+    /// io_uring-unavailable pattern (low `RLIMIT_MEMLOCK`, kernel
+    /// without the required submission queue features, etc.).
+    /// Pure check; the caller logs and returns when it sees true.
+    pub fn is_uring_unsupported(&self) -> bool {
+        if self.status.success() {
+            return false;
+        }
+        let msg = self.stderr_str();
+        msg.contains("RLIMIT_MEMLOCK")
+            || msg.contains("kernel does not support")
+            || msg.contains("not supported")
     }
 }
 

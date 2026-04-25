@@ -52,22 +52,36 @@ workaround.
 grows. Today every test in `tests/*.rs` either runs by default
 (via `cargo test`) or is `#[ignore]`d and only runs under
 `cargo test -- --ignored`. That binary switch does not capture
-the actual cost classes that matter to a developer:
+the actual cost classes that matter to a developer.
 
-- Fast contracts that should run on every edit.
-- Per-command expanded matrices that should run while working on
-  that command.
-- Slow real-dataset tests that should run before merge.
-- External-tool comparisons (osmium / osmosis / osmconvert).
-- Platform-gated tests (`--direct-io`, `--io-uring`, MEMLOCK).
-- Serial-only tests that need `--test-threads=1` due to
-  static-state fault-injection hooks.
+The pbfhogg-side reorg classifies tests by **runtime cost** in a
+5-tier ladder (see `notes/testing.md` > "Validation tiers" for the
+full development contract):
 
-`#[ignore]` collapses all of these into one bucket. The
-`pbfhogg`-side test reorg now classifies tests by their **cost
-class**, not by whether they are accidentally-ok-to-run-by-default.
-Brokkr needs a profile system so the developer can ask for the
-class they actually want.
+| Tier | Cost | When | Mechanism |
+|---|---|---|---|
+| 1. Fast contracts | seconds | Every edit | `brokkr check` default profile |
+| 2. Command slice | tens of seconds | While working on that command | `brokkr check --profile <cmd>` |
+| 3. Full in-project | minutes | Before merge | `brokkr check --profile full` |
+| 4. Scale/perf | hours | Performance work, release | `brokkr bench`, `brokkr suite` |
+| 5. External cross-validation | host-dependent | Release gate | `brokkr verify` |
+
+Tiers 1-3 are the brokkr profiles this request is about. Tiers 4
+and 5 are existing brokkr commands (`bench` / `suite` / `verify`)
+and are out of scope for the profile system. They are listed
+because they are the remaining cost classes a release passes
+through and the profile system needs to compose with them
+(`brokkr check --profile full && brokkr bench && brokkr verify` is
+the full release gate).
+
+Two orthogonal cross-cutting markers also need brokkr support:
+**platform** (host-specific tests for `--direct-io`, `--io-uring`,
+MEMLOCK requirements) and **serial** (tests that need
+`--test-threads=1`). Both can sit at any tier; they describe a
+configuration overlay, not a runtime cost.
+
+`#[ignore]` stays as the libtest mechanic for tests that must
+never run accidentally; it is no longer the tier label.
 
 ### Proposed annotation surface
 
@@ -125,25 +139,24 @@ features = ["commands"]
 build_packages = ["pbfhogg-cli"]
 
 [test.profiles.tier1]
-description = "Fast edit loop used by brokkr check"
+description = "Fast edit loop used by brokkr check (tier 1)"
 sweeps = ["all", "consumer"]
 skip = ["tier2::", "tier3::", "platform::", "serial::"]
 include_ignored = false
 
+# Tier 2 = command slice. One profile per command surface, each
+# extending tier1 with that command's `mod tier2 { ... }` cell.
+# Add similar profiles for `extract`, `add-locations-to-ways`,
+# `apply-changes`, etc., as those command surfaces grow tier-2
+# matrices.
 [test.profiles.sort]
-description = "Expanded sort command tests"
+description = "Tier 2: expanded sort command tests"
 extends = "tier1"
 tests = ["cli_sort"]
 skip = ["platform::", "serial::"]
 
-[test.profiles.tier2]
-description = "All expanded in-project command tests"
-sweeps = ["all", "consumer"]
-only = ["tier2::"]
-include_ignored = false
-
 [test.profiles.full]
-description = "All in-project correctness tests"
+description = "Tier 3: all in-project correctness tests"
 sweeps = ["all"]
 skip = ["platform::"]
 include_ignored = true
@@ -166,18 +179,20 @@ test_threads = 1
 ### Proposed command surface
 
 ```text
-brokkr check                          # uses default_profile (tier1)
-brokkr check --profile sort           # one command family
-brokkr check --profile tier2          # all command-slice tests
-brokkr check --profile full           # full in-project sweep
-brokkr verify                         # external reference checks
+brokkr check                          # tier 1 (default profile)
+brokkr check --profile sort           # tier 2: one command family
+brokkr check --profile full           # tier 3: full in-project sweep
+brokkr bench                          # tier 4: scale/perf (existing command)
+brokkr verify                         # tier 5: external reference checks (existing command)
 ```
 
-Command slices can be implemented as profiles (`sort`, `extract`,
-`add-locations-to-ways`) or as `--command <name>` sugar that
-resolves to a profile. The underlying mechanism should remain
-profile selection so non-pbfhogg projects can define their own
-slices.
+Tier 2 is delivered through per-command profiles (`sort`,
+`extract`, `add-locations-to-ways`, ...) - or `--command <name>`
+sugar that resolves to one. The underlying mechanism should
+remain profile selection so non-pbfhogg projects can define their
+own slices. There is no separate `tier2` profile because "all
+command slices at once" is approximately tier 3 and is already
+covered by `--profile full`.
 
 ### Translation to cargo/libtest
 

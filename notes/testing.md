@@ -27,11 +27,22 @@ surface audit that drove the reorg plan below.
   writer test still skips on hosts where io_uring init fails (low
   `RLIMIT_MEMLOCK`, missing kernel feature) - that is an environment
   skip, not the static-atomic race the split solved.
-- **CLI-decoupled test reorg:** plan below. Motivation: internal module
-  rewrites (ALTW stages, geocode passes, apply-changes pipeline) should
-  not break integration tests. Today 18 of 30 `tests/*.rs` import
-  internal command entrypoints or nested submodules and would need
-  edits under any such rewrite. Conversion in progress.
+- **CLI-decoupled test reorg:** all 5 priority-list surfaces landed
+  (2026-04-25). Motivation: internal module rewrites (ALTW stages,
+  geocode passes, apply-changes pipeline) should not break
+  integration tests. Started with 18 of 30 `tests/*.rs` files
+  importing internal command entrypoints; the priority-list files
+  are now driven by `CliInvoker` against the stable CLI surface.
+  Remaining `tests/*.rs` (`roundtrip*`, `read_paths`, `edge_cases`,
+  `corrupt_input`, `non_indexed_parity`, `getparents`, `inspect`,
+  etc.) are out of priority-list scope - they're either stable-API
+  tests (allowlist-only, refactor-immune by construction) or
+  text-output commands where library-internal-invariant tests
+  should move inline rather than become CLI tests.
+- **Development contract:** tier 1 (`brokkr check`) is the inner-loop
+  signal during refactor. Tiers 2-5 are by construction
+  internal-refactor-immune. See "Validation tiers" below for the
+  full contract.
 - **Validation tiering:** `cli_sort.rs` re-split by tier intent
   landed (2026-04-25): osmium check `#[ignore = "external"]` (escape
   hatch), `--direct-io` / `--io-uring` variants in `mod platform`,
@@ -50,37 +61,79 @@ stable library allowlist (fixture builders, `BlobReader`,
 in `src/**/*.rs` `#[cfg(test)] mod tests`, where they die with the
 module on rewrite - which is correct.
 
-**Five test layers end-to-end:**
+**Test placement.** Tests go where they couple least. After the reorg
+the natural placements are:
 
-| Layer | Where | What it tests | Survives internal rewrites? |
+- Inline unit tests in `src/**/*.rs` `#[cfg(test)] mod tests` -
+  module internals; die with the module on rewrite, which is the
+  point.
+- Stable-API integration tests in `tests/<topic>.rs` (e.g.
+  `tests/roundtrip.rs`, `read_paths.rs`, `edge_cases.rs`) - use only
+  the stable allowlist below.
+- CLI integration tests in `tests/cli_*.rs` - drive the `pbfhogg`
+  binary via `CliInvoker`; internal modules are invisible.
+- Fault-injection tests in `tests/fault_*.rs` (one per binary) - own
+  their `PANIC_AT_*` hooks per-process. Partially coupled to internal
+  hook surfaces by design.
+- External cross-validation in `brokkr verify` (`verify_<command>.rs`
+  modules in brokkr) - compares pbfhogg output against osmium /
+  osmosis / osmconvert.
+
+Placement and tiering are independent axes. Placement says where a
+test lives and what it imports; tiering says how often it runs.
+
+**Validation tiers (runtime-ranked).** Each tier subsumes the cost of
+the previous; higher tier = more expensive = run less often.
+`#[ignore]` is only a Cargo mechanism, not the tiering model.
+
+| Tier | Cost | When | Driven by |
 |---|---|---|---|
-| 1. Inline unit | `src/**/*.rs` `#[cfg(test)]` | Module internals, invariants on the code right next to it | Dies with the module (intentional) |
-| 2. Stable-API integration | `tests/roundtrip.rs`, `read_paths.rs`, `edge_cases.rs`, etc. | Public library API contracts (`PbfWriter`, `BlobReader`, `ElementReader`, ...) | Yes - stable allowlist only |
-| 3. CLI integration | `tests/cli_*.rs` | Command behavior: input PBF + flags → output PBF; internal modules invisible | Yes - drives binary |
-| 4. Fault injection | `tests/fault_*.rs` (one test per binary) | Error paths, panic recovery, scratch-dir cleanup in parallel pipelines | Partially - per-instance hooks on stable configs survive; static-atomic hooks on internals don't (acceptable: these tests are intentionally architecture-tied) |
-| 5. Cross-validation | `brokkr verify` | Output equivalence vs osmium/osmosis/osmconvert on real datasets | Yes - process-level |
+| 1. Fast contracts | seconds | Every edit | `brokkr check` (default) |
+| 2. Command slice | tens of seconds | While working on that command | `brokkr check --profile <cmd>` |
+| 3. Full in-project | minutes | Before merge | `brokkr check --profile full` |
+| 4. Scale/perf | hours | Performance work, release evidence | `brokkr bench`, `brokkr suite` |
+| 5. External cross-validation | depends on osmium/osmosis/osmconvert + dataset size | Release gate, after semantic rewrites | `brokkr verify` |
 
-**Validation tiers:**
+Tiers 1-3 are `brokkr check` profiles. Tiers 4 and 5 are separate
+brokkr commands; they sit in the tier list because they are the
+remaining gates a release passes through, not because `brokkr check`
+runs them.
 
-`#[ignore]` is only a Cargo mechanism, not the tiering model. Some
-ignored tests are slow real-dataset tests, some are serial-only fault
-injection, and some are platform-gated. Brokkr should expose semantic
-profiles over those mechanics.
+`mod platform` and `mod serial` are orthogonal config overlays, not
+tiers. A platform test can sit at tier 1 (fast contract) or tier 3
+(full sweep) independently; the marker says "needs particular host
+setup" or "needs `--test-threads=1`", which is a different axis from
+runtime cost.
 
-| Tier | Command shape | Runs | When |
-|---|---|---|
-| 1. Edit loop | `brokkr check` | Fast inline unit tests, stable-API tests, and small-fixture CLI command-contract tests. No real datasets, no external tools, no long fault-injection tests. | Every edit |
-| 2. Command slice | `brokkr check --command <name>` or equivalent | Expanded in-project tests for one command family: adversarial fixtures, `-j` parity, scratch cleanup, and command-specific fault injection. | While working on that command |
-| 3. Full in-project | `brokkr check --full` or equivalent | All in-project correctness tests, including slow/serial fault injection and real-Denmark/geocode tests. | Before merge/release, after broad library changes |
-| 4. Scale/perf | `brokkr bench`, `brokkr suite`, overnight jobs | Planet-scale safety, performance, sidecar analysis, README table refreshes. | Performance work, release evidence |
+**Development contract.** Tier 1 is the inner-loop signal during a
+refactor:
 
-External reference-tool cross-validation runs through `brokkr verify`,
-which is a separate workflow rather than a tier. See "External
-cross-validation" below.
+- **During refactor:** edit code + inline tests + any fault test whose
+  hook moved. Run `brokkr check`. Green ⇒ the refactor is
+  structurally landing. Tiers 2-5 stay silent during iteration.
+- **Before merge:** run tiers 2-3 to confirm CLI behaviour through the
+  stable surface.
+- **Before release:** run tier 4 for performance regression and tier 5
+  for external parity.
 
-Until brokkr has first-class Tier 2/3 profiles, use `brokkr test <name>`
-for targeted debugging and keep expensive tests out of Tier 1 with
-`#[ignore]` plus a clear runbook.
+Tier 1 contains **both** internal-coupled tests (inline unit, fault)
+**and** immune tests (stable-API, small-fixture CLI). Tiers 2-5 are by
+construction internal-refactor-immune: every test goes through the
+stable allowlist or the CLI surface, so a rewrite of
+`src/commands/<X>/` cannot break them by type changes alone. That is
+the load-bearing property of this whole reorg.
+
+Two design constraints fall out of the contract:
+
+- **Tier 1 must be both fast AND structurally complete.** Fast because
+  it is the inner loop; structurally complete because if `brokkr check`
+  passes and the refactor is actually broken, the dev gets misled.
+  Every internal contract that the refactor could break needs a tier-1
+  test (inline unit OR fault hook) that catches it.
+- **Tier 1 must not carry real-dataset cost.** A 54 s Denmark roundtrip
+  belongs in tier 3, not tier 1, because waiting 54 s per iteration
+  kills the inner loop. Tier 1 covers structural correctness on small
+  synthetic fixtures; output correctness on real data lives in tier 3+.
 
 **Stable allowlist** - imports from this set do not couple the test to
 an internal module shape:

@@ -43,12 +43,69 @@ use super::{
 struct LoaderScratch {
     data_buf: Vec<u8>,
     records: Vec<IdRecord>,
+    /// Ping-pong scratch for the LSD radix sort. Sized to the largest
+    /// bucket the worker has seen; persists across buckets to avoid
+    /// re-allocating. Adds one full-bucket Vec<IdRecord> to per-worker
+    /// peak memory (~583 MB at planet's largest bucket).
+    sort_scratch: Vec<IdRecord>,
 }
 
 impl LoaderScratch {
     fn new() -> Self {
-        Self { data_buf: Vec::new(), records: Vec::new() }
+        Self {
+            data_buf: Vec::new(),
+            records: Vec::new(),
+            sort_scratch: Vec::new(),
+        }
     }
+}
+
+/// LSD radix sort over `IdRecord.local_node_id` (u32 key, 4 stable
+/// 8-bit digit passes). Stability per pass is load-bearing for LSD
+/// correctness across passes; the scatter increments `prefix[digit]`
+/// in source-iteration order, which preserves the relative order of
+/// equal-digit records produced by the previous pass.
+///
+/// The 4 passes ping-pong: 0 records→scratch, 1 scratch→records,
+/// 2 records→scratch, 3 scratch→records. Result lands back in
+/// `records`. Falls back to `sort_unstable_by_key` for small buckets
+/// where radix's 4-pass overhead loses to comparison sort.
+fn radix_sort_id_records(records: &mut [IdRecord], scratch: &mut Vec<IdRecord>) {
+    if records.len() < 1024 {
+        records.sort_unstable_by_key(|r| r.local_node_id);
+        return;
+    }
+
+    let n = records.len();
+    scratch.clear();
+    scratch.resize(
+        n,
+        IdRecord { local_node_id: 0, blob_idx: 0, blob_local_slot: 0 },
+    );
+
+    fn pass(src: &[IdRecord], dst: &mut [IdRecord], shift: u32) {
+        let mut counts = [0usize; 256];
+        for r in src {
+            let digit = ((r.local_node_id >> shift) & 0xFF) as usize;
+            counts[digit] += 1;
+        }
+        let mut prefix = [0usize; 256];
+        let mut total = 0usize;
+        for (i, c) in counts.iter().enumerate() {
+            prefix[i] = total;
+            total += c;
+        }
+        for r in src {
+            let digit = ((r.local_node_id >> shift) & 0xFF) as usize;
+            dst[prefix[digit]] = *r;
+            prefix[digit] += 1;
+        }
+    }
+
+    pass(&records[..n], &mut scratch[..n], 0);
+    pass(&scratch[..n], &mut records[..n], 8);
+    pass(&records[..n], &mut scratch[..n], 16);
+    pass(&scratch[..n], &mut records[..n], 24);
 }
 
 struct PreparedBucket {
@@ -105,6 +162,19 @@ fn prepare_bucket(
         }
     }
 
+    // Shard integrity: each id-shard must be a sequence of
+    // ID_RECORD_SIZE-byte records. A non-multiple length means a
+    // truncated write (kernel page cache loss, fs corruption, partial
+    // worker write that didn't flush). chunks_exact would silently
+    // drop the partial tail; error explicitly instead.
+    if !loader.data_buf.len().is_multiple_of(ID_RECORD_SIZE) {
+        return Err(format!(
+            "stage2 bucket {bucket_idx}: id shard total length {} is not \
+             a multiple of {ID_RECORD_SIZE}",
+            loader.data_buf.len(),
+        ));
+    }
+
     // Parse 12-byte chunks into IdRecords.
     let t_parse = std::time::Instant::now();
     let count = loader.data_buf.len() / ID_RECORD_SIZE;
@@ -119,7 +189,7 @@ fn prepare_bucket(
     // Sort by local_node_id so the merge walk against ID-sorted node
     // tuples advances both pointers monotonically.
     let t_sort = std::time::Instant::now();
-    loader.records.sort_unstable_by_key(|r| r.local_node_id);
+    radix_sort_id_records(&mut loader.records, &mut loader.sort_scratch);
     let sort_ms = t_sort.elapsed().as_millis() as u64;
 
     Ok(PreparedBucket {
@@ -690,3 +760,91 @@ pub(super) fn stage2_node_join(
 }
 
 pub(super) type SlotBuckets = SharedSlotBuckets;
+
+#[cfg(test)]
+mod radix_sort_tests {
+    use super::{radix_sort_id_records, IdRecord};
+
+    fn rec(id: u32, blob: u32, slot: u32) -> IdRecord {
+        IdRecord { local_node_id: id, blob_idx: blob, blob_local_slot: slot }
+    }
+
+    #[test]
+    fn small_buckets_use_fallback_path() {
+        // Below the 1024 threshold; comparison sort fires.
+        let mut records = vec![rec(5, 0, 0), rec(1, 0, 0), rec(3, 0, 0)];
+        let mut scratch = Vec::new();
+        radix_sort_id_records(&mut records, &mut scratch);
+        let ids: Vec<u32> = records.iter().map(|r| r.local_node_id).collect();
+        assert_eq!(ids, vec![1, 3, 5]);
+        // Scratch untouched on the small-input fallback.
+        assert!(scratch.is_empty());
+    }
+
+    #[test]
+    fn radix_sort_orders_random_u32_keys() {
+        // Just past the threshold so we hit the radix path.
+        let n = 2048u32;
+        let mut records: Vec<IdRecord> = (0..n)
+            .map(|i| rec(i.wrapping_mul(0x9E37_79B1) ^ 0x1234_5678, i, i))
+            .collect();
+        let mut scratch = Vec::new();
+        radix_sort_id_records(&mut records, &mut scratch);
+        for w in records.windows(2) {
+            assert!(
+                w[0].local_node_id <= w[1].local_node_id,
+                "out of order: {} > {}",
+                w[0].local_node_id,
+                w[1].local_node_id,
+            );
+        }
+        assert_eq!(records.len(), usize::try_from(n).expect("n fits"));
+    }
+
+    #[test]
+    fn radix_sort_is_stable_within_equal_keys() {
+        // LSD correctness across passes requires per-pass stable
+        // scatter; this manifests as stability for equal full keys
+        // in the final result. Construct records with many duplicates
+        // and check payload order is preserved per id group.
+        let n = 4096u32;
+        let mut records: Vec<IdRecord> = (0..n)
+            .map(|i| rec(i % 16, i, i)) // 16 distinct keys, payloads encode insertion index
+            .collect();
+        let mut scratch = Vec::new();
+        radix_sort_id_records(&mut records, &mut scratch);
+        for chunk in records.chunks(usize::try_from(n / 16).expect("n/16 fits")) {
+            for w in chunk.windows(2) {
+                assert_eq!(w[0].local_node_id, w[1].local_node_id);
+                assert!(
+                    w[0].blob_idx < w[1].blob_idx,
+                    "stability violated: payload {} before {} within id={}",
+                    w[0].blob_idx, w[1].blob_idx, w[0].local_node_id,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn radix_sort_handles_full_u32_range() {
+        // Boundary keys: 0, u32::MAX, and values in each byte's high
+        // bit so all four passes do meaningful work.
+        let mut records = vec![
+            rec(0, 0, 0),
+            rec(u32::MAX, 1, 0),
+            rec(0x80_00_00_00, 2, 0),
+            rec(0x00_80_00_00, 3, 0),
+            rec(0x00_00_80_00, 4, 0),
+            rec(0x00_00_00_80, 5, 0),
+        ];
+        // Pad up to the radix threshold so we exercise the radix path.
+        for i in 0..1024u32 {
+            records.push(rec(i.wrapping_mul(7919), i + 100, 0));
+        }
+        let mut scratch = Vec::new();
+        radix_sort_id_records(&mut records, &mut scratch);
+        for w in records.windows(2) {
+            assert!(w[0].local_node_id <= w[1].local_node_id);
+        }
+    }
+}

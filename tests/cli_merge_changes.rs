@@ -1,27 +1,43 @@
-//! merge-changes correctness tests.
+//! CLI-driven integration tests for `pbfhogg merge-changes`.
+//!
+//! Replaces the library-API `tests/merge_changes.rs`. OSC inputs
+//! are written via `flate2::write::GzEncoder` (or plain file
+//! writes for `.osc`); the `merge-changes` command runs via the
+//! compiled `pbfhogg` binary through `CliInvoker`; output is
+//! verified by reading the resulting OSC text and substring
+//! matching, with stats inspected through stderr (the CLI emits
+//! them via `MergeChangesStats::print_summary`). No imports
+//! from `pbfhogg::merge_changes::*` - a rewrite of
+//! `src/commands/merge_changes/` cannot break these tests by
+//! type changes alone.
+
+#![allow(clippy::unwrap_used)]
+
+mod common;
 
 use std::fs::File;
 use std::io::{Read, Write};
+use std::path::Path;
 
+use common::cli::CliInvoker;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use pbfhogg::merge_changes::merge_changes;
 use tempfile::TempDir;
 
-fn write_osc_gz(path: &std::path::Path, xml: &str) {
+fn write_osc_gz(path: &Path, xml: &str) {
     let file = File::create(path).expect("create osc file");
     let mut enc = GzEncoder::new(file, Compression::fast());
     enc.write_all(xml.as_bytes()).expect("write xml");
     enc.finish().expect("finish gz");
 }
 
-fn write_osc_plain(path: &std::path::Path, xml: &str) {
+fn write_osc_plain(path: &Path, xml: &str) {
     let mut file = File::create(path).expect("create osc file");
     file.write_all(xml.as_bytes()).expect("write xml");
 }
 
-fn read_osc_gz(path: &std::path::Path) -> String {
+fn read_osc_gz(path: &Path) -> String {
     let file = File::open(path).expect("open osc file");
     let mut dec = GzDecoder::new(file);
     let mut xml = String::new();
@@ -29,11 +45,27 @@ fn read_osc_gz(path: &std::path::Path) -> String {
     xml
 }
 
-fn read_osc_plain(path: &std::path::Path) -> String {
+fn read_osc_plain(path: &Path) -> String {
     let mut file = File::open(path).expect("open osc file");
     let mut xml = String::new();
     file.read_to_string(&mut xml).expect("read osc");
     xml
+}
+
+/// Invoke `pbfhogg merge-changes <inputs...> -o <output> [--simplify]`
+/// and assert success. Returns captured stderr (which carries the
+/// `MergeChangesStats::print_summary` line) so the caller can pin
+/// counter values.
+fn run_merge_changes(inputs: &[&Path], output: &Path, simplify: bool) -> String {
+    let mut cli = CliInvoker::new().arg("merge-changes");
+    for input in inputs {
+        cli = cli.arg(*input);
+    }
+    cli = cli.arg("-o").arg(output);
+    if simplify {
+        cli = cli.arg("--simplify");
+    }
+    cli.assert_success().stderr_str()
 }
 
 #[test]
@@ -67,11 +99,16 @@ fn merge_changes_keeps_full_stream_by_default() {
 </osmChange>"#,
     );
 
-    let stats = merge_changes(&[&in1, &in2], &out, false).expect("merge-changes");
-    assert_eq!(stats.files, 2);
-    assert_eq!(stats.changes_in, 2);
-    assert_eq!(stats.changes_out, 2);
-    assert!(!stats.simplified);
+    let stderr = run_merge_changes(&[&in1, &in2], &out, false);
+    // Non-simplify summary: "Merged {files} files: {changes_out} changes"
+    assert!(
+        stderr.contains("Merged 2 files: 2 changes"),
+        "stats line missing or unexpected; stderr =\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("simplified"),
+        "non-simplify run must not emit '(simplified)'",
+    );
 
     let xml = read_osc_gz(&out);
     assert!(xml.contains("<create>"));
@@ -125,11 +162,13 @@ fn simplify_keeps_only_last_change_per_object() {
 </osmChange>"#,
     );
 
-    let stats = merge_changes(&[&in1, &in2], &out, true).expect("merge-changes simplify");
-    assert_eq!(stats.files, 2);
-    assert_eq!(stats.changes_in, 4);
-    assert_eq!(stats.changes_out, 2);
-    assert!(stats.simplified);
+    let stderr = run_merge_changes(&[&in1, &in2], &out, true);
+    // Simplify summary:
+    //   "Merged {files} files: {changes_in} input changes -> {changes_out} output changes (simplified)"
+    assert!(
+        stderr.contains("Merged 2 files: 4 input changes -> 2 output changes (simplified)"),
+        "stats line missing or unexpected; stderr =\n{stderr}",
+    );
 
     let xml = read_osc_gz(&out);
     assert!(xml.contains("<delete>"));
@@ -157,8 +196,8 @@ fn plain_osc_input_supported() {
 </osmChange>"#,
     );
 
-    let stats = merge_changes(&[&in1], &out, false).expect("merge plain osc");
-    assert_eq!(stats.changes_out, 1);
+    let stderr = run_merge_changes(&[&in1], &out, false);
+    assert!(stderr.contains("Merged 1 files: 1 changes"));
 
     let xml = read_osc_plain(&out);
     assert!(xml.contains(r#"id="1""#));
@@ -184,8 +223,8 @@ fn relation_roundtrip() {
 </osmChange>"#,
     );
 
-    let stats = merge_changes(&[&in1], &out, false).expect("merge relation");
-    assert_eq!(stats.changes_out, 1);
+    let stderr = run_merge_changes(&[&in1], &out, false);
+    assert!(stderr.contains("Merged 1 files: 1 changes"));
 
     let xml = read_osc_gz(&out);
     assert!(xml.contains(r#"<relation id="100" version="1">"#));
@@ -216,9 +255,11 @@ fn simplify_multiple_same_type_different_ids() {
 </osmChange>"#,
     );
 
-    let stats = merge_changes(&[&in1], &out, true).expect("simplify same type");
-    assert_eq!(stats.changes_in, 3);
-    assert_eq!(stats.changes_out, 2);
+    let stderr = run_merge_changes(&[&in1], &out, true);
+    assert!(
+        stderr.contains("Merged 1 files: 3 input changes -> 2 output changes (simplified)"),
+        "stats line missing or unexpected; stderr =\n{stderr}",
+    );
 
     let xml = read_osc_gz(&out);
     // node 1 simplified to modify (last action)
@@ -246,8 +287,11 @@ fn simplify_preserves_metadata() {
 </osmChange>"#,
     );
 
-    let stats = merge_changes(&[&in1], &out, true).expect("simplify metadata");
-    assert_eq!(stats.changes_out, 1);
+    let stderr = run_merge_changes(&[&in1], &out, true);
+    assert!(
+        stderr.contains("-> 1 output changes (simplified)"),
+        "stats line missing expected output count; stderr =\n{stderr}",
+    );
 
     let xml = read_osc_gz(&out);
     // Should have the last version's metadata
@@ -271,8 +315,8 @@ fn empty_osc_produces_empty_output() {
 </osmChange>"#,
     );
 
-    let stats = merge_changes(&[&in1], &out, false).expect("empty osc");
-    assert_eq!(stats.changes_out, 0);
+    let stderr = run_merge_changes(&[&in1], &out, false);
+    assert!(stderr.contains("Merged 1 files: 0 changes"));
 
     let xml = read_osc_gz(&out);
     assert!(xml.contains("osmChange"));
@@ -310,12 +354,12 @@ fn simplify_create_then_delete_yields_only_delete() {
 </osmChange>"#,
     );
 
-    let stats = merge_changes(&[&in1, &in2], &out, true).expect("merge simplify create-then-delete");
-    assert_eq!(stats.files, 2);
-    assert_eq!(stats.changes_in, 2);
-    // The simplified output should contain only the delete (last action wins)
-    assert_eq!(stats.changes_out, 1);
-    assert!(stats.simplified);
+    let stderr = run_merge_changes(&[&in1, &in2], &out, true);
+    // Simplified output: only the delete (last action wins).
+    assert!(
+        stderr.contains("Merged 2 files: 2 input changes -> 1 output changes (simplified)"),
+        "stats line missing or unexpected; stderr =\n{stderr}",
+    );
 
     let xml = read_osc_gz(&out);
     // Should contain the delete

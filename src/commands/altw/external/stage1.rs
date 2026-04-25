@@ -700,8 +700,24 @@ pub(super) fn stage1_way_pass(
                             let t3 = std::time::Instant::now();
                             let rank_range = unique_nodes_u64.div_ceil(NUM_BUCKETS as u64);
                             let mut ranked: Vec<(u32, usize, u64)> = Vec::with_capacity(blob_node_ids.len());
+                            // `rank_if_set` returns None on a non-member
+                            // OR out-of-range id; skip both. Pass A's
+                            // step-2 fixup applied the same skip filter
+                            // to set_atomic, so any ref that pass B
+                            // would have to look up here is guaranteed
+                            // to be a member - except for the negative
+                            // / out-of-layout cases that pass A
+                            // deliberately did NOT add to the IdSet.
+                            // Calling `.rank()` directly would panic on
+                            // those (chunk_for_atomic's preallocate
+                            // contract) before the new stage 2 even
+                            // gets a chance to run. Step 4 deletes
+                            // pass B and this loop entirely.
                             for (i, &node_id) in blob_node_ids.iter().enumerate() {
-                                let global_rank = node_id_set_ref.rank(node_id);
+                                let global_rank = match node_id_set_ref.rank_if_set(node_id) {
+                                    Some(r) => r,
+                                    None => continue,
+                                };
                                 #[allow(clippy::cast_possible_truncation)]
                                 let bucket = (global_rank
                                     .checked_div(rank_range)

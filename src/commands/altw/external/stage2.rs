@@ -423,23 +423,43 @@ pub(super) fn stage2_node_join(
                             // local_node_id; node_tuples are id-sorted
                             // (PBF invariant + extract_node_tuples
                             // preserves order). Advance both pointers
-                            // monotonically. Records whose global id
-                            // falls past `blob.max_id` belong to the
-                            // next blob in the slice; break the inner
-                            // loop and let the outer loop pick them up.
+                            // monotonically. The walk's upper bound is
+                            // `node_tuples.last().id` (the last id this
+                            // blob actually contains), NOT
+                            // `blob.max_id` from indexdata. Indexdata
+                            // is a producer claim and can overstate the
+                            // real range; using the actual extracted
+                            // last-id avoids consuming a record as
+                            // "orphan in this blob" when it should be
+                            // resolved by a later blob whose
+                            // indexdata-claimed `min_id` overlaps the
+                            // current blob's overstated `max_id`. The
+                            // old rank path's `next_rank == ref_rank_end`
+                            // canary failed loud on this class of bug;
+                            // the new walk uses the decoded stream as
+                            // the source of truth instead.
+                            //
                             // Records that find no matching tuple
-                            // (orphans) emit nothing - stage 4 fills
-                            // zero coords for any slot_pos not covered
-                            // by a ResolvedEntry, matching the existing
+                            // (true orphans - id absent from PBF) emit
+                            // nothing; stage 4 fills zero coords for
+                            // any slot_pos not covered by a
+                            // ResolvedEntry, matching the existing
                             // missing-ref behaviour.
                             let t_walk = std::time::Instant::now();
+                            let blob_actual_upper: Option<u64> = node_tuples
+                                .last()
+                                .and_then(|t| u64::try_from(t.id).ok());
                             let mut tuple_ptr = 0usize;
                             #[cfg(debug_assertions)]
                             let mut prev_tuple_id: Option<i64> = None;
                             while record_ptr < bkt.records.len() {
                                 let record = &bkt.records[record_ptr];
                                 let global_id = bucket_lo + u64::from(record.local_node_id);
-                                if global_id > blob_max {
+                                let upper = match blob_actual_upper {
+                                    Some(u) => u,
+                                    None => break,
+                                };
+                                if global_id > upper {
                                     break;
                                 }
                                 #[allow(clippy::cast_sign_loss)]

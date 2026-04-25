@@ -1,0 +1,811 @@
+//! CLI-driven integration tests for `pbfhogg add-locations-to-ways`.
+//!
+//! Replaces the library-API `tests/add_locations_to_ways.rs`. Fixture
+//! PBFs are built with the stable-allowlist writers (plus a small
+//! local helper that wraps `PbfWriter::to_path` for indexdata-bearing
+//! inputs); `add-locations-to-ways` runs through `CliInvoker`; output
+//! is verified by reading the resulting PBF with `BlobReader` +
+//! `Element` (allowlist). No imports from `pbfhogg::altw::*` - a
+//! rewrite of `src/commands/altw/` cannot break these tests by type
+//! changes alone.
+//!
+//! ALTW is the motivating example for the CLI-decoupling reorg
+//! (`notes/testing.md` > "Reorg"): the dense / sparse / external /
+//! auto index backends are internal types that change shape during
+//! the join rewrite documented in `notes/altw-external.md`. This
+//! file's only knob into "which backend" is the `--index-type` CLI
+//! flag, so backend renames or splits don't ripple in.
+
+#![allow(clippy::unwrap_used)]
+
+mod common;
+
+use std::path::Path;
+
+use common::cli::{CliInvoker, CliOutput};
+use common::{
+    assert_elements_equivalent, generate_nodes, generate_ways, write_multi_block_test_pbf,
+    write_test_pbf, write_test_pbf_non_indexed, TestMember, TestNode, TestRelation, TestWay,
+};
+use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
+use pbfhogg::writer::{Compression, PbfWriter};
+use pbfhogg::{BlobDecode, BlobReader, Element, MemberId};
+use tempfile::TempDir;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn test_nodes() -> Vec<TestNode> {
+    vec![
+        TestNode {
+            id: 1,
+            lat: 550_000_000,
+            lon: 120_000_000,
+            tags: vec![("name", "tagged_node")],
+            meta: None,
+        },
+        TestNode {
+            id: 2,
+            lat: 551_000_000,
+            lon: 121_000_000,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 3,
+            lat: 552_000_000,
+            lon: 122_000_000,
+            tags: vec![("amenity", "cafe")],
+            meta: None,
+        },
+    ]
+}
+
+fn test_ways() -> Vec<TestWay> {
+    vec![TestWay {
+        id: 10,
+        refs: vec![1, 2, 3],
+        tags: vec![("highway", "primary")],
+        meta: None,
+    }]
+}
+
+/// Write a sorted PBF whose blobs carry indexdata in their
+/// BlobHeaders. `PbfWriter::to_path` is the pipelined writer that
+/// embeds indexdata via `scan_block_ids`. Allowlist-only.
+fn write_indexed_pbf(
+    path: &Path,
+    nodes: &[TestNode],
+    ways: &[TestWay],
+    relations: &[TestRelation],
+) {
+    let header = block_builder::HeaderBuilder::new()
+        .sorted()
+        .build()
+        .expect("build header");
+    let mut writer =
+        PbfWriter::to_path(path, Compression::default(), &header).expect("create writer");
+
+    let mut bb = BlockBuilder::new();
+
+    for n in nodes {
+        if !bb.can_add_node()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+        bb.add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), None);
+    }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    for w in ways {
+        if !bb.can_add_way()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+        bb.add_way(w.id, w.tags.iter().copied(), &w.refs, None);
+    }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    for r in relations {
+        if !bb.can_add_relation()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+        let members: Vec<MemberData<'_>> = r
+            .members
+            .iter()
+            .map(|m| MemberData {
+                id: m.id,
+                role: m.role,
+            })
+            .collect();
+        bb.add_relation(r.id, r.tags.iter().copied(), &members, None);
+    }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    writer.flush().expect("flush");
+}
+
+#[derive(Clone, Copy)]
+enum IndexBackend {
+    Default, // dense (CLI default)
+    Dense,
+    Sparse,
+    External,
+    Auto,
+}
+
+impl IndexBackend {
+    fn flag(self) -> Option<&'static str> {
+        match self {
+            IndexBackend::Default => None,
+            IndexBackend::Dense => Some("dense"),
+            IndexBackend::Sparse => Some("sparse"),
+            IndexBackend::External => Some("external"),
+            IndexBackend::Auto => Some("auto"),
+        }
+    }
+}
+
+/// Invoke `pbfhogg add-locations-to-ways <input> -o <output>
+/// [--keep-untagged-nodes] [--index-type T] [--direct-io] --force`.
+/// Returns the captured output.
+fn run_altw(
+    input: &Path,
+    output: &Path,
+    keep_untagged_nodes: bool,
+    backend: IndexBackend,
+    direct_io: bool,
+) -> CliOutput {
+    let mut cli = CliInvoker::new()
+        .arg("add-locations-to-ways")
+        .arg(input)
+        .arg("-o")
+        .arg(output);
+    if keep_untagged_nodes {
+        cli = cli.arg("--keep-untagged-nodes");
+    }
+    if let Some(name) = backend.flag() {
+        cli = cli.arg("--index-type").arg(name);
+    }
+    if direct_io {
+        cli = cli.arg("--direct-io");
+    }
+    cli.arg("--force").run()
+}
+
+/// Convenience: run with default index, assert success.
+fn run_altw_ok(input: &Path, output: &Path, keep_untagged_nodes: bool) -> CliOutput {
+    let out = run_altw(input, output, keep_untagged_nodes, IndexBackend::Default, false);
+    assert!(
+        out.status.success(),
+        "add-locations-to-ways failed; stderr:\n{}",
+        out.stderr_str(),
+    );
+    out
+}
+
+/// Read every way in the output and return their node-location lists.
+fn read_way_locations(path: &Path) -> Vec<(i64, Vec<(i32, i32)>)> {
+    let reader = BlobReader::from_path(path).expect("open output");
+    let mut out = Vec::new();
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
+            for element in block.elements() {
+                if let Element::Way(w) = element {
+                    let locs: Vec<(i32, i32)> = w
+                        .node_locations()
+                        .map(|loc| (loc.decimicro_lat(), loc.decimicro_lon()))
+                        .collect();
+                    out.push((w.id(), locs));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn read_node_ids(path: &Path) -> Vec<i64> {
+    let reader = BlobReader::from_path(path).expect("open output");
+    let mut ids = Vec::new();
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
+            for element in block.elements() {
+                match element {
+                    Element::DenseNode(dn) => ids.push(dn.id()),
+                    Element::Node(n) => ids.push(n.id()),
+                    _ => {}
+                }
+            }
+        }
+    }
+    ids
+}
+
+fn read_relation_ids(path: &Path) -> Vec<i64> {
+    let reader = BlobReader::from_path(path).expect("open output");
+    let mut ids = Vec::new();
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
+            for element in block.elements() {
+                if let Element::Relation(r) = element {
+                    ids.push(r.id());
+                }
+            }
+        }
+    }
+    ids
+}
+
+// ---------------------------------------------------------------------------
+// Basic tests (default / dense backend, non-indexed input)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn basic_locations_added_to_ways() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+    run_altw_ok(&input, &output, true);
+
+    let ways = read_way_locations(&output);
+    assert_eq!(
+        ways,
+        vec![(
+            10,
+            vec![
+                (550_000_000, 120_000_000),
+                (551_000_000, 121_000_000),
+                (552_000_000, 122_000_000),
+            ]
+        )],
+    );
+}
+
+#[test]
+fn header_has_locations_on_ways_feature() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+    run_altw_ok(&input, &output, true);
+
+    let reader = BlobReader::from_path(&output).expect("open output");
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmHeader(header) = blob.decode().expect("decode") {
+            let features: Vec<&str> = header
+                .optional_features()
+                .iter()
+                .map(String::as_str)
+                .collect();
+            assert!(
+                features.contains(&"LocationsOnWays"),
+                "LocationsOnWays not in optional features: {features:?}"
+            );
+            return;
+        }
+    }
+    panic!("no header found in output");
+}
+
+#[test]
+fn drop_untagged_nodes() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+    let out = run_altw_ok(&input, &output, false);
+
+    // Stats line: pin the read/written/dropped counters (the test's
+    // entire point is "untagged nodes are dropped").
+    assert!(
+        out.stderr_str()
+            .contains("3 nodes read, 2 written, 1 dropped"),
+        "stats counters mismatch; stderr:\n{}",
+        out.stderr_str(),
+    );
+
+    // Node 2 has no tags -> dropped.
+    assert_eq!(read_node_ids(&output), vec![1, 3]);
+}
+
+#[test]
+fn keep_untagged_nodes() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+    let out = run_altw_ok(&input, &output, true);
+
+    assert!(
+        out.stderr_str()
+            .contains("3 nodes read, 3 written, 0 dropped"),
+        "stats counters mismatch; stderr:\n{}",
+        out.stderr_str(),
+    );
+    assert_eq!(read_node_ids(&output), vec![1, 2, 3]);
+}
+
+#[test]
+fn missing_node_refs_get_zero_coordinates() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let nodes = vec![TestNode {
+        id: 1,
+        lat: 550_000_000,
+        lon: 120_000_000,
+        tags: vec![],
+        meta: None,
+    }];
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![1, 99], // 99 doesn't exist
+        tags: vec![("highway", "primary")],
+        meta: None,
+    }];
+
+    write_test_pbf(&input, &nodes, &ways, &[]);
+    let out = run_altw_ok(&input, &output, true);
+
+    assert!(
+        out.stderr_str().contains("1 missing locations"),
+        "expected '1 missing locations'; stderr:\n{}",
+        out.stderr_str(),
+    );
+
+    let ways = read_way_locations(&output);
+    assert_eq!(ways, vec![(10, vec![(550_000_000, 120_000_000), (0, 0)])]);
+}
+
+#[test]
+fn relations_preserved() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let relations = vec![TestRelation {
+        id: 100,
+        members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+        tags: vec![("type", "multipolygon")],
+        meta: None,
+    }];
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &relations);
+    run_altw_ok(&input, &output, true);
+
+    assert_eq!(read_relation_ids(&output), vec![100]);
+}
+
+// ---------------------------------------------------------------------------
+// Passthrough tests (indexed input)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn passthrough_basic_with_indexdata() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_indexed_pbf(&input, &test_nodes(), &test_ways(), &[]);
+    let out = run_altw_ok(&input, &output, true);
+
+    // Indexed input enables passthrough; the optional second stats
+    // line ("Blobs: ... passthrough, ... decoded") fires when at least
+    // one blob took the raw path.
+    assert!(
+        out.stderr_str().contains("passthrough"),
+        "expected passthrough blobs reported; stderr:\n{}",
+        out.stderr_str(),
+    );
+
+    let ways = read_way_locations(&output);
+    assert_eq!(
+        ways,
+        vec![(
+            10,
+            vec![
+                (550_000_000, 120_000_000),
+                (551_000_000, 121_000_000),
+                (552_000_000, 122_000_000),
+            ]
+        )],
+    );
+}
+
+#[test]
+fn passthrough_relations_preserved() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let relations = vec![TestRelation {
+        id: 100,
+        members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+        tags: vec![("type", "multipolygon")],
+        meta: None,
+    }];
+
+    write_indexed_pbf(&input, &test_nodes(), &test_ways(), &relations);
+    let out = run_altw_ok(&input, &output, true);
+
+    assert!(
+        out.stderr_str().contains("passthrough"),
+        "expected passthrough blobs reported; stderr:\n{}",
+        out.stderr_str(),
+    );
+
+    assert_eq!(read_relation_ids(&output), vec![100]);
+}
+
+#[test]
+fn passthrough_drop_untagged_nodes() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_indexed_pbf(&input, &test_nodes(), &test_ways(), &[]);
+    let out = run_altw_ok(&input, &output, false);
+
+    assert!(
+        out.stderr_str()
+            .contains("3 nodes read, 2 written, 1 dropped"),
+        "stats counters mismatch; stderr:\n{}",
+        out.stderr_str(),
+    );
+}
+
+#[test]
+fn passthrough_keep_untagged_nodes() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_indexed_pbf(&input, &test_nodes(), &test_ways(), &[]);
+    let out = run_altw_ok(&input, &output, true);
+
+    assert!(
+        out.stderr_str()
+            .contains("3 nodes read, 3 written, 0 dropped"),
+        "stats counters mismatch; stderr:\n{}",
+        out.stderr_str(),
+    );
+    assert!(
+        out.stderr_str().contains("passthrough"),
+        "expected passthrough blobs reported; stderr:\n{}",
+        out.stderr_str(),
+    );
+}
+
+#[test]
+fn drop_untagged_keeps_relation_member_nodes() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let nodes = vec![
+        TestNode { id: 1, lat: 550_000_000, lon: 120_000_000, tags: vec![("name", "tagged")], meta: None },
+        TestNode { id: 2, lat: 551_000_000, lon: 121_000_000, tags: vec![], meta: None },
+    ];
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![1],
+        tags: vec![("highway", "service")],
+        meta: None,
+    }];
+    let relations = vec![TestRelation {
+        id: 100,
+        members: vec![TestMember { id: MemberId::Node(2), role: "label" }],
+        tags: vec![("type", "site")],
+        meta: None,
+    }];
+
+    write_test_pbf(&input, &nodes, &ways, &relations);
+    run_altw_ok(&input, &output, false);
+
+    let ids = read_node_ids(&output);
+    assert!(ids.contains(&1));
+    assert!(ids.contains(&2), "untagged relation-member node was dropped");
+}
+
+#[test]
+fn passthrough_drop_untagged_keeps_relation_member_nodes() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let nodes = vec![
+        TestNode { id: 1, lat: 550_000_000, lon: 120_000_000, tags: vec![("name", "tagged")], meta: None },
+        TestNode { id: 2, lat: 551_000_000, lon: 121_000_000, tags: vec![], meta: None },
+    ];
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![1],
+        tags: vec![("highway", "service")],
+        meta: None,
+    }];
+    let relations = vec![TestRelation {
+        id: 100,
+        members: vec![TestMember { id: MemberId::Node(2), role: "label" }],
+        tags: vec![("type", "site")],
+        meta: None,
+    }];
+
+    write_indexed_pbf(&input, &nodes, &ways, &relations);
+    run_altw_ok(&input, &output, false);
+
+    let ids = read_node_ids(&output);
+    assert!(ids.contains(&1));
+    assert!(ids.contains(&2), "untagged relation-member node was dropped");
+}
+
+// ---------------------------------------------------------------------------
+// Sparse and external backends
+// ---------------------------------------------------------------------------
+
+#[test]
+fn basic_locations_added_sparse() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+    let out = run_altw(&input, &output, true, IndexBackend::Sparse, false);
+    assert!(
+        out.status.success(),
+        "sparse backend failed; stderr:\n{}",
+        out.stderr_str(),
+    );
+
+    let ways = read_way_locations(&output);
+    assert_eq!(
+        ways,
+        vec![(
+            10,
+            vec![
+                (550_000_000, 120_000_000),
+                (551_000_000, 121_000_000),
+                (552_000_000, 122_000_000),
+            ]
+        )],
+    );
+}
+
+#[test]
+fn passthrough_basic_with_indexdata_sparse() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_indexed_pbf(&input, &test_nodes(), &test_ways(), &[]);
+    let out = run_altw(&input, &output, true, IndexBackend::Sparse, false);
+    assert!(
+        out.status.success(),
+        "sparse + indexed failed; stderr:\n{}",
+        out.stderr_str(),
+    );
+
+    assert!(
+        out.stderr_str().contains("passthrough"),
+        "expected passthrough blobs reported; stderr:\n{}",
+        out.stderr_str(),
+    );
+
+    let ways = read_way_locations(&output);
+    assert_eq!(
+        ways,
+        vec![(
+            10,
+            vec![
+                (550_000_000, 120_000_000),
+                (551_000_000, 121_000_000),
+                (552_000_000, 122_000_000),
+            ]
+        )],
+    );
+}
+
+#[test]
+fn missing_node_refs_get_zero_coordinates_sparse() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![1, 999, 3], // 999 doesn't exist
+        tags: vec![("highway", "primary")],
+        meta: None,
+    }];
+    write_test_pbf(&input, &test_nodes(), &ways, &[]);
+
+    let out = run_altw(&input, &output, true, IndexBackend::Sparse, false);
+    assert!(
+        out.status.success(),
+        "sparse missing-refs failed; stderr:\n{}",
+        out.stderr_str(),
+    );
+
+    assert!(
+        out.stderr_str().contains("1 missing locations"),
+        "expected '1 missing locations'; stderr:\n{}",
+        out.stderr_str(),
+    );
+
+    let ways = read_way_locations(&output);
+    assert_eq!(
+        ways,
+        vec![(10, vec![(550_000_000, 120_000_000), (0, 0), (552_000_000, 122_000_000)])],
+    );
+}
+
+#[test]
+#[allow(clippy::cast_possible_wrap)]
+fn backend_parity_dense_sparse_external_auto() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let out_dense = dir.path().join("out_dense.osm.pbf");
+    let out_sparse = dir.path().join("out_sparse.osm.pbf");
+    let out_external = dir.path().join("out_external.osm.pbf");
+    let out_auto = dir.path().join("out_auto.osm.pbf");
+
+    let mut nodes = generate_nodes(18, 1);
+    for idx in [0_usize, 3, 6, 9, 12, 15] {
+        nodes[idx].tags = vec![("name", "kept")];
+    }
+
+    let mut ways = generate_ways(5, 1_000, 3, 1);
+    for (i, way) in ways.iter_mut().enumerate() {
+        let start = 1 + i as i64 * 3;
+        way.refs = vec![start, start + 1, start + 2];
+        way.tags = if i % 2 == 0 {
+            vec![("highway", "primary")]
+        } else {
+            vec![("highway", "service")]
+        };
+    }
+
+    let relations = vec![TestRelation {
+        id: 300,
+        members: vec![
+            TestMember { id: MemberId::Way(1_000), role: "outer" },
+            TestMember { id: MemberId::Node(18), role: "label" },
+        ],
+        tags: vec![("type", "site")],
+        meta: None,
+    }];
+
+    write_multi_block_test_pbf(&input, &nodes, &ways, &relations, 5);
+
+    for (output, backend, label) in [
+        (&out_dense, IndexBackend::Dense, "dense"),
+        (&out_sparse, IndexBackend::Sparse, "sparse"),
+        (&out_external, IndexBackend::External, "external"),
+        (&out_auto, IndexBackend::Auto, "auto"),
+    ] {
+        let out = run_altw(&input, output, false, backend, false);
+        assert!(
+            out.status.success(),
+            "{label} backend failed; stderr:\n{}",
+            out.stderr_str(),
+        );
+    }
+
+    assert_elements_equivalent(&out_dense, &out_sparse);
+    assert_elements_equivalent(&out_dense, &out_external);
+    assert_elements_equivalent(&out_external, &out_auto);
+}
+
+/// Regression: `--index-type external --force` against a non-indexed
+/// PBF must reject the combination up front with a clear migration
+/// hint, not accept `--force` and fail much later with an opaque
+/// "OsmData blob missing indexdata" error. External join depends on
+/// per-blob indexdata to compute rank-based bucket ranges, so
+/// `--force` cannot meaningfully apply to this path.
+#[test]
+fn altw_external_rejects_force_on_non_indexed() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_non_indexed(
+        &input,
+        &[
+            TestNode { id: 1, lat: 550_000_000, lon: 120_000_000, tags: vec![], meta: None },
+            TestNode { id: 2, lat: 551_000_000, lon: 121_000_000, tags: vec![], meta: None },
+            TestNode { id: 3, lat: 552_000_000, lon: 122_000_000, tags: vec![], meta: None },
+        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2, 3],
+            tags: vec![("highway", "residential")],
+            meta: None,
+        }],
+        &[],
+    );
+
+    let out = run_altw(&input, &output, true, IndexBackend::External, false);
+    assert!(
+        !out.status.success(),
+        "expected external-join to reject --force on non-indexed PBF, but it succeeded; stdout:\n{}\nstderr:\n{}",
+        out.stdout_str(),
+        out.stderr_str(),
+    );
+
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("external") && stderr.contains("indexed"),
+        "expected setup-time rejection mentioning external + indexed, got stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("pbfhogg cat"),
+        "error should point at the indexed-generation workflow, got stderr:\n{stderr}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Platform tier
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "linux-direct-io")]
+mod platform {
+    use super::*;
+
+    #[test]
+    fn basic_locations_added_direct_io() {
+        let dir = TempDir::new().expect("tempdir");
+        let input = dir.path().join("input.osm.pbf");
+        let output = dir.path().join("output.osm.pbf");
+
+        write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+        let out = run_altw(&input, &output, true, IndexBackend::Default, true);
+        if out.is_o_direct_unsupported() {
+            eprintln!("O_DIRECT not supported on this filesystem, skipping test");
+            return;
+        }
+        assert!(
+            out.status.success(),
+            "add-locations-to-ways --direct-io failed unexpectedly; stderr:\n{}",
+            out.stderr_str(),
+        );
+
+        let ways = read_way_locations(&output);
+        assert_eq!(
+            ways,
+            vec![(
+                10,
+                vec![
+                    (550_000_000, 120_000_000),
+                    (551_000_000, 121_000_000),
+                    (552_000_000, 122_000_000),
+                ]
+            )],
+        );
+    }
+}

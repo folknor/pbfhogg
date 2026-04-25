@@ -100,7 +100,11 @@ audit doc for full reasoning):
    non-stable symbols (Region, ExtractStrategy, PolygonRings,
    ExtractSlot, etc.) replaced by --bbox/--polygon/--config CLI
    surface.
-4. `cli_altw.rs` - 18 tests. Blocks ALTW rewrite (the motivating example).
+4. `cli_add_locations_to_ways.rs` - landed (2026-04-25). 18 tests
+   converted; the four index backends (dense / sparse / external /
+   auto) addressed via `--index-type` CLI flag instead of the
+   `IndexType` enum. ALTW rewrite (notes/altw-external.md) is now
+   unblocked from a tests/ perspective.
 5. `cli_sort.rs` (landed), `cli_time_filter.rs` (landed 2026-04-25),
    `cli_merge_changes.rs` (landed 2026-04-25), `cli_cat.rs`
    (landed 2026-04-25), `cli_tags_filter.rs` (landed 2026-04-25),

@@ -1,23 +1,25 @@
-//! Stage 1: Two-pass way scan + node-blob rank mapping.
+//! Stage 1: Single-pass way scan + node-blob mapping.
 //!
-//!   Pass A: build IdSet of referenced node IDs (parallel).
-//!   Pass B: emit rank-bucketed (local_rank, slot_pos) records (parallel).
-//!   Node blob mapping: header-only walk of node blobs that records each
-//!     blob's referenced-rank range using IdSet::rank queries on the
-//!     blob's indexdata `(min_id, max_id)`. Replaces the historical 82 GB
-//!     `coords_by_rank` file - stage 2 reads node blobs directly.
+//!   Pass A: parallel scan of way blobs. Per ref it emits one
+//!     [`super::IdRecord`] into the appropriate id-bucket shard
+//!     (1 of 256, keyed by `node_id / bucket_width`) and accumulates
+//!     a per-way refcount sidecar plus the total ref count. Negative
+//!     refs and refs above the indexdata-derived `max_node_id` are
+//!     soft-skipped: the slot index still advances so stage 4 fills
+//!     zero coords for those positions, matching the existing
+//!     missing-ref behaviour.
+//!   Node blob mapping: header-only walk of node blobs that records
+//!     each blob's `(data_offset, data_size, min_id, max_id)`.
+//!     Stage 2 partitions the slice by `[min_id, max_id]` to find
+//!     blobs intersecting each id bucket.
 
 use std::io::{BufWriter, Write as _};
 use std::path::Path;
 
 use super::radix::{ScratchDir, NUM_BUCKETS};
-use crate::idset::IdSet;
 use super::super::Result;
 use super::blob_meta::BlobMeta;
-use super::{
-    BucketLayout, IdRecord, NodeBlobInfo, RankRecord, ID_RECORD_SIZE, MAX_NODE_ID,
-    RANK_RECORD_SIZE,
-};
+use super::{BucketLayout, IdRecord, NodeBlobInfo, ID_RECORD_SIZE};
 
 /// Way-blob schedule entry for the parallel way scans.
 pub(super) struct WayBlobTask {
@@ -31,17 +33,10 @@ pub(super) struct WayBlobTask {
 /// resolution) and the per-blob rank mapping.
 pub(super) struct Stage1Output {
     pub total_slots: u64,
-    pub unique_nodes: u64,
-    pub rank_bucket_counts: Vec<u64>,
-    /// Per-(id-bucket) IdRecord counts produced by pass A. Used by
-    /// stage 2 (A1 step 3+) to skip empty buckets without a probe.
-    /// Same length as `rank_bucket_counts`. Populated alongside the
-    /// existing rank-bucket emission for the duration of the dual-path
-    /// window (A1 steps 2-3); step 4 deletes `rank_bucket_counts`.
-    #[allow(dead_code)] // wired up in step 3 (stage 2 ID-bucket consumer).
+    /// Per-(id-bucket) IdRecord counts produced by pass A. Stage 2
+    /// reads it to skip empty buckets without a probe.
     pub id_bucket_counts: Vec<u64>,
     pub num_shard_workers: usize,
-    pub node_id_set: IdSet,
     pub node_blob_mapping: Vec<NodeBlobInfo>,
 }
 
@@ -71,14 +66,14 @@ pub(super) fn build_way_schedule(blob_meta: &[BlobMeta]) -> Result<Vec<WayBlobTa
     Ok(schedule)
 }
 
-/// Pass A standalone: parallel way scan to build `IdSet` of all
-/// referenced node IDs and write the two ref-count sidecars in blob order.
+/// Pass A: parallel way scan that emits one [`IdRecord`] per ref to
+/// the appropriate id-bucket shard, writes the two ref-count sidecars
+/// in blob order, and tracks per-bucket record counts.
 ///
-/// Returns `(total_refs, IdSet, id_bucket_counts)` with
-/// `build_rank_index()` already called. Used by `stage1_way_pass` as
-/// the entry into stage 1. `id_bucket_counts[k]` is the number of
-/// IdRecords pass A wrote to ID-bucket `k` across all workers; stage
-/// 2 reads it to skip empty buckets.
+/// Returns `(total_refs, id_bucket_counts)`.
+/// `id_bucket_counts[k]` is the number of IdRecords pass A wrote to
+/// id-bucket `k` across all workers; stage 2 reads it to skip empty
+/// buckets.
 #[hotpath::measure]
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
@@ -90,7 +85,7 @@ pub(super) fn stage1_pass_a(
     layout: &BucketLayout,
     ref_count_sidecar: &Path,
     per_way_refcount_sidecar: &Path,
-) -> Result<(u64, IdSet, Vec<u64>)> {
+) -> Result<(u64, Vec<u64>)> {
     use std::os::unix::fs::FileExt as _;
 
     let shared_file = std::sync::Arc::new(
@@ -100,15 +95,9 @@ pub(super) fn stage1_pass_a(
 
     crate::debug::emit_marker("EXTJOIN_S1_PASS_A_START");
 
-    let mut node_id_set = IdSet::new();
-    // Pre-allocate for planet-scale node IDs (~13B max).
-    #[allow(clippy::cast_possible_wrap)]
-    node_id_set.pre_allocate(MAX_NODE_ID as i64);
-
     let s1a_pread_ms = std::sync::atomic::AtomicU64::new(0);
     let s1a_decompress_ms = std::sync::atomic::AtomicU64::new(0);
     let s1a_scan_way_refs_ms = std::sync::atomic::AtomicU64::new(0);
-    let s1a_idset_set_ms = std::sync::atomic::AtomicU64::new(0);
     let s1a_bytes_read = std::sync::atomic::AtomicU64::new(0);
     let s1a_pread_calls = std::sync::atomic::AtomicU64::new(0);
 
@@ -139,7 +128,6 @@ pub(super) fn stage1_pass_a(
         let s1a_pread_ref = &s1a_pread_ms;
         let s1a_decompress_ref = &s1a_decompress_ms;
         let s1a_scan_ref = &s1a_scan_way_refs_ms;
-        let s1a_idset_ref = &s1a_idset_set_ms;
         let s1a_bytes_ref = &s1a_bytes_read;
         let s1a_pread_calls_ref = &s1a_pread_calls;
         let s1a_per_way_bytes_ref = &s1a_per_way_sidecar_bytes;
@@ -157,7 +145,6 @@ pub(super) fn stage1_pass_a(
             for worker_id in 0..num_workers {
                 let file = std::sync::Arc::clone(&shared_file);
                 let tx = tx.clone();
-                let node_id_set_ref = &node_id_set;
                 scope.spawn(move || {
                     use std::sync::atomic::Ordering::Relaxed;
                     let mut read_buf: Vec<u8> = Vec::new();
@@ -276,33 +263,6 @@ pub(super) fn stage1_pass_a(
                             s1a_id_skipped_ref.fetch_add(blob_skipped, Relaxed);
                             s1a_id_bytes_ref.fetch_add(blob_bytes, Relaxed);
 
-                            // Populate IdSet for the legacy rank path
-                            // (still consumed by pass B / stage 2 until
-                            // step 4). Apply the same locate-based skip
-                            // filter as IdRecord emission so negative
-                            // refs (which would land near u64::MAX after
-                            // an `i64 as u64` cast and panic the
-                            // pre_allocate'd IdSet) and out-of-range
-                            // refs are handled consistently across both
-                            // paths. The end result for skipped refs is
-                            // identical: stage 4 fills zero coords. Cost
-                            // of the double `locate` is bounded - it's a
-                            // pair of integer ops on u64, dwarfed by the
-                            // pread/decompress phases.
-                            let t3 = std::time::Instant::now();
-                            for &node_id in &blob_node_ids {
-                                if node_id < 0 {
-                                    continue;
-                                }
-                                #[allow(clippy::cast_sign_loss)]
-                                if layout_ref.locate(node_id as u64).is_none() {
-                                    continue;
-                                }
-                                node_id_set_ref.set_atomic(node_id);
-                            }
-                            #[allow(clippy::cast_possible_truncation)]
-                            s1a_idset_ref.fetch_add(t3.elapsed().as_millis() as u64, Relaxed);
-
                             Ok((blob_node_ids.len() as u64, per_way_rcs))
                         })();
 
@@ -382,20 +342,14 @@ pub(super) fn stage1_pass_a(
     }
     drop(id_flush_slot);
 
-    node_id_set.build_rank_index();
-    let unique_nodes = node_id_set.total_count();
-
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("s1a_pread_ms", s1a_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_decompress_ms", s1a_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_scan_way_refs_ms", s1a_scan_way_refs_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1a_idset_set_ms", s1a_idset_set_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_bytes_read", s1a_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_pread_calls", s1a_pread_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1a_unique_nodes", unique_nodes as i64);
         crate::debug::emit_counter("s1a_per_way_sidecar_bytes", s1a_per_way_sidecar_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        // A1 step 2 IdRecord emission counters.
         crate::debug::emit_counter("s1a_id_emit_ms", s1a_id_emit_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_id_records_emitted", s1a_id_records_emitted.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_id_records_skipped", s1a_id_records_skipped.load(std::sync::atomic::Ordering::Relaxed) as i64);
@@ -408,7 +362,7 @@ pub(super) fn stage1_pass_a(
         .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
         .collect();
 
-    Ok((total_refs, node_id_set, id_bucket_counts))
+    Ok((total_refs, id_bucket_counts))
 }
 
 /// Header-only walk of node blobs that builds the `NodeBlobInfo` mapping
@@ -416,32 +370,26 @@ pub(super) fn stage1_pass_a(
 ///
 /// Replaces the historical 82 GB `coords_by_rank` file. No decompression
 /// happens here - for each node blob we read its indexdata `(min_id, max_id)`
-/// and call `IdSet::rank` to compute the half-open referenced-rank range
-/// `[ref_rank_start, ref_rank_end)`. Adjacent blobs' ranges are non-overlapping
-/// and monotonic in rank because the input PBF is sorted by node ID.
+/// Stage 2 partitions this slice by `[min_id, max_id]` to find blobs
+/// that intersect each id bucket; the ranges are non-overlapping and
+/// monotonic in id because the input PBF is sorted by node id.
 #[hotpath::measure]
 pub(super) fn build_node_blob_mapping(
     blob_meta: &[BlobMeta],
-    node_id_set: &IdSet,
 ) -> Result<Vec<NodeBlobInfo>> {
     crate::debug::emit_marker("EXTJOIN_S1_NODE_MAP_START");
     let t0 = std::time::Instant::now();
 
     let mut mapping: Vec<NodeBlobInfo> = Vec::new();
-    let mut blobs_with_zero_refs: u64 = 0;
 
     for meta in blob_meta {
         if !matches!(meta.kind, crate::blob_meta::ElemKind::Node) {
             continue;
         }
-        // Sanity-check the indexdata range itself. A blob whose metadata
-        // advertises max_id < min_id is malformed (adversarial, bitrot,
-        // or a producer bug). count_below() with such bounds would
-        // produce a reversed rank range and silently feed stage 2 a
-        // negative-length slice via `ref_rank_end - ref_rank_start`;
-        // the tail drift check at stage2.rs:488 would fire eventually,
-        // but with a less specific diagnostic. Error here at the
-        // boundary instead.
+        // Reject malformed indexdata at the trust boundary - a blob
+        // whose metadata advertises max_id < min_id is a producer bug
+        // and stage 2's id-range partition would otherwise consume
+        // some other blob's records as if they belonged here.
         if meta.max_id < meta.min_id {
             return Err(format!(
                 "altw stage 1: blob at data_offset={} has reversed \
@@ -450,25 +398,9 @@ pub(super) fn build_node_blob_mapping(
             )
             .into());
         }
-        // count_below() is the safe variant of rank() that handles IDs past
-        // the highest allocated chunk (which can happen when a node blob's
-        // max_id sits in a chunk that contains no referenced nodes - rank()
-        // would panic on the chunks[] index). Returns count of set IDs
-        // strictly less than the argument, so this yields the half-open
-        // referenced-rank range over [min_id, max_id].
-        let ref_rank_start = node_id_set.count_below(meta.min_id);
-        let ref_rank_end = match meta.max_id.checked_add(1) {
-            Some(v) => node_id_set.count_below(v),
-            None => node_id_set.total_count(),
-        };
-        if ref_rank_end == ref_rank_start {
-            blobs_with_zero_refs += 1;
-        }
         mapping.push(NodeBlobInfo {
             data_offset: meta.data_offset,
             data_size: meta.data_size,
-            ref_rank_start,
-            ref_rank_end,
             min_id: meta.min_id,
             max_id: meta.max_id,
         });
@@ -477,27 +409,20 @@ pub(super) fn build_node_blob_mapping(
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     {
         crate::debug::emit_counter("s1_node_map_blobs", mapping.len() as i64);
-        crate::debug::emit_counter("s1_node_map_zero_ref_blobs", blobs_with_zero_refs as i64);
         crate::debug::emit_counter("s1_node_map_build_ms", t0.elapsed().as_millis() as i64);
     }
     crate::debug::emit_marker("EXTJOIN_S1_NODE_MAP_END");
     Ok(mapping)
 }
 
-/// Two-pass stage 1 + node-blob mapping construction.
+/// Stage 1 entry point: pass A + node-blob mapping construction.
 ///
-/// **Pass A**: parallel way scan to build `IdSet` of all referenced
-/// node IDs + write sidecar ref counts.
-///
-/// **Pass B**: rescan ways with rank index available. Emit `(local_rank, slot_pos)`
-/// records into rank-bucketed per-worker shard files.
+/// **Pass A**: parallel way scan that emits one IdRecord per ref to
+/// the right id-bucket shard, plus the per-way refcount sidecar and
+/// total ref-count sidecar in blob order.
 ///
 /// **Mapping**: header-only walk of node blobs to compute the
-/// `NodeBlobInfo` table stage 2 uses to find blobs covering each rank
-/// bucket. Replaces the historical 82 GB `coords_by_rank` file.
-///
-/// `IdSet` (~2 GB RSS at planet) is **kept alive** in `Stage1Output`
-/// because stage 2 calls `rank_if_set` while resolving coordinates inline.
+/// `NodeBlobInfo` table stage 2 partitions by `[min_id, max_id]`.
 #[hotpath::measure]
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(super) fn stage1_way_pass(
@@ -509,8 +434,6 @@ pub(super) fn stage1_way_pass(
     ref_count_sidecar: &Path,
     per_way_refcount_sidecar: &Path,
 ) -> Result<Stage1Output> {
-    use std::os::unix::fs::FileExt as _;
-
     let schedule = build_way_schedule(blob_meta)?;
 
     // Cap num_workers against the file descriptor budget. Pass B below
@@ -567,7 +490,7 @@ pub(super) fn stage1_way_pass(
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("extjoin_fd_cap_workers", fd_cap as i64);
 
-    let (total_refs, node_id_set, id_bucket_counts) = stage1_pass_a(
+    let (total_refs, id_bucket_counts) = stage1_pass_a(
         input,
         &schedule,
         num_workers,
@@ -576,257 +499,14 @@ pub(super) fn stage1_way_pass(
         ref_count_sidecar,
         per_way_refcount_sidecar,
     )?;
-    let unique_nodes_u64 = node_id_set.total_count();
 
-    let shared_file = std::sync::Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
-    );
-
-    // Load sidecar prefix sums for slot_pos computation in pass B.
-    let slot_starts = super::stage4::load_ref_count_sidecar(ref_count_sidecar, total_refs)?;
-
-    // ---- Pass B: emit rank-bucketed (local_rank, slot_pos) records ----
-    crate::debug::emit_marker("EXTJOIN_S1_PASS_B_START");
-
-    let s1b_pread_ms = std::sync::atomic::AtomicU64::new(0);
-    let s1b_decompress_ms = std::sync::atomic::AtomicU64::new(0);
-    let s1b_scan_ms = std::sync::atomic::AtomicU64::new(0);
-    let s1b_rank_ms = std::sync::atomic::AtomicU64::new(0);
-    let s1b_encode_write_ms = std::sync::atomic::AtomicU64::new(0);
-    let s1b_flush_ms = std::sync::atomic::AtomicU64::new(0);
-    let s1b_refs_total = std::sync::atomic::AtomicU64::new(0);
-    let s1b_bytes_written = std::sync::atomic::AtomicU64::new(0);
-    let s1b_bytes_read = std::sync::atomic::AtomicU64::new(0);
-    let s1b_shard_write_calls = std::sync::atomic::AtomicU64::new(0);
-    let s1b_pread_calls = std::sync::atomic::AtomicU64::new(0);
-
-    let next_idx = std::sync::atomic::AtomicUsize::new(0);
-
-    let worker_counts: std::sync::Mutex<Vec<Vec<u64>>> = std::sync::Mutex::new(Vec::new());
-    let actual_num_workers: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-    let pass_b_error: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
-    {
-        let schedule_ref = &schedule;
-        let next_ref = &next_idx;
-        let node_id_set_ref = &node_id_set;
-        let slot_starts_ref = &slot_starts;
-        let worker_counts_ref = &worker_counts;
-        let actual_ref = &actual_num_workers;
-        let s1b_pread_ref = &s1b_pread_ms;
-        let s1b_decompress_ref = &s1b_decompress_ms;
-        let s1b_scan_ref = &s1b_scan_ms;
-        let s1b_rank_ref = &s1b_rank_ms;
-        let s1b_encode_write_ref = &s1b_encode_write_ms;
-        let s1b_flush_ref = &s1b_flush_ms;
-        let s1b_refs_total_ref = &s1b_refs_total;
-        let s1b_bytes_written_ref = &s1b_bytes_written;
-        let s1b_bytes_read_ref = &s1b_bytes_read;
-        let s1b_shard_write_calls_ref = &s1b_shard_write_calls;
-        let s1b_pread_calls_ref = &s1b_pread_calls;
-        let err_ref = &pass_b_error;
-
-        std::thread::scope(|scope| -> Result<()> {
-            for worker_id in 0..num_workers {
-                let file = std::sync::Arc::clone(&shared_file);
-                scope.spawn(move || {
-                    use std::sync::atomic::Ordering::Relaxed;
-
-                    // Per-worker rank-bucket shard files.
-                    let mut shard_writers: Vec<Option<BufWriter<std::fs::File>>> =
-                        Vec::with_capacity(NUM_BUCKETS);
-                    let mut entry_counts = vec![0u64; NUM_BUCKETS];
-                    for bucket_idx in 0..NUM_BUCKETS {
-                        let path = scratch.path.join(format!("rank-W{worker_id}-{bucket_idx:03}"));
-                        let f = match std::fs::File::create(&path) {
-                            Ok(f) => f,
-                            Err(e) => {
-                                *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                    Some(format!("create rank shard {}: {e}", path.display()));
-                                return;
-                            }
-                        };
-                        shard_writers.push(Some(BufWriter::with_capacity(
-                            super::radix::BUCKET_BUF_SIZE, f,
-                        )));
-                    }
-
-                    let mut read_buf: Vec<u8> = Vec::new();
-                    let mut decompress_buf: Vec<u8> = Vec::new();
-                    let mut refs_buf: Vec<i64> = Vec::new();
-                    let mut group_starts: Vec<(usize, usize)> = Vec::new();
-                    let mut rec_buf = [0u8; RANK_RECORD_SIZE];
-
-                    loop {
-                        if err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
-                            break;
-                        }
-                        let idx = next_ref.fetch_add(1, Relaxed);
-                        if idx >= schedule_ref.len() { break; }
-                        let task = &schedule_ref[idx];
-
-                        let blob_result: std::result::Result<(), String> = (|| {
-                            let t0 = std::time::Instant::now();
-                            read_buf.resize(task.data_size, 0);
-                            file.read_exact_at(&mut read_buf, task.data_offset)
-                                .map_err(|e| format!("pass B pread: {e}"))?;
-                            #[allow(clippy::cast_possible_truncation)]
-                            s1b_pread_ref.fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
-                            s1b_bytes_read_ref.fetch_add(task.data_size as u64, Relaxed);
-                            s1b_pread_calls_ref.fetch_add(1, Relaxed);
-
-                            let t1 = std::time::Instant::now();
-                            crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
-                                .map_err(|e| format!("pass B decompress: {e}"))?;
-                            #[allow(clippy::cast_possible_truncation)]
-                            s1b_decompress_ref.fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
-
-                            let t2 = std::time::Instant::now();
-                            let slot_start = slot_starts_ref[task.seq as usize];
-                            let mut blob_node_ids: Vec<i64> = Vec::new();
-                            crate::scan::way::scan_way_refs(
-                                &decompress_buf, &mut refs_buf, &mut group_starts,
-                                |_way_id, refs| {
-                                    blob_node_ids.extend_from_slice(refs);
-                                },
-                            ).map_err(|e| e.to_string())?;
-                            #[allow(clippy::cast_possible_truncation)]
-                            s1b_scan_ref.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
-                            let blob_ref_count = blob_node_ids.len() as u64;
-                            s1b_refs_total_ref.fetch_add(blob_ref_count, Relaxed);
-
-                            let t3 = std::time::Instant::now();
-                            let rank_range = unique_nodes_u64.div_ceil(NUM_BUCKETS as u64);
-                            let mut ranked: Vec<(u32, usize, u64)> = Vec::with_capacity(blob_node_ids.len());
-                            // `rank_if_set` returns None on a non-member
-                            // OR out-of-range id; skip both. Pass A's
-                            // step-2 fixup applied the same skip filter
-                            // to set_atomic, so any ref that pass B
-                            // would have to look up here is guaranteed
-                            // to be a member - except for the negative
-                            // / out-of-layout cases that pass A
-                            // deliberately did NOT add to the IdSet.
-                            // Calling `.rank()` directly would panic on
-                            // those (chunk_for_atomic's preallocate
-                            // contract) before the new stage 2 even
-                            // gets a chance to run. Step 4 deletes
-                            // pass B and this loop entirely.
-                            for (i, &node_id) in blob_node_ids.iter().enumerate() {
-                                let global_rank = match node_id_set_ref.rank_if_set(node_id) {
-                                    Some(r) => r,
-                                    None => continue,
-                                };
-                                #[allow(clippy::cast_possible_truncation)]
-                                let bucket = (global_rank
-                                    .checked_div(rank_range)
-                                    .unwrap_or(0) as usize)
-                                    .min(NUM_BUCKETS - 1);
-                                let bucket_rank_start = bucket as u64 * rank_range;
-                                #[allow(clippy::cast_possible_truncation)]
-                                let local_rank = (global_rank - bucket_rank_start) as u32;
-                                let slot_pos = slot_start + i as u64;
-                                ranked.push((local_rank, bucket, slot_pos));
-                            }
-                            #[allow(clippy::cast_possible_truncation)]
-                            s1b_rank_ref.fetch_add(t3.elapsed().as_millis() as u64, Relaxed);
-
-                            let t4 = std::time::Instant::now();
-                            let mut blob_bytes: u64 = 0;
-                            let mut blob_writes: u64 = 0;
-                            for &(local_rank, bucket, slot_pos) in &ranked {
-                                let rec = RankRecord { local_rank, slot_pos };
-                                rec.write_to(&mut rec_buf);
-                                if let Some(w) = shard_writers[bucket].as_mut() {
-                                    w.write_all(&rec_buf)
-                                        .map_err(|e| format!("write rank shard: {e}"))?;
-                                    blob_bytes += RANK_RECORD_SIZE as u64;
-                                    blob_writes += 1;
-                                }
-                                entry_counts[bucket] += 1;
-                            }
-                            #[allow(clippy::cast_possible_truncation)]
-                            s1b_encode_write_ref.fetch_add(t4.elapsed().as_millis() as u64, Relaxed);
-                            s1b_bytes_written_ref.fetch_add(blob_bytes, Relaxed);
-                            s1b_shard_write_calls_ref.fetch_add(blob_writes, Relaxed);
-                            Ok(())
-                        })();
-
-                        if let Err(e) = blob_result {
-                            *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
-                            break;
-                        }
-                    }
-
-                    let t_flush = std::time::Instant::now();
-                    for w in &mut shard_writers {
-                        if let Some(writer) = w.as_mut() {
-                            if let Err(e) = writer.flush() {
-                                *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                    Some(format!("flush rank shard: {e}"));
-                            }
-                        }
-                        *w = None;
-                    }
-                    #[allow(clippy::cast_possible_truncation)]
-                    s1b_flush_ref.fetch_add(t_flush.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
-
-                    actual_ref.fetch_add(1, Relaxed);
-                    worker_counts_ref.lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(entry_counts);
-                });
-            }
-
-            Ok(())
-        })?;
-    }
-
-    if let Some(e) = pass_b_error.into_inner().unwrap_or(None) {
-        return Err(e.into());
-    }
-
-    let num_actual_workers = actual_num_workers.load(std::sync::atomic::Ordering::Relaxed);
-
-    let all_counts = worker_counts.into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut merged_counts = vec![0u64; NUM_BUCKETS];
-    for counts in &all_counts {
-        for (i, &c) in counts.iter().enumerate() {
-            merged_counts[i] += c;
-        }
-    }
-
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("s1b_pread_ms", s1b_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1b_decompress_ms", s1b_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1b_scan_ms", s1b_scan_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1b_rank_ms", s1b_rank_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1b_encode_write_ms", s1b_encode_write_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1b_flush_ms", s1b_flush_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1b_refs_total", s1b_refs_total.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1b_bytes_written", s1b_bytes_written.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1b_bytes_read", s1b_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1b_shard_write_calls", s1b_shard_write_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1b_pread_calls", s1b_pread_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1b_blobs", schedule.len() as i64);
-        crate::debug::emit_counter("s1b_actual_workers", num_actual_workers as i64);
-    }
-    crate::debug::emit_marker("EXTJOIN_S1_PASS_B_END");
-
-    // Build the per-blob rank mapping (header-only walk + rank queries -
-    // no decompression).
-    let node_blob_mapping = build_node_blob_mapping(blob_meta, &node_id_set)?;
+    // Build the per-blob mapping (header-only walk - no decompression).
+    let node_blob_mapping = build_node_blob_mapping(blob_meta)?;
 
     Ok(Stage1Output {
         total_slots: total_refs,
-        unique_nodes: unique_nodes_u64,
-        rank_bucket_counts: merged_counts,
         id_bucket_counts,
-        num_shard_workers: num_actual_workers,
-        node_id_set,
+        num_shard_workers: num_workers,
         node_blob_mapping,
     })
 }

@@ -53,10 +53,6 @@ use stage2::{stage2_node_join, SlotBuckets};
 use stage3::{stage3_slot_reorder, IntegratedInputs, SlotBucketRef};
 use stage4::stage4_assembly;
 
-/// Maximum node ID in current OSM data. Used to compute bucket ranges.
-/// 14B gives headroom above the current ~13B maximum.
-pub(super) const MAX_NODE_ID: u64 = 14_000_000_000;
-
 /// Width (in node-id space) of one ID bucket.
 ///
 /// `bucket_width = ceil(max_node_id / num_buckets)`, with a floor of 1
@@ -480,9 +476,6 @@ pub(super) fn raise_nofile_to_hard_cap() -> FdBudget {
     }
 }
 
-/// Size of a rank-occurrence record: `(local_rank: u32, slot_pos: u64)` = 12 bytes.
-pub(super) const RANK_RECORD_SIZE: usize = 12;
-
 /// Size of an id-bucketed occurrence record:
 /// `(local_node_id: u32, blob_idx: u32, blob_local_slot: u32)` = 12 bytes.
 pub(super) const ID_RECORD_SIZE: usize = 12;
@@ -506,55 +499,17 @@ pub(super) const COORD_SLOT_SIZE: usize = 8;
 pub(super) struct NodeBlobInfo {
     pub data_offset: u64,
     pub data_size: usize,
-    /// Rank-index path bookkeeping. Unused after A1 step 3 - stage 2
-    /// reads min_id/max_id instead. Step 4 deletes these along with
-    /// pass B and the rank machinery.
-    #[allow(dead_code)]
-    pub ref_rank_start: u64,
-    #[allow(dead_code)]
-    pub ref_rank_end: u64,
     /// Indexdata-advertised id range, copied straight from blob_meta.
-    /// Used by stage 2 (A1 step 3+) to find blobs intersecting an ID
-    /// bucket. Validated at construction (`max_id >= min_id`,
-    /// `min_id >= 0`); pass A's `BucketLayout` is derived from the
-    /// per-run max of `max_id` across node blobs.
+    /// Stage 2 partitions the slice by `[min_id, max_id]` to find
+    /// blobs intersecting each id bucket; stage 2's merge walk uses
+    /// `node_tuples.last().id` (the actual decoded last id) as the
+    /// upper consumption bound rather than `max_id` itself, so loose
+    /// indexdata can't cause silent record loss.
     pub min_id: i64,
     pub max_id: i64,
 }
 
-impl NodeBlobInfo {
-    /// Rank-index-derived ref count. Unused after A1 step 3; deleted
-    /// in step 4 alongside the rank fields.
-    #[allow(dead_code)]
-    pub fn ref_count(&self) -> u64 {
-        self.ref_rank_end - self.ref_rank_start
-    }
-}
-
-/// A rank-bucketed occurrence record. `local_rank` is the rank offset
-/// within the bucket (`global_rank - bucket_rank_start`), stored as u32
-/// (max ~40M entries per bucket at planet, well under u32::MAX).
-/// `slot_pos` is the linear position within the conceptual flat coord
-/// stream (way_order × ref_order); stage 3 emits these as per-blob
-/// delta-varint payloads in `coord_payloads` rather than a flat array.
-///
-/// 12 bytes instead of 16: 25% I/O reduction across stages 1B and 2.
-#[derive(Clone, Copy)]
-pub(super) struct RankRecord {
-    local_rank: u32,
-    slot_pos: u64,
-}
-
-impl RankRecord {
-    fn write_to(&self, buf: &mut [u8; RANK_RECORD_SIZE]) {
-        buf[..4].copy_from_slice(&self.local_rank.to_le_bytes());
-        buf[4..12].copy_from_slice(&self.slot_pos.to_le_bytes());
-    }
-}
-
-/// An id-bucketed occurrence record emitted by stage 1 pass A's
-/// IdRecord path (A1 step 2). Replaces `RankRecord` once A1 step 4
-/// deletes pass B.
+/// An id-bucketed occurrence record emitted by stage 1 pass A.
 ///
 /// `(local_node_id, blob_idx, blob_local_slot)` is the parallel-safe
 /// decomposition of the audit's `(local_node_id, slot_pos)` form: stage
@@ -851,34 +806,20 @@ pub fn external_join(
     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     let (s1_minflt_after, s1_majflt_after) = crate::debug::read_page_faults();
-    let total_coo: u64 = stage1_out.rank_bucket_counts.iter().sum();
+    let total_id_records: u64 = stage1_out.id_bucket_counts.iter().sum();
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("extjoin_total_slots", stage1_out.total_slots as i64);
-        crate::debug::emit_counter("extjoin_total_coo", total_coo as i64);
-        crate::debug::emit_counter("extjoin_unique_nodes", stage1_out.unique_nodes as i64);
+        crate::debug::emit_counter("extjoin_total_id_records", total_id_records as i64);
         crate::debug::emit_counter("s1_minflt_delta", (s1_minflt_after - s1_minflt_before) as i64);
         crate::debug::emit_counter("s1_majflt_delta", (s1_majflt_after - s1_majflt_before) as i64);
     }
     crate::debug::emit_marker("EXTJOIN_STAGE1_END");
 
     let total_slots = stage1_out.total_slots;
-    // Step 4 deletes pass B; until then we still log unique_nodes /
-    // rank_bucket_counts via the existing counters but stage 2 reads
-    // id_bucket_counts.
-    let _unique_nodes = stage1_out.unique_nodes;
-    let _rank_bucket_counts = stage1_out.rank_bucket_counts;
     let id_bucket_counts = stage1_out.id_bucket_counts;
     let num_shard_workers = stage1_out.num_shard_workers;
-    let mut node_id_set = stage1_out.node_id_set;
     let node_blob_mapping = stage1_out.node_blob_mapping;
-
-    // Stage 2 only needs membership bits (`get()`) now that per-node
-    // `rank_if_set()` is replaced by a blob-local rank counter seeded from
-    // `NodeBlobInfo.ref_rank_start`. Drop the rank-prefix metadata (~100 MB
-    // at planet scale) before stage 2 starts so it doesn't pollute cache
-    // through the hot decode loop.
-    node_id_set.drop_rank_index();
 
     // Compute slot_bucket_count: scale down from NUM_BUCKETS so that
     // every bucket can fit at least one full blob's slot range. This
@@ -908,14 +849,14 @@ pub fn external_join(
         .checked_div(max_blob_slots)
         .map(|n| n.max(1).min(NUM_BUCKETS as u64) as usize)
         .unwrap_or(NUM_BUCKETS);
-    let total_rank_shard_files = num_shard_workers * NUM_BUCKETS;
+    let total_id_shard_files = num_shard_workers * NUM_BUCKETS;
     #[allow(clippy::cast_possible_wrap)]
     {
-        crate::debug::emit_counter("extjoin_rank_bucket_count", NUM_BUCKETS as i64);
+        crate::debug::emit_counter("extjoin_id_bucket_count", NUM_BUCKETS as i64);
         crate::debug::emit_counter("extjoin_slot_bucket_count", slot_bucket_count as i64);
         crate::debug::emit_counter("extjoin_max_blob_slots", max_blob_slots as i64);
         crate::debug::emit_counter("extjoin_num_shard_workers", num_shard_workers as i64);
-        crate::debug::emit_counter("extjoin_total_rank_shard_files", total_rank_shard_files as i64);
+        crate::debug::emit_counter("extjoin_total_id_shard_files", total_id_shard_files as i64);
     }
 
     crate::debug::emit_marker("EXTJOIN_STAGE2_START");
@@ -939,11 +880,14 @@ pub fn external_join(
     )?;
     slot_buckets.finish()?;
     let (s2_minflt_after, s2_majflt_after) = crate::debug::read_page_faults();
+    // Reclaim id-shard scratch (workers × NUM_BUCKETS files;
+    // 80+ GB at planet) before the heavier stage 3/4 streaming
+    // handoff allocates its own tmp space.
     for worker_id in 0..num_shard_workers {
         for bucket_idx in 0..NUM_BUCKETS {
             let path = scratch_dir
                 .path
-                .join(format!("rank-W{worker_id}-{bucket_idx:03}"));
+                .join(format!("id-W{worker_id}-{bucket_idx:03}"));
             drop(std::fs::remove_file(&path));
         }
     }
@@ -955,9 +899,7 @@ pub fn external_join(
     }
     crate::debug::emit_marker("EXTJOIN_STAGE2_END");
 
-    // Free the IdSet (~2 GB RSS at planet) and the per-blob mapping
-    // - both were stage 2 inputs only, nothing downstream reads them.
-    drop(node_id_set);
+    // Free the per-blob mapping - it was a stage 2 input only.
     drop(node_blob_mapping);
 
     // Prepare inputs for the streaming stage 3 + stage 4 handoff.

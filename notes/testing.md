@@ -32,12 +32,14 @@ surface audit that drove the reorg plan below.
   not break integration tests. Today 18 of 30 `tests/*.rs` import
   internal command entrypoints or nested submodules and would need
   edits under any such rewrite. Conversion in progress.
-- **Validation tiering:** open design item. The `cli_sort.rs` pilot proves
-  the CLI boundary works, but wholesale conversion of every old test into
-  the default `brokkr check` sweep is the wrong scaling model. Keep the
-  decoupled boundary; split fast command contracts from exhaustive,
-  platform-specific, and planet-scale gates. External cross-validation
-  lives in `brokkr verify`, not the in-tree test suite.
+- **Validation tiering:** `cli_sort.rs` re-split by tier intent
+  landed (2026-04-25): osmium check `#[ignore = "external"]` (escape
+  hatch), `--direct-io` / `--io-uring` variants in `mod platform`,
+  fast contracts at file root. The `cli_sort.rs` shape is now the
+  template for new `cli_*.rs` files. Wholesale conversion of every
+  old test into the default `brokkr check` sweep is the wrong
+  scaling model. External cross-validation lives in `brokkr verify`,
+  not the in-tree test suite.
 
 ## Reorg: CLI-decoupled integration tests
 
@@ -117,10 +119,15 @@ Each command should be split by test intent:
   See "External cross-validation" below for the offload rationale and
   migration plan.
 
-`tests/cli_sort.rs` is the pilot, not the final template. Its fast
-sort fixtures are valid Tier 1 material. The osmium cross-check,
-platform variants, and ignored io_uring case should be split out before
-copying the pattern to apply-changes, diff, extract, or ALTW.
+`tests/cli_sort.rs` has been re-split by tier intent (2026-04-25).
+The fast sort-contract tests stay at file root (Tier 1). The osmium
+cross-check carries `#[ignore = "external"]` as the documented
+escape-hatch convention until it migrates to `brokkr verify`. The
+two platform variants (`--direct-io`, `--io-uring`) live inside
+`#[cfg(any(...))] mod platform { ... }` so the brokkr platform
+profile (T11) can target them via `cargo test platform::`. New
+`cli_*.rs` files for apply-changes, diff, extract, ALTW follow the
+same shape.
 
 **Known harness gap:** CLI binary feature parity across test sweeps
 is a brokkr-side concern, not a pbfhogg one. See

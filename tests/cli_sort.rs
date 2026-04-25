@@ -390,10 +390,20 @@ fn sort_already_sorted() {
 }
 
 /// Cross-validate pbfhogg sort against osmium sort on the same
-/// handcrafted fixture. Skipped if osmium is not installed.
-/// Complements `brokkr verify sort` which uses real datasets -
-/// this pins per-element equivalence on overlapping-blob input.
+/// handcrafted overlapping-blob fixture.
+///
+/// **Escape hatch**, `#[ignore = "external"]`d. External
+/// cross-validation lives in `brokkr verify`, not the in-tree
+/// suite (see `notes/testing.md` > "External cross-validation").
+/// `brokkr verify sort` already covers the real-dataset case;
+/// this fixture is the pathological overlap-run input that
+/// real Denmark data does not exercise. Migration target: when
+/// `brokkr verify sort` grows `--input <path>`, build the fixture
+/// in `examples/overlapping_fixture.rs` and retire this test.
+/// Skip-on-missing-osmium kept so the test still passes if
+/// invoked via `--include-ignored` on a host without osmium.
 #[test]
+#[ignore = "external"]
 fn sort_cross_validate_osmium() {
     let osmium_check = std::process::Command::new("osmium").arg("--version").output();
     if osmium_check.is_err() {
@@ -625,104 +635,116 @@ fn sort_preserves_historical_information_feature() {
 }
 
 // ---------------------------------------------------------------------------
-// O_DIRECT variant
+// Platform tier
 // ---------------------------------------------------------------------------
+//
+// Tests that exercise platform-gated CLI flags (`--direct-io`,
+// `--io-uring`). Wrapped in `mod platform` so the brokkr platform
+// profile (T11) can target them via `cargo test platform::` without
+// also pulling in the rest of the file. They run today under
+// `--all-features` because that builds both the library AND the CLI
+// binary with the features on; the binary/library feature-parity
+// issue in `notes/testing-cli-feature-parity.md` becomes
+// load-bearing once these are invoked via a profile that requests
+// them specifically.
 
-/// `--direct-io` on a filesystem that supports O_DIRECT must produce
-/// the same sorted output as the default path. Skipped (via stderr
-/// inspection) on filesystems that reject O_DIRECT with EINVAL.
-#[cfg(feature = "linux-direct-io")]
-#[test]
-fn sort_overlapping_blobs_direct_io() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let input = dir.path().join("overlapping.osm.pbf");
-    let output = dir.path().join("sorted.osm.pbf");
+#[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
+mod platform {
+    use super::*;
 
-    write_unsorted_overlapping_pbf(&input);
+    /// `--direct-io` on a filesystem that supports O_DIRECT must
+    /// produce the same sorted output as the default path. Skipped
+    /// (via stderr inspection) on filesystems that reject O_DIRECT
+    /// with EINVAL.
+    #[cfg(feature = "linux-direct-io")]
+    #[test]
+    fn sort_overlapping_blobs_direct_io() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = dir.path().join("overlapping.osm.pbf");
+        let output = dir.path().join("sorted.osm.pbf");
 
-    let run = CliInvoker::new()
-        .arg("sort")
-        .arg(&input)
-        .arg("-o")
-        .arg(&output)
-        .arg("--direct-io")
-        .arg("--force")
-        .run();
+        write_unsorted_overlapping_pbf(&input);
 
-    if run.is_o_direct_unsupported() {
-        eprintln!("O_DIRECT not supported on this filesystem, skipping test");
-        return;
+        let run = CliInvoker::new()
+            .arg("sort")
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .arg("--direct-io")
+            .arg("--force")
+            .run();
+
+        if run.is_o_direct_unsupported() {
+            eprintln!("O_DIRECT not supported on this filesystem, skipping test");
+            return;
+        }
+        assert!(
+            run.status.success(),
+            "sort --direct-io failed unexpectedly; stderr:\n{}",
+            run.stderr_str(),
+        );
+
+        let contents = read_all_elements_with_coords(&output);
+        assert_eq!(contents.nodes.len(), 10);
+        assert_eq!(contents.ways.len(), 2);
+        assert_eq!(contents.relations.len(), 1);
+        assert_sorted(&contents);
+        assert!(read_header(&output).is_sorted(), "output missing Sort.Type_then_ID");
+
+        let node_ids: Vec<i64> = contents.nodes.iter().map(|(id, _, _, _)| *id).collect();
+        assert_eq!(node_ids, (1..=10).collect::<Vec<_>>());
+
+        #[allow(clippy::cast_possible_truncation)]
+        for (id, lat, lon, _) in &contents.nodes {
+            assert_eq!(*lat, *id as i32 * 1_000_000);
+            assert_eq!(*lon, *id as i32 * 2_000_000);
+        }
     }
-    assert!(
-        run.status.success(),
-        "sort --direct-io failed unexpectedly; stderr:\n{}",
-        run.stderr_str(),
-    );
 
-    let contents = read_all_elements_with_coords(&output);
-    assert_eq!(contents.nodes.len(), 10);
-    assert_eq!(contents.ways.len(), 2);
-    assert_eq!(contents.relations.len(), 1);
-    assert_sorted(&contents);
-    assert!(read_header(&output).is_sorted(), "output missing Sort.Type_then_ID");
+    #[cfg(feature = "linux-io-uring")]
+    #[test]
+    #[ignore = "pre-existing io_uring writer bug for small outputs; see TODO.md"]
+    fn sort_overlapping_blobs_uring() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = dir.path().join("overlapping.osm.pbf");
+        let output = dir.path().join("sorted.osm.pbf");
 
-    let node_ids: Vec<i64> = contents.nodes.iter().map(|(id, _, _, _)| *id).collect();
-    assert_eq!(node_ids, (1..=10).collect::<Vec<_>>());
+        write_unsorted_overlapping_pbf(&input);
 
-    #[allow(clippy::cast_possible_truncation)]
-    for (id, lat, lon, _) in &contents.nodes {
-        assert_eq!(*lat, *id as i32 * 1_000_000);
-        assert_eq!(*lon, *id as i32 * 2_000_000);
-    }
-}
+        let run = CliInvoker::new()
+            .arg("sort")
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .arg("--io-uring")
+            .arg("--force")
+            .run();
 
-// ---------------------------------------------------------------------------
-// io_uring variant
-// ---------------------------------------------------------------------------
+        if run.is_uring_unsupported() {
+            eprintln!("io_uring not available, skipping test");
+            return;
+        }
+        assert!(
+            run.status.success(),
+            "sort --io-uring failed unexpectedly; stderr:\n{}",
+            run.stderr_str(),
+        );
 
-#[cfg(feature = "linux-io-uring")]
-#[test]
-#[ignore = "pre-existing io_uring writer bug for small outputs; see TODO.md"]
-fn sort_overlapping_blobs_uring() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let input = dir.path().join("overlapping.osm.pbf");
-    let output = dir.path().join("sorted.osm.pbf");
+        let contents = read_all_elements_with_coords(&output);
+        assert_eq!(contents.nodes.len(), 10);
+        assert_eq!(contents.ways.len(), 2);
+        assert_eq!(contents.relations.len(), 1);
+        assert_sorted(&contents);
+        assert!(read_header(&output).is_sorted(), "output missing Sort.Type_then_ID");
 
-    write_unsorted_overlapping_pbf(&input);
+        let node_ids: Vec<i64> = contents.nodes.iter().map(|(id, _, _, _)| *id).collect();
+        assert_eq!(node_ids, (1..=10).collect::<Vec<_>>());
 
-    let run = CliInvoker::new()
-        .arg("sort")
-        .arg(&input)
-        .arg("-o")
-        .arg(&output)
-        .arg("--io-uring")
-        .arg("--force")
-        .run();
-
-    if run.is_uring_unsupported() {
-        eprintln!("io_uring not available, skipping test");
-        return;
-    }
-    assert!(
-        run.status.success(),
-        "sort --io-uring failed unexpectedly; stderr:\n{}",
-        run.stderr_str(),
-    );
-
-    let contents = read_all_elements_with_coords(&output);
-    assert_eq!(contents.nodes.len(), 10);
-    assert_eq!(contents.ways.len(), 2);
-    assert_eq!(contents.relations.len(), 1);
-    assert_sorted(&contents);
-    assert!(read_header(&output).is_sorted(), "output missing Sort.Type_then_ID");
-
-    let node_ids: Vec<i64> = contents.nodes.iter().map(|(id, _, _, _)| *id).collect();
-    assert_eq!(node_ids, (1..=10).collect::<Vec<_>>());
-
-    #[allow(clippy::cast_possible_truncation)]
-    for (id, lat, lon, _) in &contents.nodes {
-        assert_eq!(*lat, *id as i32 * 1_000_000);
-        assert_eq!(*lon, *id as i32 * 2_000_000);
+        #[allow(clippy::cast_possible_truncation)]
+        for (id, lat, lon, _) in &contents.nodes {
+            assert_eq!(*lat, *id as i32 * 1_000_000);
+            assert_eq!(*lon, *id as i32 * 2_000_000);
+        }
     }
 }
 

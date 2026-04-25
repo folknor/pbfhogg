@@ -5,42 +5,51 @@ that have come out of the pbfhogg testing reorg (see
 `notes/testing.md`, 2026-04-25). It is intended to be delivered
 directly to the brokkr maintainer as a self-contained handoff.
 
-Each request is independent; implement in any order. The pbfhogg
-side has working fallbacks for everything except request 1 (test
-profiles), so this is not a blocker - but every item simplifies
-pbfhogg test infrastructure and removes a piece of in-tree
-workaround.
+## Status (2026-04-25)
+
+All five requests landed 2026-04-25 across brokkr commits `f7a96b7`,
+`2235792`, and `b3aa444`. The final config shape is `[[check]]`
+array entries (one (clippy + test) sweep with optional
+`build_packages`) plus `[test.profiles.*]` that reference `[[check]]`
+entries by name and layer libtest filters on top. The
+`[test.sweeps.*]` map proposed in earlier drafts of this document is
+rejected at parse time - sweeps now live in `[[check]]`. Pbfhogg's
+`brokkr.toml` migrated the same day, and `tests/common/cli.rs`
+reads `BROKKR_TEST_BIN_DIR` so CliInvoker hits the correct bin per
+sweep without `cfg!(debug_assertions)` guessing.
 
 ## Requests at a glance
 
-1. **Validation profiles via Rust module paths.** Map `cargo test`
-   shapes to named profiles defined in `brokkr.toml`, using
-   `mod tier2`, `mod platform`, `mod serial` as the annotation
+1. **Validation profiles via Rust module paths.** [LANDED] Map
+   `cargo test` shapes to named profiles defined in `brokkr.toml`,
+   using `mod tier2`, `mod platform`, `mod serial` as the annotation
    surface. Replaces the current "either run `brokkr check` or
-   `cargo test -- --ignored` and hope" model. Largest item; unlocks
-   the entire tiering story.
+   `cargo test -- --ignored` and hope" model.
 
-2. **Feature-aware test sweeps that rebuild the CLI binary.**
+2. **Feature-aware test sweeps that rebuild the CLI binary.** [LANDED]
    `cargo test -p pbfhogg --no-default-features` does not rebuild
-   `pbfhogg-cli` with matching features. Result: consumer-sweep
-   CLI tests invoke an all-features binary and silently miss the
-   feature-off behaviour they were meant to pin. Add a CLI build
-   step per sweep with matching features.
+   `pbfhogg-cli` with matching features. Solved via `build_packages`
+   on `[[check]]` entries.
 
-3. **`brokkr verify <command> --input <path>`.** Accept an
+3. **`brokkr verify <command> --input <path>`.** [LANDED] Accept an
    explicit fixture path so pbfhogg-built pathological fixtures
    (handcrafted overlapping-blob PBFs, etc.) can be cross-validated
-   against osmium / osmosis / osmconvert. Currently `brokkr verify`
-   only takes datasets from the configured `[datasets.<region>.*]`
-   tables.
+   against osmium / osmosis / osmconvert.
 
-4. **`verify_merge` delete-set tolerance.** Osmium and pbfhogg
-   disagree on apply-changes delete semantics (version-based vs
-   unconditional). Element-strict diff in `verify_merge.rs` flags
-   osmium-only elements as failures even when those elements are
-   in the input OSC's delete set. Add the carve-out so legitimate
-   semantic differences are not reported as cross-validation
-   regressions.
+4. **`verify_merge` delete-set tolerance.** [LANDED] Osmium and
+   pbfhogg disagree on apply-changes delete semantics (version-based
+   vs unconditional). Solved via the four-bucket classification in
+   `verify_merge.rs` that exempts osmium-only IDs in the input OSC's
+   delete set.
+
+5. **Test bin directory env var.** [LANDED] Brokkr exports
+   `BROKKR_TEST_BIN_DIR=<target>/<profile>` per sweep so test code
+   (CliInvoker) doesn't have to guess between `debug/` and `release/`
+   via `cfg!(debug_assertions)`. The cfg heuristic conflates the test
+   binary's profile with the bin target's profile and isn't reliable.
+   Brokkr commit `b3aa444`. pbfhogg's `tests/common/cli.rs` reads it
+   first; the cfg-based path stays as a fallback for plain
+   `cargo test` invocations.
 
 ---
 
@@ -122,59 +131,78 @@ mod serial {
 must never run accidentally (serial-only, platform-only on
 unsupported hosts). It is no longer the tier label.
 
-### Proposed `brokkr.toml` shape
+### Landed `brokkr.toml` shape
+
+The brokkr-side design landed in commit `2235792` consolidates sweeps
+under `[[check]]` (which drives both clippy and test phases), with
+profiles in `[test.profiles.*]` referencing those sweeps by name.
+Pbfhogg's actual config:
 
 ```toml
-[test]
-default_package = "pbfhogg"
-default_profile = "tier1"
-
-[test.sweeps.all]
-features = "all"
+[[check]]
+name = "all"
+features = ["test-hooks", "linux-direct-io", "linux-io-uring"]
 build_packages = ["pbfhogg-cli"]
 
-[test.sweeps.consumer]
+[[check]]
+name = "consumer"
 no_default_features = true
 features = ["commands"]
 build_packages = ["pbfhogg-cli"]
 
+[test]
+default_package = "pbfhogg"
+default_profile = "tier1"
+
 [test.profiles.tier1]
-description = "Fast edit loop used by brokkr check (tier 1)"
 sweeps = ["all", "consumer"]
 skip = ["tier2::", "tier3::", "platform::", "serial::"]
 include_ignored = false
 
-# Tier 2 = command slice. One profile per command surface, each
-# extending tier1 with that command's `mod tier2 { ... }` cell.
-# Add similar profiles for `extract`, `add-locations-to-ways`,
-# `apply-changes`, etc., as those command surfaces grow tier-2
-# matrices.
 [test.profiles.sort]
-description = "Tier 2: expanded sort command tests"
 extends = "tier1"
 tests = ["cli_sort"]
 skip = ["platform::", "serial::"]
 
 [test.profiles.full]
-description = "Tier 3: all in-project correctness tests"
 sweeps = ["all"]
 skip = ["platform::"]
 include_ignored = true
 
 [test.profiles.platform]
-description = "Platform-sensitive tests"
 sweeps = ["all"]
 only = ["platform::"]
 include_ignored = true
 env = { BROKKR_TEST_PLATFORM = "1" }
 
 [test.profiles.serial]
-description = "Serial/fault-injection tests"
 sweeps = ["all"]
 only = ["serial::"]
 include_ignored = true
 test_threads = 1
 ```
+
+Notes on the landed shape vs earlier drafts:
+
+- `features = "all"` sentinel is rejected. Enumerate explicitly so
+  adding a new feature to `Cargo.toml` doesn't silently broaden the
+  test sweep. `commands` doesn't appear in the `all` sweep because
+  pbfhogg's `default = ["commands"]` already enables it whenever
+  `no_default_features` is false (and `commands` is not a
+  `pbfhogg-cli` feature, so listing it would break the build_packages
+  step - see request 2 below).
+- The `consumer` sweep carries a no-op `commands = []` feature on
+  `pbfhogg-cli` (added 2026-04-25) so brokkr can apply
+  `--features commands` symmetrically to both crates without the CLI
+  rejecting the unknown feature. The CLI's lib dep already always
+  pulls in `pbfhogg/commands`; the no-op feature is purely a
+  brokkr-symmetry concession.
+- `hotpath` is deliberately absent from the `all` sweep, because
+  enabling `hotpath` turns `#[hotpath::measure]` into runtime
+  measurement that emits a banner to stdout at process exit and
+  contaminates stdout-output commands like `pbfhogg diff` under
+  integration tests. Production users opt in via
+  `brokkr <cmd> --hotpath`.
 
 ### Proposed command surface
 
@@ -341,62 +369,37 @@ profile's test steps. That keeps `CliInvoker` tests honest without
 requiring each individual test to understand cargo workspace
 feature resolution.
 
-### What this unblocks
+### What this unblocked (landed 2026-04-25)
 
-Once brokkr guarantees binary/library feature parity per sweep:
-
-- Restore the two `feature_missing_error` tests in `cli_sort.rs`
-  (negative tests: `--direct-io` must fail with a clear message
-  when the feature is absent), but place them in the platform
-  tier (`mod platform`) rather than the default tier 1 sweep.
-- Same pattern becomes safe for every other command with
-  feature-gated flags: `cli_apply_changes.rs`, `cli_altw.rs`,
-  `cli_cat.rs`, etc.
+- `tests/cli_sort.rs::sort_direct_io_feature_missing_error` and
+  `sort_io_uring_feature_missing_error` restored at file root,
+  gated on `cfg(not(feature = "linux-direct-io"))` /
+  `cfg(not(feature = "linux-io-uring"))`. They run under the
+  `consumer` sweep (whose `build_packages = ["pbfhogg-cli"]`
+  rebuilds the CLI without those features) and are excluded by
+  cfg in the `all` sweep. Placed at file root, not in `mod
+  platform`, because tier1 already runs the consumer sweep -
+  putting them under `platform::` would mean they only run via
+  `--profile platform` against an `all`-built binary, which is
+  the wrong shape.
+- Same pattern is now safe for every other command with
+  feature-gated flags: `cli_apply_changes.rs`, `cli_altw.rs`
+  (when it lands), `cli_cat.rs`, etc. Apply when needed.
 - The positive `_direct_io` / `_uring` tests
-  (`sort_overlapping_blobs_*` and equivalents) become genuinely
-  correct instead of accidentally-correct. They still need
-  deterministic skip handling for unsupported filesystems,
-  kernels, and MEMLOCK limits - covered on the pbfhogg side by
-  `CliOutput::is_o_direct_unsupported` /
-  `is_uring_unsupported` predicates that match the CLI's actual
-  error strings.
+  (`sort_overlapping_blobs_*` and equivalents in `mod platform`)
+  are genuinely correct now: under `--profile platform` the
+  `all` sweep rebuilds the CLI with the linux features on. Skip
+  handling for unsupported filesystems, kernels, and MEMLOCK
+  limits stays via `CliOutput::is_o_direct_unsupported` /
+  `is_uring_unsupported`.
 
-### Fallback without brokkr changes
+### Fallback (no longer in use)
 
-If the brokkr change is deferred, the invariant "feature-off
-build errors cleanly instead of silently falling back" is
-restored on the pbfhogg side with inline unit tests inside
-`src/commands/mod.rs`:
-
-```rust
-#[cfg(all(test, not(feature = "linux-direct-io")))]
-mod feature_gate_tests {
-    use super::*;
-
-    #[test]
-    fn writer_for_cli_rejects_direct_io_without_feature() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("out.pbf");
-        let result = writer_for_cli(
-            &path,
-            Compression::default(),
-            &[],
-            /* direct_io */ true,
-            /* io_uring  */ false,
-        );
-        let err = result.expect_err("must error without linux-direct-io");
-        assert!(err.to_string().contains("direct-io"));
-    }
-
-    // And symmetric cases for io_uring in writer_for_cli +
-    // writer_for_apply_changes.
-}
-```
-
-Four inline tests, ~40 lines total, no infrastructure changes.
-Covers the library-side invariant but does not exercise the
-clap-parse to library-call route through the CLI binary - which
-is exactly the surface request 2 makes testable.
+Earlier drafts proposed inline unit tests in `src/commands/mod.rs`
+under `#[cfg(all(test, not(feature = "...")))]` as a fallback in
+case brokkr's binary-rebuild support was deferred. Not needed - the
+brokkr-side fix landed and the CLI-level integration tests
+exercise the full clap-parse to library-call route.
 
 ---
 
@@ -579,3 +582,60 @@ Once this lands, `tests/merge.rs::merge_cross_validate_osmium`
 becomes redundant with `brokkr verify merge` and gets retired
 on the pbfhogg side. Until then it stays as an in-tree
 escape-hatch test.
+
+---
+
+## 5. Test bin directory env var
+
+### Problem
+
+`tests/common/cli.rs::pbfhogg_bin()` (CliInvoker) needs to find
+the compiled `pbfhogg` binary that brokkr's `build_packages` step
+just produced. The previous shape composed the path from
+`CARGO_TARGET_DIR + (debug|release based on cfg!(debug_assertions))`.
+That heuristic broke 2026-04-25 during the consumer-sweep
+feature_missing test work: the test crate ended up compiled with
+`debug_assertions = false` (no `[profile.test]` overrides in
+`Cargo.toml`, no `--release` in the brokkr trace - root cause not
+traced), so `cfg!(debug_assertions)` returned false, the helper
+looked under `release/`, and found a stale all-features binary
+instead of the consumer-build binary brokkr had just placed in
+`debug/`. Symptom: feature_missing tests asserted that
+`pbfhogg sort --direct-io` would error, but the test invocation
+hit the all-features binary and saw `--direct-io` succeed.
+
+The deeper issue is that `cfg!(debug_assertions)` conflates two
+profiles that don't have to match: the test-crate profile and the
+bin-target profile. brokkr is the authoritative source for "which
+profile is the bin under" because brokkr just ran the build.
+
+### Landed shape (brokkr commit `b3aa444`, 2026-04-25)
+
+Brokkr exports `BROKKR_TEST_BIN_DIR=<target_dir>/<profile>` on every
+cargo test invocation:
+
+- `brokkr check` test phase: `<target>/debug` (no `--release`).
+- `brokkr test`: `<target>/release` (always `--release`).
+- `target_dir` resolved once per run via `cargo metadata --no-deps`.
+- Set on every sweep, including when `build_packages` is empty.
+
+Pbfhogg-side, `pbfhogg_bin()` (in `tests/common/cli.rs`) reads the
+var first and falls back to the existing CARGO_TARGET_DIR +
+heuristic when it's absent. The fallback covers plain
+`cargo test` runs that don't go through brokkr.
+
+### Decision: skip `BROKKR_TEST_PROFILE`
+
+brokkr offered to also export `BROKKR_TEST_PROFILE=debug|release`
+for completeness. Declined - `cfg!(debug_assertions)` already
+gives test code that information for normal runs, and adding a
+permanent env-var surface to fix the rare case where it lies isn't
+worth the surface bump. Tests that need to skip "when release"
+should keep using `cfg!(debug_assertions)` directly.
+
+### Interim fallback (no longer in use)
+
+Before brokkr's commit `b3aa444` landed, `pbfhogg_bin()` used an
+mtime-based fallback: check both `debug/pbfhogg` and `release/pbfhogg`,
+pick whichever was modified more recently. Removed once
+`BROKKR_TEST_BIN_DIR` shipped and the env-var path became reliable.

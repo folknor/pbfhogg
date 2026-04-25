@@ -272,7 +272,29 @@ impl CliOutput {
 
 /// Locate the compiled `pbfhogg` binary. Panics with a helpful
 /// message if the binary is not present.
+///
+/// Resolution order:
+///   1. `BROKKR_TEST_BIN_DIR` env var (set by `brokkr check` and
+///      `brokkr test` per sweep, points at `<target>/<profile>`).
+///      Authoritative whenever brokkr drives the run, including
+///      sweeps with empty `build_packages`.
+///   2. `CARGO_TARGET_DIR` (or `CARGO_MANIFEST_DIR/target`) plus
+///      `cfg!(debug_assertions)` for plain `cargo test` runs.
+///      The cfg heuristic conflates the test crate's profile with
+///      the bin target's profile, so it can pick the wrong subdir;
+///      brokkr-driven runs avoid this via path 1.
 fn pbfhogg_bin() -> PathBuf {
+    if let Some(d) = std::env::var_os("BROKKR_TEST_BIN_DIR") {
+        let bin = PathBuf::from(d).join("pbfhogg");
+        assert!(
+            bin.exists(),
+            "pbfhogg binary not found at {} (from BROKKR_TEST_BIN_DIR). \
+             The brokkr sweep should have built it; check the sweep's \
+             build_packages config.",
+            bin.display(),
+        );
+        return bin;
+    }
     let target = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));

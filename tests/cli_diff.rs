@@ -112,7 +112,7 @@ fn run_diff_failing(old: &Path, new: &Path) -> common::cli::CliOutput {
         .arg("diff")
         .arg(old)
         .arg(new)
-        .arg("--summary")
+        .arg("--osmium-summary")
         .run()
 }
 

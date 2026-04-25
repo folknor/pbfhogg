@@ -214,6 +214,73 @@ gated probes.
 
 ---
 
+## Test-coverage audit, 2026-04-25
+
+Before starting any of A1-A4 this audits inline `#[cfg(test)] mod tests`
+coverage across `src/commands/altw/external/` against the development
+contract in `notes/testing.md`: tier 1 must be structurally complete
+for `brokkr check` green to be a real signal during refactor.
+
+**Inline coverage today.**
+
+- `coord_payloads.rs`: 11 tests covering the per-way refcount sidecar
+  codec (`parse_per_way_refcount_sidecar_bytes`, `encode_blob_payload`)
+  across single-way, multi-way, multi-blob, zero-coord, negative-coord,
+  length-mismatch cases.
+- `blob_bucket_index.rs`: 9 tests covering `classify_blobs_in_bucket`
+  (empty, fully-contained, half-overlap, multi-blob, boundary,
+  exact-match, last-blob-uses-total-slots, oversized-error).
+- `mod.rs`, `blob_meta.rs`, `radix.rs`, `relation_scan.rs`, `stage1.rs`,
+  `stage2.rs`, `stage3.rs`, `stage4.rs`: zero inline tests. ~150 KB of
+  internal logic with no unit coverage.
+
+**A1 rewrite surface vs coverage.**
+
+| What A1 changes | Covered? |
+|---|---|
+| Deletes pass B (second way scan) | n/a - deletion |
+| Deletes `IdSetDense::{rank, count_below, build_rank_index}` | n/a - deletion |
+| Replaces 12-byte rank record with `(local_node_id, slot_pos)` | NEW - inline tests written alongside the new code |
+| Preserves per-way refcount sidecar order | yes, via `coord_payloads.rs` codec tests |
+| New invariant: every referenced node ID maps to exactly one bucket | NEW - inline tests written alongside the new code |
+| New invariant: bucket width derived from metadata max ID | NEW - inline tests written alongside the new code |
+
+**CLI fail-loud coverage** from `tests/cli_add_locations_to_ways.rs`
+(refactor-immune; tier 1 by placement at file root):
+
+- Wrong way locations: `basic_locations_added_to_ways` and
+  `passthrough_basic_with_indexdata` element-equivalence checks fail.
+- Lost nodes from a bucket-coverage bug: `missing_node_refs_get_zero_coordinates`
+  flags it (asserts `missing_locations == 1` exactly).
+- Backend divergence: `backend_parity_dense_sparse_external_auto`
+  rounds dense/sparse/external/auto outputs against each other - this
+  is the canary.
+- Setup-time error path on non-indexed input:
+  `altw_external_rejects_force_on_non_indexed`.
+
+**Verdict: tier 1 is structurally sufficient to start any of A1-A4.**
+CLI tests pin user-observable correctness on the stable surface
+(`pbfhogg add-locations-to-ways --index-type external`); they catch
+bad output. The inline coverage that exists (codec, classification)
+covers the parts the rewrites *preserve*. The parts the rewrites
+*delete* do not need pre-rewrite inline tests.
+
+**New inline tests are written alongside the new code, not preemptively
+against the old code.** Preemptive inline tests would tie themselves
+to the old shape and die when the rewrite lands - work that doesn't
+survive its motivation.
+
+**Pre-rewrite gap acknowledged.** `stage1.rs`, `stage2.rs`, `stage3.rs`,
+`stage4.rs` have zero inline tests today. That is a long-standing gap,
+not specific to any one rewrite. CLI tests + codec tests are
+sufficient for refactor safety; if a rewrite surfaces an internal
+contract that needs precise localization during iteration, add a
+focused inline test then rather than blanket coverage now. Same logic
+applies to A2 (output executor), A3 (DenseNodes filter), and A4
+(stage 2-3 seam) when they begin.
+
+---
+
 ## Tier 1: actionable now (platform decisions + design work)
 
 ### L1. #10 conservative: BlobHeader refcount extension `[hist]`

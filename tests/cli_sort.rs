@@ -752,12 +752,69 @@ mod platform {
 // Feature-missing error paths
 // ---------------------------------------------------------------------------
 //
-// The feature-missing tests that lived here (verifying `--direct-io`
-// and `--io-uring` emit a clear error when the corresponding Cargo
-// feature is absent) cannot be expressed as CLI-driven tests in this
-// harness: the `cargo test -p pbfhogg --no-default-features` sweep
-// rebuilds the library without the feature, but cannot rebuild the
-// pbfhogg-cli binary, so the invocation still targets an all-features
-// binary. This is a library-level invariant that belongs in inline
-// unit tests inside `src/commands/sort/` if it matters - not an
-// integration-test shape.
+// Negative tests: `--direct-io` and `--io-uring` must emit a clear
+// error when the corresponding Cargo feature is absent. These compile
+// only when the feature is OFF, so they fire under the `consumer`
+// sweep in `brokkr.toml` (`no_default_features = true, features =
+// ["commands"]`, which rebuilds pbfhogg-cli without the linux features
+// via the sweep's `build_packages = ["pbfhogg-cli"]`). Under the
+// `all` sweep both features are on and these tests are excluded by
+// cfg, so the positive tests in `mod platform` cover that path.
+
+#[cfg(not(feature = "linux-direct-io"))]
+#[test]
+fn sort_direct_io_feature_missing_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_unsorted_overlapping_pbf(&input);
+
+    let run = CliInvoker::new()
+        .arg("sort")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--direct-io")
+        .arg("--force")
+        .run();
+
+    assert!(
+        !run.status.success(),
+        "sort --direct-io must fail without linux-direct-io feature",
+    );
+    let stderr = run.stderr_str();
+    assert!(
+        stderr.contains("--direct-io requires the linux-direct-io feature"),
+        "stderr must name the missing feature; got:\n{stderr}",
+    );
+}
+
+#[cfg(not(feature = "linux-io-uring"))]
+#[test]
+fn sort_io_uring_feature_missing_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_unsorted_overlapping_pbf(&input);
+
+    let run = CliInvoker::new()
+        .arg("sort")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--io-uring")
+        .arg("--force")
+        .run();
+
+    assert!(
+        !run.status.success(),
+        "sort --io-uring must fail without linux-io-uring feature",
+    );
+    let stderr = run.stderr_str();
+    assert!(
+        stderr.contains("--io-uring requires the linux-io-uring feature"),
+        "stderr must name the missing feature; got:\n{stderr}",
+    );
+}

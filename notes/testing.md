@@ -214,15 +214,21 @@ profile (T11) can target them via `cargo test platform::`. New
 `cli_*.rs` files for apply-changes, diff, extract, ALTW follow the
 same shape.
 
-**Known harness gap:** CLI binary feature parity across test sweeps
-is a brokkr-side concern, not a pbfhogg one. See
-[`testing-cli-feature-parity.md`](testing-cli-feature-parity.md)
-(the brokkr feature-requests handoff doc, request 2) for the problem
-statement + proposed fix. Blocks feature-missing error tests for
-every CLI-gated flag (`--direct-io`, `--io-uring`) across all
-commands. Until the fix lands, the recommended fallback is inline
-unit tests in `src/commands/mod.rs` under
-`#[cfg(all(test, not(feature = "...")))]`.
+**Harness gap (resolved 2026-04-25):** CLI binary feature parity across
+test sweeps was previously a brokkr-side concern. Three brokkr commits
+landed it the same day: `f7a96b7` introduced `build_packages` on
+`[[check]]` entries, `2235792` collapsed sweeps into the `[[check]]`
+array as the single primitive, and `b3aa444` exports
+`BROKKR_TEST_BIN_DIR=<target>/<profile>` per sweep so test code
+doesn't have to guess the profile via `cfg!(debug_assertions)`. Pbfhogg's
+`brokkr.toml` consumer sweep now sets `build_packages = ["pbfhogg-cli"]`
+so the CLI binary is rebuilt without linux features for that sweep, and
+the `feature_missing_error` tests in `cli_sort.rs` (gated on
+`cfg(not(feature = "linux-..."))`) fire correctly via the env-var
+binary lookup. Caveat: `pbfhogg-cli` carries a no-op `commands = []`
+feature in `cli/Cargo.toml` so brokkr can apply `--features commands`
+symmetrically to both crates (the CLI's lib dep already always pulls
+in `commands` - the feature is purely a brokkr-symmetry concession).
 
 **Fault-injection split** - landed 2026-04-25. Each cargo integration
 test file compiles to its own binary, so the `PANIC_AT_*` static
@@ -519,65 +525,21 @@ bug-hunting needs hours to days per target ("weekend campaign"
 cadence). Skip until T07 exposes a gap that only coverage-guided
 fuzzing can fill.
 
-### T11 - Brokkr validation profiles
+### T11 - Brokkr validation profiles [LANDED 2026-04-25]
 
-`brokkr check` is becoming too broad as the in-project test suite
-grows. Add explicit profiles that map to the validation tiers above
-instead of relying on Cargo's raw `#[ignore]` switch:
+Landed via brokkr commits `f7a96b7` (initial `[test.profiles.*]` /
+`[test.sweeps.*]`) and `2235792` (config redesign that consolidated
+sweeps under the `[[check]]` array). Pbfhogg's `brokkr.toml` migrated
+to the landed shape the same day.
 
-- Tier 1 stays `brokkr check` and must keep a hard developer-loop wall
-  budget.
-- Tier 2 should run one command family by name, so command rewrites can
-  ask for the relevant expanded suite without paying for every other
-  command.
-- Tier 3 should replace "run all ignored tests" with a named
-  full-in-project gate that includes slow/serial tests intentionally.
+The annotation surface is plain Rust module paths (`mod tier2`,
+`mod platform`, `mod serial`) translated into cargo's substring
+filter and `--skip` flag. `#[ignore]` stays a libtest mechanic for
+tests that must never run accidentally - it is no longer the tier
+label.
 
-This is brokkr work, not pbfhogg library work. Until it lands, new
-slow, platform-specific, or real-dataset tests should not be added to
-the default sweep just because they are integration tests. New
-external-tool comparisons should not be added to the in-tree suite
-at all - see "External cross-validation" above.
-
-#### Proposed brokkr-facing model
-
-Use normal Rust test module paths as the annotation surface. Do not add
-pbfhogg-specific custom attributes, and do not treat `#[ignore]` as the
-tier label. `#[ignore]` should remain a libtest execution mechanic for
-tests that must never run accidentally, such as serial fault-injection
-or platform-only cases.
-
-Tier 1 tests may live at the integration-test root or in a `tier1`
-module. Non-default tests should carry one of these module-path markers:
-
-```rust
-#[test]
-fn sort_basic_cli_contract() {}
-
-mod tier2 {
-    #[test]
-    fn sort_many_blob_boundaries() {}
-}
-
-mod tier3 {
-    #[test]
-    fn sort_large_fixture_roundtrip() {}
-}
-
-mod platform {
-    #[test]
-    fn sort_direct_io_alignment() {}
-}
-
-mod serial {
-    #[test]
-    #[ignore = "run through brokkr profile serial/fault"]
-    fn injected_write_failure_is_atomic() {}
-}
-```
-
-For command-family CLI tests, keep the current `tests/cli_<command>.rs`
-shape and split intent inside the file:
+For command-family CLI tests, the current `tests/cli_<command>.rs`
+shape splits intent inside the file:
 
 - Root or `tier1` module: small CLI contracts that belong in
   `brokkr check`.
@@ -590,86 +552,27 @@ shape and split intent inside the file:
 - `serial`: tests that require `--test-threads=1` or static
   fault-injection state.
 
-The brokkr implementation should translate named profiles into ordinary
-Cargo/libtest arguments: `--test cli_sort`, substring filters,
-`--skip`, `--include-ignored`, `--test-threads=1`, feature sweeps,
-environment variables, prerequisite-tool checks, and explicit CLI
-binary builds. That keeps the model transparent to other Rust projects
-instead of baking pbfhogg internals into brokkr.
+Today only `cli_sort.rs`, `cli_apply_changes.rs`,
+`cli_add_locations_to_ways.rs`, and `cli_cat.rs` carry `mod platform`
+(for the `--direct-io` / `--io-uring` positive tests). No `mod tier2`
+or `mod serial` populations yet - the fault-injection split made
+serial tests per-binary and race-free, and tier-2 matrices grow when
+commands actually need them rather than preemptively.
 
-#### Proposed `brokkr.toml` shape
+The landed `brokkr.toml` lives at the project root; final shape and
+notes on deviations from earlier drafts in
+[`testing-cli-feature-parity.md`](testing-cli-feature-parity.md)
+("Landed `brokkr.toml` shape").
 
-Do not add these keys to the live config until brokkr supports them.
-This is the intended target shape:
-
-```toml
-[test]
-default_package = "pbfhogg"
-default_profile = "tier1"
-
-[test.sweeps.all]
-features = "all"
-build_packages = ["pbfhogg-cli"]
-
-[test.sweeps.consumer]
-no_default_features = true
-features = ["commands"]
-build_packages = ["pbfhogg-cli"]
-
-[test.profiles.tier1]
-description = "Fast edit loop used by brokkr check"
-sweeps = ["all", "consumer"]
-skip = ["tier2::", "tier3::", "platform::", "serial::"]
-include_ignored = false
-
-[test.profiles.sort]
-description = "Expanded sort command tests"
-extends = "tier1"
-tests = ["cli_sort"]
-skip = ["platform::", "serial::"]
-
-[test.profiles.tier2]
-description = "All expanded in-project command tests"
-sweeps = ["all", "consumer"]
-only = ["tier2::"]
-include_ignored = false
-
-[test.profiles.full]
-description = "All in-project correctness tests"
-sweeps = ["all"]
-skip = ["platform::"]
-include_ignored = true
-
-[test.profiles.platform]
-description = "Platform-sensitive tests"
-sweeps = ["all"]
-only = ["platform::"]
-include_ignored = true
-env = { BROKKR_TEST_PLATFORM = "1" }
-
-[test.profiles.serial]
-description = "Serial/fault-injection tests"
-sweeps = ["all"]
-only = ["serial::"]
-include_ignored = true
-test_threads = 1
-```
-
-The command surface should stay generic:
+Command surface:
 
 ```text
-brokkr check
-brokkr check --profile sort
-brokkr check --profile tier2
-brokkr check --profile full
-brokkr verify
+brokkr check                  # tier 1 (default profile)
+brokkr check --profile sort   # tier 2 command slice
+brokkr check --profile full   # tier 3 in-project gate
+brokkr check --profile platform
+brokkr check --profile serial
 ```
-
-`brokkr check` uses `test.default_profile`. Command slices can be
-implemented as profiles (`sort`, `extract`, `add-locations-to-ways`) or
-as `--command <name>` sugar that resolves to a profile. The underlying
-mechanism should remain profile selection so non-pbfhogg projects can
-name their own slices.
 
 ### T12 - CliInvoker robustness before wider conversion
 

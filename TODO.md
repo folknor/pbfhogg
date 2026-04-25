@@ -12,7 +12,7 @@ Three new docs capturing a cross-cutting insight and two new commands that fall 
 
 **Open decision on `getparents`** (see [notes/getparents.md](notes/getparents.md) current state): uncommitted `HeaderWalker` path is +68 % on europe / -46 % on planet. Revert, threshold-dispatch, or accept? Deferred until `repack` produces an 8k-packed planet so the crossover point can be measured directly.
 
-- [ ] **[notes/testing.md](notes/testing.md)** - test infrastructure and coverage tracker. CLI-decoupling reorg in progress (2026-04-24): integration tests move to `tests/cli_*.rs` driving the binary via `CliInvoker`, so internal module rewrites (ALTW stages, apply-changes pipeline, geocode passes) no longer force test-file edits. Course correction (2026-04-25): do not wholesale-convert old tests into always-on CLI tests; split fast command contracts from command-slice, platform, and planet/perf tiers. External cross-validation lives in `brokkr verify`, not the in-tree suite. T11 now sketches the brokkr profile annotations and target `brokkr.toml` shape. Import surface audit in [`notes/testing-audit.md`](notes/testing-audit.md).
+- [ ] **[notes/testing.md](notes/testing.md)** - test infrastructure and coverage tracker. CLI-decoupling reorg landed 2026-04-25 across all 5 priority surfaces; brokkr-side validation profiles (T11), `build_packages` per sweep (the CLI feature-parity fix), and `BROKKR_TEST_BIN_DIR` (test bin lookup) landed brokkr commits `f7a96b7` + `2235792` + `b3aa444` on 2026-04-25, and pbfhogg's `brokkr.toml` migrated to the `[[check]]` + `[test.profiles]` shape the same day. The `feature_missing_error` tests in `cli_sort.rs` are restored at file root (consumer sweep). Open follow-ups: T02-T10 (fixture primitives, negative-ID matrix, truncation sweep, `-j N` parity matrix, scratch tracking, proptest, twin-site scans, `check --refs` parity, fuzz; T12 landed). Import surface audit in [`notes/testing-audit.md`](notes/testing-audit.md). Feature-request handoff to brokkr: [`notes/testing-cli-feature-parity.md`](notes/testing-cli-feature-parity.md) (all 5 requests landed).
 
 - [ ] **[notes/merge-changes.md](notes/merge-changes.md)** - `merge-changes` (squash N OSCs → 1). The serial-across-inputs CLI shape `merge_changes::write_streaming` parallelizes cleanly via `IdSet::set_atomic_if_new` newer-wins dedupe; estimated ~20-30 s saved at 7-OSC planet per reviewer Q7 speculation. No win at 1-OSC scale. **All prerequisites landed**: per-input `MERGECHANGES_PARSE_{START,END}` markers (commit `4e3c7ea`) on both the streaming and `--simplify` paths with `merge_changes_input_bytes` counter inside the span for per-OSC size distribution; overnight.sh already runs `brokkr merge-changes --dataset planet --osc-range 4914..4920 --bench 1` + `--hotpath` (overnight.sh:246-247) so the 2026-04-24 morning sidecar gives serial wall + per-OSC parse wall + hotpath breakdown. Library-level `osc::load_all_diffs` has no markers but is **unused in production** (only `#[cfg(test)]` call sites); apply-changes takes a single OSC via `parse_osc_file` so the "per-input" axis doesn't apply there. After tomorrow's baseline lands, size the parallel-parse win against the per-OSC share of serial wall and implement the rayon-scoped parse-fan-out if it's worth the complexity. Content factored out of `apply-changes-opportunities.md` 2026-04-21 - these items were filed under "weekly apply-changes" but apply scale-independently to any consumer that squashes N > 1 OSCs.
 
@@ -358,25 +358,14 @@ single-pass, tag expression and bbox filtering.
   CHANGELOG entry under "Unreleased > Breaking changes". Migration
   is `--summary` -> `--osmium-summary`, or use `-s` (works either
   way).
-- [ ] **`hotpath::HotpathGuardBuilder` banner contaminates stdout for
-  stdout-output commands under `--all-features` test runs** (surfaced
-  2026-04-25 during the cli_diff.rs conversion in commit `792421f`).
-  `cli/src/main.rs:690` builds a `HotpathGuardBuilder` whose drop
-  at `main` exit emits "`[hotpath] N.NNms | timing, alloc, threads
-  (CPU baseline avg: ...)`" to stdout. Stdout-output commands like
-  `pbfhogg diff` (when `-o` is omitted) interleave this banner with
-  their actual output, breaking shell piping (`pbfhogg diff a b
-  | ...`) and integration tests that read stdout as the data plane.
-  The cli_diff.rs conversion worked around it by always passing
-  `-o <file>` and ignoring stdout. **Resolution path: brokkr-side
-  feature selection.** `brokkr check` currently passes
-  `--all-features`, which turns on the `hotpath` feature for test
-  runs that have no business with profiling. Switching brokkr to
-  pass an explicit feature set (`test-hooks,linux-direct-io,linux-io-uring,commands`)
-  instead of `--all-features` makes the `#[hotpath::measure]` macros
-  compile-time no-ops during test runs and no banner emerges. No
-  pbfhogg change needed; production users who build with
-  `--features hotpath` deliberately keep getting banner output as
+- [x] ~~**`hotpath::HotpathGuardBuilder` banner contaminates stdout
+  for stdout-output commands under `--all-features` test runs**~~
+  Resolved 2026-04-25 via brokkr.toml migration to `[[check]]` array
+  with explicit feature lists. The `all` sweep enumerates
+  `["test-hooks", "linux-direct-io", "linux-io-uring"]` (no
+  `hotpath`), so `#[hotpath::measure]` becomes a compile-time no-op
+  during test runs and no banner emerges. Production users who build
+  with `--features hotpath` deliberately keep getting banner output as
   intended. brokkr's `--hotpath` measurement mode is unaffected
   because it already builds with hotpath explicitly enabled.
 - [ ] **CLI UX: scratch dir + mode naming, unified across the CLI** (raised

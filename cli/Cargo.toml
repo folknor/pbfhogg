@@ -17,6 +17,13 @@ path = "src/main.rs"
 
 [features]
 default = []
+# No-op passthrough. pbfhogg-cli's lib dep always pulls in
+# `pbfhogg/commands`, so this feature does nothing semantic; it
+# exists so brokkr.toml `[[check]]` sweeps can apply the same
+# `--features commands` flag to both `cargo test -p pbfhogg` and
+# `cargo build -p pbfhogg-cli` without the latter rejecting the
+# unknown feature.
+commands = []
 hotpath = ["pbfhogg/hotpath"]
 hotpath-alloc = ["pbfhogg/hotpath-alloc"]
 linux-direct-io = ["pbfhogg/linux-direct-io"]

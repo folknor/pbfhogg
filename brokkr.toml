@@ -3,12 +3,104 @@ project = "pbfhogg"
 # Env variables that match these are captured by brokkr during runs and stored in the database.
 capture_env = ["PBFHOGG*", "MALLOC*"]
 
-# Cargo feature set a downstream library consumer would build with. brokkr
-# check runs clippy a second time with --no-default-features --features <these>
-# so feature-gated proc-macro expansions (e.g. #[hotpath::measure] swallowing
-# function bodies under hotpath) can't silently mask lints library users hit.
-[check]
-consumer_features = ["commands"]
+# brokkr check + test sweeps. Each [[check]] entry is one (clippy +
+# test) pass with its own feature shape. Profiles in [test.profiles]
+# reference these by name and layer libtest filters on top.
+#
+#  - "all"      = test-hooks (fault-injection hooks) + linux-direct-io
+#                 + linux-io-uring. Mirrors what --all-features used to
+#                 pull in MINUS hotpath (#[hotpath::measure] turns into
+#                 runtime measurement that emits a banner to stdout at
+#                 process exit, contaminating stdout-output commands
+#                 like `pbfhogg diff` under integration tests; hotpath
+#                 stays opt-in via `brokkr <cmd> --hotpath`) and MINUS
+#                 `commands` because pbfhogg's `default = ["commands"]`
+#                 already enables it whenever no_default_features is
+#                 false. `commands` is also not a pbfhogg-cli feature
+#                 (the CLI always pulls in pbfhogg with `commands`
+#                 via its lib dep) so listing it would break the
+#                 build_packages step.
+#  - "consumer" = no-default-features view; what a downstream library
+#                 user builds with `default-features = false, features =
+#                 ["commands"]`. Catches lints in always-compiled code
+#                 that proc-macros silently mask (e.g. #[hotpath::measure]
+#                 swallowing function bodies). Also rebuilds the CLI
+#                 binary without linux-direct-io / linux-io-uring so
+#                 the cli_sort.rs feature_missing tests (gated on
+#                 `cfg(not(feature = "linux-..."))`) fire in this sweep
+#                 against a CLI that doesn't support the flag.
+#                 pbfhogg-cli has a no-op `commands` feature in
+#                 `cli/Cargo.toml` purely so brokkr can apply
+#                 `--features commands` symmetrically to both crates.
+#
+# build_packages rebuilds the named cargo packages with the entry's
+# feature flags before the test phase. Required for tests/cli_*.rs:
+# without it, `cargo test -p pbfhogg` leaves whatever pbfhogg-cli was
+# last built and CliInvoker silently hits a stale binary.
+
+[[check]]
+name = "all"
+features = ["test-hooks", "linux-direct-io", "linux-io-uring"]
+build_packages = ["pbfhogg-cli"]
+
+[[check]]
+name = "consumer"
+no_default_features = true
+features = ["commands"]
+build_packages = ["pbfhogg-cli"]
+
+[test]
+default_package = "pbfhogg"
+default_profile = "tier1"
+
+# Tier 1 - fast contracts. brokkr check's inner-loop signal during
+# refactor. Skips the tier2/tier3/platform/serial submodules; runs
+# everything else across both sweeps.
+[test.profiles.tier1]
+description = "Fast edit loop used by brokkr check (tier 1)"
+sweeps = ["all", "consumer"]
+skip = ["tier2::", "tier3::", "platform::", "serial::"]
+include_ignored = false
+
+# Tier 3 - full in-project correctness gate (pre-merge). include_ignored
+# picks up slow real-data tests (roundtrip_denmark, geocode_index, etc)
+# that #[ignore] keeps out of tier 1. Platform tier handled separately.
+[test.profiles.full]
+description = "Full in-project correctness gate (tier 3, pre-merge)"
+sweeps = ["all"]
+skip = ["platform::"]
+include_ignored = true
+
+# Platform-sensitive tests: --direct-io, --io-uring, MEMLOCK-dependent
+# paths, feature-missing CLI behaviour. include_ignored picks up
+# known-bug-ignored tests like the io_uring small-output regression.
+[test.profiles.platform]
+description = "Platform-sensitive tests (--direct-io, --io-uring)"
+sweeps = ["all"]
+only = ["platform::"]
+include_ignored = true
+env = { BROKKR_TEST_PLATFORM = "1" }
+
+# Tests requiring --test-threads=1. The fault-injection split
+# (2026-04-25) made the previously-serial fault tests per-binary and
+# race-free; this profile is reserved for any future serial-only test.
+[test.profiles.serial]
+description = "Serial tests requiring --test-threads=1"
+sweeps = ["all"]
+only = ["serial::"]
+include_ignored = true
+test_threads = 1
+
+# Tier 2 command-slice precedent. cli_sort.rs is already split into
+# root (tier 1) + mod platform; once it grows a mod tier2 (many-blob
+# boundary fixtures, scratch-leak sweeps), this profile picks them up.
+# Add similar entries for other commands as their tier-2 matrices
+# land - per testing.md, there is no generic tier2 profile.
+[test.profiles.sort]
+description = "Tier 2: expanded sort command tests"
+extends = "tier1"
+tests = ["cli_sort"]
+skip = ["platform::", "serial::"]
 
 # ---------------------------------------------------------------------------
 # Per-machine configuration, keyed by hostname.

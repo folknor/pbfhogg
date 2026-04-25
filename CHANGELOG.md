@@ -37,6 +37,7 @@
 - **build-geocode-index**: parallel Pass 2 / Pass 3. Planet 21m → 7m (-65%). Pass 1.5 peak anon 29.5 GB → 3.0 GB.
 - **build-geocode-index**: hard-errors when per-cell or per-way counts exceed `u16::MAX` (previously silently truncated). Error names the offending cell/way.
 - **add-locations-to-ways `--index-type external`**: rewrite. Planet 24m → 11m (-55%).
+- **add-locations-to-ways `--index-type external`**: A1 rankless rewrite. The two-pass way scan + IdSet rank index is replaced by a single-pass IdRecord emission into 256 ID-buckets keyed by node-id range. Stage 2 streams a merge-walk against decoded node tuples instead of the rank-indexed counting-sort + `coord_slice` scatter. Planet 11m1s → 10m4s (-9%); europe 4m52s → 4m31s (-7%). The `IdSet::{rank, count_below, build_rank_index, drop_rank_index, rank_if_set}` calls are gone from this command; ~100 MB of rank-index RSS that pass A built and pass B consumed is no longer allocated. The 80+ GB of intermediate rank shards is replaced by the same total in id shards (record format unchanged at 12 bytes), so scratch sizing is identical.
 - **extract** (all strategies): pass-1 blob schedule reused across subsequent passes. Europe smart 254s → 181s (-29%).
 - **getparents**: skip node-only blobs via `BlobFilter` when the query doesn't need nodes (~85% of blobs at planet scale).
 - **derive-changes**: streams output to temp files; constant memory regardless of diff size.

@@ -6,7 +6,9 @@ reports, in-RAM-coord-table thesis, historical probe record) were folded
 into `altw-optimization-history.md` and deleted once their content lived
 fully in the history doc + this one.
 
-Current baseline: planet 661.2 s (`aee7727`, `--bench 3`), europe 291.6 s.
+Current baseline: **planet 603.7 s** (`0dc8ae1`, `--bench 1`, post-A1
+2026-04-25, was 661.2 s at `aee7727` `--bench 3`); **europe 270.8 s**
+(`0dc8ae1`, `--bench 1`, post-A1, was 291.6 s at `6d71053`).
 
 Companion doc:
 
@@ -56,9 +58,50 @@ Current structure, by hot phase:
   wire logic, but sends uncompressed blocks back through the generic
   `PbfWriter` pipeline. Passthrough blobs are copied through userspace.
 
-### A1. Full rewrite: rankless node-ID bucketed join
+### A1. Full rewrite: rankless node-ID bucketed join [LANDED 2026-04-25]
 
-This is the highest-conviction remaining architectural opportunity.
+Landed across commits 2a5e830 (bucket primitives), 233cb07 (BucketLayout
+fixup), 9eae0b1 (pass A IdRecords), cef66d9 (set_atomic skip filter),
+c5c3969 (stage 2 ID-bucket merge walk), 2fabb02 (walk-boundary +
+pass-B skip filter), b2f0f7f (delete pass B and rank machinery),
+0dc8ae1 (per-bucket counters via local Vec, not atomic). Plan in
+`.plans/merry-watching-lake.md`.
+
+**Result.** Europe 270.8 s (was 291.6 s, -7.1%). Planet 603.7 s
+(was 661.2 s, -8.7%). Pass B's full second way decompress/scan +
+rank emission is gone (~84 s wall at planet); stage 2 now
+streams a merge walk and avoids the `coord_slice` allocation.
+Stage 2 picked up an O(N log N) sort cost (`s2_prepare_sort_ms`
+~520 s cumulative at planet, ~87 s wall over 6 workers) - the
+single largest new cost in the rewrite, predicted by the design
+review.
+
+**Open follow-up: stage 2 sort cost.** `prepare_bucket` does
+`sort_unstable_by_key(|r| r.local_node_id)` on each bucket's
+records. Replacement candidates if this becomes the hot lever:
+
+- Counting sort by `local_node_id` is unwieldy because the range
+  is `bucket_width` (~55M at planet); the count vector is too
+  big.
+- Radix sort on the 4-byte `local_node_id` key (e.g. `radsort` or
+  hand-rolled 8-bit-digit passes) would beat comparison sort
+  meaningfully on uniform u32 keys.
+- Hybrid: radix on the high bits to sub-bucket, then sort within
+  each sub-bucket.
+
+The old design was a counting sort over the smaller `rank_range`
+space. With node-ID space replacing rank space, a different sort
+shape is the natural fit; defer until a benchmark actually moves
+because of it.
+
+**Net architecture below.** The rest of this section captures the
+original design rationale; everything implemented matches it
+modulo the (`local_node_id`, `blob_idx`, `blob_local_slot`)
+12-byte split of the audit's stated `(local_node_id, slot_pos)`
+record (a parallel-safe decomposition - stage 2 reconstructs
+`linear_slot_pos = blob_start_slot[blob_idx] + blob_local_slot`).
+
+This was the highest-conviction remaining architectural opportunity.
 
 **Bottleneck.** Stage 1 pays a second full way pread/decompress/scan and keeps
 the large `IdSet` rank machinery alive so that refs can be transformed from
@@ -220,6 +263,16 @@ Before starting any of A1-A4 this audits inline `#[cfg(test)] mod tests`
 coverage across `src/commands/altw/external/` against the development
 contract in `notes/testing.md`: tier 1 must be structurally complete
 for `brokkr check` green to be a real signal during refactor.
+
+**Audit verdict held.** A1 landed without a single CLI canary
+regression - tier 1 caught every iteration's bugs (the step 2 IdSet
+panic on negative refs, the step 3 walk-boundary loose-indexdata
+issue, the step 4 atomic counter perf regression all surfaced before
+the bench step). New inline tests landed alongside the new code per
+the audit's plan: bucket math (8 tests in `mod.rs`), IdRecord codec
+(2 tests in `mod.rs`), `max_node_id_from_blob_meta` (5 tests in
+`mod.rs`). Stage 1/2/3/4 internals stayed without inline coverage -
+the CLI canaries plus the codec tests proved sufficient.
 
 **Inline coverage today.**
 

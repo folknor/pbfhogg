@@ -38,7 +38,7 @@ Every command listed below runs on the full planet on normal hardware. Measured 
 
 | Command | Wall | Peak anon RSS |
 |---------|------|---------------|
-| `add-locations-to-ways --index-type external` | 10m14s | 18.1 GB |
+| `add-locations-to-ways --index-type external` | 10m4s | 11.5 GB |
 | `apply-changes --locations-on-ways` (daily diff) | 2m15s | ~3.3 GB |
 | `build-geocode-index` | 7m12s | ~25 GB |
 | `cat` (indexdata generation) | 1m26s | ~200 MB |

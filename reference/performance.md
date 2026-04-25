@@ -271,12 +271,16 @@ anon RSS at Europe scale via 4-stage radix join pipeline (node-only wire
 scanner for stage 2, scatter buffer for stage 3, sequential reader for
 stage 4).
 
-Current Europe external baseline on `main` (commit `e497e54`): **320.5s** [TAINTED]
-(`5m21s`, UUID `4268196a`). Previous baseline `d3e13ed` was 333s; the
-`e497e54` change replaces the `finalize_coord_payloads` consolidation
-phase with an in-RAM `BlobLocationRouter` (see the stage-breakdown tables
-below). Earlier step `d3e13ed` had dropped 400s → 333s by collapsing
-three whole-file header-oriented scans into one shared metadata pass.
+Current Europe external baseline on `main` (post-A1 commit `0dc8ae1`):
+**270.8 s** (`4m31s`, UUID `0b89f986`, `--bench 1`). A1 (rankless
+node-ID bucketed stage 1+2, landed 2026-04-25) cut europe from
+291.6 s at `6d71053` (-7.1 %) by replacing the two-pass way scan +
+rank index with single-pass IdRecord emission and a streaming
+merge-walk. See `notes/altw-external.md` for the full A1 chain.
+
+Previous baselines: 320.5 s at `e497e54` (in-RAM `BlobLocationRouter`,
+[TAINTED]); 333 s at `d3e13ed` (collapsed three whole-file
+header scans into one shared metadata pass); 400 s before that.
 
 **Crossover point**: between Japan (2.4 GB, dense 2x faster) and Europe
 (33.6 GB, external 7.4x faster). At Europe scale, dense's mmap working set
@@ -374,7 +378,7 @@ cross-reference.
 | extract --smart (Europe bbox) | `--bench 1` | 267.5 s | `07dcdae3` | 282 s → −14 s |
 | multi-extract (5 regions) | `--bench 1` | 972.0 s | post-`01c67da` | 1004.6 s → −3.2 % |
 | cat --type way | `--bench 3` | 45.3 s | `2fe62148` | 44 s (noise) |
-| add-locations-to-ways `--index-type external` | `--bench 3` | **661.2 s** | `a406d77e` (pre scan-audit) / 673.6 s post | 698 s → −37 s |
+| add-locations-to-ways `--index-type external` | `--bench 1` | **603.7 s** | `aa0dc719` (post-A1 commit `0dc8ae1`) | 661.2 s → **−57.5 s, −8.7 %** |
 | apply-changes (daily diff, `--osc-seq 4920`) | `--bench 1` | 756.3 s | `8e940f71` | 753 s (noise) |
 | renumber | `--bench 3` | 204.5 s | `abd74459` | 194 s (+10 s, see below) |
 | diff-snapshots text `-j 16` | `--bench 1` | **227.5 s** | `22a5eb55` | 2151 s → **9.5×** |

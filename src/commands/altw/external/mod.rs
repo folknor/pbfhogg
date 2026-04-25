@@ -88,8 +88,17 @@ pub(super) fn bucket_width(max_node_id: u64, num_buckets: usize) -> u64 {
 /// out-of-range ids (stale indexdata, corrupt input, accidental
 /// `i64 as u64` of a negative ref) would otherwise silently land in
 /// the final bucket and be truncated to a 32-bit `local_node_id` in
-/// pass A. Pass A treats `None` as an indexdata-trust violation and
-/// errors out with the offending id.
+/// pass A.
+///
+/// `None` means "this id cannot be encoded into the normal bucket
+/// record." Pass A treats it as an unresolved slot and skips
+/// emission. The slot's position is still consumed (per-way refcount
+/// sidecars count every ref, including unresolved ones) so stage 4
+/// fills zero coordinates and increments `missing_locations`. This
+/// matches ALTW's existing behaviour for way refs to nodes that
+/// aren't in the input - common with extracts and node-sparse
+/// fixtures. See `missing_node_refs_get_zero_coordinates` in
+/// `tests/cli_add_locations_to_ways.rs` for the contract canary.
 #[allow(dead_code)] // wired up in step 2 of A1 (pass-A IdRecord emission).
 pub(super) struct BucketLayout {
     pub(super) max_node_id: u64,
@@ -138,6 +147,102 @@ impl BucketLayout {
     }
 }
 
+/// Largest node id advertised by any node-kind blob's indexdata.
+///
+/// This is the input to [`BucketLayout::new`]. Errors if any node
+/// blob has a malformed range (negative `max_id` or `max_id <
+/// min_id`); both are producer-side bugs that pass A would otherwise
+/// silently absorb. Returns 0 when there are no node blobs (degenerate
+/// input - bucket_layout will then reject any non-zero ref).
+#[allow(dead_code, private_interfaces)] // wired up in step 2 of A1.
+pub(super) fn max_node_id_from_blob_meta(
+    blob_meta: &[blob_meta::BlobMeta],
+) -> Result<u64> {
+    let mut max_id: i64 = 0;
+    for meta in blob_meta {
+        if !matches!(meta.kind, crate::blob_meta::ElemKind::Node) {
+            continue;
+        }
+        if meta.max_id < meta.min_id {
+            return Err(format!(
+                "altw external: node blob at data_offset={} has reversed \
+                 indexdata range [min_id={}, max_id={}]",
+                meta.data_offset, meta.min_id, meta.max_id,
+            )
+            .into());
+        }
+        if meta.max_id < 0 {
+            return Err(format!(
+                "altw external: node blob at data_offset={} has negative \
+                 max_id={}; pbfhogg rejects negative element ids",
+                meta.data_offset, meta.max_id,
+            )
+            .into());
+        }
+        if meta.max_id > max_id {
+            max_id = meta.max_id;
+        }
+    }
+    #[allow(clippy::cast_sign_loss)]
+    Ok(max_id as u64)
+}
+
+#[cfg(test)]
+mod max_node_id_tests {
+    use super::{blob_meta::BlobMeta, max_node_id_from_blob_meta};
+    use crate::blob_meta::ElemKind;
+
+    fn meta(kind: ElemKind, min_id: i64, max_id: i64) -> BlobMeta {
+        BlobMeta {
+            frame_offset: 0,
+            data_offset: 0,
+            data_size: 0,
+            kind,
+            min_id,
+            max_id,
+            count: 0,
+            has_tagindex: false,
+            has_tags: false,
+        }
+    }
+
+    #[test]
+    fn empty_input_is_zero() {
+        assert_eq!(max_node_id_from_blob_meta(&[]).expect("ok"), 0);
+    }
+
+    #[test]
+    fn no_node_blobs_is_zero() {
+        let metas = [meta(ElemKind::Way, 1, 100), meta(ElemKind::Relation, 1, 50)];
+        assert_eq!(max_node_id_from_blob_meta(&metas).expect("ok"), 0);
+    }
+
+    #[test]
+    fn picks_max_across_node_blobs() {
+        let metas = [
+            meta(ElemKind::Node, 1, 999),
+            meta(ElemKind::Way, 1, 5_000_000),
+            meta(ElemKind::Node, 1000, 12_345),
+            meta(ElemKind::Node, 12_346, 99_999),
+        ];
+        assert_eq!(max_node_id_from_blob_meta(&metas).expect("ok"), 99_999);
+    }
+
+    #[test]
+    fn errors_on_reversed_range() {
+        let metas = [meta(ElemKind::Node, 100, 50)];
+        let err = max_node_id_from_blob_meta(&metas).expect_err("reversed range");
+        assert!(err.to_string().contains("reversed indexdata"));
+    }
+
+    #[test]
+    fn errors_on_negative_max() {
+        let metas = [meta(ElemKind::Node, -10, -5)];
+        let err = max_node_id_from_blob_meta(&metas).expect_err("negative max");
+        assert!(err.to_string().contains("negative max_id"));
+    }
+}
+
 #[cfg(test)]
 mod bucket_math_tests {
     use super::{bucket_width, BucketLayout};
@@ -182,10 +287,11 @@ mod bucket_math_tests {
     }
 
     #[test]
-    fn locate_rejects_negative_refs_cast_via_u64() {
+    fn locate_returns_none_for_negative_refs_cast_via_u64() {
         // An i64 negative id reinterpreted as u64 lands near u64::MAX.
-        // Pass A must not silently truncate it into the last bucket -
-        // the layout returns None and pass A errors out.
+        // Pass A must not silently truncate it into the last bucket;
+        // the layout returns None and pass A skips emission (treating
+        // the slot as unresolved, same as a ref to an absent node).
         let layout = BucketLayout::new(14_000_000_000, 256);
         #[allow(clippy::cast_sign_loss)]
         let neg_as_u64 = (-1_i64) as u64;
@@ -377,6 +483,10 @@ pub(super) fn raise_nofile_to_hard_cap() -> FdBudget {
 /// Size of a rank-occurrence record: `(local_rank: u32, slot_pos: u64)` = 12 bytes.
 pub(super) const RANK_RECORD_SIZE: usize = 12;
 
+/// Size of an id-bucketed occurrence record:
+/// `(local_node_id: u32, blob_idx: u32, blob_local_slot: u32)` = 12 bytes.
+pub(super) const ID_RECORD_SIZE: usize = 12;
+
 /// Size of a resolved entry: `(local_slot_pos: u32, lat: i32, lon: i32)` = 12 bytes.
 pub(super) const RESOLVED_ENTRY_SIZE: usize = 12;
 
@@ -424,6 +534,86 @@ impl RankRecord {
     fn write_to(&self, buf: &mut [u8; RANK_RECORD_SIZE]) {
         buf[..4].copy_from_slice(&self.local_rank.to_le_bytes());
         buf[4..12].copy_from_slice(&self.slot_pos.to_le_bytes());
+    }
+}
+
+/// An id-bucketed occurrence record emitted by stage 1 pass A's
+/// IdRecord path (A1 step 2). Replaces `RankRecord` once A1 step 4
+/// deletes pass B.
+///
+/// `(local_node_id, blob_idx, blob_local_slot)` is the parallel-safe
+/// decomposition of the audit's `(local_node_id, slot_pos)` form: stage
+/// 2 reconstructs `linear_slot_pos = blob_start_slot[blob_idx] +
+/// blob_local_slot` from the per-blob refcount prefix-sum that pass A
+/// produces in `ref_count_sidecar`. See `.plans/merry-watching-lake.md`
+/// for the rationale.
+#[allow(dead_code)] // wired up in step 2 (emission) and step 3 (consumption).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct IdRecord {
+    pub(super) local_node_id: u32,
+    pub(super) blob_idx: u32,
+    pub(super) blob_local_slot: u32,
+}
+
+#[allow(dead_code)] // wired up in step 2 (emission) and step 3 (consumption).
+impl IdRecord {
+    pub(super) fn write_to(&self, buf: &mut [u8; ID_RECORD_SIZE]) {
+        buf[..4].copy_from_slice(&self.local_node_id.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.blob_idx.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.blob_local_slot.to_le_bytes());
+    }
+
+    pub(super) fn read_from(buf: &[u8; ID_RECORD_SIZE]) -> Self {
+        let local_node_id = u32::from_le_bytes(buf[..4].try_into().expect("4 bytes"));
+        let blob_idx = u32::from_le_bytes(buf[4..8].try_into().expect("4 bytes"));
+        let blob_local_slot =
+            u32::from_le_bytes(buf[8..12].try_into().expect("4 bytes"));
+        Self { local_node_id, blob_idx, blob_local_slot }
+    }
+}
+
+#[cfg(test)]
+mod id_record_tests {
+    use super::{IdRecord, ID_RECORD_SIZE};
+
+    #[test]
+    fn write_then_read_round_trips() {
+        let cases = [
+            IdRecord { local_node_id: 0, blob_idx: 0, blob_local_slot: 0 },
+            IdRecord { local_node_id: 1, blob_idx: 2, blob_local_slot: 3 },
+            IdRecord {
+                local_node_id: u32::MAX,
+                blob_idx: u32::MAX,
+                blob_local_slot: u32::MAX,
+            },
+            IdRecord {
+                local_node_id: 0xDEAD_BEEF,
+                blob_idx: 0xCAFE_F00D,
+                blob_local_slot: 0x1234_5678,
+            },
+        ];
+        let mut buf = [0u8; ID_RECORD_SIZE];
+        for r in cases {
+            r.write_to(&mut buf);
+            assert_eq!(IdRecord::read_from(&buf), r);
+        }
+    }
+
+    #[test]
+    fn write_emits_little_endian() {
+        let r = IdRecord {
+            local_node_id: 0x0403_0201,
+            blob_idx: 0x0807_0605,
+            blob_local_slot: 0x0C0B_0A09,
+        };
+        let mut buf = [0u8; ID_RECORD_SIZE];
+        r.write_to(&mut buf);
+        assert_eq!(
+            buf,
+            [
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
+            ]
+        );
     }
 }
 
@@ -555,6 +745,18 @@ pub fn external_join(
     }
     crate::debug::emit_marker("EXTJOIN_META_SCAN_END");
 
+    // Build the BucketLayout for A1 step 2's IdRecord emission. Width
+    // is derived from the largest node-blob max_id in indexdata, not
+    // the planet-wide constant - tighter buckets on smaller fixtures
+    // and exact for any real input.
+    let max_node_id = max_node_id_from_blob_meta(&blob_meta)?;
+    let bucket_layout = BucketLayout::new(max_node_id, NUM_BUCKETS);
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("extjoin_bucket_max_node_id", max_node_id as i64);
+        crate::debug::emit_counter("extjoin_bucket_width", bucket_layout.bucket_width as i64);
+    }
+
     // Stage 1: produces total_slots, unique_nodes, rank_bucket_counts,
     // num_shard_workers, the live IdSet (kept alive through stage 2
     // for inline coord resolution), and the per-blob rank mapping.
@@ -570,6 +772,7 @@ pub fn external_join(
 
     let input_ref_parallel: &Path = input;
     let blob_meta_ref_parallel = &blob_meta;
+    let bucket_layout_ref = &bucket_layout;
     let (stage1_out, relation_member_node_ids) = std::thread::scope(
         |scope| -> std::result::Result<(super::external::stage1::Stage1Output, Option<crate::idset::IdSet>), String> {
             let s1_handle = scope.spawn(|| {
@@ -578,6 +781,7 @@ pub fn external_join(
                     input_ref_parallel,
                     direct_io,
                     &scratch_dir,
+                    bucket_layout_ref,
                     &ref_count_sidecar,
                     &per_way_refcount_sidecar,
                 )

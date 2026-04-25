@@ -1,20 +1,57 @@
-//! Integration tests for the cat command.
+//! CLI-driven integration tests for `pbfhogg cat`.
+//!
+//! Replaces the library-API `tests/cat.rs`. Fixture PBFs are
+//! written via the stable-allowlist writers; `cat` runs through
+//! `CliInvoker`; output is verified by reading the resulting
+//! PBF with the stable-allowlist readers, with stats inspected
+//! through stderr (`CatStats::print_summary`). No imports from
+//! `pbfhogg::cat::*` - a rewrite of `src/commands/cat/` cannot
+//! break these tests by type changes alone.
+
+#![allow(clippy::unwrap_used)]
 
 mod common;
 
+use std::path::Path;
+
+use common::cli::CliInvoker;
 use common::{
     generate_nodes, generate_ways, node_ids_with_coords as node_ids,
     read_all_elements_with_coords, read_normalized, relation_ids_with_coords as relation_ids,
-    way_ids_with_coords as way_ids, write_multi_block_test_pbf, write_test_pbf, TestMember,
-    TestMeta, TestNode, TestRelation, TestWay,
+    way_ids_with_coords as way_ids, write_multi_block_test_pbf, write_test_pbf, NormalizedPbf,
+    TestMember, TestMeta, TestNode, TestRelation, TestWay,
 };
-use pbfhogg::cat::{cat, CleanAttrs};
-use pbfhogg::writer::Compression;
 use pbfhogg::MemberId;
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+/// Invoke `pbfhogg cat <inputs...> -o <output> [--type T] [-c A]... [--direct-io] --force`
+/// and assert success. Returns the captured `CliOutput` so callers
+/// can inspect stderr for stats and stdout if needed.
+///
+/// `clean_attrs` is the list of `-c <name>` flags to pass; passing
+/// `&[]` is equivalent to `CleanAttrs::default()` (no fields cleaned).
+fn run_cat(
+    inputs: &[&Path],
+    output: &Path,
+    type_filter: Option<&str>,
+    clean_attrs: &[&str],
+    direct_io: bool,
+) -> common::cli::CliOutput {
+    let mut cli = CliInvoker::new().arg("cat");
+    for input in inputs {
+        cli = cli.arg(*input);
+    }
+    cli = cli.arg("-o").arg(output);
+    if let Some(types) = type_filter {
+        cli = cli.arg("--type").arg(types);
+    }
+    for attr in clean_attrs {
+        cli = cli.arg("-c").arg(*attr);
+    }
+    if direct_io {
+        cli = cli.arg("--direct-io");
+    }
+    cli.arg("--force").run()
+}
 
 #[test]
 fn cat_passthrough_buffered() {
@@ -37,19 +74,14 @@ fn cat_passthrough_buffered() {
         }],
     );
 
-    let stats = cat(
-        &[input.as_path()],
-        &output,
-        None,
-        &CleanAttrs::default(),
-        Compression::default(),
-        false,
-        true,
-        &pbfhogg::HeaderOverrides::default(),
-    )
-    .expect("cat");
-
-    assert!(stats.blobs_passthrough > 0, "expected passthrough blobs");
+    let out = run_cat(&[&input], &output, None, &[], false);
+    assert!(out.status.success(), "cat failed; stderr:\n{}", out.stderr_str());
+    // Passthrough path summary: "{N} blobs passed through"
+    assert!(
+        out.stderr_str().contains("blobs passed through"),
+        "stderr missing passthrough summary; stderr:\n{}",
+        out.stderr_str(),
+    );
 
     let contents = read_all_elements_with_coords(&output);
     assert_eq!(contents.nodes.len(), 2);
@@ -64,66 +96,7 @@ fn cat_passthrough_buffered() {
 }
 
 // ---------------------------------------------------------------------------
-// O_DIRECT variant
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "linux-direct-io")]
-#[test]
-fn cat_passthrough_direct_io() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let input = dir.path().join("input.osm.pbf");
-    let output = dir.path().join("output.osm.pbf");
-
-    write_test_pbf(
-        &input,
-        &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "a")], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "b")], meta: None },
-        ],
-        &[TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "path")], meta: None }],
-        &[TestRelation {
-            id: 20,
-            members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
-            tags: vec![("type", "multipolygon")],
-            meta: None,
-        }],
-    );
-
-    let result = cat(
-        &[input.as_path()],
-        &output,
-        None,
-        &CleanAttrs::default(),
-        Compression::default(),
-        true,
-        true,
-        &pbfhogg::HeaderOverrides::default(),
-    );
-
-    match result {
-        Ok(stats) => {
-            assert!(stats.blobs_passthrough > 0, "expected passthrough blobs");
-
-            let contents = read_all_elements_with_coords(&output);
-            assert_eq!(contents.nodes.len(), 2);
-            assert_eq!(contents.ways.len(), 1);
-            assert_eq!(contents.relations.len(), 1);
-
-            // Verify element data preserved
-            assert_eq!(contents.nodes[0].0, 1);
-            assert_eq!(contents.nodes[1].0, 2);
-            assert_eq!(contents.ways[0].0, 10);
-            assert_eq!(contents.relations[0].0, 20);
-        }
-        Err(e) if common::is_einval(&*e) => {
-            eprintln!("O_DIRECT not supported on this filesystem, skipping test");
-        }
-        Err(e) => panic!("unexpected error: {e}"),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// F53: Type filtering
+// Type filtering
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -147,17 +120,8 @@ fn cat_type_filter_nodes_only() {
         }],
     );
 
-    let _stats = cat(
-        &[input.as_path()],
-        &output,
-        Some("node"),
-        &CleanAttrs::default(),
-        Compression::default(),
-        false,
-        true,
-        &pbfhogg::HeaderOverrides::default(),
-    )
-    .expect("cat --type node");
+    let out = run_cat(&[&input], &output, Some("node"), &[], false);
+    assert!(out.status.success(), "cat --type node failed; stderr:\n{}", out.stderr_str());
 
     let c = read_all_elements_with_coords(&output);
     assert_eq!(node_ids(&c), vec![1, 2]);
@@ -186,17 +150,8 @@ fn cat_type_filter_ways_only() {
         }],
     );
 
-    let _stats = cat(
-        &[input.as_path()],
-        &output,
-        Some("way"),
-        &CleanAttrs::default(),
-        Compression::default(),
-        false,
-        true,
-        &pbfhogg::HeaderOverrides::default(),
-    )
-    .expect("cat --type way");
+    let out = run_cat(&[&input], &output, Some("way"), &[], false);
+    assert!(out.status.success(), "cat --type way failed; stderr:\n{}", out.stderr_str());
 
     let c = read_all_elements_with_coords(&output);
     assert!(node_ids(&c).is_empty(), "nodes should be filtered out");
@@ -224,17 +179,8 @@ fn cat_type_filter_node_way() {
         }],
     );
 
-    let _stats = cat(
-        &[input.as_path()],
-        &output,
-        Some("node,way"),
-        &CleanAttrs::default(),
-        Compression::default(),
-        false,
-        true,
-        &pbfhogg::HeaderOverrides::default(),
-    )
-    .expect("cat --type node,way");
+    let out = run_cat(&[&input], &output, Some("node,way"), &[], false);
+    assert!(out.status.success(), "cat --type node,way failed; stderr:\n{}", out.stderr_str());
 
     let c = read_all_elements_with_coords(&output);
     assert_eq!(node_ids(&c), vec![1]);
@@ -243,7 +189,7 @@ fn cat_type_filter_node_way() {
 }
 
 // ---------------------------------------------------------------------------
-// F53: Multi-file concatenation
+// Multi-file concatenation
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -266,17 +212,8 @@ fn cat_multi_file() {
         &[],
     );
 
-    let _stats = cat(
-        &[input1.as_path(), input2.as_path()],
-        &output,
-        None,
-        &CleanAttrs::default(),
-        Compression::default(),
-        false,
-        true,
-        &pbfhogg::HeaderOverrides::default(),
-    )
-    .expect("cat multi-file");
+    let out = run_cat(&[&input1, &input2], &output, None, &[], false);
+    assert!(out.status.success(), "cat multi-file failed; stderr:\n{}", out.stderr_str());
 
     let c = read_all_elements_with_coords(&output);
     assert_eq!(c.nodes.len(), 2);
@@ -289,15 +226,13 @@ fn cat_multi_file() {
 // CleanAttrs field stripping
 // ---------------------------------------------------------------------------
 //
-// `CleanAttrs` selectively zeros metadata fields (version, changeset,
-// timestamp, uid) and empties `user` via `clean_metadata` in
-// `src/commands/mod.rs`. Before these tests, every `cat` fixture used
-// `CleanAttrs::default()` (no-op), so the field-stripping code had no
-// direct coverage. Each test below writes a fixture whose elements all
-// carry metadata with distinctive non-zero values, runs `cat` with a
-// specific CleanAttrs configuration, reads the result via
-// `read_normalized`, and asserts that exactly the requested fields were
-// cleaned while every other field round-tripped intact.
+// `--clean <ATTR>` selectively zeros metadata fields (version,
+// changeset, timestamp, uid) and empties `user` via
+// `clean_metadata` in `src/commands/mod.rs`. Each test below writes a
+// fixture whose elements all carry metadata with distinctive non-zero
+// values, runs `cat` with a specific set of `-c` flags, reads the
+// result via `read_normalized`, and asserts that exactly the requested
+// fields were cleaned while every other field round-tripped intact.
 
 /// Metadata values that are impossible to get "accidentally": every
 /// field is distinct and non-zero, so a cleared field is unambiguous.
@@ -315,7 +250,7 @@ fn sentinel_meta() -> TestMeta {
 /// Build a small sorted+indexed fixture with sentinel metadata on every
 /// node, way, and relation. One of each type is enough - `clean_metadata`
 /// runs per-element and has no cross-element coupling we need to stress.
-fn write_clean_fixture(path: &std::path::Path) {
+fn write_clean_fixture(path: &Path) {
     let meta = Some(sentinel_meta());
     write_test_pbf(
         path,
@@ -341,32 +276,27 @@ fn write_clean_fixture(path: &std::path::Path) {
     );
 }
 
-/// Run cat with the supplied `CleanAttrs` and return the normalized
+/// Run cat with the supplied `-c` flag list and return the normalized
 /// output PBF. Shared by every `clean_*` test.
-fn cat_with_clean(clean: &CleanAttrs) -> common::NormalizedPbf {
+fn cat_with_clean(clean_attrs: &[&str]) -> NormalizedPbf {
     let dir = tempfile::tempdir().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_clean_fixture(&input);
 
-    cat(
-        &[&input],
-        &output,
-        None,
-        clean,
-        Compression::default(),
-        false,
-        true,
-        &pbfhogg::HeaderOverrides::default(),
-    )
-    .expect("cat --clean");
+    let out = run_cat(&[&input], &output, None, clean_attrs, false);
+    assert!(
+        out.status.success(),
+        "cat --clean failed; stderr:\n{}",
+        out.stderr_str(),
+    );
 
     read_normalized(&output)
 }
 
 #[test]
 fn clean_default_preserves_all_metadata() {
-    let c = cat_with_clean(&CleanAttrs::default());
+    let c = cat_with_clean(&[]);
 
     // Nothing cleaned - every field should round-trip to the sentinel.
     let sentinel = sentinel_meta();
@@ -386,7 +316,7 @@ fn clean_default_preserves_all_metadata() {
 
 #[test]
 fn clean_version_only() {
-    let c = cat_with_clean(&CleanAttrs { version: true, ..CleanAttrs::default() });
+    let c = cat_with_clean(&["version"]);
     let sentinel = sentinel_meta();
 
     for (what, meta) in [
@@ -405,7 +335,7 @@ fn clean_version_only() {
 
 #[test]
 fn clean_user_only() {
-    let c = cat_with_clean(&CleanAttrs { user: true, ..CleanAttrs::default() });
+    let c = cat_with_clean(&["user"]);
     let sentinel = sentinel_meta();
 
     for (what, meta) in [
@@ -424,11 +354,7 @@ fn clean_user_only() {
 
 #[test]
 fn clean_timestamp_and_changeset() {
-    let c = cat_with_clean(&CleanAttrs {
-        timestamp: true,
-        changeset: true,
-        ..CleanAttrs::default()
-    });
+    let c = cat_with_clean(&["timestamp", "changeset"]);
     let sentinel = sentinel_meta();
 
     for (what, meta) in [
@@ -447,13 +373,7 @@ fn clean_timestamp_and_changeset() {
 
 #[test]
 fn clean_all_fields() {
-    let c = cat_with_clean(&CleanAttrs {
-        version: true,
-        changeset: true,
-        timestamp: true,
-        uid: true,
-        user: true,
-    });
+    let c = cat_with_clean(&["version", "changeset", "timestamp", "uid", "user"]);
 
     // Every cleanable field is zero / empty on every element type.
     for (what, meta) in [
@@ -492,23 +412,18 @@ fn clean_does_not_fabricate_metadata_on_meta_less_elements() {
         &[],
     );
 
-    cat(
+    let out = run_cat(
         &[&input],
         &output,
         None,
-        &CleanAttrs {
-            version: true,
-            changeset: true,
-            timestamp: true,
-            uid: true,
-            user: true,
-        },
-        Compression::default(),
+        &["version", "changeset", "timestamp", "uid", "user"],
         false,
-        true,
-        &pbfhogg::HeaderOverrides::default(),
-    )
-    .expect("cat --clean on metadata-less input");
+    );
+    assert!(
+        out.status.success(),
+        "cat --clean on metadata-less input failed; stderr:\n{}",
+        out.stderr_str(),
+    );
 
     let c = read_normalized(&output);
     assert_eq!(c.nodes.len(), 1);
@@ -522,14 +437,13 @@ fn clean_does_not_fabricate_metadata_on_meta_less_elements() {
 // Multi-blob raw passthrough for `cat --type way`
 // ---------------------------------------------------------------------------
 //
-// `cat_type_passthrough` at `src/commands/cat/mod.rs:191` uses the
-// per-blob indexdata to decide whether a blob's elements match the type
-// filter. Matching blobs go through `writer.write_raw_owned` as
-// pre-framed bytes (`blobs_passthrough++`); non-matching blobs are
-// `continue`-skipped entirely. With a single blob per type in the
-// fixture, existing tests exercise only the N=1 case. This test forces
-// multiple blobs per type via `write_multi_block_test_pbf` and asserts
-// `stats.blobs_passthrough` equals the number of way blobs.
+// `cat_type_passthrough` at `src/commands/cat/mod.rs` uses the per-blob
+// indexdata to decide whether a blob's elements match the type filter.
+// Matching blobs go through `writer.write_raw_owned` as pre-framed
+// bytes (counts toward `blobs_passthrough`); non-matching blobs are
+// skipped entirely. This test forces multiple blobs per type via
+// `write_multi_block_test_pbf` and asserts the stderr summary names
+// the expected number of passthrough blobs.
 
 #[test]
 fn cat_type_way_passthrough_across_multiple_blobs() {
@@ -544,24 +458,17 @@ fn cat_type_way_passthrough_across_multiple_blobs() {
     let ways = generate_ways(20, 1_000, 2, 1);
     write_multi_block_test_pbf(&input, &nodes, &ways, &[], 10);
 
-    let stats = cat(
-        &[&input],
-        &output,
-        Some("way"),
-        &CleanAttrs::default(),
-        Compression::default(),
-        false,
-        true,
-        &pbfhogg::HeaderOverrides::default(),
-    )
-    .expect("cat --type way");
+    let out = run_cat(&[&input], &output, Some("way"), &[], false);
+    assert!(out.status.success(), "cat --type way failed; stderr:\n{}", out.stderr_str());
 
-    assert_eq!(
-        stats.blobs_passthrough, 2,
-        "expected exactly 2 way blobs to pass through, got {} (blobs_decoded={})",
-        stats.blobs_passthrough, stats.blobs_decoded
+    // Passthrough summary fires when blobs_decoded == 0; in
+    // type-filter raw passthrough we expect exactly 2 way blobs
+    // through, so the line is "2 blobs passed through".
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("2 blobs passed through"),
+        "expected '2 blobs passed through' in stderr; got:\n{stderr}",
     );
-    assert_eq!(stats.blobs_decoded, 0, "no blob should be decoded in type-passthrough mode");
 
     // Round-trip check: all 20 ways present, zero nodes, zero relations.
     let c = read_all_elements_with_coords(&output);
@@ -572,4 +479,68 @@ fn cat_type_way_passthrough_across_multiple_blobs() {
         (1_000..1_020).collect::<Vec<_>>(),
         "all way ids must survive raw passthrough"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Platform tier
+// ---------------------------------------------------------------------------
+//
+// `--direct-io` on a filesystem that supports O_DIRECT must produce
+// identical output to the default path. Wrapped in `mod platform` so
+// the brokkr platform profile (T11) can target it via
+// `cargo test platform::`.
+
+#[cfg(feature = "linux-direct-io")]
+mod platform {
+    use super::*;
+
+    #[test]
+    fn cat_passthrough_direct_io() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = dir.path().join("input.osm.pbf");
+        let output = dir.path().join("output.osm.pbf");
+
+        write_test_pbf(
+            &input,
+            &[
+                TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "a")], meta: None },
+                TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "b")], meta: None },
+            ],
+            &[TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "path")], meta: None }],
+            &[TestRelation {
+                id: 20,
+                members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+                tags: vec![("type", "multipolygon")],
+                meta: None,
+            }],
+        );
+
+        let out = run_cat(&[&input], &output, None, &[], true);
+        if out.is_o_direct_unsupported() {
+            eprintln!("O_DIRECT not supported on this filesystem, skipping test");
+            return;
+        }
+        assert!(
+            out.status.success(),
+            "cat --direct-io failed unexpectedly; stderr:\n{}",
+            out.stderr_str(),
+        );
+
+        assert!(
+            out.stderr_str().contains("blobs passed through"),
+            "stderr missing passthrough summary; stderr:\n{}",
+            out.stderr_str(),
+        );
+
+        let contents = read_all_elements_with_coords(&output);
+        assert_eq!(contents.nodes.len(), 2);
+        assert_eq!(contents.ways.len(), 1);
+        assert_eq!(contents.relations.len(), 1);
+
+        // Verify element data preserved
+        assert_eq!(contents.nodes[0].0, 1);
+        assert_eq!(contents.nodes[1].0, 2);
+        assert_eq!(contents.ways[0].0, 10);
+        assert_eq!(contents.relations[0].0, 20);
+    }
 }

@@ -1,44 +1,78 @@
-//! Tags-filter correctness tests.
+//! CLI-driven integration tests for `pbfhogg tags-filter`.
+//!
+//! Replaces the library-API `tests/tags_filter.rs`. Fixture PBFs
+//! are built with the stable-allowlist writers; `tags-filter`
+//! runs through `CliInvoker`; output is verified by reading the
+//! resulting PBF with the stable-allowlist readers. No imports
+//! from `pbfhogg::tags_filter::*` - a rewrite of
+//! `src/commands/tags_filter/` cannot break these tests by type
+//! changes alone.
+//!
+//! The original library tests asserted on individual `TagsFilterStats`
+//! counters (`nodes_matched`, `nodes_from_ways`, etc.). For the CLI
+//! shape those assertions are redundant with the element-set
+//! assertions on every test except the jobs-parity test, so they are
+//! dropped here. The jobs-parity test compares the full stderr
+//! summary lines between `-j 1` and `-j 4` to pin classifier
+//! consistency under sharding.
+
+#![allow(clippy::unwrap_used)]
 
 mod common;
 
+use std::path::Path;
+
+use common::cli::CliInvoker;
 use common::{
     generate_nodes, generate_relations, generate_ways,
     node_ids_id_only as node_ids, read_all_elements_id_only as read_all_elements,
     relation_ids_id_only as relation_ids, way_ids_id_only as way_ids,
-    write_multi_block_test_pbf, write_test_pbf, TestMember, TestNode, TestRelation, TestWay,
+    write_multi_block_test_pbf, write_test_pbf, PbfContentsIdOnly, TestMember, TestNode,
+    TestRelation, TestWay,
 };
 use pbfhogg::MemberId;
-use pbfhogg::tags_filter::{tags_filter, TagsFilterOptions};
-use pbfhogg::writer::Compression;
 use tempfile::TempDir;
 
-fn run_filter(
-    input: &std::path::Path,
-    output: &std::path::Path,
-    expression_strs: &[String],
+/// Invoke `pbfhogg tags-filter <input> -o <output> [-R] [-i] [-t]
+/// [-j N] <expressions...> --force` and assert success. Returns
+/// the captured stderr (which carries the
+/// `TagsFilterStats::print_summary` line).
+fn run_filter_full(
+    input: &Path,
+    output: &Path,
+    expressions: &[&str],
     omit_referenced: bool,
-) -> pbfhogg::tags_filter::TagsFilterStats {
-    let opts = TagsFilterOptions {
-        expression_strs,
-        omit_referenced,
-        invert: false,
-        remove_tags: false,
-        compression: Compression::default(),
-        direct_io: false,
-        force: true,
-        jobs: None,
-    };
-    tags_filter(input, output, &opts, &pbfhogg::HeaderOverrides::default()).expect("filter")
+    invert: bool,
+    remove_tags: bool,
+    jobs: Option<usize>,
+) -> String {
+    let mut cli = CliInvoker::new()
+        .arg("tags-filter")
+        .arg(input)
+        .arg("-o")
+        .arg(output);
+    if omit_referenced {
+        cli = cli.arg("-R");
+    }
+    if invert {
+        cli = cli.arg("-i");
+    }
+    if remove_tags {
+        cli = cli.arg("-t");
+    }
+    if let Some(j) = jobs {
+        cli = cli.arg("-j").arg(j.to_string());
+    }
+    cli = cli.arg("--force");
+    for expr in expressions {
+        cli = cli.arg(*expr);
+    }
+    cli.assert_success().stderr_str()
 }
 
-fn exprs(strs: &[&str]) -> Vec<String> {
-    strs.iter().map(ToString::to_string).collect()
+fn run_filter(input: &Path, output: &Path, expressions: &[&str], omit_referenced: bool) -> String {
+    run_filter_full(input, output, expressions, omit_referenced, false, false, None)
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[test]
 fn key_only_filter() {
@@ -57,11 +91,9 @@ fn key_only_filter() {
         &[],
     );
 
-    let stats = run_filter(&input, &output, &exprs(&["amenity"]), true);
+    run_filter(&input, &output, &["amenity"], true);
     let c = read_all_elements(&output);
-
     assert_eq!(node_ids(&c), vec![1, 3]);
-    assert_eq!(stats.nodes_matched, 2);
 }
 
 #[test]
@@ -85,12 +117,10 @@ fn exact_value_filter() {
         &[],
     );
 
-    let stats = run_filter(&input, &output, &exprs(&["highway=primary"]), true);
+    run_filter(&input, &output, &["highway=primary"], true);
     let c = read_all_elements(&output);
-
     assert_eq!(way_ids(&c), vec![10]);
     assert!(node_ids(&c).is_empty());
-    assert_eq!(stats.ways_matched, 1);
 }
 
 #[test]
@@ -110,11 +140,9 @@ fn multi_value_filter() {
         ],
     );
 
-    let stats = run_filter(&input, &output, &exprs(&["type=multipolygon,boundary"]), true);
+    run_filter(&input, &output, &["type=multipolygon,boundary"], true);
     let c = read_all_elements(&output);
-
     assert_eq!(relation_ids(&c), vec![1, 2]);
-    assert_eq!(stats.relations_matched, 2);
 }
 
 #[test]
@@ -134,14 +162,12 @@ fn negation_filter() {
         &[],
     );
 
-    let stats = run_filter(&input, &output, &exprs(&["highway!=primary"]), true);
+    run_filter(&input, &output, &["highway!=primary"], true);
     let c = read_all_elements(&output);
-
     // Only way 11 matches: has highway tag with value != primary
     // Way 10: highway=primary -> excluded by negation
     // Way 12: no highway tag -> no match
     assert_eq!(way_ids(&c), vec![11]);
-    assert_eq!(stats.ways_matched, 1);
 }
 
 #[test]
@@ -161,11 +187,9 @@ fn wildcard_prefix_filter() {
         &[],
     );
 
-    let stats = run_filter(&input, &output, &exprs(&["addr:*"]), true);
+    run_filter(&input, &output, &["addr:*"], true);
     let c = read_all_elements(&output);
-
     assert_eq!(node_ids(&c), vec![1, 2]);
-    assert_eq!(stats.nodes_matched, 2);
 }
 
 #[test]
@@ -186,13 +210,10 @@ fn type_prefix_filter() {
     );
 
     // w/ prefix - only ways
-    let stats = run_filter(&input, &output, &exprs(&["w/building=yes"]), true);
+    run_filter(&input, &output, &["w/building=yes"], true);
     let c = read_all_elements(&output);
-
     assert!(node_ids(&c).is_empty());
     assert_eq!(way_ids(&c), vec![10]);
-    assert_eq!(stats.ways_matched, 1);
-    assert_eq!(stats.nodes_matched, 0);
 }
 
 #[test]
@@ -214,15 +235,11 @@ fn combined_type_prefix_nw() {
         ],
     );
 
-    let stats = run_filter(&input, &output, &exprs(&["nw/natural=tree"]), true);
+    run_filter(&input, &output, &["nw/natural=tree"], true);
     let c = read_all_elements(&output);
-
     assert_eq!(node_ids(&c), vec![1]);
     assert_eq!(way_ids(&c), vec![10]);
     assert!(relation_ids(&c).is_empty());
-    assert_eq!(stats.nodes_matched, 1);
-    assert_eq!(stats.ways_matched, 1);
-    assert_eq!(stats.relations_matched, 0);
 }
 
 #[test]
@@ -246,14 +263,16 @@ fn two_pass_includes_way_dep_nodes() {
     );
 
     // Default mode (include references)
-    let stats = run_filter(&input, &output, &exprs(&["highway=primary"]), false);
+    let stderr = run_filter(&input, &output, &["highway=primary"], false);
     let c = read_all_elements(&output);
-
     assert_eq!(node_ids(&c), vec![1, 2, 3]); // referenced nodes included
     assert_eq!(way_ids(&c), vec![10]);
-    assert_eq!(stats.ways_matched, 1);
-    assert_eq!(stats.nodes_from_ways, 3);
-    assert_eq!(stats.nodes_matched, 0);
+    // Pin the from-ways count specifically: this test is the canonical
+    // proof that referenced nodes are pulled in via the second pass.
+    assert!(
+        stderr.contains("3 nodes (0 direct + 3 from ways + 0 from relations)"),
+        "stats line missing expected counters; stderr =\n{stderr}",
+    );
 }
 
 #[test]
@@ -275,13 +294,10 @@ fn omit_referenced_excludes_way_dep_nodes() {
     );
 
     // -R mode (omit references)
-    let stats = run_filter(&input, &output, &exprs(&["highway=primary"]), true);
+    run_filter(&input, &output, &["highway=primary"], true);
     let c = read_all_elements(&output);
-
-    assert!(node_ids(&c).is_empty()); // no referenced nodes
+    assert!(node_ids(&c).is_empty());
     assert_eq!(way_ids(&c), vec![10]);
-    assert_eq!(stats.ways_matched, 1);
-    assert_eq!(stats.nodes_from_ways, 0);
 }
 
 #[test]
@@ -304,14 +320,16 @@ fn two_pass_direct_node_match_plus_way_deps() {
         &[],
     );
 
-    let stats = run_filter(&input, &output, &exprs(&["amenity", "highway=primary"]), false);
+    let stderr = run_filter(&input, &output, &["amenity", "highway=primary"], false);
     let c = read_all_elements(&output);
-
     assert_eq!(node_ids(&c), vec![1, 2, 3]); // 1 direct, 2+3 from way
     assert_eq!(way_ids(&c), vec![10]);
-    assert_eq!(stats.nodes_matched, 1);
-    assert_eq!(stats.nodes_from_ways, 2);
-    assert_eq!(stats.ways_matched, 1);
+    // Pin the direct/from-ways split: this test specifically exercises
+    // the case where direct matches and reference expansion overlap.
+    assert!(
+        stderr.contains("3 nodes (1 direct + 2 from ways + 0 from relations)"),
+        "stats line missing expected counters; stderr =\n{stderr}",
+    );
 }
 
 #[test]
@@ -329,15 +347,11 @@ fn empty_result_produces_valid_pbf() {
         &[],
     );
 
-    let stats = run_filter(&input, &output, &exprs(&["nonexistent_key"]), true);
+    run_filter(&input, &output, &["nonexistent_key"], true);
     let c = read_all_elements(&output);
-
     assert!(node_ids(&c).is_empty());
     assert!(way_ids(&c).is_empty());
     assert!(relation_ids(&c).is_empty());
-    assert_eq!(stats.nodes_matched, 0);
-    assert_eq!(stats.ways_matched, 0);
-    assert_eq!(stats.relations_matched, 0);
 }
 
 #[test]
@@ -358,11 +372,9 @@ fn multiple_expressions_or_semantics() {
     );
 
     // Both "amenity" and "shop" - OR semantics
-    let stats = run_filter(&input, &output, &exprs(&["amenity", "shop"]), true);
+    run_filter(&input, &output, &["amenity", "shop"], true);
     let c = read_all_elements(&output);
-
     assert_eq!(node_ids(&c), vec![1, 2]);
-    assert_eq!(stats.nodes_matched, 2);
 }
 
 #[test]
@@ -392,17 +404,21 @@ fn relation_match_includes_member_way_and_nodes() {
         ],
     );
 
-    let stats = run_filter(&input, &output, &exprs(&["type=multipolygon"]), false);
+    let stderr = run_filter(&input, &output, &["type=multipolygon"], false);
     let c = read_all_elements(&output);
-
     assert_eq!(relation_ids(&c), vec![100]);
     assert_eq!(way_ids(&c), vec![10]);
     assert_eq!(node_ids(&c), vec![1, 2]);
-    assert_eq!(stats.relations_matched, 1);
-    assert_eq!(stats.ways_matched, 0);
-    assert_eq!(stats.ways_from_relations, 1);
-    assert_eq!(stats.nodes_from_ways, 0);
-    assert_eq!(stats.nodes_from_relations, 2);
+    // Pin the relation-pulls-way and way-pulls-node chain explicitly.
+    // The way-total is 1 (0 direct + 1 pulled from the relation).
+    assert!(
+        stderr.contains("1 ways (0 direct + 1 from relations)"),
+        "stats line missing 'ways from relations' counter; stderr =\n{stderr}",
+    );
+    assert!(
+        stderr.contains("2 nodes (0 direct + 0 from ways + 2 from relations)"),
+        "stats line missing 'nodes from relations' counter; stderr =\n{stderr}",
+    );
 }
 
 #[test]
@@ -436,9 +452,8 @@ fn relation_match_includes_nested_relation_members() {
         ],
     );
 
-    let _stats = run_filter(&input, &output, &exprs(&["type=route"]), false);
+    run_filter(&input, &output, &["type=route"], false);
     let c = read_all_elements(&output);
-
     assert_eq!(relation_ids(&c), vec![100, 200]);
     assert_eq!(way_ids(&c), vec![10]);
     assert_eq!(node_ids(&c), vec![1, 2]);
@@ -470,9 +485,8 @@ fn relation_cycle_terminates_and_includes_each_once() {
         ],
     );
 
-    let _stats = run_filter(&input, &output, &exprs(&["type=route"]), false);
+    run_filter(&input, &output, &["type=route"], false);
     let c = read_all_elements(&output);
-
     assert_eq!(relation_ids(&c), vec![100, 200]);
 }
 
@@ -501,39 +515,16 @@ fn omit_referenced_does_not_expand_relation_members() {
         ],
     );
 
-    let stats = run_filter(&input, &output, &exprs(&["type=multipolygon"]), true);
+    run_filter(&input, &output, &["type=multipolygon"], true);
     let c = read_all_elements(&output);
-
     assert_eq!(relation_ids(&c), vec![100]);
     assert!(way_ids(&c).is_empty());
     assert!(node_ids(&c).is_empty());
-    assert_eq!(stats.relations_matched, 1);
 }
 
 // ---------------------------------------------------------------------------
-// F49: --invert-match
+// --invert-match
 // ---------------------------------------------------------------------------
-
-fn run_filter_opts(
-    input: &std::path::Path,
-    output: &std::path::Path,
-    expression_strs: &[String],
-    omit_referenced: bool,
-    invert: bool,
-    remove_tags: bool,
-) -> pbfhogg::tags_filter::TagsFilterStats {
-    let opts = TagsFilterOptions {
-        expression_strs,
-        omit_referenced,
-        invert,
-        remove_tags,
-        compression: Compression::default(),
-        direct_io: false,
-        force: true,
-        jobs: None,
-    };
-    tags_filter(input, output, &opts, &pbfhogg::HeaderOverrides::default()).expect("filter")
-}
 
 #[test]
 fn invert_match_excludes_matching_nodes() {
@@ -553,12 +544,10 @@ fn invert_match_excludes_matching_nodes() {
     );
 
     // Invert: output nodes that do NOT match "amenity"
-    let stats = run_filter_opts(&input, &output, &exprs(&["amenity"]), true, true, false);
+    run_filter_full(&input, &output, &["amenity"], true, true, false, None);
     let c = read_all_elements(&output);
-
     // Node 1 has amenity → excluded. Nodes 2 and 3 → included.
     assert_eq!(node_ids(&c), vec![2, 3]);
-    assert_eq!(stats.nodes_matched, 2);
 }
 
 #[test]
@@ -582,15 +571,14 @@ fn invert_match_excludes_matching_ways() {
     );
 
     // Invert: output ways that do NOT match "highway"
-    let _stats = run_filter_opts(&input, &output, &exprs(&["highway"]), true, true, false);
+    run_filter_full(&input, &output, &["highway"], true, true, false, None);
     let c = read_all_elements(&output);
-
     // Ways 10, 11 have highway → excluded. Way 12 → included.
     assert_eq!(way_ids(&c), vec![12]);
 }
 
 // ---------------------------------------------------------------------------
-// F50: --remove-tags
+// --remove-tags
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -613,20 +601,26 @@ fn remove_tags_strips_tags_from_referenced_nodes() {
 
     // Two-pass (omit_referenced=false) with remove_tags: way 10 matches
     // "highway", its referenced nodes 1,2 are pulled in but with tags stripped.
-    let _stats = run_filter_opts(&input, &output, &exprs(&["highway"]), false, false, true);
-    let c = read_all_elements(&output);
+    run_filter_full(&input, &output, &["highway"], false, false, true, None);
+
+    // Use the with-coords reader (the id-only reader doesn't return tags),
+    // brought in just for this assertion.
+    let c = common::read_all_elements_with_coords(&output);
 
     // Way 10 should keep its tags (directly matched)
-    assert_eq!(way_ids(&c), vec![10]);
-    let way_tags: Vec<_> = c.ways.iter()
+    assert_eq!(c.ways.iter().map(|w| w.0).collect::<Vec<_>>(), vec![10]);
+    let way_tags: Vec<_> = c
+        .ways
+        .iter()
         .find(|(id, _, _)| *id == 10)
         .map(|(_, _, tags)| tags.clone())
         .unwrap_or_default();
     assert!(!way_tags.is_empty(), "directly matched way should keep tags");
 
-    // Nodes 1,2 should be present but with empty tags (referenced only)
-    assert_eq!(node_ids(&c), vec![1, 2]);
-    for (id, tags) in &c.nodes {
+    // Nodes 1,2 should be present but with empty tags (referenced only).
+    let node_id_list: Vec<i64> = c.nodes.iter().map(|(id, _, _, _)| *id).collect();
+    assert_eq!(node_id_list, vec![1, 2]);
+    for (id, _, _, tags) in &c.nodes {
         assert!(tags.is_empty(), "node {id} should have tags stripped (referenced only)");
     }
 }
@@ -635,33 +629,29 @@ fn remove_tags_strips_tags_from_referenced_nodes() {
 // Parallel classify parity: jobs=1 vs jobs=4 across multiple blobs
 // ---------------------------------------------------------------------------
 //
-// Two-pass `tags_filter` routes blob scanning through
+// Two-pass `tags-filter` routes blob scanning through
 // `parallel_classify_phase` and the follow-up relation/way-node
-// dependency closures through two `parallel_classify_accumulate` calls.
-// `TagsFilterOptions.jobs` caps the worker-pool size for all three
-// calls (src/commands/tags_filter/mod.rs:150-160). With single-blob
-// fixtures the sharding is trivial; this test forces 4 node blobs +
-// 2 way blobs + 2 relation blobs and asserts that jobs=1 and jobs=4
-// produce the same element set and identical stats.
+// dependency closures through two `parallel_classify_accumulate`
+// calls. `-j N` caps the worker-pool size for all three calls. With
+// single-blob fixtures the sharding is trivial; this test forces
+// multiple blobs and asserts that jobs=1 and jobs=4 produce the same
+// element set and identical stats. The full stderr summary line is
+// compared verbatim - that is the user-observable surface for every
+// counter the library tracks.
 
-fn run_tags_filter(input: &std::path::Path, jobs: Option<usize>) -> (common::PbfContentsIdOnly, pbfhogg::tags_filter::TagsFilterStats) {
+fn run_parity(input: &Path, jobs: usize) -> (PbfContentsIdOnly, String) {
     let dir = TempDir::new().expect("tempdir");
     let output = dir.path().join("output.osm.pbf");
-    let expression_strs = vec!["w/highway=primary".to_string()];
-    let opts = TagsFilterOptions {
-        expression_strs: &expression_strs,
-        omit_referenced: false,
-        invert: false,
-        remove_tags: false,
-        compression: Compression::default(),
-        direct_io: false,
-        force: true,
-        jobs,
-    };
-    let stats = tags_filter(input, &output, &opts, &pbfhogg::HeaderOverrides::default())
-        .expect("tags_filter");
-    let c = read_all_elements(&output);
-    (c, stats)
+    let stderr = run_filter_full(
+        input,
+        &output,
+        &["w/highway=primary"],
+        false,
+        false,
+        false,
+        Some(jobs),
+    );
+    (read_all_elements(&output), stderr)
 }
 
 #[test]
@@ -684,21 +674,32 @@ fn tags_filter_parallel_classify_parity() {
 
     write_multi_block_test_pbf(&input, &nodes, &ways, &relations, 10);
 
-    let (c_seq, s_seq) = run_tags_filter(&input, Some(1));
-    let (c_par, s_par) = run_tags_filter(&input, Some(4));
+    let (c_seq, stderr_seq) = run_parity(&input, 1);
+    let (c_par, stderr_par) = run_parity(&input, 4);
 
-    // Stats must match exactly.
-    assert_eq!(s_seq.nodes_matched, s_par.nodes_matched, "nodes_matched parity");
-    assert_eq!(s_seq.nodes_from_ways, s_par.nodes_from_ways, "nodes_from_ways parity");
-    assert_eq!(s_seq.ways_matched, s_par.ways_matched, "ways_matched parity");
-    assert_eq!(s_seq.relations_matched, s_par.relations_matched, "relations_matched parity");
-
-    // Element sets must match (ids only, order preserved since sorted input).
+    // Element sets must match (ids only, order preserved on sorted input).
     assert_eq!(node_ids(&c_seq), node_ids(&c_par), "node id set diverges under -j 4");
     assert_eq!(way_ids(&c_seq), way_ids(&c_par), "way id set diverges under -j 4");
     assert_eq!(relation_ids(&c_seq), relation_ids(&c_par), "relation id set diverges under -j 4");
 
+    // The full summary line must match. This pins every counter
+    // (`nodes_matched`, `nodes_from_ways`, `nodes_from_relations`,
+    // `ways_matched`, `ways_from_relations`, `relations_matched`,
+    // `relations_from_relations`) without parsing each one.
+    let line_seq = stderr_seq
+        .lines()
+        .find(|l| l.starts_with("Wrote "))
+        .expect("stats line in -j 1 stderr");
+    let line_par = stderr_par
+        .lines()
+        .find(|l| l.starts_with("Wrote "))
+        .expect("stats line in -j 4 stderr");
+    assert_eq!(line_seq, line_par, "TagsFilterStats summary diverges under -j 4");
+
     // Sanity: the filter must have matched SOME ways (otherwise the
     // test is trivially parity-clean because nothing is emitted).
-    assert!(s_seq.ways_matched > 0, "filter must match at least one way");
+    assert!(
+        !way_ids(&c_seq).is_empty(),
+        "filter must match at least one way"
+    );
 }

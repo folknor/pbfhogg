@@ -100,9 +100,9 @@ audit doc for full reasoning):
 4. `cli_altw.rs` - 18 tests. Blocks ALTW rewrite (the motivating example).
 5. `cli_sort.rs` (landed), `cli_time_filter.rs` (landed 2026-04-25),
    `cli_merge_changes.rs` (landed 2026-04-25), `cli_cat.rs`
-   (landed 2026-04-25), `cli_getid.rs`, `cli_tags_filter.rs`,
-   `cli_renumber.rs`, `cli_tags_count.rs` - 126 tests across 11
-   existing files. Convert
+   (landed 2026-04-25), `cli_tags_filter.rs` (landed 2026-04-25),
+   `cli_getid.rs`, `cli_renumber.rs`, `cli_tags_count.rs` - 126
+   tests across 11 existing files. Convert
    them after the tier split is clear; do not blindly mirror every
    old test in Tier 1. Note that text-output commands
    (`tags-count`, `getid`, `inspect --tags`) have a different test

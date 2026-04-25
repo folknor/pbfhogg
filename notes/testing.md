@@ -16,8 +16,13 @@ surface audit that drove the reorg plan below.
 - **Fault-injection harness:** complete across all 8 parallel pipelines.
   Caught one real deadlock (apply-changes drain) and one real scratch
   leak (derive_parallel outer temp files); both fixed along the way.
-  Eight tests still `#[ignore]`d due to shared-state races - the reorg
-  un-ignores them by splitting into per-binary files.
+- **Fault-injection split:** landed (2026-04-25). Eight per-binary
+  `tests/fault_*.rs` files, one per pipeline. Static `PANIC_AT_*`
+  atomics are now per-process and race-free, so all seven previously
+  `#[ignore]`d tests run unguarded under `brokkr check`. The uring
+  writer test still skips on hosts where io_uring init fails (low
+  `RLIMIT_MEMLOCK`, missing kernel feature) - that is an environment
+  skip, not the static-atomic race the split solved.
 - **CLI-decoupled test reorg:** plan below. Motivation: internal module
   rewrites (ALTW stages, geocode passes, apply-changes pipeline) should
   not break integration tests. Today 18 of 30 `tests/*.rs` import
@@ -122,20 +127,21 @@ all commands. Until the fix lands, the recommended fallback is
 inline unit tests in `src/commands/mod.rs` under
 `#[cfg(all(test, not(feature = "...")))]`.
 
-**Fault-injection split** - un-ignores all 8 tests, independent of
-the CLI conversion work:
+**Fault-injection split** - landed 2026-04-25. Each cargo integration
+test file compiles to its own binary, so the `PANIC_AT_*` static
+atomics are per-process and race-free without `#[ignore]` or
+`--test-threads=1`.
 
-- Split `tests/fault_injection.rs` (+ the `apply-changes` panic test
-  currently in `apply_changes_invariants.rs`) into eight binaries:
-  `fault_apply_changes.rs`, `fault_parallel_writer.rs`,
-  `fault_parallel_gzip.rs`, `fault_uring_writer.rs`,
-  `fault_diff_parallel.rs`, `fault_derive_parallel.rs`,
-  `fault_altw_stage3.rs`, `fault_geocode_pass3.rs`. Each cargo
-  integration test file compiles to its own binary, so the
-  `PANIC_AT_*` static atomics are per-process and race-free without
-  `#[ignore]` or `--test-threads=1`.
-- Hook-consolidation note below becomes "explicitly don't consolidate"
-  - per-binary isolation relies on the atomics being distinct symbols
+- `tests/fault_injection.rs` deleted; six pipeline modules (uring,
+  diff_parallel, derive_parallel, geocode_pass3, altw_stage3,
+  parallel_gzip) lifted to per-binary files.
+- Two apply-changes fault tests moved out of
+  `tests/apply_changes_invariants.rs`: `fault_apply_changes.rs` houses
+  the per-instance `MergeOptions::panic_at_blob_seq` test;
+  `fault_parallel_writer.rs` houses the static-atomic
+  `parallel_writer` test.
+- Hook-consolidation rule below: explicitly don't consolidate -
+  per-binary isolation relies on the atomics being distinct symbols
   in distinct binaries.
 
 ## External cross-validation: brokkr-side

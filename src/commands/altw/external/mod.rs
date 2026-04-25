@@ -62,36 +62,85 @@ pub(super) const MAX_NODE_ID: u64 = 14_000_000_000;
 /// `bucket_width = ceil(max_node_id / num_buckets)`, with a floor of 1
 /// so empty inputs (`max_node_id = 0`) still produce a usable mapping.
 /// The `div_ceil` rounds up so every node id in `[0, max_node_id]` maps
-/// strictly into the first `num_buckets` buckets when paired with the
-/// `min(num_buckets - 1)` clamp in `bucket_for`.
+/// into the first `num_buckets` buckets when paired with the
+/// `min(num_buckets - 1)` clamp inside [`BucketLayout::locate`].
 ///
-/// Stage-1 pass A computes `local_node_id = (node_id - bucket_lo) as u32`
-/// per emitted record; the assertion at bucket-init time pins
-/// `bucket_width <= u32::MAX` so the cast is lossless. At planet
-/// (max_node_id ~= 14e9, 256 buckets) `bucket_width ~= 55M`, six orders
-/// of magnitude under 2^32.
-#[allow(dead_code)] // wired up in step 2 of A1 (pass-A IdRecord emission).
+/// Stage-1 pass A computes `local_node_id = (node_id - bucket_lo) as
+/// u32`. [`BucketLayout::new`] asserts `bucket_width <= u32::MAX` so
+/// the cast is lossless for any `node_id` inside `[0, max_node_id]`. At
+/// planet (max_node_id ~= 14e9, 256 buckets) `bucket_width ~= 55M`,
+/// six orders of magnitude under 2^32.
+#[allow(dead_code)] // exposed for testing; production callers use BucketLayout.
 pub(super) fn bucket_width(max_node_id: u64, num_buckets: usize) -> u64 {
     debug_assert!(num_buckets > 0, "num_buckets must be > 0");
     max_node_id.div_ceil(num_buckets as u64).max(1)
 }
 
-/// Bucket index for a given node id. Last bucket absorbs any
-/// `node_id > (num_buckets - 1) * bucket_width`, which can happen when
-/// `max_node_id` isn't a multiple of `num_buckets` and the last bucket
-/// is therefore wider than `bucket_width`.
+/// Layout used by stage-1 pass A and stage 2 to map a node id to its
+/// `(bucket, local-id-within-bucket)` pair.
+///
+/// Constructed once per run from the largest `max_id` advertised by
+/// any node blob's indexdata, so the bucket bounds are tight for the
+/// actual input rather than the planet-wide constant.
+///
+/// [`Self::locate`] returns `None` for any `node_id > max_node_id`
+/// instead of saturating into the last bucket. That is load-bearing:
+/// out-of-range ids (stale indexdata, corrupt input, accidental
+/// `i64 as u64` of a negative ref) would otherwise silently land in
+/// the final bucket and be truncated to a 32-bit `local_node_id` in
+/// pass A. Pass A treats `None` as an indexdata-trust violation and
+/// errors out with the offending id.
 #[allow(dead_code)] // wired up in step 2 of A1 (pass-A IdRecord emission).
-pub(super) fn bucket_for(node_id: u64, bucket_width: u64, num_buckets: usize) -> usize {
-    debug_assert!(bucket_width > 0, "bucket_width must be > 0");
-    debug_assert!(num_buckets > 0, "num_buckets must be > 0");
-    #[allow(clippy::cast_possible_truncation)]
-    let idx = (node_id / bucket_width) as usize;
-    idx.min(num_buckets - 1)
+pub(super) struct BucketLayout {
+    pub(super) max_node_id: u64,
+    pub(super) bucket_width: u64,
+    pub(super) num_buckets: usize,
+}
+
+#[allow(dead_code)] // wired up in step 2 of A1 (pass-A IdRecord emission).
+impl BucketLayout {
+    pub(super) fn new(max_node_id: u64, num_buckets: usize) -> Self {
+        assert!(num_buckets > 0, "num_buckets must be > 0");
+        let bw = bucket_width(max_node_id, num_buckets);
+        assert!(
+            bw <= u64::from(u32::MAX),
+            "altw external: bucket_width {bw} exceeds u32::MAX \
+             (max_node_id={max_node_id}, num_buckets={num_buckets}); \
+             local_node_id would no longer fit in u32",
+        );
+        Self { max_node_id, bucket_width: bw, num_buckets }
+    }
+
+    /// Returns `(bucket_idx, local_node_id)` for `node_id`, or `None`
+    /// when `node_id > max_node_id`.
+    pub(super) fn locate(&self, node_id: u64) -> Option<(usize, u32)> {
+        if node_id > self.max_node_id {
+            return None;
+        }
+        // For node_id <= max_node_id, raw_idx may equal num_buckets at
+        // the boundary case (when max_node_id isn't a multiple of
+        // num_buckets, div_ceil overshoots by one). Saturate into the
+        // last bucket; the bucket_lo arithmetic still yields a
+        // legitimate offset since the last bucket can extend up to
+        // max_node_id.
+        #[allow(clippy::cast_possible_truncation)]
+        let raw_idx = (node_id / self.bucket_width) as usize;
+        let bucket_idx = raw_idx.min(self.num_buckets - 1);
+        let bucket_lo = (bucket_idx as u64) * self.bucket_width;
+        let offset = node_id - bucket_lo;
+        // For node_id <= max_node_id and bucket_width <= u32::MAX, the
+        // last bucket can extend to max_node_id - bucket_lo. With
+        // num_buckets * bucket_width >= max_node_id, that distance is
+        // at most 2 * bucket_width - 1 < 2 * u32::MAX. u32::try_from
+        // makes the cast explicit; in practice this never fails for
+        // an in-range id, but guard the contract anyway.
+        u32::try_from(offset).ok().map(|local| (bucket_idx, local))
+    }
 }
 
 #[cfg(test)]
 mod bucket_math_tests {
-    use super::{bucket_for, bucket_width};
+    use super::{bucket_width, BucketLayout};
 
     #[test]
     fn bucket_width_handles_zero_max() {
@@ -113,56 +162,99 @@ mod bucket_math_tests {
     }
 
     #[test]
-    fn bucket_for_clamps_last_bucket() {
-        let bw = bucket_width(1000, 4);
-        assert_eq!(bw, 250);
-        assert_eq!(bucket_for(0, bw, 4), 0);
-        assert_eq!(bucket_for(249, bw, 4), 0);
-        assert_eq!(bucket_for(250, bw, 4), 1);
-        assert_eq!(bucket_for(999, bw, 4), 3);
-        assert_eq!(bucket_for(1000, bw, 4), 3);
-        assert_eq!(bucket_for(u64::MAX, bw, 4), 3);
+    fn locate_clamps_last_bucket_for_in_range_ids() {
+        let layout = BucketLayout::new(1000, 4);
+        assert_eq!(layout.bucket_width, 250);
+        assert_eq!(layout.locate(0), Some((0, 0)));
+        assert_eq!(layout.locate(249), Some((0, 249)));
+        assert_eq!(layout.locate(250), Some((1, 0)));
+        assert_eq!(layout.locate(999), Some((3, 249)));
+        // node_id == max_node_id rounds raw_idx = 1000/250 = 4, clamped
+        // to 3. bucket_lo = 3 * 250 = 750, so local = 1000 - 750 = 250.
+        assert_eq!(layout.locate(1000), Some((3, 250)));
     }
 
     #[test]
-    fn bucket_for_handles_zero_max() {
-        let bw = bucket_width(0, 256);
-        for id in 0..512 {
-            assert!(bucket_for(id, bw, 256) < 256);
-        }
+    fn locate_rejects_ids_beyond_max() {
+        let layout = BucketLayout::new(1000, 4);
+        assert_eq!(layout.locate(1001), None);
+        assert_eq!(layout.locate(u64::MAX), None);
+    }
+
+    #[test]
+    fn locate_rejects_negative_refs_cast_via_u64() {
+        // An i64 negative id reinterpreted as u64 lands near u64::MAX.
+        // Pass A must not silently truncate it into the last bucket -
+        // the layout returns None and pass A errors out.
+        let layout = BucketLayout::new(14_000_000_000, 256);
+        #[allow(clippy::cast_sign_loss)]
+        let neg_as_u64 = (-1_i64) as u64;
+        assert_eq!(layout.locate(neg_as_u64), None);
+    }
+
+    #[test]
+    fn locate_handles_zero_max() {
+        let layout = BucketLayout::new(0, 256);
+        // max_node_id=0 means only node id 0 is in range.
+        assert!(matches!(layout.locate(0), Some((b, _)) if b < 256));
+        assert_eq!(layout.locate(1), None);
     }
 
     #[test]
     fn every_referenced_id_maps_to_one_bucket() {
         let max = 12_345_678u64;
-        let bw = bucket_width(max, 256);
+        let layout = BucketLayout::new(max, 256);
         for id in (0..=max).step_by(50_000) {
-            let b = bucket_for(id, bw, 256);
+            let (b, _) = layout.locate(id).unwrap_or_else(|| panic!("locate({id})"));
             assert!(b < 256, "id={id} -> bucket={b}");
         }
-        assert!(bucket_for(0, bw, 256) <= bucket_for(max, bw, 256));
+        let (lo_b, _) = layout.locate(0).expect("0 in range");
+        let (hi_b, _) = layout.locate(max).expect("max in range");
+        assert!(lo_b <= hi_b);
     }
 
     #[test]
     fn bucket_boundaries_are_exclusive_below_inclusive_above() {
-        let bw = bucket_width(10_000, 10);
-        assert_eq!(bw, 1000);
+        let layout = BucketLayout::new(10_000, 10);
+        assert_eq!(layout.bucket_width, 1000);
         for k in 0u64..10 {
             let lo = k * 1000;
             let hi = (k + 1) * 1000 - 1;
             let expected = usize::try_from(k).expect("k fits in usize");
-            assert_eq!(bucket_for(lo, bw, 10), expected, "lo={lo}");
-            assert_eq!(bucket_for(hi, bw, 10), expected, "hi={hi}");
+            assert_eq!(
+                layout.locate(lo).map(|(b, _)| b),
+                Some(expected),
+                "lo={lo}",
+            );
+            assert_eq!(
+                layout.locate(hi).map(|(b, _)| b),
+                Some(expected),
+                "hi={hi}",
+            );
+        }
+    }
+
+    #[test]
+    fn local_node_id_round_trips_within_bucket() {
+        let layout = BucketLayout::new(10_000, 10);
+        for id in 0u64..=10_000 {
+            let (bucket_idx, local) = layout.locate(id).expect("in range");
+            let bucket_lo = (bucket_idx as u64) * layout.bucket_width;
+            let recovered = bucket_lo + u64::from(local);
+            assert_eq!(
+                recovered, id,
+                "id={id} bucket={bucket_idx} local={local} bucket_lo={bucket_lo}",
+            );
         }
     }
 
     #[test]
     fn bucket_width_fits_in_u32_at_planet_scale() {
+        // BucketLayout::new asserts this; cross-check the bare fn and
+        // confirm the constructor accepts the planet config.
         let bw = bucket_width(14_000_000_000, 256);
-        assert!(
-            bw <= u64::from(u32::MAX),
-            "bucket_width {bw} exceeds u32::MAX",
-        );
+        assert!(bw <= u64::from(u32::MAX));
+        let _ = BucketLayout::new(14_000_000_000, 256);
     }
 }
 

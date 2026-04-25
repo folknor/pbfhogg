@@ -76,23 +76,33 @@ Stage 2 picked up an O(N log N) sort cost (`s2_prepare_sort_ms`
 single largest new cost in the rewrite, predicted by the design
 review.
 
-**Open follow-up: stage 2 sort cost.** `prepare_bucket` does
-`sort_unstable_by_key(|r| r.local_node_id)` on each bucket's
-records. Replacement candidates if this becomes the hot lever:
+**Stage 2 sort cost: tried radix, no wall win [2026-04-25].**
+Hand-rolled LSD radix sort over the u32 `local_node_id` key
+(commit `a231017`, reverted in `771b3fb`). The sort itself was
+faster across two planet runs (`s2_prepare_sort_ms` 520s -> 388s
+cumulative, ~22 s wall savings), but the merge walk's
+`s2_resolve_ms` grew 70-115s cumulative (~12-19 s wall) and the
+total planet wall regressed +8 to +20 s over two samples. Stage-2
+peak anon also jumped ~3.9 GB (10.1 -> 14.0) because of the
+extra full-bucket `sort_scratch` Vec; on a 23 GB host that's not
+swap territory but it is enough memory pressure to evict the 600
+MB sorted-records Vec from cache before the walk reads it
+linearly. The 4-pass scatter ALSO competes for memory bandwidth
+with the walk in adjacent workers.
 
-- Counting sort by `local_node_id` is unwieldy because the range
-  is `bucket_width` (~55M at planet); the count vector is too
-  big.
-- Radix sort on the 4-byte `local_node_id` key (e.g. `radsort` or
-  hand-rolled 8-bit-digit passes) would beat comparison sort
-  meaningfully on uniform u32 keys.
-- Hybrid: radix on the high bits to sub-bucket, then sort within
-  each sub-bucket.
+Net: the sort algorithm choice is right, but stage 2's memory
+shape isn't. Precondition for revisiting: parse each shard
+incrementally so `data_buf` doesn't hold the whole bucket
+(currently ~600 MB at planet's largest bucket). With that landed,
+adding `sort_scratch` is roughly a wash on memory, and the
+cache-eviction effect should disappear. Not the next clean lever
+- A2 (output executor) is.
 
-The old design was a counting sort over the smaller `rank_range`
-space. With node-ID space replacing rank space, a different sort
-shape is the natural fit; defer until a benchmark actually moves
-because of it.
+The shard-integrity guard from the radix attempt was kept (commit
+`771b3fb`): `prepare_bucket` errors when a bucket's accumulated
+`data_buf` length isn't a multiple of `ID_RECORD_SIZE`. Cheap and
+catches a class of producer-side bugs that `chunks_exact` would
+otherwise silently truncate.
 
 **Net architecture below.** The rest of this section captures the
 original design rationale; everything implemented matches it

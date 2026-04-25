@@ -116,10 +116,16 @@ pub(super) fn stage1_pass_a(
     let s1a_id_shard_bytes_written = std::sync::atomic::AtomicU64::new(0);
     let s1a_id_shard_flush_err: std::sync::Mutex<Option<String>> =
         std::sync::Mutex::new(None);
-    // Per-(id-bucket) record counts. Stage 2 reads these via the
-    // `Stage1Output` field to skip empty buckets without a probe.
-    let s1a_id_bucket_counts: Vec<std::sync::atomic::AtomicU64> =
-        (0..NUM_BUCKETS).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    // Per-(id-bucket) record counts. Each worker tallies into a local
+    // `Vec<u64>` (no atomic in the hot loop - the per-record cost
+    // would dominate; europe sees ~4.7B records and a contended
+    // AtomicU64::fetch_add adds ~25 ns each, which alone explains a
+    // 30s+ wall regression vs the pre-A1 pass B baseline that used
+    // local counters). Workers push their tallies into this shared
+    // mutex on exit; the orchestrator merges into the
+    // `Stage1Output.id_bucket_counts` vector after the scope joins.
+    let s1a_id_bucket_counts_workers: std::sync::Mutex<Vec<Vec<u64>>> =
+        std::sync::Mutex::new(Vec::new());
     {
         type PassAItem = (u32, std::result::Result<(u64, Vec<u32>), String>);
         let (tx, rx) = std::sync::mpsc::sync_channel::<PassAItem>(32);
@@ -136,8 +142,7 @@ pub(super) fn stage1_pass_a(
         let s1a_id_skipped_ref = &s1a_id_records_skipped;
         let s1a_id_bytes_ref = &s1a_id_shard_bytes_written;
         let s1a_id_flush_err_ref = &s1a_id_shard_flush_err;
-        let s1a_id_bucket_counts_ref: &[std::sync::atomic::AtomicU64] =
-            &s1a_id_bucket_counts;
+        let s1a_id_bucket_counts_workers_ref = &s1a_id_bucket_counts_workers;
         let layout_ref = layout;
         let scratch_ref = scratch;
 
@@ -157,6 +162,7 @@ pub(super) fn stage1_pass_a(
                     let mut id_shard_writers: Vec<Option<BufWriter<std::fs::File>>> =
                         Vec::new();
                     let mut id_rec_buf = [0u8; ID_RECORD_SIZE];
+                    let mut id_bucket_local_counts: Vec<u64> = vec![0; NUM_BUCKETS];
 
                     loop {
                         let idx = next_ref.fetch_add(1, Relaxed);
@@ -246,8 +252,7 @@ pub(super) fn stage1_pass_a(
                                     writer.write_all(&id_rec_buf).map_err(|e| {
                                         format!("write id shard W{worker_id}: {e}")
                                     })?;
-                                    s1a_id_bucket_counts_ref[bucket_idx]
-                                        .fetch_add(1, Relaxed);
+                                    id_bucket_local_counts[bucket_idx] += 1;
                                     blob_emitted += 1;
                                     blob_bytes += ID_RECORD_SIZE as u64;
                                 } else {
@@ -287,6 +292,13 @@ pub(super) fn stage1_pass_a(
                             break;
                         }
                     }
+
+                    // Hand the local per-bucket tally to the
+                    // orchestrator for post-scope merge.
+                    s1a_id_bucket_counts_workers_ref
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(id_bucket_local_counts);
                 });
             }
             drop(tx);
@@ -357,10 +369,15 @@ pub(super) fn stage1_pass_a(
     }
     crate::debug::emit_marker("EXTJOIN_S1_PASS_A_END");
 
-    let id_bucket_counts: Vec<u64> = s1a_id_bucket_counts
-        .iter()
-        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-        .collect();
+    let mut id_bucket_counts: Vec<u64> = vec![0; NUM_BUCKETS];
+    for worker_counts in s1a_id_bucket_counts_workers
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        for (i, &c) in worker_counts.iter().enumerate() {
+            id_bucket_counts[i] += c;
+        }
+    }
 
     Ok((total_refs, id_bucket_counts))
 }

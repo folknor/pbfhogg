@@ -94,7 +94,16 @@ Everything else is non-stable and requires CLI conversion.
 **Conversion priority** (by rewrite-coupling × test count; see the
 audit doc for full reasoning):
 
-1. `cli_apply_changes.rs` - absorbs `merge.rs` + `apply_changes_invariants.rs` + `cluster2_defensive_input.rs` + `derive_changes.rs`. 51 tests, highest-traffic rewrite surface.
+1. `cli_apply_changes.rs` - in progress. Absorbs `merge.rs`,
+   `apply_changes_invariants.rs`, `cluster2_defensive_input.rs`,
+   `derive_changes.rs` (51 tests across 4 files, highest-traffic
+   rewrite surface). Stage 1 landed (2026-04-25): merge.rs converted
+   (21 tests, basic CRUD + multi-block + LocationsOnWays + edge cases
+   + error paths + osmium escape hatch + platform tier). Remaining
+   stages: apply_changes_invariants.rs (11 tests, more invariants),
+   cluster2_defensive_input.rs (2 tests, multi-command defensive
+   input), derive_changes.rs (15 tests, derive→apply roundtrip via
+   `pbfhogg derive-changes` + `pbfhogg apply-changes`).
 2. `cli_diff.rs` + `cli_derive_changes.rs` - split for file size. 45 tests combined.
 3. `cli_extract.rs` - landed (2026-04-25). 27 tests converted; 9
    non-stable symbols (Region, ExtractStrategy, PolygonRings,

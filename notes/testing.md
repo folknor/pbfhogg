@@ -325,6 +325,27 @@ Test coverage layered:
 Caller-side defensive checks (e.g. `src/scan/classify.rs:90`)
 remain as belt-and-braces but no longer load-bearing.
 
+**Open follow-up: broaden the command-level sweep.** The current
+`cli_truncation_sweep.rs` covers `cat`, `inspect`, and `sort`.
+The reader contract is pinned by unit tests so every other
+command inherits it for free, but three commands would add real
+value if extended:
+
+- `getid` (with `--` + `n1`) - exercises the
+  `next_header_skip_blob` sentinel-read on the dominant
+  HeaderWalker fast-path that all the other scan-style commands
+  also use.
+- `add-locations-to-ways` - exercises `altw::passthrough`'s
+  `FileReader::skip` path (the seventh contract site fixed in
+  commit `12699db`).
+- `renumber` - exercises the full-read + pass-2 reframe walker
+  through every shape.
+
+Each is one line in the sweep loop. Estimated cost: ~25 s
+additional sweep wall-time, pushing the per-sweep run from
+~65 s to ~90 s. Within tier-1 budget but not free, hence
+deferred.
+
 ### IdSet + CLI silent-rejection cleanup
 
 `IdSet::set` (`src/idset.rs:45`) and `set_if_new`

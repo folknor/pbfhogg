@@ -25,6 +25,7 @@ use std::path::Path;
 
 use common::adversarial::{
     locate_blobs, mutate_blob_header_indexdata, mutate_blob_payload,
+    set_relation_memids_terminator_continuation,
 };
 use common::cli::CliInvoker;
 use common::{write_test_pbf, TestMember, TestNode, TestRelation, TestWay};
@@ -312,13 +313,14 @@ fn altw_external_rejects_reversed_indexdata_range() {
 /// member ids than the relation declared. After the fix the rewriter
 /// returns a clean error and renumber exits non-zero.
 ///
-/// We don't try to match the exact byte boundary of the truncated
-/// varint - instead we chop the LAST byte of the relation blob's
-/// PrimitiveBlock payload. The truncated byte may land inside `types`
-/// (field 11) or `memids` (field 10), both of which now go through
-/// `count_varints_strict` checks. Either way the failure is the
-/// hardened defensive path - the regression we pin is "no panic, no
-/// silent truncation".
+/// `set_relation_memids_terminator_continuation` flips the high bit on
+/// the last byte of relation 0's memids field (field 9) inside the
+/// relation blob's PrimitiveBlock. Plain truncation drops a complete
+/// single-byte varint cleanly in this fixture and is caught by the
+/// downstream count-vs-types mismatch check rather than
+/// `count_varints_strict` itself; flipping the terminator's
+/// continuation bit instead leaves a hanging-continuation varint that
+/// only the strict walk can detect.
 #[test]
 fn renumber_rejects_truncated_relation_blob_payload() {
     let dir = TempDir::new().expect("tempdir");
@@ -329,15 +331,8 @@ fn renumber_rejects_truncated_relation_blob_payload() {
     let pbf = std::fs::read(&input).expect("read fixture");
     let blobs = locate_blobs(&pbf);
     // Last data blob is the relation blob (header + nodes + ways + relations).
-    let relation_idx = blobs.len() - 1;
-    let mutated = mutate_blob_payload(&pbf, relation_idx, |payload| {
-        // Drop the final byte of the inner PrimitiveBlock. Anything
-        // downstream that walks varints will trip on the truncation.
-        if let Some(last) = payload.pop() {
-            // Touch the byte to signal intent.
-            let _ = last;
-        }
-    });
+    let blob_idx = blobs.len() - 1;
+    let mutated = set_relation_memids_terminator_continuation(&pbf, blob_idx, 0);
     std::fs::write(&input, &mutated).expect("rewrite fixture");
 
     let out = CliInvoker::new()
@@ -358,19 +353,14 @@ fn renumber_rejects_truncated_relation_blob_payload() {
         !stderr.contains("panicked at"),
         "renumber must not panic on truncated relation payload; stderr:\n{stderr}",
     );
-    // Tier A2 follow-up: the reviewer asked for a stderr substring
-    // match against `count_varints_strict`'s error format
-    // (`"reframe_relations: relation <id> {memids|types}: ..."` from
-    // `src/commands/renumber/wire_rewrite.rs:556-563`). Empirically,
-    // chopping the last byte of the relation blob's PrimitiveBlock
-    // does NOT reliably land inside memids/types - protobuf field
-    // ordering and BlockBuilder's encoding choices put the relation's
-    // tail elsewhere. Renumber still rejects (the `!success` check
-    // above passes), but the rejection comes from the upstream
-    // protobuf walk rather than the strict count. Surgically
-    // pinning `count_varints_strict` requires a mutation primitive
-    // that finds and truncates the memids byte string specifically;
-    // see `notes/testing.md` "Follow-ups" for the deferred work.
+    // Pin count_varints_strict's error format from
+    // `src/commands/renumber/wire_rewrite.rs:556-563`. The truncated
+    // memids field is the exact byte stream that walk consumes, so
+    // the rejection must surface through this error path.
+    assert!(
+        stderr.contains("reframe_relations: relation 1 memids:"),
+        "expected count_varints_strict error from reframe_relations; stderr:\n{stderr}",
+    );
 }
 
 /// Cluster-2 fix: `cat` (running the indexdata-generation passthrough

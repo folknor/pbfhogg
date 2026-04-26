@@ -193,6 +193,45 @@ pub fn mutate_blob_payload(
     splice_frame(pbf, target, &new_header, &new_blob)
 }
 
+/// Set the continuation bit on the last byte of relation
+/// `relation_idx`'s memids field (PrimitiveBlock -> PrimitiveGroup ->
+/// Relation -> field 9). After mutation, a strict varint walk over
+/// memids hits a hanging-continuation `read_varint` past the field's
+/// length-delimited boundary and fails.
+///
+/// Pins `wire_rewrite::count_varints_strict`: a heuristic count of
+/// continuation-bit-clear bytes silently undercounts here (the
+/// terminator we just flipped no longer registers), letting the
+/// downstream decode loop run with a wrong member count. The strict
+/// walk catches it at the boundary.
+///
+/// Plain truncation (chopping bytes off memids) is not enough for
+/// fixtures whose memids deltas all encode in a single byte: chopping
+/// drops a complete varint cleanly, and the rewriter's downstream
+/// count-vs-types mismatch check fires first instead. A continuation
+/// flip is the minimal mutation that singles out
+/// `count_varints_strict` regardless of varint sizes in the fixture.
+///
+/// Panics if `blob_idx` is out of range, the target relation has no
+/// memids field, or memids is empty.
+pub fn set_relation_memids_terminator_continuation(
+    pbf: &[u8],
+    blob_idx: usize,
+    relation_idx: usize,
+) -> Vec<u8> {
+    mutate_blob_payload(pbf, blob_idx, |payload| {
+        let off = find_relation_memids_last_byte_offset(payload, relation_idx).expect(
+            "relation_idx out of range, target relation missing memids, or memids empty",
+        );
+        debug_assert_eq!(
+            payload[off] & 0x80,
+            0,
+            "memids last byte already has continuation bit set; fixture is malformed",
+        );
+        payload[off] |= 0x80;
+    })
+}
+
 /// Chop the PBF at a byte offset.
 ///
 /// Returns `pbf[..len.min(pbf.len())]` as an owned vector. Used by the
@@ -205,6 +244,90 @@ pub fn truncate_to(pbf: &[u8], len: usize) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 // Internal helpers (varint, protobuf scan, blob (de)compression).
 // ---------------------------------------------------------------------------
+
+/// Walk PrimitiveBlock -> PrimitiveGroup -> Relation[idx] -> memids
+/// (field 9) and return the absolute offset of the last byte of memids
+/// content within `payload`. Returns None on any structural mismatch
+/// (target not found, missing memids, or empty memids).
+fn find_relation_memids_last_byte_offset(payload: &[u8], target_rel_idx: usize) -> Option<usize> {
+    let mut rel_count = 0_usize;
+    let mut pos = 0;
+    while pos < payload.len() {
+        let (tag, np) = read_varint(&payload[pos..])?;
+        let (field, wire) = (tag >> 3, tag & 7);
+        pos += np;
+        if field == 2 && wire == 2 {
+            // PrimitiveGroup
+            let (group_len_u64, gn) = read_varint(&payload[pos..])?;
+            let group_start = pos + gn;
+            let group_end = group_start.checked_add(usize::try_from(group_len_u64).ok()?)?;
+            if group_end > payload.len() {
+                return None;
+            }
+            if let Some(off) =
+                scan_group_for_memids(payload, group_start, group_end, &mut rel_count, target_rel_idx)
+            {
+                return Some(off);
+            }
+            pos = group_end;
+        } else {
+            skip_field(payload, &mut pos, wire)?;
+        }
+    }
+    None
+}
+
+fn scan_group_for_memids(
+    payload: &[u8],
+    group_start: usize,
+    group_end: usize,
+    rel_count: &mut usize,
+    target_rel_idx: usize,
+) -> Option<usize> {
+    let mut gpos = group_start;
+    while gpos < group_end {
+        let (gtag, gn) = read_varint(&payload[gpos..])?;
+        let (gfield, gwire) = (gtag >> 3, gtag & 7);
+        gpos += gn;
+        if gfield == 4 && gwire == 2 {
+            // Relation
+            let (rel_len_u64, rn) = read_varint(&payload[gpos..])?;
+            let rel_start = gpos + rn;
+            let rel_end = rel_start.checked_add(usize::try_from(rel_len_u64).ok()?)?;
+            if rel_end > group_end {
+                return None;
+            }
+            if *rel_count == target_rel_idx {
+                return scan_relation_for_memids(payload, rel_start, rel_end);
+            }
+            *rel_count += 1;
+            gpos = rel_end;
+        } else {
+            skip_field(payload, &mut gpos, gwire)?;
+        }
+    }
+    None
+}
+
+fn scan_relation_for_memids(payload: &[u8], rel_start: usize, rel_end: usize) -> Option<usize> {
+    let mut rpos = rel_start;
+    while rpos < rel_end {
+        let (rtag, rn) = read_varint(&payload[rpos..])?;
+        let (rfield, rwire) = (rtag >> 3, rtag & 7);
+        rpos += rn;
+        if rfield == 9 && rwire == 2 {
+            let (memids_len_u64, mn) = read_varint(&payload[rpos..])?;
+            let memids_start = rpos + mn;
+            let memids_end = memids_start.checked_add(usize::try_from(memids_len_u64).ok()?)?;
+            if memids_end > rel_end || memids_end == memids_start {
+                return None;
+            }
+            return Some(memids_end - 1);
+        }
+        skip_field(payload, &mut rpos, rwire)?;
+    }
+    None
+}
 
 fn splice_frame(pbf: &[u8], target: BlobLocation, new_header: &[u8], new_blob: &[u8]) -> Vec<u8> {
     let header_len_be = u32::try_from(new_header.len())

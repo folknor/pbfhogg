@@ -545,3 +545,122 @@ fn renumber_orphan_way_ref_preserves_old_id() {
     let norm = read_normalized(&output);
     assert_eq!(norm.ways[0].refs, vec![1, 99999, 2]);
 }
+
+// ---------------------------------------------------------------------------
+// Tier B contract gaps from 2026-04-26 review
+// ---------------------------------------------------------------------------
+
+/// B3 - relation-member orphan preservation. DEVIATIONS.md says
+/// orphan refs (relation members pointing at objects absent from
+/// the input) keep their old id, mirroring the way-ref orphan
+/// behavior pinned above. Pre-batch coverage existed only for
+/// orphan way refs (`renumber_orphan_way_ref_preserves_old_id`);
+/// this test extends the contract to relation members.
+#[test]
+fn renumber_orphan_relation_member_preserves_old_id() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &input,
+        &[
+            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
+            TestNode { id: 20, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
+        ],
+        &[
+            TestWay { id: 100, refs: vec![10, 20], tags: vec![], meta: None },
+        ],
+        &[
+            TestRelation {
+                id: 1000,
+                members: vec![
+                    TestMember { id: MemberId::Way(100), role: "outer" },
+                    TestMember { id: MemberId::Way(99999), role: "outer" },
+                    TestMember { id: MemberId::Node(10), role: "label" },
+                    TestMember { id: MemberId::Node(99999), role: "label" },
+                ],
+                tags: vec![("type", "multipolygon")],
+                meta: None,
+            },
+        ],
+    );
+
+    let stats = renumber_external(
+        &input, &output, &default_opts(), Compression::default(), false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("renumber");
+
+    // Two orphan member refs (way 99999 and node 99999); plus
+    // potentially the way orphan if the stats counter doesn't
+    // distinguish member-side from ref-side. Either way, the
+    // orphan total must be at least 2.
+    assert!(
+        stats.orphan_refs >= 2,
+        "expected >=2 orphan refs (way 99999 + node 99999); got {}",
+        stats.orphan_refs,
+    );
+
+    let norm = read_normalized(&output);
+    let rel = &norm.relations[0];
+    let member_ids: Vec<i64> = rel.members.iter().map(|m| m.ref_id).collect();
+    // The in-input refs (way 100 -> way 1, node 10 -> node 1) get
+    // remapped; the orphans (way 99999, node 99999) keep their
+    // old id.
+    assert!(
+        member_ids.contains(&99999),
+        "orphan refs (99999) must be preserved with old id; got {member_ids:?}",
+    );
+}
+
+/// B4 - negative relation-member ref rejection. Per DEVIATIONS.md
+/// "Negative input IDs rejected project-wide" the renumber path
+/// rejects negatives at three named entry points
+/// (`reframe_dense_with_new_ids`, `reframe_ways_with_new_ids`,
+/// `rewrite_relations_with_new_ids`). Pre-batch tests covered the
+/// first two (negative node id, negative way ref); this test pins
+/// the third (negative relation-member ref).
+#[test]
+fn renumber_rejects_negative_relation_member_ref() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &input,
+        &[
+            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
+        ],
+        &[
+            TestWay { id: 100, refs: vec![10], tags: vec![], meta: None },
+        ],
+        &[
+            TestRelation {
+                id: 1000,
+                members: vec![
+                    TestMember { id: MemberId::Way(100), role: "outer" },
+                    TestMember { id: MemberId::Way(-7), role: "outer" },
+                ],
+                tags: vec![],
+                meta: None,
+            },
+        ],
+    );
+
+    let err = renumber_external(
+        &input, &output, &default_opts(), Compression::default(), false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect_err("expected rejection of negative relation-member ref");
+
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("negative") || msg.contains("non-negative"),
+        "error must flag the negative requirement; got: {msg}",
+    );
+    assert!(
+        msg.contains("-7"),
+        "error must name the offending member ref id (-7); got: {msg}",
+    );
+}

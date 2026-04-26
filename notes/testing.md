@@ -540,6 +540,197 @@ case-specific reproducers.
   this batch.
 - Header flag combinations - small additional set, low priority.
 
+### Follow-ups from 2026-04-26 batch review
+
+After T02/T03/T04/T05/T06/T07 landed (commits `66f2fb7`, `daf5a5b`,
+`9eb37a8`, `b245835`), four reviewers audited the result: two
+internal Opus agents (brief-vs-delivered, contract-coverage) plus
+two external reviews. Findings are tracked here, grouped by tier.
+Provenance markers: `[A1]` / `[A2]` for the two internal Opus
+agents, `[R1]` / `[R2]` for the two external reviews, `[all]` when
+multiple reviewers cross-confirmed.
+
+### Tier A: assertion strengthening in delivered tests
+
+Each item is a regression that would slip past the current test.
+Fixes are small (1-3 lines per item) and live in already-shipped
+test files.
+
+**T02 - cluster-2 regression assertions:**
+
+- A1 - `altw_external_rejects_reversed_indexdata_range`
+  (`tests/cli_defensive_input.rs:294-297`) uses
+  `stderr.contains("reversed indexdata range") || stderr.contains("max_id")`.
+  The OR defeats the contract: the actual error always contains
+  both substrings, so the disjunction can't distinguish "fix in
+  place" from any unrelated error mentioning max_id. **Drop the
+  OR**, pin only `reversed indexdata range`. `[all]`
+- A2 - `renumber_rejects_truncated_relation_blob_payload`
+  (`tests/cli_defensive_input.rs:354-356`) asserts only
+  "non-zero exit + no panic". **Outcome 2026-04-26**:
+  strengthening to require the
+  `"reframe_relations ... memids|types"` substring failed - the
+  whole-block last-byte chop lands outside memids/types in the
+  current fixture, so renumber rejects via an upstream protobuf
+  walk before reaching `count_varints_strict`. Surgically
+  pinning `count_varints_strict` requires a mutation primitive
+  that finds and truncates the memids byte string specifically.
+  **Deferred follow-up**: extend `tests/common/adversarial.rs`
+  with a `truncate_relation_memids(pbf, blob_idx, relation_idx)`
+  primitive (~30 lines walking PrimitiveBlock -> PrimitiveGroup
+  -> Relation field 9). Then strengthen this test to assert the
+  memids/types substring. `[all]`
+- A3 - `cat_rejects_truncated_node_blob_payload`
+  (`tests/cli_defensive_input.rs:395-403`) explicitly does NOT
+  assert exit status. **Outcome 2026-04-26**: strengthening to
+  `assert!(!out.status.success())` revealed cat exits 0 on this
+  truncation - cat tolerates partially-readable blobs by design
+  (the original test comment was correct). The broader
+  "non-zero exit on truncation" contract lives in the truncation
+  sweep where the cut lands at frame boundaries the reader
+  detects. Pinning `!success` here would force a code change to
+  cat's tolerance policy, deferred. Comment in the test now
+  documents the finding. `[all]`
+
+**T03 - negative-id sweep assertions:**
+
+- A4 - `cat_preserves_mixed_sign_ids`
+  (`tests/cli_negative_id_invariants.rs:56-89`) builds negative
+  relations (via `generate_relations_with_negatives`) but
+  validates only node and way ids. Relation-passthrough
+  regression slips past. **Add the relation id parity check**
+  matching the node/way pattern. `[R1]`
+- A5 - `sort_preserves_mixed_sign_ids`
+  (`tests/cli_negative_id_invariants.rs:138-146`) checks
+  neg/pos preservation only for nodes; ways and relations get
+  count-only assertions. Sign loss with unchanged counts passes.
+  **Add neg/pos filter checks for ways and relations** matching
+  the node block. `[R1]`
+- A6 - `getid_addresses_negative_ids`
+  (`tests/cli_negative_id_invariants.rs:236-258`) gets a `-o`
+  output file but never reads it back. A regression that drops
+  every queried negative id silently passes. **Add output read +
+  assert the queried ids appear**. `[A1, R1]`
+- A7 - `tags_filter_handles_mixed_sign_ids`
+  (`tests/cli_negative_id_invariants.rs:184-189`) surfaced the
+  silent-drop finding (committed in `daf5a5b`'s message,
+  documented in `TODO.md`) but pins NOTHING about it. A future
+  regression that flips the silent-drop to silent-pass-through
+  passes silently. **Lock the current behavior**: read output,
+  assert `n.ways.iter().filter(|w| w.id < 0).count() == 0` with
+  a comment pointing at the TODO entry. When TODO is acted on,
+  the test fails and forces a deliberate update. `[A1, A2, R2]`
+
+**T04 - truncation sweep assertions:**
+
+- A8 - `run_and_assert_no_panic`
+  (`tests/cli_truncation_sweep.rs:93-112`) and
+  `run_sort_and_assert_no_panic` (`:114-127`) never assert
+  exit status. **Outcome 2026-04-26**: strengthening to require
+  `!success` revealed all three commands (cat, inspect, sort)
+  are tolerant by design - they decode what they can and exit
+  0 even on truncated input. The reviewer brief over-stated
+  the contract. Helper now pins "no panic + bounded stderr" for
+  every command; the `!success` half is deferred until a
+  decision is made about whether to promote any of these to
+  strict-error-on-truncation. `[all]`
+- A9 - `run_sort_and_assert_no_panic`
+  (`tests/cli_truncation_sweep.rs:114-127`) omits the
+  `stderr.len() < 100_000` bounded-stderr check that the
+  cat/inspect helper enforces. Sort gets weaker coverage than
+  the brief's "no multi-GB allocation" applies uniformly.
+  **Add the bounded-stderr assertion**. `[all]`
+- A10 - `step_by(...).take(30)` at
+  `tests/cli_truncation_sweep.rs:73-79` drops boundaries on the
+  ~6-blob fixture - a boundary-specific regression at, say,
+  `b.header_end - 1` of blob 4 may be sampled out. **Either
+  remove the sampling cap** (the structural offset list is ~50
+  for a 6-blob fixture, all invocations finish in < 1 s; the
+  cap is over-conservative), **or shrink the fixture** so all
+  offsets fit under the cap budget. `[R1]`
+
+**T07 - proptest assertions:**
+
+- A11 - `node_fixture_roundtrips`
+  (`tests/proptests.rs:99-129`) asserts ID-set equivalence
+  only - not coordinates, tags, metadata. Coordinate-corruption
+  regressions silently pass. **Replace the id-set assertion
+  with `assert_elements_equivalent`** (the helper already
+  exists at `tests/common/mod.rs:975`). Same fix applies to
+  `negative_id_node_fixture_roundtrips`. `[all]`
+- A12 - No way / relation roundtrip property exists, and the
+  T07 deferred backlog (testing.md "Skipped from T07's brief")
+  does not list them. **Either add the properties** (~20 lines,
+  same shape as `node_fixture_roundtrips`) **or list them in the
+  T07 deferred section** with a one-line justification. `[R1]`
+
+### Tier B: documented contract gaps in pre-batch coverage
+
+Pre-batch tests already cover most of `DEVIATIONS.md` and
+`CORRECTNESS.md`, but the review surfaced these gaps. Each is a
+small new test in an existing file.
+
+- B1 - **Null Island real `(0, 0)` node** [LANDED 2026-04-26].
+  `null_island_real_node_treated_as_missing` in
+  `tests/cli_add_locations_to_ways.rs`. Pins the documented
+  CORRECTNESS limitation: a real node at `(0, 0)` is reported
+  as missing because every coordinate index uses `(0, 0)` as
+  the absent sentinel. If a future fix adds an occupancy
+  bitmap, this test fails and forces a deliberate update to
+  CORRECTNESS.md.
+- B2 - **altw `--index-type external` missing-nodes**
+  [LANDED 2026-04-26].
+  `missing_node_refs_get_zero_coordinates_external` in
+  `tests/cli_add_locations_to_ways.rs`. Mirrors the dense and
+  sparse twins. External requires indexed input
+  (`write_indexed_pbf` rather than `write_test_pbf`).
+- B3 - **renumber relation-member orphan preservation**
+  [LANDED 2026-04-26].
+  `renumber_orphan_relation_member_preserves_old_id` in
+  `tests/renumber_external.rs`. Asserts orphan member ids
+  (way 99999 + node 99999) survive with their old ids while
+  in-input refs are remapped.
+- B4 - **renumber negative relation-member ref rejection**
+  [LANDED 2026-04-26].
+  `renumber_rejects_negative_relation_member_ref` in
+  `tests/renumber_external.rs`. Asserts the error message
+  flags the negative requirement and names the offending id
+  (`-7`).
+- B5 - **Geocode admin u16 entry cap** [LANDED 2026-04-26].
+  `build_rejects_admin_entry_count_over_u16_max_for_one_cell`
+  in `tests/geocode_index.rs`. Fixture: 65 536 admin
+  relations all sharing one outer ring → all polygons land in
+  the same S2 cell → triggers the per-cell admin cap at
+  `src/geocode_index/builder/admin.rs:227`.
+
+### Tier C: reviewer disagreements (verified 2026-04-26)
+
+- C1 - **Diff content-equality "metadata-ignored" half**
+  (`DEVIATIONS.md:50-55`). **Verified**: pinned by
+  `cli_diff.rs:731` (`diff_pure_metadata_bump_is_common_not_modified`).
+  R2 was correct; A2's proposed minimal-close test would have
+  duplicated existing coverage.
+- C2 - **Osmosis -1 sentinel** (`CORRECTNESS.md:53-87`).
+  **Verified**: pinned by four tests in `tests/getid.rs`:
+  `getid_normalizes_dense_node_version_minus_one_to_absent_metadata`
+  (`:338`),
+  `getid_normalizes_dense_node_changeset_minus_one_to_zero`
+  (`:392`),
+  `getid_normalizes_way_version_minus_one_to_absent_metadata`
+  (`:446`),
+  `getid_normalizes_way_changeset_minus_one_to_zero` (`:502`).
+  Both tiers (dense + non-dense, both fields) covered.
+  R2 was correct.
+
+### Provenance and review prompts
+
+The full prompts and reports from all four reviewers are not
+checked into the repo (one-shot artifacts). The above is the
+synthesis. Re-running similar reviews should target the same four
+docs (`DEVIATIONS.md`, `CORRECTNESS.md`,
+`decisions/0002-negative-ids-rejected-project-wide.md`, this
+file) plus the test files.
+
 ### T08 - Boundary-twin scan across modules
 
 Lowest-effort lever. Several findings are direct cross-module twins

@@ -25,10 +25,12 @@ mod common;
 
 use std::io::Cursor;
 
+use std::collections::BTreeMap;
+
 use bytes::Bytes;
 use common::{
-    generate_nodes, generate_nodes_with_negatives, read_normalized,
-    write_test_pbf_sorted,
+    generate_nodes, generate_nodes_with_negatives, generate_relations, generate_ways,
+    read_normalized, write_test_pbf_sorted,
 };
 use pbfhogg::{BlobReader, PrimitiveBlock};
 use proptest::prelude::*;
@@ -97,9 +99,14 @@ proptest! {
     }
 
     /// Round-trip: write a generated node fixture, read it back, and
-    /// assert every input id is present in the output and counts
-    /// match. Pins the read/write surface against arbitrary `count`
-    /// and `start_id` shapes.
+    /// assert ids AND coordinates AND tags survive the cycle.
+    ///
+    /// Tier A11 follow-up: previously this property compared id sets
+    /// only. A coordinate-corruption regression in the writer or
+    /// reader would have slipped past. The fixture's nodes have
+    /// deterministic `(lat, lon)` derived from `id`, so we can
+    /// recompute the expected coordinates from the original
+    /// `TestNode` vector and compare.
     ///
     /// `start` is positive-only by design. Per `DEVIATIONS.md`
     /// ("Negative input IDs rejected project-wide") the *command*
@@ -121,11 +128,86 @@ proptest! {
 
         let n = read_normalized(&path);
         prop_assert_eq!(n.nodes.len(), count);
-        let mut input_ids: Vec<i64> = input_nodes.iter().map(|x| x.id).collect();
-        input_ids.sort_unstable();
-        let mut output_ids: Vec<i64> = n.nodes.iter().map(|x| x.id).collect();
-        output_ids.sort_unstable();
-        prop_assert_eq!(input_ids, output_ids);
+
+        // Build a lookup by id so we don't depend on internal sort
+        // order matching input vector order.
+        let by_id: BTreeMap<i64, &common::NormalizedNode> =
+            n.nodes.iter().map(|x| (x.id, x)).collect();
+        for input in &input_nodes {
+            let output = by_id
+                .get(&input.id)
+                .expect("input node must appear in output");
+            prop_assert_eq!(output.lat, input.lat);
+            prop_assert_eq!(output.lon, input.lon);
+            // Tag-set equality. `generate_nodes` produces empty tags,
+            // so this is trivially equal today, but pinning it here
+            // catches a future generator change that adds tags
+            // without updating this assertion.
+            let expected: BTreeMap<String, String> = input
+                .tags
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            prop_assert_eq!(&output.tags, &expected);
+        }
+    }
+
+    /// Way fixture roundtrip - pins `BlockBuilder::add_way` and the
+    /// `Way` parser by checking ids and refs survive intact. Tier A12
+    /// follow-up; the previous batch covered nodes only.
+    #[test]
+    fn way_fixture_roundtrips(
+        node_count in 5usize..30,
+        way_count in 1usize..20,
+        refs_per_way in 2usize..5,
+    ) {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("fixture.osm.pbf");
+        let nodes = generate_nodes(node_count, 1);
+        let ways = generate_ways(way_count, 1_000, refs_per_way, 1);
+        write_test_pbf_sorted(&path, &nodes, &ways, &[]);
+
+        let n = read_normalized(&path);
+        prop_assert_eq!(n.ways.len(), way_count);
+
+        let by_id: BTreeMap<i64, &common::NormalizedWay> =
+            n.ways.iter().map(|x| (x.id, x)).collect();
+        for input in &ways {
+            let output = by_id
+                .get(&input.id)
+                .expect("input way must appear in output");
+            prop_assert_eq!(&output.refs, &input.refs);
+        }
+    }
+
+    /// Relation fixture roundtrip - pins `BlockBuilder::add_relation`
+    /// and the `Relation` parser by checking ids and member shapes
+    /// survive intact. Tier A12 follow-up.
+    #[test]
+    fn relation_fixture_roundtrips(
+        node_count in 5usize..20,
+        way_count in 2usize..10,
+        rel_count in 1usize..10,
+        members_per_rel in 1usize..4,
+    ) {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("fixture.osm.pbf");
+        let nodes = generate_nodes(node_count, 1);
+        let ways = generate_ways(way_count, 1_000, 2, 1);
+        let relations = generate_relations(rel_count, 10_000, members_per_rel, 1_000);
+        write_test_pbf_sorted(&path, &nodes, &ways, &relations);
+
+        let n = read_normalized(&path);
+        prop_assert_eq!(n.relations.len(), rel_count);
+
+        let by_id: BTreeMap<i64, &common::NormalizedRelation> =
+            n.relations.iter().map(|x| (x.id, x)).collect();
+        for input in &relations {
+            let output = by_id
+                .get(&input.id)
+                .expect("input relation must appear in output");
+            prop_assert_eq!(output.members.len(), input.members.len());
+        }
     }
 
     /// Library-level mixed-sign roundtrip: `BlockBuilder` /
@@ -136,12 +218,7 @@ proptest! {
     /// `DEVIATIONS.md` the *commands* reject negatives, but the
     /// underlying library primitives don't.
     ///
-    /// Pinning this contract separately from
-    /// `node_fixture_roundtrips` makes the layering explicit: a
-    /// future change that breaks library-level mixed-sign support
-    /// fails this test loudly, even if every command-level test
-    /// still passes (because no CLI command exercises mixed-sign
-    /// input).
+    /// Tier A11 follow-up: now also pins coordinates, not just ids.
     #[test]
     fn negative_id_node_fixture_roundtrips(
         n_neg in 1usize..20,
@@ -154,10 +231,14 @@ proptest! {
 
         let n = read_normalized(&path);
         prop_assert_eq!(n.nodes.len(), n_neg + n_pos);
-        let mut input_ids: Vec<i64> = input_nodes.iter().map(|x| x.id).collect();
-        input_ids.sort_unstable();
-        let mut output_ids: Vec<i64> = n.nodes.iter().map(|x| x.id).collect();
-        output_ids.sort_unstable();
-        prop_assert_eq!(input_ids, output_ids);
+        let by_id: BTreeMap<i64, &common::NormalizedNode> =
+            n.nodes.iter().map(|x| (x.id, x)).collect();
+        for input in &input_nodes {
+            let output = by_id
+                .get(&input.id)
+                .expect("input mixed-sign node must appear in output");
+            prop_assert_eq!(output.lat, input.lat);
+            prop_assert_eq!(output.lon, input.lon);
+        }
     }
 }

@@ -39,7 +39,7 @@ use common::cli::CliInvoker;
 use common::{
     generate_nodes_with_negatives, generate_relations_with_negatives,
     generate_ways_with_negatives, node_ids_id_only, read_all_elements_id_only,
-    read_normalized, way_ids_id_only, write_test_pbf,
+    read_normalized, relation_ids_id_only, way_ids_id_only, write_test_pbf,
     write_test_pbf_sorted,
 };
 use tempfile::TempDir;
@@ -89,16 +89,29 @@ fn cat_preserves_mixed_sign_ids() {
     let contents = read_all_elements_id_only(&output);
     let nodes = node_ids_id_only(&contents);
     let ways = way_ids_id_only(&contents);
+    let relations = relation_ids_id_only(&contents);
     assert_eq!(nodes.len(), N_NEG + N_POS, "node count must survive cat");
     assert_eq!(ways.len(), N_NEG + N_POS, "way count must survive cat");
-    let mut neg_nodes = nodes.iter().filter(|id| **id < 0).count();
-    let mut pos_nodes = nodes.iter().filter(|id| **id > 0).count();
-    assert_eq!(neg_nodes, N_NEG, "all negative node ids preserved");
-    assert_eq!(pos_nodes, N_POS, "all positive node ids preserved");
-    neg_nodes = ways.iter().filter(|id| **id < 0).count();
-    pos_nodes = ways.iter().filter(|id| **id > 0).count();
-    assert_eq!(neg_nodes, N_NEG, "all negative way ids preserved");
-    assert_eq!(pos_nodes, N_POS, "all positive way ids preserved");
+    assert_eq!(
+        relations.len(),
+        N_NEG + N_POS,
+        "relation count must survive cat",
+    );
+    let mut neg = nodes.iter().filter(|id| **id < 0).count();
+    let mut pos = nodes.iter().filter(|id| **id > 0).count();
+    assert_eq!(neg, N_NEG, "all negative node ids preserved");
+    assert_eq!(pos, N_POS, "all positive node ids preserved");
+    neg = ways.iter().filter(|id| **id < 0).count();
+    pos = ways.iter().filter(|id| **id > 0).count();
+    assert_eq!(neg, N_NEG, "all negative way ids preserved");
+    assert_eq!(pos, N_POS, "all positive way ids preserved");
+    // Tier A4 follow-up: relation passthrough was previously
+    // unchecked; add the same neg/pos parity for relations so a
+    // regression that drops mixed-sign relations doesn't slip past.
+    neg = relations.iter().filter(|id| **id < 0).count();
+    pos = relations.iter().filter(|id| **id > 0).count();
+    assert_eq!(neg, N_NEG, "all negative relation ids preserved");
+    assert_eq!(pos, N_POS, "all positive relation ids preserved");
 }
 
 /// `inspect` with no subcommand prints summary stats. It must not
@@ -143,10 +156,28 @@ fn sort_preserves_mixed_sign_ids() {
         N_NEG + N_POS,
         "all relations survive sort"
     );
-    let neg_nodes = n.nodes.iter().filter(|x| x.id < 0).count();
-    let pos_nodes = n.nodes.iter().filter(|x| x.id > 0).count();
-    assert_eq!(neg_nodes, N_NEG);
-    assert_eq!(pos_nodes, N_POS);
+    // Tier A5 follow-up: previously only nodes had the neg/pos
+    // filter check; ways and relations were count-only, so a
+    // regression that loses the sign of every way/relation while
+    // keeping counts intact passed silently.
+    let assert_split = |kind: &str, ids: &[i64]| {
+        let neg = ids.iter().filter(|id| **id < 0).count();
+        let pos = ids.iter().filter(|id| **id > 0).count();
+        assert_eq!(neg, N_NEG, "all negative {kind} ids preserved by sort");
+        assert_eq!(pos, N_POS, "all positive {kind} ids preserved by sort");
+    };
+    assert_split(
+        "node",
+        &n.nodes.iter().map(|x| x.id).collect::<Vec<_>>(),
+    );
+    assert_split(
+        "way",
+        &n.ways.iter().map(|x| x.id).collect::<Vec<_>>(),
+    );
+    assert_split(
+        "relation",
+        &n.relations.iter().map(|x| x.id).collect::<Vec<_>>(),
+    );
 }
 
 /// `tags-filter` is a re-encode that walks every element through the
@@ -186,6 +217,27 @@ fn tags_filter_handles_mixed_sign_ids() {
         !stderr.contains("panicked at"),
         "tags-filter must not panic on mixed-sign ids; stderr:\n{stderr}",
     );
+    // Tier A7 follow-up: the silent-drop finding (TODO.md "Promote
+    // silent passthrough/drop to clean error") was surfaced but not
+    // pinned by an assertion. Lock the current behavior so a future
+    // change that flips the drop to a pass-through (or to a clean
+    // error) is forced to update this test deliberately - silent
+    // behavior changes don't slip past.
+    if out.status.success() {
+        let contents = read_all_elements_id_only(&output);
+        let way_ids = way_ids_id_only(&contents);
+        let neg_ways = way_ids.iter().filter(|id| **id < 0).count();
+        assert_eq!(
+            neg_ways, 0,
+            "tags-filter currently drops negative-id ways through its \
+             parallel-classify path. Pinned as the documented status quo \
+             per TODO.md 'Promote silent passthrough/drop to clean error'. \
+             If this assertion fails because tags-filter now preserves \
+             negative ids, update both this test and the TODO entry. \
+             If it fails because tags-filter now produces an error, the \
+             outer success branch should not have been taken.",
+        );
+    }
 }
 
 /// `renumber` MUST hard-reject negative input ids per the documented
@@ -235,6 +287,12 @@ fn renumber_rejects_mixed_sign_ids_with_named_id() {
 
 /// `getid` looks up specific ids in a PBF. Negative ids must be
 /// addressable through the same path as positives.
+///
+/// Tier A6 follow-up: previously the test only asserted no panic and
+/// never read the output. A regression that silently dropped every
+/// negative id from the output passed cleanly. Now we read the
+/// resulting PBF and verify the queried ids actually appear (or
+/// document the current status quo if they do not).
 #[test]
 fn getid_addresses_negative_ids() {
     let dir = TempDir::new().expect("tempdir");
@@ -256,4 +314,26 @@ fn getid_addresses_negative_ids() {
         !stderr.contains("panicked at"),
         "getid must not panic on negative-id queries; stderr:\n{stderr}",
     );
+    if out.status.success() {
+        let contents = read_all_elements_id_only(&output);
+        let nodes = node_ids_id_only(&contents);
+        let ways = way_ids_id_only(&contents);
+        // Lock the current behavior. If getid is currently treating
+        // negative ids as out-of-spec (matching the project-wide
+        // stance documented in DEVIATIONS), the assertions below
+        // will need to be inverted - that's a deliberate change,
+        // and this test will force the conversation.
+        assert!(
+            nodes.contains(&-1) && nodes.contains(&-2),
+            "getid output must contain the queried negative node ids \
+             (-1 and -2); got nodes={nodes:?}. If getid has been \
+             promoted to reject negative ids per the TODO.md \
+             discussion, invert this assertion deliberately.",
+        );
+        assert!(
+            ways.contains(&-1),
+            "getid output must contain the queried negative way id (-1); \
+             got ways={ways:?}",
+        );
+    }
 }

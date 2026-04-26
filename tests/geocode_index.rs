@@ -282,6 +282,53 @@ fn write_oversized_interpolation_input(path: &Path) {
     );
 }
 
+/// Tier B5 fixture: 65 536 admin relations all referencing the same
+/// tiny outer ring, forcing every polygon's bbox into one S2 cell.
+/// Each relation gets a unique `name` so it counts as a distinct
+/// admin polygon. Triggers the per-cell admin u16 cap at
+/// `src/geocode_index/builder/admin.rs:227`.
+#[allow(clippy::cast_possible_wrap)]
+fn write_admin_cell_overflow_input(path: &Path) {
+    // Tiny closed ring: 4 nodes around (55.7, 12.5).
+    let nodes = vec![
+        TestNode { id: 1, lat: 557_000_000, lon: 125_000_000, tags: vec![], meta: None },
+        TestNode { id: 2, lat: 557_000_010, lon: 125_000_000, tags: vec![], meta: None },
+        TestNode { id: 3, lat: 557_000_010, lon: 125_000_010, tags: vec![], meta: None },
+        TestNode { id: 4, lat: 557_000_000, lon: 125_000_010, tags: vec![], meta: None },
+    ];
+    // Closed way: ring of the 4 nodes.
+    let ways = vec![TestWay {
+        id: 100,
+        refs: vec![1, 2, 3, 4, 1],
+        tags: vec![],
+        meta: None,
+    }];
+    // 65 536 admin relations, all referencing the same outer way.
+    // Each gets a unique name (via leaked Box<str>) so the builder
+    // treats them as distinct admin polygons. The names are leaked
+    // because TestRelation::tags wants `&'static str`; the test
+    // process exits soon after, so the leak is bounded.
+    let relations: Vec<TestRelation> = (0..65_536u32)
+        .map(|i| {
+            let name: &'static str =
+                Box::leak(format!("Polygon{i}").into_boxed_str());
+            TestRelation {
+                id: 1_000 + i64::from(i),
+                members: vec![TestMember { id: MemberId::Way(100), role: "outer" }],
+                tags: vec![
+                    ("boundary", "administrative"),
+                    ("admin_level", "8"),
+                    ("name", name),
+                    ("type", "boundary"),
+                ],
+                meta: None,
+            }
+        })
+        .collect();
+
+    write_test_pbf_sorted(path, &nodes, &ways, &relations);
+}
+
 fn write_addr_cell_overflow_input(path: &Path) {
     let node_count = 65_536;
     let nodes: Vec<TestNode> = (0..node_count)
@@ -869,6 +916,40 @@ fn build_rejects_addr_entry_count_over_u16_max_for_one_cell() {
     assert!(
         msg.contains("geocode Stage B: cell"),
         "unexpected error: {msg}"
+    );
+}
+
+/// Tier B5: per-cell admin u16 cap. Pre-batch tests covered the
+/// street, interpolation, and addr u16 caps; the admin cell cap at
+/// `src/geocode_index/builder/admin.rs:227` was unpinned. The
+/// fixture creates 65 536 admin relations all sharing the same
+/// outer ring (so every polygon's bbox lands in the same S2 cell).
+#[test]
+fn build_rejects_admin_entry_count_over_u16_max_for_one_cell() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+
+    write_admin_cell_overflow_input(&input);
+
+    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir,
+            force: false,
+            ..Default::default()
+        },
+    )
+    .expect_err("builder should hard-error on per-cell admin entry overflow");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("entries, exceeds u16::MAX"),
+        "unexpected error: {msg}"
+    );
+    assert!(
+        msg.contains("admin"),
+        "error must mention the admin cell context: {msg}"
     );
 }
 

@@ -290,10 +290,14 @@ fn altw_external_rejects_reversed_indexdata_range() {
         out.stderr_str(),
     );
     let stderr = out.stderr_str();
+    // Pin the exact reversed-range hard error from
+    // `src/commands/altw/external/stage1.rs:412`. The original test
+    // OR'd this with `max_id` which the actual error always contains
+    // anyway, defeating the assertion (any unrelated error mentioning
+    // max_id would pass). Tier A1 follow-up.
     assert!(
-        stderr.contains("reversed indexdata range")
-            || stderr.contains("max_id"),
-        "expected reversed-range error message; stderr:\n{stderr}",
+        stderr.contains("reversed indexdata range"),
+        "expected the stage1 reversed-range hard error; stderr:\n{stderr}",
     );
     assert!(
         !stderr.contains("panicked at"),
@@ -354,6 +358,19 @@ fn renumber_rejects_truncated_relation_blob_payload() {
         !stderr.contains("panicked at"),
         "renumber must not panic on truncated relation payload; stderr:\n{stderr}",
     );
+    // Tier A2 follow-up: the reviewer asked for a stderr substring
+    // match against `count_varints_strict`'s error format
+    // (`"reframe_relations: relation <id> {memids|types}: ..."` from
+    // `src/commands/renumber/wire_rewrite.rs:556-563`). Empirically,
+    // chopping the last byte of the relation blob's PrimitiveBlock
+    // does NOT reliably land inside memids/types - protobuf field
+    // ordering and BlockBuilder's encoding choices put the relation's
+    // tail elsewhere. Renumber still rejects (the `!success` check
+    // above passes), but the rejection comes from the upstream
+    // protobuf walk rather than the strict count. Surgically
+    // pinning `count_varints_strict` requires a mutation primitive
+    // that finds and truncates the memids byte string specifically;
+    // see `notes/testing.md` "Follow-ups" for the deferred work.
 }
 
 /// Cluster-2 fix: `cat` (running the indexdata-generation passthrough
@@ -397,7 +414,19 @@ fn cat_rejects_truncated_node_blob_payload() {
         !stderr.contains("panicked at"),
         "cat must not panic on truncated node payload; stderr:\n{stderr}",
     );
-    // We don't require a specific exit status - cat's tolerance for
-    // partially-readable blobs is itself a hardening tradeoff. The
-    // contract is "no panic", not "always exits with status N".
+    // Tier A3 follow-up: the reviewer flagged that the original
+    // version accepted any exit status. Strengthening to assert
+    // `!success` revealed that cat actually exits 0 on this
+    // truncation - cat tolerates partially-readable blobs by
+    // design (the in-tree comment under cluster-2 hardening calls
+    // this out as a "hardening tradeoff"). The truncation-sweep
+    // test (`tests/cli_truncation_sweep.rs`) DOES require non-zero
+    // exit; the difference is that the sweep truncates at frame
+    // boundaries the reader can detect, while `mutate_blob_payload`
+    // produces a byte-valid frame whose inner protobuf decodes
+    // partially. Pinning `!success` here would force a code change
+    // to cat's tolerance policy, which is out of scope for an
+    // assertion-strengthening pass. The contract this test pins
+    // is "no panic on adversarial node payload"; the broader
+    // "non-zero exit on truncation" contract lives in the sweep.
 }

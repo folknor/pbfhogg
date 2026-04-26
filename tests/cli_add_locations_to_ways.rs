@@ -809,3 +809,102 @@ mod platform {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tier B contract gaps from 2026-04-26 review (notes/testing.md "Follow-ups")
+// ---------------------------------------------------------------------------
+
+/// B1 - Null Island sentinel collision (CORRECTNESS.md "Null Island
+/// ambiguity"). Every coordinate index uses `(0, 0)` as the
+/// "absent" sentinel - so a real node at exactly Null Island is
+/// indistinguishable from a missing reference. The four sites
+/// (`DenseMmapIndex::get`, `SparseArrayIndex::get_at_offset`, ALTW
+/// external stage 2 `is_resolved`, geocode Pass 2) all share this
+/// behavior. CORRECTNESS.md documents the limitation as accepted;
+/// fixing it requires a separate occupancy bitmap (~550 MB at planet
+/// scale).
+///
+/// This test pins the documented status quo: a way referencing a
+/// node at exactly `(lat: 0, lon: 0)` produces a "1 missing
+/// locations" report, even though the node is present and at its
+/// stored coordinates. If a future change introduces an occupancy
+/// bitmap (or any other fix), this test fails - prompting a
+/// deliberate update to both the test AND the CORRECTNESS entry.
+#[test]
+fn null_island_real_node_treated_as_missing() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let nodes = vec![TestNode {
+        id: 1,
+        lat: 0,
+        lon: 0,
+        tags: vec![],
+        meta: None,
+    }];
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![1],
+        tags: vec![("highway", "primary")],
+        meta: None,
+    }];
+    write_test_pbf(&input, &nodes, &ways, &[]);
+
+    let out = run_altw_ok(&input, &output, true);
+    assert!(
+        out.stderr_str().contains("1 missing locations"),
+        "Null Island sentinel collision: a real node at (0, 0) must \
+         be reported as missing per CORRECTNESS.md 'Null Island \
+         ambiguity'. If this assertion fails because altw now \
+         distinguishes real (0,0) from missing, update the \
+         CORRECTNESS.md entry too. stderr:\n{}",
+        out.stderr_str(),
+    );
+}
+
+/// B2 - missing-node tolerance for `--index-type external`.
+/// DEVIATIONS.md says missing nodes are tolerated by default, with
+/// `(0, 0)` substituted. Pre-batch tests pinned this for dense
+/// (`missing_node_refs_get_zero_coordinates`) and sparse
+/// (`missing_node_refs_get_zero_coordinates_sparse`); the external
+/// variant was unpinned. Same fixture, same expected output - this
+/// test makes the contract uniform across all three backends.
+#[test]
+fn missing_node_refs_get_zero_coordinates_external() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![1, 999, 3], // 999 doesn't exist
+        tags: vec![("highway", "primary")],
+        meta: None,
+    }];
+    // External requires indexed input (HeaderWalker fast-path scans
+    // BlobHeader.indexdata to drive its I/O schedule). The dense
+    // and sparse twins use `write_test_pbf` because their code
+    // paths fall back to full-decode without indexdata; external
+    // does not.
+    write_indexed_pbf(&input, &test_nodes(), &ways, &[]);
+
+    let out = run_altw(&input, &output, true, IndexBackend::External, false);
+    assert!(
+        out.status.success(),
+        "external missing-refs failed; stderr:\n{}",
+        out.stderr_str(),
+    );
+    assert!(
+        out.stderr_str().contains("1 missing locations"),
+        "expected '1 missing locations' under --index-type external; \
+         stderr:\n{}",
+        out.stderr_str(),
+    );
+
+    let ways = read_way_locations(&output);
+    assert_eq!(
+        ways,
+        vec![(10, vec![(550_000_000, 120_000_000), (0, 0), (552_000_000, 122_000_000)])],
+    );
+}

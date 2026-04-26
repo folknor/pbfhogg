@@ -160,6 +160,17 @@ pub fn mutate_blob_header_indexdata(
 /// BlobHeader.datasize and frame length prefix are recomputed. The
 /// indexdata field is preserved verbatim - tests that need to mutate
 /// it use [`mutate_blob_header_indexdata`].
+///
+/// **Scope.** This helper is byte-level: the inner protobuf encoding
+/// produced by the original `BlockBuilder` is preserved unchanged.
+/// pbfhogg's parser silently skips repeated scalar fields encoded as
+/// non-packed entries (see `CORRECTNESS.md` "Non-packed repeated
+/// fields"), but `mutate_blob_payload` cannot exercise that edge case
+/// on its own: the closure receives bytes that are already
+/// packed-encoded by the fixture writer, so chopping or splicing them
+/// keeps them packed. A future test that needs to inject non-packed
+/// entries needs a separate primitive (or hand-rolled protobuf
+/// emission) that re-encodes the inner fields.
 pub fn mutate_blob_payload(
     pbf: &[u8],
     blob_idx: usize,

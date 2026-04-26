@@ -26,7 +26,10 @@ mod common;
 use std::io::Cursor;
 
 use bytes::Bytes;
-use common::{generate_nodes, read_normalized, write_test_pbf_sorted};
+use common::{
+    generate_nodes, generate_nodes_with_negatives, read_normalized,
+    write_test_pbf_sorted,
+};
 use pbfhogg::{BlobReader, PrimitiveBlock};
 use proptest::prelude::*;
 use tempfile::TempDir;
@@ -97,6 +100,15 @@ proptest! {
     /// assert every input id is present in the output and counts
     /// match. Pins the read/write surface against arbitrary `count`
     /// and `start_id` shapes.
+    ///
+    /// `start` is positive-only by design. Per `DEVIATIONS.md`
+    /// ("Negative input IDs rejected project-wide") the *command*
+    /// pipelines reject negative ids, so a proptest covering both
+    /// signs would conflate the library-level read/write contract
+    /// with the command-level invariant. Mixed-sign roundtrips are
+    /// pinned separately by `negative_id_node_fixture_roundtrips`
+    /// below; widening this property's range without thinking
+    /// through that layering would re-merge the two contracts.
     #[test]
     fn node_fixture_roundtrips(
         count in 1usize..50,
@@ -109,6 +121,39 @@ proptest! {
 
         let n = read_normalized(&path);
         prop_assert_eq!(n.nodes.len(), count);
+        let mut input_ids: Vec<i64> = input_nodes.iter().map(|x| x.id).collect();
+        input_ids.sort_unstable();
+        let mut output_ids: Vec<i64> = n.nodes.iter().map(|x| x.id).collect();
+        output_ids.sort_unstable();
+        prop_assert_eq!(input_ids, output_ids);
+    }
+
+    /// Library-level mixed-sign roundtrip: `BlockBuilder` /
+    /// `PbfWriter` accept negative ids on input, the protobuf wire
+    /// format encodes them via zigzag (sint64), and `ElementReader`
+    /// decodes them back to the same i64 values. This holds even
+    /// though no CLI command consumes such files - per
+    /// `DEVIATIONS.md` the *commands* reject negatives, but the
+    /// underlying library primitives don't.
+    ///
+    /// Pinning this contract separately from
+    /// `node_fixture_roundtrips` makes the layering explicit: a
+    /// future change that breaks library-level mixed-sign support
+    /// fails this test loudly, even if every command-level test
+    /// still passes (because no CLI command exercises mixed-sign
+    /// input).
+    #[test]
+    fn negative_id_node_fixture_roundtrips(
+        n_neg in 1usize..20,
+        n_pos in 1usize..20,
+    ) {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("fixture.osm.pbf");
+        let input_nodes = generate_nodes_with_negatives(n_neg, n_pos);
+        write_test_pbf_sorted(&path, &input_nodes, &[], &[]);
+
+        let n = read_normalized(&path);
+        prop_assert_eq!(n.nodes.len(), n_neg + n_pos);
         let mut input_ids: Vec<i64> = input_nodes.iter().map(|x| x.id).collect();
         input_ids.sort_unstable();
         let mut output_ids: Vec<i64> = n.nodes.iter().map(|x| x.id).collect();

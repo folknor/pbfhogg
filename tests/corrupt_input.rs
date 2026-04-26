@@ -57,19 +57,20 @@ fn empty_file() {
     assert!(reader.next().is_none(), "empty input should yield None");
 }
 
-/// 1-3 bytes: not enough for the 4-byte header length prefix.
-/// The first byte reads successfully, then the second read_exact (bytes 1..4)
-/// fails with UnexpectedEof, which is now propagated as ErrorKind::Io.
+/// 1-3 bytes: not enough for the 4-byte header length prefix. Per
+/// `reference/truncation-handling.md` shape 1, this is a clean cut at
+/// a frame boundary (with 1-3 leftover bytes from a writer that
+/// crashed mid-prefix) - tolerated as EOF, no error. Aligns
+/// `BlobReader` with `read_raw_frame` and the documented stance.
 #[test]
 fn truncated_header_size() {
     for len in 1..=3 {
         let data = vec![0xAA; len];
         let mut reader = BlobReader::new(Cursor::new(data));
-        let err = reader.next().unwrap().unwrap_err();
-        match err.into_kind() {
-            ErrorKind::Io(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
-            other => panic!("expected Io(UnexpectedEof) for {len} bytes, got {other:?}"),
-        }
+        assert!(
+            reader.next().is_none(),
+            "1-3 trailing bytes should be tolerated as clean EOF (got Some for len={len})",
+        );
     }
 }
 
@@ -88,7 +89,11 @@ fn header_too_big() {
     }
 }
 
-/// Valid header length but too few bytes for the header data → wire-format parse error.
+/// Valid length prefix but too few bytes for the declared BlobHeader.
+/// Per `reference/truncation-handling.md` shape 3, this is a hard
+/// error - the BlobReader's post-`read_to_end` length check catches
+/// the short read and surfaces it as `Io(UnexpectedEof)` before the
+/// wire-format parser sees corrupt bytes.
 #[test]
 fn truncated_header_data() {
     let mut data = Vec::new();
@@ -97,8 +102,8 @@ fn truncated_header_data() {
     let mut reader = BlobReader::new(Cursor::new(data));
     let err = reader.next().unwrap().unwrap_err();
     match err.into_kind() {
-        ErrorKind::WireFormat { .. } => {}
-        other => panic!("expected WireFormat error for truncated header, got {other:?}"),
+        ErrorKind::Io(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+        other => panic!("expected Io(UnexpectedEof) for truncated header, got {other:?}"),
     }
 }
 
@@ -253,9 +258,17 @@ fn check_refs_rejects_schedule_entry_past_eof() {
         Err(e) => e,
     };
     let msg = format!("{err}");
+    // Pre-fix: schedule built cleanly, workers later failed with opaque
+    // `read_exact_at` UnexpectedEof. Post-truncation-alignment: the
+    // `HeaderWalker` payload-extent check fires up front (shape 4 per
+    // `reference/truncation-handling.md`), so the schedule never gets
+    // built. Either error class is acceptable - both pin "truncation
+    // hard-errors before workers see corrupt bytes".
     assert!(
-        msg.contains("data_size") || msg.contains("file is only"),
-        "expected schedule-builder truncation error, got: {msg}",
+        msg.contains("data_size")
+            || msg.contains("file is only")
+            || msg.contains("blob payload truncated"),
+        "expected schedule-builder or walker truncation error, got: {msg}",
     );
 }
 
@@ -281,12 +294,19 @@ fn inspect_rejects_oversized_header_length_via_walker() {
     );
 }
 
-/// After an error, BlobReader stops iteration (returns None on subsequent calls).
+/// After an error, BlobReader stops iteration (returns None on
+/// subsequent calls). Use a fixture that produces a real error per the
+/// reference truncation stance: a complete length prefix declaring N
+/// bytes of header but with too few following (shape 3). 2-byte
+/// trailing garbage no longer triggers an error - that's now
+/// tolerated as a clean cut.
 #[test]
 fn iteration_stops_after_error() {
     let mut data = write_header_only_pbf();
-    // Append 2 garbage bytes (not enough for a 4-byte header length prefix)
-    data.extend_from_slice(&[0xAA, 0xBB]);
+    // Append a complete length prefix promising 20 header bytes,
+    // then only 5 bytes - shape 3, hard error.
+    data.extend_from_slice(&20u32.to_be_bytes());
+    data.extend_from_slice(&[0x0A; 5]);
 
     let mut reader = BlobReader::new(Cursor::new(data));
 
@@ -294,7 +314,7 @@ fn iteration_stops_after_error() {
     let first = reader.next().unwrap().unwrap();
     assert_eq!(first.get_type(), BlobType::OsmHeader);
 
-    // Second read fails (2 bytes = InvalidHeaderSize)
+    // Second read fails (truncated header data, shape 3)
     let second = reader.next().unwrap();
     assert!(second.is_err());
 

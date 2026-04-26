@@ -158,11 +158,14 @@ impl HeaderWalker {
             return Ok(None);
         }
         self.header_buf.resize(probe_len, 0);
-        match self.file.read_exact_at(&mut self.header_buf, self.offset) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(crate::error::new_error(crate::error::ErrorKind::Io(e))),
-        }
+        // Per `reference/truncation-handling.md`: a committed read past
+        // EOF (i.e. probe_len bytes promised by `remaining` derived from
+        // `file_size`) is shape 2 or 3 - hard error, not silent EOF.
+        // The clean-EOF case is handled above at the `probe_len < 4`
+        // guard.
+        self.file
+            .read_exact_at(&mut self.header_buf, self.offset)
+            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
 
         let header_len = u32::from_be_bytes([
             self.header_buf[0],
@@ -198,7 +201,36 @@ impl HeaderWalker {
             .and_then(|b| BlobIndex::deserialize(b));
 
         let data_offset = self.offset + header_end as u64;
-        self.offset = data_offset + data_size as u64;
+        // Per `reference/truncation-handling.md` shape 4: the declared
+        // payload must fit within the file. Without this check, a
+        // truncated tail blob would silently terminate the walk on the
+        // next call (offset >= file_size returns Ok(None)).
+        let payload_end = data_offset
+            .checked_add(data_size as u64)
+            .ok_or_else(|| {
+                crate::error::new_error(crate::error::ErrorKind::Io(
+                    ::std::io::Error::new(
+                        ::std::io::ErrorKind::InvalidData,
+                        format!(
+                            "blob at offset {} declares overflowing payload size {data_size}",
+                            self.offset
+                        ),
+                    ),
+                ))
+            })?;
+        if payload_end > self.file_size {
+            return Err(crate::error::new_error(crate::error::ErrorKind::Io(
+                ::std::io::Error::new(
+                    ::std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "blob payload truncated: declared {data_size} bytes \
+                         from offset {data_offset}, file_size {}",
+                        self.file_size
+                    ),
+                ),
+            )));
+        }
+        self.offset = payload_end;
         let frame_size = 4 + header_len + data_size;
 
         Ok(Some(BlobHeaderMeta {

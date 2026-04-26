@@ -378,8 +378,16 @@ impl<R: Read + Send> BlobReader<R> {
                     self.offset = self.offset.map(|x| ByteOffset(x.0 + 4));
                     u64::from(u32::from_be_bytes(buf))
                 }
+                Err(e) if e.kind() == ::std::io::ErrorKind::UnexpectedEof => {
+                    // 1-3 trailing bytes after a complete previous frame
+                    // are tolerated per `reference/truncation-handling.md`
+                    // ("clean cut at frame boundary"). The partial length
+                    // prefix can't start a new frame; treat as EOF.
+                    return None;
+                }
                 Err(e) => {
-                    // Truncated header or I/O error -- propagate the real cause.
+                    // Genuine I/O error (broken pipe, permission denied,
+                    // etc.) - propagate the real cause.
                     self.offset = None;
                     self.last_blob_ok = false;
                     return Some(Err(e.into()));
@@ -399,6 +407,21 @@ impl<R: Read + Send> BlobReader<R> {
         self.header_buf.reserve(header_size as usize);
         if let Err(e) = reader.read_to_end(&mut self.header_buf) {
             return self.handle_error(e.into());
+        }
+        // `Take::read_to_end` returns Ok(short_count) on truncation; a
+        // committed length prefix that promises N bytes of header but
+        // delivers fewer is shape 3 ("EOF inside BlobHeader bytes") per
+        // `reference/truncation-handling.md` and must hard-error.
+        if self.header_buf.len() as u64 != header_size {
+            return self.handle_error(new_error(ErrorKind::Io(
+                ::std::io::Error::new(
+                    ::std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "BlobHeader truncated: expected {header_size} bytes, got {}",
+                        self.header_buf.len()
+                    ),
+                ),
+            )));
         }
 
         let header = match WireBlobHeader::parse(&self.header_buf, self.parse_tagdata, self.parse_indexdata) {
@@ -527,6 +550,22 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
         let mut blob_data = Vec::with_capacity(header.datasize as usize);
         if let Err(e) = reader.read_to_end(&mut blob_data) {
             return self.handle_error(e.into());
+        }
+        // `Take::read_to_end` returns Ok(short_count) on truncation; a
+        // BlobHeader.datasize that promises N payload bytes but
+        // delivers fewer is shape 4 ("EOF inside Blob payload") per
+        // `reference/truncation-handling.md` and must hard-error.
+        if blob_data.len() as u64 != header.datasize as u64 {
+            return self.handle_error(new_error(ErrorKind::Io(
+                ::std::io::Error::new(
+                    ::std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "Blob payload truncated: expected {} bytes, got {}",
+                        header.datasize,
+                        blob_data.len()
+                    ),
+                ),
+            )));
         }
 
         let blob_bytes = Bytes::from(blob_data);
@@ -695,11 +734,29 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
     /// (`File`, `Cursor`) the default impl is `Seek::seek`, which is already
     /// optimal for those types.
     fn skip_blob_body(&mut self, n: u64) -> Result<()> {
-        // header.datasize is i32 in the protobuf; capped at MAX_BLOB_HEADER_SIZE
-        // upstream. Comfortably fits in i64.
+        if n == 0 {
+            return Ok(());
+        }
+        // Skip n-1 bytes via the seek-aware path (preserves the
+        // BufReader buffer optimization for in-range targets), then
+        // read exactly one byte to validate the file actually contains
+        // n bytes from the current position. Without the post-skip
+        // read, `BufReader::seek_relative` can succeed past EOF on
+        // file-backed readers - the truncation would only surface at
+        // the next caller's read. Per
+        // `reference/truncation-handling.md` shape 4, a Blob payload
+        // that doesn't deliver the declared `datasize` must
+        // hard-error here, not be deferred.
+        // header.datasize is i32 in the protobuf; capped at
+        // MAX_BLOB_HEADER_SIZE upstream. Comfortably fits in i64.
         #[allow(clippy::cast_possible_wrap)]
-        let signed = n as i64;
-        match self.reader.skip_relative(signed) {
+        let signed = (n - 1) as i64;
+        if let Err(e) = self.reader.skip_relative(signed) {
+            self.offset = None;
+            return Err(e.into());
+        }
+        let mut sentinel = [0u8; 1];
+        match self.reader.read_exact(&mut sentinel) {
             Ok(()) => {
                 self.offset = self.offset.map(|x| ByteOffset(x.0 + n));
                 Ok(())

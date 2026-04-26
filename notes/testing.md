@@ -607,19 +607,29 @@ test files.
   **Add neg/pos filter checks for ways and relations** matching
   the node block. `[R1]`
 - A6 - `getid_addresses_negative_ids`
-  (`tests/cli_negative_id_invariants.rs:236-258`) gets a `-o`
-  output file but never reads it back. A regression that drops
-  every queried negative id silently passes. **Add output read +
-  assert the queried ids appear**. `[A1, R1]`
+  (`tests/cli_negative_id_invariants.rs`). **Outcome 2026-04-26
+  (pass 2)**: tightening to require output content surfaced
+  three real bugs:
+  1. The original test passed `--ids` but the CLI takes
+     positional `[IDS]...` - the `if success` guard masked
+     this for the entire prior batch.
+  2. After fixing the arg shape, getid still failed because
+     `parse_id_spec("n-1")` correctly parsed `id = -1` but
+     `IdSet::set` silently no-ops on negatives
+     (`src/idset.rs:45`, project-wide stance), leaving the
+     id set empty and triggering "no IDs specified".
+  3. Test now pins this current state (non-zero exit + "no IDs
+     specified") so the `IdSet` silent-rejection cleanup
+     tracked in `TODO.md` "Promote silent passthrough/drop"
+     fails the test deliberately when it lands. `[A1, R1, R2-pass2]`
 - A7 - `tags_filter_handles_mixed_sign_ids`
-  (`tests/cli_negative_id_invariants.rs:184-189`) surfaced the
-  silent-drop finding (committed in `daf5a5b`'s message,
-  documented in `TODO.md`) but pins NOTHING about it. A future
-  regression that flips the silent-drop to silent-pass-through
-  passes silently. **Lock the current behavior**: read output,
-  assert `n.ways.iter().filter(|w| w.id < 0).count() == 0` with
-  a comment pointing at the TODO entry. When TODO is acted on,
-  the test fails and forces a deliberate update. `[A1, A2, R2]`
+  (`tests/cli_negative_id_invariants.rs`). **Outcome 2026-04-26
+  (pass 2)**: previously the assertion was guarded by
+  `if out.status.success()`, which let any future clean-
+  rejection regression pass silently. Now asserts both shape
+  AND outcome unconditionally: tags-filter currently succeeds
+  + drops negative-id ways. A regression that flips either
+  side fails. `[A1, A2, R2, R1-pass2, R2-pass2]`
 
 **T04 - truncation sweep assertions:**
 
@@ -627,13 +637,17 @@ test files.
   (`tests/cli_truncation_sweep.rs:93-112`) and
   `run_sort_and_assert_no_panic` (`:114-127`) never assert
   exit status. **Outcome 2026-04-26**: strengthening to require
-  `!success` revealed all three commands (cat, inspect, sort)
-  are tolerant by design - they decode what they can and exit
-  0 even on truncated input. The reviewer brief over-stated
-  the contract. Helper now pins "no panic + bounded stderr" for
-  every command; the `!success` half is deferred until a
-  decision is made about whether to promote any of these to
-  strict-error-on-truncation. `[all]`
+  `!success` revealed cat / inspect / sort tolerate truncation
+  in shapes that should be hard errors per the stance now
+  documented in
+  [`reference/truncation-handling.md`](../reference/truncation-handling.md).
+  The reviewer brief was correct; the implementation is the
+  bug. Helper temporarily pins "no panic + bounded stderr"
+  only; once the read-path audit aligns the four contract sites
+  (`BlobReader::next`, `read_raw_frame`,
+  `HeaderWalker::next_header`, `PrimitiveBlock::new`) with the
+  documented stance, the helper re-tightens to assert
+  `!success`. `[all]`
 - A9 - `run_sort_and_assert_no_panic`
   (`tests/cli_truncation_sweep.rs:114-127`) omits the
   `stderr.len() < 100_000` bounded-stderr check that the
@@ -658,11 +672,12 @@ test files.
   with `assert_elements_equivalent`** (the helper already
   exists at `tests/common/mod.rs:975`). Same fix applies to
   `negative_id_node_fixture_roundtrips`. `[all]`
-- A12 - No way / relation roundtrip property exists, and the
-  T07 deferred backlog (testing.md "Skipped from T07's brief")
-  does not list them. **Either add the properties** (~20 lines,
-  same shape as `node_fixture_roundtrips`) **or list them in the
-  T07 deferred section** with a one-line justification. `[R1]`
+- A12 - No way / relation roundtrip property exists.
+  **Outcome 2026-04-26**: shipped `way_fixture_roundtrips`
+  and `relation_fixture_roundtrips` proptests. Pass 2
+  flagged that the relation property compared only member
+  count; **fixed in pass 2** to compare full member shape
+  (type + ref id + role) against the input vector. `[R1, R1-pass2, R2-pass2]`
 
 ### Tier B: documented contract gaps in pre-batch coverage
 
@@ -687,9 +702,12 @@ small new test in an existing file.
 - B3 - **renumber relation-member orphan preservation**
   [LANDED 2026-04-26].
   `renumber_orphan_relation_member_preserves_old_id` in
-  `tests/renumber_external.rs`. Asserts orphan member ids
-  (way 99999 + node 99999) survive with their old ids while
-  in-input refs are remapped.
+  `tests/renumber_external.rs`. **Pass 2 update**: original
+  used id 99999 for both way and node orphans + only
+  `contains(&99999)` check, so dropping either or switching
+  member type would pass. Now uses distinct ids (way 99998,
+  node 99999) and asserts the full member sequence
+  (type + ref id + role per slot, ordered).
 - B4 - **renumber negative relation-member ref rejection**
   [LANDED 2026-04-26].
   `renumber_rejects_negative_relation_member_ref` in
@@ -702,6 +720,17 @@ small new test in an existing file.
   relations all sharing one outer ring → all polygons land in
   the same S2 cell → triggers the per-cell admin cap at
   `src/geocode_index/builder/admin.rs:227`.
+- B5b - **Per-cell street and interp u16 entry caps**
+  [LANDED 2026-04-26]. Pass 2 flagged that the pre-batch
+  street/interp tests covered per-WAY `node_count`, not
+  per-CELL entry counts. Now covered by
+  `build_rejects_street_entry_count_over_u16_max_for_one_cell`
+  (pass3.rs:570) and
+  `build_rejects_interp_entry_count_over_u16_max_for_one_cell`
+  (pass3.rs:599) in `tests/geocode_index.rs`. Fixtures: 65 536
+  tiny streets / interp ways, each sharing the same two
+  endpoint nodes so every segment lands in the same S2 cell.
+  `[R2-pass2]`
 
 ### Tier C: reviewer disagreements (verified 2026-04-26)
 

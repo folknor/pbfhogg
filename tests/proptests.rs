@@ -181,8 +181,11 @@ proptest! {
     }
 
     /// Relation fixture roundtrip - pins `BlockBuilder::add_relation`
-    /// and the `Relation` parser by checking ids and member shapes
-    /// survive intact. Tier A12 follow-up.
+    /// and the `Relation` parser by checking ids and full member
+    /// shapes (type + ref id + role) survive intact. Reviewer pass 2
+    /// follow-up: the previous version asserted only member count,
+    /// so a regression that corrupted member type, ref id, or role
+    /// while preserving count slipped past.
     #[test]
     fn relation_fixture_roundtrips(
         node_count in 5usize..20,
@@ -207,6 +210,21 @@ proptest! {
                 .get(&input.id)
                 .expect("input relation must appear in output");
             prop_assert_eq!(output.members.len(), input.members.len());
+            for (i, expected) in input.members.iter().enumerate() {
+                let got = &output.members[i];
+                let (expected_type, expected_ref_id) = match expected.id {
+                    pbfhogg::MemberId::Node(id) => ("node", id),
+                    pbfhogg::MemberId::Way(id) => ("way", id),
+                    pbfhogg::MemberId::Relation(id) => ("relation", id),
+                    pbfhogg::MemberId::Unknown(_, id) => ("unknown", id),
+                    // `MemberId` is `#[non_exhaustive]`; future
+                    // variants would need explicit handling here.
+                    _ => ("other", expected.id.id()),
+                };
+                prop_assert_eq!(got.member_type.as_str(), expected_type);
+                prop_assert_eq!(got.ref_id, expected_ref_id);
+                prop_assert_eq!(got.role.as_str(), expected.role);
+            }
         }
     }
 

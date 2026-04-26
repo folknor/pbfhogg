@@ -350,21 +350,48 @@ single-pass, tag expression and bbox filtering.
   Three commands have known diffs: extract (relation inclusion criteria),
   diff (14-element version comparison), check-refs (occurrences vs unique).
   See `brokkr verify all` output and README cross-validation section.
+- [ ] **Align read path with `reference/truncation-handling.md`.**
+  The reference doc (drafted 2026-04-26) takes the stance that
+  every truncation shape except a clean cut at a frame boundary
+  is a hard error. Current implementation is partially aligned -
+  shape 5 (decompression failure) errors, but shapes 2-4 (length
+  prefix past EOF, mid-header, mid-payload) sometimes return
+  `Ok`/`None` instead of `Err`. Audit the four contract sites
+  (`src/read/blob.rs::BlobReader::next`,
+  `src/read/raw_frame.rs::read_raw_frame`,
+  `src/read/header_walker.rs::HeaderWalker::next_header`,
+  `src/read/block.rs::PrimitiveBlock::new`) and promote each
+  mid-frame EOF return to a typed error variant. Then re-tighten
+  `tests/cli_truncation_sweep.rs` to assert non-zero exit (Tier
+  A8 follow-up tracked in `notes/testing.md`). No DEVIATIONS
+  entry needed - the stance is just pbfhogg's contract, not a
+  difference from any other tool.
 - [ ] **Promote silent passthrough/drop to clean error on mixed-sign
   input across non-renumber commands.** `DEVIATIONS.md` ("Negative input
   IDs rejected project-wide") names `renumber` and the diff/derive shard
   planners as the only enforcement sites. Surfaced 2026-04-26 via the
-  `cli_negative_id_invariants.rs` sweep: `tags-filter`'s parallel-classify
-  path silently drops negative-id ways; `cat`/`sort`/`inspect`/`getid`
-  pass them through. Per the project-wide stance these should be clean
-  errors naming the offending id (matching renumber's shape: `"<command>
-  requires non-negative input ids. Input contains <kind> id <id>. ..."`).
-  Cheap to add - a `<id> < 0` guard at each command's first
+  `cli_negative_id_invariants.rs` sweep:
+  - `tags-filter`'s parallel-classify path silently drops negative-id
+    ways.
+  - `cat` / `sort` / `inspect` pass negatives through unchanged.
+  - `getid` produces a confusing `"no IDs specified"` error because
+    `IdSet::set` silently no-ops on negative ids
+    (`src/idset.rs:45`), leaving an empty id set even when the user
+    correctly supplied `n-1 n-2`.
+
+  Per the project-wide stance these should each be clean errors naming
+  the offending id (matching renumber's shape: `"<command> requires
+  non-negative input ids. Input contains <kind> id <id>. ..."`). Cheap
+  to add - an explicit `<id> < 0` guard at each command's first
   blob-element-walk site, returning `ErrorKind::Io` with the formatted
-  message. Decision needed: ship as a hard-error promotion across the
+  message. The `IdSet` silent-rejection at the data-structure layer
+  (`src/idset.rs:45, 65`) should also surface as a typed error rather
+  than a no-op return; that fixes `getid`'s confusing message at the
+  root. Decision needed: ship as a hard-error promotion across the
   whole CLI (consistent), or stay as documented passthrough on the
   non-named commands (less surprise for users feeding hand-edited JOSM
-  data through `cat`). Pair with `decisions/0002` if the choice changes.
+  data through `cat`). Pair with `decisions/0002` if the choice
+  changes.
 - [x] ~~**`pbfhogg diff --summary` flips stats format rather than enabling
   output**~~ - resolved 2026-04-25. Renamed to `--osmium-summary`. The
   `-s` short form is unchanged. The pbfhogg-format summary always

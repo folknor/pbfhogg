@@ -556,6 +556,13 @@ fn renumber_orphan_way_ref_preserves_old_id() {
 /// behavior pinned above. Pre-batch coverage existed only for
 /// orphan way refs (`renumber_orphan_way_ref_preserves_old_id`);
 /// this test extends the contract to relation members.
+///
+/// Reviewer pass 2 follow-up: previously the way orphan and node
+/// orphan shared id 99999, so a `contains(&99999)` check could pass
+/// when only one of the two survived (or when one was rewritten to
+/// a different type). Now uses distinct ids (way 99998, node 99999)
+/// and asserts the full member sequence: type + ref id + role for
+/// every member, preserving order.
 #[test]
 fn renumber_orphan_relation_member_preserves_old_id() {
     let dir = TempDir::new().expect("tempdir");
@@ -576,7 +583,7 @@ fn renumber_orphan_relation_member_preserves_old_id() {
                 id: 1000,
                 members: vec![
                     TestMember { id: MemberId::Way(100), role: "outer" },
-                    TestMember { id: MemberId::Way(99999), role: "outer" },
+                    TestMember { id: MemberId::Way(99998), role: "outer" },
                     TestMember { id: MemberId::Node(10), role: "label" },
                     TestMember { id: MemberId::Node(99999), role: "label" },
                 ],
@@ -592,25 +599,33 @@ fn renumber_orphan_relation_member_preserves_old_id() {
     )
     .expect("renumber");
 
-    // Two orphan member refs (way 99999 and node 99999); plus
-    // potentially the way orphan if the stats counter doesn't
-    // distinguish member-side from ref-side. Either way, the
-    // orphan total must be at least 2.
     assert!(
         stats.orphan_refs >= 2,
-        "expected >=2 orphan refs (way 99999 + node 99999); got {}",
+        "expected >=2 orphan refs (way 99998 + node 99999); got {}",
         stats.orphan_refs,
     );
 
     let norm = read_normalized(&output);
+    assert_eq!(norm.relations.len(), 1);
     let rel = &norm.relations[0];
-    let member_ids: Vec<i64> = rel.members.iter().map(|m| m.ref_id).collect();
-    // The in-input refs (way 100 -> way 1, node 10 -> node 1) get
-    // remapped; the orphans (way 99999, node 99999) keep their
-    // old id.
-    assert!(
-        member_ids.contains(&99999),
-        "orphan refs (99999) must be preserved with old id; got {member_ids:?}",
+    // In-input refs are remapped (way 100 -> way 1, node 10 -> node
+    // 1); orphans (way 99998, node 99999) keep their old id and
+    // their original member type.
+    let member_summary: Vec<(&str, i64, &str)> = rel
+        .members
+        .iter()
+        .map(|m| (m.member_type.as_str(), m.ref_id, m.role.as_str()))
+        .collect();
+    assert_eq!(
+        member_summary,
+        vec![
+            ("way",   1,     "outer"),
+            ("way",   99998, "outer"),
+            ("node",  1,     "label"),
+            ("node",  99999, "label"),
+        ],
+        "member sequence must preserve type + ref id + role for both \
+         in-input remaps and orphans (DEVIATIONS contract); got {member_summary:?}",
     );
 }
 

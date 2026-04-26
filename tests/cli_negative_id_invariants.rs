@@ -217,27 +217,30 @@ fn tags_filter_handles_mixed_sign_ids() {
         !stderr.contains("panicked at"),
         "tags-filter must not panic on mixed-sign ids; stderr:\n{stderr}",
     );
-    // Tier A7 follow-up: the silent-drop finding (TODO.md "Promote
-    // silent passthrough/drop to clean error") was surfaced but not
-    // pinned by an assertion. Lock the current behavior so a future
-    // change that flips the drop to a pass-through (or to a clean
-    // error) is forced to update this test deliberately - silent
-    // behavior changes don't slip past.
-    if out.status.success() {
-        let contents = read_all_elements_id_only(&output);
-        let way_ids = way_ids_id_only(&contents);
-        let neg_ways = way_ids.iter().filter(|id| **id < 0).count();
-        assert_eq!(
-            neg_ways, 0,
-            "tags-filter currently drops negative-id ways through its \
-             parallel-classify path. Pinned as the documented status quo \
-             per TODO.md 'Promote silent passthrough/drop to clean error'. \
-             If this assertion fails because tags-filter now preserves \
-             negative ids, update both this test and the TODO entry. \
-             If it fails because tags-filter now produces an error, the \
-             outer success branch should not have been taken.",
-        );
-    }
+    // Reviewer pass 2 follow-up: the assertions used to be guarded
+    // by `if out.status.success()`, which meant a future clean
+    // rejection of mixed-sign input would skip the silent-drop
+    // assertion entirely (and pass silently). Lock both shape AND
+    // outcome: tags-filter currently succeeds + drops negative-id
+    // ways. A regression that flips either side fails this test.
+    assert!(
+        out.status.success(),
+        "tags-filter currently succeeds on mixed-sign input. If it \
+         has been promoted to clean rejection per TODO.md 'Promote \
+         silent passthrough/drop to clean error', invert this \
+         assertion deliberately and update the TODO entry. \
+         stderr:\n{stderr}",
+    );
+    let contents = read_all_elements_id_only(&output);
+    let way_ids = way_ids_id_only(&contents);
+    let neg_ways = way_ids.iter().filter(|id| **id < 0).count();
+    assert_eq!(
+        neg_ways, 0,
+        "tags-filter currently drops negative-id ways through its \
+         parallel-classify path. If this assertion fails because \
+         tags-filter now preserves negative ids, that is a deliberate \
+         change - update both this test and the TODO entry.",
+    );
 }
 
 /// `renumber` MUST hard-reject negative input ids per the documented
@@ -285,14 +288,34 @@ fn renumber_rejects_mixed_sign_ids_with_named_id() {
     );
 }
 
-/// `getid` looks up specific ids in a PBF. Negative ids must be
-/// addressable through the same path as positives.
+/// `getid` querying negative ids: surfaces the current behavior,
+/// which is **silent rejection via the underlying data structure**.
 ///
-/// Tier A6 follow-up: previously the test only asserted no panic and
-/// never read the output. A regression that silently dropped every
-/// negative id from the output passed cleanly. Now we read the
-/// resulting PBF and verify the queried ids actually appear (or
-/// document the current status quo if they do not).
+/// The CLI's `parse_id_spec("n-1")` correctly parses node id `-1`,
+/// then calls `IdSet::set(-1)`. `IdSet::set` silently no-ops on
+/// negative ids (`src/idset.rs:45`, per the project-wide stance
+/// in `DEVIATIONS.md`). The resulting set is empty, so the CLI
+/// errors with `"no IDs specified"` - a confusing message because
+/// the user did supply ids.
+///
+/// This test pins that current state: getid exits non-zero with
+/// `"no IDs specified"` in stderr when only negative ids are
+/// queried. Three failure modes are caught:
+///
+/// - getid panics on negative ids (would fail the no-panic assert)
+/// - getid silently SUCCEEDS without addressing the negatives
+///   (would fail the !success assert)
+/// - getid emits a clearer error naming the negative-id rejection
+///   (would fail the stderr substring assert)
+///
+/// The third case is the desirable improvement; if it lands, the
+/// test fails deliberately and prompts an update to both the test
+/// and the TODO entry tracking the cross-CLI mixed-sign cleanup.
+///
+/// Reviewer pass 2 follow-up: previous version was guarded by
+/// `if out.status.success()` and never actually exercised the
+/// negative-id path - getid was rejecting via "no IDs specified"
+/// every time, but the test was happily masking it.
 #[test]
 fn getid_addresses_negative_ids() {
     let dir = TempDir::new().expect("tempdir");
@@ -305,8 +328,13 @@ fn getid_addresses_negative_ids() {
         .arg(&input)
         .arg("-o")
         .arg(&output)
-        .arg("--ids")
-        .arg("n-1,n-2,w-1")
+        // `--` marks the end of options so `n-1`, `w-1` aren't
+        // misparsed as short-flag arguments. (Without this clap
+        // treats `n-1` as `-1` after stripping.)
+        .arg("--")
+        .arg("n-1")
+        .arg("n-2")
+        .arg("w-1")
         .run();
 
     let stderr = out.stderr_str();
@@ -314,26 +342,20 @@ fn getid_addresses_negative_ids() {
         !stderr.contains("panicked at"),
         "getid must not panic on negative-id queries; stderr:\n{stderr}",
     );
-    if out.status.success() {
-        let contents = read_all_elements_id_only(&output);
-        let nodes = node_ids_id_only(&contents);
-        let ways = way_ids_id_only(&contents);
-        // Lock the current behavior. If getid is currently treating
-        // negative ids as out-of-spec (matching the project-wide
-        // stance documented in DEVIATIONS), the assertions below
-        // will need to be inverted - that's a deliberate change,
-        // and this test will force the conversation.
-        assert!(
-            nodes.contains(&-1) && nodes.contains(&-2),
-            "getid output must contain the queried negative node ids \
-             (-1 and -2); got nodes={nodes:?}. If getid has been \
-             promoted to reject negative ids per the TODO.md \
-             discussion, invert this assertion deliberately.",
-        );
-        assert!(
-            ways.contains(&-1),
-            "getid output must contain the queried negative way id (-1); \
-             got ways={ways:?}",
-        );
-    }
+    assert!(
+        !out.status.success(),
+        "getid currently fails on all-negative-id queries because \
+         IdSet::set silently rejects negatives - the resulting set \
+         is empty, triggering the 'no IDs specified' error. If this \
+         assertion fails because getid now succeeds, that is the \
+         desirable improvement: invert and update the TODO entry \
+         tracking the silent-rejection cleanup.",
+    );
+    assert!(
+        stderr.contains("no IDs specified"),
+        "current behavior: empty set after IdSet's silent reject \
+         path triggers 'no IDs specified'. If this changes (e.g. \
+         to a clearer 'negative ids not supported' message), update \
+         this test deliberately. stderr:\n{stderr}",
+    );
 }

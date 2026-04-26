@@ -282,6 +282,74 @@ fn write_oversized_interpolation_input(path: &Path) {
     );
 }
 
+/// Tier B5b fixture: 65 536 tiny streets all sharing the same two
+/// nodes, so every street's single segment lands in the same S2
+/// cell. Triggers the per-cell street u16 cap at
+/// `src/geocode_index/builder/pass3.rs:570`.
+#[allow(clippy::cast_possible_wrap)]
+fn write_street_cell_overflow_input(path: &Path) {
+    let nodes = vec![
+        TestNode { id: 1, lat: 557_000_000, lon: 125_000_000, tags: vec![], meta: None },
+        TestNode { id: 2, lat: 557_000_010, lon: 125_000_010, tags: vec![], meta: None },
+    ];
+    let ways: Vec<TestWay> = (0..65_536u32)
+        .map(|i| {
+            let name: &'static str =
+                Box::leak(format!("Street{i}").into_boxed_str());
+            TestWay {
+                id: 1_000 + i64::from(i),
+                refs: vec![1, 2],
+                tags: vec![("highway", "residential"), ("name", name)],
+                meta: None,
+            }
+        })
+        .collect();
+    write_test_pbf_sorted(path, &nodes, &ways, &[]);
+}
+
+/// Tier B5b fixture: 65 536 tiny interpolation ways all sharing the
+/// same two nodes, so every interp way's single segment lands in
+/// the same S2 cell. Triggers the per-cell interp u16 cap at
+/// `src/geocode_index/builder/pass3.rs:599`.
+#[allow(clippy::cast_possible_wrap)]
+fn write_interp_cell_overflow_input(path: &Path) {
+    // Interp endpoints carry house numbers so endpoint resolution
+    // produces real entries (otherwise unresolved interp ways may
+    // be filtered before reaching the per-cell aggregation).
+    let nodes = vec![
+        TestNode {
+            id: 1,
+            lat: 557_000_000,
+            lon: 125_000_000,
+            tags: vec![("addr:housenumber", "1")],
+            meta: None,
+        },
+        TestNode {
+            id: 2,
+            lat: 557_000_010,
+            lon: 125_000_010,
+            tags: vec![("addr:housenumber", "3")],
+            meta: None,
+        },
+    ];
+    let ways: Vec<TestWay> = (0..65_536u32)
+        .map(|i| {
+            let street: &'static str =
+                Box::leak(format!("Interp{i}").into_boxed_str());
+            TestWay {
+                id: 1_000 + i64::from(i),
+                refs: vec![1, 2],
+                tags: vec![
+                    ("addr:interpolation", "all"),
+                    ("addr:street", street),
+                ],
+                meta: None,
+            }
+        })
+        .collect();
+    write_test_pbf_sorted(path, &nodes, &ways, &[]);
+}
+
 /// Tier B5 fixture: 65 536 admin relations all referencing the same
 /// tiny outer ring, forcing every polygon's bbox into one S2 cell.
 /// Each relation gets a unique `name` so it counts as a distinct
@@ -911,6 +979,75 @@ fn build_rejects_addr_entry_count_over_u16_max_for_one_cell() {
     let msg = err.to_string();
     assert!(
         msg.contains("has 65536 addr entries, exceeds u16::MAX"),
+        "unexpected error: {msg}"
+    );
+    assert!(
+        msg.contains("geocode Stage B: cell"),
+        "unexpected error: {msg}"
+    );
+}
+
+/// Tier B5b: per-cell street u16 entry cap.
+/// `src/geocode_index/builder/pass3.rs:570`. Distinct from the
+/// pre-batch per-WAY node_count cap test
+/// (`build_rejects_street_way_coord_count_over_u16_max`) - that one
+/// pins the cap on a single oversized way; this one pins the cap
+/// on aggregation across many small ways landing in the same S2
+/// cell.
+#[test]
+fn build_rejects_street_entry_count_over_u16_max_for_one_cell() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+
+    write_street_cell_overflow_input(&input);
+
+    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir,
+            force: false,
+            ..Default::default()
+        },
+    )
+    .expect_err("builder should hard-error on per-cell street entry overflow");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("street entries, exceeds u16::MAX"),
+        "unexpected error: {msg}"
+    );
+    assert!(
+        msg.contains("geocode Stage B: cell"),
+        "unexpected error: {msg}"
+    );
+}
+
+/// Tier B5b: per-cell interp u16 entry cap.
+/// `src/geocode_index/builder/pass3.rs:599`. Distinct from the
+/// pre-batch per-WAY node_count cap test
+/// (`build_rejects_interpolation_way_coord_count_over_u16_max`).
+#[test]
+fn build_rejects_interp_entry_count_over_u16_max_for_one_cell() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+
+    write_interp_cell_overflow_input(&input);
+
+    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir,
+            force: false,
+            ..Default::default()
+        },
+    )
+    .expect_err("builder should hard-error on per-cell interp entry overflow");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("interp entries, exceeds u16::MAX"),
         "unexpected error: {msg}"
     );
     assert!(

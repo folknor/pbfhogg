@@ -147,18 +147,16 @@ path). This section documents the resulting behavior difference from
 osmium.
 
 **osmium behavior:** Treats negative IDs as first-class. libosmium
-defines a canonical `id_order` comparator
-(`include/osmium/osm/object_comparisons.hpp:87-110`) with the order
+defines a canonical `id_order` comparator with the order
 `0 → negatives by absolute value → positives by absolute value` and
-documents it as "the same ordering JOSM uses"
-(`include/osmium/osm/object.hpp:494`). `osmium renumber`'s man page
-(`osmium-tool/man/osmium-renumber.md:23`) explicitly states
-*"Negative IDs are allowed, they must be ordered before the positive
-IDs"*; `osmium sort`'s man page documents the same negative-first
-output order. The libosmium CHANGELOG calls out: *"These changes
-extend this ordering to negative IDs which are sometimes used for
-objects that have not been uploaded to the OSM server yet."* JOSM
-interop is a designed feature, not a tolerated edge case.
+documents it as "the same ordering JOSM uses". `osmium renumber`'s
+man page explicitly states *"Negative IDs are allowed, they must be
+ordered before the positive IDs"*; `osmium sort`'s man page
+documents the same negative-first output order. The libosmium
+CHANGELOG calls out: *"These changes extend this ordering to
+negative IDs which are sometimes used for objects that have not been
+uploaded to the OSM server yet."* JOSM interop is a designed
+feature, not a tolerated edge case.
 
 **pbfhogg behavior:** Rejects negative input IDs project-wide.
 Production PBFs (planet, Geofabrik extracts, applied OSC streams) are
@@ -189,20 +187,34 @@ positive-only, and several code paths rely on that invariant.
   silently mis-shard. Release builds rely on the upstream chain
   (read → renumber/apply-changes → diff) never producing a
   mixed-sign PBF; debug builds flag the violation at planner entry.
-- `getid` - **hard reject** at parse time. `parse_id_spec`
-  (`src/commands/getid/mod.rs`) rejects any negative id parsed from
-  a CLI argument or `--id-osm-file` text spec, returning an error
-  naming the offending id and its kind (node/way/relation). This is
-  the **one site in this section that aligns with osmium rather
-  than deviates** - osmium's getid rejects identically
-  (`research/osmium-tool/src/id_file.cpp:31-37`, documented in the
-  man page at `research/osmium-tool/man/osmium-getid.md:62`: *"This
-  command will not work with negative IDs."*). The reject covers
-  CLI args and id-spec files; ids extracted from a separate PBF via
-  `--id-osm-file <pbf>` are not validated (the source PBF's contents
+- `getid` - **hard reject** at parse time. `parse_id_spec` in
+  `src/commands/getid/mod.rs` rejects any negative id parsed from a
+  CLI argument or `--id-file` text spec, returning an error naming
+  the offending id and its kind (node/way/relation). osmium's
+  `getid` rejects identically; its man page is explicit that the
+  command does not work with negative IDs. The reject covers CLI
+  args and id-spec text files; ids harvested from a separate PBF
+  via `--id-osm-file` are not validated (the source PBF's contents
   are treated as opaque data, matching the project-wide stance that
   passthrough commands like `cat`/`sort`/`inspect` do not validate
   PBF payloads).
+
+**Residual divergence (tags-filter):** `tags-filter`'s
+parallel-classify path silently **drops** negative-id ways from the
+output - the `IdSet` route used to track matched/included ids
+silently no-ops on negative inputs (`src/idset.rs:45`). osmium's
+`tags-filter` instead silently **abs-converts** via
+`object.positive_id()`, folding negative-id elements together with
+their positive counterparts. Both behaviors are silent; neither
+matches the project-wide reject stance, and neither matches the
+other. Pinned as the current state by
+`tests/cli_negative_id_invariants.rs::tags_filter_handles_mixed_sign_ids`.
+Promoting `tags-filter` to a fourth enforcement site is not
+planned: osmium's own behavior is also a silent miscount, so
+neither tool offers a clean precedent for forced rejection here.
+A user who needs deterministic tags-filter behavior on mixed-sign
+input must run `renumber` first to surface the negatives as a
+hard error.
 
 **Rationale:** `IdSet` is the load-bearing data structure in
 renumber - a bitmap indexed by unsigned id supporting `O(1)`
@@ -239,13 +251,12 @@ against JOSM sample files. Reverse the decision only on a real user
 ask.
 
 **Osmium's own gap.** `osmium derive-changes` has a symmetric latent
-bug at `osmium-tool/src/command_derive_changes.cpp:184`: after
-ordering-based merging by `operator<` (which is canonical), the
-"same id?" check uses raw `it1->id() != it2->id()` rather than the
-absolute-value comparator. Mixed-sign inputs can mis-trigger there
-too. Our debug_assert at least catches the violation loudly; osmium
-does not. The pbfhogg finding is not pbfhogg-unique - it's an
-ecosystem-wide gap.
+bug: after ordering-based merging by `operator<` (which is
+canonical), the "same id?" check uses raw `it1->id() != it2->id()`
+rather than the absolute-value comparator. Mixed-sign inputs can
+mis-trigger there too. Our debug_assert at least catches the
+violation loudly; osmium does not. The pbfhogg finding is not
+pbfhogg-unique - it's an ecosystem-wide gap.
 
 **Impact:** Users with JOSM-local staging data must resolve negative
 IDs before running pbfhogg commands that touch the invariant sites.

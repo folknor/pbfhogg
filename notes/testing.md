@@ -295,10 +295,10 @@ Aligned contract sites:
 - `FileReader::skip` post-skip 1-byte sentinel read
   (`file_reader.rs:71`) - the `read_blob_header_only` caller-
   side path used by `has_indexdata`, `diff`, `cat::dedupe`, and
-  `altw::passthrough` was originally missed; the audit narrowed
-  scope to four primitive sites and the post-pass review
-  surfaced this seventh site as a silent shape-4 hole. Same
-  fix shape as `skip_blob_body`.
+  `altw::passthrough` was originally missed by the audit and
+  surfaced as a silent shape-4 hole during post-pass review.
+  Same fix shape as `skip_blob_body`. Promoted to a first-class
+  contract site in `reference/truncation-handling.md`.
 
 `read_raw_frame` already aligned (uses `read_exact` end-to-end);
 gold-standard pattern.
@@ -336,8 +336,8 @@ value if extended:
   HeaderWalker fast-path that all the other scan-style commands
   also use.
 - `add-locations-to-ways` - exercises `altw::passthrough`'s
-  `FileReader::skip` path (the seventh contract site fixed in
-  commit `12699db`).
+  `FileReader::skip` path (the contract site landed in commit
+  `12699db` after the post-pass review).
 - `renumber` - exercises the full-read + pass-2 reframe walker
   through every shape.
 
@@ -348,13 +348,13 @@ deferred.
 
 ### Negative-id handling - decided
 
-Resolved 2026-04-26 by walking the osmium reference in
-`research/osmium-tool/` and `research/libosmium/`:
+Resolved 2026-04-26 by walking the osmium reference vendored under
+`research/`:
 
 - **getid**: hard reject at parse time (`parse_id_spec` in
-  `src/commands/getid/mod.rs`). Matches osmium exactly
-  (`research/osmium-tool/src/id_file.cpp:31-37`, documented at
-  `research/osmium-tool/man/osmium-getid.md:62`). Pinned by
+  `src/commands/getid/mod.rs`). Matches osmium exactly - osmium's
+  getid rejects identically and its man page is explicit about it.
+  Pinned by
   `cli_negative_id_invariants.rs::getid_rejects_negative_ids_with_named_id_and_kind`.
 - **cat / sort / inspect**: stay as passthrough (osmium does not
   validate either). Pinned by the existing `_preserves_mixed_sign_ids`
@@ -364,10 +364,11 @@ Resolved 2026-04-26 by walking the osmium reference in
   neither is a clean precedent for a forced change. Documented as a
   residual divergence in `DEVIATIONS.md`.
 - **IdSet::set / set_if_new**: silent no-op on negatives kept.
-  libosmium enforces unsigned-only at the type layer
-  (`static_assert(std::is_unsigned<T>::value)`), not as a runtime
-  rejection. The architectural lesson: negative-id handling belongs
-  at the input boundary, not the storage layer.
+  libosmium enforces unsigned-only at the type layer (its id-set
+  template carries a `static_assert(std::is_unsigned<T>::value)`),
+  not as a runtime rejection. The architectural lesson:
+  negative-id handling belongs at the input boundary, not the
+  storage layer.
 
 DEVIATIONS.md "Negative input IDs rejected project-wide" now names
 three enforcement sites: renumber, diff/derive shard planners,

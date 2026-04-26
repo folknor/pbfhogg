@@ -259,21 +259,18 @@ affects zero real-world nodes (nearest land ~570 km).
   `loc_stats_pre.2.saturating_sub(extracted)`, and reported in the
   summary line by `MergeStats::print_summary`.
 
-**osmium implementation anchors** (vendored under
-[`research/osmium-tool/`](../research/osmium-tool/) and
-[`research/libosmium/`](../research/libosmium/)):
+**osmium implementation anchors:**
 
-- `research/osmium-tool/src/command_apply_changes.cpp`:
-  `copy_first_with_id` + `std::set_union` over reverse-version-sorted
-  inputs (lines ~174-181 for the dedup by ID, ~363-368 for the
-  merge). The write is gated on `obj.visible()`.
-- `research/libosmium/include/osmium/io/detail/xml_input_format.hpp`
-  around line 281: `<delete>` entries arrive with `visible=false`, so
-  `copy_first_with_id` skips them on absent IDs - no error path.
-- `update_nodes_if_way` in `command_apply_changes.cpp` (~lines
-  185-196): `location_index.get_noexcept(...)`, then
-  `if (location) set_location(...)` - missing nodes fall through
-  silently.
+- `osmium apply-changes` runs `copy_first_with_id` plus
+  `std::set_union` over reverse-version-sorted inputs to dedup by
+  ID and merge. The write is gated on `obj.visible()`.
+- `<delete>` entries arrive from the XML input format with
+  `visible=false`, so `copy_first_with_id` skips them on absent IDs
+  with no error path.
+- `update_nodes_if_way` looks up coordinates via
+  `location_index.get_noexcept(...)` followed by an
+  `if (location) set_location(...)` guard, so missing nodes fall
+  through silently.
 
 No `throw`, `std::cerr` warning, or validation is raised on any of
 the four scenarios in the osmium apply-changes code path.

@@ -351,20 +351,18 @@ single-pass, tag expression and bbox filtering.
   diff (14-element version comparison), check-refs (occurrences vs unique).
   See `brokkr verify all` output and README cross-validation section.
 - [x] ~~**Promote silent passthrough/drop to clean error on mixed-sign
-  input across non-renumber commands.**~~ Decided 2026-04-26 via the
-  osmium precedent walk in `research/osmium-tool/`: only `getid` gets a
-  hard reject (matches osmium exactly:
-  `research/osmium-tool/src/id_file.cpp:31-37`,
-  `research/osmium-tool/man/osmium-getid.md:62`). `cat` / `sort` /
-  `inspect` stay as passthrough (matches osmium's no-validation
-  stance). `tags-filter`'s silent abs-or-drop is a known divergence
-  from osmium's silent abs-convert; both are silent, so neither is a
-  clean precedent - documented in `DEVIATIONS.md` as the residual gap.
+  input across non-renumber commands.**~~ Decided 2026-04-26 via an
+  osmium precedent walk: only `getid` gets a hard reject (matches
+  osmium exactly - osmium's getid rejects identically and its man
+  page is explicit about it). `cat` / `sort` / `inspect` stay as
+  passthrough (matches osmium's no-validation stance).
+  `tags-filter`'s silent drop is a known divergence from osmium's
+  silent abs-convert; both are silent, so neither is a clean
+  precedent - documented in `DEVIATIONS.md` as the residual gap.
   `IdSet::set`'s silent no-op on negatives stays put (mirrors
-  libosmium's `static_assert(std::is_unsigned<T>::value)` enforcement
-  pattern: rejection lives at the call-site, not the storage layer).
-  Getid's parse-time reject lands as enforcement site #3 in
-  `DEVIATIONS.md`.
+  libosmium's unsigned-only id-set template - rejection lives at the
+  call-site, not the storage layer). Getid's parse-time reject lands
+  as enforcement site #3 in `DEVIATIONS.md`.
 - [x] ~~**`pbfhogg diff --summary` flips stats format rather than enabling
   output**~~ - resolved 2026-04-25. Renamed to `--osmium-summary`. The
   `-s` short form is unchanged. The pbfhogg-format summary always

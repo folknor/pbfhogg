@@ -73,13 +73,23 @@ Every command that reads PBF input adheres to the same contract -
 there is no per-command relaxation. The contract sites are:
 
 - `BlobReader::next` (`src/read/blob.rs`)
+- `BlobReader::skip_blob_body` (`src/read/blob.rs`) - the
+  payload-skip path used by the header-only fast scans
 - `read_raw_frame` (`src/read/raw_frame.rs`)
 - `HeaderWalker::next_header` (`src/read/header_walker.rs`)
+- `FileReader::skip` (`src/read/file_reader.rs`) - the
+  caller-side payload-skip used by `read_blob_header_only`
+  consumers (`has_indexdata`, `diff::process`, `cat::dedupe`,
+  `altw::passthrough`)
 - `PrimitiveBlock::new` (`src/read/block.rs`) for shape 5
 
 A truncation that reaches any of those entry points must surface
 as `Err(ErrorKind::Io)` (or a more specific variant) before the
-caller sees decoded output.
+caller sees decoded output. The two skip-path sites
+(`skip_blob_body`, `FileReader::skip`) preserve their `BufReader`
+seek-relative optimization for in-range targets and only pay the
+sentinel-read cost when the skip would otherwise pass EOF
+silently.
 
 Commands that consume `BlobReader` / `ElementReader` /
 `IndexedReader` inherit the contract automatically: an `Err` from
@@ -129,11 +139,15 @@ end-to-end backstop for cat/inspect/sort specifically).
 
 ## Implementation status
 
-Aligned. The four contract sites all hard-error on shapes 2-4 as
-of commit `436998b` (initial alignment) plus a follow-up that
-fixed the `read_blob_header_only` caller-side payload-skip path
-through `FileReader::skip` (used by `has_indexdata`, `diff`,
-`cat::dedupe`, `altw::passthrough`).
+Aligned. All six contract sites listed above hard-error on shapes
+2-4. Initial alignment landed in commit `436998b` (covering
+`BlobReader::next`, `skip_blob_body`, and `HeaderWalker::next_header`);
+the `FileReader::skip` site landed in commit `12699db` after a
+post-pass review surfaced the `read_blob_header_only` caller-side
+payload-skip path as a silent shape-4 hole. `read_raw_frame` and
+`PrimitiveBlock::new` were already aligned by their existing
+patterns (`read_exact` end-to-end and Cursor-based protobuf walk
+respectively).
 
 `mutate_blob_payload`-based regression tests
 (`tests/cli_defensive_input.rs`) exercise shape 5 (decompression

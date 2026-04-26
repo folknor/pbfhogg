@@ -1,18 +1,34 @@
-//! Mixed-sign-id sweep across every command that walks PBF elements.
+//! Mixed-sign-id invariant sweep.
 //!
-//! OSM ids are signed `i64`, but production PBFs use positive-only ids.
-//! Several internal pipelines are gated on or assume that production
-//! invariant - the `idset::set_atomic` cast to `u64` (panics on
-//! negative), the diff/derive shard planners (compare with raw `i64`
-//! instead of `osm_id_cmp`), `geocode_index/builder/pass1_5` (also via
-//! `set_atomic`). T03 in `notes/testing.md` lists every site.
+//! pbfhogg rejects negative input ids project-wide (see
+//! [`DEVIATIONS.md`] "Negative input IDs rejected project-wide" and
+//! [`decisions/0002-negative-ids-rejected-project-wide.md`] for the
+//! decision record). The named enforcement sites are:
 //!
-//! The contract this file pins: every command either produces correct
-//! output for the mixed-sign fixture OR exits with a clean non-zero
-//! status. **No panics**. No silently-dropped elements. No hangs.
+//! - `renumber` - **hard reject** at three entry points
+//!   (`src/commands/renumber/wire_rewrite.rs::reframe_dense_with_new_ids`,
+//!   `reframe_ways_with_new_ids`, `rewrite_relations_with_new_ids`).
+//!   Returns an error naming the offending id; never panics, never
+//!   silently passes through.
+//! - `diff` / `derive-changes` parallel shard planners - `debug_assert!`
+//!   only. Release builds rely on the upstream chain never producing
+//!   mixed-sign input. **Not exercisable from CLI tests** because
+//!   `brokkr check` runs in release mode.
+//!
+//! Other commands (`cat`, `sort`, `inspect`, `tags-filter`, `getid`)
+//! are NOT named as enforcement sites in DEVIATIONS. The contract this
+//! file pins for them is panic-freedom on mixed-sign input. Their
+//! current behavior varies (cat/sort preserve, tags-filter silently
+//! drops the negative-id ways through its parallel-classify path) -
+//! see TODO.md for the open question of whether they should promote
+//! to clean-error rejection. The tests below pin the *current* status
+//! quo, not a forward-looking contract.
 //!
 //! Tests use only the stable allowlist (CliInvoker + the existing
 //! fixture writers) so internal-module rewrites cannot break them.
+//!
+//! [`DEVIATIONS.md`]: ../../DEVIATIONS.md
+//! [`decisions/0002-negative-ids-rejected-project-wide.md`]: ../../decisions/0002-negative-ids-rejected-project-wide.md
 
 #[path = "common/mod.rs"]
 mod common;
@@ -172,14 +188,16 @@ fn tags_filter_handles_mixed_sign_ids() {
     );
 }
 
-/// `renumber` reads every element id and assigns new sequential ids.
-/// Per `DEVIATIONS.md` ("negative inputs rejected") the command may
-/// reject mixed-sign input; what it must NOT do is panic. The contract
-/// is structural: clean exit with a clear error, OR clean success with
-/// a remapped output. Either path is acceptable; the regression we pin
-/// is "no panic".
+/// `renumber` MUST hard-reject negative input ids per the documented
+/// contract in `DEVIATIONS.md`. The three named entry points
+/// (`reframe_dense_with_new_ids`, `reframe_ways_with_new_ids`,
+/// `rewrite_relations_with_new_ids`) all return an error naming the
+/// offending id. With `N_NEG = 3, N_POS = 3` the fixture's first
+/// negative node id is `-1`; the dense-node entry point fires first
+/// and the error message must contain both the error class string
+/// (`non-negative`) and the specific id (`-1`).
 #[test]
-fn renumber_handles_mixed_sign_ids_cleanly() {
+fn renumber_rejects_mixed_sign_ids_with_named_id() {
     let dir = TempDir::new().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -192,10 +210,26 @@ fn renumber_handles_mixed_sign_ids_cleanly() {
         .arg(&output)
         .run();
 
+    assert!(
+        !out.status.success(),
+        "renumber must reject mixed-sign input; stdout:\n{}\nstderr:\n{}",
+        out.stdout_str(),
+        out.stderr_str(),
+    );
     let stderr = out.stderr_str();
     assert!(
         !stderr.contains("panicked at"),
         "renumber must not panic on mixed-sign ids; stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("non-negative"),
+        "renumber error must mention the non-negative requirement \
+         (DEVIATIONS contract); stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("-1"),
+        "renumber error must name the offending id (DEVIATIONS contract); \
+         stderr:\n{stderr}",
     );
 }
 

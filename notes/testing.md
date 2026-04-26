@@ -53,7 +53,7 @@ surface audit that drove the reorg plan below.
   not the in-tree test suite.
 - **Coverage layer 2 landed 2026-04-26:** T02 byte-level adversarial
   fixture primitives (`tests/common/adversarial.rs`), T03 negative-ID
-  generators + `cli_negative_ids.rs` sweep, T04 truncation sweep
+  generators + `cli_negative_id_invariants.rs` sweep, T04 truncation sweep
   (`cli_truncation_sweep.rs`), T05 parity for diff/derive/apply, T06
   `with_tracked_scratch_dir` helper, T07 proptest baseline
   (`tests/proptests.rs`, `proptest = "1"` dev-dep). T05's remaining
@@ -401,31 +401,41 @@ appears or that area gets touched.
 - `generate_ways_with_negatives(n_neg, n_pos, refs_per_way)`
 - `generate_relations_with_negatives(n_neg, n_pos, members_per_rel)`
 
-`tests/cli_negative_ids.rs` runs the mixed-sign fixture through
-six commands via `CliInvoker` and pins panic-freedom plus
-structural-correctness assertions where applicable:
+`tests/cli_negative_id_invariants.rs` runs the mixed-sign fixture
+through six commands via `CliInvoker` and pins assertions matching
+each command's documented contract in `DEVIATIONS.md`
+("Negative input IDs rejected project-wide"):
 
+- `renumber_rejects_mixed_sign_ids_with_named_id` - non-zero exit
+  + stderr contains both `non-negative` (the error class) and `-1`
+  (the specific offending id). Pins the documented contract: the
+  three named entry points (`reframe_dense_with_new_ids`,
+  `reframe_ways_with_new_ids`, `rewrite_relations_with_new_ids`)
+  each return an error naming the offending id.
 - `cat_preserves_mixed_sign_ids` - all 2N ids survive passthrough
-- `inspect_handles_mixed_sign_ids` - no panic
+  (cat is NOT named as an enforcement site; current behavior is
+  passthrough, documented in TODO.md as a candidate for promotion
+  to clean error).
+- `inspect_handles_mixed_sign_ids` - no panic.
 - `sort_preserves_mixed_sign_ids` - all 2N ids survive sort
+  (same status as cat).
 - `tags_filter_handles_mixed_sign_ids` - no panic. **Finding:**
-  tags-filter currently drops negative-id ways through its
-  parallel-classify path. This is documented behavior (negative ids
-  are out of spec for production PBFs) and not in T03's named
-  sites; the test pins panic-freedom only, leaving the drop as a
-  known limitation.
-- `renumber_handles_mixed_sign_ids_cleanly` - no panic
-- `getid_addresses_negative_ids` - no panic on `n-1,n-2,w-1` queries
+  tags-filter silently drops negative-id ways through its
+  parallel-classify path. Aligned with the project-wide
+  "negatives shouldn't be in production PBFs" stance, but
+  inconsistent with renumber's clean-error shape; tracked in
+  TODO.md alongside cat/sort/inspect/getid.
+- `getid_addresses_negative_ids` - no panic on `n-1,n-2,w-1`.
 
-The named T03 sites (`renumber/pass1.rs:179`,
-`renumber/wire_rewrite.rs:272,519-524`,
-`diff/parallel.rs:138-142,354-357,384`,
-`derive_parallel.rs:136-142`,
-`geocode_index/builder/pass1_5.rs:102`) are now covered indirectly
-through the CLI-decoupled sweep. The `-j N` variants remain
-production-positive-only; per the user-decision constraint to skip
-lib plumbing, the parallel-shard sites stay covered by panic-freedom
-on the default jobs path.
+The diff/derive parallel-shard sites
+(`diff/parallel.rs:138-142,354-357,384`,
+`derive_parallel.rs:136-142`) and `geocode_index/builder/pass1_5.rs`
+are guarded by `debug_assert!` only. `brokkr check` runs in
+release mode (`cargo test --release`) so these planner asserts
+are NOT exercisable from the CLI sweep; they fire under
+`cargo test` (debug profile) when present in the upstream chain.
+Per the user-decision constraint to skip lib plumbing in this
+batch, that gap stays open.
 
 ### T04 - Adversarial / truncated-input tests [LANDED 2026-04-26]
 

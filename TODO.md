@@ -350,6 +350,21 @@ single-pass, tag expression and bbox filtering.
   Three commands have known diffs: extract (relation inclusion criteria),
   diff (14-element version comparison), check-refs (occurrences vs unique).
   See `brokkr verify all` output and README cross-validation section.
+- [ ] **Promote silent passthrough/drop to clean error on mixed-sign
+  input across non-renumber commands.** `DEVIATIONS.md` ("Negative input
+  IDs rejected project-wide") names `renumber` and the diff/derive shard
+  planners as the only enforcement sites. Surfaced 2026-04-26 via the
+  `cli_negative_id_invariants.rs` sweep: `tags-filter`'s parallel-classify
+  path silently drops negative-id ways; `cat`/`sort`/`inspect`/`getid`
+  pass them through. Per the project-wide stance these should be clean
+  errors naming the offending id (matching renumber's shape: `"<command>
+  requires non-negative input ids. Input contains <kind> id <id>. ..."`).
+  Cheap to add - a `<id> < 0` guard at each command's first
+  blob-element-walk site, returning `ErrorKind::Io` with the formatted
+  message. Decision needed: ship as a hard-error promotion across the
+  whole CLI (consistent), or stay as documented passthrough on the
+  non-named commands (less surprise for users feeding hand-edited JOSM
+  data through `cat`). Pair with `decisions/0002` if the choice changes.
 - [x] ~~**`pbfhogg diff --summary` flips stats format rather than enabling
   output**~~ - resolved 2026-04-25. Renamed to `--osmium-summary`. The
   `-s` short form is unchanged. The pbfhogg-format summary always

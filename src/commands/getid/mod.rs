@@ -53,6 +53,26 @@ impl DefaultType {
 // String errors are intentional - shows the bad input value, which is more helpful
 // for CLI users than the underlying ParseIntError.
 fn parse_id_spec(spec: &str, default_type: Option<DefaultType>) -> Result<(char, i64)> {
+    let (prefix, id) = parse_id_spec_inner(spec, default_type)?;
+    if id < 0 {
+        let kind = match prefix {
+            'n' => "node",
+            'w' => "way",
+            'r' => "relation",
+            _ => unreachable!(),
+        };
+        return Err(format!(
+            "getid requires non-negative input ids. \
+             Input contains {kind} id {id}. \
+             Negative ids are JOSM editor-local staging identifiers \
+             that should be resolved before processing."
+        )
+        .into());
+    }
+    Ok((prefix, id))
+}
+
+fn parse_id_spec_inner(spec: &str, default_type: Option<DefaultType>) -> Result<(char, i64)> {
     if spec.len() < 2 {
         if let Some(default) = default_type {
             let id: i64 = spec
@@ -732,4 +752,20 @@ mod tests {
         assert!(parse_ids_with_default_type(&specs, None).is_err());
     }
 
+    #[test]
+    fn parse_negative_id_rejected_with_named_id_and_kind() {
+        let err = parse_id_spec("n-1", None).unwrap_err().to_string();
+        assert!(err.contains("non-negative"), "{err}");
+        assert!(err.contains("node id -1"), "{err}");
+
+        let err = parse_id_spec("w-42", None).unwrap_err().to_string();
+        assert!(err.contains("way id -42"), "{err}");
+
+        let err = parse_id_spec("r-7", None).unwrap_err().to_string();
+        assert!(err.contains("relation id -7"), "{err}");
+
+        // Bare negative number with default type must also reject.
+        let err = parse_id_spec("-5", Some(DefaultType::Node)).unwrap_err().to_string();
+        assert!(err.contains("node id -5"), "{err}");
+    }
 }

@@ -346,25 +346,29 @@ additional sweep wall-time, pushing the per-sweep run from
 ~65 s to ~90 s. Within tier-1 budget but not free, hence
 deferred.
 
-### IdSet + CLI silent-rejection cleanup
+### Negative-id handling - decided
 
-`IdSet::set` (`src/idset.rs:45`) and `set_if_new`
-(`src/idset.rs:65`) silently no-op on negative ids. Correct for the
-storage layer (IdSet is bitset-backed, can't represent negatives)
-but hides project-wide negative-id rejection from callers:
+Resolved 2026-04-26 by walking the osmium reference in
+`research/osmium-tool/` and `research/libosmium/`:
 
-- getid produces a confusing "no IDs specified" when negative ids
-  were correctly supplied (resulting set is empty).
-- tags-filter's parallel-classify silently drops negative-id ways.
-- cat/sort/inspect silently pass them through.
+- **getid**: hard reject at parse time (`parse_id_spec` in
+  `src/commands/getid/mod.rs`). Matches osmium exactly
+  (`research/osmium-tool/src/id_file.cpp:31-37`, documented at
+  `research/osmium-tool/man/osmium-getid.md:62`). Pinned by
+  `cli_negative_id_invariants.rs::getid_rejects_negative_ids_with_named_id_and_kind`.
+- **cat / sort / inspect**: stay as passthrough (osmium does not
+  validate either). Pinned by the existing `_preserves_mixed_sign_ids`
+  / `_handles_mixed_sign_ids` tests.
+- **tags-filter**: silent-drop status quo stays pinned. Osmium
+  silently abs-converts via `positive_id()` - both are silent, so
+  neither is a clean precedent for a forced change. Documented as a
+  residual divergence in `DEVIATIONS.md`.
+- **IdSet::set / set_if_new**: silent no-op on negatives kept.
+  libosmium enforces unsigned-only at the type layer
+  (`static_assert(std::is_unsigned<T>::value)`), not as a runtime
+  rejection. The architectural lesson: negative-id handling belongs
+  at the input boundary, not the storage layer.
 
-Tracked in TODO.md "Promote silent passthrough/drop to clean
-error". The fix has two layers: surface negative-id rejection as a
-typed error from `IdSet::set`; and add explicit `<id> < 0` guards
-at each non-renumber command's first blob-element-walk site (per
-the renumber error shape: `"<command> requires non-negative input
-ids. Input contains <kind> id <id>. ..."`).
-
-`tests/cli_negative_id_invariants.rs` pins the current state for
-each command; when this lands, those tests fail deliberately and
-prompt the migration to clearer error shapes.
+DEVIATIONS.md "Negative input IDs rejected project-wide" now names
+three enforcement sites: renumber, diff/derive shard planners,
+getid.

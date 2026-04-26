@@ -189,6 +189,20 @@ positive-only, and several code paths rely on that invariant.
   silently mis-shard. Release builds rely on the upstream chain
   (read → renumber/apply-changes → diff) never producing a
   mixed-sign PBF; debug builds flag the violation at planner entry.
+- `getid` - **hard reject** at parse time. `parse_id_spec`
+  (`src/commands/getid/mod.rs`) rejects any negative id parsed from
+  a CLI argument or `--id-osm-file` text spec, returning an error
+  naming the offending id and its kind (node/way/relation). This is
+  the **one site in this section that aligns with osmium rather
+  than deviates** - osmium's getid rejects identically
+  (`research/osmium-tool/src/id_file.cpp:31-37`, documented in the
+  man page at `research/osmium-tool/man/osmium-getid.md:62`: *"This
+  command will not work with negative IDs."*). The reject covers
+  CLI args and id-spec files; ids extracted from a separate PBF via
+  `--id-osm-file <pbf>` are not validated (the source PBF's contents
+  are treated as opaque data, matching the project-wide stance that
+  passthrough commands like `cat`/`sort`/`inspect` do not validate
+  PBF payloads).
 
 **Rationale:** `IdSet` is the load-bearing data structure in
 renumber - a bitmap indexed by unsigned id supporting `O(1)`

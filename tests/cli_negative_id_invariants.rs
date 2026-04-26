@@ -288,36 +288,15 @@ fn renumber_rejects_mixed_sign_ids_with_named_id() {
     );
 }
 
-/// `getid` querying negative ids: surfaces the current behavior,
-/// which is **silent rejection via the underlying data structure**.
-///
-/// The CLI's `parse_id_spec("n-1")` correctly parses node id `-1`,
-/// then calls `IdSet::set(-1)`. `IdSet::set` silently no-ops on
-/// negative ids (`src/idset.rs:45`, per the project-wide stance
-/// in `DEVIATIONS.md`). The resulting set is empty, so the CLI
-/// errors with `"no IDs specified"` - a confusing message because
-/// the user did supply ids.
-///
-/// This test pins that current state: getid exits non-zero with
-/// `"no IDs specified"` in stderr when only negative ids are
-/// queried. Three failure modes are caught:
-///
-/// - getid panics on negative ids (would fail the no-panic assert)
-/// - getid silently SUCCEEDS without addressing the negatives
-///   (would fail the !success assert)
-/// - getid emits a clearer error naming the negative-id rejection
-///   (would fail the stderr substring assert)
-///
-/// The third case is the desirable improvement; if it lands, the
-/// test fails deliberately and prompts an update to both the test
-/// and the TODO entry tracking the cross-CLI mixed-sign cleanup.
-///
-/// Reviewer pass 2 follow-up: previous version was guarded by
-/// `if out.status.success()` and never actually exercised the
-/// negative-id path - getid was rejecting via "no IDs specified"
-/// every time, but the test was happily masking it.
+/// `getid` MUST hard-reject negative input ids per `DEVIATIONS.md`
+/// "Negative input IDs rejected project-wide". Mirrors osmium's getid
+/// (`research/osmium-tool/src/id_file.cpp:31-37`, documented in
+/// `research/osmium-tool/man/osmium-getid.md:62`: "This command will
+/// not work with negative IDs."). The error must name the offending
+/// id and its kind (node/way/relation) and contain the contract
+/// substring "non-negative", same shape as renumber's reject.
 #[test]
-fn getid_addresses_negative_ids() {
+fn getid_rejects_negative_ids_with_named_id_and_kind() {
     let dir = TempDir::new().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -344,18 +323,19 @@ fn getid_addresses_negative_ids() {
     );
     assert!(
         !out.status.success(),
-        "getid currently fails on all-negative-id queries because \
-         IdSet::set silently rejects negatives - the resulting set \
-         is empty, triggering the 'no IDs specified' error. If this \
-         assertion fails because getid now succeeds, that is the \
-         desirable improvement: invert and update the TODO entry \
-         tracking the silent-rejection cleanup.",
+        "getid must reject negative-id queries (DEVIATIONS contract); \
+         stdout:\n{}\nstderr:\n{stderr}",
+        out.stdout_str(),
     );
     assert!(
-        stderr.contains("no IDs specified"),
-        "current behavior: empty set after IdSet's silent reject \
-         path triggers 'no IDs specified'. If this changes (e.g. \
-         to a clearer 'negative ids not supported' message), update \
-         this test deliberately. stderr:\n{stderr}",
+        stderr.contains("non-negative"),
+        "getid error must mention the non-negative requirement \
+         (DEVIATIONS contract); stderr:\n{stderr}",
+    );
+    // First arg is `n-1`, so the parse-time reject fires on node id -1.
+    assert!(
+        stderr.contains("node id -1"),
+        "getid error must name the offending id and its kind; \
+         stderr:\n{stderr}",
     );
 }

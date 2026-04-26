@@ -74,9 +74,28 @@ fn truncation_sweep_no_panic() {
         std::fs::write(&truncated, &bytes).expect("write truncated");
 
         let class = classify_offset(&blobs, len);
-        run_and_assert("cat", &truncated, &output, len, class);
-        run_and_assert("inspect", &truncated, &output, len, class);
-        run_and_assert("sort", &truncated, &output, len, class);
+        run_and_assert("cat", &truncated, &output, len, class, &[]);
+        run_and_assert("inspect", &truncated, &output, len, class, &[]);
+        run_and_assert("sort", &truncated, &output, len, class, &[]);
+        // Broaden coverage to exercise read-path sites the cat/inspect/
+        // sort triple doesn't hit:
+        //   - getid: HeaderWalker fast path with pread for matching
+        //     blobs (`--` + `n1` so we ask for at least one positive id
+        //     without tripping the parse-time negative-id reject).
+        //   - add-locations-to-ways: `altw::passthrough`'s
+        //     `FileReader::skip` path - one of the contract sites that
+        //     the original audit missed and 12699db landed.
+        //   - renumber: full-read + pass-2 reframe walker.
+        run_and_assert("getid", &truncated, &output, len, class, &["--", "n1"]);
+        run_and_assert(
+            "add-locations-to-ways",
+            &truncated,
+            &output,
+            len,
+            class,
+            &[],
+        );
+        run_and_assert("renumber", &truncated, &output, len, class, &[]);
     }
 }
 
@@ -121,6 +140,7 @@ fn run_and_assert(
     output: &std::path::Path,
     len: usize,
     class: Classification,
+    extra_args: &[&str],
 ) {
     let mut inv = CliInvoker::new()
         .arg(subcmd)
@@ -128,6 +148,9 @@ fn run_and_assert(
         .timeout(PER_INVOCATION_TIMEOUT);
     if subcmd != "inspect" {
         inv = inv.arg("-o").arg(output);
+    }
+    for arg in extra_args {
+        inv = inv.arg(arg);
     }
     let out = inv.run();
     let stderr = out.stderr_str();

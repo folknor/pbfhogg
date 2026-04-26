@@ -119,23 +119,29 @@ on partial input.
   never panics.
 
 **Command layer** (`tests/cli_truncation_sweep.rs::truncation_sweep_no_panic`)
-drives `cat`, `inspect`, and `sort` through ~50 truncation offsets
-covering every blob's length-prefix midpoint, header midpoint,
-header end, payload midpoint, and payload end. For shape 2-4
-offsets, asserts non-zero exit. For shape 1 offsets, asserts
-no-panic + bounded stderr only - command-level outcome on a
-partial-input file is per-command policy (sort may legitimately
-reject a tail truncation that drops most data blobs even when
-the reader's tolerance contract holds; the reader contract is
-pinned by the reader-layer tests above).
+drives `cat`, `inspect`, `sort`, `getid`, `add-locations-to-ways`,
+and `renumber` through ~50 truncation offsets covering every
+blob's length-prefix midpoint, header midpoint, header end,
+payload midpoint, and payload end. The six commands exercise
+distinct read-path shapes - passthrough, header-only fast scan,
+indexed-decode, header-walk-with-pread, `altw::passthrough`
+through `FileReader::skip`, and full-read + pass-2 reframe - so
+between them they touch every contract site listed above. For
+shape 2-4 offsets, asserts non-zero exit. For shape 1 offsets,
+asserts no-panic + bounded stderr only - command-level outcome on
+a partial-input file is per-command policy (sort may legitimately
+reject a tail truncation that drops most data blobs even when the
+reader's tolerance contract holds; the reader contract is pinned
+by the reader-layer tests above).
 
 Other commands' read-path tolerance is implicitly covered by the
-shared `BlobReader` / `HeaderWalker` primitives - any command
-that goes through them inherits the contract.
+shared `BlobReader` / `HeaderWalker` / `FileReader::skip`
+primitives - any command that goes through them inherits the
+contract.
 
-A regression at any of the four BlobReader/HeaderWalker contract
-sites surfaces as a reader-layer test failure (the sweep is the
-end-to-end backstop for cat/inspect/sort specifically).
+A regression at any of the six contract sites surfaces as a
+reader-layer test failure (the sweep is the end-to-end backstop
+for the six commands listed above specifically).
 
 ## Implementation status
 

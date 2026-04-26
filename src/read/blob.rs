@@ -413,12 +413,19 @@ impl<R: Read + Send> BlobReader<R> {
         // delivers fewer is shape 3 ("EOF inside BlobHeader bytes") per
         // `reference/truncation-handling.md` and must hard-error.
         if self.header_buf.len() as u64 != header_size {
+            // self.offset points at the start of the BlobHeader (after
+            // the 4-byte length prefix). The truncation byte is at
+            // `header_start + got` (the byte we couldn't read).
+            let header_start = self.offset.map_or(0, |x| x.0);
+            let got = self.header_buf.len() as u64;
+            let trunc_at = header_start + got;
             return self.handle_error(new_error(ErrorKind::Io(
                 ::std::io::Error::new(
                     ::std::io::ErrorKind::UnexpectedEof,
                     format!(
-                        "BlobHeader truncated: expected {header_size} bytes, got {}",
-                        self.header_buf.len()
+                        "BlobHeader truncated at byte {trunc_at} (shape 3): \
+                         declared {header_size} bytes from offset \
+                         {header_start}, got {got}"
                     ),
                 ),
             )));
@@ -556,13 +563,19 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
         // delivers fewer is shape 4 ("EOF inside Blob payload") per
         // `reference/truncation-handling.md` and must hard-error.
         if blob_data.len() as u64 != header.datasize as u64 {
+            // self.offset points at the start of the Blob payload (after
+            // the BlobHeader). The truncation byte is at
+            // `payload_start + got`.
+            let payload_start = self.offset.map_or(0, |x| x.0);
+            let got = blob_data.len() as u64;
+            let trunc_at = payload_start + got;
             return self.handle_error(new_error(ErrorKind::Io(
                 ::std::io::Error::new(
                     ::std::io::ErrorKind::UnexpectedEof,
                     format!(
-                        "Blob payload truncated: expected {} bytes, got {}",
-                        header.datasize,
-                        blob_data.len()
+                        "Blob payload truncated at byte {trunc_at} (shape 4): \
+                         declared {} bytes from offset {payload_start}, got {got}",
+                        header.datasize
                     ),
                 ),
             )));
@@ -760,6 +773,23 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
             Ok(()) => {
                 self.offset = self.offset.map(|x| ByteOffset(x.0 + n));
                 Ok(())
+            }
+            Err(e) if e.kind() == ::std::io::ErrorKind::UnexpectedEof => {
+                // Sentinel read at byte (offset + n - 1) returned EOF;
+                // declared payload didn't fit in the file. Wrap with
+                // offset-aware context per
+                // `reference/truncation-handling.md` shape 4.
+                let payload_start = self.offset.map_or(0, |x| x.0);
+                let trunc_at = payload_start + n - 1;
+                self.offset = None;
+                Err(new_error(ErrorKind::Io(::std::io::Error::new(
+                    ::std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "Blob payload truncated at byte {trunc_at} (shape 4): \
+                         declared {n} bytes from offset {payload_start}, \
+                         file ended early"
+                    ),
+                ))))
             }
             Err(e) => {
                 self.offset = None;

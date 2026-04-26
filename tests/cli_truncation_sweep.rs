@@ -73,28 +73,46 @@ fn truncation_sweep_no_panic() {
         let bytes = truncate_to(&pbf, len);
         std::fs::write(&truncated, &bytes).expect("write truncated");
 
-        let tolerated = is_tolerated_offset(&blobs, len);
-        run_and_assert("cat", &truncated, &output, len, tolerated);
-        run_and_assert("inspect", &truncated, &output, len, tolerated);
-        run_and_assert("sort", &truncated, &output, len, tolerated);
+        let class = classify_offset(&blobs, len);
+        run_and_assert("cat", &truncated, &output, len, class);
+        run_and_assert("inspect", &truncated, &output, len, class);
+        run_and_assert("sort", &truncated, &output, len, class);
     }
 }
 
-/// An offset is tolerated (shape 1) if it falls within [0, 4) bytes
-/// past any frame_start - i.e. the file ends with an incomplete next
-/// length prefix or exactly at a frame boundary.
-fn is_tolerated_offset(blobs: &[BlobLocation], offset: usize) -> bool {
+/// Classification of a truncation offset.
+///
+/// Shape 1 is tolerated by the READER (`reference/truncation-handling.md`):
+/// `BlobReader::next` and `HeaderWalker::next_header` return `Ok(None)`
+/// for partial length prefixes. What commands DO with a partially-
+/// populated file is per-command policy: `cat`/`inspect` may succeed
+/// emitting whatever blobs they read; `sort` may legitimately reject
+/// "less data than expected" because it can't sort what it doesn't
+/// have. So this sweep can only pin shape 1 as no-panic + bounded
+/// stderr at the command level. The reader-level tolerance contract
+/// is pinned separately by inline unit tests on `BlobReader::next`
+/// (see `tests/read_paths.rs::trailing_partial_length_prefix_*`).
+#[derive(Debug, Clone, Copy)]
+enum Classification {
+    /// Shape 1: file ends with 0-3 leftover bytes of an incomplete
+    /// next-frame length prefix.
+    Tolerated,
+    /// Shapes 2-4: committed length prefix or further. Reader must
+    /// hard-error; command must exit non-zero.
+    HardError,
+}
+
+fn classify_offset(blobs: &[BlobLocation], offset: usize) -> Classification {
     for b in blobs {
         if offset >= b.frame_start && offset < b.frame_start + 4 {
-            return true;
+            return Classification::Tolerated;
         }
         if offset >= b.frame_start + 4 && offset < b.blob_end {
-            // Inside the header or payload of a committed frame.
-            return false;
+            return Classification::HardError;
         }
     }
-    // Past the end of the last blob - clean EOF.
-    true
+    // Past the end of all blobs - clean EOF.
+    Classification::Tolerated
 }
 
 fn run_and_assert(
@@ -102,7 +120,7 @@ fn run_and_assert(
     input: &std::path::Path,
     output: &std::path::Path,
     len: usize,
-    tolerated: bool,
+    class: Classification,
 ) {
     let mut inv = CliInvoker::new()
         .arg(subcmd)
@@ -122,18 +140,25 @@ fn run_and_assert(
         "{subcmd} produced suspiciously large stderr ({}) at truncation len={len}",
         stderr.len(),
     );
-    if !tolerated {
-        assert!(
-            !out.status.success(),
-            "{subcmd} must hard-error on a shape-2/3/4 truncation \
-             (len={len}); per `reference/truncation-handling.md` only \
-             shape 1 (0-3 bytes past a frame boundary) is tolerated. \
-             stdout:\n{}\nstderr:\n{stderr}",
-            out.stdout_str(),
-        );
+    match class {
+        Classification::Tolerated => {
+            // Shape 1: reader-level tolerance is pinned by unit tests
+            // (`tests/read_paths.rs::trailing_partial_length_prefix_*`).
+            // Command-level outcome here is per-policy and not part of
+            // the contract this sweep covers - sort may reject a
+            // truncated tail that cuts off most data blobs even when
+            // the reader correctly returns Ok(None) at the partial
+            // length prefix. No-panic + bounded stderr only.
+        }
+        Classification::HardError => {
+            assert!(
+                !out.status.success(),
+                "{subcmd} must hard-error on a shape-2/3/4 truncation \
+                 (len={len}); per `reference/truncation-handling.md` \
+                 only shape 1 (0-3 bytes past a frame boundary) is \
+                 tolerated. stdout:\n{}\nstderr:\n{stderr}",
+                out.stdout_str(),
+            );
+        }
     }
-    // Shape 1 (tolerated): no exit-status assertion; commands may
-    // exit 0 with the partial frame skipped, or exit non-zero if
-    // they choose to surface the leftover bytes more strictly.
-    // Both behaviors comply with the reference doc.
 }

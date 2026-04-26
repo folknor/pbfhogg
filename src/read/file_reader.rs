@@ -71,13 +71,33 @@ impl FileReader {
 impl FileReader {
     /// Skip `n` bytes without materializing data into a destination buffer.
     ///
-    /// For `BufReader`: uses `seek_relative` (advances within internal buffer
-    /// when possible, otherwise seeks the underlying fd).
+    /// For `BufReader`: skips `n-1` bytes via `seek_relative` (advances
+    /// within internal buffer when possible, otherwise seeks the underlying
+    /// fd) and then reads exactly one byte to validate the file actually
+    /// contains `n` bytes from the current position. Without the post-skip
+    /// read, `BufReader::seek_relative` can succeed past EOF on file-backed
+    /// readers - the truncation would only surface at the next caller's
+    /// read, leaving callers like `has_indexdata` that don't immediately
+    /// read again with a silent shape-4 truncation hole. Per
+    /// [`reference/truncation-handling.md`](../../reference/truncation-handling.md),
+    /// a payload that doesn't deliver the declared `data_size` must
+    /// hard-error here, not be deferred.
+    ///
     /// For `DirectReader`: consumes buffered bytes, then lseeks the fd.
+    /// `DirectReader::skip` already validates EOF and errors on past-end,
+    /// so no extra check is needed.
     pub(crate) fn skip(&mut self, n: u64) -> io::Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
         match self {
-            #[allow(clippy::cast_possible_wrap)]
-            Self::Buffered(r) => r.seek_relative(n as i64),
+            Self::Buffered(r) => {
+                #[allow(clippy::cast_possible_wrap)]
+                let signed = (n - 1) as i64;
+                r.seek_relative(signed)?;
+                let mut sentinel = [0u8; 1];
+                r.read_exact(&mut sentinel)
+            }
             #[cfg(feature = "linux-direct-io")]
             Self::Direct(r) => r.skip(n),
         }

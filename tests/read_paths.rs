@@ -656,3 +656,81 @@ fn indexed_reader_output_matches_on_indexed_and_non_indexed_twins() {
     assert_eq!(nodes_idx, nodes_non, "node dep set diverges on non-indexed input");
     assert!(!ways_idx.is_empty(), "filter must match at least one way");
 }
+
+// ---------------------------------------------------------------------------
+// Reader-level tolerance contract (`reference/truncation-handling.md`):
+// 0-3 leftover bytes of an incomplete next-frame length prefix after a
+// complete previous frame is shape 1 - the reader returns `Ok(None)`,
+// equivalent to a clean cut at the frame boundary. The `cli_truncation_sweep`
+// integration test only pins no-panic at the command level for shape 1
+// because some commands (sort) may legitimately reject a partial-input
+// file even when the reader's tolerance contract holds. These unit tests
+// pin the reader contract directly.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn trailing_partial_length_prefix_returns_ok_none() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("good.osm.pbf");
+    write_test_pbf(&path);
+    let good_bytes = std::fs::read(&path).unwrap();
+
+    // For each tail byte count in 0..=3, append that many garbage
+    // bytes to the complete file and expect the reader to iterate
+    // every original blob then return Ok(None). 0 bytes (the
+    // unmodified file) establishes the baseline; 1-3 bytes pin the
+    // documented tolerance.
+    for tail in 0..=3 {
+        let mut bytes = good_bytes.clone();
+        bytes.extend(std::iter::repeat_n(0xAAu8, tail));
+
+        let mut reader = BlobReader::new(std::io::Cursor::new(bytes));
+        let mut blob_count = 0;
+        loop {
+            match reader.next() {
+                Some(Ok(_)) => blob_count += 1,
+                Some(Err(e)) => panic!(
+                    "reader must tolerate {tail} trailing bytes per the \
+                     truncation reference doc; got Err: {e:?}"
+                ),
+                None => break,
+            }
+        }
+        assert!(
+            blob_count >= 1,
+            "fixture must contain at least one blob (got {blob_count})"
+        );
+    }
+}
+
+#[test]
+fn trailing_partial_length_prefix_4_bytes_is_committed_frame() {
+    // 4 bytes is exactly a complete length prefix; that's NOT shape 1
+    // anymore - the reader is committed to a frame and must hard-error
+    // because the declared header bytes don't follow.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("good.osm.pbf");
+    write_test_pbf(&path);
+    let good_bytes = std::fs::read(&path).unwrap();
+
+    let mut bytes = good_bytes.clone();
+    bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x10]); // claims 16-byte header
+
+    let mut reader = BlobReader::new(std::io::Cursor::new(bytes));
+    let mut errored = false;
+    loop {
+        match reader.next() {
+            Some(Ok(_)) => {}
+            Some(Err(_)) => {
+                errored = true;
+                break;
+            }
+            None => break,
+        }
+    }
+    assert!(
+        errored,
+        "4 trailing bytes (a complete length prefix declaring N>0 \
+         header bytes that don't follow) is shape 2, must hard-error"
+    );
+}

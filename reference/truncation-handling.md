@@ -89,36 +89,52 @@ on stderr.
 
 ## Tests
 
-The contract is pinned by:
+The contract is pinned at two layers:
 
-- `tests/cli_truncation_sweep.rs::truncation_sweep_no_panic` -
-  drives every command through ~50 truncation offsets covering
-  every blob's length-prefix midpoint, header midpoint, header
-  end, payload midpoint, and payload end. Asserts non-zero exit
-  + no panic + bounded stderr.
+**Reader layer** (`tests/read_paths.rs`): unit tests on
+`BlobReader::next` directly, independent of any command's policy
+on partial input.
+
+- `trailing_partial_length_prefix_returns_ok_none` - 0-3 leftover
+  bytes after every complete blob is `Ok(None)`. Pins shape 1
+  tolerance.
+- `trailing_partial_length_prefix_4_bytes_is_committed_frame` -
+  4 trailing bytes (a complete length prefix declaring header
+  bytes that don't follow) is shape 2, must hard-error.
+- `truncated_header_size`, `truncated_header_data` in
+  `tests/corrupt_input.rs` - shapes 1 and 3 at the BlobReader
+  level.
 - `tests/proptests.rs::blob_reader_truncated_fixture_never_panics` -
-  property-based variant: arbitrary truncation length must surface
-  as Err, never panic.
+  property-based: arbitrary truncation length is finite Ok/Err,
+  never panics.
 
-A regression that returns `Ok` from any of the four contract sites
-on shapes 2-5 fails one of the above. A regression that returns
-`Err` on shape 1 fails the existing roundtrip tests
-(`tests/roundtrip*.rs`) which write and read complete PBFs.
+**Command layer** (`tests/cli_truncation_sweep.rs::truncation_sweep_no_panic`)
+drives `cat`, `inspect`, and `sort` through ~50 truncation offsets
+covering every blob's length-prefix midpoint, header midpoint,
+header end, payload midpoint, and payload end. For shape 2-4
+offsets, asserts non-zero exit. For shape 1 offsets, asserts
+no-panic + bounded stderr only - command-level outcome on a
+partial-input file is per-command policy (sort may legitimately
+reject a tail truncation that drops most data blobs even when
+the reader's tolerance contract holds; the reader contract is
+pinned by the reader-layer tests above).
+
+Other commands' read-path tolerance is implicitly covered by the
+shared `BlobReader` / `HeaderWalker` primitives - any command
+that goes through them inherits the contract.
+
+A regression at any of the four BlobReader/HeaderWalker contract
+sites surfaces as a reader-layer test failure (the sweep is the
+end-to-end backstop for cat/inspect/sort specifically).
 
 ## Implementation status
 
-Not yet aligned. As of 2026-04-26, the truncation-sweep test was
-loosened to "no panic + bounded stderr" because `cat`, `inspect`,
-and `sort` currently exit 0 on shapes 2-5 in some cases. Aligning
-the implementation with this stance requires auditing the four
-contract sites for `Ok`/`None` returns on mid-frame EOF and
-promoting each to `Err`. After the audit, the sweep test
-re-tightens to assert non-zero exit and the deferred Tier A8
-follow-up in `notes/testing.md` closes.
+Aligned. The four contract sites all hard-error on shapes 2-4 as
+of commit `436998b` (initial alignment) plus a follow-up that
+fixed the `read_blob_header_only` caller-side payload-skip path
+through `FileReader::skip` (used by `has_indexdata`, `diff`,
+`cat::dedupe`, `altw::passthrough`).
 
 `mutate_blob_payload`-based regression tests
 (`tests/cli_defensive_input.rs`) exercise shape 5 (decompression
-failure on a byte-valid frame whose inner protobuf is corrupt) -
-this shape already errors today via the upstream protobuf walker.
-The other three shapes (2-4) are the ones the audit needs to
-target.
+failure on a byte-valid frame whose inner protobuf is corrupt).

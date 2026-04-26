@@ -277,7 +277,9 @@ a gap that only coverage-guided fuzzing can fill.
 Stance: [`reference/truncation-handling.md`](../reference/truncation-handling.md).
 Every truncation shape except a clean cut at a frame boundary
 (0-3 leftover bytes from an incomplete next length prefix) is a
-hard error. Six contract sites aligned:
+hard error.
+
+Aligned contract sites:
 
 - `BlobReader::next` header short-read check (`blob.rs:400`)
 - `BlobReader::next` payload short-read check (`blob.rs:528`)
@@ -290,18 +292,35 @@ hard error. Six contract sites aligned:
   Ok(None)` removal (`header_walker.rs:161`)
 - `HeaderWalker::next_header` payload-extent check
   (`header_walker.rs:200`)
+- `FileReader::skip` post-skip 1-byte sentinel read
+  (`file_reader.rs:71`) - the `read_blob_header_only` caller-
+  side path used by `has_indexdata`, `diff`, `cat::dedupe`, and
+  `altw::passthrough` was originally missed; the audit narrowed
+  scope to four primitive sites and the post-pass review
+  surfaced this seventh site as a silent shape-4 hole. Same
+  fix shape as `skip_blob_body`.
 
 `read_raw_frame` already aligned (uses `read_exact` end-to-end);
-documented as the gold-standard pattern.
+gold-standard pattern.
 
 `PrimitiveBlock::new` already aligned via the Cursor-based
 protobuf walk in `WireBlock::parse_and_inline`.
 
-`tests/cli_truncation_sweep.rs` is shape-aware: tolerated offsets
-(within 0-3 bytes of any frame_start) may exit 0; shapes 2-4
-must exit non-zero. `tests/corrupt_input.rs` tests at lines 60
-and 286 updated from "1-3 leftover -> Err" to "1-3 leftover ->
-None (tolerated)" to match the documented stance.
+Test coverage layered:
+
+- Reader-level unit tests
+  (`tests/read_paths.rs::trailing_partial_length_prefix_*`,
+  `tests/corrupt_input.rs::truncated_header_size`,
+  `truncated_header_data`) pin the `BlobReader::next` tolerance
+  contract directly.
+- `tests/cli_truncation_sweep.rs` is shape-aware: tolerated
+  offsets (within 0-3 bytes of any frame_start) pin no-panic +
+  bounded stderr only at the command level (sort may
+  legitimately reject a tail truncation even when the reader's
+  contract holds); shape-2-4 offsets assert non-zero exit.
+- Truncation errors at shapes 3 and 4 in `BlobReader::next` /
+  `skip_blob_body` include the byte offset and shape in stderr
+  per the reference doc.
 
 Caller-side defensive checks (e.g. `src/scan/classify.rs:90`)
 remain as belt-and-braces but no longer load-bearing.

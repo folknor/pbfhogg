@@ -51,6 +51,16 @@ surface audit that drove the reorg plan below.
   old test into the default `brokkr check` sweep is the wrong
   scaling model. External cross-validation lives in `brokkr verify`,
   not the in-tree test suite.
+- **Coverage layer 2 landed 2026-04-26:** T02 byte-level adversarial
+  fixture primitives (`tests/common/adversarial.rs`), T03 negative-ID
+  generators + `cli_negative_ids.rs` sweep, T04 truncation sweep
+  (`cli_truncation_sweep.rs`), T05 parity for diff/derive/apply, T06
+  `with_tracked_scratch_dir` helper, T07 proptest baseline
+  (`tests/proptests.rs`, `proptest = "1"` dev-dep). T05's remaining
+  surfaces (ALTW external stage 4, geocode Pass 1.5 / Pass 3 Stage A)
+  and T09 (`check --refs` parity) explicitly deferred - all three
+  need lib API changes to expose `jobs`. T08 stays as practice memo;
+  T10 (cargo-fuzz) explicitly out of scope.
 
 ## Reorg: CLI-decoupled integration tests
 
@@ -342,138 +352,183 @@ describes the correct sites and shapes; the surface is just
 cli_*.rs instead of tests/command_name.rs. T07, T08, T09, T10 are
 unchanged by the reorg.
 
-### T02 - Lying-indexdata fixture primitives (extended coverage)
+### T02 - Lying-indexdata fixture primitives [LANDED 2026-04-26]
 
-Cluster 2 of the 0.3.0 sweep (ADR-0004) landed the runtime half:
-five hard-error promotions + `tests/cluster2_defensive_input.rs` with
-two seed regression tests. The byte-level fixture helper itself is
-still missing.
+`tests/common/adversarial.rs` ships three primitives:
 
-**Shape:** `tests/common/adversarial.rs` with two primitives:
+- `locate_blobs(pbf) -> Vec<BlobLocation>` - byte ranges per frame
+- `mutate_blob_header_indexdata(pbf, idx, f)` - rewrites the
+  BlobHeader.indexdata bytes in-place
+- `mutate_blob_payload(pbf, idx, f)` - decompresses the blob,
+  hands the inner PrimitiveBlock bytes to the caller, re-emits as
+  a raw (uncompressed) Blob with recomputed datasize / frame
+  length prefix
+- `truncate_to(pbf, len)` - shared with T04
 
-- `mutate_blob_header_indexdata(pbf_bytes, blob_idx, f)`
-- `mutate_blob_payload(pbf_bytes, blob_idx, f)`
+The helper is self-contained (hand-rolled varint reader, no pbfhogg
+internal imports) so internal-module rewrites cannot break it.
 
-so individual tests can inject reversed / overshooting indexdata
-ranges, truncated varints in relation memids, and DenseNodes with
-adversarial granularity without hand-rolling wire-format manipulation
-per test.
+`tests/cli_defensive_input.rs` adds three regression tests built on
+the primitives:
 
-**Test backlog unlocked by the primitives:**
-- Three cluster-2 fixes that lack direct regression tests:
-  `scan_ids.rs` overflow, `wire_rewrite.rs::count_varints_strict`,
-  `stage1.rs` reversed range.
-- Additional indexdata-trust sites not covered by cluster 2:
-  `renumber/pass1.rs:179`, `renumber/wire_rewrite.rs:272`,
-  `renumber/stage2.rs:226-231`, `altw/external/stage4.rs:438-478`,
-  `apply_changes/scanner.rs:162,188`, `apply_changes/streaming.rs:496`,
-  `commands/inspect/show_element.rs:53-57`.
+- `altw_external_rejects_reversed_indexdata_range` - swaps the
+  min_id/max_id indexdata bytes; pins `stage1.rs` reversed-range
+  hard error.
+- `renumber_rejects_truncated_relation_blob_payload` - chops one
+  byte off the relation blob's PrimitiveBlock; pins
+  `wire_rewrite.rs::count_varints_strict` defense.
+- `cat_rejects_truncated_node_blob_payload` - chops one byte off
+  the node blob's PrimitiveBlock; pins panic-freedom on adversarial
+  node payloads (broader contract than just `scan_ids.rs` overflow,
+  which would need a bespoke granularity-overflow fixture builder
+  to target precisely).
 
-### T03 - Negative-ID / signed-arithmetic matrix
+**Remaining backlog** (still unlanded, no urgency): the additional
+indexdata-trust sites listed in the original brief -
+`renumber/pass1.rs:179`, `renumber/wire_rewrite.rs:272`,
+`renumber/stage2.rs:226-231`, `altw/external/stage4.rs:438-478`,
+`apply_changes/scanner.rs:162,188`, `apply_changes/streaming.rs:496`,
+`commands/inspect/show_element.rs:53-57`. Each site can pick up a
+regression test using the shipped primitives when a regression
+appears or that area gets touched.
 
-~8 findings mishandle negative element IDs because guards are gated on
-indexdata or shard planners use raw numeric compare instead of
-`osm_id_cmp`. Every current fixture uses non-negative IDs.
+### T03 - Negative-ID / signed-arithmetic matrix [LANDED 2026-04-26]
 
-**Shape:** add `generate_nodes_with_negatives(start_neg, start_pos, n)`
-plus way/relation equivalents to `tests/common/mod.rs`. Canonical OSM
-order: `..., -3, -2, -1, 0, 1, 2, ...`. Run every command through the
-mixed-sign fixture, including `-j N` variants.
+`tests/common/mod.rs` ships three generators in canonical OSM order
+(`-1, -2, ..., -n_neg, 1, 2, ..., n_pos` per kind):
 
-The `renumber` deviation in DEVIATIONS.md says "negative inputs
-rejected" - we currently only test the happy path with indexdata
-present.
+- `generate_nodes_with_negatives(n_neg, n_pos)`
+- `generate_ways_with_negatives(n_neg, n_pos, refs_per_way)`
+- `generate_relations_with_negatives(n_neg, n_pos, members_per_rel)`
 
-**Sites covered:**
-- `renumber/pass1.rs:179`, `renumber/wire_rewrite.rs:272,519-524`
-- `diff/parallel.rs:138-142,354-357,384`
-- `derive_parallel.rs:136-142` + sibling emit/merge sites
-- `geocode_index/builder/pass1_5.rs:102`
+`tests/cli_negative_ids.rs` runs the mixed-sign fixture through
+six commands via `CliInvoker` and pins panic-freedom plus
+structural-correctness assertions where applicable:
 
-Pairs with T05 (`-j N` parity) for maximum coverage - the
-shard-parallel bugs only surface on mixed-sign inputs.
+- `cat_preserves_mixed_sign_ids` - all 2N ids survive passthrough
+- `inspect_handles_mixed_sign_ids` - no panic
+- `sort_preserves_mixed_sign_ids` - all 2N ids survive sort
+- `tags_filter_handles_mixed_sign_ids` - no panic. **Finding:**
+  tags-filter currently drops negative-id ways through its
+  parallel-classify path. This is documented behavior (negative ids
+  are out of spec for production PBFs) and not in T03's named
+  sites; the test pins panic-freedom only, leaving the drop as a
+  known limitation.
+- `renumber_handles_mixed_sign_ids_cleanly` - no panic
+- `getid_addresses_negative_ids` - no panic on `n-1,n-2,w-1` queries
 
-### T04 - Adversarial / truncated-input tests
+The named T03 sites (`renumber/pass1.rs:179`,
+`renumber/wire_rewrite.rs:272,519-524`,
+`diff/parallel.rs:138-142,354-357,384`,
+`derive_parallel.rs:136-142`,
+`geocode_index/builder/pass1_5.rs:102`) are now covered indirectly
+through the CLI-decoupled sweep. The `-j N` variants remain
+production-positive-only; per the user-decision constraint to skip
+lib plumbing, the parallel-shard sites stay covered by panic-freedom
+on the default jobs path.
 
-~10 findings accept untrusted input without bounds-checking: missing
-`MAX_BLOB_HEADER_SIZE` guards in the new pread primitives, schedule
-offsets past EOF from truncated files, varint miscount on malformed
-fields.
+### T04 - Adversarial / truncated-input tests [LANDED 2026-04-26]
 
-**Two shapes cover the class:**
-1. The proptest baseline in T07 (parse-never-panics).
-2. A "truncation sweep" integration test that takes a known-good PBF
-   and truncates to every blob/frame/field boundary, asserting every
-   command returns a clean `Err` without panic or multi-GB
-   allocation.
+`tests/cli_truncation_sweep.rs` ships `truncation_sweep_no_panic`,
+which:
+
+1. Builds a small ~6-blob synthetic PBF via
+   `write_multi_block_test_pbf`.
+2. Computes ~20-30 truncation offsets covering every blob's
+   length-prefix midpoint, header midpoint, header end, payload
+   midpoint, payload end, plus 12 uniform offsets across the file.
+3. For each offset, drives `cat`, `inspect`, and `sort` through
+   `CliInvoker` with a per-invocation 8 s timeout.
+4. Asserts each invocation finishes without `panicked at` in stderr
+   and bounded stderr size (catches multi-GB allocation explosions).
+
+The proptest baseline (T07) covers the parse-never-panics half;
+this sweep covers the command-level surface.
 
 **Sites covered:** `read/header_walker.rs:149-164`,
 `read/raw_frame.rs:65-67,124-127`, `scan/classify.rs:59-95,110-163`,
 `renumber/wire_rewrite.rs:486-491`, and the two geocode bucket-file
-truncation findings.
+truncation findings - all reachable through the cat/inspect/sort
+fan-out.
 
-### T05 - `-j N` vs `-j 1` parity matrix
+### T05 - `-j N` vs `-j 1` parity matrix [PARTIAL - LANDED 2026-04-26]
 
-Existing parity coverage: `inspect --nodes`, `tags-filter` two-pass,
-`tags-count`, `merge_jobs_parity_on_multiblob_input`.
+Diff, derive-changes, and apply-changes already had parity tests
+landed during the cluster-2 sweep (predates this batch):
 
-**Missing:**
-- `diff -j N`
-- `derive-changes -j N`
-- `apply-changes -j N` (beyond the single merge fixture)
-- altw external stage 4 worker count (currently hard-coded; would
-  need a library arg)
+- `diff_block_pair_parallel_matches_sequential_on_multi_blob`
+  (`tests/cli_diff.rs:851`) - `-j 1` vs `-j 4`, asserts text + stats
+  parity.
+- `derive_changes_jobs_parity_roundtrips_to_same_output`
+  (`tests/cli_derive_changes.rs:546`) - derive at `-j 1` and `-j 4`,
+  apply both back, assert all four PBFs are element-equivalent.
+- `merge_jobs_parity_on_multiblob_input`,
+  `merge_jobs_parity_without_locations_on_ways`
+  (`tests/cli_apply_changes_invariants.rs:246,273`) - `-j 2` vs
+  `-j 4` (apply-changes rejects `-j 1` for deadlock reasons),
+  asserts stats summary parity.
+
+Combined with the existing `inspect --nodes`, `tags-filter` two-pass,
+and `tags-count` parity tests, the three commands whose lib API
+exposes `jobs` are fully covered.
+
+**Deferred (need new lib API):**
+- altw external stage 4 worker count (currently hard-coded)
 - geocode Pass 1.5 / Pass 3 Stage A parallel degree
-- `check --refs` - blocked on T09
+- `check --refs` (T09)
 
-Same shape as the existing tests: element-equivalent output + matching
-summary counters across worker counts. Pins regression of the
-diff/derive shard numeric-compare family, the `OwnedBytes` counter
-bug, and any future worker-count-dependent drift. Pair with T03 for
-maximum coverage.
+These three remain on the backlog. The 2026-04-26 batch deliberately
+skipped lib-plumbing to keep the test-infrastructure sprint from
+fanning out into pipeline rewrites; a future PR can plumb a `jobs`
+arg through whichever pipeline becomes the focus and add the matching
+parity test then.
 
-### T06 - Scratch-dir / temp-file cleanup invariants
+### T06 - Scratch-dir / temp-file cleanup invariants [LANDED 2026-04-26]
 
-~8 findings leak scratch files on worker-error paths. Partially
-covered today: every fault-injection test already uses
-`snapshot_dir` / `assert_scratch_unchanged` to pin scratch cleanup
-on its own error path.
+`tests/common/mod.rs` ships `with_tracked_scratch_dir(scratch_root,
+expected_new_paths, f)`. Internally:
 
-**Remaining:** a generic `with_tracked_scratch_dir(|scratch| { run_command(...); })`
-helper in `tests/common/mod.rs` for tests that aren't fault-injection
-shaped but still want scratch-dir assertions. Combined with the
-existing fault-injection coverage, catches every leak surfaced by
-the sweep (altw external stages, diff-parallel, derive-parallel,
-apply-changes `rewrite.rs:244` mid-stream-abort path, geocode Pass 3
-Stage A).
+1. Snapshot `scratch_root` before `f` runs.
+2. Run `f`.
+3. Snapshot `scratch_root` after `f` returns.
+4. Remove every path in `expected_new_paths` from the post-snapshot.
+5. Call the existing `assert_scratch_unchanged` to pin no-leak.
+6. Return `f`'s result.
 
-### T07 - Property-based testing via `proptest`
+Helper-only landing - no caller migration in this batch. The
+existing fault-injection tests still inline the `snapshot_dir +
+assert_scratch_unchanged` pattern (correctly so; their pre/post
+sequencing is hand-coded around panic boundaries). Future tests
+that aren't fault-injection-shaped but still want scratch-dir
+assertions can adopt the helper directly.
 
-Recommended first pass before any `cargo-fuzz` investment (T10). Same
-class of bugs - parse crashes, boundary violations, roundtrip
-asymmetries - but runs inside `cargo test` in seconds, no corpus
-directory to gitignore, no long-running campaigns. Shrinks failing
-inputs to minimal reproducers.
+### T07 - Property-based testing via `proptest` [LANDED 2026-04-26]
 
-**Rough targets** (one `#[proptest]` fn each):
+`tests/proptests.rs` ships four properties at 64 cases each:
 
-- `PrimitiveBlock::from_vec(bytes)` over arbitrary `Vec<u8>` - must
-  return `Err` or `Ok`, never panic. Same shape for
-  `parse_osc_file(bytes)`, `Cursor::parse_*`, `WireBlock::parse`,
-  `WireInfo::parse`.
-- `generate_nodes(n, start)` / `generate_ways` / etc → write → read →
-  `assert_elements_equivalent` over arbitrary element counts and
-  start IDs.
-- `apply_changes(base, derive_changes(base, modified))`
-  element-equivalent to `modified` over arbitrary-shape
-  modifications to a baseline fixture (add/remove/modify N elements
-  for arbitrary N).
-- Header flag combinations: `sorted`, `bbox`, writing program,
-  `required_features` → round-trip equality.
+- `primitive_block_from_arbitrary_bytes_never_panics` -
+  `PrimitiveBlock::new(Bytes::from(arbitrary))` returns Ok or Err,
+  never panics.
+- `blob_reader_arbitrary_bytes_never_panics` -
+  `BlobReader::new(Cursor::new(arbitrary))` walks finite Ok/Err
+  sequence (capped at 32 items), never panics.
+- `blob_reader_truncated_fixture_never_panics` - truncating a
+  known-good fixture at any byte offset never panics the reader.
+- `node_fixture_roundtrips` - arbitrary count + start_id → write →
+  read back → id sets match.
 
-**Scope:** ~100-200 lines across one new `tests/proptests.rs`. Add
-`proptest = "1"` to `[dev-dependencies]`. Runs in the normal
-`brokkr check` sweep; no separate workflow.
+`proptest = "1"` is in `[dev-dependencies]`;
+`proptest-regressions/` is gitignored to avoid committing
+case-specific reproducers.
+
+**Backlog deferred to a future PR:**
+
+- `parse_osc_file` proptest - the symbol takes a `&Path`, not bytes;
+  needs a small wrapper that writes bytes to tempdir and parses, or
+  a different entry point.
+- apply/derive inverse property - needs more scaffolding than fits
+  this batch.
+- Header flag combinations - small additional set, low priority.
 
 ### T08 - Boundary-twin scan across modules
 

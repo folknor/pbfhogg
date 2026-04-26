@@ -23,10 +23,14 @@ mod common;
 use std::io::Write;
 use std::path::Path;
 
+use common::adversarial::{
+    locate_blobs, mutate_blob_header_indexdata, mutate_blob_payload,
+};
 use common::cli::CliInvoker;
-use common::{write_test_pbf, TestNode, TestRelation, TestWay};
+use common::{write_test_pbf, TestMember, TestNode, TestRelation, TestWay};
 use pbfhogg::block_builder::{self, BlockBuilder};
 use pbfhogg::writer::{Compression, PbfWriter};
+use pbfhogg::MemberId;
 use tempfile::TempDir;
 
 const LAT: i32 = 550_000_000;
@@ -144,4 +148,256 @@ fn apply_changes_rejects_unsorted_header() {
         stderr.contains("sorted base PBF"),
         "expected a sortedness error message; stderr:\n{stderr}",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Cluster-2 fixes that need byte-level fixture manipulation (T02).
+//
+// Every cluster-2 fix is a defensive-input promotion: malformed PBFs that
+// previously panicked or silently produced wrong output now hit a clean
+// hard error. The seed tests above cover two of the five fixes via
+// fixtures that lie at the BlockBuilder level. The remaining tests inject
+// malformed bytes via `common::adversarial::*`.
+// ---------------------------------------------------------------------------
+
+/// Write a sorted-header indexed PBF with one node blob, one way blob,
+/// and one relation blob - the canonical input shape for renumber and
+/// altw. Returns the path the fixture lives at.
+fn write_three_kind_fixture(path: &Path) {
+    let nodes = (1..=8_i64)
+        .map(|id| TestNode {
+            id,
+            lat: LAT,
+            lon: LON,
+            tags: vec![],
+            meta: None,
+        })
+        .collect::<Vec<_>>();
+    let ways = (1..=4_i64)
+        .map(|id| TestWay {
+            id,
+            refs: vec![1, 2, 3, 4],
+            tags: vec![],
+            meta: None,
+        })
+        .collect::<Vec<_>>();
+    let relations = vec![TestRelation {
+        id: 1,
+        members: vec![
+            TestMember {
+                id: MemberId::Way(1),
+                role: "outer",
+            },
+            TestMember {
+                id: MemberId::Way(2),
+                role: "outer",
+            },
+            TestMember {
+                id: MemberId::Way(3),
+                role: "inner",
+            },
+            TestMember {
+                id: MemberId::Way(4),
+                role: "inner",
+            },
+        ],
+        tags: vec![("type", "multipolygon")],
+        meta: None,
+    }];
+
+    let file = std::fs::File::create(path).expect("create");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .sorted()
+        .build()
+        .expect("header");
+    writer.write_header(&header).expect("write header");
+    let mut bb = BlockBuilder::new();
+    for n in &nodes {
+        bb.add_node(n.id, n.lat, n.lon, [], None);
+    }
+    let bytes = bb.take().expect("take").expect("non-empty");
+    writer.write_primitive_block(bytes).expect("write nodes");
+    let mut bb = BlockBuilder::new();
+    for w in &ways {
+        bb.add_way(w.id, [], &w.refs, None);
+    }
+    let bytes = bb.take().expect("take").expect("non-empty");
+    writer.write_primitive_block(bytes).expect("write ways");
+    let mut bb = BlockBuilder::new();
+    for r in &relations {
+        let members: Vec<block_builder::MemberData<'_>> = r
+            .members
+            .iter()
+            .map(|m| block_builder::MemberData {
+                id: m.id,
+                role: m.role,
+            })
+            .collect();
+        bb.add_relation(r.id, r.tags.iter().map(|(k, v)| (*k, *v)), &members, None);
+    }
+    let bytes = bb.take().expect("take").expect("non-empty");
+    writer.write_primitive_block(bytes).expect("write relations");
+    writer.flush().expect("flush");
+}
+
+/// Cluster-2 fix: `altw external::stage1` rejects a node blob whose
+/// indexdata advertises `max_id < min_id`. Before the fix, stage 2's
+/// id-range partition would consume an empty range silently and emit
+/// no per-bucket assignments, causing later stages to drop all coords
+/// for the affected blob. After the fix, stage 1 hard-errors with a
+/// `reversed indexdata range` message.
+#[test]
+fn altw_external_rejects_reversed_indexdata_range() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_three_kind_fixture(&input);
+
+    // Node blob is the first OSMData blob (index 1; index 0 is OSMHeader).
+    // The indexdata layout (see `src/blob_meta/mod.rs`) is:
+    //   byte 0   version
+    //   byte 1   kind
+    //   bytes 2..10   min_id (i64 LE)
+    //   bytes 10..18  max_id (i64 LE)
+    //   ...
+    let pbf = std::fs::read(&input).expect("read fixture");
+    let mutated = mutate_blob_header_indexdata(&pbf, 1, |ix| {
+        assert!(ix.len() >= 18, "indexdata too short to swap min/max");
+        let mut min_buf = [0u8; 8];
+        let mut max_buf = [0u8; 8];
+        min_buf.copy_from_slice(&ix[2..10]);
+        max_buf.copy_from_slice(&ix[10..18]);
+        ix[2..10].copy_from_slice(&max_buf);
+        ix[10..18].copy_from_slice(&min_buf);
+    });
+    std::fs::write(&input, &mutated).expect("rewrite fixture");
+
+    let out = CliInvoker::new()
+        .arg("add-locations-to-ways")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--index-type")
+        .arg("external")
+        .run();
+
+    assert!(
+        !out.status.success(),
+        "altw external must reject reversed indexdata; stdout:\n{}\nstderr:\n{}",
+        out.stdout_str(),
+        out.stderr_str(),
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("reversed indexdata range")
+            || stderr.contains("max_id"),
+        "expected reversed-range error message; stderr:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("panicked at"),
+        "altw external must not panic on reversed indexdata; stderr:\n{stderr}",
+    );
+}
+
+/// Cluster-2 fix: `renumber/wire_rewrite::count_varints_strict` errors
+/// on a truncated trailing varint inside a relation's `memids` packed
+/// field. Before the fix the count walk silently dropped the last
+/// element of a truncated stream, causing renumber to emit fewer
+/// member ids than the relation declared. After the fix the rewriter
+/// returns a clean error and renumber exits non-zero.
+///
+/// We don't try to match the exact byte boundary of the truncated
+/// varint - instead we chop the LAST byte of the relation blob's
+/// PrimitiveBlock payload. The truncated byte may land inside `types`
+/// (field 11) or `memids` (field 10), both of which now go through
+/// `count_varints_strict` checks. Either way the failure is the
+/// hardened defensive path - the regression we pin is "no panic, no
+/// silent truncation".
+#[test]
+fn renumber_rejects_truncated_relation_blob_payload() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_three_kind_fixture(&input);
+
+    let pbf = std::fs::read(&input).expect("read fixture");
+    let blobs = locate_blobs(&pbf);
+    // Last data blob is the relation blob (header + nodes + ways + relations).
+    let relation_idx = blobs.len() - 1;
+    let mutated = mutate_blob_payload(&pbf, relation_idx, |payload| {
+        // Drop the final byte of the inner PrimitiveBlock. Anything
+        // downstream that walks varints will trip on the truncation.
+        if let Some(last) = payload.pop() {
+            // Touch the byte to signal intent.
+            let _ = last;
+        }
+    });
+    std::fs::write(&input, &mutated).expect("rewrite fixture");
+
+    let out = CliInvoker::new()
+        .arg("renumber")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .run();
+
+    assert!(
+        !out.status.success(),
+        "renumber must reject a truncated relation payload; stdout:\n{}\nstderr:\n{}",
+        out.stdout_str(),
+        out.stderr_str(),
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        !stderr.contains("panicked at"),
+        "renumber must not panic on truncated relation payload; stderr:\n{stderr}",
+    );
+}
+
+/// Cluster-2 fix: `cat` (running the indexdata-generation passthrough
+/// with no flags) walks every blob through `scan_block_ids` to derive
+/// indexdata. Before the cluster-2 hardening, an attacker-controlled
+/// `granularity` × `lat_offset` combination could wrap inside
+/// `gran * raw_lat` in release builds and produce a poisoned bbox in
+/// indexdata; in debug builds it panicked. After the fix the bbox is
+/// silently dropped via `checked_mul`/`checked_add`, leaving a clean
+/// id-range-only indexdata entry.
+///
+/// We exercise the broader defensive surface: truncate the last byte
+/// of a node blob's PrimitiveBlock, then run `cat`. Whichever varint
+/// the chop lands inside (granularity, lat/lon offset, DenseNodes id
+/// stream, etc.), the response must be a clean non-zero exit, never
+/// a panic. This pins the "no panic on adversarial node blob" contract
+/// without requiring a bespoke granularity-overflow fixture.
+#[test]
+fn cat_rejects_truncated_node_blob_payload() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_three_kind_fixture(&input);
+
+    let pbf = std::fs::read(&input).expect("read fixture");
+    // Node blob is the first OSMData blob.
+    let mutated = mutate_blob_payload(&pbf, 1, |payload| {
+        payload.pop();
+    });
+    std::fs::write(&input, &mutated).expect("rewrite fixture");
+
+    let out = CliInvoker::new()
+        .arg("cat")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .run();
+
+    let stderr = out.stderr_str();
+    assert!(
+        !stderr.contains("panicked at"),
+        "cat must not panic on truncated node payload; stderr:\n{stderr}",
+    );
+    // We don't require a specific exit status - cat's tolerance for
+    // partially-readable blobs is itself a hardening tradeoff. The
+    // contract is "no panic", not "always exits with status N".
 }

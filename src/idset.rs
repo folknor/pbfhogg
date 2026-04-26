@@ -229,12 +229,25 @@ impl IdSet {
     /// Uses chunk-level granularity for IDs outside a single chunk boundary,
     /// and bit-level for IDs within a chunk. Fast for the common case where
     /// the range spans 1-2 chunks.
+    ///
+    /// Negative-id handling: `max_id < 0` returns false (no representable
+    /// match), and `min_id < 0` is clamped to 0. An `IdSet` only stores
+    /// non-negative ids (negative `set` is a silent no-op), so a query
+    /// `[neg, max]` is equivalent to `[0, max]` for any positive `max`.
+    /// Without the clamp the unsigned cast wraps `min` past `max`, the
+    /// iteration range becomes empty, and a blob whose indexdata straddles
+    /// zero is silently skipped before the per-element matcher runs -
+    /// dropping legitimate positive matches. See the "Negative input IDs
+    /// rejected project-wide" entry in `DEVIATIONS.md` for the wider
+    /// project stance and the call sites that depend on this behavior
+    /// (`getid` blob-prefilter, `add-locations-to-ways --index-type external`
+    /// stage 4).
     #[allow(clippy::cast_sign_loss)]
     pub fn any_in_range(&self, min_id: i64, max_id: i64) -> bool {
-        if min_id > max_id {
+        if min_id > max_id || max_id < 0 {
             return false;
         }
-        let min_id = min_id as u64;
+        let min_id = min_id.max(0) as u64;
         let max_id = max_id as u64;
         let min_chunk = (min_id >> (CHUNK_BITS + 3)) as usize;
         let max_chunk = (max_id >> (CHUNK_BITS + 3)) as usize;
@@ -662,6 +675,29 @@ mod tests {
 
         // Inverted range returns false
         assert!(!s.any_in_range(100, 10));
+    }
+
+    #[test]
+    fn any_in_range_negative_min_clamps_to_zero() {
+        // Pins the negative-bound contract documented at any_in_range and in
+        // DEVIATIONS.md ("Negative input IDs rejected project-wide"). An
+        // IdSet only stores non-negative ids, so a straddling query must
+        // inspect the [0, max_id] portion rather than silently returning
+        // false (the pre-clamp bug, where the unsigned cast wrapped min
+        // past max and skipped the whole range).
+        let mut s = IdSet::new();
+        s.set(50);
+
+        // Straddling range: positive portion [0, 60] contains 50.
+        assert!(s.any_in_range(-100, 60));
+        // Straddling range with no positive match.
+        assert!(!s.any_in_range(-100, 47));
+        // Wholly negative range: nothing representable, return false.
+        assert!(!s.any_in_range(-200, -50));
+        // Both bounds zero: degenerate but valid; bit 0 not set.
+        assert!(!s.any_in_range(0, 0));
+        s.set(0);
+        assert!(s.any_in_range(-5, 0));
     }
 
     #[test]

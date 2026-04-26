@@ -197,24 +197,50 @@ positive-only, and several code paths rely on that invariant.
   via `--id-osm-file` are not validated (the source PBF's contents
   are treated as opaque data, matching the project-wide stance that
   passthrough commands like `cat`/`sort`/`inspect` do not validate
-  PBF payloads).
+  PBF payloads). The blob-prefilter (`IdSet::any_in_range` at
+  `src/idset.rs`) clamps `min_id < 0` to 0 so a *target* PBF whose
+  indexdata range straddles zero correctly screens in its positive
+  portion - without the clamp the unsigned cast wraps and the blob
+  is silently skipped, dropping legitimate positive matches.
+  Negatives in the target PBF are still absent from output because
+  `IdSet::set` is a silent no-op on negatives (no positive request
+  id can match a negative element id).
+- `add-locations-to-ways --index-type external` - **silent**, by
+  inheritance from `IdSet`. Stage 4's relation-member-node retention
+  optimization
+  (`src/commands/altw/external/stage4.rs::P1b`) consults
+  `relation_member_node_ids.any_in_range(min_id, max_id)` to skip
+  node blobs that contain no relation-referenced nodes. The
+  `any_in_range` clamp covers the straddling-blob case as for
+  `getid` above; the per-id silent no-op on `IdSet::set` (and the
+  matching abs-fold absence on the pbfhogg side) is the residual
+  divergence below. `--index-type dense|sparse` use mmap arrays
+  rather than `IdSet`, so they don't touch this path.
 
-**Residual divergence (tags-filter):** `tags-filter`'s
-parallel-classify path silently **drops** negative-id ways from the
-output - the `IdSet` route used to track matched/included ids
-silently no-ops on negative inputs (`src/idset.rs:45`). osmium's
-`tags-filter` instead silently **abs-converts** via
-`object.positive_id()`, folding negative-id elements together with
-their positive counterparts. Both behaviors are silent; neither
-matches the project-wide reject stance, and neither matches the
-other. Pinned as the current state by
-`tests/cli_negative_id_invariants.rs::tags_filter_handles_mixed_sign_ids`.
-Promoting `tags-filter` to a fourth enforcement site is not
-planned: osmium's own behavior is also a silent miscount, so
-neither tool offers a clean precedent for forced rejection here.
-A user who needs deterministic tags-filter behavior on mixed-sign
-input must run `renumber` first to surface the negatives as a
-hard error.
+**Residual divergence (tags-filter, add-locations-to-ways):**
+The shared root is `src/idset.rs:45` - `IdSet::set` is a silent
+no-op on negative ids, where osmium's equivalent paths abs-fold via
+`object.positive_id()` to collapse `-N` and `+N` into a single bit.
+
+- `tags-filter`'s parallel-classify path silently **drops**
+  negative-id ways from the output, where osmium's `tags-filter`
+  silently **abs-converts** them. Pinned as the current state by
+  `tests/cli_negative_id_invariants.rs::tags_filter_handles_mixed_sign_ids`.
+- `add-locations-to-ways --index-type external` silently **omits**
+  relation-member retention for any relation member whose id is
+  negative (the member id is dropped at `IdSet::set` time, so
+  stage 4 doesn't know to keep the corresponding untagged node).
+  osmium's `add-locations-to-ways` abs-folds the member ref via
+  `member.positive_ref()`, collapsing `-N` and `+N` member refs
+  into the same retention decision.
+
+Both behaviors are silent; neither matches the project-wide reject
+stance, and neither matches osmium's abs-fold. Promoting either to
+a fourth hard-reject site is not planned: osmium's own behavior is
+also a silent miscount (just a *different* silent miscount), so
+neither tool offers a clean precedent for forced rejection here. A
+user who needs deterministic behavior on mixed-sign input must run
+`renumber` first to surface the negatives as a hard error.
 
 **Rationale:** `IdSet` is the load-bearing data structure in
 renumber - a bitmap indexed by unsigned id supporting `O(1)`

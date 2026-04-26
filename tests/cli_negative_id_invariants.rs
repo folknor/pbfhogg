@@ -351,11 +351,13 @@ fn getid_rejects_negative_ids_with_named_id_and_kind() {
 ///
 /// Source: `build_fixture` (mixed-sign 3 neg + 3 pos per kind).
 /// Input: positives-only (`generate_*_with_negatives(0, N_POS)`).
-/// Splitting the inputs this way isolates the contract under test
-/// (the source-PBF parse path) from an unrelated IdSet quirk:
-/// `IdSet::any_in_range(min, max)` silently returns false when
-/// `min < 0`, which would skip an input blob whose indexdata
-/// straddles zero before the per-element matcher ever runs.
+/// Splitting the inputs this way keeps the test focused on the
+/// source-PBF parse path. (`IdSet::any_in_range` now clamps negative
+/// `min` to 0 so a straddling-zero indexdata range correctly screens
+/// in its positive portion; see the doc comment on `any_in_range` and
+/// the "Negative input IDs rejected project-wide" entry in
+/// `DEVIATIONS.md`. The narrower input keeps this test orthogonal to
+/// that fix even if the clamp ever changes.)
 #[test]
 fn getid_id_osm_file_passes_through_negative_source_ids() {
     let dir = TempDir::new().expect("tempdir");

@@ -17,3 +17,4 @@ docs/.vitepress/dist
 docs/.vitepress/cache
 overnight.sh
 overnight-logs/
+proptest-regressions/

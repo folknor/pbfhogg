@@ -21,6 +21,7 @@
 //!
 //! [`CliInvoker`]: cli::CliInvoker
 
+pub mod adversarial;
 pub mod cli;
 
 use std::collections::BTreeMap;
@@ -457,6 +458,129 @@ pub fn generate_relations(
             }
         })
         .collect()
+}
+
+/// Generate `n_neg + n_pos` nodes with mixed-sign ids in canonical OSM
+/// order: `[-1, -2, ..., -n_neg, 1, 2, ..., n_pos]`. Zero is not a valid
+/// OSM id and is omitted. Coordinates and tags follow the
+/// [`generate_nodes`] pattern.
+///
+/// Canonical OSM order is `0, -1, -2, ...` (negatives by ascending
+/// absolute value) `then 1, 2, ...` (positives ascending) - see
+/// `osm_id_cmp` in `src/osm_id.rs`. Used by the negative-ID sweep (T03)
+/// to drive every command through a mixed-sign fixture in the order
+/// canonical-sorted readers expect.
+pub fn generate_nodes_with_negatives(n_neg: usize, n_pos: usize) -> Vec<TestNode> {
+    let mut out = Vec::with_capacity(n_neg + n_pos);
+    for i in 1..=n_neg {
+        let id = -i64::try_from(i).expect("n_neg fits in i64");
+        let step = 1000_i32;
+        let wrap = i32::try_from(id.rem_euclid(10_000)).expect("id mod 10_000 fits in i32");
+        let coord = step.saturating_mul(wrap);
+        out.push(TestNode {
+            id,
+            lat: coord,
+            lon: coord,
+            tags: vec![],
+            meta: None,
+        });
+    }
+    for i in 1..=n_pos {
+        let id = i64::try_from(i).expect("n_pos fits in i64");
+        let step = 1000_i32;
+        let wrap = i32::try_from(id.rem_euclid(10_000)).expect("id mod 10_000 fits in i32");
+        let coord = step.saturating_mul(wrap);
+        out.push(TestNode {
+            id,
+            lat: coord,
+            lon: coord,
+            tags: vec![],
+            meta: None,
+        });
+    }
+    out
+}
+
+/// Generate `n_neg + n_pos` ways with mixed-sign ids in canonical OSM
+/// order: `[-1, -2, ..., -n_neg, 1, 2, ..., n_pos]`. Each way references
+/// `refs_per_way` consecutive positive node ids starting at `1` -
+/// callers that want way refs targeting negative nodes can layer them
+/// on after.
+pub fn generate_ways_with_negatives(
+    n_neg: usize,
+    n_pos: usize,
+    refs_per_way: usize,
+) -> Vec<TestWay> {
+    let mut out = Vec::with_capacity(n_neg + n_pos);
+    let make_refs = |seed: i64| -> Vec<i64> {
+        (0..refs_per_way)
+            .map(|r| {
+                let r = i64::try_from(r).expect("refs_per_way fits in i64");
+                seed.saturating_add(r)
+            })
+            .collect()
+    };
+    for i in 1..=n_neg {
+        let id = -i64::try_from(i).expect("n_neg fits in i64");
+        out.push(TestWay {
+            id,
+            refs: make_refs(1),
+            tags: vec![],
+            meta: None,
+        });
+    }
+    for i in 1..=n_pos {
+        let id = i64::try_from(i).expect("n_pos fits in i64");
+        out.push(TestWay {
+            id,
+            refs: make_refs(1),
+            tags: vec![],
+            meta: None,
+        });
+    }
+    out
+}
+
+/// Generate `n_neg + n_pos` relations with mixed-sign ids in canonical
+/// OSM order: `[-1, -2, ..., -n_neg, 1, 2, ..., n_pos]`. Each relation
+/// has `members_per_rel` way members with role `"outer"`, referencing
+/// positive way ids starting at `1`.
+pub fn generate_relations_with_negatives(
+    n_neg: usize,
+    n_pos: usize,
+    members_per_rel: usize,
+) -> Vec<TestRelation> {
+    let mut out = Vec::with_capacity(n_neg + n_pos);
+    let make_members = || -> Vec<TestMember> {
+        (0..members_per_rel)
+            .map(|m| {
+                let m = i64::try_from(m).expect("members_per_rel fits in i64");
+                TestMember {
+                    id: MemberId::Way(1 + m),
+                    role: "outer",
+                }
+            })
+            .collect()
+    };
+    for i in 1..=n_neg {
+        let id = -i64::try_from(i).expect("n_neg fits in i64");
+        out.push(TestRelation {
+            id,
+            members: make_members(),
+            tags: vec![],
+            meta: None,
+        });
+    }
+    for i in 1..=n_pos {
+        let id = i64::try_from(i).expect("n_pos fits in i64");
+        out.push(TestRelation {
+            id,
+            members: make_members(),
+            tags: vec![],
+            meta: None,
+        });
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,4 +1217,42 @@ pub fn assert_scratch_unchanged(
              removed (stolen): {removed:?}"
         );
     }
+}
+
+/// Run a closure inside a tracked scratch directory.
+///
+/// Snapshots `scratch_root` before and after the closure runs, removes
+/// every path in `expected_new_paths` from the post-snapshot, and panics
+/// if any other paths were added or removed. Returns the closure result.
+///
+/// Use this to wrap a command invocation that produces known outputs
+/// (relative paths under `scratch_root`) but should not leak any
+/// intermediate scratch files.
+///
+/// ```ignore
+/// with_tracked_scratch_dir(dir.path(), &[Path::new("output.osm.pbf")], || {
+///     CliInvoker::new()
+///         .arg("sort")
+///         .arg(&input)
+///         .arg("-o")
+///         .arg(&output)
+///         .assert_success();
+/// });
+/// ```
+pub fn with_tracked_scratch_dir<F, R>(
+    scratch_root: &Path,
+    expected_new_paths: &[&Path],
+    f: F,
+) -> R
+where
+    F: FnOnce() -> R,
+{
+    let before = snapshot_dir(scratch_root);
+    let result = f();
+    let mut after = snapshot_dir(scratch_root);
+    for ex in expected_new_paths {
+        after.remove(*ex);
+    }
+    assert_scratch_unchanged(&before, &after);
+    result
 }

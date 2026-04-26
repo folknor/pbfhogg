@@ -339,3 +339,77 @@ fn getid_rejects_negative_ids_with_named_id_and_kind() {
          stderr:\n{stderr}",
     );
 }
+
+/// `getid --id-osm-file <pbf>` must NOT reject a source PBF that
+/// contains negative ids. DEVIATIONS' "Negative input IDs rejected
+/// project-wide" section explicitly carves out this path: ids
+/// harvested from a separate PBF are treated as opaque payload, the
+/// same stance as cat/sort/inspect (which preserve mixed-sign input
+/// without validation). A future change that extends the
+/// `parse_id_spec` parse-time reject into `parse_ids_from_pbf`
+/// would break this test.
+///
+/// Source: `build_fixture` (mixed-sign 3 neg + 3 pos per kind).
+/// Input: positives-only (`generate_*_with_negatives(0, N_POS)`).
+/// Splitting the inputs this way isolates the contract under test
+/// (the source-PBF parse path) from an unrelated IdSet quirk:
+/// `IdSet::any_in_range(min, max)` silently returns false when
+/// `min < 0`, which would skip an input blob whose indexdata
+/// straddles zero before the per-element matcher ever runs.
+#[test]
+fn getid_id_osm_file_passes_through_negative_source_ids() {
+    let dir = TempDir::new().expect("tempdir");
+    let source = dir.path().join("source.osm.pbf");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    // Source: mixed-sign fixture (would have triggered the parse-time
+    // reject if the contract didn't carve out the PBF-source path).
+    build_fixture(&source);
+
+    // Input: positives only, so the input blob's indexdata range is
+    // wholly positive and IdSet::any_in_range can match cleanly.
+    let pos_nodes = generate_nodes_with_negatives(0, N_POS);
+    let pos_ways = generate_ways_with_negatives(0, N_POS, 3);
+    let pos_relations = generate_relations_with_negatives(0, N_POS, 2);
+    write_test_pbf_sorted(&input, &pos_nodes, &pos_ways, &pos_relations);
+
+    let out = CliInvoker::new()
+        .arg("getid")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--id-osm-file")
+        .arg(&source)
+        .run();
+
+    let stderr = out.stderr_str();
+    assert!(
+        !stderr.contains("non-negative"),
+        "getid --id-osm-file must NOT extend the parse-time reject \
+         into the PBF-source path (DEVIATIONS contract). The source \
+         PBF's negative ids should be treated as opaque payload. \
+         stderr:\n{stderr}",
+    );
+    assert!(
+        out.status.success(),
+        "getid --id-osm-file must succeed when source PBF contains \
+         negative ids; stdout:\n{}\nstderr:\n{stderr}",
+        out.stdout_str(),
+    );
+
+    // The source's positive ids (1..=N_POS for each kind) survive the
+    // IdSet population, match the input's positives, and pass through
+    // to the output.
+    let contents = read_all_elements_id_only(&output);
+    let nodes = node_ids_id_only(&contents);
+    let ways = way_ids_id_only(&contents);
+    let relations = relation_ids_id_only(&contents);
+    assert_eq!(nodes.len(), N_POS, "all positive nodes survive; ids: {nodes:?}");
+    assert_eq!(ways.len(), N_POS, "all positive ways survive; ids: {ways:?}");
+    assert_eq!(
+        relations.len(),
+        N_POS,
+        "all positive relations survive; ids: {relations:?}",
+    );
+}

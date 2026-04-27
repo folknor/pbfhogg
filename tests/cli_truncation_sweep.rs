@@ -2,7 +2,7 @@
 //! truncated at every blob/frame/payload boundary plus a deterministic
 //! set of intermediate offsets.
 //!
-//! T04 in `notes/testing.md`. The contract this file pins follows
+//! The contract this file pins follows
 //! [`reference/truncation-handling.md`](../reference/truncation-handling.md):
 //!
 //! - **Shape 1** (clean cut at a frame boundary, 0-3 leftover bytes

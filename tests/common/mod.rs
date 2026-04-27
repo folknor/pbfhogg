@@ -467,9 +467,9 @@ pub fn generate_relations(
 ///
 /// Canonical OSM order is `0, -1, -2, ...` (negatives by ascending
 /// absolute value) `then 1, 2, ...` (positives ascending) - see
-/// `osm_id_cmp` in `src/osm_id.rs`. Used by the negative-ID sweep (T03)
-/// to drive every command through a mixed-sign fixture in the order
-/// canonical-sorted readers expect.
+/// `osm_id_cmp` in `src/osm_id.rs`. Used by the negative-ID sweep
+/// (`cli_negative_id_invariants.rs`) to drive every command through
+/// a mixed-sign fixture in the order canonical-sorted readers expect.
 pub fn generate_nodes_with_negatives(n_neg: usize, n_pos: usize) -> Vec<TestNode> {
     let mut out = Vec::with_capacity(n_neg + n_pos);
     for i in 1..=n_neg {

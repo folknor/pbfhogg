@@ -1,10 +1,10 @@
 //! Property-based tests for parser entry points and roundtrip
 //! invariants.
 //!
-//! T07 in `notes/testing.md`. Same class of bugs as cargo-fuzz (parse
-//! crashes, boundary violations, roundtrip asymmetries) but runs inside
-//! `cargo test` in seconds with deterministic shrinking on failure. No
-//! corpus directory committed (`proptest-regressions/` is gitignored).
+//! Same class of bugs as cargo-fuzz (parse crashes, boundary
+//! violations, roundtrip asymmetries) but runs inside `cargo test`
+//! in seconds with deterministic shrinking on failure. No corpus
+//! directory committed (`proptest-regressions/` is gitignored).
 //!
 //! Properties pinned:
 //!

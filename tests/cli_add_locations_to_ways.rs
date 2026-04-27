@@ -9,12 +9,13 @@
 //! rewrite of `src/commands/altw/` cannot break these tests by type
 //! changes alone.
 //!
-//! ALTW is the motivating example for the CLI-decoupling reorg
-//! (`notes/testing.md` > "Reorg"): the dense / sparse / external /
-//! auto index backends are internal types that change shape during
-//! the join rewrite documented in `notes/altw-external.md`. This
-//! file's only knob into "which backend" is the `--index-type` CLI
-//! flag, so backend renames or splits don't ripple in.
+//! ALTW is the motivating example for the CLI-decoupled test layout
+//! (`notes/testing.md` > "Test placement"): the dense / sparse /
+//! external / auto index backends are internal types that change
+//! shape during the join rewrite documented in
+//! `notes/altw-external.md`. This file's only knob into "which
+//! backend" is the `--index-type` CLI flag, so backend renames or
+//! splits don't ripple in.
 
 #![allow(clippy::unwrap_used)]
 
@@ -811,7 +812,7 @@ mod platform {
 }
 
 // ---------------------------------------------------------------------------
-// Tier B contract gaps from 2026-04-26 review (notes/testing.md "Follow-ups")
+// Tier B contract gaps from 2026-04-26 review
 // ---------------------------------------------------------------------------
 
 /// B1 - Null Island sentinel collision (CORRECTNESS.md "Null Island

@@ -10,7 +10,8 @@
 //!
 //! - [`mutate_blob_header_indexdata`] - alter the BlobHeader.indexdata bytes
 //! - [`mutate_blob_payload`] - alter the OSMData PrimitiveBlock bytes
-//! - [`truncate_to`] - chop the file at a byte boundary (T04 sweep)
+//! - [`truncate_to`] - chop the file at a byte boundary
+//!   (drives `cli_truncation_sweep.rs`)
 //!
 //! Internally we walk the wire format with a tiny varint reader. We never
 //! import pbfhogg internals - these helpers stay viable across rewrites.
@@ -234,9 +235,9 @@ pub fn set_relation_memids_terminator_continuation(
 
 /// Chop the PBF at a byte offset.
 ///
-/// Returns `pbf[..len.min(pbf.len())]` as an owned vector. Used by the
-/// truncation sweep (T04) to drive every command against every truncation
-/// boundary of a known-good fixture.
+/// Returns `pbf[..len.min(pbf.len())]` as an owned vector. Used by
+/// `cli_truncation_sweep.rs` to drive every command against every
+/// truncation boundary of a known-good fixture.
 pub fn truncate_to(pbf: &[u8], len: usize) -> Vec<u8> {
     pbf[..len.min(pbf.len())].to_vec()
 }

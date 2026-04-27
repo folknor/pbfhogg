@@ -6,11 +6,10 @@
 //! folded into `cli_apply_changes_invariants.rs` (apply-changes-only)
 //! or any single command's `cli_*.rs`.
 //!
-//! See `notes/testing.md` for the broader test reorg context. Cluster
-//! 2 (the 2026-04-24 fix sweep) landed five hard-error promotions; two
-//! of them have direct regression tests here. The other three need
-//! byte-level fixture manipulation primitives (`mutate_blob_*`)
-//! tracked under T02 in `notes/testing.md`.
+//! Cluster 2 (the 2026-04-24 fix sweep) landed five hard-error
+//! promotions; two of them have direct regression tests here. The
+//! other three need byte-level fixture manipulation primitives
+//! (`mutate_blob_*`) and pick up coverage as those land.
 //!
 //! No imports from `pbfhogg::renumber::*` or `pbfhogg::apply_changes::*` -
 //! a rewrite of either command cannot break these tests by type
@@ -152,7 +151,7 @@ fn apply_changes_rejects_unsorted_header() {
 }
 
 // ---------------------------------------------------------------------------
-// Cluster-2 fixes that need byte-level fixture manipulation (T02).
+// Cluster-2 fixes that need byte-level fixture manipulation.
 //
 // Every cluster-2 fix is a defensive-input promotion: malformed PBFs that
 // previously panicked or silently produced wrong output now hit a clean

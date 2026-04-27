@@ -1,10 +1,10 @@
 //! CLI-driven integration tests for `pbfhogg sort`.
 //!
-//! Pattern-setter for the CLI-decoupled test reorg (see
-//! `notes/testing.md` > "Reorg"). Fixture PBFs are written with the
-//! stable-allowlist writer helpers; the sort command runs via the
-//! compiled `pbfhogg` binary through `CliInvoker`; output is
-//! verified by reading the resulting PBF with the stable-allowlist
+//! Pattern-setter for the CLI-decoupled test layout (see
+//! `notes/testing.md` > "Test placement"). Fixture PBFs are written
+//! with the stable-allowlist writer helpers; the sort command runs
+//! via the compiled `pbfhogg` binary through `CliInvoker`; output
+//! is verified by reading the resulting PBF with the stable-allowlist
 //! reader helpers. No imports from `pbfhogg::commands::sort` or any
 //! other internal module - a rewrite of `src/commands/sort/` cannot
 //! break these tests by type changes alone.

@@ -186,9 +186,10 @@ fn sort_preserves_mixed_sign_ids() {
 /// shaped for production-positive ids only, and silently dropping
 /// negative-id elements is a documented current behavior, not a
 /// regression. The reverse-direction "negative ids must survive
-/// tags-filter" is out of T03 scope (see `notes/testing.md` T03 - it
-/// names renumber, diff, derive, geocode pass1_5 as the sites; tags-
-/// filter is not on that list).
+/// tags-filter" is out of scope: `DEVIATIONS.md` "Negative input IDs
+/// rejected project-wide" names renumber, diff/derive shard planners,
+/// and getid as the enforcement sites; tags-filter is not on that
+/// list.
 #[test]
 fn tags_filter_handles_mixed_sign_ids() {
     let dir = TempDir::new().expect("tempdir");

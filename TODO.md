@@ -12,8 +12,6 @@ Three new docs capturing a cross-cutting insight and two new commands that fall 
 
 **Open decision on `getparents`** (see [notes/getparents.md](notes/getparents.md) current state): uncommitted `HeaderWalker` path is +68 % on europe / -46 % on planet. Revert, threshold-dispatch, or accept? Deferred until `repack` produces an 8k-packed planet so the crossover point can be measured directly.
 
-- [ ] **[notes/testing.md](notes/testing.md)** - test infrastructure and coverage tracker. Open work items (T02 indexdata-trust backlog, T05 deferred parity surfaces, T07 proptest extensions, T08 boundary-twin practice, T09 check-refs parity, T10 cargo-fuzz, IdSet silent-rejection cleanup) tracked in that file. Historical narrative of how each section was reached lives in `git log -- notes/testing.md`.
-
 - [ ] **[notes/merge-changes.md](notes/merge-changes.md)** - `merge-changes` (squash N OSCs → 1). The serial-across-inputs CLI shape `merge_changes::write_streaming` parallelizes cleanly via `IdSet::set_atomic_if_new` newer-wins dedupe. **Baseline landed 2026-04-26** (commit `16e3694`): planet 7-OSC = 267.2 s (UUID `bef0f1fa`), planet 1-OSC = 43.1 s (UUID `76f78e8b`); per-OSC scaling is essentially linear (7-OSC = 6.2× 1-OSC) so the parse phase dominates the wall. Reviewer Q7's original 20-30 s estimate was an order of magnitude low: parallel parse can collapse 7 × 38.2 s of serial parse into roughly the 1-OSC wall, **estimated win ~210-225 s at planet 7-OSC scale**. No win at 1-OSC scale. Sizing detail in `notes/merge-changes.md` and the new `reference/performance.md` Merge-changes section. Per-input `MERGECHANGES_PARSE_{START,END}` markers and `merge_changes_input_bytes` counter shipped 2026-04-22 (commit `4e3c7ea`); the planet `--hotpath` run was preflight-refused as 184 GB-estimated, needs `--no-mem-check` to capture per-OSC parse spans. Library-level `osc::load_all_diffs` is **unused in production** (only `#[cfg(test)]` call sites); apply-changes takes a single OSC via `parse_osc_file` so the "per-input" axis doesn't apply there. Next: implement the rayon-scoped parse-fan-out. Content factored out of `apply-changes-opportunities.md` 2026-04-21 - these items were filed under "weekly apply-changes" but apply scale-independently to any consumer that squashes N > 1 OSCs.
 
 - [ ] **[notes/sort.md](notes/sort.md)** - `sort` (repair unsorted PBFs into `Sort.Type_then_ID`). Drafted 2026-04-23. **Production reality**: Geofabrik / planet input is already sorted, so the overlap-count is ~zero and pass 2 is pure raw passthrough. The headline opportunity that helps the production case is **`copy_file_range` coalescing for passthrough runs** (hours-scope, transplant from apply-changes drain, 1.1-1.5x via syscall reduction). The bigger theoretical wins - parallel overlap-rewrite in pass 2 (1.5-3x) and HeaderWalker-based pass 1 (1.2-2x on non-indexed input) - only fire on genuinely-unsorted input, which has no dataset configured in `brokkr.toml` today. Planet baseline scheduled for tonight's `overnight.sh:272-275`; lands 2026-04-24. Anti-conversion rule (pipelined → sequential) explicitly off the table per `reference/pipelined-reader-paths.md:138`.
@@ -427,37 +425,6 @@ single-pass, tag expression and bbox filtering.
   Three commands have known diffs: extract (relation inclusion criteria),
   diff (14-element version comparison), check-refs (occurrences vs unique).
   See `brokkr verify all` output and README cross-validation section.
-- [x] ~~**Promote silent passthrough/drop to clean error on mixed-sign
-  input across non-renumber commands.**~~ Decided 2026-04-26 via an
-  osmium precedent walk: only `getid` gets a hard reject (matches
-  osmium exactly - osmium's getid rejects identically and its man
-  page is explicit about it). `cat` / `sort` / `inspect` stay as
-  passthrough (matches osmium's no-validation stance).
-  `tags-filter`'s silent drop is a known divergence from osmium's
-  silent abs-convert; both are silent, so neither is a clean
-  precedent - documented in `DEVIATIONS.md` as the residual gap.
-  `IdSet::set`'s silent no-op on negatives stays put (mirrors
-  libosmium's unsigned-only id-set template - rejection lives at the
-  call-site, not the storage layer). Getid's parse-time reject lands
-  as enforcement site #3 in `DEVIATIONS.md`.
-- [x] ~~**`pbfhogg diff --summary` flips stats format rather than enabling
-  output**~~ - resolved 2026-04-25. Renamed to `--osmium-summary`. The
-  `-s` short form is unchanged. The pbfhogg-format summary always
-  fires on stderr unless `--quiet`; the renamed flag now accurately
-  describes what it does (swap the format, not gate visibility).
-  CHANGELOG entry under "Unreleased > Breaking changes". Migration
-  is `--summary` -> `--osmium-summary`, or use `-s` (works either
-  way).
-- [x] ~~**`hotpath::HotpathGuardBuilder` banner contaminates stdout
-  for stdout-output commands under `--all-features` test runs**~~
-  Resolved 2026-04-25 via brokkr.toml migration to `[[check]]` array
-  with explicit feature lists. The `all` sweep enumerates
-  `["test-hooks", "linux-direct-io", "linux-io-uring"]` (no
-  `hotpath`), so `#[hotpath::measure]` becomes a compile-time no-op
-  during test runs and no banner emerges. Production users who build
-  with `--features hotpath` deliberately keep getting banner output as
-  intended. brokkr's `--hotpath` measurement mode is unaffected
-  because it already builds with hotpath explicitly enabled.
 - [ ] **CLI UX: scratch dir + mode naming, unified across the CLI** (raised
   2026-04-23, unresolved). Two related decisions, both of which should be
   applied uniformly across every command that carries the pattern, not

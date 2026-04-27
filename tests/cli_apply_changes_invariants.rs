@@ -254,7 +254,7 @@ fn merge_jobs_parity_on_multiblob_input() {
     write_merge_jobs_fixture(&base_raw, &osc);
     bootstrap_low_base(&base_raw, &base);
 
-    // Parity baseline is jobs=2 (T01: jobs=1 rejected up front).
+    // Parity baseline is jobs=2; jobs=1 is rejected up front.
     let seq = run_apply_changes(&base, &osc, &out_seq, Some(2), true);
     let par = run_apply_changes(&base, &osc, &out_par, Some(4), true);
 

@@ -11,14 +11,13 @@
 //! `src/commands/apply_changes/` cannot break these tests by type
 //! changes alone.
 //!
-//! Apply-changes is the highest-traffic rewrite surface in the
-//! testing reorg priority list (notes/testing.md). The
+//! Apply-changes is a high-traffic rewrite surface. The
 //! descriptor-first streaming rewrite documented in
-//! `notes/apply-changes-opportunities.md` will move large parts of
-//! the internal API around. After this conversion, the CLI surface
-//! (`pbfhogg apply-changes <base> <changes> -o <output>
-//! [--locations-on-ways] [-j N] [--direct-io] [--io-uring] --force`)
-//! is the only thing this file pins.
+//! `notes/apply-changes-opportunities.md` moved large parts of the
+//! internal API around; the CLI surface (`pbfhogg apply-changes
+//! <base> <changes> -o <output> [--locations-on-ways] [-j N]
+//! [--direct-io] [--io-uring] --force`) is the only thing this file
+//! pins.
 //!
 //! Per-test stats assertions on `MergeStats` counters survive via
 //! stderr substring matching against `MergeStats::print_summary`.

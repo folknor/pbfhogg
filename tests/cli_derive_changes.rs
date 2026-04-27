@@ -1,11 +1,10 @@
 //! CLI-driven integration tests for `pbfhogg diff --format osc`
 //! (the derive-changes operation).
 //!
-//! Replaces `tests/derive_changes.rs`. Stage 4 of priority 1 in the
-//! testing reorg (notes/testing.md): `derive_changes.rs` lives under
-//! `pbfhogg::diff::derive::derive_changes` but is logically tied to
-//! the apply-changes pipeline because most tests do a
-//! derive→apply roundtrip. The CLI surface is `pbfhogg diff
+//! Replaces `tests/derive_changes.rs`. `derive_changes.rs` lives
+//! under `pbfhogg::diff::derive::derive_changes` but is logically
+//! tied to the apply-changes pipeline because most tests do a
+//! derive->apply roundtrip. The CLI surface is `pbfhogg diff
 //! --format osc -o <osc> [--increment-version] [--update-timestamp]
 //! [-j N] <old> <new>`.
 //!

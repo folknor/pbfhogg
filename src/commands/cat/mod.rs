@@ -4,13 +4,10 @@ pub mod dedupe;
 
 use std::path::Path;
 
-use rayon::prelude::*;
-
 use super::{
     build_output_header, require_indexdata,
-    for_each_primitive_block_batch_budgeted, writer_from_header, HeaderOverrides,
+    writer_from_header, HeaderOverrides,
     ensure_node_capacity_local, ensure_way_capacity_local, ensure_relation_capacity_local,
-    DECODE_BATCH_BYTE_BUDGET,
 };
 use crate::owned::{dense_node_metadata, element_metadata, TypeFilter};
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
@@ -21,7 +18,7 @@ use crate::writer::{reframe_raw_with_index, Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
 use crate::writer::frame_blob_pipelined;
-use super::{flush_local, Result, BATCH_SIZE};
+use super::{flush_local, Result};
 use crate::read::raw_frame::read_raw_frame;
 
 /// Which metadata attributes to strip via `--clean`.
@@ -344,12 +341,46 @@ fn process_block(
 
 use super::clean_metadata;
 
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+/// Type-filtered cat with full decode + re-encode (used for `--clean` and for
+/// type-filtered passes when raw passthrough doesn't apply).
+///
+/// Uses `parallel_classify_phase` per kind. Each worker pread's a blob from
+/// the shared file, decodes it inline (alloc on the worker thread), processes
+/// matching elements through a thread-local `BlockBuilder`, frames the output
+/// blobs, and returns the framed bytes back to the main thread for sequential
+/// writing in seq order.
+///
+/// Replaces an earlier `into_blocks_pipelined` + `for_each_primitive_block_batch_budgeted`
+/// shape that hit the documented cross-thread `PrimitiveBlock` retention
+/// pattern (`src/read/pipeline.rs:66-89`, ~25 GB at planet scale; OOM at
+/// 28.9 GB peak measured 2026-04-26 overnight). The pipelined reader allocated
+/// blocks on its decode pool and dropped them on the consumer thread; the
+/// batch-based mitigation listed in pipeline.rs only reduced the cross-thread
+/// window without eliminating it. `parallel_classify_phase` confines each
+/// blob's allocation and drop to a single worker thread.
+///
+/// **Output ordering note.** Both modes are type-sorted: nodes first, then
+/// ways, then relations. For inputs that are already type-sorted (the
+/// production case), this preserves the existing output structure. For
+/// unsorted inputs, the output is re-sorted into type order. For mixed-type
+/// blobs (rare in practice; PBFs conventionally have one kind per block),
+/// each kind is emitted in its own phase, splitting one input blob into up
+/// to three smaller output blobs.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn cat_filtered(files: &[&Path], output: &Path, filter: &str, clean: &CleanAttrs, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<CatStats> {
     let tf = TypeFilter::parse(filter);
-
     let single_file = files.len() == 1;
-    let blob_filter = BlobFilter::new(tf.nodes, tf.ways, tf.relations);
+
+    // Cap glibc arenas to prevent cross-thread alloc/free fragmentation
+    // in the per-blob worker pool. Same precedent as check --refs / verify_ids.
+    // The workers do BlockBuilder re-encode (allocation-heavy) but each blob's
+    // alloc/free cycle is confined to a single worker thread, so the pattern
+    // that regresses time-filter (cross-blob scratch reuse defeated by arena
+    // capping) doesn't apply.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
 
     // -----------------------------------------------------------------------
     // Read header from first file
@@ -358,45 +389,37 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, clean: &CleanAttrs
     super::warn_locations_on_ways_loss(first_reader.header());
     let header = first_reader.header().clone();
     let mut writer = writer_from_header(output, compression, &header, single_file, overrides, |hb| hb, direct_io, false)?;
+    drop(first_reader);
+
     let mut blobs_decoded: u64 = 0;
     let mut elements: u64 = 0;
 
-    // -----------------------------------------------------------------------
-    // Process each input file
-    // -----------------------------------------------------------------------
-    let mut batch_count: u64 = 0;
-    let mut max_batch_blocks: usize = 0;
-    let mut max_batch_bytes: usize = 0;
-    let mut total_byte_limited: u64 = 0;
     for file in files {
-        let reader = ElementReader::open(file, direct_io)?;
-        let blocks_iter = reader.with_blob_filter(blob_filter.clone()).into_blocks_pipelined();
-        for_each_primitive_block_batch_budgeted(blocks_iter, BATCH_SIZE, Some(DECODE_BATCH_BYTE_BUDGET), &mut |batch| {
-            let batch_bytes: usize = batch.iter().map(PrimitiveBlock::decompressed_size).sum();
-            batch_count += 1;
-            if batch.len() > max_batch_blocks {
-                max_batch_blocks = batch.len();
-            }
-            if batch_bytes > max_batch_bytes {
-                max_batch_bytes = batch_bytes;
-            }
-            if batch.len() < BATCH_SIZE {
-                total_byte_limited += 1;
-            }
-            let (batch_blobs, batch_elements) = process_batch(
-                batch,
-                &mut writer,
-                compression,
-                &tf,
-                clean,
-            )?;
-            blobs_decoded += batch_blobs;
-            elements += batch_elements;
-            Ok(())
-        })?;
+        let (node_schedule, way_schedule, rel_schedule, shared_file) =
+            crate::scan::classify::build_classify_schedules_split(file)?;
+
+        if tf.nodes {
+            crate::debug::emit_marker("CAT_NODES_START");
+            let (b, e) = run_kind_phase(&shared_file, &node_schedule, KIND_NODE, clean, compression, &mut writer)?;
+            blobs_decoded += b;
+            elements += e;
+            crate::debug::emit_marker("CAT_NODES_END");
+        }
+        if tf.ways {
+            crate::debug::emit_marker("CAT_WAYS_START");
+            let (b, e) = run_kind_phase(&shared_file, &way_schedule, KIND_WAY, clean, compression, &mut writer)?;
+            blobs_decoded += b;
+            elements += e;
+            crate::debug::emit_marker("CAT_WAYS_END");
+        }
+        if tf.relations {
+            crate::debug::emit_marker("CAT_RELATIONS_START");
+            let (b, e) = run_kind_phase(&shared_file, &rel_schedule, KIND_RELATION, clean, compression, &mut writer)?;
+            blobs_decoded += b;
+            elements += e;
+            crate::debug::emit_marker("CAT_RELATIONS_END");
+        }
     }
-    eprintln!("[cat] batches: {batch_count}, max_blocks/batch: {max_batch_blocks}, max_bytes/batch: {:.1} MiB, byte-limited: {total_byte_limited}",
-        max_batch_bytes as f64 / (1024.0 * 1024.0));
 
     writer.flush()?;
 
@@ -407,61 +430,76 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, clean: &CleanAttrs
     })
 }
 
-/// Process a batch of `PrimitiveBlock`s in parallel via rayon.
-///
-/// Each rayon worker thread decodes, serializes, compresses, and frames blobs
-/// in a single parallel pass. The sequential phase writes fully framed blobs
-/// via `write_raw_owned`, which has bounded backpressure through the writer
-/// thread's `sync_channel`. This avoids the unbounded rayon task queue that
-/// caused OOM on planet-scale files.
-///
-/// Returns `(blobs_decoded, elements_written)`.
-fn process_batch(
-    batch: &[crate::PrimitiveBlock],
-    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
-    compression: Compression,
-    tf: &TypeFilter,
+const KIND_NODE: u8 = 0;
+const KIND_WAY: u8 = 1;
+const KIND_RELATION: u8 = 2;
+
+/// Run one per-kind phase: pread workers decode + clean + frame each blob
+/// of the given kind; main thread writes framed bytes in seq order via
+/// `write_raw_owned`.
+fn run_kind_phase(
+    shared_file: &std::sync::Arc<std::fs::File>,
+    schedule: &[(usize, u64, usize)],
+    kind: u8,
     clean: &CleanAttrs,
+    compression: Compression,
+    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
 ) -> Result<(u64, u64)> {
-    // Parallel phase: decode → serialize → compress → frame, all in one pass.
-    type BatchResult = std::result::Result<(Vec<Vec<u8>>, u64), String>;
-    let results: Vec<BatchResult> = batch
-        .par_iter()
-        .map_init(
-            || (BlockBuilder::new(), Vec::<i64>::new()),
-            |(bb, refs_buf), block| {
-                let mut output: Vec<OwnedBlock> = Vec::new();
-                let count = process_block(
-                    block, bb, &mut output, tf, clean, refs_buf,
-                )?;
-                flush_local(bb, &mut output)?;
+    if schedule.is_empty() {
+        return Ok((0, 0));
+    }
 
-                // Compress and frame each serialized block on this rayon thread.
-                let mut framed: Vec<Vec<u8>> = Vec::with_capacity(output.len());
-                for (block_bytes, index, tagdata) in output {
-                    let indexdata = index.serialize();
-                    let blob = frame_blob_pipelined(
-                        &block_bytes,
-                        &compression,
-                        Some(indexdata.as_slice()),
-                        tagdata.as_deref(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                    framed.push(blob.into_vec());
-                }
-                Ok((framed, count))
-            },
-        )
-        .collect();
+    let kind_filter = TypeFilter {
+        nodes: kind == KIND_NODE,
+        ways: kind == KIND_WAY,
+        relations: kind == KIND_RELATION,
+    };
 
-    // Sequential phase: write pre-framed blobs with bounded backpressure.
+    type PhaseResult = std::result::Result<(Vec<Vec<u8>>, u64), String>;
+    let mut per_blob: Vec<Option<PhaseResult>> = (0..schedule.len()).map(|_| None).collect();
+
+    // BlockBuilder contains `Rc<str>` (string interning) which is not Send,
+    // so it can't ride the `S: Send` worker-state slot. Per-blob alloc inside
+    // the closure is cheap (BlockBuilder::new is just a few empty Vec/HashMap
+    // initialisers; no heap reservation until elements are added).
+    crate::scan::classify::parallel_classify_phase(
+        shared_file,
+        schedule,
+        None,
+        || (),
+        |block, _state| -> PhaseResult {
+            let mut bb = BlockBuilder::new();
+            let mut refs_buf: Vec<i64> = Vec::new();
+            let mut output: Vec<OwnedBlock> = Vec::new();
+            let count = process_block(block, &mut bb, &mut output, &kind_filter, clean, &mut refs_buf)?;
+            flush_local(&mut bb, &mut output)?;
+
+            let mut framed: Vec<Vec<u8>> = Vec::with_capacity(output.len());
+            for (block_bytes, index, tagdata) in output {
+                let indexdata = index.serialize();
+                let blob = frame_blob_pipelined(
+                    &block_bytes,
+                    &compression,
+                    Some(indexdata.as_slice()),
+                    tagdata.as_deref(),
+                )
+                .map_err(|e| e.to_string())?;
+                framed.push(blob.into_vec());
+            }
+            Ok((framed, count))
+        },
+        |seq, r| {
+            per_blob[seq] = Some(r);
+        },
+    )?;
+
     let mut total_blobs: u64 = 0;
     let mut total_elements: u64 = 0;
-    for result in results {
-        let (framed_blobs, count) =
-            result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    for slot in per_blob {
+        let r = slot.expect("parallel_classify_phase must deliver every blob");
+        let (framed, count) = r.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         total_elements += count;
-        for blob in framed_blobs {
+        for blob in framed {
             writer.write_raw_owned(blob)?;
             total_blobs += 1;
         }

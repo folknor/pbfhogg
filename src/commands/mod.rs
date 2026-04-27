@@ -35,13 +35,6 @@ pub(crate) const BATCH_SIZE: usize = 64;
 /// Maximum bytes of raw blob data in a single merge/rewrite batch.
 pub(crate) const BATCH_BYTE_BUDGET: usize = 128 * 1024 * 1024;
 
-/// Maximum decompressed bytes per decode-process batch (e.g. `cat --type`).
-///
-/// Lower than `BATCH_BYTE_BUDGET` because decoded blocks are fully expanded in
-/// memory and then cloned into rayon compression tasks. At ~1.4 MiB/block this
-/// targets ~23 blocks/batch, well below the 64-block count cap.
-pub(crate) const DECODE_BATCH_BYTE_BUDGET: usize = 32 * 1024 * 1024;
-
 /// Minimum blobs per batch (avoids rayon overhead on tiny batches).
 pub(crate) const BATCH_MIN_BLOBS: usize = 8;
 

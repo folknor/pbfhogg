@@ -114,39 +114,78 @@ Four commands either OOM'd at planet or ran with no headroom against
 the 28 GB-free reference host. Mirrored in the README's "Not yet
 planet-safe" table.
 
+**Three of the four share a single root cause**: the documented
+cross-thread `PrimitiveBlock` retention pattern in `src/read/pipeline.rs`
+(`run_pipeline` doc-comment lines 66-89, "**25+ GB of heap retention**"
+at planet scale). `for_each_pipelined` allocates `WireStringTable::entries`
+(~10 KB per block) on rayon decode threads and drops them on the consumer
+thread; glibc/jemalloc don't return the freed pages to the OS, accumulating
+as anon RSS. The doc explicitly notes this was "**measured and verified
+across glibc, jemalloc, and multiple `MALLOC_ARENA_MAX` configurations**"
+- so `mallopt(M_ARENA_MAX, 2)` is **not** a fix here, it's a different
+mitigation that helps allocation-heavy workloads (`check --refs`, `--full`
+mode, `renumber_external`). The overnight was the first planet-scale test
+of these three commands, which is why the architectural debt only
+surfaced now.
+
 - [ ] **`check --ids` (streaming default mode)** - SIGKILL at 26 s,
-  **29.2 GB peak anon** (sidecar `dirty` from the failed run). The
-  streaming mode is documented as constant-memory ("Streaming mode
-  (default `check --ids`) was constant-memory and unchanged" in
-  `reference/performance.md` line ~559). The 29 GB peak is unexpected
-  and almost certainly a regression rather than a design limit; the
-  `--full` mode that does allocate per-type `IdSetDense` only peaks
-  at 2.22 GB on the same input. First place to dig is
-  `src/commands/check/ids.rs` for what's accumulating in the
-  default-mode loop. Cheapest blocker to clear.
-- [ ] **`cat --clean`** - SIGKILL at 33 s. `--clean` forces the
-  full-decode / re-frame Framed path (vs the default
-  indexdata-generation passthrough). The pipelined writer's rayon
-  pool has no backpressure - same shape as the existing planet OOM
-  on `cat --type` filtered path noted in
-  `reference/performance.md:60`. No sidecar preserved.
-- [ ] **`time-filter`** - SIGKILL at 94 s. The "History PBF for
-  `time-filter`" entry below describes the *real* workload that has
-  no dataset configured yet, but the bench-as-configured (regular
-  planet PBF, all-keep path) is itself OOMing - so the previous
-  "near-no-op walls" description was wrong at planet scale. No
-  sidecar preserved; needs a re-run with sidecar capture to identify
-  the leak point before either path can be planet-safe.
+  **29.2 GB peak anon** (sidecar `dirty` from the failed run). Walks
+  straight into the `for_each_pipelined` retention pattern at
+  `src/commands/check/verify_ids.rs:416`. **Cheapest blocker to
+  clear**: rewrite to use `parallel_classify_phase` like the
+  co-located `--full` mode (`verify_ids.rs:472` -
+  `verify_ids_full_parallel`) but skip the IdSet population - the
+  per-element check is just monotonicity + counters, so a
+  `BlobVerifyResult` with `first_id` / `last_id` / `count` / no
+  duplicate vec is sufficient. Estimated wall ~35-50 s at planet
+  (between `--full`'s 53.8 s and a strict subset that doesn't write
+  the IdSet), peak RSS in the same 2 GB ballpark as `--full`. One
+  commit, ~80 lines mostly cribbed from `verify_ids_full_parallel`.
+- [ ] **`cat --clean`** - SIGKILL at 33 s. Uses
+  `into_blocks_pipelined` + `for_each_primitive_block_batch_budgeted`
+  at `src/commands/cat/mod.rs:373`. The batch-based consumer is the
+  "partial mitigation" path called out in `pipeline.rs:84-86`, but
+  it's still hitting the retention ceiling - the writer thread
+  becomes the bottleneck on `--clean`'s full re-frame and batches
+  accumulate. Same shape as the existing planet OOM on `cat --type`
+  filtered path noted in `reference/performance.md:60`. No sidecar
+  preserved; needs a re-run to confirm the bottleneck is downstream
+  of the batch boundary (suspected) vs upstream (would mean
+  batch-based mitigation insufficient even with backpressure). Fix
+  candidates: bound the writer's rayon pool depth, drop to
+  sequential decode (`for_each` instead of pipelined), or rework to
+  use `parallel_classify_phase` per kind.
+- [ ] **`time-filter`** - SIGKILL at 94 s. Uses `for_each_pipelined`
+  at `src/commands/time_filter/mod.rs:154`. **`mallopt(M_ARENA_MAX, 2)`
+  is explicitly off-limits here** per the existing comment at
+  `time_filter/mod.rs:84-91`: measured 2026-04-19 on Europe to
+  *regress* this command (95.1 s -> 160.4 s, peak anon 20 GB -> 24.8 GB,
+  avg cores 20.4 -> 14.1) because the per-blob workers do allocation-heavy
+  `BlockBuilder` re-encode rather than the wire-format splice that
+  `mallopt` favours. Hardest of the three to fix because the
+  pending-group state machine (`time_filter/mod.rs:138-`) needs strict
+  element order; porting a per-element state machine into the
+  `parallel_classify_phase` per-blob shape is a real refactor. The
+  "History PBF for `time-filter`" entry below describes the production
+  workload (currently un-benched - dataset gap), but the
+  bench-as-configured (regular planet PBF, all-keep path) is OOMing
+  separately - so the previous "near-no-op walls" description was
+  wrong at planet scale. Sidecar capture on the re-run would localise
+  the retention vs. legitimate working-set components.
 - [ ] **`tags-filter --invert-match w/highway=primary`** - 461.2 s
-  wall, **28.3 GB peak anon** (UUID `6665605a`). Did not OOM in the
-  overnight run but has effectively zero headroom against the 28 GB
-  reference: a concurrent workload, a slightly larger filter set, or
-  a slightly fuller page cache would tip it over. Match path keeps
-  ~1 % of ways and writes ~1 % of output; invert keeps ~99 % and the
-  pass-2 IdSet plus writer state both scale with that. Driving the
-  peak below ~22 GB (in line with `multi-extract --smart`) would
-  give the same headroom margin as the rest of the planet-safe
-  table.
+  wall, **28.3 GB peak anon** (UUID `6665605a`). **Different root
+  cause from the three above** - the high RSS is workload-shape, not
+  pipeline retention: invert keeps ~99 % of ways (vs ~1 % for
+  match) and the pass-2 IdSet plus writer state scale with that.
+  Did not OOM in the overnight run but has effectively zero
+  headroom against the 28 GB reference: a concurrent workload, a
+  slightly larger filter set, or a slightly fuller page cache would
+  tip it over. Driving the peak below ~22 GB (in line with
+  `multi-extract --smart`) would give the same headroom margin as
+  the rest of the planet-safe table. Likely candidates: stream the
+  pass-2 IdSet to disk instead of resident, or invert the
+  data-flow direction (compute the *complement* of the match set
+  on disk rather than keeping the kept set in RAM).
 
 ### Blocked on pbfhogg CLI changes
 

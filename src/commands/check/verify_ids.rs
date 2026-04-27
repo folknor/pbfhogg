@@ -219,169 +219,6 @@ fn violation_to_json(v: &IdViolation) -> serde_json::Value {
 }
 
 // ---------------------------------------------------------------------------
-// Scan state
-// ---------------------------------------------------------------------------
-
-/// Mutable state for the streaming ID scan pass.
-///
-/// Extracted as a struct to keep `process_element` and per-type check methods
-/// small enough to satisfy `cognitive_complexity = "deny"`.
-struct ScanState {
-    prev_node_id: i64,
-    prev_way_id: i64,
-    prev_rel_id: i64,
-    /// 0 = node, 1 = way, 2 = relation. Tracks canonical ordering.
-    last_type_rank: u8,
-    node_count: u64,
-    way_count: u64,
-    relation_count: u64,
-    violations: Vec<IdViolation>,
-    total_violations: u64,
-    max_errors: usize,
-    type_filter: TypeFilter,
-    node_ids: Option<IdSet>,
-    way_ids: Option<IdSet>,
-    relation_ids: Option<IdSet>,
-}
-
-impl ScanState {
-    fn new(opts: &VerifyIdsOptions<'_>) -> Self {
-        let type_filter = opts.type_filter.map_or_else(TypeFilter::all, TypeFilter::parse);
-        Self {
-            prev_node_id: i64::MIN,
-            prev_way_id: i64::MIN,
-            prev_rel_id: i64::MIN,
-            last_type_rank: 0,
-            node_count: 0,
-            way_count: 0,
-            relation_count: 0,
-            violations: Vec::new(),
-            total_violations: 0,
-            max_errors: opts.max_errors,
-            type_filter,
-            node_ids: if opts.full { Some(IdSet::new()) } else { None },
-            way_ids: if opts.full { Some(IdSet::new()) } else { None },
-            relation_ids: if opts.full { Some(IdSet::new()) } else { None },
-        }
-    }
-
-    /// Record a violation, incrementing the total count and optionally storing it.
-    fn record_violation(&mut self, v: IdViolation) {
-        self.total_violations += 1;
-        if self.violations.len() < self.max_errors {
-            self.violations.push(v);
-        }
-    }
-
-    /// Dispatch an element to the appropriate per-type checker.
-    fn process_element(&mut self, element: &crate::Element) {
-        match element {
-            crate::Element::DenseNode(dn) => {
-                if self.type_filter.nodes {
-                    self.check_node(dn.id());
-                }
-            }
-            crate::Element::Node(n) => {
-                if self.type_filter.nodes {
-                    self.check_node(n.id());
-                }
-            }
-            crate::Element::Way(w) => {
-                if self.type_filter.ways {
-                    self.check_way(w.id());
-                }
-            }
-            crate::Element::Relation(r) => {
-                if self.type_filter.relations {
-                    self.check_relation(r.id());
-                }
-            }
-        }
-    }
-
-    /// Check a node ID for monotonicity, type ordering, and (optionally) duplicates.
-    fn check_node(&mut self, id: i64) {
-        self.node_count += 1;
-        self.check_type_order(0, "node");
-        self.check_monotonic("node", id, self.prev_node_id);
-        self.prev_node_id = id;
-        check_duplicate(&mut self.node_ids, &mut self.violations, &mut self.total_violations, self.max_errors, "node", id);
-    }
-
-    /// Check a way ID for monotonicity, type ordering, and (optionally) duplicates.
-    fn check_way(&mut self, id: i64) {
-        self.way_count += 1;
-        self.check_type_order(1, "way");
-        self.check_monotonic("way", id, self.prev_way_id);
-        self.prev_way_id = id;
-        check_duplicate(&mut self.way_ids, &mut self.violations, &mut self.total_violations, self.max_errors, "way", id);
-    }
-
-    /// Check a relation ID for monotonicity, type ordering, and (optionally) duplicates.
-    fn check_relation(&mut self, id: i64) {
-        self.relation_count += 1;
-        self.check_type_order(2, "relation");
-        self.check_monotonic("relation", id, self.prev_rel_id);
-        self.prev_rel_id = id;
-        check_duplicate(&mut self.relation_ids, &mut self.violations, &mut self.total_violations, self.max_errors, "relation", id);
-    }
-
-    /// Verify that element types appear in canonical order (nodes < ways < relations).
-    fn check_type_order(&mut self, rank: u8, type_name: &'static str) {
-        if rank < self.last_type_rank {
-            let after = rank_to_name(self.last_type_rank);
-            self.record_violation(IdViolation::TypeOrder {
-                found: type_name,
-                after,
-            });
-        }
-        self.last_type_rank = rank;
-    }
-
-    /// Verify that the current ID is strictly greater than the previous ID of the same type.
-    fn check_monotonic(&mut self, elem_type: &'static str, id: i64, prev_id: i64) {
-        if id <= prev_id && prev_id != i64::MIN {
-            self.record_violation(IdViolation::NonMonotonic {
-                elem_type,
-                id,
-                prev_id,
-            });
-        }
-    }
-}
-
-/// Check for duplicate ID in the given `IdSet` (free function to avoid
-/// borrow conflicts).
-///
-/// When the set is `None` (streaming mode), this is a no-op. When `Some`,
-/// calls `set_if_new` and records a violation if the ID was already present.
-fn check_duplicate(
-    set: &mut Option<IdSet>,
-    violations: &mut Vec<IdViolation>,
-    total_violations: &mut u64,
-    max_errors: usize,
-    elem_type: &'static str,
-    id: i64,
-) {
-    if let Some(set) = set.as_mut()
-        && !set.set_if_new(id)
-    {
-        *total_violations += 1;
-        if violations.len() < max_errors {
-            violations.push(IdViolation::Duplicate { elem_type, id });
-        }
-    }
-}
-
-fn rank_to_name(rank: u8) -> &'static str {
-    match rank {
-        0 => "node",
-        1 => "way",
-        _ => "relation",
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -389,45 +226,237 @@ fn rank_to_name(rank: u8) -> &'static str {
 ///
 /// Two internal paths depending on `opts.full`:
 ///
-/// - **Streaming (default):** single pipelined pass via `for_each_pipelined`.
-///   Constant memory. Monotonicity + type-order only - no duplicate detection.
-/// - **Full:** three-phase parallel scan via `parallel_classify_phase`. Each
-///   phase populates a shared `IdSet` using `set_atomic_if_new`; cross-blob
-///   monotonicity is resolved in the main-thread merge via seq-ordered buffering.
+/// - **Streaming (default):** three-phase parallel scan via
+///   `parallel_classify_phase`, no IdSet population. Monotonicity +
+///   offset-based type-order only (no duplicate detection).
+/// - **Full:** same shape but with a shared `IdSet` per kind populated
+///   via `set_atomic_if_new` for cross-blob duplicate detection.
 ///
-/// # Planet-scale memory (full mode)
+/// Both modes use the same per-blob worker shape to keep the planet-scale
+/// memory floor bounded. Streaming mode previously walked
+/// `for_each_pipelined` directly, which hit the documented cross-thread
+/// `PrimitiveBlock` retention pattern (`src/read/pipeline.rs:66-89`,
+/// ~25 GB at planet scale; OOM at 29.2 GB measured 2026-04-26 overnight).
 ///
-/// Three `IdSet` pre-allocated to OSM ID ceilings (~1.6 GB for nodes,
-/// 175 MB for ways, 3 MB for relations) when the corresponding `type_filter`
-/// bit is set. Pre-allocation is mandatory for `set_atomic_if_new` (workers
-/// panic on unallocated chunks). Total full-mode RSS at planet: ~1.8 GB.
+/// # Planet-scale memory
+///
+/// Streaming mode: per-blob `BlobVerifyResult` plus the schedule vec;
+/// peak anon RSS in the same ~2 GB range as `--full`.
+///
+/// `--full` mode: three `IdSet` pre-allocated to OSM ID ceilings
+/// (~1.6 GB for nodes, 175 MB for ways, 3 MB for relations) when the
+/// corresponding `type_filter` bit is set. Pre-allocation is mandatory
+/// for `set_atomic_if_new` (workers panic on unallocated chunks). Total
+/// full-mode RSS at planet: ~1.8 GB.
 #[hotpath::measure]
 pub fn verify_ids(path: &Path, opts: &VerifyIdsOptions<'_>) -> Result<VerifyIdsReport> {
     if opts.full {
         return verify_ids_full_parallel(path, opts);
     }
+    verify_ids_streaming_parallel(path, opts)
+}
 
-    let reader = ElementReader::open(path, opts.direct_io)?;
-    let header_sorted = reader.header().is_sorted();
+// ---------------------------------------------------------------------------
+// Parallel streaming-mode implementation
+// ---------------------------------------------------------------------------
+//
+// Mirrors `verify_ids_full_parallel` minus the IdSet allocation and
+// duplicate-detection pass. Workers report `BlobVerifyResult` with
+// `duplicate_ids` always empty; the serial merge skips the duplicate
+// translation step.
+
+#[allow(clippy::too_many_lines)]
+fn verify_ids_streaming_parallel(path: &Path, opts: &VerifyIdsOptions<'_>) -> Result<VerifyIdsReport> {
+    use crate::Element;
+
+    crate::debug::emit_marker("VERIFYIDS_SCAN_START");
+
+    // Same arena cap as `--full`. The streaming workers do no per-element
+    // allocation (just reads + push to a small per-blob within_violations
+    // Vec), so the regression measured on time-filter (where workers do
+    // allocation-heavy BlockBuilder re-encode) doesn't apply here.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
+
+    let header_sorted = ElementReader::open(path, opts.direct_io)?.header().is_sorted();
     let indexed = crate::commands::has_indexdata(path, opts.direct_io)?;
 
-    let mut state = ScanState::new(opts);
+    let type_filter = opts.type_filter.map_or_else(TypeFilter::all, TypeFilter::parse);
 
-    reader.for_each_pipelined(|element| {
-        state.process_element(&element);
-    })?;
+    let (node_schedule, way_schedule, rel_schedule, shared_file) =
+        crate::scan::classify::build_classify_schedules_split(path)?;
+
+    let mut node_count: u64 = 0;
+    let mut way_count: u64 = 0;
+    let mut relation_count: u64 = 0;
+    let mut violations: Vec<IdViolation> = Vec::new();
+    let mut total_violations: u64 = 0;
+
+    // Same offset-based type-order check as --full; non-indexed inputs
+    // skip it (build_classify_schedules_split replicates blobs into all
+    // three schedules when indexdata is missing).
+    if indexed {
+        check_type_order(&node_schedule, &way_schedule, &rel_schedule, &mut violations, &mut total_violations, opts.max_errors);
+    }
+
+    if type_filter.nodes {
+        crate::debug::emit_marker("VERIFYIDS_NODES_START");
+        let (count, phase_violations, phase_total) = verify_single_kind_streaming(
+            &shared_file,
+            &node_schedule,
+            "node",
+            opts.max_errors.saturating_sub(violations.len()),
+            |el| match el {
+                Element::DenseNode(dn) => Some(dn.id()),
+                Element::Node(n) => Some(n.id()),
+                _ => None,
+            },
+        )?;
+        node_count = count;
+        total_violations += phase_total;
+        violations.extend(phase_violations);
+        crate::debug::emit_marker("VERIFYIDS_NODES_END");
+    }
+
+    if type_filter.ways {
+        crate::debug::emit_marker("VERIFYIDS_WAYS_START");
+        let (count, phase_violations, phase_total) = verify_single_kind_streaming(
+            &shared_file,
+            &way_schedule,
+            "way",
+            opts.max_errors.saturating_sub(violations.len()),
+            |el| match el {
+                Element::Way(w) => Some(w.id()),
+                _ => None,
+            },
+        )?;
+        way_count = count;
+        total_violations += phase_total;
+        violations.extend(phase_violations);
+        crate::debug::emit_marker("VERIFYIDS_WAYS_END");
+    }
+
+    if type_filter.relations {
+        crate::debug::emit_marker("VERIFYIDS_RELATIONS_START");
+        let (count, phase_violations, phase_total) = verify_single_kind_streaming(
+            &shared_file,
+            &rel_schedule,
+            "relation",
+            opts.max_errors.saturating_sub(violations.len()),
+            |el| match el {
+                Element::Relation(r) => Some(r.id()),
+                _ => None,
+            },
+        )?;
+        relation_count = count;
+        total_violations += phase_total;
+        violations.extend(phase_violations);
+        crate::debug::emit_marker("VERIFYIDS_RELATIONS_END");
+    }
+
+    crate::debug::emit_marker("VERIFYIDS_SCAN_END");
 
     Ok(VerifyIdsReport {
         header_sorted,
         indexed,
-        full: opts.full,
-        node_count: state.node_count,
-        way_count: state.way_count,
-        relation_count: state.relation_count,
-        passed: state.total_violations == 0,
-        total_violations: state.total_violations,
-        violations: state.violations,
+        full: false,
+        node_count,
+        way_count,
+        relation_count,
+        passed: total_violations == 0,
+        total_violations,
+        violations,
     })
+}
+
+/// Per-kind streaming-parallel scan. Same shape as
+/// `verify_single_kind_parallel` but workers do not consult an `IdSet` and
+/// the merge skips the duplicate translation step.
+#[allow(clippy::type_complexity)]
+fn verify_single_kind_streaming(
+    shared_file: &std::sync::Arc<std::fs::File>,
+    schedule: &[(usize, u64, usize)],
+    elem_type: &'static str,
+    max_errors_remaining: usize,
+    extract_id: impl Fn(&crate::Element) -> Option<i64> + Send + Sync,
+) -> Result<(u64, Vec<IdViolation>, u64)> {
+    if schedule.is_empty() {
+        return Ok((0, Vec::new(), 0));
+    }
+
+    let mut per_blob: Vec<Option<BlobVerifyResult>> = (0..schedule.len()).map(|_| None).collect();
+    let extract_ref = &extract_id;
+
+    crate::scan::classify::parallel_classify_phase(
+        shared_file,
+        schedule,
+        None,
+        || (),
+        |block, _state| -> BlobVerifyResult {
+            let mut r = BlobVerifyResult::empty();
+            let mut prev: Option<i64> = None;
+            for el in block.elements_skip_metadata() {
+                if let Some(id) = extract_ref(&el) {
+                    r.count += 1;
+                    if r.first_id.is_none() {
+                        r.first_id = Some(id);
+                    }
+                    r.last_id = Some(id);
+                    if let Some(p) = prev
+                        && id <= p
+                    {
+                        r.within_violations.push(IdViolation::NonMonotonic {
+                            elem_type,
+                            id,
+                            prev_id: p,
+                        });
+                    }
+                    prev = Some(id);
+                }
+            }
+            r
+        },
+        |seq, r| {
+            per_blob[seq] = Some(r);
+        },
+    )?;
+
+    // Serial merge in schedule (= file) order. duplicate_ids is always
+    // empty in streaming results, so the `for id in r.duplicate_ids` loop
+    // from the --full merge is dropped.
+    let mut count: u64 = 0;
+    let mut violations: Vec<IdViolation> = Vec::new();
+    let mut total_violations: u64 = 0;
+    let mut prev_last: Option<i64> = None;
+    for slot in per_blob {
+        let r = slot.expect("parallel_classify_phase must deliver every blob");
+        count += r.count;
+        for v in r.within_violations {
+            total_violations += 1;
+            if violations.len() < max_errors_remaining {
+                violations.push(v);
+            }
+        }
+        if let (Some(pl), Some(fi)) = (prev_last, r.first_id)
+            && fi <= pl
+        {
+            total_violations += 1;
+            if violations.len() < max_errors_remaining {
+                violations.push(IdViolation::NonMonotonic {
+                    elem_type,
+                    id: fi,
+                    prev_id: pl,
+                });
+            }
+        }
+        if r.last_id.is_some() {
+            prev_last = r.last_id;
+        }
+    }
+
+    Ok((count, violations, total_violations))
 }
 
 // ---------------------------------------------------------------------------

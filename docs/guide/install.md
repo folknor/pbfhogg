@@ -16,21 +16,21 @@ Add the library to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pbfhogg = "0.2"
+pbfhogg = "0.3"
 ```
 
-This enables the default `commands` feature. If you only need read/write (no extract, check-refs, or geocode index), disable it to skip `serde_json`, `roaring`, and `s2` dependencies:
+This enables the default `commands` feature. If you only need read/write (no extract, check-refs, or geocode index), disable it to skip `serde_json` and `s2` dependencies:
 
 ```toml
 [dependencies]
-pbfhogg = { version = "0.2", default-features = false }
+pbfhogg = { version = "0.3", default-features = false }
 ```
 
 ### Feature flags
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `commands` | yes | Enables `check_refs`, `extract`, geocode index builder, and their deps (`roaring`, `serde_json`, `s2`) |
+| `commands` | yes | Enables `check_refs`, `extract`, geocode index builder, and their deps (`serde_json`, `s2`) |
 | `geocode-reader` | included by `commands` | Enables `geocode_index::Reader` for reverse geocoding queries (depends on `s2`) |
 | `linux-direct-io` | no | O_DIRECT read/write paths - bypasses page cache for planet-scale I/O (Linux only) |
 | `linux-io-uring` | no | io_uring writer with registered buffers - faster writes above ~4 GB (Linux only, requires kernel 5.1+) |
@@ -39,7 +39,7 @@ For reverse geocoding queries without the full `commands` feature:
 
 ```toml
 [dependencies]
-pbfhogg = { version = "0.2", default-features = false, features = ["geocode-reader"] }
+pbfhogg = { version = "0.3", default-features = false, features = ["geocode-reader"] }
 ```
 
 ## Building from source

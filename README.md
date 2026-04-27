@@ -14,8 +14,6 @@
   <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue" alt="License"></a>
 </p>
 
----
-
 Rust library and CLI for reading, writing, and transforming OpenStreetMap PBF files. **The full planet (87 GB, 11.6B elements) processes on a 32 GB machine - every command, bounded memory, no compromises.**
 
 Developed on Linux, untested elsewhere.
@@ -89,7 +87,7 @@ The goal for pbfhogg 1.0 is that every CLI command must be planet-scale safe on 
 
 ```toml
 [dependencies]
-pbfhogg = "0.2"
+pbfhogg = "0.3"
 ```
 
 ```rust

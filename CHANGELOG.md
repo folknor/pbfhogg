@@ -1,45 +1,32 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-04-27
 
 ### Breaking changes
 
-- **`pbfhogg diff --summary` renamed to `--osmium-summary`.** The flag
-  flips the stderr stats line from pbfhogg format
-  (`{total} differences: ... created, ... modified, ... deleted (...)`)
-  to osmium format (`Summary: left=N right=N same=N different=N`).
-  The pbfhogg-format summary always fires unless `--quiet`, so the old
-  `--summary` name was misleading - the flag controls *format*, not
-  whether output is shown. The `-s` short form is unchanged. Migration:
-  `pbfhogg diff --summary` -> `pbfhogg diff --osmium-summary`, or use
-  `-s` (works either way).
-- **`renumber --mode` flag removed.** External join is now the only implementation.
-- **`BlobReader::new_seekable<R>` and `IndexedReader::new<R>` bounds widened** from `R: Read + Seek + Send` to `R: BlobReaderSource + Send`. Downstream users with custom reader types add `impl BlobReaderSource for MyReader {}`.
+- **`pbfhogg diff --summary` renamed to `--osmium-summary`.** The flag flips the stderr stats line to osmium's `Summary: left=N right=N same=N different=N` format. Migration: replace `--summary` with `--osmium-summary`, or use the unchanged `-s` short form.
+- **`renumber --mode` flag removed.** External join is the only implementation.
+- **`BlobReader::new_seekable<R>` and `IndexedReader::new<R>` bounds widened** from `R: Read + Seek + Send` to `R: BlobReaderSource + Send`. Custom reader types add `impl BlobReaderSource for MyReader {}`.
 - **Geocode `FORMAT_VERSION` bumped to 2.** Indexes built with older versions must be rebuilt.
 - **`IdSetDense` renamed to `IdSet`** and moved from `getid` to the top-level `pbfhogg::idset` module.
-- **`pbfhogg::getid::IdSet` renamed to `pbfhogg::getid::ElementIds`.** The struct bundles three per-type ID sets and was misnamed as a single "set". Field accessors and method calls unchanged.
-- **`pbfhogg::getid::removeid` signature adds `force: bool`** (positional, between `direct_io` and `overrides`). Library callers must pass `false` to require indexdata (matches CLI default), or `true` to permit non-indexed input.
-- **`apply-changes --jobs 1` (`MergeOptions::jobs = Some(1)`) now rejected** with a clear error at setup. A single worker has a deadlock hazard on mid-stream worker panic and no production use case (2+ workers is strictly faster on every host). Pass `--jobs 2` or omit `--jobs` for the default. The default's minimum is also bumped to 2 for low-core hosts.
+- **`pbfhogg::getid::IdSet` renamed to `pbfhogg::getid::ElementIds`.** Field accessors and method calls unchanged.
+- **`pbfhogg::getid::removeid` adds `force: bool`** (positional, between `direct_io` and `overrides`). Pass `false` to require indexdata, `true` to permit non-indexed input.
+- **`apply-changes --jobs 1` rejected.** Pass `--jobs 2` or omit `--jobs` for the default. The default's minimum is also bumped to 2 on low-core hosts.
 
 ### Commands
 
-- **getid** / **add-locations-to-ways `--index-type external`**: blob-prefilter now correctly screens blobs whose indexdata range straddles zero. `IdSet::any_in_range(min, max)` previously did `min as u64`, which wrapped past `max` for negative `min` and silently returned false - dropping the whole blob from the schedule before the per-element matcher ran. On positive-only production input (planet, Geofabrik) this never fired; on mixed-sign input (JOSM-staged data, hand-crafted PBFs) it silently lost positive matches. The fix clamps `min` to 0 (an `IdSet` only stores non-negative ids) and short-circuits when `max < 0`. See `DEVIATIONS.md` "Negative input IDs rejected project-wide" for the wider stance and the residual divergence from osmium (silent drop vs osmium's abs-fold for `IdSet::set` on negatives).
-- **renumber**: complete rewrite to an external-join architecture. Planet 3m25s, 3.3 GB peak RSS, zero temp disk. Negative input IDs are now rejected. Orphan refs (way refs / relation members absent from the input) are counted and surfaced in the summary.
-- **apply-changes**: new descriptor-first streaming pipeline and new parallel-pwrite writer backend (now the default). `-j/--jobs N` worker-count override. Planet daily diff 762s → 81s with the default backend; 135s with `--compression none`. `io_uring` and `--direct-io` remain opt-in. The buffered writer is no longer used on this path.
-- **build-geocode-index**: hard-errors when the cumulative admin-vertex byte offset would overflow `AdminPolygon.vertex_offset` (u32, ~4 GiB of admin-vertex data). Previously the accumulator silently wrapped, making every subsequent polygon's `vertex_offset` point at garbage. Error names the current offset and the step that would overflow, with a pointer to bump `vertex_offset` to u64 and increment `FORMAT_VERSION`. Sibling per-polygon `vertex_count` guard also added.
-- **build-geocode-index**: hard-errors on the same overflow class at `write_admin_index` (the `AdminCell.entries_offset` u32 accumulator) and on a pre-emptive `INTERIOR_FLAG` bit collision when `poly_index >= 2^31`. Both would silently produce wrong on-disk entries before; both now carry the same widen-and-bump diagnostic.
-- **io_uring writer: buffer-pool accounting under CQE error.** On a negative-result or short-write CQE, `reap_cqes` returned the error without releasing the registered buffer slot, leaking one slot per error CQE for the writer's lifetime. The writer typically tears down on error anyway (no observable user-visible bug in production), but the accounting inconsistency could surface as "no free buffers" in any code path that tried to observe pool state or continue past a soft error. Release is now unconditional.
+- **renumber**: complete rewrite to an external-join architecture. Planet 3m25s, 3.3 GB peak RSS, zero temp disk. Negative input IDs are rejected. Orphan refs (way refs / relation members absent from the input) are counted and surfaced in the summary.
+- **apply-changes**: new descriptor-first streaming pipeline and parallel-pwrite writer backend (now the default). `-j/--jobs N` worker-count override. Planet daily diff 762s → 81s with the default backend; 135s with `--compression none`. `io_uring` and `--direct-io` remain opt-in.
+- **build-geocode-index**: parallel Pass 2 / Pass 3. Planet 21m → 7m (-65%). Pass 1.5 peak anon 29.5 GB → 3.0 GB.
+- **build-geocode-index**: now hard-errors on three on-disk-format overflow classes (admin-vertex byte offset, admin-cell entries offset, per-cell / per-way `u16` counts) instead of silently producing wrong output. Error names the offending field and points at the `FORMAT_VERSION` bump path.
 - **check --refs**: parallel three-phase scan. Planet 1,225s → 70s (17.5×); Europe 426s → 34s (12.7×). Peak RSS 2.17 GB.
-- **check --ids**: parallel three-phase scan in both modes. `--full`: Europe 313s → 53s (5.9×). Streaming (default, non-`--full`) was previously OOM-killed at planet scale (29 GB peak anon in the underlying `for_each_pipelined` cross-thread `PrimitiveBlock` retention pattern); now uses the same per-blob shape as `--full` (without IdSet population) and bench-measured at planet **57s wall, 504 MB peak anon** (UUID `02595428`) - the lowest peak RSS of any `check --ids` variant. The element-level type-order check on non-indexed input is dropped (matches the existing `--full` semantics on non-indexed input - mixed-type-blob ordering is no longer flagged on inputs without indexdata; PBFs with indexdata get the offset-based check from both modes).
-- **cat --clean** / **cat --type X --clean**: parallel three-phase scan per kind, replacing the `into_blocks_pipelined` + `for_each_primitive_block_batch_budgeted` shape. The previous shape was OOM-killed at planet (28.9 GB peak anon at 32 s before SIGKILL, UUID `dirty` from 2026-04-26 overnight) - the documented `for_each_pipelined` cross-thread `PrimitiveBlock` retention pattern wasn't bounded by the batch-based mitigation. New shape: each worker pread's a blob from the file, decodes inline, applies `--clean`, frames the output, and main thread streams framed bytes to the writer in seq order via a `ReorderBuffer` (caps in-flight at ~decode-thread count regardless of input size). Bench-measured at planet **5m48s wall, 835 MB peak anon** (UUID `7c4e03eb`) - 35× peak-RSS reduction vs the failed run, planet-safe at the 28 GB-free reference host. Output is type-sorted (nodes first, then ways, then relations); for already type-sorted input (the production case) this preserves the existing structure, for unsorted input the output is re-sorted into type order. Mixed-type blobs (rare in practice) are split into up to three smaller output blobs.
+- **check --ids**: parallel three-phase scan in both modes. Streaming (default) was previously OOM-killed at planet; now planet-safe at 57s wall, 504 MB peak. `--full` Europe 313s → 53s (5.9×). The element-level type-order check on non-indexed input is dropped (matches the existing `--full` semantics; PBFs with indexdata get the offset-based check from both modes).
+- **cat --clean** / **cat --type X --clean**: parallel three-phase scan per kind, replacing a shape that was OOM-killed at planet. Now planet-safe at 5m48s wall, 835 MB peak. Output is type-sorted (nodes, ways, relations); already-sorted input keeps its structure, unsorted input is re-sorted, mixed-type blobs are split.
 - **diff** / **diff --format osc**: new `-j/--jobs N` for shard-parallel merge. Planet text 35m → 3m30s at `-j 16` (10.2×); `--format osc` 37m → 5m13s (7.1×). `-j 1` (default) keeps the sequential path.
 - **getid** include mode: header-walk fast path. Planet 44s → 7s (6.2×); disk read 88 GB → 636 MB.
 - **inspect** default metadata: header-walk fast path. Planet 21s → 6.5s.
-- **inspect --nodes** / **inspect --tags**: now parallel, with `-j/--jobs N`. Planet `--nodes -j 16` 57s (new); `--tags -j 16` 2m50s (new). Germany `--nodes -j 8` 18.5s → 3.6s.
-- **build-geocode-index**: parallel Pass 2 / Pass 3. Planet 21m → 7m (-65%). Pass 1.5 peak anon 29.5 GB → 3.0 GB.
-- **build-geocode-index**: hard-errors when per-cell or per-way counts exceed `u16::MAX` (previously silently truncated). Error names the offending cell/way.
-- **add-locations-to-ways `--index-type external`**: rewrite. Planet 24m → 11m (-55%).
-- **add-locations-to-ways `--index-type external`**: A1 rankless rewrite. The two-pass way scan + IdSet rank index is replaced by a single-pass IdRecord emission into 256 ID-buckets keyed by node-id range. Stage 2 streams a merge-walk against decoded node tuples instead of the rank-indexed counting-sort + `coord_slice` scatter. Planet 11m1s → 10m4s (-9%); europe 4m52s → 4m31s (-7%). The `IdSet::{rank, count_below, build_rank_index, drop_rank_index, rank_if_set}` calls are gone from this command; ~100 MB of rank-index RSS that pass A built and pass B consumed is no longer allocated. The 80+ GB of intermediate rank shards is replaced by the same total in id shards (record format unchanged at 12 bytes), so scratch sizing is identical.
+- **inspect --nodes** / **inspect --tags**: now parallel, with `-j/--jobs N`. Planet `--nodes -j 16` 57s; `--tags -j 16` 2m50s. Germany `--nodes -j 8` 18.5s → 3.6s.
+- **add-locations-to-ways `--index-type external`**: rewrite plus a follow-up rankless reshape. Planet 24m → 10m4s (-58%); Europe 4m52s → 4m31s. The `IdSet` rank machinery is no longer used by this command.
 - **extract** (all strategies): pass-1 blob schedule reused across subsequent passes. Europe smart 254s → 181s (-29%).
 - **getparents**: skip node-only blobs via `BlobFilter` when the query doesn't need nodes (~85% of blobs at planet scale).
 - **derive-changes**: streams output to temp files; constant memory regardless of diff size.
@@ -47,41 +34,32 @@
 
 ### Bug fixes
 
-- `has_indexdata` / `check_sorted_and_indexed` scanned every blob header instead of short-circuiting on the first OsmData blob. Fixed.
-- `BlobReader::seek_raw` caused ~10x file-size read amplification on header-walking paths via buffered `BufReader<File>`. Fixed.
-- Geocode `simplify_ring` Douglas-Peucker could exceed `max_vertices` due to metric divergence between cost and marking passes. Fixed.
-- `apply-changes --io-uring` on indexed input produced structurally-broken PBFs on the `CopyRange` fast-path. Fixed.
-- `cat --dedupe` silently dropped elements at kind boundaries. Fixed.
-- `sort` silently dropped elements at kind boundaries. Fixed.
-- `apply-changes --force` on a malformed non-indexed PBF could emit every remaining upsert of a kind as gap-creates before a single blob. Fixed.
-- `apply-changes --force` on non-indexed input could silently drop upsert modifications. Fixed.
-- Adversarial or truncated blob-header length prefix could abort the process via a multi-GB allocation. Fixed.
-- `inspect --show` returned "not found" on unsorted PBFs when the target element lived in a later blob with a smaller `min_id` than a preceding blob. Fixed.
-- `renumber` could panic or produce phantom orphans on PBFs containing negative IDs (via stale indexdata understating the range, or via inconsistent input whose relation member refs carry negatives while nodes/ways do not). Now hard-rejects at every `IdSet` entry point, with an error naming the offending element and the enclosing context.
-- `getid` rejected negative-id queries (e.g. `getid -- n-1`) with the misleading `"no IDs specified"` message - the parsed id was silently dropped at `IdSet::set` and the resulting empty set tripped the downstream "nothing to query" check. Now hard-rejects at parse time with `"getid requires non-negative input ids. Input contains node id -1. ..."`, naming the offending id and its kind. Matches osmium's getid behavior.
-- `renumber` left a partial output file on disk when an error surfaced mid-stream (pass1 count mismatch, stage 2d failure, relation rewrite failure, final flush). The output file is now removed on any error path.
-- Geocode builder Pass 3 leaked ~256 temp files per bucket directory on a mid-Stage-A panic or I/O error; the next build would sweep them via an unconditional remove at entry. Now cleaned up on every error path as well.
-- Geocode builder Pass 3 Stage B silently truncated trailing partial records when a Stage A bucket file write was interrupted (ENOSPC, SIGKILL during write), dropping real cell assignments with no diagnostic. Now errors with a message naming the incomplete file length.
-- `apply-changes` (and `merge`) now requires a base PBF with `Sort.Type_then_ID` in the header regardless of `--locations-on-ways`. Previously the general path accepted unsorted headers and could silently drop upsert creates on non-canonical input. If you hit this error on a previously-accepted file, re-sort the base with `pbfhogg sort`.
-- `renumber` no longer panics in `IdSet::set_atomic` when the PBF header advertises `Sort.Type_then_ID` but the node blobs are actually out of order. The per-command max-node-id bound now scans the full blob schedule rather than trusting "last blob's max_id == global max".
-- Multiple read sites in `renumber`, `apply-changes`, and the ALTW external pipeline now reject malformed input at the boundary instead of surfacing as a panic or silently scrambled output: a relation with truncated `memids` varints, a DenseNodes block with a `granularity * offset` product that would overflow `i64`, and an ALTW node blob whose indexdata advertises `max_id < min_id`.
-- `apply-changes --force --locations-on-ways` on a non-indexed PBF silently stripped LocationsOnWays data from base ways. Now rejected up front with a migration hint.
-- Parallel and io_uring writers could silently truncate output on upstream framer panic. Fixed.
-- `add-locations-to-ways --index-type external --force` on a non-indexed PBF failed with a confusing error deep inside the metadata scan. Now rejected up front with a migration hint.
-- Parallel `diff` / `derive-changes` leaked per-shard scratch temp files on worker error or panic. Fixed.
-- Truncated or corrupt-header PBFs produced past-EOF entries in classify schedules and failed much later inside pread workers. Fixed.
-- Concurrent pbfhogg processes against the same scratch directory could collide on temp file names. Fixed.
-- Temp files leaked on assembly error paths. Fixed.
-- `add-locations-to-ways --index-type external` could silently produce wrong coordinates on PBFs with loose blob indexdata. Now hard-errors naming the offending blob.
-- `add-locations-to-ways --index-type external` hit `EMFILE` on a default-ulimit shell. Fixed.
-- Parallel-pwrite cross-device passthrough copy could fail on a signal-interrupted `pread` instead of retrying, surfacing as a spurious I/O error when a signal (e.g. SIGWINCH) arrived during an EXDEV fallback. Fixed.
-- Parallel `derive-changes` scratch filenames could collide across concurrent `pbfhogg` processes when PIDs recycled in the same scratch directory (container restart). Process-lifetime random tag now included in the path.
-- `BlobReader::seek_raw` left iteration permanently stuck after a prior `next()` returned an error: the sticky `last_blob_ok` flag was never reset on successful seek, so `next()` returned `None` even though the user had recovered by seeking past the bad bytes. A successful `seek_raw` now clears the flag.
-- `removeid` (`getid --invert`) on a non-indexed PBF silently fell through to full decode + re-encode for every blob instead of using the raw-passthrough fast path (which is unreachable without indexdata). Now errors up front with a specific message unless `--force` is passed, matching `getid` include-mode behaviour. The previous `Warning: --force has no effect with --invert` message was incorrect - `--force` is the gate on this path - and has been removed.
-- `build-geocode-index` could drop admin inner rings (holes) on multi-outer relations when aggressive Douglas-Peucker simplification on the outer ring shifted the simplified boundary past the hole's first vertex. Hole-in-outer containment now tests against the original (unsimplified) outer polygon; rendered geometry stored on disk is unchanged (still simplified).
-- `inspect --direct-io` on an indexed PBF silently ignored the flag when the header-only fast path applied. Now prints a one-line stderr notice explaining that `HeaderWalker`'s `posix_fadvise(POSIX_FADV_RANDOM)` provides equivalent cache-avoidance on the fast path, and that the full-decode fallback still honours `--direct-io`.
-- `apply-changes` drain loop could spin indefinitely if a worker thread panicked mid-stream (e.g. OOM or an internal `unwrap`). The drain only exited once its reorder buffer was empty, but a panicking worker leaves seqs stuck ahead of the dropped seq so the buffer never drains. Loop now breaks on channel-disconnect unconditionally; the post-loop "channel closed with items in reorder buffer" error surfaces the real diagnostic and the outer `thread::scope` propagates the worker's panic. Note: the narrow `-j 1` worker-panic scenario still deadlocks at the scanner (no surviving worker to drain the candidate channel); that's tracked as a separate invariant gap.
-- `derive-changes -j N` (parallel OSC assembly, invoked via `diff --format osc`) leaked three outer aggregate XML temp files (`derive-par-{creates,modifies,deletes}-{pid}.xml.tmp`) on any error-path early-return (shard panic, sweep failure, flush failure). Fixed by wrapping each in `PathGuard::file()` per ADR-0003, so the files are removed on any `?`-bailout or panic unwind. Happy-path behavior unchanged.
+- **Negative input IDs are now rejected at the input boundary** in `renumber` (every `IdSet` entry point) and in `getid` (parse-time, matching osmium's getid). Previously `renumber` could panic or produce phantom orphans, and `getid` silently dropped negative-id queries with a misleading `"no IDs specified"` message. See `DEVIATIONS.md > "Negative input IDs rejected project-wide"` for the full project-wide stance.
+- **Truncated and adversarial PBF inputs now hard-error** instead of silently producing partial output. The contract covers `BlobReader::next`, `BlobReader::skip_blob_body`, `HeaderWalker::next_header`, and `FileReader::skip` (the caller-side payload-skip used by `has_indexdata`, `diff`, `cat --dedupe`, and `altw::passthrough`). Adversarial blob-header length prefixes can no longer trigger multi-GB allocations or process aborts. Truncated headers no longer produce past-EOF schedule entries that fail later inside pread workers. See `reference/truncation-handling.md`.
+- **Multiple read sites** in `renumber`, `apply-changes`, and the ALTW external pipeline now reject malformed input at the boundary instead of panicking or scrambling output: truncated relation `memids` varints, DenseNodes blocks whose `granularity * offset` would overflow `i64`, and ALTW node blobs whose indexdata advertises `max_id < min_id`.
+- **`apply-changes --io-uring`** on indexed input produced structurally-broken PBFs on the `CopyRange` fast-path. Fixed.
+- **`apply-changes` (and `merge`)** now require a base PBF with `Sort.Type_then_ID` in the header regardless of `--locations-on-ways`. The general path previously accepted unsorted headers and could silently drop upsert creates. Migration: re-sort with `pbfhogg sort`.
+- **`apply-changes --force` on non-indexed input** could silently drop upsert modifications, or emit every remaining upsert of a kind as gap-creates before a single blob. Fixed.
+- **`apply-changes --force --locations-on-ways` on a non-indexed PBF** silently stripped LocationsOnWays data from base ways. Now rejected up front with a migration hint.
+- **`apply-changes` drain loop** could spin indefinitely if a worker thread panicked mid-stream. The loop now breaks on channel-disconnect; the worker's panic propagates with a clear diagnostic.
+- **`cat --dedupe`** silently dropped elements at kind boundaries. Fixed.
+- **`sort`** silently dropped elements at kind boundaries. Fixed.
+- **`inspect --show`** returned "not found" on unsorted PBFs when the target element lived in a later blob with a smaller `min_id` than a preceding blob. Fixed.
+- **`inspect --direct-io`** on the indexed-PBF header-only fast path silently ignored the flag (the path uses `posix_fadvise(POSIX_FADV_RANDOM)` for equivalent cache-avoidance). Now prints a one-line stderr notice; the full-decode fallback honours the flag as before.
+- **`renumber`** no longer panics in `IdSet::set_atomic` when the header advertises `Sort.Type_then_ID` but the node blobs are out of order.
+- **`renumber`** removes its partial output file on every error path.
+- **`removeid`** (`getid --invert`) on a non-indexed PBF silently fell through to full decode + re-encode for every blob instead of using the (unreachable-without-indexdata) raw-passthrough fast path. Now errors up front unless `--force` is passed.
+- **`add-locations-to-ways --index-type external`** could silently produce wrong coordinates on PBFs with loose blob indexdata. Now hard-errors naming the offending blob.
+- **`add-locations-to-ways --index-type external --force` on a non-indexed PBF** failed with a confusing error deep inside the metadata scan. Now rejected up front with a migration hint.
+- **`add-locations-to-ways --index-type external`** hit `EMFILE` on a default-ulimit shell. Fixed.
+- **Geocode builder** could drop admin inner rings (holes) on multi-outer relations when aggressive Douglas-Peucker simplification on the outer ring shifted the simplified boundary past the hole's first vertex. Hole containment now tests against the original (unsimplified) outer polygon; rendered geometry on disk is unchanged.
+- **Geocode builder Pass 3 Stage B** silently truncated trailing partial records when a Stage A bucket file write was interrupted (ENOSPC, SIGKILL during write). Now errors with a message naming the incomplete file length.
+- **Geocode `simplify_ring`** Douglas-Peucker could exceed `max_vertices` due to metric divergence between cost and marking passes. Fixed.
+- **Parallel and io_uring writers** could silently truncate output on upstream framer panic. Fixed.
+- **Parallel-pwrite cross-device passthrough copy** could fail on a signal-interrupted `pread` instead of retrying. Fixed.
+- **`IdSet::any_in_range` blob prefilter** silently dropped any blob whose indexdata range straddles zero (negative `min`, positive `max`). Production input never triggers this; mixed-sign input (JOSM-staged data, hand-crafted PBFs) lost legitimate `getid` and ALTW external matches. Fixed.
+- **Scratch / temp file leaks** on error paths in parallel `diff`, parallel `derive-changes`, geocode Pass 3 buckets, and OSC assembly aggregates are now cleaned up by `PathGuard` RAII. Concurrent `pbfhogg` processes against the same scratch directory no longer collide on temp file names (PID + process-lifetime random tag in the path).
+- **`BlobReader::seek_raw`** left iteration permanently stuck after a prior `next()` returned an error. A successful `seek_raw` now clears the sticky error flag.
 
 ### Library
 
@@ -91,23 +69,25 @@
 
 - **`roaring` removed.** Both remaining consumers (`check --refs`, `check --ids --full`) migrated to `IdSet`.
 - `protohoggr` 0.2.1 → 0.4.0.
-- `hotpath` 0.14.1 → 0.15.
-- `io-uring`, `libc`, `rayon`, `clap`: patch/minor bumps.
 
 ### Performance highlights
 
 | Operation | Dataset | Time | vs 0.2.0 |
 |-----------|---------|------|----------|
 | cat (indexdata generation) | Planet 87 GB | 86.5s | -83% (5.8×) |
+| cat --clean | Planet 87 GB | 5m48s | OOM → planet-safe |
 | apply-changes (daily diff, default backend) | Planet 87 GB | 81s | -89% (9.4×) |
 | renumber | Planet 87 GB | 3m25s | new architecture |
 | build-geocode-index | Planet 87 GB | 7m12s | -65% (2.9×) |
 | check --refs | Planet 87 GB | 70s | -94% (17.5×) |
+| check --ids (streaming) | Planet 87 GB | 57s | OOM → planet-safe |
 | diff `-j 16` (text) | Planet 87 GB | 3m30s | -90% (10.2×) |
 | diff `--format osc -j 16` | Planet 87 GB | 5m13s | -86% (7.1×) |
 | getid (include mode) | Planet 87 GB | 7s | -86% (6.2×) |
 | inspect (default) | Planet 87 GB | 6.5s | -70% (3.3×) |
-| add-locations-to-ways external | Planet 87 GB | 11m | -55% |
+| inspect --nodes `-j 16` | Planet 87 GB | 57s | new |
+| inspect --tags `-j 16` | Planet 87 GB | 2m50s | new |
+| add-locations-to-ways external | Planet 87 GB | 10m4s | -58% |
 | extract --smart | Europe 35 GB | 3m01s | -29% |
 
 ## 0.2.0 - 2026-04-09

@@ -109,11 +109,10 @@ The skeleton has exactly two sections. `Context`, `Consequences`, and
 
 ## Index
 
-- [ADR-0001](0001-organize-bug-sweep-by-policy-cluster.md) -
-  Organize bug-sweep residue by policy cluster, not subsystem.
 - [ADR-0002](0002-negative-ids-rejected-project-wide.md) - Negative
-  input IDs rejected project-wide; hard reject in renumber,
-  `debug_assert` in diff / derive shard planners.
+  input IDs rejected project-wide; hard reject in renumber and
+  getid, `debug_assert` in diff / derive shard planners, silent
+  inheritance through `IdSet` for tags-filter / altw-external.
 - [ADR-0003](0003-error-path-hygiene-via-pathguard.md) - Error path
   hygiene via a shared `PathGuard` RAII primitive plus a
   counters-after-write rule.

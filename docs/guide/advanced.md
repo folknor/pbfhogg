@@ -121,5 +121,5 @@ The index can be queried from Rust using the `geocode-reader` feature:
 
 ```toml
 [dependencies]
-pbfhogg = { version = "0.2", default-features = false, features = ["geocode-reader"] }
+pbfhogg = { version = "0.3", default-features = false, features = ["geocode-reader"] }
 ```

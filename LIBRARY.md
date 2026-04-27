@@ -12,21 +12,21 @@ For the CLI toolkit (`pbfhogg-cli`), see [the CLI crate](https://crates.io/crate
 
 ```toml
 [dependencies]
-pbfhogg = "0.2"
+pbfhogg = "0.3"
 ```
 
-Library users who only need read/write can disable the `commands` feature to skip `serde_json`, `roaring`, and `s2` dependencies:
+Library users who only need read/write can disable the `commands` feature to skip `serde_json` and `s2` dependencies:
 
 ```toml
 [dependencies]
-pbfhogg = { version = "0.2", default-features = false }
+pbfhogg = { version = "0.3", default-features = false }
 ```
 
 For reverse geocoding queries (memory-mapped index reader), enable just the `geocode-reader` feature:
 
 ```toml
 [dependencies]
-pbfhogg = { version = "0.2", default-features = false, features = ["geocode-reader"] }
+pbfhogg = { version = "0.3", default-features = false, features = ["geocode-reader"] }
 ```
 
 ### Reading
@@ -127,7 +127,7 @@ writer.flush()?;
 
 | Feature | Description |
 |---------|-------------|
-| `commands` (default) | Enables `check_refs`, `extract`, geocode index builder, and their deps (`roaring`, `serde_json`, `s2`) |
+| `commands` (default) | Enables `check_refs`, `extract`, geocode index builder, and their deps (`serde_json`, `s2`) |
 | `geocode-reader` | Enables `geocode_index::Reader` for reverse geocoding queries (depends on `s2`). Included by `commands`. |
 | `linux-direct-io` | O_DIRECT read/write paths - bypasses page cache for planet-scale I/O |
 | `linux-io-uring` | io_uring writer with registered buffers - 20% faster writes above ~4 GB |

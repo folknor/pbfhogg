@@ -43,6 +43,7 @@ Every command listed below runs on the full planet on normal hardware. Measured 
 | `apply-changes --locations-on-ways` (daily diff) | 2m15s | ~3.3 GB |
 | `build-geocode-index` | 7m5s | ~25 GB |
 | `cat` (indexdata generation) | 1m26s | ~200 MB |
+| `cat --clean version` | 5m48s | 835 MB |
 | `cat --dedupe` | 2h13m | 1.4 GB |
 | `cat --type way` (raw passthrough) | 45s | 10 MB |
 | `check --ids` (streaming, default) | 57s | 504 MB |
@@ -82,7 +83,6 @@ The goal for pbfhogg 1.0 is that every CLI command must be planet-scale safe on 
 | Command | Status | Note |
 |---------|--------|------|
 | `time-filter` | OOM at ~94 s wall | Bench runs against a regular planet PBF (history-PBF dataset not yet configured); see [TODO.md](TODO.md) |
-| `cat --clean` | OOM at ~33 s wall | Forces the full-decode / re-frame path that bypasses raw passthrough |
 | `tags-filter --invert-match w/highway=primary` | 28.3 GB peak anon (no headroom) | Essentially the entire ways table is kept; runs to completion on a 28 GB-free host but cannot tolerate concurrent workloads |
 
 ## Usage

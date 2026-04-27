@@ -110,23 +110,25 @@ that are not currently driven by `overnight.sh`.
 
 ### 1.0 blockers (planet OOM or RSS-exceeds-ceiling, 2026-04-26 overnight)
 
-Three commands remain after `check --ids` streaming was fixed
-2026-04-27 (commit `516129e`, see "Done" subsection below). All three
-either OOM'd at planet or ran with no headroom against the 28 GB-free
-reference host. Mirrored in the README's "Not yet planet-safe" table.
+Two commands remain after `check --ids` streaming and `cat --clean`
+were fixed 2026-04-27 (commits `516129e` and `b347c0a`, see "Done"
+notes below each entry). Both attempt planet bench runs with no
+headroom against the 28 GB-free reference host. Mirrored in the
+README's "Not yet planet-safe" table.
 
-**Two of the three share a single root cause**: the documented
-cross-thread `PrimitiveBlock` retention pattern in `src/read/pipeline.rs`
-(`run_pipeline` doc-comment lines 66-89, "**25+ GB of heap retention**"
-at planet scale). `for_each_pipelined` allocates `WireStringTable::entries`
-(~10 KB per block) on rayon decode threads and drops them on the consumer
-thread; glibc/jemalloc don't return the freed pages to the OS, accumulating
-as anon RSS. The doc explicitly notes this was "**measured and verified
-across glibc, jemalloc, and multiple `MALLOC_ARENA_MAX` configurations**"
-- so `mallopt(M_ARENA_MAX, 2)` is **not** a fix here, it's a different
-mitigation that helps allocation-heavy workloads (`check --refs`, `--full`
-mode, `renumber_external`). The overnight was the first planet-scale test
-of these commands, which is why the architectural debt only surfaced now.
+**`time-filter` shares the documented cross-thread `PrimitiveBlock`
+retention pattern** in `src/read/pipeline.rs` (`run_pipeline`
+doc-comment lines 66-89, "**25+ GB of heap retention**" at planet
+scale). `for_each_pipelined` allocates `WireStringTable::entries`
+(~10 KB per block) on rayon decode threads and drops them on the
+consumer thread; glibc/jemalloc don't return the freed pages to
+the OS, accumulating as anon RSS. The doc notes this was "**measured
+and verified across glibc, jemalloc, and multiple `MALLOC_ARENA_MAX`
+configurations**" - so `mallopt(M_ARENA_MAX, 2)` is **not** a fix
+here. The fix template is the `verify_ids` / `cat --clean` pattern
+(rewire onto `parallel_classify_phase` per kind, stream output via
+`ReorderBuffer`) but time-filter has structural constraints that
+make it harder; see the entry below.
 
 - [x] ~~**`check --ids` (streaming default mode)**~~ - **fixed
   2026-04-27** (commit `516129e`). Rewrote streaming entry to use
@@ -138,20 +140,19 @@ of these commands, which is why the architectural debt only surfaced now.
   input: element-level type-order detection (mixed-type-blob
   ordering) dropped, matching `--full`'s existing semantics on
   non-indexed input.
-- [ ] **`cat --clean`** - SIGKILL at 33 s. Uses
-  `into_blocks_pipelined` + `for_each_primitive_block_batch_budgeted`
-  at `src/commands/cat/mod.rs:373`. The batch-based consumer is the
-  "partial mitigation" path called out in `pipeline.rs:84-86`, but
-  it's still hitting the retention ceiling - the writer thread
-  becomes the bottleneck on `--clean`'s full re-frame and batches
-  accumulate. Same shape as the existing planet OOM on `cat --type`
-  filtered path noted in `reference/performance.md:60`. No sidecar
-  preserved; needs a re-run to confirm the bottleneck is downstream
-  of the batch boundary (suspected) vs upstream (would mean
-  batch-based mitigation insufficient even with backpressure). Fix
-  candidates: bound the writer's rayon pool depth, drop to
-  sequential decode (`for_each` instead of pipelined), or rework to
-  use `parallel_classify_phase` per kind.
+- [x] ~~**`cat --clean`**~~ - **fixed 2026-04-27** (commits
+  `6184602` + `b347c0a`). Rewrote `cat_filtered` to use
+  `parallel_classify_phase` per kind (mirroring the verify_ids
+  template) with the per-blob framed output streamed via
+  `ReorderBuffer` so that planet-scale phase output isn't
+  accumulated up-front (the first cut accumulated all framed
+  blobs before writing - 47K node blobs × ~1.6 MB framed each
+  ≈ 75 GB ceiling - and OOM'd at 28.9 GB on its own). Re-bench:
+  planet **5m48s wall, 835 MB peak anon** (UUID `7c4e03eb`) vs
+  the failed 32 s SIGKILL at 28.9 GB - 35× peak-RSS reduction.
+  Output ordering is type-sorted (nodes, then ways, then
+  relations); preserves structure on already-type-sorted input,
+  re-sorts unsorted input.
 - [ ] **`time-filter`** - SIGKILL at 94 s. Uses `for_each_pipelined`
   at `src/commands/time_filter/mod.rs:154`. **`mallopt(M_ARENA_MAX, 2)`
   is explicitly off-limits here** per the existing comment at

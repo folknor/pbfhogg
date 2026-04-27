@@ -57,9 +57,14 @@ the same output shape. Passthrough remains buffered-only; `--direct-io`
 adds alignment overhead without the concurrent read/write pattern that
 makes it faster for merge.
 
-The `--type` filtered path (full decode+re-encode) **OOMs on planet** (87 GB) on
-30 GB host at ~25% through. Pipelined writer's rayon pool lacks backpressure.
-Works on europe (32.4 GB).
+The `--type` filtered path (full decode+re-encode) and the `--clean`
+path now use `parallel_classify_phase` per kind with framed-output
+streamed via `ReorderBuffer` (commits `6184602` + `b347c0a`,
+2026-04-27). Planet `cat --clean version`: **5m48s wall, 835 MB peak
+anon** (UUID `7c4e03eb`). The earlier `into_blocks_pipelined`
++ batch shape OOM'd at planet (~25 % through, 28.9 GB peak before
+SIGKILL) - hit the documented `for_each_pipelined` cross-thread
+`PrimitiveBlock` retention pattern with no path back.
 
 ## Read throughput
 
@@ -429,6 +434,7 @@ cross-reference.
 | cat (indexdata generation) | `--bench 1` | **86.5 s** | `5d90623f` | 497 s → **5.8×** |
 | cat --type way | `--bench 3` | 45.3 s | `2fe62148` | 44 s (noise) |
 | cat --type relation | `--bench 1` | 47.7 s | `fba6e13e` (commit `16e3694`) | first stored measurement |
+| cat --clean version | `--bench 1` | **348.1 s (5m48s)** | `7c4e03eb` (commit `b347c0a`, 2026-04-27) | first stored measurement; previously OOM-killed at 28.9 GB peak via the same `for_each_pipelined` retention pattern that broke streaming `check --ids`, fixed 2026-04-27 by porting to `parallel_classify_phase` + reorder-buffer streaming |
 | cat --dedupe | `--bench 1` | **7,981 s (133m)** | `1794f8a6` (commit `16e3694`) | first stored measurement; single-threaded MERGEPBF path - see callout below |
 | check --refs | `--bench 1` | **53.8 s** | `7d9f5dfd` (commit `16e3694`) | 72 s → −25.3 % |
 | check --ids (streaming, default) | `--bench 1` | **57.3 s** | `02595428` (commit `516129e`, 2026-04-27) | first stored measurement; previously OOM-killed at 29.2 GB peak anon via `for_each_pipelined`, fix landed 2026-04-27 |

@@ -217,7 +217,10 @@ impl BlockBuilder {
     ///
     /// Panics if `cap == 0`.
     pub fn with_element_cap(cap: usize) -> Self {
-        assert!(cap > 0, "BlockBuilder element cap must be > 0");
+        assert!(
+            cap > 0,
+            "BlockBuilder::with_element_cap: --elements-per-blob must be > 0"
+        );
         // dense_keys_vals carries 2*N entries on average for tagless nodes
         // (one key/val pair plus a 0 delimiter is more typical, but the
         // historical pre-alloc is 2*cap; preserved here). saturating_mul

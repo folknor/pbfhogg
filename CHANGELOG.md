@@ -11,7 +11,9 @@
   same-corpus-different-encoding pairs for the blob-density measurement
   matrix (`reference/blob-density.md`). v1 fires the cap per worker
   invocation, so growing beyond the input blob size requires
-  cross-input-blob coalescing (deferred).
+  cross-input-blob coalescing (deferred). When the cap exceeds every
+  input blob (no-op grow attempt), repack emits a stderr warning so
+  the silent-identity outcome is visible.
 
 ### Library API
 

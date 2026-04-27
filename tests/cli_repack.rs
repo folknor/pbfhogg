@@ -190,7 +190,9 @@ fn repack_rejects_zero_cap() {
 /// At a cap larger than the input's per-blob element count, repack is a
 /// per-input-blob identity: element-equivalent output, with output blob
 /// count equal to input blob count (each worker emits one output blob
-/// because the cap never fires).
+/// because the cap never fires). The CLI also emits a stderr warning so
+/// users running `--elements-per-blob 64000` against a Geofabrik input
+/// don't silently get the same blob layout back.
 #[test]
 fn repack_large_cap_preserves_input_blob_layout() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -200,7 +202,8 @@ fn repack_large_cap_preserves_input_blob_layout() {
     write_repack_fixture(&input);
     // Cap larger than any input blob: each worker emits exactly one
     // partial output blob carrying all elements of that input blob.
-    run_repack(&input, &output, 8000);
+    let out = run_repack(&input, &output, 8000);
+    out.assert_stderr_contains("--elements-per-blob 8000 never fired");
 
     let original = read_normalized(&input);
     let repacked = read_normalized(&output);
@@ -217,4 +220,22 @@ fn repack_large_cap_preserves_input_blob_layout() {
     assert_eq!(node_blobs, 3);
     assert_eq!(way_blobs, 1);
     assert_eq!(rel_blobs, 1);
+}
+
+/// On a shrink (cap=10 vs input 20/blob) the cap fires on every input
+/// blob, so the no-op-cap warning must NOT appear. Regression sentinel
+/// against false positives on the cap-fires path.
+#[test]
+fn repack_no_warning_when_cap_fires() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    write_repack_fixture(&input);
+    let out = run_repack(&input, &output, 10);
+    let stderr = out.stderr_str();
+    assert!(
+        !stderr.contains("never fired"),
+        "no-op-cap warning should not fire on a real shrink; stderr was:\n{stderr}"
+    );
 }

@@ -133,7 +133,7 @@ pbfhogg sort [OPTIONS] --output <OUTPUT> <FILE>
 
 ### repack
 
-> **Unreleased** — lands in the next pbfhogg release after 0.3.0.
+> **Unreleased** - lands in the next pbfhogg release after 0.3.0.
 
 Re-encode a PBF with a configurable per-blob element cap. Element semantics, tags, refs, members, metadata, and DenseNodes encoding all round-trip; output is type-sorted and propagates `Sort.Type_then_ID` from the input header.
 

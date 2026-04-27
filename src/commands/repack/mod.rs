@@ -19,7 +19,11 @@
 //! ~228 k/blob -> 8 k/blob) one input blob produces multiple output
 //! blobs and the cap fires correctly; this is the blob-density
 //! measurement use case. To grow (8 k/blob -> 64 k/blob) cross-input-
-//! blob coalescing would be needed and is deferred to v2.
+//! blob coalescing would be needed and is deferred to v2. Grow attempts
+//! that produce no actual repacking (cap exceeds every input blob) emit
+//! a stderr warning at end-of-run so the silent-identity outcome is
+//! visible to users running e.g. `--elements-per-blob 64000` against a
+//! Geofabrik input.
 
 use std::path::Path;
 
@@ -113,9 +117,10 @@ pub fn repack(
 
     let mut blobs_written: u64 = 0;
     let mut elements_written: u64 = 0;
+    let mut cap_fired = false;
 
     crate::debug::emit_marker("REPACK_NODES_START");
-    let (b, e) = run_kind_phase(
+    let (b, e, cf) = run_kind_phase(
         &shared_file,
         &node_schedule,
         KIND_NODE,
@@ -125,10 +130,11 @@ pub fn repack(
     )?;
     blobs_written += b;
     elements_written += e;
+    cap_fired |= cf;
     crate::debug::emit_marker("REPACK_NODES_END");
 
     crate::debug::emit_marker("REPACK_WAYS_START");
-    let (b, e) = run_kind_phase(
+    let (b, e, cf) = run_kind_phase(
         &shared_file,
         &way_schedule,
         KIND_WAY,
@@ -138,10 +144,11 @@ pub fn repack(
     )?;
     blobs_written += b;
     elements_written += e;
+    cap_fired |= cf;
     crate::debug::emit_marker("REPACK_WAYS_END");
 
     crate::debug::emit_marker("REPACK_RELATIONS_START");
-    let (b, e) = run_kind_phase(
+    let (b, e, cf) = run_kind_phase(
         &shared_file,
         &rel_schedule,
         KIND_RELATION,
@@ -151,6 +158,7 @@ pub fn repack(
     )?;
     blobs_written += b;
     elements_written += e;
+    cap_fired |= cf;
     crate::debug::emit_marker("REPACK_RELATIONS_END");
 
     writer.flush()?;
@@ -159,6 +167,20 @@ pub fn repack(
     {
         crate::debug::emit_counter("repack_blobs_written", blobs_written as i64);
         crate::debug::emit_counter("repack_elements_written", elements_written as i64);
+    }
+
+    // Detect the silent-identity surprise: --elements-per-blob N exceeds the
+    // largest input blob, so v1's per-worker cap never fires and the output
+    // blob layout matches the input. Only meaningful when there was real work
+    // to do (elements_written > 0); a fully-empty-of-elements input would
+    // also have cap_fired == false but is not a no-op grow attempt.
+    if !cap_fired && elements_written > 0 {
+        eprintln!(
+            "Warning: --elements-per-blob {elements_per_blob} never fired; \
+             cap exceeds the largest input blob, so the output blob layout \
+             matches the input. v1 cannot grow blobs across input-blob \
+             boundaries (deferred to v2)."
+        );
     }
 
     Ok(RepackStats {
@@ -172,6 +194,12 @@ pub fn repack(
 /// caller's element cap) + frame each input blob's matching elements;
 /// main thread streams framed bytes to the writer in seq order via a
 /// `ReorderBuffer`.
+///
+/// Returns `(blobs_written, elements_written, cap_fired)`. `cap_fired` is
+/// `true` if any worker emitted >1 output blob from a single input blob,
+/// which under v1's per-worker semantics is exactly when the element cap
+/// was applied. The caller uses this to detect silent-identity grow
+/// attempts (cap exceeds every input blob).
 #[allow(clippy::too_many_lines)]
 fn run_kind_phase(
     shared_file: &std::sync::Arc<std::fs::File>,
@@ -180,17 +208,18 @@ fn run_kind_phase(
     elements_per_blob: usize,
     compression: Compression,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
-) -> Result<(u64, u64)> {
+) -> Result<(u64, u64, bool)> {
     use crate::reorder_buffer::ReorderBuffer;
 
     if schedule.is_empty() {
-        return Ok((0, 0));
+        return Ok((0, 0, false));
     }
 
     type PhaseResult = std::result::Result<(Vec<Vec<u8>>, u64), String>;
     let mut reorder: ReorderBuffer<PhaseResult> = ReorderBuffer::with_capacity(64);
     let mut total_blobs: u64 = 0;
     let mut total_elements: u64 = 0;
+    let mut cap_fired = false;
     let mut write_error: Option<Box<dyn std::error::Error>> = None;
     let mut classify_error: Option<String> = None;
 
@@ -275,6 +304,9 @@ fn run_kind_phase(
             while let Some(r) = reorder.pop_ready() {
                 match r {
                     Ok((framed, count)) => {
+                        if framed.len() > 1 {
+                            cap_fired = true;
+                        }
                         if write_error.is_some() {
                             continue;
                         }
@@ -304,5 +336,5 @@ fn run_kind_phase(
         return Err(e.into());
     }
 
-    Ok((total_blobs, total_elements))
+    Ok((total_blobs, total_elements, cap_fired))
 }

@@ -72,7 +72,7 @@ Three commands write temp files to the output's parent directory: `add-locations
 
 `multi-extract --smart` is the closest to the ceiling among the planet-safe rows at 22.9 GB peak anon - the per-region working set accumulates across the 5 regions.
 
-Per-command phase breakdowns and optimization history are in [reference/performance.md](reference/performance.md). Note that recorded results always track the latest git head and may not match the released version.
+Per-command phase breakdowns are in [reference/performance.md](reference/performance.md); per-command optimization arcs and retired phase breakdowns at older architectures are in [reference/performance-history.md](reference/performance-history.md). Note that recorded results always track the latest git head and may not match the released version.
 
 The goal for pbfhogg 1.0 is that every CLI command must be planet-scale safe on a 32GB RAM host (28-ish free GB.)
 

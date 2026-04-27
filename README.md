@@ -148,6 +148,7 @@ pbfhogg check <file> --ids                Validate ID uniqueness and ordering
 pbfhogg check <file> --refs               Validate referential integrity
 pbfhogg cat <files...> -o <out>           Concatenate PBFs (-t node,way,relation to filter)
 pbfhogg sort <file> -o <out>              Sort into standard order (nodes, ways, relations by ID)
+pbfhogg repack <file> -o <out>            Re-encode at a configurable --elements-per-blob N cap
 pbfhogg renumber <file> -o <out>          Renumber all IDs sequentially, remap cross-references
 pbfhogg extract <file> -o <out> -b <bbox> Extract by bounding box
 pbfhogg extract <file> -o <out> -p <geo>  Extract by GeoJSON polygon

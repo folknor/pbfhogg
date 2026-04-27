@@ -133,6 +133,29 @@ pbfhogg sort [OPTIONS] --output <OUTPUT> <FILE>
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
+### repack
+
+Re-encode a PBF with a configurable per-blob element cap. Element semantics, tags, refs, members, metadata, and DenseNodes encoding all round-trip; output is type-sorted and propagates `Sort.Type_then_ID` from the input header.
+
+Primary use case: producing same-corpus-different-encoding pairs for blob-density measurement (Geofabrik's ~8 k/blob convention vs `planet.openstreetmap.org`'s ~228 k/blob), so commands with implicit blob-count scaling (`HeaderWalker`-based paths in particular) can be measured at controlled densities.
+
+```
+pbfhogg repack [OPTIONS] --output <OUTPUT> <FILE>
+```
+
+| Flag | Description |
+|------|-------------|
+| `-o, --output <FILE>` | Output file |
+| `--elements-per-blob <N>` | Per-blob element cap [default: 8000]. `8000` matches the osmium / Geofabrik convention; pass a larger value to approximate `planet.openstreetmap.org`-style packing. Must be > 0. |
+| `--compression` | Blob compression [default: zlib] |
+| `--direct-io` | Use O_DIRECT to bypass page cache |
+| `--io-uring` | Use io_uring for output I/O |
+| `--force` | Proceed even if input lacks indexdata |
+| `--generator` | Override writing program name |
+| `--output-header <K=V>` | Set output header fields (repeatable) |
+
+**v1 limitation:** the cap fires per worker invocation, so output blobs cannot grow beyond the input blob size. Shrinking (e.g. planet 228 k -> 8 k) produces multiple output blobs per input blob and the cap fires correctly. Growing (e.g. europe 8 k -> 64 k) emits at-most-input-sized output blobs; cross-input-blob coalescing is deferred to v2.
+
 ### renumber
 
 Renumber all element IDs sequentially, remapping cross-references (way node refs, relation member refs).
@@ -399,6 +422,7 @@ Which commands support `--direct-io` (O_DIRECT bypass of page cache) and `--io-u
 | cat | Yes | Yes | Yes (R+W) | - | Passthrough + filtered paths |
 | cat --dedupe | Yes | Yes | Yes (R+W) | Yes | Via merge-pbf path |
 | sort | Yes | Yes | Yes (R+W) | Yes | |
+| repack | Yes | Yes | Yes (R+W) | Yes | Re-encode at configurable elements-per-blob cap |
 | renumber | Yes | Yes | Yes (R+W) | - | |
 | extract | Yes | Yes | Yes (R+W) | - | All strategies |
 | tags-filter | Yes | Yes | Yes (R+W) | - | Both single-pass and two-pass |

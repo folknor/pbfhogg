@@ -131,6 +131,31 @@ pbfhogg sort [OPTIONS] --output <OUTPUT> <FILE>
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
+### repack
+
+> **Unreleased** — lands in the next pbfhogg release after 0.3.0.
+
+Re-encode a PBF with a configurable per-blob element cap. Element semantics, tags, refs, members, metadata, and DenseNodes encoding all round-trip; output is type-sorted and propagates `Sort.Type_then_ID` from the input header.
+
+Primary use case: producing same-corpus-different-encoding pairs for blob-density measurement (Geofabrik's ~8 k/blob convention vs `planet.openstreetmap.org`'s ~228 k/blob), so commands with implicit blob-count scaling can be measured at controlled densities.
+
+```
+pbfhogg repack [OPTIONS] --output <OUTPUT> <FILE>
+```
+
+| Flag | Description |
+|------|-------------|
+| `-o, --output <FILE>` | Output file |
+| `--elements-per-blob <N>` | Per-blob element cap [default: 8000]. `8000` matches the osmium / Geofabrik convention; pass a larger value to approximate `planet.openstreetmap.org`-style packing. Must be > 0. |
+| `--compression` | Blob compression [default: zlib] |
+| `--direct-io` | Use O_DIRECT to bypass page cache |
+| `--io-uring` | Use io_uring for output I/O |
+| `--force` | Proceed even if input lacks indexdata |
+| `--generator` | Override writing program name |
+| `--output-header <K=V>` | Set output header fields (repeatable) |
+
+**v1 limitation:** the cap fires per worker invocation, so output blobs cannot grow beyond the input blob size. Shrinking (e.g. planet 228 k -> 8 k) produces multiple output blobs per input blob and the cap fires correctly. Growing (e.g. europe 8 k -> 64 k) emits at-most-input-sized output blobs; cross-input-blob coalescing is deferred to v2.
+
 ### renumber
 
 Renumber all element IDs sequentially, remapping cross-references (way node refs, relation member refs).

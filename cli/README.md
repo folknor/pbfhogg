@@ -18,6 +18,7 @@ Requires Rust 1.87+. The binary is called `pbfhogg`.
 | `check` | Validate IDs and referential integrity |
 | `cat` | Concatenate PBFs with optional type filtering; `--dedupe` for sorted merge |
 | `sort` | Sort into standard order (nodes, ways, relations by ID) |
+| `repack` | Re-encode a PBF at a configurable `--elements-per-blob N` cap |
 | `extract` | Extract by bounding box or GeoJSON polygon (simple/complete/smart) |
 | `tags-filter` | Filter elements by tag expressions (also supports OSC input) |
 | `diff` | Compare two PBFs; `--format osc` generates an OSC diff |

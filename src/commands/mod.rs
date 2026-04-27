@@ -11,6 +11,7 @@ pub mod inspect;
 pub mod apply_changes;
 pub mod merge_changes;
 pub mod renumber;
+pub mod repack;
 pub mod sort;
 pub mod tags_count;
 pub mod tags_filter;

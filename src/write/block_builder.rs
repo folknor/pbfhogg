@@ -4,7 +4,10 @@
 //! protobuf `PrimitiveBlock` bytes suitable for [`PbfWriter`](crate::writer::PbfWriter).
 //!
 //! Handles string table construction, delta encoding, dense node packing,
-//! and block size limits (8000 entities per block, matching osmium).
+//! and per-block element caps. The default cap is 8000 (matching osmium);
+//! [`BlockBuilder::with_element_cap`] picks a different cap, used by
+//! [`pbfhogg::repack`](crate::commands::repack) to produce alternate-density
+//! re-encodings.
 
 use crate::blob_meta::{BlobIndex, ElemKind};
 use crate::PrimitiveBlock;
@@ -29,8 +32,9 @@ use super::string_table::StringTable;
 // the type was lifted into its own sibling module.
 pub use crate::write::header_builder::HeaderBuilder;
 
-/// Maximum number of entities in a single `PrimitiveBlock`.
-/// Matches osmium's hardcoded limit.
+/// Default per-block element cap. Matches osmium's hardcoded limit; the
+/// PBF interop convention. Callers that need a different cap construct
+/// the builder via [`BlockBuilder::with_element_cap`].
 const MAX_ENTITIES_PER_BLOCK: usize = 8000;
 
 // ---------------------------------------------------------------------------
@@ -108,9 +112,10 @@ pub(super) fn member_type_value(mt: MemberType) -> i32 {
 
 /// Builds `PrimitiveBlock` protobuf messages for PBF output.
 ///
-/// Elements are added one at a time. When the block reaches the limit
-/// (8000 entities), [`should_flush`](Self::should_flush) returns `true`
-/// and [`take`](Self::take) should be called to serialize and reset.
+/// Elements are added one at a time. When the block reaches the cap
+/// (default 8000 entities; configurable via [`Self::with_element_cap`]),
+/// [`should_flush`](Self::should_flush) returns `true` and
+/// [`take`](Self::take) should be called to serialize and reset.
 ///
 /// Each block contains only one element type (nodes OR ways OR relations).
 /// Adding a different type when the block is non-empty will panic - the
@@ -119,6 +124,7 @@ pub struct BlockBuilder {
     string_table: StringTable,
     block_type: Option<BlockType>,
     count: usize,
+    cap: usize,
 
     // ID range tracking for BlobIndex (avoids scan_block_ids on the write path).
     min_id: i64,
@@ -185,31 +191,43 @@ impl Default for BlockBuilder {
 }
 
 impl BlockBuilder {
-    /// Create a new, empty block builder.
+    /// Create a new, empty block builder with the default 8000-entity cap.
     ///
-    /// Dense node vectors are pre-allocated to `MAX_ENTITIES_PER_BLOCK` (8000)
-    /// capacity because a full dense-node block will contain exactly that many
-    /// entries. Without pre-allocation, each Vec would grow through several
-    /// doublings (0 -> 1 -> 2 -> 4 -> ... -> 8192), causing O(log N)
-    /// reallocations and memcpys per block. Pre-allocating avoids this entirely
-    /// for the common case where blocks are filled to capacity.
-    ///
-    /// `dense_keys_vals` is pre-allocated to 16000 (2 * MAX_ENTITIES_PER_BLOCK).
-    /// Each node contributes at least one entry (the 0 delimiter), and nodes
-    /// with tags contribute 2 * num_tags + 1 entries. An estimate of ~2 tags
-    /// per node on average gives (2 * 2 + 1) * 8000 = 40000, but many nodes
-    /// are tagless (especially in dense areas), so 16000 is a pragmatic middle
-    /// ground that avoids most reallocations without over-allocating.
-    ///
-    /// Wire-format scratch buffers (`group_buf`, `elem_scratch`, etc.) are left
-    /// at zero capacity because each block is single-type: if the block is a
-    /// dense-nodes block, these buffers are never used at all. Way/relation
-    /// blocks grow as needed via the standard doubling strategy.
+    /// Equivalent to `BlockBuilder::with_element_cap(8000)`.
     pub fn new() -> Self {
+        Self::with_element_cap(MAX_ENTITIES_PER_BLOCK)
+    }
+
+    /// Create a new, empty block builder with a caller-supplied per-block
+    /// element cap.
+    ///
+    /// Used by [`pbfhogg::repack`](crate::commands::repack) to produce PBFs
+    /// with alternate blob densities. The default 8000 matches osmium and
+    /// is the PBF interop convention; overriding to larger values matches
+    /// `planet.openstreetmap.org`-style densities (~228 k entities/blob),
+    /// overriding to smaller values exercises blob-count-bound code paths.
+    ///
+    /// Dense node vectors are pre-allocated to `cap` to avoid reallocations
+    /// through the doubling growth strategy when the block fills. Wire-format
+    /// scratch buffers (`group_buf`, `elem_scratch`, ...) are left at zero
+    /// capacity: each block is single-type, so dense-node blocks never touch
+    /// them and way/relation blocks grow as needed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cap == 0`.
+    pub fn with_element_cap(cap: usize) -> Self {
+        assert!(cap > 0, "BlockBuilder element cap must be > 0");
+        // dense_keys_vals carries 2*N entries on average for tagless nodes
+        // (one key/val pair plus a 0 delimiter is more typical, but the
+        // historical pre-alloc is 2*cap; preserved here). saturating_mul
+        // guards against pathological caps near usize::MAX.
+        let kv_cap = cap.saturating_mul(2);
         BlockBuilder {
             string_table: StringTable::new(),
             block_type: None,
             count: 0,
+            cap,
             min_id: i64::MAX,
             max_id: i64::MIN,
             min_lat: i32::MAX,
@@ -221,25 +239,19 @@ impl BlockBuilder {
             tag_key_scratch: Vec::new(),
             last_tagdata: None,
 
-            // Pre-allocate dense node vectors to the max block size (8000).
-            // One entry per node for each of id, lat, lon.
-            dense_ids: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK),
-            dense_lats: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK),
-            dense_lons: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK),
-            // Interleaved key/val string indices plus delimiters - see doc comment above.
-            dense_keys_vals: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK * 2),
+            dense_ids: Vec::with_capacity(cap),
+            dense_lats: Vec::with_capacity(cap),
+            dense_lons: Vec::with_capacity(cap),
+            dense_keys_vals: Vec::with_capacity(kv_cap),
 
-            // Pre-allocate dense metadata vectors to max block size.
-            // One entry per node for each metadata field.
-            dense_versions: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK),
-            dense_timestamps: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK),
-            dense_changesets: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK),
-            dense_uids: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK),
-            dense_user_sids: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK),
-            dense_visibles: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK),
+            dense_versions: Vec::with_capacity(cap),
+            dense_timestamps: Vec::with_capacity(cap),
+            dense_changesets: Vec::with_capacity(cap),
+            dense_uids: Vec::with_capacity(cap),
+            dense_user_sids: Vec::with_capacity(cap),
+            dense_visibles: Vec::with_capacity(cap),
             has_dense_metadata: false,
 
-            // Delta encoding state - reset to zero for each new block.
             last_dense_id: 0,
             last_dense_lat: 0,
             last_dense_lon: 0,
@@ -248,9 +260,6 @@ impl BlockBuilder {
             last_dense_uid: 0,
             last_dense_user_sid: 0,
 
-            // Wire-format scratch buffers - left at zero capacity since
-            // way/relation blocks will grow as needed, and dense-node blocks
-            // never use them.
             group_buf: Vec::new(),
             elem_scratch: Vec::new(),
             packed_scratch: Vec::new(),
@@ -301,10 +310,11 @@ impl BlockBuilder {
         self.pre_seeded
     }
 
-    /// Returns `true` if the block has reached the entity limit (8000).
+    /// Returns `true` if the block has reached its per-block element cap
+    /// (default 8000; configurable via [`Self::with_element_cap`]).
     #[inline]
     pub fn should_flush(&self) -> bool {
-        self.count >= MAX_ENTITIES_PER_BLOCK
+        self.count >= self.cap
     }
 
     /// Returns `true` if a node can be added to the current block.

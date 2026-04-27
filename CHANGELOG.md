@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Commands
+
+- **repack**: new command. Re-encode a PBF with a configurable
+  `--elements-per-blob N` cap. Element semantics, tags, refs, members,
+  metadata, and DenseNodes encoding round-trip; output is type-sorted
+  and propagates `Sort.Type_then_ID`. Primary use case: producing
+  same-corpus-different-encoding pairs for the blob-density measurement
+  matrix (`reference/blob-density.md`). v1 fires the cap per worker
+  invocation, so growing beyond the input blob size requires
+  cross-input-blob coalescing (deferred).
+
+### Library API
+
+- `BlockBuilder::with_element_cap(n)` constructor for callers that need
+  a non-default per-block element cap. `BlockBuilder::new()` keeps the
+  8000 default.
+
 ## 0.3.0 - 2026-04-27
 
 ### Breaking changes

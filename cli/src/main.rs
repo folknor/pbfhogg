@@ -142,6 +142,38 @@ enum Command {
         #[command(flatten)]
         header: HeaderOverrideArg,
     },
+    /// Re-encode a PBF with a different per-blob element cap.
+    ///
+    /// Element semantics, tags, refs, members, metadata, and DenseNodes
+    /// encoding all round-trip. Output is type-sorted (nodes, ways,
+    /// relations); the `Sort.Type_then_ID` flag is propagated when the
+    /// input has it.
+    ///
+    /// Primary use case: producing same-corpus-different-encoding pairs
+    /// for the blob-density measurement matrix. v1 only fires the cap
+    /// on shrinks (cap < input blob size); growing across input blobs
+    /// is deferred to v2.
+    Repack {
+        /// Input PBF file
+        file: PathBuf,
+        #[command(flatten)]
+        output: OutputArg,
+        /// Per-blob element cap. Default 8000 matches the PBF interop
+        /// convention; passing 8000 against a `planet.openstreetmap.org`-
+        /// packed input (~228 k/blob) produces a Geofabrik-style packing.
+        #[arg(long = "elements-per-blob", default_value_t = 8000)]
+        elements_per_blob: usize,
+        #[command(flatten)]
+        compression: CompressionArg,
+        #[command(flatten)]
+        io: DirectIoArg,
+        #[command(flatten)]
+        uring: UringArg,
+        #[command(flatten)]
+        force: ForceArg,
+        #[command(flatten)]
+        header: HeaderOverrideArg,
+    },
     /// Renumber all element IDs sequentially, remapping cross-references.
     ///
     /// Input must be sorted. Negative IDs (JOSM editor-local staging
@@ -755,6 +787,25 @@ fn main() -> process::ExitCode {
         } => run_sort(
             &file,
             &output.output,
+            &compression.compression,
+            io.direct_io,
+            uring.io_uring,
+            force.force,
+            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
+        ),
+        Command::Repack {
+            file,
+            output,
+            elements_per_blob,
+            compression,
+            io,
+            uring,
+            force,
+            header,
+        } => run_repack(
+            &file,
+            &output.output,
+            elements_per_blob,
             &compression.compression,
             io.direct_io,
             uring.io_uring,
@@ -1496,6 +1547,32 @@ fn run_sort(
         force,
     };
     let stats = pbfhogg::sort::sort(file, output, &opts, overrides)?;
+    stats.print_summary();
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_repack(
+    file: &std::path::Path,
+    output: &std::path::Path,
+    elements_per_blob: usize,
+    compression: &str,
+    direct_io: bool,
+    io_uring: bool,
+    force: bool,
+    overrides: &HeaderOverrides,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let compression: Compression = compression.parse()?;
+    let stats = pbfhogg::repack::repack(
+        file,
+        output,
+        elements_per_blob,
+        compression,
+        direct_io,
+        io_uring,
+        force,
+        overrides,
+    )?;
     stats.print_summary();
     Ok(())
 }

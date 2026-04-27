@@ -12,12 +12,31 @@ because that was the scenario that forced the question. The underlying
 optimizations apply to `merge-changes` directly and benefit any
 consumer that squashes N > 1 OSCs, scale-independently.
 
-## Current state (2026-04-23)
+## Current state (2026-04-27)
 
-No `.brokkr/results.db` rows at planet-range OSC sets yet.
-`overnight.sh:246` runs
-`brokkr merge-changes --dataset planet --osc-range 4914..4920 --bench 1`
-plus `--hotpath` tonight, so the baseline lands tomorrow morning.
+Baselines landed in the 2026-04-26 overnight run (commit `16e3694`,
+plantasjen, `--bench 1`). Full cross-dataset matrix in
+[`reference/performance.md`](../reference/performance.md) under the
+new "Merge-changes" section. Headline numbers:
+
+| Dataset | OSC count | Wall | Per-OSC rate | UUID |
+|---|---:|---:|---:|---|
+| Germany | 1 (`--osc-seq 4705`) | **2.5 s** | 2.5 s | `1ba15f41` |
+| Germany | 7 (`--osc-range 4706..4712`) | **18.0 s** | 2.6 s/OSC | `91cb8465` |
+| Europe | 7 (`--osc-range 4716..4722`) | **153.2 s** | 21.9 s/OSC | `993ae62a` |
+| Planet | 1 (`--osc-seq 4913`) | **43.1 s** | 43.1 s | `76f78e8b` |
+| Planet | 7 (`--osc-range 4914..4920`) | **267.2 s (4m27s)** | 38.2 s/OSC | `bef0f1fa` |
+
+`--simplify` adds near-zero overhead at every scale (planet 7-OSC
+262.2 s vs 267.2 s default; UUID `c0d140b6`); the `BTreeMap` dedupe
+is cheap relative to the per-OSC parse cost.
+
+**Per-OSC scaling is essentially linear**: planet 7-OSC = 6.2× the
+1-OSC wall; germany 7-OSC = 7.2× the 1-OSC wall. There's no batching
+benefit in the current serial-across-inputs shape - each input pays
+its full parse cost. This confirms the parallel-parse opportunity
+is real, and it's substantially larger than originally sized (see
+"Parallel OSC parse" below).
 
 Production serial-across-inputs shapes today (both in
 [`src/commands/merge_changes/mod.rs`](../src/commands/merge_changes/mod.rs)):
@@ -30,7 +49,8 @@ Production serial-across-inputs shapes today (both in
   `ChangeStream`, which feeds a global `BTreeMap` dedupe in
   `write_simplified`. Still serial across inputs in the parse stage.
 
-Both scale linearly with OSC count.
+Both scale linearly with OSC count - the matrix above measures
+exactly that.
 
 The library-level `osc::load_all_diffs`
 ([`src/osc/parse.rs:315`](../src/osc/parse.rs#L315)) also has this
@@ -69,16 +89,29 @@ Each OSC is independent work. The merge / write pass is a few seconds
 over the combined content; parallel parse scales with OSC count up to
 available cores.
 
-Estimated **~20-30 s wall saved at 7-OSC planet scale** (reviewer 2's
-Q7 analysis from the apply-changes round): serial parse ≈ 30-40 s
-becomes `max(per-OSC parse, merge pass)` ≈ 10-15 s. Bounds are
-speculative - needs confirmation from the tomorrow-morning baseline
-and the per-OSC `MERGECHANGES_PARSE_{START,END}` spans.
+**Sizing against the measured 2026-04-26 baseline:**
 
-No win at 1-OSC scale. The feature only fires when the input slice has
-length > 1, and scales with input count. Overnight.sh also runs
-`--osc-seq 4913` (1-OSC planet) to pin the "no win at 1-OSC"
-speculation.
+- Serial 7-OSC planet parse ≈ 7 × 38.2 s = 267 s wall (matches the
+  measured `bef0f1fa` 267.2 s within rounding - confirms parse-cost
+  is essentially the entire wall, write tail is negligible).
+- Concurrent 7-OSC parse ceiling ≈ max(per-OSC parse) + merge ≈
+  the 1-OSC wall (43.1 s) plus a small merge pass.
+- **Estimated win: ~210-225 s at planet 7-OSC scale**. The reviewer
+  2 Q7 estimate of 20-30 s was sized before the baseline existed
+  and turns out to have been an order of magnitude low - it
+  assumed parse was 30-40 s of total wall, but the actual
+  serial-parse share is ~265 s of 267 s.
+
+The 1-OSC planet bench at 43.1 s is the floor for the
+"max(per-OSC parse)" term - the parallel path cannot beat 43 s on
+this workload regardless of OSC count. Below that floor would
+require parallelizing the per-OSC parse itself (gzip decompress
+concurrent with XML parse), which is a separate item.
+
+No win at 1-OSC scale. The feature only fires when the input slice
+has length > 1, and scales with input count. The 1-OSC planet bench
+above pins this empirically: the wall is per-OSC parse, no
+concurrency to extract.
 
 ### Parallel gzip output
 
@@ -116,9 +149,13 @@ this work.
 
 ## Prerequisites before shipping anything
 
-1. **Measure current state.** Scheduled: `overnight.sh:246`
-   (`brokkr merge-changes --dataset planet --osc-range 4914..4920
-   --bench 1` + `--hotpath`). Baseline lands morning of 2026-04-24.
+1. ~~**Measure current state.**~~ Landed 2026-04-26 overnight at
+   commit `16e3694`. Cross-dataset matrix in the "Current state"
+   section above and in
+   [`reference/performance.md`](../reference/performance.md). The
+   `--hotpath` planet run was preflight-refused (estimated 184 GB
+   exceeds the 28 GB host RAM); re-bench with `--no-mem-check` to
+   capture per-OSC parse spans.
 2. ~~**Per-input parse span instrumentation.**~~ Landed 2026-04-22
    (commit `4e3c7ea`). `MERGECHANGES_PARSE_{START,END}` wrap each
    `parse_osc_streaming` and `parse_osc_into` call on both

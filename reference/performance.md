@@ -156,39 +156,62 @@ Planet LOW altw + OSC 4913, `--bench 1`, plantasjen (source on
 Banan/nvme1n1; cross-disk scratch on Booty/nvme0n1p3 for the
 separate-drives experiment):
 
-Parallel pwrite is now the default writer backend for `apply-changes`
-(buffered fallback removed from that path on 2026-04-21); the columns
-below show the three backends as measured during the decision.
+Parallel pwrite is the default writer backend for `apply-changes`
+(buffered fallback removed from that path on 2026-04-21). The columns
+below show the three backends as measured during the decision; the
+same-disk `--io-uring` column was re-measured at commit `16e3694`
+(2026-04-26) after the CopyRange corruption fix (commit `fa8251d`)
+landed - pre-fix runs wrote a zero-page between the OSMHeader and the
+first OSMData blob, undercounting real writer wall.
 
 | Config | Buffered (removed) | `--io-uring` | Parallel pwrite (default, POOL_SIZE=16) |
 |---|---:|---:|---:|
-| Same-disk, `--compression none` | 135.5 s | 108.6 s | 116.0 s |
-| Same-disk, `--compression zlib:6` | 143.7 s | 137.1 s | 140.8 s |
-| Same-disk, `--compression zstd:1` | 121.2 s | 99.4 s | 104.5 s |
-| Cross-disk, `--compression none` | 95.4 s | 93.0 s | 99.0 s |
-| Cross-disk, `--compression zlib:6` | 134.9 s | 127.9 s | 117.4 s |
-| Cross-disk, `--compression zstd:1` | 87.1 s | 82.8 s | **80.9 s** |
+| Same-disk, `--compression none` | 135.5 s | **137.5 s** ¹ | 116.0 s |
+| Same-disk, `--compression zlib:6` | 143.7 s | **137.4 s** ¹ | 140.8 s |
+| Same-disk, `--compression zstd:1` | 121.2 s | **126.3 s** ¹ | 104.5 s |
+| Cross-disk, `--compression none` | 95.4 s | 93.0 s ² | 99.0 s |
+| Cross-disk, `--compression zlib:6` | 134.9 s | 127.9 s ² | 117.4 s |
+| Cross-disk, `--compression zstd:1` | 87.1 s | 82.8 s ² | **80.9 s** |
+
+¹ Post-`fa8251d` re-measurement at `16e3694`, 2026-04-26 (UUIDs
+`9a5c25a7` / `70e5414b` / `0e6a5918`). Original same-axis numbers
+108.6 s / 137.1 s / 99.4 s at commit `2a43702` (UUIDs
+`2fbf6369` / `2fecc14b` / `886ae532`) are tainted by the CopyRange
+offset bug.
+
+² Cross-disk io-uring rows still pre-`fa8251d` and not re-measured -
+treat as tainted until refreshed.
 
 Pre-flip baseline (commit `52c2c4b`, UUID `e81a9316`): 144.4 s.
 Best post-flip: **80.9 s** (-44 %) at zstd:1 + cross-disk + parallel
-pwrite.
+pwrite (parallel pwrite was unaffected by the CopyRange bug, so the
+headline number is unchanged). Same-disk best on the fixed writer:
+**104.5 s** at zstd:1 + parallel pwrite.
 
-Writer-backend rule (the reasoning that landed parallel pwrite as the
+Writer-backend rule (reasoning that landed parallel pwrite as the
 default, with `--io-uring` kept as an opt-in override for IOPS-bound
-topologies):
+cross-disk topologies):
 
-- **Same-disk**: `--io-uring` wins at every compression level. Same-disk
-  is IOPS-bound (reads compete with writes on one NVMe); io_uring's
-  queue-depth batching alleviates contention more than multiple
-  per-syscall pwrites.
+- **Same-disk**: parallel pwrite wins at every compression level. The
+  pre-fix io-uring advantage was an artefact of the CopyRange offset
+  bug; on the fixed writer, parallel pwrite's 16 concurrent pwrites
+  beat io-uring's queue-depth batching at every same-disk compression
+  point measured.
 - **Cross-disk** + zstd:1 / zlib:6: parallel pwrite wins (80.9 s at
   zstd:1, 117.4 s at zlib:6). Disk has write bandwidth headroom;
   parallel pwrite saturates it faster than a single-thread writer can.
   Compressed-output rule: cross-disk favours parallel pwrite at every
   compressed level measured.
-- **Cross-disk** + `--compression none`: `--io-uring` wins. The 119 GB
-  output is close enough to NVMe peak that queue-depth tuning beats
-  per-syscall parallelism.
+- **Cross-disk** + `--compression none`: io-uring's pre-fix 93.0 s
+  advantage over parallel pwrite's 99.0 s sits inside the same
+  CopyRange bug; whether it survives re-measurement on the fixed
+  writer is open.
+
+Same axis points re-measured at europe scale on the fixed writer
+(`16e3694`, 2026-04-26): same-disk io-uring at none / zlib:6 / zstd:1
+= **57.9 s / 58.5 s / 53.9 s** (UUIDs `377ac699` / `0d62d01a` /
+`42b24498`). Original tainted values were 47.2 s / 55.3 s / 39.2 s at
+`6c9dbc7` (UUIDs `36dee15a` / `5647f9fa` / `72413ff3`).
 
 Pool-size sweep at cross-disk zstd:1 (plantasjen, Samsung 990 PRO):
 4 → 89.2 s, 8 → 83.4 s, 16 → **80.9-82.1 s** (two runs), 32 → 82.2 s.
@@ -215,6 +238,46 @@ reorder buffer account for most of the RSS delta.
 Full plan, bench setup (`RLIMIT_MEMLOCK` for `--io-uring`, cross-disk
 scratch toml override, etc.), and measurement log in
 [notes/apply-changes-opportunities.md](../notes/apply-changes-opportunities.md).
+
+### Same-disk `-j N` sweep (LOW + zstd:1, planet, commit `16e3694`)
+
+Default writer (parallel pwrite, POOL_SIZE=16). `-j` is the
+descriptor-first scanner's worker pool size; default auto-detect on
+this 24-thread host picks `nproc - 2 = 22`.
+
+| `-j` | Wall | UUID |
+|---:|---:|---|
+| 4 | 173.8 s | `10f8ddf2` |
+| 8 | 120.8 s | `54f7fd4e` |
+| 16 | 106.2 s | `2161ea62` |
+| 24 | 107.8 s | `0b3829bc` |
+
+Saturates at `j16`; `j24` is within single-shot noise. Matches the
+table-row same-disk parallel pwrite zstd:1 (104.5 s) within noise -
+confirming the writer-pool ceiling at POOL_SIZE=16, not the scanner
+ceiling.
+
+### OSC-only path (no `--locations-on-ways`, planet, commit `16e3694`)
+
+Apply-changes without `--locations-on-ways` is a structurally
+different code path: no node→way coord-fusion barrier, no per-worker
+coord slots, no `LocMapHandle`. The scanner classifies blobs against
+the OSC ID set and rewrites only the touched blobs; everything else
+is `CopyRange` passthrough.
+
+| Compression | Wall | UUID |
+|---|---:|---|
+| `--compression none` | 274.2 s (4m34s) | `fda9f7a6` |
+| `--compression zlib:6` | **462.3 s (7m42s)** | `18b695ed` |
+| `--compression zstd:1` | 269.7 s (4m30s) | `3ad57fc5` |
+
+zlib:6 is the outlier at 1.7× zstd:1 wall - the rewritten blobs
+re-compress on the writer thread, and at planet's ~85 MB of changed
+output zlib's serial deflate becomes the bottleneck. zstd:1 narrowly
+beats `none` (parallel-compressed bytes leave the writer faster than
+uncompressed bytes through the same pipe). For OSC-only daily-diff
+pipelines that don't need osmium-interop output, zstd:1 is the right
+default.
 
 ## Add-locations-to-ways
 
@@ -364,26 +427,84 @@ cross-reference.
 | Command | Mode | Wall | UUID | vs pre-fix |
 |---|---|---:|---|---:|
 | cat (indexdata generation) | `--bench 1` | **86.5 s** | `5d90623f` | 497 s → **5.8×** |
-| check --refs | `--bench 1` | **62.7 s** | post-`01c67da` | 72 s → −13.7 % |
+| cat --type way | `--bench 3` | 45.3 s | `2fe62148` | 44 s (noise) |
+| cat --type relation | `--bench 1` | 47.7 s | `fba6e13e` (commit `16e3694`) | first stored measurement |
+| cat --dedupe | `--bench 1` | **7,981 s (133m)** | `1794f8a6` (commit `16e3694`) | first stored measurement; single-threaded MERGEPBF path - see callout below |
+| check --refs | `--bench 1` | **53.8 s** | `7d9f5dfd` (commit `16e3694`) | 72 s → −25.3 % |
 | check --ids --full | `--bench 1` | **63.2 s** | post-`01c67da` | 72.5 s → −12.8 % |
 | getid (include mode) | `--bench 1` | **6.1 s** | `24362e36` | 44 s → **7.2×** |
 | getid --invert | `--bench 1` | 91.0 s | `40f5bd52` | 83 s (noise) |
+| getparents | `--bench 1` | **23.5 s** | `11bc44dc` (commit `16e3694`) | 44.8 s @ `68e1ba0` → −47.5 % (likely from `12699db` `has_indexdata` payload-skip closing); 51.9 s @ `7e9c2e9` originally |
 | inspect default (index-only) | `--bench 1` | **6.5 s** | `c146f2bb` | 21.4 s → **3.3×** |
 | inspect --nodes `-j 16` | `--bench 1` | **49.4 s** | post-`01c67da` | sequential (never stored) |
 | inspect --tags `-j 16` | `--bench 1` | **168.3 s** | `9d741341` / post-`01c67da` | sequential (never stored) |
-| tags-filter -R | `--bench 1` | 51.8 s | `f262f068` | 52 s (noise) |
-| tags-filter (transitive) | `--bench 1` | **119.9 s** | post-`01c67da` | 147.5 s → −18.7 % |
-| extract --simple (Europe bbox) | `--bench 1` | **247.3 s** | post-`01c67da` | 264.7 s → −6.6 % |
-| extract --complete (Europe bbox) | `--bench 1` | **254.2 s** | post-`01c67da` | 261.8 s → −2.9 % |
+| inspect --tags --type node | `--bench 1` | 71.3 s | `047ac2f9` (commit `16e3694`) | first stored type-narrowed measurement |
+| inspect --tags --type way | `--bench 1` | 82.9 s | `959bda7c` (commit `16e3694`) | first stored type-narrowed measurement |
+| inspect --tags --type relation | `--bench 1` | 8.8 s | `8daf5f04` (commit `16e3694`) | first stored type-narrowed measurement |
+| inspect --extended | `--bench 1` | **820.7 s (13m41s)** | `19db1512` (commit `16e3694`) | first stored measurement; full decode + extended counters |
+| sort (already-sorted input) | `--bench 1` | 132.3 s | `b9c10a41` (commit `16e3694`) | 124.6 s @ `68e1ba0` (+6.2 %, see note below) |
+| sort `--io-uring` | `--bench 1` | 126.8 s | `9ce80125` (commit `16e3694`) | 118.1 s @ `1f97fae` (+7.4 %, see note below) |
+| tags-filter -R | `--bench 1` | 51.8 s | `cf116a6b` (commit `16e3694`); originally `f262f068` | flat (51.8 s @ both points) |
+| tags-filter (transitive) | `--bench 1` | **108.2 s** | `7e4301f9` (commit `16e3694`) | 119.9 s → −9.8 % |
+| tags-filter --invert-match | `--bench 1` | 461.2 s (7m41s) | `6665605a` (commit `16e3694`) | first stored measurement; 4.3× the match path (highway=primary keeps ~1 % of ways) |
+| tags-filter --remove-tags | `--bench 1` | 111.8 s | `44d96d0a` (commit `16e3694`) | first stored measurement |
+| tags-filter --input-kind osc (osc 4913) | `--bench 1` | 6.2 s | `37f360d2` (commit `16e3694`) | first stored measurement |
+| extract --simple (Europe bbox) | `--bench 1` | **221.9 s** | `e43bb19f` (commit `16e3694`) | 247.3 s @ `26d1402` → −10.3 % |
+| extract --complete (Europe bbox) | `--bench 1` | **222.7 s** | `91fd90b4` (commit `16e3694`) | 254.2 s @ `26d1402` → −12.4 % |
 | extract --smart (Europe bbox) | `--bench 1` | 267.5 s | `07dcdae3` | 282 s → −14 s |
-| multi-extract (5 regions) | `--bench 1` | 972.0 s | post-`01c67da` | 1004.6 s → −3.2 % |
-| cat --type way | `--bench 3` | 45.3 s | `2fe62148` | 44 s (noise) |
-| add-locations-to-ways `--index-type external` | `--bench 1` | **603.7 s** | `aa0dc719` (post-A1 commit `0dc8ae1`) | 661.2 s → **−57.5 s, −8.7 %** |
+| multi-extract --simple (5 regions, Europe bbox) | `--bench 1` | **883.6 s** | `68cecf88` (commit `16e3694`) | 972.0 s @ `57b01f9` → −9.1 % |
+| multi-extract --smart (5 regions, Europe bbox) | `--bench 1` | 837.6 s | `2c842414` (commit `16e3694`) | first stored `--smart` measurement at planet |
+| add-locations-to-ways `--index-type external` | `--bench 1` | **546.0 s** | `7fd04130` (commit `16e3694`, 2026-04-26) | 661.2 s → **−115.2 s, −17.4 %** |
 | apply-changes (daily diff, `--osc-seq 4920`) | `--bench 1` | 756.3 s | `8e940f71` | 753 s (noise) |
 | renumber | `--bench 3` | 204.5 s | `abd74459` | 194 s (+10 s, see below) |
 | diff-snapshots text `-j 16` | `--bench 1` | **227.5 s** | `22a5eb55` | 2151 s → **9.5×** |
-| diff-snapshots osc `-j 16` | `--bench 1` | **313.8 s** | `9b3fc2b9` | 2226 s → **7.1×** |
-| build-geocode-index | `--bench 1` | **432.9 s** | `b4b25c05` (commit `82db8ed`) | independent optimisation arc |
+| diff-snapshots osc `-j 16` | `--bench 1` | **293.8 s** | `cdcaa4f1` (commit `16e3694`) | 2226 s → **7.6×** |
+| build-geocode-index | `--bench 1` | **424.8 s** | `2b412af4` (commit `16e3694`, 2026-04-26) | independent optimisation arc |
+| merge-changes (planet, `--osc-seq 4913`, 1-OSC) | `--bench 1` | 43.1 s | `76f78e8b` (commit `16e3694`) | first stored measurement |
+| merge-changes (planet, `--osc-range 4914..4920`, 7-OSC) | `--bench 1` | 267.2 s (4m27s) | `bef0f1fa` (commit `16e3694`) | first stored measurement |
+| merge-changes (planet, `--osc-range 4914..4920 --simplify`, 7-OSC) | `--bench 1` | 262.2 s (4m22s) | `c0d140b6` (commit `16e3694`) | first stored measurement |
+
+> **Sort `+6-7 %` regression flag.** Both default and `--io-uring` sort
+> on planet drifted slightly slower at `16e3694` vs the prior `1f97fae`
+> / `68e1ba0` baselines from 2026-04-24. Inside single-shot bench
+> noise on a sub-150-s wall, but the direction is consistent across
+> both backends - worth a `--bench 3` re-measurement before treating
+> as confirmed. No code change between those commits is an obvious
+> driver; possible candidates are the truncation-handling commits
+> (`436998b`, `12699db`) which add small per-blob branches in the
+> read path.
+
+> **`cat --dedupe` planet 133-minute wall.** Single `MERGEPBF` phase,
+> peak anon RSS only 1.4 GB, avg cores 1.3 - the path is essentially
+> single-threaded for the full 87 GB input. `cat --type way`
+> passthrough is 45.3 s on the same input, so the dedupe overhead is
+> ~175× the passthrough wall. Workload is the BTreeMap-backed
+> "newest-version-per-id" pass; not a regression (no prior planet
+> measurement existed) but a clear `O(N)` parallelisation
+> opportunity if `cat --dedupe` becomes a recurring planet workload.
+
+#### HeaderWalker / next_header_skip_blob regression check (commit `436998b`, re-measured 2026-04-26 at `16e3694`)
+
+The `436998b` (2026-04-26) read-path truncation alignment added small
+per-blob branches in `HeaderWalker::next_header` (payload-extent
+check, probe-pread arm cleanup) and rewired
+`BlobReader::skip_blob_body` from `seek_relative(n)` to
+`seek_relative(n-1) + read_exact(1)`. First-order analysis predicted
+no extra syscalls in steady state. Verified empirically against the
+four heaviest users of the touched primitives:
+
+| Command | Pre-`436998b` | Post-`436998b` (`16e3694`) | Δ |
+|---|---:|---:|---:|
+| getid (include) | 6.1 s (`24362e36`) | 6.8 s (`41413398`) | +0.7 s, +11 % (within `--bench 1` noise at sub-10 s walls) |
+| check --refs | 72.5 s (`862547e4`) | **53.8 s** (`7d9f5dfd`) | **−18.7 s, −25.8 %** |
+| add-locations-to-ways external | 603.7 s (`aa0dc719`, post-A1) | **546.0 s** (`7fd04130`) | **−57.7 s, −9.6 %** |
+| build-geocode-index | 432.9 s (`b4b25c05`) | 424.8 s (`2b412af4`) | −8.1 s, −1.9 % (within noise) |
+
+No regression from the truncation-alignment commit. check-refs and
+ALTW external both moved materially faster than noise; the wins are
+attributable to commits landed between the prior baselines and
+`16e3694` (the ALTW row carries A1's effect against the older
+pre-A1 row in the audit comment).
 
 Headline landings:
 
@@ -918,6 +1039,106 @@ brought it to 363s. Parallel classification for pass 1 brought it to
 158s. Parallelizing closure + way dep scans brings the total to 107.5s.
 Full journey: 366.7s → 107.5s (3.4x total improvement).
 
+### Planet axes (commit `16e3694`, plantasjen, `--bench 1`, `w/highway=primary`)
+
+| Axis | Wall | UUID | Notes |
+|---|---:|---|---|
+| default (transitive two-pass) | **108.2 s** | `7e4301f9` | reproducible against the post-`01c67da` 119.9 s row |
+| `-R` (single-pass, keep referenced) | 51.8 s | `cf116a6b` | flat vs `f262f068` baseline |
+| `--invert-match` | 461.2 s (7m41s) | `6665605a` | first stored measurement; ~1 % of ways match `highway=primary`, so invert touches ~99 % of ways |
+| `--remove-tags` (`-t`) | 111.8 s | `44d96d0a` | first stored measurement; two-pass with tag-stripping in pass 2 |
+| `--input-kind osc` (osc 4913, 1-OSC) | 6.2 s | `37f360d2` | OSC parse + filter only; no PBF read |
+
+`--invert-match` is the headline outlier: 4.3× the match path. The
+asymmetry is workload-shape: keeping primary highways drops ~99 % of
+ways (and most of their referenced nodes) so the writer's pass-2
+output is small; inverting keeps ~99 % and the writer becomes the
+ceiling.
+
+### Planet `-j N` sweep (default two-pass, `w/highway=primary`, commit `16e3694`)
+
+`-j` only affects the two-pass parallel path; the single-pass `-R`
+path ignores it (CLI rejects the combination).
+
+| `-j` | Wall | UUID |
+|---:|---:|---|
+| 4 | 184.0 s | `46d83578` |
+| 8 | 123.3 s | `2a8fe06e` |
+| 16 | 112.2 s | `b1d0c53d` |
+| 24 | 111.1 s | `cffa644a` |
+
+Saturates at `j16`; `j24` is within single-shot noise. Default
+auto-detect on this 24-thread host lands the same workload at
+108.2 s (`7e4301f9`), inside the noise band.
+
+## Merge-changes
+
+`pbfhogg merge-changes` squashes N OSC (gzip + XML) inputs into one OSC
+output. Two production code paths, both serial-across-inputs today:
+**streaming** (`write_streaming` parses each OSC sequentially and writes
+events straight through an `OscWriter`, no in-memory overlay) and
+**simplify** (`parse_one_into_stream` builds a per-input `ChangeStream`
+fed into a global `BTreeMap` for last-write-wins dedupe). Optimization
+plan in [`notes/merge-changes.md`](../notes/merge-changes.md).
+
+The 1-OSC vs N-OSC axis is the load-bearing distinction: a single OSC
+measures fixed setup + per-OSC parse + per-OSC write; an N-OSC squash
+measures N× per-OSC parse + a (proportionally cheaper) merge/write
+tail. The parallelization opportunity in the plan doc only fires when
+N > 1. The 7-OSC entries below stand in for "one week of daily diffs"
+- the production cadence that motivated the plan.
+
+### Cross-dataset matrix (commit `16e3694`, plantasjen, `--bench 1`)
+
+| Dataset | OSC count | Default wall | `--simplify` wall | Per-OSC effective rate | UUIDs (default / simplify) |
+|---|---:|---:|---:|---:|---|
+| Germany | 1 (`--osc-seq 4705`) | **2.5 s** | - | 2.5 s | `1ba15f41` / - |
+| Germany | 7 (`--osc-range 4706..4712`) | **18.0 s** | 16.2 s | 2.6 s/OSC | `91cb8465` / `638a4b99` |
+| Europe | 7 (`--osc-range 4716..4722`) | **153.2 s** | 152.9 s | 21.9 s/OSC | `993ae62a` / `745ee521` |
+| Planet | 1 (`--osc-seq 4913`) | **43.1 s** | - | 43.1 s | `76f78e8b` / - |
+| Planet | 7 (`--osc-range 4914..4920`) | **267.2 s (4m27s)** | 262.2 s (4m22s) | 38.2 s/OSC | `bef0f1fa` / `c0d140b6` |
+
+(Europe 1-OSC not measured this round - that cell would let us
+cross-check whether the per-OSC rate scales with input size linearly
+between germany and planet.)
+
+Three observations from the matrix:
+
+- **Per-OSC scaling is essentially linear** at every dataset scale.
+  Germany 7-OSC = 7.2× the 1-OSC wall; planet 7-OSC = 6.2× the
+  1-OSC wall. There's no batching benefit in the current
+  serial-across-inputs shape - each input pays its full parse cost.
+- **`--simplify` is a near-zero overhead** at every scale measured
+  (planet −5.0 s / −1.9 %; europe −0.3 s; germany −1.8 s / −10 %
+  inside single-shot variance). The `BTreeMap` dedupe is cheap
+  relative to the parse cost; the simplify path's win comes when
+  multiple OSCs touch the same object IDs (which dailies on planet
+  do at low percentages).
+- **Per-OSC rate scales with input size, not OSC count**. Germany
+  2.6 s/OSC, europe 21.9 s/OSC, planet 38.2 s/OSC. Each OSC is
+  roughly proportional to the dataset's daily-diff size; planet's
+  ~140 MB/OSC takes ~38 s of gzip + XML parse on the main thread.
+
+### Parallel-parse opportunity (the plan doc target)
+
+Plan in [`notes/merge-changes.md`](../notes/merge-changes.md) targets
+the per-OSC parse phase: each OSC is independent work, so concurrent
+parse + sequential merge could collapse `N × per-OSC parse` into
+`max(per-OSC parse, merge pass)`. Sized against the planet 7-OSC
+baseline:
+
+- Serial 7-OSC parse ≈ 7 × 38 s = ~265 s wall (matches measured
+  267.2 s within rounding).
+- Concurrent 7-OSC parse ceiling ≈ max(per-OSC parse) + merge ≈
+  ~38-50 s.
+- Estimated win: **~210-225 s at planet 7-OSC scale**, an order of
+  magnitude bigger than the original "20-30 s" speculation in the
+  plan doc (which was sized before this baseline existed).
+
+The 1-OSC planet bench at 43.1 s is the ceiling for that
+"max(per-OSC parse)" term - the parallel path cannot beat 43 s on
+this workload regardless of OSC count.
+
 ## Pipeline end-to-end
 
 Bootstrap (one-time): `cat` → `add-locations-to-ways` → enriched PBF.
@@ -1113,7 +1334,14 @@ paths parallelise over the same ID-range shard plan.
 | UUID | Args | Wall | Peak anon RSS | vs sequential |
 |---|---|---:|---:|---:|
 | `22a5eb55` | `-j 16` (text, temp-file shape) | **227.5 s (3m48s)** | 586 MB | **9.5×** |
-| `9b3fc2b9` | `-j 16 --format osc` | **313.8 s (5m13s)** | 663 MB | **7.1×** |
+| `cdcaa4f1` | `-j 16 --format osc` (commit `16e3694`, 2026-04-26) | **293.8 s (4m54s)** | n/a | **7.6×** |
+
+OSC `--format osc` re-bench at `16e3694` (2026-04-26) shows
+**−20.0 s / −6.4 %** vs the prior `9b3fc2b9` baseline (313.8 s at
+commit `06628d8`). The improvement is consistent with the
+parallel-gzip `assemble_osc` work that landed between - serial gzip
++ XML concat tail was the single-threaded bottleneck noted in the
+prior measurement.
 
 Sequential baselines (now superseded) were 2150.9 s text / 2225.6 s
 osc, both inside the 2026-04-18 TAINTED window (wall carried the

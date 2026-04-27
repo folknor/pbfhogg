@@ -38,30 +38,52 @@ Every command listed below runs on the full planet on normal hardware. Measured 
 
 | Command | Wall | Peak anon RSS |
 |---------|------|---------------|
-| `add-locations-to-ways --index-type external` | 10m4s | 11.5 GB |
+| `add-locations-to-ways --index-type external` | 9m6s | 12.0 GB |
+| `apply-changes` (OSC-only daily diff, `zstd:1`) | 4m29s | 2.4 GB |
 | `apply-changes --locations-on-ways` (daily diff) | 2m15s | ~3.3 GB |
-| `build-geocode-index` | 7m12s | ~25 GB |
+| `build-geocode-index` | 7m5s | ~25 GB |
 | `cat` (indexdata generation) | 1m26s | ~200 MB |
+| `cat --dedupe` | 2h13m | 1.4 GB |
 | `cat --type way` (raw passthrough) | 45s | 10 MB |
 | `check --ids --full` | 1m10s | 2.22 GB |
-| `check --refs` | 1m10s | 2.17 GB |
+| `check --refs` | 54s | 2.17 GB |
 | `diff -j 16` (two independent 47-day-apart planets, text) | 3m48s | 586 MB |
-| `diff --format osc -j 16` (two independent 47-day-apart planets) | 5m13s | 663 MB |
+| `diff --format osc -j 16` (two independent 47-day-apart planets) | 4m54s | 634 MB |
+| `extract --complete` (Europe bbox) | 3m42s | 4.7 GB |
+| `extract --simple` (Europe bbox) | 3m42s | 3.0 GB |
 | `extract --smart` (Europe bbox) | 4m28s | 11.17 GB |
 | `getid` | 6.1s | 27 MB |
 | `getid --invert` | 1m31s | 102 MB |
+| `getparents` | 24s | 506 MB |
 | `inspect` | 6.5s | 5 MB |
+| `inspect --extended` | 13m41s | 34 MB |
 | `inspect --nodes -j 16` | 56.8s | 410 MB |
 | `inspect --tags -j 16` | 2m50s | 17.5 GB |
+| `merge-changes --osc-seq N` (1-OSC daily) | 43s | 2 MB |
+| `merge-changes --osc-range A..B` (7-OSC, ~1 week of dailies) | 4m27s | 2 MB |
+| `multi-extract --simple -c` (5 regions, Europe bbox) | 14m44s | 9.4 GB |
+| `multi-extract --smart -c` (5 regions, Europe bbox) | 13m58s | 22.9 GB |
 | `renumber` | 3m25s | 3.3 GB |
 | `sort` (already-sorted input) | 2m04s | 476 MB |
+| `tags-filter` (default two-pass, `w/highway=primary`) | 1m48s | 2.6 GB |
 | `tags-filter -R highway=primary` | 52s | 688 MB |
 
 Three commands write temp files to the output's parent directory: `add-locations-to-ways --index-type external` (~246 GB), `diff -j 16` (~30 GB text shards), `diff --format osc -j 16` (~45 GB XML shards). The others are scratch-free.
 
+`multi-extract --smart` is the closest to the ceiling among the planet-safe rows at 22.9 GB peak anon - the per-region working set accumulates across the 5 regions.
+
 Per-command phase breakdowns and optimization history are in [reference/performance.md](reference/performance.md). Note that recorded results always track the latest git head and may not match the released version.
 
 The goal for pbfhogg 1.0 is that every CLI command must be planet-scale safe on a 32GB RAM host (28-ish free GB.)
+
+### Not yet planet-safe
+
+| Command | Status | Note |
+|---------|--------|------|
+| `time-filter` | OOM at ~94 s wall | Bench runs against a regular planet PBF (history-PBF dataset not yet configured); see [TODO.md](TODO.md) |
+| `cat --clean` | OOM at ~33 s wall | Forces the full-decode / re-frame path that bypasses raw passthrough |
+| `check --ids` (streaming, no `--full`) | OOM at 26 s, 29.2 GB peak anon | Streaming mode should be constant-memory; the 29 GB peak is unexpected (the `--full` mode in the planet-safe table peaks at 2.22 GB) |
+| `tags-filter --invert-match w/highway=primary` | 28.3 GB peak anon (no headroom) | Essentially the entire ways table is kept; runs to completion on a 28 GB-free host but cannot tolerate concurrent workloads |
 
 ## Usage
 

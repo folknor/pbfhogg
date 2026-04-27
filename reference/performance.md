@@ -431,6 +431,7 @@ cross-reference.
 | cat --type relation | `--bench 1` | 47.7 s | `fba6e13e` (commit `16e3694`) | first stored measurement |
 | cat --dedupe | `--bench 1` | **7,981 s (133m)** | `1794f8a6` (commit `16e3694`) | first stored measurement; single-threaded MERGEPBF path - see callout below |
 | check --refs | `--bench 1` | **53.8 s** | `7d9f5dfd` (commit `16e3694`) | 72 s → −25.3 % |
+| check --ids (streaming, default) | `--bench 1` | **57.3 s** | `02595428` (commit `516129e`, 2026-04-27) | first stored measurement; previously OOM-killed at 29.2 GB peak anon via `for_each_pipelined`, fix landed 2026-04-27 |
 | check --ids --full | `--bench 1` | **63.2 s** | post-`01c67da` | 72.5 s → −12.8 % |
 | getid (include mode) | `--bench 1` | **6.1 s** | `24362e36` | 44 s → **7.2×** |
 | getid --invert | `--bench 1` | 91.0 s | `40f5bd52` | 83 s (noise) |

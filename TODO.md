@@ -110,11 +110,12 @@ that are not currently driven by `overnight.sh`.
 
 ### 1.0 blockers (planet OOM or RSS-exceeds-ceiling, 2026-04-26 overnight)
 
-Four commands either OOM'd at planet or ran with no headroom against
-the 28 GB-free reference host. Mirrored in the README's "Not yet
-planet-safe" table.
+Three commands remain after `check --ids` streaming was fixed
+2026-04-27 (commit `516129e`, see "Done" subsection below). All three
+either OOM'd at planet or ran with no headroom against the 28 GB-free
+reference host. Mirrored in the README's "Not yet planet-safe" table.
 
-**Three of the four share a single root cause**: the documented
+**Two of the three share a single root cause**: the documented
 cross-thread `PrimitiveBlock` retention pattern in `src/read/pipeline.rs`
 (`run_pipeline` doc-comment lines 66-89, "**25+ GB of heap retention**"
 at planet scale). `for_each_pipelined` allocates `WireStringTable::entries`
@@ -125,22 +126,18 @@ across glibc, jemalloc, and multiple `MALLOC_ARENA_MAX` configurations**"
 - so `mallopt(M_ARENA_MAX, 2)` is **not** a fix here, it's a different
 mitigation that helps allocation-heavy workloads (`check --refs`, `--full`
 mode, `renumber_external`). The overnight was the first planet-scale test
-of these three commands, which is why the architectural debt only
-surfaced now.
+of these commands, which is why the architectural debt only surfaced now.
 
-- [ ] **`check --ids` (streaming default mode)** - SIGKILL at 26 s,
-  **29.2 GB peak anon** (sidecar `dirty` from the failed run). Walks
-  straight into the `for_each_pipelined` retention pattern at
-  `src/commands/check/verify_ids.rs:416`. **Cheapest blocker to
-  clear**: rewrite to use `parallel_classify_phase` like the
-  co-located `--full` mode (`verify_ids.rs:472` -
-  `verify_ids_full_parallel`) but skip the IdSet population - the
-  per-element check is just monotonicity + counters, so a
-  `BlobVerifyResult` with `first_id` / `last_id` / `count` / no
-  duplicate vec is sufficient. Estimated wall ~35-50 s at planet
-  (between `--full`'s 53.8 s and a strict subset that doesn't write
-  the IdSet), peak RSS in the same 2 GB ballpark as `--full`. One
-  commit, ~80 lines mostly cribbed from `verify_ids_full_parallel`.
+- [x] ~~**`check --ids` (streaming default mode)**~~ - **fixed
+  2026-04-27** (commit `516129e`). Rewrote streaming entry to use
+  `parallel_classify_phase` mirroring the co-located `--full` mode,
+  minus the IdSet population. Re-bench: planet **57 s wall, 504 MB
+  peak anon** (UUID `02595428`) vs the failed 26 s SIGKILL at
+  29.2 GB. Now the lowest peak RSS of any `check --ids` variant on
+  planet (`--full` is 2.17 GB). Behavior change on non-indexed
+  input: element-level type-order detection (mixed-type-blob
+  ordering) dropped, matching `--full`'s existing semantics on
+  non-indexed input.
 - [ ] **`cat --clean`** - SIGKILL at 33 s. Uses
   `into_blocks_pipelined` + `for_each_primitive_block_batch_budgeted`
   at `src/commands/cat/mod.rs:373`. The batch-based consumer is the

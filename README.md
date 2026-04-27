@@ -45,6 +45,7 @@ Every command listed below runs on the full planet on normal hardware. Measured 
 | `cat` (indexdata generation) | 1m26s | ~200 MB |
 | `cat --dedupe` | 2h13m | 1.4 GB |
 | `cat --type way` (raw passthrough) | 45s | 10 MB |
+| `check --ids` (streaming, default) | 57s | 504 MB |
 | `check --ids --full` | 1m10s | 2.22 GB |
 | `check --refs` | 54s | 2.17 GB |
 | `diff -j 16` (two independent 47-day-apart planets, text) | 3m48s | 586 MB |
@@ -82,7 +83,6 @@ The goal for pbfhogg 1.0 is that every CLI command must be planet-scale safe on 
 |---------|--------|------|
 | `time-filter` | OOM at ~94 s wall | Bench runs against a regular planet PBF (history-PBF dataset not yet configured); see [TODO.md](TODO.md) |
 | `cat --clean` | OOM at ~33 s wall | Forces the full-decode / re-frame path that bypasses raw passthrough |
-| `check --ids` (streaming, no `--full`) | OOM at 26 s, 29.2 GB peak anon | Streaming mode should be constant-memory; the 29 GB peak is unexpected (the `--full` mode in the planet-safe table peaks at 2.22 GB) |
 | `tags-filter --invert-match w/highway=primary` | 28.3 GB peak anon (no headroom) | Essentially the entire ways table is kept; runs to completion on a 28 GB-free host but cannot tolerate concurrent workloads |
 
 ## Usage

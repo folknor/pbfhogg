@@ -435,8 +435,15 @@ const KIND_WAY: u8 = 1;
 const KIND_RELATION: u8 = 2;
 
 /// Run one per-kind phase: pread workers decode + clean + frame each blob
-/// of the given kind; main thread writes framed bytes in seq order via
-/// `write_raw_owned`.
+/// of the given kind; main thread streams framed bytes to the writer in seq
+/// order via a `ReorderBuffer`.
+///
+/// The reorder buffer is essential here. Worker output is large
+/// (~1.6 MB framed per planet node blob × 47K node blobs ≈ 75 GB if the
+/// whole phase's output were accumulated before writing). Streaming with
+/// `pop_ready` after every push caps the in-flight set to roughly the
+/// decode-thread count (~24 on a 24-thread host), bounding peak RSS to
+/// ~50 MB of framed bytes per phase regardless of input size.
 fn run_kind_phase(
     shared_file: &std::sync::Arc<std::fs::File>,
     schedule: &[(usize, u64, usize)],
@@ -445,6 +452,8 @@ fn run_kind_phase(
     compression: Compression,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
 ) -> Result<(u64, u64)> {
+    use crate::reorder_buffer::ReorderBuffer;
+
     if schedule.is_empty() {
         return Ok((0, 0));
     }
@@ -456,7 +465,11 @@ fn run_kind_phase(
     };
 
     type PhaseResult = std::result::Result<(Vec<Vec<u8>>, u64), String>;
-    let mut per_blob: Vec<Option<PhaseResult>> = (0..schedule.len()).map(|_| None).collect();
+    let mut reorder: ReorderBuffer<PhaseResult> = ReorderBuffer::with_capacity(64);
+    let mut total_blobs: u64 = 0;
+    let mut total_elements: u64 = 0;
+    let mut write_error: Option<Box<dyn std::error::Error>> = None;
+    let mut classify_error: Option<String> = None;
 
     // BlockBuilder contains `Rc<str>` (string interning) which is not Send,
     // so it can't ride the `S: Send` worker-state slot. Per-blob alloc inside
@@ -489,20 +502,45 @@ fn run_kind_phase(
             Ok((framed, count))
         },
         |seq, r| {
-            per_blob[seq] = Some(r);
+            // Always queue the result so the next-seq invariant holds; we
+            // can't drop a slot mid-phase without breaking the reorder
+            // buffer's contiguous-prefix expectation.
+            reorder.push(seq, r);
+            // Drain everything ready from the front. Once we hit a hole
+            // (next seq not yet delivered), stop and wait for the next
+            // merge call. Errors are captured into local Option slots and
+            // propagated after parallel_classify_phase returns; further
+            // ready items are still drained so the buffer doesn't grow.
+            while let Some(r) = reorder.pop_ready() {
+                match r {
+                    Ok((framed, count)) => {
+                        if write_error.is_some() {
+                            continue;
+                        }
+                        for blob in framed {
+                            if let Err(e) = writer.write_raw_owned(blob) {
+                                write_error = Some(e.into());
+                                break;
+                            }
+                            total_blobs += 1;
+                        }
+                        total_elements += count;
+                    }
+                    Err(e) => {
+                        if classify_error.is_none() {
+                            classify_error = Some(e);
+                        }
+                    }
+                }
+            }
         },
     )?;
 
-    let mut total_blobs: u64 = 0;
-    let mut total_elements: u64 = 0;
-    for slot in per_blob {
-        let r = slot.expect("parallel_classify_phase must deliver every blob");
-        let (framed, count) = r.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        total_elements += count;
-        for blob in framed {
-            writer.write_raw_owned(blob)?;
-            total_blobs += 1;
-        }
+    if let Some(e) = write_error {
+        return Err(e);
+    }
+    if let Some(e) = classify_error {
+        return Err(e.into());
     }
 
     Ok((total_blobs, total_elements))

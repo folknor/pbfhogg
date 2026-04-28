@@ -489,30 +489,80 @@ sum is ~28 GB at planet scale. Tuning knobs (`malloc_trim`,
 `M_MMAP_THRESHOLD`, `decode_ahead`, `M_ARENA_MAX`) cannot fix
 this; they only redistribute where the bytes sit.
 
-### Path forward (open)
+### Migration: parallel_classify_phase + ReorderBuffer (LANDED 2026-04-28)
 
-Three viable routes, all with non-trivial cost:
+Fix template was hiding in plain sight. Audit of other commands
+sharing the
+`for_each_primitive_block_batch + par_iter().map_init(BlockBuilder) + collect + drain`
+shape found `tags-filter` (default + `-R`), `getid --add-referenced`
+pass 2, and `altw` dense/sparse use the identical pattern.
+`cat --clean` (commit `b347c0a`, 28.9 GB → 750 MB) and
+`check --ids` streaming (commit `516129e`, 29.2 GB → 504 MB) had
+the exact same ceiling and were unblocked by migrating to
+`parallel_classify_phase` + `ReorderBuffer`.
 
-1. **Sequential reader path.** Use `BlobReader` directly, drop
-   `into_blocks_pipelined`. All alloc/free on one thread; cuts
-   the cross-thread retention vector entirely. Wall regresses
-   from 92.6 s to ~250-300 s on Europe (~3x slower from losing
-   30 cores worth of decode parallelism). Documented mitigation
-   in `pipeline.rs:66-89`. Used by ALTW external join and node-
-   only scanners. Smallest-scope fix; cleanest correctness.
-2. **Per-decode-thread re-encode.** Move `BlockBuilder` work
-   *into* the decode_pool's spawn closure so each PrimitiveBlock
-   is allocated, processed, and freed on the same thread. Output
-   is the framed-bytes Vec, sent through the channel as raw
-   bytes. Bypasses the `par_iter().collect()` step entirely.
-   Architectural refactor; the wall could stay close to iter 5's
-   if zlib compression is kept on rayon. Larger landing arc.
-3. **Accept the ceiling.** Document `time-filter` planet as
-   needing >32 GB RAM. Configure `time-filter --dataset europe`
-   as the validation upper bound in `brokkr.toml`. No code work.
+Migration shape (commit `83183fb`):
 
-Note: items #5 (in-flight depth tuning) and #6 (reader scratch
-cap) in the ranked-opportunities section above are now confirmed
-*not* to be the planet blocker. Leaving them ranked for the wall-
-optimization story (cutting depth could still help on hosts with
-more RAM headroom) but they don't unlock planet.
+- `time_filter_snapshot` now opens via
+  `build_classify_schedule(input, None)` (single-pass; input is
+  already type-sorted via `require_sorted`, so seq order in the
+  ReorderBuffer drain produces type-sorted output without per-kind
+  sub-passes).
+- Workers each create a fresh `BlockBuilder::new()` inside the
+  classify closure (BlockBuilder is `!Send` via `Rc<str>`), filter
+  via `snapshot_gate`, `take_owned`, `frame_blob_pipelined` →
+  `Vec<Vec<u8>>` of framed bytes per blob.
+- Merge closure pushes results into a 64-slot `ReorderBuffer`,
+  drains `pop_ready` in seq order to `writer.write_raw_owned`.
+- `mallopt(M_ARENA_MAX, 2)` enabled at function entry. The iter-3
+  K=2 regression was on the pre-migration code with cross-blob
+  thread-local-BB scratch reuse; post-migration there's no such
+  state, so the cat --clean / check --refs precedent applies.
+
+### Measured results (commit `83183fb`)
+
+| Dataset | Wall | Peak anon | UUID |
+|---|---|---|---|
+| denmark `--bench 1` | 3.1 s | n/a | (dirty) |
+| europe `--bench 1` | **2m27s** (was 1m32s, +59 %) | **324 MB** (was 16.9 GB, **−98 %**) | `53e74946` |
+| planet `--bench 1` | **4m30s** (was 5x SIGKILL) | **812 MB** (was ~28 GB ceiling) | `6d905564` |
+
+Planet correctness counters (`6d905564`):
+`timefilter_versions_seen = 11.6 B`,
+`timefilter_versions_before_cutoff = 9.3 B`,
+`timefilter_elements_written = 9.3 B`,
+`timefilter_dropped_no_snapshot_version = 2.3 B`,
+`timefilter_dropped_deleted = 0`. Output 74 GB framed; matches the
+expected ~80 % keep rate at cutoff 2024-01-01.
+
+Wall regression on Europe (1.59×) is in the predicted 1.5-2× range
+- the cost of dropping the iter-5 thread-local-BB capacity reuse
+in exchange for the cross-thread retention vector going away. At
+planet the absolute wall is ~4.5 min, comfortable inside any
+realistic workload budget. RSS reduction is 35× at planet
+(measured) and 50× at Europe.
+
+### Code deletions
+
+The pool infrastructure existed solely for the iter-4 / iter-5
+RSS arc. Post-migration, the snapshot path doesn't use it and
+nothing else in-tree referenced it. Removed completely (per
+project convention against dead-code shims):
+
+- `src/write/buf_pool.rs` (whole module - `BlockBufPool`,
+  `emit_counters`, `TARGET_CAPACITY`)
+- `BlockBuilder::take_owned_swap` method
+- `PbfWriter::write_primitive_block_owned_pooled` and the
+  `write_primitive_block_owned_inner` private helper (folded
+  back into `write_primitive_block_owned`)
+- Local helpers in `time_filter`: `process_snapshot_batch`,
+  `SNAPSHOT_BB` thread_local, `flush_local_pooled`,
+  `ensure_*_capacity_pooled`, `OwnedBlockTriple` alias
+
+### Items #5 / #6 / #4 in "Remaining opportunities" above
+
+All three were chasing the wrong root cause. They're now removed
+from the planet-blocker path. Leaving them in the ranked list as
+*wall*-optimization candidates (e.g. cutting depth could still
+help on hosts with more RAM headroom and a wall budget tighter
+than 4.5 min at planet), but they don't unlock anything.

@@ -113,27 +113,14 @@ of the reachable gaps as bench runs (produces
 they land). This section tracks the remaining axes and dataset gaps
 that are not currently driven by `overnight.sh`.
 
-### 1.0 blockers (planet OOM or RSS-exceeds-ceiling, 2026-04-26 overnight)
+### 1.0 blockers (planet OOM or RSS-exceeds-ceiling)
 
-Two commands remain after `check --ids` streaming and `cat --clean`
-were fixed 2026-04-27 (commits `516129e` and `b347c0a`, see "Done"
-notes below each entry). Both attempt planet bench runs with no
-headroom against the 28 GB-free reference host. Mirrored in the
-README's "Not yet planet-safe" table.
-
-**`time-filter` shares the documented cross-thread `PrimitiveBlock`
-retention pattern** in `src/read/pipeline.rs` (`run_pipeline`
-doc-comment lines 66-89, "**25+ GB of heap retention**" at planet
-scale). `for_each_pipelined` allocates `WireStringTable::entries`
-(~10 KB per block) on rayon decode threads and drops them on the
-consumer thread; glibc/jemalloc don't return the freed pages to
-the OS, accumulating as anon RSS. The doc notes this was "**measured
-and verified across glibc, jemalloc, and multiple `MALLOC_ARENA_MAX`
-configurations**" - so `mallopt(M_ARENA_MAX, 2)` is **not** a fix
-here. The fix template is the `verify_ids` / `cat --clean` pattern
-(rewire onto `parallel_classify_phase` per kind, stream output via
-`ReorderBuffer`) but time-filter has structural constraints that
-make it harder; see the entry below.
+One command remains after the four 2026-04-27 / 2026-04-28 fixes:
+`check --ids` streaming (`516129e`), `cat --clean` (`b347c0a`),
+and `time-filter` (`83183fb`) all migrated to `parallel_classify_phase`
++ `ReorderBuffer`; the residual is `tags-filter --invert-match`,
+which shares the same root cause and same migration template.
+Mirrored in the README's "Not yet planet-safe" table.
 
 - [x] ~~**`check --ids` (streaming default mode)**~~ - **fixed
   2026-04-27** (commit `516129e`). Rewrote streaming entry to use
@@ -159,45 +146,31 @@ make it harder; see the entry below.
   28.9 GB - 38× peak-RSS reduction. Output ordering is type-sorted
   (nodes, then ways, then relations); preserves structure on
   already-type-sorted input, re-sorts unsorted input.
-- [ ] **`time-filter`** - five planet `--bench 1` attempts have
-  SIGKILL'd at ~28 GB anon. The 2026-04-28 instrumentation campaign
-  (UUIDs `4800c0a` / `e06c6ad` / `9fffdc4` via `dirty` sidecar)
-  ruled out the iter-5 hypothesis: per-decode-thread
-  `parse_and_inline_with_scratch` retention was 60 MB total (2 MB ×
-  ~30 threads), three orders of magnitude smaller than the 4.4 GB
-  predicted from the alloc profile. Allocator knobs (`malloc_trim`
-  per batch, `mallopt(M_MMAP_THRESHOLD, 64 KB)`,
-  `decode_ahead = 8`) all hit the same ~28 GB ceiling - mallinfo2
-  showed the bytes shifting between `arena` and `hblkhd` (mmap
-  chunks ARE genuinely live, returned to OS on free), confirming
-  the working set itself is structural. **Root cause: shared
-  pipeline shape with `tags-filter`**: `for_each_primitive_block_batch`
-  + `par_iter().map_init(BlockBuilder)` + `collect` + drain
-  materializes the full batch's `Vec<OwnedBlockTriple>` results
-  before draining, while the upstream pipeline keeps stuffing the
-  next batch in flight - cross-thread `PrimitiveBlock` retention
-  (`pipeline.rs:66-89`) amplified by per-batch result Vec retention
-  + writer reorder window. Tuning knobs cannot fix it.
-  **Migration template**: `parallel_classify_phase` + `ReorderBuffer`
-  (single-pass via `build_classify_schedule(input, None)`,
-  workers each emit framed bytes through a 32-slot bounded result
-  channel). Same template used by `cat --clean` (commit `b347c0a`,
-  28.9 GB → 750 MB) and `check --ids` streaming (commit `516129e`,
-  29.2 GB → 504 MB), both of which had the exact same ceiling
-  before migration. Drops the `mallopt(M_ARENA_MAX, 2)` off-limits
-  rule (post-migration the per-blob alloc/free is on one thread, so
-  arena capping doesn't trigger lock contention - `cat --clean`
-  enables it). Drops the iter-5 thread-local-BB optimization (each
-  blob allocates a fresh `BlockBuilder::new()` inside the worker
-  closure since BlockBuilder is `!Send`) - small wall hit on Europe
-  expected; planet correctness is the unblocking goal.
-  See [`notes/time-filter-optimization.md`](notes/time-filter-optimization.md)
-  Planet section for the full measurement table and ruled-out
-  hypotheses. Separately: the history-path pending-group state
-  machine (`time_filter_history`, `mod.rs` near line 124) is
-  sequential by design and would need a real refactor for
+- [x] ~~**`time-filter`**~~ - **LANDED 2026-04-28** (commit `83183fb`).
+  Snapshot path migrated from
+  `for_each_primitive_block_batch + par_iter().map(thread_local BB)`
+  + drain to `parallel_classify_phase` + `ReorderBuffer`, mirroring
+  the `cat --clean` (`b347c0a`) and `check --ids` (`516129e`)
+  precedents. Planet `--bench 1` (UUID `6d905564`):
+  **4m30s wall, 812 MB peak anon** (was 5x SIGKILL at ~28 GB).
+  Europe **2m27s / 324 MB** (was 1m32s / 16.9 GB; +59 % wall,
+  −98 % RSS). The 2026-04-28 instrumentation campaign across three
+  SIGKILL'd attempts (UUIDs `4800c0a` / `e06c6ad` / `9fffdc4`) ruled
+  out the iter-5 alloc-profile hypothesis (per-decode-thread scratch
+  was 60 MB total, not 4.4 GB) and ruled out allocator knobs
+  (`malloc_trim`, `M_MMAP_THRESHOLD=64K`, `decode_ahead=8` all
+  hit the same ceiling); mallinfo2 confirmed the ~28 GB working set
+  is structural to the parallel-decode + batch-collect + parallel-
+  write architecture, not retention. Migration also deleted the
+  iter-4 / iter-5 pool infrastructure (`buf_pool` module,
+  `take_owned_swap`, `write_primitive_block_owned_pooled`) since
+  nothing else in-tree referenced it. Plan doc:
+  [`notes/time-filter-optimization.md`](notes/time-filter-optimization.md).
+  History-path pending-group state machine (`time_filter_history`)
+  is sequential by design and would need a real refactor for
   parallelism, but no history PBF is configured in `brokkr.toml`
-  so it doesn't show up in the snapshot-path planet bench.
+  so it doesn't show up in the snapshot-path planet bench - keep
+  separate from this entry.
 - [ ] **`tags-filter --invert-match w/highway=primary`** - 461.2 s
   wall, **28.3 GB peak anon** (UUID `6665605a`). **Same root cause
   as `time-filter`**: shared pipeline shape

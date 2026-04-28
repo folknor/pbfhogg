@@ -67,6 +67,7 @@ Every command listed below runs on the full planet on normal hardware. Measured 
 | `sort` (already-sorted input) | 2m04s | 476 MB |
 | `tags-filter` (default two-pass, `w/highway=primary`) | 1m48s | 2.6 GB |
 | `tags-filter -R highway=primary` | 52s | 688 MB |
+| `time-filter` (snapshot, cutoff 2024-01-01) | 4m30s | 812 MB |
 
 Three commands write temp files to the output's parent directory: `add-locations-to-ways --index-type external` (~246 GB), `diff -j 16` (~30 GB text shards), `diff --format osc -j 16` (~45 GB XML shards). The others are scratch-free.
 
@@ -80,8 +81,7 @@ The goal for pbfhogg 1.0 is that every CLI command must be planet-scale safe on 
 
 | Command | Status | Note |
 |---------|--------|------|
-| `time-filter` | OOM at ~94 s wall | Bench runs against a regular planet PBF (history-PBF dataset not yet configured); see [TODO.md](TODO.md) |
-| `tags-filter --invert-match w/highway=primary` | 28.3 GB peak anon (no headroom) | Essentially the entire ways table is kept; runs to completion on a 28 GB-free host but cannot tolerate concurrent workloads |
+| `tags-filter --invert-match w/highway=primary` | 28.3 GB peak anon (no headroom) | Same structural cause as the now-resolved `time-filter` snapshot OOM; migration to `parallel_classify_phase` template scheduled - see [TODO.md](TODO.md) |
 
 ## Usage
 

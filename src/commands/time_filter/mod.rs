@@ -276,6 +276,20 @@ fn time_filter_snapshot(
         // negligible cost relative to per-batch wall.
         crate::read::pipeline_metrics::PIPELINE_METRICS.emit();
         crate::write::metrics::WRITER_METRICS.emit();
+        // Per-batch mallinfo2 + malloc_trim. The cross-thread
+        // PrimitiveBlock retention pattern (pipeline.rs:66-89) leaves
+        // freed chunks on the decode-thread arena's free list - glibc
+        // doesn't return those pages to the OS, so anon RSS climbs
+        // ~200 MB/batch even though the live working set is bounded.
+        // `malloc_trim(0)` forces glibc to scan all arenas and release
+        // free chunks back to the OS. Cost ~ms per call. The mallinfo2
+        // emit captures arena (brk-managed) vs hblkhd (mmap-managed) so
+        // the sidecar timeline shows how trim affects each.
+        crate::debug::emit_mallinfo2("timefilter_snapshot_batch_pre_trim");
+        let trim_result = crate::debug::malloc_trim();
+        #[allow(clippy::cast_possible_wrap)]
+        crate::debug::emit_counter("timefilter_snapshot_batch_trim_released", i64::from(trim_result));
+        crate::debug::emit_mallinfo2("timefilter_snapshot_batch_post_trim");
         crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_BATCH_END");
         result
     };

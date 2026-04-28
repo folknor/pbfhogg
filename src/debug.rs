@@ -55,6 +55,33 @@ pub fn emit_mallinfo2(prefix: &str) {
 #[cfg(not(target_os = "linux"))]
 pub fn emit_mallinfo2(_prefix: &str) {}
 
+/// Ask glibc to return free chunks above the trim threshold to the OS
+/// (`malloc_trim(0)`). Returns 1 if memory was released, 0 otherwise.
+///
+/// Use to fight the documented cross-thread `PrimitiveBlock` retention
+/// pattern (`src/read/pipeline.rs:66-89`): decoded blocks are
+/// allocated on rayon decode threads and dropped on the consumer
+/// thread; glibc retains those pages on the decode-thread arena's
+/// free list rather than returning them to the OS, which manifests
+/// as steadily-climbing anon RSS at scale. Calling `malloc_trim(0)`
+/// at a batch boundary forces a sweep across all arenas.
+///
+/// Cost: a few ms per call at planet scale (one pass over the
+/// free-list). Cheap enough to fire per snapshot batch (~140
+/// batches at planet, ~150 ms total).
+///
+/// On non-glibc / non-Linux this is a no-op returning 0.
+#[cfg(target_os = "linux")]
+pub fn malloc_trim() -> i32 {
+    // SAFETY: malloc_trim is a glibc function safe to call from any thread.
+    unsafe { libc::malloc_trim(0) }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn malloc_trim() -> i32 {
+    0
+}
+
 /// Read cumulative (minor, major) page faults from `/proc/self/stat`.
 /// Returns `(minflt, majflt)`. Returns `(0, 0)` on failure or non-Linux.
 #[cfg(target_os = "linux")]

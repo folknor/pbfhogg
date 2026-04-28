@@ -9,11 +9,16 @@
   metadata, and DenseNodes encoding round-trip; output is type-sorted
   and propagates `Sort.Type_then_ID`. Primary use case: producing
   same-corpus-different-encoding pairs for the blob-density measurement
-  matrix (`reference/blob-density.md`). v1 fires the cap per worker
-  invocation, so growing beyond the input blob size requires
-  cross-input-blob coalescing (deferred). When the cap exceeds every
-  input blob (no-op grow attempt), repack emits a stderr warning so
-  the silent-identity outcome is visible.
+  matrix (`reference/blob-density.md`). Both shrink (cap < input blob
+  size) and grow (cap > input blob size) work: workers re-encode the
+  leading `M - (M%cap)` matching elements per input blob in parallel,
+  and the merge thread runs a single long-lived `BlockBuilder` per
+  kind that coalesces the trailing `M%cap` elements across input-blob
+  boundaries. The "never fired" warning fires only when the cap
+  exceeds every kind's total element count (every kind collapses to a
+  single output blob). New `repack_input_blobs_coalesced` sidecar
+  counter tracks how often a trailing slice extends a non-empty
+  central builder.
 - **degrade**: new command. Produce a valid-but-adversarial PBF for
   benchmarking non-optimal code paths. v1 ships three composable
   transformations: `--unsort` (clear `Sort.Type_then_ID`, perturb the

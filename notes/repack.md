@@ -5,10 +5,12 @@ Motivated by [`reference/blob-density.md`](../reference/blob-density.md):
 the measurement matrix needs same-corpus-different-encoding pairs to
 control for blob-count effects independent of byte size.
 
-**Status:** v1 shipped. This document records what v1 actually does
-(it diverged from the original sketch) and what v2 still needs.
+**Status:** v1 + v2.1 shipped. v1 was the parallel per-worker shrink
+path; v2.1 added cross-input-blob coalescing so grow caps actually
+fire. v2.2 (LocationsOnWays preservation) and v2.3 (osmium cross-
+validation) remain deferred.
 
-## What v1 does
+## What ships today
 
 Code: [`src/commands/repack/mod.rs`](../src/commands/repack/mod.rs);
 CLI: `pbfhogg repack`.
@@ -22,18 +24,44 @@ pbfhogg repack <input> -o <output> [--elements-per-blob N]
 ```
 
 Pipeline shape: parallel three-phase per-kind classify (nodes, then
-ways, then relations), mirroring `cat --clean`. Each worker decodes
-one input blob, re-encodes its matching elements through a
-`BlockBuilder` configured with the requested cap, and emits the
-resulting framed blob bytes. Output is streamed in input-seq order
-via a `ReorderBuffer`, so peak RSS is bounded by the in-flight worker
-count rather than total output size.
+ways, then relations). Each worker decodes one input blob, filters
+to the current kind, and splits its `M` matching elements at the
+`M % cap` boundary:
 
-This shape replaced the original sequential `for_each_element`
-sketch. The parallel classify pipeline already existed for
-`cat --clean` and gives us free per-kind segregation, the right
-peak-RSS profile, and the same fault-injection coverage as the rest
-of the parallel-write commands.
+- The leading `M - (M % cap)` elements (a multiple of `cap`) are
+  re-encoded through a per-worker `BlockBuilder` and shipped to the
+  merge thread as already-framed blob bytes. This is the parallel
+  path that recovers v1's shrink throughput.
+- The trailing `M % cap` elements are shipped as decoded
+  `OwnedNode`/`OwnedWay`/`OwnedRelation` to the merge thread.
+
+The merge thread runs a single long-lived `BlockBuilder` per kind,
+configured with the requested cap, and consumes worker outputs in
+seq order via a `ReorderBuffer`. For each input blob it writes the
+worker's full framed blocks directly, then feeds the trailing
+`Owned*` slice into the central builder; mid-stream flushes are
+framed in parallel via `rayon::par_iter` over `FRAME_BATCH`-sized
+batches and written serially.
+
+This hybrid keeps shrinks fast (when `cap` divides `M` cleanly all
+work happens in workers, matching v1) while supporting grows
+correctly: when `cap > M_per_input_blob` each worker emits 0 full
+blocks and ships everything as trailing, and the central builder
+spans input-blob boundaries to produce cap-sized output.
+
+Validated on Denmark (commit 741e482, plantasjen):
+- cap=4000 (shrink, exact div): 2.8 s — within noise of v1's 2.7 s.
+- cap=8000 (matches input default): 2.9 s — same shape, all
+  workers produce one full block each, no merge work.
+- cap=16000 (grow, all-tail): 23 s — merge-thread bound.
+
+The grow regression versus shrink is fundamental: when every input
+blob's elements end up in the trailing slice, the central builder
+on a single thread does all the encoding work. For dev/debug
+repacks this is acceptable; if a planet-scale grow ever needs to
+be faster, the next intervention is element-offset-aware workers
+(shape (2) from the original design sketch), which would require
+extending the schedule with per-blob element counts.
 
 ### Inputs and flags
 
@@ -55,31 +83,34 @@ which it derives from indexdata.
 The phase boundaries emit
 `REPACK_NODES_START` / `_END`, `REPACK_WAYS_START` / `_END`,
 `REPACK_RELATIONS_START` / `_END`, and end-of-run counters
-`repack_blobs_written` and `repack_elements_written` (visible via
-`brokkr sidecar <uuid>`).
+`repack_blobs_written`, `repack_elements_written`, and
+`repack_input_blobs_coalesced` (visible via `brokkr sidecar <uuid>`).
 
-### v1 limitation: per-worker cap, no cross-input-blob coalescing
+The `repack_input_blobs_coalesced` counter increments every time an
+input blob's trailing slice arrives at the merge thread with the
+central builder already non-empty, i.e. that input blob's elements
+extended a prior input blob's residuals inside a single output
+blob. 0 on shrinks with exact division; otherwise grows with the
+proportion of input blobs that don't divide cleanly.
 
-The cap fires per worker invocation, so output blobs cannot grow
-beyond the input blob size:
+### Grow no-op detection
 
-- **Shrink** (planet's ~228 k/blob -> 8 k/blob): one input blob
-  produces multiple output blobs and the cap fires correctly. This
-  is the blob-density measurement use case and works as designed.
-- **Grow** (Geofabrik 8 k/blob -> 64 k/blob): cross-input-blob
-  coalescing is needed and is **not** implemented.
-
-When a grow attempt produces no actual repacking (cap exceeds every
-input blob), the run prints a stderr warning so the silent-identity
-outcome is visible:
+The "never fired" warning still exists but its scope tightened with
+v2.1. It now fires only when the cap exceeds every kind's total
+element count - i.e. each kind collapses to a single output blob and
+no mid-stream flush ever happened anywhere:
 
 ```
-Warning: --elements-per-blob N never fired; cap exceeds the largest
-input blob, so the output blob layout matches the input. v1 cannot
-grow blobs across input-blob boundaries (deferred to v2).
+Warning: --elements-per-blob N never fired; every per-kind element
+count fits in a single output blob, so the output is one blob per kind.
 ```
 
-### v1 limitation: LocationsOnWays not preserved
+The pre-v2.1 message ("cap exceeds the largest input blob, so the
+output blob layout matches the input") is no longer accurate: with
+cross-input-blob coalescing, the input blob layout no longer
+constrains the output.
+
+### Limitation: LocationsOnWays not preserved
 
 If the input header declares `LocationsOnWays`, the run prints a
 stderr warning that inline way-node coordinates will not be
@@ -110,86 +141,26 @@ the round-trip drops.
   count matches `ceil(elements / cap)` on a clean shrink.
 - `repack_propagates_sorted_flag` - `Sort.Type_then_ID` round-trips.
 - `repack_rejects_zero_cap` - `--elements-per-blob 0` fails up front.
-- `repack_large_cap_preserves_input_blob_layout` - grow attempt
-  prints the "never fired" warning and the output is element-equal
-  with the same input-blob layout.
+- `repack_grow_collapses_to_one_blob_per_kind` - cap >> all per-kind
+  totals (60/12/3 vs cap 8000): one output blob per kind, "never
+  fired" warning fires.
+- `repack_round_trip_preserves_elements_on_grow` - element/ID/tag
+  multiset equality after a grow that fires the cap mid-stream
+  (cap=30 vs input 20/blob).
+- `repack_grow_blob_count_matches_prediction` - cap=30 grows produce
+  `ceil(60/30)=2` node blobs, exercising cross-input-blob coalesce.
 - `repack_no_warning_when_cap_fires` - regression sentinel against
   false-positive warnings on real shrinks.
+- `repack_grow_no_warning_when_cap_fires` - same sentinel for grows
+  that fire the cap mid-stream.
 
 Cross-validation against osmium's `cat` re-block flag is **not** in
-the suite; deferred to v2 alongside the cross-input-blob work.
+the suite; deferred to v2.3.
 
 ## v2 scope
 
-Two known v1 gaps. Pick them off in order; the grow path is the one
-blocking real measurement work.
-
-### v2.1 - cross-input-blob coalescing (the grow path)
-
-**Goal:** make `--elements-per-blob N` fire correctly when N exceeds
-the input blob size, so Geofabrik 8 k/blob -> planet-style 256 k/blob
-re-packings produce the requested output.
-
-**Constraint:** preserve the parallel three-phase pipeline shape so
-peak RSS stays bounded and the per-kind segregation remains free.
-
-**Sketch:**
-
-A worker today: one input blob -> 1+ framed output blob(s),
-emitted in seq order via `ReorderBuffer`. The cap fires inside the
-worker and the worker is the framing boundary.
-
-For grow, the framing boundary has to move past the input-blob
-boundary. Two plausible shapes:
-
-1. **Per-kind serial coalescer downstream of the worker pool.**
-   Workers stop framing; they emit decoded `OwnedBlock`s in seq
-   order. A single coalescer thread per kind feeds those into one
-   long-lived `BlockBuilder`, flushing to a framed blob each time
-   the cap fires. Compression/framing happens on the coalescer
-   thread (or on a fan-out write pool downstream).
-
-   Trade-off: the coalescer is a serial choke point. For shrink it
-   does no work (the worker already produced cap-sized blobs); for
-   grow it does all the framing work. Compression-bound on planet
-   it could become the bottleneck.
-
-2. **Worker emits decoded elements in seq order; downstream block
-   layout is computed deterministically.**
-   The cap point is decided by element index (`element_seq /
-   cap`). Workers can pre-frame any complete output blob whose
-   element range falls entirely within their input blob; cross-
-   boundary blobs are framed by a small downstream task that joins
-   the trailing elements of input blob `k` with the leading
-   elements of input blob `k+1`.
-
-   Trade-off: more book-keeping, but the slow framing path stays
-   parallel. The element-index addressing also lets us emit a
-   deterministic `--bench` artifact.
-
-Pick (1) for v2.1 unless profiling shows the coalescer is the
-bottleneck. The simpler shape is worth the risk; if it lands and
-benchmarks show the choke, (2) is a v2.1.x follow-up.
-
-**New behavior:**
-
-- The "never fired" warning becomes much rarer: only when the input
-  has fewer than `cap` elements total per kind.
-- A new counter `repack_input_blobs_coalesced` (or similar)
-  measures how often the coalescer crosses an input-blob boundary,
-  visible via `brokkr sidecar`.
-
-**Tests to add:**
-
-- `repack_round_trip_preserves_elements_on_grow` - shrink fixture
-  with cap larger than per-blob count, verify element/ID/tag
-  multiset equality and that the output blob count drops.
-- `repack_grow_blob_count_matches_prediction` - 60 nodes packed
-  20/blob, cap=64, expect 1 output node blob.
-- `repack_grow_no_warning_when_cap_fires` - regression sentinel.
-- The existing `repack_large_cap_preserves_input_blob_layout` test
-  needs to either be deleted or rewritten to assert that the
-  warning *does not* fire and the output is one blob per kind.
+v2.1 (cross-input-blob coalescing) shipped. Two gaps remain; v2.2 is
+the next likely candidate, v2.3 is cheap once it lands.
 
 ### v2.2 - LocationsOnWays preservation
 
@@ -238,7 +209,8 @@ in the standard verify suite.
 doesn't, the cross-check is element-equality only, not byte-
 equality.
 
-Cheap once v2.1 lands. Skip until then.
+Cheap to add now that v2.1 has landed; pick up when a measurement
+run actually needs the third-party sanity check.
 
 ## Out of scope (still deferred past v2)
 

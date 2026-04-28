@@ -156,6 +156,30 @@ pbfhogg repack [OPTIONS] --output <OUTPUT> <FILE>
 
 **v1 limitation:** the cap fires per worker invocation, so output blobs cannot grow beyond the input blob size. Shrinking (e.g. planet 228 k -> 8 k) produces multiple output blobs per input blob and the cap fires correctly. Growing (e.g. europe 8 k -> 64 k) emits at-most-input-sized output blobs; cross-input-blob coalescing is deferred to v2.
 
+### degrade
+
+Produce a valid-but-adversarial PBF by stripping properties or perturbing structure. Each flag composes; at least one is required. Used to produce inputs for benchmarking non-optimal code paths (`sort` overlap-rewrite, `add-locations-to-ways`, `--force` fallbacks).
+
+```
+pbfhogg degrade [OPTIONS] --output <OUTPUT> <FILE>
+```
+
+| Flag | Description |
+|------|-------------|
+| `-o, --output <FILE>` | Output file |
+| `--unsort` | Clear `Sort.Type_then_ID`; perturb the element stream so at least one adjacent same-kind blob pair has overlapping IDs (one per kind that has more than `block-cap + 1` elements). Triggers `sort`'s overlap-rewrite path. |
+| `--strip-locations` | Drop the `LocationsOnWays` header feature. Inline way-node coordinates are not preserved; downstream `add-locations-to-ways` runs see a redundancy-free starting point. |
+| `--strip-indexdata` | Clear `BlobHeader.indexdata` on every OsmData blob. Forces commands into their `--force` / non-indexed fallback paths (`sort`, `getid`, `tags-filter`). Blob payloads are not decompressed. |
+| `--compression` | Blob compression [default: zlib] |
+| `--direct-io` | Use O_DIRECT to bypass page cache |
+| `--io-uring` | Use io_uring for output I/O |
+| `--generator` | Override writing program name |
+| `--output-header <K=V>` | Set output header fields (repeatable) |
+
+**Implementation paths:** `--strip-indexdata` alone runs as a blob-level passthrough (raw frames reframed with cleared `indexdata`, payload bit-identical). Any combination involving `--unsort` or `--strip-locations` decodes elements, re-encodes via `BlockBuilder`, and frames with `indexdata=None` when `--strip-indexdata` composes.
+
+**v1 scope:** `--unsort`, `--strip-locations`, `--strip-indexdata`. Other transformations from the design doc (`--strip-tagdata`, `--strip-bbox`, `--recompress`, `--drop-ids`) are deferred. The `--unsort` perturbation is the minimum-viable swap that triggers `sort`'s overlap detector; configurable chaos modes (rotate / shuffle / reverse) are deferred.
+
 ### renumber
 
 Renumber all element IDs sequentially, remapping cross-references (way node refs, relation member refs).
@@ -423,6 +447,7 @@ Which commands support `--direct-io` (O_DIRECT bypass of page cache) and `--io-u
 | cat --dedupe | Yes | Yes | Yes (R+W) | Yes | Via merge-pbf path |
 | sort | Yes | Yes | Yes (R+W) | Yes | |
 | repack | Yes | Yes | Yes (R+W) | Yes | Re-encode at configurable elements-per-blob cap |
+| degrade | Yes | Yes | Yes (R+W) | Yes | Adversarial PBF generator (--unsort / --strip-locations / --strip-indexdata) |
 | renumber | Yes | Yes | Yes (R+W) | - | |
 | extract | Yes | Yes | Yes (R+W) | - | All strategies |
 | tags-filter | Yes | Yes | Yes (R+W) | - | Both single-pass and two-pass |

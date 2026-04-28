@@ -14,6 +14,17 @@
   cross-input-blob coalescing (deferred). When the cap exceeds every
   input blob (no-op grow attempt), repack emits a stderr warning so
   the silent-identity outcome is visible.
+- **degrade**: new command. Produce a valid-but-adversarial PBF for
+  benchmarking non-optimal code paths. v1 ships three composable
+  transformations: `--unsort` (clear `Sort.Type_then_ID`, perturb the
+  element stream so at least one adjacent same-kind blob pair has
+  overlapping IDs - triggers `sort`'s overlap-rewrite path);
+  `--strip-locations` (drop the `LocationsOnWays` header feature);
+  `--strip-indexdata` (clear `BlobHeader.indexdata` on every OsmData
+  blob, forcing `--force` / non-indexed fallback paths). Flags compose;
+  at least one is required. `--strip-indexdata` alone runs as a
+  blob-level passthrough (payload bit-identical); other combinations
+  decode and re-encode through `BlockBuilder`.
 
 ### Library API
 

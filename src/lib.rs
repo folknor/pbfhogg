@@ -182,7 +182,7 @@ pub use commands::has_indexdata;
 pub use commands::HeaderOverrides;
 #[doc(hidden)]
 pub use commands::{
-    altw, apply_changes, cat, diff, getid, getparents, inspect,
+    altw, apply_changes, cat, degrade, diff, getid, getparents, inspect,
     merge_changes, renumber, repack, sort,
     tags_count, tags_filter, time_filter,
 };

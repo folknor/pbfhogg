@@ -174,6 +174,43 @@ enum Command {
         #[command(flatten)]
         header: HeaderOverrideArg,
     },
+    /// Produce a valid-but-adversarial PBF by stripping properties or
+    /// perturbing structure.
+    ///
+    /// Each flag composes; at least one is required. v1 supports
+    /// `--unsort`, `--strip-locations`, `--strip-indexdata`. Used to
+    /// produce inputs for benchmarking non-optimal code paths
+    /// (`sort` overlap-rewrite, `add-locations-to-ways`, `--force`
+    /// fallbacks).
+    Degrade {
+        /// Input PBF file
+        file: PathBuf,
+        #[command(flatten)]
+        output: OutputArg,
+        /// Clear `Sort.Type_then_ID`; perturb the element stream so at
+        /// least one adjacent same-kind blob pair has overlapping IDs.
+        #[arg(long)]
+        unsort: bool,
+        /// Drop inline way-node coordinates (`LocationsOnWays`).
+        #[arg(long)]
+        strip_locations: bool,
+        /// Clear `BlobHeader.indexdata` on every OsmData blob.
+        #[arg(long)]
+        strip_indexdata: bool,
+        /// Per-block element cap on the decode path. Hidden; used by
+        /// the test suite so `--unsort` can fire on small fixtures
+        /// without 8000+ elements per kind.
+        #[arg(long = "block-cap", default_value_t = pbfhogg::degrade::DEFAULT_BLOCK_CAP, hide = true)]
+        block_cap: usize,
+        #[command(flatten)]
+        compression: CompressionArg,
+        #[command(flatten)]
+        io: DirectIoArg,
+        #[command(flatten)]
+        uring: UringArg,
+        #[command(flatten)]
+        header: HeaderOverrideArg,
+    },
     /// Renumber all element IDs sequentially, remapping cross-references.
     ///
     /// Input must be sorted. Negative IDs (JOSM editor-local staging
@@ -810,6 +847,29 @@ fn main() -> process::ExitCode {
             io.direct_io,
             uring.io_uring,
             force.force,
+            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
+        ),
+        Command::Degrade {
+            file,
+            output,
+            unsort,
+            strip_locations,
+            strip_indexdata,
+            block_cap,
+            compression,
+            io,
+            uring,
+            header,
+        } => run_degrade(
+            &file,
+            &output.output,
+            unsort,
+            strip_locations,
+            strip_indexdata,
+            block_cap,
+            &compression.compression,
+            io.direct_io,
+            uring.io_uring,
             &HeaderOverrides::parse(header.generator, &header.output_headers)?,
         ),
         Command::Renumber {
@@ -1571,6 +1631,39 @@ fn run_repack(
         direct_io,
         io_uring,
         force,
+        overrides,
+    )?;
+    stats.print_summary();
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_degrade(
+    file: &std::path::Path,
+    output: &std::path::Path,
+    unsort: bool,
+    strip_locations: bool,
+    strip_indexdata: bool,
+    block_cap: usize,
+    compression: &str,
+    direct_io: bool,
+    io_uring: bool,
+    overrides: &HeaderOverrides,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let compression: Compression = compression.parse()?;
+    let flags = pbfhogg::degrade::DegradeFlags {
+        unsort,
+        strip_locations,
+        strip_indexdata,
+    };
+    let stats = pbfhogg::degrade::degrade(
+        file,
+        output,
+        flags,
+        block_cap,
+        compression,
+        direct_io,
+        io_uring,
         overrides,
     )?;
     stats.print_summary();

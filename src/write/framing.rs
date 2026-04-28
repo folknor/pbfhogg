@@ -238,7 +238,7 @@ fn compress_zlib(
 /// routinely exceed this. Filed as <https://github.com/osmcode/libosmium/issues/405>.
 /// Not a problem for pbfhogg's own reader or the production pipeline - only
 /// affects users who open pbfhogg-generated PBFs with osmium-tool.
-pub(super) fn encode_blob_header_into(
+pub(crate) fn encode_blob_header_into(
     blob_type: &str,
     datasize: i32,
     indexdata: Option<&[u8]>,

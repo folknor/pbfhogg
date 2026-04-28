@@ -2,6 +2,7 @@ pub mod altw;
 pub mod cat;
 #[cfg(feature = "commands")]
 pub mod check;
+pub mod degrade;
 pub mod diff;
 #[cfg(feature = "commands")]
 pub mod extract;

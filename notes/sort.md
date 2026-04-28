@@ -307,9 +307,11 @@ post-walker buffered is partly given back.
 
 ### Hotpath anatomy (`e42b0c8c`, commit `1f97fae`)
 
-Planet post-walker with `--hotpath --no-mem-check` (2x input
-memory preflight rejects planet; the bench doesn't actually need
-it, sort is O(num_blobs) memory).
+Planet post-walker with `--hotpath`. (At the time of this run the
+2x-input memory preflight in brokkr would have rejected planet,
+so the bench was originally captured under `--no-mem-check`; the
+preflight was later removed entirely. Sort itself is O(num_blobs)
+memory regardless, so the run never needed the override.)
 
 Wall 119.3 s. Top annotated frames:
 

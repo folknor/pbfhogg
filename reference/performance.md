@@ -46,7 +46,10 @@ the concurrent read/write pattern that makes it faster for merge.
 The `--type` filtered path (full decode+re-encode) and the `--clean` path
 both use `parallel_classify_phase` per kind with framed-output streamed via
 `ReorderBuffer` (commits `6184602` + `b347c0a`, 2026-04-27). Planet
-`cat --clean version`: **5m48s wall, 835 MB peak anon** (UUID `7c4e03eb`).
+`cat --clean version`: **5m34s wall, 750 MB peak anon** (UUID `f2315551`
+at `4fc8e35`, 2026-04-27 overnight; previously `7c4e03eb` 5m48s/835 MB at
+`b347c0a` re-bench - 14 s wall, 10 % anon improvement attributable to
+single-shot variance).
 
 ## Merge (apply-changes)
 
@@ -254,6 +257,22 @@ merge-walk. See `notes/altw-external.md` for the full A1 chain.
 (~16 GB) exceeds available RAM, causing thrashing. External's sequential
 I/O stays bounded.
 
+### Compression axis (Europe external, plantasjen, `--bench 1`)
+
+| Compression | Wall | Peak anon | UUID | Commit | Δ vs zlib:6 |
+|---|---:|---:|---|---|---:|
+| `zlib:6` (default) | 270.8 s | n/a | `0b89f986` | `0dc8ae1` (post-A1) | - |
+| `none` | **246.8 s** (`4m07s`) | 6.5 GB | `16c35911` | `4fc8e35` | -24.0 s, -8.9 % |
+| `zstd:1` | **233.3 s** (`3m53s`) | 6.6 GB | `e2fba1bf` | `4fc8e35` | -37.5 s, -13.9 % |
+
+The zlib:6 row was measured at an earlier commit (`0dc8ae1`); the
+none/zstd:1 rows pin the compression-axis comparison to `4fc8e35`
+(2026-04-27 overnight) but the cross-commit zlib:6 reference is not
+co-pinned. Order of magnitude matches the prior 2026-04-14 finding
+(419 s zlib:6 → 379 s zstd:1, -9.5 %, at the older `f3c53a34`/`66e43a11`
+baselines): zstd:1 wins by relieving consumer/compression saturation
+in stage 4, with similar output size.
+
 ### Current planet baselines (commit `16e3694`, plantasjen)
 
 The consolidated headline table. All rows `--bench 1` unless noted.
@@ -263,10 +282,10 @@ The consolidated headline table. All rows `--bench 1` unless noted.
 | cat (indexdata generation) | `--bench 1` | **86.5 s** | `5d90623f` | commit `aee7727` |
 | cat --type way | `--bench 3` | 45.3 s | `2fe62148` | |
 | cat --type relation | `--bench 1` | 47.7 s | `fba6e13e` | |
-| cat --clean version | `--bench 1` | **348.1 s (5m48s)** | `7c4e03eb` (commit `b347c0a`, 2026-04-27) | `parallel_classify_phase` + reorder-buffer streaming, 835 MB peak anon |
+| cat --clean version | `--bench 1` | **333.8 s (5m34s)** | `f2315551` (4fc8e35, 2026-04-27 overnight) | `parallel_classify_phase` + reorder-buffer streaming, 750 MB peak anon |
 | cat --dedupe | `--bench 1` | **7,981 s (133m)** | `1794f8a6` | single-threaded MERGEPBF path - see callout below |
 | check --refs | `--bench 1` | **53.8 s** | `7d9f5dfd` | |
-| check --ids (streaming, default) | `--bench 1` | **57.3 s** | `02595428` (commit `516129e`, 2026-04-27) | parallel_classify_phase port, 504 MB peak anon |
+| check --ids (streaming, default) | `--bench 1` | **56.4 s** | `b1fc4d2e` (4fc8e35, 2026-04-27 overnight) | parallel_classify_phase port, 457 MB peak anon |
 | check --ids --full | `--bench 1` | **63.2 s** | post-`01c67da` | |
 | getid (include mode) | `--bench 1` | **6.1 s** | `24362e36` | |
 | getid --invert | `--bench 1` | 91.0 s | `40f5bd52` | |
@@ -300,15 +319,21 @@ The consolidated headline table. All rows `--bench 1` unless noted.
 | merge-changes (planet, `--osc-range 4914..4920`, 7-OSC) | `--bench 1` | 267.2 s (4m27s) | `bef0f1fa` | |
 | merge-changes (planet, `--osc-range 4914..4920 --simplify`, 7-OSC) | `--bench 1` | 262.2 s (4m22s) | `c0d140b6` | |
 
-> **Sort `+6-7 %` regression flag.** Both default and `--io-uring` sort
-> on planet drifted slightly slower at `16e3694` vs the prior `1f97fae`
-> / `68e1ba0` baselines from 2026-04-24. Inside single-shot bench
-> noise on a sub-150-s wall, but the direction is consistent across
-> both backends - worth a `--bench 3` re-measurement before treating
-> as confirmed. No code change between those commits is an obvious
-> driver; possible candidates are the truncation-handling commits
-> (`436998b`, `12699db`) which add small per-blob branches in the
-> read path.
+> **Sort `+6-7 %` regression flag - softened by 4fc8e35 hotpath.**
+> Both default and `--io-uring` sort on planet drifted slightly slower
+> at `16e3694` vs the prior `1f97fae` / `68e1ba0` baselines from
+> 2026-04-24. Inside single-shot bench noise on a sub-150-s wall, but
+> the direction was consistent across both backends. A `sort --hotpath`
+> at `4fc8e35` (UUID `d64932d2`, 2026-04-27 overnight) ran in **115.4 s**
+> total - of which 108.6 s (94 %) was `pbfhogg::write::writer::flush`
+> and 6.77 s (6 %) was `build_blob_index`. That hotpath wall sits
+> *below* both the 124.6 s `68e1ba0` baseline and the 132.3 s `16e3694`
+> regression on the same writer-flush-dominated phase mix. Hotpath has
+> single-digit-percent instrumentation overhead on this command shape,
+> so a fresh `--bench 1` is still wanted to settle cleanly, but the
+> data point is consistent with "drift not real" rather than "drift
+> confirmed". Possible drivers if the regression *were* real remain the
+> truncation-handling commits (`436998b`, `12699db`).
 
 > **`cat --dedupe` planet 133-minute wall.** Single `MERGEPBF` phase,
 > peak anon RSS only 1.4 GB, avg cores 1.3 - the path is essentially
@@ -559,14 +584,20 @@ baseline:
 - Serial 7-OSC parse ≈ 7 × 38 s = ~265 s wall (matches measured
   267.2 s within rounding).
 - Concurrent 7-OSC parse ceiling ≈ max(per-OSC parse) + merge ≈
-  ~38-50 s.
-- Estimated win: **~210-225 s at planet 7-OSC scale**, an order of
-  magnitude bigger than the original "20-30 s" speculation in the
-  plan doc (which was sized before this baseline existed).
+  ~51 s based on the 4fc8e35 `--hotpath` (UUID `ee108ec9`,
+  2026-04-27 overnight): 7 calls to `parse_osc_streaming` totalled
+  264.42 s = 100 % of wall, with per-OSC avg 37.8 s and **P95 50.9 s**.
+- Estimated win: **~210-215 s at planet 7-OSC scale**.
 
-The 1-OSC planet bench at 43.1 s is the ceiling for that
-"max(per-OSC parse)" term - the parallel path cannot beat 43 s on
-this workload regardless of OSC count.
+The 1-OSC planet bench at 43.1 s underestimates the parallel-parse
+ceiling for the 4914..4920 range - that range's slowest OSC took
+50.9 s in the hotpath, so the true `max(per-OSC parse)` term is ~51 s
+on this workload. Different daily-diff weeks would re-establish this.
+
+The `--alloc` companion (UUID `13615a4a`) attributes 62.4 GB cumulative
+allocation across the 7 calls **entirely** to `parse_osc_streaming`;
+no other function shows on the alloc table. The parser is the only
+allocation hotspot.
 
 ## Pipeline end-to-end
 

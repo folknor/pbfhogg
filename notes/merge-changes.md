@@ -152,10 +152,12 @@ this work.
 1. ~~**Measure current state.**~~ Landed 2026-04-26 overnight at
    commit `16e3694`. Cross-dataset matrix in the "Current state"
    section above and in
-   [`reference/performance.md`](../reference/performance.md). The
-   `--hotpath` planet run was preflight-refused (estimated 184 GB
-   exceeds the 28 GB host RAM); re-bench with `--no-mem-check` to
-   capture per-OSC parse spans.
+   [`reference/performance.md`](../reference/performance.md).
+   `--hotpath` + `--alloc` captured 2026-04-27 overnight at `4fc8e35`
+   (UUIDs `ee108ec9` / `13615a4a`) once brokkr's preflight memory
+   check was removed: 100 % of wall in 7 calls to `parse_osc_streaming`,
+   per-OSC avg 37.8 s / **P95 50.9 s**, 62.4 GB cumulative alloc all
+   in `parse_osc_streaming`.
 2. ~~**Per-input parse span instrumentation.**~~ Landed 2026-04-22
    (commit `4e3c7ea`). `MERGECHANGES_PARSE_{START,END}` wrap each
    `parse_osc_streaming` and `parse_osc_into` call on both

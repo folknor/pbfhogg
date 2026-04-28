@@ -41,7 +41,7 @@ Every command listed below runs on the full planet on normal hardware. Measured 
 | `apply-changes --locations-on-ways` (daily diff) | 2m15s | ~3.3 GB |
 | `build-geocode-index` | 7m5s | ~25 GB |
 | `cat` (indexdata generation) | 1m26s | ~200 MB |
-| `cat --clean version` | 5m48s | 835 MB |
+| `cat --clean version` | 5m34s | 750 MB |
 | `cat --dedupe` | 2h13m | 1.4 GB |
 | `cat --type way` (raw passthrough) | 45s | 10 MB |
 | `check --ids` (streaming, default) | 57s | 504 MB |
@@ -164,7 +164,7 @@ pbfhogg time-filter <file> -o <out> <ts>  Filter history PBF to a timestamp
 pbfhogg build-geocode-index <f> -d <dir>  Build reverse geocoding index
 ```
 
-All write commands accept `--compression` (`none`, `zlib`, `zstd`, or with level: `zlib:9`). Default is `zlib:6` for osmium interop. For internal pipelines that don't need osmium/JOSM compatibility, `zstd:1` is a substantial wall-time win - measured ≈ −10 % on Europe `add-locations-to-ways --index-type external` (419 s → 379 s) by relieving consumer/compression saturation in stage 4, at similar output size. Commands that benefit from indexdata will error without it - pass `--force` to proceed (slower), or generate indexed PBFs with `pbfhogg cat input.osm.pbf -o indexed.osm.pbf`.
+All write commands accept `--compression` (`none`, `zlib`, `zstd`, or with level: `zlib:9`). Default is `zlib:6` for osmium interop. For internal pipelines that don't need osmium/JOSM compatibility, `zstd:1` is a substantial wall-time win - measured ≈ −14 % on Europe `add-locations-to-ways --index-type external` (270.8 s zlib:6 at `0dc8ae1` → 233.3 s zstd:1 at `4fc8e35`, UUID `e2fba1bf`) by relieving consumer/compression saturation in stage 4, at similar output size. Commands that benefit from indexdata will error without it - pass `--force` to proceed (slower), or generate indexed PBFs with `pbfhogg cat input.osm.pbf -o indexed.osm.pbf`.
 
 See [docs/cli/commands.md](docs/cli/commands.md) for detailed command documentation, [docs/guide/advanced.md](docs/guide/advanced.md) for O_DIRECT, io_uring, and index type details.
 

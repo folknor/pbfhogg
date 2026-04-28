@@ -50,10 +50,10 @@ blocks and ships everything as trailing, and the central builder
 spans input-blob boundaries to produce cap-sized output.
 
 Validated on Denmark (commit 741e482, plantasjen):
-- cap=4000 (shrink, exact div): 2.8 s — within noise of v1's 2.7 s.
-- cap=8000 (matches input default): 2.9 s — same shape, all
+- cap=4000 (shrink, exact div): 2.8 s - within noise of v1's 2.7 s.
+- cap=8000 (matches input default): 2.9 s - same shape, all
   workers produce one full block each, no merge work.
-- cap=16000 (grow, all-tail): 23 s — merge-thread bound.
+- cap=16000 (grow, all-tail): 23 s - merge-thread bound.
 
 The grow regression versus shrink is fundamental: when every input
 blob's elements end up in the trailing slice, the central builder

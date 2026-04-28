@@ -3,10 +3,13 @@
 //! Default mode preserves the full change stream in input order.
 //! `--simplify` keeps only the last change per object (type + id).
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufReader, Seek, Write};
 use std::path::Path;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
@@ -20,6 +23,30 @@ use crate::osc::write::{
 };
 use super::Result;
 use crate::MemberId;
+
+/// Wraps an `io::Read` and accumulates wall time spent in `read()` calls.
+///
+/// Used to attribute the gzip-decompress portion of `parse_osc_streaming` /
+/// `parse_osc_into` separately from the surrounding XML-parse machinery, so
+/// the parallel-parse plan in `notes/merge-changes.md` can choose between
+/// buffer-and-drain (parallel XML parse) and parallel-decompress +
+/// sequential-XML shapes with a measured gzip/XML split rather than a guess.
+/// The shared `Rc<Cell<Duration>>` lets the wrapped reader live behind a
+/// `Box<dyn io::Read>` while the outer parse function still recovers the
+/// total at end-of-call.
+struct TimedRead<R: io::Read> {
+    inner: R,
+    total: Rc<Cell<Duration>>,
+}
+
+impl<R: io::Read> io::Read for TimedRead<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let start = Instant::now();
+        let result = self.inner.read(buf);
+        self.total.set(self.total.get() + start.elapsed());
+        result
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
@@ -214,9 +241,15 @@ fn parse_one_into_stream(path: &Path, stream: &mut ChangeStream) -> Result<()> {
         #[allow(clippy::cast_possible_wrap)]
         crate::debug::emit_counter("merge_changes_input_bytes", meta.len() as i64);
     }
+    let len_before = stream.changes.len();
     crate::debug::emit_marker("MERGECHANGES_PARSE_START");
     let result = parse_osc_into(path, stream);
     crate::debug::emit_marker("MERGECHANGES_PARSE_END");
+    #[allow(clippy::cast_possible_wrap)]
+    crate::debug::emit_counter(
+        "merge_changes_changes_per_osc",
+        (stream.changes.len() - len_before) as i64,
+    );
     result
 }
 
@@ -227,10 +260,19 @@ fn parse_osc_into(path: &Path, stream: &mut ChangeStream) -> Result<()> {
     io::Read::read_exact(&mut file, &mut magic)?;
     file.seek(io::SeekFrom::Start(0))?;
 
+    let decompress_total = Rc::new(Cell::new(Duration::ZERO));
     let reader: Reader<BufReader<Box<dyn io::Read>>> = if magic == [0x1f, 0x8b] {
-        Reader::from_reader(BufReader::new(Box::new(MultiGzDecoder::new(file))))
+        let timed = TimedRead {
+            inner: MultiGzDecoder::new(file),
+            total: Rc::clone(&decompress_total),
+        };
+        Reader::from_reader(BufReader::new(Box::new(timed)))
     } else {
-        Reader::from_reader(BufReader::new(Box::new(file)))
+        let timed = TimedRead {
+            inner: file,
+            total: Rc::clone(&decompress_total),
+        };
+        Reader::from_reader(BufReader::new(Box::new(timed)))
     };
     let mut reader = reader;
     reader.config_mut().trim_text(true);
@@ -261,6 +303,11 @@ fn parse_osc_into(path: &Path, stream: &mut ChangeStream) -> Result<()> {
         buf.clear();
     }
 
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    crate::debug::emit_counter(
+        "merge_changes_decompress_ns",
+        decompress_total.get().as_nanos() as i64,
+    );
     Ok(())
 }
 
@@ -490,9 +537,15 @@ fn write_streaming(inputs: &[&Path], output: &Path) -> Result<u64> {
             #[allow(clippy::cast_possible_wrap)]
             crate::debug::emit_counter("merge_changes_input_bytes", meta.len() as i64);
         }
+        let count_before = count;
         crate::debug::emit_marker("MERGECHANGES_PARSE_START");
         parse_osc_streaming(path, &mut writer, &mut open_action, &mut count)?;
         crate::debug::emit_marker("MERGECHANGES_PARSE_END");
+        #[allow(clippy::cast_possible_wrap)]
+        crate::debug::emit_counter(
+            "merge_changes_changes_per_osc",
+            (count - count_before) as i64,
+        );
     }
 
     if let Some(prev) = open_action {
@@ -519,10 +572,19 @@ fn parse_osc_streaming(
     io::Read::read_exact(&mut file, &mut magic)?;
     file.seek(io::SeekFrom::Start(0))?;
 
+    let decompress_total = Rc::new(Cell::new(Duration::ZERO));
     let reader: Reader<BufReader<Box<dyn io::Read>>> = if magic == [0x1f, 0x8b] {
-        Reader::from_reader(BufReader::new(Box::new(MultiGzDecoder::new(file))))
+        let timed = TimedRead {
+            inner: MultiGzDecoder::new(file),
+            total: Rc::clone(&decompress_total),
+        };
+        Reader::from_reader(BufReader::new(Box::new(timed)))
     } else {
-        Reader::from_reader(BufReader::new(Box::new(file)))
+        let timed = TimedRead {
+            inner: file,
+            total: Rc::clone(&decompress_total),
+        };
+        Reader::from_reader(BufReader::new(Box::new(timed)))
     };
     let mut reader = reader;
     reader.config_mut().trim_text(true);
@@ -566,6 +628,11 @@ fn parse_osc_streaming(
         buf.clear();
     }
 
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    crate::debug::emit_counter(
+        "merge_changes_decompress_ns",
+        decompress_total.get().as_nanos() as i64,
+    );
     Ok(())
 }
 

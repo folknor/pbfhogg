@@ -22,7 +22,10 @@
   available core), each chunk emits a self-contained
   `<action>...</action>` gzip member, main thread concatenates with
   the same prelude/postlude wrapping. Planet 7-OSC `--simplify`:
-  **262s -> 74s, 3.6x** (UUID `3e3ef119` at commit `abd1d9e`).
+  **262s -> 74s, 3.6x** (UUID `3e3ef119` at commit `abd1d9e`). New
+  `-j/--jobs N` flag caps the worker pool (defaults to
+  `available_parallelism()`); useful for benchmarking sweeps and
+  capping concurrency on memory-tight hosts.
 - **repack**: new command. Re-encode a PBF with a configurable
   `--elements-per-blob N` cap. Element semantics, tags, refs, members,
   metadata, and DenseNodes encoding round-trip; output is type-sorted

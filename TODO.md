@@ -21,8 +21,6 @@ Three new docs capturing a cross-cutting insight and two new commands that fall 
 
 **Open decision on `getparents`** (see [notes/getparents.md](notes/getparents.md) current state): `HeaderWalker` path landed as experiment commit `783970a` (2026-04-24). Measured: planet 44.8 s -> 23.5 s (-46 %), europe 26.4 s -> 44.2 s (+68 %). Revert, threshold-dispatch, or accept? Deferred until `repack` produces an 8k-packed planet so the crossover point can be measured directly.
 
-- [x] ~~**[notes/merge-changes.md](notes/merge-changes.md)** - `merge-changes` parallel parse**~~ - **landed 2026-04-28**, planet 7-OSC `--osc-range 4914..4920` **267.2 s → 54.7 s, 5.0×** (UUID `b6e964cc` at commit `99057fa`, plantasjen). The headline shape is parallel-drain via per-worker gzip members: each worker runs parse + XML re-emit + gzip-compress into its own `OscWriter<Vec<u8>>`, main thread writes a pre-built prelude gzip member, the worker chunks in input order, and a postlude gzip member. Multi-member gzip is valid (osmium, osmosis, `MultiGzDecoder`, gzip CLI all support it); output bytes within 1 % of serial. 1-OSC fast path unchanged (planet 44.2 s, UUID `941a5784`). Pre-flight `c612c5e6` instrumentation (commit `fb1719c`) proved gzip = 1.5 % of wall; the abandoned middle step (parallel parse, serial drain at `43dd620`, planet 235.8 s / 1.16×, UUID `07ee92ee`) showed a 223 s serial drain ceiling on `quick_xml::Writer` emit, which the parallel-drain shape eliminates by moving emit + gzip onto the workers. Sizing detail and stage-by-stage history in `notes/merge-changes.md`; row in `reference/performance.md`'s Merge-changes section. Markers / counters: `MERGECHANGES_PARALLEL_EMIT_{START,END}`, `MERGECHANGES_DRAIN_{START,END}`, `merge_changes_decompress_ns`, `merge_changes_changes_per_osc`, plus the pre-existing `MERGECHANGES_PARSE_*`, `merge_changes_input_bytes`. **`--simplify` parallel write_simplified also landed 2026-04-28 at `abd1d9e`** (UUID `3e3ef119`): **262.2 s -> 73.7 s, 3.6× total** (write_simplified phase 197 s -> 49.4 s, 4.0× phase). Same shape as streaming parallel-drain - after BTreeMap dedupe, par_chunks each action group, each chunk emits a self-contained `<action>...</action>` gzip member, main thread concatenates. Simplify wall is 19 s slower than streaming on the same input - the gap is the dedupe phase (6.9 s) plus a slightly less efficient parse fan-out. Remaining follow-ups: re-bench germany / europe N-OSC rows (still on `16e3694` baseline); pipelined drain (begin emitting worker[0]'s chunk while worker[6] is still parsing) - peak memory drop from ~1 GB compressed in flight to ~280 MB; switch to single-member gzip if interop ever shows up as a real complaint (current consumers handle multi-member fine). The "BTreeMap dedupe alternatives" speculative item in `notes/merge-changes.md` was retired on 2026-04-28: dedupe is 9.4 % of wall (6.9 s of 73.7 s), an FxHashMap swap saves 3-5 s at most. Content factored out of `apply-changes-opportunities.md` 2026-04-21 - these items were filed under "weekly apply-changes" but apply scale-independently to any consumer that squashes N > 1 OSCs.
-
 - [ ] **[notes/sort.md](notes/sort.md)** - `sort` (repair unsorted PBFs into `Sort.Type_then_ID`). Drafted 2026-04-23. **Production reality**: Geofabrik / planet input is already sorted, so the overlap-count is ~zero and pass 2 is pure raw passthrough. The headline opportunity that helps the production case is **`copy_file_range` coalescing for passthrough runs** (hours-scope, transplant from apply-changes drain, 1.1-1.5x via syscall reduction). The bigger theoretical wins - parallel overlap-rewrite in pass 2 (1.5-3x) and HeaderWalker-based pass 1 (1.2-2x on non-indexed input) - only fire on genuinely-unsorted input, which has no dataset configured in `brokkr.toml` today. Planet hotpath + alloc captured 2026-04-27 overnight at `4fc8e35` (UUIDs `d64932d2` hotpath / `26fb329e` alloc): 115.4 s wall, **94 % in `pbfhogg::write::writer::flush`** (108.6 s) and 6 % in `build_blob_index` (6.77 s) - reaffirms the writer-side `copy_file_range` ceiling is the only lever for already-sorted input, with no allocation pressure (459 MB exclusive, all in `blob_wire::parse`). Hotpath wall sits below both the 124.6 s `68e1ba0` and 132.3 s `16e3694` bench baselines, softening the `+6-7 %` regression flag tracked in `reference/performance.md`. Anti-conversion rule (pipelined → sequential) explicitly off the table per `reference/pipelined-reader-paths.md:138`.
 
 - [ ] **[notes/getparents.md](notes/getparents.md)** - `getparents` (whole-file scan listing ways / relations referencing a given ID set). Drafted 2026-04-23, headline experiment landed 2026-04-24 (`783970a`). The HeaderWalker + `parallel_classify_phase` rewrite shipped: planet 44.8 s -> **23.5 s** (-46 %, UUID `11bc44dc` at `16e3694`), europe 26.4 s -> **44.2 s** (+68 %, blob-density asymmetry - see [reference/blob-density.md](reference/blob-density.md)). Original 4-8x estimate was wrong: blob indexdata stores `(min_id, max_id)` of *elements in the blob*, not the *ref/member IDs* the typical "find ways referencing these nodes" query cares about, so `IdSet::any_in_range()` pre-screen does not apply. Actual win comes from IO byte reduction (74.8 GB -> 30 GB at planet) by skipping blob kinds structurally incapable of producing matches. Planet hotpath at `4fc8e35` (UUID `00253c7d`): 23.0 s wall, 78 % in `parallel_classify_phase` - that **is** the post-experiment state, not headroom. The c912e4d Denmark 4.7x sequential-decode regression rule remains explicitly off the table (it targets sequential-decode conversions; `parallel_classify_phase` keeps decompression parallel via pread workers). **Open question is the europe regression**: revert / threshold-dispatch (e.g. branch on blob count or byte size) / accept. Deferred until `repack` produces an 8k-packed planet so the crossover point can be measured directly. Smaller residual opportunities in `notes/getparents.md`: blob-filter skip-rate verification (#3, hours scope), refs/members buf pre-sizing (#4, <1 % wall).
@@ -192,15 +190,6 @@ make it harder; see the entry below.
   pass-2 IdSet to disk instead of resident, or invert the
   data-flow direction (compute the *complement* of the match set
   on disk rather than keeping the kept set in RAM).
-
-### Blocked on pbfhogg CLI changes
-
-Need a pbfhogg CLI flag to exist before brokkr can forward it:
-
-- [ ] **`merge-changes -j N`** - parallel-parse axis the
-  [`notes/merge-changes.md`](notes/merge-changes.md) plan will
-  eventually deliver. Not a gap today; will appear when the feature
-  lands.
 
 ### Blocked on dataset / config
 
@@ -491,6 +480,16 @@ single-pass, tag expression and bbox filtering.
 - [ ] Migration guide from other tools - command mapping table, behavioral
   differences, indexdata workflow explanation. Build on existing
   `reference/osmium-parity.md`.
+- [ ] **Document the `merge-changes -> apply-changes` pipeline pattern in
+  README.** When applying accumulated dailies (e.g. a week worth), squashing
+  them with `merge-changes` first and then running `apply-changes` once on
+  the result is the recommended shape - cheaper than running `apply-changes`
+  N times. The 5x speedup at planet 7-OSC (commit `99057fa`, 267 s -> 55 s)
+  makes this an unambiguous recommendation now; pre-parallel the squash itself
+  was 4m27s and the calculus was murkier. Original suggestion from the
+  apply-changes Q7 reviewer round (2026-04-21), retired from the now-deleted
+  `notes/merge-changes.md` plan doc 2026-04-28 when the parallel-drain work
+  shipped. Pure documentation; no code change needed.
 - [ ] **`renumber` - maintenance polish** (current: 204.5 s / 3m25s planet at `aee7727`,
   historical 194 s at `cb99106`, 3.3 GB peak anon, zero temp disk).
   Three candidate items (varint fast path, `way_id_set` vs schedule, reframe

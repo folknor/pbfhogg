@@ -27,12 +27,10 @@ use crate::MemberId;
 
 /// Wraps an `io::Read` and accumulates wall time spent in `read()` calls.
 ///
-/// Used to attribute the gzip-decompress portion of `parse_osc_streaming` /
-/// `parse_osc_into` separately from the surrounding XML-parse machinery, so
-/// the parallel-parse plan in `notes/merge-changes.md` can choose between
-/// buffer-and-drain (parallel XML parse) and parallel-decompress +
-/// sequential-XML shapes with a measured gzip/XML split rather than a guess.
-/// The shared `Rc<Cell<Duration>>` lets the wrapped reader live behind a
+/// Used to attribute the gzip-decompress portion of `parse_osc_streaming`
+/// and `parse_osc_into` separately from the surrounding `quick_xml` parse
+/// machinery via the `merge_changes_decompress_ns` sidecar counter. The
+/// shared `Rc<Cell<Duration>>` lets the wrapped reader live behind a
 /// `Box<dyn io::Read>` while the outer parse function still recovers the
 /// total at end-of-call.
 struct TimedRead<R: io::Read> {
@@ -188,14 +186,28 @@ impl CurrentElem {
 }
 
 #[hotpath::measure]
-pub fn merge_changes(inputs: &[&Path], output: &Path, simplify: bool) -> Result<MergeChangesStats> {
+pub fn merge_changes(
+    inputs: &[&Path],
+    output: &Path,
+    simplify: bool,
+    jobs: Option<usize>,
+) -> Result<MergeChangesStats> {
     if inputs.is_empty() {
         return Err("at least one input OSC file is required".into());
     }
 
+    let worker_count = match jobs {
+        Some(n) if n > 0 => n,
+        _ => std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(8),
+    };
+
     crate::debug::emit_marker("MERGECHANGES_START");
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("merge_changes_files", inputs.len() as i64);
+    #[allow(clippy::cast_possible_wrap)]
+    crate::debug::emit_counter("merge_changes_worker_count", worker_count as i64);
     let total_bytes_in: u64 = inputs
         .iter()
         .filter_map(|p| std::fs::metadata(p).ok())
@@ -204,59 +216,43 @@ pub fn merge_changes(inputs: &[&Path], output: &Path, simplify: bool) -> Result<
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("merge_changes_total_bytes_in", total_bytes_in as i64);
 
-    let (changes_in, changes_out) = if simplify {
-        let stream = if inputs.len() <= 1 {
-            // N <= 1: serial, same as before.
-            let mut stream = ChangeStream::default();
-            for path in inputs {
-                parse_one_into_stream(path, &mut stream)?;
-            }
-            stream
-        } else {
-            // N > 1: parallel parse to per-input ChangeStream, concatenate
-            // in input order so `write_simplified`'s "later wins" BTreeMap
-            // dedupe still observes inputs in sequence order.
-            for path in inputs {
-                if let Ok(meta) = std::fs::metadata(path) {
-                    #[allow(clippy::cast_possible_wrap)]
-                    crate::debug::emit_counter("merge_changes_input_bytes", meta.len() as i64);
-                }
-            }
-
-            crate::debug::emit_marker("MERGECHANGES_PARALLEL_PARSE_START");
-            let streams: std::result::Result<Vec<ChangeStream>, String> = inputs
-                .par_iter()
-                .map(|path| -> std::result::Result<ChangeStream, String> {
-                    let mut s = ChangeStream::default();
-                    parse_osc_into(path, &mut s).map_err(|e| e.to_string())?;
-                    Ok(s)
-                })
-                .collect();
-            let streams =
-                streams.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-            crate::debug::emit_marker("MERGECHANGES_PARALLEL_PARSE_END");
-
-            let mut combined = ChangeStream::default();
-            let total_changes: usize = streams.iter().map(|s| s.changes.len()).sum();
-            combined.changes.reserve(total_changes);
-            for s in streams {
-                let len_before = combined.changes.len();
-                combined.changes.extend(s.changes);
-                #[allow(clippy::cast_possible_wrap)]
-                crate::debug::emit_counter(
-                    "merge_changes_changes_per_osc",
-                    (combined.changes.len() - len_before) as i64,
-                );
-            }
-            combined
-        };
-        let changes_in = stream.changes.len() as u64;
-        let changes_out = write_simplified(output, stream)? as u64;
-        (changes_in, changes_out)
+    // Build a scoped rayon pool when the caller passed an explicit `jobs`.
+    // Pool controls par_iter and par_chunks thread count for both the
+    // streaming and simplify paths. When `jobs` is None, the global rayon
+    // pool is used (current default behaviour).
+    let pool = if jobs.is_some() {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(worker_count)
+                .build()
+                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?,
+        )
     } else {
-        let changes_out = write_streaming(inputs, output)?;
-        (changes_out, changes_out)
+        None
     };
+
+    // The closure converts errors to String so it is Send across the
+    // pool.install boundary; the project's `BoxResult` wraps a non-Send
+    // `Box<dyn Error>` which `rayon::ThreadPool::install` cannot bridge.
+    let do_work = || -> std::result::Result<(u64, u64), String> {
+        if simplify {
+            let stream = build_simplify_stream(inputs)?;
+            let changes_in = stream.changes.len() as u64;
+            let changes_out = write_simplified(output, stream, worker_count)
+                .map_err(|e| e.to_string())? as u64;
+            Ok((changes_in, changes_out))
+        } else {
+            let changes_out =
+                write_streaming(inputs, output).map_err(|e| e.to_string())?;
+            Ok((changes_out, changes_out))
+        }
+    };
+
+    let (changes_in, changes_out) = match &pool {
+        Some(p) => p.install(do_work),
+        None => do_work(),
+    }
+    .map_err(|s| -> Box<dyn std::error::Error> { s.into() })?;
 
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("merge_changes_changes_out", changes_out as i64);
@@ -274,10 +270,61 @@ pub fn merge_changes(inputs: &[&Path], output: &Path, simplify: bool) -> Result<
     })
 }
 
+/// Build the simplify path's pre-dedupe `ChangeStream` from N inputs.
+///
+/// N <= 1: serial, same as the pre-parallel shape. N > 1: rayon
+/// `par_iter` fan-out into per-input streams, concatenated in input order
+/// so `write_simplified`'s "later inputs win" `BTreeMap` dedupe still
+/// observes inputs in sequence order. Errors are returned as `String`
+/// so the closure can be `Send` across the `rayon::ThreadPool::install`
+/// boundary in `merge_changes`.
+fn build_simplify_stream(inputs: &[&Path]) -> std::result::Result<ChangeStream, String> {
+    if inputs.len() <= 1 {
+        let mut stream = ChangeStream::default();
+        for path in inputs {
+            parse_one_into_stream(path, &mut stream).map_err(|e| e.to_string())?;
+        }
+        return Ok(stream);
+    }
+
+    for path in inputs {
+        if let Ok(meta) = std::fs::metadata(path) {
+            #[allow(clippy::cast_possible_wrap)]
+            crate::debug::emit_counter("merge_changes_input_bytes", meta.len() as i64);
+        }
+    }
+
+    crate::debug::emit_marker("MERGECHANGES_PARALLEL_PARSE_START");
+    let streams: std::result::Result<Vec<ChangeStream>, String> = inputs
+        .par_iter()
+        .map(|path| -> std::result::Result<ChangeStream, String> {
+            let mut s = ChangeStream::default();
+            parse_osc_into(path, &mut s).map_err(|e| e.to_string())?;
+            Ok(s)
+        })
+        .collect();
+    let streams = streams?;
+    crate::debug::emit_marker("MERGECHANGES_PARALLEL_PARSE_END");
+
+    let mut combined = ChangeStream::default();
+    let total_changes: usize = streams.iter().map(|s| s.changes.len()).sum();
+    combined.changes.reserve(total_changes);
+    for s in streams {
+        let len_before = combined.changes.len();
+        combined.changes.extend(s.changes);
+        #[allow(clippy::cast_possible_wrap)]
+        crate::debug::emit_counter(
+            "merge_changes_changes_per_osc",
+            (combined.changes.len() - len_before) as i64,
+        );
+    }
+    Ok(combined)
+}
+
 /// Wrap `parse_osc_into` in the `MERGECHANGES_PARSE_{START,END}` pair so
-/// `brokkr sidecar --durations` can measure each input's parse wall and
-/// the parallel-parse opportunity can be sized against the per-OSC share
-/// of serial wall (the plan prerequisite in TODO.md / notes/merge-changes.md).
+/// `brokkr sidecar --durations` can measure each input's parse wall, and
+/// emit `merge_changes_changes_per_osc` on the post-parse stream length
+/// delta so the per-input change count is observable in the sidecar.
 fn parse_one_into_stream(path: &Path, stream: &mut ChangeStream) -> Result<()> {
     if let Ok(meta) = std::fs::metadata(path) {
         #[allow(clippy::cast_possible_wrap)]
@@ -917,7 +964,11 @@ fn emit_change<W: io::Write>(
 }
 
 #[hotpath::measure]
-fn write_simplified(output: &Path, stream: ChangeStream) -> Result<usize> {
+fn write_simplified(
+    output: &Path,
+    stream: ChangeStream,
+    worker_count: usize,
+) -> Result<usize> {
     crate::debug::emit_marker("MERGECHANGES_SIMPLIFY_START");
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("merge_changes_changes_in", stream.changes.len() as i64);
@@ -955,10 +1006,6 @@ fn write_simplified(output: &Path, stream: ChangeStream) -> Result<usize> {
     // `quick_xml::Writer` + zlib ceiling that bottlenecked the
     // streaming path's abandoned parallel-parse-only stage. Same
     // mechanism, same fix.
-    let num_workers = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(8);
-
     crate::debug::emit_marker("MERGECHANGES_PARALLEL_EMIT_START");
     let mut all_chunks: Vec<Vec<u8>> = Vec::new();
     for (action, group) in [
@@ -969,7 +1016,7 @@ fn write_simplified(output: &Path, stream: ChangeStream) -> Result<usize> {
         if group.is_empty() {
             continue;
         }
-        let chunk_len = group.len().div_ceil(num_workers).max(1);
+        let chunk_len = group.len().div_ceil(worker_count).max(1);
         let chunks: std::result::Result<Vec<Vec<u8>>, String> = group
             .par_chunks(chunk_len)
             .map(|chunk| -> std::result::Result<Vec<u8>, String> {

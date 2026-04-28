@@ -531,8 +531,7 @@ auto-detect on this 24-thread host lands the same workload at
 output. Two production code paths: **streaming** (`write_streaming`,
 the default) and **simplify** (`--simplify`, builds an in-memory
 overlay then writes the latest change per object via a `BTreeMap`
-dedupe). Optimization plan and history in
-[`notes/merge-changes.md`](../notes/merge-changes.md).
+dedupe).
 
 The 1-OSC vs N-OSC axis is the load-bearing distinction: a single OSC
 measures fixed setup + per-OSC parse + per-OSC write; an N-OSC squash

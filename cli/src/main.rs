@@ -566,6 +566,13 @@ enum Command {
         /// Keep only the last change per object (type + id)
         #[arg(long)]
         simplify: bool,
+        /// Parallel worker threads. `1` forces sequential, `0` auto-picks
+        /// from `available_parallelism()`, higher values cap the worker
+        /// pool. Affects both the per-input parse fan-out (capped by
+        /// input count) and the simplify path's `write_simplified` chunk
+        /// fan-out.
+        #[arg(short = 'j', long = "jobs", default_value_t = 0)]
+        jobs: usize,
     },
     /// Validate PBF file integrity (IDs + referential integrity)
     Check {
@@ -1236,7 +1243,8 @@ fn main() -> process::ExitCode {
             changes,
             output,
             simplify,
-        } => run_merge_changes(&changes, &output.output, simplify),
+            jobs,
+        } => run_merge_changes(&changes, &output.output, simplify, jobs),
         Command::Check {
             file,
             ids,
@@ -2515,9 +2523,11 @@ fn run_merge_changes(
     changes: &[PathBuf],
     output: &std::path::Path,
     simplify: bool,
+    jobs: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let inputs: Vec<&std::path::Path> = changes.iter().map(AsRef::as_ref).collect();
-    let stats = pbfhogg::merge_changes::merge_changes(&inputs, output, simplify)?;
+    let jobs = if jobs == 0 { None } else { Some(jobs) };
+    let stats = pbfhogg::merge_changes::merge_changes(&inputs, output, simplify, jobs)?;
     stats.print_summary();
     Ok(())
 }

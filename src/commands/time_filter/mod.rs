@@ -101,16 +101,9 @@ pub fn time_filter(
     let stats = if is_history {
         time_filter_history(reader, &mut writer, cutoff_timestamp)?
     } else {
-        // Cap pipeline decode-ahead at 8 (default 32) for the
-        // snapshot path. The cross-thread PrimitiveBlock retention
-        // pattern documented at pipeline.rs:66-89 leaves freed bytes
-        // on the decode-thread brk arenas; tighter alloc-free
-        // distance lets glibc reuse arena slots instead of growing
-        // them. The 2026-04-28 e06c6ad attempt measured
-        // pipeline_reorder_high_water = 53 (resized past the default
-        // 32 cap) and per-batch RSS climb of ~200 MB, so the
-        // in-flight window itself is a meaningful contributor.
-        let reader = reader.decode_ahead(8);
+        // decode_ahead default = 32. Tested decode_ahead=8 at planet
+        // 2026-04-28 (commit 9fffdc4): same ~28 GB ceiling, wall
+        // 1m18s -> 1m58s (decode pool starved). Not a useful knob.
         time_filter_snapshot(reader, &mut writer, cutoff_timestamp)?
     };
 
@@ -231,19 +224,19 @@ fn time_filter_snapshot(
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     cutoff_timestamp: i64,
 ) -> Result<TimeFilterStats> {
-    // Lower glibc's mmap threshold so cross-thread `PrimitiveBlock`
-    // allocations route through mmap and get released to the OS on
-    // free. The 2026-04-28 planet attempts at 4800c0a / e06c6ad
-    // showed mallinfo2 `arena` (brk-managed) climbing to 34 GB while
-    // `hblkhd` (mmap-managed) stayed flat at 534 KB - the documented
-    // cross-thread retention pattern (pipeline.rs:66-89) lives
-    // entirely in the brk arena because PrimitiveBlock's many
-    // small-but-numerous allocations all sit below the default
-    // 128 KB threshold. malloc_trim(0) at every batch boundary on
-    // the e06c6ad attempt couldn't reach buried freed pages and
-    // didn't bound RSS. 64 KB threshold pushes more allocs into
-    // the unmappable category at modest mmap-syscall cost.
-    let _ = crate::debug::set_mmap_threshold(64 * 1024);
+    // Allocator-knob attempts (2026-04-28) all hit the same ~28 GB
+    // ceiling at planet:
+    //   - default mallopt (4800c0a): arena climbs to 34 GB, hblkhd flat.
+    //   - +malloc_trim(0)/batch (e06c6ad): trim_released=1 each call,
+    //     RSS curve ~unchanged. Trim only releases top-of-brk; freed
+    //     pages buried mid-arena across decode threads stay mapped.
+    //   - +mallopt(M_MMAP_THRESHOLD,64K)+decode_ahead=8 (9fffdc4):
+    //     arena 42 MB / hblkhd 32 GB - same total. mmap'd allocations
+    //     ARE genuinely live according to mallinfo, not retention.
+    // The ~28 GB working set is structural to the parallel-decode +
+    // batch-collect + parallel-writer shape, not a glibc artefact.
+    // Fixing it requires a different shape (sequential reader or
+    // worker-emits-then-drops-locally), not a tuning knob.
 
     let mut stats = TimeFilterStats {
         versions_seen: 0,
@@ -300,20 +293,15 @@ fn time_filter_snapshot(
         // negligible cost relative to per-batch wall.
         crate::read::pipeline_metrics::PIPELINE_METRICS.emit();
         crate::write::metrics::WRITER_METRICS.emit();
-        // Per-batch mallinfo2 + malloc_trim. The cross-thread
-        // PrimitiveBlock retention pattern (pipeline.rs:66-89) leaves
-        // freed chunks on the decode-thread arena's free list - glibc
-        // doesn't return those pages to the OS, so anon RSS climbs
-        // ~200 MB/batch even though the live working set is bounded.
-        // `malloc_trim(0)` forces glibc to scan all arenas and release
-        // free chunks back to the OS. Cost ~ms per call. The mallinfo2
-        // emit captures arena (brk-managed) vs hblkhd (mmap-managed) so
-        // the sidecar timeline shows how trim affects each.
-        crate::debug::emit_mallinfo2("timefilter_snapshot_batch_pre_trim");
-        let trim_result = crate::debug::malloc_trim();
-        #[allow(clippy::cast_possible_wrap)]
-        crate::debug::emit_counter("timefilter_snapshot_batch_trim_released", i64::from(trim_result));
-        crate::debug::emit_mallinfo2("timefilter_snapshot_batch_post_trim");
+        // Per-batch mallinfo2: arena (brk-managed) vs hblkhd
+        // (mmap-managed) split. The 2026-04-28 e06c6ad / 9fffdc4
+        // attempts established that the snapshot path's planet RSS
+        // is genuine working set, not glibc retention - which one
+        // you see in arena vs hblkhd depends on M_MMAP_THRESHOLD
+        // tuning, but the total is the same. Keep this emit for
+        // future investigations; it cost a few microseconds and
+        // makes the residency story unambiguous.
+        crate::debug::emit_mallinfo2("timefilter_snapshot_batch_mallinfo");
         crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_BATCH_END");
         result
     };

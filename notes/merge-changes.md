@@ -64,67 +64,95 @@ not `load_all_diffs`.
 
 ### Parallel OSC parse
 
-Parse each OSC concurrently; merge results with newer-wins semantics
-in sequence order. Per-element dedupe primitive:
-[`IdSet::set_atomic_if_new`](../src/idset.rs) (atomic fetch-or under
-shared `&self`). `IdSet::set_if_new` is the non-atomic variant for
-single-threaded paths. Pre-allocate per element type via
-`IdSet::pre_allocate(max_id)`.
+Parse each OSC concurrently; merge results in sequence order. Per-input
+work is independent; the join is a deterministic main-thread drain.
 
-Two plausible shapes depending on which production path is being
-optimised:
+**Pre-flight measurement (2026-04-28, commit `fb1719c`, UUID
+`c612c5e6`):** Added `merge_changes_decompress_ns` (via a
+`TimedRead<R>` wrapper around the file/gzip reader) and
+`merge_changes_changes_per_osc` (per-input change-count delta) to
+both production parse shapes. Planet 7-OSC re-bench:
 
-- **Simplify path**: each worker parses one OSC into its own
-  `ChangeStream`; main thread drains the per-worker streams into the
-  `BTreeMap` in sequence order so "later wins" survives. The
-  `set_atomic_if_new` primitive can replace the `BTreeMap` entirely
-  if measurements show it dominating the wall.
-- **Streaming path**: the output is event-ordered XML, not an
-  overlay, so "parse in parallel, write sequentially" only helps if
-  gzip decompress and XML parse are both concurrent with the writer.
-  The simpler win may be parallel gzip decompress + sequential XML
-  parse if the hotpath breakdown shows decompress dominating.
+| OSC | Input MB | Wall (s) | Decompress (s) | Decompress % | Changes |
+|----:|---------:|---------:|---------------:|-------------:|--------:|
+|   1 |     97.3 |    39.59 |          0.576 |         1.5% | 3.74 M |
+|   2 |     97.1 |    38.67 |          0.578 |         1.5% | 3.86 M |
+|   3 |    130.2 |    52.54 |          0.785 |         1.5% | 5.80 M |
+|   4 |     87.1 |    34.71 |          0.513 |         1.5% | 3.41 M |
+|   5 |     72.7 |    29.70 |          0.429 |         1.4% | 2.62 M |
+|   6 |     80.2 |    31.50 |          0.468 |         1.5% | 3.06 M |
+|   7 |    106.2 |    45.87 |          0.629 |         1.4% | 3.78 M |
+| **sum** | **670.9** | **272.57** | **3.98** | **1.5%** | **26.26 M** |
 
-Each OSC is independent work. The merge / write pass is a few seconds
-over the combined content; parallel parse scales with OSC count up to
-available cores.
+**Two findings reshape the implementation choice.**
 
-**Sizing against the measured 2026-04-26 baseline:**
+1. **Gzip decompress is 1.5 % of wall.** The "parallel gzip
+   decompress + sequential XML parse" alternative is dead - there is
+   nothing to win there. The 98.5 % remainder is XML parse + output
+   XML emit + output gzip-compress, all interleaved on one thread in
+   the streaming shape.
+2. **The win must come from parallel XML parsing**, which forces a
+   buffer-and-drain shape: each worker parses its OSC into a local
+   `ChangeStream`, the main thread iterates streams in input order
+   and emits XML to the writer.
 
-- Serial 7-OSC planet parse ≈ 7 × 38.2 s = 267 s wall (matches the
-  measured `bef0f1fa` 267.2 s within rounding - confirms parse-cost
-  is essentially the entire wall, write tail is negligible).
-- Concurrent 7-OSC parse ceiling ≈ max(per-OSC parse) + merge ≈
-  the 1-OSC wall (43.1 s) plus a small merge pass.
-- **Estimated win: ~210-225 s at planet 7-OSC scale**. The reviewer
-  2 Q7 estimate of 20-30 s was sized before the baseline existed
-  and turns out to have been an order of magnitude low - it
-  assumed parse was 30-40 s of total wall, but the actual
-  serial-parse share is ~265 s of 267 s.
+**Decision: buffer-and-drain.** Both production paths take the same
+shape:
 
-The 1-OSC planet bench at 43.1 s is the floor for the
-"max(per-OSC parse)" term - the parallel path cannot beat 43 s on
-this workload regardless of OSC count. Below that floor would
-require parallelizing the per-OSC parse itself (gzip decompress
-concurrent with XML parse), which is a separate item.
+- **Streaming path**: each worker calls `parse_osc_into` (already
+  exists) to build a local `ChangeStream`. Main thread drains
+  streams[0..N] in input order, emitting XML to the existing
+  `OscWriter` via the existing `emit_change` /
+  `write_change_to` helpers. `open_action` grouping flows across
+  the drain so the action-tag elision optimization survives.
+- **Simplify path**: each worker calls `parse_osc_into` into a
+  local `ChangeStream`. Main thread inserts streams[0..N] into the
+  global `BTreeMap` in input order, so "later inputs win" semantics
+  survive (the existing serial loop already relies on insertion
+  order). Stage afterwards is unchanged.
+
+**Per-worker `ChangeStream` peak memory.** Largest single OSC at
+planet 7-OSC: 5.80 M changes. Average residual per `Change` (Action
++ enum-wrapped `OwnedNode` / `OwnedWay` / `OwnedRelation` with
+inline tags / refs / members) is hard to size exactly without an
+RSS sample, but a crude estimate from typical OSC content is
+~120-200 B / change residual after parser scratch is freed, putting
+the per-worker peak at ~700 MB - 1.2 GB for OSC 3, lower for
+others. **All-7-streams-buffered ceiling: ~4 GB.** Comfortable on
+the 23 GB reference host (plantasjen). Pipelining the drain
+(begin emitting streams[0] while streams[1..6] are still parsing)
+trims peak to ~2-3 in-flight streams (~1.5-2 GB) but is an
+optimization, not a correctness requirement.
+
+**Revised win estimate.** The original sizing
+(~210-225 s, "ceiling = max(per-OSC parse) + merge") missed that
+the streaming shape currently emits XML + gzip-compresses output
+*during* parse. Once parse is decoupled, the drain pass becomes a
+new serial cost: re-walking 26.26 M changes, emitting XML, and
+gzip-compressing 968 MB of output. Output gzip-compress alone
+(zlib level 6, 968 MB output) is in the 20-60 s range based on
+zlib throughput on this host.
+
+- Max per-OSC parse from `c612c5e6` table: 52.5 s (OSC 3).
+- Drain pass estimate: 30-60 s (XML emit + zlib output).
+- **New ceiling: ~80-115 s at planet 7-OSC scale**, vs the 272.6 s
+  baseline. **Estimated win: ~160-190 s, ~2.4-3.4x speedup.**
+
+If the drain-pass gzip-compress dominates the new wall, swapping
+the output through `ParallelGzipWriter`
+([`src/write/parallel_gzip.rs`](../src/write/parallel_gzip.rs))
+recovers the bulk of it (proven ~10 % win in `diff --format osc`
+assembly, larger here because output is pure-zlib without any
+upstream parallelism stealing cores).
+
+The 1-OSC planet bench at 43.1 s is **not** the floor for the
+parallel path under the new sizing - decoupling parse from output
+introduces a drain cost that the 1-OSC serial wall does not pay.
+Below ~80 s on planet 7-OSC requires either a `ParallelGzipWriter`
+output or pipelining drain with parse.
 
 No win at 1-OSC scale. The feature only fires when the input slice
-has length > 1, and scales with input count. The 1-OSC planet bench
-above pins this empirically: the wall is per-OSC parse, no
-concurrency to extract.
-
-### Parallel gzip output
-
-`write_streaming` and `write_simplified` both write gzip-compressed
-XML on the main thread. If the hotpath breakdown shows the
-`MERGECHANGES_WRITE_FINISH_{START,END}` span is a non-trivial fraction
-of wall, substitute
-[`ParallelGzipWriter`](../src/write/parallel_gzip.rs) (already proven
-in `diff --format osc` assembly - ~10% wall win there). No API change
-to callers; it implements `Write`.
-
-Gated on tomorrow's sidecar data - if the writer tail is under ~15%
-of wall, deprioritise.
+has length > 1.
 
 ### Simplify dedupe: BTreeMap alternatives
 
@@ -169,6 +197,16 @@ this work.
    production consumers. Parallelisation target is the two
    production shapes in
    [`src/commands/merge_changes/mod.rs`](../src/commands/merge_changes/mod.rs).
+4. ~~**Gzip-vs-XML and per-OSC change-count instrumentation.**~~
+   Landed 2026-04-28 (commit `fb1719c`). `TimedRead<R>` wrapper
+   accumulates `read()` wall time so `merge_changes_decompress_ns`
+   attributes gzip work separately from the surrounding
+   quick-xml machinery. `merge_changes_changes_per_osc` emitted on
+   the per-input `count` / `stream.changes.len()` delta sizes the
+   per-worker `ChangeStream` peak. Re-bench `c612c5e6` proved
+   gzip = 1.5 % of wall, killing the parallel-decompress
+   alternative and locking in the buffer-and-drain shape; see the
+   measurement table in "Parallel OSC parse" above.
 
 ## Cross-references
 

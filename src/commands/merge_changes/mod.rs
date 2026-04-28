@@ -16,6 +16,7 @@ use flate2::write::GzEncoder;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, Event};
 use quick_xml::name::QName;
 use quick_xml::{Reader, Writer};
+use rayon::prelude::*;
 
 use crate::osc::write::{
     OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay,
@@ -204,10 +205,51 @@ pub fn merge_changes(inputs: &[&Path], output: &Path, simplify: bool) -> Result<
     crate::debug::emit_counter("merge_changes_total_bytes_in", total_bytes_in as i64);
 
     let (changes_in, changes_out) = if simplify {
-        let mut stream = ChangeStream::default();
-        for path in inputs {
-            parse_one_into_stream(path, &mut stream)?;
-        }
+        let stream = if inputs.len() <= 1 {
+            // N <= 1: serial, same as before.
+            let mut stream = ChangeStream::default();
+            for path in inputs {
+                parse_one_into_stream(path, &mut stream)?;
+            }
+            stream
+        } else {
+            // N > 1: parallel parse to per-input ChangeStream, concatenate
+            // in input order so `write_simplified`'s "later wins" BTreeMap
+            // dedupe still observes inputs in sequence order.
+            for path in inputs {
+                if let Ok(meta) = std::fs::metadata(path) {
+                    #[allow(clippy::cast_possible_wrap)]
+                    crate::debug::emit_counter("merge_changes_input_bytes", meta.len() as i64);
+                }
+            }
+
+            crate::debug::emit_marker("MERGECHANGES_PARALLEL_PARSE_START");
+            let streams: std::result::Result<Vec<ChangeStream>, String> = inputs
+                .par_iter()
+                .map(|path| -> std::result::Result<ChangeStream, String> {
+                    let mut s = ChangeStream::default();
+                    parse_osc_into(path, &mut s).map_err(|e| e.to_string())?;
+                    Ok(s)
+                })
+                .collect();
+            let streams =
+                streams.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            crate::debug::emit_marker("MERGECHANGES_PARALLEL_PARSE_END");
+
+            let mut combined = ChangeStream::default();
+            let total_changes: usize = streams.iter().map(|s| s.changes.len()).sum();
+            combined.changes.reserve(total_changes);
+            for s in streams {
+                let len_before = combined.changes.len();
+                combined.changes.extend(s.changes);
+                #[allow(clippy::cast_possible_wrap)]
+                crate::debug::emit_counter(
+                    "merge_changes_changes_per_osc",
+                    (combined.changes.len() - len_before) as i64,
+                );
+            }
+            combined
+        };
         let changes_in = stream.changes.len() as u64;
         let changes_out = write_simplified(output, stream)? as u64;
         (changes_in, changes_out)
@@ -532,20 +574,70 @@ fn write_streaming(inputs: &[&Path], output: &Path) -> Result<u64> {
 
     let mut open_action: Option<Action> = None;
     let mut count = 0u64;
-    for path in inputs {
-        if let Ok(meta) = std::fs::metadata(path) {
+
+    if inputs.len() <= 1 {
+        // N <= 1: no parallelism available. Use the original serial
+        // streaming path that emits XML during parse - one-pass, no
+        // buffer-and-drain cost. Avoids the regression a forced
+        // buffer-and-drain would inflict at single-OSC scale (drain pass
+        // is pure overhead when there is no parse to overlap with).
+        for path in inputs {
+            if let Ok(meta) = std::fs::metadata(path) {
+                #[allow(clippy::cast_possible_wrap)]
+                crate::debug::emit_counter("merge_changes_input_bytes", meta.len() as i64);
+            }
+            let count_before = count;
+            crate::debug::emit_marker("MERGECHANGES_PARSE_START");
+            parse_osc_streaming(path, &mut writer, &mut open_action, &mut count)?;
+            crate::debug::emit_marker("MERGECHANGES_PARSE_END");
             #[allow(clippy::cast_possible_wrap)]
-            crate::debug::emit_counter("merge_changes_input_bytes", meta.len() as i64);
+            crate::debug::emit_counter(
+                "merge_changes_changes_per_osc",
+                (count - count_before) as i64,
+            );
         }
-        let count_before = count;
-        crate::debug::emit_marker("MERGECHANGES_PARSE_START");
-        parse_osc_streaming(path, &mut writer, &mut open_action, &mut count)?;
-        crate::debug::emit_marker("MERGECHANGES_PARSE_END");
-        #[allow(clippy::cast_possible_wrap)]
-        crate::debug::emit_counter(
-            "merge_changes_changes_per_osc",
-            (count - count_before) as i64,
-        );
+    } else {
+        // N > 1: parallel parse (gzip + XML) into per-input ChangeStream,
+        // then drain in input order to emit XML to the output writer.
+        // Locked-in 2026-04-28 by `c612c5e6` measurement showing gzip is
+        // 1.5 % of wall - parallelism must target the XML parse phase,
+        // which forces buffer-and-drain. See notes/merge-changes.md.
+        for path in inputs {
+            if let Ok(meta) = std::fs::metadata(path) {
+                #[allow(clippy::cast_possible_wrap)]
+                crate::debug::emit_counter("merge_changes_input_bytes", meta.len() as i64);
+            }
+        }
+
+        crate::debug::emit_marker("MERGECHANGES_PARALLEL_PARSE_START");
+        // Convert closure errors to String so the closure return type is
+        // Send + Sync (rayon requires it). `parse_osc_into` returns
+        // BoxResult = `Result<(), Box<dyn Error>>` which is not Send.
+        let streams: std::result::Result<Vec<ChangeStream>, String> = inputs
+            .par_iter()
+            .map(|path| -> std::result::Result<ChangeStream, String> {
+                let mut s = ChangeStream::default();
+                parse_osc_into(path, &mut s).map_err(|e| e.to_string())?;
+                Ok(s)
+            })
+            .collect();
+        let streams = streams.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        crate::debug::emit_marker("MERGECHANGES_PARALLEL_PARSE_END");
+
+        crate::debug::emit_marker("MERGECHANGES_DRAIN_START");
+        for stream in streams {
+            let count_before = count;
+            for change in &stream.changes {
+                emit_change(&mut writer, &mut open_action, change)?;
+                count += 1;
+            }
+            #[allow(clippy::cast_possible_wrap)]
+            crate::debug::emit_counter(
+                "merge_changes_changes_per_osc",
+                (count - count_before) as i64,
+            );
+        }
+        crate::debug::emit_marker("MERGECHANGES_DRAIN_END");
     }
 
     if let Some(prev) = open_action {

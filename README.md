@@ -65,7 +65,8 @@ Every command listed below runs on the full planet on normal hardware. Measured 
 | `multi-extract --smart -c` (5 regions, Europe bbox) | 13m58s | 22.9 GB |
 | `renumber` | 3m25s | 3.3 GB |
 | `sort` (already-sorted input) | 2m04s | 476 MB |
-| `tags-filter` (default two-pass, `w/highway=primary`) | 1m48s | 2.6 GB |
+| `tags-filter` (default two-pass, `w/highway=primary`) | 1m57s | 2.6 GB |
+| `tags-filter -i w/highway=primary` (invert-match) | 7m57s | 7.0 GB |
 | `tags-filter -R highway=primary` | 52s | 688 MB |
 | `time-filter` (snapshot, cutoff 2024-01-01) | 4m30s | 812 MB |
 
@@ -79,9 +80,10 @@ The goal for pbfhogg 1.0 is that every CLI command must be planet-scale safe on 
 
 ### Not yet planet-safe
 
-| Command | Status | Note |
-|---------|--------|------|
-| `tags-filter --invert-match w/highway=primary` | 28.3 GB peak anon (no headroom) | Same structural cause as the now-resolved `time-filter` snapshot OOM; migration to `parallel_classify_phase` template scheduled - see [TODO.md](TODO.md) |
+All commands now pass at planet scale on the 28 GB-free reference host. The
+"not yet planet-safe" status was resolved 2026-04-28 with the migrations of
+`time-filter` (snapshot path) and `tags-filter` (way-deps phase) to the
+`parallel_classify_phase` + `ReorderBuffer` template.
 
 ## Usage
 

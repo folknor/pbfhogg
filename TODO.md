@@ -115,12 +115,11 @@ that are not currently driven by `overnight.sh`.
 
 ### 1.0 blockers (planet OOM or RSS-exceeds-ceiling)
 
-One command remains after the four 2026-04-27 / 2026-04-28 fixes:
-`check --ids` streaming (`516129e`), `cat --clean` (`b347c0a`),
-and `time-filter` (`83183fb`) all migrated to `parallel_classify_phase`
-+ `ReorderBuffer`; the residual is `tags-filter --invert-match`,
-which shares the same root cause and same migration template.
-Mirrored in the README's "Not yet planet-safe" table.
+**All resolved 2026-04-27 / 2026-04-28** via `parallel_classify_phase`
++ `ReorderBuffer` migrations: `check --ids` streaming (`516129e`),
+`cat --clean` (`b347c0a`), `time-filter` snapshot (`83183fb`),
+`tags-filter` way-deps phase (`17b116c`). README's "Not yet
+planet-safe" table is now empty.
 
 - [x] ~~**`check --ids` (streaming default mode)**~~ - **fixed
   2026-04-27** (commit `516129e`). Rewrote streaming entry to use
@@ -171,31 +170,35 @@ Mirrored in the README's "Not yet planet-safe" table.
   parallelism, but no history PBF is configured in `brokkr.toml`
   so it doesn't show up in the snapshot-path planet bench - keep
   separate from this entry.
-- [ ] **`tags-filter --invert-match w/highway=primary`** - 461.2 s
-  wall, **28.3 GB peak anon** (UUID `6665605a`). **Same root cause
-  as `time-filter`**: shared pipeline shape
-  (`for_each_primitive_block_batch` + `par_iter().map_init(BlockBuilder)`
-  + `collect` + drain) at high keep rate (invert keeps ~99 % of
-  ways) hits the same structural ~28 GB ceiling. The per-blob
-  match-or-keep filter is independent across blocks; doesn't need
-  cross-block state. Earlier diagnosis ("workload-shape, not
-  pipeline retention" / pass-2 IdSet sizing) was wrong: the IdSet
-  is a tiny fraction of the 28 GB; the bulk is cross-thread
-  `PrimitiveBlock` retention amplified by the per-batch result-Vec
-  holding pattern, exactly the same as time-filter's measured
-  29-30 GB ceiling. Did not OOM in the overnight run but has zero
-  headroom against the 28 GB reference - concurrent workload or
-  slightly fuller page cache would tip it over.
-  **Migration template**: same `parallel_classify_phase` +
-  `ReorderBuffer` shape that landed for `cat --clean` and
-  `check --ids` and is the chosen fix for time-filter (see entry
-  above). Two-pass tags-filter wraps the migration around the
-  pass-2 single-pass writer; pass-1 (the IdSet population scan)
-  stays as is. Single-pass `-R` (omit-referenced) maps cleanly to
-  one parallel_classify_phase call. Land tags-filter migration
-  *after* time-filter so the shared helpers (frame_owned_blocks,
-  drain_classify_phase) extract from a working precedent rather
-  than getting designed up-front.
+- [x] ~~**`tags-filter --invert-match w/highway=primary`**~~ -
+  **LANDED 2026-04-28** (commit `17b116c`). The 28.3 GB peak from
+  the earlier 16e3694 bench (UUID `6665605a`) was misattributed
+  to pass 2 in the prior diagnosis. The 2026-04-28 reproduction
+  on the time-filter-migration commit `4f16591` (UUID `9044c456`)
+  showed pass 2 only peaks at **7.04 GB** - it already uses the
+  right shape (custom pread-from-workers + ReorderBuffer, lines
+  852-961 of `tags_filter/mod.rs`). The actual 24.09 GB peak was
+  in **`collect_way_node_dependencies`**, which used
+  `parallel_classify_accumulate` with a per-worker `IdSet`: the
+  bitmap is sized by the node ID space (~1.5 GB at planet),
+  multiplied by ~30 decode threads. Documentation at
+  `scan/classify.rs:300-308` already flagged this exact pattern
+  as a known concern at 14.59 GB at planet. Migration: switched
+  to `parallel_classify_phase` so workers emit per-blob
+  `Vec<i64>` of way node-refs (bounded by blob size, ~640 KB max),
+  consumer merges into one shared IdSet through the 32-slot
+  result channel. Re-bench (UUID `7e74981a`): **planet 7m57s
+  wall, 6.97 GB peak anon** (was 8m08s / 24 GB; **−71 % RSS**,
+  wall ~unchanged). Default mode `tags-filter w/highway=primary`
+  re-bench (UUID `258a2e9a`): 1m57s / 2.59 GB (was 1m48s / 2.6 GB;
+  +8 % wall, RSS unchanged). `collect_relation_member_closure`
+  was NOT migrated despite using the same per-worker pattern -
+  its merge step needs `&mut included_relation_ids` while
+  classify needs `&included_relation_ids`, so they cannot
+  co-exist in one parallel_classify_phase invocation; the
+  per-worker accumulation there is also bounded enough (6.8 GB
+  peak even at planet invert-match). Pinned in a comment block
+  inside the function.
 
 ### Latent same-shape risks (not gating 1.0)
 

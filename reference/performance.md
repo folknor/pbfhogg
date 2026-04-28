@@ -315,9 +315,9 @@ The consolidated headline table. All rows `--bench 1` unless noted.
 | diff-snapshots text `-j 16` | `--bench 1` | **227.5 s** | `22a5eb55` | |
 | diff-snapshots osc `-j 16` | `--bench 1` | **293.8 s** | `cdcaa4f1` | |
 | build-geocode-index | `--bench 1` | **424.8 s** | `2b412af4` (2026-04-26) | |
-| merge-changes (planet, `--osc-seq 4913`, 1-OSC) | `--bench 1` | 43.1 s | `76f78e8b` | |
-| merge-changes (planet, `--osc-range 4914..4920`, 7-OSC) | `--bench 1` | 267.2 s (4m27s) | `bef0f1fa` | |
-| merge-changes (planet, `--osc-range 4914..4920 --simplify`, 7-OSC) | `--bench 1` | 262.2 s (4m22s) | `c0d140b6` | |
+| merge-changes (planet, `--osc-seq 4913`, 1-OSC) | `--bench 1` | 44.2 s | `941a5784` (2026-04-28) | |
+| merge-changes (planet, `--osc-range 4914..4920`, 7-OSC) | `--bench 1` | **54.7 s** | `b6e964cc` (2026-04-28) | parallel-drain landed (was 267.2 s `bef0f1fa`) |
+| merge-changes (planet, `--osc-range 4914..4920 --simplify`, 7-OSC) | `--bench 1` | 262.2 s (4m22s) | `c0d140b6` | pre-parallel; parse parallelized in `99057fa` but write_simplified still serial - re-bench pending |
 
 > **Sort `+6-7 %` regression flag - softened by 4fc8e35 hotpath.**
 > Both default and `--io-uring` sort on planet drifted slightly slower
@@ -528,21 +528,57 @@ auto-detect on this 24-thread host lands the same workload at
 ## Merge-changes
 
 `pbfhogg merge-changes` squashes N OSC (gzip + XML) inputs into one OSC
-output. Two production code paths, both serial-across-inputs today:
-**streaming** (`write_streaming` parses each OSC sequentially and writes
-events straight through an `OscWriter`, no in-memory overlay) and
-**simplify** (`parse_one_into_stream` builds a per-input `ChangeStream`
-fed into a global `BTreeMap` for last-write-wins dedupe). Optimization
-plan in [`notes/merge-changes.md`](../notes/merge-changes.md).
+output. Two production code paths: **streaming** (`write_streaming`,
+the default) and **simplify** (`--simplify`, builds an in-memory
+overlay then writes the latest change per object via a `BTreeMap`
+dedupe). Optimization plan and history in
+[`notes/merge-changes.md`](../notes/merge-changes.md).
 
 The 1-OSC vs N-OSC axis is the load-bearing distinction: a single OSC
 measures fixed setup + per-OSC parse + per-OSC write; an N-OSC squash
-measures N× per-OSC parse + a (proportionally cheaper) merge/write
-tail. The parallelization opportunity in the plan doc only fires when
-N > 1. The 7-OSC entries below stand in for "one week of daily diffs"
-- the production cadence that motivated the plan.
+measures the N inputs' work plus a merge/write tail. **The parallel
+shape only fires when N > 1**, and the 1-OSC fast path keeps the
+original serial streaming pipeline (parse + emit + gzip interleaved on
+one thread) so single-OSC walls are unchanged.
+
+### Streaming-path planet 7-OSC: 5.0× speedup (commit `99057fa`, plantasjen)
+
+| Stage | UUID | Wall | vs serial baseline |
+|---|---|---:|---:|
+| Serial baseline | `c612c5e6` (commit `fb1719c`) | 272.6 s | 1.00× |
+| Parallel parse, serial drain | `07ee92ee` (commit `43dd620`) | 235.8 s | 1.16× |
+| **Parallel-drain (current)** | **`b6e964cc`** | **54.7 s** | **5.0×** |
+| 1-OSC fast path | `941a5784` | 44.2 s | (within noise of pre-parallel 43.1 s) |
+
+The middle row is the abandoned intermediate shape. It correctly
+parallelized the 12.6 s parse phase (21× phase speedup) but exposed a
+223 s serial drain on the main thread - per-change `quick_xml::Writer`
+emit + zlib level-1 gzip-compress of 26.3 M changes, one thread,
+~118 K changes/s ceiling. The current shape moves emit + gzip onto the
+worker threads: each worker runs the full per-input pipeline (parse +
+re-emit + gzip-compress) into its own `OscWriter<Vec<u8>>` and returns
+self-contained gzip bytes. Main thread writes a pre-built prelude
+gzip member, the 7 worker chunks in input order, and a postlude gzip
+member. Multi-member gzip is valid (osmium, osmosis, gzip CLI,
+`MultiGzDecoder` all support it); output decompresses to the
+concatenation of all members.
+
+Phase breakdown of the 54.7 s `b6e964cc` run:
+
+- `MERGECHANGES_PARALLEL_EMIT`: **54.1 s** - 7 workers running parse +
+  XML emit + gzip-compress in parallel. Worker completion order
+  (from per-worker `merge_changes_decompress_ns` counter timestamps):
+  31.2 s, 33.3 s, 36.5 s, 40.3 s, 41.4 s, 47.9 s, 54.1 s. The longest
+  worker is OSC 3 (5.8 M changes, the heaviest input by a factor of
+  ~2 over the others) - the wall is gated by the heaviest single OSC.
+- `MERGECHANGES_DRAIN`: **0.59 s** - main thread concatenates prelude
+  + 7 worker chunks + postlude through a `BufWriter<File>` raw-bytes
+  copy. Drain is essentially free; the work it used to do is now
+  spread across the workers.
 
 ### Cross-dataset matrix (commit `16e3694`, plantasjen, `--bench 1`)
+
+Pre-parallel baselines, retained for cross-dataset shape:
 
 | Dataset | OSC count | Default wall | `--simplify` wall | Per-OSC effective rate | UUIDs (default / simplify) |
 |---|---:|---:|---:|---:|---|
@@ -552,16 +588,18 @@ N > 1. The 7-OSC entries below stand in for "one week of daily diffs"
 | Planet | 1 (`--osc-seq 4913`) | **43.1 s** | - | 43.1 s | `76f78e8b` / - |
 | Planet | 7 (`--osc-range 4914..4920`) | **267.2 s (4m27s)** | 262.2 s (4m22s) | 38.2 s/OSC | `bef0f1fa` / `c0d140b6` |
 
-(Europe 1-OSC not measured this round - that cell would let us
-cross-check whether the per-OSC rate scales with input size linearly
-between germany and planet.)
+Planet 7-OSC default has dropped to **54.7 s** at `99057fa`; the rest
+of the matrix has not been re-benched. The germany/europe rows would
+now hit the parallel-drain path at any N > 1 row; expected speedup is
+similar in shape (max-per-OSC + small drain) but smaller in magnitude
+because the heaviest OSC dominates and germany 7-OSC walls are
+already short. `--simplify` planet 7-OSC has not yet been re-benched
+- the simplify path parallelizes the parse phase (commit `99057fa`)
+but `write_simplified` still emits XML + gzip serially through a
+single `OscWriter`. Re-bench pending.
 
-Three observations from the matrix:
+Pre-parallel observations from the matrix that still hold:
 
-- **Per-OSC scaling is essentially linear** at every dataset scale.
-  Germany 7-OSC = 7.2× the 1-OSC wall; planet 7-OSC = 6.2× the
-  1-OSC wall. There's no batching benefit in the current
-  serial-across-inputs shape - each input pays its full parse cost.
 - **`--simplify` is a near-zero overhead** at every scale measured
   (planet −5.0 s / −1.9 %; europe −0.3 s; germany −1.8 s / −10 %
   inside single-shot variance). The `BTreeMap` dedupe is cheap
@@ -573,31 +611,26 @@ Three observations from the matrix:
   roughly proportional to the dataset's daily-diff size; planet's
   ~140 MB/OSC takes ~38 s of gzip + XML parse on the main thread.
 
-### Parallel-parse opportunity (the plan doc target)
+### Pre-flight measurements that locked in the implementation choice
 
-Plan in [`notes/merge-changes.md`](../notes/merge-changes.md) targets
-the per-OSC parse phase: each OSC is independent work, so concurrent
-parse + sequential merge could collapse `N × per-OSC parse` into
-`max(per-OSC parse, merge pass)`. Sized against the planet 7-OSC
-baseline:
+The `c612c5e6` instrumented re-bench (commit `fb1719c`) added a
+`TimedRead<R>` wrapper around the file reader to attribute gzip
+decompress wall separately from the surrounding `quick_xml` machinery:
+**gzip = 1.5 % of wall** (3.98 s of 272.6 s, 1.4-1.5 % per-OSC). That
+killed the parallel-decompress + sequential-XML alternative outright -
+no win to extract there - and forced the buffer-and-drain shape that
+landed at `43dd620` and `99057fa`. The same pre-flight added
+`merge_changes_changes_per_osc` (per-input change-count delta) which
+sized peak per-worker `ChangeStream` residual at 5.8 M changes for
+the heaviest OSC.
 
-- Serial 7-OSC parse ≈ 7 × 38 s = ~265 s wall (matches measured
-  267.2 s within rounding).
-- Concurrent 7-OSC parse ceiling ≈ max(per-OSC parse) + merge ≈
-  ~51 s based on the 4fc8e35 `--hotpath` (UUID `ee108ec9`,
-  2026-04-27 overnight): 7 calls to `parse_osc_streaming` totalled
-  264.42 s = 100 % of wall, with per-OSC avg 37.8 s and **P95 50.9 s**.
-- Estimated win: **~210-215 s at planet 7-OSC scale**.
-
-The 1-OSC planet bench at 43.1 s underestimates the parallel-parse
-ceiling for the 4914..4920 range - that range's slowest OSC took
-50.9 s in the hotpath, so the true `max(per-OSC parse)` term is ~51 s
-on this workload. Different daily-diff weeks would re-establish this.
-
-The `--alloc` companion (UUID `13615a4a`) attributes 62.4 GB cumulative
-allocation across the 7 calls **entirely** to `parse_osc_streaming`;
-no other function shows on the alloc table. The parser is the only
-allocation hotspot.
+The `4fc8e35` `--hotpath` companion (UUID `ee108ec9`, 2026-04-27)
+recorded 7 calls to `parse_osc_streaming` totalling 264.42 s = 100 %
+of wall, with per-OSC avg 37.8 s and **P95 50.9 s**. The `--alloc`
+companion (UUID `13615a4a`) attributed 62.4 GB cumulative
+allocation across the 7 calls entirely to `parse_osc_streaming`;
+no other function showed on the alloc table. The parser was the only
+allocation hotspot pre-parallel.
 
 ## Pipeline end-to-end
 

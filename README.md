@@ -59,8 +59,8 @@ Every command listed below runs on the full planet on normal hardware. Measured 
 | `inspect --extended` | 13m41s | 34 MB |
 | `inspect --nodes -j 16` | 56.8s | 410 MB |
 | `inspect --tags -j 16` | 2m50s | 17.5 GB |
-| `merge-changes --osc-seq N` (1-OSC daily) | 43s | 2 MB |
-| `merge-changes --osc-range A..B` (7-OSC, ~1 week of dailies) | 4m27s | 2 MB |
+| `merge-changes --osc-seq N` (1-OSC daily) | 44s | 2 MB |
+| `merge-changes --osc-range A..B` (7-OSC, ~1 week of dailies) | 55s | 2 MB |
 | `multi-extract --simple -c` (5 regions, Europe bbox) | 14m44s | 9.4 GB |
 | `multi-extract --smart -c` (5 regions, Europe bbox) | 13m58s | 22.9 GB |
 | `renumber` | 3m25s | 3.3 GB |

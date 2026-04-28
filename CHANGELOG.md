@@ -4,6 +4,20 @@
 
 ### Commands
 
+- **merge-changes**: parallel-drain via per-worker gzip members. When
+  N > 1, each worker runs the full per-input pipeline (parse + XML
+  re-emit + gzip-compress) into its own buffer; main thread writes a
+  pre-built XML prelude gzip member, the worker chunks in input
+  order, and a postlude gzip member. Multi-member gzip; OSC consumers
+  (osmium, osmosis, gzip CLI, `MultiGzDecoder`) all support it.
+  Planet 7-OSC `--osc-range 4914..4920`: **267s → 55s, 5.0×**
+  (UUID `b6e964cc` at commit `99057fa`, plantasjen). 1-OSC fast path
+  unchanged at 44s. Action-tag elision is now per-input rather than
+  global, adding ~50 bytes per input boundary; output remains valid
+  OSC. Output bytes are within 1% of the serial path. The streaming
+  path's parallel implementation is the headline; `--simplify`
+  parallelizes only the parse phase (the BTreeMap dedupe + write
+  remain serial); `--simplify` re-bench pending.
 - **repack**: new command. Re-encode a PBF with a configurable
   `--elements-per-blob N` cap. Element semantics, tags, refs, members,
   metadata, and DenseNodes encoding round-trip; output is type-sorted

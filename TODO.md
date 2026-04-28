@@ -159,48 +159,112 @@ make it harder; see the entry below.
   28.9 GB - 38× peak-RSS reduction. Output ordering is type-sorted
   (nodes, then ways, then relations); preserves structure on
   already-type-sorted input, re-sorts unsorted input.
-- [ ] **`time-filter`** - planet `--bench 1` SIGKILL'd twice since
-  iter 5 landed (2026-04-26 21:10 at `16e3694`, 1.6 m; 2026-04-27 19:53
-  at `4fc8e35`, 2.2 m; neither left recoverable sidecar data because
-  failure preceded the writer flush that emits `WRITER_METRICS`).
-  Bench-as-configured (regular PBF) hits the **snapshot path**
-  (`time_filter_snapshot`, parallel per-block via
-  `for_each_primitive_block_batch_budgeted` on `into_blocks_pipelined()`),
-  not the history pending-group state machine. Iter 5 brought Europe
-  peak anon to 16.9 GB / 35 GB input; naive linear to planet ~45 GB
-  is over the 28 GB host. **`mallopt(M_ARENA_MAX, 2)` is off-limits**
-  per the pin at `src/commands/time_filter/mod.rs:84-91` (measured
-  2026-04-19 on Europe to regress wall +69 % and anon +24 % because
-  the workers do allocation-heavy `BlockBuilder` re-encode, not the
-  wire-format splice that `mallopt` favours; K=4 / K=8 untested).
-  Residual snapshot-path RSS levers (per
-  [notes/time-filter-optimization.md](notes/time-filter-optimization.md)
-  ranked items): #6 reader-side scratch cap (4.4 GB / 70 % of
-  remaining alloc, retained per-decode-thread `ST_SCRATCH`/`GR_SCRATCH`),
-  #5 in-flight depth tuning (pipelined reader's `decode_ahead = 32`
-  reorder window + writer permit pool). Next planet attempt needs an
-  instrumentation pass first (reader-side WAIT_/high-water counters,
-  per-batch markers, mallinfo2 snapshots) so the next SIGKILL leaves
-  a localized read-out instead of a 2-minute wall and an empty DB row.
-  Separately: the history-path pending-group state machine
-  (`time_filter_history`, `mod.rs:154` onward) is sequential by
-  design and would need a real refactor for parallelism, but no
-  history PBF is configured in `brokkr.toml` so it doesn't show
-  up in the snapshot-path planet bench.
+- [ ] **`time-filter`** - five planet `--bench 1` attempts have
+  SIGKILL'd at ~28 GB anon. The 2026-04-28 instrumentation campaign
+  (UUIDs `4800c0a` / `e06c6ad` / `9fffdc4` via `dirty` sidecar)
+  ruled out the iter-5 hypothesis: per-decode-thread
+  `parse_and_inline_with_scratch` retention was 60 MB total (2 MB ×
+  ~30 threads), three orders of magnitude smaller than the 4.4 GB
+  predicted from the alloc profile. Allocator knobs (`malloc_trim`
+  per batch, `mallopt(M_MMAP_THRESHOLD, 64 KB)`,
+  `decode_ahead = 8`) all hit the same ~28 GB ceiling - mallinfo2
+  showed the bytes shifting between `arena` and `hblkhd` (mmap
+  chunks ARE genuinely live, returned to OS on free), confirming
+  the working set itself is structural. **Root cause: shared
+  pipeline shape with `tags-filter`**: `for_each_primitive_block_batch`
+  + `par_iter().map_init(BlockBuilder)` + `collect` + drain
+  materializes the full batch's `Vec<OwnedBlockTriple>` results
+  before draining, while the upstream pipeline keeps stuffing the
+  next batch in flight - cross-thread `PrimitiveBlock` retention
+  (`pipeline.rs:66-89`) amplified by per-batch result Vec retention
+  + writer reorder window. Tuning knobs cannot fix it.
+  **Migration template**: `parallel_classify_phase` + `ReorderBuffer`
+  (single-pass via `build_classify_schedule(input, None)`,
+  workers each emit framed bytes through a 32-slot bounded result
+  channel). Same template used by `cat --clean` (commit `b347c0a`,
+  28.9 GB → 750 MB) and `check --ids` streaming (commit `516129e`,
+  29.2 GB → 504 MB), both of which had the exact same ceiling
+  before migration. Drops the `mallopt(M_ARENA_MAX, 2)` off-limits
+  rule (post-migration the per-blob alloc/free is on one thread, so
+  arena capping doesn't trigger lock contention - `cat --clean`
+  enables it). Drops the iter-5 thread-local-BB optimization (each
+  blob allocates a fresh `BlockBuilder::new()` inside the worker
+  closure since BlockBuilder is `!Send`) - small wall hit on Europe
+  expected; planet correctness is the unblocking goal.
+  See [`notes/time-filter-optimization.md`](notes/time-filter-optimization.md)
+  Planet section for the full measurement table and ruled-out
+  hypotheses. Separately: the history-path pending-group state
+  machine (`time_filter_history`, `mod.rs` near line 124) is
+  sequential by design and would need a real refactor for
+  parallelism, but no history PBF is configured in `brokkr.toml`
+  so it doesn't show up in the snapshot-path planet bench.
 - [ ] **`tags-filter --invert-match w/highway=primary`** - 461.2 s
-  wall, **28.3 GB peak anon** (UUID `6665605a`). **Different root
-  cause from the three above** - the high RSS is workload-shape, not
-  pipeline retention: invert keeps ~99 % of ways (vs ~1 % for
-  match) and the pass-2 IdSet plus writer state scale with that.
-  Did not OOM in the overnight run but has effectively zero
-  headroom against the 28 GB reference: a concurrent workload, a
-  slightly larger filter set, or a slightly fuller page cache would
-  tip it over. Driving the peak below ~22 GB (in line with
-  `multi-extract --smart`) would give the same headroom margin as
-  the rest of the planet-safe table. Likely candidates: stream the
-  pass-2 IdSet to disk instead of resident, or invert the
-  data-flow direction (compute the *complement* of the match set
-  on disk rather than keeping the kept set in RAM).
+  wall, **28.3 GB peak anon** (UUID `6665605a`). **Same root cause
+  as `time-filter`**: shared pipeline shape
+  (`for_each_primitive_block_batch` + `par_iter().map_init(BlockBuilder)`
+  + `collect` + drain) at high keep rate (invert keeps ~99 % of
+  ways) hits the same structural ~28 GB ceiling. The per-blob
+  match-or-keep filter is independent across blocks; doesn't need
+  cross-block state. Earlier diagnosis ("workload-shape, not
+  pipeline retention" / pass-2 IdSet sizing) was wrong: the IdSet
+  is a tiny fraction of the 28 GB; the bulk is cross-thread
+  `PrimitiveBlock` retention amplified by the per-batch result-Vec
+  holding pattern, exactly the same as time-filter's measured
+  29-30 GB ceiling. Did not OOM in the overnight run but has zero
+  headroom against the 28 GB reference - concurrent workload or
+  slightly fuller page cache would tip it over.
+  **Migration template**: same `parallel_classify_phase` +
+  `ReorderBuffer` shape that landed for `cat --clean` and
+  `check --ids` and is the chosen fix for time-filter (see entry
+  above). Two-pass tags-filter wraps the migration around the
+  pass-2 single-pass writer; pass-1 (the IdSet population scan)
+  stays as is. Single-pass `-R` (omit-referenced) maps cleanly to
+  one parallel_classify_phase call. Land tags-filter migration
+  *after* time-filter so the shared helpers (frame_owned_blocks,
+  drain_classify_phase) extract from a working precedent rather
+  than getting designed up-front.
+
+### Latent same-shape risks (not gating 1.0)
+
+The 2026-04-28 audit found two more commands sharing the
+`for_each_primitive_block_batch` + `par_iter().map_init(BlockBuilder)`
++ `collect` + drain pattern that drives the time-filter and
+tags-filter planet OOMs. Neither blocks 1.0 today, but both would
+hit the same ~28 GB ceiling under the right workload, and both have
+the same migration template available.
+
+- [ ] **`getid --add-referenced` pass 2** (`process_filter_batch`
+  at `src/commands/getid/mod.rs:614-648`). Identical shape to the
+  pre-migration time-filter snapshot path. Currently masked because:
+  (a) the dep_node_ids set is typically small enough that workers
+  rarely emit large output volumes per blob; (b) plain `getid` and
+  `getid --invert` use a separate single-threaded `HeaderWalker`
+  loop (`filter_by_id` at `mod.rs:302-432`) that's already planet-
+  safe (27 MB / 102 MB peak per the user's measurement table). The
+  `--add-referenced` path has not been benched at planet RSS-wise.
+  Migration trigger: the day a planet user with
+  `--add-referenced` reports an OOM, or the day someone wants to
+  preempt it. Same `parallel_classify_phase` template as time-filter.
+
+- [ ] **`altw` dense / sparse path** (`src/commands/altw/mod.rs:485-510`
+  + `process_batch:692-736`). Identical shape. Currently masked
+  because `add-locations-to-ways --index-type auto` selects
+  `external` for sorted+indexed planet inputs, and external uses
+  entirely different scatter/gather code (`altw/external/`) - this
+  pattern doesn't fire on the planet recommended path. Forcing
+  `--index-type dense` or `--index-type sparse` at planet would
+  hit the same ceiling. Migration trigger: a non-canonical planet
+  PBF (unsorted or non-indexed) becomes a regular workload, or the
+  dense rank-indexed-array improvement (the open
+  "Dense ALTW compact rank-indexed array" research item below)
+  lands and pushes someone to bench dense at planet. Same template.
+
+Reuse plan: time-filter migration ships first as the
+`parallel_classify_phase` + `ReorderBuffer` precedent. Tags-filter
+follows and extracts shared helpers
+(`frame_owned_blocks`, `drain_classify_phase`). Either of these
+two commands becomes a drop-in third caller of the helpers if/when
+the trigger fires; not active code work today.
 
 ### Blocked on dataset / config
 

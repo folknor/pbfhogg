@@ -445,34 +445,6 @@ impl<W: Write> PbfWriter<W> {
         index: blob_meta::BlobIndex,
         tagdata: Option<&[u8]>,
     ) -> io::Result<()> {
-        self.write_primitive_block_owned_inner(block_bytes, index, tagdata, None)
-    }
-
-    /// Pool-aware variant of [`write_primitive_block_owned`](Self::write_primitive_block_owned).
-    ///
-    /// After the framing closure has consumed `block_bytes` (it is cloned
-    /// into `FramedBlobParts`), the original `Vec<u8>` is returned to the
-    /// pool at closure exit instead of being dropped. Pass the same pool
-    /// the caller pulled the buffer from (typically via
-    /// `BlockBuilder::take_owned_swap`).
-    #[hotpath::measure]
-    pub(crate) fn write_primitive_block_owned_pooled(
-        &mut self,
-        block_bytes: Vec<u8>,
-        index: blob_meta::BlobIndex,
-        tagdata: Option<&[u8]>,
-        pool: std::sync::Arc<crate::write::buf_pool::BlockBufPool>,
-    ) -> io::Result<()> {
-        self.write_primitive_block_owned_inner(block_bytes, index, tagdata, Some(pool))
-    }
-
-    fn write_primitive_block_owned_inner(
-        &mut self,
-        block_bytes: Vec<u8>,
-        index: blob_meta::BlobIndex,
-        tagdata: Option<&[u8]>,
-        pool: Option<std::sync::Arc<crate::write::buf_pool::BlockBufPool>>,
-    ) -> io::Result<()> {
         let indexdata = index.serialize();
         if let Some(ref mut pipeline) = self.pipeline {
             // Bound in-flight rayon dispatches - see the sibling
@@ -517,27 +489,15 @@ impl<W: Write> PbfWriter<W> {
                 // Failure here means the main thread already dropped its
                 // receiver (shutting down); safe to ignore.
                 permit_tx.send(()).ok();
-                // Return block_bytes to the pool after frame_blob_into has
-                // cloned its contents into FramedBlobParts. This runs at
-                // closure exit, which is also when block_bytes would be
-                // dropped otherwise.
-                if let Some(pool) = pool {
-                    pool.put(block_bytes);
-                }
             });
             Ok(())
         } else {
-            let result = self.write_framed_blob(
+            self.write_framed_blob(
                 "OSMData",
                 &block_bytes,
                 Some(indexdata.as_slice()),
                 tagdata,
-            );
-            // Sync path: no rayon closure, return to pool here.
-            if let Some(pool) = pool {
-                pool.put(block_bytes);
-            }
-            result
+            )
         }
     }
 

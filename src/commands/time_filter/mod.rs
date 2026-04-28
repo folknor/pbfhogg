@@ -16,19 +16,18 @@
 
 use std::path::Path;
 
-use rayon::prelude::*;
-
 use crate::owned::{
     OwnedElement, dense_node_metadata, element_metadata, owned_to_metadata, read_dense_node,
     read_node, read_relation, read_way,
 };
 use super::{
-    BATCH_SIZE, HeaderOverrides, Result,
-    for_each_primitive_block_batch_budgeted, require_sorted, warn_locations_on_ways_loss,
-    writer_from_header,
+    HeaderOverrides, Result,
+    ensure_node_capacity_local, ensure_relation_capacity_local, ensure_way_capacity_local,
+    flush_local, require_sorted, warn_locations_on_ways_loss, writer_from_header,
 };
-use crate::block_builder::{BlockBuilder, MemberData};
-use crate::write::buf_pool::BlockBufPool;
+use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
+use crate::reorder_buffer::ReorderBuffer;
+use crate::scan::classify::{build_classify_schedule, parallel_classify_phase};
 use crate::writer::{Compression, PbfWriter};
 use crate::{DenseNode, Element, ElementReader, Node, PrimitiveBlock, Relation, Way};
 
@@ -81,14 +80,9 @@ pub fn time_filter(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<TimeFilterStats> {
-    // Do NOT mallopt(M_ARENA_MAX, 2) here. That pattern works for
-    // renumber_external (whose workers do low-alloc wire-format splice)
-    // but regresses time-filter hard (workers do full BlockBuilder
-    // re-encode, which is allocation-heavy - arena-lock contention
-    // dominates the fragmentation win). Measured 2026-04-19: wall
-    // 95.1 s -> 160.4 s (+69 %), peak anon 20 GB -> 24.8 GB (+24 %),
-    // avg cores 20.4 -> 14.1 on Europe --bench 1. Different command
-    // class, different allocator knob.
+    // History path: keep the legacy mallopt rule (no M_ARENA_MAX=2).
+    // Snapshot path: opts into M_ARENA_MAX=2 internally, post-migration -
+    // see the in-function comment in time_filter_snapshot.
     let reader = ElementReader::open(input, direct_io)?;
     require_sorted(reader.header(), input, "Input history PBF")?;
     warn_locations_on_ways_loss(reader.header());
@@ -101,10 +95,12 @@ pub fn time_filter(
     let stats = if is_history {
         time_filter_history(reader, &mut writer, cutoff_timestamp)?
     } else {
-        // decode_ahead default = 32. Tested decode_ahead=8 at planet
-        // 2026-04-28 (commit 9fffdc4): same ~28 GB ceiling, wall
-        // 1m18s -> 1m58s (decode pool starved). Not a useful knob.
-        time_filter_snapshot(reader, &mut writer, cutoff_timestamp)?
+        // Drop the reader before the snapshot path - the migrated
+        // snapshot path opens the input via HeaderWalker through
+        // build_classify_schedule, not ElementReader, so holding the
+        // reader open here would just keep an extra fd around.
+        drop(reader);
+        time_filter_snapshot(input, &mut writer, cutoff_timestamp, compression)?
     };
 
     writer.flush()?;
@@ -218,25 +214,41 @@ fn time_filter_history(
 // explicitly), and writes surviving elements straight into a local
 // BlockBuilder via reference. Consumer drains batch results in order.
 
+/// Snapshot path migrated 2026-04-28 from the
+/// `for_each_primitive_block_batch_budgeted` + `par_iter().map(thread_local
+/// BB)` + drain shape to `parallel_classify_phase` + `ReorderBuffer`. The
+/// pre-migration shape hit a structural ~28 GB anon ceiling at planet (five
+/// SIGKILL'd attempts, last three with full instrumentation) because the
+/// `par_iter().collect()` step materialises the full batch's
+/// `Vec<OwnedBlockTriple>` results before draining, and the upstream
+/// pipeline keeps stuffing the next batch's PrimitiveBlocks in flight
+/// under the cross-thread retention pattern (`pipeline.rs:66-89`).
+/// Allocator knobs (`malloc_trim` per batch, `M_MMAP_THRESHOLD=64K`,
+/// `decode_ahead=8`) all hit the same ceiling: mallinfo2 showed bytes
+/// shifting between `arena` and `hblkhd` but the total live set was
+/// genuine working set, not retention. The migration mirrors the
+/// `cat --clean` (`b347c0a`, 28.9 GB -> 750 MB) and `check --ids`
+/// (`516129e`, 29.2 GB -> 504 MB) precedents.
 #[hotpath::measure]
 fn time_filter_snapshot(
-    reader: ElementReader<crate::file_reader::FileReader>,
+    input: &Path,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     cutoff_timestamp: i64,
+    compression: Compression,
 ) -> Result<TimeFilterStats> {
-    // Allocator-knob attempts (2026-04-28) all hit the same ~28 GB
-    // ceiling at planet:
-    //   - default mallopt (4800c0a): arena climbs to 34 GB, hblkhd flat.
-    //   - +malloc_trim(0)/batch (e06c6ad): trim_released=1 each call,
-    //     RSS curve ~unchanged. Trim only releases top-of-brk; freed
-    //     pages buried mid-arena across decode threads stay mapped.
-    //   - +mallopt(M_MMAP_THRESHOLD,64K)+decode_ahead=8 (9fffdc4):
-    //     arena 42 MB / hblkhd 32 GB - same total. mmap'd allocations
-    //     ARE genuinely live according to mallinfo, not retention.
-    // The ~28 GB working set is structural to the parallel-decode +
-    // batch-collect + parallel-writer shape, not a glibc artefact.
-    // Fixing it requires a different shape (sequential reader or
-    // worker-emits-then-drops-locally), not a tuning knob.
+    // Cap glibc arenas to prevent cross-thread alloc/free fragmentation
+    // in the per-blob worker pool. Same precedent as cat --clean and
+    // check --refs / verify_ids. Post-migration, each blob's BlockBuilder
+    // alloc/free cycle is confined to a single worker thread, so the
+    // pattern that regressed iter-3 (cross-blob scratch reuse defeated
+    // by arena capping) doesn't apply: K=2 measured -69 % wall and
+    // -24 % anon on the pre-migration code, but that pre-migration code
+    // had thread-local BlockBuilder state surviving across blobs on the
+    // same rayon worker. parallel_classify_phase has no such state.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
 
     let mut stats = TimeFilterStats {
         versions_seen: 0,
@@ -246,201 +258,104 @@ fn time_filter_snapshot(
         dropped_no_snapshot_version: 0,
     };
 
-    // Shared free-list pool of Vec<u8> block buffers (cleared + retained
-    // capacity). Workers pull via BlockBuilder::take_owned_swap; writer
-    // returns via write_primitive_block_owned_pooled at the end of its
-    // rayon compression closure. Without this the snapshot path was
-    // allocating a fresh ~500 KB Vec per block - 18 GB of churn on Japan,
-    // and the dominant anon-RSS ceiling at Europe/planet.
-    let pool = std::sync::Arc::new(BlockBufPool::new());
-
     crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_START");
     crate::debug::emit_mallinfo2("timefilter_snapshot_start_mallinfo");
-    // Byte-bounded batches cap in-flight decoded-block bytes directly,
-    // which is the dominant anon-RSS source at scale. Europe iter 2
-    // (count-only BATCH_SIZE=64) peaked at 20 GB anon on a 35 GB input;
-    // the 128 MB byte cap below flushes batches around 16 blocks instead
-    // of 64 when decoded blocks are ~8 MB each, keeping the batch-level
-    // working set predictable regardless of input blob size.
-    const SNAPSHOT_BATCH_MAX_BYTES: usize = 128 * 1024 * 1024;
-    let mut max_batch_blocks: u64 = 0;
-    let mut max_batch_bytes: u64 = 0;
-    let mut total_batches: u64 = 0;
-    let mut process = |batch: &[PrimitiveBlock]| -> Result<()> {
-        // Per-batch markers let `brokkr sidecar --samples` show RSS
-        // climb across batches and `--durations` show per-batch wall.
-        // Distinguishes a single oversized batch from accumulating
-        // residual retention across many same-size batches.
-        crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_BATCH_START");
-        let batch_blocks = batch.len() as u64;
-        let batch_bytes: u64 = batch
-            .iter()
-            .map(|b| b.decompressed_size() as u64)
-            .sum();
-        if batch_blocks > max_batch_blocks {
-            max_batch_blocks = batch_blocks;
-        }
-        if batch_bytes > max_batch_bytes {
-            max_batch_bytes = batch_bytes;
-        }
-        total_batches += 1;
-        let result = process_snapshot_batch(batch, cutoff_timestamp, writer, &mut stats, &pool);
-        // Emit pipeline + writer counters at every batch boundary so
-        // that a SIGKILL (e.g. OOM at planet) leaves fresh state in
-        // the sidecar FIFO. The previous two planet attempts died
-        // before `writer.flush()` could call WRITER_METRICS.emit(),
-        // leaving zero recoverable per-phase data. Atomic loads only;
-        // negligible cost relative to per-batch wall.
-        crate::read::pipeline_metrics::PIPELINE_METRICS.emit();
-        crate::write::metrics::WRITER_METRICS.emit();
-        // Per-batch mallinfo2: arena (brk-managed) vs hblkhd
-        // (mmap-managed) split. The 2026-04-28 e06c6ad / 9fffdc4
-        // attempts established that the snapshot path's planet RSS
-        // is genuine working set, not glibc retention - which one
-        // you see in arena vs hblkhd depends on M_MMAP_THRESHOLD
-        // tuning, but the total is the same. Keep this emit for
-        // future investigations; it cost a few microseconds and
-        // makes the residency story unambiguous.
-        crate::debug::emit_mallinfo2("timefilter_snapshot_batch_mallinfo");
-        crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_BATCH_END");
-        result
-    };
-    for_each_primitive_block_batch_budgeted(
-        reader.into_blocks_pipelined(),
-        BATCH_SIZE,
-        Some(SNAPSHOT_BATCH_MAX_BYTES),
-        &mut process,
-    )?;
-    pool.emit_counters("timefilter_snapshot_pool");
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("timefilter_snapshot_total_batches", total_batches as i64);
-        crate::debug::emit_counter("timefilter_snapshot_max_batch_blocks", max_batch_blocks as i64);
-        crate::debug::emit_counter("timefilter_snapshot_max_batch_bytes", max_batch_bytes as i64);
+
+    let (schedule, shared_file) = build_classify_schedule(input, None)?;
+
+    if schedule.is_empty() {
+        crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_END");
+        return Ok(stats);
     }
+
+    type PhaseResult =
+        std::result::Result<(Vec<Vec<u8>>, TimeFilterStats), String>;
+    let mut reorder: ReorderBuffer<PhaseResult> = ReorderBuffer::with_capacity(64);
+    let mut write_error: Option<Box<dyn std::error::Error>> = None;
+    let mut classify_error: Option<String> = None;
+
+    // BlockBuilder contains `Rc<str>` (string interning) which is not
+    // Send, so it can't ride the `S: Send` worker-state slot. Per-blob
+    // alloc inside the closure is cheap (BlockBuilder::new is just a
+    // few empty Vec/HashMap initialisers; no heap reservation until
+    // elements are added). Same pattern as cat --clean's run_kind_phase.
+    parallel_classify_phase(
+        &shared_file,
+        &schedule,
+        None,
+        || (),
+        |block, _state| -> PhaseResult {
+            let mut bb = BlockBuilder::new();
+            let mut output: Vec<OwnedBlock> = Vec::new();
+            let block_stats =
+                filter_block_snapshot(block, cutoff_timestamp, &mut bb, &mut output)?;
+            flush_local(&mut bb, &mut output)?;
+
+            let mut framed: Vec<Vec<u8>> = Vec::with_capacity(output.len());
+            for (block_bytes, index, tagdata) in output {
+                let indexdata = index.serialize();
+                let blob = crate::writer::frame_blob_pipelined(
+                    &block_bytes,
+                    &compression,
+                    Some(indexdata.as_slice()),
+                    tagdata.as_deref(),
+                )
+                .map_err(|e| e.to_string())?;
+                framed.push(blob.into_vec());
+            }
+            Ok((framed, block_stats))
+        },
+        |seq, r| {
+            // Always queue the result so the next-seq invariant holds;
+            // we can't drop a slot mid-phase without breaking the
+            // reorder buffer's contiguous-prefix expectation.
+            reorder.push(seq, r);
+            // Drain everything ready from the front. Once we hit a
+            // hole (next seq not yet delivered), stop and wait for the
+            // next merge call. Errors are captured into local Option
+            // slots and propagated after parallel_classify_phase
+            // returns; further ready items are still drained so the
+            // buffer doesn't grow.
+            while let Some(r) = reorder.pop_ready() {
+                match r {
+                    Ok((framed, block_stats)) => {
+                        if write_error.is_some() {
+                            continue;
+                        }
+                        stats.versions_seen += block_stats.versions_seen;
+                        stats.versions_before_cutoff +=
+                            block_stats.versions_before_cutoff;
+                        stats.elements_written += block_stats.elements_written;
+                        stats.dropped_deleted += block_stats.dropped_deleted;
+                        stats.dropped_no_snapshot_version +=
+                            block_stats.dropped_no_snapshot_version;
+                        for blob in framed {
+                            if let Err(e) = writer.write_raw_owned(blob) {
+                                write_error = Some(e.into());
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if classify_error.is_none() {
+                            classify_error = Some(e);
+                        }
+                    }
+                }
+            }
+        },
+    )?;
+
+    if let Some(e) = write_error {
+        return Err(e);
+    }
+    if let Some(e) = classify_error {
+        return Err(e.into());
+    }
+
     crate::debug::emit_mallinfo2("timefilter_snapshot_end_mallinfo");
     crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_END");
     Ok(stats)
-}
-
-// Per-rayon-thread BlockBuilder. rayon pools worker threads across
-// successive par_iter() calls, so a thread_local persists the same
-// BlockBuilder across all batches processed by that thread. This is
-// what lets the iter-4 BlockBufPool pay off: take_owned_swap installs
-// the pool-sized `swap` as encode_buf, and the *next* encode_block on
-// the same BlockBuilder writes into it directly (no cap-0 grow). With
-// map_init creating a fresh BlockBuilder per task, the next encode
-// never came and the pool Vecs went unused (measured iter 4).
-//
-// Safety / lifecycle: BlockBuilder::new() initialises to Vec::new() for
-// encode_buf; the first take_owned_swap on each thread still pays the
-// cap-0 -> block-size grow once, then subsequent encodes on that
-// thread reuse pool capacity. After filter_block_snapshot's final
-// flush_local_pooled, the BlockBuilder's internal accumulators are
-// reset by encode_block -> reset_block_state, so the thread_local can
-// safely span across time_filter invocations in the same process.
-thread_local! {
-    static SNAPSHOT_BB: std::cell::RefCell<BlockBuilder> =
-        std::cell::RefCell::new(BlockBuilder::new());
-}
-
-#[hotpath::measure]
-fn process_snapshot_batch(
-    batch: &[PrimitiveBlock],
-    cutoff_timestamp: i64,
-    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
-    stats: &mut TimeFilterStats,
-    pool: &std::sync::Arc<BlockBufPool>,
-) -> Result<()> {
-    type BatchResult = std::result::Result<(Vec<OwnedBlockTriple>, TimeFilterStats), String>;
-    let results: Vec<BatchResult> = batch
-        .par_iter()
-        .map(|block| {
-            SNAPSHOT_BB.with_borrow_mut(|bb| {
-                let mut output: Vec<OwnedBlockTriple> = Vec::new();
-                let block_stats =
-                    filter_block_snapshot(block, cutoff_timestamp, bb, &mut output, pool)?;
-                flush_local_pooled(bb, &mut output, pool)?;
-                Ok((output, block_stats))
-            })
-        })
-        .collect();
-
-    // Pooled drain: forwards each OwnedBlock to the writer's pool-aware
-    // emit path, which returns `bytes` to the pool at the end of the
-    // rayon compression closure. Stats are accumulated as in
-    // drain_batch_results.
-    for result in results {
-        let (blocks, block_stats) =
-            result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        stats.versions_seen += block_stats.versions_seen;
-        stats.versions_before_cutoff += block_stats.versions_before_cutoff;
-        stats.elements_written += block_stats.elements_written;
-        stats.dropped_deleted += block_stats.dropped_deleted;
-        stats.dropped_no_snapshot_version += block_stats.dropped_no_snapshot_version;
-        for (bytes, index, tagdata) in blocks {
-            writer.write_primitive_block_owned_pooled(
-                bytes,
-                index,
-                tagdata.as_deref(),
-                std::sync::Arc::clone(pool),
-            )?;
-        }
-    }
-    Ok(())
-}
-
-type OwnedBlockTriple = crate::block_builder::OwnedBlock;
-
-/// Pool-aware counterpart to `super::flush_local`. Uses
-/// `BlockBuilder::take_owned_swap` so the next encode reuses a pool-sourced
-/// buffer instead of allocating fresh.
-#[hotpath::measure]
-fn flush_local_pooled(
-    bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlockTriple>,
-    pool: &BlockBufPool,
-) -> std::result::Result<(), String> {
-    let swap = pool.get();
-    if let Some(triple) = bb.take_owned_swap(swap).map_err(|e| e.to_string())? {
-        output.push(triple);
-    }
-    Ok(())
-}
-
-/// Pool-aware capacity-ensure helpers. Same predicate as the non-pooled
-/// versions in `commands/mod.rs`, but route through `flush_local_pooled`.
-fn ensure_node_capacity_pooled(
-    bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlockTriple>,
-    pool: &BlockBufPool,
-) -> std::result::Result<(), String> {
-    if !bb.can_add_node() {
-        flush_local_pooled(bb, output, pool)?;
-    }
-    Ok(())
-}
-
-fn ensure_way_capacity_pooled(
-    bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlockTriple>,
-    pool: &BlockBufPool,
-) -> std::result::Result<(), String> {
-    if !bb.can_add_way() {
-        flush_local_pooled(bb, output, pool)?;
-    }
-    Ok(())
-}
-
-fn ensure_relation_capacity_pooled(
-    bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlockTriple>,
-    pool: &BlockBufPool,
-) -> std::result::Result<(), String> {
-    if !bb.can_add_relation() {
-        flush_local_pooled(bb, output, pool)?;
-    }
-    Ok(())
 }
 
 /// Snapshot-gate: returns `Some(())` if the element survives both the cutoff
@@ -469,8 +384,7 @@ fn filter_block_snapshot(
     block: &PrimitiveBlock,
     cutoff_timestamp: i64,
     bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlockTriple>,
-    pool: &BlockBufPool,
+    output: &mut Vec<OwnedBlock>,
 ) -> std::result::Result<TimeFilterStats, String> {
     let mut stats = TimeFilterStats {
         versions_seen: 0,
@@ -488,7 +402,7 @@ fn filter_block_snapshot(
         match &element {
             Element::DenseNode(dn) => {
                 let Some(()) = snapshot_gate(dense_timestamp(dn), dense_visible(dn), cutoff_timestamp, &mut stats) else { continue; };
-                ensure_node_capacity_pooled(bb, output, pool)?;
+                ensure_node_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(dn.tags());
                 let meta = dense_node_metadata(dn);
@@ -500,7 +414,7 @@ fn filter_block_snapshot(
             }
             Element::Node(n) => {
                 let Some(()) = snapshot_gate(node_timestamp(n), node_visible(n), cutoff_timestamp, &mut stats) else { continue; };
-                ensure_node_capacity_pooled(bb, output, pool)?;
+                ensure_node_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(n.tags());
                 let meta = element_metadata(&n.info());
@@ -512,7 +426,7 @@ fn filter_block_snapshot(
             }
             Element::Way(w) => {
                 let Some(()) = snapshot_gate(way_timestamp(w), way_visible(w), cutoff_timestamp, &mut stats) else { continue; };
-                ensure_way_capacity_pooled(bb, output, pool)?;
+                ensure_way_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(w.tags());
                 refs_buf.clear();
@@ -525,7 +439,7 @@ fn filter_block_snapshot(
             }
             Element::Relation(r) => {
                 let Some(()) = snapshot_gate(relation_timestamp(r), relation_visible(r), cutoff_timestamp, &mut stats) else { continue; };
-                ensure_relation_capacity_pooled(bb, output, pool)?;
+                ensure_relation_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(r.tags());
                 members_buf.clear();

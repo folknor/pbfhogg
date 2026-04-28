@@ -1,5 +1,4 @@
 pub mod block_builder;
-pub(crate) mod buf_pool;
 pub mod compression;
 #[cfg(feature = "linux-direct-io")]
 mod copy_range;

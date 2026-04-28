@@ -917,29 +917,6 @@ impl BlockBuilder {
         }
     }
 
-    /// Like [`take_owned`](Self::take_owned) but swaps `swap` in as the
-    /// new `encode_buf` instead of leaving `Vec::new()` behind. Pass a
-    /// cleared `Vec<u8>` with retained capacity (e.g. from a
-    /// `BlockBufPool`); the next encode reuses the capacity instead of
-    /// reallocating. When this returns `Some`, the returned tuple owns
-    /// the previously-built block bytes. When it returns `None`, the
-    /// swap still happens (the caller's `swap` becomes the new
-    /// `encode_buf`), so subsequent encodes continue to benefit.
-    #[hotpath::measure]
-    pub(crate) fn take_owned_swap(&mut self, swap: Vec<u8>) -> io::Result<Option<OwnedBlock>> {
-        if let Some(index) = self.encode_block()? {
-            let tagdata = self.last_tagdata.take();
-            let filled = std::mem::replace(&mut self.encode_buf, swap);
-            Ok(Some((filled, index, tagdata)))
-        } else {
-            // No block was built this round, but still install the swap so
-            // the next build uses the pool-sourced capacity. Drop whatever
-            // was in encode_buf (empty Vec::new() in the steady state).
-            self.encode_buf = swap;
-            Ok(None)
-        }
-    }
-
     /// Encode DenseNodes directly to wire format into `encode_buf`.
     ///
     /// Encodes PrimitiveGroup (field 2 of PrimitiveBlock) containing

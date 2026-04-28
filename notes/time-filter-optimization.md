@@ -436,41 +436,83 @@ second.
 
 Iter 5 left Europe peak anon at **16.9 GB** on 35 GB input. Naive
 linear extrapolation to planet 92 GB lands at ~45 GB - over the
-28 GB-free reference host's ceiling. Two planet `--bench 1`
-attempts have OOM/SIGKILL'd since iter 5 landed:
+28 GB-free reference host's ceiling. Five planet `--bench 1`
+attempts have all OOM/SIGKILL'd:
 
-- 2026-04-26 21:10:59 at `16e3694` - FAIL:1 after 1.6 m
-- 2026-04-27 19:53:45 at `4fc8e35` - FAIL:1 after 2.2 m
+| Date | Commit | Wall | Notes |
+|---|---|---|---|
+| 2026-04-26 21:10 | `16e3694` | 1m36s | pre-instrumentation |
+| 2026-04-27 19:53 | `4fc8e35` | 2m12s | pre-instrumentation |
+| 2026-04-28 16:22 | `4800c0a` | 1m16s | reader-pipeline metrics + per-batch markers |
+| 2026-04-28 16:32 | `e06c6ad` | 1m18s | + `malloc_trim` per batch |
+| 2026-04-28 16:40 | `9fffdc4` | 1m58s | + `mallopt(M_MMAP_THRESHOLD,64K)` + `decode_ahead=8` |
 
-Both attempts failed before the writer's `flush()` could call
-`WRITER_METRICS.emit()`, and the `dirty` sidecar handle has since
-been overwritten by an unrelated repack run, so neither attempt
-left recoverable per-phase data. The next bench needs to be
-preceded by an instrumentation pass (see "Instrumentation" above
-plus the items below) so the next failure produces a localized
-read-out before the SIGKILL lands.
+All five hit ~28 GB anon at SIGKILL.
 
-Iter-1 pool (#1) and iter-5 thread-local BlockBuilder (#2) have
-both shipped, so the residual Europe RSS is no longer driven by
-`take_owned` churn. Iter 5 alloc profile points the remaining
-levers at:
+### Allocator-tuning hypothesis: ruled out (2026-04-28)
 
-1. **Pipelined-reader scratch retention** (#6): 4.4 GB / 70 % of
-   remaining alloc at Japan, retained per-decode-thread capacity
-   across the whole run. `parse_and_inline_with_scratch`'s
-   thread-local `ST_SCRATCH` / `GR_SCRATCH` Vecs grow to
-   max-block-size and never shrink. Shrink-on-loop or
-   shared-pool fix shape both available.
-2. **Reader / writer in-flight depth tuning** (#5): pipelined
-   reader holds `decode_ahead = 32` decoded blocks in its reorder
-   window plus `read_ahead = 16` raw blobs in stage 1. Writer's
-   permit-pool plus reorder window add another layer. Both use
-   defaults; cutting either trades wall parallelism for peak RSS.
-3. **`mallopt(M_ARENA_MAX, K)` with K > 2**. K=2 regressed (#5);
-   K=4 / K=8 untested.
+The iter-5 alloc profile fingered per-decode-thread
+`parse_and_inline_with_scratch` retention as the residual blocker
+(4.4 GB / 70 % of remaining alloc at Japan). **The instrumentation
+showed this hypothesis was wrong**:
+`pipeline_scratch_st_capacity_peak_bytes` topped at 2 MB/thread
+× ~30 threads = 60 MB total, three orders of magnitude smaller
+than predicted.
 
-Cheap to plan: do (1) shrink-on-loop first because it's the
-biggest single alloc bucket and the fix is one `Vec::shrink_to`
-call at the bottom of the decode-task closure. Then re-bench
-planet with sidecar + new instrumentation; the next item is
-whichever counter localizes the residual.
+The `4800c0a` attempt's mallinfo2 split localised retention to
+`arena` (brk-managed): 656 MB at batch 1 → 34 GB at t=52 s, while
+`hblkhd` (mmap-managed) stayed flat at 534 KB. The `e06c6ad`
+attempt added per-batch `malloc_trim(0)` - it returned non-zero
+on every call (glibc *did* release something) but the curve was
+unchanged. Trim only releases pages from the *top* of brk;
+allocations interleave across decode threads, leaving freed pages
+buried mid-arena and unreleasable.
+
+The `9fffdc4` attempt forced cross-thread allocations through mmap
+by lowering `M_MMAP_THRESHOLD` to 64 KB (so `free()` actually returns
+pages to the OS) and capped the in-flight pipeline at
+`decode_ahead = 8`. mallinfo2 swung to `arena = 42 MB`, `hblkhd =
+32 GB`. Same total live anon. mmap chunks are returned to the OS
+the moment they're freed, so `hblkhd = 32 GB` means **32 GB is
+genuinely live** at peak - not retention. `decode_ahead=8` also
+hurt wall (1m18s → 1m58s) by starving the decode pool
+(`pipeline_decoded_send_wait_ns`: 996 s → 1243 s cumulative).
+
+### Conclusion: the working set itself is ~28 GB at planet
+
+The snapshot path's working set is structural to the parallel-
+decode + batch-collect + parallel-write architecture. With ~30
+decode threads, a 128 MB byte-budgeted batch, a writer reorder
+window of ~155-314 in-flight framed blobs, plus per-rayon-task
+PrimitiveBlock holds via `par_iter()` on the global pool, the
+sum is ~28 GB at planet scale. Tuning knobs (`malloc_trim`,
+`M_MMAP_THRESHOLD`, `decode_ahead`, `M_ARENA_MAX`) cannot fix
+this; they only redistribute where the bytes sit.
+
+### Path forward (open)
+
+Three viable routes, all with non-trivial cost:
+
+1. **Sequential reader path.** Use `BlobReader` directly, drop
+   `into_blocks_pipelined`. All alloc/free on one thread; cuts
+   the cross-thread retention vector entirely. Wall regresses
+   from 92.6 s to ~250-300 s on Europe (~3x slower from losing
+   30 cores worth of decode parallelism). Documented mitigation
+   in `pipeline.rs:66-89`. Used by ALTW external join and node-
+   only scanners. Smallest-scope fix; cleanest correctness.
+2. **Per-decode-thread re-encode.** Move `BlockBuilder` work
+   *into* the decode_pool's spawn closure so each PrimitiveBlock
+   is allocated, processed, and freed on the same thread. Output
+   is the framed-bytes Vec, sent through the channel as raw
+   bytes. Bypasses the `par_iter().collect()` step entirely.
+   Architectural refactor; the wall could stay close to iter 5's
+   if zlib compression is kept on rayon. Larger landing arc.
+3. **Accept the ceiling.** Document `time-filter` planet as
+   needing >32 GB RAM. Configure `time-filter --dataset europe`
+   as the validation upper bound in `brokkr.toml`. No code work.
+
+Note: items #5 (in-flight depth tuning) and #6 (reader scratch
+cap) in the ranked-opportunities section above are now confirmed
+*not* to be the planet blocker. Leaving them ranked for the wall-
+optimization story (cutting depth could still help on hosts with
+more RAM headroom) but they don't unlock planet.

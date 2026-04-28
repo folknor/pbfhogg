@@ -12,5 +12,6 @@ pub mod indexed;
 pub mod reader;
 pub(crate) mod header_walker;
 pub(crate) mod pipeline;
+pub(crate) mod pipeline_metrics;
 pub(crate) mod raw_frame;
 pub(crate) mod wire;

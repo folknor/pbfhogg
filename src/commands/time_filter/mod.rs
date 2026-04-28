@@ -238,6 +238,7 @@ fn time_filter_snapshot(
     let pool = std::sync::Arc::new(BlockBufPool::new());
 
     crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_START");
+    crate::debug::emit_mallinfo2("timefilter_snapshot_start_mallinfo");
     // Byte-bounded batches cap in-flight decoded-block bytes directly,
     // which is the dominant anon-RSS source at scale. Europe iter 2
     // (count-only BATCH_SIZE=64) peaked at 20 GB anon on a 35 GB input;
@@ -245,8 +246,38 @@ fn time_filter_snapshot(
     // of 64 when decoded blocks are ~8 MB each, keeping the batch-level
     // working set predictable regardless of input blob size.
     const SNAPSHOT_BATCH_MAX_BYTES: usize = 128 * 1024 * 1024;
+    let mut max_batch_blocks: u64 = 0;
+    let mut max_batch_bytes: u64 = 0;
+    let mut total_batches: u64 = 0;
     let mut process = |batch: &[PrimitiveBlock]| -> Result<()> {
-        process_snapshot_batch(batch, cutoff_timestamp, writer, &mut stats, &pool)
+        // Per-batch markers let `brokkr sidecar --samples` show RSS
+        // climb across batches and `--durations` show per-batch wall.
+        // Distinguishes a single oversized batch from accumulating
+        // residual retention across many same-size batches.
+        crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_BATCH_START");
+        let batch_blocks = batch.len() as u64;
+        let batch_bytes: u64 = batch
+            .iter()
+            .map(|b| b.decompressed_size() as u64)
+            .sum();
+        if batch_blocks > max_batch_blocks {
+            max_batch_blocks = batch_blocks;
+        }
+        if batch_bytes > max_batch_bytes {
+            max_batch_bytes = batch_bytes;
+        }
+        total_batches += 1;
+        let result = process_snapshot_batch(batch, cutoff_timestamp, writer, &mut stats, &pool);
+        // Emit pipeline + writer counters at every batch boundary so
+        // that a SIGKILL (e.g. OOM at planet) leaves fresh state in
+        // the sidecar FIFO. The previous two planet attempts died
+        // before `writer.flush()` could call WRITER_METRICS.emit(),
+        // leaving zero recoverable per-phase data. Atomic loads only;
+        // negligible cost relative to per-batch wall.
+        crate::read::pipeline_metrics::PIPELINE_METRICS.emit();
+        crate::write::metrics::WRITER_METRICS.emit();
+        crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_BATCH_END");
+        result
     };
     for_each_primitive_block_batch_budgeted(
         reader.into_blocks_pipelined(),
@@ -255,6 +286,13 @@ fn time_filter_snapshot(
         &mut process,
     )?;
     pool.emit_counters("timefilter_snapshot_pool");
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("timefilter_snapshot_total_batches", total_batches as i64);
+        crate::debug::emit_counter("timefilter_snapshot_max_batch_blocks", max_batch_blocks as i64);
+        crate::debug::emit_counter("timefilter_snapshot_max_batch_bytes", max_batch_bytes as i64);
+    }
+    crate::debug::emit_mallinfo2("timefilter_snapshot_end_mallinfo");
     crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_END");
     Ok(stats)
 }
@@ -331,6 +369,7 @@ type OwnedBlockTriple = crate::block_builder::OwnedBlock;
 /// Pool-aware counterpart to `super::flush_local`. Uses
 /// `BlockBuilder::take_owned_swap` so the next encode reuses a pool-sourced
 /// buffer instead of allocating fresh.
+#[hotpath::measure]
 fn flush_local_pooled(
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlockTriple>,

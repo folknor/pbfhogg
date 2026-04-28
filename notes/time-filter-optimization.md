@@ -6,7 +6,7 @@ version per (kind, id) with `timestamp <= cutoff`, drop if
 `visible=false`); degrades to a per-element timestamp filter when the
 input is a snapshot (all our current datasets).
 
-Active code: [`src/commands/time_filter.rs`](../src/commands/time_filter.rs).
+Active code: [`src/commands/time_filter/mod.rs`](../src/commands/time_filter/mod.rs).
 
 ## Architecture
 
@@ -104,7 +104,7 @@ retention drives the 20 GB anon peak at Europe.
   class: renumber workers do low-alloc wire-format splice, time-filter
   workers do allocation-heavy full BlockBuilder re-encode. With 2
   arenas the malloc lock contention dominates the fragmentation win.
-  **Do not re-attempt** - the pin comment in `time_filter.rs` carries
+  **Do not re-attempt** - the pin comment in `time_filter/mod.rs` carries
   the full measurement.
 
 - **`parse_and_inline_with_scratch` audit resolved.** Explore agent
@@ -397,7 +397,7 @@ fraction **on the existing I/O architecture** before investing in a
 new one. Concrete shape:
 
 - Add a cheap scan inside iter 5's
-  [`filter_block_snapshot`](../src/commands/time_filter.rs) that
+  [`filter_block_snapshot`](../src/commands/time_filter/mod.rs) that
   does the `ts <= cutoff && visible` predicate as a separate pass,
   returns `(all_survive: bool, total)`. Counter at end of the phase
   reports `timefilter_all_survive_blobs / timefilter_total_blobs`.
@@ -434,7 +434,43 @@ second.
 
 ## Planet
 
-**Not running planet** until opportunity #1 lands. Europe peak anon
-20 GB at 35 GB input → naive linear extrapolation to planet 92 GB is
-~52 GB, which OOMs the 27 GB bench host. Pooling `take_owned` is the
-blocker; everything else is follow-up.
+Iter 5 left Europe peak anon at **16.9 GB** on 35 GB input. Naive
+linear extrapolation to planet 92 GB lands at ~45 GB - over the
+28 GB-free reference host's ceiling. Two planet `--bench 1`
+attempts have OOM/SIGKILL'd since iter 5 landed:
+
+- 2026-04-26 21:10:59 at `16e3694` - FAIL:1 after 1.6 m
+- 2026-04-27 19:53:45 at `4fc8e35` - FAIL:1 after 2.2 m
+
+Both attempts failed before the writer's `flush()` could call
+`WRITER_METRICS.emit()`, and the `dirty` sidecar handle has since
+been overwritten by an unrelated repack run, so neither attempt
+left recoverable per-phase data. The next bench needs to be
+preceded by an instrumentation pass (see "Instrumentation" above
+plus the items below) so the next failure produces a localized
+read-out before the SIGKILL lands.
+
+Iter-1 pool (#1) and iter-5 thread-local BlockBuilder (#2) have
+both shipped, so the residual Europe RSS is no longer driven by
+`take_owned` churn. Iter 5 alloc profile points the remaining
+levers at:
+
+1. **Pipelined-reader scratch retention** (#6): 4.4 GB / 70 % of
+   remaining alloc at Japan, retained per-decode-thread capacity
+   across the whole run. `parse_and_inline_with_scratch`'s
+   thread-local `ST_SCRATCH` / `GR_SCRATCH` Vecs grow to
+   max-block-size and never shrink. Shrink-on-loop or
+   shared-pool fix shape both available.
+2. **Reader / writer in-flight depth tuning** (#5): pipelined
+   reader holds `decode_ahead = 32` decoded blocks in its reorder
+   window plus `read_ahead = 16` raw blobs in stage 1. Writer's
+   permit-pool plus reorder window add another layer. Both use
+   defaults; cutting either trades wall parallelism for peak RSS.
+3. **`mallopt(M_ARENA_MAX, K)` with K > 2**. K=2 regressed (#5);
+   K=4 / K=8 untested.
+
+Cheap to plan: do (1) shrink-on-loop first because it's the
+biggest single alloc bucket and the fix is one `Vec::shrink_to`
+call at the bottom of the decode-task closure. Then re-bench
+planet with sidecar + new instrumentation; the next item is
+whichever counter localizes the residual.

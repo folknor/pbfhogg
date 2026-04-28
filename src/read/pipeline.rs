@@ -5,13 +5,16 @@
 
 use super::blob::{BlobReader, BlobType, DecompressPool};
 use super::block::PrimitiveBlock;
+use super::pipeline_metrics::{elapsed_ns_u64, PIPELINE_METRICS};
 use crate::blob_meta::BlobFilter;
 use crate::error::Result;
 use crate::reorder_buffer::ReorderBuffer;
 use std::cell::RefCell;
 use std::io::Read;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Returns `true` if the blob should be skipped based on the filter.
 ///
@@ -118,7 +121,12 @@ where
         // Stage 1: Sequential I/O reader thread
         scope.spawn(move || {
             for (seq, blob_result) in blob_reader.enumerate() {
-                if raw_tx.send((seq, blob_result)).is_err() {
+                let t_send = Instant::now();
+                let send_result = raw_tx.send((seq, blob_result));
+                PIPELINE_METRICS
+                    .raw_send_wait_ns
+                    .fetch_add(elapsed_ns_u64(t_send), Relaxed);
+                if send_result.is_err() {
                     break; // receiver dropped, pipeline shutting down
                 }
             }
@@ -181,6 +189,7 @@ where
                 match blob_result {
                     Ok(blob) => {
                         let bf = blob_filter.clone();
+                        PIPELINE_METRICS.decode_tasks.fetch_add(1, Relaxed);
                         decode_pool.spawn(move || {
                             // Thread-local scratch buffers for parse_and_inline.
                             // Avoids allocating fresh Vec<(u32, u32)> per blob.
@@ -194,11 +203,24 @@ where
                                         if let Some(ref filter) = bf
                                             && should_skip_blob(filter, &blob)
                                         {
+                                            PIPELINE_METRICS
+                                                .blobs_skipped_by_filter
+                                                .fetch_add(1, Relaxed);
                                             return None;
                                         }
                                         ST_SCRATCH.with_borrow_mut(|st| {
                                             GR_SCRATCH.with_borrow_mut(|gr| {
-                                                Some(blob.to_primitiveblock_inline_with_scratch(&bp, st, gr))
+                                                let result = blob
+                                                    .to_primitiveblock_inline_with_scratch(&bp, st, gr);
+                                                // Per-thread scratch retention is the iter-5
+                                                // residual alloc bucket (4.4 GB / 70 % at Japan).
+                                                // Record current capacity in (u32, u32) pairs *
+                                                // 8 bytes for the global peak.
+                                                PIPELINE_METRICS.record_scratch_capacity(
+                                                    st.capacity().saturating_mul(8),
+                                                    gr.capacity().saturating_mul(8),
+                                                );
+                                                Some(result)
                                             })
                                         })
                                     }
@@ -213,12 +235,20 @@ where
                                     ),
                                 ))),
                             };
+                            let t_send = Instant::now();
                             drop(tx.send((seq, item)));
+                            PIPELINE_METRICS
+                                .decoded_send_wait_ns
+                                .fetch_add(elapsed_ns_u64(t_send), Relaxed);
                         });
                     }
                     Err(e) => {
                         // Forward I/O error directly to main thread
+                        let t_send = Instant::now();
                         drop(tx.send((seq, Some(Err(e)))));
+                        PIPELINE_METRICS
+                            .decoded_send_wait_ns
+                            .fetch_add(elapsed_ns_u64(t_send), Relaxed);
                     }
                 }
             }
@@ -241,21 +271,41 @@ where
         let mut pending: ReorderBuffer<Option<Result<PrimitiveBlock>>> =
             ReorderBuffer::with_capacity(pipeline_config.decode_ahead);
 
-        for (seq, item) in decoded_rx {
-            pending.push(seq, item);
+        // Use explicit recv() instead of `for ... in decoded_rx` so we
+        // can attribute time spent waiting on stage 2. Iterator desugaring
+        // would hide the recv inside the loop scaffolding and prevent
+        // wrapping it with the timer.
+        let result: Result<()> = (|| {
+            loop {
+                let t_recv = Instant::now();
+                let next = decoded_rx.recv();
+                PIPELINE_METRICS
+                    .decoded_recv_wait_ns
+                    .fetch_add(elapsed_ns_u64(t_recv), Relaxed);
+                let (seq, item) = match next {
+                    Ok(pair) => pair,
+                    Err(_) => break, // all senders dropped, drain finished
+                };
+                pending.push(seq, item);
+                PIPELINE_METRICS.record_reorder_high_water(pending.pending_len());
 
-            // Drain all consecutive ready blocks from the front.
-            while let Some(item) = pending.pop_ready() {
-                match item {
-                    Some(Ok(block)) => {
-                        block_fn(block)?;
+                while let Some(item) = pending.pop_ready() {
+                    match item {
+                        Some(Ok(block)) => {
+                            block_fn(block)?;
+                        }
+                        Some(Err(e)) => return Err(e),
+                        None => {} // header or unknown blob - skip
                     }
-                    Some(Err(e)) => return Err(e),
-                    None => {} // header or unknown blob - skip
                 }
             }
-        }
+            Ok(())
+        })();
 
-        Ok(())
+        // Emit reader-pipeline counters before returning so that even
+        // an error path produces sidecar data. Mirrors the writer's
+        // WRITER_METRICS.emit() in flush().
+        PIPELINE_METRICS.emit();
+        result
     })
 }

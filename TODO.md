@@ -159,23 +159,34 @@ make it harder; see the entry below.
   28.9 GB - 38× peak-RSS reduction. Output ordering is type-sorted
   (nodes, then ways, then relations); preserves structure on
   already-type-sorted input, re-sorts unsorted input.
-- [ ] **`time-filter`** - SIGKILL at 94 s. Uses `for_each_pipelined`
-  at `src/commands/time_filter/mod.rs:154`. **`mallopt(M_ARENA_MAX, 2)`
-  is explicitly off-limits here** per the existing comment at
-  `time_filter/mod.rs:84-91`: measured 2026-04-19 on Europe to
-  *regress* this command (95.1 s -> 160.4 s, peak anon 20 GB -> 24.8 GB,
-  avg cores 20.4 -> 14.1) because the per-blob workers do allocation-heavy
-  `BlockBuilder` re-encode rather than the wire-format splice that
-  `mallopt` favours. Hardest of the three to fix because the
-  pending-group state machine (`time_filter/mod.rs:138-`) needs strict
-  element order; porting a per-element state machine into the
-  `parallel_classify_phase` per-blob shape is a real refactor. The
-  "History PBF for `time-filter`" entry below describes the production
-  workload (currently un-benched - dataset gap), but the
-  bench-as-configured (regular planet PBF, all-keep path) is OOMing
-  separately - so the previous "near-no-op walls" description was
-  wrong at planet scale. Sidecar capture on the re-run would localise
-  the retention vs. legitimate working-set components.
+- [ ] **`time-filter`** - planet `--bench 1` SIGKILL'd twice since
+  iter 5 landed (2026-04-26 21:10 at `16e3694`, 1.6 m; 2026-04-27 19:53
+  at `4fc8e35`, 2.2 m; neither left recoverable sidecar data because
+  failure preceded the writer flush that emits `WRITER_METRICS`).
+  Bench-as-configured (regular PBF) hits the **snapshot path**
+  (`time_filter_snapshot`, parallel per-block via
+  `for_each_primitive_block_batch_budgeted` on `into_blocks_pipelined()`),
+  not the history pending-group state machine. Iter 5 brought Europe
+  peak anon to 16.9 GB / 35 GB input; naive linear to planet ~45 GB
+  is over the 28 GB host. **`mallopt(M_ARENA_MAX, 2)` is off-limits**
+  per the pin at `src/commands/time_filter/mod.rs:84-91` (measured
+  2026-04-19 on Europe to regress wall +69 % and anon +24 % because
+  the workers do allocation-heavy `BlockBuilder` re-encode, not the
+  wire-format splice that `mallopt` favours; K=4 / K=8 untested).
+  Residual snapshot-path RSS levers (per
+  [notes/time-filter-optimization.md](notes/time-filter-optimization.md)
+  ranked items): #6 reader-side scratch cap (4.4 GB / 70 % of
+  remaining alloc, retained per-decode-thread `ST_SCRATCH`/`GR_SCRATCH`),
+  #5 in-flight depth tuning (pipelined reader's `decode_ahead = 32`
+  reorder window + writer permit pool). Next planet attempt needs an
+  instrumentation pass first (reader-side WAIT_/high-water counters,
+  per-batch markers, mallinfo2 snapshots) so the next SIGKILL leaves
+  a localized read-out instead of a 2-minute wall and an empty DB row.
+  Separately: the history-path pending-group state machine
+  (`time_filter_history`, `mod.rs:154` onward) is sequential by
+  design and would need a real refactor for parallelism, but no
+  history PBF is configured in `brokkr.toml` so it doesn't show
+  up in the snapshot-path planet bench.
 - [ ] **`tags-filter --invert-match w/highway=primary`** - 461.2 s
   wall, **28.3 GB peak anon** (UUID `6665605a`). **Different root
   cause from the three above** - the high RSS is workload-shape, not

@@ -317,7 +317,7 @@ The consolidated headline table. All rows `--bench 1` unless noted.
 | build-geocode-index | `--bench 1` | **424.8 s** | `2b412af4` (2026-04-26) | |
 | merge-changes (planet, `--osc-seq 4913`, 1-OSC) | `--bench 1` | 44.2 s | `941a5784` (2026-04-28) | |
 | merge-changes (planet, `--osc-range 4914..4920`, 7-OSC) | `--bench 1` | **54.7 s** | `b6e964cc` (2026-04-28) | parallel-drain landed (was 267.2 s `bef0f1fa`) |
-| merge-changes (planet, `--osc-range 4914..4920 --simplify`, 7-OSC) | `--bench 1` | 262.2 s (4m22s) | `c0d140b6` | pre-parallel; parse parallelized in `99057fa` but write_simplified still serial - re-bench pending |
+| merge-changes (planet, `--osc-range 4914..4920 --simplify`, 7-OSC) | `--bench 1` | **73.7 s** | `3e3ef119` (2026-04-28) | parallel parse + parallel write_simplified landed (was 262.2 s `c0d140b6`) |
 
 > **Sort `+6-7 %` regression flag - softened by 4fc8e35 hotpath.**
 > Both default and `--io-uring` sort on planet drifted slightly slower
@@ -588,15 +588,44 @@ Pre-parallel baselines, retained for cross-dataset shape:
 | Planet | 1 (`--osc-seq 4913`) | **43.1 s** | - | 43.1 s | `76f78e8b` / - |
 | Planet | 7 (`--osc-range 4914..4920`) | **267.2 s (4m27s)** | 262.2 s (4m22s) | 38.2 s/OSC | `bef0f1fa` / `c0d140b6` |
 
-Planet 7-OSC default has dropped to **54.7 s** at `99057fa`; the rest
-of the matrix has not been re-benched. The germany/europe rows would
-now hit the parallel-drain path at any N > 1 row; expected speedup is
-similar in shape (max-per-OSC + small drain) but smaller in magnitude
-because the heaviest OSC dominates and germany 7-OSC walls are
-already short. `--simplify` planet 7-OSC has not yet been re-benched
-- the simplify path parallelizes the parse phase (commit `99057fa`)
-but `write_simplified` still emits XML + gzip serially through a
-single `OscWriter`. Re-bench pending.
+Planet 7-OSC walls have dropped substantially at `abd1d9e`: default
+to **54.7 s** (UUID `b6e964cc` at `99057fa`), `--simplify` to
+**73.7 s** (UUID `3e3ef119` at `abd1d9e`). The germany/europe rows
+have not been re-benched; expected speedup at those scales is similar
+in shape (max-per-OSC + small drain) but smaller in magnitude because
+the heaviest OSC dominates and germany 7-OSC walls are already short.
+
+### Simplify-path planet 7-OSC: 3.6× speedup (commit `abd1d9e`, plantasjen)
+
+| Stage | UUID | Wall | vs serial baseline |
+|---|---|---:|---:|
+| Pre-parallel baseline | `c0d140b6` (commit `16e3694`) | 262.2 s | 1.00× |
+| Parallel parse only | `37fbe5b5` (commit `488d1f0`) | 220.9 s | 1.19× |
+| **Parallel parse + parallel write_simplified** | **`3e3ef119`** | **73.7 s** | **3.6×** |
+
+Phase breakdown of the 73.7 s `3e3ef119` run:
+
+- `MERGECHANGES_PARALLEL_PARSE`: **12.3 s** - same shape as the
+  streaming-path parse (workers each call `parse_osc_into` into a
+  local `ChangeStream`, main thread concatenates in input order).
+- `MERGECHANGES_SIMPLIFY`: **6.9 s** - serial `BTreeMap` dedupe of
+  26.3 M changes into 25.4 M deduped; cheap relative to parse + emit.
+- `MERGECHANGES_PARALLEL_EMIT`: **49.4 s** - the new shape. After
+  dedupe, each non-empty action group (creates / modifies / deletes)
+  is split into chunks of size `group.len().div_ceil(num_workers)`
+  via rayon's `par_chunks`. Each worker emits its chunk as a
+  self-contained `<action>...</action>` gzip member and returns the
+  bytes. Same multi-member gzip output shape as the streaming path.
+  This phase replaces a previous ~197 s serial XML + gzip emit
+  through a single OscWriter (4.0× phase speedup).
+- `MERGECHANGES_DRAIN`: **0.33 s** - main thread concatenates prelude
+  + per-chunk members in (group, chunk-index) order + postlude.
+
+The simplify wall is now 19 s slower than the streaming wall on the
+same input. The gap is the dedupe phase (6.9 s) plus a slightly less
+efficient parse fan-out (workers parse to a separate ChangeStream
+buffer in simplify, vs the streaming path's fused parse + emit
+through `parse_osc_streaming`).
 
 Pre-parallel observations from the matrix that still hold:
 

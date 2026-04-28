@@ -16,8 +16,13 @@
   global, adding ~50 bytes per input boundary; output remains valid
   OSC. Output bytes are within 1% of the serial path. The streaming
   path's parallel implementation is the headline; `--simplify`
-  parallelizes only the parse phase (the BTreeMap dedupe + write
-  remain serial); `--simplify` re-bench pending.
+  parallelizes the parse phase the same way as the streaming path
+  AND parallelizes `write_simplified`'s output: after the BTreeMap
+  dedupe, each non-empty action group is split into chunks (one per
+  available core), each chunk emits a self-contained
+  `<action>...</action>` gzip member, main thread concatenates with
+  the same prelude/postlude wrapping. Planet 7-OSC `--simplify`:
+  **262s -> 74s, 3.6x** (UUID `3e3ef119` at commit `abd1d9e`).
 - **repack**: new command. Re-encode a PBF with a configurable
   `--elements-per-blob N` cap. Element semantics, tags, refs, members,
   metadata, and DenseNodes encoding round-trip; output is type-sorted

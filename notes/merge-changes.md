@@ -14,21 +14,34 @@ consumer that squashes N > 1 OSCs, scale-independently.
 
 ## Current state (2026-04-28)
 
-**Streaming path parallel-drain landed 2026-04-28 at commit `99057fa`.**
-Planet 7-OSC `--osc-range 4914..4920`: **267.2 s → 54.7 s, 5.0×**
-(UUID `b6e964cc`, plantasjen). 1-OSC fast path unchanged at 44.2 s
-(UUID `941a5784`). Cross-dataset matrix and stage-by-stage breakdown
-in [`reference/performance.md`](../reference/performance.md) under
-the "Merge-changes" section.
+**Both production paths parallelized.** Planet 7-OSC headline:
 
-Headline numbers:
+| Path | Pre-parallel | Final | Speedup | Final UUID / commit |
+|---|---:|---:|---:|---|
+| Streaming, planet 7-OSC | 267.2 s | **54.7 s** | **5.0×** | `b6e964cc` / `99057fa` |
+| Simplify, planet 7-OSC | 262.2 s | **73.7 s** | **3.6×** | `3e3ef119` / `abd1d9e` |
+| 1-OSC fast path | 43.1 s | 44.2 s | (unchanged) | `941a5784` |
 
-| Stage | UUID | Planet 7-OSC wall | vs serial baseline |
+Streaming-path stage history:
+
+| Stage | UUID | Wall | vs baseline |
 |---|---|---:|---:|
 | Serial baseline (`16e3694`) | `bef0f1fa` | 267.2 s | 1.00× |
 | Instrumented re-bench (`fb1719c`) | `c612c5e6` | 272.6 s | 1.00× |
 | Parallel parse, serial drain (`43dd620`) | `07ee92ee` | 235.8 s | 1.16× |
 | **Parallel-drain (`99057fa`)** | **`b6e964cc`** | **54.7 s** | **5.0×** |
+
+Simplify-path stage history:
+
+| Stage | UUID | Wall | vs baseline |
+|---|---|---:|---:|
+| Pre-parallel baseline (`16e3694`) | `c0d140b6` | 262.2 s | 1.00× |
+| Parallel parse only (`488d1f0`) | `37fbe5b5` | 220.9 s | 1.19× |
+| **Parallel parse + parallel write_simplified (`abd1d9e`)** | **`3e3ef119`** | **73.7 s** | **3.6×** |
+
+Cross-dataset matrix in
+[`reference/performance.md`](../reference/performance.md) under the
+"Merge-changes" section.
 
 Production code paths in
 [`src/commands/merge_changes/mod.rs`](../src/commands/merge_changes/mod.rs):
@@ -43,12 +56,15 @@ Production code paths in
   valid; OSC consumers (osmium, osmosis, `MultiGzDecoder`, gzip CLI)
   all support it.
 - **Simplify path** (`merge_changes` with `--simplify`): N > 1
-  parallelizes only the parse phase - workers each call
-  `parse_osc_into` into a local `ChangeStream`, main thread
-  concatenates them in input order before the existing
-  `write_simplified` BTreeMap dedupe + serial XML emit + gzip output.
-  Re-bench at `99057fa` pending; expected partial speedup (parse
-  parallelizes, write does not).
+  parallelizes the parse phase the same way as streaming AND
+  parallelizes `write_simplified`'s output. After the BTreeMap
+  dedupe, each non-empty action group (creates / modifies / deletes)
+  is split into `available_parallelism`-sized chunks via rayon's
+  `par_chunks`; each chunk emits a self-contained
+  `<action>...</action>` gzip member; main thread concatenates with
+  the same prelude/postlude wrapping as the streaming path. Phase
+  breakdown at planet 7-OSC: parse 12.3 s + dedupe 6.9 s + parallel
+  emit 49.4 s + drain 0.33 s.
 
 Per-OSC scaling pre-parallel was essentially linear (planet 7-OSC =
 6.2× the 1-OSC wall; germany 7-OSC = 7.2× the 1-OSC wall) - each
@@ -147,19 +163,24 @@ re-engineering cost.
 
 #### Follow-ups
 
-- **`--simplify` re-bench at `99057fa`.** The simplify path
-  parallelizes the parse phase (workers each call `parse_osc_into`
-  into a local `ChangeStream`, main thread concatenates them in
-  input order before the existing `BTreeMap` dedupe + serial XML +
-  gzip emit through a single `OscWriter`). Expected partial speedup;
-  the dedupe + write_simplified phase is still serial through one
-  writer thread.
+- **`--simplify` parallel write_simplified landed 2026-04-28 at
+  `abd1d9e`** (UUID `3e3ef119`): **262.2 s -> 73.7 s, 3.6×**, with
+  the write_simplified phase itself going from ~197 s to 49.4 s
+  (4.0× phase speedup). Implementation mirrors the streaming-path
+  parallel-drain: after the BTreeMap dedupe, each non-empty action
+  group is split into `available_parallelism`-sized chunks via
+  rayon's `par_chunks`, each chunk emits a self-contained
+  `<action>...</action>` gzip member, main thread concatenates with
+  the shared prelude/postlude wrapping. The intermediate stage at
+  `488d1f0` (UUID `37fbe5b5`, 220.9 s, parallel parse only,
+  write_simplified still serial) is the load-bearing measurement
+  proving the write_simplified phase was the bottleneck (~197 s of
+  220.9 s).
 - **Pipelined drain.** Workers emit gzip bytes; main thread could
   begin writing worker[0]'s chunk to disk while worker[6] is still
   parsing. Current shape buffers all worker chunks in memory before
   any drain. ~280 MB peak instead of ~1 GB at planet 7-OSC, modest
   win.
-- **Simplify dedupe alternatives** (existing item, see below).
 - **`merge-changes` as the formal upstream-diff-squash stage**
   (existing item, see below).
 
@@ -167,16 +188,20 @@ No win at 1-OSC scale. The feature only fires when the input slice
 has length > 1; the 1-OSC fast path keeps the original serial
 streaming pipeline (parse + emit + gzip interleaved on one thread).
 
-### Simplify dedupe: BTreeMap alternatives
+### Simplify dedupe: BTreeMap alternatives - RETIRED 2026-04-28
 
 `write_simplified` uses a global `BTreeMap` for "last change per
-object" dedupe. At N inputs naturally ordered by sequence number,
-a multi-input merge walk with first-occurrence-wins could replace the
-global sort. Or an `FxHashMap` keyed by `(kind, id)` holding the
-latest change, followed by a single sort at the end.
+object" dedupe. The original entry speculated that an `FxHashMap`
+keyed by `(kind, id)` (or a multi-input merge walk over already-sorted
+inputs) could shave 5-10% of `--simplify` wall.
 
-Expected small win (5-10% of `--simplify` wall). Low priority until
-overnight data says simplify is hot enough to matter.
+**Invalidated by `3e3ef119`'s phase breakdown.** With parse and
+write_simplified both parallelized, the BTreeMap dedupe is **6.9 s
+of 73.7 s** (9.4 % of wall) at planet 7-OSC. A perfect zero-cost
+dedupe replacement would shave at most 6.9 s; an `FxHashMap` swap
+realistically saves ~3-5 s (40-70 % of dedupe wall). That is below
+the noise band of the wall measurement and not the load-bearing
+optimization the original entry framed it as. Retired.
 
 ### `merge-changes` as the formal upstream-diff-squash stage
 

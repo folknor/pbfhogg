@@ -938,45 +938,75 @@ fn write_simplified(output: &Path, stream: ChangeStream) -> Result<usize> {
     }
     crate::debug::emit_marker("MERGECHANGES_SIMPLIFY_END");
 
-    crate::debug::emit_marker("MERGECHANGES_WRITE_OPEN_START");
-    let mut writer = OscWriter::from_file(output)?;
+    let total_out = creates.len() + modifies.len() + deletes.len();
+    let is_gz = output.to_str().is_some_and(|s| s.ends_with(".gz"));
 
-    writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
-    let mut root = BytesStart::new("osmChange");
-    root.push_attribute(("version", "0.6"));
-    writer.write_event(Event::Start(root))?;
-    crate::debug::emit_marker("MERGECHANGES_WRITE_OPEN_END");
+    // Mirror the streaming-path parallel-drain shape: split each
+    // non-empty action group into chunks, parallel-emit each chunk as a
+    // self-contained `<action>...</action>` gzip member, main thread
+    // concatenates members in (group, chunk-index) order with the
+    // shared prelude / postlude. Multiple consecutive same-action
+    // sections are valid OSC; the per-chunk wrapping costs ~14 bytes
+    // per chunk and is negligible against the win.
+    //
+    // 37fbe5b5 (parallel parse, serial write_simplified) clocked
+    // planet 7-OSC --simplify at 220.9 s with the write_simplified
+    // phase consuming ~197 s on a single thread - the same per-change
+    // `quick_xml::Writer` + zlib ceiling that bottlenecked the
+    // streaming path's abandoned parallel-parse-only stage. Same
+    // mechanism, same fix.
+    let num_workers = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(8);
 
-    if !creates.is_empty() {
-        writer.write_event(Event::Start(BytesStart::new("create")))?;
-        for change in &creates {
-            write_change_to(&mut writer, change)?;
+    crate::debug::emit_marker("MERGECHANGES_PARALLEL_EMIT_START");
+    let mut all_chunks: Vec<Vec<u8>> = Vec::new();
+    for (action, group) in [
+        (Action::Create, &creates),
+        (Action::Modify, &modifies),
+        (Action::Delete, &deletes),
+    ] {
+        if group.is_empty() {
+            continue;
         }
-        writer.write_event(Event::End(BytesEnd::new("create")))?;
+        let chunk_len = group.len().div_ceil(num_workers).max(1);
+        let chunks: std::result::Result<Vec<Vec<u8>>, String> = group
+            .par_chunks(chunk_len)
+            .map(|chunk| -> std::result::Result<Vec<u8>, String> {
+                let mut writer = OscWriter::<Vec<u8>>::new_buf(is_gz);
+                writer
+                    .write_event(Event::Start(BytesStart::new(action_tag(action))))
+                    .map_err(|e| e.to_string())?;
+                for change in chunk {
+                    write_change_to(&mut writer, change).map_err(|e| e.to_string())?;
+                }
+                writer
+                    .write_event(Event::End(BytesEnd::new(action_tag(action))))
+                    .map_err(|e| e.to_string())?;
+                writer.into_inner().map_err(|e| e.to_string())
+            })
+            .collect();
+        let chunks = chunks.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        all_chunks.extend(chunks);
     }
+    crate::debug::emit_marker("MERGECHANGES_PARALLEL_EMIT_END");
 
-    if !modifies.is_empty() {
-        writer.write_event(Event::Start(BytesStart::new("modify")))?;
-        for change in &modifies {
-            write_change_to(&mut writer, change)?;
-        }
-        writer.write_event(Event::End(BytesEnd::new("modify")))?;
+    crate::debug::emit_marker("MERGECHANGES_DRAIN_START");
+    let prelude = build_prelude_bytes(is_gz)?;
+    let postlude = build_postlude_bytes(is_gz)?;
+    let file = File::create(output)?;
+    let mut out = io::BufWriter::new(file);
+    out.write_all(&prelude)?;
+    for bytes in &all_chunks {
+        out.write_all(bytes)?;
     }
-
-    if !deletes.is_empty() {
-        writer.write_event(Event::Start(BytesStart::new("delete")))?;
-        for change in &deletes {
-            write_change_to(&mut writer, change)?;
-        }
-        writer.write_event(Event::End(BytesEnd::new("delete")))?;
-    }
-
-    writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
+    out.write_all(&postlude)?;
+    out.flush()?;
+    crate::debug::emit_marker("MERGECHANGES_DRAIN_END");
     crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_START");
-    writer.finish()?;
     crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_END");
 
-    Ok(creates.len() + modifies.len() + deletes.len())
+    Ok(total_out)
 }
 
 fn action_tag(action: Action) -> &'static str {

@@ -232,18 +232,34 @@ batch boundary leave fresh state in the FIFO - the time-filter
 migration set up that pattern in `src/commands/time_filter/mod.rs`;
 mirror it if you expect SIGKILL on the first attempt.
 
-- [ ] **`getid --add-referenced` pass 2** (`process_filter_batch`
-  at `src/commands/getid/mod.rs:614-648`). Identical par_iter+collect
-  shape to pre-migration time-filter. Plain `getid` and
-  `getid --invert` use a separate single-threaded `HeaderWalker`
-  loop (`filter_by_id` at `mod.rs:302-432`) and are already
-  planet-safe (27 MB / 102 MB peak per measurement table). The
-  `--add-referenced` path has not been benched at planet
-  RSS-wise. **Don't preemptively migrate** - bench first with
-  the time-filter instrumentation as template. If the par_iter+collect
-  step ISN'T the actual peak (per the tags-filter lesson above), look
-  for sibling pass-1 / dependency-collection phases that may use
-  `parallel_classify_accumulate` with worrying per-worker state.
+- [x] ~~**`getid --add-referenced` pass 2**~~ - **PLANET-SAFE AT
+  CURRENT WORKLOAD, no migration needed.** Benched 2026-04-28 at
+  commit `afe3139` (UUID `dirty`, brokkr's hardcoded ID set: 3 ways
+  + 3 relations + ~76 referenced nodes via pass 1): planet wall
+  **96.3 s**, peak anon **1.26 GB** at the GETID_PASS2 phase
+  (par_iter+collect shape). Pass 1 (`parallel_classify_accumulate`
+  with per-worker `IdSet`) peaks at 499 MB - the per-worker bitmap
+  stayed small because only 3 way IDs needed scanning. The europe
+  9.03 GB pass 2 peak observed 2026-03-29 (UUID `c0d364c3` at
+  commit `7cf002c`) was on pre-`DecompressPool` /
+  pre-`parse_and_inline`-fix infrastructure; HEAD's pipelined-reader
+  memory profile is dramatically smaller. **Same lesson as
+  tags-filter (2026-04-28): shape ≠ root cause. The par_iter+collect
+  shape did not trigger the predicted peak because brokkr's tiny
+  hardcoded ID set yields ~zero output blobs per batch (29 framed
+  output items total at planet, 8 KB), so the `Vec<OwnedBlock>`
+  collected per batch is almost empty.** Pass 2 is read-bound, not
+  memory-bound: `writer_recv_wait_ns=72.4 s` of the 72.9 s pass 2
+  wall, `pipeline_decoded_recv_wait_ns=43.7 s`. Future risk is a
+  workload with a much larger / wider-spread input ID set
+  (millions of IDs hitting many blobs at high keep-rate), which
+  would re-introduce the result accumulation peak - but that's the
+  same axis as the deferred TODO line below ("Custom ID set
+  distributions for `getid` / `getparents`") and not gating 1.0.
+  Counter `getid_dep_node_ids` added 2026-04-28 (commit forthcoming)
+  emits the dep-set size between pass 1 and pass 2, so a future
+  run with a different ID set surfaces the size up-front before
+  pass 2 starts.
 
 - [ ] **`altw` dense / sparse path** (`src/commands/altw/mod.rs:485-510`
   + `process_batch:692-736`). Identical par_iter+collect shape.

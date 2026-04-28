@@ -476,6 +476,15 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &ElementIds, opts: &GetidOp
     // get their tags stripped. Check at query time: dep_node_ids.get(id) && !ids.node_ids.get(id).
     let strip_tags = opts.remove_tags && has_dep_nodes;
     crate::debug::emit_marker("GETID_PASS1_END");
+    // Cheap one-time iteration; gives the dep-set size before pass 2
+    // starts so the counter survives a SIGKILL during pass 2.
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter(
+            "getid_dep_node_ids",
+            i64::try_from(dep_node_ids.iter().count()).unwrap_or(i64::MAX),
+        );
+    }
 
     // Pass 2: Write matching elements + dependent nodes (parallel batches).
     crate::debug::emit_marker("GETID_PASS2_START");

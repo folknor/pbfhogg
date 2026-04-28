@@ -1007,6 +1007,15 @@ fn collect_relation_member_closure(
 
         // Classify phase: workers read included_relation_ids (immutable).
         // Results collected into a Vec - merge phase runs after with mutable access.
+        // Note: this uses parallel_classify_accumulate (per-worker
+        // accumulation) rather than parallel_classify_phase. The merge
+        // step needs `&mut included_relation_ids` while the classify
+        // step needs `&included_relation_ids`, so they cannot co-exist
+        // in the same parallel_classify_phase call. Per-worker
+        // accumulation is fine here at planet (per-worker Vec<i64>
+        // tops at ~80 MB even in the worst invert-match case;
+        // measured 6.8 GB total for this phase). collect_way_node_deps
+        // is the one that hit 24 GB and needed the per-blob shape.
         let mut results: Vec<ClosureResult> = Vec::new();
         crate::scan::classify::parallel_classify_accumulate(
             &shared_file,
@@ -1079,12 +1088,23 @@ fn collect_way_node_dependencies(
         input, Some(crate::blob_meta::ElemKind::Way),
     )?;
 
-    crate::scan::classify::parallel_classify_accumulate(
+    // Per-blob node-ref accumulation. Earlier this function used
+    // `parallel_classify_accumulate` with a per-worker `IdSet`; at
+    // planet's invert-match keep-rate (~99 % of ways included) each
+    // worker's bitmap grew to ~1.5 GB and the cumulative across ~30
+    // decode threads peaked at 24 GB anon - the documented
+    // parallel_classify_accumulate caution at scan/classify.rs:300-308.
+    // parallel_classify_phase emits per-blob `Vec<i64>` (bounded by
+    // blob size: ~8000 ways × ~10 refs × 8 bytes = ~640 KB max) through
+    // a 32-slot bounded result channel, so in-flight memory is
+    // ~32 × 640 KB = ~20 MB regardless of corpus size.
+    crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &schedule,
         jobs,
-        IdSet::new,
-        |block, node_ids| {
+        || (),
+        |block, _state| {
+            let mut node_ids: Vec<i64> = Vec::new();
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element
                     && included_way_ids.get(w.id())
@@ -1094,12 +1114,13 @@ fn collect_way_node_dependencies(
                             continue;
                         }
                     }
-                    for r in w.refs() { node_ids.set(r); }
+                    for r in w.refs() { node_ids.push(r); }
                 }
             }
+            node_ids
         },
-        |worker_node_ids| {
-            relation_dep_node_ids.merge(worker_node_ids);
+        |_seq, node_ids| {
+            for id in node_ids { relation_dep_node_ids.set(id); }
         },
     )?;
 

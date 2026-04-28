@@ -72,18 +72,9 @@ Every command listed below runs on the full planet on normal hardware. Measured 
 
 Three commands write temp files to the output's parent directory: `add-locations-to-ways --index-type external` (~246 GB), `diff -j 16` (~30 GB text shards), `diff --format osc -j 16` (~45 GB XML shards). The others are scratch-free.
 
-`multi-extract --smart` is the closest to the ceiling among the planet-safe rows at 22.9 GB peak anon - the per-region working set accumulates across the 5 regions.
-
 Per-command phase breakdowns are in [reference/performance.md](reference/performance.md); per-command optimization arcs and retired phase breakdowns at older architectures are in [reference/performance-history.md](reference/performance-history.md). Note that recorded results always track the latest git head and may not match the released version.
 
 The goal for pbfhogg 1.0 is that every CLI command must be planet-scale safe on a 32GB RAM host (28-ish free GB.)
-
-### Not yet planet-safe
-
-All commands now pass at planet scale on the 28 GB-free reference host. The
-"not yet planet-safe" status was resolved 2026-04-28 with the migrations of
-`time-filter` (snapshot path) and `tags-filter` (way-deps phase) to the
-`parallel_classify_phase` + `ReorderBuffer` template.
 
 ## Usage
 
@@ -151,7 +142,7 @@ pbfhogg check <file> --refs               Validate referential integrity
 pbfhogg cat <files...> -o <out>           Concatenate PBFs (-t node,way,relation to filter)
 pbfhogg sort <file> -o <out>              Sort into standard order (nodes, ways, relations by ID)
 pbfhogg repack <file> -o <out>            Re-encode at a configurable --elements-per-blob N cap
-pbfhogg degrade <file> -o <out>           Adversarial PBF generator (--unsort, --strip-locations, --strip-indexdata)
+pbfhogg degrade <file> -o <out>           Adversarial PBF generator
 pbfhogg renumber <file> -o <out>          Renumber all IDs sequentially, remap cross-references
 pbfhogg extract <file> -o <out> -b <bbox> Extract by bounding box
 pbfhogg extract <file> -o <out> -p <geo>  Extract by GeoJSON polygon

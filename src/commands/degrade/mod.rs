@@ -123,13 +123,38 @@ pub fn degrade(
         return Err("--block-cap must be > 0".into());
     }
 
-    if flags.needs_decode() {
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("degrade_unsort", i64::from(flags.unsort));
+        crate::debug::emit_counter(
+            "degrade_strip_locations",
+            i64::from(flags.strip_locations),
+        );
+        crate::debug::emit_counter(
+            "degrade_strip_indexdata",
+            i64::from(flags.strip_indexdata),
+        );
+        crate::debug::emit_counter("degrade_block_cap", block_cap as i64);
+    }
+
+    let stats = if flags.needs_decode() {
         degrade_decode_path(
             input, output, flags, block_cap, compression, direct_io, io_uring, overrides,
-        )
+        )?
     } else {
-        degrade_passthrough_strip_indexdata(input, output, compression, direct_io, io_uring, overrides)
+        degrade_passthrough_strip_indexdata(input, output, compression, direct_io, io_uring, overrides)?
+    };
+
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("degrade_blobs_written", stats.blobs_written as i64);
+        crate::debug::emit_counter(
+            "degrade_elements_written",
+            stats.elements_written as i64,
+        );
     }
+
+    Ok(stats)
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +168,7 @@ pub fn degrade(
 /// unchanged. The output's `LocationsOnWays` and `Sort.Type_then_ID`
 /// header features are preserved when the input declared them, since the
 /// blob bytes still encode that data.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn degrade_passthrough_strip_indexdata(
     input: &Path,
     output: &Path,
@@ -170,6 +196,7 @@ fn degrade_passthrough_strip_indexdata(
     let mut file_offset: u64 = 0;
     let mut blobs_written: u64 = 0;
 
+    crate::debug::emit_marker("DEGRADE_PASSTHROUGH_START");
     while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
         match &frame.blob_type {
             BlobKind::OsmHeader => {}
@@ -183,8 +210,11 @@ fn degrade_passthrough_strip_indexdata(
             _ => {}
         }
     }
+    crate::debug::emit_marker("DEGRADE_PASSTHROUGH_END");
 
+    crate::debug::emit_marker("DEGRADE_FLUSH_START");
     writer.flush()?;
+    crate::debug::emit_marker("DEGRADE_FLUSH_END");
 
     Ok(DegradeStats {
         blobs_written,
@@ -282,6 +312,7 @@ impl UnsortState {
 /// Streaming decode + re-encode. Handles `--unsort`, `--strip-locations`,
 /// and the decode-side composition of `--strip-indexdata`.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn degrade_decode_path(
     input: &Path,
     output: &Path,
@@ -311,6 +342,7 @@ fn degrade_decode_path(
     let mut unsort = UnsortState::new(block_cap);
     let mut elements_written: u64 = 0;
 
+    crate::debug::emit_marker("DEGRADE_DECODE_START");
     for block in reader.into_blocks_pipelined() {
         let block = block?;
         for element in block.elements() {
@@ -331,7 +363,27 @@ fn degrade_decode_path(
     }
 
     flush_terminal_blocks(&mut bb, &mut writer, flags.strip_indexdata, compression)?;
+    crate::debug::emit_marker("DEGRADE_DECODE_END");
+
+    crate::debug::emit_marker("DEGRADE_FLUSH_START");
     writer.flush()?;
+    crate::debug::emit_marker("DEGRADE_FLUSH_END");
+
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter(
+            "degrade_unsort_fired_nodes",
+            i64::from(unsort.fired[Kind::Node.index()]),
+        );
+        crate::debug::emit_counter(
+            "degrade_unsort_fired_ways",
+            i64::from(unsort.fired[Kind::Way.index()]),
+        );
+        crate::debug::emit_counter(
+            "degrade_unsort_fired_relations",
+            i64::from(unsort.fired[Kind::Relation.index()]),
+        );
+    }
 
     let blobs_written = blob_count(output, direct_io)?;
 
@@ -401,6 +453,7 @@ fn read_owned(element: &Element<'_>) -> OwnedElement {
 /// Add a borrowed element to the BlockBuilder. Flushes via the
 /// `--strip-indexdata`-aware path so output blobs match the requested
 /// degradation when the flag is set.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn add_element_to_builder(
     element: &Element<'_>,
     flags: DegradeFlags,
@@ -533,6 +586,7 @@ fn ensure_capacity(
 /// with `indexdata = None` and dispatch via `write_raw_owned`. Otherwise
 /// use the standard `write_primitive_block_owned` path that embeds
 /// indexdata.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn flush_with_indexdata_choice(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
@@ -561,6 +615,7 @@ fn flush_terminal_blocks(
 
 /// After the writer has flushed, count the OsmData blobs in `output` so
 /// the stats summary reflects reality regardless of which path was taken.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn blob_count(output: &Path, direct_io: bool) -> Result<u64> {
     let mut reader = FileReader::open(output, direct_io)?;
     let mut file_offset: u64 = 0;

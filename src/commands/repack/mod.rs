@@ -113,7 +113,7 @@ struct WorkerOutput {
 /// round-trips with its tags, refs, members, metadata, and DenseNodes
 /// encoding. Output is type-sorted (nodes, then ways, then relations);
 /// the `Sort.Type_then_ID` flag is propagated when the input has it.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn repack(
     input: &Path,
@@ -164,13 +164,26 @@ pub fn repack(
     let (node_schedule, way_schedule, rel_schedule, shared_file) =
         crate::scan::classify::build_classify_schedules_split(input)?;
 
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("repack_input_blobs_nodes", node_schedule.len() as i64);
+        crate::debug::emit_counter("repack_input_blobs_ways", way_schedule.len() as i64);
+        crate::debug::emit_counter("repack_input_blobs_relations", rel_schedule.len() as i64);
+        crate::debug::emit_counter(
+            "repack_input_blobs_total",
+            (node_schedule.len() + way_schedule.len() + rel_schedule.len()) as i64,
+        );
+    }
+
     let mut blobs_written: u64 = 0;
     let mut elements_written: u64 = 0;
     let mut total_coalesces: u64 = 0;
+    let mut total_worker_full_blobs: u64 = 0;
+    let mut total_central_blobs: u64 = 0;
     let mut any_cap_fired: bool = false;
 
     crate::debug::emit_marker("REPACK_NODES_START");
-    let s = run_kind_phase(
+    let node_stats = run_kind_phase(
         &shared_file,
         &node_schedule,
         KIND_NODE,
@@ -178,14 +191,17 @@ pub fn repack(
         compression,
         &mut writer,
     )?;
-    blobs_written += s.blobs;
-    elements_written += s.elements;
-    total_coalesces += s.coalesces;
-    any_cap_fired |= s.cap_fired;
     crate::debug::emit_marker("REPACK_NODES_END");
+    emit_phase_counters("nodes", &node_stats);
+    blobs_written += node_stats.blobs;
+    elements_written += node_stats.elements;
+    total_coalesces += node_stats.coalesces;
+    total_worker_full_blobs += node_stats.worker_full_blobs;
+    total_central_blobs += node_stats.central_blobs;
+    any_cap_fired |= node_stats.cap_fired;
 
     crate::debug::emit_marker("REPACK_WAYS_START");
-    let s = run_kind_phase(
+    let way_stats = run_kind_phase(
         &shared_file,
         &way_schedule,
         KIND_WAY,
@@ -193,14 +209,17 @@ pub fn repack(
         compression,
         &mut writer,
     )?;
-    blobs_written += s.blobs;
-    elements_written += s.elements;
-    total_coalesces += s.coalesces;
-    any_cap_fired |= s.cap_fired;
     crate::debug::emit_marker("REPACK_WAYS_END");
+    emit_phase_counters("ways", &way_stats);
+    blobs_written += way_stats.blobs;
+    elements_written += way_stats.elements;
+    total_coalesces += way_stats.coalesces;
+    total_worker_full_blobs += way_stats.worker_full_blobs;
+    total_central_blobs += way_stats.central_blobs;
+    any_cap_fired |= way_stats.cap_fired;
 
     crate::debug::emit_marker("REPACK_RELATIONS_START");
-    let s = run_kind_phase(
+    let rel_stats = run_kind_phase(
         &shared_file,
         &rel_schedule,
         KIND_RELATION,
@@ -208,19 +227,28 @@ pub fn repack(
         compression,
         &mut writer,
     )?;
-    blobs_written += s.blobs;
-    elements_written += s.elements;
-    total_coalesces += s.coalesces;
-    any_cap_fired |= s.cap_fired;
     crate::debug::emit_marker("REPACK_RELATIONS_END");
+    emit_phase_counters("relations", &rel_stats);
+    blobs_written += rel_stats.blobs;
+    elements_written += rel_stats.elements;
+    total_coalesces += rel_stats.coalesces;
+    total_worker_full_blobs += rel_stats.worker_full_blobs;
+    total_central_blobs += rel_stats.central_blobs;
+    any_cap_fired |= rel_stats.cap_fired;
 
+    crate::debug::emit_marker("REPACK_FLUSH_START");
     writer.flush()?;
+    crate::debug::emit_marker("REPACK_FLUSH_END");
 
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("repack_blobs_written", blobs_written as i64);
         crate::debug::emit_counter("repack_elements_written", elements_written as i64);
         crate::debug::emit_counter("repack_input_blobs_coalesced", total_coalesces as i64);
+        crate::debug::emit_counter("repack_worker_full_blobs", total_worker_full_blobs as i64);
+        crate::debug::emit_counter("repack_central_blobs", total_central_blobs as i64);
+        crate::debug::emit_counter("repack_cap_fired", i64::from(any_cap_fired));
+        crate::debug::emit_counter("repack_elements_per_blob", elements_per_blob as i64);
     }
 
     // Detect the silent-identity surprise: cap exceeds every kind's total
@@ -250,10 +278,37 @@ struct PhaseStats {
     /// central builder. 0 on shrinks with exact division; otherwise grows
     /// with the proportion of input blobs that don't divide cleanly.
     coalesces: u64,
+    /// Output blobs framed in workers (full-block path).
+    worker_full_blobs: u64,
+    /// Output blobs framed via the merge-thread central builder (mid-stream
+    /// flushes from cap fires + the final residual flush).
+    central_blobs: u64,
     /// True iff this kind produced more than one output blob, i.e. the
     /// cap actually shaped the output (worker emitted full blocks or the
     /// central builder flushed mid-stream). Used by the global warning.
     cap_fired: bool,
+}
+
+/// Emit per-kind sidecar counters for one `run_kind_phase` result.
+fn emit_phase_counters(kind: &str, s: &PhaseStats) {
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter(&format!("repack_{kind}_blobs"), s.blobs as i64);
+        crate::debug::emit_counter(&format!("repack_{kind}_elements"), s.elements as i64);
+        crate::debug::emit_counter(&format!("repack_{kind}_coalesces"), s.coalesces as i64);
+        crate::debug::emit_counter(
+            &format!("repack_{kind}_worker_full_blobs"),
+            s.worker_full_blobs as i64,
+        );
+        crate::debug::emit_counter(
+            &format!("repack_{kind}_central_blobs"),
+            s.central_blobs as i64,
+        );
+        crate::debug::emit_counter(
+            &format!("repack_{kind}_cap_fired"),
+            i64::from(s.cap_fired),
+        );
+    }
 }
 
 /// Run one per-kind phase: pread workers decode + split (full blocks
@@ -261,6 +316,7 @@ struct PhaseStats {
 /// thread writes full blocks directly and runs a single long-lived
 /// `BlockBuilder` for cross-input-blob coalescing on the trailing slices.
 #[allow(clippy::too_many_lines)]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn run_kind_phase(
     shared_file: &std::sync::Arc<std::fs::File>,
     schedule: &[(usize, u64, usize)],
@@ -276,6 +332,8 @@ fn run_kind_phase(
             blobs: 0,
             elements: 0,
             coalesces: 0,
+            worker_full_blobs: 0,
+            central_blobs: 0,
             cap_fired: false,
         });
     }
@@ -411,10 +469,17 @@ fn run_kind_phase(
     // actually shaping the output.
     let cap_fired = (worker_full_blobs + central_blobs + residual) > 1;
 
+    // Roll the residual into central_blobs for the sidecar accounting:
+    // the merge thread framed and wrote it via the same `frame_and_write_batch`
+    // path as the mid-stream flushes.
+    let central_blobs_total = central_blobs + residual;
+
     Ok(PhaseStats {
         blobs,
         elements,
         coalesces,
+        worker_full_blobs,
+        central_blobs: central_blobs_total,
         cap_fired,
     })
 }
@@ -424,6 +489,7 @@ fn run_kind_phase(
 /// and ship the trailing `M%cap` elements as `Owned*` data for the merge
 /// thread to coalesce across input-blob boundaries.
 #[allow(clippy::too_many_lines)]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn worker_split_blob(
     block: &crate::PrimitiveBlock,
     kind: u8,
@@ -566,6 +632,7 @@ fn frame_owned(
 /// Frame `batch` in parallel via rayon, then write the framed bytes in
 /// seq order. Used by the merge thread to keep central-builder framing
 /// off the serial critical path.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn frame_and_write_batch(
     batch: Vec<OwnedBlock>,
     compression: Compression,

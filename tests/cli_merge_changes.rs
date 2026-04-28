@@ -20,7 +20,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use common::cli::CliInvoker;
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use tempfile::TempDir;
@@ -39,7 +39,7 @@ fn write_osc_plain(path: &Path, xml: &str) {
 
 fn read_osc_gz(path: &Path) -> String {
     let file = File::open(path).expect("open osc file");
-    let mut dec = GzDecoder::new(file);
+    let mut dec = MultiGzDecoder::new(file);
     let mut xml = String::new();
     dec.read_to_string(&mut xml).expect("read osc");
     xml

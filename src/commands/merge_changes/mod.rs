@@ -517,13 +517,37 @@ fn parse_str_attr_optional(e: &BytesStart<'_>, name: &[u8]) -> Option<String> {
     None
 }
 
-enum OscWriter {
-    Gz(Box<Writer<GzEncoder<io::BufWriter<File>>>>),
-    Plain(Writer<io::BufWriter<File>>),
+enum OscWriter<W: io::Write> {
+    Gz(Box<Writer<GzEncoder<W>>>),
+    Plain(Writer<W>),
 }
 
-impl OscWriter {
-    fn new(output: &Path) -> Result<Self> {
+impl<W: io::Write> OscWriter<W> {
+    fn write_event(&mut self, event: Event<'_>) -> Result<()> {
+        match self {
+            Self::Gz(w) => w.write_event(event)?,
+            Self::Plain(w) => w.write_event(event)?,
+        }
+        Ok(())
+    }
+
+    /// Closes the gzip stream (if Gz) and returns the inner writer.
+    /// For the file-backed flow, prefer `finish()` which also flushes
+    /// the BufWriter. For the in-memory worker flow, this is the way
+    /// to recover the produced `Vec<u8>` of compressed (or plain) XML.
+    fn into_inner(self) -> Result<W> {
+        match self {
+            Self::Gz(w) => {
+                let gz = w.into_inner();
+                Ok(gz.finish()?)
+            }
+            Self::Plain(w) => Ok(w.into_inner()),
+        }
+    }
+}
+
+impl OscWriter<io::BufWriter<File>> {
+    fn from_file(output: &Path) -> Result<Self> {
         let file = File::create(output)?;
         let buf = io::BufWriter::new(file);
         let is_gz = output.to_str().is_some_and(|s| s.ends_with(".gz"));
@@ -536,14 +560,6 @@ impl OscWriter {
         } else {
             Ok(Self::Plain(Writer::new_with_indent(buf, b' ', 2)))
         }
-    }
-
-    fn write_event(&mut self, event: Event<'_>) -> Result<()> {
-        match self {
-            Self::Gz(w) => w.write_event(event)?,
-            Self::Plain(w) => w.write_event(event)?,
-        }
-        Ok(())
     }
 
     fn finish(self) -> Result<()> {
@@ -561,19 +577,29 @@ impl OscWriter {
     }
 }
 
+impl OscWriter<Vec<u8>> {
+    /// In-memory `OscWriter` for parallel-drain workers. Each worker
+    /// emits its OSC's XML into its own `Vec<u8>` buffer (gz-encoded if
+    /// `is_gz`); main thread concatenates worker buffers in input order.
+    /// Multi-member gzip is valid: the resulting output file is the
+    /// concatenation of self-contained gzip streams, decoded as the
+    /// concatenation of their decompressed contents.
+    fn new_buf(is_gz: bool) -> Self {
+        if is_gz {
+            Self::Gz(Box::new(Writer::new_with_indent(
+                GzEncoder::new(Vec::new(), flate2::Compression::fast()),
+                b' ',
+                2,
+            )))
+        } else {
+            Self::Plain(Writer::new_with_indent(Vec::new(), b' ', 2))
+        }
+    }
+}
+
 #[hotpath::measure]
 fn write_streaming(inputs: &[&Path], output: &Path) -> Result<u64> {
-    crate::debug::emit_marker("MERGECHANGES_WRITE_OPEN_START");
-    let mut writer = OscWriter::new(output)?;
-
-    writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
-    let mut root = BytesStart::new("osmChange");
-    root.push_attribute(("version", "0.6"));
-    writer.write_event(Event::Start(root))?;
-    crate::debug::emit_marker("MERGECHANGES_WRITE_OPEN_END");
-
-    let mut open_action: Option<Action> = None;
-    let mut count = 0u64;
+    let is_gz = output.to_str().is_some_and(|s| s.ends_with(".gz"));
 
     if inputs.len() <= 1 {
         // N <= 1: no parallelism available. Use the original serial
@@ -581,6 +607,17 @@ fn write_streaming(inputs: &[&Path], output: &Path) -> Result<u64> {
         // buffer-and-drain cost. Avoids the regression a forced
         // buffer-and-drain would inflict at single-OSC scale (drain pass
         // is pure overhead when there is no parse to overlap with).
+        crate::debug::emit_marker("MERGECHANGES_WRITE_OPEN_START");
+        let mut writer = OscWriter::from_file(output)?;
+
+        writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
+        let mut root = BytesStart::new("osmChange");
+        root.push_attribute(("version", "0.6"));
+        writer.write_event(Event::Start(root))?;
+        crate::debug::emit_marker("MERGECHANGES_WRITE_OPEN_END");
+
+        let mut open_action: Option<Action> = None;
+        let mut count = 0u64;
         for path in inputs {
             if let Ok(meta) = std::fs::metadata(path) {
                 #[allow(clippy::cast_possible_wrap)]
@@ -596,66 +633,107 @@ fn write_streaming(inputs: &[&Path], output: &Path) -> Result<u64> {
                 (count - count_before) as i64,
             );
         }
-    } else {
-        // N > 1: parallel parse (gzip + XML) into per-input ChangeStream,
-        // then drain in input order to emit XML to the output writer.
-        // Locked-in 2026-04-28 by `c612c5e6` measurement showing gzip is
-        // 1.5 % of wall - parallelism must target the XML parse phase,
-        // which forces buffer-and-drain. See notes/merge-changes.md.
-        for path in inputs {
-            if let Ok(meta) = std::fs::metadata(path) {
-                #[allow(clippy::cast_possible_wrap)]
-                crate::debug::emit_counter("merge_changes_input_bytes", meta.len() as i64);
-            }
+
+        if let Some(prev) = open_action {
+            writer.write_event(Event::End(BytesEnd::new(action_tag(prev))))?;
         }
+        writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
+        crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_START");
+        writer.finish()?;
+        crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_END");
+        return Ok(count);
+    }
 
-        crate::debug::emit_marker("MERGECHANGES_PARALLEL_PARSE_START");
-        // Convert closure errors to String so the closure return type is
-        // Send + Sync (rayon requires it). `parse_osc_into` returns
-        // BoxResult = `Result<(), Box<dyn Error>>` which is not Send.
-        let streams: std::result::Result<Vec<ChangeStream>, String> = inputs
-            .par_iter()
-            .map(|path| -> std::result::Result<ChangeStream, String> {
-                let mut s = ChangeStream::default();
-                parse_osc_into(path, &mut s).map_err(|e| e.to_string())?;
-                Ok(s)
-            })
-            .collect();
-        let streams = streams.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        crate::debug::emit_marker("MERGECHANGES_PARALLEL_PARSE_END");
-
-        crate::debug::emit_marker("MERGECHANGES_DRAIN_START");
-        for stream in streams {
-            let count_before = count;
-            for change in &stream.changes {
-                emit_change(&mut writer, &mut open_action, change)?;
-                count += 1;
-            }
+    // N > 1: parallel-drain. Each worker runs the full per-input pipeline
+    // (parse + XML re-emit + gzip-compress) into its own in-memory buffer.
+    // Main thread writes the prelude (XML decl + osmChange opening) as its
+    // own gzip member, concatenates worker buffers in input order (also
+    // self-contained gzip members), and writes the postlude (osmChange
+    // closing) as its own gzip member. Multi-member gzip is valid; on
+    // decompress the members concatenate to produce the full XML document.
+    //
+    // Why this beats parallel-parse + serial-drain (commit 43dd620,
+    // UUID 07ee92ee, 235.8 s wall): the serial drain pass at planet
+    // 7-OSC was 223 s, dominated by per-change `quick_xml::Writer`
+    // emit cost (single-thread XML serialization of 26.3 M changes).
+    // Moving the re-emit + gzip onto the worker threads parallelizes
+    // that 223 s across the same N rayon workers already doing parse.
+    for path in inputs {
+        if let Ok(meta) = std::fs::metadata(path) {
             #[allow(clippy::cast_possible_wrap)]
-            crate::debug::emit_counter(
-                "merge_changes_changes_per_osc",
-                (count - count_before) as i64,
-            );
+            crate::debug::emit_counter("merge_changes_input_bytes", meta.len() as i64);
         }
-        crate::debug::emit_marker("MERGECHANGES_DRAIN_END");
     }
 
-    if let Some(prev) = open_action {
-        writer.write_event(Event::End(BytesEnd::new(action_tag(prev))))?;
-    }
+    crate::debug::emit_marker("MERGECHANGES_PARALLEL_EMIT_START");
+    let chunks: std::result::Result<Vec<(Vec<u8>, u64)>, String> = inputs
+        .par_iter()
+        .map(|path| -> std::result::Result<(Vec<u8>, u64), String> {
+            let mut writer = OscWriter::<Vec<u8>>::new_buf(is_gz);
+            let mut open_action: Option<Action> = None;
+            let mut count = 0u64;
+            parse_osc_streaming(path, &mut writer, &mut open_action, &mut count)
+                .map_err(|e| e.to_string())?;
+            if let Some(prev) = open_action {
+                writer
+                    .write_event(Event::End(BytesEnd::new(action_tag(prev))))
+                    .map_err(|e| e.to_string())?;
+            }
+            let bytes = writer.into_inner().map_err(|e| e.to_string())?;
+            Ok((bytes, count))
+        })
+        .collect();
+    let chunks = chunks.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    crate::debug::emit_marker("MERGECHANGES_PARALLEL_EMIT_END");
 
-    writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
+    crate::debug::emit_marker("MERGECHANGES_DRAIN_START");
+    let prelude = build_prelude_bytes(is_gz)?;
+    let postlude = build_postlude_bytes(is_gz)?;
+    let file = File::create(output)?;
+    let mut out = io::BufWriter::new(file);
+    out.write_all(&prelude)?;
+    let mut count = 0u64;
+    for (bytes, n) in chunks {
+        out.write_all(&bytes)?;
+        count += n;
+        #[allow(clippy::cast_possible_wrap)]
+        crate::debug::emit_counter("merge_changes_changes_per_osc", n as i64);
+    }
+    out.write_all(&postlude)?;
+    out.flush()?;
+    crate::debug::emit_marker("MERGECHANGES_DRAIN_END");
     crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_START");
-    writer.finish()?;
     crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_END");
 
     Ok(count)
 }
 
+/// Pre-build the XML prelude (`<?xml ?><osmChange version="0.6">`) as
+/// a self-contained gzip member (or plain bytes if `is_gz` is false).
+/// Used by the N > 1 parallel-drain path so the main thread can write
+/// it directly to the output file before concatenating worker chunks.
+fn build_prelude_bytes(is_gz: bool) -> Result<Vec<u8>> {
+    let mut writer = OscWriter::<Vec<u8>>::new_buf(is_gz);
+    writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
+    let mut root = BytesStart::new("osmChange");
+    root.push_attribute(("version", "0.6"));
+    writer.write_event(Event::Start(root))?;
+    writer.into_inner()
+}
+
+/// Pre-build the XML postlude (`</osmChange>`) as a self-contained
+/// gzip member (or plain bytes if `is_gz` is false). Counterpart to
+/// `build_prelude_bytes`.
+fn build_postlude_bytes(is_gz: bool) -> Result<Vec<u8>> {
+    let mut writer = OscWriter::<Vec<u8>>::new_buf(is_gz);
+    writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
+    writer.into_inner()
+}
+
 #[hotpath::measure]
-fn parse_osc_streaming(
+fn parse_osc_streaming<W: io::Write>(
     path: &Path,
-    writer: &mut OscWriter,
+    writer: &mut OscWriter<W>,
     open_action: &mut Option<Action>,
     count: &mut u64,
 ) -> Result<()> {
@@ -728,12 +806,12 @@ fn parse_osc_streaming(
     Ok(())
 }
 
-fn handle_start_like_streaming(
+fn handle_start_like_streaming<W: io::Write>(
     e: &BytesStart<'_>,
     is_empty: bool,
     section: &mut Section,
     current: &mut Option<CurrentElem>,
-    writer: &mut OscWriter,
+    writer: &mut OscWriter<W>,
     open_action: &mut Option<Action>,
     count: &mut u64,
 ) -> Result<()> {
@@ -823,8 +901,8 @@ fn handle_start_like_streaming(
     Ok(())
 }
 
-fn emit_change(
-    writer: &mut OscWriter,
+fn emit_change<W: io::Write>(
+    writer: &mut OscWriter<W>,
     open_action: &mut Option<Action>,
     change: &Change,
 ) -> Result<()> {
@@ -861,7 +939,7 @@ fn write_simplified(output: &Path, stream: ChangeStream) -> Result<usize> {
     crate::debug::emit_marker("MERGECHANGES_SIMPLIFY_END");
 
     crate::debug::emit_marker("MERGECHANGES_WRITE_OPEN_START");
-    let mut writer = OscWriter::new(output)?;
+    let mut writer = OscWriter::from_file(output)?;
 
     writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
     let mut root = BytesStart::new("osmChange");
@@ -909,7 +987,7 @@ fn action_tag(action: Action) -> &'static str {
     }
 }
 
-fn write_change_to(writer: &mut OscWriter, change: &Change) -> Result<()> {
+fn write_change_to<W: io::Write>(writer: &mut OscWriter<W>, change: &Change) -> Result<()> {
     let delete = change.action == Action::Delete;
     match writer {
         OscWriter::Gz(w) => write_change_element(w, &change.element, delete),

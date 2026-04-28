@@ -202,45 +202,92 @@ planet-safe" table is now empty.
 
 ### Latent same-shape risks (not gating 1.0)
 
-The 2026-04-28 audit found two more commands sharing the
+Two commands share the
 `for_each_primitive_block_batch` + `par_iter().map_init(BlockBuilder)`
-+ `collect` + drain pattern that drives the time-filter and
-tags-filter planet OOMs. Neither blocks 1.0 today, but both would
-hit the same ~28 GB ceiling under the right workload, and both have
-the same migration template available.
++ `collect` + drain pattern that drove the pre-migration
+time-filter snapshot OOM. Neither has been benched at planet
+RSS-wise; neither blocks 1.0 today.
+
+**Critical lesson from the tags-filter investigation (2026-04-28):
+shape ≠ root cause. Always instrument first.** The pre-migration
+TODO entry for tags-filter `--invert-match` claimed the par_iter+collect
+shape was the 28.3 GB peak's root cause, by analogy with time-filter.
+The actual measurement showed pass 2 (which has that exact shape)
+peaks at only ~7 GB at planet. The 24 GB came from a sibling phase
+(`collect_way_node_dependencies`) using `parallel_classify_accumulate`
+with a per-worker `IdSet` bitmap whose size scales with ID space
+not element count. Both bugs are real, but they live in different
+phases and have different fixes. **Before assuming either of these
+two commands needs the par_iter+collect migration, run a planet bench
+with full sidecar instrumentation and read the per-phase RSS table.**
+The actual blocker may be a sibling phase (e.g. an
+`parallel_classify_accumulate` caller that's now visible because
+the headline phase isn't dominating).
+
+When you do bench, the data lives in `brokkr sidecar <UUID> --human`
+and won't survive a subsequent forced/failed run from any other
+command (the `dirty` alias rotates). If the run OOM/SIGKILL'd before
+`writer.flush()`, mid-run `WRITER_METRICS.emit()` calls inside the
+batch boundary leave fresh state in the FIFO - the time-filter
+migration set up that pattern in `src/commands/time_filter/mod.rs`;
+mirror it if you expect SIGKILL on the first attempt.
 
 - [ ] **`getid --add-referenced` pass 2** (`process_filter_batch`
-  at `src/commands/getid/mod.rs:614-648`). Identical shape to the
-  pre-migration time-filter snapshot path. Currently masked because:
-  (a) the dep_node_ids set is typically small enough that workers
-  rarely emit large output volumes per blob; (b) plain `getid` and
+  at `src/commands/getid/mod.rs:614-648`). Identical par_iter+collect
+  shape to pre-migration time-filter. Plain `getid` and
   `getid --invert` use a separate single-threaded `HeaderWalker`
-  loop (`filter_by_id` at `mod.rs:302-432`) that's already planet-
-  safe (27 MB / 102 MB peak per the user's measurement table). The
-  `--add-referenced` path has not been benched at planet RSS-wise.
-  Migration trigger: the day a planet user with
-  `--add-referenced` reports an OOM, or the day someone wants to
-  preempt it. Same `parallel_classify_phase` template as time-filter.
+  loop (`filter_by_id` at `mod.rs:302-432`) and are already
+  planet-safe (27 MB / 102 MB peak per measurement table). The
+  `--add-referenced` path has not been benched at planet
+  RSS-wise. **Don't preemptively migrate** - bench first with
+  the time-filter instrumentation as template. If the par_iter+collect
+  step ISN'T the actual peak (per the tags-filter lesson above), look
+  for sibling pass-1 / dependency-collection phases that may use
+  `parallel_classify_accumulate` with worrying per-worker state.
 
 - [ ] **`altw` dense / sparse path** (`src/commands/altw/mod.rs:485-510`
-  + `process_batch:692-736`). Identical shape. Currently masked
-  because `add-locations-to-ways --index-type auto` selects
-  `external` for sorted+indexed planet inputs, and external uses
-  entirely different scatter/gather code (`altw/external/`) - this
-  pattern doesn't fire on the planet recommended path. Forcing
-  `--index-type dense` or `--index-type sparse` at planet would
-  hit the same ceiling. Migration trigger: a non-canonical planet
-  PBF (unsorted or non-indexed) becomes a regular workload, or the
-  dense rank-indexed-array improvement (the open
-  "Dense ALTW compact rank-indexed array" research item below)
-  lands and pushes someone to bench dense at planet. Same template.
+  + `process_batch:692-736`). Identical par_iter+collect shape.
+  Currently masked because `add-locations-to-ways --index-type auto`
+  selects `external` for sorted+indexed planet inputs, and external
+  uses entirely different scatter/gather code (`altw/external/`) -
+  this pattern doesn't fire on the planet recommended path.
+  Forcing `--index-type dense` or `--index-type sparse` at planet
+  is the trigger. Same investigative discipline as getid above:
+  bench first, instrument the sidecar, identify the actual peak
+  phase before assuming the par_iter+collect step is the culprit.
+  Other altw stages also worth checking: any
+  `parallel_classify_accumulate` caller in the dense or sparse
+  pipelines is suspect at planet keep-rates (the documented
+  caution at `src/scan/classify.rs:300-317` lists the criteria).
 
-Reuse plan: time-filter migration ships first as the
-`parallel_classify_phase` + `ReorderBuffer` precedent. Tags-filter
-follows and extracts shared helpers
-(`frame_owned_blocks`, `drain_classify_phase`). Either of these
-two commands becomes a drop-in third caller of the helpers if/when
-the trigger fires; not active code work today.
+### Other `parallel_classify_accumulate` callers (audit checklist)
+
+The pattern that bit tags-filter (`parallel_classify_accumulate` +
+per-worker `IdSet`) lives in at least one other place that's
+already documented:
+
+- **geocode pass 1.5** - per-worker IdSet of way node refs. Documented
+  at `src/scan/classify.rs:302-308` as "shipping at 14.59 GB peak RSS
+  (planet) - OK in practice, but on the rewrite list in
+  `notes/geocode-build-opportunities.md`." Migration template applies
+  identically: per-blob `Vec<i64>` of node refs through the bounded
+  result channel. **Borrow caveat:** the geocode pass 1.5 merge
+  step's mutability vs. the classify step's read access has not been
+  audited in this context - if the same `&X` / `&mut X` conflict
+  arises that prevented `tags_filter::collect_relation_member_closure`
+  from migrating, fall back on `parallel_classify_accumulate` and
+  size the per-worker state explicitly. The
+  `tags_filter::collect_relation_member_closure` precedent at
+  `src/commands/tags_filter/mod.rs:984-1066` shows the unmigratable
+  shape and the trade-off (bounded per-worker `Vec<i64>` is fine
+  when state grows with element count, not ID space).
+
+- **`tags_filter::collect_relation_member_closure`** itself - kept
+  on `parallel_classify_accumulate` *deliberately* (per the borrow
+  caveat above; pinned in code).
+
+If you discover another caller while investigating getid or altw,
+add it here with the per-worker upper bound at planet scale.
 
 ### Blocked on dataset / config
 

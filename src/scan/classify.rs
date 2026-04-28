@@ -296,8 +296,9 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
 /// multiplied by the number of decode threads.
 ///
 /// Safe: relation classify (~68 MB per worker at planet) and relation
-/// closure members (~13 MB per worker). These are sparse paths where `S`
-/// is dominated by a small set of relation-local IDs or metadata.
+/// closure members (~13 MB per worker, e.g.
+/// `tags_filter::collect_relation_member_closure`). These are sparse paths
+/// where `S` is dominated by a small set of relation-local IDs or metadata.
 ///
 /// Borderline: per-worker `IdSet` accumulation of node IDs during
 /// way classify (geocode Pass 1.5). A worker can legitimately touch node
@@ -307,10 +308,40 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
 /// but on the rewrite list in `notes/geocode-build-opportunities.md`.
 /// If you add another caller like this, measure first.
 ///
+/// **A previous caller in this category was migrated to
+/// [`parallel_classify_phase`] on 2026-04-28** (commit `17b116c`,
+/// `tags_filter::collect_way_node_dependencies`). Per-worker IdSet was the
+/// 24 GB anon RSS peak at planet `--invert-match w/highway=primary`
+/// (UUID `9044c456`); after the migration to per-blob `Vec<i64>` of node
+/// refs through the 32-slot result channel, the same phase peaks at
+/// ~7 GB total (UUID `7e74981a`). Mechanism: per-worker bitmap × N
+/// workers is bounded by ID space × N, not by element count, so a few
+/// dozen workers each with a planet-wide bitmap saturates RSS. Per-blob
+/// `Vec<i64>` is bounded by element count (`~8000 elements/blob × 8 bytes`
+/// at planet ≈ ~640 KB), and the bounded result channel caps the queue
+/// depth.
+///
 /// Unsafe: per-worker `Vec<i64>` accumulation of node IDs during dense
 /// node classify (would be O(billions of i64) per worker). Use
 /// [`parallel_classify_phase`] instead - its per-blob merge is bounded
 /// by blob size (~8 000 elements).
+///
+/// # When you can't migrate to `parallel_classify_phase`
+///
+/// `parallel_classify_phase`'s `classify` closure is `Fn + Sync`
+/// (immutable borrow of captures) and the `merge` closure is `FnMut`
+/// (mutable borrow). They run concurrently - classify on workers,
+/// merge on the consumer thread. If your classify needs `&X` while
+/// merge needs `&mut X` for the same `X`, the borrow checker correctly
+/// rejects the closure pair. This is exactly the case in
+/// `tags_filter::collect_relation_member_closure`'s convergence loop:
+/// classify reads `&included_relation_ids`, merge calls
+/// `included_relation_ids.set_if_new(id)`. Stay on
+/// `parallel_classify_accumulate` for those - the merge runs after
+/// the parallel scope, so there's no read/write conflict, and
+/// per-worker `Vec<i64>` member-list state is bounded by member counts
+/// (relation closure: ~tens of MB / worker at planet) rather than by
+/// ID space.
 ///
 /// If you change this comment, also update the caller audit in the
 /// geocode Pass 1.5 call site and the TODO item tracking it.

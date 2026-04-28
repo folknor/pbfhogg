@@ -101,6 +101,16 @@ pub fn time_filter(
     let stats = if is_history {
         time_filter_history(reader, &mut writer, cutoff_timestamp)?
     } else {
+        // Cap pipeline decode-ahead at 8 (default 32) for the
+        // snapshot path. The cross-thread PrimitiveBlock retention
+        // pattern documented at pipeline.rs:66-89 leaves freed bytes
+        // on the decode-thread brk arenas; tighter alloc-free
+        // distance lets glibc reuse arena slots instead of growing
+        // them. The 2026-04-28 e06c6ad attempt measured
+        // pipeline_reorder_high_water = 53 (resized past the default
+        // 32 cap) and per-batch RSS climb of ~200 MB, so the
+        // in-flight window itself is a meaningful contributor.
+        let reader = reader.decode_ahead(8);
         time_filter_snapshot(reader, &mut writer, cutoff_timestamp)?
     };
 
@@ -221,6 +231,20 @@ fn time_filter_snapshot(
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     cutoff_timestamp: i64,
 ) -> Result<TimeFilterStats> {
+    // Lower glibc's mmap threshold so cross-thread `PrimitiveBlock`
+    // allocations route through mmap and get released to the OS on
+    // free. The 2026-04-28 planet attempts at 4800c0a / e06c6ad
+    // showed mallinfo2 `arena` (brk-managed) climbing to 34 GB while
+    // `hblkhd` (mmap-managed) stayed flat at 534 KB - the documented
+    // cross-thread retention pattern (pipeline.rs:66-89) lives
+    // entirely in the brk arena because PrimitiveBlock's many
+    // small-but-numerous allocations all sit below the default
+    // 128 KB threshold. malloc_trim(0) at every batch boundary on
+    // the e06c6ad attempt couldn't reach buried freed pages and
+    // didn't bound RSS. 64 KB threshold pushes more allocs into
+    // the unmappable category at modest mmap-syscall cost.
+    let _ = crate::debug::set_mmap_threshold(64 * 1024);
+
     let mut stats = TimeFilterStats {
         versions_seen: 0,
         versions_before_cutoff: 0,

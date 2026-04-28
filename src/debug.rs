@@ -82,6 +82,32 @@ pub fn malloc_trim() -> i32 {
     0
 }
 
+/// Lower glibc's `M_MMAP_THRESHOLD` so allocations >= `bytes` route
+/// through `mmap`/`munmap` instead of brk. mmap-backed chunks are
+/// released back to the OS the moment they're freed, while brk-arena
+/// chunks accumulate as fragmentation when allocations interleave
+/// across threads.
+///
+/// Use to fight the cross-thread `PrimitiveBlock` retention pattern
+/// when mallinfo2 shows growth concentrated in `arena` (brk) with
+/// `hblkhd` (mmap) flat. Default glibc threshold is 128 KB and is
+/// also dynamic (climbs as the program runs, up to 32 MB). This
+/// pins it to a hard floor.
+///
+/// Call once early in the run; the setting is process-global. On
+/// non-glibc / non-Linux this is a no-op returning 0.
+#[cfg(target_os = "linux")]
+pub fn set_mmap_threshold(bytes: i32) -> i32 {
+    // SAFETY: mallopt is glibc and safe to call from any thread
+    // before allocations grow past the desired threshold.
+    unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, bytes) }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_mmap_threshold(_bytes: i32) -> i32 {
+    0
+}
+
 /// Read cumulative (minor, major) page faults from `/proc/self/stat`.
 /// Returns `(minflt, majflt)`. Returns `(0, 0)` on failure or non-Linux.
 #[cfg(target_os = "linux")]

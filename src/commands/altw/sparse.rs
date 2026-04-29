@@ -112,16 +112,104 @@ impl SparseArrayIndex {
     }
 }
 
+/// Per-blob worker output: a contiguous, ascending list of node tuples
+/// referenced by ways. Filtering against the `referenced` IdSet happens in
+/// the worker so the consumer only handles work that contributes to the
+/// index.
+type WorkerNodes = Vec<(i64, i32, i32)>;
+
+/// Sparse-index consumer state. The fields collectively express the
+/// chunk-streaming invariant (one chunk in flight, prior chunks closed
+/// via trailing-sentinel padding) plus the global byte cursor and
+/// monotonicity check.
+struct SparseConsumer<'a> {
+    offsets: &'a mut Vec<u64>,
+    start_pad: &'a mut Vec<u8>,
+    current_chunk: &'a mut usize,
+    last_offset_in_chunk: &'a mut u8,
+    byte_pos: &'a mut u64,
+    prev_id: &'a mut i64,
+}
+
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+fn append_node<W: std::io::Write>(
+    state: &mut SparseConsumer<'_>,
+    writer: &mut W,
+    sentinel: &[u8; ENTRY_SIZE],
+    id: i64,
+    lat: i32,
+    lon: i32,
+) -> Result<()> {
+    if id <= *state.prev_id {
+        return Err(format!(
+            "sparse index requires strictly increasing node IDs, \
+             but node {id} follows node {prev} (use --index-type dense \
+             for unsorted input)",
+            prev = *state.prev_id,
+        )
+        .into());
+    }
+    *state.prev_id = id;
+    let uid = id as u64;
+    let chunk_id = (uid >> CHUNK_SHIFT) as usize;
+    let offset_in_chunk = (uid & CHUNK_MASK) as u8;
+
+    if chunk_id != *state.current_chunk {
+        // Close previous chunk: pad trailing slots with sentinels.
+        if *state.current_chunk != usize::MAX {
+            let trailing = (CHUNK_MASK as u8).wrapping_sub(*state.last_offset_in_chunk);
+            for _ in 0..trailing {
+                writer.write_all(sentinel)?;
+                *state.byte_pos += ENTRY_SIZE as u64;
+            }
+        }
+        if chunk_id >= state.offsets.len() {
+            state.offsets.resize(chunk_id + 1, CHUNK_NOT_PRESENT);
+            state.start_pad.resize(chunk_id + 1, 0);
+        }
+        state.offsets[chunk_id] = *state.byte_pos;
+        state.start_pad[chunk_id] = offset_in_chunk;
+        *state.current_chunk = chunk_id;
+        *state.last_offset_in_chunk = offset_in_chunk;
+    } else {
+        let gap = offset_in_chunk
+            .wrapping_sub(*state.last_offset_in_chunk)
+            .wrapping_sub(1);
+        for _ in 0..gap {
+            writer.write_all(sentinel)?;
+            *state.byte_pos += ENTRY_SIZE as u64;
+        }
+        *state.last_offset_in_chunk = offset_in_chunk;
+    }
+
+    let mut buf = [0u8; ENTRY_SIZE];
+    buf[..4].copy_from_slice(&lat.to_le_bytes());
+    buf[4..].copy_from_slice(&lon.to_le_bytes());
+    writer.write_all(&buf)?;
+    *state.byte_pos += ENTRY_SIZE as u64;
+    Ok(())
+}
+
 /// Build a sparse array index from node blobs.
 ///
 /// Writes values sequentially to a temp file, tracking chunk boundaries.
 /// Nodes must arrive in ascending ID order (guaranteed by sorted PBFs).
 /// Only nodes present in `referenced` are stored.
+///
+/// Pipeline shape: parallel decode through `parallel_classify_phase`
+/// (one PrimitiveBlock per blob, decompressed off the consumer thread)
+/// fed into a `ReorderBuffer` so blob outputs drain in file order.
+/// Each worker emits a `Vec<(id, lat, lon)>` of referenced-and-positive
+/// tuples for its blob; the consumer runs the chunk-streaming state
+/// machine against the drained sequence. The `direct_io` flag is
+/// intentionally dropped on this path: blob bodies are pread'd from
+/// a shared file handle on worker threads, incompatible with
+/// `O_DIRECT` alignment.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-#[allow(clippy::cast_sign_loss, clippy::too_many_lines)]
+#[allow(clippy::cast_sign_loss)]
 pub(super) fn build_node_index_sparse(
     input: &Path,
-    direct_io: bool,
+    _direct_io: bool,
     scratch_dir: &Path,
     referenced: &IdSet,
 ) -> Result<SparseArrayIndex> {
@@ -142,97 +230,70 @@ pub(super) fn build_node_index_sparse(
 
     let sentinel = [0u8; ENTRY_SIZE];
     let mut writer = BufWriter::with_capacity(256 * 1024, &file);
-    let mut current_chunk: usize = usize::MAX; // no chunk yet
+    let mut current_chunk: usize = usize::MAX;
     let mut last_offset_in_chunk: u8 = 0;
     let mut byte_pos: u64 = 0;
     let mut prev_id: i64 = -1;
 
-    // Grow on demand - avoids 450 MB upfront allocation for small datasets.
+    let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
+        input,
+        Some(crate::blob_meta::ElemKind::Node),
+    )?;
 
-    // Node-only sequential scanner: bypasses PrimitiveBlock construction to avoid
-    // cross-thread alloc/free retention (25+ GB at Europe/planet scale).
-    // See notes/cross-pipeline-optimization-plan.md.
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    blob_reader.set_parse_indexdata(true);
-    blob_reader.next()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let mut reorder: crate::reorder_buffer::ReorderBuffer<WorkerNodes> =
+        crate::reorder_buffer::ReorderBuffer::with_capacity(64);
+    let mut consumer_error: Option<Box<dyn std::error::Error>> = None;
 
-    let mut decompress_buf: Vec<u8> = Vec::new();
-    let mut tuples: Vec<crate::scan::node::NodeTuple> = Vec::new();
-    let mut group_starts: Vec<(usize, usize)> = Vec::new();
-
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
-            continue;
-        }
-        if let Some(idx) = blob.index() {
-            if !matches!(idx.kind, crate::blob_meta::ElemKind::Node) {
-                continue;
+    crate::scan::classify::parallel_classify_phase(
+        &shared_file,
+        &schedule,
+        None,
+        || (),
+        |block, _state| -> WorkerNodes {
+            let mut tuples: WorkerNodes = Vec::new();
+            for element in block.elements_skip_metadata() {
+                let (id, lat, lon) = match element {
+                    crate::Element::DenseNode(dn) => {
+                        (dn.id(), dn.decimicro_lat(), dn.decimicro_lon())
+                    }
+                    crate::Element::Node(n) => {
+                        (n.id(), n.decimicro_lat(), n.decimicro_lon())
+                    }
+                    _ => continue,
+                };
+                if id < 0 || !referenced.get(id) {
+                    continue;
+                }
+                tuples.push((id, lat, lon));
             }
-        }
-
-        blob.decompress_into(&mut decompress_buf)?;
-        tuples.clear();
-        crate::scan::node::extract_node_tuples(&decompress_buf, &mut tuples, &mut group_starts)?;
-
-        for &crate::scan::node::NodeTuple { id, lat, lon } in &tuples {
-            if !referenced.get(id) {
-                continue;
-            }
-
-            if id < 0 {
-                continue;
-            }
-            if id <= prev_id {
-                return Err(format!(
-                    "sparse index requires strictly increasing node IDs, \
-                     but node {id} follows node {prev_id} (use --index-type dense \
-                     for unsorted input)"
-                )
-                .into());
-            }
-            prev_id = id;
-            let uid = id as u64;
-            let chunk_id = (uid >> CHUNK_SHIFT) as usize;
-            let offset_in_chunk = (uid & CHUNK_MASK) as u8;
-
-            if chunk_id != current_chunk {
-                // Close previous chunk: pad trailing slots with sentinels.
-                if current_chunk != usize::MAX {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let trailing = (CHUNK_MASK as u8).wrapping_sub(last_offset_in_chunk);
-                    for _ in 0..trailing {
-                        writer.write_all(&sentinel)?;
-                        byte_pos += ENTRY_SIZE as u64;
+            tuples
+        },
+        |seq, tuples| {
+            reorder.push(seq, tuples);
+            while let Some(blob_tuples) = reorder.pop_ready() {
+                if consumer_error.is_some() {
+                    continue;
+                }
+                let mut state = SparseConsumer {
+                    offsets: &mut offsets,
+                    start_pad: &mut start_pad,
+                    current_chunk: &mut current_chunk,
+                    last_offset_in_chunk: &mut last_offset_in_chunk,
+                    byte_pos: &mut byte_pos,
+                    prev_id: &mut prev_id,
+                };
+                for (id, lat, lon) in blob_tuples {
+                    if let Err(e) = append_node(&mut state, &mut writer, &sentinel, id, lat, lon) {
+                        consumer_error = Some(e);
+                        break;
                     }
                 }
-                // Ensure offsets/start_pad are large enough for this chunk.
-                if chunk_id >= offsets.len() {
-                    offsets.resize(chunk_id + 1, CHUNK_NOT_PRESENT);
-                    start_pad.resize(chunk_id + 1, 0);
-                }
-                offsets[chunk_id] = byte_pos;
-                start_pad[chunk_id] = offset_in_chunk;
-                current_chunk = chunk_id;
-                last_offset_in_chunk = offset_in_chunk;
-            } else {
-                // Fill gaps within the chunk with sentinels.
-                let gap = offset_in_chunk.wrapping_sub(last_offset_in_chunk).wrapping_sub(1);
-                for _ in 0..gap {
-                    writer.write_all(&sentinel)?;
-                    byte_pos += ENTRY_SIZE as u64;
-                }
-                last_offset_in_chunk = offset_in_chunk;
             }
+        },
+    )?;
 
-            // Write the actual entry.
-            let mut buf = [0u8; ENTRY_SIZE];
-            buf[..4].copy_from_slice(&lat.to_le_bytes());
-            buf[4..].copy_from_slice(&lon.to_le_bytes());
-            writer.write_all(&buf)?;
-            byte_pos += ENTRY_SIZE as u64;
-        }
+    if let Some(e) = consumer_error {
+        return Err(e);
     }
 
     // Close final chunk: pad trailing slots.
@@ -247,7 +308,6 @@ pub(super) fn build_node_index_sparse(
     writer.flush()?;
     drop(writer);
 
-    // Re-map as read-only for the lookup phase.
     let mmap = unsafe {
         memmap2::Mmap::map(&file)
             .map_err(|e| format!("failed to mmap sparse index values: {e}"))?

@@ -84,32 +84,6 @@ impl SparseArrayIndex {
         let (base, slot) = self.resolve(node_id)?;
         self.read_at(base, slot)
     }
-
-    /// Compute the byte offset into the values mmap for a node ID.
-    /// Used by batched sorted lookups to sort by file position.
-    #[allow(clippy::cast_sign_loss)]
-    pub(super) fn byte_offset(&self, node_id: i64) -> Option<u64> {
-        let (base, slot) = self.resolve(node_id)?;
-        Some(base + slot * ENTRY_SIZE as u64)
-    }
-
-    /// Read a `(lat, lon)` pair at a known valid byte offset.
-    /// The offset must have been produced by `byte_offset()`.
-    #[allow(clippy::cast_possible_truncation)]
-    pub(super) fn get_at_offset(&self, byte_offset: u64) -> Option<(i32, i32)> {
-        let start = byte_offset as usize;
-        let end = start + ENTRY_SIZE;
-        if end > self.mmap.len() {
-            return None;
-        }
-        let bytes = &self.mmap[start..end];
-        let lat = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let lon = i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-        if lat == 0 && lon == 0 {
-            return None;
-        }
-        Some((lat, lon))
-    }
 }
 
 /// Per-blob worker output: a contiguous, ascending list of node tuples

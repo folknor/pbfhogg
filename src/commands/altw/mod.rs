@@ -568,94 +568,24 @@ use super::flush_local;
 use crate::owned::{dense_node_metadata, element_metadata};
 
 
-// ---------------------------------------------------------------------------
-// Batched sorted lookups for sparse index
-// ---------------------------------------------------------------------------
-
-use rustc_hash::FxHashMap;
-
-/// How to resolve node coordinates during way processing.
-enum LocationLookup<'a> {
-    /// Direct random access (dense index or sparse with small dataset).
-    Index(&'a NodeIndex),
-    /// Pre-resolved map from batched sorted lookup (sparse, large dataset).
-    Resolved(&'a FxHashMap<i64, (i32, i32)>),
-}
-
-impl LocationLookup<'_> {
-    fn get(&self, node_id: i64) -> Option<(i32, i32)> {
-        match self {
-            Self::Index(idx) => idx.get(node_id),
-            Self::Resolved(map) => map.get(&node_id).copied(),
-        }
-    }
-}
-
-/// Entry for sorting lookups by file offset.
-struct LookupEntry {
-    /// Byte offset into the sparse index values mmap.
-    mmap_offset: u64,
-    /// The node ID (used as key in the result map).
-    node_id: i64,
-}
-
-/// Collect all unique way node refs from a batch of blocks, resolve their
-/// coordinates via sorted sequential access through the sparse index mmap,
-/// and return a map of node_id → (lat, lon).
-///
-/// This converts random I/O (one page fault per lookup) into sequential I/O
-/// (one pass through the mmap in file order). At planet scale, a batch of
-/// ~128 way blobs contains ~100K unique node refs. Sorting these by mmap
-/// offset and scanning sequentially touches each page at most once.
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn resolve_batch_locations(
-    blocks: &[PrimitiveBlock],
-    sparse: &SparseArrayIndex,
-) -> FxHashMap<i64, (i32, i32)> {
-    // Collect all unique node refs with their mmap offsets.
-    let mut entries: Vec<LookupEntry> = Vec::new();
-    let mut seen = FxHashMap::<i64, ()>::default();
-
-    for block in blocks {
-        for element in block.elements_skip_metadata() {
-            if let Element::Way(w) = element {
-                for node_id in w.refs() {
-                    if seen.contains_key(&node_id) {
-                        continue;
-                    }
-                    seen.insert(node_id, ());
-                    if let Some(offset) = sparse.byte_offset(node_id) {
-                        entries.push(LookupEntry { mmap_offset: offset, node_id });
-                    }
-                }
-            }
-        }
-    }
-
-    // Sort by mmap offset → sequential access pattern.
-    entries.sort_unstable_by_key(|e| e.mmap_offset);
-
-    // Resolve coordinates via sequential scan.
-    let mut result = FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
-    for entry in &entries {
-        if let Some(coords) = sparse.get_at_offset(entry.mmap_offset) {
-            result.insert(entry.node_id, coords);
-        }
-    }
-
-    result
-}
-
-
 /// Process a single `PrimitiveBlock`, writing elements into the thread-local
 /// `BlockBuilder` and flushing complete blocks into `output`.
+///
+/// Way refs resolve via inline `NodeIndex::get`. The earlier
+/// `resolve_batch_locations` pre-pass that converted random sparse mmap
+/// I/O to a sorted sequential scan was removed in favour of straight
+/// parallel inline lookups: the parallelism win (sparse pass 2 went from
+/// avg cores ~4 with the serial resolve to ~16 with inline lookups)
+/// dominates whatever cache-friendliness the sort provided. Pages get
+/// faulted in either way; only the order changes, and the amortised
+/// page-touch cost is the same once each page is hot.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
 fn process_block(
     block: &PrimitiveBlock,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-    lookup: &LocationLookup<'_>,
+    node_index: &NodeIndex,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,
     refs_buf: &mut Vec<i64>,
@@ -703,7 +633,7 @@ fn process_block(
                 refs_buf.extend(w.refs());
                 locations_buf.clear();
                 for node_id in refs_buf.iter() {
-                    match lookup.get(*node_id) {
+                    match node_index.get(*node_id) {
                         Some(loc) => locations_buf.push(loc),
                         None => {
                             stats.missing_locations += 1;
@@ -734,8 +664,11 @@ fn process_block(
 
 /// Process a batch of `PrimitiveBlock`s in parallel via rayon.
 ///
-/// For sparse indexes: pre-resolves all way node coordinates via sorted
-/// sequential scan before parallel processing (avoids random mmap I/O).
+/// Way coordinate lookups happen inline in the per-block worker via
+/// `NodeIndex::get`. Both dense (direct array) and sparse (chunk +
+/// slot indirection through a file-backed mmap) handle random access
+/// well at ~16+ cores; the prior sparse-only pre-resolve was a serial
+/// step that capped pass 2 at ~4 cores.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn process_batch(
     batch: &[PrimitiveBlock],
@@ -744,16 +677,6 @@ fn process_batch(
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,
 ) -> Result<Stats> {
-    // For sparse index: resolve all way node coordinates upfront.
-    let resolved_map;
-    let lookup = match index {
-        NodeIndex::Dense(_) => LocationLookup::Index(index),
-        NodeIndex::Sparse(sparse) => {
-            resolved_map = resolve_batch_locations(batch, sparse);
-            LocationLookup::Resolved(&resolved_map)
-        }
-    };
-
     type BatchResult = std::result::Result<(Vec<OwnedBlock>, Stats), String>;
     let results: Vec<BatchResult> = batch
         .par_iter()
@@ -765,7 +688,7 @@ fn process_batch(
                     block,
                     bb,
                     &mut output,
-                    &lookup,
+                    index,
                     keep_untagged_nodes,
                     relation_member_node_ids,
                     refs_buf, locations_buf,

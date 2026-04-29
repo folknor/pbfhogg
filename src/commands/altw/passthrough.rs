@@ -20,7 +20,6 @@ use crate::file_reader::FileReader;
 use crate::idset::IdSet;
 use crate::read::raw_frame::{read_raw_frame, RawBlobFrame};
 use crate::writer::{Compression, PbfWriter};
-use crate::PrimitiveBlock;
 
 use crate::commands::{
     build_output_header, drain_batch_results, flush_local, flush_passthrough_buf,
@@ -28,7 +27,7 @@ use crate::commands::{
     BATCH_MIN_BLOBS,
 };
 
-use super::{process_block, resolve_batch_locations, LocationLookup, NodeIndex, Stats};
+use super::{process_block, NodeIndex, Stats};
 use super::Result;
 
 // ---------------------------------------------------------------------------
@@ -410,32 +409,14 @@ pub(super) fn write_output_passthrough(
     Ok(stats)
 }
 
-/// Decompress and parse a batch of slots in parallel.
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn decompress_slot_batch(
-    batch: &[BatchSlot],
-) -> std::result::Result<Vec<PrimitiveBlock>, String> {
-    batch
-        .par_iter()
-        .map_init(
-            DecompressPool::new,
-            |pool, slot| {
-                let wire_blob = WireBlob::parse_slice(slot.frame().blob_bytes())
-                    .map_err(|e| e.to_string())?;
-                let bytes = decompress_blob(&wire_blob, Some(pool))
-                    .map_err(|e| e.to_string())?;
-                parse_primitive_block_from_bytes_owned(&bytes)
-                    .map_err(|e| e.to_string())
-            },
-        )
-        .collect()
-}
-
 /// Process a batch of slots in parallel: decompress, transform, write.
 ///
-/// For sparse indexes: decompresses all blobs first, pre-resolves way node
-/// coordinates via sorted sequential scan, then processes in parallel.
-/// For dense indexes: decompresses and processes in one parallel pass.
+/// One par_iter pass per slot: decompress + parse + process_block +
+/// flush_local. Way refs resolve via inline `NodeIndex::get` against
+/// either the dense or sparse index. The previous sparse-only
+/// pre-resolve (decompress all, then sort refs by mmap offset, then
+/// sequential scan) was a serial step that capped pass 2 at ~4 cores;
+/// inline lookups scale with the rayon worker count instead.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn process_slot_batch(
     batch: &[BatchSlot],
@@ -444,63 +425,7 @@ fn process_slot_batch(
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,
 ) -> Result<Stats> {
-    // For sparse: decompress first, resolve locations, then process.
-    // For dense: decompress + process in one pass (original path).
-    let resolved_map;
-    let decoded_blocks;
-    let (blocks_ref, lookup): (&[PrimitiveBlock], LocationLookup<'_>) = match node_index {
-        NodeIndex::Dense(_) => {
-            // Dense path: decompress + process in single parallel pass.
-            return process_slot_batch_dense(
-                batch, writer, node_index, keep_untagged_nodes, relation_member_node_ids,
-            );
-        }
-        NodeIndex::Sparse(sparse) => {
-            decoded_blocks = decompress_slot_batch(batch)
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-            resolved_map = resolve_batch_locations(&decoded_blocks, sparse);
-            (&decoded_blocks, LocationLookup::Resolved(&resolved_map))
-        }
-    };
-
     type SlotResult = std::result::Result<(Vec<OwnedBlock>, Stats), String>;
-    let results: Vec<SlotResult> = blocks_ref
-        .par_iter()
-        .map_init(
-            || (BlockBuilder::new(), Vec::<i64>::new(), Vec::<(i32, i32)>::new()),
-            |(bb, refs_buf, locations_buf), block| {
-                let mut output: Vec<OwnedBlock> = Vec::new();
-                let block_stats = process_block(
-                    block, bb, &mut output, &lookup,
-                    keep_untagged_nodes, relation_member_node_ids,
-                    refs_buf, locations_buf,
-                )?;
-                flush_local(bb, &mut output)?;
-                Ok((std::mem::take(&mut output), block_stats))
-            },
-        )
-        .collect();
-
-    let mut total = Stats {
-        nodes_read: 0, nodes_written: 0, nodes_dropped: 0,
-        ways_written: 0, relations_written: 0, missing_locations: 0,
-        blobs_passthrough: 0, blobs_decoded: 0,
-    };
-    drain_batch_results(results, writer, |s| total.merge(&s))?;
-    Ok(total)
-}
-
-/// Dense-index path for slot batch: decompress + process in one parallel pass.
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn process_slot_batch_dense(
-    batch: &[BatchSlot],
-    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
-    node_index: &NodeIndex,
-    keep_untagged_nodes: bool,
-    relation_member_node_ids: Option<&IdSet>,
-) -> Result<Stats> {
-    type SlotResult = std::result::Result<(Vec<OwnedBlock>, Stats), String>;
-    let lookup = LocationLookup::Index(node_index);
 
     let results: Vec<SlotResult> = batch
         .par_iter()
@@ -525,7 +450,7 @@ fn process_slot_batch_dense(
                     .map_err(|e| e.to_string())?;
 
                 let block_stats = process_block(
-                    &block, bb, output, &lookup,
+                    &block, bb, output, node_index,
                     keep_untagged_nodes, relation_member_node_ids,
                     refs_buf, locations_buf,
                 )?;

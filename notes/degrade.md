@@ -102,6 +102,48 @@ clears it. `LocationsOnWays` is dropped by `BlockBuilder` as on every
 other decode-path command in pbfhogg (`repack`, `sort`, `tags-filter`,
 etc.); `--strip-locations` makes the loss explicit.
 
+### Validated at scale (commit 48685ba, plantasjen, 2026-04-28)
+
+| Flag                | Mode    | Wall  | Peak RSS | UUID       |
+|---------------------|---------|-------|----------|------------|
+| `--strip-indexdata` | bench   | 79 s  | 15 MB    | `dc99fc70` |
+| `--strip-indexdata` | hotpath | 90 s  | -        | `a7fa3897` |
+| `--strip-indexdata` | alloc   | 92 s  | -        | `3470474f` |
+
+The `--strip-indexdata` passthrough path stays under 16 MB RSS on
+planet and is safe in every measurement mode; the blob bytes are
+not decompressed.
+
+### Known issue: decode-path planet OOM
+
+`degrade --strip-locations` and `degrade --unsort` were OOM-killed
+at planet scale on plantasjen (30 GB RAM, 8 GB swap) during the
+2026-04-28 overnight run. Both flags failed in every measurement
+mode, including plain `--bench 1` - this is not profiler overhead.
+Peak anon-rss at the kernel kill point was 28.9-29.3 GB across all
+six killed processes (plantasjen kernel log, 22:10-22:18).
+
+Both flags route through the decode + re-encode pipeline. Unlike
+`repack`, which uses a per-kind parallel-classify pipeline that
+bounds memory per worker (planet repack peaks at 1.36 GB), the v1
+`degrade` decode path streams `into_blocks_pipelined` straight into
+the writer with no comparable bound. At planet element densities
+the pipeline backlog evidently exceeds 30 GB.
+
+`degrade` should be planet-scale safe in every transformation; this
+is a memory-safety bug to fix, not a documented limit. The likely
+intervention is to mirror `repack`'s parallel-classify pipeline
+shape: per-worker bounded element batches with a single merge thread
+holding only the cross-blob residual (which for `--unsort` is one
+held element per kind, and for `--strip-locations` is zero).
+
+Workarounds until it lands:
+- `--strip-indexdata` alone is planet-safe (passthrough).
+- Europe-scale runs of `--strip-locations` / `--unsort` were not
+  measured in this overnight; predicted to fit but unverified.
+- Composite flag combinations involving `--unsort` or
+  `--strip-locations` are blocked at planet scale on this host.
+
 ### Tests
 
 [`tests/cli_degrade.rs`](../tests/cli_degrade.rs):

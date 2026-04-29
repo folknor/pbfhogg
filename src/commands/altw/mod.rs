@@ -258,6 +258,23 @@ pub fn add_locations_to_ways(
     crate::debug::emit_marker("ALTW_PASS0_START");
     let referenced = collect_way_referenced_node_ids(input, direct_io)?;
     crate::debug::emit_marker("ALTW_PASS0_END");
+    // Cheap one-shot iter().count(); surfaces the way-ref IdSet size before
+    // the index build so the counter survives SIGKILL during pass 1.
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter(
+            "altw_referenced_node_ids",
+            i64::try_from(referenced.iter().count()).unwrap_or(i64::MAX),
+        );
+        crate::debug::emit_counter(
+            "altw_index_kind",
+            match index_type {
+                IndexType::Dense => 0,
+                IndexType::Sparse => 1,
+                IndexType::External | IndexType::Auto => i64::MIN,
+            },
+        );
+    }
 
     crate::debug::emit_marker("ALTW_PASS1_START");
     let index = build_node_index(input, direct_io, scratch_dir, &referenced, index_type)?;
@@ -267,10 +284,20 @@ pub fn add_locations_to_ways(
     let relation_member_node_ids = if keep_untagged_nodes {
         None
     } else {
-        Some(collect_relation_member_node_ids(input, direct_io)?)
+        crate::debug::emit_marker("ALTW_REL_MEMBER_SCAN_START");
+        let ids = collect_relation_member_node_ids(input, direct_io)?;
+        crate::debug::emit_marker("ALTW_REL_MEMBER_SCAN_END");
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            crate::debug::emit_counter(
+                "altw_relation_member_node_ids",
+                i64::try_from(ids.iter().count()).unwrap_or(i64::MAX),
+            );
+        }
+        Some(ids)
     };
     crate::debug::emit_marker("ALTW_PASS2_START");
-    let result = write_output_checked(
+    let stats = write_output_checked(
         input,
         output,
         &index,
@@ -280,9 +307,22 @@ pub fn add_locations_to_ways(
         direct_io,
         indexdata_present,
         overrides,
-    );
+    )?;
     crate::debug::emit_marker("ALTW_PASS2_END");
-    result
+    emit_stats_counters(&stats);
+    Ok(stats)
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn emit_stats_counters(stats: &Stats) {
+    crate::debug::emit_counter("altw_nodes_read", stats.nodes_read as i64);
+    crate::debug::emit_counter("altw_nodes_written", stats.nodes_written as i64);
+    crate::debug::emit_counter("altw_nodes_dropped", stats.nodes_dropped as i64);
+    crate::debug::emit_counter("altw_ways_written", stats.ways_written as i64);
+    crate::debug::emit_counter("altw_relations_written", stats.relations_written as i64);
+    crate::debug::emit_counter("altw_missing_locations", stats.missing_locations as i64);
+    crate::debug::emit_counter("altw_blobs_passthrough", stats.blobs_passthrough as i64);
+    crate::debug::emit_counter("altw_blobs_decoded", stats.blobs_decoded as i64);
 }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +521,7 @@ fn write_output_decode_all(
     )?;
 
     let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
+    let mut batches_dispatched: i64 = 0;
 
     for block in reader.into_blocks_pipelined() {
         batch.push(block?);
@@ -495,6 +536,10 @@ fn write_output_decode_all(
             )?;
             stats.merge(&batch_stats);
             batch.clear();
+            batches_dispatched += 1;
+            // Per-batch counter survives SIGKILL inside pass 2; sidecar
+            // reads the latest value to know how far the loop got.
+            crate::debug::emit_counter("altw_pass2_batches_dispatched", batches_dispatched);
         }
     }
 
@@ -507,6 +552,8 @@ fn write_output_decode_all(
             relation_member_node_ids,
         )?;
         stats.merge(&batch_stats);
+        batches_dispatched += 1;
+        crate::debug::emit_counter("altw_pass2_batches_dispatched", batches_dispatched);
     }
 
     writer.flush()?;
@@ -560,6 +607,7 @@ struct LookupEntry {
 /// (one pass through the mmap in file order). At planet scale, a batch of
 /// ~128 way blobs contains ~100K unique node refs. Sorting these by mmap
 /// offset and scanning sequentially touches each page at most once.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn resolve_batch_locations(
     blocks: &[PrimitiveBlock],
     sparse: &SparseArrayIndex,

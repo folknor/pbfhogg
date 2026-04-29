@@ -63,6 +63,46 @@ be faster, the next intervention is element-offset-aware workers
 (shape (2) from the original design sketch), which would require
 extending the schedule with per-blob element counts.
 
+### Validated at scale (commit 48685ba, plantasjen, 2026-04-28)
+
+| Dataset | Cap   | Mode  | Wall   | Peak RSS | UUID       |
+|---------|-------|-------|--------|----------|------------|
+| denmark | 64000 | bench | 23 s   | 983 MB   | `a48e755f` |
+| denmark | 64000 | hot   | 18 s   | -        | `e5edccad` |
+| denmark | 64000 | alloc | 17 s   | -        | `ebd3083e` |
+| europe  | 8000  | bench | 195 s  | 428 MB   | `29d0216c` |
+| planet  | 8000  | bench | 380 s  | 1.36 GB  | `0ae01c09` |
+
+Bench-mode peak RSS stays under 1.5 GB even at planet scale - the
+per-kind parallel-classify pipeline is bounded per worker, so the
+working set does not grow with the input. The planet 8k artefact
+(`0ae01c09`) is the input that unblocks
+[`reference/blob-density.md`](../reference/blob-density.md) and the
+deferred `HeaderWalker` dispatch decision in
+[`notes/getparents.md`](getparents.md).
+
+### Known issue: `--hotpath` / `--alloc` OOM at europe and planet scale
+
+`brokkr repack --hotpath` and `brokkr repack --alloc` were OOM-killed
+at both europe and planet scale on plantasjen (30 GB RAM, 8 GB swap)
+during the 2026-04-28 overnight run. The kernel oom-killer logged
+peak anon-rss between 28.9 GB and 29.1 GB on all four killed
+processes (plantasjen kernel log, 21:53-22:04). Bench mode at the
+same dataset and cap landed at <1.5 GB peak, so the regression is
+from the brokkr profiler modes, not the repack pipeline itself.
+
+Denmark `--hotpath` / `--alloc` complete fine (`e5edccad`, `ebd3083e`),
+so the overhead scales with element throughput rather than being a
+fixed constant.
+
+`repack` should be planet-scale safe in every measurement mode; this
+is a memory-safety regression to fix, not a documented limit.
+
+Workarounds until it lands:
+- Bench mode is planet-safe at any cap.
+- Denmark / Norway / Switzerland still produce useful `--hotpath` and
+  `--alloc` profiles.
+
 ### Inputs and flags
 
 - `--elements-per-blob N` (default 8000). Zero is rejected up front.

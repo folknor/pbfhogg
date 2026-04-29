@@ -52,12 +52,47 @@
   at least one is required. `--strip-indexdata` alone runs as a
   blob-level passthrough (payload bit-identical); other combinations
   decode and re-encode through `BlockBuilder`.
+- **time-filter** (snapshot path): migrated to `parallel_classify_phase`
+  + `ReorderBuffer`, mirroring the architecture that unblocked
+  `cat --clean` and `check --ids` in 0.3.0. Planet was 5× SIGKILL at
+  ~94 s wall in 0.3.0; now planet-safe at 4m30s with 812 MB peak anon
+  (was ~28 GB at SIGKILL). Europe peak anon drops 16.9 GB → 324 MB
+  (-98 %); Europe wall regresses 1m32s → 2m27s (+59 %) - the cost of
+  giving up the iter-5 thread-local-BB capacity reuse to bound
+  cross-thread retention. Removed the now-unused pool plumbing
+  (`buf_pool` module, `BlockBuilder::take_owned_swap`,
+  `write_primitive_block_owned_pooled`).
+- **tags-filter** `--invert-match`: `collect_way_node_dependencies`
+  migrated to `parallel_classify_phase`. Planet `-i w/highway=primary`
+  peak anon 28.3 GB → 7.0 GB. Wall is within noise (8m08s → 7m57s);
+  the command moves off the "not yet planet-safe" list with comfortable
+  RAM headroom on a 30 GB host.
+- **getid** `--add-referenced`: new `getid_dep_node_ids` sidecar
+  counter emitted after `GETID_PASS1_END` so the dep-set size surfaces
+  before pass 2 starts. Bench-first measurement on planet (brokkr's
+  reference workload: 3 ways + 3 relations + ~76 dep nodes) recorded
+  96.3 s wall and 1.26 GB peak anon at `GETID_PASS2`, retiring the
+  par_iter+collect planet-OOM concern from TODO.md. The predicted
+  peak depended on a high-keep-rate workload that this ID set
+  doesn't produce; future risk path is unchanged for much wider
+  input distributions.
 
 ### Library API
 
 - `BlockBuilder::with_element_cap(n)` constructor for callers that need
   a non-default per-block element cap. `BlockBuilder::new()` keeps the
   8000 default.
+
+### Performance highlights
+
+| Operation | Dataset | Time | vs 0.3.0 |
+|-----------|---------|------|----------|
+| merge-changes (7-OSC range) | Planet 87 GB | 55s | -79% (5.0×) |
+| merge-changes `--simplify` (7-OSC range) | Planet 87 GB | 74s | -72% (3.6×) |
+| time-filter (snapshot) | Planet 87 GB | 4m30s | OOM → planet-safe |
+| tags-filter `-i` (way-deps phase) | Planet 87 GB | 7m57s | 28.3 GB → 7.0 GB peak anon |
+| repack `--elements-per-blob 8000` | Planet 87 GB | 6m20s | new |
+| degrade `--strip-indexdata` | Planet 87 GB | 79s | new |
 
 ## 0.3.0 - 2026-04-27
 

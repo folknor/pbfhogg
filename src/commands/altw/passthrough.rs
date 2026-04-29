@@ -274,6 +274,9 @@ pub(super) fn write_output_passthrough(
     // Coalescing buffer for non-copy-range passthrough (without linux-direct-io,
     // or when copy_file_range is incompatible with O_DIRECT output).
     let mut passthrough_chunks: Vec<Vec<u8>> = Vec::new();
+    // Per-batch counter survives SIGKILL inside pass 2; sidecar reads
+    // the latest value to know how far the loop got.
+    let mut batches_dispatched: i64 = 0;
 
     while let Some(header) = read_blob_header(&mut reader, &mut file_offset)? {
         if header.blob_type != BlobKind::OsmData {
@@ -310,6 +313,8 @@ pub(super) fn write_output_passthrough(
                 stats.merge(&batch_stats);
                 batch.clear();
                 batch_bytes = 0;
+                batches_dispatched += 1;
+                crate::debug::emit_counter("altw_pass2_batches_dispatched", batches_dispatched);
             }
 
             // Update stats from indexdata.
@@ -379,6 +384,8 @@ pub(super) fn write_output_passthrough(
             stats.merge(&batch_stats);
             batch.clear();
             batch_bytes = 0;
+            batches_dispatched += 1;
+            crate::debug::emit_counter("altw_pass2_batches_dispatched", batches_dispatched);
         }
     }
 
@@ -392,6 +399,8 @@ pub(super) fn write_output_passthrough(
             relation_member_node_ids,
         )?;
         stats.merge(&batch_stats);
+        batches_dispatched += 1;
+        crate::debug::emit_counter("altw_pass2_batches_dispatched", batches_dispatched);
     }
     #[cfg(feature = "linux-direct-io")]
     copy_range.flush(&mut writer)?;
@@ -402,6 +411,7 @@ pub(super) fn write_output_passthrough(
 }
 
 /// Decompress and parse a batch of slots in parallel.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn decompress_slot_batch(
     batch: &[BatchSlot],
 ) -> std::result::Result<Vec<PrimitiveBlock>, String> {
@@ -426,6 +436,7 @@ fn decompress_slot_batch(
 /// For sparse indexes: decompresses all blobs first, pre-resolves way node
 /// coordinates via sorted sequential scan, then processes in parallel.
 /// For dense indexes: decompresses and processes in one parallel pass.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn process_slot_batch(
     batch: &[BatchSlot],
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
@@ -480,6 +491,7 @@ fn process_slot_batch(
 }
 
 /// Dense-index path for slot batch: decompress + process in one parallel pass.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn process_slot_batch_dense(
     batch: &[BatchSlot],
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,

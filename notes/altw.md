@@ -26,53 +26,73 @@ Both dense and sparse share the surrounding pipeline:
      sequential blob walk on the main thread, then
      `tuples.par_iter().for_each` writes coords to mmap slots via
      `SharedDenseWriter`'s atomic stores.
-   - Sparse: single-threaded sequential write through a `BufWriter`
-     over a temp file. Chunk layout: 256 IDs per chunk with
-     `start_pad` to skip leading empty slots.
+   - Sparse: parallel-classify-phase + reorder-buffer build over a
+     `BufWriter` to a temp file. Chunk layout: 256 IDs per chunk
+     with `start_pad` to skip leading empty slots. Workers emit
+     filtered (id, lat, lon) tuples per blob; consumer drains in
+     seq order through the reorder buffer and runs a single
+     chunk-streaming state machine over the merged stream.
 3. **Optional rel-member scan**
    (`collect_relation_member_node_ids`, fires when
-   `keep_untagged_nodes=false`) - `parallel_classify_accumulate` with
-   per-worker `IdSet`, merged at the end.
+   `keep_untagged_nodes=false`) - `parallel_classify_accumulate`
+   with per-worker `IdSet`, merged at the end.
 4. **Pass 2** - dispatches on `indexdata_present`:
    - `write_output_passthrough` (indexed input): two-phase header /
-     data read, batches `BatchSlot`s, dispatches to
-     `process_slot_batch_dense` or `process_slot_batch` (sparse).
+     data read, batches `BatchSlot`s, parallel decompress + parse +
+     `process_block` per slot via `process_slot_batch`. Way refs
+     resolve via inline `NodeIndex::get` in the per-block worker.
    - `write_output_decode_all` (`--force` on non-indexed input):
      `into_blocks_pipelined` + batch + `par_iter().map_init(
-     BlockBuilder).collect()` + drain via `process_batch`.
+     BlockBuilder).collect()` + drain via `process_batch`. Same
+     inline `NodeIndex::get` resolution.
 
-## Measured baselines (commit 68806b0, plantasjen 2026-04-29)
+## Status
 
-Wall:
+| Path | Denmark | Japan | Europe | Planet |
+|------|---------|-------|--------|--------|
+| Dense | safe | safe | thrash, OOM | thrash, OOM |
+| Sparse | safe | safe | I/O bound (52 GB mmap > cache) | n/a |
+| External | safe | safe | safe | safe |
 
-| Dataset | dense | sparse | sparse / dense |
-|---|---|---|---|
-| Denmark 700 MB | 11.9 s | 17.3 s | 1.45x |
-| Japan 2.4 GB | 51.6 s | 1m18s | 1.52x |
-| Europe 35 GB | thrashed, killed at 19 min | not run | n/a |
+Dense / sparse are both fast at sizes where the index fits in RAM;
+above that, neither is viable. External (separate document) is the
+only path that survives at europe+ scale. The dense / sparse
+optimizations below have made them competitive at small / medium
+scale, but the structural ceiling above ~25 GB working set is
+unchanged.
 
-Per-phase wall and peak RSS:
+## Measured walls (commit 9c1c83e or later, plantasjen 2026-04-29)
 
-| Phase | DK dense | DK sparse | JP dense | JP sparse |
-|---|---|---|---|---|
-| Pass 1 wall | 4.4 s | 2.2 s | 23.2 s | 10.7 s |
-| Pass 1 peak RSS | 4.1 GB | 1.4 GB | 13.4 GB | 1.9 GB |
-| Pass 1 majflt | 826 K | 0 | 3.1 M | 0 |
-| Pass 1 avg cores | 9.6 | 1.0 | 8.3 | 1.0 |
-| Pass 2 wall | 2.4 s | 11.2 s | 12.0 s | 56.7 s |
-| Pass 2 peak RSS | 5.2 GB | 4.4 GB | 14.3 GB | 9.5 GB |
-| Pass 2 avg cores | 16.5 | 4.2 | 18.1 | 4.1 |
+Three baseline points across the optimization arc, denmark + japan:
 
-UUIDs: `c5611d55` (DK dense), `262af1a0` (DK sparse), `a40c5ff7`
-(JP dense), `8d035980` (JP sparse).
+| Dataset | Mode | `68806b0` (pre) | `29683ee` (parallel pass 1) | `8e0cef9` (inline pass 2) |
+|---------|------|-----------------|------------------------------|----------------------------|
+| Denmark | dense | 11.9 s | - | - |
+| Denmark | sparse | 17.3 s | 15.6 s | **5.8 s** |
+| Japan | dense | 51.6 s | - | - |
+| Japan | sparse | 78.4 s | 71.7 s | **20.9 s** |
 
-Counters:
+Sparse went from 1.5x slower than dense at japan to **2.5x faster**
+than dense at japan (20.9 s vs 51.3 s). Dense has not been touched.
 
-| Counter | Denmark | Japan | Europe (partial) |
-|---|---|---|---|
+Per-phase profile at the final state (commit `8e0cef9`, japan
+sparse, UUID `fa7e61ed`):
+
+| Phase | Wall | Peak RSS | Avg cores |
+|-------|------|----------|-----------|
+| Pass 0 | 4.9 s | 1.5 GB | 5.4 |
+| Pass 1 | 3.5 s | 1.9 GB | 6.3 |
+| Rel-member scan | 4.2 s | 4.3 GB | 1.5 |
+| Pass 2 | 8.3 s | 8.6 GB | 19.9 |
+
+Counters at scale (`altw_referenced_node_ids` x 8 bytes is a good
+proxy for the dense working set or sparse mmap touched-page set):
+
+| Counter | Denmark | Japan | Europe |
+|---------|---------|-------|--------|
 | `altw_referenced_node_ids` | 49 M | 299 M | 3,617 M |
 | `altw_relation_member_node_ids` | 25 K | 193 K | 10.6 M |
-| `altw_ways_written` | 6.6 M | 42.9 M | (killed) |
+| Sparse temp file | 1.0 GB | 5.7 GB | ~52 GB |
 
 ## Findings
 
@@ -82,37 +102,56 @@ Touched mmap pages scale linearly with `altw_referenced_node_ids` x
 8 bytes:
 
 - Denmark: 49 M x 8 = 393 MB. Fits trivially.
-- Japan: 299 M x 8 = 2.4 GB. Fits, but 3.1 M pass-1 majflt
-  show the page cache is already churning.
+- Japan: 299 M x 8 = 2.4 GB. Fits, 3.1 M pass-1 majflt indicates
+  the page cache is already churning a bit.
 - Europe: 3,617 M x 8 = 29 GB. Exceeds the 27 GB-free host.
   Catastrophic page-thrash: 12 M majflt in pass 1 (4m18s), 23 M
   majflt in 13 minutes of pass 2 before SIGKILL. 2.1 TB read off
-  disk.
+  disk for 35 GB of input.
 
-This is architectural, not a tuning gap. Pre-pass-0 filtering already
+Architectural, not a tuning gap. Pre-pass-0 filtering already
 restricts to way-referenced nodes; the working set IS those nodes
 times 8 bytes. Above host free RAM, dense cannot work.
 
-### Sparse pass 1 is single-threaded but already faster than dense
+### Sparse pass 2 is global-locality-bound at scale
 
-`build_node_index_sparse` runs on one thread (avg cores 1.0) writing
-through a `BufWriter`. Despite that, it beats parallel dense pass 1
-at every measured scale:
+Sparse pass 2 is fast at small / medium scale (japan: 8.3 s wall,
+avg cores 19.9, peak RSS 8.6 GB) and fails at europe scale (killed
+at 11 min, 14.9 M majflt, 1.38 TB disk read for 35 GB input). The
+failure is a working-set overflow, not a parallelism or instruction-
+mix problem.
 
-- Denmark: 2.2 s vs 4.4 s (sparse 2.0x faster).
-- Japan: 10.7 s vs 23.2 s (sparse 2.2x faster).
+The sparse temp file is ~52 GB at europe (linear from japan's 5.7 GB
+at 1/12 the data). The host has ~25 GB available page cache after
+the application's RSS settles. Each way's nodes scatter across the
+ID space, so each block's lookups land on pages spread across the
+whole 52 GB index. With 25 GB cache and 52 GB total, ~50 % of
+accesses fault to disk regardless of order.
 
-Dense's parallel write is no faster because mmap page-fault
-throughput is the bottleneck, not CPU. Sparse skips the mmap, writes
-contiguous bytes to disk, and even single-threaded outpaces it.
+The sort-by-id-or-offset trick converts random access into sorted
+access **within a sort run**. At small scale (whole index in cache)
+the sort is wasted overhead - inline lookup wins because the cache
+absorbs everything. At europe scale, sorting per-block produces
+short sorted runs whose pages are then evicted before the next
+block's run can use them; the cross-block global access pattern
+remains random. This was measured directly (see "Don't re-attempt"
+below): per-block sorted resolve produced no measurable improvement
+over inline at europe (both killed at the same wall, same disk read,
+same majflt).
 
-### Sparse pass 2 is bottlenecked at ~4 cores
+The serial pre-batch resolve (the v1 design) sorts globally across
+the batch which gives the prefetcher a longer run, but capped pass 2
+parallelism at avg cores ~4 - which alone slowed pass 2 ~5x at small
+scale. Either way, total page faults at europe-scale are bounded by
+"cache size vs working set", and sorting only changes the order in
+which the faults happen.
 
-Avg cores 4.2 (DK) / 4.1 (JP) vs dense's 16-18. The bottleneck is
-`resolve_batch_locations` running serially before the per-blob
-`par_iter` dispatch: one thread dedups + sorts by mmap offset +
-sequentially scans the entire batch's unique node refs through the
-mmap before workers get to start.
+The structural fix, if sparse should work at europe scale, is a
+**smaller encoding** that fits the index in cache. Today's chunk
+format wastes ~57 % at japan density (5.7 GB temp / 299 M nodes =
+19 bytes/node, vs 8 byte minimum). A bitmap+packed encoding could
+plausibly halve this, putting europe sparse close to or under
+cache.
 
 ### Rel-member scan IdSet bloat scales hard
 
@@ -125,32 +164,74 @@ with one IdSet per worker. Per-phase anon delta during the scan:
 
 24 workers x ~400 MB per IdSet at europe. The mod.rs doc comment
 claimed ~68 MB / worker; measurement disagrees by 6x. Linear
-extrapolation: planet ~24 x ~3 GB = **~72 GB**. Same shape that bit
+extrapolation: planet ~24 x ~3 GB = ~72 GB. Same shape that bit
 tags-filter `--invert-match` (28.3 GB peak anon -> 7.0 GB after the
 2026-04-28 migration); same fix template available.
 
+This is independent of dense vs sparse choice and would be a planet
+blocker on its own.
+
 ### What is NOT the bottleneck
 
-The `par_iter().map_init(BlockBuilder).collect()` shape in pass 2
-(mod.rs `process_batch`, passthrough.rs `process_slot_batch_dense`
-and `process_slot_batch`). Peak anon stays under 4 GB at every
-measured scale, including europe before the dense mmap thrash
-dominated the sidecar profile.
+The `par_iter().map_init(BlockBuilder).collect()` shape in pass 2.
+Peak anon stays under 4 GB at every measured scale, including
+europe before the dense mmap thrash dominated the sidecar profile.
 
 The shape != root cause lesson holds; see commit `48685ba` (getid
 add-referenced) and the tags-filter `9d41465` doc landing for two
-prior incidents where the same shape was suspected and measurement
-ruled it out.
+prior incidents where this shape was suspected and measurement
+ruled it out. The pass-2 ceilings come from index access patterns
+(dense: anon working set, sparse: file-backed working set), not from
+the rayon-collect pattern.
 
-## Ranked work
+## Landed work
 
-Targets in priority order. None landed.
+### Parallelize sparse `build_node_index_sparse` - landed `29683ee`
+
+`parallel_classify_phase` + `ReorderBuffer` shape, mirroring the
+time-filter snapshot migration (`83183fb`). Workers receive one
+PrimitiveBlock each, filter by referenced node IDs, emit
+`Vec<(id, lat, lon)>` in blob-internal ID order. Consumer drains in
+seq order through a 64-slot reorder buffer and runs the existing
+chunk-streaming state machine.
+
+Result:
+
+| Dataset | Pass 1 wall | Pass 1 cores |
+|---------|-------------|--------------|
+| Denmark | 2.2 s -> 1.16 s (1.9x) | 1.0 -> 5.8 |
+| Japan | 10.7 s -> 3.47 s (3.1x) | 1.0 -> 6.3 |
+
+Peak RSS unchanged. The "strictly increasing node IDs" precondition
+is preserved by the ReorderBuffer drain order.
+
+### Inline `NodeIndex::get` in pass 2 - landed `8e0cef9`
+
+Removed the serial `resolve_batch_locations` pre-pass that capped
+sparse pass 2 at avg cores ~4. process_block now takes &NodeIndex
+directly; both dense and sparse use inline lookup. Reverted the
+`process_slot_batch` / `process_slot_batch_dense` split into one
+function. Removed `LocationLookup` enum, `LookupEntry` struct,
+`decompress_slot_batch`, `SparseArrayIndex::byte_offset` and
+`SparseArrayIndex::get_at_offset` (all dead with the resolve gone).
+
+Result:
+
+| Dataset | Pass 2 wall | Pass 2 cores | Total wall |
+|---------|-------------|--------------|------------|
+| Denmark | 11.2 s -> ~3 s | 4.2 -> 16+ | 17.3 s -> 5.8 s (2.98x) |
+| Japan | 56.7 s -> 8.3 s | 4.1 -> 19.9 | 78.4 s -> 20.9 s (3.75x) |
+
+Japan sparse went from 1.5x slower than japan dense to 2.5x faster.
+
+## Remaining work
 
 ### 1. Migrate rel-member scan off `parallel_classify_accumulate`
 
 **Why first:** real planet-scale blocker independent of index-type
 choice. Affects every `keep_untagged_nodes=false` run, which is the
-default.
+default. Whether or not we ever fix sparse at europe, this fires for
+dense and sparse runs alike.
 
 **Shape:** mirror the tags-filter way-deps migration (commit
 `17b116c`). Replace `parallel_classify_accumulate` with
@@ -163,54 +244,73 @@ not N-workers x per-worker IdSet.
 keep / drop semantics; set-union is commutative so the migration
 preserves correctness by definition.
 
-### 2. Parallelize sparse `build_node_index_sparse`
+### 2. Sparse encoding redesign (optional, large investment)
 
-**Why:** sparse is structurally needed at scale (dense fails) and is
-single-threaded today. Compounds the win sparse already shows over
-dense.
+**Status:** speculative. Land only if there is a real workload need
+for sparse at europe-or-larger scale that isn't served by external.
 
-**Constraint:** "strictly increasing node IDs" comes from the chunk
-layout (each chunk is a contiguous run with `start_pad`). Inter-blob
-ordering is satisfied by the input PBF's sort; parallel workers can
-violate that if they emit out of seq order.
+**Goal:** shrink the sparse temp file below available page cache so
+random pass-2 access stops thrashing. Today: ~19 bytes/node at japan,
+extrapolating to ~50 GB at europe (cache is ~25 GB).
 
-**Shape sketch A:** `parallel_classify_phase` with workers emitting
-`(seq, chunk_run)` outputs; main thread drains in seq order through a
-`ReorderBuffer` and writes the chunk runs to the `BufWriter`. Each
-chunk run is the same internal layout as today (sentinel-padded run
-of (lat, lon) pairs plus chunk-index updates).
+**Candidates:**
 
-**Shape sketch B:** workers write per-blob temp files; main thread
-concatenates in seq order. Simpler than streaming through the shared
-writer but adds N file handles and a final concatenation pass.
+- 64-slot chunks instead of 256, smaller per-chunk overhead per node
+  but more chunks. Net effect data-dependent; a quick prototype
+  would say if this halves the file or just shifts bytes.
+- Bitmap-per-chunk plus packed-entries layout. Each chunk stores a
+  256-bit presence map (32 bytes) plus only the present (lat, lon)
+  pairs, no sentinels. At japan's chunk density (~30 entries / 256
+  slots) this would land near 8 bytes / node, ~2.4x shrink.
+- Two-level chunk layout (super-chunk -> chunk -> slot) so very
+  sparse super-chunks get 0 storage instead of N empty chunks.
 
-### 3. Parallelize sparse pass 2 `resolve_batch_locations`
+**Constraint:** any redesign must keep Pass 1 parallelisable and
+keep Pass 2's `NodeIndex::get` reasonably fast. A bitmap-and-pack
+chunk requires `popcount(bitmap[..slot]) << 3` to find the byte
+offset, vs today's `start_pad + slot << 3`. Cheap on modern CPUs
+but per-call overhead matters at billions of lookups.
 
-**Why:** sparse pass 2 avg cores 4.2 vs dense's 16-18. The serial
-resolve step is leaving 75% of CPU idle.
+**Or:** just document that sparse is small / medium scale and keep
+external as the planet-recommended path. (Current state.)
 
-**Constraint:** the batched sorted lookup is sequential-mmap-friendly
-precisely because the sort + scan happens once over the whole batch.
-Splitting across workers loses some of that locality.
+### 3. Per-batch parallel resolve (optional, lower priority)
 
-**Shape:** measure-first. Two candidates:
+**Status:** ranked low. Inline lookup at small / medium scale wins
+on its own merits; the regime where global-locality sort would help
+(europe sparse) is also the regime where sparse fundamentally
+doesn't fit, and global sort can't change that.
 
-- Per-worker resolve over a slice of the batch's blocks. Each
-  worker dedups + sorts + scans its own slice. Loses cross-block
-  dedup, but at typical batch sizes the cross-block overlap is
-  small.
-- Fold the resolve into the per-worker process loop: each worker
-  random-reads its block's refs against the sparse mmap as it
-  processes. Loses the sequential-scan advantage; at small batches
-  the random reads might still hit page cache.
+**Shape:** the v1 `resolve_batch_locations` did global-batch sort
+on a single thread; what was missing was parallelism. A version
+that splits the sorted ref list into N chunks across rayon workers
+would parallelise the scan while preserving global-locality. But
+it only pays off at scales where the index doesn't fit cache - at
+which point sparse is already failing for the working-set reason,
+not the access-order reason. Leaving this here as a record; not
+worth pursuing without the encoding fix above.
 
 ## Don't re-attempt
 
 - **`parallel_classify_accumulate` with per-worker IdSet at scale.**
-  The doc caution at `src/scan/classify.rs:300-317` lists the
-  criteria. The rel-member scan above is an open example.
+  See doc caution at `src/scan/classify.rs:300-317`. The rel-member
+  scan above is an open example.
 - **Dense at planet without 30+ GB free RAM.** Page-thrashing is
   architectural, not a tuning gap. External or sparse, not dense.
+- **Per-block sorted resolve as a sparse-pass-2 fix at europe scale**
+  (commit `d9edb5f`, reverted). Each block's refs scatter across the
+  whole ID space, so per-block sort gives the prefetcher only short
+  runs that are evicted before the next block needs them. Measured:
+  identical kill point as inline (1.38 TB read, 14.9 M vs 15.3 M
+  majflt), and adds ~20 % overhead on japan pass 2 from HashMap
+  construction. Different `process_block` lookup mechanism, same
+  cache-miss-bound fate.
+- **Treating shape as the diagnosis.** The
+  `par_iter+collect+drain` pattern was the suspect for sparse
+  pass 2 thrashing - measurement instead pointed at single-thread
+  resolve (the `8e0cef9` win) and at index-vs-cache size (the
+  europe failure). Bench first, find the actual peak phase, only
+  then rewrite.
 
 ## Cross-references
 

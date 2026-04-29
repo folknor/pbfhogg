@@ -566,26 +566,79 @@ fn write_output_decode_all(
 
 use super::flush_local;
 use crate::owned::{dense_node_metadata, element_metadata};
+use rustc_hash::FxHashMap;
 
+/// How a process_block worker resolves a way ref to coordinates.
+///
+/// `Direct` calls `NodeIndex::get` per ref. Used for dense indexes,
+/// where direct array indexing is already cache-line-friendly, and
+/// for sparse at small scale where the whole index fits in page
+/// cache.
+///
+/// `Resolved` carries a per-block pre-resolved map produced by sorting
+/// the block's way refs by ID and walking them through the index in
+/// sorted order before processing. This is the path used for sparse
+/// at scales where the values mmap exceeds page cache - sorted
+/// access lets the kernel prefetcher win where random inline lookups
+/// thrash. The previous implementation made this resolve serial
+/// over the whole batch (cap at avg cores 4); this lifts it into
+/// the per-block parallel worker so N workers each do their own
+/// sorted scan in parallel.
+enum NodeCoords<'a> {
+    Direct(&'a NodeIndex),
+    Resolved(&'a FxHashMap<i64, (i32, i32)>),
+}
+
+impl NodeCoords<'_> {
+    fn get(&self, node_id: i64) -> Option<(i32, i32)> {
+        match self {
+            Self::Direct(idx) => idx.get(node_id),
+            Self::Resolved(map) => map.get(&node_id).copied(),
+        }
+    }
+}
+
+/// Build a per-block resolved map by sorting the block's way refs and
+/// looking them up in sorted order. Reuses caller-owned scratch buffers
+/// across blocks to avoid per-block allocator churn.
+fn resolve_block_refs(
+    block: &PrimitiveBlock,
+    node_index: &NodeIndex,
+    sort_buf: &mut Vec<i64>,
+    resolved: &mut FxHashMap<i64, (i32, i32)>,
+) {
+    sort_buf.clear();
+    for element in block.elements_skip_metadata() {
+        if let Element::Way(w) = element {
+            sort_buf.extend(w.refs());
+        }
+    }
+    sort_buf.sort_unstable();
+
+    resolved.clear();
+    let mut prev = i64::MIN;
+    for &id in sort_buf.iter() {
+        if id == prev {
+            continue;
+        }
+        prev = id;
+        if let Some(coords) = node_index.get(id) {
+            resolved.insert(id, coords);
+        }
+    }
+}
 
 /// Process a single `PrimitiveBlock`, writing elements into the thread-local
-/// `BlockBuilder` and flushing complete blocks into `output`.
-///
-/// Way refs resolve via inline `NodeIndex::get`. The earlier
-/// `resolve_batch_locations` pre-pass that converted random sparse mmap
-/// I/O to a sorted sequential scan was removed in favour of straight
-/// parallel inline lookups: the parallelism win (sparse pass 2 went from
-/// avg cores ~4 with the serial resolve to ~16 with inline lookups)
-/// dominates whatever cache-friendliness the sort provided. Pages get
-/// faulted in either way; only the order changes, and the amortised
-/// page-touch cost is the same once each page is hot.
+/// `BlockBuilder` and flushing complete blocks into `output`. Way coordinate
+/// lookups go through the supplied `NodeCoords` (direct index or per-block
+/// pre-resolved map).
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
 fn process_block(
     block: &PrimitiveBlock,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-    node_index: &NodeIndex,
+    coords: &NodeCoords<'_>,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,
     refs_buf: &mut Vec<i64>,
@@ -633,7 +686,7 @@ fn process_block(
                 refs_buf.extend(w.refs());
                 locations_buf.clear();
                 for node_id in refs_buf.iter() {
-                    match node_index.get(*node_id) {
+                    match coords.get(*node_id) {
                         Some(loc) => locations_buf.push(loc),
                         None => {
                             stats.missing_locations += 1;
@@ -664,11 +717,13 @@ fn process_block(
 
 /// Process a batch of `PrimitiveBlock`s in parallel via rayon.
 ///
-/// Way coordinate lookups happen inline in the per-block worker via
-/// `NodeIndex::get`. Both dense (direct array) and sparse (chunk +
-/// slot indirection through a file-backed mmap) handle random access
-/// well at ~16+ cores; the prior sparse-only pre-resolve was a serial
-/// step that capped pass 2 at ~4 cores.
+/// Dense uses direct `NodeIndex::get` lookups (cache-friendly, no
+/// pre-resolve needed). Sparse does a per-block sorted resolve before
+/// processing so the mmap touches happen in ascending byte order,
+/// trading random page faults for prefetch-friendly streaming. The
+/// resolve runs inside the rayon worker so N blocks resolve in
+/// parallel; cf. the predecessor `resolve_batch_locations` which ran
+/// serial over the whole batch.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn process_batch(
     batch: &[PrimitiveBlock],
@@ -678,17 +733,32 @@ fn process_batch(
     relation_member_node_ids: Option<&IdSet>,
 ) -> Result<Stats> {
     type BatchResult = std::result::Result<(Vec<OwnedBlock>, Stats), String>;
+    let use_resolve = matches!(index, NodeIndex::Sparse(_));
     let results: Vec<BatchResult> = batch
         .par_iter()
         .map_init(
-            || (BlockBuilder::new(), Vec::<i64>::new(), Vec::<(i32, i32)>::new()),
-            |(bb, refs_buf, locations_buf), block| {
+            || {
+                (
+                    BlockBuilder::new(),
+                    Vec::<i64>::new(),
+                    Vec::<(i32, i32)>::new(),
+                    Vec::<i64>::new(),
+                    FxHashMap::<i64, (i32, i32)>::default(),
+                )
+            },
+            |(bb, refs_buf, locations_buf, sort_buf, resolved), block| {
                 let mut output: Vec<OwnedBlock> = Vec::new();
+                let coords = if use_resolve {
+                    resolve_block_refs(block, index, sort_buf, resolved);
+                    NodeCoords::Resolved(resolved)
+                } else {
+                    NodeCoords::Direct(index)
+                };
                 let block_stats = process_block(
                     block,
                     bb,
                     &mut output,
-                    index,
+                    &coords,
                     keep_untagged_nodes,
                     relation_member_node_ids,
                     refs_buf, locations_buf,

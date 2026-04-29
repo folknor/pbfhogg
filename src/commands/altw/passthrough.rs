@@ -27,7 +27,7 @@ use crate::commands::{
     BATCH_MIN_BLOBS,
 };
 
-use super::{process_block, resolve_block_refs, NodeCoords, NodeIndex, Stats};
+use super::{process_block, NodeIndex, Stats};
 use super::Result;
 
 // ---------------------------------------------------------------------------
@@ -411,13 +411,12 @@ pub(super) fn write_output_passthrough(
 
 /// Process a batch of slots in parallel: decompress, transform, write.
 ///
-/// One par_iter pass per slot: decompress + parse + (per-block resolve
-/// for sparse) + process_block + flush_local. The per-block sorted
-/// resolve runs inside each rayon worker, so N workers each do their
-/// own prefetch-friendly mmap scan in parallel - the predecessor
-/// implementation made this serial across the whole batch and capped
-/// pass 2 at avg cores ~4. Dense skips the resolve and goes through
-/// inline `NodeIndex::get`.
+/// One par_iter pass per slot: decompress + parse + process_block +
+/// flush_local. Way refs resolve via inline `NodeIndex::get` against
+/// either the dense or sparse index. The previous sparse-only
+/// pre-resolve (decompress all, then sort refs by mmap offset, then
+/// sequential scan) was a serial step that capped pass 2 at ~4 cores;
+/// inline lookups scale with the rayon worker count instead.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn process_slot_batch(
     batch: &[BatchSlot],
@@ -427,7 +426,6 @@ fn process_slot_batch(
     relation_member_node_ids: Option<&IdSet>,
 ) -> Result<Stats> {
     type SlotResult = std::result::Result<(Vec<OwnedBlock>, Stats), String>;
-    let use_resolve = matches!(node_index, NodeIndex::Sparse(_));
 
     let results: Vec<SlotResult> = batch
         .par_iter()
@@ -438,12 +436,10 @@ fn process_slot_batch(
                     Vec::<OwnedBlock>::new(),
                     Vec::<i64>::new(),
                     Vec::<(i32, i32)>::new(),
-                    Vec::<i64>::new(),
-                    rustc_hash::FxHashMap::<i64, (i32, i32)>::default(),
                     DecompressPool::new(),
                 )
             },
-            |(bb, output, refs_buf, locations_buf, sort_buf, resolved, pool), slot| {
+            |(bb, output, refs_buf, locations_buf, pool), slot| {
                 output.clear();
 
                 let wire_blob = WireBlob::parse_slice(slot.frame().blob_bytes())
@@ -453,15 +449,8 @@ fn process_slot_batch(
                 let block = parse_primitive_block_from_bytes_owned(&bytes)
                     .map_err(|e| e.to_string())?;
 
-                let coords = if use_resolve {
-                    resolve_block_refs(&block, node_index, sort_buf, resolved);
-                    NodeCoords::Resolved(resolved)
-                } else {
-                    NodeCoords::Direct(node_index)
-                };
-
                 let block_stats = process_block(
-                    &block, bb, output, &coords,
+                    &block, bb, output, node_index,
                     keep_untagged_nodes, relation_member_node_ids,
                     refs_buf, locations_buf,
                 )?;

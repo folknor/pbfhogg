@@ -279,9 +279,8 @@ pub fn add_locations_to_ways(
     }
 
     crate::debug::emit_marker("ALTW_PASS1_START");
-    let index = build_node_index(input, direct_io, scratch_dir, &referenced, index_type)?;
+    let index = build_node_index(input, direct_io, scratch_dir, referenced, index_type)?;
     crate::debug::emit_marker("ALTW_PASS1_END");
-    drop(referenced);
 
     let relation_member_node_ids = if keep_untagged_nodes {
         None
@@ -337,15 +336,22 @@ fn build_node_index(
     input: &Path,
     direct_io: bool,
     scratch_dir: &Path,
-    referenced: &IdSet,
+    referenced: IdSet,
     index_type: IndexType,
 ) -> Result<NodeIndex> {
     match index_type {
         IndexType::Dense => {
-            build_node_index_dense(input, direct_io, scratch_dir, referenced)
+            // Dense indexes by node id directly via mmap[node_id*8]; the
+            // referenced IdSet was only used for pass-0 filtering and is
+            // no longer needed beyond this point.
+            build_node_index_dense(input, direct_io, scratch_dir, &referenced)
                 .map(NodeIndex::Dense)
         }
         IndexType::Sparse => {
+            // Sparse takes ownership: the rank-indexed flat layout
+            // builds rank index on the IdSet and carries it through to
+            // SparseArrayIndex so pass 2 lookups can do
+            // rank_if_set(node_id) -> mmap read at rank * 8.
             build_node_index_sparse(input, direct_io, scratch_dir, referenced)
                 .map(NodeIndex::Sparse)
         }

@@ -121,6 +121,32 @@ at 11 min, 14.9 M majflt, 1.38 TB disk read for 35 GB input). The
 failure is a working-set overflow, not a parallelism or instruction-
 mix problem.
 
+**Re-verified after the 5-item optimization arc (commit `e63d0b6`):
+europe sparse still OOMs at pass 2.** UUID was a `--bench --force`
+dirty run, but the per-phase profile is conclusive:
+
+  Pass 0:        65 s (wire-only scan working).
+  Pass 1:        76 s (52.8 GB sparse temp file written).
+  Rel-member:    0.7 s (planet blocker fixed by the new shape).
+  Pass 2:    9 m 56 s -> SIGKILL (OOM).
+  Pass 2 majflt:        19.7 M.
+  Pass 2 disk read:     1.73 TB for 35 GB input.
+  Pass 2 avg cores:     2.9 (vs ~21 expected; bound by page faults).
+
+Today's run actually had MORE majflt than yesterday's pre-arc
+baseline (19.7 M vs 14.9 M). The descriptor-first pipeline +
+parallel writer add concurrent workers (peak threads 65 vs 26
+before), all of them page-faulting on disjoint regions of the
+52 GB mmap. More parallelism IS NOT a fix for working-set
+overflow - it makes the thrash *more* parallel.
+
+The five-item optimization arc therefore landed exactly the wins
+the doc predicted in advance: small / medium 31% faster, the
+rel-member planet blocker bounded - and made no progress on the
+sparse pass-2 europe ceiling, which is structural and only
+addressable by **shrinking the encoding** or **changing the
+access pattern** (see "Remaining work" below).
+
 The sparse temp file is ~52 GB at europe (linear from japan's 5.7 GB
 at 1/12 the data). The host has ~25 GB available page cache after
 the application's RSS settles. Each way's nodes scatter across the
@@ -226,7 +252,62 @@ Result:
 
 Japan sparse went from 1.5x slower than japan dense to 2.5x faster.
 
-### Descriptor-first pass 2 pipeline - landed (this commit)
+### Sparse rank-indexed flat layout - landed (this commit)
+
+`build_node_index_sparse` rewritten to use a rank-indexed flat
+encoding instead of the chunk + start_pad scheme:
+
+  IdSet::build_rank_index() (one-time, ~100 MB at planet) ->
+  set_len(referenced.total_count() * 8) on a temp file ->
+  MmapMut + raw `*mut u8` shared with workers -> workers extract
+  (id, lat, lon) tuples via scan::node::extract_node_tuples
+  (wire-only, no PrimitiveBlock) -> for each referenced id,
+  AtomicU64::store(Relaxed) at byte offset rank_if_set(id) << 3.
+
+`SparseArrayIndex::get(id)` becomes `rank_if_set(id)` plus an
+`AtomicU64::load(Relaxed)` at the same offset. Same shape as
+`DenseMmapIndex`, just with the rank step in front.
+
+What this changes:
+  - Disk shrinks 2.4-2.8x (chunk + sentinel padding overhead is
+    gone). Japan: 5.6 GB -> 2.0 GB. Europe extrapolation:
+    52 GB -> ~29 GB (referenced_count * 8 = 3.6 G * 8).
+  - Pass 1 becomes parallel: 21.1 avg cores vs 6.5 (4.2x). The
+    serial chunk-streaming consumer is gone; workers `pwrite`
+    via the mmap with no merge step. Reorder buffer no longer
+    needed.
+  - Strictly-increasing-id precondition is gone. Random arrival
+    order works because each rank slot is unique and atomic.
+    The CLI help text ("works on any PBF") now matches the
+    implementation behavior - reviewer doc-bug catch resolved.
+
+What this costs:
+  - SparseArrayIndex carries the IdSet (with rank index) into
+    pass 2. ~440 MB + ~100 MB at planet, vs the chunk format's
+    ~440 MB `offsets`+`start_pad`. Net RAM is roughly flat.
+
+First attempt used `pwrite` per tuple (299 M syscalls at japan)
+and ran 10x slower (143 s pass 1). Switching to mmap + AtomicU64
+matches dense's pattern and recovers the parallel win.
+
+Result (japan sparse, plantasjen 2026-04-30, dirty bench):
+
+| Metric | post descriptor-first | post rank-indexed flat |
+|--------|-----------------------|------------------------|
+| Pass 1 wall | 3.45 s | 0.82 s |
+| Pass 1 avg cores | 6.5 | 21.1 |
+| Pass 1 disk write | 5.59 GB | 2.01 GB |
+| Total japan sparse wall | 14.3 s | 11.9 s |
+
+Cross-validation passed (`brokkr verify
+add-locations-to-ways --dataset denmark`): dense / sparse /
+external all produce byte-identical output.
+
+Europe survival measurement is the actual reason this work
+exists (sparse pass-2 OOMed at europe with 1.73 TB read against
+the 52 GB chunk format). See europe results below.
+
+### Descriptor-first pass 2 pipeline - landed `e63d0b6`
 
 `passthrough.rs::write_output_passthrough` rewritten end-to-end as a
 descriptor-first parallel pipeline mirroring `external/stage4.rs`:

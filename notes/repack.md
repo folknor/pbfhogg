@@ -81,27 +81,31 @@ working set does not grow with the input. The planet 8k artefact
 deferred `HeaderWalker` dispatch decision in
 [`notes/getparents.md`](getparents.md).
 
-### Known issue: `--hotpath` / `--alloc` OOM at europe and planet scale
+### Profiler-mode OOM (fixed at commit `195b7ff`)
 
-`brokkr repack --hotpath` and `brokkr repack --alloc` were OOM-killed
-at both europe and planet scale on plantasjen (30 GB RAM, 8 GB swap)
-during the 2026-04-28 overnight run. The kernel oom-killer logged
-peak anon-rss between 28.9 GB and 29.1 GB on all four killed
-processes (plantasjen kernel log, 21:53-22:04). Bench mode at the
-same dataset and cap landed at <1.5 GB peak, so the regression is
-from the brokkr profiler modes, not the repack pipeline itself.
+Historical: `brokkr repack --hotpath` / `--alloc` were OOM-killed at
+europe and planet scale during the 2026-04-28 overnight run, with
+peak anon-rss 28.9-29.1 GB on a 30 GB host. Bench mode at the same
+dataset and cap landed at <1.5 GB, so the OOM scaled with profiler
+overhead, not the repack pipeline itself.
 
-Denmark `--hotpath` / `--alloc` complete fine (`e5edccad`, `ebd3083e`),
-so the overhead scales with element throughput rather than being a
-fixed constant.
+Root cause: `BlockBuilder::add_node` / `add_way` /
+`add_way_with_locations` / `add_relation` carried unconditional
+`#[hotpath::measure]` annotations. At europe (700M elements) /
+planet (9B+ elements) the per-element span recording exhausted the
+hotpath span buffer. Phase boundaries (`take`, `take_owned`, the
+encode helpers) keep their annotations - they fire per-block, not
+per-element, so they don't scale with input size.
 
-`repack` should be planet-scale safe in every measurement mode; this
-is a memory-safety regression to fix, not a documented limit.
+Verified at europe (commit `195b7ff`, plantasjen):
 
-Workarounds until it lands:
-- Bench mode is planet-safe at any cap.
-- Denmark / Norway / Switzerland still produce useful `--hotpath` and
-  `--alloc` profiles.
+| Mode      | Wall   | UUID       |
+|-----------|--------|------------|
+| `--hotpath` | 156 s | `eff071a3` |
+| `--alloc`   | 157 s | `81fb1aaf` |
+
+Both complete with informative function tables. Planet re-measure
+deferred but no longer expected to OOM.
 
 ### Inputs and flags
 

@@ -50,20 +50,31 @@ Both dense and sparse share the surrounding pipeline:
 
 | Path | Denmark | Japan | Europe | Planet |
 |------|---------|-------|--------|--------|
-| Dense | safe | safe | thrash, OOM | thrash, OOM |
-| Sparse | safe | safe | I/O bound (52 GB mmap > cache) | n/a |
+| Sparse | safe | safe | safe (5:59, ~25-30% slower than external) | thrash (29-bytes-per-node × ~2 G referenced > cache) |
 | External | safe | safe | safe | safe |
 
-Dense / sparse are both fast at sizes where the index fits in RAM;
-above that, neither is viable. External (separate document) is the
-only path that survives at europe+ scale. The dense / sparse
-optimizations below have made them competitive at small / medium
-scale, but the structural ceiling above ~25 GB working set is
-unchanged.
+`dense` was removed: sparse rank-indexed flat is faster than the
+prior dense path at every measured scale (japan dense 51.6 s vs
+sparse 11.9 s, 4.3x), and works in regimes dense did not (europe
+survives at ~6 minutes on a 27 GB-RAM host). See "Don't re-attempt"
+below for the reasoning, and the dense-removal commit for the
+breaking-change notes.
 
-## Measured walls (commit 9c1c83e or later, plantasjen 2026-04-29)
+After the `c6f08ff` rank-indexed flat layout, sparse europe goes
+from "OOM at 9:56" to "completes in 5:59" - the chunk format's
+~52 GB working set became ~29 GB, fitting close enough to the
+host's ~25 GB free cache margin to bound (not eliminate) the
+fault rate. Sparse is now competitive with external at europe.
+Sparse planet has not been tried (likely thrashes at ~60 GB
+working set); external remains the planet-recommended path.
 
-Three baseline points across the optimization arc, denmark + japan:
+## Measured walls (plantasjen)
+
+Two distinct optimization arcs landed against this code:
+
+**Arc 1 (2026-04-29, commits `68806b0` -> `8e0cef9`):** parallelize
+pass 1, inline NodeIndex::get in pass 2. Sparse went from "1.5x
+slower than dense at japan" to "2.5x faster than dense at japan."
 
 | Dataset | Mode | `68806b0` (pre) | `29683ee` (parallel pass 1) | `8e0cef9` (inline pass 2) |
 |---------|------|-----------------|------------------------------|----------------------------|
@@ -72,46 +83,74 @@ Three baseline points across the optimization arc, denmark + japan:
 | Japan | dense | 51.6 s | - | - |
 | Japan | sparse | 78.4 s | 71.7 s | **20.9 s** |
 
-Sparse went from 1.5x slower than dense at japan to **2.5x faster**
-than dense at japan (20.9 s vs 51.3 s). Dense has not been touched.
+**Arc 2 (2026-04-30, commits `66cfa4a` -> `c6f08ff`):** five-item
+reviewer plan + sparse rank-indexed flat layout. The reviewer plan
+freed CPU; the rank-indexed flat layout shrunk the sparse working
+set 2.4-2.8x and made europe sparse survive.
 
-Per-phase profile at the final state (commit `8e0cef9`, japan
-sparse, UUID `fa7e61ed`):
+| Dataset | Mode | `8e0cef9` baseline | `e63d0b6` (5-item) | `c6f08ff` (rank flat) |
+|---------|------|-------------------|---------------------|------------------------|
+| Japan | sparse | 20.9 s | 14.3 s | 11.9 s |
+| Europe | sparse | OOM at 9:56 | not measured (still chunk format) | **5:59** |
 
-| Phase | Wall | Peak RSS | Avg cores |
-|-------|------|----------|-----------|
-| Pass 0 | 4.9 s | 1.5 GB | 5.4 |
-| Pass 1 | 3.5 s | 1.9 GB | 6.3 |
-| Rel-member scan | 4.2 s | 4.3 GB | 1.5 |
-| Pass 2 | 8.3 s | 8.6 GB | 19.9 |
+Per-phase profile at the final state (japan sparse, commit
+`c6f08ff`, UUID `aa4fe496` hotpath / `158a86d7` bench):
 
-Counters at scale (`altw_referenced_node_ids` x 8 bytes is a good
-proxy for the dense working set or sparse mmap touched-page set):
+| Phase | Wall | Avg cores | Note |
+|-------|------|-----------|------|
+| Pass 0 | 2.5 s | ~5 | wire-only scan |
+| Pass 1 | 0.8 s | 21.1 | rank-indexed parallel mmap-write |
+| Rel-member scan | 0.8 s | 1.0 | shared IdSet via parallel_classify_phase |
+| Pass 2 | 7.3 s | 20.5 | compression-bound at zlib:6 |
+
+Pass 2 is now the headline floor at ~7.3 s on japan. Hotpath shows
+`frame_blob_into` (compress + frame) is 1027% of wall (~10 cores
+worth) - see Findings below.
+
+Counters at scale (`altw_referenced_node_ids` x 8 bytes is the
+sparse working set after `c6f08ff`):
 
 | Counter | Denmark | Japan | Europe |
 |---------|---------|-------|--------|
 | `altw_referenced_node_ids` | 49 M | 299 M | 3,617 M |
 | `altw_relation_member_node_ids` | 25 K | 193 K | 10.6 M |
-| Sparse temp file | 1.0 GB | 5.7 GB | ~52 GB |
+| Sparse temp file (chunk format, pre `c6f08ff`) | 1.0 GB | 5.7 GB | ~52 GB |
+| Sparse temp file (rank-indexed flat) | 0.4 GB | 2.0 GB | ~29 GB |
 
 ## Findings
 
-### Dense fails above ~25 GB working set
+### Dense fails above ~25 GB working set (historical; dense removed)
 
-Touched mmap pages scale linearly with `altw_referenced_node_ids` x
-8 bytes:
+Recorded for context - dense (`--index-type dense`) was removed
+after the rank-indexed flat sparse layout dominated it at every
+measured scale. The original failure-mode characterization that
+motivated the removal:
+
+Touched mmap pages scale linearly with `altw_referenced_node_ids`
+x 8 bytes:
 
 - Denmark: 49 M x 8 = 393 MB. Fits trivially.
 - Japan: 299 M x 8 = 2.4 GB. Fits, 3.1 M pass-1 majflt indicates
-  the page cache is already churning a bit.
+  the page cache was already churning a bit.
 - Europe: 3,617 M x 8 = 29 GB. Exceeds the 27 GB-free host.
   Catastrophic page-thrash: 12 M majflt in pass 1 (4m18s), 23 M
   majflt in 13 minutes of pass 2 before SIGKILL. 2.1 TB read off
   disk for 35 GB of input.
 
 Architectural, not a tuning gap. Pre-pass-0 filtering already
-restricts to way-referenced nodes; the working set IS those nodes
-times 8 bytes. Above host free RAM, dense cannot work.
+restricts to way-referenced nodes; the working set was those nodes
+times 8 bytes. Above host free RAM, dense could not work.
+
+Sparse rank-indexed flat has the same 8-bytes-per-node working set
+as dense, so it has the same upper limit at planet (~60 GB) - the
+encoding doesn't shrink the working set, it shrinks the chunk
+format's overhead. The reason sparse rank-flat *survives* europe
+where dense did not is that pass 1 is parallel mmap-write (no
+serial consumer) and pass 2 reads via `rank_if_set + mmap` (no
+chunk indirection): the access pattern is cleaner, fault behavior
+is more predictable, and the working set fits the host's free
+cache margin closely enough to bound the fault rate. At planet
+scale neither encoding will fit; external remains the planet path.
 
 ### Sparse pass 2 is global-locality-bound at scale
 
@@ -196,7 +235,7 @@ tags-filter `--invert-match` (28.3 GB peak anon -> 7.0 GB after the
 2026-04-28 migration). Independent of dense vs sparse choice; would
 have been a planet blocker on its own.
 
-Migrated to `parallel_classify_phase` in commit (this commit);
+Migrated to `parallel_classify_phase` in commit `66cfa4a`;
 see "Landed work" below.
 
 ### What is NOT the bottleneck
@@ -211,6 +250,40 @@ prior incidents where this shape was suspected and measurement
 ruled it out. The pass-2 ceilings come from index access patterns
 (dense: anon working set, sparse: file-backed working set), not from
 the rayon-collect pattern.
+
+### Pass 2 floor at zlib:6 is compression CPU (hotpath UUID `aa4fe496`)
+
+Hotpath profile of japan sparse at commit `c6f08ff` (post 5-item
+arc + rank-indexed flat). Pass 2 wall 7.45 s; total CPU split:
+
+| Function | Total CPU across threads | % of wall |
+|----------|--------------------------|-----------|
+| `write::framing::frame_blob_into` (compress + frame) | 123.1 s | 1027% (~10 cores) |
+| `process_block` (Node decode + BlockBuilder) | 21.1 s | 176% |
+| `decompress_blob_raw` | 18.2 s | 152% |
+| `write_primitive_block_owned` (dispatch) | 5.3 s | 44% |
+| `add_node` | 1.7 s | 14% |
+
+Compression is ~75% of pass-2 CPU; pass 2 is fully core-saturated
+(avg cores ~21 of 22). Decode work (process_block + decompress
++ add_node = ~41 s = ~3.4 cores) is genuinely a small fraction.
+
+Compression sweep at japan sparse (single bench each):
+
+| Compression | Wall | Δ vs zlib:6 |
+|-------------|------|-------------|
+| zlib:6 (default) | 11.9 s | - |
+| none | 9.7 s | -18% |
+| zstd:1 | 8.9 s | -25% |
+
+Implication: pass-2 CPU optimizations (untagged-node skip, partial
+wire-format edits, etc.) cannot move wall under default zlib:6
+because freed decoder CPU just refills the writer queue. Same
+diagnostic that closed the stage-4 wire-format DenseNodes filter
+in `notes/altw-optimization-history.md` (the "writer ceiling
+diagnostic" lesson). Any future pass-2 item must measure under
+both `zlib:6` and `zstd:1` (or `compression:none`) to confirm the
+win is real.
 
 ## Landed work
 
@@ -252,7 +325,7 @@ Result:
 
 Japan sparse went from 1.5x slower than japan dense to 2.5x faster.
 
-### Sparse rank-indexed flat layout - landed (this commit)
+### Sparse rank-indexed flat layout - landed `c6f08ff`
 
 `build_node_index_sparse` rewritten to use a rank-indexed flat
 encoding instead of the chunk + start_pad scheme:
@@ -303,9 +376,42 @@ Cross-validation passed (`brokkr verify
 add-locations-to-ways --dataset denmark`): dense / sparse /
 external all produce byte-identical output.
 
-Europe survival measurement is the actual reason this work
-exists (sparse pass-2 OOMed at europe with 1.73 TB read against
-the 52 GB chunk format). See europe results below.
+**Europe sparse survives** (UUID `f9a61784`, plantasjen
+2026-04-30, 35.3 GB input, 28 GB host RAM, ~25 GB free cache):
+
+| Phase | Wall | Notes |
+|-------|------|-------|
+| Pass 0 | 63.2 s | wire-only scan, 22.5 GB header + body reads |
+| Pass 1 | 57.7 s | 28 GB sparse temp file written, avg cores 11.6 |
+| Rel-member scan | 1.24 s | bounded as before |
+| Pass 2 | 197.0 s | 6.8 M majflt, 251 GB read, avg cores 13.9 |
+| Total | **5 min 59 s** | exit 0, output validated |
+
+Compared to yesterday (chunk-format europe sparse OOM'd at 9 min
+56 s, 19.7 M majflt, 1.73 TB read) the rank-indexed flat layout:
+  - Survives (33 GB working set fits within margin of 25 GB
+    cache; we still page-fault but bounded).
+  - 65% fewer pass-2 majflts (6.8 M vs 19.7 M).
+  - 7x less pass-2 disk read (251 GB vs 1.73 TB).
+
+Compared to external at europe (which is the planet-recommended
+path):
+  - External default zlib:6: 4 min 31 s - 5 min 22 s.
+  - External zstd:3: 3 min 53 s.
+  - Sparse rank-indexed flat: 5 min 59 s (~25-30% slower).
+
+Sparse at europe is now within striking distance of external.
+The 29 GB working set is still slightly cache-oversubscribed; if
+we reduce the encoding further (delta-encoded packed lat/lon, or
+i64 -> i32 quantization beyond decimicrodegrees) sparse could
+close the gap or even win. As is, sparse is a viable alternative
+at europe scale rather than a non-starter.
+
+Planet sparse hasn't been tried yet. The working set scales with
+referenced_node_ids; at planet that is roughly 2x europe (or
+more), so ~60-70 GB - well above the host's free cache. Without
+a smaller encoding sparse will likely thrash again at planet.
+External remains the planet-recommended path for now.
 
 ### Descriptor-first pass 2 pipeline - landed `e63d0b6`
 
@@ -400,8 +506,9 @@ no ref redelta, no tag re-intern. Reviewer 3's split shape:
 
 Node and Unknown slots stay on the existing
 PrimitiveBlock + `BlockBuilder` path; the wire-format equivalent
-for nodes (untagged-node skip + partial wire edit) is a separate
-follow-up item from the reviewers, not in this commit.
+for nodes (untagged-node skip + partial wire edit) was tried as
+a follow-up in the same session and reverted - see "Don't
+re-attempt" for why.
 
 Result (japan sparse, plantasjen 2026-04-30, dirty bench best of 3):
 
@@ -478,51 +585,43 @@ bounded ~20 MB total).
 
 ## Remaining work
 
-### 1. Sparse encoding redesign (optional, large investment)
+### 1. Further sparse encoding shrink (planet-only, speculative)
 
 **Status:** speculative. Land only if there is a real workload need
-for sparse at europe-or-larger scale that isn't served by external.
+for sparse at planet scale that external doesn't already serve.
 
-**Goal:** shrink the sparse temp file below available page cache so
-random pass-2 access stops thrashing. Today: ~19 bytes/node at japan,
-extrapolating to ~50 GB at europe (cache is ~25 GB).
+**Where we are after `c6f08ff`:** rank-indexed flat layout shrunk
+the sparse temp file 2.4-2.8x. Japan 5.7 GB -> 2.0 GB; europe
+~52 GB -> ~29 GB; planet projection ~60 GB (still above the
+~25 GB cache budget on plantasjen-class hardware). Europe sparse
+now survives at 5:59; planet sparse not yet measured but expected
+to thrash at ~60 GB working set.
 
-**Candidates:**
+**Path forward (unmeasured, optimistic estimates):**
 
-- 64-slot chunks instead of 256, smaller per-chunk overhead per node
-  but more chunks. Net effect data-dependent; a quick prototype
-  would say if this halves the file or just shifts bytes.
-- Bitmap-per-chunk plus packed-entries layout. Each chunk stores a
-  256-bit presence map (32 bytes) plus only the present (lat, lon)
-  pairs, no sentinels. At japan's chunk density (~30 entries / 256
-  slots) this would land near 8 bytes / node, ~2.4x shrink.
-- Two-level chunk layout (super-chunk -> chunk -> slot) so very
-  sparse super-chunks get 0 storage instead of N empty chunks.
+- Drop precision: i16 lat/lon would halve the encoding to 4
+  bytes/node. Loses sub-microdegree precision (~1 cm at equator).
+  Lossy - probably not viable without explicit project sign-off.
+- Per-blob origin/granularity reuse: store i32 deltas relative to
+  a per-blob origin (already in PBF wire format). Requires per-
+  ref blob lookup, costing CPU. Complexity vs benefit unclear.
+- Use existing PBF `granularity` (default 100 nanodegrees) more
+  aggressively - i16 + per-blob lat/lon offset would be ~4
+  bytes/node lossless if every node fits within a per-blob
+  bounding box. PBF blob bboxes vary; not always tight enough.
 
-**Constraint:** any redesign must keep Pass 1 parallelisable and
-keep Pass 2's `NodeIndex::get` reasonably fast. A bitmap-and-pack
-chunk requires `popcount(bitmap[..slot]) << 3` to find the byte
-offset, vs today's `start_pad + slot << 3`. Cheap on modern CPUs
-but per-call overhead matters at billions of lookups.
-
-**Or:** just document that sparse is small / medium scale and keep
-external as the planet-recommended path. (Current state.)
+**Alternative:** keep external as the planet-recommended path,
+document sparse as medium-scale-or-smaller. (Current state.)
 
 ### 2. Per-batch parallel resolve (optional, lower priority)
 
 **Status:** ranked low. Inline lookup at small / medium scale wins
 on its own merits; the regime where global-locality sort would help
-(europe sparse) is also the regime where sparse fundamentally
-doesn't fit, and global sort can't change that.
-
-**Shape:** the v1 `resolve_batch_locations` did global-batch sort
-on a single thread; what was missing was parallelism. A version
-that splits the sorted ref list into N chunks across rayon workers
-would parallelise the scan while preserving global-locality. But
-it only pays off at scales where the index doesn't fit cache - at
-which point sparse is already failing for the working-set reason,
-not the access-order reason. Leaving this here as a record; not
-worth pursuing without the encoding fix above.
+(europe sparse) is also the regime where the rank-indexed flat
+layout already paid for itself by shrinking the working set.
+Global sort doesn't help further at europe and sparse planet still
+fails for the working-set reason regardless. Not worth pursuing
+without an encoding fix that gets sparse planet inside cache.
 
 ## Don't re-attempt
 
@@ -545,6 +644,50 @@ worth pursuing without the encoding fix above.
   resolve (the `8e0cef9` win) and at index-vs-cache size (the
   europe failure). Bench first, find the actual peak phase, only
   then rewrite.
+- **Re-introducing `--index-type dense`.** Dense was removed
+  after rank-indexed flat sparse dominated it at every measured
+  scale: japan dense 51.6 s vs sparse 11.9 s (4.3x), europe dense
+  OOM vs sparse 5:59. The remaining reviewer items for dense
+  (parallel pass 1, retire 128 GB virtual mmap in favor of
+  rank-compacted index) would have *converged* dense to sparse
+  rank-flat anyway - same encoding, same access pattern, same
+  wall. Re-adding dense as a "simpler-to-reason-about fallback"
+  is a cosmetic bet against a measurement-anchored consolidation;
+  don't.
+- **Untagged-node skip-entirely as a wall-time optimization at
+  small/medium.** Phase 1 of the reviewer item (skip an output
+  node blob if `!has_tags && !relation_member_node_ids.any_in_range`)
+  was implemented and reverted in this same session: at japan,
+  zero blobs qualified for skip-entirely (every node blob has at
+  least one tagged node OR overlaps a relation member). Wall flat,
+  no measurement signal. The reviewer's "common case" framing
+  refers to the *partial wire-format edit* path (drop 95-99% of
+  untagged nodes per blob, keep StringTable). The skip-entirely
+  alone is a planet-scale-only win at best, and now also blocked
+  by the compression-CPU floor finding (Pass 2 wall is bounded by
+  `frame_blob_into` at zlib:6 - freed decoder CPU just refills the
+  writer queue). Re-attempt only if measurement at planet scale
+  shows a non-trivial fraction of node blobs hit the skip path,
+  AND the run is under zstd:1 / `compression:none`.
+- **Standalone "streaming batch resolve" / "slot+join" as a fourth
+  `--index-type`.** Reviewer 2's pitch in the "External review"
+  block below: replace dense + sparse + (optionally) external with
+  a single streaming external join. Evaluated at session end and
+  declined: the design is not categorically different from the
+  existing `external` mode (also a streaming external join with
+  bucketed shards). External has had 12+ months of incremental
+  optimization (1462 s -> 661 s on planet, see
+  `altw-optimization-history.md`); a Reviewer-2-shape rebuild starts
+  many wins behind from day 1. The closest precedent
+  (`altw_v2`, 2026-04-16) failed at europe specifically because it
+  was in-RAM (Reviewer 2's design avoids that), so the past failure
+  doesn't disqualify the design - but the burden of "must beat
+  heavily-optimized external" is steep. Live opportunity work for
+  external lives in `altw-external.md`. Reviewer 2's design stays
+  recorded below as a "record of the option," not the recommended
+  direction. Re-attempt only if a measurement-anchored thesis
+  identifies a specific weakness in existing external that
+  Reviewer 2's structure addresses.
 
 ## External review (2026-04-29)
 
@@ -570,7 +713,7 @@ pass 2 structural items) are independent of the framing question.
   `block.elements_skip_metadata()` at `mod.rs:383`, with a wire-only
   scan via `scan_way_refs` (`src/scan/way.rs:78`). Drops per-blob
   StringTable parse and `(u32, u32)` scratch allocations entirely.
-  (Reviewers 1, 3, 4.)~~ **Landed (this commit) - see "Landed work"
+  (Reviewers 1, 3, 4.)~~ **Landed `87f53eb` - see "Landed work"
   above. Japan: cores 5.3 -> 4.5, wall unchanged within variance.
   Wins should compound at planet scale.**
 - Run pass 0 and the relation-member scan concurrently under
@@ -580,51 +723,37 @@ pass 2 structural items) are independent of the framing question.
 
 ### Pass 1, dense
 
-- The outer loop in `build_node_index_dense`
-  (`src/commands/altw/dense.rs:191`) is single-threaded for
-  decompress and `extract_node_tuples`; only the trivial mmap-store
-  inner loop is parallelized. Replace with parallel
-  pread+decompress+`extract_node_tuples` workers writing directly to
-  `SharedDenseWriter` (atomic stores already make N-thread writes
-  safe). The historical reason for the serial loop was 25 GB of
-  cross-thread `PrimitiveBlock` heap retention; using
-  `extract_node_tuples` on raw decompressed bytes inside the worker
-  bypasses `PrimitiveBlock` entirely and avoids that retention.
-  `NodeTuple` is 16 bytes, allocated and consumed on the same
-  worker, so cross-thread retention is bounded. Reviewer 2 estimates
-  ~50 lines. (Reviewers 1, 2, 3, 4.)
-- Optionally retire the 128 GB virtual mmap in favor of a
+- ~~The outer loop in `build_node_index_dense` is single-threaded
+  for decompress and `extract_node_tuples`; only the trivial
+  mmap-store inner loop is parallelized. Replace with parallel
+  pread+decompress+`extract_node_tuples` workers... (Reviewers
+  1, 2, 3, 4.)~~ **Obsolete: dense was removed (see "Status" and
+  "Don't re-attempt"). The parallel-pass-1 + extract_node_tuples
+  shape now exists in sparse rank-flat (`c6f08ff`).**
+- ~~Optionally retire the 128 GB virtual mmap in favor of a
   rank-compacted index. After pass 0, call
   `IdSet::build_rank_index` and allocate `referenced_count * 8`
-  bytes; pass 1 writes via `rank_if_set(node_id)`; pass 2 reads via
-  `rank_if_set(ref_id)`. Pattern already used by geocode pass 2
-  (`src/geocode_index/builder/pass2.rs:362`, `src/idset.rs:477`).
-  Cuts page faults / cache misses for sparse-id extracts; adds rank
-  CPU per ref. Direct dense may still win on cache-hot dense inputs,
-  so this is an intrusive benchmark, not a gated probe. Duplicate
-  IDs or unsorted/corrupt inputs need atomic writes or a defined
-  overwrite rule. (Reviewer 4.)
+  bytes... (Reviewer 4.)~~ **Obsolete in spirit: dense was
+  removed. The rank-compacted shape Reviewer 4 described *is* what
+  sparse rank-flat is now (`c6f08ff`).**
 
 ### Pass 1, sparse
 
-- The serial consumer (single thread owning the `BufWriter`, chunk
-  state machine, and byte cursor) is the structural bottleneck;
-  parallel decompress workers stall waiting on it. Reviewer 3 also
-  notes the chunk format is load-bearing only in service of that
-  consumer; once the consumer is gone, the chunk structure stops
-  earning its keep. Two replacement shapes proposed:
-  - **K shard files.** Workers write per-shard files directly; final
-    coalescer concatenates in node-id order. (Reviewers 2, 3.)
-  - **Rank-indexed flat layout.** Pre-allocate
-    `referenced.len() * 8` bytes; workers `pwrite` at
-    `IdSet::rank(node_id) << 3`. Retires the chunk / start_pad
-    scheme entirely and removes the strictly-increasing-id
-    precondition. `SparseArrayIndex::get` becomes a bare mmap read.
-    (Reviewer 3.)
-- Replace the worker body with `extract_node_tuples`
+- ~~The serial consumer (single thread owning the `BufWriter`,
+  chunk state machine, and byte cursor) is the structural
+  bottleneck; parallel decompress workers stall waiting on it.
+  Reviewer 3 also notes the chunk format is load-bearing only in
+  service of that consumer; once the consumer is gone, the chunk
+  structure stops earning its keep. Two replacement shapes proposed:
+  K shard files (Reviewers 2, 3) or **Rank-indexed flat layout**
+  (Reviewer 3).~~ **Rank-indexed flat layout landed `c6f08ff` - see
+  "Landed work" above. Japan pass 1 wall 3.45 s -> 0.82 s (4.2x);
+  europe sparse went from OOM-at-9:56 to completing in 5:59. Disk
+  shrinks 2.4-2.8x.**
+- ~~Replace the worker body with `extract_node_tuples`
   (`src/scan/node.rs:49`) instead of `PrimitiveBlock` construction,
-  same reasoning as the pass 0 wire-only switch.
-  (Reviewers 1, 3, 4.)
+  same reasoning as the pass 0 wire-only switch.~~ **Landed
+  `c6f08ff` (folded into the rank-indexed flat work).**
 
 ### Relation-member scan
 
@@ -637,7 +766,7 @@ pass 2 structural items) are independent of the framing question.
   (`src/commands/altw/external/relation_scan.rs:22`) once dense /
   sparse has a shared blob plan. (Reviewer 4.)
 - (Orthogonal to the per-worker-IdSet -> shared-IdSet migration,
-  landed (this commit) - see "Landed work" above.)
+  landed `66cfa4a` - see "Landed work" above.)
 
 ### Pass 2 way path
 
@@ -651,7 +780,7 @@ pass 2 structural items) are independent of the framing question.
   `BlockBuilder`, no `StringTable::add`, no Info decode / encode,
   no ref redelta, no tag re-intern. The hot path becomes:
   decompress, raw protobuf scan, coord lookup, append packed lat /
-  lon, compress. (Reviewers 1, 3, 4.)~~ **Landed (this commit) -
+  lon, compress. (Reviewers 1, 3, 4.)~~ **Landed `cb31654` -
   see "Landed work" above. Japan: pass 2 7.9 -> 7.5 s, total wall
   flat at zlib:6 (writer-bound).**
 - On the reframe path, walk refs as an iterator instead of
@@ -686,16 +815,16 @@ pass 2 structural items) are independent of the framing question.
   `flush before passthrough` invariant
   (`passthrough.rs:301`) becomes "drain workers in order before
   the consumer ever switches modes." (Reviewers 1, 2, 3.)~~
-  **Landed (this commit) - see "Landed work" above. Japan: pass 2
+  **Landed `e63d0b6` - see "Landed work" above. Japan: pass 2
   wall flat (CPU-bound saturation already). Wins reserved for
   planet. `copy_file_range` deferred - stage 4 lives without it.**
 - ~~ALTW pass 2 currently routes through `to_path` (single-threaded
   write thread) via `writer_from_header_bytes`
   (`src/commands/mod.rs:352`); apply-changes already defaults to
   `to_path_parallel` (`src/commands/mod.rs:386`). Lifts the ~1.5
-  GB/s NVMe write ceiling. (Reviewers 2, 4.)~~ **Landed (this
-  commit) - see "Landed work" above. Japan: invisible (well below
-  the write ceiling). Win is reserved for planet scale.**
+  GB/s NVMe write ceiling. (Reviewers 2, 4.)~~ **Landed `7169216`
+  - see "Landed work" above. Japan: invisible (well below the
+  write ceiling). Win is reserved for planet scale.**
 - Skip output node blobs in the default
   `keep_untagged_nodes=false` mode when the blob has zero tagged
   nodes (cheap pre-scan of `dense_keys_vals` for any non-zero
@@ -721,10 +850,12 @@ pass 2 structural items) are independent of the framing question.
 
 ### Doc bug catches
 
-- The CLI text for sparse advertises that it works on any PBF, but
-  `build_node_index_sparse` requires strictly increasing node IDs.
-  Either fix the help text or land the rank-indexed flat layout
-  (which removes the constraint). (Reviewers 1, 3.)
+- ~~The CLI text for sparse advertises that it works on any PBF,
+  but `build_node_index_sparse` requires strictly increasing node
+  IDs. Either fix the help text or land the rank-indexed flat
+  layout (which removes the constraint). (Reviewers 1, 3.)~~
+  **Resolved by `c6f08ff` (rank-indexed flat layout). The
+  precondition is gone; CLI text and implementation now agree.**
 
 ### Anti-recommendations
 

@@ -680,8 +680,8 @@ pub fn external_join(
              Generate an indexed PBF first:\n\n\
              \x20 pbfhogg cat <input.osm.pbf> -o indexed.osm.pbf\n\n\
              Then run add-locations-to-ways against the indexed output, or use \
-             --index-type dense or sparse (which decode every blob anyway and \
-             therefore tolerate --force)."
+             --index-type sparse (which decodes every blob anyway and \
+             therefore tolerates --force)."
                 .into(),
         );
     }

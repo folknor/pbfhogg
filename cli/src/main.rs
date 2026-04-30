@@ -445,15 +445,16 @@ enum Command {
         #[arg(long)]
         keep_untagged_nodes: bool,
         /// Node coordinate index type:
-        ///   auto     - external if sorted + indexed, dense otherwise (recommended).
-        ///   dense    - direct-mapped mmap array. Fastest when working set fits in RAM.
-        ///              Works on any PBF (sorted or unsorted).
-        ///   sparse   - chunk-indexed sparse array. Bounded memory (~540 MB), slower.
-        ///              Works on any PBF. No temp disk needed.
+        ///   auto     - external if sorted + indexed, sparse otherwise (recommended).
+        ///   sparse   - rank-indexed flat mmap array (~8 bytes per referenced node).
+        ///              Fast at small / medium scale; survives europe at ~6 minutes
+        ///              on a 27 GB-RAM host. Works on any PBF. Needs temp disk equal
+        ///              to referenced_nodes * 8 bytes.
         ///   external - double radix permutation. Bounded memory (~17 GB planet),
-        ///              all sequential I/O. 3.9x faster than dense at planet scale.
-        ///              Requires sorted PBF and indexdata. ~300 GB temp disk at planet.
-        #[arg(long, default_value = "dense")]
+        ///              all sequential I/O. The only mode that survives at planet
+        ///              on memory-constrained hosts. Requires sorted PBF and
+        ///              indexdata. ~256 GB temp disk at planet.
+        #[arg(long, default_value = "sparse")]
         index_type: String,
         #[command(flatten)]
         compression: CompressionArg,

@@ -10,10 +10,10 @@
 //! changes alone.
 //!
 //! ALTW is the motivating example for the CLI-decoupled test layout
-//! (`notes/testing.md` > "Test placement"): the dense / sparse /
-//! external / auto index backends are internal types that change
-//! shape during the join rewrite documented in
-//! `notes/altw-external.md`. This file's only knob into "which
+//! (`notes/testing.md` > "Test placement"): the sparse / external /
+//! auto index backends are internal types that change shape during
+//! the join rewrite documented in `notes/altw-external.md`. This
+//! file's only knob into "which
 //! backend" is the `--index-type` CLI flag, so backend renames or
 //! splits don't ripple in.
 
@@ -145,8 +145,7 @@ fn write_indexed_pbf(
 
 #[derive(Clone, Copy)]
 enum IndexBackend {
-    Default, // dense (CLI default)
-    Dense,
+    Default, // sparse (CLI default)
     Sparse,
     External,
     Auto,
@@ -156,7 +155,6 @@ impl IndexBackend {
     fn flag(self) -> Option<&'static str> {
         match self {
             IndexBackend::Default => None,
-            IndexBackend::Dense => Some("dense"),
             IndexBackend::Sparse => Some("sparse"),
             IndexBackend::External => Some("external"),
             IndexBackend::Auto => Some("auto"),
@@ -258,7 +256,7 @@ fn read_relation_ids(path: &Path) -> Vec<i64> {
 }
 
 // ---------------------------------------------------------------------------
-// Basic tests (default / dense backend, non-indexed input)
+// Basic tests (default / sparse backend, non-indexed input)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -668,10 +666,9 @@ fn missing_node_refs_get_zero_coordinates_sparse() {
 
 #[test]
 #[allow(clippy::cast_possible_wrap)]
-fn backend_parity_dense_sparse_external_auto() {
+fn backend_parity_sparse_external_auto() {
     let dir = TempDir::new().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");
-    let out_dense = dir.path().join("out_dense.osm.pbf");
     let out_sparse = dir.path().join("out_sparse.osm.pbf");
     let out_external = dir.path().join("out_external.osm.pbf");
     let out_auto = dir.path().join("out_auto.osm.pbf");
@@ -705,7 +702,6 @@ fn backend_parity_dense_sparse_external_auto() {
     write_multi_block_test_pbf(&input, &nodes, &ways, &relations, 5);
 
     for (output, backend, label) in [
-        (&out_dense, IndexBackend::Dense, "dense"),
         (&out_sparse, IndexBackend::Sparse, "sparse"),
         (&out_external, IndexBackend::External, "external"),
         (&out_auto, IndexBackend::Auto, "auto"),
@@ -718,8 +714,7 @@ fn backend_parity_dense_sparse_external_auto() {
         );
     }
 
-    assert_elements_equivalent(&out_dense, &out_sparse);
-    assert_elements_equivalent(&out_dense, &out_external);
+    assert_elements_equivalent(&out_sparse, &out_external);
     assert_elements_equivalent(&out_external, &out_auto);
 }
 
@@ -866,11 +861,10 @@ fn null_island_real_node_treated_as_missing() {
 
 /// B2 - missing-node tolerance for `--index-type external`.
 /// DEVIATIONS.md says missing nodes are tolerated by default, with
-/// `(0, 0)` substituted. Pre-batch tests pinned this for dense
-/// (`missing_node_refs_get_zero_coordinates`) and sparse
+/// `(0, 0)` substituted. Pre-batch tests pinned this for sparse
 /// (`missing_node_refs_get_zero_coordinates_sparse`); the external
 /// variant was unpinned. Same fixture, same expected output - this
-/// test makes the contract uniform across all three backends.
+/// test makes the contract uniform across both backends.
 #[test]
 fn missing_node_refs_get_zero_coordinates_external() {
     let dir = TempDir::new().expect("tempdir");
@@ -884,10 +878,9 @@ fn missing_node_refs_get_zero_coordinates_external() {
         meta: None,
     }];
     // External requires indexed input (HeaderWalker fast-path scans
-    // BlobHeader.indexdata to drive its I/O schedule). The dense
-    // and sparse twins use `write_test_pbf` because their code
-    // paths fall back to full-decode without indexdata; external
-    // does not.
+    // BlobHeader.indexdata to drive its I/O schedule). The sparse
+    // twin uses `write_test_pbf` because its code path falls back
+    // to full-decode without indexdata; external does not.
     write_indexed_pbf(&input, &test_nodes(), &ways, &[]);
 
     let out = run_altw(&input, &output, true, IndexBackend::External, false);

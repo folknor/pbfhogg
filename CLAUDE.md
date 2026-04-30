@@ -105,7 +105,7 @@ I/O flags (`--direct-io`, `--io-uring`) create named variants in results. `--for
 - `brokkr kill [--hard]` - asks the brokkr process holding the lock to wrap up cleanly and exit ASAP.
 - `brokkr clean` - remove scratch temp files.
 - `brokkr history [--command CMD] [--failed] [--since DATE] [--slow MS] [-n N]` - global command history.
-- `brokkr verify <command> [--dataset name]` - cross-validate vs osmium/osmosis/osmconvert. `brokkr verify all` runs all. Default `--dataset denmark`, `--variant indexed`.
+- `brokkr verify <command> [--dataset name]` - cross-validate vs osmium/osmosis/osmconvert. `brokkr verify all` runs all. Default `--dataset denmark`, `--variant indexed`. For commands with multiple modes (e.g. `add-locations-to-ways` has `--mode hash|sparse|external|all`, default `all`), pass the explicit mode to skip the others - e.g. `brokkr verify add-locations-to-ways --dataset denmark --mode sparse` runs only the sparse path against the hash reference. Brokkr may still accept `--mode dense` in its CLI surface; that maps to `pbfhogg --index-type dense` which errors out since dense was removed in commit (see `notes/altw.md`).
 
 ### OSC resolver
 
@@ -141,9 +141,11 @@ Commands requiring indexdata: `apply-changes`, `sort`, `add-locations-to-ways`, 
 
 | Type | Memory | Temp disk | Best for |
 |------|--------|-----------|----------|
-| `dense` (default) | ~30+ GB mmap | none | RAM fits working set |
-| `sparse` | ~540 MB + 16 GB disk | ~16 GB | memory-constrained, batched lookups |
-| `external` | ~8.7 GB | ~112 GB (Europe) | rank-bucketed counting sort, parallel stages. Planet: 1,075s (18 min), 5.4x faster than dense |
+| `sparse` (default) | ~540 MB + IdSet/rank index | `referenced_count * 8` bytes (japan 2 GB, europe ~29 GB) | rank-indexed flat mmap; small to europe scale |
+| `external` | ~8.7 GB | ~256 GB (planet) | rank-bucketed counting sort, parallel stages; the only mode that survives at planet on 30 GB-class hosts |
+| `auto` | (one of the above) | (one of the above) | external if sorted+indexed, sparse otherwise |
+
+`dense` was removed - sparse rank-indexed flat is faster than the prior dense path at every measured scale and works in regimes dense didn't (europe survives at ~6 minutes on a 27 GB-RAM host). See `notes/altw.md` "Don't re-attempt" and "Status".
 
 ## Benchmarking Rules
 - **NEVER run benchmark, profiling, or verify commands in parallel.** ONE AT A TIME. Always wait for each to fully complete before starting the next.

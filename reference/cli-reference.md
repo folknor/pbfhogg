@@ -330,11 +330,12 @@ pbfhogg getparents [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 
 ### add-locations-to-ways
 
-Embed node coordinates in ways. Three index strategies:
+Embed node coordinates in ways. Two index strategies:
 
-- **dense** (default) - Direct-mapped mmap array. Fastest when the working set fits in RAM. At planet scale (~16 GB touched), requires ~30+ GB free memory to avoid page cache thrashing.
-- **sparse** - Planetiler-inspired chunk-indexed sparse array. Bounded memory (~540 MB). Slower than dense at all scales. No temp disk needed. Works on any PBF.
-- **external** - Double radix permutation via 4-stage pipeline. Bounded memory (~17 GB at planet). 3.9x faster than dense at planet scale. Requires sorted PBF (Sort.Type\_then\_ID) and indexdata. Uses ~112 GB temp disk at Europe, ~300 GB at planet.
+- **sparse** (default) - Rank-indexed flat mmap array. Pre-allocates `referenced.total_count() * 8` bytes; workers store `(lat, lon)` at byte offset `IdSet::rank_if_set(node_id) << 3` via atomic stores. Fast at small / medium scale; survives Europe at ~6 minutes on a 27 GB-RAM host. Likely thrashes at planet (working set exceeds free page cache) - use `external` for planet.
+- **external** - Double radix permutation via 4-stage pipeline. Bounded memory (~17 GB at planet). The only mode that survives at planet on memory-constrained hosts. Requires sorted PBF (Sort.Type\_then\_ID) and indexdata. Uses ~112 GB temp disk at Europe, ~256 GB at planet.
+
+`--index-type dense` was removed - sparse rank-indexed flat dominated dense at every measured scale (japan dense 51.6 s vs sparse 11.9 s). Passing `--index-type dense` errors with a pointer to `sparse`.
 
 By default, untagged nodes not referenced by a relation are dropped from output.
 
@@ -345,7 +346,7 @@ pbfhogg add-locations-to-ways [OPTIONS] --output <OUTPUT> <FILE>
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
-| `--index-type <TYPE>` | Node index type: `dense` (default), `sparse`, `external`, or `auto` (external if sorted+indexed, dense otherwise) |
+| `--index-type <TYPE>` | Node index type: `sparse` (default), `external`, or `auto` (external if sorted+indexed, sparse otherwise) |
 | `--keep-untagged-nodes` | Keep all untagged nodes in output |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |

@@ -8,7 +8,6 @@ pub mod external;
 pub mod external_test_hooks {
     pub use super::external::test_hooks::stage3 as stage3;
 }
-mod dense;
 mod passthrough;
 mod reframe;
 mod sparse;
@@ -31,7 +30,6 @@ use crate::idset::IdSet;
 
 use super::{Result, BATCH_SIZE};
 
-use self::dense::{build_node_index_dense, DenseMmapIndex};
 use self::passthrough::write_output_passthrough;
 use self::sparse::{build_node_index_sparse, SparseArrayIndex};
 
@@ -42,21 +40,20 @@ use self::sparse::{build_node_index_sparse, SparseArrayIndex};
 /// Strategy for storing node coordinates during add-locations-to-ways.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IndexType {
-    /// Direct-mapped array: `index[node_id] = (lat, lon)`. Fastest when the
-    /// working set fits in RAM. At planet scale (~16 GB touched after pass 0
-    /// filtering), this requires ~30+ GB of free memory to avoid page thrashing.
+    /// Rank-indexed flat sparse array. Pre-allocates
+    /// `referenced.total_count() * 8` bytes (~29 GB at europe, ~60 GB at
+    /// planet); workers `pwrite` coords at byte offset
+    /// `IdSet::rank_if_set(node_id) << 3`. Fast at small / medium scale,
+    /// survives europe at ~6 minutes on a 27 GB-RAM host. Likely thrashes
+    /// at planet (working set exceeds free page cache); use `external`
+    /// for planet.
     #[default]
-    Dense,
-    /// Chunk-indexed sparse array with batched sorted lookups. Uses ~540 MB
-    /// RAM for the chunk index plus a compact on-disk values file (~16 GB for
-    /// planet). Way lookups are batched and sorted by file offset, converting
-    /// random I/O into sequential scans. Works on memory-constrained hosts.
     Sparse,
     /// External join via double radix permutation. Bounded memory (<1 GB),
-    /// all sequential I/O. Uses ~224 GB temp disk at planet scale. Best for
-    /// memory-constrained hosts where dense thrashes and sparse is too slow.
+    /// all sequential I/O. Uses ~224 GB temp disk at planet scale. The
+    /// only mode that survives at planet on a memory-constrained host.
     External,
-    /// Auto-select: external if sorted + indexed, dense otherwise.
+    /// Auto-select: external if sorted + indexed, sparse otherwise.
     Auto,
 }
 
@@ -77,12 +74,17 @@ impl FromStr for IndexType {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
-            "dense" => Ok(Self::Dense),
             "sparse" => Ok(Self::Sparse),
             "external" => Ok(Self::External),
             "auto" => Ok(Self::Auto),
+            "dense" => Err(ParseIndexTypeError(
+                "index type 'dense' was removed in favor of 'sparse'. Sparse \
+                 (rank-indexed flat) is faster than dense at every measured \
+                 scale and works in regimes dense doesn't. Use \
+                 --index-type sparse instead.".to_string(),
+            )),
             _ => Err(ParseIndexTypeError(format!(
-                "unknown index type '{s}': expected 'dense', 'sparse', 'external', or 'auto'"
+                "unknown index type '{s}': expected 'sparse', 'external', or 'auto'"
             ))),
         }
     }
@@ -91,7 +93,6 @@ impl FromStr for IndexType {
 impl std::fmt::Display for IndexType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Dense => f.write_str("dense"),
             Self::Sparse => f.write_str("sparse"),
             Self::External => f.write_str("external"),
             Self::Auto => f.write_str("auto"),
@@ -99,24 +100,24 @@ impl std::fmt::Display for IndexType {
     }
 }
 
-/// 4 bytes lat + 4 bytes lon = 8 bytes per entry. Shared between the dense
-/// mmap layout and the sparse values file.
-const ENTRY_SIZE: usize = 8;
-
 // ---------------------------------------------------------------------------
 // Unified node index
 // ---------------------------------------------------------------------------
 
-/// Unified node coordinate index dispatching to either dense or sparse.
+/// Unified node coordinate index. Currently a single-variant enum because
+/// `external` builds its own coord representation inline (stage 4 reads
+/// `coord_payloads` directly, never instantiates `NodeIndex`); `auto`
+/// resolves to either Sparse (here) or External (separate path) before
+/// the build step. The enum stays as a future-proofing shape - a follow-up
+/// shrink encoding (planet-scale, ~17 GB working set) would add a variant
+/// rather than reshape the dispatch.
 enum NodeIndex {
-    Dense(DenseMmapIndex),
     Sparse(SparseArrayIndex),
 }
 
 impl NodeIndex {
     fn get(&self, node_id: i64) -> Option<(i32, i32)> {
         match self {
-            Self::Dense(idx) => idx.get(node_id),
             Self::Sparse(idx) => idx.get(node_id),
         }
     }
@@ -214,7 +215,7 @@ pub fn add_locations_to_ways(
         let chosen = if sorted && has_index {
             IndexType::External
         } else {
-            IndexType::Dense
+            IndexType::Sparse
         };
         eprintln!("auto-selected --index-type {chosen} (sorted={sorted}, indexed={has_index})");
         chosen
@@ -271,7 +272,6 @@ pub fn add_locations_to_ways(
         crate::debug::emit_counter(
             "altw_index_kind",
             match index_type {
-                IndexType::Dense => 0,
                 IndexType::Sparse => 1,
                 IndexType::External | IndexType::Auto => i64::MIN,
             },
@@ -340,13 +340,6 @@ fn build_node_index(
     index_type: IndexType,
 ) -> Result<NodeIndex> {
     match index_type {
-        IndexType::Dense => {
-            // Dense indexes by node id directly via mmap[node_id*8]; the
-            // referenced IdSet was only used for pass-0 filtering and is
-            // no longer needed beyond this point.
-            build_node_index_dense(input, direct_io, scratch_dir, &referenced)
-                .map(NodeIndex::Dense)
-        }
         IndexType::Sparse => {
             // Sparse takes ownership: the rank-indexed flat layout
             // builds rank index on the IdSet and carries it through to

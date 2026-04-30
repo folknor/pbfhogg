@@ -2,7 +2,56 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- **`add-locations-to-ways --index-type dense` removed.** Dense
+  was outperformed by the new sparse rank-indexed flat layout at
+  every measured scale (japan dense 51.6 s vs sparse 11.9 s,
+  4.3x; europe dense OOMed, sparse completes at 5:59) and there
+  was no regime where dense won. The flag now errors with a
+  pointer to `--index-type sparse`. The default `--index-type`
+  changed from `dense` to `sparse`. `--index-type auto` now
+  resolves to `external if sorted+indexed, sparse otherwise`
+  (previously fell back to dense). See `notes/altw.md` for the
+  measurement record.
+
 ### Commands
+
+- **add-locations-to-ways**: substantial performance and
+  memory-safety arc on dense / sparse paths. Japan sparse went
+  20.9 s -> 11.9 s (-43%); europe sparse went from "OOM at
+  9:56" to "completes at 5:59" - now competitive with external
+  at europe scale. Five-item structural cleanup + sparse
+  encoding redesign:
+  - Rel-member scan migrated from `parallel_classify_accumulate`
+    (per-worker IdSet) to `parallel_classify_phase` (per-blob
+    `Vec<i64>` through bounded result channel). Bounds peak anon
+    from N-workers x ~3 GB at planet to ~1.3 GB shared IdSet.
+    Was a planet blocker on its own.
+  - Pass 0 (way-ref node-id collection) goes through
+    `parallel_scan_blobs_raw` + `scan_way_refs` (wire-only, no
+    `PrimitiveBlock` construction). Drops per-blob StringTable
+    parse and group_ranges scratch.
+  - Pass 2 way blobs go through wire-format reframe (lifted from
+    external/stage4): copy StringTable bytes, copy non-way
+    fields verbatim, append packed lat/lon to original way
+    bytes from `NodeIndex::get` lookups. No BlockBuilder, no
+    StringTable::add, no Info / tag / ref re-encode.
+  - Pass 2 dispatch is now descriptor-first: `HeaderWalker`
+    builds a `BlobDescriptor` schedule, partitioned into decode
+    + passthrough; bounded ordered channel feeds workers and
+    consumer. Read + decode + write overlap; raw-frame retention
+    drops from a ~128-blob batch to channel depth.
+  - Pass 2 writer routed through `to_path_parallel` (was
+    single-thread `to_path`). Lifts the ~1.5 GB/s NVMe write
+    ceiling at planet.
+  - Sparse encoding switched to rank-indexed flat: file sized
+    `referenced.total_count() * 8` bytes, mmap-write via
+    AtomicU64 stores at byte offset
+    `IdSet::rank_if_set(node_id) << 3`. Disk shrinks 2.4-2.8x
+    (japan 5.7 GB -> 2.0 GB; europe ~52 GB -> ~29 GB). Pass 1
+    becomes data-parallel end-to-end (avg cores 6.5 -> 21.1 at
+    japan). Removes the strictly-increasing-id precondition.
 
 - **merge-changes**: parallel-drain via per-worker gzip members. When
   N > 1, each worker runs the full per-input pipeline (parse + XML

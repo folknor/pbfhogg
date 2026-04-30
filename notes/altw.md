@@ -153,23 +153,25 @@ format wastes ~57 % at japan density (5.7 GB temp / 299 M nodes =
 plausibly halve this, putting europe sparse close to or under
 cache.
 
-### Rel-member scan IdSet bloat scales hard
+### Rel-member scan IdSet bloat scales hard (fixed)
 
-`collect_relation_member_node_ids` uses `parallel_classify_accumulate`
-with one IdSet per worker. Per-phase anon delta during the scan:
+Was: `collect_relation_member_node_ids` used
+`parallel_classify_accumulate` with one IdSet per worker. Per-phase
+anon delta during the scan:
 
 - Denmark: +0.9 GB.
 - Japan: +2.5 GB.
 - Europe: +9.7 GB.
 
 24 workers x ~400 MB per IdSet at europe. The mod.rs doc comment
-claimed ~68 MB / worker; measurement disagrees by 6x. Linear
+claimed ~68 MB / worker; measurement disagreed by 6x. Linear
 extrapolation: planet ~24 x ~3 GB = ~72 GB. Same shape that bit
 tags-filter `--invert-match` (28.3 GB peak anon -> 7.0 GB after the
-2026-04-28 migration); same fix template available.
+2026-04-28 migration). Independent of dense vs sparse choice; would
+have been a planet blocker on its own.
 
-This is independent of dense vs sparse choice and would be a planet
-blocker on its own.
+Migrated to `parallel_classify_phase` in commit (this commit);
+see "Landed work" below.
 
 ### What is NOT the bottleneck
 
@@ -224,27 +226,32 @@ Result:
 
 Japan sparse went from 1.5x slower than japan dense to 2.5x faster.
 
+### Migrate rel-member scan to `parallel_classify_phase` - landed (this commit)
+
+`collect_relation_member_node_ids` now mirrors the
+tags-filter way-deps shape (`17b116c`): per-blob worker emits
+`Vec<i64>` of member node IDs through the bounded 32-slot result
+channel, main thread unions into a single shared `IdSet`. Bounds
+memory to one IdSet plus per-blob transient vectors, not
+N-workers x per-worker IdSet. Set-union is commutative so the
+migration is correctness-preserving by construction.
+
+Result (japan sparse, plantasjen 2026-04-30, dirty-bench best of 3):
+
+| Metric | `8e0cef9` (pre) | post |
+|--------|-----------------|------|
+| Rel-member scan wall | 4.2 s | 0.76 s |
+| Rel-member scan peak anon | 4.3 GB | 0.81 GB |
+| Total japan sparse wall | 20.9 s | 17.4 s |
+
+Linear extrapolation at planet (was ~72 GB peak anon in 24 workers
+x ~3 GB): now bounded by one shared IdSet (~1.3 GB at planet) plus
+the 32-slot Vec<i64> queue (~640 KB / slot at planet density,
+bounded ~20 MB total).
+
 ## Remaining work
 
-### 1. Migrate rel-member scan off `parallel_classify_accumulate`
-
-**Why first:** real planet-scale blocker independent of index-type
-choice. Affects every `keep_untagged_nodes=false` run, which is the
-default. Whether or not we ever fix sparse at europe, this fires for
-dense and sparse runs alike.
-
-**Shape:** mirror the tags-filter way-deps migration (commit
-`17b116c`). Replace `parallel_classify_accumulate` with
-`parallel_classify_phase`: per-blob worker emits `Vec<i64>` of
-relation member node IDs, main thread unions into a single shared
-IdSet. Bounds memory to one IdSet plus per-blob transient vectors,
-not N-workers x per-worker IdSet.
-
-**Test surface:** existing CLI integration tests cover the
-keep / drop semantics; set-union is commutative so the migration
-preserves correctness by definition.
-
-### 2. Sparse encoding redesign (optional, large investment)
+### 1. Sparse encoding redesign (optional, large investment)
 
 **Status:** speculative. Land only if there is a real workload need
 for sparse at europe-or-larger scale that isn't served by external.
@@ -274,7 +281,7 @@ but per-call overhead matters at billions of lookups.
 **Or:** just document that sparse is small / medium scale and keep
 external as the planet-recommended path. (Current state.)
 
-### 3. Per-batch parallel resolve (optional, lower priority)
+### 2. Per-batch parallel resolve (optional, lower priority)
 
 **Status:** ranked low. Inline lookup at small / medium scale wins
 on its own merits; the regime where global-locality sort would help
@@ -311,6 +318,326 @@ worth pursuing without the encoding fix above.
   resolve (the `8e0cef9` win) and at index-vs-cache size (the
   europe failure). Bench first, find the actual peak phase, only
   then rewrite.
+
+## External review (2026-04-29)
+
+Four outside reviewers were commissioned with split briefs:
+
+- **Reviewers 1 and 2** were asked to make dense / sparse
+  planet-scale safe.
+- **Reviewers 3 and 4** were asked to optimize dense / sparse for
+  small / medium only, treating europe+ as out of scope (external
+  owns the planet path).
+
+Reviewers 3 and 4 were operating in the doc's current frame
+(dense / sparse ceiling at ~25 GB working set is structural, external
+is the planet path). The planet-safety architectural rewrites from 1
+and 2 are recorded at the end as a record of the option, not as
+recommended direction. Findings shared across briefs (most pass 1 /
+pass 2 structural items) are independent of the framing question.
+
+### Pass 0
+
+- Replace the current `parallel_classify_phase` body, which builds
+  full `PrimitiveBlock`s per blob just to iterate
+  `block.elements_skip_metadata()` at `mod.rs:383`, with a wire-only
+  scan via `scan_way_refs` (`src/scan/way.rs:78`). Drops per-blob
+  StringTable parse and `(u32, u32)` scratch allocations entirely.
+  (Reviewers 1, 3, 4.)
+- Run pass 0 and the relation-member scan concurrently under
+  `std::thread::scope`. They read disjoint blob types, both produce
+  IdSets used by pass 2, and external already runs them overlapped.
+  (Reviewer 2.)
+
+### Pass 1, dense
+
+- The outer loop in `build_node_index_dense`
+  (`src/commands/altw/dense.rs:191`) is single-threaded for
+  decompress and `extract_node_tuples`; only the trivial mmap-store
+  inner loop is parallelized. Replace with parallel
+  pread+decompress+`extract_node_tuples` workers writing directly to
+  `SharedDenseWriter` (atomic stores already make N-thread writes
+  safe). The historical reason for the serial loop was 25 GB of
+  cross-thread `PrimitiveBlock` heap retention; using
+  `extract_node_tuples` on raw decompressed bytes inside the worker
+  bypasses `PrimitiveBlock` entirely and avoids that retention.
+  `NodeTuple` is 16 bytes, allocated and consumed on the same
+  worker, so cross-thread retention is bounded. Reviewer 2 estimates
+  ~50 lines. (Reviewers 1, 2, 3, 4.)
+- Optionally retire the 128 GB virtual mmap in favor of a
+  rank-compacted index. After pass 0, call
+  `IdSet::build_rank_index` and allocate `referenced_count * 8`
+  bytes; pass 1 writes via `rank_if_set(node_id)`; pass 2 reads via
+  `rank_if_set(ref_id)`. Pattern already used by geocode pass 2
+  (`src/geocode_index/builder/pass2.rs:362`, `src/idset.rs:477`).
+  Cuts page faults / cache misses for sparse-id extracts; adds rank
+  CPU per ref. Direct dense may still win on cache-hot dense inputs,
+  so this is an intrusive benchmark, not a gated probe. Duplicate
+  IDs or unsorted/corrupt inputs need atomic writes or a defined
+  overwrite rule. (Reviewer 4.)
+
+### Pass 1, sparse
+
+- The serial consumer (single thread owning the `BufWriter`, chunk
+  state machine, and byte cursor) is the structural bottleneck;
+  parallel decompress workers stall waiting on it. Reviewer 3 also
+  notes the chunk format is load-bearing only in service of that
+  consumer; once the consumer is gone, the chunk structure stops
+  earning its keep. Two replacement shapes proposed:
+  - **K shard files.** Workers write per-shard files directly; final
+    coalescer concatenates in node-id order. (Reviewers 2, 3.)
+  - **Rank-indexed flat layout.** Pre-allocate
+    `referenced.len() * 8` bytes; workers `pwrite` at
+    `IdSet::rank(node_id) << 3`. Retires the chunk / start_pad
+    scheme entirely and removes the strictly-increasing-id
+    precondition. `SparseArrayIndex::get` becomes a bare mmap read.
+    (Reviewer 3.)
+- Replace the worker body with `extract_node_tuples`
+  (`src/scan/node.rs:49`) instead of `PrimitiveBlock` construction,
+  same reasoning as the pass 0 wire-only switch.
+  (Reviewers 1, 3, 4.)
+
+### Relation-member scan
+
+- Replace `parallel_classify_accumulate` at `mod.rs:426` with a
+  wire-only scanner walking `PrimitiveGroup` field 7 (Relation) and
+  the packed `memids` field directly. The current path builds a
+  full `PrimitiveBlock` per blob to read one packed varint field.
+  (Reviewers 3, 4.)
+- Reuse external's relation-only pread scan
+  (`src/commands/altw/external/relation_scan.rs:22`) once dense /
+  sparse has a shared blob plan. (Reviewer 4.)
+- (Orthogonal to the per-worker-IdSet -> shared-IdSet migration,
+  landed (this commit) - see "Landed work" above.)
+
+### Pass 2 way path
+
+- Lift `reframe_way_blob_with_locations`
+  (`src/commands/altw/external/stage4.rs:993`) into the dense /
+  sparse pass 2 way arm at `src/commands/altw/mod.rs:630`. Copies
+  the original StringTable byte-for-byte
+  (`encode_bytes_field(output, 1, stringtable_bytes)`), copies
+  non-way `PrimitiveGroup` fields verbatim, and for each way
+  appends fields 9 / 10 to the original way bytes. No
+  `BlockBuilder`, no `StringTable::add`, no Info decode / encode,
+  no ref redelta, no tag re-intern. The hot path becomes:
+  decompress, raw protobuf scan, coord lookup, append packed lat /
+  lon, compress. (Reviewers 1, 3, 4.)
+- On the reframe path, walk refs as an iterator instead of
+  materializing `refs_buf: Vec<i64>` and
+  `locations_buf: Vec<(i32, i32)>` at
+  `src/commands/altw/mod.rs:632`; stream zigzag-delta lat / lon
+  bytes directly into `packed_lats` / `packed_lons` while running
+  cum-id over `refs_data`. Saves ~50-100 M small heap touches at
+  europe scale. (Reviewer 3.)
+- Inputs that already declare `LocationsOnWays` need existing
+  fields 9 / 10 stripped before append, not appended after. Two
+  extra wire-tag matches in the way walker. (Reviewers 3, 4.)
+- Risks: clippy `cognitive_complexity` will fight a single-function
+  implementation; reviewer 3 suggests splitting into
+  `parse_block_top` / `walk_way_in_blob` / `splice_way_locations`,
+  same shape as stage 4. Reviewer 4 notes compression is a
+  candidate next bottleneck after the way-decode work disappears.
+
+### Pass 2 dispatch and writer
+
+- Replace the read-batch-rayon-drain stop-and-wait loop at
+  `src/commands/altw/passthrough.rs:280` with a descriptor-first
+  parallel pipeline mirroring `external/stage4.rs:230+`:
+  `HeaderWalker` builds the descriptor schedule (cheap, no body
+  reads), partition into decode-eligible vs passthrough-eligible,
+  fixed-size worker pool runs pread+decompress+reframe+assemble per
+  descriptor, bounded ordered channel feeds a single consumer
+  thread that only writes (and on Linux uses `copy_file_range` for
+  contiguous passthrough runs). Decode, reframe, and write all
+  overlap; raw-frame retention drops from a ~128-blob batch to
+  channel depth + per-worker buffers. The current
+  `flush before passthrough` invariant
+  (`passthrough.rs:301`) becomes "drain workers in order before
+  the consumer ever switches modes." (Reviewers 1, 2, 3.)
+- ALTW pass 2 currently routes through `to_path` (single-threaded
+  write thread) via `writer_from_header_bytes`
+  (`src/commands/mod.rs:352`); apply-changes already defaults to
+  `to_path_parallel` (`src/commands/mod.rs:386`). Lifts the ~1.5
+  GB/s NVMe write ceiling. (Reviewers 2, 4.)
+- Skip output node blobs in the default
+  `keep_untagged_nodes=false` mode when the blob has zero tagged
+  nodes (cheap pre-scan of `dense_keys_vals` for any non-zero
+  entry) AND no overlap with `relation_member_node_ids` via
+  `IdSet::any_in_range` against the blob's id range. Stage 4
+  already does this. Otherwise, do a partial wire-format edit that
+  drops dropped nodes from `id` / `lat` / `lon` / `keys_vals`
+  packed fields without rebuilding the StringTable, rather than
+  full decode+re-encode. Most blobs are ~95-99 % untagged so the
+  skip path is the common case. (Reviewers 1, 2, 3, 4.)
+- Drop the `Vec<OwnedBlock>` per-worker buffer in `process_block`
+  and `drain_batch_results`; push owned blocks directly into the
+  writer's input channel (the writer pipeline already reorders by
+  seq). (Reviewer 2.)
+
+### Cross-cutting structural
+
+- Build one `BlobMeta` table up front, mirror
+  `src/commands/altw/external/blob_meta.rs:31`, drive pass 0 / pass
+  1 / relation scan / pass 2 from the same plan. Removes repeated
+  header walks and gives pass 2 exact frame offsets for worker pread
+  / raw passthrough. (Reviewer 4.)
+
+### Doc bug catches
+
+- The CLI text for sparse advertises that it works on any PBF, but
+  `build_node_index_sparse` requires strictly increasing node IDs.
+  Either fix the help text or land the rank-indexed flat layout
+  (which removes the constraint). (Reviewers 1, 3.)
+
+### Anti-recommendations
+
+- Do not tune `BATCH_MAX_BLOBS` / `BATCH_BYTE_BUDGET` / channel
+  widths / decompression-pool sizes / sparse chunk size before the
+  structural fixes land. Tuning knobs in a structurally
+  bottlenecked pipeline will not move the needle. (Reviewers 2, 3.)
+- Do not chase `NodeIndex::get` micro-optimization (SoA, prefetch).
+  Once way blobs go through reframe, `get` is one mmap or array
+  load per ref and is no longer a top item. (Reviewer 3.)
+- Do not optimize sparse pass 2 further. Sparse's structural gap is
+  in pass 1's serial consumer, not in pass 2. (Reviewer 3.)
+- Do not try `madvise(WILLNEED)` over sorted ref ranges. The kernel
+  page cache will not cooperate when the working set exceeds RAM
+  regardless of advise hints; the fix has to change the access
+  pattern, not the advisories. (Reviewer 2.)
+- Do not add a `--index-type ramcheck` mode that picks dense /
+  sparse based on free RAM. Config band-aid over a structural
+  problem; another knob to debug. (Reviewer 2.)
+- Land replacements as full replacements; benchmark and decide
+  keep / revert. No env-var gates, no side-by-side variants.
+  (Reviewer 3.)
+
+### Planet-safety architectural rewrites
+
+These appear only in reviewers 1 and 2 because their brief was
+"make dense / sparse planet-safe." The doc's current frame is the
+opposite: external is the planet path, dense / sparse stay small /
+medium. Recorded so the option is not lost.
+
+#### Reviewer 1: bounded slot / join replacement
+
+**Diagnostic frame.** The current architecture is "build global
+coordinate state, then fully decode and rebuild way blobs." Dense
+allocates a fixed 16 B-entry, 128 GB virtual mmap and writes
+coordinates by node id (`src/commands/altw/dense.rs:19`); even if
+only referenced pages are dirtied, the working set competes with
+input page cache, output writer buffers, and compression scratch.
+Sparse avoids the 128 GB virtual reservation but still builds a
+global chunk index plus mmap-backed values file
+(`src/commands/altw/sparse.rs:28`). Both require global state
+proportional to the referenced-node universe; that is the root
+safety problem at planet scale.
+
+**Replacement shape.** Slot / join based: scan way refs into
+bounded buckets, resolve node coordinates by id bucket against
+node blobs, emit per-way-blob coordinate payloads, stream
+assembly. The source already proves this architecture internally:
+stage 1 emits ref records and node-blob mapping
+(`src/commands/altw/external/stage1.rs:1`), stage 2 resolves by
+bucket without a global mmap
+(`src/commands/altw/external/stage2.rs:1`). The rewrite is to fold
+dense / sparse into that pipeline rather than maintain them as
+separate global-index modes.
+
+**Effect.** Effectively retires dense / sparse as planet modes.
+Dense can remain as a small / medium fast path; sparse's identity
+disappears (it is a constraint workaround, not a separate
+architecture). Reviewer 1's framing: "preserving dense / sparse
+identity is not worth much pre-1.0 if the architecture is wrong."
+
+**Risk.** Large rewrite; overlaps conceptually with external.
+
+#### Reviewer 2: streaming batch resolve
+
+**Diagnostic frame.** The dense / sparse naming oversells the
+difference. After the pass-0 referenced-node filter, both paths
+physically hold ~16 GB of coord data (one 8-byte slot per
+referenced node, ~2 B referenced nodes at planet); dense reserves
+128 GB virtual but only ~16 GB pages get dirtied, sparse uses
+~16 GB of file-backed mmap directly. Their physical hot working
+set is nearly identical. The dominant pathology is pass-2 random
+reads against that 16 GB store: way refs are nearly uniform across
+the planet's node-id range, each blob's lookups touch the whole
+coord file in arbitrary order, and on a 28 GB host the kernel page
+cache holds ~10-20 GB after subtracting input readahead, output
+buffers, and rayon scratch. Cross that threshold and the OS starts
+evicting pages that will be touched again immediately.
+
+**Phase 1, parallel.** Read node blobs in parallel; filter by the
+pass-0 IdSet; bucket each kept `(id, lat, lon)` triple into one of
+K shards by the high bits of `id` (K = 256 or 1024). Each shard
+appended to its own on-disk file in input order. On a sorted PBF
+that input order is also id-ascending, so each shard file ends up
+sorted ascending by node id with no merge step. Concurrency: many
+decode workers, each appending to its current shard; transitions
+between shards are cheap because the bucket is just a high-bit
+extract.
+
+- Disk: ~16 GB total at planet (same physical size as today's
+  stores, just K small files).
+- RAM: bounded - per-worker output buffers, no IdSet larger than
+  today's.
+
+**Phase 2, batched merge-join.** Process way blobs in batches of N
+(N ~= 64 blobs, ~512 K ways). Per batch:
+
+  a. Decompress all N blobs in parallel; collect
+     `(blob_idx, ref_position, node_id)` triples (~5 M triples per
+     batch at planet, easy memory).
+  b. Bucket triples by shard; sort each bucket by `node_id`.
+  c. For each shard, sequentially scan the shard's coord file
+     until every requested id has been resolved. Single forward
+     pass, kernel readahead carries the load. Multiple shards
+     scan in parallel.
+  d. Scatter resolved coords back to per-blob, per-way arrays.
+  e. Re-encode each way blob in parallel and emit through the
+     existing writer pipeline.
+
+**Why this is the rewrite, not just another mode.** Pass 2's RAM
+bound becomes O(batch), not O(referenced nodes). Coord shards are
+touched sequentially, so the page cache only needs the small
+forward window per shard, not the full 16 GB; the pass survives
+with as little as ~1 GB free RAM. All decompress is parallel, all
+re-encode is parallel, writes go through the existing parallel
+writer, the coord shards are private temp files so no O_DIRECT
+alignment fights. Dense's strength ("lookup is one mmap load") and
+sparse's strength ("no 128 GB virtual reservation") collapse into
+the same shape, and that shape is also planet-safe at 28 GB.
+
+**Comparison to external.** ~16 GB total temp vs external's ~224
+GB, because the coord shards do not materialize per-ref records.
+Reviewer 2 claims this could deprecate dense, sparse, and external
+in one move (except for adversarial unsorted input).
+
+**Risk.**
+- Implementation surface is roughly stage 1 + stage 2 size. The
+  external codebase already provides every supporting primitive
+  (sharding, parallel scan, scratch dirs, `BlobMeta`,
+  `ReorderBuffer`, parallel writer); the work is remixing, not
+  inventing.
+- Tuning K (shard count) and N (batch size) matters. Wrong K
+  produces either too many open files or too-large per-shard
+  windows; wrong N produces either too little parallelism or too
+  much per-batch RAM.
+- Output ordering: way blobs must remain in input order. The
+  existing reorder / writer pipeline already handles this; the
+  passthrough flush invariant just becomes "drain workers in order
+  before the consumer switches modes."
+
+## Measurement notes
+
+Pass 2 CPU wins (wire-format reframe, descriptor-first pipeline,
+`to_path_parallel`, untagged-node skip) can be invisible on wall
+time under default `zlib:6` because decoder CPU freed by these
+items refills the writer queue. Measure any pass-2 item under both
+`zlib:6` and a non-default such as `zstd:1` or `compression:none`
+to confirm the win is real and not a decoder-shifted writer-bound
+case.
 
 ## Cross-references
 

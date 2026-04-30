@@ -404,14 +404,15 @@ fn collect_way_referenced_node_ids(input: &Path, _direct_io: bool) -> Result<IdS
 
 /// Collect all node IDs referenced by relation members.
 ///
-/// Uses `build_classify_schedule(Relation)` plus
-/// `parallel_classify_accumulate` so each worker unions member-node IDs
-/// into its own `IdSet` across the whole scan; the main thread merges
-/// the per-worker bitsets at completion. Relation member-node-ID sets
-/// are sparse (only members with type=Node, and only those that are
-/// also node IDs rather than way/relation IDs), so per-worker `IdSet`
-/// memory stays bounded - the scan/classify.rs doc comment estimates
-/// ~68 MB per worker at planet scale.
+/// Per-blob node-id streaming via `parallel_classify_phase`: workers emit
+/// `Vec<i64>` of relation-member node ids per blob through the bounded
+/// 32-slot result channel; the main thread unions them into one shared
+/// `IdSet`. Memory is bounded to one IdSet plus per-blob transient vectors
+/// rather than N-workers x per-worker `IdSet` (the previous shape, which
+/// hit +9.7 GB anon at europe scale - see notes/altw.md `Findings`). Same
+/// migration template as `tags_filter::collect_way_node_dependencies`
+/// (commit `17b116c`). Set-union is commutative, so the worker-arrival
+/// order does not affect the final IdSet contents.
 ///
 /// `direct_io` is intentionally dropped on this path: blob bodies are
 /// pread from the shared file handle on worker threads, incompatible
@@ -423,26 +424,30 @@ pub(crate) fn collect_relation_member_node_ids(input: &Path, _direct_io: bool) -
         Some(crate::blob_meta::ElemKind::Relation),
     )?;
     let mut member_node_ids = IdSet::new();
-    crate::scan::classify::parallel_classify_accumulate(
+    crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &schedule,
         None,
-        IdSet::new,
-        |block, set| {
+        || (),
+        |block, _state| {
+            let mut node_ids: Vec<i64> = Vec::new();
             for element in block.elements_skip_metadata() {
                 if let Element::Relation(r) = element {
                     for member in r.members() {
                         if let MemberId::Node(id) = member.id
                             && id >= 0
                         {
-                            set.set(id);
+                            node_ids.push(id);
                         }
                     }
                 }
             }
+            node_ids
         },
-        |worker_set| {
-            member_node_ids.merge_from(&worker_set);
+        |_seq, node_ids| {
+            for id in node_ids {
+                member_node_ids.set(id);
+            }
         },
     )?;
     Ok(member_node_ids)

@@ -1,246 +1,241 @@
 //! Pass 2b: passthrough output path (indexdata present).
 //!
-//! Relation blobs and optionally node blobs bypass decode and re-encode -
-//! the raw frame bytes either go through a userspace coalescing buffer or,
-//! on linux-direct-io, through `copy_file_range` kernel-space copies.
-//! Way blobs and decode-required nodes go through a parallel decode batch.
+//! Descriptor-first parallel pipeline lifted from
+//! `external/stage4.rs`:
+//!
+//!   `HeaderWalker` builds a `Vec<BlobDescriptor>` (cheap, no body
+//!   reads) -> partition into decode-eligible vs passthrough-eligible
+//!   -> fixed-size worker pool runs `pread` + decompress + reframe (or
+//!   re-encode) per descriptor -> bounded ordered channel feeds a
+//!   single consumer thread that only writes -> writer pipeline
+//!   compresses + writes in parallel.
+//!
+//! The previous shape was a read-batch-rayon-drain stop-and-wait
+//! loop: each batch read, decoded, drained, flushed before reading
+//! the next batch. Decode was parallel within a batch, but read +
+//! decode + write never overlapped. The descriptor-first form lets
+//! all three overlap: read on the consumer (passthrough preads on
+//! demand) + workers (decode preads via shared file) + decode on
+//! workers + compress + write on the writer pool.
+//!
+//! Relation blobs are always passthrough. Node blobs are passthrough
+//! only when `keep_untagged_nodes` is set (otherwise per-element
+//! filtering forces full decode + re-encode). Way blobs always go
+//! through the wire-format reframe in `super::reframe`.
 
-use std::io::Read;
+use std::os::unix::fs::FileExt as _;
 use std::path::Path;
-
-use rayon::prelude::*;
+use std::sync::atomic::AtomicI64;
 
 use crate::blob::{
-    decode_blob_to_headerblock, decompress_blob, decompress_blob_raw,
-    parse_blob_header_with_index, parse_primitive_block_from_bytes_owned, BlobKind,
-    DecompressPool, WireBlob,
+    decompress_blob_raw, parse_primitive_block_from_bytes_owned, BlobKind,
+    DecompressPool,
 };
 use crate::blob_meta::{BlobIndex, ElemKind};
 use crate::block_builder::{BlockBuilder, OwnedBlock};
-use crate::file_reader::FileReader;
 use crate::idset::IdSet;
-use crate::read::raw_frame::{read_raw_frame, RawBlobFrame};
+use crate::read::header_walker::HeaderWalker;
+use crate::reorder_buffer::ReorderBuffer;
 use crate::writer::{Compression, PbfWriter};
 
 use crate::commands::{
-    build_output_header, drain_batch_results, flush_local, flush_passthrough_buf,
-    writer_from_header_bytes_parallel, HeaderOverrides, BATCH_BYTE_BUDGET, BATCH_MAX_BLOBS,
-    BATCH_MIN_BLOBS,
+    build_output_header, flush_local, writer_from_header_bytes_parallel, HeaderOverrides,
 };
 
 use super::reframe::{reframe_way_blob_with_locations, WayReframeScratch};
 use super::{process_block, NodeIndex, Stats};
 use super::Result;
 
-// ---------------------------------------------------------------------------
-// Two-phase read: header-only classification + selective data read/skip
-// ---------------------------------------------------------------------------
-
-/// Blob header info from phase 1 of two-phase read.
-///
-/// Contains classification data (blob_type, index) and file position info
-/// needed to either read the full blob data or skip it for copy_file_range.
-struct BlobHeaderInfo {
-    blob_type: BlobKind,
+/// Per-blob descriptor produced once up front by the header walk and
+/// consumed by both the worker pool (decode) and the consumer thread
+/// (passthrough pread + write).
+#[derive(Clone, Copy)]
+struct BlobDescriptor {
+    seq: usize,
+    /// Start of the on-disk 4-byte length prefix. Used by the
+    /// consumer-side passthrough path to pread the entire framed blob
+    /// (header + data) and hand it verbatim to
+    /// `PbfWriter::write_raw_owned`.
+    frame_offset: u64,
+    /// `(data_offset - frame_offset) + data_size`. The exact number of
+    /// bytes to pread for raw passthrough.
+    frame_size: usize,
+    data_offset: u64,
     data_size: usize,
-    index: Option<BlobIndex>,
-    #[allow(dead_code)]
-    tagdata: Option<Box<[u8]>>,
-    /// File offset where this frame starts (for copy_file_range).
-    frame_start: u64,
-    /// Total frame length: 4 + header_len + data_size.
-    frame_len: usize,
-    /// Raw header prefix: [len_buf(4) | header_bytes(header_len)].
-    /// Used by `read_blob_data` to assemble the full frame.
-    header_raw: Vec<u8>,
+    is_way_blob: bool,
+    /// `true` when the blob can be passed through as raw compressed
+    /// bytes without decompress + decode + re-encode. Relations always
+    /// qualify; node blobs qualify only when `keep_untagged_nodes`.
+    /// Ways never qualify (they need location splicing).
+    is_passthrough: bool,
+    /// Blob kind from indexdata; `None` only for blobs with no
+    /// indexdata header (only reachable on `--force` non-indexed
+    /// input). Both decode and passthrough branches treat `None` as
+    /// "decode" to preserve correctness.
+    kind: Option<ElemKind>,
+    /// Element count from indexdata. Used to populate stats on the
+    /// passthrough path (no decode available for a live count).
+    count: u64,
 }
 
-/// Read just the BlobHeader (phase 1). Returns `None` at EOF.
-///
-/// Advances `file_offset` by the header portion only (4 + header_len).
-/// The blob data is NOT read - call `read_blob_data` or `skip_blob_data` next.
-fn read_blob_header(
-    reader: &mut FileReader,
-    file_offset: &mut u64,
-) -> Result<Option<BlobHeaderInfo>> {
-    let frame_start = *file_offset;
-
-    let mut len_buf = [0u8; 4];
-    match reader.read_exact(&mut len_buf) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
-    }
-    #[allow(clippy::cast_possible_truncation)]
-    let header_len = u32::from_be_bytes(len_buf) as usize;
-
-    let mut header_bytes = vec![0u8; header_len];
-    reader.read_exact(&mut header_bytes)?;
-    let (blob_type, data_size, indexdata, tagdata) =
-        parse_blob_header_with_index(&header_bytes)?;
-
-    let blob_offset = 4 + header_len;
-    let frame_len = blob_offset + data_size;
-    *file_offset += blob_offset as u64;
-
-    let index = indexdata.and_then(|d| BlobIndex::deserialize(&d));
-
-    // Assemble header_raw: [len_buf | header_bytes]
-    let mut header_raw = Vec::with_capacity(blob_offset);
-    header_raw.extend_from_slice(&len_buf);
-    header_raw.extend_from_slice(&header_bytes);
-
-    Ok(Some(BlobHeaderInfo {
-        blob_type,
-        data_size,
-        index,
-        tagdata,
-        frame_start,
-        frame_len,
-        header_raw,
-    }))
-}
-
-/// Read blob data after a header read (phase 2, decode path).
-///
-/// Consumes the `BlobHeaderInfo` and reads the blob data to produce a full
-/// `RawBlobFrame`. Advances `file_offset` by `data_size`.
-fn read_blob_data(
-    reader: &mut FileReader,
-    info: BlobHeaderInfo,
-    file_offset: &mut u64,
-) -> Result<RawBlobFrame> {
-    let blob_offset = info.header_raw.len();
-    let mut frame_bytes = Vec::with_capacity(info.frame_len);
-    frame_bytes.extend_from_slice(&info.header_raw);
-    frame_bytes.resize(info.frame_len, 0);
-    reader.read_exact(&mut frame_bytes[blob_offset..])?;
-    *file_offset += info.data_size as u64;
-
-    Ok(RawBlobFrame {
-        frame_bytes,
-        blob_type: info.blob_type,
-        blob_offset,
-        index: info.index,
-        tagdata: info.tagdata,
-        file_offset: info.frame_start,
-    })
-}
-
-/// Skip blob data after a header read (phase 2, passthrough path).
-///
-/// Advances the reader past the blob data without allocating or reading it
-/// into userspace. Advances `file_offset` by `data_size`.
-fn skip_blob_data(
-    reader: &mut FileReader,
-    data_size: usize,
-    file_offset: &mut u64,
-) -> Result<()> {
-    reader.skip(data_size as u64)?;
-    *file_offset += data_size as u64;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Batch slot for parallel decode
-// ---------------------------------------------------------------------------
-
-/// A slot in a parallel decode batch for the passthrough path.
-enum BatchSlot {
-    /// Way blob: decompress, enrich with node locations, re-encode.
-    Way(RawBlobFrame),
-    /// Node blob: decompress, filter untagged, re-encode.
-    Node(RawBlobFrame),
-    /// Unknown blob (no indexdata): decompress, inspect, process generically.
-    Unknown(RawBlobFrame),
-}
-
-impl BatchSlot {
-    fn frame(&self) -> &RawBlobFrame {
-        match self {
-            Self::Way(f) | Self::Node(f) | Self::Unknown(f) => f,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Passthrough coalescing
-// ---------------------------------------------------------------------------
-
-fn coalesce_passthrough(frame: &mut RawBlobFrame, chunks: &mut Vec<Vec<u8>>) {
-    chunks.push(std::mem::take(&mut frame.frame_bytes));
-}
-
-// ---------------------------------------------------------------------------
-// Copy-range passthrough (linux-direct-io: kernel-space copy via copy_file_range)
-// ---------------------------------------------------------------------------
-
-/// Coalesced file range for kernel-space passthrough copy.
-///
-/// Consecutive passthrough blobs produce contiguous byte ranges in the input
-/// file. Rather than issuing a `write_raw_copy` per blob (like merge), we
-/// extend the range and flush once per contiguous run. At planet scale,
-/// hundreds of consecutive passthrough blobs are common.
-#[cfg(feature = "linux-direct-io")]
-struct CopyRange {
-    input_fd: std::os::unix::io::RawFd,
-    start: u64,
-    len: u64,
-}
-
-#[cfg(feature = "linux-direct-io")]
-impl CopyRange {
-    fn new(input_fd: std::os::unix::io::RawFd) -> Self {
-        Self { input_fd, start: 0, len: 0 }
-    }
-
-    fn extend(&mut self, frame_start: u64, frame_len: u64) {
-        if self.len == 0 {
-            self.start = frame_start;
-            self.len = frame_len;
-        } else {
-            debug_assert_eq!(self.start + self.len, frame_start);
-            self.len += frame_len;
-        }
-    }
-
-    fn flush(
-        &mut self,
-        writer: &mut PbfWriter<crate::file_writer::FileWriter>,
-    ) -> Result<()> {
-        if self.len > 0 {
-            writer.write_raw_copy(self.input_fd, self.start, self.len)?;
-            self.len = 0;
-        }
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Pass 2b: Passthrough path (indexdata present)
-// ---------------------------------------------------------------------------
-
-/// Read raw header blob, build output header with `LocationsOnWays`.
-fn read_header_raw<R: Read>(
-    reader: &mut R,
-    file_offset: &mut u64,
+/// Walk all blob headers and build the schedule. The first OsmHeader
+/// blob is consumed and used to build the output header bytes.
+fn build_schedule(
+    input: &Path,
     overrides: &HeaderOverrides,
-) -> Result<(Vec<u8>, bool)> {
-    while let Some(frame) = read_raw_frame(reader, file_offset)? {
-        if frame.blob_type == BlobKind::OsmHeader {
-            let header = decode_blob_to_headerblock(frame.blob_bytes())?;
-            let sorted = header.is_sorted();
-            let header_bytes = build_output_header(&header, true, overrides, |hb| {
-                hb.optional_feature("LocationsOnWays")
-            })?;
-            return Ok((header_bytes, sorted));
+    keep_untagged_nodes: bool,
+) -> Result<(Vec<BlobDescriptor>, Vec<u8>, std::sync::Arc<std::fs::File>)> {
+    let mut walker = HeaderWalker::open(input)?;
+    let mut header_bytes: Option<Vec<u8>> = None;
+    let mut schedule: Vec<BlobDescriptor> = Vec::new();
+    let mut seq: usize = 0;
+
+    while let Some(meta) = walker.next_header()? {
+        match meta.blob_type {
+            BlobKind::OsmHeader => {
+                let mut data_buf: Vec<u8> = vec![0; meta.data_size];
+                walker
+                    .shared_file()
+                    .read_exact_at(&mut data_buf, meta.data_offset)
+                    .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                let header = crate::blob::decode_blob_to_headerblock(&data_buf)?;
+                let bytes = build_output_header(&header, true, overrides, |hb| {
+                    hb.optional_feature("LocationsOnWays")
+                })?;
+                header_bytes = Some(bytes);
+            }
+            BlobKind::Unknown(_) => continue,
+            BlobKind::OsmData => {
+                let kind = meta.index.as_ref().map(|idx| idx.kind);
+                let count = meta.index.as_ref().map_or(0, |idx| idx.count);
+
+                let is_way_blob = matches!(kind, Some(ElemKind::Way));
+                let is_passthrough = matches!(kind, Some(ElemKind::Relation))
+                    || matches!(kind, Some(ElemKind::Node) if keep_untagged_nodes);
+
+                schedule.push(BlobDescriptor {
+                    seq,
+                    frame_offset: meta.frame_start,
+                    frame_size: meta.frame_size,
+                    data_offset: meta.data_offset,
+                    data_size: meta.data_size,
+                    is_way_blob,
+                    is_passthrough,
+                    kind,
+                    count,
+                });
+                seq += 1;
+            }
         }
     }
-    Err("no OSMHeader blob found".into())
+
+    let header_bytes = header_bytes.ok_or_else(|| -> Box<dyn std::error::Error> {
+        "no OSMHeader blob found".into()
+    })?;
+    let shared_file = std::sync::Arc::clone(walker.shared_file());
+    Ok((schedule, header_bytes, shared_file))
+}
+
+/// Per-worker scratch reused across decode descriptors.
+struct WorkerScratch {
+    read_buf: Vec<u8>,
+    decompress_buf: Vec<u8>,
+    bb: BlockBuilder,
+    refs_buf: Vec<i64>,
+    locations_buf: Vec<(i32, i32)>,
+    pool: std::sync::Arc<DecompressPool>,
+    way_scratch: WayReframeScratch,
+    reframe_output: Vec<u8>,
+    output: Vec<OwnedBlock>,
+}
+
+impl WorkerScratch {
+    fn new() -> Self {
+        Self {
+            read_buf: Vec::new(),
+            decompress_buf: Vec::new(),
+            bb: BlockBuilder::new(),
+            refs_buf: Vec::new(),
+            locations_buf: Vec::new(),
+            pool: DecompressPool::new(),
+            way_scratch: WayReframeScratch::default(),
+            reframe_output: Vec::new(),
+            output: Vec::new(),
+        }
+    }
+}
+
+/// Decode one descriptor. Way blobs go through the wire-format
+/// reframe; everything else (Node decode, Unknown decode) goes through
+/// the existing `PrimitiveBlock` + `BlockBuilder` path.
+fn decode_one(
+    desc: &BlobDescriptor,
+    file: &std::sync::Arc<std::fs::File>,
+    node_index: &NodeIndex,
+    keep_untagged_nodes: bool,
+    relation_member_node_ids: Option<&IdSet>,
+    scratch: &mut WorkerScratch,
+) -> std::result::Result<(Vec<OwnedBlock>, Stats), String> {
+    scratch.read_buf.resize(desc.data_size, 0);
+    file.read_exact_at(&mut scratch.read_buf, desc.data_offset)
+        .map_err(|e| format!("pass 2 pread: {e}"))?;
+    scratch.output.clear();
+
+    if desc.is_way_blob {
+        decompress_blob_raw(&scratch.read_buf, &mut scratch.decompress_buf)
+            .map_err(|e| e.to_string())?;
+        let stats = reframe_way_blob_with_locations(
+            &scratch.decompress_buf,
+            node_index,
+            &mut scratch.reframe_output,
+            &mut scratch.way_scratch,
+        )?;
+        let index = BlobIndex {
+            kind: ElemKind::Way,
+            min_id: stats.min_way_id,
+            max_id: stats.max_way_id,
+            count: stats.way_count,
+            bbox: None,
+        };
+        scratch
+            .output
+            .push((std::mem::take(&mut scratch.reframe_output), index, None));
+        let block_stats = Stats {
+            ways_written: stats.way_count,
+            missing_locations: stats.missing_locations,
+            blobs_decoded: 1,
+            ..Stats::default()
+        };
+        return Ok((std::mem::take(&mut scratch.output), block_stats));
+    }
+
+    // Non-way decode (Node decode when keep_untagged_nodes=false; Unknown).
+    // Goes through the WireBlob -> Bytes path so the existing
+    // process_block / BlockBuilder pipeline runs unchanged.
+    let wire_blob = crate::blob::WireBlob::parse_slice(&scratch.read_buf)
+        .map_err(|e| e.to_string())?;
+    let bytes = crate::blob::decompress_blob(&wire_blob, Some(&scratch.pool))
+        .map_err(|e| e.to_string())?;
+    let block = parse_primitive_block_from_bytes_owned(&bytes)
+        .map_err(|e| e.to_string())?;
+    let block_stats = process_block(
+        &block,
+        &mut scratch.bb,
+        &mut scratch.output,
+        node_index,
+        keep_untagged_nodes,
+        relation_member_node_ids,
+        &mut scratch.refs_buf,
+        &mut scratch.locations_buf,
+    )?;
+    flush_local(&mut scratch.bb, &mut scratch.output)?;
+    let mut block_stats = block_stats;
+    block_stats.blobs_decoded = 1;
+    Ok((std::mem::take(&mut scratch.output), block_stats))
 }
 
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(super) fn write_output_passthrough(
     input: &Path,
     output: &Path,
@@ -251,259 +246,175 @@ pub(super) fn write_output_passthrough(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<Stats> {
-    let mut stats = Stats::default();
+    let (schedule, header_bytes, shared_file) =
+        build_schedule(input, overrides, keep_untagged_nodes)?;
 
-    let mut reader = FileReader::open(input, direct_io)?;
-    let mut file_offset: u64 = 0;
-    let (header_bytes, _sorted) = read_header_raw(&mut reader, &mut file_offset, overrides)?;
-    let mut writer = writer_from_header_bytes_parallel(output, compression, &header_bytes, direct_io, false)?;
+    let mut writer = writer_from_header_bytes_parallel(
+        output, compression, &header_bytes, direct_io, false,
+    )?;
 
-    // Open second handle for copy_file_range (explicit offsets, thread-safe).
-    #[cfg(feature = "linux-direct-io")]
-    let (_copy_fd_file, use_copy_range) = {
-        let f = FileReader::buffered(input)?;
-        (f, !direct_io)
-    };
-    #[cfg(feature = "linux-direct-io")]
-    let mut copy_range = {
-        let fd = _copy_fd_file.raw_fd();
-        CopyRange::new(fd)
-    };
+    let decode_threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(4);
 
-    let mut batch: Vec<BatchSlot> = Vec::with_capacity(BATCH_MAX_BLOBS);
-    let mut batch_bytes: usize = 0;
-    // Coalescing buffer for non-copy-range passthrough (without linux-direct-io,
-    // or when copy_file_range is incompatible with O_DIRECT output).
-    let mut passthrough_chunks: Vec<Vec<u8>> = Vec::new();
-    // Per-batch counter survives SIGKILL inside pass 2; sidecar reads
-    // the latest value to know how far the loop got.
-    let mut batches_dispatched: i64 = 0;
+    // Partition: passthrough items are pre-seeded into the reorder
+    // buffer at their global seq positions; decode items go through
+    // the worker channel.
+    let (decode_items, passthrough_items): (Vec<BlobDescriptor>, Vec<BlobDescriptor>) =
+        schedule.into_iter().partition(|d| !d.is_passthrough);
 
-    while let Some(header) = read_blob_header(&mut reader, &mut file_offset)? {
-        if header.blob_type != BlobKind::OsmData {
-            skip_blob_data(&mut reader, header.data_size, &mut file_offset)?;
-            continue;
-        }
+    type DecodedItem = (usize, std::result::Result<(Vec<OwnedBlock>, Stats), String>);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<BlobDescriptor>(16);
+    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
+    let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<DecodedItem>(32);
 
-        let kind = header.index.as_ref().map(|idx| idx.kind);
-        // `kind == None` happens on `--force` against non-indexed input.
-        // Both match arms below require `Some(...)`, so `is_passthrough`
-        // is false and the blob falls into the decode batch path below,
-        // where ordering is preserved implicitly (file-order decode).
-        // The "flush before passthrough" invariant is therefore
-        // vacuously satisfied for the non-indexed --force case.
-        let is_passthrough = matches!(kind, Some(ElemKind::Relation))
-            || matches!(kind, Some(ElemKind::Node) if keep_untagged_nodes);
+    let batches_dispatched = AtomicI64::new(0);
 
-        if is_passthrough {
-            // Flush pending decode batch before writing passthrough blobs to
-            // preserve input element ordering (nodes → ways → relations).
-            // Without this, the last decode batch (ways) could be written after
-            // passthrough blobs (relations) at the type boundary.
-            if !batch.is_empty() {
-                #[cfg(feature = "linux-direct-io")]
-                copy_range.flush(&mut writer)?;
-                flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
-                let batch_stats = process_slot_batch(
-                    &batch,
-                    &mut writer,
-                    node_index,
-                    keep_untagged_nodes,
-                    relation_member_node_ids,
-                )?;
-                stats.merge(&batch_stats);
-                batch.clear();
-                batch_bytes = 0;
-                batches_dispatched += 1;
-                crate::debug::emit_counter("altw_pass2_batches_dispatched", batches_dispatched);
-            }
+    let mut total_stats = Stats::default();
 
-            // Update stats from indexdata.
-            if let Some(ref idx) = header.index {
-                match idx.kind {
-                    ElemKind::Node => {
-                        stats.nodes_read += idx.count;
-                        stats.nodes_written += idx.count;
-                    }
-                    ElemKind::Relation => {
-                        stats.relations_written += idx.count;
-                    }
-                    ElemKind::Way => {}
+    std::thread::scope(|scope| -> Result<()> {
+        // Dispatcher: feed only decode-eligible descriptors into the
+        // worker channel. Passthrough descriptors bypass workers and
+        // never travel through this channel.
+        scope.spawn(move || {
+            for desc in decode_items {
+                if desc_tx.send(desc).is_err() {
+                    break;
                 }
             }
-            stats.blobs_passthrough += 1;
+        });
 
-            // With copy_file_range: skip blob data, extend kernel copy range.
-            // Without: read full frame and coalesce into userspace buffer.
-            #[cfg(feature = "linux-direct-io")]
-            if use_copy_range {
-                skip_blob_data(&mut reader, header.data_size, &mut file_offset)?;
-                copy_range.extend(header.frame_start, header.frame_len as u64);
-            }
-            #[cfg(feature = "linux-direct-io")]
-            if !use_copy_range {
-                let mut frame = read_blob_data(&mut reader, header, &mut file_offset)?;
-                coalesce_passthrough(&mut frame, &mut passthrough_chunks);
-            }
-            #[cfg(not(feature = "linux-direct-io"))]
-            {
-                let mut frame = read_blob_data(&mut reader, header, &mut file_offset)?;
-                coalesce_passthrough(&mut frame, &mut passthrough_chunks);
-            }
-        } else {
-            // Flush any pending copy range before decoding - the next passthrough
-            // blob may not be contiguous with the previous one (decode blobs in
-            // between break contiguity).
-            #[cfg(feature = "linux-direct-io")]
-            copy_range.flush(&mut writer)?;
-            flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
-            // Decode: read full frame, classify into batch slot.
-            let frame = read_blob_data(&mut reader, header, &mut file_offset)?;
-            stats.blobs_decoded += 1;
-            batch_bytes += frame.frame_bytes.len();
-            match kind {
-                Some(ElemKind::Node) => batch.push(BatchSlot::Node(frame)),
-                Some(ElemKind::Way) => batch.push(BatchSlot::Way(frame)),
-                _ => batch.push(BatchSlot::Unknown(frame)),
-            }
+        for _ in 0..decode_threads {
+            let rx = std::sync::Arc::clone(&desc_rx);
+            let tx = decoded_tx.clone();
+            let file = std::sync::Arc::clone(&shared_file);
+            scope.spawn(move || {
+                let mut scratch = WorkerScratch::new();
+                loop {
+                    let desc = {
+                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match guard.recv() {
+                            Ok(d) => d,
+                            Err(_) => break,
+                        }
+                    };
+                    let result = decode_one(
+                        &desc,
+                        &file,
+                        node_index,
+                        keep_untagged_nodes,
+                        relation_member_node_ids,
+                        &mut scratch,
+                    );
+                    if tx.send((desc.seq, result)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(desc_rx);
+        drop(decoded_tx);
+
+        // Consumer: reorder + write. Pre-seed passthrough items at
+        // their global seq positions; decode results arrive on
+        // `decoded_rx` and are inserted by seq. The drain pops only
+        // contiguous ready items so input element ordering (nodes ->
+        // ways -> relations) is preserved.
+        enum ConsumerItem {
+            Decoded(std::result::Result<(Vec<OwnedBlock>, Stats), String>),
+            Passthrough { frame_offset: u64, frame_size: usize, count: u64, kind: Option<ElemKind> },
         }
 
-        // Dispatch when byte budget reached or batch is full.
-        if batch.len() >= BATCH_MAX_BLOBS
-            || (batch.len() >= BATCH_MIN_BLOBS && batch_bytes >= BATCH_BYTE_BUDGET)
-        {
-            #[cfg(feature = "linux-direct-io")]
-            copy_range.flush(&mut writer)?;
-            flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
-            let batch_stats = process_slot_batch(
-                &batch,
-                &mut writer,
-                node_index,
-                keep_untagged_nodes,
-                relation_member_node_ids,
-            )?;
-            stats.merge(&batch_stats);
-            batch.clear();
-            batch_bytes = 0;
-            batches_dispatched += 1;
-            crate::debug::emit_counter("altw_pass2_batches_dispatched", batches_dispatched);
-        }
-    }
+        let mut reorder: ReorderBuffer<ConsumerItem> =
+            ReorderBuffer::with_capacity(passthrough_items.len() + decode_threads);
 
-    // Flush remaining decode batch, then passthrough.
-    if !batch.is_empty() {
-        let batch_stats = process_slot_batch(
-            &batch,
-            &mut writer,
-            node_index,
-            keep_untagged_nodes,
-            relation_member_node_ids,
-        )?;
-        stats.merge(&batch_stats);
-        batches_dispatched += 1;
-        crate::debug::emit_counter("altw_pass2_batches_dispatched", batches_dispatched);
-    }
-    #[cfg(feature = "linux-direct-io")]
-    copy_range.flush(&mut writer)?;
-    flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
+        for desc in &passthrough_items {
+            reorder.push(
+                desc.seq,
+                ConsumerItem::Passthrough {
+                    frame_offset: desc.frame_offset,
+                    frame_size: desc.frame_size,
+                    count: desc.count,
+                    kind: desc.kind,
+                },
+            );
+        }
+
+        let mut frame_read_buf: Vec<u8> = Vec::new();
+
+        let drain = |reorder: &mut ReorderBuffer<ConsumerItem>,
+                     total_stats: &mut Stats,
+                     frame_read_buf: &mut Vec<u8>,
+                     writer: &mut PbfWriter<crate::file_writer::FileWriter>|
+         -> Result<()> {
+            while let Some(item) = reorder.pop_ready() {
+                match item {
+                    ConsumerItem::Decoded(result) => {
+                        let (blocks, block_stats) =
+                            result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                        total_stats.merge(&block_stats);
+                        for (block_bytes, index, tagdata) in blocks {
+                            writer.write_primitive_block_owned(
+                                block_bytes, index, tagdata.as_deref(),
+                            )?;
+                        }
+                        let n = batches_dispatched.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        crate::debug::emit_counter("altw_pass2_blobs_dispatched", n);
+                    }
+                    ConsumerItem::Passthrough { frame_offset, frame_size, count, kind } => {
+                        frame_read_buf.resize(frame_size, 0);
+                        shared_file
+                            .read_exact_at(frame_read_buf, frame_offset)
+                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                        writer.write_raw_owned(std::mem::replace(
+                            frame_read_buf,
+                            Vec::with_capacity(frame_size),
+                        ))?;
+                        total_stats.blobs_passthrough += 1;
+                        match kind {
+                            Some(ElemKind::Node) => {
+                                total_stats.nodes_read += count;
+                                total_stats.nodes_written += count;
+                            }
+                            Some(ElemKind::Relation) => {
+                                total_stats.relations_written += count;
+                            }
+                            Some(ElemKind::Way) | None => {
+                                // Ways never pass through (they need
+                                // location splicing). `None` means a
+                                // blob with no indexdata reached the
+                                // consumer as passthrough, which the
+                                // schedule filter excludes by
+                                // construction (only Relation/Node
+                                // can be passthrough). Stats untouched.
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        };
+
+        // Drain any passthrough prefix before the first decode result.
+        drain(&mut reorder, &mut total_stats, &mut frame_read_buf, &mut writer)?;
+
+        loop {
+            let msg = decoded_rx.recv();
+            let (seq_num, item) = match msg {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            reorder.push(seq_num, ConsumerItem::Decoded(item));
+            drain(&mut reorder, &mut total_stats, &mut frame_read_buf, &mut writer)?;
+        }
+
+        // Final drain for passthrough tails (relations sit at EOF in
+        // sorted PBFs - no trailing decode push to trigger pop_ready).
+        drain(&mut reorder, &mut total_stats, &mut frame_read_buf, &mut writer)?;
+
+        Ok(())
+    })?;
 
     writer.flush()?;
-    Ok(stats)
-}
-
-/// Process a batch of slots in parallel: decompress, transform, write.
-///
-/// Way slots take the wire-format reframe path: decompress -> walk
-/// PrimitiveBlock wire format -> for each way append packed lat / lon
-/// fields built from `NodeIndex::get` lookups -> compress + write. No
-/// `BlockBuilder`, no `StringTable::add`, no Info decode / encode, no
-/// ref redelta, no tag re-intern. Lifted from `external/stage4.rs`.
-///
-/// Node and Unknown slots still take the full
-/// PrimitiveBlock + `BlockBuilder` path: the node arm filters untagged
-/// nodes and re-encodes (the wire-format equivalent is a separate
-/// optimization, not in this commit).
-///
-/// Way refs resolve via inline `NodeIndex::get` against either the
-/// dense or sparse index. The previous sparse-only pre-resolve
-/// (decompress all, then sort refs by mmap offset, then sequential
-/// scan) was a serial step that capped pass 2 at ~4 cores; inline
-/// lookups scale with the rayon worker count instead.
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn process_slot_batch(
-    batch: &[BatchSlot],
-    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
-    node_index: &NodeIndex,
-    keep_untagged_nodes: bool,
-    relation_member_node_ids: Option<&IdSet>,
-) -> Result<Stats> {
-    type SlotResult = std::result::Result<(Vec<OwnedBlock>, Stats), String>;
-
-    let results: Vec<SlotResult> = batch
-        .par_iter()
-        .map_init(
-            || {
-                (
-                    BlockBuilder::new(),
-                    Vec::<OwnedBlock>::new(),
-                    Vec::<i64>::new(),
-                    Vec::<(i32, i32)>::new(),
-                    DecompressPool::new(),
-                    WayReframeScratch::default(),
-                    Vec::<u8>::new(),
-                    Vec::<u8>::new(),
-                )
-            },
-            |(bb, output, refs_buf, locations_buf, pool, way_scratch, decompress_buf, reframe_output), slot| {
-                output.clear();
-
-                if let BatchSlot::Way(frame) = slot {
-                    decompress_blob_raw(frame.blob_bytes(), decompress_buf)
-                        .map_err(|e| e.to_string())?;
-                    let stats = reframe_way_blob_with_locations(
-                        decompress_buf, node_index, reframe_output, way_scratch,
-                    )?;
-                    let index = BlobIndex {
-                        kind: ElemKind::Way,
-                        min_id: stats.min_way_id,
-                        max_id: stats.max_way_id,
-                        count: stats.way_count,
-                        bbox: None,
-                    };
-                    output.push((std::mem::take(reframe_output), index, None));
-                    let block_stats = Stats {
-                        ways_written: stats.way_count,
-                        missing_locations: stats.missing_locations,
-                        blobs_decoded: 1,
-                        ..Stats::default()
-                    };
-                    return Ok((std::mem::take(output), block_stats));
-                }
-
-                let wire_blob = WireBlob::parse_slice(slot.frame().blob_bytes())
-                    .map_err(|e| e.to_string())?;
-                let bytes = decompress_blob(&wire_blob, Some(pool))
-                    .map_err(|e| e.to_string())?;
-                let block = parse_primitive_block_from_bytes_owned(&bytes)
-                    .map_err(|e| e.to_string())?;
-
-                let block_stats = process_block(
-                    &block, bb, output, node_index,
-                    keep_untagged_nodes, relation_member_node_ids,
-                    refs_buf, locations_buf,
-                )?;
-
-                flush_local(bb, output)?;
-                Ok((std::mem::take(output), block_stats))
-            },
-        )
-        .collect();
-
-    let mut total = Stats {
-        nodes_read: 0, nodes_written: 0, nodes_dropped: 0,
-        ways_written: 0, relations_written: 0, missing_locations: 0,
-        blobs_passthrough: 0, blobs_decoded: 0,
-    };
-    drain_batch_results(results, writer, |s| total.merge(&s))?;
-    Ok(total)
+    Ok(total_stats)
 }

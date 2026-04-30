@@ -226,7 +226,66 @@ Result:
 
 Japan sparse went from 1.5x slower than japan dense to 2.5x faster.
 
-### Switch ALTW pass 2 writer to `to_path_parallel` - landed (this commit)
+### Descriptor-first pass 2 pipeline - landed (this commit)
+
+`passthrough.rs::write_output_passthrough` rewritten end-to-end as a
+descriptor-first parallel pipeline mirroring `external/stage4.rs`:
+
+  HeaderWalker -> Vec<BlobDescriptor> -> partition into decode +
+  passthrough -> dispatcher thread feeds decode descriptors via a
+  bounded channel (16-deep) -> N decode worker threads pread +
+  decompress + reframe (way) or PrimitiveBlock + BlockBuilder
+  (non-way) and send (seq, result) on a 32-deep result channel ->
+  consumer pre-seeds passthrough items in a `ReorderBuffer` at
+  their global seq positions, drains contiguous ready items as
+  decoded results arrive, calls `write_raw_owned` for passthrough
+  / `write_primitive_block_owned` for decoded.
+
+Replaces the old read-batch-rayon-drain stop-and-wait loop:
+read N blobs into batch -> par_iter decode -> drain to writer ->
+read next N. Read + decode + write never overlapped. The new
+shape lets dispatcher reads, worker decodes, and writer-pool
+compresses + writes all run concurrently; raw-frame retention
+drops from a ~128-blob batch to channel depth (~32 in flight)
+plus per-worker buffers.
+
+Removed the userspace passthrough coalescing buffer
+(`flush_passthrough_buf`, `coalesce_passthrough`) and the
+`CopyRange` helper from this path - the consumer now hands each
+passthrough frame directly to the writer's pipelined raw path
+(equivalent to stage 4's choice). `BATCH_BYTE_BUDGET`,
+`BATCH_MIN_BLOBS`, `BATCH_MAX_BLOBS` constants in
+`commands/mod.rs` had only this caller and were dropped.
+
+Result (japan sparse, plantasjen 2026-04-30, dirty bench best of 3):
+
+| Metric | post `to_path_parallel` | post descriptor-first |
+|--------|-------------------------|-----------------------|
+| Pass 2 wall | 7.5 s | 7.5 s |
+| Pass 2 peak threads | 42 | 65 |
+| Pass 2 voluntary cs | 5,486 | 13,583 |
+| Pass 2 peak anon | 1.43 GB | 1.64 GB |
+| Disk write | 2547 MB | 2547 MB |
+| Total japan sparse wall | 14.5 s | 14.7 s |
+
+Wall is unchanged at japan because we were already CPU-bound on
+pass 2 (avg cores ~20 of 22 available); the new shape adds threads
+and channel queueing but cannot reduce CPU work, only overlap it.
+The wins are reserved for planet scale where read + decode + write
+overlap actually matters and where the writer pool (now able to
+fill) is the new ceiling.
+
+The reviewers' note about `copy_file_range` for contiguous
+passthrough runs was deliberately not pursued: stage 4 (also
+planet-recommended) lives without it; if measurement shows it is
+the next pass 2 ceiling we can add the `write_raw_copy` opt-in
+later.
+
+Cross-validation passed (`brokkr verify
+add-locations-to-ways --dataset denmark`): dense / sparse /
+external all produce byte-identical output.
+
+### Switch ALTW pass 2 writer to `to_path_parallel` - landed `7169216`
 
 `writer_from_header_bytes_parallel` and `writer_from_header_parallel`
 generalize the existing `writer_for_apply_changes` shape (renamed to
@@ -532,7 +591,7 @@ pass 2 structural items) are independent of the framing question.
 
 ### Pass 2 dispatch and writer
 
-- Replace the read-batch-rayon-drain stop-and-wait loop at
+- ~~Replace the read-batch-rayon-drain stop-and-wait loop at
   `src/commands/altw/passthrough.rs:280` with a descriptor-first
   parallel pipeline mirroring `external/stage4.rs:230+`:
   `HeaderWalker` builds the descriptor schedule (cheap, no body
@@ -545,7 +604,10 @@ pass 2 structural items) are independent of the framing question.
   channel depth + per-worker buffers. The current
   `flush before passthrough` invariant
   (`passthrough.rs:301`) becomes "drain workers in order before
-  the consumer ever switches modes." (Reviewers 1, 2, 3.)
+  the consumer ever switches modes." (Reviewers 1, 2, 3.)~~
+  **Landed (this commit) - see "Landed work" above. Japan: pass 2
+  wall flat (CPU-bound saturation already). Wins reserved for
+  planet. `copy_file_range` deferred - stage 4 lives without it.**
 - ~~ALTW pass 2 currently routes through `to_path` (single-threaded
   write thread) via `writer_from_header_bytes`
   (`src/commands/mod.rs:352`); apply-changes already defaults to

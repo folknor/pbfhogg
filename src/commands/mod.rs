@@ -34,15 +34,6 @@ pub(crate) type Result<T> = crate::BoxResult<T>;
 /// Number of decoded `PrimitiveBlock`s collected before dispatching to rayon.
 pub(crate) const BATCH_SIZE: usize = 64;
 
-/// Maximum bytes of raw blob data in a single merge/rewrite batch.
-pub(crate) const BATCH_BYTE_BUDGET: usize = 128 * 1024 * 1024;
-
-/// Minimum blobs per batch (avoids rayon overhead on tiny batches).
-pub(crate) const BATCH_MIN_BLOBS: usize = 8;
-
-/// Maximum blobs per batch (bounds per-batch memory).
-pub(crate) const BATCH_MAX_BLOBS: usize = 128;
-
 /// Consume `PrimitiveBlock` results in fixed-size batches.
 ///
 /// Each incoming block result is propagated with `?`; successful blocks are

@@ -13,7 +13,7 @@ use crate::osc::parse_osc_file;
 use crate::writer::Compression;
 
 use crate::commands::{
-    build_output_header, require_indexdata, writer_for_apply_changes, HeaderOverrides,
+    build_output_header, require_indexdata, writer_from_header_bytes_parallel, HeaderOverrides,
 };
 use crate::read::raw_frame::read_raw_frame;
 
@@ -278,7 +278,7 @@ pub fn merge(
     let header_read_ms = header_start.elapsed().as_millis().try_into().unwrap_or(i64::MAX);
 
     let writer_setup_start = std::time::Instant::now();
-    let mut writer = writer_for_apply_changes(
+    let mut writer = writer_from_header_bytes_parallel(
         output_pbf,
         compression,
         &header_bytes,

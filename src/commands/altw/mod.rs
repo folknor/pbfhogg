@@ -24,7 +24,8 @@ use crate::{Element, ElementReader, MemberId, PrimitiveBlock};
 
 use super::{
     drain_batch_results, ensure_node_capacity_local, ensure_relation_capacity_local,
-    ensure_way_capacity_local, require_indexdata, writer_from_header, HeaderOverrides,
+    ensure_way_capacity_local, require_indexdata, writer_from_header, writer_from_header_parallel,
+    HeaderOverrides,
 };
 use crate::idset::IdSet;
 
@@ -520,7 +521,7 @@ fn write_output_decode_all(
     let mut stats = Stats::default();
 
     let reader = ElementReader::open(input, direct_io)?;
-    let mut writer = writer_from_header(
+    let mut writer = writer_from_header_parallel(
         output,
         compression,
         reader.header(),

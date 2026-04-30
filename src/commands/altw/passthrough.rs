@@ -24,7 +24,7 @@ use crate::writer::{Compression, PbfWriter};
 
 use crate::commands::{
     build_output_header, drain_batch_results, flush_local, flush_passthrough_buf,
-    writer_from_header_bytes, HeaderOverrides, BATCH_BYTE_BUDGET, BATCH_MAX_BLOBS,
+    writer_from_header_bytes_parallel, HeaderOverrides, BATCH_BYTE_BUDGET, BATCH_MAX_BLOBS,
     BATCH_MIN_BLOBS,
 };
 
@@ -256,7 +256,7 @@ pub(super) fn write_output_passthrough(
     let mut reader = FileReader::open(input, direct_io)?;
     let mut file_offset: u64 = 0;
     let (header_bytes, _sorted) = read_header_raw(&mut reader, &mut file_offset, overrides)?;
-    let mut writer = writer_from_header_bytes(output, compression, &header_bytes, direct_io, false)?;
+    let mut writer = writer_from_header_bytes_parallel(output, compression, &header_bytes, direct_io, false)?;
 
     // Open second handle for copy_file_range (explicit offsets, thread-safe).
     #[cfg(feature = "linux-direct-io")]

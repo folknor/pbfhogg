@@ -226,7 +226,21 @@ Result:
 
 Japan sparse went from 1.5x slower than japan dense to 2.5x faster.
 
-### Pass 2 wire-format way reframe - landed (this commit)
+### Switch ALTW pass 2 writer to `to_path_parallel` - landed (this commit)
+
+`writer_from_header_bytes_parallel` and `writer_from_header_parallel`
+generalize the existing `writer_for_apply_changes` shape (renamed to
+the new generic name, apply-changes' single caller updated). ALTW
+pass 2 (both `write_output_passthrough` and `write_output_decode_all`)
+now uses the parallel writer.
+
+At japan scale this is invisible on wall - the ~500 MB output is far
+below the ~1.5 GB/s NVMe single-thread write ceiling. Confirmed
+mechanically: pass 2 peak threads went from 26 to 42 (writer pool
+attached). Wall: 7.5 s -> 7.5 s. The win lands at planet scale where
+the output ceilings are ~50 GB and the serial writer is the floor.
+
+### Pass 2 wire-format way reframe - landed `cb31654`
 
 Lifted the wire-format reframe shape from `external/stage4.rs` into
 the dense / sparse pass 2 way arm. New file
@@ -532,11 +546,13 @@ pass 2 structural items) are independent of the framing question.
   `flush before passthrough` invariant
   (`passthrough.rs:301`) becomes "drain workers in order before
   the consumer ever switches modes." (Reviewers 1, 2, 3.)
-- ALTW pass 2 currently routes through `to_path` (single-threaded
+- ~~ALTW pass 2 currently routes through `to_path` (single-threaded
   write thread) via `writer_from_header_bytes`
   (`src/commands/mod.rs:352`); apply-changes already defaults to
   `to_path_parallel` (`src/commands/mod.rs:386`). Lifts the ~1.5
-  GB/s NVMe write ceiling. (Reviewers 2, 4.)
+  GB/s NVMe write ceiling. (Reviewers 2, 4.)~~ **Landed (this
+  commit) - see "Landed work" above. Japan: invisible (well below
+  the write ceiling). Win is reserved for planet scale.**
 - Skip output node blobs in the default
   `keep_untagged_nodes=false` mode when the blob has zero tagged
   nodes (cheap pre-scan of `dense_keys_vals` for any non-zero

@@ -379,11 +379,18 @@ pub(crate) fn writer_from_header_bytes(
     }
 }
 
-/// Open an output writer for `apply-changes`. Parallel writer is the
-/// default (winning or tying across the writer-backend matrix at
-/// germany / europe / planet); `--io-uring` and `--direct-io` remain
-/// as opt-in overrides.
-pub(crate) fn writer_for_apply_changes(
+/// Same as [`writer_from_header_bytes`] but uses the parallel writer
+/// (`PbfWriter::to_path_parallel`) instead of the single-thread
+/// `to_path` writer for the default (non-`--direct-io`,
+/// non-`--io-uring`) branch. Lifts the ~1.5 GB/s NVMe single-thread
+/// write ceiling.
+///
+/// Used by commands whose pass-2 is writer-bound at default `zlib:6`
+/// compression: apply-changes (winning across the writer-backend
+/// matrix at germany / europe / planet) and ALTW pass 2 (CPU savings
+/// from wire-format reframe were getting absorbed by the serial
+/// writer queue).
+pub(crate) fn writer_from_header_bytes_parallel(
     output: &Path,
     compression: Compression,
     header_bytes: &[u8],
@@ -411,6 +418,24 @@ pub(crate) fn writer_for_apply_changes(
     } else {
         Ok(PbfWriter::to_path_parallel(output, compression, header_bytes)?)
     }
+}
+
+/// Same as [`writer_from_header`] but uses the parallel writer for the
+/// default branch. See [`writer_from_header_bytes_parallel`] for the
+/// rationale.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn writer_from_header_parallel(
+    output: &Path,
+    compression: Compression,
+    header: &crate::HeaderBlock,
+    preserve_sorted: bool,
+    overrides: &HeaderOverrides,
+    configure: impl FnOnce(HeaderBuilder) -> HeaderBuilder,
+    direct_io: bool,
+    io_uring: bool,
+) -> Result<PbfWriter<FileWriter>> {
+    let header_bytes = build_output_header(header, preserve_sorted, overrides, configure)?;
+    writer_from_header_bytes_parallel(output, compression, &header_bytes, direct_io, io_uring)
 }
 
 /// Map Osmosis sentinel -1 to 0 (protobuf default for absent) in dense node

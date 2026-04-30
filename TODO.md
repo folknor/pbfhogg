@@ -261,20 +261,19 @@ mirror it if you expect SIGKILL on the first attempt.
   run with a different ID set surfaces the size up-front before
   pass 2 starts.
 
-- [ ] **`altw` dense / sparse path** (`src/commands/altw/mod.rs:485-510`
+- [ ] **`altw` sparse path** (`src/commands/altw/mod.rs:485-510`
   + `process_batch:692-736`). Identical par_iter+collect shape.
   Currently masked because `add-locations-to-ways --index-type auto`
   selects `external` for sorted+indexed planet inputs, and external
   uses entirely different scatter/gather code (`altw/external/`) -
   this pattern doesn't fire on the planet recommended path.
-  Forcing `--index-type dense` or `--index-type sparse` at planet
-  is the trigger. Same investigative discipline as getid above:
-  bench first, instrument the sidecar, identify the actual peak
-  phase before assuming the par_iter+collect step is the culprit.
-  Other altw stages also worth checking: any
-  `parallel_classify_accumulate` caller in the dense or sparse
-  pipelines is suspect at planet keep-rates (the documented
-  caution at `src/scan/classify.rs:300-317` lists the criteria).
+  Forcing `--index-type sparse` at planet is the trigger. Same
+  investigative discipline as getid above: bench first, instrument
+  the sidecar, identify the actual peak phase before assuming the
+  par_iter+collect step is the culprit. Other altw stages also worth
+  checking: any `parallel_classify_accumulate` caller in the sparse
+  pipeline is suspect at planet keep-rates (the documented caution
+  at `src/scan/classify.rs:300-317` lists the criteria).
 
 ### Other `parallel_classify_accumulate` callers (audit checklist)
 
@@ -521,7 +520,7 @@ export. The pieces exist in the codebase:
 - Geometry: `src/geo.rs` has point-in-polygon, ring assembly from way
   refs, Douglas-Peucker simplification
 - Coordinates: `Way::node_locations()` from enriched PBFs (ALTW output),
-  or inline coordinate resolution via the dense/external index
+  or inline coordinate resolution via the sparse/external index
 - Multipolygons: relation member assembly is in extract's smart strategy
 
 The export command would iterate elements, resolve geometry (points for
@@ -571,13 +570,13 @@ single-pass, tag expression and bbox filtering.
 
   (B) **Rename `--index-type` to `--mode`, and unify mode-like flag naming
   across the CLI.** Today we have:
-  - `add-locations-to-ways --index-type` (dense/sparse/external/auto)
+  - `add-locations-to-ways --index-type` (sparse/external/auto)
   - `extract --strategy` (simple/complete/smart)
-  - `bench-read --mode`, `bench-write --mode`, `bench-write --io-mode`
+  - `bench-read --mode`, `bench-write --writer`, `bench-merge --io-mode`
   - `diff --format` (text/osc) - semantically "output shape", different concept
 
   `--index-type` is misnamed (external isn't really an index), `--strategy`
-  and `--mode` are synonyms picked inconsistently, and `bench-*` already
+  and `--mode` are synonyms picked inconsistently, and `bench-read` already
   uses `--mode`. Unifying on `--mode` across add-locations-to-ways,
   extract, and the bench subcommands would make the CLI more regular at
   the cost of a breaking rename on two user-facing commands. `--format`
@@ -587,7 +586,7 @@ single-pass, tag expression and bbox filtering.
   Both decisions are breaking CLI changes; batch them into a single
   release note when we land them. No urgency - 0.3.0 ships with the
   current names.
-- [ ] Auto-selection: `--index-type auto` exists (dense vs external).
+- [ ] Auto-selection: `--index-type auto` exists (sparse vs external).
   Extend to other decisions: sequential vs pread-from-workers based on
   available RAM and blob count; compression level based on output target;
   batch size based on core count. Config or heuristic, not manual flags.
@@ -752,21 +751,20 @@ per-iteration allocations remain across the codebase, ordered by impact:
 **Milestone C: hardware-level tuning (where perf counters justify it)**
 
 - [ ] **4. Huge pages** - `MAP_HUGETLB` (2 MB pages) for large mmap'd
-  structures. Dense ALTW index (128 GB virtual, ~16 GB touched): 4 KB
-  pages cover 8 MB via TLB, 2 MB pages cover 4 GB. Geocode index mmap
-  reader, external join temp files. 5-15% speedup for random-access
-  patterns. Note: dense ALTW is deprecated at planet scale in favor of
-  external join. Requires hugepage availability (`sysctl` config) or
-  `madvise(MADV_HUGEPAGE)` for THP. Linux-only.
+  structures. Sparse ALTW rank-flat values file (japan 2 GB, europe
+  ~29 GB), geocode index mmap reader, external join temp files. 5-15%
+  speedup for random-access patterns. Requires hugepage availability
+  (`sysctl` config) or `madvise(MADV_HUGEPAGE)` for THP. Linux-only.
 
 - [ ] **5. NUMA-aware memory placement** - last by unanimous agreement
   (6/6). Only matters on multi-socket servers. Current benchmark host
   (plantasjen) is single-socket. Pread-from-workers pattern already has
   natural NUMA affinity (thread-local allocations, first-touch policy).
   `set_mempolicy(MPOL_BIND)` / `mbind()` for explicit placement.
-  Candidates: pipelined reader decode pool, dense ALTW index interleave,
-  external join scatter buffers. 10-20% on dual-socket, 0% on
-  single-socket. Requires per-host tuning and NUMA hardware to validate.
+  Candidates: pipelined reader decode pool, sparse ALTW rank-flat
+  interleave, external join scatter buffers. 10-20% on dual-socket,
+  0% on single-socket. Requires per-host tuning and NUMA hardware to
+  validate.
 
 **Separate track (GPU, independent of milestones A-C):**
 
@@ -806,15 +804,15 @@ per-iteration allocations remain across the codebase, ordered by impact:
   The codebase already does the most valuable composition (inline
   indexdata in all write paths). Multi-pass commands can't consume
   streams. See [notes/streaming-pipeline-composition.md](notes/streaming-pipeline-composition.md).
-- [ ] Dense ALTW compact rank-indexed array (same pattern as geocode builder -
-  better locality on hosts where dense currently works, reviewers split 1/8).
-  **Still relevant 2026-04-19**: dense is a fallback path (auto-select picks
-  External for sorted+indexed, dense only fires for non-canonical inputs),
-  but the rank-indexed layout is isomorphic to the geocode pass 2 pattern
-  (~16 GB contiguous vs scattered across 128 GB virtual) and would help
-  users with non-canonical PBFs. No current dense planet bench to measure
-  against; build and bench on a non-indexed/non-sorted planet variant if
-  prioritised.
+- [x] ~~Dense ALTW compact rank-indexed array~~ - CLOSED 2026-04-30 by
+  commit `c6f08ff` (sparse rank-indexed flat) + `b70dd8c` (dense removed).
+  The proposed rank-indexed layout landed as the new sparse encoding,
+  which dominated dense at every measured scale (japan 4.3x faster) and
+  worked in regimes dense did not (europe survives where dense OOMs);
+  dense was then removed entirely. Reviewer items "parallel pass 1" and
+  "rank-compacted index" would have converged dense to the same encoding,
+  same access pattern, same wall - so maintaining two near-identical
+  implementations was not earned.
 - [ ] Verify GeoJSON polygon format coverage for extract (does `--polygon`
   accept GeoJSON, or only .poly format?).
 - [ ] History-file support - decide in-scope or explicitly out-of-scope.

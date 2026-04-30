@@ -22,7 +22,7 @@ Select the node coordinate index strategy with `--index-type`:
 pbfhogg add-locations-to-ways input.osm.pbf -o output.osm.pbf --index-type auto
 ```
 
-Options: `dense` (default), `sparse`, `external`, `auto`. See [Advanced Topics](./advanced#add-locations-to-ways-index-types) for details on each strategy and when to use them.
+Options: `sparse` (default), `external`, `auto`. See [Advanced Topics](./advanced#add-locations-to-ways-index-types) for details on each strategy and when to use them.
 
 ## Output header metadata
 

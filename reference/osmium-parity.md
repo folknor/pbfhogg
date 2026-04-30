@@ -188,7 +188,7 @@ These osmium flags have no pbfhogg equivalent:
 | `--fsync` | Always enabled (no flag needed) |
 | `-H, --with-history` | Current-snapshot tool, no history file support |
 | `--buffer-data` | Pipelined writer handles buffering internally |
-| `--index-type` | `dense` (default), `sparse`, `external` (bounded memory, 3.9x faster than dense at planet), `auto` (external if sorted+indexed). Different valid values from osmium's `-i, --index-type`. |
+| `--index-type` | `sparse` (default), `external` (bounded memory, sequential I/O, only mode that survives at planet on memory-constrained hosts), `auto` (external if sorted+indexed, sparse otherwise). Different valid values from osmium's `-i, --index-type`. |
 
 ### Flags only pbfhogg has
 
@@ -201,7 +201,7 @@ These osmium flags have no pbfhogg equivalent:
 | `--generator` | Most write commands | Set writing program name in output header |
 | `--output-header` | Most write commands | Set replication header fields |
 | `--json` | inspect, check | Machine-readable output |
-| `--index-type` | add-locations-to-ways | `dense`, `sparse`, `external`, `auto` (different values from osmium's `-i`) |
+| `--index-type` | add-locations-to-ways | `sparse` (default), `external`, `auto` (different values from osmium's `-i`) |
 
 ## Commands pbfhogg doesn't have
 

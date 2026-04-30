@@ -198,7 +198,7 @@ pub fn add_locations_to_ways(
     overrides: &HeaderOverrides,
     index_type: IndexType,
 ) -> Result<Stats> {
-    // Auto-select: external if sorted + indexed, dense otherwise.
+    // Auto-select: external if sorted + indexed, sparse otherwise.
     let index_type = if index_type == IndexType::Auto {
         let reader = crate::ElementReader::open(input, direct_io)?;
         let sorted = reader.header().is_sorted();
@@ -246,9 +246,9 @@ pub fn add_locations_to_ways(
         if reader.header().is_sorted() {
             eprintln!(
                 "hint: this sorted indexed PBF is eligible for --index-type external, \
-                 which uses bounded memory and sequential I/O (3.9x faster than dense \
-                 at planet scale). Sparse is slower than both dense and external on \
-                 sorted inputs."
+                 which uses bounded memory and sequential I/O. External is faster than \
+                 sparse on sorted indexed inputs at every scale, and the only mode that \
+                 survives at planet on memory-constrained hosts."
             );
         }
     }

@@ -54,7 +54,7 @@ Zlib uses `zlib-rs` (pure Rust). No C compiler needed.
 
 ## Add-locations-to-ways index types
 
-`add-locations-to-ways` embeds node coordinates in ways. It supports four index strategies via `--index-type`:
+`add-locations-to-ways` embeds node coordinates in ways. It supports two index strategies (plus `auto`) via `--index-type`:
 
 ```sh
 pbfhogg add-locations-to-ways input.osm.pbf -o output.osm.pbf --index-type external
@@ -62,16 +62,15 @@ pbfhogg add-locations-to-ways input.osm.pbf -o output.osm.pbf --index-type exter
 
 | Type | Memory | Disk | Sorted required | Best for |
 |------|--------|------|-----------------|----------|
-| `dense` | 8 bytes/node slot (mmap) | none | no | Country-scale where working set fits in RAM |
-| `sparse` | ~540 MB fixed | ~16 GB values file | no | Memory-constrained hosts, no temp disk |
-| `external` | ~17 GB peak (planet) | ~300 GB temp (planet) | yes + indexdata | Planet-scale, 3.9x faster than dense |
-| `auto` | varies | varies | external if sorted+indexed, else dense | Recommended default |
+| `sparse` (default) | ~540 MB + IdSet/rank index | `referenced_count * 8` bytes (japan 2 GB, europe ~29 GB) | no | Small to europe scale; survives europe at ~6 minutes on a 27 GB-RAM host |
+| `external` | ~8.7 GB | ~256 GB (planet) | yes + indexdata | Planet-scale, the only mode that survives at planet on memory-constrained hosts |
+| `auto` | varies | varies | external if sorted+indexed, else sparse | Recommended default |
 
-**dense** is a direct-mapped mmap array indexed by node ID. Fastest when the working set fits in RAM. At planet scale (~16 GB touched), requires 30+ GB free memory to avoid page cache thrashing.
+**sparse** is a rank-indexed flat mmap array (~8 bytes per referenced node). Builds a referenced-id IdSet in pass 1, then writes locations in pass 2 indexed by rank within that set. Works on any PBF.
 
-**sparse** uses a Planetiler-inspired chunk-indexed array. Way lookups are batched and sorted by file offset, converting random I/O into sequential scans. About 1.85x slower than dense when everything fits in RAM (pure CPU overhead).
+**external** uses a rank-bucketed counting sort with parallel stages and bounded memory. Requires sorted input with indexdata. ~256 GB temp disk at planet scale.
 
-**external** uses a double radix permutation with bounded memory and all sequential I/O. Requires sorted input with indexdata. Planet (87 GB): 24 minutes, 17 GB peak memory, 3.9x faster than dense (which takes 96 minutes due to thrashing). Needs ~300 GB temp disk at planet scale.
+A previous `dense` mode (a direct-mapped mmap array indexed by node ID) was removed: the rank-indexed flat sparse layout dominated dense at every measured scale (japan 4.3x faster) and worked in regimes dense did not (europe survives where dense OOMs).
 
 ## Multi-extract
 

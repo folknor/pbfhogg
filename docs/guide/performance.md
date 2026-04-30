@@ -44,7 +44,7 @@ Denmark (487 MB, 59M elements, commit `6fc1283`, osmium from `23862d1`):
 | cat --type way (raw passthrough) | **0.24s** | 2.22s | **9.3x** |
 | inspect tags --type way (indexdata) | **0.4s** | 0.59s | **1.5x** |
 | getid (9 elements) | **0.6s** | 0.83s | **1.4x** |
-| add-locations-to-ways (dense) | **9.9s** | 12.1s | **1.2x** |
+| add-locations-to-ways (sparse) | **9.9s** | 12.1s | **1.2x** |
 | add-locations-to-ways (external) | **9.7s** | 12.1s | **1.2x** |
 
 The largest speedups come from blob passthrough (sort, apply-changes, cat --type) where pbfhogg avoids decompressing and re-compressing unmodified blobs entirely.
@@ -109,15 +109,15 @@ Generate an indexed PBF once with `pbfhogg cat`, then use it for all subsequent 
 
 ### Choose the right ALTW index type
 
-`add-locations-to-ways` supports three index strategies:
+`add-locations-to-ways` supports two index strategies (plus `auto`):
 
 | Type | Best for | Trade-off |
 |------|----------|-----------|
-| `dense` | Country-scale where working set fits in RAM | Fastest when it fits; thrashes at planet scale |
-| `sparse` | Memory-constrained hosts, no temp disk | ~540 MB RAM; ~1.85x slower than dense when everything fits |
-| `external` | Planet-scale, memory-constrained hosts | Bounded memory, all sequential I/O; needs sorted input + temp disk |
+| `sparse` (default) | Small to europe scale | Rank-indexed flat mmap (~8 bytes per referenced node); needs `referenced_count * 8` bytes of temp disk |
+| `external` | Planet-scale, memory-constrained hosts | Bounded memory, all sequential I/O; needs sorted input + indexdata + ~256 GB temp disk at planet |
+| `auto` | Recommended default | external if sorted+indexed, else sparse |
 
-At planet scale on a 30 GB machine, `external` is 3.9x faster than `dense` (24 min vs 96 min) because dense causes page cache thrashing.
+At planet scale on a 30 GB machine, `external` is the only mode that survives. A previous `dense` mode was removed: sparse rank-indexed flat dominates dense at every measured scale.
 
 ### O_DIRECT for planet-scale I/O
 

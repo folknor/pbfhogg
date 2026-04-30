@@ -765,6 +765,48 @@ fn altw_external_rejects_force_on_non_indexed() {
     );
 }
 
+/// `--index-type dense` was removed (commit `b70dd8c`) after the
+/// rank-indexed flat sparse layout dominated dense at every measured
+/// scale. The parser must surface a clear migration hint pointing at
+/// `sparse` rather than a generic "unknown index type" error, so users
+/// upgrading from older releases see *why* their flag stopped working
+/// and what to switch to.
+#[test]
+fn altw_dense_index_type_rejected_with_migration_hint() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+
+    let out = CliInvoker::new()
+        .arg("add-locations-to-ways")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--index-type")
+        .arg("dense")
+        .arg("--force")
+        .run();
+
+    assert!(
+        !out.status.success(),
+        "expected --index-type dense to be rejected, but it succeeded; stdout:\n{}\nstderr:\n{}",
+        out.stdout_str(),
+        out.stderr_str(),
+    );
+
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("dense") && stderr.contains("sparse"),
+        "expected migration hint mentioning both 'dense' (the removed type) and 'sparse' (the replacement), got stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("removed"),
+        "expected error to state dense was removed, got stderr:\n{stderr}",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Platform tier
 // ---------------------------------------------------------------------------

@@ -14,7 +14,7 @@
 //! - **Sorted PBF assumption.** Relies on indexdata `ElemKind::Way` for blob
 //!   filtering. Mixed-type blobs in unsorted PBFs could be mislabeled.
 
-use crate::Result;
+use crate::error::Result;
 
 /// Classification flags emitted by [`scan_way_geocode_tagged_refs`] per
 /// matching way. The caller combines these with its own

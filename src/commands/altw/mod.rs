@@ -355,9 +355,11 @@ fn build_node_index(
 ///
 /// Uses `build_classify_schedule(Way)` to obtain a way-only blob schedule
 /// via the pread-only `HeaderWalker`, then fans work out to
-/// `parallel_classify_phase` workers. Each worker decompresses one blob
-/// and emits the set of referenced node IDs; the main thread unions them
-/// into a single `IdSet`.
+/// `parallel_scan_blobs_raw` workers. Each worker decompresses one blob
+/// and walks the wire format directly via `scan_way_refs` - skipping
+/// `PrimitiveBlock` construction (no StringTable parse, no
+/// `(u32, u32)` group_ranges allocation). The main thread unions
+/// per-blob `Vec<i64>`s into a single `IdSet`.
 ///
 /// At planet scale (~2 B unique node refs) the union bitset costs ~1.6 GB.
 /// Per-blob refs are emitted into fresh `Vec<i64>`s that the main thread
@@ -375,23 +377,26 @@ fn collect_way_referenced_node_ids(input: &Path, _direct_io: bool) -> Result<IdS
         Some(crate::blob_meta::ElemKind::Way),
     )?;
     let mut referenced = IdSet::new();
-    crate::scan::classify::parallel_classify_phase(
+    crate::scan::classify::parallel_scan_blobs_raw(
         &shared_file,
         &schedule,
         None,
-        || (),
-        |block, _| {
+        || (Vec::<i64>::new(), Vec::<(usize, usize)>::new()),
+        |decompressed, (refs_buf, group_starts)| {
             let mut refs_vec: Vec<i64> = Vec::new();
-            for element in block.elements_skip_metadata() {
-                if let Element::Way(w) = element {
-                    for node_id in w.refs() {
+            crate::scan::way::scan_way_refs(
+                decompressed,
+                refs_buf,
+                group_starts,
+                |_way_id, refs| {
+                    for &node_id in refs {
                         if node_id >= 0 {
                             refs_vec.push(node_id);
                         }
                     }
-                }
-            }
-            refs_vec
+                },
+            )?;
+            Ok(refs_vec)
         },
         |_seq, refs_vec| {
             for &node_id in &refs_vec {

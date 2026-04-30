@@ -5,7 +5,7 @@
 //! closure on the decoded `PrimitiveBlock`. The consumer thread merges
 //! per-blob results.
 //!
-//! Two modes:
+//! Three modes:
 //!
 //! - [`parallel_classify_phase`]: per-blob result `R` is sent to the
 //!   consumer for each blob (worker holds only persistent scratch state
@@ -15,6 +15,12 @@
 //! - [`parallel_classify_accumulate`]: per-worker accumulator `S` is held
 //!   for the whole scan and merged once at completion. Use for sparse
 //!   paths where the accumulator has a known small bound.
+//!
+//! - [`parallel_scan_blobs_raw`]: same shape as `parallel_classify_phase`
+//!   but the worker hands the caller `&[u8]` of decompressed blob bytes,
+//!   skipping `PrimitiveBlock` construction. Use when the caller only
+//!   needs a small wire-format subset (a couple of fields per element)
+//!   and parsing the full block is wasted work.
 //!
 //! Schedule construction lives in [`build_classify_schedule`] and
 //! [`build_classify_schedules_split`].
@@ -268,6 +274,92 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
                             buf, &worker_pool, &mut st_scratch, &mut gr_scratch,
                         )?;
                         Ok(classify_ref(&block, &mut state))
+                    })();
+                    if tx.send((s, r)).is_err() { break; }
+                }
+            });
+        }
+        drop(desc_rx);
+        drop(result_tx);
+
+        for (seq, result) in result_rx {
+            merge(seq, result?);
+        }
+        Ok(())
+    })?;
+
+    Ok(())
+}
+
+/// Per-blob streaming scan over decompressed blob bytes (no `PrimitiveBlock`
+/// construction).
+///
+/// Same shape as [`parallel_classify_phase`] but the worker hands the
+/// caller `&[u8]` of decompressed blob bytes instead of a parsed
+/// `PrimitiveBlock`. Callers are expected to walk the wire format
+/// themselves via the helpers in `crate::scan::way`, `crate::scan::node`,
+/// `crate::scan::relation`, etc.
+///
+/// Use when the caller only needs a small subset of the blob's fields
+/// and parsing the full block (StringTable, group_ranges, dense_nodes
+/// columns) is wasted work. ALTW pass 0 (way-ref node-id collection)
+/// is the canonical caller: it iterates only `Way.refs()` and never
+/// touches strings or info, so going through `PrimitiveBlock` was
+/// dropping per-blob StringTable parse + `(u32, u32)` scratch
+/// allocations onto the hot path for nothing.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
+    shared_file: &std::sync::Arc<std::fs::File>,
+    schedule: &[ScheduleEntry],
+    threads: Option<usize>,
+    worker_init: impl Fn() -> S + Send + Sync,
+    classify: impl Fn(&[u8], &mut S) -> crate::error::Result<R> + Send + Sync,
+    mut merge: impl FnMut(usize, R),
+) -> Result<()> {
+    use std::os::unix::fs::FileExt as _;
+
+    if schedule.is_empty() { return Ok(()); }
+
+    let decode_threads = resolve_thread_count(threads);
+
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<ScheduleEntry>(16);
+    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
+    let (result_tx, result_rx) =
+        std::sync::mpsc::sync_channel::<(usize, crate::error::Result<R>)>(32);
+
+    std::thread::scope(|scope| -> Result<()> {
+        scope.spawn(move || {
+            for &item in schedule {
+                if desc_tx.send(item).is_err() { break; }
+            }
+        });
+
+        for _ in 0..decode_threads {
+            let rx = std::sync::Arc::clone(&desc_rx);
+            let tx = result_tx.clone();
+            let file = std::sync::Arc::clone(shared_file);
+            let classify_ref = &classify;
+            let worker_init_ref = &worker_init;
+            scope.spawn(move || {
+                let mut read_buf: Vec<u8> = Vec::new();
+                let mut decompress_buf: Vec<u8> = Vec::new();
+                let mut state = worker_init_ref();
+
+                loop {
+                    let (s, data_offset, data_size) = {
+                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match guard.recv() {
+                            Ok(d) => d,
+                            Err(_) => break,
+                        }
+                    };
+
+                    let r: crate::error::Result<R> = (|| {
+                        read_buf.resize(data_size, 0);
+                        file.read_exact_at(&mut read_buf, data_offset)
+                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
+                        classify_ref(&decompress_buf, &mut state)
                     })();
                     if tx.send((s, r)).is_err() { break; }
                 }

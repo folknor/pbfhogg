@@ -226,7 +226,35 @@ Result:
 
 Japan sparse went from 1.5x slower than japan dense to 2.5x faster.
 
-### Migrate rel-member scan to `parallel_classify_phase` - landed (this commit)
+### Pass 0 wire-only scan - landed (this commit)
+
+`collect_way_referenced_node_ids` now uses
+`parallel_scan_blobs_raw` (new helper in `scan/classify.rs`) +
+`scan_way_refs` from `scan/way.rs`. Workers walk the wire format
+directly and never construct a `PrimitiveBlock`: no StringTable
+parse, no `(u32, u32)` group_ranges scratch.
+
+Result (japan sparse, plantasjen 2026-04-30, dirty-bench best of 3):
+
+| Metric | post rel-member (`a8db8837`) | post wire-only |
+|--------|------------------------------|----------------|
+| Pass 0 parallel decode wall | 1.74 s | 1.78 s |
+| Pass 0 parallel decode avg cores | 5.3 | 4.5 |
+| Total japan sparse wall | 14.9 s | 15.2 s |
+
+Wall delta is within run-to-run variance at japan; the cores delta
+is the real signal - per-blob CPU work dropped enough that workers
+now idle waiting for descriptors. The reviewers (3 of 4) flagged
+this as a planet-scale win on the way-blob classify side, where
+the absolute CPU saved per blob compounds across ~50k way blobs.
+
+The new `parallel_scan_blobs_raw` helper is symmetric with
+`parallel_classify_phase` but exposes `&[u8]` decompressed bytes
+to the closure. Anticipates further wire-only callers (e.g. the
+relation-member wire-only scan that reviewers 3/4 flagged as
+orthogonal to the per-worker-IdSet migration above).
+
+### Migrate rel-member scan to `parallel_classify_phase` - landed `66cfa4a`
 
 `collect_relation_member_node_ids` now mirrors the
 tags-filter way-deps shape (`17b116c`): per-blob worker emits
@@ -236,13 +264,13 @@ memory to one IdSet plus per-blob transient vectors, not
 N-workers x per-worker IdSet. Set-union is commutative so the
 migration is correctness-preserving by construction.
 
-Result (japan sparse, plantasjen 2026-04-30, dirty-bench best of 3):
+Result (japan sparse, plantasjen 2026-04-30, best of 3 UUID `a8db8837`):
 
 | Metric | `8e0cef9` (pre) | post |
 |--------|-----------------|------|
 | Rel-member scan wall | 4.2 s | 0.76 s |
-| Rel-member scan peak anon | 4.3 GB | 0.81 GB |
-| Total japan sparse wall | 20.9 s | 17.4 s |
+| Rel-member scan peak anon | 4.3 GB | 0.82 GB |
+| Total japan sparse wall | 20.9 s | 14.9 s |
 
 Linear extrapolation at planet (was ~72 GB peak anon in 24 workers
 x ~3 GB): now bounded by one shared IdSet (~1.3 GB at planet) plus
@@ -338,12 +366,14 @@ pass 2 structural items) are independent of the framing question.
 
 ### Pass 0
 
-- Replace the current `parallel_classify_phase` body, which builds
+- ~~Replace the current `parallel_classify_phase` body, which builds
   full `PrimitiveBlock`s per blob just to iterate
   `block.elements_skip_metadata()` at `mod.rs:383`, with a wire-only
   scan via `scan_way_refs` (`src/scan/way.rs:78`). Drops per-blob
   StringTable parse and `(u32, u32)` scratch allocations entirely.
-  (Reviewers 1, 3, 4.)
+  (Reviewers 1, 3, 4.)~~ **Landed (this commit) - see "Landed work"
+  above. Japan: cores 5.3 -> 4.5, wall unchanged within variance.
+  Wins should compound at planet scale.**
 - Run pass 0 and the relation-member scan concurrently under
   `std::thread::scope`. They read disjoint blob types, both produce
   IdSets used by pass 2, and external already runs them overlapped.

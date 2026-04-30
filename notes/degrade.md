@@ -149,19 +149,43 @@ clears it. `LocationsOnWays` is dropped by `BlockBuilder` as on every
 other decode-path command in pbfhogg (`repack`, `sort`, `tags-filter`,
 etc.); `--strip-locations` makes the loss explicit.
 
-### Validated at scale (commit 48685ba, plantasjen, 2026-04-28)
+### Validated at scale
 
-| Flag                | Mode    | Wall  | Peak RSS | UUID       |
-|---------------------|---------|-------|----------|------------|
-| `--strip-indexdata` | bench   | 79 s  | 15 MB    | `dc99fc70` |
-| `--strip-indexdata` | hotpath | 90 s  | -        | `a7fa3897` |
-| `--strip-indexdata` | alloc   | 92 s  | -        | `3470474f` |
+Passthrough (commit `48685ba`, plantasjen, 2026-04-28):
 
-The `--strip-indexdata` passthrough path stays under 16 MB RSS on
-planet and is safe in every measurement mode; the blob bytes are
-not decompressed. The decode path's planet bench numbers are
-pending re-measurement against the per-kind classify port (the
-prior numbers are from the OOM regime and are not representative).
+| Flag                | Mode    | Wall  | Peak anon | UUID       |
+|---------------------|---------|-------|-----------|------------|
+| `--strip-indexdata` | bench   | 79 s  | 15 MB     | `dc99fc70` |
+| `--strip-indexdata` | hotpath | 90 s  | -         | `a7fa3897` |
+| `--strip-indexdata` | alloc   | 92 s  | -         | `3470474f` |
+
+The passthrough stays under 16 MB RSS on planet and is safe in every
+measurement mode; the blob bytes are not decompressed.
+
+Decode path post per-kind port (commit `69a8bbc`, plantasjen,
+2026-04-30):
+
+| Flag                | Dataset | Wall   | Peak anon   | UUID       |
+|---------------------|---------|--------|-------------|------------|
+| `--strip-locations` | europe  | 2m35s  | 404 MB      | `0fb0772d` |
+| `--strip-locations` | planet  | 6m22s  | **1.19 GB** | `ae9d590d` |
+| `--unsort`          | europe  | 20m47s | 1.51 GB     | `e5ab68c4` |
+
+Planet `--strip-locations` lands at 1.19 GB peak anon and 6m22s
+wall on plantasjen (28 GB RAM, 8 GB swap), down from the prior
+~29 GB OOM at the same scale (commit `48685ba` overnight run).
+Memory ceiling is in the same class as `repack` at planet
+(1.36 GB / 380 s) - exactly what the per-kind port was designed
+to deliver.
+
+`--unsort` at europe runs at 1.51 GB peak (still bounded; only
+one phase in flight at a time) but wall is 8x `--strip-locations`
+at the same scale because all encoding serializes through the
+merge thread. Planet `--unsort` not measured (linear projection
+~2-3 hours); structurally OOM-safe by the same per-kind bound
+that makes `--strip-locations` planet-safe. The wall cost is
+the deferred-optimization motivation in
+[v2.7](#v27---unsort-throughput-recovery).
 
 ### Tests
 

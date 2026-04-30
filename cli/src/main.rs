@@ -202,6 +202,11 @@ enum Command {
         /// without 8000+ elements per kind.
         #[arg(long = "block-cap", default_value_t = pbfhogg::degrade::DEFAULT_BLOCK_CAP, hide = true)]
         block_cap: usize,
+        /// Skip the indexdata precondition required by the decode path.
+        /// The per-kind classify pipeline will fall back to scanning every
+        /// blob for every kind, so runs are slower.
+        #[arg(long)]
+        force: bool,
         #[command(flatten)]
         compression: CompressionArg,
         #[command(flatten)]
@@ -864,6 +869,7 @@ fn main() -> process::ExitCode {
             strip_locations,
             strip_indexdata,
             block_cap,
+            force,
             compression,
             io,
             uring,
@@ -875,6 +881,7 @@ fn main() -> process::ExitCode {
             strip_locations,
             strip_indexdata,
             block_cap,
+            force,
             &compression.compression,
             io.direct_io,
             uring.io_uring,
@@ -1654,6 +1661,7 @@ fn run_degrade(
     strip_locations: bool,
     strip_indexdata: bool,
     block_cap: usize,
+    force: bool,
     compression: &str,
     direct_io: bool,
     io_uring: bool,
@@ -1673,6 +1681,7 @@ fn run_degrade(
         compression,
         direct_io,
         io_uring,
+        force,
         overrides,
     )?;
     stats.print_summary();

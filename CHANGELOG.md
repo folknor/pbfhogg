@@ -101,6 +101,19 @@
   at least one is required. `--strip-indexdata` alone runs as a
   blob-level passthrough (payload bit-identical); other combinations
   decode and re-encode through `BlockBuilder`.
+- **degrade** decode path: switched from single-pass
+  `into_blocks_pipelined` + serial encoder to three sequential per-kind
+  phases driven by `parallel_classify_phase` (mirrors `repack`).
+  Resolves the planet-scale OOM that took out `--unsort` and
+  `--strip-locations` in every measurement mode (28-29 GB anon kill on
+  a 30 GB host). New `--force` flag skips the indexdata precondition
+  the per-kind classify pipeline requires; without it, an unindexed
+  input fails fast with the standard guidance. `--strip-indexdata`
+  alone still runs as the same blob-level passthrough and accepts
+  non-indexed input. Throughput note: `--unsort` serializes its kind's
+  encoding on the merge thread (the cap-1 swap needs serial element
+  ordering); `--strip-locations` keeps the parallel worker re-encode
+  path.
 - **time-filter** (snapshot path): migrated to `parallel_classify_phase`
   + `ReorderBuffer`, mirroring the architecture that unblocked
   `cat --clean` and `check --ids` in 0.3.0. Planet was 5× SIGKILL at

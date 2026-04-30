@@ -5,8 +5,9 @@ perturbing structure. A "make our lives difficult" tool for exercising
 code paths that require less-optimised inputs (unsorted, missing
 indexdata, scattered coords).
 
-**Status:** v1 shipped. This document records what v1 actually does
-and what v2 still needs.
+**Status:** v1 shipped, planet-scale safe in every transformation
+mode after the per-kind classify-pipeline port. This document
+records what v1 actually does and what v2 still needs.
 
 ## What v1 does
 
@@ -17,6 +18,7 @@ CLI: `pbfhogg degrade`.
 pbfhogg degrade <input> -o <output> [--unsort]
                                      [--strip-locations]
                                      [--strip-indexdata]
+                                     [--force]
                                      [--compression C]
                                      [--direct-io] [--io-uring]
                                      [--generator ...]
@@ -26,7 +28,10 @@ pbfhogg degrade <input> -o <output> [--unsort]
 Flags compose; at least one transformation flag is required. The CLI
 also exposes a hidden `--block-cap N` so the test suite can exercise
 the `--unsort` swap on small fixtures (production runs use the default
-8000).
+8000). `--force` skips the indexdata precondition required by the
+decode path's per-kind classify pipeline (without indexdata, every
+classify schedule includes every blob, so each blob is decoded by
+each phase).
 
 ### Implementation paths
 
@@ -38,18 +43,60 @@ combination:
   is cleared, the rest of the frame (compressed Blob payload + any
   `tagdata`) is forwarded verbatim. Sortedness, `LocationsOnWays`
   inline coordinates, and every element-level property pass through
-  unchanged because the blob bytes are not touched.
+  unchanged because the blob bytes are not touched. Accepts
+  non-indexed input (no precondition).
 - **Decode path** (any flag set involving `--unsort` or
-  `--strip-locations`): elements stream through `into_blocks_pipelined`,
-  are re-emitted via `BlockBuilder`, and framed with `frame_blob_pipelined`.
-  When `--strip-indexdata` composes, the framing path is taken with
-  `indexdata=None`; the standard `write_primitive_block_owned` path
-  embeds indexdata and is bypassed for this combination.
+  `--strip-locations`): three sequential per-kind phases driven by
+  [`parallel_classify_phase`](../src/scan/classify.rs), mirroring
+  [`repack`](../src/commands/repack/mod.rs). For each kind in
+  `nodes -> ways -> relations`: workers decode one input blob,
+  filter to the current kind, and (when not `--unsort`) pre-frame
+  full cap-multiples through a per-worker `BlockBuilder`. The merge
+  thread runs a single long-lived `BlockBuilder` per kind, flushes
+  it before writing each input blob's worker frames (sort
+  preservation), and applies the `--unsort` cap-1 swap state
+  machine to the trailing slice. `--strip-indexdata` composes by
+  passing `indexdata=None` to `frame_blob_pipelined`; the standard
+  `write_primitive_block_owned` path that embeds indexdata is
+  bypassed for the decode path. Requires indexdata (or `--force`).
 
 The choice is structural: cross-input-blob element reordering (the
 `--unsort` perturbation) cannot be done at the blob-passthrough level,
 and `--strip-locations` requires re-encoding ways without inline
 coords.
+
+### Decode-path memory model
+
+The per-kind phasing bounds working set the same way `repack` does:
+
+- Only one kind's blobs are scheduled at a time. Mixed-kind input
+  blobs are decoded once per phase that includes them.
+- The reorder buffer caps at 32 worker outputs in flight per phase.
+- Worker pre-framed blocks are bounded by the input blob's element
+  count divided by `block_cap` (typically a few MB of compressed
+  bytes per worker output).
+- Under `--unsort` the worker output is `Owned*` data instead of
+  pre-framed blocks - up to the input blob's full kind count per
+  slot. At planet scale a node blob holds ~228k nodes, so 32 slots
+  is ~350 MB worst case, still well under the 1.5 GB ceiling that
+  `repack` peaks at.
+
+### Decode-path throughput model
+
+Two distinct shapes:
+
+- `--strip-locations` (no `--unsort`): workers re-encode in
+  parallel; merge thread writes worker frames directly and only
+  encodes the trailing `M%cap` slice per input blob. Same shape as
+  `repack`'s shrink path.
+- `--unsort` (with or without `--strip-locations`): workers ship
+  every matching element as `Owned*`; the merge thread runs all
+  encoding serially because the cap-1 swap needs to see elements
+  in stream order. Throughput is bounded by the single-thread
+  encoder. Acceptable because `--unsort` is a one-time generation
+  step for `sort` benchmarking, not a hot path. See [v2.7](#v27-
+  --unsort-throughput-recovery) for sketches that recover parallel
+  re-encode if a hot-loop consumer ever surfaces.
 
 ### Transformations
 
@@ -112,37 +159,9 @@ etc.); `--strip-locations` makes the loss explicit.
 
 The `--strip-indexdata` passthrough path stays under 16 MB RSS on
 planet and is safe in every measurement mode; the blob bytes are
-not decompressed.
-
-### Known issue: decode-path planet OOM
-
-`degrade --strip-locations` and `degrade --unsort` were OOM-killed
-at planet scale on plantasjen (30 GB RAM, 8 GB swap) during the
-2026-04-28 overnight run. Both flags failed in every measurement
-mode, including plain `--bench 1` - this is not profiler overhead.
-Peak anon-rss at the kernel kill point was 28.9-29.3 GB across all
-six killed processes (plantasjen kernel log, 22:10-22:18).
-
-Both flags route through the decode + re-encode pipeline. Unlike
-`repack`, which uses a per-kind parallel-classify pipeline that
-bounds memory per worker (planet repack peaks at 1.36 GB), the v1
-`degrade` decode path streams `into_blocks_pipelined` straight into
-the writer with no comparable bound. At planet element densities
-the pipeline backlog evidently exceeds 30 GB.
-
-`degrade` should be planet-scale safe in every transformation; this
-is a memory-safety bug to fix, not a documented limit. The likely
-intervention is to mirror `repack`'s parallel-classify pipeline
-shape: per-worker bounded element batches with a single merge thread
-holding only the cross-blob residual (which for `--unsort` is one
-held element per kind, and for `--strip-locations` is zero).
-
-Workarounds until it lands:
-- `--strip-indexdata` alone is planet-safe (passthrough).
-- Europe-scale runs of `--strip-locations` / `--unsort` were not
-  measured in this overnight; predicted to fit but unverified.
-- Composite flag combinations involving `--unsort` or
-  `--strip-locations` are blocked at planet scale on this host.
+not decompressed. The decode path's planet bench numbers are
+pending re-measurement against the per-kind classify port (the
+prior numbers are from the OOM regime and are not representative).
 
 ### Tests
 
@@ -258,6 +277,70 @@ can run without regenerating the input each time.
 v1's surgical swap may be sufficient (one overlap per kind = one
 overlap-rewrite span per kind = directly measures the rewrite path).
 Bigger chaos modes burn more wall on the generator side.
+
+### v2.7 - `--unsort` throughput recovery
+
+**Goal:** close the Denmark `--unsort` regression introduced by the
+per-kind classify port (denmark bench 7.7 s -> 27.3 s, 3.5x slower at
+commit `13eed79`). Planet completes where it previously OOM'd, but
+the per-element cost grew because workers now serialize each
+matching element into `OwnedNode/OwnedWay/OwnedRelation` (Vec of
+String pairs for tags, Vec for refs/members) and the merge thread
+deserializes them back into the central `BlockBuilder`. The old
+single-pass design went `Element<'_> -> BlockBuilder` directly,
+amortizing one allocation per element instead of two.
+
+**Why deferred:** `--unsort` is a one-time generation step (run
+once, cache the result) feeding `sort`'s overlap-rewrite path. Even
+at planet the projected wall (~30-40 min linear from per-element
+overhead) is fine for that workload. Land when a consumer surfaces
+that runs `--unsort` interactively or in a tight benchmarking loop.
+
+**Three sketches, ordered by complexity:**
+
+1. **Eliminate the Owned roundtrip.** Workers ship the full decoded
+   `PrimitiveBlock` (or its decompressed bytes) to the merge thread
+   instead of `Owned*`. Merge iterates `block.elements()` borrowed
+   straight into the BlockBuilder. Per-slot memory grows from ~50 KB
+   to ~80 MB at planet (the decoded block is the cost), 32 slots
+   = ~2.5 GB - bounded, still well under repack's 1.36 GB ceiling
+   only because the per-kind sequencing keeps just one phase in
+   flight, but it does push the working set higher than current.
+   Requires extending `parallel_classify_phase` to let workers ship
+   an owning `PrimitiveBlock` (today the closure receives `&PrimitiveBlock`
+   and the block is dropped after the closure returns).
+
+2. **Restructure the swap to fire in the worker.** The swap is one
+   event per kind, at the cap-1 boundary of the *first* input blob.
+   If the worker handling input blob seq=0 of each kind does the
+   swap inline (it can: it knows it's the first blob via seq=0, it
+   knows the kind it's filtering for, it knows the cap), then
+   subsequent blobs follow the `--strip-locations` shape and get
+   parallel re-encoding. The worker for blob 0 still runs serially
+   but only for ~`cap+1` elements. Requires extending
+   `parallel_classify_phase` to pass the schedule entry's seq to
+   the closure (today the closure signature is
+   `Fn(&PrimitiveBlock, &mut S) -> R` with no seq). Edge case: blob
+   0 having fewer than `cap+1` matching elements - swap doesn't
+   fire there, has to roll into blob 1 (and possibly later) until
+   enough elements arrive. State across workers is tricky; might
+   degenerate to "ship Owned\* until swap done, then pre-frame"
+   coordinated via the merge thread setting an atomic flag workers
+   read.
+
+3. **Two-pass approach.** Pass 1: re-encode without swap (basically
+   `repack` with cap unchanged). Pass 2: byte-splice the first ~2
+   blocks per kind to apply the swap. Pass 1 gets full parallel
+   re-encode; pass 2 touches a tiny fraction of the file. Requires
+   blob-level rewrite plumbing that doesn't exist today; the
+   complexity is in pass 2's careful blob boundary handling.
+
+Sketch 2 is the cleanest if `parallel_classify_phase`'s closure
+signature is something we'd want to widen anyway (other callers
+might also benefit from seeing the seq). Sketch 1 is the smallest
+delta but pushes peak memory up. Sketch 3 is structurally separate
+from the existing pipeline and earns its weight only if pass 2 has
+other consumers.
 
 ## Out of scope
 

@@ -545,7 +545,7 @@ single-pass, tag expression and bbox filtering.
   (A) **Scratch-dir argument presence.** Today `add-locations-to-ways
   --index-type external` infers scratch as `output.parent()` with a `.`
   fallback (silent cwd footgun at 112-224 GB scale; see the `altw/external/mod.rs:191`
-  bug-sweep entry). Dense/sparse follow the same pattern. Other large-scratch
+  bug-sweep entry). Sparse follows the same pattern. Other large-scratch
   paths (extract complete/smart, geocode builder, renumber stage 2d) need
   auditing: do they infer scratch the same way, and would a unified policy
   apply to all of them?
@@ -568,24 +568,55 @@ single-pass, tag expression and bbox filtering.
   per-command bug-sweep LOW ticket for altw folds in once the posture
   is picked.
 
-  (B) **Rename `--index-type` to `--mode`, and unify mode-like flag naming
-  across the CLI.** Today we have:
-  - `add-locations-to-ways --index-type` (sparse/external/auto)
-  - `extract --strategy` (simple/complete/smart)
-  - `bench-read --mode`, `bench-write --writer`, `bench-merge --io-mode`
-  - `diff --format` (text/osc) - semantically "output shape", different concept
+  (B) **Replace `--index-type` on `add-locations-to-ways` with a single
+  user-facing override flag.** Today: `--index-type sparse|external|auto`,
+  default `sparse`. The three-value flag exposes implementation names
+  (`sparse`, `external`) that don't mean anything to a user picking a
+  PBF tool, and the `auto` value is what the default should have been
+  in the first place.
 
-  `--index-type` is misnamed (external isn't really an index), `--strategy`
-  and `--mode` are synonyms picked inconsistently, and `bench-read` already
-  uses `--mode`. Unifying on `--mode` across add-locations-to-ways,
-  extract, and the bench subcommands would make the CLI more regular at
-  the cost of a breaking rename on two user-facing commands. `--format`
-  for output shape (diff, and potential future geojson/csv exports) is
-  a different axis and should stay `--format`.
+  Proposed shape:
+  - Default behaviour: today's `auto` logic. Pick external when the input
+    is sorted + indexed (the fast path at planet scale), pick sparse
+    otherwise.
+  - Single override flag, opting INTO the in-memory path: `--in-memory`
+    (working name; alternatives considered: `--low-disk`,
+    `--minimal-disk`, `--no-spill`). The override only matters when auto
+    would have picked external - i.e., the input is sorted + indexed but
+    the user doesn't have ~256 GB of temp disk for external's scratch.
+    Forcing external the other direction is pointless: auto would have
+    already picked it when conditions were met, and external can't run
+    when they aren't (it requires sorted + indexdata).
 
-  Both decisions are breaking CLI changes; batch them into a single
-  release note when we land them. No urgency - 0.3.0 ships with the
-  current names.
+  Why one flag is enough: the asymmetry above. Two flags
+  (`--force-sparse` + `--force-external`) was the obvious symmetric
+  shape, but `--force-external` is either redundant (auto picks it) or
+  fails (preconditions not met), so it earns nothing.
+
+  Why `--in-memory` over `--low-disk`: framing the override by what the
+  user gets ("keep the index in process memory, don't spill to a giant
+  scratch file") reads more naturally than framing by what they avoid.
+  Slight imprecision since sparse still mmaps a values file
+  (`referenced_count * 8` bytes; ~29 GB at europe), but that file is
+  dwarfed by external's ~256 GB planet scratch and the user's mental
+  model is "don't make a huge temp file."
+
+  Library-side API change: `IndexType` enum loses its `FromStr` (no
+  string parsing) and the dense-removal migration hint goes with it -
+  users on `--index-type dense` would get clap's "unrecognized
+  argument" error rather than the friendly pointer at sparse. The
+  `altw_dense_index_type_rejected_with_migration_hint` test goes
+  away in the same change. Acceptable cost: dense has been gone since
+  `b70dd8c` (2026-04-30); by the time `--index-type` itself goes, the
+  migration hint has done its job.
+
+  Other "mode-like" flags (`extract --strategy`, `bench-read --mode`,
+  `bench-write --writer`, `bench-merge --io-mode`, `diff --format`) are
+  inconsistent but each picks a value out of a closed set that DOES
+  matter to the user (e.g., extract strategies have different output
+  semantics, not just performance). Leave them alone.
+
+  Breaking CLI change. No urgency.
 - [ ] Auto-selection: `--index-type auto` exists (sparse vs external).
   Extend to other decisions: sequential vs pread-from-workers based on
   available RAM and blob count; compression level based on output target;

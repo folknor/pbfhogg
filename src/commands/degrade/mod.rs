@@ -13,13 +13,18 @@
 //!   reframed with a cleared `BlobHeader.indexdata` field. Blob bytes
 //!   are bit-identical; only the header changes. Mirrors `cat`'s
 //!   passthrough but drops the index instead of adding one.
-//! - Decode path (`--unsort` and/or `--strip-locations`): elements are
-//!   pulled through the pipelined reader, transformed, and re-emitted
-//!   via `BlockBuilder`. `--strip-indexdata` composes by suppressing
-//!   the indexdata field at frame time.
+//! - Decode path (`--unsort` and/or `--strip-locations`): three sequential
+//!   per-kind phases driven by `parallel_classify_phase`. Workers decode
+//!   one input blob, filter to the current kind, and re-encode. Without
+//!   `--unsort`, workers pre-frame full cap-sized blocks (parallel
+//!   re-encode) and ship the trailing `M%cap` elements as `Owned*` to a
+//!   merge thread that flushes a central `BlockBuilder` between input
+//!   blobs (sort preserved). Under `--unsort`, workers ship every
+//!   element as `Owned*` so the merge thread can apply the cap-1 swap
+//!   per kind in a serial state machine.
 //!
 //! `--unsort` swaps two adjacent same-kind elements at the first
-//! BlockBuilder cap boundary (per kind), so adjacent output blobs of
+//! `BlockBuilder` cap boundary (per kind), so adjacent output blobs of
 //! that kind have overlapping ID ranges. This is the minimum
 //! perturbation that makes `sort`'s `detect_overlaps` flag the file -
 //! enough to trigger the overlap-rewrite path without chaos-ifying
@@ -28,15 +33,17 @@
 use std::path::Path;
 
 use super::{
-    build_output_header, flush_block, writer_from_header_bytes, HeaderOverrides, Result,
+    build_output_header, ensure_node_capacity_local, ensure_relation_capacity_local,
+    ensure_way_capacity_local, flush_local, require_indexdata, writer_from_header_bytes,
+    HeaderOverrides, Result,
 };
-use crate::block_builder::{BlockBuilder, MemberData};
+use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::blob::BlobKind;
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
 use crate::owned::{
-    dense_node_metadata, element_metadata, owned_to_metadata, read_dense_node, read_node,
-    read_relation, read_way, OwnedElement,
+    dense_node_metadata, element_metadata, read_dense_node, read_node, read_relation, read_way,
+    OwnedElement, OwnedNode, OwnedRelation, OwnedWay,
 };
 use crate::read::raw_frame::read_raw_frame;
 use crate::writer::{encode_blob_header_into, frame_blob_pipelined, Compression, PbfWriter};
@@ -47,6 +54,13 @@ use crate::{Element, ElementReader};
 /// `--block-cap` CLI flag so fixtures don't need 8000+ elements per kind
 /// to exercise the `--unsort` swap.
 pub const DEFAULT_BLOCK_CAP: usize = 8000;
+
+const KIND_NODE: u8 = 0;
+const KIND_WAY: u8 = 1;
+const KIND_RELATION: u8 = 2;
+
+/// Batch size for the parallel-framing fan-out on the merge thread.
+const FRAME_BATCH: usize = 32;
 
 /// Set of degradations to apply. At least one flag must be set.
 #[derive(Clone, Copy, Debug, Default)]
@@ -102,6 +116,9 @@ impl DegradeStats {
 /// `BlockBuilder`. Production callers pass `DEFAULT_BLOCK_CAP`; tests pass
 /// a smaller value so the `--unsort` swap can be exercised on fixtures of
 /// modest size.
+///
+/// `force` skips the indexdata precondition required by the decode path's
+/// per-kind classify pipeline. Has no effect on the passthrough path.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn degrade(
@@ -112,6 +129,7 @@ pub fn degrade(
     compression: Compression,
     direct_io: bool,
     io_uring: bool,
+    force: bool,
     overrides: &HeaderOverrides,
 ) -> Result<DegradeStats> {
     if !flags.any() {
@@ -139,7 +157,7 @@ pub fn degrade(
 
     let stats = if flags.needs_decode() {
         degrade_decode_path(
-            input, output, flags, block_cap, compression, direct_io, io_uring, overrides,
+            input, output, flags, block_cap, compression, direct_io, io_uring, force, overrides,
         )?
     } else {
         degrade_passthrough_strip_indexdata(input, output, compression, direct_io, io_uring, overrides)?
@@ -254,63 +272,68 @@ fn reframe_raw_without_index(
 // Decode path: --unsort and/or --strip-locations (with optional --strip-indexdata)
 // ---------------------------------------------------------------------------
 
-/// Element kind tag for per-kind state in the unsort buffer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
-    Node = 0,
-    Way = 1,
-    Relation = 2,
+/// Trailing-partial payload: 0 to `cap-1` elements that didn't fill a
+/// full output block in the worker. Under `--unsort` workers pack every
+/// matching element here so the merge thread can apply the swap.
+enum KindPayload {
+    Nodes(Vec<OwnedNode>),
+    Ways(Vec<OwnedWay>),
+    Relations(Vec<OwnedRelation>),
 }
 
-impl Kind {
-    fn index(self) -> usize {
-        self as usize
+impl KindPayload {
+    fn empty(kind: u8) -> Self {
+        match kind {
+            KIND_WAY => Self::Ways(Vec::new()),
+            KIND_RELATION => Self::Relations(Vec::new()),
+            _ => Self::Nodes(Vec::new()),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Nodes(v) => v.len(),
+            Self::Ways(v) => v.len(),
+            Self::Relations(v) => v.len(),
+        }
     }
 }
 
-/// Per-kind unsort state: hold the (cap-1)-th element of each kind so it
-/// can be re-injected after the cap-th element. Triggers exactly one
-/// adjacent-blob ID overlap per kind in the output.
-struct UnsortState {
-    /// `held[k]` is the (cap-1)-th element of kind `k`, captured pending
-    /// re-injection at element index `cap+1`. `None` once injected (or
-    /// if the kind never reached `cap-1` elements).
-    held: [Option<OwnedElement>; 3],
-    /// Number of elements seen for each kind so far in the input stream.
-    seen: [u64; 3],
-    /// Whether the swap has fired for each kind (for diagnostic).
-    fired: [bool; 3],
-    /// Element cap that drives the swap point. Matches BlockBuilder cap.
+/// One worker's output for one input blob: framed full blocks plus the
+/// trailing partial. Under `--unsort`, `full_framed` is always empty.
+struct WorkerOutput {
+    full_framed: Vec<Vec<u8>>,
+    tail: KindPayload,
+}
+
+/// Per-kind unsort state held on the merge thread. Mirrors the v1
+/// inline state machine but scoped to one kind's phase.
+struct UnsortKindState {
+    held: Option<OwnedElement>,
+    seen: u64,
+    fired: bool,
     cap: u64,
 }
 
-impl UnsortState {
+impl UnsortKindState {
     fn new(cap: usize) -> Self {
         Self {
-            held: [None, None, None],
-            seen: [0, 0, 0],
-            fired: [false, false, false],
+            held: None,
+            seen: 0,
+            fired: false,
             cap: cap as u64,
         }
     }
 
-    /// Returns true if this is the (cap-1)-th element of its kind, i.e.
-    /// the one to hold for swap.
-    fn should_hold(&self, kind: Kind) -> bool {
-        let n = self.seen[kind.index()];
-        self.cap >= 2 && n + 1 == self.cap
+    fn should_hold(&self) -> bool {
+        self.cap >= 2 && self.seen + 1 == self.cap
     }
 
-    /// Returns true if this is the (cap+1)-th element of its kind, i.e.
-    /// the one after which the held element is re-injected.
-    fn should_inject_after(&self, kind: Kind) -> bool {
-        let n = self.seen[kind.index()];
-        self.cap >= 2 && n + 1 == self.cap + 1 && self.held[kind.index()].is_some()
+    fn should_inject_after(&self) -> bool {
+        self.cap >= 2 && self.seen + 1 == self.cap + 1 && self.held.is_some()
     }
 }
 
-/// Streaming decode + re-encode. Handles `--unsort`, `--strip-locations`,
-/// and the decode-side composition of `--strip-indexdata`.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn degrade_decode_path(
@@ -321,49 +344,92 @@ fn degrade_decode_path(
     compression: Compression,
     direct_io: bool,
     io_uring: bool,
+    force: bool,
     overrides: &HeaderOverrides,
 ) -> Result<DegradeStats> {
-    let reader = ElementReader::open(input, direct_io)?;
-    let header = reader.header().clone();
+    require_indexdata(
+        input,
+        direct_io,
+        force,
+        "input PBF has no blob-level indexdata. degrade's decode path uses the \
+         parallel per-kind classify pipeline, which needs indexdata to build \
+         per-kind blob schedules.",
+    )?;
 
-    // Warn about LocationsOnWays loss on the decode path - BlockBuilder
-    // does not preserve inline way-node coordinates. `--strip-locations`
-    // makes the loss explicit, so suppress the warning in that case.
-    if !flags.strip_locations {
-        super::warn_locations_on_ways_loss(&header);
+    // Cap glibc arenas to prevent cross-thread alloc/free fragmentation in
+    // the per-blob worker pool. Same precedent as `cat --clean` and `repack`.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
     }
+
+    let header = {
+        let reader = ElementReader::open(input, direct_io)?;
+        // Warn about LocationsOnWays loss on the decode path - BlockBuilder
+        // does not preserve inline way-node coordinates. `--strip-locations`
+        // makes the loss explicit, so suppress the warning in that case.
+        if !flags.strip_locations {
+            super::warn_locations_on_ways_loss(reader.header());
+        }
+        reader.header().clone()
+    };
 
     let preserve_sorted = !flags.unsort && header.is_sorted();
     let header_bytes = build_output_header(&header, preserve_sorted, overrides, |hb| hb)?;
-
     let mut writer =
         writer_from_header_bytes(output, compression, &header_bytes, direct_io, io_uring)?;
-    let mut bb = BlockBuilder::with_element_cap(block_cap);
-    let mut unsort = UnsortState::new(block_cap);
+
+    let (node_schedule, way_schedule, rel_schedule, shared_file) =
+        crate::scan::classify::build_classify_schedules_split(input)?;
+
+    let mut blobs_written: u64 = 0;
     let mut elements_written: u64 = 0;
+    let mut unsort_fired = [false; 3];
 
-    crate::debug::emit_marker("DEGRADE_DECODE_START");
-    for block in reader.into_blocks_pipelined() {
-        let block = block?;
-        for element in block.elements() {
-            handle_element(&element, flags, &mut bb, &mut writer, &mut unsort, compression)?;
-            elements_written += 1;
-        }
-    }
+    crate::debug::emit_marker("DEGRADE_NODES_START");
+    let s = run_kind_phase(
+        &shared_file,
+        &node_schedule,
+        KIND_NODE,
+        block_cap,
+        flags,
+        compression,
+        &mut writer,
+    )?;
+    crate::debug::emit_marker("DEGRADE_NODES_END");
+    blobs_written += s.blobs;
+    elements_written += s.elements;
+    unsort_fired[0] = s.unsort_fired;
 
-    // End-of-input: re-inject any elements still held (only happens for
-    // kinds whose total count is between cap-1 and cap, where the swap
-    // partially fired). The held element is the smallest-id member of
-    // its kind, so emitting it at end preserves correctness even if the
-    // swap target never arrived.
-    for k in [Kind::Node, Kind::Way, Kind::Relation] {
-        if let Some(elem) = unsort.held[k.index()].take() {
-            write_owned_element(&elem, flags, &mut bb, &mut writer, compression)?;
-        }
-    }
+    crate::debug::emit_marker("DEGRADE_WAYS_START");
+    let s = run_kind_phase(
+        &shared_file,
+        &way_schedule,
+        KIND_WAY,
+        block_cap,
+        flags,
+        compression,
+        &mut writer,
+    )?;
+    crate::debug::emit_marker("DEGRADE_WAYS_END");
+    blobs_written += s.blobs;
+    elements_written += s.elements;
+    unsort_fired[1] = s.unsort_fired;
 
-    flush_terminal_blocks(&mut bb, &mut writer, flags.strip_indexdata, compression)?;
-    crate::debug::emit_marker("DEGRADE_DECODE_END");
+    crate::debug::emit_marker("DEGRADE_RELATIONS_START");
+    let s = run_kind_phase(
+        &shared_file,
+        &rel_schedule,
+        KIND_RELATION,
+        block_cap,
+        flags,
+        compression,
+        &mut writer,
+    )?;
+    crate::debug::emit_marker("DEGRADE_RELATIONS_END");
+    blobs_written += s.blobs;
+    elements_written += s.elements;
+    unsort_fired[2] = s.unsort_fired;
 
     crate::debug::emit_marker("DEGRADE_FLUSH_START");
     writer.flush()?;
@@ -373,19 +439,17 @@ fn degrade_decode_path(
     {
         crate::debug::emit_counter(
             "degrade_unsort_fired_nodes",
-            i64::from(unsort.fired[Kind::Node.index()]),
+            i64::from(unsort_fired[0]),
         );
         crate::debug::emit_counter(
             "degrade_unsort_fired_ways",
-            i64::from(unsort.fired[Kind::Way.index()]),
+            i64::from(unsort_fired[1]),
         );
         crate::debug::emit_counter(
             "degrade_unsort_fired_relations",
-            i64::from(unsort.fired[Kind::Relation.index()]),
+            i64::from(unsort_fired[2]),
         );
     }
-
-    let blobs_written = blob_count(output, direct_io)?;
 
     Ok(DegradeStats {
         blobs_written,
@@ -394,236 +458,449 @@ fn degrade_decode_path(
     })
 }
 
-fn element_kind(element: &Element<'_>) -> Option<Kind> {
-    match element {
-        Element::Node(_) | Element::DenseNode(_) => Some(Kind::Node),
-        Element::Way(_) => Some(Kind::Way),
-        Element::Relation(_) => Some(Kind::Relation),
-    }
+struct PhaseStats {
+    blobs: u64,
+    elements: u64,
+    unsort_fired: bool,
 }
 
-fn handle_element(
-    element: &Element<'_>,
+/// Run one per-kind phase. Workers decode + filter + (when not `--unsort`)
+/// pre-frame full cap-multiples; the merge thread writes them in seq
+/// order, flushing the central `BlockBuilder` between input blobs to
+/// keep IDs ascending. Under `--unsort` workers ship every matching
+/// element as `Owned*` so the merge thread can run the cap-1 swap.
+#[allow(clippy::too_many_lines)]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn run_kind_phase(
+    shared_file: &std::sync::Arc<std::fs::File>,
+    schedule: &[(usize, u64, usize)],
+    kind: u8,
+    block_cap: usize,
     flags: DegradeFlags,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    unsort: &mut UnsortState,
     compression: Compression,
-) -> Result<()> {
-    let Some(kind) = element_kind(element) else {
-        return Ok(());
+    writer: &mut PbfWriter<FileWriter>,
+) -> Result<PhaseStats> {
+    use crate::reorder_buffer::ReorderBuffer;
+
+    if schedule.is_empty() {
+        return Ok(PhaseStats {
+            blobs: 0,
+            elements: 0,
+            unsort_fired: false,
+        });
+    }
+
+    type PhaseResult = std::result::Result<WorkerOutput, String>;
+    let mut reorder: ReorderBuffer<PhaseResult> = ReorderBuffer::with_capacity(32);
+
+    let mut bb = BlockBuilder::with_element_cap(block_cap);
+    let mut output: Vec<OwnedBlock> = Vec::new();
+    let mut pending: Vec<OwnedBlock> = Vec::with_capacity(FRAME_BATCH);
+    let mut unsort = UnsortKindState::new(block_cap);
+
+    let mut blobs: u64 = 0;
+    let mut elements: u64 = 0;
+    let mut write_error: Option<Box<dyn std::error::Error>> = None;
+    let mut classify_error: Option<String> = None;
+
+    crate::scan::classify::parallel_classify_phase(
+        shared_file,
+        schedule,
+        None,
+        || (),
+        |block, _state| -> PhaseResult {
+            worker_decode_kind(block, kind, block_cap, flags, &compression)
+        },
+        |seq, r| {
+            reorder.push(seq, r);
+            while let Some(item) = reorder.pop_ready() {
+                if write_error.is_some() {
+                    continue;
+                }
+                let out = match item {
+                    Ok(out) => out,
+                    Err(e) => {
+                        classify_error.get_or_insert(e);
+                        continue;
+                    }
+                };
+
+                // Sort preservation: flush central BB before writing this
+                // input blob's worker frames. Anything left in central
+                // belongs to a strictly lower ID range than the next
+                // blob's full frames; flushing now keeps the output
+                // monotone. Empty central is a no-op.
+                if !bb.is_empty() {
+                    if let Err(e) = flush_local(&mut bb, &mut output) {
+                        classify_error.get_or_insert(e);
+                        continue;
+                    }
+                    pending.append(&mut output);
+                    if !pending.is_empty() {
+                        let batch = std::mem::take(&mut pending);
+                        match frame_and_write_batch(batch, compression, writer, flags.strip_indexdata) {
+                            Ok(written) => blobs += written,
+                            Err(e) => {
+                                write_error = Some(e);
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                let WorkerOutput { full_framed, tail } = out;
+                let full_count = full_framed.len() as u64 * block_cap as u64;
+                let tail_n = tail.len() as u64;
+
+                for framed in full_framed {
+                    if let Err(e) = writer.write_raw_owned(framed) {
+                        write_error = Some(e.into());
+                        break;
+                    }
+                    blobs += 1;
+                }
+                if write_error.is_some() {
+                    continue;
+                }
+
+                let consume_res: std::result::Result<(), String> = if flags.unsort {
+                    feed_tail_unsort(tail, &mut unsort, &mut bb, &mut output)
+                } else {
+                    feed_tail_plain(tail, &mut bb, &mut output)
+                };
+                if let Err(e) = consume_res {
+                    classify_error.get_or_insert(e);
+                    continue;
+                }
+
+                pending.append(&mut output);
+                while pending.len() >= FRAME_BATCH {
+                    let batch: Vec<OwnedBlock> = pending.drain(..FRAME_BATCH).collect();
+                    match frame_and_write_batch(batch, compression, writer, flags.strip_indexdata) {
+                        Ok(written) => blobs += written,
+                        Err(e) => {
+                            write_error = Some(e);
+                            break;
+                        }
+                    }
+                }
+
+                elements += full_count + tail_n;
+            }
+        },
+    )?;
+
+    if let Some(e) = write_error {
+        return Err(e);
+    }
+    if let Some(e) = classify_error {
+        return Err(e.into());
+    }
+
+    // End-of-phase: re-inject any held element (partial swap fire), then
+    // flush the central builder one last time.
+    if let Some(elem) = unsort.held.take() {
+        write_owned_to_central(&elem, &mut bb, &mut output)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        elements += 1;
+    }
+
+    flush_local(&mut bb, &mut output)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    pending.append(&mut output);
+    if !pending.is_empty() {
+        let final_batch = std::mem::take(&mut pending);
+        let written = frame_and_write_batch(final_batch, compression, writer, flags.strip_indexdata)?;
+        blobs += written;
+    }
+
+    Ok(PhaseStats {
+        blobs,
+        elements,
+        unsort_fired: unsort.fired,
+    })
+}
+
+/// Worker body: decode + filter to one kind, optionally pre-frame full
+/// cap-multiples, ship the trailing partial as owned data. Under
+/// `--unsort` everything goes into the tail so the merge thread can
+/// apply the cap-1 swap.
+#[allow(clippy::too_many_lines)]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn worker_decode_kind(
+    block: &crate::PrimitiveBlock,
+    kind: u8,
+    cap: usize,
+    flags: DegradeFlags,
+    compression: &Compression,
+) -> std::result::Result<WorkerOutput, String> {
+    let total = match kind {
+        KIND_NODE => block
+            .elements()
+            .filter(|e| matches!(e, Element::DenseNode(_) | Element::Node(_)))
+            .count(),
+        KIND_WAY => block
+            .elements()
+            .filter(|e| matches!(e, Element::Way(_)))
+            .count(),
+        KIND_RELATION => block
+            .elements()
+            .filter(|e| matches!(e, Element::Relation(_)))
+            .count(),
+        _ => return Err(format!("invalid kind constant: {kind}")),
     };
 
-    if flags.unsort {
-        if unsort.should_hold(kind) {
-            unsort.held[kind.index()] = Some(read_owned(element));
-            unsort.seen[kind.index()] += 1;
-            return Ok(());
+    // Under --unsort the merge thread must see every element in order to
+    // apply the cap-1 swap, so workers ship everything as tail.
+    let (full_count, tail_size) = if flags.unsort {
+        (0usize, total)
+    } else {
+        let tail = total % cap;
+        (total - tail, tail)
+    };
+
+    let mut bb = BlockBuilder::with_element_cap(cap);
+    let mut output: Vec<OwnedBlock> = Vec::new();
+    let mut full_framed: Vec<Vec<u8>> = Vec::new();
+    let mut tail: KindPayload = match kind {
+        KIND_NODE => KindPayload::Nodes(Vec::with_capacity(tail_size)),
+        KIND_WAY => KindPayload::Ways(Vec::with_capacity(tail_size)),
+        KIND_RELATION => KindPayload::Relations(Vec::with_capacity(tail_size)),
+        _ => KindPayload::empty(kind),
+    };
+
+    let mut idx: usize = 0;
+    let mut refs_buf: Vec<i64> = Vec::new();
+    let mut members_buf: Vec<MemberData<'_>> = Vec::new();
+    for element in block.elements() {
+        let is_match = matches!(
+            (&element, kind),
+            (Element::DenseNode(_) | Element::Node(_), KIND_NODE)
+                | (Element::Way(_), KIND_WAY)
+                | (Element::Relation(_), KIND_RELATION)
+        );
+        if !is_match {
+            continue;
         }
-        if unsort.should_inject_after(kind) {
-            // Add the kind's currently-arriving element first (it goes
-            // into the previous block, displacing the held cap-1 slot).
-            // Then add the held one (which becomes the first element of
-            // the next block, sandwiched between the higher-id element
-            // we just wrote and the rest of the new block).
-            add_element_to_builder(element, flags, bb, writer, compression)?;
-            let held = unsort.held[kind.index()].take().expect("held checked");
-            write_owned_element(&held, flags, bb, writer, compression)?;
-            unsort.fired[kind.index()] = true;
-            unsort.seen[kind.index()] += 1;
-            return Ok(());
+
+        if idx < full_count {
+            match (&element, kind) {
+                (Element::DenseNode(dn), KIND_NODE) => {
+                    ensure_node_capacity_local(&mut bb, &mut output)?;
+                    let meta = dense_node_metadata(dn);
+                    bb.add_node(
+                        dn.id(),
+                        dn.decimicro_lat(),
+                        dn.decimicro_lon(),
+                        dn.tags(),
+                        meta.as_ref(),
+                    );
+                }
+                (Element::Node(n), KIND_NODE) => {
+                    ensure_node_capacity_local(&mut bb, &mut output)?;
+                    let meta = element_metadata(&n.info());
+                    bb.add_node(
+                        n.id(),
+                        n.decimicro_lat(),
+                        n.decimicro_lon(),
+                        n.tags(),
+                        meta.as_ref(),
+                    );
+                }
+                (Element::Way(w), KIND_WAY) => {
+                    ensure_way_capacity_local(&mut bb, &mut output)?;
+                    refs_buf.clear();
+                    refs_buf.extend(w.refs());
+                    let meta = element_metadata(&w.info());
+                    // add_way drops inline LOW coords - the documented
+                    // behaviour for the decode path regardless of
+                    // --strip-locations.
+                    bb.add_way(w.id(), w.tags(), &refs_buf, meta.as_ref());
+                }
+                (Element::Relation(r), KIND_RELATION) => {
+                    ensure_relation_capacity_local(&mut bb, &mut output)?;
+                    members_buf.clear();
+                    members_buf.extend(r.members().map(|m| MemberData {
+                        id: m.id,
+                        role: m.role().unwrap_or(""),
+                    }));
+                    let meta = element_metadata(&r.info());
+                    bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
+                }
+                _ => {}
+            }
+            for owned_block in output.drain(..) {
+                full_framed.push(frame_owned(owned_block, compression, flags.strip_indexdata)?);
+            }
+        } else {
+            match (&element, &mut tail) {
+                (Element::DenseNode(dn), KindPayload::Nodes(v)) => v.push(read_dense_node(dn)),
+                (Element::Node(n), KindPayload::Nodes(v)) => v.push(read_node(n)),
+                (Element::Way(w), KindPayload::Ways(v)) => v.push(read_way(w)),
+                (Element::Relation(r), KindPayload::Relations(v)) => v.push(read_relation(r)),
+                _ => {}
+            }
         }
+        idx += 1;
     }
 
-    add_element_to_builder(element, flags, bb, writer, compression)?;
-    unsort.seen[kind.index()] += 1;
-    Ok(())
-}
-
-/// Read a borrowed element into an `OwnedElement` so it can be deferred.
-fn read_owned(element: &Element<'_>) -> OwnedElement {
-    match element {
-        Element::Node(n) => OwnedElement::Node(read_node(n)),
-        Element::DenseNode(dn) => OwnedElement::Node(read_dense_node(dn)),
-        Element::Way(w) => OwnedElement::Way(read_way(w)),
-        Element::Relation(r) => OwnedElement::Relation(read_relation(r)),
+    // Flush any final full block from the worker BB.
+    flush_local(&mut bb, &mut output)?;
+    for owned_block in output.drain(..) {
+        full_framed.push(frame_owned(owned_block, compression, flags.strip_indexdata)?);
     }
+
+    Ok(WorkerOutput { full_framed, tail })
 }
 
-/// Add a borrowed element to the BlockBuilder. Flushes via the
-/// `--strip-indexdata`-aware path so output blobs match the requested
-/// degradation when the flag is set.
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn add_element_to_builder(
-    element: &Element<'_>,
-    flags: DegradeFlags,
+/// Feed an entire `--unsort` tail into the central builder, applying the
+/// per-kind cap-1 swap. Elements are moved out of the tail (no clones).
+/// Mid-stream cap fires append blocks to `output`.
+fn feed_tail_unsort(
+    tail: KindPayload,
+    unsort: &mut UnsortKindState,
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    compression: Compression,
-) -> Result<()> {
-    match element {
-        Element::Node(n) => {
-            ensure_capacity(Kind::Node, bb, writer, flags.strip_indexdata, compression)?;
-            let meta = element_metadata(&n.info());
-            bb.add_node(
-                n.id(),
-                n.decimicro_lat(),
-                n.decimicro_lon(),
-                n.tags(),
-                meta.as_ref(),
-            );
+    output: &mut Vec<OwnedBlock>,
+) -> std::result::Result<(), String> {
+    match tail {
+        KindPayload::Nodes(v) => {
+            for n in v {
+                if unsort.should_hold() {
+                    unsort.held = Some(OwnedElement::Node(n));
+                    unsort.seen += 1;
+                } else if unsort.should_inject_after() {
+                    crate::owned::write_single_node_local(&n, bb, output)?;
+                    let held = unsort.held.take().expect("checked");
+                    write_owned_to_central(&held, bb, output)?;
+                    unsort.fired = true;
+                    unsort.seen += 1;
+                } else {
+                    crate::owned::write_single_node_local(&n, bb, output)?;
+                    unsort.seen += 1;
+                }
+            }
         }
-        Element::DenseNode(dn) => {
-            ensure_capacity(Kind::Node, bb, writer, flags.strip_indexdata, compression)?;
-            let meta = dense_node_metadata(dn);
-            bb.add_node(
-                dn.id(),
-                dn.decimicro_lat(),
-                dn.decimicro_lon(),
-                dn.tags(),
-                meta.as_ref(),
-            );
+        KindPayload::Ways(v) => {
+            for w in v {
+                if unsort.should_hold() {
+                    unsort.held = Some(OwnedElement::Way(w));
+                    unsort.seen += 1;
+                } else if unsort.should_inject_after() {
+                    crate::owned::write_single_way_local(&w, bb, output)?;
+                    let held = unsort.held.take().expect("checked");
+                    write_owned_to_central(&held, bb, output)?;
+                    unsort.fired = true;
+                    unsort.seen += 1;
+                } else {
+                    crate::owned::write_single_way_local(&w, bb, output)?;
+                    unsort.seen += 1;
+                }
+            }
         }
-        Element::Way(w) => {
-            ensure_capacity(Kind::Way, bb, writer, flags.strip_indexdata, compression)?;
-            let refs: Vec<i64> = w.refs().collect();
-            let meta = element_metadata(&w.info());
-            bb.add_way(w.id(), w.tags(), &refs, meta.as_ref());
-        }
-        Element::Relation(r) => {
-            ensure_capacity(Kind::Relation, bb, writer, flags.strip_indexdata, compression)?;
-            let members: Vec<MemberData<'_>> = r
-                .members()
-                .map(|m| MemberData {
-                    id: m.id,
-                    role: m.role().unwrap_or(""),
-                })
-                .collect();
-            let meta = element_metadata(&r.info());
-            bb.add_relation(r.id(), r.tags(), &members, meta.as_ref());
+        KindPayload::Relations(v) => {
+            for r in v {
+                if unsort.should_hold() {
+                    unsort.held = Some(OwnedElement::Relation(r));
+                    unsort.seen += 1;
+                } else if unsort.should_inject_after() {
+                    crate::owned::write_single_relation_local(&r, bb, output)?;
+                    let held = unsort.held.take().expect("checked");
+                    write_owned_to_central(&held, bb, output)?;
+                    unsort.fired = true;
+                    unsort.seen += 1;
+                } else {
+                    crate::owned::write_single_relation_local(&r, bb, output)?;
+                    unsort.seen += 1;
+                }
+            }
         }
     }
     Ok(())
 }
 
-/// Write an owned element to the BlockBuilder (used for re-injecting held
-/// elements during `--unsort`). Mirrors `add_element_to_builder` but reads
-/// from owned-element fields. Routes flushes through the
-/// strip-indexdata-aware path so output blob framing matches the rest
-/// of the run.
-fn write_owned_element(
+/// Feed a non-unsort tail straight into the central builder.
+fn feed_tail_plain(
+    tail: KindPayload,
+    bb: &mut BlockBuilder,
+    output: &mut Vec<OwnedBlock>,
+) -> std::result::Result<(), String> {
+    match tail {
+        KindPayload::Nodes(v) => {
+            for n in &v {
+                crate::owned::write_single_node_local(n, bb, output)?;
+            }
+        }
+        KindPayload::Ways(v) => {
+            for w in &v {
+                crate::owned::write_single_way_local(w, bb, output)?;
+            }
+        }
+        KindPayload::Relations(v) => {
+            for r in &v {
+                crate::owned::write_single_relation_local(r, bb, output)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_owned_to_central(
     element: &OwnedElement,
-    flags: DegradeFlags,
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    compression: Compression,
-) -> Result<()> {
+    output: &mut Vec<OwnedBlock>,
+) -> std::result::Result<(), String> {
     match element {
-        OwnedElement::Node(n) => {
-            ensure_capacity(Kind::Node, bb, writer, flags.strip_indexdata, compression)?;
-            let meta = owned_to_metadata(n.metadata.as_ref());
-            bb.add_node(
-                n.id,
-                n.decimicro_lat,
-                n.decimicro_lon,
-                n.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-                meta.as_ref(),
-            );
-        }
-        OwnedElement::Way(w) => {
-            ensure_capacity(Kind::Way, bb, writer, flags.strip_indexdata, compression)?;
-            let meta = owned_to_metadata(w.metadata.as_ref());
-            bb.add_way(
-                w.id,
-                w.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-                &w.refs,
-                meta.as_ref(),
-            );
-        }
-        OwnedElement::Relation(r) => {
-            ensure_capacity(Kind::Relation, bb, writer, flags.strip_indexdata, compression)?;
-            let members: Vec<MemberData<'_>> = r
-                .members
-                .iter()
-                .map(|m| MemberData {
-                    id: m.id,
-                    role: &m.role,
-                })
-                .collect();
-            let meta = owned_to_metadata(r.metadata.as_ref());
-            bb.add_relation(
-                r.id,
-                r.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-                &members,
-                meta.as_ref(),
-            );
-        }
+        OwnedElement::Node(n) => crate::owned::write_single_node_local(n, bb, output),
+        OwnedElement::Way(w) => crate::owned::write_single_way_local(w, bb, output),
+        OwnedElement::Relation(r) => crate::owned::write_single_relation_local(r, bb, output),
     }
-    Ok(())
 }
 
-/// Capacity check that flushes via the strip-indexdata-aware path.
-fn ensure_capacity(
-    kind: Kind,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
+fn frame_owned(
+    owned: OwnedBlock,
+    compression: &Compression,
     strip_indexdata: bool,
-    compression: Compression,
-) -> Result<()> {
-    let can_add = match kind {
-        Kind::Node => bb.can_add_node(),
-        Kind::Way => bb.can_add_way(),
-        Kind::Relation => bb.can_add_relation(),
+) -> std::result::Result<Vec<u8>, String> {
+    let (block_bytes, index, tagdata) = owned;
+    let indexdata_buf = index.serialize();
+    let indexdata = if strip_indexdata {
+        None
+    } else {
+        Some(indexdata_buf.as_slice())
     };
-    if !can_add {
-        flush_with_indexdata_choice(bb, writer, strip_indexdata, compression)?;
-    }
-    Ok(())
+    let blob = frame_blob_pipelined(&block_bytes, compression, indexdata, tagdata.as_deref())
+        .map_err(|e| e.to_string())?;
+    Ok(blob.into_vec())
 }
 
-/// Take the current block from the BlockBuilder and write it. When
-/// `strip_indexdata` is set, frame manually via `frame_blob_pipelined`
-/// with `indexdata = None` and dispatch via `write_raw_owned`. Otherwise
-/// use the standard `write_primitive_block_owned` path that embeds
-/// indexdata.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn flush_with_indexdata_choice(
-    bb: &mut BlockBuilder,
+fn frame_and_write_batch(
+    batch: Vec<OwnedBlock>,
+    compression: Compression,
     writer: &mut PbfWriter<FileWriter>,
     strip_indexdata: bool,
-    compression: Compression,
-) -> Result<()> {
-    if !strip_indexdata {
-        return flush_block(bb, writer);
-    }
-    if let Some((bytes, _index, tagdata)) = bb.take_owned()? {
-        let parts =
-            frame_blob_pipelined(&bytes, &compression, None, tagdata.as_deref())?;
-        writer.write_raw_owned(parts.into_vec())?;
-    }
-    Ok(())
-}
+) -> std::result::Result<u64, Box<dyn std::error::Error>> {
+    use rayon::prelude::*;
 
-fn flush_terminal_blocks(
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    strip_indexdata: bool,
-    compression: Compression,
-) -> Result<()> {
-    flush_with_indexdata_choice(bb, writer, strip_indexdata, compression)
-}
+    let framed: Vec<std::io::Result<Vec<u8>>> = batch
+        .into_par_iter()
+        .map(|(block_bytes, index, tagdata)| -> std::io::Result<Vec<u8>> {
+            let indexdata_buf = index.serialize();
+            let indexdata = if strip_indexdata {
+                None
+            } else {
+                Some(indexdata_buf.as_slice())
+            };
+            let blob = frame_blob_pipelined(&block_bytes, &compression, indexdata, tagdata.as_deref())?;
+            Ok(blob.into_vec())
+        })
+        .collect();
 
-/// After the writer has flushed, count the OsmData blobs in `output` so
-/// the stats summary reflects reality regardless of which path was taken.
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn blob_count(output: &Path, direct_io: bool) -> Result<u64> {
-    let mut reader = FileReader::open(output, direct_io)?;
-    let mut file_offset: u64 = 0;
-    let mut count: u64 = 0;
-    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
-        if frame.blob_type == BlobKind::OsmData {
-            count += 1;
-        }
+    let mut written: u64 = 0;
+    for r in framed {
+        let bytes = r?;
+        writer.write_raw_owned(bytes)?;
+        written += 1;
     }
-    Ok(count)
+    Ok(written)
 }

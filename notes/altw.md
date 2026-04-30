@@ -226,7 +226,52 @@ Result:
 
 Japan sparse went from 1.5x slower than japan dense to 2.5x faster.
 
-### Pass 0 wire-only scan - landed (this commit)
+### Pass 2 wire-format way reframe - landed (this commit)
+
+Lifted the wire-format reframe shape from `external/stage4.rs` into
+the dense / sparse pass 2 way arm. New file
+`src/commands/altw/reframe.rs` exposes
+`reframe_way_blob_with_locations` to `passthrough.rs::process_slot_batch`.
+
+Way slots now take the wire-format path:
+
+  decompress -> walk PrimitiveBlock wire format -> for each way:
+    parse only id + refs, copy other fields raw, strip existing
+    fields 9 / 10, append fresh fields 9 / 10 from NodeIndex::get
+    lookups (zigzag-delta-encoded inline) -> compress -> write.
+
+No `BlockBuilder`, no `StringTable::add`, no Info decode / encode,
+no ref redelta, no tag re-intern. Reviewer 3's split shape:
+`parse_block_top` / `process_group` / `splice_way_locations`.
+
+Node and Unknown slots stay on the existing
+PrimitiveBlock + `BlockBuilder` path; the wire-format equivalent
+for nodes (untagged-node skip + partial wire edit) is a separate
+follow-up item from the reviewers, not in this commit.
+
+Result (japan sparse, plantasjen 2026-04-30, dirty bench best of 3):
+
+| Metric | post wire-only (`044f642a`) | post reframe |
+|--------|-----------------------------|--------------|
+| Pass 2 wall | ~7.9 s | 7.5 s |
+| Pass 2 disk write | 2553 MB | 2547 MB |
+| Total japan sparse wall | 15.1 s | 14.9 s |
+
+Modest. Pass 2 at zlib:6 is writer-bound at this scale (single
+write thread + zlib:6 compression CPU per blob); reframe frees
+decoder CPU which the writer queue absorbs. The Measurement Notes
+section already flagged this - any pass 2 item benchmarked under
+zlib:6 risks showing as "wall unchanged" while the underlying
+work is genuinely cheaper. The follow-up items (descriptor-first
+pipeline, `to_path_parallel`, untagged-node skip) compound: once
+the writer is parallelized and node-blob CPU drops, the reframe
+savings become visible.
+
+Cross-validation passed: `brokkr verify add-locations-to-ways
+--dataset denmark` shows dense / sparse / external all produce
+byte-identical output.
+
+### Pass 0 wire-only scan - landed `87f53eb`
 
 `collect_way_referenced_node_ids` now uses
 `parallel_scan_blobs_raw` (new helper in `scan/classify.rs`) +
@@ -442,7 +487,7 @@ pass 2 structural items) are independent of the framing question.
 
 ### Pass 2 way path
 
-- Lift `reframe_way_blob_with_locations`
+- ~~Lift `reframe_way_blob_with_locations`
   (`src/commands/altw/external/stage4.rs:993`) into the dense /
   sparse pass 2 way arm at `src/commands/altw/mod.rs:630`. Copies
   the original StringTable byte-for-byte
@@ -452,7 +497,9 @@ pass 2 structural items) are independent of the framing question.
   `BlockBuilder`, no `StringTable::add`, no Info decode / encode,
   no ref redelta, no tag re-intern. The hot path becomes:
   decompress, raw protobuf scan, coord lookup, append packed lat /
-  lon, compress. (Reviewers 1, 3, 4.)
+  lon, compress. (Reviewers 1, 3, 4.)~~ **Landed (this commit) -
+  see "Landed work" above. Japan: pass 2 7.9 -> 7.5 s, total wall
+  flat at zlib:6 (writer-bound).**
 - On the reframe path, walk refs as an iterator instead of
   materializing `refs_buf: Vec<i64>` and
   `locations_buf: Vec<(i32, i32)>` at

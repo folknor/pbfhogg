@@ -10,6 +10,7 @@ pub mod external_test_hooks {
 }
 mod dense;
 mod passthrough;
+mod reframe;
 mod sparse;
 
 use std::path::Path;

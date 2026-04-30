@@ -11,8 +11,9 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::blob::{
-    decode_blob_to_headerblock, decompress_blob, parse_blob_header_with_index,
-    parse_primitive_block_from_bytes_owned, BlobKind, DecompressPool, WireBlob,
+    decode_blob_to_headerblock, decompress_blob, decompress_blob_raw,
+    parse_blob_header_with_index, parse_primitive_block_from_bytes_owned, BlobKind,
+    DecompressPool, WireBlob,
 };
 use crate::blob_meta::{BlobIndex, ElemKind};
 use crate::block_builder::{BlockBuilder, OwnedBlock};
@@ -27,6 +28,7 @@ use crate::commands::{
     BATCH_MIN_BLOBS,
 };
 
+use super::reframe::{reframe_way_blob_with_locations, WayReframeScratch};
 use super::{process_block, NodeIndex, Stats};
 use super::Result;
 
@@ -411,12 +413,22 @@ pub(super) fn write_output_passthrough(
 
 /// Process a batch of slots in parallel: decompress, transform, write.
 ///
-/// One par_iter pass per slot: decompress + parse + process_block +
-/// flush_local. Way refs resolve via inline `NodeIndex::get` against
-/// either the dense or sparse index. The previous sparse-only
-/// pre-resolve (decompress all, then sort refs by mmap offset, then
-/// sequential scan) was a serial step that capped pass 2 at ~4 cores;
-/// inline lookups scale with the rayon worker count instead.
+/// Way slots take the wire-format reframe path: decompress -> walk
+/// PrimitiveBlock wire format -> for each way append packed lat / lon
+/// fields built from `NodeIndex::get` lookups -> compress + write. No
+/// `BlockBuilder`, no `StringTable::add`, no Info decode / encode, no
+/// ref redelta, no tag re-intern. Lifted from `external/stage4.rs`.
+///
+/// Node and Unknown slots still take the full
+/// PrimitiveBlock + `BlockBuilder` path: the node arm filters untagged
+/// nodes and re-encodes (the wire-format equivalent is a separate
+/// optimization, not in this commit).
+///
+/// Way refs resolve via inline `NodeIndex::get` against either the
+/// dense or sparse index. The previous sparse-only pre-resolve
+/// (decompress all, then sort refs by mmap offset, then sequential
+/// scan) was a serial step that capped pass 2 at ~4 cores; inline
+/// lookups scale with the rayon worker count instead.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn process_slot_batch(
     batch: &[BatchSlot],
@@ -437,10 +449,36 @@ fn process_slot_batch(
                     Vec::<i64>::new(),
                     Vec::<(i32, i32)>::new(),
                     DecompressPool::new(),
+                    WayReframeScratch::default(),
+                    Vec::<u8>::new(),
+                    Vec::<u8>::new(),
                 )
             },
-            |(bb, output, refs_buf, locations_buf, pool), slot| {
+            |(bb, output, refs_buf, locations_buf, pool, way_scratch, decompress_buf, reframe_output), slot| {
                 output.clear();
+
+                if let BatchSlot::Way(frame) = slot {
+                    decompress_blob_raw(frame.blob_bytes(), decompress_buf)
+                        .map_err(|e| e.to_string())?;
+                    let stats = reframe_way_blob_with_locations(
+                        decompress_buf, node_index, reframe_output, way_scratch,
+                    )?;
+                    let index = BlobIndex {
+                        kind: ElemKind::Way,
+                        min_id: stats.min_way_id,
+                        max_id: stats.max_way_id,
+                        count: stats.way_count,
+                        bbox: None,
+                    };
+                    output.push((std::mem::take(reframe_output), index, None));
+                    let block_stats = Stats {
+                        ways_written: stats.way_count,
+                        missing_locations: stats.missing_locations,
+                        blobs_decoded: 1,
+                        ..Stats::default()
+                    };
+                    return Ok((std::mem::take(output), block_stats));
+                }
 
                 let wire_blob = WireBlob::parse_slice(slot.frame().blob_bytes())
                     .map_err(|e| e.to_string())?;

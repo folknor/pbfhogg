@@ -1,143 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 - 2026-05-09
 
 ### Breaking changes
 
-- **`add-locations-to-ways --index-type dense` removed.** Dense
-  was outperformed by the new sparse rank-indexed flat layout at
-  every measured scale (japan dense 51.6 s vs sparse 11.9 s,
-  4.3x; europe dense OOMed, sparse completes at 5:59) and there
-  was no regime where dense won. The flag now errors with a
-  pointer to `--index-type sparse`. The default `--index-type`
-  changed from `dense` to `sparse`. `--index-type auto` now
-  resolves to `external if sorted+indexed, sparse otherwise`
-  (previously fell back to dense). See `notes/altw.md` for the
-  measurement record.
+- **`add-locations-to-ways --index-type dense` removed.** Sparse beats dense at every measured scale (japan 51.6s → 11.9s, europe dense OOMed) with no regime where dense won. The flag now errors pointing at `--index-type sparse`. Default `--index-type` changed from `dense` to `sparse`. `--index-type auto` now resolves to `external if sorted+indexed, sparse otherwise` (was: dense fallback).
 
 ### Commands
 
-- **add-locations-to-ways**: substantial performance and
-  memory-safety arc on dense / sparse paths. Japan sparse went
-  20.9 s -> 11.9 s (-43%); europe sparse went from "OOM at
-  9:56" to "completes at 5:59" - now competitive with external
-  at europe scale. Five-item structural cleanup + sparse
-  encoding redesign:
-  - Rel-member scan migrated from `parallel_classify_accumulate`
-    (per-worker IdSet) to `parallel_classify_phase` (per-blob
-    `Vec<i64>` through bounded result channel). Bounds peak anon
-    from N-workers x ~3 GB at planet to ~1.3 GB shared IdSet.
-    Was a planet blocker on its own.
-  - Pass 0 (way-ref node-id collection) goes through
-    `parallel_scan_blobs_raw` + `scan_way_refs` (wire-only, no
-    `PrimitiveBlock` construction). Drops per-blob StringTable
-    parse and group_ranges scratch.
-  - Pass 2 way blobs go through wire-format reframe (lifted from
-    external/stage4): copy StringTable bytes, copy non-way
-    fields verbatim, append packed lat/lon to original way
-    bytes from `NodeIndex::get` lookups. No BlockBuilder, no
-    StringTable::add, no Info / tag / ref re-encode.
-  - Pass 2 dispatch is now descriptor-first: `HeaderWalker`
-    builds a `BlobDescriptor` schedule, partitioned into decode
-    + passthrough; bounded ordered channel feeds workers and
-    consumer. Read + decode + write overlap; raw-frame retention
-    drops from a ~128-blob batch to channel depth.
-  - Pass 2 writer routed through `to_path_parallel` (was
-    single-thread `to_path`). Lifts the ~1.5 GB/s NVMe write
-    ceiling at planet.
-  - Sparse encoding switched to rank-indexed flat: file sized
-    `referenced.total_count() * 8` bytes, mmap-write via
-    AtomicU64 stores at byte offset
-    `IdSet::rank_if_set(node_id) << 3`. Disk shrinks 2.4-2.8x
-    (japan 5.7 GB -> 2.0 GB; europe ~52 GB -> ~29 GB). Pass 1
-    becomes data-parallel end-to-end (avg cores 6.5 -> 21.1 at
-    japan). Removes the strictly-increasing-id precondition.
-
-- **merge-changes**: parallel-drain via per-worker gzip members. When
-  N > 1, each worker runs the full per-input pipeline (parse + XML
-  re-emit + gzip-compress) into its own buffer; main thread writes a
-  pre-built XML prelude gzip member, the worker chunks in input
-  order, and a postlude gzip member. Multi-member gzip; OSC consumers
-  (osmium, osmosis, gzip CLI, `MultiGzDecoder`) all support it.
-  Planet 7-OSC `--osc-range 4914..4920`: **267s → 55s, 5.0×**
-  (UUID `b6e964cc` at commit `99057fa`, plantasjen). 1-OSC fast path
-  unchanged at 44s. Action-tag elision is now per-input rather than
-  global, adding ~50 bytes per input boundary; output remains valid
-  OSC. Output bytes are within 1% of the serial path. The streaming
-  path's parallel implementation is the headline; `--simplify`
-  parallelizes the parse phase the same way as the streaming path
-  AND parallelizes `write_simplified`'s output: after the BTreeMap
-  dedupe, each non-empty action group is split into chunks (one per
-  available core), each chunk emits a self-contained
-  `<action>...</action>` gzip member, main thread concatenates with
-  the same prelude/postlude wrapping. Planet 7-OSC `--simplify`:
-  **262s -> 74s, 3.6x** (UUID `3e3ef119` at commit `abd1d9e`). New
-  `-j/--jobs N` flag caps the worker pool (defaults to
-  `available_parallelism()`); useful for benchmarking sweeps and
-  capping concurrency on memory-tight hosts.
-- **repack**: new command. Re-encode a PBF with a configurable
-  `--elements-per-blob N` cap. Element semantics, tags, refs, members,
-  metadata, and DenseNodes encoding round-trip; output is type-sorted
-  and propagates `Sort.Type_then_ID`. Primary use case: producing
-  same-corpus-different-encoding pairs for the blob-density measurement
-  matrix (`reference/blob-density.md`). Both shrink (cap < input blob
-  size) and grow (cap > input blob size) work: workers re-encode the
-  leading `M - (M%cap)` matching elements per input blob in parallel,
-  and the merge thread runs a single long-lived `BlockBuilder` per
-  kind that coalesces the trailing `M%cap` elements across input-blob
-  boundaries. The "never fired" warning fires only when the cap
-  exceeds every kind's total element count (every kind collapses to a
-  single output blob). New `repack_input_blobs_coalesced` sidecar
-  counter tracks how often a trailing slice extends a non-empty
-  central builder.
-- **degrade**: new command. Produce a valid-but-adversarial PBF for
-  benchmarking non-optimal code paths. v1 ships three composable
-  transformations: `--unsort` (clear `Sort.Type_then_ID`, perturb the
-  element stream so at least one adjacent same-kind blob pair has
-  overlapping IDs - triggers `sort`'s overlap-rewrite path);
-  `--strip-locations` (drop the `LocationsOnWays` header feature);
-  `--strip-indexdata` (clear `BlobHeader.indexdata` on every OsmData
-  blob, forcing `--force` / non-indexed fallback paths). Flags compose;
-  at least one is required. `--strip-indexdata` alone runs as a
-  blob-level passthrough (payload bit-identical); other combinations
-  decode and re-encode through `BlockBuilder`.
-- **degrade** decode path: switched from single-pass
-  `into_blocks_pipelined` + serial encoder to three sequential per-kind
-  phases driven by `parallel_classify_phase` (mirrors `repack`).
-  Resolves the planet-scale OOM that took out `--unsort` and
-  `--strip-locations` in every measurement mode (28-29 GB anon kill on
-  a 30 GB host). New `--force` flag skips the indexdata precondition
-  the per-kind classify pipeline requires; without it, an unindexed
-  input fails fast with the standard guidance. `--strip-indexdata`
-  alone still runs as the same blob-level passthrough and accepts
-  non-indexed input. Throughput note: `--unsort` serializes its kind's
-  encoding on the merge thread (the cap-1 swap needs serial element
-  ordering); `--strip-locations` keeps the parallel worker re-encode
-  path.
-- **time-filter** (snapshot path): migrated to `parallel_classify_phase`
-  + `ReorderBuffer`, mirroring the architecture that unblocked
-  `cat --clean` and `check --ids` in 0.3.0. Planet was 5× SIGKILL at
-  ~94 s wall in 0.3.0; now planet-safe at 4m30s with 812 MB peak anon
-  (was ~28 GB at SIGKILL). Europe peak anon drops 16.9 GB → 324 MB
-  (-98 %); Europe wall regresses 1m32s → 2m27s (+59 %) - the cost of
-  giving up the iter-5 thread-local-BB capacity reuse to bound
-  cross-thread retention. Removed the now-unused pool plumbing
-  (`buf_pool` module, `BlockBuilder::take_owned_swap`,
-  `write_primitive_block_owned_pooled`).
-- **tags-filter** `--invert-match`: `collect_way_node_dependencies`
-  migrated to `parallel_classify_phase`. Planet `-i w/highway=primary`
-  peak anon 28.3 GB → 7.0 GB. Wall is within noise (8m08s → 7m57s);
-  the command moves off the "not yet planet-safe" list with comfortable
-  RAM headroom on a 30 GB host.
-- **getid** `--add-referenced`: new `getid_dep_node_ids` sidecar
-  counter emitted after `GETID_PASS1_END` so the dep-set size surfaces
-  before pass 2 starts. Bench-first measurement on planet (brokkr's
-  reference workload: 3 ways + 3 relations + ~76 dep nodes) recorded
-  96.3 s wall and 1.26 GB peak anon at `GETID_PASS2`, retiring the
-  par_iter+collect planet-OOM concern from TODO.md. The predicted
-  peak depended on a high-keep-rate workload that this ID set
-  doesn't produce; future risk path is unchanged for much wider
-  input distributions.
+- **add-locations-to-ways** sparse: rewritten as a rank-indexed flat layout with parallel pass 1 and wire-format reframe in pass 2. Japan 20.9s → 11.9s (-43%); europe OOM → 5m59s (now competitive with external). Temp disk shrinks 2.4-2.8× (japan 5.7 GB → 2.0 GB; europe 52 GB → 29 GB). The strictly-increasing-id precondition is gone.
+- **merge-changes**: parallel-drain via multi-member gzip output. Planet 7-OSC `--osc-range 4914..4920`: **267s → 55s (5.0×)**; `--simplify`: **262s → 74s (3.6×)**. 1-OSC fast path unchanged. Output is within 1% of the serial path's bytes; OSC consumers (osmium, osmosis, gzip CLI, `MultiGzDecoder`) all accept multi-member gzip. New `-j/--jobs N` caps the worker pool.
+- **repack**: new command. Re-encode a PBF with a configurable `--elements-per-blob N` cap. Tags, refs, members, metadata, and DenseNodes encoding round-trip; output is type-sorted and propagates `Sort.Type_then_ID`. Primary use case: producing same-corpus-different-encoding pairs for blob-density measurement.
+- **degrade**: new command. Produce a valid-but-adversarial PBF for benchmarking non-optimal code paths. Three composable transformations: `--unsort` (clear `Sort.Type_then_ID` and overlap adjacent same-kind blobs), `--strip-locations` (drop `LocationsOnWays`), `--strip-indexdata` (clear `BlobHeader.indexdata` on every OsmData blob). At least one required; `--strip-indexdata` alone is a blob-level passthrough (payload bit-identical). Planet-safe in all combinations.
+- **time-filter** (snapshot path): now planet-safe. Planet 5× SIGKILL → 4m30s, 812 MB peak anon (was ~28 GB at kill). Europe peak anon 16.9 GB → 324 MB (-98%); europe wall regresses 1m32s → 2m27s - the cost of bounding cross-thread retention.
+- **tags-filter** `--invert-match`: planet-safe. `-i w/highway=primary` peak anon 28.3 GB → 7.0 GB on planet; wall within noise (8m08s → 7m57s).
 
 ### Library API
 

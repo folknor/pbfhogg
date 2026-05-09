@@ -133,7 +133,7 @@ pbfhogg sort [OPTIONS] --output <OUTPUT> <FILE>
 
 ### repack
 
-> **Unreleased** - lands in the next pbfhogg release after 0.3.0.
+> **0.4.0**
 
 Re-encode a PBF with a configurable per-blob element cap. Element semantics, tags, refs, members, metadata, and DenseNodes encoding all round-trip; output is type-sorted and propagates `Sort.Type_then_ID` from the input header.
 
@@ -158,7 +158,7 @@ pbfhogg repack [OPTIONS] --output <OUTPUT> <FILE>
 
 ### degrade
 
-> **Unreleased** - lands in the next pbfhogg release after 0.3.0.
+> **0.4.0**
 
 Produce a valid-but-adversarial PBF by stripping properties or perturbing structure. Each flag composes; at least one is required. Used to produce inputs for benchmarking non-optimal code paths (`sort` overlap-rewrite, `add-locations-to-ways`, `--force` fallbacks).
 

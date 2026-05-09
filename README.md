@@ -80,7 +80,7 @@ The goal for pbfhogg 1.0 is that every CLI command must be planet-scale safe on 
 
 ```toml
 [dependencies]
-pbfhogg = "0.3"
+pbfhogg = "0.4"
 ```
 
 ```rust

@@ -79,12 +79,12 @@ memmap2 = "0.9"
 rayon = "1.12.0"
 rustc-hash = "2.1.2"
 zstd = "0.13"
-hotpath = "0.15"
-quick-xml = "0.39"
+hotpath = "0.16.0"
+quick-xml = "0.39.4"
 serde_json = { version = "1", optional = true }
 s2 = { version = "0.0.13", optional = true }
 io-uring = { version = "0.7.12", optional = true }
-libc = "0.2.185"
+libc = "0.2.186"
 
 
 [dev-dependencies]

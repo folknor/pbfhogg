@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Dependencies
+
+- `hotpath` 0.15.0 → 0.15.1, `libc` 0.2.185 → 0.2.186, `quick-xml` 0.39.2 → 0.39.4 (patch bumps).
+
 ## 0.4.0 - 2026-05-09
 
 ### Breaking changes

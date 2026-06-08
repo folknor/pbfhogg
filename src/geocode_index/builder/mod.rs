@@ -99,7 +99,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     // Scoped to this command; other pbfhogg paths unaffected. Same prelude
     // used by renumber_external / check_refs / verify_ids for the same
     // reason.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
         libc::mallopt(libc::M_ARENA_MAX, 2);
     }

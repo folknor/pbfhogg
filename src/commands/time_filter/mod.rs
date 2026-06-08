@@ -245,7 +245,7 @@ fn time_filter_snapshot(
     // -24 % anon on the pre-migration code, but that pre-migration code
     // had thread-local BlockBuilder state surviving across blobs on the
     // same rayon worker. parallel_classify_phase has no such state.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
         libc::mallopt(libc::M_ARENA_MAX, 2);
     }

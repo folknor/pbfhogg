@@ -140,7 +140,7 @@ pub fn repack(
 
     // Cap glibc arenas to prevent cross-thread alloc/free fragmentation in
     // the per-blob worker pool. Same precedent as `cat --clean`.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
         libc::mallopt(libc::M_ARENA_MAX, 2);
     }

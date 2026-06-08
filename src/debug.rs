@@ -37,7 +37,7 @@ pub fn emit_counter(name: &str, value: i64) {
 /// - `<prefix>_keepcost`  - top-most releasable block in arena
 ///
 /// On non-glibc platforms this is a no-op.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub fn emit_mallinfo2(prefix: &str) {
     // SAFETY: mallinfo2 is a glibc function safe to call from any thread.
     let info = unsafe { libc::mallinfo2() };
@@ -52,7 +52,7 @@ pub fn emit_mallinfo2(prefix: &str) {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 pub fn emit_mallinfo2(_prefix: &str) {}
 
 /// Ask glibc to return free chunks above the trim threshold to the OS
@@ -71,13 +71,13 @@ pub fn emit_mallinfo2(_prefix: &str) {}
 /// batches at planet, ~150 ms total).
 ///
 /// On non-glibc / non-Linux this is a no-op returning 0.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub fn malloc_trim() -> i32 {
     // SAFETY: malloc_trim is a glibc function safe to call from any thread.
     unsafe { libc::malloc_trim(0) }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 pub fn malloc_trim() -> i32 {
     0
 }
@@ -96,14 +96,14 @@ pub fn malloc_trim() -> i32 {
 ///
 /// Call once early in the run; the setting is process-global. On
 /// non-glibc / non-Linux this is a no-op returning 0.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub fn set_mmap_threshold(bytes: i32) -> i32 {
     // SAFETY: mallopt is glibc and safe to call from any thread
     // before allocations grow past the desired threshold.
     unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, bytes) }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 pub fn set_mmap_threshold(_bytes: i32) -> i32 {
     0
 }

@@ -82,9 +82,7 @@ impl AlignedReadBuffer {
         self.len = 0;
         // Safety: ptr is page-aligned, capacity is a multiple of PAGE_SIZE,
         // and fd is open with O_DIRECT.
-        let n = unsafe {
-            libc::read(fd, self.ptr.as_ptr().cast(), self.capacity())
-        };
+        let n = unsafe { libc::read(fd, self.ptr.as_ptr().cast(), self.capacity()) };
         if n < 0 {
             return Err(io::Error::last_os_error());
         }

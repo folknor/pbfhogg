@@ -1,9 +1,9 @@
 //! Stage 3: Slot reorder - emit per-blob coord_payloads via the integrated
 //! pipeline (the flat coord_slots intermediate was retired 2026-04).
 
+use super::super::Result;
 #[cfg(feature = "linux-direct-io")]
 use super::radix::advise_dontneed_file;
-use super::super::Result;
 
 // Fault-injection hooks for tests. Gated behind the `test-hooks`
 // Cargo feature; release builds don't compile this module at all.
@@ -27,12 +27,12 @@ pub mod test_hooks {
         PANIC_AT_BUCKET_IDX.store(usize::MAX, Ordering::Relaxed);
     }
 }
+use super::blob_bucket_index::{BlobBucketIntersection, classify_blobs_in_bucket};
 use super::coord_payloads::{
-    encode_blob_payload_from_record, AbortOnDrop, ConcurrentBlobLocationRouter, PerWayRcs,
-    StraddlerSide,
+    AbortOnDrop, ConcurrentBlobLocationRouter, PerWayRcs, StraddlerSide,
+    encode_blob_payload_from_record,
 };
-use super::blob_bucket_index::{classify_blobs_in_bucket, BlobBucketIntersection};
-use super::{RESOLVED_ENTRY_SIZE, COORD_SLOT_SIZE};
+use super::{COORD_SLOT_SIZE, RESOLVED_ENTRY_SIZE};
 
 /// Lightweight reference to slot bucket paths + counts for stage 3.
 pub(super) struct SlotBucketRef {
@@ -70,9 +70,7 @@ fn scatter_bucket_entries(
     let bucket_slots = scatter_buf.len() / COORD_SLOT_SIZE;
     let mut stores: u64 = 0;
     for chunk in data_buf.chunks_exact(RESOLVED_ENTRY_SIZE) {
-        let local_slot_pos = u32::from_le_bytes([
-            chunk[0], chunk[1], chunk[2], chunk[3],
-        ]) as usize;
+        let local_slot_pos = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as usize;
         if local_slot_pos >= bucket_slots {
             return Err(format!(
                 "slot bucket {bucket_idx} local_pos {local_slot_pos} outside bucket slot span {bucket_slots}"
@@ -359,7 +357,9 @@ pub(super) fn stage3_slot_reorder(
             }
         }
         if let Some(e) = first_err {
-            *s3_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
+            *s3_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
         }
     });
 
@@ -377,12 +377,21 @@ pub(super) fn stage3_slot_reorder(
         crate::debug::emit_counter("s3_buckets_loaded", s3_buckets_loaded.load(Relaxed) as i64);
         crate::debug::emit_counter("s3_bytes_read", s3_bytes_read.load(Relaxed) as i64);
         crate::debug::emit_counter("s3_scatter_stores", s3_scatter_stores.load(Relaxed) as i64);
-        crate::debug::emit_counter("s3_max_worker_buf_bytes", s3_max_worker_buf_bytes.load(Relaxed) as i64);
+        crate::debug::emit_counter(
+            "s3_max_worker_buf_bytes",
+            s3_max_worker_buf_bytes.load(Relaxed) as i64,
+        );
         crate::debug::emit_counter("s3_fadvise_calls", s3_fadvise_calls.load(Relaxed) as i64);
         crate::debug::emit_counter("s3_fadvise_bytes", s3_fadvise_bytes.load(Relaxed) as i64);
         crate::debug::emit_counter("s3_encode_ms", s3_integ_encode_ms.load(Relaxed) as i64);
-        crate::debug::emit_counter("s3_straddler_copy_ms", s3_integ_straddler_copy_ms.load(Relaxed) as i64);
-        crate::debug::emit_counter("s3_worker_tmp_bytes", s3_integ_worker_tmp_bytes.load(Relaxed) as i64);
+        crate::debug::emit_counter(
+            "s3_straddler_copy_ms",
+            s3_integ_straddler_copy_ms.load(Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s3_worker_tmp_bytes",
+            s3_integ_worker_tmp_bytes.load(Relaxed) as i64,
+        );
     }
 
     Ok(())
@@ -419,7 +428,11 @@ fn emit_integrated_intersections(
             BlobBucketIntersection::FullyContained { blob_idx } => {
                 let blob_idx = *blob_idx;
                 let blob_start = ctx.way_slot_starts[blob_idx];
-                let blob_end = ctx.way_slot_starts.get(blob_idx + 1).copied().unwrap_or(total_slots);
+                let blob_end = ctx
+                    .way_slot_starts
+                    .get(blob_idx + 1)
+                    .copied()
+                    .unwrap_or(total_slots);
                 #[allow(clippy::cast_possible_truncation)]
                 let local_start = ((blob_start - bucket_start) as usize) * COORD_SLOT_SIZE;
                 #[allow(clippy::cast_possible_truncation)]
@@ -434,7 +447,7 @@ fn emit_integrated_intersections(
                     blob_idx,
                     encode_scratch,
                 )
-                    .map_err(|e| format!("encode blob {blob_idx}: {e}"))?;
+                .map_err(|e| format!("encode blob {blob_idx}: {e}"))?;
                 #[allow(clippy::cast_possible_truncation)]
                 s3_integ_encode_ref.fetch_add(t_enc.elapsed().as_millis() as u64, Relaxed);
 
@@ -476,7 +489,11 @@ fn emit_integrated_intersections(
             }
             BlobBucketIntersection::RightHalf { blob_idx } => {
                 let blob_idx = *blob_idx;
-                let blob_end = ctx.way_slot_starts.get(blob_idx + 1).copied().unwrap_or(total_slots);
+                let blob_end = ctx
+                    .way_slot_starts
+                    .get(blob_idx + 1)
+                    .copied()
+                    .unwrap_or(total_slots);
                 #[allow(clippy::cast_possible_truncation)]
                 let local_end = ((blob_end - bucket_start) as usize) * COORD_SLOT_SIZE;
                 let slice = &scatter_buf[..local_end];

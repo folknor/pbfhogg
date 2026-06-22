@@ -25,9 +25,7 @@ use std::sync::mpsc::sync_channel;
 pub use crate::write::compression::{Compression, ParseCompressionError};
 
 // Blob framing / encoding helpers live in the sibling `framing` module.
-use super::framing::{
-    encode_blob_body, frame_blob_into, FrameScratch, PIPELINE_SCRATCH,
-};
+use super::framing::{FrameScratch, PIPELINE_SCRATCH, encode_blob_body, frame_blob_into};
 pub(crate) use super::framing::{
     encode_blob_header_into, frame_blob, frame_blob_pipelined, reframe_raw_with_index,
 };
@@ -35,8 +33,8 @@ pub(crate) use super::framing::{
 // Pipeline plumbing (ordered channel items, sink trait, permit pool, writer
 // thread) lives in the sibling `pipeline` module.
 use super::pipeline::{
-    elapsed_ns_u64, new_permit_pool, record_send_wait, writer_thread, FileOutputSink,
-    OutputChunk, PipelineItem, WritePipeline, WRITE_AHEAD,
+    FileOutputSink, OutputChunk, PipelineItem, WRITE_AHEAD, WritePipeline, elapsed_ns_u64,
+    new_permit_pool, record_send_wait, writer_thread,
 };
 
 /// Writes PBF files as a sequence of framed, compressed blobs.
@@ -210,7 +208,9 @@ impl PbfWriter<FileWriter> {
             Err(_) => {
                 drop(tx);
                 return Err(match handle.join() {
-                    Ok(Ok(())) => io::Error::other("parallel writer thread exited without init signal"),
+                    Ok(Ok(())) => {
+                        io::Error::other("parallel writer thread exited without init signal")
+                    }
                     Ok(Err(e)) => e,
                     Err(_) => io::Error::other("parallel writer thread panicked during init"),
                 });
@@ -307,9 +307,10 @@ impl<W: Write> PbfWriter<W> {
             // doc comment for the planet-scale OOM story that motivated
             // this).
             let t_permit = std::time::Instant::now();
-            pipeline.permit_rx.recv().map_err(|_| {
-                io::Error::other("pipelined writer permit pool disconnected")
-            })?;
+            pipeline
+                .permit_rx
+                .recv()
+                .map_err(|_| io::Error::other("pipelined writer permit pool disconnected"))?;
             WRITER_METRICS
                 .permit_wait_ns
                 .fetch_add(elapsed_ns_u64(t_permit), Relaxed);
@@ -320,10 +321,8 @@ impl<W: Write> PbfWriter<W> {
             let tx = pipeline.tx.clone();
             let permit_tx = pipeline.permit_tx.clone();
             rayon::spawn(move || {
-                let indexdata = blob_meta::scan_block_ids(&uncompressed)
-                    .map(|idx| idx.serialize());
-                let tagdata = blob_meta::scan_block_tags(&uncompressed)
-                    .map(|ti| ti.serialize());
+                let indexdata = blob_meta::scan_block_ids(&uncompressed).map(|idx| idx.serialize());
+                let tagdata = blob_meta::scan_block_tags(&uncompressed).map(|ti| ti.serialize());
                 let result = PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
                     frame_blob_into(
                         "OSMData",
@@ -356,10 +355,8 @@ impl<W: Write> PbfWriter<W> {
             });
             Ok(())
         } else {
-            let indexdata = blob_meta::scan_block_ids(block_bytes)
-                .map(|idx| idx.serialize());
-            let tagdata = blob_meta::scan_block_tags(block_bytes)
-                .map(|ti| ti.serialize());
+            let indexdata = blob_meta::scan_block_ids(block_bytes).map(|idx| idx.serialize());
+            let tagdata = blob_meta::scan_block_tags(block_bytes).map(|ti| ti.serialize());
             self.write_framed_blob(
                 "OSMData",
                 block_bytes,
@@ -387,9 +384,10 @@ impl<W: Write> PbfWriter<W> {
     pub fn write_primitive_block_no_indexdata(&mut self, block_bytes: &[u8]) -> io::Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
             let t_permit = std::time::Instant::now();
-            pipeline.permit_rx.recv().map_err(|_| {
-                io::Error::other("pipelined writer permit pool disconnected")
-            })?;
+            pipeline
+                .permit_rx
+                .recv()
+                .map_err(|_| io::Error::other("pipelined writer permit pool disconnected"))?;
             WRITER_METRICS
                 .permit_wait_ns
                 .fetch_add(elapsed_ns_u64(t_permit), Relaxed);
@@ -401,14 +399,7 @@ impl<W: Write> PbfWriter<W> {
             let permit_tx = pipeline.permit_tx.clone();
             rayon::spawn(move || {
                 let result = PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
-                    frame_blob_into(
-                        "OSMData",
-                        &uncompressed,
-                        &compression,
-                        None,
-                        None,
-                        scratch,
-                    )
+                    frame_blob_into("OSMData", &uncompressed, &compression, None, None, scratch)
                 });
                 if let Ok(ref parts) = result {
                     WRITER_METRICS.payload_framed_items.fetch_add(1, Relaxed);
@@ -451,9 +442,10 @@ impl<W: Write> PbfWriter<W> {
             // `write_primitive_block` above and the
             // `PIPELINE_DISPATCH_PERMITS` doc comment for why.
             let t_permit = std::time::Instant::now();
-            pipeline.permit_rx.recv().map_err(|_| {
-                io::Error::other("pipelined writer permit pool disconnected")
-            })?;
+            pipeline
+                .permit_rx
+                .recv()
+                .map_err(|_| io::Error::other("pipelined writer permit pool disconnected"))?;
             WRITER_METRICS
                 .permit_wait_ns
                 .fetch_add(elapsed_ns_u64(t_permit), Relaxed);
@@ -492,12 +484,7 @@ impl<W: Write> PbfWriter<W> {
             });
             Ok(())
         } else {
-            self.write_framed_blob(
-                "OSMData",
-                &block_bytes,
-                Some(indexdata.as_slice()),
-                tagdata,
-            )
+            self.write_framed_blob("OSMData", &block_bytes, Some(indexdata.as_slice()), tagdata)
         }
     }
 
@@ -748,7 +735,9 @@ impl PbfWriter<FileWriter> {
         if let Some(ref mut pipeline) = self.pipeline {
             let seq = pipeline.seq;
             pipeline.seq += 1;
-            WRITER_METRICS.payload_copy_range_items.fetch_add(1, Relaxed);
+            WRITER_METRICS
+                .payload_copy_range_items
+                .fetch_add(1, Relaxed);
             WRITER_METRICS
                 .payload_copy_range_bytes
                 .fetch_add(len, Relaxed);

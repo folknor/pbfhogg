@@ -5,7 +5,7 @@
 
 use bytes::Bytes;
 
-use crate::error::{new_blob_error, new_wire_error, BlobError, Result};
+use crate::error::{BlobError, Result, new_blob_error, new_wire_error};
 
 /// Blob type parsed from BlobHeader, avoiding per-blob String allocation.
 ///
@@ -77,7 +77,9 @@ impl WireBlobHeader {
                 3 => {
                     // datasize: int32 (varint)
                     #[allow(clippy::cast_possible_truncation)]
-                    { datasize = cursor.read_varint()? as i32; }
+                    {
+                        datasize = cursor.read_varint()? as i32;
+                    }
                 }
                 4 if parse_tagdata => {
                     // tagdata: per-blob tag key index (len-delimited)
@@ -90,7 +92,12 @@ impl WireBlobHeader {
             }
         }
 
-        Ok(WireBlobHeader { blob_type, datasize, indexdata, tagdata })
+        Ok(WireBlobHeader {
+            blob_type,
+            datasize,
+            indexdata,
+            tagdata,
+        })
     }
 }
 
@@ -134,7 +141,9 @@ impl WireBlob {
                 2 => {
                     // raw_size: int32 (varint)
                     #[allow(clippy::cast_possible_truncation)]
-                    { raw_size = Some(cursor.read_varint()? as i32); }
+                    {
+                        raw_size = Some(cursor.read_varint()? as i32);
+                    }
                 }
                 3 => {
                     // zlib_data: bytes (len-delimited)
@@ -186,7 +195,12 @@ pub const MAX_BLOB_MESSAGE_SIZE: u64 = 32 * 1024 * 1024;
 #[allow(clippy::type_complexity)]
 pub(crate) fn parse_blob_header_with_index(
     header_bytes: &[u8],
-) -> Result<(BlobKind, usize, Option<[u8; crate::blob_meta::INDEX_SIZE]>, Option<Box<[u8]>>)> {
+) -> Result<(
+    BlobKind,
+    usize,
+    Option<[u8; crate::blob_meta::INDEX_SIZE]>,
+    Option<Box<[u8]>>,
+)> {
     let header = WireBlobHeader::parse(header_bytes, true, true)?;
     if header.datasize < 0 {
         return Err(new_blob_error(BlobError::InvalidDataSize {
@@ -194,5 +208,10 @@ pub(crate) fn parse_blob_header_with_index(
         }));
     }
     #[allow(clippy::cast_sign_loss)]
-    Ok((header.blob_type, header.datasize as usize, header.indexdata, header.tagdata))
+    Ok((
+        header.blob_type,
+        header.datasize as usize,
+        header.indexdata,
+        header.tagdata,
+    ))
 }

@@ -15,8 +15,8 @@ use std::path::Path;
 
 use common::cli::CliInvoker;
 use common::{
-    read_all_elements_with_coords, read_header, write_test_pbf, PbfContentsWithCoords, TestNode,
-    TestRelation, TestWay,
+    PbfContentsWithCoords, TestNode, TestRelation, TestWay, read_all_elements_with_coords,
+    read_header, write_test_pbf,
 };
 use pbfhogg::block_builder::{self, BlockBuilder, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
@@ -48,14 +48,22 @@ fn write_unsorted_overlapping_pbf(path: &Path) {
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new().build().expect("build header");
+    let header = block_builder::HeaderBuilder::new()
+        .build()
+        .expect("build header");
     writer.write_header(&header).expect("write header");
 
     let mut bb = BlockBuilder::new();
 
     // Blob 1: odd node IDs
     for id in (1..=9).step_by(2) {
-        bb.add_node(id, id as i32 * 1_000_000, id as i32 * 2_000_000, std::iter::empty::<(&str, &str)>(), None);
+        bb.add_node(
+            id,
+            id as i32 * 1_000_000,
+            id as i32 * 2_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
     }
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");
@@ -63,7 +71,13 @@ fn write_unsorted_overlapping_pbf(path: &Path) {
 
     // Blob 2: even node IDs (overlapping range with blob 1)
     for id in (2..=10).step_by(2) {
-        bb.add_node(id, id as i32 * 1_000_000, id as i32 * 2_000_000, std::iter::empty::<(&str, &str)>(), None);
+        bb.add_node(
+            id,
+            id as i32 * 1_000_000,
+            id as i32 * 2_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
     }
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");
@@ -78,7 +92,10 @@ fn write_unsorted_overlapping_pbf(path: &Path) {
     bb.add_relation(
         300,
         [("type", "route")],
-        &[pbfhogg::block_builder::MemberData { id: pbfhogg::MemberId::Way(100), role: "outer" }],
+        &[pbfhogg::block_builder::MemberData {
+            id: pbfhogg::MemberId::Way(100),
+            role: "outer",
+        }],
         None,
     );
     if let Some(bytes) = bb.take().expect("take") {
@@ -96,7 +113,9 @@ fn write_type_unsorted_pbf(path: &Path) {
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new().build().expect("build header");
+    let header = block_builder::HeaderBuilder::new()
+        .build()
+        .expect("build header");
     writer.write_header(&header).expect("write header");
 
     let mut bb = BlockBuilder::new();
@@ -109,7 +128,13 @@ fn write_type_unsorted_pbf(path: &Path) {
     }
 
     for id in 1..=6 {
-        bb.add_node(id, id as i32 * 1_000_000, id as i32 * 2_000_000, std::iter::empty::<(&str, &str)>(), None);
+        bb.add_node(
+            id,
+            id as i32 * 1_000_000,
+            id as i32 * 2_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
     }
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");
@@ -118,7 +143,10 @@ fn write_type_unsorted_pbf(path: &Path) {
     bb.add_relation(
         300,
         [("type", "route")],
-        &[pbfhogg::block_builder::MemberData { id: pbfhogg::MemberId::Way(100), role: "outer" }],
+        &[pbfhogg::block_builder::MemberData {
+            id: pbfhogg::MemberId::Way(100),
+            role: "outer",
+        }],
         None,
     );
     if let Some(bytes) = bb.take().expect("take") {
@@ -130,13 +158,23 @@ fn write_type_unsorted_pbf(path: &Path) {
 
 fn assert_sorted(contents: &PbfContentsWithCoords) {
     for w in contents.nodes.windows(2) {
-        assert!(w[0].0 < w[1].0, "nodes not sorted: {} >= {}", w[0].0, w[1].0);
+        assert!(
+            w[0].0 < w[1].0,
+            "nodes not sorted: {} >= {}",
+            w[0].0,
+            w[1].0
+        );
     }
     for w in contents.ways.windows(2) {
         assert!(w[0].0 < w[1].0, "ways not sorted: {} >= {}", w[0].0, w[1].0);
     }
     for w in contents.relations.windows(2) {
-        assert!(w[0].0 < w[1].0, "relations not sorted: {} >= {}", w[0].0, w[1].0);
+        assert!(
+            w[0].0 < w[1].0,
+            "relations not sorted: {} >= {}",
+            w[0].0,
+            w[1].0
+        );
     }
 }
 
@@ -166,9 +204,7 @@ fn read_raw_node_meta(path: &Path) -> Vec<RawNodeMeta> {
                             version: info.as_ref().map(|i| i.version()),
                             changeset: info.as_ref().map(|i| i.changeset()),
                             uid: info.as_ref().map(|i| i.uid()),
-                            user: info
-                                .as_ref()
-                                .map(|i| i.user().unwrap_or("").to_string()),
+                            user: info.as_ref().map(|i| i.user().unwrap_or("").to_string()),
                             visible: info.as_ref().map(|i| i.visible()),
                         });
                     }
@@ -216,7 +252,10 @@ fn sort_overlapping_blobs() {
     assert_eq!(result.ways.len(), 2);
     assert_eq!(result.relations.len(), 1);
     assert_sorted(&result);
-    assert!(read_header(&output).is_sorted(), "output missing Sort.Type_then_ID");
+    assert!(
+        read_header(&output).is_sorted(),
+        "output missing Sort.Type_then_ID"
+    );
 
     let node_ids: Vec<i64> = result.nodes.iter().map(|(id, _, _, _)| *id).collect();
     assert_eq!(node_ids, (1..=10).collect::<Vec<_>>());
@@ -245,7 +284,10 @@ fn sort_wrong_type_order() {
     assert_eq!(result.ways.len(), 2);
     assert_eq!(result.relations.len(), 1);
     assert_sorted(&result);
-    assert!(read_header(&output).is_sorted(), "output missing Sort.Type_then_ID");
+    assert!(
+        read_header(&output).is_sorted(),
+        "output missing Sort.Type_then_ID"
+    );
 
     let way_tags: Vec<&str> = result
         .ways
@@ -269,7 +311,9 @@ fn sort_overlap_rewrite_normalizes_dense_node_changeset_minus_one() {
     let file = std::fs::File::create(&input).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new().build().expect("build header");
+    let header = block_builder::HeaderBuilder::new()
+        .build()
+        .expect("build header");
     writer.write_header(&header).expect("write header");
 
     let meta = Metadata {
@@ -295,13 +339,7 @@ fn sort_overlap_rewrite_normalizes_dense_node_changeset_minus_one() {
         writer.write_primitive_block(bytes).expect("write block");
     }
 
-    bb.add_node(
-        2,
-        2_000_000,
-        4_000_000,
-        [("name", "sentinel")],
-        Some(&meta),
-    );
+    bb.add_node(2, 2_000_000, 4_000_000, [("name", "sentinel")], Some(&meta));
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");
     }
@@ -353,10 +391,27 @@ fn sort_already_sorted() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "a")], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "b")], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("name", "a")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![("name", "b")],
+                meta: None,
+            },
         ],
-        &[TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "path")], meta: None }],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "path")],
+            meta: None,
+        }],
         &[TestRelation {
             id: 20,
             members: vec![common::TestMember {
@@ -376,7 +431,10 @@ fn sort_already_sorted() {
     assert_eq!(before.nodes.len(), after.nodes.len());
     assert_eq!(before.ways.len(), after.ways.len());
     assert_eq!(before.relations.len(), after.relations.len());
-    assert!(read_header(&output).is_sorted(), "output missing Sort.Type_then_ID");
+    assert!(
+        read_header(&output).is_sorted(),
+        "output missing Sort.Type_then_ID"
+    );
 
     for (a, b) in before.nodes.iter().zip(after.nodes.iter()) {
         assert_eq!(a, b);
@@ -405,7 +463,9 @@ fn sort_already_sorted() {
 #[test]
 #[ignore = "external"]
 fn sort_cross_validate_osmium() {
-    let osmium_check = std::process::Command::new("osmium").arg("--version").output();
+    let osmium_check = std::process::Command::new("osmium")
+        .arg("--version")
+        .output();
     if osmium_check.is_err() {
         eprintln!("osmium not found, skipping cross-validation");
         return;
@@ -430,8 +490,16 @@ fn sort_cross_validate_osmium() {
     let pbfhogg_result = read_all_elements_with_coords(&pbfhogg_out);
     let osmium_result = read_all_elements_with_coords(&osmium_out);
 
-    assert_eq!(pbfhogg_result.nodes.len(), osmium_result.nodes.len(), "node count mismatch");
-    assert_eq!(pbfhogg_result.ways.len(), osmium_result.ways.len(), "way count mismatch");
+    assert_eq!(
+        pbfhogg_result.nodes.len(),
+        osmium_result.nodes.len(),
+        "node count mismatch"
+    );
+    assert_eq!(
+        pbfhogg_result.ways.len(),
+        osmium_result.ways.len(),
+        "way count mismatch"
+    );
     assert_eq!(
         pbfhogg_result.relations.len(),
         osmium_result.relations.len(),
@@ -450,7 +518,11 @@ fn sort_cross_validate_osmium() {
         assert_eq!(p.2, o.2, "way tags mismatch for id {}", p.0);
     }
 
-    for (p, o) in pbfhogg_result.relations.iter().zip(osmium_result.relations.iter()) {
+    for (p, o) in pbfhogg_result
+        .relations
+        .iter()
+        .zip(osmium_result.relations.iter())
+    {
         assert_eq!(p.0, o.0, "relation ID mismatch");
         assert_eq!(p.1, o.1, "relation members mismatch for id {}", p.0);
         assert_eq!(p.2, o.2, "relation tags mismatch for id {}", p.0);
@@ -470,14 +542,22 @@ fn sort_many_overlapping_blobs() {
     let file = std::fs::File::create(&input).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new().build().expect("build header");
+    let header = block_builder::HeaderBuilder::new()
+        .build()
+        .expect("build header");
     writer.write_header(&header).expect("write header");
 
     let mut bb = BlockBuilder::new();
     for blob_idx in 1..=10_i64 {
         for step in 0..10_i64 {
             let id = blob_idx + step * 10;
-            bb.add_node(id, id as i32 * 100_000, id as i32 * 200_000, std::iter::empty::<(&str, &str)>(), None);
+            bb.add_node(
+                id,
+                id as i32 * 100_000,
+                id as i32 * 200_000,
+                std::iter::empty::<(&str, &str)>(),
+                None,
+            );
         }
         if let Some(bytes) = bb.take().expect("take") {
             writer.write_primitive_block(bytes).expect("write block");
@@ -500,7 +580,10 @@ fn sort_many_overlapping_blobs() {
         assert_eq!(*lon, *id as i32 * 200_000);
     }
 
-    assert!(read_header(&output).is_sorted(), "output missing Sort.Type_then_ID");
+    assert!(
+        read_header(&output).is_sorted(),
+        "output missing Sort.Type_then_ID"
+    );
 }
 
 /// Overlap-runs must not cross element-kind boundaries.
@@ -528,7 +611,9 @@ fn sort_overlap_runs_scoped_to_single_kind() {
     let file = std::fs::File::create(&input).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new().build().expect("build header");
+    let header = block_builder::HeaderBuilder::new()
+        .build()
+        .expect("build header");
     writer.write_header(&header).expect("write header");
 
     let mut bb = BlockBuilder::new();
@@ -566,8 +651,18 @@ fn sort_overlap_runs_scoped_to_single_kind() {
     run_sort(&input, &output);
 
     let result = read_all_elements_with_coords(&output);
-    assert_eq!(result.nodes.len(), 10, "expected 10 nodes, got {}", result.nodes.len());
-    assert_eq!(result.ways.len(), 6, "expected 6 ways, got {}", result.ways.len());
+    assert_eq!(
+        result.nodes.len(),
+        10,
+        "expected 10 nodes, got {}",
+        result.nodes.len()
+    );
+    assert_eq!(
+        result.ways.len(),
+        6,
+        "expected 6 ways, got {}",
+        result.ways.len()
+    );
     assert_sorted(&result);
 
     let node_ids: Vec<i64> = result.nodes.iter().map(|(id, _, _, _)| *id).collect();
@@ -689,7 +784,10 @@ mod platform {
         assert_eq!(contents.ways.len(), 2);
         assert_eq!(contents.relations.len(), 1);
         assert_sorted(&contents);
-        assert!(read_header(&output).is_sorted(), "output missing Sort.Type_then_ID");
+        assert!(
+            read_header(&output).is_sorted(),
+            "output missing Sort.Type_then_ID"
+        );
 
         let node_ids: Vec<i64> = contents.nodes.iter().map(|(id, _, _, _)| *id).collect();
         assert_eq!(node_ids, (1..=10).collect::<Vec<_>>());
@@ -735,7 +833,10 @@ mod platform {
         assert_eq!(contents.ways.len(), 2);
         assert_eq!(contents.relations.len(), 1);
         assert_sorted(&contents);
-        assert!(read_header(&output).is_sorted(), "output missing Sort.Type_then_ID");
+        assert!(
+            read_header(&output).is_sorted(),
+            "output missing Sort.Type_then_ID"
+        );
 
         let node_ids: Vec<i64> = contents.nodes.iter().map(|(id, _, _, _)| *id).collect();
         assert_eq!(node_ids, (1..=10).collect::<Vec<_>>());

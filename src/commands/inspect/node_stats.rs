@@ -2,20 +2,13 @@ use std::path::Path;
 
 use crate::elements::Element;
 
-use crate::commands::require_indexdata;
 use crate::BoxResult as Result;
+use crate::commands::require_indexdata;
 
 const BLOCK_SIZE: usize = 128;
 
 /// Bit-width histogram bucket boundaries.
-const BUCKETS: &[(u32, u32)] = &[
-    (0, 8),
-    (9, 16),
-    (17, 20),
-    (21, 24),
-    (25, 28),
-    (29, 32),
-];
+const BUCKETS: &[(u32, u32)] = &[(0, 8), (9, 16), (17, 20), (21, 24), (25, 28), (29, 32)];
 
 fn bucket_index(bits: u32) -> usize {
     match bits {
@@ -62,8 +55,12 @@ impl CoordStats {
         let mut min = values[0];
         let mut max = values[0];
         for &v in &values[1..] {
-            if v < min { min = v; }
-            if v > max { max = v; }
+            if v < min {
+                min = v;
+            }
+            if v > max {
+                max = v;
+            }
         }
         // max >= min guaranteed, and both are i32, so difference is in [0, u32::MAX].
         // i32::MAX - i32::MIN = 4_294_967_295 = u32::MAX, so this always succeeds.
@@ -128,13 +125,15 @@ impl NodeStatsReport {
         let uncompressed_bytes = self.node_count as f64 * 8.0;
 
         println!("Estimated compressed size:");
-        println!("  {:.2} GB ({} blocks x ({:.1} + {:.1}) bytes/block)",
+        println!(
+            "  {:.2} GB ({} blocks x ({:.1} + {:.1}) bytes/block)",
             total_bytes / 1_073_741_824.0,
             num_blocks,
             lat_bytes_per_block,
             lon_bytes_per_block,
         );
-        println!("  vs {:.2} GB uncompressed ({} nodes x 8 bytes)",
+        println!(
+            "  vs {:.2} GB uncompressed ({} nodes x 8 bytes)",
             uncompressed_bytes / 1_073_741_824.0,
             self.node_count,
         );
@@ -223,9 +222,13 @@ pub fn node_stats(
     force: bool,
     jobs: usize,
 ) -> Result<NodeStatsReport> {
-    require_indexdata(path, direct_io, force,
+    require_indexdata(
+        path,
+        direct_io,
+        force,
         "input PBF has no blob-level indexdata. Without indexdata, the node-only \
-         filter is a no-op - all blobs are decompressed (significantly slower).")?;
+         filter is a no-op - all blobs are decompressed (significantly slower).",
+    )?;
 
     crate::debug::emit_marker("NODESTATS_START");
 
@@ -253,10 +256,18 @@ pub fn node_stats(
                 };
 
                 accum.node_count += 1;
-                if lat_e7 < accum.min_lat { accum.min_lat = lat_e7; }
-                if lat_e7 > accum.max_lat { accum.max_lat = lat_e7; }
-                if lon_e7 < accum.min_lon { accum.min_lon = lon_e7; }
-                if lon_e7 > accum.max_lon { accum.max_lon = lon_e7; }
+                if lat_e7 < accum.min_lat {
+                    accum.min_lat = lat_e7;
+                }
+                if lat_e7 > accum.max_lat {
+                    accum.max_lat = lat_e7;
+                }
+                if lon_e7 < accum.min_lon {
+                    accum.min_lon = lon_e7;
+                }
+                if lon_e7 > accum.max_lon {
+                    accum.max_lon = lon_e7;
+                }
 
                 accum.lat_block.push(lat_e7);
                 accum.lon_block.push(lon_e7);

@@ -1,7 +1,7 @@
 //! Generate the `tests/test.osm.pbf` fixture used by doc examples.
 
-use pbfhogg::block_builder::{self, BlockBuilder, MemberData, Metadata};
 use pbfhogg::MemberId;
+use pbfhogg::block_builder::{self, BlockBuilder, MemberData, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
 use std::path::Path;
 
@@ -11,9 +11,10 @@ fn main() {
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
 
-    let header =
-        block_builder::HeaderBuilder::new().bbox(9.0, 54.0, 13.0, 58.0).build()
-            .expect("build header");
+    let header = block_builder::HeaderBuilder::new()
+        .bbox(9.0, 54.0, 13.0, 58.0)
+        .build()
+        .expect("build header");
     writer.write_header(&header).expect("write header");
 
     // Three nodes (expected by indexed.rs doc tests)
@@ -26,9 +27,27 @@ fn main() {
         user: "test",
         visible: true,
     };
-    bb.add_node(1, 556_000_000, 125_600_000, [("name", "Test Node")], Some(&meta));
-    bb.add_node(2, 556_001_000, 125_601_000, std::iter::empty::<(&str, &str)>(), Some(&meta));
-    bb.add_node(3, 556_002_000, 125_602_000, std::iter::empty::<(&str, &str)>(), Some(&meta));
+    bb.add_node(
+        1,
+        556_000_000,
+        125_600_000,
+        [("name", "Test Node")],
+        Some(&meta),
+    );
+    bb.add_node(
+        2,
+        556_001_000,
+        125_601_000,
+        std::iter::empty::<(&str, &str)>(),
+        Some(&meta),
+    );
+    bb.add_node(
+        3,
+        556_002_000,
+        125_602_000,
+        std::iter::empty::<(&str, &str)>(),
+        Some(&meta),
+    );
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write nodes");
     }

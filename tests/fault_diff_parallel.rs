@@ -15,9 +15,7 @@ mod diff_parallel {
 
     use pbfhogg::diff::{DiffOptions, diff, parallel_test_hooks as diff_hooks};
 
-    use crate::common::{
-        TestNode, generate_nodes, snapshot_dir, write_multi_block_test_pbf,
-    };
+    use crate::common::{TestNode, generate_nodes, snapshot_dir, write_multi_block_test_pbf};
 
     /// A shard panic inside `diff::parallel::run_shard` must surface
     /// as an `Err` (scope-join captures the panic, cleanup sweeps
@@ -85,10 +83,7 @@ mod diff_parallel {
         let after = snapshot_dir(dir.path());
         let leaked: Vec<_> = after
             .difference(&before)
-            .filter(|p| {
-                p.to_string_lossy()
-                    .contains("diff-par-")
-            })
+            .filter(|p| p.to_string_lossy().contains("diff-par-"))
             .collect();
         assert!(
             leaked.is_empty(),

@@ -20,7 +20,7 @@ use crate::write::metrics::WRITER_METRICS;
 use std::sync::atomic::Ordering::Relaxed;
 
 use super::compression::Compression;
-use super::pipeline::{elapsed_ns_u64, FramedBlobParts};
+use super::pipeline::{FramedBlobParts, elapsed_ns_u64};
 
 /// Per-thread reusable blob framing scratch: header/body/compression buffers
 /// plus lazy-initialized zlib/zstd compressors. Reused across blobs to keep
@@ -91,7 +91,14 @@ pub(crate) fn frame_blob_pipelined(
     tagdata: Option<&[u8]>,
 ) -> io::Result<FramedBlobParts> {
     PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
-        frame_blob_into("OSMData", uncompressed, compression, indexdata, tagdata, scratch)
+        frame_blob_into(
+            "OSMData",
+            uncompressed,
+            compression,
+            indexdata,
+            tagdata,
+            scratch,
+        )
     })
 }
 
@@ -124,12 +131,25 @@ pub(super) fn frame_blob_into(
     let t_frame = std::time::Instant::now();
 
     let datasize = i32::try_from(scratch.blob_buf.len()).map_err(|_| {
-        io::Error::other(format!("blob datasize overflow: {} bytes", scratch.blob_buf.len()))
+        io::Error::other(format!(
+            "blob datasize overflow: {} bytes",
+            scratch.blob_buf.len()
+        ))
     })?;
-    encode_blob_header_into(blob_type, datasize, indexdata, tagdata, &mut scratch.header_buf);
+    encode_blob_header_into(
+        blob_type,
+        datasize,
+        indexdata,
+        tagdata,
+        &mut scratch.header_buf,
+    );
 
-    let header_len = u32::try_from(scratch.header_buf.len())
-        .map_err(|_| io::Error::other(format!("header too large: {} bytes", scratch.header_buf.len())))?;
+    let header_len = u32::try_from(scratch.header_buf.len()).map_err(|_| {
+        io::Error::other(format!(
+            "header too large: {} bytes",
+            scratch.header_buf.len()
+        ))
+    })?;
     let total_len = 4 + scratch.header_buf.len() + scratch.blob_buf.len();
     WRITER_METRICS
         .frame_ns
@@ -182,9 +202,14 @@ pub(super) fn encode_blob_body(
             let bound = zstd::zstd_safe::compress_bound(uncompressed.len());
             scratch.compress_buf.clear();
             scratch.compress_buf.reserve(bound);
-            compressor.compress_to_buffer(uncompressed, &mut scratch.compress_buf).map_err(io::Error::other)?;
+            compressor
+                .compress_to_buffer(uncompressed, &mut scratch.compress_buf)
+                .map_err(io::Error::other)?;
             let raw_size = i32::try_from(uncompressed.len()).map_err(|_| {
-                io::Error::other(format!("blob raw_size overflow: {} bytes", uncompressed.len()))
+                io::Error::other(format!(
+                    "blob raw_size overflow: {} bytes",
+                    uncompressed.len()
+                ))
             })?;
             // Blob field 2: raw_size (int32, varint)
             encode_int32_field(&mut scratch.blob_buf, 2, raw_size);
@@ -196,11 +221,7 @@ pub(super) fn encode_blob_body(
 }
 
 /// Zlib compression via reusable `flate2::Compress` with `reset()`.
-fn compress_zlib(
-    uncompressed: &[u8],
-    level: u32,
-    scratch: &mut FrameScratch,
-) -> io::Result<()> {
+fn compress_zlib(uncompressed: &[u8], level: u32, scratch: &mut FrameScratch) -> io::Result<()> {
     let needs_new = match &scratch.zlib_compressor {
         Some((cached_level, _)) => *cached_level != level,
         None => true,
@@ -211,16 +232,27 @@ fn compress_zlib(
     let (_, compressor) = scratch.zlib_compressor.as_mut().expect("just initialized");
     scratch.compress_buf.clear();
     // Zlib worst-case bound: input + ~0.1% + header/trailer.
-    scratch.compress_buf.reserve(uncompressed.len() + (uncompressed.len() >> 10) + 64);
+    scratch
+        .compress_buf
+        .reserve(uncompressed.len() + (uncompressed.len() >> 10) + 64);
     let status = compressor
-        .compress_vec(uncompressed, &mut scratch.compress_buf, FlushCompress::Finish)
+        .compress_vec(
+            uncompressed,
+            &mut scratch.compress_buf,
+            FlushCompress::Finish,
+        )
         .map_err(|e| io::Error::other(format!("zlib compress error: {e}")))?;
     if !matches!(status, Status::StreamEnd) {
-        return Err(io::Error::other("zlib compress did not complete in one call"));
+        return Err(io::Error::other(
+            "zlib compress did not complete in one call",
+        ));
     }
     compressor.reset();
     let raw_size = i32::try_from(uncompressed.len()).map_err(|_| {
-        io::Error::other(format!("blob raw_size overflow: {} bytes", uncompressed.len()))
+        io::Error::other(format!(
+            "blob raw_size overflow: {} bytes",
+            uncompressed.len()
+        ))
     })?;
     encode_int32_field(&mut scratch.blob_buf, 2, raw_size);
     encode_bytes_field(&mut scratch.blob_buf, 3, &scratch.compress_buf);
@@ -284,7 +316,10 @@ pub(crate) fn reframe_raw_with_index_scratch(
     header_buf: &mut Vec<u8>,
 ) -> io::Result<Vec<u8>> {
     let datasize = i32::try_from(blob_bytes.len()).map_err(|_| {
-        io::Error::other(format!("blob datasize overflow: {} bytes", blob_bytes.len()))
+        io::Error::other(format!(
+            "blob datasize overflow: {} bytes",
+            blob_bytes.len()
+        ))
     })?;
     header_buf.clear();
     encode_blob_header_into("OSMData", datasize, Some(indexdata), tagdata, header_buf);

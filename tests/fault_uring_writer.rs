@@ -96,9 +96,7 @@ mod uring_writer {
         uring_hooks::reset();
 
         match write_result {
-            Ok(Ok(())) => panic!(
-                "uring_writer dispatch panic must not produce a silent success"
-            ),
+            Ok(Ok(())) => panic!("uring_writer dispatch panic must not produce a silent success"),
             Ok(Err(_)) => {
                 // Expected: flush() returned Err carrying the
                 // joined-thread panic.

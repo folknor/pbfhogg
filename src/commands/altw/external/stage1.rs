@@ -16,10 +16,10 @@
 use std::io::{BufWriter, Write as _};
 use std::path::Path;
 
-use super::radix::{ScratchDir, NUM_BUCKETS};
 use super::super::Result;
 use super::blob_meta::BlobMeta;
-use super::{BucketLayout, IdRecord, NodeBlobInfo, ID_RECORD_SIZE};
+use super::radix::{NUM_BUCKETS, ScratchDir};
+use super::{BucketLayout, ID_RECORD_SIZE, IdRecord, NodeBlobInfo};
 
 /// Way-blob schedule entry for the parallel way scans.
 pub(super) struct WayBlobTask {
@@ -114,8 +114,7 @@ pub(super) fn stage1_pass_a(
     let s1a_id_records_emitted = std::sync::atomic::AtomicU64::new(0);
     let s1a_id_records_skipped = std::sync::atomic::AtomicU64::new(0);
     let s1a_id_shard_bytes_written = std::sync::atomic::AtomicU64::new(0);
-    let s1a_id_shard_flush_err: std::sync::Mutex<Option<String>> =
-        std::sync::Mutex::new(None);
+    let s1a_id_shard_flush_err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     // Per-(id-bucket) record counts. Each worker tallies into a local
     // `Vec<u64>` (no atomic in the hot loop - the per-record cost
     // would dominate; europe sees ~4.7B records and a contended
@@ -159,14 +158,15 @@ pub(super) fn stage1_pass_a(
                     // Lazy-initialised on first blob so creation errors
                     // flow into the per-blob IIFE result and propagate
                     // through the existing tx/rx channel.
-                    let mut id_shard_writers: Vec<Option<BufWriter<std::fs::File>>> =
-                        Vec::new();
+                    let mut id_shard_writers: Vec<Option<BufWriter<std::fs::File>>> = Vec::new();
                     let mut id_rec_buf = [0u8; ID_RECORD_SIZE];
                     let mut id_bucket_local_counts: Vec<u64> = vec![0; NUM_BUCKETS];
 
                     loop {
                         let idx = next_ref.fetch_add(1, Relaxed);
-                        if idx >= schedule_ref.len() { break; }
+                        if idx >= schedule_ref.len() {
+                            break;
+                        }
                         let task = &schedule_ref[idx];
 
                         let result: std::result::Result<(u64, Vec<u32>), String> = (|| {
@@ -189,13 +189,16 @@ pub(super) fn stage1_pass_a(
                             let mut blob_node_ids: Vec<i64> = Vec::new();
                             let mut per_way_rcs: Vec<u32> = Vec::new();
                             crate::scan::way::scan_way_refs(
-                                &decompress_buf, &mut refs_buf, &mut group_starts,
+                                &decompress_buf,
+                                &mut refs_buf,
+                                &mut group_starts,
                                 |_way_id, refs| {
                                     blob_node_ids.extend_from_slice(refs);
                                     #[allow(clippy::cast_possible_truncation)]
                                     per_way_rcs.push(refs.len() as u32);
                                 },
-                            ).map_err(|e| e.to_string())?;
+                            )
+                            .map_err(|e| e.to_string())?;
                             #[allow(clippy::cast_possible_truncation)]
                             s1a_scan_ref.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
 
@@ -208,14 +211,11 @@ pub(super) fn stage1_pass_a(
                             if id_shard_writers.is_empty() {
                                 id_shard_writers.reserve(NUM_BUCKETS);
                                 for bucket_idx in 0..NUM_BUCKETS {
-                                    let path = scratch_ref.path.join(
-                                        format!("id-W{worker_id}-{bucket_idx:03}"),
-                                    );
+                                    let path = scratch_ref
+                                        .path
+                                        .join(format!("id-W{worker_id}-{bucket_idx:03}"));
                                     let f = std::fs::File::create(&path).map_err(|e| {
-                                        format!(
-                                            "create id shard {}: {e}",
-                                            path.display(),
-                                        )
+                                        format!("create id shard {}: {e}", path.display(),)
                                     })?;
                                     id_shard_writers.push(Some(BufWriter::with_capacity(
                                         super::radix::BUCKET_BUF_SIZE,
@@ -228,10 +228,7 @@ pub(super) fn stage1_pass_a(
                             let mut blob_bytes: u64 = 0;
                             for (i, &node_id) in blob_node_ids.iter().enumerate() {
                                 let blob_local_slot = u32::try_from(i).map_err(|_| {
-                                    format!(
-                                        "blob {} has > u32::MAX refs (i={i})",
-                                        task.seq,
-                                    )
+                                    format!("blob {} has > u32::MAX refs (i={i})", task.seq,)
                                 })?;
                                 let location = if node_id < 0 {
                                     None
@@ -249,9 +246,9 @@ pub(super) fn stage1_pass_a(
                                     let writer = id_shard_writers[bucket_idx]
                                         .as_mut()
                                         .expect("shard writer initialised");
-                                    writer.write_all(&id_rec_buf).map_err(|e| {
-                                        format!("write id shard W{worker_id}: {e}")
-                                    })?;
+                                    writer
+                                        .write_all(&id_rec_buf)
+                                        .map_err(|e| format!("write id shard W{worker_id}: {e}"))?;
                                     id_bucket_local_counts[bucket_idx] += 1;
                                     blob_emitted += 1;
                                     blob_bytes += ID_RECORD_SIZE as u64;
@@ -260,18 +257,18 @@ pub(super) fn stage1_pass_a(
                                 }
                             }
                             #[allow(clippy::cast_possible_truncation)]
-                            s1a_id_emit_ref.fetch_add(
-                                t_id.elapsed().as_millis() as u64,
-                                Relaxed,
-                            );
+                            s1a_id_emit_ref.fetch_add(t_id.elapsed().as_millis() as u64, Relaxed);
                             s1a_id_emitted_ref.fetch_add(blob_emitted, Relaxed);
                             s1a_id_skipped_ref.fetch_add(blob_skipped, Relaxed);
                             s1a_id_bytes_ref.fetch_add(blob_bytes, Relaxed);
 
                             Ok((blob_node_ids.len() as u64, per_way_rcs))
-                        })();
+                        })(
+                        );
 
-                        if tx.send((task.seq, result)).is_err() { break; }
+                        if tx.send((task.seq, result)).is_err() {
+                            break;
+                        }
                     }
 
                     // Flush id-shard writers before the worker thread
@@ -285,9 +282,7 @@ pub(super) fn stage1_pass_a(
                                 .lock()
                                 .expect("id shard flush error mutex");
                             if slot.is_none() {
-                                *slot = Some(format!(
-                                    "flush id shard W{worker_id}: {e}",
-                                ));
+                                *slot = Some(format!("flush id shard W{worker_id}: {e}",));
                             }
                             break;
                         }
@@ -356,16 +351,46 @@ pub(super) fn stage1_pass_a(
 
     #[allow(clippy::cast_possible_wrap)]
     {
-        crate::debug::emit_counter("s1a_pread_ms", s1a_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1a_decompress_ms", s1a_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1a_scan_way_refs_ms", s1a_scan_way_refs_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1a_bytes_read", s1a_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1a_pread_calls", s1a_pread_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1a_per_way_sidecar_bytes", s1a_per_way_sidecar_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1a_id_emit_ms", s1a_id_emit_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1a_id_records_emitted", s1a_id_records_emitted.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1a_id_records_skipped", s1a_id_records_skipped.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1a_id_shard_bytes_written", s1a_id_shard_bytes_written.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter(
+            "s1a_pread_ms",
+            s1a_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s1a_decompress_ms",
+            s1a_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s1a_scan_way_refs_ms",
+            s1a_scan_way_refs_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s1a_bytes_read",
+            s1a_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s1a_pread_calls",
+            s1a_pread_calls.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s1a_per_way_sidecar_bytes",
+            s1a_per_way_sidecar_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s1a_id_emit_ms",
+            s1a_id_emit_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s1a_id_records_emitted",
+            s1a_id_records_emitted.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s1a_id_records_skipped",
+            s1a_id_records_skipped.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s1a_id_shard_bytes_written",
+            s1a_id_shard_bytes_written.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
     }
     crate::debug::emit_marker("EXTJOIN_S1_PASS_A_END");
 
@@ -391,9 +416,7 @@ pub(super) fn stage1_pass_a(
 /// that intersect each id bucket; the ranges are non-overlapping and
 /// monotonic in id because the input PBF is sorted by node id.
 #[hotpath::measure]
-pub(super) fn build_node_blob_mapping(
-    blob_meta: &[BlobMeta],
-) -> Result<Vec<NodeBlobInfo>> {
+pub(super) fn build_node_blob_mapping(blob_meta: &[BlobMeta]) -> Result<Vec<NodeBlobInfo>> {
     crate::debug::emit_marker("EXTJOIN_S1_NODE_MAP_START");
     let t0 = std::time::Instant::now();
 

@@ -1,12 +1,15 @@
 //! Round-trip tests: write PBF → read back → verify.
-#![allow(clippy::unwrap_used, clippy::cognitive_complexity, clippy::too_many_lines)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::cognitive_complexity,
+    clippy::too_many_lines
+)]
 
-use pbfhogg::block_builder::{self, BlockBuilder, MemberData, Metadata};
 use pbfhogg::MemberId;
+use pbfhogg::block_builder::{self, BlockBuilder, MemberData, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element};
 use std::io::Cursor;
-
 
 /// Write a PBF with known nodes (all with metadata), read back, verify every field.
 #[test]
@@ -183,7 +186,13 @@ fn roundtrip_dense_nodes_no_metadata() {
 
         let mut bb = BlockBuilder::new();
         bb.add_node(1, 100_000_000, 200_000_000, [("k", "v")], None);
-        bb.add_node(2, -100_000_000, -200_000_000, std::iter::empty::<(&str, &str)>(), None);
+        bb.add_node(
+            2,
+            -100_000_000,
+            -200_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
         let bytes = bb.take().unwrap().unwrap();
         writer.write_primitive_block(bytes).unwrap();
         writer.flush().unwrap();
@@ -469,8 +478,10 @@ fn roundtrip_way_with_locations() {
     let mut buf = Vec::new();
     {
         let mut writer = PbfWriter::new(&mut buf, Compression::default());
-        let header =
-            block_builder::HeaderBuilder::new().optional_feature("LocationsOnWays").build().unwrap();
+        let header = block_builder::HeaderBuilder::new()
+            .optional_feature("LocationsOnWays")
+            .build()
+            .unwrap();
         writer.write_header(&header).unwrap();
 
         let mut bb = BlockBuilder::new();
@@ -478,7 +489,11 @@ fn roundtrip_way_with_locations() {
             100,
             [("highway", "primary")],
             &[1, 2, 3],
-            &[(550_000_000, 120_000_000), (551_000_000, 121_000_000), (552_000_000, 122_000_000)],
+            &[
+                (550_000_000, 120_000_000),
+                (551_000_000, 121_000_000),
+                (552_000_000, 122_000_000),
+            ],
             None,
         );
         let bytes = bb.take().unwrap().unwrap();
@@ -593,7 +608,13 @@ fn roundtrip_direct_io() {
 
     let mut bb = BlockBuilder::new();
     bb.add_node(1, 100_000_000, 200_000_000, [("k", "v")], None);
-    bb.add_node(2, -100_000_000, -200_000_000, std::iter::empty::<(&str, &str)>(), None);
+    bb.add_node(
+        2,
+        -100_000_000,
+        -200_000_000,
+        std::iter::empty::<(&str, &str)>(),
+        None,
+    );
     let bytes = bb.take().unwrap().unwrap();
     writer.write_primitive_block(bytes).unwrap();
 
@@ -664,8 +685,7 @@ fn roundtrip_pipelined_direct_io() {
 
     let header = block_builder::HeaderBuilder::new().build().unwrap();
 
-    let write_result =
-        PbfWriter::to_path_direct(&path, Compression::default(), &header);
+    let write_result = PbfWriter::to_path_direct(&path, Compression::default(), &header);
     let mut writer = match write_result {
         Ok(w) => w,
         Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
@@ -682,7 +702,13 @@ fn roundtrip_pipelined_direct_io() {
             let id = i * 100 + j + 1;
             #[allow(clippy::cast_possible_truncation)]
             let id32 = id as i32;
-            bb.add_node(id, id32 * 1_000_000, id32 * 2_000_000, std::iter::empty::<(&str, &str)>(), None);
+            bb.add_node(
+                id,
+                id32 * 1_000_000,
+                id32 * 2_000_000,
+                std::iter::empty::<(&str, &str)>(),
+                None,
+            );
         }
         let bytes = bb.take().unwrap().unwrap();
         writer.write_primitive_block(bytes).unwrap();
@@ -714,7 +740,12 @@ fn roundtrip_pipelined_direct_io() {
     assert_eq!(all_ids[499], 500);
     // Verify monotonically increasing
     for pair in all_ids.windows(2) {
-        assert!(pair[1] > pair[0], "IDs should be increasing: {} > {}", pair[1], pair[0]);
+        assert!(
+            pair[1] > pair[0],
+            "IDs should be increasing: {} > {}",
+            pair[1],
+            pair[0]
+        );
     }
 }
 
@@ -752,7 +783,13 @@ fn roundtrip_uring_tiny_output() {
     };
 
     let mut bb = BlockBuilder::new();
-    bb.add_node(42, 123_456_789, -987_654_321, std::iter::empty::<(&str, &str)>(), None);
+    bb.add_node(
+        42,
+        123_456_789,
+        -987_654_321,
+        std::iter::empty::<(&str, &str)>(),
+        None,
+    );
     let bytes = bb.take().unwrap().unwrap();
     writer.write_primitive_block(bytes).unwrap();
 
@@ -814,7 +851,13 @@ fn roundtrip_uring_small_size_sweep() {
         for i in 0..n {
             #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
             let id = i as i64 + 1;
-            bb.add_node(id, 100_000_000, 200_000_000, std::iter::empty::<(&str, &str)>(), None);
+            bb.add_node(
+                id,
+                100_000_000,
+                200_000_000,
+                std::iter::empty::<(&str, &str)>(),
+                None,
+            );
             if let Some(bytes) = bb.take().unwrap() {
                 writer.write_primitive_block(bytes).unwrap();
             }
@@ -929,7 +972,9 @@ fn roundtrip_mixed_metadata() {
 
         // Node 1: with metadata (like a base PBF node)
         bb.add_node(
-            1, 100_000_000, 200_000_000,
+            1,
+            100_000_000,
+            200_000_000,
             [("name", "base")],
             Some(&Metadata {
                 version: 5,
@@ -946,7 +991,9 @@ fn roundtrip_mixed_metadata() {
 
         // Node 3: with metadata again (back to base)
         bb.add_node(
-            3, 120_000_000, 220_000_000,
+            3,
+            120_000_000,
+            220_000_000,
             [("name", "base2")],
             Some(&Metadata {
                 version: 2,
@@ -1028,14 +1075,28 @@ fn roundtrip_backfill_metadata() {
         let mut bb = BlockBuilder::new();
 
         // Node 1: NO metadata
-        bb.add_node(1, 100_000_000, 200_000_000, std::iter::empty::<(&str, &str)>(), None);
+        bb.add_node(
+            1,
+            100_000_000,
+            200_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
 
         // Node 2: NO metadata
-        bb.add_node(2, 110_000_000, 210_000_000, std::iter::empty::<(&str, &str)>(), None);
+        bb.add_node(
+            2,
+            110_000_000,
+            210_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
 
         // Node 3: WITH metadata (triggers backfill of nodes 1 and 2)
         bb.add_node(
-            3, 120_000_000, 220_000_000,
+            3,
+            120_000_000,
+            220_000_000,
             [("name", "first_with_meta")],
             Some(&Metadata {
                 version: 1,
@@ -1066,7 +1127,11 @@ fn roundtrip_backfill_metadata() {
         match elem {
             Element::DenseNode(dn) => {
                 let info = dn.info().unwrap();
-                assert_eq!(info.version(), 0, "backfilled node {i} should have version 0");
+                assert_eq!(
+                    info.version(),
+                    0,
+                    "backfilled node {i} should have version 0"
+                );
                 assert_eq!(info.uid(), 0);
             }
             _ => panic!("expected DenseNode"),

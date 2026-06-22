@@ -125,9 +125,8 @@ pub fn read_expressions_file(path: &Path) -> BoxResult<Vec<String>> {
     let reader = std::io::BufReader::new(file);
     let mut expressions = Vec::new();
     for line in reader.lines() {
-        let line = line.map_err(|e| {
-            format!("error reading expressions file '{}': {e}", path.display())
-        })?;
+        let line =
+            line.map_err(|e| format!("error reading expressions file '{}': {e}", path.display()))?;
         // Strip inline comments
         let line = match line.find('#') {
             Some(pos) => &line[..pos],
@@ -151,9 +150,7 @@ pub(crate) fn tag_matches(matcher: &TagMatcher, key: &str, value: &str) -> bool 
         TagMatcher::KeyOnly { key: k } => key == k,
         TagMatcher::KeyPrefix { prefix } => key.starts_with(prefix.as_str()),
         TagMatcher::ExactValue { key: k, value: v } => key == k && value == v,
-        TagMatcher::MultiValue { key: k, values } => {
-            key == k && values.iter().any(|v| v == value)
-        }
+        TagMatcher::MultiValue { key: k, values } => key == k && values.iter().any(|v| v == value),
         TagMatcher::NotValue { key: k, value: v } => key == k && value != v,
     }
 }

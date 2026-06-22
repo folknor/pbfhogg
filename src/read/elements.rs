@@ -273,10 +273,7 @@ pub struct Relation<'a> {
 }
 
 impl<'a> Relation<'a> {
-    pub(crate) fn new(
-        block: &'a WireBlock<'static>,
-        rel: WireRelation<'a>,
-    ) -> Relation<'a> {
+    pub(crate) fn new(block: &'a WireBlock<'static>, rel: WireRelation<'a>) -> Relation<'a> {
         Relation { block, rel }
     }
 

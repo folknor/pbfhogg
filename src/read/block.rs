@@ -6,7 +6,7 @@ use super::wire::{
     WireBlock, WireBlockMeta, WireDenseNodes, WireGroup, WireMessageIter, WireNode, WireRelation,
     WireWay,
 };
-use crate::error::{new_error, new_wire_error, ErrorKind, Result};
+use crate::error::{ErrorKind, Result, new_error, new_wire_error};
 use bytes::Bytes;
 use std;
 
@@ -42,7 +42,12 @@ impl WireHeaderBBox {
             }
         }
 
-        Ok(WireHeaderBBox { left, right, top, bottom })
+        Ok(WireHeaderBBox {
+            left,
+            right,
+            top,
+            bottom,
+        })
     }
 }
 
@@ -97,14 +102,18 @@ impl WireHeaderBlock {
                 16 => {
                     // writingprogram: string
                     let bytes = cursor.read_len_delimited()?;
-                    writingprogram = Some(String::from_utf8(bytes.to_vec())
-                        .map_err(|_| new_wire_error("invalid UTF-8 in writingprogram"))?);
+                    writingprogram = Some(
+                        String::from_utf8(bytes.to_vec())
+                            .map_err(|_| new_wire_error("invalid UTF-8 in writingprogram"))?,
+                    );
                 }
                 17 => {
                     // source: string
                     let bytes = cursor.read_len_delimited()?;
-                    source = Some(String::from_utf8(bytes.to_vec())
-                        .map_err(|_| new_wire_error("invalid UTF-8 in source"))?);
+                    source = Some(
+                        String::from_utf8(bytes.to_vec())
+                            .map_err(|_| new_wire_error("invalid UTF-8 in source"))?,
+                    );
                 }
                 32 => {
                     // osmosis_replication_timestamp: int64
@@ -117,8 +126,10 @@ impl WireHeaderBlock {
                 34 => {
                     // osmosis_replication_base_url: string
                     let bytes = cursor.read_len_delimited()?;
-                    osmosis_replication_base_url = Some(String::from_utf8(bytes.to_vec())
-                        .map_err(|_| new_wire_error("invalid UTF-8 in replication_base_url"))?);
+                    osmosis_replication_base_url =
+                        Some(String::from_utf8(bytes.to_vec()).map_err(|_| {
+                            new_wire_error("invalid UTF-8 in replication_base_url")
+                        })?);
                 }
                 _ => cursor.skip_field(wire_type)?,
             }
@@ -400,10 +411,12 @@ impl PrimitiveBlock {
         }
 
         #[allow(clippy::transmute_undefined_repr)]
-        let block =
-            unsafe { std::mem::transmute::<WireBlock<'_>, WireBlock<'static>>(block) };
+        let block = unsafe { std::mem::transmute::<WireBlock<'_>, WireBlock<'static>>(block) };
 
-        Ok(PrimitiveBlock { buffer: bytes, block })
+        Ok(PrimitiveBlock {
+            buffer: bytes,
+            block,
+        })
     }
 
     /// Like [`new`] but reuses caller-provided scratch buffers for
@@ -536,7 +549,12 @@ impl PrimitiveBlock {
     /// Scaffolding for future per-group raw passthrough.
     #[allow(dead_code)]
     pub(crate) fn block_scalars(&self) -> (i32, i64, i64, i32) {
-        (self.block.granularity, self.block.lat_offset, self.block.lon_offset, self.block.date_granularity)
+        (
+            self.block.granularity,
+            self.block.lat_offset,
+            self.block.lon_offset,
+            self.block.date_granularity,
+        )
     }
 
     /// Returns the number of entries in this block's string table.
@@ -732,11 +750,13 @@ impl<'a> BlockElementsIter<'a> {
                 let group = WireGroup::new(group_data);
                 self.dense_nodes = match group.dense() {
                     Ok(Some(data)) => match WireDenseNodes::parse(data) {
-                        Ok(dense) => if self.skip_metadata {
-                            DenseNodeIter::new_skip_metadata(self.block, dense)
-                        } else {
-                            DenseNodeIter::new(self.block, dense)
-                        },
+                        Ok(dense) => {
+                            if self.skip_metadata {
+                                DenseNodeIter::new_skip_metadata(self.block, dense)
+                            } else {
+                                DenseNodeIter::new(self.block, dense)
+                            }
+                        }
                         Err(_) => DenseNodeIter::empty(self.block),
                     },
                     _ => DenseNodeIter::empty(self.block),
@@ -774,9 +794,7 @@ impl<'a> BlockElementsIter<'a> {
             ElementsIterState::Relation => {
                 for data in self.relations.by_ref() {
                     if let Ok(wire_rel) = WireRelation::parse(data) {
-                        return Some(Some(Element::Relation(Relation::new(
-                            self.block, wire_rel,
-                        ))));
+                        return Some(Some(Element::Relation(Relation::new(self.block, wire_rel))));
                     }
                 }
                 self.state = ElementsIterState::Group;

@@ -36,16 +36,16 @@
 use std::path::Path;
 
 use super::{
-    ensure_node_capacity_local, ensure_relation_capacity_local, ensure_way_capacity_local,
-    flush_local, require_indexdata, writer_from_header, HeaderOverrides, Result,
+    HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
+    ensure_way_capacity_local, flush_local, require_indexdata, writer_from_header,
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::owned::{
-    dense_node_metadata, element_metadata, read_dense_node, read_node, read_relation, read_way,
-    write_single_node_local, write_single_relation_local, write_single_way_local, OwnedNode,
-    OwnedRelation, OwnedWay,
+    OwnedNode, OwnedRelation, OwnedWay, dense_node_metadata, element_metadata, read_dense_node,
+    read_node, read_relation, read_way, write_single_node_local, write_single_relation_local,
+    write_single_way_local,
 };
-use crate::writer::{frame_blob_pipelined, Compression, PbfWriter};
+use crate::writer::{Compression, PbfWriter, frame_blob_pipelined};
 use crate::{Element, ElementReader};
 
 const KIND_NODE: u8 = 0;
@@ -304,10 +304,7 @@ fn emit_phase_counters(kind: &str, s: &PhaseStats) {
             &format!("repack_{kind}_central_blobs"),
             s.central_blobs as i64,
         );
-        crate::debug::emit_counter(
-            &format!("repack_{kind}_cap_fired"),
-            i64::from(s.cap_fired),
-        );
+        crate::debug::emit_counter(&format!("repack_{kind}_cap_fired"), i64::from(s.cap_fired));
     }
 }
 
@@ -413,7 +410,8 @@ fn run_kind_phase(
                                 }
                             }
                             Ok(())
-                        })();
+                        })(
+                        );
                         if let Err(e) = consume_res {
                             classify_error.get_or_insert(e);
                             continue;
@@ -424,8 +422,7 @@ fn run_kind_phase(
                         central_blobs += output.len() as u64;
                         pending.append(&mut output);
                         while pending.len() >= FRAME_BATCH {
-                            let batch: Vec<OwnedBlock> =
-                                pending.drain(..FRAME_BATCH).collect();
+                            let batch: Vec<OwnedBlock> = pending.drain(..FRAME_BATCH).collect();
                             match frame_and_write_batch(batch, compression, writer) {
                                 Ok(written) => blobs += written,
                                 Err(e) => {
@@ -642,16 +639,18 @@ fn frame_and_write_batch(
 
     let framed: Vec<std::io::Result<Vec<u8>>> = batch
         .into_par_iter()
-        .map(|(block_bytes, index, tagdata)| -> std::io::Result<Vec<u8>> {
-            let indexdata = index.serialize();
-            let blob = frame_blob_pipelined(
-                &block_bytes,
-                &compression,
-                Some(indexdata.as_slice()),
-                tagdata.as_deref(),
-            )?;
-            Ok(blob.into_vec())
-        })
+        .map(
+            |(block_bytes, index, tagdata)| -> std::io::Result<Vec<u8>> {
+                let indexdata = index.serialize();
+                let blob = frame_blob_pipelined(
+                    &block_bytes,
+                    &compression,
+                    Some(indexdata.as_slice()),
+                    tagdata.as_deref(),
+                )?;
+                Ok(blob.into_vec())
+            },
+        )
         .collect();
 
     let mut written: u64 = 0;

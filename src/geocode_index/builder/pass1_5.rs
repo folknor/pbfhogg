@@ -8,8 +8,8 @@
 
 use std::os::unix::fs::FileExt as _;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::Result;
 
@@ -73,12 +73,18 @@ pub(super) fn run_pass1_5(
 
                     loop {
                         // Exit early if another worker has reported an error.
-                        if first_err_ref.lock().unwrap_or_else(
-                            std::sync::PoisonError::into_inner).is_some()
-                        { return; }
+                        if first_err_ref
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .is_some()
+                        {
+                            return;
+                        }
 
                         let idx = next_ref.fetch_add(1, Ordering::Relaxed);
-                        if idx >= way_schedule.len() { break; }
+                        if idx >= way_schedule.len() {
+                            break;
+                        }
                         let (_seq, offset, size) = way_schedule[idx];
 
                         let result = (|| -> std::result::Result<(), String> {
@@ -95,8 +101,10 @@ pub(super) fn run_pass1_5(
                                 &mut group_starts,
                                 |way_id, flags, refs| {
                                     let is_admin = needed_admin_ways_ref.get(way_id);
-                                    if flags.is_street || flags.is_building_addr
-                                        || flags.is_interp || is_admin
+                                    if flags.is_street
+                                        || flags.is_building_addr
+                                        || flags.is_interp
+                                        || is_admin
                                     {
                                         for &r in refs {
                                             // Guard: `IdSet::set_atomic` casts
@@ -111,19 +119,25 @@ pub(super) fn run_pass1_5(
                                             // `IdSet::set` silently skips
                                             // negatives; match that here
                                             // rather than panic.
-                                            if r < 0 { continue; }
+                                            if r < 0 {
+                                                continue;
+                                            }
                                             referenced_ref.set_atomic(r);
                                         }
                                     }
                                 },
-                            ).map_err(|e| e.to_string())?;
+                            )
+                            .map_err(|e| e.to_string())?;
                             Ok(())
                         })();
 
                         if let Err(e) = result {
-                            let mut slot = first_err_ref.lock().unwrap_or_else(
-                                std::sync::PoisonError::into_inner);
-                            if slot.is_none() { *slot = Some(e); }
+                            let mut slot = first_err_ref
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if slot.is_none() {
+                                *slot = Some(e);
+                            }
                             return;
                         }
                     }
@@ -131,7 +145,8 @@ pub(super) fn run_pass1_5(
             }
         });
 
-        if let Some(e) = first_err.into_inner()
+        if let Some(e) = first_err
+            .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
         {
             return Err(e.into());
@@ -166,9 +181,9 @@ pub(super) fn run_pass1_5(
 pub(super) fn build_pass2_schedules(
     input_path: &Path,
 ) -> Result<(
-    Vec<(usize, u64, usize)>,  // node_schedule
-    Vec<(usize, u64, usize)>,  // way_schedule
-    i64,                        // max_node_id
+    Vec<(usize, u64, usize)>, // node_schedule
+    Vec<(usize, u64, usize)>, // way_schedule
+    i64,                      // max_node_id
     std::sync::Arc<std::fs::File>,
 )> {
     let mut walker = crate::read::header_walker::HeaderWalker::open(input_path)?;
@@ -182,7 +197,9 @@ pub(super) fn build_pass2_schedules(
     let mut way_seq: usize = 0;
     let mut max_node_id: i64 = 0;
     while let Some(meta) = walker.next_header()? {
-        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) { continue; }
+        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
+            continue;
+        }
         let Some(idx) = meta.index.as_ref() else {
             // No indexdata: conservatively include in both schedules so
             // neither phase silently drops data from a --force run.

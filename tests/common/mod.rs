@@ -149,7 +149,9 @@ pub fn write_test_pbf_impl(
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
     let mut hb = block_builder::HeaderBuilder::new();
-    if sorted { hb = hb.sorted(); }
+    if sorted {
+        hb = hb.sorted();
+    }
     let header = hb.build().expect("build header");
     writer.write_header(&header).expect("write header");
 
@@ -664,9 +666,12 @@ pub fn read_all_elements_with_coords(path: &Path) -> PbfContentsWithCoords {
                             .tags()
                             .map(|(k, v)| (k.to_string(), v.to_string()))
                             .collect();
-                        contents
-                            .nodes
-                            .push((dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), tags));
+                        contents.nodes.push((
+                            dn.id(),
+                            dn.decimicro_lat(),
+                            dn.decimicro_lon(),
+                            tags,
+                        ));
                     }
                     Element::Node(n) => {
                         let tags: Vec<(String, String)> = n
@@ -678,14 +683,18 @@ pub fn read_all_elements_with_coords(path: &Path) -> PbfContentsWithCoords {
                             .push((n.id(), n.decimicro_lat(), n.decimicro_lon(), tags));
                     }
                     Element::Way(w) => {
-                        let tags: Vec<(String, String)> =
-                            w.tags().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+                        let tags: Vec<(String, String)> = w
+                            .tags()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect();
                         let refs: Vec<i64> = w.refs().collect();
                         contents.ways.push((w.id(), refs, tags));
                     }
                     Element::Relation(r) => {
-                        let tags: Vec<(String, String)> =
-                            r.tags().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+                        let tags: Vec<(String, String)> = r
+                            .tags()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect();
                         let members: Vec<(i64, String, String)> = r
                             .members()
                             .map(|m| {
@@ -780,14 +789,18 @@ pub fn read_all_elements_id_only(path: &Path) -> PbfContentsIdOnly {
                         contents.nodes.push((n.id(), tags));
                     }
                     Element::Way(w) => {
-                        let tags: Vec<(String, String)> =
-                            w.tags().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+                        let tags: Vec<(String, String)> = w
+                            .tags()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect();
                         let refs: Vec<i64> = w.refs().collect();
                         contents.ways.push((w.id(), refs, tags));
                     }
                     Element::Relation(r) => {
-                        let tags: Vec<(String, String)> =
-                            r.tags().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+                        let tags: Vec<(String, String)> = r
+                            .tags()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect();
                         contents.relations.push((r.id(), tags));
                     }
                     _ => {}
@@ -1239,11 +1252,7 @@ pub fn assert_scratch_unchanged(
 ///         .assert_success();
 /// });
 /// ```
-pub fn with_tracked_scratch_dir<F, R>(
-    scratch_root: &Path,
-    expected_new_paths: &[&Path],
-    f: F,
-) -> R
+pub fn with_tracked_scratch_dir<F, R>(scratch_root: &Path, expected_new_paths: &[&Path], f: F) -> R
 where
     F: FnOnce() -> R,
 {

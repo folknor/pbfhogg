@@ -21,7 +21,7 @@ use quick_xml::Writer;
 use crate::blob_meta::{BlobIndex, ElemKind};
 use crate::error::Result;
 use crate::osc::merge_join::{element_id, element_version};
-use crate::osc::write::{write_element_xml, OwnedMetadata};
+use crate::osc::write::{OwnedMetadata, write_element_xml};
 use crate::read::header_walker::HeaderWalker;
 use crate::{Element, PrimitiveBlock};
 
@@ -132,11 +132,7 @@ struct Shard {
 /// boundaries so correctness doesn't depend on new-side alignment;
 /// straddling new blobs are read by both adjacent shards and each
 /// shard's element merge filters to its `(t_low, t_high]` window.
-fn plan_shards(
-    old_descs: &[BlobDesc],
-    new_descs: &[BlobDesc],
-    target_count: usize,
-) -> Vec<Shard> {
+fn plan_shards(old_descs: &[BlobDesc], new_descs: &[BlobDesc], target_count: usize) -> Vec<Shard> {
     // Positive-only input invariant (DEVIATIONS.md > renumber: negative
     // input IDs rejected). Threshold comparisons in this planner and in
     // the shard hot path are raw i64 compares rather than `osm_id_cmp`;
@@ -185,12 +181,7 @@ fn plan_shards(
     shards
 }
 
-fn build_shard(
-    old_descs: &[BlobDesc],
-    new_descs: &[BlobDesc],
-    t_low: i64,
-    t_high: i64,
-) -> Shard {
+fn build_shard(old_descs: &[BlobDesc], new_descs: &[BlobDesc], t_low: i64, t_high: i64) -> Shard {
     // A blob intersects (t_low, t_high] iff max_id > t_low and
     // min_id <= t_high. Because blobs are sorted by (max_id, min_id)
     // monotonically, the intersecting range is contiguous.
@@ -330,15 +321,18 @@ fn run_shard(
 
     let (cp, mp, dp) = shard_xml_paths(scratch_dir, kind, shard_idx);
 
-    let mut creates_w = Writer::new(BufWriter::new(
-        File::create(&cp).map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?,
-    ));
-    let mut modifies_w = Writer::new(BufWriter::new(
-        File::create(&mp).map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?,
-    ));
-    let mut deletes_w = Writer::new(BufWriter::new(
-        File::create(&dp).map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?,
-    ));
+    let mut creates_w =
+        Writer::new(BufWriter::new(File::create(&cp).map_err(|e| {
+            crate::error::new_error(crate::error::ErrorKind::Io(e))
+        })?));
+    let mut modifies_w =
+        Writer::new(BufWriter::new(File::create(&mp).map_err(|e| {
+            crate::error::new_error(crate::error::ErrorKind::Io(e))
+        })?));
+    let mut deletes_w =
+        Writer::new(BufWriter::new(File::create(&dp).map_err(|e| {
+            crate::error::new_error(crate::error::ErrorKind::Io(e))
+        })?));
     let mut coord_buf = String::new();
 
     let old_slice = &old_descs[shard.old_start..shard.old_end];
@@ -396,7 +390,13 @@ fn run_shard(
                     if id > t_high {
                         break;
                     }
-                    emit_delete(&mut deletes_w, &elem, kind, increment_version, update_timestamp)?;
+                    emit_delete(
+                        &mut deletes_w,
+                        &elem,
+                        kind,
+                        increment_version,
+                        update_timestamp,
+                    )?;
                     delete_count += 1;
                 }
             }
@@ -425,7 +425,13 @@ fn run_shard(
                         if id > t_high {
                             break;
                         }
-                        emit_delete(&mut deletes_w, &elem, kind, increment_version, update_timestamp)?;
+                        emit_delete(
+                            &mut deletes_w,
+                            &elem,
+                            kind,
+                            increment_version,
+                            update_timestamp,
+                        )?;
                         delete_count += 1;
                     }
                     continue;
@@ -579,8 +585,12 @@ fn element_merge<W: Write>(
     }
 
     loop {
-        let old_in_range = old_iter.peek().is_some_and(|e| element_id(e) <= merge_up_to);
-        let new_in_range = new_iter.peek().is_some_and(|e| element_id(e) <= merge_up_to);
+        let old_in_range = old_iter
+            .peek()
+            .is_some_and(|e| element_id(e) <= merge_up_to);
+        let new_in_range = new_iter
+            .peek()
+            .is_some_and(|e| element_id(e) <= merge_up_to);
 
         match (old_in_range, new_in_range) {
             (false, false) => break,
@@ -635,9 +645,7 @@ fn borrowed_elements_equal(a: &Element<'_>, b: &Element<'_>) -> bool {
         (Element::DenseNode(_) | Element::Node(_), Element::DenseNode(_) | Element::Node(_)) => {
             borrowed_nodes_equal(a, b)
         }
-        (Element::Way(wa), Element::Way(wb)) => {
-            wa.refs().eq(wb.refs()) && wa.tags().eq(wb.tags())
-        }
+        (Element::Way(wa), Element::Way(wb)) => wa.refs().eq(wb.refs()) && wa.tags().eq(wb.tags()),
         (Element::Relation(ra), Element::Relation(rb)) => borrowed_relations_equal(ra, rb),
         _ => false,
     }
@@ -717,8 +725,15 @@ fn emit_delete<W: Write>(
     let Some((tag, id, meta)) = extract_delete_info(elem, kind) else {
         return Ok(());
     };
-    write_delete_element(writer, tag, id, meta.as_ref(), increment_version, update_timestamp)
-        .map_err(map_emit_err)
+    write_delete_element(
+        writer,
+        tag,
+        id,
+        meta.as_ref(),
+        increment_version,
+        update_timestamp,
+    )
+    .map_err(map_emit_err)
 }
 
 fn extract_delete_info(
@@ -1030,10 +1045,9 @@ pub(crate) fn derive_changes_parallel(
 }
 
 fn append_and_cleanup(out: &mut BufWriter<File>, src: &Path) -> Result<()> {
-    let mut f = File::open(src)
-        .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
-    io::copy(&mut f, out)
-        .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+    let mut f =
+        File::open(src).map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+    io::copy(&mut f, out).map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
     drop(f);
     drop(std::fs::remove_file(src));
     Ok(())

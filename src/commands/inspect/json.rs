@@ -5,8 +5,8 @@
 
 use super::format::format_timestamp;
 use super::types::{
-    anomaly_blocks, is_standard_ordering, BlockInfo, ExtendedStats, InspectReport, LocationStats,
-    MetadataCoverage, ScanState, TypeIdRange, TypeStats,
+    BlockInfo, ExtendedStats, InspectReport, LocationStats, MetadataCoverage, ScanState,
+    TypeIdRange, TypeStats, anomaly_blocks, is_standard_ordering,
 };
 
 impl InspectReport {
@@ -44,8 +44,12 @@ impl InspectReport {
             },
         });
 
-        let sequence: Vec<&str> = self.accum.segments.iter()
-            .map(|s| s.kind.short_label()).collect();
+        let sequence: Vec<&str> = self
+            .accum
+            .segments
+            .iter()
+            .map(|s| s.kind.short_label())
+            .collect();
 
         let mut json = serde_json::json!({
             "schema_version": 1,
@@ -180,14 +184,16 @@ fn blocks_detail_json(
         let selected = anomaly_blocks(infos);
         let arr: Vec<serde_json::Value> = selected
             .iter()
-            .map(|(info, reason)| serde_json::json!({
-                "number": info.number,
-                "type": info.kind.short_label(),
-                "elements": info.elements,
-                "compressed_bytes": info.compressed,
-                "raw_bytes": info.raw,
-                "anomaly": reason,
-            }))
+            .map(|(info, reason)| {
+                serde_json::json!({
+                    "number": info.number,
+                    "type": info.kind.short_label(),
+                    "elements": info.elements,
+                    "compressed_bytes": info.compressed,
+                    "raw_bytes": info.raw,
+                    "anomaly": reason,
+                })
+            })
             .collect();
         return serde_json::Value::Array(arr);
     }
@@ -204,19 +210,25 @@ fn blocks_detail_json(
         Box::new(selected.iter().copied())
     };
     let arr: Vec<serde_json::Value> = iter
-        .map(|info| serde_json::json!({
-            "number": info.number,
-            "type": info.kind.short_label(),
-            "elements": info.elements,
-            "compressed_bytes": info.compressed,
-            "raw_bytes": info.raw,
-        }))
+        .map(|info| {
+            serde_json::json!({
+                "number": info.number,
+                "type": info.kind.short_label(),
+                "elements": info.elements,
+                "compressed_bytes": info.compressed,
+                "raw_bytes": info.raw,
+            })
+        })
         .collect();
     serde_json::Value::Array(arr)
 }
 
 #[cfg(feature = "commands")]
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn locations_json(loc_stats: &Option<LocationStats>) -> serde_json::Value {
     let Some(stats) = loc_stats else {
         return serde_json::Value::Null;

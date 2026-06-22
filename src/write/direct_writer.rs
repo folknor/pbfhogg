@@ -39,7 +39,11 @@ impl AlignedBuffer {
     /// Allocate a new buffer of `capacity` bytes aligned to `PAGE_SIZE`.
     fn new(capacity: usize) -> io::Result<Self> {
         let (ptr, layout) = alloc_page_aligned(capacity)?;
-        Ok(Self { ptr, layout, len: 0 })
+        Ok(Self {
+            ptr,
+            layout,
+            len: 0,
+        })
     }
 
     fn capacity(&self) -> usize {
@@ -59,7 +63,11 @@ impl AlignedBuffer {
         debug_assert!(data.len() <= self.remaining());
         // Safety: we verified there is room, and ptr + len is within the allocation.
         unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.as_ptr().add(self.len), data.len());
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                self.ptr.as_ptr().add(self.len),
+                data.len(),
+            );
         }
         self.len += data.len();
     }

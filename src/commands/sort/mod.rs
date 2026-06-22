@@ -12,28 +12,25 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
+use crate::Element;
 use crate::blob::{
-    decode_blob_to_headerblock, decode_blob_to_primitiveblock, decompress_blob_data_into,
-    BlobKind,
+    BlobKind, decode_blob_to_headerblock, decode_blob_to_primitiveblock, decompress_blob_data_into,
 };
 use crate::blob_meta::{BlobIndex, ElemKind, scan_block_ids};
 use crate::block_builder::BlockBuilder;
 use crate::file_writer::FileWriter;
 use crate::read::header_walker::HeaderWalker;
-use crate::writer::{reframe_raw_with_index, Compression, PbfWriter};
-use crate::Element;
+use crate::writer::{Compression, PbfWriter, reframe_raw_with_index};
 
+use super::{
+    HeaderOverrides, Result, build_output_header, require_indexdata, writer_from_header_bytes,
+};
 use crate::block_builder::OwnedBlock;
 use crate::owned::{
-    read_dense_node, read_node, read_relation, read_way,
+    OwnedNode, OwnedRelation, OwnedWay, read_dense_node, read_node, read_relation, read_way,
     write_single_node_local, write_single_relation_local, write_single_way_local,
-    OwnedNode, OwnedRelation, OwnedWay,
 };
 use rayon::prelude::*;
-use super::{
-    build_output_header, require_indexdata, HeaderOverrides, Result,
-    writer_from_header_bytes,
-};
 
 /// Statistics from a sort operation.
 pub struct SortStats {
@@ -49,8 +46,12 @@ impl SortStats {
     pub fn print_summary(&self) {
         eprintln!(
             "Sorted {} nodes, {} ways, {} relations ({} blobs: {} passthrough, {} rewritten)",
-            self.nodes, self.ways, self.relations,
-            self.blobs_total, self.blobs_passthrough, self.blobs_rewritten,
+            self.nodes,
+            self.ways,
+            self.relations,
+            self.blobs_total,
+            self.blobs_passthrough,
+            self.blobs_rewritten,
         );
     }
 }
@@ -92,11 +93,25 @@ pub struct SortOptions {
 
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]
-pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderOverrides) -> Result<SortStats> {
-    let SortOptions { compression, direct_io, io_uring, force } = *opts;
-    require_indexdata(input, direct_io, force,
+pub fn sort(
+    input: &Path,
+    output: &Path,
+    opts: &SortOptions,
+    overrides: &HeaderOverrides,
+) -> Result<SortStats> {
+    let SortOptions {
+        compression,
+        direct_io,
+        io_uring,
+        force,
+    } = *opts;
+    require_indexdata(
+        input,
+        direct_io,
+        force,
         "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
-         decompressed to scan element IDs (significantly slower).")?;
+         decompressed to scan element IDs (significantly slower).",
+    )?;
 
     #[allow(clippy::cast_possible_wrap)]
     if let Ok(meta) = std::fs::metadata(input) {
@@ -117,7 +132,10 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderO
     // Sort by (type_order, min_id)
     crate::debug::emit_marker("SORT_OVERLAP_DETECT_START");
     entries.sort_by_key(|e| {
-        (type_order(e.index.kind), crate::osm_id::blob_osm_first_key(e.index.min_id, e.index.max_id))
+        (
+            type_order(e.index.kind),
+            crate::osm_id::blob_osm_first_key(e.index.min_id, e.index.max_id),
+        )
     });
 
     // Detect overlaps
@@ -138,13 +156,8 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderO
     crate::debug::emit_marker("SORT_WRITER_SETUP_START");
     #[allow(clippy::redundant_closure_for_method_calls)]
     let header_bytes = build_output_header(&header, false, overrides, |hb| hb.sorted())?;
-    let mut writer = writer_from_header_bytes(
-        output,
-        compression,
-        &header_bytes,
-        direct_io,
-        io_uring,
-    )?;
+    let mut writer =
+        writer_from_header_bytes(output, compression, &header_bytes, direct_io, io_uring)?;
     crate::debug::emit_marker("SORT_WRITER_SETUP_END");
 
     // Open input for random-access reads
@@ -259,7 +272,10 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderO
         }
     }
     flush_copy_run(&mut copy_run, &mut writer, input_fd, &mut copy_run_calls)?;
-    debug_assert!(overlap_iter.next().is_none(), "overlap outputs not fully drained");
+    debug_assert!(
+        overlap_iter.next().is_none(),
+        "overlap outputs not fully drained"
+    );
 
     crate::debug::emit_marker("SORT_WRITE_LOOP_END");
 
@@ -329,10 +345,7 @@ fn build_blob_index(
                         walker.pread_data(meta.data_offset, meta.data_size, &mut data_buf)?;
                         decompress_blob_data_into(&data_buf, &mut decompress_buf)?;
                         scan_block_ids(&decompress_buf).ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "failed to scan block IDs",
-                            )
+                            io::Error::new(io::ErrorKind::InvalidData, "failed to scan block IDs")
                         })?
                     }
                 };
@@ -351,9 +364,8 @@ fn build_blob_index(
         }
     }
 
-    let header = header.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "no OSMHeader blob found")
-    })?;
+    let header = header
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no OSMHeader blob found"))?;
 
     Ok((header, entries))
 }
@@ -380,7 +392,10 @@ fn detect_overlaps(entries: &[BlobEntry]) -> Vec<bool> {
     for i in 0..entries.len().saturating_sub(1) {
         if entries[i].index.kind == entries[i + 1].index.kind
             && crate::osm_id::blob_osm_last_key(entries[i].index.min_id, entries[i].index.max_id)
-                >= crate::osm_id::blob_osm_first_key(entries[i + 1].index.min_id, entries[i + 1].index.max_id)
+                >= crate::osm_id::blob_osm_first_key(
+                    entries[i + 1].index.min_id,
+                    entries[i + 1].index.max_id,
+                )
         {
             overlaps[i] = true;
             overlaps[i + 1] = true;
@@ -410,7 +425,11 @@ fn write_passthrough_blob(
         // Reframe with indexdata before writing.
         read_frame_into(input_file, entry, frame_buf)?;
         let blob_bytes = extract_blob_bytes(frame_buf)?;
-        let reframed = reframe_raw_with_index(blob_bytes, &entry.index.serialize(), entry.tagdata.as_deref())?;
+        let reframed = reframe_raw_with_index(
+            blob_bytes,
+            &entry.index.serialize(),
+            entry.tagdata.as_deref(),
+        )?;
         writer.write_raw(&reframed)?;
     }
     Ok(())
@@ -484,17 +503,16 @@ fn flush_copy_run(
     _input_fd: i32,
     _calls: &mut u64,
 ) -> Result<()> {
-    debug_assert!(run.is_none(), "copy_file_range run set without linux-direct-io feature");
+    debug_assert!(
+        run.is_none(),
+        "copy_file_range run set without linux-direct-io feature"
+    );
     run.take();
     Ok(())
 }
 
 /// Read a complete frame from the input file at the given offset into `buf`.
-fn read_frame_into(
-    file: &mut File,
-    entry: &BlobEntry,
-    buf: &mut Vec<u8>,
-) -> io::Result<()> {
+fn read_frame_into(file: &mut File, entry: &BlobEntry, buf: &mut Vec<u8>) -> io::Result<()> {
     file.seek(SeekFrom::Start(entry.file_offset))?;
     #[allow(clippy::cast_possible_truncation)]
     let len = entry.frame_len as usize;
@@ -509,17 +527,13 @@ fn read_frame_into(
 /// Frame layout: `[4-byte header_len][BlobHeader][Blob]`.
 fn extract_blob_bytes(frame: &[u8]) -> Result<&[u8]> {
     if frame.len() < 4 {
-        return Err(
-            io::Error::new(io::ErrorKind::InvalidData, "frame too short").into(),
-        );
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too short").into());
     }
     #[allow(clippy::cast_possible_truncation)]
     let header_len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
     let blob_start = 4 + header_len;
     if blob_start > frame.len() {
-        return Err(
-            io::Error::new(io::ErrorKind::InvalidData, "invalid header length").into(),
-        );
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid header length").into());
     }
     Ok(&frame[blob_start..])
 }
@@ -642,7 +656,11 @@ fn sweep_merge_local<T: Ord + HasId>(
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
     mut extract: impl FnMut(&Element<'_>, &mut BinaryHeap<Reverse<T>>),
-    mut write_elem: impl FnMut(&T, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> std::result::Result<(), String>,
+    mut write_elem: impl FnMut(
+        &T,
+        &mut BlockBuilder,
+        &mut Vec<OwnedBlock>,
+    ) -> std::result::Result<(), String>,
 ) -> std::result::Result<u64, String> {
     let mut heap: BinaryHeap<Reverse<T>> = BinaryHeap::new();
     let mut frame_buf: Vec<u8> = Vec::new();
@@ -680,7 +698,10 @@ fn flush_heap_below_local<T: Ord + HasId>(
     below: i64,
     mut emit: impl FnMut(T) -> std::result::Result<(), String>,
 ) -> std::result::Result<(), String> {
-    while heap.peek().is_some_and(|Reverse(e)| crate::osm_id::osm_id_cmp(e.id(), below).is_lt()) {
+    while heap
+        .peek()
+        .is_some_and(|Reverse(e)| crate::osm_id::osm_id_cmp(e.id(), below).is_lt())
+    {
         if let Some(Reverse(element)) = heap.pop() {
             emit(element)?;
         }
@@ -694,15 +715,19 @@ trait HasId {
 }
 
 impl HasId for OwnedNode {
-    fn id(&self) -> i64 { self.id }
+    fn id(&self) -> i64 {
+        self.id
+    }
 }
 
 impl HasId for OwnedWay {
-    fn id(&self) -> i64 { self.id }
+    fn id(&self) -> i64 {
+        self.id
+    }
 }
 
 impl HasId for OwnedRelation {
-    fn id(&self) -> i64 { self.id }
+    fn id(&self) -> i64 {
+        self.id
+    }
 }
-
-

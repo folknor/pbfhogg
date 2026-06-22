@@ -2,10 +2,10 @@
 
 use std::path::Path;
 
-use crate::idset::IdSet;
 use crate::BoxResult as Result;
-use crate::owned::TypeFilter;
 use crate::ElementReader;
+use crate::idset::IdSet;
+use crate::owned::TypeFilter;
 
 // ---------------------------------------------------------------------------
 // Options
@@ -38,10 +38,7 @@ pub enum IdViolation {
         prev_id: i64,
     },
     /// An element ID appears more than once (only detected in full mode).
-    Duplicate {
-        elem_type: &'static str,
-        id: i64,
-    },
+    Duplicate { elem_type: &'static str, id: i64 },
     /// Element types appear out of canonical order (nodes, then ways, then relations).
     TypeOrder {
         found: &'static str,
@@ -98,7 +95,9 @@ impl VerifyIdsReport {
 
     /// Serialize the report as a JSON string.
     pub fn to_json(&self, file_name: &str) -> Result<String> {
-        Ok(serde_json::to_string_pretty(&self.to_json_value(file_name))?)
+        Ok(serde_json::to_string_pretty(
+            &self.to_json_value(file_name),
+        )?)
     }
 
     /// Print a human-readable summary to stdout.
@@ -266,7 +265,10 @@ pub fn verify_ids(path: &Path, opts: &VerifyIdsOptions<'_>) -> Result<VerifyIdsR
 // translation step.
 
 #[allow(clippy::too_many_lines)]
-fn verify_ids_streaming_parallel(path: &Path, opts: &VerifyIdsOptions<'_>) -> Result<VerifyIdsReport> {
+fn verify_ids_streaming_parallel(
+    path: &Path,
+    opts: &VerifyIdsOptions<'_>,
+) -> Result<VerifyIdsReport> {
     use crate::Element;
 
     crate::debug::emit_marker("VERIFYIDS_SCAN_START");
@@ -280,10 +282,14 @@ fn verify_ids_streaming_parallel(path: &Path, opts: &VerifyIdsOptions<'_>) -> Re
         libc::mallopt(libc::M_ARENA_MAX, 2);
     }
 
-    let header_sorted = ElementReader::open(path, opts.direct_io)?.header().is_sorted();
+    let header_sorted = ElementReader::open(path, opts.direct_io)?
+        .header()
+        .is_sorted();
     let indexed = crate::commands::has_indexdata(path, opts.direct_io)?;
 
-    let type_filter = opts.type_filter.map_or_else(TypeFilter::all, TypeFilter::parse);
+    let type_filter = opts
+        .type_filter
+        .map_or_else(TypeFilter::all, TypeFilter::parse);
 
     let (node_schedule, way_schedule, rel_schedule, shared_file) =
         crate::scan::classify::build_classify_schedules_split(path)?;
@@ -298,7 +304,14 @@ fn verify_ids_streaming_parallel(path: &Path, opts: &VerifyIdsOptions<'_>) -> Re
     // skip it (build_classify_schedules_split replicates blobs into all
     // three schedules when indexdata is missing).
     if indexed {
-        check_type_order(&node_schedule, &way_schedule, &rel_schedule, &mut violations, &mut total_violations, opts.max_errors);
+        check_type_order(
+            &node_schedule,
+            &way_schedule,
+            &rel_schedule,
+            &mut violations,
+            &mut total_violations,
+            opts.max_errors,
+        );
     }
 
     if type_filter.nodes {
@@ -515,10 +528,14 @@ fn verify_ids_full_parallel(path: &Path, opts: &VerifyIdsOptions<'_>) -> Result<
     // Cheap: ElementReader::open reads the header and stops. Drop it
     // immediately; parallel_classify_phase reopens the file internally via
     // the shared_file from build_classify_schedules_split.
-    let header_sorted = ElementReader::open(path, opts.direct_io)?.header().is_sorted();
+    let header_sorted = ElementReader::open(path, opts.direct_io)?
+        .header()
+        .is_sorted();
     let indexed = crate::commands::has_indexdata(path, opts.direct_io)?;
 
-    let type_filter = opts.type_filter.map_or_else(TypeFilter::all, TypeFilter::parse);
+    let type_filter = opts
+        .type_filter
+        .map_or_else(TypeFilter::all, TypeFilter::parse);
 
     // Pre-allocate IdSets for the kinds we intend to verify.
     let mut node_ids = IdSet::new();
@@ -561,7 +578,14 @@ fn verify_ids_full_parallel(path: &Path, opts: &VerifyIdsOptions<'_>) -> Result<
     // non-indexed input; `--full` under `--force` just loses the
     // offset-based pre-check.
     if indexed {
-        check_type_order(&node_schedule, &way_schedule, &rel_schedule, &mut violations, &mut total_violations, opts.max_errors);
+        check_type_order(
+            &node_schedule,
+            &way_schedule,
+            &rel_schedule,
+            &mut violations,
+            &mut total_violations,
+            opts.max_errors,
+        );
     }
 
     // Phase 1 - nodes
@@ -754,7 +778,10 @@ fn check_type_order(
     total_violations: &mut u64,
     max_errors: usize,
 ) {
-    let record = |after: &'static str, found: &'static str, violations: &mut Vec<IdViolation>, total_violations: &mut u64| {
+    let record = |after: &'static str,
+                  found: &'static str,
+                  violations: &mut Vec<IdViolation>,
+                  total_violations: &mut u64| {
         *total_violations += 1;
         if violations.len() < max_errors {
             violations.push(IdViolation::TypeOrder { found, after });

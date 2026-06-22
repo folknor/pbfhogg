@@ -159,4 +159,3 @@ impl fmt::Display for Error {
         }
     }
 }
-

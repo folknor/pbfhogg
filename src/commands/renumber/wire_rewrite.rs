@@ -89,7 +89,9 @@ pub(super) fn reframe_dense_with_new_ids(
                 group_ranges_scratch.push((offset, data.len()));
             }
             (17..=20, WIRE_VARINT) => {
-                let raw = cursor.read_raw_field(wire_type).map_err(|e| e.to_string())?;
+                let raw = cursor
+                    .read_raw_field(wire_type)
+                    .map_err(|e| e.to_string())?;
                 protohoggr::encode_tag(scalar_fields_scratch, field, wire_type);
                 scalar_fields_scratch.extend_from_slice(raw);
             }
@@ -97,8 +99,8 @@ pub(super) fn reframe_dense_with_new_ids(
         }
     }
 
-    let (st_offset, st_len) = stringtable_range
-        .ok_or("reframe: no StringTable in PrimitiveBlock")?;
+    let (st_offset, st_len) =
+        stringtable_range.ok_or("reframe: no StringTable in PrimitiveBlock")?;
     if group_ranges_scratch.is_empty() {
         return Err("reframe: no PrimitiveGroup in PrimitiveBlock".into());
     }
@@ -136,7 +138,9 @@ pub(super) fn reframe_dense_with_new_ids(
             if field == 1 && wire_type == WIRE_LEN {
                 id_field = Some(dn_cursor.read_len_delimited().map_err(|e| e.to_string())?);
             } else {
-                let raw = dn_cursor.read_raw_field(wire_type).map_err(|e| e.to_string())?;
+                let raw = dn_cursor
+                    .read_raw_field(wire_type)
+                    .map_err(|e| e.to_string())?;
                 protohoggr::encode_tag(other_fields_scratch, field, wire_type);
                 other_fields_scratch.extend_from_slice(raw);
             }
@@ -173,8 +177,7 @@ pub(super) fn reframe_dense_with_new_ids(
         total_nodes += group_node_count;
 
         // Build new packed ID field for this group.
-        let gnc = usize::try_from(group_node_count)
-            .map_err(|_| "group node count > usize")?;
+        let gnc = usize::try_from(group_node_count).map_err(|_| "group node count > usize")?;
         new_id_packed_scratch.clear();
         protohoggr::encode_varint(
             new_id_packed_scratch,
@@ -240,15 +243,17 @@ pub(super) fn reframe_ways_with_new_ids(
                 group_ranges_scratch.push((offset, data.len()));
             }
             _ => {
-                let raw = cursor.read_raw_field(wire_type).map_err(|e| e.to_string())?;
+                let raw = cursor
+                    .read_raw_field(wire_type)
+                    .map_err(|e| e.to_string())?;
                 protohoggr::encode_tag(scalar_fields_scratch, field, wire_type);
                 scalar_fields_scratch.extend_from_slice(raw);
             }
         }
     }
 
-    let (st_offset, st_len) = stringtable_range
-        .ok_or("reframe_ways: no StringTable in PrimitiveBlock")?;
+    let (st_offset, st_len) =
+        stringtable_range.ok_or("reframe_ways: no StringTable in PrimitiveBlock")?;
     let stringtable_bytes = &decompressed[st_offset..st_offset + st_len];
 
     output.clear();
@@ -287,17 +292,22 @@ pub(super) fn reframe_ways_with_new_ids(
                     // class in test rather than letting it splice mid-varint.
                     let val_start = way_bytes.len() - way_cursor.remaining();
                     if wf == 1 && wt == WIRE_VARINT {
-                        debug_assert!(way_bytes[val_start - 1] < 0x80,
-                            "way field 1 tag byte has continuation bit set; field >= 16 schema extension?");
+                        debug_assert!(
+                            way_bytes[val_start - 1] < 0x80,
+                            "way field 1 tag byte has continuation bit set; field >= 16 schema extension?"
+                        );
                         let tag_start = val_start - 1; // field 1 varint tag = 1 byte
                         old_way_id = way_cursor.read_varint_i64().map_err(|e| e.to_string())?;
                         let val_end = way_bytes.len() - way_cursor.remaining();
                         id_range = Some((tag_start, val_end));
                     } else if wf == 8 && wt == WIRE_LEN {
-                        debug_assert!(way_bytes[val_start - 1] < 0x80,
-                            "way field 8 tag byte has continuation bit set; field >= 16 schema extension?");
+                        debug_assert!(
+                            way_bytes[val_start - 1] < 0x80,
+                            "way field 8 tag byte has continuation bit set; field >= 16 schema extension?"
+                        );
                         let tag_start = val_start - 1; // field 8 varint tag = 1 byte
-                        old_refs_data = way_cursor.read_len_delimited().map_err(|e| e.to_string())?;
+                        old_refs_data =
+                            way_cursor.read_len_delimited().map_err(|e| e.to_string())?;
                         let val_end = way_bytes.len() - way_cursor.remaining();
                         refs_range = Some((tag_start, val_end));
                     } else {
@@ -389,7 +399,9 @@ pub(super) fn reframe_ways_with_new_ids(
                 total_ways += 1;
             } else {
                 // Non-way field in the group - copy verbatim.
-                let raw = gr_cursor.read_raw_field(wire_type).map_err(|e| e.to_string())?;
+                let raw = gr_cursor
+                    .read_raw_field(wire_type)
+                    .map_err(|e| e.to_string())?;
                 protohoggr::encode_tag(group_scratch, field, wire_type);
                 group_scratch.extend_from_slice(raw);
             }
@@ -423,7 +435,11 @@ pub(super) fn reframe_ways_with_new_ids(
 /// delta encoding is over the interleaved stream, not per-type.
 ///
 /// Returns `(relation_count, min_new_id, max_new_id)`.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cast_possible_truncation)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation
+)]
 pub(super) fn reframe_relations_with_new_ids(
     decompressed: &[u8],
     relation_id_set: &IdSet,
@@ -460,15 +476,17 @@ pub(super) fn reframe_relations_with_new_ids(
                 group_ranges_scratch.push((offset, data.len()));
             }
             _ => {
-                let raw = cursor.read_raw_field(wire_type).map_err(|e| e.to_string())?;
+                let raw = cursor
+                    .read_raw_field(wire_type)
+                    .map_err(|e| e.to_string())?;
                 protohoggr::encode_tag(scalar_fields_scratch, field, wire_type);
                 scalar_fields_scratch.extend_from_slice(raw);
             }
         }
     }
 
-    let (st_offset, st_len) = stringtable_range
-        .ok_or("reframe_relations: no StringTable in PrimitiveBlock")?;
+    let (st_offset, st_len) =
+        stringtable_range.ok_or("reframe_relations: no StringTable in PrimitiveBlock")?;
     let stringtable_bytes = &decompressed[st_offset..st_offset + st_len];
 
     output.clear();
@@ -504,23 +522,29 @@ pub(super) fn reframe_relations_with_new_ids(
                     let val_start = rel_bytes.len() - rel_cursor.remaining();
                     match (rf, rt) {
                         (1, WIRE_VARINT) => {
-                            debug_assert!(rel_bytes[val_start - 1] < 0x80,
-                                "relation field 1 tag byte has continuation bit set; field >= 16 schema extension?");
+                            debug_assert!(
+                                rel_bytes[val_start - 1] < 0x80,
+                                "relation field 1 tag byte has continuation bit set; field >= 16 schema extension?"
+                            );
                             let tag_start = val_start - 1; // field 1 tag = 0x08, 1 byte
                             old_rel_id = rel_cursor.read_varint_i64().map_err(|e| e.to_string())?;
                             let val_end = rel_bytes.len() - rel_cursor.remaining();
                             id_range = Some((tag_start, val_end));
                         }
                         (9, WIRE_LEN) => {
-                            debug_assert!(rel_bytes[val_start - 1] < 0x80,
-                                "relation field 9 tag byte has continuation bit set; field >= 16 schema extension?");
+                            debug_assert!(
+                                rel_bytes[val_start - 1] < 0x80,
+                                "relation field 9 tag byte has continuation bit set; field >= 16 schema extension?"
+                            );
                             let tag_start = val_start - 1; // field 9 tag = 0x4A, 1 byte
-                            old_memids_data = rel_cursor.read_len_delimited().map_err(|e| e.to_string())?;
+                            old_memids_data =
+                                rel_cursor.read_len_delimited().map_err(|e| e.to_string())?;
                             let val_end = rel_bytes.len() - rel_cursor.remaining();
                             memids_range = Some((tag_start, val_end));
                         }
                         (10, WIRE_LEN) => {
-                            types_data = rel_cursor.read_len_delimited().map_err(|e| e.to_string())?;
+                            types_data =
+                                rel_cursor.read_len_delimited().map_err(|e| e.to_string())?;
                             // Not patched - just captured for dispatch.
                         }
                         _ => {
@@ -553,14 +577,12 @@ pub(super) fn reframe_relations_with_new_ids(
                     // varint walk catches every malformation here, at the
                     // boundary, rather than letting it surface as a
                     // misaligned decode further in.
-                    let memids_count = count_varints_strict(old_memids_data)
-                        .map_err(|e| format!(
-                            "reframe_relations: relation {old_rel_id} memids: {e}"
-                        ))?;
-                    let types_count = count_varints_strict(types_data)
-                        .map_err(|e| format!(
-                            "reframe_relations: relation {old_rel_id} types: {e}"
-                        ))?;
+                    let memids_count = count_varints_strict(old_memids_data).map_err(|e| {
+                        format!("reframe_relations: relation {old_rel_id} memids: {e}")
+                    })?;
+                    let types_count = count_varints_strict(types_data).map_err(|e| {
+                        format!("reframe_relations: relation {old_rel_id} types: {e}")
+                    })?;
                     if memids_count != types_count {
                         return Err(format!(
                             "reframe_relations: relation {old_rel_id} has {memids_count} memids \
@@ -609,7 +631,9 @@ pub(super) fn reframe_relations_with_new_ids(
                         let (new_abs_id, is_orphan) = match member_type {
                             0 => resolve_with_orphan(node_id_set, old_abs_id, start_node_id),
                             1 => resolve_with_orphan(way_id_set, old_abs_id, start_way_id),
-                            2 => resolve_with_orphan(relation_id_set, old_abs_id, start_relation_id),
+                            2 => {
+                                resolve_with_orphan(relation_id_set, old_abs_id, start_relation_id)
+                            }
                             _ => (old_abs_id, false), // unknown type - preserve
                         };
                         if is_orphan {
@@ -670,7 +694,9 @@ pub(super) fn reframe_relations_with_new_ids(
             } else {
                 // Non-relation field in the group - drop it to match
                 // current R2d behavior (only relations are emitted).
-                gr_cursor.read_raw_field(wire_type).map_err(|e| e.to_string())?;
+                gr_cursor
+                    .read_raw_field(wire_type)
+                    .map_err(|e| e.to_string())?;
             }
         }
 

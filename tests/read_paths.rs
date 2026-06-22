@@ -2,7 +2,11 @@
 //!
 //! Verifies that all reading modes produce identical results and that seek
 //! operations work correctly on BlobReader.
-#![allow(clippy::unwrap_used, clippy::cognitive_complexity, clippy::too_many_lines)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::cognitive_complexity,
+    clippy::too_many_lines
+)]
 
 mod common;
 
@@ -22,9 +26,10 @@ fn write_test_pbf(path: &Path) {
     let file = std::fs::File::create(path).unwrap();
     let mut writer = PbfWriter::new(file, Compression::default());
 
-    let header =
-        block_builder::HeaderBuilder::new().bbox(9.0, 54.0, 13.0, 58.0).build()
-            .unwrap();
+    let header = block_builder::HeaderBuilder::new()
+        .bbox(9.0, 54.0, 13.0, 58.0)
+        .build()
+        .unwrap();
     writer.write_header(&header).unwrap();
 
     let mut bb = BlockBuilder::new();
@@ -32,7 +37,13 @@ fn write_test_pbf(path: &Path) {
     // Block 1: 3 nodes
     bb.add_node(100, 550_000_000, 120_000_000, [("name", "A")], None);
     bb.add_node(200, 560_000_000, 130_000_000, [("name", "B")], None);
-    bb.add_node(300, -330_000_000, -580_000_000, std::iter::empty::<(&str, &str)>(), None);
+    bb.add_node(
+        300,
+        -330_000_000,
+        -580_000_000,
+        std::iter::empty::<(&str, &str)>(),
+        None,
+    );
     writer
         .write_primitive_block(bb.take().unwrap().unwrap())
         .unwrap();
@@ -161,7 +172,10 @@ fn block_type_classification() {
     }
 
     // write_test_pbf creates 3 blocks: dense nodes, ways, relations
-    assert_eq!(types, vec![BlockType::DenseNodes, BlockType::Ways, BlockType::Relations]);
+    assert_eq!(
+        types,
+        vec![BlockType::DenseNodes, BlockType::Ways, BlockType::Relations]
+    );
 
     // Convenience methods
     assert!(BlockType::DenseNodes.is_nodes());
@@ -268,10 +282,7 @@ fn blobreader_blob_from_offset() {
     let mut blobs_info: Vec<(String, ByteOffset)> = Vec::new();
     for blob in reader.by_ref() {
         let blob = blob.unwrap();
-        blobs_info.push((
-            blob.get_type().as_str().to_string(),
-            blob.offset().unwrap(),
-        ));
+        blobs_info.push((blob.get_type().as_str().to_string(), blob.offset().unwrap()));
     }
 
     // Random access each blob by its offset
@@ -385,9 +396,27 @@ fn write_sorted_pbf(path: &Path) {
     writer.write_header(&header).unwrap();
 
     let mut bb = BlockBuilder::new();
-    bb.add_node(1, 550_000_000, 120_000_000, std::iter::empty::<(&str, &str)>(), None);
-    bb.add_node(2, 560_000_000, 130_000_000, std::iter::empty::<(&str, &str)>(), None);
-    bb.add_node(3, 570_000_000, 140_000_000, std::iter::empty::<(&str, &str)>(), None);
+    bb.add_node(
+        1,
+        550_000_000,
+        120_000_000,
+        std::iter::empty::<(&str, &str)>(),
+        None,
+    );
+    bb.add_node(
+        2,
+        560_000_000,
+        130_000_000,
+        std::iter::empty::<(&str, &str)>(),
+        None,
+    );
+    bb.add_node(
+        3,
+        570_000_000,
+        140_000_000,
+        std::iter::empty::<(&str, &str)>(),
+        None,
+    );
     writer
         .write_primitive_block(bb.take().unwrap().unwrap())
         .unwrap();
@@ -500,8 +529,20 @@ fn sorted_flag_but_unsorted_nodes_panics() {
     writer.write_header(&header).unwrap();
 
     let mut bb = BlockBuilder::new();
-    bb.add_node(100, 550_000_000, 120_000_000, std::iter::empty::<(&str, &str)>(), None);
-    bb.add_node(50, 560_000_000, 130_000_000, std::iter::empty::<(&str, &str)>(), None); // out of order!
+    bb.add_node(
+        100,
+        550_000_000,
+        120_000_000,
+        std::iter::empty::<(&str, &str)>(),
+        None,
+    );
+    bb.add_node(
+        50,
+        560_000_000,
+        130_000_000,
+        std::iter::empty::<(&str, &str)>(),
+        None,
+    ); // out of order!
     writer
         .write_primitive_block(bb.take().unwrap().unwrap())
         .unwrap();
@@ -555,8 +596,14 @@ fn blobfilter_only_ways_skips_node_blobs_on_indexed_input() {
         })
         .unwrap();
 
-    assert_eq!(saw_nodes, 0, "only_ways filter must skip node blobs on indexed input");
-    assert_eq!(saw_ways, 5, "only_ways filter must deliver all ways on indexed input");
+    assert_eq!(
+        saw_nodes, 0,
+        "only_ways filter must skip node blobs on indexed input"
+    );
+    assert_eq!(
+        saw_ways, 5,
+        "only_ways filter must deliver all ways on indexed input"
+    );
 }
 
 #[test]
@@ -653,7 +700,10 @@ fn indexed_reader_output_matches_on_indexed_and_non_indexed_twins() {
     let (ways_non, nodes_non) = collect(&non_indexed);
 
     assert_eq!(ways_idx, ways_non, "way set diverges on non-indexed input");
-    assert_eq!(nodes_idx, nodes_non, "node dep set diverges on non-indexed input");
+    assert_eq!(
+        nodes_idx, nodes_non,
+        "node dep set diverges on non-indexed input"
+    );
     assert!(!ways_idx.is_empty(), "filter must match at least one way");
 }
 

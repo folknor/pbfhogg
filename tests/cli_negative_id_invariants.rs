@@ -37,10 +37,9 @@ use std::path::Path;
 
 use common::cli::CliInvoker;
 use common::{
-    generate_nodes_with_negatives, generate_relations_with_negatives,
-    generate_ways_with_negatives, node_ids_id_only, read_all_elements_id_only,
-    read_normalized, relation_ids_id_only, way_ids_id_only, write_test_pbf,
-    write_test_pbf_sorted,
+    generate_nodes_with_negatives, generate_relations_with_negatives, generate_ways_with_negatives,
+    node_ids_id_only, read_all_elements_id_only, read_normalized, relation_ids_id_only,
+    way_ids_id_only, write_test_pbf, write_test_pbf_sorted,
 };
 use tempfile::TempDir;
 
@@ -166,14 +165,8 @@ fn sort_preserves_mixed_sign_ids() {
         assert_eq!(neg, N_NEG, "all negative {kind} ids preserved by sort");
         assert_eq!(pos, N_POS, "all positive {kind} ids preserved by sort");
     };
-    assert_split(
-        "node",
-        &n.nodes.iter().map(|x| x.id).collect::<Vec<_>>(),
-    );
-    assert_split(
-        "way",
-        &n.ways.iter().map(|x| x.id).collect::<Vec<_>>(),
-    );
+    assert_split("node", &n.nodes.iter().map(|x| x.id).collect::<Vec<_>>());
+    assert_split("way", &n.ways.iter().map(|x| x.id).collect::<Vec<_>>());
     assert_split(
         "relation",
         &n.relations.iter().map(|x| x.id).collect::<Vec<_>>(),
@@ -408,8 +401,16 @@ fn getid_id_osm_file_passes_through_negative_source_ids() {
     let nodes = node_ids_id_only(&contents);
     let ways = way_ids_id_only(&contents);
     let relations = relation_ids_id_only(&contents);
-    assert_eq!(nodes.len(), N_POS, "all positive nodes survive; ids: {nodes:?}");
-    assert_eq!(ways.len(), N_POS, "all positive ways survive; ids: {ways:?}");
+    assert_eq!(
+        nodes.len(),
+        N_POS,
+        "all positive nodes survive; ids: {nodes:?}"
+    );
+    assert_eq!(
+        ways.len(),
+        N_POS,
+        "all positive ways survive; ids: {ways:?}"
+    );
     assert_eq!(
         relations.len(),
         N_POS,

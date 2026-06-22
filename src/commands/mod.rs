@@ -1,4 +1,5 @@
 pub mod altw;
+pub mod apply_changes;
 pub mod cat;
 #[cfg(feature = "commands")]
 pub mod check;
@@ -9,7 +10,6 @@ pub mod extract;
 pub mod getid;
 pub mod getparents;
 pub mod inspect;
-pub mod apply_changes;
 pub mod merge_changes;
 pub mod renumber;
 pub mod repack;
@@ -20,12 +20,12 @@ pub mod time_filter;
 
 use std::path::Path;
 
+use crate::PrimitiveBlock;
 use crate::blob::BlobKind;
 use crate::block_builder::{BlockBuilder, HeaderBuilder, Metadata, OwnedBlock};
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
-use crate::PrimitiveBlock;
 
 // Alias for crate::BoxResult kept for short `super::Result` imports inside command
 // implementations. The canonical definition (with rationale) is at the crate root.
@@ -107,10 +107,7 @@ pub(crate) fn flush_passthrough_buf(
 /// into a protobuf `PrimitiveBlock` and the owned bytes are moved into the
 /// writer (no `to_vec()` copy in pipelined mode). If the builder is empty,
 /// this is a no-op.
-pub(crate) fn flush_block(
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-) -> Result<()> {
+pub(crate) fn flush_block(bb: &mut BlockBuilder, writer: &mut PbfWriter<FileWriter>) -> Result<()> {
     if let Some((bytes, index, tagdata)) = bb.take_owned()? {
         writer.write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
     }
@@ -269,10 +266,9 @@ impl HeaderOverrides {
                     })?);
                 }
                 "osmosis_replication_sequence_number" => {
-                    ov.replication_sequence_number =
-                        Some(value.parse::<i64>().map_err(|_| {
-                            format!("invalid osmosis_replication_sequence_number: '{value}'")
-                        })?);
+                    ov.replication_sequence_number = Some(value.parse::<i64>().map_err(|_| {
+                        format!("invalid osmosis_replication_sequence_number: '{value}'")
+                    })?);
                 }
                 "osmosis_replication_base_url" => {
                     ov.replication_base_url = Some(value.to_string());
@@ -359,7 +355,11 @@ pub(crate) fn writer_from_header_bytes(
     } else if direct_io {
         #[cfg(feature = "linux-direct-io")]
         {
-            Ok(PbfWriter::to_path_direct(output, compression, header_bytes)?)
+            Ok(PbfWriter::to_path_direct(
+                output,
+                compression,
+                header_bytes,
+            )?)
         }
         #[cfg(not(feature = "linux-direct-io"))]
         {
@@ -400,14 +400,22 @@ pub(crate) fn writer_from_header_bytes_parallel(
     } else if direct_io {
         #[cfg(feature = "linux-direct-io")]
         {
-            Ok(PbfWriter::to_path_direct(output, compression, header_bytes)?)
+            Ok(PbfWriter::to_path_direct(
+                output,
+                compression,
+                header_bytes,
+            )?)
         }
         #[cfg(not(feature = "linux-direct-io"))]
         {
             Err("--direct-io requires the linux-direct-io feature".into())
         }
     } else {
-        Ok(PbfWriter::to_path_parallel(output, compression, header_bytes)?)
+        Ok(PbfWriter::to_path_parallel(
+            output,
+            compression,
+            header_bytes,
+        )?)
     }
 }
 
@@ -432,16 +440,29 @@ pub(crate) fn writer_from_header_parallel(
 /// Map Osmosis sentinel -1 to 0 (protobuf default for absent) in dense node
 /// Apply per-attribute cleaning to metadata. Returns `None` if all attributes
 /// are cleaned or if the input has no metadata.
-pub(crate) fn clean_metadata<'a>(meta: Option<Metadata<'a>>, clean: &cat::CleanAttrs) -> Option<Metadata<'a>> {
+pub(crate) fn clean_metadata<'a>(
+    meta: Option<Metadata<'a>>,
+    clean: &cat::CleanAttrs,
+) -> Option<Metadata<'a>> {
     if !clean.any() {
         return meta;
     }
     meta.map(|mut m| {
-        if clean.version { m.version = 0; }
-        if clean.changeset { m.changeset = 0; }
-        if clean.timestamp { m.timestamp = 0; }
-        if clean.uid { m.uid = 0; }
-        if clean.user { m.user = ""; }
+        if clean.version {
+            m.version = 0;
+        }
+        if clean.changeset {
+            m.changeset = 0;
+        }
+        if clean.timestamp {
+            m.timestamp = 0;
+        }
+        if clean.uid {
+            m.uid = 0;
+        }
+        if clean.user {
+            m.user = "";
+        }
         m
     })
 }
@@ -522,7 +543,8 @@ pub(crate) fn require_sorted_err(path: &Path, context: &str) -> Result<()> {
 pub fn has_indexdata(path: &Path, direct_io: bool) -> Result<bool> {
     let mut reader = FileReader::open(path, direct_io)?;
     let mut offset = 0u64;
-    while let Some(info) = crate::read::raw_frame::read_blob_header_only(&mut reader, &mut offset)? {
+    while let Some(info) = crate::read::raw_frame::read_blob_header_only(&mut reader, &mut offset)?
+    {
         if matches!(info.blob_type, BlobKind::OsmData) {
             return Ok(info.index.is_some());
         }
@@ -583,7 +605,11 @@ mod tests {
             // Compute how many overhead bytes the length varint will take,
             // then set pad_len so total = target_size.
             let remaining = target_size - 4; // after stringtable (2) + tag (2)
-            let varint_len = if remaining.saturating_sub(1) < 128 { 1 } else { 2 };
+            let varint_len = if remaining.saturating_sub(1) < 128 {
+                1
+            } else {
+                2
+            };
             let pad_len = remaining - varint_len;
             assert!(pad_len < 16384, "test helper limited to ~16 KB blocks");
             if varint_len == 1 {

@@ -126,8 +126,10 @@ impl MergeStats {
         if self.loc_nodes_needed > 0 {
             eprintln!(
                 "  Locations-on-ways: {} nodes needed, {} from diff, {} from base, {} missing, {} node blobs scanned",
-                self.loc_nodes_needed, self.loc_nodes_from_diff,
-                self.loc_nodes_from_base, self.loc_missing,
+                self.loc_nodes_needed,
+                self.loc_nodes_from_diff,
+                self.loc_nodes_from_base,
+                self.loc_missing,
                 self.loc_node_blobs_scanned,
             );
         }
@@ -143,4 +145,3 @@ fn percentiles_u32(data: &mut [u32]) -> (u32, u32, u32) {
     let len = data.len();
     (data[len / 2], data[len * 95 / 100], data[len * 99 / 100])
 }
-

@@ -62,8 +62,10 @@ pub(super) struct AdminCellEntry {
 /// allocation - uses a small stack buffer for deduplication (most segments
 /// cross 1-4 cells).
 fn cover_segment(
-    lat1_e7: i32, lon1_e7: i32,
-    lat2_e7: i32, lon2_e7: i32,
+    lat1_e7: i32,
+    lon1_e7: i32,
+    lat2_e7: i32,
+    lon2_e7: i32,
     level: u8,
     mut emit: impl FnMut(u64),
 ) {
@@ -104,7 +106,9 @@ fn cover_segment(
         let t = i as f64 / steps as f64;
         let lat = lat1 + t * (lat2 - lat1);
         let lon = lon1 + t * (lon2 - lon1);
-        let c = CellID::from(LatLng::from_degrees(lat, lon)).parent(level as u64).0;
+        let c = CellID::from(LatLng::from_degrees(lat, lon))
+            .parent(level as u64)
+            .0;
         let already = seen[..seen_count].contains(&c);
         if !already {
             emit(c);
@@ -155,7 +159,13 @@ fn ensure_bucket_writer(
     Ok(())
 }
 
-fn write_bucket_record(w: &mut BufWriter<std::fs::File>, cell_id: u64, etype: u8, index: u32, segment: u16) -> std::io::Result<()> {
+fn write_bucket_record(
+    w: &mut BufWriter<std::fs::File>,
+    cell_id: u64,
+    etype: u8,
+    index: u32,
+    segment: u16,
+) -> std::io::Result<()> {
     let mut buf = [0u8; BUCKET_RECORD_SIZE];
     buf[0..8].copy_from_slice(&cell_id.to_le_bytes());
     buf[8] = etype;
@@ -191,13 +201,29 @@ fn parse_bucket_file(data: &[u8]) -> std::io::Result<Vec<ParsedBucketEntry>> {
     for i in 0..count {
         let off = i * BUCKET_RECORD_SIZE;
         let cell_id = u64::from_le_bytes([
-            data[off], data[off+1], data[off+2], data[off+3],
-            data[off+4], data[off+5], data[off+6], data[off+7],
+            data[off],
+            data[off + 1],
+            data[off + 2],
+            data[off + 3],
+            data[off + 4],
+            data[off + 5],
+            data[off + 6],
+            data[off + 7],
         ]);
-        let etype = data[off+8];
-        let index = u32::from_le_bytes([data[off+9], data[off+10], data[off+11], data[off+12]]);
-        let segment = u16::from_le_bytes([data[off+13], data[off+14]]);
-        entries.push(ParsedBucketEntry { cell_id, etype, index, segment });
+        let etype = data[off + 8];
+        let index = u32::from_le_bytes([
+            data[off + 9],
+            data[off + 10],
+            data[off + 11],
+            data[off + 12],
+        ]);
+        let segment = u16::from_le_bytes([data[off + 13], data[off + 14]]);
+        entries.push(ParsedBucketEntry {
+            cell_id,
+            etype,
+            index,
+            segment,
+        });
     }
     Ok(entries)
 }
@@ -242,17 +268,36 @@ pub(super) struct FusedCellAssignmentParams<'a> {
 /// Stage B runs separately on each of the two bucket trees -
 /// parallelised per plan item #3 (256-bucket parallel parse+sort,
 /// serial group+write).
-#[allow(clippy::cast_possible_truncation, clippy::too_many_lines, clippy::cognitive_complexity)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::too_many_lines,
+    clippy::cognitive_complexity
+)]
 #[hotpath::measure]
-pub(super) fn bucketed_cell_assignment_fused(p: &FusedCellAssignmentParams<'_>) -> Result<(u32, u32)> {
+pub(super) fn bucketed_cell_assignment_fused(
+    p: &FusedCellAssignmentParams<'_>,
+) -> Result<(u32, u32)> {
     use rayon::prelude::*;
 
     let FusedCellAssignmentParams {
-        output_dir, street_ways_mmap, street_nodes_mmap, street_way_count,
-        addr_points_mmap, addr_point_count, interp_ways, interp_nodes_mmap,
-        fine_level, coarse_level,
-        fine_cells_file, fine_street_entries_file, fine_addr_entries_file, fine_interp_entries_file,
-        coarse_cells_file, coarse_street_entries_file, coarse_addr_entries_file, coarse_interp_entries_file,
+        output_dir,
+        street_ways_mmap,
+        street_nodes_mmap,
+        street_way_count,
+        addr_points_mmap,
+        addr_point_count,
+        interp_ways,
+        interp_nodes_mmap,
+        fine_level,
+        coarse_level,
+        fine_cells_file,
+        fine_street_entries_file,
+        fine_addr_entries_file,
+        fine_interp_entries_file,
+        coarse_cells_file,
+        coarse_street_entries_file,
+        coarse_addr_entries_file,
+        coarse_interp_entries_file,
     } = p;
     let street_way_count = *street_way_count;
     let addr_point_count = *addr_point_count;
@@ -267,19 +312,19 @@ pub(super) fn bucketed_cell_assignment_fused(p: &FusedCellAssignmentParams<'_>) 
     let fine_bucket_dir = output_dir.join(format!(".buckets-level{fine_level}"));
     let coarse_bucket_dir = output_dir.join(format!(".buckets-level{coarse_level}"));
     for dir in [&fine_bucket_dir, &coarse_bucket_dir] {
-        if dir.exists() { std::fs::remove_dir_all(dir)?; }
+        if dir.exists() {
+            std::fs::remove_dir_all(dir)?;
+        }
         std::fs::create_dir_all(dir)?;
     }
     let fine_guard = crate::path_guard::PathGuard::dir(fine_bucket_dir.clone());
     let coarse_guard = crate::path_guard::PathGuard::dir(coarse_bucket_dir.clone());
 
     // Two sets of bucket writers (lazy).
-    let mut fine_writers: Vec<Option<BufWriter<std::fs::File>>> = (0..NUM_BUCKETS)
-        .map(|_| None)
-        .collect();
-    let mut coarse_writers: Vec<Option<BufWriter<std::fs::File>>> = (0..NUM_BUCKETS)
-        .map(|_| None)
-        .collect();
+    let mut fine_writers: Vec<Option<BufWriter<std::fs::File>>> =
+        (0..NUM_BUCKETS).map(|_| None).collect();
+    let mut coarse_writers: Vec<Option<BufWriter<std::fs::File>>> =
+        (0..NUM_BUCKETS).map(|_| None).collect();
 
     // Stage A: Chunked parallel compute at the FINE level; every emitted
     // fine cell derives its coarse parent via S2 `parent()` and
@@ -306,16 +351,14 @@ pub(super) fn bucketed_cell_assignment_fused(p: &FusedCellAssignmentParams<'_>) 
                 // (ADR-0003) sweep the scratch trees on the unwind.
                 // Release builds compile this out entirely.
                 #[cfg(feature = "test-hooks")]
-                if test_hooks::PANIC_AT_STREETS_WAY_IDX
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                if test_hooks::PANIC_AT_STREETS_WAY_IDX.load(std::sync::atomic::Ordering::Relaxed)
                     == way_idx
                 {
-                    panic!(
-                        "test-hooks: geocode pass3 stage A streets way {way_idx} panicking"
-                    );
+                    panic!("test-hooks: geocode pass3 stage A streets way {way_idx} panicking");
                 }
                 let offset = way_idx as usize * STREET_WAY_SIZE;
-                let rec = street_ways_mmap.get(offset..offset + STREET_WAY_SIZE)
+                let rec = street_ways_mmap
+                    .get(offset..offset + STREET_WAY_SIZE)
                     .and_then(|b| <&[u8; STREET_WAY_SIZE]>::try_from(b).ok())
                     .map(StreetWay::from_bytes);
                 let mut out = Vec::new();
@@ -333,17 +376,17 @@ pub(super) fn bucketed_cell_assignment_fused(p: &FusedCellAssignmentParams<'_>) 
                                 let mut coarse_seen = [0u64; 4];
                                 let mut coarse_n = 0usize;
                                 cover_segment(n1.0, n1.1, n2.0, n2.1, fine_level, |fine_cid| {
-                                    let coarse_cid = CellID(fine_cid)
-                                        .parent(coarse_level as u64).0;
-                                    let coarse_to_emit = if coarse_seen[..coarse_n].contains(&coarse_cid) {
-                                        None
-                                    } else {
-                                        if coarse_n < coarse_seen.len() {
-                                            coarse_seen[coarse_n] = coarse_cid;
-                                            coarse_n += 1;
-                                        }
-                                        Some(coarse_cid)
-                                    };
+                                    let coarse_cid = CellID(fine_cid).parent(coarse_level as u64).0;
+                                    let coarse_to_emit =
+                                        if coarse_seen[..coarse_n].contains(&coarse_cid) {
+                                            None
+                                        } else {
+                                            if coarse_n < coarse_seen.len() {
+                                                coarse_seen[coarse_n] = coarse_cid;
+                                                coarse_n += 1;
+                                            }
+                                            Some(coarse_cid)
+                                        };
                                     out.push((fine_cid, coarse_to_emit, way_idx, seg_idx as u16));
                                 });
                             }
@@ -357,13 +400,23 @@ pub(super) fn bucketed_cell_assignment_fused(p: &FusedCellAssignmentParams<'_>) 
         for &(fine_cid, coarse_opt, wi, si) in &entries {
             let b = bucket_for_cell(fine_cid);
             ensure_bucket_writer(&mut fine_writers, b, &fine_bucket_dir)?;
-            write_bucket_record(fine_writers[b].as_mut().expect("ensured"),
-                fine_cid, ENTRY_TYPE_STREET, wi, si)?;
+            write_bucket_record(
+                fine_writers[b].as_mut().expect("ensured"),
+                fine_cid,
+                ENTRY_TYPE_STREET,
+                wi,
+                si,
+            )?;
             if let Some(coarse_cid) = coarse_opt {
                 let b = bucket_for_cell(coarse_cid);
                 ensure_bucket_writer(&mut coarse_writers, b, &coarse_bucket_dir)?;
-                write_bucket_record(coarse_writers[b].as_mut().expect("ensured"),
-                    coarse_cid, ENTRY_TYPE_STREET, wi, si)?;
+                write_bucket_record(
+                    coarse_writers[b].as_mut().expect("ensured"),
+                    coarse_cid,
+                    ENTRY_TYPE_STREET,
+                    wi,
+                    si,
+                )?;
             }
         }
         chunk_start = chunk_end;
@@ -390,12 +443,22 @@ pub(super) fn bucketed_cell_assignment_fused(p: &FusedCellAssignmentParams<'_>) 
         for &(fine_cid, coarse_cid, idx) in &addr_entries {
             let b = bucket_for_cell(fine_cid);
             ensure_bucket_writer(&mut fine_writers, b, &fine_bucket_dir)?;
-            write_bucket_record(fine_writers[b].as_mut().expect("ensured"),
-                fine_cid, ENTRY_TYPE_ADDR, idx, 0)?;
+            write_bucket_record(
+                fine_writers[b].as_mut().expect("ensured"),
+                fine_cid,
+                ENTRY_TYPE_ADDR,
+                idx,
+                0,
+            )?;
             let b = bucket_for_cell(coarse_cid);
             ensure_bucket_writer(&mut coarse_writers, b, &coarse_bucket_dir)?;
-            write_bucket_record(coarse_writers[b].as_mut().expect("ensured"),
-                coarse_cid, ENTRY_TYPE_ADDR, idx, 0)?;
+            write_bucket_record(
+                coarse_writers[b].as_mut().expect("ensured"),
+                coarse_cid,
+                ENTRY_TYPE_ADDR,
+                idx,
+                0,
+            )?;
         }
         chunk_start = chunk_end;
     }
@@ -422,8 +485,7 @@ pub(super) fn bucketed_cell_assignment_fused(p: &FusedCellAssignmentParams<'_>) 
                         let mut coarse_seen = [0u64; 4];
                         let mut coarse_n = 0usize;
                         cover_segment(n1.0, n1.1, n2.0, n2.1, fine_level, |fine_cid| {
-                            let coarse_cid = CellID(fine_cid)
-                                .parent(coarse_level as u64).0;
+                            let coarse_cid = CellID(fine_cid).parent(coarse_level as u64).0;
                             let coarse_to_emit = if coarse_seen[..coarse_n].contains(&coarse_cid) {
                                 None
                             } else {
@@ -444,20 +506,34 @@ pub(super) fn bucketed_cell_assignment_fused(p: &FusedCellAssignmentParams<'_>) 
     for &(fine_cid, coarse_opt, wi, si) in &interp_entries {
         let b = bucket_for_cell(fine_cid);
         ensure_bucket_writer(&mut fine_writers, b, &fine_bucket_dir)?;
-        write_bucket_record(fine_writers[b].as_mut().expect("ensured"),
-            fine_cid, ENTRY_TYPE_INTERP, wi, si)?;
+        write_bucket_record(
+            fine_writers[b].as_mut().expect("ensured"),
+            fine_cid,
+            ENTRY_TYPE_INTERP,
+            wi,
+            si,
+        )?;
         if let Some(coarse_cid) = coarse_opt {
             let b = bucket_for_cell(coarse_cid);
             ensure_bucket_writer(&mut coarse_writers, b, &coarse_bucket_dir)?;
-            write_bucket_record(coarse_writers[b].as_mut().expect("ensured"),
-                coarse_cid, ENTRY_TYPE_INTERP, wi, si)?;
+            write_bucket_record(
+                coarse_writers[b].as_mut().expect("ensured"),
+                coarse_cid,
+                ENTRY_TYPE_INTERP,
+                wi,
+                si,
+            )?;
         }
     }
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_INTERP_END");
 
     // Flush and drop both sets of bucket writers
-    for writer in fine_writers.iter_mut().flatten() { writer.flush()?; }
-    for writer in coarse_writers.iter_mut().flatten() { writer.flush()?; }
+    for writer in fine_writers.iter_mut().flatten() {
+        writer.flush()?;
+    }
+    for writer in coarse_writers.iter_mut().flatten() {
+        writer.flush()?;
+    }
     drop(fine_writers);
     drop(coarse_writers);
 
@@ -467,18 +543,24 @@ pub(super) fn bucketed_cell_assignment_fused(p: &FusedCellAssignmentParams<'_>) 
     // scale).
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEB_FINE_START");
     let fine_count = run_stage_b(
-        output_dir, &fine_bucket_dir,
-        fine_cells_file, fine_street_entries_file,
-        fine_addr_entries_file, fine_interp_entries_file,
+        output_dir,
+        &fine_bucket_dir,
+        fine_cells_file,
+        fine_street_entries_file,
+        fine_addr_entries_file,
+        fine_interp_entries_file,
     )?;
     drop(fine_guard);
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEB_FINE_END");
 
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEB_COARSE_START");
     let coarse_count = run_stage_b(
-        output_dir, &coarse_bucket_dir,
-        coarse_cells_file, coarse_street_entries_file,
-        coarse_addr_entries_file, coarse_interp_entries_file,
+        output_dir,
+        &coarse_bucket_dir,
+        coarse_cells_file,
+        coarse_street_entries_file,
+        coarse_addr_entries_file,
+        coarse_interp_entries_file,
     )?;
     drop(coarse_guard);
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEB_COARSE_END");
@@ -506,9 +588,11 @@ fn run_stage_b(
     use rayon::prelude::*;
 
     let mut cells_out = BufWriter::new(std::fs::File::create(output_dir.join(cells_file))?);
-    let mut street_out = BufWriter::new(std::fs::File::create(output_dir.join(street_entries_file))?);
+    let mut street_out =
+        BufWriter::new(std::fs::File::create(output_dir.join(street_entries_file))?);
     let mut addr_out = BufWriter::new(std::fs::File::create(output_dir.join(addr_entries_file))?);
-    let mut interp_out = BufWriter::new(std::fs::File::create(output_dir.join(interp_entries_file))?);
+    let mut interp_out =
+        BufWriter::new(std::fs::File::create(output_dir.join(interp_entries_file))?);
 
     let mut street_byte_offset: u64 = 0;
     let mut addr_byte_offset: u64 = 0;
@@ -520,10 +604,14 @@ fn run_stage_b(
         .into_par_iter()
         .map(|bucket_idx| -> std::io::Result<Vec<ParsedBucketEntry>> {
             let bucket_path = bucket_dir.join(format!("{bucket_idx:03}"));
-            if !bucket_path.exists() { return Ok(Vec::new()); }
+            if !bucket_path.exists() {
+                return Ok(Vec::new());
+            }
             let data = std::fs::read(&bucket_path)?;
             std::fs::remove_file(&bucket_path)?;
-            if data.is_empty() { return Ok(Vec::new()); }
+            if data.is_empty() {
+                return Ok(Vec::new());
+            }
             let mut entries = parse_bucket_file(&data)?;
             drop(data);
             entries.sort_unstable_by_key(|e| e.cell_id);
@@ -532,7 +620,9 @@ fn run_stage_b(
         .collect::<std::io::Result<_>>()?;
 
     for entries in &sorted_buckets {
-        if entries.is_empty() { continue; }
+        if entries.is_empty() {
+            continue;
+        }
 
         let mut i = 0;
         let mut streets: Vec<&ParsedBucketEntry> = Vec::new();
@@ -567,27 +657,34 @@ fn run_stage_b(
             // silent truncation made this a latent bug for a long time.
             let has_streets = !streets.is_empty();
             if has_streets {
-                let count = u16::try_from(streets.len()).map_err(|_| format!(
-                    "geocode Stage B: cell {cell_id} has {} street entries, exceeds u16::MAX. \
+                let count = u16::try_from(streets.len()).map_err(|_| {
+                    format!(
+                        "geocode Stage B: cell {cell_id} has {} street entries, exceeds u16::MAX. \
                      Bump on-disk count to u32 and increment FORMAT_VERSION.",
-                    streets.len()
-                ))?;
+                        streets.len()
+                    )
+                })?;
                 street_out.write_all(&count.to_le_bytes())?;
                 for e in &streets {
-                    street_out.write_all(&SegmentRef {
-                        way_index: e.index,
-                        segment_index: e.segment,
-                    }.to_bytes())?;
+                    street_out.write_all(
+                        &SegmentRef {
+                            way_index: e.index,
+                            segment_index: e.segment,
+                        }
+                        .to_bytes(),
+                    )?;
                 }
             }
 
             let has_addrs = !addrs.is_empty();
             if has_addrs {
-                let count = u16::try_from(addrs.len()).map_err(|_| format!(
-                    "geocode Stage B: cell {cell_id} has {} addr entries, exceeds u16::MAX. \
+                let count = u16::try_from(addrs.len()).map_err(|_| {
+                    format!(
+                        "geocode Stage B: cell {cell_id} has {} addr entries, exceeds u16::MAX. \
                      Bump on-disk count to u32 and increment FORMAT_VERSION.",
-                    addrs.len()
-                ))?;
+                        addrs.len()
+                    )
+                })?;
                 addr_out.write_all(&count.to_le_bytes())?;
                 for e in &addrs {
                     addr_out.write_all(&e.index.to_le_bytes())?;
@@ -596,25 +693,42 @@ fn run_stage_b(
 
             let has_interps = !interps.is_empty();
             if has_interps {
-                let count = u16::try_from(interps.len()).map_err(|_| format!(
-                    "geocode Stage B: cell {cell_id} has {} interp entries, exceeds u16::MAX. \
+                let count = u16::try_from(interps.len()).map_err(|_| {
+                    format!(
+                        "geocode Stage B: cell {cell_id} has {} interp entries, exceeds u16::MAX. \
                      Bump on-disk count to u32 and increment FORMAT_VERSION.",
-                    interps.len()
-                ))?;
+                        interps.len()
+                    )
+                })?;
                 interp_out.write_all(&count.to_le_bytes())?;
                 for e in &interps {
-                    interp_out.write_all(&SegmentRef {
-                        way_index: e.index,
-                        segment_index: e.segment,
-                    }.to_bytes())?;
+                    interp_out.write_all(
+                        &SegmentRef {
+                            way_index: e.index,
+                            segment_index: e.segment,
+                        }
+                        .to_bytes(),
+                    )?;
                 }
             }
 
             let gc = GeoCell {
                 cell_id,
-                street_offset: if has_streets { street_byte_offset } else { NO_DATA_U64 },
-                addr_offset: if has_addrs { addr_byte_offset } else { NO_DATA_U64 },
-                interp_offset: if has_interps { interp_byte_offset } else { NO_DATA_U64 },
+                street_offset: if has_streets {
+                    street_byte_offset
+                } else {
+                    NO_DATA_U64
+                },
+                addr_offset: if has_addrs {
+                    addr_byte_offset
+                } else {
+                    NO_DATA_U64
+                },
+                interp_offset: if has_interps {
+                    interp_byte_offset
+                } else {
+                    NO_DATA_U64
+                },
             };
             cells_out.write_all(&gc.to_bytes())?;
             debug_assert!(
@@ -653,7 +767,10 @@ fn run_stage_b(
 
 #[allow(clippy::cast_possible_truncation)]
 #[hotpath::measure]
-pub(super) fn assign_admin_cells(polygons: &[AssembledPolygon], admin_level: u8) -> Vec<AdminCellEntry> {
+pub(super) fn assign_admin_cells(
+    polygons: &[AssembledPolygon],
+    admin_level: u8,
+) -> Vec<AdminCellEntry> {
     use rayon::prelude::*;
 
     // Per-polygon work is independent: edge-cell cover + centroid flood-fill
@@ -663,9 +780,13 @@ pub(super) fn assign_admin_cells(polygons: &[AssembledPolygon], admin_level: u8)
     // in `write_admin_index` gives a byte-identical result to the sequential
     // path. Plan item #6 - Europe admin flood-fill was 10.7 s sequential
     // (UUID bf8f2038); expected ~5× on 12 cores.
-    polygons.par_iter().enumerate().flat_map_iter(|(poly_idx, poly)| {
-        admin_cells_for_polygon(poly_idx, poly, admin_level).into_iter()
-    }).collect()
+    polygons
+        .par_iter()
+        .enumerate()
+        .flat_map_iter(|(poly_idx, poly)| {
+            admin_cells_for_polygon(poly_idx, poly, admin_level).into_iter()
+        })
+        .collect()
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -676,40 +797,63 @@ fn admin_cells_for_polygon(
 ) -> Vec<AdminCellEntry> {
     // Parse vertices into rings (exterior + holes) separated by RING_SENTINEL
     let (ext_f64, hole_rings) = parse_polygon_rings(&poly.vertices);
-    if ext_f64.len() < 3 { return Vec::new(); }
+    if ext_f64.len() < 3 {
+        return Vec::new();
+    }
 
     let hole_slices: Vec<&[(f64, f64)]> = hole_rings.iter().map(Vec::as_slice).collect();
 
     // Edge cells: cover each ring segment using cover_segment
     let mut edge_cells = rustc_hash::FxHashSet::default();
     for v in poly.vertices.windows(2) {
-        if v[0] == RING_SENTINEL || v[1] == RING_SENTINEL { continue; }
-        cover_segment(v[0].lat_e7, v[0].lon_e7, v[1].lat_e7, v[1].lon_e7, admin_level, |cid| {
-            edge_cells.insert(cid);
-        });
+        if v[0] == RING_SENTINEL || v[1] == RING_SENTINEL {
+            continue;
+        }
+        cover_segment(
+            v[0].lat_e7,
+            v[0].lon_e7,
+            v[1].lat_e7,
+            v[1].lon_e7,
+            admin_level,
+            |cid| {
+                edge_cells.insert(cid);
+            },
+        );
     }
 
-    let mut entries: Vec<AdminCellEntry> = edge_cells.iter()
-        .map(|&cid| AdminCellEntry { cell_id: cid, poly_index: poly_idx as u32, is_interior: false })
+    let mut entries: Vec<AdminCellEntry> = edge_cells
+        .iter()
+        .map(|&cid| AdminCellEntry {
+            cell_id: cid,
+            poly_index: poly_idx as u32,
+            is_interior: false,
+        })
         .collect();
 
     // Interior cells: flood-fill from centroid using point_in_polygon (with holes)
-    let exterior_end = poly.vertices.iter()
+    let exterior_end = poly
+        .vertices
+        .iter()
         .position(|v| *v == RING_SENTINEL)
         .unwrap_or(poly.vertices.len());
     let exterior = &poly.vertices[..exterior_end];
-    if exterior.len() < 3 { return entries; }
+    if exterior.len() < 3 {
+        return entries;
+    }
 
-    let (sum_lat, sum_lon, count) = exterior.iter()
-        .fold((0i64, 0i64, 0i64), |(sl, sn, c), v| {
-            (sl + v.lat_e7 as i64, sn + v.lon_e7 as i64, c + 1)
-        });
-    if count == 0 { return entries; }
+    let (sum_lat, sum_lon, count) = exterior.iter().fold((0i64, 0i64, 0i64), |(sl, sn, c), v| {
+        (sl + v.lat_e7 as i64, sn + v.lon_e7 as i64, c + 1)
+    });
+    if count == 0 {
+        return entries;
+    }
     let clat = sum_lat as f64 / count as f64 * 1e-7;
     let clon = sum_lon as f64 / count as f64 * 1e-7;
 
     // Centroid must be inside the polygon (exterior AND not in any hole)
-    if !crate::geo::point_in_polygon(clon, clat, &ext_f64, &hole_slices) { return entries; }
+    if !crate::geo::point_in_polygon(clon, clat, &ext_f64, &hole_slices) {
+        return entries;
+    }
 
     let seed = CellID::from(LatLng::from_degrees(clat, clon)).parent(admin_level as u64);
     let mut visited = rustc_hash::FxHashSet::default();
@@ -718,15 +862,22 @@ fn admin_cells_for_polygon(
     queue.push_back(seed);
 
     while let Some(cell) = queue.pop_front() {
-        if edge_cells.contains(&cell.0) { continue; }
+        if edge_cells.contains(&cell.0) {
+            continue;
+        }
 
         let center_ll = s2::latlng::LatLng::from(cell);
         // Test with holes - cells inside enclaves are NOT interior
         if crate::geo::point_in_polygon(
-            center_ll.lng.deg(), center_ll.lat.deg(), &ext_f64, &hole_slices,
+            center_ll.lng.deg(),
+            center_ll.lat.deg(),
+            &ext_f64,
+            &hole_slices,
         ) {
             entries.push(AdminCellEntry {
-                cell_id: cell.0, poly_index: poly_idx as u32, is_interior: true,
+                cell_id: cell.0,
+                poly_index: poly_idx as u32,
+                is_interior: true,
             });
             for n in cell.all_neighbors(admin_level as u64) {
                 if !visited.contains(&n.0) {
@@ -760,7 +911,11 @@ mod tests {
         let mut cells = Vec::new();
         cover_segment(lat1, lon1, lat2, lon2, 17, |c| cells.push(c));
 
-        assert_eq!(cells.len(), 1, "very close points should produce exactly 1 cell");
+        assert_eq!(
+            cells.len(),
+            1,
+            "very close points should produce exactly 1 cell"
+        );
     }
 
     #[test]
@@ -775,7 +930,11 @@ mod tests {
         let mut cells = Vec::new();
         cover_segment(lat1, lon1, lat2, lon2, 17, |c| cells.push(c));
 
-        assert!(cells.len() >= 2, "points ~1km apart should cross at least 2 level-17 cells, got {}", cells.len());
+        assert!(
+            cells.len() >= 2,
+            "points ~1km apart should cross at least 2 level-17 cells, got {}",
+            cells.len()
+        );
     }
 
     #[test]
@@ -786,8 +945,12 @@ mod tests {
         let lat2 = 556_800_000;
         let lon2 = 125_700_000;
 
-        let c1 = CellID::from(LatLng::from_degrees(55.6700, 12.5600)).parent(17).0;
-        let c2 = CellID::from(LatLng::from_degrees(55.6800, 12.5700)).parent(17).0;
+        let c1 = CellID::from(LatLng::from_degrees(55.6700, 12.5600))
+            .parent(17)
+            .0;
+        let c2 = CellID::from(LatLng::from_degrees(55.6800, 12.5700))
+            .parent(17)
+            .0;
 
         let mut cells = Vec::new();
         cover_segment(lat1, lon1, lat2, lon2, 17, |c| cells.push(c));

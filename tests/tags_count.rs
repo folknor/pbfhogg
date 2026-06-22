@@ -6,7 +6,7 @@
 mod common;
 
 use common::{generate_nodes, generate_ways, write_multi_block_test_pbf};
-use pbfhogg::tags_count::{tags_count, TagCount, TagCountOptions, TagCountSort};
+use pbfhogg::tags_count::{TagCount, TagCountOptions, TagCountSort, tags_count};
 use tempfile::TempDir;
 
 fn default_opts() -> TagCountOptions<'static> {
@@ -52,7 +52,10 @@ fn basic_tag_counting() {
     };
     assert_eq!(find("amenity", "cafe").expect("amenity=cafe").count, 3);
     assert_eq!(find("shop", "bakery").expect("shop=bakery").count, 2);
-    assert_eq!(find("highway", "primary").expect("highway=primary").count, 3);
+    assert_eq!(
+        find("highway", "primary").expect("highway=primary").count,
+        3
+    );
 }
 
 /// jobs=1 and jobs=4 must produce identical per-blob classification +
@@ -107,5 +110,8 @@ fn tags_count_parallel_classify_parity() {
     }
 
     // Sanity: we actually have some counts to compare.
-    assert!(!seq_sorted.is_empty(), "fixture must produce at least one tag count");
+    assert!(
+        !seq_sorted.is_empty(),
+        "fixture must produce at least one tag count"
+    );
 }

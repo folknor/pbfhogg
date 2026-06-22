@@ -14,7 +14,10 @@
 //! `LocationsOnWays` PBF), those fields are stripped before append - we
 //! own the coordinates from `NodeIndex`, the input's are stale at best.
 
-use protohoggr::{encode_bytes_field, encode_int64_field, encode_tag, encode_varint, zigzag_encode_64, Cursor, PackedSint64Iter, WIRE_LEN, WIRE_VARINT};
+use protohoggr::{
+    Cursor, PackedSint64Iter, WIRE_LEN, WIRE_VARINT, encode_bytes_field, encode_int64_field,
+    encode_tag, encode_varint, zigzag_encode_64,
+};
 
 use super::NodeIndex;
 
@@ -94,24 +97,35 @@ fn parse_block_top(
     let mut stringtable_range: Option<(usize, usize)> = None;
 
     let mut cursor = Cursor::new(decompressed);
-    while let Some((field, wire_type)) = cursor.read_tag().map_err(|e| format!("reframe block tag: {e}"))? {
+    while let Some((field, wire_type)) = cursor
+        .read_tag()
+        .map_err(|e| format!("reframe block tag: {e}"))?
+    {
         match (field, wire_type) {
             (1, WIRE_LEN) => {
-                let data = cursor.read_len_delimited().map_err(|e| format!("reframe st: {e}"))?;
+                let data = cursor
+                    .read_len_delimited()
+                    .map_err(|e| format!("reframe st: {e}"))?;
                 let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
                 stringtable_range = Some((offset, data.len()));
             }
             (2, WIRE_LEN) => {
-                let data = cursor.read_len_delimited().map_err(|e| format!("reframe group: {e}"))?;
+                let data = cursor
+                    .read_len_delimited()
+                    .map_err(|e| format!("reframe group: {e}"))?;
                 let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
                 scratch.group_ranges.push((offset, data.len()));
             }
             (17..=20, WIRE_VARINT) => {
-                let raw = cursor.read_raw_field(wire_type).map_err(|e| format!("reframe scalar: {e}"))?;
+                let raw = cursor
+                    .read_raw_field(wire_type)
+                    .map_err(|e| format!("reframe scalar: {e}"))?;
                 encode_tag(&mut scratch.scalar_fields, field, wire_type);
                 scratch.scalar_fields.extend_from_slice(raw);
             }
-            _ => cursor.skip_field(wire_type).map_err(|e| format!("reframe skip: {e}"))?,
+            _ => cursor
+                .skip_field(wire_type)
+                .map_err(|e| format!("reframe skip: {e}"))?,
         }
     }
 
@@ -132,13 +146,20 @@ fn process_group(
     scratch.group_out.clear();
 
     let mut gr_cursor = Cursor::new(group_bytes);
-    while let Some((field, wire_type)) = gr_cursor.read_tag().map_err(|e| format!("reframe gtag: {e}"))? {
+    while let Some((field, wire_type)) = gr_cursor
+        .read_tag()
+        .map_err(|e| format!("reframe gtag: {e}"))?
+    {
         if field == 3 && wire_type == WIRE_LEN {
-            let way_bytes = gr_cursor.read_len_delimited().map_err(|e| format!("reframe way: {e}"))?;
+            let way_bytes = gr_cursor
+                .read_len_delimited()
+                .map_err(|e| format!("reframe way: {e}"))?;
             splice_way_locations(way_bytes, node_index, scratch, stats)?;
             encode_bytes_field(&mut scratch.group_out, 3, &scratch.reframed_way);
         } else {
-            let raw = gr_cursor.read_raw_field(wire_type).map_err(|e| format!("reframe gskip: {e}"))?;
+            let raw = gr_cursor
+                .read_raw_field(wire_type)
+                .map_err(|e| format!("reframe gskip: {e}"))?;
             encode_tag(&mut scratch.group_out, field, wire_type);
             scratch.group_out.extend_from_slice(raw);
         }
@@ -168,15 +189,22 @@ fn splice_way_locations(
     let mut have_id = false;
 
     let mut way_cursor = Cursor::new(way_bytes);
-    while let Some((wf, wt)) = way_cursor.read_tag().map_err(|e| format!("reframe wtag: {e}"))? {
+    while let Some((wf, wt)) = way_cursor
+        .read_tag()
+        .map_err(|e| format!("reframe wtag: {e}"))?
+    {
         match (wf, wt) {
             (1, WIRE_VARINT) => {
-                way_id = way_cursor.read_varint_i64().map_err(|e| format!("reframe wid: {e}"))?;
+                way_id = way_cursor
+                    .read_varint_i64()
+                    .map_err(|e| format!("reframe wid: {e}"))?;
                 have_id = true;
                 encode_int64_field(&mut scratch.reframed_way, 1, way_id);
             }
             (8, WIRE_LEN) => {
-                let refs_data = way_cursor.read_len_delimited().map_err(|e| format!("reframe wrefs: {e}"))?;
+                let refs_data = way_cursor
+                    .read_len_delimited()
+                    .map_err(|e| format!("reframe wrefs: {e}"))?;
                 let mut cum: i64 = 0;
                 for delta in PackedSint64Iter::new(refs_data) {
                     cum += delta;
@@ -187,10 +215,14 @@ fn splice_way_locations(
                 scratch.reframed_way.extend_from_slice(refs_data);
             }
             (9 | 10, WIRE_LEN) => {
-                let _ = way_cursor.read_raw_field(wt).map_err(|e| format!("reframe wstrip: {e}"))?;
+                let _ = way_cursor
+                    .read_raw_field(wt)
+                    .map_err(|e| format!("reframe wstrip: {e}"))?;
             }
             _ => {
-                let raw = way_cursor.read_raw_field(wt).map_err(|e| format!("reframe wskip: {e}"))?;
+                let raw = way_cursor
+                    .read_raw_field(wt)
+                    .map_err(|e| format!("reframe wskip: {e}"))?;
                 encode_tag(&mut scratch.reframed_way, wf, wt);
                 scratch.reframed_way.extend_from_slice(raw);
             }
@@ -201,8 +233,12 @@ fn splice_way_locations(
         return Err("reframe: way without field 1 (id)".to_string());
     }
 
-    if way_id < stats.min_way_id { stats.min_way_id = way_id; }
-    if way_id > stats.max_way_id { stats.max_way_id = way_id; }
+    if way_id < stats.min_way_id {
+        stats.min_way_id = way_id;
+    }
+    if way_id > stats.max_way_id {
+        stats.max_way_id = way_id;
+    }
     stats.way_count += 1;
 
     let mut last_lat: i64 = 0;

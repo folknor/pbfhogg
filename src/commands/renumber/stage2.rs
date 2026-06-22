@@ -4,12 +4,12 @@
 //! `node_id_set.rank()` and splices new IDs into the wire format.
 //! No intermediate flat file, no sidecar, no mmap.
 
-use crate::idset::IdSet;
 use super::super::Result;
+use super::StageCounters;
 use super::schedule::BlobTask;
 use super::wire_rewrite::reframe_ways_with_new_ids;
-use super::StageCounters;
 use crate::block_builder::OwnedBlock;
+use crate::idset::IdSet;
 
 /// Parallel stage 2d: fused way resolve + wire-format rewrite.
 ///
@@ -115,11 +115,7 @@ pub(super) fn stage2d_parallel_way_assembly(
                 let blocks = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                 for (block_bytes, index, tagdata) in blocks {
                     let t0 = std::time::Instant::now();
-                    writer.write_primitive_block_owned(
-                        block_bytes,
-                        index,
-                        tagdata.as_deref(),
-                    )?;
+                    writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
                     #[allow(clippy::cast_possible_truncation)]
                     stage2d_cref.consumer_write_ms.fetch_add(
                         t0.elapsed().as_millis() as u64,
@@ -181,13 +177,17 @@ fn stage2d_worker(
                 .read_exact_at(&mut read_buf, task.data_offset)
                 .map_err(|e| format!("pread failed at offset {}: {e}", task.data_offset))?;
             #[allow(clippy::cast_possible_truncation)]
-            counters.pread_ms.fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
+            counters
+                .pread_ms
+                .fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
 
             let t1 = std::time::Instant::now();
             crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
                 .map_err(|e| e.to_string())?;
             #[allow(clippy::cast_possible_truncation)]
-            counters.decompress_ms.fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
+            counters
+                .decompress_ms
+                .fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
 
             let t2 = std::time::Instant::now();
             reframe_buf.clear();
@@ -205,7 +205,9 @@ fn stage2d_worker(
                 &mut way_scalar_fields,
             )?;
             #[allow(clippy::cast_possible_truncation)]
-            counters.reframe_ms.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
+            counters
+                .reframe_ms
+                .fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
 
             // Build the OwnedBlock from the reframed bytes.
             let index = crate::blob_meta::BlobIndex {
@@ -241,6 +243,8 @@ fn stage2d_worker(
             break;
         }
         #[allow(clippy::cast_possible_truncation)]
-        counters.send_ms.fetch_add(t4.elapsed().as_millis() as u64, Relaxed);
+        counters
+            .send_ms
+            .fetch_add(t4.elapsed().as_millis() as u64, Relaxed);
     }
 }

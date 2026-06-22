@@ -6,7 +6,7 @@ use super::elements::Element;
 use super::file_reader::FileReader;
 use super::pipeline::PipelineConfig;
 use crate::blob_meta::BlobFilter;
-use crate::error::{new_error, ErrorKind, Result};
+use crate::error::{ErrorKind, Result, new_error};
 use rayon::prelude::*;
 use std::io::Read;
 use std::path::Path;
@@ -155,7 +155,9 @@ impl<R: Read + Send> ElementReader<R> {
     where
         F: for<'a> FnMut(Element<'a>),
     {
-        let Self { blob_iter, header, .. } = self;
+        let Self {
+            blob_iter, header, ..
+        } = self;
         let is_sorted = header.is_sorted();
         let mut last_node_id: i64 = i64::MIN;
 
@@ -163,9 +165,7 @@ impl<R: Read + Send> ElementReader<R> {
             match blob?.decode() {
                 Ok(BlobDecode::OsmData(block)) => {
                     block.for_each_element(|element| {
-                        if is_sorted
-                            && let Some(id) = node_id(&element)
-                        {
+                        if is_sorted && let Some(id) = node_id(&element) {
                             debug_assert!(
                                 id > last_node_id,
                                 "Sort.Type_then_ID violated: node {id} <= previous {last_node_id}"
@@ -195,16 +195,18 @@ impl<R: Read + Send> ElementReader<R> {
         F: for<'a> FnMut(Element<'a>),
     {
         let is_sorted = self.header.is_sorted();
+        // History files carry multiple versions per object, so the same node id
+        // repeats consecutively under Sort.Type_then_ID. Only non-history sorted
+        // files guarantee strictly increasing node ids.
+        let is_history = self.header.has_historical_information();
         let mut last_node_id: i64 = i64::MIN;
 
         self.for_each_block_pipelined(|block| {
             block.for_each_element(|element| {
-                if is_sorted
-                    && let Some(id) = node_id(&element)
-                {
+                if is_sorted && let Some(id) = node_id(&element) {
                     debug_assert!(
-                        id > last_node_id,
-                        "Sort.Type_then_ID violated: node {id} <= previous {last_node_id}"
+                        if is_history { id >= last_node_id } else { id > last_node_id },
+                        "Sort.Type_then_ID violated: node {id} < previous {last_node_id}"
                     );
                     last_node_id = id;
                 }
@@ -406,7 +408,12 @@ impl<R: Read + Send> ElementReader<R> {
     //   expose per-bridge granularity controls. The mutex is fundamental to
     //   how par_bridge adapts a sequential iterator.
     //
-    pub fn par_map_reduce<MP, RD, ID, T>(mut self, map_op: MP, identity: ID, reduce_op: RD) -> Result<T>
+    pub fn par_map_reduce<MP, RD, ID, T>(
+        mut self,
+        map_op: MP,
+        identity: ID,
+        reduce_op: RD,
+    ) -> Result<T>
     where
         MP: for<'a> Fn(Element<'a>) -> T + Sync + Send,
         RD: Fn(T, T) -> T + Sync + Send,
@@ -426,17 +433,14 @@ impl<R: Read + Send> ElementReader<R> {
         // worker thread -- no mutex, no atomic CAS, just index arithmetic.
         blobs
             .into_par_iter()
-            .try_fold(
-                &identity,
-                |acc, blob: Blob| match blob.decode()? {
-                    BlobDecode::OsmData(block) => {
-                        Ok(block.elements().map(&map_op).fold(acc, &reduce_op))
-                    }
-                    // Should not happen: collect_osm_data_blobs filters to OsmData only.
-                    // Handle gracefully by returning the accumulator unchanged.
-                    BlobDecode::OsmHeader(_) | BlobDecode::Unknown(_) => Ok(acc),
-                },
-            )
+            .try_fold(&identity, |acc, blob: Blob| match blob.decode()? {
+                BlobDecode::OsmData(block) => {
+                    Ok(block.elements().map(&map_op).fold(acc, &reduce_op))
+                }
+                // Should not happen: collect_osm_data_blobs filters to OsmData only.
+                // Handle gracefully by returning the accumulator unchanged.
+                BlobDecode::OsmHeader(_) | BlobDecode::Unknown(_) => Ok(acc),
+            })
             .try_reduce(&identity, |a, b| Ok(reduce_op(a, b)))
     }
 }

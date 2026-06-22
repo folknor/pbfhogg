@@ -36,7 +36,10 @@ impl<T> ReorderBuffer<T> {
         if slot_idx >= self.pending.len() {
             self.pending.resize_with(slot_idx + 1, || None);
         }
-        assert!(self.pending[slot_idx].is_none(), "duplicate sequence number: {seq}");
+        assert!(
+            self.pending[slot_idx].is_none(),
+            "duplicate sequence number: {seq}"
+        );
         self.pending[slot_idx] = Some(item);
     }
 

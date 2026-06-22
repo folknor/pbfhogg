@@ -169,13 +169,19 @@ impl WorkerCounters {
         emit!("merge_streaming_blobs_processed", blobs_processed);
         emit!("merge_streaming_blobs_rewritten", blobs_rewritten);
         emit!("merge_streaming_blobs_false_positive", blobs_false_positive);
-        emit!("merge_streaming_blobs_owned_passthrough", blobs_owned_passthrough);
+        emit!(
+            "merge_streaming_blobs_owned_passthrough",
+            blobs_owned_passthrough
+        );
         emit!("merge_streaming_decompress_ns", decompress_ns);
         emit!("merge_streaming_parse_ns", parse_ns);
         emit!("merge_streaming_precise_ns", precise_ns);
         emit!("merge_streaming_rewrite_ns", rewrite_ns);
         emit!("merge_streaming_coord_extract_ns", coord_extract_ns);
-        emit!("merge_streaming_coord_pairs_extracted", coord_pairs_extracted);
+        emit!(
+            "merge_streaming_coord_pairs_extracted",
+            coord_pairs_extracted
+        );
         emit!("merge_streaming_frame_ns", frame_ns);
     }
 }
@@ -206,7 +212,10 @@ pub(super) fn run_workers(
         #[cfg(feature = "test-hooks")]
         panic_at_blob_seq,
     } = cfg;
-    let StreamingChannels { candidate_rx, drain_tx } = channels;
+    let StreamingChannels {
+        candidate_rx,
+        drain_tx,
+    } = channels;
 
     if locations_on_ways {
         let slots_len = coord_slots.as_ref().map_or(0, Vec::len);
@@ -273,8 +282,9 @@ pub(super) fn run_workers(
                     panic_at_blob_seq,
                 );
                 if let Err(e) = result {
-                    let mut slot =
-                        first_err.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut slot = first_err
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if slot.is_none() {
                         *slot = Some(e);
                     }
@@ -333,7 +343,9 @@ fn worker_loop(
 
     loop {
         let item = {
-            let rx = candidate_rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let rx = candidate_rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             match rx.recv() {
                 Ok(item) => item,
                 Err(_) => break, // channel closed by scanner
@@ -350,9 +362,7 @@ fn worker_loop(
                 ScannedBlob::Candidate(d) | ScannedBlob::Passthrough(d) => d.seq,
             };
             if panic_at_blob_seq == Some(seq) {
-                panic!(
-                    "test-hooks: panic_at_blob_seq={seq} triggered in worker {worker_id}"
-                );
+                panic!("test-hooks: panic_at_blob_seq={seq} triggered in worker {worker_id}");
             }
         }
 
@@ -390,7 +400,13 @@ fn worker_loop(
                 // desc.kind/id_range are authoritative (no override).
                 let count = desc.index.as_ref().map_or(0, |i| i.count);
                 handle_owned_passthrough(
-                    file, &desc, drain_tx, counters, &mut read_buf, count, None,
+                    file,
+                    &desc,
+                    drain_tx,
+                    counters,
+                    &mut read_buf,
+                    count,
+                    None,
                 )?;
             }
         }
@@ -399,7 +415,8 @@ fn worker_loop(
     // Final flush of this worker's coord accumulator into the shared slot.
     // Safe regardless of whether the drain has merged yet - drain holds
     // the same Arc and acquires when ready.
-    if locations_on_ways && !local_coords.is_empty()
+    if locations_on_ways
+        && !local_coords.is_empty()
         && let Some(slot) = coord_slot
     {
         flush_local_coords(slot, &mut local_coords);
@@ -488,8 +505,8 @@ fn handle_candidate(
 
     let t_parse = std::time::Instant::now();
     let raw = std::mem::take(decompress_buf);
-    let block =
-        crate::PrimitiveBlock::from_vec_with_scratch(raw, st_scratch, gr_scratch).map_err(io_err)?;
+    let block = crate::PrimitiveBlock::from_vec_with_scratch(raw, st_scratch, gr_scratch)
+        .map_err(io_err)?;
     counters
         .parse_ns
         .fetch_add(elapsed_ns(t_parse), Ordering::Relaxed);
@@ -513,7 +530,9 @@ fn handle_candidate(
     }
 
     if !overlaps {
-        counters.blobs_false_positive.fetch_add(1, Ordering::Relaxed);
+        counters
+            .blobs_false_positive
+            .fetch_add(1, Ordering::Relaxed);
         // The drain needs an element count for per-kind `base_*` stats
         // (gap #7). Indexed blobs carry it in `desc.index.count`; for
         // non-indexed blobs (-force path) we walk the already-parsed
@@ -737,8 +756,8 @@ fn handle_owned_passthrough(
     // Move the bytes into the DrainItem; reset read_buf for the next
     // pread without keeping the per-blob allocation alive.
     let frame_bytes = std::mem::take(read_buf);
-    let (kind, id_range) = override_kind_range
-        .unwrap_or_else(|| (desc.kind, desc.id_range.unwrap_or((0, 0))));
+    let (kind, id_range) =
+        override_kind_range.unwrap_or_else(|| (desc.kind, desc.id_range.unwrap_or((0, 0))));
 
     send_drain(
         drain_tx,
@@ -784,7 +803,9 @@ fn flush_local_coords(
     if local.is_empty() {
         return;
     }
-    let mut shared = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut shared = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if shared.is_empty() {
         std::mem::swap(&mut *shared, local);
     } else {

@@ -10,9 +10,11 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, Event};
 use quick_xml::name::QName;
 use quick_xml::{Reader, Writer};
 
-use crate::osc::write::{format_coord, from_decimicro, OwnedMember, OwnedNode, OwnedRelation, OwnedWay};
-use crate::tag_expr::{tag_matches, parse_expressions, Expression};
 use crate::BoxResult as Result;
+use crate::osc::write::{
+    OwnedMember, OwnedNode, OwnedRelation, OwnedWay, format_coord, from_decimicro,
+};
+use crate::tag_expr::{Expression, parse_expressions, tag_matches};
 use crate::{MemberId, MemberType};
 
 fn matches_any(expressions: &[Expression], tags: &[(String, String)], element_type: char) -> bool {
@@ -195,7 +197,13 @@ fn parse_and_filter_osc(
             Ok(Event::End(ref e)) => match e.name().as_ref() {
                 b"create" | b"modify" | b"delete" => section = Section::None,
                 b"node" | b"way" | b"relation" => {
-                    finalize_current(section, &mut current, &mut filtered, &mut stats, expressions);
+                    finalize_current(
+                        section,
+                        &mut current,
+                        &mut filtered,
+                        &mut stats,
+                        expressions,
+                    );
                 }
                 _ => {}
             },
@@ -286,7 +294,10 @@ fn append_member(e: &BytesStart<'_>, current: &mut Option<CurrentElem>) -> Resul
             MemberType::Relation => MemberId::Relation(id),
             MemberType::Unknown(v) => MemberId::Unknown(v, id),
         };
-        cur.members.push(OwnedMember { id: member_id, role });
+        cur.members.push(OwnedMember {
+            id: member_id,
+            role,
+        });
     }
     Ok(())
 }
@@ -442,7 +453,7 @@ fn attr_string(e: &BytesStart<'_>, name: &[u8]) -> Result<String> {
     for attr_result in e.attributes() {
         let attr = attr_result?;
         if attr.key == QName(name) {
-            let val = attr.unescape_value()?;
+            let val = attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)?;
             return Ok(val.into_owned());
         }
     }
@@ -459,7 +470,10 @@ fn write_filtered_osc(output: &Path, filtered: &FilteredOsc) -> Result<()> {
     root.push_attribute(("version", "0.6"));
     writer.write_event(Event::Start(root))?;
 
-    if !filtered.create_nodes.is_empty() || !filtered.create_ways.is_empty() || !filtered.create_relations.is_empty() {
+    if !filtered.create_nodes.is_empty()
+        || !filtered.create_ways.is_empty()
+        || !filtered.create_relations.is_empty()
+    {
         writer.write_event(Event::Start(BytesStart::new("create")))?;
         for node in &filtered.create_nodes {
             write_node(&mut writer, node)?;
@@ -473,7 +487,10 @@ fn write_filtered_osc(output: &Path, filtered: &FilteredOsc) -> Result<()> {
         writer.write_event(Event::End(BytesEnd::new("create")))?;
     }
 
-    if !filtered.modify_nodes.is_empty() || !filtered.modify_ways.is_empty() || !filtered.modify_relations.is_empty() {
+    if !filtered.modify_nodes.is_empty()
+        || !filtered.modify_ways.is_empty()
+        || !filtered.modify_relations.is_empty()
+    {
         writer.write_event(Event::Start(BytesStart::new("modify")))?;
         for node in &filtered.modify_nodes {
             write_node(&mut writer, node)?;
@@ -487,7 +504,10 @@ fn write_filtered_osc(output: &Path, filtered: &FilteredOsc) -> Result<()> {
         writer.write_event(Event::End(BytesEnd::new("modify")))?;
     }
 
-    if !filtered.delete_node_ids.is_empty() || !filtered.delete_way_ids.is_empty() || !filtered.delete_relation_ids.is_empty() {
+    if !filtered.delete_node_ids.is_empty()
+        || !filtered.delete_way_ids.is_empty()
+        || !filtered.delete_relation_ids.is_empty()
+    {
         writer.write_event(Event::Start(BytesStart::new("delete")))?;
         for id in &filtered.delete_node_ids {
             write_delete_id(&mut writer, "node", *id)?;

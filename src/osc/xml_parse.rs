@@ -3,9 +3,9 @@
 
 use crate::read::elements::MemberType;
 
+use super::ParseResult;
 use super::compact::member_type_to_byte;
 use super::parse::CompactDiffOverlay;
-use super::ParseResult;
 
 // ---------------------------------------------------------------------------
 // Section tracking
@@ -51,7 +51,7 @@ fn parse_str_attr(e: &quick_xml::events::BytesStart, name: &[u8]) -> ParseResult
     for attr_result in e.attributes() {
         let attr = attr_result?;
         if attr.key.as_ref() == name {
-            let val = attr.unescape_value()?;
+            let val = attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)?;
             return Ok(val.into_owned());
         }
     }
@@ -136,7 +136,12 @@ fn finalize_element(state: &mut ParserState, overlay: &mut CompactDiffOverlay) {
 
     match state.current_elem {
         CurrentElem::Node => {
-            overlay.push_node(state.current_id, state.current_lat, state.current_lon, &tags);
+            overlay.push_node(
+                state.current_id,
+                state.current_lat,
+                state.current_lon,
+                &tags,
+            );
         }
         CurrentElem::Way => {
             overlay.push_way(state.current_id, &state.refs, &tags);
@@ -302,9 +307,7 @@ pub(super) fn handle_end_event_compact(
 ) {
     match e.name().as_ref() {
         b"create" | b"modify" | b"delete" => state.section = Section::None,
-        b"node" | b"way" | b"relation"
-            if state.current_elem != CurrentElem::None =>
-        {
+        b"node" | b"way" | b"relation" if state.current_elem != CurrentElem::None => {
             finalize_element(state, overlay);
         }
         _ => {}

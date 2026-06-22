@@ -101,7 +101,10 @@ mod tests {
     fn classify_single_blob_fully_contained() {
         // Blob 0: [20, 80), bucket: [0, 100)
         let result = classify_blobs_in_bucket(0, 100, &[20], 80).expect("classify");
-        assert_eq!(result, vec![BlobBucketIntersection::FullyContained { blob_idx: 0 }]);
+        assert_eq!(
+            result,
+            vec![BlobBucketIntersection::FullyContained { blob_idx: 0 }]
+        );
     }
 
     #[test]
@@ -109,7 +112,10 @@ mod tests {
         // Blob 0: [50, 150), bucket: [0, 100)
         // Blob extends past bucket end → LeftHalf
         let result = classify_blobs_in_bucket(0, 100, &[50], 150).expect("classify");
-        assert_eq!(result, vec![BlobBucketIntersection::LeftHalf { blob_idx: 0 }]);
+        assert_eq!(
+            result,
+            vec![BlobBucketIntersection::LeftHalf { blob_idx: 0 }]
+        );
     }
 
     #[test]
@@ -117,7 +123,10 @@ mod tests {
         // Blob 0: [0, 50), bucket: [25, 100)
         // Blob starts before bucket_start → RightHalf
         let result = classify_blobs_in_bucket(25, 100, &[0], 50).expect("classify");
-        assert_eq!(result, vec![BlobBucketIntersection::RightHalf { blob_idx: 0 }]);
+        assert_eq!(
+            result,
+            vec![BlobBucketIntersection::RightHalf { blob_idx: 0 }]
+        );
     }
 
     #[test]
@@ -133,9 +142,18 @@ mod tests {
         let result = classify_blobs_in_bucket(100, 600, &starts, total_slots).expect("classify");
         assert_eq!(result.len(), 5);
         assert_eq!(result[0], BlobBucketIntersection::RightHalf { blob_idx: 0 });
-        assert_eq!(result[1], BlobBucketIntersection::FullyContained { blob_idx: 1 });
-        assert_eq!(result[2], BlobBucketIntersection::FullyContained { blob_idx: 2 });
-        assert_eq!(result[3], BlobBucketIntersection::FullyContained { blob_idx: 3 });
+        assert_eq!(
+            result[1],
+            BlobBucketIntersection::FullyContained { blob_idx: 1 }
+        );
+        assert_eq!(
+            result[2],
+            BlobBucketIntersection::FullyContained { blob_idx: 2 }
+        );
+        assert_eq!(
+            result[3],
+            BlobBucketIntersection::FullyContained { blob_idx: 3 }
+        );
         assert_eq!(result[4], BlobBucketIntersection::LeftHalf { blob_idx: 4 });
     }
 
@@ -144,12 +162,18 @@ mod tests {
         // Blob end exactly equals bucket end → FullyContained, not LeftHalf.
         // Blob 0: [50, 100), bucket: [0, 100)
         let result = classify_blobs_in_bucket(0, 100, &[50], 100).expect("classify");
-        assert_eq!(result, vec![BlobBucketIntersection::FullyContained { blob_idx: 0 }]);
+        assert_eq!(
+            result,
+            vec![BlobBucketIntersection::FullyContained { blob_idx: 0 }]
+        );
 
         // Blob start exactly equals bucket start → FullyContained (if blob fits within bucket).
         // Blob 0: [0, 80), bucket: [0, 100)
         let result = classify_blobs_in_bucket(0, 100, &[0], 80).expect("classify");
-        assert_eq!(result, vec![BlobBucketIntersection::FullyContained { blob_idx: 0 }]);
+        assert_eq!(
+            result,
+            vec![BlobBucketIntersection::FullyContained { blob_idx: 0 }]
+        );
     }
 
     #[test]
@@ -160,7 +184,10 @@ mod tests {
         // blob 2: [20, 20) → empty (total_slots == way_slot_starts[2]), skip
         let starts = [10, 10, 20];
         let result = classify_blobs_in_bucket(0, 30, &starts, 20).expect("classify");
-        assert_eq!(result, vec![BlobBucketIntersection::FullyContained { blob_idx: 1 }]);
+        assert_eq!(
+            result,
+            vec![BlobBucketIntersection::FullyContained { blob_idx: 1 }]
+        );
     }
 
     #[test]
@@ -171,10 +198,13 @@ mod tests {
         // bucket [0, 100): both FullyContained
         let starts = [0, 50];
         let result = classify_blobs_in_bucket(0, 100, &starts, 80).expect("classify");
-        assert_eq!(result, vec![
-            BlobBucketIntersection::FullyContained { blob_idx: 0 },
-            BlobBucketIntersection::FullyContained { blob_idx: 1 },
-        ]);
+        assert_eq!(
+            result,
+            vec![
+                BlobBucketIntersection::FullyContained { blob_idx: 0 },
+                BlobBucketIntersection::FullyContained { blob_idx: 1 },
+            ]
+        );
     }
 
     #[test]

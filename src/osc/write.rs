@@ -3,8 +3,8 @@
 //! Metadata fields are String-typed for direct XML attribute output.
 //! See `crate::owned` for the PBF-oriented variant with native types.
 
-use quick_xml::events::{BytesEnd, BytesStart, Event};
 use quick_xml::Writer;
+use quick_xml::events::{BytesEnd, BytesStart, Event};
 
 use crate::MemberId;
 

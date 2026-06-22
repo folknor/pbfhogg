@@ -12,12 +12,12 @@ use crate::writer::Compression;
 use crate::{Element, PrimitiveBlock};
 
 use super::super::Stats;
+use super::super::{
+    HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
+    flush_local, writer_from_header,
+};
 use crate::idset::IdSet;
 use crate::owned::{dense_node_metadata, element_metadata};
-use super::super::{
-    ensure_node_capacity_local, ensure_relation_capacity_local,
-    flush_local, HeaderOverrides, Result, writer_from_header,
-};
 
 use super::blob_meta::BlobMeta;
 
@@ -55,19 +55,20 @@ struct BlobDescriptor {
 
 /// Load the ref-count sidecar and compute prefix sums for slot_start values.
 pub(super) fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Vec<u64>> {
-    let data = std::fs::read(path)
-        .map_err(|e| format!("failed to read ref count sidecar: {e}"))?;
+    let data = std::fs::read(path).map_err(|e| format!("failed to read ref count sidecar: {e}"))?;
     if data.len() < 8 {
         return Err("ref count sidecar is too small".into());
     }
     // Last 8 bytes are the trailer (total ref count).
-    let trailer_bytes: [u8; 8] = data[data.len() - 8..].try_into()
+    let trailer_bytes: [u8; 8] = data[data.len() - 8..]
+        .try_into()
         .map_err(|_| "ref count sidecar trailer read failed")?;
     let trailer_total = u64::from_le_bytes(trailer_bytes);
     if trailer_total != total_slots {
         return Err(format!(
             "ref count sidecar total ({trailer_total}) != stage 1 total_slots ({total_slots})"
-        ).into());
+        )
+        .into());
     }
 
     let entry_bytes = &data[..data.len() - 8];
@@ -79,14 +80,18 @@ pub(super) fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Ve
     let mut cumulative: u64 = 0;
     for chunk in entry_bytes.chunks_exact(8) {
         slot_starts.push(cumulative);
-        let count = u64::from_le_bytes(chunk.try_into()
-            .map_err(|_| "ref count sidecar entry read failed")?);
+        let count = u64::from_le_bytes(
+            chunk
+                .try_into()
+                .map_err(|_| "ref count sidecar entry read failed")?,
+        );
         cumulative += count;
     }
     if cumulative != total_slots {
         return Err(format!(
             "ref count sidecar cumulative ({cumulative}) != total_slots ({total_slots})"
-        ).into());
+        )
+        .into());
     }
     Ok(slot_starts)
 }
@@ -121,7 +126,8 @@ pub(super) fn stage4_assembly(
 
     // Also read the header for the writer (need a regular BlobReader for this).
     let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    let header_blob = header_reader.next()
+    let header_blob = header_reader
+        .next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
     let header = header_blob.to_headerblock()?;
     drop(header_reader);
@@ -216,15 +222,17 @@ pub(super) fn stage4_assembly(
     if way_sidecar_idx != way_slot_starts.len() {
         return Err(format!(
             "ref count sidecar has {} entries but only {} way blobs seen in PBF",
-            way_slot_starts.len(), way_sidecar_idx,
-        ).into());
+            way_slot_starts.len(),
+            way_sidecar_idx,
+        )
+        .into());
     }
     crate::debug::emit_marker("EXTJOIN_S4_SCHEDULE_END");
 
     // Open shared file for worker pread.
     let shared_file = std::sync::Arc::new(
         std::fs::File::open(input)
-            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
     );
 
     let mut writer = writer_from_header(
@@ -380,11 +388,11 @@ pub(super) fn stage4_assembly(
                             let t_wait = std::time::Instant::now();
                             coord_payloads_reader
                                 .wait_ready(desc.way_blob_idx)
-                                .map_err(|e| crate::error::new_error(
-                                    crate::error::ErrorKind::Io(std::io::Error::other(
-                                        e.to_string(),
-                                    )),
-                                ))?;
+                                .map_err(|e| {
+                                    crate::error::new_error(crate::error::ErrorKind::Io(
+                                        std::io::Error::other(e.to_string()),
+                                    ))
+                                })?;
                             #[allow(clippy::cast_possible_truncation)]
                             let wait_ns = t_wait.elapsed().as_nanos() as u64;
                             if wait_ns > 0 {
@@ -397,9 +405,7 @@ pub(super) fn stage4_assembly(
                         let t0 = std::time::Instant::now();
                         read_buf.resize(desc.data_size, 0);
                         file.read_exact_at(&mut read_buf, desc.data_offset)
-                            .map_err(|e| crate::error::new_error(
-                                crate::error::ErrorKind::Io(e)
-                            ))?;
+                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
                         #[allow(clippy::cast_possible_truncation)]
                         s4_pread_ref.fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
                         s4_bytes_read_ref.fetch_add(desc.data_size as u64, Relaxed);
@@ -419,20 +425,16 @@ pub(super) fn stage4_assembly(
                             let t_cpread = std::time::Instant::now();
                             coord_payloads_reader
                                 .pread_blob_payload(desc.way_blob_idx, &mut coord_payload_buf)
-                                .map_err(|e| crate::error::new_error(
-                                    crate::error::ErrorKind::Io(std::io::Error::other(
-                                        e.to_string(),
-                                    )),
-                                ))?;
+                                .map_err(|e| {
+                                    crate::error::new_error(crate::error::ErrorKind::Io(
+                                        std::io::Error::other(e.to_string()),
+                                    ))
+                                })?;
                             #[allow(clippy::cast_possible_truncation)]
-                            s4_coord_payload_pread_ref.fetch_add(
-                                t_cpread.elapsed().as_millis() as u64,
-                                Relaxed,
-                            );
-                            s4_coord_payload_bytes_ref.fetch_add(
-                                coord_payload_buf.len() as u64,
-                                Relaxed,
-                            );
+                            s4_coord_payload_pread_ref
+                                .fetch_add(t_cpread.elapsed().as_millis() as u64, Relaxed);
+                            s4_coord_payload_bytes_ref
+                                .fetch_add(coord_payload_buf.len() as u64, Relaxed);
 
                             // Wire-format reframe: splice locations without
                             // full PrimitiveBlock decode or BlockBuilder.
@@ -446,9 +448,12 @@ pub(super) fn stage4_assembly(
                                     &mut reframe_output,
                                     &mut way_reframe_scratch,
                                     way_reframe_cref,
-                                ).map_err(|e| crate::error::new_error(
-                                    crate::error::ErrorKind::Io(std::io::Error::other(e))
-                                ))?;
+                                )
+                                .map_err(|e| {
+                                    crate::error::new_error(crate::error::ErrorKind::Io(
+                                        std::io::Error::other(e),
+                                    ))
+                                })?;
 
                             let index = crate::blob_meta::BlobIndex {
                                 kind: crate::blob_meta::ElemKind::Way,
@@ -479,23 +484,26 @@ pub(super) fn stage4_assembly(
                         }
 
                         // Non-way blobs: full PrimitiveBlock decode + BlockBuilder.
-                        let block = PrimitiveBlock::new(
-                            bytes::Bytes::from(std::mem::take(&mut decompress_buf))
-                        )?;
+                        let block = PrimitiveBlock::new(bytes::Bytes::from(std::mem::take(
+                            &mut decompress_buf,
+                        )))?;
                         let mut block_stats = assemble_block(
                             &block,
                             &mut bb,
                             &mut output_blocks,
                             keep_untagged_nodes,
                             relation_member_node_ids,
-                        ).map_err(|e| crate::error::new_error(
-                            crate::error::ErrorKind::Io(std::io::Error::other(e))
-                        ))?;
+                        )
+                        .map_err(|e| {
+                            crate::error::new_error(crate::error::ErrorKind::Io(
+                                std::io::Error::other(e),
+                            ))
+                        })?;
                         block_stats.blobs_decoded = 1;
                         flush_local(&mut bb, &mut output_blocks).map_err(|e| {
-                            crate::error::new_error(
-                                crate::error::ErrorKind::Io(std::io::Error::other(e))
-                            )
+                            crate::error::new_error(crate::error::ErrorKind::Io(
+                                std::io::Error::other(e),
+                            ))
                         })?;
                         #[allow(clippy::cast_possible_truncation)]
                         {
@@ -512,17 +520,20 @@ pub(super) fn stage4_assembly(
                         s4_blobs_ref.fetch_add(1, Relaxed);
 
                         Ok((std::mem::take(&mut output_blocks), block_stats))
-                    })();
+                    })(
+                    );
 
                     // Track max live buffer bytes for this worker.
                     {
                         let worker_bytes = read_buf.capacity() as u64
                             + decompress_buf.capacity() as u64
                             + reframe_output.capacity() as u64;
-                        let mut current = s4_max_worker_buf_ref.load(std::sync::atomic::Ordering::Relaxed);
+                        let mut current =
+                            s4_max_worker_buf_ref.load(std::sync::atomic::Ordering::Relaxed);
                         while worker_bytes > current {
                             match s4_max_worker_buf_ref.compare_exchange_weak(
-                                current, worker_bytes,
+                                current,
+                                worker_bytes,
                                 std::sync::atomic::Ordering::Relaxed,
                                 std::sync::atomic::Ordering::Relaxed,
                             ) {
@@ -539,15 +550,15 @@ pub(super) fn stage4_assembly(
                     // completes). Bounded `sync_channel` blocks here
                     // when full, so the recorded value still reflects
                     // a real moment of saturation.
-                    let depth_after = s4_channel_depth_ref
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        + 1;
+                    let depth_after =
+                        s4_channel_depth_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     {
-                        let mut hw = s4_channel_high_water_ref
-                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let mut hw =
+                            s4_channel_high_water_ref.load(std::sync::atomic::Ordering::Relaxed);
                         while depth_after > hw {
                             match s4_channel_high_water_ref.compare_exchange_weak(
-                                hw, depth_after,
+                                hw,
+                                depth_after,
                                 std::sync::atomic::Ordering::Relaxed,
                                 std::sync::atomic::Ordering::Relaxed,
                             ) {
@@ -560,7 +571,10 @@ pub(super) fn stage4_assembly(
                         break;
                     }
                     #[allow(clippy::cast_possible_truncation)]
-                    s4_send_ref.fetch_add(t3.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+                    s4_send_ref.fetch_add(
+                        t3.elapsed().as_millis() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
             });
         }
@@ -603,15 +617,18 @@ pub(super) fn stage4_assembly(
         // descriptor construction must be audited before removing
         // this expect.
         for desc in &passthrough_items {
-            let kind = desc.kind.expect(
-                "passthrough eligibility requires a known blob kind",
+            let kind = desc
+                .kind
+                .expect("passthrough eligibility requires a known blob kind");
+            reorder.push(
+                desc.seq,
+                ConsumerItem::Passthrough {
+                    frame_offset: desc.frame_offset,
+                    frame_size: desc.frame_size,
+                    count: desc.count,
+                    kind,
+                },
             );
-            reorder.push(desc.seq, ConsumerItem::Passthrough {
-                frame_offset: desc.frame_offset,
-                frame_size: desc.frame_size,
-                count: desc.count,
-                kind,
-            });
         }
 
         let mut frame_read_buf: Vec<u8> = Vec::new();
@@ -627,7 +644,7 @@ pub(super) fn stage4_assembly(
                          s4_passthrough_blobs: &mut u64,
                          s4_passthrough_pread_ms: &mut u64,
                          s4_passthrough_bytes: &mut u64|
-            -> Result<()> {
+         -> Result<()> {
             while let Some(item) = reorder.pop_ready() {
                 match item {
                     ConsumerItem::Decoded(result) => {
@@ -638,21 +655,31 @@ pub(super) fn stage4_assembly(
                             *s4_write_calls += 1;
                             let t_w = std::time::Instant::now();
                             writer.write_primitive_block_owned(
-                                block_bytes, index, tagdata.as_deref(),
+                                block_bytes,
+                                index,
+                                tagdata.as_deref(),
                             )?;
                             #[allow(clippy::cast_possible_truncation)]
-                            { *s4_write_ms += t_w.elapsed().as_millis() as u64; }
+                            {
+                                *s4_write_ms += t_w.elapsed().as_millis() as u64;
+                            }
                         }
                     }
-                    ConsumerItem::Passthrough { frame_offset, frame_size, count, kind } => {
+                    ConsumerItem::Passthrough {
+                        frame_offset,
+                        frame_size,
+                        count,
+                        kind,
+                    } => {
                         let t_pread = std::time::Instant::now();
                         frame_read_buf.resize(frame_size, 0);
-                        shared_file.read_exact_at(&mut frame_read_buf, frame_offset)
-                            .map_err(|e| crate::error::new_error(
-                                crate::error::ErrorKind::Io(e),
-                            ))?;
+                        shared_file
+                            .read_exact_at(&mut frame_read_buf, frame_offset)
+                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
                         #[allow(clippy::cast_possible_truncation)]
-                        { *s4_passthrough_pread_ms += t_pread.elapsed().as_millis() as u64; }
+                        {
+                            *s4_passthrough_pread_ms += t_pread.elapsed().as_millis() as u64;
+                        }
                         *s4_passthrough_bytes += frame_size as u64;
 
                         let t_w = std::time::Instant::now();
@@ -663,7 +690,9 @@ pub(super) fn stage4_assembly(
                             Vec::with_capacity(frame_size),
                         ))?;
                         #[allow(clippy::cast_possible_truncation)]
-                        { *s4_write_ms += t_w.elapsed().as_millis() as u64; }
+                        {
+                            *s4_write_ms += t_w.elapsed().as_millis() as u64;
+                        }
 
                         *s4_passthrough_blobs += 1;
                         total_stats.blobs_passthrough += 1;
@@ -691,9 +720,13 @@ pub(super) fn stage4_assembly(
 
         // Drain any passthrough prefix before the first decode result.
         drain(
-            &mut reorder, &mut total_stats,
-            &mut s4_bytes_written, &mut s4_write_calls, &mut s4_write_ms,
-            &mut s4_passthrough_blobs, &mut s4_passthrough_pread_ms,
+            &mut reorder,
+            &mut total_stats,
+            &mut s4_bytes_written,
+            &mut s4_write_calls,
+            &mut s4_write_ms,
+            &mut s4_passthrough_blobs,
+            &mut s4_passthrough_pread_ms,
             &mut s4_passthrough_bytes,
         )?;
 
@@ -701,7 +734,9 @@ pub(super) fn stage4_assembly(
             let t_recv = std::time::Instant::now();
             let msg = decoded_rx.recv();
             #[allow(clippy::cast_possible_truncation)]
-            { s4_recv_ms += t_recv.elapsed().as_millis() as u64; }
+            {
+                s4_recv_ms += t_recv.elapsed().as_millis() as u64;
+            }
             let (seq_num, item) = match msg {
                 Ok(v) => {
                     // Decrement channel depth on successful recv.
@@ -713,9 +748,13 @@ pub(super) fn stage4_assembly(
 
             reorder.push(seq_num, ConsumerItem::Decoded(item));
             drain(
-                &mut reorder, &mut total_stats,
-                &mut s4_bytes_written, &mut s4_write_calls, &mut s4_write_ms,
-                &mut s4_passthrough_blobs, &mut s4_passthrough_pread_ms,
+                &mut reorder,
+                &mut total_stats,
+                &mut s4_bytes_written,
+                &mut s4_write_calls,
+                &mut s4_write_ms,
+                &mut s4_passthrough_blobs,
+                &mut s4_passthrough_pread_ms,
                 &mut s4_passthrough_bytes,
             )?;
         }
@@ -725,9 +764,13 @@ pub(super) fn stage4_assembly(
         // PBFs) there's no trailing decode push to trigger the last
         // pop_ready, so do it here.
         drain(
-            &mut reorder, &mut total_stats,
-            &mut s4_bytes_written, &mut s4_write_calls, &mut s4_write_ms,
-            &mut s4_passthrough_blobs, &mut s4_passthrough_pread_ms,
+            &mut reorder,
+            &mut total_stats,
+            &mut s4_bytes_written,
+            &mut s4_write_calls,
+            &mut s4_write_ms,
+            &mut s4_passthrough_blobs,
+            &mut s4_passthrough_pread_ms,
             &mut s4_passthrough_bytes,
         )?;
 
@@ -750,22 +793,64 @@ pub(super) fn stage4_assembly(
 
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     {
-        crate::debug::emit_counter("s4_pread_ms", s4_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s4_decompress_ms", s4_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s4_assemble_ms", s4_assemble_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s4_way_reframe_ms", s4_way_reframe_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s4_nonway_assemble_ms", s4_nonway_assemble_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s4_way_blobs_processed", s4_way_blobs_processed.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s4_nonway_blobs_processed", s4_nonway_blobs_processed.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s4_send_ms", s4_send_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s4_blobs", s4_blobs.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s4_bytes_read", s4_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter(
+            "s4_pread_ms",
+            s4_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s4_decompress_ms",
+            s4_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s4_assemble_ms",
+            s4_assemble_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s4_way_reframe_ms",
+            s4_way_reframe_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s4_nonway_assemble_ms",
+            s4_nonway_assemble_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s4_way_blobs_processed",
+            s4_way_blobs_processed.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s4_nonway_blobs_processed",
+            s4_nonway_blobs_processed.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s4_send_ms",
+            s4_send_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s4_blobs",
+            s4_blobs.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s4_bytes_read",
+            s4_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
         crate::debug::emit_counter("s4_bytes_written", s4_bytes_written as i64);
-        crate::debug::emit_counter("s4_pread_calls", s4_pread_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter(
+            "s4_pread_calls",
+            s4_pread_calls.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
         crate::debug::emit_counter("s4_write_calls", s4_write_calls as i64);
-        crate::debug::emit_counter("s4_max_worker_buf_bytes", s4_max_worker_buf_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s4_coord_payload_pread_ms", s4_coord_payload_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s4_coord_payload_bytes", s4_coord_payload_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter(
+            "s4_max_worker_buf_bytes",
+            s4_max_worker_buf_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s4_coord_payload_pread_ms",
+            s4_coord_payload_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s4_coord_payload_bytes",
+            s4_coord_payload_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
         crate::debug::emit_counter(
             "s4_readiness_wait_ms",
             (s4_readiness_wait_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000) as i64,
@@ -776,7 +861,8 @@ pub(super) fn stage4_assembly(
         );
         crate::debug::emit_counter(
             "s4_readiness_wait_max_ms",
-            (s4_readiness_wait_max_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000) as i64,
+            (s4_readiness_wait_max_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000)
+                as i64,
         );
         crate::debug::emit_counter("s4_passthrough_blobs", s4_passthrough_blobs as i64);
         crate::debug::emit_counter("s4_passthrough_pread_ms", s4_passthrough_pread_ms as i64);
@@ -792,19 +878,30 @@ pub(super) fn stage4_assembly(
         );
         crate::debug::emit_counter("extjoin_skipped_node_blobs", skipped_node_blobs as i64);
         crate::debug::emit_counter("s4_node_blobs_total", s4_node_blobs_total as i64);
-        crate::debug::emit_counter("s4_node_blobs_no_tagindex", s4_node_blobs_no_tagindex as i64);
+        crate::debug::emit_counter(
+            "s4_node_blobs_no_tagindex",
+            s4_node_blobs_no_tagindex as i64,
+        );
         crate::debug::emit_counter("s4_node_blobs_empty_tags", s4_node_blobs_empty_tags as i64);
-        crate::debug::emit_counter("s4_node_blobs_kept_by_tags", s4_node_blobs_kept_by_tags as i64);
-        crate::debug::emit_counter("s4_node_blobs_kept_by_members", s4_node_blobs_kept_by_members as i64);
+        crate::debug::emit_counter(
+            "s4_node_blobs_kept_by_tags",
+            s4_node_blobs_kept_by_tags as i64,
+        );
+        crate::debug::emit_counter(
+            "s4_node_blobs_kept_by_members",
+            s4_node_blobs_kept_by_members as i64,
+        );
         crate::debug::emit_counter("s4_way_blobs", s4_way_blobs as i64);
         crate::debug::emit_counter("s4_relation_blobs", s4_relation_blobs as i64);
-        crate::debug::emit_counter("s4_schedule_scan_ms", t_schedule.elapsed().as_millis() as i64);
+        crate::debug::emit_counter(
+            "s4_schedule_scan_ms",
+            t_schedule.elapsed().as_millis() as i64,
+        );
     }
     way_reframe_counters.emit();
 
     Ok(total_stats)
 }
-
 
 /// Process a single block for assembly.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
@@ -831,7 +928,13 @@ fn assemble_block(
                 {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = dense_node_metadata(dn);
-                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), meta.as_ref());
+                    bb.add_node(
+                        dn.id(),
+                        dn.decimicro_lat(),
+                        dn.decimicro_lon(),
+                        dn.tags(),
+                        meta.as_ref(),
+                    );
                     stats.nodes_written += 1;
                 } else {
                     stats.nodes_dropped += 1;
@@ -846,7 +949,13 @@ fn assemble_block(
                 {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = element_metadata(&n.info());
-                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), n.tags(), meta.as_ref());
+                    bb.add_node(
+                        n.id(),
+                        n.decimicro_lat(),
+                        n.decimicro_lon(),
+                        n.tags(),
+                        meta.as_ref(),
+                    );
                     stats.nodes_written += 1;
                 } else {
                     stats.nodes_dropped += 1;
@@ -929,15 +1038,33 @@ impl WayReframeCounters {
         // Convert nanosecond accumulators to milliseconds at emit time so
         // counter names and downstream comparisons stay on the same unit.
         let ns_to_ms = |ns: u64| (ns / 1_000_000) as i64;
-        crate::debug::emit_counter("s4_way_parse_block_ms", ns_to_ms(self.parse_block_ns.load(Relaxed)));
-        crate::debug::emit_counter("s4_way_unknown_field_copy_ms", ns_to_ms(self.unknown_field_copy_ns.load(Relaxed)));
-        crate::debug::emit_counter("s4_way_group_reframe_ms", ns_to_ms(self.group_reframe_ns.load(Relaxed)));
+        crate::debug::emit_counter(
+            "s4_way_parse_block_ms",
+            ns_to_ms(self.parse_block_ns.load(Relaxed)),
+        );
+        crate::debug::emit_counter(
+            "s4_way_unknown_field_copy_ms",
+            ns_to_ms(self.unknown_field_copy_ns.load(Relaxed)),
+        );
+        crate::debug::emit_counter(
+            "s4_way_group_reframe_ms",
+            ns_to_ms(self.group_reframe_ns.load(Relaxed)),
+        );
         crate::debug::emit_counter("s4_way_refs_total", self.refs_total.load(Relaxed) as i64);
-        crate::debug::emit_counter("s4_way_refs_present", self.refs_present.load(Relaxed) as i64);
-        crate::debug::emit_counter("s4_way_max_refs_per_way", self.max_refs_per_way.load(Relaxed) as i64);
+        crate::debug::emit_counter(
+            "s4_way_refs_present",
+            self.refs_present.load(Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s4_way_max_refs_per_way",
+            self.max_refs_per_way.load(Relaxed) as i64,
+        );
         crate::debug::emit_counter("s4_way_lat_bytes", self.lat_bytes.load(Relaxed) as i64);
         crate::debug::emit_counter("s4_way_lon_bytes", self.lon_bytes.load(Relaxed) as i64);
-        crate::debug::emit_counter("s4_way_messages_total", self.ways_total.load(Relaxed) as i64);
+        crate::debug::emit_counter(
+            "s4_way_messages_total",
+            self.ways_total.load(Relaxed) as i64,
+        );
         let total_refs = self.refs_total.load(Relaxed);
         let total_ways = self.ways_total.load(Relaxed);
         if let Some(avg) = total_refs.checked_div(total_ways) {
@@ -1010,33 +1137,46 @@ fn reframe_way_blob_with_locations(
     // Level 1: PrimitiveBlock - find string table + groups.
     let t_block = std::time::Instant::now();
     let mut cursor = Cursor::new(decompressed);
-    while let Some((field, wire_type)) = cursor.read_tag().map_err(|e| format!("reframe block: {e}"))? {
+    while let Some((field, wire_type)) = cursor
+        .read_tag()
+        .map_err(|e| format!("reframe block: {e}"))?
+    {
         match (field, wire_type) {
             (1, WIRE_LEN) => {
-                let data = cursor.read_len_delimited().map_err(|e| format!("reframe st: {e}"))?;
+                let data = cursor
+                    .read_len_delimited()
+                    .map_err(|e| format!("reframe st: {e}"))?;
                 let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
                 stringtable_range = Some((offset, data.len()));
             }
             (2, WIRE_LEN) => {
-                let data = cursor.read_len_delimited().map_err(|e| format!("reframe group: {e}"))?;
+                let data = cursor
+                    .read_len_delimited()
+                    .map_err(|e| format!("reframe group: {e}"))?;
                 let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
                 scratch.group_ranges.push((offset, data.len()));
             }
             (17..=20, WIRE_VARINT) => {
-                let raw = cursor.read_raw_field(wire_type).map_err(|e| format!("reframe scalar: {e}"))?;
+                let raw = cursor
+                    .read_raw_field(wire_type)
+                    .map_err(|e| format!("reframe scalar: {e}"))?;
                 protohoggr::encode_tag(&mut scratch.scalar_fields, field, wire_type);
                 scratch.scalar_fields.extend_from_slice(raw);
             }
-            _ => cursor.skip_field(wire_type).map_err(|e| format!("reframe skip: {e}"))?,
+            _ => cursor
+                .skip_field(wire_type)
+                .map_err(|e| format!("reframe skip: {e}"))?,
         }
     }
 
-    let (st_offset, st_len) = stringtable_range
-        .ok_or("reframe: no StringTable in PrimitiveBlock")?;
+    let (st_offset, st_len) =
+        stringtable_range.ok_or("reframe: no StringTable in PrimitiveBlock")?;
     let stringtable_bytes = &decompressed[st_offset..st_offset + st_len];
 
     #[allow(clippy::cast_possible_truncation)]
-    counters.parse_block_ns.fetch_add(t_block.elapsed().as_nanos() as u64, Relaxed);
+    counters
+        .parse_block_ns
+        .fetch_add(t_block.elapsed().as_nanos() as u64, Relaxed);
 
     let mut refcount_cursor = Cursor::new(per_way_refcount_record);
     let expected_ways = refcount_cursor
@@ -1074,36 +1214,50 @@ fn reframe_way_blob_with_locations(
         scratch.group_out.clear();
 
         let mut gr_cursor = Cursor::new(group_bytes);
-        while let Some((field, wire_type)) = gr_cursor.read_tag().map_err(|e| format!("reframe gfield: {e}"))? {
+        while let Some((field, wire_type)) = gr_cursor
+            .read_tag()
+            .map_err(|e| format!("reframe gfield: {e}"))?
+        {
             if field == 3 && wire_type == WIRE_LEN {
                 // Way submessage - splice locations.
-                let way_bytes = gr_cursor.read_len_delimited().map_err(|e| format!("reframe way: {e}"))?;
+                let way_bytes = gr_cursor
+                    .read_len_delimited()
+                    .map_err(|e| format!("reframe way: {e}"))?;
 
                 if sidecar_way_idx >= expected_ways_usize {
                     return Err(format!(
                         "blob {way_blob_idx}: encountered more way messages than the per-way sidecar record declares ({expected_ways_usize})"
                     ));
                 }
-                let ref_count = refcount_cursor
-                    .read_varint()
-                    .map_err(|e| format!(
-                        "per-way sidecar blob {way_blob_idx} way {sidecar_way_idx}: {e}"
-                    ))?;
+                let ref_count = refcount_cursor.read_varint().map_err(|e| {
+                    format!("per-way sidecar blob {way_blob_idx} way {sidecar_way_idx}: {e}")
+                })?;
                 sidecar_way_idx += 1;
 
                 let mut way_id: i64 = 0;
 
                 let mut way_cursor = Cursor::new(way_bytes);
-                while let Some((wf, wt)) = way_cursor.read_tag().map_err(|e| format!("reframe wfield: {e}"))? {
+                while let Some((wf, wt)) = way_cursor
+                    .read_tag()
+                    .map_err(|e| format!("reframe wfield: {e}"))?
+                {
                     if wf == 1 && wt == WIRE_VARINT {
-                        way_id = way_cursor.read_varint_i64().map_err(|e| format!("reframe id: {e}"))?;
+                        way_id = way_cursor
+                            .read_varint_i64()
+                            .map_err(|e| format!("reframe id: {e}"))?;
                     } else {
-                        way_cursor.skip_field(wt).map_err(|e| format!("reframe wskip: {e}"))?;
+                        way_cursor
+                            .skip_field(wt)
+                            .map_err(|e| format!("reframe wskip: {e}"))?;
                     }
                 }
 
-                if way_id < min_way_id { min_way_id = way_id; }
-                if way_id > max_way_id { max_way_id = way_id; }
+                if way_id < min_way_id {
+                    min_way_id = way_id;
+                }
+                if way_id > max_way_id {
+                    max_way_id = way_id;
+                }
 
                 // De-interleave pre-encoded varints from coord_payload into
                 // PBF packed fields 9/10. The raw varint bytes match PBF's
@@ -1122,7 +1276,9 @@ fn reframe_way_blob_with_locations(
                         return Err("coord_payload: truncated lat varint".into());
                     }
                     payload_pos += 1;
-                    scratch.packed_lats.extend_from_slice(&coord_payload[lat_start..payload_pos]);
+                    scratch
+                        .packed_lats
+                        .extend_from_slice(&coord_payload[lat_start..payload_pos]);
                     let lon_start = payload_pos;
                     while payload_pos < coord_payload.len()
                         && (coord_payload[payload_pos] & 0x80) != 0
@@ -1133,7 +1289,9 @@ fn reframe_way_blob_with_locations(
                         return Err("coord_payload: truncated lon varint".into());
                     }
                     payload_pos += 1;
-                    scratch.packed_lons.extend_from_slice(&coord_payload[lon_start..payload_pos]);
+                    scratch
+                        .packed_lons
+                        .extend_from_slice(&coord_payload[lon_start..payload_pos]);
                 }
                 way_slot_pos += ref_count;
                 blob_refs_present += ref_count;
@@ -1148,8 +1306,16 @@ fn reframe_way_blob_with_locations(
                 scratch.reframed_way.clear();
                 scratch.reframed_way.extend_from_slice(way_bytes);
                 if ref_count > 0 {
-                    protohoggr::encode_bytes_field(&mut scratch.reframed_way, 9, &scratch.packed_lats);
-                    protohoggr::encode_bytes_field(&mut scratch.reframed_way, 10, &scratch.packed_lons);
+                    protohoggr::encode_bytes_field(
+                        &mut scratch.reframed_way,
+                        9,
+                        &scratch.packed_lats,
+                    );
+                    protohoggr::encode_bytes_field(
+                        &mut scratch.reframed_way,
+                        10,
+                        &scratch.packed_lons,
+                    );
                 }
 
                 protohoggr::encode_bytes_field(&mut scratch.group_out, 3, &scratch.reframed_way);
@@ -1157,18 +1323,24 @@ fn reframe_way_blob_with_locations(
             } else {
                 // Non-way field in the group - copy verbatim.
                 let t_copy = std::time::Instant::now();
-                let raw = gr_cursor.read_raw_field(wire_type).map_err(|e| format!("reframe gskip: {e}"))?;
+                let raw = gr_cursor
+                    .read_raw_field(wire_type)
+                    .map_err(|e| format!("reframe gskip: {e}"))?;
                 protohoggr::encode_tag(&mut scratch.group_out, field, wire_type);
                 scratch.group_out.extend_from_slice(raw);
                 #[allow(clippy::cast_possible_truncation)]
-                counters.unknown_field_copy_ns.fetch_add(t_copy.elapsed().as_nanos() as u64, Relaxed);
+                counters
+                    .unknown_field_copy_ns
+                    .fetch_add(t_copy.elapsed().as_nanos() as u64, Relaxed);
             }
         }
 
         let t_group = std::time::Instant::now();
         protohoggr::encode_bytes_field(output, 2, &scratch.group_out);
         #[allow(clippy::cast_possible_truncation)]
-        counters.group_reframe_ns.fetch_add(t_group.elapsed().as_nanos() as u64, Relaxed);
+        counters
+            .group_reframe_ns
+            .fetch_add(t_group.elapsed().as_nanos() as u64, Relaxed);
     }
 
     // Append scalar fields (granularity, etc.).
@@ -1199,7 +1371,10 @@ fn reframe_way_blob_with_locations(
         let mut current = counters.max_refs_per_way.load(Relaxed);
         while blob_max_refs_per_way > current {
             match counters.max_refs_per_way.compare_exchange_weak(
-                current, blob_max_refs_per_way, Relaxed, Relaxed,
+                current,
+                blob_max_refs_per_way,
+                Relaxed,
+                Relaxed,
             ) {
                 Ok(_) => break,
                 Err(actual) => current = actual,
@@ -1214,5 +1389,11 @@ fn reframe_way_blob_with_locations(
         ));
     }
 
-    Ok((total_ways, way_slot_pos, min_way_id, max_way_id, missing_locations))
+    Ok((
+        total_ways,
+        way_slot_pos,
+        min_way_id,
+        max_way_id,
+        missing_locations,
+    ))
 }

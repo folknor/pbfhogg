@@ -120,7 +120,10 @@ impl WriterMetrics {
 
         emit!("writer_uring_submit_calls", uring_submit_calls);
         emit!("writer_uring_submit_ns", uring_submit_ns);
-        emit!("writer_uring_submit_and_wait_calls", uring_submit_and_wait_calls);
+        emit!(
+            "writer_uring_submit_and_wait_calls",
+            uring_submit_and_wait_calls
+        );
         emit!("writer_uring_submit_and_wait_ns", uring_submit_and_wait_ns);
         emit!("writer_uring_cq_wait_ns", uring_cq_wait_ns);
     }

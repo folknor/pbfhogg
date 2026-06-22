@@ -51,7 +51,7 @@ pub(crate) fn extract_node_tuples(
     out: &mut Vec<NodeTuple>,
     group_starts: &mut Vec<(usize, usize)>,
 ) -> Result<()> {
-    use crate::read::wire::{Cursor, WireDenseNodes, PackedSint64Iter, WIRE_LEN, WIRE_VARINT};
+    use crate::read::wire::{Cursor, PackedSint64Iter, WIRE_LEN, WIRE_VARINT, WireDenseNodes};
 
     let buffer = decompressed;
     let mut cursor = Cursor::new(buffer);
@@ -62,16 +62,26 @@ pub(crate) fn extract_node_tuples(
 
     while let Some((field, wire_type)) = cursor.read_tag()? {
         match (field, wire_type) {
-            (1, WIRE_LEN) => { cursor.skip_field(wire_type)?; }
+            (1, WIRE_LEN) => {
+                cursor.skip_field(wire_type)?;
+            }
             (2, WIRE_LEN) => {
                 let data = cursor.read_len_delimited()?;
                 let offset = data.as_ptr() as usize - buffer.as_ptr() as usize;
                 group_starts.push((offset, data.len()));
             }
-            (17, WIRE_VARINT) => { granularity = cursor.read_varint()? as i64; }
-            (19, WIRE_VARINT) => { lat_offset = cursor.read_varint_i64()?; }
-            (20, WIRE_VARINT) => { lon_offset = cursor.read_varint_i64()?; }
-            _ => { cursor.skip_field(wire_type)?; }
+            (17, WIRE_VARINT) => {
+                granularity = cursor.read_varint()? as i64;
+            }
+            (19, WIRE_VARINT) => {
+                lat_offset = cursor.read_varint_i64()?;
+            }
+            (20, WIRE_VARINT) => {
+                lon_offset = cursor.read_varint_i64()?;
+            }
+            _ => {
+                cursor.skip_field(wire_type)?;
+            }
         }
     }
 
@@ -96,7 +106,9 @@ pub(crate) fn extract_node_tuples(
                     dense_data = Some(gcursor.read_len_delimited()?);
                     break;
                 }
-                _ => { gcursor.skip_field(wire_type)?; }
+                _ => {
+                    gcursor.skip_field(wire_type)?;
+                }
             }
         }
 

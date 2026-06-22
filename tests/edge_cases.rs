@@ -11,9 +11,7 @@
 
 mod common;
 
-use common::{
-    read_normalized, write_test_pbf_sorted, TestMember, TestNode, TestRelation, TestWay,
-};
+use common::{TestMember, TestNode, TestRelation, TestWay, read_normalized, write_test_pbf_sorted};
 use pbfhogg::block_builder;
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobReader, BlobType, ElementReader, MemberId};
@@ -121,9 +119,16 @@ fn zero_ref_way_roundtrips() {
     let c = read_normalized(&path);
     assert_eq!(c.ways.len(), 1);
     assert_eq!(c.ways[0].id, 10);
-    assert_eq!(c.ways[0].refs.len(), 0, "zero-ref way must round-trip with empty refs");
+    assert_eq!(
+        c.ways[0].refs.len(),
+        0,
+        "zero-ref way must round-trip with empty refs"
+    );
     // Tag must still be present.
-    assert_eq!(c.ways[0].tags.get("note").map(String::as_str), Some("empty"));
+    assert_eq!(
+        c.ways[0].tags.get("note").map(String::as_str),
+        Some("empty")
+    );
 }
 
 #[test]
@@ -157,7 +162,10 @@ fn zero_member_relation_roundtrips() {
         0,
         "zero-member relation must round-trip with empty members"
     );
-    assert_eq!(c.relations[0].tags.get("type").map(String::as_str), Some("empty"));
+    assert_eq!(
+        c.relations[0].tags.get("type").map(String::as_str),
+        Some("empty")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +226,10 @@ fn empty_string_tag_key_behaviour() {
     // dropped as invalid) - don't silently corrupt ids/other tags.
     let c = read_normalized(&path);
     assert_eq!(c.nodes.len(), 1);
-    assert_eq!(c.nodes[0].id, 1, "node id must be preserved whatever the tag fate");
+    assert_eq!(
+        c.nodes[0].id, 1,
+        "node id must be preserved whatever the tag fate"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -243,13 +254,19 @@ fn relation_referencing_relation_roundtrips() {
         &[
             TestRelation {
                 id: 100,
-                members: vec![TestMember { id: MemberId::Node(1), role: "pin" }],
+                members: vec![TestMember {
+                    id: MemberId::Node(1),
+                    role: "pin",
+                }],
                 tags: vec![("type", "leaf")],
                 meta: None,
             },
             TestRelation {
                 id: 200,
-                members: vec![TestMember { id: MemberId::Relation(100), role: "child" }],
+                members: vec![TestMember {
+                    id: MemberId::Relation(100),
+                    role: "child",
+                }],
                 tags: vec![("type", "super")],
                 meta: None,
             },
@@ -258,7 +275,11 @@ fn relation_referencing_relation_roundtrips() {
 
     let c = read_normalized(&path);
     assert_eq!(c.relations.len(), 2);
-    let super_rel = c.relations.iter().find(|r| r.id == 200).expect("super relation");
+    let super_rel = c
+        .relations
+        .iter()
+        .find(|r| r.id == 200)
+        .expect("super relation");
     assert_eq!(super_rel.members.len(), 1);
     assert_eq!(super_rel.members[0].member_type, "relation");
     assert_eq!(super_rel.members[0].ref_id, 100);
@@ -325,5 +346,8 @@ fn block_builder_capacity_boundary() {
             data_blobs += 1;
         }
     }
-    assert_eq!(data_blobs, 2, "expected 2 data blobs for 8001 nodes at cap 8000");
+    assert_eq!(
+        data_blobs, 2,
+        "expected 2 data blobs for 8001 nodes at cap 8000"
+    );
 }

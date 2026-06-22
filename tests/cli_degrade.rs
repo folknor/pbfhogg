@@ -17,8 +17,8 @@ use std::path::Path;
 
 use common::cli::CliInvoker;
 use common::{
-    assert_indexed, assert_non_indexed, generate_nodes, generate_relations, generate_ways,
-    read_header, read_normalized, write_multi_block_test_pbf, TestNode, TestRelation, TestWay,
+    TestNode, TestRelation, TestWay, assert_indexed, assert_non_indexed, generate_nodes,
+    generate_relations, generate_ways, read_header, read_normalized, write_multi_block_test_pbf,
 };
 use pbfhogg::{BlobDecode, BlobReader, Element};
 

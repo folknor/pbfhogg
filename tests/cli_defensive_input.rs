@@ -27,10 +27,10 @@ use common::adversarial::{
     set_relation_memids_terminator_continuation,
 };
 use common::cli::CliInvoker;
-use common::{write_test_pbf, TestMember, TestNode, TestRelation, TestWay};
+use common::{TestMember, TestNode, TestRelation, TestWay, write_test_pbf};
+use pbfhogg::MemberId;
 use pbfhogg::block_builder::{self, BlockBuilder};
 use pbfhogg::writer::{Compression, PbfWriter};
-use pbfhogg::MemberId;
 use tempfile::TempDir;
 
 const LAT: i32 = 550_000_000;
@@ -238,7 +238,9 @@ fn write_three_kind_fixture(path: &Path) {
         bb.add_relation(r.id, r.tags.iter().map(|(k, v)| (*k, *v)), &members, None);
     }
     let bytes = bb.take().expect("take").expect("non-empty");
-    writer.write_primitive_block(bytes).expect("write relations");
+    writer
+        .write_primitive_block(bytes)
+        .expect("write relations");
     writer.flush().expect("flush");
 }
 

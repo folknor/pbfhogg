@@ -148,11 +148,7 @@ struct Shard {
 /// negative IDs ever enter production, this planner and every
 /// `id > t_high`/`id <= t_low` clip in `emit_side` must be
 /// rewritten against `osm_id_cmp`.
-fn plan_shards(
-    old_descs: &[BlobDesc],
-    new_descs: &[BlobDesc],
-    target_count: usize,
-) -> Vec<Shard> {
+fn plan_shards(old_descs: &[BlobDesc], new_descs: &[BlobDesc], target_count: usize) -> Vec<Shard> {
     // Positive-only input invariant (DEVIATIONS.md > renumber: negative
     // input IDs rejected). Threshold comparisons in this planner and in
     // the shard hot path are raw i64 compares rather than `osm_id_cmp`;
@@ -197,12 +193,7 @@ fn plan_shards(
     shards
 }
 
-fn build_shard(
-    old_descs: &[BlobDesc],
-    new_descs: &[BlobDesc],
-    t_low: i64,
-    t_high: i64,
-) -> Shard {
+fn build_shard(old_descs: &[BlobDesc], new_descs: &[BlobDesc], t_low: i64, t_high: i64) -> Shard {
     let old_start = old_descs
         .iter()
         .position(|b| b.index.max_id > t_low)
@@ -496,8 +487,12 @@ fn element_merge(
     }
 
     loop {
-        let old_in_range = old_iter.peek().is_some_and(|e| element_id(e) <= merge_up_to);
-        let new_in_range = new_iter.peek().is_some_and(|e| element_id(e) <= merge_up_to);
+        let old_in_range = old_iter
+            .peek()
+            .is_some_and(|e| element_id(e) <= merge_up_to);
+        let new_in_range = new_iter
+            .peek()
+            .is_some_and(|e| element_id(e) <= merge_up_to);
 
         match (old_in_range, new_in_range) {
             (false, false) => break,
@@ -536,13 +531,7 @@ fn element_merge(
                         new_consumed += 1;
                         if borrowed_elements_equal(&o, &n) {
                             if !options.suppress_common {
-                                emit_element(
-                                    out,
-                                    ' ',
-                                    type_char,
-                                    o_id,
-                                    element_version(&o),
-                                )?;
+                                emit_element(out, ' ', type_char, o_id, element_version(&o))?;
                             }
                             stats.common += 1;
                         } else {
@@ -573,12 +562,8 @@ fn borrowed_elements_equal(a: &Element<'_>, b: &Element<'_>) -> bool {
         (Element::DenseNode(_) | Element::Node(_), Element::DenseNode(_) | Element::Node(_)) => {
             borrowed_nodes_equal(a, b)
         }
-        (Element::Way(wa), Element::Way(wb)) => {
-            wa.refs().eq(wb.refs()) && wa.tags().eq(wb.tags())
-        }
-        (Element::Relation(ra), Element::Relation(rb)) => {
-            borrowed_relations_equal(ra, rb)
-        }
+        (Element::Way(wa), Element::Way(wb)) => wa.refs().eq(wb.refs()) && wa.tags().eq(wb.tags()),
+        (Element::Relation(ra), Element::Relation(rb)) => borrowed_relations_equal(ra, rb),
         _ => false,
     }
 }
@@ -819,7 +804,11 @@ pub(crate) fn diff_block_pair_parallel(
             // Also sweep any files a panicked shard created before crashing;
             // the `ShardOutput` for such shards is absent from `outputs`.
             for shard_idx in 0..shards.len() {
-                drop(std::fs::remove_file(shard_text_path(scratch_dir, kind, shard_idx)));
+                drop(std::fs::remove_file(shard_text_path(
+                    scratch_dir,
+                    kind,
+                    shard_idx,
+                )));
             }
             return Err(e);
         }

@@ -6,8 +6,8 @@ use crate::block_builder::{BlockBuilder, MemberData, Metadata, OwnedBlock, RawMe
 use crate::file_writer::FileWriter;
 use crate::writer::PbfWriter;
 
-pub(crate) use crate::osc::write::OwnedMember;
 use crate::BoxResult;
+pub(crate) use crate::osc::write::OwnedMember;
 
 // ---------------------------------------------------------------------------
 // Element type filter (node | way | relation), used by tag_expr matchers and
@@ -25,7 +25,11 @@ pub(crate) struct TypeFilter {
 impl TypeFilter {
     /// All types included.
     pub(crate) fn all() -> Self {
-        Self { nodes: true, ways: true, relations: true }
+        Self {
+            nodes: true,
+            ways: true,
+            relations: true,
+        }
     }
 
     /// Parse a comma-separated type list (e.g. "node,way,relation").
@@ -41,14 +45,29 @@ impl TypeFilter {
     pub(crate) fn from_single(s: Option<&str>) -> Self {
         match s {
             None => Self::all(),
-            Some("node") => Self { nodes: true, ways: false, relations: false },
-            Some("way") => Self { nodes: false, ways: true, relations: false },
-            Some("relation") => Self { nodes: false, ways: false, relations: true },
-            Some(_) => Self { nodes: false, ways: false, relations: false },
+            Some("node") => Self {
+                nodes: true,
+                ways: false,
+                relations: false,
+            },
+            Some("way") => Self {
+                nodes: false,
+                ways: true,
+                relations: false,
+            },
+            Some("relation") => Self {
+                nodes: false,
+                ways: false,
+                relations: true,
+            },
+            Some(_) => Self {
+                nodes: false,
+                ways: false,
+                relations: false,
+            },
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Owned element types - Vec fields are kept (not Box<[T]>) because these are
@@ -103,11 +122,15 @@ fn version_of(meta: &Option<OwnedMetadata>) -> i32 {
 }
 
 impl PartialEq for OwnedNode {
-    fn eq(&self, other: &Self) -> bool { self.id == other.id && version_of(&self.metadata) == version_of(&other.metadata) }
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && version_of(&self.metadata) == version_of(&other.metadata)
+    }
 }
 impl Eq for OwnedNode {}
 impl PartialOrd for OwnedNode {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 impl Ord for OwnedNode {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -117,11 +140,15 @@ impl Ord for OwnedNode {
 }
 
 impl PartialEq for OwnedWay {
-    fn eq(&self, other: &Self) -> bool { self.id == other.id && version_of(&self.metadata) == version_of(&other.metadata) }
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && version_of(&self.metadata) == version_of(&other.metadata)
+    }
 }
 impl Eq for OwnedWay {}
 impl PartialOrd for OwnedWay {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 impl Ord for OwnedWay {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -131,11 +158,15 @@ impl Ord for OwnedWay {
 }
 
 impl PartialEq for OwnedRelation {
-    fn eq(&self, other: &Self) -> bool { self.id == other.id && version_of(&self.metadata) == version_of(&other.metadata) }
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && version_of(&self.metadata) == version_of(&other.metadata)
+    }
 }
 impl Eq for OwnedRelation {}
 impl PartialOrd for OwnedRelation {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 impl Ord for OwnedRelation {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -159,7 +190,6 @@ impl OwnedMetadata {
             visible: self.visible,
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -285,7 +315,11 @@ pub(crate) fn read_dense_node(dn: &crate::DenseNode<'_>) -> OwnedNode {
             Some(OwnedMetadata {
                 version: info.version(),
                 timestamp: info.milli_timestamp() / 1000,
-                changeset: if info.changeset() == -1 { 0 } else { info.changeset() },
+                changeset: if info.changeset() == -1 {
+                    0
+                } else {
+                    info.changeset()
+                },
                 uid: info.uid(),
                 user: info.user().ok()?.to_owned(),
                 visible: info.visible(),
@@ -385,7 +419,9 @@ pub(crate) fn write_single_node(
     crate::commands::ensure_node_capacity(bb, writer)?;
     let meta = owned_to_metadata(node.metadata.as_ref());
     bb.add_node(
-        node.id, node.decimicro_lat, node.decimicro_lon,
+        node.id,
+        node.decimicro_lat,
+        node.decimicro_lon,
         node.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
         meta.as_ref(),
     );
@@ -417,7 +453,10 @@ pub(crate) fn write_single_relation(
     let members: Vec<MemberData<'_>> = rel
         .members
         .iter()
-        .map(|m| MemberData { id: m.id, role: &m.role })
+        .map(|m| MemberData {
+            id: m.id,
+            role: &m.role,
+        })
         .collect();
     let meta = owned_to_metadata(rel.metadata.as_ref());
     bb.add_relation(
@@ -442,7 +481,9 @@ pub(crate) fn write_single_node_local(
     crate::commands::ensure_node_capacity_local(bb, output)?;
     let meta = owned_to_metadata(node.metadata.as_ref());
     bb.add_node(
-        node.id, node.decimicro_lat, node.decimicro_lon,
+        node.id,
+        node.decimicro_lat,
+        node.decimicro_lon,
         node.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
         meta.as_ref(),
     );
@@ -474,7 +515,10 @@ pub(crate) fn write_single_relation_local(
     let members: Vec<MemberData<'_>> = rel
         .members
         .iter()
-        .map(|m| MemberData { id: m.id, role: &m.role })
+        .map(|m| MemberData {
+            id: m.id,
+            role: &m.role,
+        })
         .collect();
     let meta = owned_to_metadata(rel.metadata.as_ref());
     bb.add_relation(

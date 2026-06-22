@@ -40,9 +40,7 @@ mod parallel_writer {
     use pbfhogg::writer::Compression;
     use tempfile::TempDir;
 
-    use crate::common::{
-        self, generate_nodes, write_multi_block_test_pbf,
-    };
+    use crate::common::{self, generate_nodes, write_multi_block_test_pbf};
 
     fn write_osc(path: &Path, xml: &str) {
         let file = File::create(path).expect("create osc file");

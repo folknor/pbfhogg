@@ -14,26 +14,26 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
+use crate::Element;
 use crate::blob::{
-    decode_blob_to_headerblock, decode_blob_to_primitiveblock, decompress_blob_data_into,
-    parse_blob_header_with_index, BlobKind,
+    BlobKind, decode_blob_to_headerblock, decode_blob_to_primitiveblock, decompress_blob_data_into,
+    parse_blob_header_with_index,
 };
 use crate::blob_meta::{BlobIndex, ElemKind, scan_block_ids};
 use crate::block_builder::BlockBuilder;
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
-use crate::writer::{reframe_raw_with_index, Compression, PbfWriter};
-use crate::Element;
+use crate::writer::{Compression, PbfWriter, reframe_raw_with_index};
 
-use crate::owned::{
-    read_dense_node, read_node, read_relation, read_way, write_single_node, write_single_relation,
-    write_single_way, OwnedNode, OwnedRelation, OwnedWay,
-};
-use crate::commands::{
-    build_output_header, flush_block, require_indexdata, require_sorted, writer_from_header_bytes,
-    HeaderOverrides,
-};
 use crate::BoxResult as Result;
+use crate::commands::{
+    HeaderOverrides, build_output_header, flush_block, require_indexdata, require_sorted,
+    writer_from_header_bytes,
+};
+use crate::owned::{
+    OwnedNode, OwnedRelation, OwnedWay, read_dense_node, read_node, read_relation, read_way,
+    write_single_node, write_single_relation, write_single_way,
+};
 
 /// Statistics from a multi-PBF merge operation.
 pub struct MergePbfStats {
@@ -83,7 +83,6 @@ struct BlobEntry {
     tagdata: Option<Box<[u8]>>,
     file_index: usize,
 }
-
 
 trait HasId {
     fn id(&self) -> i64;
@@ -188,10 +187,7 @@ pub fn merge_pbf(
     )?;
 
     // Open all input files for random access
-    let mut files: Vec<File> = inputs
-        .iter()
-        .map(File::open)
-        .collect::<io::Result<_>>()?;
+    let mut files: Vec<File> = inputs.iter().map(File::open).collect::<io::Result<_>>()?;
 
     let mut stats = MergePbfStats {
         nodes: 0,
@@ -338,7 +334,10 @@ fn build_blob_index(
     }
 
     let header = header.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "no OSMHeader blob found in any input file")
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "no OSMHeader blob found in any input file",
+        )
     })?;
 
     Ok((header, entries))
@@ -443,7 +442,11 @@ fn write_overlap_run(
     let kind = entries[0].index.kind;
     match kind {
         ElemKind::Node => {
-            let (c, d) = sweep_merge_dedup(entries, files, bb, writer,
+            let (c, d) = sweep_merge_dedup(
+                entries,
+                files,
+                bb,
+                writer,
                 |e, heap| match e {
                     Element::DenseNode(dn) => heap.push(Reverse(read_dense_node(dn))),
                     Element::Node(n) => heap.push(Reverse(read_node(n))),
@@ -455,16 +458,32 @@ fn write_overlap_run(
             stats.duplicates_removed += d;
         }
         ElemKind::Way => {
-            let (c, d) = sweep_merge_dedup(entries, files, bb, writer,
-                |e, heap| { if let Element::Way(w) = e { heap.push(Reverse(read_way(w))); } },
+            let (c, d) = sweep_merge_dedup(
+                entries,
+                files,
+                bb,
+                writer,
+                |e, heap| {
+                    if let Element::Way(w) = e {
+                        heap.push(Reverse(read_way(w)));
+                    }
+                },
                 write_single_way,
             )?;
             stats.ways += c;
             stats.duplicates_removed += d;
         }
         ElemKind::Relation => {
-            let (c, d) = sweep_merge_dedup(entries, files, bb, writer,
-                |e, heap| { if let Element::Relation(r) = e { heap.push(Reverse(read_relation(r))); } },
+            let (c, d) = sweep_merge_dedup(
+                entries,
+                files,
+                bb,
+                writer,
+                |e, heap| {
+                    if let Element::Relation(r) = e {
+                        heap.push(Reverse(read_relation(r)));
+                    }
+                },
                 write_single_relation,
             )?;
             stats.relations += c;
@@ -497,11 +516,16 @@ fn sweep_merge_dedup<T: Ord + HasId>(
     let mut deduped: u64 = 0;
 
     for entry in entries {
-        flush_heap_below_dedup(&mut heap, crate::osm_id::blob_osm_first_id(entry.index.min_id, entry.index.max_id), &mut deduped, |elem| {
-            write_elem(&elem, bb, writer)?;
-            count += 1;
-            Ok(())
-        })?;
+        flush_heap_below_dedup(
+            &mut heap,
+            crate::osm_id::blob_osm_first_id(entry.index.min_id, entry.index.max_id),
+            &mut deduped,
+            |elem| {
+                write_elem(&elem, bb, writer)?;
+                count += 1;
+                Ok(())
+            },
+        )?;
 
         read_frame_into(&mut files[entry.file_index], entry, &mut frame_buf)?;
         let blob_bytes = extract_blob_bytes(&frame_buf)?;
@@ -556,4 +580,3 @@ fn flush_heap_below_dedup<T: Ord + HasId>(
     }
     Ok(())
 }
-

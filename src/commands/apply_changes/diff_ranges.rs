@@ -118,11 +118,19 @@ pub(super) struct UpsertCursors {
 
 impl UpsertCursors {
     pub(super) fn new() -> Self {
-        Self { node: 0, way: 0, rel: 0 }
+        Self {
+            node: 0,
+            way: 0,
+            rel: 0,
+        }
     }
 
     /// Mutable cursor + upsert slice for the given element kind.
-    pub(super) fn get_mut<'a>(&mut self, kind: ElemKind, ranges: &'a DiffRanges) -> (&mut usize, &'a [i64]) {
+    pub(super) fn get_mut<'a>(
+        &mut self,
+        kind: ElemKind,
+        ranges: &'a DiffRanges,
+    ) -> (&mut usize, &'a [i64]) {
         match kind {
             ElemKind::Node => (&mut self.node, ranges.upserts(ElemKind::Node)),
             ElemKind::Way => (&mut self.way, ranges.upserts(ElemKind::Way)),

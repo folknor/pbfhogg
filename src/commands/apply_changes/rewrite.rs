@@ -7,13 +7,13 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 use rustc_hash::FxHashMap;
 
-use crate::blob::{decode_blob_to_headerblock, BlobKind};
+use crate::blob::{BlobKind, decode_blob_to_headerblock};
 use crate::file_reader::FileReader;
 use crate::osc::parse_osc_file;
 use crate::writer::Compression;
 
 use crate::commands::{
-    build_output_header, require_indexdata, writer_from_header_bytes_parallel, HeaderOverrides,
+    HeaderOverrides, build_output_header, require_indexdata, writer_from_header_bytes_parallel,
 };
 use crate::read::raw_frame::read_raw_frame;
 
@@ -25,9 +25,7 @@ use super::drain::{
 use super::node_locations::NodeLocationIndex;
 use super::scanner::{self, ScannerChannels, ScannerConfig};
 use super::stats::MergeStats;
-use super::streaming::{
-    self, CoordSlots, StreamingChannels, StreamingConfig, WorkerCounters,
-};
+use super::streaming::{self, CoordSlots, StreamingChannels, StreamingConfig, WorkerCounters};
 
 use super::Result;
 
@@ -180,7 +178,11 @@ fn read_header(
 ///
 /// Returns an error if the base PBF or OSC file cannot be read, the
 /// output file cannot be written, or any PBF parsing/encoding fails.
-#[allow(clippy::too_many_lines, clippy::cognitive_complexity, clippy::cast_precision_loss)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::cognitive_complexity,
+    clippy::cast_precision_loss
+)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn merge(
     base_pbf: &Path,
@@ -233,18 +235,32 @@ pub fn merge(
     let diff = Arc::new(parse_osc_file(osc_file)?);
     eprintln!(
         "Diff: {} nodes, {} ways, {} relations ({} del nodes, {} del ways, {} del rels)",
-        diff.node_count(), diff.way_count(), diff.relation_count(),
-        diff.deleted_nodes.len(), diff.deleted_ways.len(), diff.deleted_relations.len(),
+        diff.node_count(),
+        diff.way_count(),
+        diff.relation_count(),
+        diff.deleted_nodes.len(),
+        diff.deleted_ways.len(),
+        diff.deleted_relations.len(),
     );
     let diff_heap_bytes = diff.heap_size_estimate() as u64;
-    let osc_parse_ms = osc_start.elapsed().as_millis().try_into().unwrap_or(i64::MAX);
+    let osc_parse_ms = osc_start
+        .elapsed()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX);
 
     let diffranges_start = std::time::Instant::now();
     let ranges = Arc::new(DiffRanges::from_diff(&diff));
-    let diffranges_ms = diffranges_start.elapsed().as_millis().try_into().unwrap_or(i64::MAX);
+    let diffranges_ms = diffranges_start
+        .elapsed()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX);
     eprintln!(
         "Diff ID ranges: {} node IDs, {} way IDs, {} rel IDs",
-        ranges.node_ids.len(), ranges.way_ids.len(), ranges.rel_ids.len(),
+        ranges.node_ids.len(),
+        ranges.way_ids.len(),
+        ranges.rel_ids.len(),
     );
 
     // --locations-on-ways setup. The descriptor-first pipeline fuses
@@ -263,11 +279,7 @@ pub fn merge(
         (
             Some(idx.locations),
             Some(Arc::new(idx.needed_set)),
-            (
-                total_needed as u64,
-                seeded as u64,
-                still_needed as u64,
-            ),
+            (total_needed as u64, seeded as u64, still_needed as u64),
         )
     } else {
         (None, None, (0, 0, 0))
@@ -275,7 +287,11 @@ pub fn merge(
 
     let header_start = std::time::Instant::now();
     let header_bytes = read_header(base_pbf, direct_io, locations_on_ways, overrides)?;
-    let header_read_ms = header_start.elapsed().as_millis().try_into().unwrap_or(i64::MAX);
+    let header_read_ms = header_start
+        .elapsed()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX);
 
     let writer_setup_start = std::time::Instant::now();
     let mut writer = writer_from_header_bytes_parallel(
@@ -285,7 +301,11 @@ pub fn merge(
         direct_io,
         io_uring,
     )?;
-    let writer_setup_ms = writer_setup_start.elapsed().as_millis().try_into().unwrap_or(i64::MAX);
+    let writer_setup_ms = writer_setup_start
+        .elapsed()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX);
 
     // copy_file_range fd setup. Mirrors the legacy path so direct-io
     // and io_uring routing remain correct.
@@ -314,8 +334,7 @@ pub fn merge(
     // it's strictly slower than 2+ workers on every host).
     let worker_count = match jobs {
         Some(1) => {
-            return Err(
-                "apply-changes requires at least 2 worker threads \
+            return Err("apply-changes requires at least 2 worker threads \
                  (`--jobs N` with N >= 2, or omit `--jobs` for the \
                  default). A single worker has a deadlock hazard on \
                  mid-stream worker panic (scanner blocks on a full \
@@ -323,8 +342,7 @@ pub fn merge(
                  Single-threaded operation has no production use \
                  case here - 2 workers is strictly faster on every \
                  host."
-                    .into(),
-            );
+                .into());
         }
         Some(n) if n > 1 => n,
         _ => std::thread::available_parallelism()
@@ -343,17 +361,21 @@ pub fn merge(
     // and the drain thread deadlocks waiting for a sender that will
     // never drop until merge() returns - which only happens after the
     // drain joins.
-    let drain_tx_for_scanner = if use_copy_range { Some(drain_tx.clone()) } else { None };
+    let drain_tx_for_scanner = if use_copy_range {
+        Some(drain_tx.clone())
+    } else {
+        None
+    };
 
     // --locations-on-ways barrier wiring.
-    let (barrier_tx_opt, barrier_rx_opt, last_node_tx_opt, last_node_rx_opt) =
-        if locations_on_ways {
-            let (b_tx, b_rx) = mpsc::sync_channel::<()>(1);
-            let (n_tx, n_rx) = mpsc::sync_channel::<u64>(1);
-            (Some(b_tx), Some(b_rx), Some(n_tx), Some(n_rx))
-        } else {
-            (None, None, None, None)
-        };
+    let (barrier_tx_opt, barrier_rx_opt, last_node_tx_opt, last_node_rx_opt) = if locations_on_ways
+    {
+        let (b_tx, b_rx) = mpsc::sync_channel::<()>(1);
+        let (n_tx, n_rx) = mpsc::sync_channel::<u64>(1);
+        (Some(b_tx), Some(b_rx), Some(n_tx), Some(n_rx))
+    } else {
+        (None, None, None, None)
+    };
 
     let coord_slots: Option<CoordSlots> = if locations_on_ways {
         Some(
@@ -392,7 +414,9 @@ pub fn merge(
         diff: Arc::clone(&diff),
         worker_count,
         locations_on_ways,
-        coord_slots: coord_slots.as_ref().map(|s| s.iter().map(Arc::clone).collect()),
+        coord_slots: coord_slots
+            .as_ref()
+            .map(|s| s.iter().map(Arc::clone).collect()),
         loc_map_handle: loc_map_handle.as_ref().map(Arc::clone),
         needed_set: needed_set.as_ref().map(Arc::clone),
         compression,
@@ -461,7 +485,11 @@ pub fn merge(
         Ok(drain_stats)
     })?;
 
-    let pipeline_ms = pipeline_start.elapsed().as_millis().try_into().unwrap_or(i64::MAX);
+    let pipeline_ms = pipeline_start
+        .elapsed()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX);
     crate::debug::emit_marker("MERGE_LOOP_END");
 
     let mut final_stats = stats;
@@ -492,7 +520,10 @@ pub fn merge(
 
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     {
-        crate::debug::emit_counter("merge_blobs_passthrough", final_stats.blobs_passthrough as i64);
+        crate::debug::emit_counter(
+            "merge_blobs_passthrough",
+            final_stats.blobs_passthrough as i64,
+        );
         crate::debug::emit_counter("merge_blobs_rewritten", final_stats.blobs_rewritten as i64);
         crate::debug::emit_counter("merge_blobs_index_hit", final_stats.blobs_index_hit as i64);
         crate::debug::emit_counter("merge_total_elements", final_stats.total_elements() as i64);
@@ -500,13 +531,22 @@ pub fn merge(
         crate::debug::emit_counter("merge_diff_nodes", final_stats.diff_nodes as i64);
         crate::debug::emit_counter("merge_diff_ways", final_stats.diff_ways as i64);
         crate::debug::emit_counter("merge_diff_relations", final_stats.diff_relations as i64);
-        crate::debug::emit_counter("merge_bytes_passthrough", final_stats.bytes_passthrough as i64);
+        crate::debug::emit_counter(
+            "merge_bytes_passthrough",
+            final_stats.bytes_passthrough as i64,
+        );
         crate::debug::emit_counter("merge_bytes_rewritten", final_stats.bytes_rewritten as i64);
         crate::debug::emit_counter("merge_diff_heap_bytes", final_stats.diff_heap_bytes as i64);
         if locations_on_ways {
             crate::debug::emit_counter("merge_loc_needed", final_stats.loc_nodes_needed as i64);
-            crate::debug::emit_counter("merge_loc_from_diff", final_stats.loc_nodes_from_diff as i64);
-            crate::debug::emit_counter("merge_loc_from_base", final_stats.loc_nodes_from_base as i64);
+            crate::debug::emit_counter(
+                "merge_loc_from_diff",
+                final_stats.loc_nodes_from_diff as i64,
+            );
+            crate::debug::emit_counter(
+                "merge_loc_from_base",
+                final_stats.loc_nodes_from_base as i64,
+            );
             crate::debug::emit_counter("merge_loc_missing", final_stats.loc_missing as i64);
             crate::debug::emit_counter(
                 "merge_loc_node_blobs_scanned",

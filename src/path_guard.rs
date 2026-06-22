@@ -53,7 +53,6 @@ impl PathGuard {
             .take()
             .expect("PathGuard::commit called after path released")
     }
-
 }
 
 impl Drop for PathGuard {
@@ -105,10 +104,8 @@ mod tests {
 
     #[test]
     fn dir_drop_removes_recursively() {
-        let tmp = std::env::temp_dir().join(format!(
-            "pbfhogg-path-guard-dir-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("pbfhogg-path-guard-dir-{}", std::process::id()));
         fs::create_dir_all(&tmp).expect("create test dir");
         fs::write(tmp.join("inside.txt"), b"x").expect("write test file");
         {

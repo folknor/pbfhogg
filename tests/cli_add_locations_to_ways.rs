@@ -25,8 +25,8 @@ use std::path::Path;
 
 use common::cli::{CliInvoker, CliOutput};
 use common::{
-    assert_elements_equivalent, generate_nodes, generate_ways, write_multi_block_test_pbf,
-    write_test_pbf, write_test_pbf_non_indexed, TestMember, TestNode, TestRelation, TestWay,
+    TestMember, TestNode, TestRelation, TestWay, assert_elements_equivalent, generate_nodes,
+    generate_ways, write_multi_block_test_pbf, write_test_pbf, write_test_pbf_non_indexed,
 };
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
 use pbfhogg::writer::{Compression, PbfWriter};
@@ -191,7 +191,13 @@ fn run_altw(
 
 /// Convenience: run with default index, assert success.
 fn run_altw_ok(input: &Path, output: &Path, keep_untagged_nodes: bool) -> CliOutput {
-    let out = run_altw(input, output, keep_untagged_nodes, IndexBackend::Default, false);
+    let out = run_altw(
+        input,
+        output,
+        keep_untagged_nodes,
+        IndexBackend::Default,
+        false,
+    );
     assert!(
         out.status.success(),
         "add-locations-to-ways failed; stderr:\n{}",
@@ -391,7 +397,10 @@ fn relations_preserved() {
 
     let relations = vec![TestRelation {
         id: 100,
-        members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+        members: vec![TestMember {
+            id: MemberId::Way(10),
+            role: "outer",
+        }],
         tags: vec![("type", "multipolygon")],
         meta: None,
     }];
@@ -446,7 +455,10 @@ fn passthrough_relations_preserved() {
 
     let relations = vec![TestRelation {
         id: 100,
-        members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+        members: vec![TestMember {
+            id: MemberId::Way(10),
+            role: "outer",
+        }],
         tags: vec![("type", "multipolygon")],
         meta: None,
     }];
@@ -509,8 +521,20 @@ fn drop_untagged_keeps_relation_member_nodes() {
     let output = dir.path().join("output.osm.pbf");
 
     let nodes = vec![
-        TestNode { id: 1, lat: 550_000_000, lon: 120_000_000, tags: vec![("name", "tagged")], meta: None },
-        TestNode { id: 2, lat: 551_000_000, lon: 121_000_000, tags: vec![], meta: None },
+        TestNode {
+            id: 1,
+            lat: 550_000_000,
+            lon: 120_000_000,
+            tags: vec![("name", "tagged")],
+            meta: None,
+        },
+        TestNode {
+            id: 2,
+            lat: 551_000_000,
+            lon: 121_000_000,
+            tags: vec![],
+            meta: None,
+        },
     ];
     let ways = vec![TestWay {
         id: 10,
@@ -520,7 +544,10 @@ fn drop_untagged_keeps_relation_member_nodes() {
     }];
     let relations = vec![TestRelation {
         id: 100,
-        members: vec![TestMember { id: MemberId::Node(2), role: "label" }],
+        members: vec![TestMember {
+            id: MemberId::Node(2),
+            role: "label",
+        }],
         tags: vec![("type", "site")],
         meta: None,
     }];
@@ -530,7 +557,10 @@ fn drop_untagged_keeps_relation_member_nodes() {
 
     let ids = read_node_ids(&output);
     assert!(ids.contains(&1));
-    assert!(ids.contains(&2), "untagged relation-member node was dropped");
+    assert!(
+        ids.contains(&2),
+        "untagged relation-member node was dropped"
+    );
 }
 
 #[test]
@@ -540,8 +570,20 @@ fn passthrough_drop_untagged_keeps_relation_member_nodes() {
     let output = dir.path().join("output.osm.pbf");
 
     let nodes = vec![
-        TestNode { id: 1, lat: 550_000_000, lon: 120_000_000, tags: vec![("name", "tagged")], meta: None },
-        TestNode { id: 2, lat: 551_000_000, lon: 121_000_000, tags: vec![], meta: None },
+        TestNode {
+            id: 1,
+            lat: 550_000_000,
+            lon: 120_000_000,
+            tags: vec![("name", "tagged")],
+            meta: None,
+        },
+        TestNode {
+            id: 2,
+            lat: 551_000_000,
+            lon: 121_000_000,
+            tags: vec![],
+            meta: None,
+        },
     ];
     let ways = vec![TestWay {
         id: 10,
@@ -551,7 +593,10 @@ fn passthrough_drop_untagged_keeps_relation_member_nodes() {
     }];
     let relations = vec![TestRelation {
         id: 100,
-        members: vec![TestMember { id: MemberId::Node(2), role: "label" }],
+        members: vec![TestMember {
+            id: MemberId::Node(2),
+            role: "label",
+        }],
         tags: vec![("type", "site")],
         meta: None,
     }];
@@ -561,7 +606,10 @@ fn passthrough_drop_untagged_keeps_relation_member_nodes() {
 
     let ids = read_node_ids(&output);
     assert!(ids.contains(&1));
-    assert!(ids.contains(&2), "untagged relation-member node was dropped");
+    assert!(
+        ids.contains(&2),
+        "untagged relation-member node was dropped"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -660,7 +708,14 @@ fn missing_node_refs_get_zero_coordinates_sparse() {
     let ways = read_way_locations(&output);
     assert_eq!(
         ways,
-        vec![(10, vec![(550_000_000, 120_000_000), (0, 0), (552_000_000, 122_000_000)])],
+        vec![(
+            10,
+            vec![
+                (550_000_000, 120_000_000),
+                (0, 0),
+                (552_000_000, 122_000_000)
+            ]
+        )],
     );
 }
 
@@ -692,8 +747,14 @@ fn backend_parity_sparse_external_auto() {
     let relations = vec![TestRelation {
         id: 300,
         members: vec![
-            TestMember { id: MemberId::Way(1_000), role: "outer" },
-            TestMember { id: MemberId::Node(18), role: "label" },
+            TestMember {
+                id: MemberId::Way(1_000),
+                role: "outer",
+            },
+            TestMember {
+                id: MemberId::Node(18),
+                role: "label",
+            },
         ],
         tags: vec![("type", "site")],
         meta: None,
@@ -733,9 +794,27 @@ fn altw_external_rejects_force_on_non_indexed() {
     write_test_pbf_non_indexed(
         &input,
         &[
-            TestNode { id: 1, lat: 550_000_000, lon: 120_000_000, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 551_000_000, lon: 121_000_000, tags: vec![], meta: None },
-            TestNode { id: 3, lat: 552_000_000, lon: 122_000_000, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 550_000_000,
+                lon: 120_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 551_000_000,
+                lon: 121_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 552_000_000,
+                lon: 122_000_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[TestWay {
             id: 10,
@@ -941,6 +1020,13 @@ fn missing_node_refs_get_zero_coordinates_external() {
     let ways = read_way_locations(&output);
     assert_eq!(
         ways,
-        vec![(10, vec![(550_000_000, 120_000_000), (0, 0), (552_000_000, 122_000_000)])],
+        vec![(
+            10,
+            vec![
+                (550_000_000, 120_000_000),
+                (0, 0),
+                (552_000_000, 122_000_000)
+            ]
+        )],
     );
 }

@@ -73,7 +73,9 @@ impl TagIndex {
 
     /// Returns `true` if any of the given keys is present in this tag index.
     pub fn has_any_key(&self, required: &[Box<[u8]>]) -> bool {
-        required.iter().any(|rk| self.keys.binary_search(rk).is_ok())
+        required
+            .iter()
+            .any(|rk| self.keys.binary_search(rk).is_ok())
     }
 
     /// Returns `true` if any key in this tag index starts with any of the given prefixes.
@@ -359,31 +361,42 @@ mod tests {
     #[test]
     fn wants_tag_index_no_filter_passes() {
         let filter = BlobFilter::new(true, true, true);
-        let ti = TagIndex { keys: vec![b"highway"[..].into()] };
-        assert!(filter.wants_tag_index(&ti), "no filter configured → always pass");
+        let ti = TagIndex {
+            keys: vec![b"highway"[..].into()],
+        };
+        assert!(
+            filter.wants_tag_index(&ti),
+            "no filter configured → always pass"
+        );
     }
 
     #[test]
     fn wants_tag_index_key_match() {
-        let filter = BlobFilter::new(true, true, true)
-            .with_required_tag_keys(vec!["highway".to_string()]);
-        let ti = TagIndex { keys: vec![b"highway"[..].into(), b"name"[..].into()] };
+        let filter =
+            BlobFilter::new(true, true, true).with_required_tag_keys(vec!["highway".to_string()]);
+        let ti = TagIndex {
+            keys: vec![b"highway"[..].into(), b"name"[..].into()],
+        };
         assert!(filter.wants_tag_index(&ti));
     }
 
     #[test]
     fn wants_tag_index_key_no_match() {
-        let filter = BlobFilter::new(true, true, true)
-            .with_required_tag_keys(vec!["amenity".to_string()]);
-        let ti = TagIndex { keys: vec![b"highway"[..].into(), b"name"[..].into()] };
+        let filter =
+            BlobFilter::new(true, true, true).with_required_tag_keys(vec!["amenity".to_string()]);
+        let ti = TagIndex {
+            keys: vec![b"highway"[..].into(), b"name"[..].into()],
+        };
         assert!(!filter.wants_tag_index(&ti));
     }
 
     #[test]
     fn wants_tag_index_prefix_match() {
-        let filter = BlobFilter::new(true, true, true)
-            .with_required_tag_prefixes(vec!["addr:".to_string()]);
-        let ti = TagIndex { keys: vec![b"addr:street"[..].into(), b"name"[..].into()] };
+        let filter =
+            BlobFilter::new(true, true, true).with_required_tag_prefixes(vec!["addr:".to_string()]);
+        let ti = TagIndex {
+            keys: vec![b"addr:street"[..].into(), b"name"[..].into()],
+        };
         assert!(filter.wants_tag_index(&ti));
     }
 
@@ -393,8 +406,13 @@ mod tests {
         let filter = BlobFilter::new(true, true, true)
             .with_required_tag_keys(vec!["highway".to_string()])
             .with_required_tag_prefixes(vec!["addr:".to_string()]);
-        let ti = TagIndex { keys: vec![b"highway"[..].into(), b"name"[..].into()] };
-        assert!(filter.wants_tag_index(&ti), "key match should pass even if prefix doesn't");
+        let ti = TagIndex {
+            keys: vec![b"highway"[..].into(), b"name"[..].into()],
+        };
+        assert!(
+            filter.wants_tag_index(&ti),
+            "key match should pass even if prefix doesn't"
+        );
     }
 
     #[test]
@@ -403,8 +421,13 @@ mod tests {
         let filter = BlobFilter::new(true, true, true)
             .with_required_tag_keys(vec!["amenity".to_string()])
             .with_required_tag_prefixes(vec!["addr:".to_string()]);
-        let ti = TagIndex { keys: vec![b"addr:city"[..].into(), b"name"[..].into()] };
-        assert!(filter.wants_tag_index(&ti), "prefix match should pass even if key doesn't");
+        let ti = TagIndex {
+            keys: vec![b"addr:city"[..].into(), b"name"[..].into()],
+        };
+        assert!(
+            filter.wants_tag_index(&ti),
+            "prefix match should pass even if key doesn't"
+        );
     }
 
     #[test]
@@ -412,7 +435,12 @@ mod tests {
         let filter = BlobFilter::new(true, true, true)
             .with_required_tag_keys(vec!["amenity".to_string()])
             .with_required_tag_prefixes(vec!["addr:".to_string()]);
-        let ti = TagIndex { keys: vec![b"highway"[..].into(), b"name"[..].into()] };
-        assert!(!filter.wants_tag_index(&ti), "neither key nor prefix matches → reject");
+        let ti = TagIndex {
+            keys: vec![b"highway"[..].into(), b"name"[..].into()],
+        };
+        assert!(
+            !filter.wants_tag_index(&ti),
+            "neither key nor prefix matches → reject"
+        );
     }
 }

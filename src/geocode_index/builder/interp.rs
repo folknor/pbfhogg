@@ -26,7 +26,9 @@ fn parse_house_number(s: &str) -> u32 {
 pub(super) fn read_addr_point_mmap(mmap: &[u8], index: u32) -> Option<AddrPoint> {
     let offset = index as usize * ADDR_POINT_SIZE;
     let end = offset + ADDR_POINT_SIZE;
-    if end > mmap.len() { return None; }
+    if end > mmap.len() {
+        return None;
+    }
     Some(AddrPoint::from_bytes(mmap[offset..end].try_into().ok()?))
 }
 
@@ -35,7 +37,9 @@ pub(super) fn read_addr_point_mmap(mmap: &[u8], index: u32) -> Option<AddrPoint>
 pub(super) fn read_node_at(mmap: &[u8], byte_offset: u64) -> Option<(i32, i32)> {
     let off = byte_offset as usize;
     let end = off + NODE_COORD_SIZE;
-    if end > mmap.len() { return None; }
+    if end > mmap.len() {
+        return None;
+    }
     let nc = NodeCoord::from_bytes(mmap[off..end].try_into().ok()?);
     Some((nc.lat_e7, nc.lon_e7))
 }
@@ -70,7 +74,9 @@ pub(super) fn resolve_interpolation_endpoints_mmap(
     let mut resolved = 0u32;
 
     for iw in interp_ways.iter_mut() {
-        if iw.node_count < 2 { continue; }
+        if iw.node_count < 2 {
+            continue;
+        }
 
         let Some(start_coord) = read_node_at(interp_nodes_mmap, iw.node_file_offset) else {
             continue;
@@ -81,10 +87,20 @@ pub(super) fn resolve_interpolation_endpoints_mmap(
         };
 
         let start_hn = find_endpoint_house_number_mmap(
-            start_coord, iw.street_offset, addr_mmap, strings, &cell_to_addrs, street_level,
+            start_coord,
+            iw.street_offset,
+            addr_mmap,
+            strings,
+            &cell_to_addrs,
+            street_level,
         );
         let end_hn = find_endpoint_house_number_mmap(
-            end_coord, iw.street_offset, addr_mmap, strings, &cell_to_addrs, street_level,
+            end_coord,
+            iw.street_offset,
+            addr_mmap,
+            strings,
+            &cell_to_addrs,
+            street_level,
         );
 
         if let (Some(s), Some(e)) = (start_hn, end_hn) {
@@ -122,10 +138,16 @@ fn find_endpoint_house_number_mmap(
     let mut found_exact = false;
 
     let mut check_cell = |cell_id: u64| {
-        let Some(indices) = cell_to_addrs.get(&cell_id) else { return };
+        let Some(indices) = cell_to_addrs.get(&cell_id) else {
+            return;
+        };
         for &idx in indices {
-            let Some(pt) = read_addr_point_mmap(addr_mmap, idx) else { continue };
-            if pt.street_offset != street_offset { continue; }
+            let Some(pt) = read_addr_point_mmap(addr_mmap, idx) else {
+                continue;
+            };
+            if pt.street_offset != street_offset {
+                continue;
+            }
             let dlat = (pt.lat_e7 - lat_e7) as i64;
             let dlon = (pt.lon_e7 - lon_e7) as i64;
             let dist_sq = dlat * dlat + dlon * dlon;

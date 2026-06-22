@@ -15,8 +15,8 @@ use std::path::Path;
 
 use common::cli::CliInvoker;
 use common::{
-    generate_nodes, generate_relations, generate_ways, read_header, read_normalized,
-    write_multi_block_test_pbf, TestNode, TestRelation, TestWay,
+    TestNode, TestRelation, TestWay, generate_nodes, generate_relations, generate_ways,
+    read_header, read_normalized, write_multi_block_test_pbf,
 };
 use pbfhogg::{BlobDecode, BlobReader, Element};
 
@@ -148,8 +148,14 @@ fn repack_blob_count_matches_prediction() {
     let rel_blobs = per_blob.iter().filter(|(_, _, r)| *r > 0).count();
 
     assert_eq!(node_blobs, 6, "expected 6 node blobs (60 nodes / cap 10)");
-    assert_eq!(way_blobs, 2, "expected 2 way blobs (12 ways: 10 + 2 partial)");
-    assert_eq!(rel_blobs, 1, "expected 1 relation blob (3 relations partial)");
+    assert_eq!(
+        way_blobs, 2,
+        "expected 2 way blobs (12 ways: 10 + 2 partial)"
+    );
+    assert_eq!(
+        rel_blobs, 1,
+        "expected 1 relation blob (3 relations partial)"
+    );
 }
 
 /// Sort.Type_then_ID propagates from input to output. The input fixture
@@ -216,9 +222,18 @@ fn repack_grow_collapses_to_one_blob_per_kind() {
     let node_blobs = per_blob.iter().filter(|(n, _, _)| *n > 0).count();
     let way_blobs = per_blob.iter().filter(|(_, w, _)| *w > 0).count();
     let rel_blobs = per_blob.iter().filter(|(_, _, r)| *r > 0).count();
-    assert_eq!(node_blobs, 1, "expected 60 nodes to collapse to 1 blob (cap 8000)");
-    assert_eq!(way_blobs, 1, "expected 12 ways to collapse to 1 blob (cap 8000)");
-    assert_eq!(rel_blobs, 1, "expected 3 relations to collapse to 1 blob (cap 8000)");
+    assert_eq!(
+        node_blobs, 1,
+        "expected 60 nodes to collapse to 1 blob (cap 8000)"
+    );
+    assert_eq!(
+        way_blobs, 1,
+        "expected 12 ways to collapse to 1 blob (cap 8000)"
+    );
+    assert_eq!(
+        rel_blobs, 1,
+        "expected 3 relations to collapse to 1 blob (cap 8000)"
+    );
 }
 
 /// Round-trip preserves element multiset on a grow that also fires the

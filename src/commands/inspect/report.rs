@@ -5,8 +5,8 @@ use std::io::Write;
 
 use super::format::{format_number, format_number_signed, format_size, format_timestamp, yes_no};
 use super::types::{
-    anomaly_blocks, is_standard_ordering, BlockInfo, BlockKind, ExtendedStats, InspectReport,
-    LocationStats, MetadataCoverage, TypeIdRange,
+    BlockInfo, BlockKind, ExtendedStats, InspectReport, LocationStats, MetadataCoverage,
+    TypeIdRange, anomaly_blocks, is_standard_ordering,
 };
 
 impl InspectReport {
@@ -61,7 +61,11 @@ impl InspectReport {
     }
 
     fn print_header(&self) {
-        println!("File:     {} ({})", self.file_name, format_size(self.file_size));
+        println!(
+            "File:     {} ({})",
+            self.file_name,
+            format_size(self.file_size)
+        );
         if let Some(ref prog) = self.header_meta.writing_program {
             println!("Program:  {prog}");
         }
@@ -180,7 +184,12 @@ impl InspectReport {
     /// element counts and compressed sizes.
     fn print_block_distribution(infos: &[BlockInfo]) {
         println!("Block distribution:");
-        for kind in [BlockKind::Nodes, BlockKind::Ways, BlockKind::Relations, BlockKind::Mixed] {
+        for kind in [
+            BlockKind::Nodes,
+            BlockKind::Ways,
+            BlockKind::Relations,
+            BlockKind::Mixed,
+        ] {
             let mut elements: Vec<u64> = infos
                 .iter()
                 .filter(|i| i.kind == kind)
@@ -290,7 +299,11 @@ impl InspectReport {
     }
 
     fn print_id_ranges(node_ids: &TypeIdRange, way_ids: &TypeIdRange, rel_ids: &TypeIdRange) {
-        for (label, ids) in [("Nodes:", node_ids), ("Ways:", way_ids), ("Relations:", rel_ids)] {
+        for (label, ids) in [
+            ("Nodes:", node_ids),
+            ("Ways:", way_ids),
+            ("Relations:", rel_ids),
+        ] {
             if ids.has_data() {
                 println!(
                     "  {:13}{} .. {}   (monotonic: {})",
@@ -346,15 +359,19 @@ impl InspectReport {
             "file.name" => Some(self.file_name.clone()),
             "file.size" => Some(self.file_size.to_string()),
             "file.format" => Some("PBF".to_string()),
-            "header.bbox" => self.header_meta.bbox.map(|(l, b, r, t)| format!("{l} {b} {r} {t}")),
+            "header.bbox" => self
+                .header_meta
+                .bbox
+                .map(|(l, b, r, t)| format!("{l} {b} {r} {t}")),
             "header.writing_program" => self.header_meta.writing_program.clone(),
             "header.replication.url" => self.header_meta.replication_url.clone(),
             "header.replication.sequence" => {
                 self.header_meta.replication_sequence.map(|s| s.to_string())
             }
-            "header.replication.timestamp" => {
-                self.header_meta.replication_timestamp.map(|t| t.to_string())
-            }
+            "header.replication.timestamp" => self
+                .header_meta
+                .replication_timestamp
+                .map(|t| t.to_string()),
             "indexed" => Some(self.is_indexed.to_string()),
             "blocks.total" => Some(self.total_blocks.to_string()),
             "elements.nodes" => Some(self.state.node_count.to_string()),
@@ -404,16 +421,34 @@ impl InspectReport {
             "data.count.nodes" => Some(self.state.node_count.to_string()),
             "data.count.ways" => Some(self.state.way_count.to_string()),
             "data.count.relations" => Some(self.state.relation_count.to_string()),
-            "metadata.all_objects.version" => Some(yes_no(ext.metadata.all_have(ext.metadata.has_version))),
-            "metadata.all_objects.timestamp" => Some(yes_no(ext.metadata.all_have(ext.metadata.has_timestamp))),
-            "metadata.all_objects.changeset" => Some(yes_no(ext.metadata.all_have(ext.metadata.has_changeset))),
+            "metadata.all_objects.version" => {
+                Some(yes_no(ext.metadata.all_have(ext.metadata.has_version)))
+            }
+            "metadata.all_objects.timestamp" => {
+                Some(yes_no(ext.metadata.all_have(ext.metadata.has_timestamp)))
+            }
+            "metadata.all_objects.changeset" => {
+                Some(yes_no(ext.metadata.all_have(ext.metadata.has_changeset)))
+            }
             "metadata.all_objects.uid" => Some(yes_no(ext.metadata.all_have(ext.metadata.has_uid))),
-            "metadata.all_objects.user" => Some(yes_no(ext.metadata.all_have(ext.metadata.has_user))),
-            "metadata.some_objects.version" => Some(yes_no(ext.metadata.some_have(ext.metadata.has_version))),
-            "metadata.some_objects.timestamp" => Some(yes_no(ext.metadata.some_have(ext.metadata.has_timestamp))),
-            "metadata.some_objects.changeset" => Some(yes_no(ext.metadata.some_have(ext.metadata.has_changeset))),
-            "metadata.some_objects.uid" => Some(yes_no(ext.metadata.some_have(ext.metadata.has_uid))),
-            "metadata.some_objects.user" => Some(yes_no(ext.metadata.some_have(ext.metadata.has_user))),
+            "metadata.all_objects.user" => {
+                Some(yes_no(ext.metadata.all_have(ext.metadata.has_user)))
+            }
+            "metadata.some_objects.version" => {
+                Some(yes_no(ext.metadata.some_have(ext.metadata.has_version)))
+            }
+            "metadata.some_objects.timestamp" => {
+                Some(yes_no(ext.metadata.some_have(ext.metadata.has_timestamp)))
+            }
+            "metadata.some_objects.changeset" => {
+                Some(yes_no(ext.metadata.some_have(ext.metadata.has_changeset)))
+            }
+            "metadata.some_objects.uid" => {
+                Some(yes_no(ext.metadata.some_have(ext.metadata.has_uid)))
+            }
+            "metadata.some_objects.user" => {
+                Some(yes_no(ext.metadata.some_have(ext.metadata.has_user)))
+            }
             _ => None,
         }
     }
@@ -454,7 +489,11 @@ impl InspectReport {
     }
 
     fn id_range_tuple(&self) -> Option<(&TypeIdRange, &TypeIdRange, &TypeIdRange)> {
-        match (&self.state.node_ids, &self.state.way_ids, &self.state.relation_ids) {
+        match (
+            &self.state.node_ids,
+            &self.state.way_ids,
+            &self.state.relation_ids,
+        ) {
             (Some(n), Some(w), Some(r)) => Some((n, w, r)),
             _ => None,
         }
@@ -521,7 +560,11 @@ fn print_distribution_line(label: &str, sorted: &[u64], is_bytes: bool) {
 
 fn print_metadata_line(label: &str, m: &MetadataCoverage, all: bool) {
     let check = |count: u64| -> bool {
-        if all { m.all_have(count) } else { m.some_have(count) }
+        if all {
+            m.all_have(count)
+        } else {
+            m.some_have(count)
+        }
     };
     let mut attrs = Vec::new();
     if check(m.has_version) {

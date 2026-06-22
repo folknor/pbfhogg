@@ -10,16 +10,14 @@ use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::osc::CompactDiffOverlay;
 use crate::{Element, PrimitiveBlock};
 
-use crate::commands::{
-    ensure_node_capacity_local, ensure_relation_capacity_local, flush_local,
-};
+use crate::commands::{ensure_node_capacity_local, ensure_relation_capacity_local, flush_local};
 
+use super::Result;
 use super::element_writes::{
     write_base_dense_node_local, write_base_node_local, write_base_relation_local,
     write_base_way_local, write_base_way_local_with_locations, write_osc_way_local,
 };
 use super::stats::MergeStats;
-use super::Result;
 
 /// Output from `rewrite_block_parallel`: serialized blocks + local stats.
 pub(super) struct RewriteOutput {
@@ -42,7 +40,13 @@ fn emit_create_local(
         ElemKind::Node => {
             if let Some(osc) = diff.get_node(id) {
                 ensure_node_capacity_local(bb, output)?;
-                bb.add_node(osc.id(), osc.decimicro_lat(), osc.decimicro_lon(), osc.tags(), None);
+                bb.add_node(
+                    osc.id(),
+                    osc.decimicro_lat(),
+                    osc.decimicro_lon(),
+                    osc.tags(),
+                    None,
+                );
                 stats.diff_nodes += 1;
             }
         }
@@ -107,7 +111,9 @@ pub(super) fn rewrite_block_parallel(
         // `rewrite.rs::build_header_bytes`; any future caller that bypasses
         // the sort gate must re-establish the invariant or the cursor may
         // skip past upserts and drop creates.
-        while upsert_cursor < inline_upserts.len() && crate::osm_id::osm_id_cmp(inline_upserts[upsert_cursor], elem_id).is_lt() {
+        while upsert_cursor < inline_upserts.len()
+            && crate::osm_id::osm_id_cmp(inline_upserts[upsert_cursor], elem_id).is_lt()
+        {
             let cid = inline_upserts[upsert_cursor];
             upsert_cursor += 1;
             emit_create_local(cid, kind, diff, bb, &mut output, &mut stats, loc_map)?;
@@ -124,7 +130,13 @@ pub(super) fn rewrite_block_parallel(
                     stats.deleted += 1;
                 } else if let Some(osc) = diff.get_node(id) {
                     ensure_node_capacity_local(bb, &mut output)?;
-                    bb.add_node(osc.id(), osc.decimicro_lat(), osc.decimicro_lon(), osc.tags(), None);
+                    bb.add_node(
+                        osc.id(),
+                        osc.decimicro_lat(),
+                        osc.decimicro_lon(),
+                        osc.tags(),
+                        None,
+                    );
 
                     stats.diff_nodes += 1;
                 } else {
@@ -138,7 +150,13 @@ pub(super) fn rewrite_block_parallel(
                     stats.deleted += 1;
                 } else if let Some(osc) = diff.get_node(id) {
                     ensure_node_capacity_local(bb, &mut output)?;
-                    bb.add_node(osc.id(), osc.decimicro_lat(), osc.decimicro_lon(), osc.tags(), None);
+                    bb.add_node(
+                        osc.id(),
+                        osc.decimicro_lat(),
+                        osc.decimicro_lon(),
+                        osc.tags(),
+                        None,
+                    );
 
                     stats.diff_nodes += 1;
                 } else {

@@ -28,8 +28,8 @@ use rustc_hash::FxHashMap;
 
 use crate::Element;
 
-use super::Result;
 use super::BuildConfig;
+use super::Result;
 use super::strings::StringPool;
 
 use super::super::format::*;
@@ -39,8 +39,15 @@ use super::super::format::*;
 // ---------------------------------------------------------------------------
 
 pub(super) const EXCLUDED_HIGHWAYS: &[&str] = &[
-    "footway", "path", "track", "steps", "cycleway",
-    "service", "pedestrian", "bridleway", "construction",
+    "footway",
+    "path",
+    "track",
+    "steps",
+    "cycleway",
+    "service",
+    "pedestrian",
+    "bridleway",
+    "construction",
 ];
 
 // ---------------------------------------------------------------------------
@@ -134,8 +141,11 @@ impl CoordMmapShared {
     unsafe fn write_coord(&self, rank: u64, lat_e7: i32, lon_e7: i32) {
         #[allow(clippy::cast_possible_truncation)]
         let off = (rank as usize) * 8;
-        debug_assert!(off + 8 <= self.len,
-            "CoordMmapShared: rank {rank} (offset {off}) out of bounds (len {})", self.len);
+        debug_assert!(
+            off + 8 <= self.len,
+            "CoordMmapShared: rank {rank} (offset {off}) out of bounds (len {})",
+            self.len
+        );
         let lat_bytes = lat_e7.to_le_bytes();
         let lon_bytes = lon_e7.to_le_bytes();
         // SAFETY: caller guarantees disjoint ranks and in-bounds `off`
@@ -194,7 +204,9 @@ fn classify_way_into(
     coord_slice: &[u8],
     needed_admin_ways: &crate::idset::IdSet,
 ) {
-    if state.error.is_some() { return; }
+    if state.error.is_some() {
+        return;
+    }
 
     let way_id = way.id();
     let is_admin_way = needed_admin_ways.get(way_id);
@@ -222,8 +234,8 @@ fn classify_way_into(
         }
     }
 
-    let is_street = highway.is_some() && name.is_some()
-        && !EXCLUDED_HIGHWAYS.contains(&highway.unwrap_or(""));
+    let is_street =
+        highway.is_some() && name.is_some() && !EXCLUDED_HIGHWAYS.contains(&highway.unwrap_or(""));
     let is_building_addr = building && hn.is_some() && addr_st.is_some();
     let is_interp = interp.is_some() && addr_st.is_some();
 
@@ -231,14 +243,17 @@ fn classify_way_into(
         return;
     }
 
-    let coords: Vec<(i32, i32)> = way.refs()
+    let coords: Vec<(i32, i32)> = way
+        .refs()
         .filter_map(|nid| {
-            if !referenced_nodes.get(nid) { return None; }
+            if !referenced_nodes.get(nid) {
+                return None;
+            }
             #[allow(clippy::cast_possible_truncation)]
             let r = referenced_nodes.rank(nid) as usize;
             let off = r * 8;
-            let lat = i32::from_le_bytes(coord_slice.get(off..off+4)?.try_into().ok()?);
-            let lon = i32::from_le_bytes(coord_slice.get(off+4..off+8)?.try_into().ok()?);
+            let lat = i32::from_le_bytes(coord_slice.get(off..off + 4)?.try_into().ok()?);
+            let lon = i32::from_le_bytes(coord_slice.get(off + 4..off + 8)?.try_into().ok()?);
             // KNOWN LIMITATION: (0, 0) doubles as the "unresolved" sentinel
             // for the coord mmap (zero-filled on creation, see Pass 2 write
             // path) AND as a legitimate OSM node at Null Island off the
@@ -250,10 +265,16 @@ fn classify_way_into(
             // Same convention is used in ALTW stage 2 (see
             // `src/commands/altw/stage2.rs` `is_resolved`) - fix both
             // together if we ever change the sentinel contract.
-            if lat == 0 && lon == 0 { None } else { Some((lat, lon)) }
+            if lat == 0 && lon == 0 {
+                None
+            } else {
+                Some((lat, lon))
+            }
         })
         .collect();
-    if coords.is_empty() { return; }
+    if coords.is_empty() {
+        return;
+    }
 
     // Admin way geometry - move coords if no other consumer needs them
     if is_admin_way && !is_street && !is_building_addr && !is_interp {
@@ -270,7 +291,9 @@ fn classify_way_into(
     if is_interp {
         if coords.len() >= 2 {
             let itype = match interp.unwrap_or("") {
-                "even" => 1u8, "odd" => 2, _ => 0,
+                "even" => 1u8,
+                "odd" => 2,
+                _ => 0,
             };
             if u16::try_from(coords.len()).is_err() {
                 state.error = Some(format!(
@@ -292,10 +315,9 @@ fn classify_way_into(
 
     // Building addresses (centroid) - main thread interns + streams.
     if is_building_addr {
-        let (sum_lat, sum_lon) = coords.iter()
-            .fold((0i64, 0i64), |acc, &(lat, lon)| {
-                (acc.0 + i64::from(lat), acc.1 + i64::from(lon))
-            });
+        let (sum_lat, sum_lon) = coords.iter().fold((0i64, 0i64), |acc, &(lat, lon)| {
+            (acc.0 + i64::from(lat), acc.1 + i64::from(lon))
+        });
         #[allow(clippy::cast_possible_wrap)]
         let count = coords.len().max(1) as i64;
         #[allow(clippy::cast_possible_truncation)]
@@ -303,7 +325,8 @@ fn classify_way_into(
         #[allow(clippy::cast_possible_truncation)]
         let clon = (sum_lon / count) as i32;
         state.building_addrs.push(PendingAddrPoint {
-            lat_e7: clat, lon_e7: clon,
+            lat_e7: clat,
+            lon_e7: clon,
             hn: hn.unwrap_or("").into(),
             st: addr_st.unwrap_or("").into(),
             pc: pc.map(Into::into),
@@ -347,7 +370,11 @@ pub(super) struct Pass2Output {
     pub(super) interp_nodes_mmap: memmap2::Mmap,
 }
 
-#[allow(clippy::too_many_lines, clippy::cognitive_complexity, clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::cognitive_complexity,
+    clippy::too_many_arguments
+)]
 #[hotpath::measure]
 pub(super) fn run_pass2(
     config: &BuildConfig,
@@ -368,27 +395,30 @@ pub(super) fn run_pass2(
     referenced_nodes.build_rank_index();
     crate::debug::emit_marker("GEOCODE_PASS2_RANK_INDEX_END");
     let referenced_count = referenced_nodes.total_count();
-    eprintln!("  {referenced_count} referenced nodes, compact index = {} MB",
-        referenced_count * 8 / 1_000_000);
+    eprintln!(
+        "  {referenced_count} referenced nodes, compact index = {} MB",
+        referenced_count * 8 / 1_000_000
+    );
     #[allow(clippy::cast_possible_truncation)]
     let coord_array_len = referenced_count as usize * 8; // 8 bytes per (lat_e7: i32, lon_e7: i32)
     let mut coord_mmap = memmap2::MmapMut::map_anon(coord_array_len.max(1))?;
-    let mut way_geom: rustc_hash::FxHashMap<i64, Vec<(i32, i32)>> = rustc_hash::FxHashMap::default();
+    let mut way_geom: rustc_hash::FxHashMap<i64, Vec<(i32, i32)>> =
+        rustc_hash::FxHashMap::default();
 
     // Streaming output: write data files directly during the merge instead
     // of accumulating Vecs. Running counters track offsets and record counts.
-    let mut street_ways_out = BufWriter::new(
-        std::fs::File::create(config.output_dir.join(FILE_STREET_WAYS))?,
-    );
-    let mut street_nodes_out = BufWriter::new(
-        std::fs::File::create(config.output_dir.join(FILE_STREET_NODES))?,
-    );
-    let mut addr_points_out = BufWriter::new(
-        std::fs::File::create(config.output_dir.join(FILE_ADDR_POINTS))?,
-    );
-    let mut interp_nodes_out = BufWriter::new(
-        std::fs::File::create(config.output_dir.join(FILE_INTERP_NODES))?,
-    );
+    let mut street_ways_out = BufWriter::new(std::fs::File::create(
+        config.output_dir.join(FILE_STREET_WAYS),
+    )?);
+    let mut street_nodes_out = BufWriter::new(std::fs::File::create(
+        config.output_dir.join(FILE_STREET_NODES),
+    )?);
+    let mut addr_points_out = BufWriter::new(std::fs::File::create(
+        config.output_dir.join(FILE_ADDR_POINTS),
+    )?);
+    let mut interp_nodes_out = BufWriter::new(std::fs::File::create(
+        config.output_dir.join(FILE_INTERP_NODES),
+    )?);
 
     // State that Phase 2a populates and Phase 2b carries forward.
     let mut addr_point_count: u32 = 0;
@@ -422,7 +452,9 @@ pub(super) fn run_pass2(
                         if let Some(rank) = referenced_ref.rank_if_set(node.id()) {
                             // SAFETY: disjoint ranks guaranteed by sorted PBF +
                             // unique rank-per-id in IdSet. See CoordMmapShared docs.
-                            unsafe { coord_ref.write_coord(rank, lat_e7, lon_e7); }
+                            unsafe {
+                                coord_ref.write_coord(rank, lat_e7, lon_e7);
+                            }
                         }
                         let mut hn: Option<&str> = None;
                         let mut st: Option<&str> = None;
@@ -437,7 +469,8 @@ pub(super) fn run_pass2(
                         }
                         if let (Some(h), Some(s)) = (hn, st) {
                             state.addr_points.push(PendingAddrPoint {
-                                lat_e7, lon_e7,
+                                lat_e7,
+                                lon_e7,
                                 hn: h.into(),
                                 st: s.into(),
                                 pc: pc.map(Into::into),
@@ -448,13 +481,16 @@ pub(super) fn run_pass2(
                 std::mem::take(state)
             },
             |_seq, out| {
-                if merge_err.is_some() { return; }
+                if merge_err.is_some() {
+                    return;
+                }
                 for pap in out.addr_points {
                     let hn_off = strings.intern(&pap.hn);
                     let st_off = strings.intern(&pap.st);
                     let pc_off = pap.pc.as_deref().map_or(0, |s| strings.intern(s));
                     let ap = AddrPoint {
-                        lat_e7: pap.lat_e7, lon_e7: pap.lon_e7,
+                        lat_e7: pap.lat_e7,
+                        lon_e7: pap.lon_e7,
                         housenumber_offset: hn_off,
                         street_offset: st_off,
                         postcode_offset: pc_off,
@@ -506,14 +542,20 @@ pub(super) fn run_pass2(
                 for element in block.elements_skip_metadata() {
                     if let Element::Way(way) = element {
                         classify_way_into(
-                            &way, state, referenced_ref, coord_slice, needed_admin_ways_ref,
+                            &way,
+                            state,
+                            referenced_ref,
+                            coord_slice,
+                            needed_admin_ways_ref,
                         );
                     }
                 }
                 std::mem::take(state)
             },
             |_seq, out| {
-                if merge_err.is_some() { return; }
+                if merge_err.is_some() {
+                    return;
+                }
                 if let Some(err) = out.error {
                     merge_err = Some(err);
                     return;
@@ -551,7 +593,11 @@ pub(super) fn run_pass2(
                     });
                     for &(lat, lon) in &pi.coords {
                         if let Err(e) = interp_nodes_out.write_all(
-                            &NodeCoord { lat_e7: lat, lon_e7: lon }.to_bytes()
+                            &NodeCoord {
+                                lat_e7: lat,
+                                lon_e7: lon,
+                            }
+                            .to_bytes(),
                         ) {
                             merge_err = Some(e.to_string());
                             return;
@@ -566,7 +612,8 @@ pub(super) fn run_pass2(
                     let st_off = strings.intern(&pap.st);
                     let pc_off = pap.pc.as_deref().map_or(0, |s| strings.intern(s));
                     let ap = AddrPoint {
-                        lat_e7: pap.lat_e7, lon_e7: pap.lon_e7,
+                        lat_e7: pap.lat_e7,
+                        lon_e7: pap.lon_e7,
                         housenumber_offset: hn_off,
                         street_offset: st_off,
                         postcode_offset: pc_off,
@@ -606,7 +653,11 @@ pub(super) fn run_pass2(
                     }
                     for &(lat, lon) in &ps.coords {
                         if let Err(e) = street_nodes_out.write_all(
-                            &NodeCoord { lat_e7: lat, lon_e7: lon }.to_bytes()
+                            &NodeCoord {
+                                lat_e7: lat,
+                                lon_e7: lon,
+                            }
+                            .to_bytes(),
                         ) {
                             merge_err = Some(e.to_string());
                             return;
@@ -634,8 +685,13 @@ pub(super) fn run_pass2(
     drop(addr_points_out);
     drop(interp_nodes_out);
 
-    eprintln!("  {} addr, {} streets, {} interp, {} admin way geoms",
-        addr_point_count, street_way_count, interp_ways.len(), way_geom.len());
+    eprintln!(
+        "  {} addr, {} streets, {} interp, {} admin way geoms",
+        addr_point_count,
+        street_way_count,
+        interp_ways.len(),
+        way_geom.len()
+    );
     drop(needed_admin_ways);
     drop(referenced_nodes);
     drop(coord_mmap);
@@ -647,9 +703,7 @@ pub(super) fn run_pass2(
         let file = std::fs::File::open(&path)?;
         let len = file.metadata()?.len();
         if len == 0 {
-            return Ok(
-                memmap2::MmapOptions::new().map_anon()?.make_read_only()?
-            );
+            return Ok(memmap2::MmapOptions::new().map_anon()?.make_read_only()?);
         }
         Ok(unsafe { memmap2::Mmap::map(&file)? })
     };

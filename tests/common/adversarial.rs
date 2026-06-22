@@ -72,12 +72,8 @@ pub fn locate_blobs(pbf: &[u8]) -> Vec<BlobLocation> {
         if pbf.len() - pos < 4 {
             break;
         }
-        let header_len = u32::from_be_bytes([
-            pbf[pos],
-            pbf[pos + 1],
-            pbf[pos + 2],
-            pbf[pos + 3],
-        ]) as usize;
+        let header_len =
+            u32::from_be_bytes([pbf[pos], pbf[pos + 1], pbf[pos + 2], pbf[pos + 3]]) as usize;
         let header_start = pos + 4;
         let Some(header_end) = header_start.checked_add(header_len) else {
             break;
@@ -172,11 +168,7 @@ pub fn mutate_blob_header_indexdata(
 /// keeps them packed. A future test that needs to inject non-packed
 /// entries needs a separate primitive (or hand-rolled protobuf
 /// emission) that re-encodes the inner fields.
-pub fn mutate_blob_payload(
-    pbf: &[u8],
-    blob_idx: usize,
-    f: impl FnOnce(&mut Vec<u8>),
-) -> Vec<u8> {
+pub fn mutate_blob_payload(pbf: &[u8], blob_idx: usize, f: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
     let blobs = locate_blobs(pbf);
     let target = *blobs.get(blob_idx).expect("blob_idx out of range");
 
@@ -221,9 +213,8 @@ pub fn set_relation_memids_terminator_continuation(
     relation_idx: usize,
 ) -> Vec<u8> {
     mutate_blob_payload(pbf, blob_idx, |payload| {
-        let off = find_relation_memids_last_byte_offset(payload, relation_idx).expect(
-            "relation_idx out of range, target relation missing memids, or memids empty",
-        );
+        let off = find_relation_memids_last_byte_offset(payload, relation_idx)
+            .expect("relation_idx out of range, target relation missing memids, or memids empty");
         debug_assert_eq!(
             payload[off] & 0x80,
             0,
@@ -265,9 +256,13 @@ fn find_relation_memids_last_byte_offset(payload: &[u8], target_rel_idx: usize) 
             if group_end > payload.len() {
                 return None;
             }
-            if let Some(off) =
-                scan_group_for_memids(payload, group_start, group_end, &mut rel_count, target_rel_idx)
-            {
+            if let Some(off) = scan_group_for_memids(
+                payload,
+                group_start,
+                group_end,
+                &mut rel_count,
+                target_rel_idx,
+            ) {
                 return Some(off);
             }
             pos = group_end;
@@ -334,8 +329,9 @@ fn splice_frame(pbf: &[u8], target: BlobLocation, new_header: &[u8], new_blob: &
     let header_len_be = u32::try_from(new_header.len())
         .expect("BlobHeader fits in u32")
         .to_be_bytes();
-    let mut out =
-        Vec::with_capacity(pbf.len() + new_header.len() + new_blob.len() - (target.blob_end - target.frame_start));
+    let mut out = Vec::with_capacity(
+        pbf.len() + new_header.len() + new_blob.len() - (target.blob_end - target.frame_start),
+    );
     out.extend_from_slice(&pbf[..target.frame_start]);
     out.extend_from_slice(&header_len_be);
     out.extend_from_slice(new_header);
@@ -491,7 +487,10 @@ fn decompress_blob(blob: &[u8]) -> Result<Vec<u8>, String> {
 fn emit_blob_raw(payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(0x0A);
-    write_varint(&mut out, u64::try_from(payload.len()).expect("payload len fits in u64"));
+    write_varint(
+        &mut out,
+        u64::try_from(payload.len()).expect("payload len fits in u64"),
+    );
     out.extend_from_slice(payload);
     out
 }
@@ -499,11 +498,17 @@ fn emit_blob_raw(payload: &[u8]) -> Vec<u8> {
 fn build_blob_header(blob_type: &[u8], indexdata: Option<&[u8]>, datasize: u32) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(0x0A);
-    write_varint(&mut out, u64::try_from(blob_type.len()).expect("type len fits in u64"));
+    write_varint(
+        &mut out,
+        u64::try_from(blob_type.len()).expect("type len fits in u64"),
+    );
     out.extend_from_slice(blob_type);
     if let Some(ix) = indexdata {
         out.push(0x12);
-        write_varint(&mut out, u64::try_from(ix.len()).expect("indexdata len fits in u64"));
+        write_varint(
+            &mut out,
+            u64::try_from(ix.len()).expect("indexdata len fits in u64"),
+        );
         out.extend_from_slice(ix);
     }
     out.push(0x18);
@@ -536,4 +541,3 @@ mod tests {
         assert_eq!(truncate_to(&bytes, 0), Vec::<u8>::new());
     }
 }
-

@@ -48,8 +48,15 @@ impl GeocodeTagLiterals<'_> {
             k_building: b"building",
             k_addr_interpolation: b"addr:interpolation",
             excluded_highway_values: &[
-                b"footway", b"path", b"track", b"steps", b"cycleway",
-                b"service", b"pedestrian", b"bridleway", b"construction",
+                b"footway",
+                b"path",
+                b"track",
+                b"steps",
+                b"cycleway",
+                b"service",
+                b"pedestrian",
+                b"bridleway",
+                b"construction",
             ],
         }
     }
@@ -100,7 +107,9 @@ pub(crate) fn scan_way_refs(
                 let offset = data.as_ptr() as usize - buffer.as_ptr() as usize;
                 group_starts.push((offset, data.len()));
             }
-            _ => { cursor.skip_field(wire_type)?; }
+            _ => {
+                cursor.skip_field(wire_type)?;
+            }
         }
     }
 
@@ -137,9 +146,15 @@ fn parse_way_refs(
 
     while let Some((field, wire_type)) = cursor.read_tag()? {
         match (field, wire_type) {
-            (1, WIRE_VARINT) => { way_id = cursor.read_varint_i64()?; }
-            (8, WIRE_LEN) => { refs_data = Some(cursor.read_len_delimited()?); }
-            _ => { cursor.skip_field(wire_type)?; }
+            (1, WIRE_VARINT) => {
+                way_id = cursor.read_varint_i64()?;
+            }
+            (8, WIRE_LEN) => {
+                refs_data = Some(cursor.read_len_delimited()?);
+            }
+            _ => {
+                cursor.skip_field(wire_type)?;
+            }
         }
     }
 
@@ -166,7 +181,12 @@ fn parse_way_refs(
 /// The callback receives `(way_id, flags, refs)`. The caller applies
 /// any additional admin-way-membership test (by `way_id`) and decides
 /// whether to consume the refs.
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cognitive_complexity, clippy::too_many_lines)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cognitive_complexity,
+    clippy::too_many_lines
+)]
 pub(crate) fn scan_way_geocode_tagged_refs(
     decompressed: &[u8],
     literals: &GeocodeTagLiterals<'_>,
@@ -184,13 +204,17 @@ pub(crate) fn scan_way_geocode_tagged_refs(
     let mut stringtable_data: Option<&[u8]> = None;
     while let Some((field, wire_type)) = cursor.read_tag()? {
         match (field, wire_type) {
-            (1, WIRE_LEN) => { stringtable_data = Some(cursor.read_len_delimited()?); }
+            (1, WIRE_LEN) => {
+                stringtable_data = Some(cursor.read_len_delimited()?);
+            }
             (2, WIRE_LEN) => {
                 let data = cursor.read_len_delimited()?;
                 let offset = data.as_ptr() as usize - buffer.as_ptr() as usize;
                 group_starts.push((offset, data.len()));
             }
-            _ => { cursor.skip_field(wire_type)?; }
+            _ => {
+                cursor.skip_field(wire_type)?;
+            }
         }
     }
 
@@ -225,7 +249,11 @@ pub(crate) fn scan_way_geocode_tagged_refs(
             if field == 3 && wire_type == WIRE_LEN {
                 let way_data = gcursor.read_len_delimited()?;
                 parse_way_tagged_refs(
-                    way_data, &resolved, any_key_present, refs_buf, &mut callback,
+                    way_data,
+                    &resolved,
+                    any_key_present,
+                    refs_buf,
+                    &mut callback,
                 )?;
             } else {
                 gcursor.skip_field(wire_type)?;
@@ -313,11 +341,21 @@ fn parse_way_tagged_refs(
 
     while let Some((field, wire_type)) = cursor.read_tag()? {
         match (field, wire_type) {
-            (1, WIRE_VARINT) => { way_id = cursor.read_varint_i64()?; }
-            (2, WIRE_LEN) => { keys_data = Some(cursor.read_len_delimited()?); }
-            (3, WIRE_LEN) => { vals_data = Some(cursor.read_len_delimited()?); }
-            (8, WIRE_LEN) => { refs_data = Some(cursor.read_len_delimited()?); }
-            _ => { cursor.skip_field(wire_type)?; }
+            (1, WIRE_VARINT) => {
+                way_id = cursor.read_varint_i64()?;
+            }
+            (2, WIRE_LEN) => {
+                keys_data = Some(cursor.read_len_delimited()?);
+            }
+            (3, WIRE_LEN) => {
+                vals_data = Some(cursor.read_len_delimited()?);
+            }
+            (8, WIRE_LEN) => {
+                refs_data = Some(cursor.read_len_delimited()?);
+            }
+            _ => {
+                cursor.skip_field(wire_type)?;
+            }
         }
     }
 
@@ -384,7 +422,11 @@ fn parse_way_tagged_refs(
 
     callback(
         way_id,
-        WayGeocodeFlags { is_street, is_building_addr, is_interp },
+        WayGeocodeFlags {
+            is_street,
+            is_building_addr,
+            is_interp,
+        },
         refs_buf,
     );
 

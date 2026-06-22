@@ -27,7 +27,11 @@ const CHUNK_SIZE: usize = 1 << CHUNK_BITS;
 
 impl IdSet {
     pub fn new() -> Self {
-        Self { chunks: Vec::new(), rank_chunk_prefix: None, rank_block_prefix: None }
+        Self {
+            chunks: Vec::new(),
+            rank_chunk_prefix: None,
+            rank_block_prefix: None,
+        }
     }
 
     /// Returns `true` if any chunk has been allocated (at least one `set` call).
@@ -42,7 +46,9 @@ impl IdSet {
 
     #[allow(clippy::cast_sign_loss)]
     pub fn set(&mut self, id: i64) {
-        if id < 0 { return; } // Negative IDs are not valid OSM element IDs
+        if id < 0 {
+            return;
+        } // Negative IDs are not valid OSM element IDs
         let id = id as u64;
         let cid = (id >> (CHUNK_BITS + 3)) as usize;
         if cid >= self.chunks.len() {
@@ -62,7 +68,9 @@ impl IdSet {
     /// callers should prefer the void-return [`set`].
     #[allow(clippy::cast_sign_loss)]
     pub fn set_if_new(&mut self, id: i64) -> bool {
-        if id < 0 { return false; }
+        if id < 0 {
+            return false;
+        }
         let id = id as u64;
         let cid = (id >> (CHUNK_BITS + 3)) as usize;
         if cid >= self.chunks.len() {
@@ -100,7 +108,9 @@ impl IdSet {
     /// against a sanity bound, or to widen the hard-coded caps.
     #[allow(clippy::cast_sign_loss)]
     pub fn pre_allocate(&mut self, max_id: i64) {
-        if max_id < 0 { return; }
+        if max_id < 0 {
+            return;
+        }
         let max_cid = (max_id as u64 >> (CHUNK_BITS + 3)) as usize;
         if max_cid >= self.chunks.len() {
             self.chunks.resize_with(max_cid + 1, || None);
@@ -144,7 +154,8 @@ impl IdSet {
         // is pre-allocated and lives for the duration of the parallel phase.
         // Relaxed ordering is sufficient - we only need visibility after
         // the thread::scope join barrier.
-        let atomic = unsafe { &*(std::ptr::addr_of!(chunk[offset]).cast::<std::sync::atomic::AtomicU8>()) };
+        let atomic =
+            unsafe { &*(std::ptr::addr_of!(chunk[offset]).cast::<std::sync::atomic::AtomicU8>()) };
         atomic.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -168,7 +179,8 @@ impl IdSet {
         let bit = 1u8 << (id & 7);
         // SAFETY: same as set_atomic. fetch_or returns the previous byte,
         // from which we extract the prior state of this specific bit.
-        let atomic = unsafe { &*(std::ptr::addr_of!(chunk[offset]).cast::<std::sync::atomic::AtomicU8>()) };
+        let atomic =
+            unsafe { &*(std::ptr::addr_of!(chunk[offset]).cast::<std::sync::atomic::AtomicU8>()) };
         let prev = atomic.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
         (prev & bit) == 0
     }
@@ -184,9 +196,11 @@ impl IdSet {
             let max_covered = if self.chunks.is_empty() {
                 "<none - pre_allocate was never called>".to_string()
             } else {
-                format!("chunk {} (~id {})",
+                format!(
+                    "chunk {} (~id {})",
                     self.chunks.len() - 1,
-                    (self.chunks.len() as u64) << (CHUNK_BITS + 3))
+                    (self.chunks.len() as u64) << (CHUNK_BITS + 3)
+                )
             };
             panic!(
                 "{fn_name}: id {id} lands in chunk {cid}, but pre_allocate only \
@@ -261,7 +275,11 @@ impl IdSet {
                 let chunk_base = (cid as u64) << (CHUNK_BITS + 3);
                 let range_start = min_id.saturating_sub(chunk_base);
                 let chunk_end = chunk_base + ((CHUNK_SIZE as u64) << 3);
-                let range_end = if max_id < chunk_end { max_id - chunk_base } else { ((CHUNK_SIZE as u64) << 3) - 1 };
+                let range_end = if max_id < chunk_end {
+                    max_id - chunk_base
+                } else {
+                    ((CHUNK_SIZE as u64) << 3) - 1
+                };
 
                 // Check byte range for any set bits.
                 let start_byte = (range_start >> 3) as usize;
@@ -326,10 +344,7 @@ impl IdSet {
             chunk_prefix.push(cumulative);
             if let Some(data) = chunk {
                 let words: &[u64] = unsafe {
-                    std::slice::from_raw_parts(
-                        data.as_ptr().cast::<u64>(),
-                        CHUNK_SIZE / 8,
-                    )
+                    std::slice::from_raw_parts(data.as_ptr().cast::<u64>(), CHUNK_SIZE / 8)
                 };
                 let mut bp = Vec::with_capacity(BLOCKS_PER_CHUNK);
                 let mut within_chunk: u32 = 0;
@@ -359,9 +374,13 @@ impl IdSet {
         const BLOCK_BYTES: usize = 64;
         const WORDS_PER_BLOCK: usize = BLOCK_BYTES / 8;
 
-        let chunk_prefix = self.rank_chunk_prefix.as_ref()
+        let chunk_prefix = self
+            .rank_chunk_prefix
+            .as_ref()
             .expect("rank() called without build_rank_index()");
-        let block_prefix = self.rank_block_prefix.as_ref()
+        let block_prefix = self
+            .rank_block_prefix
+            .as_ref()
             .expect("rank() called without build_rank_index()");
 
         let id = id as u64;
@@ -380,12 +399,8 @@ impl IdSet {
             }
 
             // Scan only the remaining words within the block (max 31 words).
-            let words: &[u64] = unsafe {
-                std::slice::from_raw_parts(
-                    chunk.as_ptr().cast::<u64>(),
-                    CHUNK_SIZE / 8,
-                )
-            };
+            let words: &[u64] =
+                unsafe { std::slice::from_raw_parts(chunk.as_ptr().cast::<u64>(), CHUNK_SIZE / 8) };
             let block_start_word = block_idx * WORDS_PER_BLOCK;
             let target_word = target_byte / 8;
             for &w in &words[block_start_word..target_word] {
@@ -409,7 +424,11 @@ impl IdSet {
     /// Avoids the double chunk lookup + bounds check of separate `get()` + `rank()`.
     /// Requires `build_rank_index()`.
     #[inline]
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    #[allow(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap
+    )]
     pub fn resolve(&self, id: i64, start_id: i64) -> i64 {
         const BLOCK_BYTES: usize = 64;
         const WORDS_PER_BLOCK: usize = BLOCK_BYTES / 8;
@@ -435,9 +454,13 @@ impl IdSet {
         }
 
         // Bit is set - compute rank.
-        let chunk_prefix = self.rank_chunk_prefix.as_ref()
+        let chunk_prefix = self
+            .rank_chunk_prefix
+            .as_ref()
             .expect("resolve() called without build_rank_index()");
-        let block_prefix = self.rank_block_prefix.as_ref()
+        let block_prefix = self
+            .rank_block_prefix
+            .as_ref()
             .expect("resolve() called without build_rank_index()");
 
         let mut r = chunk_prefix[cid];
@@ -447,12 +470,8 @@ impl IdSet {
             r += u64::from(bp[block_idx]);
         }
 
-        let words: &[u64] = unsafe {
-            std::slice::from_raw_parts(
-                chunk.as_ptr().cast::<u64>(),
-                CHUNK_SIZE / 8,
-            )
-        };
+        let words: &[u64] =
+            unsafe { std::slice::from_raw_parts(chunk.as_ptr().cast::<u64>(), CHUNK_SIZE / 8) };
         let block_start_word = block_idx * WORDS_PER_BLOCK;
         let target_word = target_byte / 8;
         for &w in &words[block_start_word..target_word] {
@@ -503,12 +522,8 @@ impl IdSet {
             r += u64::from(bp[block_idx]);
         }
 
-        let words: &[u64] = unsafe {
-            std::slice::from_raw_parts(
-                chunk.as_ptr().cast::<u64>(),
-                CHUNK_SIZE / 8,
-            )
-        };
+        let words: &[u64] =
+            unsafe { std::slice::from_raw_parts(chunk.as_ptr().cast::<u64>(), CHUNK_SIZE / 8) };
         let block_start_word = block_idx * WORDS_PER_BLOCK;
         let target_word = target_byte / 8;
         for &w in &words[block_start_word..target_word] {
@@ -579,7 +594,9 @@ impl IdSet {
 
     /// Returns the total number of set IDs. Requires `build_rank_index()`.
     pub fn total_count(&self) -> u64 {
-        let prefix = self.rank_chunk_prefix.as_ref()
+        let prefix = self
+            .rank_chunk_prefix
+            .as_ref()
             .expect("total_count() called without build_rank_index()");
         prefix[self.chunks.len()]
     }

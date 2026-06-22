@@ -10,13 +10,13 @@ use crate::ElementReader;
 
 use super::format::*;
 
-mod strings;
+mod admin;
+mod interp;
 mod pass1;
 mod pass1_5;
 mod pass2;
-mod admin;
-mod interp;
 mod pass3;
+mod strings;
 
 // Under the `test-hooks` feature, expose Pass 3 Stage A fault-
 // injection hooks so integration tests can arm them. The rest of
@@ -121,7 +121,9 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
 
     // Validate input
     crate::commands::require_indexdata(
-        &config.input_path, config.direct_io, config.force,
+        &config.input_path,
+        config.direct_io,
+        config.force,
         "input PBF has no blob-level indexdata. Without indexdata, \
          every blob must be decompressed (significantly slower).",
     )?;
@@ -130,7 +132,9 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let reader = ElementReader::open(&config.input_path, config.direct_io)?;
     let pbf_header = reader.header();
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    let repl_seq = pbf_header.osmosis_replication_sequence_number().unwrap_or(0) as u32;
+    let repl_seq = pbf_header
+        .osmosis_replication_sequence_number()
+        .unwrap_or(0) as u32;
     #[allow(clippy::cast_sign_loss)]
     let repl_ts = pbf_header.osmosis_replication_timestamp().unwrap_or(0) as u64;
     drop(reader);
@@ -146,9 +150,8 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     #[cfg(feature = "hotpath")]
     let pass1_start = std::time::Instant::now();
 
-    let (admin_relations, needed_admin_ways) = pass1::run_pass1(
-        &config.input_path, config.direct_io, &mut strings,
-    )?;
+    let (admin_relations, needed_admin_ways) =
+        pass1::run_pass1(&config.input_path, config.direct_io, &mut strings)?;
     eprintln!("  {} admin relations", admin_relations.len());
 
     #[cfg(feature = "hotpath")]
@@ -182,9 +185,8 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     crate::debug::emit_marker("GEOCODE_PASS1_5_START");
     eprintln!("Pass 1.5: Referenced node collection...");
 
-    let referenced_nodes = pass1_5::run_pass1_5(
-        &way_schedule, max_node_id, &shared_file, &needed_admin_ways,
-    )?;
+    let referenced_nodes =
+        pass1_5::run_pass1_5(&way_schedule, max_node_id, &shared_file, &needed_admin_ways)?;
     crate::debug::emit_marker("GEOCODE_PASS1_5_END");
 
     // -----------------------------------------------------------------------
@@ -213,8 +215,13 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         addr_points_mmap,
         interp_nodes_mmap,
     } = pass2::run_pass2(
-        config, &node_schedule, &way_schedule, &shared_file,
-        needed_admin_ways, referenced_nodes, &mut strings,
+        config,
+        &node_schedule,
+        &way_schedule,
+        &shared_file,
+        needed_admin_ways,
+        referenced_nodes,
+        &mut strings,
     )?;
     drop(node_schedule);
     drop(way_schedule);
@@ -236,17 +243,24 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     // -----------------------------------------------------------------------
     crate::debug::emit_marker("GEOCODE_PASS2_INTERP_RESOLVE_START");
     let resolved = interp::resolve_interpolation_endpoints_mmap(
-        &mut interp_ways, &addr_points_mmap, &interp_nodes_mmap, &strings, config.street_level,
+        &mut interp_ways,
+        &addr_points_mmap,
+        &interp_nodes_mmap,
+        &strings,
+        config.street_level,
     );
-    eprintln!("  {resolved}/{} interpolation ways resolved", interp_ways.len());
+    eprintln!(
+        "  {resolved}/{} interpolation ways resolved",
+        interp_ways.len()
+    );
     crate::debug::emit_marker("GEOCODE_PASS2_INTERP_RESOLVE_END");
 
     // Write interp_ways.bin now (after resolution has set start/end numbers)
     crate::debug::emit_marker("GEOCODE_PASS2_WRITE_START");
     {
-        let mut iw_out = BufWriter::new(
-            std::fs::File::create(config.output_dir.join(FILE_INTERP_WAYS))?,
-        );
+        let mut iw_out = BufWriter::new(std::fs::File::create(
+            config.output_dir.join(FILE_INTERP_WAYS),
+        )?);
         for iw in &interp_ways {
             let rec = InterpWay {
                 node_offset: iw.node_file_offset,
@@ -294,8 +308,8 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     // the duplicate `cover_segment` pass that ran separately at coarse
     // level. Two Stage B invocations follow - one per bucket tree.
     crate::debug::emit_marker("GEOCODE_PASS3_CELLS_START");
-    let (fine_count, coarse_count) = pass3::bucketed_cell_assignment_fused(
-        &pass3::FusedCellAssignmentParams {
+    let (fine_count, coarse_count) =
+        pass3::bucketed_cell_assignment_fused(&pass3::FusedCellAssignmentParams {
             output_dir: &config.output_dir,
             street_ways_mmap: &street_ways_mmap,
             street_nodes_mmap: &street_nodes_mmap,
@@ -314,8 +328,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
             coarse_street_entries_file: FILE_COARSE_STREET_ENTRIES,
             coarse_addr_entries_file: FILE_COARSE_ADDR_ENTRIES,
             coarse_interp_entries_file: FILE_COARSE_INTERP_ENTRIES,
-        },
-    )?;
+        })?;
     crate::debug::emit_marker("GEOCODE_PASS3_CELLS_END");
     crate::debug::emit_marker("GEOCODE_PASS3_ADMIN_INDEX_START");
     let admin_count = admin::write_admin_index(&config.output_dir, &mut { admin_cell_entries })?;

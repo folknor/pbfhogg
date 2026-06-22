@@ -14,13 +14,13 @@ use std::sync::Arc;
 
 use super::getid::ElementIds;
 use super::{
-    flush_local, writer_from_header_bytes, HeaderOverrides,
-    ensure_node_capacity_local, ensure_way_capacity_local, ensure_relation_capacity_local,
+    HeaderOverrides, ensure_node_capacity_local, ensure_relation_capacity_local,
+    ensure_way_capacity_local, flush_local, writer_from_header_bytes,
 };
-use crate::blob::{decode_blob_to_headerblock, BlobKind};
+use crate::blob::{BlobKind, decode_blob_to_headerblock};
 use crate::blob_meta::ElemKind;
-use crate::owned::{dense_node_metadata, element_metadata};
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
+use crate::owned::{dense_node_metadata, element_metadata};
 use crate::read::header_walker::HeaderWalker;
 use crate::reorder_buffer::ReorderBuffer;
 use crate::writer::Compression;
@@ -69,11 +69,9 @@ pub fn getparents(
     // - relation blobs: any relation may reference a query node/way/relation ID;
     //   --add-self on relation IDs
     let need_node_blobs = opts.add_self && ids.node_ids.has_any();
-    let need_way_blobs = ids.node_ids.has_any()
-        || (opts.add_self && ids.way_ids.has_any());
-    let need_relation_blobs = ids.node_ids.has_any()
-        || ids.way_ids.has_any()
-        || ids.relation_ids.has_any();
+    let need_way_blobs = ids.node_ids.has_any() || (opts.add_self && ids.way_ids.has_any());
+    let need_relation_blobs =
+        ids.node_ids.has_any() || ids.way_ids.has_any() || ids.relation_ids.has_any();
 
     crate::debug::emit_marker("GETPARENTS_SCHEDULE_START");
     let mut walker = HeaderWalker::open(input)?;
@@ -103,7 +101,8 @@ pub fn getparents(
                         return Err(format!(
                             "blob at offset {} claims data_size {} but file is only {} bytes",
                             meta.data_offset, meta.data_size, file_size,
-                        ).into());
+                        )
+                        .into());
                     }
                     schedule.push((schedule.len(), meta.data_offset, meta.data_size));
                 } else {
@@ -117,9 +116,8 @@ pub fn getparents(
     let shared_file = Arc::clone(walker.shared_file());
     drop(walker);
 
-    let header = header_block.ok_or_else(|| {
-        crate::error::new_error(crate::error::ErrorKind::MissingHeader)
-    })?;
+    let header = header_block
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
 
     #[allow(clippy::cast_possible_wrap)]
     {
@@ -130,9 +128,8 @@ pub fn getparents(
 
     super::warn_locations_on_ways_loss(&header);
     let header_bytes = super::build_output_header(&header, true, overrides, |hb| hb)?;
-    let mut writer = writer_from_header_bytes(
-        output, compression, &header_bytes, direct_io, false,
-    )?;
+    let mut writer =
+        writer_from_header_bytes(output, compression, &header_bytes, direct_io, false)?;
 
     let mut stats = GetparentsStats {
         nodes_written: 0,
@@ -141,8 +138,7 @@ pub fn getparents(
     };
 
     crate::debug::emit_marker("GETPARENTS_DECODE_START");
-    type ClassifyResult =
-        std::result::Result<(Vec<OwnedBlock>, (u64, u64, u64)), String>;
+    type ClassifyResult = std::result::Result<(Vec<OwnedBlock>, (u64, u64, u64)), String>;
     let mut reorder: ReorderBuffer<ClassifyResult> = ReorderBuffer::with_capacity(32);
     // Captured write error: `parallel_classify_phase`'s `merge` is `FnMut(usize, R)`
     // and cannot return a Result. Capture the first error here and bail out
@@ -167,14 +163,18 @@ pub fn getparents(
             Ok((output, counts))
         },
         |seq, result| {
-            if write_err.is_some() { return; }
+            if write_err.is_some() {
+                return;
+            }
             reorder.push(seq, result);
             while let Some(item) = reorder.pop_ready() {
                 match item {
                     Ok((blocks, (n, w, r))) => {
                         for (block_bytes, index, tagdata) in blocks {
                             if let Err(e) = writer.write_primitive_block_owned(
-                                block_bytes, index, tagdata.as_deref(),
+                                block_bytes,
+                                index,
+                                tagdata.as_deref(),
                             ) {
                                 write_err = Some(Box::new(e));
                                 return;
@@ -227,7 +227,13 @@ fn process_block(
                 if add_self && ids.node_ids.get(dn.id()) {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = dense_node_metadata(dn);
-                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), meta.as_ref());
+                    bb.add_node(
+                        dn.id(),
+                        dn.decimicro_lat(),
+                        dn.decimicro_lon(),
+                        dn.tags(),
+                        meta.as_ref(),
+                    );
                     nodes += 1;
                 }
             }
@@ -235,7 +241,13 @@ fn process_block(
                 if add_self && ids.node_ids.get(n.id()) {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = element_metadata(&n.info());
-                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), n.tags(), meta.as_ref());
+                    bb.add_node(
+                        n.id(),
+                        n.decimicro_lat(),
+                        n.decimicro_lon(),
+                        n.tags(),
+                        meta.as_ref(),
+                    );
                     nodes += 1;
                 }
             }
@@ -278,4 +290,3 @@ fn process_block(
 
     Ok((nodes, ways, relations))
 }
-

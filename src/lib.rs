@@ -112,24 +112,24 @@ writer.flush()?;
 #![recursion_limit = "1024"]
 
 // Module tree
-pub mod read;
-pub mod write;
+pub(crate) mod blob_meta;
 #[doc(hidden)]
 pub mod commands;
-pub mod geo;
-pub mod geocode_index;  // format is always available; reader requires geocode-reader feature
-pub mod osc;
-pub(crate) mod blob_meta;
 pub mod debug;
 mod error;
+pub mod geo;
+pub mod geocode_index; // format is always available; reader requires geocode-reader feature
 pub(crate) mod idset;
+pub mod osc;
 pub(crate) mod osm_id;
 pub(crate) mod owned;
 pub(crate) mod path_guard;
+pub mod read;
 pub(crate) mod reorder_buffer;
 pub(crate) mod scan;
 #[doc(hidden)]
 pub mod tag_expr;
+pub mod write;
 
 /// Boxed-error Result alias used by command implementations and lifted
 /// command-shared library code. Distinct from [`crate::Result`] (which is
@@ -150,6 +150,8 @@ pub(crate) type BoxResult<T> = std::result::Result<T, Box<dyn std::error::Error>
 // ---------------------------------------------------------------------------
 
 // Explicit re-exports: flat public API (`pbfhogg::Element`, `pbfhogg::BlobReader`, etc.)
+pub use blob_meta::{BlobBbox, BlobFilter};
+pub use error::{BlobError, Error, ErrorKind, Result};
 pub use read::blob::{
     Blob, BlobDecode, BlobHeader, BlobReader, BlobReaderSource, BlobType, ByteOffset,
     MAX_BLOB_HEADER_SIZE, MAX_BLOB_MESSAGE_SIZE,
@@ -167,25 +169,22 @@ pub use read::elements::{
 };
 pub use read::indexed::{IdRanges, IndexedReader};
 pub use read::reader::{ElementReader, PipelinedBlocks};
-pub use blob_meta::{BlobBbox, BlobFilter};
-pub use error::{BlobError, Error, ErrorKind, Result};
 
 // Module re-exports: short internal paths (`crate::blob`, `crate::block_builder`, etc.)
 // Required by imports and doc links in commands/, read/, and write/ modules.
-pub use read::{blob, block, dense, elements, indexed, reader};
-pub(crate) use read::file_reader;
-pub use write::{block_builder, writer};
-pub(crate) use write::file_writer;
-#[doc(hidden)]
-pub use commands::has_indexdata;
 #[doc(hidden)]
 pub use commands::HeaderOverrides;
 #[doc(hidden)]
+pub use commands::has_indexdata;
+#[doc(hidden)]
 pub use commands::{
-    altw, apply_changes, cat, degrade, diff, getid, getparents, inspect,
-    merge_changes, renumber, repack, sort,
-    tags_count, tags_filter, time_filter,
+    altw, apply_changes, cat, degrade, diff, getid, getparents, inspect, merge_changes, renumber,
+    repack, sort, tags_count, tags_filter, time_filter,
 };
 #[cfg(feature = "commands")]
 #[doc(hidden)]
 pub use commands::{check, extract};
+pub(crate) use read::file_reader;
+pub use read::{blob, block, dense, elements, indexed, reader};
+pub(crate) use write::file_writer;
+pub use write::{block_builder, writer};

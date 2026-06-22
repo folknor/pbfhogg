@@ -28,20 +28,20 @@ pub mod derive_parallel_test_hooks {
     pub use super::derive_parallel::test_hooks::{PANIC_AT_SHARD_IDX, reset};
 }
 
+use super::Result;
+use crate::blob_meta::ElemKind;
+use crate::osc::merge_join::{
+    BlockMergeAction, BlockPairMergeState, MergeJoinAction, MergeJoinElement, StreamingBlocks,
+    block_pair_merge_phase, merge_join_phase,
+};
+use crate::osc::write::{
+    OwnedMember, OwnedNode, OwnedRelation, OwnedWay, format_coord, from_decimicro,
+};
+use crate::owned::TypeFilter;
+use crate::{Element, MemberType};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
-use crate::osc::write::{
-    format_coord, from_decimicro, OwnedMember, OwnedNode, OwnedRelation, OwnedWay,
-};
-use crate::osc::merge_join::{
-    block_pair_merge_phase, merge_join_phase, BlockMergeAction, BlockPairMergeState,
-    MergeJoinAction, MergeJoinElement, StreamingBlocks,
-};
-use super::Result;
-use crate::owned::TypeFilter;
-use crate::blob_meta::ElemKind;
-use crate::{Element, MemberType};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -79,7 +79,8 @@ pub(crate) fn check_sorted_and_indexed(path: &Path, direct_io: bool) -> Result<(
     let mut offset = 0u64;
     let mut indexed = false;
 
-    while let Some(info) = crate::read::raw_frame::read_blob_header_only(&mut reader, &mut offset)? {
+    while let Some(info) = crate::read::raw_frame::read_blob_header_only(&mut reader, &mut offset)?
+    {
         if matches!(info.blob_type, BlobKind::OsmData) {
             indexed = info.index.is_some();
             break;
@@ -164,18 +165,30 @@ trait DiffMeta {
 }
 
 impl DiffMeta for OwnedNode {
-    fn version(&self) -> Option<i32> { self.metadata.as_ref().map(|m| m.version) }
-    fn type_char() -> char { 'n' }
+    fn version(&self) -> Option<i32> {
+        self.metadata.as_ref().map(|m| m.version)
+    }
+    fn type_char() -> char {
+        'n'
+    }
 }
 
 impl DiffMeta for OwnedWay {
-    fn version(&self) -> Option<i32> { self.metadata.as_ref().map(|m| m.version) }
-    fn type_char() -> char { 'w' }
+    fn version(&self) -> Option<i32> {
+        self.metadata.as_ref().map(|m| m.version)
+    }
+    fn type_char() -> char {
+        'w'
+    }
 }
 
 impl DiffMeta for OwnedRelation {
-    fn version(&self) -> Option<i32> { self.metadata.as_ref().map(|m| m.version) }
-    fn type_char() -> char { 'r' }
+    fn version(&self) -> Option<i32> {
+        self.metadata.as_ref().map(|m| m.version)
+    }
+    fn type_char() -> char {
+        'r'
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -204,8 +217,12 @@ pub fn diff(
     // Single-pass: check sorted headers + indexdata from one file open each.
     let (old_sorted, old_indexed) = check_sorted_and_indexed(old_path, direct_io)?;
     let (new_sorted, new_indexed) = check_sorted_and_indexed(new_path, direct_io)?;
-    if !old_sorted { super::require_sorted_err(old_path, "Old PBF")?; }
-    if !new_sorted { super::require_sorted_err(new_path, "New PBF")?; }
+    if !old_sorted {
+        super::require_sorted_err(old_path, "Old PBF")?;
+    }
+    if !new_sorted {
+        super::require_sorted_err(new_path, "New PBF")?;
+    }
     let both_indexed = old_indexed && new_indexed;
 
     crate::debug::emit_marker("DIFF_SCAN_START");
@@ -274,76 +291,67 @@ fn diff_block_pair(
         let end_marker = format!("DIFF_PHASE_{tag}_END");
         crate::debug::emit_marker(&start_marker);
 
-        block_pair_merge_phase(
-            &mut merge,
-            kind,
-            options.suppress_common,
-            &mut |action| {
-                match action {
-                    BlockMergeAction::BlobEqual(count) => {
-                        stats.common += count;
-                    }
-                    BlockMergeAction::BlobOldOnly {
-                        block, count, skip,
-                    } => {
-                        let type_char = crate::osc::merge_join::kind_type_char(kind);
-                        for elem in block.elements().skip(skip) {
-                            let id = crate::osc::merge_join::element_id(&elem);
-                            let ver = crate::osc::merge_join::element_version(&elem);
-                            write_compact_line(output, '-', type_char, id, ver)?;
-                        }
-                        stats.deleted += count;
-                    }
-                    BlockMergeAction::BlobNewOnly {
-                        block, count, skip,
-                    } => {
-                        let type_char = crate::osc::merge_join::kind_type_char(kind);
-                        for elem in block.elements().skip(skip) {
-                            let id = crate::osc::merge_join::element_id(&elem);
-                            let ver = crate::osc::merge_join::element_version(&elem);
-                            write_compact_line(output, '+', type_char, id, ver)?;
-                        }
-                        stats.created += count;
-                    }
-                    BlockMergeAction::ElementEqual {
-                        id,
-                        version,
-                        type_char,
-                    } => {
-                        if !options.suppress_common {
-                            write_compact_line(output, ' ', type_char, id, version)?;
-                        }
-                        stats.common += 1;
-                    }
-                    BlockMergeAction::ElementModified { old, new } => {
-                        let type_char = crate::osc::merge_join::kind_type_char(kind);
-                        let id = crate::osc::merge_join::element_id(old);
-                        let old_ver = crate::osc::merge_join::element_version(old);
-                        let new_ver = crate::osc::merge_join::element_version(new);
-                        write_modified_line(output, type_char, id, old_ver, new_ver)?;
-                        if options.verbose {
-                            write_modified_details_borrowed(output, old, new)?;
-                        }
-                        stats.modified += 1;
-                    }
-                    BlockMergeAction::ElementOldOnly(o) => {
-                        let type_char = crate::osc::merge_join::kind_type_char(kind);
-                        let id = crate::osc::merge_join::element_id(o);
-                        let ver = crate::osc::merge_join::element_version(o);
-                        write_compact_line(output, '-', type_char, id, ver)?;
-                        stats.deleted += 1;
-                    }
-                    BlockMergeAction::ElementNewOnly(n) => {
-                        let type_char = crate::osc::merge_join::kind_type_char(kind);
-                        let id = crate::osc::merge_join::element_id(n);
-                        let ver = crate::osc::merge_join::element_version(n);
-                        write_compact_line(output, '+', type_char, id, ver)?;
-                        stats.created += 1;
-                    }
+        block_pair_merge_phase(&mut merge, kind, options.suppress_common, &mut |action| {
+            match action {
+                BlockMergeAction::BlobEqual(count) => {
+                    stats.common += count;
                 }
-                Ok(())
-            },
-        )?;
+                BlockMergeAction::BlobOldOnly { block, count, skip } => {
+                    let type_char = crate::osc::merge_join::kind_type_char(kind);
+                    for elem in block.elements().skip(skip) {
+                        let id = crate::osc::merge_join::element_id(&elem);
+                        let ver = crate::osc::merge_join::element_version(&elem);
+                        write_compact_line(output, '-', type_char, id, ver)?;
+                    }
+                    stats.deleted += count;
+                }
+                BlockMergeAction::BlobNewOnly { block, count, skip } => {
+                    let type_char = crate::osc::merge_join::kind_type_char(kind);
+                    for elem in block.elements().skip(skip) {
+                        let id = crate::osc::merge_join::element_id(&elem);
+                        let ver = crate::osc::merge_join::element_version(&elem);
+                        write_compact_line(output, '+', type_char, id, ver)?;
+                    }
+                    stats.created += count;
+                }
+                BlockMergeAction::ElementEqual {
+                    id,
+                    version,
+                    type_char,
+                } => {
+                    if !options.suppress_common {
+                        write_compact_line(output, ' ', type_char, id, version)?;
+                    }
+                    stats.common += 1;
+                }
+                BlockMergeAction::ElementModified { old, new } => {
+                    let type_char = crate::osc::merge_join::kind_type_char(kind);
+                    let id = crate::osc::merge_join::element_id(old);
+                    let old_ver = crate::osc::merge_join::element_version(old);
+                    let new_ver = crate::osc::merge_join::element_version(new);
+                    write_modified_line(output, type_char, id, old_ver, new_ver)?;
+                    if options.verbose {
+                        write_modified_details_borrowed(output, old, new)?;
+                    }
+                    stats.modified += 1;
+                }
+                BlockMergeAction::ElementOldOnly(o) => {
+                    let type_char = crate::osc::merge_join::kind_type_char(kind);
+                    let id = crate::osc::merge_join::element_id(o);
+                    let ver = crate::osc::merge_join::element_version(o);
+                    write_compact_line(output, '-', type_char, id, ver)?;
+                    stats.deleted += 1;
+                }
+                BlockMergeAction::ElementNewOnly(n) => {
+                    let type_char = crate::osc::merge_join::kind_type_char(kind);
+                    let id = crate::osc::merge_join::element_id(n);
+                    let ver = crate::osc::merge_join::element_version(n);
+                    write_compact_line(output, '+', type_char, id, ver)?;
+                    stats.created += 1;
+                }
+            }
+            Ok(())
+        })?;
         crate::debug::emit_marker(&end_marker);
     }
 
@@ -356,14 +364,32 @@ fn diff_block_pair(
 /// diff-snapshots opportunity plan for how these feed the v3 decision.
 #[allow(clippy::cast_possible_wrap)]
 fn emit_merge_stats_counters(s: &crate::osc::merge_join::BlockPairMergeStats) {
-    crate::debug::emit_counter("mergejoin_shadow_pairs_byte_equal", s.pairs_byte_equal as i64);
-    crate::debug::emit_counter("mergejoin_shadow_elements_byte_equal", s.elements_byte_equal as i64);
-    crate::debug::emit_counter("mergejoin_shadow_pairs_overlapping_decoded", s.pairs_overlapping_decoded as i64);
-    crate::debug::emit_counter("mergejoin_shadow_elements_overlapping_decoded", s.elements_overlapping_decoded as i64);
+    crate::debug::emit_counter(
+        "mergejoin_shadow_pairs_byte_equal",
+        s.pairs_byte_equal as i64,
+    );
+    crate::debug::emit_counter(
+        "mergejoin_shadow_elements_byte_equal",
+        s.elements_byte_equal as i64,
+    );
+    crate::debug::emit_counter(
+        "mergejoin_shadow_pairs_overlapping_decoded",
+        s.pairs_overlapping_decoded as i64,
+    );
+    crate::debug::emit_counter(
+        "mergejoin_shadow_elements_overlapping_decoded",
+        s.elements_overlapping_decoded as i64,
+    );
     crate::debug::emit_counter("mergejoin_shadow_blobs_old_only", s.blobs_old_only as i64);
-    crate::debug::emit_counter("mergejoin_shadow_elements_old_only", s.elements_old_only as i64);
+    crate::debug::emit_counter(
+        "mergejoin_shadow_elements_old_only",
+        s.elements_old_only as i64,
+    );
     crate::debug::emit_counter("mergejoin_shadow_blobs_new_only", s.blobs_new_only as i64);
-    crate::debug::emit_counter("mergejoin_shadow_elements_new_only", s.elements_new_only as i64);
+    crate::debug::emit_counter(
+        "mergejoin_shadow_elements_new_only",
+        s.elements_new_only as i64,
+    );
 }
 
 /// Fallback diff path using element-level merge-join with owned elements.
@@ -468,7 +494,11 @@ fn run_diff_phase<T: MergeJoinElement + DiffMeta>(
     ctx: &mut DiffPhaseCtx<'_, impl Write>,
     write_details: fn(&mut dyn Write, &T, &T) -> Result<()>,
 ) -> Result<()> {
-    let DiffPhaseCtx { output, opts, stats } = ctx;
+    let DiffPhaseCtx {
+        output,
+        opts,
+        stats,
+    } = ctx;
     merge_join_phase(old_src, old_buf, new_src, new_buf, |action| {
         match action {
             MergeJoinAction::OldOnly(o) => {
@@ -505,7 +535,9 @@ fn drain_phase<T: MergeJoinElement>(
     old_src: &mut StreamingBlocks,
     new_src: &mut StreamingBlocks,
 ) -> Result<()> {
-    merge_join_phase::<T>(old_src, &mut Vec::new(), new_src, &mut Vec::new(), |_| Ok(()))
+    merge_join_phase::<T>(old_src, &mut Vec::new(), new_src, &mut Vec::new(), |_| {
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -546,11 +578,7 @@ pub(super) fn write_modified_line(
 // Output formatting -- verbose details
 // ---------------------------------------------------------------------------
 
-fn write_node_details(
-    output: &mut dyn Write,
-    old: &OwnedNode,
-    new: &OwnedNode,
-) -> Result<()> {
+fn write_node_details(output: &mut dyn Write, old: &OwnedNode, new: &OwnedNode) -> Result<()> {
     if old.decimicro_lat != new.decimicro_lat || old.decimicro_lon != new.decimicro_lon {
         let mut buf = String::new();
         format_coord(&mut buf, from_decimicro(old.decimicro_lat));
@@ -569,11 +597,7 @@ fn write_node_details(
     Ok(())
 }
 
-fn write_way_details(
-    output: &mut dyn Write,
-    old: &OwnedWay,
-    new: &OwnedWay,
-) -> Result<()> {
+fn write_way_details(output: &mut dyn Write, old: &OwnedWay, new: &OwnedWay) -> Result<()> {
     if old.refs != new.refs {
         writeln!(
             output,
@@ -647,10 +671,14 @@ fn write_member_diff(
     old_members: &[OwnedMember],
     new_members: &[OwnedMember],
 ) -> Result<()> {
-    let new_set: HashSet<(crate::MemberId, &str)> =
-        new_members.iter().map(|m| (m.id, m.role.as_str())).collect();
-    let old_set: HashSet<(crate::MemberId, &str)> =
-        old_members.iter().map(|m| (m.id, m.role.as_str())).collect();
+    let new_set: HashSet<(crate::MemberId, &str)> = new_members
+        .iter()
+        .map(|m| (m.id, m.role.as_str()))
+        .collect();
+    let old_set: HashSet<(crate::MemberId, &str)> = old_members
+        .iter()
+        .map(|m| (m.id, m.role.as_str()))
+        .collect();
 
     // Removed members (in old but not in new)
     for old_m in old_members {
@@ -810,9 +838,7 @@ fn write_tag_diff_borrowed(
         (Element::Node(na), Element::DenseNode(db)) => {
             write_tag_diff_iter(output, na.tags(), db.tags())
         }
-        (Element::Node(na), Element::Node(nb)) => {
-            write_tag_diff_iter(output, na.tags(), nb.tags())
-        }
+        (Element::Node(na), Element::Node(nb)) => write_tag_diff_iter(output, na.tags(), nb.tags()),
         _ => Ok(()),
     }
 }

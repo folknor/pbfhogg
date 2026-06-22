@@ -5,15 +5,15 @@
 
 use super::blob::{BlobReader, BlobType, DecompressPool};
 use super::block::PrimitiveBlock;
-use super::pipeline_metrics::{elapsed_ns_u64, PIPELINE_METRICS};
+use super::pipeline_metrics::{PIPELINE_METRICS, elapsed_ns_u64};
 use crate::blob_meta::BlobFilter;
 use crate::error::Result;
 use crate::reorder_buffer::ReorderBuffer;
 use std::cell::RefCell;
 use std::io::Read;
+use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::sync_channel;
-use std::sync::Arc;
 use std::time::Instant;
 
 /// Returns `true` if the blob should be skipped based on the filter.

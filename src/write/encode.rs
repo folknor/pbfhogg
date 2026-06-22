@@ -6,7 +6,7 @@ use rustc_hash::FxHashSet;
 
 use protohoggr::{encode_bytes_field, encode_int64_field, encode_varint, zigzag_encode_64};
 
-use super::block_builder::{member_type_value, MemberData, Metadata};
+use super::block_builder::{MemberData, Metadata, member_type_value};
 use super::string_table::StringTable;
 
 /// Encode an `int32` field unconditionally (even when value is 0).
@@ -17,7 +17,10 @@ use super::string_table::StringTable;
 #[inline]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn encode_optional_int32(buf: &mut Vec<u8>, field: u32, value: i32) {
-    debug_assert!(field <= 15, "single-byte tag requires field <= 15, got {field}");
+    debug_assert!(
+        field <= 15,
+        "single-byte tag requires field <= 15, got {field}"
+    );
     buf.push((field << 3) as u8); // wire type 0 (varint)
     encode_varint(buf, value as i64 as u64);
 }
@@ -28,7 +31,10 @@ fn encode_optional_int32(buf: &mut Vec<u8>, field: u32, value: i32) {
 #[inline]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn encode_optional_int64(buf: &mut Vec<u8>, field: u32, value: i64) {
-    debug_assert!(field <= 15, "single-byte tag requires field <= 15, got {field}");
+    debug_assert!(
+        field <= 15,
+        "single-byte tag requires field <= 15, got {field}"
+    );
     buf.push((field << 3) as u8);
     encode_varint(buf, value as u64);
 }
@@ -39,7 +45,10 @@ fn encode_optional_int64(buf: &mut Vec<u8>, field: u32, value: i64) {
 #[inline]
 #[allow(clippy::cast_possible_truncation)]
 fn encode_optional_uint32(buf: &mut Vec<u8>, field: u32, value: u32) {
-    debug_assert!(field <= 15, "single-byte tag requires field <= 15, got {field}");
+    debug_assert!(
+        field <= 15,
+        "single-byte tag requires field <= 15, got {field}"
+    );
     buf.push((field << 3) as u8);
     encode_varint(buf, u64::from(value));
 }
@@ -120,7 +129,14 @@ pub(super) fn encode_way<'t>(
     encode_int64_field(elem, 1, id);
 
     // Fields 2+3: keys/vals
-    encode_tags(string_table, elem, packed_keys, packed_vals, tag_key_indices, tags);
+    encode_tags(
+        string_table,
+        elem,
+        packed_keys,
+        packed_vals,
+        tag_key_indices,
+        tags,
+    );
 
     // Field 4: info (submessage)
     if let Some(meta) = metadata {
@@ -168,7 +184,14 @@ pub(super) fn encode_way_with_locations<'t>(
     encode_int64_field(elem, 1, id);
 
     // Fields 2+3: keys/vals
-    encode_tags(string_table, elem, packed_refs, packed_vals, tag_key_indices, tags);
+    encode_tags(
+        string_table,
+        elem,
+        packed_refs,
+        packed_vals,
+        tag_key_indices,
+        tags,
+    );
 
     if let Some(meta) = metadata {
         encode_info_to(info_buf, string_table, meta);
@@ -285,7 +308,14 @@ pub(super) fn encode_relation<'t>(
     encode_int64_field(elem, 1, id);
 
     // Fields 2+3: keys/vals
-    encode_tags(string_table, elem, packed, packed_vals, tag_key_indices, tags);
+    encode_tags(
+        string_table,
+        elem,
+        packed,
+        packed_vals,
+        tag_key_indices,
+        tags,
+    );
 
     if let Some(meta) = metadata {
         encode_info_to(info_buf, string_table, meta);

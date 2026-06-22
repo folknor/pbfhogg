@@ -72,7 +72,8 @@ pub(crate) fn build_classify_schedule(
     // to the prior `next_header_skip_blob` call: on an empty file return
     // MissingHeader; on non-empty files the first blob is dropped without
     // kind validation (subsequent non-OsmData blobs are filtered below).
-    let _ = walker.next_header()?
+    let _ = walker
+        .next_header()?
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
 
@@ -81,10 +82,14 @@ pub(crate) fn build_classify_schedule(
     let mut schedule: Vec<ScheduleEntry> = Vec::new();
     let mut seq: usize = 0;
     while let Some(meta) = walker.next_header()? {
-        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) { continue; }
+        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
+            continue;
+        }
         if let Some(filter_kind) = kind_filter {
             if let Some(idx) = &meta.index {
-                if idx.kind != filter_kind { continue; }
+                if idx.kind != filter_kind {
+                    continue;
+                }
             }
         }
         // Reject bogus blob-header data_size before it flows to pread
@@ -137,7 +142,8 @@ pub(crate) fn build_classify_schedules_split(
 )> {
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
     let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
-    let _ = walker.next_header()?
+    let _ = walker
+        .next_header()?
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
 
@@ -147,7 +153,9 @@ pub(crate) fn build_classify_schedules_split(
     let mut ways: Vec<ScheduleEntry> = Vec::new();
     let mut rels: Vec<ScheduleEntry> = Vec::new();
     while let Some(meta) = walker.next_header()? {
-        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) { continue; }
+        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
+            continue;
+        }
         // See `build_classify_schedule` for the rationale: reject
         // past-EOF blob bodies before the schedule is handed to pread
         // workers. Replicated across both schedule builders since they
@@ -227,18 +235,23 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
-    if schedule.is_empty() { return Ok(()); }
+    if schedule.is_empty() {
+        return Ok(());
+    }
 
     let decode_threads = resolve_thread_count(threads);
 
     let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<ScheduleEntry>(16);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<(usize, crate::error::Result<R>)>(32);
+    let (result_tx, result_rx) =
+        std::sync::mpsc::sync_channel::<(usize, crate::error::Result<R>)>(32);
 
     std::thread::scope(|scope| -> Result<()> {
         scope.spawn(move || {
             for &item in schedule {
-                if desc_tx.send(item).is_err() { break; }
+                if desc_tx.send(item).is_err() {
+                    break;
+                }
             }
         });
 
@@ -271,11 +284,16 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
                         let mut buf = crate::blob::pool_get_pub(&worker_pool, data_size * 4);
                         crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
                         let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
-                            buf, &worker_pool, &mut st_scratch, &mut gr_scratch,
+                            buf,
+                            &worker_pool,
+                            &mut st_scratch,
+                            &mut gr_scratch,
                         )?;
                         Ok(classify_ref(&block, &mut state))
                     })();
-                    if tx.send((s, r)).is_err() { break; }
+                    if tx.send((s, r)).is_err() {
+                        break;
+                    }
                 }
             });
         }
@@ -318,7 +336,9 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
-    if schedule.is_empty() { return Ok(()); }
+    if schedule.is_empty() {
+        return Ok(());
+    }
 
     let decode_threads = resolve_thread_count(threads);
 
@@ -330,7 +350,9 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
     std::thread::scope(|scope| -> Result<()> {
         scope.spawn(move || {
             for &item in schedule {
-                if desc_tx.send(item).is_err() { break; }
+                if desc_tx.send(item).is_err() {
+                    break;
+                }
             }
         });
 
@@ -361,7 +383,9 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
                         crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
                         classify_ref(&decompress_buf, &mut state)
                     })();
-                    if tx.send((s, r)).is_err() { break; }
+                    if tx.send((s, r)).is_err() {
+                        break;
+                    }
                 }
             });
         }
@@ -448,18 +472,23 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
-    if schedule.is_empty() { return Ok(()); }
+    if schedule.is_empty() {
+        return Ok(());
+    }
 
     let decode_threads = resolve_thread_count(threads);
 
     let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<ScheduleEntry>(16);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<crate::error::Result<S>>(decode_threads);
+    let (result_tx, result_rx) =
+        std::sync::mpsc::sync_channel::<crate::error::Result<S>>(decode_threads);
 
     std::thread::scope(|scope| -> Result<()> {
         scope.spawn(move || {
             for &item in schedule {
-                if desc_tx.send(item).is_err() { break; }
+                if desc_tx.send(item).is_err() {
+                    break;
+                }
             }
         });
 
@@ -479,7 +508,8 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
                 let result: crate::error::Result<()> = (|| {
                     loop {
                         let (_s, data_offset, data_size) = {
-                            let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let guard =
+                                rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             match guard.recv() {
                                 Ok(d) => d,
                                 Err(_) => return Ok(()),
@@ -492,15 +522,22 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
                         let mut buf = crate::blob::pool_get_pub(&worker_pool, data_size * 4);
                         crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
                         let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
-                            buf, &worker_pool, &mut st_scratch, &mut gr_scratch,
+                            buf,
+                            &worker_pool,
+                            &mut st_scratch,
+                            &mut gr_scratch,
                         )?;
                         classify_ref(&block, &mut state);
                     }
                 })();
 
                 match result {
-                    Ok(()) => { tx.send(Ok(state)).ok(); }
-                    Err(e) => { tx.send(Err(e)).ok(); }
+                    Ok(()) => {
+                        tx.send(Ok(state)).ok();
+                    }
+                    Err(e) => {
+                        tx.send(Err(e)).ok();
+                    }
                 }
             });
         }

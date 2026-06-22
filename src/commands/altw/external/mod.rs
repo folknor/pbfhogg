@@ -21,12 +21,12 @@
 
 use std::path::Path;
 
-use crate::writer::Compression;
 use crate::ElementReader;
+use crate::writer::Compression;
 
 use super::Stats;
-use crate::commands::{require_indexdata, HeaderOverrides};
 use crate::BoxResult as Result;
+use crate::commands::{HeaderOverrides, require_indexdata};
 
 mod blob_bucket_index;
 mod blob_meta;
@@ -46,11 +46,11 @@ pub mod test_hooks {
     pub use super::stage3::test_hooks as stage3;
 }
 
-use radix::{ScratchDir, NUM_BUCKETS};
+use radix::{NUM_BUCKETS, ScratchDir};
 
 use stage1::stage1_way_pass;
-use stage2::{stage2_node_join, SlotBuckets};
-use stage3::{stage3_slot_reorder, IntegratedInputs, SlotBucketRef};
+use stage2::{SlotBuckets, stage2_node_join};
+use stage3::{IntegratedInputs, SlotBucketRef, stage3_slot_reorder};
 use stage4::stage4_assembly;
 
 /// Width (in node-id space) of one ID bucket.
@@ -113,7 +113,11 @@ impl BucketLayout {
              (max_node_id={max_node_id}, num_buckets={num_buckets}); \
              local_node_id would no longer fit in u32",
         );
-        Self { max_node_id, bucket_width: bw, num_buckets }
+        Self {
+            max_node_id,
+            bucket_width: bw,
+            num_buckets,
+        }
     }
 
     /// Returns `(bucket_idx, local_node_id)` for `node_id`, or `None`
@@ -151,9 +155,7 @@ impl BucketLayout {
 /// silently absorb. Returns 0 when there are no node blobs (degenerate
 /// input - bucket_layout will then reject any non-zero ref).
 #[allow(dead_code, private_interfaces)] // wired up in step 2 of A1.
-pub(super) fn max_node_id_from_blob_meta(
-    blob_meta: &[blob_meta::BlobMeta],
-) -> Result<u64> {
+pub(super) fn max_node_id_from_blob_meta(blob_meta: &[blob_meta::BlobMeta]) -> Result<u64> {
     let mut max_id: i64 = 0;
     for meta in blob_meta {
         if !matches!(meta.kind, crate::blob_meta::ElemKind::Node) {
@@ -241,7 +243,7 @@ mod max_node_id_tests {
 
 #[cfg(test)]
 mod bucket_math_tests {
-    use super::{bucket_width, BucketLayout};
+    use super::{BucketLayout, bucket_width};
 
     #[test]
     fn bucket_width_handles_zero_max() {
@@ -323,16 +325,8 @@ mod bucket_math_tests {
             let lo = k * 1000;
             let hi = (k + 1) * 1000 - 1;
             let expected = usize::try_from(k).expect("k fits in usize");
-            assert_eq!(
-                layout.locate(lo).map(|(b, _)| b),
-                Some(expected),
-                "lo={lo}",
-            );
-            assert_eq!(
-                layout.locate(hi).map(|(b, _)| b),
-                Some(expected),
-                "hi={hi}",
-            );
+            assert_eq!(layout.locate(lo).map(|(b, _)| b), Some(expected), "lo={lo}",);
+            assert_eq!(layout.locate(hi).map(|(b, _)| b), Some(expected), "hi={hi}",);
         }
     }
 
@@ -536,21 +530,32 @@ impl IdRecord {
     pub(super) fn read_from(buf: &[u8; ID_RECORD_SIZE]) -> Self {
         let local_node_id = u32::from_le_bytes(buf[..4].try_into().expect("4 bytes"));
         let blob_idx = u32::from_le_bytes(buf[4..8].try_into().expect("4 bytes"));
-        let blob_local_slot =
-            u32::from_le_bytes(buf[8..12].try_into().expect("4 bytes"));
-        Self { local_node_id, blob_idx, blob_local_slot }
+        let blob_local_slot = u32::from_le_bytes(buf[8..12].try_into().expect("4 bytes"));
+        Self {
+            local_node_id,
+            blob_idx,
+            blob_local_slot,
+        }
     }
 }
 
 #[cfg(test)]
 mod id_record_tests {
-    use super::{IdRecord, ID_RECORD_SIZE};
+    use super::{ID_RECORD_SIZE, IdRecord};
 
     #[test]
     fn write_then_read_round_trips() {
         let cases = [
-            IdRecord { local_node_id: 0, blob_idx: 0, blob_local_slot: 0 },
-            IdRecord { local_node_id: 1, blob_idx: 2, blob_local_slot: 3 },
+            IdRecord {
+                local_node_id: 0,
+                blob_idx: 0,
+                blob_local_slot: 0,
+            },
+            IdRecord {
+                local_node_id: 1,
+                blob_idx: 2,
+                blob_local_slot: 3,
+            },
             IdRecord {
                 local_node_id: u32::MAX,
                 blob_idx: u32::MAX,
@@ -695,8 +700,7 @@ pub fn external_join(
         }
     }
 
-    let scratch_dir =
-        ScratchDir::new(output.parent().unwrap_or(Path::new(".")), "external-join")?;
+    let scratch_dir = ScratchDir::new(output.parent().unwrap_or(Path::new(".")), "external-join")?;
 
     let ref_count_sidecar = scratch_dir.file_path("way-ref-counts");
     let per_way_refcount_sidecar = scratch_dir.file_path("per-way-refcounts");
@@ -744,7 +748,13 @@ pub fn external_join(
     let blob_meta_ref_parallel = &blob_meta;
     let bucket_layout_ref = &bucket_layout;
     let (stage1_out, relation_member_node_ids) = std::thread::scope(
-        |scope| -> std::result::Result<(super::external::stage1::Stage1Output, Option<crate::idset::IdSet>), String> {
+        |scope| -> std::result::Result<
+            (
+                super::external::stage1::Stage1Output,
+                Option<crate::idset::IdSet>,
+            ),
+            String,
+        > {
             let s1_handle = scope.spawn(|| {
                 stage1_way_pass(
                     blob_meta_ref_parallel,
@@ -811,8 +821,14 @@ pub fn external_join(
     {
         crate::debug::emit_counter("extjoin_total_slots", stage1_out.total_slots as i64);
         crate::debug::emit_counter("extjoin_total_id_records", total_id_records as i64);
-        crate::debug::emit_counter("s1_minflt_delta", (s1_minflt_after - s1_minflt_before) as i64);
-        crate::debug::emit_counter("s1_majflt_delta", (s1_majflt_after - s1_majflt_before) as i64);
+        crate::debug::emit_counter(
+            "s1_minflt_delta",
+            (s1_minflt_after - s1_minflt_before) as i64,
+        );
+        crate::debug::emit_counter(
+            "s1_majflt_delta",
+            (s1_majflt_after - s1_majflt_before) as i64,
+        );
     }
     crate::debug::emit_marker("EXTJOIN_STAGE1_END");
 
@@ -826,8 +842,7 @@ pub fn external_join(
     // keeps the 2-piece straddler invariant (a blob spans at most two
     // adjacent buckets) for both planet-scale inputs and tiny test
     // fixtures where total_slots / NUM_BUCKETS would otherwise be < 1.
-    let way_slot_starts =
-        stage4::load_ref_count_sidecar(&ref_count_sidecar, total_slots)?;
+    let way_slot_starts = stage4::load_ref_count_sidecar(&ref_count_sidecar, total_slots)?;
     let max_blob_slots: u64 = (0..way_slot_starts.len())
         .map(|i| {
             let end = if i + 1 < way_slot_starts.len() {
@@ -863,8 +878,7 @@ pub fn external_join(
     let (s2_minflt_before, s2_majflt_before) = crate::debug::read_page_faults();
     let slot_buckets = SlotBuckets::create(&scratch_dir, slot_bucket_count)?;
     let input_pbf = std::sync::Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| format!("open input pbf for stage 2: {e}"))?,
+        std::fs::File::open(input).map_err(|e| format!("open input pbf for stage 2: {e}"))?,
     );
     let resolved_count = stage2_node_join(
         &scratch_dir,
@@ -894,8 +908,14 @@ pub fn external_join(
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("extjoin_resolved_count", resolved_count as i64);
-        crate::debug::emit_counter("s2_minflt_delta", (s2_minflt_after - s2_minflt_before) as i64);
-        crate::debug::emit_counter("s2_majflt_delta", (s2_majflt_after - s2_majflt_before) as i64);
+        crate::debug::emit_counter(
+            "s2_minflt_delta",
+            (s2_minflt_after - s2_minflt_before) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_majflt_delta",
+            (s2_majflt_after - s2_majflt_before) as i64,
+        );
     }
     crate::debug::emit_marker("EXTJOIN_STAGE2_END");
 
@@ -958,10 +978,8 @@ pub fn external_join(
     // The streaming router: pre-populates `Empty` entries for zero-ref
     // way blobs so stage 4 never waits on a blob that stage 3 would
     // never publish.
-    let router = coord_payloads::ConcurrentBlobLocationRouter::new(
-        &per_way_rcs,
-        worker_files.clone(),
-    )?;
+    let router =
+        coord_payloads::ConcurrentBlobLocationRouter::new(&per_way_rcs, worker_files.clone())?;
 
     // (#9 layer 2: relation scan already ran in parallel with stage 1
     // above; `relation_member_node_ids` is already bound. No serial
@@ -1048,8 +1066,14 @@ pub fn external_join(
     }
     #[allow(clippy::cast_possible_wrap)]
     {
-        crate::debug::emit_counter("s3_minflt_delta", (s3_minflt_after - s3_minflt_before) as i64);
-        crate::debug::emit_counter("s3_majflt_delta", (s3_majflt_after - s3_majflt_before) as i64);
+        crate::debug::emit_counter(
+            "s3_minflt_delta",
+            (s3_minflt_after - s3_minflt_before) as i64,
+        );
+        crate::debug::emit_counter(
+            "s3_majflt_delta",
+            (s3_majflt_after - s3_majflt_before) as i64,
+        );
     }
     crate::debug::emit_marker("EXTJOIN_STAGE4_END");
     crate::debug::emit_marker("EXTJOIN_STAGE3_END");
@@ -1058,7 +1082,10 @@ pub fn external_join(
     // Emit router stats that the deleted `build_blob_location_router`
     // used to report.
     {
-        let s = router.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let s = router
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         #[allow(clippy::cast_possible_wrap)]
         {
             crate::debug::emit_counter("s3_router_num_worker", s.num_worker as i64);
@@ -1066,7 +1093,10 @@ pub fn external_join(
             crate::debug::emit_counter("s3_router_num_empty", s.num_empty as i64);
             crate::debug::emit_counter("s3_router_worker_bytes", s.worker_bytes as i64);
             crate::debug::emit_counter("s3_router_straddler_bytes", s.straddler_bytes as i64);
-            crate::debug::emit_counter("s3_straddler_encode_ms", (s.straddler_encode_ns / 1_000_000) as i64);
+            crate::debug::emit_counter(
+                "s3_straddler_encode_ms",
+                (s.straddler_encode_ns / 1_000_000) as i64,
+            );
         }
         eprintln!(
             "[coord_payloads] streaming router {} way blobs ({} worker / {} straddler / {} empty), \

@@ -26,7 +26,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::blob::{parse_blob_header_with_index, BlobKind, MAX_BLOB_HEADER_SIZE};
+use crate::blob::{BlobKind, MAX_BLOB_HEADER_SIZE, parse_blob_header_with_index};
 use crate::blob_meta::BlobIndex;
 use crate::error::Result;
 
@@ -82,9 +82,10 @@ impl HeaderWalker {
     /// this helper.
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path).map_err(|e| {
-            crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
-                format!("failed to open {}: {e}", path.display()),
-            )))
+            crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(format!(
+                "failed to open {}: {e}",
+                path.display()
+            ))))
         })?;
         let file_size = file
             .metadata()
@@ -179,7 +180,9 @@ impl HeaderWalker {
         // multi-GB allocation on the fallback path.
         if header_len as u64 >= MAX_BLOB_HEADER_SIZE {
             return Err(crate::error::new_blob_error(
-                crate::error::BlobError::HeaderTooBig { size: header_len as u64 },
+                crate::error::BlobError::HeaderTooBig {
+                    size: header_len as u64,
+                },
             ));
         }
         let header_end = 4 + header_len;
@@ -196,28 +199,22 @@ impl HeaderWalker {
 
         let (blob_type, data_size, raw_index, tagdata) =
             parse_blob_header_with_index(&self.header_buf[4..header_end])?;
-        let index = raw_index
-            .as_ref()
-            .and_then(|b| BlobIndex::deserialize(b));
+        let index = raw_index.as_ref().and_then(|b| BlobIndex::deserialize(b));
 
         let data_offset = self.offset + header_end as u64;
         // Per `reference/truncation-handling.md` shape 4: the declared
         // payload must fit within the file. Without this check, a
         // truncated tail blob would silently terminate the walk on the
         // next call (offset >= file_size returns Ok(None)).
-        let payload_end = data_offset
-            .checked_add(data_size as u64)
-            .ok_or_else(|| {
-                crate::error::new_error(crate::error::ErrorKind::Io(
-                    ::std::io::Error::new(
-                        ::std::io::ErrorKind::InvalidData,
-                        format!(
-                            "blob at offset {} declares overflowing payload size {data_size}",
-                            self.offset
-                        ),
-                    ),
-                ))
-            })?;
+        let payload_end = data_offset.checked_add(data_size as u64).ok_or_else(|| {
+            crate::error::new_error(crate::error::ErrorKind::Io(::std::io::Error::new(
+                ::std::io::ErrorKind::InvalidData,
+                format!(
+                    "blob at offset {} declares overflowing payload size {data_size}",
+                    self.offset
+                ),
+            )))
+        })?;
         if payload_end > self.file_size {
             return Err(crate::error::new_error(crate::error::ErrorKind::Io(
                 ::std::io::Error::new(

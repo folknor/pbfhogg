@@ -6,7 +6,7 @@ pub mod external;
 // hooks so integration tests can arm them.
 #[cfg(feature = "test-hooks")]
 pub mod external_test_hooks {
-    pub use super::external::test_hooks::stage3 as stage3;
+    pub use super::external::test_hooks::stage3;
 }
 mod passthrough;
 mod reframe;
@@ -22,16 +22,16 @@ use crate::writer::{Compression, PbfWriter};
 use crate::{Element, ElementReader, MemberId, PrimitiveBlock};
 
 use super::{
-    drain_batch_results, ensure_node_capacity_local, ensure_relation_capacity_local,
-    ensure_way_capacity_local, require_indexdata, writer_from_header, writer_from_header_parallel,
-    HeaderOverrides,
+    HeaderOverrides, drain_batch_results, ensure_node_capacity_local,
+    ensure_relation_capacity_local, ensure_way_capacity_local, require_indexdata,
+    writer_from_header, writer_from_header_parallel,
 };
 use crate::idset::IdSet;
 
-use super::{Result, BATCH_SIZE};
+use super::{BATCH_SIZE, Result};
 
 use self::passthrough::write_output_passthrough;
-use self::sparse::{build_node_index_sparse, SparseArrayIndex};
+use self::sparse::{SparseArrayIndex, build_node_index_sparse};
 
 // ---------------------------------------------------------------------------
 // Index type selection
@@ -81,7 +81,8 @@ impl FromStr for IndexType {
                 "index type 'dense' was removed in favor of 'sparse'. Sparse \
                  (rank-indexed flat) is faster than dense at every measured \
                  scale and works in regimes dense doesn't. Use \
-                 --index-type sparse instead.".to_string(),
+                 --index-type sparse instead."
+                    .to_string(),
             )),
             _ => Err(ParseIndexTypeError(format!(
                 "unknown index type '{s}': expected 'sparse', 'external', or 'auto'"
@@ -200,25 +201,7 @@ pub fn add_locations_to_ways(
 ) -> Result<Stats> {
     // Auto-select: external if sorted + indexed, sparse otherwise.
     let index_type = if index_type == IndexType::Auto {
-        let reader = crate::ElementReader::open(input, direct_io)?;
-        let sorted = reader.header().is_sorted();
-        drop(reader);
-        // Check indexdata presence without erroring (peek at first blob).
-        let has_index = (|| -> Option<bool> {
-            let mut r = crate::blob::BlobReader::open(input, direct_io).ok()?;
-            r.set_parse_indexdata(true);
-            r.next()?.ok()?; // skip header
-            let blob = r.next()?.ok()?;
-            Some(blob.index().is_some())
-        })().unwrap_or(false);
-
-        let chosen = if sorted && has_index {
-            IndexType::External
-        } else {
-            IndexType::Sparse
-        };
-        eprintln!("auto-selected --index-type {chosen} (sorted={sorted}, indexed={has_index})");
-        chosen
+        auto_select_index_type(input, direct_io)?
     } else {
         index_type
     };
@@ -236,9 +219,13 @@ pub fn add_locations_to_ways(
         );
     }
 
-    let indexdata_present = require_indexdata(input, direct_io, force,
+    let indexdata_present = require_indexdata(
+        input,
+        direct_io,
+        force,
         "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
-         decompressed and re-encoded (significantly slower).")?;
+         decompressed and re-encoded (significantly slower).",
+    )?;
 
     // Suggest external index for sorted indexed PBFs on sparse selection.
     if index_type == IndexType::Sparse && indexdata_present {
@@ -312,6 +299,30 @@ pub fn add_locations_to_ways(
     crate::debug::emit_marker("ALTW_PASS2_END");
     emit_stats_counters(&stats);
     Ok(stats)
+}
+
+// Auto-select: external if sorted + indexed, sparse otherwise.
+fn auto_select_index_type(input: &Path, direct_io: bool) -> Result<IndexType> {
+    let reader = crate::ElementReader::open(input, direct_io)?;
+    let sorted = reader.header().is_sorted();
+    drop(reader);
+    // Check indexdata presence without erroring (peek at first blob).
+    let has_index = (|| -> Option<bool> {
+        let mut r = crate::blob::BlobReader::open(input, direct_io).ok()?;
+        r.set_parse_indexdata(true);
+        r.next()?.ok()?; // skip header
+        let blob = r.next()?.ok()?;
+        Some(blob.index().is_some())
+    })()
+    .unwrap_or(false);
+
+    let chosen = if sorted && has_index {
+        IndexType::External
+    } else {
+        IndexType::Sparse
+    };
+    eprintln!("auto-selected --index-type {chosen} (sorted={sorted}, indexed={has_index})");
+    Ok(chosen)
 }
 
 #[allow(clippy::cast_possible_wrap)]
@@ -463,7 +474,6 @@ pub(crate) fn collect_relation_member_node_ids(input: &Path, _direct_io: bool) -
 // Pass 2: Write output with locations on ways
 // ---------------------------------------------------------------------------
 
-
 #[allow(clippy::too_many_arguments)]
 fn write_output_checked(
     input: &Path,
@@ -578,7 +588,6 @@ fn write_output_decode_all(
 use super::flush_local;
 use crate::owned::{dense_node_metadata, element_metadata};
 
-
 /// Process a single `PrimitiveBlock`, writing elements into the thread-local
 /// `BlockBuilder` and flushing complete blocks into `output`.
 ///
@@ -617,7 +626,13 @@ fn process_block(
                 {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = dense_node_metadata(dn);
-                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), meta.as_ref());
+                    bb.add_node(
+                        dn.id(),
+                        dn.decimicro_lat(),
+                        dn.decimicro_lon(),
+                        dn.tags(),
+                        meta.as_ref(),
+                    );
                     stats.nodes_written += 1;
                 } else {
                     stats.nodes_dropped += 1;
@@ -632,7 +647,13 @@ fn process_block(
                 {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = element_metadata(&n.info());
-                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), n.tags(), meta.as_ref());
+                    bb.add_node(
+                        n.id(),
+                        n.decimicro_lat(),
+                        n.decimicro_lon(),
+                        n.tags(),
+                        meta.as_ref(),
+                    );
                     stats.nodes_written += 1;
                 } else {
                     stats.nodes_dropped += 1;
@@ -692,7 +713,13 @@ fn process_batch(
     let results: Vec<BatchResult> = batch
         .par_iter()
         .map_init(
-            || (BlockBuilder::new(), Vec::<i64>::new(), Vec::<(i32, i32)>::new()),
+            || {
+                (
+                    BlockBuilder::new(),
+                    Vec::<i64>::new(),
+                    Vec::<(i32, i32)>::new(),
+                )
+            },
             |(bb, refs_buf, locations_buf), block| {
                 let mut output: Vec<OwnedBlock> = Vec::new();
                 let block_stats = process_block(
@@ -702,7 +729,8 @@ fn process_batch(
                     index,
                     keep_untagged_nodes,
                     relation_member_node_ids,
-                    refs_buf, locations_buf,
+                    refs_buf,
+                    locations_buf,
                 )?;
                 flush_local(bb, &mut output)?;
                 Ok((output, block_stats))

@@ -24,11 +24,10 @@ use std::path::Path;
 
 use common::cli::CliInvoker;
 use common::{
-    generate_nodes, generate_relations, generate_ways,
-    node_ids_id_only as node_ids, read_all_elements_id_only as read_all_elements,
-    relation_ids_id_only as relation_ids, way_ids_id_only as way_ids,
-    write_multi_block_test_pbf, write_test_pbf, PbfContentsIdOnly, TestMember, TestNode,
-    TestRelation, TestWay,
+    PbfContentsIdOnly, TestMember, TestNode, TestRelation, TestWay, generate_nodes,
+    generate_relations, generate_ways, node_ids_id_only as node_ids,
+    read_all_elements_id_only as read_all_elements, relation_ids_id_only as relation_ids,
+    way_ids_id_only as way_ids, write_multi_block_test_pbf, write_test_pbf,
 };
 use pbfhogg::MemberId;
 use tempfile::TempDir;
@@ -71,7 +70,15 @@ fn run_filter_full(
 }
 
 fn run_filter(input: &Path, output: &Path, expressions: &[&str], omit_referenced: bool) -> String {
-    run_filter_full(input, output, expressions, omit_referenced, false, false, None)
+    run_filter_full(
+        input,
+        output,
+        expressions,
+        omit_referenced,
+        false,
+        false,
+        None,
+    )
 }
 
 #[test]
@@ -83,9 +90,27 @@ fn key_only_filter() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("amenity", "bench")], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "foo")], meta: None },
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![("amenity", "restaurant"), ("name", "bar")], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("amenity", "bench")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![("name", "foo")],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 120_000_000,
+                lon: 220_000_000,
+                tags: vec![("amenity", "restaurant"), ("name", "bar")],
+                meta: None,
+            },
         ],
         &[],
         &[],
@@ -105,14 +130,47 @@ fn exact_value_filter() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 120_000_000,
+                lon: 220_000_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[
-            TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")], meta: None },
-            TestWay { id: 11, refs: vec![2, 3], tags: vec![("highway", "secondary")], meta: None },
-            TestWay { id: 12, refs: vec![1, 3], tags: vec![("name", "road")], meta: None },
+            TestWay {
+                id: 10,
+                refs: vec![1, 2],
+                tags: vec![("highway", "primary")],
+                meta: None,
+            },
+            TestWay {
+                id: 11,
+                refs: vec![2, 3],
+                tags: vec![("highway", "secondary")],
+                meta: None,
+            },
+            TestWay {
+                id: 12,
+                refs: vec![1, 3],
+                tags: vec![("name", "road")],
+                meta: None,
+            },
         ],
         &[],
     );
@@ -134,9 +192,24 @@ fn multi_value_filter() {
         &[],
         &[],
         &[
-            TestRelation { id: 1, members: vec![], tags: vec![("type", "multipolygon")], meta: None },
-            TestRelation { id: 2, members: vec![], tags: vec![("type", "boundary")], meta: None },
-            TestRelation { id: 3, members: vec![], tags: vec![("type", "route")], meta: None },
+            TestRelation {
+                id: 1,
+                members: vec![],
+                tags: vec![("type", "multipolygon")],
+                meta: None,
+            },
+            TestRelation {
+                id: 2,
+                members: vec![],
+                tags: vec![("type", "boundary")],
+                meta: None,
+            },
+            TestRelation {
+                id: 3,
+                members: vec![],
+                tags: vec![("type", "route")],
+                meta: None,
+            },
         ],
     );
 
@@ -155,9 +228,24 @@ fn negation_filter() {
         &input,
         &[],
         &[
-            TestWay { id: 10, refs: vec![], tags: vec![("highway", "primary")], meta: None },
-            TestWay { id: 11, refs: vec![], tags: vec![("highway", "secondary")], meta: None },
-            TestWay { id: 12, refs: vec![], tags: vec![("name", "road")], meta: None }, // no highway tag
+            TestWay {
+                id: 10,
+                refs: vec![],
+                tags: vec![("highway", "primary")],
+                meta: None,
+            },
+            TestWay {
+                id: 11,
+                refs: vec![],
+                tags: vec![("highway", "secondary")],
+                meta: None,
+            },
+            TestWay {
+                id: 12,
+                refs: vec![],
+                tags: vec![("name", "road")],
+                meta: None,
+            }, // no highway tag
         ],
         &[],
     );
@@ -179,9 +267,27 @@ fn wildcard_prefix_filter() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("addr:street", "Main St")], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("addr:city", "Berlin")], meta: None },
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![("name", "foo")], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("addr:street", "Main St")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![("addr:city", "Berlin")],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 120_000_000,
+                lon: 220_000_000,
+                tags: vec![("name", "foo")],
+                meta: None,
+            },
         ],
         &[],
         &[],
@@ -200,12 +306,19 @@ fn type_prefix_filter() {
 
     write_test_pbf(
         &input,
-        &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("building", "yes")], meta: None },
-        ],
-        &[
-            TestWay { id: 10, refs: vec![], tags: vec![("building", "yes")], meta: None },
-        ],
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![("building", "yes")],
+            meta: None,
+        }],
+        &[TestWay {
+            id: 10,
+            refs: vec![],
+            tags: vec![("building", "yes")],
+            meta: None,
+        }],
         &[],
     );
 
@@ -224,15 +337,25 @@ fn combined_type_prefix_nw() {
 
     write_test_pbf(
         &input,
-        &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("natural", "tree")], meta: None },
-        ],
-        &[
-            TestWay { id: 10, refs: vec![], tags: vec![("natural", "tree")], meta: None },
-        ],
-        &[
-            TestRelation { id: 100, members: vec![], tags: vec![("natural", "tree")], meta: None },
-        ],
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![("natural", "tree")],
+            meta: None,
+        }],
+        &[TestWay {
+            id: 10,
+            refs: vec![],
+            tags: vec![("natural", "tree")],
+            meta: None,
+        }],
+        &[TestRelation {
+            id: 100,
+            members: vec![],
+            tags: vec![("natural", "tree")],
+            meta: None,
+        }],
     );
 
     run_filter(&input, &output, &["nw/natural=tree"], true);
@@ -251,14 +374,41 @@ fn two_pass_includes_way_dep_nodes() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![], meta: None },
-            TestNode { id: 4, lat: 130_000_000, lon: 230_000_000, tags: vec![], meta: None }, // not referenced
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 120_000_000,
+                lon: 220_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 4,
+                lat: 130_000_000,
+                lon: 230_000_000,
+                tags: vec![],
+                meta: None,
+            }, // not referenced
         ],
-        &[
-            TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "primary")], meta: None },
-        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2, 3],
+            tags: vec![("highway", "primary")],
+            meta: None,
+        }],
         &[],
     );
 
@@ -284,12 +434,27 @@ fn omit_referenced_excludes_way_dep_nodes() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
-        &[
-            TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")], meta: None },
-        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "primary")],
+            meta: None,
+        }],
         &[],
     );
 
@@ -309,14 +474,41 @@ fn two_pass_direct_node_match_plus_way_deps() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("amenity", "bench")], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![], meta: None },
-            TestNode { id: 4, lat: 130_000_000, lon: 230_000_000, tags: vec![], meta: None }, // excluded
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("amenity", "bench")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 120_000_000,
+                lon: 220_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 4,
+                lat: 130_000_000,
+                lon: 230_000_000,
+                tags: vec![],
+                meta: None,
+            }, // excluded
         ],
-        &[
-            TestWay { id: 10, refs: vec![2, 3], tags: vec![("highway", "primary")], meta: None },
-        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![2, 3],
+            tags: vec![("highway", "primary")],
+            meta: None,
+        }],
         &[],
     );
 
@@ -340,9 +532,13 @@ fn empty_result_produces_valid_pbf() {
 
     write_test_pbf(
         &input,
-        &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "foo")], meta: None },
-        ],
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![("name", "foo")],
+            meta: None,
+        }],
         &[],
         &[],
     );
@@ -363,9 +559,27 @@ fn multiple_expressions_or_semantics() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("amenity", "bench")], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("shop", "bakery")], meta: None },
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![("name", "foo")], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("amenity", "bench")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![("shop", "bakery")],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 120_000_000,
+                lon: 220_000_000,
+                tags: vec![("name", "foo")],
+                meta: None,
+            },
         ],
         &[],
         &[],
@@ -386,22 +600,51 @@ fn relation_match_includes_member_way_and_nodes() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![], meta: None }, // unrelated
-        ],
-        &[
-            TestWay { id: 10, refs: vec![1, 2], tags: vec![], meta: None },
-            TestWay { id: 11, refs: vec![3], tags: vec![], meta: None }, // unrelated
-        ],
-        &[
-            TestRelation {
-                id: 100,
-                members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
-                tags: vec![("type", "multipolygon")],
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
                 meta: None,
             },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 120_000_000,
+                lon: 220_000_000,
+                tags: vec![],
+                meta: None,
+            }, // unrelated
         ],
+        &[
+            TestWay {
+                id: 10,
+                refs: vec![1, 2],
+                tags: vec![],
+                meta: None,
+            },
+            TestWay {
+                id: 11,
+                refs: vec![3],
+                tags: vec![],
+                meta: None,
+            }, // unrelated
+        ],
+        &[TestRelation {
+            id: 100,
+            members: vec![TestMember {
+                id: MemberId::Way(10),
+                role: "outer",
+            }],
+            tags: vec![("type", "multipolygon")],
+            meta: None,
+        }],
     );
 
     let stderr = run_filter(&input, &output, &["type=multipolygon"], false);
@@ -430,22 +673,43 @@ fn relation_match_includes_nested_relation_members() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
-        &[
-            TestWay { id: 10, refs: vec![1, 2], tags: vec![], meta: None },
-        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![],
+            meta: None,
+        }],
         &[
             TestRelation {
                 id: 100,
-                members: vec![TestMember { id: MemberId::Relation(200), role: "" }],
+                members: vec![TestMember {
+                    id: MemberId::Relation(200),
+                    role: "",
+                }],
                 tags: vec![("type", "route")],
                 meta: None,
             },
             TestRelation {
                 id: 200,
-                members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+                members: vec![TestMember {
+                    id: MemberId::Way(10),
+                    role: "outer",
+                }],
                 tags: vec![],
                 meta: None,
             },
@@ -472,13 +736,19 @@ fn relation_cycle_terminates_and_includes_each_once() {
         &[
             TestRelation {
                 id: 100,
-                members: vec![TestMember { id: MemberId::Relation(200), role: "" }],
+                members: vec![TestMember {
+                    id: MemberId::Relation(200),
+                    role: "",
+                }],
                 tags: vec![("type", "route")],
                 meta: None,
             },
             TestRelation {
                 id: 200,
-                members: vec![TestMember { id: MemberId::Relation(100), role: "" }],
+                members: vec![TestMember {
+                    id: MemberId::Relation(100),
+                    role: "",
+                }],
                 tags: vec![],
                 meta: None,
             },
@@ -499,20 +769,36 @@ fn omit_referenced_does_not_expand_relation_members() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
-        ],
-        &[
-            TestWay { id: 10, refs: vec![1, 2], tags: vec![], meta: None },
-        ],
-        &[
-            TestRelation {
-                id: 100,
-                members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
-                tags: vec![("type", "multipolygon")],
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
                 meta: None,
             },
         ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![],
+            meta: None,
+        }],
+        &[TestRelation {
+            id: 100,
+            members: vec![TestMember {
+                id: MemberId::Way(10),
+                role: "outer",
+            }],
+            tags: vec![("type", "multipolygon")],
+            meta: None,
+        }],
     );
 
     run_filter(&input, &output, &["type=multipolygon"], true);
@@ -535,9 +821,27 @@ fn invert_match_excludes_matching_nodes() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("amenity", "bench")], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "foo")], meta: None },
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("amenity", "bench")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![("name", "foo")],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 120_000_000,
+                lon: 220_000_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[],
         &[],
@@ -559,13 +863,40 @@ fn invert_match_excludes_matching_ways() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[
-            TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")], meta: None },
-            TestWay { id: 11, refs: vec![1, 2], tags: vec![("highway", "secondary")], meta: None },
-            TestWay { id: 12, refs: vec![1, 2], tags: vec![("building", "yes")], meta: None },
+            TestWay {
+                id: 10,
+                refs: vec![1, 2],
+                tags: vec![("highway", "primary")],
+                meta: None,
+            },
+            TestWay {
+                id: 11,
+                refs: vec![1, 2],
+                tags: vec![("highway", "secondary")],
+                meta: None,
+            },
+            TestWay {
+                id: 12,
+                refs: vec![1, 2],
+                tags: vec![("building", "yes")],
+                meta: None,
+            },
         ],
         &[],
     );
@@ -590,12 +921,27 @@ fn remove_tags_strips_tags_from_referenced_nodes() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("shop", "bakery")], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "corner")], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("shop", "bakery")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![("name", "corner")],
+                meta: None,
+            },
         ],
-        &[
-            TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "residential")], meta: None },
-        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "residential")],
+            meta: None,
+        }],
         &[],
     );
 
@@ -615,13 +961,19 @@ fn remove_tags_strips_tags_from_referenced_nodes() {
         .find(|(id, _, _)| *id == 10)
         .map(|(_, _, tags)| tags.clone())
         .unwrap_or_default();
-    assert!(!way_tags.is_empty(), "directly matched way should keep tags");
+    assert!(
+        !way_tags.is_empty(),
+        "directly matched way should keep tags"
+    );
 
     // Nodes 1,2 should be present but with empty tags (referenced only).
     let node_id_list: Vec<i64> = c.nodes.iter().map(|(id, _, _, _)| *id).collect();
     assert_eq!(node_id_list, vec![1, 2]);
     for (id, _, _, tags) in &c.nodes {
-        assert!(tags.is_empty(), "node {id} should have tags stripped (referenced only)");
+        assert!(
+            tags.is_empty(),
+            "node {id} should have tags stripped (referenced only)"
+        );
     }
 }
 
@@ -678,9 +1030,21 @@ fn tags_filter_parallel_classify_parity() {
     let (c_par, stderr_par) = run_parity(&input, 4);
 
     // Element sets must match (ids only, order preserved on sorted input).
-    assert_eq!(node_ids(&c_seq), node_ids(&c_par), "node id set diverges under -j 4");
-    assert_eq!(way_ids(&c_seq), way_ids(&c_par), "way id set diverges under -j 4");
-    assert_eq!(relation_ids(&c_seq), relation_ids(&c_par), "relation id set diverges under -j 4");
+    assert_eq!(
+        node_ids(&c_seq),
+        node_ids(&c_par),
+        "node id set diverges under -j 4"
+    );
+    assert_eq!(
+        way_ids(&c_seq),
+        way_ids(&c_par),
+        "way id set diverges under -j 4"
+    );
+    assert_eq!(
+        relation_ids(&c_seq),
+        relation_ids(&c_par),
+        "relation id set diverges under -j 4"
+    );
 
     // The full summary line must match. This pins every counter
     // (`nodes_matched`, `nodes_from_ways`, `nodes_from_relations`,
@@ -694,7 +1058,10 @@ fn tags_filter_parallel_classify_parity() {
         .lines()
         .find(|l| l.starts_with("Wrote "))
         .expect("stats line in -j 4 stderr");
-    assert_eq!(line_seq, line_par, "TagsFilterStats summary diverges under -j 4");
+    assert_eq!(
+        line_seq, line_par,
+        "TagsFilterStats summary diverges under -j 4"
+    );
 
     // Sanity: the filter must have matched SOME ways (otherwise the
     // test is trivially parity-clean because nothing is emitted).

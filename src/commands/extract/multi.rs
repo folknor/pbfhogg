@@ -6,9 +6,9 @@ use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::{Compression, PbfWriter};
 use crate::{Element, PrimitiveBlock};
 
-use super::super::{Result,
-    flush_local, ensure_node_capacity_local, ensure_way_capacity_local,
-    ensure_relation_capacity_local, HeaderOverrides,
+use super::super::{
+    HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
+    ensure_way_capacity_local, flush_local,
 };
 use crate::idset::IdSet;
 
@@ -23,7 +23,11 @@ use crate::owned::{dense_node_metadata, element_metadata};
 ///
 /// Simple strategy only (no per-region way/relation ID tracking beyond what
 /// fits in memory). Uses sync-mode PbfWriters (no per-writer thread).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cognitive_complexity)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cognitive_complexity
+)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn try_extract_multi_single_pass(
     input: &Path,
@@ -58,16 +62,33 @@ pub(super) fn try_extract_multi_single_pass(
     eprintln!("[multi-extract] single-pass: {n} regions, simple strategy");
 
     // Precompute per-region integer bboxes.
-    let bbox_ints: Vec<BboxInt> = slots.iter()
+    let bbox_ints: Vec<BboxInt> = slots
+        .iter()
         .map(|s| BboxInt::from_bbox(s.region.bbox()))
         .collect();
 
     // Union bbox for blob-level spatial skip.
     let union_bbox = BboxInt {
-        min_lon: bbox_ints.iter().map(|b| b.min_lon).min().unwrap_or(i32::MIN),
-        min_lat: bbox_ints.iter().map(|b| b.min_lat).min().unwrap_or(i32::MIN),
-        max_lon: bbox_ints.iter().map(|b| b.max_lon).max().unwrap_or(i32::MAX),
-        max_lat: bbox_ints.iter().map(|b| b.max_lat).max().unwrap_or(i32::MAX),
+        min_lon: bbox_ints
+            .iter()
+            .map(|b| b.min_lon)
+            .min()
+            .unwrap_or(i32::MIN),
+        min_lat: bbox_ints
+            .iter()
+            .map(|b| b.min_lat)
+            .min()
+            .unwrap_or(i32::MIN),
+        max_lon: bbox_ints
+            .iter()
+            .map(|b| b.max_lon)
+            .max()
+            .unwrap_or(i32::MAX),
+        max_lat: bbox_ints
+            .iter()
+            .map(|b| b.max_lat)
+            .max()
+            .unwrap_or(i32::MAX),
     };
     let spatial_filter = spatial_blob_filter(&union_bbox);
 
@@ -85,7 +106,7 @@ pub(super) fn try_extract_multi_single_pass(
         })?;
         let file = BufWriter::new(
             std::fs::File::create(&slot.output)
-                .map_err(|e| format!("failed to create {}: {e}", slot.output.display()))?
+                .map_err(|e| format!("failed to create {}: {e}", slot.output.display()))?,
         );
         let mut w = PbfWriter::new(file, compression);
         w.write_header(&header_bytes)
@@ -97,15 +118,17 @@ pub(super) fn try_extract_multi_single_pass(
     let mut bbox_node_ids: Vec<IdSet> = (0..n).map(|_| IdSet::new()).collect();
     let mut matched_way_ids: Vec<IdSet> = (0..n).map(|_| IdSet::new()).collect();
     let mut matched_relation_ids: Vec<IdSet> = (0..n).map(|_| IdSet::new()).collect();
-    let mut stats: Vec<ExtractStats> = (0..n).map(|_| ExtractStats {
-        nodes_in_bbox: 0,
-        nodes_from_ways: 0,
-        nodes_from_relations: 0,
-        ways_written: 0,
-        ways_from_relations: 0,
-        relations_written: 0,
-        strategy: "simple",
-    }).collect();
+    let mut stats: Vec<ExtractStats> = (0..n)
+        .map(|_| ExtractStats {
+            nodes_in_bbox: 0,
+            nodes_from_ways: 0,
+            nodes_from_relations: 0,
+            ways_written: 0,
+            ways_from_relations: 0,
+            relations_written: 0,
+            strategy: "simple",
+        })
+        .collect();
 
     // Build schedules by element type for parallel classification.
     // Walk via the pread-only HeaderWalker so blob bodies stay out of the
@@ -124,9 +147,13 @@ pub(super) fn try_extract_multi_single_pass(
     let mut node_blob_info: Vec<NodeBlobInfo> = Vec::new();
     let mut seq: usize = 0;
     while let Some(meta) = walker.next_header()? {
-        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) { continue; }
+        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
+            continue;
+        }
         if let Some(idx) = meta.index.as_ref() {
-            if !spatial_filter.wants_index(idx) { continue; }
+            if !spatial_filter.wants_index(idx) {
+                continue;
+            }
             match idx.kind {
                 crate::blob_meta::ElemKind::Node => {
                     // Raw passthrough is only sound for bbox regions - polygon
@@ -136,7 +163,9 @@ pub(super) fn try_extract_multi_single_pass(
                     if let Some(ref blob_bbox) = idx.bbox {
                         for (i, (bi, slot)) in bbox_ints.iter().zip(slots.iter()).enumerate() {
                             if matches!(slot.region, Region::Bbox(_)) {
-                                let region_bbox = crate::BlobBbox::new(bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon);
+                                let region_bbox = crate::BlobBbox::new(
+                                    bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon,
+                                );
                                 if region_bbox.contains(blob_bbox) {
                                     contained_in.push(i);
                                 }
@@ -151,8 +180,12 @@ pub(super) fn try_extract_multi_single_pass(
                     });
                     node_schedule.push((seq, meta.data_offset, meta.data_size));
                 }
-                crate::blob_meta::ElemKind::Way => way_schedule.push((seq, meta.data_offset, meta.data_size)),
-                crate::blob_meta::ElemKind::Relation => relation_schedule.push((seq, meta.data_offset, meta.data_size)),
+                crate::blob_meta::ElemKind::Way => {
+                    way_schedule.push((seq, meta.data_offset, meta.data_size));
+                }
+                crate::blob_meta::ElemKind::Relation => {
+                    relation_schedule.push((seq, meta.data_offset, meta.data_size));
+                }
             }
         } else {
             // No indexdata - include in all schedules (conservative).
@@ -219,23 +252,33 @@ pub(super) fn try_extract_multi_single_pass(
     let all_bbox = slots.iter().all(|s| matches!(s.region, Region::Bbox(_)));
     crate::debug::emit_marker("MULTI_NODE_CLASSIFY_START");
     if all_bbox {
-        let bboxes: Vec<(i32, i32, i32, i32)> = bbox_ints.iter()
+        let bboxes: Vec<(i32, i32, i32, i32)> = bbox_ints
+            .iter()
             .map(|bi| (bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon))
             .collect();
         crate::scan::classify::parallel_classify_phase(
             &shared_file,
             &node_schedule,
             None,
-            || (crate::read::columnar::DenseNodeColumns::new(), vec![Vec::<i64>::new(); n]),
+            || {
+                (
+                    crate::read::columnar::DenseNodeColumns::new(),
+                    vec![Vec::<i64>::new(); n],
+                )
+            },
             |block, (columns, scratch)| {
                 block.decode_dense_columns(columns);
-                for v in scratch.iter_mut() { v.clear(); }
+                for v in scratch.iter_mut() {
+                    v.clear();
+                }
                 columns.collect_matching_ids_multi_bbox(&bboxes, scratch);
                 scratch.iter_mut().map(std::mem::take).collect::<Vec<_>>()
             },
             |_seq, region_ids: Vec<Vec<i64>>| {
                 for (i, ids) in region_ids.into_iter().enumerate() {
-                    for id in ids { bbox_node_ids[i].set(id); }
+                    for id in ids {
+                        bbox_node_ids[i].set(id);
+                    }
                 }
             },
         )?;
@@ -246,7 +289,9 @@ pub(super) fn try_extract_multi_single_pass(
             None,
             || vec![Vec::<i64>::new(); n],
             |block, scratch| {
-                for v in scratch.iter_mut() { v.clear(); }
+                for v in scratch.iter_mut() {
+                    v.clear();
+                }
                 for element in block.elements_skip_metadata() {
                     match &element {
                         Element::DenseNode(dn) => {
@@ -274,7 +319,9 @@ pub(super) fn try_extract_multi_single_pass(
             },
             |_seq, region_ids: Vec<Vec<i64>>| {
                 for (i, ids) in region_ids.into_iter().enumerate() {
-                    for id in ids { bbox_node_ids[i].set(id); }
+                    for id in ids {
+                        bbox_node_ids[i].set(id);
+                    }
                 }
             },
         )?;
@@ -298,7 +345,13 @@ pub(super) fn try_extract_multi_single_pass(
                         for i in 0..n {
                             if bbox_node_ids[i].get(id) {
                                 ensure_node_capacity_local(&mut bbs[i], &mut output[i])?;
-                                bbs[i].add_node(id, dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), meta.as_ref());
+                                bbs[i].add_node(
+                                    id,
+                                    dn.decimicro_lat(),
+                                    dn.decimicro_lon(),
+                                    dn.tags(),
+                                    meta.as_ref(),
+                                );
                                 counts[i] += 1;
                             }
                         }
@@ -309,7 +362,13 @@ pub(super) fn try_extract_multi_single_pass(
                         for i in 0..n {
                             if bbox_node_ids[i].get(id) {
                                 ensure_node_capacity_local(&mut bbs[i], &mut output[i])?;
-                                bbs[i].add_node(id, nd.decimicro_lat(), nd.decimicro_lon(), nd.tags(), meta.as_ref());
+                                bbs[i].add_node(
+                                    id,
+                                    nd.decimicro_lat(),
+                                    nd.decimicro_lon(),
+                                    nd.tags(),
+                                    meta.as_ref(),
+                                );
                                 counts[i] += 1;
                             }
                         }
@@ -339,7 +398,9 @@ pub(super) fn try_extract_multi_single_pass(
         None,
         || vec![Vec::<i64>::new(); n],
         |block, scratch: &mut Vec<Vec<i64>>| {
-            for v in scratch.iter_mut() { v.clear(); }
+            for v in scratch.iter_mut() {
+                v.clear();
+            }
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element {
                     for i in 0..n {
@@ -353,7 +414,9 @@ pub(super) fn try_extract_multi_single_pass(
         },
         |_seq, region_ids| {
             for (i, ids) in region_ids.into_iter().enumerate() {
-                for id in ids { matched_way_ids[i].set(id); }
+                for id in ids {
+                    matched_way_ids[i].set(id);
+                }
             }
         },
     )?;
@@ -370,7 +433,9 @@ pub(super) fn try_extract_multi_single_pass(
             for element in block.elements() {
                 if let Element::Way(w) = &element {
                     let wid = w.id();
-                    if !matched_way_ids.iter().any(|s| s.get(wid)) { continue; }
+                    if !matched_way_ids.iter().any(|s| s.get(wid)) {
+                        continue;
+                    }
                     scratch.clear();
                     scratch.extend(w.refs());
                     let meta = element_metadata(&w.info());
@@ -429,7 +494,9 @@ pub(super) fn try_extract_multi_single_pass(
             for element in block.elements() {
                 if let Element::Relation(r) = &element {
                     let rid = r.id();
-                    if !matched_relation_ids.iter().any(|s| s.get(rid)) { continue; }
+                    if !matched_relation_ids.iter().any(|s| s.get(rid)) {
+                        continue;
+                    }
                     members_buf.clear();
                     members_buf.extend(r.members().map(|m| MemberData {
                         id: m.id,
@@ -455,7 +522,8 @@ pub(super) fn try_extract_multi_single_pass(
 
     // Flush all writers (workers already flushed their BlockBuilders per blob).
     for (i, slot) in slots.iter().enumerate() {
-        writers[i].flush()
+        writers[i]
+            .flush()
             .map_err(|e| format!("failed to flush {}: {e}", slot.output.display()))?;
     }
 
@@ -466,8 +534,14 @@ pub(super) fn try_extract_multi_single_pass(
         eprintln!(
             "  [{}] {}: {} elements ({} nodes, {} ways, {} relations)",
             i + 1,
-            slot.output.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
-            total, s.nodes_in_bbox, s.ways_written, s.relations_written,
+            slot.output
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("?"),
+            total,
+            s.nodes_in_bbox,
+            s.ways_written,
+            s.relations_written,
         );
     }
 
@@ -480,7 +554,10 @@ pub(super) fn try_extract_multi_single_pass(
         crate::debug::emit_counter("multi_extract_region_count", n as i64);
         crate::debug::emit_counter("multi_extract_node_blobs", node_schedule.len() as i64);
         crate::debug::emit_counter("multi_extract_way_blobs", way_schedule.len() as i64);
-        crate::debug::emit_counter("multi_extract_relation_blobs", relation_schedule.len() as i64);
+        crate::debug::emit_counter(
+            "multi_extract_relation_blobs",
+            relation_schedule.len() as i64,
+        );
         let total_nodes: u64 = stats.iter().map(|s| s.nodes_in_bbox).sum();
         let total_ways: u64 = stats.iter().map(|s| s.ways_written).sum();
         let total_relations: u64 = stats.iter().map(|s| s.relations_written).sum();
@@ -523,12 +600,20 @@ fn multi_extract_pread_write_nodes<F>(
     stats: &mut [ExtractStats],
 ) -> Result<()>
 where
-    F: Fn(&PrimitiveBlock, &mut Vec<BlockBuilder>, &mut Vec<Vec<OwnedBlock>>, &mut Vec<i64>)
-        -> std::result::Result<Vec<u64>, String> + Send + Sync,
+    F: Fn(
+            &PrimitiveBlock,
+            &mut Vec<BlockBuilder>,
+            &mut Vec<Vec<OwnedBlock>>,
+            &mut Vec<i64>,
+        ) -> std::result::Result<Vec<u64>, String>
+        + Send
+        + Sync,
 {
     use std::os::unix::fs::FileExt as _;
 
-    if schedule.is_empty() { return Ok(()); }
+    if schedule.is_empty() {
+        return Ok(());
+    }
 
     // Blobs fully contained in ALL N regions skip decode entirely - write raw
     // frame to all N writers. Other blobs go through parallel decode workers.
@@ -555,7 +640,8 @@ where
         let mut frame_buf: Vec<u8> = Vec::new();
         for &(_, frame_offset, frame_size, count) in &passthrough_items {
             frame_buf.resize(frame_size, 0);
-            shared_file.read_exact_at(&mut frame_buf, frame_offset)
+            shared_file
+                .read_exact_at(&mut frame_buf, frame_offset)
                 .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
             for i in 0..n {
                 writers[i].write_raw(&frame_buf)?;
@@ -578,7 +664,9 @@ where
     std::thread::scope(|scope| -> Result<()> {
         scope.spawn(move || {
             for item in decode_items {
-                if desc_tx.send(item).is_err() { break; }
+                if desc_tx.send(item).is_err() {
+                    break;
+                }
             }
         });
 
@@ -612,26 +700,34 @@ where
                         let mut buf = crate::blob::pool_get_pub(&worker_pool, data_size * 4);
                         crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
                         let block = PrimitiveBlock::from_vec_pooled_with_scratch(
-                            buf, &worker_pool, &mut st_scratch, &mut gr_scratch,
+                            buf,
+                            &worker_pool,
+                            &mut st_scratch,
+                            &mut gr_scratch,
                         )?;
-                        for v in &mut output { v.clear(); }
+                        for v in &mut output {
+                            v.clear();
+                        }
                         let counts = block_fn_ref(&block, &mut bbs, &mut output, &mut i64_scratch)
-                            .map_err(|e| crate::error::new_error(
-                                crate::error::ErrorKind::Io(std::io::Error::other(e))
-                            ))?;
+                            .map_err(|e| {
+                                crate::error::new_error(crate::error::ErrorKind::Io(
+                                    std::io::Error::other(e),
+                                ))
+                            })?;
                         for i in 0..n {
                             flush_local(&mut bbs[i], &mut output[i]).map_err(|e| {
-                                crate::error::new_error(
-                                    crate::error::ErrorKind::Io(std::io::Error::other(e))
-                                )
+                                crate::error::new_error(crate::error::ErrorKind::Io(
+                                    std::io::Error::other(e),
+                                ))
                             })?;
                         }
-                        let taken: Vec<Vec<OwnedBlock>> = output.iter_mut()
-                            .map(std::mem::take)
-                            .collect();
+                        let taken: Vec<Vec<OwnedBlock>> =
+                            output.iter_mut().map(std::mem::take).collect();
                         Ok((taken, counts))
                     })();
-                    if tx.send((s, MultiNodeCI::Decoded(r))).is_err() { break; }
+                    if tx.send((s, MultiNodeCI::Decoded(r))).is_err() {
+                        break;
+                    }
                 }
             });
         }
@@ -642,7 +738,10 @@ where
         let mut reorder: crate::reorder_buffer::ReorderBuffer<MultiNodeCI> =
             crate::reorder_buffer::ReorderBuffer::with_capacity(32);
         for &(local_seq, frame_offset, frame_size, count) in &passthrough_items {
-            reorder.push(local_seq, MultiNodeCI::Passthrough(frame_offset, frame_size, count));
+            reorder.push(
+                local_seq,
+                MultiNodeCI::Passthrough(frame_offset, frame_size, count),
+            );
         }
 
         let mut frame_buf: Vec<u8> = Vec::new();
@@ -677,13 +776,18 @@ fn write_consumer_item(
             for (i, blocks) in region_blocks.into_iter().enumerate() {
                 stats[i].nodes_in_bbox += counts[i];
                 for (block_bytes, index, tagdata) in blocks {
-                    writers[i].write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+                    writers[i].write_primitive_block_owned(
+                        block_bytes,
+                        index,
+                        tagdata.as_deref(),
+                    )?;
                 }
             }
         }
         MultiNodeCI::Passthrough(frame_offset, frame_size, count) => {
             frame_buf.resize(frame_size, 0);
-            shared_file.read_exact_at(frame_buf, frame_offset)
+            shared_file
+                .read_exact_at(frame_buf, frame_offset)
                 .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
             for i in 0..n {
                 writers[i].write_raw(frame_buf)?;
@@ -717,12 +821,20 @@ fn multi_extract_pread_write<F>(
     stat_field: fn(&mut ExtractStats) -> &mut u64,
 ) -> Result<()>
 where
-    F: Fn(&PrimitiveBlock, &mut Vec<BlockBuilder>, &mut Vec<Vec<OwnedBlock>>, &mut Vec<i64>)
-        -> std::result::Result<Vec<u64>, String> + Send + Sync,
+    F: Fn(
+            &PrimitiveBlock,
+            &mut Vec<BlockBuilder>,
+            &mut Vec<Vec<OwnedBlock>>,
+            &mut Vec<i64>,
+        ) -> std::result::Result<Vec<u64>, String>
+        + Send
+        + Sync,
 {
     use std::os::unix::fs::FileExt as _;
 
-    if schedule.is_empty() { return Ok(()); }
+    if schedule.is_empty() {
+        return Ok(());
+    }
 
     let decode_threads = std::thread::available_parallelism()
         .map(|t| t.get().saturating_sub(2).max(1))
@@ -739,7 +851,9 @@ where
         // Dispatcher: feed schedule items to workers with local sequence index.
         scope.spawn(move || {
             for (local_seq, &(_global_seq, data_offset, data_size)) in schedule.iter().enumerate() {
-                if desc_tx.send((local_seq, data_offset, data_size)).is_err() { break; }
+                if desc_tx.send((local_seq, data_offset, data_size)).is_err() {
+                    break;
+                }
             }
         });
 
@@ -774,27 +888,35 @@ where
                         let mut buf = crate::blob::pool_get_pub(&worker_pool, data_size * 4);
                         crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
                         let block = PrimitiveBlock::from_vec_pooled_with_scratch(
-                            buf, &worker_pool, &mut st_scratch, &mut gr_scratch,
+                            buf,
+                            &worker_pool,
+                            &mut st_scratch,
+                            &mut gr_scratch,
                         )?;
-                        for v in &mut output { v.clear(); }
+                        for v in &mut output {
+                            v.clear();
+                        }
                         let counts = block_fn_ref(&block, &mut bbs, &mut output, &mut i64_scratch)
-                            .map_err(|e| crate::error::new_error(
-                                crate::error::ErrorKind::Io(std::io::Error::other(e))
-                            ))?;
+                            .map_err(|e| {
+                                crate::error::new_error(crate::error::ErrorKind::Io(
+                                    std::io::Error::other(e),
+                                ))
+                            })?;
                         // Flush remaining elements in each BlockBuilder.
                         for i in 0..n {
                             flush_local(&mut bbs[i], &mut output[i]).map_err(|e| {
-                                crate::error::new_error(
-                                    crate::error::ErrorKind::Io(std::io::Error::other(e))
-                                )
+                                crate::error::new_error(crate::error::ErrorKind::Io(
+                                    std::io::Error::other(e),
+                                ))
                             })?;
                         }
-                        let taken: Vec<Vec<OwnedBlock>> = output.iter_mut()
-                            .map(std::mem::take)
-                            .collect();
+                        let taken: Vec<Vec<OwnedBlock>> =
+                            output.iter_mut().map(std::mem::take).collect();
                         Ok((taken, counts))
                     })();
-                    if tx.send((s, r)).is_err() { break; }
+                    if tx.send((s, r)).is_err() {
+                        break;
+                    }
                 }
             });
         }
@@ -813,7 +935,11 @@ where
                 for (i, blocks) in region_blocks.into_iter().enumerate() {
                     *stat_field(&mut stats[i]) += counts[i];
                     for (block_bytes, index, tagdata) in blocks {
-                        writers[i].write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+                        writers[i].write_primitive_block_owned(
+                            block_bytes,
+                            index,
+                            tagdata.as_deref(),
+                        )?;
                     }
                 }
             }
@@ -824,7 +950,11 @@ where
             for (i, blocks) in region_blocks.into_iter().enumerate() {
                 *stat_field(&mut stats[i]) += counts[i];
                 for (block_bytes, index, tagdata) in blocks {
-                    writers[i].write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+                    writers[i].write_primitive_block_owned(
+                        block_bytes,
+                        index,
+                        tagdata.as_deref(),
+                    )?;
                 }
             }
         }

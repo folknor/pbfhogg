@@ -5,9 +5,9 @@ use std::time::Instant;
 
 use crate::{Element, MemberId};
 
+use crate::BoxResult as Result;
 use crate::idset::IdSet;
 use crate::scan::classify::{build_classify_schedules_split, parallel_classify_phase};
-use crate::BoxResult as Result;
 
 /// A single missing reference entry (populated when `show_ids` is true).
 pub struct MissingRef {
@@ -138,7 +138,12 @@ struct RelBlobResult {
 /// parse a meaningful share of wall again.
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 #[hotpath::measure]
-pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io: bool) -> Result<RefCheckResult> {
+pub fn check_refs(
+    path: &Path,
+    check_relations: bool,
+    show_ids: bool,
+    direct_io: bool,
+) -> Result<RefCheckResult> {
     // `direct_io` is not plumbed through the parallel pread workers yet
     // (parallel_classify_phase opens the input via a shared Arc<File>
     // without O_DIRECT). Accept silently for now; if this matters for a
@@ -293,7 +298,11 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
     // both `node_ids` and `way_ids`, write `relation_ids`, and collect
     // per-blob missing/deferred vecs.
     // ------------------------------------------------------------------
-    let relation_blobs: u64 = if check_relations { relation_blobs_total } else { 0 };
+    let relation_blobs: u64 = if check_relations {
+        relation_blobs_total
+    } else {
+        0
+    };
     if check_relations {
         crate::debug::emit_marker("CHECKREFS_RELATIONS_START");
         {
@@ -430,27 +439,57 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
         crate::debug::emit_counter("checkrefs_node_count", result.node_count as i64);
         crate::debug::emit_counter("checkrefs_way_count", result.way_count as i64);
         crate::debug::emit_counter("checkrefs_relation_count", result.relation_count as i64);
-        crate::debug::emit_counter("checkrefs_missing_node_refs", result.missing_node_refs as i64);
+        crate::debug::emit_counter(
+            "checkrefs_missing_node_refs",
+            result.missing_node_refs as i64,
+        );
         crate::debug::emit_counter("checkrefs_missing_way_refs", result.missing_way_refs as i64);
-        crate::debug::emit_counter("checkrefs_missing_node_members", result.missing_node_members as i64);
-        crate::debug::emit_counter("checkrefs_missing_relation_members", result.missing_relation_members as i64);
+        crate::debug::emit_counter(
+            "checkrefs_missing_node_members",
+            result.missing_node_members as i64,
+        );
+        crate::debug::emit_counter(
+            "checkrefs_missing_relation_members",
+            result.missing_relation_members as i64,
+        );
 
         // One-shot post-pass timers.
         let ns_to_ms = |ns: u128| (ns / 1_000_000) as i64;
         crate::debug::emit_counter("checkrefs_missing_dedup_ms", ns_to_ms(missing_dedup_ns));
-        crate::debug::emit_counter("checkrefs_deferred_resolve_ms", ns_to_ms(deferred_resolve_ns));
+        crate::debug::emit_counter(
+            "checkrefs_deferred_resolve_ms",
+            ns_to_ms(deferred_resolve_ns),
+        );
 
         // Structural counters.
         crate::debug::emit_counter("checkrefs_node_blobs", node_blobs as i64);
         crate::debug::emit_counter("checkrefs_way_blobs", way_blobs as i64);
         crate::debug::emit_counter("checkrefs_relation_blobs", relation_blobs as i64);
         crate::debug::emit_counter("checkrefs_way_refs_checked", way_refs_checked as i64);
-        crate::debug::emit_counter("checkrefs_rel_node_members_checked", rel_node_members_checked as i64);
-        crate::debug::emit_counter("checkrefs_rel_way_members_checked", rel_way_members_checked as i64);
-        crate::debug::emit_counter("checkrefs_rel_rel_members_deferred", rel_rel_members_deferred as i64);
-        crate::debug::emit_counter("checkrefs_missing_node_refs_occurrences", missing_node_refs_occurrences as i64);
-        crate::debug::emit_counter("checkrefs_missing_way_refs_occurrences", missing_way_refs_occurrences as i64);
-        crate::debug::emit_counter("checkrefs_missing_node_members_occurrences", missing_node_members_occurrences as i64);
+        crate::debug::emit_counter(
+            "checkrefs_rel_node_members_checked",
+            rel_node_members_checked as i64,
+        );
+        crate::debug::emit_counter(
+            "checkrefs_rel_way_members_checked",
+            rel_way_members_checked as i64,
+        );
+        crate::debug::emit_counter(
+            "checkrefs_rel_rel_members_deferred",
+            rel_rel_members_deferred as i64,
+        );
+        crate::debug::emit_counter(
+            "checkrefs_missing_node_refs_occurrences",
+            missing_node_refs_occurrences as i64,
+        );
+        crate::debug::emit_counter(
+            "checkrefs_missing_way_refs_occurrences",
+            missing_way_refs_occurrences as i64,
+        );
+        crate::debug::emit_counter(
+            "checkrefs_missing_node_members_occurrences",
+            missing_node_members_occurrences as i64,
+        );
     }
 
     Ok(result)

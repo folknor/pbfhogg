@@ -4,8 +4,8 @@
 //! batch loop) is gone - the scanner owns the fast-path now and the
 //! worker pool slow-path always decompresses + parses + precise-checks.
 
-use crate::PrimitiveBlock;
 use crate::Element;
+use crate::PrimitiveBlock;
 
 use super::diff_ranges::DiffRanges;
 

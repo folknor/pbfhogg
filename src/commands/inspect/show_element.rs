@@ -4,8 +4,8 @@
 use std::path::Path;
 
 use super::super::Result;
-use crate::blob_meta::ElemKind;
 use crate::Element;
+use crate::blob_meta::ElemKind;
 
 /// Element type filter for `show_element`.
 #[derive(Clone, Copy, PartialEq, Eq)]

@@ -137,10 +137,18 @@ impl GeoCell {
 
     pub fn from_bytes(buf: &[u8; GEO_CELL_SIZE]) -> Self {
         Self {
-            cell_id: u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]),
-            street_offset: u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]),
-            addr_offset: u64::from_le_bytes([buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]]),
-            interp_offset: u64::from_le_bytes([buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31]]),
+            cell_id: u64::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]),
+            street_offset: u64::from_le_bytes([
+                buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+            ]),
+            addr_offset: u64::from_le_bytes([
+                buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+            ]),
+            interp_offset: u64::from_le_bytes([
+                buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
+            ]),
         }
     }
 }
@@ -200,7 +208,9 @@ impl StreetWay {
 
     pub fn from_bytes(buf: &[u8; STREET_WAY_SIZE]) -> Self {
         Self {
-            node_offset: u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]),
+            node_offset: u64::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]),
             name_offset: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
             node_count: u16::from_le_bytes([buf[12], buf[13]]),
         }
@@ -276,7 +286,9 @@ impl InterpWay {
 
     pub fn from_bytes(buf: &[u8; INTERP_WAY_SIZE]) -> Self {
         Self {
-            node_offset: u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]),
+            node_offset: u64::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]),
             street_offset: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
             start_number: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
             end_number: u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
@@ -308,7 +320,9 @@ impl AdminCell {
 
     pub fn from_bytes(buf: &[u8; ADMIN_CELL_SIZE]) -> Self {
         Self {
-            cell_id: u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]),
+            cell_id: u64::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]),
             entries_offset: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
         }
     }
@@ -428,7 +442,9 @@ pub fn parse_rings(coords: impl Iterator<Item = NodeCoord>) -> Vec<Vec<(f64, f64
 /// Convenience wrapper around [`parse_rings`] that returns the first ring as the
 /// exterior and the rest as holes.
 #[allow(clippy::type_complexity)]
-pub fn parse_polygon_rings(coords: impl Iterator<Item = NodeCoord>) -> (Vec<(f64, f64)>, Vec<Vec<(f64, f64)>>) {
+pub fn parse_polygon_rings(
+    coords: impl Iterator<Item = NodeCoord>,
+) -> (Vec<(f64, f64)>, Vec<Vec<(f64, f64)>>) {
     let mut rings = parse_rings(coords);
     if rings.is_empty() {
         return (Vec::new(), Vec::new());
@@ -454,7 +470,10 @@ pub fn read_nul_string(data: &[u8], offset: u32) -> &str {
         return "";
     }
     let remaining = &data[start..];
-    let end = remaining.iter().position(|&b| b == 0).unwrap_or(remaining.len());
+    let end = remaining
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(remaining.len());
     std::str::from_utf8(&remaining[..end]).unwrap_or("")
 }
 
@@ -498,7 +517,10 @@ impl std::fmt::Display for FormatError {
         match self {
             Self::BadMagic => write!(f, "invalid geocode index header (expected GIDX magic)"),
             Self::UnsupportedVersion(v) => {
-                write!(f, "unsupported geocode index version {v} (expected {FORMAT_VERSION})")
+                write!(
+                    f,
+                    "unsupported geocode index version {v} (expected {FORMAT_VERSION})"
+                )
             }
         }
     }
@@ -559,7 +581,10 @@ mod tests {
     fn header_bad_magic() {
         let mut bytes = [0u8; HEADER_SIZE];
         bytes[0..4].copy_from_slice(b"XXXX");
-        assert!(matches!(Header::from_bytes(&bytes), Err(FormatError::BadMagic)));
+        assert!(matches!(
+            Header::from_bytes(&bytes),
+            Err(FormatError::BadMagic)
+        ));
     }
 
     #[test]
@@ -696,7 +721,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn nc(lat: i32, lon: i32) -> NodeCoord {
-        NodeCoord { lat_e7: lat, lon_e7: lon }
+        NodeCoord {
+            lat_e7: lat,
+            lon_e7: lon,
+        }
     }
 
     #[test]
@@ -712,9 +740,13 @@ mod tests {
     fn parse_polygon_rings_exterior_plus_hole() {
         // Exterior ring, then RING_SENTINEL, then hole ring
         let coords = vec![
-            nc(10, 20), nc(30, 40), nc(50, 60),
+            nc(10, 20),
+            nc(30, 40),
+            nc(50, 60),
             RING_SENTINEL,
-            nc(15, 25), nc(35, 45), nc(55, 65),
+            nc(15, 25),
+            nc(35, 45),
+            nc(55, 65),
         ];
         let (exterior, holes) = parse_polygon_rings(coords.into_iter());
         assert_eq!(exterior.len(), 3);
@@ -726,7 +758,8 @@ mod tests {
     fn parse_polygon_rings_short_ring_dropped() {
         // A ring with fewer than 3 vertices gets dropped
         let coords = vec![
-            nc(10, 20), nc(30, 40), // 2 vertices - too short
+            nc(10, 20),
+            nc(30, 40), // 2 vertices - too short
         ];
         let (exterior, holes) = parse_polygon_rings(coords.into_iter());
         assert!(exterior.is_empty());
@@ -745,15 +778,23 @@ mod tests {
     fn parse_polygon_rings_consecutive_sentinels_no_empty_rings() {
         // Multiple sentinels in a row should not produce empty rings
         let coords = vec![
-            nc(10, 20), nc(30, 40), nc(50, 60),
+            nc(10, 20),
+            nc(30, 40),
+            nc(50, 60),
             RING_SENTINEL,
             RING_SENTINEL,
             RING_SENTINEL,
-            nc(15, 25), nc(35, 45), nc(55, 65),
+            nc(15, 25),
+            nc(35, 45),
+            nc(55, 65),
         ];
         let (exterior, holes) = parse_polygon_rings(coords.into_iter());
         assert_eq!(exterior.len(), 3);
-        assert_eq!(holes.len(), 1, "consecutive sentinels should not create empty rings");
+        assert_eq!(
+            holes.len(),
+            1,
+            "consecutive sentinels should not create empty rings"
+        );
         assert_eq!(holes[0].len(), 3);
     }
 

@@ -33,20 +33,20 @@
 use std::path::Path;
 
 use super::{
-    build_output_header, ensure_node_capacity_local, ensure_relation_capacity_local,
-    ensure_way_capacity_local, flush_local, require_indexdata, writer_from_header_bytes,
-    HeaderOverrides, Result,
+    HeaderOverrides, Result, build_output_header, ensure_node_capacity_local,
+    ensure_relation_capacity_local, ensure_way_capacity_local, flush_local, require_indexdata,
+    writer_from_header_bytes,
 };
-use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::blob::BlobKind;
+use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
 use crate::owned::{
-    dense_node_metadata, element_metadata, read_dense_node, read_node, read_relation, read_way,
-    OwnedElement, OwnedNode, OwnedRelation, OwnedWay,
+    OwnedElement, OwnedNode, OwnedRelation, OwnedWay, dense_node_metadata, element_metadata,
+    read_dense_node, read_node, read_relation, read_way,
 };
 use crate::read::raw_frame::read_raw_frame;
-use crate::writer::{encode_blob_header_into, frame_blob_pipelined, Compression, PbfWriter};
+use crate::writer::{Compression, PbfWriter, encode_blob_header_into, frame_blob_pipelined};
 use crate::{Element, ElementReader};
 
 /// Default per-block element cap. Matches the `BlockBuilder` default and
@@ -144,32 +144,38 @@ pub fn degrade(
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("degrade_unsort", i64::from(flags.unsort));
-        crate::debug::emit_counter(
-            "degrade_strip_locations",
-            i64::from(flags.strip_locations),
-        );
-        crate::debug::emit_counter(
-            "degrade_strip_indexdata",
-            i64::from(flags.strip_indexdata),
-        );
+        crate::debug::emit_counter("degrade_strip_locations", i64::from(flags.strip_locations));
+        crate::debug::emit_counter("degrade_strip_indexdata", i64::from(flags.strip_indexdata));
         crate::debug::emit_counter("degrade_block_cap", block_cap as i64);
     }
 
     let stats = if flags.needs_decode() {
         degrade_decode_path(
-            input, output, flags, block_cap, compression, direct_io, io_uring, force, overrides,
+            input,
+            output,
+            flags,
+            block_cap,
+            compression,
+            direct_io,
+            io_uring,
+            force,
+            overrides,
         )?
     } else {
-        degrade_passthrough_strip_indexdata(input, output, compression, direct_io, io_uring, overrides)?
+        degrade_passthrough_strip_indexdata(
+            input,
+            output,
+            compression,
+            direct_io,
+            io_uring,
+            overrides,
+        )?
     };
 
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("degrade_blobs_written", stats.blobs_written as i64);
-        crate::debug::emit_counter(
-            "degrade_elements_written",
-            stats.elements_written as i64,
-        );
+        crate::debug::emit_counter("degrade_elements_written", stats.elements_written as i64);
     }
 
     Ok(stats)
@@ -253,7 +259,10 @@ fn reframe_raw_without_index(
     tagdata: Option<&[u8]>,
 ) -> std::io::Result<Vec<u8>> {
     let datasize = i32::try_from(blob_bytes.len()).map_err(|_| {
-        std::io::Error::other(format!("blob datasize overflow: {} bytes", blob_bytes.len()))
+        std::io::Error::other(format!(
+            "blob datasize overflow: {} bytes",
+            blob_bytes.len()
+        ))
     })?;
     let mut header_buf = Vec::new();
     encode_blob_header_into("OSMData", datasize, None, tagdata, &mut header_buf);
@@ -437,18 +446,9 @@ fn degrade_decode_path(
 
     #[allow(clippy::cast_possible_wrap)]
     {
-        crate::debug::emit_counter(
-            "degrade_unsort_fired_nodes",
-            i64::from(unsort_fired[0]),
-        );
-        crate::debug::emit_counter(
-            "degrade_unsort_fired_ways",
-            i64::from(unsort_fired[1]),
-        );
-        crate::debug::emit_counter(
-            "degrade_unsort_fired_relations",
-            i64::from(unsort_fired[2]),
-        );
+        crate::debug::emit_counter("degrade_unsort_fired_nodes", i64::from(unsort_fired[0]));
+        crate::debug::emit_counter("degrade_unsort_fired_ways", i64::from(unsort_fired[1]));
+        crate::debug::emit_counter("degrade_unsort_fired_relations", i64::from(unsort_fired[2]));
     }
 
     Ok(DegradeStats {
@@ -538,7 +538,12 @@ fn run_kind_phase(
                     pending.append(&mut output);
                     if !pending.is_empty() {
                         let batch = std::mem::take(&mut pending);
-                        match frame_and_write_batch(batch, compression, writer, flags.strip_indexdata) {
+                        match frame_and_write_batch(
+                            batch,
+                            compression,
+                            writer,
+                            flags.strip_indexdata,
+                        ) {
                             Ok(written) => blobs += written,
                             Err(e) => {
                                 write_error = Some(e);
@@ -605,12 +610,12 @@ fn run_kind_phase(
         elements += 1;
     }
 
-    flush_local(&mut bb, &mut output)
-        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    flush_local(&mut bb, &mut output).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     pending.append(&mut output);
     if !pending.is_empty() {
         let final_batch = std::mem::take(&mut pending);
-        let written = frame_and_write_batch(final_batch, compression, writer, flags.strip_indexdata)?;
+        let written =
+            frame_and_write_batch(final_batch, compression, writer, flags.strip_indexdata)?;
         blobs += written;
     }
 
@@ -730,7 +735,11 @@ fn worker_decode_kind(
                 _ => {}
             }
             for owned_block in output.drain(..) {
-                full_framed.push(frame_owned(owned_block, compression, flags.strip_indexdata)?);
+                full_framed.push(frame_owned(
+                    owned_block,
+                    compression,
+                    flags.strip_indexdata,
+                )?);
             }
         } else {
             match (&element, &mut tail) {
@@ -747,7 +756,11 @@ fn worker_decode_kind(
     // Flush any final full block from the worker BB.
     flush_local(&mut bb, &mut output)?;
     for owned_block in output.drain(..) {
-        full_framed.push(frame_owned(owned_block, compression, flags.strip_indexdata)?);
+        full_framed.push(frame_owned(
+            owned_block,
+            compression,
+            flags.strip_indexdata,
+        )?);
     }
 
     Ok(WorkerOutput { full_framed, tail })
@@ -884,16 +897,23 @@ fn frame_and_write_batch(
 
     let framed: Vec<std::io::Result<Vec<u8>>> = batch
         .into_par_iter()
-        .map(|(block_bytes, index, tagdata)| -> std::io::Result<Vec<u8>> {
-            let indexdata_buf = index.serialize();
-            let indexdata = if strip_indexdata {
-                None
-            } else {
-                Some(indexdata_buf.as_slice())
-            };
-            let blob = frame_blob_pipelined(&block_bytes, &compression, indexdata, tagdata.as_deref())?;
-            Ok(blob.into_vec())
-        })
+        .map(
+            |(block_bytes, index, tagdata)| -> std::io::Result<Vec<u8>> {
+                let indexdata_buf = index.serialize();
+                let indexdata = if strip_indexdata {
+                    None
+                } else {
+                    Some(indexdata_buf.as_slice())
+                };
+                let blob = frame_blob_pipelined(
+                    &block_bytes,
+                    &compression,
+                    indexdata,
+                    tagdata.as_deref(),
+                )?;
+                Ok(blob.into_vec())
+            },
+        )
         .collect();
 
     let mut written: u64 = 0;

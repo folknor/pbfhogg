@@ -1,6 +1,6 @@
 # pbfhogg CLI Reference
 
-Version 0.4.0. Generated from `pbfhogg --help` output.
+Version 0.4.1. Generated from `pbfhogg --help` output.
 
 ## Global flags
 

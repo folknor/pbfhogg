@@ -28,10 +28,7 @@ pub(super) struct BlobMeta {
 /// scan - stage 1 / stage 4 open their own fds and pread the bodies they
 /// need.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub(super) fn scan_blob_metadata(
-    input: &Path,
-    parse_tagdata: bool,
-) -> Result<Vec<BlobMeta>> {
+pub(super) fn scan_blob_metadata(input: &Path, parse_tagdata: bool) -> Result<Vec<BlobMeta>> {
     crate::debug::emit_marker("ALTW_BLOB_META_SCAN_START");
     let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
     let _ = walker
@@ -46,10 +43,13 @@ pub(super) fn scan_blob_metadata(
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
         }
-        let idx = meta.index.as_ref()
+        let idx = meta
+            .index
+            .as_ref()
             .ok_or("external join metadata scan: OsmData blob missing indexdata")?;
         let tag_index = if parse_tagdata {
-            meta.tagdata.as_deref()
+            meta.tagdata
+                .as_deref()
                 .and_then(crate::blob_meta::TagIndex::deserialize)
         } else {
             None

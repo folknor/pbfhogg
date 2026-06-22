@@ -3,9 +3,9 @@
 use std::fs::File;
 use std::io::{Read, Write};
 
+use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use flate2::Compression;
 use pbfhogg::tags_filter::osc::tags_filter_osc;
 use tempfile::TempDir;
 
@@ -34,7 +34,9 @@ fn create_and_modify_are_filtered_but_deletes_are_preserved() {
     let input = dir.path().join("in.osc.gz");
     let output = dir.path().join("out.osc.gz");
 
-    write_osc_gz(&input, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc_gz(
+        &input,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <create>
     <node id="1" lat="1.0" lon="2.0">
@@ -59,7 +61,8 @@ fn create_and_modify_are_filtered_but_deletes_are_preserved() {
     <way id="88"/>
     <relation id="77"/>
   </delete>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     let stats = tags_filter_osc(&input, &output, &exprs(&["highway=primary"])).expect("filter");
     let xml = read_osc_gz(&output);
@@ -91,7 +94,9 @@ fn type_prefix_applies_to_create_modify_only() {
     let input = dir.path().join("in.osc.gz");
     let output = dir.path().join("out.osc.gz");
 
-    write_osc_gz(&input, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc_gz(
+        &input,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <create>
     <node id="1" lat="1.0" lon="1.0">
@@ -111,7 +116,8 @@ fn type_prefix_applies_to_create_modify_only() {
   <delete>
     <node id="42"/>
   </delete>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     let stats = tags_filter_osc(&input, &output, &exprs(&["w/amenity=bench"])).expect("filter");
     let xml = read_osc_gz(&output);
@@ -132,7 +138,9 @@ fn multiple_expressions_use_or_semantics() {
     let input = dir.path().join("in.osc.gz");
     let output = dir.path().join("out.osc.gz");
 
-    write_osc_gz(&input, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc_gz(
+        &input,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <create>
     <node id="1" lat="1.0" lon="1.0">
@@ -145,7 +153,8 @@ fn multiple_expressions_use_or_semantics() {
       <tag k="name" v="x"/>
     </node>
   </create>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     let stats = tags_filter_osc(&input, &output, &exprs(&["amenity", "shop"])).expect("filter");
     let xml = read_osc_gz(&output);

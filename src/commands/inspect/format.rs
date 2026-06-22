@@ -77,5 +77,9 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
 }
 
 pub(super) fn yes_no(b: bool) -> String {
-    if b { "yes".to_string() } else { "no".to_string() }
+    if b {
+        "yes".to_string()
+    } else {
+        "no".to_string()
+    }
 }

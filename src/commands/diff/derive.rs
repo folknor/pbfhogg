@@ -9,20 +9,18 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 
-use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
+use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 
-use crate::osc::write::{
-    OwnedMetadata,
-    write_element_xml,
-    write_node_xml, write_way_xml, write_relation_xml,
-};
-use crate::osc::merge_join::{
-    block_pair_merge_phase, merge_join_phase, BlockMergeAction, BlockPairMergeState,
-    MergeJoinAction, StreamingBlocks,
-};
 use crate::BoxResult as Result;
 use crate::blob_meta::ElemKind;
+use crate::osc::merge_join::{
+    BlockMergeAction, BlockPairMergeState, MergeJoinAction, StreamingBlocks,
+    block_pair_merge_phase, merge_join_phase,
+};
+use crate::osc::write::{
+    OwnedMetadata, write_element_xml, write_node_xml, write_relation_xml, write_way_xml,
+};
 
 // ---------------------------------------------------------------------------
 // Stats
@@ -73,8 +71,12 @@ pub fn derive_changes(
     // Single-pass: check sorted headers + indexdata from one file open each.
     let (old_sorted, old_indexed) = super::check_sorted_and_indexed(old_path, direct_io)?;
     let (new_sorted, new_indexed) = super::check_sorted_and_indexed(new_path, direct_io)?;
-    if !old_sorted { crate::commands::require_sorted_err(old_path, "Old PBF")?; }
-    if !new_sorted { crate::commands::require_sorted_err(new_path, "New PBF")?; }
+    if !old_sorted {
+        crate::commands::require_sorted_err(old_path, "Old PBF")?;
+    }
+    if !new_sorted {
+        crate::commands::require_sorted_err(new_path, "New PBF")?;
+    }
     let both_indexed = old_indexed && new_indexed;
 
     // Scratch directory for temp files (same as brokkr scratch).
@@ -199,8 +201,12 @@ impl ChangeSink {
     fn write_delete(&mut self, elem: &crate::Element<'_>, kind: ElemKind) -> Result<()> {
         if let Some((tag, id, meta)) = extract_delete_info(elem, kind) {
             write_delete_element(
-                &mut self.deletes, tag, id, meta.as_ref(),
-                self.increment_version, self.update_timestamp,
+                &mut self.deletes,
+                tag,
+                id,
+                meta.as_ref(),
+                self.increment_version,
+                self.update_timestamp,
             )?;
             self.delete_count += 1;
         }
@@ -231,16 +237,34 @@ impl ChangeSink {
 
 /// Extract just id + metadata from a borrowed element for delete output.
 /// Avoids full owned conversion (no tag/ref cloning - deletes only need id + version).
-fn extract_delete_info(elem: &crate::Element<'_>, kind: ElemKind) -> Option<(&'static str, i64, Option<OwnedMetadata>)> {
+fn extract_delete_info(
+    elem: &crate::Element<'_>,
+    kind: ElemKind,
+) -> Option<(&'static str, i64, Option<OwnedMetadata>)> {
     match (kind, elem) {
-        (ElemKind::Node, crate::Element::DenseNode(dn)) => Some(("node", dn.id(),
-            dn.info().map(crate::dense::DenseNodeInfo::version).filter(|&v| v != -1).map(OwnedMetadata::version_only))),
-        (ElemKind::Node, crate::Element::Node(n)) => Some(("node", n.id(),
-            n.info().version().map(OwnedMetadata::version_only))),
-        (ElemKind::Way, crate::Element::Way(w)) => Some(("way", w.id(),
-            w.info().version().map(OwnedMetadata::version_only))),
-        (ElemKind::Relation, crate::Element::Relation(r)) => Some(("relation", r.id(),
-            r.info().version().map(OwnedMetadata::version_only))),
+        (ElemKind::Node, crate::Element::DenseNode(dn)) => Some((
+            "node",
+            dn.id(),
+            dn.info()
+                .map(crate::dense::DenseNodeInfo::version)
+                .filter(|&v| v != -1)
+                .map(OwnedMetadata::version_only),
+        )),
+        (ElemKind::Node, crate::Element::Node(n)) => Some((
+            "node",
+            n.id(),
+            n.info().version().map(OwnedMetadata::version_only),
+        )),
+        (ElemKind::Way, crate::Element::Way(w)) => Some((
+            "way",
+            w.id(),
+            w.info().version().map(OwnedMetadata::version_only),
+        )),
+        (ElemKind::Relation, crate::Element::Relation(r)) => Some((
+            "relation",
+            r.id(),
+            r.info().version().map(OwnedMetadata::version_only),
+        )),
         _ => None,
     }
 }
@@ -248,7 +272,6 @@ fn extract_delete_info(elem: &crate::Element<'_>, kind: ElemKind) -> Option<(&'s
 // ---------------------------------------------------------------------------
 // Change collection via shared merge-join
 // ---------------------------------------------------------------------------
-
 
 // ---------------------------------------------------------------------------
 // Optimized block-pair path (borrowed elements, zero-alloc for Equal)
@@ -292,14 +315,32 @@ fn derive_changes_block_pair(
 /// `BlockPairMergeState` and benefit from the same shadow view.
 #[allow(clippy::cast_possible_wrap)]
 fn emit_merge_stats_counters(s: &crate::osc::merge_join::BlockPairMergeStats) {
-    crate::debug::emit_counter("mergejoin_shadow_pairs_byte_equal", s.pairs_byte_equal as i64);
-    crate::debug::emit_counter("mergejoin_shadow_elements_byte_equal", s.elements_byte_equal as i64);
-    crate::debug::emit_counter("mergejoin_shadow_pairs_overlapping_decoded", s.pairs_overlapping_decoded as i64);
-    crate::debug::emit_counter("mergejoin_shadow_elements_overlapping_decoded", s.elements_overlapping_decoded as i64);
+    crate::debug::emit_counter(
+        "mergejoin_shadow_pairs_byte_equal",
+        s.pairs_byte_equal as i64,
+    );
+    crate::debug::emit_counter(
+        "mergejoin_shadow_elements_byte_equal",
+        s.elements_byte_equal as i64,
+    );
+    crate::debug::emit_counter(
+        "mergejoin_shadow_pairs_overlapping_decoded",
+        s.pairs_overlapping_decoded as i64,
+    );
+    crate::debug::emit_counter(
+        "mergejoin_shadow_elements_overlapping_decoded",
+        s.elements_overlapping_decoded as i64,
+    );
     crate::debug::emit_counter("mergejoin_shadow_blobs_old_only", s.blobs_old_only as i64);
-    crate::debug::emit_counter("mergejoin_shadow_elements_old_only", s.elements_old_only as i64);
+    crate::debug::emit_counter(
+        "mergejoin_shadow_elements_old_only",
+        s.elements_old_only as i64,
+    );
     crate::debug::emit_counter("mergejoin_shadow_blobs_new_only", s.blobs_new_only as i64);
-    crate::debug::emit_counter("mergejoin_shadow_elements_new_only", s.elements_new_only as i64);
+    crate::debug::emit_counter(
+        "mergejoin_shadow_elements_new_only",
+        s.elements_new_only as i64,
+    );
 }
 
 /// Run one type phase of block-pair merge, streaming changed elements to temp files.
@@ -345,7 +386,7 @@ fn derive_changes_element_stream(
     direct_io: bool,
     sink: &mut ChangeSink,
 ) -> Result<()> {
-    use crate::osc::write::{OwnedNode, OwnedWay, OwnedRelation};
+    use crate::osc::write::{OwnedNode, OwnedRelation, OwnedWay};
 
     let mut old_src = StreamingBlocks::new_sequential(old_path, direct_io)?;
     let mut new_src = StreamingBlocks::new_sequential(new_path, direct_io)?;
@@ -360,11 +401,24 @@ fn derive_changes_element_stream(
         merge_join_phase(&mut old_src, &mut ob, &mut new_src, &mut nb, |action| {
             match action {
                 MergeJoinAction::OldOnly(n) => {
-                    write_delete_element(&mut sink.deletes, "node", n.id, n.metadata.as_ref(), iv, ut)?;
+                    write_delete_element(
+                        &mut sink.deletes,
+                        "node",
+                        n.id,
+                        n.metadata.as_ref(),
+                        iv,
+                        ut,
+                    )?;
                     sink.delete_count += 1;
                 }
-                MergeJoinAction::NewOnly(n) => { write_node_xml(&mut sink.creates, n)?; sink.create_count += 1; }
-                MergeJoinAction::Modified(_, n) => { write_node_xml(&mut sink.modifies, n)?; sink.modify_count += 1; }
+                MergeJoinAction::NewOnly(n) => {
+                    write_node_xml(&mut sink.creates, n)?;
+                    sink.create_count += 1;
+                }
+                MergeJoinAction::Modified(_, n) => {
+                    write_node_xml(&mut sink.modifies, n)?;
+                    sink.modify_count += 1;
+                }
                 MergeJoinAction::Equal(_) => {}
             }
             Ok(())
@@ -378,11 +432,24 @@ fn derive_changes_element_stream(
         merge_join_phase(&mut old_src, &mut ob, &mut new_src, &mut nb, |action| {
             match action {
                 MergeJoinAction::OldOnly(w) => {
-                    write_delete_element(&mut sink.deletes, "way", w.id, w.metadata.as_ref(), iv, ut)?;
+                    write_delete_element(
+                        &mut sink.deletes,
+                        "way",
+                        w.id,
+                        w.metadata.as_ref(),
+                        iv,
+                        ut,
+                    )?;
                     sink.delete_count += 1;
                 }
-                MergeJoinAction::NewOnly(w) => { write_way_xml(&mut sink.creates, w)?; sink.create_count += 1; }
-                MergeJoinAction::Modified(_, w) => { write_way_xml(&mut sink.modifies, w)?; sink.modify_count += 1; }
+                MergeJoinAction::NewOnly(w) => {
+                    write_way_xml(&mut sink.creates, w)?;
+                    sink.create_count += 1;
+                }
+                MergeJoinAction::Modified(_, w) => {
+                    write_way_xml(&mut sink.modifies, w)?;
+                    sink.modify_count += 1;
+                }
                 MergeJoinAction::Equal(_) => {}
             }
             Ok(())
@@ -396,11 +463,24 @@ fn derive_changes_element_stream(
         merge_join_phase(&mut old_src, &mut ob, &mut new_src, &mut nb, |action| {
             match action {
                 MergeJoinAction::OldOnly(r) => {
-                    write_delete_element(&mut sink.deletes, "relation", r.id, r.metadata.as_ref(), iv, ut)?;
+                    write_delete_element(
+                        &mut sink.deletes,
+                        "relation",
+                        r.id,
+                        r.metadata.as_ref(),
+                        iv,
+                        ut,
+                    )?;
                     sink.delete_count += 1;
                 }
-                MergeJoinAction::NewOnly(r) => { write_relation_xml(&mut sink.creates, r)?; sink.create_count += 1; }
-                MergeJoinAction::Modified(_, r) => { write_relation_xml(&mut sink.modifies, r)?; sink.modify_count += 1; }
+                MergeJoinAction::NewOnly(r) => {
+                    write_relation_xml(&mut sink.creates, r)?;
+                    sink.create_count += 1;
+                }
+                MergeJoinAction::Modified(_, r) => {
+                    write_relation_xml(&mut sink.modifies, r)?;
+                    sink.modify_count += 1;
+                }
                 MergeJoinAction::Equal(_) => {}
             }
             Ok(())
@@ -444,7 +524,7 @@ pub(crate) fn assemble_osc_from_paths(
     modify_count: u64,
     delete_count: u64,
 ) -> Result<()> {
-    use crate::write::parallel_gzip::{ParallelGzipWriter, DEFAULT_CHUNK_SIZE};
+    use crate::write::parallel_gzip::{DEFAULT_CHUNK_SIZE, ParallelGzipWriter};
 
     let file = File::create(output)?;
     let buf = io::BufWriter::new(file);
@@ -532,4 +612,3 @@ fn write_delete_element<W: Write>(
     writer.write_event(Event::Empty(elem))?;
     Ok(())
 }
-

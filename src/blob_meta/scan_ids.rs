@@ -3,7 +3,7 @@
 //!
 //! Uses `Cursor` from `protohoggr` for varint/tag/skip primitives.
 
-use protohoggr::{zigzag_decode_64, Cursor};
+use protohoggr::{Cursor, zigzag_decode_64};
 
 use super::{BlobBbox, BlobIndex, ElemKind};
 
@@ -211,7 +211,13 @@ fn scan_dense_nodes(
         })
     });
 
-    Some(BlobIndex { kind: ElemKind::Node, min_id, max_id, count, bbox })
+    Some(BlobIndex {
+        kind: ElemKind::Node,
+        min_id,
+        max_id,
+        count,
+        bbox,
+    })
 }
 
 /// Iterate delta-encoded packed sint64, returning (min, max) of accumulated values.

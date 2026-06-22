@@ -1,10 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.4.1 - 2026-06-22
 
 ### Dependencies
 
-- `hotpath` 0.15.0 → 0.15.1, `libc` 0.2.185 → 0.2.186, `quick-xml` 0.39.2 → 0.39.4 (patch bumps).
+- **`flate2` 1.0 → 1.1.9, pulling `zlib-rs` 0.6.4** (the pure-Rust zlib backend used for all blob (de)compression). This is the headline change for the release.
+- `hotpath` 0.15.0 → 0.17.0, `quick-xml` 0.39.2 → 0.40.1, `libc` 0.2.185 → 0.2.186, `bytes` → 1.12.0, `serde_json` → 1.0.150. The `quick-xml` minor bump deprecated `Attribute::unescape_value`; OSC attribute parsing migrated to `normalized_value(XmlVersion::Implicit1_0)` (same behavior).
 
 ## 0.4.0 - 2026-05-09
 

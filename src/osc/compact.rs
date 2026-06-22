@@ -63,7 +63,13 @@ fn byte_to_member_type(b: u8) -> MemberType {
 ///
 /// Returns the byte offset where this node starts in the arena.
 #[allow(clippy::cast_possible_truncation)]
-pub(super) fn arena_append_node(arena: &mut Vec<u8>, id: i64, lat: i32, lon: i32, tags: &[(u32, &str)]) -> u32 {
+pub(super) fn arena_append_node(
+    arena: &mut Vec<u8>,
+    id: i64,
+    lat: i32,
+    lon: i32,
+    tags: &[(u32, &str)],
+) -> u32 {
     let offset = arena.len() as u32;
     arena.extend_from_slice(&id.to_le_bytes());
     arena.extend_from_slice(&lat.to_le_bytes());
@@ -86,7 +92,12 @@ pub(super) fn arena_append_node(arena: &mut Vec<u8>, id: i64, lat: i32, lon: i32
 ///
 /// Returns the byte offset where this way starts in the arena.
 #[allow(clippy::cast_possible_truncation)]
-pub(super) fn arena_append_way(arena: &mut Vec<u8>, id: i64, refs: &[i64], tags: &[(u32, &str)]) -> u32 {
+pub(super) fn arena_append_way(
+    arena: &mut Vec<u8>,
+    id: i64,
+    refs: &[i64],
+    tags: &[(u32, &str)],
+) -> u32 {
     let offset = arena.len() as u32;
     arena.extend_from_slice(&id.to_le_bytes());
     let ref_count = refs.len() as u32;

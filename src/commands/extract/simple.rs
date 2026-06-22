@@ -9,8 +9,8 @@ use crate::cat::CleanAttrs;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlockType, Element, PrimitiveBlock};
 
-use super::super::{Result, BATCH_SIZE,
-    drain_batch_results, flush_local, writer_from_header, HeaderOverrides,
+use super::super::{
+    BATCH_SIZE, HeaderOverrides, Result, drain_batch_results, flush_local, writer_from_header,
 };
 use crate::idset::IdSet;
 
@@ -50,13 +50,21 @@ fn classify_block_simple(
             for element in block.elements_skip_metadata() {
                 match &element {
                     Element::DenseNode(dn)
-                        if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
+                        if region.contains_decimicro(
+                            bbox_int,
+                            dn.decimicro_lat(),
+                            dn.decimicro_lon(),
+                        ) =>
                     {
                         bbox_node_ids.set(dn.id());
                         matched = true;
                     }
                     Element::Node(n)
-                        if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
+                        if region.contains_decimicro(
+                            bbox_int,
+                            n.decimicro_lat(),
+                            n.decimicro_lon(),
+                        ) =>
                     {
                         bbox_node_ids.set(n.id());
                         matched = true;
@@ -93,13 +101,21 @@ fn classify_block_simple(
             for element in block.elements_skip_metadata() {
                 match &element {
                     Element::DenseNode(dn)
-                        if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
+                        if region.contains_decimicro(
+                            bbox_int,
+                            dn.decimicro_lat(),
+                            dn.decimicro_lon(),
+                        ) =>
                     {
                         bbox_node_ids.set(dn.id());
                         matched = true;
                     }
                     Element::Node(n)
-                        if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
+                        if region.contains_decimicro(
+                            bbox_int,
+                            n.decimicro_lat(),
+                            n.decimicro_lon(),
+                        ) =>
                     {
                         bbox_node_ids.set(n.id());
                         matched = true;
@@ -123,7 +139,16 @@ fn classify_block_simple(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool, clean: &CleanAttrs, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<ExtractStats> {
+pub(super) fn extract_simple(
+    input: &Path,
+    output: &Path,
+    region: &Region,
+    set_bounds: bool,
+    clean: &CleanAttrs,
+    compression: Compression,
+    direct_io: bool,
+    overrides: &HeaderOverrides,
+) -> Result<ExtractStats> {
     // Check if input is sorted - if so, classify + write in a single file pass.
     // We need a quick header check without keeping the reader open. Use BlobReader
     // to read just the first blob (header).
@@ -142,10 +167,35 @@ pub(super) fn extract_simple(input: &Path, output: &Path, region: &Region, set_b
     };
 
     if is_sorted {
-        return extract_simple_single_pass(input, output, region, set_bounds, clean, compression, direct_io, overrides);
+        return extract_simple_single_pass(
+            input,
+            output,
+            region,
+            set_bounds,
+            clean,
+            compression,
+            direct_io,
+            overrides,
+        );
     }
 
-    // --- Unsorted fallback: two passes (collect IDs, then write) ---
+    extract_simple_two_pass(
+        input, output, region, set_bounds, clean, compression, direct_io, overrides,
+    )
+}
+
+// Unsorted fallback: two passes (collect IDs, then write).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn extract_simple_two_pass(
+    input: &Path,
+    output: &Path,
+    region: &Region,
+    set_bounds: bool,
+    clean: &CleanAttrs,
+    compression: Compression,
+    direct_io: bool,
+    overrides: &HeaderOverrides,
+) -> Result<ExtractStats> {
     crate::debug::emit_marker("SIMPLE_UNSORTED_PASS1_START");
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
@@ -166,21 +216,30 @@ pub(super) fn extract_simple(input: &Path, output: &Path, region: &Region, set_b
 
     let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
     blob_reader.set_parse_indexdata(true);
-    blob_reader.next()
+    blob_reader
+        .next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
     let mut decompress_buf: Vec<u8> = Vec::new();
 
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+            continue;
+        }
         if let Some(idx) = blob.index() {
-            if !spatial_filter.wants_index(&idx) { continue; }
+            if !spatial_filter.wants_index(&idx) {
+                continue;
+            }
         }
         blob.decompress_into(&mut decompress_buf)?;
         let block = PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))?;
         classify_block_simple(
-            &block, region, &bbox_int,
-            &mut bbox_node_ids, &mut matched_way_ids, &mut matched_relation_ids,
+            &block,
+            region,
+            &bbox_int,
+            &mut bbox_node_ids,
+            &mut matched_way_ids,
+            &mut matched_relation_ids,
         );
     }
     crate::debug::emit_marker("SIMPLE_UNSORTED_PASS1_END");
@@ -190,18 +249,28 @@ pub(super) fn extract_simple(input: &Path, output: &Path, region: &Region, set_b
 
     let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
     blob_reader.set_parse_indexdata(true);
-    let header_blob = blob_reader.next()
+    let header_blob = blob_reader
+        .next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
     let header = header_blob.to_headerblock()?;
     let bbox = region.bbox();
-    let mut writer = writer_from_header(output, compression, &header, false, overrides, |hb| {
-        let hb = if set_bounds {
-            hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
-        } else {
-            hb
-        };
-        hb.sorted()
-    }, direct_io, false)?;
+    let mut writer = writer_from_header(
+        output,
+        compression,
+        &header,
+        false,
+        overrides,
+        |hb| {
+            let hb = if set_bounds {
+                hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
+            } else {
+                hb
+            };
+            hb.sorted()
+        },
+        direct_io,
+        false,
+    )?;
 
     let ids = ExtractPass2IdSets {
         bbox_node_ids: &bbox_node_ids,
@@ -214,7 +283,9 @@ pub(super) fn extract_simple(input: &Path, output: &Path, region: &Region, set_b
     let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+            continue;
+        }
         blob.decompress_into(&mut decompress_buf)?;
         let block = PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))?;
         batch.push(block);
@@ -276,13 +347,17 @@ fn extract_simple_single_pass(
     // Tag node blobs for raw passthrough if bbox region + no clean.
     let passthrough_bbox = if matches!(region, Region::Bbox(_)) && !clean.any() {
         Some(crate::BlobBbox::new(
-            bbox_int.min_lat, bbox_int.max_lat, bbox_int.min_lon, bbox_int.max_lon,
+            bbox_int.min_lat,
+            bbox_int.max_lat,
+            bbox_int.min_lon,
+            bbox_int.max_lon,
         ))
     } else {
         None
     };
     let full_schedule = build_blob_schedule_with_passthrough(input, passthrough_bbox.as_ref())?;
-    let node_schedule: Vec<&BlobDesc> = full_schedule.iter()
+    let node_schedule: Vec<&BlobDesc> = full_schedule
+        .iter()
         .filter(|d| {
             match d.kind {
                 Some(crate::blob_meta::ElemKind::Node) => {
@@ -307,29 +382,41 @@ fn extract_simple_single_pass(
     // other types are silently skipped. This means non-indexed blobs are
     // decompressed up to 3 times - acceptable since indexed PBFs (production
     // path) always have kind set and this path is only reachable via --force.
-    let way_schedule: Vec<&BlobDesc> = full_schedule.iter()
+    let way_schedule: Vec<&BlobDesc> = full_schedule
+        .iter()
         .filter(|d| matches!(d.kind, Some(crate::blob_meta::ElemKind::Way) | None))
         .collect();
-    let relation_schedule: Vec<&BlobDesc> = full_schedule.iter()
+    let relation_schedule: Vec<&BlobDesc> = full_schedule
+        .iter()
         .filter(|d| matches!(d.kind, Some(crate::blob_meta::ElemKind::Relation) | None))
         .collect();
 
     // Open writer.
     let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    let header_blob = header_reader.next()
+    let header_blob = header_reader
+        .next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
     let header = header_blob.to_headerblock()?;
     drop(header_reader);
     super::super::warn_locations_on_ways_loss(&header);
     let bbox = region.bbox();
-    let mut writer = writer_from_header(output, compression, &header, false, overrides, |hb| {
-        let hb = if set_bounds {
-            hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
-        } else {
-            hb
-        };
-        hb.sorted()
-    }, direct_io, false)?;
+    let mut writer = writer_from_header(
+        output,
+        compression,
+        &header,
+        false,
+        overrides,
+        |hb| {
+            let hb = if set_bounds {
+                hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
+            } else {
+                hb
+            };
+            hb.sorted()
+        },
+        direct_io,
+        false,
+    )?;
 
     let mut bbox_node_ids = IdSet::new();
     let mut matched_way_ids = IdSet::new();
@@ -348,7 +435,7 @@ fn extract_simple_single_pass(
 
         let classify_file = std::sync::Arc::new(
             std::fs::File::open(input)
-                .map_err(|e| format!("failed to open {}: {e}", input.display()))?
+                .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
         );
 
         let decode_threads = std::thread::available_parallelism()
@@ -362,13 +449,16 @@ fn extract_simple_single_pass(
 
         std::thread::scope(|scope| -> Result<()> {
             // Dispatcher: send node blob descriptors.
-            let descs: Vec<(usize, u64, usize)> = node_schedule.iter()
+            let descs: Vec<(usize, u64, usize)> = node_schedule
+                .iter()
                 .enumerate()
                 .map(|(i, d)| (i, d.offset, d.size))
                 .collect();
             scope.spawn(move || {
                 for item in descs {
-                    if cls_tx.send(item).is_err() { break; }
+                    if cls_tx.send(item).is_err() {
+                        break;
+                    }
                 }
             });
 
@@ -387,7 +477,8 @@ fn extract_simple_single_pass(
 
                     loop {
                         let (seq, data_offset, data_size) = {
-                            let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let guard =
+                                rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             match guard.recv() {
                                 Ok(d) => d,
                                 Err(_) => break,
@@ -397,20 +488,33 @@ fn extract_simple_single_pass(
                         let r: crate::error::Result<Vec<i64>> = (|| {
                             read_buf.resize(data_size, 0);
                             file.read_exact_at(&mut read_buf, data_offset)
-                                .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                                .map_err(|e| {
+                                    crate::error::new_error(crate::error::ErrorKind::Io(e))
+                                })?;
                             crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
                             tuples.clear();
-                            crate::scan::node::extract_node_tuples(&decompress_buf, &mut tuples, &mut group_starts)
-                                .map_err(|e| crate::error::new_error(
-                                    crate::error::ErrorKind::Io(std::io::Error::other(e.to_string()))
-                                ))?;
-                            let matching: Vec<i64> = tuples.iter()
-                                .filter(|t| region_ref.contains_decimicro(bbox_int_ref, t.lat, t.lon))
+                            crate::scan::node::extract_node_tuples(
+                                &decompress_buf,
+                                &mut tuples,
+                                &mut group_starts,
+                            )
+                            .map_err(|e| {
+                                crate::error::new_error(crate::error::ErrorKind::Io(
+                                    std::io::Error::other(e.to_string()),
+                                ))
+                            })?;
+                            let matching: Vec<i64> = tuples
+                                .iter()
+                                .filter(|t| {
+                                    region_ref.contains_decimicro(bbox_int_ref, t.lat, t.lon)
+                                })
                                 .map(|t| t.id)
                                 .collect();
                             Ok(matching)
                         })();
-                        if tx.send((seq, r)).is_err() { break; }
+                        if tx.send((seq, r)).is_err() {
+                            break;
+                        }
                     }
                 });
             }
@@ -438,11 +542,24 @@ fn extract_simple_single_pass(
             matched_way_ids: &matched_way_ids,
             matched_relation_ids: &empty_relation_ids,
         };
-        pread_execute(input, &node_descs, &mut writer, &mut stats, |block, bb, output| {
-            let s = extract_block_pass2(block, &ids, clean, Some(crate::blob_meta::ElemKind::Node), bb, output)?;
-            flush_local(bb, output)?;
-            Ok(s)
-        })?;
+        pread_execute(
+            input,
+            &node_descs,
+            &mut writer,
+            &mut stats,
+            |block, bb, output| {
+                let s = extract_block_pass2(
+                    block,
+                    &ids,
+                    clean,
+                    Some(crate::blob_meta::ElemKind::Node),
+                    bb,
+                    output,
+                )?;
+                flush_local(bb, output)?;
+                Ok(s)
+            },
+        )?;
     }
 
     crate::debug::emit_marker("SIMPLE_NODE_WRITE_END");
@@ -453,7 +570,7 @@ fn extract_simple_single_pass(
 
         let classify_file = std::sync::Arc::new(
             std::fs::File::open(input)
-                .map_err(|e| format!("failed to open {}: {e}", input.display()))?
+                .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
         );
         let decode_threads = std::thread::available_parallelism()
             .map(|n| n.get().saturating_sub(2).max(1))
@@ -465,13 +582,16 @@ fn extract_simple_single_pass(
         let (ids_tx, ids_rx) = std::sync::mpsc::sync_channel::<WayClassifyResult>(32);
 
         std::thread::scope(|scope| -> Result<()> {
-            let descs: Vec<(usize, u64, usize)> = way_schedule.iter()
+            let descs: Vec<(usize, u64, usize)> = way_schedule
+                .iter()
                 .enumerate()
                 .map(|(i, d)| (i, d.offset, d.size))
                 .collect();
             scope.spawn(move || {
                 for item in descs {
-                    if cls_tx.send(item).is_err() { break; }
+                    if cls_tx.send(item).is_err() {
+                        break;
+                    }
                 }
             });
 
@@ -489,7 +609,8 @@ fn extract_simple_single_pass(
 
                     loop {
                         let (seq, data_offset, data_size) = {
-                            let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let guard =
+                                rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             match guard.recv() {
                                 Ok(d) => d,
                                 Err(_) => break,
@@ -499,19 +620,31 @@ fn extract_simple_single_pass(
                         let r: crate::error::Result<Vec<i64>> = (|| {
                             read_buf.resize(data_size, 0);
                             file.read_exact_at(&mut read_buf, data_offset)
-                                .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                                .map_err(|e| {
+                                    crate::error::new_error(crate::error::ErrorKind::Io(e))
+                                })?;
                             crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
                             let mut matching: Vec<i64> = Vec::new();
-                            crate::scan::way::scan_way_refs(&decompress_buf, &mut refs_buf, &mut group_starts, |way_id, refs| {
-                                if refs.iter().any(|&r| bbox_ids_ref.get(r)) {
-                                    matching.push(way_id);
-                                }
-                            }).map_err(|e| crate::error::new_error(
-                                crate::error::ErrorKind::Io(std::io::Error::other(e.to_string()))
-                            ))?;
+                            crate::scan::way::scan_way_refs(
+                                &decompress_buf,
+                                &mut refs_buf,
+                                &mut group_starts,
+                                |way_id, refs| {
+                                    if refs.iter().any(|&r| bbox_ids_ref.get(r)) {
+                                        matching.push(way_id);
+                                    }
+                                },
+                            )
+                            .map_err(|e| {
+                                crate::error::new_error(crate::error::ErrorKind::Io(
+                                    std::io::Error::other(e.to_string()),
+                                ))
+                            })?;
                             Ok(matching)
                         })();
-                        if tx.send((seq, r)).is_err() { break; }
+                        if tx.send((seq, r)).is_err() {
+                            break;
+                        }
                     }
                 });
             }
@@ -530,8 +663,12 @@ fn extract_simple_single_pass(
     crate::debug::emit_marker("SIMPLE_WAY_CLASSIFY_END");
     // matched_way_ids frozen. Write matching ways via pread-from-workers.
     crate::debug::emit_marker("SIMPLE_WAY_WRITE_START");
-    let way_descs: Vec<BlobDesc> = way_schedule.iter()
-        .map(|d| BlobDesc { raw_passthrough: false, ..**d })
+    let way_descs: Vec<BlobDesc> = way_schedule
+        .iter()
+        .map(|d| BlobDesc {
+            raw_passthrough: false,
+            ..**d
+        })
         .collect();
     {
         let ids = ExtractPass2IdSets {
@@ -540,11 +677,24 @@ fn extract_simple_single_pass(
             matched_way_ids: &matched_way_ids,
             matched_relation_ids: &empty_relation_ids,
         };
-        pread_execute(input, &way_descs, &mut writer, &mut stats, |block, bb, output| {
-            let s = extract_block_pass2(block, &ids, clean, Some(crate::blob_meta::ElemKind::Way), bb, output)?;
-            flush_local(bb, output)?;
-            Ok(s)
-        })?;
+        pread_execute(
+            input,
+            &way_descs,
+            &mut writer,
+            &mut stats,
+            |block, bb, output| {
+                let s = extract_block_pass2(
+                    block,
+                    &ids,
+                    clean,
+                    Some(crate::blob_meta::ElemKind::Way),
+                    bb,
+                    output,
+                )?;
+                flush_local(bb, output)?;
+                Ok(s)
+            },
+        )?;
     }
 
     crate::debug::emit_marker("SIMPLE_WAY_WRITE_END");
@@ -552,9 +702,11 @@ fn extract_simple_single_pass(
     crate::debug::emit_marker("SIMPLE_REL_CLASSIFY_START");
     let mut matched_relation_ids = IdSet::new();
     {
-        let (rel_classify_schedule, rel_classify_file) = crate::scan::classify::build_classify_schedule(
-            input, Some(crate::blob_meta::ElemKind::Relation),
-        )?;
+        let (rel_classify_schedule, rel_classify_file) =
+            crate::scan::classify::build_classify_schedule(
+                input,
+                Some(crate::blob_meta::ElemKind::Relation),
+            )?;
         crate::scan::classify::parallel_classify_accumulate(
             &rel_classify_file,
             &rel_classify_schedule,
@@ -576,8 +728,12 @@ fn extract_simple_single_pass(
     }
     crate::debug::emit_marker("SIMPLE_REL_CLASSIFY_END");
     crate::debug::emit_marker("SIMPLE_REL_WRITE_START");
-    let rel_descs: Vec<BlobDesc> = relation_schedule.iter()
-        .map(|d| BlobDesc { raw_passthrough: false, ..**d })
+    let rel_descs: Vec<BlobDesc> = relation_schedule
+        .iter()
+        .map(|d| BlobDesc {
+            raw_passthrough: false,
+            ..**d
+        })
         .collect();
     {
         let ids = ExtractPass2IdSets {
@@ -586,11 +742,24 @@ fn extract_simple_single_pass(
             matched_way_ids: &matched_way_ids,
             matched_relation_ids: &matched_relation_ids,
         };
-        pread_execute(input, &rel_descs, &mut writer, &mut stats, |block, bb, output| {
-            let s = extract_block_pass2(block, &ids, clean, Some(crate::blob_meta::ElemKind::Relation), bb, output)?;
-            flush_local(bb, output)?;
-            Ok(s)
-        })?;
+        pread_execute(
+            input,
+            &rel_descs,
+            &mut writer,
+            &mut stats,
+            |block, bb, output| {
+                let s = extract_block_pass2(
+                    block,
+                    &ids,
+                    clean,
+                    Some(crate::blob_meta::ElemKind::Relation),
+                    bb,
+                    output,
+                )?;
+                flush_local(bb, output)?;
+                Ok(s)
+            },
+        )?;
     }
 
     crate::debug::emit_marker("SIMPLE_REL_WRITE_END");
@@ -610,15 +779,12 @@ fn process_extract_pass2_batch(
     type BatchResult = std::result::Result<(Vec<OwnedBlock>, ExtractStats), String>;
     let results: Vec<BatchResult> = batch
         .par_iter()
-        .map_init(
-            BlockBuilder::new,
-            |bb, block| {
-                let mut output: Vec<OwnedBlock> = Vec::new();
-                let block_stats = extract_block_pass2(block, ids, clean, None, bb, &mut output)?;
-                flush_local(bb, &mut output)?;
-                Ok((output, block_stats))
-            },
-        )
+        .map_init(BlockBuilder::new, |bb, block| {
+            let mut output: Vec<OwnedBlock> = Vec::new();
+            let block_stats = extract_block_pass2(block, ids, clean, None, bb, &mut output)?;
+            flush_local(bb, &mut output)?;
+            Ok((output, block_stats))
+        })
         .collect();
 
     drain_batch_results(results, writer, |s| merge_extract_stats(stats, &s))?;

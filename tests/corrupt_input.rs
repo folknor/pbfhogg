@@ -128,8 +128,7 @@ fn truncated_blob_data() {
 
     // Find offset of the second blob (data block)
     let second_offset = {
-        let mut reader =
-            BlobReader::new_seekable(Cursor::new(full.as_slice())).unwrap();
+        let mut reader = BlobReader::new_seekable(Cursor::new(full.as_slice())).unwrap();
         let _ = reader.next().unwrap().unwrap(); // header blob
         let second = reader.next().unwrap().unwrap(); // data blob
         second.offset().unwrap().0 as usize
@@ -248,8 +247,7 @@ fn check_refs_rejects_schedule_entry_past_eof() {
     // with an opaque `read_exact_at` UnexpectedEof. Post-fix: the
     // schedule builder catches the mismatch up front.
     let result = pbfhogg::check::refs::check_refs(
-        &input,
-        false, // check_relations
+        &input, false, // check_relations
         false, // show_ids
         false, // direct_io
     );
@@ -321,4 +319,3 @@ fn iteration_stops_after_error() {
     // Third read: iteration has stopped (last_blob_ok = false)
     assert!(reader.next().is_none());
 }
-

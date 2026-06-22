@@ -132,8 +132,7 @@ fn main() {
 
     for (i, &n) in PARTITION_COUNTS.iter().enumerate() {
         let range_size = MAX_NODE_ID.div_ceil(n);
-        let index_per_partition_gb =
-            (range_size as f64 * 8.0) / 1_000_000_000.0;
+        let index_per_partition_gb = (range_size as f64 * 8.0) / 1_000_000_000.0;
 
         let single_count = blobs
             .iter()
@@ -158,10 +157,7 @@ fn main() {
         }
 
         // Total way-blob reads across all partition passes.
-        let total_blob_reads: u64 = blobs
-            .iter()
-            .map(|b| b.bitmaps[i].count_ones() as u64)
-            .sum();
+        let total_blob_reads: u64 = blobs.iter().map(|b| b.bitmaps[i].count_ones() as u64).sum();
 
         println!("## N={} partitions", n);
         println!(

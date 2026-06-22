@@ -16,9 +16,7 @@ mod derive_parallel {
     use pbfhogg::diff::derive::derive_changes;
     use pbfhogg::diff::derive_parallel_test_hooks as derive_hooks;
 
-    use crate::common::{
-        TestNode, generate_nodes, snapshot_dir, write_multi_block_test_pbf,
-    };
+    use crate::common::{TestNode, generate_nodes, snapshot_dir, write_multi_block_test_pbf};
 
     /// A shard panic inside `diff::derive_parallel::run_shard` must
     /// surface as an `Err` and leave the scratch dir clean of
@@ -53,13 +51,8 @@ mod derive_parallel {
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             derive_changes(
-                &old,
-                &new,
-                &osc,
-                /* direct_io */ false,
-                /* increment_version */ false,
-                /* update_timestamp */ false,
-                /* jobs */ 3,
+                &old, &new, &osc, /* direct_io */ false, /* increment_version */ false,
+                /* update_timestamp */ false, /* jobs */ 3,
             )
         }));
 

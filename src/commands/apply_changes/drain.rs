@@ -178,13 +178,28 @@ impl DrainCounters {
         }
         emit!("merge_drain_items_processed", items_processed);
         emit!("merge_drain_copy_range_calls", copy_range_calls);
-        emit!("merge_drain_copy_range_coalesced_items", copy_range_coalesced_items);
-        emit!("merge_drain_passthrough_chunks_flushed", passthrough_chunks_flushed);
+        emit!(
+            "merge_drain_copy_range_coalesced_items",
+            copy_range_coalesced_items
+        );
+        emit!(
+            "merge_drain_passthrough_chunks_flushed",
+            passthrough_chunks_flushed
+        );
         emit!("merge_drain_rewrite_blocks_written", rewrite_blocks_written);
         emit!("merge_drain_gap_creates_emitted", gap_creates_emitted);
-        emit!("merge_drain_trailing_creates_emitted", trailing_creates_emitted);
-        emit!("merge_drain_reorder_buffer_high_water_count", reorder_buffer_high_water_count);
-        emit!("merge_drain_reorder_buffer_high_water_bytes", reorder_buffer_high_water_bytes);
+        emit!(
+            "merge_drain_trailing_creates_emitted",
+            trailing_creates_emitted
+        );
+        emit!(
+            "merge_drain_reorder_buffer_high_water_count",
+            reorder_buffer_high_water_count
+        );
+        emit!(
+            "merge_drain_reorder_buffer_high_water_bytes",
+            reorder_buffer_high_water_bytes
+        );
         emit!("merge_drain_barrier_loc_map_size", barrier_loc_map_size);
         emit!("merge_drain_reorder_gap_wait_ns", reorder_gap_wait_ns);
     }
@@ -195,7 +210,11 @@ impl DrainCounters {
 /// Exits when `drain_rx` disconnects AND the reorder buffer is empty.
 /// If the channel closes with a seq gap, returns an error rather than
 /// silently emitting truncated output.
-#[allow(clippy::too_many_lines, clippy::cognitive_complexity, clippy::needless_pass_by_value)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::cognitive_complexity,
+    clippy::needless_pass_by_value
+)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn run_drain(
     cfg: DrainConfig<'_>,
@@ -205,7 +224,10 @@ pub(super) fn run_drain(
 ) -> Result<MergeStats> {
     crate::debug::emit_marker("MERGE_DRAIN_START");
 
-    let DrainChannels { drain_rx, last_node_seq_rx } = channels;
+    let DrainChannels {
+        drain_rx,
+        last_node_seq_rx,
+    } = channels;
 
     let mut state = DrainState::new();
     let mut stats = MergeStats::new();

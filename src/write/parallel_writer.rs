@@ -156,7 +156,9 @@ fn parallel_writer_thread_inner(
     // Write the header at offset 0. Everything after grows from
     // `framed_header.len()`.
     if let Err(e) = file.write_all_at(&framed_header, 0) {
-        init_tx.send(Err(io::Error::new(e.kind(), format!("header write: {e}")))).ok();
+        init_tx
+            .send(Err(io::Error::new(e.kind(), format!("header write: {e}"))))
+            .ok();
         return Err(e);
     }
 
@@ -174,21 +176,20 @@ fn parallel_writer_thread_inner(
         worker_txs.push(wtx);
         let file = Arc::clone(&shared_file);
         let err_slot = Arc::clone(&err_slot);
-        worker_handles.push(std::thread::spawn(move || worker_loop(wrx, &file, &err_slot)));
+        worker_handles.push(std::thread::spawn(move || {
+            worker_loop(wrx, &file, &err_slot);
+        }));
     }
 
-    let result = dispatch_loop(
-        &rx,
-        &worker_txs,
-        &err_slot,
-        framed_header.len() as u64,
-    );
+    let result = dispatch_loop(&rx, &worker_txs, &err_slot, framed_header.len() as u64);
 
     // Close pool channels to signal EOI; join workers.
     drop(worker_txs);
     for handle in worker_handles {
         if let Err(e) = handle.join() {
-            return Err(io::Error::other(format!("parallel writer pool panicked: {e:?}")));
+            return Err(io::Error::other(format!(
+                "parallel writer pool panicked: {e:?}"
+            )));
         }
     }
 
@@ -204,12 +205,10 @@ fn parallel_writer_thread_inner(
 
     let t_sync = std::time::Instant::now();
     shared_file.sync_all()?;
-    WRITER_METRICS
-        .sync_all_ns
-        .fetch_add(
-            u64::try_from(t_sync.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
+    WRITER_METRICS.sync_all_ns.fetch_add(
+        u64::try_from(t_sync.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
 
     Ok(())
 }
@@ -274,22 +273,32 @@ fn dispatch_chunk(
             send_to_worker(
                 worker_txs,
                 next_worker,
-                WriteOp::Write { offset: *current_offset, bytes },
+                WriteOp::Write {
+                    offset: *current_offset,
+                    bytes,
+                },
                 err_slot,
             )?;
             *current_offset += len;
-            WRITER_METRICS.bytes_written.fetch_add(len, Ordering::Relaxed);
+            WRITER_METRICS
+                .bytes_written
+                .fetch_add(len, Ordering::Relaxed);
         }
         OutputChunk::Raw(bytes) => {
             let len = bytes.len() as u64;
             send_to_worker(
                 worker_txs,
                 next_worker,
-                WriteOp::Write { offset: *current_offset, bytes },
+                WriteOp::Write {
+                    offset: *current_offset,
+                    bytes,
+                },
                 err_slot,
             )?;
             *current_offset += len;
-            WRITER_METRICS.bytes_written.fetch_add(len, Ordering::Relaxed);
+            WRITER_METRICS
+                .bytes_written
+                .fetch_add(len, Ordering::Relaxed);
         }
         OutputChunk::RawChunks(chunks) => {
             for c in chunks {
@@ -297,15 +306,24 @@ fn dispatch_chunk(
                 send_to_worker(
                     worker_txs,
                     next_worker,
-                    WriteOp::Write { offset: *current_offset, bytes: c },
+                    WriteOp::Write {
+                        offset: *current_offset,
+                        bytes: c,
+                    },
                     err_slot,
                 )?;
                 *current_offset += len;
-                WRITER_METRICS.bytes_written.fetch_add(len, Ordering::Relaxed);
+                WRITER_METRICS
+                    .bytes_written
+                    .fetch_add(len, Ordering::Relaxed);
             }
         }
         #[cfg(feature = "linux-direct-io")]
-        OutputChunk::CopyRange { in_fd, offset: src_offset, len } => {
+        OutputChunk::CopyRange {
+            in_fd,
+            offset: src_offset,
+            len,
+        } => {
             send_to_worker(
                 worker_txs,
                 next_worker,
@@ -318,7 +336,9 @@ fn dispatch_chunk(
                 err_slot,
             )?;
             *current_offset += len;
-            WRITER_METRICS.bytes_written.fetch_add(len, Ordering::Relaxed);
+            WRITER_METRICS
+                .bytes_written
+                .fetch_add(len, Ordering::Relaxed);
         }
     }
     Ok(())
@@ -382,9 +402,12 @@ fn worker_loop(rx: Receiver<WriteOp>, file: &File, err_slot: &ErrSlot) {
         let result = match op {
             WriteOp::Write { offset, bytes } => file.write_all_at(&bytes, offset),
             #[cfg(feature = "linux-direct-io")]
-            WriteOp::CopyRange { out_offset, in_fd, src_offset, len } => {
-                copy_range_to_fd(file, in_fd, src_offset, out_offset, len)
-            }
+            WriteOp::CopyRange {
+                out_offset,
+                in_fd,
+                src_offset,
+                len,
+            } => copy_range_to_fd(file, in_fd, src_offset, out_offset, len),
         };
         WRITER_METRICS.write_ns.fetch_add(
             u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX),
@@ -405,7 +428,11 @@ fn worker_loop(rx: Receiver<WriteOp>, file: &File, err_slot: &ErrSlot) {
 /// `copy_file_range` with explicit out offset. Loops until `len` bytes
 /// are copied, handling short returns per kernel semantics.
 #[cfg(feature = "linux-direct-io")]
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
 fn copy_range_to_fd(
     out: &File,
     in_fd: RawFd,
@@ -437,13 +464,7 @@ fn copy_range_to_fd(
                 // to pread → pwrite in userspace for the remaining
                 // range, using explicit offsets so parallel workers
                 // don't race on the output fd's position.
-                return copy_range_fallback_pwrite(
-                    out,
-                    in_fd,
-                    src_offset,
-                    out_offset,
-                    remaining,
-                );
+                return copy_range_fallback_pwrite(out, in_fd, src_offset, out_offset, remaining);
             }
             return Err(err);
         }
@@ -453,9 +474,8 @@ fn copy_range_to_fd(
                 "copy_file_range returned 0 before completing",
             ));
         }
-        let advanced = u64::try_from(ret).map_err(|_| {
-            io::Error::other("copy_file_range returned negative advance")
-        })?;
+        let advanced = u64::try_from(ret)
+            .map_err(|_| io::Error::other("copy_file_range returned negative advance"))?;
         src_offset += advanced;
         out_offset += advanced;
         remaining -= advanced;
@@ -467,7 +487,11 @@ fn copy_range_to_fd(
 /// offsets. Safe to call concurrently from pool workers because
 /// `pwrite` doesn't touch the fd's file position.
 #[cfg(feature = "linux-direct-io")]
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
 fn copy_range_fallback_pwrite(
     out: &File,
     in_fd: RawFd,
@@ -479,9 +503,8 @@ fn copy_range_fallback_pwrite(
     while remaining > 0 {
         let chunk = buf.len().min(remaining as usize);
         let n = loop {
-            let ret = unsafe {
-                libc::pread(in_fd, buf.as_mut_ptr().cast(), chunk, src_offset as i64)
-            };
+            let ret =
+                unsafe { libc::pread(in_fd, buf.as_mut_ptr().cast(), chunk, src_offset as i64) };
             if ret < 0 {
                 let err = io::Error::last_os_error();
                 if err.raw_os_error() == Some(libc::EINTR) {
@@ -497,9 +520,7 @@ fn copy_range_fallback_pwrite(
                 "pread returned 0 during cross-device copy",
             ));
         }
-        let n_u = usize::try_from(n).map_err(|_| {
-            io::Error::other("pread returned negative")
-        })?;
+        let n_u = usize::try_from(n).map_err(|_| io::Error::other("pread returned negative"))?;
         out.write_all_at(&buf[..n_u], out_offset)?;
         src_offset += n_u as u64;
         out_offset += n_u as u64;

@@ -5,11 +5,11 @@
 //! parsers: PrimitiveBlock, PrimitiveGroup, Node, Way, Relation, DenseNodes,
 //! DenseInfo, Info, and StringTable.
 
-pub(crate) use protohoggr::{
-    Cursor, PackedBoolIter, PackedInt32Iter, PackedSint32Iter, PackedSint64Iter,
-    PackedUint32Iter, WIRE_LEN, WIRE_VARINT,
-};
 use crate::error::Result;
+pub(crate) use protohoggr::{
+    Cursor, PackedBoolIter, PackedInt32Iter, PackedSint32Iter, PackedSint64Iter, PackedUint32Iter,
+    WIRE_LEN, WIRE_VARINT,
+};
 
 // ---------------------------------------------------------------------------
 // WireStringTable - zero-copy indexed string table
@@ -56,7 +56,11 @@ impl<'a> WireStringTable<'a> {
 
     /// Create a WireStringTable that reads entries from the buffer itself.
     fn new(buffer: &'a [u8], entries_offset: u32, entries_count: u32) -> Self {
-        Self { buffer, entries_offset, entries_count }
+        Self {
+            buffer,
+            entries_offset,
+            entries_count,
+        }
     }
 
     #[inline]
@@ -66,16 +70,24 @@ impl<'a> WireStringTable<'a> {
 
     #[inline]
     pub fn get(&self, index: usize) -> Option<&'a [u8]> {
-        if index >= self.entries_count as usize { return None; }
+        if index >= self.entries_count as usize {
+            return None;
+        }
         let base = self.entries_offset as usize + index * 8;
-        if base + 8 > self.buffer.len() { return None; }
+        if base + 8 > self.buffer.len() {
+            return None;
+        }
         let off = u32::from_le_bytes([
-            self.buffer[base], self.buffer[base + 1],
-            self.buffer[base + 2], self.buffer[base + 3],
+            self.buffer[base],
+            self.buffer[base + 1],
+            self.buffer[base + 2],
+            self.buffer[base + 3],
         ]);
         let len = u32::from_le_bytes([
-            self.buffer[base + 4], self.buffer[base + 5],
-            self.buffer[base + 6], self.buffer[base + 7],
+            self.buffer[base + 4],
+            self.buffer[base + 5],
+            self.buffer[base + 6],
+            self.buffer[base + 7],
         ]);
         Some(&self.buffer[off as usize..off as usize + len as usize])
     }
@@ -113,7 +125,6 @@ pub(crate) struct WireBlock<'a> {
 }
 
 impl<'a> WireBlock<'a> {
-
     /// Parse and inline: scan protobuf, then append string table entries and group
     /// ranges as raw LE bytes to the buffer. Zero separate heap allocations.
     ///
@@ -172,13 +183,21 @@ impl<'a> WireBlock<'a> {
                     }
                     (17, WIRE_VARINT) => {
                         #[allow(clippy::cast_possible_wrap)]
-                        { granularity = cursor.read_varint()? as i32; }
+                        {
+                            granularity = cursor.read_varint()? as i32;
+                        }
                     }
-                    (19, WIRE_VARINT) => { lat_offset = cursor.read_varint_i64()?; }
-                    (20, WIRE_VARINT) => { lon_offset = cursor.read_varint_i64()?; }
+                    (19, WIRE_VARINT) => {
+                        lat_offset = cursor.read_varint_i64()?;
+                    }
+                    (20, WIRE_VARINT) => {
+                        lon_offset = cursor.read_varint_i64()?;
+                    }
                     (18, WIRE_VARINT) => {
                         #[allow(clippy::cast_possible_wrap)]
-                        { date_granularity = cursor.read_varint()? as i32; }
+                        {
+                            date_granularity = cursor.read_varint()? as i32;
+                        }
                     }
                     _ => cursor.skip_field(wire_type)?,
                 }
@@ -258,7 +277,8 @@ impl<'a> WireBlock<'a> {
     #[inline]
     #[allow(dead_code)]
     pub fn raw_stringtable(&self) -> &'a [u8] {
-        &self.buffer[self.st_raw_offset as usize..self.st_raw_offset as usize + self.st_raw_len as usize]
+        &self.buffer
+            [self.st_raw_offset as usize..self.st_raw_offset as usize + self.st_raw_len as usize]
     }
 
     /// Raw protobuf bytes for the entire PrimitiveBlock (before inline entries).
@@ -273,12 +293,16 @@ impl<'a> WireBlock<'a> {
     pub fn group(&self, index: usize) -> &'a [u8] {
         let base = self.group_ranges_offset as usize + index * 8;
         let off = u32::from_le_bytes([
-            self.buffer[base], self.buffer[base + 1],
-            self.buffer[base + 2], self.buffer[base + 3],
+            self.buffer[base],
+            self.buffer[base + 1],
+            self.buffer[base + 2],
+            self.buffer[base + 3],
         ]);
         let len = u32::from_le_bytes([
-            self.buffer[base + 4], self.buffer[base + 5],
-            self.buffer[base + 6], self.buffer[base + 7],
+            self.buffer[base + 4],
+            self.buffer[base + 5],
+            self.buffer[base + 6],
+            self.buffer[base + 7],
         ]);
         &self.buffer[off as usize..off as usize + len as usize]
     }

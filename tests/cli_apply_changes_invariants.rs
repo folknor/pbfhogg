@@ -33,9 +33,9 @@ use std::path::Path;
 
 use common::cli::{CliInvoker, CliOutput};
 use common::{
-    assert_elements_equivalent, generate_nodes, generate_ways,
+    TestNode, TestWay, assert_elements_equivalent, generate_nodes, generate_ways,
     read_all_elements_with_coords as read_all_elements, write_multi_block_test_pbf,
-    write_test_pbf_sorted, TestNode, TestWay,
+    write_test_pbf_sorted,
 };
 use flate2::write::GzEncoder;
 use tempfile::TempDir;
@@ -47,7 +47,13 @@ fn write_osc(path: &Path, xml: &str) {
     enc.finish().expect("finish gz");
 }
 
-fn run_apply_changes(base: &Path, osc: &Path, output: &Path, jobs: Option<usize>, locations_on_ways: bool) -> CliOutput {
+fn run_apply_changes(
+    base: &Path,
+    osc: &Path,
+    output: &Path,
+    jobs: Option<usize>,
+    locations_on_ways: bool,
+) -> CliOutput {
     let mut cli = CliInvoker::new()
         .arg("apply-changes")
         .arg(base)
@@ -169,20 +175,46 @@ fn cursor_rule_false_positive_blob_emits_create_after() {
     write_test_pbf_sorted(
         &base,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 200_000_000, lon: 200_000_000, tags: vec![], meta: None },
-            TestNode { id: 10, lat: 300_000_000, lon: 300_000_000, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 100_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 200_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 10,
+                lat: 300_000_000,
+                lon: 300_000_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
-        &[TestWay { id: 100, refs: vec![1, 2, 10], tags: vec![], meta: None }],
+        &[TestWay {
+            id: 100,
+            refs: vec![1, 2, 10],
+            tags: vec![],
+            meta: None,
+        }],
         &[],
     );
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <create>
     <node id="5" lat="40.0" lon="40.0" version="1"/>
   </create>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     run_apply_simple(&base, &osc, &output);
     let c = read_all_elements(&output);
@@ -212,25 +244,43 @@ fn cursor_rule_false_positive_blob_emits_create_at_tail() {
     write_test_pbf_sorted(
         &base,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![], meta: None },
-            TestNode { id: 10, lat: 300_000_000, lon: 300_000_000, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 100_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 10,
+                lat: 300_000_000,
+                lon: 300_000_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[],
         &[],
     );
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <create>
     <node id="5" lat="40.0" lon="40.0" version="1"/>
   </create>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     run_apply_simple(&base, &osc, &output);
     let c = read_all_elements(&output);
 
     let node_ids: Vec<i64> = c.nodes.iter().map(|n| n.0).collect();
-    assert!(node_ids.contains(&5), "id=5 must be present (got {node_ids:?})");
+    assert!(
+        node_ids.contains(&5),
+        "id=5 must be present (got {node_ids:?})"
+    );
     assert_eq!(
         node_ids,
         vec![1, 10, 5],
@@ -304,7 +354,9 @@ fn empty_base_pbf_flushes_all_three_kinds() {
 
     write_test_pbf_sorted(&base, &[], &[], &[]);
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <create>
     <node id="1" lat="10.0" lon="10.0" version="1"/>
@@ -317,14 +369,18 @@ fn empty_base_pbf_flushes_all_three_kinds() {
       <member type="way" ref="100" role="outer"/>
     </relation>
   </create>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     run_apply_simple(&base, &osc, &output);
     let c = read_all_elements(&output);
 
     assert_eq!(c.nodes.iter().map(|n| n.0).collect::<Vec<_>>(), vec![1, 2]);
     assert_eq!(c.ways.iter().map(|w| w.0).collect::<Vec<_>>(), vec![100]);
-    assert_eq!(c.relations.iter().map(|r| r.0).collect::<Vec<_>>(), vec![1000]);
+    assert_eq!(
+        c.relations.iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![1000]
+    );
 }
 
 #[test]
@@ -335,9 +391,12 @@ fn empty_base_pbf_noop_on_empty_diff() {
     let output = dir.path().join("output.osm.pbf");
 
     write_test_pbf_sorted(&base, &[], &[], &[]);
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     run_apply_simple(&base, &osc, &output);
     let c = read_all_elements(&output);
@@ -360,12 +419,20 @@ fn trailing_creates_after_node_blob_flush_way_and_relation() {
 
     write_test_pbf_sorted(
         &base,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![], meta: None }],
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 100_000_000,
+            tags: vec![],
+            meta: None,
+        }],
         &[],
         &[],
     );
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <create>
     <node id="2" lat="20.0" lon="20.0" version="1"/>
@@ -377,14 +444,18 @@ fn trailing_creates_after_node_blob_flush_way_and_relation() {
       <member type="way" ref="100" role="outer"/>
     </relation>
   </create>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     run_apply_simple(&base, &osc, &output);
     let c = read_all_elements(&output);
 
     assert_eq!(c.nodes.iter().map(|n| n.0).collect::<Vec<_>>(), vec![1, 2]);
     assert_eq!(c.ways.iter().map(|w| w.0).collect::<Vec<_>>(), vec![100]);
-    assert_eq!(c.relations.iter().map(|r| r.0).collect::<Vec<_>>(), vec![1000]);
+    assert_eq!(
+        c.relations.iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![1000]
+    );
 }
 
 #[test]
@@ -396,26 +467,43 @@ fn trailing_creates_after_way_blob_flush_relation_only() {
 
     write_test_pbf_sorted(
         &base,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![], meta: None }],
-        &[TestWay { id: 10, refs: vec![1], tags: vec![], meta: None }],
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 100_000_000,
+            tags: vec![],
+            meta: None,
+        }],
+        &[TestWay {
+            id: 10,
+            refs: vec![1],
+            tags: vec![],
+            meta: None,
+        }],
         &[],
     );
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <create>
     <relation id="500" version="1">
       <member type="way" ref="10" role="outer"/>
     </relation>
   </create>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     run_apply_simple(&base, &osc, &output);
     let c = read_all_elements(&output);
 
     assert_eq!(c.nodes.iter().map(|n| n.0).collect::<Vec<_>>(), vec![1]);
     assert_eq!(c.ways.iter().map(|w| w.0).collect::<Vec<_>>(), vec![10]);
-    assert_eq!(c.relations.iter().map(|r| r.0).collect::<Vec<_>>(), vec![500]);
+    assert_eq!(
+        c.relations.iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![500]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -433,17 +521,26 @@ fn modify_on_missing_id_silently_inserts() {
 
     write_test_pbf_sorted(
         &base,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![], meta: None }],
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 100_000_000,
+            tags: vec![],
+            meta: None,
+        }],
         &[],
         &[],
     );
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <modify>
     <node id="42" lat="55.0" lon="12.0" version="3"/>
   </modify>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     run_apply_simple(&base, &osc, &output);
     let c = read_all_elements(&output);
@@ -464,17 +561,26 @@ fn delete_on_missing_id_is_noop() {
 
     write_test_pbf_sorted(
         &base,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 100_000_000, tags: vec![], meta: None }],
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 100_000_000,
+            tags: vec![],
+            meta: None,
+        }],
         &[],
         &[],
     );
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <delete>
     <node id="42" version="1"/>
   </delete>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     run_apply_simple(&base, &osc, &output);
     let c = read_all_elements(&output);
@@ -493,17 +599,26 @@ fn create_on_existing_id_overwrites_base() {
 
     write_test_pbf_sorted(
         &base,
-        &[TestNode { id: 42, lat: 100_000_000, lon: 100_000_000, tags: vec![], meta: None }],
+        &[TestNode {
+            id: 42,
+            lat: 100_000_000,
+            lon: 100_000_000,
+            tags: vec![],
+            meta: None,
+        }],
         &[],
         &[],
     );
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <create>
     <node id="42" lat="20.0" lon="20.0" version="2"/>
   </create>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     run_apply_simple(&base, &osc, &output);
     let c = read_all_elements(&output);

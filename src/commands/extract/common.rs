@@ -7,9 +7,9 @@ use crate::cat::CleanAttrs;
 use crate::writer::PbfWriter;
 use crate::{BlobFilter, Element, MemberId, PrimitiveBlock};
 
-use super::super::{Result, flush_local,
-    ensure_node_capacity_local, ensure_way_capacity_local,
-    ensure_relation_capacity_local,
+use super::super::{
+    Result, ensure_node_capacity_local, ensure_relation_capacity_local, ensure_way_capacity_local,
+    flush_local,
 };
 use crate::idset::IdSet;
 
@@ -112,18 +112,22 @@ pub(super) fn build_blob_schedule_with_passthrough(
     let mut schedule = Vec::new();
     let mut passthrough_node_blobs: u64 = 0;
     while let Some(meta) = walker.next_header()? {
-        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) { continue; }
+        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
+            continue;
+        }
         let idx = meta.index.as_ref();
         let kind = idx.map(|i| i.kind);
 
         // Tag node blobs for raw passthrough if fully contained in extract bbox.
         let raw_passthrough = extract_bbox.is_some_and(|ebbox| {
-            idx.is_some_and(|i|
+            idx.is_some_and(|i| {
                 matches!(i.kind, crate::blob_meta::ElemKind::Node)
-                && i.bbox.as_ref().is_some_and(|bb| ebbox.contains(bb))
-            )
+                    && i.bbox.as_ref().is_some_and(|bb| ebbox.contains(bb))
+            })
         });
-        if raw_passthrough { passthrough_node_blobs += 1; }
+        if raw_passthrough {
+            passthrough_node_blobs += 1;
+        }
 
         let bbox = idx.and_then(|i| i.bbox);
         let count = idx.map_or(0, |i| i.count);
@@ -133,7 +137,10 @@ pub(super) fn build_blob_schedule_with_passthrough(
             frame_size: meta.frame_size,
             offset: meta.data_offset,
             size: meta.data_size,
-            kind, bbox, count, raw_passthrough,
+            kind,
+            bbox,
+            count,
+            raw_passthrough,
         });
     }
     crate::debug::emit_marker("EXTRACT_SCHEDULE_SCAN_END");
@@ -141,7 +148,10 @@ pub(super) fn build_blob_schedule_with_passthrough(
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("extract_schedule_blobs", schedule.len() as i64);
-        crate::debug::emit_counter("extract_schedule_passthrough_node_blobs", passthrough_node_blobs as i64);
+        crate::debug::emit_counter(
+            "extract_schedule_passthrough_node_blobs",
+            passthrough_node_blobs as i64,
+        );
     }
     Ok(schedule)
 }
@@ -170,11 +180,19 @@ pub(super) fn pread_execute<F>(
     block_fn: F,
 ) -> Result<()>
 where
-    F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> std::result::Result<ExtractStats, String> + Send + Sync,
+    F: Fn(
+            &PrimitiveBlock,
+            &mut BlockBuilder,
+            &mut Vec<OwnedBlock>,
+        ) -> std::result::Result<ExtractStats, String>
+        + Send
+        + Sync,
 {
     use std::os::unix::fs::FileExt as _;
 
-    if schedule.is_empty() { return Ok(()); }
+    if schedule.is_empty() {
+        return Ok(());
+    }
 
     // Shared file for pread. Uses buffered (non-O_DIRECT) I/O because O_DIRECT
     // requires aligned buffers for pread, which we don't have - our read buffers
@@ -188,7 +206,7 @@ where
     // See TODO.md history 2026-04-19 for the investigation.
     let shared_file = std::sync::Arc::new(
         std::fs::File::open(input)
-            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
     );
 
     let decode_threads = std::thread::available_parallelism()
@@ -218,7 +236,9 @@ where
         // Passthrough blobs are handled directly by the consumer.
         scope.spawn(move || {
             for item in decode_items {
-                if desc_tx.send(item).is_err() { break; }
+                if desc_tx.send(item).is_err() {
+                    break;
+                }
             }
         });
 
@@ -254,22 +274,29 @@ where
                         let mut buf = crate::blob::pool_get_pub(&worker_pool, data_size * 4);
                         crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
                         let block = PrimitiveBlock::from_vec_pooled_with_scratch(
-                            buf, &worker_pool, &mut st_scratch, &mut gr_scratch,
+                            buf,
+                            &worker_pool,
+                            &mut st_scratch,
+                            &mut gr_scratch,
                         )?;
                         output_blocks.clear();
-                        let block_stats = block_fn_ref(
-                            &block, &mut bb, &mut output_blocks,
-                        ).map_err(|e| crate::error::new_error(
-                            crate::error::ErrorKind::Io(std::io::Error::other(e))
-                        ))?;
+                        let block_stats = block_fn_ref(&block, &mut bb, &mut output_blocks)
+                            .map_err(|e| {
+                                crate::error::new_error(crate::error::ErrorKind::Io(
+                                    std::io::Error::other(e),
+                                ))
+                            })?;
                         flush_local(&mut bb, &mut output_blocks).map_err(|e| {
-                            crate::error::new_error(
-                                crate::error::ErrorKind::Io(std::io::Error::other(e))
-                            )
+                            crate::error::new_error(crate::error::ErrorKind::Io(
+                                std::io::Error::other(e),
+                            ))
                         })?;
                         Ok((std::mem::take(&mut output_blocks), block_stats))
-                    })();
-                    if tx.send((s, r)).is_err() { break; }
+                    })(
+                    );
+                    if tx.send((s, r)).is_err() {
+                        break;
+                    }
                 }
             });
         }
@@ -292,7 +319,10 @@ where
 
         // Pre-insert passthrough items into the reorder buffer.
         for &(seq, frame_offset, frame_size, count) in &passthrough_items {
-            reorder.push(seq, ConsumerItem::Passthrough(frame_offset, frame_size, count));
+            reorder.push(
+                seq,
+                ConsumerItem::Passthrough(frame_offset, frame_size, count),
+            );
         }
 
         // Drain worker results into the reorder buffer.
@@ -306,13 +336,18 @@ where
                         let (blocks, block_stats) = r?;
                         merge_extract_stats(stats, &block_stats);
                         for (block_bytes, index, tagdata) in blocks {
-                            writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+                            writer.write_primitive_block_owned(
+                                block_bytes,
+                                index,
+                                tagdata.as_deref(),
+                            )?;
                         }
                     }
                     ConsumerItem::Passthrough(frame_offset, frame_size, count) => {
                         // Read raw frame directly and write without decode/re-encode.
                         frame_read_buf.resize(frame_size, 0);
-                        shared_file.read_exact_at(&mut frame_read_buf, frame_offset)
+                        shared_file
+                            .read_exact_at(&mut frame_read_buf, frame_offset)
                             .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
                         writer.write_raw_owned(std::mem::take(&mut frame_read_buf))?;
                         stats.nodes_in_bbox += count;
@@ -328,12 +363,17 @@ where
                     let (blocks, block_stats) = r?;
                     merge_extract_stats(stats, &block_stats);
                     for (block_bytes, index, tagdata) in blocks {
-                        writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+                        writer.write_primitive_block_owned(
+                            block_bytes,
+                            index,
+                            tagdata.as_deref(),
+                        )?;
                     }
                 }
                 ConsumerItem::Passthrough(frame_offset, frame_size, count) => {
                     frame_read_buf.resize(frame_size, 0);
-                    shared_file.read_exact_at(&mut frame_read_buf, frame_offset)
+                    shared_file
+                        .read_exact_at(&mut frame_read_buf, frame_offset)
                         .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
                     writer.write_raw_owned(std::mem::take(&mut frame_read_buf))?;
                     stats.nodes_in_bbox += count;
@@ -357,7 +397,13 @@ pub(super) fn pread_write_pass<F>(
     block_fn: F,
 ) -> Result<()>
 where
-    F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> std::result::Result<ExtractStats, String> + Send + Sync,
+    F: Fn(
+            &PrimitiveBlock,
+            &mut BlockBuilder,
+            &mut Vec<OwnedBlock>,
+        ) -> std::result::Result<ExtractStats, String>
+        + Send
+        + Sync,
 {
     crate::debug::emit_mallinfo2("MI_PRE_BLOB_SCHEDULE");
     crate::debug::emit_marker("PREAD_WRITE_BLOB_SCHEDULE_START");
@@ -381,7 +427,13 @@ pub(super) fn pread_write_pass_with_schedule<F>(
     block_fn: F,
 ) -> Result<()>
 where
-    F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> std::result::Result<ExtractStats, String> + Send + Sync,
+    F: Fn(
+            &PrimitiveBlock,
+            &mut BlockBuilder,
+            &mut Vec<OwnedBlock>,
+        ) -> std::result::Result<ExtractStats, String>
+        + Send
+        + Sync,
 {
     crate::debug::emit_marker("PREAD_WRITE_EXECUTE_START");
     pread_execute(input, schedule, writer, stats, block_fn)?;
@@ -452,7 +504,13 @@ pub(super) fn extract_block_pass2(
                 if in_bbox || from_way {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = clean_metadata(dense_node_metadata(dn), clean);
-                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), meta.as_ref());
+                    bb.add_node(
+                        dn.id(),
+                        dn.decimicro_lat(),
+                        dn.decimicro_lon(),
+                        dn.tags(),
+                        meta.as_ref(),
+                    );
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else {
@@ -466,7 +524,13 @@ pub(super) fn extract_block_pass2(
                 if in_bbox || from_way {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = clean_metadata(element_metadata(&n.info()), clean);
-                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), n.tags(), meta.as_ref());
+                    bb.add_node(
+                        n.id(),
+                        n.decimicro_lat(),
+                        n.decimicro_lon(),
+                        n.tags(),
+                        meta.as_ref(),
+                    );
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else {

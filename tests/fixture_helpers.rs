@@ -9,8 +9,8 @@
 mod common;
 
 use common::{
-    assert_indexed, generate_nodes, generate_relations, generate_ways, read_header,
-    read_normalized, write_multi_block_test_pbf, write_test_pbf_sorted, TestMeta, TestNode,
+    TestMeta, TestNode, assert_indexed, generate_nodes, generate_relations, generate_ways,
+    read_header, read_normalized, write_multi_block_test_pbf, write_test_pbf_sorted,
 };
 use pbfhogg::{BlobDecode, BlobReader, BlobType};
 use tempfile::TempDir;
@@ -81,7 +81,10 @@ fn generator_roundtrip() {
     write_test_pbf_sorted(&path, &nodes, &ways, &relations);
 
     let c = read_normalized(&path);
-    assert_eq!(c.nodes.iter().map(|n| n.id).collect::<Vec<_>>(), (1..=50).collect::<Vec<_>>());
+    assert_eq!(
+        c.nodes.iter().map(|n| n.id).collect::<Vec<_>>(),
+        (1..=50).collect::<Vec<_>>()
+    );
     assert_eq!(
         c.ways.iter().map(|w| w.id).collect::<Vec<_>>(),
         (1_000..1_010).collect::<Vec<_>>()

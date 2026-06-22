@@ -10,20 +10,20 @@ use std::io::BufReader;
 use std::path::Path;
 
 use flate2::read::MultiGzDecoder;
-use quick_xml::events::Event;
 use quick_xml::Reader;
+use quick_xml::events::Event;
 use rustc_hash::FxHashMap;
 
+use super::ParseResult;
 use super::compact::{arena_append_node, arena_append_relation, arena_append_way};
 use super::interner::StringInterner;
 use super::xml_parse::{
-    handle_empty_event_compact, handle_end_event_compact, handle_start_event_compact, ParserState,
+    ParserState, handle_empty_event_compact, handle_end_event_compact, handle_start_event_compact,
 };
-use super::ParseResult;
 
 pub use super::compact::{
-    CompactMemberIter, CompactNodeRef, CompactRefIter, CompactRelationRef,
-    CompactTagIter, CompactWayRef,
+    CompactMemberIter, CompactNodeRef, CompactRefIter, CompactRelationRef, CompactTagIter,
+    CompactWayRef,
 };
 
 // ---------------------------------------------------------------------------
@@ -365,13 +365,13 @@ pub fn load_all_diffs(diffs_dir: &Path) -> ParseResult<CompactDiffOverlay> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::compact::{
         arena_append_node, arena_append_relation, arena_append_way, member_type_to_byte,
     };
+    use super::*;
     use crate::read::elements::MemberType;
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
     use std::io::Write;
 
     /// Create a unique temp directory for test isolation.
@@ -467,7 +467,9 @@ mod tests {
         parse_osc_file_into(&dir.join("001.osc.gz"), &mut overlay)?;
         parse_osc_file_into(&dir.join("002.osc.gz"), &mut overlay)?;
 
-        let node = overlay.get_node(100).ok_or("node 100 should exist after merge")?;
+        let node = overlay
+            .get_node(100)
+            .ok_or("node 100 should exist after merge")?;
         // lat=3.0 -> decimicro = 30000000
         assert_eq!(node.decimicro_lat(), 30_000_000);
         assert_eq!(node.decimicro_lon(), 40_000_000);
@@ -701,7 +703,11 @@ mod tests {
         let members = vec![
             (10, member_type_to_byte(MemberType::Way), role_outer),
             (20, member_type_to_byte(MemberType::Way), role_inner),
-            (30, member_type_to_byte(MemberType::Node), interner.intern("")),
+            (
+                30,
+                member_type_to_byte(MemberType::Node),
+                interner.intern(""),
+            ),
         ];
         let tags: Vec<(u32, &str)> = vec![(key_type, "multipolygon")];
         let offset = arena_append_relation(&mut arena, 500, &members, &tags);
@@ -764,7 +770,10 @@ mod tests {
         let refs: Vec<i64> = way100.refs().collect();
         assert_eq!(refs, vec![1, 2, 3]);
         let tags: Vec<(&str, &str)> = way100.tags().collect();
-        assert_eq!(tags, vec![("highway", "residential"), ("name", "Main Street")]);
+        assert_eq!(
+            tags,
+            vec![("highway", "residential"), ("name", "Main Street")]
+        );
 
         // Way 300: 2 refs, 1 tag (modify)
         let way300 = overlay.get_way(300).ok_or("way 300 should exist")?;
@@ -774,7 +783,9 @@ mod tests {
         assert_eq!(tags, vec![("highway", "primary")]);
 
         // Relation 200: 3 members, 1 tag
-        let rel = overlay.get_relation(200).ok_or("relation 200 should exist")?;
+        let rel = overlay
+            .get_relation(200)
+            .ok_or("relation 200 should exist")?;
         let members: Vec<(MemberType, i64, &str)> = rel.members().collect();
         assert_eq!(members.len(), 3);
         assert_eq!(members[0], (MemberType::Way, 100, "outer"));

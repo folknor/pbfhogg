@@ -19,11 +19,9 @@ mod common;
 
 use std::time::Duration;
 
-use common::adversarial::{locate_blobs, truncate_to, BlobLocation};
+use common::adversarial::{BlobLocation, locate_blobs, truncate_to};
 use common::cli::CliInvoker;
-use common::{
-    generate_nodes, generate_relations, generate_ways, write_multi_block_test_pbf,
-};
+use common::{generate_nodes, generate_relations, generate_ways, write_multi_block_test_pbf};
 use tempfile::TempDir;
 
 /// Wall clock cap per truncation × command invocation.

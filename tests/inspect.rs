@@ -2,9 +2,7 @@
 
 mod common;
 
-use common::{
-    generate_nodes, write_multi_block_test_pbf, TestNode, TestRelation, TestWay,
-};
+use common::{TestNode, TestRelation, TestWay, generate_nodes, write_multi_block_test_pbf};
 use pbfhogg::block_builder::{self, BlockBuilder};
 use pbfhogg::writer::{Compression, PbfWriter};
 
@@ -12,28 +10,68 @@ fn write_simple_pbf(path: &std::path::Path) {
     common::write_test_pbf(
         path,
         &[
-            TestNode { id: 1, lat: 510_000_000, lon: -1_000_000, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 520_000_000, lon: -2_000_000, tags: vec![("name", "foo")], meta: None },
-            TestNode { id: 3, lat: 530_000_000, lon: -3_000_000, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 510_000_000,
+                lon: -1_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 520_000_000,
+                lon: -2_000_000,
+                tags: vec![("name", "foo")],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 530_000_000,
+                lon: -3_000_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[
-            TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "residential")], meta: None },
-            TestWay { id: 11, refs: vec![2, 3], tags: vec![], meta: None },
+            TestWay {
+                id: 10,
+                refs: vec![1, 2, 3],
+                tags: vec![("highway", "residential")],
+                meta: None,
+            },
+            TestWay {
+                id: 11,
+                refs: vec![2, 3],
+                tags: vec![],
+                meta: None,
+            },
         ],
-        &[
-            TestRelation { id: 100, members: vec![], tags: vec![("type", "route")], meta: None },
-        ],
+        &[TestRelation {
+            id: 100,
+            members: vec![],
+            tags: vec![("type", "route")],
+            meta: None,
+        }],
     );
 }
 
 fn write_nodes_blocks(path: &std::path::Path, blocks: &[usize]) {
-    let header = block_builder::HeaderBuilder::new().build().expect("build header");
-    let mut writer = PbfWriter::to_path(path, Compression::default(), &header).expect("create writer");
+    let header = block_builder::HeaderBuilder::new()
+        .build()
+        .expect("build header");
+    let mut writer =
+        PbfWriter::to_path(path, Compression::default(), &header).expect("create writer");
     let mut bb = BlockBuilder::new();
     let mut next_id: i64 = 1;
     for &count in blocks {
         for _ in 0..count {
-            bb.add_node(next_id, 500_000_000, 100_000_000, std::iter::empty::<(&str, &str)>(), None);
+            bb.add_node(
+                next_id,
+                500_000_000,
+                100_000_000,
+                std::iter::empty::<(&str, &str)>(),
+                None,
+            );
             next_id += 1;
         }
         if let Some(bytes) = bb.take().expect("take") {
@@ -49,15 +87,20 @@ fn inspect_json_base() {
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
-    let report = pbfhogg::inspect::inspect(&input, false, false, false, false, false)
-        .expect("inspect");
+    let report =
+        pbfhogg::inspect::inspect(&input, false, false, false, false, false).expect("inspect");
     let json = report.to_json(None);
 
     // Schema version
     assert_eq!(json["schema_version"], 1);
 
     // File metadata
-    assert!(json["file"].as_str().expect("value").contains("test.osm.pbf"));
+    assert!(
+        json["file"]
+            .as_str()
+            .expect("value")
+            .contains("test.osm.pbf")
+    );
     assert!(json["file_size"].as_u64().expect("value") > 0);
 
     // Header
@@ -96,8 +139,8 @@ fn inspect_json_with_id_ranges() {
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
-    let report = pbfhogg::inspect::inspect(&input, false, true, false, false, false)
-        .expect("inspect");
+    let report =
+        pbfhogg::inspect::inspect(&input, false, true, false, false, false).expect("inspect");
     let json = report.to_json(None);
 
     // id_ranges should be an object, not null
@@ -126,8 +169,8 @@ fn inspect_json_with_blocks() {
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
-    let report = pbfhogg::inspect::inspect(&input, true, false, false, false, false)
-        .expect("inspect");
+    let report =
+        pbfhogg::inspect::inspect(&input, true, false, false, false, false).expect("inspect");
     let json = report.to_json(Some(0));
 
     // blocks_detail should be an array, not null
@@ -149,8 +192,8 @@ fn inspect_json_blocks_limit_honored() {
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
-    let report = pbfhogg::inspect::inspect(&input, true, false, false, false, false)
-        .expect("inspect");
+    let report =
+        pbfhogg::inspect::inspect(&input, true, false, false, false, false).expect("inspect");
 
     let json_all = report.to_json(Some(0));
     let total = json_all["blocks_detail"].as_array().expect("value").len();
@@ -158,7 +201,10 @@ fn inspect_json_blocks_limit_honored() {
     // With limit=1, if total > 2, should get first 1 + last 1 = 2
     if total > 2 {
         let json_limited = report.to_json(Some(1));
-        let limited = json_limited["blocks_detail"].as_array().expect("value").len();
+        let limited = json_limited["blocks_detail"]
+            .as_array()
+            .expect("value")
+            .len();
         assert_eq!(limited, 2);
     }
 }
@@ -169,8 +215,8 @@ fn inspect_json_combined_flags() {
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
-    let report = pbfhogg::inspect::inspect(&input, true, true, false, false, false)
-        .expect("inspect");
+    let report =
+        pbfhogg::inspect::inspect(&input, true, true, false, false, false).expect("inspect");
     let json = report.to_json(Some(0));
 
     // All optional fields should be present
@@ -182,9 +228,18 @@ fn inspect_json_combined_flags() {
     // Verify deterministic key set - all top-level keys present
     let obj = json.as_object().expect("value");
     for key in &[
-        "schema_version", "file", "file_size", "header", "indexed",
-        "blocks", "elements", "ordering", "id_ranges", "anomalies_only",
-        "blocks_detail", "locations",
+        "schema_version",
+        "file",
+        "file_size",
+        "header",
+        "indexed",
+        "blocks",
+        "elements",
+        "ordering",
+        "id_ranges",
+        "anomalies_only",
+        "blocks_detail",
+        "locations",
     ] {
         assert!(obj.contains_key(*key), "missing key: {key}");
     }
@@ -198,8 +253,8 @@ fn inspect_json_blocks_anomalies_only() {
     // Median=100, so the 10-element block is anomalously small (<50% of median).
     write_nodes_blocks(&input, &[100, 100, 10]);
 
-    let report = pbfhogg::inspect::inspect(&input, true, false, false, false, false)
-        .expect("inspect");
+    let report =
+        pbfhogg::inspect::inspect(&input, true, false, false, false, false).expect("inspect");
     let json = report.to_json_filtered(Some(0), true);
 
     assert!(json["anomalies_only"].as_bool().expect("bool"));
@@ -218,8 +273,8 @@ fn inspect_extended() {
     write_simple_pbf(&input);
 
     // extended=true forces full decode and collects timestamps, bbox, metadata
-    let report = pbfhogg::inspect::inspect(&input, false, false, false, true, false)
-        .expect("inspect");
+    let report =
+        pbfhogg::inspect::inspect(&input, false, false, false, true, false).expect("inspect");
     let json = report.to_json(None);
 
     // Extended automatically enables id_ranges
@@ -242,8 +297,8 @@ fn inspect_get_value() {
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
-    let report = pbfhogg::inspect::inspect(&input, false, false, false, true, false)
-        .expect("inspect");
+    let report =
+        pbfhogg::inspect::inspect(&input, false, false, false, true, false).expect("inspect");
 
     // Basic keys
     assert_eq!(report.get_value("file.format"), Some("PBF".to_string()));
@@ -281,10 +336,10 @@ fn node_stats_parallel_classify_parity() {
     let nodes = generate_nodes(40, 1);
     write_multi_block_test_pbf(&input, &nodes, &[], &[], 10);
 
-    let seq = pbfhogg::inspect::node_stats::node_stats(&input, false, true, 1)
-        .expect("node_stats seq");
-    let par = pbfhogg::inspect::node_stats::node_stats(&input, false, true, 4)
-        .expect("node_stats par");
+    let seq =
+        pbfhogg::inspect::node_stats::node_stats(&input, false, true, 1).expect("node_stats seq");
+    let par =
+        pbfhogg::inspect::node_stats::node_stats(&input, false, true, 4).expect("node_stats par");
 
     // Raw totals must match exactly. These are simple sums /
     // min-reductions over blobs; if workers double-count or drop a
@@ -332,17 +387,43 @@ fn show_element_unsorted_pbf_finds_target_in_later_blob() {
     // before sort, etc.) but would wrongly trigger `show_element`'s
     // min_id-based early-exit.
     let nodes = vec![
-        TestNode { id: 100, lat: 0, lon: 0, tags: vec![], meta: None },
-        TestNode { id: 101, lat: 0, lon: 0, tags: vec![], meta: None },
-        TestNode { id: 50,  lat: 0, lon: 0, tags: vec![], meta: None },
-        TestNode { id: 51,  lat: 0, lon: 0, tags: vec![], meta: None },
+        TestNode {
+            id: 100,
+            lat: 0,
+            lon: 0,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 101,
+            lat: 0,
+            lon: 0,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 50,
+            lat: 0,
+            lon: 0,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 51,
+            lat: 0,
+            lon: 0,
+            tags: vec![],
+            meta: None,
+        },
     ];
     common::write_test_pbf_impl(&input, &nodes, &[], &[], false, Some(2));
 
     use pbfhogg::inspect::{ShowElementType, show_element};
-    let found =
-        show_element(&input, ShowElementType::Node, 51, false).expect("show_element");
-    assert!(found, "node 51 lives in the second blob; must be found on unsorted PBF");
+    let found = show_element(&input, ShowElementType::Node, 51, false).expect("show_element");
+    assert!(
+        found,
+        "node 51 lives in the second blob; must be found on unsorted PBF"
+    );
 
     // Sanity: also find 100 (first blob).
     let found100 =
@@ -353,4 +434,3 @@ fn show_element_unsorted_pbf_finds_target_in_later_blob() {
     let miss = show_element(&input, ShowElementType::Node, 999, false).expect("show miss");
     assert!(!miss, "node 999 shouldn't exist");
 }
-

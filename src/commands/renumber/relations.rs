@@ -5,12 +5,12 @@
 //! - **R2d**: parallel wire-format splice rewriter for relations.
 //!   Resolves node/way/relation member refs inline via `resolve()`.
 
-use crate::idset::IdSet;
-use super::super::renumber::RenumberStats;
 use super::super::Result;
+use super::super::renumber::RenumberStats;
+use super::StageCounters;
 use super::schedule::BlobTask;
 use super::wire_rewrite::reframe_relations_with_new_ids;
-use super::StageCounters;
+use crate::idset::IdSet;
 
 /// Reject negative ids at the entry of the external path.
 ///
@@ -61,13 +61,17 @@ pub(super) fn relation_r1_collect_ids(
             .read_exact_at(&mut raw_buf, task.data_offset)
             .map_err(|e| format!("failed to pread relation blob at {}: {e}", task.data_offset))?;
         #[allow(clippy::cast_possible_truncation)]
-        { pread_ms += t0.elapsed().as_millis() as u64; }
+        {
+            pread_ms += t0.elapsed().as_millis() as u64;
+        }
 
         let t1 = std::time::Instant::now();
         crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)
             .map_err(|e| format!("R1 decompress: {e}"))?;
         #[allow(clippy::cast_possible_truncation)]
-        { decompress_ms += t1.elapsed().as_millis() as u64; }
+        {
+            decompress_ms += t1.elapsed().as_millis() as u64;
+        }
 
         // Wire-format scan: extract relation IDs without full
         // PrimitiveBlock decode. Skip string table, skip all fields
@@ -75,41 +79,61 @@ pub(super) fn relation_r1_collect_ids(
         let t2 = std::time::Instant::now();
         group_ranges.clear();
         let mut cursor = Cursor::new(&decompress_buf);
-        while let Some((field, wire_type)) = cursor.read_tag().map_err(|e| format!("R1 block: {e}"))? {
+        while let Some((field, wire_type)) =
+            cursor.read_tag().map_err(|e| format!("R1 block: {e}"))?
+        {
             if field == 2 && wire_type == WIRE_LEN {
-                let data = cursor.read_len_delimited().map_err(|e| format!("R1 group: {e}"))?;
+                let data = cursor
+                    .read_len_delimited()
+                    .map_err(|e| format!("R1 group: {e}"))?;
                 let offset = data.as_ptr() as usize - decompress_buf.as_ptr() as usize;
                 group_ranges.push((offset, data.len()));
             } else {
-                cursor.skip_field(wire_type).map_err(|e| format!("R1 skip: {e}"))?;
+                cursor
+                    .skip_field(wire_type)
+                    .map_err(|e| format!("R1 skip: {e}"))?;
             }
         }
 
         for &(off, len) in &group_ranges {
             let group_bytes = &decompress_buf[off..off + len];
             let mut gcursor = Cursor::new(group_bytes);
-            while let Some((field, wire_type)) = gcursor.read_tag().map_err(|e| format!("R1 gfield: {e}"))? {
+            while let Some((field, wire_type)) =
+                gcursor.read_tag().map_err(|e| format!("R1 gfield: {e}"))?
+            {
                 if field == 4 && wire_type == WIRE_LEN {
                     // Relation submessage - extract field 1 (id).
-                    let rel_bytes = gcursor.read_len_delimited().map_err(|e| format!("R1 rel: {e}"))?;
+                    let rel_bytes = gcursor
+                        .read_len_delimited()
+                        .map_err(|e| format!("R1 rel: {e}"))?;
                     let mut rcursor = Cursor::new(rel_bytes);
-                    while let Some((rf, rt)) = rcursor.read_tag().map_err(|e| format!("R1 rfield: {e}"))? {
+                    while let Some((rf, rt)) =
+                        rcursor.read_tag().map_err(|e| format!("R1 rfield: {e}"))?
+                    {
                         if rf == 1 && rt == WIRE_VARINT {
-                            let rel_id = rcursor.read_varint_i64().map_err(|e| format!("R1 id: {e}"))?;
+                            let rel_id = rcursor
+                                .read_varint_i64()
+                                .map_err(|e| format!("R1 id: {e}"))?;
                             reject_negative_id(rel_id, "relation")?;
                             relation_id_set.set(rel_id);
                             // id is always field 1, first in the message - skip the rest.
                             break;
                         }
-                        rcursor.skip_field(rt).map_err(|e| format!("R1 rskip: {e}"))?;
+                        rcursor
+                            .skip_field(rt)
+                            .map_err(|e| format!("R1 rskip: {e}"))?;
                     }
                 } else {
-                    gcursor.skip_field(wire_type).map_err(|e| format!("R1 gskip: {e}"))?;
+                    gcursor
+                        .skip_field(wire_type)
+                        .map_err(|e| format!("R1 gskip: {e}"))?;
                 }
             }
         }
         #[allow(clippy::cast_possible_truncation)]
-        { scan_ms += t2.elapsed().as_millis() as u64; }
+        {
+            scan_ms += t2.elapsed().as_millis() as u64;
+        }
     }
 
     #[allow(clippy::cast_possible_wrap)]
@@ -149,7 +173,6 @@ pub(super) fn relation_r2d_assembly(
     start_relation_id: i64,
     stats: &mut RenumberStats,
 ) -> Result<()> {
-
     if relation_schedule.is_empty() {
         return Ok(());
     }
@@ -160,7 +183,10 @@ pub(super) fn relation_r2d_assembly(
         .min(6);
 
     // Each blob produces one OwnedBlock tuple + orphan count.
-    type R2dItem = (usize, std::result::Result<(Vec<u8>, crate::blob_meta::BlobIndex, u64, u64), String>);
+    type R2dItem = (
+        usize,
+        std::result::Result<(Vec<u8>, crate::blob_meta::BlobIndex, u64, u64), String>,
+    );
     let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<R2dItem>(32);
 
     let rels_written = std::sync::atomic::AtomicU64::new(0);
@@ -195,38 +221,48 @@ pub(super) fn relation_r2d_assembly(
                     }
                     let task = &relation_schedule[idx];
 
-                    let result: std::result::Result<(Vec<u8>, crate::blob_meta::BlobIndex, u64, u64), String> = (|| {
+                    let result: std::result::Result<
+                        (Vec<u8>, crate::blob_meta::BlobIndex, u64, u64),
+                        String,
+                    > = (|| {
                         let t0 = std::time::Instant::now();
                         read_buf.resize(task.data_size, 0);
                         file.read_exact_at(&mut read_buf, task.data_offset)
                             .map_err(|e| format!("pread at {}: {e}", task.data_offset))?;
                         #[allow(clippy::cast_possible_truncation)]
-                        r2d_cref.pread_ms.fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
+                        r2d_cref
+                            .pread_ms
+                            .fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
 
                         let t1 = std::time::Instant::now();
                         crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
                             .map_err(|e| e.to_string())?;
                         #[allow(clippy::cast_possible_truncation)]
-                        r2d_cref.decompress_ms.fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
+                        r2d_cref
+                            .decompress_ms
+                            .fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
 
                         let t2 = std::time::Instant::now();
-                        let (blob_count, min_id, max_id, blob_orphans) = reframe_relations_with_new_ids(
-                            &decompress_buf,
-                            rid_set,
-                            start_rid,
-                            node_id_set,
-                            start_node_id,
-                            way_id_set,
-                            start_way_id,
-                            &mut reframe_buf,
-                            &mut memids_scratch,
-                            &mut group_scratch,
-                            &mut reframed_rel_scratch,
-                            &mut group_ranges,
-                            &mut scalar_fields,
-                        )?;
+                        let (blob_count, min_id, max_id, blob_orphans) =
+                            reframe_relations_with_new_ids(
+                                &decompress_buf,
+                                rid_set,
+                                start_rid,
+                                node_id_set,
+                                start_node_id,
+                                way_id_set,
+                                start_way_id,
+                                &mut reframe_buf,
+                                &mut memids_scratch,
+                                &mut group_scratch,
+                                &mut reframed_rel_scratch,
+                                &mut group_ranges,
+                                &mut scalar_fields,
+                            )?;
                         #[allow(clippy::cast_possible_truncation)]
-                        r2d_cref.reframe_ms.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
+                        r2d_cref
+                            .reframe_ms
+                            .fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
 
                         r2d_cref.blobs.fetch_add(1, Relaxed);
 
@@ -247,7 +283,9 @@ pub(super) fn relation_r2d_assembly(
                         break;
                     }
                     #[allow(clippy::cast_possible_truncation)]
-                    r2d_cref.send_ms.fetch_add(t4.elapsed().as_millis() as u64, Relaxed);
+                    r2d_cref
+                        .send_ms
+                        .fetch_add(t4.elapsed().as_millis() as u64, Relaxed);
                 }
             });
         }

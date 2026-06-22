@@ -13,8 +13,20 @@ fn write_synthetic_indexed_input(path: &Path) {
     write_test_pbf_sorted(
         path,
         &[
-            TestNode { id: 1, lat: 557_000_000, lon: 125_000_000, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 557_000_000, lon: 125_010_000, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 557_000_000,
+                lon: 125_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 557_000_000,
+                lon: 125_010_000,
+                tags: vec![],
+                meta: None,
+            },
             TestNode {
                 id: 3,
                 lat: 557_000_500,
@@ -41,10 +53,34 @@ fn write_synthetic_admin_input(path: &Path) {
     write_test_pbf_sorted(
         path,
         &[
-            TestNode { id: 10, lat: 556_990_000, lon: 124_990_000, tags: vec![], meta: None },
-            TestNode { id: 11, lat: 556_990_000, lon: 125_020_000, tags: vec![], meta: None },
-            TestNode { id: 12, lat: 557_010_000, lon: 125_020_000, tags: vec![], meta: None },
-            TestNode { id: 13, lat: 557_010_000, lon: 124_990_000, tags: vec![], meta: None },
+            TestNode {
+                id: 10,
+                lat: 556_990_000,
+                lon: 124_990_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 11,
+                lat: 556_990_000,
+                lon: 125_020_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 12,
+                lat: 557_010_000,
+                lon: 125_020_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 13,
+                lat: 557_010_000,
+                lon: 124_990_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[TestWay {
             id: 20,
@@ -54,7 +90,10 @@ fn write_synthetic_admin_input(path: &Path) {
         }],
         &[TestRelation {
             id: 30,
-            members: vec![TestMember { id: MemberId::Way(20), role: "outer" }],
+            members: vec![TestMember {
+                id: MemberId::Way(20),
+                role: "outer",
+            }],
             tags: vec![
                 ("type", "boundary"),
                 ("boundary", "administrative"),
@@ -67,27 +106,89 @@ fn write_synthetic_admin_input(path: &Path) {
     );
 }
 
+#[allow(clippy::too_many_lines)]
 fn write_synthetic_nested_admin_same_level_input(path: &Path) {
     write_test_pbf_sorted(
         path,
         &[
-            TestNode { id: 40, lat: 556_980_000, lon: 124_980_000, tags: vec![], meta: None },
-            TestNode { id: 41, lat: 556_980_000, lon: 125_030_000, tags: vec![], meta: None },
-            TestNode { id: 42, lat: 557_020_000, lon: 125_030_000, tags: vec![], meta: None },
-            TestNode { id: 43, lat: 557_020_000, lon: 124_980_000, tags: vec![], meta: None },
-            TestNode { id: 44, lat: 556_995_000, lon: 124_995_000, tags: vec![], meta: None },
-            TestNode { id: 45, lat: 556_995_000, lon: 125_015_000, tags: vec![], meta: None },
-            TestNode { id: 46, lat: 557_005_000, lon: 125_015_000, tags: vec![], meta: None },
-            TestNode { id: 47, lat: 557_005_000, lon: 124_995_000, tags: vec![], meta: None },
+            TestNode {
+                id: 40,
+                lat: 556_980_000,
+                lon: 124_980_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 41,
+                lat: 556_980_000,
+                lon: 125_030_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 42,
+                lat: 557_020_000,
+                lon: 125_030_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 43,
+                lat: 557_020_000,
+                lon: 124_980_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 44,
+                lat: 556_995_000,
+                lon: 124_995_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 45,
+                lat: 556_995_000,
+                lon: 125_015_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 46,
+                lat: 557_005_000,
+                lon: 125_015_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 47,
+                lat: 557_005_000,
+                lon: 124_995_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[
-            TestWay { id: 50, refs: vec![40, 41, 42, 43, 40], tags: vec![], meta: None },
-            TestWay { id: 51, refs: vec![44, 45, 46, 47, 44], tags: vec![], meta: None },
+            TestWay {
+                id: 50,
+                refs: vec![40, 41, 42, 43, 40],
+                tags: vec![],
+                meta: None,
+            },
+            TestWay {
+                id: 51,
+                refs: vec![44, 45, 46, 47, 44],
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[
             TestRelation {
                 id: 60,
-                members: vec![TestMember { id: MemberId::Way(50), role: "outer" }],
+                members: vec![TestMember {
+                    id: MemberId::Way(50),
+                    role: "outer",
+                }],
                 tags: vec![
                     ("type", "boundary"),
                     ("boundary", "administrative"),
@@ -98,7 +199,10 @@ fn write_synthetic_nested_admin_same_level_input(path: &Path) {
             },
             TestRelation {
                 id: 61,
-                members: vec![TestMember { id: MemberId::Way(51), role: "outer" }],
+                members: vec![TestMember {
+                    id: MemberId::Way(51),
+                    role: "outer",
+                }],
                 tags: vec![
                     ("type", "boundary"),
                     ("boundary", "administrative"),
@@ -115,24 +219,88 @@ fn write_synthetic_admin_with_hole_input(path: &Path) {
     write_test_pbf_sorted(
         path,
         &[
-            TestNode { id: 70, lat: 556_990_000, lon: 124_990_000, tags: vec![], meta: None },
-            TestNode { id: 71, lat: 556_990_000, lon: 125_020_000, tags: vec![], meta: None },
-            TestNode { id: 72, lat: 557_010_000, lon: 125_020_000, tags: vec![], meta: None },
-            TestNode { id: 73, lat: 557_010_000, lon: 124_990_000, tags: vec![], meta: None },
-            TestNode { id: 74, lat: 556_997_000, lon: 124_997_000, tags: vec![], meta: None },
-            TestNode { id: 75, lat: 556_997_000, lon: 125_013_000, tags: vec![], meta: None },
-            TestNode { id: 76, lat: 557_003_000, lon: 125_013_000, tags: vec![], meta: None },
-            TestNode { id: 77, lat: 557_003_000, lon: 124_997_000, tags: vec![], meta: None },
+            TestNode {
+                id: 70,
+                lat: 556_990_000,
+                lon: 124_990_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 71,
+                lat: 556_990_000,
+                lon: 125_020_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 72,
+                lat: 557_010_000,
+                lon: 125_020_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 73,
+                lat: 557_010_000,
+                lon: 124_990_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 74,
+                lat: 556_997_000,
+                lon: 124_997_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 75,
+                lat: 556_997_000,
+                lon: 125_013_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 76,
+                lat: 557_003_000,
+                lon: 125_013_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 77,
+                lat: 557_003_000,
+                lon: 124_997_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[
-            TestWay { id: 80, refs: vec![70, 71, 72, 73, 70], tags: vec![], meta: None },
-            TestWay { id: 81, refs: vec![74, 75, 76, 77, 74], tags: vec![], meta: None },
+            TestWay {
+                id: 80,
+                refs: vec![70, 71, 72, 73, 70],
+                tags: vec![],
+                meta: None,
+            },
+            TestWay {
+                id: 81,
+                refs: vec![74, 75, 76, 77, 74],
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[TestRelation {
             id: 90,
             members: vec![
-                TestMember { id: MemberId::Way(80), role: "outer" },
-                TestMember { id: MemberId::Way(81), role: "inner" },
+                TestMember {
+                    id: MemberId::Way(80),
+                    role: "outer",
+                },
+                TestMember {
+                    id: MemberId::Way(81),
+                    role: "inner",
+                },
             ],
             tags: vec![
                 ("type", "boundary"),
@@ -167,7 +335,10 @@ fn write_synthetic_interpolation_input(path: &Path) {
         &[TestWay {
             id: 200,
             refs: vec![100, 101],
-            tags: vec![("addr:interpolation", "even"), ("addr:street", "Interp Street")],
+            tags: vec![
+                ("addr:interpolation", "even"),
+                ("addr:street", "Interp Street"),
+            ],
             meta: None,
         }],
         &[],
@@ -182,10 +353,19 @@ fn write_synthetic_unresolved_interpolation_input(path: &Path) {
                 id: 110,
                 lat: 557_000_000,
                 lon: 125_000_000,
-                tags: vec![("addr:housenumber", "10"), ("addr:street", "Missing End Street")],
+                tags: vec![
+                    ("addr:housenumber", "10"),
+                    ("addr:street", "Missing End Street"),
+                ],
                 meta: None,
             },
-            TestNode { id: 111, lat: 557_000_000, lon: 125_060_000, tags: vec![], meta: None },
+            TestNode {
+                id: 111,
+                lat: 557_000_000,
+                lon: 125_060_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[TestWay {
             id: 210,
@@ -204,10 +384,34 @@ fn write_synthetic_postal_boundary_input(path: &Path) {
     write_test_pbf_sorted(
         path,
         &[
-            TestNode { id: 300, lat: 556_990_000, lon: 124_990_000, tags: vec![], meta: None },
-            TestNode { id: 301, lat: 556_990_000, lon: 125_020_000, tags: vec![], meta: None },
-            TestNode { id: 302, lat: 557_010_000, lon: 125_020_000, tags: vec![], meta: None },
-            TestNode { id: 303, lat: 557_010_000, lon: 124_990_000, tags: vec![], meta: None },
+            TestNode {
+                id: 300,
+                lat: 556_990_000,
+                lon: 124_990_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 301,
+                lat: 556_990_000,
+                lon: 125_020_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 302,
+                lat: 557_010_000,
+                lon: 125_020_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 303,
+                lat: 557_010_000,
+                lon: 124_990_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[TestWay {
             id: 310,
@@ -217,7 +421,10 @@ fn write_synthetic_postal_boundary_input(path: &Path) {
         }],
         &[TestRelation {
             id: 320,
-            members: vec![TestMember { id: MemberId::Way(310), role: "outer" }],
+            members: vec![TestMember {
+                id: MemberId::Way(310),
+                role: "outer",
+            }],
             tags: vec![
                 ("type", "boundary"),
                 ("boundary", "postal_code"),
@@ -289,13 +496,24 @@ fn write_oversized_interpolation_input(path: &Path) {
 #[allow(clippy::cast_possible_wrap)]
 fn write_street_cell_overflow_input(path: &Path) {
     let nodes = vec![
-        TestNode { id: 1, lat: 557_000_000, lon: 125_000_000, tags: vec![], meta: None },
-        TestNode { id: 2, lat: 557_000_010, lon: 125_000_010, tags: vec![], meta: None },
+        TestNode {
+            id: 1,
+            lat: 557_000_000,
+            lon: 125_000_000,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 2,
+            lat: 557_000_010,
+            lon: 125_000_010,
+            tags: vec![],
+            meta: None,
+        },
     ];
     let ways: Vec<TestWay> = (0..65_536u32)
         .map(|i| {
-            let name: &'static str =
-                Box::leak(format!("Street{i}").into_boxed_str());
+            let name: &'static str = Box::leak(format!("Street{i}").into_boxed_str());
             TestWay {
                 id: 1_000 + i64::from(i),
                 refs: vec![1, 2],
@@ -334,15 +552,11 @@ fn write_interp_cell_overflow_input(path: &Path) {
     ];
     let ways: Vec<TestWay> = (0..65_536u32)
         .map(|i| {
-            let street: &'static str =
-                Box::leak(format!("Interp{i}").into_boxed_str());
+            let street: &'static str = Box::leak(format!("Interp{i}").into_boxed_str());
             TestWay {
                 id: 1_000 + i64::from(i),
                 refs: vec![1, 2],
-                tags: vec![
-                    ("addr:interpolation", "all"),
-                    ("addr:street", street),
-                ],
+                tags: vec![("addr:interpolation", "all"), ("addr:street", street)],
                 meta: None,
             }
         })
@@ -359,10 +573,34 @@ fn write_interp_cell_overflow_input(path: &Path) {
 fn write_admin_cell_overflow_input(path: &Path) {
     // Tiny closed ring: 4 nodes around (55.7, 12.5).
     let nodes = vec![
-        TestNode { id: 1, lat: 557_000_000, lon: 125_000_000, tags: vec![], meta: None },
-        TestNode { id: 2, lat: 557_000_010, lon: 125_000_000, tags: vec![], meta: None },
-        TestNode { id: 3, lat: 557_000_010, lon: 125_000_010, tags: vec![], meta: None },
-        TestNode { id: 4, lat: 557_000_000, lon: 125_000_010, tags: vec![], meta: None },
+        TestNode {
+            id: 1,
+            lat: 557_000_000,
+            lon: 125_000_000,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 2,
+            lat: 557_000_010,
+            lon: 125_000_000,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 3,
+            lat: 557_000_010,
+            lon: 125_000_010,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 4,
+            lat: 557_000_000,
+            lon: 125_000_010,
+            tags: vec![],
+            meta: None,
+        },
     ];
     // Closed way: ring of the 4 nodes.
     let ways = vec![TestWay {
@@ -378,11 +616,13 @@ fn write_admin_cell_overflow_input(path: &Path) {
     // process exits soon after, so the leak is bounded.
     let relations: Vec<TestRelation> = (0..65_536u32)
         .map(|i| {
-            let name: &'static str =
-                Box::leak(format!("Polygon{i}").into_boxed_str());
+            let name: &'static str = Box::leak(format!("Polygon{i}").into_boxed_str());
             TestRelation {
                 id: 1_000 + i64::from(i),
-                members: vec![TestMember { id: MemberId::Way(100), role: "outer" }],
+                members: vec![TestMember {
+                    id: MemberId::Way(100),
+                    role: "outer",
+                }],
                 tags: vec![
                     ("boundary", "administrative"),
                     ("admin_level", "8"),
@@ -433,40 +673,76 @@ fn synthetic_build_query_and_api_equivalence() {
     )
     .expect("build should succeed");
 
-    assert_eq!(stats.addr_points, 1, "synthetic fixture has one address node");
-    assert_eq!(stats.street_ways, 1, "synthetic fixture has one named street way");
-    assert_eq!(stats.interp_ways, 0, "synthetic fixture has no interpolation ways");
-    assert_eq!(stats.admin_polygons, 0, "synthetic fixture has no admin relations");
+    assert_eq!(
+        stats.addr_points, 1,
+        "synthetic fixture has one address node"
+    );
+    assert_eq!(
+        stats.street_ways, 1,
+        "synthetic fixture has one named street way"
+    );
+    assert_eq!(
+        stats.interp_ways, 0,
+        "synthetic fixture has no interpolation ways"
+    );
+    assert_eq!(
+        stats.admin_polygons, 0,
+        "synthetic fixture has no admin relations"
+    );
 
-    let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
-        .expect("reader should open");
+    let reader =
+        pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
 
     let result = reader.query(55.70005, 12.5005);
-    let addr = result.address.as_ref().expect("query should find the address");
+    let addr = result
+        .address
+        .as_ref()
+        .expect("query should find the address");
     assert_eq!(addr.house_number, "10");
     assert_eq!(addr.street, "Main Street");
     assert_eq!(addr.postcode, Some("1234"));
-    let street = result.street.as_ref().expect("query should find the street");
+    let street = result
+        .street
+        .as_ref()
+        .expect("query should find the street");
     assert_eq!(street.name, "Main Street");
-    assert!(result.interpolation.is_none(), "fixture has no interpolation data");
+    assert!(
+        result.interpolation.is_none(),
+        "fixture has no interpolation data"
+    );
     assert!(result.admin.is_empty(), "fixture has no admin polygons");
 
     let via_candidates = reader.candidates(55.70005, 12.5005).into_result(&reader);
-    let cand_addr = via_candidates.address.as_ref().expect("candidates should find the address");
+    let cand_addr = via_candidates
+        .address
+        .as_ref()
+        .expect("candidates should find the address");
     assert_eq!(cand_addr.house_number, "10");
     assert_eq!(cand_addr.street, "Main Street");
     assert_eq!(cand_addr.postcode, Some("1234"));
-    let cand_street = via_candidates.street.as_ref().expect("candidates should find the street");
+    let cand_street = via_candidates
+        .street
+        .as_ref()
+        .expect("candidates should find the street");
     assert_eq!(cand_street.name, "Main Street");
-    assert!(via_candidates.interpolation.is_none(), "fixture has no interpolation data");
+    assert!(
+        via_candidates.interpolation.is_none(),
+        "fixture has no interpolation data"
+    );
     assert!(
         via_candidates.admin.is_empty(),
         "fixture has no admin polygons"
     );
 
     let far = reader.query(0.0, 0.0);
-    assert!(far.address.is_none(), "far-away query must not invent an address");
-    assert!(far.street.is_none(), "far-away query must not invent a street");
+    assert!(
+        far.address.is_none(),
+        "far-away query must not invent an address"
+    );
+    assert!(
+        far.street.is_none(),
+        "far-away query must not invent a street"
+    );
     assert!(
         far.interpolation.is_none(),
         "far-away query must not invent interpolation"
@@ -503,8 +779,8 @@ fn coarse_fallback_recovers_hits_outside_fine_radius() {
     let query_lat = 55.7002;
     let query_lon = 12.5005;
 
-    let no_fallback = pbfhogg::geocode_index::reader::Reader::open(&no_fallback_dir)
-        .expect("reader should open");
+    let no_fallback =
+        pbfhogg::geocode_index::reader::Reader::open(&no_fallback_dir).expect("reader should open");
     let no_fallback_result = no_fallback.query(query_lat, query_lon);
     assert!(
         no_fallback_result.address.is_none(),
@@ -553,15 +829,24 @@ fn synthetic_admin_polygon_query_returns_country_match() {
     )
     .expect("build should succeed");
 
-    assert_eq!(stats.addr_points, 0, "admin-only fixture has no address points");
-    assert_eq!(stats.street_ways, 0, "admin-only fixture has no street ways");
+    assert_eq!(
+        stats.addr_points, 0,
+        "admin-only fixture has no address points"
+    );
+    assert_eq!(
+        stats.street_ways, 0,
+        "admin-only fixture has no street ways"
+    );
     assert_eq!(stats.admin_polygons, 1, "fixture has one admin boundary");
 
-    let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
-        .expect("reader should open");
+    let reader =
+        pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
 
     let inside = reader.query(55.7000, 12.5005);
-    assert!(inside.address.is_none(), "admin-only fixture has no addresses");
+    assert!(
+        inside.address.is_none(),
+        "admin-only fixture has no addresses"
+    );
     assert!(inside.street.is_none(), "admin-only fixture has no streets");
     assert!(
         inside.interpolation.is_none(),
@@ -600,10 +885,13 @@ fn nested_same_level_admin_prefers_smallest_polygon() {
     )
     .expect("build should succeed");
 
-    assert_eq!(stats.admin_polygons, 2, "fixture has two admin polygons at the same level");
+    assert_eq!(
+        stats.admin_polygons, 2,
+        "fixture has two admin polygons at the same level"
+    );
 
-    let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
-        .expect("reader should open");
+    let reader =
+        pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
 
     let query_lat = 55.7000;
     let query_lon = 12.5005;
@@ -615,7 +903,11 @@ fn nested_same_level_admin_prefers_smallest_polygon() {
         .filter(|admin| admin.admin_level == 8)
         .map(|admin| admin.name)
         .collect();
-    assert_eq!(raw_level8.len(), 2, "raw candidates should expose both containing polygons");
+    assert_eq!(
+        raw_level8.len(),
+        2,
+        "raw candidates should expose both containing polygons"
+    );
     assert!(raw_level8.contains(&"Bigshire"));
     assert!(raw_level8.contains(&"Smallshire"));
 
@@ -625,7 +917,11 @@ fn nested_same_level_admin_prefers_smallest_polygon() {
         .iter()
         .filter(|admin| admin.admin_level == 8)
         .collect();
-    assert_eq!(collapsed_level8.len(), 1, "query() should collapse same-level admin matches");
+    assert_eq!(
+        collapsed_level8.len(),
+        1,
+        "query() should collapse same-level admin matches"
+    );
     assert_eq!(collapsed_level8[0].name, "Smallshire");
 
     let via_into_result = reader.candidates(query_lat, query_lon).into_result(&reader);
@@ -660,10 +956,13 @@ fn admin_polygon_hole_excludes_queries_inside_the_hole() {
     )
     .expect("build should succeed");
 
-    assert_eq!(stats.admin_polygons, 1, "fixture has one admin polygon with one hole");
+    assert_eq!(
+        stats.admin_polygons, 1,
+        "fixture has one admin polygon with one hole"
+    );
 
-    let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
-        .expect("reader should open");
+    let reader =
+        pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
 
     let shell = reader.query(55.6992, 12.4992);
     let shell_admin = shell
@@ -705,12 +1004,15 @@ fn synthetic_interpolation_query_resolves_even_house_number() {
     )
     .expect("build should succeed");
 
-    assert_eq!(stats.addr_points, 2, "fixture has two endpoint address nodes");
+    assert_eq!(
+        stats.addr_points, 2,
+        "fixture has two endpoint address nodes"
+    );
     assert_eq!(stats.street_ways, 0, "fixture has no named street way");
     assert_eq!(stats.interp_ways, 1, "fixture has one interpolation way");
 
-    let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
-        .expect("reader should open");
+    let reader =
+        pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
 
     let query_lat = 55.7000;
     let query_lon = 12.5030;
@@ -725,7 +1027,10 @@ fn synthetic_interpolation_query_resolves_even_house_number() {
         .as_ref()
         .expect("query should resolve the interpolation");
     assert_eq!(interp.street, "Interp Street");
-    assert_eq!(interp.house_number, 20, "midpoint on the interpolation should resolve to 20");
+    assert_eq!(
+        interp.house_number, 20,
+        "midpoint on the interpolation should resolve to 20"
+    );
     assert!(result.admin.is_empty(), "fixture has no admin polygons");
 
     let candidates = reader.candidates(query_lat, query_lon);
@@ -761,16 +1066,25 @@ fn unresolved_interpolation_stays_hidden_behind_zero_sentinel() {
     )
     .expect("build should succeed");
 
-    assert_eq!(stats.addr_points, 1, "fixture has only one matching endpoint address");
-    assert_eq!(stats.interp_ways, 1, "fixture still writes one interpolation way");
+    assert_eq!(
+        stats.addr_points, 1,
+        "fixture has only one matching endpoint address"
+    );
+    assert_eq!(
+        stats.interp_ways, 1,
+        "fixture still writes one interpolation way"
+    );
 
-    let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
-        .expect("reader should open");
+    let reader =
+        pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
 
     let query_lat = 55.7000;
     let query_lon = 12.5030;
     let result = reader.query(query_lat, query_lon);
-    assert!(result.address.is_none(), "midpoint query should not hit the lone endpoint address");
+    assert!(
+        result.address.is_none(),
+        "midpoint query should not hit the lone endpoint address"
+    );
     assert!(
         result.interpolation.is_none(),
         "unresolved endpoints stay at 0/0 and must not surface as an interpolation result"
@@ -780,7 +1094,11 @@ fn unresolved_interpolation_stays_hidden_behind_zero_sentinel() {
     let candidate = candidates
         .interpolations
         .iter()
-        .min_by(|a, b| a.distance_m.partial_cmp(&b.distance_m).unwrap_or(std::cmp::Ordering::Equal))
+        .min_by(|a, b| {
+            a.distance_m
+                .partial_cmp(&b.distance_m)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .expect("raw candidates should still expose the interpolation segment");
     assert!(
         reader.interpolate(candidate).is_none(),
@@ -825,8 +1143,8 @@ fn coarse_fallback_recovers_interpolation_outside_fine_radius() {
     let query_lat = 55.7002;
     let query_lon = 12.5030;
 
-    let no_fallback = pbfhogg::geocode_index::reader::Reader::open(&no_fallback_dir)
-        .expect("reader should open");
+    let no_fallback =
+        pbfhogg::geocode_index::reader::Reader::open(&no_fallback_dir).expect("reader should open");
     let no_fallback_result = no_fallback.query(query_lat, query_lon);
     assert!(
         no_fallback_result.address.is_none(),
@@ -884,10 +1202,13 @@ fn synthetic_postal_boundary_query_returns_level_11_match() {
     )
     .expect("build should succeed");
 
-    assert_eq!(stats.admin_polygons, 1, "fixture has one postal boundary polygon");
+    assert_eq!(
+        stats.admin_polygons, 1,
+        "fixture has one postal boundary polygon"
+    );
 
-    let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
-        .expect("reader should open");
+    let reader =
+        pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
 
     let inside = reader.query(55.7000, 12.5005);
     let postal = inside
@@ -1156,20 +1477,48 @@ fn build_denmark_index() {
     let stats = pbfhogg::geocode_index::builder::build_geocode_index(&config)
         .expect("build should succeed");
 
-    assert!(stats.addr_points > 2_000_000, "expected >2M addr, got {}", stats.addr_points);
-    assert!(stats.street_ways > 200_000, "expected >200K streets, got {}", stats.street_ways);
-    assert!(stats.admin_polygons > 100, "expected >100 admin, got {}", stats.admin_polygons);
-    assert!(stats.fine_cells > 100_000, "expected >100K fine cells, got {}", stats.fine_cells);
+    assert!(
+        stats.addr_points > 2_000_000,
+        "expected >2M addr, got {}",
+        stats.addr_points
+    );
+    assert!(
+        stats.street_ways > 200_000,
+        "expected >200K streets, got {}",
+        stats.street_ways
+    );
+    assert!(
+        stats.admin_polygons > 100,
+        "expected >100 admin, got {}",
+        stats.admin_polygons
+    );
+    assert!(
+        stats.fine_cells > 100_000,
+        "expected >100K fine cells, got {}",
+        stats.fine_cells
+    );
 
     // Verify all index files exist
     let expected_files = [
-        "geocode_header.bin", "geo_cells.bin", "street_entries.bin",
-        "addr_entries.bin", "interp_entries.bin", "coarse_geo_cells.bin",
-        "coarse_street_entries.bin", "coarse_addr_entries.bin",
-        "coarse_interp_entries.bin", "street_ways.bin", "street_nodes.bin",
-        "addr_points.bin", "interp_ways.bin", "interp_nodes.bin",
-        "admin_cells.bin", "admin_entries.bin", "admin_polygons.bin",
-        "admin_vertices.bin", "strings.bin",
+        "geocode_header.bin",
+        "geo_cells.bin",
+        "street_entries.bin",
+        "addr_entries.bin",
+        "interp_entries.bin",
+        "coarse_geo_cells.bin",
+        "coarse_street_entries.bin",
+        "coarse_addr_entries.bin",
+        "coarse_interp_entries.bin",
+        "street_ways.bin",
+        "street_nodes.bin",
+        "addr_points.bin",
+        "interp_ways.bin",
+        "interp_nodes.bin",
+        "admin_cells.bin",
+        "admin_entries.bin",
+        "admin_polygons.bin",
+        "admin_vertices.bin",
+        "strings.bin",
     ];
     for name in &expected_files {
         assert!(dir.join(name).exists(), "missing index file: {name}");
@@ -1184,8 +1533,7 @@ fn query_copenhagen() {
         eprintln!("Skipping: index not available");
         return;
     };
-    let reader = pbfhogg::geocode_index::reader::Reader::open(&dir)
-        .expect("reader should open");
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&dir).expect("reader should open");
 
     // 55.6761°N, 12.5683°E - Copenhagen City Hall / Rådhuspladsen
     let result = reader.query(55.6761, 12.5683);
@@ -1202,12 +1550,16 @@ fn query_copenhagen() {
     if let Some(c) = country {
         assert!(
             c.name.contains("Danmark") || c.name.contains("Denmark"),
-            "expected Danmark/Denmark, got '{}'", c.name
+            "expected Danmark/Denmark, got '{}'",
+            c.name
         );
     }
 
     if let Some(addr) = &result.address {
-        eprintln!("Address: {} {} (dist: {:.1}m)", addr.street, addr.house_number, addr.distance_m);
+        eprintln!(
+            "Address: {} {} (dist: {:.1}m)",
+            addr.street, addr.house_number, addr.distance_m
+        );
     }
     if let Some(st) = &result.street {
         eprintln!("Street: {} (dist: {:.1}m)", st.name, st.distance_m);
@@ -1222,8 +1574,7 @@ fn query_rural_jutland() {
         eprintln!("Skipping: index not available");
         return;
     };
-    let reader = pbfhogg::geocode_index::reader::Reader::open(&dir)
-        .expect("reader should open");
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&dir).expect("reader should open");
 
     // 57.5°N, 10.0°E - sparse area in northern Jutland
     let result = reader.query(57.5, 10.0);
@@ -1239,8 +1590,7 @@ fn query_north_sea() {
         eprintln!("Skipping: index not available");
         return;
     };
-    let reader = pbfhogg::geocode_index::reader::Reader::open(&dir)
-        .expect("reader should open");
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&dir).expect("reader should open");
 
     // 56.0°N, 4.0°E - North Sea
     let result = reader.query(56.0, 4.0);
@@ -1256,8 +1606,7 @@ fn api_equivalence() {
         eprintln!("Skipping: index not available");
         return;
     };
-    let reader = pbfhogg::geocode_index::reader::Reader::open(&dir)
-        .expect("reader should open");
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&dir).expect("reader should open");
 
     let points = [(55.6761, 12.5683), (56.15, 10.2), (55.4, 12.3)];
 
@@ -1265,19 +1614,29 @@ fn api_equivalence() {
         let rq = reader.query(lat, lon);
         let rc = reader.candidates(lat, lon).into_result(&reader);
 
-        assert_eq!(rq.address.is_some(), rc.address.is_some(),
-            "disagree on address at ({lat}, {lon})");
-        assert_eq!(rq.street.is_some(), rc.street.is_some(),
-            "disagree on street at ({lat}, {lon})");
+        assert_eq!(
+            rq.address.is_some(),
+            rc.address.is_some(),
+            "disagree on address at ({lat}, {lon})"
+        );
+        assert_eq!(
+            rq.street.is_some(),
+            rc.street.is_some(),
+            "disagree on street at ({lat}, {lon})"
+        );
 
         let q_levels: Vec<u8> = rq.admin.iter().map(|a| a.admin_level).collect();
         let c_levels: Vec<u8> = rc.admin.iter().map(|a| a.admin_level).collect();
-        assert_eq!(q_levels, c_levels,
-            "disagree on admin levels at ({lat}, {lon})");
+        assert_eq!(
+            q_levels, c_levels,
+            "disagree on admin levels at ({lat}, {lon})"
+        );
 
         if let (Some(qa), Some(ca)) = (&rq.address, &rc.address) {
-            assert_eq!(qa.street, ca.street,
-                "disagree on address street at ({lat}, {lon})");
+            assert_eq!(
+                qa.street, ca.street,
+                "disagree on address street at ({lat}, {lon})"
+            );
         }
     }
 }
@@ -1290,8 +1649,7 @@ fn coarse_fallback() {
         eprintln!("Skipping: index not available");
         return;
     };
-    let reader = pbfhogg::geocode_index::reader::Reader::open(&dir)
-        .expect("reader should open");
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&dir).expect("reader should open");
 
     // Thy National Park, northern Jutland: 56.92°N, 8.52°E
     let result = reader.query(56.92, 8.52);
@@ -1300,6 +1658,10 @@ fn coarse_fallback() {
     let country = result.admin.iter().find(|a| a.admin_level == 2);
     assert!(country.is_some(), "should find country in rural Thy");
 
-    eprintln!("Thy: address={} street={} admin={}",
-        result.address.is_some(), result.street.is_some(), result.admin.len());
+    eprintln!(
+        "Thy: address={} street={} admin={}",
+        result.address.is_some(),
+        result.street.is_some(),
+        result.admin.len()
+    );
 }

@@ -16,16 +16,16 @@
 
 use std::path::Path;
 
+use super::{
+    HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
+    ensure_way_capacity_local, flush_local, require_sorted, warn_locations_on_ways_loss,
+    writer_from_header,
+};
+use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::owned::{
     OwnedElement, dense_node_metadata, element_metadata, owned_to_metadata, read_dense_node,
     read_node, read_relation, read_way,
 };
-use super::{
-    HeaderOverrides, Result,
-    ensure_node_capacity_local, ensure_relation_capacity_local, ensure_way_capacity_local,
-    flush_local, require_sorted, warn_locations_on_ways_loss, writer_from_header,
-};
-use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::reorder_buffer::ReorderBuffer;
 use crate::scan::classify::{build_classify_schedule, parallel_classify_phase};
 use crate::writer::{Compression, PbfWriter};
@@ -66,7 +66,6 @@ struct PendingGroup {
     latest: Option<OwnedElement>,
 }
 
-
 /// Filter history PBF to a snapshot at `cutoff_timestamp` (UNIX seconds).
 ///
 /// Requires sorted input (`Sort.Type_then_ID`) so each object's versions are
@@ -88,9 +87,16 @@ pub fn time_filter(
     warn_locations_on_ways_loss(reader.header());
 
     let is_history = reader.header().has_historical_information();
-    let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| {
-        hb.replication_timestamp(cutoff_timestamp)
-    }, direct_io, false)?;
+    let mut writer = writer_from_header(
+        output,
+        compression,
+        reader.header(),
+        true,
+        overrides,
+        |hb| hb.replication_timestamp(cutoff_timestamp),
+        direct_io,
+        false,
+    )?;
 
     let stats = if is_history {
         time_filter_history(reader, &mut writer, cutoff_timestamp)?
@@ -107,10 +113,16 @@ pub fn time_filter(
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("timefilter_versions_seen", stats.versions_seen as i64);
-        crate::debug::emit_counter("timefilter_versions_before_cutoff", stats.versions_before_cutoff as i64);
+        crate::debug::emit_counter(
+            "timefilter_versions_before_cutoff",
+            stats.versions_before_cutoff as i64,
+        );
         crate::debug::emit_counter("timefilter_elements_written", stats.elements_written as i64);
         crate::debug::emit_counter("timefilter_dropped_deleted", stats.dropped_deleted as i64);
-        crate::debug::emit_counter("timefilter_dropped_no_snapshot_version", stats.dropped_no_snapshot_version as i64);
+        crate::debug::emit_counter(
+            "timefilter_dropped_no_snapshot_version",
+            stats.dropped_no_snapshot_version as i64,
+        );
         crate::debug::emit_counter("timefilter_is_history_path", i64::from(is_history));
     }
     Ok(stats)
@@ -268,8 +280,7 @@ fn time_filter_snapshot(
         return Ok(stats);
     }
 
-    type PhaseResult =
-        std::result::Result<(Vec<Vec<u8>>, TimeFilterStats), String>;
+    type PhaseResult = std::result::Result<(Vec<Vec<u8>>, TimeFilterStats), String>;
     let mut reorder: ReorderBuffer<PhaseResult> = ReorderBuffer::with_capacity(64);
     let mut write_error: Option<Box<dyn std::error::Error>> = None;
     let mut classify_error: Option<String> = None;
@@ -287,8 +298,7 @@ fn time_filter_snapshot(
         |block, _state| -> PhaseResult {
             let mut bb = BlockBuilder::new();
             let mut output: Vec<OwnedBlock> = Vec::new();
-            let block_stats =
-                filter_block_snapshot(block, cutoff_timestamp, &mut bb, &mut output)?;
+            let block_stats = filter_block_snapshot(block, cutoff_timestamp, &mut bb, &mut output)?;
             flush_local(&mut bb, &mut output)?;
 
             let mut framed: Vec<Vec<u8>> = Vec::with_capacity(output.len());
@@ -323,8 +333,7 @@ fn time_filter_snapshot(
                             continue;
                         }
                         stats.versions_seen += block_stats.versions_seen;
-                        stats.versions_before_cutoff +=
-                            block_stats.versions_before_cutoff;
+                        stats.versions_before_cutoff += block_stats.versions_before_cutoff;
                         stats.elements_written += block_stats.elements_written;
                         stats.dropped_deleted += block_stats.dropped_deleted;
                         stats.dropped_no_snapshot_version +=
@@ -380,6 +389,7 @@ fn snapshot_gate(
 }
 
 #[hotpath::measure]
+#[allow(clippy::too_many_lines)]
 fn filter_block_snapshot(
     block: &PrimitiveBlock,
     cutoff_timestamp: i64,
@@ -401,44 +411,76 @@ fn filter_block_snapshot(
         stats.versions_seen += 1;
         match &element {
             Element::DenseNode(dn) => {
-                let Some(()) = snapshot_gate(dense_timestamp(dn), dense_visible(dn), cutoff_timestamp, &mut stats) else { continue; };
+                let Some(()) = snapshot_gate(
+                    dense_timestamp(dn),
+                    dense_visible(dn),
+                    cutoff_timestamp,
+                    &mut stats,
+                ) else {
+                    continue;
+                };
                 ensure_node_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(dn.tags());
                 let meta = dense_node_metadata(dn);
                 bb.add_node(
-                    dn.id(), dn.decimicro_lat(), dn.decimicro_lon(),
-                    tags_buf.iter().copied(), meta.as_ref(),
+                    dn.id(),
+                    dn.decimicro_lat(),
+                    dn.decimicro_lon(),
+                    tags_buf.iter().copied(),
+                    meta.as_ref(),
                 );
                 stats.elements_written += 1;
             }
             Element::Node(n) => {
-                let Some(()) = snapshot_gate(node_timestamp(n), node_visible(n), cutoff_timestamp, &mut stats) else { continue; };
+                let Some(()) = snapshot_gate(
+                    node_timestamp(n),
+                    node_visible(n),
+                    cutoff_timestamp,
+                    &mut stats,
+                ) else {
+                    continue;
+                };
                 ensure_node_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(n.tags());
                 let meta = element_metadata(&n.info());
                 bb.add_node(
-                    n.id(), n.decimicro_lat(), n.decimicro_lon(),
-                    tags_buf.iter().copied(), meta.as_ref(),
+                    n.id(),
+                    n.decimicro_lat(),
+                    n.decimicro_lon(),
+                    tags_buf.iter().copied(),
+                    meta.as_ref(),
                 );
                 stats.elements_written += 1;
             }
             Element::Way(w) => {
-                let Some(()) = snapshot_gate(way_timestamp(w), way_visible(w), cutoff_timestamp, &mut stats) else { continue; };
+                let Some(()) = snapshot_gate(
+                    way_timestamp(w),
+                    way_visible(w),
+                    cutoff_timestamp,
+                    &mut stats,
+                ) else {
+                    continue;
+                };
                 ensure_way_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(w.tags());
                 refs_buf.clear();
                 refs_buf.extend(w.refs());
                 let meta = element_metadata(&w.info());
-                bb.add_way(
-                    w.id(), tags_buf.iter().copied(), &refs_buf, meta.as_ref(),
-                );
+                bb.add_way(w.id(), tags_buf.iter().copied(), &refs_buf, meta.as_ref());
                 stats.elements_written += 1;
             }
             Element::Relation(r) => {
-                let Some(()) = snapshot_gate(relation_timestamp(r), relation_visible(r), cutoff_timestamp, &mut stats) else { continue; };
+                let Some(()) = snapshot_gate(
+                    relation_timestamp(r),
+                    relation_visible(r),
+                    cutoff_timestamp,
+                    &mut stats,
+                ) else {
+                    continue;
+                };
                 ensure_relation_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(r.tags());
@@ -449,7 +491,10 @@ fn filter_block_snapshot(
                 }));
                 let meta = element_metadata(&r.info());
                 bb.add_relation(
-                    r.id(), tags_buf.iter().copied(), &members_buf, meta.as_ref(),
+                    r.id(),
+                    tags_buf.iter().copied(),
+                    &members_buf,
+                    meta.as_ref(),
                 );
                 stats.elements_written += 1;
             }
@@ -511,7 +556,13 @@ fn write_owned_element(
                 writer.write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
             }
             let meta = owned_to_metadata(n.metadata.as_ref());
-            bb.add_node(n.id, n.decimicro_lat, n.decimicro_lon, n.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())), meta.as_ref());
+            bb.add_node(
+                n.id,
+                n.decimicro_lat,
+                n.decimicro_lon,
+                n.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+                meta.as_ref(),
+            );
         }
         OwnedElement::Way(w) => {
             if !bb.can_add_way()
@@ -520,7 +571,12 @@ fn write_owned_element(
                 writer.write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
             }
             let meta = owned_to_metadata(w.metadata.as_ref());
-            bb.add_way(w.id, w.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())), &w.refs, meta.as_ref());
+            bb.add_way(
+                w.id,
+                w.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+                &w.refs,
+                meta.as_ref(),
+            );
         }
         OwnedElement::Relation(r) => {
             if !bb.can_add_relation()
@@ -529,8 +585,20 @@ fn write_owned_element(
                 writer.write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
             }
             let meta = owned_to_metadata(r.metadata.as_ref());
-            let members: Vec<MemberData<'_>> = r.members.iter().map(|m| MemberData { id: m.id, role: &m.role }).collect();
-            bb.add_relation(r.id, r.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())), &members, meta.as_ref());
+            let members: Vec<MemberData<'_>> = r
+                .members
+                .iter()
+                .map(|m| MemberData {
+                    id: m.id,
+                    role: &m.role,
+                })
+                .collect();
+            bb.add_relation(
+                r.id,
+                r.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+                &members,
+                meta.as_ref(),
+            );
         }
     }
     Ok(())

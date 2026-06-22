@@ -105,8 +105,14 @@ impl PipelineMetrics {
         emit!("pipeline_decoded_send_wait_ns", decoded_send_wait_ns);
         emit!("pipeline_decoded_recv_wait_ns", decoded_recv_wait_ns);
         emit!("pipeline_reorder_high_water", reorder_high_water);
-        emit!("pipeline_scratch_st_capacity_peak_bytes", scratch_st_capacity_peak_bytes);
-        emit!("pipeline_scratch_gr_capacity_peak_bytes", scratch_gr_capacity_peak_bytes);
+        emit!(
+            "pipeline_scratch_st_capacity_peak_bytes",
+            scratch_st_capacity_peak_bytes
+        );
+        emit!(
+            "pipeline_scratch_gr_capacity_peak_bytes",
+            scratch_gr_capacity_peak_bytes
+        );
         emit!("pipeline_decode_tasks", decode_tasks);
         emit!("pipeline_blobs_skipped_by_filter", blobs_skipped_by_filter);
     }

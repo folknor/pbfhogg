@@ -174,12 +174,20 @@ impl<'a> HeaderBuilder<'a> {
         encode_bytes_field(&mut buf, 4, b"OsmSchema-V0.6");
         encode_bytes_field(&mut buf, 4, b"DenseNodes");
         if self.historical_information {
-            encode_bytes_field(&mut buf, 4, crate::HeaderBlock::HISTORICAL_INFORMATION.as_bytes());
+            encode_bytes_field(
+                &mut buf,
+                4,
+                crate::HeaderBlock::HISTORICAL_INFORMATION.as_bytes(),
+            );
         }
 
         // Field 5: optional_features (repeated string)
         if self.sorted {
-            encode_bytes_field(&mut buf, 5, crate::HeaderBlock::SORT_TYPE_THEN_ID.as_bytes());
+            encode_bytes_field(
+                &mut buf,
+                5,
+                crate::HeaderBlock::SORT_TYPE_THEN_ID.as_bytes(),
+            );
         }
         for feature in &self.optional_features {
             encode_bytes_field(&mut buf, 5, feature.as_bytes());

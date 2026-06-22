@@ -191,10 +191,18 @@ pub fn simplify_ring(ring: &[(f64, f64)], max_vertices: usize) -> Vec<(f64, f64)
     let mut min_y = f64::MAX;
     let mut max_y = f64::MIN;
     for &(x, y) in ring {
-        if x < min_x { min_x = x; }
-        if x > max_x { max_x = x; }
-        if y < min_y { min_y = y; }
-        if y > max_y { max_y = y; }
+        if x < min_x {
+            min_x = x;
+        }
+        if x > max_x {
+            max_x = x;
+        }
+        if y < min_y {
+            min_y = y;
+        }
+        if y > max_y {
+            max_y = y;
+        }
     }
     let diag = ((max_x - min_x).powi(2) + (max_y - min_y).powi(2)).sqrt();
 
@@ -372,9 +380,7 @@ pub fn assemble_rings(segments: &[&[(i32, i32)]]) -> Vec<Vec<(i32, i32)>> {
             // Find an unused segment that connects at current_end
             let next = endpoint_map
                 .get(&current_end)
-                .and_then(|indices| {
-                    indices.iter().find(|&&idx| !used[idx])
-                })
+                .and_then(|indices| indices.iter().find(|&&idx| !used[idx]))
                 .copied();
 
             let Some(next_idx) = next else {
@@ -504,13 +510,7 @@ mod tests {
             (0.0, 10.0),
             (0.0, 0.0),
         ];
-        let hole = vec![
-            (3.0, 3.0),
-            (7.0, 3.0),
-            (7.0, 7.0),
-            (3.0, 7.0),
-            (3.0, 3.0),
-        ];
+        let hole = vec![(3.0, 3.0), (7.0, 3.0), (7.0, 7.0), (3.0, 7.0), (3.0, 3.0)];
         // Inside exterior, outside hole
         assert!(point_in_polygon(1.0, 1.0, &exterior, &[&hole]));
         // Inside hole

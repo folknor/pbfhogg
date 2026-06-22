@@ -1,9 +1,9 @@
 //! Read and decode blobs
 
 use super::block::{HeaderBlock, PrimitiveBlock};
-use crate::error::{new_blob_error, new_error, BlobError, ErrorKind, Result};
-use bytes::Bytes;
 use super::file_reader::FileReader;
+use crate::error::{BlobError, ErrorKind, Result, new_blob_error, new_error};
+use bytes::Bytes;
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -13,8 +13,8 @@ use std::sync::Arc;
 // in the sibling `decompress` module. Re-exported here so existing paths like
 // `crate::blob::DecompressPool` keep resolving.
 pub(crate) use super::decompress::{
-    decompress_blob, decompress_blob_data_into, decompress_blob_raw,
-    decompress_wire_blob_into, pool_get_pub, pool_wrap, DecompressPool,
+    DecompressPool, decompress_blob, decompress_blob_data_into, decompress_blob_raw,
+    decompress_wire_blob_into, pool_get_pub, pool_wrap,
 };
 use super::decompress::{decompress_parsed_blob_into, pool_get};
 
@@ -22,7 +22,7 @@ use super::decompress::{decompress_parsed_blob_into, pool_get};
 // Re-exported at pub(crate) so existing paths like `crate::blob::WireBlob`
 // and `crate::blob::parse_blob_header_with_index` keep resolving.
 pub(crate) use super::blob_wire::{
-    parse_blob_header_with_index, BlobData, BlobKind, WireBlob, WireBlobHeader,
+    BlobData, BlobKind, WireBlob, WireBlobHeader, parse_blob_header_with_index,
 };
 pub use super::blob_wire::{MAX_BLOB_HEADER_SIZE, MAX_BLOB_MESSAGE_SIZE};
 
@@ -82,11 +82,7 @@ pub struct Blob {
 }
 
 impl Blob {
-    fn new(
-        header: WireBlobHeader,
-        blob: WireBlob,
-        offset: Option<ByteOffset>,
-    ) -> Blob {
+    fn new(header: WireBlobHeader, blob: WireBlob, offset: Option<ByteOffset>) -> Blob {
         Blob {
             header,
             blob,
@@ -233,7 +229,6 @@ impl BlobHeader {
     pub fn get_blob_size(&self) -> i32 {
         self.header.datasize
     }
-
 }
 
 /// Underlying source for [`BlobReader`] that supports seeking.
@@ -419,24 +414,22 @@ impl<R: Read + Send> BlobReader<R> {
             let header_start = self.offset.map_or(0, |x| x.0);
             let got = self.header_buf.len() as u64;
             let trunc_at = header_start + got;
-            return self.handle_error(new_error(ErrorKind::Io(
-                ::std::io::Error::new(
-                    ::std::io::ErrorKind::UnexpectedEof,
-                    format!(
-                        "BlobHeader truncated at byte {trunc_at} (shape 3): \
+            return self.handle_error(new_error(ErrorKind::Io(::std::io::Error::new(
+                ::std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "BlobHeader truncated at byte {trunc_at} (shape 3): \
                          declared {header_size} bytes from offset \
                          {header_start}, got {got}"
-                    ),
                 ),
-            )));
+            ))));
         }
 
-        let header = match WireBlobHeader::parse(&self.header_buf, self.parse_tagdata, self.parse_indexdata) {
-            Ok(header) => header,
-            Err(e) => {
-                return self.handle_error(e)
-            }
-        };
+        let header =
+            match WireBlobHeader::parse(&self.header_buf, self.parse_tagdata, self.parse_indexdata)
+            {
+                Ok(header) => header,
+                Err(e) => return self.handle_error(e),
+            };
 
         if header.datasize < 0 {
             return self.handle_error(new_blob_error(BlobError::InvalidDataSize {
@@ -512,7 +505,9 @@ impl BlobReader<FileReader> {
     pub fn open<P: AsRef<Path>>(path: P, direct: bool) -> Result<Self> {
         let reader = FileReader::open(path.as_ref(), direct)?;
         #[cfg(target_os = "linux")]
-        let evict_fd = if direct { None } else {
+        let evict_fd = if direct {
+            None
+        } else {
             Some({
                 use std::os::unix::io::AsRawFd;
                 match &reader {
@@ -569,16 +564,14 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
             let payload_start = self.offset.map_or(0, |x| x.0);
             let got = blob_data.len() as u64;
             let trunc_at = payload_start + got;
-            return self.handle_error(new_error(ErrorKind::Io(
-                ::std::io::Error::new(
-                    ::std::io::ErrorKind::UnexpectedEof,
-                    format!(
-                        "Blob payload truncated at byte {trunc_at} (shape 4): \
+            return self.handle_error(new_error(ErrorKind::Io(::std::io::Error::new(
+                ::std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "Blob payload truncated at byte {trunc_at} (shape 4): \
                          declared {} bytes from offset {payload_start}, got {got}",
-                        header.datasize
-                    ),
+                    header.datasize
                 ),
-            )));
+            ))));
         }
 
         let blob_bytes = Bytes::from(blob_data);
@@ -829,7 +822,6 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
 
         Some(Ok((BlobHeader::new(header), prev_offset)))
     }
-
 }
 
 impl BlobReader<BufReader<File>> {
@@ -897,7 +889,9 @@ pub(crate) fn decode_blob_to_headerblock(blob_bytes: &[u8]) -> Result<crate::Hea
 /// Accepts a `Bytes` value directly, avoiding the copy that the `&[u8]`
 /// variant must perform. Use `Bytes::from(vec)` to wrap a `Vec<u8>` in
 /// O(1).
-pub(crate) fn decode_blob_to_headerblock_from_bytes(blob_bytes: &Bytes) -> Result<crate::HeaderBlock> {
+pub(crate) fn decode_blob_to_headerblock_from_bytes(
+    blob_bytes: &Bytes,
+) -> Result<crate::HeaderBlock> {
     let blob = WireBlob::parse(blob_bytes)?;
     let raw = decompress_blob(&blob, None)?;
     crate::HeaderBlock::parse_from_bytes(&raw)
@@ -930,7 +924,10 @@ mod tests {
     fn test_get_type() {
         let pairs: &[(BlobKind, BlobType<'_>)] = &[
             (BlobKind::Unknown(String::new()), BlobType::Unknown("")),
-            (BlobKind::Unknown("abc".to_string()), BlobType::Unknown("abc")),
+            (
+                BlobKind::Unknown("abc".to_string()),
+                BlobType::Unknown("abc"),
+            ),
             (BlobKind::OsmHeader, BlobType::OsmHeader),
             (BlobKind::OsmData, BlobType::OsmData),
         ];
@@ -942,7 +939,10 @@ mod tests {
                 indexdata: None,
                 tagdata: None,
             };
-            let ff_blob = WireBlob { data: None, raw_size: None };
+            let ff_blob = WireBlob {
+                data: None,
+                raw_size: None,
+            };
 
             let blob = Blob::new(ff_header, ff_blob, None);
             assert_eq!(blob.get_type(), *expected_type);

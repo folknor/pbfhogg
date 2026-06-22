@@ -34,7 +34,7 @@
 
 use std::path::Path;
 
-use super::{require_sorted, writer_from_header, HeaderOverrides, Result};
+use super::{HeaderOverrides, Result, require_sorted, writer_from_header};
 use crate::writer::Compression;
 
 // ---------------------------------------------------------------------------
@@ -88,7 +88,6 @@ use relations::{relation_r1_collect_ids, relation_r2d_assembly};
 use schedule::build_all_blob_schedules;
 use stage2::stage2d_parallel_way_assembly;
 
-
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -132,12 +131,30 @@ impl StageCounters {
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     pub(super) fn emit(&self, prefix: &str) {
         use std::sync::atomic::Ordering::Relaxed;
-        crate::debug::emit_counter(&format!("{prefix}_pread_ms"), self.pread_ms.load(Relaxed) as i64);
-        crate::debug::emit_counter(&format!("{prefix}_decompress_ms"), self.decompress_ms.load(Relaxed) as i64);
-        crate::debug::emit_counter(&format!("{prefix}_reframe_ms"), self.reframe_ms.load(Relaxed) as i64);
-        crate::debug::emit_counter(&format!("{prefix}_send_ms"), self.send_ms.load(Relaxed) as i64);
-        crate::debug::emit_counter(&format!("{prefix}_consumer_recv_ms"), self.consumer_recv_ms.load(Relaxed) as i64);
-        crate::debug::emit_counter(&format!("{prefix}_consumer_write_ms"), self.consumer_write_ms.load(Relaxed) as i64);
+        crate::debug::emit_counter(
+            &format!("{prefix}_pread_ms"),
+            self.pread_ms.load(Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            &format!("{prefix}_decompress_ms"),
+            self.decompress_ms.load(Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            &format!("{prefix}_reframe_ms"),
+            self.reframe_ms.load(Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            &format!("{prefix}_send_ms"),
+            self.send_ms.load(Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            &format!("{prefix}_consumer_recv_ms"),
+            self.consumer_recv_ms.load(Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            &format!("{prefix}_consumer_write_ms"),
+            self.consumer_write_ms.load(Relaxed) as i64,
+        );
         crate::debug::emit_counter(&format!("{prefix}_blobs"), self.blobs.load(Relaxed) as i64);
     }
 }
@@ -201,9 +218,17 @@ pub fn renumber_external(
     } else {
         compression
     };
-    let mut writer = writer_from_header(output, effective_compression, &header, true, overrides, |hb| {
-        hb.sorted()
-    }, direct_io, false)?;
+    let mut writer = writer_from_header(
+        output,
+        effective_compression,
+        &header,
+        true,
+        overrides,
+        #[allow(clippy::redundant_closure_for_method_calls)]
+        |hb| hb.sorted(),
+        direct_io,
+        false,
+    )?;
     // On any mid-stream error below (pass1 count mismatch, stage 2d
     // failure, relation rewrite failure, final flush) the partially
     // written output must not survive. Guard removes it on Drop unless
@@ -227,10 +252,12 @@ pub fn renumber_external(
 
     // ---- Blob schedule scan ----
     let t_sched = std::time::Instant::now();
-    let (pass1_schedule, way_schedule, relation_schedule) =
-        build_all_blob_schedules(input)?;
+    let (pass1_schedule, way_schedule, relation_schedule) = build_all_blob_schedules(input)?;
     #[allow(clippy::cast_possible_truncation)]
-    crate::debug::emit_counter("renumber_ext_schedule_ms", t_sched.elapsed().as_millis() as i64);
+    crate::debug::emit_counter(
+        "renumber_ext_schedule_ms",
+        t_sched.elapsed().as_millis() as i64,
+    );
 
     crate::debug::emit_marker("RENUMBER_EXT_PASS1_START");
 
@@ -253,11 +280,7 @@ pub fn renumber_external(
     // blob's id overshoot the pre-allocated bitset and panic in
     // `IdSet::set_atomic` with an opaque "pre_allocate only covers..."
     // message. O(N) in schedule length, called once at startup.
-    let max_node_id = pass1_schedule
-        .iter()
-        .map(|t| t.max_id)
-        .max()
-        .unwrap_or(0);
+    let max_node_id = pass1_schedule.iter().map(|t| t.max_id).max().unwrap_or(0);
     let mut node_id_set = crate::idset::IdSet::new();
     node_id_set.pre_allocate(max_node_id);
 
@@ -289,7 +312,10 @@ pub fn renumber_external(
     node_id_set.build_rank_index();
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     {
-        crate::debug::emit_counter("renumber_ext_node_rank_ms", t_rank.elapsed().as_millis() as i64);
+        crate::debug::emit_counter(
+            "renumber_ext_node_rank_ms",
+            t_rank.elapsed().as_millis() as i64,
+        );
         crate::debug::emit_counter(
             "renumber_ext_node_map_entries",
             node_id_set.total_count() as i64,
@@ -336,22 +362,30 @@ pub fn renumber_external(
     way_id_set.build_rank_index();
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     {
-        crate::debug::emit_counter("renumber_ext_way_merge_rank_ms", t_way_merge.elapsed().as_millis() as i64);
-        crate::debug::emit_counter("renumber_ext_way_map_entries", way_id_set.total_count() as i64);
+        crate::debug::emit_counter(
+            "renumber_ext_way_merge_rank_ms",
+            t_way_merge.elapsed().as_millis() as i64,
+        );
+        crate::debug::emit_counter(
+            "renumber_ext_way_map_entries",
+            way_id_set.total_count() as i64,
+        );
     }
 
     let mut relation_id_set = crate::idset::IdSet::new();
-    relation_r1_collect_ids(
-        &shared_file,
-        &relation_schedule,
-        &mut relation_id_set,
-    )?;
+    relation_r1_collect_ids(&shared_file, &relation_schedule, &mut relation_id_set)?;
     let t_rel_rank = std::time::Instant::now();
     relation_id_set.build_rank_index();
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     {
-        crate::debug::emit_counter("renumber_ext_rel_rank_ms", t_rel_rank.elapsed().as_millis() as i64);
-        crate::debug::emit_counter("renumber_ext_relation_map_entries", relation_id_set.total_count() as i64);
+        crate::debug::emit_counter(
+            "renumber_ext_rel_rank_ms",
+            t_rel_rank.elapsed().as_millis() as i64,
+        );
+        crate::debug::emit_counter(
+            "renumber_ext_relation_map_entries",
+            relation_id_set.total_count() as i64,
+        );
     }
     crate::debug::emit_marker("RENUMBER_EXT_R1_END");
 

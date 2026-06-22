@@ -31,14 +31,14 @@ use std::path::Path;
 
 use common::cli::{CliInvoker, CliOutput};
 use common::{
-    node_ids_id_only as node_ids, read_all_elements_id_only as read_all_elements,
-    read_all_elements_with_coords, read_header, relation_ids_id_only as relation_ids,
-    way_ids_id_only as way_ids, write_multi_block_test_pbf, write_test_pbf,
-    write_test_pbf_sorted, TestMember, TestNode, TestRelation, TestWay,
+    TestMember, TestNode, TestRelation, TestWay, node_ids_id_only as node_ids,
+    read_all_elements_id_only as read_all_elements, read_all_elements_with_coords, read_header,
+    relation_ids_id_only as relation_ids, way_ids_id_only as way_ids, write_multi_block_test_pbf,
+    write_test_pbf, write_test_pbf_sorted,
 };
+use pbfhogg::MemberId;
 use pbfhogg::block_builder::{self, BlockBuilder};
 use pbfhogg::writer::{Compression, PbfWriter};
-use pbfhogg::MemberId;
 use tempfile::TempDir;
 
 const BBOX_STR: &str = "12.4,55.6,12.7,55.8";
@@ -74,18 +74,57 @@ enum RegionArg<'a> {
 
 fn test_nodes() -> Vec<TestNode> {
     vec![
-        TestNode { id: 1, lat: 557_000_000, lon: 125_000_000, tags: vec![("name", "inside1")], meta: None },
-        TestNode { id: 2, lat: 540_000_000, lon: 125_000_000, tags: vec![("name", "outside_south")], meta: None },
-        TestNode { id: 3, lat: 556_500_000, lon: 125_500_000, tags: vec![("name", "inside2")], meta: None },
-        TestNode { id: 4, lat: 557_000_000, lon: 140_000_000, tags: vec![("name", "outside_east")], meta: None },
+        TestNode {
+            id: 1,
+            lat: 557_000_000,
+            lon: 125_000_000,
+            tags: vec![("name", "inside1")],
+            meta: None,
+        },
+        TestNode {
+            id: 2,
+            lat: 540_000_000,
+            lon: 125_000_000,
+            tags: vec![("name", "outside_south")],
+            meta: None,
+        },
+        TestNode {
+            id: 3,
+            lat: 556_500_000,
+            lon: 125_500_000,
+            tags: vec![("name", "inside2")],
+            meta: None,
+        },
+        TestNode {
+            id: 4,
+            lat: 557_000_000,
+            lon: 140_000_000,
+            tags: vec![("name", "outside_east")],
+            meta: None,
+        },
     ]
 }
 
 fn test_ways() -> Vec<TestWay> {
     vec![
-        TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")], meta: None },
-        TestWay { id: 11, refs: vec![2, 4], tags: vec![("highway", "secondary")], meta: None },
-        TestWay { id: 12, refs: vec![1, 3], tags: vec![("highway", "tertiary")], meta: None },
+        TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "primary")],
+            meta: None,
+        },
+        TestWay {
+            id: 11,
+            refs: vec![2, 4],
+            tags: vec![("highway", "secondary")],
+            meta: None,
+        },
+        TestWay {
+            id: 12,
+            refs: vec![1, 3],
+            tags: vec![("highway", "tertiary")],
+            meta: None,
+        },
     ]
 }
 
@@ -93,13 +132,19 @@ fn test_relations() -> Vec<TestRelation> {
     vec![
         TestRelation {
             id: 100,
-            members: vec![TestMember { id: MemberId::Node(1), role: "stop" }],
+            members: vec![TestMember {
+                id: MemberId::Node(1),
+                role: "stop",
+            }],
             tags: vec![("type", "route")],
             meta: None,
         },
         TestRelation {
             id: 101,
-            members: vec![TestMember { id: MemberId::Node(4), role: "stop" }],
+            members: vec![TestMember {
+                id: MemberId::Node(4),
+                role: "stop",
+            }],
             tags: vec![("type", "route")],
             meta: None,
         },
@@ -108,7 +153,12 @@ fn test_relations() -> Vec<TestRelation> {
 
 /// Invoke `pbfhogg extract <input> -o <output> [--bbox|--polygon]
 /// [--simple|--smart] --set-bounds --force` and assert success.
-fn run_extract(input: &Path, output: &Path, region: &RegionArg<'_>, strategy: Strategy) -> CliOutput {
+fn run_extract(
+    input: &Path,
+    output: &Path,
+    region: &RegionArg<'_>,
+    strategy: Strategy,
+) -> CliOutput {
     let mut cli = CliInvoker::new()
         .arg("extract")
         .arg(input)
@@ -157,7 +207,12 @@ fn simple_filters_nodes_by_bbox() {
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf(&input, &test_nodes(), &[], &[]);
 
-    run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), Strategy::Simple);
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
     let c = read_all_elements(&output);
     assert_eq!(node_ids(&c), vec![1, 3]);
 }
@@ -169,7 +224,12 @@ fn simple_includes_ways_with_nodes_in_bbox() {
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
 
-    run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), Strategy::Simple);
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
     let c = read_all_elements(&output);
     // Ways 10 and 12 have at least one node in bbox; way 11 does not.
     assert_eq!(way_ids(&c), vec![10, 12]);
@@ -182,7 +242,12 @@ fn simple_does_not_add_extra_nodes() {
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
 
-    run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), Strategy::Simple);
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
     let c = read_all_elements(&output);
     // Simple mode: only nodes actually in bbox, not way dependencies.
     assert_eq!(node_ids(&c), vec![1, 3]);
@@ -195,7 +260,12 @@ fn complete_ways_includes_all_way_nodes() {
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
 
-    run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), Strategy::CompleteWays);
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::CompleteWays,
+    );
     let c = read_all_elements(&output);
     // Way 10 [1,2]: node 1 in bbox -> way matches -> node 2 pulled in
     // Way 12 [1,3]: both in bbox -> no extra deps
@@ -211,7 +281,12 @@ fn complete_ways_includes_relations() {
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf(&input, &test_nodes(), &test_ways(), &test_relations());
 
-    run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), Strategy::CompleteWays);
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::CompleteWays,
+    );
     let c = read_all_elements(&output);
     // Relation 100 has member node 1 (in bbox) -> included
     // Relation 101 has member node 4 (outside bbox) -> excluded
@@ -226,13 +301,21 @@ fn simple_includes_relations_with_matched_ways() {
 
     let relations = vec![TestRelation {
         id: 200,
-        members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+        members: vec![TestMember {
+            id: MemberId::Way(10),
+            role: "outer",
+        }],
         tags: vec![("type", "multipolygon")],
         meta: None,
     }];
     write_test_pbf(&input, &test_nodes(), &test_ways(), &relations);
 
-    run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), Strategy::Simple);
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
     let c = read_all_elements(&output);
     // Way 10 matched -> relation 200 should be included.
     assert_eq!(relation_ids(&c), vec![200]);
@@ -246,7 +329,12 @@ fn empty_extract() {
     write_test_pbf(&input, &test_nodes(), &test_ways(), &test_relations());
 
     // Bbox far away from all test data.
-    run_extract(&input, &output, &RegionArg::Bbox("0.0,0.0,1.0,1.0"), Strategy::CompleteWays);
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox("0.0,0.0,1.0,1.0"),
+        Strategy::CompleteWays,
+    );
     let c = read_all_elements(&output);
     assert!(c.nodes.is_empty());
     assert!(c.ways.is_empty());
@@ -260,16 +348,28 @@ fn tags_preserved_in_extract() {
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
 
-    run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), Strategy::CompleteWays);
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::CompleteWays,
+    );
     let c = read_all_elements_with_coords(&output);
 
     // Check node 1 tags.
-    let node1 = c.nodes.iter().find(|(id, _, _, _)| *id == 1).expect("node 1");
+    let node1 = c
+        .nodes
+        .iter()
+        .find(|(id, _, _, _)| *id == 1)
+        .expect("node 1");
     assert_eq!(node1.3, vec![("name".to_string(), "inside1".to_string())]);
 
     // Check way 10 tags.
     let way10 = c.ways.iter().find(|(id, _, _)| *id == 10).expect("way 10");
-    assert_eq!(way10.2, vec![("highway".to_string(), "primary".to_string())]);
+    assert_eq!(
+        way10.2,
+        vec![("highway".to_string(), "primary".to_string())]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -286,7 +386,12 @@ fn polygon_simple_filters_nodes() {
     write_test_pbf(&input, &test_nodes(), &[], &[]);
     write_geojson(&geojson, TRIANGLE_GEOJSON);
 
-    run_extract(&input, &output, &RegionArg::Polygon(&geojson), Strategy::Simple);
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Polygon(&geojson),
+        Strategy::Simple,
+    );
     let c = read_all_elements(&output);
     assert_eq!(node_ids(&c), vec![1, 3]);
 }
@@ -301,7 +406,12 @@ fn polygon_complete_ways_includes_all_way_nodes() {
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
     write_geojson(&geojson, TRIANGLE_GEOJSON);
 
-    run_extract(&input, &output, &RegionArg::Polygon(&geojson), Strategy::CompleteWays);
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Polygon(&geojson),
+        Strategy::CompleteWays,
+    );
     let c = read_all_elements(&output);
     assert_eq!(node_ids(&c), vec![1, 2, 3]);
     assert_eq!(way_ids(&c), vec![10, 12]);
@@ -317,7 +427,12 @@ fn polygon_with_hole_excludes_interior() {
     write_test_pbf(&input, &test_nodes(), &[], &[]);
     write_geojson(&geojson, SQUARE_WITH_HOLE_GEOJSON);
 
-    run_extract(&input, &output, &RegionArg::Polygon(&geojson), Strategy::Simple);
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Polygon(&geojson),
+        Strategy::Simple,
+    );
     let c = read_all_elements(&output);
     // Node 1 is inside the hole -> excluded.
     // Node 3 is inside exterior, outside hole -> included.
@@ -335,7 +450,12 @@ fn polygon_from_geojson_file() {
     write_test_pbf(&input, &test_nodes(), &[], &[]);
     write_geojson(&geojson, TRIANGLE_GEOJSON);
 
-    run_extract(&input, &output, &RegionArg::Polygon(&geojson), Strategy::Simple);
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Polygon(&geojson),
+        Strategy::Simple,
+    );
     let c = read_all_elements(&output);
     assert_eq!(node_ids(&c), vec![1, 3]);
 }
@@ -353,8 +473,14 @@ fn smart_includes_multipolygon_way_members() {
     let relations = vec![TestRelation {
         id: 300,
         members: vec![
-            TestMember { id: MemberId::Way(10), role: "outer" },
-            TestMember { id: MemberId::Way(11), role: "inner" },
+            TestMember {
+                id: MemberId::Way(10),
+                role: "outer",
+            },
+            TestMember {
+                id: MemberId::Way(11),
+                role: "inner",
+            },
         ],
         tags: vec![("type", "multipolygon")],
         meta: None,
@@ -380,8 +506,14 @@ fn smart_includes_boundary_node_members() {
     let relations = vec![TestRelation {
         id: 301,
         members: vec![
-            TestMember { id: MemberId::Way(12), role: "outer" },
-            TestMember { id: MemberId::Node(4), role: "admin_centre" },
+            TestMember {
+                id: MemberId::Way(12),
+                role: "outer",
+            },
+            TestMember {
+                id: MemberId::Node(4),
+                role: "admin_centre",
+            },
         ],
         tags: vec![("type", "boundary"), ("boundary", "administrative")],
         meta: None,
@@ -391,7 +523,10 @@ fn smart_includes_boundary_node_members() {
     let out = run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), Strategy::Smart);
     let c = read_all_elements(&output);
     // Node 4 should be pulled in via smart boundary deps.
-    assert!(node_ids(&c).contains(&4), "node 4 (admin_centre) should be included");
+    assert!(
+        node_ids(&c).contains(&4),
+        "node 4 (admin_centre) should be included"
+    );
     assert_eq!(relation_ids(&c), vec![301]);
 
     // The smart-contribution branch of `ExtractStats::print_summary`
@@ -413,8 +548,14 @@ fn smart_ignores_non_qualifying_relations() {
     let relations = vec![TestRelation {
         id: 302,
         members: vec![
-            TestMember { id: MemberId::Way(10), role: "forward" },
-            TestMember { id: MemberId::Way(11), role: "backward" },
+            TestMember {
+                id: MemberId::Way(10),
+                role: "forward",
+            },
+            TestMember {
+                id: MemberId::Way(11),
+                role: "backward",
+            },
         ],
         tags: vec![("type", "route")],
         meta: None,
@@ -442,14 +583,22 @@ fn write_multi_blob_pbf(path: &Path) {
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new().build().expect("build header");
+    let header = block_builder::HeaderBuilder::new()
+        .build()
+        .expect("build header");
     writer.write_header(&header).expect("write header");
 
     let mut bb = BlockBuilder::new();
 
     // Blob 1: Copenhagen area (lat ~55.7, lon ~12.5)
     for i in 1..=10_i64 {
-        bb.add_node(i, 557_000_000 + i as i32 * 1000, 125_000_000 + i as i32 * 1000, std::iter::empty::<(&str, &str)>(), None);
+        bb.add_node(
+            i,
+            557_000_000 + i as i32 * 1000,
+            125_000_000 + i as i32 * 1000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
     }
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");
@@ -457,7 +606,13 @@ fn write_multi_blob_pbf(path: &Path) {
 
     // Blob 2: Stockholm area (lat ~59.3, lon ~18.0) - far from Copenhagen
     for i in 11..=20_i64 {
-        bb.add_node(i, 593_000_000 + i as i32 * 1000, 180_000_000 + i as i32 * 1000, std::iter::empty::<(&str, &str)>(), None);
+        bb.add_node(
+            i,
+            593_000_000 + i as i32 * 1000,
+            180_000_000 + i as i32 * 1000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
     }
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");
@@ -465,7 +620,13 @@ fn write_multi_blob_pbf(path: &Path) {
 
     // Blob 3: Berlin area (lat ~52.5, lon ~13.4) - far from Copenhagen
     for i in 21..=30_i64 {
-        bb.add_node(i, 525_000_000 + i as i32 * 1000, 134_000_000 + i as i32 * 1000, std::iter::empty::<(&str, &str)>(), None);
+        bb.add_node(
+            i,
+            525_000_000 + i as i32 * 1000,
+            134_000_000 + i as i32 * 1000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
     }
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");
@@ -482,13 +643,21 @@ fn spatial_filter_skips_distant_blobs() {
 
     write_multi_blob_pbf(&input);
 
-    run_extract(&input, &output, &RegionArg::Bbox("12.4,55.6,12.7,55.8"), Strategy::Simple);
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox("12.4,55.6,12.7,55.8"),
+        Strategy::Simple,
+    );
     let c = read_all_elements(&output);
 
     // Only Copenhagen nodes (1-10) should be in the output.
     let ids = node_ids(&c);
     assert_eq!(ids, (1..=10).collect::<Vec<_>>());
-    assert!(ids.iter().all(|&id| id <= 10), "no non-Copenhagen nodes should be present");
+    assert!(
+        ids.iter().all(|&id| id <= 10),
+        "no non-Copenhagen nodes should be present"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -506,7 +675,12 @@ fn simple_sorted_filters_nodes_by_bbox() {
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf_sorted(&input, &test_nodes(), &[], &[]);
 
-    run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), Strategy::Simple);
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
     let c = read_all_elements(&output);
     assert_eq!(node_ids(&c), vec![1, 3]);
 }
@@ -518,7 +692,12 @@ fn simple_sorted_includes_ways_with_nodes_in_bbox() {
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &[]);
 
-    run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), Strategy::Simple);
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
     let c = read_all_elements(&output);
     assert_eq!(way_ids(&c), vec![10, 12]);
 }
@@ -530,7 +709,12 @@ fn simple_sorted_does_not_add_extra_nodes() {
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &[]);
 
-    run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), Strategy::Simple);
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
     let c = read_all_elements(&output);
     assert_eq!(node_ids(&c), vec![1, 3]);
 }
@@ -542,7 +726,12 @@ fn simple_sorted_includes_relations() {
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
 
-    run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), Strategy::Simple);
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
     let c = read_all_elements(&output);
     assert_eq!(relation_ids(&c), vec![100]);
 }
@@ -555,13 +744,21 @@ fn simple_sorted_includes_relations_with_matched_ways() {
 
     let relations = vec![TestRelation {
         id: 200,
-        members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+        members: vec![TestMember {
+            id: MemberId::Way(10),
+            role: "outer",
+        }],
         tags: vec![("type", "multipolygon")],
         meta: None,
     }];
     write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &relations);
 
-    run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), Strategy::Simple);
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
     let c = read_all_elements(&output);
     assert_eq!(relation_ids(&c), vec![200]);
 }
@@ -573,7 +770,12 @@ fn simple_sorted_empty_extract() {
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
 
-    run_extract(&input, &output, &RegionArg::Bbox("0.0,0.0,1.0,1.0"), Strategy::Simple);
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox("0.0,0.0,1.0,1.0"),
+        Strategy::Simple,
+    );
     let c = read_all_elements(&output);
     assert!(c.nodes.is_empty());
     assert!(c.ways.is_empty());
@@ -587,9 +789,17 @@ fn simple_sorted_output_declares_sorted() {
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
 
-    run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), Strategy::Simple);
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
     let header = read_header(&output);
-    assert!(header.is_sorted(), "output should declare Sort.Type_then_ID");
+    assert!(
+        header.is_sorted(),
+        "output should declare Sort.Type_then_ID"
+    );
 }
 
 #[test]
@@ -602,7 +812,12 @@ fn simple_sorted_polygon_filters_nodes() {
     write_test_pbf_sorted(&input, &test_nodes(), &[], &[]);
     write_geojson(&geojson, TRIANGLE_GEOJSON);
 
-    run_extract(&input, &output, &RegionArg::Polygon(&geojson), Strategy::Simple);
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Polygon(&geojson),
+        Strategy::Simple,
+    );
     let c = read_all_elements(&output);
     assert_eq!(node_ids(&c), vec![1, 3]);
 }
@@ -712,7 +927,12 @@ fn simple_multi_blob_bbox_partitioning() {
 
     write_multi_block_test_pbf(&input, &all_nodes, &[], &[], 10);
 
-    run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), Strategy::Simple);
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
     let c = read_all_elements(&output);
     let got: Vec<i64> = node_ids(&c);
     let want: Vec<i64> = (1..=10).collect();

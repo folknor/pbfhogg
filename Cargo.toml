@@ -4,7 +4,7 @@ exclude = ["bench/osmpbf-baseline"]
 dependencies = {}
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["folknor <folk@folk.wtf>"]
@@ -73,15 +73,15 @@ test-hooks = []
 
 [dependencies]
 protohoggr = "0.4.0"
-bytes = "1"
+bytes = "1.12.0"
 flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
 memmap2 = "0.9"
 rayon = "1.12.0"
 rustc-hash = "2.1.2"
 zstd = "0.13"
-hotpath = "0.16.0"
-quick-xml = "0.39.4"
-serde_json = { version = "1", optional = true }
+hotpath = "0.17.0"
+quick-xml = "0.40.1"
+serde_json = { version = "1.0.150", optional = true }
 s2 = { version = "0.0.13", optional = true }
 io-uring = { version = "0.7.12", optional = true }
 libc = "0.2.186"

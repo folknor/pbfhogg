@@ -34,7 +34,8 @@ impl StreamingBlocks {
     ) -> crate::error::Result<Self> {
         let mut blob_reader = crate::blob::BlobReader::open(path, direct_io)?;
         blob_reader.set_parse_indexdata(true);
-        blob_reader.next()
+        blob_reader
+            .next()
             .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
         let mut decompress_buf: Vec<u8> = Vec::new();
         let mut st_scratch: Vec<(u32, u32)> = Vec::new();
@@ -52,11 +53,16 @@ impl StreamingBlocks {
                     return Some(Err(e));
                 }
                 return Some(crate::block::PrimitiveBlock::from_vec_with_scratch(
-                    std::mem::take(&mut decompress_buf), &mut st_scratch, &mut gr_scratch,
+                    std::mem::take(&mut decompress_buf),
+                    &mut st_scratch,
+                    &mut gr_scratch,
                 ));
             }
         });
-        Ok(Self { blocks: Box::new(iter), stashed: None })
+        Ok(Self {
+            blocks: Box::new(iter),
+            stashed: None,
+        })
     }
 
     fn next_block(&mut self) -> BoxResult<Option<PrimitiveBlock>> {
@@ -189,7 +195,10 @@ pub(crate) fn convert_node(element: &Element<'_>) -> Option<OwnedNode> {
             id: dn.id(),
             decimicro_lat: dn.decimicro_lat(),
             decimicro_lon: dn.decimicro_lon(),
-            tags: dn.tags().map(|(k, v)| (k.to_owned(), v.to_owned())).collect(),
+            tags: dn
+                .tags()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
             metadata: dn
                 .info()
                 .map(crate::dense::DenseNodeInfo::version)
@@ -200,7 +209,10 @@ pub(crate) fn convert_node(element: &Element<'_>) -> Option<OwnedNode> {
             id: n.id(),
             decimicro_lat: n.decimicro_lat(),
             decimicro_lon: n.decimicro_lon(),
-            tags: n.tags().map(|(k, v)| (k.to_owned(), v.to_owned())).collect(),
+            tags: n
+                .tags()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
             metadata: n.info().version().map(OwnedMetadata::version_only),
         }),
         _ => None,
@@ -211,7 +223,10 @@ pub(crate) fn convert_way(element: &Element<'_>) -> Option<OwnedWay> {
     match element {
         Element::Way(w) => Some(OwnedWay {
             id: w.id(),
-            tags: w.tags().map(|(k, v)| (k.to_owned(), v.to_owned())).collect(),
+            tags: w
+                .tags()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
             refs: w.refs().collect(),
             metadata: w.info().version().map(OwnedMetadata::version_only),
         }),
@@ -223,7 +238,10 @@ pub(crate) fn convert_relation(element: &Element<'_>) -> Option<OwnedRelation> {
     match element {
         Element::Relation(r) => Some(OwnedRelation {
             id: r.id(),
-            tags: r.tags().map(|(k, v)| (k.to_owned(), v.to_owned())).collect(),
+            tags: r
+                .tags()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
             members: r
                 .members()
                 .map(|m| OwnedMember {
@@ -249,24 +267,48 @@ pub(crate) trait MergeJoinElement: Sized {
 }
 
 impl MergeJoinElement for OwnedNode {
-    fn id(&self) -> i64 { self.id }
-    fn is_block_type(bt: BlockType) -> bool { is_node_block(bt) }
-    fn equal(a: &Self, b: &Self) -> bool { super::write::nodes_equal(a, b) }
-    fn convert(element: &Element<'_>) -> Option<Self> { convert_node(element) }
+    fn id(&self) -> i64 {
+        self.id
+    }
+    fn is_block_type(bt: BlockType) -> bool {
+        is_node_block(bt)
+    }
+    fn equal(a: &Self, b: &Self) -> bool {
+        super::write::nodes_equal(a, b)
+    }
+    fn convert(element: &Element<'_>) -> Option<Self> {
+        convert_node(element)
+    }
 }
 
 impl MergeJoinElement for OwnedWay {
-    fn id(&self) -> i64 { self.id }
-    fn is_block_type(bt: BlockType) -> bool { is_way_block(bt) }
-    fn equal(a: &Self, b: &Self) -> bool { super::write::ways_equal(a, b) }
-    fn convert(element: &Element<'_>) -> Option<Self> { convert_way(element) }
+    fn id(&self) -> i64 {
+        self.id
+    }
+    fn is_block_type(bt: BlockType) -> bool {
+        is_way_block(bt)
+    }
+    fn equal(a: &Self, b: &Self) -> bool {
+        super::write::ways_equal(a, b)
+    }
+    fn convert(element: &Element<'_>) -> Option<Self> {
+        convert_way(element)
+    }
 }
 
 impl MergeJoinElement for OwnedRelation {
-    fn id(&self) -> i64 { self.id }
-    fn is_block_type(bt: BlockType) -> bool { is_relation_block(bt) }
-    fn equal(a: &Self, b: &Self) -> bool { super::write::relations_equal(a, b) }
-    fn convert(element: &Element<'_>) -> Option<Self> { convert_relation(element) }
+    fn id(&self) -> i64 {
+        self.id
+    }
+    fn is_block_type(bt: BlockType) -> bool {
+        is_relation_block(bt)
+    }
+    fn equal(a: &Self, b: &Self) -> bool {
+        super::write::relations_equal(a, b)
+    }
+    fn convert(element: &Element<'_>) -> Option<Self> {
+        convert_relation(element)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -313,30 +355,28 @@ pub(crate) fn merge_join_phase<T: MergeJoinElement>(
 
                 new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
             }
-            (Some(o), Some(n)) => {
-                match crate::osm_id::osm_id_cmp(o.id(), n.id()) {
-                    std::cmp::Ordering::Less => {
-                        on_action(MergeJoinAction::OldOnly(o))?;
+            (Some(o), Some(n)) => match crate::osm_id::osm_id_cmp(o.id(), n.id()) {
+                std::cmp::Ordering::Less => {
+                    on_action(MergeJoinAction::OldOnly(o))?;
 
-                        old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
-                    }
-                    std::cmp::Ordering::Greater => {
-                        on_action(MergeJoinAction::NewOnly(n))?;
-
-                        new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
-                    }
-                    std::cmp::Ordering::Equal => {
-                        if T::equal(o, n) {
-                            on_action(MergeJoinAction::Equal(o))?;
-                        } else {
-                            on_action(MergeJoinAction::Modified(o, n))?;
-                        }
-
-                        old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
-                        new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
-                    }
+                    old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
                 }
-            }
+                std::cmp::Ordering::Greater => {
+                    on_action(MergeJoinAction::NewOnly(n))?;
+
+                    new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
+                }
+                std::cmp::Ordering::Equal => {
+                    if T::equal(o, n) {
+                        on_action(MergeJoinAction::Equal(o))?;
+                    } else {
+                        on_action(MergeJoinAction::Modified(o, n))?;
+                    }
+
+                    old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
+                    new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
+                }
+            },
         }
     }
     Ok(())
@@ -387,12 +427,8 @@ fn borrowed_nodes_equal(a: &Element<'_>, b: &Element<'_>) -> bool {
     // yield (&str, &str). Handle all 4 cross-match combinations explicitly.
     match (a, b) {
         (Element::DenseNode(da), Element::DenseNode(db)) => da.tags().eq(db.tags()),
-        (Element::DenseNode(da), Element::Node(nb)) => {
-            iter_tags_equal(da.tags(), nb.tags())
-        }
-        (Element::Node(na), Element::DenseNode(db)) => {
-            iter_tags_equal(na.tags(), db.tags())
-        }
+        (Element::DenseNode(da), Element::Node(nb)) => iter_tags_equal(da.tags(), nb.tags()),
+        (Element::Node(na), Element::DenseNode(db)) => iter_tags_equal(na.tags(), db.tags()),
         (Element::Node(na), Element::Node(nb)) => na.tags().eq(nb.tags()),
         _ => false,
     }
@@ -575,9 +611,7 @@ fn decode_pending(
     gr_scratch: &mut Vec<(u32, u32)>,
 ) -> crate::error::Result<BlockState> {
     pending.blob.decompress_into(buf)?;
-    let block = PrimitiveBlock::from_vec_with_scratch(
-        std::mem::take(buf), st_scratch, gr_scratch,
-    )?;
+    let block = PrimitiveBlock::from_vec_with_scratch(std::mem::take(buf), st_scratch, gr_scratch)?;
     Ok(BlockState {
         block,
         skip_count: 0,
@@ -693,9 +727,21 @@ fn drain_remaining(
 ) -> BoxResult<()> {
     let stats = &mut state.stats;
     let (reader, buf, st, gr, stash) = if is_old {
-        (&mut state.old_reader, &mut state.old_buf, &mut state.old_st, &mut state.old_gr, &mut state.old_stash)
+        (
+            &mut state.old_reader,
+            &mut state.old_buf,
+            &mut state.old_st,
+            &mut state.old_gr,
+            &mut state.old_stash,
+        )
     } else {
-        (&mut state.new_reader, &mut state.new_buf, &mut state.new_st, &mut state.new_gr, &mut state.new_stash)
+        (
+            &mut state.new_reader,
+            &mut state.new_buf,
+            &mut state.new_st,
+            &mut state.new_gr,
+            &mut state.new_stash,
+        )
     };
     while let Some(p) = next_blob_for_kind(reader, kind, stash)? {
         let bs = decode_pending(p, buf, st, gr)?;
@@ -776,6 +822,7 @@ fn merge_decoded_pair(
 /// Callers that need per-element output for unchanged elements (e.g., diff with
 /// `!suppress_common`) should pass `false`.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
+#[allow(clippy::too_many_lines)]
 pub(crate) fn block_pair_merge_phase(
     state: &mut BlockPairMergeState,
     kind: ElemKind,
@@ -796,27 +843,47 @@ pub(crate) fn block_pair_merge_phase(
             match (op, np) {
                 (None, None) => break,
                 (Some(op), None) => {
-                    let os = decode_pending(op, &mut state.old_buf, &mut state.old_st, &mut state.old_gr)?;
+                    let os = decode_pending(
+                        op,
+                        &mut state.old_buf,
+                        &mut state.old_st,
+                        &mut state.old_gr,
+                    )?;
                     emit_block(&os, true, on_action, &mut state.stats)?;
                     drain_remaining(state, kind, true, on_action)?;
                     break;
                 }
                 (None, Some(np)) => {
-                    let ns = decode_pending(np, &mut state.new_buf, &mut state.new_st, &mut state.new_gr)?;
+                    let ns = decode_pending(
+                        np,
+                        &mut state.new_buf,
+                        &mut state.new_st,
+                        &mut state.new_gr,
+                    )?;
                     emit_block(&ns, false, on_action, &mut state.stats)?;
                     drain_remaining(state, kind, false, on_action)?;
                     break;
                 }
                 (Some(op), Some(np)) => {
                     if op.index.max_id < np.index.min_id {
-                        let os = decode_pending(op, &mut state.old_buf, &mut state.old_st, &mut state.old_gr)?;
+                        let os = decode_pending(
+                            op,
+                            &mut state.old_buf,
+                            &mut state.old_st,
+                            &mut state.old_gr,
+                        )?;
                         emit_block(&os, true, on_action, &mut state.stats)?;
                         // Stash new blob undecoded - next iteration can try v1 byte comparison.
                         state.new_stash = Some(np.blob);
                         continue;
                     }
                     if np.index.max_id < op.index.min_id {
-                        let ns = decode_pending(np, &mut state.new_buf, &mut state.new_st, &mut state.new_gr)?;
+                        let ns = decode_pending(
+                            np,
+                            &mut state.new_buf,
+                            &mut state.new_st,
+                            &mut state.new_gr,
+                        )?;
                         emit_block(&ns, false, on_action, &mut state.stats)?;
                         // Stash old blob undecoded - next iteration can try v1 byte comparison.
                         state.old_stash = Some(op.blob);
@@ -831,18 +898,42 @@ pub(crate) fn block_pair_merge_phase(
                     }
                     state.stats.pairs_overlapping_decoded += 1;
                     state.stats.elements_overlapping_decoded += op.index.count + np.index.count;
-                    old_decoded = Some(decode_pending(op, &mut state.old_buf, &mut state.old_st, &mut state.old_gr)?);
-                    new_decoded = Some(decode_pending(np, &mut state.new_buf, &mut state.new_st, &mut state.new_gr)?);
+                    old_decoded = Some(decode_pending(
+                        op,
+                        &mut state.old_buf,
+                        &mut state.old_st,
+                        &mut state.old_gr,
+                    )?);
+                    new_decoded = Some(decode_pending(
+                        np,
+                        &mut state.new_buf,
+                        &mut state.new_st,
+                        &mut state.new_gr,
+                    )?);
                 }
             }
         }
 
         // Slow path: at least one side has a decoded residual block.
         if old_decoded.is_none() {
-            old_decoded = next_decoded_block(&mut state.old_reader, &mut state.old_buf, &mut state.old_st, &mut state.old_gr, kind, &mut state.old_stash)?;
+            old_decoded = next_decoded_block(
+                &mut state.old_reader,
+                &mut state.old_buf,
+                &mut state.old_st,
+                &mut state.old_gr,
+                kind,
+                &mut state.old_stash,
+            )?;
         }
         if new_decoded.is_none() {
-            new_decoded = next_decoded_block(&mut state.new_reader, &mut state.new_buf, &mut state.new_st, &mut state.new_gr, kind, &mut state.new_stash)?;
+            new_decoded = next_decoded_block(
+                &mut state.new_reader,
+                &mut state.new_buf,
+                &mut state.new_st,
+                &mut state.new_gr,
+                kind,
+                &mut state.new_stash,
+            )?;
         }
 
         match (&old_decoded, &new_decoded) {
@@ -955,10 +1046,7 @@ fn element_merge_pair(
                                 type_char,
                             })?;
                         } else {
-                            on_action(BlockMergeAction::ElementModified {
-                                old: &o,
-                                new: &n,
-                            })?;
+                            on_action(BlockMergeAction::ElementModified { old: &o, new: &n })?;
                         }
                     }
                 }
@@ -968,4 +1056,3 @@ fn element_merge_pair(
 
     Ok((old_consumed, new_consumed))
 }
-

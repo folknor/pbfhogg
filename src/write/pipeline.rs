@@ -11,7 +11,7 @@ use crate::write::file_writer::FileWriter;
 use crate::write::metrics::WRITER_METRICS;
 use std::io::{self, Write};
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 
 /// Maximum number of framed blobs in-flight before backpressure stalls senders.
@@ -157,15 +157,12 @@ impl OutputSink for FileOutputSink {
             #[cfg(feature = "linux-direct-io")]
             OutputChunk::CopyRange { in_fd, offset, len } => {
                 let t_write = std::time::Instant::now();
-                let out_fd = self
-                    .writer
-                    .flush_and_raw_fd()?
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            "copy_file_range incompatible with O_DIRECT output",
-                        )
-                    })?;
+                let out_fd = self.writer.flush_and_raw_fd()?.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "copy_file_range incompatible with O_DIRECT output",
+                    )
+                })?;
                 super::copy_range::copy_range(in_fd, out_fd, offset, len)?;
                 WRITER_METRICS
                     .write_ns
@@ -202,7 +199,9 @@ pub(super) fn new_permit_pool() -> (SyncSender<()>, Receiver<()>) {
     for _ in 0..PIPELINE_DISPATCH_PERMITS {
         // `send` on a fresh channel with capacity = N can't fail or block
         // for the first N sends. unwrap is sound here.
-        permit_tx.send(()).expect("seeding permit pool on fresh channel");
+        permit_tx
+            .send(())
+            .expect("seeding permit pool on fresh channel");
     }
     (permit_tx, permit_rx)
 }

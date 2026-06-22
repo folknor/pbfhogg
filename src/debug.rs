@@ -6,7 +6,9 @@
 /// the marker is silently dropped (O_NONBLOCK).
 pub fn emit_marker(name: &str) {
     use std::io::Write;
-    write_fifo(|f, us| { drop((&*f).write_all(format!("{us} {name}\n").as_bytes())); });
+    write_fifo(|f, us| {
+        drop((&*f).write_all(format!("{us} {name}\n").as_bytes()));
+    });
 }
 
 /// Emit a named counter value to the sidecar profiler (if active).
@@ -18,7 +20,9 @@ pub fn emit_marker(name: &str) {
 /// Format: `<timestamp_us> @<name>=<value>\n`
 pub fn emit_counter(name: &str, value: i64) {
     use std::io::Write;
-    write_fifo(|f, us| { drop((&*f).write_all(format!("{us} @{name}={value}\n").as_bytes())); });
+    write_fifo(|f, us| {
+        drop((&*f).write_all(format!("{us} @{name}={value}\n").as_bytes()));
+    });
 }
 
 /// Snapshot glibc allocator state via `mallinfo2()` and emit the key fields
@@ -117,9 +121,15 @@ pub fn read_page_faults() -> (u64, u64) {
     };
     // Fields are space-separated. Field 10 = minflt, field 12 = majflt (1-indexed).
     let mut fields = stat.split_whitespace();
-    let minflt = fields.nth(9).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let minflt = fields
+        .nth(9)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
     // Skip field 11 (cminflt) to get field 12 (majflt).
-    let majflt = fields.nth(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let majflt = fields
+        .nth(1)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
     (minflt, majflt)
 }
 

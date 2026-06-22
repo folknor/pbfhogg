@@ -61,7 +61,9 @@ fn write_pbf_copy(input: &Path, output: &Path) {
     let mut writer = PbfWriter::new(buf, Compression::default());
 
     // Write a minimal header
-    let header_bytes = block_builder::HeaderBuilder::new().build().expect("build header");
+    let header_bytes = block_builder::HeaderBuilder::new()
+        .build()
+        .expect("build header");
     writer.write_header(&header_bytes).expect("write header");
 
     let mut bb = BlockBuilder::new();
@@ -204,9 +206,7 @@ fn roundtrip_denmark() {
     eprintln!("Writing round-trip copy...");
     write_pbf_copy(&dk, &out);
 
-    let output_size = std::fs::metadata(&out)
-        .expect("stat output")
-        .len();
+    let output_size = std::fs::metadata(&out).expect("stat output").len();
     eprintln!("  Output size: {} MB", output_size / 1_000_000);
 
     eprintln!("Counting elements in output...");
@@ -216,7 +216,10 @@ fn roundtrip_denmark() {
         output_counts.nodes, output_counts.ways, output_counts.relations
     );
 
-    assert_eq!(source_counts.nodes, output_counts.nodes, "node count mismatch");
+    assert_eq!(
+        source_counts.nodes, output_counts.nodes,
+        "node count mismatch"
+    );
     assert_eq!(source_counts.ways, output_counts.ways, "way count mismatch");
     assert_eq!(
         source_counts.relations, output_counts.relations,

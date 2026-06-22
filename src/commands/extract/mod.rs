@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::cat::CleanAttrs;
 use crate::writer::Compression;
 
-use super::{Result, require_indexdata, HeaderOverrides};
+use super::{HeaderOverrides, Result, require_indexdata};
 
 mod common;
 mod complete;
@@ -38,7 +38,11 @@ impl Bbox {
 pub fn parse_bbox(s: &str) -> Result<Bbox> {
     let parts: Vec<&str> = s.split(',').collect();
     if parts.len() != 4 {
-        return Err(format!("bbox must have 4 comma-separated values, got {}", parts.len()).into());
+        return Err(format!(
+            "bbox must have 4 comma-separated values, got {}",
+            parts.len()
+        )
+        .into());
     }
     let min_lon: f64 = parts[0]
         .trim()
@@ -208,7 +212,9 @@ fn extract_geometry(value: &serde_json::Value) -> Result<serde_json::Value> {
                 .get("features")
                 .and_then(serde_json::Value::as_array)
                 .ok_or("FeatureCollection missing 'features' array")?;
-            let first = features.first().ok_or("FeatureCollection has no features")?;
+            let first = features
+                .first()
+                .ok_or("FeatureCollection has no features")?;
             let geom = first
                 .get("geometry")
                 .ok_or("first Feature missing 'geometry' field")?;
@@ -219,10 +225,7 @@ fn extract_geometry(value: &serde_json::Value) -> Result<serde_json::Value> {
 }
 
 /// Dispatch to the right parser based on geometry type.
-fn parse_geometry_by_type(
-    geo_type: &str,
-    coords: &serde_json::Value,
-) -> Result<Vec<PolygonRings>> {
+fn parse_geometry_by_type(geo_type: &str, coords: &serde_json::Value) -> Result<Vec<PolygonRings>> {
     match geo_type {
         "Polygon" => {
             let poly = parse_polygon_coordinates(coords)?;
@@ -269,12 +272,8 @@ fn parse_ring(ring: &serde_json::Value) -> Result<Vec<(f64, f64)>> {
         if pair.len() < 2 {
             return Err("coordinate array must have at least 2 elements".into());
         }
-        let lon = pair[0]
-            .as_f64()
-            .ok_or("coordinate lon must be a number")?;
-        let lat = pair[1]
-            .as_f64()
-            .ok_or("coordinate lat must be a number")?;
+        let lon = pair[0].as_f64().ok_or("coordinate lon must be a number")?;
+        let lat = pair[1].as_f64().ok_or("coordinate lat must be a number")?;
         result.push((lon, lat));
     }
     Ok(result)
@@ -376,9 +375,7 @@ pub fn parse_extract_config(
         return Err(format!("too many extracts: {} (max 500)", extracts_arr.len()).into());
     }
 
-    let config_dir = config_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
+    let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
 
     let resolve_dir = directory.as_deref().unwrap_or(config_dir);
 
@@ -417,7 +414,8 @@ fn parse_extract_geometry(
     let has_polygon = entry.get("polygon").is_some();
     let has_polygon_file = entry.get("polygon_file").is_some();
 
-    let geo_count = usize::from(has_bbox) + usize::from(has_polygon) + usize::from(has_polygon_file);
+    let geo_count =
+        usize::from(has_bbox) + usize::from(has_polygon) + usize::from(has_polygon_file);
     if geo_count == 0 {
         return Err(format!(
             "extract[{index}] must have exactly one of 'bbox', 'polygon', or 'polygon_file'"
@@ -517,7 +515,12 @@ pub fn extract_multi(
     // Try single-pass multi-extract for simple strategy on sorted input.
     if matches!(strategy, ExtractStrategy::Simple) && !clean.any() {
         if let Some(stats) = multi::try_extract_multi_single_pass(
-            input, slots, set_bounds, compression, direct_io, overrides,
+            input,
+            slots,
+            set_bounds,
+            compression,
+            direct_io,
+            overrides,
         )? {
             return Ok(stats);
         }
@@ -627,22 +630,59 @@ pub fn extract(
     overrides: &HeaderOverrides,
 ) -> Result<ExtractStats> {
     if !matches!(strategy, ExtractStrategy::Simple) {
-        require_indexdata(input, direct_io, force,
+        require_indexdata(
+            input,
+            direct_io,
+            force,
             "input PBF has no blob-level indexdata. Without indexdata, the spatial bbox \
-             filter is a no-op - all blobs are decompressed (significantly slower).")?;
+             filter is a no-op - all blobs are decompressed (significantly slower).",
+        )?;
     }
     let result = match strategy {
-        ExtractStrategy::Simple => simple::extract_simple(input, output, region, set_bounds, clean, compression, direct_io, overrides),
-        ExtractStrategy::CompleteWays => complete::extract_complete_ways(input, output, region, set_bounds, clean, compression, direct_io, overrides),
-        ExtractStrategy::Smart => smart::extract_smart(input, output, region, set_bounds, clean, compression, direct_io, overrides),
+        ExtractStrategy::Simple => simple::extract_simple(
+            input,
+            output,
+            region,
+            set_bounds,
+            clean,
+            compression,
+            direct_io,
+            overrides,
+        ),
+        ExtractStrategy::CompleteWays => complete::extract_complete_ways(
+            input,
+            output,
+            region,
+            set_bounds,
+            clean,
+            compression,
+            direct_io,
+            overrides,
+        ),
+        ExtractStrategy::Smart => smart::extract_smart(
+            input,
+            output,
+            region,
+            set_bounds,
+            clean,
+            compression,
+            direct_io,
+            overrides,
+        ),
     }?;
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("extract_nodes_in_bbox", result.nodes_in_bbox as i64);
         crate::debug::emit_counter("extract_nodes_from_ways", result.nodes_from_ways as i64);
-        crate::debug::emit_counter("extract_nodes_from_relations", result.nodes_from_relations as i64);
+        crate::debug::emit_counter(
+            "extract_nodes_from_relations",
+            result.nodes_from_relations as i64,
+        );
         crate::debug::emit_counter("extract_ways_written", result.ways_written as i64);
-        crate::debug::emit_counter("extract_ways_from_relations", result.ways_from_relations as i64);
+        crate::debug::emit_counter(
+            "extract_ways_from_relations",
+            result.ways_from_relations as i64,
+        );
         crate::debug::emit_counter("extract_relations_written", result.relations_written as i64);
     }
     Ok(result)

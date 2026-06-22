@@ -131,9 +131,9 @@ impl DenseNodeColumns {
             let id = ids[i];
             for (j, &(min_lat, max_lat, min_lon, max_lon)) in bboxes.iter().enumerate() {
                 let hit = (lat >= min_lat) as u8
-                        & (lat <= max_lat) as u8
-                        & (lon >= min_lon) as u8
-                        & (lon <= max_lon) as u8;
+                    & (lat <= max_lat) as u8
+                    & (lon >= min_lon) as u8
+                    & (lon <= max_lon) as u8;
                 if hit != 0 {
                     out[j].push(id);
                 }
@@ -166,9 +166,9 @@ impl DenseNodeColumns {
             // All four comparisons execute unconditionally - enables
             // autovectorization (no data-dependent branches).
             let hit = (lats[i] >= min_lat) as u8
-                    & (lats[i] <= max_lat) as u8
-                    & (lons[i] >= min_lon) as u8
-                    & (lons[i] <= max_lon) as u8;
+                & (lats[i] <= max_lat) as u8
+                & (lons[i] >= min_lon) as u8
+                & (lons[i] <= max_lon) as u8;
             if hit != 0 {
                 out.push(ids[i]);
             }

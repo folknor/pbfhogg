@@ -9,8 +9,8 @@
 //! [`pbfhogg::repack`](crate::commands::repack) to produce alternate-density
 //! re-encodings.
 
-use crate::blob_meta::{BlobIndex, ElemKind};
 use crate::PrimitiveBlock;
+use crate::blob_meta::{BlobIndex, ElemKind};
 use rustc_hash::FxHashSet;
 use std::io;
 
@@ -168,13 +168,13 @@ pub struct BlockBuilder {
     last_dense_user_sid: i32,
 
     // Wire-format accumulators for ways and relations
-    group_buf: Vec<u8>,       // per-block: all serialized way/relation messages
-    elem_scratch: Vec<u8>,    // per-element body (cleared each add_way/add_relation call)
-    packed_scratch: Vec<u8>,      // per-field packed content (refs in location path)
+    group_buf: Vec<u8>,      // per-block: all serialized way/relation messages
+    elem_scratch: Vec<u8>,   // per-element body (cleared each add_way/add_relation call)
+    packed_scratch: Vec<u8>, // per-field packed content (refs in location path)
     packed_vals_scratch: Vec<u8>, // tag values packed encoding (dual-buffer single-pass)
-    packed_lat_scratch: Vec<u8>,  // way location lat encoding (single-pass)
-    packed_lon_scratch: Vec<u8>,  // way location lon encoding (single-pass)
-    info_scratch: Vec<u8>,        // Info sub-message body
+    packed_lat_scratch: Vec<u8>, // way location lat encoding (single-pass)
+    packed_lon_scratch: Vec<u8>, // way location lon encoding (single-pass)
+    info_scratch: Vec<u8>,   // Info sub-message body
 
     // Reusable encode buffer for take() - avoids allocating a fresh Vec<u8> per block.
     encode_buf: Vec<u8>,
@@ -297,10 +297,18 @@ impl BlockBuilder {
     /// Track node coordinates for BlobIndex v2 spatial bbox.
     #[inline]
     fn track_coords(&mut self, decimicro_lat: i32, decimicro_lon: i32) {
-        if decimicro_lat < self.min_lat { self.min_lat = decimicro_lat; }
-        if decimicro_lat > self.max_lat { self.max_lat = decimicro_lat; }
-        if decimicro_lon < self.min_lon { self.min_lon = decimicro_lon; }
-        if decimicro_lon > self.max_lon { self.max_lon = decimicro_lon; }
+        if decimicro_lat < self.min_lat {
+            self.min_lat = decimicro_lat;
+        }
+        if decimicro_lat > self.max_lat {
+            self.max_lat = decimicro_lat;
+        }
+        if decimicro_lon < self.min_lon {
+            self.min_lon = decimicro_lon;
+        }
+        if decimicro_lon > self.max_lon {
+            self.max_lon = decimicro_lon;
+        }
     }
 
     /// Returns `true` if the string table has been pre-seeded from an input block.
@@ -383,8 +391,7 @@ impl BlockBuilder {
             let key_idx = self.string_table.add(key);
             self.tag_key_indices.insert(key_idx);
             self.dense_keys_vals.push(key_idx as i32);
-            self.dense_keys_vals
-                .push(self.string_table.add(val) as i32);
+            self.dense_keys_vals.push(self.string_table.add(val) as i32);
         }
         self.dense_keys_vals.push(0);
 
@@ -816,7 +823,8 @@ impl BlockBuilder {
         self.encode_buf.clear();
 
         // PrimitiveBlock field 1: StringTable submessage
-        self.string_table.encode_to(&mut self.encode_buf, &mut self.elem_scratch);
+        self.string_table
+            .encode_to(&mut self.encode_buf, &mut self.elem_scratch);
 
         match block_type {
             BlockType::DenseNodes => {
@@ -845,7 +853,8 @@ impl BlockBuilder {
         } else {
             self.tag_key_scratch.clear();
             self.tag_key_scratch.extend(
-                self.tag_key_indices.iter()
+                self.tag_key_indices
+                    .iter()
                     .copied()
                     .filter(|&idx| !self.string_table.strings[idx as usize].is_empty()),
             );
@@ -854,7 +863,9 @@ impl BlockBuilder {
                     .as_bytes()
                     .cmp(self.string_table.strings[b as usize].as_bytes())
             });
-            let total: usize = 3 + self.tag_key_scratch.iter()
+            let total: usize = 3 + self
+                .tag_key_scratch
+                .iter()
                 .map(|&idx| 2 + self.string_table.strings[idx as usize].len())
                 .sum::<usize>();
             let mut buf = Vec::with_capacity(total);
@@ -932,7 +943,12 @@ impl BlockBuilder {
         self.group_buf.clear();
 
         // DenseNodes field 1: id (packed sint64)
-        encode_packed_sint64(&mut self.group_buf, &mut self.elem_scratch, 1, &self.dense_ids);
+        encode_packed_sint64(
+            &mut self.group_buf,
+            &mut self.elem_scratch,
+            1,
+            &self.dense_ids,
+        );
 
         // DenseNodes field 5: denseinfo (submessage)
         if self.has_dense_metadata {
@@ -941,15 +957,40 @@ impl BlockBuilder {
             self.packed_scratch.clear();
 
             // DenseInfo field 1: version (packed int32)
-            encode_packed_int32(&mut self.elem_scratch, &mut self.packed_scratch, 1, &self.dense_versions);
+            encode_packed_int32(
+                &mut self.elem_scratch,
+                &mut self.packed_scratch,
+                1,
+                &self.dense_versions,
+            );
             // DenseInfo field 2: timestamp (packed sint64)
-            encode_packed_sint64(&mut self.elem_scratch, &mut self.packed_scratch, 2, &self.dense_timestamps);
+            encode_packed_sint64(
+                &mut self.elem_scratch,
+                &mut self.packed_scratch,
+                2,
+                &self.dense_timestamps,
+            );
             // DenseInfo field 3: changeset (packed sint64)
-            encode_packed_sint64(&mut self.elem_scratch, &mut self.packed_scratch, 3, &self.dense_changesets);
+            encode_packed_sint64(
+                &mut self.elem_scratch,
+                &mut self.packed_scratch,
+                3,
+                &self.dense_changesets,
+            );
             // DenseInfo field 4: uid (packed sint32)
-            encode_packed_sint32(&mut self.elem_scratch, &mut self.packed_scratch, 4, &self.dense_uids);
+            encode_packed_sint32(
+                &mut self.elem_scratch,
+                &mut self.packed_scratch,
+                4,
+                &self.dense_uids,
+            );
             // DenseInfo field 5: user_sid (packed sint32)
-            encode_packed_sint32(&mut self.elem_scratch, &mut self.packed_scratch, 5, &self.dense_user_sids);
+            encode_packed_sint32(
+                &mut self.elem_scratch,
+                &mut self.packed_scratch,
+                5,
+                &self.dense_user_sids,
+            );
             // DenseInfo field 6: visible (packed bool)
             encode_packed_bool(&mut self.elem_scratch, 6, &self.dense_visibles);
 
@@ -957,11 +998,26 @@ impl BlockBuilder {
         }
 
         // DenseNodes field 8: lat (packed sint64)
-        encode_packed_sint64(&mut self.group_buf, &mut self.elem_scratch, 8, &self.dense_lats);
+        encode_packed_sint64(
+            &mut self.group_buf,
+            &mut self.elem_scratch,
+            8,
+            &self.dense_lats,
+        );
         // DenseNodes field 9: lon (packed sint64)
-        encode_packed_sint64(&mut self.group_buf, &mut self.elem_scratch, 9, &self.dense_lons);
+        encode_packed_sint64(
+            &mut self.group_buf,
+            &mut self.elem_scratch,
+            9,
+            &self.dense_lons,
+        );
         // DenseNodes field 10: keys_vals (packed int32)
-        encode_packed_int32(&mut self.group_buf, &mut self.elem_scratch, 10, &self.dense_keys_vals);
+        encode_packed_int32(
+            &mut self.group_buf,
+            &mut self.elem_scratch,
+            10,
+            &self.dense_keys_vals,
+        );
 
         // Wrap DenseNodes as PrimitiveGroup field 2 (submessage)
         self.elem_scratch.clear();

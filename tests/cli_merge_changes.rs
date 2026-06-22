@@ -20,9 +20,9 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use common::cli::CliInvoker;
+use flate2::Compression;
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
-use flate2::Compression;
 use tempfile::TempDir;
 
 fn write_osc_gz(path: &Path, xml: &str) {
@@ -363,9 +363,21 @@ fn simplify_create_then_delete_yields_only_delete() {
 
     let xml = read_osc_gz(&out);
     // Should contain the delete
-    assert!(xml.contains("<delete>"), "output should contain a delete section");
-    assert!(xml.contains(r#"id="42""#), "output should contain node id=42");
-    assert!(xml.contains(r#"version="2""#), "output should have version 2 from the delete");
+    assert!(
+        xml.contains("<delete>"),
+        "output should contain a delete section"
+    );
+    assert!(
+        xml.contains(r#"id="42""#),
+        "output should contain node id=42"
+    );
+    assert!(
+        xml.contains(r#"version="2""#),
+        "output should have version 2 from the delete"
+    );
     // Should NOT contain a create
-    assert!(!xml.contains("<create>"), "simplified output should not contain create for a deleted element");
+    assert!(
+        !xml.contains("<create>"),
+        "simplified output should not contain create for a deleted element"
+    );
 }

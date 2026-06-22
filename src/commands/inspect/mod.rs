@@ -11,5 +11,5 @@ mod show_element;
 mod types;
 
 pub use scan::inspect;
-pub use show_element::{show_element, ShowElementType};
+pub use show_element::{ShowElementType, show_element};
 pub use types::InspectReport;

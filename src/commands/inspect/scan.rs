@@ -3,16 +3,16 @@
 
 use std::path::Path;
 
-use crate::read::raw_frame::read_raw_frame;
 use super::super::Result;
 use super::types::{
-    classify_block, is_standard_ordering, update_extended_for_element, BlockAccum, BlockInfo,
-    BlockKind, HeaderMeta, InspectReport, OrderingSegment, ScanState,
+    BlockAccum, BlockInfo, BlockKind, HeaderMeta, InspectReport, OrderingSegment, ScanState,
+    classify_block, is_standard_ordering, update_extended_for_element,
 };
-use crate::blob::{decode_blob_to_headerblock, decompress_blob_data_into, BlobKind};
+use crate::blob::{BlobKind, decode_blob_to_headerblock, decompress_blob_data_into};
 use crate::blob_meta::ElemKind;
 use crate::file_reader::FileReader;
 use crate::read::header_walker::HeaderWalker;
+use crate::read::raw_frame::read_raw_frame;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -31,13 +31,19 @@ pub fn inspect(
     // --locations and --extended require per-element data, so they need full decode.
     if !show_locations
         && !extended
-        && let Some(report) =
-            try_index_only_scan(path, show_blocks, show_id_ranges, direct_io)?
+        && let Some(report) = try_index_only_scan(path, show_blocks, show_id_ranges, direct_io)?
     {
         return Ok(report);
     }
 
-    full_decode_scan(path, show_blocks, show_id_ranges, show_locations, extended, direct_io)
+    full_decode_scan(
+        path,
+        show_blocks,
+        show_id_ranges,
+        show_locations,
+        extended,
+        direct_io,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -202,7 +208,9 @@ pub(super) fn extract_header_metadata(header: &crate::HeaderBlock) -> HeaderMeta
             .iter()
             .map(ToString::to_string)
             .collect(),
-        bbox: header.bbox().map(|bb| (bb.left, bb.bottom, bb.right, bb.top)),
+        bbox: header
+            .bbox()
+            .map(|bb| (bb.left, bb.bottom, bb.right, bb.top)),
         replication_timestamp: header.osmosis_replication_timestamp(),
         replication_sequence: header.osmosis_replication_sequence_number(),
         replication_url: header.osmosis_replication_base_url().map(String::from),
@@ -254,7 +262,15 @@ fn full_decode_scan(
                     indexed_blobs += 1;
                 }
                 block_number += 1;
-                scan_data_blob(&frame, &mut decompress_buf, &mut st_scratch, &mut gr_scratch, &mut state, block_number, &mut accum)?;
+                scan_data_blob(
+                    &frame,
+                    &mut decompress_buf,
+                    &mut st_scratch,
+                    &mut gr_scratch,
+                    &mut state,
+                    block_number,
+                    &mut accum,
+                )?;
             }
             BlobKind::Unknown(_) => {}
         }

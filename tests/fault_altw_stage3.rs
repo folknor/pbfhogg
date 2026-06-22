@@ -13,14 +13,11 @@ mod common;
 mod altw_external_stage3 {
     use std::sync::atomic::Ordering;
 
-    use pbfhogg::altw::{
-        add_locations_to_ways, external_test_hooks as altw_hooks, IndexType,
-    };
+    use pbfhogg::altw::{IndexType, add_locations_to_ways, external_test_hooks as altw_hooks};
     use pbfhogg::writer::Compression;
 
     use crate::common::{
-        TestNode, TestWay, generate_nodes, generate_ways, snapshot_dir,
-        write_multi_block_test_pbf,
+        TestNode, TestWay, generate_nodes, generate_ways, snapshot_dir, write_multi_block_test_pbf,
     };
 
     /// A stage-3 worker panic during altw external join must surface
@@ -78,9 +75,7 @@ mod altw_external_stage3 {
         after.remove(std::path::Path::new("out.osm.pbf"));
         let scratch_leaks: Vec<_> = after
             .difference(&before)
-            .filter(|p| {
-                p.to_string_lossy().contains("external-join")
-            })
+            .filter(|p| p.to_string_lossy().contains("external-join"))
             .collect();
         assert!(
             scratch_leaks.is_empty(),

@@ -248,12 +248,9 @@ impl DrainItem {
             DrainItem::CopyRange { tagdata, .. } => {
                 DESCRIPTOR_OVERHEAD + tagdata.as_ref().map_or(0, |t| t.len())
             }
-            DrainItem::OwnedBytes { frame_bytes, .. } => {
-                DESCRIPTOR_OVERHEAD + frame_bytes.len()
-            }
+            DrainItem::OwnedBytes { frame_bytes, .. } => DESCRIPTOR_OVERHEAD + frame_bytes.len(),
             DrainItem::Rewritten { framed_chunks, .. } => {
-                DESCRIPTOR_OVERHEAD
-                    + framed_chunks.iter().map(Vec::len).sum::<usize>()
+                DESCRIPTOR_OVERHEAD + framed_chunks.iter().map(Vec::len).sum::<usize>()
             }
         }
     }

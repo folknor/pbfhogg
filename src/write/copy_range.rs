@@ -83,9 +83,7 @@ fn copy_range_fallback(
     // Read from in_fd using pread (doesn't change file position).
     while len > 0 {
         let chunk = buf.len().min(len as usize);
-        let n = unsafe {
-            libc::pread(in_fd, buf.as_mut_ptr().cast(), chunk, offset as i64)
-        };
+        let n = unsafe { libc::pread(in_fd, buf.as_mut_ptr().cast(), chunk, offset as i64) };
         if n < 0 {
             return Err(io::Error::last_os_error());
         }

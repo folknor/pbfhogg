@@ -12,10 +12,10 @@ use crate::writer::PbfWriter;
 
 use crate::commands::{ensure_node_capacity, flush_block};
 
+use super::Result;
 use super::diff_ranges::{DiffRanges, UpsertCursors};
 use super::element_writes::{write_osc_relation, write_osc_way};
 use super::stats::MergeStats;
-use super::Result;
 
 /// Emit a single create element via PbfWriter (for gap creates and trailing creates).
 #[allow(clippy::too_many_arguments)]
@@ -32,7 +32,13 @@ pub(super) fn emit_create_for_output(
         ElemKind::Node => {
             if let Some(osc) = diff.get_node(id) {
                 ensure_node_capacity(bb, writer)?;
-                bb.add_node(osc.id(), osc.decimicro_lat(), osc.decimicro_lon(), osc.tags(), None);
+                bb.add_node(
+                    osc.id(),
+                    osc.decimicro_lat(),
+                    osc.decimicro_lon(),
+                    osc.tags(),
+                    None,
+                );
                 stats.diff_nodes += 1;
             }
         }
@@ -79,7 +85,15 @@ pub(super) fn flush_remaining_upserts(
     if prev == ElemKind::Node && next == ElemKind::Relation {
         let (cursor, upserts) = cursors.get_mut(ElemKind::Way, ranges);
         while *cursor < upserts.len() {
-            emit_create_for_output(upserts[*cursor], ElemKind::Way, diff, bb, writer, stats, loc_map)?;
+            emit_create_for_output(
+                upserts[*cursor],
+                ElemKind::Way,
+                diff,
+                bb,
+                writer,
+                stats,
+                loc_map,
+            )?;
             *cursor += 1;
         }
         flush_block(bb, writer)?;
@@ -103,7 +117,15 @@ pub(super) fn emit_gap_creates(
 ) -> Result<()> {
     let (cursor, upserts) = cursors.get_mut(blob_kind, ranges);
     while *cursor < upserts.len() && crate::osm_id::osm_id_cmp(upserts[*cursor], min_id).is_lt() {
-        emit_create_for_output(upserts[*cursor], blob_kind, diff, bb, writer, stats, loc_map)?;
+        emit_create_for_output(
+            upserts[*cursor],
+            blob_kind,
+            diff,
+            bb,
+            writer,
+            stats,
+            loc_map,
+        )?;
         *cursor += 1;
     }
     Ok(())

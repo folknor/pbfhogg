@@ -11,8 +11,8 @@
 mod common;
 
 use common::{
-    assert_elements_equivalent, generate_nodes, generate_relations, generate_ways,
-    write_multi_block_test_pbf, write_test_pbf_sorted, TestMember, TestNode, TestRelation,
+    TestMember, TestNode, TestRelation, assert_elements_equivalent, generate_nodes,
+    generate_relations, generate_ways, write_multi_block_test_pbf, write_test_pbf_sorted,
 };
 use pbfhogg::MemberId;
 use pbfhogg::writer::Compression;
@@ -40,7 +40,10 @@ fn sample_fixture(path: &Path) {
     }
     let relations = vec![TestRelation {
         id: 100,
-        members: vec![TestMember { id: MemberId::Way(1_000), role: "outer" }],
+        members: vec![TestMember {
+            id: MemberId::Way(1_000),
+            role: "outer",
+        }],
         tags: vec![("type", "multipolygon")],
         meta: None,
     }];
@@ -92,8 +95,7 @@ fn extract_simple_idempotence() {
     let twice = dir.path().join("twice.osm.pbf");
     sample_fixture(&input);
 
-    let bbox = pbfhogg::commands::extract::parse_bbox("0.0,0.0,0.002,0.002")
-        .expect("parse bbox");
+    let bbox = pbfhogg::commands::extract::parse_bbox("0.0,0.0,0.002,0.002").expect("parse bbox");
     let region = pbfhogg::commands::extract::Region::Bbox(bbox);
 
     let extract = |input: &Path, output: &Path| {
@@ -167,7 +169,10 @@ fn derive_then_apply_roundtrip() {
     }
     let relations = vec![TestRelation {
         id: 100,
-        members: vec![TestMember { id: MemberId::Way(1_000), role: "outer" }],
+        members: vec![TestMember {
+            id: MemberId::Way(1_000),
+            role: "outer",
+        }],
         tags: vec![("type", "multipolygon")],
         meta: None,
     }];
@@ -175,11 +180,7 @@ fn derive_then_apply_roundtrip() {
 
     // derive_changes(base, modified) -> delta.osc.gz
     let stats = pbfhogg::diff::derive::derive_changes(
-        &base,
-        &modified,
-        &osc,
-        false,
-        true, // increment_version
+        &base, &modified, &osc, false, true, // increment_version
         true, // update_timestamp
         1,
     )
@@ -200,8 +201,14 @@ fn derive_then_apply_roundtrip() {
         #[cfg(feature = "test-hooks")]
         panic_at_blob_seq: None,
     };
-    pbfhogg::apply_changes::merge(&base, &osc, &reconstructed, &opts, &pbfhogg::HeaderOverrides::default())
-        .expect("apply_changes");
+    pbfhogg::apply_changes::merge(
+        &base,
+        &osc,
+        &reconstructed,
+        &opts,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("apply_changes");
 
     assert_elements_equivalent(&modified, &reconstructed);
 }
@@ -378,16 +385,31 @@ fn diff_blob_layout_independence() {
 
     // All four pairings compare the same logical content, so common
     // element count must match; differences must be zero.
-    assert_eq!(s_1_1.common, s_100_100.common, "common stats diverge with layout");
-    assert_eq!(s_1_100.common, s_100_100.common, "cross-layout common stats diverge");
+    assert_eq!(
+        s_1_1.common, s_100_100.common,
+        "common stats diverge with layout"
+    );
+    assert_eq!(
+        s_1_100.common, s_100_100.common,
+        "cross-layout common stats diverge"
+    );
     for (label, s) in [
         ("bs=1 vs bs=1", &s_1_1),
         ("bs=1 vs bs=100", &s_1_100),
         ("bs=100 vs bs=100", &s_100_100),
     ] {
-        assert_eq!(s.created, 0, "{label}: same-content diff must have no created");
-        assert_eq!(s.modified, 0, "{label}: same-content diff must have no modified");
-        assert_eq!(s.deleted, 0, "{label}: same-content diff must have no deleted");
+        assert_eq!(
+            s.created, 0,
+            "{label}: same-content diff must have no created"
+        );
+        assert_eq!(
+            s.modified, 0,
+            "{label}: same-content diff must have no modified"
+        );
+        assert_eq!(
+            s.deleted, 0,
+            "{label}: same-content diff must have no deleted"
+        );
     }
 }
 
@@ -410,8 +432,16 @@ fn sort_compression_level_parity() {
 
     let outputs = [
         ("none", Compression::None, dir.path().join("none.osm.pbf")),
-        ("zlib6", Compression::Zlib(6), dir.path().join("zlib6.osm.pbf")),
-        ("zstd3", Compression::Zstd(3), dir.path().join("zstd3.osm.pbf")),
+        (
+            "zlib6",
+            Compression::Zlib(6),
+            dir.path().join("zlib6.osm.pbf"),
+        ),
+        (
+            "zstd3",
+            Compression::Zstd(3),
+            dir.path().join("zstd3.osm.pbf"),
+        ),
     ];
 
     for (_label, compression, path) in &outputs {
@@ -439,8 +469,16 @@ fn tags_filter_compression_level_parity() {
     let exprs = vec!["w/building=yes".to_string()];
     let outputs = [
         ("none", Compression::None, dir.path().join("none.osm.pbf")),
-        ("zlib6", Compression::Zlib(6), dir.path().join("zlib6.osm.pbf")),
-        ("zstd3", Compression::Zstd(3), dir.path().join("zstd3.osm.pbf")),
+        (
+            "zlib6",
+            Compression::Zlib(6),
+            dir.path().join("zlib6.osm.pbf"),
+        ),
+        (
+            "zstd3",
+            Compression::Zstd(3),
+            dir.path().join("zstd3.osm.pbf"),
+        ),
     ];
 
     for (_label, compression, path) in &outputs {
@@ -454,8 +492,13 @@ fn tags_filter_compression_level_parity() {
             force: true,
             jobs: None,
         };
-        pbfhogg::tags_filter::tags_filter(&input, path, &opts, &pbfhogg::HeaderOverrides::default())
-            .expect("tags_filter");
+        pbfhogg::tags_filter::tags_filter(
+            &input,
+            path,
+            &opts,
+            &pbfhogg::HeaderOverrides::default(),
+        )
+        .expect("tags_filter");
     }
 
     assert_elements_equivalent(&outputs[0].2, &outputs[1].2);

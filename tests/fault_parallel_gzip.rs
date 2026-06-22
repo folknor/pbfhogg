@@ -59,10 +59,7 @@ mod parallel_gzip {
                 let acceptable = msg.contains("parallel gzip worker panicked")
                     || msg.contains("chunks missing at seq")
                     || msg.contains("worker pool dropped");
-                assert!(
-                    acceptable,
-                    "unexpected error message from finish(): {msg}"
-                );
+                assert!(acceptable, "unexpected error message from finish(): {msg}");
             }
             Err(_) => {
                 // Also acceptable: the panic propagates directly

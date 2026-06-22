@@ -173,18 +173,12 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>) -> Result<u64> {
             // Convert directly to a DrainItem for the splice channel.
             // `into_drain_copy_range` requires indexdata, which we just
             // verified.
-            ScannerEmit::Drain(
-                descriptor
-                    .into_drain_copy_range()
-                    .ok_or_else(|| {
-                        crate::error::new_error(crate::error::ErrorKind::Io(
-                            std::io::Error::other(
-                                "scanner: fast-path descriptor missing indexdata - \
+            ScannerEmit::Drain(descriptor.into_drain_copy_range().ok_or_else(|| {
+                crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
+                    "scanner: fast-path descriptor missing indexdata - \
                                  should be unreachable",
-                            ),
-                        ))
-                    })?,
-            )
+                )))
+            })?)
         } else if !low_node_must_decompress
             && has_indexdata
             && !ranges.range_overlaps(
@@ -217,9 +211,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>) -> Result<u64> {
             // back. Send happens before the buffer push so the drain
             // can pre-receive even while workers are still processing
             // queued Node candidates.
-            if !last_node_seq_sent
-                && let Some(tx) = last_node_seq_tx.as_ref()
-            {
+            if !last_node_seq_sent && let Some(tx) = last_node_seq_tx.as_ref() {
                 let payload = last_node_seq.unwrap_or(u64::MAX);
                 tx.send(payload).map_err(send_err)?;
                 last_node_seq_sent = true;
@@ -282,9 +274,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>) -> Result<u64> {
     // unblocks us when the drain has no buffered items but the
     // barrier condition is met. Do not remove the idle-fire without
     // also rewriting this wait.
-    if !barrier_open
-        && let Some(ref rx) = barrier_rx
-    {
+    if !barrier_open && let Some(ref rx) = barrier_rx {
         crate::debug::emit_marker("MERGE_SCANNER_BARRIER_WAIT_START");
         rx.recv().map_err(|_| {
             crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(

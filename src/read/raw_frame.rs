@@ -11,10 +11,10 @@
 
 use std::io::Read;
 
-use crate::blob::{parse_blob_header_with_index, BlobKind, MAX_BLOB_HEADER_SIZE};
+use crate::BoxResult as Result;
+use crate::blob::{BlobKind, MAX_BLOB_HEADER_SIZE, parse_blob_header_with_index};
 use crate::blob_meta::BlobIndex;
 use crate::file_reader::FileReader;
-use crate::BoxResult as Result;
 
 /// A raw blob frame for passthrough or selective decode.
 ///
@@ -68,17 +68,18 @@ pub(crate) fn read_raw_frame<R: Read>(
     // forces the `vec![0u8; header_len]` allocation below into a
     // multi-GB alloc that aborts the process.
     if header_len as u64 >= MAX_BLOB_HEADER_SIZE {
-        return Err(crate::error::new_blob_error(
-            crate::error::BlobError::HeaderTooBig { size: header_len as u64 },
-        )
-        .into());
+        return Err(
+            crate::error::new_blob_error(crate::error::BlobError::HeaderTooBig {
+                size: header_len as u64,
+            })
+            .into(),
+        );
     }
 
     let mut header_bytes = vec![0u8; header_len];
     reader.read_exact(&mut header_bytes)?;
 
-    let (blob_type, data_size, raw_index, tagdata) =
-        parse_blob_header_with_index(&header_bytes)?;
+    let (blob_type, data_size, raw_index, tagdata) = parse_blob_header_with_index(&header_bytes)?;
     let index = raw_index.and_then(|ref data| BlobIndex::deserialize(data));
 
     let blob_offset = 4 + header_len;
@@ -135,17 +136,18 @@ pub(crate) fn read_blob_header_only(
     // Match BlobReader's MAX_BLOB_HEADER_SIZE guard (blob.rs:390).
     // See `read_raw_frame` above for the same guard's rationale.
     if header_len as u64 >= MAX_BLOB_HEADER_SIZE {
-        return Err(crate::error::new_blob_error(
-            crate::error::BlobError::HeaderTooBig { size: header_len as u64 },
-        )
-        .into());
+        return Err(
+            crate::error::new_blob_error(crate::error::BlobError::HeaderTooBig {
+                size: header_len as u64,
+            })
+            .into(),
+        );
     }
 
     let mut header_bytes = vec![0u8; header_len];
     reader.read_exact(&mut header_bytes)?;
 
-    let (blob_type, data_size, raw_index, _tagdata) =
-        parse_blob_header_with_index(&header_bytes)?;
+    let (blob_type, data_size, raw_index, _tagdata) = parse_blob_header_with_index(&header_bytes)?;
     let index = raw_index.and_then(|ref data| BlobIndex::deserialize(data));
 
     *file_offset += (4 + header_len) as u64;

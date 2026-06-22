@@ -15,7 +15,7 @@ mod geocode_pass3 {
 
     use pbfhogg::block_builder::{self, BlockBuilder};
     use pbfhogg::geocode_index::builder::{
-        build_geocode_index, pass3_test_hooks as pass3_hooks, BuildConfig,
+        BuildConfig, build_geocode_index, pass3_test_hooks as pass3_hooks,
     };
     use pbfhogg::writer::{Compression, PbfWriter};
 

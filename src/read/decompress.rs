@@ -9,9 +9,9 @@ use bytes::Bytes;
 use flate2::Decompress;
 use std::cell::RefCell;
 
-use crate::error::{new_blob_error, new_error, BlobError, ErrorKind, Result};
+use crate::error::{BlobError, ErrorKind, Result, new_blob_error, new_error};
 
-use super::blob_wire::{BlobData, WireBlob, MAX_BLOB_MESSAGE_SIZE};
+use super::blob_wire::{BlobData, MAX_BLOB_MESSAGE_SIZE, WireBlob};
 
 thread_local! {
     /// Per-thread reusable zlib decompressor state (~32 KB inflate tables).
@@ -251,7 +251,9 @@ pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<
             2 => {
                 // raw_size: int32
                 #[allow(clippy::cast_possible_truncation)]
-                { raw_size = Some(cursor.read_varint()? as i32); }
+                {
+                    raw_size = Some(cursor.read_varint()? as i32);
+                }
             }
             3 => {
                 // zlib_data: bytes
@@ -285,7 +287,11 @@ pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<
         }
     }
 
-    if found { Ok(()) } else { Err(new_blob_error(BlobError::Empty)) }
+    if found {
+        Ok(())
+    } else {
+        Err(new_blob_error(BlobError::Empty))
+    }
 }
 
 /// Decompress a parsed WireBlob into an owned `Bytes`.
@@ -341,12 +347,16 @@ pub(crate) fn decompress_wire_blob_into(blob: &WireBlob, buf: &mut Vec<u8>) -> R
         }
         Some(BlobData::Zlib(bytes)) => {
             let est = blob.estimated_capacity();
-            if est > 0 { buf.reserve(est); }
+            if est > 0 {
+                buf.reserve(est);
+            }
             zlib_decompress_into(bytes, buf)?;
         }
         Some(BlobData::Zstd(bytes)) => {
             let est = blob.estimated_capacity();
-            if est > 0 { buf.reserve(est); }
+            if est > 0 {
+                buf.reserve(est);
+            }
             zstd::stream::copy_decode(Cursor::new(&**bytes), &mut *buf)?;
             let size = buf.len() as u64;
             if size > MAX_BLOB_MESSAGE_SIZE {

@@ -3,14 +3,14 @@
 mod common;
 
 use common::{
-    node_ids_id_only as node_ids, read_all_elements_id_only as read_all_elements,
-    way_ids_id_only as way_ids, relation_ids_id_only as relation_ids,
-    write_test_pbf, TestMember, TestNode, TestRelation, TestWay,
+    TestMember, TestNode, TestRelation, TestWay, node_ids_id_only as node_ids,
+    read_all_elements_id_only as read_all_elements, relation_ids_id_only as relation_ids,
+    way_ids_id_only as way_ids, write_test_pbf,
 };
-use pbfhogg::getid::parse_ids;
-use pbfhogg::getparents::{getparents, GetparentsOptions};
-use pbfhogg::writer::Compression;
 use pbfhogg::MemberId;
+use pbfhogg::getid::parse_ids;
+use pbfhogg::getparents::{GetparentsOptions, getparents};
+use pbfhogg::writer::Compression;
 use tempfile::TempDir;
 
 fn ids(strs: &[&str]) -> Vec<String> {
@@ -34,21 +34,63 @@ fn ways_referencing_node() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 120_000_000,
+                lon: 220_000_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[
-            TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")], meta: None },
-            TestWay { id: 11, refs: vec![2, 3], tags: vec![("highway", "secondary")], meta: None },
-            TestWay { id: 12, refs: vec![3], tags: vec![], meta: None },
+            TestWay {
+                id: 10,
+                refs: vec![1, 2],
+                tags: vec![("highway", "primary")],
+                meta: None,
+            },
+            TestWay {
+                id: 11,
+                refs: vec![2, 3],
+                tags: vec![("highway", "secondary")],
+                meta: None,
+            },
+            TestWay {
+                id: 12,
+                refs: vec![3],
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[],
     );
 
     // Find ways referencing node 2
     let id_set = parse_ids(&ids(&["n2"])).expect("parse ids");
-    let stats = getparents(&input, &output, &id_set, &default_opts(), Compression::default(), false, &pbfhogg::HeaderOverrides::default()).expect("getparents");
+    let stats = getparents(
+        &input,
+        &output,
+        &id_set,
+        &default_opts(),
+        Compression::default(),
+        false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("getparents");
     let c = read_all_elements(&output);
 
     // Ways 10 and 11 reference node 2
@@ -68,23 +110,35 @@ fn relations_referencing_way() {
         &input,
         &[],
         &[
-            TestWay { id: 10, refs: vec![1, 2], tags: vec![], meta: None },
-            TestWay { id: 11, refs: vec![2, 3], tags: vec![], meta: None },
+            TestWay {
+                id: 10,
+                refs: vec![1, 2],
+                tags: vec![],
+                meta: None,
+            },
+            TestWay {
+                id: 11,
+                refs: vec![2, 3],
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[
             TestRelation {
                 id: 100,
-                members: vec![
-                    TestMember { id: MemberId::Way(10), role: "outer" },
-                ],
+                members: vec![TestMember {
+                    id: MemberId::Way(10),
+                    role: "outer",
+                }],
                 tags: vec![("type", "multipolygon")],
                 meta: None,
             },
             TestRelation {
                 id: 101,
-                members: vec![
-                    TestMember { id: MemberId::Way(11), role: "inner" },
-                ],
+                members: vec![TestMember {
+                    id: MemberId::Way(11),
+                    role: "inner",
+                }],
                 tags: vec![("type", "multipolygon")],
                 meta: None,
             },
@@ -93,7 +147,16 @@ fn relations_referencing_way() {
 
     // Find relations referencing way 10
     let id_set = parse_ids(&ids(&["w10"])).expect("parse ids");
-    let stats = getparents(&input, &output, &id_set, &default_opts(), Compression::default(), false, &pbfhogg::HeaderOverrides::default()).expect("getparents");
+    let stats = getparents(
+        &input,
+        &output,
+        &id_set,
+        &default_opts(),
+        Compression::default(),
+        false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("getparents");
     let c = read_all_elements(&output);
 
     assert_eq!(relation_ids(&c), vec![100]);
@@ -110,19 +173,43 @@ fn add_self_includes_queried_objects() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "test")], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("name", "test")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
-        &[
-            TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")], meta: None },
-        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "primary")],
+            meta: None,
+        }],
         &[],
     );
 
     // Find parents of node 1 WITH --add-self
     let id_set = parse_ids(&ids(&["n1"])).expect("parse ids");
     let opts = GetparentsOptions { add_self: true };
-    let stats = getparents(&input, &output, &id_set, &opts, Compression::default(), false, &pbfhogg::HeaderOverrides::default()).expect("getparents");
+    let stats = getparents(
+        &input,
+        &output,
+        &id_set,
+        &opts,
+        Compression::default(),
+        false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("getparents");
     let c = read_all_elements(&output);
 
     // Node 1 itself + way 10 (references node 1)
@@ -140,26 +227,43 @@ fn no_transitive_relations() {
 
     write_test_pbf(
         &input,
-        &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
-        ],
-        &[
-            TestWay { id: 10, refs: vec![1], tags: vec![], meta: None },
-        ],
-        &[
-            TestRelation {
-                id: 100,
-                members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
-                tags: vec![("type", "multipolygon")],
-                meta: None,
-            },
-        ],
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![],
+            meta: None,
+        }],
+        &[TestWay {
+            id: 10,
+            refs: vec![1],
+            tags: vec![],
+            meta: None,
+        }],
+        &[TestRelation {
+            id: 100,
+            members: vec![TestMember {
+                id: MemberId::Way(10),
+                role: "outer",
+            }],
+            tags: vec![("type", "multipolygon")],
+            meta: None,
+        }],
     );
 
     // Find parents of node 1: should find way 10 but NOT relation 100
     // (relation references way, not node directly)
     let id_set = parse_ids(&ids(&["n1"])).expect("parse ids");
-    let stats = getparents(&input, &output, &id_set, &default_opts(), Compression::default(), false, &pbfhogg::HeaderOverrides::default()).expect("getparents");
+    let stats = getparents(
+        &input,
+        &output,
+        &id_set,
+        &default_opts(),
+        Compression::default(),
+        false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("getparents");
     let c = read_all_elements(&output);
 
     assert_eq!(way_ids(&c), vec![10]);
@@ -176,18 +280,34 @@ fn empty_result() {
 
     write_test_pbf(
         &input,
-        &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
-        ],
-        &[
-            TestWay { id: 10, refs: vec![1], tags: vec![], meta: None },
-        ],
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![],
+            meta: None,
+        }],
+        &[TestWay {
+            id: 10,
+            refs: vec![1],
+            tags: vec![],
+            meta: None,
+        }],
         &[],
     );
 
     // Node 999 doesn't exist - no parents found
     let id_set = parse_ids(&ids(&["n999"])).expect("parse ids");
-    let stats = getparents(&input, &output, &id_set, &default_opts(), Compression::default(), false, &pbfhogg::HeaderOverrides::default()).expect("getparents");
+    let stats = getparents(
+        &input,
+        &output,
+        &id_set,
+        &default_opts(),
+        Compression::default(),
+        false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("getparents");
 
     assert_eq!(stats.nodes_written, 0);
     assert_eq!(stats.ways_written, 0);

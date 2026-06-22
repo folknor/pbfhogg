@@ -18,12 +18,12 @@ use quick_xml::name::QName;
 use quick_xml::{Reader, Writer};
 use rayon::prelude::*;
 
-use crate::osc::write::{
-    OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay,
-    write_node_xml, write_way_xml, write_relation_xml, write_delete_xml,
-};
 use super::Result;
 use crate::MemberId;
+use crate::osc::write::{
+    OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay, write_delete_xml,
+    write_node_xml, write_relation_xml, write_way_xml,
+};
 
 /// Wraps an `io::Read` and accumulates wall time spent in `read()` calls.
 ///
@@ -238,12 +238,11 @@ pub fn merge_changes(
         if simplify {
             let stream = build_simplify_stream(inputs)?;
             let changes_in = stream.changes.len() as u64;
-            let changes_out = write_simplified(output, stream, worker_count)
-                .map_err(|e| e.to_string())? as u64;
+            let changes_out =
+                write_simplified(output, stream, worker_count).map_err(|e| e.to_string())? as u64;
             Ok((changes_in, changes_out))
         } else {
-            let changes_out =
-                write_streaming(inputs, output).map_err(|e| e.to_string())?;
+            let changes_out = write_streaming(inputs, output).map_err(|e| e.to_string())?;
             Ok((changes_out, changes_out))
         }
     };
@@ -549,7 +548,9 @@ fn parse_str_attr(e: &BytesStart<'_>, name: &[u8]) -> Result<String> {
     for attr in e.attributes() {
         let attr = attr?;
         if attr.key == QName(name) {
-            return Ok(attr.unescape_value()?.into_owned());
+            return Ok(attr
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)?
+                .into_owned());
         }
     }
     Err(format!("missing attribute '{}'", String::from_utf8_lossy(name)).into())
@@ -558,7 +559,10 @@ fn parse_str_attr(e: &BytesStart<'_>, name: &[u8]) -> Result<String> {
 fn parse_str_attr_optional(e: &BytesStart<'_>, name: &[u8]) -> Option<String> {
     for attr in e.attributes().flatten() {
         if attr.key == QName(name) {
-            return attr.unescape_value().ok().map(std::borrow::Cow::into_owned);
+            return attr
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .ok()
+                .map(std::borrow::Cow::into_owned);
         }
     }
     None
@@ -814,12 +818,24 @@ fn parse_osc_streaming<W: io::Write>(
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 handle_start_like_streaming(
-                    e, false, &mut section, &mut current, writer, open_action, count,
+                    e,
+                    false,
+                    &mut section,
+                    &mut current,
+                    writer,
+                    open_action,
+                    count,
                 )?;
             }
             Ok(Event::Empty(ref e)) => {
                 handle_start_like_streaming(
-                    e, true, &mut section, &mut current, writer, open_action, count,
+                    e,
+                    true,
+                    &mut section,
+                    &mut current,
+                    writer,
+                    open_action,
+                    count,
                 )?;
             }
             Ok(Event::End(ref e)) => match e.name().as_ref() {
@@ -964,11 +980,7 @@ fn emit_change<W: io::Write>(
 }
 
 #[hotpath::measure]
-fn write_simplified(
-    output: &Path,
-    stream: ChangeStream,
-    worker_count: usize,
-) -> Result<usize> {
+fn write_simplified(output: &Path, stream: ChangeStream, worker_count: usize) -> Result<usize> {
     crate::debug::emit_marker("MERGECHANGES_SIMPLIFY_START");
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("merge_changes_changes_in", stream.changes.len() as i64);
@@ -1092,4 +1104,3 @@ fn write_change_element<W: Write>(
         }
     }
 }
-

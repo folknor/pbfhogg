@@ -42,9 +42,9 @@ use std::path::Path;
 
 use common::cli::{CliInvoker, CliOutput};
 use common::{
-    node_ids_with_coords as node_ids, read_all_elements_with_coords as read_all_elements,
-    relation_ids_with_coords as relation_ids, way_ids_with_coords as way_ids, write_test_pbf_sorted,
-    TestMember, TestNode, TestRelation, TestWay,
+    TestMember, TestNode, TestRelation, TestWay, node_ids_with_coords as node_ids,
+    read_all_elements_with_coords as read_all_elements, relation_ids_with_coords as relation_ids,
+    way_ids_with_coords as way_ids, write_test_pbf_sorted,
 };
 use flate2::write::GzEncoder;
 use pbfhogg::block_builder::{self, BlockBuilder};
@@ -117,20 +117,48 @@ fn merge_basic_create_modify_delete() {
     write_test_pbf_sorted(
         &base,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "one")], meta: None },
-            TestNode { id: 2, lat: 300_000_000, lon: 400_000_000, tags: vec![("name", "two")], meta: None },
-            TestNode { id: 3, lat: 500_000_000, lon: 600_000_000, tags: vec![("name", "three")], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("name", "one")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 300_000_000,
+                lon: 400_000_000,
+                tags: vec![("name", "two")],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 500_000_000,
+                lon: 600_000_000,
+                tags: vec![("name", "three")],
+                meta: None,
+            },
         ],
-        &[TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "road")], meta: None }],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2, 3],
+            tags: vec![("highway", "road")],
+            meta: None,
+        }],
         &[TestRelation {
             id: 100,
-            members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+            members: vec![TestMember {
+                id: MemberId::Way(10),
+                role: "outer",
+            }],
             tags: vec![("type", "multipolygon")],
             meta: None,
         }],
     );
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <create>
     <node id="4" lat="55.0" lon="12.0" version="1">
@@ -150,7 +178,8 @@ fn merge_basic_create_modify_delete() {
   <delete>
     <node id="3" version="2"/>
   </delete>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     let out = run_apply_ok(&base, &osc, &output);
     let c = read_all_elements(&output);
@@ -161,17 +190,26 @@ fn merge_basic_create_modify_delete() {
     assert_eq!(c.nodes[0].3, vec![("name".to_string(), "one".to_string())]);
     assert_eq!(c.nodes[1].1, 350_000_000);
     assert_eq!(c.nodes[1].2, 450_000_000);
-    assert_eq!(c.nodes[1].3, vec![("name".to_string(), "two-modified".to_string())]);
+    assert_eq!(
+        c.nodes[1].3,
+        vec![("name".to_string(), "two-modified".to_string())]
+    );
     assert_eq!(c.nodes[2].1, 550_000_000);
     assert_eq!(c.nodes[2].2, 120_000_000);
     assert_eq!(c.nodes[2].3, vec![("name".to_string(), "four".to_string())]);
 
     assert_eq!(way_ids(&c), vec![10]);
     assert_eq!(c.ways[0].1, vec![1, 2]);
-    assert_eq!(c.ways[0].2, vec![("highway".to_string(), "primary".to_string())]);
+    assert_eq!(
+        c.ways[0].2,
+        vec![("highway".to_string(), "primary".to_string())]
+    );
 
     assert_eq!(relation_ids(&c), vec![100]);
-    assert_eq!(c.relations[0].2, vec![("type".to_string(), "multipolygon".to_string())]);
+    assert_eq!(
+        c.relations[0].2,
+        vec![("type".to_string(), "multipolygon".to_string())]
+    );
 
     assert!(
         out.stderr_str().contains("Deleted: 1"),
@@ -190,21 +228,42 @@ fn merge_create_between_existing_ids() {
     write_test_pbf_sorted(
         &base,
         &[
-            TestNode { id: 10, lat: 0, lon: 0, tags: vec![], meta: None },
-            TestNode { id: 20, lat: 0, lon: 0, tags: vec![], meta: None },
-            TestNode { id: 30, lat: 0, lon: 0, tags: vec![], meta: None },
+            TestNode {
+                id: 10,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 20,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 30,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[],
         &[],
     );
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <create>
     <node id="15" lat="1.0" lon="2.0" version="1"/>
     <node id="25" lat="3.0" lon="4.0" version="1"/>
   </create>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     run_apply_ok(&base, &osc, &output);
     let c = read_all_elements(&output);
@@ -228,15 +287,35 @@ fn merge_create_beyond_max_id() {
     write_test_pbf_sorted(
         &base,
         &[
-            TestNode { id: 1, lat: 0, lon: 0, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 0, lon: 0, tags: vec![], meta: None },
-            TestNode { id: 3, lat: 0, lon: 0, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[],
         &[],
     );
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <create>
     <node id="100" lat="10.0" lon="20.0" version="1">
@@ -244,7 +323,8 @@ fn merge_create_beyond_max_id() {
     </node>
     <node id="200" lat="30.0" lon="40.0" version="1"/>
   </create>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     run_apply_ok(&base, &osc, &output);
     let c = read_all_elements(&output);
@@ -274,24 +354,68 @@ fn merge_multi_block_partial_rewrite() {
         let mut bb = BlockBuilder::new();
 
         bb.add_node(1, 100_000_000, 100_000_000, [("block", "1")], None);
-        bb.add_node(2, 200_000_000, 200_000_000, std::iter::empty::<(&str, &str)>(), None);
-        bb.add_node(3, 300_000_000, 300_000_000, std::iter::empty::<(&str, &str)>(), None);
-        writer.write_primitive_block(bb.take().expect("take").expect("bytes")).expect("write");
+        bb.add_node(
+            2,
+            200_000_000,
+            200_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+        bb.add_node(
+            3,
+            300_000_000,
+            300_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
+            .expect("write");
 
         bb.add_node(10, 100_000_000, 100_000_000, [("name", "old")], None);
-        bb.add_node(11, 110_000_000, 110_000_000, std::iter::empty::<(&str, &str)>(), None);
-        bb.add_node(12, 120_000_000, 120_000_000, std::iter::empty::<(&str, &str)>(), None);
-        writer.write_primitive_block(bb.take().expect("take").expect("bytes")).expect("write");
+        bb.add_node(
+            11,
+            110_000_000,
+            110_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+        bb.add_node(
+            12,
+            120_000_000,
+            120_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
+            .expect("write");
 
         bb.add_node(20, 200_000_000, 200_000_000, [("block", "3")], None);
-        bb.add_node(21, 210_000_000, 210_000_000, std::iter::empty::<(&str, &str)>(), None);
-        bb.add_node(22, 220_000_000, 220_000_000, std::iter::empty::<(&str, &str)>(), None);
-        writer.write_primitive_block(bb.take().expect("take").expect("bytes")).expect("write");
+        bb.add_node(
+            21,
+            210_000_000,
+            210_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+        bb.add_node(
+            22,
+            220_000_000,
+            220_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
+            .expect("write");
 
         writer.flush().expect("flush");
     }
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <modify>
     <node id="10" lat="99.0" lon="99.0" version="2">
@@ -301,19 +425,36 @@ fn merge_multi_block_partial_rewrite() {
   <delete>
     <node id="11" version="2"/>
   </delete>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     let out = run_apply_ok(&base, &osc, &output);
     let c = read_all_elements(&output);
 
-    assert_eq!(c.nodes[0], (1, 100_000_000, 100_000_000, vec![("block".to_string(), "1".to_string())]));
+    assert_eq!(
+        c.nodes[0],
+        (
+            1,
+            100_000_000,
+            100_000_000,
+            vec![("block".to_string(), "1".to_string())]
+        )
+    );
     assert_eq!(c.nodes[1].0, 2);
     assert_eq!(c.nodes[2].0, 3);
     assert_eq!(c.nodes[3].0, 10);
     assert_eq!(c.nodes[3].1, 990_000_000);
     assert_eq!(c.nodes[3].3, vec![("name".to_string(), "new".to_string())]);
     assert_eq!(c.nodes[4].0, 12);
-    assert_eq!(c.nodes[5], (20, 200_000_000, 200_000_000, vec![("block".to_string(), "3".to_string())]));
+    assert_eq!(
+        c.nodes[5],
+        (
+            20,
+            200_000_000,
+            200_000_000,
+            vec![("block".to_string(), "3".to_string())]
+        )
+    );
     assert_eq!(c.nodes[6].0, 21);
     assert_eq!(c.nodes[7].0, 22);
     assert_eq!(c.nodes.len(), 8);
@@ -336,25 +477,56 @@ fn merge_nodes_only_diff_ways_passthrough() {
     write_test_pbf_sorted(
         &base,
         &[
-            TestNode { id: 1, lat: 0, lon: 0, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 100_000_000, lon: 100_000_000, tags: vec![("old", "tag")], meta: None },
-            TestNode { id: 3, lat: 0, lon: 0, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 100_000_000,
+                lon: 100_000_000,
+                tags: vec![("old", "tag")],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[
-            TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "path")], meta: None },
-            TestWay { id: 20, refs: vec![3, 2, 1], tags: vec![("building", "yes")], meta: None },
+            TestWay {
+                id: 10,
+                refs: vec![1, 2, 3],
+                tags: vec![("highway", "path")],
+                meta: None,
+            },
+            TestWay {
+                id: 20,
+                refs: vec![3, 2, 1],
+                tags: vec![("building", "yes")],
+                meta: None,
+            },
         ],
         &[],
     );
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <modify>
     <node id="2" lat="11.0" lon="22.0" version="2">
       <tag k="new" v="tag"/>
     </node>
   </modify>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     run_apply_ok(&base, &osc, &output);
     let c = read_all_elements(&output);
@@ -364,9 +536,15 @@ fn merge_nodes_only_diff_ways_passthrough() {
     assert_eq!(c.nodes[1].3, vec![("new".to_string(), "tag".to_string())]);
     assert_eq!(way_ids(&c), vec![10, 20]);
     assert_eq!(c.ways[0].1, vec![1, 2, 3]);
-    assert_eq!(c.ways[0].2, vec![("highway".to_string(), "path".to_string())]);
+    assert_eq!(
+        c.ways[0].2,
+        vec![("highway".to_string(), "path".to_string())]
+    );
     assert_eq!(c.ways[1].1, vec![3, 2, 1]);
-    assert_eq!(c.ways[1].2, vec![("building".to_string(), "yes".to_string())]);
+    assert_eq!(
+        c.ways[1].2,
+        vec![("building".to_string(), "yes".to_string())]
+    );
 }
 
 #[test]
@@ -379,18 +557,47 @@ fn merge_ways_only_diff() {
     write_test_pbf_sorted(
         &base,
         &[
-            TestNode { id: 1, lat: 0, lon: 0, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 0, lon: 0, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[
-            TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "road")], meta: None },
-            TestWay { id: 20, refs: vec![2, 1], tags: vec![("name", "delete me")], meta: None },
-            TestWay { id: 30, refs: vec![1, 2, 1], tags: vec![("building", "yes")], meta: None },
+            TestWay {
+                id: 10,
+                refs: vec![1, 2],
+                tags: vec![("highway", "road")],
+                meta: None,
+            },
+            TestWay {
+                id: 20,
+                refs: vec![2, 1],
+                tags: vec![("name", "delete me")],
+                meta: None,
+            },
+            TestWay {
+                id: 30,
+                refs: vec![1, 2, 1],
+                tags: vec![("building", "yes")],
+                meta: None,
+            },
         ],
         &[],
     );
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <create>
     <way id="15" version="1">
@@ -402,16 +609,23 @@ fn merge_ways_only_diff() {
   <delete>
     <way id="20" version="2"/>
   </delete>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     run_apply_ok(&base, &osc, &output);
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 2]);
     assert_eq!(way_ids(&c), vec![10, 15, 30]);
-    assert_eq!(c.ways[0].2, vec![("highway".to_string(), "road".to_string())]);
+    assert_eq!(
+        c.ways[0].2,
+        vec![("highway".to_string(), "road".to_string())]
+    );
     assert_eq!(c.ways[1].2, vec![("new".to_string(), "way".to_string())]);
-    assert_eq!(c.ways[2].2, vec![("building".to_string(), "yes".to_string())]);
+    assert_eq!(
+        c.ways[2].2,
+        vec![("building".to_string(), "yes".to_string())]
+    );
 }
 
 #[test]
@@ -423,25 +637,44 @@ fn merge_relations_only_diff() {
 
     write_test_pbf_sorted(
         &base,
-        &[TestNode { id: 1, lat: 0, lon: 0, tags: vec![], meta: None }],
-        &[TestWay { id: 10, refs: vec![1], tags: vec![], meta: None }],
+        &[TestNode {
+            id: 1,
+            lat: 0,
+            lon: 0,
+            tags: vec![],
+            meta: None,
+        }],
+        &[TestWay {
+            id: 10,
+            refs: vec![1],
+            tags: vec![],
+            meta: None,
+        }],
         &[
             TestRelation {
                 id: 100,
-                members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+                members: vec![TestMember {
+                    id: MemberId::Way(10),
+                    role: "outer",
+                }],
                 tags: vec![("type", "multipolygon")],
                 meta: None,
             },
             TestRelation {
                 id: 200,
-                members: vec![TestMember { id: MemberId::Node(1), role: "stop" }],
+                members: vec![TestMember {
+                    id: MemberId::Node(1),
+                    role: "stop",
+                }],
                 tags: vec![("type", "route")],
                 meta: None,
             },
         ],
     );
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <create>
     <relation id="150" version="1">
@@ -456,7 +689,8 @@ fn merge_relations_only_diff() {
       <tag k="type" v="public_transport"/>
     </relation>
   </modify>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     run_apply_ok(&base, &osc, &output);
     let c = read_all_elements(&output);
@@ -464,13 +698,28 @@ fn merge_relations_only_diff() {
     assert_eq!(node_ids(&c), vec![1]);
     assert_eq!(way_ids(&c), vec![10]);
     assert_eq!(relation_ids(&c), vec![100, 150, 200]);
-    assert_eq!(c.relations[0].2, vec![("type".to_string(), "multipolygon".to_string())]);
-    assert_eq!(c.relations[1].1, vec![(10, "way".to_string(), "inner".to_string())]);
-    assert_eq!(c.relations[1].2, vec![("type".to_string(), "boundary".to_string())]);
+    assert_eq!(
+        c.relations[0].2,
+        vec![("type".to_string(), "multipolygon".to_string())]
+    );
+    assert_eq!(
+        c.relations[1].1,
+        vec![(10, "way".to_string(), "inner".to_string())]
+    );
+    assert_eq!(
+        c.relations[1].2,
+        vec![("type".to_string(), "boundary".to_string())]
+    );
     assert_eq!(c.relations[2].1.len(), 2);
-    assert_eq!(c.relations[2].1[0], (1, "node".to_string(), "platform".to_string()));
+    assert_eq!(
+        c.relations[2].1[0],
+        (1, "node".to_string(), "platform".to_string())
+    );
     assert_eq!(c.relations[2].1[1], (10, "way".to_string(), String::new()));
-    assert_eq!(c.relations[2].2, vec![("type".to_string(), "public_transport".to_string())]);
+    assert_eq!(
+        c.relations[2].2,
+        vec![("type".to_string(), "public_transport".to_string())]
+    );
 }
 
 #[test]
@@ -483,17 +732,42 @@ fn merge_all_types() {
     write_test_pbf_sorted(
         &base,
         &[
-            TestNode { id: 1, lat: 0, lon: 0, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 0, lon: 0, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[
-            TestWay { id: 10, refs: vec![1, 2], tags: vec![("delete", "me")], meta: None },
-            TestWay { id: 20, refs: vec![2, 1], tags: vec![("keep", "me")], meta: None },
+            TestWay {
+                id: 10,
+                refs: vec![1, 2],
+                tags: vec![("delete", "me")],
+                meta: None,
+            },
+            TestWay {
+                id: 20,
+                refs: vec![2, 1],
+                tags: vec![("keep", "me")],
+                meta: None,
+            },
         ],
         &[
             TestRelation {
                 id: 100,
-                members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+                members: vec![TestMember {
+                    id: MemberId::Way(10),
+                    role: "outer",
+                }],
                 tags: vec![("old", "tags")],
                 meta: None,
             },
@@ -506,7 +780,9 @@ fn merge_all_types() {
         ],
     );
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <create>
     <node id="3" lat="1.0" lon="2.0" version="1">
@@ -523,7 +799,8 @@ fn merge_all_types() {
       <tag k="name" v="updated"/>
     </relation>
   </modify>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     run_apply_ok(&base, &osc, &output);
     let c = read_all_elements(&output);
@@ -533,9 +810,19 @@ fn merge_all_types() {
     assert_eq!(relation_ids(&c), vec![100, 200]);
     assert_eq!(c.nodes[2].3, vec![("new".to_string(), "node".to_string())]);
     assert_eq!(c.ways[0].2, vec![("keep".to_string(), "me".to_string())]);
-    assert_eq!(c.relations[0].2, vec![("old".to_string(), "tags".to_string())]);
-    assert_eq!(c.relations[1].1, vec![(3, "node".to_string(), "label".to_string())]);
-    assert!(c.relations[1].2.contains(&("name".to_string(), "updated".to_string())));
+    assert_eq!(
+        c.relations[0].2,
+        vec![("old".to_string(), "tags".to_string())]
+    );
+    assert_eq!(
+        c.relations[1].1,
+        vec![(3, "node".to_string(), "label".to_string())]
+    );
+    assert!(
+        c.relations[1]
+            .2
+            .contains(&("name".to_string(), "updated".to_string()))
+    );
 }
 
 /// Diff deletes every element in a block. The rewrite should produce
@@ -558,35 +845,71 @@ fn merge_delete_entire_block() {
         writer.write_header(&header).expect("write header");
         let mut bb = BlockBuilder::new();
 
-        bb.add_node(1, 100_000_000, 100_000_000, std::iter::empty::<(&str, &str)>(), None);
-        bb.add_node(2, 200_000_000, 200_000_000, std::iter::empty::<(&str, &str)>(), None);
-        bb.add_node(3, 300_000_000, 300_000_000, std::iter::empty::<(&str, &str)>(), None);
-        writer.write_primitive_block(bb.take().expect("take").expect("bytes")).expect("write");
+        bb.add_node(
+            1,
+            100_000_000,
+            100_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+        bb.add_node(
+            2,
+            200_000_000,
+            200_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+        bb.add_node(
+            3,
+            300_000_000,
+            300_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
+            .expect("write");
 
         bb.add_node(10, 100_000_000, 100_000_000, [("survivor", "yes")], None);
-        bb.add_node(11, 110_000_000, 110_000_000, std::iter::empty::<(&str, &str)>(), None);
-        writer.write_primitive_block(bb.take().expect("take").expect("bytes")).expect("write");
+        bb.add_node(
+            11,
+            110_000_000,
+            110_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
+            .expect("write");
 
         bb.add_way(100, [("highway", "path")], &[10, 11], None);
-        writer.write_primitive_block(bb.take().expect("take").expect("bytes")).expect("write");
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
+            .expect("write");
 
         writer.flush().expect("flush");
     }
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <delete>
     <node id="1" version="2"/>
     <node id="2" version="2"/>
     <node id="3" version="2"/>
   </delete>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     let out = run_apply_ok(&base, &osc, &output);
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![10, 11]);
-    assert_eq!(c.nodes[0].3, vec![("survivor".to_string(), "yes".to_string())]);
+    assert_eq!(
+        c.nodes[0].3,
+        vec![("survivor".to_string(), "yes".to_string())]
+    );
     assert_eq!(way_ids(&c), vec![100]);
     assert_eq!(c.ways[0].1, vec![10, 11]);
     assert!(
@@ -606,15 +929,45 @@ fn merge_stats_accuracy() {
     write_test_pbf_sorted(
         &base,
         &[
-            TestNode { id: 1, lat: 0, lon: 0, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 0, lon: 0, tags: vec![], meta: None },
-            TestNode { id: 3, lat: 0, lon: 0, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
         ],
-        &[TestWay { id: 10, refs: vec![1, 2], tags: vec![], meta: None }],
-        &[TestRelation { id: 100, members: vec![], tags: vec![], meta: None }],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![],
+            meta: None,
+        }],
+        &[TestRelation {
+            id: 100,
+            members: vec![],
+            tags: vec![],
+            meta: None,
+        }],
     );
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <create>
     <node id="4" lat="1.0" lon="2.0" version="1"/>
@@ -629,15 +982,22 @@ fn merge_stats_accuracy() {
   <delete>
     <node id="3" version="2"/>
   </delete>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     let out = run_apply_ok(&base, &osc, &output);
     let stderr = out.stderr_str();
     // Format: "  Base: {nodes} nodes, {ways} ways, {relations} relations"
     //         "  Diff: {nodes} nodes, {ways} ways, {relations} relations"
     //         "  Deleted: {N}"
-    assert!(stderr.contains("Base: 1 nodes, 0 ways, 1 relations"), "stats: {stderr}");
-    assert!(stderr.contains("Diff: 2 nodes, 1 ways, 0 relations"), "stats: {stderr}");
+    assert!(
+        stderr.contains("Base: 1 nodes, 0 ways, 1 relations"),
+        "stats: {stderr}"
+    );
+    assert!(
+        stderr.contains("Diff: 2 nodes, 1 ways, 0 relations"),
+        "stats: {stderr}"
+    );
     assert!(stderr.contains("Deleted: 1"), "stats: {stderr}");
 }
 
@@ -662,27 +1022,65 @@ fn merge_metadata_preservation() {
         writer.write_header(&header).expect("write header");
         let mut bb = BlockBuilder::new();
 
-        bb.add_node(1, 100_000_000, 200_000_000, [("name", "one")], Some(&block_builder::Metadata {
-            version: 5, timestamp: 1_700_000_000, changeset: 12345, uid: 42, user: "mapper", visible: true,
-        }));
-        bb.add_node(2, 300_000_000, 400_000_000, [("name", "two")], Some(&block_builder::Metadata {
-            version: 3, timestamp: 1_600_000_000, changeset: 67890, uid: 7, user: "editor", visible: true,
-        }));
-        bb.add_node(3, 500_000_000, 600_000_000, [("name", "three")], Some(&block_builder::Metadata {
-            version: 1, timestamp: 1_500_000_000, changeset: 11111, uid: 99, user: "creator", visible: true,
-        }));
-        writer.write_primitive_block(bb.take().expect("take").expect("bytes")).expect("write");
+        bb.add_node(
+            1,
+            100_000_000,
+            200_000_000,
+            [("name", "one")],
+            Some(&block_builder::Metadata {
+                version: 5,
+                timestamp: 1_700_000_000,
+                changeset: 12345,
+                uid: 42,
+                user: "mapper",
+                visible: true,
+            }),
+        );
+        bb.add_node(
+            2,
+            300_000_000,
+            400_000_000,
+            [("name", "two")],
+            Some(&block_builder::Metadata {
+                version: 3,
+                timestamp: 1_600_000_000,
+                changeset: 67890,
+                uid: 7,
+                user: "editor",
+                visible: true,
+            }),
+        );
+        bb.add_node(
+            3,
+            500_000_000,
+            600_000_000,
+            [("name", "three")],
+            Some(&block_builder::Metadata {
+                version: 1,
+                timestamp: 1_500_000_000,
+                changeset: 11111,
+                uid: 99,
+                user: "creator",
+                visible: true,
+            }),
+        );
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
+            .expect("write");
         writer.flush().expect("flush");
     }
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <modify>
     <node id="2" lat="35.0" lon="45.0" version="4">
       <tag k="name" v="two-modified"/>
     </node>
   </modify>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     run_apply_ok(&base, &osc, &output);
 
@@ -779,7 +1177,10 @@ fn write_test_pbf_with_locations(
         let members: Vec<block_builder::MemberData<'_>> = r
             .members
             .iter()
-            .map(|m| block_builder::MemberData { id: m.id, role: m.role })
+            .map(|m| block_builder::MemberData {
+                id: m.id,
+                role: m.role,
+            })
             .collect();
         bb.add_relation(r.id, r.tags.iter().copied(), &members, None);
     }
@@ -822,18 +1223,48 @@ fn merge_locations_on_ways_basic() {
     write_test_pbf_with_locations(
         &base,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 300_000_000, lon: 400_000_000, tags: vec![], meta: None },
-            TestNode { id: 3, lat: 500_000_000, lon: 600_000_000, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 300_000_000,
+                lon: 400_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 500_000_000,
+                lon: 600_000_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[
-            (10, vec![1, 2], vec![(100_000_000, 200_000_000), (300_000_000, 400_000_000)], vec![("highway", "road")]),
-            (20, vec![2, 3], vec![(300_000_000, 400_000_000), (500_000_000, 600_000_000)], vec![("highway", "path")]),
+            (
+                10,
+                vec![1, 2],
+                vec![(100_000_000, 200_000_000), (300_000_000, 400_000_000)],
+                vec![("highway", "road")],
+            ),
+            (
+                20,
+                vec![2, 3],
+                vec![(300_000_000, 400_000_000), (500_000_000, 600_000_000)],
+                vec![("highway", "path")],
+            ),
         ],
         &[],
     );
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <modify>
     <way id="10" version="2">
@@ -850,12 +1281,18 @@ fn merge_locations_on_ways_basic() {
       <tag k="highway" v="footway"/>
     </way>
   </create>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
-    let out = run_apply_changes(&base, &osc, &output, ApplyOpts {
-        locations_on_ways: true,
-        ..ApplyOpts::default()
-    });
+    let out = run_apply_changes(
+        &base,
+        &osc,
+        &output,
+        ApplyOpts {
+            locations_on_ways: true,
+            ..ApplyOpts::default()
+        },
+    );
     assert!(
         out.status.success(),
         "apply-changes --locations-on-ways failed; stderr:\n{}",
@@ -867,16 +1304,32 @@ fn merge_locations_on_ways_basic() {
     assert!(stderr.contains("0 missing"), "loc stats: {stderr}");
 
     let header = common::read_header(&output);
-    assert!(header.has_locations_on_ways(), "output must have LocationsOnWays");
+    assert!(
+        header.has_locations_on_ways(),
+        "output must have LocationsOnWays"
+    );
 
     let locs = read_way_locations(&output);
     assert_eq!(locs.len(), 3);
     let way10 = locs.iter().find(|(id, _)| *id == 10).expect("way 10");
-    assert_eq!(way10.1, vec![(100_000_000, 200_000_000), (500_000_000, 600_000_000)]);
+    assert_eq!(
+        way10.1,
+        vec![(100_000_000, 200_000_000), (500_000_000, 600_000_000)]
+    );
     let way20 = locs.iter().find(|(id, _)| *id == 20).expect("way 20");
-    assert_eq!(way20.1, vec![(300_000_000, 400_000_000), (500_000_000, 600_000_000)]);
+    assert_eq!(
+        way20.1,
+        vec![(300_000_000, 400_000_000), (500_000_000, 600_000_000)]
+    );
     let way30 = locs.iter().find(|(id, _)| *id == 30).expect("way 30");
-    assert_eq!(way30.1, vec![(100_000_000, 200_000_000), (300_000_000, 400_000_000), (500_000_000, 600_000_000)]);
+    assert_eq!(
+        way30.1,
+        vec![
+            (100_000_000, 200_000_000),
+            (300_000_000, 400_000_000),
+            (500_000_000, 600_000_000)
+        ]
+    );
 }
 
 #[test]
@@ -889,14 +1342,33 @@ fn merge_locations_on_ways_osc_node_coords() {
     write_test_pbf_with_locations(
         &base,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 300_000_000, lon: 400_000_000, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 300_000_000,
+                lon: 400_000_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
-        &[(10, vec![1, 2], vec![(100_000_000, 200_000_000), (300_000_000, 400_000_000)], vec![])],
+        &[(
+            10,
+            vec![1, 2],
+            vec![(100_000_000, 200_000_000), (300_000_000, 400_000_000)],
+            vec![],
+        )],
         &[],
     );
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <modify>
     <node id="2" lat="55.0" lon="12.0" version="2"/>
@@ -906,17 +1378,26 @@ fn merge_locations_on_ways_osc_node_coords() {
       <tag k="highway" v="primary"/>
     </way>
   </modify>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
-    let out = run_apply_changes(&base, &osc, &output, ApplyOpts {
-        locations_on_ways: true,
-        ..ApplyOpts::default()
-    });
+    let out = run_apply_changes(
+        &base,
+        &osc,
+        &output,
+        ApplyOpts {
+            locations_on_ways: true,
+            ..ApplyOpts::default()
+        },
+    );
     assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
 
     let locs = read_way_locations(&output);
     let way10 = locs.iter().find(|(id, _)| *id == 10).expect("way 10");
-    assert_eq!(way10.1, vec![(100_000_000, 200_000_000), (550_000_000, 120_000_000)]);
+    assert_eq!(
+        way10.1,
+        vec![(100_000_000, 200_000_000), (550_000_000, 120_000_000)]
+    );
 }
 
 /// Merge with --locations-on-ways requires LocationsOnWays in base PBF.
@@ -929,22 +1410,36 @@ fn merge_locations_on_ways_requires_base_feature() {
 
     write_test_pbf_sorted(
         &base,
-        &[TestNode { id: 1, lat: 0, lon: 0, tags: vec![], meta: None }],
+        &[TestNode {
+            id: 1,
+            lat: 0,
+            lon: 0,
+            tags: vec![],
+            meta: None,
+        }],
         &[],
         &[],
     );
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <create>
     <node id="2" lat="1.0" lon="2.0" version="1"/>
   </create>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
-    let out = run_apply_changes(&base, &osc, &output, ApplyOpts {
-        locations_on_ways: true,
-        ..ApplyOpts::default()
-    });
+    let out = run_apply_changes(
+        &base,
+        &osc,
+        &output,
+        ApplyOpts {
+            locations_on_ways: true,
+            ..ApplyOpts::default()
+        },
+    );
     assert!(
         !out.status.success(),
         "should fail without LocationsOnWays in base; stderr:\n{}",
@@ -972,18 +1467,48 @@ fn merge_gap_creates_between_blobs() {
     write_test_pbf_sorted(
         &base,
         &[
-            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
-            TestNode { id: 20, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
-            TestNode { id: 30, lat: 120_000_000, lon: 220_000_000, tags: vec![], meta: None },
+            TestNode {
+                id: 10,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 20,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 30,
+                lat: 120_000_000,
+                lon: 220_000_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[
-            TestWay { id: 100, refs: vec![10, 20], tags: vec![("highway", "road")], meta: None },
-            TestWay { id: 200, refs: vec![20, 30], tags: vec![("highway", "path")], meta: None },
+            TestWay {
+                id: 100,
+                refs: vec![10, 20],
+                tags: vec![("highway", "road")],
+                meta: None,
+            },
+            TestWay {
+                id: 200,
+                refs: vec![20, 30],
+                tags: vec![("highway", "path")],
+                meta: None,
+            },
         ],
         &[],
     );
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <create>
     <node id="5" lat="50.0" lon="10.0" version="1"/>
@@ -998,7 +1523,8 @@ fn merge_gap_creates_between_blobs() {
       <nd ref="30"/>
     </way>
   </create>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     let out = run_apply_ok(&base, &osc, &output);
     let c = read_all_elements(&output);
@@ -1030,19 +1556,36 @@ fn merge_type_transition_node_to_relation_skipping_ways() {
     write_test_pbf_sorted(
         &base,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
         &[],
         &[TestRelation {
             id: 100,
-            members: vec![TestMember { id: MemberId::Node(1), role: "label" }],
+            members: vec![TestMember {
+                id: MemberId::Node(1),
+                role: "label",
+            }],
             tags: vec![("type", "boundary")],
             meta: None,
         }],
     );
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <create>
     <way id="50" version="1">
@@ -1056,7 +1599,8 @@ fn merge_type_transition_node_to_relation_skipping_ways() {
       <tag k="highway" v="primary"/>
     </way>
   </create>
-</osmChange>"#);
+</osmChange>"#,
+    );
 
     let out = run_apply_ok(&base, &osc, &output);
     let c = read_all_elements(&output);
@@ -1066,8 +1610,14 @@ fn merge_type_transition_node_to_relation_skipping_ways() {
     assert_eq!(relation_ids(&c), vec![100]);
 
     let stderr = out.stderr_str();
-    assert!(stderr.contains("Base: 2 nodes, 0 ways, 1 relations"), "stats: {stderr}");
-    assert!(stderr.contains("Diff: 0 nodes, 2 ways, 0 relations"), "stats: {stderr}");
+    assert!(
+        stderr.contains("Base: 2 nodes, 0 ways, 1 relations"),
+        "stats: {stderr}"
+    );
+    assert!(
+        stderr.contains("Diff: 0 nodes, 2 ways, 0 relations"),
+        "stats: {stderr}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,20 +1638,45 @@ fn merge_rejects_force_with_locations_on_ways_on_non_indexed() {
     write_test_pbf_non_indexed(
         &base,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 300_000_000, lon: 400_000_000, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 300_000_000,
+                lon: 400_000_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
-        &[TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "road")], meta: None }],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "road")],
+            meta: None,
+        }],
         &[],
     );
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
-<osmChange version="0.6"></osmChange>"#);
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6"></osmChange>"#,
+    );
 
-    let out = run_apply_changes(&base, &osc, &output, ApplyOpts {
-        locations_on_ways: true,
-        ..ApplyOpts::default()
-    });
+    let out = run_apply_changes(
+        &base,
+        &osc,
+        &output,
+        ApplyOpts {
+            locations_on_ways: true,
+            ..ApplyOpts::default()
+        },
+    );
     assert!(
         !out.status.success(),
         "must reject --force --locations-on-ways on non-indexed PBF; stderr:\n{}",
@@ -1129,18 +1704,32 @@ fn merge_rejects_jobs_equal_one() {
 
     write_test_pbf_sorted(
         &base,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None }],
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![],
+            meta: None,
+        }],
         &[],
         &[],
     );
 
-    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
-<osmChange version="0.6"></osmChange>"#);
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6"></osmChange>"#,
+    );
 
-    let out = run_apply_changes(&base, &osc, &output, ApplyOpts {
-        jobs: Some(1),
-        ..ApplyOpts::default()
-    });
+    let out = run_apply_changes(
+        &base,
+        &osc,
+        &output,
+        ApplyOpts {
+            jobs: Some(1),
+            ..ApplyOpts::default()
+        },
+    );
     assert!(
         !out.status.success(),
         "must reject -j 1; stderr:\n{}",
@@ -1165,20 +1754,48 @@ mod platform {
         write_test_pbf_sorted(
             base,
             &[
-                TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "one")], meta: None },
-                TestNode { id: 2, lat: 300_000_000, lon: 400_000_000, tags: vec![("name", "two")], meta: None },
-                TestNode { id: 3, lat: 500_000_000, lon: 600_000_000, tags: vec![("name", "three")], meta: None },
+                TestNode {
+                    id: 1,
+                    lat: 100_000_000,
+                    lon: 200_000_000,
+                    tags: vec![("name", "one")],
+                    meta: None,
+                },
+                TestNode {
+                    id: 2,
+                    lat: 300_000_000,
+                    lon: 400_000_000,
+                    tags: vec![("name", "two")],
+                    meta: None,
+                },
+                TestNode {
+                    id: 3,
+                    lat: 500_000_000,
+                    lon: 600_000_000,
+                    tags: vec![("name", "three")],
+                    meta: None,
+                },
             ],
-            &[TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "road")], meta: None }],
+            &[TestWay {
+                id: 10,
+                refs: vec![1, 2, 3],
+                tags: vec![("highway", "road")],
+                meta: None,
+            }],
             &[TestRelation {
                 id: 100,
-                members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+                members: vec![TestMember {
+                    id: MemberId::Way(10),
+                    role: "outer",
+                }],
                 tags: vec![("type", "multipolygon")],
                 meta: None,
             }],
         );
 
-        write_osc(osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+        write_osc(
+            osc,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <create>
     <node id="4" lat="55.0" lon="12.0" version="1">
@@ -1198,7 +1815,8 @@ mod platform {
   <delete>
     <node id="3" version="2"/>
   </delete>
-</osmChange>"#);
+</osmChange>"#,
+        );
     }
 
     fn check_basic_output(output: &Path) {
@@ -1224,10 +1842,15 @@ mod platform {
         let output = dir.path().join("output.osm.pbf");
 
         basic_fixture(&base, &osc);
-        let out = run_apply_changes(&base, &osc, &output, ApplyOpts {
-            direct_io: true,
-            ..ApplyOpts::default()
-        });
+        let out = run_apply_changes(
+            &base,
+            &osc,
+            &output,
+            ApplyOpts {
+                direct_io: true,
+                ..ApplyOpts::default()
+            },
+        );
         if out.is_o_direct_unsupported() {
             eprintln!("O_DIRECT not supported on this filesystem, skipping test");
             return;
@@ -1254,10 +1877,15 @@ mod platform {
         let output = dir.path().join("output.osm.pbf");
 
         basic_fixture(&base, &osc);
-        let out = run_apply_changes(&base, &osc, &output, ApplyOpts {
-            io_uring: true,
-            ..ApplyOpts::default()
-        });
+        let out = run_apply_changes(
+            &base,
+            &osc,
+            &output,
+            ApplyOpts {
+                io_uring: true,
+                ..ApplyOpts::default()
+            },
+        );
         if out.is_uring_unsupported() {
             eprintln!("io_uring not available, skipping test");
             return;
@@ -1330,11 +1958,14 @@ fn read_all_for_comparison(path: &Path) -> CmpContents {
                             .map(|(k, v)| (k.to_string(), v.to_string()))
                             .collect();
                         tags.sort();
-                        contents.nodes.insert(dn.id(), CmpNode {
-                            lat: dn.decimicro_lat(),
-                            lon: dn.decimicro_lon(),
-                            tags,
-                        });
+                        contents.nodes.insert(
+                            dn.id(),
+                            CmpNode {
+                                lat: dn.decimicro_lat(),
+                                lon: dn.decimicro_lon(),
+                                tags,
+                            },
+                        );
                     }
                     Element::Node(n) => {
                         let mut tags: Vec<(String, String)> = n
@@ -1342,11 +1973,14 @@ fn read_all_for_comparison(path: &Path) -> CmpContents {
                             .map(|(k, v)| (k.to_string(), v.to_string()))
                             .collect();
                         tags.sort();
-                        contents.nodes.insert(n.id(), CmpNode {
-                            lat: n.decimicro_lat(),
-                            lon: n.decimicro_lon(),
-                            tags,
-                        });
+                        contents.nodes.insert(
+                            n.id(),
+                            CmpNode {
+                                lat: n.decimicro_lat(),
+                                lon: n.decimicro_lon(),
+                                tags,
+                            },
+                        );
                     }
                     Element::Way(w) => {
                         let refs: Vec<i64> = w.refs().collect();
@@ -1368,7 +2002,11 @@ fn read_all_for_comparison(path: &Path) -> CmpContents {
                                     MemberType::Unknown(_) => "unknown",
                                     _ => "unknown",
                                 };
-                                (m.id.id(), type_str.to_string(), m.role().unwrap_or("").to_string())
+                                (
+                                    m.id.id(),
+                                    type_str.to_string(),
+                                    m.role().unwrap_or("").to_string(),
+                                )
                             })
                             .collect();
                         let mut tags: Vec<(String, String)> = r
@@ -1376,7 +2014,9 @@ fn read_all_for_comparison(path: &Path) -> CmpContents {
                             .map(|(k, v)| (k.to_string(), v.to_string()))
                             .collect();
                         tags.sort();
-                        contents.relations.insert(r.id(), CmpRelation { members, tags });
+                        contents
+                            .relations
+                            .insert(r.id(), CmpRelation { members, tags });
                     }
                     _ => {}
                 }
@@ -1397,13 +2037,23 @@ fn compare_maps<V: std::fmt::Debug + PartialEq>(
             && ours_val != theirs_val
         {
             if mismatches < 5 {
-                eprintln!("{label} {id} mismatch:\n  ours:   {ours_val:?}\n  theirs: {theirs_val:?}");
+                eprintln!(
+                    "{label} {id} mismatch:\n  ours:   {ours_val:?}\n  theirs: {theirs_val:?}"
+                );
             }
             mismatches += 1;
         }
     }
-    let extra: Vec<i64> = ours.keys().filter(|id| !theirs.contains_key(id)).copied().collect();
-    let missing: Vec<i64> = theirs.keys().filter(|id| !ours.contains_key(id)).copied().collect();
+    let extra: Vec<i64> = ours
+        .keys()
+        .filter(|id| !theirs.contains_key(id))
+        .copied()
+        .collect();
+    let missing: Vec<i64> = theirs
+        .keys()
+        .filter(|id| !ours.contains_key(id))
+        .copied()
+        .collect();
     (mismatches, extra, missing)
 }
 
@@ -1470,11 +2120,15 @@ fn merge_cross_validate_osmium() {
 
     eprintln!(
         "pbfhogg: {} nodes, {} ways, {} relations",
-        ours.nodes.len(), ours.ways.len(), ours.relations.len()
+        ours.nodes.len(),
+        ours.ways.len(),
+        ours.relations.len()
     );
     eprintln!(
         "osmium:  {} nodes, {} ways, {} relations",
-        theirs.nodes.len(), theirs.ways.len(), theirs.relations.len()
+        theirs.nodes.len(),
+        theirs.ways.len(),
+        theirs.relations.len()
     );
 
     let (node_mm, extra_n, missing_n) = compare_maps("node", &ours.nodes, &theirs.nodes);
@@ -1484,14 +2138,24 @@ fn merge_cross_validate_osmium() {
     let mut failures = node_mm + way_mm + rel_mm;
     failures += extra_n.len() as u64 + extra_w.len() as u64 + extra_r.len() as u64;
 
-    if !extra_n.is_empty() { eprintln!("FAIL: {} extra nodes in pbfhogg", extra_n.len()); }
-    if !extra_w.is_empty() { eprintln!("FAIL: {} extra ways in pbfhogg", extra_w.len()); }
-    if !extra_r.is_empty() { eprintln!("FAIL: {} extra relations in pbfhogg", extra_r.len()); }
+    if !extra_n.is_empty() {
+        eprintln!("FAIL: {} extra nodes in pbfhogg", extra_n.len());
+    }
+    if !extra_w.is_empty() {
+        eprintln!("FAIL: {} extra ways in pbfhogg", extra_w.len());
+    }
+    if !extra_r.is_empty() {
+        eprintln!("FAIL: {} extra relations in pbfhogg", extra_r.len());
+    }
 
     eprintln!(
         "Delete difference: {} nodes, {} ways, {} rels (OSC: {}, {}, {})",
-        missing_n.len(), missing_w.len(), missing_r.len(),
-        diff.deleted_nodes.len(), diff.deleted_ways.len(), diff.deleted_relations.len(),
+        missing_n.len(),
+        missing_w.len(),
+        missing_r.len(),
+        diff.deleted_nodes.len(),
+        diff.deleted_ways.len(),
+        diff.deleted_relations.len(),
     );
     for id in &missing_n {
         if !diff.deleted_nodes.contains(id) {

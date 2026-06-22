@@ -87,13 +87,25 @@ fn cli_cat_passthrough() {
     write_minimal_pbf(&input);
 
     let result = Command::new(pbfhogg_bin())
-        .args(["cat", input.to_str().expect("path"), "-o", output.to_str().expect("path")])
+        .args([
+            "cat",
+            input.to_str().expect("path"),
+            "-o",
+            output.to_str().expect("path"),
+        ])
         .output()
         .expect("run pbfhogg cat");
 
-    assert!(result.status.success(), "cat failed: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "cat failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     assert!(output.exists(), "output file should exist");
-    assert!(output.metadata().expect("metadata").len() > 0, "output should be non-empty");
+    assert!(
+        output.metadata().expect("metadata").len() > 0,
+        "output should be non-empty"
+    );
 }
 
 #[test]
@@ -105,11 +117,20 @@ fn cli_sort() {
     write_minimal_pbf(&input);
 
     let result = Command::new(pbfhogg_bin())
-        .args(["sort", input.to_str().expect("path"), "-o", output.to_str().expect("path")])
+        .args([
+            "sort",
+            input.to_str().expect("path"),
+            "-o",
+            output.to_str().expect("path"),
+        ])
         .output()
         .expect("run pbfhogg sort");
 
-    assert!(result.status.success(), "sort failed: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "sort failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     assert!(output.exists(), "output file should exist");
 }
 
@@ -125,9 +146,16 @@ fn cli_inspect() {
         .output()
         .expect("run pbfhogg inspect");
 
-    assert!(result.status.success(), "inspect failed: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "inspect failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     let stdout = String::from_utf8_lossy(&result.stdout);
-    assert!(stdout.contains("nodes") || stdout.contains("Node"), "inspect should show element info");
+    assert!(
+        stdout.contains("nodes") || stdout.contains("Node"),
+        "inspect should show element info"
+    );
 }
 
 #[test]
@@ -142,7 +170,11 @@ fn cli_check() {
         .output()
         .expect("run pbfhogg check");
 
-    assert!(result.status.success(), "check failed: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "check failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -161,12 +193,17 @@ fn cli_renumber() {
         .args([
             "renumber",
             input.to_str().expect("path"),
-            "-o", output.to_str().expect("path"),
+            "-o",
+            output.to_str().expect("path"),
         ])
         .output()
         .expect("run pbfhogg renumber");
 
-    assert!(result.status.success(), "renumber failed: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "renumber failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     assert!(output.exists(), "output file should exist");
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
@@ -186,9 +223,11 @@ fn cli_renumber_custom_start_id() {
     let result = Command::new(pbfhogg_bin())
         .args([
             "renumber",
-            "-s", "1000,5000,9000",
+            "-s",
+            "1000,5000,9000",
             input.to_str().expect("path"),
-            "-o", output.to_str().expect("path"),
+            "-o",
+            output.to_str().expect("path"),
         ])
         .output()
         .expect("run pbfhogg renumber -s ...");
@@ -221,9 +260,15 @@ fn cli_renumber_custom_start_id() {
                 }
             }
         }
-        if first_node_id.is_some() { break; }
+        if first_node_id.is_some() {
+            break;
+        }
     }
-    assert_eq!(first_node_id, Some(1000), "first node id should be start_node_id=1000");
+    assert_eq!(
+        first_node_id,
+        Some(1000),
+        "first node id should be start_node_id=1000"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -245,13 +290,17 @@ fn cli_direct_io_rejected_without_feature() {
         .args([
             "sort",
             input.to_str().expect("path"),
-            "-o", output.to_str().expect("path"),
+            "-o",
+            output.to_str().expect("path"),
             "--direct-io",
         ])
         .output()
         .expect("run pbfhogg sort --direct-io");
 
-    assert!(!result.status.success(), "should fail without linux-direct-io feature");
+    assert!(
+        !result.status.success(),
+        "should fail without linux-direct-io feature"
+    );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
         stderr.contains("direct-io") && stderr.contains("feature"),
@@ -273,13 +322,17 @@ fn cli_io_uring_rejected_without_feature() {
         .args([
             "sort",
             input.to_str().expect("path"),
-            "-o", output.to_str().expect("path"),
+            "-o",
+            output.to_str().expect("path"),
             "--io-uring",
         ])
         .output()
         .expect("run pbfhogg sort --io-uring");
 
-    assert!(!result.status.success(), "should fail without linux-io-uring feature");
+    assert!(
+        !result.status.success(),
+        "should fail without linux-io-uring feature"
+    );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
         stderr.contains("io-uring") && stderr.contains("feature"),

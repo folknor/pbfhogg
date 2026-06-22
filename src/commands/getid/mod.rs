@@ -7,17 +7,17 @@ use crate::idset::IdSet;
 use rayon::prelude::*;
 
 use super::{
-    drain_batch_results, flush_local, require_indexdata,
-    for_each_primitive_block_batch, writer_from_header, ensure_node_capacity_local,
-    ensure_way_capacity_local, ensure_relation_capacity_local, HeaderOverrides,
+    HeaderOverrides, drain_batch_results, ensure_node_capacity_local,
+    ensure_relation_capacity_local, ensure_way_capacity_local, flush_local,
+    for_each_primitive_block_batch, require_indexdata, writer_from_header,
 };
-use crate::owned::{dense_node_metadata, element_metadata};
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_writer::FileWriter;
+use crate::owned::{dense_node_metadata, element_metadata};
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
-use super::{Result, BATCH_SIZE};
+use super::{BATCH_SIZE, Result};
 
 // ---------------------------------------------------------------------------
 // ID parsing
@@ -189,9 +189,15 @@ pub fn parse_ids_from_pbf(path: &Path, _direct_io: bool) -> Result<ElementIds> {
             batch
         },
         |_seq, batch| {
-            for id in batch.node_ids { set.node_ids.set(id); }
-            for id in batch.way_ids { set.way_ids.set(id); }
-            for id in batch.relation_ids { set.relation_ids.set(id); }
+            for id in batch.node_ids {
+                set.node_ids.set(id);
+            }
+            for id in batch.way_ids {
+                set.way_ids.set(id);
+            }
+            for id in batch.relation_ids {
+                set.relation_ids.set(id);
+            }
         },
     )?;
 
@@ -255,10 +261,14 @@ pub fn getid(
     force: bool,
     overrides: &HeaderOverrides,
 ) -> Result<GetidStats> {
-    require_indexdata(input, direct_io, force,
+    require_indexdata(
+        input,
+        direct_io,
+        force,
         "input PBF has no blob-level indexdata. Without indexdata, the type filter \
          based on requested ID types is a no-op - all blobs are decompressed \
-         (significantly slower).")?;
+         (significantly slower).",
+    )?;
 
     let result = if opts.add_referenced {
         getid_with_refs(input, output, ids, opts, compression, direct_io, overrides)
@@ -282,11 +292,23 @@ pub fn getid(
 /// decode-and-re-encode silently; `--force` overrides.
 #[allow(clippy::too_many_arguments)]
 #[hotpath::measure]
-pub fn removeid(input: &Path, output: &Path, ids: &ElementIds, compression: Compression, direct_io: bool, force: bool, overrides: &HeaderOverrides) -> Result<GetidStats> {
-    require_indexdata(input, direct_io, force,
+pub fn removeid(
+    input: &Path,
+    output: &Path,
+    ids: &ElementIds,
+    compression: Compression,
+    direct_io: bool,
+    force: bool,
+    overrides: &HeaderOverrides,
+) -> Result<GetidStats> {
+    require_indexdata(
+        input,
+        direct_io,
+        force,
         "input PBF has no blob-level indexdata. Without indexdata, the \
          invert-mode raw-passthrough fast path is unreachable and every \
-         blob is decompressed and re-encoded (significantly slower).")?;
+         blob is decompressed and re-encoded (significantly slower).",
+    )?;
     filter_by_id(input, output, ids, false, compression, direct_io, overrides)
 }
 
@@ -308,7 +330,7 @@ fn filter_by_id(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<GetidStats> {
-    use crate::blob::{decode_blob_to_headerblock, BlobKind};
+    use crate::blob::{BlobKind, decode_blob_to_headerblock};
     use crate::read::header_walker::HeaderWalker;
 
     crate::debug::emit_marker("GETID_SCAN_START");
@@ -350,23 +372,31 @@ fn filter_by_id(
                 walker.pread_data(meta.data_offset, meta.data_size, &mut data_buf)?;
                 let header = decode_blob_to_headerblock(&data_buf)?;
                 super::warn_locations_on_ways_loss(&header);
-                let header_bytes =
-                    super::build_output_header(&header, true, overrides, |hb| hb)?;
+                let header_bytes = super::build_output_header(&header, true, overrides, |hb| hb)?;
                 writer = Some(super::writer_from_header_bytes(
-                    output, compression, &header_bytes, direct_io, false,
+                    output,
+                    compression,
+                    &header_bytes,
+                    direct_io,
+                    false,
                 )?);
             }
             BlobKind::OsmData => {
-                let w = writer.as_mut().ok_or("no OSMHeader blob found before OsmData")?;
+                let w = writer
+                    .as_mut()
+                    .ok_or("no OSMHeader blob found before OsmData")?;
 
                 if let Some(ref idx) = meta.index {
                     let has_match = match idx.kind {
-                        crate::blob_meta::ElemKind::Node =>
-                            ids.node_ids.any_in_range(idx.min_id, idx.max_id),
-                        crate::blob_meta::ElemKind::Way =>
-                            ids.way_ids.any_in_range(idx.min_id, idx.max_id),
-                        crate::blob_meta::ElemKind::Relation =>
-                            ids.relation_ids.any_in_range(idx.min_id, idx.max_id),
+                        crate::blob_meta::ElemKind::Node => {
+                            ids.node_ids.any_in_range(idx.min_id, idx.max_id)
+                        }
+                        crate::blob_meta::ElemKind::Way => {
+                            ids.way_ids.any_in_range(idx.min_id, idx.max_id)
+                        }
+                        crate::blob_meta::ElemKind::Relation => {
+                            ids.relation_ids.any_in_range(idx.min_id, idx.max_id)
+                        }
                     };
                     if include {
                         if !blob_filter.wants_index(idx) || !has_match {
@@ -381,7 +411,9 @@ fn filter_by_id(
                         match idx.kind {
                             crate::blob_meta::ElemKind::Node => stats.nodes_written += idx.count,
                             crate::blob_meta::ElemKind::Way => stats.ways_written += idx.count,
-                            crate::blob_meta::ElemKind::Relation => stats.relations_written += idx.count,
+                            crate::blob_meta::ElemKind::Relation => {
+                                stats.relations_written += idx.count;
+                            }
                         }
                         w.write_raw_owned(std::mem::take(&mut frame_buf))?;
                         blobs_passthrough += 1;
@@ -396,12 +428,20 @@ fn filter_by_id(
                 crate::blob::decompress_blob_data_into(&data_buf, &mut decompress_buf)?;
                 let block = PrimitiveBlock::new_with_scratch(
                     std::mem::take(&mut decompress_buf).into(),
-                    &mut st_scratch, &mut gr_scratch,
+                    &mut st_scratch,
+                    &mut gr_scratch,
                 )?;
                 output_blocks.clear();
                 let (nodes, ways, relations) = process_block(
-                    &block, &mut bb, &mut output_blocks, ids, include, None, false,
-                ).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                    &block,
+                    &mut bb,
+                    &mut output_blocks,
+                    ids,
+                    include,
+                    None,
+                    false,
+                )
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                 flush_local(&mut bb, &mut output_blocks)
                     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                 for (block_bytes, index, tagdata) in output_blocks.drain(..) {
@@ -427,12 +467,19 @@ fn filter_by_id(
     Ok(stats)
 }
 
-
 // ---------------------------------------------------------------------------
 // Two-pass getid with --add-referenced
 // ---------------------------------------------------------------------------
 
-fn getid_with_refs(input: &Path, output: &Path, ids: &ElementIds, opts: &GetidOptions, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<GetidStats> {
+fn getid_with_refs(
+    input: &Path,
+    output: &Path,
+    ids: &ElementIds,
+    opts: &GetidOptions,
+    compression: Compression,
+    direct_io: bool,
+    overrides: &HeaderOverrides,
+) -> Result<GetidStats> {
     let mut stats = GetidStats {
         nodes_written: 0,
         ways_written: 0,
@@ -449,7 +496,8 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &ElementIds, opts: &GetidOp
         // Parallel classification: pread workers scan way blobs for matching
         // way IDs and collect their node refs.
         let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
-            input, Some(crate::blob_meta::ElemKind::Way),
+            input,
+            Some(crate::blob_meta::ElemKind::Way),
         )?;
 
         crate::scan::classify::parallel_classify_accumulate(
@@ -462,12 +510,16 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &ElementIds, opts: &GetidOp
                     if let Element::Way(w) = &element
                         && ids.way_ids.get(w.id())
                     {
-                        for r in w.refs() { node_ids.set(r); }
+                        for r in w.refs() {
+                            node_ids.set(r);
+                        }
                     }
                 }
             },
             |worker_node_ids| {
-                if worker_node_ids.has_any() { has_dep_nodes = true; }
+                if worker_node_ids.has_any() {
+                    has_dep_nodes = true;
+                }
                 dep_node_ids.merge(worker_node_ids);
             },
         )?;
@@ -497,19 +549,31 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &ElementIds, opts: &GetidOp
         true,
         ids.relation_ids.has_any(),
     ));
-    let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| hb, direct_io, false)?;
+    let mut writer = writer_from_header(
+        output,
+        compression,
+        reader.header(),
+        true,
+        overrides,
+        |hb| hb,
+        direct_io,
+        false,
+    )?;
 
-    let dep_ref = if has_dep_nodes { Some(&dep_node_ids) } else { None };
+    let dep_ref = if has_dep_nodes {
+        Some(&dep_node_ids)
+    } else {
+        None
+    };
 
     for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
-            let (nodes, ways, relations) = process_filter_batch(
-                batch, &mut writer, ids, true, dep_ref, strip_tags,
-            )?;
-            stats.nodes_written += nodes;
-            stats.ways_written += ways;
-            stats.relations_written += relations;
-            Ok(())
-        })?;
+        let (nodes, ways, relations) =
+            process_filter_batch(batch, &mut writer, ids, true, dep_ref, strip_tags)?;
+        stats.nodes_written += nodes;
+        stats.ways_written += ways;
+        stats.relations_written += relations;
+        Ok(())
+    })?;
 
     writer.flush()?;
     crate::debug::emit_marker("GETID_PASS2_END");
@@ -544,12 +608,10 @@ fn process_block(
     for element in block.elements() {
         let dominated = match &element {
             Element::DenseNode(dn) => {
-                ids.node_ids.get(dn.id())
-                    || dep_node_ids.is_some_and(|deps| deps.get(dn.id()))
+                ids.node_ids.get(dn.id()) || dep_node_ids.is_some_and(|deps| deps.get(dn.id()))
             }
             Element::Node(n) => {
-                ids.node_ids.get(n.id())
-                    || dep_node_ids.is_some_and(|deps| deps.get(n.id()))
+                ids.node_ids.get(n.id()) || dep_node_ids.is_some_and(|deps| deps.get(n.id()))
             }
             Element::Way(w) => ids.way_ids.get(w.id()),
             Element::Relation(r) => ids.relation_ids.get(r.id()),
@@ -568,9 +630,21 @@ fn process_block(
                     && !ids.node_ids.get(dn.id());
                 let meta = dense_node_metadata(dn);
                 if strip {
-                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), std::iter::empty::<(&str, &str)>(), meta.as_ref());
+                    bb.add_node(
+                        dn.id(),
+                        dn.decimicro_lat(),
+                        dn.decimicro_lon(),
+                        std::iter::empty::<(&str, &str)>(),
+                        meta.as_ref(),
+                    );
                 } else {
-                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), meta.as_ref());
+                    bb.add_node(
+                        dn.id(),
+                        dn.decimicro_lat(),
+                        dn.decimicro_lon(),
+                        dn.tags(),
+                        meta.as_ref(),
+                    );
                 }
                 nodes += 1;
             }
@@ -581,9 +655,21 @@ fn process_block(
                     && !ids.node_ids.get(n.id());
                 let meta = element_metadata(&n.info());
                 if strip {
-                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), std::iter::empty::<(&str, &str)>(), meta.as_ref());
+                    bb.add_node(
+                        n.id(),
+                        n.decimicro_lat(),
+                        n.decimicro_lon(),
+                        std::iter::empty::<(&str, &str)>(),
+                        meta.as_ref(),
+                    );
                 } else {
-                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), n.tags(), meta.as_ref());
+                    bb.add_node(
+                        n.id(),
+                        n.decimicro_lat(),
+                        n.decimicro_lon(),
+                        n.tags(),
+                        meta.as_ref(),
+                    );
                 }
                 nodes += 1;
             }
@@ -631,17 +717,20 @@ fn process_filter_batch(
     type BatchResult = std::result::Result<(Vec<OwnedBlock>, (u64, u64, u64)), String>;
     let results: Vec<BatchResult> = batch
         .par_iter()
-        .map_init(
-            BlockBuilder::new,
-            |bb, block| {
-                let mut output: Vec<OwnedBlock> = Vec::new();
-                let (nodes, ways, relations) = process_block(
-                    block, bb, &mut output, ids, include, dep_node_ids, strip_tags,
-                )?;
-                flush_local(bb, &mut output)?;
-                Ok((output, (nodes, ways, relations)))
-            },
-        )
+        .map_init(BlockBuilder::new, |bb, block| {
+            let mut output: Vec<OwnedBlock> = Vec::new();
+            let (nodes, ways, relations) = process_block(
+                block,
+                bb,
+                &mut output,
+                ids,
+                include,
+                dep_node_ids,
+                strip_tags,
+            )?;
+            flush_local(bb, &mut output)?;
+            Ok((output, (nodes, ways, relations)))
+        })
         .collect();
 
     let mut total_nodes: u64 = 0;
@@ -774,7 +863,9 @@ mod tests {
         assert!(err.contains("relation id -7"), "{err}");
 
         // Bare negative number with default type must also reject.
-        let err = parse_id_spec("-5", Some(DefaultType::Node)).unwrap_err().to_string();
+        let err = parse_id_spec("-5", Some(DefaultType::Node))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("node id -5"), "{err}");
     }
 }

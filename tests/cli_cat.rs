@@ -16,10 +16,10 @@ use std::path::Path;
 
 use common::cli::CliInvoker;
 use common::{
-    generate_nodes, generate_ways, node_ids_with_coords as node_ids,
-    read_all_elements_with_coords, read_normalized, relation_ids_with_coords as relation_ids,
-    way_ids_with_coords as way_ids, write_multi_block_test_pbf, write_test_pbf, NormalizedPbf,
-    TestMember, TestMeta, TestNode, TestRelation, TestWay,
+    NormalizedPbf, TestMember, TestMeta, TestNode, TestRelation, TestWay, generate_nodes,
+    generate_ways, node_ids_with_coords as node_ids, read_all_elements_with_coords,
+    read_normalized, relation_ids_with_coords as relation_ids, way_ids_with_coords as way_ids,
+    write_multi_block_test_pbf, write_test_pbf,
 };
 use pbfhogg::MemberId;
 
@@ -62,20 +62,44 @@ fn cat_passthrough_buffered() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "a")], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "b")], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("name", "a")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![("name", "b")],
+                meta: None,
+            },
         ],
-        &[TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "path")], meta: None }],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "path")],
+            meta: None,
+        }],
         &[TestRelation {
             id: 20,
-            members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+            members: vec![TestMember {
+                id: MemberId::Way(10),
+                role: "outer",
+            }],
             tags: vec![("type", "multipolygon")],
             meta: None,
         }],
     );
 
     let out = run_cat(&[&input], &output, None, &[], false);
-    assert!(out.status.success(), "cat failed; stderr:\n{}", out.stderr_str());
+    assert!(
+        out.status.success(),
+        "cat failed; stderr:\n{}",
+        out.stderr_str()
+    );
     // Passthrough path summary: "{N} blobs passed through"
     assert!(
         out.stderr_str().contains("blobs passed through"),
@@ -108,25 +132,52 @@ fn cat_type_filter_nodes_only() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "a")], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("name", "a")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
-        &[TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "path")], meta: None }],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "path")],
+            meta: None,
+        }],
         &[TestRelation {
             id: 20,
-            members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+            members: vec![TestMember {
+                id: MemberId::Way(10),
+                role: "outer",
+            }],
             tags: vec![("type", "multipolygon")],
             meta: None,
         }],
     );
 
     let out = run_cat(&[&input], &output, Some("node"), &[], false);
-    assert!(out.status.success(), "cat --type node failed; stderr:\n{}", out.stderr_str());
+    assert!(
+        out.status.success(),
+        "cat --type node failed; stderr:\n{}",
+        out.stderr_str()
+    );
 
     let c = read_all_elements_with_coords(&output);
     assert_eq!(node_ids(&c), vec![1, 2]);
     assert!(way_ids(&c).is_empty(), "ways should be filtered out");
-    assert!(relation_ids(&c).is_empty(), "relations should be filtered out");
+    assert!(
+        relation_ids(&c).is_empty(),
+        "relations should be filtered out"
+    );
 }
 
 #[test]
@@ -138,25 +189,52 @@ fn cat_type_filter_ways_only() {
     write_test_pbf(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
-        &[TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "path")], meta: None }],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "path")],
+            meta: None,
+        }],
         &[TestRelation {
             id: 20,
-            members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+            members: vec![TestMember {
+                id: MemberId::Way(10),
+                role: "outer",
+            }],
             tags: vec![("type", "multipolygon")],
             meta: None,
         }],
     );
 
     let out = run_cat(&[&input], &output, Some("way"), &[], false);
-    assert!(out.status.success(), "cat --type way failed; stderr:\n{}", out.stderr_str());
+    assert!(
+        out.status.success(),
+        "cat --type way failed; stderr:\n{}",
+        out.stderr_str()
+    );
 
     let c = read_all_elements_with_coords(&output);
     assert!(node_ids(&c).is_empty(), "nodes should be filtered out");
     assert_eq!(way_ids(&c), vec![10]);
-    assert!(relation_ids(&c).is_empty(), "relations should be filtered out");
+    assert!(
+        relation_ids(&c).is_empty(),
+        "relations should be filtered out"
+    );
 }
 
 #[test]
@@ -167,25 +245,44 @@ fn cat_type_filter_node_way() {
 
     write_test_pbf(
         &input,
-        &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
-        ],
-        &[TestWay { id: 10, refs: vec![1], tags: vec![("highway", "path")], meta: None }],
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![],
+            meta: None,
+        }],
+        &[TestWay {
+            id: 10,
+            refs: vec![1],
+            tags: vec![("highway", "path")],
+            meta: None,
+        }],
         &[TestRelation {
             id: 20,
-            members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+            members: vec![TestMember {
+                id: MemberId::Way(10),
+                role: "outer",
+            }],
             tags: vec![("type", "multipolygon")],
             meta: None,
         }],
     );
 
     let out = run_cat(&[&input], &output, Some("node,way"), &[], false);
-    assert!(out.status.success(), "cat --type node,way failed; stderr:\n{}", out.stderr_str());
+    assert!(
+        out.status.success(),
+        "cat --type node,way failed; stderr:\n{}",
+        out.stderr_str()
+    );
 
     let c = read_all_elements_with_coords(&output);
     assert_eq!(node_ids(&c), vec![1]);
     assert_eq!(way_ids(&c), vec![10]);
-    assert!(relation_ids(&c).is_empty(), "relations should be filtered out");
+    assert!(
+        relation_ids(&c).is_empty(),
+        "relations should be filtered out"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -201,19 +298,40 @@ fn cat_multi_file() {
 
     write_test_pbf(
         &input1,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "a")], meta: None }],
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![("name", "a")],
+            meta: None,
+        }],
         &[],
         &[],
     );
     write_test_pbf(
         &input2,
-        &[TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "b")], meta: None }],
-        &[TestWay { id: 10, refs: vec![2], tags: vec![("highway", "road")], meta: None }],
+        &[TestNode {
+            id: 2,
+            lat: 110_000_000,
+            lon: 210_000_000,
+            tags: vec![("name", "b")],
+            meta: None,
+        }],
+        &[TestWay {
+            id: 10,
+            refs: vec![2],
+            tags: vec![("highway", "road")],
+            meta: None,
+        }],
         &[],
     );
 
     let out = run_cat(&[&input1, &input2], &output, None, &[], false);
-    assert!(out.status.success(), "cat multi-file failed; stderr:\n{}", out.stderr_str());
+    assert!(
+        out.status.success(),
+        "cat multi-file failed; stderr:\n{}",
+        out.stderr_str()
+    );
 
     let c = read_all_elements_with_coords(&output);
     assert_eq!(c.nodes.len(), 2);
@@ -269,7 +387,10 @@ fn write_clean_fixture(path: &Path) {
         }],
         &[TestRelation {
             id: 100,
-            members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+            members: vec![TestMember {
+                id: MemberId::Way(10),
+                role: "outer",
+            }],
             tags: vec![("type", "route")],
             meta,
         }],
@@ -326,8 +447,14 @@ fn clean_version_only() {
     ] {
         let m = meta.unwrap_or_else(|| panic!("{what} should carry metadata"));
         assert_eq!(m.version, 0, "{what} version must be zeroed");
-        assert_eq!(m.timestamp, sentinel.timestamp, "{what} timestamp must survive");
-        assert_eq!(m.changeset, sentinel.changeset, "{what} changeset must survive");
+        assert_eq!(
+            m.timestamp, sentinel.timestamp,
+            "{what} timestamp must survive"
+        );
+        assert_eq!(
+            m.changeset, sentinel.changeset,
+            "{what} changeset must survive"
+        );
         assert_eq!(m.uid, sentinel.uid, "{what} uid must survive");
         assert_eq!(m.user, sentinel.user, "{what} user must survive");
     }
@@ -345,8 +472,14 @@ fn clean_user_only() {
     ] {
         let m = meta.unwrap_or_else(|| panic!("{what} should carry metadata"));
         assert_eq!(m.version, sentinel.version, "{what} version must survive");
-        assert_eq!(m.timestamp, sentinel.timestamp, "{what} timestamp must survive");
-        assert_eq!(m.changeset, sentinel.changeset, "{what} changeset must survive");
+        assert_eq!(
+            m.timestamp, sentinel.timestamp,
+            "{what} timestamp must survive"
+        );
+        assert_eq!(
+            m.changeset, sentinel.changeset,
+            "{what} changeset must survive"
+        );
         assert_eq!(m.uid, sentinel.uid, "{what} uid must survive");
         assert_eq!(m.user, "", "{what} user must be empty");
     }
@@ -459,7 +592,11 @@ fn cat_type_way_passthrough_across_multiple_blobs() {
     write_multi_block_test_pbf(&input, &nodes, &ways, &[], 10);
 
     let out = run_cat(&[&input], &output, Some("way"), &[], false);
-    assert!(out.status.success(), "cat --type way failed; stderr:\n{}", out.stderr_str());
+    assert!(
+        out.status.success(),
+        "cat --type way failed; stderr:\n{}",
+        out.stderr_str()
+    );
 
     // Passthrough summary fires when blobs_decoded == 0; in
     // type-filter raw passthrough we expect exactly 2 way blobs
@@ -503,13 +640,33 @@ mod platform {
         write_test_pbf(
             &input,
             &[
-                TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "a")], meta: None },
-                TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "b")], meta: None },
+                TestNode {
+                    id: 1,
+                    lat: 100_000_000,
+                    lon: 200_000_000,
+                    tags: vec![("name", "a")],
+                    meta: None,
+                },
+                TestNode {
+                    id: 2,
+                    lat: 110_000_000,
+                    lon: 210_000_000,
+                    tags: vec![("name", "b")],
+                    meta: None,
+                },
             ],
-            &[TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "path")], meta: None }],
+            &[TestWay {
+                id: 10,
+                refs: vec![1, 2],
+                tags: vec![("highway", "path")],
+                meta: None,
+            }],
             &[TestRelation {
                 id: 20,
-                members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+                members: vec![TestMember {
+                    id: MemberId::Way(10),
+                    role: "outer",
+                }],
                 tags: vec![("type", "multipolygon")],
                 meta: None,
             }],

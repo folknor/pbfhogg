@@ -329,10 +329,7 @@ pub struct DenseNodeInfoIter<'a> {
 }
 
 impl<'a> DenseNodeInfoIter<'a> {
-    fn new(
-        block: &'a WireBlock<'static>,
-        info: WireDenseInfo<'a>,
-    ) -> DenseNodeInfoIter<'a> {
+    fn new(block: &'a WireBlock<'static>, info: WireDenseInfo<'a>) -> DenseNodeInfoIter<'a> {
         DenseNodeInfoIter {
             block,
             versions: PackedInt32Iter::new(info.version_data),

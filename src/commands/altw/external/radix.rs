@@ -42,9 +42,8 @@ pub(crate) struct ScratchDir {
 impl ScratchDir {
     pub(crate) fn new(parent: &Path, name: &str) -> Result<Self> {
         let path = parent.join(format!(".pbfhogg-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&path).map_err(|e| {
-            format!("failed to create scratch directory {}: {e}", path.display())
-        })?;
+        std::fs::create_dir_all(&path)
+            .map_err(|e| format!("failed to create scratch directory {}: {e}", path.display()))?;
         Ok(Self { path })
     }
 

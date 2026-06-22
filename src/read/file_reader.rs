@@ -30,7 +30,10 @@ impl FileReader {
     /// `posix_fadvise(POSIX_FADV_SEQUENTIAL)`.
     pub fn buffered(path: &Path) -> io::Result<Self> {
         let f = File::open(path)?;
-        #[cfg(all(target_os = "linux", any(feature = "linux-direct-io", feature = "linux-io-uring")))]
+        #[cfg(all(
+            target_os = "linux",
+            any(feature = "linux-direct-io", feature = "linux-io-uring")
+        ))]
         {
             use std::os::unix::io::AsRawFd;
             // Advisory hint for sequential readahead - matches osmium's approach.

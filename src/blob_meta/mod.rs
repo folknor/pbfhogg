@@ -13,7 +13,7 @@ mod scan_ids;
 mod tag_index;
 
 pub(crate) use scan_ids::scan_block_ids;
-pub(crate) use tag_index::{scan_block_tags, TagIndex, TAG_INDEX_VERSION};
+pub(crate) use tag_index::{TAG_INDEX_VERSION, TagIndex, scan_block_tags};
 
 /// Element type stored in a blob index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,7 +39,12 @@ pub struct BlobBbox {
 impl BlobBbox {
     /// Create a new bounding box from decimicrodegree coordinates.
     pub fn new(min_lat: i32, max_lat: i32, min_lon: i32, max_lon: i32) -> Self {
-        Self { min_lat, max_lat, min_lon, max_lon }
+        Self {
+            min_lat,
+            max_lat,
+            min_lon,
+            max_lon,
+        }
     }
 
     /// Returns `true` if `inner` is fully contained within this bbox.
@@ -131,7 +136,8 @@ impl BlobIndex {
         let count = u64::from_le_bytes(data[18..26].try_into().ok()?);
 
         // v2: parse spatial bbox for node blobs
-        let bbox = if version == INDEX_VERSION && data.len() >= INDEX_SIZE && kind == ElemKind::Node {
+        let bbox = if version == INDEX_VERSION && data.len() >= INDEX_SIZE && kind == ElemKind::Node
+        {
             let min_lat = i32::from_le_bytes(data[26..30].try_into().ok()?);
             let max_lat = i32::from_le_bytes(data[30..34].try_into().ok()?);
             let min_lon = i32::from_le_bytes(data[34..38].try_into().ok()?);
@@ -140,13 +146,24 @@ impl BlobIndex {
             if min_lat == 0 && max_lat == 0 && min_lon == 0 && max_lon == 0 {
                 None
             } else {
-                Some(BlobBbox { min_lat, max_lat, min_lon, max_lon })
+                Some(BlobBbox {
+                    min_lat,
+                    max_lat,
+                    min_lon,
+                    max_lon,
+                })
             }
         } else {
             None
         };
 
-        Some(BlobIndex { kind, min_id, max_id, count, bbox })
+        Some(BlobIndex {
+            kind,
+            min_id,
+            max_id,
+            count,
+            bbox,
+        })
     }
 }
 
@@ -190,8 +207,12 @@ impl BlobFilter {
     /// Create a filter that accepts only the specified element types.
     pub fn new(want_nodes: bool, want_ways: bool, want_relations: bool) -> Self {
         Self {
-            want_nodes, want_ways, want_relations,
-            node_bbox: None, required_tag_keys: None, required_tag_prefixes: None,
+            want_nodes,
+            want_ways,
+            want_relations,
+            node_bbox: None,
+            required_tag_keys: None,
+            required_tag_prefixes: None,
         }
     }
 
@@ -268,7 +289,8 @@ impl BlobFilter {
     /// prefixes are skipped (e.g. `addr:` matches `addr:city`, `addr:street`).
     pub fn with_required_tag_prefixes(mut self, prefixes: Vec<String>) -> Self {
         self.required_tag_prefixes = Some(
-            prefixes.into_iter()
+            prefixes
+                .into_iter()
                 .map(|s| s.into_bytes().into_boxed_slice())
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -433,7 +455,10 @@ mod tests {
         assert!(a.intersects(&b), "overlapping boxes should intersect");
 
         let c = BlobBbox::new(200, 300, 200, 300);
-        assert!(!a.intersects(&c), "non-overlapping boxes should not intersect");
+        assert!(
+            !a.intersects(&c),
+            "non-overlapping boxes should not intersect"
+        );
 
         // Edge-touching
         let d = BlobBbox::new(100, 200, 100, 200);
@@ -452,9 +477,12 @@ mod tests {
 
     #[test]
     fn wants_index_spatial_filter() {
-        let filter = BlobFilter::new(true, true, true).with_node_bbox(
-            BlobBbox::new(500_000_000, 520_000_000, 100_000_000, 120_000_000),
-        );
+        let filter = BlobFilter::new(true, true, true).with_node_bbox(BlobBbox::new(
+            500_000_000,
+            520_000_000,
+            100_000_000,
+            120_000_000,
+        ));
 
         // Node blob inside filter bbox → accepted
         let inside = BlobIndex {
@@ -462,7 +490,12 @@ mod tests {
             min_id: 1,
             max_id: 100,
             count: 100,
-            bbox: Some(BlobBbox::new(510_000_000, 515_000_000, 110_000_000, 115_000_000)),
+            bbox: Some(BlobBbox::new(
+                510_000_000,
+                515_000_000,
+                110_000_000,
+                115_000_000,
+            )),
         };
         assert!(filter.wants_index(&inside));
 
@@ -472,7 +505,12 @@ mod tests {
             min_id: 200,
             max_id: 300,
             count: 100,
-            bbox: Some(BlobBbox::new(-100_000_000, -50_000_000, -100_000_000, -50_000_000)),
+            bbox: Some(BlobBbox::new(
+                -100_000_000,
+                -50_000_000,
+                -100_000_000,
+                -50_000_000,
+            )),
         };
         assert!(!filter.wants_index(&outside));
 

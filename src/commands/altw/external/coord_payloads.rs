@@ -209,7 +209,10 @@ impl ConcurrentBlobLocationRouter {
         });
         drop(guard);
         {
-            let mut s = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut s = self
+                .stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             s.num_worker += 1;
             s.worker_bytes += byte_length;
         }
@@ -284,7 +287,10 @@ impl ConcurrentBlobLocationRouter {
         *slot_guard = Some(BlobLocation::Straddler { bytes });
         drop(slot_guard);
         {
-            let mut s = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut s = self
+                .stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             s.num_straddlers += 1;
             s.straddler_bytes += byte_len;
             s.straddler_encode_ns += encode_ns;
@@ -466,10 +472,7 @@ pub(super) struct AbortOnDrop<'a> {
 }
 
 impl<'a> AbortOnDrop<'a> {
-    pub(super) fn new(
-        router: &'a ConcurrentBlobLocationRouter,
-        label: &'static str,
-    ) -> Self {
+    pub(super) fn new(router: &'a ConcurrentBlobLocationRouter, label: &'static str) -> Self {
         Self {
             router,
             label,
@@ -541,11 +544,7 @@ fn scan_blob_record(cursor: &mut protohoggr::Cursor<'_>, blob_idx: usize) -> Res
 }
 
 #[cfg(test)]
-fn decode_blob_record_into(
-    record: &[u8],
-    blob_idx: usize,
-    scratch: &mut Vec<u32>,
-) -> Result<()> {
+fn decode_blob_record_into(record: &[u8], blob_idx: usize, scratch: &mut Vec<u32>) -> Result<()> {
     let mut cursor = protohoggr::Cursor::new(record);
     let num_ways = cursor
         .read_varint()
@@ -615,10 +614,7 @@ fn build_per_way_refcount_index(data: Vec<u8>, num_way_blobs: usize) -> Result<P
         .into());
     }
 
-    Ok(PerWayRcs {
-        data,
-        offsets,
-    })
+    Ok(PerWayRcs { data, offsets })
 }
 
 /// Parse the per-way refcount sidecar bytes into an indexed `PerWayRcs`.
@@ -635,11 +631,9 @@ pub(super) fn load_per_way_refcount_sidecar_indexed(
     path: &Path,
     num_way_blobs: usize,
 ) -> Result<PerWayRcs> {
-    let data = std::fs::read(path)
-        .map_err(|e| format!("read per-way refcount sidecar: {e}"))?;
+    let data = std::fs::read(path).map_err(|e| format!("read per-way refcount sidecar: {e}"))?;
     build_per_way_refcount_index(data, num_way_blobs)
 }
-
 
 const _: () = {
     assert!(COORD_SLOT_SIZE == 8);
@@ -840,9 +834,12 @@ mod tests {
     fn encode_blob_payload_multiple_ways() {
         // Three ways of 2/3/1 refs; deltas reset at way boundaries.
         let coords = [
-            (10_i32, 20_i32), (30_i32, 40_i32),           // way 0
-            (500_i32, 600_i32), (510_i32, 610_i32), (490_i32, 590_i32), // way 1
-            (9999_i32, -9999_i32),                          // way 2
+            (10_i32, 20_i32),
+            (30_i32, 40_i32), // way 0
+            (500_i32, 600_i32),
+            (510_i32, 610_i32),
+            (490_i32, 590_i32),    // way 1
+            (9999_i32, -9999_i32), // way 2
         ];
         let cb = make_coord_bytes(&coords);
         let rcs = [2u32, 3u32, 1u32];
@@ -914,8 +911,14 @@ mod tests {
         let pwr = parse_per_way_refcount_sidecar_bytes(&sidecar, 2).expect("parse");
         let mut scratch: Vec<u32> = Vec::new();
         assert_eq!(pwr.num_blobs(), 2);
-        assert_eq!(pwr.decode_blob_into(0, &mut scratch).expect("decode 0"), &[3u32, 1u32]);
-        assert_eq!(pwr.decode_blob_into(1, &mut scratch).expect("decode 1"), &[2u32]);
+        assert_eq!(
+            pwr.decode_blob_into(0, &mut scratch).expect("decode 0"),
+            &[3u32, 1u32]
+        );
+        assert_eq!(
+            pwr.decode_blob_into(1, &mut scratch).expect("decode 1"),
+            &[2u32]
+        );
     }
 
     #[test]
@@ -924,15 +927,24 @@ mod tests {
         let sidecar = make_sidecar_bytes(&[&[], &[1]]);
         let pwr = parse_per_way_refcount_sidecar_bytes(&sidecar, 2).expect("parse");
         let mut scratch: Vec<u32> = Vec::new();
-        assert_eq!(pwr.decode_blob_into(0, &mut scratch).expect("decode 0"), &[] as &[u32]);
-        assert_eq!(pwr.decode_blob_into(1, &mut scratch).expect("decode 1"), &[1u32]);
+        assert_eq!(
+            pwr.decode_blob_into(0, &mut scratch).expect("decode 0"),
+            &[] as &[u32]
+        );
+        assert_eq!(
+            pwr.decode_blob_into(1, &mut scratch).expect("decode 1"),
+            &[1u32]
+        );
     }
 
     #[test]
     fn encode_blob_payload_from_record_matches_decoded_path() {
         let coords = [
-            (10_i32, 20_i32), (30_i32, 40_i32),
-            (500_i32, 600_i32), (510_i32, 610_i32), (490_i32, 590_i32),
+            (10_i32, 20_i32),
+            (30_i32, 40_i32),
+            (500_i32, 600_i32),
+            (510_i32, 610_i32),
+            (490_i32, 590_i32),
             (9999_i32, -9999_i32),
         ];
         let cb = make_coord_bytes(&coords);
@@ -943,7 +955,10 @@ mod tests {
 
         encode_blob_payload_from_record(&cb, pwr.blob_record(0), 0, &mut from_record)
             .expect("encode from record");
-        let decoded = pwr.decode_blob_into(0, &mut scratch).expect("decode 0").to_vec();
+        let decoded = pwr
+            .decode_blob_into(0, &mut scratch)
+            .expect("decode 0")
+            .to_vec();
         encode_blob_payload(&cb, &decoded, &mut from_decoded).expect("encode decoded");
 
         assert_eq!(from_record, from_decoded);
@@ -954,5 +969,4 @@ mod tests {
         let sidecar = make_sidecar_bytes(blobs);
         parse_per_way_refcount_sidecar_bytes(&sidecar, blobs.len()).expect("make_per_way_rcs")
     }
-
 }

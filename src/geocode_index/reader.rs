@@ -9,13 +9,13 @@ use memmap2::Mmap;
 use s2::cellid::CellID;
 use s2::latlng::LatLng;
 
-use crate::geo;
 use super::format::{
-    self, AdminCell, AdminPolygon, AddrPoint, GeoCell, Header, InterpWay, NodeCoord,
-    SegmentRef, StreetWay, ADMIN_CELL_SIZE, ADMIN_POLYGON_SIZE, ADDR_POINT_SIZE,
-    GEO_CELL_SIZE, HEADER_SIZE, INDEX_MASK, INTERIOR_FLAG, INTERP_WAY_SIZE,
-    NODE_COORD_SIZE, SEGMENT_REF_SIZE, STREET_WAY_SIZE,
+    self, ADDR_POINT_SIZE, ADMIN_CELL_SIZE, ADMIN_POLYGON_SIZE, AddrPoint, AdminCell, AdminPolygon,
+    GEO_CELL_SIZE, GeoCell, HEADER_SIZE, Header, INDEX_MASK, INTERIOR_FLAG, INTERP_WAY_SIZE,
+    InterpWay, NODE_COORD_SIZE, NodeCoord, SEGMENT_REF_SIZE, STREET_WAY_SIZE, SegmentRef,
+    StreetWay,
 };
+use crate::geo;
 
 // ---------------------------------------------------------------------------
 // Public result types
@@ -92,20 +92,26 @@ impl<'a> Candidates<'a> {
     /// Apply default ranking: nearest of each type, smallest admin per level,
     /// postcode fallback from nearest address if no postal boundary.
     pub fn into_result(self, reader: &'a Reader) -> ReverseResult<'a> {
-        let address = self
-            .addresses
-            .into_iter()
-            .min_by(|a, b| a.distance_m.partial_cmp(&b.distance_m).unwrap_or(std::cmp::Ordering::Equal));
+        let address = self.addresses.into_iter().min_by(|a, b| {
+            a.distance_m
+                .partial_cmp(&b.distance_m)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
-        let street = self
-            .streets
-            .into_iter()
-            .min_by(|a, b| a.distance_m.partial_cmp(&b.distance_m).unwrap_or(std::cmp::Ordering::Equal));
+        let street = self.streets.into_iter().min_by(|a, b| {
+            a.distance_m
+                .partial_cmp(&b.distance_m)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let interpolation = self
             .interpolations
             .iter()
-            .min_by(|a, b| a.distance_m.partial_cmp(&b.distance_m).unwrap_or(std::cmp::Ordering::Equal))
+            .min_by(|a, b| {
+                a.distance_m
+                    .partial_cmp(&b.distance_m)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .and_then(|c| {
                 let hn = reader.interpolate(c)?;
                 Some(InterpolationMatch {
@@ -191,7 +197,8 @@ impl Reader {
             let path = dir.join(name);
             let file = std::fs::File::open(&path)
                 .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-            let len = file.metadata()
+            let len = file
+                .metadata()
                 .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
                 .len();
             if len == 0 {
@@ -199,12 +206,18 @@ impl Reader {
                 // Return an empty read-only anonymous mmap instead.
                 // All consumers check record bounds before reading,
                 // so an empty mmap (len=0) is handled correctly.
-                return Ok(
-                    memmap2::MmapOptions::new().map_anon()
-                        .map_err(|e| format!("failed to create empty mmap for {}: {e}", path.display()))?
-                        .make_read_only()
-                        .map_err(|e| format!("failed to make anon mmap read-only for {}: {e}", path.display()))?
-                );
+                return Ok(memmap2::MmapOptions::new()
+                    .map_anon()
+                    .map_err(|e| {
+                        format!("failed to create empty mmap for {}: {e}", path.display())
+                    })?
+                    .make_read_only()
+                    .map_err(|e| {
+                        format!(
+                            "failed to make anon mmap read-only for {}: {e}",
+                            path.display()
+                        )
+                    })?);
             }
             // SAFETY: the file is read-only for the lifetime of the Reader.
             let m = unsafe { Mmap::map(&file) }
@@ -300,11 +313,11 @@ impl Reader {
             }
         });
 
-        let interpolation = best
-            .interp
-            .and_then(|(way_idx, seg_idx, snap_lat, snap_lon, dist_sq)| {
-                self.resolve_interpolation(way_idx, seg_idx, snap_lat, snap_lon, dist_sq)
-            });
+        let interpolation =
+            best.interp
+                .and_then(|(way_idx, seg_idx, snap_lat, snap_lon, dist_sq)| {
+                    self.resolve_interpolation(way_idx, seg_idx, snap_lat, snap_lon, dist_sq)
+                });
 
         ReverseResult {
             address,
@@ -431,14 +444,18 @@ impl QueryContext {
 
 /// Tracks nearest candidate of each type for `query()` (allocation-free).
 struct BestTracker {
-    addr: Option<(u32, f64)>,                   // (index, dist_sq)
-    street: Option<(u32, i32, i32, f64)>,       // (way_idx, snap_lat, snap_lon, dist_sq)
-    interp: Option<(u32, u16, i32, i32, f64)>,  // (way_idx, seg_idx, snap_lat, snap_lon, dist_sq)
+    addr: Option<(u32, f64)>,                  // (index, dist_sq)
+    street: Option<(u32, i32, i32, f64)>,      // (way_idx, snap_lat, snap_lon, dist_sq)
+    interp: Option<(u32, u16, i32, i32, f64)>, // (way_idx, seg_idx, snap_lat, snap_lon, dist_sq)
 }
 
 impl BestTracker {
     fn new() -> Self {
-        Self { addr: None, street: None, interp: None }
+        Self {
+            addr: None,
+            street: None,
+            interp: None,
+        }
     }
 }
 
@@ -474,10 +491,18 @@ impl<'a> U32EntryIter<'a> {
     fn new(mmap: &'a [u8], offset: u64) -> Self {
         let off = offset as usize;
         if off + 2 > mmap.len() {
-            return Self { data: mmap, pos: 0, remaining: 0 };
+            return Self {
+                data: mmap,
+                pos: 0,
+                remaining: 0,
+            };
         }
         let count = u16::from_le_bytes([mmap[off], mmap[off + 1]]);
-        Self { data: mmap, pos: off + 2, remaining: count }
+        Self {
+            data: mmap,
+            pos: off + 2,
+            remaining: count,
+        }
     }
 }
 
@@ -517,12 +542,19 @@ impl<'a> SegmentEntryIter<'a> {
     fn new(mmap: &'a [u8], offset: u64) -> Self {
         let off = offset as usize;
         if off + 2 > mmap.len() {
-            return Self { data: mmap, pos: 0, remaining: 0 };
+            return Self {
+                data: mmap,
+                pos: 0,
+                remaining: 0,
+            };
         }
         let count = u16::from_le_bytes([mmap[off], mmap[off + 1]]);
-        Self { data: mmap, pos: off + 2, remaining: count }
+        Self {
+            data: mmap,
+            pos: off + 2,
+            remaining: count,
+        }
     }
-
 }
 
 impl Iterator for SegmentEntryIter<'_> {
@@ -555,10 +587,18 @@ impl<'a> AdminEntryIter<'a> {
     fn new(mmap: &'a [u8], offset: u32) -> Self {
         let off = offset as usize;
         if off + 2 > mmap.len() {
-            return Self { data: mmap, pos: 0, remaining: 0 };
+            return Self {
+                data: mmap,
+                pos: 0,
+                remaining: 0,
+            };
         }
         let count = u16::from_le_bytes([mmap[off], mmap[off + 1]]);
-        Self { data: mmap, pos: off + 2, remaining: count }
+        Self {
+            data: mmap,
+            pos: off + 2,
+            remaining: count,
+        }
     }
 }
 
@@ -645,8 +685,10 @@ impl Reader {
                 for idx in U32EntryIter::new(addr_entries_mmap, gc.addr_offset) {
                     let pt = self.read_addr_point(idx);
                     let dist_sq = geo::approx_distance_sq(
-                        ctx.lat_rad, ctx.lon_rad,
-                        geo::e7_to_rad(pt.lat_e7), geo::e7_to_rad(pt.lon_e7),
+                        ctx.lat_rad,
+                        ctx.lon_rad,
+                        geo::e7_to_rad(pt.lat_e7),
+                        geo::e7_to_rad(pt.lon_e7),
                         ctx.cos_lat,
                     );
                     if dist_sq < max_dist_sq
@@ -660,10 +702,10 @@ impl Reader {
             // Street segments
             if gc.street_offset != format::NO_DATA_U64 {
                 for seg_ref in SegmentEntryIter::new(street_entries_mmap, gc.street_offset) {
-                    let (snap_lat, snap_lon, dist_sq) =
-                        self.street_segment_distance(ctx, &seg_ref);
+                    let (snap_lat, snap_lon, dist_sq) = self.street_segment_distance(ctx, &seg_ref);
                     if dist_sq < max_dist_sq
-                        && (best.street.is_none() || dist_sq < best.street.map_or(f64::MAX, |b| b.3))
+                        && (best.street.is_none()
+                            || dist_sq < best.street.map_or(f64::MAX, |b| b.3))
                     {
                         best.street = Some((seg_ref.way_index, snap_lat, snap_lon, dist_sq));
                     }
@@ -673,14 +715,17 @@ impl Reader {
             // Interpolation segments
             if gc.interp_offset != format::NO_DATA_U64 {
                 for seg_ref in SegmentEntryIter::new(interp_entries_mmap, gc.interp_offset) {
-                    let (snap_lat, snap_lon, dist_sq) =
-                        self.interp_segment_distance(ctx, &seg_ref);
+                    let (snap_lat, snap_lon, dist_sq) = self.interp_segment_distance(ctx, &seg_ref);
                     if dist_sq < max_dist_sq
-                        && (best.interp.is_none() || dist_sq < best.interp.map_or(f64::MAX, |b| b.4))
+                        && (best.interp.is_none()
+                            || dist_sq < best.interp.map_or(f64::MAX, |b| b.4))
                     {
                         best.interp = Some((
-                            seg_ref.way_index, seg_ref.segment_index,
-                            snap_lat, snap_lon, dist_sq,
+                            seg_ref.way_index,
+                            seg_ref.segment_index,
+                            snap_lat,
+                            snap_lon,
+                            dist_sq,
                         ));
                     }
                 }
@@ -713,8 +758,10 @@ impl Reader {
                 for idx in U32EntryIter::new(addr_entries_mmap, gc.addr_offset) {
                     let pt = self.read_addr_point(idx);
                     let dist_sq = geo::approx_distance_sq(
-                        ctx.lat_rad, ctx.lon_rad,
-                        geo::e7_to_rad(pt.lat_e7), geo::e7_to_rad(pt.lon_e7),
+                        ctx.lat_rad,
+                        ctx.lon_rad,
+                        geo::e7_to_rad(pt.lat_e7),
+                        geo::e7_to_rad(pt.lon_e7),
                         ctx.cos_lat,
                     );
                     if dist_sq < max_dist_sq {
@@ -732,8 +779,7 @@ impl Reader {
 
             if gc.street_offset != format::NO_DATA_U64 {
                 for seg_ref in SegmentEntryIter::new(street_entries_mmap, gc.street_offset) {
-                    let (snap_lat, snap_lon, dist_sq) =
-                        self.street_segment_distance(ctx, &seg_ref);
+                    let (snap_lat, snap_lon, dist_sq) = self.street_segment_distance(ctx, &seg_ref);
                     if dist_sq < max_dist_sq {
                         let way = self.read_street_way(seg_ref.way_index);
                         cands.streets.push(StreetMatch {
@@ -748,8 +794,7 @@ impl Reader {
 
             if gc.interp_offset != format::NO_DATA_U64 {
                 for seg_ref in SegmentEntryIter::new(interp_entries_mmap, gc.interp_offset) {
-                    let (snap_lat, snap_lon, dist_sq) =
-                        self.interp_segment_distance(ctx, &seg_ref);
+                    let (snap_lat, snap_lon, dist_sq) = self.interp_segment_distance(ctx, &seg_ref);
                     if dist_sq < max_dist_sq {
                         let iw = self.read_interp_way(seg_ref.way_index);
                         cands.interpolations.push(InterpolationCandidate {
@@ -778,7 +823,9 @@ impl Reader {
             let Some(ac) = binary_search_admin_cells(&self.admin_cells, cell_count, cell_id) else {
                 continue;
             };
-            for (poly_idx, is_interior) in AdminEntryIter::new(&self.admin_entries, ac.entries_offset) {
+            for (poly_idx, is_interior) in
+                AdminEntryIter::new(&self.admin_entries, ac.entries_offset)
+            {
                 let poly = self.read_admin_polygon(poly_idx);
                 let level = poly.admin_level as usize;
                 if level >= 12 || poly.area >= best_by_level[level].1 {
@@ -817,7 +864,9 @@ impl Reader {
             let Some(ac) = binary_search_admin_cells(&self.admin_cells, cell_count, cell_id) else {
                 continue;
             };
-            for (poly_idx, is_interior) in AdminEntryIter::new(&self.admin_entries, ac.entries_offset) {
+            for (poly_idx, is_interior) in
+                AdminEntryIter::new(&self.admin_entries, ac.entries_offset)
+            {
                 if seen.contains(&poly_idx) {
                     continue;
                 }
@@ -892,8 +941,11 @@ impl Reader {
         read_record::<ADDR_POINT_SIZE>(&self.addr_points, offset)
             .map(AddrPoint::from_bytes)
             .unwrap_or(AddrPoint {
-                lat_e7: 0, lon_e7: 0,
-                housenumber_offset: 0, street_offset: 0, postcode_offset: 0,
+                lat_e7: 0,
+                lon_e7: 0,
+                housenumber_offset: 0,
+                street_offset: 0,
+                postcode_offset: 0,
             })
     }
 
@@ -901,7 +953,11 @@ impl Reader {
         let offset = index as usize * STREET_WAY_SIZE;
         read_record::<STREET_WAY_SIZE>(&self.street_ways, offset)
             .map(StreetWay::from_bytes)
-            .unwrap_or(StreetWay { node_offset: 0, name_offset: 0, node_count: 0 })
+            .unwrap_or(StreetWay {
+                node_offset: 0,
+                name_offset: 0,
+                node_count: 0,
+            })
     }
 
     fn read_interp_way(&self, index: u32) -> InterpWay {
@@ -909,8 +965,12 @@ impl Reader {
         read_record::<INTERP_WAY_SIZE>(&self.interp_ways, offset)
             .map(InterpWay::from_bytes)
             .unwrap_or(InterpWay {
-                node_offset: 0, street_offset: 0,
-                start_number: 0, end_number: 0, node_count: 0, interpolation_type: 0,
+                node_offset: 0,
+                street_offset: 0,
+                start_number: 0,
+                end_number: 0,
+                node_count: 0,
+                interpolation_type: 0,
             })
     }
 
@@ -919,8 +979,12 @@ impl Reader {
         read_record::<ADMIN_POLYGON_SIZE>(&self.admin_polygons, offset)
             .map(AdminPolygon::from_bytes)
             .unwrap_or(AdminPolygon {
-                area: 0.0, vertex_offset: 0, vertex_count: 0,
-                name_offset: 0, country_code_offset: 0, admin_level: 0,
+                area: 0.0,
+                vertex_offset: 0,
+                vertex_count: 0,
+                name_offset: 0,
+                country_code_offset: 0,
+                admin_level: 0,
             })
     }
 
@@ -947,7 +1011,11 @@ impl Reader {
             return None;
         }
         let acc_len = self.accumulated_length_radians(
-            &self.interp_nodes, iw.node_offset, seg_idx, snap_lat, snap_lon,
+            &self.interp_nodes,
+            iw.node_offset,
+            seg_idx,
+            snap_lat,
+            snap_lon,
         );
         let t = acc_len / total_len;
         let diff = iw.end_number as f64 - iw.start_number as f64;
@@ -1001,11 +1069,14 @@ impl Reader {
             }
         }
         // Partial segment to snap point
-        if let Some(rec) = read_record::<NODE_COORD_SIZE>(
-            nodes_mmap, base + seg_idx as usize * NODE_COORD_SIZE,
-        ) {
+        if let Some(rec) =
+            read_record::<NODE_COORD_SIZE>(nodes_mmap, base + seg_idx as usize * NODE_COORD_SIZE)
+        {
             let seg_start = NodeCoord::from_bytes(rec);
-            let snap = NodeCoord { lat_e7: snap_lat, lon_e7: snap_lon };
+            let snap = NodeCoord {
+                lat_e7: snap_lat,
+                lon_e7: snap_lon,
+            };
             acc += segment_length_radians(&seg_start, &snap);
         }
         acc
@@ -1024,9 +1095,12 @@ fn two_node_distance(ctx: &QueryContext, nodes_mmap: &Mmap, byte_offset: usize) 
         return (0, 0, f64::MAX);
     };
     let (t, dist_sq) = geo::point_to_segment_distance_sq(
-        ctx.lon_rad, ctx.lat_rad,
-        geo::e7_to_rad(a.lon_e7), geo::e7_to_rad(a.lat_e7),
-        geo::e7_to_rad(b.lon_e7), geo::e7_to_rad(b.lat_e7),
+        ctx.lon_rad,
+        ctx.lat_rad,
+        geo::e7_to_rad(a.lon_e7),
+        geo::e7_to_rad(a.lat_e7),
+        geo::e7_to_rad(b.lon_e7),
+        geo::e7_to_rad(b.lat_e7),
         ctx.cos_lat,
     );
     #[allow(clippy::cast_possible_truncation)]
@@ -1038,8 +1112,10 @@ fn two_node_distance(ctx: &QueryContext, nodes_mmap: &Mmap, byte_offset: usize) 
 
 fn segment_length_radians(a: &NodeCoord, b: &NodeCoord) -> f64 {
     geo::approx_distance_sq(
-        geo::e7_to_rad(a.lat_e7), geo::e7_to_rad(a.lon_e7),
-        geo::e7_to_rad(b.lat_e7), geo::e7_to_rad(b.lon_e7),
+        geo::e7_to_rad(a.lat_e7),
+        geo::e7_to_rad(a.lon_e7),
+        geo::e7_to_rad(b.lat_e7),
+        geo::e7_to_rad(b.lon_e7),
         geo::e7_to_rad(a.lat_e7).cos(),
     )
     .sqrt()
@@ -1086,5 +1162,9 @@ fn radians_sq_to_meters(rad_sq: f64) -> f64 {
 }
 
 fn nonzero_string(reader: &Reader, offset: u32) -> Option<&str> {
-    if offset == 0 { None } else { Some(reader.read_string(offset)) }
+    if offset == 0 {
+        None
+    } else {
+        Some(reader.read_string(offset))
+    }
 }

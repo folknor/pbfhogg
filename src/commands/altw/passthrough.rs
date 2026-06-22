@@ -28,8 +28,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicI64;
 
 use crate::blob::{
-    decompress_blob_raw, parse_primitive_block_from_bytes_owned, BlobKind,
-    DecompressPool,
+    BlobKind, DecompressPool, decompress_blob_raw, parse_primitive_block_from_bytes_owned,
 };
 use crate::blob_meta::{BlobIndex, ElemKind};
 use crate::block_builder::{BlockBuilder, OwnedBlock};
@@ -39,12 +38,12 @@ use crate::reorder_buffer::ReorderBuffer;
 use crate::writer::{Compression, PbfWriter};
 
 use crate::commands::{
-    build_output_header, flush_local, writer_from_header_bytes_parallel, HeaderOverrides,
+    HeaderOverrides, build_output_header, flush_local, writer_from_header_bytes_parallel,
 };
 
-use super::reframe::{reframe_way_blob_with_locations, WayReframeScratch};
-use super::{process_block, NodeIndex, Stats};
 use super::Result;
+use super::reframe::{WayReframeScratch, reframe_way_blob_with_locations};
+use super::{NodeIndex, Stats, process_block};
 
 /// Per-blob descriptor produced once up front by the header walk and
 /// consumed by both the worker pool (decode) and the consumer thread
@@ -129,9 +128,8 @@ fn build_schedule(
         }
     }
 
-    let header_bytes = header_bytes.ok_or_else(|| -> Box<dyn std::error::Error> {
-        "no OSMHeader blob found".into()
-    })?;
+    let header_bytes = header_bytes
+        .ok_or_else(|| -> Box<dyn std::error::Error> { "no OSMHeader blob found".into() })?;
     let shared_file = std::sync::Arc::clone(walker.shared_file());
     Ok((schedule, header_bytes, shared_file))
 }
@@ -212,12 +210,11 @@ fn decode_one(
     // Non-way decode (Node decode when keep_untagged_nodes=false; Unknown).
     // Goes through the WireBlob -> Bytes path so the existing
     // process_block / BlockBuilder pipeline runs unchanged.
-    let wire_blob = crate::blob::WireBlob::parse_slice(&scratch.read_buf)
-        .map_err(|e| e.to_string())?;
-    let bytes = crate::blob::decompress_blob(&wire_blob, Some(&scratch.pool))
-        .map_err(|e| e.to_string())?;
-    let block = parse_primitive_block_from_bytes_owned(&bytes)
-        .map_err(|e| e.to_string())?;
+    let wire_blob =
+        crate::blob::WireBlob::parse_slice(&scratch.read_buf).map_err(|e| e.to_string())?;
+    let bytes =
+        crate::blob::decompress_blob(&wire_blob, Some(&scratch.pool)).map_err(|e| e.to_string())?;
+    let block = parse_primitive_block_from_bytes_owned(&bytes).map_err(|e| e.to_string())?;
     let block_stats = process_block(
         &block,
         &mut scratch.bb,
@@ -249,9 +246,8 @@ pub(super) fn write_output_passthrough(
     let (schedule, header_bytes, shared_file) =
         build_schedule(input, overrides, keep_untagged_nodes)?;
 
-    let mut writer = writer_from_header_bytes_parallel(
-        output, compression, &header_bytes, direct_io, false,
-    )?;
+    let mut writer =
+        writer_from_header_bytes_parallel(output, compression, &header_bytes, direct_io, false)?;
 
     let decode_threads = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))
@@ -322,7 +318,12 @@ pub(super) fn write_output_passthrough(
         // ways -> relations) is preserved.
         enum ConsumerItem {
             Decoded(std::result::Result<(Vec<OwnedBlock>, Stats), String>),
-            Passthrough { frame_offset: u64, frame_size: usize, count: u64, kind: Option<ElemKind> },
+            Passthrough {
+                frame_offset: u64,
+                frame_size: usize,
+                count: u64,
+                kind: Option<ElemKind>,
+            },
         }
 
         let mut reorder: ReorderBuffer<ConsumerItem> =
@@ -355,13 +356,22 @@ pub(super) fn write_output_passthrough(
                         total_stats.merge(&block_stats);
                         for (block_bytes, index, tagdata) in blocks {
                             writer.write_primitive_block_owned(
-                                block_bytes, index, tagdata.as_deref(),
+                                block_bytes,
+                                index,
+                                tagdata.as_deref(),
                             )?;
                         }
-                        let n = batches_dispatched.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        let n = batches_dispatched
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            + 1;
                         crate::debug::emit_counter("altw_pass2_blobs_dispatched", n);
                     }
-                    ConsumerItem::Passthrough { frame_offset, frame_size, count, kind } => {
+                    ConsumerItem::Passthrough {
+                        frame_offset,
+                        frame_size,
+                        count,
+                        kind,
+                    } => {
                         frame_read_buf.resize(frame_size, 0);
                         shared_file
                             .read_exact_at(frame_read_buf, frame_offset)
@@ -396,7 +406,12 @@ pub(super) fn write_output_passthrough(
         };
 
         // Drain any passthrough prefix before the first decode result.
-        drain(&mut reorder, &mut total_stats, &mut frame_read_buf, &mut writer)?;
+        drain(
+            &mut reorder,
+            &mut total_stats,
+            &mut frame_read_buf,
+            &mut writer,
+        )?;
 
         loop {
             let msg = decoded_rx.recv();
@@ -405,12 +420,22 @@ pub(super) fn write_output_passthrough(
                 Err(_) => break,
             };
             reorder.push(seq_num, ConsumerItem::Decoded(item));
-            drain(&mut reorder, &mut total_stats, &mut frame_read_buf, &mut writer)?;
+            drain(
+                &mut reorder,
+                &mut total_stats,
+                &mut frame_read_buf,
+                &mut writer,
+            )?;
         }
 
         // Final drain for passthrough tails (relations sit at EOF in
         // sorted PBFs - no trailing decode push to trigger pop_ready).
-        drain(&mut reorder, &mut total_stats, &mut frame_read_buf, &mut writer)?;
+        drain(
+            &mut reorder,
+            &mut total_stats,
+            &mut frame_read_buf,
+            &mut writer,
+        )?;
 
         Ok(())
     })?;

@@ -7,8 +7,9 @@ use crate::cat::CleanAttrs;
 use crate::writer::Compression;
 use crate::{Element, MemberId, PrimitiveBlock};
 
-use super::super::{Result, writer_from_header, HeaderOverrides,
-    ensure_node_capacity_local, ensure_way_capacity_local, ensure_relation_capacity_local,
+use super::super::{
+    HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
+    ensure_way_capacity_local, writer_from_header,
 };
 use crate::idset::IdSet;
 
@@ -136,7 +137,8 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     // Sequential reader to avoid PrimitiveBlock cross-thread retention OOM.
     let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
     blob_reader.set_parse_indexdata(true);
-    let header_blob = blob_reader.next()
+    let header_blob = blob_reader
+        .next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
     let is_sorted = header_blob.to_headerblock()?.is_sorted();
     let filter = spatial_blob_filter(bbox_int);
@@ -145,27 +147,37 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     if !is_sorted {
         for blob_result in &mut blob_reader {
             let blob = blob_result?;
-            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+                continue;
+            }
             if let Some(idx) = blob.index() {
-                if !filter.wants_index(&idx) { continue; }
+                if !filter.wants_index(&idx) {
+                    continue;
+                }
             }
             blob.decompress_into(&mut decompress_buf)?;
             let block = PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))?;
             for element in block.elements_skip_metadata() {
                 match &element {
                     Element::DenseNode(dn)
-                        if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
+                        if region.contains_decimicro(
+                            bbox_int,
+                            dn.decimicro_lat(),
+                            dn.decimicro_lon(),
+                        ) =>
                     {
                         bbox_node_ids.set(dn.id());
                     }
                     Element::Node(n)
-                        if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
+                        if region.contains_decimicro(
+                            bbox_int,
+                            n.decimicro_lat(),
+                            n.decimicro_lon(),
+                        ) =>
                     {
                         bbox_node_ids.set(n.id());
                     }
-                    Element::Way(w)
-                        if w.refs().any(|r| bbox_node_ids.get(r)) =>
-                    {
+                    Element::Way(w) if w.refs().any(|r| bbox_node_ids.get(r)) => {
                         matched_way_ids.set(w.id());
                         for r in w.refs() {
                             all_way_node_ids.set(r);
@@ -182,7 +194,10 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             }
         }
         return Ok(Pass1Result {
-            bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids,
+            bbox_node_ids,
+            matched_way_ids,
+            all_way_node_ids,
+            matched_relation_ids,
             way_schedule: Vec::new(),
             pass3_blob_schedule: Vec::new(),
         });
@@ -218,7 +233,9 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     let mut pass3_blob_schedule: Vec<BlobDesc> = Vec::new();
     let mut seq: usize = 0;
     while let Some(meta) = walker.next_header()? {
-        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) { continue; }
+        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
+            continue;
+        }
         let idx = meta.index.as_ref();
         // Build pass3_blob_schedule unconditionally for all OsmData blobs.
         // Mirrors build_blob_schedule's behavior (no kind/spatial filter,
@@ -242,11 +259,19 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             if matches!(idx.kind, crate::blob_meta::ElemKind::Way) {
                 full_way_schedule.push((seq, meta.data_offset, meta.data_size));
             }
-            if !filter.wants_index(idx) { continue; }
+            if !filter.wants_index(idx) {
+                continue;
+            }
             match idx.kind {
-                crate::blob_meta::ElemKind::Node => node_schedule.push((seq, meta.data_offset, meta.data_size)),
-                crate::blob_meta::ElemKind::Way => way_schedule.push((seq, meta.data_offset, meta.data_size)),
-                crate::blob_meta::ElemKind::Relation => relation_schedule.push((seq, meta.data_offset, meta.data_size)),
+                crate::blob_meta::ElemKind::Node => {
+                    node_schedule.push((seq, meta.data_offset, meta.data_size));
+                }
+                crate::blob_meta::ElemKind::Way => {
+                    way_schedule.push((seq, meta.data_offset, meta.data_size));
+                }
+                crate::blob_meta::ElemKind::Relation => {
+                    relation_schedule.push((seq, meta.data_offset, meta.data_size));
+                }
             }
         } else {
             // Non-indexed blob (force-flag path). Without indexdata we cannot
@@ -287,26 +312,41 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         &shared_file,
         &node_schedule,
         None,
-        || (crate::read::columnar::DenseNodeColumns::new(), Vec::<i64>::new()),
+        || {
+            (
+                crate::read::columnar::DenseNodeColumns::new(),
+                Vec::<i64>::new(),
+            )
+        },
         |block, (columns, ids)| {
             ids.clear();
             if use_columnar {
                 block.decode_dense_columns(columns);
                 columns.collect_matching_ids_bbox(
-                    bbox_int.min_lat, bbox_int.max_lat,
-                    bbox_int.min_lon, bbox_int.max_lon,
+                    bbox_int.min_lat,
+                    bbox_int.max_lat,
+                    bbox_int.min_lon,
+                    bbox_int.max_lon,
                     ids,
                 );
             } else {
                 for element in block.elements_skip_metadata() {
                     match &element {
                         Element::DenseNode(dn)
-                            if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
+                            if region.contains_decimicro(
+                                bbox_int,
+                                dn.decimicro_lat(),
+                                dn.decimicro_lon(),
+                            ) =>
                         {
                             ids.push(dn.id());
                         }
                         Element::Node(n)
-                            if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
+                            if region.contains_decimicro(
+                                bbox_int,
+                                n.decimicro_lat(),
+                                n.decimicro_lon(),
+                            ) =>
                         {
                             ids.push(n.id());
                         }
@@ -317,7 +357,9 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             std::mem::take(ids)
         },
         |_seq, ids| {
-            for id in ids { bbox_node_ids.set(id); }
+            for id in ids {
+                bbox_node_ids.set(id);
+            }
         },
     )?;
     crate::debug::emit_marker("PASS1_NODE_CLASSIFY_END");
@@ -343,8 +385,12 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             (way_ids, node_ids)
         },
         |_seq, (way_ids, node_ids)| {
-            for id in way_ids { matched_way_ids.set(id); }
-            for id in node_ids { all_way_node_ids.set(id); }
+            for id in way_ids {
+                matched_way_ids.set(id);
+            }
+            for id in node_ids {
+                all_way_node_ids.set(id);
+            }
         },
     )?;
     crate::debug::emit_marker("PASS1_WAY_CLASSIFY_END");
@@ -383,7 +429,10 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     crate::debug::emit_marker("PASS1_RELATION_CLASSIFY_END");
 
     Ok(Pass1Result {
-        bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids,
+        bbox_node_ids,
+        matched_way_ids,
+        all_way_node_ids,
+        matched_relation_ids,
         way_schedule: full_way_schedule,
         pass3_blob_schedule,
     })
@@ -434,52 +483,59 @@ pub(super) fn extract_smart(
     // wall on Europe extract-smart. Falls back to build_classify_schedule
     // for the unsorted-fallback path where PASS1 doesn't build a schedule.
     {
-    crate::debug::emit_marker("SMART_PASS2_SCHEDULE_START");
-    let pass1_way_schedule = std::mem::take(&mut result.way_schedule);
-    let (way_schedule, shared_file) = if pass1_way_schedule.is_empty() {
-        crate::scan::classify::build_classify_schedule(input, Some(crate::blob_meta::ElemKind::Way))?
-    } else {
-        let shared_file = std::sync::Arc::new(
-            std::fs::File::open(input)
-                .map_err(|e| format!("failed to open {}: {e}", input.display()))?
-        );
-        (pass1_way_schedule, shared_file)
-    };
-    crate::debug::emit_marker("SMART_PASS2_SCHEDULE_END");
+        crate::debug::emit_marker("SMART_PASS2_SCHEDULE_START");
+        let pass1_way_schedule = std::mem::take(&mut result.way_schedule);
+        let (way_schedule, shared_file) = if pass1_way_schedule.is_empty() {
+            crate::scan::classify::build_classify_schedule(
+                input,
+                Some(crate::blob_meta::ElemKind::Way),
+            )?
+        } else {
+            let shared_file = std::sync::Arc::new(
+                std::fs::File::open(input)
+                    .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+            );
+            (pass1_way_schedule, shared_file)
+        };
+        crate::debug::emit_marker("SMART_PASS2_SCHEDULE_END");
 
-    let extra_way_ids_ref = &handler.extra_way_ids;
-    let matched_way_ids_ref = &result.matched_way_ids;
-    // Per-blob send (not accumulate): extra_way_ids is relation-driven and
-    // can be wide + globally dispersed. Per-worker IdSet accumulate over
-    // an unbounded node-ID set is the unsafe shape the helper doc warns
-    // against, regardless of whether this specific workload triggers the
-    // worst case. The fix improves PASS2 wall by ~23%; the planet-scale
-    // memory peak it was originally framed as fixing turned out to be
-    // elsewhere (cold-arena-page residency cascade, addressed by the
-    // PASS1 schedule-reuse commits `d4ea760` and `0b085b1`).
-    crate::debug::emit_marker("SMART_PASS2_CLASSIFY_START");
-    crate::scan::classify::parallel_classify_phase(
-        &shared_file,
-        &way_schedule,
-        None,
-        Vec::<i64>::new,
-        |block, scratch| {
-            scratch.clear();
-            for element in block.elements_skip_metadata() {
-                if let Element::Way(w) = &element {
-                    let wid = w.id();
-                    if extra_way_ids_ref.get(wid) && !matched_way_ids_ref.get(wid) {
-                        for r in w.refs() { scratch.push(r); }
+        let extra_way_ids_ref = &handler.extra_way_ids;
+        let matched_way_ids_ref = &result.matched_way_ids;
+        // Per-blob send (not accumulate): extra_way_ids is relation-driven and
+        // can be wide + globally dispersed. Per-worker IdSet accumulate over
+        // an unbounded node-ID set is the unsafe shape the helper doc warns
+        // against, regardless of whether this specific workload triggers the
+        // worst case. The fix improves PASS2 wall by ~23%; the planet-scale
+        // memory peak it was originally framed as fixing turned out to be
+        // elsewhere (cold-arena-page residency cascade, addressed by the
+        // PASS1 schedule-reuse commits `d4ea760` and `0b085b1`).
+        crate::debug::emit_marker("SMART_PASS2_CLASSIFY_START");
+        crate::scan::classify::parallel_classify_phase(
+            &shared_file,
+            &way_schedule,
+            None,
+            Vec::<i64>::new,
+            |block, scratch| {
+                scratch.clear();
+                for element in block.elements_skip_metadata() {
+                    if let Element::Way(w) = &element {
+                        let wid = w.id();
+                        if extra_way_ids_ref.get(wid) && !matched_way_ids_ref.get(wid) {
+                            for r in w.refs() {
+                                scratch.push(r);
+                            }
+                        }
                     }
                 }
-            }
-            std::mem::take(scratch)
-        },
-        |_seq, refs| {
-            for id in refs { extra_node_ids.set(id); }
-        },
-    )?;
-    crate::debug::emit_marker("SMART_PASS2_CLASSIFY_END");
+                std::mem::take(scratch)
+            },
+            |_seq, refs| {
+                for id in refs {
+                    extra_node_ids.set(id);
+                }
+            },
+        )?;
+        crate::debug::emit_marker("SMART_PASS2_CLASSIFY_END");
     }
 
     crate::debug::emit_marker("SMART_PASS2_END");
@@ -489,20 +545,30 @@ pub(super) fn extract_smart(
     crate::debug::emit_marker("SMART_PASS3_SETUP_START");
 
     let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    let header_blob = header_reader.next()
+    let header_blob = header_reader
+        .next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
     let header = header_blob.to_headerblock()?;
     drop(header_reader);
     super::super::warn_locations_on_ways_loss(&header);
     let bbox = region.bbox();
-    let mut writer = writer_from_header(output, compression, &header, false, overrides, |hb| {
-        let hb = if set_bounds {
-            hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
-        } else {
-            hb
-        };
-        hb.sorted()
-    }, direct_io, false)?;
+    let mut writer = writer_from_header(
+        output,
+        compression,
+        &header,
+        false,
+        overrides,
+        |hb| {
+            let hb = if set_bounds {
+                hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
+            } else {
+                hb
+            };
+            hb.sorted()
+        },
+        direct_io,
+        false,
+    )?;
 
     // Take the pre-built blob schedule BEFORE creating `ids`, since `ids`
     // holds immutable borrows of `result` and we need a brief mutable borrow
@@ -524,13 +590,20 @@ pub(super) fn extract_smart(
     // build_blob_schedule for the unsorted-fallback path. Avoids the third
     // post-PASS1 header scan and its cold-arena-page residency cascade.
     if pass1_blob_schedule.is_empty() {
-        pread_write_pass(input, &mut writer, &mut stats, |block, bb, output_blocks| {
-            extract_block_pass3(block, &ids, clean, bb, output_blocks)
-        })?;
+        pread_write_pass(
+            input,
+            &mut writer,
+            &mut stats,
+            |block, bb, output_blocks| extract_block_pass3(block, &ids, clean, bb, output_blocks),
+        )?;
     } else {
-        pread_write_pass_with_schedule(input, &pass1_blob_schedule, &mut writer, &mut stats, |block, bb, output_blocks| {
-            extract_block_pass3(block, &ids, clean, bb, output_blocks)
-        })?;
+        pread_write_pass_with_schedule(
+            input,
+            &pass1_blob_schedule,
+            &mut writer,
+            &mut stats,
+            |block, bb, output_blocks| extract_block_pass3(block, &ids, clean, bb, output_blocks),
+        )?;
     }
     crate::debug::emit_marker("SMART_PASS3_WRITE_END");
 
@@ -587,7 +660,13 @@ fn extract_block_pass3(
                 if in_bbox || from_way || from_rel {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = clean_metadata(dense_node_metadata(dn), clean);
-                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), meta.as_ref());
+                    bb.add_node(
+                        dn.id(),
+                        dn.decimicro_lat(),
+                        dn.decimicro_lon(),
+                        dn.tags(),
+                        meta.as_ref(),
+                    );
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else if from_way {
@@ -605,7 +684,13 @@ fn extract_block_pass3(
                 if in_bbox || from_way || from_rel {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = clean_metadata(element_metadata(&n.info()), clean);
-                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), n.tags(), meta.as_ref());
+                    bb.add_node(
+                        n.id(),
+                        n.decimicro_lat(),
+                        n.decimicro_lon(),
+                        n.tags(),
+                        meta.as_ref(),
+                    );
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else if from_way {
@@ -658,5 +743,6 @@ fn extract_block_pass3(
 /// These are the relation types whose way members should be fully included
 /// in the smart extraction strategy, along with all nodes those ways reference.
 fn is_smart_relation(r: &crate::Relation) -> bool {
-    r.tags().any(|(k, v)| k == "type" && (v == "multipolygon" || v == "boundary"))
+    r.tags()
+        .any(|(k, v)| k == "type" && (v == "multipolygon" || v == "boundary"))
 }

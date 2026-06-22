@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 
 use flate2::write::GzEncoder;
@@ -287,10 +287,7 @@ fn compress_one(raw: &[u8]) -> io::Result<Vec<u8>> {
 /// write to inner in sequence. Takes `compressed_rx` by value so the
 /// receiver is dropped (and the channel released) on return.
 #[allow(clippy::needless_pass_by_value)]
-fn writer_loop<W: Write>(
-    mut inner: W,
-    compressed_rx: Receiver<(u64, Vec<u8>)>,
-) -> io::Result<W> {
+fn writer_loop<W: Write>(mut inner: W, compressed_rx: Receiver<(u64, Vec<u8>)>) -> io::Result<W> {
     let mut pending: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     let mut expected: u64 = 0;
     while let Ok((seq, bytes)) = compressed_rx.recv() {
@@ -329,7 +326,9 @@ mod tests {
         gz.write_all(bytes).unwrap();
         let compressed = gz.finish().unwrap();
         let mut out = Vec::new();
-        MultiGzDecoder::new(compressed.as_slice()).read_to_end(&mut out).unwrap();
+        MultiGzDecoder::new(compressed.as_slice())
+            .read_to_end(&mut out)
+            .unwrap();
         out
     }
 
@@ -345,7 +344,10 @@ mod tests {
         let mut gz = ParallelGzipWriter::new(sink, 1024, 2);
         gz.write_all(&[]).unwrap();
         let compressed = gz.finish().unwrap();
-        assert!(compressed.is_empty(), "empty input should produce no output");
+        assert!(
+            compressed.is_empty(),
+            "empty input should produce no output"
+        );
     }
 
     #[test]
@@ -377,7 +379,9 @@ mod tests {
         }
         let compressed = gz.finish().unwrap();
         let mut out = Vec::new();
-        MultiGzDecoder::new(compressed.as_slice()).read_to_end(&mut out).unwrap();
+        MultiGzDecoder::new(compressed.as_slice())
+            .read_to_end(&mut out)
+            .unwrap();
         assert_eq!(out.len(), 5 * 1024);
         for (i, chunk) in out.chunks(1024).enumerate() {
             #[allow(clippy::cast_possible_truncation)]
@@ -394,7 +398,9 @@ mod tests {
         gz.write_all(b"def").unwrap();
         let bytes = gz.finish().unwrap();
         let mut out = Vec::new();
-        MultiGzDecoder::new(bytes.as_slice()).read_to_end(&mut out).unwrap();
+        MultiGzDecoder::new(bytes.as_slice())
+            .read_to_end(&mut out)
+            .unwrap();
         assert_eq!(out, b"abcdef");
     }
 
@@ -409,7 +415,9 @@ mod tests {
         gz.write_all(&[11u8; 64]).unwrap();
         let bytes = gz.finish().unwrap();
         let mut out = Vec::new();
-        MultiGzDecoder::new(bytes.as_slice()).read_to_end(&mut out).unwrap();
+        MultiGzDecoder::new(bytes.as_slice())
+            .read_to_end(&mut out)
+            .unwrap();
         assert_eq!(out.len(), 128 + 128 + 64);
         assert!(out[0..128].iter().all(|&b| b == 7));
         assert!(out[128..256].iter().all(|&b| b == 9));

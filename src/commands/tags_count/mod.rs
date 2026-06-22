@@ -4,9 +4,9 @@ use std::path::Path;
 
 use rustc_hash::FxHashMap;
 
-use crate::tag_expr::{tag_matches, parse_expressions, Expression};
 use super::require_indexdata;
 use crate::owned::TypeFilter;
+use crate::tag_expr::{Expression, parse_expressions, tag_matches};
 use crate::{Element, PrimitiveBlock};
 
 use super::Result;
@@ -65,16 +65,17 @@ pub struct TagCountOptions<'a> {
 /// emission keeps peak anon at a small multiple of one blob's
 /// distinct tags (~few MB) plus the single global map.
 #[hotpath::measure]
-pub fn tags_count(
-    path: &Path,
-    opts: &TagCountOptions<'_>,
-) -> Result<Vec<TagCount>> {
+pub fn tags_count(path: &Path, opts: &TagCountOptions<'_>) -> Result<Vec<TagCount>> {
     // Need indexdata either for the type-filter schedule or (when there
     // is no type filter) simply for the all-kinds schedule the parallel
     // path uses. `require_indexdata` gracefully accepts `force`.
-    require_indexdata(path, opts.direct_io, opts.force,
+    require_indexdata(
+        path,
+        opts.direct_io,
+        opts.force,
         "input PBF has no blob-level indexdata. Without indexdata, the type filter \
-         is a no-op - all blobs are decompressed (significantly slower).")?;
+         is a no-op - all blobs are decompressed (significantly slower).",
+    )?;
 
     let expressions = if opts.expressions.is_empty() {
         None
@@ -160,9 +161,15 @@ pub fn tags_count(
     Ok(results)
 }
 
-
 /// Check if a tag matches any expression (respecting the element's type).
-fn matches_expression(expressions: &[Expression], key: &str, value: &str, is_node: bool, is_way: bool, is_relation: bool) -> bool {
+fn matches_expression(
+    expressions: &[Expression],
+    key: &str,
+    value: &str,
+    is_node: bool,
+    is_way: bool,
+    is_relation: bool,
+) -> bool {
     for expr in expressions {
         let type_ok = (is_node && expr.type_filter.nodes)
             || (is_way && expr.type_filter.ways)
@@ -196,28 +203,40 @@ fn count_block_tags(
         match &element {
             Element::DenseNode(dn) => {
                 for (k, v) in dn.tags() {
-                    if expressions.as_ref().is_none_or(|e| matches_expression(e, k, v, is_node, is_way, is_relation)) {
+                    if expressions
+                        .as_ref()
+                        .is_none_or(|e| matches_expression(e, k, v, is_node, is_way, is_relation))
+                    {
                         increment_tag(counts, k, v);
                     }
                 }
             }
             Element::Node(n) => {
                 for (k, v) in n.tags() {
-                    if expressions.as_ref().is_none_or(|e| matches_expression(e, k, v, is_node, is_way, is_relation)) {
+                    if expressions
+                        .as_ref()
+                        .is_none_or(|e| matches_expression(e, k, v, is_node, is_way, is_relation))
+                    {
                         increment_tag(counts, k, v);
                     }
                 }
             }
             Element::Way(w) => {
                 for (k, v) in w.tags() {
-                    if expressions.as_ref().is_none_or(|e| matches_expression(e, k, v, is_node, is_way, is_relation)) {
+                    if expressions
+                        .as_ref()
+                        .is_none_or(|e| matches_expression(e, k, v, is_node, is_way, is_relation))
+                    {
                         increment_tag(counts, k, v);
                     }
                 }
             }
             Element::Relation(r) => {
                 for (k, v) in r.tags() {
-                    if expressions.as_ref().is_none_or(|e| matches_expression(e, k, v, is_node, is_way, is_relation)) {
+                    if expressions
+                        .as_ref()
+                        .is_none_or(|e| matches_expression(e, k, v, is_node, is_way, is_relation))
+                    {
                         increment_tag(counts, k, v);
                     }
                 }
@@ -225,7 +244,6 @@ fn count_block_tags(
         }
     }
 }
-
 
 /// Increment the count for a (key, value) pair, allocating only on first insert.
 #[inline]

@@ -1,8 +1,8 @@
 //! Shared types and small classification helpers used across the inspect
 //! submodules.
 
-use crate::blob_meta::ElemKind;
 use crate::Element;
+use crate::blob_meta::ElemKind;
 
 // ---------------------------------------------------------------------------
 // Block type classification
@@ -266,9 +266,21 @@ impl ScanState {
             tagged_node_count: 0,
             way_count: 0,
             relation_count: 0,
-            node_ids: if show_id_ranges { Some(TypeIdRange::new()) } else { None },
-            way_ids: if show_id_ranges { Some(TypeIdRange::new()) } else { None },
-            relation_ids: if show_id_ranges { Some(TypeIdRange::new()) } else { None },
+            node_ids: if show_id_ranges {
+                Some(TypeIdRange::new())
+            } else {
+                None
+            },
+            way_ids: if show_id_ranges {
+                Some(TypeIdRange::new())
+            } else {
+                None
+            },
+            relation_ids: if show_id_ranges {
+                Some(TypeIdRange::new())
+            } else {
+                None
+            },
             loc_stats: if show_locations {
                 Some(LocationStats {
                     with_locations: 0,
@@ -278,7 +290,11 @@ impl ScanState {
             } else {
                 None
             },
-            extended: if extended { Some(ExtendedStats::new()) } else { None },
+            extended: if extended {
+                Some(ExtendedStats::new())
+            } else {
+                None
+            },
         }
     }
 

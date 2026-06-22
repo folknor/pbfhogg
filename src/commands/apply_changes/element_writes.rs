@@ -5,19 +5,19 @@
 
 use rustc_hash::FxHashMap;
 
+use crate::PrimitiveBlock;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_writer::FileWriter;
 use crate::owned::{dense_node_raw_metadata, element_raw_metadata};
 use crate::writer::PbfWriter;
-use crate::PrimitiveBlock;
 
 use crate::commands::{
     ensure_node_capacity_local, ensure_relation_capacity, ensure_relation_capacity_local,
     ensure_way_capacity, ensure_way_capacity_local, flush_local,
 };
 
-use super::stats::MergeStats;
 use super::Result;
+use super::stats::MergeStats;
 
 // ---------------------------------------------------------------------------
 // Writing OSC elements (from diff, no metadata)
@@ -106,7 +106,8 @@ pub(super) fn write_base_node_local(
         node.id(),
         node.decimicro_lat(),
         node.decimicro_lon(),
-        node.raw_tags().map(|(k, v)| (k.cast_signed(), v.cast_signed())),
+        node.raw_tags()
+            .map(|(k, v)| (k.cast_signed(), v.cast_signed())),
         meta.as_ref(),
     );
     Ok(())

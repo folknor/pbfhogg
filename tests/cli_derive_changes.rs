@@ -22,15 +22,15 @@ use std::path::Path;
 
 use common::cli::{CliInvoker, CliOutput};
 use common::{
-    assert_elements_equivalent, generate_nodes, generate_ways,
-    node_ids_with_coords as node_ids, read_all_elements_with_coords as read_all_elements,
-    relation_ids_with_coords as relation_ids, way_ids_with_coords as way_ids,
-    write_multi_block_test_pbf, write_test_pbf, write_test_pbf_sorted, TestMember, TestNode,
-    TestRelation, TestWay,
+    TestMember, TestNode, TestRelation, TestWay, assert_elements_equivalent, generate_nodes,
+    generate_ways, node_ids_with_coords as node_ids,
+    read_all_elements_with_coords as read_all_elements, relation_ids_with_coords as relation_ids,
+    way_ids_with_coords as way_ids, write_multi_block_test_pbf, write_test_pbf,
+    write_test_pbf_sorted,
 };
+use pbfhogg::MemberId;
 use pbfhogg::block_builder::{self, BlockBuilder, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
-use pbfhogg::MemberId;
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -99,15 +99,16 @@ fn parse_derive_stats(stderr: &str) -> Option<(u64, u64, u64)> {
         .filter(|s| !s.is_empty())
         .filter_map(|s| s.parse().ok())
         .collect();
-    if nums.len() < 4 { return None; }
+    if nums.len() < 4 {
+        return None;
+    }
     // [total, creates, modifies, deletes]
     Some((nums[1], nums[2], nums[3]))
 }
 
 fn assert_derive_stats(stderr: &str, creates: u64, modifies: u64, deletes: u64) {
-    let parsed = parse_derive_stats(stderr).unwrap_or_else(|| {
-        panic!("could not parse derive stats; stderr:\n{stderr}")
-    });
+    let parsed = parse_derive_stats(stderr)
+        .unwrap_or_else(|| panic!("could not parse derive stats; stderr:\n{stderr}"));
     assert_eq!(
         parsed,
         (creates, modifies, deletes),
@@ -127,11 +128,7 @@ fn read_osc(path: &Path) -> String {
 }
 
 /// Write a sorted PBF with version metadata on each element.
-fn write_versioned_pbf(
-    path: &Path,
-    nodes: &[(i64, i32, i32, i32)],
-    ways: &[(i64, Vec<i64>, i32)],
-) {
+fn write_versioned_pbf(path: &Path, nodes: &[(i64, i32, i32, i32)], ways: &[(i64, Vec<i64>, i32)]) {
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
@@ -143,17 +140,41 @@ fn write_versioned_pbf(
 
     let mut bb = BlockBuilder::new();
     for &(id, lat, lon, ver) in nodes {
-        let meta = Metadata { version: ver, timestamp: 0, changeset: 0, uid: 0, user: "", visible: true };
-        bb.add_node(id, lat, lon, std::iter::empty::<(&str, &str)>(), Some(&meta));
+        let meta = Metadata {
+            version: ver,
+            timestamp: 0,
+            changeset: 0,
+            uid: 0,
+            user: "",
+            visible: true,
+        };
+        bb.add_node(
+            id,
+            lat,
+            lon,
+            std::iter::empty::<(&str, &str)>(),
+            Some(&meta),
+        );
     }
-    if !bb.is_empty() && let Some(bytes) = bb.take().expect("take") {
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
         writer.write_primitive_block(bytes).expect("write block");
     }
     for (id, refs, ver) in ways {
-        let meta = Metadata { version: *ver, timestamp: 0, changeset: 0, uid: 0, user: "", visible: true };
+        let meta = Metadata {
+            version: *ver,
+            timestamp: 0,
+            changeset: 0,
+            uid: 0,
+            user: "",
+            visible: true,
+        };
         bb.add_way(*id, std::iter::empty::<(&str, &str)>(), refs, Some(&meta));
     }
-    if !bb.is_empty() && let Some(bytes) = bb.take().expect("take") {
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
         writer.write_primitive_block(bytes).expect("write block");
     }
     writer.flush().expect("flush");
@@ -180,7 +201,13 @@ fn write_roundtrip_multiblob_pair(old: &Path, new: &Path) {
 
     let mut new_nodes: Vec<TestNode> = old_nodes
         .iter()
-        .map(|n| TestNode { id: n.id, lat: n.lat, lon: n.lon, tags: n.tags.clone(), meta: None })
+        .map(|n| TestNode {
+            id: n.id,
+            lat: n.lat,
+            lon: n.lon,
+            tags: n.tags.clone(),
+            meta: None,
+        })
         .collect();
     new_nodes.retain(|n| n.id != 23);
     if let Some(node5) = new_nodes.iter_mut().find(|n| n.id == 5) {
@@ -188,18 +215,34 @@ fn write_roundtrip_multiblob_pair(old: &Path, new: &Path) {
         node5.lon = 444_444;
         node5.tags = vec![("name", "modified")];
     }
-    new_nodes.push(TestNode { id: 30, lat: 300_000, lon: 600_000, tags: vec![("created", "yes")], meta: None });
+    new_nodes.push(TestNode {
+        id: 30,
+        lat: 300_000,
+        lon: 600_000,
+        tags: vec![("created", "yes")],
+        meta: None,
+    });
 
     let mut new_ways: Vec<TestWay> = old_ways
         .iter()
-        .map(|w| TestWay { id: w.id, refs: w.refs.clone(), tags: w.tags.clone(), meta: None })
+        .map(|w| TestWay {
+            id: w.id,
+            refs: w.refs.clone(),
+            tags: w.tags.clone(),
+            meta: None,
+        })
         .collect();
     new_ways.retain(|w| w.id != 1_007);
     if let Some(way1003) = new_ways.iter_mut().find(|w| w.id == 1_003) {
         way1003.refs = vec![7, 5, 30];
         way1003.tags = vec![("highway", "secondary"), ("surface", "gravel")];
     }
-    new_ways.push(TestWay { id: 2_000, refs: vec![5, 30, 6], tags: vec![("highway", "primary")], meta: None });
+    new_ways.push(TestWay {
+        id: 2_000,
+        refs: vec![5, 30, 6],
+        tags: vec![("highway", "primary")],
+        meta: None,
+    });
 
     write_multi_block_test_pbf(old, &old_nodes, &old_ways, &[], 4);
     write_multi_block_test_pbf(new, &new_nodes, &new_ways, &[], 4);
@@ -217,10 +260,27 @@ fn identical_files_no_changes() {
     let osc = dir.path().join("changes.osc.gz");
 
     let nodes = [
-        TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "a")], meta: None },
-        TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
+        TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![("name", "a")],
+            meta: None,
+        },
+        TestNode {
+            id: 2,
+            lat: 110_000_000,
+            lon: 210_000_000,
+            tags: vec![],
+            meta: None,
+        },
     ];
-    let ways = [TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")], meta: None }];
+    let ways = [TestWay {
+        id: 10,
+        refs: vec![1, 2],
+        tags: vec![("highway", "primary")],
+        meta: None,
+    }];
 
     write_test_pbf_sorted(&old, &nodes, &ways, &[]);
     write_test_pbf_sorted(&new, &nodes, &ways, &[]);
@@ -238,17 +298,40 @@ fn create_only() {
 
     write_test_pbf_sorted(
         &old,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None }],
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![],
+            meta: None,
+        }],
         &[],
         &[],
     );
     write_test_pbf_sorted(
         &new,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "new")], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![("name", "new")],
+                meta: None,
+            },
         ],
-        &[TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")], meta: None }],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "primary")],
+            meta: None,
+        }],
         &[],
     );
 
@@ -266,15 +349,38 @@ fn delete_only() {
     write_test_pbf_sorted(
         &old,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
-        &[TestWay { id: 10, refs: vec![1, 2], tags: vec![], meta: None }],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![],
+            meta: None,
+        }],
         &[],
     );
     write_test_pbf_sorted(
         &new,
-        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None }],
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![],
+            meta: None,
+        }],
         &[],
         &[],
     );
@@ -290,8 +396,30 @@ fn modify_node_coords() {
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
 
-    write_test_pbf_sorted(&old, &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None }], &[], &[]);
-    write_test_pbf_sorted(&new, &[TestNode { id: 1, lat: 150_000_000, lon: 250_000_000, tags: vec![], meta: None }], &[], &[]);
+    write_test_pbf_sorted(
+        &old,
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![],
+            meta: None,
+        }],
+        &[],
+        &[],
+    );
+    write_test_pbf_sorted(
+        &new,
+        &[TestNode {
+            id: 1,
+            lat: 150_000_000,
+            lon: 250_000_000,
+            tags: vec![],
+            meta: None,
+        }],
+        &[],
+        &[],
+    );
 
     let out = run_derive_simple(&old, &new, &osc);
     assert_derive_stats(&out.stderr_str(), 0, 1, 0);
@@ -304,8 +432,30 @@ fn modify_node_tags() {
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
 
-    write_test_pbf_sorted(&old, &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "old")], meta: None }], &[], &[]);
-    write_test_pbf_sorted(&new, &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "new")], meta: None }], &[], &[]);
+    write_test_pbf_sorted(
+        &old,
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![("name", "old")],
+            meta: None,
+        }],
+        &[],
+        &[],
+    );
+    write_test_pbf_sorted(
+        &new,
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![("name", "new")],
+            meta: None,
+        }],
+        &[],
+        &[],
+    );
 
     let out = run_derive_simple(&old, &new, &osc);
     let (_, modifies, _) = parse_derive_stats(&out.stderr_str()).expect("stats");
@@ -319,8 +469,28 @@ fn modify_way_refs() {
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
 
-    write_test_pbf_sorted(&old, &[], &[TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")], meta: None }], &[]);
-    write_test_pbf_sorted(&new, &[], &[TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "primary")], meta: None }], &[]);
+    write_test_pbf_sorted(
+        &old,
+        &[],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "primary")],
+            meta: None,
+        }],
+        &[],
+    );
+    write_test_pbf_sorted(
+        &new,
+        &[],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2, 3],
+            tags: vec![("highway", "primary")],
+            meta: None,
+        }],
+        &[],
+    );
 
     let out = run_derive_simple(&old, &new, &osc);
     let (_, modifies, _) = parse_derive_stats(&out.stderr_str()).expect("stats");
@@ -334,21 +504,40 @@ fn modify_relation_members() {
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
 
-    write_test_pbf_sorted(&old, &[], &[], &[TestRelation {
-        id: 100,
-        members: vec![TestMember { id: MemberId::Node(1), role: "stop" }],
-        tags: vec![("type", "route")],
-        meta: None,
-    }]);
-    write_test_pbf_sorted(&new, &[], &[], &[TestRelation {
-        id: 100,
-        members: vec![
-            TestMember { id: MemberId::Node(1), role: "stop" },
-            TestMember { id: MemberId::Way(2), role: "outer" },
-        ],
-        tags: vec![("type", "route")],
-        meta: None,
-    }]);
+    write_test_pbf_sorted(
+        &old,
+        &[],
+        &[],
+        &[TestRelation {
+            id: 100,
+            members: vec![TestMember {
+                id: MemberId::Node(1),
+                role: "stop",
+            }],
+            tags: vec![("type", "route")],
+            meta: None,
+        }],
+    );
+    write_test_pbf_sorted(
+        &new,
+        &[],
+        &[],
+        &[TestRelation {
+            id: 100,
+            members: vec![
+                TestMember {
+                    id: MemberId::Node(1),
+                    role: "stop",
+                },
+                TestMember {
+                    id: MemberId::Way(2),
+                    role: "outer",
+                },
+            ],
+            tags: vec![("type", "route")],
+            meta: None,
+        }],
+    );
 
     let out = run_derive_simple(&old, &new, &osc);
     let (_, modifies, _) = parse_derive_stats(&out.stderr_str()).expect("stats");
@@ -365,21 +554,67 @@ fn mixed_create_modify_delete() {
     write_test_pbf_sorted(
         &old,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "one")], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("name", "one")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 120_000_000,
+                lon: 220_000_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
-        &[TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "primary")], meta: None }],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2, 3],
+            tags: vec![("highway", "primary")],
+            meta: None,
+        }],
         &[],
     );
     write_test_pbf_sorted(
         &new,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "ONE")], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
-            TestNode { id: 4, lat: 130_000_000, lon: 230_000_000, tags: vec![], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("name", "ONE")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 4,
+                lat: 130_000_000,
+                lon: 230_000_000,
+                tags: vec![],
+                meta: None,
+            },
         ],
-        &[TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")], meta: None }],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "primary")],
+            meta: None,
+        }],
         &[],
     );
 
@@ -402,21 +637,67 @@ fn roundtrip_with_merge() {
     write_test_pbf_sorted(
         &old,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "one")], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![("to_delete", "yes")], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("name", "one")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 120_000_000,
+                lon: 220_000_000,
+                tags: vec![("to_delete", "yes")],
+                meta: None,
+            },
         ],
-        &[TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")], meta: None }],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "primary")],
+            meta: None,
+        }],
         &[],
     );
     write_test_pbf_sorted(
         &new,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "ONE")], meta: None },
-            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![], meta: None },
-            TestNode { id: 5, lat: 140_000_000, lon: 240_000_000, tags: vec![("new", "yes")], meta: None },
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("name", "ONE")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 5,
+                lat: 140_000_000,
+                lon: 240_000_000,
+                tags: vec![("new", "yes")],
+                meta: None,
+            },
         ],
-        &[TestWay { id: 10, refs: vec![1, 2, 5], tags: vec![("highway", "secondary")], meta: None }],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2, 5],
+            tags: vec![("highway", "secondary")],
+            meta: None,
+        }],
         &[],
     );
 
@@ -455,11 +736,37 @@ fn unsorted_input_rejected() {
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
 
-    write_test_pbf(&old, &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None }], &[], &[]);
-    write_test_pbf_sorted(&new, &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![], meta: None }], &[], &[]);
+    write_test_pbf(
+        &old,
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![],
+            meta: None,
+        }],
+        &[],
+        &[],
+    );
+    write_test_pbf_sorted(
+        &new,
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![],
+            meta: None,
+        }],
+        &[],
+        &[],
+    );
 
     let out = run_derive(&old, &new, &osc, false, false, Some(1));
-    assert!(!out.status.success(), "should reject unsorted input; stderr:\n{}", out.stderr_str());
+    assert!(
+        !out.status.success(),
+        "should reject unsorted input; stderr:\n{}",
+        out.stderr_str()
+    );
 
     let stderr = out.stderr_str();
     assert!(stderr.contains("not sorted"), "stderr:\n{stderr}");
@@ -480,7 +787,10 @@ fn increment_version_bumps_delete_versions() {
 
     write_versioned_pbf(
         &old,
-        &[(1, 100_000_000, 200_000_000, 3), (2, 110_000_000, 210_000_000, 5)],
+        &[
+            (1, 100_000_000, 200_000_000, 3),
+            (2, 110_000_000, 210_000_000, 5),
+        ],
         &[(10, vec![1, 2], 2)],
     );
     write_versioned_pbf(&new, &[(1, 100_000_000, 200_000_000, 3)], &[]);
@@ -489,10 +799,22 @@ fn increment_version_bumps_delete_versions() {
     assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
 
     let xml = read_osc(&osc);
-    assert!(xml.contains(r#"id="2"#), "should contain node id=2; xml:\n{xml}");
-    assert!(xml.contains(r#"version="6""#), "node 2 version should be 6; xml:\n{xml}");
-    assert!(xml.contains(r#"id="10"#), "should contain way id=10; xml:\n{xml}");
-    assert!(xml.contains(r#"version="3""#), "way 10 version should be 3; xml:\n{xml}");
+    assert!(
+        xml.contains(r#"id="2"#),
+        "should contain node id=2; xml:\n{xml}"
+    );
+    assert!(
+        xml.contains(r#"version="6""#),
+        "node 2 version should be 6; xml:\n{xml}"
+    );
+    assert!(
+        xml.contains(r#"id="10"#),
+        "should contain way id=10; xml:\n{xml}"
+    );
+    assert!(
+        xml.contains(r#"version="3""#),
+        "way 10 version should be 3; xml:\n{xml}"
+    );
 }
 
 #[test]
@@ -504,7 +826,10 @@ fn no_increment_version_preserves_delete_versions() {
 
     write_versioned_pbf(
         &old,
-        &[(1, 100_000_000, 200_000_000, 3), (2, 110_000_000, 210_000_000, 5)],
+        &[
+            (1, 100_000_000, 200_000_000, 3),
+            (2, 110_000_000, 210_000_000, 5),
+        ],
         &[],
     );
     write_versioned_pbf(&new, &[(1, 100_000_000, 200_000_000, 3)], &[]);
@@ -514,7 +839,10 @@ fn no_increment_version_preserves_delete_versions() {
     assert_eq!(deletes, 1);
 
     let xml = read_osc(&osc);
-    assert!(xml.contains(r#"version="5""#), "node 2 version should be 5 (unchanged); xml:\n{xml}");
+    assert!(
+        xml.contains(r#"version="5""#),
+        "node 2 version should be 5 (unchanged); xml:\n{xml}"
+    );
 }
 
 #[test]
@@ -524,17 +852,33 @@ fn increment_version_and_update_timestamp_combined() {
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
 
-    write_versioned_pbf(&old, &[(1, 100_000_000, 200_000_000, 2)], &[(10, vec![1], 4)]);
+    write_versioned_pbf(
+        &old,
+        &[(1, 100_000_000, 200_000_000, 2)],
+        &[(10, vec![1], 4)],
+    );
     write_versioned_pbf(&new, &[], &[]);
 
     let out = run_derive(&old, &new, &osc, true, true, Some(1));
     assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
 
     let xml = read_osc(&osc);
-    assert!(xml.contains(r#"version="3""#), "node 1 version should be 3 (was 2); xml:\n{xml}");
-    assert!(xml.contains(r#"version="5""#), "way 10 version should be 5 (was 4); xml:\n{xml}");
-    assert!(xml.contains("timestamp="), "delete elements should have a timestamp; xml:\n{xml}");
-    assert!(xml.contains("timestamp=\"20"), "timestamp should be a recent ISO date; xml:\n{xml}");
+    assert!(
+        xml.contains(r#"version="3""#),
+        "node 1 version should be 3 (was 2); xml:\n{xml}"
+    );
+    assert!(
+        xml.contains(r#"version="5""#),
+        "way 10 version should be 5 (was 4); xml:\n{xml}"
+    );
+    assert!(
+        xml.contains("timestamp="),
+        "delete elements should have a timestamp; xml:\n{xml}"
+    );
+    assert!(
+        xml.contains("timestamp=\"20"),
+        "timestamp should be a recent ISO date; xml:\n{xml}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -554,9 +898,17 @@ fn derive_changes_jobs_parity_roundtrips_to_same_output() {
     write_roundtrip_multiblob_pair(&old, &new);
 
     let seq = run_derive(&old, &new, &osc_seq, false, false, Some(1));
-    assert!(seq.status.success(), "derive seq; stderr:\n{}", seq.stderr_str());
+    assert!(
+        seq.status.success(),
+        "derive seq; stderr:\n{}",
+        seq.stderr_str()
+    );
     let par = run_derive(&old, &new, &osc_par, false, false, Some(4));
-    assert!(par.status.success(), "derive par; stderr:\n{}", par.stderr_str());
+    assert!(
+        par.status.success(),
+        "derive par; stderr:\n{}",
+        par.stderr_str()
+    );
 
     let seq_stats = parse_derive_stats(&seq.stderr_str()).expect("seq stats");
     let par_stats = parse_derive_stats(&par.stderr_str()).expect("par stats");
@@ -591,15 +943,16 @@ fn merge_stats_match_output_counts_after_roundtrip() {
     let result_contents = read_all_elements(&result);
     let result_nodes = u64::try_from(result_contents.nodes.len()).expect("node count");
     let result_ways = u64::try_from(result_contents.ways.len()).expect("way count");
-    let result_relations =
-        u64::try_from(result_contents.relations.len()).expect("relation count");
+    let result_relations = u64::try_from(result_contents.relations.len()).expect("relation count");
     let total_elements = result_nodes + result_ways + result_relations;
 
     let stderr = merge_out.stderr_str();
 
     // Pin the "Merge complete: {N} elements written" total.
     assert!(
-        stderr.contains(&format!("Merge complete: {total_elements} elements written")),
+        stderr.contains(&format!(
+            "Merge complete: {total_elements} elements written"
+        )),
         "MergeStats::total_elements must equal actual output element count; \
          expected {total_elements} elements; stderr:\n{stderr}",
     );
@@ -613,15 +966,36 @@ fn merge_stats_match_output_counts_after_roundtrip() {
             .filter(|s| !s.is_empty())
             .filter_map(|s| s.parse().ok())
             .collect();
-        if nums.len() >= 3 { Some((nums[0], nums[1], nums[2])) } else { None }
+        if nums.len() >= 3 {
+            Some((nums[0], nums[1], nums[2]))
+        } else {
+            None
+        }
     }
-    let base_line = stderr.lines().find(|l| l.trim_start().starts_with("Base:")).expect("Base line");
-    let diff_line = stderr.lines().find(|l| l.trim_start().starts_with("Diff:")).expect("Diff line");
+    let base_line = stderr
+        .lines()
+        .find(|l| l.trim_start().starts_with("Base:"))
+        .expect("Base line");
+    let diff_line = stderr
+        .lines()
+        .find(|l| l.trim_start().starts_with("Diff:"))
+        .expect("Diff line");
     let (b_n, b_w, b_r) = extract_three(base_line).expect("Base nums");
     let (d_n, d_w, d_r) = extract_three(diff_line).expect("Diff nums");
 
-    assert_eq!(b_n + d_n, result_nodes, "node stats must partition the output node set");
-    assert_eq!(b_w + d_w, result_ways, "way stats must partition the output way set");
-    assert_eq!(b_r + d_r, result_relations, "relation stats must partition the output relation set");
+    assert_eq!(
+        b_n + d_n,
+        result_nodes,
+        "node stats must partition the output node set"
+    );
+    assert_eq!(
+        b_w + d_w,
+        result_ways,
+        "way stats must partition the output way set"
+    );
+    assert_eq!(
+        b_r + d_r,
+        result_relations,
+        "relation stats must partition the output relation set"
+    );
 }
-

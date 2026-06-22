@@ -12,9 +12,9 @@
 
 mod compact;
 mod interner;
+pub(crate) mod merge_join;
 pub mod parse;
 pub(crate) mod write;
-pub(crate) mod merge_join;
 mod xml_parse;
 
 // Box<dyn Error> is intentional - OSC parsing is CLI-internal, callers only

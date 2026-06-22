@@ -23,7 +23,7 @@ mod stats;
 mod stream_output;
 mod streaming;
 
-pub use rewrite::{merge, MergeOptions};
+pub use rewrite::{MergeOptions, merge};
 pub use stats::MergeStats;
 
 type Result<T> = super::Result<T>;

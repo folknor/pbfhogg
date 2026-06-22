@@ -27,9 +27,7 @@ mod apply_changes {
     use pbfhogg::writer::Compression;
     use tempfile::TempDir;
 
-    use crate::common::{
-        self, generate_nodes, write_multi_block_test_pbf,
-    };
+    use crate::common::{self, generate_nodes, write_multi_block_test_pbf};
 
     fn write_osc(path: &Path, xml: &str) {
         let file = File::create(path).expect("create osc file");
@@ -101,7 +99,13 @@ mod apply_changes {
         // invariant is "does not silently succeed" + "scratch stays clean"
         // + "output is absent-or-truncated-to-zero".
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            merge(&base, &osc, &output, &opts, &pbfhogg::HeaderOverrides::default())
+            merge(
+                &base,
+                &osc,
+                &output,
+                &opts,
+                &pbfhogg::HeaderOverrides::default(),
+            )
         }));
         let silently_succeeded = matches!(result, Ok(Ok(_)));
         assert!(

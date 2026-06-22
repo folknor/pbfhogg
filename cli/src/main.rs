@@ -94,7 +94,6 @@ enum DefaultTypeArg {
     Relation,
 }
 
-
 #[derive(Subcommand)]
 enum Command {
     /// Concatenate PBF files with optional type filtering
@@ -491,7 +490,7 @@ enum Command {
         #[command(subcommand)]
         subcommand: Option<InspectCommand>,
         /// Input PBF file
-        #[arg(required_unless_present = "subcommand")]
+        #[arg(required = true)]
         file: Option<PathBuf>,
         /// Check if PBF has blob-level indexdata (exit code 0/1)
         #[arg(long)]
@@ -680,7 +679,6 @@ enum Command {
     },
 }
 
-
 #[derive(Subcommand)]
 enum InspectCommand {
     /// Count tag key=value frequencies
@@ -780,145 +778,146 @@ fn main() -> process::ExitCode {
 
     let cli = Cli::parse();
 
-    let result = (|| -> Result<(), Box<dyn std::error::Error>> { match cli.command {
-        Command::Cat {
-            files,
-            output,
-            clean,
-            type_filter,
-            dedupe,
-            compression,
-            io,
-            uring,
-            force,
-            header,
-        } => {
-            let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
-            if dedupe {
-                if type_filter.is_some() {
-                    return Err("--type is not valid with --dedupe".into());
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        match cli.command {
+            Command::Cat {
+                files,
+                output,
+                clean,
+                type_filter,
+                dedupe,
+                compression,
+                io,
+                uring,
+                force,
+                header,
+            } => {
+                let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                if dedupe {
+                    if type_filter.is_some() {
+                        return Err("--type is not valid with --dedupe".into());
+                    }
+                    if !clean.is_empty() {
+                        return Err("--clean is not valid with --dedupe".into());
+                    }
+                    run_merge_pbf(
+                        &files,
+                        &output.output,
+                        &compression.compression,
+                        io.direct_io,
+                        uring.io_uring,
+                        force.force,
+                        &overrides,
+                    )
+                } else {
+                    if uring.io_uring {
+                        return Err("--io-uring is only valid with --dedupe".into());
+                    }
+                    run_cat(
+                        &files,
+                        &output.output,
+                        type_filter.as_deref(),
+                        &clean,
+                        &compression.compression,
+                        io.direct_io,
+                        force.force,
+                        &overrides,
+                    )
                 }
-                if !clean.is_empty() {
-                    return Err("--clean is not valid with --dedupe".into());
-                }
-                run_merge_pbf(
-                    &files,
-                    &output.output,
-                    &compression.compression,
-                    io.direct_io,
-                    uring.io_uring,
-                    force.force,
-                    &overrides,
-                )
-            } else {
-                if uring.io_uring {
-                    return Err("--io-uring is only valid with --dedupe".into());
-                }
-                run_cat(
-                    &files,
-                    &output.output,
-                    type_filter.as_deref(),
-                    &clean,
-                    &compression.compression,
-                    io.direct_io,
-                    force.force,
-                    &overrides,
-                )
             }
-        }
-        Command::Sort {
-            file,
-            output,
-            compression,
-            io,
-            uring,
-            force,
-            header,
-        } => run_sort(
-            &file,
-            &output.output,
-            &compression.compression,
-            io.direct_io,
-            uring.io_uring,
-            force.force,
-            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-        ),
-        Command::Repack {
-            file,
-            output,
-            elements_per_blob,
-            compression,
-            io,
-            uring,
-            force,
-            header,
-        } => run_repack(
-            &file,
-            &output.output,
-            elements_per_blob,
-            &compression.compression,
-            io.direct_io,
-            uring.io_uring,
-            force.force,
-            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-        ),
-        Command::Degrade {
-            file,
-            output,
-            unsort,
-            strip_locations,
-            strip_indexdata,
-            block_cap,
-            force,
-            compression,
-            io,
-            uring,
-            header,
-        } => run_degrade(
-            &file,
-            &output.output,
-            unsort,
-            strip_locations,
-            strip_indexdata,
-            block_cap,
-            force,
-            &compression.compression,
-            io.direct_io,
-            uring.io_uring,
-            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-        ),
-        Command::Renumber {
-            file,
-            output,
-            start_id,
-            compression,
-            io,
-            header,
-        } => run_renumber(
-            &file,
-            &output.output,
-            &start_id,
-            &compression.compression,
-            io.direct_io,
-            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-        ),
-        Command::TagsFilter {
-            file,
-            output,
-            input_kind,
-            omit_referenced,
-            invert_match,
-            remove_tags,
-            expressions_file,
-            expressions,
-            compression,
-            force,
-            io,
-            jobs,
-            header,
-        } => {
-            let kind = input_kind.unwrap_or_else(|| detect_input_kind(&file));
-            match kind {
+            Command::Sort {
+                file,
+                output,
+                compression,
+                io,
+                uring,
+                force,
+                header,
+            } => run_sort(
+                &file,
+                &output.output,
+                &compression.compression,
+                io.direct_io,
+                uring.io_uring,
+                force.force,
+                &HeaderOverrides::parse(header.generator, &header.output_headers)?,
+            ),
+            Command::Repack {
+                file,
+                output,
+                elements_per_blob,
+                compression,
+                io,
+                uring,
+                force,
+                header,
+            } => run_repack(
+                &file,
+                &output.output,
+                elements_per_blob,
+                &compression.compression,
+                io.direct_io,
+                uring.io_uring,
+                force.force,
+                &HeaderOverrides::parse(header.generator, &header.output_headers)?,
+            ),
+            Command::Degrade {
+                file,
+                output,
+                unsort,
+                strip_locations,
+                strip_indexdata,
+                block_cap,
+                force,
+                compression,
+                io,
+                uring,
+                header,
+            } => run_degrade(
+                &file,
+                &output.output,
+                unsort,
+                strip_locations,
+                strip_indexdata,
+                block_cap,
+                force,
+                &compression.compression,
+                io.direct_io,
+                uring.io_uring,
+                &HeaderOverrides::parse(header.generator, &header.output_headers)?,
+            ),
+            Command::Renumber {
+                file,
+                output,
+                start_id,
+                compression,
+                io,
+                header,
+            } => run_renumber(
+                &file,
+                &output.output,
+                &start_id,
+                &compression.compression,
+                io.direct_io,
+                &HeaderOverrides::parse(header.generator, &header.output_headers)?,
+            ),
+            Command::TagsFilter {
+                file,
+                output,
+                input_kind,
+                omit_referenced,
+                invert_match,
+                remove_tags,
+                expressions_file,
+                expressions,
+                compression,
+                force,
+                io,
+                jobs,
+                header,
+            } => {
+                let kind = input_kind.unwrap_or_else(|| detect_input_kind(&file));
+                match kind {
                 InputKind::Osc => {
                     if omit_referenced {
                         return Err("-R/--omit-referenced is not valid in OSC mode".into());
@@ -952,369 +951,378 @@ fn main() -> process::ExitCode {
                     &HeaderOverrides::parse(header.generator, &header.output_headers)?,
                 ),
             }
-        }
-        Command::Diff {
-            old,
-            new,
-            suppress_common,
-            verbose,
-            osmium_summary,
-            quiet,
-            output,
-            type_filter,
-            jobs,
-            format,
-            increment_version,
-            update_timestamp,
-            io,
-        } => match format {
-            DiffFormat::Osc => {
-                let output = output.ok_or("--output is required with --format osc")?;
-                if suppress_common {
-                    return Err("--suppress-common is not valid with --format osc".into());
-                }
-                if verbose {
-                    return Err("--verbose is not valid with --format osc".into());
-                }
-                if osmium_summary {
-                    return Err("--osmium-summary is not valid with --format osc".into());
-                }
-                if quiet {
-                    return Err("--quiet is not valid with --format osc".into());
-                }
-                if type_filter.is_some() {
-                    return Err("--type is not valid with --format osc".into());
-                }
-                run_derive_changes(&old, &new, &output, io.direct_io, increment_version, update_timestamp, jobs)
             }
-            DiffFormat::Text => {
-                if increment_version {
-                    return Err("--increment-version is only valid with --format osc".into());
-                }
-                if update_timestamp {
-                    return Err("--update-timestamp is only valid with --format osc".into());
-                }
-                run_diff(
-                    &old,
-                    &new,
-                    suppress_common,
-                    verbose,
-                    osmium_summary,
-                    quiet,
-                    output.as_deref(),
-                    type_filter.as_deref(),
-                    jobs,
-                    io.direct_io,
-                )
-            }
-        },
-        Command::Getid {
-            file,
-            output,
-            invert,
-            add_referenced,
-            remove_tags,
-            verbose_ids,
-            id_file,
-            id_osm_file,
-            default_type,
-            ids,
-            compression,
-            force,
-            io,
-            header,
-        } => {
-            if invert {
-                run_removeid(
-                    &file,
-                    &output.output,
-                    id_file.as_deref(),
-                    id_osm_file.as_deref(),
-                    default_type,
-                    &ids,
-                    &compression.compression,
-                    io.direct_io,
-                    force.force,
-                    &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-                )
-            } else {
-                run_getid(
-                    &file,
-                    &output.output,
-                    add_referenced,
-                    remove_tags,
-                    verbose_ids,
-                    id_file.as_deref(),
-                    id_osm_file.as_deref(),
-                    default_type,
-                    &ids,
-                    &compression.compression,
-                    io.direct_io,
-                    force.force,
-                    &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-                )
-            }
-        }
-        Command::Getparents {
-            file,
-            output,
-            add_self,
-            id_file,
-            id_osm_file,
-            default_type,
-            ids,
-            compression,
-            io,
-            header,
-        } => run_getparents(
-            &file,
-            &output.output,
-            add_self,
-            id_file.as_deref(),
-            id_osm_file.as_deref(),
-            default_type,
-            &ids,
-            &compression.compression,
-            io.direct_io,
-            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-        ),
-        Command::Extract {
-            file,
-            output,
-            bbox,
-            polygon,
-            config,
-            directory,
-            simple,
-            smart,
-            set_bounds,
-            clean,
-            compression,
-            force,
-            io,
-            header,
-        } => {
-            let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
-            if let Some(config_path) = config.as_deref() {
-                run_extract_config(
-                    &file,
-                    config_path,
-                    directory.as_deref(),
-                    extract_strategy(simple, smart),
-                    set_bounds,
-                    &clean,
-                    &compression.compression,
-                    io.direct_io,
-                    force.force,
-                    &overrides,
-                )
-            } else if let Some(output) = output.as_ref() {
-                run_extract(
-                    &file,
-                    output,
-                    bbox.as_deref(),
-                    polygon.as_deref(),
-                    extract_strategy(simple, smart),
-                    set_bounds,
-                    &clean,
-                    &compression.compression,
-                    io.direct_io,
-                    force.force,
-                    &overrides,
-                )
-            } else {
-                Err("--output is required without --config".into())
-            }
-        }
-        Command::AddLocationsToWays {
-            file,
-            output,
-            keep_untagged_nodes,
-            index_type,
-            compression,
-            force,
-            io,
-            header,
-        } => run_add_locations_to_ways(
-            &file,
-            &output.output,
-            keep_untagged_nodes,
-            &index_type,
-            &compression.compression,
-            io.direct_io,
-            force.force,
-            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-        ),
-        Command::TimeFilter {
-            file,
-            output,
-            timestamp,
-            compression,
-            io,
-            header,
-        } => run_time_filter(
-            &file,
-            &output.output,
-            &timestamp,
-            &compression.compression,
-            io.direct_io,
-            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-        ),
-        Command::Inspect {
-            subcommand,
-            file,
-            indexed,
-            nodes,
-            jobs,
-            blocks,
-            id_ranges,
-            locations,
-            anomalies,
-            extended,
-            show,
-            get,
-            json,
-            io,
-            force,
-        } => {
-            if let Some(InspectCommand::Tags {
-                file: tags_file,
-                min_count,
-                max_count,
-                sort,
-                expressions_file,
-                expressions,
+            Command::Diff {
+                old,
+                new,
+                suppress_common,
+                verbose,
+                osmium_summary,
+                quiet,
+                output,
                 type_filter,
-                jobs: tags_jobs,
-                io: tags_io,
-                force: tags_force,
-            }) = subcommand
-            {
-                run_tags_count(
-                    &tags_file,
+                jobs,
+                format,
+                increment_version,
+                update_timestamp,
+                io,
+            } => match format {
+                DiffFormat::Osc => {
+                    let output = output.ok_or("--output is required with --format osc")?;
+                    if suppress_common {
+                        return Err("--suppress-common is not valid with --format osc".into());
+                    }
+                    if verbose {
+                        return Err("--verbose is not valid with --format osc".into());
+                    }
+                    if osmium_summary {
+                        return Err("--osmium-summary is not valid with --format osc".into());
+                    }
+                    if quiet {
+                        return Err("--quiet is not valid with --format osc".into());
+                    }
+                    if type_filter.is_some() {
+                        return Err("--type is not valid with --format osc".into());
+                    }
+                    run_derive_changes(
+                        &old,
+                        &new,
+                        &output,
+                        io.direct_io,
+                        increment_version,
+                        update_timestamp,
+                        jobs,
+                    )
+                }
+                DiffFormat::Text => {
+                    if increment_version {
+                        return Err("--increment-version is only valid with --format osc".into());
+                    }
+                    if update_timestamp {
+                        return Err("--update-timestamp is only valid with --format osc".into());
+                    }
+                    run_diff(
+                        &old,
+                        &new,
+                        suppress_common,
+                        verbose,
+                        osmium_summary,
+                        quiet,
+                        output.as_deref(),
+                        type_filter.as_deref(),
+                        jobs,
+                        io.direct_io,
+                    )
+                }
+            },
+            Command::Getid {
+                file,
+                output,
+                invert,
+                add_referenced,
+                remove_tags,
+                verbose_ids,
+                id_file,
+                id_osm_file,
+                default_type,
+                ids,
+                compression,
+                force,
+                io,
+                header,
+            } => {
+                if invert {
+                    run_removeid(
+                        &file,
+                        &output.output,
+                        id_file.as_deref(),
+                        id_osm_file.as_deref(),
+                        default_type,
+                        &ids,
+                        &compression.compression,
+                        io.direct_io,
+                        force.force,
+                        &HeaderOverrides::parse(header.generator, &header.output_headers)?,
+                    )
+                } else {
+                    run_getid(
+                        &file,
+                        &output.output,
+                        add_referenced,
+                        remove_tags,
+                        verbose_ids,
+                        id_file.as_deref(),
+                        id_osm_file.as_deref(),
+                        default_type,
+                        &ids,
+                        &compression.compression,
+                        io.direct_io,
+                        force.force,
+                        &HeaderOverrides::parse(header.generator, &header.output_headers)?,
+                    )
+                }
+            }
+            Command::Getparents {
+                file,
+                output,
+                add_self,
+                id_file,
+                id_osm_file,
+                default_type,
+                ids,
+                compression,
+                io,
+                header,
+            } => run_getparents(
+                &file,
+                &output.output,
+                add_self,
+                id_file.as_deref(),
+                id_osm_file.as_deref(),
+                default_type,
+                &ids,
+                &compression.compression,
+                io.direct_io,
+                &HeaderOverrides::parse(header.generator, &header.output_headers)?,
+            ),
+            Command::Extract {
+                file,
+                output,
+                bbox,
+                polygon,
+                config,
+                directory,
+                simple,
+                smart,
+                set_bounds,
+                clean,
+                compression,
+                force,
+                io,
+                header,
+            } => {
+                let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                if let Some(config_path) = config.as_deref() {
+                    run_extract_config(
+                        &file,
+                        config_path,
+                        directory.as_deref(),
+                        extract_strategy(simple, smart),
+                        set_bounds,
+                        &clean,
+                        &compression.compression,
+                        io.direct_io,
+                        force.force,
+                        &overrides,
+                    )
+                } else if let Some(output) = output.as_ref() {
+                    run_extract(
+                        &file,
+                        output,
+                        bbox.as_deref(),
+                        polygon.as_deref(),
+                        extract_strategy(simple, smart),
+                        set_bounds,
+                        &clean,
+                        &compression.compression,
+                        io.direct_io,
+                        force.force,
+                        &overrides,
+                    )
+                } else {
+                    Err("--output is required without --config".into())
+                }
+            }
+            Command::AddLocationsToWays {
+                file,
+                output,
+                keep_untagged_nodes,
+                index_type,
+                compression,
+                force,
+                io,
+                header,
+            } => run_add_locations_to_ways(
+                &file,
+                &output.output,
+                keep_untagged_nodes,
+                &index_type,
+                &compression.compression,
+                io.direct_io,
+                force.force,
+                &HeaderOverrides::parse(header.generator, &header.output_headers)?,
+            ),
+            Command::TimeFilter {
+                file,
+                output,
+                timestamp,
+                compression,
+                io,
+                header,
+            } => run_time_filter(
+                &file,
+                &output.output,
+                &timestamp,
+                &compression.compression,
+                io.direct_io,
+                &HeaderOverrides::parse(header.generator, &header.output_headers)?,
+            ),
+            Command::Inspect {
+                subcommand,
+                file,
+                indexed,
+                nodes,
+                jobs,
+                blocks,
+                id_ranges,
+                locations,
+                anomalies,
+                extended,
+                show,
+                get,
+                json,
+                io,
+                force,
+            } => {
+                if let Some(InspectCommand::Tags {
+                    file: tags_file,
                     min_count,
                     max_count,
-                    &sort,
-                    expressions_file.as_deref(),
-                    &expressions,
-                    type_filter.as_deref(),
-                    tags_jobs,
-                    tags_io.direct_io,
-                    tags_force.force,
-                )
-            } else {
-                let file = file.ok_or("Input PBF file is required")?;
-                if let Some(ref show_id) = show {
-                    return run_show_element(&file, show_id, io.direct_io);
+                    sort,
+                    expressions_file,
+                    expressions,
+                    type_filter,
+                    jobs: tags_jobs,
+                    io: tags_io,
+                    force: tags_force,
+                }) = subcommand
+                {
+                    run_tags_count(
+                        &tags_file,
+                        min_count,
+                        max_count,
+                        &sort,
+                        expressions_file.as_deref(),
+                        &expressions,
+                        type_filter.as_deref(),
+                        tags_jobs,
+                        tags_io.direct_io,
+                        tags_force.force,
+                    )
+                } else {
+                    let file = file.ok_or("Input PBF file is required")?;
+                    if let Some(ref show_id) = show {
+                        return run_show_element(&file, show_id, io.direct_io);
+                    }
+                    run_inspect(
+                        &file,
+                        indexed,
+                        nodes,
+                        jobs,
+                        blocks,
+                        id_ranges,
+                        locations,
+                        anomalies,
+                        extended,
+                        get.as_deref(),
+                        json,
+                        io.direct_io,
+                        force.force,
+                    )
                 }
-                run_inspect(
-                    &file,
-                    indexed,
-                    nodes,
-                    jobs,
-                    blocks,
-                    id_ranges,
-                    locations,
-                    anomalies,
-                    extended,
-                    get.as_deref(),
-                    json,
-                    io.direct_io,
-                    force.force,
-                )
             }
+            Command::ApplyChanges {
+                base,
+                changes,
+                output,
+                compression,
+                force,
+                io,
+                uring,
+                locations_on_ways,
+                jobs,
+                header,
+            } => run_apply_changes(
+                &base,
+                &changes,
+                &output.output,
+                &compression.compression,
+                io.direct_io,
+                uring.io_uring,
+                force.force,
+                locations_on_ways,
+                jobs,
+                &HeaderOverrides::parse(header.generator, &header.output_headers)?,
+            ),
+            Command::MergeChanges {
+                changes,
+                output,
+                simplify,
+                jobs,
+            } => run_merge_changes(&changes, &output.output, simplify, jobs),
+            Command::Check {
+                file,
+                ids,
+                refs,
+                check_relations,
+                show_ids,
+                full,
+                type_filter,
+                max_errors,
+                json,
+                quiet,
+                io,
+            } => run_check(
+                &file,
+                ids,
+                refs,
+                check_relations,
+                show_ids,
+                full,
+                type_filter.as_deref(),
+                max_errors,
+                json,
+                quiet,
+                io.direct_io,
+            ),
+            Command::BuildGeocodeIndex {
+                file,
+                output_dir,
+                street_level,
+                coarse_level,
+                admin_level,
+                max_admin_vertices,
+                search_radius,
+                coarse_search_radius,
+                io,
+                force,
+            } => run_build_geocode_index(
+                &file,
+                &output_dir,
+                street_level,
+                coarse_level,
+                admin_level,
+                max_admin_vertices,
+                search_radius,
+                coarse_search_radius,
+                io.direct_io,
+                force.force,
+            ),
+            Command::BenchRead { file, mode } => run_bench_read(&file, &mode),
+            Command::BenchWrite {
+                file,
+                compression,
+                writer,
+            } => run_bench_write(&file, &compression, &writer),
+            Command::BenchMerge {
+                base,
+                changes,
+                output,
+                compression,
+                io_mode,
+            } => run_bench_merge(&base, &changes, &output.output, &compression, &io_mode),
         }
-        Command::ApplyChanges {
-            base,
-            changes,
-            output,
-            compression,
-            force,
-            io,
-            uring,
-            locations_on_ways,
-            jobs,
-            header,
-        } => run_apply_changes(
-            &base,
-            &changes,
-            &output.output,
-            &compression.compression,
-            io.direct_io,
-            uring.io_uring,
-            force.force,
-            locations_on_ways,
-            jobs,
-            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-        ),
-        Command::MergeChanges {
-            changes,
-            output,
-            simplify,
-            jobs,
-        } => run_merge_changes(&changes, &output.output, simplify, jobs),
-        Command::Check {
-            file,
-            ids,
-            refs,
-            check_relations,
-            show_ids,
-            full,
-            type_filter,
-            max_errors,
-            json,
-            quiet,
-            io,
-        } => run_check(
-            &file,
-            ids,
-            refs,
-            check_relations,
-            show_ids,
-            full,
-            type_filter.as_deref(),
-            max_errors,
-            json,
-            quiet,
-            io.direct_io,
-        ),
-        Command::BuildGeocodeIndex {
-            file,
-            output_dir,
-            street_level,
-            coarse_level,
-            admin_level,
-            max_admin_vertices,
-            search_radius,
-            coarse_search_radius,
-            io,
-            force,
-        } => run_build_geocode_index(
-            &file,
-            &output_dir,
-            street_level,
-            coarse_level,
-            admin_level,
-            max_admin_vertices,
-            search_radius,
-            coarse_search_radius,
-            io.direct_io,
-            force.force,
-        ),
-        Command::BenchRead { file, mode } => run_bench_read(&file, &mode),
-        Command::BenchWrite {
-            file,
-            compression,
-            writer,
-        } => run_bench_write(&file, &compression, &writer),
-        Command::BenchMerge {
-            base,
-            changes,
-            output,
-            compression,
-            io_mode,
-        } => run_bench_merge(&base, &changes, &output.output, &compression, &io_mode),
-    } })();
+    })();
 
     match result {
         Ok(()) => process::ExitCode::SUCCESS,
@@ -1361,13 +1369,22 @@ fn run_build_geocode_index(
     let stats = pbfhogg::geocode_index::builder::build_geocode_index(&config)?;
     eprintln!(
         "Index built: {} addr, {} streets, {} interp, {} admin, {} fine cells, {} coarse cells, {} admin cells",
-        stats.addr_points, stats.street_ways, stats.interp_ways, stats.admin_polygons,
-        stats.fine_cells, stats.coarse_cells, stats.admin_cells,
+        stats.addr_points,
+        stats.street_ways,
+        stats.interp_ways,
+        stats.admin_polygons,
+        stats.fine_cells,
+        stats.coarse_cells,
+        stats.admin_cells,
     );
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cognitive_complexity)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cognitive_complexity
+)]
 fn run_check(
     path: &std::path::Path,
     ids: bool,
@@ -1396,7 +1413,9 @@ fn run_check(
     }
     if !run_refs {
         if check_relations {
-            return Err("--check-relations requires --refs (or omit --ids to run both checks)".into());
+            return Err(
+                "--check-relations requires --refs (or omit --ids to run both checks)".into(),
+            );
         }
         if show_ids {
             return Err("--show-ids requires --refs (or omit --ids to run both checks)".into());
@@ -1463,12 +1482,18 @@ fn run_check(
                     })
                 }).collect();
                 if let Some(m) = refs_obj.as_object_mut() {
-                    m.insert("missing_details".to_string(), serde_json::Value::Array(details));
+                    m.insert(
+                        "missing_details".to_string(),
+                        serde_json::Value::Array(details),
+                    );
                 }
             }
             combined.insert("refs".to_string(), refs_obj);
         }
-        println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(combined))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::Value::Object(combined))?
+        );
     } else if !quiet {
         if let Some(ref report) = ids_report {
             report.print_human(file_name);
@@ -1478,8 +1503,10 @@ fn run_check(
                 for mref in &result.missing_refs {
                     println!(
                         "{}{} in {}{}",
-                        mref.missing_type, mref.missing_id,
-                        mref.referencing_type, mref.referencing_id,
+                        mref.missing_type,
+                        mref.missing_id,
+                        mref.referencing_type,
+                        mref.referencing_id,
                     );
                 }
             }
@@ -1500,24 +1527,34 @@ fn run_check(
                     println!("Missing way refs in relations: {}", result.missing_way_refs);
                 }
                 if result.missing_node_members > 0 {
-                    println!("Missing node members in relations: {}", result.missing_node_members);
+                    println!(
+                        "Missing node members in relations: {}",
+                        result.missing_node_members
+                    );
                 }
                 if result.missing_relation_members > 0 {
-                    if result.missing_relation_member_occurrences > result.missing_relation_members {
+                    if result.missing_relation_member_occurrences > result.missing_relation_members
+                    {
                         println!(
                             "Missing relation members: {} ({} references)",
                             result.missing_relation_members,
                             result.missing_relation_member_occurrences,
                         );
                     } else {
-                        println!("Missing relation members: {}", result.missing_relation_members);
+                        println!(
+                            "Missing relation members: {}",
+                            result.missing_relation_members
+                        );
                     }
                 }
             }
             if result.is_valid() {
                 println!("Referential integrity: OK");
             } else {
-                println!("Referential integrity: FAILED ({} missing references)", result.total_missing());
+                println!(
+                    "Referential integrity: FAILED ({} missing references)",
+                    result.total_missing()
+                );
             }
         }
     }
@@ -1547,7 +1584,10 @@ fn run_tags_count(
         "count-asc" => pbfhogg::tags_count::TagCountSort::CountAsc,
         "name-asc" | "name" => pbfhogg::tags_count::TagCountSort::NameAsc,
         "name-desc" => pbfhogg::tags_count::TagCountSort::NameDesc,
-        _ => return Err(format!("unknown sort order: {sort_str} (expected count-desc, count-asc, name-asc, name-desc)").into()),
+        _ => return Err(format!(
+            "unknown sort order: {sort_str} (expected count-desc, count-asc, name-asc, name-desc)"
+        )
+        .into()),
     };
     let all_expressions = combine_expressions(expressions_file, expressions)?;
     let opts = pbfhogg::tags_count::TagCountOptions {
@@ -1570,7 +1610,9 @@ fn run_tags_count(
     Ok(())
 }
 
-fn parse_clean_attrs(attrs: &[String]) -> Result<pbfhogg::cat::CleanAttrs, Box<dyn std::error::Error>> {
+fn parse_clean_attrs(
+    attrs: &[String],
+) -> Result<pbfhogg::cat::CleanAttrs, Box<dyn std::error::Error>> {
     let mut clean = pbfhogg::cat::CleanAttrs::default();
     for attr in attrs {
         match attr.as_str() {
@@ -1601,7 +1643,16 @@ fn run_cat(
     let compression: Compression = compression.parse()?;
     let clean = parse_clean_attrs(clean_attrs)?;
     let paths: Vec<&std::path::Path> = files.iter().map(AsRef::as_ref).collect();
-    let stats = pbfhogg::cat::cat(&paths, output, type_filter, &clean, compression, direct_io, force, overrides)?;
+    let stats = pbfhogg::cat::cat(
+        &paths,
+        output,
+        type_filter,
+        &clean,
+        compression,
+        direct_io,
+        force,
+        overrides,
+    )?;
     stats.print_summary();
     Ok(())
 }
@@ -1699,33 +1750,50 @@ fn run_renumber(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let parts: Vec<&str> = start_id.split(',').collect();
-    let opts = match parts.len() {
-        1 => {
-            let id: i64 = parts[0].trim().parse()
-                .map_err(|_| format!("invalid start ID: {}", parts[0]))?;
-            pbfhogg::renumber::RenumberOptions {
-                start_node_id: id,
-                start_way_id: id,
-                start_relation_id: id,
+    let opts =
+        match parts.len() {
+            1 => {
+                let id: i64 = parts[0]
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("invalid start ID: {}", parts[0]))?;
+                pbfhogg::renumber::RenumberOptions {
+                    start_node_id: id,
+                    start_way_id: id,
+                    start_relation_id: id,
+                }
             }
-        }
-        3 => {
-            let node_id: i64 = parts[0].trim().parse()
-                .map_err(|_| format!("invalid node start ID: {}", parts[0]))?;
-            let way_id: i64 = parts[1].trim().parse()
-                .map_err(|_| format!("invalid way start ID: {}", parts[1]))?;
-            let rel_id: i64 = parts[2].trim().parse()
-                .map_err(|_| format!("invalid relation start ID: {}", parts[2]))?;
-            pbfhogg::renumber::RenumberOptions {
-                start_node_id: node_id,
-                start_way_id: way_id,
-                start_relation_id: rel_id,
+            3 => {
+                let node_id: i64 = parts[0]
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("invalid node start ID: {}", parts[0]))?;
+                let way_id: i64 = parts[1]
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("invalid way start ID: {}", parts[1]))?;
+                let rel_id: i64 = parts[2]
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("invalid relation start ID: {}", parts[2]))?;
+                pbfhogg::renumber::RenumberOptions {
+                    start_node_id: node_id,
+                    start_way_id: way_id,
+                    start_relation_id: rel_id,
+                }
             }
-        }
-        _ => return Err("--start-id must be a single value or 3 comma-separated values (node,way,relation)".into()),
-    };
+            _ => return Err(
+                "--start-id must be a single value or 3 comma-separated values (node,way,relation)"
+                    .into(),
+            ),
+        };
     let stats = pbfhogg::renumber::renumber_external(
-        file, output, &opts, compression, direct_io, overrides,
+        file,
+        output,
+        &opts,
+        compression,
+        direct_io,
+        overrides,
     )?;
     stats.print_summary();
     Ok(())
@@ -1753,7 +1821,9 @@ fn run_tags_filter(
         return Err("no filter expressions provided (use positional args or -e FILE)".into());
     }
     if remove_tags && omit_referenced {
-        eprintln!("Warning! With -R/--omit-referenced use of -t/--remove-tags isn't doing anything.");
+        eprintln!(
+            "Warning! With -R/--omit-referenced use of -t/--remove-tags isn't doing anything."
+        );
     }
     let opts = pbfhogg::tags_filter::TagsFilterOptions {
         expression_strs: &all_expressions,
@@ -1848,9 +1918,21 @@ fn print_missing_ids(
     // Scan the output PBF to find which requested IDs are present.
     let found = pbfhogg::getid::parse_ids_from_pbf(output, direct_io)?;
 
-    let missing_nodes: Vec<_> = requested.node_ids.iter().filter(|&id| !found.node_ids.get(id)).collect();
-    let missing_ways: Vec<_> = requested.way_ids.iter().filter(|&id| !found.way_ids.get(id)).collect();
-    let missing_rels: Vec<_> = requested.relation_ids.iter().filter(|&id| !found.relation_ids.get(id)).collect();
+    let missing_nodes: Vec<_> = requested
+        .node_ids
+        .iter()
+        .filter(|&id| !found.node_ids.get(id))
+        .collect();
+    let missing_ways: Vec<_> = requested
+        .way_ids
+        .iter()
+        .filter(|&id| !found.way_ids.get(id))
+        .collect();
+    let missing_rels: Vec<_> = requested
+        .relation_ids
+        .iter()
+        .filter(|&id| !found.relation_ids.get(id))
+        .collect();
 
     let total_missing = missing_nodes.len() + missing_ways.len() + missing_rels.len();
     if total_missing == 0 {
@@ -1976,14 +2058,19 @@ fn run_getid(
     let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, direct_io)?;
 
     if remove_tags && !add_referenced {
-        eprintln!("Warning! Without -r/--add-referenced use of -t/--remove-tags isn't doing anything.");
+        eprintln!(
+            "Warning! Without -r/--add-referenced use of -t/--remove-tags isn't doing anything."
+        );
     }
 
     if verbose_ids {
         print_requested_ids(&id_set);
     }
 
-    let opts = pbfhogg::getid::GetidOptions { add_referenced, remove_tags };
+    let opts = pbfhogg::getid::GetidOptions {
+        add_referenced,
+        remove_tags,
+    };
     let stats = pbfhogg::getid::getid(
         file,
         output,
@@ -2019,7 +2106,15 @@ fn run_getparents(
     let compression: Compression = compression.parse()?;
     let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, direct_io)?;
     let opts = pbfhogg::getparents::GetparentsOptions { add_self };
-    let stats = pbfhogg::getparents::getparents(file, output, &id_set, &opts, compression, direct_io, overrides)?;
+    let stats = pbfhogg::getparents::getparents(
+        file,
+        output,
+        &id_set,
+        &opts,
+        compression,
+        direct_io,
+        overrides,
+    )?;
     stats.print_summary();
     Ok(())
 }
@@ -2039,7 +2134,15 @@ fn run_removeid(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, direct_io)?;
-    let stats = pbfhogg::getid::removeid(file, output, &id_set, compression, direct_io, force, overrides)?;
+    let stats = pbfhogg::getid::removeid(
+        file,
+        output,
+        &id_set,
+        compression,
+        direct_io,
+        force,
+        overrides,
+    )?;
     stats.print_summary();
     Ok(())
 }
@@ -2117,9 +2220,7 @@ fn run_extract_config(
         let config_parent = config_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
-        let old_dir = config_dir
-            .as_deref()
-            .unwrap_or(config_parent);
+        let old_dir = config_dir.as_deref().unwrap_or(config_parent);
         for slot in &mut slots {
             // Re-resolve output relative to new directory
             if let Ok(relative) = slot.output.strip_prefix(old_dir) {
@@ -2185,7 +2286,8 @@ fn run_time_filter(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let cutoff = parse_timestamp(timestamp)?;
-    let stats = pbfhogg::time_filter::time_filter(file, output, cutoff, compression, direct_io, overrides)?;
+    let stats =
+        pbfhogg::time_filter::time_filter(file, output, cutoff, compression, direct_io, overrides)?;
     stats.print_summary();
     Ok(())
 }
@@ -2368,11 +2470,21 @@ fn run_inspect(
     }
 
     if nodes && json {
-        return Err("--nodes and --json cannot be used together (node stats have no JSON output)".into());
+        return Err(
+            "--nodes and --json cannot be used together (node stats have no JSON output)".into(),
+        );
     }
 
     // --nodes only: run node stats without full inspect
-    if nodes && !indexed && !extended && !id_ranges && !locations && !anomalies && blocks.is_none() && get.is_none() {
+    if nodes
+        && !indexed
+        && !extended
+        && !id_ranges
+        && !locations
+        && !anomalies
+        && blocks.is_none()
+        && get.is_none()
+    {
         let report = pbfhogg::inspect::node_stats::node_stats(path, direct_io, force, jobs)?;
         report.print_report();
         return Ok(());
@@ -2389,7 +2501,8 @@ fn run_inspect(
             || key.starts_with("elements.")
             || key.starts_with("blocks.")
             || key == "indexed";
-        let has_other_flags = extended || id_ranges || locations || anomalies || nodes || indexed || blocks.is_some();
+        let has_other_flags =
+            extended || id_ranges || locations || anomalies || nodes || indexed || blocks.is_some();
         if !needs_full_scan && !has_other_flags {
             let mut reader = pbfhogg::BlobReader::open(path, direct_io)?;
             let header = match reader.next() {
@@ -2408,11 +2521,17 @@ fn run_inspect(
                 ),
                 "file.size" => Some(std::fs::metadata(path)?.len().to_string()),
                 "file.format" => Some("PBF".to_string()),
-                "header.bbox" => header.bbox().map(|bb| format!("{} {} {} {}", bb.left, bb.bottom, bb.right, bb.top)),
+                "header.bbox" => header
+                    .bbox()
+                    .map(|bb| format!("{} {} {} {}", bb.left, bb.bottom, bb.right, bb.top)),
                 "header.writing_program" => header.writing_program().map(String::from),
                 "header.replication.url" => header.osmosis_replication_base_url().map(String::from),
-                "header.replication.sequence" => header.osmosis_replication_sequence_number().map(|s| s.to_string()),
-                "header.replication.timestamp" => header.osmosis_replication_timestamp().map(|t| t.to_string()),
+                "header.replication.sequence" => header
+                    .osmosis_replication_sequence_number()
+                    .map(|s| s.to_string()),
+                "header.replication.timestamp" => header
+                    .osmosis_replication_timestamp()
+                    .map(|t| t.to_string()),
                 _ => return Err(format!("unknown key: {key}").into()),
             };
             match val {
@@ -2464,7 +2583,10 @@ fn run_inspect(
         let mut value = report.to_json_filtered(block_limit, anomalies);
         if indexed {
             if let serde_json::Value::Object(ref mut map) = value {
-                map.insert("indexed".to_string(), serde_json::Value::Bool(!exit_not_indexed));
+                map.insert(
+                    "indexed".to_string(),
+                    serde_json::Value::Bool(!exit_not_indexed),
+                );
             }
         }
         println!("{value}");
@@ -2545,83 +2667,82 @@ fn run_merge_changes(
 fn run_bench_read(path: &std::path::Path, mode: &str) -> Result<(), Box<dyn std::error::Error>> {
     use std::time::Instant;
 
-    let (elapsed_ms, nodes, ways, rels): (u128, u64, u64, u64) = match mode {
-        "sequential" => {
-            let reader = pbfhogg::ElementReader::from_path(path)?;
-            let mut nodes = 0u64;
-            let mut ways = 0u64;
-            let mut rels = 0u64;
-            let start = Instant::now();
-            reader.for_each(|el| match el {
-                pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => nodes += 1,
-                pbfhogg::Element::Way(_) => ways += 1,
-                pbfhogg::Element::Relation(_) => rels += 1,
-                _ => {}
-            })?;
-            (start.elapsed().as_millis(), nodes, ways, rels)
-        }
-        "parallel" => {
-            let reader = pbfhogg::ElementReader::from_path(path)?;
-            let start = Instant::now();
-            let (nodes, ways, rels) = reader.par_map_reduce(
-                |el| match el {
-                    pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => {
-                        (1u64, 0u64, 0u64)
-                    }
-                    pbfhogg::Element::Way(_) => (0, 1, 0),
-                    pbfhogg::Element::Relation(_) => (0, 0, 1),
-                    _ => (0, 0, 0),
-                },
-                || (0, 0, 0),
-                |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
-            )?;
-            (start.elapsed().as_millis(), nodes, ways, rels)
-        }
-        "pipelined" => {
-            let reader = pbfhogg::ElementReader::from_path(path)?;
-            let mut nodes = 0u64;
-            let mut ways = 0u64;
-            let mut rels = 0u64;
-            let start = Instant::now();
-            reader.for_each_pipelined(|el| match el {
-                pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => nodes += 1,
-                pbfhogg::Element::Way(_) => ways += 1,
-                pbfhogg::Element::Relation(_) => rels += 1,
-                _ => {}
-            })?;
-            (start.elapsed().as_millis(), nodes, ways, rels)
-        }
-        "blobreader" => {
-            use std::io::BufReader;
-            let reader = pbfhogg::BlobReader::new(BufReader::new(std::fs::File::open(path)?));
-            let mut nodes = 0u64;
-            let mut ways = 0u64;
-            let mut rels = 0u64;
-            let start = Instant::now();
-            for blob_result in reader {
-                let blob = blob_result?;
-                if let pbfhogg::BlobDecode::OsmData(block) = blob.decode()? {
-                    for el in block.elements() {
-                        match el {
-                            pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => {
-                                nodes += 1;
+    let (elapsed_ms, nodes, ways, rels): (u128, u64, u64, u64) =
+        match mode {
+            "sequential" => {
+                let reader = pbfhogg::ElementReader::from_path(path)?;
+                let mut nodes = 0u64;
+                let mut ways = 0u64;
+                let mut rels = 0u64;
+                let start = Instant::now();
+                reader.for_each(|el| match el {
+                    pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => nodes += 1,
+                    pbfhogg::Element::Way(_) => ways += 1,
+                    pbfhogg::Element::Relation(_) => rels += 1,
+                    _ => {}
+                })?;
+                (start.elapsed().as_millis(), nodes, ways, rels)
+            }
+            "parallel" => {
+                let reader = pbfhogg::ElementReader::from_path(path)?;
+                let start = Instant::now();
+                let (nodes, ways, rels) = reader.par_map_reduce(
+                    |el| match el {
+                        pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => {
+                            (1u64, 0u64, 0u64)
+                        }
+                        pbfhogg::Element::Way(_) => (0, 1, 0),
+                        pbfhogg::Element::Relation(_) => (0, 0, 1),
+                        _ => (0, 0, 0),
+                    },
+                    || (0, 0, 0),
+                    |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
+                )?;
+                (start.elapsed().as_millis(), nodes, ways, rels)
+            }
+            "pipelined" => {
+                let reader = pbfhogg::ElementReader::from_path(path)?;
+                let mut nodes = 0u64;
+                let mut ways = 0u64;
+                let mut rels = 0u64;
+                let start = Instant::now();
+                reader.for_each_pipelined(|el| match el {
+                    pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => nodes += 1,
+                    pbfhogg::Element::Way(_) => ways += 1,
+                    pbfhogg::Element::Relation(_) => rels += 1,
+                    _ => {}
+                })?;
+                (start.elapsed().as_millis(), nodes, ways, rels)
+            }
+            "blobreader" => {
+                use std::io::BufReader;
+                let reader = pbfhogg::BlobReader::new(BufReader::new(std::fs::File::open(path)?));
+                let mut nodes = 0u64;
+                let mut ways = 0u64;
+                let mut rels = 0u64;
+                let start = Instant::now();
+                for blob_result in reader {
+                    let blob = blob_result?;
+                    if let pbfhogg::BlobDecode::OsmData(block) = blob.decode()? {
+                        for el in block.elements() {
+                            match el {
+                                pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => {
+                                    nodes += 1;
+                                }
+                                pbfhogg::Element::Way(_) => ways += 1,
+                                pbfhogg::Element::Relation(_) => rels += 1,
+                                _ => {}
                             }
-                            pbfhogg::Element::Way(_) => ways += 1,
-                            pbfhogg::Element::Relation(_) => rels += 1,
-                            _ => {}
                         }
                     }
                 }
+                (start.elapsed().as_millis(), nodes, ways, rels)
             }
-            (start.elapsed().as_millis(), nodes, ways, rels)
-        }
-        other => {
-            return Err(format!(
+            other => return Err(format!(
                 "unknown read mode: {other} (expected: sequential, parallel, pipelined, blobreader)"
             )
-            .into())
-        }
-    };
+            .into()),
+        };
 
     eprintln!("elapsed_ms={elapsed_ms}");
     eprintln!("nodes={nodes}");
@@ -2654,7 +2775,13 @@ fn bench_write_loop<W: std::io::Write>(
                                 writer.write_primitive_block(bytes)?;
                             }
                         }
-                        bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), None);
+                        bb.add_node(
+                            dn.id(),
+                            dn.decimicro_lat(),
+                            dn.decimicro_lon(),
+                            dn.tags(),
+                            None,
+                        );
                         nodes += 1;
                     }
                     pbfhogg::Element::Node(n) => {
@@ -2803,7 +2930,8 @@ fn run_bench_merge(
         #[cfg(feature = "test-hooks")]
         panic_at_blob_seq: None,
     };
-    let stats = pbfhogg::apply_changes::merge(base, changes, output, &opts, &HeaderOverrides::default())?;
+    let stats =
+        pbfhogg::apply_changes::merge(base, changes, output, &opts, &HeaderOverrides::default())?;
     let elapsed_ms = start.elapsed().as_millis();
 
     let output_mb = std::fs::metadata(output)

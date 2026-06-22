@@ -26,15 +26,15 @@
 use std::io::Write as _;
 use std::sync::Arc;
 
-use super::radix::{ScratchDir, NUM_BUCKETS};
+use super::super::Result;
 #[cfg(feature = "linux-direct-io")]
 use super::radix::advise_dontneed_file;
-use crate::scan::node::{extract_node_tuples, NodeTuple};
-use super::super::Result;
+use super::radix::{NUM_BUCKETS, ScratchDir};
 use super::{
-    slot_bucket_bounds, BucketLayout, IdRecord, NodeBlobInfo, RESOLVED_ENTRY_SIZE, ID_RECORD_SIZE,
-    ResolvedEntry,
+    BucketLayout, ID_RECORD_SIZE, IdRecord, NodeBlobInfo, RESOLVED_ENTRY_SIZE, ResolvedEntry,
+    slot_bucket_bounds,
 };
+use crate::scan::node::{NodeTuple, extract_node_tuples};
 
 // ---------------------------------------------------------------------------
 // Stage 2: Parallel node join - id-bucket merge walk
@@ -47,7 +47,10 @@ struct LoaderScratch {
 
 impl LoaderScratch {
     fn new() -> Self {
-        Self { data_buf: Vec::new(), records: Vec::new() }
+        Self {
+            data_buf: Vec::new(),
+            records: Vec::new(),
+        }
     }
 }
 
@@ -82,17 +85,25 @@ fn prepare_bucket(
     let mut fadvise_bytes: u64 = 0;
 
     for worker_id in 0..num_shard_workers {
-        let path = scratch.path.join(format!("id-W{worker_id}-{bucket_idx:03}"));
+        let path = scratch
+            .path
+            .join(format!("id-W{worker_id}-{bucket_idx:03}"));
         let file = match std::fs::File::open(&path) {
-            Ok(f) => { open_calls += 1; f }
+            Ok(f) => {
+                open_calls += 1;
+                f
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(format!("open id shard: {e}")),
         };
         stat_calls += 1;
-        let len = file.metadata()
+        let len = file
+            .metadata()
             .map_err(|e| format!("stat id shard: {e}"))?
             .len() as usize;
-        if len == 0 { continue; }
+        if len == 0 {
+            continue;
+        }
         let start = loader.data_buf.len();
         loader.data_buf.resize(start + len, 0);
         std::io::Read::read_exact(&mut &file, &mut loader.data_buf[start..])
@@ -123,7 +134,8 @@ fn prepare_bucket(
     let count = loader.data_buf.len() / ID_RECORD_SIZE;
     loader.records.reserve(count);
     for chunk in loader.data_buf.chunks_exact(ID_RECORD_SIZE) {
-        let buf: &[u8; ID_RECORD_SIZE] = chunk.try_into()
+        let buf: &[u8; ID_RECORD_SIZE] = chunk
+            .try_into()
             .map_err(|_| "chunks_exact returned non-12-byte chunk".to_string())?;
         loader.records.push(IdRecord::read_from(buf));
     }
@@ -137,8 +149,12 @@ fn prepare_bucket(
 
     Ok(PreparedBucket {
         records: std::mem::take(&mut loader.records),
-        open_calls, stat_calls, fadvise_calls, fadvise_bytes,
-        parse_ms, sort_ms,
+        open_calls,
+        stat_calls,
+        fadvise_calls,
+        fadvise_bytes,
+        parse_ms,
+        sort_ms,
     })
 }
 
@@ -163,36 +179,36 @@ impl SharedSlotBuckets {
             let path = scratch.bucket_path("slot", i);
             let file = std::fs::File::create(&path)
                 .map_err(|e| format!("failed to create slot bucket {}: {e}", path.display()))?;
-            writers.push(std::sync::Mutex::new(
-                std::io::BufWriter::with_capacity(BUCKET_BUF_SIZE, file),
-            ));
+            writers.push(std::sync::Mutex::new(std::io::BufWriter::with_capacity(
+                BUCKET_BUF_SIZE,
+                file,
+            )));
             entry_counts.push(std::sync::atomic::AtomicU64::new(0));
         }
 
-        Ok(Self { writers, entry_counts })
+        Ok(Self {
+            writers,
+            entry_counts,
+        })
     }
 
     pub(super) fn finish(&self) -> std::result::Result<(), Box<dyn std::error::Error>> {
         for writer_mutex in &self.writers {
-            let mut w = writer_mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut w = writer_mutex
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             w.flush()?;
             #[cfg(feature = "linux-direct-io")]
             {
                 use std::os::unix::io::AsRawFd;
                 drop(w.get_ref().sync_data());
                 unsafe {
-                    libc::posix_fadvise(
-                        w.get_ref().as_raw_fd(),
-                        0,
-                        0,
-                        libc::POSIX_FADV_DONTNEED,
-                    )
+                    libc::posix_fadvise(w.get_ref().as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED)
                 };
             }
         }
         Ok(())
     }
-
 }
 
 /// Parallel stage 2: N workers each claim id buckets via atomic
@@ -666,35 +682,122 @@ pub(super) fn stage2_node_join(
 
     #[allow(clippy::cast_possible_wrap)]
     {
-        crate::debug::emit_counter("s2_node_pread_ms", s2_node_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_node_decompress_ms", s2_node_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_node_extract_ms", s2_node_extract_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_node_walk_ms", s2_node_walk_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_node_pread_ns", s2_node_pread_ns.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_node_decompress_ns", s2_node_decompress_ns.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_node_extract_ns", s2_node_extract_ns.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_node_walk_ns", s2_node_walk_ns.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_node_bytes_read", s2_node_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_node_blobs_read", s2_node_blobs_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_node_straddler_blobs", s2_node_straddler_blobs.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_resolve_ms", s2_resolve_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_bucket_load_ms", s2_bucket_load_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_bucket_loads", s2_bucket_loads.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_prepare_parse_ms", s2_prepare_parse_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_prepare_sort_ms", s2_prepare_sort_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_orphan_records", s2_orphan_records.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_slot_flush_lock_wait_ms", s2_slot_flush_lock_wait_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_slot_flush_write_ms", s2_slot_flush_write_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_slot_bytes_written", s2_slot_bytes_written.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_slot_flush_calls", s2_slot_flush_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_nonempty_slot_buckets_total", s2_nonempty_slot_buckets_total.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_max_slot_buffer_bytes", s2_max_slot_buffer_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_max_worker_buf_bytes", s2_max_worker_buf_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_pread_calls", s2_pread_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_open_calls", s2_open_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_stat_calls", s2_stat_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_fadvise_calls", s2_fadvise_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_fadvise_bytes", s2_fadvise_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter(
+            "s2_node_pread_ms",
+            s2_node_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_node_decompress_ms",
+            s2_node_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_node_extract_ms",
+            s2_node_extract_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_node_walk_ms",
+            s2_node_walk_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_node_pread_ns",
+            s2_node_pread_ns.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_node_decompress_ns",
+            s2_node_decompress_ns.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_node_extract_ns",
+            s2_node_extract_ns.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_node_walk_ns",
+            s2_node_walk_ns.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_node_bytes_read",
+            s2_node_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_node_blobs_read",
+            s2_node_blobs_read.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_node_straddler_blobs",
+            s2_node_straddler_blobs.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_resolve_ms",
+            s2_resolve_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_bucket_load_ms",
+            s2_bucket_load_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_bucket_loads",
+            s2_bucket_loads.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_prepare_parse_ms",
+            s2_prepare_parse_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_prepare_sort_ms",
+            s2_prepare_sort_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_orphan_records",
+            s2_orphan_records.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_slot_flush_lock_wait_ms",
+            s2_slot_flush_lock_wait_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_slot_flush_write_ms",
+            s2_slot_flush_write_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_slot_bytes_written",
+            s2_slot_bytes_written.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_slot_flush_calls",
+            s2_slot_flush_calls.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_nonempty_slot_buckets_total",
+            s2_nonempty_slot_buckets_total.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_max_slot_buffer_bytes",
+            s2_max_slot_buffer_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_max_worker_buf_bytes",
+            s2_max_worker_buf_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_pread_calls",
+            s2_pread_calls.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_open_calls",
+            s2_open_calls.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_stat_calls",
+            s2_stat_calls.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_fadvise_calls",
+            s2_fadvise_calls.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s2_fadvise_bytes",
+            s2_fadvise_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
         crate::debug::emit_counter("s2_num_workers", num_workers as i64);
     }
 

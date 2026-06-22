@@ -11,11 +11,11 @@
 
 use std::collections::VecDeque;
 
+use crate::reorder_buffer::ReorderBuffer;
 use crate::write::pipeline::{OutputChunk, PipelineItem, WRITE_AHEAD};
+use io_uring::IoUring;
 use io_uring::opcode;
 use io_uring::types::Fixed;
-use io_uring::IoUring;
-use crate::reorder_buffer::ReorderBuffer;
 use std::alloc::{self, Layout};
 use std::fs::File;
 use std::io;
@@ -23,11 +23,11 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::ptr::NonNull;
-use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::mpsc::{Receiver, SyncSender};
 
-use super::{PAGE_SIZE, alloc_page_aligned};
 use super::metrics::WRITER_METRICS;
+use super::{PAGE_SIZE, alloc_page_aligned};
 
 fn elapsed_ns_u64(start: std::time::Instant) -> u64 {
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
@@ -113,7 +113,13 @@ impl AlignedBufferPool {
         for i in 0..count {
             free.push_back(i);
         }
-        Ok(Self { base, layout, count, buf_size, free })
+        Ok(Self {
+            base,
+            layout,
+            count,
+            buf_size,
+            free,
+        })
     }
 
     /// Pointer to the start of buffer at `index`.
@@ -262,17 +268,12 @@ impl UringState {
         }
 
         let ptr = self.pool.buf_ptr(buf_idx).cast_const();
-        let sqe = opcode::WriteFixed::new(
-            Fixed(OUT_FD_IDX),
-            ptr,
-            aligned_len as u32,
-            buf_idx,
-        )
-        .offset(self.write_offset)
-        .build()
-        // Pack buf_idx (low 16 bits) and expected length (upper 48 bits) into user_data
-        // so reap_cqes can detect short writes.
-        .user_data((aligned_len as u64) << 16 | buf_idx as u64);
+        let sqe = opcode::WriteFixed::new(Fixed(OUT_FD_IDX), ptr, aligned_len as u32, buf_idx)
+            .offset(self.write_offset)
+            .build()
+            // Pack buf_idx (low 16 bits) and expected length (upper 48 bits) into user_data
+            // so reap_cqes can detect short writes.
+            .user_data((aligned_len as u64) << 16 | buf_idx as u64);
 
         // Safety: the SQE references a registered buffer (buf_idx) and a
         // registered fd (OUT_FD_IDX). The buffer will not be touched until the
@@ -344,14 +345,13 @@ impl UringState {
         }
         if wait {
             let t_wait = std::time::Instant::now();
-            self.ring
-                .submitter()
-                .submit_and_wait(1)
-                .map_err(|e| {
-                    io::Error::new(e.kind(), format!("io_uring submit_and_wait failed: {e}"))
-                })?;
+            self.ring.submitter().submit_and_wait(1).map_err(|e| {
+                io::Error::new(e.kind(), format!("io_uring submit_and_wait failed: {e}"))
+            })?;
             let elapsed = elapsed_ns_u64(t_wait);
-            WRITER_METRICS.uring_submit_and_wait_calls.fetch_add(1, Relaxed);
+            WRITER_METRICS
+                .uring_submit_and_wait_calls
+                .fetch_add(1, Relaxed);
             WRITER_METRICS
                 .uring_submit_and_wait_ns
                 .fetch_add(elapsed, Relaxed);
@@ -472,14 +472,7 @@ fn handle_copy_range_uring(
         // Safety: dst points into a valid registered buffer of size BUF_SIZE,
         // chunk <= remaining space in that buffer, and in_fd is a valid
         // readable file descriptor passed in from the caller.
-        let n = unsafe {
-            libc::pread(
-                in_fd,
-                dst.cast::<libc::c_void>(),
-                chunk,
-                src_offset as i64,
-            )
-        };
+        let n = unsafe { libc::pread(in_fd, dst.cast::<libc::c_void>(), chunk, src_offset as i64) };
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -625,10 +618,7 @@ fn uring_init_and_run(
 
 /// Reorder and write loop using the shared sequence-number reorder buffer,
 /// then dispatches to [`UringState::write`].
-fn uring_main_loop(
-    rx: &Receiver<PipelineItem>,
-    state: &mut UringState,
-) -> io::Result<()> {
+fn uring_main_loop(rx: &Receiver<PipelineItem>, state: &mut UringState) -> io::Result<()> {
     let mut pending: ReorderBuffer<io::Result<OutputChunk>> =
         ReorderBuffer::with_capacity(WRITE_AHEAD);
 

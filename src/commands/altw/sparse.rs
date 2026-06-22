@@ -134,10 +134,7 @@ pub(super) fn build_node_index_sparse(
     referenced.build_rank_index();
     let total_bytes = referenced.total_count().saturating_mul(8);
 
-    let temp_path = scratch_dir.join(format!(
-        ".pbfhogg-sparse-index-{}",
-        std::process::id()
-    ));
+    let temp_path = scratch_dir.join(format!(".pbfhogg-sparse-index-{}", std::process::id()));
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)

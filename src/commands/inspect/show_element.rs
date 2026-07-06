@@ -123,26 +123,26 @@ fn print_node_header(id: i64, lat: f64, lon: f64) {
 }
 
 fn print_dense_node_info(dn: &crate::DenseNode<'_>) {
-    if let Some(info) = dn.info() {
-        if info.version() != -1 {
-            println!("  version: {}", info.version());
-            let ts = info.milli_timestamp();
-            if ts != 0 {
-                println!("  timestamp: {}", ts / 1000);
-            }
-            let cs = info.changeset();
-            if cs != -1 && cs != 0 {
-                println!("  changeset: {cs}");
-            }
-            let uid = info.uid();
-            if uid != 0 {
-                println!("  uid: {uid}");
-            }
-            if let Ok(user) = info.user() {
-                if !user.is_empty() {
-                    println!("  user: {user}");
-                }
-            }
+    if let Some(info) = dn.info()
+        && info.version() != -1
+    {
+        println!("  version: {}", info.version());
+        let ts = info.milli_timestamp();
+        if ts != 0 {
+            println!("  timestamp: {}", ts / 1000);
+        }
+        let cs = info.changeset();
+        if cs != -1 && cs != 0 {
+            println!("  changeset: {cs}");
+        }
+        let uid = info.uid();
+        if uid != 0 {
+            println!("  uid: {uid}");
+        }
+        if let Ok(user) = info.user()
+            && !user.is_empty()
+        {
+            println!("  user: {user}");
         }
     }
 }
@@ -155,25 +155,25 @@ fn print_info(info: &crate::Info<'_>) {
     if let Some(v) = info.version() {
         println!("  version: {v}");
     }
-    if let Some(ts) = info.milli_timestamp() {
-        if ts != 0 {
-            println!("  timestamp: {}", ts / 1000);
-        }
+    if let Some(ts) = info.milli_timestamp()
+        && ts != 0
+    {
+        println!("  timestamp: {}", ts / 1000);
     }
-    if let Some(cs) = info.changeset() {
-        if cs != 0 {
-            println!("  changeset: {cs}");
-        }
+    if let Some(cs) = info.changeset()
+        && cs != 0
+    {
+        println!("  changeset: {cs}");
     }
-    if let Some(uid) = info.uid() {
-        if uid != 0 {
-            println!("  uid: {uid}");
-        }
+    if let Some(uid) = info.uid()
+        && uid != 0
+    {
+        println!("  uid: {uid}");
     }
-    if let Some(Ok(user)) = info.user() {
-        if !user.is_empty() {
-            println!("  user: {user}");
-        }
+    if let Some(Ok(user)) = info.user()
+        && !user.is_empty()
+    {
+        println!("  user: {user}");
     }
 }
 

@@ -592,15 +592,15 @@ impl PrimitiveBlock {
     ) -> usize {
         columns.clear();
         for group in self.groups() {
-            if let Ok(Some(dense_data)) = group.group.dense() {
-                if let Ok(dense) = super::wire::WireDenseNodes::parse(dense_data) {
-                    columns.decode_append(
-                        &dense,
-                        self.block.granularity,
-                        self.block.lat_offset,
-                        self.block.lon_offset,
-                    );
-                }
+            if let Ok(Some(dense_data)) = group.group.dense()
+                && let Ok(dense) = super::wire::WireDenseNodes::parse(dense_data)
+            {
+                columns.decode_append(
+                    &dense,
+                    self.block.granularity,
+                    self.block.lat_offset,
+                    self.block.lon_offset,
+                );
             }
         }
         columns.len()

@@ -78,13 +78,10 @@ pub(super) fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Ve
     let num_entries = entry_bytes.len() / 8;
     let mut slot_starts = Vec::with_capacity(num_entries);
     let mut cumulative: u64 = 0;
-    for chunk in entry_bytes.chunks_exact(8) {
+    let (chunks, _rem) = entry_bytes.as_chunks::<8>();
+    for chunk in chunks {
         slot_starts.push(cumulative);
-        let count = u64::from_le_bytes(
-            chunk
-                .try_into()
-                .map_err(|_| "ref count sidecar entry read failed")?,
-        );
+        let count = u64::from_le_bytes(*chunk);
         cumulative += count;
     }
     if cumulative != total_slots {

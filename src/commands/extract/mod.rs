@@ -513,17 +513,18 @@ pub fn extract_multi(
     overrides: &HeaderOverrides,
 ) -> Result<Vec<ExtractStats>> {
     // Try single-pass multi-extract for simple strategy on sorted input.
-    if matches!(strategy, ExtractStrategy::Simple) && !clean.any() {
-        if let Some(stats) = multi::try_extract_multi_single_pass(
+    if matches!(strategy, ExtractStrategy::Simple)
+        && !clean.any()
+        && let Some(stats) = multi::try_extract_multi_single_pass(
             input,
             slots,
             set_bounds,
             compression,
             direct_io,
             overrides,
-        )? {
-            return Ok(stats);
-        }
+        )?
+    {
+        return Ok(stats);
     }
 
     // Sequential fallback: one extract at a time.

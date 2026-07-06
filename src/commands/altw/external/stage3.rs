@@ -69,7 +69,8 @@ fn scatter_bucket_entries(
 
     let bucket_slots = scatter_buf.len() / COORD_SLOT_SIZE;
     let mut stores: u64 = 0;
-    for chunk in data_buf.chunks_exact(RESOLVED_ENTRY_SIZE) {
+    let (chunks, _rem) = data_buf.as_chunks::<RESOLVED_ENTRY_SIZE>();
+    for chunk in chunks {
         let local_slot_pos = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as usize;
         if local_slot_pos >= bucket_slots {
             return Err(format!(

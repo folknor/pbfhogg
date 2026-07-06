@@ -226,10 +226,10 @@ fn extract_simple_two_pass(
         if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
             continue;
         }
-        if let Some(idx) = blob.index() {
-            if !spatial_filter.wants_index(&idx) {
-                continue;
-            }
+        if let Some(idx) = blob.index()
+            && !spatial_filter.wants_index(&idx)
+        {
+            continue;
         }
         blob.decompress_into(&mut decompress_buf)?;
         let block = PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))?;
@@ -714,10 +714,10 @@ fn extract_simple_single_pass(
             IdSet::new,
             |block, ids| {
                 for element in block.elements_skip_metadata() {
-                    if let Element::Relation(r) = &element {
-                        if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) {
-                            ids.set(r.id());
-                        }
+                    if let Element::Relation(r) = &element
+                        && relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids)
+                    {
+                        ids.set(r.id());
                     }
                 }
             },

@@ -1156,10 +1156,10 @@ pub fn is_einval(err: &(dyn std::error::Error + 'static)) -> bool {
     if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
         return io_err.raw_os_error() == Some(libc::EINVAL);
     }
-    if let Some(pbf_err) = err.downcast_ref::<pbfhogg::Error>() {
-        if let pbfhogg::ErrorKind::Io(io_err) = pbf_err.kind() {
-            return io_err.raw_os_error() == Some(libc::EINVAL);
-        }
+    if let Some(pbf_err) = err.downcast_ref::<pbfhogg::Error>()
+        && let pbfhogg::ErrorKind::Io(io_err) = pbf_err.kind()
+    {
+        return io_err.raw_os_error() == Some(libc::EINVAL);
     }
     false
 }

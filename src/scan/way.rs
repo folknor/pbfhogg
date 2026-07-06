@@ -369,26 +369,26 @@ fn parse_way_tagged_refs(
     let mut has_building = false;
     let mut has_addr_interp = false;
 
-    if any_key_present {
-        if let (Some(kd), Some(vd)) = (keys_data, vals_data) {
-            let keys = PackedUint32Iter::new(kd);
-            let mut vals = PackedUint32Iter::new(vd);
-            for key_idx in keys {
-                let val_idx = vals.next();
-                if Some(key_idx) == resolved.k_highway {
-                    has_highway = true;
-                    highway_val_idx = val_idx;
-                } else if Some(key_idx) == resolved.k_name {
-                    has_name = true;
-                } else if Some(key_idx) == resolved.k_addr_housenumber {
-                    has_addr_hn = true;
-                } else if Some(key_idx) == resolved.k_addr_street {
-                    has_addr_st = true;
-                } else if Some(key_idx) == resolved.k_building {
-                    has_building = true;
-                } else if Some(key_idx) == resolved.k_addr_interpolation {
-                    has_addr_interp = true;
-                }
+    if any_key_present
+        && let (Some(kd), Some(vd)) = (keys_data, vals_data)
+    {
+        let keys = PackedUint32Iter::new(kd);
+        let mut vals = PackedUint32Iter::new(vd);
+        for key_idx in keys {
+            let val_idx = vals.next();
+            if Some(key_idx) == resolved.k_highway {
+                has_highway = true;
+                highway_val_idx = val_idx;
+            } else if Some(key_idx) == resolved.k_name {
+                has_name = true;
+            } else if Some(key_idx) == resolved.k_addr_housenumber {
+                has_addr_hn = true;
+            } else if Some(key_idx) == resolved.k_addr_street {
+                has_addr_st = true;
+            } else if Some(key_idx) == resolved.k_building {
+                has_building = true;
+            } else if Some(key_idx) == resolved.k_addr_interpolation {
+                has_addr_interp = true;
             }
         }
     }

@@ -172,11 +172,12 @@ fn time_filter_history(
         let group_changed = pending
             .as_ref()
             .is_some_and(|g| g.kind != kind || g.id != id);
-        if group_changed && let Some(group) = pending.take() {
-            if let Err(e) = flush_group(group, &mut bb, writer, &mut stats) {
-                flush_error = Err(e);
-                return;
-            }
+        if group_changed
+            && let Some(group) = pending.take()
+            && let Err(e) = flush_group(group, &mut bb, writer, &mut stats)
+        {
+            flush_error = Err(e);
+            return;
         }
 
         if pending.is_none() {

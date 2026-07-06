@@ -76,10 +76,10 @@ impl DecompressPool {
             return;
         }
         buf.clear();
-        if let Ok(mut v) = self.buffers.lock() {
-            if v.len() < MAX_POOL_SIZE {
-                v.push(buf);
-            }
+        if let Ok(mut v) = self.buffers.lock()
+            && v.len() < MAX_POOL_SIZE
+        {
+            v.push(buf);
         }
     }
 }
@@ -258,11 +258,11 @@ pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<
             3 => {
                 // zlib_data: bytes
                 let slice = cursor.read_len_delimited()?;
-                if let Some(rs) = raw_size {
-                    if rs > 0 {
-                        #[allow(clippy::cast_sign_loss)]
-                        buf.reserve((rs as usize).saturating_sub(buf.capacity()));
-                    }
+                if let Some(rs) = raw_size
+                    && rs > 0
+                {
+                    #[allow(clippy::cast_sign_loss)]
+                    buf.reserve((rs as usize).saturating_sub(buf.capacity()));
                 }
                 zlib_decompress_into(slice, buf)?;
                 found = true;
@@ -270,11 +270,11 @@ pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<
             7 => {
                 // zstd_data: bytes
                 let slice = cursor.read_len_delimited()?;
-                if let Some(rs) = raw_size {
-                    if rs > 0 {
-                        #[allow(clippy::cast_sign_loss)]
-                        buf.reserve((rs as usize).saturating_sub(buf.capacity()));
-                    }
+                if let Some(rs) = raw_size
+                    && rs > 0
+                {
+                    #[allow(clippy::cast_sign_loss)]
+                    buf.reserve((rs as usize).saturating_sub(buf.capacity()));
                 }
                 zstd::stream::copy_decode(std::io::Cursor::new(slice), &mut *buf)?;
                 let size = buf.len() as u64;

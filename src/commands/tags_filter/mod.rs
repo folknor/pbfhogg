@@ -901,13 +901,12 @@ fn tags_filter_two_pass(
         // is ever relaxed, this site needs tightening: either bail out
         // earlier for non-indexed blobs, or decode-to-check the blob's kind
         // before admitting it to the schedule.
-        if let Some(ref filter) = blob_filter {
-            if let Some(idx) = meta.index.as_ref() {
-                if !filter.wants_index(idx) {
-                    blobs_skipped += 1;
-                    continue;
-                }
-            }
+        if let Some(ref filter) = blob_filter
+            && let Some(idx) = meta.index.as_ref()
+            && !filter.wants_index(idx)
+        {
+            blobs_skipped += 1;
+            continue;
         }
 
         schedule.push((meta.data_offset, meta.data_size));
@@ -1256,10 +1255,10 @@ fn collect_way_node_dependencies(
                 if let Element::Way(w) = &element
                     && included_way_ids.get(w.id())
                 {
-                    if let Some(skip) = skip_way_ids {
-                        if skip.get(w.id()) {
-                            continue;
-                        }
+                    if let Some(skip) = skip_way_ids
+                        && skip.get(w.id())
+                    {
+                        continue;
                     }
                     for r in w.refs() {
                         node_ids.push(r);

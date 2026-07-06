@@ -150,10 +150,10 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
                 continue;
             }
-            if let Some(idx) = blob.index() {
-                if !filter.wants_index(&idx) {
-                    continue;
-                }
+            if let Some(idx) = blob.index()
+                && !filter.wants_index(&idx)
+            {
+                continue;
             }
             blob.decompress_into(&mut decompress_buf)?;
             let block = PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))?;
@@ -375,11 +375,11 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             let mut way_ids = Vec::new();
             let mut node_ids = Vec::new();
             for element in block.elements_skip_metadata() {
-                if let Element::Way(w) = &element {
-                    if w.refs().any(|r| bbox_node_ids.get(r)) {
-                        way_ids.push(w.id());
-                        node_ids.extend(w.refs());
-                    }
+                if let Element::Way(w) = &element
+                    && w.refs().any(|r| bbox_node_ids.get(r))
+                {
+                    way_ids.push(w.id());
+                    node_ids.extend(w.refs());
                 }
             }
             (way_ids, node_ids)
@@ -405,16 +405,16 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         || (IdSet::new(), IdSet::new(), IdSet::new()),
         |block, (rel_ids, extra_way_ids, extra_node_ids)| {
             for element in block.elements_skip_metadata() {
-                if let Element::Relation(r) = &element {
-                    if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) {
-                        rel_ids.set(r.id());
-                        if collect_member_ids && is_smart_relation(r) {
-                            for m in r.members() {
-                                match m.id {
-                                    MemberId::Way(id) => extra_way_ids.set(id),
-                                    MemberId::Node(id) => extra_node_ids.set(id),
-                                    MemberId::Relation(_) | MemberId::Unknown(_, _) => {}
-                                }
+                if let Element::Relation(r) = &element
+                    && relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids)
+                {
+                    rel_ids.set(r.id());
+                    if collect_member_ids && is_smart_relation(r) {
+                        for m in r.members() {
+                            match m.id {
+                                MemberId::Way(id) => extra_way_ids.set(id),
+                                MemberId::Node(id) => extra_node_ids.set(id),
+                                MemberId::Relation(_) | MemberId::Unknown(_, _) => {}
                             }
                         }
                     }

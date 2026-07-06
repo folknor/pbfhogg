@@ -85,12 +85,11 @@ pub(crate) fn build_classify_schedule(
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
         }
-        if let Some(filter_kind) = kind_filter {
-            if let Some(idx) = &meta.index {
-                if idx.kind != filter_kind {
-                    continue;
-                }
-            }
+        if let Some(filter_kind) = kind_filter
+            && let Some(idx) = &meta.index
+            && idx.kind != filter_kind
+        {
+            continue;
         }
         // Reject bogus blob-header data_size before it flows to pread
         // workers: a truncated file or a corrupt BlobHeader advertising

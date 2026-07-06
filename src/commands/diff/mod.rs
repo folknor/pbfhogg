@@ -644,10 +644,10 @@ fn write_tag_diff(
     }
     // Changed: same key, different value
     for (k, v) in new_tags {
-        if let Some((_, old_v)) = old_tags.iter().find(|(ok, _)| ok == k) {
-            if old_v != v {
-                writeln!(output, "  ~{k}: {old_v} -> {v}")?;
-            }
+        if let Some((_, old_v)) = old_tags.iter().find(|(ok, _)| ok == k)
+            && old_v != v
+        {
+            writeln!(output, "  ~{k}: {old_v} -> {v}")?;
         }
     }
     Ok(())
@@ -813,10 +813,10 @@ fn write_tag_diff_iter<'a>(
         }
     }
     for (k, new_v) in &new_vec {
-        if let Some(old_v) = old_map.get(k) {
-            if old_v != new_v {
-                writeln!(output, "  ~{k}: {old_v} -> {new_v}")?;
-            }
+        if let Some(old_v) = old_map.get(k)
+            && old_v != new_v
+        {
+            writeln!(output, "  ~{k}: {old_v} -> {new_v}")?;
         }
     }
     Ok(())

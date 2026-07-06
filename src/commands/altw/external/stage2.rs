@@ -133,10 +133,8 @@ fn prepare_bucket(
     let t_parse = std::time::Instant::now();
     let count = loader.data_buf.len() / ID_RECORD_SIZE;
     loader.records.reserve(count);
-    for chunk in loader.data_buf.chunks_exact(ID_RECORD_SIZE) {
-        let buf: &[u8; ID_RECORD_SIZE] = chunk
-            .try_into()
-            .map_err(|_| "chunks_exact returned non-12-byte chunk".to_string())?;
+    let (chunks, _rem) = loader.data_buf.as_chunks::<ID_RECORD_SIZE>();
+    for buf in chunks {
         loader.records.push(IdRecord::read_from(buf));
     }
     let parse_ms = t_parse.elapsed().as_millis() as u64;

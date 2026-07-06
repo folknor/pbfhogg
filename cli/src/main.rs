@@ -5,6 +5,15 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use pbfhogg::HeaderOverrides;
 use pbfhogg::writer::Compression;
 
+// hotpath 0.15 installed CountingAllocator internally under hotpath-alloc; as
+// of 0.16 it is a plain generic type the consumer must declare - the crate no
+// longer wires it up on its own. Without this, hotpath-alloc builds fall back
+// to the system allocator and track_alloc/track_dealloc never fire, so every
+// function silently reports 0 bytes.
+#[cfg(feature = "hotpath-alloc")]
+#[global_allocator]
+static ALLOC: hotpath::CountingAllocator = hotpath::CountingAllocator::new();
+
 /// Non-fatal exit code carrier. Subcommands that need to signal a
 /// specific non-zero exit status (e.g. `diff` with differences found)
 /// return this via the error channel instead of calling `process::exit`.

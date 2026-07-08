@@ -635,6 +635,7 @@ fn run_stage_b(
                 i += 1;
             }
             let group = &entries[group_start..i];
+            let cell_token = CellID(cell_id);
 
             streets.clear();
             addrs.clear();
@@ -659,7 +660,7 @@ fn run_stage_b(
             if has_streets {
                 let count = u16::try_from(streets.len()).map_err(|_| {
                     format!(
-                        "geocode Stage B: cell {cell_id} has {} street entries, exceeds u16::MAX. \
+                        "geocode Stage B: cell {cell_token} ({cell_id}) has {} street entries, exceeds u16::MAX. \
                      Bump on-disk count to u32 and increment FORMAT_VERSION.",
                         streets.len()
                     )
@@ -680,7 +681,7 @@ fn run_stage_b(
             if has_addrs {
                 let count = u16::try_from(addrs.len()).map_err(|_| {
                     format!(
-                        "geocode Stage B: cell {cell_id} has {} addr entries, exceeds u16::MAX. \
+                        "geocode Stage B: cell {cell_token} ({cell_id}) has {} addr entries, exceeds u16::MAX. \
                      Bump on-disk count to u32 and increment FORMAT_VERSION.",
                         addrs.len()
                     )
@@ -695,7 +696,7 @@ fn run_stage_b(
             if has_interps {
                 let count = u16::try_from(interps.len()).map_err(|_| {
                     format!(
-                        "geocode Stage B: cell {cell_id} has {} interp entries, exceeds u16::MAX. \
+                        "geocode Stage B: cell {cell_token} ({cell_id}) has {} interp entries, exceeds u16::MAX. \
                      Bump on-disk count to u32 and increment FORMAT_VERSION.",
                         interps.len()
                     )
@@ -733,7 +734,9 @@ fn run_stage_b(
             cells_out.write_all(&gc.to_bytes())?;
             debug_assert!(
                 cell_id > prev_cell_id || total_cells == 0,
-                "bucket ordering violated: cell {cell_id} <= prev {prev_cell_id}"
+                "bucket ordering violated: cell {} ({cell_id}) <= prev {} ({prev_cell_id})",
+                CellID(cell_id),
+                CellID(prev_cell_id),
             );
             prev_cell_id = cell_id;
             total_cells += 1;

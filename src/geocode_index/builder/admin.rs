@@ -4,6 +4,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use rustc_hash::FxHashMap;
+use s2::cellid::CellID;
 
 use super::BuildConfig;
 use super::Result;
@@ -244,6 +245,7 @@ pub(super) fn write_admin_index(
         if start == i {
             continue;
         }
+        let cell_token = CellID(cid);
 
         cells_out.write_all(
             &AdminCell {
@@ -260,14 +262,14 @@ pub(super) fn write_admin_index(
         let group_len = i - start;
         let count = u16::try_from(group_len).map_err(|_| {
             format!(
-                "write_admin_index: admin cell {cid} has {group_len} entries, exceeds u16::MAX. \
+                "write_admin_index: admin cell {cell_token} ({cid}) has {group_len} entries, exceeds u16::MAX. \
              Bump on-disk count to u32 and increment FORMAT_VERSION."
             )
         })?;
         entries_out.write_all(&count.to_le_bytes())?;
         byte_off = byte_off.checked_add(2).ok_or_else(|| {
             format!(
-                "write_admin_index: admin-entries byte offset overflows u32 at cell {cid} \
+                "write_admin_index: admin-entries byte offset overflows u32 at cell {cell_token} ({cid}) \
              (current {byte_off}; total exceeds 4 GiB). Widen AdminCell.entries_offset \
              to u64 and increment FORMAT_VERSION."
             )
@@ -280,7 +282,7 @@ pub(super) fn write_admin_index(
             // rather than at the upstream counter.
             if e.poly_index & INTERIOR_FLAG != 0 {
                 return Err(format!(
-                    "write_admin_index: poly_index {} in cell {cid} has the INTERIOR_FLAG bit set; \
+                    "write_admin_index: poly_index {} in cell {cell_token} ({cid}) has the INTERIOR_FLAG bit set; \
                      admin polygon count has exceeded 2^31 - 1. Split INTERIOR_FLAG into a \
                      separate byte or grow AdminEntry to u64 and increment FORMAT_VERSION.",
                     e.poly_index
@@ -295,7 +297,7 @@ pub(super) fn write_admin_index(
             entries_out.write_all(&val.to_le_bytes())?;
             byte_off = byte_off.checked_add(4).ok_or_else(|| {
                 format!(
-                    "write_admin_index: admin-entries byte offset overflows u32 at cell {cid} \
+                    "write_admin_index: admin-entries byte offset overflows u32 at cell {cell_token} ({cid}) \
                  (current {byte_off}; total exceeds 4 GiB). Widen AdminCell.entries_offset \
                  to u64 and increment FORMAT_VERSION."
                 )

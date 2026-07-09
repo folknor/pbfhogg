@@ -380,6 +380,25 @@ Cross-thread buffer retention is **solved** - `DecompressPool` (commit
 remaining architectural concern is thread oversubscription (two concurrent
 rayon pools: decode + batch processing), not retention.
 
+- [ ] **[notes/pipelined-reader-decode-backpressure.md](notes/pipelined-reader-decode-backpressure.md)** -
+  the pipelined reader's `decode_ahead` cap is a lie: stage 2 spawns decode
+  tasks with a non-blocking `rayon::spawn` and the stage-3 `ReorderBuffer`
+  window grows via `resize_with`, so read-ahead is effectively the whole file
+  and decoded-block memory is unbounded (elivagar reported 21.5 GB RSS / 660
+  reorder high-water on a 19 GB NA locations run; documented in
+  `run_pipeline`'s own doc comment at 25+ GB, and the reason `cat` migrated off
+  the reader after a 28.9 GB OOM 2026-04-26). Distinct from the DecompressPool
+  retention fix above - this is unbounded *admission*, not un-recycled buffers.
+  Still live in-tree: `altw:547` and `time_filter:165` are unfiltered
+  full-scan pipelined reads on the unbounded path. **Decision:** bound
+  in-flight decode tasks with one token counter keyed on `decode_ahead`
+  (default 32) inside `src/read/pipeline.rs` - no signature change, fixes all
+  five residual callers at once. Deferred today (2026-07-08): needs a bench
+  host to run the `getid` / `tags-filter` no-regression check (the two
+  throughput-sensitive filtered consumers) before landing. Note carries the
+  full inventory, the three options weighed, the implementation plan, and the
+  validation plan.
+
 See [notes/altw-optimization-history.md](notes/altw-optimization-history.md)
 for the complete plan: 20 items across 5 priority groups, covering infrastructure
 fixes, planet blockers, external join P2b/P2c, and all affected commands.

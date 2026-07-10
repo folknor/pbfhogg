@@ -24,6 +24,13 @@ Entry points:
 - `ElementReader::for_each_block_pipelined()` - owned `PrimitiveBlock` callback
 - `ElementReader::into_blocks_pipelined()` - returns `Iterator<Item = Result<PrimitiveBlock>>`
 
+Decode admission is bounded (commit `a0a2e3b`): at most `decode_ahead`
+(default 32) decode tasks may be admitted but not yet delivered from the
+reorder buffer, so decoded-block memory is a fixed working set instead of
+growing with file size, and consumer backpressure propagates through the
+admission gate to the reader thread. Early drop or an error from the block
+closure stops the pipeline within ~`decode_ahead` blobs.
+
 Used by most commands. See Sequential Read below for exceptions.
 
 ### Sequential Read
@@ -155,19 +162,29 @@ Also supports `--input-kind osc` for filtering OSC change files.
 
 ### add-locations-to-ways
 
-Embeds node coordinates in ways. Three index strategies:
+Embeds node coordinates in ways. Index strategies (`--index-type`, default
+`sparse`; `dense` was removed 2026-04 - sparse is faster at every measured
+scale):
 
-**Dense** (default): file-backed mmap, direct addressing by node ID. Pass 0 builds an `IdSet` of way-referenced nodes, pass 1 populates index via node-only scanner (lock-free parallel writes), pass 2 enriches ways.
+**Sparse** (default): rank-indexed flat file. Builds an `IdSet` of
+way-referenced nodes; workers pwrite packed `(lat, lon)` at byte offset
+`rank << 3` into a values file (`referenced_count * 8` bytes, ~29 GB at
+europe), read back via mmap with batched sorted access. Small-to-europe
+scale; likely thrashes at planet.
 
-**Sparse**: chunk-indexed sparse array (~540 MB RAM). Batched sorted access converts random I/O to sequential scans.
+**External** (`altw/external/`, 4-stage bounded-memory join; requires
+sorted + indexed input):
+1. Way pass → emit `(node_id, slot_pos)` records into 256 node-id buckets
+2. Node join → per bucket, sort by node id, merge-join against the node
+   stream (pread workers), emit resolved coords into slot buckets
+3. Slot reorder → per bucket, sort by slot_pos, emit blob-ordered
+   delta-varint `coord_payloads`
+4. Assembly → pread workers reframe way blobs, splicing coord payloads
 
-**External** (4-stage radix partition):
-1. Way pass → emit `(node_id, slot_pos)` COO pairs into 256 buckets
-2. Node join → merge-join with sorted COO buckets, emit resolved `(slot_pos, lat, lon)`
-3. Slot reorder → scatter buffer into final coord_slots file
-4. Assembly → pread-from-workers, enrich ways with coordinates
+~8.7 GB RAM, ~224 GB temp disk at planet; the only mode that survives
+planet on a 30 GB-class host.
 
-Bounded memory (<2 GB), all sequential I/O, uses temp disk (~4 GB Denmark, ~112 GB Europe, ~300 GB planet).
+**Auto**: external if sorted + indexed, sparse otherwise.
 
 ### renumber
 
@@ -211,22 +228,51 @@ OSC-only: merges multiple OSC XML files into one. Optional `--simplify` keeps on
 
 _The following describes the specific deployment that drives pbfhogg's development. It documents how the author uses pbfhogg in a planet-scale OSM refresh pipeline feeding tile generation and reverse geocoding. It is not part of the library's public API or general documentation - it records operational context, allocation budgets, and performance measurements specific to this ecosystem._
 
-**Production pipeline** (runs every planet refresh cycle):
+**Production pipeline** (ratified 2026-07-10; steady-state shape is
+decision 1 / option (a) of `notes/injected-prepass.md` section 7):
+
 ```
-Bootstrap (once):  pbfhogg cat → pbfhogg add-locations-to-ways → enriched PBF
-                   pbfhogg build-geocode-index → reverse geocoding index
-Steady state:      pbfhogg apply-changes --locations-on-ways (daily diffs)
-                   pbfhogg build-geocode-index (rebuild after merge)
+Bootstrap (once):  pbfhogg cat → indexed planet PBF
+Daily refresh:     pbfhogg apply-changes                      (plain merge)
+                   pbfhogg add-locations-to-ways              (external, re-enrichment)
+                   pbfhogg build-geocode-index                (rebuild)
                                       │
                                       ├── elivagar → PMTiles → nidhogg (tile serving)
                                       └── nidhogg (PBF ingest + reverse geocoding)
 ```
 
-`merge --locations-on-ways` preserves and updates inline way-node coordinates
-through OSC diffs, so `add-locations-to-ways` only needs to run once to bootstrap
-the initial enriched PBF. Subsequent daily diffs maintain coordinates automatically:
-surviving base ways forward raw lat/lon bytes, OSC ways look up node coordinates
-from a sparse index built from the diff and base PBF.
+**altw runs in the daily loop, not once at bootstrap.** The original
+design ran `add-locations-to-ways` once and maintained inline way-node
+coordinates through daily diffs via `apply-changes --locations-on-ways`.
+That architecture dates from when altw meant the dense path at ~96 min
+planet; post-A1 external is ~9 min (546.0 s, UUID `7fd04130`, commit
+`16e3694`, plantasjen), and the daily loop already carries a post-merge
+rebuild of the same magnitude (`build-geocode-index`, ~7 min planet).
+Re-running altw after each merge was ratified 2026-07-10 because it keeps
+every enrichment fresh each cycle:
+
+- `LocationsOnWays` inline coordinates, and
+- the injected-prepass fields (`pbfhogg.WayMembers-v1` BlobHeader field 5,
+  `pbfhogg.SharedNodePins-v1` Way field 20 - implementation pending, Brick
+  2 of `notes/injected-prepass.md`), which cannot be maintained
+  incrementally through `apply-changes`: stale field 5 is a
+  false-negative membership risk (wrong tiles downstream), and field 20
+  needs exact global ref counts with decrement.
+
+Consequences:
+
+- The production merge drops `--locations-on-ways`. The feature stays in
+  the library and CLI for users who do not re-enrich; it is just no
+  longer load-bearing for this pipeline.
+- Enrichment injection is flag-gated (working name `--inject-prepass`);
+  default altw output stays byte-identical, brokkr passes the flag when
+  enriching, and sparse implements both fields too so the backend-parity
+  canary keeps covering them (decision 2 of the same note, ratified
+  alongside).
+- Daily write volume roughly doubles at planet: apply-changes rewrites
+  ~92% of blobs (~90 GB output) and altw writes the full enriched file
+  again. Wall stays comfortable (~17-18 min for the whole loop); NVMe
+  endurance is the number to watch if the host changes.
 
 **`sort` is not in the pipeline.** Geofabrik and planet PBFs are always `Sort.Type_then_ID`, and every pipeline step preserves sorted order: `cat` copies blobs in input order, `merge` interleaves upserts at sorted positions, `add-locations-to-ways` passes through or decodes without reordering. The `sort` command exists for repairing unsorted PBFs from other tools (osmosis, custom exporters) - a one-time fix, not a recurring step.
 
@@ -239,12 +285,18 @@ The two downstream consumers are:
 **Elivagar** - tile generation (read-only)
 - `Cargo.toml`: `pbfhogg = { path = "../pbfhogg" }` (default features = `commands`)
 - Only uses the **read pipeline**; no writes
-- Entry: `ElementReader::from_path()` → `.into_blocks_pipelined()` → iterates owned `PrimitiveBlock`s
-- Sends way blocks to a worker thread via `SyncSender<PrimitiveBlock>` (bounded queue of 1)
+- Locations-on-ways path (production shape): elivagar's own bounded read
+  loop over `BlobReader` + `Blob::to_primitiveblock()` - Option 3 of the
+  decode-backpressure decision (`reference/performance-history.md`
+  "Pipelined-reader decode-admission bound"). The raw-Geofabrik path stays
+  on the legacy pipelined reader.
+- Once injected-prepass Brick 2 lands, that loop sets `parse_waymembers`
+  on `BlobReader` when the header declares `pbfhogg.WayMembers-v1` and
+  consumes `Blob::way_members()` / `Way::shared_node_pins()` (their
+  Bricks 4/5).
 - API surface: `node.id()`, `.decimicro_lat()`, `.decimicro_lon()`, `.tags()`, `way.id()`, `.refs()`, `.node_locations()`, `.tags()`, `rel.id()`, `.tags()`, `.members()`
-- `Way::node_locations()` yields `WayNodeLocation` (lat/lon) from enriched PBFs - eliminates the node coordinate store entirely
+- `Way::node_locations()` yields `WayNodeLocation` (lat/lon) from enriched PBFs - eliminates the node coordinate store entirely (~44 GB at planet; peak RSS ~65-75 GB → ~15-20 GB)
 - Also uses `protohoggr` directly for MVT/PMTiles protobuf encoding (unrelated to PBF I/O)
-- File: `~/Programs/elivagar/src/pipeline.rs:340-605`
 
 **Nidhogg** - planet refresh pipeline (read + merge)
 - `Cargo.toml`: `pbfhogg = { path = "../pbfhogg" }` (default features = `commands`)
@@ -253,7 +305,10 @@ The two downstream consumers are:
 - **Merge path**: delegates entirely to `pbfhogg::apply_changes::merge(base, osc, output, &MergeOptions { .. })`
   - File: `~/Programs/nidhogg/src/merge.rs:6`
   - Currently: zlib compression, no direct_io/io_uring, no locations_on_ways
-  - TODO: enable `locations_on_ways: true` once the enriched PBF is bootstrapped
+  - `locations_on_ways` stays `false` by design: the ratified steady
+    state re-runs `add-locations-to-ways` after each merge instead of
+    maintaining coordinates through the diff (the earlier TODO to enable
+    it is retired)
 - **No direct BlockBuilder/PbfWriter usage** - nidhogg never constructs PBF blocks itself
 - Also reads PBF headers via `BlobReader::from_path()` → `.to_headerblock()` for replication state
   - File: `~/Programs/nidhogg/src/update.rs:95-114`
@@ -268,11 +323,11 @@ Both consumers use default features. In practice:
 - Zlib backend: **zlib-rs** (hardcoded, pure Rust, via flate2)
 - Zstd: available but **unused** - nidhogg hardcodes `Compression::Zlib(6)`
 
-## Pipeline 1: Pipelined Read (both consumers)
+## Read-path internals (both consumers)
 
 All source PBFs are zlib-compressed (Geofabrik/AWS). Every read decompresses.
 
-**3-stage pipeline** - `src/pipeline.rs`
+**3-stage pipeline** - `src/read/pipeline.rs`
 1. **I/O thread**: reads raw compressed blobs (~32KB each) sequentially, sends via channel (READ_AHEAD=16 slots)
 2. **Rayon decode pool**: parallel decompress + parse. Thread count = `available_parallelism() - 2`
    - `decompress_blob()` - thread-local `flate2::Decompress` with `reset(true)`, reused per thread
@@ -295,149 +350,17 @@ All source PBFs are zlib-compressed (Geofabrik/AWS). Every read decompresses.
 - `WireBlock` group_ranges: inline (offset, count) into decompressed buffer - zero separate allocation
 - Element wrappers: stack-allocated (~24 bytes each)
 
-## Pipeline 2: Merge (nidhogg only)
+## Merge passthrough ratios (measured)
 
-**Entry**: `src/commands/merge.rs` - `merge(base, osc, output, &MergeOptions, &HeaderOverrides)`
+The apply-changes descriptor pipeline (see Command Pipelines above) is
+passthrough-dominated on small extracts and rewrite-dominated at planet:
 
-**OSC diff parsing**: `src/osc.rs` - `CompactDiffOverlay` with arena-packed binary layouts (`Vec<u8>` per type), `FxHashMap<i64, u32>` index (byte offsets into arenas), `StringInterner` for tag keys/roles, `HashSet<i64>` for deletes. 40-60% less memory than per-element HashMap. Typical Denmark diff: ~300KB compressed, ~50K entries.
-
-**DiffRanges**: `src/commands/merge.rs:231` - pre-sorted `Vec<i64>` per element type (separate vecs for all-IDs and upsert-only-IDs) for O(log n) overlap checks via `partition_point`. Wrapped in `Arc` for sharing across rayon tasks.
-
-**Reader thread**: dedicated `std::thread::spawn` with `sync_channel::<RawBlobFrame>(128)` read-ahead. Decouples I/O from processing - while the main thread runs classify/rewrite/output on the current batch, the reader pre-fills the next.
-
-**Byte-budgeted batch processing** (`BATCH_BYTE_BUDGET=128MB`, `BATCH_MIN_BLOBS=8`, `BATCH_MAX_BLOBS=128`). `estimate_blob_cost()` returns raw frame size for passthrough blobs, `raw * 21` for potential rewrites (raw + ~16x decompressed + ~5x rewrite estimate). Batches fill via `try_recv` until the byte budget or max blob count is reached.
-
-**3-phase pipeline per batch:**
-
-- **Phase 1 - Parallel classify** (rayon `par_iter`):
-  - `classify_only()` - `merge.rs:935`
-  - Fast path (index hit): blob has indexdata → `DiffRanges::range_overlaps()` → false = `Passthrough`. **Zero decompression.**
-  - Medium path (scan): decompress into reusable `Vec<u8>`, `scan_block_ids()` for min/max ID
-  - Slow path (precise): full `PrimitiveBlock` parse, `block_overlaps_diff()` checks each element ID against diff
-
-- **Phase 2 - Sequential assign** (main thread):
-  - Assigns each blob to `BatchSlot::Passthrough | FalsePositive | Rewrite`
-  - For rewrites: binary search (`partition_point`) into sorted upsert IDs computes `upsert_range: (usize, usize)` - range indices into the DiffRanges upsert vec (no per-job Vec copy)
-  - Builds `RewriteJob { block: PrimitiveBlock, kind: ElemKind, upsert_range: (usize, usize) }`
-
-- **Phase 3+4 - Streaming rewrite + output** (`rayon::spawn` + bounded `sync_channel`):
-  - Each rewrite job is dispatched via `rayon::spawn`, owning its `RewriteJob` (including `PrimitiveBlock`). Channel bounded to `rayon::current_num_threads().min(rewrite_count)`.
-  - `rewrite_block_parallel()` - `merge.rs:760` - allocates a local `BlockBuilder` per task, pre-seeds string table from base block, iterates elements, skips deleted, applies modifications, interleaves creates at sorted positions via `&upserts[range.0..range.1]`. Returns `RewriteOutput { blocks: Vec<OwnedBlock>, stats }`.
-  - PrimitiveBlock freed as soon as each task completes (not held until all finish).
-  - Main thread processes slots in file order. Out-of-order rewrite results buffered in `received: Vec<Option<RewriteOutput>>`, consumed when their slot is reached.
-  - Passthrough: `coalesce_passthrough()` - accumulates consecutive raw frames in `passthrough_buf`, flushed as single `write_raw_owned()` (move semantics). On `linux-direct-io` with `copy_file_range`, passthrough uses kernel-space copy instead.
-  - Rewrite: flush passthrough buf, then write each `OwnedBlock` via `write_primitive_block_owned()` (move, no copy)
-  - Gap creates between blobs: `emit_gap_creates()` via `BlockBuilder`
-
-**Passthrough ratios** (measured):
 - Denmark (465 MB, ~300K changes): ~92% passthrough, ~8% rewrite
 - Germany (4.5 GB, ~146K changes): ~82% passthrough, ~18% rewrite
-- Planet (87 GB, daily diff): ~8% passthrough, ~92% rewrite (most blobs touched)
+- Planet (~90 GB, daily diff): ~8% passthrough, ~92% rewrite (most blobs touched)
 
-## Pipeline 3: Cat (pbfhogg CLI, used to generate indexed PBFs)
-
-**Entry**: `src/commands/cat.rs` - `cat(files, output, type_filter, &CleanAttrs, compression, direct_io, force, &HeaderOverrides)`
-
-**No type filter** (passthrough) - reads raw blob frames, adds indexdata via `reframe_raw_with_index()`, writes raw. **No decompress/compress.**
-
-**With type filter** - full decode → `BlockBuilder` → re-encode → compress. Same allocation pattern as merge rewrite path. `CleanAttrs` optionally strips metadata attributes (version, timestamp, changeset, uid, user).
-
-**Dedupe mode** (`--dedupe`) - K-way sorted merge of multiple PBFs with blob-level passthrough and exact-duplicate deduplication. All inputs must be sorted.
-
-## Pipeline 4: Add-locations-to-ways (enrichment step)
-
-**Entry**: `src/commands/add_locations_to_ways.rs` - `add_locations_to_ways(input, output, keep_untagged_nodes, compression, direct_io, force, &HeaderOverrides, index_type)`
-
-Three index strategies that embeds node coordinates directly into way elements:
-
-- **`Dense`** (`DenseMmapIndex`): file-backed anonymous mmap, 8 bytes/slot, direct addressing by node ID. 128 GB virtual address space, ~16 GB touched at planet (after pass 0 filtering). Fastest when working set fits in RAM.
-- **`Sparse`** (`SparseArrayIndex`): Planetiler-inspired chunk-indexed sparse array (chunk size 256). RAM: `offsets` Vec<u64> + `start_pad` Vec<u8> (~540 MB at planet). On-disk: compact packed (lat, lon) values file via read-only mmap (~16 GB for planet). Way lookups use batched sorted access - collect all node refs from a batch, sort by file offset, sequential scan into `FxHashMap`, then process blocks with pre-resolved coordinates. Memory-bounded for planet on low-RAM hosts.
-- **`External`** (`external_join`): double radix permutation via temp disk. Bounded memory (~1.4 GB stages 1-3, ~2.1 GB stage 4 at Europe). See Pipeline 4b below.
-
-### Dense/Sparse path (2-pass + pass 0)
-
-**Pass 0 - Way-referenced node IDs (both index types):**
-- Scans way blobs to build `IdSetDense` bitset (~1.6 GB for planet's ~2B unique way-node refs)
-- Dense: filters which mmap slots to populate. Sparse: determines which nodes to store.
-
-**Pass 1 - Node index building:**
-- Node-only wire scanner (`extract_node_tuples`) - bypasses PrimitiveBlock, zero per-block heap alloc
-- **Dense path**: `par_iter` over `NodeTuple` batches. `SharedDenseWriter` holds raw `*mut u8` into the mmap (`Send + Sync`). Each rayon task writes to disjoint 8-byte slots (`base + node_id * 8`). No merge step - writes are lock-free.
-- **Sparse path**: sequential insertion via node-only scanner into chunk-indexed temp file.
-
-**Pass 2 - Output with locations on ways:**
-- **Indexed PBF (fast path)**: reads raw blob frames, classifies by `BlobIndex.kind` from BlobHeader indexdata
-  - Node blobs + `keep_untagged=true` → `write_raw_owned` (passthrough, zero decode)
-  - Node blobs + `keep_untagged=false` → decompress → filter untagged → re-encode
-  - Relation blobs → `write_raw_owned` (always passthrough)
-  - Way blobs → decompress → coordinate lookup → `add_way_with_locations` → re-encode
-  - **Dense**: direct `NodeIndex::get(id)` per way node ref
-  - **Sparse**: `resolve_batch_locations` collects all way node refs from the batch, sorts by mmap offset, sequential scan builds `FxHashMap<i64, (i32, i32)>`, then `LocationLookup::Resolved` provides O(1) HashMap lookups during block processing
-  - Batch processing via `par_iter().map_init(BlockBuilder::new, ...)` for way and node batches
-- **Non-indexed PBF (fallback)**: full decode-all path, same as above but every blob is decoded
-
-**Passthrough ratios** (Denmark, indexed PBF):
-- Default (drop untagged): 6 passthrough / 7390 decoded (only relation blobs passthrough)
-- `--keep-untagged-nodes`: 6568 passthrough / 828 decoded (~89% passthrough)
-
-## Pipeline 4b: External Join (add-locations-to-ways --index-type external)
-
-**Entry**: `src/commands/external_join.rs`
-
-4-stage sequential I/O pipeline with bounded memory. No mmap, no random access.
-Requires sorted PBF with indexdata. Uses temp disk (~4 GB Denmark, ~112 GB Europe).
-
-**Stage 1 - Way pass** (sequential BlobReader + DecompressPool):
-- Reads way blobs via indexdata filter, iterates way refs
-- Emits `(node_id, slot_pos)` COO pairs into 256 node buckets (radix by high byte of node_id)
-- Anon: 70 MB at Europe scale
-
-**Stage 2 - Node join** (P2b-v2, pread-from-workers):
-- IO thread reads only blob headers (~50 bytes), filters to node blobs via indexdata
-- Sends lightweight descriptors `(seq, data_offset, data_size)` to worker threads
-- Workers `pread` blob data from shared `Arc<File>`, decompress via `decompress_blob_raw()`,
-  extract `NodeTuple`s - all alloc/free thread-local, zero cross-thread ownership
-- Workers call `fadvise(DONTNEED)` after each pread (worker-side eviction)
-- Consumer reorders via `ReorderBuffer`, merge-joins against one sorted COO bucket at a time
-- Emits `(slot_pos, lat, lon)` resolved entries into 256 slot buckets
-- Anon: 1.4 GB at Europe scale (bucket sort data, irreducible)
-- Europe: 216s (was 301s sequential, -28%)
-
-**Stage 3 - Slot reorder** (scatter buffer):
-- Per slot bucket: load resolved entries, scatter by slot_pos into zeroed buffer, write_all
-- Eliminates sort + reduces syscalls (15x speedup over sorted pwrite)
-
-**Stage 4 - Assembly** (P2c, pread-from-workers):
-- Header-only pre-scan builds blob schedule with pre-computed slot_starts
-  (from ref count sidecar written in stage 1)
-- Dedicated worker threads pread + decompress + PrimitiveBlock + assemble
-- PrimitiveBlock lifecycle entirely on worker thread (no cross-thread retention)
-- P1b: skips node blobs without tagged/member nodes via header indexdata + tagdata
-- Consumer reorders + drains OwnedBlocks to pipelined PbfWriter
-- Anon: 7.3 GB at Europe scale (parallel in-flight PrimitiveBlocks + OwnedBlocks)
-
-**Measured results:**
-- Denmark (465 MB): 12.3s, ~4 GB temp disk
-- Europe (32.4 GB, commit `6b09796`): **577s (9.6 min)**, ~112 GB temp disk. Dense ALTW: 2,565s. **4.5x faster.**
-
-**Planet (87 GB, sidecar `98e71e2b`): 1,462s (24.4 min). Dense: 5,773s (96 min). 3.9x faster.**
-
-| Resource | Europe (measured) | Planet (measured) |
-|----------|------------------|------------------|
-| Peak anon RSS | 7.3 GB (stage 4) | **16.7 GB** (stage 4) |
-| Temp disk | ~112 GB | ~300 GB |
-| Wall time | 577s (9.6 min) | **1,462s (24.4 min)** |
-
-Memory is bounded by design: pread-from-workers with thread-local buffers
-(stages 2/4), sequential reader (stage 1), one bucket at a time (stages 2/3).
-Peak anon is stage 4's parallel PrimitiveBlock construction (7.3 GB Europe,
-16.7 GB planet). Validated on 30 GB host.
-
-Temp disk is the main constraint at planet scale. The 256 node buckets hold all
-`(node_id, slot_pos)` COO pairs (16 bytes each, ~13B pairs = ~208 GB), plus 256
-slot buckets with resolved `(slot_pos, lat, lon)` entries (16 bytes each), plus
-the final coord_slots file (8 bytes per ref). Total ~300 GB scratch. Cleaned up
-on completion (or crash - `ScratchDir` has `Drop` impl).
+The planet ratio is why the daily loop's write volume is effectively one
+full file per step: passthrough saves little there.
 
 ## Write Side (shared by merge rewrite + cat filtered + add-locations-to-ways)
 
@@ -467,19 +390,21 @@ on completion (or crash - `ScratchDir` has `Drop` impl).
 | add-locations-to-ways passthrough | none (~89% keep-untagged) | none | - |
 | add-locations-to-ways decode | yes (way blobs + filtered nodes) | zlib (default) | zlib-rs via flate2 |
 
-## Benchmark Context (commit `a6ebbfe`)
+## Benchmark context (daily loop at planet, plantasjen)
 
-**Merge (buffered I/O):**
-- Denmark (465 MB): zlib 363ms, none 250ms
-- Germany (4.5 GB): zlib 5.3s, none 3.4s
-- North America (18.8 GB): zlib 17.3s, none 14.9s
+The measurement record is `reference/performance.md` (current baselines
+and per-command breakdowns), `reference/performance-history.md` (arcs
+and retrospectives), and `.brokkr/results.db`. Headline planet figures
+for the ratified daily loop:
 
-**Merge (io_uring, North America):** zlib 15.2s, none 11.9s (-20% vs buffered)
+| Step | Wall | Pin |
+|---|---:|---|
+| `apply-changes` (zstd:1, cross-disk, parallel pwrite) | 80.9 s | performance.md apply-changes table |
+| `add-locations-to-ways --index-type external` | 546.0 s | UUID `7fd04130`, commit `16e3694` |
+| `build-geocode-index` | 432.9 s | 2026-04-18 arc, performance.md |
 
-RSS under 600 MB at North America scale (18.8 GB input, 30 GB host).
-
-**Merge `--locations-on-ways` (commit `e7bbfa2`):**
-- Denmark (501 MB with LocationsOnWays): pbfhogg 3.9s vs osmium 8.3s (2.1x faster)
-- vs separate merge + ALTW pipeline: pbfhogg 2.7s + 6.5s = 9.2s → 3.9s (2.4x faster)
-- Overhead vs plain merge (flag off): +170ms at Denmark scale (475ms vs 307ms to /dev/null)
-- 883 passthrough node blobs decompressed for coordinate extraction (of 5559 total)
+Total ~17-18 min per daily refresh on a 30 GB-class host. The
+injected-prepass flag (Brick 2, pending) must stay inside the standing
+**external <= 3% regression bound** (~16 s against the 546.0 s
+baseline); the enriched run becomes its own brokkr variant with its own
+recorded price.

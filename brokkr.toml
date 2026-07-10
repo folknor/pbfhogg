@@ -472,3 +472,10 @@ download_date = "2026-04-28"
 [plantasjen.datasets.denmark.snapshot.test-packed-4k.pbf.indexed]
 file = "denmark-test-packed-4k-with-indexdata.osm.pbf"
 xxhash = "a46218737b7046299ff2e2fce77e8591"
+
+[plantasjen.datasets.planet.snapshot.8k]
+download_date = "2026-07-10"
+
+[plantasjen.datasets.planet.snapshot.8k.pbf.indexed]
+file = "planet-8k-with-indexdata.osm.pbf"
+xxhash = "0725049652040e1d361f8a2471a6739f"

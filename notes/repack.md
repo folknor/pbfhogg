@@ -73,13 +73,30 @@ extending the schedule with per-blob element counts.
 | europe  | 8000  | bench | 195 s  | 428 MB   | `29d0216c` |
 | planet  | 8000  | bench | 380 s  | 1.36 GB  | `0ae01c09` |
 
+Re-validated 2026-07-10 at `8c1cf03` (plantasjen): planet 8k bench
+**389.6 s / 1.31 GB peak anon** (UUID `a4791ddc`) - consistent with
+the April number. Output: 1,453,433 blobs (28.6x the 50,816 input
+blobs), 98.4 GB; writer `recv_wait` 339 s of 390 s wall, so
+worker-side compression is the ceiling.
+
 Bench-mode peak RSS stays under 1.5 GB even at planet scale - the
 per-kind parallel-classify pipeline is bounded per worker, so the
-working set does not grow with the input. The planet 8k artefact
-(`0ae01c09`) is the input that unblocks
+working set does not grow with the input.
+
+**Artifact preservation (resolved 2026-07-10):** the first two planet
+8k runs kept no output - bench mode writes to scratch
+(`bench-repack-output.osm.pbf`), overwritten per iteration and swept
+by `brokkr clean` - so the "artefact that unblocks blob-density" never
+actually survived them. Resolved by a third run with snapshot
+promotion: UUID `8027765b` (377.5 s, commit `8c1cf03`, plantasjen)
+promoted its output to `data/planet-8k-with-indexdata.osm.pbf` and
+registered it as `[datasets.planet.snapshot.8k]` `pbf.indexed`. That
+file is the input for
 [`reference/blob-density.md`](../reference/blob-density.md) and the
 deferred `HeaderWalker` dispatch decision in
-[`notes/getparents.md`](getparents.md).
+[`notes/getparents.md`](getparents.md); consumer commands reach it via
+`--snapshot 8k` (consumer-side snapshot support is complete as of
+brokkr `e635f5b` - see AGENTS.md).
 
 ### Profiler-mode OOM (fixed at commit `195b7ff`)
 

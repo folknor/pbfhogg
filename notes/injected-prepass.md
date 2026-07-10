@@ -1,7 +1,11 @@
 # Injected prepass metadata: WayMembers-v1 + SharedNodePins-v1 (survey)
 
-Status: 2026-07-09. Survey and assessment; precedes the paired pbfhogg
-implementation spec ("Brick 2" below). No code has landed.
+Status: 2026-07-09 survey; no code has landed. Decisions 1 and 2 were
+RATIFIED 2026-07-10: steady state is option (a) - altw moves into the
+daily loop and the production merge drops `--locations-on-ways`
+(recorded in `reference/pipeline.md`) - and injection is opt-in
+flag-gated with sparse parity. The paired spec now waits only on
+elivagar's Brick 1 superset screen (decision 3).
 
 Origin: elivagar's `notes/injected-prepass-spec.md` (H2a + H2b of their
 planet-30gb roadmap) specifies a cross-repo contract in which altw computes
@@ -363,6 +367,13 @@ Options, in decreasing enrichment freshness:
 **This is a product decision that shapes how much Brick 2 complexity is
 worth buying, and it must be taken before the paired spec is written.**
 
+**RESOLVED 2026-07-10: option (a) ratified.** Rationale: post-A1
+external is ~9 min at planet (546.0 s), the daily loop already carries
+a post-merge rebuild of the same magnitude (build-geocode-index ~7
+min), and nidhogg had not yet enabled `locations_on_ways` so nothing
+downstream migrates. Cost accepted: daily write volume roughly doubles
+at planet. Full pipeline shape in `reference/pipeline.md`.
+
 Related asymmetry worth recording: subset-producing commands
 (extract/getid/tags-filter) err SAFE if metadata were ever carried through
 them - dropping relations only turns true members into false positives
@@ -423,9 +434,17 @@ follow-up on the same rails.
 
 ## 11. Open decisions before the paired spec
 
-1. Steady-state story (section 7, options a/b/c) - product decision.
-2. Opt-in flag shape and sparse parity (section 6).
+1. ~~Steady-state story (section 7, options a/b/c)~~ - **RATIFIED
+   2026-07-10: option (a).** altw runs in the daily loop after each
+   merge; the production merge drops `--locations-on-ways`; both
+   injected fields stay fresh every cycle, so apply-changes needs no
+   field-5/20 maintenance (only the section-8 hygiene rule + pinning
+   test). Recorded in `reference/pipeline.md`.
+2. ~~Opt-in flag shape and sparse parity (section 6)~~ - **RATIFIED
+   2026-07-10 as recommended:** flag-gated injection (working name
+   `--inject-prepass`), sparse implements both fields to keep the
+   backend-parity canary.
 3. Wait for elivagar's Brick 1 superset screen (<= 1.5x on germany
    locations) before any format work; if it fails, the contract changes
    (relation tag filter) and this note's membership section changes with
-   it.
+   it. **This is now the only gate on the paired spec.**

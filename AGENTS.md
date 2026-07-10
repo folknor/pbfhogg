@@ -55,6 +55,17 @@ brokkr <command> [--dataset D] --commit <ref>   # build+bench an old commit in a
 worktree and stores the result tagged to that commit - pass it to capture a
 before/after baseline from your own branch.
 
+**`--commit` build-thrash warning:** dev hosts export a global
+`CARGO_TARGET_DIR`, which overrides the worktree's local `target/` - so
+worktree builds and HEAD builds share ONE artifact directory and clobber
+each other (different lockfiles, same output paths). Every HEAD/worktree
+alternation costs a full release rebuild of whichever side runs next.
+**Group `--commit` benches together**: run all HEAD cells consecutively,
+then all worktree cells (or vice versa), and end on a HEAD build so the
+shared target is left in HEAD state for whatever follows. A
+dataset-grouped order that alternates commits doubles the total build
+count.
+
 `--stop MARKER` requires a measured mode. Kills process after the named marker. Accepts three spellings: verbatim (`--stop RENUMBER_EXT_STAGE2D_END`), the `-` sigil (`--stop -RENUMBER_EXT_STAGE2D` → resolves to `RENUMBER_EXT_STAGE2D_END`), and the bare-name fallback (`--stop RENUMBER_EXT_STAGE2D` → also resolves to `RENUMBER_EXT_STAGE2D_END`; the sidecar log line shows the resolved form).
 
 Markers are point-in-time bookmarks - the FIFO protocol is `<timestamp_us> <name>` per marker, nothing else. The default `brokkr sidecar <uuid>` view segments the stream between consecutive markers; `brokkr sidecar <uuid> --durations` is the one view that opts into the `FOO_START` / `FOO_END` pairing convention for duration math.

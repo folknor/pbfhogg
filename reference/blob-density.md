@@ -167,6 +167,32 @@ getparents-shaped workloads sits between 51 k and 522 k blobs.
 io_uring-batched header probes would flatten the walk term entirely
 (known non-pursued lever in `notes/getparents.md`).
 
+### getid include mode confirms, steeper (2026-07-10)
+
+Full three-cell matrix (scan arm via `--commit 51c662e`, the parent of
+the `bb16193` HeaderWalker landing):
+
+| encoding | blobs | scan | HeaderWalker | winner |
+|---|---:|---:|---:|---|
+| planet primary | 50,816 | 43.7 s | **6.1 s** | HW, -86 % |
+| europe | 522,168 | **17.9 s** (`bc96d15d`) | 40.2 s (`57ffbf49`) | scan, HW +125 % |
+| planet 8k | 1,453,433 | **33.2 s** (`c0d89d8f`) | 102.6 s (`aa5bc158`) | scan, HW +209 % |
+
+Two findings beyond the getparents confirmation. First, getid's arms
+move in OPPOSITE directions with blob density: the scan arm gets
+FASTER on dense encodings (33.2 s on the 98 GB 8k file vs 43.7 s on
+the 92 GB primary) because narrow per-blob ID ranges make the
+indexdata prescreen skip decompression almost everywhere, leaving
+near-pure sequential read; the walk arm degrades linearly as always.
+Second, the divergence is therefore much steeper than getparents'
+(+209 % vs +57 % at 8k), which argues for placing the shared dispatch
+constant toward the LOW end of the 51 k-522 k bracket (~150 k blobs):
+getid pays more for a wrong high-side call than getparents pays for a
+wrong low-side one. getid is dispatch consumer number three (with
+getparents and sort pass 1); one shared blob-count threshold serves
+all of them. Cross-epoch caveat: scan cells ran the April tree via
+`--commit`; margins of 2.2-3x dwarf any plausible tree drift.
+
 ### Correctness across the encoding axis
 
 `brokkr verify all --snapshot 1k|64k|320k` (denmark, 2026-07-10): every

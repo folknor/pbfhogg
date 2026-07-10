@@ -653,6 +653,39 @@ integration test covering both "reflink taken" and "reflink
 declined" paths. Largest remaining opportunity for the
 already-sorted production path on a reflink-capable fs.
 
+## Correctness finding: intra-blob disorder is invisible (2026-07-10)
+
+Blob-level permutation sort assumes every blob is internally sorted
+and nothing checks it. Given a file whose blobs are internally
+UNSORTED but whose blob (min_id, max_id) ranges do not overlap, sort
+emits a byte-identical copy of the input stamped `Sort.Type_then_ID` -
+silent corruption of the sorted invariant. Found via
+`degrade --unsort` + `verify sort --snapshot unsorted`: degrade's swap
+accidentally landed intra-blob (see `notes/degrade.md` "Known bugs"),
+`detect_overlaps` correctly saw no range overlap (run `f5cd6522`:
+0 overlaps, 7,399 passthrough, one whole-file `copy_file_range`), and
+osmium's element-level sort fixed what we passed through. The
+overlap-rewrite path itself has therefore STILL never been exercised
+on real unsorted data.
+
+Decision needed (tracked in TODO.md):
+
+- **Detect in the non-indexed fallback for ~free.** `build_blob_index`'s
+  fallback already decompresses payloads and scans element IDs for
+  min/max; tracking monotonicity during that scan costs one compare per
+  element. Genuinely-unsorted third-party files (osmosis output, custom
+  exporters) are exactly the non-indexed case, so the free check covers
+  the realistic threat.
+- **Indexed inputs: producer contract.** Indexdata-carrying blobs are
+  pbfhogg-produced and internally sorted by construction - except
+  `degrade`'s output, which is adversarial by design. Options: document
+  intra-blob sortedness as a precondition of the indexed fast path, or
+  add an opt-in `--verify-blobs` decode pass. A mandatory decode of
+  every blob would destroy the passthrough design (94 % of wall is
+  already writer-side `copy_file_range` on sorted input).
+- Whatever the decision lands, record it in CORRECTNESS.md; nothing
+  there covers this today.
+
 ## Things that deliberately do not change
 
 - **Pipelined decode is not adopted.** `sort` uses direct pread per

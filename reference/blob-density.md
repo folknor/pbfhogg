@@ -136,26 +136,53 @@ regress on Geofabrik-style packing:
 Each is a candidate for `if blob_count > N { pipelined_decode }
 else { header_walk }` dispatch, gated on measurements.
 
-## Measurement plan
+## Measured evidence (2026-07-10, plantasjen)
 
-Needed to turn this doc from "insight" to "insight + evidence":
+The same-corpus control exists: `snapshot.8k` on the planet dataset
+(`brokkr repack --dataset planet --elements-per-blob 8000 --as-snapshot
+8k`, UUID `8027765b` at `8c1cf03`). 98.4 GB, **1,453,433 blobs** (nodes
+1,305,968 / ways 145,699 / relations 1,766) - 28.6x the primary's
+50,816. Denmark-scale controls in the other direction:
+`snapshot.1k` / `snapshot.64k` / `snapshot.320k`.
 
-1. **Produce a 8k-packed planet** via `pbfhogg repack --elements-per-blob 8000`
-   (see `notes/repack.md`). This is the same-corpus-different-encoding
-   control that doesn't exist today.
-2. **Register it in `brokkr.toml`** as a new dataset variant alongside
-   the existing `planet/indexed` (the osm.org-packed one).
-3. **Run the matrix** for each header-walk command:
-   - `planet/indexed` (50 k blobs, current baseline)
-   - `planet/packed-8k` (~6-7 M blobs, Geofabrik-style packing)
-   - Record wall, peak RSS, disk read, phase split.
-4. **Fill in the "Decisions that need revisiting" section** with
-   concrete data: which commands hold up, which need threshold
-   dispatch, which need structural rework.
+### getparents three-cell matrix (the dispatch decision data)
 
-Measurements will also confirm or refute the prediction that
-`HeaderWalker` scan scales linearly with blob count (versus, say,
-sublinearly thanks to page cache effects).
+| Encoding | Blobs | Full scan | HeaderWalker | Winner |
+|---|---:|---:|---:|---|
+| planet primary | 50,816 | 44.8 s | **23.5 s** (`11bc44dc`) | HW, -46 % |
+| europe Geofabrik | 522,168 | **26.4 s** | 44.2 s | scan, HW +68 % |
+| planet 8k | 1,453,433 | **52.8 s** (`2b3e496e` at `68e1ba0` via `--commit`) | 82.7 s (`425d1f1e`) | scan, HW +57 % |
+
+Phase split of the 8k HeaderWalker run: schedule walk **64.8 s**
+(single-threaded, 0.1 avg cores, 1.45 M voluntary context switches),
+decode **17.8 s** (19 cores). The decode phase is byte-bound and
+encoding-invariant (~18 s on both planet encodings); the walk is pure
+per-blob QD=1 latency at **~45 µs/blob**, confirming the linear-scaling
+prediction. Consistency check: europe 522 k × 45 µs ≈ 23 s walk +
+~20 s decode ≈ the measured 44.2 s.
+
+The dispatch rule this supports: HeaderWalker wins iff
+`blob_count × ~45 µs < bytes_skipped / scan_rate`. Crossover for
+getparents-shaped workloads sits between 51 k and 522 k blobs.
+io_uring-batched header probes would flatten the walk term entirely
+(known non-pursued lever in `notes/getparents.md`).
+
+### Correctness across the encoding axis
+
+`brokkr verify all --snapshot 1k|64k|320k` (denmark, 2026-07-10): every
+element-shaped command (sort, cat, extract, tags-filter, getid, altw
+all three backends, check-refs, renumber) passes identically on all
+three re-encodes and on primary. The four suite failures reproduce
+bit-identically on primary - harness-side or pre-existing, none
+encoding-sensitive.
+
+### New encoding-sensitive finding: `read` parallel variant OOM
+
+`brokkr read --dataset planet --snapshot 8k --bench 1`: 3 of 4 variants
+completed; the **parallel variant was killed by signal** on the 8k
+encoding. It survives primary planet (50.8 k blobs), so per-blob memory
+accumulation at 28.6x blob count is implicated. Uninvestigated; tracked
+in TODO.md.
 
 ## Cross-references
 

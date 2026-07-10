@@ -215,6 +215,35 @@ the decode path's flush is routed through a single helper that
 respects `--strip-indexdata`, so any pairing of decode-path flags
 gets the right framing.
 
+## Known bugs
+
+### `--unsort` produces intra-blob disorder, not the documented cross-blob overlap (found 2026-07-10)
+
+The design intent (doc comment at the top of `mod.rs`): swap two
+adjacent same-kind elements at a block boundary so two adjacent output
+blobs get overlapping ID ranges - the minimum perturbation that fires
+`sort`'s `detect_overlaps`. What actually happens: the merge loop's
+sort-preservation flush (the `if !bb.is_empty()` block at the top of
+the per-worker-output consume step in `run_kind_phase`) flushes the
+central builder at EVERY input-blob boundary, so output blocks mirror
+input blobs (~7,998 elements on Geofabrik input, never reaching the
+8,000 cap). The cap-keyed swap of global elements #8000/#8001 then
+lands entirely inside output blob 2 (which spans elements
+#7,999..#15,996): an intra-blob inversion with non-overlapping blob
+ranges. `detect_overlaps` correctly returns 0 and sort passes the
+whole file through (verified: run `f5cd6522`, `sort_blobs_overlap=0`,
+`sort_blobs_passthrough=7399`, one `copy_file_range` for the whole
+file). `unsort_fired=true` reports success misleadingly.
+
+Fix options: (a) suppress the boundary flush under `--unsort` so the
+central builder packs to cap and the swap straddles a builder boundary
+as designed (small change; output blob counts become exact-8000
+packed); (b) key the swap to actual output-blob boundaries instead of
+a global element counter. Either way, keep the accidental shape too -
+it exposed a real sort blind spot (see `notes/sort.md` "Intra-blob
+disorder" finding) - e.g. as a new `--unsort-intra` flag, so degrade
+can produce BOTH adversarial shapes deliberately.
+
 ## v2 scope
 
 The deferred transformations from the design doc, ordered by likely

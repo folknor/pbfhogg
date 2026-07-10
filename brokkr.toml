@@ -479,3 +479,31 @@ download_date = "2026-07-10"
 [plantasjen.datasets.planet.snapshot.8k.pbf.indexed]
 file = "planet-8k-with-indexdata.osm.pbf"
 xxhash = "0725049652040e1d361f8a2471a6739f"
+
+[plantasjen.datasets.denmark.snapshot.1k]
+download_date = "2026-07-10"
+
+[plantasjen.datasets.denmark.snapshot.1k.pbf.indexed]
+file = "denmark-1k-with-indexdata.osm.pbf"
+xxhash = "19c4f1bd09c730910374784df763d39e"
+
+[plantasjen.datasets.denmark.snapshot.64k]
+download_date = "2026-07-10"
+
+[plantasjen.datasets.denmark.snapshot.64k.pbf.indexed]
+file = "denmark-64k-with-indexdata.osm.pbf"
+xxhash = "23c841f232c90f11e25916e39f536b1f"
+
+[plantasjen.datasets.denmark.snapshot.320k]
+download_date = "2026-07-10"
+
+[plantasjen.datasets.denmark.snapshot.320k.pbf.indexed]
+file = "denmark-320k-with-indexdata.osm.pbf"
+xxhash = "0d32721cc6d99cc61e7a2f01c4b8ddf5"
+
+[plantasjen.datasets.denmark.snapshot.unsorted]
+download_date = "2026-07-10"
+
+[plantasjen.datasets.denmark.snapshot.unsorted.pbf.indexed]
+file = "denmark-unsorted-with-indexdata.osm.pbf"
+xxhash = "573e35a1e07bc139793218219aff9f3f"

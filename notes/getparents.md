@@ -83,6 +83,35 @@ but we have no measurement yet of what the threshold should be.
 Deferred until `repack` produces an 8k-packed planet so we can
 measure the crossover directly.
 
+### Crossover measured (2026-07-10, plantasjen) - data supports threshold-dispatch
+
+The 8k-packed planet exists (`snapshot.8k`, 1,453,433 blobs, 98.4 GB).
+Third matrix cell, same corpus, same host:
+
+| encoding | blobs | full scan (pre-`783970a`) | HeaderWalker | winner |
+|---|---:|---:|---:|---|
+| planet primary | 50,816 | 44.8 s | **23.5 s** (`11bc44dc`) | HW, -46 % |
+| europe Geofabrik | 522,168 | **26.4 s** | 44.2 s | scan, HW +68 % |
+| planet 8k | 1,453,433 | **52.8 s** (`2b3e496e`, `--commit 68e1ba0`) | 82.7 s (`425d1f1e`) | scan, HW +57 % |
+
+8k HeaderWalker phase split: schedule walk 64.8 s (single-threaded,
+QD=1, ~45 us/blob), decode 17.8 s (19 cores, encoding-invariant vs
+primary's ~18 s). The walk term is linear in blob count; the decode
+term is byte-bound. Dispatch rule: HeaderWalker wins iff
+`blob_count x ~45 us < bytes_skipped / scan_rate`; the getparents
+crossover sits between 51 k and 522 k blobs. Blob count is known
+before committing to either path (indexdata scan / file size over
+average blob size estimate), so a single `if` at entry suffices.
+io_uring-batched header probes remain the lever that would flatten
+the walk term entirely if threshold-dispatch ever feels unsatisfying.
+
+Recommendation: **option (2), threshold-dispatch**, with the branch
+constant picked conservatively inside the measured bracket (e.g.
+~150-250 k blobs) and both paths kept under test. Revert (1) throws
+away a solid 2x planet win; accept (3) is now measurably wrong on
+BOTH high-density encodings, not just europe. Decision awaits
+ratification.
+
 **Experiment commit: `783970a`.** If option (1) wins after
 `repack`-measured data lands, revert with `git revert 783970a`
 (or cherry-pick the parts of that commit worth keeping and drop

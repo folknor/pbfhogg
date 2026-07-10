@@ -32,31 +32,48 @@ breakdowns, and old commit-pinned cross-dataset tables live in
 ## Reading rules
 
 How a keep/revert verdict is read off this file and `.brokkr/results.db`.
-These are conventions, not hard thresholds - the exact magnitudes below want
-a fresh measurement pass to pin, but the direction of each rule holds today.
+Calibrated 2026-07-10 at commit `6d6e158` on denmark
+`add-locations-to-ways` across all three modes: clean bench `7bd88e83`
+(4.0 s wall, 1.49 GB peak anon), hotpath `53ed877e` (3.9 s), alloc
+`a7e1159b` (4.3 s, ~7 GB cumulative churn).
+
+Instrumentation here is sparse and per-command. Where a single production
+pipeline would be annotated densely and pay a large fixed profiling tax,
+pbfhogg spreads a handful of coarse `hotpath::measure` points across each
+command, so `--hotpath` / `--alloc` overhead is workload-dependent and
+usually small.
 
 - **Verdicts come from `--bench 3` best-of, not a single `--bench 1` run.**
-  `brokkr <cmd> --bench` defaults to three runs and stores the best. Planet is
-  often run `--bench 1` on cost, so a single-shot delta of a few percent at
-  sub-150-s walls, and a larger fraction at sub-10-s walls, sits inside
-  observed bench-to-bench variance (this file flags such rows "within noise").
-  A spec claiming a win states the expected bound up front and the verdict is
-  read against that bound, not against zero.
-- **`--hotpath` ranks, it does not measure absolutes.** Instrumentation
-  inflates wall clock, and inflates it most for entries with tens of millions
-  of calls at sub-microsecond averages; entries with large per-call work
-  (tens of microseconds and up) are mostly real. Use hotpath to find where
-  the time goes, never to quote a wall number.
-- **Never read RSS from a `--hotpath` or `--alloc` run.** Per-call records
-  and the counting allocator dominate resident memory under instrumentation;
-  peak-anon-RSS figures come from `--bench` or plain runs only.
-- **`--alloc` numbers before commit `678478d` are invalid.** That commit
-  installs `CountingAllocator` as the global allocator under the hotpath-alloc
-  feature; before it, allocation tracking was not wired to the global
-  allocator, so the byte totals undercount and do not compare to current ones.
-- **A hotpath timing percentage over 100% is not an error.** It is
-  cross-thread CPU seconds relative to wall clock: a parallel phase running on
-  N cores reports up to N times 100%.
+  `brokkr <cmd> --bench` defaults to three runs and stores the best. Planet
+  is often run `--bench 1` on cost, so a single-shot delta of a few percent
+  at sub-150-s walls, and a larger fraction at sub-10-s walls, sits inside
+  observed bench-to-bench variance (this file flags such rows "within
+  noise"). A spec claiming a win states the expected bound up front and the
+  verdict is read against that bound, not against zero.
+- **`--hotpath` ranks; it does not measure absolute wall.** On the denmark
+  calibration hotpath wall was 3.9 s against a 4.0 s clean bench - no
+  measurable inflation, because altw's annotated functions are coarse
+  (hundreds of microseconds to milliseconds per call over a few thousand
+  calls). The per-call record cost only surfaces on an annotation taking
+  tens of millions of sub-microsecond calls, which pbfhogg's sparse
+  instrumentation mostly avoids. Use hotpath to see where the time goes; read
+  the clean bench for the wall.
+- **A hotpath percentage over 100% is not an error.** It is cross-thread CPU
+  seconds relative to wall clock: on the denmark run `frame_blob_into`
+  reports 614% and `process_block` 158%, the parallel compression and
+  block-processing pools spending several core-seconds per wall-second.
+- **Neither `--hotpath` nor `--alloc` emits a peak-RSS figure.** Both run
+  under the instrumentation features and produce no `/proc` sidecar timeline
+  at all - only a point-in-time thread snapshot (415.9 MB hotpath, 315.6 MB
+  alloc on the denmark run), which is not the peak and here sits below the
+  clean 1.49 GB. Peak anon RSS comes from `--bench` or plain runs only.
+- **`--alloc` numbers are valid only from commit `678478d` onward.** That
+  commit installs `CountingAllocator` as the global allocator under the
+  hotpath-alloc feature; before it, tracking was not wired to the global
+  allocator and byte totals undercount. The denmark alloc run above is post
+  `678478d`, so its ~7 GB churn - led by `parse_and_inline_with_scratch`
+  1.7 GB, `parallel_scan_blobs_raw` and `parallel_classify_phase` 1.6 GB
+  each - is real; older alloc profiles do not compare.
 
 ## Cat passthrough (indexdata generation)
 

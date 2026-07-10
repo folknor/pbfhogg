@@ -96,8 +96,9 @@ impl<R: Read + Send> ElementReader<R> {
 
     /// Sets Stage 2 pipeline decode-ahead depth.
     ///
-    /// Controls both the channel capacity between the decode pool and the
-    /// reorder buffer, and the reorder buffer's own capacity. Lower values
+    /// Controls decode admission as well as the channel capacity between the
+    /// decode pool and the reorder buffer. At most this many decode tasks are
+    /// admitted but not yet delivered from the reorder buffer. Lower values
     /// reduce memory usage; higher values absorb decode-time variance.
     ///
     /// Defaults to 32. Values <1 are clamped to 1.
@@ -251,6 +252,8 @@ impl<R: Read + Send> ElementReader<R> {
     /// The 3-stage pipeline (I/O → decode → reorder) runs in a background thread.
     /// Blocks arrive in file order via a bounded channel. The consumer controls
     /// the iteration pace; backpressure propagates naturally when the channel fills.
+    /// Dropping the iterator stops the background pipeline promptly, within
+    /// about `decode_ahead` blobs, instead of reading the rest of the file.
     ///
     /// This is the iterator equivalent of [`for_each_block_pipelined`](Self::for_each_block_pipelined).
     /// Use it when you need loop control (early exit, zipping two files, interleaving work).
@@ -557,7 +560,7 @@ fn collect_osm_data_blobs<R: Read + Send>(blob_iter: BlobReader<R>) -> Result<Ve
 ///
 /// Created by [`ElementReader::into_blocks_pipelined`]. The 3-stage pipeline
 /// runs in a background thread; blocks are delivered in file order via a bounded
-/// channel. Dropping this iterator signals the pipeline to shut down.
+/// channel. Dropping this iterator signals the pipeline to shut down promptly.
 pub struct PipelinedBlocks {
     rx: Option<Receiver<Result<PrimitiveBlock>>>,
     handle: Option<JoinHandle<()>>,

@@ -6,6 +6,18 @@
 
 - **Minimum supported Rust version raised 1.87 → 1.96** (library and CLI). Required by the move to `if let` chains and `as_chunks` in the read and command paths.
 
+### Changed
+
+- The pipelined reader (`for_each_pipelined`,
+  `for_each_block_pipelined`, `into_blocks_pipelined`) now bounds
+  decode-in-flight memory at the `decode_ahead` knob (default 32 blocks).
+  Previously the decode stage admitted the entire file at disk
+  rate, so decoded-block memory grew with file size (21.5 GB peak observed
+  on a 19 GB input). Dropping `PipelinedBlocks` early, or returning an
+  error from the block closure, now stops the pipeline within about
+  `decode_ahead` blobs instead of reading and decompressing the rest of the
+  file in the background.
+
 ### Dependencies
 
 - `hotpath` 0.17.0 → 0.21.1, `quick-xml` 0.40.1 → 0.41.0, `io-uring` 0.7.12 → 0.7.13, `memmap2` → 0.9.11, `rustc-hash` → 2.1.3.

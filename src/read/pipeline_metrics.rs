@@ -7,11 +7,9 @@
 //!
 //! Bench scope: every command that consumes blocks via
 //! `for_each_pipelined` / `into_blocks_pipelined` gets these counters
-//! for free. Time-filter is the immediate driver - the snapshot path's
-//! residual planet RSS lives somewhere between the pipeline's
-//! decode-ahead window, the per-decode-thread `parse_and_inline` scratch
-//! retention, and downstream batch / writer state, and this is the
-//! only of those three with no observability today.
+//! for free. Current production users include geocode pass 1, getid
+//! referenced-node collection, tags-filter `-R`, the non-indexed
+//! add-locations-to-ways fallback, and the history time-filter path.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -19,6 +17,14 @@ pub(crate) struct PipelineMetrics {
     /// Cumulative time stage-1 (I/O reader) blocked on a full
     /// `read_ahead` raw-blob channel.
     pub raw_send_wait_ns: AtomicU64,
+    /// Cumulative time stage-2 dispatcher spent waiting for decode
+    /// admission permits. This is where backpressure from the decode
+    /// cap is accounted.
+    pub decode_admit_wait_ns: AtomicU64,
+    /// Number of decode admission acquisitions that actually blocked.
+    /// This is the gate-engaged signal; `decode_admit_wait_ns` can be
+    /// nonzero from uncontended lock overhead alone.
+    pub decode_admit_blocked: AtomicU64,
     /// Cumulative time stage-2 decode workers blocked sending decoded
     /// blocks toward the reorder buffer (channel bound by `decode_ahead`).
     pub decoded_send_wait_ns: AtomicU64,
@@ -27,10 +33,16 @@ pub(crate) struct PipelineMetrics {
     /// Combined with `block_fn`'s own time this localises whether the
     /// consumer is starved by decode or by its own work.
     pub decoded_recv_wait_ns: AtomicU64,
-    /// Maximum length the in-order reorder buffer reached during the run.
-    /// Bounded by `decode_ahead` (default 32). High-water at the cap
-    /// means the consumer was the bottleneck.
+    /// Maximum filled slots the in-order reorder buffer reached during
+    /// the run. This is the live decoded-block memory diagnostic. For
+    /// cross-run comparison with pre-change UUIDs, use
+    /// `reorder_window_high_water` instead; old runs recorded window
+    /// length including gaps under this counter name.
     pub reorder_high_water: AtomicU64,
+    /// Maximum window length the in-order reorder buffer reached during
+    /// the run, including gaps. This preserves the old
+    /// `reorder_high_water` meaning as a completion-skew diagnostic.
+    pub reorder_window_high_water: AtomicU64,
     /// Maximum retained capacity (bytes) of the per-decode-thread
     /// `ST_SCRATCH` Vec (string-table kv pairs in `parse_and_inline`).
     /// Sum across all decode threads at end of run. The iter-5 alloc
@@ -52,9 +64,12 @@ impl PipelineMetrics {
     const fn new() -> Self {
         Self {
             raw_send_wait_ns: AtomicU64::new(0),
+            decode_admit_wait_ns: AtomicU64::new(0),
+            decode_admit_blocked: AtomicU64::new(0),
             decoded_send_wait_ns: AtomicU64::new(0),
             decoded_recv_wait_ns: AtomicU64::new(0),
             reorder_high_water: AtomicU64::new(0),
+            reorder_window_high_water: AtomicU64::new(0),
             scratch_st_capacity_peak_bytes: AtomicU64::new(0),
             scratch_gr_capacity_peak_bytes: AtomicU64::new(0),
             decode_tasks: AtomicU64::new(0),
@@ -62,20 +77,11 @@ impl PipelineMetrics {
         }
     }
 
-    /// Compare-and-swap maximum for `reorder_high_water`. Called from
-    /// the consumer thread on every push, so kept lock-free.
-    pub fn record_reorder_high_water(&self, len: usize) {
-        let len = len as u64;
-        let mut current = self.reorder_high_water.load(Relaxed);
-        while len > current {
-            match self
-                .reorder_high_water
-                .compare_exchange_weak(current, len, Relaxed, Relaxed)
-            {
-                Ok(_) => break,
-                Err(observed) => current = observed,
-            }
-        }
+    /// Compare-and-swap maxima for reorder-buffer fill and window levels.
+    /// Called from the consumer thread on every push, so kept lock-free.
+    pub fn record_reorder_levels(&self, filled: usize, window: usize) {
+        cas_max(&self.reorder_high_water, filled as u64);
+        cas_max(&self.reorder_window_high_water, window as u64);
     }
 
     /// Compare-and-swap maximum for the named scratch field. Each
@@ -102,9 +108,15 @@ impl PipelineMetrics {
             };
         }
         emit!("pipeline_raw_send_wait_ns", raw_send_wait_ns);
+        emit!("pipeline_decode_admit_wait_ns", decode_admit_wait_ns);
+        emit!("pipeline_decode_admit_blocked", decode_admit_blocked);
         emit!("pipeline_decoded_send_wait_ns", decoded_send_wait_ns);
         emit!("pipeline_decoded_recv_wait_ns", decoded_recv_wait_ns);
         emit!("pipeline_reorder_high_water", reorder_high_water);
+        emit!(
+            "pipeline_reorder_window_high_water",
+            reorder_window_high_water
+        );
         emit!(
             "pipeline_scratch_st_capacity_peak_bytes",
             scratch_st_capacity_peak_bytes

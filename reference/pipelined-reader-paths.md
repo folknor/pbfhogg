@@ -45,6 +45,17 @@ If the 4.7× regression didn't flip for the lightest workload
 heavier. Adding to the list of pipelined callers is fine; removing
 from it is not.
 
+**Admission is bounded.** The decode stage gates `rayon::spawn`
+behind `decode_ahead` tokens. A token is released only after the
+decoded item is delivered from the reorder buffer, so queued,
+decoding, blocked-on-send, channel-held, and reorder-held items are
+capped together. `pipeline_reorder_high_water` records filled slots
+and `pipeline_reorder_window_high_water` records the old gap-inclusive
+window diagnostic. Dropping `PipelinedBlocks` or returning an error
+from a block closure closes the decoded receiver before the scoped
+threads join, so stage 1 stops promptly instead of reading the rest of
+the file.
+
 ## Callers
 
 ### `getid --add-referenced` pass 2
@@ -69,59 +80,28 @@ from it is not.
 
 ### `add-locations-to-ways` decode-all fallback
 
-- **Path:** `src/commands/altw/dense.rs` at the decode-all branch
+- **Path:** `src/commands/altw/mod.rs`, `write_output_decode_all`
 - **Scale:** triggered only by `--force` on non-indexed PBFs.
   Production `--index-type external` uses pread workers.
 - **Per-block work:** heaviest of any pipelined caller. Every
   element processed:
   - Nodes: tag check + conditional `BlockBuilder` write
   - Ways: collect refs, look up every node location from the
-    index (dense mmap or pre-resolved map), `add_way_with_locations`
+    index or pre-resolved map, `add_way_with_locations`
   - Relations: full member collection + `BlockBuilder` write
-  - Sparse index: `resolve_batch_locations` pre-resolves all
-    way-node coordinates via a sorted sequential scan before
-    par_iter
 
-### `cat --type` re-encoding branch
+### `time-filter` history path
 
-- **Path:** `src/commands/cat/mod.rs`, non-passthrough side of the
-  split (blobs that don't fully match the filter and must be
-  re-encoded)
-- **Scale:** full-match blobs go through the pread passthrough
-  schedule; this branch handles partial-match blobs only
-- **Per-block work:** heaviest batch work in the codebase. Each
-  rayon worker does type filter + `BlockBuilder` re-encode + zlib
-  compress + `frame_blob_pipelined` - all inside the `par_iter`.
-  Compression is CPU-heavy enough that the pipelined decode overlap
-  genuinely wins.
-
-### `getparents`
-
-- **Path:** `src/commands/getparents/mod.rs`
-- **Scale:** whole-file scan for ways / relations referencing a
-  given ID set
-- **Per-block work:** light (ID-set lookups)
-- **History:** sequential conversion attempted in `c912e4d`,
-  reverted - 4.7× regression on Denmark. This result is the
-  load-bearing evidence for the "do not convert" rule above.
-
-### `time-filter`
-
-- **Path:** `src/commands/time_filter/mod.rs` - both history mode
-  (`for_each_pipelined`) and snapshot mode (`into_blocks_pipelined`
-  + batch dispatch)
-- **Scale:** whole-file scan; every element touched
+- **Path:** `src/commands/time_filter/mod.rs`, history mode
+- **Scale:** history PBF scan; every element touched
 - **Per-block work:** medium - timestamp compare, `PendingGroup`
   latest-version tracking, re-encode survivors through `BlockBuilder`
 
-### `check --ids` streaming default
+### `build-geocode-index` pass 1
 
-- **Path:** `src/commands/check/verify_ids.rs`,
-  `reader.for_each_pipelined(...)`
-- **Scale:** whole-file scan
-- **Per-block work:** light (ID ordering + uniqueness check)
-- **Related:** `--full` (bitmap duplicate detection) switches to
-  `parallel_classify_phase`; see the list below.
+- **Path:** `src/geocode_index/builder/pass1.rs`, `only_relations()`
+- **Scale:** filtered relation scan
+- **Per-block work:** bounded relation metadata extraction
 
 ## Callers that use something else (deliberately not pipelined)
 
@@ -133,7 +113,10 @@ should stay that way:
 - `inspect` default / `inspect --indexed` - `HeaderWalker`
   (pread-only header walk)
 - `check --refs`, `check --ids --full` - `parallel_classify_phase`
+- `check --ids` streaming default - `parallel_classify_phase`
 - `tags-filter` two-pass - pread workers
+- `cat --type` / `cat --clean` re-encoding - pread classification
+  and writer-side reframe paths
 - `extract` (simple / complete / smart / multi) - pread workers
 - `sort` - direct pread per blob
 - `diff`, `derive_changes` (aka `diff --format osc`) - `StreamingBlocks`
@@ -148,6 +131,9 @@ should stay that way:
   pread workers
 - `getid` single-pass (include / invert) - `HeaderWalker` +
   raw-frame reads
+- `getparents` - blob-filtered pipelined history is retired; current
+  code does not use `ElementReader::into_blocks_pipelined`
+- `time-filter` snapshot path - `parallel_classify_phase`
 
 ## Adding a new pipelined caller
 

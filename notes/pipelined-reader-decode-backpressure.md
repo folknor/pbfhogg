@@ -2,13 +2,14 @@
 
 Status: 2026-07-08 analysis and decision recorded; 2026-07-09 scoping
 pass done and the implementation plan (section 6) detailed to
-execution-readiness. Implementation and validation still deferred (no
-benchmark host available).
+execution-readiness; 2026-07-10 implemented with release-after-deliver
+permits, validation pending.
 
 Origin: an elivagar bug report against pbfhogg's 3-stage pipelined reader,
-cross-checked against the pbfhogg tree. The conclusion is that the pathology
-is real, is documented in our own source, and is still live in two of our own
-commands - so the fix is owed to pbfhogg independently of elivagar.
+cross-checked against the pbfhogg tree. The conclusion was that the pathology
+was real, documented in our own source, and live in two of our own commands
+before the 2026-07-10 implementation - so the fix was owed to pbfhogg
+independently of elivagar.
 
 Companion docs:
 
@@ -310,6 +311,20 @@ Details that are load-bearing:
   `decode_ahead` (~2x decode_ahead decoded blocks + window in flight);
   the stage-2 comment about `raw_rx` early-drop semantics stays valid.
 
+**Shipped design revises this plan.** The landed code
+(`src/read/pipeline.rs`) does not release the permit after `tx.send`
+returns, as sketched above. The `Permit` rides inside `DecodedItem`
+through the decoded channel and into the reorder buffer slot, and is
+dropped when `drain_decoded` pops the item out via `pop_ready` -
+release-after-*deliver*, not release-after-*send*. That makes the
+bound `admitted - delivered <= cap`, a hard cap on live decoded
+blocks rather than the ~2x-decode_ahead soft bound this section
+describes. The pseudocode and the "~2x `decode_ahead`" bullet above
+are kept as the historical record of the plan as scoped 2026-07-09;
+they do not describe what shipped. `run_pipeline`'s in-file doc
+comment and `ElementReader::decode_ahead`'s rustdoc use "at most
+`decode_ahead`" language accordingly.
+
 ### 6.3 `src/read/pipeline_metrics.rs`
 
 - New `decode_admit_wait_ns` - time the dispatcher spends blocked on
@@ -434,9 +449,10 @@ drained decode tasks. Same name, tighter guarantee. Update the doc comment on
 add a CHANGELOG entry (behaviour change at an existing surface: the pipelined
 reader now bounds decode-in-flight memory near `decode_ahead`).
 
-## 7. Validation plan (deferred - needs a bench host)
+## 7. Validation plan (implemented, pending - needs a bench host)
 
-Cannot run today. When a host is available:
+The code landed 2026-07-10 without running this plan; no benchmark host
+was available. Nothing below has run yet. When a host is available:
 
 - **No-regression bench** on the two filtered batched consumers, `getid` and
   `tags-filter` - these are the throughput-sensitive residual paths, and a hard
@@ -444,11 +460,13 @@ Cannot run today. When a host is available:
   could slow down. Compare wall before/after at denmark + europe.
 - **Memory win** on `time-filter` and `add-locations-to-ways` (sparse) at
   europe/japan: peak RSS and `pipeline_reorder_high_water` before/after. Expect
-  high-water to cap near `decode_ahead` and peak RSS to fall to working set.
+  high-water to cap at `decode_ahead` (the shipped design hard-caps filled
+  slots, per the 6.2 revision note above - not merely "near" it) and peak RSS
+  to fall to working set.
 - **Elivagar re-run**: they can re-run the NA locations bench from their side
   once a fix lands (against `into_blocks_pipelined`) and report peak RSS +
   high-water back. Expected: 21.5 GB -> ~6-8 GB (their other stocks), high-water
-  capped near `decode_ahead`.
+  capped at `decode_ahead`.
 - Record all numbers with commit hash + hostname per repo convention; they land
   in `.brokkr/results.db` automatically for the pbfhogg-side benches.
 
@@ -460,10 +478,12 @@ pool always has work). If cap 32 measurably hurts a fully-parallel consumer,
 knob honest rather than adding a new one, so the mitigation is to raise the
 default or let that one caller set it, not to redesign.
 
-## 8. Today's blocker
+## 8. Status
 
-No benchmark or verification host available on 2026-07-08. The analysis,
-option weighting, and decision are final; the code change is small and
-self-contained but must not be considered done until the section-7 benches run.
-Do not commit performance claims to markdown without the commit hash + hostname
-the convention requires.
+No benchmark or verification host was available through 2026-07-10. The
+analysis, option weighing, and decision were final before that date, and
+the implementation (section 6, revised per the 6.2 note above) has since
+landed in-tree. Section 7's validation plan has not run - do not consider
+this fix proven correct on wall-clock or memory grounds, and do not commit
+performance claims to markdown, until the section-7 benches run on a real
+host.

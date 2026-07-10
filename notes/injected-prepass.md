@@ -398,10 +398,13 @@ bounded loop (Option 3 there). Three touch points:
   on `BlobReader::new`, not only on `ElementReader`.
 - ALTW external is untouched by the backpressure fix (pread workers
   throughout), so the two work items do not interact on the 3% budget.
-- Both items are queued behind the same bench-host bottleneck. Land the
-  backpressure fix (Option 1) first: it changes memory behaviour on read
-  paths that Brick 2's gates would otherwise be measured on top of, and
-  two behaviour changes should not share a baseline.
+- Both items are queued behind the same bench-host bottleneck. The
+  backpressure fix (Option 1) implementation landed 2026-07-10, but its
+  validation benches have not run (no bench host yet - see
+  `pipelined-reader-decode-backpressure.md` sections 7-8). Brick 2's
+  gates still must wait until that lands as a commit and its verdict is
+  read: the two behaviour changes touch the same read paths and should
+  not share a baseline.
 
 ## 10. Lineage
 

@@ -11,7 +11,14 @@
 mod common;
 
 use std::io::SeekFrom;
+use std::io::{Cursor, Read};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::mpsc;
+use std::time::Duration;
+#[cfg(feature = "test-hooks")]
+use std::time::Instant;
 
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
 use pbfhogg::writer::{Compression, PbfWriter};
@@ -70,6 +77,80 @@ fn write_test_pbf(path: &Path) {
         .unwrap();
 
     writer.flush().unwrap();
+}
+
+/// Write a larger multi-block PBF to exercise tiny pipeline caps.
+fn write_many_block_pbf(path: &Path, node_blocks: usize) {
+    let file = std::fs::File::create(path).unwrap();
+    let mut writer = PbfWriter::new(file, Compression::default());
+
+    let header = block_builder::HeaderBuilder::new()
+        .bbox(9.0, 54.0, 13.0, 58.0)
+        .build()
+        .unwrap();
+    writer.write_header(&header).unwrap();
+
+    let mut bb = BlockBuilder::new();
+    let mut node_id = 100_i64;
+    for _ in 0..node_blocks {
+        for offset in 0..3 {
+            bb.add_node(
+                node_id,
+                550_000_000 + offset * 10_000,
+                120_000_000 + offset * 10_000,
+                [("name", "node")],
+                None,
+            );
+            node_id += 100;
+        }
+        writer
+            .write_primitive_block(bb.take().unwrap().unwrap())
+            .unwrap();
+    }
+
+    bb.add_way(1000, [("highway", "primary")], &[100, 200, 300], None);
+    bb.add_way(2000, [("building", "yes")], &[200, 300, 200], None);
+    writer
+        .write_primitive_block(bb.take().unwrap().unwrap())
+        .unwrap();
+
+    bb.add_relation(
+        5000,
+        [("type", "multipolygon")],
+        &[MemberData {
+            id: MemberId::Way(1000),
+            role: "outer",
+        }],
+        None,
+    );
+    writer
+        .write_primitive_block(bb.take().unwrap().unwrap())
+        .unwrap();
+
+    writer.flush().unwrap();
+}
+
+#[derive(Clone)]
+struct CountingRead {
+    inner: Cursor<Vec<u8>>,
+    bytes_read: Arc<AtomicUsize>,
+}
+
+impl CountingRead {
+    fn new(bytes: Vec<u8>, bytes_read: Arc<AtomicUsize>) -> Self {
+        Self {
+            inner: Cursor::new(bytes),
+            bytes_read,
+        }
+    }
+}
+
+impl Read for CountingRead {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.bytes_read.fetch_add(n, Relaxed);
+        Ok(n)
+    }
 }
 
 /// Extract (type_char, id) from an element.
@@ -153,6 +234,162 @@ fn block_iterator_early_drop() {
     let _first = blocks.next();
     drop(blocks);
     // If we get here without hanging, the test passes.
+}
+
+#[test]
+fn block_iterator_early_drop_under_pressure() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("many.osm.pbf");
+    write_many_block_pbf(&path, 64);
+
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let reader = ElementReader::from_path(&path)
+            .unwrap()
+            .read_ahead(1)
+            .decode_ahead(1);
+        let mut blocks = reader.into_blocks_pipelined();
+        let _first = blocks.next();
+        drop(blocks);
+        done_tx.send(()).unwrap();
+    });
+
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("pipeline did not stop after iterator drop");
+}
+
+#[test]
+fn block_fn_error_stops_pipeline() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("many.osm.pbf");
+    write_many_block_pbf(&path, 64);
+
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = ElementReader::from_path(&path)
+            .unwrap()
+            .read_ahead(1)
+            .decode_ahead(1)
+            .for_each_block_pipelined(|_| Err(std::io::Error::other("stop").into()));
+        done_tx.send(result.is_err()).unwrap();
+    });
+
+    assert!(
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("pipeline did not stop after block closure error")
+    );
+}
+
+#[test]
+fn pipelined_matches_sequential_tiny_caps() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("many.osm.pbf");
+    write_many_block_pbf(&path, 16);
+
+    let sequential = collect_sequential(&path);
+
+    let mut pipelined = Vec::new();
+    ElementReader::from_path(&path)
+        .unwrap()
+        .read_ahead(1)
+        .decode_ahead(1)
+        .for_each_pipelined(|element| {
+            pipelined.push(element_id(&element));
+        })
+        .unwrap();
+
+    assert_eq!(sequential, pipelined);
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn admission_high_water_bounded_under_slow_first_decode() {
+    use pbfhogg::read::pipeline_test_hooks::{
+        BLOCK_DECODE_SEQ, BLOCKED_DECODE_READY, RELEASE_BLOCKED_DECODE, REORDER_FILLED_HIGH_WATER,
+        reset,
+    };
+
+    reset();
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("many.osm.pbf");
+    write_many_block_pbf(&path, 16);
+
+    BLOCK_DECODE_SEQ.store(1, Relaxed);
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = ElementReader::from_path(&path)
+            .unwrap()
+            .read_ahead(1)
+            .decode_ahead(2)
+            .for_each_block_pipelined(|_| Ok(()));
+        done_tx.send(result).unwrap();
+    });
+
+    let start = Instant::now();
+    while !BLOCKED_DECODE_READY.load(Relaxed) {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "decode hook was not reached"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let start = Instant::now();
+    while REORDER_FILLED_HIGH_WATER.load(Relaxed) < 1 {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "later decode did not reach the reorder buffer"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    RELEASE_BLOCKED_DECODE.store(true, Relaxed);
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("pipeline did not finish after releasing decode hook")
+        .unwrap();
+
+    assert!(REORDER_FILLED_HIGH_WATER.load(Relaxed) <= 2);
+    reset();
+}
+
+#[test]
+fn early_exit_does_not_read_whole_file() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("many.osm.pbf");
+    write_many_block_pbf(&path, 256);
+    let bytes = std::fs::read(&path).unwrap();
+    let full_len = bytes.len();
+    let bytes_read = Arc::new(AtomicUsize::new(0));
+
+    // Dropping `PipelinedBlocks` joins the background pipeline thread, so a
+    // shutdown regression would hang here. Run it on a spawned thread and
+    // fail via `recv_timeout` rather than hanging the whole suite.
+    let reader_count = Arc::clone(&bytes_read);
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let reader = CountingRead::new(bytes, reader_count);
+        let reader = ElementReader::new(reader)
+            .unwrap()
+            .read_ahead(1)
+            .decode_ahead(1);
+        let mut blocks = reader.into_blocks_pipelined();
+        let _first = blocks.next();
+        drop(blocks);
+        done_tx.send(()).unwrap();
+    });
+
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("early-drop pipeline did not stop after iterator drop");
+
+    let read = bytes_read.load(Relaxed);
+    assert!(
+        read < full_len,
+        "early drop read the whole file: read {read}, full {full_len}"
+    );
 }
 
 /// block_type() correctly classifies each block in a sorted PBF.

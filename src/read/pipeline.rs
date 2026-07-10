@@ -11,10 +11,14 @@ use crate::error::Result;
 use crate::reorder_buffer::ReorderBuffer;
 use std::cell::RefCell;
 use std::io::Read;
-use std::sync::Arc;
-use std::sync::atomic::Ordering::Relaxed;
-use std::sync::mpsc::sync_channel;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Instant;
+
+type RawItem = (usize, crate::error::Result<crate::blob::Blob>);
+type DecodedPayload = Option<crate::error::Result<PrimitiveBlock>>;
+type DecodedItem = (usize, DecodedPayload, Option<Permit>);
 
 /// Returns `true` if the blob should be skipped based on the filter.
 ///
@@ -41,6 +45,101 @@ pub(crate) const DEFAULT_READ_AHEAD: usize = 16;
 /// Number of decoded blocks that can be in-flight before backpressure stalls decode.
 pub(crate) const DEFAULT_DECODE_AHEAD: usize = 32;
 
+/// Bounds decode items admitted but not yet delivered from the reorder buffer.
+///
+/// Single-acquirer invariant: only the one stage-2 dispatcher thread calls
+/// `acquire`. `release` can therefore use `notify_one`; adding a second
+/// acquirer requires changing this to `notify_all` or per-waiter wakeups.
+struct AdmissionGate {
+    count: Mutex<usize>,
+    cond: Condvar,
+    cap: usize,
+}
+
+impl AdmissionGate {
+    fn new(cap: usize) -> Self {
+        Self {
+            count: Mutex::new(0),
+            cond: Condvar::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    fn acquire(&self) -> bool {
+        let mut count = self.count.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut blocked = false;
+        while *count >= self.cap {
+            blocked = true;
+            count = self
+                .cond
+                .wait(count)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        *count += 1;
+        blocked
+    }
+
+    fn release(&self) {
+        let mut count = self.count.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(*count > 0, "decode admission permit released below zero");
+        *count -= 1;
+        drop(count);
+        self.cond.notify_one();
+    }
+}
+
+struct Permit(Arc<AdmissionGate>);
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+pub(crate) mod test_hooks {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+
+    pub static BLOCK_DECODE_SEQ: AtomicUsize = AtomicUsize::new(usize::MAX);
+    pub static BLOCKED_DECODE_READY: AtomicBool = AtomicBool::new(false);
+    pub static RELEASE_BLOCKED_DECODE: AtomicBool = AtomicBool::new(false);
+    pub static REORDER_FILLED_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
+    pub static REORDER_WINDOW_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn reset() {
+        BLOCK_DECODE_SEQ.store(usize::MAX, Relaxed);
+        BLOCKED_DECODE_READY.store(false, Relaxed);
+        RELEASE_BLOCKED_DECODE.store(false, Relaxed);
+        REORDER_FILLED_HIGH_WATER.store(0, Relaxed);
+        REORDER_WINDOW_HIGH_WATER.store(0, Relaxed);
+    }
+
+    pub(crate) fn maybe_block_decode(seq: usize) {
+        if BLOCK_DECODE_SEQ.load(Relaxed) != seq {
+            return;
+        }
+        BLOCKED_DECODE_READY.store(true, Relaxed);
+        while !RELEASE_BLOCKED_DECODE.load(Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    pub(crate) fn record_reorder_levels(filled: usize, window: usize) {
+        cas_max_usize(&REORDER_FILLED_HIGH_WATER, filled);
+        cas_max_usize(&REORDER_WINDOW_HIGH_WATER, window);
+    }
+
+    fn cas_max_usize(field: &AtomicUsize, candidate: usize) {
+        let mut current = field.load(Relaxed);
+        while candidate > current {
+            match field.compare_exchange_weak(current, candidate, Relaxed, Relaxed) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
 /// Runtime-tunable pipeline buffering configuration.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PipelineConfig {
@@ -55,6 +154,137 @@ impl Default for PipelineConfig {
             decode_ahead: DEFAULT_DECODE_AHEAD,
         }
     }
+}
+
+fn send_direct_error(tx: &SyncSender<DecodedItem>, seq: usize, e: crate::error::Error) -> bool {
+    let t_send = Instant::now();
+    let sent = tx.send((seq, Some(Err(e)), None)).is_ok();
+    PIPELINE_METRICS
+        .decoded_send_wait_ns
+        .fetch_add(elapsed_ns_u64(t_send), Relaxed);
+    sent
+}
+
+struct DecodeTask {
+    seq: usize,
+    blob: crate::blob::Blob,
+    tx: SyncSender<DecodedItem>,
+    buffer_pool: Arc<DecompressPool>,
+    blob_filter: Option<Arc<BlobFilter>>,
+    permit: Permit,
+    shutdown: Arc<AtomicBool>,
+}
+
+fn spawn_decode_task(decode_pool: &rayon::ThreadPool, task: DecodeTask) {
+    let DecodeTask {
+        seq,
+        blob,
+        tx,
+        buffer_pool,
+        blob_filter,
+        permit,
+        shutdown,
+    } = task;
+    decode_pool.spawn(move || {
+        #[cfg(feature = "test-hooks")]
+        test_hooks::maybe_block_decode(seq);
+
+        // Thread-local scratch buffers for parse_and_inline. Avoids allocating
+        // fresh Vec<(u32, u32)> per blob.
+        thread_local! {
+            static ST_SCRATCH: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
+            static GR_SCRATCH: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
+        }
+        let item =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match blob.get_type() {
+                BlobType::OsmData => {
+                    if let Some(ref filter) = blob_filter
+                        && should_skip_blob(filter, &blob)
+                    {
+                        PIPELINE_METRICS
+                            .blobs_skipped_by_filter
+                            .fetch_add(1, Relaxed);
+                        return None;
+                    }
+                    ST_SCRATCH.with_borrow_mut(|st| {
+                        GR_SCRATCH.with_borrow_mut(|gr| {
+                            let result =
+                                blob.to_primitiveblock_inline_with_scratch(&buffer_pool, st, gr);
+                            // Per-thread scratch retention is the iter-5 residual
+                            // alloc bucket. Record current capacity in (u32, u32)
+                            // pairs * 8 bytes for the global peak.
+                            PIPELINE_METRICS.record_scratch_capacity(
+                                st.capacity().saturating_mul(8),
+                                gr.capacity().saturating_mul(8),
+                            );
+                            Some(result)
+                        })
+                    })
+                }
+                _ => None,
+            }));
+        let item = match item {
+            Ok(item) => item,
+            Err(_) => Some(Err(crate::error::new_error(crate::error::ErrorKind::Io(
+                std::io::Error::other("decode task panicked"),
+            )))),
+        };
+        let t_send = Instant::now();
+        if tx.send((seq, item, Some(permit))).is_err() {
+            shutdown.store(true, Relaxed);
+        }
+        PIPELINE_METRICS
+            .decoded_send_wait_ns
+            .fetch_add(elapsed_ns_u64(t_send), Relaxed);
+    });
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn drain_decoded<F>(
+    decoded_rx: Receiver<DecodedItem>,
+    decode_ahead: usize,
+    block_fn: &mut F,
+) -> Result<()>
+where
+    F: FnMut(PrimitiveBlock) -> Result<()>,
+{
+    // Normal completion: the dispatcher drops its sender after raw EOF, task
+    // clones finish, and recv returns Err once the last sender is gone.
+    //
+    // Early exit: returning from this helper drops `decoded_rx` before scoped
+    // threads join. Blocked senders then fail, set shutdown, release permits,
+    // wake the dispatcher, and let stage 1 stop at the raw channel.
+    let mut pending: ReorderBuffer<(DecodedPayload, Option<Permit>)> =
+        ReorderBuffer::with_capacity(decode_ahead);
+
+    loop {
+        let t_recv = Instant::now();
+        let next = decoded_rx.recv();
+        PIPELINE_METRICS
+            .decoded_recv_wait_ns
+            .fetch_add(elapsed_ns_u64(t_recv), Relaxed);
+        let (seq, item, permit) = match next {
+            Ok(pair) => pair,
+            Err(_) => break,
+        };
+        pending.push(seq, (item, permit));
+        PIPELINE_METRICS.record_reorder_levels(pending.filled_len(), pending.pending_len());
+        #[cfg(feature = "test-hooks")]
+        test_hooks::record_reorder_levels(pending.filled_len(), pending.pending_len());
+
+        while let Some((item, permit)) = pending.pop_ready() {
+            match item {
+                Some(Ok(block)) => {
+                    let result = block_fn(block);
+                    drop(permit);
+                    result?;
+                }
+                Some(Err(e)) => return Err(e),
+                None => drop(permit),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Runs a three-stage pipeline over a PBF file:
@@ -87,6 +317,13 @@ impl Default for PipelineConfig {
 /// - **Batch-based consumers** (e.g., `for_each_primitive_block_batch` with
 ///   `par_iter`) are partially mitigated because the batch processes blocks
 ///   on the consumer's rayon pool, reducing the cross-thread window.
+///
+/// Decode admission is bounded by `decode_ahead`: at most `decode_ahead`
+/// decode tasks are admitted but not yet delivered from the reorder buffer.
+/// The permit rides with decoded items through the channel and any reorder
+/// slot, so completion skew cannot grow decoded-block memory with file size.
+/// Backpressure from a slow consumer propagates through the decoded channel
+/// to the admission gate, then to the raw channel and stage 1.
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]
@@ -101,9 +338,6 @@ where
     R: Read + Send,
     F: FnMut(PrimitiveBlock) -> Result<()>,
 {
-    type RawItem = (usize, crate::error::Result<crate::blob::Blob>);
-    type DecodedItem = (usize, Option<crate::error::Result<PrimitiveBlock>>);
-
     // Enable tagdata parsing only when the filter needs tag key matching.
     // Enable indexdata parsing only when any filter is active (should_skip_blob
     // checks blob.index() for type + spatial filtering).
@@ -175,77 +409,46 @@ where
                     let err = crate::error::new_error(crate::error::ErrorKind::Io(
                         std::io::Error::other(format!("failed to build decode pool: {e}")),
                     ));
-                    drop(dispatch_tx.send((0, Some(Err(err)))));
+                    drop(dispatch_tx.send((0, Some(Err(err)), None)));
                     return;
                 }
             };
             let buffer_pool = DecompressPool::new();
+            let gate = Arc::new(AdmissionGate::new(pipeline_config.decode_ahead));
+            let shutdown = Arc::new(AtomicBool::new(false));
             for (seq, blob_result) in raw_rx {
-                let tx = dispatch_tx.clone();
-                let bp = Arc::clone(&buffer_pool);
+                if shutdown.load(Relaxed) {
+                    break;
+                }
                 match blob_result {
                     Ok(blob) => {
-                        let bf = blob_filter.clone();
+                        let t_admit = Instant::now();
+                        let blocked = gate.acquire();
+                        PIPELINE_METRICS
+                            .decode_admit_wait_ns
+                            .fetch_add(elapsed_ns_u64(t_admit), Relaxed);
+                        if blocked {
+                            PIPELINE_METRICS.decode_admit_blocked.fetch_add(1, Relaxed);
+                        }
+                        let permit = Permit(Arc::clone(&gate));
                         PIPELINE_METRICS.decode_tasks.fetch_add(1, Relaxed);
-                        decode_pool.spawn(move || {
-                            // Thread-local scratch buffers for parse_and_inline.
-                            // Avoids allocating fresh Vec<(u32, u32)> per blob.
-                            thread_local! {
-                                static ST_SCRATCH: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
-                                static GR_SCRATCH: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
-                            }
-                            let item = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                match blob.get_type() {
-                                    BlobType::OsmData => {
-                                        if let Some(ref filter) = bf
-                                            && should_skip_blob(filter, &blob)
-                                        {
-                                            PIPELINE_METRICS
-                                                .blobs_skipped_by_filter
-                                                .fetch_add(1, Relaxed);
-                                            return None;
-                                        }
-                                        ST_SCRATCH.with_borrow_mut(|st| {
-                                            GR_SCRATCH.with_borrow_mut(|gr| {
-                                                let result = blob
-                                                    .to_primitiveblock_inline_with_scratch(&bp, st, gr);
-                                                // Per-thread scratch retention is the iter-5
-                                                // residual alloc bucket (4.4 GB / 70 % at Japan).
-                                                // Record current capacity in (u32, u32) pairs *
-                                                // 8 bytes for the global peak.
-                                                PIPELINE_METRICS.record_scratch_capacity(
-                                                    st.capacity().saturating_mul(8),
-                                                    gr.capacity().saturating_mul(8),
-                                                );
-                                                Some(result)
-                                            })
-                                        })
-                                    }
-                                    _ => None,
-                                }
-                            }));
-                            let item = match item {
-                                Ok(item) => item,
-                                Err(_) => Some(Err(crate::error::new_error(
-                                    crate::error::ErrorKind::Io(
-                                        std::io::Error::other("decode task panicked"),
-                                    ),
-                                ))),
-                            };
-                            let t_send = Instant::now();
-                            drop(tx.send((seq, item)));
-                            PIPELINE_METRICS
-                                .decoded_send_wait_ns
-                                .fetch_add(elapsed_ns_u64(t_send), Relaxed);
-                        });
+                        spawn_decode_task(
+                            &decode_pool,
+                            DecodeTask {
+                                seq,
+                                blob,
+                                tx: dispatch_tx.clone(),
+                                buffer_pool: Arc::clone(&buffer_pool),
+                                blob_filter: blob_filter.clone(),
+                                permit,
+                                shutdown: Arc::clone(&shutdown),
+                            },
+                        );
                     }
                     Err(e) => {
-                        // Forward I/O error directly to main thread
-                        let t_send = Instant::now();
-                        drop(tx.send((seq, Some(Err(e)))));
-                        PIPELINE_METRICS
-                            .decoded_send_wait_ns
-                            .fetch_add(elapsed_ns_u64(t_send), Relaxed);
+                        if !send_direct_error(&dispatch_tx, seq, e) {
+                            break;
+                        }
                     }
                 }
             }
@@ -255,49 +458,7 @@ where
         // Drop the original so the channel closes when all rayon task clones are done
         drop(decoded_tx);
 
-        // Stage 3: Reorder buffer on main thread - deliver blocks in file order.
-        //
-        // Reorder by sequence number and emit only contiguous ready items.
-        // The underlying storage is VecDeque-based and bounded by decode_ahead.
-        //
-        // Each slot is `Option<Option<Result<PrimitiveBlock>>>`:
-        //   - Outer `None`  → slot not yet filled (decode still in progress)
-        //   - `Some(None)`  → slot filled, but blob was a header/unknown (skip)
-        //   - `Some(Some(Ok(block)))` → decoded data block ready to deliver
-        //   - `Some(Some(Err(e)))` → decode or I/O error to propagate
-        let mut pending: ReorderBuffer<Option<Result<PrimitiveBlock>>> =
-            ReorderBuffer::with_capacity(pipeline_config.decode_ahead);
-
-        // Use explicit recv() instead of `for ... in decoded_rx` so we
-        // can attribute time spent waiting on stage 2. Iterator desugaring
-        // would hide the recv inside the loop scaffolding and prevent
-        // wrapping it with the timer.
-        let result: Result<()> = (|| {
-            loop {
-                let t_recv = Instant::now();
-                let next = decoded_rx.recv();
-                PIPELINE_METRICS
-                    .decoded_recv_wait_ns
-                    .fetch_add(elapsed_ns_u64(t_recv), Relaxed);
-                let (seq, item) = match next {
-                    Ok(pair) => pair,
-                    Err(_) => break, // all senders dropped, drain finished
-                };
-                pending.push(seq, item);
-                PIPELINE_METRICS.record_reorder_high_water(pending.pending_len());
-
-                while let Some(item) = pending.pop_ready() {
-                    match item {
-                        Some(Ok(block)) => {
-                            block_fn(block)?;
-                        }
-                        Some(Err(e)) => return Err(e),
-                        None => {} // header or unknown blob - skip
-                    }
-                }
-            }
-            Ok(())
-        })();
+        let result = drain_decoded(decoded_rx, pipeline_config.decode_ahead, &mut block_fn);
 
         // Emit reader-pipeline counters before returning so that even
         // an error path produces sidecar data. Mirrors the writer's
@@ -305,4 +466,50 @@ where
         PIPELINE_METRICS.emit();
         result
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn gate_blocks_at_cap_and_release_unblocks() {
+        let gate = Arc::new(AdmissionGate::new(2));
+        assert!(!gate.acquire());
+        assert!(!gate.acquire());
+
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let child_gate = Arc::clone(&gate);
+        let handle = std::thread::spawn(move || {
+            ready_tx.send(()).expect("ready channel open");
+            let blocked = child_gate.acquire();
+            done_tx.send(blocked).expect("done channel open");
+        });
+
+        ready_rx.recv().expect("child reached acquire");
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        gate.release();
+        match done_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(blocked) => assert!(blocked),
+            Err(e) => panic!("child did not acquire after release: {e}"),
+        }
+        if let Err(e) = handle.join() {
+            panic!("child panicked: {e:?}");
+        }
+    }
+
+    #[test]
+    fn permit_drop_releases() {
+        let gate = Arc::new(AdmissionGate::new(1));
+        {
+            assert!(!gate.acquire());
+            let _permit = Permit(Arc::clone(&gate));
+        }
+        assert!(!gate.acquire());
+        gate.release();
+    }
 }

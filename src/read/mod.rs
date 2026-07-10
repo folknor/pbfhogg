@@ -15,3 +15,11 @@ pub(crate) mod pipeline_metrics;
 pub(crate) mod raw_frame;
 pub mod reader;
 pub(crate) mod wire;
+
+#[cfg(feature = "test-hooks")]
+pub mod pipeline_test_hooks {
+    pub use super::pipeline::test_hooks::{
+        BLOCK_DECODE_SEQ, BLOCKED_DECODE_READY, RELEASE_BLOCKED_DECODE, REORDER_FILLED_HIGH_WATER,
+        REORDER_WINDOW_HIGH_WATER, reset,
+    };
+}

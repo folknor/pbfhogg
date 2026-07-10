@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 /// next contiguous ready item from the front.
 pub(crate) struct ReorderBuffer<T> {
     next_seq: usize,
+    filled: usize,
     pending: VecDeque<Option<T>>,
 }
 
@@ -13,6 +14,7 @@ impl<T> ReorderBuffer<T> {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             next_seq: 0,
+            filled: 0,
             pending: VecDeque::with_capacity(capacity),
         }
     }
@@ -41,6 +43,7 @@ impl<T> ReorderBuffer<T> {
             "duplicate sequence number: {seq}"
         );
         self.pending[slot_idx] = Some(item);
+        self.filled += 1;
     }
 
     /// Pop the next contiguous ready item, if available.
@@ -50,9 +53,14 @@ impl<T> ReorderBuffer<T> {
         }
         let item = self.pending.pop_front().and_then(|x| x);
         if item.is_some() {
+            self.filled -= 1;
             self.next_seq += 1;
         }
         item
+    }
+
+    pub(crate) fn filled_len(&self) -> usize {
+        self.filled
     }
 
     pub(crate) fn pending_len(&self) -> usize {
@@ -125,5 +133,25 @@ mod tests {
         assert_eq!(rb.pop_ready(), Some("y"));
         assert_eq!(rb.pop_ready(), Some("z"));
         assert_eq!(rb.pop_ready(), None);
+    }
+
+    #[test]
+    fn filled_diverges_from_window_across_gap() {
+        let mut rb = ReorderBuffer::with_capacity(4);
+
+        rb.push(0, "x");
+        rb.push(2, "z");
+        assert_eq!(rb.filled_len(), 2);
+        assert_eq!(rb.pending_len(), 3);
+
+        assert_eq!(rb.pop_ready(), Some("x"));
+        assert_eq!(rb.filled_len(), 1);
+        assert_eq!(rb.pending_len(), 2);
+
+        rb.push(1, "y");
+        assert_eq!(rb.pop_ready(), Some("y"));
+        assert_eq!(rb.pop_ready(), Some("z"));
+        assert_eq!(rb.filled_len(), 0);
+        assert_eq!(rb.pending_len(), 0);
     }
 }

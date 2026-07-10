@@ -26,7 +26,7 @@ from codex_common import run_codex
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Spec-loop implement role (codex gpt-5.5, /goal-driven)."
+        description="Spec-loop implement role (codex gpt-5.6-terra, /goal-driven)."
     )
     parser.add_argument(
         "--effort",
@@ -36,8 +36,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--model",
-        default="gpt-5.5",
-        help="codex model (default: gpt-5.5)",
+        default="gpt-5.6-terra",
+        help="codex model (default: gpt-5.6-terra)",
     )
     parser.add_argument(
         "prompt",

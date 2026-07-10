@@ -31,7 +31,7 @@ background, one Bash call, nothing before or after it:
 
 - Critique: `python3 scripts/codex-review.py '<prompt>'` (gpt-5.6-sol at
   xhigh).
-- Implement: `python3 scripts/codex-implement.py '<prompt>'` (gpt-5.5 at
+- Implement: `python3 scripts/codex-implement.py '<prompt>'` (gpt-5.6-terra at
   medium; the script adds the `/goal` prefix).
 
 The single argument is the prompt: one line, no linebreaks, plain ascii, no
@@ -40,7 +40,7 @@ Each script sets the role's defaults - the model, the reasoning effort, the
 workspace-write sandbox, and `/goal` - so the caller normally owns only the
 prompt. Two defaults are overridable when a step explicitly calls for it:
 `--model <name>` on either script (defaults: review gpt-5.6-sol, implement
-gpt-5.5), and `--effort <low|medium|high|xhigh>` on codex-implement.py
+gpt-5.6-terra), and `--effort <low|medium|high|xhigh>` on codex-implement.py
 (default medium; e.g. `--effort xhigh` to staff a hard landing at a stronger
 implementer tier). codex-review.py is fixed at xhigh; the sandbox and `/goal`
 are not overridable. The canonical default model lives in one place,

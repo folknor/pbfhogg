@@ -8,6 +8,40 @@ use quick_xml::events::{BytesEnd, BytesStart, Event};
 
 use crate::MemberId;
 
+/// Push an attribute whose value is OSM user data (tag key/value, member
+/// role, user name) and may therefore contain control characters.
+///
+/// XML 1.0 attribute-value normalization (spec section 3.3.3) replaces raw
+/// tab, newline, and carriage-return characters in attribute values with
+/// spaces at parse time, so a literal newline inside e.g. a multi-line
+/// `inscription` tag value does not survive a write -> parse roundtrip -
+/// the applied result silently has spaces where the source had newlines.
+/// Character references (`&#10;` etc.) are the only spec-conforming way to
+/// preserve them; osmium's OSC writer does the same (`&#xA;`).
+/// quick-xml's tuple `push_attribute` escapes only `< > & " '`, so the
+/// control characters must be pre-escaped here and pushed as an
+/// already-escaped `Attribute`.
+fn push_attribute_escaped<'a>(elem: &mut BytesStart<'a>, key: &'a str, value: &str) {
+    if value.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'\t')) {
+        let escaped = quick_xml::escape::escape(value);
+        let mut out = String::with_capacity(escaped.len() + 8);
+        for ch in escaped.chars() {
+            match ch {
+                '\n' => out.push_str("&#10;"),
+                '\r' => out.push_str("&#13;"),
+                '\t' => out.push_str("&#9;"),
+                _ => out.push(ch),
+            }
+        }
+        elem.push_attribute(quick_xml::events::attributes::Attribute {
+            key: quick_xml::name::QName(key.as_bytes()),
+            value: std::borrow::Cow::Owned(out.into_bytes()),
+        });
+    } else {
+        elem.push_attribute((key, value));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Owned element types - Vec fields are not converted to Box<[T]> because these
 // are low-volume types (derive_changes/diff output), not hot-path allocations.
@@ -48,7 +82,7 @@ impl OwnedMetadata {
             elem.push_attribute(("uid", self.uid.as_str()));
         }
         if !self.user.is_empty() {
-            elem.push_attribute(("user", self.user.as_str()));
+            push_attribute_escaped(elem, "user", self.user.as_str());
         }
         if !self.visible.is_empty() {
             elem.push_attribute(("visible", self.visible.as_str()));
@@ -218,7 +252,7 @@ pub(crate) fn write_relation_xml<W: std::io::Write>(
             let member_id = m.id.id().to_string();
             member.push_attribute(("type", type_str));
             member.push_attribute(("ref", member_id.as_str()));
-            member.push_attribute(("role", m.role.as_str()));
+            push_attribute_escaped(&mut member, "role", m.role.as_str());
             writer.write_event(Event::Empty(member))?;
         }
         write_tags_xml(writer, &rel.tags)?;
@@ -250,8 +284,8 @@ pub(crate) fn write_tags_xml<W: std::io::Write>(
 ) -> crate::BoxResult<()> {
     for (k, v) in tags {
         let mut tag = BytesStart::new("tag");
-        tag.push_attribute(("k", k.as_str()));
-        tag.push_attribute(("v", v.as_str()));
+        push_attribute_escaped(&mut tag, "k", k.as_str());
+        push_attribute_escaped(&mut tag, "v", v.as_str());
         writer.write_event(Event::Empty(tag))?;
     }
     Ok(())
@@ -263,8 +297,8 @@ fn write_borrowed_tags_xml<'a, W: std::io::Write>(
 ) -> crate::BoxResult<()> {
     for (k, v) in tags {
         let mut tag = BytesStart::new("tag");
-        tag.push_attribute(("k", k));
-        tag.push_attribute(("v", v));
+        push_attribute_escaped(&mut tag, "k", k);
+        push_attribute_escaped(&mut tag, "v", v);
         writer.write_event(Event::Empty(tag))?;
     }
     Ok(())
@@ -410,11 +444,125 @@ fn write_borrowed_relation_xml<W: std::io::Write>(
             let member_id = m.id.id().to_string();
             member.push_attribute(("type", type_str));
             member.push_attribute(("ref", member_id.as_str()));
-            member.push_attribute(("role", m.role().unwrap_or("")));
+            push_attribute_escaped(&mut member, "role", m.role().unwrap_or(""));
             writer.write_event(Event::Empty(member))?;
         }
         write_borrowed_tags_xml(writer, tags)?;
         writer.write_event(Event::End(BytesEnd::new("relation")))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::osc::parse::parse_osc_file;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::fs::File;
+    use std::io::Write as IoWrite;
+    use std::path::{Path, PathBuf};
+
+    fn make_test_dir(suffix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pbfhogg_osc_write_test_{suffix}"));
+        drop(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    fn write_osc_gz(dir: &Path, filename: &str, xml: &[u8]) -> crate::BoxResult<PathBuf> {
+        let path = dir.join(filename);
+        let file = File::create(&path)?;
+        let mut enc = GzEncoder::new(file, Compression::fast());
+        enc.write_all(xml)?;
+        enc.finish()?;
+        Ok(path)
+    }
+
+    /// Control characters in tag values must survive an OSC write -> parse
+    /// roundtrip. XML attribute-value normalization turns RAW tab/newline/CR
+    /// into spaces at parse time, so the writer must emit them as character
+    /// references. Regression test for the 2026-07-10 finding where applying
+    /// a derived OSC turned multi-line `inscription` values into
+    /// space-separated ones.
+    #[test]
+    fn control_chars_in_tag_values_roundtrip() -> crate::BoxResult<()> {
+        let value = "MINDESTEN\n1864 -1920\ttabbed\rcr &<>\"' end";
+        let node = OwnedNode {
+            id: 100,
+            decimicro_lat: 551_989_605,
+            decimicro_lon: 92_041_876,
+            tags: vec![("inscription".to_string(), value.to_string())],
+            metadata: None,
+        };
+
+        let mut writer = Writer::new(Vec::new());
+        writer.write_event(Event::Start(BytesStart::new("osmChange")))?;
+        writer.write_event(Event::Start(BytesStart::new("modify")))?;
+        write_node_xml(&mut writer, &node)?;
+        writer.write_event(Event::End(BytesEnd::new("modify")))?;
+        writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
+        let xml = writer.into_inner();
+
+        // Writer-side mechanism: the emitted document must carry character
+        // references and no raw control bytes (the Writer emits no
+        // indentation, so any raw control byte would be inside an attribute).
+        let xml_str = std::str::from_utf8(&xml)?;
+        assert!(xml_str.contains("&#10;"), "newline not escaped: {xml_str}");
+        assert!(xml_str.contains("&#9;"), "tab not escaped: {xml_str}");
+        assert!(xml_str.contains("&#13;"), "CR not escaped: {xml_str}");
+        assert!(!xml_str.contains('\n'), "raw newline in output: {xml_str}");
+        assert!(!xml_str.contains('\t'), "raw tab in output: {xml_str}");
+        assert!(!xml_str.contains('\r'), "raw CR in output: {xml_str}");
+
+        // Parse-side roundtrip: the value comes back byte-identical.
+        let dir = make_test_dir("tag_values");
+        let path = write_osc_gz(&dir, "roundtrip.osc.gz", &xml)?;
+        let overlay = parse_osc_file(&path)?;
+        let parsed = overlay.get_node(100).ok_or("node 100 missing")?;
+        let tags: Vec<(&str, &str)> = parsed.tags().collect();
+        assert_eq!(tags, vec![("inscription", value)]);
+
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// Same guarantee for relation member roles (the other user-data
+    /// attribute), via the owned-relation writer.
+    #[test]
+    fn control_chars_in_member_roles_roundtrip() -> crate::BoxResult<()> {
+        let role = "outer\nline2";
+        let rel = OwnedRelation {
+            id: 200,
+            tags: Vec::new(),
+            members: vec![OwnedMember {
+                id: MemberId::Way(42),
+                role: role.to_string(),
+            }],
+            metadata: None,
+        };
+
+        let mut writer = Writer::new(Vec::new());
+        writer.write_event(Event::Start(BytesStart::new("osmChange")))?;
+        writer.write_event(Event::Start(BytesStart::new("create")))?;
+        write_relation_xml(&mut writer, &rel)?;
+        writer.write_event(Event::End(BytesEnd::new("create")))?;
+        writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
+        let xml = writer.into_inner();
+
+        let xml_str = std::str::from_utf8(&xml)?;
+        assert!(xml_str.contains("&#10;"), "newline not escaped: {xml_str}");
+        assert!(!xml_str.contains('\n'), "raw newline in output: {xml_str}");
+
+        let dir = make_test_dir("member_roles");
+        let path = write_osc_gz(&dir, "roundtrip.osc.gz", &xml)?;
+        let overlay = parse_osc_file(&path)?;
+        let parsed = overlay.get_relation(200).ok_or("relation 200 missing")?;
+        let members: Vec<_> = parsed.members().collect();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].2, role);
+
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
 }

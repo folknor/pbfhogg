@@ -68,7 +68,13 @@ from two PBFs. In Denmark cross-validation, osmium's OSC is missing 1243 deletes
 that are present in the original diff.
 
 **pbfhogg behavior:** `diff --format osc` produces a perfect roundtrip - applying
-the derived OSC to the old PBF reproduces the new PBF exactly.
+the derived OSC to the old PBF reproduces the new PBF exactly. Caveat
+(2026-07-10): "exactly" currently holds under content comparison
+(coordinates, tags, refs, members) but not under metadata-strict
+comparison - apply-changes does not yet carry element metadata from OSC
+input (see TODO.md "apply-changes drops OSC element metadata"), so both
+the roundtrip and the reference `new` lose version/timestamp on
+OSC-sourced elements symmetrically.
 
 **Rationale:** Not a design choice - osmium simply cannot represent certain deletes
 when the deleted element is absent from both input files. pbfhogg's content-equality

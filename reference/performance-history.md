@@ -495,6 +495,54 @@ stage 3 `100.2s → 85.7s` (−14%), finalize/router `46.4s → 1.4s` (−97%,
 all of #8), relation scan down to 6.0s (#9 L1), stage 4 `231.6s →
 215.6s` (−7%).
 
+### Pipelined-reader decode-admission bound (`a0a2e3b`, 2026-07-10, plantasjen)
+
+The 3-stage pipelined reader's stage-2 dispatcher used to `rayon::spawn`
+per blob without backpressure, and the reorder buffer admitted far-ahead
+blocks unboundedly - so decoded-block memory grew with file size, not
+with the nominal `read_ahead`/`decode_ahead` caps (elivagar measured a
+reorder high-water of 660 and a 21.5 GB RSS peak on a 19 GB North
+America run; the same unfiltered-full-scan shape was live in pbfhogg's
+own `time-filter` and `altw` sparse residual paths). Fix: an
+`AdmissionGate` with release-after-deliver permits - a permit rides each
+decoded item through the channel and reorder slot, so
+`admitted - delivered <= decode_ahead` is a hard cap on live decoded
+blocks. Landed `a0a2e3b`; validated same day, all gates kept:
+
+| Gate | V0 (`86a03f2`) | V1 (`a0a2e3b`) | Bound | Result |
+|------|---------------:|---------------:|-------|--------|
+| read japan pipelined | 7.78 s | 7.48 s | <= x1.03 | PASS (−3.9%) |
+| read europe pipelined | 110.2 s | 95.9 s | <= x1.05 | PASS (−13%) |
+| getid europe `--add-referenced` | ~73 s | 74.3 s | <= x1.03 | PASS (+1.8%) |
+| tags-filter europe `-R` | 19.59 s | 19.8 s | <= x1.03 | PASS (+1.1%) |
+| memory: reorder filled high-water | unbounded (660 observed) | 32 | <= 64 | PASS |
+| backpressure engaged | - | `decode_admit_blocked=10216` | > 0 | PASS |
+| denmark smokes | fast | fast | no blowup | PASS |
+
+Provenance: V1 rows are in `results.db` at `a0a2e3b` (japan read
+`ba5e1f0a`, europe read `7f35648f`, getid `cc846f0c`, tags-filter
+`4241316a`); V0 *read* baselines were captured post-hoc via
+`brokkr read --commit 86a03f2` (japan `3285d2af`, europe `e3c62000`).
+The V0 getid/tags-filter numbers were never stored as DB rows - they
+survive only in the validation-session log and orphaned sidecar
+artifacts, so treat those two baselines as approximate.
+
+Counter-semantics change that rides along: `pipeline_reorder_high_water`
+now counts FILLED reorder slots (the memory diagnostic); the old
+window-length meaning (the completion-skew diagnostic) moved to
+`pipeline_reorder_window_high_water`. Cross-run comparisons against
+pre-`a0a2e3b` UUIDs (e.g. the 660) must use the window column. New
+counters `pipeline_decode_admit_wait_ns` / `pipeline_decode_admit_blocked`
+capture the read backpressure that `raw_send_wait_ns` structurally never
+saw (stage 2 never let the raw channel fill).
+
+Deliberately deferred alternative: exporting the
+`scan::classify::parallel_classify_phase` machinery as `pub` API (so
+external consumers could adopt the bounded-by-construction pread-worker
+shape) was weighed and postponed - the classify surface is still moving
+in-tree, and `pub` is a hard-to-walk-back contract. Revisit only if
+elivagar proves classify is its long-term primary read path.
+
 ---
 
 ## build-geocode-index
@@ -651,3 +699,7 @@ commit messages and PR descriptions.
 - `notes/scan-optimization-audit.md` (Tier 1 items landed; dense node
   index Pattern 2, O(1) `check_sorted_and_indexed`/`has_indexdata`
   probes, and unsorted extract paths remain intentional non-goals).
+- `notes/pipelined-reader-decode-backpressure.md` (admission gate landed
+  `a0a2e3b`, validated same day; findings in "Pipelined-reader
+  decode-admission bound" above; root cause + bound semantics live in
+  `run_pipeline`'s doc comment and `pipeline_metrics.rs`).

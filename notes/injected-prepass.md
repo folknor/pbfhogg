@@ -19,8 +19,11 @@ Companion docs:
   measured lessons this note's risk analysis leans on.
 - [../reference/blob-density.md](../reference/blob-density.md) - element
   density figures used for the field-5 size policy.
-- [pipelined-reader-decode-backpressure.md](pipelined-reader-decode-backpressure.md) -
-  the elivagar read-loop context; consistency notes in section 9.
+- `reference/performance-history.md` "Pipelined-reader decode-admission
+  bound" - the landed elivagar-reported backpressure fix (`a0a2e3b`);
+  consistency notes in section 9. (The plan doc
+  `notes/pipelined-reader-decode-backpressure.md` was retired after
+  validation.)
 
 ## 1. What elivagar re-derives today, and why it moves here
 
@@ -388,9 +391,12 @@ output) belongs in Brick 2.
 
 ## 9. Consistency with the decode-backpressure work
 
-[pipelined-reader-decode-backpressure.md](pipelined-reader-decode-backpressure.md)
-records that elivagar's locations path reads via its own BlobReader-based
-bounded loop (Option 3 there). Three touch points:
+The decode-backpressure fix (elivagar-reported; pipelined-reader
+admission gate) landed and was validated 2026-07-10 at commit `a0a2e3b`
+- all gates kept; the full record is in
+`reference/performance-history.md` "Pipelined-reader decode-admission
+bound". elivagar's locations path reads via its own BlobReader-based
+bounded loop (Option 3 of that decision). Three touch points:
 
 - The contract's field-5 enforcement point on the elivagar side ("the
   decode worker, right where it calls `blob.way_members()`") lives inside
@@ -398,13 +404,10 @@ bounded loop (Option 3 there). Three touch points:
   on `BlobReader::new`, not only on `ElementReader`.
 - ALTW external is untouched by the backpressure fix (pread workers
   throughout), so the two work items do not interact on the 3% budget.
-- Both items are queued behind the same bench-host bottleneck. The
-  backpressure fix (Option 1) implementation landed 2026-07-10, but its
-  validation benches have not run (no bench host yet - see
-  `pipelined-reader-decode-backpressure.md` sections 7-8). Brick 2's
-  gates still must wait until that lands as a commit and its verdict is
-  read: the two behaviour changes touch the same read paths and should
-  not share a baseline.
+- The sequencing gate this section used to track is cleared: the
+  backpressure fix is landed and validated, so Brick 2 no longer risks
+  sharing a baseline with an unlanded behaviour change on the same read
+  paths. Brick 2 benches should baseline at `a0a2e3b` or later.
 
 ## 10. Lineage
 

@@ -1,7 +1,7 @@
 //! CLI-driven integration tests for `pbfhogg sort`.
 //!
 //! Pattern-setter for the CLI-decoupled test layout (see
-//! `notes/testing.md` > "Test placement"). Fixture PBFs are written
+//! `reference/testing.md` > "Test placement"). Fixture PBFs are written
 //! with the stable-allowlist writer helpers; the sort command runs
 //! via the compiled `pbfhogg` binary through `CliInvoker`; output
 //! is verified by reading the resulting PBF with the stable-allowlist
@@ -452,7 +452,7 @@ fn sort_already_sorted() {
 ///
 /// **Escape hatch**, `#[ignore = "external"]`d. External
 /// cross-validation lives in `brokkr verify`, not the in-tree
-/// suite (see `notes/testing.md` > "External cross-validation").
+/// suite (see `reference/testing.md` > "External cross-validation").
 /// `brokkr verify sort` already covers the real-dataset case;
 /// this fixture is the pathological overlap-run input that
 /// real Denmark data does not exercise. Migration target: when

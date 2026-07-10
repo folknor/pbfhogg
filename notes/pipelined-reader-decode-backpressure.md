@@ -1,7 +1,9 @@
 # Pipelined reader: unbounded decode-in-flight memory
 
-Status: 2026-07-08. Analysis and decision recorded; implementation and
-validation deferred (no benchmark host available today).
+Status: 2026-07-08 analysis and decision recorded; 2026-07-09 scoping
+pass done and the implementation plan (section 6) detailed to
+execution-readiness. Implementation and validation still deferred (no
+benchmark host available).
 
 Origin: an elivagar bug report against pbfhogg's 3-stage pipelined reader,
 cross-checked against the pbfhogg tree. The conclusion is that the pathology
@@ -13,6 +15,10 @@ Companion docs:
 - [external-join-oom-investigation.md](external-join-oom-investigation.md)
 - [cross-pipeline-optimization-plan.md](cross-pipeline-optimization-plan.md)
 - [../reference/pbfhogg-techniques-for-elivagar.md](../reference/pbfhogg-techniques-for-elivagar.md)
+- [injected-prepass.md](injected-prepass.md) - the other elivagar-driven
+  work item; its section 9 records the touch points with this fix
+  (Option-3 read loop hosts the field-5 enforcement point; land this fix
+  first on the shared bench host).
 
 ## 1. Symptom (as reported)
 
@@ -207,27 +213,217 @@ fixing our own documented pathology in our own commands.
 
 ## 6. Implementation plan (Option 1)
 
-In [`src/read/pipeline.rs`](../src/read/pipeline.rs):
+Detailed to execution-readiness 2026-07-09 (source-verified against the
+tree at `119edc5`; rationale for the shutdown items is in the "Scoping
+findings" subsection below). One coherent commit: gate + shutdown +
+counters + tests + docs; `brokkr check` green at the boundary; bench-host
+validation per section 7 before any recorded claim; keep/revert on the
+section-7 gates.
 
-1. Introduce an admission counter shared between stage 2's dispatcher and the
-   decode tasks. Semaphore-like: `Arc<(Mutex<usize>, Condvar)>` or a small
-   permit type. Cap = `pipeline_config.decode_ahead`.
-2. Dispatcher acquires before each `decode_pool.spawn`; blocks while
-   `in_flight == cap`.
-3. Every decode task releases + notifies exactly once after its `tx.send`
-   returns - guard all three exit paths (OsmData, filtered-skip returns `None`,
-   panic/error). An abort-on-drop guard should release the permit if a task
-   panics before its manual release, so the dispatcher cannot deadlock.
-4. Instrumentation (this is where the current archaeology cost came from):
-   - `decode_admit_wait_ns` counter in
-     [`pipeline_metrics.rs`](../src/read/pipeline_metrics.rs) - time the
-     dispatcher spends blocked on admission (this is the new home of the read
-     backpressure that `raw_send_wait_ns` used to fail to capture).
-   - A **filled-slot** high-water on `ReorderBuffer` distinct from
-     `pending_len()`. Today `pending_len()` (reorder_buffer.rs:58) returns the
-     window length including empty gaps, which overstates memory. A count of
-     `Some` slots would have made this diagnosis one counter read instead of an
-     archaeology session; `pipeline_reorder_high_water` should track that.
+### 6.1 `src/reorder_buffer.rs` - O(1) filled-slot count
+
+- Add a `filled: usize` field, incremented in `push`, decremented in
+  `pop_ready` on a successful pop; expose `pub(crate) fn filled_len()`.
+  A maintained counter, not a scan.
+- `pending_len()` keeps its current meaning (window length including
+  empty gap slots).
+- Inline tests: filled vs window diverge across a gap (`push(0)`,
+  `push(2)` -> filled 2, window 3); drain returns filled to 0.
+- Other `ReorderBuffer` users (external stage 1/3/4, apply-changes
+  drain, altw passthrough) compile unchanged; the field is private.
+
+### 6.2 `src/read/pipeline.rs` - AdmissionGate, Permit, shutdown
+
+Module-level, with inline tests:
+
+```rust
+struct AdmissionGate {
+    count: Mutex<usize>,
+    cond: Condvar,
+    cap: usize,          // pipeline_config.decode_ahead.max(1)
+}
+// acquire(): lock; while *n >= cap { wait }; *n += 1
+// release(): lock; *n -= 1; drop lock; notify_one
+struct Permit(Arc<AdmissionGate>);   // Drop = release
+```
+
+Lock poisoning: `unwrap_or_else(PoisonError::into_inner)`, matching the
+house style in `altw/external/stage2.rs`.
+
+Dispatcher (stage 2) loop shape:
+
+```rust
+let shutdown = Arc::new(AtomicBool::new(false));
+for (seq, blob_result) in raw_rx {
+    if shutdown.load(Relaxed) { break; }      // drops raw_rx -> stage 1 stops
+    match blob_result {
+        Ok(blob) => {
+            let t = Instant::now();
+            gate.acquire();                    // blocks at cap
+            METRICS.decode_admit_wait_ns += elapsed(t);
+            let permit = Permit(Arc::clone(&gate));
+            decode_pool.spawn(move || {
+                /* existing catch_unwind decode body, unchanged */
+                if tx.send((seq, item)).is_err() {
+                    shutdown_flag.store(true, Relaxed);
+                }
+                /* decoded_send_wait_ns timing as today */
+                drop(permit);   // release AFTER the send resolves
+            });
+        }
+        Err(e) => { /* direct send, unchanged - no permit needed;
+                       bounded by the decoded channel */ }
+    }
+}
+```
+
+Details that are load-bearing:
+
+- `drop(permit)` explicit at the closure tail: move closures capture
+  only referenced variables, so the drop is both the capture and the
+  documented release point. The `Drop` impl covers the panic path (the
+  existing `catch_unwind` converts decode panics to `Err` items and
+  still sends; the guard is belt-and-braces for anything outside it).
+- Release-after-send means "in-flight" includes channel-blocked
+  senders: a stalled consumer holds at most `cap` items in the decoded
+  channel + `cap` permit-holding tasks + the reorder window (~2x
+  `decode_ahead` decoded blocks). That is the memory bound.
+- Wake-on-shutdown needs no extra plumbing: failing senders release
+  permits, release notifies, the dispatcher's next iteration reads the
+  flag and breaks.
+- Stage 3 must own `decoded_rx` and drop it when its receive loop
+  exits, BEFORE the scope join - today it is created outside
+  `thread::scope` and outlives the join, which is exactly what turns
+  the gate into a deadlock on early exit (Scoping findings, item A).
+  Concretely: move the loop body into a helper
+  `fn drain_decoded<F>(decoded_rx: Receiver<DecodedItem>, config, block_fn: &mut F) -> Result<()>`
+  that consumes the receiver; `run_pipeline` calls it and the receiver
+  drops at helper return. The helper split also keeps
+  `cognitive_complexity = deny` satisfied as the dispatcher grows; a
+  `spawn_decode_task` helper may be needed for the same reason.
+- In the helper, record `filled_len()` into `reorder_high_water` and
+  `pending_len()` into the new `reorder_window_high_water` after each
+  push.
+- Doc updates in-file: `run_pipeline`'s memory-warning block keeps the
+  allocator-retention paragraph (that is a distinct pathology) and
+  gains a paragraph stating decode admission is now bounded by
+  `decode_ahead` (~2x decode_ahead decoded blocks + window in flight);
+  the stage-2 comment about `raw_rx` early-drop semantics stays valid.
+
+### 6.3 `src/read/pipeline_metrics.rs`
+
+- New `decode_admit_wait_ns` - time the dispatcher spends blocked on
+  admission. This is the new home of the read backpressure that
+  `raw_send_wait_ns` structurally failed to capture (stage 2 never let
+  the raw channel fill).
+- `reorder_high_water` changes meaning to FILLED slots (the memory
+  diagnostic) and its doc comment - which today claims "Bounded by
+  `decode_ahead`", false until this change - becomes true.
+- New `reorder_window_high_water` - window length including gaps (the
+  completion-skew diagnostic; the old meaning). Cross-run comparisons
+  against pre-change UUIDs (e.g. elivagar's 660) must use this column,
+  not `reorder_high_water`.
+- Emit all three alongside the existing counters.
+
+### 6.4 `src/read/reader.rs` - doc contract
+
+- `decode_ahead(n)`: same name, tighter guarantee - now also bounds
+  spawned-but-undrained decode tasks; decoded in-flight memory is ~2x
+  `n` blocks plus the reorder window.
+- `into_blocks_pipelined`: early drop now stops the pipeline promptly
+  (no full-file drain on detached threads).
+
+### 6.5 Tests (tier 1, no bench host needed)
+
+- Inline: `AdmissionGate` blocks at cap / release unblocks (two
+  threads, generous timeout); `ReorderBuffer::filled_len` semantics.
+- `tests/read_paths.rs` (fixture: parameterized `write_test_pbf`
+  variant emitting ~16 node blocks, since the existing 3-block fixture
+  cannot fill any channel):
+  - `block_iterator_early_drop_under_pressure`: `.read_ahead(1)
+    .decode_ahead(1)`, `next()` once, drop. Completing at all is the
+    assertion (deadlock = hang = test timeout).
+  - `block_fn_error_stops_pipeline`: `for_each_block_pipelined` whose
+    closure errors on the first block, same tiny caps; asserts the Err
+    propagates (and returns promptly rather than draining the file).
+  - `pipelined_matches_sequential_tiny_caps`: conformance at
+    `decode_ahead(1)` - ordering under maximum backpressure.
+
+### 6.6 CHANGELOG + doc sweep
+
+- CHANGELOG entry (behaviour change at an existing surface): the
+  pipelined reader now bounds decode-in-flight memory near
+  `decode_ahead`; early drop / error exit stops promptly instead of
+  draining the rest of the file.
+- This note's status line flips to "implemented, validation pending";
+  TODO.md entry updated the same way.
+
+(Historical aside on why the filled-slot counter exists: `pending_len()`
+returns window length including empty gaps, which overstates memory. A
+count of `Some` slots would have made the original diagnosis one counter
+read instead of an archaeology session.)
+
+### Scoping findings (2026-07-09, code-verified)
+
+Source-level scoping pass before implementation; the 6.x subsections
+above already incorporate the consequences. Recorded separately because
+the WHY is not obvious from the plan items alone.
+
+**A. The naive gate deadlocks on early exit; today's code does not.**
+Verified in rayon-core 1.13.0: `ThreadPool::drop` only calls
+`registry.terminate()` (registry.rs:594) - it does NOT join spawned
+tasks; workers drain their queues on detached threads. That is why
+today's unbounded spawn survives consumer early-exit (`PipelinedBlocks`
+drop, or `block_fn` returning `Err`): stage 2 drains the entire raw
+channel, spawns everything, drops the pool without blocking, the scope
+joins, `run_pipeline` returns, `decoded_rx` finally drops, and the
+up-to-32 senders blocked on the full decoded channel fail-fast. Cost
+today: an early exit still READS the whole file and decompresses every
+queued blob on detached threads that can outlive `run_pipeline`'s
+return. Not a hang - but with a naive admission gate it becomes one:
+dispatcher blocked in `acquire()` (a scope thread), permits held by
+tasks blocked in `tx.send`, `decoded_rx` alive until after the scope
+join, which waits on the dispatcher. Real deadlock cycle.
+
+Two required shutdown changes ship with the gate:
+
+1. **Stage 3 drops `decoded_rx` when its loop exits** (move it into the
+   stage-3 flow; explicit drop before the scope join). Blocked senders
+   then fail-fast, permits release, the dispatcher unblocks.
+2. **Shutdown fast-path**: an `AtomicBool` set by any task whose
+   `tx.send` fails; the dispatcher checks it each iteration and breaks,
+   dropping `raw_rx` so stage 1 stops reading promptly. This upgrades
+   early-exit behaviour from "read + decompress the rest of the file"
+   to "stop within ~cap blobs" - a real win for early-exit/zip
+   consumers, and it makes error returns from `block_fn` fast on large
+   files.
+
+**B. The existing early-drop test cannot catch any of this.**
+`tests/read_paths.rs::block_iterator_early_drop` uses a 3-block
+fixture against a 32-cap channel; the full-channel shutdown path is
+never exercised. The implementation must add a deterministic test:
+`decode_ahead(1)` + `read_ahead(1)` against a fixture with more blocks
+than the caps (e.g. ~16 node blocks), early-dropped after the first
+item, plus a `for_each_block_pipelined` variant whose `block_fn`
+errors on the first block. Also re-run the pipelined-equals-sequential
+conformance shape at `decode_ahead(1)` to pin ordering under maximum
+backpressure.
+
+**C. Permit release point confirms the ~2x bound.** Releasing after
+`tx.send` returns means "in-flight" includes channel-blocked senders,
+so a stalled consumer holds at most `cap` items in the decoded channel
+plus `cap` permit-holding tasks plus the reorder window - the ~64-block
+worst case in Option 1's sizing, now derived rather than asserted.
+
+Also verified: `pipeline_metrics.rs:31` currently documents
+`reorder_high_water` as "Bounded by `decode_ahead`" - false today (the
+660 measurement is the counterexample); becomes true once the gate
+lands. The doc fix rides along. `ReorderBuffer` gains an O(1)
+`filled_len()` (maintained counter, not a scan); `reorder_high_water`
+switches to filled slots per the instrumentation plan above, and the
+old window-length meaning moves to a new
+`pipeline_reorder_window_high_water` counter so completion-skew
+visibility is not lost.
 
 ### Semantics note (public knob)
 

@@ -3,11 +3,12 @@ Cargo.lock
 .*.swp
 .*.swo
 .idea
-.plans/
-.claude/
+.plans
+.claude
 .codex
+.agents
 data
-bench/osmpbf-baseline/target/
+bench/osmpbf-baseline/target
 .bench_stderr.*
 .brokkr/*
 !.brokkr/results.db
@@ -16,5 +17,5 @@ node_modules
 docs/.vitepress/dist
 docs/.vitepress/cache
 overnight.sh
-overnight-logs/
-proptest-regressions/
+overnight-logs
+proptest-regressions

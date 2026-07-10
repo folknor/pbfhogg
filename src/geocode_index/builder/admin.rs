@@ -35,8 +35,7 @@ pub(super) fn assemble_admin_polygons(
     // and the relation itself. `par_iter().flat_map_iter().collect()`
     // preserves input order so the output `Vec<AssembledPolygon>` is
     // byte-identical to the previous sequential path. Europe phase was
-    // 50.6 s at UUID `bf8f2038` - expected ~5× on plantasjen's 12 cores
-    // (plan item #8 in notes/geocode-build-opportunities.md).
+    // 50.6 s at UUID `bf8f2038` - expected ~5× on plantasjen's 12 cores.
     relations
         .par_iter()
         .flat_map_iter(|rel| assemble_one_relation(rel, way_geom, max_verts).into_iter())

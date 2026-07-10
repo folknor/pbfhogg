@@ -10,7 +10,7 @@
 //! changes alone.
 //!
 //! ALTW is the motivating example for the CLI-decoupled test layout
-//! (`notes/testing.md` > "Test placement"): the sparse / external /
+//! (`reference/testing.md` > "Test placement"): the sparse / external /
 //! auto index backends are internal types that change shape during
 //! the join rewrite documented in `notes/altw-external.md`. This
 //! file's only knob into "which

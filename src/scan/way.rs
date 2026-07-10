@@ -369,9 +369,7 @@ fn parse_way_tagged_refs(
     let mut has_building = false;
     let mut has_addr_interp = false;
 
-    if any_key_present
-        && let (Some(kd), Some(vd)) = (keys_data, vals_data)
-    {
+    if any_key_present && let (Some(kd), Some(vd)) = (keys_data, vals_data) {
         let keys = PackedUint32Iter::new(kd);
         let mut vals = PackedUint32Iter::new(vd);
         for key_idx in keys {

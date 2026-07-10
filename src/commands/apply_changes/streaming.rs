@@ -27,9 +27,6 @@
 //!   Workers pread the **full framed bytes** via
 //!   `(frame_start, frame_len)` and emit
 //!   [`WorkerOutput::OwnedPassthrough`].
-//!
-//! Plan doc: `notes/apply-changes-opportunities.md`, "Synthesized design"
-//! → "Worker pool" and "`--direct-io` fallback" sections.
 
 use std::os::unix::fs::FileExt as _;
 use std::path::Path;

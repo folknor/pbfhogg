@@ -100,7 +100,6 @@ pub(super) fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Ve
 /// Assembly pass: re-read the PBF, attach coordinates from per-blob
 /// coord_payloads preads to ways.
 /// P2c: pread-from-workers with pre-scan schedule for parallel decompress + assembly.
-/// See notes/p2c-parallel-assembly-spec.md.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn stage4_assembly(

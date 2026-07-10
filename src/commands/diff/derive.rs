@@ -533,7 +533,7 @@ pub(crate) fn assemble_osc_from_paths(
     // At planet scale (~45 GB of XML across the three temp files) that's
     // ~23k 2 MB members; the 18 B per-member framing is ~400 KB of
     // overhead, and the per-chunk dictionary reset costs ~1-3% on the
-    // ratio. See `notes/...` or the CHANGELOG for measured wall wins.
+    // ratio. See the CHANGELOG for measured wall wins.
     let worker_count = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(4);

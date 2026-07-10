@@ -113,7 +113,7 @@ pub(crate) fn frame_blob_pipelined(
 /// the writer thread. Regressed throughput by +12% (Germany, Compression::None)
 /// due to Mutex contention. The allocator's own thread-local caching handles
 /// the cross-thread alloc/free pattern better than an explicit pool.
-/// Full analysis: `notes/memory/p6-vectored-writer-framing.md` at 2bf438c.
+/// Measured at commit 2bf438c.
 #[hotpath::measure]
 pub(super) fn frame_blob_into(
     blob_type: &str,

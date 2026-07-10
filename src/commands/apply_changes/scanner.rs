@@ -22,9 +22,6 @@
 //! descriptors. Barrier ownership is **scanner-side** (not drain-side) so
 //! that no way worker can start classify concurrent with a still-in-flight
 //! node worker.
-//!
-//! Plan doc: `notes/apply-changes-opportunities.md`, "Synthesized design"
-//! section and "Node→way barrier ownership" block.
 
 use std::path::Path;
 use std::sync::mpsc;

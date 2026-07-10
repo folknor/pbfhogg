@@ -426,7 +426,7 @@ fn collect_way_referenced_node_ids(input: &Path, _direct_io: bool) -> Result<IdS
 /// 32-slot result channel; the main thread unions them into one shared
 /// `IdSet`. Memory is bounded to one IdSet plus per-blob transient vectors
 /// rather than N-workers x per-worker `IdSet` (the previous shape, which
-/// hit +9.7 GB anon at europe scale - see notes/altw.md `Findings`). Same
+/// hit +9.7 GB anon at europe scale). Same
 /// migration template as `tags_filter::collect_way_node_dependencies`
 /// (commit `17b116c`). Set-union is commutative, so the worker-arrival
 /// order does not affect the final IdSet contents.

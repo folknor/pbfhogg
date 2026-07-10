@@ -25,7 +25,7 @@
 //! assertion it is dropped.
 //!
 //! `merge_cross_validate_osmium` keeps `#[ignore = "external"]` per
-//! the in-tree escape-hatch convention (notes/testing.md >
+//! the in-tree escape-hatch convention (reference/testing.md >
 //! "External cross-validation"); it migrates to brokkr once
 //! `verify_merge` handles delete-set tolerance (request 4 in
 //! notes/testing-cli-feature-parity.md).

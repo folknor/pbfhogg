@@ -180,7 +180,14 @@ pub(super) fn extract_simple(
     }
 
     extract_simple_two_pass(
-        input, output, region, set_bounds, clean, compression, direct_io, overrides,
+        input,
+        output,
+        region,
+        set_bounds,
+        clean,
+        compression,
+        direct_io,
+        overrides,
     )
 }
 

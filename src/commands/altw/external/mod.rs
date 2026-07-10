@@ -17,7 +17,6 @@
 //!    emit enriched ways.
 //!
 //! Memory at every stage: <1 GB. All I/O sequential. No mmap, no random access.
-//! See `notes/altw-partitioned.md` for the full design.
 
 use std::path::Path;
 

@@ -29,6 +29,35 @@ breakdowns, and old commit-pinned cross-dataset tables live in
 | Europe | 32.4 GB | 33.6 GB | - | 4.2B (3.7B nodes, 454M ways, 8.2M rels) |
 | Planet | 87.3 GB | 87.7 GB | 88.4 GB | 11.6B (10.4B nodes, 1.17B ways, 14.1M rels) |
 
+## Reading rules
+
+How a keep/revert verdict is read off this file and `.brokkr/results.db`.
+These are conventions, not hard thresholds - the exact magnitudes below want
+a fresh measurement pass to pin, but the direction of each rule holds today.
+
+- **Verdicts come from `--bench 3` best-of, not a single `--bench 1` run.**
+  `brokkr <cmd> --bench` defaults to three runs and stores the best. Planet is
+  often run `--bench 1` on cost, so a single-shot delta of a few percent at
+  sub-150-s walls, and a larger fraction at sub-10-s walls, sits inside
+  observed bench-to-bench variance (this file flags such rows "within noise").
+  A spec claiming a win states the expected bound up front and the verdict is
+  read against that bound, not against zero.
+- **`--hotpath` ranks, it does not measure absolutes.** Instrumentation
+  inflates wall clock, and inflates it most for entries with tens of millions
+  of calls at sub-microsecond averages; entries with large per-call work
+  (tens of microseconds and up) are mostly real. Use hotpath to find where
+  the time goes, never to quote a wall number.
+- **Never read RSS from a `--hotpath` or `--alloc` run.** Per-call records
+  and the counting allocator dominate resident memory under instrumentation;
+  peak-anon-RSS figures come from `--bench` or plain runs only.
+- **`--alloc` numbers before commit `678478d` are invalid.** That commit
+  installs `CountingAllocator` as the global allocator under the hotpath-alloc
+  feature; before it, allocation tracking was not wired to the global
+  allocator, so the byte totals undercount and do not compare to current ones.
+- **A hotpath timing percentage over 100% is not an error.** It is
+  cross-thread CPU seconds relative to wall clock: a parallel phase running on
+  N cores reports up to N times 100%.
+
 ## Cat passthrough (indexdata generation)
 
 No `--type` filter. Decompresses each blob to scan IDs/tags, reframes BlobHeader

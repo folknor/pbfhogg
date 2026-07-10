@@ -420,8 +420,8 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
 /// IDs across the full planet range via referenced-node unions, so the
 /// worst-case per-worker bitmap is ~1.3 GB at planet scale (10.4 B node
 /// IDs × 1 bit). Shipping at 14.59 GB peak RSS (planet) - OK in practice,
-/// but on the rewrite list in `notes/geocode-build-opportunities.md`.
-/// If you add another caller like this, measure first.
+/// but a candidate for the same [`parallel_classify_phase`] migration
+/// described below. If you add another caller like this, measure first.
 ///
 /// **A previous caller in this category was migrated to
 /// [`parallel_classify_phase`] on 2026-04-28** (commit `17b116c`,

@@ -4,8 +4,7 @@
 //! indexdata, scattered coords).
 //!
 //! v1 transformations: `--unsort`, `--strip-locations`, `--strip-indexdata`.
-//! Flags compose. See [`notes/degrade.md`](../../../notes/degrade.md) for
-//! the design rationale.
+//! Flags compose.
 //!
 //! Implementation paths:
 //!

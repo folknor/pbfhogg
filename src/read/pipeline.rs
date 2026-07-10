@@ -87,9 +87,6 @@ impl Default for PipelineConfig {
 /// - **Batch-based consumers** (e.g., `for_each_primitive_block_batch` with
 ///   `par_iter`) are partially mitigated because the batch processes blocks
 ///   on the consumer's rayon pool, reducing the cross-thread window.
-///
-/// See `notes/external-join-oom-investigation.md` and
-/// `notes/cross-pipeline-optimization-plan.md` for the full analysis.
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]

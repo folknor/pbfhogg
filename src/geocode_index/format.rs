@@ -3,7 +3,9 @@
 //! All records use little-endian byte order and manual serialization (no
 //! `#[repr(C)]` transmutation) to avoid alignment padding issues.
 //!
-//! See `notes/reverse-geocoding-spec.md` section 4 for the full format specification.
+//! This module is the authoritative on-disk format definition: the record
+//! layouts below (magic bytes, header, and the per-file records) are the
+//! format.
 
 /// Magic bytes for the index header: `GIDX`.
 pub const HEADER_MAGIC: [u8; 4] = *b"GIDX";

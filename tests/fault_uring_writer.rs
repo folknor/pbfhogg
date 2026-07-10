@@ -4,7 +4,7 @@
 //! `tests/fault_*.rs` compiles to its own integration-test binary,
 //! so the static `PANIC_AT_*` atomics are per-process and race-free
 //! without `#[ignore]` or `--test-threads=1`. See
-//! `notes/testing.md` > "Conventions" (`test-hooks` + per-binary
+//! `reference/testing.md` > "Conventions" (`test-hooks` + per-binary
 //! isolation).
 //!
 //! The test still skips cleanly on hosts where io_uring init fails

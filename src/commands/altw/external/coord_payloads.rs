@@ -6,7 +6,7 @@
 //! coord_slots array. Measured compression is ~1.81× vs coord_slots (37.5 GB
 //! Europe → 20.8 GB; 99 GB planet projects to ~55 GB). The original 3-4×
 //! estimate did not account for OSM's moderate varint widths after delta
-//! encoding; see notes/altw-optimization-history.md for the reconciliation.
+//! encoding.
 //! The integration is pursued primarily for its non-wall benefits
 //! (scratch footprint, page faults, memory pressure), not raw compression.
 //!

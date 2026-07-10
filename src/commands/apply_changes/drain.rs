@@ -40,10 +40,6 @@
 //! After the drain channel closes and the reorder buffer empties, the
 //! drain ports the existing `types_to_flush` match from `rewrite.rs`
 //! verbatim: emit any remaining upserts of the current and later kinds.
-//!
-//! Plan doc: `notes/apply-changes-opportunities.md`,
-//! "Synthesized design" → "Drain actor" + "Cursor rule" + "Node→way
-//! barrier ownership" + "`--direct-io` fallback" sections.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};

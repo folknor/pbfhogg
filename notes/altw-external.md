@@ -310,7 +310,7 @@ gated probes.
 
 Before starting any of A1-A4 this audits inline `#[cfg(test)] mod tests`
 coverage across `src/commands/altw/external/` against the development
-contract in `notes/testing.md`: tier 1 must be structurally complete
+contract in `reference/testing.md`: tier 1 must be structurally complete
 for `brokkr check` green to be a real signal during refactor.
 
 **Audit verdict held.** A1 landed without a single CLI canary

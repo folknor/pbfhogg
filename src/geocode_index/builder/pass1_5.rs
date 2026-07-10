@@ -24,8 +24,7 @@ pub(super) fn run_pass1_5(
     // `set_atomic`. Replaces the previous per-worker `IdSet`
     // accumulation that grew to ~20 GB anon on Germany (~29.5 GB at planet)
     // because each worker allocated independent chunks across the full
-    // planet ID range. Pattern follows `renumber_external/pass1.rs`
-    // (plan item #7 in notes/geocode-build-opportunities.md).
+    // planet ID range. Pattern follows `renumber_external/pass1.rs`.
     //
     // `pre_allocate(max_node_id)` requires `max_node_id` to cover every ID
     // the classify closure will call `set_atomic` on. We get it from

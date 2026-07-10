@@ -205,7 +205,11 @@ impl<R: Read + Send> ElementReader<R> {
             block.for_each_element(|element| {
                 if is_sorted && let Some(id) = node_id(&element) {
                     debug_assert!(
-                        if is_history { id >= last_node_id } else { id > last_node_id },
+                        if is_history {
+                            id >= last_node_id
+                        } else {
+                            id > last_node_id
+                        },
                         "Sort.Type_then_ID violated: node {id} < previous {last_node_id}"
                     );
                     last_node_id = id;

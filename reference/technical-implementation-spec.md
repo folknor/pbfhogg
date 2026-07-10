@@ -81,7 +81,12 @@ Specifications are saved to the ./notes folder.
    boundary between them.
    Complete-but-unorderable is a failed spec. Benchmark discipline holds
    at every landing: commit first, then measure, then record numbers
-   against the commit hash (never benchmark uncommitted code).
+   against the commit hash (never benchmark uncommitted code). For a
+   before/after comparison, land the change, bench HEAD for the after
+   number, and bench the baseline with `brokkr <cmd> --commit <ref> --bench`,
+   which builds and benches a prior commit in its own worktree and stores the
+   row tagged to it - so a baseline is available at any time from your own
+   branch.
 7. **The target as concrete artifacts.** "The ideal structure" is pinned to
    exact types, signatures, ownership, and data flow - buildable, not merely
    directional.

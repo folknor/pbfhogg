@@ -1,9 +1,13 @@
 # Pipelined reader: unbounded decode-in-flight memory
 
-Status: 2026-07-08 analysis and decision recorded; 2026-07-09 scoping
-pass done and the implementation plan (section 6) detailed to
-execution-readiness; 2026-07-10 implemented with release-after-deliver
-permits, validation pending.
+Status: LANDED AND VALIDATED 2026-07-10 (commit a0a2e3b). Implemented with
+release-after-deliver permits - a hard bound where admitted minus delivered
+stays at or below decode_ahead. Validation kept it: every wall gate is
+neutral-to-faster (europe read -13%, japan read -3.9%, getid and tags-filter
+europe within noise) and the memory bound is decisive - reorder filled
+high-water pinned at 32 versus the pre-change 660, with decode_admit_blocked
+at 10216 confirming the gate engaged. Baselines captured at 86a03f2 via
+brokkr --commit; V0/V1 rows in .brokkr/results.db.
 
 Origin: an elivagar bug report against pbfhogg's 3-stage pipelined reader,
 cross-checked against the pbfhogg tree. The conclusion was that the pathology

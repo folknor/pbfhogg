@@ -48,7 +48,12 @@ brokkr <command> [--dataset D] --hotpath        # function-level timing
 brokkr <command> [--dataset D] --alloc          # allocation tracking
 brokkr <command> [--dataset D] --direct-io      # pass --direct-io to pbfhogg
 brokkr <command> [--dataset D] --io-uring       # pass --io-uring to pbfhogg
+brokkr <command> [--dataset D] --commit <ref>   # build+bench an old commit in a worktree (baselines)
 ```
+
+`--commit <ref>` builds and benchmarks a prior commit in brokkr's own git
+worktree and stores the result tagged to that commit - pass it to capture a
+before/after baseline from your own branch.
 
 `--stop MARKER` requires a measured mode. Kills process after the named marker. Accepts three spellings: verbatim (`--stop RENUMBER_EXT_STAGE2D_END`), the `-` sigil (`--stop -RENUMBER_EXT_STAGE2D` → resolves to `RENUMBER_EXT_STAGE2D_END`), and the bare-name fallback (`--stop RENUMBER_EXT_STAGE2D` → also resolves to `RENUMBER_EXT_STAGE2D_END`; the sidecar log line shows the resolved form).
 

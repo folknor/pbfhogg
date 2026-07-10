@@ -57,7 +57,7 @@ Three new docs capturing a cross-cutting insight and two new commands that fall 
 
   Rough prioritization if a day were available: cross-disk bench first (10 min, tells us where the ALTW ceiling actually lives), then worker-framed-bytes if Stage 4 is writer-bound.
 
-- [ ] **[notes/injected-prepass.md](notes/injected-prepass.md)** - cross-repo contract from elivagar's `injected-prepass-spec.md` (their H2a+H2b): altw computes relation membership and exact shared-node pins at enrichment time and injects them as BlobHeader field 5 (way-member bitmap, superset semantics, presence = validity) + Way field 20 (per-ref pin bitmap, omitted when empty), declared via `pbfhogg.WayMembers-v1` / `pbfhogg.SharedNodePins-v1` optional_features. Public surface: `Blob::way_members()`, `Way::shared_node_pins()`, opt-in `parse_waymembers` toggle on `BlobReader::new`. Survey landed 2026-07-09; the note restates the full contract (self-contained, no reach into the elivagar repo), maps it onto the post-A1 external pipeline (relation-scan fusion at ~zero wall, stage-2 run-length shared bit, two zero-widening escapes that keep both 12-byte records at 12 bytes), and prices it against the standing **external <= 3% regression bound** (~16 s at planet, baseline 546.0 s `7fd04130`). Three decisions block the paired implementation spec ("Brick 2"): (1) steady-state story - `apply-changes` builds a fresh output header (`rewrite.rs:133`) so the enrichment flags vanish after the first daily diff (options: re-run altw per refresh ~9-10 min planet / teach merge field-5 maintenance, pins go stale / accept bootstrap-only); (2) opt-in CLI flag shape + sparse parity (recommended: flag-gated, implement sparse too to keep the backend-parity canary); (3) elivagar's Brick 1 superset screen (superset <= 1.5x needed_ways on germany locations) must pass before format work - if it fails, the membership semantics gain a `tag_expr` relation filter. Sequencing: the decode-backpressure fix implementation landed 2026-07-10 (see the "Cross-pipeline optimization" entry below), but its validation benches haven't run yet; Brick 2's bench gates still wait for that to land as a commit and its verdict to be read, so the two behavior changes don't share a baseline. Risk-free early slice if idle time appears: the format/reader layer (field-5 parse/encode, accessors, toggle) is invariant under all three open decisions.
+- [ ] **[notes/injected-prepass.md](notes/injected-prepass.md)** - cross-repo contract from elivagar's `injected-prepass-spec.md` (their H2a+H2b): altw computes relation membership and exact shared-node pins at enrichment time and injects them as BlobHeader field 5 (way-member bitmap, superset semantics, presence = validity) + Way field 20 (per-ref pin bitmap, omitted when empty), declared via `pbfhogg.WayMembers-v1` / `pbfhogg.SharedNodePins-v1` optional_features. Public surface: `Blob::way_members()`, `Way::shared_node_pins()`, opt-in `parse_waymembers` toggle on `BlobReader::new`. Survey landed 2026-07-09; the note restates the full contract (self-contained, no reach into the elivagar repo), maps it onto the post-A1 external pipeline (relation-scan fusion at ~zero wall, stage-2 run-length shared bit, two zero-widening escapes that keep both 12-byte records at 12 bytes), and prices it against the standing **external <= 3% regression bound** (~16 s at planet, baseline 546.0 s `7fd04130`). Three decisions block the paired implementation spec ("Brick 2"): (1) steady-state story - `apply-changes` builds a fresh output header (`rewrite.rs:133`) so the enrichment flags vanish after the first daily diff (options: re-run altw per refresh ~9-10 min planet / teach merge field-5 maintenance, pins go stale / accept bootstrap-only); (2) opt-in CLI flag shape + sparse parity (recommended: flag-gated, implement sparse too to keep the backend-parity canary); (3) elivagar's Brick 1 superset screen (superset <= 1.5x needed_ways on germany locations) must pass before format work - if it fails, the membership semantics gain a `tag_expr` relation filter. Sequencing: the decode-backpressure fix landed and was validated 2026-07-10 (commit `a0a2e3b`; verdict read, all gates kept), so Brick 2 can be baselined now without sharing a baseline with an unlanded behavior change. Risk-free early slice if idle time appears: the format/reader layer (field-5 parse/encode, accessors, toggle) is invariant under all three open decisions.
 
 Measurement-first on every one: turn on `#[cfg(feature = "hotpath")]` counters (or add unconditional `*_ms` counters) to ground-truth the inferred per-phase breakdowns before committing to the order of landing items within a plan.
 
@@ -381,37 +381,6 @@ Cross-thread buffer retention is **solved** - `DecompressPool` (commit
 `8f6999b`) recycles decompression buffers in the pipelined reader. The
 remaining architectural concern is thread oversubscription (two concurrent
 rayon pools: decode + batch processing), not retention.
-
-- [ ] **[notes/pipelined-reader-decode-backpressure.md](notes/pipelined-reader-decode-backpressure.md)** -
-  the pipelined reader's `decode_ahead` cap is a lie: stage 2 spawns decode
-  tasks with a non-blocking `rayon::spawn` and the stage-3 `ReorderBuffer`
-  window grows via `resize_with`, so read-ahead is effectively the whole file
-  and decoded-block memory is unbounded (elivagar reported 21.5 GB RSS / 660
-  reorder high-water on a 19 GB NA locations run; documented in
-  `run_pipeline`'s own doc comment at 25+ GB, and the reason `cat` migrated off
-  the reader after a 28.9 GB OOM 2026-04-26). Distinct from the DecompressPool
-  retention fix above - this is unbounded *admission*, not un-recycled buffers.
-  Still live in-tree: `altw:547` and `time_filter:165` are unfiltered
-  full-scan pipelined reads on the affected path. **Decision:** bound
-  in-flight decode tasks with one token counter keyed on `decode_ahead`
-  (default 32) inside `src/read/pipeline.rs` - no signature change, fixes all
-  five residual callers at once. **Implemented 2026-07-10 with
-  release-after-deliver permits; validation pending** against the note's
-  section-8 bench gates (`getid` / `tags-filter` no-regression plus
-  pipelined-reader memory counters). Note carries the
-  full inventory, the three options weighed, the implementation plan, and the
-  validation plan. **Scoped to execution-readiness 2026-07-09** (code-verified,
-  note section 6 rewritten file-by-file): the naive gate DEADLOCKS on consumer
-  early-exit - rayon `ThreadPool::drop` never joins (verified rayon-core
-  1.13.0), which is the only reason today's unbounded spawn survives early
-  drop, at the cost of reading + decompressing the rest of the file on
-  detached threads. Two shutdown changes ship with the gate: stage 3 owns and
-  drops `decoded_rx` at loop exit, and a shutdown `AtomicBool` (set on send
-  failure) breaks the dispatcher so stage 1 stops promptly. The existing
-  `block_iterator_early_drop` test cannot catch any of this (3-block fixture
-  vs 32-cap channel); new tiny-cap pressure tests specified. Counters:
-  `decode_admit_wait_ns` new, `reorder_high_water` becomes filled-slot count,
-  old window meaning moves to `reorder_window_high_water`.
 
 See [notes/altw-optimization-history.md](notes/altw-optimization-history.md)
 for the complete plan: 20 items across 5 priority groups, covering infrastructure

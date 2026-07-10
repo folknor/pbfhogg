@@ -20,7 +20,7 @@ use super::Result;
 use super::stats::MergeStats;
 
 // ---------------------------------------------------------------------------
-// Writing OSC elements (from diff, no metadata)
+// Writing OSC elements (from diff, metadata carried from the OSC attributes)
 // ---------------------------------------------------------------------------
 
 pub(super) fn write_osc_way(
@@ -32,6 +32,7 @@ pub(super) fn write_osc_way(
 ) -> Result<()> {
     ensure_way_capacity(bb, writer)?;
     let refs: Vec<i64> = way.refs().collect();
+    let meta = way.metadata();
     if let Some(locs) = loc_map {
         let mut locations: Vec<(i32, i32)> = Vec::with_capacity(refs.len());
         for &node_id in &refs {
@@ -40,9 +41,9 @@ pub(super) fn write_osc_way(
                 None => locations.push((0, 0)),
             }
         }
-        bb.add_way_with_locations(way.id(), way.tags(), &refs, &locations, None);
+        bb.add_way_with_locations(way.id(), way.tags(), &refs, &locations, meta.as_ref());
     } else {
-        bb.add_way(way.id(), way.tags(), &refs, None);
+        bb.add_way(way.id(), way.tags(), &refs, meta.as_ref());
     }
     Ok(())
 }
@@ -60,7 +61,7 @@ pub(super) fn write_osc_relation(
             role,
         })
         .collect();
-    bb.add_relation(rel.id(), rel.tags(), &members, None);
+    bb.add_relation(rel.id(), rel.tags(), &members, rel.metadata().as_ref());
     Ok(())
 }
 
@@ -170,6 +171,7 @@ pub(super) fn write_osc_way_local(
 ) -> Result<()> {
     ensure_way_capacity_local(bb, output)?;
     let refs: Vec<i64> = way.refs().collect();
+    let meta = way.metadata();
 
     if let Some(locs) = loc_map {
         let mut locations: Vec<(i32, i32)> = Vec::with_capacity(refs.len());
@@ -179,9 +181,9 @@ pub(super) fn write_osc_way_local(
                 None => locations.push((0, 0)),
             }
         }
-        bb.add_way_with_locations(way.id(), way.tags(), &refs, &locations, None);
+        bb.add_way_with_locations(way.id(), way.tags(), &refs, &locations, meta.as_ref());
     } else {
-        bb.add_way(way.id(), way.tags(), &refs, None);
+        bb.add_way(way.id(), way.tags(), &refs, meta.as_ref());
     }
     Ok(())
 }

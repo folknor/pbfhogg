@@ -11,7 +11,7 @@
 mod common;
 
 use common::{
-    TestMember, TestNode, TestRelation, assert_elements_equivalent, generate_nodes,
+    TestMember, TestNode, TestRelation, TestWay, assert_elements_equivalent, generate_nodes,
     generate_relations, generate_ways, write_multi_block_test_pbf, write_test_pbf_sorted,
 };
 use pbfhogg::MemberId;
@@ -210,6 +210,129 @@ fn derive_then_apply_roundtrip() {
     )
     .expect("apply_changes");
 
+    assert_elements_equivalent(&modified, &reconstructed);
+}
+
+// ---------------------------------------------------------------------------
+// derive -> apply metadata preservation
+// ---------------------------------------------------------------------------
+
+/// The derive -> apply circle must preserve element metadata (version,
+/// timestamp, changeset, uid, user), not just content.
+/// `assert_elements_equivalent` compares `NormalizedMeta`, so any loss in
+/// either half surfaces here. Regression test for the 2026-07-10 finding:
+/// derive emitted only `version` and apply-changes dropped OSC metadata
+/// entirely (every OSC-sourced element in merged output carried v0).
+#[test]
+fn derive_then_apply_preserves_metadata() {
+    use common::TestMeta;
+
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let modified = dir.path().join("modified.osm.pbf");
+    let osc = dir.path().join("delta.osc.gz");
+    let reconstructed = dir.path().join("reconstructed.osm.pbf");
+
+    let meta = |version: i32, user: &'static str| {
+        Some(TestMeta {
+            version,
+            timestamp: 1_771_622_445, // 2026-02-20T21:20:45Z
+            changeset: 123_456_789,
+            uid: 4_242,
+            user,
+            visible: true,
+        })
+    };
+
+    let base_nodes: Vec<TestNode> = (1..=6i32)
+        .map(|i| TestNode {
+            id: i64::from(i),
+            lat: 550_000_000 + i * 1_000,
+            lon: 120_000_000 + i * 1_000,
+            tags: vec![],
+            meta: meta(2, "base mapper"),
+        })
+        .collect();
+    let base_ways = vec![TestWay {
+        id: 1_000,
+        refs: vec![1, 2, 3],
+        tags: vec![("highway", "primary")],
+        meta: meta(5, "way mapper"),
+    }];
+    let base_relations = vec![TestRelation {
+        id: 100,
+        members: vec![TestMember {
+            id: MemberId::Way(1_000),
+            role: "outer",
+        }],
+        tags: vec![("type", "multipolygon")],
+        meta: meta(1, "rel mapper"),
+    }];
+    write_test_pbf_sorted(&base, &base_nodes, &base_ways, &base_relations);
+
+    // Modified: bump one node (modify), add one node (create), touch the way.
+    let mut mod_nodes = base_nodes;
+    mod_nodes[1].tags = vec![("amenity", "cafe")];
+    mod_nodes[1].meta = meta(3, "editing mapper");
+    mod_nodes.push(TestNode {
+        id: 50,
+        lat: 556_000_000,
+        lon: 126_000_000,
+        tags: vec![("man_made", "flagpole")],
+        meta: meta(1, "creator with spaces in name"),
+    });
+    mod_nodes.sort_by_key(|n| n.id);
+    let mod_ways = vec![TestWay {
+        id: 1_000,
+        refs: vec![1, 2, 3, 4],
+        tags: vec![("highway", "primary")],
+        meta: meta(6, "way mapper"),
+    }];
+    // Genuinely modify the relation (tag change + version bump) so the
+    // OSC carries it and the relation-modify write path is exercised -
+    // an identical relation would pass through and prove nothing.
+    let mod_relations = vec![TestRelation {
+        id: 100,
+        members: vec![TestMember {
+            id: MemberId::Way(1_000),
+            role: "outer",
+        }],
+        tags: vec![("type", "multipolygon"), ("landuse", "forest")],
+        meta: meta(2, "rel editor"),
+    }];
+    write_test_pbf_sorted(&modified, &mod_nodes, &mod_ways, &mod_relations);
+
+    let stats = pbfhogg::diff::derive::derive_changes(
+        &base, &modified, &osc, false, false, // increment_version: keep raw metadata
+        false, // update_timestamp: keep raw metadata
+        1,
+    )
+    .expect("derive_changes");
+    assert!(
+        stats.creates + stats.modifies > 0,
+        "derive must produce creates/modifies"
+    );
+
+    let opts = pbfhogg::apply_changes::MergeOptions {
+        compression: Compression::default(),
+        direct_io: false,
+        io_uring: false,
+        force: true,
+        locations_on_ways: false,
+        jobs: None,
+        #[cfg(feature = "test-hooks")]
+        panic_at_blob_seq: None,
+    };
+    pbfhogg::apply_changes::merge(
+        &base,
+        &osc,
+        &reconstructed,
+        &opts,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("apply_changes");
+
+    // Metadata-inclusive equivalence: NormalizedMeta is part of the compare.
     assert_elements_equivalent(&modified, &reconstructed);
 }
 

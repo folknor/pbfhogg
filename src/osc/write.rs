@@ -308,6 +308,44 @@ fn write_borrowed_tags_xml<'a, W: std::io::Write>(
 // Borrowed element XML writing - zero-clone path for derive_changes
 // ---------------------------------------------------------------------------
 
+/// Emit the metadata attribute set from a borrowed element's info fields.
+///
+/// Each attribute is emitted only when its value is meaningful (version and
+/// changeset and uid positive, timestamp nonzero, user non-empty), matching
+/// what osmium's OSC writer produces. Full emission (not just version)
+/// keeps the derive -> apply roundtrip metadata-lossless now that
+/// apply-changes carries OSC metadata into its output.
+fn push_info_attrs(
+    elem: &mut BytesStart<'_>,
+    version: i32,
+    milli_timestamp: i64,
+    changeset: i64,
+    uid: i32,
+    user: Option<&str>,
+) {
+    if version > 0 {
+        let v_str = version.to_string();
+        elem.push_attribute(("version", v_str.as_str()));
+    }
+    if milli_timestamp > 0 {
+        let ts = crate::commands::format_epoch_secs((milli_timestamp / 1000).cast_unsigned());
+        elem.push_attribute(("timestamp", ts.as_str()));
+    }
+    if changeset > 0 {
+        let c_str = changeset.to_string();
+        elem.push_attribute(("changeset", c_str.as_str()));
+    }
+    if uid > 0 {
+        let u_str = uid.to_string();
+        elem.push_attribute(("uid", u_str.as_str()));
+    }
+    if let Some(u) = user
+        && !u.is_empty()
+    {
+        push_attribute_escaped(elem, "user", u);
+    }
+}
+
 /// Write a borrowed `Element` as XML. Avoids the owned conversion path
 /// (no tag/ref/member String cloning). Used by derive_changes for the
 /// create/modify paths.
@@ -337,12 +375,17 @@ fn write_dense_node_xml<W: std::io::Write>(
     elem.push_attribute(("id", id_str.as_str()));
     elem.push_attribute(("lat", lat_str.as_str()));
     elem.push_attribute(("lon", coord_buf.as_str()));
-    if let Some(info) = node.info() {
-        let v = info.version();
-        if v != -1 {
-            let v_str = v.to_string();
-            elem.push_attribute(("version", v_str.as_str()));
-        }
+    if let Some(info) = node.info()
+        && info.version() != -1
+    {
+        push_info_attrs(
+            &mut elem,
+            info.version(),
+            info.milli_timestamp(),
+            info.changeset(),
+            info.uid(),
+            info.user().ok(),
+        );
     }
 
     let mut tags = node.tags().peekable();
@@ -369,9 +412,16 @@ fn write_borrowed_node_xml<W: std::io::Write>(
     elem.push_attribute(("id", id_str.as_str()));
     elem.push_attribute(("lat", lat_str.as_str()));
     elem.push_attribute(("lon", coord_buf.as_str()));
-    if let Some(v) = node.info().version() {
-        let v_str = v.to_string();
-        elem.push_attribute(("version", v_str.as_str()));
+    let info = node.info();
+    if let Some(v) = info.version() {
+        push_info_attrs(
+            &mut elem,
+            v,
+            info.milli_timestamp().unwrap_or(0),
+            info.changeset().unwrap_or(0),
+            info.uid().unwrap_or(0),
+            info.user().and_then(Result::ok),
+        );
     }
 
     let mut tags = node.tags().peekable();
@@ -392,9 +442,16 @@ fn write_borrowed_way_xml<W: std::io::Write>(
     let mut elem = BytesStart::new("way");
     let id_str = way.id().to_string();
     elem.push_attribute(("id", id_str.as_str()));
-    if let Some(v) = way.info().version() {
-        let v_str = v.to_string();
-        elem.push_attribute(("version", v_str.as_str()));
+    let info = way.info();
+    if let Some(v) = info.version() {
+        push_info_attrs(
+            &mut elem,
+            v,
+            info.milli_timestamp().unwrap_or(0),
+            info.changeset().unwrap_or(0),
+            info.uid().unwrap_or(0),
+            info.user().and_then(Result::ok),
+        );
     }
 
     let mut refs = way.refs().peekable();
@@ -422,9 +479,16 @@ fn write_borrowed_relation_xml<W: std::io::Write>(
     let mut elem = BytesStart::new("relation");
     let id_str = rel.id().to_string();
     elem.push_attribute(("id", id_str.as_str()));
-    if let Some(v) = rel.info().version() {
-        let v_str = v.to_string();
-        elem.push_attribute(("version", v_str.as_str()));
+    let info = rel.info();
+    if let Some(v) = info.version() {
+        push_info_attrs(
+            &mut elem,
+            v,
+            info.milli_timestamp().unwrap_or(0),
+            info.changeset().unwrap_or(0),
+            info.uid().unwrap_or(0),
+            info.user().and_then(Result::ok),
+        );
     }
 
     let mut members = rel.members().peekable();

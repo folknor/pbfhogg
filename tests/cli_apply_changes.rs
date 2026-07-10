@@ -1002,8 +1002,9 @@ fn merge_stats_accuracy() {
 }
 
 /// Metadata (version/timestamp/changeset/uid/user) from base PBF nodes
-/// survives a merge. OSC parser doesn't extract metadata, so OSC
-/// replacements get default metadata.
+/// survives a merge, and OSC replacements carry the metadata attributes
+/// from the OSC element (node 2's `version="4"` below; attributes the
+/// OSC omits stay at their defaults, e.g. uid 0).
 #[test]
 fn merge_metadata_preservation() {
     let dir = TempDir::new().expect("tempdir");
@@ -1105,8 +1106,8 @@ fn merge_metadata_preservation() {
     assert_eq!(uid, 42);
     assert_eq!(node_meta[1].0, 2);
     let (version, uid) = node_meta[1].1.expect("node 2 meta");
-    assert_eq!(version, 0);
-    assert_eq!(uid, 0);
+    assert_eq!(version, 4, "OSC-sourced version must be carried");
+    assert_eq!(uid, 0, "uid absent from the OSC stays default");
     assert_eq!(node_meta[2].0, 3);
     let (version, uid) = node_meta[2].1.expect("node 3 meta");
     assert_eq!(version, 1);

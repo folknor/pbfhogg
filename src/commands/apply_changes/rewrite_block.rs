@@ -45,7 +45,7 @@ fn emit_create_local(
                     osc.decimicro_lat(),
                     osc.decimicro_lon(),
                     osc.tags(),
-                    None,
+                    osc.metadata().as_ref(),
                 );
                 stats.diff_nodes += 1;
             }
@@ -66,7 +66,7 @@ fn emit_create_local(
                         role,
                     })
                     .collect();
-                bb.add_relation(osc.id(), osc.tags(), &members, None);
+                bb.add_relation(osc.id(), osc.tags(), &members, osc.metadata().as_ref());
                 stats.diff_relations += 1;
             }
         }
@@ -135,7 +135,7 @@ pub(super) fn rewrite_block_parallel(
                         osc.decimicro_lat(),
                         osc.decimicro_lon(),
                         osc.tags(),
-                        None,
+                        osc.metadata().as_ref(),
                     );
 
                     stats.diff_nodes += 1;
@@ -155,7 +155,7 @@ pub(super) fn rewrite_block_parallel(
                         osc.decimicro_lat(),
                         osc.decimicro_lon(),
                         osc.tags(),
-                        None,
+                        osc.metadata().as_ref(),
                     );
 
                     stats.diff_nodes += 1;
@@ -193,7 +193,7 @@ pub(super) fn rewrite_block_parallel(
                             role,
                         })
                         .collect();
-                    bb.add_relation(osc.id(), osc.tags(), &members, None);
+                    bb.add_relation(osc.id(), osc.tags(), &members, osc.metadata().as_ref());
 
                     stats.diff_relations += 1;
                 } else {

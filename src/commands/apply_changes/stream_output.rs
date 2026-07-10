@@ -37,7 +37,7 @@ pub(super) fn emit_create_for_output(
                     osc.decimicro_lat(),
                     osc.decimicro_lon(),
                     osc.tags(),
-                    None,
+                    osc.metadata().as_ref(),
                 );
                 stats.diff_nodes += 1;
             }

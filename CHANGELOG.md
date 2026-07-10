@@ -29,6 +29,18 @@
   space-separated ones. They are now escaped as character references
   (`&#10;` etc.), matching osmium's OSC writer. Affected attributes: tag
   keys/values, relation member roles, user names.
+- **apply-changes now carries OSC element metadata into its output.**
+  The OSC parser never read `version`/`timestamp`/`changeset`/`uid`/`user`
+  attributes, so every OSC-sourced created or modified element in merged
+  output silently carried version 0 and no timestamp (osmium's
+  applychanges preserves them). The overlay now stores a metadata block
+  per element and all nine apply-changes write paths pass it through.
+  Elements whose OSC carries no metadata attributes are written without
+  metadata, as before.
+- **`diff --format osc` now emits full element metadata** (timestamp,
+  changeset, uid, user - previously version only), matching osmium's OSC
+  writer and making the derive -> apply roundtrip metadata-lossless
+  end-to-end. Attributes absent from the source element are omitted.
 
 ### Dependencies
 

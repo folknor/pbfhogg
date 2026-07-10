@@ -4,7 +4,9 @@
 use crate::read::elements::MemberType;
 
 use super::ParseResult;
-use super::compact::member_type_to_byte;
+use super::compact::{
+    ArenaMeta, META_FLAG_HAS_USER, META_FLAG_HIDDEN, META_FLAG_PRESENT, member_type_to_byte,
+};
 use super::parse::CompactDiffOverlay;
 
 // ---------------------------------------------------------------------------
@@ -94,6 +96,7 @@ pub(super) struct ParserState {
     current_id: i64,
     current_lat: i32,
     current_lon: i32,
+    current_meta: ArenaMeta,
     tag_keys: Vec<u32>,
     tag_values: Vec<String>,
     refs: Vec<i64>,
@@ -108,6 +111,7 @@ impl ParserState {
             current_id: 0,
             current_lat: 0,
             current_lon: 0,
+            current_meta: ArenaMeta::default(),
             tag_keys: Vec::new(),
             tag_values: Vec::new(),
             refs: Vec::new(),
@@ -121,7 +125,61 @@ impl ParserState {
         self.refs.clear();
         self.members.clear();
         self.current_elem = CurrentElem::None;
+        self.current_meta = ArenaMeta::default();
     }
+}
+
+/// Parse the element metadata attributes (`version`, `timestamp`,
+/// `changeset`, `uid`, `user`, `visible`) in one pass over the attribute
+/// list. Lenient by design: any attribute that is absent or unparsable
+/// leaves its field at the zero default (real OSC producers always emit
+/// well-formed values; being strict here would make the whole parse fail
+/// on an exotic producer's metadata quirk while the element data itself
+/// is fine). The present flag is set when ANY metadata attribute was
+/// seen, mirroring `merge_changes::parse_metadata`'s leniency.
+fn parse_meta_attrs(
+    e: &quick_xml::events::BytesStart,
+    overlay: &mut CompactDiffOverlay,
+) -> ParseResult<ArenaMeta> {
+    let mut meta = ArenaMeta::default();
+    for attr_result in e.attributes() {
+        let attr = attr_result?;
+        match attr.key.as_ref() {
+            b"version" => {
+                let val = std::str::from_utf8(&attr.value)?;
+                meta.version = val.parse::<i32>().unwrap_or(0);
+                meta.flags |= META_FLAG_PRESENT;
+            }
+            b"timestamp" => {
+                let val = std::str::from_utf8(&attr.value)?;
+                meta.timestamp = crate::commands::parse_rfc3339_utc(val).unwrap_or(0);
+                meta.flags |= META_FLAG_PRESENT;
+            }
+            b"changeset" => {
+                let val = std::str::from_utf8(&attr.value)?;
+                meta.changeset = val.parse::<i64>().unwrap_or(0);
+                meta.flags |= META_FLAG_PRESENT;
+            }
+            b"uid" => {
+                let val = std::str::from_utf8(&attr.value)?;
+                meta.uid = val.parse::<i32>().unwrap_or(0);
+                meta.flags |= META_FLAG_PRESENT;
+            }
+            b"user" => {
+                let val = attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)?;
+                meta.user_id = overlay.intern(&val);
+                meta.flags |= META_FLAG_PRESENT | META_FLAG_HAS_USER;
+            }
+            b"visible" => {
+                if attr.value.as_ref() == b"false" {
+                    meta.flags |= META_FLAG_HIDDEN;
+                }
+                meta.flags |= META_FLAG_PRESENT;
+            }
+            _ => {}
+        }
+    }
+    Ok(meta)
 }
 
 /// Finalize the current element: build the tag slice, append to the appropriate
@@ -141,13 +199,14 @@ fn finalize_element(state: &mut ParserState, overlay: &mut CompactDiffOverlay) {
                 state.current_lat,
                 state.current_lon,
                 &tags,
+                &state.current_meta,
             );
         }
         CurrentElem::Way => {
-            overlay.push_way(state.current_id, &state.refs, &tags);
+            overlay.push_way(state.current_id, &state.refs, &tags, &state.current_meta);
         }
         CurrentElem::Relation => {
-            overlay.push_relation(state.current_id, &state.members, &tags);
+            overlay.push_relation(state.current_id, &state.members, &tags, &state.current_meta);
         }
         CurrentElem::None => {}
     }
@@ -192,6 +251,7 @@ fn handle_elem_start(
     }
 
     state.current_id = id;
+    state.current_meta = parse_meta_attrs(e, overlay)?;
 
     if elem_kind == CurrentElem::Node {
         let lat = parse_f64_attr(e, b"lat").unwrap_or(0.0);

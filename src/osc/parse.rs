@@ -15,7 +15,7 @@ use quick_xml::events::Event;
 use rustc_hash::FxHashMap;
 
 use super::ParseResult;
-use super::compact::{arena_append_node, arena_append_relation, arena_append_way};
+use super::compact::{ArenaMeta, arena_append_node, arena_append_relation, arena_append_way};
 use super::interner::StringInterner;
 use super::xml_parse::{
     ParserState, handle_empty_event_compact, handle_end_event_compact, handle_start_event_compact,
@@ -193,15 +193,28 @@ impl CompactDiffOverlay {
 
     /// Append a node to the arena and register it in the node index.
     #[inline]
-    pub(super) fn push_node(&mut self, id: i64, lat: i32, lon: i32, tags: &[(u32, &str)]) {
-        let offset = arena_append_node(&mut self.node_arena, id, lat, lon, tags);
+    pub(super) fn push_node(
+        &mut self,
+        id: i64,
+        lat: i32,
+        lon: i32,
+        tags: &[(u32, &str)],
+        meta: &ArenaMeta,
+    ) {
+        let offset = arena_append_node(&mut self.node_arena, id, lat, lon, tags, meta);
         self.node_index.insert(id, offset);
     }
 
     /// Append a way to the arena and register it in the way index.
     #[inline]
-    pub(super) fn push_way(&mut self, id: i64, refs: &[i64], tags: &[(u32, &str)]) {
-        let offset = arena_append_way(&mut self.way_arena, id, refs, tags);
+    pub(super) fn push_way(
+        &mut self,
+        id: i64,
+        refs: &[i64],
+        tags: &[(u32, &str)],
+        meta: &ArenaMeta,
+    ) {
+        let offset = arena_append_way(&mut self.way_arena, id, refs, tags, meta);
         self.way_index.insert(id, offset);
     }
 
@@ -212,8 +225,9 @@ impl CompactDiffOverlay {
         id: i64,
         members: &[(i64, u8, u32)],
         tags: &[(u32, &str)],
+        meta: &ArenaMeta,
     ) {
-        let offset = arena_append_relation(&mut self.relation_arena, id, members, tags);
+        let offset = arena_append_relation(&mut self.relation_arena, id, members, tags, meta);
         self.relation_index.insert(id, offset);
     }
 
@@ -441,6 +455,63 @@ mod tests {
         Ok(())
     }
 
+    /// Element metadata attributes survive the parse into the overlay and
+    /// come back through the ref accessors; elements without any metadata
+    /// attribute report `None`.
+    #[test]
+    fn test_parse_osc_element_metadata() -> ParseResult<()> {
+        let dir = make_test_dir("element_metadata");
+
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="100" lat="55.6761" lon="12.5683" version="7" timestamp="1970-01-02T00:00:00Z" changeset="123456" uid="42" user="mapper one"/>
+    <way id="200">
+      <nd ref="100"/>
+    </way>
+    <relation id="300" version="2" timestamp="2026-02-20T21:39:49Z">
+      <member type="way" ref="200" role="outer"/>
+    </relation>
+  </modify>
+</osmChange>"#;
+
+        write_osc_gz(&dir, "meta.osc.gz", xml);
+        let overlay = parse_osc_file(&dir.join("meta.osc.gz"))?;
+
+        let node = overlay.get_node(100).ok_or("node 100 missing")?;
+        let meta = node.metadata().ok_or("node 100 metadata missing")?;
+        assert_eq!(meta.version, 7);
+        assert_eq!(meta.timestamp, 86_400);
+        assert_eq!(meta.changeset, 123_456);
+        assert_eq!(meta.uid, 42);
+        assert_eq!(meta.user, "mapper one");
+        assert!(meta.visible);
+
+        // No metadata attributes at all -> None.
+        let way = overlay.get_way(200).ok_or("way 200 missing")?;
+        assert!(way.metadata().is_none());
+        // Metadata does not disturb the variable-length sections.
+        assert_eq!(way.refs().collect::<Vec<_>>(), vec![100]);
+
+        // Partial metadata: version + timestamp only; user absent -> "".
+        let rel = overlay.get_relation(300).ok_or("relation 300 missing")?;
+        let rmeta = rel.metadata().ok_or("relation 300 metadata missing")?;
+        assert_eq!(rmeta.version, 2);
+        assert_eq!(
+            rmeta.timestamp,
+            crate::commands::parse_rfc3339_utc("2026-02-20T21:39:49Z")
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
+        );
+        assert_eq!(rmeta.changeset, 0);
+        assert_eq!(rmeta.user, "");
+        let members: Vec<_> = rel.members().collect();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].2, "outer");
+
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
     #[test]
     fn test_merge_later_wins() -> ParseResult<()> {
         // Parse create first, then modify into the same overlay.
@@ -649,7 +720,14 @@ mod tests {
 
         let mut arena = Vec::new();
         let tags: Vec<(u32, &str)> = vec![(key_name, "Test City"), (key_place, "city")];
-        let offset = arena_append_node(&mut arena, 42, 556_800_000, 125_700_000, &tags);
+        let offset = arena_append_node(
+            &mut arena,
+            42,
+            556_800_000,
+            125_700_000,
+            &tags,
+            &ArenaMeta::default(),
+        );
 
         let node = CompactNodeRef {
             data: &arena[offset as usize..],
@@ -674,7 +752,7 @@ mod tests {
         let mut arena = Vec::new();
         let refs = vec![1, 2, 3, 4, 5];
         let tags: Vec<(u32, &str)> = vec![(key_highway, "residential")];
-        let offset = arena_append_way(&mut arena, 99, &refs, &tags);
+        let offset = arena_append_way(&mut arena, 99, &refs, &tags, &ArenaMeta::default());
 
         let way = CompactWayRef {
             data: &arena[offset as usize..],
@@ -710,7 +788,7 @@ mod tests {
             ),
         ];
         let tags: Vec<(u32, &str)> = vec![(key_type, "multipolygon")];
-        let offset = arena_append_relation(&mut arena, 500, &members, &tags);
+        let offset = arena_append_relation(&mut arena, 500, &members, &tags, &ArenaMeta::default());
 
         let rel = CompactRelationRef {
             data: &arena[offset as usize..],

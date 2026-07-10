@@ -582,6 +582,73 @@ pub(crate) fn format_epoch_secs(secs: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}Z")
 }
 
+/// Parse an RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`, the OSM XML
+/// timestamp format) into Unix epoch seconds.
+///
+/// Inverse of [`format_epoch_secs`]. Strict: exactly 20 bytes, `Z` suffix,
+/// no fractional seconds or offsets (OSM planet/OSC files never carry
+/// either). Used by the OSC parser for element `timestamp` attributes and
+/// by the CLI for `time-filter`'s cutoff argument.
+pub fn parse_rfc3339_utc(input: &str) -> std::result::Result<i64, String> {
+    const FORMAT_ERR: &str = "timestamp must be YYYY-MM-DDTHH:MM:SSZ";
+    if input.len() != 20 {
+        return Err(FORMAT_ERR.to_owned());
+    }
+
+    let bytes = input.as_bytes();
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return Err(FORMAT_ERR.to_owned());
+    }
+
+    let field = |start: usize, end: usize| -> std::result::Result<i64, String> {
+        input[start..end]
+            .parse::<i64>()
+            .map_err(|_| "invalid numeric timestamp component".to_owned())
+    };
+
+    let year = field(0, 4)?;
+    let month = field(5, 7)?;
+    let day = field(8, 10)?;
+    let hour = field(11, 13)?;
+    let minute = field(14, 16)?;
+    let second = field(17, 19)?;
+
+    if !(1..=12).contains(&month) {
+        return Err("invalid month in timestamp".to_owned());
+    }
+    if hour > 23 || minute > 59 || second > 59 {
+        return Err("invalid time in timestamp".to_owned());
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 0,
+    };
+    if day == 0 || day > max_day {
+        return Err("invalid day in timestamp".to_owned());
+    }
+
+    // Howard Hinnant's civil-date algorithm (inverse of format_epoch_secs).
+    let y = year - i64::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+
+    Ok(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -714,5 +781,40 @@ mod tests {
         })
         .expect("should not fail");
         assert!(!called);
+    }
+
+    /// `parse_rfc3339_utc` is the exact inverse of `format_epoch_secs` and
+    /// rejects malformed input.
+    #[test]
+    fn rfc3339_parse_inverts_format() -> std::result::Result<(), String> {
+        // Known anchor values.
+        assert_eq!(parse_rfc3339_utc("1970-01-01T00:00:00Z")?, 0);
+        assert_eq!(parse_rfc3339_utc("1970-01-02T00:00:00Z")?, 86_400);
+        assert_eq!(parse_rfc3339_utc("2004-02-29T12:00:00Z")?, 1_078_056_000);
+
+        // Roundtrip across a spread of epochs (leap years, month ends,
+        // century boundary).
+        for secs in [
+            0_u64,
+            951_827_696,   // 2000-02-29 (leap century)
+            1_582_934_400, // 2020-02-29
+            1_771_622_445, // denmark replication timestamp in test data
+            4_102_444_799, // 2099-12-31T23:59:59Z
+        ] {
+            let formatted = format_epoch_secs(secs);
+            assert_eq!(
+                parse_rfc3339_utc(&formatted)?,
+                secs.cast_signed(),
+                "roundtrip failed for {formatted}"
+            );
+        }
+
+        // Rejections.
+        assert!(parse_rfc3339_utc("2026-02-20 21:39:49").is_err()); // wrong shape
+        assert!(parse_rfc3339_utc("2026-13-01T00:00:00Z").is_err()); // month 13
+        assert!(parse_rfc3339_utc("2026-02-30T00:00:00Z").is_err()); // Feb 30
+        assert!(parse_rfc3339_utc("2026-02-20T24:00:00Z").is_err()); // hour 24
+        assert!(parse_rfc3339_utc("not-a-timestamp-at-al").is_err());
+        Ok(())
     }
 }

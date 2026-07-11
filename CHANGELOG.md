@@ -26,6 +26,22 @@
 
 ### Fixed
 
+- **`sort` no longer passes through blobs that are internally out of
+  order.** A blob whose elements were internally unsorted but whose
+  `(min_id, max_id)` range did not overlap its neighbours slipped past the
+  blob-range overlap check: `sort` emitted a byte-identical copy stamped
+  `Sort.Type_then_ID`, silently corrupting the sorted invariant. Pass 1 now
+  checks intra-blob monotonicity while scanning element IDs and routes any
+  internally out-of-order blob into the decode + re-encode path, so the
+  output is genuinely sorted. The check covers every input whose header
+  does not declare `Sort.Type_then_ID` - including indexed inputs, since
+  blob indexdata alone is not proof of internal order (an unsorted file
+  piped through `cat` gains indexdata without being reordered). Behavior
+  change for indexed inputs without the sorted claim: pass 1 now decodes
+  blob payloads to verify order (a one-line stderr notice says so).
+  Declared-sorted inputs keep the header-only fast path; a header that
+  claims sortedness over internally unsorted blobs violates its own
+  contract and remains undetected - see CORRECTNESS.md.
 - **OSC output no longer corrupts multi-line tag values.** All OSC-emitting
   paths (`diff --format osc` / derive-changes, `merge-changes`,
   `tags-filter --input-kind osc`) wrote raw newline/tab/CR characters

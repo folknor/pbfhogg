@@ -16,7 +16,7 @@ use crate::Element;
 use crate::blob::{
     BlobKind, decode_blob_to_headerblock, decode_blob_to_primitiveblock, decompress_blob_data_into,
 };
-use crate::blob_meta::{BlobIndex, ElemKind, scan_block_ids};
+use crate::blob_meta::{BlobIndex, ElemKind, scan_block_ids_checked};
 use crate::block_builder::BlockBuilder;
 use crate::file_writer::FileWriter;
 use crate::read::header_walker::HeaderWalker;
@@ -72,6 +72,16 @@ struct BlobEntry {
     has_indexdata: bool,
     /// Per-blob tag key data from BlobHeader field 4, preserved for passthrough.
     tagdata: Option<Box<[u8]>>,
+    /// True when this blob's elements are internally out of canonical OSM ID
+    /// order. Set by the payload-decoding pass-1 scan, which runs for every
+    /// non-indexed blob and for indexed blobs whose input header does not
+    /// claim `Sort.Type_then_ID`. Only blobs of a declared-sorted input skip
+    /// the payload; intra-blob sortedness there is a precondition of the
+    /// header claim itself (see CORRECTNESS.md). A blob flagged here is
+    /// routed into the decode + re-encode path so the sweep-merge actually
+    /// reorders it, even when its (min_id, max_id) range does not overlap
+    /// any neighbour.
+    intra_unsorted: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -139,13 +149,34 @@ pub fn sort(
     });
 
     // Detect overlaps
-    let overlaps = detect_overlaps(&entries);
-    crate::debug::emit_marker("SORT_OVERLAP_DETECT_END");
+    let mut overlaps = detect_overlaps(&entries);
+    // Capture the genuine range-overlap count BEFORE folding intra-blob
+    // disorder in. `sort_blobs_overlap` keeps its historical meaning:
+    // blobs whose (min_id, max_id) range overlaps a same-kind neighbour.
+    // Intra-unsorted blobs forced into the same rewrite path below are
+    // counted separately (sort_blobs_intra_unsorted) so the two attributions
+    // stay disjoint instead of double-counting the forced rewrites.
     let overlap_count = overlaps.iter().filter(|&&b| b).count();
+    // Fold in intra-blob disorder detected during the pass-1 payload scan.
+    // A blob whose elements are internally out of ID order but whose
+    // (min_id, max_id) range does not overlap its neighbours would otherwise
+    // pass straight through as raw bytes while the output header still claims
+    // Sort.Type_then_ID - silent corruption of the sorted invariant. Route it
+    // into the same decode + re-encode path an overlapping blob takes so the
+    // sweep-merge reorders its elements. (Blobs of a declared-sorted indexed
+    // input are never flagged here; pass 1 skips their payloads and trusts
+    // the header's Sort.Type_then_ID claim - see CORRECTNESS.md.)
+    let intra_unsorted_blobs = mark_intra_unsorted_for_rewrite(&entries, &mut overlaps);
+    crate::debug::emit_marker("SORT_OVERLAP_DETECT_END");
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("sort_blobs_overlap", overlap_count as i64);
+    #[allow(clippy::cast_possible_wrap)]
+    crate::debug::emit_counter("sort_blobs_intra_unsorted", intra_unsorted_blobs as i64);
     if overlap_count > 0 {
         eprintln!("  {overlap_count} blobs in overlap runs (decode + re-encode)");
+    }
+    if intra_unsorted_blobs > 0 {
+        eprintln!("  {intra_unsorted_blobs} blobs internally unsorted (decode + re-encode)");
     }
 
     crate::debug::emit_marker("SORT_PASS1_END");
@@ -311,9 +342,18 @@ pub fn sort(
 /// Build a blob-level index of the input file.
 ///
 /// Walks blob headers via `HeaderWalker` (pread-only, `fadvise(RANDOM)`).
-/// Blobs with indexdata are classified without touching payload bytes;
-/// non-indexed blobs take a fallback path that preads + decompresses the
-/// payload and scans element IDs. `direct_io` is accepted for signature
+/// When the input header claims `Sort.Type_then_ID`, blobs with indexdata
+/// are classified without touching payload bytes. All other blobs -
+/// non-indexed ones, and indexed ones of an input that does NOT declare
+/// itself sorted - take the fallback path that preads + decompresses the
+/// payload and scans element IDs, and while doing so checks intra-blob
+/// monotonicity (flagging blobs whose elements are internally out of
+/// canonical OSM ID order so pass 2 re-encodes them). Indexdata alone does
+/// not prove intra-blob order: `cat` attaches indexdata to third-party
+/// payloads it never reorders, and `PbfWriter::write_primitive_block`
+/// indexes caller-provided blocks as-is; the trusted ordering signal is the
+/// header claim, the same contract `ElementReader` keys its monotonicity
+/// guarantees on (see CORRECTNESS.md). `direct_io` is accepted for signature
 /// stability but unused here - the walker opens its own buffered fd.
 /// Twin of the migration done for `inspect/scan.rs::try_index_only_scan`
 /// (planet pass 1 was 21 s / 36 GB read through the buffered reader's
@@ -329,6 +369,7 @@ fn build_blob_index(
     let mut header: Option<crate::HeaderBlock> = None;
     let mut data_buf: Vec<u8> = Vec::new();
     let mut decompress_buf: Vec<u8> = Vec::new();
+    let mut warned_unclaimed_indexed = false;
 
     while let Some(meta) = walker.next_header()? {
         match meta.blob_type {
@@ -338,15 +379,34 @@ fn build_blob_index(
             }
             BlobKind::OsmData => {
                 let has_indexdata = meta.index.is_some();
-                let index = match meta.index {
-                    Some(idx) => idx,
+                // The header blob precedes all data blobs in a well-formed
+                // PBF; if a data blob somehow arrives first, `header` is
+                // still None and the blob conservatively takes the checked
+                // scan below.
+                let header_claims_sorted =
+                    header.as_ref().is_some_and(crate::HeaderBlock::is_sorted);
+                let (index, intra_unsorted) = match meta.index.filter(|_| header_claims_sorted) {
+                    // Declared-sorted input: pass 1 reads only the indexdata
+                    // header and never touches the payload. Intra-blob order
+                    // is a precondition of the Sort.Type_then_ID claim
+                    // itself, upheld by pbfhogg's own sorted producers and
+                    // trusted here exactly as ElementReader trusts it (see
+                    // CORRECTNESS.md).
+                    Some(idx) => (idx, false),
                     None => {
-                        // No indexdata - pread payload, decompress, scan IDs.
-                        walker.pread_data(meta.data_offset, meta.data_size, &mut data_buf)?;
-                        decompress_blob_data_into(&data_buf, &mut decompress_buf)?;
-                        scan_block_ids(&decompress_buf).ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidData, "failed to scan block IDs")
-                        })?
+                        // No indexdata, or indexdata on an input that does
+                        // not declare itself sorted (e.g. unsorted input run
+                        // through `cat`, which indexes blobs without
+                        // reordering them) - pread payload, decompress, scan
+                        // IDs with the intra-blob order check.
+                        if has_indexdata && !warned_unclaimed_indexed {
+                            warned_unclaimed_indexed = true;
+                            eprintln!(
+                                "  input does not declare Sort.Type_then_ID; verifying \
+                                 intra-blob order (pass 1 decodes every blob payload)"
+                            );
+                        }
+                        scan_payload_checked(&walker, &meta, &mut data_buf, &mut decompress_buf)?
                     }
                 };
                 entries.push(BlobEntry {
@@ -355,6 +415,7 @@ fn build_blob_index(
                     index,
                     has_indexdata,
                     tagdata: meta.tagdata,
+                    intra_unsorted,
                 });
             }
             _ => {
@@ -368,6 +429,31 @@ fn build_blob_index(
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no OSMHeader blob found"))?;
 
     Ok((header, entries))
+}
+
+/// Pass-1 payload fallback: pread + decompress one blob's payload and scan
+/// element IDs, checking intra-blob monotonicity along the way. Returns the
+/// freshly scanned `BlobIndex` (used for range analysis in preference to any
+/// stored indexdata, which is unverified on these inputs) and whether the
+/// blob is internally OUT of canonical OSM ID order.
+///
+/// Used for non-indexed blobs (no other way to learn the ID range) and for
+/// indexed blobs of an input whose header does not claim
+/// `Sort.Type_then_ID` (indexdata proves nothing about internal order -
+/// see CORRECTNESS.md). The monotonicity check is one compare per element
+/// on a scan that already visits every element ID, so effectively free
+/// relative to the pread + decompress it rides on.
+fn scan_payload_checked(
+    walker: &HeaderWalker,
+    meta: &crate::read::header_walker::BlobHeaderMeta,
+    data_buf: &mut Vec<u8>,
+    decompress_buf: &mut Vec<u8>,
+) -> Result<(BlobIndex, bool)> {
+    walker.pread_data(meta.data_offset, meta.data_size, data_buf)?;
+    decompress_blob_data_into(data_buf, decompress_buf)?;
+    let (index, sorted) = scan_block_ids_checked(decompress_buf)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "failed to scan block IDs"))?;
+    Ok((index, !sorted))
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +473,33 @@ fn type_order(kind: ElemKind) -> u8 {
 /// Two adjacent blobs of the same type overlap if the first's max_id >=
 /// the second's min_id. Returns a boolean vec where `true` marks entries
 /// that must be decoded and re-encoded.
+/// Fold intra-blob disorder flags into the overlap set, returning the number
+/// of blobs newly routed to rewrite.
+///
+/// `entry.intra_unsorted` is only ever set by the pass-1 payload scan, which
+/// runs for non-indexed blobs and for indexed blobs of an input that does
+/// not declare `Sort.Type_then_ID` (declared-sorted indexed blobs skip the
+/// payload and are trusted - see the `BlobEntry` field doc and
+/// CORRECTNESS.md). Marking such a blob as an overlap makes pass 2 decode and
+/// re-encode it through the sweep-merge, repairing the internal order even
+/// when its ID range does not overlap a neighbour.
+///
+/// The returned count is the number of blobs NEWLY routed to rewrite by this
+/// pass - blobs not already flagged by `detect_overlaps`. A blob that is both
+/// intra-unsorted AND genuinely range-overlapping is already in the rewrite
+/// set and is not counted here, keeping this figure disjoint from the
+/// genuine-overlap count the caller captured beforehand.
+fn mark_intra_unsorted_for_rewrite(entries: &[BlobEntry], overlaps: &mut [bool]) -> u64 {
+    let mut count = 0;
+    for (i, entry) in entries.iter().enumerate() {
+        if entry.intra_unsorted && !overlaps[i] {
+            overlaps[i] = true;
+            count += 1;
+        }
+    }
+    count
+}
+
 fn detect_overlaps(entries: &[BlobEntry]) -> Vec<bool> {
     let mut overlaps = vec![false; entries.len()];
     for i in 0..entries.len().saturating_sub(1) {

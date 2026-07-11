@@ -186,3 +186,71 @@ hard error is a strictly better signal than silent truncation until a
 real workload actually hits the cap. If that happens, the error message
 names the exact field and the migration path: bump the count to `u32`
 and increment `FORMAT_VERSION` in `src/geocode_index/format.rs`.
+
+## `sort`: intra-blob disorder
+
+**Status:** Fixed for every input that does not declare `Sort.Type_then_ID`
+(non-indexed AND indexed). For inputs that do declare it, intra-blob
+sortedness is a precondition of the header claim itself, documented below.
+
+**Context:** `pbfhogg sort` is a blob-level permutation sort: pass 1 indexes
+each blob's `(element_type, min_id, max_id)`, pass 2 raw-passes-through blobs
+whose ranges do not overlap a neighbour and decode-merges the ones that do.
+Both passes assume every blob is *internally* sorted - nothing decoded the
+elements to check. A file whose blobs are internally UNSORTED but whose
+`(min_id, max_id)` ranges are disjoint therefore slipped past the overlap
+check: `sort` emitted a byte-identical copy stamped `Sort.Type_then_ID`,
+silently corrupting the sorted invariant. `degrade --unsort-intra` produces
+exactly this shape (one internal ID inversion per kind, no cross-blob range
+overlap); composed with `--strip-indexdata` it yields the non-indexed variant
+that reaches the pass-1 fallback.
+
+**Fix:** Pass 1's payload fallback already preads, decompresses, and scans
+every element ID to derive the blob's `(min_id, max_id)`. `scan_block_ids`
+grew a checked twin (`scan_block_ids_checked`) that tracks intra-blob
+monotonicity during that same scan - one canonical-OSM-order compare per
+element, so effectively free where the payload is decoded anyway. A blob
+found internally out of order is flagged and routed into pass 2's decode +
+re-encode path exactly as an overlapping blob would be, so the sweep-merge
+reorders its elements and the output is genuinely sorted. Sorting is the
+command's job, so detected disorder is *handled*, not errored. The
+monotonicity check uses `osm_id_cmp`, so blobs in canonical negative-ID
+order (`-1, -2, -3, ...`) are not false-flagged.
+
+**Which blobs get the payload check - keyed on the header claim, not on
+indexdata:** Indexdata presence does NOT imply an internally sorted payload.
+`cat` attaches indexdata to arbitrary third-party blobs without reordering
+them (`src/commands/cat/mod.rs`, reframe path), and
+`PbfWriter::write_primitive_block` indexes caller-provided blocks as-is - so
+"indexdata is pbfhogg-written, hence sorted" is false: an unsorted
+non-indexed file piped through `cat` yields indexed-but-unsorted blobs. Pass
+1 therefore keys its trust on the input header's `Sort.Type_then_ID` claim,
+the same format-level contract `ElementReader` keys its ordering guarantees
+on:
+
+- **Input declares `Sort.Type_then_ID` + blob has indexdata:** header-only
+  classification, payload never decoded. This preserves the passthrough
+  design (on declared-sorted input ~94% of wall time is already the
+  writer-side `copy_file_range`; a mandatory decode would defeat the point).
+- **Everything else** (no indexdata, or indexdata without the header claim):
+  pread + decompress + checked ID scan. For the indexed-unclaimed case sort
+  prints a one-line stderr notice that pass 1 is decoding payloads to verify
+  intra-blob order; the freshly scanned index (not the stored indexdata) is
+  used for range analysis. `degrade --unsort` / `--unsort-intra` clear the
+  sorted claim, so their output - indexed or not - is detected and repaired,
+  not passed through.
+
+**Residual - precondition on the header claim:** A file whose header claims
+`Sort.Type_then_ID` while its blobs are internally unsorted is passed
+through undetected. That file already violates its own declared contract;
+every reader in the ecosystem (including pbfhogg's `ElementReader` ordering
+guarantees) trusts the claim, and pbfhogg's own sorted producers (`sort`,
+`repack`, `apply-changes`) uphold it. Trusting an explicit format-level
+declaration is categorically different from inferring sortedness from the
+mere presence of an implementation-detail sidecar field. No `--verify-blobs`
+flag: an input that wants verification simply arrives without the claim and
+gets the checked scan by default. Producers were deliberately left
+unchanged: indexdata (kind/range/count/bbox) is valid for an unsorted blob,
+and every consumer other than sort's former inference only uses it for range
+queries - stripping or gating it in `cat`/`PbfWriter` would punish those
+consumers to protect an inference sort no longer makes.

@@ -15,8 +15,9 @@ use std::path::Path;
 
 use common::cli::CliInvoker;
 use common::{
-    PbfContentsWithCoords, TestNode, TestRelation, TestWay, read_all_elements_with_coords,
-    read_header, write_test_pbf,
+    PbfContentsWithCoords, TestNode, TestRelation, TestWay, assert_indexed, assert_non_indexed,
+    assert_sorted_file, read_all_elements_with_coords, read_header, write_test_pbf,
+    write_test_pbf_non_indexed,
 };
 use pbfhogg::block_builder::{self, BlockBuilder, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
@@ -151,6 +152,90 @@ fn write_type_unsorted_pbf(path: &Path) {
     );
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    writer.flush().expect("flush");
+}
+
+/// Write a NON-INDEXED PBF whose first node blob is internally unsorted
+/// (elements 2, 1, 3 in wire order) while every blob's `(min_id, max_id)`
+/// range stays disjoint from its neighbours. This is the exact shape
+/// `degrade --unsort-intra --strip-indexdata` produces: a genuinely
+/// out-of-order stream that a blob-range overlap check cannot see. Because
+/// the blobs carry no indexdata, `sort`'s pass 1 decodes the payload and can
+/// (post-fix) observe the intra-blob inversion.
+///
+/// Blob layout (all blobs written without indexdata):
+///   node blob 0: ids 2, 1, 3   (internally unsorted, range 1..=3)
+///   node blob 1: ids 4, 5, 6   (sorted, range 4..=6, no overlap with blob 0)
+///   way  blob 2: ids 100, 200  (sorted)
+///   rel  blob 3: id  300
+#[allow(clippy::cast_possible_truncation)]
+fn write_intra_unsorted_non_indexed_pbf(path: &Path) {
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    // Genuinely-unsorted third-party file: header does not claim sortedness.
+    let header = block_builder::HeaderBuilder::new()
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+
+    // Node blob 0: insertion order 2, 1, 3 => internal ID inversion.
+    for id in [2_i64, 1, 3] {
+        bb.add_node(
+            id,
+            id as i32 * 1_000_000,
+            id as i32 * 2_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer
+            .write_primitive_block_no_indexdata(bytes)
+            .expect("write block");
+    }
+
+    // Node blob 1: sorted, disjoint range 4..=6.
+    for id in [4_i64, 5, 6] {
+        bb.add_node(
+            id,
+            id as i32 * 1_000_000,
+            id as i32 * 2_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer
+            .write_primitive_block_no_indexdata(bytes)
+            .expect("write block");
+    }
+
+    bb.add_way(100, [("highway", "residential")], &[1, 2, 3], None);
+    bb.add_way(200, [("highway", "primary")], &[4, 5, 6], None);
+    if let Some(bytes) = bb.take().expect("take") {
+        writer
+            .write_primitive_block_no_indexdata(bytes)
+            .expect("write block");
+    }
+
+    bb.add_relation(
+        300,
+        [("type", "route")],
+        &[pbfhogg::block_builder::MemberData {
+            id: pbfhogg::MemberId::Way(100),
+            role: "outer",
+        }],
+        None,
+    );
+    if let Some(bytes) = bb.take().expect("take") {
+        writer
+            .write_primitive_block_no_indexdata(bytes)
+            .expect("write block");
     }
 
     writer.flush().expect("flush");
@@ -727,6 +812,243 @@ fn sort_preserves_historical_information_feature() {
         header.has_historical_information(),
         "output header must declare HistoricalInformation",
     );
+}
+
+/// A non-indexed blob that is internally unsorted but whose ID range does
+/// not overlap its neighbours must be repaired, not passed through.
+///
+/// This is the correctness hole from `notes/sort.md` ("intra-blob disorder
+/// is invisible"): pass 1's blob-range overlap check sees nothing to fix, so
+/// pre-fix `sort` emitted a byte-identical copy stamped `Sort.Type_then_ID` -
+/// silent corruption. The non-indexed pass-1 fallback now tracks intra-blob
+/// monotonicity while it scans element IDs and routes any internally
+/// out-of-order blob into the decode + re-encode path.
+#[test]
+fn sort_repairs_intra_blob_disorder_in_non_indexed_input() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("intra_unsorted.osm.pbf");
+    let output = dir.path().join("sorted.osm.pbf");
+
+    write_intra_unsorted_non_indexed_pbf(&input);
+    // Precondition: the disorder is only observable because the blobs carry
+    // no indexdata, forcing the payload-decoding pass-1 fallback.
+    assert_non_indexed(&input);
+
+    let run = CliInvoker::new()
+        .arg("sort")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--force")
+        .assert_success();
+
+    // The disordered blob must be routed to rewrite, not passed through.
+    // (Pre-fix this printed nothing: detect_overlaps saw no range overlap and
+    // every blob went through the raw-passthrough copy path.)
+    run.assert_stderr_contains("internally unsorted");
+
+    // Output is genuinely sorted in file order with a truthful header, not
+    // merely element-equivalent. assert_sorted_file walks the file in blob
+    // order and checks the Sort.Type_then_ID flag plus per-type monotonicity.
+    assert_sorted_file(&output);
+
+    // Element set preserved: the internally-swapped node ids come back in order.
+    let result = read_all_elements_with_coords(&output);
+    let node_ids: Vec<i64> = result.nodes.iter().map(|(id, _, _, _)| *id).collect();
+    assert_eq!(node_ids, (1..=6).collect::<Vec<_>>());
+    assert_eq!(result.ways.len(), 2);
+    assert_eq!(result.relations.len(), 1);
+}
+
+/// The unsorted -> `cat` -> `sort` composition must not launder a false
+/// `Sort.Type_then_ID` claim (external review finding, 2026-07-11).
+///
+/// `cat` attaches indexdata to non-indexed blobs WITHOUT reordering their
+/// elements, so an internally-unsorted file emerges from `cat` indexed but
+/// still unsorted. Pre-fix, `sort` treated indexdata presence as proof of
+/// intra-blob order: pass 1 classified the catted blobs header-only, the
+/// range-disjoint disordered blob passed through byte-identical, and the
+/// output header claimed `Sort.Type_then_ID` - silent corruption. Post-fix,
+/// pass 1 keys its trust on the input header's sorted claim instead of on
+/// indexdata: the catted file does not declare `Sort.Type_then_ID`, so its
+/// payloads are decoded and checked, and the disordered blob is routed to
+/// decode + re-encode.
+#[test]
+fn sort_repairs_intra_blob_disorder_in_catted_indexed_input() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let raw = dir.path().join("intra_unsorted_raw.osm.pbf");
+    let catted = dir.path().join("intra_unsorted_catted.osm.pbf");
+    let output = dir.path().join("sorted.osm.pbf");
+
+    write_intra_unsorted_non_indexed_pbf(&raw);
+    assert_non_indexed(&raw);
+
+    // cat indexes the blobs but never reorders elements.
+    CliInvoker::new()
+        .arg("cat")
+        .arg(&raw)
+        .arg("-o")
+        .arg(&catted)
+        .assert_success();
+    assert_indexed(&catted);
+    // The composition premise: indexdata present, sorted claim absent.
+    assert!(
+        !read_header(&catted).is_sorted(),
+        "cat must not add a Sort.Type_then_ID claim the input never had"
+    );
+
+    // Indexed input: no --force needed. Pre-fix this run passed the
+    // disordered blob through and stamped a false sorted claim.
+    let run = CliInvoker::new()
+        .arg("sort")
+        .arg(&catted)
+        .arg("-o")
+        .arg(&output)
+        .assert_success();
+
+    // Pass 1 must announce the payload-verification path (indexed input
+    // without a sorted claim) and must catch the intra-blob inversion.
+    run.assert_stderr_contains("does not declare Sort.Type_then_ID");
+    run.assert_stderr_contains("internally unsorted");
+
+    // Output is genuinely sorted in file order with a truthful header.
+    assert_sorted_file(&output);
+
+    let result = read_all_elements_with_coords(&output);
+    let node_ids: Vec<i64> = result.nodes.iter().map(|(id, _, _, _)| *id).collect();
+    assert_eq!(node_ids, (1..=6).collect::<Vec<_>>());
+    assert_eq!(result.ways.len(), 2);
+    assert_eq!(result.relations.len(), 1);
+}
+
+/// A declared-sorted indexed input keeps the header-only pass 1: no
+/// payload-verification notice, no rewrites. Guards the passthrough fast
+/// path the header-claim-keyed trust ruling deliberately preserves.
+#[test]
+fn sort_declared_sorted_indexed_input_skips_payload_verification() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("declared_sorted.osm.pbf");
+    let output = dir.path().join("sorted.osm.pbf");
+
+    common::write_test_pbf_sorted(
+        &input,
+        &[
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("name", "a")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![("name", "b")],
+                meta: None,
+            },
+        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "path")],
+            meta: None,
+        }],
+        &[],
+    );
+    assert_indexed(&input);
+    assert!(read_header(&input).is_sorted(), "fixture must claim sorted");
+
+    let run = CliInvoker::new()
+        .arg("sort")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .assert_success();
+
+    let stderr = run.stderr_str();
+    assert!(
+        !stderr.contains("does not declare Sort.Type_then_ID"),
+        "declared-sorted input must keep the header-only pass 1; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("internally unsorted"),
+        "declared-sorted input must not trip the intra-disorder detector; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("0 rewritten"),
+        "declared-sorted indexed input must pass through with zero rewrites; stderr:\n{stderr}"
+    );
+    assert_sorted_file(&output);
+}
+
+/// A fully-sorted non-indexed input must still take the passthrough fast
+/// path: the intra-blob monotonicity check added for the disorder case must
+/// not flag well-formed blobs (no false positives, no rewrite regression).
+#[test]
+fn sort_sorted_non_indexed_input_stays_on_passthrough() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("sorted_non_indexed.osm.pbf");
+    let output = dir.path().join("sorted.osm.pbf");
+
+    write_test_pbf_non_indexed(
+        &input,
+        &[
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("name", "a")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![("name", "b")],
+                meta: None,
+            },
+        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "path")],
+            meta: None,
+        }],
+        &[TestRelation {
+            id: 20,
+            members: vec![common::TestMember {
+                id: pbfhogg::MemberId::Way(10),
+                role: "outer",
+            }],
+            tags: vec![("type", "multipolygon")],
+            meta: None,
+        }],
+    );
+    assert_non_indexed(&input);
+
+    let run = CliInvoker::new()
+        .arg("sort")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--force")
+        .assert_success();
+
+    // No blob was internally out of order, so none is routed to rewrite: the
+    // summary reports zero rewritten blobs and the intra-disorder line is
+    // absent.
+    let stderr = run.stderr_str();
+    assert!(
+        !stderr.contains("internally unsorted"),
+        "sorted input must not trip the intra-disorder detector; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("0 rewritten"),
+        "sorted non-indexed input must pass through with zero rewrites; stderr:\n{stderr}"
+    );
+
+    assert_sorted_file(&output);
 }
 
 // ---------------------------------------------------------------------------

@@ -668,23 +668,40 @@ osmium's element-level sort fixed what we passed through. The
 overlap-rewrite path itself has therefore STILL never been exercised
 on real unsorted data.
 
-Decision needed (tracked in TODO.md):
+**Resolved (2026-07-11).** Recorded in CORRECTNESS.md ("`sort`: intra-blob
+disorder"). An external review falsified the first ruling's premise that
+"indexdata implies pbfhogg-sorted payload" - `cat` attaches indexdata to
+third-party blobs without reordering them, and
+`PbfWriter::write_primitive_block` indexes caller-provided blocks as-is, so
+unsorted non-indexed -> `cat` -> `sort` yielded a false sorted claim. The
+final ruling keys trust on the header claim instead:
 
-- **Detect in the non-indexed fallback for ~free.** `build_blob_index`'s
-  fallback already decompresses payloads and scans element IDs for
-  min/max; tracking monotonicity during that scan costs one compare per
-  element. Genuinely-unsorted third-party files (osmosis output, custom
-  exporters) are exactly the non-indexed case, so the free check covers
-  the realistic threat.
-- **Indexed inputs: producer contract.** Indexdata-carrying blobs are
-  pbfhogg-produced and internally sorted by construction - except
-  `degrade`'s output, which is adversarial by design. Options: document
-  intra-blob sortedness as a precondition of the indexed fast path, or
-  add an opt-in `--verify-blobs` decode pass. A mandatory decode of
-  every blob would destroy the passthrough design (94 % of wall is
-  already writer-side `copy_file_range` on sorted input).
-- Whatever the decision lands, record it in CORRECTNESS.md; nothing
-  there covers this today.
+- **Checked scan wherever the payload is decoded.** `scan_block_ids` grew a
+  checked twin, `scan_block_ids_checked`, that tracks intra-blob
+  monotonicity (canonical OSM order via `osm_id_cmp`) during the scan
+  that already computes min/max - one compare per element. `build_blob_index`
+  flags any out-of-order blob, and `sort` folds that flag into
+  the overlap set so pass 2 decodes + re-encodes it (handled, not errored -
+  sorting is the command's job). `sort` prints a
+  `blobs internally unsorted (decode + re-encode)` line and emits a
+  `sort_blobs_intra_unsorted` counter when it fires.
+- **Trust is keyed on the header's `Sort.Type_then_ID` claim, not on
+  indexdata presence.** Declared-sorted indexed input: header-only pass 1,
+  passthrough design intact. Indexed input WITHOUT the sorted claim (the
+  `cat`-over-unsorted shape, and `degrade --unsort*` output, which clears
+  the claim): pass 1 preads + decompresses + checked-scans every payload,
+  with a one-line stderr notice, and uses the fresh scan for range
+  analysis. This is the same trust boundary `ElementReader` already uses.
+- **Residual, documented:** a header that claims sorted over internally
+  unsorted blobs violates its own contract and passes through undetected.
+  No `--verify-blobs` flag - wanting verification means arriving without
+  the claim, which now gets it by default. Producers (`cat`, `PbfWriter`)
+  deliberately unchanged: indexdata range info is valid for unsorted blobs
+  and every other consumer only uses it for range queries.
+
+The overlap-rewrite path is now also exercised on real unsorted data by
+`degrade --unsort` (cross-blob) and `degrade --unsort-intra --strip-indexdata`
+(intra-blob), closing the "STILL never been exercised" gap noted above.
 
 ## Things that deliberately do not change
 

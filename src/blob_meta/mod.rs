@@ -12,7 +12,7 @@
 mod scan_ids;
 mod tag_index;
 
-pub(crate) use scan_ids::scan_block_ids;
+pub(crate) use scan_ids::{scan_block_ids, scan_block_ids_checked};
 pub(crate) use tag_index::{TAG_INDEX_VERSION, TagIndex, scan_block_tags};
 
 /// Element type stored in a blob index.

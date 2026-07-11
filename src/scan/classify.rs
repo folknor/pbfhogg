@@ -32,6 +32,152 @@ use crate::BoxResult as Result;
 /// `data_size` address the blob's payload in the input PBF.
 pub(crate) type ScheduleEntry = (usize, u64, usize);
 
+const PREFETCH_WILLNEED_ENV: &str = "PBFHOGG_PREFETCH_WILLNEED";
+const WILLNEED_COALESCE_GAP_BYTES: u64 = 4 * 1024;
+const WILLNEED_WINDOW_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Read the experimental schedule-prefetch gate at its sole environment
+/// boundary. `WillneedPrefetch` owns the resulting plain state, so tests need
+/// not mutate the process environment.
+fn prefetch_willneed_from_env() -> Result<bool> {
+    parse_prefetch_willneed(std::env::var(PREFETCH_WILLNEED_ENV))
+}
+
+fn parse_prefetch_willneed(value: std::result::Result<String, std::env::VarError>) -> Result<bool> {
+    match value {
+        Ok(value) if value == "1" => Ok(true),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Ok(value) => {
+            Err(format!("{PREFETCH_WILLNEED_ENV} must be exactly 1 when set, got {value:?}").into())
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("{PREFETCH_WILLNEED_ENV} must be Unicode and exactly 1 when set").into())
+        }
+    }
+}
+
+/// Coalesce body ranges in a walker-derived schedule. Schedule entries retain
+/// file order, so bodies separated by up to a BlobHeader-sized gap are joined.
+/// A zero-sized body has no range to advise: passing length zero to
+/// `posix_fadvise` would instead mean through EOF.
+fn coalesce_willneed_ranges(schedule: &[ScheduleEntry]) -> Vec<(u64, u64)> {
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    for &(_, offset, size) in schedule {
+        let size = size as u64;
+        if size == 0 {
+            continue;
+        }
+        let Some(end) = offset.checked_add(size) else {
+            continue;
+        };
+        if let Some((previous_offset, previous_size)) = ranges.last_mut()
+            && previous_offset
+                .checked_add(*previous_size)
+                .and_then(|previous_end| previous_end.checked_add(WILLNEED_COALESCE_GAP_BYTES))
+                .is_some_and(|end_with_gap| offset <= end_with_gap)
+            && let Some(previous_end) = previous_offset.checked_add(*previous_size)
+            && let Some(extension) = end.checked_sub(previous_end)
+            && let Some(extended_size) = previous_size.checked_add(extension)
+        {
+            *previous_size = extended_size;
+        } else {
+            ranges.push((offset, size));
+        }
+    }
+    ranges
+}
+
+/// Sliding WILLNEED state for a pread dispatcher. The dispatcher advises about
+/// 256 MiB ahead as it hands entries to workers, rather than prefetching the
+/// entire schedule before any reads begin.
+pub(crate) struct WillneedPrefetch {
+    ranges: Vec<(u64, u64)>,
+    next_range: usize,
+    next_offset: u64,
+}
+
+impl WillneedPrefetch {
+    /// The one environment boundary for this experimental knob. It runs
+    /// before a caller can return early for an empty schedule.
+    pub(crate) fn from_env(schedule: &[ScheduleEntry]) -> Result<Self> {
+        let enabled = prefetch_willneed_from_env()?;
+        Ok(Self {
+            ranges: if enabled {
+                coalesce_willneed_ranges(schedule)
+            } else {
+                Vec::new()
+            },
+            next_range: 0,
+            next_offset: 0,
+        })
+    }
+
+    /// Advise enough coalesced ranges to keep the window ahead of `entry`.
+    pub(crate) fn before_dispatch(
+        &mut self,
+        shared_file: &std::sync::Arc<std::fs::File>,
+        entry: ScheduleEntry,
+    ) {
+        let Some(window_end) = entry
+            .1
+            .checked_add(entry.2 as u64)
+            .and_then(|end| end.checked_add(WILLNEED_WINDOW_BYTES))
+        else {
+            return;
+        };
+
+        while let Some(&(range_offset, range_size)) = self.ranges.get(self.next_range) {
+            let Some(range_end) = range_offset.checked_add(range_size) else {
+                self.next_range += 1;
+                self.next_offset = 0;
+                continue;
+            };
+            let offset = if self.next_offset == 0 {
+                range_offset
+            } else {
+                self.next_offset
+            };
+            if offset >= window_end {
+                break;
+            }
+            let end = range_end.min(window_end);
+            let Some(size) = end.checked_sub(offset) else {
+                self.next_range += 1;
+                self.next_offset = 0;
+                continue;
+            };
+            if end == range_end {
+                self.next_range += 1;
+                self.next_offset = 0;
+            } else {
+                self.next_offset = end;
+            }
+
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::io::AsRawFd as _;
+
+                let (Ok(offset), Ok(size)) = (offset.try_into(), size.try_into()) else {
+                    continue;
+                };
+                // Safety: the File owns a valid descriptor for this call. As
+                // with HeaderWalker's RANDOM hint, fadvise failures are advisory.
+                unsafe {
+                    libc::posix_fadvise(
+                        shared_file.as_ref().as_raw_fd(),
+                        offset,
+                        size,
+                        libc::POSIX_FADV_WILLNEED,
+                    );
+                }
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            let _ = shared_file;
+        }
+    }
+}
+
 /// Resolve a caller-supplied `threads: Option<usize>` override into a
 /// concrete decode-thread count. `None` (the default for every existing
 /// caller) picks `available_parallelism() - 2` clamped to ≥ 1, the
@@ -234,6 +380,7 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
+    let mut willneed = WillneedPrefetch::from_env(schedule)?;
     if schedule.is_empty() {
         return Ok(());
     }
@@ -248,6 +395,7 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
     std::thread::scope(|scope| -> Result<()> {
         scope.spawn(move || {
             for &item in schedule {
+                willneed.before_dispatch(shared_file, item);
                 if desc_tx.send(item).is_err() {
                     break;
                 }
@@ -335,6 +483,7 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
+    let mut willneed = WillneedPrefetch::from_env(schedule)?;
     if schedule.is_empty() {
         return Ok(());
     }
@@ -349,6 +498,7 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
     std::thread::scope(|scope| -> Result<()> {
         scope.spawn(move || {
             for &item in schedule {
+                willneed.before_dispatch(shared_file, item);
                 if desc_tx.send(item).is_err() {
                     break;
                 }
@@ -471,6 +621,7 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
+    let mut willneed = WillneedPrefetch::from_env(schedule)?;
     if schedule.is_empty() {
         return Ok(());
     }
@@ -485,6 +636,7 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
     std::thread::scope(|scope| -> Result<()> {
         scope.spawn(move || {
             for &item in schedule {
+                willneed.before_dispatch(shared_file, item);
                 if desc_tx.send(item).is_err() {
                     break;
                 }
@@ -550,4 +702,52 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::{ScheduleEntry, coalesce_willneed_ranges, parse_prefetch_willneed};
+
+    #[test]
+    fn prefetch_willneed_gate_accepts_only_one_or_unset() {
+        assert!(parse_prefetch_willneed(Ok("1".to_owned())).unwrap());
+        assert!(!parse_prefetch_willneed(Err(std::env::VarError::NotPresent)).unwrap());
+
+        for value in ["", "0", "true", "01", "1 "] {
+            let error = parse_prefetch_willneed(Ok(value.to_owned())).unwrap_err();
+            assert!(
+                error.to_string().contains("PBFHOGG_PREFETCH_WILLNEED"),
+                "error must name the environment variable: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn willneed_ranges_coalesce_abutting_body_ranges() {
+        let schedule: [ScheduleEntry; 3] = [(0, 100, 20), (1, 120, 30), (2, 5_000, 5)];
+
+        assert_eq!(
+            coalesce_willneed_ranges(&schedule),
+            vec![(100, 50), (5_000, 5)]
+        );
+    }
+
+    #[test]
+    fn willneed_ranges_coalesce_realistic_blob_header_gaps() {
+        let schedule: [ScheduleEntry; 4] = [
+            (0, 100, 20),
+            // Real PBF payloads have a four-byte header length plus the
+            // BlobHeader between bodies. These represent 24- and 4096-byte
+            // gaps, both intentionally bridged by the prefetch range.
+            (1, 144, 5),
+            (2, 4_245, 10),
+            (3, 8_352, 10),
+        ];
+
+        assert_eq!(
+            coalesce_willneed_ranges(&schedule),
+            vec![(100, 4_155), (8_352, 10)]
+        );
+    }
 }

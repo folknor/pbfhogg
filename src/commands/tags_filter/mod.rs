@@ -982,6 +982,7 @@ fn tags_filter_two_pass(
             .enumerate()
             .map(|(i, &(data_offset, data_size))| (i, data_offset, data_size))
             .collect();
+        let mut willneed = crate::scan::classify::WillneedPrefetch::from_env(&decode_items)?;
 
         type WorkerResult = (
             usize,
@@ -990,10 +991,12 @@ fn tags_filter_two_pass(
         let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
         let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<WorkerResult>(32);
+        let prefetch_file = std::sync::Arc::clone(&shared_file);
 
         std::thread::scope(|scope| -> Result<()> {
             scope.spawn(move || {
                 for item in decode_items {
+                    willneed.before_dispatch(&prefetch_file, item);
                     if desc_tx.send(item).is_err() {
                         break;
                     }

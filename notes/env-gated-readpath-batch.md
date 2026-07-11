@@ -233,10 +233,16 @@ verdict. **The user explicitly overrode both rules for this batch
 - Denmark gates: `brokkr check`;
   `scripts/envrun.sh PBFHOGG_BATCHED_PIPELINE=1 brokkr verify all --dataset denmark`;
   pipelined equivalence tests in `tests/read_paths.rs` run both states.
-- Overnight cells:
+- Overnight cells (rev 3 - the spec survey proved the planned time-filter
+  pair inert: planet primary is a snapshot PBF, so time-filter dispatches
+  to `parallel_classify_phase` and never enters `run_pipeline`; no history
+  dataset exists in brokkr.toml, and the history path is covered by a CLI
+  byte-compare test instead):
   - Read pairs: gated read cells on planet primary, planet 8k, and europe
     (baselines shared per layout below).
-  - `run brokkr time-filter --dataset planet --bench 1` + gated twin.
+  - getparents 8k gated pair (genuine ADR-0006 FullScan `run_pipeline`
+    consumer; shares the item-3 baseline) plus a cheap getid 8k
+    single-gate isolation cell, per the spec.
   - tags-filter `-R` pairs are shared with item 3 (the baseline and the
     single-gate cells serve both items).
   - Combination cell:

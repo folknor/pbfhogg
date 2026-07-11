@@ -1,5 +1,20 @@
 # Implementation spec: ordered-pipeline batch rebuild (gate `PBFHOGG_BATCHED_PIPELINE`)
 
+Rev 3 (2026-07-11): cross-amendment driven by the fusion spec's review
+(`notes/fusion-spec-R1.md` finding 4) - rev 2 said fusion would thread
+its transform through `decode_batch_entry` and defined state 2 of the
+morning matrix as restoring that signature, which contradicted
+`notes/fusion-spec.md` section 1.5 point 3. Resolved in fusion's
+direction, which is structurally better: no signature churn on the
+shared decode seam, and state 2's fusion revert becomes a pure section
+delete. `decode_batch_entry` keeps its plain signature permanently;
+fusion applies its transform at the call site inside a marked
+fusion-only worker loop. Sections 1.6, 2.5, and 5 updated to match.
+Rider from the same review's finding 2 (measurement rules,
+`reference/performance.md`): the command cells shared with item 3 move
+to `--bench 3`, and the `--bench 1` read cells get a pre-registered
+aggregation rule (section 3 brick 5).
+
 Rev 2 (2026-07-11): folds the R1 codex critique
 (`notes/pipeline-rebuild-spec-R1.md`) - pump admission redesigned
 (flush-before-blocking), morning adjudication is now a four-state
@@ -210,17 +225,24 @@ dead code:
      contracts under both engines. Fusion may build any new surface on top
      of them.
    - Inside the batched engine, per-blob decode is factored as one named
-     function (`decode_batch_entry`, section 2.5). Item 3's
-     gate-on-both-gates arm (the combination cell) WILL EDIT
-     `batched_pipeline.rs` to thread its transform through that function
-     (a closure/parameter fusion's spec defines); its gate-on-fusion-only
-     arm runs inside the default engine's rayon decode tasks and must be
-     completely free-standing from this module. This split is binding on
-     fusion's spec because it is what keeps the four-state morning matrix
-     (section 5) executable: deleting `batched_pipeline.rs` + the dispatch
-     arms must delete fusion's both-gates arm with it, leaving fusion's
-     default-engine arm intact. Fusion's transform definitions and its
-     command-side code live outside this module, always.
+     function (`decode_batch_entry`, section 2.5) whose signature is
+     PERMANENT - fusion never re-signs it (rev 3, resolving the
+     contradiction `notes/fusion-spec-R1.md` finding 4 caught; the
+     agreed design is fusion's, `notes/fusion-spec.md` section 1.5
+     point 3). Item 3's gate-on-both-gates arm (the combination cell)
+     adds a clearly-marked fusion section to `batched_pipeline.rs` - a
+     fused-only worker loop that calls `decode_batch_entry` and applies
+     the transform to the returned block at the call site; its
+     gate-on-fusion-only arm runs inside the default engine's rayon
+     decode tasks and must be completely free-standing from this
+     module. This split is binding on fusion's spec because it is what
+     keeps the four-state morning matrix (section 5) executable:
+     deleting `batched_pipeline.rs` + the dispatch arms must delete
+     fusion's both-gates arm with it, leaving fusion's default-engine
+     arm intact; deleting only fusion (state 2) is a pure delete of the
+     marked section, with nothing to restore. Fusion's transform
+     definitions and its command-side code live outside this module,
+     always.
    - Budget accounting under fusion: the decoded-byte permit is charged
      for the decoded block regardless of what the transform emits, and is
      released at ordered delivery of the batch. Fusion must not release it
@@ -533,7 +555,10 @@ cannot make queue slot count unbounded under a byte cap.
    storage first, then releases the raw bytes.
 3. For each blob, in order, `decode_batch_entry(blob, filter, pool,
    st_scratch, gr_scratch) -> Option<Result<PrimitiveBlock>>` - the named
-   seam item 3 hooks (section 1.6): filter check via the same
+   seam item 3's fused worker loop calls at its own call site (section
+   1.6; the signature is permanent - fusion applies its transform to
+   the returned block and never re-signs this function): filter check
+   via the same
    `should_skip_blob` (imported from `pipeline.rs` - a pure function, not
    an engine seam) returning `None` for skips and bumping the skip
    counter; otherwise `to_primitiveblock_inline_with_scratch` with
@@ -861,6 +886,25 @@ re-running the 8k parallel variant, which is documented OOM-killed in
 `reference/blob-density.md`. The shared BASELINE cells stay four-mode
 (items 1 and 2 adjudicate other rows off them).
 
+Bench counts (rev 3, from the fusion review's finding 2, reconciled
+with `reference/performance.md`'s reading rules - verdicts come from
+`--bench 3` best-of, not single runs): the command cells - the
+getparents 8k pair, the getid isolation cell, the tags-filter gated
+twins (their item-3-shared baselines are `--bench 3` per the fusion
+spec), and the combination cell - run `--bench 3`; both sides of a
+pair always share the bench count (a best-of-3 side against a
+single-run side biases the comparison). Read cells stay `--bench 1` on
+cost (a planet four-mode baseline is ~26 min; tripling the baselines
+plus twins adds hours), under this pre-registered aggregation rule: a
+read-pair delta adjudicates - in EITHER direction - only when
+corroborated, by a same-direction >= 3 % delta on the other read
+signal cell (8k and europe corroborate each other) or by a same-engine
+`--bench 3` command signal cell clearing the floor. An uncorroborated
+single read-cell delta >= 3 % (improvement or regression) triggers an
+attended repeat of that pair before adjudication; two same-direction
+single runs count as confirmed. Primary-read pairs remain
+no-regression controls under the same corroboration rule.
+
 - Read pairs (shared baselines per the plan's layout; verdict = pipelined
   wall only):
   - `run brokkr read --dataset planet --variant indexed --bench 1` +
@@ -871,21 +915,21 @@ re-running the 8k parallel variant, which is documented OOM-killed in
     `run env PBFHOGG_BATCHED_PIPELINE=1 brokkr read --dataset europe --variant indexed --modes pipelined --bench 1`
 - **REPLACED CELL** (was the time-filter planet pair, inert per section
   1.3): getparents 8k pair, baseline shared with items 2/3:
-  - `run brokkr getparents --dataset planet --variant indexed --snapshot 8k --bench 1` +
-    `run env PBFHOGG_BATCHED_PIPELINE=1 brokkr getparents --dataset planet --variant indexed --snapshot 8k --bench 1`
+  - `run brokkr getparents --dataset planet --variant indexed --snapshot 8k --bench 3` +
+    `run env PBFHOGG_BATCHED_PIPELINE=1 brokkr getparents --dataset planet --variant indexed --snapshot 8k --bench 3`
 - getid single-gate isolation cell (shares item-3's same-night 8k
   `--add-referenced` baseline; separates BATCHED's solo command effect
   from the combination):
-  - `run env PBFHOGG_BATCHED_PIPELINE=1 brokkr getid --dataset planet --variant indexed --snapshot 8k --add-referenced --bench 1`
+  - `run env PBFHOGG_BATCHED_PIPELINE=1 brokkr getid --dataset planet --variant indexed --snapshot 8k --add-referenced --bench 3`
 - tags-filter `-R` gated twins on the item-3-shared baselines. Command
   form corrected (R1 finding, verified against brokkr's schema: `-R` is
   a bare flag, the expression rides `--filter`); expression pinned in
   section 1.6 point 5:
-  - `run env PBFHOGG_BATCHED_PIPELINE=1 brokkr tags-filter --dataset planet --variant indexed -R --filter w/highway=primary --bench 1`
-  - `run env PBFHOGG_BATCHED_PIPELINE=1 brokkr tags-filter --dataset planet --variant indexed --snapshot 8k -R --filter w/highway=primary --bench 1`
+  - `run env PBFHOGG_BATCHED_PIPELINE=1 brokkr tags-filter --dataset planet --variant indexed -R --filter w/highway=primary --bench 3`
+  - `run env PBFHOGG_BATCHED_PIPELINE=1 brokkr tags-filter --dataset planet --variant indexed --snapshot 8k -R --filter w/highway=primary --bench 3`
 - Combination cell (the end-state candidate, vs item-3's same-night 8k
   `--add-referenced` baseline):
-  - `run env PBFHOGG_BATCHED_PIPELINE=1 PBFHOGG_FUSE_TRANSFORM=1 brokkr getid --dataset planet --variant indexed --snapshot 8k --add-referenced --bench 1`
+  - `run env PBFHOGG_BATCHED_PIPELINE=1 PBFHOGG_FUSE_TRANSFORM=1 brokkr getid --dataset planet --variant indexed --snapshot 8k --add-referenced --bench 3`
 
 No dedicated geocode cell: build-geocode-index pass 1 is
 relation-filtered (skips the overwhelming node/way majority pre-decode)
@@ -898,15 +942,21 @@ Budget note for the plan: dropping the two time-filter cells and
 trimming the three gated read twins to `--modes pipelined` funds the
 getparents gated twin (~1 min) and the getid isolation cell (~1 min)
 with room to spare (time-filter planet was one of the heavy command
-cells).
+cells). Rev 3's `--bench 3` roughly triples the command-cell line
+items - still minutes-scale against the read cells' hours.
 
 **Pre-registered verdict (plan noise floor):** KEEP requires >= 3 %
 improvement on at least one signal cell - 8k read (pipelined variant),
 europe read (pipelined variant), getparents 8k, tags-filter `-R` 8k, or
 the getid isolation cell. Planet-primary pairs must sit inside +/-3 %
-both directions (no-regression controls). Any paired cell regressing
-> 3 % is an automatic revert. Read verdicts wall-only; command verdicts
-wall plus `brokkr sidecar --compare` RSS as supporting evidence.
+both directions (no-regression controls). Command cells read
+`--bench 3` best-of; a command cell regressing > 3 % is an automatic
+revert. Read cells read single-run walls under the rev-3 corroboration
+rule above - an uncorroborated read-cell regression does not
+auto-revert; it triggers the attended repeat first, and a confirmed
+> 3 % regression then reverts. Read verdicts wall-only; command
+verdicts wall plus `brokkr sidecar --compare` RSS as supporting
+evidence.
 
 ---
 
@@ -978,16 +1028,18 @@ item.
 
 The four states:
 
-1. **Keep both.** Fusion's KEEP edits (its spec's path, including
-   promoting the `decode_batch_entry` transform hook to production),
+1. **Keep both.** Fusion's KEEP edits (its spec's path; its fused
+   worker section in this module becomes production code beside the
+   plain worker loop - `decode_batch_entry` unchanged either way),
    then this item's KEEP edits. ADR-0008 records the batched engine;
    fusion's ADR (its spec names it) records the fused end state.
    Gates: `brokkr check` +
    `brokkr verify all --dataset denmark --variant indexed`.
 2. **Keep batching, revert fusion.** Fusion's REVERT edits first (its
-   spec's path; inside this module that means `decode_batch_entry`
-   returns to the plain no-transform signature of section 2.5), then
-   this item's KEEP edits. Gates: `brokkr check` +
+   spec's path; inside this module that means deleting the marked
+   fusion section - `decode_batch_entry` was never re-signed, so there
+   is nothing to restore), then this item's KEEP edits. Gates:
+   `brokkr check` +
    `brokkr verify all --dataset denmark --variant indexed`.
 3. **Revert batching, keep fusion.** Fusion's KEEP edits restricted to
    its default-engine arm (its both-gates arm dies with this module -

@@ -27,9 +27,7 @@ use std::os::unix::fs::FileExt as _;
 use std::path::Path;
 use std::sync::atomic::AtomicI64;
 
-use crate::blob::{
-    BlobKind, DecompressPool, decompress_blob_raw, parse_primitive_block_from_bytes_owned,
-};
+use crate::blob::{BlobKind, DecompressPool, decompress_blob_raw};
 use crate::blob_meta::{BlobIndex, ElemKind};
 use crate::block_builder::{BlockBuilder, OwnedBlock};
 use crate::idset::IdSet;
@@ -151,6 +149,11 @@ struct WorkerScratch {
     way_scratch: WayReframeScratch,
     reframe_output: Vec<u8>,
     output: Vec<OwnedBlock>,
+    /// String-table and group-range scratch for `parse_and_inline_with_scratch`
+    /// on the non-way decode path. Retained across descriptors so the per-block
+    /// `Vec<(u32, u32)>` allocation is eliminated.
+    st_scratch: Vec<(u32, u32)>,
+    gr_scratch: Vec<(u32, u32)>,
 }
 
 impl WorkerScratch {
@@ -165,6 +168,8 @@ impl WorkerScratch {
             way_scratch: WayReframeScratch::default(),
             reframe_output: Vec::new(),
             output: Vec::new(),
+            st_scratch: Vec::new(),
+            gr_scratch: Vec::new(),
         }
     }
 }
@@ -231,13 +236,23 @@ fn decode_one(
     }
 
     // Non-way decode (Node decode when keep_untagged_nodes=false; Unknown).
-    // Goes through the WireBlob -> Bytes path so the existing
-    // process_block / BlockBuilder pipeline runs unchanged.
-    let wire_blob =
-        crate::blob::WireBlob::parse_slice(&scratch.read_buf).map_err(|e| e.to_string())?;
-    let bytes =
-        crate::blob::decompress_blob(&wire_blob, Some(&scratch.pool)).map_err(|e| e.to_string())?;
-    let block = parse_primitive_block_from_bytes_owned(&bytes).map_err(|e| e.to_string())?;
+    // Decompress straight into a pooled buffer and parse it in place. The buffer
+    // is fetched from and returned to the same `DecompressPool` (the block's
+    // backing `Bytes` recycles it on drop), preserving the pooling economics of
+    // the old `decompress_blob(.., Some(pool))` route while dropping the extra
+    // whole-buffer copy that `parse_primitive_block_from_bytes_owned`'s
+    // `Bytes -> to_vec` incurred. Also skips the `WireBlob::parse_slice` copy the
+    // old route paid, going straight from the framed blob bytes via
+    // `decompress_blob_raw` - the same wire-level path the way branch above uses.
+    let mut decompressed = crate::blob::pool_get_pub(&scratch.pool, 0);
+    decompress_blob_raw(&scratch.read_buf, &mut decompressed).map_err(|e| e.to_string())?;
+    let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
+        decompressed,
+        &scratch.pool,
+        &mut scratch.st_scratch,
+        &mut scratch.gr_scratch,
+    )
+    .map_err(|e| e.to_string())?;
     // A Way in a blob the index classified as non-way would be emitted without
     // field 9/10/20 and would be absent from every field-5 payload, silently
     // breaking the WayMembers superset. Reject it, mirroring the external

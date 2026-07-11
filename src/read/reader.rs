@@ -163,23 +163,60 @@ impl<R: Read + Send> ElementReader<R> {
         let is_sorted = header.is_sorted();
         let mut last_node_id: i64 = i64::MIN;
 
+        // Loop-local decode scratch. `decompress_into` fills `buf` straight from
+        // the compressed payload; `std::mem::take` then MOVES that allocation
+        // into the block, leaving `buf` empty so the next iteration allocates a
+        // fresh buffer. So `buf` is NOT reused across blobs - its allocation
+        // becomes the block's backing store each time (one allocation per block,
+        // freed when the block drops). What this route eliminates is the SECOND
+        // whole-buffer copy the old `decode()` -> `PrimitiveBlock::new` path paid
+        // via `to_vec()` - hundreds of GB of pure memcpy on a planet pass.
+        //
+        // The genuinely reused buffers are `st_scratch` and `gr_scratch`: the
+        // `parse_and_inline_with_scratch` route borrows them per block and hands
+        // back their retained capacity, eliminating the per-block
+        // `Vec<(u32, u32)>` allocation. `buf` deliberately is not pooled here
+        // because the block takes ownership of it.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+        let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+
         for blob in blob_iter {
-            match blob?.decode() {
-                Ok(BlobDecode::OsmData(block)) => {
-                    block.for_each_element(|element| {
-                        if is_sorted && let Some(id) = node_id(&element) {
-                            debug_assert!(
-                                id > last_node_id,
-                                "Sort.Type_then_ID violated: node {id} <= previous {last_node_id}"
-                            );
-                            last_node_id = id;
-                        }
-                        f(element);
-                    });
-                }
-                Ok(_) => {} // Unknown blobs - header already consumed at construction
-                Err(e) => return Err(e),
+            let blob = blob?;
+            // Only OsmData blobs carry elements, so any other blob type is
+            // skipped WITHOUT decompressing or parsing it. This is a deliberate
+            // decode-semantics parity choice with the pipelined path: the
+            // parallel frame pump (`pipeline.rs`) also matches on
+            // `BlobType::OsmData` and returns `None` for every other type, never
+            // touching a mid-stream header or unknown blob's payload. The header
+            // blob was already consumed and validated at construction.
+            //
+            // Consequence, spelled out because it is a behavior change from the
+            // old `blob.decode()` route: neither read path validates the
+            // compression or protobuf integrity of a *repeated* OsmHeader blob
+            // or an unknown blob appearing later in the stream. The old
+            // sequential path decoded (and thus error-checked) those blobs even
+            // though it discarded the result; the pipelined path never did. We
+            // converge both on "skip without decode" so the two paths agree.
+            if blob.get_type() != BlobType::OsmData {
+                continue;
             }
+            blob.decompress_into(&mut buf)?;
+            let block = PrimitiveBlock::from_vec_with_scratch(
+                std::mem::take(&mut buf),
+                &mut st_scratch,
+                &mut gr_scratch,
+            )?;
+            block.for_each_element(|element| {
+                if is_sorted && let Some(id) = node_id(&element) {
+                    debug_assert!(
+                        id > last_node_id,
+                        "Sort.Type_then_ID violated: node {id} <= previous {last_node_id}"
+                    );
+                    last_node_id = id;
+                }
+                f(element);
+            });
         }
 
         Ok(())

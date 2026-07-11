@@ -506,9 +506,11 @@ pub(super) fn stage4_assembly(
                         }
 
                         // Non-way blobs: full PrimitiveBlock decode + BlockBuilder.
-                        let block = PrimitiveBlock::new(bytes::Bytes::from(std::mem::take(
-                            &mut decompress_buf,
-                        )))?;
+                        // `decompress_buf` is already an owned, unshared Vec, so
+                        // parse it in place with `from_vec`; the old
+                        // `PrimitiveBlock::new(Bytes::from(vec))` wrapped it as
+                        // Bytes only to copy it straight back out via `to_vec()`.
+                        let block = PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))?;
                         let mut block_stats = assemble_block(
                             &block,
                             &mut bb,

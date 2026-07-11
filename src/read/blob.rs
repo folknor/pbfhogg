@@ -172,7 +172,16 @@ impl Blob {
     /// Tries to decode the blob to a [`PrimitiveBlock`]. This operation might involve an expensive
     /// decompression step.
     pub fn to_primitiveblock(&self) -> Result<PrimitiveBlock> {
-        decompress_blob(&self.blob, None).and_then(PrimitiveBlock::new)
+        // Decompress straight into an owned Vec and parse it in place with
+        // `from_vec`. The prior `decompress_blob(...).and_then(new)` route
+        // decompressed into one buffer and then `PrimitiveBlock::new` copied the
+        // whole thing again via `to_vec()`; going through `decompress_into` pays
+        // a single decompress and no second whole-buffer copy. Raw/Zlib/Zstd
+        // boundary semantics are identical (`decompress_wire_blob_into` keeps
+        // the same `> MAX_BLOB_MESSAGE_SIZE` Raw check as `decompress_blob`).
+        let mut buf = Vec::new();
+        self.decompress_into(&mut buf)?;
+        PrimitiveBlock::from_vec(buf)
     }
 
     /// Decompress into a caller-owned buffer, avoiding the Bytes→Vec copy.
@@ -955,15 +964,13 @@ impl BlobReader<BufReader<File>> {
 /// Decode raw Blob protobuf bytes into a [`PrimitiveBlock`].
 pub(crate) fn decode_blob_to_primitiveblock(blob_bytes: &[u8]) -> Result<crate::PrimitiveBlock> {
     let blob = WireBlob::parse_slice(blob_bytes)?;
-    decompress_blob(&blob, None).and_then(crate::PrimitiveBlock::new)
-}
-
-/// Parse already-decompressed bytes into a [`PrimitiveBlock`].
-///
-/// Accepts a `Bytes` value directly. Use `Bytes::from(vec)` to wrap a
-/// `Vec<u8>` in O(1).
-pub(crate) fn parse_primitive_block_from_bytes_owned(raw: &Bytes) -> Result<crate::PrimitiveBlock> {
-    crate::PrimitiveBlock::new(raw.clone())
+    // Decompress into an owned Vec and parse in place via `from_vec`, avoiding
+    // the second whole-buffer `to_vec()` copy that `PrimitiveBlock::new` pays.
+    // `decompress_wire_blob_into` keeps the same `> MAX_BLOB_MESSAGE_SIZE` Raw
+    // boundary as `decompress_blob`, so decode semantics are unchanged.
+    let mut buf = Vec::new();
+    decompress_wire_blob_into(&blob, &mut buf)?;
+    crate::PrimitiveBlock::from_vec(buf)
 }
 
 /// Decode raw Blob protobuf bytes into a [`HeaderBlock`].

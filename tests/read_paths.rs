@@ -20,18 +20,25 @@ use std::time::Duration;
 #[cfg(feature = "test-hooks")]
 use std::time::Instant;
 
-use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
+use pbfhogg::block_builder::{self, BlockBuilder, MemberData, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{
-    BlobFilter, BlobReader, BlobType, ByteOffset, Element, ElementReader, IndexedReader, MemberId,
+    BlobFilter, BlobReader, BlobType, ByteOffset, Element, ElementReader, IndexedReader, Info,
+    MemberId,
 };
 use tempfile::TempDir;
 
 /// Write a multi-block PBF to the given path.
 /// Contains: header + 3 data blocks (3 nodes, 2 ways, 1 relation).
 fn write_test_pbf(path: &Path) {
+    write_test_pbf_with_compression(path, Compression::default());
+}
+
+/// Like [`write_test_pbf`] but selects the blob compression, so a test can
+/// exercise the Raw / Zlib / Zstd `BlobData` variants of the decode path.
+fn write_test_pbf_with_compression(path: &Path, compression: Compression) {
     let file = std::fs::File::create(path).unwrap();
-    let mut writer = PbfWriter::new(file, Compression::default());
+    let mut writer = PbfWriter::new(file, compression);
 
     let header = block_builder::HeaderBuilder::new()
         .bbox(9.0, 54.0, 13.0, 58.0)
@@ -77,6 +84,218 @@ fn write_test_pbf(path: &Path) {
         .unwrap();
 
     writer.flush().unwrap();
+}
+
+/// Write a PBF with several differently-shaped consecutive blocks carrying full
+/// element detail - tags, coordinates, per-element metadata, way references, and
+/// relation members with roles - so a decode-path comparison can catch a
+/// divergence in ANY materialized field, not just element kind and ID. Selects
+/// the blob compression so Raw / Zlib / Zstd are all exercised.
+fn write_materialization_pbf(path: &Path, compression: Compression) {
+    let file = std::fs::File::create(path).unwrap();
+    let mut writer = PbfWriter::new(file, compression);
+
+    let header = block_builder::HeaderBuilder::new()
+        .bbox(9.0, 54.0, 13.0, 58.0)
+        .build()
+        .unwrap();
+    writer.write_header(&header).unwrap();
+
+    let meta_a = Metadata {
+        version: 3,
+        timestamp: 1_600_000_000,
+        changeset: 42,
+        uid: 7,
+        user: "alice",
+        visible: true,
+    };
+    let meta_b = Metadata {
+        version: 1,
+        timestamp: 1_500_000_500,
+        changeset: 99,
+        uid: 12,
+        user: "bob",
+        visible: true,
+    };
+
+    let mut bb = BlockBuilder::new();
+
+    // Block 1: dense nodes, mixed tag shapes, mixed metadata presence.
+    bb.add_node(
+        100,
+        550_000_000,
+        120_000_000,
+        [("name", "A"), ("place", "city")],
+        Some(&meta_a),
+    );
+    bb.add_node(
+        200,
+        560_000_000,
+        130_000_000,
+        std::iter::empty::<(&str, &str)>(),
+        Some(&meta_b),
+    );
+    bb.add_node(300, -330_000_000, -580_000_000, [("amenity", "cafe")], None);
+    writer
+        .write_primitive_block(bb.take().unwrap().unwrap())
+        .unwrap();
+
+    // Block 2: more nodes, a deliberately different shape (no tags, no metadata).
+    bb.add_node(
+        400,
+        570_000_000,
+        140_000_000,
+        std::iter::empty::<(&str, &str)>(),
+        None,
+    );
+    bb.add_node(
+        500,
+        580_000_000,
+        150_000_000,
+        std::iter::empty::<(&str, &str)>(),
+        None,
+    );
+    writer
+        .write_primitive_block(bb.take().unwrap().unwrap())
+        .unwrap();
+
+    // Block 3: ways with references, tags, and metadata.
+    bb.add_way(
+        1000,
+        [("highway", "primary"), ("name", "Main")],
+        &[100, 200, 300, 400],
+        Some(&meta_a),
+    );
+    bb.add_way(2000, [("building", "yes")], &[200, 300, 200], None);
+    writer
+        .write_primitive_block(bb.take().unwrap().unwrap())
+        .unwrap();
+
+    // Block 4: a relation with multiple typed members and distinct roles.
+    bb.add_relation(
+        5000,
+        [("type", "multipolygon"), ("name", "Region")],
+        &[
+            MemberData {
+                id: MemberId::Way(1000),
+                role: "outer",
+            },
+            MemberData {
+                id: MemberId::Way(2000),
+                role: "inner",
+            },
+            MemberData {
+                id: MemberId::Node(100),
+                role: "label",
+            },
+        ],
+        Some(&meta_b),
+    );
+    writer
+        .write_primitive_block(bb.take().unwrap().unwrap())
+        .unwrap();
+
+    writer.flush().unwrap();
+}
+
+/// Render the metadata block of an element to a stable string.
+fn info_string(info: &Info<'_>) -> String {
+    let user = match info.user() {
+        Some(Ok(u)) => u.to_string(),
+        Some(Err(_)) => "<err>".to_string(),
+        None => "<none>".to_string(),
+    };
+    format!(
+        "v={:?} ts={:?} cs={:?} uid={:?} user={user} vis={}",
+        info.version(),
+        info.milli_timestamp(),
+        info.changeset(),
+        info.uid(),
+        info.visible(),
+    )
+}
+
+/// Fully materialize an element into a stable string: kind, ID, coordinates,
+/// sorted tags, metadata, way references, and relation members with roles. Two
+/// decode paths that agree on every element's `materialize` output are
+/// producing byte-for-byte identical decoded content, not merely the same
+/// (kind, ID) pairs.
+fn materialize(element: &Element<'_>) -> String {
+    let sorted_tags = |mut v: Vec<(&str, &str)>| {
+        v.sort_unstable();
+        format!("{v:?}")
+    };
+    match element {
+        Element::Node(n) => format!(
+            "node id={} dlat={} dlon={} tags={} info=[{}]",
+            n.id(),
+            n.decimicro_lat(),
+            n.decimicro_lon(),
+            sorted_tags(n.tags().collect()),
+            info_string(&n.info()),
+        ),
+        Element::DenseNode(dn) => {
+            let info = match dn.info() {
+                Some(i) => {
+                    let user = match i.user() {
+                        Ok(u) => u.to_string(),
+                        Err(_) => "<err>".to_string(),
+                    };
+                    format!(
+                        "v={:?} ts={:?} cs={:?} uid={:?} user={user} vis={}",
+                        i.version(),
+                        i.milli_timestamp(),
+                        i.changeset(),
+                        i.uid(),
+                        i.visible(),
+                    )
+                }
+                None => "<none>".to_string(),
+            };
+            format!(
+                "node id={} dlat={} dlon={} tags={} info=[{info}]",
+                dn.id(),
+                dn.decimicro_lat(),
+                dn.decimicro_lon(),
+                sorted_tags(dn.tags().collect()),
+            )
+        }
+        Element::Way(w) => {
+            let refs: Vec<i64> = w.refs().collect();
+            format!(
+                "way id={} tags={} refs={refs:?} info=[{}]",
+                w.id(),
+                sorted_tags(w.tags().collect()),
+                info_string(&w.info()),
+            )
+        }
+        Element::Relation(r) => {
+            let members: Vec<String> = r
+                .members()
+                .map(|m| {
+                    let role = m.role().unwrap_or("<err>");
+                    format!("{:?}:{}:{role}", m.id.member_type(), m.id.id())
+                })
+                .collect();
+            format!(
+                "rel id={} tags={} members={members:?} info=[{}]",
+                r.id(),
+                sorted_tags(r.tags().collect()),
+                info_string(&r.info()),
+            )
+        }
+        _ => "unknown".to_string(),
+    }
+}
+
+/// Collect the full materialization of every element via sequential `for_each`.
+fn collect_sequential_full(path: &Path) -> Vec<String> {
+    let mut result = Vec::new();
+    ElementReader::from_path(path)
+        .unwrap()
+        .for_each(|element| result.push(materialize(&element)))
+        .unwrap();
+    result
 }
 
 /// Write a larger multi-block PBF to exercise tiny pipeline caps.
@@ -198,6 +417,61 @@ fn pipelined_matches_sequential() {
         .unwrap();
 
     assert_eq!(sequential, pipelined);
+}
+
+/// The sequential `for_each` decode route (`decompress_into` +
+/// `from_vec_with_scratch`) must yield elements identical to the pipelined
+/// route for every blob compression kind. Raw, Zlib, and Zstd exercise the
+/// three `BlobData` variants the copy-free decode path handles. The comparison
+/// is over the FULL materialization of each element - kind, ID, coordinates,
+/// sorted tags, metadata, way references, and relation members with roles -
+/// across several differently-shaped consecutive blocks, so a stale
+/// string-table range, a wrong coordinate, dropped metadata, or a mangled
+/// member role surfaces here as a mismatch rather than slipping past a
+/// kind-and-ID-only check. The pipelined path decodes through a genuinely
+/// different constructor and reuses per-thread scratch, so a scratch-reuse
+/// regression in either route would diverge. (The exact `MAX_BLOB_MESSAGE_SIZE`
+/// Raw/Zlib/Zstd boundary is pinned separately, at the decompression-helper
+/// level, by `decompress_helpers_agree_at_message_size_boundary` in
+/// `src/read/decompress.rs`.)
+#[test]
+fn for_each_matches_pipelined_across_compressions() {
+    for compression in [
+        Compression::None,
+        Compression::Zlib(6),
+        Compression::Zstd(3),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.osm.pbf");
+        write_materialization_pbf(&path, compression);
+
+        let sequential = collect_sequential_full(&path);
+
+        let mut pipelined = Vec::new();
+        ElementReader::from_path(&path)
+            .unwrap()
+            .for_each_pipelined(|element| pipelined.push(materialize(&element)))
+            .unwrap();
+
+        // Sanity: the fixture must actually produce each element kind, or a
+        // materialization bug in one branch could hide behind an empty set.
+        assert!(
+            sequential.iter().any(|s| s.starts_with("node ")),
+            "fixture must produce nodes for {compression:?}"
+        );
+        assert!(
+            sequential.iter().any(|s| s.starts_with("way ")),
+            "fixture must produce ways for {compression:?}"
+        );
+        assert!(
+            sequential.iter().any(|s| s.starts_with("rel ")),
+            "fixture must produce relations for {compression:?}"
+        );
+        assert_eq!(
+            sequential, pipelined,
+            "sequential vs pipelined element mismatch for {compression:?}"
+        );
+    }
 }
 
 /// into_blocks_pipelined yields the same elements as for_each_pipelined.

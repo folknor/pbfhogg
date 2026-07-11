@@ -286,8 +286,12 @@ fn cat_type_passthrough(
                         let blob_bytes = frame.blob_bytes();
                         decompress_buf.clear();
                         decompress_blob_data_into(blob_bytes, &mut decompress_buf)?;
-                        let block = PrimitiveBlock::new_with_scratch(
-                            std::mem::take(&mut decompress_buf).into(),
+                        // Take the decompressed Vec straight into the block: no
+                        // Bytes round-trip, no second whole-buffer copy (the
+                        // dropped `new_with_scratch(Bytes)` route paid a `to_vec`).
+                        // `decompress_buf` is left empty and reallocated next blob.
+                        let block = PrimitiveBlock::from_vec_with_scratch(
+                            std::mem::take(&mut decompress_buf),
                             &mut st_scratch,
                             &mut gr_scratch,
                         )?;

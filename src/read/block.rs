@@ -441,20 +441,6 @@ impl PrimitiveBlock {
         })
     }
 
-    /// Like [`new`] but reuses caller-provided scratch buffers for
-    /// `parse_and_inline`. Sequential loops call this with loop-local
-    /// scratch to avoid per-block allocation.
-    #[allow(clippy::needless_pass_by_value)]
-    pub(crate) fn new_with_scratch(
-        buffer: Bytes,
-        st_scratch: &mut Vec<(u32, u32)>,
-        gr_scratch: &mut Vec<(u32, u32)>,
-    ) -> Result<PrimitiveBlock> {
-        let mut buf = buffer.to_vec();
-        let meta = WireBlock::parse_and_inline_with_scratch(&mut buf, st_scratch, gr_scratch)?;
-        Self::finish(Bytes::from(buf), &meta)
-    }
-
     /// Parse from a mutable Vec, inlining string table entries and group ranges
     /// into the buffer itself. Zero separate heap allocations beyond the buffer.
     ///

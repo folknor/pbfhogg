@@ -322,8 +322,13 @@ fn scan_data_blob(
 
     decompress_blob_data_into(frame.blob_bytes(), decompress_buf)?;
     let raw_size = decompress_buf.len();
-    let block = crate::block::PrimitiveBlock::new_with_scratch(
-        bytes::Bytes::copy_from_slice(decompress_buf),
+    // Move the decompressed Vec straight into the block. The old
+    // `new_with_scratch(Bytes::copy_from_slice(..))` route copied the buffer
+    // twice - once into `Bytes`, then again inside `new_with_scratch`'s
+    // `to_vec()`. `from_vec_with_scratch` takes the Vec by value with zero
+    // copies; `decompress_buf` is left empty and reallocated on the next blob.
+    let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
+        std::mem::take(decompress_buf),
         st_scratch,
         gr_scratch,
     )?;

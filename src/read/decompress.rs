@@ -190,12 +190,20 @@ pub(super) fn decompress_parsed_blob_into(blob: &WireBlob, buf: &mut Vec<u8>) ->
     buf.clear();
     match &blob.data {
         Some(BlobData::Raw(bytes)) => {
+            // Reject only when strictly greater than the cap, so a payload at
+            // exactly MAX_BLOB_MESSAGE_SIZE is accepted - matching the Zlib and
+            // Zstd branches below (which error on `size > MAX`) and the sibling
+            // `decompress_wire_blob_into` / `decompress_blob_raw` / `decompress_blob`
+            // Raw checks. This gives every decompression helper identical
+            // boundary semantics; the earlier strict `<` here made the pipelined
+            // path (via `decompress_blob_data_into`) reject an exact-cap Raw blob
+            // that the sequential and pread paths accepted.
             let size = bytes.len() as u64;
-            if size < MAX_BLOB_MESSAGE_SIZE {
+            if size > MAX_BLOB_MESSAGE_SIZE {
+                Err(new_blob_error(BlobError::MessageTooBig { size }))
+            } else {
                 buf.extend_from_slice(bytes);
                 Ok(())
-            } else {
-                Err(new_blob_error(BlobError::MessageTooBig { size }))
             }
         }
         Some(BlobData::Zlib(bytes)) => {
@@ -366,4 +374,123 @@ pub(crate) fn decompress_wire_blob_into(blob: &WireBlob, buf: &mut Vec<u8>) -> R
         None => return Err(new_blob_error(BlobError::Empty)),
     }
     Ok(())
+}
+
+// Tests use `unwrap()` throughout because panicking is the correct failure mode
+// for unit tests. See the note in `blob_wire.rs`'s test module for the rationale
+// and the crate-wide `unwrap_used = "deny"` exemption.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
+mod tests {
+    use super::{
+        BlobData, MAX_BLOB_MESSAGE_SIZE, WireBlob, decompress_blob, decompress_parsed_blob_into,
+        decompress_wire_blob_into,
+    };
+    use crate::error::{BlobError, ErrorKind};
+    use bytes::Bytes;
+
+    /// Which `BlobData` variant a boundary case exercises.
+    #[derive(Clone, Copy, Debug)]
+    enum Kind {
+        Raw,
+        Zlib,
+        Zstd,
+    }
+
+    fn zlib_compress(data: &[u8]) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write as _;
+        let mut e = ZlibEncoder::new(Vec::new(), Compression::fast());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    fn zstd_compress(data: &[u8]) -> Vec<u8> {
+        zstd::stream::encode_all(std::io::Cursor::new(data), 1).unwrap()
+    }
+
+    /// Build a `WireBlob` whose *decompressed* payload is exactly `payload`.
+    /// The Raw variant stores it verbatim; Zlib/Zstd store the compressed form
+    /// and declare `raw_size` so the helpers pre-size their output buffer.
+    fn make_blob(kind: Kind, payload: &[u8]) -> WireBlob {
+        let raw_size = Some(i32::try_from(payload.len()).unwrap());
+        match kind {
+            Kind::Raw => WireBlob {
+                data: Some(BlobData::Raw(Bytes::copy_from_slice(payload))),
+                raw_size,
+            },
+            Kind::Zlib => WireBlob {
+                data: Some(BlobData::Zlib(Bytes::from(zlib_compress(payload)))),
+                raw_size,
+            },
+            Kind::Zstd => WireBlob {
+                data: Some(BlobData::Zstd(Bytes::from(zstd_compress(payload)))),
+                raw_size,
+            },
+        }
+    }
+
+    fn assert_too_big(result: crate::error::Result<()>, expected_size: u64) {
+        match result.map_err(crate::error::Error::into_kind) {
+            Err(ErrorKind::Blob(BlobError::MessageTooBig { size })) => {
+                assert_eq!(
+                    size, expected_size,
+                    "surfaced size must be the payload size"
+                );
+            }
+            other => panic!("expected MessageTooBig, got {other:?}"),
+        }
+    }
+
+    /// A decompressed payload at exactly `MAX_BLOB_MESSAGE_SIZE` is accepted, and
+    /// one byte over is rejected with `MessageTooBig`, for Raw, Zlib, and Zstd -
+    /// across every helper that decodes a `WireBlob`. This pins the boundary the
+    /// copy-removal refactor had to preserve: the sequential
+    /// (`decompress_wire_blob_into`) and pipelined (`decompress_parsed_blob_into`,
+    /// via `decompress_blob_data_into`) routes must agree with each other and with
+    /// the `decompress_blob` Bytes route on the exact-cap decision. Before the
+    /// fix, `decompress_parsed_blob_into` used a strict `<` for Raw and rejected an
+    /// exact-cap Raw blob the other helpers accepted.
+    #[test]
+    fn decompress_helpers_agree_at_message_size_boundary() {
+        let cap = MAX_BLOB_MESSAGE_SIZE as usize;
+
+        for kind in [Kind::Raw, Kind::Zlib, Kind::Zstd] {
+            // Exactly at the cap: every helper accepts and yields `cap` bytes.
+            let at_cap = vec![0u8; cap];
+            let blob = make_blob(kind, &at_cap);
+
+            let mut into = Vec::new();
+            decompress_wire_blob_into(&blob, &mut into)
+                .unwrap_or_else(|e| panic!("{kind:?} wire_blob_into at cap: {e:?}"));
+            assert_eq!(into.len(), cap, "{kind:?} wire_blob_into length at cap");
+
+            let mut parsed = Vec::new();
+            decompress_parsed_blob_into(&blob, &mut parsed)
+                .unwrap_or_else(|e| panic!("{kind:?} parsed_blob_into at cap: {e:?}"));
+            assert_eq!(parsed.len(), cap, "{kind:?} parsed_blob_into length at cap");
+
+            let bytes = decompress_blob(&blob, None)
+                .unwrap_or_else(|e| panic!("{kind:?} decompress_blob at cap: {e:?}"));
+            assert_eq!(bytes.len(), cap, "{kind:?} decompress_blob length at cap");
+
+            // One byte over the cap: every helper rejects with the same typed
+            // error and surfaces the over-cap size verbatim.
+            let over_len = cap + 1;
+            let over = vec![0u8; over_len];
+            let blob = make_blob(kind, &over);
+
+            let mut into = Vec::new();
+            assert_too_big(decompress_wire_blob_into(&blob, &mut into), over_len as u64);
+
+            let mut parsed = Vec::new();
+            assert_too_big(
+                decompress_parsed_blob_into(&blob, &mut parsed),
+                over_len as u64,
+            );
+
+            assert_too_big(decompress_blob(&blob, None).map(|_| ()), over_len as u64);
+        }
+    }
 }

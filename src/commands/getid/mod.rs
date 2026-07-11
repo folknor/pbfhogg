@@ -516,8 +516,11 @@ fn filter_by_id_walker(
                 walker.pread_data(meta.data_offset, meta.data_size, &mut data_buf)?;
                 decompress_buf.clear();
                 crate::blob::decompress_blob_data_into(&data_buf, &mut decompress_buf)?;
-                let block = PrimitiveBlock::new_with_scratch(
-                    std::mem::take(&mut decompress_buf).into(),
+                // Move the decompressed Vec into the block: no Bytes round-trip,
+                // no second whole-buffer copy (the `new_with_scratch(Bytes)` route
+                // paid a `to_vec`). `decompress_buf` is reallocated next blob.
+                let block = PrimitiveBlock::from_vec_with_scratch(
+                    std::mem::take(&mut decompress_buf),
                     &mut st_scratch,
                     &mut gr_scratch,
                 )?;
@@ -660,8 +663,11 @@ fn filter_by_id_streaming(
                 // and must be decoded to check.
                 decompress_buf.clear();
                 crate::blob::decompress_blob_data_into(frame.blob_bytes(), &mut decompress_buf)?;
-                let block = PrimitiveBlock::new_with_scratch(
-                    std::mem::take(&mut decompress_buf).into(),
+                // Move the decompressed Vec into the block: no Bytes round-trip,
+                // no second whole-buffer copy (the `new_with_scratch(Bytes)` route
+                // paid a `to_vec`). `decompress_buf` is reallocated next blob.
+                let block = PrimitiveBlock::from_vec_with_scratch(
+                    std::mem::take(&mut decompress_buf),
                     &mut st_scratch,
                     &mut gr_scratch,
                 )?;

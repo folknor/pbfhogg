@@ -14,6 +14,17 @@
 
 ### Changed
 
+- The sequential read path (`ElementReader::for_each`, `Blob::decode`,
+  `Blob::to_primitiveblock`, `IndexedReader` iteration) no longer pays a
+  whole-buffer copy per decoded block: decompression now lands directly in
+  the block's owned buffer instead of being copied out of a temporary.
+  Two behavior notes ride along. `for_each` now skips non-OSMData blobs
+  without decoding them, matching the pipelined path - a malformed
+  *repeated* header blob mid-file no longer surfaces a decode error on
+  either path. And a Raw (uncompressed) blob of exactly 32 MiB is now
+  accepted uniformly; previously the pipelined path rejected the exact
+  boundary while sequential accepted it.
+
 - `getparents` and `getid` include mode now select between the pread
   header walk and a full-file scan from a bounded OSMData blob-count
   estimate. This preserves the walker's win on low-blob-count planet

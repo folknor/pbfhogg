@@ -606,16 +606,12 @@ fn filter_by_id_pipelined(
     let metric = &crate::read::pipeline_metrics::PIPELINE_METRICS.blobs_skipped_by_filter;
     let skipped_before = metric.load(Relaxed);
     crate::debug::emit_marker("GETID_SCAN_START");
-    reader.for_each_block_pipelined(|block| {
-        let mut bb = BlockBuilder::new();
-        let mut blocks = Vec::new();
+    // Classify runs on rayon workers per batch, not on the consumer thread:
+    // with a dense query the per-element include filter is linear in decoded
+    // elements and would otherwise serialize behind the decode pipeline.
+    for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
         let (nodes, ways, relations) =
-            process_block(&block, &mut bb, &mut blocks, ids, true, None, false)
-                .map_err(std::io::Error::other)?;
-        flush_local(&mut bb, &mut blocks).map_err(std::io::Error::other)?;
-        for (block_bytes, index, tagdata) in blocks {
-            writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
-        }
+            process_filter_batch(batch, &mut writer, ids, true, None, false)?;
         stats.nodes_written += nodes;
         stats.ways_written += ways;
         stats.relations_written += relations;

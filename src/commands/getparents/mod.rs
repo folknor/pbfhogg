@@ -12,10 +12,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 use super::getid::ElementIds;
 use super::{
-    HeaderOverrides, ensure_node_capacity_local, ensure_relation_capacity_local,
-    ensure_way_capacity_local, flush_local, writer_from_header_bytes,
+    BATCH_SIZE, HeaderOverrides, drain_batch_results, ensure_node_capacity_local,
+    ensure_relation_capacity_local, ensure_way_capacity_local, flush_local,
+    for_each_primitive_block_batch, writer_from_header_bytes,
 };
 use crate::blob::{BlobKind, decode_blob_to_headerblock};
 use crate::blob_meta::ElemKind;
@@ -313,16 +316,8 @@ fn getparents_pipelined(
     };
 
     crate::debug::emit_marker("GETPARENTS_DECODE_START");
-    reader.for_each_block_pipelined(|block| {
-        let mut bb = BlockBuilder::new();
-        let mut blocks = Vec::new();
-        let (nodes, ways, relations) =
-            process_block(&block, &mut bb, &mut blocks, ids, opts.add_self)
-                .map_err(std::io::Error::other)?;
-        flush_local(&mut bb, &mut blocks).map_err(std::io::Error::other)?;
-        for (block_bytes, index, tagdata) in blocks {
-            writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
-        }
+    for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
+        let (nodes, ways, relations) = process_batch(batch, &mut writer, ids, opts.add_self)?;
         stats.nodes_written += nodes;
         stats.ways_written += ways;
         stats.relations_written += relations;
@@ -331,6 +326,42 @@ fn getparents_pipelined(
     writer.flush()?;
     crate::debug::emit_marker("GETPARENTS_DECODE_END");
     Ok(stats)
+}
+
+/// Classify a batch of blocks in parallel via rayon. Each worker owns a
+/// `BlockBuilder` through `map_init` and reuses it across the blocks it
+/// takes, flushing serialized output blocks into a local `Vec`; the
+/// serialized blocks are then written sequentially in batch order.
+///
+/// Classify cost is linear in decoded elements, so it must not run on the
+/// single consumer thread: at planet scale that serializes over a billion
+/// way-ref checks behind the decode pipeline and dominates wall time.
+fn process_batch(
+    batch: &[PrimitiveBlock],
+    writer: &mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
+    ids: &ElementIds,
+    add_self: bool,
+) -> Result<(u64, u64, u64)> {
+    type BatchResult = std::result::Result<(Vec<OwnedBlock>, (u64, u64, u64)), String>;
+    let results: Vec<BatchResult> = batch
+        .par_iter()
+        .map_init(BlockBuilder::new, |bb, block| {
+            let mut output: Vec<OwnedBlock> = Vec::new();
+            let counts = process_block(block, bb, &mut output, ids, add_self)?;
+            flush_local(bb, &mut output)?;
+            Ok((output, counts))
+        })
+        .collect();
+
+    let mut total_nodes: u64 = 0;
+    let mut total_ways: u64 = 0;
+    let mut total_relations: u64 = 0;
+    drain_batch_results(results, writer, |(nodes, ways, relations)| {
+        total_nodes += nodes;
+        total_ways += ways;
+        total_relations += relations;
+    })?;
+    Ok((total_nodes, total_ways, total_relations))
 }
 
 // ---------------------------------------------------------------------------

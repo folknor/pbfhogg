@@ -4,8 +4,9 @@ Status: 2026-07-09 survey. Decisions 1 and 2 were RATIFIED 2026-07-10:
 steady state is option (a) - altw moves into the daily loop and the
 production merge drops `--locations-on-ways` (recorded in
 `reference/pipeline.md`) - and injection is opt-in flag-gated with
-sparse parity. The paired implementation spec now waits only on
-elivagar's Brick 1 superset screen (decision 3).
+sparse parity. Decision 3 (the Brick 1 superset screen) and the D9
+refinement both CLOSED 2026-07-11 in pbfhogg's favor - see the dated
+entry below. The producer landings are unblocked.
 
 **2026-07-11: the format/reader layer has landed** - `WireBlobHeader`
 field-5 parse/encode behind the `parse_waymembers` toggle,
@@ -15,10 +16,46 @@ field-5 parse/encode behind the `parse_waymembers` toggle,
 feature-string constants and accessors, and the write-time BlobHeader
 size cap in `encode_blob_header_into` (now fallible). All additive and
 default-off: no producer emits field 5/20 yet, so every reader/writer
-call site still passes `None`/off and output is unchanged. The altw
-producer (relation-scan fusion, stage 1-4 pin computation, the
-`--inject-prepass` flag) has not landed and stays gated on Brick 1 and
-the D9 resolved-refs refinement described above.
+call site still passes `None`/off and output is unchanged.
+
+**2026-07-11, later: BOTH cross-repo gates are CLOSED** (elivagar's
+verdicts recorded normatively in their `notes/injected-prepass-spec.md`
+"Cross-repo ratifications (2026-07-11)" section, elivagar commit
+`0f67f51`; instrumentation `4ceacd1`):
+
+- **Brick 1 superset screen PASSED.** germany locations: superset
+  1,092,149 vs needed 886,109 = 1.23x (threshold 1.5x; elivagar bench
+  `f2b93719`); denmark 1.16x (`fc55fca5`). Superset semantics stand;
+  the relation `tag_expr` filter is never built; the "Membership scan"
+  section below needs no amendment. elivagar's Brick 4 still gates the
+  real cost in bytes on their side (exact-plan baseline 112.3 MB data +
+  14.1 MB index on germany locations).
+- **D9 resolved-refs refinement RATIFIED as specified** (pin = shared
+  AND resolved). Their length validations are unaffected (both depend
+  only on lengths, which D9 never changes); the unrefined semantics
+  would have pinned their (0,0) unresolved-sentinel vertices, forcing
+  DP simplification to retain garbage - D9 is what they want, not what
+  they tolerate; and it matches their node-store path, where pins never
+  land on unresolved refs today. The survey's shared-ness definition in
+  "Way message field 20" below should be read as narrowed to RESOLVED
+  positions; the ring-closure trailing duplicate still mirrors bit 0 by
+  construction (it resolves iff position 0 does). The survey-faithful
+  fallback (zero-coord `ResolvedEntry` emission on shared orphan runs)
+  is declined and closed - nothing on their side ever wants a pinned
+  position without a real coordinate.
+- **`Blob::way_member_count()` ACCEPTED** (the D8 count-validation
+  fold). elivagar will grow a third release-checked hard error
+  comparing the encoded `way_count` against the blob's actual decoded
+  Way count. Consequence for pbfhogg: the producer-side oracle must
+  include a fixture spanning a within-byte count difference (encoded
+  vs actual counts that need the same number of bitmap bytes) so their
+  compare is exercised end-to-end.
+
+The altw producer (relation-scan fusion, stage 1-4 pin computation, the
+`--inject-prepass` flag, sparse parity, oracle, benches) is therefore
+UNBLOCKED. Remaining prerequisites are pbfhogg-side only: the brokkr
+`--inject-prepass` passthrough brick, and the flag-on planet bench
+green-light.
 
 Origin: elivagar's `notes/injected-prepass-spec.md` (H2a + H2b of their
 planet-30gb roadmap) specifies a cross-repo contract in which altw computes
@@ -457,7 +494,9 @@ follow-up on the same rails.
    2026-07-10 as recommended:** flag-gated injection (working name
    `--inject-prepass`), sparse implements both fields to keep the
    backend-parity canary.
-3. Wait for elivagar's Brick 1 superset screen (<= 1.5x on germany
-   locations) before any format work; if it fails, the contract changes
-   (relation tag filter) and this note's membership section changes with
-   it. **This is now the only gate on the paired spec.**
+3. ~~Wait for elivagar's Brick 1 superset screen (<= 1.5x on germany
+   locations)~~ - **PASSED 2026-07-11** (germany 1.23x, denmark 1.16x;
+   elivagar commits `4ceacd1` instrumentation / `0f67f51` record). The
+   contract does not change; no relation tag filter. Together with the
+   same-day D9 ratification (see the status entry at the top), no open
+   cross-repo gate remains on the producer landings.

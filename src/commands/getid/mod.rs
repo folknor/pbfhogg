@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use super::{
     HeaderOverrides, drain_batch_results, ensure_node_capacity_local,
     ensure_relation_capacity_local, ensure_way_capacity_local, flush_local,
-    for_each_primitive_block_batch, require_indexdata, writer_from_header,
+    for_each_primitive_block_batch, fuse_transform_from_env, require_indexdata, writer_from_header,
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_writer::FileWriter;
@@ -262,6 +262,7 @@ pub fn getid(
     force: bool,
     overrides: &HeaderOverrides,
 ) -> Result<GetidStats> {
+    let fused = fuse_transform_from_env()?;
     let (_, stats) = getid_dispatched(
         input,
         output,
@@ -272,6 +273,7 @@ pub fn getid(
         force,
         overrides,
         FULL_SCAN_ARM_MIN_BLOBS,
+        fused,
     )?;
     Ok(stats)
 }
@@ -291,6 +293,7 @@ fn getid_dispatched(
     force: bool,
     overrides: &HeaderOverrides,
     min_blobs: u64,
+    fused: bool,
 ) -> Result<(Option<ScanArm>, GetidStats)> {
     let has_indexdata = require_indexdata(
         input,
@@ -302,7 +305,16 @@ fn getid_dispatched(
     )?;
 
     let (arm, result) = if opts.add_referenced {
-        let stats = getid_with_refs(input, output, ids, opts, compression, direct_io, overrides)?;
+        let stats = getid_with_refs(
+            input,
+            output,
+            ids,
+            opts,
+            compression,
+            direct_io,
+            overrides,
+            fused,
+        )?;
         (None, stats)
     } else {
         let arm = super::dispatch_scan_arm(input, has_indexdata, min_blobs)?;
@@ -716,6 +728,7 @@ fn filter_by_id_streaming(
 // Two-pass getid with --add-referenced
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn getid_with_refs(
     input: &Path,
     output: &Path,
@@ -724,6 +737,7 @@ fn getid_with_refs(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    fused: bool,
 ) -> Result<GetidStats> {
     let mut stats = GetidStats {
         nodes_written: 0,
@@ -811,14 +825,60 @@ fn getid_with_refs(
         None
     };
 
-    for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
-        let (nodes, ways, relations) =
-            process_filter_batch(batch, &mut writer, ids, true, dep_ref, strip_tags)?;
-        stats.nodes_written += nodes;
-        stats.ways_written += ways;
-        stats.relations_written += relations;
-        Ok(())
-    })?;
+    if fused {
+        crate::debug::emit_counter("fuse_transform_active", 1);
+        let mut fused_blocks = 0_u64;
+        reader.for_each_fused_block(
+            |block| {
+                let mut bb = BlockBuilder::new();
+                let mut output = Vec::new();
+                let counts =
+                    process_block(&block, &mut bb, &mut output, ids, true, dep_ref, strip_tags)?;
+                flush_local(&mut bb, &mut output)?;
+                Ok((output, counts))
+            },
+            |(blocks, (nodes, ways, relations))| {
+                for OwnedBlock {
+                    bytes,
+                    index,
+                    tagdata,
+                    way_members,
+                } in blocks
+                {
+                    writer.write_primitive_block_owned(
+                        bytes,
+                        index,
+                        tagdata.as_deref(),
+                        way_members.as_deref(),
+                    )?;
+                }
+                stats.nodes_written += nodes;
+                stats.ways_written += ways;
+                stats.relations_written += relations;
+                fused_blocks += 1;
+                if fused_blocks.is_multiple_of(64) {
+                    crate::debug::emit_counter(
+                        "fuse_transform_blocks",
+                        i64::try_from(fused_blocks).unwrap_or(i64::MAX),
+                    );
+                }
+                Ok(())
+            },
+        )?;
+        crate::debug::emit_counter(
+            "fuse_transform_blocks",
+            i64::try_from(fused_blocks).unwrap_or(i64::MAX),
+        );
+    } else {
+        for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
+            let (nodes, ways, relations) =
+                process_filter_batch(batch, &mut writer, ids, true, dep_ref, strip_tags)?;
+            stats.nodes_written += nodes;
+            stats.ways_written += ways;
+            stats.relations_written += relations;
+            Ok(())
+        })?;
+    }
 
     writer.flush()?;
     crate::debug::emit_marker("GETID_PASS2_END");
@@ -1166,6 +1226,37 @@ mod tests {
         found
     }
 
+    #[test]
+    fn fused_with_refs_matches_batched() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.pbf");
+        write_blocks(&input, &[1, 2, 3], Some((10, &[1, 2])), true);
+        let ids = parse_ids(&["w10".to_owned()]).unwrap();
+        let opts = GetidOptions {
+            add_referenced: true,
+            remove_tags: false,
+        };
+        let batched = dir.path().join("batched.pbf");
+        let fused = dir.path().join("fused.pbf");
+        for (output, fused) in [(&batched, false), (&fused, true)] {
+            getid_with_refs(
+                &input,
+                output,
+                &ids,
+                &opts,
+                Compression::default(),
+                false,
+                &HeaderOverrides::default(),
+                fused,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            std::fs::read(fused).unwrap(),
+            std::fs::read(batched).unwrap()
+        );
+    }
+
     /// Run the same include-mode query under both arms, assert they emit
     /// identical element sets, and return that common (sorted) ID list.
     fn ids_from_both_arms(input: &Path, query: &[&str]) -> Vec<i64> {
@@ -1249,6 +1340,7 @@ mod tests {
                 false,
                 &HeaderOverrides::default(),
                 min_blobs,
+                false,
             )
             .unwrap();
             assert_eq!(arm, Some(expected_arm));

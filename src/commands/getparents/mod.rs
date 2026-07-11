@@ -18,7 +18,7 @@ use super::getid::ElementIds;
 use super::{
     BATCH_SIZE, HeaderOverrides, drain_batch_results, ensure_node_capacity_local,
     ensure_relation_capacity_local, ensure_way_capacity_local, flush_local,
-    for_each_primitive_block_batch, writer_from_header_bytes,
+    for_each_primitive_block_batch, fuse_transform_from_env, writer_from_header_bytes,
 };
 use crate::blob::{BlobKind, decode_blob_to_headerblock};
 use crate::blob_meta::ElemKind;
@@ -65,6 +65,7 @@ pub fn getparents(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<GetparentsStats> {
+    let fused = fuse_transform_from_env()?;
     let (_, stats) = getparents_dispatched(
         input,
         output,
@@ -74,6 +75,7 @@ pub fn getparents(
         direct_io,
         overrides,
         FULL_SCAN_ARM_MIN_BLOBS,
+        fused,
     )?;
     Ok(stats)
 }
@@ -91,6 +93,7 @@ pub fn getparents_with_min_blobs(
     overrides: &HeaderOverrides,
     min_blobs: u64,
 ) -> Result<GetparentsStats> {
+    let fused = fuse_transform_from_env()?;
     getparents_dispatched(
         input,
         output,
@@ -100,6 +103,7 @@ pub fn getparents_with_min_blobs(
         direct_io,
         overrides,
         min_blobs,
+        fused,
     )
     .map(|(_, stats)| stats)
 }
@@ -117,6 +121,7 @@ fn getparents_dispatched(
     direct_io: bool,
     overrides: &HeaderOverrides,
     min_blobs: u64,
+    fused: bool,
 ) -> Result<(ScanArm, GetparentsStats)> {
     let arm = super::dispatch_scan_arm(input, super::has_indexdata(input, direct_io)?, min_blobs)?;
     let stats = getparents_with_arm(
@@ -128,6 +133,7 @@ fn getparents_dispatched(
         direct_io,
         overrides,
         arm,
+        fused,
     )?;
     Ok((arm, stats))
 }
@@ -142,14 +148,22 @@ pub(crate) fn getparents_with_arm(
     direct_io: bool,
     overrides: &HeaderOverrides,
     arm: ScanArm,
+    fused: bool,
 ) -> Result<GetparentsStats> {
     match arm {
         ScanArm::Walker => {
             getparents_walker(input, output, ids, opts, compression, direct_io, overrides)
         }
-        ScanArm::FullScan => {
-            getparents_pipelined(input, output, ids, opts, compression, direct_io, overrides)
-        }
+        ScanArm::FullScan => getparents_pipelined(
+            input,
+            output,
+            ids,
+            opts,
+            compression,
+            direct_io,
+            overrides,
+            fused,
+        ),
     }
 }
 
@@ -331,6 +345,7 @@ fn getparents_pipelined(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    fused: bool,
 ) -> Result<GetparentsStats> {
     let (need_node_blobs, need_way_blobs, need_relation_blobs) = needed_blob_kinds(ids, opts);
     let reader = ElementReader::open(input, direct_io)?.with_blob_filter(BlobFilter::new(
@@ -349,13 +364,58 @@ fn getparents_pipelined(
     };
 
     crate::debug::emit_marker("GETPARENTS_DECODE_START");
-    for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
-        let (nodes, ways, relations) = process_batch(batch, &mut writer, ids, opts.add_self)?;
-        stats.nodes_written += nodes;
-        stats.ways_written += ways;
-        stats.relations_written += relations;
-        Ok(())
-    })?;
+    if fused {
+        crate::debug::emit_counter("fuse_transform_active", 1);
+        let mut fused_blocks = 0_u64;
+        reader.for_each_fused_block(
+            |block| {
+                let mut bb = BlockBuilder::new();
+                let mut output = Vec::new();
+                let counts = process_block(&block, &mut bb, &mut output, ids, opts.add_self)?;
+                flush_local(&mut bb, &mut output)?;
+                Ok((output, counts))
+            },
+            |(blocks, (nodes, ways, relations))| {
+                for OwnedBlock {
+                    bytes,
+                    index,
+                    tagdata,
+                    way_members,
+                } in blocks
+                {
+                    writer.write_primitive_block_owned(
+                        bytes,
+                        index,
+                        tagdata.as_deref(),
+                        way_members.as_deref(),
+                    )?;
+                }
+                stats.nodes_written += nodes;
+                stats.ways_written += ways;
+                stats.relations_written += relations;
+                fused_blocks += 1;
+                if fused_blocks.is_multiple_of(64) {
+                    crate::debug::emit_counter(
+                        "fuse_transform_blocks",
+                        i64::try_from(fused_blocks).unwrap_or(i64::MAX),
+                    );
+                }
+                Ok(())
+            },
+        )?;
+        crate::debug::emit_counter(
+            "fuse_transform_blocks",
+            i64::try_from(fused_blocks).unwrap_or(i64::MAX),
+        );
+    } else {
+        for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
+            let (nodes, ways, relations) = process_batch(batch, &mut writer, ids, opts.add_self)?;
+            stats.nodes_written += nodes;
+            stats.ways_written += ways;
+            stats.relations_written += relations;
+            Ok(())
+        })?;
+    }
     writer.flush()?;
     crate::debug::emit_marker("GETPARENTS_DECODE_END");
     Ok(stats)
@@ -550,6 +610,35 @@ mod tests {
         ids
     }
 
+    #[test]
+    fn fused_full_scan_matches_batched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = dir.path().join("input.pbf");
+        fixture(&input);
+        let query = parse_ids(&["n1".to_owned()]).expect("ids");
+        let opts = GetparentsOptions { add_self: true };
+        let batched = dir.path().join("batched.pbf");
+        let fused = dir.path().join("fused.pbf");
+        for (output, fused) in [(&batched, false), (&fused, true)] {
+            getparents_with_arm(
+                &input,
+                output,
+                &query,
+                &opts,
+                Compression::default(),
+                false,
+                &HeaderOverrides::default(),
+                ScanArm::FullScan,
+                fused,
+            )
+            .expect("getparents");
+        }
+        assert_eq!(
+            std::fs::read(fused).expect("fused output"),
+            std::fs::read(batched).expect("batched output")
+        );
+    }
+
     /// Run the same query under both arms, assert they emit identical element
     /// sets, and return that common (sorted) ID list.
     fn ids_from_both_arms(input: &std::path::Path, query: &[&str], add_self: bool) -> Vec<i64> {
@@ -569,6 +658,7 @@ mod tests {
                 false,
                 &HeaderOverrides::default(),
                 arm,
+                false,
             )
             .expect("getparents");
         }
@@ -633,6 +723,7 @@ mod tests {
                 false,
                 &HeaderOverrides::default(),
                 min_blobs,
+                false,
             )
             .expect("getparents");
             assert_eq!(arm, expected_arm);

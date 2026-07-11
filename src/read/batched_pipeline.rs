@@ -257,17 +257,16 @@ impl<'a> BatchCharge<'a> {
         &self.msg.as_ref().expect("batch charge present").blobs
     }
 
-    fn finish(mut self, entries: Vec<Result<PrimitiveBlock>>) -> (usize, DecodedBatch) {
+    fn finish(self, entries: Vec<Result<PrimitiveBlock>>) -> (usize, DecodedBatch) {
+        let (seq, decoded) = self.finish_parts();
+        (seq, DecodedBatch { entries, decoded })
+    }
+
+    fn finish_parts(mut self) -> (usize, Option<Permit>) {
         let mut msg = self.msg.take().expect("batch charge present");
         msg.blobs.clear();
         self.raw.release(msg.raw_bytes);
-        (
-            msg.seq,
-            DecodedBatch {
-                entries,
-                decoded: msg.decoded.take(),
-            },
-        )
+        (msg.seq, msg.decoded.take())
     }
 }
 
@@ -347,13 +346,18 @@ fn flush(
     true
 }
 
-fn pump<R: Read + Send>(
+fn pump<R, E, M>(
     mut reader: BlobReader<R>,
     queue: &Queue,
     raw: &Arc<Budget>,
     decoded: &Arc<Budget>,
-    tx: &SyncSender<(usize, DecodedBatch)>,
-) {
+    tx: &SyncSender<(usize, E)>,
+    make_error: M,
+) where
+    R: Read + Send,
+    E: Send,
+    M: Fn(crate::error::Error) -> E,
+{
     // A reader/pump panic must wake workers blocked in pop and the consumer
     // blocked in recv before scoped-thread join begins.
     let mut guard = CancelGuard::new(raw, decoded, queue);
@@ -366,13 +370,7 @@ fn pump<R: Read + Send>(
             Err(error) => {
                 if flush(&mut batch, &mut raw_bytes, &mut seq, queue, decoded) {
                     // Receiver drop wakes this direct send on consumer error.
-                    drop(tx.send((
-                        seq,
-                        DecodedBatch {
-                            entries: vec![Err(error)],
-                            decoded: None,
-                        },
-                    )));
+                    drop(tx.send((seq, make_error(error))));
                 }
                 break;
             }
@@ -594,7 +592,19 @@ where
         let pump_raw = Arc::clone(&raw);
         let pump_decoded = Arc::clone(&decoded);
         let pump_tx = tx.clone();
-        scope.spawn(move || pump(reader, &pump_queue, &pump_raw, &pump_decoded, &pump_tx));
+        scope.spawn(move || {
+            pump(
+                reader,
+                &pump_queue,
+                &pump_raw,
+                &pump_decoded,
+                &pump_tx,
+                |error| DecodedBatch {
+                    entries: vec![Err(error)],
+                    decoded: None,
+                },
+            );
+        });
         for _ in 0..workers {
             let queue = Arc::clone(&queue);
             let raw = Arc::clone(&raw);
@@ -616,6 +626,194 @@ where
     })
 }
 
+// ---------------------------------------------------------------------------
+// Fusion section: removable independently of the batched engine.
+// `decode_batch_entry` above is permanent; transform happens at its call site.
+// ---------------------------------------------------------------------------
+
+struct FusedDecodedBatch<T> {
+    entries: Vec<Result<T>>,
+    decoded: Option<Permit>,
+}
+
+fn run_fused_worker<T, X>(
+    queue: &Queue,
+    raw: &Arc<Budget>,
+    decoded: &Arc<Budget>,
+    tx: &SyncSender<(usize, FusedDecodedBatch<T>)>,
+    filter: Option<&BlobFilter>,
+    pool: &Arc<DecompressPool>,
+    transform: &X,
+) where
+    T: Send,
+    X: Fn(PrimitiveBlock) -> std::result::Result<T, String> + Sync,
+{
+    let mut guard = CancelGuard::new(raw, decoded, queue);
+    let mut st_scratch = Vec::new();
+    let mut gr_scratch = Vec::new();
+    while let Some(msg) = queue.pop() {
+        let charge = BatchCharge::new(msg, raw);
+        if raw.is_shutdown() {
+            break;
+        }
+        let mut entries = Vec::with_capacity(charge.blobs().len());
+        for blob in charge.blobs() {
+            let entry = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                decode_batch_entry(blob, filter, pool, &mut st_scratch, &mut gr_scratch).map(
+                    |result| {
+                        result.and_then(|block| {
+                            transform(block).map_err(|error| {
+                                new_error(ErrorKind::Io(std::io::Error::other(error)))
+                            })
+                        })
+                    },
+                )
+            }));
+            match entry {
+                Ok(Some(Ok(item))) => entries.push(Ok(item)),
+                Ok(Some(Err(error))) => {
+                    entries.push(Err(error));
+                    break;
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    entries.push(Err(new_error(ErrorKind::Io(std::io::Error::other(
+                        "decode task panicked",
+                    )))));
+                    break;
+                }
+            }
+        }
+        let (seq, decoded_permit) = charge.finish_parts();
+        if tx
+            .send((
+                seq,
+                FusedDecodedBatch {
+                    entries,
+                    decoded: decoded_permit,
+                },
+            ))
+            .is_err()
+        {
+            cancel(raw, decoded, queue);
+            break;
+        }
+    }
+    guard.disarm();
+}
+
+fn consume_fused<T, F>(
+    rx: Receiver<(usize, FusedDecodedBatch<T>)>,
+    raw: &Budget,
+    decoded: &Budget,
+    queue: &Queue,
+    consume: &mut F,
+) -> Result<()>
+where
+    F: FnMut(T) -> Result<()>,
+{
+    let mut pending = ReorderBuffer::with_capacity(8);
+    loop {
+        let start = Instant::now();
+        let next = rx.recv();
+        PIPELINE_METRICS
+            .decoded_recv_wait_ns
+            .fetch_add(elapsed_ns_u64(start), Relaxed);
+        let (seq, batch) = match next {
+            Ok(item) => item,
+            Err(_) => break,
+        };
+        pending.push(seq, batch);
+        record_reorder_high_water(pending.filled_len());
+        while let Some(batch) = pending.pop_ready() {
+            for entry in batch.entries {
+                if let Err(error) = entry.and_then(&mut *consume) {
+                    cancel(raw, decoded, queue);
+                    drop(rx);
+                    return Err(error);
+                }
+            }
+            // Charge decoded input bytes until ordered delivery. Transformed
+            // AltW output can be larger, so this is not a byte ceiling there.
+            drop(batch.decoded);
+        }
+    }
+    debug_assert_eq!(pending.filled_len(), 0, "batches lost at clean EOF");
+    Ok(())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+#[hotpath::measure]
+pub(crate) fn run_batched_pipeline_fused<R, T, X, F>(
+    mut reader: BlobReader<R>,
+    decode_threads: Option<usize>,
+    config: PipelineConfig,
+    filter: Option<BlobFilter>,
+    transform: &X,
+    mut consume: F,
+) -> Result<()>
+where
+    R: Read + Send,
+    T: Send,
+    X: Fn(PrimitiveBlock) -> std::result::Result<T, String> + Sync,
+    F: FnMut(T) -> Result<()>,
+{
+    reader.set_parse_tagdata(filter.as_ref().is_some_and(BlobFilter::has_tag_filter));
+    reader.set_parse_indexdata(filter.is_some());
+    let raw = Arc::new(Budget::new(
+        config
+            .read_ahead_bytes
+            .map_or(RAW_INFLIGHT_BUDGET, |bytes| bytes as u64),
+    ));
+    let decoded = Arc::new(Budget::new(
+        config
+            .decode_ahead_bytes
+            .map_or(DECODED_INFLIGHT_BUDGET, |bytes| bytes as u64),
+    ));
+    let queue = Arc::new(Queue::new());
+    let pool = DecompressPool::new();
+    let workers = worker_count(decode_threads);
+    let (tx, rx) = sync_channel(workers.saturating_mul(2).max(1));
+
+    std::thread::scope(|scope| {
+        let mut consumer_guard = CancelGuard::new(&raw, &decoded, &queue);
+        let pump_queue = Arc::clone(&queue);
+        let pump_raw = Arc::clone(&raw);
+        let pump_decoded = Arc::clone(&decoded);
+        let pump_tx = tx.clone();
+        scope.spawn(move || {
+            pump(
+                reader,
+                &pump_queue,
+                &pump_raw,
+                &pump_decoded,
+                &pump_tx,
+                |error| FusedDecodedBatch {
+                    entries: vec![Err(error)],
+                    decoded: None,
+                },
+            );
+        });
+        for _ in 0..workers {
+            let queue = Arc::clone(&queue);
+            let raw = Arc::clone(&raw);
+            let decoded = Arc::clone(&decoded);
+            let tx = tx.clone();
+            let pool = Arc::clone(&pool);
+            let filter = filter.as_ref();
+            scope.spawn(move || {
+                run_fused_worker(&queue, &raw, &decoded, &tx, filter, &pool, transform);
+            });
+        }
+        drop(tx);
+        let result = consume_fused(rx, &raw, &decoded, &queue, &mut consume);
+        consumer_guard.disarm();
+        PIPELINE_METRICS.emit();
+        emit_batched_metrics();
+        result
+    })
+}
+
 #[cfg(feature = "test-hooks")]
 pub(crate) mod test_hooks {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
@@ -630,6 +828,8 @@ pub(crate) mod test_hooks {
         STALLED_READY.store(false, Relaxed);
         RELEASE_STALLED.store(false, Relaxed);
         PANIC_BATCH_SEQ.store(usize::MAX, Relaxed);
+        // Cross-test isolation: this counter is process-global test state.
+        super::BATCHED_REORDER_HIGH_WATER.store(0, Relaxed);
     }
 
     pub fn reorder_high_water() -> u64 {
@@ -661,11 +861,55 @@ mod tests {
     use crate::ElementReader;
     use crate::block_builder::{BlockBuilder, HeaderBuilder};
     use crate::writer::{Compression, PbfWriter};
-    use std::io::Cursor;
+    use std::io::{Cursor, Read};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     const RAW_INFLIGHT_BUDGET_USIZE: usize = 32 * 1024 * 1024;
+
+    #[derive(Clone)]
+    struct CountingRead {
+        inner: Cursor<Vec<u8>>,
+        bytes_read: Arc<AtomicUsize>,
+    }
+
+    impl CountingRead {
+        fn new(bytes: Vec<u8>, bytes_read: Arc<AtomicUsize>) -> Self {
+            Self {
+                inner: Cursor::new(bytes),
+                bytes_read,
+            }
+        }
+    }
+
+    impl Read for CountingRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.inner.read(buf)?;
+            self.bytes_read.fetch_add(read, Ordering::Relaxed);
+            if read > 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(read)
+        }
+    }
+
+    fn assert_completes<F, T>(label: &str, f: F) -> T
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let handle = std::thread::spawn(move || {
+            let result = f();
+            tx.send(()).expect("watchdog receiver open");
+            result
+        });
+        rx.recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|_| panic!("{label}: did not complete within timeout"));
+        handle.join().expect("watchdog thread joins")
+    }
 
     fn pbf(data_blobs: usize) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -754,6 +998,10 @@ mod tests {
             &raw,
             &decoded,
             &tx,
+            |error| DecodedBatch {
+                entries: vec![Err(error)],
+                decoded: None,
+            },
         );
         let mut batches = Vec::new();
         while let Some(batch) = queue.pop() {
@@ -786,6 +1034,119 @@ mod tests {
             writer.flush().unwrap();
         }
         bytes
+    }
+
+    #[test]
+    fn batched_fused_matches_plain_batched() {
+        let mut plain = Vec::new();
+        ElementReader::new(Cursor::new(pbf(3)))
+            .unwrap()
+            .batched_pipeline(true)
+            .for_each_block_pipelined(|block| {
+                plain.push(block.elements().count());
+                Ok(())
+            })
+            .unwrap();
+        let mut fused = Vec::new();
+        ElementReader::new(Cursor::new(pbf(3)))
+            .unwrap()
+            .batched_pipeline(true)
+            .for_each_fused_block(
+                |block| Ok::<_, String>(block.elements().count()),
+                |count| {
+                    fused.push(count);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(plain, fused);
+    }
+
+    #[test]
+    fn batched_fused_transform_error_position() {
+        let seen = std::sync::atomic::AtomicUsize::new(0);
+        let mut consumed = Vec::new();
+        let result = ElementReader::new(Cursor::new(pbf(3)))
+            .unwrap()
+            .batched_pipeline(true)
+            .decode_threads(1)
+            .for_each_fused_block(
+                |_| {
+                    let seq = seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if seq == 1 {
+                        Err("transform failure".to_owned())
+                    } else {
+                        Ok(seq)
+                    }
+                },
+                |seq| {
+                    consumed.push(seq);
+                    Ok(())
+                },
+            );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("transform failure")
+        );
+        assert_eq!(consumed, [0]);
+    }
+
+    #[test]
+    fn batched_fused_transform_panic_reports_error() {
+        let result = assert_completes("batched fused transform panic", || {
+            ElementReader::new(Cursor::new(pbf(1)))
+                .unwrap()
+                .batched_pipeline(true)
+                .for_each_fused_block(
+                    |_| -> std::result::Result<(), String> { panic!("test panic") },
+                    |_| Ok(()),
+                )
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("decode task panicked")
+        );
+    }
+
+    #[test]
+    fn batched_fused_early_consumer_error_stops_promptly() {
+        let bytes = pbf(128);
+        let full_len = bytes.len();
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let result = ElementReader::new(CountingRead::new(bytes, Arc::clone(&bytes_read)))
+            .unwrap()
+            .batched_pipeline(true)
+            .for_each_fused_block(
+                |_| Ok::<_, String>(()),
+                |_| {
+                    Err(crate::error::new_error(crate::error::ErrorKind::Io(
+                        std::io::Error::other("stop"),
+                    )))
+                },
+            );
+        assert!(result.unwrap_err().to_string().contains("stop"));
+        assert!(bytes_read.load(Ordering::Relaxed) < full_len);
+    }
+
+    #[test]
+    fn batched_fused_dispatch_via_builder() {
+        let mut count = 0;
+        ElementReader::new(Cursor::new(pbf(2)))
+            .unwrap()
+            .batched_pipeline(true)
+            .for_each_fused_block(
+                |_| Ok::<_, String>(()),
+                |_| {
+                    count += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(count, 2);
     }
 
     #[test]

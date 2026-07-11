@@ -330,6 +330,40 @@ impl<R: Read + Send> ElementReader<R> {
         }
     }
 
+    /// Ordered pipelined read with a per-block transform executed on the
+    /// decode workers. The consumer remains serialized on the calling thread.
+    ///
+    /// `PBFHOGG_BLOCK_QUEUE_BYTES` and `PBFHOGG_CMD_BATCH_BYTES` are
+    /// intentionally inert here: fused arms do not construct the iterator
+    /// block queue or command-side batches. The raw and decoded byte budgets
+    /// continue to apply in the selected engine.
+    pub(crate) fn for_each_fused_block<T, X, F>(self, transform: X, consume: F) -> Result<()>
+    where
+        T: Send,
+        X: Fn(PrimitiveBlock) -> std::result::Result<T, String> + Sync,
+        F: FnMut(T) -> Result<()>,
+    {
+        if self.pipeline_config.batched {
+            super::batched_pipeline::run_batched_pipeline_fused(
+                self.blob_iter,
+                self.decode_threads,
+                self.pipeline_config,
+                self.blob_filter,
+                &transform,
+                consume,
+            )
+        } else {
+            super::pipeline::run_pipeline_fused(
+                self.blob_iter,
+                self.decode_threads,
+                self.pipeline_config,
+                self.blob_filter,
+                &transform,
+                consume,
+            )
+        }
+    }
+
     /// Returns an iterator of decoded [`PrimitiveBlock`]s from the pipelined reader.
     ///
     /// The 3-stage pipeline (I/O → decode → reorder) runs in a background thread.

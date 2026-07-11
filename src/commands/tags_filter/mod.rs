@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use super::{
     HeaderOverrides, drain_batch_results, ensure_node_capacity_local,
     ensure_relation_capacity_local, ensure_way_capacity_local, flush_local,
-    for_each_primitive_block_batch, require_indexdata, writer_from_header,
+    for_each_primitive_block_batch, fuse_transform_from_env, require_indexdata, writer_from_header,
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::idset::IdSet;
@@ -178,6 +178,7 @@ pub fn tags_filter(
     opts: &TagsFilterOptions<'_>,
     overrides: &HeaderOverrides,
 ) -> Result<TagsFilterStats> {
+    let fused = fuse_transform_from_env()?;
     // Blob-level filtering can't help in invert mode (we want non-matching blobs).
     if !opts.invert {
         require_indexdata(
@@ -204,6 +205,7 @@ pub fn tags_filter(
             opts.compression,
             opts.direct_io,
             overrides,
+            fused,
         )?;
         #[allow(clippy::cast_possible_wrap)]
         {
@@ -351,7 +353,7 @@ fn filter_block_parallel(
 }
 
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn tags_filter_single_pass(
     input: &Path,
     output: &Path,
@@ -360,6 +362,7 @@ fn tags_filter_single_pass(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    fused: bool,
 ) -> Result<TagsFilterStats> {
     crate::debug::emit_marker("TAGSFILTER_SCAN_START");
     let reader = ElementReader::open(input, direct_io)?;
@@ -393,9 +396,55 @@ fn tags_filter_single_pass(
         relations_from_relations: 0,
     };
 
-    for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
-        process_filter_batch(batch, expressions, invert, &mut writer, &mut stats)
-    })?;
+    if fused {
+        crate::debug::emit_counter("fuse_transform_active", 1);
+        let mut fused_blocks = 0_u64;
+        reader.for_each_fused_block(
+            |block| {
+                let mut bb = BlockBuilder::new();
+                let mut output = Vec::new();
+                let block_stats =
+                    filter_block_parallel(&block, expressions, invert, &mut bb, &mut output)?;
+                flush_local(&mut bb, &mut output)?;
+                Ok((output, block_stats))
+            },
+            |(blocks, block_stats)| {
+                for OwnedBlock {
+                    bytes,
+                    index,
+                    tagdata,
+                    way_members,
+                } in blocks
+                {
+                    writer.write_primitive_block_owned(
+                        bytes,
+                        index,
+                        tagdata.as_deref(),
+                        way_members.as_deref(),
+                    )?;
+                }
+                stats.nodes_matched += block_stats.nodes_matched;
+                stats.ways_matched += block_stats.ways_matched;
+                stats.relations_matched += block_stats.relations_matched;
+                fused_blocks += 1;
+                if fused_blocks.is_multiple_of(64) {
+                    crate::debug::emit_counter(
+                        "fuse_transform_blocks",
+                        i64::try_from(fused_blocks).unwrap_or(i64::MAX),
+                    );
+                }
+                Ok(())
+            },
+        )?;
+        crate::debug::emit_counter(
+            "fuse_transform_blocks",
+            i64::try_from(fused_blocks).unwrap_or(i64::MAX),
+        );
+    } else {
+        for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
+            process_filter_batch(batch, expressions, invert, &mut writer, &mut stats)
+        })?;
+    }
 
     writer.flush()?;
     crate::debug::emit_marker("TAGSFILTER_SCAN_END");
@@ -1302,6 +1351,45 @@ fn collect_way_node_dependencies(
 mod tests {
     use super::*;
     use crate::owned::TypeFilter;
+
+    #[test]
+    fn fused_single_pass_matches_batched() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.pbf");
+        let file = std::fs::File::create(&input).unwrap();
+        let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+        writer
+            .write_header(&crate::block_builder::HeaderBuilder::new().build().unwrap())
+            .unwrap();
+        let mut block = BlockBuilder::new();
+        block.add_node(1, 0, 0, [("amenity", "bench")], None);
+        block.add_node(2, 0, 0, [("name", "untagged-match")], None);
+        writer
+            .write_primitive_block(block.take().unwrap().unwrap())
+            .unwrap();
+        writer.flush().unwrap();
+
+        let expressions = parse_expressions(&["amenity".to_owned()]).unwrap();
+        let batched = dir.path().join("batched.pbf");
+        let fused = dir.path().join("fused.pbf");
+        for (output, fused) in [(&batched, false), (&fused, true)] {
+            tags_filter_single_pass(
+                &input,
+                output,
+                &expressions,
+                false,
+                Compression::default(),
+                false,
+                &HeaderOverrides::default(),
+                fused,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            std::fs::read(fused).unwrap(),
+            std::fs::read(batched).unwrap()
+        );
+    }
 
     #[test]
     fn element_matches_respects_type_filter() {

@@ -35,6 +35,15 @@ pub(crate) type Result<T> = crate::BoxResult<T>;
 pub(crate) const BATCH_SIZE: usize = 64;
 const BATCH_COUNT_BACKSTOP: usize = BATCH_SIZE * 16;
 
+/// PBFHOGG_FUSE_TRANSFORM gate (env-gated read-path batch, item 3).
+/// Invalid values fail fast so a misspelled experimental invocation is never
+/// mistaken for an unfused baseline.
+pub(crate) fn fuse_transform_from_env() -> Result<bool> {
+    Ok(crate::read::pipeline::bool_gate_from_env(
+        "PBFHOGG_FUSE_TRANSFORM",
+    )?)
+}
+
 // PBFHOGG_CMD_BATCH_BYTES charges `PrimitiveBlock::decompressed_size()`.
 // Planet primary's 87 GiB on-disk compressed size / 50,816 blobs is 1,838,309
 // compressed bytes/blob; using the approximately 2x zlib expansion estimate

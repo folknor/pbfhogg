@@ -653,11 +653,507 @@ where
     })
 }
 
+// ---------------------------------------------------------------------------
+// Fusion section: removable with PBFHOGG_FUSE_TRANSFORM.
+// ---------------------------------------------------------------------------
+
+/// Fused sibling of `run_pipeline`. Keep this additive: the default engine's
+/// decode seam is deliberately untouched so the gate-off path remains exact.
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+#[hotpath::measure]
+pub(crate) fn run_pipeline_fused<R, T, X, F>(
+    mut blob_reader: BlobReader<R>,
+    decode_thread_count: Option<usize>,
+    pipeline_config: PipelineConfig,
+    blob_filter: Option<BlobFilter>,
+    transform: &X,
+    mut consume: F,
+) -> Result<()>
+where
+    R: Read + Send,
+    T: Send,
+    X: Fn(PrimitiveBlock) -> std::result::Result<T, String> + Sync,
+    F: FnMut(T) -> Result<()>,
+{
+    let has_tag_filter = blob_filter.as_ref().is_some_and(BlobFilter::has_tag_filter);
+    blob_reader.set_parse_tagdata(has_tag_filter);
+    blob_reader.set_parse_indexdata(blob_filter.is_some());
+    let blob_filter = blob_filter.map(Arc::new);
+    let read_ahead = pipeline_config.effective_read_ahead();
+    let decode_ahead = pipeline_config.effective_decode_ahead();
+    let raw_budget = pipeline_config
+        .read_ahead_bytes
+        .map(ByteBudget::new)
+        .map(Arc::new);
+    let decoded_budget = pipeline_config
+        .decode_ahead_bytes
+        .map(ByteBudget::new)
+        .map(Arc::new);
+    let (raw_tx, raw_rx) = sync_channel::<RawItem>(read_ahead);
+    type FusedPayload<T> = Option<crate::error::Result<T>>;
+    let (decoded_tx, decoded_rx) =
+        sync_channel::<(usize, FusedPayload<T>, Option<Permit>, Option<BytePermit>)>(decode_ahead);
+
+    std::thread::scope(|scope| {
+        let raw_budget_for_reader = raw_budget.clone();
+        scope.spawn(move || {
+            for (seq, blob_result) in blob_reader.enumerate() {
+                let byte_permit = blob_result.as_ref().ok().and_then(|blob| {
+                    raw_budget_for_reader.as_ref().map(|budget| {
+                        budget.acquire(usize::try_from(blob.retained_len()).unwrap_or(usize::MAX))
+                    })
+                });
+                let start = Instant::now();
+                let send_result = raw_tx.send((seq, blob_result, byte_permit));
+                PIPELINE_METRICS
+                    .raw_send_wait_ns
+                    .fetch_add(elapsed_ns_u64(start), Relaxed);
+                if send_result.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let dispatch_tx = decoded_tx.clone();
+        scope.spawn(move || {
+            let threads = decode_thread_count.unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get().saturating_sub(2).max(1))
+                    .unwrap_or(4)
+            });
+            let pool = match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+                Ok(pool) => pool,
+                Err(e) => {
+                    let error = crate::error::new_error(crate::error::ErrorKind::Io(
+                        std::io::Error::other(format!("failed to build decode pool: {e}")),
+                    ));
+                    drop(dispatch_tx.send((0, Some(Err(error)), None, None)));
+                    return;
+                }
+            };
+            let buffer_pool = DecompressPool::new();
+            let gate = Arc::new(AdmissionGate::new(decode_ahead));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            pool.in_place_scope(|task_scope| {
+                for (seq, blob_result, _raw_permit) in raw_rx {
+                    if shutdown.load(Relaxed) {
+                        break;
+                    }
+                    match blob_result {
+                        Ok(blob) => {
+                            let start = Instant::now();
+                            let blocked = gate.acquire();
+                            PIPELINE_METRICS
+                                .decode_admit_wait_ns
+                                .fetch_add(elapsed_ns_u64(start), Relaxed);
+                            if blocked {
+                                PIPELINE_METRICS.decode_admit_blocked.fetch_add(1, Relaxed);
+                            }
+                            let permit = Permit(Arc::clone(&gate));
+                            // This charges decoded input size, not transformed output. AltW
+                            // can expand output, so the bound is count-times-bounded-payload.
+                            let byte_permit = decoded_budget
+                                .as_ref()
+                                .map(|budget| budget.acquire(blob.decoded_len_hint()));
+                            let tx = dispatch_tx.clone();
+                            let pool = Arc::clone(&buffer_pool);
+                            let filter = blob_filter.clone();
+                            let shutdown = Arc::clone(&shutdown);
+                            PIPELINE_METRICS.decode_tasks.fetch_add(1, Relaxed);
+                            task_scope.spawn(move |_| {
+                                // Rayon keeps these thread-local buffers with its worker,
+                                // avoiding a fresh pair of Vec allocations per blob task.
+                                thread_local! {
+                                    static ST_SCRATCH: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
+                                    static GR_SCRATCH: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
+                                }
+                                let item =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        if blob.get_type() != BlobType::OsmData {
+                                            return None;
+                                        }
+                                        if let Some(filter) = filter.as_ref()
+                                            && should_skip_blob(filter, &blob)
+                                        {
+                                            PIPELINE_METRICS
+                                                .blobs_skipped_by_filter
+                                                .fetch_add(1, Relaxed);
+                                            return None;
+                                        }
+                                        ST_SCRATCH.with_borrow_mut(|st| {
+                                            GR_SCRATCH.with_borrow_mut(|gr| {
+                                                let result = blob
+                                                    .to_primitiveblock_inline_with_scratch(&pool, st, gr)
+                                                    .and_then(
+                                                |block| {
+                                                    transform(block).map_err(|error| {
+                                                        crate::error::new_error(
+                                                            crate::error::ErrorKind::Io(
+                                                                std::io::Error::other(error),
+                                                            ),
+                                                        )
+                                                    })
+                                                },
+                                            );
+                                                PIPELINE_METRICS.record_scratch_capacity(
+                                                    st.capacity().saturating_mul(8),
+                                                    gr.capacity().saturating_mul(8),
+                                                );
+                                                Some(result)
+                                            })
+                                        })
+                                    }));
+                                let item = match item {
+                                    Ok(item) => item,
+                                    Err(_) => Some(Err(crate::error::new_error(
+                                        crate::error::ErrorKind::Io(std::io::Error::other(
+                                            "decode task panicked",
+                                        )),
+                                    ))),
+                                };
+                                let start = Instant::now();
+                                if tx.send((seq, item, Some(permit), byte_permit)).is_err() {
+                                    shutdown.store(true, Relaxed);
+                                }
+                                PIPELINE_METRICS
+                                    .decoded_send_wait_ns
+                                    .fetch_add(elapsed_ns_u64(start), Relaxed);
+                            });
+                        }
+                        Err(error) => {
+                            let start = Instant::now();
+                            if dispatch_tx
+                                .send((seq, Some(Err(error)), None, None))
+                                .is_err()
+                            {
+                                break;
+                            }
+                            PIPELINE_METRICS
+                                .decoded_send_wait_ns
+                                .fetch_add(elapsed_ns_u64(start), Relaxed);
+                        }
+                    }
+                }
+            });
+        });
+        drop(decoded_tx);
+        let result = drain_fused(decoded_rx, decode_ahead, &mut consume);
+        PIPELINE_METRICS.emit();
+        result
+    })
+}
+
+#[allow(clippy::needless_pass_by_value, clippy::type_complexity)]
+fn drain_fused<T, F>(
+    decoded_rx: Receiver<(
+        usize,
+        Option<crate::error::Result<T>>,
+        Option<Permit>,
+        Option<BytePermit>,
+    )>,
+    decode_ahead: usize,
+    consume: &mut F,
+) -> Result<()>
+where
+    F: FnMut(T) -> Result<()>,
+{
+    let mut pending = ReorderBuffer::with_capacity(decode_ahead);
+    loop {
+        let start = Instant::now();
+        let next = decoded_rx.recv();
+        PIPELINE_METRICS
+            .decoded_recv_wait_ns
+            .fetch_add(elapsed_ns_u64(start), Relaxed);
+        let (seq, item, permit, byte_permit) = match next {
+            Ok(item) => item,
+            Err(_) => break,
+        };
+        pending.push(seq, (item, permit, byte_permit));
+        PIPELINE_METRICS.record_reorder_levels(pending.filled_len(), pending.pending_len());
+        #[cfg(feature = "test-hooks")]
+        test_hooks::record_reorder_levels(pending.filled_len(), pending.pending_len());
+        while let Some((item, permit, byte_permit)) = pending.pop_ready() {
+            match item {
+                Some(Ok(item)) => {
+                    let result = consume(item);
+                    drop(permit);
+                    drop(byte_permit);
+                    result?;
+                }
+                Some(Err(error)) => return Err(error),
+                None => drop(permit),
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
+    use crate::block_builder::{BlockBuilder, HeaderBuilder};
+    use crate::writer::{Compression, PbfWriter};
+    use crate::{BlobFilter, ElementReader};
+    use std::io::{Cursor, Read};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
     use std::time::Duration;
+
+    #[derive(Clone)]
+    struct CountingRead {
+        inner: Cursor<Vec<u8>>,
+        bytes_read: Arc<AtomicUsize>,
+    }
+
+    impl CountingRead {
+        fn new(bytes: Vec<u8>, bytes_read: Arc<AtomicUsize>) -> Self {
+            Self {
+                inner: Cursor::new(bytes),
+                bytes_read,
+            }
+        }
+    }
+
+    impl Read for CountingRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.inner.read(buf)?;
+            self.bytes_read.fetch_add(read, Ordering::Relaxed);
+            if read > 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(read)
+        }
+    }
+
+    fn assert_completes<F, T>(label: &str, f: F) -> T
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let handle = std::thread::spawn(move || {
+            let result = f();
+            tx.send(()).expect("watchdog receiver open");
+            result
+        });
+        rx.recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|_| panic!("{label}: did not complete within timeout"));
+        handle.join().expect("watchdog thread joins")
+    }
+
+    fn fused_pbf(blocks: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut writer = PbfWriter::new(&mut bytes, Compression::None);
+            writer
+                .write_header(&HeaderBuilder::new().build().unwrap())
+                .unwrap();
+            for id in 0..blocks {
+                let mut builder = BlockBuilder::new();
+                builder.add_node(
+                    i64::try_from(id).unwrap(),
+                    0,
+                    0,
+                    std::iter::empty::<(&str, &str)>(),
+                    None,
+                );
+                writer
+                    .write_primitive_block(builder.take().unwrap().unwrap())
+                    .unwrap();
+            }
+            writer.flush().unwrap();
+        }
+        bytes
+    }
+
+    fn fused_counts(reader: ElementReader<Cursor<Vec<u8>>>) -> Result<Vec<usize>> {
+        let mut counts = Vec::new();
+        reader.for_each_fused_block(
+            |block| Ok::<_, String>(block.elements().count()),
+            |count| {
+                counts.push(count);
+                Ok(())
+            },
+        )?;
+        Ok(counts)
+    }
+
+    #[test]
+    fn fused_output_matches_block_pipelined() {
+        let bytes = fused_pbf(3);
+        let mut pipelined = Vec::new();
+        ElementReader::new(Cursor::new(bytes.clone()))
+            .unwrap()
+            .for_each_block_pipelined(|block| {
+                pipelined.push(block.elements().count());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            fused_counts(ElementReader::new(Cursor::new(bytes)).unwrap()).unwrap(),
+            pipelined
+        );
+    }
+
+    #[test]
+    fn fused_transform_error_surfaces_after_prior_blocks() {
+        let mut consumed = Vec::new();
+        let result = ElementReader::new(Cursor::new(fused_pbf(4)))
+            .unwrap()
+            .decode_threads(1)
+            .for_each_fused_block(
+                |block| {
+                    let id = match block.elements().next().expect("fixture element") {
+                        crate::Element::DenseNode(node) => node.id(),
+                        crate::Element::Node(node) => node.id(),
+                        crate::Element::Way(way) => way.id(),
+                        crate::Element::Relation(relation) => relation.id(),
+                    };
+                    if id == 2 {
+                        Err("transform failure".to_owned())
+                    } else {
+                        Ok(id)
+                    }
+                },
+                |seq| {
+                    consumed.push(seq);
+                    Ok(())
+                },
+            );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("transform failure")
+        );
+        assert_eq!(consumed, [0, 1]);
+    }
+
+    #[test]
+    fn fused_transform_panic_reports_error() {
+        let result = assert_completes("fused transform panic", || {
+            ElementReader::new(Cursor::new(fused_pbf(1)))
+                .unwrap()
+                .for_each_fused_block(
+                    |_| -> std::result::Result<(), String> { panic!("test panic") },
+                    |_| Ok(()),
+                )
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("decode task panicked")
+        );
+    }
+
+    #[test]
+    fn fused_early_consumer_error_stops_promptly() {
+        let bytes = fused_pbf(128);
+        let full_len = bytes.len();
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let result = ElementReader::new(CountingRead::new(bytes, Arc::clone(&bytes_read)))
+            .unwrap()
+            .for_each_fused_block(
+                |_| Ok::<_, String>(()),
+                |_| {
+                    Err(crate::error::new_error(crate::error::ErrorKind::Io(
+                        std::io::Error::other("stop"),
+                    )))
+                },
+            );
+        assert!(result.unwrap_err().to_string().contains("stop"));
+        assert!(bytes_read.load(Ordering::Relaxed) < full_len);
+    }
+
+    #[test]
+    fn fused_tiny_byte_budgets_complete_in_order() {
+        assert_eq!(
+            fused_counts(
+                ElementReader::new(Cursor::new(fused_pbf(3)))
+                    .unwrap()
+                    .read_ahead_bytes(1)
+                    .decode_ahead_bytes(1)
+            )
+            .unwrap(),
+            [1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn fused_stalled_transform_preserves_order() {
+        let stalled = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let worker_stalled = Arc::clone(&stalled);
+        let worker_release = Arc::clone(&release);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut ids = Vec::new();
+            let result = ElementReader::new(Cursor::new(fused_pbf(3)))
+                .unwrap()
+                .decode_threads(2)
+                .for_each_fused_block(
+                    |block| {
+                        let id = match block.elements().next().unwrap() {
+                            crate::Element::DenseNode(node) => node.id(),
+                            crate::Element::Node(node) => node.id(),
+                            crate::Element::Way(way) => way.id(),
+                            crate::Element::Relation(relation) => relation.id(),
+                        };
+                        if id == 0 {
+                            worker_stalled.store(true, Ordering::Relaxed);
+                            while !worker_release.load(Ordering::Relaxed) {
+                                std::thread::yield_now();
+                            }
+                        }
+                        Ok::<_, String>(id)
+                    },
+                    |id| {
+                        ids.push(id);
+                        Ok(())
+                    },
+                );
+            done_tx.send((result, ids)).unwrap();
+        });
+        let start = std::time::Instant::now();
+        while !stalled.load(Ordering::Relaxed) {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "transform did not stall"
+            );
+            std::thread::yield_now();
+        }
+        release.store(true, Ordering::Relaxed);
+        let (result, ids) = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        result.unwrap();
+        assert_eq!(ids, [0, 1, 2]);
+    }
+
+    #[test]
+    fn fused_thread_count_parity() {
+        let one = fused_counts(
+            ElementReader::new(Cursor::new(fused_pbf(8)))
+                .unwrap()
+                .decode_threads(1),
+        )
+        .unwrap();
+        let many = fused_counts(
+            ElementReader::new(Cursor::new(fused_pbf(8)))
+                .unwrap()
+                .decode_threads(8),
+        )
+        .unwrap();
+        assert_eq!(one, many);
+    }
+
+    #[test]
+    fn fused_blobfilter_skips_blobs() {
+        let reader = ElementReader::new(Cursor::new(fused_pbf(2)))
+            .unwrap()
+            .with_blob_filter(BlobFilter::new(false, true, false));
+        assert!(fused_counts(reader).unwrap().is_empty());
+    }
 
     #[test]
     fn gate_blocks_at_cap_and_release_unblocks() {

@@ -534,8 +534,19 @@ fn filter_by_id_walker(
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                 flush_local(&mut bb, &mut output_blocks)
                     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                for (block_bytes, index, tagdata) in output_blocks.drain(..) {
-                    w.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+                for OwnedBlock {
+                    bytes: block_bytes,
+                    index,
+                    tagdata,
+                    way_members,
+                } in output_blocks.drain(..)
+                {
+                    w.write_primitive_block_owned(
+                        block_bytes,
+                        index,
+                        tagdata.as_deref(),
+                        way_members.as_deref(),
+                    )?;
                 }
                 stats.nodes_written += nodes;
                 stats.ways_written += ways;
@@ -660,8 +671,19 @@ fn filter_by_id_streaming(
                         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                 flush_local(&mut bb, &mut output_blocks)
                     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                for (block_bytes, index, tagdata) in output_blocks.drain(..) {
-                    w.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+                for OwnedBlock {
+                    bytes: block_bytes,
+                    index,
+                    tagdata,
+                    way_members,
+                } in output_blocks.drain(..)
+                {
+                    w.write_primitive_block_owned(
+                        block_bytes,
+                        index,
+                        tagdata.as_deref(),
+                        way_members.as_deref(),
+                    )?;
                 }
                 stats.nodes_written += nodes;
                 stats.ways_written += ways;

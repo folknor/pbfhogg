@@ -273,8 +273,19 @@ pub fn sort(
             let (blocks, counts) = overlap_iter
                 .next()
                 .ok_or_else(|| io::Error::other("overlap output iterator drained"))?;
-            for (block_bytes, index, tagdata) in blocks {
-                writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+            for OwnedBlock {
+                bytes: block_bytes,
+                index,
+                tagdata,
+                way_members,
+            } in blocks
+            {
+                writer.write_primitive_block_owned(
+                    block_bytes,
+                    index,
+                    tagdata.as_deref(),
+                    way_members.as_deref(),
+                )?;
             }
             stats.nodes += counts.nodes;
             stats.ways += counts.ways;

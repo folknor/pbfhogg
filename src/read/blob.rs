@@ -124,6 +124,45 @@ impl Blob {
         self.offset
     }
 
+    /// Raw way-member bitmap from BlobHeader field 5 (`pbfhogg.WayMembers-v1`).
+    /// The version byte and encoded way count are validated and stripped.
+    /// Returns `None` when absent, parsing was disabled, or the payload is malformed.
+    pub fn way_members(&self) -> Option<&[u8]> {
+        let (_, bitmap) = self.way_members_parts()?;
+        Some(bitmap)
+    }
+
+    /// Encoded field-5 way count for cross-checking against decoded ways.
+    /// Returns `None` under the same conditions as [`Self::way_members`].
+    pub fn way_member_count(&self) -> Option<u32> {
+        self.way_members_parts().map(|(count, _)| count)
+    }
+
+    fn way_members_parts(&self) -> Option<(u32, &[u8])> {
+        let data = self.header.waymembers.as_deref()?;
+        if data.first().copied()? != 1 {
+            return None;
+        }
+        let mut value = 0u32;
+        let mut shift = 0u32;
+        let mut end = None;
+        for (i, byte) in data[1..].iter().copied().enumerate() {
+            if shift >= 32 {
+                return None;
+            }
+            value |= u32::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                end = Some(i + 2);
+                break;
+            }
+            shift += 7;
+        }
+        let end = end?;
+        let bitmap = data.get(end..)?;
+        let expected = usize::try_from(u64::from(value).div_ceil(8)).ok()?;
+        (bitmap.len() == expected).then_some((value, bitmap))
+    }
+
     /// Tries to decode the blob to a [`HeaderBlock`]. This operation might involve an expensive
     /// decompression step.
     pub fn to_headerblock(&self) -> Result<HeaderBlock> {
@@ -287,6 +326,8 @@ pub struct BlobReader<R: Read + Send> {
     /// Default `true` for compatibility. Disabled in hot paths that never
     /// call `Blob::index()` (par_map_reduce, unfiltered pipeline).
     parse_indexdata: bool,
+    /// When `true`, `WireBlobHeader::parse` allocates field-5 waymembers.
+    parse_waymembers: bool,
     /// File descriptor for fadvise(DONTNEED) after each blob read. When set,
     /// the reader evicts page cache pages behind the read head, preventing
     /// sequential reads from accumulating the entire file in RSS.
@@ -320,6 +361,7 @@ impl<R: Read + Send> BlobReader<R> {
             header_buf: Vec::new(),
             parse_tagdata: false,
             parse_indexdata: true,
+            parse_waymembers: false,
             #[cfg(target_os = "linux")]
             evict_fd: None,
         }
@@ -346,6 +388,12 @@ impl<R: Read + Send> BlobReader<R> {
     /// to skip the per-blob copy.
     pub(crate) fn set_parse_indexdata(&mut self, enable: bool) {
         self.parse_indexdata = enable;
+    }
+
+    /// Enable or disable way-member bitmap parsing (BlobHeader field 5).
+    /// Disabled by default to avoid allocating metadata unused by normal reads.
+    pub fn set_parse_waymembers(&mut self, enable: bool) {
+        self.parse_waymembers = enable;
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -424,12 +472,15 @@ impl<R: Read + Send> BlobReader<R> {
             ))));
         }
 
-        let header =
-            match WireBlobHeader::parse(&self.header_buf, self.parse_tagdata, self.parse_indexdata)
-            {
-                Ok(header) => header,
-                Err(e) => return self.handle_error(e),
-            };
+        let header = match WireBlobHeader::parse(
+            &self.header_buf,
+            self.parse_tagdata,
+            self.parse_indexdata,
+            self.parse_waymembers,
+        ) {
+            Ok(header) => header,
+            Err(e) => return self.handle_error(e),
+        };
 
         if header.datasize < 0 {
             return self.handle_error(new_blob_error(BlobError::InvalidDataSize {
@@ -478,6 +529,7 @@ impl BlobReader<FileReader> {
             header_buf: Vec::new(),
             parse_tagdata: false,
             parse_indexdata: true,
+            parse_waymembers: false,
             #[cfg(target_os = "linux")]
             evict_fd,
         })
@@ -497,6 +549,7 @@ impl BlobReader<FileReader> {
             header_buf: Vec::new(),
             parse_tagdata: false,
             parse_indexdata: true,
+            parse_waymembers: false,
             evict_fd: None, // O_DIRECT: no pages to evict
         })
     }
@@ -524,6 +577,7 @@ impl BlobReader<FileReader> {
             header_buf: Vec::new(),
             parse_tagdata: false,
             parse_indexdata: true,
+            parse_waymembers: false,
             #[cfg(target_os = "linux")]
             evict_fd,
         })
@@ -639,6 +693,7 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
             header_buf: Vec::new(),
             parse_tagdata: false,
             parse_indexdata: true,
+            parse_waymembers: false,
             #[cfg(target_os = "linux")]
             evict_fd: None,
         })
@@ -938,6 +993,7 @@ mod tests {
                 datasize: 0,
                 indexdata: None,
                 tagdata: None,
+                waymembers: None,
             };
             let ff_blob = WireBlob {
                 data: None,
@@ -947,5 +1003,67 @@ mod tests {
             let blob = Blob::new(ff_header, ff_blob, None);
             assert_eq!(blob.get_type(), *expected_type);
         }
+    }
+
+    fn blob_with_waymembers(waymembers: Option<Vec<u8>>) -> Blob {
+        let header = WireBlobHeader {
+            blob_type: BlobKind::OsmData,
+            datasize: 0,
+            indexdata: None,
+            tagdata: None,
+            waymembers: waymembers.map(Vec::into_boxed_slice),
+        };
+        let blob = WireBlob {
+            data: None,
+            raw_size: None,
+        };
+        Blob::new(header, blob, None)
+    }
+
+    #[test]
+    fn way_members_strips_preamble_and_reports_count() {
+        // version 1, count 9, ceil(9/8) = 2 bitmap bytes.
+        let blob = blob_with_waymembers(Some(vec![0x01, 9, 0xA5, 0x01]));
+        assert_eq!(blob.way_members(), Some([0xA5u8, 0x01].as_slice()));
+        assert_eq!(blob.way_member_count(), Some(9));
+    }
+
+    #[test]
+    fn way_members_handles_multibyte_count() {
+        // count 200 -> varint [0xC8, 0x01]; ceil(200/8) = 25 bitmap bytes.
+        let mut payload = vec![0u8; 3 + 25];
+        payload[0] = 0x01;
+        payload[1] = 0xC8;
+        payload[2] = 0x01;
+        let blob = blob_with_waymembers(Some(payload));
+        assert_eq!(blob.way_member_count(), Some(200));
+        assert_eq!(blob.way_members().map(<[u8]>::len), Some(25));
+    }
+
+    #[test]
+    fn way_members_rejects_malformed() {
+        // Absent field.
+        assert_eq!(blob_with_waymembers(None).way_members(), None);
+        assert_eq!(blob_with_waymembers(None).way_member_count(), None);
+        // Wrong version byte.
+        assert_eq!(
+            blob_with_waymembers(Some(vec![0x02, 1, 0x00])).way_members(),
+            None
+        );
+        // Bitmap shorter than ceil(count/8): count 9 needs 2 bytes, 1 supplied.
+        assert_eq!(
+            blob_with_waymembers(Some(vec![0x01, 9, 0x00])).way_members(),
+            None
+        );
+        // Bitmap longer than ceil(count/8): count 1 needs 1 byte, 2 supplied.
+        assert_eq!(
+            blob_with_waymembers(Some(vec![0x01, 1, 0x00, 0x00])).way_members(),
+            None
+        );
+        // Truncated count varint (continuation bit set with no following byte).
+        assert_eq!(
+            blob_with_waymembers(Some(vec![0x01, 0x80])).way_members(),
+            None
+        );
     }
 }

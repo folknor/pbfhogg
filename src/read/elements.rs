@@ -224,6 +224,11 @@ impl<'a> Way<'a> {
         }
     }
 
+    /// Raw field-20 shared-node pin bitmap, if present.
+    pub fn shared_node_pins(&self) -> Option<&'a [u8]> {
+        self.way.pins_data
+    }
+
     /// Returns an iterator over the tags of this way as raw index pairs.
     pub fn raw_tags(&self) -> RawTagIter<'a> {
         RawTagIter {

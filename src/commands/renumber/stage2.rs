@@ -113,9 +113,20 @@ pub(super) fn stage2d_parallel_way_assembly(
             reorder.push(seq_num, item);
             while let Some(result) = reorder.pop_ready() {
                 let blocks = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                for (block_bytes, index, tagdata) in blocks {
+                for OwnedBlock {
+                    bytes: block_bytes,
+                    index,
+                    tagdata,
+                    way_members,
+                } in blocks
+                {
                     let t0 = std::time::Instant::now();
-                    writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+                    writer.write_primitive_block_owned(
+                        block_bytes,
+                        index,
+                        tagdata.as_deref(),
+                        way_members.as_deref(),
+                    )?;
                     #[allow(clippy::cast_possible_truncation)]
                     stage2d_cref.consumer_write_ms.fetch_add(
                         t0.elapsed().as_millis() as u64,
@@ -222,7 +233,12 @@ fn stage2d_worker(
             let taken = std::mem::take(&mut reframe_buf);
             // Pre-reserve for next blob based on this blob's output size.
             reframe_buf.reserve(taken.len());
-            output_blocks.push((taken, index, None));
+            output_blocks.push(OwnedBlock {
+                bytes: taken,
+                index,
+                tagdata: None,
+                way_members: None,
+            });
 
             if blob_way_count != task.element_count {
                 return Err(format!(

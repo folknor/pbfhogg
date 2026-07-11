@@ -257,11 +257,18 @@ fn getparents_walker(
             while let Some(item) = reorder.pop_ready() {
                 match item {
                     Ok((blocks, (n, w, r))) => {
-                        for (block_bytes, index, tagdata) in blocks {
+                        for OwnedBlock {
+                            bytes: block_bytes,
+                            index,
+                            tagdata,
+                            way_members,
+                        } in blocks
+                        {
                             if let Err(e) = writer.write_primitive_block_owned(
                                 block_bytes,
                                 index,
                                 tagdata.as_deref(),
+                                way_members.as_deref(),
                             ) {
                                 write_err = Some(Box::new(e));
                                 return;

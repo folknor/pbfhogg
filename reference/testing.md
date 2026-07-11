@@ -74,7 +74,7 @@ shape:
 
 - `pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData, Metadata}`
 - `pbfhogg::writer::{PbfWriter, Compression}`
-- `pbfhogg::{BlobDecode, BlobError, BlobReader, BlobType, Element, ElementReader, ErrorKind, HeaderOverrides, MemberId, MemberType}`
+- `pbfhogg::{Blob, BlobDecode, BlobError, BlobReader, BlobType, Element, ElementReader, ErrorKind, HeaderBlock, HeaderOverrides, MemberId, MemberType, Way}`
 
 Everything else is non-stable and requires CLI conversion.
 

@@ -84,7 +84,7 @@ Used by `sort`, `cat --dedupe`, `apply-changes`.
 - Max 8000 entities per block, one element type per block
 - `StringTable` with `FxHashMap<Rc<str>, u32>` dedup
 - Reusable wire scratch buffers (`wire.rs` encoding primitives)
-- Output: `OwnedBlock = (Vec<u8>, BlobIndex, Option<Vec<u8>>)` - serialized data + index + optional tagdata
+- Output: `OwnedBlock { bytes: Vec<u8>, index: BlobIndex, tagdata: Option<Vec<u8>>, way_members: Option<Vec<u8>> }` - serialized data + index + optional tagdata + optional BlobHeader field-5 way-member payload (`None` from every current producer)
 
 Used by all commands that produce PBF output.
 

@@ -1,11 +1,24 @@
 # Injected prepass metadata: WayMembers-v1 + SharedNodePins-v1 (survey)
 
-Status: 2026-07-09 survey; no code has landed. Decisions 1 and 2 were
-RATIFIED 2026-07-10: steady state is option (a) - altw moves into the
-daily loop and the production merge drops `--locations-on-ways`
-(recorded in `reference/pipeline.md`) - and injection is opt-in
-flag-gated with sparse parity. The paired spec now waits only on
+Status: 2026-07-09 survey. Decisions 1 and 2 were RATIFIED 2026-07-10:
+steady state is option (a) - altw moves into the daily loop and the
+production merge drops `--locations-on-ways` (recorded in
+`reference/pipeline.md`) - and injection is opt-in flag-gated with
+sparse parity. The paired implementation spec now waits only on
 elivagar's Brick 1 superset screen (decision 3).
+
+**2026-07-11: the format/reader layer has landed** - `WireBlobHeader`
+field-5 parse/encode behind the `parse_waymembers` toggle,
+`BlobReader::set_parse_waymembers`, the public `Blob::way_members()` /
+`Blob::way_member_count()` / `Way::shared_node_pins()` accessors, the
+`pbfhogg.WayMembers-v1` / `pbfhogg.SharedNodePins-v1` `HeaderBlock`
+feature-string constants and accessors, and the write-time BlobHeader
+size cap in `encode_blob_header_into` (now fallible). All additive and
+default-off: no producer emits field 5/20 yet, so every reader/writer
+call site still passes `None`/off and output is unchanged. The altw
+producer (relation-scan fusion, stage 1-4 pin computation, the
+`--inject-prepass` flag) has not landed and stays gated on Brick 1 and
+the D9 resolved-refs refinement described above.
 
 Origin: elivagar's `notes/injected-prepass-spec.md` (H2a + H2b of their
 planet-30gb roadmap) specifies a cross-repo contract in which altw computes

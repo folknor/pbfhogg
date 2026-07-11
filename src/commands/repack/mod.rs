@@ -614,13 +614,19 @@ fn frame_owned(
     owned: OwnedBlock,
     compression: &Compression,
 ) -> std::result::Result<Vec<u8>, String> {
-    let (block_bytes, index, tagdata) = owned;
+    let OwnedBlock {
+        bytes: block_bytes,
+        index,
+        tagdata,
+        way_members,
+    } = owned;
     let indexdata = index.serialize();
     let blob = frame_blob_pipelined(
         &block_bytes,
         compression,
         Some(indexdata.as_slice()),
         tagdata.as_deref(),
+        way_members.as_deref(),
     )
     .map_err(|e| e.to_string())?;
     Ok(blob.into_vec())
@@ -640,13 +646,20 @@ fn frame_and_write_batch(
     let framed: Vec<std::io::Result<Vec<u8>>> = batch
         .into_par_iter()
         .map(
-            |(block_bytes, index, tagdata)| -> std::io::Result<Vec<u8>> {
+            |OwnedBlock {
+                 bytes: block_bytes,
+                 index,
+                 tagdata,
+                 way_members,
+             }|
+             -> std::io::Result<Vec<u8>> {
                 let indexdata = index.serialize();
                 let blob = frame_blob_pipelined(
                     &block_bytes,
                     &compression,
                     Some(indexdata.as_slice()),
                     tagdata.as_deref(),
+                    way_members.as_deref(),
                 )?;
                 Ok(blob.into_vec())
             },

@@ -14,8 +14,22 @@ use crate::blob_meta::{BlobIndex, ElemKind};
 use rustc_hash::FxHashSet;
 use std::io;
 
-/// Encoded block bytes, blob index, and optional pre-serialized tagdata.
-pub(crate) type OwnedBlock = (Vec<u8>, BlobIndex, Option<Vec<u8>>);
+/// Encoded block bytes plus the metadata needed to frame them into a blob.
+///
+/// The worker-to-consumer vehicle: rayon workers build these, the writer
+/// thread frames them. `way_members` carries the optional `BlobHeader`
+/// field-5 (`pbfhogg.WayMembers-v1`) payload; every current producer sets it
+/// to `None` (a later landing populates it for enriched output).
+pub(crate) struct OwnedBlock {
+    /// Serialized `PrimitiveBlock` bytes.
+    pub bytes: Vec<u8>,
+    /// Pre-computed blob index (element type, ID range, count).
+    pub index: BlobIndex,
+    /// Optional pre-serialized tagdata (`BlobHeader` field 4 tag key index).
+    pub tagdata: Option<Vec<u8>>,
+    /// Optional full field-5 way-member payload (preamble included).
+    pub way_members: Option<Vec<u8>>,
+}
 
 use protohoggr::{
     encode_bytes_field, encode_packed_bool, encode_packed_int32, encode_packed_sint32,
@@ -918,7 +932,12 @@ impl BlockBuilder {
     pub(crate) fn take_owned(&mut self) -> io::Result<Option<OwnedBlock>> {
         if let Some(index) = self.encode_block()? {
             let tagdata = self.last_tagdata.take();
-            Ok(Some((std::mem::take(&mut self.encode_buf), index, tagdata)))
+            Ok(Some(OwnedBlock {
+                bytes: std::mem::take(&mut self.encode_buf),
+                index,
+                tagdata,
+                way_members: None,
+            }))
         } else {
             Ok(None)
         }

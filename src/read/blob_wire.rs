@@ -20,7 +20,8 @@ pub(crate) enum BlobKind {
 
 /// Parsed BlobHeader from protobuf wire format.
 ///
-/// Fields: type (string, field 1), indexdata (bytes, field 2), datasize (int32, field 3).
+/// Fields: type (string, field 1), indexdata (bytes, field 2), datasize
+/// (int32, field 3), tagdata (bytes, field 4), and waymembers (bytes, field 5).
 #[derive(Clone, Debug)]
 pub(crate) struct WireBlobHeader {
     pub blob_type: BlobKind,
@@ -29,6 +30,8 @@ pub(crate) struct WireBlobHeader {
     pub indexdata: Option<[u8; crate::blob_meta::INDEX_SIZE]>,
     /// Per-blob tag key index (BlobHeader field 4). Variable-length.
     pub tagdata: Option<Box<[u8]>>,
+    /// Per-blob way-member bitmap (BlobHeader field 5). Variable-length.
+    pub waymembers: Option<Box<[u8]>>,
 }
 
 impl WireBlobHeader {
@@ -42,13 +45,19 @@ impl WireBlobHeader {
     /// of copied. Hot read paths that never call `Blob::index()` (e.g.
     /// `par_map_reduce`, unfiltered pipeline) can skip the 42-byte per-blob copy.
     #[hotpath::measure]
-    pub fn parse(data: &[u8], parse_tagdata: bool, parse_indexdata: bool) -> Result<Self> {
+    pub fn parse(
+        data: &[u8],
+        parse_tagdata: bool,
+        parse_indexdata: bool,
+        parse_waymembers: bool,
+    ) -> Result<Self> {
         use super::wire::Cursor;
         let mut cursor = Cursor::new(data);
         let mut blob_type = BlobKind::Unknown(String::new());
         let mut datasize: i32 = 0;
         let mut indexdata: Option<[u8; crate::blob_meta::INDEX_SIZE]> = None;
         let mut tagdata: Option<Box<[u8]>> = None;
+        let mut waymembers: Option<Box<[u8]>> = None;
 
         while let Some((field, wire_type)) = cursor.read_tag()? {
             match field {
@@ -88,6 +97,13 @@ impl WireBlobHeader {
                         tagdata = Some(bytes.into());
                     }
                 }
+                5 if parse_waymembers => {
+                    // waymembers: WayMembers-v1 bitmap incl. preamble (len-delimited)
+                    let bytes = cursor.read_len_delimited()?;
+                    if !bytes.is_empty() {
+                        waymembers = Some(bytes.into());
+                    }
+                }
                 _ => cursor.skip_field(wire_type)?,
             }
         }
@@ -97,6 +113,7 @@ impl WireBlobHeader {
             datasize,
             indexdata,
             tagdata,
+            waymembers,
         })
     }
 }
@@ -201,7 +218,7 @@ pub(crate) fn parse_blob_header_with_index(
     Option<[u8; crate::blob_meta::INDEX_SIZE]>,
     Option<Box<[u8]>>,
 )> {
-    let header = WireBlobHeader::parse(header_bytes, true, true)?;
+    let header = WireBlobHeader::parse(header_bytes, true, true, false)?;
     if header.datasize < 0 {
         return Err(new_blob_error(BlobError::InvalidDataSize {
             size: header.datasize,

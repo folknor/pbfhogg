@@ -37,7 +37,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::blob::decompress_blob_raw;
 use crate::blob_meta::ElemKind;
-use crate::block_builder::BlockBuilder;
+use crate::block_builder::{BlockBuilder, OwnedBlock};
 use crate::error::{Error, ErrorKind, Result, new_error};
 use crate::writer::{Compression, frame_blob_pipelined};
 
@@ -620,13 +620,20 @@ fn handle_candidate(
     // contributor to `writer_pipeline_send_wait_ns` at planet).
     let t_frame = std::time::Instant::now();
     let mut framed_chunks: Vec<Vec<u8>> = Vec::with_capacity(output.blocks.len());
-    for (block_bytes, index, tagdata) in output.blocks {
+    for OwnedBlock {
+        bytes: block_bytes,
+        index,
+        tagdata,
+        way_members,
+    } in output.blocks
+    {
         let indexdata = index.serialize();
         let parts = frame_blob_pipelined(
             &block_bytes,
             compression,
             Some(&indexdata),
             tagdata.as_deref(),
+            way_members.as_deref(),
         )
         .map_err(io_err)?;
         framed_chunks.push(parts.into_vec());

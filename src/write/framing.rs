@@ -16,6 +16,7 @@ use flate2::FlushCompress;
 use flate2::Status;
 use protohoggr::{encode_bytes_field, encode_int32_field};
 
+use crate::read::blob_wire::MAX_BLOB_HEADER_SIZE;
 use crate::write::metrics::WRITER_METRICS;
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -74,6 +75,7 @@ pub(crate) fn frame_blob(
         compression,
         indexdata,
         None,
+        None,
         &mut scratch,
     )?
     .into_vec())
@@ -89,6 +91,7 @@ pub(crate) fn frame_blob_pipelined(
     compression: &Compression,
     indexdata: Option<&[u8]>,
     tagdata: Option<&[u8]>,
+    way_members: Option<&[u8]>,
 ) -> io::Result<FramedBlobParts> {
     PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
         frame_blob_into(
@@ -97,6 +100,7 @@ pub(crate) fn frame_blob_pipelined(
             compression,
             indexdata,
             tagdata,
+            way_members,
             scratch,
         )
     })
@@ -121,6 +125,7 @@ pub(super) fn frame_blob_into(
     compression: &Compression,
     indexdata: Option<&[u8]>,
     tagdata: Option<&[u8]>,
+    way_members: Option<&[u8]>,
     scratch: &mut FrameScratch,
 ) -> io::Result<FramedBlobParts> {
     let t_compress = std::time::Instant::now();
@@ -141,8 +146,9 @@ pub(super) fn frame_blob_into(
         datasize,
         indexdata,
         tagdata,
+        way_members,
         &mut scratch.header_buf,
-    );
+    )?;
 
     let header_len = u32::try_from(scratch.header_buf.len()).map_err(|_| {
         io::Error::other(format!(
@@ -262,7 +268,7 @@ fn compress_zlib(uncompressed: &[u8], level: u32, scratch: &mut FrameScratch) ->
 /// Encode a BlobHeader into `buf` (cleared and reused).
 ///
 /// BlobHeader fields: type (string, field 1), indexdata (bytes, field 2),
-/// datasize (int32, field 3), tagdata (bytes, field 4).
+/// datasize (int32, field 3), tagdata (bytes, field 4), waymembers (bytes, field 5).
 ///
 /// **libosmium compat note:** libosmium 2.23.0 has a signed-char sign-extension
 /// bug in `get_size_in_network_byte_order` that rejects any BlobHeader > 127
@@ -275,8 +281,9 @@ pub(crate) fn encode_blob_header_into(
     datasize: i32,
     indexdata: Option<&[u8]>,
     tagdata: Option<&[u8]>,
+    way_members: Option<&[u8]>,
     buf: &mut Vec<u8>,
-) {
+) -> io::Result<()> {
     buf.clear();
     // Field 1: type (string = len-delimited bytes)
     encode_bytes_field(buf, 1, blob_type.as_bytes());
@@ -290,6 +297,17 @@ pub(crate) fn encode_blob_header_into(
     if let Some(data) = tagdata {
         encode_bytes_field(buf, 4, data);
     }
+    // Field 5: WayMembers-v1 payload (optional bytes).
+    if let Some(data) = way_members {
+        encode_bytes_field(buf, 5, data);
+    }
+    if buf.len() as u64 >= MAX_BLOB_HEADER_SIZE {
+        return Err(io::Error::other(format!(
+            "BlobHeader for {blob_type} is {} bytes, must be smaller than {MAX_BLOB_HEADER_SIZE}",
+            buf.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Re-frame an already-compressed Blob with a new BlobHeader that includes indexdata.
@@ -322,7 +340,14 @@ pub(crate) fn reframe_raw_with_index_scratch(
         ))
     })?;
     header_buf.clear();
-    encode_blob_header_into("OSMData", datasize, Some(indexdata), tagdata, header_buf);
+    encode_blob_header_into(
+        "OSMData",
+        datasize,
+        Some(indexdata),
+        tagdata,
+        None,
+        header_buf,
+    )?;
 
     let header_len = u32::try_from(header_buf.len())
         .map_err(|_| io::Error::other(format!("header too large: {} bytes", header_buf.len())))?;
@@ -333,4 +358,52 @@ pub(crate) fn reframe_raw_with_index_scratch(
     out.extend_from_slice(header_buf);
     out.extend_from_slice(blob_bytes);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::read::blob_wire::WireBlobHeader;
+
+    #[test]
+    fn way_members_header_roundtrip_respects_toggle() {
+        let mut bytes = Vec::new();
+        let payload = [1, 9, 0b1010_0101, 0b0000_0001];
+        encode_blob_header_into("OSMData", 12, None, None, Some(&payload), &mut bytes)
+            .expect("way-members header must encode");
+
+        match WireBlobHeader::parse(&bytes, false, false, true) {
+            Ok(parsed) => assert_eq!(parsed.waymembers.as_deref(), Some(payload.as_slice())),
+            Err(err) => panic!("failed to parse way-members header: {err}"),
+        }
+        match WireBlobHeader::parse(&bytes, false, false, false) {
+            Ok(skipped) => assert!(skipped.waymembers.is_none()),
+            Err(err) => panic!("failed to parse toggle-off header: {err}"),
+        }
+    }
+
+    #[test]
+    fn blob_header_cap_rejects_at_strict_boundary() {
+        // The cap is strict (`>= MAX_BLOB_HEADER_SIZE` errors), mirroring the
+        // reader reject in blob.rs, so a 65,535-byte header must encode and a
+        // 65,536-byte header must fail. Measure the fixed field-5 encoder
+        // overhead once (length varint stays 3 bytes across this size range),
+        // then size the payloads to land exactly on either side of the bound.
+        let mut buf = Vec::new();
+        let probe = vec![0u8; 60_000];
+        encode_blob_header_into("OSMData", 1, None, None, Some(&probe), &mut buf)
+            .expect("probe header must encode");
+        let overhead = buf.len() - probe.len();
+
+        let cap = usize::try_from(MAX_BLOB_HEADER_SIZE).unwrap_or(usize::MAX);
+        let pass_payload = vec![0u8; cap - 1 - overhead];
+        encode_blob_header_into("OSMData", 1, None, None, Some(&pass_payload), &mut buf)
+            .expect("65,535-byte header must encode");
+        assert_eq!(buf.len() as u64, MAX_BLOB_HEADER_SIZE - 1);
+
+        let fail_payload = vec![0u8; cap - overhead];
+        let err = encode_blob_header_into("OSMData", 1, None, None, Some(&fail_payload), &mut buf)
+            .expect_err("65,536-byte header must error");
+        assert!(err.to_string().contains("BlobHeader"));
+    }
 }

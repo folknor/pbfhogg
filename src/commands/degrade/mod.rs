@@ -334,7 +334,7 @@ fn reframe_raw_without_index(
         ))
     })?;
     let mut header_buf = Vec::new();
-    encode_blob_header_into("OSMData", datasize, None, tagdata, &mut header_buf);
+    encode_blob_header_into("OSMData", datasize, None, tagdata, None, &mut header_buf)?;
     let header_len = u32::try_from(header_buf.len()).map_err(|_| {
         std::io::Error::other(format!("header too large: {} bytes", header_buf.len()))
     })?;
@@ -982,15 +982,26 @@ fn frame_owned(
     compression: &Compression,
     strip_indexdata: bool,
 ) -> std::result::Result<Vec<u8>, String> {
-    let (block_bytes, index, tagdata) = owned;
+    let OwnedBlock {
+        bytes: block_bytes,
+        index,
+        tagdata,
+        way_members,
+    } = owned;
     let indexdata_buf = index.serialize();
     let indexdata = if strip_indexdata {
         None
     } else {
         Some(indexdata_buf.as_slice())
     };
-    let blob = frame_blob_pipelined(&block_bytes, compression, indexdata, tagdata.as_deref())
-        .map_err(|e| e.to_string())?;
+    let blob = frame_blob_pipelined(
+        &block_bytes,
+        compression,
+        indexdata,
+        tagdata.as_deref(),
+        way_members.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
     Ok(blob.into_vec())
 }
 
@@ -1006,7 +1017,13 @@ fn frame_and_write_batch(
     let framed: Vec<std::io::Result<Vec<u8>>> = batch
         .into_par_iter()
         .map(
-            |(block_bytes, index, tagdata)| -> std::io::Result<Vec<u8>> {
+            |OwnedBlock {
+                 bytes: block_bytes,
+                 index,
+                 tagdata,
+                 way_members,
+             }|
+             -> std::io::Result<Vec<u8>> {
                 let indexdata_buf = index.serialize();
                 let indexdata = if strip_indexdata {
                     None
@@ -1018,6 +1035,7 @@ fn frame_and_write_batch(
                     &compression,
                     indexdata,
                     tagdata.as_deref(),
+                    way_members.as_deref(),
                 )?;
                 Ok(blob.into_vec())
             },

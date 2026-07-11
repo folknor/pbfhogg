@@ -473,6 +473,7 @@ pub(crate) struct WireWay<'a> {
     pub lat_data: &'a [u8],
     pub lon_data: &'a [u8],
     pub info_data: Option<&'a [u8]>,
+    pub pins_data: Option<&'a [u8]>,
 }
 
 impl<'a> WireWay<'a> {
@@ -485,6 +486,7 @@ impl<'a> WireWay<'a> {
         let mut lat_data: &[u8] = &[];
         let mut lon_data: &[u8] = &[];
         let mut info_data: Option<&[u8]> = None;
+        let mut pins_data: Option<&[u8]> = None;
 
         while let Some((field, wire_type)) = cursor.read_tag()? {
             match (field, wire_type) {
@@ -495,6 +497,7 @@ impl<'a> WireWay<'a> {
                 (8, WIRE_LEN) => refs_data = cursor.read_len_delimited()?,
                 (9, WIRE_LEN) => lat_data = cursor.read_len_delimited()?,
                 (10, WIRE_LEN) => lon_data = cursor.read_len_delimited()?,
+                (20, WIRE_LEN) => pins_data = Some(cursor.read_len_delimited()?),
                 _ => cursor.skip_field(wire_type)?,
             }
         }
@@ -507,6 +510,7 @@ impl<'a> WireWay<'a> {
             lat_data,
             lon_data,
             info_data,
+            pins_data,
         })
     }
 }
@@ -708,5 +712,22 @@ mod tests {
         assert_eq!(info.timestamp, None);
         assert_eq!(info.changeset, None);
         assert_eq!(info.user_sid, None);
+    }
+
+    #[test]
+    fn wire_way_parses_field_20_pins() {
+        // field 1 (id) varint = 1; field 8 (refs) len=1 [0x00];
+        // field 20 (pins) tag = (20<<3)|2 = 162 -> varint [0xA2, 0x01], len=1 [0xFF]
+        let with_pins = [
+            0x08, 0x01, // field 1: id = 1
+            0x42, 0x01, 0x00, // field 8: refs = [0x00]
+            0xA2, 0x01, 0x01, 0xFF, // field 20: pins = [0xFF]
+        ];
+        let way = WireWay::parse(&with_pins).unwrap();
+        assert_eq!(way.pins_data, Some([0xFFu8].as_slice()));
+
+        let without_pins = [0x08, 0x01, 0x42, 0x01, 0x00];
+        let way = WireWay::parse(&without_pins).unwrap();
+        assert_eq!(way.pins_data, None);
     }
 }

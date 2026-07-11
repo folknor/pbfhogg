@@ -99,9 +99,20 @@ pub(super) fn pass1_parallel_scan(
             reorder.push(seq_num, item);
             while let Some(result) = reorder.pop_ready() {
                 let blocks = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                for (block_bytes, index, tagdata) in blocks {
+                for OwnedBlock {
+                    bytes: block_bytes,
+                    index,
+                    tagdata,
+                    way_members,
+                } in blocks
+                {
                     let t0 = std::time::Instant::now();
-                    writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+                    writer.write_primitive_block_owned(
+                        block_bytes,
+                        index,
+                        tagdata.as_deref(),
+                        way_members.as_deref(),
+                    )?;
                     #[allow(clippy::cast_possible_truncation)]
                     pass1_cref.consumer_write_ms.fetch_add(
                         t0.elapsed().as_millis() as u64,
@@ -200,7 +211,12 @@ fn pass1_worker(
             output_blocks.clear();
             let taken = std::mem::take(&mut reframe_buf);
             reframe_buf.reserve(taken.len());
-            output_blocks.push((taken, index, None));
+            output_blocks.push(OwnedBlock {
+                bytes: taken,
+                index,
+                tagdata: None,
+                way_members: None,
+            });
 
             if blob_node_count != task.element_count {
                 return Err(format!(

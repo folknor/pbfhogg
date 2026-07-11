@@ -208,8 +208,19 @@ fn time_filter_history(
     if let Some(group) = pending.take() {
         flush_group(group, &mut bb, writer, &mut stats)?;
     }
-    if let Some((bytes, index, tagdata)) = bb.take_owned()? {
-        writer.write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
+    if let Some(OwnedBlock {
+        bytes,
+        index,
+        tagdata,
+        way_members,
+    }) = bb.take_owned()?
+    {
+        writer.write_primitive_block_owned(
+            bytes,
+            index,
+            tagdata.as_deref(),
+            way_members.as_deref(),
+        )?;
     }
     crate::debug::emit_marker("TIMEFILTER_HISTORY_END");
     Ok(stats)
@@ -303,13 +314,20 @@ fn time_filter_snapshot(
             flush_local(&mut bb, &mut output)?;
 
             let mut framed: Vec<Vec<u8>> = Vec::with_capacity(output.len());
-            for (block_bytes, index, tagdata) in output {
+            for OwnedBlock {
+                bytes: block_bytes,
+                index,
+                tagdata,
+                way_members,
+            } in output
+            {
                 let indexdata = index.serialize();
                 let blob = crate::writer::frame_blob_pipelined(
                     &block_bytes,
                     &compression,
                     Some(indexdata.as_slice()),
                     tagdata.as_deref(),
+                    way_members.as_deref(),
                 )
                 .map_err(|e| e.to_string())?;
                 framed.push(blob.into_vec());
@@ -552,9 +570,19 @@ fn write_owned_element(
     match elem {
         OwnedElement::Node(n) => {
             if !bb.can_add_node()
-                && let Some((bytes, index, tagdata)) = bb.take_owned()?
+                && let Some(OwnedBlock {
+                    bytes,
+                    index,
+                    tagdata,
+                    way_members,
+                }) = bb.take_owned()?
             {
-                writer.write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
+                writer.write_primitive_block_owned(
+                    bytes,
+                    index,
+                    tagdata.as_deref(),
+                    way_members.as_deref(),
+                )?;
             }
             let meta = owned_to_metadata(n.metadata.as_ref());
             bb.add_node(
@@ -567,9 +595,19 @@ fn write_owned_element(
         }
         OwnedElement::Way(w) => {
             if !bb.can_add_way()
-                && let Some((bytes, index, tagdata)) = bb.take_owned()?
+                && let Some(OwnedBlock {
+                    bytes,
+                    index,
+                    tagdata,
+                    way_members,
+                }) = bb.take_owned()?
             {
-                writer.write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
+                writer.write_primitive_block_owned(
+                    bytes,
+                    index,
+                    tagdata.as_deref(),
+                    way_members.as_deref(),
+                )?;
             }
             let meta = owned_to_metadata(w.metadata.as_ref());
             bb.add_way(
@@ -581,9 +619,19 @@ fn write_owned_element(
         }
         OwnedElement::Relation(r) => {
             if !bb.can_add_relation()
-                && let Some((bytes, index, tagdata)) = bb.take_owned()?
+                && let Some(OwnedBlock {
+                    bytes,
+                    index,
+                    tagdata,
+                    way_members,
+                }) = bb.take_owned()?
             {
-                writer.write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
+                writer.write_primitive_block_owned(
+                    bytes,
+                    index,
+                    tagdata.as_deref(),
+                    way_members.as_deref(),
+                )?;
             }
             let meta = owned_to_metadata(r.metadata.as_ref());
             let members: Vec<MemberData<'_>> = r

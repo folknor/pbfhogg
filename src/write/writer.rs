@@ -330,6 +330,7 @@ impl<W: Write> PbfWriter<W> {
                         &compression,
                         indexdata.as_ref().map(<[u8; 42]>::as_slice),
                         tagdata.as_deref(),
+                        None,
                         scratch,
                     )
                 });
@@ -362,6 +363,7 @@ impl<W: Write> PbfWriter<W> {
                 block_bytes,
                 indexdata.as_ref().map(<[u8; 42]>::as_slice),
                 tagdata.as_deref(),
+                None,
             )
         }
     }
@@ -399,7 +401,15 @@ impl<W: Write> PbfWriter<W> {
             let permit_tx = pipeline.permit_tx.clone();
             rayon::spawn(move || {
                 let result = PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
-                    frame_blob_into("OSMData", &uncompressed, &compression, None, None, scratch)
+                    frame_blob_into(
+                        "OSMData",
+                        &uncompressed,
+                        &compression,
+                        None,
+                        None,
+                        None,
+                        scratch,
+                    )
                 });
                 if let Ok(ref parts) = result {
                     WRITER_METRICS.payload_framed_items.fetch_add(1, Relaxed);
@@ -417,7 +427,7 @@ impl<W: Write> PbfWriter<W> {
             });
             Ok(())
         } else {
-            self.write_framed_blob("OSMData", block_bytes, None, None)
+            self.write_framed_blob("OSMData", block_bytes, None, None, None)
         }
     }
 
@@ -429,12 +439,16 @@ impl<W: Write> PbfWriter<W> {
     /// pre-serialized tagdata from
     /// [`BlockBuilder::take_owned`](crate::block_builder::BlockBuilder::take_owned)
     /// instead of rescanning the serialized bytes.
+    ///
+    /// The optional `way_members` payload is emitted as `BlobHeader` field 5
+    /// (`pbfhogg.WayMembers-v1`); all non-enrichment callers pass `None`.
     #[hotpath::measure]
     pub(crate) fn write_primitive_block_owned(
         &mut self,
         block_bytes: Vec<u8>,
         index: blob_meta::BlobIndex,
         tagdata: Option<&[u8]>,
+        way_members: Option<&[u8]>,
     ) -> io::Result<()> {
         let indexdata = index.serialize();
         if let Some(ref mut pipeline) = self.pipeline {
@@ -454,6 +468,7 @@ impl<W: Write> PbfWriter<W> {
             let compression = self.compression;
             let tx = pipeline.tx.clone();
             let tagdata_owned = tagdata.map(<[u8]>::to_vec);
+            let way_members_owned = way_members.map(<[u8]>::to_vec);
             let permit_tx = pipeline.permit_tx.clone();
             rayon::spawn(move || {
                 let result = PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
@@ -463,6 +478,7 @@ impl<W: Write> PbfWriter<W> {
                         &compression,
                         Some(indexdata.as_slice()),
                         tagdata_owned.as_deref(),
+                        way_members_owned.as_deref(),
                         scratch,
                     )
                 });
@@ -484,7 +500,13 @@ impl<W: Write> PbfWriter<W> {
             });
             Ok(())
         } else {
-            self.write_framed_blob("OSMData", &block_bytes, Some(indexdata.as_slice()), tagdata)
+            self.write_framed_blob(
+                "OSMData",
+                &block_bytes,
+                Some(indexdata.as_slice()),
+                tagdata,
+                way_members,
+            )
         }
     }
 
@@ -634,7 +656,7 @@ impl<W: Write> PbfWriter<W> {
     // only 2 constants ("OSMHeader"/"OSMData"), no real typo risk.
     #[hotpath::measure]
     fn write_blob(&mut self, blob_type: &str, uncompressed: &[u8]) -> io::Result<()> {
-        self.write_framed_blob(blob_type, uncompressed, None, None)
+        self.write_framed_blob(blob_type, uncompressed, None, None, None)
     }
 
     /// Encode, compress, and write a blob directly to the writer using reusable
@@ -645,6 +667,7 @@ impl<W: Write> PbfWriter<W> {
         uncompressed: &[u8],
         indexdata: Option<&[u8]>,
         tagdata: Option<&[u8]>,
+        way_members: Option<&[u8]>,
     ) -> io::Result<()> {
         let t_compress = std::time::Instant::now();
         encode_blob_body(uncompressed, &self.compression, &mut self.scratch)?;
@@ -663,8 +686,9 @@ impl<W: Write> PbfWriter<W> {
             datasize,
             indexdata,
             tagdata,
+            way_members,
             &mut self.scratch.header_buf,
-        );
+        )?;
         let header_len = u32::try_from(self.scratch.header_buf.len()).map_err(|_| {
             io::Error::other(format!(
                 "header too large: {} bytes",

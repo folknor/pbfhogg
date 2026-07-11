@@ -460,7 +460,12 @@ pub(super) fn stage4_assembly(
                             };
                             let taken = std::mem::take(&mut reframe_output);
                             reframe_output.reserve(taken.len());
-                            output_blocks.push((taken, index, None));
+                            output_blocks.push(OwnedBlock {
+                                bytes: taken,
+                                index,
+                                tagdata: None,
+                                way_members: None,
+                            });
 
                             let block_stats = Stats {
                                 ways_written: way_count,
@@ -646,7 +651,13 @@ pub(super) fn stage4_assembly(
                     ConsumerItem::Decoded(result) => {
                         let (blocks, block_stats) = result?;
                         total_stats.merge(&block_stats);
-                        for (block_bytes, index, tagdata) in blocks {
+                        for OwnedBlock {
+                            bytes: block_bytes,
+                            index,
+                            tagdata,
+                            way_members,
+                        } in blocks
+                        {
                             *s4_bytes_written += block_bytes.len() as u64;
                             *s4_write_calls += 1;
                             let t_w = std::time::Instant::now();
@@ -654,6 +665,7 @@ pub(super) fn stage4_assembly(
                                 block_bytes,
                                 index,
                                 tagdata.as_deref(),
+                                way_members.as_deref(),
                             )?;
                             #[allow(clippy::cast_possible_truncation)]
                             {

@@ -1083,11 +1083,18 @@ fn tags_filter_two_pass(
                         stats.ways_from_relations += block_stats.ways_from_relations;
                         stats.relations_matched += block_stats.relations_matched;
                         stats.relations_from_relations += block_stats.relations_from_relations;
-                        for (block_bytes, index, tagdata) in blocks {
+                        for OwnedBlock {
+                            bytes: block_bytes,
+                            index,
+                            tagdata,
+                            way_members,
+                        } in blocks
+                        {
                             writer.write_primitive_block_owned(
                                 block_bytes,
                                 index,
                                 tagdata.as_deref(),
+                                way_members.as_deref(),
                             )?;
                         }
                     }

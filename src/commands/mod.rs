@@ -108,8 +108,19 @@ pub(crate) fn flush_passthrough_buf(
 /// writer (no `to_vec()` copy in pipelined mode). If the builder is empty,
 /// this is a no-op.
 pub(crate) fn flush_block(bb: &mut BlockBuilder, writer: &mut PbfWriter<FileWriter>) -> Result<()> {
-    if let Some((bytes, index, tagdata)) = bb.take_owned()? {
-        writer.write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
+    if let Some(OwnedBlock {
+        bytes,
+        index,
+        tagdata,
+        way_members,
+    }) = bb.take_owned()?
+    {
+        writer.write_primitive_block_owned(
+            bytes,
+            index,
+            tagdata.as_deref(),
+            way_members.as_deref(),
+        )?;
     }
     Ok(())
 }
@@ -163,8 +174,19 @@ pub(crate) fn drain_batch_results<S>(
     for result in results {
         let (blocks, stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         merge(stats);
-        for (block_bytes, index, tagdata) in blocks {
-            writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+        for OwnedBlock {
+            bytes: block_bytes,
+            index,
+            tagdata,
+            way_members,
+        } in blocks
+        {
+            writer.write_primitive_block_owned(
+                block_bytes,
+                index,
+                tagdata.as_deref(),
+                way_members.as_deref(),
+            )?;
         }
     }
     Ok(())
@@ -178,8 +200,8 @@ pub(crate) fn flush_local(
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
 ) -> std::result::Result<(), String> {
-    if let Some(triple) = bb.take_owned().map_err(|e| e.to_string())? {
-        output.push(triple);
+    if let Some(owned) = bb.take_owned().map_err(|e| e.to_string())? {
+        output.push(owned);
     }
     Ok(())
 }

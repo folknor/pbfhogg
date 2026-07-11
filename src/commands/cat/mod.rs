@@ -302,11 +302,18 @@ fn cat_type_passthrough(
                         )?;
                         flush_local(&mut bb, &mut output_blocks)
                             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                        for (block_bytes, index, tagdata) in output_blocks.drain(..) {
+                        for OwnedBlock {
+                            bytes: block_bytes,
+                            index,
+                            tagdata,
+                            way_members,
+                        } in output_blocks.drain(..)
+                        {
                             writer.write_primitive_block_owned(
                                 block_bytes,
                                 index,
                                 tagdata.as_deref(),
+                                way_members.as_deref(),
                             )?;
                         }
                         blobs_decoded += 1;
@@ -593,13 +600,20 @@ fn run_kind_phase(
             flush_local(&mut bb, &mut output)?;
 
             let mut framed: Vec<Vec<u8>> = Vec::with_capacity(output.len());
-            for (block_bytes, index, tagdata) in output {
+            for OwnedBlock {
+                bytes: block_bytes,
+                index,
+                tagdata,
+                way_members,
+            } in output
+            {
                 let indexdata = index.serialize();
                 let blob = frame_blob_pipelined(
                     &block_bytes,
                     &compression,
                     Some(indexdata.as_slice()),
                     tagdata.as_deref(),
+                    way_members.as_deref(),
                 )
                 .map_err(|e| e.to_string())?;
                 framed.push(blob.into_vec());

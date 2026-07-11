@@ -195,9 +195,12 @@ fn decode_one(
             count: stats.way_count,
             bbox: None,
         };
-        scratch
-            .output
-            .push((std::mem::take(&mut scratch.reframe_output), index, None));
+        scratch.output.push(OwnedBlock {
+            bytes: std::mem::take(&mut scratch.reframe_output),
+            index,
+            tagdata: None,
+            way_members: None,
+        });
         let block_stats = Stats {
             ways_written: stats.way_count,
             missing_locations: stats.missing_locations,
@@ -354,11 +357,18 @@ pub(super) fn write_output_passthrough(
                         let (blocks, block_stats) =
                             result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                         total_stats.merge(&block_stats);
-                        for (block_bytes, index, tagdata) in blocks {
+                        for OwnedBlock {
+                            bytes: block_bytes,
+                            index,
+                            tagdata,
+                            way_members,
+                        } in blocks
+                        {
                             writer.write_primitive_block_owned(
                                 block_bytes,
                                 index,
                                 tagdata.as_deref(),
+                                way_members.as_deref(),
                             )?;
                         }
                         let n = batches_dispatched

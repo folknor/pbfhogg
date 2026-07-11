@@ -775,11 +775,18 @@ fn write_consumer_item(
             let (region_blocks, counts) = r?;
             for (i, blocks) in region_blocks.into_iter().enumerate() {
                 stats[i].nodes_in_bbox += counts[i];
-                for (block_bytes, index, tagdata) in blocks {
+                for OwnedBlock {
+                    bytes: block_bytes,
+                    index,
+                    tagdata,
+                    way_members,
+                } in blocks
+                {
                     writers[i].write_primitive_block_owned(
                         block_bytes,
                         index,
                         tagdata.as_deref(),
+                        way_members.as_deref(),
                     )?;
                 }
             }
@@ -934,11 +941,18 @@ where
                 let (region_blocks, counts) = result?;
                 for (i, blocks) in region_blocks.into_iter().enumerate() {
                     *stat_field(&mut stats[i]) += counts[i];
-                    for (block_bytes, index, tagdata) in blocks {
+                    for OwnedBlock {
+                        bytes: block_bytes,
+                        index,
+                        tagdata,
+                        way_members,
+                    } in blocks
+                    {
                         writers[i].write_primitive_block_owned(
                             block_bytes,
                             index,
                             tagdata.as_deref(),
+                            way_members.as_deref(),
                         )?;
                     }
                 }
@@ -949,11 +963,18 @@ where
             let (region_blocks, counts) = result?;
             for (i, blocks) in region_blocks.into_iter().enumerate() {
                 *stat_field(&mut stats[i]) += counts[i];
-                for (block_bytes, index, tagdata) in blocks {
+                for OwnedBlock {
+                    bytes: block_bytes,
+                    index,
+                    tagdata,
+                    way_members,
+                } in blocks
+                {
                     writers[i].write_primitive_block_owned(
                         block_bytes,
                         index,
                         tagdata.as_deref(),
+                        way_members.as_deref(),
                     )?;
                 }
             }

@@ -316,7 +316,7 @@ pub(super) fn relation_r2d_assembly(
                     result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                 if index.count > 0 {
                     let t0 = std::time::Instant::now();
-                    writer.write_primitive_block_owned(block_bytes, index, None)?;
+                    writer.write_primitive_block_owned(block_bytes, index, None, None)?;
                     #[allow(clippy::cast_possible_truncation)]
                     r2d_cref.consumer_write_ms.fetch_add(
                         t0.elapsed().as_millis() as u64,

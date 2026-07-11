@@ -226,6 +226,12 @@ impl HeaderBlock {
     /// PBF optional feature string indicating ways contain inline node coordinates.
     pub const LOCATIONS_ON_WAYS: &str = "LocationsOnWays";
 
+    /// Optional feature declaring BlobHeader field-5 way-member bitmaps.
+    pub const WAY_MEMBERS_V1: &str = "pbfhogg.WayMembers-v1";
+
+    /// Optional feature declaring Way field-20 shared-node pin bitmaps.
+    pub const SHARED_NODE_PINS_V1: &str = "pbfhogg.SharedNodePins-v1";
+
     /// PBF required feature string indicating history metadata (`visible`) may
     /// be present on elements.
     pub const HISTORICAL_INFORMATION: &str = "HistoricalInformation";
@@ -236,6 +242,22 @@ impl HeaderBlock {
             .optional_features
             .iter()
             .any(|f| f == Self::LOCATIONS_ON_WAYS)
+    }
+
+    /// Returns `true` if the header declares `pbfhogg.WayMembers-v1`.
+    pub fn has_way_members_v1(&self) -> bool {
+        self.header
+            .optional_features
+            .iter()
+            .any(|f| f == Self::WAY_MEMBERS_V1)
+    }
+
+    /// Returns `true` if the header declares `pbfhogg.SharedNodePins-v1`.
+    pub fn has_shared_node_pins_v1(&self) -> bool {
+        self.header
+            .optional_features
+            .iter()
+            .any(|f| f == Self::SHARED_NODE_PINS_V1)
     }
 
     /// Returns `true` if the header declares `HistoricalInformation` as a

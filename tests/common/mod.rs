@@ -268,6 +268,84 @@ pub fn write_multi_block_test_pbf(
     write_test_pbf_impl(path, nodes, ways, relations, true, Some(block_size));
 }
 
+/// Write a sorted PBF whose OsmData blobs carry `indexdata` in their
+/// `BlobHeader`s. [`PbfWriter::to_path`] is the pipelined writer that embeds
+/// indexdata via `scan_block_ids`; commands that require blob-level indexdata
+/// (`add-locations-to-ways --index-type external`, `--inject-prepass`) need
+/// this rather than [`write_test_pbf`], which uses the sync writer and emits
+/// no indexdata. Each element type is flushed into its own block so way blobs
+/// are well-formed. Allowlist-only.
+pub fn write_indexed_pbf(
+    path: &Path,
+    nodes: &[TestNode],
+    ways: &[TestWay],
+    relations: &[TestRelation],
+) {
+    let header = block_builder::HeaderBuilder::new()
+        .sorted()
+        .build()
+        .expect("build header");
+    let mut writer =
+        PbfWriter::to_path(path, Compression::default(), &header).expect("create writer");
+
+    let mut bb = BlockBuilder::new();
+
+    for n in nodes {
+        if !bb.can_add_node()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+        let meta = n.meta.as_ref().map(to_block_meta);
+        bb.add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), meta.as_ref());
+    }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    for w in ways {
+        if !bb.can_add_way()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+        let meta = w.meta.as_ref().map(to_block_meta);
+        bb.add_way(w.id, w.tags.iter().copied(), &w.refs, meta.as_ref());
+    }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    for r in relations {
+        if !bb.can_add_relation()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+        let members: Vec<MemberData<'_>> = r
+            .members
+            .iter()
+            .map(|m| MemberData {
+                id: m.id,
+                role: m.role,
+            })
+            .collect();
+        let meta = r.meta.as_ref().map(to_block_meta);
+        bb.add_relation(r.id, r.tags.iter().copied(), &members, meta.as_ref());
+    }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    writer.flush().expect("flush");
+}
+
 /// Write a sorted test PBF whose OsmData blobs lack the `indexdata`
 /// `BlobHeader` field. Use this to exercise read paths (most visibly
 /// `diff_element_stream` in `commands::diff`) that only fire when one

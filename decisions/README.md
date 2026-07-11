@@ -124,3 +124,9 @@ The skeleton has exactly two sections. `Context`, `Consequences`, and
   insurance for latent-only invariants: triage rule of
   `debug_assert` + comment / doc-only / drop-from-triage, no
   blanket sweep.
+- [ADR-0007](0007-injected-prepass-wire-extensions.md) - Private,
+  opt-in PBF wire extensions (`pbfhogg.WayMembers-v1` BlobHeader
+  field 5, `pbfhogg.SharedNodePins-v1` Way field 20) for
+  `add-locations-to-ways --inject-prepass`; presence-is-validity
+  superset semantics, rewriting commands must not carry the flags
+  forward.

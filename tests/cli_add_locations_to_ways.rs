@@ -1,9 +1,10 @@
 //! CLI-driven integration tests for `pbfhogg add-locations-to-ways`.
 //!
 //! Replaces the library-API `tests/add_locations_to_ways.rs`. Fixture
-//! PBFs are built with the stable-allowlist writers (plus a small
-//! local helper that wraps `PbfWriter::to_path` for indexdata-bearing
-//! inputs); `add-locations-to-ways` runs through `CliInvoker`; output
+//! PBFs are built with the stable-allowlist writers (including
+//! `common::write_indexed_pbf`, which wraps `PbfWriter::to_path` for
+//! indexdata-bearing inputs); `add-locations-to-ways` runs through
+//! `CliInvoker`; output
 //! is verified by reading the resulting PBF with `BlobReader` +
 //! `Element` (allowlist). No imports from `pbfhogg::altw::*` - a
 //! rewrite of `src/commands/altw/` cannot break these tests by type
@@ -26,10 +27,9 @@ use std::path::Path;
 use common::cli::{CliInvoker, CliOutput};
 use common::{
     TestMember, TestNode, TestRelation, TestWay, assert_elements_equivalent, generate_nodes,
-    generate_ways, write_multi_block_test_pbf, write_test_pbf, write_test_pbf_non_indexed,
+    generate_ways, write_indexed_pbf, write_multi_block_test_pbf, write_test_pbf,
+    write_test_pbf_non_indexed,
 };
-use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
-use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element, MemberId};
 use tempfile::TempDir;
 
@@ -70,77 +70,6 @@ fn test_ways() -> Vec<TestWay> {
         tags: vec![("highway", "primary")],
         meta: None,
     }]
-}
-
-/// Write a sorted PBF whose blobs carry indexdata in their
-/// BlobHeaders. `PbfWriter::to_path` is the pipelined writer that
-/// embeds indexdata via `scan_block_ids`. Allowlist-only.
-fn write_indexed_pbf(
-    path: &Path,
-    nodes: &[TestNode],
-    ways: &[TestWay],
-    relations: &[TestRelation],
-) {
-    let header = block_builder::HeaderBuilder::new()
-        .sorted()
-        .build()
-        .expect("build header");
-    let mut writer =
-        PbfWriter::to_path(path, Compression::default(), &header).expect("create writer");
-
-    let mut bb = BlockBuilder::new();
-
-    for n in nodes {
-        if !bb.can_add_node()
-            && let Some(bytes) = bb.take().expect("take")
-        {
-            writer.write_primitive_block(bytes).expect("write block");
-        }
-        bb.add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), None);
-    }
-    if !bb.is_empty()
-        && let Some(bytes) = bb.take().expect("take")
-    {
-        writer.write_primitive_block(bytes).expect("write block");
-    }
-
-    for w in ways {
-        if !bb.can_add_way()
-            && let Some(bytes) = bb.take().expect("take")
-        {
-            writer.write_primitive_block(bytes).expect("write block");
-        }
-        bb.add_way(w.id, w.tags.iter().copied(), &w.refs, None);
-    }
-    if !bb.is_empty()
-        && let Some(bytes) = bb.take().expect("take")
-    {
-        writer.write_primitive_block(bytes).expect("write block");
-    }
-
-    for r in relations {
-        if !bb.can_add_relation()
-            && let Some(bytes) = bb.take().expect("take")
-        {
-            writer.write_primitive_block(bytes).expect("write block");
-        }
-        let members: Vec<MemberData<'_>> = r
-            .members
-            .iter()
-            .map(|m| MemberData {
-                id: m.id,
-                role: m.role,
-            })
-            .collect();
-        bb.add_relation(r.id, r.tags.iter().copied(), &members, None);
-    }
-    if !bb.is_empty()
-        && let Some(bytes) = bb.take().expect("take")
-    {
-        writer.write_primitive_block(bytes).expect("write block");
-    }
-
-    writer.flush().expect("flush");
 }
 
 #[derive(Clone, Copy)]

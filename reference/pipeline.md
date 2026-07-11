@@ -253,8 +253,8 @@ every enrichment fresh each cycle:
 
 - `LocationsOnWays` inline coordinates, and
 - the injected-prepass fields (`pbfhogg.WayMembers-v1` BlobHeader field 5,
-  `pbfhogg.SharedNodePins-v1` Way field 20 - implementation pending, Brick
-  2 of `notes/injected-prepass.md`), which cannot be maintained
+  `pbfhogg.SharedNodePins-v1` Way field 20 - landed 2026-07-11, see
+  `decisions/0007-injected-prepass-wire-extensions.md`), which cannot be maintained
   incrementally through `apply-changes`: stale field 5 is a
   false-negative membership risk (wrong tiles downstream), and field 20
   needs exact global ref counts with decrement.
@@ -290,7 +290,7 @@ The two downstream consumers are:
   decode-backpressure decision (`reference/performance-history.md`
   "Pipelined-reader decode-admission bound"). The raw-Geofabrik path stays
   on the legacy pipelined reader.
-- Once injected-prepass Brick 2 lands, that loop sets `parse_waymembers`
+- With injected-prepass landed 2026-07-11, that loop sets `parse_waymembers`
   on `BlobReader` when the header declares `pbfhogg.WayMembers-v1` and
   consumes `Blob::way_members()` / `Way::shared_node_pins()` (their
   Bricks 4/5).
@@ -404,7 +404,9 @@ for the ratified daily loop:
 | `build-geocode-index` | 432.9 s | 2026-04-18 arc, performance.md |
 
 Total ~17-18 min per daily refresh on a 30 GB-class host. The
-injected-prepass flag (Brick 2, pending) must stay inside the standing
+injected-prepass flag (landed 2026-07-11) must stay inside the standing
 **external <= 3% regression bound** (~16 s against the 546.0 s
-baseline); the enriched run becomes its own brokkr variant with its own
-recorded price.
+baseline); the flag-on planet verdict awaits the brokkr
+`--inject-prepass` passthrough and an explicit green-light, and the
+enriched run becomes its own brokkr variant with its own recorded
+price.

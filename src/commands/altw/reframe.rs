@@ -31,6 +31,8 @@ pub(super) struct WayReframeScratch {
     pub packed_lats: Vec<u8>,
     pub packed_lons: Vec<u8>,
     pub refs: Vec<i64>,
+    pub member_ways: Vec<bool>,
+    pub pins: Vec<u8>,
 }
 
 /// Per-blob counters that the caller folds into `Stats` after the reframe.
@@ -49,12 +51,15 @@ pub(super) struct WayReframeStats {
 ///
 /// Errors are returned as `String` to match the existing par_iter result
 /// channel in `process_slot_batch`.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(super) fn reframe_way_blob_with_locations(
     decompressed: &[u8],
     node_index: &NodeIndex,
     output: &mut Vec<u8>,
     scratch: &mut WayReframeScratch,
+    shared_node_ids: Option<&crate::idset::IdSet>,
+    member_way_ids: Option<&crate::idset::IdSet>,
+    inject_prepass: bool,
 ) -> std::result::Result<WayReframeStats, String> {
     let (st_offset, st_len) = parse_block_top(decompressed, scratch)?;
     let stringtable_bytes = &decompressed[st_offset..st_offset + st_len];
@@ -67,11 +72,21 @@ pub(super) fn reframe_way_blob_with_locations(
         max_way_id: i64::MIN,
         ..WayReframeStats::default()
     };
+    scratch.member_ways.clear();
 
     for i in 0..scratch.group_ranges.len() {
         let (gr_offset, gr_len) = scratch.group_ranges[i];
         let group_bytes = &decompressed[gr_offset..gr_offset + gr_len];
-        process_group(group_bytes, node_index, output, scratch, &mut stats)?;
+        process_group(
+            group_bytes,
+            node_index,
+            output,
+            scratch,
+            &mut stats,
+            shared_node_ids,
+            member_way_ids,
+            inject_prepass,
+        )?;
     }
 
     output.extend_from_slice(&scratch.scalar_fields);
@@ -136,12 +151,16 @@ fn parse_block_top(
 /// appended); non-way fields are copied verbatim. Builds the
 /// `PrimitiveGroup` bytes in `scratch.group_out`, then emits as field 2
 /// of the `PrimitiveBlock` in `output`.
+#[allow(clippy::too_many_arguments)]
 fn process_group(
     group_bytes: &[u8],
     node_index: &NodeIndex,
     output: &mut Vec<u8>,
     scratch: &mut WayReframeScratch,
     stats: &mut WayReframeStats,
+    shared_node_ids: Option<&crate::idset::IdSet>,
+    member_way_ids: Option<&crate::idset::IdSet>,
+    inject_prepass: bool,
 ) -> std::result::Result<(), String> {
     scratch.group_out.clear();
 
@@ -154,7 +173,15 @@ fn process_group(
             let way_bytes = gr_cursor
                 .read_len_delimited()
                 .map_err(|e| format!("reframe way: {e}"))?;
-            splice_way_locations(way_bytes, node_index, scratch, stats)?;
+            splice_way_locations(
+                way_bytes,
+                node_index,
+                scratch,
+                stats,
+                shared_node_ids,
+                member_way_ids,
+                inject_prepass,
+            )?;
             encode_bytes_field(&mut scratch.group_out, 3, &scratch.reframed_way);
         } else {
             let raw = gr_cursor
@@ -179,11 +206,15 @@ fn splice_way_locations(
     node_index: &NodeIndex,
     scratch: &mut WayReframeScratch,
     stats: &mut WayReframeStats,
+    shared_node_ids: Option<&crate::idset::IdSet>,
+    member_way_ids: Option<&crate::idset::IdSet>,
+    inject_prepass: bool,
 ) -> std::result::Result<(), String> {
     scratch.reframed_way.clear();
     scratch.refs.clear();
     scratch.packed_lats.clear();
     scratch.packed_lons.clear();
+    scratch.pins.clear();
 
     let mut way_id: i64 = 0;
     let mut have_id = false;
@@ -214,7 +245,7 @@ fn splice_way_locations(
                 encode_varint(&mut scratch.reframed_way, refs_data.len() as u64);
                 scratch.reframed_way.extend_from_slice(refs_data);
             }
-            (9 | 10, WIRE_LEN) => {
+            (9 | 10 | 20, WIRE_LEN) => {
                 let _ = way_cursor
                     .read_raw_field(wt)
                     .map_err(|e| format!("reframe wstrip: {e}"))?;
@@ -240,27 +271,60 @@ fn splice_way_locations(
         stats.max_way_id = way_id;
     }
     stats.way_count += 1;
+    scratch
+        .member_ways
+        .push(inject_prepass && member_way_ids.is_some_and(|ids| ids.get(way_id)));
 
+    // Field 20 is a fixed-width ceil(ref_count/8) bitmap; size it up front so
+    // trailing unpinned refs still contribute their bytes (the consumer
+    // validates the length, and the external backend emits full width too).
+    if inject_prepass {
+        scratch.pins.resize(scratch.refs.len().div_ceil(8), 0);
+    }
     let mut last_lat: i64 = 0;
     let mut last_lon: i64 = 0;
-    for &node_id in &scratch.refs {
-        let (lat, lon) = match node_index.get(node_id) {
-            Some(loc) => (i64::from(loc.0), i64::from(loc.1)),
+    for (idx, &node_id) in scratch.refs.iter().enumerate() {
+        let (lat, lon, resolved) = match node_index.get(node_id) {
+            Some(loc) => (i64::from(loc.0), i64::from(loc.1), true),
             None => {
                 stats.missing_locations += 1;
-                (0, 0)
+                (0, 0, false)
             }
         };
         encode_varint(&mut scratch.packed_lats, zigzag_encode_64(lat - last_lat));
         encode_varint(&mut scratch.packed_lons, zigzag_encode_64(lon - last_lon));
         last_lat = lat;
         last_lon = lon;
+        if inject_prepass && resolved && shared_node_ids.is_some_and(|ids| ids.get(node_id)) {
+            scratch.pins[idx / 8] |= 1 << (idx % 8);
+        }
     }
 
+    if inject_prepass {
+        super::inject_metrics::record_pins(&scratch.pins);
+    }
     if !scratch.refs.is_empty() {
         encode_bytes_field(&mut scratch.reframed_way, 9, &scratch.packed_lats);
         encode_bytes_field(&mut scratch.reframed_way, 10, &scratch.packed_lons);
+        if inject_prepass && scratch.pins.iter().any(|&byte| byte != 0) {
+            encode_bytes_field(&mut scratch.reframed_way, 20, &scratch.pins);
+        }
     }
 
     Ok(())
+}
+
+/// Field-5 payload for a way blob. Bits are in file order and identify ways
+/// that participate in a multipolygon or boundary relation.
+pub(super) fn way_members_payload(way_count: u64, members: &[bool]) -> Vec<u8> {
+    let mut payload = vec![1];
+    encode_varint(&mut payload, way_count);
+    let mut bits = vec![0; members.len().div_ceil(8)];
+    for (i, member) in members.iter().enumerate() {
+        if *member {
+            bits[i / 8] |= 1 << (i % 8);
+        }
+    }
+    payload.extend_from_slice(&bits);
+    payload
 }

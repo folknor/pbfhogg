@@ -57,6 +57,18 @@ pub enum IndexType {
     Auto,
 }
 
+/// Configuration for [`add_locations_to_ways`].
+#[derive(Clone, Copy, Debug)]
+pub struct AltwOptions {
+    pub keep_untagged_nodes: bool,
+    pub compression: Compression,
+    pub direct_io: bool,
+    pub force: bool,
+    pub index_type: IndexType,
+    /// Emit the private WayMembers-v1 and SharedNodePins-v1 prepass metadata.
+    pub inject_prepass: bool,
+}
+
 /// Parse error for [`IndexType`].
 #[derive(Debug, Clone)]
 pub struct ParseIndexTypeError(String);
@@ -188,22 +200,18 @@ impl Stats {
 /// If `keep_untagged_nodes` is false, nodes with zero tags are omitted from
 /// the output (their coordinates are still used for ways).
 #[hotpath::measure]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 pub fn add_locations_to_ways(
     input: &Path,
     output: &Path,
-    keep_untagged_nodes: bool,
-    compression: Compression,
-    direct_io: bool,
-    force: bool,
+    options: &AltwOptions,
     overrides: &HeaderOverrides,
-    index_type: IndexType,
 ) -> Result<Stats> {
     // Auto-select: external if sorted + indexed, sparse otherwise.
-    let index_type = if index_type == IndexType::Auto {
-        auto_select_index_type(input, direct_io)?
+    let index_type = if options.index_type == IndexType::Auto {
+        auto_select_index_type(input, options.direct_io)?
     } else {
-        index_type
+        options.index_type
     };
 
     // External join has its own pipeline - dispatch early.
@@ -211,25 +219,26 @@ pub fn add_locations_to_ways(
         return external::external_join(
             input,
             output,
-            keep_untagged_nodes,
-            compression,
-            direct_io,
-            force,
+            options.keep_untagged_nodes,
+            options.compression,
+            options.direct_io,
+            options.force,
             overrides,
+            options.inject_prepass,
         );
     }
 
     let indexdata_present = require_indexdata(
         input,
-        direct_io,
-        force,
+        options.direct_io,
+        options.force,
         "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
          decompressed and re-encoded (significantly slower).",
     )?;
 
     // Suggest external index for sorted indexed PBFs on sparse selection.
     if index_type == IndexType::Sparse && indexdata_present {
-        let reader = crate::ElementReader::open(input, direct_io)?;
+        let reader = crate::ElementReader::open(input, options.direct_io)?;
         if reader.header().is_sorted() {
             eprintln!(
                 "hint: this sorted indexed PBF is eligible for --index-type external, \
@@ -246,7 +255,8 @@ pub fn add_locations_to_ways(
     // nodes need coordinate lookups, so only these get indexed. At planet
     // scale this reduces touched mmap pages from ~80 GB to ~16 GB.
     crate::debug::emit_marker("ALTW_PASS0_START");
-    let referenced = collect_way_referenced_node_ids(input, direct_io)?;
+    let (referenced, shared) =
+        collect_way_referenced_node_ids(input, options.direct_io, options.inject_prepass)?;
     crate::debug::emit_marker("ALTW_PASS0_END");
     // Cheap one-shot iter().count(); surfaces the way-ref IdSet size before
     // the index build so the counter survives SIGKILL during pass 1.
@@ -266,38 +276,60 @@ pub fn add_locations_to_ways(
     }
 
     crate::debug::emit_marker("ALTW_PASS1_START");
-    let index = build_node_index(input, direct_io, scratch_dir, referenced, index_type)?;
+    let index = build_node_index(
+        input,
+        options.direct_io,
+        scratch_dir,
+        referenced,
+        index_type,
+    )?;
     crate::debug::emit_marker("ALTW_PASS1_END");
 
-    let relation_member_node_ids = if keep_untagged_nodes {
-        None
+    let relation_scan = if options.keep_untagged_nodes && !options.inject_prepass {
+        (None, None)
     } else {
         crate::debug::emit_marker("ALTW_REL_MEMBER_SCAN_START");
-        let ids = collect_relation_member_node_ids(input, direct_io)?;
+        let ids = collect_relation_member_ids(
+            input,
+            options.direct_io,
+            !options.keep_untagged_nodes,
+            options.inject_prepass,
+        )?;
         crate::debug::emit_marker("ALTW_REL_MEMBER_SCAN_END");
         #[allow(clippy::cast_possible_wrap)]
         {
             crate::debug::emit_counter(
                 "altw_relation_member_node_ids",
-                i64::try_from(ids.iter().count()).unwrap_or(i64::MAX),
+                i64::try_from(ids.0.as_ref().map_or(0, |set| set.iter().count()))
+                    .unwrap_or(i64::MAX),
             );
         }
-        Some(ids)
+        ids
     };
     crate::debug::emit_marker("ALTW_PASS2_START");
     let stats = write_output_checked(
         input,
         output,
         &index,
-        keep_untagged_nodes,
-        relation_member_node_ids.as_ref(),
-        compression,
-        direct_io,
+        options.keep_untagged_nodes,
+        relation_scan.0.as_ref(),
+        relation_scan.1.as_ref(),
+        shared.as_ref(),
+        options.inject_prepass,
+        options.compression,
+        options.direct_io,
         indexdata_present,
         overrides,
     )?;
     crate::debug::emit_marker("ALTW_PASS2_END");
     emit_stats_counters(&stats);
+    if options.inject_prepass {
+        let member_ways = relation_scan
+            .1
+            .as_ref()
+            .map_or(0, |set| set.iter().count() as u64);
+        inject_metrics::emit(member_ways);
+    }
     Ok(stats)
 }
 
@@ -323,6 +355,50 @@ fn auto_select_index_type(input: &Path, direct_io: bool) -> Result<IndexType> {
     };
     eprintln!("auto-selected --index-type {chosen} (sorted={sorted}, indexed={has_index})");
     Ok(chosen)
+}
+
+/// Process-global instrumentation for the injected-prepass producer.
+///
+/// The values feed brokkr sidecar counters only (a no-op without the FIFO),
+/// so they are diagnostic and never surface in `Stats` or the CLI summary.
+/// Both the sparse and external backends fold into these accumulators during
+/// the parallel reframe and each emits once at the end of its run; the
+/// counters start at zero per process, which matches brokkr's one-process-per
+/// -run benchmark model.
+pub(super) mod inject_metrics {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    static PINNED_REFS: AtomicU64 = AtomicU64::new(0);
+    static FIELD20_WAYS: AtomicU64 = AtomicU64::new(0);
+    static FIELD5_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    /// Fold one way's field-20 pin bitmap: total set bits into `pinned_refs`,
+    /// and one into `field20_ways` when the way emits a (non-empty) bitmap.
+    pub(super) fn record_pins(pins: &[u8]) {
+        let popcount: u32 = pins.iter().map(|b| b.count_ones()).sum();
+        if popcount > 0 {
+            PINNED_REFS.fetch_add(u64::from(popcount), Relaxed);
+            FIELD20_WAYS.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Fold one way blob's field-5 payload length.
+    pub(super) fn record_field5_bytes(len: usize) {
+        FIELD5_BYTES.fetch_add(len as u64, Relaxed);
+    }
+
+    /// Emit the four injected-prepass counters. `member_ways` is the size of
+    /// the relation member-way IdSet, computed by the caller.
+    #[allow(clippy::cast_possible_wrap)]
+    pub(super) fn emit(member_ways: u64) {
+        crate::debug::emit_counter("altw_member_ways", member_ways as i64);
+        crate::debug::emit_counter("altw_pinned_refs", PINNED_REFS.load(Relaxed) as i64);
+        crate::debug::emit_counter(
+            "altw_field20_ways_emitted",
+            FIELD20_WAYS.load(Relaxed) as i64,
+        );
+        crate::debug::emit_counter("altw_field5_bytes", FIELD5_BYTES.load(Relaxed) as i64);
+    }
 }
 
 #[allow(clippy::cast_possible_wrap)]
@@ -383,12 +459,17 @@ fn build_node_index(
 /// pread from the shared file handle on worker threads, which is
 /// incompatible with `O_DIRECT`'s alignment requirements.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn collect_way_referenced_node_ids(input: &Path, _direct_io: bool) -> Result<IdSet> {
+fn collect_way_referenced_node_ids(
+    input: &Path,
+    _direct_io: bool,
+    inject_prepass: bool,
+) -> Result<(IdSet, Option<IdSet>)> {
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
         Some(crate::blob_meta::ElemKind::Way),
     )?;
     let mut referenced = IdSet::new();
+    let mut shared = inject_prepass.then(IdSet::new);
     crate::scan::classify::parallel_scan_blobs_raw(
         &shared_file,
         &schedule,
@@ -401,6 +482,11 @@ fn collect_way_referenced_node_ids(input: &Path, _direct_io: bool) -> Result<IdS
                 refs_buf,
                 group_starts,
                 |_way_id, refs| {
+                    let refs = if refs.len() >= 4 && refs.first() == refs.last() {
+                        &refs[..refs.len() - 1]
+                    } else {
+                        refs
+                    };
                     for &node_id in refs {
                         if node_id >= 0 {
                             refs_vec.push(node_id);
@@ -412,11 +498,17 @@ fn collect_way_referenced_node_ids(input: &Path, _direct_io: bool) -> Result<IdS
         },
         |_seq, refs_vec| {
             for &node_id in &refs_vec {
-                referenced.set(node_id);
+                if referenced.get(node_id) {
+                    if let Some(shared) = &mut shared {
+                        shared.set(node_id);
+                    }
+                } else {
+                    referenced.set(node_id);
+                }
             }
         },
     )?;
-    Ok(referenced)
+    Ok((referenced, shared))
 }
 
 /// Collect all node IDs referenced by relation members.
@@ -435,39 +527,54 @@ fn collect_way_referenced_node_ids(input: &Path, _direct_io: bool) -> Result<IdS
 /// pread from the shared file handle on worker threads, incompatible
 /// with `O_DIRECT` alignment requirements.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub(crate) fn collect_relation_member_node_ids(input: &Path, _direct_io: bool) -> Result<IdSet> {
+pub(crate) fn collect_relation_member_ids(
+    input: &Path,
+    _direct_io: bool,
+    want_nodes: bool,
+    want_ways: bool,
+) -> Result<(Option<IdSet>, Option<IdSet>)> {
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
         Some(crate::blob_meta::ElemKind::Relation),
     )?;
-    let mut member_node_ids = IdSet::new();
+    let mut member_node_ids = want_nodes.then(IdSet::new);
+    let mut member_way_ids = want_ways.then(IdSet::new);
     crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &schedule,
         None,
         || (),
         |block, _state| {
-            let mut node_ids: Vec<i64> = Vec::new();
+            let mut ids: Vec<(bool, i64)> = Vec::new();
             for element in block.elements_skip_metadata() {
                 if let Element::Relation(r) = element {
+                    let complete = r.tags().any(|(key, value)| {
+                        key == "type" && matches!(value, "multipolygon" | "boundary")
+                    });
                     for member in r.members() {
-                        if let MemberId::Node(id) = member.id
-                            && id >= 0
-                        {
-                            node_ids.push(id);
+                        match member.id {
+                            MemberId::Node(id) if want_nodes && id >= 0 => ids.push((false, id)),
+                            MemberId::Way(id) if want_ways && complete && id >= 0 => {
+                                ids.push((true, id));
+                            }
+                            _ => {}
                         }
                     }
                 }
             }
-            node_ids
+            ids
         },
-        |_seq, node_ids| {
-            for id in node_ids {
-                member_node_ids.set(id);
+        |_seq, ids| {
+            for (way, id) in ids {
+                if way {
+                    member_way_ids.as_mut().expect("requested").set(id);
+                } else {
+                    member_node_ids.as_mut().expect("requested").set(id);
+                }
             }
         },
     )?;
-    Ok(member_node_ids)
+    Ok((member_node_ids, member_way_ids))
 }
 
 // ---------------------------------------------------------------------------
@@ -481,11 +588,17 @@ fn write_output_checked(
     index: &NodeIndex,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,
+    relation_member_way_ids: Option<&IdSet>,
+    shared_node_ids: Option<&IdSet>,
+    inject_prepass: bool,
     compression: Compression,
     direct_io: bool,
     indexdata_present: bool,
     overrides: &HeaderOverrides,
 ) -> Result<Stats> {
+    if inject_prepass && !indexdata_present {
+        return Err("--inject-prepass requires blob-level indexdata; --force cannot enable the decode-all fallback because it cannot attach per-blob WayMembers metadata".into());
+    }
     if indexdata_present {
         write_output_passthrough(
             input,
@@ -493,6 +606,9 @@ fn write_output_checked(
             index,
             keep_untagged_nodes,
             relation_member_node_ids,
+            relation_member_way_ids,
+            shared_node_ids,
+            inject_prepass,
             compression,
             direct_io,
             overrides,

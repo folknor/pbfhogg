@@ -85,6 +85,7 @@ pub(super) fn stage1_pass_a(
     layout: &BucketLayout,
     ref_count_sidecar: &Path,
     per_way_refcount_sidecar: &Path,
+    _inject_prepass: bool,
 ) -> Result<(u64, Vec<u64>)> {
     use std::os::unix::fs::FileExt as _;
 
@@ -188,12 +189,17 @@ pub(super) fn stage1_pass_a(
                             let t2 = std::time::Instant::now();
                             let mut blob_node_ids: Vec<i64> = Vec::new();
                             let mut per_way_rcs: Vec<u32> = Vec::new();
+                            let mut closure_slots: Vec<bool> = Vec::new();
                             crate::scan::way::scan_way_refs(
                                 &decompress_buf,
                                 &mut refs_buf,
                                 &mut group_starts,
                                 |_way_id, refs| {
+                                    let closed = refs.len() >= 4 && refs.first() == refs.last();
                                     blob_node_ids.extend_from_slice(refs);
+                                    closure_slots.extend(
+                                        (0..refs.len()).map(|i| closed && i + 1 == refs.len()),
+                                    );
                                     #[allow(clippy::cast_possible_truncation)]
                                     per_way_rcs.push(refs.len() as u32);
                                 },
@@ -238,7 +244,12 @@ pub(super) fn stage1_pass_a(
                                 };
                                 if let Some((bucket_idx, local_node_id)) = location {
                                     let rec = IdRecord {
-                                        local_node_id,
+                                        local_node_id: local_node_id
+                                            | if closure_slots[i] {
+                                                super::CLOSURE_FLAG
+                                            } else {
+                                                0
+                                            },
                                         blob_idx: task.seq,
                                         blob_local_slot,
                                     };
@@ -473,6 +484,7 @@ pub(super) fn stage1_way_pass(
     layout: &BucketLayout,
     ref_count_sidecar: &Path,
     per_way_refcount_sidecar: &Path,
+    inject_prepass: bool,
 ) -> Result<Stage1Output> {
     let schedule = build_way_schedule(blob_meta)?;
 
@@ -538,6 +550,7 @@ pub(super) fn stage1_way_pass(
         layout,
         ref_count_sidecar,
         per_way_refcount_sidecar,
+        inject_prepass,
     )?;
 
     // Build the per-blob mapping (header-only walk - no decompression).

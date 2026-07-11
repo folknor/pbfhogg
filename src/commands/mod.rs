@@ -242,13 +242,16 @@ pub(crate) fn ensure_relation_capacity_local(
     Ok(())
 }
 
-/// Warn if the input header declares `LocationsOnWays` - inline way-node
-/// coordinates are not propagated through re-encoding.
+/// Warn if the input header declares way-level metadata that re-encoding does
+/// not propagate.
 pub(crate) fn warn_locations_on_ways_loss(header: &crate::HeaderBlock) {
-    if header.has_locations_on_ways() {
+    if header.has_locations_on_ways()
+        || header.has_way_members_v1()
+        || header.has_shared_node_pins_v1()
+    {
         eprintln!(
-            "Warning: input PBF has LocationsOnWays (inline way-node coordinates). \
-             These will not be preserved in the output."
+            "Warning: input PBF has way-level enrichment metadata. \
+             LocationsOnWays and injected prepass metadata are not preserved in the output."
         );
     }
 }

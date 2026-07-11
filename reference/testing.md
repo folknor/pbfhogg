@@ -74,7 +74,7 @@ shape:
 
 - `pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData, Metadata}`
 - `pbfhogg::writer::{PbfWriter, Compression}`
-- `pbfhogg::{Blob, BlobDecode, BlobError, BlobReader, BlobType, Element, ElementReader, ErrorKind, HeaderBlock, HeaderOverrides, MemberId, MemberType, Way}`
+- `pbfhogg::{Blob, BlobDecode, BlobError, BlobReader, BlobType, Element, ElementReader, ErrorKind, HeaderBlock, HeaderOverrides, MemberId, MemberType, Way}` (including `Blob::way_members`, `Blob::way_member_count`, `BlobReader::set_parse_waymembers`, `Way::shared_node_pins`, and `HeaderBlock`'s injected-prepass feature accessors)
 
 Everything else is non-stable and requires CLI conversion.
 

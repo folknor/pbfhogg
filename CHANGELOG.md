@@ -4,6 +4,12 @@
 
 ### Breaking changes
 
+- `add_locations_to_ways` now takes `AltwOptions` instead of positional
+  configuration arguments. Its CLI gains `--inject-prepass`, which emits the
+  opt-in `pbfhogg.WayMembers-v1` and `pbfhogg.SharedNodePins-v1` metadata.
+  The public read API adds `Blob::way_members`, `Way::shared_node_pins`, and
+  `BlobReader::set_parse_waymembers` for those artifacts.
+
 - **Minimum supported Rust version raised 1.87 → 1.96** (library and CLI). Required by the move to `if let` chains and `as_chunks` in the read and command paths.
 
 ### Changed

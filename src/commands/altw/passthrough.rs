@@ -83,6 +83,7 @@ fn build_schedule(
     input: &Path,
     overrides: &HeaderOverrides,
     keep_untagged_nodes: bool,
+    inject_prepass: bool,
 ) -> Result<(Vec<BlobDescriptor>, Vec<u8>, std::sync::Arc<std::fs::File>)> {
     let mut walker = HeaderWalker::open(input)?;
     let mut header_bytes: Option<Vec<u8>> = None;
@@ -99,7 +100,12 @@ fn build_schedule(
                     .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
                 let header = crate::blob::decode_blob_to_headerblock(&data_buf)?;
                 let bytes = build_output_header(&header, true, overrides, |hb| {
-                    hb.optional_feature("LocationsOnWays")
+                    let mut hb = hb.optional_feature("LocationsOnWays");
+                    if inject_prepass {
+                        hb = hb.optional_feature(crate::HeaderBlock::WAY_MEMBERS_V1);
+                        hb = hb.optional_feature(crate::HeaderBlock::SHARED_NODE_PINS_V1);
+                    }
+                    hb
                 })?;
                 header_bytes = Some(bytes);
             }
@@ -166,12 +172,16 @@ impl WorkerScratch {
 /// Decode one descriptor. Way blobs go through the wire-format
 /// reframe; everything else (Node decode, Unknown decode) goes through
 /// the existing `PrimitiveBlock` + `BlockBuilder` path.
+#[allow(clippy::too_many_arguments)]
 fn decode_one(
     desc: &BlobDescriptor,
     file: &std::sync::Arc<std::fs::File>,
     node_index: &NodeIndex,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,
+    relation_member_way_ids: Option<&IdSet>,
+    shared_node_ids: Option<&IdSet>,
+    inject_prepass: bool,
     scratch: &mut WorkerScratch,
 ) -> std::result::Result<(Vec<OwnedBlock>, Stats), String> {
     scratch.read_buf.resize(desc.data_size, 0);
@@ -187,6 +197,9 @@ fn decode_one(
             node_index,
             &mut scratch.reframe_output,
             &mut scratch.way_scratch,
+            shared_node_ids,
+            relation_member_way_ids,
+            inject_prepass,
         )?;
         let index = BlobIndex {
             kind: ElemKind::Way,
@@ -199,7 +212,14 @@ fn decode_one(
             bytes: std::mem::take(&mut scratch.reframe_output),
             index,
             tagdata: None,
-            way_members: None,
+            way_members: inject_prepass.then(|| {
+                let payload = crate::commands::altw::reframe::way_members_payload(
+                    stats.way_count,
+                    &scratch.way_scratch.member_ways,
+                );
+                crate::commands::altw::inject_metrics::record_field5_bytes(payload.len());
+                payload
+            }),
         });
         let block_stats = Stats {
             ways_written: stats.way_count,
@@ -218,6 +238,21 @@ fn decode_one(
     let bytes =
         crate::blob::decompress_blob(&wire_blob, Some(&scratch.pool)).map_err(|e| e.to_string())?;
     let block = parse_primitive_block_from_bytes_owned(&bytes).map_err(|e| e.to_string())?;
+    // A Way in a blob the index classified as non-way would be emitted without
+    // field 9/10/20 and would be absent from every field-5 payload, silently
+    // breaking the WayMembers superset. Reject it, mirroring the external
+    // backend's assemble_block guard.
+    if inject_prepass
+        && block
+            .elements_skip_metadata()
+            .any(|e| matches!(e, crate::Element::Way(_)))
+    {
+        return Err(format!(
+            "--inject-prepass: blob {} classified as non-way contains a Way element; \
+             refusing to emit unenriched ways",
+            desc.seq,
+        ));
+    }
     let block_stats = process_block(
         &block,
         &mut scratch.bb,
@@ -242,12 +277,15 @@ pub(super) fn write_output_passthrough(
     node_index: &NodeIndex,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,
+    relation_member_way_ids: Option<&IdSet>,
+    shared_node_ids: Option<&IdSet>,
+    inject_prepass: bool,
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<Stats> {
     let (schedule, header_bytes, shared_file) =
-        build_schedule(input, overrides, keep_untagged_nodes)?;
+        build_schedule(input, overrides, keep_untagged_nodes, inject_prepass)?;
 
     let mut writer =
         writer_from_header_bytes_parallel(output, compression, &header_bytes, direct_io, false)?;
@@ -303,6 +341,9 @@ pub(super) fn write_output_passthrough(
                         node_index,
                         keep_untagged_nodes,
                         relation_member_node_ids,
+                        relation_member_way_ids,
+                        shared_node_ids,
+                        inject_prepass,
                         &mut scratch,
                     );
                     if tx.send((desc.seq, result)).is_err() {

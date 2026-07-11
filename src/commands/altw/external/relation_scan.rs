@@ -19,15 +19,23 @@ use super::super::Result;
 use super::blob_meta::BlobMeta;
 use crate::idset::IdSet;
 
-pub(super) fn collect_relation_member_node_ids_indexed(
+pub(super) struct RelationScanOutput {
+    pub(super) member_node_ids: Option<IdSet>,
+    pub(super) member_way_ids: Option<IdSet>,
+}
+
+pub(super) fn collect_relation_member_ids_indexed(
     input: &Path,
     blob_meta: &[BlobMeta],
-) -> Result<IdSet> {
+    want_nodes: bool,
+    want_ways: bool,
+) -> Result<RelationScanOutput> {
     let file = Arc::new(
         std::fs::File::open(input).map_err(|e| format!("open pbf for relation scan: {e}"))?,
     );
 
-    let mut ids = IdSet::new();
+    let mut node_ids = want_nodes.then(IdSet::new);
+    let mut way_ids = want_ways.then(IdSet::new);
     let mut read_buf: Vec<u8> = Vec::new();
     let mut decompress_buf: Vec<u8> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
@@ -49,16 +57,26 @@ pub(super) fn collect_relation_member_node_ids_indexed(
         )?;
         for element in block.elements_skip_metadata() {
             if let Element::Relation(r) = element {
+                let complete = r.tags().any(|(key, value)| {
+                    key == "type" && matches!(value, "multipolygon" | "boundary")
+                });
                 for member in r.members() {
-                    if let MemberId::Node(id) = member.id
-                        && id >= 0
-                    {
-                        ids.set(id);
+                    match member.id {
+                        MemberId::Node(id) if want_nodes && id >= 0 => {
+                            node_ids.as_mut().expect("requested").set(id);
+                        }
+                        MemberId::Way(id) if want_ways && complete && id >= 0 => {
+                            way_ids.as_mut().expect("requested").set(id);
+                        }
+                        _ => {}
                     }
                 }
             }
         }
     }
 
-    Ok(ids)
+    Ok(RelationScanOutput {
+        member_node_ids: node_ids,
+        member_way_ids: way_ids,
+    })
 }

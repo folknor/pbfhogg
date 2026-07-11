@@ -230,6 +230,7 @@ impl ConcurrentBlobLocationRouter {
         side: StraddlerSide,
         raw_bytes: Vec<u8>,
         per_way_rcs: &PerWayRcs,
+        inject_prepass: bool,
         encode_scratch: &mut Vec<u8>,
     ) -> Result<()> {
         let mut map = self
@@ -268,6 +269,7 @@ impl ConcurrentBlobLocationRouter {
             &coord_bytes,
             per_way_rcs.blob_record(blob_idx),
             blob_idx,
+            inject_prepass,
             encode_scratch,
         )
         .map_err(|e| format!("router straddler encode blob {blob_idx}: {e}"))?;
@@ -692,6 +694,7 @@ pub(super) fn encode_blob_payload_from_record(
     coord_bytes: &[u8],
     record: &[u8],
     blob_idx: usize,
+    inject_prepass: bool,
     output: &mut Vec<u8>,
 ) -> std::result::Result<(), String> {
     let mut cursor = protohoggr::Cursor::new(record);
@@ -722,10 +725,18 @@ pub(super) fn encode_blob_payload_from_record(
 
         let mut last_lat: i32 = 0;
         let mut last_lon: i32 = 0;
-        for _ in 0..rc_usize {
+        // When injecting, lat carries the pin bit in position 0; unpack it and
+        // accumulate the per-way pin bitmap emitted after the coordinate
+        // varints (v2 framing: 2*N varints then ceil(N/8) bitmap bytes).
+        let mut pins = if inject_prepass {
+            vec![0_u8; rc_usize.div_ceil(8)]
+        } else {
+            Vec::new()
+        };
+        for i in 0..rc_usize {
             let off = coord_cursor;
             coord_cursor += COORD_SLOT_SIZE;
-            let lat = i32::from_le_bytes([
+            let packed_lat = i32::from_le_bytes([
                 coord_bytes[off],
                 coord_bytes[off + 1],
                 coord_bytes[off + 2],
@@ -737,12 +748,23 @@ pub(super) fn encode_blob_payload_from_record(
                 coord_bytes[off + 6],
                 coord_bytes[off + 7],
             ]);
+            let lat = if inject_prepass {
+                if packed_lat & 1 != 0 {
+                    pins[i / 8] |= 1 << (i % 8);
+                }
+                packed_lat >> 1
+            } else {
+                packed_lat
+            };
             let dlat = i64::from(lat) - i64::from(last_lat);
             let dlon = i64::from(lon) - i64::from(last_lon);
             protohoggr::encode_varint(output, protohoggr::zigzag_encode_64(dlat));
             protohoggr::encode_varint(output, protohoggr::zigzag_encode_64(dlon));
             last_lat = lat;
             last_lon = lon;
+        }
+        if inject_prepass {
+            output.extend_from_slice(&pins);
         }
     }
     if cursor.remaining() != 0 {
@@ -953,7 +975,7 @@ mod tests {
         let mut from_decoded = Vec::new();
         let mut scratch: Vec<u32> = Vec::new();
 
-        encode_blob_payload_from_record(&cb, pwr.blob_record(0), 0, &mut from_record)
+        encode_blob_payload_from_record(&cb, pwr.blob_record(0), 0, false, &mut from_record)
             .expect("encode from record");
         let decoded = pwr
             .decode_blob_into(0, &mut scratch)

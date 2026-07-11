@@ -50,6 +50,7 @@ pub(super) struct IntegratedInputs<'a> {
     pub way_slot_starts: &'a [u64],
     pub per_way_rcs: &'a PerWayRcs,
     pub router: &'a ConcurrentBlobLocationRouter,
+    pub inject_prepass: bool,
 }
 
 fn scatter_bucket_entries(
@@ -446,6 +447,7 @@ fn emit_integrated_intersections(
                     slice,
                     ctx.per_way_rcs.blob_record(blob_idx),
                     blob_idx,
+                    ctx.inject_prepass,
                     encode_scratch,
                 )
                 .map_err(|e| format!("encode blob {blob_idx}: {e}"))?;
@@ -484,6 +486,7 @@ fn emit_integrated_intersections(
                         StraddlerSide::Left,
                         bytes,
                         ctx.per_way_rcs,
+                        ctx.inject_prepass,
                         encode_scratch,
                     )
                     .map_err(|e| format!("straddler left blob {blob_idx}: {e}"))?;
@@ -509,6 +512,7 @@ fn emit_integrated_intersections(
                         StraddlerSide::Right,
                         bytes,
                         ctx.per_way_rcs,
+                        ctx.inject_prepass,
                         encode_scratch,
                     )
                     .map_err(|e| format!("straddler right blob {blob_idx}: {e}"))?;

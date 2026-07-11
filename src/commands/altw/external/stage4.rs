@@ -111,6 +111,8 @@ pub(super) fn stage4_assembly(
     way_slot_starts: &[u64],
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,
+    member_way_ids: Option<&IdSet>,
+    inject_prepass: bool,
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
@@ -237,7 +239,14 @@ pub(super) fn stage4_assembly(
         &header,
         true,
         overrides,
-        |hb| hb.optional_feature("LocationsOnWays"),
+        |hb| {
+            let mut hb = hb.optional_feature("LocationsOnWays");
+            if inject_prepass {
+                hb = hb.optional_feature(crate::HeaderBlock::WAY_MEMBERS_V1);
+                hb = hb.optional_feature(crate::HeaderBlock::SHARED_NODE_PINS_V1);
+            }
+            hb
+        },
         direct_io,
         false,
     )?;
@@ -444,6 +453,8 @@ pub(super) fn stage4_assembly(
                                     &mut reframe_output,
                                     &mut way_reframe_scratch,
                                     way_reframe_cref,
+                                    member_way_ids,
+                                    inject_prepass,
                                 )
                                 .map_err(|e| {
                                     crate::error::new_error(crate::error::ErrorKind::Io(
@@ -464,7 +475,17 @@ pub(super) fn stage4_assembly(
                                 bytes: taken,
                                 index,
                                 tagdata: None,
-                                way_members: None,
+                                way_members: inject_prepass.then(|| {
+                                    let payload =
+                                        crate::commands::altw::reframe::way_members_payload(
+                                            way_count,
+                                            &way_reframe_scratch.member_ways,
+                                        );
+                                    crate::commands::altw::inject_metrics::record_field5_bytes(
+                                        payload.len(),
+                                    );
+                                    payload
+                                }),
                             });
 
                             let block_stats = Stats {
@@ -1088,6 +1109,8 @@ struct WayReframeScratch {
     reframed_way: Vec<u8>,
     packed_lats: Vec<u8>,
     packed_lons: Vec<u8>,
+    pins: Vec<u8>,
+    member_ways: Vec<bool>,
     group_out: Vec<u8>,
 }
 
@@ -1099,6 +1122,8 @@ impl WayReframeScratch {
             reframed_way: Vec::new(),
             packed_lats: Vec::new(),
             packed_lons: Vec::new(),
+            pins: Vec::new(),
+            member_ways: Vec::new(),
             group_out: Vec::new(),
         }
     }
@@ -1134,12 +1159,15 @@ fn reframe_way_blob_with_locations(
     output: &mut Vec<u8>,
     scratch: &mut WayReframeScratch,
     counters: &WayReframeCounters,
+    member_way_ids: Option<&IdSet>,
+    inject_prepass: bool,
 ) -> std::result::Result<(u64, u64, i64, i64, u64), String> {
     use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT};
     use std::sync::atomic::Ordering::Relaxed;
 
     scratch.group_ranges.clear();
     scratch.scalar_fields.clear();
+    scratch.member_ways.clear();
     let mut stringtable_range: Option<(usize, usize)> = None;
 
     // Level 1: PrimitiveBlock - find string table + groups.
@@ -1243,20 +1271,30 @@ fn reframe_way_blob_with_locations(
                 sidecar_way_idx += 1;
 
                 let mut way_id: i64 = 0;
+                let mut has_existing_way_locations = false;
 
                 let mut way_cursor = Cursor::new(way_bytes);
                 while let Some((wf, wt)) = way_cursor
                     .read_tag()
                     .map_err(|e| format!("reframe wfield: {e}"))?
                 {
-                    if wf == 1 && wt == WIRE_VARINT {
-                        way_id = way_cursor
-                            .read_varint_i64()
-                            .map_err(|e| format!("reframe id: {e}"))?;
-                    } else {
-                        way_cursor
-                            .skip_field(wt)
-                            .map_err(|e| format!("reframe wskip: {e}"))?;
+                    match (wf, wt) {
+                        (1, WIRE_VARINT) => {
+                            way_id = way_cursor
+                                .read_varint_i64()
+                                .map_err(|e| format!("reframe id: {e}"))?;
+                        }
+                        (9 | 10 | 20, WIRE_LEN) => {
+                            has_existing_way_locations = true;
+                            way_cursor
+                                .skip_field(wt)
+                                .map_err(|e| format!("reframe wskip: {e}"))?;
+                        }
+                        _ => {
+                            way_cursor
+                                .skip_field(wt)
+                                .map_err(|e| format!("reframe wskip: {e}"))?;
+                        }
                     }
                 }
 
@@ -1266,6 +1304,9 @@ fn reframe_way_blob_with_locations(
                 if way_id > max_way_id {
                     max_way_id = way_id;
                 }
+                scratch
+                    .member_ways
+                    .push(inject_prepass && member_way_ids.is_some_and(|ids| ids.get(way_id)));
 
                 // De-interleave pre-encoded varints from coord_payload into
                 // PBF packed fields 9/10. The raw varint bytes match PBF's
@@ -1273,6 +1314,7 @@ fn reframe_way_blob_with_locations(
                 // zigzag decode + re-encode.
                 scratch.packed_lats.clear();
                 scratch.packed_lons.clear();
+                scratch.pins.clear();
                 for _ in 0..ref_count {
                     let lat_start = payload_pos;
                     while payload_pos < coord_payload.len()
@@ -1301,6 +1343,19 @@ fn reframe_way_blob_with_locations(
                         .packed_lons
                         .extend_from_slice(&coord_payload[lon_start..payload_pos]);
                 }
+                if inject_prepass {
+                    let pin_ref_count = usize::try_from(ref_count)
+                        .map_err(|_| "coord_payload: ref count exceeds usize")?;
+                    let pin_bytes = pin_ref_count.div_ceil(8);
+                    if payload_pos + pin_bytes > coord_payload.len() {
+                        return Err("coord_payload: truncated pin bitmap".into());
+                    }
+                    scratch
+                        .pins
+                        .extend_from_slice(&coord_payload[payload_pos..payload_pos + pin_bytes]);
+                    payload_pos += pin_bytes;
+                    crate::commands::altw::inject_metrics::record_pins(&scratch.pins);
+                }
                 way_slot_pos += ref_count;
                 blob_refs_present += ref_count;
                 if ref_count > blob_max_refs_per_way {
@@ -1312,7 +1367,23 @@ fn reframe_way_blob_with_locations(
 
                 // Build reframed way: original bytes + appended fields 9, 10.
                 scratch.reframed_way.clear();
-                scratch.reframed_way.extend_from_slice(way_bytes);
+                if !has_existing_way_locations {
+                    scratch.reframed_way.extend_from_slice(way_bytes);
+                } else {
+                    let mut copy_cursor = Cursor::new(way_bytes);
+                    while let Some((wf, wt)) = copy_cursor
+                        .read_tag()
+                        .map_err(|e| format!("reframe copy tag: {e}"))?
+                    {
+                        let raw = copy_cursor
+                            .read_raw_field(wt)
+                            .map_err(|e| format!("reframe copy field: {e}"))?;
+                        if !matches!((wf, wt), (9 | 10 | 20, WIRE_LEN)) {
+                            protohoggr::encode_tag(&mut scratch.reframed_way, wf, wt);
+                            scratch.reframed_way.extend_from_slice(raw);
+                        }
+                    }
+                }
                 if ref_count > 0 {
                     protohoggr::encode_bytes_field(
                         &mut scratch.reframed_way,
@@ -1324,6 +1395,15 @@ fn reframe_way_blob_with_locations(
                         10,
                         &scratch.packed_lons,
                     );
+                    // Field order matches the sparse reframe (9, 10, 20) so the
+                    // two backends produce byte-identical way payloads.
+                    if inject_prepass && scratch.pins.iter().any(|&bit| bit != 0) {
+                        protohoggr::encode_bytes_field(
+                            &mut scratch.reframed_way,
+                            20,
+                            &scratch.pins,
+                        );
+                    }
                 }
 
                 protohoggr::encode_bytes_field(&mut scratch.group_out, 3, &scratch.reframed_way);

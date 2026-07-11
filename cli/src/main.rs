@@ -479,6 +479,9 @@ enum Command {
         ///              indexdata. ~256 GB temp disk at planet.
         #[arg(long, default_value = "sparse")]
         index_type: String,
+        /// Emit pbfhogg's opt-in WayMembers-v1 and SharedNodePins-v1 metadata.
+        #[arg(long)]
+        inject_prepass: bool,
         #[command(flatten)]
         compression: CompressionArg,
         #[command(flatten)]
@@ -1159,6 +1162,7 @@ fn main() -> process::ExitCode {
                 output,
                 keep_untagged_nodes,
                 index_type,
+                inject_prepass,
                 compression,
                 force,
                 io,
@@ -1168,6 +1172,7 @@ fn main() -> process::ExitCode {
                 &output.output,
                 keep_untagged_nodes,
                 &index_type,
+                inject_prepass,
                 &compression.compression,
                 io.direct_io,
                 force.force,
@@ -2278,6 +2283,7 @@ fn run_add_locations_to_ways(
     output: &std::path::Path,
     keep_untagged_nodes: bool,
     index_type: &str,
+    inject_prepass: bool,
     compression: &str,
     direct_io: bool,
     force: bool,
@@ -2285,16 +2291,15 @@ fn run_add_locations_to_ways(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let index_type: pbfhogg::altw::IndexType = index_type.parse()?;
-    let stats = pbfhogg::altw::add_locations_to_ways(
-        file,
-        output,
+    let options = pbfhogg::altw::AltwOptions {
         keep_untagged_nodes,
         compression,
         direct_io,
         force,
-        overrides,
         index_type,
-    )?;
+        inject_prepass,
+    };
+    let stats = pbfhogg::altw::add_locations_to_ways(file, output, &options, overrides)?;
     stats.print_summary();
     Ok(())
 }

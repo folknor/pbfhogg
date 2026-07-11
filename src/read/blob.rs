@@ -1236,4 +1236,71 @@ mod tests {
             None
         );
     }
+
+    /// D8 count-gap fixture: a hand-built blob whose field-5 preamble declares
+    /// a `way_count` differing from the blob's actual decoded Way count *within
+    /// one bitmap byte* (encoded 7, actual 8; `ceil(7/8) == ceil(8/8) == 1`).
+    /// The producer always keeps encoded == actual, so this class of gap can
+    /// only be built by hand. It is invisible through `way_members().len()`
+    /// alone (both round to a 1-byte bitmap); only `way_member_count()` exposes
+    /// it, which is why that accessor is on the public surface - the enriched
+    /// -file consumer compares the encoded count against the blob's real Way
+    /// count and hard-errors on a mismatch.
+    #[test]
+    fn way_member_count_exposes_within_byte_gap_vs_decoded_ways() {
+        use crate::block_builder::{BlockBuilder, HeaderBuilder};
+        use crate::writer::{Compression, PbfWriter};
+
+        let mut bb = BlockBuilder::new();
+        for id in 1_i64..=8 {
+            bb.add_way(
+                id,
+                std::iter::empty::<(&str, &str)>(),
+                &[id * 10, id * 10 + 1],
+                None,
+            );
+        }
+        let owned = bb.take_owned().expect("encode").expect("nonempty block");
+
+        // Preamble: version 1, way_count 7 (one short of the 8 real ways), one
+        // bitmap byte. ceil(7/8) == ceil(8/8) == 1, so the gap stays within the
+        // single bitmap byte and cannot be seen from the bitmap length.
+        let field5 = [0x01_u8, 7, 0x00];
+
+        let header = HeaderBuilder::new().sorted().build().expect("build header");
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = PbfWriter::new(&mut buf, Compression::default());
+            writer.write_header(&header).expect("write header");
+            writer
+                .write_primitive_block_owned(owned.bytes, owned.index, None, Some(&field5))
+                .expect("write block");
+            writer.flush().expect("flush");
+        }
+
+        let mut reader = BlobReader::new(Cursor::new(buf));
+        reader.set_parse_waymembers(true);
+        reader.next().expect("header blob").expect("read header");
+        let data = reader.next().expect("data blob").expect("read data");
+
+        assert_eq!(data.way_member_count(), Some(7), "encoded count preserved");
+        assert_eq!(
+            data.way_members().map(<[u8]>::len),
+            Some(1),
+            "the gap is invisible through the bitmap length",
+        );
+        let actual_ways = match data.decode().expect("decode") {
+            BlobDecode::OsmData(block) => block
+                .elements()
+                .filter(|e| matches!(e, crate::Element::Way(_)))
+                .count(),
+            other => panic!("expected OsmData, got {other:?}"),
+        };
+        assert_eq!(actual_ways, 8, "blob really carries 8 ways");
+        assert_ne!(
+            u32::try_from(actual_ways).expect("fits"),
+            data.way_member_count().expect("count"),
+            "the encoded-vs-actual count gap is detectable via way_member_count()",
+        );
+    }
 }

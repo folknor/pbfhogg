@@ -31,8 +31,8 @@ use super::super::Result;
 use super::radix::advise_dontneed_file;
 use super::radix::{NUM_BUCKETS, ScratchDir};
 use super::{
-    BucketLayout, ID_RECORD_SIZE, IdRecord, NodeBlobInfo, RESOLVED_ENTRY_SIZE, ResolvedEntry,
-    slot_bucket_bounds,
+    BucketLayout, CLOSURE_FLAG, ID_RECORD_SIZE, IdRecord, LOCAL_ID_MASK, NodeBlobInfo,
+    RESOLVED_ENTRY_SIZE, ResolvedEntry, slot_bucket_bounds,
 };
 use crate::scan::node::{NodeTuple, extract_node_tuples};
 
@@ -142,7 +142,9 @@ fn prepare_bucket(
     // Sort by local_node_id so the merge walk against ID-sorted node
     // tuples advances both pointers monotonically.
     let t_sort = std::time::Instant::now();
-    loader.records.sort_unstable_by_key(|r| r.local_node_id);
+    loader
+        .records
+        .sort_unstable_by_key(|r| r.local_node_id & LOCAL_ID_MASK);
     let sort_ms = t_sort.elapsed().as_millis() as u64;
 
     Ok(PreparedBucket {
@@ -229,6 +231,7 @@ pub(super) fn stage2_node_join(
     total_slots: u64,
     input_pbf: &Arc<std::fs::File>,
     node_blob_mapping: &[NodeBlobInfo],
+    inject_prepass: bool,
 ) -> Result<u64> {
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))
@@ -477,11 +480,17 @@ pub(super) fn stage2_node_join(
                                 .last()
                                 .and_then(|t| u64::try_from(t.id).ok());
                             let mut tuple_ptr = 0usize;
+                            // Pin decision cached for the current run of equal
+                            // masked ids. Records with the same id are
+                            // contiguous after the stage-2 sort and a run never
+                            // spans blobs, so the run is computed once at its
+                            // start and every record in it inherits the result.
+                            let mut run_pin_cache: Option<(u32, bool)> = None;
                             #[cfg(debug_assertions)]
                             let mut prev_tuple_id: Option<i64> = None;
                             while record_ptr < bkt.records.len() {
                                 let record = &bkt.records[record_ptr];
-                                let global_id = bucket_lo + u64::from(record.local_node_id);
+                                let global_id = bucket_lo + u64::from(record.local_node_id & LOCAL_ID_MASK);
                                 let upper = match blob_actual_upper {
                                     Some(u) => u,
                                     None => break,
@@ -524,9 +533,40 @@ pub(super) fn stage2_node_join(
                                         })?;
                                     let linear_slot_pos =
                                         blob_start + u64::from(record.blob_local_slot);
+                                    // Pin = the node is shared: it occurs in at
+                                    // least two non-closure ref positions. All
+                                    // occurrences of an id form one run, so the
+                                    // whole run is counted once (from its start)
+                                    // and every record inherits the decision -
+                                    // including the trailing closure ref, which
+                                    // mirrors bit 0 by construction.
+                                    let pin = if inject_prepass {
+                                        let masked = record.local_node_id & LOCAL_ID_MASK;
+                                        if run_pin_cache.map(|(m, _)| m) != Some(masked) {
+                                            let run_len = bkt.records[record_ptr..]
+                                                .iter()
+                                                .take_while(|c| {
+                                                    c.local_node_id & LOCAL_ID_MASK == masked
+                                                })
+                                                .count();
+                                            let unflagged = bkt.records
+                                                [record_ptr..record_ptr + run_len]
+                                                .iter()
+                                                .filter(|c| c.local_node_id & CLOSURE_FLAG == 0)
+                                                .count();
+                                            run_pin_cache = Some((masked, unflagged >= 2));
+                                        }
+                                        run_pin_cache.is_some_and(|(_, p)| p)
+                                    } else {
+                                        false
+                                    };
                                     let entry = ResolvedEntry {
                                         slot_pos: linear_slot_pos,
-                                        lat: tuple.lat,
+                                        lat: if inject_prepass {
+                                            (tuple.lat << 1) | i32::from(pin)
+                                        } else {
+                                            tuple.lat
+                                        },
                                         lon: tuple.lon,
                                     };
                                     let bucket = entry.slot_bucket(total_slots, slot_bucket_count);
@@ -536,7 +576,7 @@ pub(super) fn stage2_node_join(
                                     entry.write_to(bucket_start, &mut entry_buf);
                                     slot_bufs[bucket].extend_from_slice(&entry_buf);
                                     slot_counts[bucket] += 1;
-                                    if entry.lat != 0 || entry.lon != 0 {
+                                    if tuple.lat != 0 || tuple.lon != 0 {
                                         local_resolved += 1;
                                     }
                                     if slot_bufs[bucket].len() >= FLUSH_THRESHOLD {

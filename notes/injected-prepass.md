@@ -1,12 +1,23 @@
 # Injected prepass metadata: WayMembers-v1 + SharedNodePins-v1 (survey)
 
-Status: 2026-07-09 survey. Decisions 1 and 2 were RATIFIED 2026-07-10:
+Status: IMPLEMENTED 2026-07-11. Both cross-repo gates closed (Brick 1
+superset screen, D9 resolved-refs refinement) and the pbfhogg producer
+landed the same day: field-5/field-20 reader and writer layer, the
+external and sparse producers behind `--inject-prepass`, the oracle
+roundtrip and flag-hygiene tests, and
+[`ADR-0007`](../decisions/0007-injected-prepass-wire-extensions.md).
+Outstanding: the flag-ON planet benchmark verdict, blocked on the
+brokkr `--inject-prepass` passthrough flag (cross-repo,
+`~/Programs/brokkr`) and an explicit user green-light; the Brick 3/6
+on-disk-growth readings follow once that runs. Decisions 1 and
+2 were RATIFIED 2026-07-10:
 steady state is option (a) - altw moves into the daily loop and the
 production merge drops `--locations-on-ways` (recorded in
 `reference/pipeline.md`) - and injection is opt-in flag-gated with
 sparse parity. Decision 3 (the Brick 1 superset screen) and the D9
 refinement both CLOSED 2026-07-11 in pbfhogg's favor - see the dated
-entry below. The producer landings are unblocked.
+entry below. The producer landed the same day (see the status line
+above and the entry further down).
 
 **2026-07-11: the format/reader layer has landed** - `WireBlobHeader`
 field-5 parse/encode behind the `parse_waymembers` toggle,
@@ -52,8 +63,11 @@ verdicts recorded normatively in their `notes/injected-prepass-spec.md`
   compare is exercised end-to-end.
 
 The altw producer (relation-scan fusion, stage 1-4 pin computation, the
-`--inject-prepass` flag, sparse parity, oracle, benches) is therefore
-UNBLOCKED. Remaining prerequisites are pbfhogg-side only: the brokkr
+`--inject-prepass` flag, sparse parity, oracle) was therefore UNBLOCKED
+and **landed the same day** (external + sparse producers, CLI flag,
+oracle roundtrip test, flag-hygiene sweep; see
+[`ADR-0007`](../decisions/0007-injected-prepass-wire-extensions.md)).
+Remaining prerequisites are pbfhogg-side only: the brokkr
 `--inject-prepass` passthrough brick, and the flag-on planet bench
 green-light.
 

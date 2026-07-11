@@ -67,7 +67,9 @@ impl<'a> HeaderBuilder<'a> {
     ///
     /// Optional features (including `Sort.Type_then_ID`) are **not** copied -
     /// call [`.sorted()`](Self::sorted) explicitly if the output should declare
-    /// sorted order.
+    /// sorted order. This is deliberate hygiene: a command that rewrites way
+    /// payloads or way-blob headers without maintaining WayMembers-v1 and
+    /// SharedNodePins-v1 must not preserve their feature declarations.
     ///
     /// [`HeaderBlock`]: crate::HeaderBlock
     #[must_use]

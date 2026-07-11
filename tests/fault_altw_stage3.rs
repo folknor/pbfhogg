@@ -13,7 +13,9 @@ mod common;
 mod altw_external_stage3 {
     use std::sync::atomic::Ordering;
 
-    use pbfhogg::altw::{IndexType, add_locations_to_ways, external_test_hooks as altw_hooks};
+    use pbfhogg::altw::{
+        AltwOptions, IndexType, add_locations_to_ways, external_test_hooks as altw_hooks,
+    };
     use pbfhogg::writer::Compression;
 
     use crate::common::{
@@ -50,12 +52,15 @@ mod altw_external_stage3 {
             add_locations_to_ways(
                 &input,
                 &output,
-                /* direct_io */ false,
-                Compression::default(),
-                /* io_uring */ false,
-                /* force */ true,
+                &AltwOptions {
+                    keep_untagged_nodes: false,
+                    compression: Compression::default(),
+                    direct_io: false,
+                    force: true,
+                    index_type: IndexType::External,
+                    inject_prepass: false,
+                },
                 &pbfhogg::HeaderOverrides::default(),
-                IndexType::External,
             )
         }));
 

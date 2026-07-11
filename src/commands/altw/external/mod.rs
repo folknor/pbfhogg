@@ -107,8 +107,8 @@ impl BucketLayout {
         assert!(num_buckets > 0, "num_buckets must be > 0");
         let bw = bucket_width(max_node_id, num_buckets);
         assert!(
-            bw <= u64::from(u32::MAX),
-            "altw external: bucket_width {bw} exceeds u32::MAX \
+            bw <= (1_u64 << 30),
+            "altw external: bucket_width {bw} exceeds 1<<30 \
              (max_node_id={max_node_id}, num_buckets={num_buckets}); \
              local_node_id would no longer fit in u32",
         );
@@ -136,7 +136,7 @@ impl BucketLayout {
         let bucket_idx = raw_idx.min(self.num_buckets - 1);
         let bucket_lo = (bucket_idx as u64) * self.bucket_width;
         let offset = node_id - bucket_lo;
-        // For node_id <= max_node_id and bucket_width <= u32::MAX, the
+        // For node_id <= max_node_id and bucket_width <= 1<<30, the
         // last bucket can extend to max_node_id - bucket_lo. With
         // num_buckets * bucket_width >= max_node_id, that distance is
         // at most 2 * bucket_width - 1 < 2 * u32::MAX. u32::try_from
@@ -518,6 +518,11 @@ pub(super) struct IdRecord {
     pub(super) blob_local_slot: u32,
 }
 
+/// High bit in an [`IdRecord::local_node_id`] marks a trailing closed-ring
+/// reference. It is metadata, never part of the bucket-local node id.
+pub(super) const CLOSURE_FLAG: u32 = 0x8000_0000;
+pub(super) const LOCAL_ID_MASK: u32 = 0x7fff_ffff;
+
 #[allow(dead_code)] // wired up in step 2 (emission) and step 3 (consumption).
 impl IdRecord {
     pub(super) fn write_to(&self, buf: &mut [u8; ID_RECORD_SIZE]) {
@@ -650,7 +655,7 @@ pub(super) fn slot_bucket_bounds(
 /// Bounded memory (<1 GB), all sequential I/O. Uses ~224 GB temp disk at
 /// planet scale. See module docs for the algorithm.
 #[hotpath::measure]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn external_join(
     input: &Path,
     output: &Path,
@@ -659,6 +664,7 @@ pub fn external_join(
     direct_io: bool,
     force: bool,
     overrides: &HeaderOverrides,
+    inject_prepass: bool,
 ) -> Result<Stats> {
     let has_indexdata = require_indexdata(
         input,
@@ -750,7 +756,7 @@ pub fn external_join(
         |scope| -> std::result::Result<
             (
                 super::external::stage1::Stage1Output,
-                Option<crate::idset::IdSet>,
+                Option<relation_scan::RelationScanOutput>,
             ),
             String,
         > {
@@ -763,18 +769,21 @@ pub fn external_join(
                     bucket_layout_ref,
                     &ref_count_sidecar,
                     &per_way_refcount_sidecar,
+                    inject_prepass,
                 )
                 .map_err(|e| e.to_string())
             });
-            let rel_handle = if keep_untagged_nodes {
+            let rel_handle = if keep_untagged_nodes && !inject_prepass {
                 None
             } else {
                 crate::debug::emit_marker("EXTJOIN_RELATION_SCAN_START");
                 Some(scope.spawn(move || {
                     let t_relscan = std::time::Instant::now();
-                    let ids = relation_scan::collect_relation_member_node_ids_indexed(
+                    let ids = relation_scan::collect_relation_member_ids_indexed(
                         input_ref_parallel,
                         blob_meta_ref_parallel,
+                        !keep_untagged_nodes,
+                        inject_prepass,
                     )
                     .map_err(|e| e.to_string())?;
                     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
@@ -890,6 +899,7 @@ pub fn external_join(
         total_slots,
         &input_pbf,
         &node_blob_mapping,
+        inject_prepass,
     )?;
     slot_buckets.finish()?;
     let (s2_minflt_after, s2_majflt_after) = crate::debug::read_page_faults();
@@ -998,7 +1008,12 @@ pub fn external_join(
     let per_way_rcs_ref = &per_way_rcs;
     let blob_meta_ref = &blob_meta;
     let way_slot_starts_ref = way_slot_starts.as_slice();
-    let rel_ids_ref = relation_member_node_ids.as_ref();
+    let rel_ids_ref = relation_member_node_ids
+        .as_ref()
+        .and_then(|scan| scan.member_node_ids.as_ref());
+    let member_way_ids_ref = relation_member_node_ids
+        .as_ref()
+        .and_then(|scan| scan.member_way_ids.as_ref());
     let slot_bucket_ref_ref = &slot_bucket_ref;
 
     // Closures return Result<_, String> because BoxResult's error type
@@ -1011,6 +1026,7 @@ pub fn external_join(
                 way_slot_starts: way_slot_starts_ref,
                 per_way_rcs: per_way_rcs_ref,
                 router: router_ref,
+                inject_prepass,
             };
             let result = stage3_slot_reorder(
                 slot_bucket_ref_ref,
@@ -1037,6 +1053,8 @@ pub fn external_join(
                 way_slot_starts_ref,
                 keep_untagged_nodes,
                 rel_ids_ref,
+                member_way_ids_ref,
+                inject_prepass,
                 compression,
                 direct_io,
                 overrides,
@@ -1116,6 +1134,11 @@ pub fn external_join(
     // `stage2.rs` `is_resolved` comment and CORRECTNESS.md
     // "Null Island ambiguity in dense mmap index" for the rationale.
     stats.missing_locations = total_slots.saturating_sub(resolved_count);
+
+    if inject_prepass {
+        let member_ways = member_way_ids_ref.map_or(0, |set| set.iter().count() as u64);
+        super::inject_metrics::emit(member_ways);
+    }
 
     drop(scratch_dir);
 

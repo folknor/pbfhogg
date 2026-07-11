@@ -185,8 +185,12 @@ enum Command {
     /// Produce a valid-but-adversarial PBF by stripping properties or
     /// perturbing structure.
     ///
-    /// Each flag composes; at least one is required. v1 supports
-    /// `--unsort`, `--strip-locations`, `--strip-indexdata`. Used to
+    /// At least one flag is required, and flags compose - except
+    /// `--unsort` and `--unsort-intra`, which are mutually exclusive (they
+    /// request opposite blob shapes). Supports `--unsort`, `--unsort-intra`,
+    /// `--strip-locations`, `--strip-indexdata`. Both unsort modes perturb
+    /// exactly one same-kind pair per kind that has more than `block_cap`
+    /// elements; kinds with fewer elements pass through unchanged. Used to
     /// produce inputs for benchmarking non-optimal code paths
     /// (`sort` overlap-rewrite, `add-locations-to-ways`, `--force`
     /// fallbacks).
@@ -195,10 +199,16 @@ enum Command {
         file: PathBuf,
         #[command(flatten)]
         output: OutputArg,
-        /// Clear `Sort.Type_then_ID`; perturb the element stream so at
-        /// least one adjacent same-kind blob pair has overlapping IDs.
-        #[arg(long)]
+        /// Clear `Sort.Type_then_ID`; pack blobs to the cap so exactly one
+        /// adjacent same-kind blob pair per kind has overlapping ID ranges
+        /// (cross-blob overlap). Fires `sort`'s overlap-rewrite path.
+        #[arg(long, conflicts_with = "unsort_intra")]
         unsort: bool,
+        /// Clear `Sort.Type_then_ID`; leave one same-kind blob per kind with
+        /// an internal ID-order inversion but non-overlapping blob ranges
+        /// (intra-blob shape for `sort`'s monotonicity blind spot).
+        #[arg(long = "unsort-intra")]
+        unsort_intra: bool,
         /// Drop inline way-node coordinates (`LocationsOnWays`).
         #[arg(long)]
         strip_locations: bool,
@@ -874,6 +884,7 @@ fn main() -> process::ExitCode {
                 file,
                 output,
                 unsort,
+                unsort_intra,
                 strip_locations,
                 strip_indexdata,
                 block_cap,
@@ -886,6 +897,7 @@ fn main() -> process::ExitCode {
                 &file,
                 &output.output,
                 unsort,
+                unsort_intra,
                 strip_locations,
                 strip_indexdata,
                 block_cap,
@@ -1718,6 +1730,7 @@ fn run_degrade(
     file: &std::path::Path,
     output: &std::path::Path,
     unsort: bool,
+    unsort_intra: bool,
     strip_locations: bool,
     strip_indexdata: bool,
     block_cap: usize,
@@ -1730,6 +1743,7 @@ fn run_degrade(
     let compression: Compression = compression.parse()?;
     let flags = pbfhogg::degrade::DegradeFlags {
         unsort,
+        unsort_intra,
         strip_locations,
         strip_indexdata,
     };

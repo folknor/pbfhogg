@@ -16,6 +16,7 @@ CLI: `pbfhogg degrade`.
 
 ```
 pbfhogg degrade <input> -o <output> [--unsort]
+                                     [--unsort-intra]
                                      [--strip-locations]
                                      [--strip-indexdata]
                                      [--force]
@@ -25,13 +26,17 @@ pbfhogg degrade <input> -o <output> [--unsort]
                                      [--output-header ...]
 ```
 
-Flags compose; at least one transformation flag is required. The CLI
-also exposes a hidden `--block-cap N` so the test suite can exercise
-the `--unsort` swap on small fixtures (production runs use the default
-8000). `--force` skips the indexdata precondition required by the
-decode path's per-kind classify pipeline (without indexdata, every
-classify schedule includes every blob, so each blob is decoded by
-each phase).
+Flags compose, except `--unsort` and `--unsort-intra`, which are
+mutually exclusive (they request opposite blob shapes); at least one
+transformation flag is required. The CLI also exposes a hidden
+`--block-cap N` so the test suite can exercise the unsort swaps on
+small fixtures (production runs use the default 8000). `--unsort-intra`
+requires `--block-cap >= 2` (a cap of 1 cannot hold two same-kind
+elements in one output block, so the intra-blob inversion is
+impossible); `--unsort` accepts any `--block-cap >= 1`. `--force`
+skips the indexdata precondition required by the decode path's
+per-kind classify pipeline (without indexdata, every classify schedule
+includes every blob, so each blob is decoded by each phase).
 
 ### Implementation paths
 
@@ -119,7 +124,35 @@ ranges, exactly one such pair per kind that has more than `block_cap +
 This is the minimum perturbation that gets `sort` to dispatch to the
 overlap-rewrite path without chaos-ifying the file. The two output
 blocks are still internally ID-monotone; only the inter-blob ordering
-breaks.
+breaks. Achievable for any `block_cap >= 1` (at cap 1 the two adjacent
+single-element blobs overlap directly).
+
+#### `--unsort-intra`
+
+Clears `Sort.Type_then_ID` from the output header. Produces the
+opposite adversarial shape from `--unsort`: exactly one same-kind blob
+per kind carries an internal ID-order inversion, but every blob's ID
+range stays disjoint from its neighbours'. `sort`'s `detect_overlaps`
+(which compares adjacent blobs' `(min_id, max_id)` ranges) therefore
+sees nothing to fix even though the stream is genuinely out of order -
+the intra-blob monotonicity blind spot.
+
+- Swap the first two same-kind elements to arrive (hold element #1,
+  re-inject it after element #2). Both land at the start of the first
+  output block (positions 1 and 2), so the descending step sits well
+  inside a blob, away from any block boundary.
+- Because the swap is keyed to the start of the stream rather than the
+  cap boundary, it stays intra-blob for any `block_cap >= 2`,
+  independent of where input- or output-blob boundaries fall - in
+  particular even when a single input blob carries more than
+  `block_cap` same-kind elements. (Keying the swap to the cap boundary,
+  the way `--unsort` does, would fill and flush an output block there
+  and produce the cross-blob shape instead; that was the pre-fix bug.)
+
+Requires `block_cap >= 2`: a cap of 1 puts every element in its own
+blob, so no blob can hold the two elements an intra-blob inversion
+needs. `degrade` rejects `--unsort-intra --block-cap 1` up front rather
+than clearing `Sort.Type_then_ID` and emitting an untouched stream.
 
 #### `--strip-locations`
 
@@ -145,7 +178,8 @@ header flag, and `LocationsOnWays` when the input declared them.
 
 On the decode path: element IDs, tags, refs, members, OsmMetadata,
 DenseNode encoding. `Sort.Type_then_ID` is preserved unless `--unsort`
-clears it. `LocationsOnWays` is dropped by `BlockBuilder` as on every
+or `--unsort-intra` clears it. `LocationsOnWays` is dropped by
+`BlockBuilder` as on every
 other decode-path command in pbfhogg (`repack`, `sort`, `tags-filter`,
 etc.); `--strip-locations` makes the loss explicit.
 
@@ -197,52 +231,79 @@ the deferred-optimization motivation in
 - `degrade_strip_locations_clears_low_and_preserves_elements` -
   output header has no `LocationsOnWays`; element data round-trips.
 - `degrade_unsort_creates_adjacent_overlap_per_kind` - output header
-  has no `Sort.Type_then_ID`; for each kind at least one adjacent
-  same-kind blob pair has overlapping ID ranges; element multiset
-  round-trips.
+  has no `Sort.Type_then_ID`; each kind has exactly one adjacent
+  same-kind blob pair with overlapping ID ranges and zero intra-blob
+  inversions; element multiset round-trips.
+- `degrade_unsort_intra_creates_intra_blob_inversion` - output header
+  has no `Sort.Type_then_ID`; each kind has exactly one intra-blob
+  inversion and zero cross-blob overlaps; element multiset round-trips.
+- `degrade_unsort_intra_large_input_blobs_stay_intra_blob` - the
+  finding-1 regime: input packed at 20 elements/blob, cap 5, so one
+  input blob spans four output blocks. `--unsort-intra` still yields
+  the intra-blob shape (the old cap-boundary swap produced cross-blob
+  overlap here).
+- `degrade_unsort_and_unsort_intra_are_mutually_exclusive` -
+  validation: the two unsort modes cannot be combined.
 - `degrade_unsort_then_sort_round_trips` - the design's primary
-  consumer loop: `degrade --unsort` then `pbfhogg sort` recovers
-  the original element set with `Sort.Type_then_ID` re-declared.
+  consumer loop: `degrade --unsort` then `pbfhogg sort`. Asserts sort's
+  stderr reports blobs in overlap runs (the overlap-rewrite path fired,
+  not passthrough), the resorted file is monotone in blob order
+  (`assert_sorted_file`, which - unlike `read_normalized` - does not
+  re-sort before checking), and the original element set is recovered.
 - `degrade_unsort_and_strip_indexdata_compose` - composition test:
   output is unsorted *and* unindexed.
+- `degrade_unsort_and_strip_locations_compose` /
+  `degrade_unsort_intra_and_strip_locations_compose` - each unsort mode
+  keeps its blob shape while `LocationsOnWays` is cleared.
+- `degrade_unsort_intra_and_strip_indexdata_compose` - intra-blob
+  unsorted *and* unindexed.
 - `degrade_requires_at_least_one_flag` - validation: no flags is a
   hard error.
 - `degrade_rejects_zero_block_cap` - validation: `--block-cap 0`
   is a hard error.
+- `degrade_unsort_intra_rejects_block_cap_one` - validation:
+  `--unsort-intra --block-cap 1` is a hard error (intra shape
+  impossible at cap 1).
+- `degrade_unsort_accepts_block_cap_one` - `--unsort --block-cap 1`
+  is supported and still yields the one-overlap-per-kind shape.
 
-Combination matrix beyond the explicit composition test is implicit:
-the decode path's flush is routed through a single helper that
-respects `--strip-indexdata`, so any pairing of decode-path flags
-gets the right framing.
+Each unsort-mode composition test reuses the same shape helpers
+(`assert_unsort_cross_blob_shape` / `assert_unsort_intra_shape`), so a
+regression in the swap logic surfaces under every flag pairing, not
+just the standalone case.
 
-## Known bugs
+## Fixed
 
-### `--unsort` produces intra-blob disorder, not the documented cross-blob overlap (found 2026-07-10)
+### `--unsort` produced intra-blob disorder instead of cross-blob overlap (found 2026-07-10, fixed 2026-07-11)
 
-The design intent (doc comment at the top of `mod.rs`): swap two
-adjacent same-kind elements at a block boundary so two adjacent output
-blobs get overlapping ID ranges - the minimum perturbation that fires
-`sort`'s `detect_overlaps`. What actually happens: the merge loop's
-sort-preservation flush (the `if !bb.is_empty()` block at the top of
-the per-worker-output consume step in `run_kind_phase`) flushes the
-central builder at EVERY input-blob boundary, so output blocks mirror
-input blobs (~7,998 elements on Geofabrik input, never reaching the
-8,000 cap). The cap-keyed swap of global elements #8000/#8001 then
-lands entirely inside output blob 2 (which spans elements
-#7,999..#15,996): an intra-blob inversion with non-overlapping blob
-ranges. `detect_overlaps` correctly returns 0 and sort passes the
-whole file through (verified: run `f5cd6522`, `sort_blobs_overlap=0`,
-`sort_blobs_passthrough=7399`, one `copy_file_range` for the whole
-file). `unsort_fired=true` reports success misleadingly.
+The merge loop's sort-preservation flush fired at every input-blob
+boundary, so the central builder never spanned input blobs. On
+Geofabrik input (~7,998 elements/blob, below the 8,000 cap) the
+cap-keyed swap of global elements #8000/#8001 landed entirely inside
+one output blob - an intra-blob inversion with non-overlapping blob
+ranges. `detect_overlaps` returned 0 and `sort` passed the whole file
+through, so its overlap-rewrite path had never actually run on real
+unsorted data despite `unsort_fired=true` reporting success (run
+`f5cd6522`: `sort_blobs_overlap=0`, full passthrough).
 
-Fix options: (a) suppress the boundary flush under `--unsort` so the
-central builder packs to cap and the swap straddles a builder boundary
-as designed (small change; output blob counts become exact-8000
-packed); (b) key the swap to actual output-blob boundaries instead of
-a global element counter. Either way, keep the accidental shape too -
-it exposed a real sort blind spot (see `notes/sort.md` "Intra-blob
-disorder" finding) - e.g. as a new `--unsort-intra` flag, so degrade
-can produce BOTH adversarial shapes deliberately.
+Fix (option (a) plus the deliberate second shape):
+
+- `--unsort` now suppresses the boundary flush (`suppress_boundary_flush`),
+  so the central builder packs continuously to `block_cap` and the
+  cap-boundary swap straddles a genuine output-blob boundary
+  (cross-blob overlap, as designed).
+- The old intra-blob shape is preserved as the new `--unsort-intra`
+  flag, which keys its swap to the first two same-kind elements rather
+  than the cap boundary. That placement is robustly intra-blob for any
+  `block_cap >= 2`, independent of input blob size - fixing the further
+  bug that a large input blob (more than `block_cap` same-kind
+  elements) would have made the shared cap-boundary swap produce
+  cross-blob overlap instead.
+
+Remaining follow-up (pending, run by the orchestrator): regenerate the
+`unsorted` snapshot with `degrade --unsort --as-snapshot unsorted
+--replace-snapshot`, then `verify sort --snapshot unsorted` as the
+overlap-rewrite correctness gate.
 
 ## v2 scope
 

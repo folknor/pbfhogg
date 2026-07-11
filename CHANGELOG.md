@@ -47,6 +47,17 @@
   changeset, uid, user - previously version only), matching osmium's OSC
   writer and making the derive -> apply roundtrip metadata-lossless
   end-to-end. Attributes absent from the source element are omitted.
+- **`degrade --unsort` now produces the documented cross-blob overlap.**
+  It previously emitted an intra-blob inversion with non-overlapping blob
+  ranges, so `sort`'s overlap-rewrite path never fired on the output.
+  `--unsort` now packs output blobs continuously to the cap so the swap
+  straddles a real blob boundary; the two adjacent blobs' ID ranges
+  overlap as intended. The former intra-blob shape is available as the
+  new `--unsort-intra` flag (mutually exclusive with `--unsort`), which
+  keys its swap to the first two same-kind elements so it stays
+  intra-blob regardless of input blob size. `--unsort-intra` requires
+  `--block-cap >= 2`; a cap of 1 is now a hard error there instead of a
+  silent no-op that still cleared `Sort.Type_then_ID`.
 
 ### Dependencies
 

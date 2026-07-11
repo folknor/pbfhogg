@@ -3,8 +3,9 @@
 //! code paths that require less-optimised inputs (unsorted, missing
 //! indexdata, scattered coords).
 //!
-//! v1 transformations: `--unsort`, `--strip-locations`, `--strip-indexdata`.
-//! Flags compose.
+//! v1 transformations: `--unsort`, `--unsort-intra`, `--strip-locations`,
+//! `--strip-indexdata`. Flags compose (except the two unsort modes, which
+//! are mutually exclusive).
 //!
 //! Implementation paths:
 //!
@@ -12,22 +13,44 @@
 //!   reframed with a cleared `BlobHeader.indexdata` field. Blob bytes
 //!   are bit-identical; only the header changes. Mirrors `cat`'s
 //!   passthrough but drops the index instead of adding one.
-//! - Decode path (`--unsort` and/or `--strip-locations`): three sequential
-//!   per-kind phases driven by `parallel_classify_phase`. Workers decode
-//!   one input blob, filter to the current kind, and re-encode. Without
-//!   `--unsort`, workers pre-frame full cap-sized blocks (parallel
-//!   re-encode) and ship the trailing `M%cap` elements as `Owned*` to a
-//!   merge thread that flushes a central `BlockBuilder` between input
-//!   blobs (sort preserved). Under `--unsort`, workers ship every
-//!   element as `Owned*` so the merge thread can apply the cap-1 swap
-//!   per kind in a serial state machine.
+//! - Decode path (either unsort mode and/or `--strip-locations`): three
+//!   sequential per-kind phases driven by `parallel_classify_phase`.
+//!   Workers decode one input blob, filter to the current kind, and
+//!   re-encode. Without an unsort mode, workers pre-frame full cap-sized
+//!   blocks (parallel re-encode) and ship the trailing `M%cap` elements
+//!   as `Owned*` to a merge thread that flushes a central `BlockBuilder`
+//!   between input blobs (sort preserved). Under either unsort mode,
+//!   workers ship every element as `Owned*` so the merge thread can
+//!   apply the cap-1 swap per kind in a serial state machine.
 //!
-//! `--unsort` swaps two adjacent same-kind elements at the first
-//! `BlockBuilder` cap boundary (per kind), so adjacent output blobs of
-//! that kind have overlapping ID ranges. This is the minimum
-//! perturbation that makes `sort`'s `detect_overlaps` flag the file -
-//! enough to trigger the overlap-rewrite path without chaos-ifying
-//! every blob.
+//! Both unsort modes clear `Sort.Type_then_ID` and swap one adjacent
+//! same-kind element pair per kind. They differ in which pair is swapped,
+//! which decides whether the disorder lands across an output-blob
+//! boundary or inside a single blob:
+//!
+//! - `--unsort` (cross-blob overlap): swaps the pair straddling the
+//!   `block_cap` boundary (elements #block_cap and #block_cap+1). The
+//!   per-input-blob boundary flush is suppressed, so the central
+//!   `BlockBuilder` packs continuously to `block_cap`: the newer element
+//!   fills and flushes the current output block, and the held
+//!   smaller-id element opens the next one. The result is exactly one
+//!   adjacent same-kind blob pair per kind whose indexdata ID ranges
+//!   overlap - the minimum perturbation that makes `sort`'s
+//!   `detect_overlaps` dispatch to the overlap-rewrite path. The two
+//!   output blobs stay internally ID-monotone. Valid for any
+//!   `block_cap >= 1`.
+//! - `--unsort-intra` (intra-blob inversion): swaps the first two
+//!   same-kind elements. That pair always lands at the start of the
+//!   first output block (positions 1 and 2), so the descending step
+//!   sits inside a blob for any `block_cap >= 2` - independent of where
+//!   input- or output-blob boundaries fall, and in particular even when
+//!   one input blob carries more than `block_cap` same-kind elements.
+//!   Blob ID ranges stay non-overlapping, so `detect_overlaps` returns
+//!   zero - this is the adversarial shape for `sort`'s intra-blob
+//!   monotonicity blind spot (a blob internally unsorted but
+//!   range-disjoint passes straight through while the header still
+//!   claims sortedness). Requires `block_cap >= 2`; a cap of 1 cannot
+//!   hold two same-kind elements in one block and is rejected up front.
 
 use std::path::Path;
 
@@ -64,20 +87,41 @@ const FRAME_BATCH: usize = 32;
 /// Set of degradations to apply. At least one flag must be set.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DegradeFlags {
+    /// Cross-blob unsort: adjacent same-kind blobs get overlapping ID ranges.
     pub unsort: bool,
+    /// Intra-blob unsort: one same-kind blob gets an internal ID inversion.
+    pub unsort_intra: bool,
     pub strip_locations: bool,
     pub strip_indexdata: bool,
 }
 
 impl DegradeFlags {
     pub fn any(self) -> bool {
-        self.unsort || self.strip_locations || self.strip_indexdata
+        self.unsort || self.unsort_intra || self.strip_locations || self.strip_indexdata
     }
 
     /// Returns `true` if elements must be decoded and re-encoded. Only
     /// `--strip-indexdata` alone can run as a pure blob-level passthrough.
     fn needs_decode(self) -> bool {
-        self.unsort || self.strip_locations
+        self.unsort || self.unsort_intra || self.strip_locations
+    }
+
+    /// Either unsort mode: workers ship every matching element as `Owned*`,
+    /// the merge thread runs the cap-1 swap state machine, and the output
+    /// header's `Sort.Type_then_ID` flag is cleared.
+    fn unsort_any(self) -> bool {
+        self.unsort || self.unsort_intra
+    }
+
+    /// Cross-blob `--unsort` suppresses the per-input-blob boundary flush so
+    /// the central `BlockBuilder` packs to `block_cap` and the swap straddles
+    /// a genuine output-blob boundary (adjacent blobs overlap). Every other
+    /// mode - including `--unsort-intra` - keeps the flush so output blobs
+    /// mirror input blobs. (`--unsort-intra`'s swap is confined to a single
+    /// blob by its hold-at-position-1 placement, not by the flush, so it
+    /// stays intra-blob regardless of input blob sizes.)
+    fn suppress_boundary_flush(self) -> bool {
+        self.unsort
     }
 }
 
@@ -93,6 +137,9 @@ impl DegradeStats {
         let mut applied: Vec<&str> = Vec::new();
         if self.flags.unsort {
             applied.push("--unsort");
+        }
+        if self.flags.unsort_intra {
+            applied.push("--unsort-intra");
         }
         if self.flags.strip_locations {
             applied.push("--strip-locations");
@@ -133,16 +180,38 @@ pub fn degrade(
 ) -> Result<DegradeStats> {
     if !flags.any() {
         return Err("degrade requires at least one transformation flag \
-                    (--unsort, --strip-locations, --strip-indexdata)"
+                    (--unsort, --unsort-intra, --strip-locations, --strip-indexdata)"
             .into());
+    }
+    if flags.unsort && flags.unsort_intra {
+        return Err(
+            "--unsort and --unsort-intra are mutually exclusive: --unsort \
+                    produces cross-blob ID-range overlap, --unsort-intra produces \
+                    an intra-blob inversion"
+                .into(),
+        );
     }
     if block_cap == 0 {
         return Err("--block-cap must be > 0".into());
+    }
+    // An intra-blob inversion needs two same-kind elements sitting inside
+    // one output block. A cap of 1 puts every element in its own block, so
+    // the requested shape is impossible - reject it rather than silently
+    // clearing Sort.Type_then_ID and emitting an untouched (still-monotone)
+    // stream. `--unsort` (cross-blob overlap) IS achievable at cap 1: two
+    // adjacent single-element blobs with a descending step overlap, so it
+    // stays supported.
+    if flags.unsort_intra && block_cap < 2 {
+        return Err("--unsort-intra needs --block-cap >= 2: an intra-blob \
+                    inversion requires at least two same-kind elements inside \
+                    one output block, which a cap of 1 cannot hold"
+            .into());
     }
 
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("degrade_unsort", i64::from(flags.unsort));
+        crate::debug::emit_counter("degrade_unsort_intra", i64::from(flags.unsort_intra));
         crate::debug::emit_counter("degrade_strip_locations", i64::from(flags.strip_locations));
         crate::debug::emit_counter("degrade_strip_indexdata", i64::from(flags.strip_indexdata));
         crate::debug::emit_counter("degrade_block_cap", block_cap as i64);
@@ -244,6 +313,7 @@ fn degrade_passthrough_strip_indexdata(
         elements_written: 0,
         flags: DegradeFlags {
             unsort: false,
+            unsort_intra: false,
             strip_locations: false,
             strip_indexdata: true,
         },
@@ -277,12 +347,12 @@ fn reframe_raw_without_index(
 }
 
 // ---------------------------------------------------------------------------
-// Decode path: --unsort and/or --strip-locations (with optional --strip-indexdata)
+// Decode path: --unsort / --unsort-intra and/or --strip-locations (with optional --strip-indexdata)
 // ---------------------------------------------------------------------------
 
 /// Trailing-partial payload: 0 to `cap-1` elements that didn't fill a
-/// full output block in the worker. Under `--unsort` workers pack every
-/// matching element here so the merge thread can apply the swap.
+/// full output block in the worker. Under either unsort mode workers pack
+/// every matching element here so the merge thread can apply the swap.
 enum KindPayload {
     Nodes(Vec<OwnedNode>),
     Ways(Vec<OwnedWay>),
@@ -308,37 +378,57 @@ impl KindPayload {
 }
 
 /// One worker's output for one input blob: framed full blocks plus the
-/// trailing partial. Under `--unsort`, `full_framed` is always empty.
+/// trailing partial. Under either unsort mode, `full_framed` is always empty.
 struct WorkerOutput {
     full_framed: Vec<Vec<u8>>,
     tail: KindPayload,
 }
 
-/// Per-kind unsort state held on the merge thread. Mirrors the v1
-/// inline state machine but scoped to one kind's phase.
+/// Per-kind unsort state held on the merge thread. Holds one element at
+/// the 1-based arrival position `hold_at` and re-injects it one element
+/// later, producing a single adjacent-pair swap per kind.
+///
+/// The two modes differ only in `hold_at`, which decides where the swap
+/// lands:
+///
+/// - `--unsort` (cross-blob overlap): `hold_at = block_cap`. With the
+///   boundary flush suppressed the central builder packs to `block_cap`,
+///   so the newer element fills and flushes the current output block and
+///   the held smaller-id element opens the next one - the two blobs'
+///   ID ranges overlap. Reachable for any `block_cap >= 1`.
+/// - `--unsort-intra` (intra-blob inversion): `hold_at = 1`. The swap
+///   fires on the first two same-kind elements, which always land at the
+///   start of the first output block (positions 1 and 2), so the
+///   descending step sits inside a blob for any `block_cap >= 2`. This is
+///   independent of input/output blob boundaries, so it stays intra-blob
+///   even when one input blob carries more than `block_cap` same-kind
+///   elements.
 struct UnsortKindState {
     held: Option<OwnedElement>,
     seen: u64,
     fired: bool,
-    cap: u64,
+    hold_at: u64,
 }
 
 impl UnsortKindState {
-    fn new(cap: usize) -> Self {
+    fn new(flags: DegradeFlags, cap: usize) -> Self {
+        // block_cap validation upstream guarantees hold_at is reachable:
+        // >= 1 for --unsort, >= 2 for --unsort-intra.
+        let hold_at = if flags.unsort_intra { 1 } else { cap as u64 };
         Self {
             held: None,
             seen: 0,
             fired: false,
-            cap: cap as u64,
+            hold_at,
         }
     }
 
     fn should_hold(&self) -> bool {
-        self.cap >= 2 && self.seen + 1 == self.cap
+        self.held.is_none() && !self.fired && self.seen + 1 == self.hold_at
     }
 
     fn should_inject_after(&self) -> bool {
-        self.cap >= 2 && self.seen + 1 == self.cap + 1 && self.held.is_some()
+        self.seen + 1 == self.hold_at + 1 && self.held.is_some()
     }
 }
 
@@ -382,7 +472,7 @@ fn degrade_decode_path(
         reader.header().clone()
     };
 
-    let preserve_sorted = !flags.unsort && header.is_sorted();
+    let preserve_sorted = !flags.unsort_any() && header.is_sorted();
     let header_bytes = build_output_header(&header, preserve_sorted, overrides, |hb| hb)?;
     let mut writer =
         writer_from_header_bytes(output, compression, &header_bytes, direct_io, io_uring)?;
@@ -463,11 +553,16 @@ struct PhaseStats {
     unsort_fired: bool,
 }
 
-/// Run one per-kind phase. Workers decode + filter + (when not `--unsort`)
-/// pre-frame full cap-multiples; the merge thread writes them in seq
+/// Run one per-kind phase. Workers decode + filter + (when not an unsort
+/// mode) pre-frame full cap-multiples; the merge thread writes them in seq
 /// order, flushing the central `BlockBuilder` between input blobs to
-/// keep IDs ascending. Under `--unsort` workers ship every matching
-/// element as `Owned*` so the merge thread can run the cap-1 swap.
+/// keep IDs ascending. Under either unsort mode workers ship every
+/// matching element as `Owned*` so the merge thread can run the
+/// adjacent-pair swap. `--unsort` additionally suppresses the boundary
+/// flush so the central builder packs to cap and the swap straddles a real
+/// output-blob boundary (cross-blob overlap); `--unsort-intra` keeps the
+/// flush and swaps the first two same-kind elements, so the inversion
+/// stays inside the first output block (intra-blob inversion).
 #[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn run_kind_phase(
@@ -495,7 +590,7 @@ fn run_kind_phase(
     let mut bb = BlockBuilder::with_element_cap(block_cap);
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut pending: Vec<OwnedBlock> = Vec::with_capacity(FRAME_BATCH);
-    let mut unsort = UnsortKindState::new(block_cap);
+    let mut unsort = UnsortKindState::new(flags, block_cap);
 
     let mut blobs: u64 = 0;
     let mut elements: u64 = 0;
@@ -529,7 +624,18 @@ fn run_kind_phase(
                 // belongs to a strictly lower ID range than the next
                 // blob's full frames; flushing now keeps the output
                 // monotone. Empty central is a no-op.
-                if !bb.is_empty() {
+                //
+                // `--unsort` suppresses this flush so the central builder
+                // packs continuously to cap across input blobs and the
+                // boundary swap straddles a real output-blob boundary
+                // (cross-blob overlap). `--unsort-intra` and every plain
+                // decode-path mode keep the flush so output blobs mirror
+                // input blobs, which preserves sort order for
+                // `--strip-locations`. (`--unsort-intra` stays intra-blob
+                // because it swaps the first two same-kind elements, which
+                // always land inside the first output block - not because
+                // of this flush.)
+                if !flags.suppress_boundary_flush() && !bb.is_empty() {
                     if let Err(e) = flush_local(&mut bb, &mut output) {
                         classify_error.get_or_insert(e);
                         continue;
@@ -567,7 +673,7 @@ fn run_kind_phase(
                     continue;
                 }
 
-                let consume_res: std::result::Result<(), String> = if flags.unsort {
+                let consume_res: std::result::Result<(), String> = if flags.unsort_any() {
                     feed_tail_unsort(tail, &mut unsort, &mut bb, &mut output)
                 } else {
                     feed_tail_plain(tail, &mut bb, &mut output)
@@ -626,8 +732,8 @@ fn run_kind_phase(
 }
 
 /// Worker body: decode + filter to one kind, optionally pre-frame full
-/// cap-multiples, ship the trailing partial as owned data. Under
-/// `--unsort` everything goes into the tail so the merge thread can
+/// cap-multiples, ship the trailing partial as owned data. Under either
+/// unsort mode everything goes into the tail so the merge thread can
 /// apply the cap-1 swap.
 #[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
@@ -654,9 +760,9 @@ fn worker_decode_kind(
         _ => return Err(format!("invalid kind constant: {kind}")),
     };
 
-    // Under --unsort the merge thread must see every element in order to
-    // apply the cap-1 swap, so workers ship everything as tail.
-    let (full_count, tail_size) = if flags.unsort {
+    // Under either unsort mode the merge thread must see every element in
+    // order to apply the cap-1 swap, so workers ship everything as tail.
+    let (full_count, tail_size) = if flags.unsort_any() {
         (0usize, total)
     } else {
         let tail = total % cap;
@@ -765,9 +871,12 @@ fn worker_decode_kind(
     Ok(WorkerOutput { full_framed, tail })
 }
 
-/// Feed an entire `--unsort` tail into the central builder, applying the
-/// per-kind cap-1 swap. Elements are moved out of the tail (no clones).
-/// Mid-stream cap fires append blocks to `output`.
+/// Feed an entire unsort-mode tail into the central builder, applying the
+/// per-kind adjacent-pair swap. Elements are moved out of the tail (no
+/// clones). Mid-stream cap fires append blocks to `output`. Shared by
+/// `--unsort` and `--unsort-intra`; the two differ only in `hold_at` (the
+/// arrival position of the held element) and in whether the merge loop
+/// flushes the central builder at input-blob boundaries.
 fn feed_tail_unsort(
     tail: KindPayload,
     unsort: &mut UnsortKindState,

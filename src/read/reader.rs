@@ -1,16 +1,17 @@
 //! High level reader interface
 
-use super::blob::{Blob, BlobDecode, BlobReader, BlobType};
+use super::blob::{Blob, BlobDecode, BlobReader, BlobType, DecompressPool};
 use super::block::{HeaderBlock, PrimitiveBlock};
 use super::elements::Element;
 use super::file_reader::FileReader;
 use super::pipeline::PipelineConfig;
 use crate::blob_meta::BlobFilter;
 use crate::error::{ErrorKind, Result, new_error};
-use rayon::prelude::*;
+use std::collections::VecDeque;
 use std::io::Read;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, sync_channel};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 
 /// Number of decoded blocks buffered between the pipeline and the consumer iterator.
@@ -308,22 +309,23 @@ impl<R: Read + Send> ElementReader<R> {
     /// necessary. The number of times that this identity value is inserted should not alter the
     /// result.
     ///
-    /// **Note:** Elements are delivered in arbitrary order across rayon worker threads.
+    /// **Note:** Elements are delivered in arbitrary order across worker threads.
     /// The [`Sort.Type_then_ID`](HeaderBlock::is_sorted) ordering guarantee does **not**
     /// apply to this method. Use [`for_each`](Self::for_each) or
     /// [`for_each_pipelined`](Self::for_each_pipelined) if you need sorted element order.
     ///
     /// # Memory
     ///
-    /// This method collects **all** compressed blobs into memory before parallel
-    /// processing. Memory usage is approximately equal to the PBF file size
-    /// (compressed blobs are ~16-64 KB each). For a planet file (~80 GB), this
-    /// requires ~80 GB of RAM for the blob collection alone, plus one decoded
-    /// block (~1.4 MB) per rayon worker thread.
-    ///
-    /// For memory-constrained environments processing large files, use
-    /// [`for_each_pipelined`](Self::for_each_pipelined) instead, which streams
-    /// blocks through a bounded channel with constant memory overhead.
+    /// One-pass and byte-bounded: the calling thread pumps compressed blobs
+    /// from the file into count- and byte-bounded batches, admitting each blob
+    /// against a fixed 256 MiB in-flight byte budget before reading further.
+    /// Long-lived decode/map workers each fold into a
+    /// single worker-local `T`; the caller then reduces at most one partial per
+    /// worker. Total reader working set stays well under 2 GiB regardless of
+    /// file size - even with pathological 32 MiB blobs - because nothing
+    /// accumulates the whole file. This is the key difference from a
+    /// collect-everything-then-decode design, which pinned ~1x the file size in
+    /// compressed blobs and OOM-killed at planet scale.
     ///
     /// # Errors
     /// Returns the first Error encountered while parsing the PBF structure.
@@ -352,69 +354,6 @@ impl<R: Read + Send> ElementReader<R> {
     /// # }
     /// # foo().unwrap();
     /// ```
-    //
-    // ## Implementation: batch-collect + into_par_iter
-    //
-    // ### Why not par_bridge()?
-    //
-    // The previous implementation used `par_bridge()` to parallelize iteration
-    // over the sequential `BlobReader`. Rayon's `par_bridge()` wraps the
-    // sequential iterator with a `Mutex`, and every rayon worker thread must
-    // acquire that lock to pull the next item. At high parallelism (8+ cores),
-    // this single-lock contention becomes a significant bottleneck: threads
-    // spend time spinning/blocking on the mutex instead of doing useful decode
-    // work. Profiling shows this contention dominates at high core counts,
-    // limiting scalability.
-    //
-    // ### Why batch-collect is better
-    //
-    // Instead, we split the work into two phases:
-    //
-    //   Phase 1 (sequential): Iterate the BlobReader and collect all OsmData
-    //   blobs into a Vec<Blob>. This is cheap because blobs at this stage are
-    //   still compressed -- typically 16-64KB each. The I/O and collection is
-    //   inherently sequential (single stream), but the per-blob cost is just
-    //   reading + a small protobuf header parse, no decompression.
-    //
-    //   Phase 2 (parallel): Use `into_par_iter()` on the Vec for lock-free
-    //   parallel decode + map + reduce. Rayon splits the Vec into contiguous
-    //   chunks and assigns them to worker threads with zero synchronization
-    //   overhead -- no mutex, no atomic contention. Each thread independently
-    //   decompresses, parses protobuf, and applies the map/reduce closures.
-    //
-    // The expensive work (zlib decompression + protobuf parsing, typically
-    // 500KB-2MB of decompressed data per blob) happens entirely in Phase 2,
-    // which is fully parallel and lock-free.
-    //
-    // ### Memory safety analysis
-    //
-    // Collecting all compressed blobs into a Vec is safe for memory:
-    //   - A ~500MB PBF file (e.g. Germany) has ~16K blobs at ~32KB avg
-    //     compressed = ~512MB in the Vec. This is comparable to the file size
-    //     itself and well within typical system memory.
-    //   - The full planet (~80GB PBF) has ~2.5M blobs at ~32KB avg = ~80GB.
-    //     This is the same order as the file size, and any system processing
-    //     the planet file already needs substantial RAM for the decoded data.
-    //   - The Vec is consumed by `into_par_iter()` and each Blob is dropped
-    //     after processing, so peak memory is the Vec plus the in-flight
-    //     decoded blocks (one per rayon thread).
-    //
-    // ### Alternatives considered
-    //
-    // - **Chunked collection** (collect N blobs, process, repeat): Would cap
-    //   memory but adds complexity and reintroduces synchronization between
-    //   chunks. For typical PBF sizes the full collect is fine.
-    //
-    // - **Channel-based producer/consumer** (crossbeam channel feeding rayon):
-    //   More complex, introduces backpressure tuning. The pipelined reader
-    //   (`for_each_pipelined`) already provides this pattern for ordered
-    //   processing; par_map_reduce is for unordered reduce where batch-collect
-    //   is simpler and faster.
-    //
-    // - **par_bridge() with larger work stealing granularity**: Rayon doesn't
-    //   expose per-bridge granularity controls. The mutex is fundamental to
-    //   how par_bridge adapts a sequential iterator.
-    //
     pub fn par_map_reduce<MP, RD, ID, T>(
         mut self,
         map_op: MP,
@@ -427,28 +366,495 @@ impl<R: Read + Send> ElementReader<R> {
         ID: Fn() -> T + Sync + Send,
         T: Send,
     {
-        // Phase 1: Sequentially collect all OsmData blobs into a Vec.
-        // Blobs are still compressed at this stage (~16-64KB each), so the Vec
-        // holds only the compressed data. The header blob was already consumed
-        // at construction time, so only data and unknown blobs remain.
-        // Skip indexdata parsing - par_map_reduce never calls blob.index().
+        // par_map_reduce never inspects blob.index(); skip the per-blob
+        // indexdata copy in the frame pump.
         self.blob_iter.set_parse_indexdata(false);
-        let blobs = collect_osm_data_blobs(self.blob_iter)?;
 
-        // Phase 2: Parallel decode + map + reduce with zero lock contention.
-        // Rayon's into_par_iter() splits the Vec into contiguous slices for each
-        // worker thread -- no mutex, no atomic CAS, just index arithmetic.
-        blobs
-            .into_par_iter()
-            .try_fold(&identity, |acc, blob: Blob| match blob.decode()? {
-                BlobDecode::OsmData(block) => {
-                    Ok(block.elements().map(&map_op).fold(acc, &reduce_op))
+        // Reserve one thread for the frame pump (this thread); the rest decode.
+        let worker_count = self.decode_threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get().saturating_sub(1).max(1))
+                .unwrap_or(3)
+        });
+
+        par_fold_blobs(
+            self.blob_iter,
+            worker_count,
+            PAR_INFLIGHT_BUDGET,
+            PAR_BATCH_MAX_BLOBS,
+            PAR_BATCH_MAX_BYTES,
+            map_op,
+            identity,
+            reduce_op,
+        )
+    }
+}
+
+/// Worker-resident parallel fold shared by [`ElementReader::par_map_reduce`] and
+/// its failure-path tests. The frame pump runs on the calling thread under a
+/// fixed in-flight byte budget; scoped workers fold each into one partial `T`;
+/// the caller reduces at most one partial per worker on complete success.
+///
+/// Cancellation and panic safety are handled by RAII guards installed before any
+/// worker spawns, so no unwind - from a panicking `map_op`/`reduce_op`/`identity`,
+/// a panicking `Read`, or a spawn failure - can leave the pump or a sibling
+/// worker blocked forever:
+///
+/// - [`CancelGuard`] on the calling thread closes the queue and shuts the budget
+///   down if the calling thread unwinds inside the scope before the pump returns
+///   normally (finding: spawn/`Read` panic deadlocks scoped cleanup).
+/// - a per-worker [`CancelGuard`] does the same if a worker unwinds, so a lone
+///   `decode_threads(1)` worker cannot strand the pump in `ByteBudget::acquire`.
+/// - [`BatchCharge`] releases a worker's held budget on every batch exit -
+///   normal, decode error, or mid-fold panic - after freeing the compressed
+///   storage, so budget capacity never leaks and never frees before the bytes
+///   it accounts for actually drop.
+#[allow(clippy::too_many_arguments)]
+fn par_fold_blobs<R, MP, RD, ID, T>(
+    blob_iter: BlobReader<R>,
+    worker_count: usize,
+    budget_cap: u64,
+    batch_max_blobs: usize,
+    batch_max_bytes: u64,
+    map_op: MP,
+    identity: ID,
+    reduce_op: RD,
+) -> Result<T>
+where
+    R: Read + Send,
+    MP: for<'a> Fn(Element<'a>) -> T + Sync + Send,
+    RD: Fn(T, T) -> T + Sync + Send,
+    ID: Fn() -> T + Sync + Send,
+    T: Send,
+{
+    let queue = Arc::new(BatchQueue::new());
+    let budget = Arc::new(ByteBudget::new(budget_cap));
+    let pool = DecompressPool::new();
+
+    // Borrow the caller closures by shared reference so every worker shares
+    // one instance. Their `Sync + Send` bounds make the shared references
+    // safe to move into the scoped worker threads.
+    let map_op = &map_op;
+    let identity = &identity;
+    let reduce_op = &reduce_op;
+
+    std::thread::scope(|scope| -> Result<T> {
+        // Installed before the first worker spawns: if the calling thread
+        // unwinds inside this scope - a `scope.spawn` failure, or a panicking
+        // `R::read` inside the pump - this closes the queue and shuts the budget
+        // down so every already-spawned worker wakes and scope-join can finish
+        // the unwind instead of blocking forever on a queue that would never be
+        // closed. Disarmed once the pump returns normally and teardown moves to
+        // the join loop below.
+        let mut cancel = CancelGuard::new(&queue, &budget);
+
+        let mut handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let queue = Arc::clone(&queue);
+            let budget = Arc::clone(&budget);
+            let pool = Arc::clone(&pool);
+            handles.push(scope.spawn(move || -> Result<T> {
+                run_par_worker(&queue, &budget, &pool, map_op, identity, reduce_op)
+            }));
+        }
+
+        // Frame pump runs on the calling thread: sequential file I/O with
+        // kernel readahead preserved, feeding bounded batches to workers.
+        let pump_result = pump_blobs(blob_iter, &queue, &budget, batch_max_blobs, batch_max_bytes);
+        // On a read error, wake and stop workers promptly; on success let them
+        // drain the queue to completion (never shut the budget down, which would
+        // make workers skip queued batches).
+        if pump_result.is_err() {
+            budget.shutdown();
+        }
+        queue.close();
+        // The pump returned normally (Ok or Err, not a panic); teardown is now
+        // the join loop's job, so defuse the calling-thread guard.
+        cancel.disarm();
+
+        // Join every worker, collecting at most one partial each. Do NOT reduce
+        // yet: a panic in `identity`/`reduce_op` must not mask an already-known
+        // parse error, and read/framing errors must win over decode errors.
+        // Worker panics propagate deterministically here (mirroring rayon).
+        let mut partials: Vec<T> = Vec::with_capacity(worker_count);
+        let mut worker_err: Option<crate::error::Error> = None;
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(partial)) => partials.push(partial),
+                Ok(Err(e)) => {
+                    if worker_err.is_none() {
+                        worker_err = Some(e);
+                    }
                 }
-                // Should not happen: collect_osm_data_blobs filters to OsmData only.
-                // Handle gracefully by returning the accumulator unchanged.
-                BlobDecode::OsmHeader(_) | BlobDecode::Unknown(_) => Ok(acc),
-            })
-            .try_reduce(&identity, |a, b| Ok(reduce_op(a, b)))
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }
+
+        // Read/framing errors take precedence, matching the prior collect-first
+        // behavior where a bad blob aborted before any decode ran. Then worker
+        // decode errors. Both are decided before any user-closure reduction, so
+        // a panic in the final fold cannot replace a real parsing error.
+        pump_result?;
+        if let Some(e) = worker_err {
+            return Err(e);
+        }
+
+        // Complete success: only now fold the per-worker partials.
+        let mut acc = identity();
+        for partial in partials {
+            acc = reduce_op(acc, partial);
+        }
+        Ok(acc)
+    })
+}
+
+/// Total compressed bytes allowed in flight across the frame pump's queue and
+/// the decode workers. Bounds the reader working set independent of file size.
+const PAR_INFLIGHT_BUDGET: u64 = 256 * 1024 * 1024;
+
+/// Maximum number of compressed blobs gathered into one batch handed to a
+/// worker. Amortizes queue synchronization without starving load balancing.
+const PAR_BATCH_MAX_BLOBS: usize = 64;
+
+/// Byte target that flushes a batch: the pump flushes the current batch before
+/// admitting a blob that would carry its retained weight past this, so a batch
+/// exceeds it only when a lone blob larger than the whole target forms its own
+/// one-element batch (blobs are never split).
+const PAR_BATCH_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// A count- and byte-bounded run of compressed OsmData blobs handed to a worker.
+struct Batch {
+    blobs: Vec<Blob>,
+    /// Sum of the retained byte weights admitted for `blobs`. Released back to
+    /// the [`ByteBudget`] as a unit once the worker finishes the batch.
+    bytes: u64,
+}
+
+impl Batch {
+    fn new() -> Self {
+        Self {
+            blobs: Vec::new(),
+            bytes: 0,
+        }
+    }
+}
+
+/// RAII release of a worker's held batch budget.
+///
+/// Owns the batch for the duration of decode/fold so that on *any* exit -
+/// normal end of batch, decode error, or a panic in `map_op`/`reduce_op` mid
+/// fold - the compressed blob storage is freed *before* the accounted bytes are
+/// returned to the [`ByteBudget`]. Releasing before the storage drops would let
+/// the pump admit replacement bytes while the old allocations are still
+/// resident, transiently exceeding the in-flight cap.
+struct BatchCharge<'a> {
+    budget: &'a ByteBudget,
+    batch: Batch,
+}
+
+impl<'a> BatchCharge<'a> {
+    fn new(budget: &'a ByteBudget, batch: Batch) -> Self {
+        Self { budget, batch }
+    }
+
+    fn blobs(&self) -> &[Blob] {
+        &self.batch.blobs
+    }
+}
+
+impl Drop for BatchCharge<'_> {
+    fn drop(&mut self) {
+        let bytes = self.batch.bytes;
+        // Free the compressed blob storage FIRST, then return capacity, so the
+        // pump can never admit replacement bytes while these allocations are
+        // still resident.
+        self.batch.blobs = Vec::new();
+        self.budget.release(bytes);
+    }
+}
+
+/// Cancellation guard for the calling thread and each worker. On an armed drop -
+/// i.e. an unwind that never reached a matching [`disarm`](Self::disarm) - it
+/// closes the queue and shuts the budget down, waking the pump and every blocked
+/// worker so scoped-thread join can complete instead of deadlocking on a queue
+/// that would otherwise never be closed. A clean exit disarms it first.
+struct CancelGuard<'a> {
+    queue: &'a BatchQueue,
+    budget: &'a ByteBudget,
+    armed: bool,
+}
+
+impl<'a> CancelGuard<'a> {
+    fn new(queue: &'a BatchQueue, budget: &'a ByteBudget) -> Self {
+        Self {
+            queue,
+            budget,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.budget.shutdown();
+            self.queue.close();
+        }
+    }
+}
+
+/// Sequential frame pump: reads compressed blobs on the calling thread,
+/// preserving single-stream file I/O and kernel readahead, and feeds bounded
+/// batches to the worker queue. Acquires in-flight byte capacity before
+/// admitting each blob so the queued working set stays bounded. Stops promptly
+/// if a worker signals shutdown; propagates the first read error.
+///
+/// A read/framing error is inspected *before* the shutdown check, so a read
+/// error the pump has already obtained is never discarded because a worker
+/// happened to signal shutdown in the same window - read errors win over decode
+/// errors deterministically.
+fn pump_blobs<R: Read + Send>(
+    blob_iter: BlobReader<R>,
+    queue: &BatchQueue,
+    budget: &ByteBudget,
+    batch_max_blobs: usize,
+    batch_max_bytes: u64,
+) -> Result<()> {
+    let mut batch = Batch::new();
+    for blob_result in blob_iter {
+        // Resolve the read result before consulting shutdown: an obtained
+        // read/framing error must propagate and win over any worker decode
+        // error, even if a worker signaled shutdown while this blob was read.
+        let blob = blob_result?;
+        if budget.is_shutdown() {
+            break;
+        }
+        if blob.get_type() != BlobType::OsmData {
+            continue; // non-OsmData blobs carry no elements
+        }
+        let weight = blob.retained_len();
+        if !budget.acquire(weight) {
+            break; // a worker errored while we waited for capacity
+        }
+        // Byte cap is a hard cap: flush the current batch before a blob would
+        // carry it past the target. A lone blob heavier than the whole target
+        // still forms its own one-element batch (never split).
+        if !batch.blobs.is_empty() && batch.bytes.saturating_add(weight) > batch_max_bytes {
+            queue.push(std::mem::replace(&mut batch, Batch::new()));
+        }
+        batch.bytes += weight;
+        batch.blobs.push(blob);
+        // Count cap is exact: appended then flushed at the limit, never past it.
+        if batch.blobs.len() >= batch_max_blobs {
+            queue.push(std::mem::replace(&mut batch, Batch::new()));
+        }
+    }
+    if !batch.blobs.is_empty() {
+        queue.push(batch);
+    }
+    Ok(())
+}
+
+/// Long-lived decode/map worker: pulls bounded batches, reuses worker-local
+/// decompression scratch, folds every element into one worker-local `T`, and
+/// returns byte capacity as each batch completes. Returns the single partial
+/// (or the first decode error, after signaling shutdown so the pump stops).
+///
+/// A [`CancelGuard`] armed for the whole worker turns any unwind - through
+/// `identity`, `map_op`, or `reduce_op` - into a queue close plus budget
+/// shutdown, so a panicking worker (even the only one) cannot strand the pump
+/// blocked in `ByteBudget::acquire`. Held batch budget is released by
+/// [`BatchCharge`] regardless of how the batch exits.
+fn run_par_worker<MP, RD, ID, T>(
+    queue: &BatchQueue,
+    budget: &ByteBudget,
+    pool: &Arc<DecompressPool>,
+    map_op: &MP,
+    identity: &ID,
+    reduce_op: &RD,
+) -> Result<T>
+where
+    MP: for<'a> Fn(Element<'a>) -> T,
+    RD: Fn(T, T) -> T,
+    ID: Fn() -> T,
+{
+    // Armed before `identity()` so even a panic there cancels cleanly.
+    let mut cancel = CancelGuard::new(queue, budget);
+    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut acc = identity();
+    while let Some(batch) = queue.pop() {
+        if budget.is_shutdown() {
+            // Free storage then release; shutdown is already signaled.
+            drop(BatchCharge::new(budget, batch));
+            break;
+        }
+        // BatchCharge owns the batch: on normal end, decode error, or a mid-fold
+        // panic it frees the compressed storage before returning capacity.
+        let charge = BatchCharge::new(budget, batch);
+        let mut decode_err: Option<crate::error::Error> = None;
+        for blob in charge.blobs() {
+            match blob.to_primitiveblock_inline_with_scratch(pool, &mut st_scratch, &mut gr_scratch)
+            {
+                Ok(block) => {
+                    for element in block.elements() {
+                        acc = reduce_op(acc, map_op(element));
+                    }
+                }
+                Err(e) => {
+                    decode_err = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(e) = decode_err {
+            // Signal shutdown/close BEFORE dropping the charge (which releases
+            // this batch's bytes) so a blocked pump cannot slip one extra blob
+            // through the freed capacity on the way out.
+            budget.shutdown();
+            queue.close();
+            cancel.disarm(); // cancellation performed explicitly above
+            drop(charge); // frees storage, then releases budget
+            return Err(e);
+        }
+        // Normal end of batch: charge drops here (frees storage, then releases).
+    }
+    // Clean drain: leave siblings to finish; do not shut the budget down.
+    cancel.disarm();
+    Ok(acc)
+}
+
+/// Closable multi-consumer queue of [`Batch`]es between the single frame pump
+/// and the decode workers. Memory is bounded by the [`ByteBudget`] the pump
+/// acquires before pushing, so the queue itself is unbounded in slot count.
+struct BatchQueue {
+    inner: Mutex<BatchQueueState>,
+    cond: Condvar,
+}
+
+struct BatchQueueState {
+    batches: VecDeque<Batch>,
+    closed: bool,
+}
+
+impl BatchQueue {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(BatchQueueState {
+                batches: VecDeque::new(),
+                closed: false,
+            }),
+            cond: Condvar::new(),
+        }
+    }
+
+    fn push(&self, batch: Batch) {
+        let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        state.batches.push_back(batch);
+        drop(state);
+        self.cond.notify_one();
+    }
+
+    /// Marks the queue closed and wakes every blocked consumer. After close,
+    /// `pop` drains remaining batches then returns `None`.
+    fn close(&self) {
+        let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        state.closed = true;
+        drop(state);
+        self.cond.notify_all();
+    }
+
+    /// Blocks until a batch is available or the queue is closed and drained.
+    /// The condvar wait releases the lock, so a blocked consumer never stalls
+    /// its peers.
+    fn pop(&self) -> Option<Batch> {
+        let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if let Some(batch) = state.batches.pop_front() {
+                return Some(batch);
+            }
+            if state.closed {
+                return None;
+            }
+            state = self
+                .cond
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+/// Fixed budget for compressed bytes in flight (queued plus under decode).
+///
+/// The frame pump is the sole acquirer; workers release as batches finish. A
+/// blob is admitted whenever it fits under the cap, or unconditionally when the
+/// budget is empty so a single legal blob larger than the cap cannot deadlock.
+/// `shutdown` wakes a blocked pump so worker errors cancel the read promptly.
+struct ByteBudget {
+    state: Mutex<ByteBudgetState>,
+    cond: Condvar,
+    cap: u64,
+}
+
+struct ByteBudgetState {
+    used: u64,
+    shutdown: bool,
+}
+
+impl ByteBudget {
+    fn new(cap: u64) -> Self {
+        Self {
+            state: Mutex::new(ByteBudgetState {
+                used: 0,
+                shutdown: false,
+            }),
+            cond: Condvar::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Acquires `n` bytes of capacity, blocking until it fits. Returns `false`
+    /// if shutdown was signaled instead of admitting the bytes.
+    fn acquire(&self, n: u64) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if state.shutdown {
+                return false;
+            }
+            if state.used == 0 || state.used + n <= self.cap {
+                state.used += n;
+                return true;
+            }
+            state = self
+                .cond
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn release(&self, n: u64) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.used = state.used.saturating_sub(n);
+        drop(state);
+        self.cond.notify_one();
+    }
+
+    fn shutdown(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.shutdown = true;
+        drop(state);
+        self.cond.notify_all();
+    }
+
+    fn is_shutdown(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .shutdown
     }
 }
 
@@ -532,26 +938,6 @@ fn node_id(element: &Element<'_>) -> Option<i64> {
     }
 }
 
-/// Sequentially iterate a `BlobReader`, collecting all OsmData blobs into a Vec.
-///
-/// Skips unknown blob types since they contain no OSM elements. The header blob
-/// has already been consumed at `ElementReader` construction time.
-///
-/// This is used by `par_map_reduce` to separate the sequential I/O phase from
-/// the parallel decode phase. See the comments on `par_map_reduce` for the full
-/// rationale.
-#[hotpath::measure]
-fn collect_osm_data_blobs<R: Read + Send>(blob_iter: BlobReader<R>) -> Result<Vec<Blob>> {
-    let mut blobs = Vec::new();
-    for blob_result in blob_iter {
-        let blob = blob_result?;
-        if blob.get_type() == BlobType::OsmData {
-            blobs.push(blob);
-        }
-    }
-    Ok(blobs)
-}
-
 // ---------------------------------------------------------------------------
 // PipelinedBlocks iterator
 // ---------------------------------------------------------------------------
@@ -582,5 +968,321 @@ impl Drop for PipelinedBlocks {
         if let Some(h) = self.handle.take() {
             drop(h.join());
         }
+    }
+}
+
+// Tests use `unwrap()` freely: a panic is the correct failure mode for a unit
+// test - it fails immediately with a backtrace at the exact call site. The
+// crate-wide `unwrap_used = "deny"` lint targets production code.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::{Batch, BatchQueue, ByteBudget, ElementReader, par_fold_blobs};
+    use crate::error::{BlobError, ErrorKind};
+    use std::io::{Cursor, Read};
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    // The `par_map_reduce` frame pump admits blobs against `ByteBudget` before
+    // reading further; these pin that bounded-admission contract deterministically
+    // (no I/O, no threads-of-decode) so the reader working set stays bounded.
+
+    #[test]
+    fn byte_budget_blocks_at_cap_until_release() {
+        let budget = Arc::new(ByteBudget::new(10));
+        assert!(budget.acquire(6));
+
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let child = Arc::clone(&budget);
+        let handle = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            // 6 + 5 > 10 and the budget is non-empty, so this blocks.
+            let admitted = child.acquire(5);
+            done_tx.send(admitted).unwrap();
+        });
+
+        ready_rx.recv().unwrap();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "acquire must block while the budget is over cap"
+        );
+
+        budget.release(6);
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "acquire must succeed once capacity frees up"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn byte_budget_admits_oversized_when_empty() {
+        // A single legal blob larger than the whole cap must not deadlock: it is
+        // admitted unconditionally when nothing else is in flight.
+        let budget = ByteBudget::new(10);
+        assert!(budget.acquire(100));
+    }
+
+    #[test]
+    fn byte_budget_shutdown_unblocks_acquirer() {
+        let budget = Arc::new(ByteBudget::new(10));
+        assert!(budget.acquire(10));
+
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let child = Arc::clone(&budget);
+        let handle = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let admitted = child.acquire(5);
+            done_tx.send(admitted).unwrap();
+        });
+
+        ready_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        budget.shutdown();
+        assert!(
+            !done_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "shutdown must wake a blocked acquirer and return false"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn batch_queue_drains_then_closes() {
+        // pop() blocks on an empty open queue, so only pop after pushing/closing.
+        let queue = BatchQueue::new();
+        queue.push(Batch::new());
+        queue.close();
+        assert!(queue.pop().is_some(), "queued batch drains after close");
+        assert!(queue.pop().is_none(), "closed empty queue returns None");
+    }
+
+    #[test]
+    fn batch_queue_close_wakes_blocked_consumer() {
+        let queue = Arc::new(BatchQueue::new());
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let child = Arc::clone(&queue);
+        let handle = std::thread::spawn(move || {
+            let got = child.pop();
+            done_tx.send(got.is_none()).unwrap();
+        });
+
+        // Consumer is blocked on an empty, open queue.
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        queue.close();
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "close must wake a blocked consumer with None"
+        );
+        handle.join().unwrap();
+    }
+
+    // ---- par_map_reduce orchestration failure paths --------------------------
+    //
+    // These drive the whole worker-resident fold end to end - the queue/budget
+    // unit tests above cannot expose the pump/worker deadlocks. Each risky path
+    // runs under a watchdog: if a missing cancellation guard reintroduces a
+    // deadlock, the watchdog panics with a clear message instead of hanging the
+    // whole suite.
+
+    /// Build an in-memory PBF: one header blob plus `data_blobs` OsmData blobs,
+    /// four dense nodes each. Enough distinct blobs to exercise batching,
+    /// budget backpressure, and mid-stream failures.
+    fn build_pbf(data_blobs: usize) -> Vec<u8> {
+        use crate::block_builder::{BlockBuilder, HeaderBuilder};
+        use crate::writer::{Compression, PbfWriter};
+
+        let mut buf = Vec::new();
+        {
+            let mut writer = PbfWriter::new(&mut buf, Compression::Zlib(6));
+            let header = HeaderBuilder::new().build().unwrap();
+            writer.write_header(&header).unwrap();
+            for _ in 0..data_blobs {
+                let mut bb = BlockBuilder::new();
+                // Dense-node ids must ascend within a block; each block builder
+                // starts fresh, so a local 1..=4 range per block is fine. Blob
+                // content need not differ - only the blob count matters here.
+                for i in 1..=4_i32 {
+                    bb.add_node(
+                        i64::from(i),
+                        500_000_000 + i,
+                        100_000_000 + i,
+                        std::iter::empty::<(&str, &str)>(),
+                        None,
+                    );
+                }
+                let block = bb.take().unwrap().unwrap();
+                writer.write_primitive_block(block).unwrap();
+            }
+            writer.flush().unwrap();
+        }
+        buf
+    }
+
+    /// Byte offset where the first OsmData blob begins - i.e. the point the
+    /// frame pump starts reading after the header blob was consumed in
+    /// `ElementReader::new`.
+    fn first_data_blob_offset(buf: &[u8]) -> usize {
+        use crate::read::blob::BlobReader;
+        let mut r = BlobReader::new_seekable(Cursor::new(buf.to_vec())).unwrap();
+        let _header = r.next().unwrap().unwrap();
+        let first_data = r.next().unwrap().unwrap();
+        usize::try_from(first_data.offset().unwrap().0).unwrap()
+    }
+
+    /// Run `f` on a helper thread and fail loudly if it does not finish within a
+    /// generous window - a deadlock would otherwise hang the whole test binary.
+    /// Returns the thread result so callers can assert an expected panic.
+    #[allow(clippy::unwrap_in_result)]
+    fn assert_completes<F, T>(label: &str, f: F) -> std::thread::Result<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = mpsc::sync_channel::<()>(1);
+        let handle = std::thread::spawn(move || {
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            if tx.send(()).is_err() {
+                // Watchdog already timed out and dropped the receiver; the
+                // panic below has fired and this result is unobserved.
+            }
+            out
+        });
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(()) => handle
+                .join()
+                .expect("watchdog thread itself failed to join"),
+            Err(_) => panic!("{label}: did not complete within timeout - deadlock"),
+        }
+    }
+
+    /// A `Read` that serves `data[..panic_at]` then panics on any further read,
+    /// simulating an I/O source that faults mid-stream inside the frame pump.
+    struct PanicAfterRead {
+        data: Vec<u8>,
+        pos: usize,
+        panic_at: usize,
+    }
+
+    impl Read for PanicAfterRead {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            assert!(
+                self.pos <= self.panic_at,
+                "reader served past its panic threshold"
+            );
+            if self.pos >= self.panic_at {
+                panic!("boom in Read during pump");
+            }
+            let end = (self.pos + out.len()).min(self.panic_at);
+            let n = end - self.pos;
+            out[..n].copy_from_slice(&self.data[self.pos..end]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn par_map_reduce_accepts_borrowed_non_static_reader() {
+        // The whole reason par_map_reduce uses scoped threads: it must accept a
+        // reader borrowing local data (no `R: 'static`). `Cursor<&[u8]>` borrows
+        // `buf`, so this only compiles if the bound really is absent - and the
+        // count proves the borrowed path decodes correctly.
+        let buf = build_pbf(3);
+        let reader = ElementReader::new(Cursor::new(buf.as_slice())).unwrap();
+        let count = reader
+            .par_map_reduce(|_e| 1_u64, || 0_u64, |a, b| a + b)
+            .unwrap();
+        assert_eq!(count, 12, "3 blobs x 4 dense nodes");
+    }
+
+    #[test]
+    fn worker_panic_one_worker_over_budget_does_not_deadlock() {
+        // decode_threads(1) + a 1-byte budget: the pump admits blob 0 then
+        // blocks in `acquire`, and the single worker panics folding blob 0.
+        // Without the worker cancel guard (release + shutdown), the pump would
+        // block in `acquire` forever and never reach the join loop.
+        let buf = build_pbf(4);
+        let result = assert_completes("worker panic", move || {
+            let ElementReader { blob_iter, .. } = ElementReader::new(Cursor::new(buf)).unwrap();
+            par_fold_blobs(
+                blob_iter,
+                1, // one worker
+                1, // tiny budget: pump blocks after blob 0
+                1, // one blob per batch: deliver eagerly
+                super::PAR_BATCH_MAX_BYTES,
+                |_e| -> u64 { panic!("boom in map_op") },
+                || 0_u64,
+                |a, b| a + b,
+            )
+        });
+        assert!(
+            result.is_err(),
+            "a worker panic must propagate as a panic, not be swallowed"
+        );
+    }
+
+    #[test]
+    fn panicking_read_during_pump_does_not_deadlock() {
+        // A Read that faults on the pump's first data-blob read. The calling
+        // thread unwinds inside the scope with workers blocked on the open
+        // queue; the calling-thread cancel guard must close the queue so
+        // scope-join completes and the panic propagates.
+        let buf = build_pbf(3);
+        let panic_at = first_data_blob_offset(&buf);
+        let result = assert_completes("panicking read", move || {
+            let reader = ElementReader::new(PanicAfterRead {
+                data: buf,
+                pos: 0,
+                panic_at,
+            })
+            .unwrap();
+            reader.par_map_reduce(|_e| 1_u64, || 0_u64, |a, b| a + b)
+        });
+        assert!(
+            result.is_err(),
+            "a panicking Read must propagate, not deadlock scope cleanup"
+        );
+    }
+
+    #[test]
+    fn read_error_wins_over_simultaneous_decode_error() {
+        // Corrupt the sole data blob's zlib trailer (a decode error once a
+        // worker touches it) and append a framing (read) error right after it.
+        // The pump reads the bad frame; with batch_max_blobs = 1 the corrupt
+        // blob is already in flight to a worker, so both errors race. The
+        // framing error must win deterministically.
+        let mut buf = build_pbf(1);
+        let n = buf.len();
+        // The zlib stream's 4-byte adler32 trailer ends the file; flipping it
+        // guarantees an inflate failure while leaving all framing/lengths intact.
+        for b in &mut buf[n - 4..n] {
+            *b ^= 0xFF;
+        }
+        // A length prefix declaring a BlobHeader >= MAX_BLOB_HEADER_SIZE makes
+        // the pump's next read a hard HeaderTooBig framing error.
+        buf.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]); // 65536 == MAX
+
+        let result = assert_completes("read vs decode", move || {
+            let ElementReader { blob_iter, .. } = ElementReader::new(Cursor::new(buf)).unwrap();
+            par_fold_blobs(
+                blob_iter,
+                2,
+                super::PAR_INFLIGHT_BUDGET,
+                1, // deliver the corrupt blob to a worker before the bad frame
+                super::PAR_BATCH_MAX_BYTES,
+                |_e| 1_u64,
+                || 0_u64,
+                |a, b| a + b,
+            )
+        })
+        .expect("orchestration must not panic");
+        let err = result.expect_err("must surface an error");
+        assert!(
+            matches!(err.kind(), ErrorKind::Blob(BlobError::HeaderTooBig { .. })),
+            "framing/read error must win over the decode error, got {err:?}"
+        );
     }
 }

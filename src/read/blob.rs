@@ -212,6 +212,24 @@ impl Blob {
         }
     }
 
+    /// Total bytes retained by this blob's payload allocation.
+    ///
+    /// [`compressed_data`](Self::compressed_data) returns only the selected
+    /// compression field, but that `Bytes` slice shares the single parent
+    /// buffer holding the entire Blob message body (`BlobReader::next` fills a
+    /// `datasize`-byte `Vec` and every `BlobData` variant is a zero-copy slice
+    /// into it). Slicing never shrinks that buffer, so the whole
+    /// `datasize`-byte allocation stays resident as long as any slice lives -
+    /// even a one-byte data field beside a large unknown field pins the full
+    /// body. Byte-budget accounting must charge this, not the field length,
+    /// or pathological blobs accumulate file-sized memory under the cap.
+    pub(crate) fn retained_len(&self) -> u64 {
+        // datasize is the Blob message size = the parent buffer length that the
+        // payload slices keep alive. Negative sizes are rejected upstream in
+        // `BlobReader`; treat any stray negative as zero rather than wrapping.
+        u64::try_from(self.header.datasize).unwrap_or(0)
+    }
+
     /// Returns the per-blob tag key index from the header's `tagdata` field, if present.
     ///
     /// PBFs written by pbfhogg embed tag key data automatically. Third-party PBFs
@@ -1003,6 +1021,47 @@ mod tests {
             let blob = Blob::new(ff_header, ff_blob, None);
             assert_eq!(blob.get_type(), *expected_type);
         }
+    }
+
+    #[test]
+    fn retained_len_charges_full_body_not_just_compression_field() {
+        // The selected compression field is one byte, but the declared datasize
+        // (the parent body allocation those Bytes slices keep alive) is large.
+        // Budget accounting must charge the full body: otherwise a one-byte data
+        // field beside a large unknown field is wildly under-charged and
+        // file-sized memory can accumulate under the in-flight cap.
+        let header = WireBlobHeader {
+            blob_type: BlobKind::OsmData,
+            datasize: 1_000_000,
+            indexdata: None,
+            tagdata: None,
+            waymembers: None,
+        };
+        let wire = WireBlob {
+            data: Some(BlobData::Raw(Bytes::from_static(&[0u8]))),
+            raw_size: None,
+        };
+        let blob = Blob::new(header, wire, None);
+        assert_eq!(blob.retained_len(), 1_000_000);
+        assert_eq!(blob.compressed_data().map(|(_, d)| d.len()), Some(1));
+    }
+
+    #[test]
+    fn retained_len_treats_negative_datasize_as_zero() {
+        // datasize is validated non-negative upstream in BlobReader; a stray
+        // negative must clamp to 0 rather than wrap to a huge u64 charge.
+        let header = WireBlobHeader {
+            blob_type: BlobKind::OsmData,
+            datasize: -1,
+            indexdata: None,
+            tagdata: None,
+            waymembers: None,
+        };
+        let wire = WireBlob {
+            data: None,
+            raw_size: None,
+        };
+        assert_eq!(Blob::new(header, wire, None).retained_len(), 0);
     }
 
     fn blob_with_waymembers(waymembers: Option<Vec<u8>>) -> Blob {

@@ -26,6 +26,18 @@
 
 ### Fixed
 
+- **`ElementReader::par_map_reduce` no longer buffers the whole file in
+  memory.** It previously collected every compressed blob before starting
+  parallel decode, requiring RAM proportional to file size (OOM on
+  planet-scale inputs on 32 GB hosts). It now streams: a byte-and-count
+  bounded pump feeds long-lived decode workers that fold in place, capping
+  reader memory at a few hundred MB regardless of input size. Planet
+  measurements: 86-98 GB inputs complete in ~54-58 s at 170-616 MB peak
+  RSS (previously killed by the OOM reaper). Same signature and semantics;
+  parallel reduction grouping may differ (already documented as
+  order-unspecified). The `bench-read` blobreader arm also now uses the
+  library's 256 KiB buffered reader instead of an 8 KiB `BufReader`.
+
 - **`sort` no longer passes through blobs that are internally out of
   order.** A blob whose elements were internally unsorted but whose
   `(min_id, max_id)` range did not overlap its neighbours slipped past the

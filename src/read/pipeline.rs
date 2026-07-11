@@ -296,27 +296,18 @@ where
 /// The closure runs on the calling thread and may hold mutable state.
 /// PBF ordering (nodes → ways → relations) is preserved.
 ///
-/// # Memory warning: cross-thread PrimitiveBlock retention
+/// # Memory: decoded-block working set
 ///
-/// Each `PrimitiveBlock` allocates `WireStringTable::entries` (~10 KB) and
-/// `group_ranges` (~8 bytes) on a rayon decode thread. The consumer drops
-/// them on the calling thread. Neither glibc nor jemalloc returns these
-/// freed pages to the OS promptly - they accumulate as anonymous RSS.
-///
-/// At 400K+ blocks (Europe/planet scale), this causes **25+ GB of heap
-/// retention** that the allocator holds as "free but mapped" memory.
-/// This was measured and verified across glibc, jemalloc, and multiple
-/// `MALLOC_ARENA_MAX` configurations.
-///
-/// **Mitigation patterns:**
-/// - **Sequential reader**: use `BlobReader` directly instead of this
-///   pipeline. All alloc/free on one thread. Used by external join stages 2+4.
-/// - **Node-only scanner**: use `scan::node::extract_node_tuples`
-///   to bypass PrimitiveBlock entirely. Zero per-block heap allocations.
-///   Used by external join stage 2 and ALTW dense/sparse pass 1.
-/// - **Batch-based consumers** (e.g., `for_each_primitive_block_batch` with
-///   `par_iter`) are partially mitigated because the batch processes blocks
-///   on the consumer's rayon pool, reducing the cross-thread window.
+/// Each decoded `PrimitiveBlock` is built by the inline-entries constructors
+/// (`to_primitiveblock_inline_with_scratch` / `from_vec_pooled_with_scratch`):
+/// the string-table entries and group ranges live as `(u32, u32)` slices
+/// carved from the decompressed `Bytes` using reused thread-local scratch,
+/// and the decompression buffer returns to `DecompressPool` on drop. There is
+/// no per-block ~10 KB `WireStringTable::entries` heap Vec allocated on a
+/// decode thread and freed on the consumer thread, so the earlier cross-thread
+/// "free but mapped" retention pathology (once measured at 25+ GB at
+/// Europe/planet scale) no longer occurs. The decoded working set is bounded
+/// by the admission window below, not by file size.
 ///
 /// Decode admission is bounded by `decode_ahead`: at most `decode_ahead`
 /// decode tasks are admitted but not yet delivered from the reorder buffer.

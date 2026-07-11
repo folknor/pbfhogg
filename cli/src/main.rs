@@ -2659,8 +2659,10 @@ fn run_bench_read(path: &std::path::Path, mode: &str) -> Result<(), Box<dyn std:
                 (start.elapsed().as_millis(), nodes, ways, rels)
             }
             "blobreader" => {
-                use std::io::BufReader;
-                let reader = pbfhogg::BlobReader::new(BufReader::new(std::fs::File::open(path)?));
+                // Route through the library's buffered path (256 KiB FileReader)
+                // so this arm measures decode architecture, not the syscall
+                // overhead of a default 8 KiB BufReader.
+                let reader = pbfhogg::BlobReader::from_path(path)?;
                 let mut nodes = 0u64;
                 let mut ways = 0u64;
                 let mut rels = 0u64;

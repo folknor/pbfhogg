@@ -64,24 +64,14 @@ blobs per byte than the planet encoder.** See
 [`reference/blob-density.md`](../reference/blob-density.md) for the
 cross-cutting insight and affected-command audit.
 
-### Open question: revert, threshold-dispatch, or accept?
+### Decision resolved
 
-Three paths, undecided:
-
-1. **Revert** - drop the HeaderWalker path, stay on the pipelined
-   reader. Planet regresses to 44.8 s but europe stays at 26.4 s.
-2. **Threshold-dispatch** - branch on blob count (or byte size):
-   `HeaderWalker` path on large-blob PBFs (planet.osm.org style,
-   ~50 k blobs), pipelined path on small-blob PBFs (Geofabrik style,
-   500 k+ blobs). Keeps both paths alive; one `if` at entry.
-3. **Accept** - ship the HeaderWalker path as-is. Planet wins,
-   europe regresses. Matches the `sort` pass-1 precedent where
-   the europe regression was deemed the price of the planet win.
-
-Option (2) is what `blob-density.md` points at as the honest call
-but we have no measurement yet of what the threshold should be.
-Deferred until `repack` produces an 8k-packed planet so we can
-measure the crossover directly.
+The threshold-dispatch decision was ratified on 2026-07-10 and is
+implemented by [`ADR-0006`](../decisions/0006-blob-count-threshold-dispatch.md).
+`getparents` estimates OSMData blob count from a bounded header probe,
+uses `HeaderWalker` below 150,000 blobs, and uses the pipelined reader
+at or above that threshold. The measurements below are retained as the
+record that led to the ADR, not as open work.
 
 ### Crossover measured (2026-07-10, plantasjen) - data supports threshold-dispatch
 
@@ -105,17 +95,13 @@ average blob size estimate), so a single `if` at entry suffices.
 io_uring-batched header probes remain the lever that would flatten
 the walk term entirely if threshold-dispatch ever feels unsatisfying.
 
-Recommendation: **option (2), threshold-dispatch**, with the branch
-constant picked conservatively inside the measured bracket (e.g.
-~150-250 k blobs) and both paths kept under test. Revert (1) throws
-away a solid 2x planet win; accept (3) is now measurably wrong on
-BOTH high-density encodings, not just europe. Decision awaits
-ratification.
+The measured bracket was ratified as a 150,000-blob threshold in
+[`ADR-0006`](../decisions/0006-blob-count-threshold-dispatch.md).
 
-**Experiment commit: `783970a`.** If option (1) wins after
-`repack`-measured data lands, revert with `git revert 783970a`
-(or cherry-pick the parts of that commit worth keeping and drop
-the `src/commands/getparents/mod.rs` rewrite).
+**Experiment commit: `783970a`** (the HeaderWalker rewrite whose
+high-blob-count regression prompted the dispatch). Superseded by
+ADR-0006: both scan paths are now kept behind the threshold, so the
+once-contemplated `git revert 783970a` escape hatch no longer applies.
 
 Architecture today:
 

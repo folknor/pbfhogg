@@ -36,6 +36,101 @@ use crate::error::Result;
 /// exception where a blob's header exceeds the probe window.
 const HEADER_PROBE_SIZE: usize = 4096;
 
+/// Number of leading frames sampled when estimating a file's blob count.
+const SAMPLE_CAP: usize = 1_000;
+
+/// Estimate of the OSMData blob count of a PBF, from a bounded probe walk of
+/// leading blob headers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BlobCountEstimate {
+    /// OSMData blobs. Exact when [`Self::exact`] is true.
+    pub(crate) osmdata_blobs: u64,
+    /// The probe walk reached EOF before its sample cap.
+    pub(crate) exact: bool,
+}
+
+/// Arm selected for a command that can use either a header walk or a
+/// pipelined, single-pass reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScanArm {
+    Walker,
+    Pipelined,
+}
+
+/// Blob-count policy boundary measured in `reference/blob-density.md`.
+pub(crate) const PIPELINED_ARM_MIN_BLOBS: u64 = 150_000;
+
+/// Estimate the number of OSMData frames using a bounded header-only probe.
+///
+/// The first header frame and unknown frames are intentionally excluded from
+/// the frame-size mean: only OSMData frame bytes predict OSMData count.
+pub(crate) fn estimate_blob_count(path: &Path) -> Result<BlobCountEstimate> {
+    let mut walker = HeaderWalker::open(path)?;
+    let file_size = walker.file_size();
+    if file_size == 0 {
+        return Err(crate::error::new_error(
+            crate::error::ErrorKind::MissingHeader,
+        ));
+    }
+    let mut frames = 0_usize;
+    let mut osmdata_blobs = 0_u64;
+    let mut sampled_osmdata_bytes = 0_u64;
+    let mut sampled_end = 0_u64;
+
+    while frames < SAMPLE_CAP {
+        let Some(meta) = walker.next_header()? else {
+            return Ok(BlobCountEstimate {
+                osmdata_blobs,
+                exact: true,
+            });
+        };
+        frames += 1;
+        if frames == 1 && meta.blob_type != BlobKind::OsmHeader {
+            return Err(crate::error::new_error(
+                crate::error::ErrorKind::MissingHeader,
+            ));
+        }
+        if meta.blob_type == BlobKind::OsmData {
+            osmdata_blobs += 1;
+            sampled_osmdata_bytes += meta.frame_size as u64;
+            sampled_end = meta.frame_start + meta.frame_size as u64;
+        }
+    }
+
+    if osmdata_blobs == 0 {
+        // A cap of entirely non-data frames cannot provide a useful mean.
+        // Conservatively choose the cheap walker rather than inventing a
+        // high-count estimate.
+        return Ok(BlobCountEstimate {
+            osmdata_blobs: 0,
+            exact: false,
+        });
+    }
+    let mean_frame_bytes = sampled_osmdata_bytes / osmdata_blobs;
+    if mean_frame_bytes == 0 {
+        return Ok(BlobCountEstimate {
+            osmdata_blobs,
+            exact: false,
+        });
+    }
+    let remaining_bytes = file_size.saturating_sub(sampled_end);
+    Ok(BlobCountEstimate {
+        osmdata_blobs: osmdata_blobs + remaining_bytes / mean_frame_bytes,
+        exact: false,
+    })
+}
+
+/// Pure policy: pipelined at or above `min_blobs`, walker below. Callers pass
+/// [`PIPELINED_ARM_MIN_BLOBS`]; tests inject a threshold a small fixture can
+/// cross.
+pub(crate) fn choose_scan_arm_at(estimate: &BlobCountEstimate, min_blobs: u64) -> ScanArm {
+    if estimate.osmdata_blobs >= min_blobs {
+        ScanArm::Pipelined
+    } else {
+        ScanArm::Walker
+    }
+}
+
 /// Per-blob metadata produced by [`HeaderWalker::next_header`].
 pub(crate) struct BlobHeaderMeta {
     pub blob_type: BlobKind,
@@ -279,4 +374,138 @@ pub(crate) fn read_blob_data<R: Read>(reader: &mut R, size: usize) -> Result<Vec
         .read_exact(&mut buf)
         .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BlobCountEstimate, PIPELINED_ARM_MIN_BLOBS, SAMPLE_CAP, ScanArm, choose_scan_arm_at,
+        estimate_blob_count,
+    };
+    use crate::block_builder::{BlockBuilder, HeaderBuilder};
+    use crate::writer::{Compression, PbfWriter};
+
+    fn write_fixture(path: &std::path::Path, with_data: bool) {
+        let file = std::fs::File::create(path).expect("create fixture");
+        let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+        writer
+            .write_header(&HeaderBuilder::new().build().expect("header"))
+            .expect("write header");
+        if with_data {
+            let mut block = BlockBuilder::new();
+            block.add_node(1, 0, 0, std::iter::empty::<(&str, &str)>(), None);
+            writer
+                .write_primitive_block(block.take().expect("take").expect("block"))
+                .expect("write block");
+        }
+        writer.flush().expect("flush fixture");
+    }
+
+    #[test]
+    fn chooser_switches_at_the_policy_boundary() {
+        assert_eq!(
+            choose_scan_arm_at(
+                &BlobCountEstimate {
+                    osmdata_blobs: PIPELINED_ARM_MIN_BLOBS - 1,
+                    exact: true,
+                },
+                PIPELINED_ARM_MIN_BLOBS
+            ),
+            ScanArm::Walker
+        );
+        assert_eq!(
+            choose_scan_arm_at(
+                &BlobCountEstimate {
+                    osmdata_blobs: PIPELINED_ARM_MIN_BLOBS,
+                    exact: false,
+                },
+                PIPELINED_ARM_MIN_BLOBS
+            ),
+            ScanArm::Pipelined
+        );
+    }
+
+    #[test]
+    fn chooser_is_independent_of_estimate_exactness() {
+        let estimate = BlobCountEstimate {
+            osmdata_blobs: 1,
+            exact: false,
+        };
+        assert_eq!(choose_scan_arm_at(&estimate, 1), ScanArm::Pipelined);
+    }
+
+    #[test]
+    fn estimator_is_exact_for_small_and_header_only_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let header_only = dir.path().join("header-only.pbf");
+        write_fixture(&header_only, false);
+        assert_eq!(
+            estimate_blob_count(&header_only).expect("estimate"),
+            BlobCountEstimate {
+                osmdata_blobs: 0,
+                exact: true,
+            }
+        );
+
+        let one_block = dir.path().join("one-block.pbf");
+        write_fixture(&one_block, true);
+        assert_eq!(
+            estimate_blob_count(&one_block).expect("estimate"),
+            BlobCountEstimate {
+                osmdata_blobs: 1,
+                exact: true,
+            }
+        );
+    }
+
+    #[test]
+    fn estimator_rejects_empty_input() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let empty = dir.path().join("empty.pbf");
+        std::fs::File::create(&empty).expect("create empty file");
+        assert!(estimate_blob_count(&empty).is_err());
+    }
+
+    #[test]
+    fn estimator_projects_within_tolerance_on_mixed_frame_sizes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mixed = dir.path().join("mixed.pbf");
+        let file = std::fs::File::create(&mixed).expect("create fixture");
+        let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::None);
+        writer
+            .write_header(&HeaderBuilder::new().build().expect("header"))
+            .expect("write header");
+        // Alternate small and large frames so the projected mean has to
+        // absorb per-frame size variance, and overshoot the sample cap so
+        // the estimation branch (not the exact count) is exercised.
+        let actual_blobs = (SAMPLE_CAP + SAMPLE_CAP / 2) as u64;
+        let mut block = BlockBuilder::new();
+        for blob in 0..actual_blobs {
+            let nodes_in_blob = if blob % 2 == 0 { 1 } else { 40 };
+            for node in 0..nodes_in_blob {
+                #[allow(clippy::cast_possible_wrap)]
+                let id = (blob * 64 + node) as i64;
+                block.add_node(
+                    id,
+                    0,
+                    0,
+                    [("highway", "primary_link")].iter().copied(),
+                    None,
+                );
+            }
+            writer
+                .write_primitive_block(block.take().expect("take").expect("block"))
+                .expect("write block");
+        }
+        writer.flush().expect("flush fixture");
+
+        let estimate = estimate_blob_count(&mixed).expect("estimate");
+        assert!(!estimate.exact);
+        let error = estimate.osmdata_blobs.abs_diff(actual_blobs);
+        assert!(
+            error * 100 < actual_blobs * 30,
+            "estimated {} of {actual_blobs} actual blobs; relative error over 30 %",
+            estimate.osmdata_blobs,
+        );
+    }
 }

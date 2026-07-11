@@ -533,6 +533,33 @@ pub(crate) fn require_sorted_err(path: &Path, context: &str) -> Result<()> {
     .into())
 }
 
+/// Choose between the pread header walker and the pipelined reader for a
+/// selective scan, from a bounded estimate of the input's OSMData blob count
+/// (ADR-0006). Emits the estimate as the `walk_estimated_blobs` counter.
+///
+/// Non-indexed input is pinned to the walker: without indexdata neither arm
+/// can skip irrelevant blob types, and that unmeasured full-decode regime is
+/// outside the dispatch policy. `has_indexdata` reflects the first data blob
+/// only, so a file with an indexed head and an unindexed tail can still
+/// dispatch to the pipelined arm; its filter passes unindexed blobs through
+/// to a full decode, which keeps that choice correct, merely unpriced.
+pub(crate) fn dispatch_scan_arm(
+    input: &Path,
+    has_indexdata: bool,
+    min_blobs: u64,
+) -> Result<crate::read::header_walker::ScanArm> {
+    use crate::read::header_walker::{ScanArm, choose_scan_arm_at, estimate_blob_count};
+    if !has_indexdata {
+        return Ok(ScanArm::Walker);
+    }
+    let estimate = estimate_blob_count(input)?;
+    crate::debug::emit_counter(
+        "walk_estimated_blobs",
+        i64::try_from(estimate.osmdata_blobs).unwrap_or(i64::MAX),
+    );
+    Ok(choose_scan_arm_at(&estimate, min_blobs))
+}
+
 /// Check if the first OsmData blob in a PBF has indexdata.
 ///
 /// O(1) header-only probe: reads blob headers until the first OsmData

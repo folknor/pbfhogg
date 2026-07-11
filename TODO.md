@@ -25,9 +25,9 @@ Three new docs capturing a cross-cutting insight and two new commands that fall 
 **Read-path follow-ups from the 2026-07-11 architecture reports** (full analysis in [notes/read-path-architecture-reports.md](notes/read-path-architecture-reports.md); each needs its own gates):
 
 - [x] ~~**`BlobHeader.datasize` unvalidated on read**~~ **FIXED 2026-07-11.** New `MAX_BLOB_DATASIZE` const (`2 * MAX_BLOB_MESSAGE_SIZE` = the PBF spec's 64 MiB serialized-Blob hard limit) rejects an oversized declared `datasize` with the typed `BlobError::DataSizeTooBig` before any pre-decompression body allocation. Enforced at two funnels covering every read-side site: inline in `BlobReader::read_blob_header` (covers `next` + `next_header_skip_blob`), and in `parse_blob_header_with_index` (covers `read_raw_frame`, `read_blob_header_only`, and `HeaderWalker::next_header`, so every consumer's returned `data_size` and every `pread_data` is bounded). Well-formed files are byte-identical; only adversarial declared sizes error. Unit tests pin the boundary at both funnels (`blob_wire.rs`, `blob.rs`); integration tests in `tests/corrupt_input.rs` drive the three raw paths via `BlobReader`, `cat`, and `inspect`. CORRECTNESS.md records the invariant.
-- [ ] **Ordered-pipeline batch rebuild** (high conviction, both reports) - per-blob channel/task/permit/reorder seams in `run_pipeline` become structural overhead at high blob count; rebuild around byte-bounded batches with long-lived workers. Touches the production spine: carries the full re-verification protocol (`verify all`, shutdown/early-exit/ordering tests, europe benches before planet).
+- [ ] **Ordered-pipeline batch rebuild** (high conviction, both reports) - per-blob channel/task/permit/reorder seams in `run_pipeline` become structural overhead at high blob count; rebuild around byte-bounded batches with long-lived workers. Touches the production spine: carries the full re-verification protocol (`verify all`, shutdown/early-exit/ordering tests, europe benches before planet). **ON HOLD by user decision (2026-07-11): do not start uninvited** - it waits for a session the user dedicates to it; full analysis preserved in [notes/read-path-architecture-reports.md](notes/read-path-architecture-reports.md).
 - [ ] **Command-transform fusion into decode workers** - getid pass 2, getparents full-scan arm, tags-filter single-pass, altw decode-all currently decode in one rayon stage, materialize 64-block batches (~90 MB), and re-dispatch to a second stage. Fuse transform into the decode worker per the classify precedent; one command at a time.
-- [ ] **Sequential-path double copy** - `PrimitiveBlock::new` copies the whole decompressed buffer (~300+ GB of memcpy per planet pass); the scratch-reusing constructors already exist, `for_each` was never routed onto them. Touches `Blob::decode`'s shared surface; lean on read-path equivalence tests.
+- [x] ~~**Sequential-path double copy**~~ **FIXED 2026-07-11** (`3ccc580`). Every sequential full-decode site routed onto the owned-Vec scratch constructors (`for_each`, `to_primitiveblock`, `decode_blob_to_primitiveblock`, cat/inspect/getid loops, altw passthrough via a new pooled-Vec route); `new_with_scratch` and `parse_primitive_block_from_bytes_owned` deleted. Same-day `--commit` A/B vs `29e4eab`, no regression in any of 16 cells: sequential denmark 3047 -> 3004 ms, germany 29166 -> 28073 ms (-3.7 %); blobreader germany 31113 -> 30128 ms (-3.2 %); parallel/pipelined flat-to-better. Equivalence test upgraded to full element materialization across Raw/Zlib/Zstd; 32 MiB Raw boundary reconciled across all decompress helpers.
 - [ ] **Per-blob `posix_fadvise(DONTNEED)`** with a cumulative prefix range = 1.45 M ever-growing advisory syscalls on the 8k encoding; batch behind a watermark. Needs measurement (kernel cache interaction).
 - [ ] **Count-only buffer knobs -> byte-aware** (`read_ahead 16`, `decode_ahead 32`, `BLOCK_QUEUE 8`, command batches of 64): memory meaning differs ~25x between encodings; keep counts as defenses, make bytes primary.
 
@@ -324,6 +324,14 @@ add it here with the per-worker upper bound at planet scale.
 
 ### Blocked on dataset / config
 
+- [ ] **Injected-prepass flag-ON planet verdict**. The producer landed
+  2026-07-11 (`29e4eab`, ADR-0007) with flag-OFF neutrality shown, but
+  the flag-ON planet bench - both the altw regression bound and the
+  first end-to-end sidecar-counter exercise - waits on two things:
+  the brokkr `--inject-prepass` passthrough brick in `~/Programs/brokkr`
+  (no benchable inject variant exists until then), and an explicit
+  user green-light for the run. See `reference/pipeline.md` for the
+  full gate context.
 - [ ] **History PBF for `time-filter`**. pbfhogg supports per-element
   version history and visibility, but `brokkr.toml` has no history
   variant on any dataset. `time-filter` benches on a regular PBF

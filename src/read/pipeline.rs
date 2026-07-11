@@ -51,12 +51,15 @@ pub(crate) const DEFAULT_DECODE_AHEAD: usize = 32;
 
 const COUNT_BACKSTOP_MULTIPLIER: usize = 16;
 
-// The overnight gates use 87 GiB / 50,816 planet-primary blobs = 1,838,309
-// bytes/blob: read-ahead 16 * 1,838,309 = 29,412,944 and decode-ahead
-// 32 * 1,838,309 = 58,825,888. The byte budgets preserve today's primary
-// working sets while the raised count backstops admit the smaller 8k blobs.
+// Planet primary occupies 87 GiB on disk across 50,816 blobs, or 1,838,309
+// compressed bytes/blob. PBFHOGG_READ_AHEAD_BYTES charges retained compressed
+// blob bytes, so its overnight suggestion remains 16 * 1,838,309 =
+// 29,412,944 bytes. PBFHOGG_DECODE_AHEAD_BYTES charges decoded_len_hint bytes;
+// using the approximately 2x zlib expansion estimate gives 3,676,618 decoded
+// bytes/blob and 32 * 3,676,618 = 117,651,776 bytes. The raised count
+// backstops admit the smaller 8k blobs.
 
-fn byte_budget_from_env(var: &str) -> Result<Option<usize>> {
+pub(crate) fn byte_budget_from_env(var: &str) -> Result<Option<usize>> {
     match std::env::var(var) {
         Ok(value) => {
             let bytes = value.parse::<usize>().map_err(|_| {
@@ -241,6 +244,12 @@ impl PipelineConfig {
     }
 }
 
+/// A byte-capacity gate for one producer stage.
+///
+/// Single-acquirer invariant: exactly one producer calls [`Self::acquire`] for
+/// each instance. Releases may come from other threads, so `release` can use
+/// `notify_one`; adding another acquirer requires `notify_all` or per-waiter
+/// wakeups.
 pub(crate) struct ByteBudget {
     used: Mutex<usize>,
     cond: Condvar,

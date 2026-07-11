@@ -17,8 +17,10 @@ use std::thread::JoinHandle;
 /// Number of decoded blocks buffered between the pipeline and the consumer iterator.
 const BLOCK_QUEUE: usize = 8;
 const BLOCK_QUEUE_COUNT_BACKSTOP: usize = BLOCK_QUEUE * 16;
-// The overnight BLOCK_QUEUE gate uses the planet-primary estimate from
-// pipeline.rs: 8 * 1,838,309 bytes/block = 14,706,472 bytes.
+// PBFHOGG_BLOCK_QUEUE_BYTES charges `PrimitiveBlock::decompressed_size()`.
+// With the approximately 2x zlib expansion estimate from pipeline.rs, planet
+// primary has 3,676,618 decoded bytes/blob, so its overnight suggestion is
+// 8 * 3,676,618 = 29,412,944 bytes.
 
 /// A reader for PBF files that gives access to the stored elements: nodes, ways and relations.
 ///

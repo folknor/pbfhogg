@@ -132,13 +132,24 @@ verdict. **The user explicitly overrode both rules for this batch
   the parameter API with tiny byte budgets (forcing the byte bound to
   bind); CLI smoke via
   `scripts/envrun.sh PBFHOGG_DECODE_AHEAD_BYTES=1048576 brokkr read --dataset denmark`.
-- Overnight cells: one gated read cell per encoding, all four vars set
-  (attribution across the four knobs is deliberately sacrificed for night
-  budget - if the combined cell wins, a follow-up night can bisect; if it
-  is neutral or regresses, the item closes without needing attribution):
-  `run env PBFHOGG_READ_AHEAD_BYTES=<N1> PBFHOGG_DECODE_AHEAD_BYTES=<N2> PBFHOGG_BLOCK_QUEUE_BYTES=<N3> PBFHOGG_CMD_BATCH_BYTES=<N4> brokkr read --dataset planet --bench 1`
-  `run env <same four> brokkr read --snapshot 8k --dataset planet --bench 1`
-- Verdict: pipelined + parallel variant walls; primary must be inside the
+- Overnight cells (rev 3 - the post-commit review proved two knobs INERT
+  in read cells: BLOCK_QUEUE_BYTES binds only in `into_blocks_pipelined`
+  and CMD_BATCH_BYTES only in command batch loops, neither of which any
+  read variant calls; a combined-vars read cell would have adjudicated
+  them as false-neutral):
+  - Read pairs adjudicate READ_AHEAD + DECODE_AHEAD only:
+    `run env PBFHOGG_READ_AHEAD_BYTES=<N1> PBFHOGG_DECODE_AHEAD_BYTES=<N2> brokkr read --dataset planet --bench 1`
+    `run env <same two> brokkr read --snapshot 8k --dataset planet --bench 1`
+  - CMD_BATCH_BYTES gets its own command pair (shares the item-3 baseline):
+    `run env PBFHOGG_CMD_BATCH_BYTES=<N4> brokkr getid --dataset planet --snapshot 8k --add-referenced --bench 1`
+  - BLOCK_QUEUE_BYTES is adjudicable (fix-run report: `into_blocks_pipelined`
+    is consumed by getid, getparents, PBF tags-filter, and altw's
+    decode-all fallback) and gets its own dedicated pair on the cheapest
+    consumer (shares the item-3 getparents 8k baseline):
+    `run env PBFHOGG_BLOCK_QUEUE_BYTES=<N3> brokkr getparents --dataset planet --snapshot 8k --bench 1`
+- Verdict: pipelined variant walls for the read pairs (the parallel
+  variant uses its own fixed PAR_INFLIGHT_BUDGET and is a no-regression
+  control only), getid wall for the CMD_BATCH pair; primary inside the
   noise floor both directions, 8k must clear +3 % to keep.
 - Interaction: the rebuild (item 4) may subsume decode_ahead/BLOCK_QUEUE;
   if both verdicts are keep, morning adjudication decides which knobs

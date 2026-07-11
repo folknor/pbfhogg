@@ -569,6 +569,25 @@ fn pipelined_matches_sequential_tiny_caps() {
         .unwrap()
         .read_ahead(1)
         .decode_ahead(1)
+        .for_each_pipelined(|element| {
+            pipelined.push(element_id(&element));
+        })
+        .unwrap();
+
+    assert_eq!(sequential, pipelined);
+}
+
+#[test]
+fn pipelined_matches_sequential_tiny_byte_budgets() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("many.osm.pbf");
+    write_many_block_pbf(&path, 16);
+
+    let sequential = collect_sequential(&path);
+
+    let mut pipelined = Vec::new();
+    ElementReader::from_path(&path)
+        .unwrap()
         // Each generated block is larger than one byte, so these tiny budgets
         // bind before the raised 16x count backstops. Exercise the parameter
         // API directly rather than mutating process-global environment state.

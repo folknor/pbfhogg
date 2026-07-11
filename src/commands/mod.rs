@@ -33,6 +33,30 @@ pub(crate) type Result<T> = crate::BoxResult<T>;
 
 /// Number of decoded `PrimitiveBlock`s collected before dispatching to rayon.
 pub(crate) const BATCH_SIZE: usize = 64;
+const BATCH_COUNT_BACKSTOP: usize = BATCH_SIZE * 16;
+
+// The overnight CMD gate uses 87 GiB / 50,816 planet-primary blobs =
+// 1,838,309 bytes/block; today's 64-block batch is therefore
+// 64 * 1,838,309 = 117,651,776 bytes.
+
+fn command_batch_bytes_from_env() -> Result<Option<usize>> {
+    const VAR: &str = "PBFHOGG_CMD_BATCH_BYTES";
+    match std::env::var(VAR) {
+        Ok(value) => {
+            let bytes = value
+                .parse::<usize>()
+                .map_err(|_| format!("{VAR} must be a non-zero byte count, got {value:?}"))?;
+            if bytes == 0 {
+                return Err(format!("{VAR} must be a non-zero byte count, got {value:?}").into());
+            }
+            Ok(Some(bytes))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("{VAR} must be a non-zero Unicode byte count").into())
+        }
+    }
+}
 
 /// Consume `PrimitiveBlock` results in fixed-size batches.
 ///
@@ -47,7 +71,13 @@ pub(crate) fn for_each_primitive_block_batch<E>(
 where
     E: Into<Box<dyn std::error::Error>>,
 {
-    for_each_primitive_block_batch_budgeted(blocks, batch_size, None, &mut process_batch)
+    let max_bytes = command_batch_bytes_from_env()?;
+    let max_blocks = if max_bytes.is_some() {
+        BATCH_COUNT_BACKSTOP
+    } else {
+        batch_size
+    };
+    for_each_primitive_block_batch_budgeted(blocks, max_blocks, max_bytes, &mut process_batch)
 }
 
 /// Consume `PrimitiveBlock` results in batches bounded by both block count and

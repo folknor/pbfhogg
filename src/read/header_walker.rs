@@ -49,16 +49,20 @@ pub(crate) struct BlobCountEstimate {
     pub(crate) exact: bool,
 }
 
-/// Arm selected for a command that can use either a header walk or a
-/// pipelined, single-pass reader.
+/// Arm selected for a command that can either walk blob headers (reading
+/// bodies selectively via pread) or scan the whole file in one pass.
+///
+/// The full-scan mechanism is per-command: getparents decodes a large byte
+/// fraction and uses the pipelined reader; getid include streams frames
+/// sequentially and decodes only prescreen survivors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScanArm {
     Walker,
-    Pipelined,
+    FullScan,
 }
 
 /// Blob-count policy boundary measured in `reference/blob-density.md`.
-pub(crate) const PIPELINED_ARM_MIN_BLOBS: u64 = 150_000;
+pub(crate) const FULL_SCAN_ARM_MIN_BLOBS: u64 = 150_000;
 
 /// Estimate the number of OSMData frames using a bounded header-only probe.
 ///
@@ -121,11 +125,11 @@ pub(crate) fn estimate_blob_count(path: &Path) -> Result<BlobCountEstimate> {
 }
 
 /// Pure policy: pipelined at or above `min_blobs`, walker below. Callers pass
-/// [`PIPELINED_ARM_MIN_BLOBS`]; tests inject a threshold a small fixture can
+/// [`FULL_SCAN_ARM_MIN_BLOBS`]; tests inject a threshold a small fixture can
 /// cross.
 pub(crate) fn choose_scan_arm_at(estimate: &BlobCountEstimate, min_blobs: u64) -> ScanArm {
     if estimate.osmdata_blobs >= min_blobs {
-        ScanArm::Pipelined
+        ScanArm::FullScan
     } else {
         ScanArm::Walker
     }
@@ -379,7 +383,7 @@ pub(crate) fn read_blob_data<R: Read>(reader: &mut R, size: usize) -> Result<Vec
 #[cfg(test)]
 mod tests {
     use super::{
-        BlobCountEstimate, PIPELINED_ARM_MIN_BLOBS, SAMPLE_CAP, ScanArm, choose_scan_arm_at,
+        BlobCountEstimate, FULL_SCAN_ARM_MIN_BLOBS, SAMPLE_CAP, ScanArm, choose_scan_arm_at,
         estimate_blob_count,
     };
     use crate::block_builder::{BlockBuilder, HeaderBuilder};
@@ -406,22 +410,22 @@ mod tests {
         assert_eq!(
             choose_scan_arm_at(
                 &BlobCountEstimate {
-                    osmdata_blobs: PIPELINED_ARM_MIN_BLOBS - 1,
+                    osmdata_blobs: FULL_SCAN_ARM_MIN_BLOBS - 1,
                     exact: true,
                 },
-                PIPELINED_ARM_MIN_BLOBS
+                FULL_SCAN_ARM_MIN_BLOBS
             ),
             ScanArm::Walker
         );
         assert_eq!(
             choose_scan_arm_at(
                 &BlobCountEstimate {
-                    osmdata_blobs: PIPELINED_ARM_MIN_BLOBS,
+                    osmdata_blobs: FULL_SCAN_ARM_MIN_BLOBS,
                     exact: false,
                 },
-                PIPELINED_ARM_MIN_BLOBS
+                FULL_SCAN_ARM_MIN_BLOBS
             ),
-            ScanArm::Pipelined
+            ScanArm::FullScan
         );
     }
 
@@ -431,7 +435,7 @@ mod tests {
             osmdata_blobs: 1,
             exact: false,
         };
-        assert_eq!(choose_scan_arm_at(&estimate, 1), ScanArm::Pipelined);
+        assert_eq!(choose_scan_arm_at(&estimate, 1), ScanArm::FullScan);
     }
 
     #[test]

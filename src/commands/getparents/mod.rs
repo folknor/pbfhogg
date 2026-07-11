@@ -24,7 +24,7 @@ use crate::blob::{BlobKind, decode_blob_to_headerblock};
 use crate::blob_meta::ElemKind;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::owned::{dense_node_metadata, element_metadata};
-use crate::read::header_walker::{HeaderWalker, PIPELINED_ARM_MIN_BLOBS, ScanArm};
+use crate::read::header_walker::{FULL_SCAN_ARM_MIN_BLOBS, HeaderWalker, ScanArm};
 use crate::reorder_buffer::ReorderBuffer;
 use crate::writer::Compression;
 use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
@@ -73,7 +73,7 @@ pub fn getparents(
         compression,
         direct_io,
         overrides,
-        PIPELINED_ARM_MIN_BLOBS,
+        FULL_SCAN_ARM_MIN_BLOBS,
     )?;
     Ok(stats)
 }
@@ -121,7 +121,7 @@ pub(crate) fn getparents_with_arm(
         ScanArm::Walker => {
             getparents_walker(input, output, ids, opts, compression, direct_io, overrides)
         }
-        ScanArm::Pipelined => {
+        ScanArm::FullScan => {
             getparents_pipelined(input, output, ids, opts, compression, direct_io, overrides)
         }
     }
@@ -456,7 +456,7 @@ fn process_block(
 #[cfg(test)]
 mod tests {
     use super::{
-        GetparentsOptions, PIPELINED_ARM_MIN_BLOBS, ScanArm, getparents_dispatched,
+        FULL_SCAN_ARM_MIN_BLOBS, GetparentsOptions, ScanArm, getparents_dispatched,
         getparents_with_arm,
     };
     use crate::block_builder::{BlockBuilder, HeaderBuilder};
@@ -526,7 +526,7 @@ mod tests {
         let opts = GetparentsOptions { add_self };
         let walker = dir.path().join("walker.pbf");
         let pipelined = dir.path().join("pipelined.pbf");
-        for (output, arm) in [(&walker, ScanArm::Walker), (&pipelined, ScanArm::Pipelined)] {
+        for (output, arm) in [(&walker, ScanArm::Walker), (&pipelined, ScanArm::FullScan)] {
             getparents_with_arm(
                 input,
                 output,
@@ -587,8 +587,8 @@ mod tests {
         let query = parse_ids(&["n1".to_owned()]).expect("ids");
         let opts = GetparentsOptions { add_self: true };
         for (min_blobs, expected_arm) in [
-            (1, ScanArm::Pipelined),
-            (PIPELINED_ARM_MIN_BLOBS, ScanArm::Walker),
+            (1, ScanArm::FullScan),
+            (FULL_SCAN_ARM_MIN_BLOBS, ScanArm::Walker),
         ] {
             let output = dir.path().join(format!("out-{min_blobs}.pbf"));
             let (arm, _) = getparents_dispatched(

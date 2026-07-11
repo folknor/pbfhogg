@@ -201,11 +201,6 @@ pub struct BlobFilter {
     /// Required tag key prefixes for blob-level filtering. Blobs whose tag
     /// index contains no key starting with any prefix are skipped.
     pub(crate) required_tag_prefixes: Option<Box<[Box<[u8]>]>>,
-    /// Inclusive ID intervals. When present, indexed blobs outside every
-    /// interval are skipped before decompression; unindexed blobs pass.
-    pub(crate) node_id_ranges: Option<Box<[(i64, i64)]>>,
-    pub(crate) way_id_ranges: Option<Box<[(i64, i64)]>>,
-    pub(crate) relation_id_ranges: Option<Box<[(i64, i64)]>>,
 }
 
 impl BlobFilter {
@@ -218,9 +213,6 @@ impl BlobFilter {
             node_bbox: None,
             required_tag_keys: None,
             required_tag_prefixes: None,
-            node_id_ranges: None,
-            way_id_ranges: None,
-            relation_id_ranges: None,
         }
     }
 
@@ -270,38 +262,10 @@ impl BlobFilter {
         if let Some(ref filter_bbox) = self.node_bbox
             && index.kind == ElemKind::Node
             && let Some(ref blob_bbox) = index.bbox
-            && !filter_bbox.intersects(blob_bbox)
         {
-            return false;
+            return filter_bbox.intersects(blob_bbox);
         }
-        self.id_range_matches(index)
-    }
-
-    /// Add inclusive, coalesced ID ranges for each OSM element type.
-    /// Intended for selective readers such as getid; callers should merge
-    /// adjacent IDs before constructing the filter.
-    pub(crate) fn with_id_ranges(
-        mut self,
-        node_id_ranges: Vec<(i64, i64)>,
-        way_id_ranges: Vec<(i64, i64)>,
-        relation_id_ranges: Vec<(i64, i64)>,
-    ) -> Self {
-        self.node_id_ranges = Some(node_id_ranges.into_boxed_slice());
-        self.way_id_ranges = Some(way_id_ranges.into_boxed_slice());
-        self.relation_id_ranges = Some(relation_id_ranges.into_boxed_slice());
-        self
-    }
-
-    fn id_range_matches(&self, index: &BlobIndex) -> bool {
-        let ranges = match index.kind {
-            ElemKind::Node => self.node_id_ranges.as_deref(),
-            ElemKind::Way => self.way_id_ranges.as_deref(),
-            ElemKind::Relation => self.relation_id_ranges.as_deref(),
-        };
-        ranges.is_none_or(|ranges| {
-            let insertion = ranges.partition_point(|&(start, _)| start <= index.max_id);
-            insertion > 0 && ranges[insertion - 1].1 >= index.min_id
-        })
+        true
     }
 
     /// Add required tag keys for blob-level tag filtering.
@@ -569,33 +533,5 @@ mod tests {
             bbox: None,
         };
         assert!(filter.wants_index(&way));
-    }
-
-    #[test]
-    fn wants_index_id_ranges_use_binary_search_and_compose_with_bbox() {
-        let filter = BlobFilter::new(true, false, false)
-            .with_node_bbox(BlobBbox::new(0, 100, 0, 100))
-            .with_id_ranges(vec![(10, 12), (100, 105)], Vec::new(), Vec::new());
-        let matching = BlobIndex {
-            kind: ElemKind::Node,
-            min_id: 102,
-            max_id: 110,
-            count: 9,
-            bbox: Some(BlobBbox::new(10, 20, 10, 20)),
-        };
-        assert!(filter.wants_index(&matching));
-
-        let missing_id = BlobIndex {
-            min_id: 20,
-            max_id: 30,
-            ..matching
-        };
-        assert!(!filter.wants_index(&missing_id));
-
-        let missing_bbox = BlobIndex {
-            bbox: Some(BlobBbox::new(200, 210, 200, 210)),
-            ..matching
-        };
-        assert!(!filter.wants_index(&missing_bbox));
     }
 }

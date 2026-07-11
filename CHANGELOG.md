@@ -8,10 +8,11 @@
 
 ### Changed
 
-- `getparents` and `getid` include mode now select their header-walk or
-  pipelined scan strategy from a bounded OSMData blob-count estimate. This
-  preserves the pread walker on low-blob-count planet encodings while
-  recovering the pipelined path for high-blob-count encodings.
+- `getparents` and `getid` include mode now select between the pread
+  header walk and a full-file scan from a bounded OSMData blob-count
+  estimate. This preserves the walker's win on low-blob-count planet
+  encodings while recovering full-scan performance on high-blob-count
+  encodings such as Geofabrik extracts.
 
 - The pipelined reader (`for_each_pipelined`,
   `for_each_block_pipelined`, `into_blocks_pipelined`) now bounds

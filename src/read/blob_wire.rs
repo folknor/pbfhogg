@@ -205,6 +205,38 @@ pub const MAX_BLOB_HEADER_SIZE: u64 = 64 * 1024;
 /// is inlined at each use site with no memory address or indirection overhead.
 pub const MAX_BLOB_MESSAGE_SIZE: u64 = 32 * 1024 * 1024;
 
+/// Maximum accepted declared `BlobHeader.datasize` in bytes: 32 MiB, equal to
+/// [`MAX_BLOB_MESSAGE_SIZE`].
+///
+/// `datasize` is the on-wire length of the serialized (usually compressed)
+/// `Blob` message that follows the header - the byte count a reader
+/// preallocates and reads *before* any decompression happens.
+/// `MAX_BLOB_MESSAGE_SIZE` caps the *decompressed* block content, but that
+/// guard only fires after the compressed body has already been read into
+/// memory, so a hostile or corrupt `datasize` can drive an arbitrarily large
+/// pre-decompression allocation ahead of it. This cap rejects the declared
+/// size before that allocation.
+///
+/// This value is not a written format limit. The OSM PBF spec caps the
+/// *uncompressed* block at 32 MiB and the `BlobHeader` message at 64 KiB, but
+/// defines no ceiling on the serialized-`Blob` `datasize`. The bound here is
+/// the *de facto interoperability limit*: the reference reader (OSM-binary,
+/// `FileBlockHead`) applies a single 32 MiB `MAX_BODY_SIZE` directly to
+/// `BlobHeader.datasize` and rejects anything at or above it. We mirror that
+/// reader exactly, so every file pbfhogg accepts the reference reader also
+/// accepts. A consequence worth stating: a blob carrying its content
+/// uncompressed in the `raw` field at exactly the 32 MiB content cap serializes
+/// to a few bytes over 32 MiB (protobuf field tags, the length prefix, and the
+/// `raw_size` hint), so it too is rejected by the reference reader -
+/// interoperable files cannot carry such a blob.
+///
+/// The two constants denote different things - a decompressed-content cap and a
+/// declared-datasize cap - but coincide at 32 MiB because the reference reader
+/// enforces one number on both fields. Defined as an alias of
+/// `MAX_BLOB_MESSAGE_SIZE` rather than a bare literal to keep that relationship
+/// explicit.
+pub const MAX_BLOB_DATASIZE: u64 = MAX_BLOB_MESSAGE_SIZE;
+
 /// Parse a blob header and extract type, datasize, indexdata, and tagdata.
 ///
 /// Used by the pread-from-workers pattern to classify and dispatch raw
@@ -224,6 +256,22 @@ pub(crate) fn parse_blob_header_with_index(
             size: header.datasize,
         }));
     }
+    // Reject an oversized declared datasize before any downstream site
+    // preallocates or preads the compressed body. This is the shared funnel
+    // for `read_raw_frame`, `read_blob_header_only`, and
+    // `HeaderWalker::next_header`; enforcing here bounds the `data_size`
+    // every one of those returns, so none can drive an outsized allocation
+    // ahead of the 32 MiB post-decompression `MAX_BLOB_MESSAGE_SIZE` guard.
+    // `BlobReader::read_blob_header` bypasses this funnel and carries the
+    // equivalent check inline. datasize is known non-negative here (checked
+    // above), so the u64 cast cannot lose sign.
+    #[allow(clippy::cast_sign_loss)]
+    let datasize_u64 = header.datasize as u64;
+    if datasize_u64 >= MAX_BLOB_DATASIZE {
+        return Err(new_blob_error(BlobError::DataSizeTooBig {
+            size: datasize_u64,
+        }));
+    }
     #[allow(clippy::cast_sign_loss)]
     Ok((
         header.blob_type,
@@ -231,4 +279,87 @@ pub(crate) fn parse_blob_header_with_index(
         header.indexdata,
         header.tagdata,
     ))
+}
+
+// Tests use `unwrap()` throughout because panicking is the correct failure mode
+// for unit tests. See the note in `blob.rs`'s test module for the rationale and
+// the crate-wide `unwrap_used = "deny"` exemption.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
+mod tests {
+    use super::{BlobError, BlobKind, MAX_BLOB_DATASIZE, parse_blob_header_with_index};
+    use crate::error::ErrorKind;
+
+    /// Hand-encode a minimal BlobHeader protobuf (`OSMData` type + a chosen
+    /// datasize) so a test can drive `parse_blob_header_with_index` with a
+    /// declared datasize that no legitimate writer would produce. The payload
+    /// itself is never written - the funnel guard rejects the declared size
+    /// before any payload read, which is exactly the property under test.
+    fn header_with_datasize(datasize: u64) -> Vec<u8> {
+        let mut h = Vec::new();
+        // Field 1 (type): tag 0x0A, len 7, "OSMData".
+        h.push(0x0A);
+        h.push(7);
+        h.extend_from_slice(b"OSMData");
+        // Field 3 (datasize): tag 0x18, LEB128 varint.
+        h.push(0x18);
+        let mut v = datasize;
+        loop {
+            let mut byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                byte |= 0x80;
+            }
+            h.push(byte);
+            if v == 0 {
+                break;
+            }
+        }
+        h
+    }
+
+    /// The largest legal declared datasize (one below the cap) parses cleanly
+    /// and reports its size; the cap value itself is rejected with the typed
+    /// `DataSizeTooBig` error before any allocation. The guard is strict
+    /// (`>=`), matching the sibling `MAX_BLOB_HEADER_SIZE` / `HeaderTooBig`
+    /// contract.
+    #[test]
+    fn datasize_at_or_over_cap_is_rejected() {
+        // One below the cap: accepted, size flows through unchanged.
+        let max_legal = MAX_BLOB_DATASIZE - 1;
+        let (_, data_size, _, _) =
+            parse_blob_header_with_index(&header_with_datasize(max_legal)).unwrap();
+        assert_eq!(data_size as u64, max_legal);
+
+        // Exactly at the cap: rejected.
+        let err =
+            parse_blob_header_with_index(&header_with_datasize(MAX_BLOB_DATASIZE)).unwrap_err();
+        match err.into_kind() {
+            ErrorKind::Blob(BlobError::DataSizeTooBig { size }) => {
+                assert_eq!(size, MAX_BLOB_DATASIZE);
+            }
+            other => panic!("expected DataSizeTooBig, got {other:?}"),
+        }
+
+        // Comfortably over the cap: also rejected, and the surfaced size is the
+        // declared value verbatim (the guard is `>=`, not `==`).
+        let over = MAX_BLOB_DATASIZE + 4096;
+        let err = parse_blob_header_with_index(&header_with_datasize(over)).unwrap_err();
+        match err.into_kind() {
+            ErrorKind::Blob(BlobError::DataSizeTooBig { size }) => {
+                assert_eq!(size, over);
+            }
+            other => panic!("expected DataSizeTooBig, got {other:?}"),
+        }
+    }
+
+    /// A tiny, ordinary datasize is unaffected - the guard only trips at the
+    /// cap, so well-formed blobs parse exactly as before.
+    #[test]
+    fn small_datasize_parses_normally() {
+        let (blob_type, data_size, _, _) =
+            parse_blob_header_with_index(&header_with_datasize(1234)).unwrap();
+        assert_eq!(blob_type, BlobKind::OsmData);
+        assert_eq!(data_size, 1234);
+    }
 }

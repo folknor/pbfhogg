@@ -80,6 +80,14 @@ pub enum BlobError {
         /// Blob content size in bytes.
         size: u64,
     },
+    /// `BlobHeader.datasize` declares a serialized `Blob` message bigger than
+    /// [`MAX_BLOB_DATASIZE`](blob/MAX_BLOB_DATASIZE.v.html). Rejected before the
+    /// compressed body is allocated, so a hostile declared size cannot force an
+    /// outsized pre-decompression allocation.
+    DataSizeTooBig {
+        /// Declared `datasize` in bytes.
+        size: u64,
+    },
     /// The blob is empty because the `raw` and `zlib-data` fields are missing.
     Empty,
     /// Blob header declares a negative `datasize`.
@@ -143,6 +151,9 @@ impl fmt::Display for Error {
             }
             ErrorKind::Blob(BlobError::MessageTooBig { size }) => {
                 write!(f, "blob message is too big: {size} bytes")
+            }
+            ErrorKind::Blob(BlobError::DataSizeTooBig { size }) => {
+                write!(f, "blob header declares datasize too big: {size} bytes")
             }
             ErrorKind::Blob(BlobError::Empty) => {
                 write!(f, "blob is missing fields 'raw' and 'zlib_data'")

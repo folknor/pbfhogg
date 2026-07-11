@@ -79,6 +79,10 @@ pub(crate) fn read_raw_frame<R: Read>(
     let mut header_bytes = vec![0u8; header_len];
     reader.read_exact(&mut header_bytes)?;
 
+    // parse_blob_header_with_index rejects an oversized declared datasize
+    // (>= MAX_BLOB_DATASIZE) before returning, so `data_size` here is already
+    // bounded and the `vec![0u8; frame_len]` allocation below cannot be driven
+    // to an outsized size by a hostile BlobHeader.datasize.
     let (blob_type, data_size, raw_index, tagdata) = parse_blob_header_with_index(&header_bytes)?;
     let index = raw_index.and_then(|ref data| BlobIndex::deserialize(data));
 

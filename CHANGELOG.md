@@ -26,6 +26,20 @@
 
 ### Fixed
 
+- **Oversized declared `BlobHeader.datasize` is now rejected before
+  allocation.** The read path capped only the *decompressed* blob content
+  (32 MiB), so a hostile or corrupt `datasize` could drive the
+  pre-decompression compressed-body allocation to an arbitrary size ahead of
+  that guard. A new 32 MiB cap (`MAX_BLOB_DATASIZE`) rejects such input with
+  the typed `BlobError::DataSizeTooBig` at every read-side site (`BlobReader`,
+  `read_raw_frame`, `read_blob_header_only`, `HeaderWalker`). The value is not
+  a written format limit - the spec caps only the uncompressed block (32 MiB)
+  and the `BlobHeader` (64 KiB) - but the de facto interoperability bound: the
+  reference reader (OSM-binary) applies a single 32 MiB `MAX_BODY_SIZE`
+  directly to `datasize` and rejects anything at or above it, so mirroring it
+  keeps pbfhogg-accepted files readable by the reference implementation.
+  Well-formed files are unaffected - only adversarial declared sizes error.
+
 - **`ElementReader::par_map_reduce` no longer buffers the whole file in
   memory.** It previously collected every compressed blob before starting
   parallel decode, requiring RAM proportional to file size (OOM on

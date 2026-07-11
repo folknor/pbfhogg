@@ -296,6 +296,10 @@ impl HeaderWalker {
                 .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
         }
 
+        // parse_blob_header_with_index rejects an oversized declared datasize
+        // (>= MAX_BLOB_DATASIZE) before returning, so the `data_size` below -
+        // and every `pread_data(data_offset, data_size, ..)` a consumer later
+        // issues against it - is bounded, never a hostile multi-GB size.
         let (blob_type, data_size, raw_index, tagdata) =
             parse_blob_header_with_index(&self.header_buf[4..header_end])?;
         let index = raw_index.as_ref().and_then(|b| BlobIndex::deserialize(b));

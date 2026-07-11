@@ -154,7 +154,7 @@ pub use blob_meta::{BlobBbox, BlobFilter};
 pub use error::{BlobError, Error, ErrorKind, Result};
 pub use read::blob::{
     Blob, BlobDecode, BlobHeader, BlobReader, BlobReaderSource, BlobType, ByteOffset,
-    MAX_BLOB_HEADER_SIZE, MAX_BLOB_MESSAGE_SIZE,
+    MAX_BLOB_DATASIZE, MAX_BLOB_HEADER_SIZE, MAX_BLOB_MESSAGE_SIZE,
 };
 pub use read::block::{
     BlockElementsIter, BlockType, GroupIter, GroupNodeIter, GroupRelationIter, GroupWayIter,

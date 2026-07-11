@@ -24,7 +24,7 @@ use super::decompress::{decompress_parsed_blob_into, pool_get};
 pub(crate) use super::blob_wire::{
     BlobData, BlobKind, WireBlob, WireBlobHeader, parse_blob_header_with_index,
 };
-pub use super::blob_wire::{MAX_BLOB_HEADER_SIZE, MAX_BLOB_MESSAGE_SIZE};
+pub use super::blob_wire::{MAX_BLOB_DATASIZE, MAX_BLOB_HEADER_SIZE, MAX_BLOB_MESSAGE_SIZE};
 
 /// The content type of a blob.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -506,6 +506,24 @@ impl<R: Read + Send> BlobReader<R> {
             }));
         }
 
+        // Reject an oversized declared datasize before `next` /
+        // `next_header_skip_blob` allocate or skip the compressed body. The
+        // 32 MiB `MAX_BLOB_MESSAGE_SIZE` cap only fires after decompression,
+        // so without this guard a hostile datasize forces the
+        // `Vec::with_capacity(header.datasize)` in `next` into an outsized
+        // pre-decompression allocation. This is the inline twin of the check
+        // in `parse_blob_header_with_index`, which covers the raw-frame and
+        // header-walker paths that bypass `read_blob_header`. datasize is
+        // known non-negative here, so the u64 cast cannot lose sign.
+        #[allow(clippy::cast_sign_loss)]
+        let datasize = header.datasize as u64;
+        if datasize >= MAX_BLOB_DATASIZE {
+            self.last_blob_ok = false;
+            return Some(Err(new_blob_error(BlobError::DataSizeTooBig {
+                size: datasize,
+            })));
+        }
+
         self.offset = self.offset.map(|x| ByteOffset(x.0 + header_size));
 
         Some(Ok(header))
@@ -827,7 +845,7 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
         // that doesn't deliver the declared `datasize` must
         // hard-error here, not be deferred.
         // header.datasize is i32 in the protobuf; capped at
-        // MAX_BLOB_HEADER_SIZE upstream. Comfortably fits in i64.
+        // MAX_BLOB_DATASIZE upstream. Comfortably fits in i64.
         #[allow(clippy::cast_possible_wrap)]
         let signed = (n - 1) as i64;
         if let Err(e) = self.reader.skip_relative(signed) {
@@ -989,9 +1007,102 @@ pub(crate) fn decode_headerblock(
 // `unwrap_used = "deny"` lint is designed for production code where panics are
 // unacceptable; test code is exempt via this module-level allow.
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
+
+    /// Hand-encode `[4-byte BE header_len][BlobHeader]` for an `OSMData` blob
+    /// declaring the given datasize, with no Blob payload following. Lets a
+    /// test drive `BlobReader` with a hostile declared datasize.
+    fn frame_with_datasize(datasize: u64) -> Vec<u8> {
+        let mut header = Vec::new();
+        // Field 1 (type): tag 0x0A, len 7, "OSMData".
+        header.push(0x0A);
+        header.push(7);
+        header.extend_from_slice(b"OSMData");
+        // Field 3 (datasize): tag 0x18, LEB128 varint.
+        header.push(0x18);
+        let mut v = datasize;
+        loop {
+            let mut byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                byte |= 0x80;
+            }
+            header.push(byte);
+            if v == 0 {
+                break;
+            }
+        }
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&u32::try_from(header.len()).unwrap().to_be_bytes());
+        frame.extend_from_slice(&header);
+        frame
+    }
+
+    /// A BlobHeader declaring `datasize == MAX_BLOB_DATASIZE` is rejected with
+    /// the typed `DataSizeTooBig` error *before* `next` reaches the
+    /// `Vec::with_capacity(datasize)` payload allocation. Without the guard the
+    /// reader would attempt a 32 MiB pre-decompression allocation driven purely
+    /// by the declared size and only then hit the (absent) payload as a
+    /// truncation Io error. The frame carries no payload, so the fact that the
+    /// surfaced error is `DataSizeTooBig` and not `Io(UnexpectedEof)` proves the
+    /// cap fires ahead of the allocation. Iteration then stops (sticky error).
+    #[test]
+    fn datasize_over_cap_rejected_before_payload_alloc() {
+        let frame = frame_with_datasize(MAX_BLOB_DATASIZE);
+        let mut reader = BlobReader::new(Cursor::new(frame));
+        let err = reader.next().unwrap().unwrap_err();
+        match err.into_kind() {
+            ErrorKind::Blob(BlobError::DataSizeTooBig { size }) => {
+                assert_eq!(size, MAX_BLOB_DATASIZE);
+            }
+            other => panic!("expected DataSizeTooBig, got {other:?}"),
+        }
+        assert!(reader.next().is_none(), "iteration stops after error");
+    }
+
+    /// The `next_header_skip_blob` funnel (the header-walk spine, distinct from
+    /// `next`) enforces the same cap: `datasize == MAX_BLOB_DATASIZE` is rejected
+    /// with `DataSizeTooBig` before `skip_blob_body` is asked to skip the body.
+    #[test]
+    fn next_header_skip_blob_rejects_over_cap_datasize() {
+        let frame = frame_with_datasize(MAX_BLOB_DATASIZE);
+        let mut reader = BlobReader::new(Cursor::new(frame));
+        let err = reader.next_header_skip_blob().unwrap().unwrap_err();
+        match err.into_kind() {
+            ErrorKind::Blob(BlobError::DataSizeTooBig { size }) => {
+                assert_eq!(size, MAX_BLOB_DATASIZE);
+            }
+            other => panic!("expected DataSizeTooBig, got {other:?}"),
+        }
+        assert!(
+            reader.next_header_skip_blob().is_none(),
+            "iteration stops after error"
+        );
+    }
+
+    /// The largest legal declared datasize (`MAX_BLOB_DATASIZE - 1`) passes the
+    /// cap guard; the read then fails downstream because this fixture carries no
+    /// payload. Driven through `next_header_skip_blob` so the sentinel-byte skip
+    /// surfaces the truncation without a 32 MiB payload allocation. The surfaced
+    /// error being `Io(UnexpectedEof)` and *not* `DataSizeTooBig` is the proof
+    /// that one-below-cap is admitted by the guard, pinning the `>=` boundary at
+    /// the BlobReader funnel exactly as the sibling `parse_blob_header_with_index`
+    /// test pins it at the raw-frame funnel.
+    #[test]
+    fn datasize_just_below_cap_passes_guard_then_truncates() {
+        let frame = frame_with_datasize(MAX_BLOB_DATASIZE - 1);
+        let mut reader = BlobReader::new(Cursor::new(frame));
+        let err = reader.next_header_skip_blob().unwrap().unwrap_err();
+        match err.into_kind() {
+            ErrorKind::Io(ref e) if e.kind() == ::std::io::ErrorKind::UnexpectedEof => {}
+            ErrorKind::Blob(BlobError::DataSizeTooBig { size }) => {
+                panic!("one-below-cap datasize {size} was wrongly rejected by the guard");
+            }
+            other => panic!("expected Io(UnexpectedEof) truncation, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_get_type() {

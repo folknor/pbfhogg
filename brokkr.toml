@@ -50,6 +50,7 @@ features = ["commands"]
 build_packages = ["pbfhogg-cli"]
 
 [test]
+debug = true
 default_package = "pbfhogg"
 default_profile = "tier1"
 

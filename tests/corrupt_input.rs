@@ -13,7 +13,7 @@ use std::io::Cursor;
 
 use pbfhogg::block_builder::{self, BlockBuilder};
 use pbfhogg::writer::{Compression, PbfWriter};
-use pbfhogg::{BlobError, BlobReader, BlobType, ErrorKind};
+use pbfhogg::{BlobError, BlobReader, BlobType, ErrorKind, MAX_BLOB_DATASIZE};
 
 /// Write a minimal valid PBF (header blob only, no data blocks) into a Vec.
 fn write_header_only_pbf() -> Vec<u8> {
@@ -290,6 +290,157 @@ fn inspect_rejects_oversized_header_length_via_walker() {
         msg.contains("header") && (msg.contains("too big") || msg.contains("65536")),
         "expected HeaderTooBig surface, got: {msg}",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Raw-frame / BlobReader / HeaderWalker MAX_BLOB_DATASIZE guards
+//
+// The decompressed-content cap (`MAX_BLOB_MESSAGE_SIZE`, 32 MiB) only fires
+// after a blob's compressed body has been read into memory. A hostile or
+// corrupt `BlobHeader.datasize` therefore forces the pre-decompression body
+// allocation (`Vec::with_capacity(datasize)` in `BlobReader::next`,
+// `vec![0u8; frame_len]` in `read_raw_frame`, `pread_data` in `HeaderWalker`
+// consumers) to an arbitrary size ahead of that guard - a memory-amplification
+// DoS. `MAX_BLOB_DATASIZE` (32 MiB, mirroring the reference reader's
+// `MAX_BODY_SIZE` applied directly to `BlobHeader.datasize`) rejects the
+// declared size at the boundary. These tests append an adversarial OSMData
+// frame - a valid BlobHeader declaring `datasize == MAX_BLOB_DATASIZE` with NO
+// Blob payload following - after a valid header-only PBF, and assert each read
+// path hard-errors before the allocation.
+//
+// Command entry points (`cat`, `inspect`, `has_indexdata`) return
+// `Box<dyn Error>`; the concrete error boxed at the `?` boundary is
+// `pbfhogg::Error`, so these downcast to the typed
+// `ErrorKind::Blob(BlobError::DataSizeTooBig)` rather than matching display text.
+// ---------------------------------------------------------------------------
+
+/// Downcast a boxed command error to the crate's typed `DataSizeTooBig` and
+/// assert it carries the expected declared size.
+fn assert_datasize_too_big(err: Box<dyn std::error::Error>, expected: u64) {
+    let typed = err
+        .downcast::<pbfhogg::Error>()
+        .unwrap_or_else(|e| panic!("expected a pbfhogg::Error, got: {e}"));
+    match typed.into_kind() {
+        ErrorKind::Blob(BlobError::DataSizeTooBig { size }) => {
+            assert_eq!(size, expected);
+        }
+        other => panic!("expected DataSizeTooBig, got {other:?}"),
+    }
+}
+
+/// Append `[4-byte BE header_len][BlobHeader]` for an OSMData blob declaring
+/// `datasize`, with no Blob payload. Hand-encoded to keep the fixture on the
+/// public API (no writer produces an oversized datasize).
+fn append_oversized_datasize_frame(buf: &mut Vec<u8>, datasize: u64) {
+    let mut header = Vec::new();
+    // Field 1 (type): tag 0x0A, len 7, "OSMData".
+    header.push(0x0A);
+    header.push(7);
+    header.extend_from_slice(b"OSMData");
+    // Field 3 (datasize): tag 0x18, LEB128 varint.
+    header.push(0x18);
+    let mut v = datasize;
+    loop {
+        let mut byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            byte |= 0x80;
+        }
+        header.push(byte);
+        if v == 0 {
+            break;
+        }
+    }
+    buf.extend_from_slice(&(header.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&header);
+}
+
+/// `BlobReader` (the public reader spine every command inherits) rejects an
+/// oversized declared datasize with `DataSizeTooBig` before allocating the
+/// payload buffer.
+#[test]
+fn blob_reader_rejects_oversized_datasize() {
+    let mut data = write_header_only_pbf();
+    append_oversized_datasize_frame(&mut data, MAX_BLOB_DATASIZE);
+
+    let mut reader = BlobReader::new(Cursor::new(data));
+    // First blob (header) parses fine.
+    let first = reader.next().unwrap().unwrap();
+    assert_eq!(first.get_type(), BlobType::OsmHeader);
+    // Second (adversarial) blob is rejected before payload allocation.
+    let err = reader.next().unwrap().unwrap_err();
+    match err.into_kind() {
+        ErrorKind::Blob(BlobError::DataSizeTooBig { size }) => {
+            assert_eq!(size, MAX_BLOB_DATASIZE);
+        }
+        other => panic!("expected DataSizeTooBig, got {other:?}"),
+    }
+}
+
+/// `read_raw_frame` (via `cat` passthrough) rejects an oversized declared
+/// datasize before the `vec![0u8; frame_len]` frame allocation.
+#[test]
+fn cat_rejects_oversized_datasize() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("adversarial.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    let mut data = write_header_only_pbf();
+    append_oversized_datasize_frame(&mut data, MAX_BLOB_DATASIZE);
+    std::fs::write(&input, &data).unwrap();
+
+    let result = pbfhogg::cat::cat(
+        &[input.as_path()],
+        &output,
+        None,
+        &pbfhogg::cat::CleanAttrs::default(),
+        Compression::default(),
+        false,
+        false,
+        &pbfhogg::HeaderOverrides::default(),
+    );
+    let err = match result {
+        Ok(_) => panic!("expected cat() to error on adversarial datasize"),
+        Err(e) => e,
+    };
+    assert_datasize_too_big(err, MAX_BLOB_DATASIZE);
+}
+
+/// `read_blob_header_only` (via `has_indexdata`) rejects an oversized declared
+/// datasize with the typed `DataSizeTooBig` before any body allocation. This is
+/// the one funnel consumer not exercised by the cat / inspect / BlobReader
+/// tests: `has_indexdata` walks blob headers with `read_blob_header_only` until
+/// the first OSMData blob. The fixture is a valid header-only PBF (whose
+/// OsmHeader blob is walked past) followed by an adversarial OSMData frame, so
+/// the guard trips on that second header.
+#[test]
+fn has_indexdata_rejects_oversized_datasize() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("adversarial.osm.pbf");
+    let mut data = write_header_only_pbf();
+    append_oversized_datasize_frame(&mut data, MAX_BLOB_DATASIZE);
+    std::fs::write(&path, &data).unwrap();
+
+    let err = pbfhogg::has_indexdata(&path, false).unwrap_err();
+    assert_datasize_too_big(err, MAX_BLOB_DATASIZE);
+}
+
+/// `HeaderWalker::next_header` (via `inspect`'s index-only fast path) rejects an
+/// oversized declared datasize before any consumer `pread_data`.
+#[cfg(feature = "commands")]
+#[test]
+fn inspect_rejects_oversized_datasize_via_walker() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("adversarial.osm.pbf");
+    let mut data = write_header_only_pbf();
+    append_oversized_datasize_frame(&mut data, MAX_BLOB_DATASIZE);
+    std::fs::write(&path, &data).unwrap();
+
+    let result = pbfhogg::inspect::inspect(&path, false, false, false, false, false);
+    let err = match result {
+        Ok(_) => panic!("expected inspect() to error on adversarial datasize"),
+        Err(e) => e,
+    };
+    assert_datasize_too_big(err, MAX_BLOB_DATASIZE);
 }
 
 /// After an error, BlobReader stops iteration (returns None on

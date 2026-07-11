@@ -187,6 +187,57 @@ real workload actually hits the cap. If that happens, the error message
 names the exact field and the migration path: bump the count to `u32`
 and increment `FORMAT_VERSION` in `src/geocode_index/format.rs`.
 
+## `BlobHeader.datasize` cap (hard error before allocation)
+
+**Status:** Enforced. Reader hard-errors before allocating an oversized
+compressed body.
+
+**Context:** `BlobHeader.datasize` is the producer-declared on-wire length of
+the serialized (usually compressed) `Blob` message that follows the header -
+the number of bytes a reader preallocates and reads *before* any decompression.
+The existing `MAX_BLOB_MESSAGE_SIZE` (32 MiB) caps the *decompressed* block
+content, but it only fires after the compressed body has already been read into
+memory. A hostile or corrupt `datasize` therefore drove the pre-decompression
+body allocation (`Vec::with_capacity(datasize)` in `BlobReader::next`,
+`vec![0u8; frame_len]` in `read_raw_frame`, and consumer `pread_data` calls
+against `HeaderWalker` metadata) to an arbitrary size ahead of the 32 MiB
+guard - a memory-amplification vector on every command that reads PBF input.
+
+**Fix:** `MAX_BLOB_DATASIZE` (`src/read/blob_wire.rs`), set to 32 MiB (defined
+as an alias of `MAX_BLOB_MESSAGE_SIZE` to keep the relationship explicit),
+rejects the declared size at the boundary with the typed
+`BlobError::DataSizeTooBig` before any allocation. This is **not** a written
+format limit: the OSM PBF spec caps only the *uncompressed* block (32 MiB) and
+the `BlobHeader` message (64 KiB), and says nothing about a serialized-`Blob`
+`datasize` ceiling. The bound is the *de facto interoperability limit* - the
+reference reader (OSM-binary, `FileBlockHead`) applies a single 32 MiB
+`MAX_BODY_SIZE` directly to `BlobHeader.datasize` and rejects anything at or
+above it. Mirroring that reader exactly means every file pbfhogg accepts the
+reference reader also accepts. A consequence worth stating: a blob carrying its
+content uncompressed in `raw` at exactly the 32 MiB content cap serializes to a
+few bytes over 32 MiB (protobuf framing plus the `raw_size` hint), so it too is
+rejected by the reference reader - interoperable files cannot carry such a blob.
+`MAX_BLOB_DATASIZE` (declared-datasize cap) and `MAX_BLOB_MESSAGE_SIZE`
+(decompressed-content cap) denote different things but coincide at 32 MiB
+because the reference reader enforces one number on both fields. The check lives
+at two funnels covering every read-side site: inline in
+`BlobReader::read_blob_header` (the `next` / `next_header_skip_blob` spine) and
+in `parse_blob_header_with_index` (the shared parse funnel for `read_raw_frame`,
+`read_blob_header_only`, and `HeaderWalker::next_header`).
+
+**Impact:** Well-formed files are byte-identical - the guard only trips at the
+cap, which no interoperable blob reaches. The single observable change is a
+typed `DataSizeTooBig` error on an adversarial or corrupt declared datasize, in
+place of an outsized allocation followed (for a payload that never arrives) by a
+truncation error.
+
+**Why hard-error instead of clamping:** Matches the repo's
+hard-error-over-silent-corruption posture (`reference/truncation-handling.md`)
+and the sibling `MAX_BLOB_HEADER_SIZE` / `HeaderTooBig` cap. A declared size at
+or past the reference reader's own bound is a corrupt or hostile (or simply
+non-interoperable) input; refusing it is strictly better than reading a partial
+body or aborting on a failed allocation.
+
 ## `sort`: intra-blob disorder
 
 **Status:** Fixed for every input that does not declare `Sort.Type_then_ID`

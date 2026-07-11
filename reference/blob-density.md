@@ -1,5 +1,10 @@
 # Blob density - scaling signal for PBF workloads
 
+Status: the getparents and getid include-mode decision is resolved by
+[`ADR-0006`](../decisions/0006-blob-count-threshold-dispatch.md): a bounded
+blob-count estimate dispatches those commands between the walker and
+pipelined reader. Other HeaderWalker consumers remain separately priced.
+
 PBFs from different producers pack very different numbers of elements per
 blob. On commands that do per-blob fixed work (`HeaderWalker` preads,
 decompress setup, block parse prologue, schedule construction), **blob
@@ -188,9 +193,9 @@ Second, the divergence is therefore much steeper than getparents'
 (+209 % vs +57 % at 8k), which argues for placing the shared dispatch
 constant toward the LOW end of the 51 k-522 k bracket (~150 k blobs):
 getid pays more for a wrong high-side call than getparents pays for a
-wrong low-side one. getid is dispatch consumer number three (with
-getparents and sort pass 1); one shared blob-count threshold serves
-all of them. Cross-epoch caveat: scan cells ran the April tree via
+wrong low-side one. getid and getparents are the two current dispatch
+consumers; sort pass 1 remains a separately-priced follow-on. Cross-epoch
+caveat: scan cells ran the April tree via
 `--commit`; margins of 2.2-3x dwarf any plausible tree drift.
 
 ### Correctness across the encoding axis

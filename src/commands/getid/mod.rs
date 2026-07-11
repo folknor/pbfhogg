@@ -14,6 +14,7 @@ use super::{
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_writer::FileWriter;
 use crate::owned::{dense_node_metadata, element_metadata};
+use crate::read::header_walker::{PIPELINED_ARM_MIN_BLOBS, ScanArm};
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
@@ -261,7 +262,37 @@ pub fn getid(
     force: bool,
     overrides: &HeaderOverrides,
 ) -> Result<GetidStats> {
-    require_indexdata(
+    let (_, stats) = getid_dispatched(
+        input,
+        output,
+        ids,
+        opts,
+        compression,
+        direct_io,
+        force,
+        overrides,
+        PIPELINED_ARM_MIN_BLOBS,
+    )?;
+    Ok(stats)
+}
+
+/// Dispatch the single-pass include mode on the blob-count estimate, then
+/// run. Returns the arm (`None` on the two-pass `--add-referenced` path,
+/// which is not dispatched) alongside the stats so tests can inject
+/// `min_blobs` and assert which arm auto-dispatch actually executed.
+#[allow(clippy::too_many_arguments)]
+fn getid_dispatched(
+    input: &Path,
+    output: &Path,
+    ids: &ElementIds,
+    opts: &GetidOptions,
+    compression: Compression,
+    direct_io: bool,
+    force: bool,
+    overrides: &HeaderOverrides,
+    min_blobs: u64,
+) -> Result<(Option<ScanArm>, GetidStats)> {
+    let has_indexdata = require_indexdata(
         input,
         direct_io,
         force,
@@ -270,18 +301,30 @@ pub fn getid(
          (significantly slower).",
     )?;
 
-    let result = if opts.add_referenced {
-        getid_with_refs(input, output, ids, opts, compression, direct_io, overrides)
+    let (arm, result) = if opts.add_referenced {
+        let stats = getid_with_refs(input, output, ids, opts, compression, direct_io, overrides)?;
+        (None, stats)
     } else {
-        filter_by_id(input, output, ids, true, compression, direct_io, overrides)
-    }?;
+        let arm = super::dispatch_scan_arm(input, has_indexdata, min_blobs)?;
+        let stats = filter_by_id(
+            input,
+            output,
+            ids,
+            true,
+            compression,
+            direct_io,
+            overrides,
+            arm,
+        )?;
+        (Some(arm), stats)
+    };
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("getid_nodes_written", result.nodes_written as i64);
         crate::debug::emit_counter("getid_ways_written", result.ways_written as i64);
         crate::debug::emit_counter("getid_relations_written", result.relations_written as i64);
     }
-    Ok(result)
+    Ok((arm, result))
 }
 
 /// Remove elements matching the given IDs (output everything else).
@@ -309,7 +352,18 @@ pub fn removeid(
          invert-mode raw-passthrough fast path is unreachable and every \
          blob is decompressed and re-encoded (significantly slower).",
     )?;
-    filter_by_id(input, output, ids, false, compression, direct_io, overrides)
+    // Invert mode retains raw-frame passthrough in the walker arm. The
+    // pipelined reader would decode and re-encode those frames.
+    filter_by_id(
+        input,
+        output,
+        ids,
+        false,
+        compression,
+        direct_io,
+        overrides,
+        ScanArm::Walker,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +376,39 @@ pub fn removeid(
 #[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn filter_by_id(
+    input: &Path,
+    output: &Path,
+    ids: &ElementIds,
+    include: bool,
+    compression: Compression,
+    direct_io: bool,
+    overrides: &HeaderOverrides,
+    arm: ScanArm,
+) -> Result<GetidStats> {
+    match arm {
+        ScanArm::Walker => filter_by_id_walker(
+            input,
+            output,
+            ids,
+            include,
+            compression,
+            direct_io,
+            overrides,
+        ),
+        ScanArm::Pipelined => {
+            debug_assert!(
+                include,
+                "the pipelined arm implements include mode only; \
+                 removeid is pinned to ScanArm::Walker"
+            );
+            filter_by_id_pipelined(input, output, ids, compression, direct_io, overrides)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+fn filter_by_id_walker(
     input: &Path,
     output: &Path,
     ids: &ElementIds,
@@ -362,6 +449,7 @@ fn filter_by_id(
     );
     let mut blobs_skipped: u64 = 0;
     let mut blobs_passthrough: u64 = 0;
+    let mut osmdata_blobs: u64 = 0;
 
     // Find and decode the leading OsmHeader blob to build the output header.
     let mut writer: Option<PbfWriter<FileWriter>> = None;
@@ -382,6 +470,7 @@ fn filter_by_id(
                 )?);
             }
             BlobKind::OsmData => {
+                osmdata_blobs += 1;
                 let w = writer
                     .as_mut()
                     .ok_or("no OSMHeader blob found before OsmData")?;
@@ -456,6 +545,10 @@ fn filter_by_id(
     }
 
     let mut writer = writer.ok_or("no OSMHeader blob found")?;
+    crate::debug::emit_counter(
+        "walk_actual_osmdata_blobs",
+        i64::try_from(osmdata_blobs).unwrap_or(i64::MAX),
+    );
     if blobs_skipped > 0 {
         eprintln!("[getid] {blobs_skipped} blobs skipped by ID range filter");
     }
@@ -465,6 +558,93 @@ fn filter_by_id(
     writer.flush()?;
     crate::debug::emit_marker("GETID_SCAN_END");
     Ok(stats)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn filter_by_id_pipelined(
+    input: &Path,
+    output: &Path,
+    ids: &ElementIds,
+    compression: Compression,
+    direct_io: bool,
+    overrides: &HeaderOverrides,
+) -> Result<GetidStats> {
+    let reader = ElementReader::open(input, direct_io)?.with_blob_filter(
+        BlobFilter::new(
+            ids.node_ids.has_any(),
+            ids.way_ids.has_any(),
+            ids.relation_ids.has_any(),
+        )
+        .with_id_ranges(
+            coalesced_id_ranges(&ids.node_ids),
+            coalesced_id_ranges(&ids.way_ids),
+            coalesced_id_ranges(&ids.relation_ids),
+        ),
+    );
+    super::warn_locations_on_ways_loss(reader.header());
+    let mut writer = writer_from_header(
+        output,
+        compression,
+        reader.header(),
+        true,
+        overrides,
+        |hb| hb,
+        direct_io,
+        false,
+    )?;
+    let mut stats = GetidStats {
+        nodes_written: 0,
+        ways_written: 0,
+        relations_written: 0,
+    };
+    // Blob skipping happens inside the pipeline here, so the walker arm's
+    // stderr summary is reconstructed from the process-global pipeline
+    // metric. The delta is exact for this command's single pipeline; only
+    // a library caller running concurrent pipelined readers would blur it,
+    // and then only in this informational line.
+    use std::sync::atomic::Ordering::Relaxed;
+    let metric = &crate::read::pipeline_metrics::PIPELINE_METRICS.blobs_skipped_by_filter;
+    let skipped_before = metric.load(Relaxed);
+    crate::debug::emit_marker("GETID_SCAN_START");
+    reader.for_each_block_pipelined(|block| {
+        let mut bb = BlockBuilder::new();
+        let mut blocks = Vec::new();
+        let (nodes, ways, relations) =
+            process_block(&block, &mut bb, &mut blocks, ids, true, None, false)
+                .map_err(std::io::Error::other)?;
+        flush_local(&mut bb, &mut blocks).map_err(std::io::Error::other)?;
+        for (block_bytes, index, tagdata) in blocks {
+            writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+        }
+        stats.nodes_written += nodes;
+        stats.ways_written += ways;
+        stats.relations_written += relations;
+        Ok(())
+    })?;
+    writer.flush()?;
+    crate::debug::emit_marker("GETID_SCAN_END");
+    let blobs_skipped = metric.load(Relaxed).saturating_sub(skipped_before);
+    if blobs_skipped > 0 {
+        eprintln!("[getid] {blobs_skipped} blobs skipped by ID range filter");
+    }
+    Ok(stats)
+}
+
+/// Convert the sparse query set into inclusive intervals for pipeline-time
+/// indexdata prescreening. The exact per-element set remains authoritative
+/// in `process_block`; these ranges only avoid impossible blobs.
+fn coalesced_id_ranges(ids: &IdSet) -> Vec<(i64, i64)> {
+    let mut ranges: Vec<(i64, i64)> = Vec::new();
+    for id in ids.iter() {
+        if let Some((_, end)) = ranges.last_mut()
+            && id == end.saturating_add(1)
+        {
+            *end = id;
+        } else {
+            ranges.push((id, id));
+        }
+    }
+    ranges
 }
 
 // ---------------------------------------------------------------------------
@@ -867,5 +1047,156 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("node id -5"), "{err}");
+    }
+
+    /// Write a node block, then optionally a way block, which can be written
+    /// without indexdata to model a partially indexed input.
+    fn write_blocks(
+        path: &Path,
+        node_ids: &[i64],
+        way: Option<(i64, &[i64])>,
+        index_way_blob: bool,
+    ) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+        writer
+            .write_header(
+                &crate::block_builder::HeaderBuilder::new()
+                    .sorted()
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut block = BlockBuilder::new();
+        for &id in node_ids {
+            block.add_node(id, 0, 0, std::iter::empty::<(&str, &str)>(), None);
+        }
+        writer
+            .write_primitive_block(block.take().unwrap().unwrap())
+            .unwrap();
+        if let Some((way_id, refs)) = way {
+            block.add_way(way_id, std::iter::empty::<(&str, &str)>(), refs, None);
+            let bytes = block.take().unwrap().unwrap();
+            if index_way_blob {
+                writer.write_primitive_block(bytes).unwrap();
+            } else {
+                writer.write_primitive_block_no_indexdata(bytes).unwrap();
+            }
+        }
+        writer.flush().unwrap();
+    }
+
+    fn read_ids(path: &Path) -> Vec<i64> {
+        let mut found = Vec::new();
+        ElementReader::from_path(path)
+            .unwrap()
+            .for_each(|element| match element {
+                Element::DenseNode(node) => found.push(node.id()),
+                Element::Node(node) => found.push(node.id()),
+                Element::Way(way) => found.push(way.id()),
+                Element::Relation(relation) => found.push(relation.id()),
+            })
+            .unwrap();
+        found.sort_unstable();
+        found
+    }
+
+    /// Run the same include-mode query under both arms, assert they emit
+    /// identical element sets, and return that common (sorted) ID list.
+    fn ids_from_both_arms(input: &Path, query: &[&str]) -> Vec<i64> {
+        let dir = tempfile::tempdir().unwrap();
+        let query: Vec<String> = query.iter().map(|s| (*s).to_owned()).collect();
+        let query = parse_ids(&query).unwrap();
+        let walker = dir.path().join("walker.pbf");
+        let pipelined = dir.path().join("pipelined.pbf");
+        for (output, arm) in [(&walker, ScanArm::Walker), (&pipelined, ScanArm::Pipelined)] {
+            filter_by_id(
+                input,
+                output,
+                &query,
+                true,
+                Compression::default(),
+                false,
+                &HeaderOverrides::default(),
+                arm,
+            )
+            .unwrap();
+        }
+        let walker_ids = read_ids(&walker);
+        assert_eq!(walker_ids, read_ids(&pipelined));
+        walker_ids
+    }
+
+    #[test]
+    fn walker_and_pipelined_include_arms_emit_the_same_elements() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.pbf");
+        write_blocks(&input, &[1, 2], Some((10, &[1, 2])), true);
+        assert_eq!(ids_from_both_arms(&input, &["n1", "w10"]), vec![1, 10]);
+    }
+
+    #[test]
+    fn include_arms_agree_on_empty_query_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.pbf");
+        write_blocks(&input, &[1, 2], Some((10, &[1, 2])), true);
+        assert!(ids_from_both_arms(&input, &["n999"]).is_empty());
+    }
+
+    #[test]
+    fn include_arms_agree_on_single_data_blob_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.pbf");
+        write_blocks(&input, &[1, 2], None, true);
+        assert_eq!(ids_from_both_arms(&input, &["n2"]), vec![2]);
+    }
+
+    #[test]
+    fn include_arms_agree_when_a_blob_lacks_indexdata() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.pbf");
+        write_blocks(&input, &[1, 2], Some((10, &[1, 2])), false);
+        assert_eq!(ids_from_both_arms(&input, &["n1", "w10"]), vec![1, 10]);
+    }
+
+    #[test]
+    fn auto_dispatch_crosses_arms_at_the_injected_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.pbf");
+        write_blocks(&input, &[1, 2], Some((10, &[1, 2])), true);
+        let query = parse_ids(&["n1".to_owned(), "w10".to_owned()]).unwrap();
+        let opts = GetidOptions {
+            add_referenced: false,
+            remove_tags: false,
+        };
+        for (min_blobs, expected_arm) in [
+            (1, ScanArm::Pipelined),
+            (PIPELINED_ARM_MIN_BLOBS, ScanArm::Walker),
+        ] {
+            let output = dir.path().join(format!("out-{min_blobs}.pbf"));
+            let (arm, _) = getid_dispatched(
+                &input,
+                &output,
+                &query,
+                &opts,
+                Compression::default(),
+                false,
+                false,
+                &HeaderOverrides::default(),
+                min_blobs,
+            )
+            .unwrap();
+            assert_eq!(arm, Some(expected_arm));
+            assert_eq!(read_ids(&output), vec![1, 10]);
+        }
+    }
+
+    #[test]
+    fn coalesced_id_ranges_merge_adjacent_ids() {
+        let mut ids = IdSet::new();
+        for id in [1, 2, 3, 7, 9, 10] {
+            ids.set(id);
+        }
+        assert_eq!(coalesced_id_ranges(&ids), vec![(1, 3), (7, 7), (9, 10)]);
     }
 }

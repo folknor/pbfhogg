@@ -2,8 +2,13 @@
 
 Status: the getparents and getid include-mode decision is resolved by
 [`ADR-0006`](../decisions/0006-blob-count-threshold-dispatch.md): a bounded
-blob-count estimate dispatches those commands between the walker and
-pipelined reader. Other HeaderWalker consumers remain separately priced.
+blob-count estimate dispatches those commands between the walker and a
+full-file scan (pipelined reader for getparents, sequential streaming for
+getid). Other HeaderWalker consumers remain separately priced. Landing
+gate measurements, including the cross-day I/O environment shift that
+made this file's absolute 8k walls unusable as bounds (~45 % swing in
+steady sequential read rate between sessions, same code, same file), are
+in `performance.md` "Blob-count threshold dispatch landing gates".
 
 PBFs from different producers pack very different numbers of elements per
 blob. On commands that do per-blob fixed work (`HeaderWalker` preads,

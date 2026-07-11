@@ -333,9 +333,9 @@ The consolidated headline table. All rows `--bench 1` unless noted.
 | check --refs | `--bench 1` | **53.8 s** | `7d9f5dfd` | |
 | check --ids (streaming, default) | `--bench 1` | **56.4 s** | `b1fc4d2e` (4fc8e35, 2026-04-27 overnight) | parallel_classify_phase port, 457 MB peak anon |
 | check --ids --full | `--bench 1` | **63.2 s** | post-`01c67da` | |
-| getid (include mode) | `--bench 1` | **6.1 s** | `24362e36` | |
+| getid (include mode) | `--bench 1` | **6.8 s cold / 0.2 s warm** | `264d9dbf` / `12e74756` | dispatch landing `19d3a62`, 2026-07-11; cache-state dominated, see ADR-0006 gates below |
 | getid --invert | `--bench 1` | 91.0 s | `40f5bd52` | |
-| getparents | `--bench 1` | **23.5 s** | `11bc44dc` | |
+| getparents | `--bench 1` | **19.0 s** | `a7c064eb` | dispatch landing `2306fd9`, 2026-07-11; was 23.5 s (`11bc44dc`) |
 | inspect default (index-only) | `--bench 1` | **6.5 s** | `c146f2bb` | |
 | inspect --nodes `-j 16` | `--bench 1` | **49.4 s** | post-`01c67da` | |
 | inspect --tags `-j 16` | `--bench 1` | **168.3 s** | `9d741341` / post-`01c67da` | |
@@ -394,6 +394,65 @@ The consolidated headline table. All rows `--bench 1` unless noted.
 > the wrong way; both `--bench 3`, several dozen unrelated commits
 > in-between, ~5 % is inside variance but not comfortably. Not a
 > release blocker and not steady-state critical; shelved.
+
+### Blob-count threshold dispatch landing gates (ADR-0006, plantasjen, 2026-07-11)
+
+getparents and getid include mode dispatch between the pread header
+walker and a full-file scan at an estimated 150,000 OSMData blobs
+([`decisions/0006`](../decisions/0006-blob-count-threshold-dispatch.md)).
+Landing commits `3adb44c` (getparents), `2306fd9` (getid), `dad28de`
+(batch-parallel classify fix), `19d3a62` (getid streaming-arm fix).
+Gate cells, all measured at HEAD of the day:
+
+| cell | arm (estimate) | wall | UUID | reference (2026-07-10) | verdict |
+|---|---|---:|---|---:|---|
+| getparents planet primary | Walker (36,063) | **19.0 s** | `a7c064eb` | 23.5 s walker | pass |
+| getparents europe `--bench` | FullScan (458,132) | **22.2 s** | `9f8602a2` | 26.4 s scan | pass |
+| getparents planet 8k | FullScan (899,866) | 62.0 s | `595e8d7e` | 52.8 s scan (`2b3e496e`) | pass by same-day A/B: `68e1ba0` re-run today 69.4 s (`0e2c2313`), HEAD -11 % |
+| getid planet primary | Walker (36,063) | 6.8 s cold / **0.2 s warm** | `264d9dbf` / `12e74756` | 6.1 s walker | pass; cache-state dominated |
+| getid europe `--bench` | FullScan (458,132) | **17.6 s** | `6b9ad93c` | 17.9 s scan | pass |
+| getid planet 8k | FullScan (899,866) | 48.6 s | `ddf6fed4` | 33.2 s scan (`c0d89d8f`) | pass by same-day A/B: `51c662e` re-run today 48.2 s (`80e726bf`), HEAD +0.8 % |
+
+Disk read on the 8k FullScan cells is the whole file (~96 GB - the
+kind filter and prescreen skip decompression, not bytes); the walker
+cells read only headers plus matching bodies. The 8k profiles confirm
+the mechanism: no schedule/walk phase on the FullScan arm.
+
+**Same-day A/B rule for I/O-bound cells.** The 8k cells missed their
+pre-registered absolute bounds (52.8 s + 10 %, 33.2 s + 10 %) for a
+reason that had nothing to do with the code: the machine's steady
+sequential buffered read rate on this file was ~2.95 GB/s on the
+evening of 2026-07-10 and ~2.03 GB/s on the morning of 2026-07-11.
+Both runs are flat-rate for their whole duration; page-cache eviction
+(interposing a 26 GB europe read) changed nothing; no reboot between
+the sessions; `read_ahead_kb` 128 both days. Re-running the *reference
+commits themselves* via `--commit` reproduced today's regime, not
+yesterday's - the April getid binary did 48.2 s against its own 33.2 s
+from the previous evening. Verdicts for those cells were therefore
+taken on same-day `--commit` A/B, which is the discipline to reuse:
+absolute wall bounds carried across days on I/O-bound cells can be off
+by ~45 % from environment alone.
+
+**Two refuted shapes** hit the gates before the landing settled (both
+recorded in ADR-0006): classify on the pipeline consumer thread
+(getparents 8k 142.8 s, `cbd4c0a3` - one thread serialized a billion
+way-ref checks behind the parallel decode) and the pipelined reader as
+getid's scan arm (53.9 s, `3a9990e5` - per-frame pipeline overhead
+times 1.45 M small blobs loses 62 % to sequential streaming reads).
+
+**Estimator accuracy** (`walk_estimated_blobs` vs exact count):
+
+| encoding | actual | estimate | error |
+|---|---:|---:|---:|
+| planet primary | 50,816 | 36,063 | -29 % |
+| europe | 522,168 | 458,132 | -12 % |
+| planet 8k | 1,453,433 | 899,866 | -38 % |
+
+The head-of-file sample over-weights node frames, which run larger
+than the file-wide mean on all three encodings, so the estimator
+undershoots consistently. Every arm choice was still correct - the
+dispatch discriminates a >= 3x gap and the worst error is 1.6x - but
+any future move of the 150 k constant must price this bias.
 
 ### HeaderWalker / next_header_skip_blob regression check (commit `436998b`, re-measured 2026-04-26 at `16e3694`)
 

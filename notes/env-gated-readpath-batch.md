@@ -54,15 +54,14 @@ verdict. **The user explicitly overrode both rules for this batch
 - **One `brokkr read` invocation stores FOUR UUIDs** (one per variant, in
   fixed order sequential/parallel/pipelined/blobreader). The read-out
   protocol pairs per-variant, fourth-to-fourth etc., never line-to-line.
-- **`brokkr read` rows store no sidecar data** (the sidecar lands under
-  `dirty` and each subsequent variant overwrites it - brokkr-side
-  limitation, confirmed against results.db). Read-pair verdicts are
-  therefore WALL-ONLY, from the stored elapsed per variant UUID.
-  `brokkr sidecar --compare` is available for the command cells (getid,
-  getparents, tags-filter, time-filter, altw), not for read cells. If a
-  read-side RSS question survives the night, it gets an attended follow-up
-  run; fixing brokkr's read sidecar is a separate brokkr-repo ask, not a
-  brick here.
+- **`brokkr read` sidecar: FIXED in brokkr `ab1762e` (2026-07-11).** The
+  old limitation (sidecar landed under `dirty`, each variant clobbering
+  the last) is gone for fresh runs: read rows now carry sidecar data
+  under their real UUIDs, so `brokkr sidecar <uuid>` and `--compare`
+  adjudicate read pairs directly. Wall remains the primary verdict axis;
+  per-phase RSS is now available as supporting evidence. UUIDs stored
+  before the fix stay empty - only overnight-run rows (all fresh) get
+  sidecar data.
 - **In-test gate coverage never uses `std::env::set_var`** (racy under the
   parallel test harness, unsafe in edition 2024). The pinned mechanism:
   the env var is read at exactly ONE entry point per knob and plumbed as a
@@ -199,7 +198,9 @@ verdict. **The user explicitly overrode both rules for this batch
     twin; same pair with `--snapshot 8k`. (Exact expr pinned by the spec
     to whatever brokkr's tags-filter axis accepts for `-R`.)
   - altw decode-all pair per the spec's sizing decision (europe raw
-    sparse).
+    sparse). The brokkr `--force-altw` brick this pair needs LANDED
+    2026-07-11 (brokkr `5f6ce56`), so the pair is unconditional; the
+    spec's pre-flight argv check stays as cheap insurance.
 - Verdict: command walls (>= 3 % on at least the 8k signal cells to keep)
   and per-phase RSS via `brokkr sidecar --compare` (the ~90 MB batch
   materialization should drop).

@@ -399,6 +399,9 @@ enum Command {
         /// Also include the queried objects themselves in the output
         #[arg(short = 's', long = "add-self")]
         add_self: bool,
+        /// Test instrument: override the ADR-0006 FullScan dispatch threshold.
+        #[arg(long, hide = true)]
+        full_scan_min_blobs: Option<u64>,
         /// Read IDs from text file (one per line, e.g. n123)
         #[arg(short = 'i', long = "id-file")]
         id_file: Option<PathBuf>,
@@ -1090,6 +1093,7 @@ fn main() -> process::ExitCode {
                 file,
                 output,
                 add_self,
+                full_scan_min_blobs,
                 id_file,
                 id_osm_file,
                 default_type,
@@ -1108,6 +1112,7 @@ fn main() -> process::ExitCode {
                 &compression.compression,
                 io.direct_io,
                 &HeaderOverrides::parse(header.generator, &header.output_headers)?,
+                full_scan_min_blobs,
             ),
             Command::Extract {
                 file,
@@ -2130,19 +2135,33 @@ fn run_getparents(
     compression: &str,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    full_scan_min_blobs: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, direct_io)?;
     let opts = pbfhogg::getparents::GetparentsOptions { add_self };
-    let stats = pbfhogg::getparents::getparents(
-        file,
-        output,
-        &id_set,
-        &opts,
-        compression,
-        direct_io,
-        overrides,
-    )?;
+    let stats = if let Some(min_blobs) = full_scan_min_blobs {
+        pbfhogg::getparents::getparents_with_min_blobs(
+            file,
+            output,
+            &id_set,
+            &opts,
+            compression,
+            direct_io,
+            overrides,
+            min_blobs,
+        )?
+    } else {
+        pbfhogg::getparents::getparents(
+            file,
+            output,
+            &id_set,
+            &opts,
+            compression,
+            direct_io,
+            overrides,
+        )?
+    };
     stats.print_summary();
     Ok(())
 }

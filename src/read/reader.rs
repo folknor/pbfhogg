@@ -129,6 +129,13 @@ impl<R: Read + Send> ElementReader<R> {
         self
     }
 
+    /// Test-only routing control for the gated ordered batch pipeline.
+    #[doc(hidden)]
+    pub fn batched_pipeline(mut self, enabled: bool) -> Self {
+        self.pipeline_config.batched = enabled;
+        self
+    }
+
     /// Sets a byte budget for decoded blocks queued for an iterator consumer.
     /// A configured budget raises the count backstop to 128 blocks.
     pub fn block_queue_bytes(mut self, bytes: usize) -> Self {
@@ -304,13 +311,23 @@ impl<R: Read + Send> ElementReader<R> {
     where
         F: FnMut(PrimitiveBlock) -> Result<()>,
     {
-        super::pipeline::run_pipeline(
-            self.blob_iter,
-            self.decode_threads,
-            self.pipeline_config,
-            self.blob_filter,
-            f,
-        )
+        if self.pipeline_config.batched {
+            super::batched_pipeline::run_batched_pipeline(
+                self.blob_iter,
+                self.decode_threads,
+                self.pipeline_config,
+                self.blob_filter,
+                f,
+            )
+        } else {
+            super::pipeline::run_pipeline(
+                self.blob_iter,
+                self.decode_threads,
+                self.pipeline_config,
+                self.blob_filter,
+                f,
+            )
+        }
     }
 
     /// Returns an iterator of decoded [`PrimitiveBlock`]s from the pipelined reader.
@@ -350,22 +367,33 @@ impl<R: Read + Send> ElementReader<R> {
             .map(super::pipeline::ByteBudget::new)
             .map(Arc::new);
         let handle = std::thread::spawn(move || {
-            let result = super::pipeline::run_pipeline(
-                blob_iter,
-                decode_threads,
-                pipeline_config,
-                blob_filter,
-                |block| {
-                    let permit = queue_budget
-                        .as_ref()
-                        .map(|budget| budget.acquire(block.decompressed_size()));
-                    tx.send((Ok(block), permit)).map_err(|_| {
-                        new_error(ErrorKind::Io(std::io::Error::other(
-                            "pipeline consumer dropped",
-                        )))
-                    })
-                },
-            );
+            let deliver = |block: PrimitiveBlock| {
+                let permit = queue_budget
+                    .as_ref()
+                    .map(|budget| budget.acquire(block.decompressed_size()));
+                tx.send((Ok(block), permit)).map_err(|_| {
+                    new_error(ErrorKind::Io(std::io::Error::other(
+                        "pipeline consumer dropped",
+                    )))
+                })
+            };
+            let result = if pipeline_config.batched {
+                super::batched_pipeline::run_batched_pipeline(
+                    blob_iter,
+                    decode_threads,
+                    pipeline_config,
+                    blob_filter,
+                    deliver,
+                )
+            } else {
+                super::pipeline::run_pipeline(
+                    blob_iter,
+                    decode_threads,
+                    pipeline_config,
+                    blob_filter,
+                    deliver,
+                )
+            };
             if let Err(e) = result {
                 // Deliver the error as the last iterator item.
                 // Ignore send failure - consumer may have already dropped.

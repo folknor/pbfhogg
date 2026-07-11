@@ -858,7 +858,13 @@ the tier-1 contract. Gates:
   attended once the brick lands.
 
 **External prerequisite (R1 finding 1, blocker): a brokkr-side brick,
-owned by the user.** brokkr's `--force` is ONLY its own dirty-tree
+owned by the user. STATUS: LANDED 2026-07-11, brokkr commit `5f6ce56` -
+`--force-altw` exists, forwards pbfhogg `--force`, composes with
+`--inject-prepass`/`--index-type`/`--compression`, and the exact europe
+cell below was confirmed working verbatim by the brokkr dev. The
+pre-flight below still runs (cheap insurance); the fallback clause
+remains but should not trigger.** Original analysis, kept for the
+record: brokkr's `--force` is ONLY its own dirty-tree
 override: `AddLocationsToWays` has no command-specific force field and
 its argument builder never appends `--force` to the child command
 (R1, confirmed by dry-run - the generated child argv contained

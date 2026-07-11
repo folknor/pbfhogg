@@ -88,6 +88,12 @@ impl CliInvoker {
         self
     }
 
+    /// Set one environment variable for this child process only.
+    pub fn env<K: AsRef<OsStr>, V: AsRef<OsStr>>(mut self, key: K, val: V) -> Self {
+        self.cmd.env(key, val);
+        self
+    }
+
     /// Set bytes to feed on the binary's stdin.
     pub fn stdin_bytes(mut self, bytes: impl Into<Vec<u8>>) -> Self {
         self.stdin = Some(bytes.into());

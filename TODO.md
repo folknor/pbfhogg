@@ -325,13 +325,14 @@ add it here with the per-worker upper bound at planet scale.
 ### Blocked on dataset / config
 
 - [ ] **Injected-prepass flag-ON planet verdict**. The producer landed
-  2026-07-11 (`29e4eab`, ADR-0007) with flag-OFF neutrality shown, but
-  the flag-ON planet bench - both the altw regression bound and the
-  first end-to-end sidecar-counter exercise - waits on two things:
-  the brokkr `--inject-prepass` passthrough brick in `~/Programs/brokkr`
-  (no benchable inject variant exists until then), and an explicit
-  user green-light for the run. See `reference/pipeline.md` for the
-  full gate context.
+  2026-07-11 (`29e4eab`, ADR-0007) with flag-OFF neutrality shown. The
+  brokkr `--inject-prepass` passthrough LANDED the same day (brokkr
+  `e50a679`; the flag lands in recorded cli_args like `--direct-io`
+  does, no separate variant column needed), so the flag-ON planet
+  bench - the altw regression bound against the 546.0 s baseline and
+  the first end-to-end exercise of the four `altw_*` sidecar counters -
+  now waits ONLY on an explicit user green-light for the run. See
+  `reference/pipeline.md` for the full gate context.
 - [ ] **History PBF for `time-filter`**. pbfhogg supports per-element
   version history and visibility, but `brokkr.toml` has no history
   variant on any dataset. `time-filter` benches on a regular PBF

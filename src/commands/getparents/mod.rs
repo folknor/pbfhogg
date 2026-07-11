@@ -78,6 +78,32 @@ pub fn getparents(
     Ok(stats)
 }
 
+/// Test instrument for exercising the FullScan arm on small fixtures.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn getparents_with_min_blobs(
+    input: &Path,
+    output: &Path,
+    ids: &ElementIds,
+    opts: &GetparentsOptions,
+    compression: Compression,
+    direct_io: bool,
+    overrides: &HeaderOverrides,
+    min_blobs: u64,
+) -> Result<GetparentsStats> {
+    getparents_dispatched(
+        input,
+        output,
+        ids,
+        opts,
+        compression,
+        direct_io,
+        overrides,
+        min_blobs,
+    )
+    .map(|(_, stats)| stats)
+}
+
 /// Dispatch on the blob-count estimate, then run the selected arm. Returns
 /// the arm alongside the stats so tests can inject `min_blobs` and assert
 /// which arm auto-dispatch actually executed.

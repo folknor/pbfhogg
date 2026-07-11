@@ -1,3 +1,4 @@
+pub(crate) mod batched_pipeline;
 pub mod blob;
 pub(crate) mod blob_wire;
 pub mod block;
@@ -21,5 +22,12 @@ pub mod pipeline_test_hooks {
     pub use super::pipeline::test_hooks::{
         BLOCK_DECODE_SEQ, BLOCKED_DECODE_READY, RELEASE_BLOCKED_DECODE, REORDER_FILLED_HIGH_WATER,
         REORDER_WINDOW_HIGH_WATER, reset,
+    };
+}
+
+#[cfg(feature = "test-hooks")]
+pub mod batched_pipeline_test_hooks {
+    pub use super::batched_pipeline::test_hooks::{
+        PANIC_BATCH_SEQ, RELEASE_STALLED, STALL_BATCH_SEQ, STALLED_READY, reorder_high_water, reset,
     };
 }

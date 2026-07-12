@@ -454,6 +454,29 @@ undershoots consistently. Every arm choice was still correct - the
 dispatch discriminates a >= 3x gap and the worst error is 1.6x - but
 any future move of the 150 k constant must price this bias.
 
+### Fused command transforms (ADR-0009, 2026-07-12, plantasjen)
+
+The FullScan / pipelined command arms above now run their transform
+inside the decode workers rather than materializing 64-block batches and
+re-dispatching to a second rayon pool. Same-night A/B at commit
+`a65cecc`, best of `--bench 3`:
+
+| cell | baseline | fused | delta |
+|---|---:|---:|---:|
+| getid planet-8k `--add-referenced` | 197.9 s | **182.7 s** | -7.68 % |
+| getparents planet-8k FullScan | 63.0 s | **58.9 s** | -6.51 % |
+| tags-filter `-R` planet-8k | 45.9 s | **42.7 s** | -6.97 % |
+| tags-filter `-R` planet primary | 52.8 s | **49.5 s** | -6.25 % |
+| getid planet primary `--add-referenced` | 96.3 s | **83.9 s** | -12.88 % |
+
+The getid cells are `--add-referenced` pass 2 (heavier than the
+include-mode getid rows above). getid primary pass-2 peak RSS also fell
+1.18 GB -> 596 MB (the batch materialization is gone). The altw
+decode-all europe-raw signal cell OOM-killed on this 23 GB host, so its
+large-scale wall is unmeasured. Full arc and the reverted sibling
+experiments (batched pipeline, byte knobs) in
+`reference/performance-history.md` "Env-gated read-path batch".
+
 ### HeaderWalker / next_header_skip_blob regression check (commit `436998b`, re-measured 2026-04-26 at `16e3694`)
 
 The `436998b` (2026-04-26) read-path truncation alignment added small

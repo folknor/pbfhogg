@@ -778,3 +778,8 @@ commit messages and PR descriptions.
   `a0a2e3b`, validated same day; findings in "Pipelined-reader
   decode-admission bound" above; root cause + bound semantics live in
   `run_pipeline`'s doc comment and `pipeline_metrics.rs`).
+- `notes/env-gated-readpath-batch.md`, `notes/fusion-spec.md`,
+  `notes/pipeline-rebuild-spec.md` (the 2026-07-12 env-gated batch:
+  plan of record plus the fusion and batched-pipeline specs; verdicts
+  in "Env-gated read-path batch" above, fusion kept as ADR-0009, the
+  batched engine and byte knobs reverted).

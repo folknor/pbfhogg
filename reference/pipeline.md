@@ -104,7 +104,7 @@ No `--type` filter: reads raw blob frames, adds indexdata via `reframe_raw_with_
 
 ### cat --type / --clean
 
-Blob filter → pipelined decode → element-level type check → `BlockBuilder` → pipelined write. Batch processing (64 blocks or 32 MB budget).
+Blob filter → pread-worker parallel decode + reframe, file order restored by a `ReorderBuffer` → element-level type check / clean → `BlockBuilder` re-encode → write. Migrated off the earlier `into_blocks_pipelined` + batch-budget path (see `src/commands/cat/mod.rs`).
 
 ### cat --dedupe
 

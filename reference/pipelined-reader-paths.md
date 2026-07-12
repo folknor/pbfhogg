@@ -1,18 +1,35 @@
 # Pipelined reader paths
 
-Reference for every current caller of `ElementReader::into_blocks_pipelined`
-(`src/read/pipeline.rs`). Workload profile, batch shape, and the rule
-for adding or converting callers.
+Reference for every current caller of the ordered pipelined reader
+surfaces on `ElementReader` (`src/read/pipeline.rs`): the plain
+`into_blocks_pipelined` / `for_each_block_pipelined` / `for_each_pipelined`
+(engine `run_pipeline`) and the fused `for_each_fused_block`
+(engine `run_pipeline_fused`). Workload profile, decode shape, and the
+rule for adding or converting callers.
 
 ## Background
 
-`into_blocks_pipelined` spawns a private rayon decode pool
+Both surfaces spawn a private rayon decode pool
 (`available_parallelism() - 2` threads) that decompresses and parses
-blobs into `PrimitiveBlock`s and sends them through a channel. Most
-consumers then batch-dispatch the blocks to the **global** rayon pool
-via `par_iter`. Two concurrent pools means ~14 threads on an 8-core
-host, which is deliberate: the decode pool stays busy producing the
-next batch while the global pool processes the current one.
+blobs into `PrimitiveBlock`s and delivers them in file order to a
+consumer serialized on the calling thread.
+
+**Plain** (`into_blocks_pipelined` and friends): the decode pool
+produces `PrimitiveBlock`s and the consumer processes them directly.
+Callers today are the `read` bench, `time-filter` history, and
+`build-geocode-index` pass 1.
+
+**Fused** (`for_each_fused_block`, landed 2026-07-12, ADR-0009 in
+`decisions/0009-fused-command-transforms.md`): the per-block command
+transform runs INSIDE the decode worker - decode and transform on the
+same thread - and only the compact `(Vec<OwnedBlock>, stats)` result
+crosses to the ordered consumer. There is no second rayon dispatch and
+no 64-block materialization. The earlier shape that batch-dispatched
+decoded blocks to the **global** rayon pool via `par_iter` (~14 threads
+on an 8-core host) is gone; the four full-scan commands below carry
+their transform on the decode workers instead. Measured wins at high
+blob count: getid `--add-referenced` -7.7 %, getparents FullScan
+-6.5 %, tags-filter `-R` -7.0 % (planet-8k, 2026-07-12).
 
 Alternative primitives used elsewhere in the codebase:
 
@@ -60,15 +77,27 @@ the file.
 
 ### `getid --add-referenced` pass 2
 
-- **Path:** `src/commands/getid/mod.rs`, two-pass mode only
-- **Scale:** niche. The single-pass include / invert path is the
-  common one and uses `HeaderWalker` + raw-frame reads, no pipelined
-  decode at all.
+- **Surface:** fused (`for_each_fused_block`)
+- **Path:** `src/commands/getid/mod.rs`, `--add-referenced` mode only
+- **Scale:** the plain include / invert path is the common one and uses
+  `HeaderWalker` + raw-frame reads, no pipelined decode at all.
 - **Per-block work:** light - `IdSet::get` per element, most
   skipped, a few re-encoded through `BlockBuilder`
 
+### `getparents` FullScan arm
+
+- **Surface:** fused (`for_each_fused_block`)
+- **Path:** `src/commands/getparents/mod.rs`, FullScan arm
+- **Scale:** high-blob-count encodings only. ADR-0006 dispatches
+  low-blob-count planet (~36 k blobs) to the `HeaderWalker` arm; the
+  FullScan arm runs at ~150 k+ estimated OSMData blobs (Geofabrik-style
+  8k encodings).
+- **Per-block work:** light - membership check per element, matched
+  parents re-encoded through `BlockBuilder`
+
 ### `tags-filter -R <expr>` single-pass
 
+- **Surface:** fused (`for_each_fused_block`)
 - **Path:** `src/commands/tags_filter/mod.rs` single-pass branch
 - **Scale:** every element touched
 - **Per-block work:** heavy - tag iteration, expression match
@@ -80,6 +109,7 @@ the file.
 
 ### `add-locations-to-ways` decode-all fallback
 
+- **Surface:** fused (`for_each_fused_block`)
 - **Path:** `src/commands/altw/mod.rs`, `write_output_decode_all`
 - **Scale:** triggered only by `--force` on non-indexed PBFs.
   Production `--index-type external` uses pread workers.
@@ -92,6 +122,7 @@ the file.
 
 ### `time-filter` history path
 
+- **Surface:** plain (`for_each_pipelined`)
 - **Path:** `src/commands/time_filter/mod.rs`, history mode
 - **Scale:** history PBF scan; every element touched
 - **Per-block work:** medium - timestamp compare, `PendingGroup`
@@ -99,6 +130,7 @@ the file.
 
 ### `build-geocode-index` pass 1
 
+- **Surface:** plain (`for_each_block_pipelined`)
 - **Path:** `src/geocode_index/builder/pass1.rs`, `only_relations()`
 - **Scale:** filtered relation scan
 - **Per-block work:** bounded relation metadata extraction
@@ -131,8 +163,9 @@ should stay that way:
   pread workers
 - `getid` single-pass (include / invert) - `HeaderWalker` +
   raw-frame reads
-- `getparents` - blob-filtered pipelined history is retired; current
-  code does not use `ElementReader::into_blocks_pipelined`
+- `getparents` walker arm - `HeaderWalker` (pread-only). The FullScan
+  arm IS a fused pipelined caller (see Callers above); ADR-0006 picks
+  the arm by blob count.
 - `time-filter` snapshot path - `parallel_classify_phase`
 
 ## Adding a new pipelined caller
@@ -150,9 +183,13 @@ Decision order:
    blobs?** (e.g. merge-join, ID-remap with cross-blob state). If
    yes, pipelined decode is the right primitive. Retention is
    handled for you by `DecompressPool`.
-3. **Is the consumer dispatching blocks to a par_iter?** If yes,
-   pipelined decode is fine and the decode/process overlap is
-   measurably positive (see cat and ALTW decode-all).
+3. **Does the consumer run a per-block transform (decode, then
+   re-encode or filter)?** Use the fused surface `for_each_fused_block`:
+   the transform runs on the decode worker and only the compact
+   `(Vec<OwnedBlock>, stats)` result crosses to the ordered consumer -
+   no second rayon pool, no 64-block materialization. This replaced the
+   earlier decode-then-`par_iter` shape (see the four fused callers
+   above).
 
 Do not convert an existing pipelined caller to sequential decode
 "to avoid oversubscription" without a fresh benchmark showing the

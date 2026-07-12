@@ -530,7 +530,11 @@ Single-pass multi-extract shipped for simple strategy on sorted input
 regions, writes to N sync-mode PbfWriters. 3-phase barrier (nodes →
 ways → relations) with per-region IdSet + BlockBuilder. Memory:
 N × ~1.5 GB at planet scale. Falls back to sequential for unsorted
-input or --clean. Verified via `brokkr verify multi-extract`.
+input or --clean. Verified via `brokkr verify multi-extract`. Node
+classify (the only coordinate-driven phase) is grid-pruned at N ≥ 16
+regions via a CSR region grid (256 MiB coverage budget, linear
+fallback above it); way/relation classify stay linear (IdSet
+membership, not spatial).
 
 **Known issues:**
 
@@ -543,10 +547,6 @@ input or --clean. Verified via `brokkr verify multi-extract`.
 
 **v2 improvements:**
 
-- [ ] **Spatial index** - grid or R-tree over regions for O(1)
-  per-element lookup instead of O(N). Required for 200+ regions where
-  linear scan becomes the bottleneck. Simple grid (3600×1800 cells of
-  0.1°, precompute overlapping regions per cell) is sufficient.
 - [ ] **Complete/smart strategies** - per-region way/relation ID
   tracking. Memory: N × ~3 GB (bbox_node_ids + all_way_node_ids per
   region). Feasible for ~10 regions on 30 GB host, ~40 on 128 GB.

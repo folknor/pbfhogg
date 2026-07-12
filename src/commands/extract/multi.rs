@@ -11,6 +11,7 @@ use super::super::{
     ensure_way_capacity_local, flush_local,
 };
 use crate::idset::IdSet;
+use crate::read::region_grid::RegionGrid;
 
 use super::common::{BboxInt, relation_has_matched_member, spatial_blob_filter};
 use super::{ExtractSlot, ExtractStats, Region};
@@ -250,12 +251,17 @@ pub(super) fn try_extract_multi_single_pass(
     // contiguous arrays) with single-pass multi-region classification.
     // Polygon regions fall back to element-by-element iteration.
     let all_bbox = slots.iter().all(|s| matches!(s.region, Region::Bbox(_)));
+    const GRID_REGION_THRESHOLD: usize = 16;
+    let region_bboxes: Vec<(i32, i32, i32, i32)> = bbox_ints
+        .iter()
+        .map(|bi| (bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon))
+        .collect();
+    let grid = (n >= GRID_REGION_THRESHOLD)
+        .then(|| RegionGrid::build(&region_bboxes))
+        .flatten();
     crate::debug::emit_marker("MULTI_NODE_CLASSIFY_START");
     if all_bbox {
-        let bboxes: Vec<(i32, i32, i32, i32)> = bbox_ints
-            .iter()
-            .map(|bi| (bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon))
-            .collect();
+        let bboxes = region_bboxes;
         crate::scan::classify::parallel_classify_phase(
             &shared_file,
             &node_schedule,
@@ -271,7 +277,12 @@ pub(super) fn try_extract_multi_single_pass(
                 for v in scratch.iter_mut() {
                     v.clear();
                 }
-                columns.collect_matching_ids_multi_bbox(&bboxes, scratch);
+                match &grid {
+                    Some(grid) => {
+                        columns.collect_matching_ids_multi_bbox_grid(&bboxes, grid, scratch);
+                    }
+                    None => columns.collect_matching_ids_multi_bbox(&bboxes, scratch),
+                }
                 scratch.iter_mut().map(std::mem::take).collect::<Vec<_>>()
             },
             |_seq, region_ids: Vec<Vec<i64>>| {
@@ -293,26 +304,39 @@ pub(super) fn try_extract_multi_single_pass(
                     v.clear();
                 }
                 for element in block.elements_skip_metadata() {
-                    match &element {
-                        Element::DenseNode(dn) => {
-                            let lat = dn.decimicro_lat();
-                            let lon = dn.decimicro_lon();
-                            for i in 0..n {
-                                if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
-                                    scratch[i].push(dn.id());
+                    let (id, lat, lon) = match &element {
+                        Element::DenseNode(node) => {
+                            (node.id(), node.decimicro_lat(), node.decimicro_lon())
+                        }
+                        Element::Node(node) => {
+                            (node.id(), node.decimicro_lat(), node.decimicro_lon())
+                        }
+                        _ => continue,
+                    };
+                    match &grid {
+                        Some(grid) => {
+                            for &region in grid.candidates(lat, lon) {
+                                let region = region as usize;
+                                if slots[region].region.contains_decimicro(
+                                    &bbox_ints[region],
+                                    lat,
+                                    lon,
+                                ) {
+                                    scratch[region].push(id);
                                 }
                             }
                         }
-                        Element::Node(nd) => {
-                            let lat = nd.decimicro_lat();
-                            let lon = nd.decimicro_lon();
-                            for i in 0..n {
-                                if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
-                                    scratch[i].push(nd.id());
+                        None => {
+                            for region in 0..n {
+                                if slots[region].region.contains_decimicro(
+                                    &bbox_ints[region],
+                                    lat,
+                                    lon,
+                                ) {
+                                    scratch[region].push(id);
                                 }
                             }
                         }
-                        _ => {}
                     }
                 }
                 scratch.iter_mut().map(std::mem::take).collect::<Vec<_>>()

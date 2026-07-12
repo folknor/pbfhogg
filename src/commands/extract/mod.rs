@@ -959,6 +959,152 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Grid-pruned vs linear classify parity (real contains_decimicro)
+    // -----------------------------------------------------------------------
+
+    /// The grid narrows the candidate regions per point; every candidate is
+    /// still re-tested with the exact `contains_decimicro`. This pins that the
+    /// grid-pruned classify reproduces the brute-force linear classify exactly,
+    /// including per-region push order, over a mix of bbox and polygon regions
+    /// (with a hole, an antimeridian full-width polygon, and a pole-adjacent
+    /// polygon) using the real containment test - so conservative-cover false
+    /// positives are rejected identically.
+    /// Build the 24-region mix (bbox band, polygon squares, a holed polygon,
+    /// an antimeridian full-width polygon, and a pole-adjacent polygon) used by
+    /// [`polygon_mixed_grid_parity`]. Split out to keep that test's body within
+    /// the line budget.
+    fn mixed_parity_regions() -> Vec<Region> {
+        fn square(lon0: f64, lat0: f64, size: f64) -> Vec<(f64, f64)> {
+            vec![
+                (lon0, lat0),
+                (lon0 + size, lat0),
+                (lon0 + size, lat0 + size),
+                (lon0, lat0 + size),
+                (lon0, lat0),
+            ]
+        }
+        fn poly(exterior: Vec<(f64, f64)>, holes: Vec<Vec<(f64, f64)>>) -> Region {
+            let mut min_lon = f64::MAX;
+            let mut min_lat = f64::MAX;
+            let mut max_lon = f64::MIN;
+            let mut max_lat = f64::MIN;
+            for &(x, y) in &exterior {
+                min_lon = min_lon.min(x);
+                max_lon = max_lon.max(x);
+                min_lat = min_lat.min(y);
+                max_lat = max_lat.max(y);
+            }
+            Region::Polygon {
+                polygons: vec![PolygonRings { exterior, holes }],
+                bbox: Bbox {
+                    min_lon,
+                    min_lat,
+                    max_lon,
+                    max_lat,
+                },
+            }
+        }
+
+        let mut regions: Vec<Region> = Vec::new();
+        // 12 bbox regions tiling a longitude band.
+        for k in 0..12 {
+            let lon0 = -30.0 + f64::from(k) * 6.0;
+            regions.push(Region::Bbox(Bbox {
+                min_lon: lon0,
+                min_lat: 0.0,
+                max_lon: lon0 + 5.0,
+                max_lat: 20.0,
+            }));
+        }
+        // 8 polygon squares.
+        for k in 0..8 {
+            let lon0 = -20.0 + f64::from(k) * 5.0;
+            regions.push(poly(square(lon0, -10.0, 6.0), vec![]));
+        }
+        // Polygon with a hole.
+        regions.push(poly(square(0.0, 0.0, 10.0), vec![square(3.0, 3.0, 4.0)]));
+        // Antimeridian-crossing polygon -> full-width bbox.
+        regions.push(Region::Polygon {
+            polygons: vec![PolygonRings {
+                exterior: vec![
+                    (179.0, 10.0),
+                    (-179.0, 10.0),
+                    (-179.0, 12.0),
+                    (179.0, 12.0),
+                    (179.0, 10.0),
+                ],
+                holes: vec![],
+            }],
+            bbox: Bbox {
+                min_lon: -180.0,
+                min_lat: 10.0,
+                max_lon: 180.0,
+                max_lat: 12.0,
+            },
+        });
+        // Pole-adjacent polygon.
+        regions.push(poly(square(0.0, 85.0, 4.0), vec![]));
+        // One more bbox in the southern hemisphere to reach 24.
+        regions.push(Region::Bbox(Bbox {
+            min_lon: 100.0,
+            min_lat: -80.0,
+            max_lon: 120.0,
+            max_lat: -60.0,
+        }));
+        assert_eq!(regions.len(), 24);
+        regions
+    }
+
+    // The two `(-.. + (xs(..) % ..) as i64) as i32` narrowings sample a point
+    // whose latitude stays in +/-9e8 and longitude in +/-1.8e9 - both inside the
+    // i32 decimicrodegree domain - so the u64->i64 and i64->i32 casts are lossless.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    #[test]
+    fn polygon_mixed_grid_parity() {
+        use crate::read::region_grid::RegionGrid;
+
+        fn xs(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+
+        let regions = mixed_parity_regions();
+
+        let bbox_ints: Vec<common::BboxInt> = regions
+            .iter()
+            .map(|r| common::BboxInt::from_bbox(r.bbox()))
+            .collect();
+        let region_bboxes: Vec<(i32, i32, i32, i32)> = bbox_ints
+            .iter()
+            .map(|b| (b.min_lat, b.max_lat, b.min_lon, b.max_lon))
+            .collect();
+        let grid = RegionGrid::build(&region_bboxes).expect("fixture within budget");
+
+        let n = regions.len();
+        let mut linear = vec![Vec::<i64>::new(); n];
+        let mut pruned = vec![Vec::<i64>::new(); n];
+        let mut state = 0xDEAD_BEEF_CAFE_F00D_u64;
+        for id in 0..2_000_i64 {
+            let lat = (-900_000_000_i64 + (xs(&mut state) % 1_800_000_001) as i64) as i32;
+            let lon = (-1_800_000_000_i64 + (xs(&mut state) % 3_600_000_001) as i64) as i32;
+            for i in 0..n {
+                if regions[i].contains_decimicro(&bbox_ints[i], lat, lon) {
+                    linear[i].push(id);
+                }
+            }
+            for &j in grid.candidates(lat, lon) {
+                let j = j as usize;
+                if regions[j].contains_decimicro(&bbox_ints[j], lat, lon) {
+                    pruned[j].push(id);
+                }
+            }
+        }
+        assert_eq!(linear, pruned);
+    }
+
+    // -----------------------------------------------------------------------
     // Region::Bbox pass-through
     // -----------------------------------------------------------------------
 

@@ -865,6 +865,72 @@ fn multi_extract_two_bbox_regions() {
 }
 
 #[test]
+fn multi_extract_grid_matches_linear_bbox() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let config = dir.path().join("config.json");
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+
+    let extracts = (0..20)
+        .map(|i| format!(r#"{{"output":"grid-{i}.osm.pbf","bbox":[12.4,55.6,12.7,55.8]}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"directory":"{}","extracts":[{extracts}]}}"#,
+            dir.path().display()
+        ),
+    )
+    .expect("write config");
+
+    run_extract_multi(&input, &config, Strategy::Simple);
+    for i in 0..20 {
+        let output = dir.path().join(format!("grid-{i}.osm.pbf"));
+        let extracted = read_all_elements(&output);
+        assert_eq!(node_ids(&extracted), vec![1, 3]);
+        assert_eq!(way_ids(&extracted), vec![10, 12]);
+        assert_eq!(relation_ids(&extracted), vec![100]);
+    }
+}
+
+#[test]
+fn multi_extract_grid_matches_linear_mixed_regions() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let config = dir.path().join("config.json");
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+
+    let extracts = (0..20)
+        .map(|i| {
+            if i % 2 == 0 {
+                format!(r#"{{"output":"mixed-{i}.osm.pbf","bbox":[12.4,55.6,12.7,55.8]}}"#)
+            } else {
+                format!(r#"{{"output":"mixed-{i}.osm.pbf","polygon":{TRIANGLE_GEOJSON}}}"#)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"directory":"{}","extracts":[{extracts}]}}"#,
+            dir.path().display()
+        ),
+    )
+    .expect("write config");
+
+    run_extract_multi(&input, &config, Strategy::Simple);
+    for i in 0..20 {
+        let output = dir.path().join(format!("mixed-{i}.osm.pbf"));
+        let extracted = read_all_elements(&output);
+        assert_eq!(node_ids(&extracted), vec![1, 3]);
+        assert_eq!(way_ids(&extracted), vec![10, 12]);
+        assert_eq!(relation_ids(&extracted), vec![100]);
+    }
+}
+
+#[test]
 fn multi_extract_from_config_file() {
     let dir = TempDir::new().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");

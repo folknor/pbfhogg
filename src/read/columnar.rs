@@ -7,6 +7,7 @@
 //! can operate on directly, enabling autovectorization and better cache
 //! utilization vs element-by-element iteration.
 
+use super::region_grid::RegionGrid;
 use super::wire::{PackedSint64Iter, WireDenseNodes};
 
 /// Decoded dense node columns - contiguous arrays of IDs and coordinates.
@@ -141,6 +142,33 @@ impl DenseNodeColumns {
         }
     }
 
+    /// Grid-pruned counterpart to [`Self::collect_matching_ids_multi_bbox`].
+    /// Candidate regions are still checked against their exact integer bbox.
+    #[inline]
+    pub(crate) fn collect_matching_ids_multi_bbox_grid(
+        &self,
+        bboxes: &[(i32, i32, i32, i32)],
+        grid: &RegionGrid,
+        out: &mut [Vec<i64>],
+    ) {
+        for i in 0..self.len() {
+            let lat = self.lats[i];
+            let lon = self.lons[i];
+            let id = self.ids[i];
+            for &region in grid.candidates(lat, lon) {
+                let region = region as usize;
+                let (min_lat, max_lat, min_lon, max_lon) = bboxes[region];
+                let hit = (lat >= min_lat) as u8
+                    & (lat <= max_lat) as u8
+                    & (lon >= min_lon) as u8
+                    & (lon <= max_lon) as u8;
+                if hit != 0 {
+                    out[region].push(id);
+                }
+            }
+        }
+    }
+
     /// Classify nodes against a bounding box, collecting matching IDs
     /// into a caller-provided Vec (scratch reuse).
     ///
@@ -173,5 +201,56 @@ impl DenseNodeColumns {
                 out.push(ids[i]);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::read::region_grid::RegionGrid;
+
+    fn next(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    // The `next(..) as i32` narrowings intentionally fold the u64 RNG stream
+    // into a signed coordinate (later reduced mod ~2.1e9), and the i64->i32
+    // longitude narrowing stays within the i32 decimicrodegree domain by
+    // construction; all casts are lossless for the inputs exercised here.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    #[test]
+    fn columnar_grid_parity() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut columns = DenseNodeColumns::new();
+        for id in 0..2_000_i64 {
+            columns.ids.push(id);
+            columns
+                .lats
+                .push((next(&mut state) as i32).wrapping_rem(2_100_000_001));
+            columns
+                .lons
+                .push((next(&mut state) as i32).wrapping_rem(2_100_000_001));
+        }
+        let bboxes: Vec<_> = (0..24_i32)
+            .map(|i| {
+                let min_lat = -900_000_000 + i * 70_000_000;
+                let min_lon = (-1_800_000_000_i64 + i64::from(i) * 140_000_000) as i32;
+                (
+                    min_lat,
+                    min_lat + 120_000_000,
+                    min_lon,
+                    min_lon + 240_000_000,
+                )
+            })
+            .collect();
+        let grid = RegionGrid::build(&bboxes).expect("fixture is within budget");
+        let mut linear = vec![Vec::new(); bboxes.len()];
+        let mut pruned = vec![Vec::new(); bboxes.len()];
+        columns.collect_matching_ids_multi_bbox(&bboxes, &mut linear);
+        columns.collect_matching_ids_multi_bbox_grid(&bboxes, &grid, &mut pruned);
+        assert_eq!(pruned, linear);
     }
 }

@@ -39,6 +39,16 @@
   to v2), and `pbfhogg.WayMembers-v1` and any unknown header fields pass
   through unchanged. Only the field the flag targets is cleared.
 
+- `multi-extract`'s node classification now prunes candidate regions with
+  a CSR grid (3600x1800 cells of 0.1 degree over the region bounding
+  boxes) instead of testing every node against every region. The grid
+  engages only at 16 or more regions and only within a 256 MiB coverage
+  budget; below the threshold, or over budget (e.g. many overlapping
+  near-planet-wide regions), classification falls back to the prior
+  linear scan unchanged. Output is byte-for-byte identical to the linear
+  scan in every case - the grid only narrows which regions get tested
+  per node, it never decides a match itself.
+
 ### Changed
 
 - `repack` now preserves `LocationsOnWays`: when the input header declares

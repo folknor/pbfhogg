@@ -31,6 +31,7 @@ Do not use your Memory functionality. Do not read, write, or update memories. Do
 
 ### git commit rules
 - Remember to update CHANGELOG.md for relevant commits (but not general small performance improvements.)
+- Never offer to commit or tell the user "per your rules I've left things uncommitted". Don't mention git commits, ever. The user will instruct you when to commit.
 
 #### What gets added to CHANGELOG.md
 

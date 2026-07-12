@@ -4,11 +4,17 @@ Status: the getparents and getid include-mode decision is resolved by
 [`ADR-0006`](../decisions/0006-blob-count-threshold-dispatch.md): a bounded
 blob-count estimate dispatches those commands between the walker and a
 full-file scan (pipelined reader for getparents, sequential streaming for
-getid). Other HeaderWalker consumers remain separately priced. Landing
-gate measurements, including the cross-day I/O environment shift that
-made this file's absolute 8k walls unusable as bounds (~45 % swing in
-steady sequential read rate between sessions, same code, same file), are
-in `performance.md` "Blob-count threshold dispatch landing gates".
+getid). Other consumers are priced by shape (see "Two command shapes"
+below): tags-filter is confirmed pure parallel-classify and *gains* on
+dense encodings; check-refs and the rest of the
+`build_classify_schedules_split` family carry a single-threaded schedule
+walk that regresses on high blob count (check-refs +185 % at planet-8k),
+but with near-zero production bite since the production planet dump is
+50 k blobs. Landing gate measurements, including the cross-day I/O
+environment shift that made this file's absolute 8k walls unusable as
+bounds (~45 % swing in steady sequential read rate between sessions,
+same code, same file), are in `performance.md` "Blob-count threshold
+dispatch landing gates".
 
 PBFs from different producers pack very different numbers of elements per
 blob. On commands that do per-blob fixed work (`HeaderWalker` preads,
@@ -48,26 +54,75 @@ fixed costs over ~40x more payload.
 The ratio flips per-byte performance expectations for every command
 that does per-blob work outside the main decode loop.
 
-### Commands with per-blob fixed cost
+### Two command shapes, not one
 
-Every `HeaderWalker`-based path pays a QD=1 pread per blob for its
-header scan:
+The original framing of this note lumped every `HeaderWalker`-touching
+command together as "per-blob fixed cost". Measurement (2026-07-10 ->
+2026-07-12) split that list into two shapes that move in **opposite**
+directions with blob density. Getting the shape right is the whole
+decision: only the first shape needs blob-count dispatch.
 
-- `sort` pass 1 (`src/commands/sort/mod.rs::build_blob_index`)
-- `getid` include mode (`src/commands/getid/mod.rs::filter_by_id`)
-- `getparents` (`src/commands/getparents/mod.rs`) - new
+**Shape 1 - selective header-walk (latency-bound, REGRESSES on
+density).** These walk blob headers with a QD=1 pread per blob and
+decode almost nothing; the walk is pure per-blob NVMe latency
+(~45 µs/blob measured), so wall grows linearly in blob count. On a
+522 k-blob europe PBF the walk alone is 522 k × ~45-70 µs before any
+payload work; on a 50 k-blob planet PBF it is ~40x cheaper. These are
+the commands that win on planet primary and lose on Geofabrik / 8k
+encodings:
+
+- `getid` include mode (`src/commands/getid/mod.rs`) - **dispatched**
+- `getparents` (`src/commands/getparents/mod.rs`) - **dispatched**
+- `removeid` raw-frame passthrough - walker-only (unmeasured full-scan;
+  see ADR-0006)
+- `sort` pass 1 (`src/commands/sort/mod.rs::build_blob_index`) - **not
+  dispatched**, separate seek-skip mechanism (see below)
 - `inspect` index-only (`src/commands/inspect/scan.rs::try_index_only_scan`)
+
+**Shape 2 - pure parallel classify (decompression-bound, IMPROVES or
+stays flat on density).** Build a per-kind schedule cheaply, then
+decompress matching bodies across a rayon pool. Throughput-bound, not
+per-blob-latency-bound, and the indexdata prescreen gets *more*
+selective as blobs shrink (narrow per-blob ID ranges skip more
+decompression), so several get *faster* on dense encodings. No dispatch
+needed:
+
+- `tags-filter` (its own schedule scan) - **measured faster on 8k**
+  (see below)
 - `apply-changes` scanner (`src/commands/apply_changes/scanner.rs`)
-- `check --refs` / `check --ids` via `build_classify_schedules_split`
-- `extract --smart` / `--complete` via `pread_execute`
-  (`src/commands/extract/common.rs`)
-- `tags-filter` via its own schedule scan
 - `build-geocode-index`
 - `renumber_external`
 
-On a 522 k-blob europe PBF, that's 522 k × ~50-70 µs of QD=1 NVMe
-latency per scan, even before any payload work. On a 50 k-blob planet
-PBF, the same header scan is ~40x cheaper.
+**Shape 3 - hybrid (serial schedule walk THEN parallel classify).**
+The `build_classify_schedules_split` family runs a **single-threaded
+`HeaderWalker` loop** (one QD=1 pread per blob, shape-1 latency) to
+build the per-kind schedule, then hands it to the parallel classify
+phase (shape-2 throughput). The serial walk is invisible at 50 k blobs
+(~3.5 s) but dominant at 1.45 M (~102 s of a 153 s wall - see the
+check-refs cell below), so these **regress on high blob count** via the
+walk term even though their payload phase is shape-2. Callers of
+`build_classify_schedules_split` (`src/scan/classify.rs`):
+
+- `check --refs` (`src/commands/check/refs.rs`)
+- `check --ids` (`src/commands/check/verify_ids.rs`)
+- `cat --clean` (`src/commands/cat/mod.rs`)
+- `repack` (`src/commands/repack/mod.rs`)
+- `degrade` (`src/commands/degrade/mod.rs`)
+- `extract --smart` shares the pattern
+  (`src/commands/extract/common.rs::pread_execute`)
+
+The serial walk cannot be trivially parallelized: PBF has no top-level
+blob index, so blob N+1's offset is only known after reading blob N's
+header. Flattening it needs io_uring-batched header probes (the
+non-pursued getparents lever) or a dispatch to a buffered sequential
+walk on high blob count - both unmeasured, and low production priority
+because the production planet dump is 50 k blobs where the walk is
+negligible. tags-filter escapes this because its own scan is not the
+serial `build_classify_schedules_split` walk.
+
+The rest of this note's asymmetry evidence is about shape 1 and the
+shape-3 walk term. Shapes 2/3 are covered by the tags-filter and
+check-refs cells below.
 
 ### Measured consequences
 
@@ -138,15 +193,25 @@ threshold-based dispatch here is new ground.
 
 ### Audit targets for threshold-based dispatch
 
-Commands that are planet-favourable on large-blob PBFs but may
-regress on Geofabrik-style packing:
+Only shape-1 (selective header-walk) commands are candidates; shape-2
+parallel-classify commands do not regress on density and are off this
+list. Current status:
 
-- `sort` pass 1 (landed as HeaderWalker on planet wins)
-- `getparents` (HeaderWalker path, landing)
-- Any other `HeaderWalker`-based path from the list above
+- `getid` include mode - **RESOLVED** (ADR-0006, 150 k-blob dispatch)
+- `getparents` - **RESOLVED** (ADR-0006, 150 k-blob dispatch)
+- `sort` pass 1 - **not converted.** Excluded from ADR-0006: pass 1
+  uses a third mechanism (seek-skip index build), not the walker vs
+  full-scan dichotomy the ADR prices. Its europe +21 % regression is
+  unaddressed on paper, but production input (Geofabrik / planet) is
+  already sorted, so pass 1 stays on the header-only fast path and the
+  regression has near-zero real-world bite. Revisit only if an
+  unsorted large-blob workload becomes real.
+- `inspect` index-only - separately priced, unmeasured on 8k. Header-
+  only by design; low stakes.
 
-Each is a candidate for `if blob_count > N { pipelined_decode }
-else { header_walk }` dispatch, gated on measurements.
+The dispatch rule for the resolved commands: `if blob_count >
+150_000 { full_scan } else { header_walk }`, from a bounded head-of-
+file estimate (`estimate_blob_count`, `src/read/header_walker.rs`).
 
 ## Measured evidence (2026-07-10, plantasjen)
 
@@ -204,6 +269,82 @@ wrong low-side one. getid and getparents are the two current dispatch
 consumers; sort pass 1 remains a separately-priced follow-on. Cross-epoch
 caveat: scan cells ran the April tree via
 `--commit`; margins of 2.2-3x dwarf any plausible tree drift.
+
+### tags-filter and check-refs: shape 2 vs shape 3 (2026-07-12)
+
+Both measured at HEAD (`a65cecc` / `5dc07c4`, plantasjen). Same axis,
+opposite verdicts - the reason shape matters.
+
+| command | encoding | blobs | wall | vs primary |
+|---|---|---:|---:|---:|
+| tags-filter `-R` | planet primary | 50,816 | 49.5 s | - |
+| tags-filter `-R` | planet 8k | 1,453,433 | **42.7 s** | **-14 %** |
+| check --refs | planet primary | 50,816 | 53.8 s (`7d9f5dfd`) | - |
+| check --refs | planet 8k | 1,453,433 | **153.5 s** (`1851f73a`) | **+185 %** |
+
+**tags-filter is pure shape 2** - it gets *faster* on the dense
+encoding, same mechanism as getid's scan arm (indexdata prescreen
+skips more decompression at narrow per-blob ID ranges). No dispatch
+needed; this is the clean positive the note originally predicted for
+"parallel classify" commands.
+
+**check-refs is shape 3, and refuted that prediction.** Phase split of
+the 8k run (`1851f73a`): `SCHEDULE_SCAN_LOOP` **101.9 s**
+(single-threaded, 0.1 avg cores, 1.47 M voluntary context switches -
+one per blob, ~70 µs/blob), then `CHECKREFS_NODES` 33.4 s and
+`CHECKREFS_WAYS` 18.1 s (both ~21 cores, parallel). The serial schedule
+walk - the shape-1 preamble inside `build_classify_schedules_split` -
+is 66 % of the wall at 8k. On planet primary the same walk is ~50 k ×
+70 µs ≈ 3.5 s, invisible against the 53.8 s wall. The parallel phases
+behave like shape 2 (flat-to-faster); the regression is entirely the
+serial walk term. This is the same asymmetry as getid/getparents,
+found a third time, now in the shared scanner rather than a
+command-private walk. **Instrument-first vindicated again:** the
+structural "check-refs is parallel classify, expect it fine on 8k"
+inference was wrong by 2.85x because the shared scanner hides a
+serial shape-1 loop.
+
+Disposition: real regression, low production bite (production planet is
+50 k blobs). Not chased. If a high-blob-count workload becomes real,
+the fix axis is the serial `build_classify_schedules_split` walk (shared
+by six commands), not the parallel classify phases.
+
+### Full shape-3 sweep (2026-07-12, all six callers, plantasjen `5dc07c4`)
+
+Benched every `build_classify_schedules_split` caller on `--snapshot
+8k`. The serial walk (`SCHEDULE_SCAN_LOOP` / `SMART_PASS1_SCHEDULE_SCAN`)
+is a rock-steady **~97-109 s** everywhere - it is the same 1.45 M-blob
+loop regardless of command, and the spread is pure I/O noise. What
+differs is the *fraction*, which cleanly splits the family:
+
+| command | 8k wall | serial walk | walk % | README (50 k) | ratio |
+|---|---:|---:|---:|---:|---:|
+| `check --refs` | 153.5 s | 101.9 s | **66 %** | 54 s | 2.85x |
+| `check --ids` | 149 s | 100.5 s | **67 %** | 57 s | 2.6x |
+| `extract --smart` | 373 s | 108.6 s | 29 % | 268 s | 1.39x |
+| `cat --clean` | 526 s | 100.0 s | 19 % | 334 s | 1.57x |
+| `repack` | 548 s | 99.9 s | 18 % | ~383 s | ~1.4x |
+| `degrade --strip-loc` | 544 s | 96.5 s | 18 % | 383 s | 1.42x |
+
+UUIDs: `1851f73a` / check-ids dirty / `4b82686f` / `3f4c222c` /
+`8f275ebf` / `6f8a3e94`.
+
+**The lever's payoff is narrower than "six commands" implied.** The two
+**read-only** callers (`check --refs`, `check --ids`) are ~2/3 walk, so
+flattening it roughly halves their 8k wall - and they are the same two
+whose selective-scan cousins (getid, getparents) already got dispatch.
+The four **re-encoding** callers spend only 18-29 % in the walk; their
+8k regression is dominated by the inherent cost of framing + writing
+1.45 M tiny blobs instead of 50 k fat ones, which the walk fix does not
+touch. So a perfect io_uring walker would take check-refs/check-ids from
+~2.7x down to ~1.3x, but leave cat/repack/degrade/extract-smart roughly
+where they are. If the walker primitive is ever built, prioritise it for
+the read-only pair; do not expect it to rescue the write-heavy four.
+
+Side finding (`check --ids` run): the 8k snapshot has 7 non-monotonic
+relation violations (repack relation-blob ordering; nodes/ways clean).
+Timing-neutral - the walk is ID-order-independent - so the sweep numbers
+stand. Tracked under the repack entry in TODO.md.
 
 ### Correctness across the encoding axis
 

@@ -93,7 +93,9 @@ crossover sits between 51 k and 522 k blobs. Blob count is known
 before committing to either path (indexdata scan / file size over
 average blob size estimate), so a single `if` at entry suffices.
 io_uring-batched header probes remain the lever that would flatten
-the walk term entirely if threshold-dispatch ever feels unsatisfying.
+the walk term entirely if threshold-dispatch ever feels unsatisfying -
+that primitive, and every other call site that shares it, is
+consolidated in [`notes/header-walk-batching.md`](header-walk-batching.md).
 
 The measured bracket was ratified as a 150,000-blob threshold in
 [`ADR-0006`](../decisions/0006-blob-count-threshold-dispatch.md).

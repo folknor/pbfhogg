@@ -436,8 +436,12 @@ requirement) surfaces:
    `HeaderWalker` that submits K header probes in flight, harvests
    completions, submits more. Recovers NVMe concurrency at the
    primitive level; single-threaded call-site; preserves
-   `fadvise(RANDOM)`. Days; would also benefit `getid`,
-   `apply_changes::scanner`, `inspect/scan.rs` if generalised.
+   `fadvise(RANDOM)`. Days; would also benefit `getid`, `getparents`,
+   `check --refs`/`--ids`, `apply_changes::scanner`, `inspect/scan.rs`
+   if generalised. This is the same primitive several other commands
+   want - the cross-command convergence, measured payoff per call site,
+   and the rejected alternatives are consolidated in
+   [`notes/header-walk-batching.md`](header-walk-batching.md).
 3. **Streaming `posix_fadvise(DONTNEED)` on the BufReader path
    [TRIED 2026-04-24, REJECTED - zero-sum trade].** Implemented
    as `BufReader<File>` + `fadvise(SEQUENTIAL)` walk with

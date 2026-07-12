@@ -20,9 +20,8 @@
 //!
 //! `PBFHOGG_READ_AHEAD_BYTES` keeps its name but has a wider domain here: the
 //! default engine releases its raw permit when the dispatcher picks the blob up,
-//! while this engine holds the raw charge through worker decode. `PBFHOGG_FADVISE_BATCH_BYTES`
-//! remains below this seam in `BlobReader`, so it composes unchanged with either
-//! engine. The only verdict-bearing gate combination is
+//! while this engine holds the raw charge through worker decode. The only
+//! verdict-bearing gate combination is
 //! `PBFHOGG_BATCHED_PIPELINE=1 PBFHOGG_FUSE_TRANSFORM=1`; batched byte-knob
 //! combinations are supported for correctness testing, not verdict measurement.
 //!

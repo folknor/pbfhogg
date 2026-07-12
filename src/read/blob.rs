@@ -368,12 +368,6 @@ pub struct BlobReader<R: Read + Send> {
     /// Only set for buffered FileReader - O_DIRECT has no pages to evict.
     #[cfg(target_os = "linux")]
     evict_fd: Option<std::os::unix::io::RawFd>,
-    /// `Some((watermark, last_evicted_offset))` batches DONTNEED calls once
-    /// that many newly consumed bytes accumulate; the second member records
-    /// the end of the last advised range. `None` preserves the historical
-    /// per-blob, cumulative-prefix advice exactly.
-    #[cfg(target_os = "linux")]
-    fadvise_batch: Option<(u64, u64)>,
 }
 
 impl<R: Read + Send> BlobReader<R> {
@@ -404,8 +398,6 @@ impl<R: Read + Send> BlobReader<R> {
             parse_waymembers: false,
             #[cfg(target_os = "linux")]
             evict_fd: None,
-            #[cfg(target_os = "linux")]
-            fadvise_batch: None,
         }
     }
 
@@ -572,7 +564,27 @@ impl BlobReader<FileReader> {
     /// # foo().unwrap();
     /// ```
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::open(path, false)
+        let reader = FileReader::buffered(path.as_ref())?;
+        #[cfg(target_os = "linux")]
+        let evict_fd = Some({
+            use std::os::unix::io::AsRawFd;
+            match &reader {
+                FileReader::Buffered(r) => r.get_ref().as_raw_fd(),
+                #[cfg(feature = "linux-direct-io")]
+                FileReader::Direct(r) => r.raw_fd(),
+            }
+        });
+        Ok(BlobReader {
+            reader,
+            offset: Some(ByteOffset(0)),
+            last_blob_ok: true,
+            header_buf: Vec::new(),
+            parse_tagdata: false,
+            parse_indexdata: true,
+            parse_waymembers: false,
+            #[cfg(target_os = "linux")]
+            evict_fd,
+        })
     }
 
     /// Open a file for reading with O_DIRECT (bypasses page cache).
@@ -581,29 +593,21 @@ impl BlobReader<FileReader> {
     /// filesystem does not support O_DIRECT (e.g. tmpfs).
     #[cfg(feature = "linux-direct-io")]
     pub fn from_path_direct<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::open(path, true)
+        let reader = FileReader::direct(path.as_ref())?;
+        Ok(BlobReader {
+            reader,
+            offset: Some(ByteOffset(0)),
+            last_blob_ok: true,
+            header_buf: Vec::new(),
+            parse_tagdata: false,
+            parse_indexdata: true,
+            parse_waymembers: false,
+            evict_fd: None, // O_DIRECT: no pages to evict
+        })
     }
 
     /// Open a file, selecting buffered or O_DIRECT based on the `direct` flag.
     pub fn open<P: AsRef<Path>>(path: P, direct: bool) -> Result<Self> {
-        // This is the sole production entry point for the experiment knob.
-        // Constructors above delegate here; lower layers receive only this
-        // plain parameter so unit tests never mutate the process environment.
-        #[cfg(target_os = "linux")]
-        let fadvise_batch_bytes = fadvise_batch_bytes_from_env()?;
-        Self::open_with_fadvise_batch(
-            path,
-            direct,
-            #[cfg(target_os = "linux")]
-            fadvise_batch_bytes,
-        )
-    }
-
-    fn open_with_fadvise_batch<P: AsRef<Path>>(
-        path: P,
-        direct: bool,
-        #[cfg(target_os = "linux")] fadvise_batch_bytes: Option<u64>,
-    ) -> Result<Self> {
         let reader = FileReader::open(path.as_ref(), direct)?;
         #[cfg(target_os = "linux")]
         let evict_fd = if direct {
@@ -628,46 +632,7 @@ impl BlobReader<FileReader> {
             parse_waymembers: false,
             #[cfg(target_os = "linux")]
             evict_fd,
-            #[cfg(target_os = "linux")]
-            fadvise_batch: fadvise_batch_bytes.map(|watermark| (watermark, 0)),
         })
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn fadvise_batch_bytes_from_env() -> Result<Option<u64>> {
-    parse_fadvise_batch_bytes(std::env::var("PBFHOGG_FADVISE_BATCH_BYTES"))
-}
-
-#[cfg(target_os = "linux")]
-fn parse_fadvise_batch_bytes(
-    value: std::result::Result<String, std::env::VarError>,
-) -> Result<Option<u64>> {
-    const VAR: &str = "PBFHOGG_FADVISE_BATCH_BYTES";
-
-    match value {
-        Ok(value) => {
-            let watermark = value.parse::<u64>().map_err(|_| {
-                new_error(ErrorKind::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("{VAR} must be a non-zero byte count, got {value:?}"),
-                )))
-            })?;
-            if watermark == 0 {
-                return Err(new_error(ErrorKind::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("{VAR} must be a non-zero byte count, got {value:?}"),
-                ))));
-            }
-            Ok(Some(watermark))
-        }
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            Err(new_error(ErrorKind::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("{VAR} must be a non-zero Unicode byte count"),
-            ))))
-        }
     }
 }
 
@@ -686,11 +651,7 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
         let header = match self.read_blob_header() {
             Some(Ok(header)) => header,
             Some(Err(err)) => return Some(Err(err)),
-            None => {
-                #[cfg(target_os = "linux")]
-                self.evict_dontneed(true);
-                return None;
-            }
+            None => return None,
         };
 
         let mut reader = self.reader.by_ref().take(header.datasize as u64);
@@ -735,69 +696,23 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
         // DONTNEED prevents sequential reads from accumulating the entire file
         // in RSS - critical for 30+ GB PBFs on memory-constrained hosts.
         #[cfg(target_os = "linux")]
-        self.evict_dontneed(false);
+        if let Some(fd) = self.evict_fd
+            && let Some(offset) = self.offset
+        {
+            // posix_fadvise(fd, 0, offset, POSIX_FADV_DONTNEED)
+            // SAFETY: fd is valid (owned by FileReader in same struct), offset is in range.
+            unsafe {
+                libc::posix_fadvise(
+                    fd,
+                    0,
+                    offset.0.try_into().unwrap_or(i64::MAX),
+                    libc::POSIX_FADV_DONTNEED,
+                )
+            };
+        }
 
         Some(Ok(Blob::new(header, blob, prev_offset)))
     }
-}
-
-#[cfg(target_os = "linux")]
-impl<R: Read + Send> BlobReader<R> {
-    fn evict_dontneed(&mut self, at_eof: bool) {
-        let Some(fd) = self.evict_fd else {
-            return;
-        };
-        let Some(offset) = self.offset else {
-            return;
-        };
-        let range = match self.fadvise_batch.as_mut() {
-            Some((watermark, last_evicted_offset)) => {
-                fadvise_dontneed_range(Some(*watermark), last_evicted_offset, offset.0, at_eof)
-            }
-            None => fadvise_dontneed_range(None, &mut 0, offset.0, at_eof),
-        };
-        let Some((start, len)) = range else {
-            return;
-        };
-
-        // SAFETY: fd is valid (owned by FileReader in the same struct), and
-        // the range describes bytes already consumed from that file.
-        unsafe {
-            libc::posix_fadvise(
-                fd,
-                start.try_into().unwrap_or(i64::MAX),
-                len.try_into().unwrap_or(i64::MAX),
-                libc::POSIX_FADV_DONTNEED,
-            )
-        };
-    }
-}
-
-/// Return the next DONTNEED range for the configured watermark.
-///
-/// `None` is the legacy cumulative-prefix behavior. A configured watermark
-/// emits only newly consumed bytes once the watermark is reached, plus a final
-/// partial range at EOF.
-#[cfg(target_os = "linux")]
-fn fadvise_dontneed_range(
-    watermark: Option<u64>,
-    last_evicted_offset: &mut u64,
-    offset: u64,
-    at_eof: bool,
-) -> Option<(u64, u64)> {
-    let Some(watermark) = watermark else {
-        return (!at_eof).then_some((0, offset));
-    };
-    let len = offset.saturating_sub(*last_evicted_offset);
-    if len < watermark && !at_eof {
-        return None;
-    }
-    if len == 0 {
-        return None;
-    }
-    let start = *last_evicted_offset;
-    *last_evicted_offset = offset;
-    Some((start, len))
 }
 
 impl<R: BlobReaderSource + Send> BlobReader<R> {
@@ -833,8 +748,6 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
             parse_waymembers: false,
             #[cfg(target_os = "linux")]
             evict_fd: None,
-            #[cfg(target_os = "linux")]
-            fadvise_batch: None,
         })
     }
 
@@ -1111,135 +1024,6 @@ pub(crate) fn decode_headerblock(
 #[allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn fadvise_watermark_emits_only_new_ranges_and_flushes_eof_tail() {
-        let mut last_evicted_offset = 0;
-        let watermark = Some(64);
-
-        assert_eq!(
-            fadvise_dontneed_range(watermark, &mut last_evicted_offset, 31, false),
-            None
-        );
-        assert_eq!(
-            fadvise_dontneed_range(watermark, &mut last_evicted_offset, 64, false),
-            Some((0, 64))
-        );
-        assert_eq!(last_evicted_offset, 64);
-        assert_eq!(
-            fadvise_dontneed_range(watermark, &mut last_evicted_offset, 100, false),
-            None
-        );
-        assert_eq!(
-            fadvise_dontneed_range(watermark, &mut last_evicted_offset, 100, true),
-            Some((64, 36))
-        );
-        assert_eq!(last_evicted_offset, 100);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn fadvise_unset_keeps_cumulative_prefix_behavior_without_eof_syscall() {
-        let mut last_evicted_offset = 0;
-
-        assert_eq!(
-            fadvise_dontneed_range(None, &mut last_evicted_offset, 17, false),
-            Some((0, 17))
-        );
-        assert_eq!(
-            fadvise_dontneed_range(None, &mut last_evicted_offset, 42, false),
-            Some((0, 42))
-        );
-        assert_eq!(
-            fadvise_dontneed_range(None, &mut last_evicted_offset, 42, true),
-            None
-        );
-        assert_eq!(last_evicted_offset, 0);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn parse_fadvise_batch_bytes_accepts_valid_value_and_unset() {
-        assert_eq!(
-            parse_fadvise_batch_bytes(Ok("64".to_string())).unwrap(),
-            Some(64)
-        );
-        assert_eq!(
-            parse_fadvise_batch_bytes(Err(std::env::VarError::NotPresent)).unwrap(),
-            None
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn parse_fadvise_batch_bytes_rejects_malformed_and_zero_values() {
-        for value in ["64M", "0"] {
-            let error = parse_fadvise_batch_bytes(Ok(value.to_string())).unwrap_err();
-            assert!(
-                error.to_string().contains("PBFHOGG_FADVISE_BATCH_BYTES"),
-                "error must name the environment variable: {error}"
-            );
-            assert!(
-                error.to_string().contains(value),
-                "error must name the bad value: {error}"
-            );
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn open_with_fadvise_batch_advances_watermark_on_multiblob_file() {
-        use crate::block_builder::{BlockBuilder, HeaderBuilder};
-        use crate::writer::{Compression, PbfWriter};
-
-        let file = tempfile::NamedTempFile::new().expect("create PBF fixture");
-        {
-            let mut writer = PbfWriter::new(file.as_file(), Compression::default());
-            let header = HeaderBuilder::new().build().expect("build header");
-            writer.write_header(&header).expect("write header");
-            for id in 1_i64..=2 {
-                let mut builder = BlockBuilder::new();
-                builder.add_node(id, 0, 0, std::iter::empty::<(&str, &str)>(), None);
-                let bytes = builder
-                    .take()
-                    .expect("encode block")
-                    .expect("nonempty block");
-                writer
-                    .write_primitive_block(bytes)
-                    .expect("write data blob");
-            }
-            writer.flush().expect("flush PBF fixture");
-        }
-
-        let mut reader = BlobReader::open_with_fadvise_batch(file.path(), false, Some(1))
-            .expect("open PBF fixture");
-        reader
-            .next()
-            .expect("header blob")
-            .expect("read header blob");
-        let after_header = reader.fadvise_batch.expect("batch state").1;
-        reader
-            .next()
-            .expect("first data blob")
-            .expect("read first data blob");
-        let after_first_data = reader.fadvise_batch.expect("batch state").1;
-        reader
-            .next()
-            .expect("second data blob")
-            .expect("read second data blob");
-        let after_second_data = reader.fadvise_batch.expect("batch state").1;
-
-        assert!(after_header > 0, "header crosses the one-byte watermark");
-        assert!(
-            after_first_data > after_header,
-            "first data blob advances watermark"
-        );
-        assert!(
-            after_second_data > after_first_data,
-            "second data blob advances watermark"
-        );
-    }
 
     /// Hand-encode `[4-byte BE header_len][BlobHeader]` for an `OSMData` blob
     /// declaring the given datasize, with no Blob payload following. Lets a

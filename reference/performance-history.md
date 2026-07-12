@@ -685,6 +685,81 @@ Allocation profiling (same commit):
 
 ---
 
+## Env-gated read-path batch (2026-07-12 overnight, commit `a65cecc`, plantasjen)
+
+Five read-path follow-ups from the 2026-07-11 architecture reports
+(`notes/read-path-architecture-reports.md`) were landed behind default-off
+`PBFHOGG_*` env gates and adjudicated in one overnight A/B run - one binary,
+one commit, gate-off IS the baseline, same-day A/B by construction. Host
+plantasjen (23 GB RAM this run; the reports' "26-30 GB" was swap-inclusive).
+Pre-registered noise floor +/-3%. Working read-out lived in
+`notes/env-gated-readpath-batch.md` (deleted on landing); this is the
+durable record.
+
+| Item | Gate | Verdict | Key numbers |
+|---|---|---|---|
+| 1 fadvise DONTNEED watermark | `PBFHOGG_FADVISE_BATCH_BYTES` | REVERT | planet-8k all modes +0.75% to +2.68%, inside noise, mildly slower |
+| 2 byte-aware buffer knobs (x4) | `READ_AHEAD/DECODE_AHEAD/BLOCK_QUEUE/CMD_BATCH_BYTES` | REVERT | 8k pipelined +3.13%, CMD_BATCH getid-8k +3.49% regressed; no win anywhere |
+| 3 command-transform fusion | `PBFHOGG_FUSE_TRANSFORM` | **KEEP** | getid-8k -7.68%, getparents-8k -6.51%, tags-filter-R 8k -6.97%; getid-primary GETID_PASS2 RSS 1.18 GB -> 596 MB (-50%) |
+| 4 ordered batched pipeline | `PBFHOGG_BATCHED_PIPELINE` | REVERT | getparents-8k -6.67% (redundant with fusion); combination getid-8k +9.30% regression |
+| 5 europe prefetch WILLNEED | `PBFHOGG_PREFETCH_WILLNEED` | **KEEP** | check-refs europe -6.16%, tags-filter europe -5.66% |
+
+**Failed experiments, recorded so they are not blindly re-attempted:**
+
+- **Ordered batched-pipeline rebuild (item 4)** - a byte-bounded ordered
+  batch engine with long-lived workers, both architecture reports'
+  "high-conviction" rewrite. Measured: no isolated win. Its one
+  floor-clearing cell (getparents-8k FullScan -6.67%, base `357c360f`
+  62.0 s -> `53a9e76a` 58.8 s bench-3) is redundant - fusion delivers the
+  same win on the same cell. Reads neutral (pipelined 8k +2.10%, primary
+  +1.59%, europe -1.40%), getid-8k isolation +0.05%, tags-filter-R 8k
+  -0.65%. The both-gates combination (BATCHED+FUSE getid-8k, `f1d76362`)
+  REGRESSED +9.30% vs baseline (197.9 -> 216.3 s) - and +18.4% vs
+  fusion-alone (182.7 s, `895184ee`), the figure that actually kills the
+  candidate since fusion-alone is the shipped end state - with deeper
+  reorder skew (`pipeline_batched_reorder_high_water` 32 vs 14,
+  `pipeline_batches` 43564 vs 30977). Diagnosis: at 1.45 M blobs the per-blob channel/task/
+  permit/reorder seams cost LESS than the reports estimated, and the batch
+  engine's own per-batch coordination gave the difference back. Do not
+  re-propose a batch-rebuild of `run_pipeline` on "per-blob seam overhead
+  x blob count" reasoning without first measuring that the seams are the
+  binding cost - here they were not.
+- **fadvise DONTNEED watermark batching (item 1)** - watermark-batched
+  eviction to replace the per-blob cumulative-prefix `posix_fadvise`. The
+  1.45 M advisory syscalls on the 8k encoding are real but carry no
+  measurable wall cost; every planet-8k mode came out inside +/-3% and
+  slightly slower gated. Mispriced (user confidence was already zero).
+- **byte-aware buffer knobs (item 2)** - making `read_ahead`/`decode_ahead`/
+  `BLOCK_QUEUE`/command-batch admission byte-primary instead of count-primary.
+  No configuration improved anything; two knobs regressed just past the
+  floor. Count-vs-byte admission was not the binding constraint at either
+  encoding.
+
+**Kept (promoted to default; current numbers in `performance.md`):**
+
+- **Command-transform fusion (item 3)** - moving getid pass-2, getparents
+  FullScan, tags-filter `-R`, and altw decode-all transforms INTO the decode
+  workers, deleting the 64-block (~90 MB) materialization + second rayon
+  dispatch. All three surviving signal cells cleared +3% (getid-8k
+  `a57807df` 197.9 -> `895184ee` 182.7 s; getparents-8k `357c360f` 63.0 ->
+  `f461f307` 58.9 s; tags-filter-R 8k `0aa45689` 45.9 -> `896b8ffc` 42.7 s,
+  all bench-3). Executing no-regression controls also improved: getid-primary
+  -12.88% with GETID_PASS2 peak RSS halved (1.18 GB -> 596 MB) and pass-2
+  wall -17% at higher core occupancy; tags-filter-R primary -6.25%. The altw
+  europe-raw signal pair OOM-killed on the 23 GB host (anon decode-all +
+  re-encode), so altw fusion is correctness-proven but performance-unmeasured
+  - a follow-up night on a bigger host owes it. Resolved as State 3 of the
+  fusion/batching four-state matrix (keep fusion, revert batching), since the
+  two share the `run_pipeline` seam.
+- **Europe WILLNEED prefetch (item 5)** - `POSIX_FADV_WILLNEED` over the
+  scan schedule's `(data_offset, data_size)` ranges, reclaiming the
+  page-warming the 2026-04-20 HeaderWalker swap to `POSIX_FADV_RANDOM` gave
+  up. The TODO estimate ("~14 s") was unbacked; the first real measurement
+  is ~6% on both europe consumers (check-refs `a64f56dd` 56.8 -> `7d114432`
+  53.3 s; tags-filter `9b47383c` 61.8 -> `c8681230` 58.3 s, bench-3).
+  Europe-only: planet is larger than RAM so prefetched pages evict before
+  reuse.
+
 ## Retired plan docs
 
 These plan docs lived in `notes/` while their work was active and were

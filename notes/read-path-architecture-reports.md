@@ -1,5 +1,16 @@
 # Read-path architecture: the two theorizing reports (2026-07-11, verbatim)
 
+> **Empirical verdicts landed 2026-07-12** - the follow-up items these
+> reports surfaced were implemented env-gated and measured in one
+> overnight A/B run (commit `a65cecc`, plantasjen). Scorecard against the
+> reports' own conviction levels at the end of this file
+> ("Empirical verdicts"). Headline: the reports' two "high-conviction"
+> *full rewrites* split - fusion (section 6) KEPT with 6-8% command
+> wins, but the ordered-pipeline batch rebuild (section 5) REVERTED (no
+> isolated win, and it regressed the fused combination +9.3%). Both
+> medium-value read-buffer items (fadvise batching, byte-aware knobs)
+> also reverted inside the noise floor.
+
 Context: the bench-read parallel-mode planet OOM investigation. Two
 independent deep passes were run against the same brief
 (code-only ground rules, aggressive-rewrite framing contract): codex
@@ -573,3 +584,37 @@ Honest caveat on payoff: ordered consumers are today bound by single-threaded pe
 ## 5. Bottom line
 
 The parallel-mode OOM is not a deep memory-model problem; it is one function (`collect_osm_data_blobs`) implementing 2020-era osmpbf semantics with a whole-file materialization that the rest of this codebase outgrew. The 0.4 retention ratio that looked like a mystery is swap arithmetic on a 39 GB-swap host over a 1.0x-retention collect. All four read modes can run at planet scale on this host with two-orders-of-magnitude memory headroom; the fixed parallel mode should not merely survive but become the fastest mode by roughly 4-6x, because the library already owns the right engine (worker-pull pread + thread-local decode) and simply never pointed its oldest API at it. Do the par_map_reduce rewrite as a complete, unhedged change; then retire pipeline.rs into a delivery policy of the same engine as a follow-up; take the sequential-path copy elimination and the bench harness BufReader fix along the way.
+
+---
+
+## Empirical verdicts (2026-07-12 overnight, commit `a65cecc`, plantasjen)
+
+Every follow-up these reports surfaced was implemented env-gated
+(default-off, byte-identical gate-off) and measured in one overnight A/B
+run - one binary, one commit, same-day A/B by construction. Full read-out
+in `notes/env-gated-readpath-batch.md` (deleted on landing; durable arc
+settles into `reference/performance-history.md`). The reports predicted
+direction well on fusion and the local reads, but MISPLACED conviction on
+the ordered-pipeline rebuild - a caution worth preserving against the next
+"high-conviction full rewrite" framing.
+
+| Report prediction | Conviction claimed | Measured verdict |
+|---|---|---|
+| Replace `par_map_reduce` with bounded worker-resident fold (R1 sec 4, R2 sec 3.1) | high | **VALIDATED** - landed `7532021` pre-batch: planet SIGKILL -> 54 s / 616 MB; the win the reports promised |
+| Fuse transforms into decode workers (R1 sec 6) | high | **KEPT** - getid-8k -7.68%, getparents-8k -6.51%, tags-filter-R 8k -6.97%; getid-primary GETID_PASS2 RSS 1.18 GB -> 596 MB (-50%). The 90 MB batch materialization the report named is real and it went away |
+| Rebuild ordered pipeline around byte-bounded batches (R1 sec 5, R2 sec 3.2) | high | **REVERTED** - no isolated win (getparents-8k -6.67% but redundant with fusion on the same cell; reads/getid/tags-filter neutral) and the fused combination REGRESSED +9.30% vs baseline, +18.4% vs fusion-alone (216.3 vs 182.7s) - and fusion-alone is the shipped state, so that is the killing figure (deeper reorder skew: high-water 32 vs 14). The per-blob seams the report indicted as "structural overhead at high blob count" cost less than the report assumed; the batch engine's own coordination gave it back |
+| Batch page-cache eviction / fadvise watermark (R1 sec 7, R2 sec 3.4) | medium | **REVERTED** - planet-8k all modes +0.75% to +2.68%, inside noise, mildly slower. The 1.45 M advisory syscalls are real but not a measurable wall cost at this scale |
+| Byte-aware buffer knobs (R1 sec 7, R2 sec 3.4) | medium | **REVERTED** - no knob improved anything; 8k pipelined +3.13% and CMD_BATCH getid-8k +3.49% regressed past the floor. Count-vs-byte admission was not the binding constraint |
+| Sequential-path double copy (R1 sec 7, R2 sec 3.3) | medium | **LANDED separately** `3ccc580` (not in this batch); no regression across 16 cells |
+| `BlobHeader.datasize` unvalidated (R1 sec 3) | robustness | **FIXED** `MAX_BLOB_DATASIZE`, 2026-07-11 |
+
+The through-line correction: at 1.45 M blobs the per-blob pipeline seams
+are cheaper than both reports estimated, so the two read-side rewrites
+premised on "seam overhead x 1.45 M" (the batch engine, the fadvise
+watermark, the byte knobs) did not pay. The wins came from the two items
+premised on removing WHOLE STAGES of materialization/collection
+(par_map_reduce's whole-file collect; fusion's 90 MB per-batch
+materialization + second dispatch), not from shaving per-blob constants.
+Kept: fusion (item 3) and the unrelated europe WILLNEED prefetch (item 5,
+TODO's own item, not from these reports) at ~6%. Item 3/4 resolved as
+State 3 of the shared four-state matrix: keep fusion, revert batching.

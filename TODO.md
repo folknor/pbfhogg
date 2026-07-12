@@ -280,18 +280,35 @@ mirror it if you expect SIGKILL on the first attempt.
   pass 2 starts.
 
 - [ ] **`altw` sparse path** (`src/commands/altw/mod.rs:485-510`
-  + `process_batch:692-736`). Identical par_iter+collect shape.
+  + `process_batch:692-736`). **BENCHED (partial) 2026-07-12, commit
+  `a65cecc`, UUID `dirty` - the par_iter+collect shape is NOT the
+  problem; shape != root cause a third time.** The overnight rider
+  `add-locations-to-ways --dataset planet --index-type sparse --bench 1`
+  was terminated by the operator ~72 min into `ALTW_PASS2` (a manual
+  kill, NOT a crash and NOT OOM: RSS was bounded at ~21.3 GB with only
+  ~3.2 GB anon, nowhere near the host ceiling; brokkr's `exit 137
+  "(OOM?)"` label is the SIGKILL heuristic misfiring). The failure mode
+  is SOFT: unboundedly slow progress, not death. The pass-2 sidecar
+  phase shows the actual peak is random-access mmap thrash on the sparse
+  rank-indexed flat scratch during location write-back:
+  **~181M major page faults, ~13 TB disk re-read** (against a scratch
+  file orders of magnitude smaller), **2.5 avg cores** (I/O-stalled, not
+  compute-bound), still far from done at kill. The index build itself is
+  fine (rank buckets written in ~80 s); the pathology is purely pass-2
+  read-back locality. So the par_iter+collect `Vec<OwnedBlock>`
+  accumulation the prior TODO framing feared never dominated - RSS
+  stayed bounded exactly as getid's pass 2 did.
   Currently masked because `add-locations-to-ways --index-type auto`
   selects `external` for sorted+indexed planet inputs, and external
   uses entirely different scatter/gather code (`altw/external/`) -
   this pattern doesn't fire on the planet recommended path.
-  Forcing `--index-type sparse` at planet is the trigger. Same
-  investigative discipline as getid above: bench first, instrument
-  the sidecar, identify the actual peak phase before assuming the
-  par_iter+collect step is the culprit. Other altw stages also worth
-  checking: any `parallel_classify_accumulate` caller in the sparse
-  pipeline is suspect at planet keep-rates (the documented caution
-  at `src/scan/classify.rs:300-317` lists the criteria).
+  Forcing `--index-type sparse` at planet is the trigger. **Conclusion:
+  sparse is not planet-viable, but the fix axis is pass-2 mmap access
+  locality (or simply keep `auto` steering planet to `external`), NOT a
+  par_iter+collect migration.** Other altw stages still worth checking:
+  any `parallel_classify_accumulate` caller in the sparse pipeline is
+  suspect at planet keep-rates (the documented caution at
+  `src/scan/classify.rs:300-317` lists the criteria).
 
 ### Other `parallel_classify_accumulate` callers (audit checklist)
 

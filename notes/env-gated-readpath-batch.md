@@ -269,9 +269,14 @@ verdict. **The user explicitly overrode both rules for this batch
 - Overnight cells (europe only - planet is bigger than RAM, prefetched
   pages evict before reuse; extract dropped for budget, TODO's third
   candidate can join a follow-up night if these two clear the floor):
-  `run brokkr check-refs --dataset europe --bench 1` + gated twin;
-  `run brokkr tags-filter --dataset europe <default expr> --bench 1` +
-  gated twin.
+  `run brokkr check-refs --dataset europe --variant indexed --bench 3`
+  + gated twin;
+  `run brokkr tags-filter --dataset europe --variant indexed --filter w/highway=primary --bench 3`
+  + gated twin. (Registered revision 2026-07-12, pre-launch: these
+  four cells moved from bench 1 to bench 3 to align with the
+  batch-wide command-cell rule - best-of-three costs ~11 extra
+  minutes at europe walls and removes single-shot noise from a
+  zero-confidence verdict.)
 - Verdict: wall, >= 3 % to keep.
 
 ### 6. Measurement-only riders
@@ -325,9 +330,14 @@ Honest cell count (rev 2 - the rev-1 estimate undercounted ~2.5x):
   tags-filter/time-filter the heavy ones. ~1.7-2.3 h.
 - Rider: altw sparse planet, unknown wall, last.
 
-Total ~4.6-5.2 h before the rider - fits the night with margin for lock
-contention and the rider. No `--hotpath`/`--alloc` modes; those are
-follow-up nights for whichever items survive.
+Total (final wiring, post spec rev 3 and the fusion spec's bench-3
+command repetitions, per the pre-launch review): roughly 5-7 h before
+the rider - the europe-raw altw pair alone is priced at 36-75 min per
+the fusion spec. The sparse-planet rider has no baseline and accepts
+OOM risk, so the complete script is NOT bounded to the night; it is
+deliberately last so an out-of-time or OOM rider costs nothing. No
+`--hotpath`/`--alloc` modes; those are follow-up nights for whichever
+items survive.
 
 ## Staffing and sequence
 
@@ -359,3 +369,138 @@ Standing constraints that survive the deviation: nothing regresses the
 README planet-safe table at default settings (default-off makes this
 structural until adjudication); `brokkr check` green at every commit
 boundary; `.brokkr/results.db` + dirty markdown ride each commit.
+
+## Read-out results (2026-07-12)
+
+Overnight run completed on plantasjen (23 GB RAM host, commit `a65cecc`):
+started 05:35, ended 11:33, 5h58m, 37 commands. Log
+`overnight-logs/plantasjen-20260712-053514.log`. All walls read from
+`.brokkr/results.db`; pairing by `capture_env` metadata + `cli_args`
+mode, never by position. Read invocations store four UUIDs in
+completion order sequential/parallel/pipelined/blobreader (confirmed:
+`57999b93`=sequential, `8a0119f2`=pipelined, both in `cli_args --mode`).
+
+### Failures (no verdict-bearing data)
+
+- **Item 3 altw europe-raw signal pair (RUN 29 + 30): both OOM-killed.**
+  `pbfhogg killed by signal` on europe-raw sparse decode-all + full
+  re-encode. The `--force-altw` brick worked (argv accepted, child ran
+  then died mid-execution); this is anon-memory exhaustion on a 23 GB
+  host, not a missing flag. Item 3's verdict therefore reads from its
+  three surviving signal cells (getid-8k, getparents-8k, tags-filter-R
+  8k), per the fusion spec's own brick-4 fallback. altw fusion stays
+  correctness-proven (the CLI byte-compare test) but performance-
+  unmeasured; a follow-up night on a bigger host owes the pair.
+- **Item 6 rider (RUN 35): operator-killed** ~72 min into ALTW_PASS2
+  (soft failure, not OOM - findings recorded in TODO.md "Latent
+  same-shape risks"). Measurement-only, no verdict.
+
+### Cell validity (execution-proof counters)
+
+All gated signal cells passed the counter gate; a missing counter would
+have read as INVALID, not neutral:
+
+- FUSE cells `895184ee`/`f461f307`/`896b8ffc` (getid/getparents/
+  tags-filter 8k): `fuse_transform_active=1` + `fuse_transform_blocks`
+  climbing. VALID.
+- FUSE getparents-primary `21ed8d7c` (inert control): NEITHER counter
+  present, `walk_estimated_blobs=36063` -> walker arm, fusion never
+  executed. Correctly inert.
+- BATCHED cells `53a9e76a`/`46c1d50f`/`bc949ad7`: `pipeline_batches`
+  present (29442/30977/29179). Engine dispatched.
+- Combination `f1d76362`: BOTH `fuse_transform_active=1` AND
+  `pipeline_batches=43564`. Genuine both-gates path.
+- Output parity exact across every getid-8k arm (nodes=79, ways=3,
+  relations=3): baseline, FUSE, BATCHED, BATCHED+FUSE all identical.
+- Inert control drift +0.39% (< +/-3%): the night is VALID.
+
+### Verdict table (Delta = gated vs same-night baseline; negative = faster)
+
+| Item | Gate | Signal | Verdict |
+|---|---|---|---|
+| 1 fadvise DONTNEED batching | `PBFHOGG_FADVISE_BATCH_BYTES` | 8k seq +0.75%, blob +1.06% (all modes slower, all < 3%) | REVERT (mispriced) |
+| 2 byte-aware buffer knobs | `PBFHOGG_READ_AHEAD/DECODE_AHEAD/BLOCK_QUEUE/CMD_BATCH_BYTES` | 8k pipe +3.13%, CMD_BATCH getid-8k +3.49% (regress); BLOCK_QUEUE +0.16% | REVERT (all four) |
+| 3 command-transform fusion | `PBFHOGG_FUSE_TRANSFORM` | getid-8k -7.68%, getparents-8k -6.51%, tags-filter-R 8k -6.97% | KEEP |
+| 4 ordered batched pipeline | `PBFHOGG_BATCHED_PIPELINE` | getparents-8k -6.67% (redundant); combination getid-8k +9.30% (regress) | REVERT |
+| 5 europe prefetch WILLNEED | `PBFHOGG_PREFETCH_WILLNEED` | check-refs -6.16%, tags-filter -5.66% (both europe, corroborating) | KEEP |
+
+Per-item detail:
+
+- **Item 1** planet-8k bench-1 (base `57999b93.` / gated `5e108d35.`):
+  seq 575.3->579.6s (+0.75%), blob 627.8->634.5s (+1.06%), par
+  72.5->73.9s (+1.92%), pipe 266.2->273.4s (+2.68%). Every mode mildly
+  slower, all inside +/-3%. Zero-confidence item inside the noise floor
+  -> revert-and-close, mispriced (as predicted).
+- **Item 2** read knobs (base `57999b93.`/`dbd205fd.`): 8k pipelined
+  266.2->274.6s (+3.13%, `6021a581`), primary pipelined 254.1->257.9s
+  (+1.51%); parallel controls +0.52%/-0.71%. CMD_BATCH getid-8k
+  197.9->204.8s (+3.49%, `414a4501`). BLOCK_QUEUE getparents-8k
+  63.0->63.1s (+0.16%, `98802fba`). No knob improves anything; two
+  regress just past the floor. Revert all.
+- **Item 3** (bench-3): getid-8k 197.9->182.7s (-7.68%, `895184ee`),
+  getparents-8k 63.0->58.9s (-6.51%, `f461f307`), tags-filter-R 8k
+  45.9->42.7s (-6.97%, `896b8ffc`). Executing controls also improved:
+  getid-primary 96.3->83.9s (-12.88%, `35c57e36`) with GETID_PASS2 peak
+  RSS 1.18 GB -> 596 MB (-50%, batch materialization gone) and pass-2
+  wall -17% at HIGHER core occupancy (16.0->18.5); tags-filter-R primary
+  52.8->49.5s (-6.25%, `6eb2a965`). getparents-primary inert control
+  +0.39% (`21ed8d7c`). Clean keep.
+- **Item 4** (bench-3 command, bench-1 read): read pipelined 8k
+  +2.10% (`bc949ad7`), primary +1.59% (`ede99bd2`), europe -1.40%
+  (`80df3af0`) - all within noise. getparents-8k 63.0->58.8s (-6.67%,
+  `53a9e76a`) is the ONE floor-clearing win, but it is REDUNDANT: fusion
+  delivers the identical win on the same cell (-6.51%), and in the keep-
+  fusion end state getparents-FullScan runs the fused arm anyway. getid-8k
+  isolation +0.05% (`46c1d50f`), tags-filter-R 8k -0.65% (`d2c1e77b`),
+  tags-filter-R primary -2.84% (`7a8bbdae`) - neutral. Combination
+  BATCHED+FUSE getid-8k 197.9->216.3s (+9.30%, `f1d76362`): the end-state
+  candidate REGRESSES (fused batched worker runs deeper - reorder
+  high-water 32 vs 14, 43564 batches vs 30977). Sharper still: the
+  combination is +18.4% slower than FUSION ALONE (216.3 vs 182.7s) -
+  and fusion-alone is what we ship, so that is the figure that kills the
+  end-state candidate. Auto-revert on the >3% combination regression,
+  and the engineering substance agrees: batching buys nothing on top of
+  fusion and hurts when combined.
+- **Item 5** (bench-3): check-refs europe 56.8->53.3s (-6.16%,
+  `7d114432`), tags-filter europe 61.8->58.3s (-5.66%, `c8681230`). Both
+  clear +3%, same direction, mutually corroborating. The "~14 s" estimate
+  was unbacked; the real measurement is a solid ~6% on both consumers. A
+  zero-confidence item that earned its keep.
+
+### Resolution: four-state matrix -> STATE 3 (revert batching, keep fusion)
+
+Items 3 and 4 share the `run_pipeline` seam. Fusion KEEPs, batching
+REVERTs -> State 3 of the shared matrix (pipeline-rebuild-spec section 5,
+fusion-spec section 5). Ordering: fusion's KEEP edits first (its default-
+engine arm becomes the only arm; its both-gates arm dies with
+`batched_pipeline.rs`), then batching's REVERT edits (delete the module +
+dispatch arms). End state: `pipeline.rs` carries two ordered engines -
+plain (read bench, geocode pass 1, time-filter history) and fused (the
+four commands). Headline: fusion is the mechanism that delivers the high-
+blob-count command wins; the batched engine buys nothing on top of it and
+regresses the combination.
+
+### Execution checklist (next phase)
+
+1. Fusion KEEP (fusion-spec section 5, state-3 half): flip the four
+   commands to the fused arm unconditionally, delete `fuse_transform_from_env`
+   + the `fused: bool` plumbing + `fuse_transform_active`, keep
+   `run_pipeline_fused` (state 3 retains the default fused engine), delete
+   the batch machinery (`for_each_primitive_block_batch*`, `BATCH_COUNT_BACKSTOP`,
+   move `BATCH_SIZE` to `extract/simple.rs`), collapse `for_each_fused_block`
+   to the bare `run_pipeline_fused` call, author `decisions/0009-fused-command-transforms.md`.
+2. Batching REVERT (pipeline-rebuild-spec section 5, revert half): delete
+   `src/read/batched_pipeline.rs`, the two dispatch arms, the `batched`
+   config field + `bool_gate_from_env` gate read, the `#[doc(hidden)]`
+   builder, `tests/fault_batched_pipeline.rs`, `tests/cli_batched_gate.rs`,
+   the `batched_*` tests. Keep CliInvoker `.env()` and getparents
+   `--full-scan-min-blobs` (durable instruments).
+3. Items 1, 2 REVERT: delete the fadvise watermark gate + code, the four
+   byte-knob gates + code (subject to the CMD_BATCH_BYTES / BLOCK_QUEUE_BYTES
+   consumers surviving only if fusion's keep does not already delete them).
+4. Item 5 KEEP: flip `PBFHOGG_PREFETCH_WILLNEED` to default-on, delete the
+   gate, CHANGELOG the europe ~6% win.
+5. TODO.md verdicts; settle kept numbers into `reference/performance.md`
+   (new current) + this batch's arc into `reference/performance-history.md`;
+   CHANGELOG for the two keeps (fusion command headlines, europe prefetch);
+   delete this note; reconcile the doc riders (plan item 7).

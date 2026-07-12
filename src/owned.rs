@@ -96,6 +96,16 @@ pub(crate) struct OwnedWay {
     pub(crate) id: i64,
     pub(crate) tags: Vec<(String, String)>,
     pub(crate) refs: Vec<i64>,
+    /// Inline node coordinates (decimicro lat/lon), one per ref, for
+    /// LocationsOnWays preservation. Empty when the source way carried no
+    /// inline coordinates (the common case: input header lacks the
+    /// `LocationsOnWays` feature). `read_way` always leaves this empty;
+    /// only `read_way_with_locations` populates it, so existing consumers
+    /// (sort, cat dedupe, degrade, time_filter) that go through `read_way`
+    /// keep re-encoding via the plain `add_way` path unchanged. The
+    /// `write_single_way*` helpers switch to `add_way_with_locations` only
+    /// when this is non-empty and its length matches `refs`.
+    pub(crate) locations: Vec<(i32, i32)>,
     pub(crate) metadata: Option<OwnedMetadata>,
 }
 
@@ -362,6 +372,7 @@ pub(crate) fn read_way(w: &crate::Way<'_>) -> OwnedWay {
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect(),
         refs: w.refs().collect(),
+        locations: Vec::new(),
         metadata: info.version().map(|v| OwnedMetadata {
             version: v,
             timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
@@ -375,6 +386,21 @@ pub(crate) fn read_way(w: &crate::Way<'_>) -> OwnedWay {
             visible: info.visible(),
         }),
     }
+}
+
+/// Like [`read_way`] but also captures the way's inline node coordinates
+/// (LocationsOnWays). Used by `repack` when the input header declares the
+/// `LocationsOnWays` feature so the trailing-slice / merge path can
+/// round-trip coordinates. If the source way carries no inline coordinates
+/// (empty `node_locations()`), `locations` stays empty and the write path
+/// falls back to the plain `add_way` encoding for that way.
+pub(crate) fn read_way_with_locations(w: &crate::Way<'_>) -> OwnedWay {
+    let mut way = read_way(w);
+    way.locations = w
+        .node_locations()
+        .map(|loc| (loc.decimicro_lat(), loc.decimicro_lon()))
+        .collect();
+    way
 }
 
 pub(crate) fn read_relation(r: &crate::Relation<'_>) -> OwnedRelation {
@@ -435,12 +461,22 @@ pub(crate) fn write_single_way(
 ) -> BoxResult<()> {
     crate::commands::ensure_way_capacity(bb, writer)?;
     let meta = owned_to_metadata(way.metadata.as_ref());
-    bb.add_way(
-        way.id,
-        way.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-        &way.refs,
-        meta.as_ref(),
-    );
+    if way.locations.len() == way.refs.len() && !way.locations.is_empty() {
+        bb.add_way_with_locations(
+            way.id,
+            way.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+            &way.refs,
+            &way.locations,
+            meta.as_ref(),
+        );
+    } else {
+        bb.add_way(
+            way.id,
+            way.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+            &way.refs,
+            meta.as_ref(),
+        );
+    }
     Ok(())
 }
 
@@ -497,12 +533,22 @@ pub(crate) fn write_single_way_local(
 ) -> std::result::Result<(), String> {
     crate::commands::ensure_way_capacity_local(bb, output)?;
     let meta = owned_to_metadata(way.metadata.as_ref());
-    bb.add_way(
-        way.id,
-        way.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-        &way.refs,
-        meta.as_ref(),
-    );
+    if way.locations.len() == way.refs.len() && !way.locations.is_empty() {
+        bb.add_way_with_locations(
+            way.id,
+            way.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+            &way.refs,
+            &way.locations,
+            meta.as_ref(),
+        );
+    } else {
+        bb.add_way(
+            way.id,
+            way.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+            &way.refs,
+            meta.as_ref(),
+        );
+    }
     Ok(())
 }
 

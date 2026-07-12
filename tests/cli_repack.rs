@@ -653,3 +653,235 @@ fn repack_output_is_monotonic_with_pending_prepopulated_at_guard() {
     assert_eq!(rel_ids.len(), 30, "expected all 30 relations in the output");
     assert_strictly_increasing(&rel_ids, "relation");
 }
+
+// ---------------------------------------------------------------------------
+// LocationsOnWays preservation (v2.2)
+// ---------------------------------------------------------------------------
+
+/// A way with an id, node refs, and one inline `(decimicro_lat, decimicro_lon)`
+/// coordinate per ref. The stable `write_multi_block_test_pbf` helper cannot
+/// emit LocationsOnWays, so these tests build the fixture directly with the
+/// allowlisted `BlockBuilder`/`PbfWriter` surface.
+type LowWay = (
+    i64,
+    Vec<i64>,
+    Vec<(i32, i32)>,
+    Vec<(&'static str, &'static str)>,
+);
+
+/// Write a sorted, indexed PBF whose header declares `LocationsOnWays` and
+/// whose ways carry inline node coordinates (via
+/// `BlockBuilder::add_way_with_locations`). Nodes occupy one blob, ways a
+/// second. Sync-writer blobs carry indexdata (`write_primitive_block` scans
+/// block IDs), so repack's indexdata requirement is satisfied without
+/// `--force`. Allowlist-only (block_builder + writer).
+fn write_low_pbf(path: &Path, nodes: &[TestNode], ways: &[LowWay]) {
+    write_way_coords_pbf(path, nodes, ways, true);
+}
+
+/// Like [`write_low_pbf`], but the ways always carry inline
+/// `(decimicro_lat, decimicro_lon)` coordinates via
+/// `BlockBuilder::add_way_with_locations` regardless of `declare_low`; only
+/// whether the header advertises the `LocationsOnWays` feature is
+/// parameterized. Used to pin the reverse no-implicit-conversion direction:
+/// coordinates present in the wire data but the feature flag absent from the
+/// header must not cause repack to preserve (or otherwise expose) them.
+fn write_way_coords_pbf(path: &Path, nodes: &[TestNode], ways: &[LowWay], declare_low: bool) {
+    use pbfhogg::block_builder::{self, BlockBuilder};
+    use pbfhogg::writer::{Compression, PbfWriter};
+
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let mut header_builder = block_builder::HeaderBuilder::new().sorted();
+    if declare_low {
+        header_builder = header_builder.optional_feature("LocationsOnWays");
+    }
+    let header = header_builder.build().expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+
+    // Nodes: one blob.
+    for n in nodes {
+        bb.add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), None);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    // Ways: one blob, each carrying inline coordinates.
+    for (id, refs, locs, tags) in ways {
+        assert_eq!(refs.len(), locs.len(), "refs and locations must match");
+        bb.add_way_with_locations(*id, tags.iter().copied(), refs, locs, None);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    writer.flush().expect("flush");
+}
+
+/// Collect `(way_id, inline coordinates)` for every way in the output, in
+/// physical order. Coordinates come from `Way::node_locations()`, which is
+/// empty unless the way actually embeds LocationsOnWays data.
+fn way_locations_in_output(path: &Path) -> Vec<(i64, Vec<(i32, i32)>)> {
+    let reader = BlobReader::from_path(path).expect("open pbf");
+    let mut out = Vec::new();
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") {
+            for element in block.elements() {
+                if let Element::Way(w) = element {
+                    let locs: Vec<(i32, i32)> = w
+                        .node_locations()
+                        .map(|l| (l.decimicro_lat(), l.decimicro_lon()))
+                        .collect();
+                    out.push((w.id(), locs));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// When the input header declares `LocationsOnWays`, repack must re-advertise
+/// the feature AND round-trip every way-ref coordinate exactly. Cap 2 against
+/// 5 ways in one input blob forces the split: the worker frames two full
+/// blocks (4 ways) and ships one way as the trailing merge slice, so both the
+/// per-worker `add_way_with_locations` path and the central-builder
+/// (Owned-way) path carry coordinates.
+#[test]
+fn repack_preserves_locations_on_ways() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    let nodes = generate_nodes(6, 1);
+    let ways: Vec<LowWay> = (1..=5i64)
+        .map(|w| {
+            let refs: Vec<i64> = (0..3i64).map(|r| w * 10 + r).collect();
+            let locs: Vec<(i32, i32)> = (0..3i64)
+                .map(|r| {
+                    let base = i32::try_from(w * 1_000_000 + r * 1000).expect("coord fits in i32");
+                    (base, base + 7)
+                })
+                .collect();
+            (w, refs, locs, vec![("highway", "residential")])
+        })
+        .collect();
+    write_low_pbf(&input, &nodes, &ways);
+
+    assert!(
+        read_header(&input).has_locations_on_ways(),
+        "fixture must declare LocationsOnWays"
+    );
+
+    // Cap 2 < 5 ways/blob: worker full blocks (4 ways) plus a 1-way tail.
+    run_repack(&input, &output, 2);
+
+    assert!(
+        read_header(&output).has_locations_on_ways(),
+        "output dropped LocationsOnWays"
+    );
+
+    let mut got = way_locations_in_output(&output);
+    got.sort_by_key(|(id, _)| *id);
+    let mut expected: Vec<(i64, Vec<(i32, i32)>)> = ways
+        .iter()
+        .map(|(id, _, locs, _)| (*id, locs.clone()))
+        .collect();
+    expected.sort_by_key(|(id, _)| *id);
+
+    assert_eq!(
+        got, expected,
+        "way-ref coordinates did not round-trip exactly"
+    );
+}
+
+/// Sentinel for the no-implicit-conversion constraint: when the input header
+/// lacks `LocationsOnWays`, repack must NOT emit the feature and must NOT
+/// synthesize inline way coordinates. The standard fixture has no LOW.
+#[test]
+fn repack_strips_no_low_when_input_has_none() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    write_repack_fixture(&input);
+    assert!(
+        !read_header(&input).has_locations_on_ways(),
+        "fixture must not declare LocationsOnWays"
+    );
+
+    run_repack(&input, &output, 10);
+
+    assert!(
+        !read_header(&output).has_locations_on_ways(),
+        "output emitted LocationsOnWays when the input lacked it"
+    );
+
+    let got = way_locations_in_output(&output);
+    assert!(!got.is_empty(), "expected ways in the output");
+    for (id, locs) in &got {
+        assert!(
+            locs.is_empty(),
+            "way {id} unexpectedly carries inline coordinates"
+        );
+    }
+}
+
+/// Reverse of the constraint above: the input header omits the
+/// `LocationsOnWays` feature flag, but the way blob still carries inline
+/// `(decimicro_lat, decimicro_lon)` coordinates in the wire data (a
+/// malformed-but-decodable input, or one hand-built to probe repack's
+/// gating). `repack_strips_no_low_when_input_has_none` cannot catch
+/// accidental preservation because its fixture has no coordinate fields at
+/// all; this test puts real coordinates in the input and pins that repack's
+/// gate on `header.has_locations_on_ways()` - not on whether the way payload
+/// happens to carry locations - controls the output.
+#[test]
+fn repack_strips_coords_when_input_flag_absent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    let nodes = generate_nodes(6, 1);
+    let ways: Vec<LowWay> = (1..=5i64)
+        .map(|w| {
+            let refs: Vec<i64> = (0..3i64).map(|r| w * 10 + r).collect();
+            let locs: Vec<(i32, i32)> = (0..3i64)
+                .map(|r| {
+                    let base = i32::try_from(w * 1_000_000 + r * 1000).expect("coord fits in i32");
+                    (base, base + 7)
+                })
+                .collect();
+            (w, refs, locs, vec![("highway", "residential")])
+        })
+        .collect();
+    write_way_coords_pbf(&input, &nodes, &ways, false);
+
+    assert!(
+        !read_header(&input).has_locations_on_ways(),
+        "fixture must not declare LocationsOnWays"
+    );
+
+    // Cap 2 < 5 ways/blob: exercises both the worker full-block path and the
+    // trailing Owned-way merge path, same split as
+    // `repack_preserves_locations_on_ways`.
+    run_repack(&input, &output, 2);
+
+    assert!(
+        !read_header(&output).has_locations_on_ways(),
+        "output emitted LocationsOnWays when the input lacked the flag"
+    );
+
+    let got = way_locations_in_output(&output);
+    assert_eq!(got.len(), ways.len(), "expected all ways in the output");
+    for (id, locs) in &got {
+        assert!(
+            locs.is_empty(),
+            "way {id} exposed inline coordinates despite absent LocationsOnWays flag"
+        );
+    }
+}

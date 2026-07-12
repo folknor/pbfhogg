@@ -5,10 +5,11 @@ Motivated by [`reference/blob-density.md`](../reference/blob-density.md):
 the measurement matrix needs same-corpus-different-encoding pairs to
 control for blob-count effects independent of byte size.
 
-**Status:** v1 + v2.1 shipped. v1 was the parallel per-worker shrink
-path; v2.1 added cross-input-blob coalescing so grow caps actually
-fire. v2.2 (LocationsOnWays preservation) and v2.3 (osmium cross-
-validation) remain deferred.
+**Status:** v1 + v2.1 + v2.2 shipped. v1 was the parallel per-worker
+shrink path; v2.1 added cross-input-blob coalescing so grow caps
+actually fire; v2.2 preserves LocationsOnWays (the input's inline
+way-ref coordinates and feature flag round-trip exactly). v2.3
+(osmium cross-validation) remains deferred.
 
 ## What ships today
 
@@ -206,13 +207,34 @@ output blob layout matches the input") is no longer accurate: with
 cross-input-blob coalescing, the input blob layout no longer
 constrains the output.
 
-### Limitation: LocationsOnWays not preserved
+### LocationsOnWays preservation (v2.2)
 
-If the input header declares `LocationsOnWays`, the run prints a
-stderr warning that inline way-node coordinates will not be
-propagated. The output PBF does not carry the LOW feature flag and
-does not embed coordinates in way refs. This is the only metadata
-the round-trip drops.
+No implicit conversion: the output mirrors the input's LOW state.
+
+- Input header WITHOUT `LocationsOnWays`: output carries no LOW
+  feature flag and no inline way coordinates (unchanged pre-v2.2
+  shape). There is no add-locations mode here - that is what the
+  `add-locations-to-ways` command is for.
+- Input header WITH `LocationsOnWays`: the output header re-advertises
+  the feature and every way-ref `(decimicro_lat, decimicro_lon)`
+  round-trips exactly.
+
+Detection is a single up-front `HeaderBlock::has_locations_on_ways`
+read. When active, both way-phase output streams carry coordinates:
+the per-worker `BlockBuilder` calls `add_way_with_locations` on the
+full-block path, and the trailing slice ships as `OwnedWay` extended
+with the per-ref coordinates so the central merge builder also uses
+`add_way_with_locations`. A way that carries no inline coordinates
+under a LOW header (empty lat/lon fields) falls back to the plain
+`add_way` encoding for that way, so the refs==locations invariant
+never trips. The shared `warn_locations_on_ways_loss` call was
+dropped from `repack` - it stays in commands that genuinely cannot
+preserve LOW (tags-filter, extract, sort, and so on) - and replaced
+with a narrower `warn_way_metadata_loss` local to the repack module.
+repack still drops the two `pbfhogg.*` prepass features
+(`WayMembers-v1`, `SharedNodePins-v1`; see "What repack does not
+preserve" below), so the narrowed warning still fires for those two,
+just never for `LocationsOnWays`.
 
 ### What v1 preserves
 
@@ -222,8 +244,20 @@ the round-trip drops.
 - Relation members (id + type + role).
 - DenseNode encoding (DenseNode in -> DenseNode out).
 - `Sort.Type_then_ID` header flag when the input has it.
+- `LocationsOnWays` feature flag and inline way-ref coordinates when
+  the input has them (v2.2).
 - All `OsmSchema-V0.6` / `DenseNodes` / `HistoricalInformation`
   features that pass through the standard writer header path.
+
+### What repack does not preserve
+
+repack still drops the two `pbfhogg.*` injected prepass metadata
+features: `pbfhogg.WayMembers-v1` (BlobHeader field-5 way-member
+bitmaps) and `pbfhogg.SharedNodePins-v1` (Way field-20 shared-node
+pin bitmaps). An input header declaring either trips
+`warn_way_metadata_loss` (repack-local, narrower than the shared
+`warn_locations_on_ways_loss`), which does not fire for
+`LocationsOnWays` since v2.2.
 
 ### Tests
 
@@ -264,6 +298,20 @@ the round-trip drops.
   `bb`-empty-`pending`-non-empty guard state is unreachable (lazy
   builder flush always leaves `bb` a non-empty remainder), so its
   disjunct is defensive.
+- `repack_preserves_locations_on_ways` - LOW fixture (header declares
+  `LocationsOnWays`, 5 ways with inline coords, one node blob), cap 2
+  so the way phase splits into worker full blocks plus a trailing
+  merge slice; asserts the output header declares LOW and every
+  way-ref coordinate round-trips exactly across both paths.
+- `repack_strips_no_low_when_input_has_none` - sentinel for the
+  no-implicit-conversion constraint: the standard (no-LOW) fixture
+  produces output with no LOW feature and no inline way coordinates.
+- `repack_strips_coords_when_input_flag_absent` - reverse direction of
+  the above: ways carry real inline coordinates in the wire data but
+  the header omits `LocationsOnWays`; asserts the gate is
+  `header.has_locations_on_ways()` alone, not the presence of
+  coordinate fields, so the output declares no LOW and every way's
+  `node_locations()` is empty.
 
 Note on the `_matches_prediction` tests: they assert `ceil(elements /
 cap)` because their fixtures divide evenly (cap 10 vs 20/blob input ->
@@ -275,45 +323,19 @@ the suite; deferred to v2.3.
 
 ## v2 scope
 
-v2.1 (cross-input-blob coalescing) shipped. Two gaps remain; v2.2 is
-the next likely candidate, v2.3 is cheap once it lands.
+v2.1 (cross-input-blob coalescing) and v2.2 (LocationsOnWays
+preservation) shipped. One gap remains; v2.3 is cheap now that v2.2
+has landed.
 
-### v2.2 - LocationsOnWays preservation
+### v2.2 - LocationsOnWays preservation (shipped)
 
-**Goal:** if the input header declares `LocationsOnWays`, the
-output preserves both the feature flag and the inline coordinates
-on way refs.
-
-**Constraint:** no implicit conversion. Input without LOW must
-produce output without LOW; input with LOW must produce output with
-LOW. There is no `--add-locations-to-ways` mode here - that is what
-the existing `add-locations-to-ways` command is for.
-
-**Sketch:**
-
-`Element::Way` already exposes inline coordinates when the source
-blob has them. The writer path - `BlockBuilder::add_way` - takes
-only `refs: &[i64]` today. v2.2 needs:
-
-1. A second `BlockBuilder` entry point (`add_way_with_locations` or
-   an enum-valued variant) that takes `refs` plus parallel
-   `decimicro_lat` / `decimicro_lon` slices.
-2. The repack worker, when the input header has LOW, populates
-   those slices from the way's inline coordinates.
-3. The output header inherits the LOW feature flag instead of being
-   stripped by `warn_locations_on_ways_loss`.
-
-Then drop the `warn_locations_on_ways_loss` call from `repack` (the
-warning still belongs in commands that genuinely cannot preserve
-LOW, like `tags-filter` and `extract`).
-
-**Tests to add:**
-
-- `repack_preserves_locations_on_ways` - fixture with LOW + a
-  handful of ways, verify the output declares LOW and that
-  way-ref coordinates round-trip exactly.
-- `repack_strips_no_low_when_input_has_none` - sentinel that we
-  don't accidentally emit LOW when the input doesn't have it.
+Shipped. Detection, the two coordinate-carrying way-phase paths, and
+the header re-advertisement are described under "LocationsOnWays
+preservation (v2.2)" above; `repack_preserves_locations_on_ways` and
+`repack_strips_no_low_when_input_has_none` cover it. The `OwnedWay`
+owned type gained a `locations: Vec<(i32, i32)>` field (empty on the
+`read_way` path so sort / cat-dedupe / degrade / time_filter behave
+unchanged; populated only by the new `read_way_with_locations`).
 
 ### v2.3 - osmium cross-validation
 

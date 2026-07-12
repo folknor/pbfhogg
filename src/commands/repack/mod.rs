@@ -47,8 +47,8 @@ use super::{
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::owned::{
     OwnedNode, OwnedRelation, OwnedWay, dense_node_metadata, element_metadata, read_dense_node,
-    read_node, read_relation, read_way, write_single_node_local, write_single_relation_local,
-    write_single_way_local,
+    read_node, read_relation, read_way, read_way_with_locations, write_single_node_local,
+    write_single_relation_local, write_single_way_local,
 };
 use crate::writer::{Compression, PbfWriter, frame_blob_pipelined};
 use crate::{Element, ElementReader};
@@ -113,6 +113,20 @@ struct WorkerOutput {
     tail: KindPayload,
 }
 
+/// Warn if the input header declares way-level metadata that repack does not
+/// preserve. Narrower than [`super::warn_locations_on_ways_loss`]: repack
+/// preserves `LocationsOnWays` (see the coordinate-threading comment in
+/// [`repack`]) so it must not warn about that feature, but it still drops
+/// `pbfhogg.WayMembers-v1` and `pbfhogg.SharedNodePins-v1`.
+fn warn_way_metadata_loss(header: &crate::HeaderBlock) {
+    if header.has_way_members_v1() || header.has_shared_node_pins_v1() {
+        eprintln!(
+            "Warning: input PBF has way-level enrichment metadata. \
+             Injected prepass metadata (WayMembers/SharedNodePins) is not preserved in the output."
+        );
+    }
+}
+
 /// Re-encode `input` to `output` with a per-blob element cap of
 /// `elements_per_blob`. Element semantics are preserved: every element
 /// round-trips with its tags, refs, members, metadata, and DenseNodes
@@ -150,10 +164,26 @@ pub fn repack(
         libc::mallopt(libc::M_ARENA_MAX, 2);
     }
 
-    let header = {
+    // Detect LocationsOnWays on the input header once, up front. Unlike
+    // tags-filter / extract, repack round-trips way payloads verbatim, so it
+    // CAN preserve inline way-ref coordinates - hence no
+    // `warn_locations_on_ways_loss` call here (that helper also warns about
+    // LocationsOnWays, which would misfire on the case repack now handles).
+    // When the input declares LOW, the output header re-advertises the
+    // feature (below) and the way phase threads the inline coordinates
+    // through both the worker full-block path and the trailing Owned* merge
+    // path. When the input lacks LOW, none of that fires and the output is
+    // byte-for-byte the pre-v2.2 shape (no LOW feature, no way coordinates) -
+    // the no-implicit-conversion constraint.
+    //
+    // repack still drops the other two optional way-metadata features
+    // (`pbfhogg.WayMembers-v1`, `pbfhogg.SharedNodePins-v1`), so those still
+    // need a loss warning; see `warn_way_metadata_loss` below.
+    let (header, preserve_locations) = {
         let reader = ElementReader::open(input, direct_io)?;
-        super::warn_locations_on_ways_loss(reader.header());
-        reader.header().clone()
+        let preserve = reader.header().has_locations_on_ways();
+        warn_way_metadata_loss(reader.header());
+        (reader.header().clone(), preserve)
     };
     let mut writer = writer_from_header(
         output,
@@ -161,7 +191,13 @@ pub fn repack(
         &header,
         true,
         overrides,
-        |hb| hb,
+        |hb| {
+            if preserve_locations {
+                hb.optional_feature("LocationsOnWays")
+            } else {
+                hb
+            }
+        },
         direct_io,
         io_uring,
     )?;
@@ -194,6 +230,7 @@ pub fn repack(
         KIND_NODE,
         elements_per_blob,
         compression,
+        preserve_locations,
         &mut writer,
     )?;
     crate::debug::emit_marker("REPACK_NODES_END");
@@ -212,6 +249,7 @@ pub fn repack(
         KIND_WAY,
         elements_per_blob,
         compression,
+        preserve_locations,
         &mut writer,
     )?;
     crate::debug::emit_marker("REPACK_WAYS_END");
@@ -230,6 +268,7 @@ pub fn repack(
         KIND_RELATION,
         elements_per_blob,
         compression,
+        preserve_locations,
         &mut writer,
     )?;
     crate::debug::emit_marker("REPACK_RELATIONS_END");
@@ -325,6 +364,7 @@ fn run_kind_phase(
     kind: u8,
     elements_per_blob: usize,
     compression: Compression,
+    preserve_locations: bool,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
 ) -> Result<PhaseStats> {
     use crate::reorder_buffer::ReorderBuffer;
@@ -362,7 +402,13 @@ fn run_kind_phase(
         None,
         || (),
         |block, _state| -> PhaseResult {
-            worker_split_blob(block, kind, elements_per_blob, &compression)
+            worker_split_blob(
+                block,
+                kind,
+                elements_per_blob,
+                preserve_locations,
+                &compression,
+            )
         },
         |seq, r| {
             reorder.push(seq, r);
@@ -525,6 +571,36 @@ fn run_kind_phase(
     })
 }
 
+/// Encode one way into the per-worker full-block `BlockBuilder`, reusing the
+/// caller's scratch buffers. When `preserve_locations` is set (input header
+/// declares LocationsOnWays) the way's own inline coordinates are embedded via
+/// `add_way_with_locations`. The length guard keeps a way that carries no
+/// inline coordinates under a LOW header (empty lat/lon fields) on the plain
+/// `add_way` path instead of tripping the refs==locations invariant.
+fn encode_way_full_block(
+    bb: &mut BlockBuilder,
+    w: &crate::Way<'_>,
+    refs_buf: &mut Vec<i64>,
+    locations_buf: &mut Vec<(i32, i32)>,
+    preserve_locations: bool,
+) {
+    refs_buf.clear();
+    refs_buf.extend(w.refs());
+    let meta = element_metadata(&w.info());
+    if preserve_locations {
+        locations_buf.clear();
+        locations_buf.extend(
+            w.node_locations()
+                .map(|loc| (loc.decimicro_lat(), loc.decimicro_lon())),
+        );
+    }
+    if preserve_locations && locations_buf.len() == refs_buf.len() && !locations_buf.is_empty() {
+        bb.add_way_with_locations(w.id(), w.tags(), refs_buf, locations_buf, meta.as_ref());
+    } else {
+        bb.add_way(w.id(), w.tags(), refs_buf, meta.as_ref());
+    }
+}
+
 /// One worker's body: count matching elements, frame the leading
 /// `M - M%cap` elements as full blocks via a per-worker `BlockBuilder`,
 /// and ship the trailing `M%cap` elements as `Owned*` data for the merge
@@ -535,6 +611,7 @@ fn worker_split_blob(
     block: &crate::PrimitiveBlock,
     kind: u8,
     cap: usize,
+    preserve_locations: bool,
     compression: &Compression,
 ) -> std::result::Result<WorkerOutput, String> {
     let total = match kind {
@@ -567,6 +644,7 @@ fn worker_split_blob(
 
     let mut idx: usize = 0;
     let mut refs_buf: Vec<i64> = Vec::new();
+    let mut locations_buf: Vec<(i32, i32)> = Vec::new();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
     for element in block.elements() {
         let is_match = matches!(
@@ -607,10 +685,13 @@ fn worker_split_blob(
                 }
                 (Element::Way(w), KIND_WAY) => {
                     ensure_way_capacity_local(&mut bb, &mut output)?;
-                    refs_buf.clear();
-                    refs_buf.extend(w.refs());
-                    let meta = element_metadata(&w.info());
-                    bb.add_way(w.id(), w.tags(), &refs_buf, meta.as_ref());
+                    encode_way_full_block(
+                        &mut bb,
+                        w,
+                        &mut refs_buf,
+                        &mut locations_buf,
+                        preserve_locations,
+                    );
                 }
                 (Element::Relation(r), KIND_RELATION) => {
                     ensure_relation_capacity_local(&mut bb, &mut output)?;
@@ -632,7 +713,11 @@ fn worker_split_blob(
             match (&element, &mut tail) {
                 (Element::DenseNode(dn), KindPayload::Nodes(v)) => v.push(read_dense_node(dn)),
                 (Element::Node(n), KindPayload::Nodes(v)) => v.push(read_node(n)),
-                (Element::Way(w), KindPayload::Ways(v)) => v.push(read_way(w)),
+                (Element::Way(w), KindPayload::Ways(v)) => v.push(if preserve_locations {
+                    read_way_with_locations(w)
+                } else {
+                    read_way(w)
+                }),
                 (Element::Relation(r), KindPayload::Relations(v)) => v.push(read_relation(r)),
                 _ => {}
             }

@@ -14,6 +14,13 @@
 
 ### Changed
 
+- `repack` now preserves `LocationsOnWays`: when the input header declares
+  the feature, the output re-advertises it and every inline way-node
+  coordinate round-trips exactly, instead of being silently dropped. Inputs
+  without the feature are unchanged (no coordinates, no flag). `repack` still
+  drops `pbfhogg.WayMembers-v1` and `pbfhogg.SharedNodePins-v1` and now warns
+  specifically about those two.
+
 - Full-scan transforms now execute in the decode workers for `getid`
   `--add-referenced`, getparents FullScan, single-pass `tags-filter`, and the
   decode-all `add-locations-to-ways` fallback. On the 8k blob encoding,

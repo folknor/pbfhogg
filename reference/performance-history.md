@@ -688,7 +688,7 @@ Allocation profiling (same commit):
 ## Env-gated read-path batch (2026-07-12 overnight, commit `a65cecc`, plantasjen)
 
 Five read-path follow-ups from the 2026-07-11 architecture reports
-(`notes/read-path-architecture-reports.md`) were landed behind default-off
+(codex xhigh + Fable, verbatim in git history) were landed behind default-off
 `PBFHOGG_*` env gates and adjudicated in one overnight A/B run - one binary,
 one commit, gate-off IS the baseline, same-day A/B by construction. Host
 plantasjen (23 GB RAM this run; the reports' "26-30 GB" was swap-inclusive).

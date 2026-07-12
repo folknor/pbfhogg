@@ -122,8 +122,8 @@ Specifications are saved to the ./notes folder.
 10. **The standing references.** Every spec MUST cite, by path: this document
     (`reference/technical-implementation-spec.md`) as the contract it is
     written against, AND the document the spec was spawned from (the item's
-    source naming the problem - e.g. the owning `notes/*.md` writeup such
-    as `notes/injected-prepass.md`), if it exists.
+    source naming the problem - e.g. the owning `notes/*.md` writeup),
+    if it exists.
     A spec that adds, moves, or reorganizes tests also cites
     `reference/testing.md`, the placement-and-tier contract those bricks must
     satisfy. The measurement record is `reference/performance.md` plus

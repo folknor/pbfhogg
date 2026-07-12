@@ -228,8 +228,7 @@ OSC-only: merges multiple OSC XML files into one. Optional `--simplify` keeps on
 
 _The following describes the specific deployment that drives pbfhogg's development. It documents how the author uses pbfhogg in a planet-scale OSM refresh pipeline feeding tile generation and reverse geocoding. It is not part of the library's public API or general documentation - it records operational context, allocation budgets, and performance measurements specific to this ecosystem._
 
-**Production pipeline** (ratified 2026-07-10; steady-state shape is
-decision 1 / option (a) of `notes/injected-prepass.md` section 7):
+**Production pipeline** (ratified 2026-07-10):
 
 ```
 Bootstrap (once):  pbfhogg cat → indexed planet PBF

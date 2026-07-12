@@ -130,3 +130,7 @@ The skeleton has exactly two sections. `Context`, `Consequences`, and
   `add-locations-to-ways --inject-prepass`; presence-is-validity
   superset semantics, rewriting commands must not carry the flags
   forward.
+- [ADR-0009](0009-fused-command-transforms.md) - Full-scan command
+  transforms run in decode workers; decoded-input admission remains the
+  memory budget, while command-side batches and their byte override are
+  retired.

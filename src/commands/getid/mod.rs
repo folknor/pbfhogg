@@ -4,12 +4,9 @@ use std::path::Path;
 
 use crate::idset::IdSet;
 
-use rayon::prelude::*;
-
 use super::{
-    HeaderOverrides, drain_batch_results, ensure_node_capacity_local,
-    ensure_relation_capacity_local, ensure_way_capacity_local, flush_local,
-    for_each_primitive_block_batch, fuse_transform_from_env, require_indexdata, writer_from_header,
+    HeaderOverrides, ensure_node_capacity_local, ensure_relation_capacity_local,
+    ensure_way_capacity_local, flush_local, require_indexdata, writer_from_header,
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_writer::FileWriter;
@@ -18,7 +15,7 @@ use crate::read::header_walker::{FULL_SCAN_ARM_MIN_BLOBS, ScanArm};
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
-use super::{BATCH_SIZE, Result};
+use super::Result;
 
 // ---------------------------------------------------------------------------
 // ID parsing
@@ -262,7 +259,6 @@ pub fn getid(
     force: bool,
     overrides: &HeaderOverrides,
 ) -> Result<GetidStats> {
-    let fused = fuse_transform_from_env()?;
     let (_, stats) = getid_dispatched(
         input,
         output,
@@ -273,7 +269,6 @@ pub fn getid(
         force,
         overrides,
         FULL_SCAN_ARM_MIN_BLOBS,
-        fused,
     )?;
     Ok(stats)
 }
@@ -293,7 +288,6 @@ fn getid_dispatched(
     force: bool,
     overrides: &HeaderOverrides,
     min_blobs: u64,
-    fused: bool,
 ) -> Result<(Option<ScanArm>, GetidStats)> {
     let has_indexdata = require_indexdata(
         input,
@@ -305,16 +299,7 @@ fn getid_dispatched(
     )?;
 
     let (arm, result) = if opts.add_referenced {
-        let stats = getid_with_refs(
-            input,
-            output,
-            ids,
-            opts,
-            compression,
-            direct_io,
-            overrides,
-            fused,
-        )?;
+        let stats = getid_with_refs(input, output, ids, opts, compression, direct_io, overrides)?;
         (None, stats)
     } else {
         let arm = super::dispatch_scan_arm(input, has_indexdata, min_blobs)?;
@@ -737,7 +722,6 @@ fn getid_with_refs(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
-    fused: bool,
 ) -> Result<GetidStats> {
     let mut stats = GetidStats {
         nodes_written: 0,
@@ -797,7 +781,8 @@ fn getid_with_refs(
         );
     }
 
-    // Pass 2: Write matching elements + dependent nodes (parallel batches).
+    // Pass 2: Write matching elements + dependent nodes (transform fused into
+    // the decode workers).
     crate::debug::emit_marker("GETID_PASS2_START");
     let reader = ElementReader::open(input, direct_io)?;
     super::warn_locations_on_ways_loss(reader.header());
@@ -825,75 +810,47 @@ fn getid_with_refs(
         None
     };
 
-    if fused {
-        crate::debug::emit_counter("fuse_transform_active", 1);
-        let mut fused_blocks = 0_u64;
-        reader.for_each_fused_block(
-            |block| {
-                let mut bb = BlockBuilder::new();
-                let mut output = Vec::new();
-                let counts =
-                    process_block(&block, &mut bb, &mut output, ids, true, dep_ref, strip_tags)?;
-                flush_local(&mut bb, &mut output)?;
-                Ok((output, counts))
-            },
-            |(blocks, (nodes, ways, relations))| {
-                for OwnedBlock {
+    reader.for_each_fused_block(
+        |block| {
+            let mut bb = BlockBuilder::new();
+            let mut output = Vec::new();
+            let counts =
+                process_block(&block, &mut bb, &mut output, ids, true, dep_ref, strip_tags)?;
+            flush_local(&mut bb, &mut output)?;
+            Ok((output, counts))
+        },
+        |(blocks, (nodes, ways, relations))| {
+            for OwnedBlock {
+                bytes,
+                index,
+                tagdata,
+                way_members,
+            } in blocks
+            {
+                writer.write_primitive_block_owned(
                     bytes,
                     index,
-                    tagdata,
-                    way_members,
-                } in blocks
-                {
-                    writer.write_primitive_block_owned(
-                        bytes,
-                        index,
-                        tagdata.as_deref(),
-                        way_members.as_deref(),
-                    )?;
-                }
-                stats.nodes_written += nodes;
-                stats.ways_written += ways;
-                stats.relations_written += relations;
-                fused_blocks += 1;
-                if fused_blocks.is_multiple_of(64) {
-                    crate::debug::emit_counter(
-                        "fuse_transform_blocks",
-                        i64::try_from(fused_blocks).unwrap_or(i64::MAX),
-                    );
-                }
-                Ok(())
-            },
-        )?;
-        crate::debug::emit_counter(
-            "fuse_transform_blocks",
-            i64::try_from(fused_blocks).unwrap_or(i64::MAX),
-        );
-    } else {
-        for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
-            let (nodes, ways, relations) =
-                process_filter_batch(batch, &mut writer, ids, true, dep_ref, strip_tags)?;
+                    tagdata.as_deref(),
+                    way_members.as_deref(),
+                )?;
+            }
             stats.nodes_written += nodes;
             stats.ways_written += ways;
             stats.relations_written += relations;
             Ok(())
-        })?;
-    }
+        },
+    )?;
 
     writer.flush()?;
     crate::debug::emit_marker("GETID_PASS2_END");
     Ok(stats)
 }
 
-// ---------------------------------------------------------------------------
-// Parallel batch processing
-// ---------------------------------------------------------------------------
-
 /// Process a single `PrimitiveBlock` through the ID filter, writing matching
 /// elements into the thread-local `BlockBuilder` and flushing complete blocks
 /// into `output`. Returns `(nodes, ways, relations)` counts.
 ///
-/// Called from rayon worker threads via `map_init`.
+/// Called on the decode-worker threads via `for_each_fused_block`.
 fn process_block(
     block: &PrimitiveBlock,
     bb: &mut BlockBuilder,
@@ -1001,53 +958,6 @@ fn process_block(
     }
 
     Ok((nodes, ways, relations))
-}
-
-/// Process a batch of `PrimitiveBlock`s in parallel via rayon.
-///
-/// Each rayon worker thread owns a `BlockBuilder` (via `map_init`) and
-/// processes one block at a time, flushing serialized output to a local
-/// `Vec<OwnedBlock>`. After parallel processing, the serialized
-/// blocks are written sequentially to the `PbfWriter` in batch order.
-///
-/// Returns `(nodes_written, ways_written, relations_written)`.
-fn process_filter_batch(
-    batch: &[PrimitiveBlock],
-    writer: &mut PbfWriter<FileWriter>,
-    ids: &ElementIds,
-    include: bool,
-    dep_node_ids: Option<&crate::idset::IdSet>,
-    strip_tags: bool,
-) -> Result<(u64, u64, u64)> {
-    type BatchResult = std::result::Result<(Vec<OwnedBlock>, (u64, u64, u64)), String>;
-    let results: Vec<BatchResult> = batch
-        .par_iter()
-        .map_init(BlockBuilder::new, |bb, block| {
-            let mut output: Vec<OwnedBlock> = Vec::new();
-            let (nodes, ways, relations) = process_block(
-                block,
-                bb,
-                &mut output,
-                ids,
-                include,
-                dep_node_ids,
-                strip_tags,
-            )?;
-            flush_local(bb, &mut output)?;
-            Ok((output, (nodes, ways, relations)))
-        })
-        .collect();
-
-    let mut total_nodes: u64 = 0;
-    let mut total_ways: u64 = 0;
-    let mut total_relations: u64 = 0;
-    drain_batch_results(results, writer, |(nodes, ways, relations)| {
-        total_nodes += nodes;
-        total_ways += ways;
-        total_relations += relations;
-    })?;
-
-    Ok((total_nodes, total_ways, total_relations))
 }
 
 // ---------------------------------------------------------------------------
@@ -1227,7 +1137,7 @@ mod tests {
     }
 
     #[test]
-    fn fused_with_refs_matches_batched() {
+    fn with_refs_writes_referenced_elements() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("input.pbf");
         write_blocks(&input, &[1, 2, 3], Some((10, &[1, 2])), true);
@@ -1236,25 +1146,18 @@ mod tests {
             add_referenced: true,
             remove_tags: false,
         };
-        let batched = dir.path().join("batched.pbf");
-        let fused = dir.path().join("fused.pbf");
-        for (output, fused) in [(&batched, false), (&fused, true)] {
-            getid_with_refs(
-                &input,
-                output,
-                &ids,
-                &opts,
-                Compression::default(),
-                false,
-                &HeaderOverrides::default(),
-                fused,
-            )
-            .unwrap();
-        }
-        assert_eq!(
-            std::fs::read(fused).unwrap(),
-            std::fs::read(batched).unwrap()
-        );
+        let output = dir.path().join("output.pbf");
+        getid_with_refs(
+            &input,
+            &output,
+            &ids,
+            &opts,
+            Compression::default(),
+            false,
+            &HeaderOverrides::default(),
+        )
+        .unwrap();
+        assert_eq!(read_ids(&output), vec![1, 2, 10]);
     }
 
     /// Run the same include-mode query under both arms, assert they emit
@@ -1340,7 +1243,6 @@ mod tests {
                 false,
                 &HeaderOverrides::default(),
                 min_blobs,
-                false,
             )
             .unwrap();
             assert_eq!(arm, Some(expected_arm));

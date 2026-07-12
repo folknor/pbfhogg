@@ -15,20 +15,17 @@ mod sparse;
 use std::path::Path;
 use std::str::FromStr;
 
-use rayon::prelude::*;
-
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
-use crate::writer::{Compression, PbfWriter};
+use crate::writer::Compression;
 use crate::{Element, ElementReader, MemberId, PrimitiveBlock};
 
 use super::{
-    HeaderOverrides, drain_batch_results, ensure_node_capacity_local,
-    ensure_relation_capacity_local, ensure_way_capacity_local, fuse_transform_from_env,
-    require_indexdata, writer_from_header, writer_from_header_parallel,
+    HeaderOverrides, ensure_node_capacity_local, ensure_relation_capacity_local,
+    ensure_way_capacity_local, require_indexdata, writer_from_header, writer_from_header_parallel,
 };
 use crate::idset::IdSet;
 
-use super::{BATCH_SIZE, Result};
+use super::Result;
 
 use self::passthrough::write_output_passthrough;
 use self::sparse::{SparseArrayIndex, build_node_index_sparse};
@@ -207,7 +204,6 @@ pub fn add_locations_to_ways(
     options: &AltwOptions,
     overrides: &HeaderOverrides,
 ) -> Result<Stats> {
-    let fused = fuse_transform_from_env()?;
     // Auto-select: external if sorted + indexed, sparse otherwise.
     let index_type = if options.index_type == IndexType::Auto {
         auto_select_index_type(input, options.direct_io)?
@@ -321,7 +317,6 @@ pub fn add_locations_to_ways(
         options.direct_io,
         indexdata_present,
         overrides,
-        fused,
     )?;
     crate::debug::emit_marker("ALTW_PASS2_END");
     emit_stats_counters(&stats);
@@ -419,8 +414,6 @@ fn emit_stats_counters(stats: &Stats) {
 // Pass 1: Build node coordinate index
 // ---------------------------------------------------------------------------
 
-/// Number of decoded `PrimitiveBlock`s collected before dispatching to rayon
-/// for parallel node index population.
 fn build_node_index(
     input: &Path,
     direct_io: bool,
@@ -597,7 +590,6 @@ fn write_output_checked(
     direct_io: bool,
     indexdata_present: bool,
     overrides: &HeaderOverrides,
-    fused: bool,
 ) -> Result<Stats> {
     if inject_prepass && !indexdata_present {
         return Err("--inject-prepass requires blob-level indexdata; --force cannot enable the decode-all fallback because it cannot attach per-blob WayMembers metadata".into());
@@ -626,7 +618,6 @@ fn write_output_checked(
             compression,
             direct_io,
             overrides,
-            fused,
         )
     }
 }
@@ -646,7 +637,6 @@ fn write_output_decode_all(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
-    fused: bool,
 ) -> Result<Stats> {
     let mut stats = Stats::default();
 
@@ -662,98 +652,63 @@ fn write_output_decode_all(
         false,
     )?;
 
-    if fused {
-        crate::debug::emit_counter("fuse_transform_active", 1);
-        let mut fused_blocks = 0_u64;
-        reader.for_each_fused_block(
-            |block| {
-                let mut bb = BlockBuilder::new();
-                let mut output = Vec::new();
-                let mut refs_buf = Vec::new();
-                let mut locations_buf = Vec::new();
-                let block_stats = process_block(
-                    &block,
-                    &mut bb,
-                    &mut output,
-                    index,
-                    keep_untagged_nodes,
-                    relation_member_node_ids,
-                    &mut refs_buf,
-                    &mut locations_buf,
-                )?;
-                flush_local(&mut bb, &mut output)?;
-                Ok((output, block_stats))
-            },
-            |(blocks, block_stats)| {
-                for OwnedBlock {
-                    bytes,
-                    index,
-                    tagdata,
-                    way_members,
-                } in blocks
-                {
-                    writer.write_primitive_block_owned(
-                        bytes,
-                        index,
-                        tagdata.as_deref(),
-                        way_members.as_deref(),
-                    )?;
-                }
-                stats.merge(&block_stats);
-                fused_blocks += 1;
-                if fused_blocks.is_multiple_of(64) {
-                    crate::debug::emit_counter(
-                        "fuse_transform_blocks",
-                        i64::try_from(fused_blocks).unwrap_or(i64::MAX),
-                    );
-                }
-                Ok(())
-            },
-        )?;
-        crate::debug::emit_counter(
-            "fuse_transform_blocks",
-            i64::try_from(fused_blocks).unwrap_or(i64::MAX),
-        );
-    } else {
-        // This counter is SIGKILL forensics for the unfused batch arm.
-        let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
-        let mut batches_dispatched: i64 = 0;
-        for block in reader.into_blocks_pipelined() {
-            batch.push(block?);
-            if batch.len() >= BATCH_SIZE {
-                let batch_stats = process_batch(
-                    &batch,
-                    &mut writer,
-                    index,
-                    keep_untagged_nodes,
-                    relation_member_node_ids,
-                )?;
-                stats.merge(&batch_stats);
-                batch.clear();
-                batches_dispatched += 1;
-                crate::debug::emit_counter("altw_pass2_batches_dispatched", batches_dispatched);
-            }
-        }
-        if !batch.is_empty() {
-            let batch_stats = process_batch(
-                &batch,
-                &mut writer,
+    let mut decoded_blocks = 0_u64;
+    reader.for_each_fused_block(
+        |block| {
+            let mut bb = BlockBuilder::new();
+            let mut output = Vec::new();
+            let mut refs_buf = Vec::new();
+            let mut locations_buf = Vec::new();
+            let block_stats = process_block(
+                &block,
+                &mut bb,
+                &mut output,
                 index,
                 keep_untagged_nodes,
                 relation_member_node_ids,
+                &mut refs_buf,
+                &mut locations_buf,
             )?;
-            stats.merge(&batch_stats);
-            batches_dispatched += 1;
-            crate::debug::emit_counter("altw_pass2_batches_dispatched", batches_dispatched);
-        }
-    }
+            flush_local(&mut bb, &mut output)?;
+            Ok((output, block_stats))
+        },
+        |(blocks, block_stats)| {
+            for OwnedBlock {
+                bytes,
+                index,
+                tagdata,
+                way_members,
+            } in blocks
+            {
+                writer.write_primitive_block_owned(
+                    bytes,
+                    index,
+                    tagdata.as_deref(),
+                    way_members.as_deref(),
+                )?;
+            }
+            stats.merge(&block_stats);
+            decoded_blocks += 1;
+            if decoded_blocks.is_multiple_of(64) {
+                crate::debug::emit_counter(
+                    "altw_pass2_blocks",
+                    i64::try_from(decoded_blocks).unwrap_or(i64::MAX),
+                );
+            }
+            Ok(())
+        },
+    )?;
+    crate::debug::emit_counter(
+        "altw_pass2_blocks",
+        i64::try_from(decoded_blocks).unwrap_or(i64::MAX),
+    );
 
     writer.flush()?;
     Ok(stats)
 }
 
 // ---------------------------------------------------------------------------
-// Parallel batch processing
+// Per-block fused transform
 // ---------------------------------------------------------------------------
 
 use super::flush_local;
@@ -863,55 +818,4 @@ fn process_block(
     }
 
     Ok(stats)
-}
-
-/// Process a batch of `PrimitiveBlock`s in parallel via rayon.
-///
-/// Way coordinate lookups happen inline in the per-block worker via
-/// `NodeIndex::get`. Both dense (direct array) and sparse (chunk +
-/// slot indirection through a file-backed mmap) handle random access
-/// well at ~16+ cores; the prior sparse-only pre-resolve was a serial
-/// step that capped pass 2 at ~4 cores.
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn process_batch(
-    batch: &[PrimitiveBlock],
-    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
-    index: &NodeIndex,
-    keep_untagged_nodes: bool,
-    relation_member_node_ids: Option<&IdSet>,
-) -> Result<Stats> {
-    type BatchResult = std::result::Result<(Vec<OwnedBlock>, Stats), String>;
-    let results: Vec<BatchResult> = batch
-        .par_iter()
-        .map_init(
-            || {
-                (
-                    BlockBuilder::new(),
-                    Vec::<i64>::new(),
-                    Vec::<(i32, i32)>::new(),
-                )
-            },
-            |(bb, refs_buf, locations_buf), block| {
-                let mut output: Vec<OwnedBlock> = Vec::new();
-                let block_stats = process_block(
-                    block,
-                    bb,
-                    &mut output,
-                    index,
-                    keep_untagged_nodes,
-                    relation_member_node_ids,
-                    refs_buf,
-                    locations_buf,
-                )?;
-                flush_local(bb, &mut output)?;
-                Ok((output, block_stats))
-            },
-        )
-        .collect();
-
-    let mut total = Stats::default();
-
-    drain_batch_results(results, writer, |s| total.merge(&s))?;
-
-    Ok(total)
 }

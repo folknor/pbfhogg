@@ -14,6 +14,13 @@
 
 ### Changed
 
+- Full-scan transforms now execute in the decode workers for `getid`
+  `--add-referenced`, getparents FullScan, single-pass `tags-filter`, and the
+  decode-all `add-locations-to-ways` fallback. On the 8k blob encoding,
+  getid improved 7.7%, getparents 6.5%, and `tags-filter -R` 7.0%; getid's
+  primary-input pass-2 peak RSS fell from 1.18 GB to 596 MB. The old
+  64-block command batches and `PBFHOGG_CMD_BATCH_BYTES` override are gone.
+
 - Classify-schedule commands (`check-refs`, `tags-filter` two-pass, and
   the other `parallel_classify_*` consumers) now issue a bounded
   `POSIX_FADV_WILLNEED` prefetch over the blob-body ranges the scan is

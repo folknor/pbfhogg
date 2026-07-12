@@ -4,21 +4,18 @@ pub mod osc;
 
 use std::path::Path;
 
-use rayon::prelude::*;
-
 use super::{
-    HeaderOverrides, drain_batch_results, ensure_node_capacity_local,
-    ensure_relation_capacity_local, ensure_way_capacity_local, flush_local,
-    for_each_primitive_block_batch, fuse_transform_from_env, require_indexdata, writer_from_header,
+    HeaderOverrides, ensure_node_capacity_local, ensure_relation_capacity_local,
+    ensure_way_capacity_local, flush_local, require_indexdata, writer_from_header,
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::idset::IdSet;
 use crate::owned::{dense_node_metadata, element_metadata};
 use crate::tag_expr::{Expression, TagMatcher, parse_expressions, tag_matches};
-use crate::writer::{Compression, PbfWriter};
+use crate::writer::Compression;
 use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
 
-use super::{BATCH_SIZE, Result};
+use super::Result;
 
 /// Compute a `BlobFilter` from the union of all expression type + tag key filters.
 ///
@@ -178,7 +175,6 @@ pub fn tags_filter(
     opts: &TagsFilterOptions<'_>,
     overrides: &HeaderOverrides,
 ) -> Result<TagsFilterStats> {
-    let fused = fuse_transform_from_env()?;
     // Blob-level filtering can't help in invert mode (we want non-matching blobs).
     if !opts.invert {
         require_indexdata(
@@ -205,7 +201,6 @@ pub fn tags_filter(
             opts.compression,
             opts.direct_io,
             overrides,
-            fused,
         )?;
         #[allow(clippy::cast_possible_wrap)]
         {
@@ -353,7 +348,7 @@ fn filter_block_parallel(
 }
 
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn tags_filter_single_pass(
     input: &Path,
     output: &Path,
@@ -362,7 +357,6 @@ fn tags_filter_single_pass(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
-    fused: bool,
 ) -> Result<TagsFilterStats> {
     crate::debug::emit_marker("TAGSFILTER_SCAN_START");
     let reader = ElementReader::open(input, direct_io)?;
@@ -396,86 +390,40 @@ fn tags_filter_single_pass(
         relations_from_relations: 0,
     };
 
-    if fused {
-        crate::debug::emit_counter("fuse_transform_active", 1);
-        let mut fused_blocks = 0_u64;
-        reader.for_each_fused_block(
-            |block| {
-                let mut bb = BlockBuilder::new();
-                let mut output = Vec::new();
-                let block_stats =
-                    filter_block_parallel(&block, expressions, invert, &mut bb, &mut output)?;
-                flush_local(&mut bb, &mut output)?;
-                Ok((output, block_stats))
-            },
-            |(blocks, block_stats)| {
-                for OwnedBlock {
+    reader.for_each_fused_block(
+        |block| {
+            let mut bb = BlockBuilder::new();
+            let mut output = Vec::new();
+            let block_stats =
+                filter_block_parallel(&block, expressions, invert, &mut bb, &mut output)?;
+            flush_local(&mut bb, &mut output)?;
+            Ok((output, block_stats))
+        },
+        |(blocks, block_stats)| {
+            for OwnedBlock {
+                bytes,
+                index,
+                tagdata,
+                way_members,
+            } in blocks
+            {
+                writer.write_primitive_block_owned(
                     bytes,
                     index,
-                    tagdata,
-                    way_members,
-                } in blocks
-                {
-                    writer.write_primitive_block_owned(
-                        bytes,
-                        index,
-                        tagdata.as_deref(),
-                        way_members.as_deref(),
-                    )?;
-                }
-                stats.nodes_matched += block_stats.nodes_matched;
-                stats.ways_matched += block_stats.ways_matched;
-                stats.relations_matched += block_stats.relations_matched;
-                fused_blocks += 1;
-                if fused_blocks.is_multiple_of(64) {
-                    crate::debug::emit_counter(
-                        "fuse_transform_blocks",
-                        i64::try_from(fused_blocks).unwrap_or(i64::MAX),
-                    );
-                }
-                Ok(())
-            },
-        )?;
-        crate::debug::emit_counter(
-            "fuse_transform_blocks",
-            i64::try_from(fused_blocks).unwrap_or(i64::MAX),
-        );
-    } else {
-        for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
-            process_filter_batch(batch, expressions, invert, &mut writer, &mut stats)
-        })?;
-    }
+                    tagdata.as_deref(),
+                    way_members.as_deref(),
+                )?;
+            }
+            stats.nodes_matched += block_stats.nodes_matched;
+            stats.ways_matched += block_stats.ways_matched;
+            stats.relations_matched += block_stats.relations_matched;
+            Ok(())
+        },
+    )?;
 
     writer.flush()?;
     crate::debug::emit_marker("TAGSFILTER_SCAN_END");
     Ok(stats)
-}
-
-/// Process a batch of blocks in parallel for single-pass tag filtering.
-fn process_filter_batch(
-    batch: &[PrimitiveBlock],
-    expressions: &[Expression],
-    invert: bool,
-    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
-    stats: &mut TagsFilterStats,
-) -> Result<()> {
-    type BatchResult = std::result::Result<(Vec<OwnedBlock>, TagsFilterStats), String>;
-    let results: Vec<BatchResult> = batch
-        .par_iter()
-        .map_init(BlockBuilder::new, |bb, block| {
-            let mut output: Vec<OwnedBlock> = Vec::new();
-            let block_stats = filter_block_parallel(block, expressions, invert, bb, &mut output)?;
-            flush_local(bb, &mut output)?;
-            Ok((output, block_stats))
-        })
-        .collect();
-
-    drain_batch_results(results, writer, |s| {
-        stats.nodes_matched += s.nodes_matched;
-        stats.ways_matched += s.ways_matched;
-        stats.relations_matched += s.relations_matched;
-    })?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1351,9 +1299,10 @@ fn collect_way_node_dependencies(
 mod tests {
     use super::*;
     use crate::owned::TypeFilter;
+    use crate::writer::PbfWriter;
 
     #[test]
-    fn fused_single_pass_matches_batched() {
+    fn single_pass_filters_matching_elements() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("input.pbf");
         let file = std::fs::File::create(&input).unwrap();
@@ -1370,25 +1319,28 @@ mod tests {
         writer.flush().unwrap();
 
         let expressions = parse_expressions(&["amenity".to_owned()]).unwrap();
-        let batched = dir.path().join("batched.pbf");
-        let fused = dir.path().join("fused.pbf");
-        for (output, fused) in [(&batched, false), (&fused, true)] {
-            tags_filter_single_pass(
-                &input,
-                output,
-                &expressions,
-                false,
-                Compression::default(),
-                false,
-                &HeaderOverrides::default(),
-                fused,
-            )
+        let output = dir.path().join("output.pbf");
+        tags_filter_single_pass(
+            &input,
+            &output,
+            &expressions,
+            false,
+            Compression::default(),
+            false,
+            &HeaderOverrides::default(),
+        )
+        .unwrap();
+        let mut ids = Vec::new();
+        ElementReader::from_path(&output)
+            .unwrap()
+            .for_each(|element| match element {
+                Element::DenseNode(node) => ids.push(node.id()),
+                Element::Node(node) => ids.push(node.id()),
+                Element::Way(way) => ids.push(way.id()),
+                Element::Relation(relation) => ids.push(relation.id()),
+            })
             .unwrap();
-        }
-        assert_eq!(
-            std::fs::read(fused).unwrap(),
-            std::fs::read(batched).unwrap()
-        );
+        assert_eq!(ids, vec![1]);
     }
 
     #[test]

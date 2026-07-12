@@ -28,7 +28,7 @@ type DecodedItem = (usize, DecodedPayload, Option<Permit>, Option<BytePermit>);
 ///
 /// Checks indexdata (element type + spatial bbox) and tagdata (tag key presence).
 /// Blobs without indexdata or tagdata always pass through (conservative).
-pub(crate) fn should_skip_blob(filter: &BlobFilter, blob: &super::blob::Blob) -> bool {
+fn should_skip_blob(filter: &BlobFilter, blob: &super::blob::Blob) -> bool {
     if let Some(idx) = blob.index()
         && !filter.wants_index(&idx)
     {
@@ -83,27 +83,6 @@ pub(crate) fn byte_budget_from_env(var: &str) -> Result<Option<usize>> {
             crate::error::ErrorKind::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("{var} must be a non-zero Unicode byte count"),
-            )),
-        )),
-    }
-}
-
-/// Parse an opt-in boolean environment gate without silently accepting typos.
-pub(crate) fn bool_gate_from_env(var: &str) -> Result<bool> {
-    match std::env::var(var) {
-        Ok(value) if value == "1" => Ok(true),
-        Ok(value) if value == "0" => Ok(false),
-        Ok(value) => Err(crate::error::new_error(crate::error::ErrorKind::Io(
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("{var} must be 0 or 1, got {value:?}"),
-            ),
-        ))),
-        Err(std::env::VarError::NotPresent) => Ok(false),
-        Err(std::env::VarError::NotUnicode(_)) => Err(crate::error::new_error(
-            crate::error::ErrorKind::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("{var} must be a Unicode 0 or 1"),
             )),
         )),
     }
@@ -215,7 +194,6 @@ pub(crate) struct PipelineConfig {
     pub(crate) decode_ahead: usize,
     pub(crate) read_ahead_bytes: Option<usize>,
     pub(crate) decode_ahead_bytes: Option<usize>,
-    pub(crate) batched: bool,
 }
 
 impl Default for PipelineConfig {
@@ -225,7 +203,6 @@ impl Default for PipelineConfig {
             decode_ahead: DEFAULT_DECODE_AHEAD,
             read_ahead_bytes: None,
             decode_ahead_bytes: None,
-            batched: false,
         }
     }
 }
@@ -237,7 +214,6 @@ impl PipelineConfig {
             decode_ahead: DEFAULT_DECODE_AHEAD,
             read_ahead_bytes: byte_budget_from_env("PBFHOGG_READ_AHEAD_BYTES")?,
             decode_ahead_bytes: byte_budget_from_env("PBFHOGG_DECODE_AHEAD_BYTES")?,
-            batched: bool_gate_from_env("PBFHOGG_BATCHED_PIPELINE")?,
         })
     }
 
@@ -654,11 +630,11 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Fusion section: removable with PBFHOGG_FUSE_TRANSFORM.
+// Fusion section: ordered decode-worker transforms for full-scan commands.
 // ---------------------------------------------------------------------------
 
-/// Fused sibling of `run_pipeline`. Keep this additive: the default engine's
-/// decode seam is deliberately untouched so the gate-off path remains exact.
+/// Fused sibling of `run_pipeline`. Keep this additive: the plain engine
+/// continues to serve non-transform consumers with a different read shape.
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 #[hotpath::measure]
 pub(crate) fn run_pipeline_fused<R, T, X, F>(

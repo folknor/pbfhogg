@@ -10,9 +10,7 @@
 //!   and within-group versions can straddle blob boundaries, which rules
 //!   out trivial per-block parallelism.
 //! - **Snapshot input**: parallel per-block filter. Each (kind, id) appears
-//!   in exactly one block, so blocks are independent. Same pattern as
-//!   `tags-filter` single-pass: `for_each_primitive_block_batch` +
-//!   `par_iter().map_init(BlockBuilder::new, ...)`.
+//!   in exactly one block, so blocks are independent.
 
 use std::path::Path;
 

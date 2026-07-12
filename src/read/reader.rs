@@ -129,13 +129,6 @@ impl<R: Read + Send> ElementReader<R> {
         self
     }
 
-    /// Test-only routing control for the gated ordered batch pipeline.
-    #[doc(hidden)]
-    pub fn batched_pipeline(mut self, enabled: bool) -> Self {
-        self.pipeline_config.batched = enabled;
-        self
-    }
-
     /// Sets a byte budget for decoded blocks queued for an iterator consumer.
     /// A configured budget raises the count backstop to 128 blocks.
     pub fn block_queue_bytes(mut self, bytes: usize) -> Self {
@@ -311,57 +304,35 @@ impl<R: Read + Send> ElementReader<R> {
     where
         F: FnMut(PrimitiveBlock) -> Result<()>,
     {
-        if self.pipeline_config.batched {
-            super::batched_pipeline::run_batched_pipeline(
-                self.blob_iter,
-                self.decode_threads,
-                self.pipeline_config,
-                self.blob_filter,
-                f,
-            )
-        } else {
-            super::pipeline::run_pipeline(
-                self.blob_iter,
-                self.decode_threads,
-                self.pipeline_config,
-                self.blob_filter,
-                f,
-            )
-        }
+        super::pipeline::run_pipeline(
+            self.blob_iter,
+            self.decode_threads,
+            self.pipeline_config,
+            self.blob_filter,
+            f,
+        )
     }
 
     /// Ordered pipelined read with a per-block transform executed on the
     /// decode workers. The consumer remains serialized on the calling thread.
     ///
-    /// `PBFHOGG_BLOCK_QUEUE_BYTES` and `PBFHOGG_CMD_BATCH_BYTES` are
-    /// intentionally inert here: fused arms do not construct the iterator
-    /// block queue or command-side batches. The raw and decoded byte budgets
-    /// continue to apply in the selected engine.
+    /// `PBFHOGG_BLOCK_QUEUE_BYTES` is intentionally inert here: the fused
+    /// path does not construct the iterator block queue. The raw and decoded
+    /// byte budgets continue to apply.
     pub(crate) fn for_each_fused_block<T, X, F>(self, transform: X, consume: F) -> Result<()>
     where
         T: Send,
         X: Fn(PrimitiveBlock) -> std::result::Result<T, String> + Sync,
         F: FnMut(T) -> Result<()>,
     {
-        if self.pipeline_config.batched {
-            super::batched_pipeline::run_batched_pipeline_fused(
-                self.blob_iter,
-                self.decode_threads,
-                self.pipeline_config,
-                self.blob_filter,
-                &transform,
-                consume,
-            )
-        } else {
-            super::pipeline::run_pipeline_fused(
-                self.blob_iter,
-                self.decode_threads,
-                self.pipeline_config,
-                self.blob_filter,
-                &transform,
-                consume,
-            )
-        }
+        super::pipeline::run_pipeline_fused(
+            self.blob_iter,
+            self.decode_threads,
+            self.pipeline_config,
+            self.blob_filter,
+            &transform,
+            consume,
+        )
     }
 
     /// Returns an iterator of decoded [`PrimitiveBlock`]s from the pipelined reader.
@@ -411,23 +382,13 @@ impl<R: Read + Send> ElementReader<R> {
                     )))
                 })
             };
-            let result = if pipeline_config.batched {
-                super::batched_pipeline::run_batched_pipeline(
-                    blob_iter,
-                    decode_threads,
-                    pipeline_config,
-                    blob_filter,
-                    deliver,
-                )
-            } else {
-                super::pipeline::run_pipeline(
-                    blob_iter,
-                    decode_threads,
-                    pipeline_config,
-                    blob_filter,
-                    deliver,
-                )
-            };
+            let result = super::pipeline::run_pipeline(
+                blob_iter,
+                decode_threads,
+                pipeline_config,
+                blob_filter,
+                deliver,
+            );
             if let Err(e) = result {
                 // Deliver the error as the last iterator item.
                 // Ignore send failure - consumer may have already dropped.

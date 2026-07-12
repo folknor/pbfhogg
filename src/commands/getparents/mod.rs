@@ -12,13 +12,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rayon::prelude::*;
-
 use super::getid::ElementIds;
 use super::{
-    BATCH_SIZE, HeaderOverrides, drain_batch_results, ensure_node_capacity_local,
-    ensure_relation_capacity_local, ensure_way_capacity_local, flush_local,
-    for_each_primitive_block_batch, fuse_transform_from_env, writer_from_header_bytes,
+    HeaderOverrides, ensure_node_capacity_local, ensure_relation_capacity_local,
+    ensure_way_capacity_local, flush_local, writer_from_header_bytes,
 };
 use crate::blob::{BlobKind, decode_blob_to_headerblock};
 use crate::blob_meta::ElemKind;
@@ -65,7 +62,6 @@ pub fn getparents(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<GetparentsStats> {
-    let fused = fuse_transform_from_env()?;
     let (_, stats) = getparents_dispatched(
         input,
         output,
@@ -75,7 +71,6 @@ pub fn getparents(
         direct_io,
         overrides,
         FULL_SCAN_ARM_MIN_BLOBS,
-        fused,
     )?;
     Ok(stats)
 }
@@ -93,7 +88,6 @@ pub fn getparents_with_min_blobs(
     overrides: &HeaderOverrides,
     min_blobs: u64,
 ) -> Result<GetparentsStats> {
-    let fused = fuse_transform_from_env()?;
     getparents_dispatched(
         input,
         output,
@@ -103,7 +97,6 @@ pub fn getparents_with_min_blobs(
         direct_io,
         overrides,
         min_blobs,
-        fused,
     )
     .map(|(_, stats)| stats)
 }
@@ -121,7 +114,6 @@ fn getparents_dispatched(
     direct_io: bool,
     overrides: &HeaderOverrides,
     min_blobs: u64,
-    fused: bool,
 ) -> Result<(ScanArm, GetparentsStats)> {
     let arm = super::dispatch_scan_arm(input, super::has_indexdata(input, direct_io)?, min_blobs)?;
     let stats = getparents_with_arm(
@@ -133,7 +125,6 @@ fn getparents_dispatched(
         direct_io,
         overrides,
         arm,
-        fused,
     )?;
     Ok((arm, stats))
 }
@@ -148,22 +139,14 @@ pub(crate) fn getparents_with_arm(
     direct_io: bool,
     overrides: &HeaderOverrides,
     arm: ScanArm,
-    fused: bool,
 ) -> Result<GetparentsStats> {
     match arm {
         ScanArm::Walker => {
             getparents_walker(input, output, ids, opts, compression, direct_io, overrides)
         }
-        ScanArm::FullScan => getparents_pipelined(
-            input,
-            output,
-            ids,
-            opts,
-            compression,
-            direct_io,
-            overrides,
-            fused,
-        ),
+        ScanArm::FullScan => {
+            getparents_pipelined(input, output, ids, opts, compression, direct_io, overrides)
+        }
     }
 }
 
@@ -345,7 +328,6 @@ fn getparents_pipelined(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
-    fused: bool,
 ) -> Result<GetparentsStats> {
     let (need_node_blobs, need_way_blobs, need_relation_blobs) = needed_blob_kinds(ids, opts);
     let reader = ElementReader::open(input, direct_io)?.with_blob_filter(BlobFilter::new(
@@ -364,102 +346,39 @@ fn getparents_pipelined(
     };
 
     crate::debug::emit_marker("GETPARENTS_DECODE_START");
-    if fused {
-        crate::debug::emit_counter("fuse_transform_active", 1);
-        let mut fused_blocks = 0_u64;
-        reader.for_each_fused_block(
-            |block| {
-                let mut bb = BlockBuilder::new();
-                let mut output = Vec::new();
-                let counts = process_block(&block, &mut bb, &mut output, ids, opts.add_self)?;
-                flush_local(&mut bb, &mut output)?;
-                Ok((output, counts))
-            },
-            |(blocks, (nodes, ways, relations))| {
-                for OwnedBlock {
+    reader.for_each_fused_block(
+        |block| {
+            let mut bb = BlockBuilder::new();
+            let mut output = Vec::new();
+            let counts = process_block(&block, &mut bb, &mut output, ids, opts.add_self)?;
+            flush_local(&mut bb, &mut output)?;
+            Ok((output, counts))
+        },
+        |(blocks, (nodes, ways, relations))| {
+            for OwnedBlock {
+                bytes,
+                index,
+                tagdata,
+                way_members,
+            } in blocks
+            {
+                writer.write_primitive_block_owned(
                     bytes,
                     index,
-                    tagdata,
-                    way_members,
-                } in blocks
-                {
-                    writer.write_primitive_block_owned(
-                        bytes,
-                        index,
-                        tagdata.as_deref(),
-                        way_members.as_deref(),
-                    )?;
-                }
-                stats.nodes_written += nodes;
-                stats.ways_written += ways;
-                stats.relations_written += relations;
-                fused_blocks += 1;
-                if fused_blocks.is_multiple_of(64) {
-                    crate::debug::emit_counter(
-                        "fuse_transform_blocks",
-                        i64::try_from(fused_blocks).unwrap_or(i64::MAX),
-                    );
-                }
-                Ok(())
-            },
-        )?;
-        crate::debug::emit_counter(
-            "fuse_transform_blocks",
-            i64::try_from(fused_blocks).unwrap_or(i64::MAX),
-        );
-    } else {
-        for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
-            let (nodes, ways, relations) = process_batch(batch, &mut writer, ids, opts.add_self)?;
+                    tagdata.as_deref(),
+                    way_members.as_deref(),
+                )?;
+            }
             stats.nodes_written += nodes;
             stats.ways_written += ways;
             stats.relations_written += relations;
             Ok(())
-        })?;
-    }
+        },
+    )?;
     writer.flush()?;
     crate::debug::emit_marker("GETPARENTS_DECODE_END");
     Ok(stats)
 }
-
-/// Classify a batch of blocks in parallel via rayon. Each worker owns a
-/// `BlockBuilder` through `map_init` and reuses it across the blocks it
-/// takes, flushing serialized output blocks into a local `Vec`; the
-/// serialized blocks are then written sequentially in batch order.
-///
-/// Classify cost is linear in decoded elements, so it must not run on the
-/// single consumer thread: at planet scale that serializes over a billion
-/// way-ref checks behind the decode pipeline and dominates wall time.
-fn process_batch(
-    batch: &[PrimitiveBlock],
-    writer: &mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
-    ids: &ElementIds,
-    add_self: bool,
-) -> Result<(u64, u64, u64)> {
-    type BatchResult = std::result::Result<(Vec<OwnedBlock>, (u64, u64, u64)), String>;
-    let results: Vec<BatchResult> = batch
-        .par_iter()
-        .map_init(BlockBuilder::new, |bb, block| {
-            let mut output: Vec<OwnedBlock> = Vec::new();
-            let counts = process_block(block, bb, &mut output, ids, add_self)?;
-            flush_local(bb, &mut output)?;
-            Ok((output, counts))
-        })
-        .collect();
-
-    let mut total_nodes: u64 = 0;
-    let mut total_ways: u64 = 0;
-    let mut total_relations: u64 = 0;
-    drain_batch_results(results, writer, |(nodes, ways, relations)| {
-        total_nodes += nodes;
-        total_ways += ways;
-        total_relations += relations;
-    })?;
-    Ok((total_nodes, total_ways, total_relations))
-}
-
-// ---------------------------------------------------------------------------
-// Parallel batch processing
-// ---------------------------------------------------------------------------
 
 fn process_block(
     block: &PrimitiveBlock,
@@ -611,32 +530,25 @@ mod tests {
     }
 
     #[test]
-    fn fused_full_scan_matches_batched() {
+    fn full_scan_writes_parents() {
         let dir = tempfile::tempdir().expect("tempdir");
         let input = dir.path().join("input.pbf");
         fixture(&input);
         let query = parse_ids(&["n1".to_owned()]).expect("ids");
         let opts = GetparentsOptions { add_self: true };
-        let batched = dir.path().join("batched.pbf");
-        let fused = dir.path().join("fused.pbf");
-        for (output, fused) in [(&batched, false), (&fused, true)] {
-            getparents_with_arm(
-                &input,
-                output,
-                &query,
-                &opts,
-                Compression::default(),
-                false,
-                &HeaderOverrides::default(),
-                ScanArm::FullScan,
-                fused,
-            )
-            .expect("getparents");
-        }
-        assert_eq!(
-            std::fs::read(fused).expect("fused output"),
-            std::fs::read(batched).expect("batched output")
-        );
+        let output = dir.path().join("output.pbf");
+        getparents_with_arm(
+            &input,
+            &output,
+            &query,
+            &opts,
+            Compression::default(),
+            false,
+            &HeaderOverrides::default(),
+            ScanArm::FullScan,
+        )
+        .expect("getparents");
+        assert_eq!(ids(&output), vec![1, 10]);
     }
 
     /// Run the same query under both arms, assert they emit identical element
@@ -658,7 +570,6 @@ mod tests {
                 false,
                 &HeaderOverrides::default(),
                 arm,
-                false,
             )
             .expect("getparents");
         }
@@ -723,7 +634,6 @@ mod tests {
                 false,
                 &HeaderOverrides::default(),
                 min_blobs,
-                false,
             )
             .expect("getparents");
             assert_eq!(arm, expected_arm);

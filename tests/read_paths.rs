@@ -419,23 +419,6 @@ fn pipelined_matches_sequential() {
     assert_eq!(sequential, pipelined);
 }
 
-/// The gated ordered-batch engine preserves the ordinary reader surface and
-/// exact element order.
-#[test]
-fn batched_pipelined_matches_sequential() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("test.osm.pbf");
-    write_test_pbf(&path);
-    let sequential = collect_sequential(&path);
-    let mut batched = Vec::new();
-    ElementReader::from_path(&path)
-        .unwrap()
-        .batched_pipeline(true)
-        .for_each_pipelined(|element| batched.push(element_id(&element)))
-        .unwrap();
-    assert_eq!(sequential, batched);
-}
-
 /// The sequential `for_each` decode route (`decompress_into` +
 /// `from_vec_with_scratch`) must yield elements identical to the pipelined
 /// route for every blob compression kind. Raw, Zlib, and Zstd exercise the
@@ -491,27 +474,6 @@ fn for_each_matches_pipelined_across_compressions() {
     }
 }
 
-#[test]
-fn batched_for_each_matches_pipelined_across_compressions() {
-    for compression in [
-        Compression::None,
-        Compression::Zlib(6),
-        Compression::Zstd(3),
-    ] {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test.osm.pbf");
-        write_materialization_pbf(&path, compression);
-        let expected = collect_sequential_full(&path);
-        let mut actual = Vec::new();
-        ElementReader::from_path(&path)
-            .unwrap()
-            .batched_pipeline(true)
-            .for_each_pipelined(|element| actual.push(materialize(&element)))
-            .unwrap();
-        assert_eq!(expected, actual, "batched mismatch for {compression:?}");
-    }
-}
-
 /// into_blocks_pipelined yields the same elements as for_each_pipelined.
 #[test]
 fn block_iterator_matches_pipelined() {
@@ -531,25 +493,6 @@ fn block_iterator_matches_pipelined() {
     }
 
     assert_eq!(sequential, from_iter);
-}
-
-#[test]
-fn batched_block_iterator_matches_pipelined() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("test.osm.pbf");
-    write_test_pbf(&path);
-    let expected = collect_sequential(&path);
-    let mut actual = Vec::new();
-    for block in ElementReader::from_path(&path)
-        .unwrap()
-        .batched_pipeline(true)
-        .into_blocks_pipelined()
-    {
-        block
-            .unwrap()
-            .for_each_element(|element| actual.push(element_id(&element)));
-    }
-    assert_eq!(expected, actual);
 }
 
 /// into_blocks_pipelined handles early drop without hanging.
@@ -591,30 +534,6 @@ fn block_iterator_early_drop_under_pressure() {
 }
 
 #[test]
-fn batched_block_iterator_early_drop_under_pressure() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("many.osm.pbf");
-    write_many_block_pbf(&path, 128);
-    let (done_tx, done_rx) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut blocks = ElementReader::from_path(&path)
-            .unwrap()
-            .batched_pipeline(true)
-            .decode_threads(1)
-            .read_ahead_bytes(1)
-            .decode_ahead_bytes(1)
-            .block_queue_bytes(1)
-            .into_blocks_pipelined();
-        let _ = blocks.next();
-        drop(blocks);
-        done_tx.send(()).unwrap();
-    });
-    done_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("batched pipeline did not stop after iterator drop");
-}
-
-#[test]
 fn block_fn_error_stops_pipeline() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("many.osm.pbf");
@@ -637,26 +556,39 @@ fn block_fn_error_stops_pipeline() {
     );
 }
 
+/// A mid-file decode failure surfaces from the plain `run_pipeline` in its
+/// file-order position: blocks before the corrupt blob are delivered first,
+/// then the error returns. Pins the surviving default engine now that the
+/// gated batched twin that also covered this was removed.
 #[test]
-fn batched_block_fn_error_stops_pipeline() {
+fn decode_error_surfaces_after_prior_blocks() {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().join("many.osm.pbf");
-    write_many_block_pbf(&path, 128);
-    let (done_tx, done_rx) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let result = ElementReader::from_path(&path)
-            .unwrap()
-            .batched_pipeline(true)
-            .decode_threads(1)
-            .read_ahead_bytes(1)
-            .decode_ahead_bytes(1)
-            .for_each_block_pipelined(|_| Err(std::io::Error::other("stop").into()));
-        done_tx.send(result.is_err()).unwrap();
-    });
+    let good = dir.path().join("good.osm.pbf");
+    let broken = dir.path().join("broken.osm.pbf");
+    write_test_pbf(&good);
+    let bytes = std::fs::read(&good).unwrap();
+    // Frame 0 is the header, frame 1 the first node block; corrupt the
+    // following way block (frame 2) so the reader must deliver the preceding
+    // block before returning the decode failure.
+    std::fs::write(
+        &broken,
+        common::adversarial::mutate_blob_payload(&bytes, 2, |payload| {
+            payload.clear();
+            payload.push(0xFF);
+        }),
+    )
+    .unwrap();
+    let mut blocks = 0;
+    let result = ElementReader::from_path(&broken)
+        .unwrap()
+        .for_each_block_pipelined(|_| {
+            blocks += 1;
+            Ok(())
+        });
+    assert!(result.is_err(), "decode error must surface");
     assert!(
-        done_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("batched pipeline did not stop after block closure error")
+        blocks > 0,
+        "preceding block must be delivered before the error"
     );
 }
 
@@ -703,64 +635,6 @@ fn pipelined_matches_sequential_tiny_byte_budgets() {
         .unwrap();
 
     assert_eq!(sequential, pipelined);
-}
-
-#[test]
-fn batched_matches_sequential_tiny_byte_budgets() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("many.osm.pbf");
-    write_many_block_pbf(&path, 16);
-    let expected = collect_sequential(&path);
-    let mut actual = Vec::new();
-    ElementReader::from_path(&path)
-        .unwrap()
-        .batched_pipeline(true)
-        .read_ahead_bytes(1)
-        .decode_ahead_bytes(1)
-        .for_each_pipelined(|element| actual.push(element_id(&element)))
-        .unwrap();
-    assert_eq!(expected, actual);
-}
-
-#[test]
-fn batched_decode_error_surfaces_after_prior_blocks() {
-    let dir = TempDir::new().unwrap();
-    let good = dir.path().join("good.osm.pbf");
-    let broken = dir.path().join("broken.osm.pbf");
-    write_test_pbf(&good);
-    let bytes = std::fs::read(&good).unwrap();
-    // Frame 0 is the header and frame 1 is the first node block. Corrupt the
-    // following way block so both engines must deliver the preceding block
-    // before returning the decode failure in its file-order position.
-    std::fs::write(
-        &broken,
-        common::adversarial::mutate_blob_payload(&bytes, 2, |payload| {
-            payload.clear();
-            payload.push(0xFF);
-        }),
-    )
-    .unwrap();
-    let collect_until_error = |batched| {
-        let mut blocks = 0;
-        let mut reader = ElementReader::from_path(&broken).unwrap();
-        if batched {
-            reader = reader.batched_pipeline(true);
-        }
-        let result = reader.for_each_block_pipelined(|_| {
-            blocks += 1;
-            Ok(())
-        });
-        (blocks, result)
-    };
-    let (default_blocks, default_result) = collect_until_error(false);
-    let (batched_blocks, batched_result) = collect_until_error(true);
-    assert!(default_result.is_err());
-    assert!(batched_result.is_err());
-    assert_eq!(batched_blocks, default_blocks);
-    assert!(
-        batched_blocks > 0,
-        "preceding block must be delivered first"
-    );
 }
 
 #[test]
@@ -873,34 +747,6 @@ fn early_exit_does_not_read_whole_file() {
         read < full_len,
         "early drop read the whole file: read {read}, full {full_len}"
     );
-}
-
-#[test]
-fn batched_early_exit_does_not_read_whole_file() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("many.osm.pbf");
-    write_many_block_pbf(&path, 256);
-    let bytes = std::fs::read(&path).unwrap();
-    let full_len = bytes.len();
-    let bytes_read = Arc::new(AtomicUsize::new(0));
-    let reader_count = Arc::clone(&bytes_read);
-    let (done_tx, done_rx) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut blocks = ElementReader::new(CountingRead::new(bytes, reader_count))
-            .unwrap()
-            .batched_pipeline(true)
-            .decode_threads(1)
-            .read_ahead_bytes(1)
-            .decode_ahead_bytes(1)
-            .into_blocks_pipelined();
-        let _ = blocks.next();
-        drop(blocks);
-        done_tx.send(()).unwrap();
-    });
-    done_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("batched early-drop pipeline did not stop");
-    assert!(bytes_read.load(Relaxed) < full_len);
 }
 
 /// block_type() correctly classifies each block in a sorted PBF.
@@ -1355,31 +1201,6 @@ fn blobfilter_only_ways_skips_node_blobs_on_indexed_input() {
 }
 
 #[test]
-fn batched_blobfilter_only_ways_skips_node_blobs_on_indexed_input() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("indexed.osm.pbf");
-    common::write_test_pbf_sorted(
-        &path,
-        &common::generate_nodes(10, 1),
-        &common::generate_ways(5, 1_000, 2, 1),
-        &[],
-    );
-    let mut nodes = 0_u64;
-    let mut ways = 0_u64;
-    ElementReader::from_path(&path)
-        .unwrap()
-        .batched_pipeline(true)
-        .with_blob_filter(BlobFilter::only_ways())
-        .for_each_pipelined(|element| match element {
-            Element::Node(_) | Element::DenseNode(_) => nodes += 1,
-            Element::Way(_) => ways += 1,
-            _ => {}
-        })
-        .unwrap();
-    assert_eq!((nodes, ways), (0, 5));
-}
-
-#[test]
 fn blobfilter_only_ways_passes_through_on_non_indexed_input() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("non_indexed.osm.pbf");
@@ -1412,49 +1233,6 @@ fn blobfilter_only_ways_passes_through_on_non_indexed_input() {
         "BlobFilter on non-indexed input must NOT drop node blobs - callers get every element"
     );
     assert_eq!(saw_ways, 5, "ways still delivered");
-}
-
-#[test]
-fn batched_blobfilter_only_ways_passes_through_on_non_indexed_input() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("non_indexed.osm.pbf");
-    common::write_test_pbf_non_indexed(
-        &path,
-        &common::generate_nodes(10, 1),
-        &common::generate_ways(5, 1_000, 2, 1),
-        &[],
-    );
-    let mut nodes = 0_u64;
-    let mut ways = 0_u64;
-    ElementReader::from_path(&path)
-        .unwrap()
-        .batched_pipeline(true)
-        .with_blob_filter(BlobFilter::only_ways())
-        .for_each_pipelined(|element| match element {
-            Element::Node(_) | Element::DenseNode(_) => nodes += 1,
-            Element::Way(_) => ways += 1,
-            _ => {}
-        })
-        .unwrap();
-    assert_eq!((nodes, ways), (10, 5));
-}
-
-#[test]
-fn batched_thread_count_parity() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("many.osm.pbf");
-    write_many_block_pbf(&path, 128);
-    let collect = |threads| {
-        let mut ids = Vec::new();
-        ElementReader::from_path(&path)
-            .unwrap()
-            .batched_pipeline(true)
-            .decode_threads(threads)
-            .for_each_pipelined(|element| ids.push(element_id(&element)))
-            .unwrap();
-        ids
-    };
-    assert_eq!(collect(1), collect(8));
 }
 
 // ---------------------------------------------------------------------------

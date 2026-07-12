@@ -9,9 +9,7 @@ use crate::cat::CleanAttrs;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlockType, Element, PrimitiveBlock};
 
-use super::super::{
-    BATCH_SIZE, HeaderOverrides, Result, drain_batch_results, flush_local, writer_from_header,
-};
+use super::super::{HeaderOverrides, Result, drain_batch_results, flush_local, writer_from_header};
 use crate::idset::IdSet;
 
 use super::common::{
@@ -20,6 +18,10 @@ use super::common::{
     spatial_blob_filter,
 };
 use super::{ExtractStats, Region};
+
+/// Number of decoded blocks collected before unsorted pass-2 dispatches them
+/// to rayon.
+const BATCH_SIZE: usize = 64;
 
 /// Classify elements in a single block for simple extract (populate ID sets).
 ///

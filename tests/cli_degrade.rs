@@ -885,6 +885,226 @@ fn degrade_requires_at_least_one_flag() {
         .assert_stderr_contains("at least one transformation flag");
 }
 
+// ---------------------------------------------------------------------------
+// --drop-ids
+// ---------------------------------------------------------------------------
+
+fn normalized_count(path: &Path) -> usize {
+    let pbf = read_normalized(path);
+    pbf.nodes.len() + pbf.ways.len() + pbf.relations.len()
+}
+
+/// Extract an unsigned-integer field from the `refs` object of a
+/// `check --refs --json` document. The output is pretty-printed one field
+/// per line as `"name": value,`; the closing quote in the needle makes the
+/// match exact (so `missing_relation_members` never matches
+/// `missing_relation_member_occurrences`). Kept dependency-free because the
+/// integration-test crate has no `serde_json` dev-dependency.
+fn refs_field(stdout: &str, field: &str) -> u64 {
+    let needle = format!("\"{field}\"");
+    let line = stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with(&needle))
+        .unwrap_or_else(|| panic!("field {field:?} not found in check --refs json:\n{stdout}"));
+    let value = line
+        .split_once(':')
+        .expect("json field line has a colon")
+        .1
+        .trim()
+        .trim_end_matches(',');
+    value
+        .parse()
+        .unwrap_or_else(|_| panic!("field {field:?} value {value:?} is not an integer"))
+}
+
+/// Compute the four unique dangling-reference counts hash-independently from
+/// the degrade *output* alone, per the spec's Section 7.3 definition: a
+/// reference dangles iff its target `(kind, id)` is absent from the output.
+/// Returns `(missing_node_refs, missing_way_refs, missing_node_members,
+/// missing_relation_members)`.
+fn expected_dangles(out: &common::NormalizedPbf) -> (u64, u64, u64, u64) {
+    use std::collections::BTreeSet;
+    let node_ids: BTreeSet<i64> = out.nodes.iter().map(|n| n.id).collect();
+    let way_ids: BTreeSet<i64> = out.ways.iter().map(|w| w.id).collect();
+    let rel_ids: BTreeSet<i64> = out.relations.iter().map(|r| r.id).collect();
+
+    let mut missing_node_refs = BTreeSet::new();
+    for w in &out.ways {
+        for r in &w.refs {
+            if !node_ids.contains(r) {
+                missing_node_refs.insert(*r);
+            }
+        }
+    }
+
+    let mut missing_node_members = BTreeSet::new();
+    let mut missing_way_refs = BTreeSet::new();
+    let mut missing_relation_members = BTreeSet::new();
+    for rel in &out.relations {
+        for m in &rel.members {
+            match m.member_type.as_str() {
+                "node" if !node_ids.contains(&m.ref_id) => {
+                    missing_node_members.insert(m.ref_id);
+                }
+                "way" if !way_ids.contains(&m.ref_id) => {
+                    missing_way_refs.insert(m.ref_id);
+                }
+                "relation" if !rel_ids.contains(&m.ref_id) => {
+                    missing_relation_members.insert(m.ref_id);
+                }
+                _ => {}
+            }
+        }
+    }
+    (
+        missing_node_refs.len() as u64,
+        missing_way_refs.len() as u64,
+        missing_node_members.len() as u64,
+        missing_relation_members.len() as u64,
+    )
+}
+
+/// Run `check --refs --check-relations --json` on `path` and assert its four
+/// `missing_*` fields equal the hash-independent expectation derived from the
+/// output. `check` exits 1 when integrity fails while still printing the JSON,
+/// so this uses `run()` (not `assert_success`) and reads stdout. Returns the
+/// four-field sum so callers can guard against a vacuous (zero-dangle) run.
+fn assert_check_refs_matches_output(path: &Path) -> u64 {
+    let out = read_normalized(path);
+    let (mnr, mwr, mnm, mrm) = expected_dangles(&out);
+    let check = CliInvoker::new()
+        .arg("check")
+        .arg(path)
+        .arg("--refs")
+        .arg("--check-relations")
+        .arg("--json")
+        .run();
+    let stdout = check.stdout_str();
+    assert_eq!(
+        refs_field(&stdout, "missing_node_refs"),
+        mnr,
+        "missing_node_refs"
+    );
+    assert_eq!(
+        refs_field(&stdout, "missing_way_refs"),
+        mwr,
+        "missing_way_refs"
+    );
+    assert_eq!(
+        refs_field(&stdout, "missing_node_members"),
+        mnm,
+        "missing_node_members"
+    );
+    assert_eq!(
+        refs_field(&stdout, "missing_relation_members"),
+        mrm,
+        "missing_relation_members"
+    );
+    mnr + mwr + mnm + mrm
+}
+
+/// The consumer contract: dropping referenced elements makes surviving
+/// ways/relations dangle, and `check --refs` reports exactly the dangles the
+/// output structure implies. Expectations are computed hash-independently from
+/// the output (spec Section 7.3), so the test survives a fixture tweak; the
+/// pinned `10:16` is verified to drop nodes 2 and 3 (referenced by every way)
+/// and way 2 (a member of every relation), so the four-field sum is > 0.
+#[test]
+fn degrade_drop_ids_dangling_refs_match_check_refs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    write_degrade_fixture(&input);
+
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--drop-ids")
+        .arg("10:16")
+        .assert_success();
+
+    assert_eq!(normalized_count(&output), normalized_count(&input) - 10);
+    let sum = assert_check_refs_matches_output(&output);
+    assert!(
+        sum > 0,
+        "10:16 must drop referenced elements so dangles are produced, got sum 0"
+    );
+}
+
+#[test]
+fn degrade_drop_ids_removes_exactly_n() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    write_degrade_fixture(&input);
+
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--drop-ids")
+        .arg("10:1")
+        .assert_success();
+
+    assert_eq!(normalized_count(&output), normalized_count(&input) - 10);
+    assert!(read_header(&output).is_sorted());
+    assert_sorted_file(&output);
+}
+
+#[test]
+fn degrade_drop_ids_is_reproducible_and_seed_changes_selection() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let first = dir.path().join("first.osm.pbf");
+    let second = dir.path().join("second.osm.pbf");
+    let third = dir.path().join("third.osm.pbf");
+    write_degrade_fixture(&input);
+    for (output, spec) in [(&first, "10:7"), (&second, "10:7"), (&third, "10:8")] {
+        CliInvoker::new()
+            .arg("degrade")
+            .arg(&input)
+            .arg("-o")
+            .arg(output)
+            .arg("--drop-ids")
+            .arg(spec)
+            .assert_success();
+    }
+    assert_eq!(
+        std::fs::read(&first).expect("first"),
+        std::fs::read(&second).expect("second")
+    );
+    assert_ne!(
+        std::fs::read(&first).expect("first"),
+        std::fs::read(&third).expect("third")
+    );
+}
+
+#[test]
+fn degrade_drop_ids_validates_arguments_and_total() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    write_degrade_fixture(&input);
+    for (spec, message) in [
+        ("0:1", "N must be >= 1"),
+        ("10", "N:SEED"),
+        ("1000000:1", "input has only"),
+    ] {
+        CliInvoker::new()
+            .arg("degrade")
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .arg("--drop-ids")
+            .arg(spec)
+            .assert_failure()
+            .assert_stderr_contains(message);
+    }
+}
+
 /// `--block-cap 0` is rejected up front.
 #[test]
 fn degrade_rejects_zero_block_cap() {
@@ -953,4 +1173,82 @@ fn degrade_unsort_accepts_block_cap_one() {
         .assert_success();
 
     assert_unsort_cross_blob_shape(&output, &input);
+}
+
+mod tier2 {
+    use super::*;
+
+    #[test]
+    fn degrade_drop_ids_and_strip_locations_compose() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = dir.path().join("in.osm.pbf");
+        let output = dir.path().join("out.osm.pbf");
+        write_degrade_fixture(&input);
+        let input_count = normalized_count(&input);
+        CliInvoker::new()
+            .arg("degrade")
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .args(["--drop-ids", "10:16", "--strip-locations"])
+            .assert_success();
+        assert_eq!(normalized_count(&output), input_count - 10);
+        assert!(!read_header(&output).has_locations_on_ways());
+        assert!(read_header(&output).is_sorted());
+    }
+
+    #[test]
+    fn degrade_drop_ids_and_strip_indexdata_compose() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = dir.path().join("in.osm.pbf");
+        let output = dir.path().join("out.osm.pbf");
+        write_degrade_fixture(&input);
+        let input_count = normalized_count(&input);
+        CliInvoker::new()
+            .arg("degrade")
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .args(["--drop-ids", "10:16", "--strip-indexdata"])
+            .assert_success();
+        assert_eq!(normalized_count(&output), input_count - 10);
+        assert_non_indexed(&output);
+    }
+
+    #[test]
+    fn degrade_drop_ids_and_unsort_compose() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = dir.path().join("in.osm.pbf");
+        let output = dir.path().join("out.osm.pbf");
+        write_unsort_fixture(&input);
+        let input_count = normalized_count(&input);
+        CliInvoker::new()
+            .arg("degrade")
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .args(["--drop-ids", "10:16", "--unsort", "--block-cap", UNSORT_CAP])
+            .assert_success();
+        assert_eq!(normalized_count(&output), input_count - 10);
+        assert!(!read_header(&output).is_sorted());
+        for kind in [
+            BlobKindLabel::Node,
+            BlobKindLabel::Way,
+            BlobKindLabel::Relation,
+        ] {
+            assert_eq!(
+                count_adjacent_overlaps(&blob_index_summary(&output), kind),
+                1
+            );
+            assert_eq!(
+                count_intra_blob_inversions(&blob_elements(&output), kind),
+                0
+            );
+        }
+        // The consumer contract must still hold on an unsorted-but-kind-
+        // separated file: check --refs reports exactly the dangles the output
+        // structure implies (spec Section 8.2 #9). Not merely a cleared flag.
+        let sum = assert_check_refs_matches_output(&output);
+        assert!(sum > 0, "10:16 on the unsort fixture must produce dangles");
+    }
 }

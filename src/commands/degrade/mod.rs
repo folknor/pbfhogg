@@ -4,7 +4,7 @@
 //! indexdata, scattered coords).
 //!
 //! Transformations: `--unsort`, `--unsort-intra`, `--strip-locations`,
-//! `--strip-indexdata`, `--strip-tagdata`. Flags compose (except the two
+//! `--strip-indexdata`, `--strip-tagdata`, `--drop-ids`. Flags compose (except the two
 //! unsort modes, which are mutually exclusive).
 //!
 //! Implementation paths:
@@ -18,7 +18,7 @@
 //!   any unknown/extension fields. Blob bytes are bit-identical; only the
 //!   targeted header field changes. Mirrors `cat`'s passthrough but drops
 //!   header hints instead of adding them.
-//! - Decode path (either unsort mode and/or `--strip-locations`): three
+//! - Decode path (either unsort mode, `--strip-locations`, or `--drop-ids`): three
 //!   sequential per-kind phases driven by `parallel_classify_phase`.
 //!   Workers decode one input blob, filter to the current kind, and
 //!   re-encode. Without an unsort mode, workers pre-frame full cap-sized
@@ -57,7 +57,10 @@
 //!   claims sortedness). Requires `block_cap >= 2`; a cap of 1 cannot
 //!   hold two same-kind elements in one block and is rejected up front.
 
+use std::collections::BinaryHeap;
 use std::path::Path;
+
+use rustc_hash::FxHashSet;
 
 use super::{
     HeaderOverrides, Result, build_output_header, ensure_node_capacity_local,
@@ -89,6 +92,106 @@ const KIND_RELATION: u8 = 2;
 /// Batch size for the parallel-framing fan-out on the merge thread.
 const FRAME_BATCH: usize = 32;
 
+/// Parsed `--drop-ids N:SEED` argument.
+#[derive(Clone, Copy, Debug)]
+pub struct DropSpec {
+    pub n: u64,
+    pub seed: u64,
+}
+
+impl DropSpec {
+    /// Parse the required absolute-count and seed pair.
+    pub fn parse(s: &str) -> Result<Self> {
+        let (n_str, seed_str) = s
+            .split_once(':')
+            .ok_or("--drop-ids expects N:SEED (e.g. 5000:42); the ':' separator is required")?;
+        let n = n_str
+            .trim()
+            .parse()
+            .map_err(|_| format!("--drop-ids: N must be a non-negative integer, got {n_str:?}"))?;
+        let seed = seed_str.trim().parse().map_err(|_| {
+            format!("--drop-ids: SEED must be a non-negative integer, got {seed_str:?}")
+        })?;
+        if n == 0 {
+            return Err("--drop-ids: N must be >= 1 (dropping zero elements is a no-op)".into());
+        }
+        Ok(Self { n, seed })
+    }
+}
+
+/// splitmix64 finalizer used exclusively for reproducible drop selection.
+fn mix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+fn drop_hash(kind: u8, id: i64, seed: u64) -> u64 {
+    #[allow(clippy::cast_sign_loss)]
+    let idw = id as u64;
+    mix64(
+        idw.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ u64::from(kind).wrapping_mul(0xD1B5_4A32_D192_ED03)
+            ^ seed,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DropKey {
+    hash: u64,
+    kind: u8,
+    id: i64,
+}
+
+#[derive(Default)]
+struct DropSets {
+    nodes: FxHashSet<i64>,
+    ways: FxHashSet<i64>,
+    relations: FxHashSet<i64>,
+}
+
+impl DropSets {
+    fn for_kind(&self, kind: u8) -> &FxHashSet<i64> {
+        match kind {
+            KIND_NODE => &self.nodes,
+            KIND_WAY => &self.ways,
+            KIND_RELATION => &self.relations,
+            _ => unreachable!("invalid degrade kind"),
+        }
+    }
+
+    fn insert(&mut self, key: DropKey) {
+        match key.kind {
+            KIND_NODE => {
+                self.nodes.insert(key.id);
+            }
+            KIND_WAY => {
+                self.ways.insert(key.id);
+            }
+            KIND_RELATION => {
+                self.relations.insert(key.id);
+            }
+            _ => unreachable!("invalid degrade kind"),
+        }
+    }
+}
+
+struct BlockDrop {
+    matched: u64,
+    smallest: Vec<DropKey>,
+}
+
+fn keep_smallest(heap: &mut BinaryHeap<DropKey>, n: u64, key: DropKey) {
+    if (heap.len() as u64) < n {
+        heap.push(key);
+    } else if let Some(largest) = heap.peek()
+        && key < *largest
+    {
+        heap.pop();
+        heap.push(key);
+    }
+}
+
 /// Set of degradations to apply. At least one flag must be set.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DegradeFlags {
@@ -103,6 +206,8 @@ pub struct DegradeFlags {
     /// `--strip-indexdata` it is a header-only change, so it composes with
     /// the passthrough path and leaves `indexdata` alone.
     pub strip_tagdata: bool,
+    /// Deterministically remove exactly this many unique element IDs.
+    pub drop_ids: Option<DropSpec>,
 }
 
 impl DegradeFlags {
@@ -112,13 +217,14 @@ impl DegradeFlags {
             || self.strip_locations
             || self.strip_indexdata
             || self.strip_tagdata
+            || self.drop_ids.is_some()
     }
 
     /// Returns `true` if elements must be decoded and re-encoded. Only the
     /// header-only strips (`--strip-indexdata` / `--strip-tagdata`, alone or
     /// together) can run as a pure blob-level passthrough.
     fn needs_decode(self) -> bool {
-        self.unsort || self.unsort_intra || self.strip_locations
+        self.unsort || self.unsort_intra || self.strip_locations || self.drop_ids.is_some()
     }
 
     /// Either unsort mode: workers ship every matching element as `Owned*`,
@@ -144,6 +250,7 @@ impl DegradeFlags {
 pub struct DegradeStats {
     pub blobs_written: u64,
     pub elements_written: u64,
+    pub dropped: u64,
     pub flags: DegradeFlags,
 }
 
@@ -165,10 +272,19 @@ impl DegradeStats {
         if self.flags.strip_tagdata {
             applied.push("--strip-tagdata");
         }
+        if self.flags.drop_ids.is_some() {
+            applied.push("--drop-ids");
+        }
+        let dropped = if self.dropped > 0 {
+            format!(" (dropped {} elements)", self.dropped)
+        } else {
+            String::new()
+        };
         eprintln!(
-            "Degraded {} elements across {} blobs (applied: {})",
+            "Degraded {} elements across {} blobs{} (applied: {})",
             self.elements_written,
             self.blobs_written,
+            dropped,
             applied.join(" "),
         );
     }
@@ -183,7 +299,7 @@ impl DegradeStats {
 ///
 /// `force` skips the indexdata precondition required by the decode path's
 /// per-kind classify pipeline. Has no effect on the passthrough path.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn degrade(
     input: &Path,
@@ -234,6 +350,11 @@ pub fn degrade(
         crate::debug::emit_counter("degrade_strip_locations", i64::from(flags.strip_locations));
         crate::debug::emit_counter("degrade_strip_indexdata", i64::from(flags.strip_indexdata));
         crate::debug::emit_counter("degrade_strip_tagdata", i64::from(flags.strip_tagdata));
+        crate::debug::emit_counter("degrade_drop_ids", i64::from(flags.drop_ids.is_some()));
+        if let Some(spec) = flags.drop_ids {
+            crate::debug::emit_counter("degrade_drop_n", spec.n as i64);
+            crate::debug::emit_counter("degrade_drop_seed", spec.seed as i64);
+        }
         crate::debug::emit_counter("degrade_block_cap", block_cap as i64);
     }
 
@@ -265,6 +386,7 @@ pub fn degrade(
     {
         crate::debug::emit_counter("degrade_blobs_written", stats.blobs_written as i64);
         crate::debug::emit_counter("degrade_elements_written", stats.elements_written as i64);
+        crate::debug::emit_counter("degrade_dropped_elements", stats.dropped as i64);
     }
 
     Ok(stats)
@@ -351,6 +473,7 @@ fn degrade_passthrough(
     Ok(DegradeStats {
         blobs_written,
         elements_written: 0,
+        dropped: 0,
         flags,
     })
 }
@@ -476,7 +599,7 @@ impl UnsortKindState {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn degrade_decode_path(
     input: &Path,
@@ -516,13 +639,30 @@ fn degrade_decode_path(
         reader.header().clone()
     };
 
+    let (node_schedule, way_schedule, rel_schedule, shared_file) =
+        crate::scan::classify::build_classify_schedules_split(input)?;
+
+    // Selection must finish before opening the writer: an over-large N must
+    // not leave a header-only output behind.
+    let drop_sets = if let Some(spec) = flags.drop_ids {
+        crate::debug::emit_marker("DEGRADE_DROP_SELECT_START");
+        let sets = select_drop_sets(
+            &shared_file,
+            &node_schedule,
+            &way_schedule,
+            &rel_schedule,
+            spec,
+        )?;
+        crate::debug::emit_marker("DEGRADE_DROP_SELECT_END");
+        Some(sets)
+    } else {
+        None
+    };
+
     let preserve_sorted = !flags.unsort_any() && header.is_sorted();
     let header_bytes = build_output_header(&header, preserve_sorted, overrides, |hb| hb)?;
     let mut writer =
         writer_from_header_bytes(output, compression, &header_bytes, direct_io, io_uring)?;
-
-    let (node_schedule, way_schedule, rel_schedule, shared_file) =
-        crate::scan::classify::build_classify_schedules_split(input)?;
 
     let mut blobs_written: u64 = 0;
     let mut elements_written: u64 = 0;
@@ -536,6 +676,7 @@ fn degrade_decode_path(
         block_cap,
         flags,
         compression,
+        drop_sets.as_ref().map(|sets| sets.for_kind(KIND_NODE)),
         &mut writer,
     )?;
     crate::debug::emit_marker("DEGRADE_NODES_END");
@@ -551,6 +692,7 @@ fn degrade_decode_path(
         block_cap,
         flags,
         compression,
+        drop_sets.as_ref().map(|sets| sets.for_kind(KIND_WAY)),
         &mut writer,
     )?;
     crate::debug::emit_marker("DEGRADE_WAYS_END");
@@ -566,6 +708,7 @@ fn degrade_decode_path(
         block_cap,
         flags,
         compression,
+        drop_sets.as_ref().map(|sets| sets.for_kind(KIND_RELATION)),
         &mut writer,
     )?;
     crate::debug::emit_marker("DEGRADE_RELATIONS_END");
@@ -587,8 +730,79 @@ fn degrade_decode_path(
     Ok(DegradeStats {
         blobs_written,
         elements_written,
+        dropped: flags.drop_ids.map_or(0, |spec| spec.n),
         flags,
     })
+}
+
+fn select_drop_sets(
+    shared_file: &std::sync::Arc<std::fs::File>,
+    node_schedule: &[crate::scan::classify::ScheduleEntry],
+    way_schedule: &[crate::scan::classify::ScheduleEntry],
+    relation_schedule: &[crate::scan::classify::ScheduleEntry],
+    spec: DropSpec,
+) -> Result<DropSets> {
+    let mut total = 0_u64;
+    let mut heap = BinaryHeap::new();
+    for (kind, schedule) in [
+        (KIND_NODE, node_schedule),
+        (KIND_WAY, way_schedule),
+        (KIND_RELATION, relation_schedule),
+    ] {
+        crate::scan::classify::parallel_classify_phase(
+            shared_file,
+            schedule,
+            None,
+            || (),
+            |block, _| select_block_keys(block, kind, spec),
+            |_seq, block_drop| {
+                total += block_drop.matched;
+                for key in block_drop.smallest {
+                    keep_smallest(&mut heap, spec.n, key);
+                }
+            },
+        )?;
+    }
+    if spec.n > total {
+        return Err(format!(
+            "--drop-ids: cannot drop {} elements, input has only {}",
+            spec.n, total,
+        )
+        .into());
+    }
+    let mut sets = DropSets::default();
+    for key in heap {
+        sets.insert(key);
+    }
+    Ok(sets)
+}
+
+fn select_block_keys(block: &crate::PrimitiveBlock, kind: u8, spec: DropSpec) -> BlockDrop {
+    let mut matched = 0_u64;
+    let mut heap = BinaryHeap::new();
+    for element in block.elements() {
+        let id = match (&element, kind) {
+            (Element::DenseNode(node), KIND_NODE) => node.id(),
+            (Element::Node(node), KIND_NODE) => node.id(),
+            (Element::Way(way), KIND_WAY) => way.id(),
+            (Element::Relation(relation), KIND_RELATION) => relation.id(),
+            _ => continue,
+        };
+        matched += 1;
+        keep_smallest(
+            &mut heap,
+            spec.n,
+            DropKey {
+                hash: drop_hash(kind, id, spec.seed),
+                kind,
+                id,
+            },
+        );
+    }
+    BlockDrop {
+        matched,
+        smallest: heap.into_vec(),
+    }
 }
 
 struct PhaseStats {
@@ -607,7 +821,7 @@ struct PhaseStats {
 /// output-blob boundary (cross-blob overlap); `--unsort-intra` keeps the
 /// flush and swaps the first two same-kind elements, so the inversion
 /// stays inside the first output block (intra-blob inversion).
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn run_kind_phase(
     shared_file: &std::sync::Arc<std::fs::File>,
@@ -616,6 +830,7 @@ fn run_kind_phase(
     block_cap: usize,
     flags: DegradeFlags,
     compression: Compression,
+    drop: Option<&FxHashSet<i64>>,
     writer: &mut PbfWriter<FileWriter>,
 ) -> Result<PhaseStats> {
     use crate::reorder_buffer::ReorderBuffer;
@@ -647,7 +862,7 @@ fn run_kind_phase(
         None,
         || (),
         |block, _state| -> PhaseResult {
-            worker_decode_kind(block, kind, block_cap, flags, &compression)
+            worker_decode_kind(block, kind, block_cap, flags, &compression, drop)
         },
         |seq, r| {
             reorder.push(seq, r);
@@ -799,19 +1014,20 @@ fn worker_decode_kind(
     cap: usize,
     flags: DegradeFlags,
     compression: &Compression,
+    drop: Option<&FxHashSet<i64>>,
 ) -> std::result::Result<WorkerOutput, String> {
     let total = match kind {
         KIND_NODE => block
             .elements()
-            .filter(|e| matches!(e, Element::DenseNode(_) | Element::Node(_)))
+            .filter(|e| element_matches_kind(e, kind, drop))
             .count(),
         KIND_WAY => block
             .elements()
-            .filter(|e| matches!(e, Element::Way(_)))
+            .filter(|e| element_matches_kind(e, kind, drop))
             .count(),
         KIND_RELATION => block
             .elements()
-            .filter(|e| matches!(e, Element::Relation(_)))
+            .filter(|e| element_matches_kind(e, kind, drop))
             .count(),
         _ => return Err(format!("invalid kind constant: {kind}")),
     };
@@ -839,13 +1055,7 @@ fn worker_decode_kind(
     let mut refs_buf: Vec<i64> = Vec::new();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
     for element in block.elements() {
-        let is_match = matches!(
-            (&element, kind),
-            (Element::DenseNode(_) | Element::Node(_), KIND_NODE)
-                | (Element::Way(_), KIND_WAY)
-                | (Element::Relation(_), KIND_RELATION)
-        );
-        if !is_match {
+        if !element_matches_kind(&element, kind, drop) {
             continue;
         }
 
@@ -927,6 +1137,17 @@ fn worker_decode_kind(
     }
 
     Ok(WorkerOutput { full_framed, tail })
+}
+
+fn element_matches_kind(element: &Element<'_>, kind: u8, drop: Option<&FxHashSet<i64>>) -> bool {
+    let id = match (element, kind) {
+        (Element::DenseNode(node), KIND_NODE) => node.id(),
+        (Element::Node(node), KIND_NODE) => node.id(),
+        (Element::Way(way), KIND_WAY) => way.id(),
+        (Element::Relation(relation), KIND_RELATION) => relation.id(),
+        _ => return false,
+    };
+    drop.is_none_or(|ids| !ids.contains(&id))
 }
 
 /// Feed an entire unsort-mode tail into the central builder, applying the
@@ -1119,4 +1340,151 @@ fn frame_and_write_batch(
         written += 1;
     }
     Ok(written)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DropKey, drop_hash, keep_smallest, mix64};
+    use std::collections::BinaryHeap;
+
+    fn select(keys: impl IntoIterator<Item = DropKey>, n: u64) -> Vec<DropKey> {
+        let mut heap = BinaryHeap::new();
+        for key in keys {
+            keep_smallest(&mut heap, n, key);
+        }
+        let mut out = heap.into_vec();
+        out.sort();
+        out
+    }
+
+    fn keys() -> Vec<DropKey> {
+        vec![
+            DropKey {
+                hash: 9,
+                kind: 2,
+                id: 1,
+            },
+            DropKey {
+                hash: 2,
+                kind: 1,
+                id: 4,
+            },
+            DropKey {
+                hash: 2,
+                kind: 0,
+                id: 9,
+            },
+            DropKey {
+                hash: 7,
+                kind: 0,
+                id: 2,
+            },
+            DropKey {
+                hash: 1,
+                kind: 2,
+                id: 8,
+            },
+            DropKey {
+                hash: 5,
+                kind: 1,
+                id: 3,
+            },
+        ]
+    }
+
+    #[test]
+    fn drop_hash_golden_vectors() {
+        assert_eq!(mix64(0), 0);
+        assert_eq!(mix64(1), 0x5692_161d_100b_05e5);
+        assert_eq!(mix64(u64::MAX), 0xb4d0_55fc_f2cb_bd7b);
+        assert_eq!(drop_hash(0, 1, 0), 0xe220_a839_7b1d_cdaf);
+        assert_eq!(drop_hash(1, 1, 0), 0xd28f_0491_68bd_d34c);
+        assert_eq!(drop_hash(2, 42, 0), 0x454c_0046_9e53_63e2);
+        assert_eq!(drop_hash(0, 1, 1), 0xe4d9_7177_1b65_2c20);
+        assert_eq!(drop_hash(0, 1, 0x1_0000_0000), 0x219f_c13d_6bc5_b015);
+        assert_eq!(
+            drop_hash(2, 42, 0xdead_beef_cafe_babe),
+            0xdd1c_b91c_cef4_8036
+        );
+    }
+
+    #[test]
+    fn drop_selection_matches_full_sort() {
+        let all = keys();
+        for n in [3, all.len() as u64, all.len() as u64 + 2] {
+            let mut expected = all.clone();
+            expected.sort();
+            expected.truncate(usize::try_from(n).unwrap_or(usize::MAX));
+            assert_eq!(select(all.clone(), n), expected);
+        }
+    }
+
+    #[test]
+    fn drop_selection_permutation_invariant() {
+        let all = keys();
+        let expected = select(all.clone(), 4);
+        let mut reversed = all;
+        reversed.reverse();
+        assert_eq!(select(reversed, 4), expected);
+    }
+
+    #[test]
+    fn drop_selection_partition_invariant() {
+        let all = keys();
+        let expected = select(all.clone(), 4);
+        let mut global = BinaryHeap::new();
+        for chunk in all.chunks(2) {
+            let mut local = BinaryHeap::new();
+            for &key in chunk {
+                keep_smallest(&mut local, 4, key);
+            }
+            for key in local {
+                keep_smallest(&mut global, 4, key);
+            }
+        }
+        let mut actual = global.into_vec();
+        actual.sort();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn drop_key_orders_by_hash_then_kind_then_id() {
+        let keys = vec![
+            DropKey {
+                hash: 1,
+                kind: 1,
+                id: 1,
+            },
+            DropKey {
+                hash: 1,
+                kind: 0,
+                id: 9,
+            },
+            DropKey {
+                hash: 1,
+                kind: 0,
+                id: 2,
+            },
+        ];
+        assert_eq!(
+            select(keys, 3),
+            vec![
+                DropKey {
+                    hash: 1,
+                    kind: 0,
+                    id: 2
+                },
+                DropKey {
+                    hash: 1,
+                    kind: 0,
+                    id: 9
+                },
+                DropKey {
+                    hash: 1,
+                    kind: 1,
+                    id: 1
+                },
+            ]
+        );
+    }
 }

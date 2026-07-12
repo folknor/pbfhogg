@@ -14,6 +14,19 @@
 
 ### Added
 
+- `degrade --drop-ids <N:SEED>` deterministically removes exactly N elements
+  from the output, selected by a global (hash, kind, id) ordering seeded by
+  `SEED` (splitmix64-based, fully specified so selection is reproducible
+  byte-for-byte across builds and hosts). Ways and relations that still
+  reference a dropped id become dangling references, giving `check --refs`
+  a well-defined, reproducible dangling-reference count to validate against.
+  `N` is an exact count (not a rate); `N == 0` is rejected, and `N` greater
+  than the input's element count is a hard error once the true count is
+  known. Because dropping elements changes blob framing, `--drop-ids` always
+  forces the decode path (it cannot ride the blob-level passthrough), and it
+  composes with every other transformation flag (`--strip-locations`,
+  `--strip-indexdata`, `--strip-tagdata`, `--unsort`, `--unsort-intra`).
+
 - `degrade --strip-tagdata` clears the per-blob `BlobHeader.tagdata` tag key
   index on every OsmData blob, so `tags-filter` runs its no-hint fallback
   path against the output. Like `--strip-indexdata` it is a header-only

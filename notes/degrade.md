@@ -20,6 +20,7 @@ pbfhogg degrade <input> -o <output> [--unsort]
                                      [--strip-locations]
                                      [--strip-indexdata]
                                      [--strip-tagdata]
+                                     [--drop-ids N:SEED]
                                      [--force]
                                      [--compression C]
                                      [--direct-io] [--io-uring]
@@ -62,8 +63,8 @@ combination:
   blob bytes are not touched. Accepts non-indexed input (no
   precondition). `--strip-tagdata` alone therefore yields a still-sorted,
   still-indexed file that only lacks the per-blob tag key index.
-- **Decode path** (any flag set involving `--unsort` or
-  `--strip-locations`; `--strip-indexdata` / `--strip-tagdata` ride
+- **Decode path** (any flag set involving `--unsort`, `--strip-locations`,
+  or `--drop-ids`; `--strip-indexdata` / `--strip-tagdata` ride
   along as `indexdata=None` / `tagdata=None` on the framing call):
   three sequential per-kind phases driven by
   [`parallel_classify_phase`](../src/scan/classify.rs), mirroring
@@ -81,8 +82,9 @@ combination:
 
 The choice is structural: cross-input-blob element reordering (the
 `--unsort` perturbation) cannot be done at the blob-passthrough level,
-and `--strip-locations` requires re-encoding ways without inline
-coords.
+`--strip-locations` requires re-encoding ways without inline
+coords, and `--drop-ids` changes per-blob element counts (and
+therefore blob framing), which a byte-for-byte blob copy cannot do.
 
 ### Decode-path memory model
 
@@ -202,6 +204,47 @@ in both `frame_owned` (worker full blocks) and `frame_and_write_batch`
 (merge-thread tail). Composes with every other flag, and alone is
 passthrough-eligible (does not force a decode).
 
+#### `--drop-ids N:SEED`
+
+Deterministically removes exactly `N` elements from the output so that
+surviving ways/relations that referenced them become dangling
+references - the primary consumer is `check --refs` slow-path /
+error-recovery benchmarking, where the dangling count needs to be a
+well-defined, testable function of the input and `N:SEED`. `N` is an
+exact absolute count, not a rate: `output_element_count ==
+input_element_count - N` exactly, on input where every element has a
+unique `(kind, id)` (every valid PBF and every degrade fixture; degrade
+does not police the precondition, so duplicate `(kind, id)` pairs can
+drop more than `N`). `N == 0` is rejected at the CLI; `N` greater than
+the input's total element count is a hard error once the true count is
+known (before any output file is opened, so a rejected run leaves no
+partial output).
+
+Selection is global across all three kinds (not per kind, so nodes -
+vastly more numerous than ways/relations - dominate the dropped set,
+maximizing dangling references) and is a pure function of `N`, `SEED`,
+and the input's `(kind, id)` pairs: every element gets an ordering key
+`(drop_hash(kind, id, SEED), kind, id)` from a fully-specified
+splitmix64-style hash, and the `N` elements with the smallest keys are
+dropped. Same input + same `N:SEED` always selects the byte-identical
+set and produces a byte-identical output; a different `SEED` (same
+`N`) selects a different set. The selection itself runs as a bounded-
+memory pre-pass (one global size-`N` max-heap, fed by
+`parallel_classify_phase` per-blob top-K results) before the decode
+emit phases, so peak memory during selection is `O(min(N, total
+elements))`, independent of thread count.
+
+Because dropping elements changes per-blob element counts, `--drop-ids`
+always forces the decode path (Section "Implementation paths" above),
+even when composed only with otherwise-passthrough-eligible flags
+(`--strip-indexdata`, `--strip-tagdata`). It composes with every other
+transformation flag: survivors are emitted in original stream order,
+so `Sort.Type_then_ID` is preserved exactly as without `--drop-ids`
+(dropping a subsequence of a monotone sequence stays monotone), and the
+`--unsort` / `--unsort-intra` swap state machines operate purely on
+survivors (a kind whose survivor count falls to or below `hold_at` does
+not swap, per the existing unsort machinery).
+
 ### What v1 preserves
 
 On the passthrough path: every blob payload byte (including LOW
@@ -219,7 +262,10 @@ DenseNode encoding. `Sort.Type_then_ID` is preserved unless `--unsort`
 or `--unsort-intra` clears it. `LocationsOnWays` is dropped by
 `BlockBuilder` as on every
 other decode-path command in pbfhogg (`repack`, `sort`, `tags-filter`,
-etc.); `--strip-locations` makes the loss explicit.
+etc.); `--strip-locations` makes the loss explicit. `--drop-ids`
+preserves every one of these properties on the surviving elements; it
+only removes the `N` selected elements (and any reference to them
+becomes dangling by construction, which is the point).
 
 ### Validated at scale
 
@@ -321,6 +367,19 @@ the deferred-optimization motivation in
   with `--block-cap 10` against 20-element input blobs so workers
   pre-frame full blocks: exercises the `frame_owned` `tagdata=None`
   path while `LocationsOnWays` is cleared.
+- `degrade_drop_ids_and_strip_locations_compose` (tier 2) -
+  `--drop-ids 10:16 --strip-locations`: count is input - 10,
+  `LocationsOnWays` cleared, output still sorted.
+- `degrade_drop_ids_and_strip_indexdata_compose` (tier 2) -
+  `--drop-ids 10:16 --strip-indexdata`: count is input - 10,
+  `assert_non_indexed(&output)`.
+- `degrade_drop_ids_and_unsort_compose` (tier 2) - `--drop-ids 10:16
+  --unsort --block-cap 10` on the unsort fixture (60 nodes / 24 ways /
+  24 relations, so every kind stays well above `hold_at` after 10 are
+  dropped): count is input - 10, header not sorted, and each kind still
+  shows exactly one adjacent cross-blob overlap and zero intra-blob
+  inversions - proving the drop filter and the unsort swap compose
+  without disturbing each other's shape.
 - `degrade_requires_at_least_one_flag` - validation: no flags is a
   hard error.
 - `degrade_rejects_zero_block_cap` - validation: `--block-cap 0`
@@ -330,11 +389,50 @@ the deferred-optimization motivation in
   impossible at cap 1).
 - `degrade_unsort_accepts_block_cap_one` - `--unsort --block-cap 1`
   is supported and still yields the one-overlap-per-kind shape.
+- `degrade_drop_ids_removes_exactly_n` - `--drop-ids 10:1` removes
+  exactly 10 elements (`read_normalized` count) and leaves the output
+  sorted (`is_sorted()` and `assert_sorted_file`), confirming that
+  dropping a subsequence of a monotone stream stays monotone.
+- `degrade_drop_ids_dangling_refs_match_check_refs` - the consumer
+  contract: `--drop-ids 10:16` (pinned to drop nodes 2 and 3, referenced
+  by every way, and way 2, a member of every relation) produces a
+  `check --refs --check-relations --json` report whose four
+  `missing_*` fields match expectations computed hash-independently
+  from the output's surviving refs/members vs. surviving ids, and the
+  four-field sum is asserted `> 0` so the run cannot pass vacuously.
+- `degrade_drop_ids_is_reproducible_and_seed_changes_selection` - two
+  runs of `--drop-ids 10:7` produce byte-identical output files;
+  `--drop-ids 10:8` on the same input produces a different file.
+- `degrade_drop_ids_validates_arguments_and_total` - table-driven:
+  `0:1` rejects with "N must be >= 1", bare `10` (no seed) rejects with
+  "N:SEED", and `1000000:1` against the small fixture rejects with
+  "input has only" (N greater than the input's total element count).
 
 Each unsort-mode composition test reuses the same shape helpers
 (`assert_unsort_cross_blob_shape` / `assert_unsort_intra_shape`), so a
 regression in the swap logic surfaces under every flag pairing, not
 just the standalone case.
+
+The `--drop-ids` hash and selection primitives are private, so they are
+pinned by inline unit tests in `src/commands/degrade/mod.rs`
+(`#[cfg(test)] mod tests`) rather than in `tests/cli_degrade.rs`:
+
+- `drop_hash_golden_vectors` - pins the splitmix64 finalizer and
+  `drop_hash` against fixed constants, including seeds that isolate a
+  low bit and bit 32 (the guard against a 64-bit-seed collapse).
+- `drop_selection_matches_full_sort` - the size-N max-heap top-K helper
+  matches a full sort-and-truncate, for `N < len`, `N == len`, and
+  `N > len`.
+- `drop_selection_permutation_invariant` - the same key multiset in
+  different orders selects the identical N-smallest set.
+- `drop_selection_partition_invariant` - splitting keys into chunks
+  (simulating per-blob worker results), reducing each chunk locally,
+  and merging through one global heap matches the single-pass top-K -
+  pinning the worker/merge decomposition as order- and
+  partition-independent.
+- `drop_key_orders_by_hash_then_kind_then_id` - `DropKey`s with an
+  identical hash but differing `(kind, id)` order deterministically by
+  `kind` then `id`, regardless of insertion order.
 
 ## Fixed
 
@@ -374,8 +472,8 @@ overlap-rewrite correctness gate.
 The deferred transformations from the design doc, ordered by likely
 demand. Pick them up as benchmarking work surfaces consumers.
 
-(v2.1 `--strip-tagdata` shipped - see the transformations and test
-inventory above.)
+(v2.1 `--strip-tagdata` and v2.4 `--drop-ids` shipped - see the
+transformations and test inventory above.)
 
 ### v2.2 - `--strip-bbox`
 
@@ -404,21 +502,6 @@ this when the cap matches the input.
 
 **Tests:** input zlib + `--recompress none` -> output is uncompressed;
 element multiset round-trips.
-
-### v2.4 - `--drop-ids N:SEED`
-
-**Goal:** introduce referential dangles for `check --refs` slow-path
-benchmarking and error-recovery validation.
-
-**Sketch:** during the decode-path pass, deterministically drop N
-elements (chosen by hashing id with seed) from the output. Ways and
-relations referencing the dropped IDs become dangling. The
-`--strip-indexdata` passthrough path is unsuitable here - dropping
-elements changes blob counts, so we must decode.
-
-**Tests:** output has exactly the original count minus N elements;
-`check --refs` on the degraded output reports the expected number of
-dangling references, and the seed is reproducible.
 
 ### v2.5 - `--unsort` chaos modes
 

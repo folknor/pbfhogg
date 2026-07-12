@@ -44,6 +44,14 @@ impl RawBlobFrame {
     pub(crate) fn blob_bytes(&self) -> &[u8] {
         &self.frame_bytes[self.blob_offset..]
     }
+
+    /// The raw `BlobHeader` protobuf message bytes, sitting between the
+    /// 4-byte big-endian length prefix and the Blob payload. Callers that
+    /// reframe a passthrough blob use this to preserve every original header
+    /// field verbatim rather than reconstructing fields from parsed values.
+    pub(crate) fn header_bytes(&self) -> &[u8] {
+        &self.frame_bytes[4..self.blob_offset]
+    }
 }
 
 /// Read the next raw blob frame. Returns `None` at EOF.
@@ -115,6 +123,8 @@ pub(crate) struct BlobHeaderInfo {
     pub blob_type: BlobKind,
     pub data_size: usize,
     pub index: Option<BlobIndex>,
+    /// Whether the header carried a `tagdata` (field 4) tag key index.
+    pub has_tagdata: bool,
 }
 
 /// Read the next blob header without reading the blob data payload.
@@ -151,7 +161,7 @@ pub(crate) fn read_blob_header_only(
     let mut header_bytes = vec![0u8; header_len];
     reader.read_exact(&mut header_bytes)?;
 
-    let (blob_type, data_size, raw_index, _tagdata) = parse_blob_header_with_index(&header_bytes)?;
+    let (blob_type, data_size, raw_index, tagdata) = parse_blob_header_with_index(&header_bytes)?;
     let index = raw_index.and_then(|ref data| BlobIndex::deserialize(data));
 
     *file_offset += (4 + header_len) as u64;
@@ -160,5 +170,6 @@ pub(crate) fn read_blob_header_only(
         blob_type,
         data_size,
         index,
+        has_tagdata: tagdata.is_some(),
     }))
 }

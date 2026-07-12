@@ -550,6 +550,27 @@ pub fn has_indexdata(path: &Path, direct_io: bool) -> Result<bool> {
     Ok(false)
 }
 
+/// Check if the first OsmData blob in a PBF has tagdata (`BlobHeader`
+/// field 4, the per-blob tag key index).
+///
+/// O(1) header-only probe, the tagdata sibling of [`has_indexdata`]: reads
+/// blob headers until the first OsmData blob and returns whether it carries
+/// tagdata. Returns false if the file has no data blobs. Trusts the first
+/// blob to be representative.
+pub fn has_tagdata(path: &Path, direct_io: bool) -> Result<bool> {
+    let mut reader = FileReader::open(path, direct_io)?;
+    let mut offset = 0u64;
+    while let Some(info) = crate::read::raw_frame::read_blob_header_only(&mut reader, &mut offset)?
+    {
+        if matches!(info.blob_type, BlobKind::OsmData) {
+            return Ok(info.has_tagdata);
+        }
+        reader.skip(info.data_size as u64)?;
+        offset += info.data_size as u64;
+    }
+    Ok(false)
+}
+
 /// Format a Unix epoch timestamp (seconds) as ISO 8601 UTC string.
 ///
 /// Uses the civil-time algorithm from Howard Hinnant's `chrono`-compatible

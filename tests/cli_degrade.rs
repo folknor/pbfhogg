@@ -17,7 +17,8 @@ use std::path::Path;
 
 use common::cli::CliInvoker;
 use common::{
-    TestNode, TestRelation, TestWay, assert_indexed, assert_non_indexed, assert_sorted_file,
+    TestNode, TestRelation, TestWay, assert_has_tagdata, assert_indexed, assert_no_tagdata,
+    assert_no_tagdata_all_blobs, assert_non_indexed, assert_sorted_file, count_tagdata_blobs,
     generate_nodes, generate_relations, generate_ways, read_header, read_normalized,
     write_multi_block_test_pbf,
 };
@@ -28,11 +29,20 @@ use pbfhogg::{BlobDecode, BlobReader, Element};
 /// relation blob = 5 OsmData blobs in the input.
 fn write_degrade_fixture(path: &Path) -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>) {
     let mut nodes = generate_nodes(60, 1);
+    // Tag elements in several distinct blobs (and across all three kinds) so
+    // the fixture carries tagdata in more than one blob. With 20 elements per
+    // blob the tagged nodes land in the first node blob (ids 1 and 8) and the
+    // third node blob (id 43); tagging a way and a relation adds tagdata to
+    // the way blob and the relation blob too. That makes the whole-file
+    // `assert_no_tagdata_all_blobs` check on `--strip-tagdata` output
+    // meaningful rather than a single-blob assertion in disguise.
     nodes[0].tags = vec![("place", "city"), ("name", "Origo")];
     nodes[7].tags = vec![("amenity", "cafe")];
     nodes[42].tags = vec![("highway", "bus_stop")];
-    let ways = generate_ways(12, 1, 3, 1);
-    let rels = generate_relations(6, 1, 2, 1);
+    let mut ways = generate_ways(12, 1, 3, 1);
+    ways[0].tags = vec![("highway", "residential")];
+    let mut rels = generate_relations(6, 1, 2, 1);
+    rels[0].tags = vec![("type", "route")];
     write_multi_block_test_pbf(path, &nodes, &ways, &rels, 20);
     (nodes, ways, rels)
 }
@@ -286,6 +296,66 @@ fn degrade_strip_locations_clears_low_and_preserves_elements() {
         "--strip-locations output must not declare LocationsOnWays"
     );
 
+    let original = read_normalized(&input);
+    let degraded = read_normalized(&output);
+    assert_eq!(original.nodes, degraded.nodes);
+    assert_eq!(original.ways, degraded.ways);
+    assert_eq!(original.relations, degraded.relations);
+}
+
+// ---------------------------------------------------------------------------
+// --strip-tagdata
+// ---------------------------------------------------------------------------
+
+/// `--strip-tagdata` clears the BlobHeader.tagdata field (the per-blob tag
+/// key index) on every OsmData blob, forcing `tags-filter`'s no-hint
+/// fallback path. Like `--strip-indexdata` it is a header-only passthrough:
+/// indexdata, sortedness, and every element property pass through unchanged
+/// because the blob payload is not touched. Crucially it leaves indexdata
+/// intact - a tagdata-stripped file is still indexed.
+#[test]
+fn degrade_strip_tagdata_drops_tagdata() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    write_degrade_fixture(&input);
+    // Precondition: the fixture carries tagdata in more than one blob (tagged
+    // nodes in two node blobs plus a tagged way and relation), so a stripper
+    // that only cleared the first blob would be caught by the whole-file walk
+    // below rather than passing a single-blob assertion.
+    assert_has_tagdata(&input);
+    assert!(
+        count_tagdata_blobs(&input) > 1,
+        "fixture must carry tagdata in more than one blob to make the \
+         whole-file strip assertion meaningful, got {}",
+        count_tagdata_blobs(&input)
+    );
+    assert_indexed(&input);
+
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--strip-tagdata")
+        .assert_success();
+
+    // Every output blob must be free of tagdata, not just the first.
+    assert_no_tagdata_all_blobs(&output);
+
+    // indexdata is preserved (only tagdata is targeted). The passthrough keeps
+    // the original indexdata bytes verbatim, so the file is still indexed.
+    assert_indexed(&output);
+
+    // Sortedness preserved (the blob payload is unchanged; only the
+    // BlobHeader.tagdata is cleared).
+    assert!(
+        read_header(&output).is_sorted(),
+        "--strip-tagdata should not clear Sort.Type_then_ID"
+    );
+
+    // Element semantics preserved.
     let original = read_normalized(&input);
     let degraded = read_normalized(&output);
     assert_eq!(original.nodes, degraded.nodes);
@@ -684,6 +754,113 @@ fn degrade_unsort_intra_and_strip_indexdata_compose() {
 
     assert_non_indexed(&output);
     assert_unsort_intra_shape(&output, &input);
+}
+
+/// `--strip-tagdata --strip-indexdata` composes on the passthrough path:
+/// both header fields are cleared while the blob payload (and sortedness)
+/// pass through untouched.
+#[test]
+fn degrade_strip_tagdata_and_strip_indexdata_compose() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    write_degrade_fixture(&input);
+    assert_has_tagdata(&input);
+    assert_indexed(&input);
+
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--strip-tagdata")
+        .arg("--strip-indexdata")
+        .assert_success();
+
+    assert_no_tagdata_all_blobs(&output);
+    assert_non_indexed(&output);
+    // Passthrough leaves the payload alone, so sortedness survives.
+    assert!(read_header(&output).is_sorted());
+
+    let original = read_normalized(&input);
+    let degraded = read_normalized(&output);
+    assert_eq!(original.nodes, degraded.nodes);
+    assert_eq!(original.ways, degraded.ways);
+    assert_eq!(original.relations, degraded.relations);
+}
+
+/// `--unsort --strip-tagdata` composes on the decode path: the elements are
+/// re-encoded (unsorted) *and* every output blob is emitted without tagdata.
+/// This exercises the `frame_and_write_batch` tagdata=None path that the
+/// merge thread uses under either unsort mode.
+#[test]
+fn degrade_unsort_and_strip_tagdata_compose() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    write_degrade_fixture(&input);
+    assert_has_tagdata(&input);
+
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--unsort")
+        .arg("--strip-tagdata")
+        .arg("--block-cap")
+        .arg("5")
+        .assert_success();
+
+    assert_no_tagdata(&output);
+    assert!(!read_header(&output).is_sorted());
+
+    let original = read_normalized(&input);
+    let degraded = read_normalized(&output);
+    assert_eq!(original.nodes, degraded.nodes);
+    assert_eq!(original.ways, degraded.ways);
+    assert_eq!(original.relations, degraded.relations);
+}
+
+/// `--strip-locations --strip-tagdata` composes on the decode path's
+/// non-unsort shape: with `--block-cap 10` against the fixture's 20-element
+/// input blobs, workers pre-frame full cap-blocks via `frame_owned`, so this
+/// exercises the `frame_owned` tagdata=None path (distinct from the merge
+/// thread's batch path above). `LocationsOnWays` is cleared and no output
+/// blob carries tagdata.
+#[test]
+fn degrade_strip_locations_and_strip_tagdata_compose() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    write_degrade_fixture(&input);
+    assert_has_tagdata(&input);
+
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--strip-locations")
+        .arg("--strip-tagdata")
+        .arg("--block-cap")
+        .arg("10")
+        .assert_success();
+
+    assert_no_tagdata(&output);
+    assert!(
+        !read_header(&output).has_locations_on_ways(),
+        "--strip-locations output must not declare LocationsOnWays"
+    );
+
+    let original = read_normalized(&input);
+    let degraded = read_normalized(&output);
+    assert_eq!(original.nodes, degraded.nodes);
+    assert_eq!(original.ways, degraded.ways);
+    assert_eq!(original.relations, degraded.relations);
 }
 
 // ---------------------------------------------------------------------------

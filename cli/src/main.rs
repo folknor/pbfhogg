@@ -188,7 +188,8 @@ enum Command {
     /// At least one flag is required, and flags compose - except
     /// `--unsort` and `--unsort-intra`, which are mutually exclusive (they
     /// request opposite blob shapes). Supports `--unsort`, `--unsort-intra`,
-    /// `--strip-locations`, `--strip-indexdata`. Both unsort modes perturb
+    /// `--strip-locations`, `--strip-indexdata`, `--strip-tagdata`. Both
+    /// unsort modes perturb
     /// exactly one same-kind pair per kind that has more than `block_cap`
     /// elements; kinds with fewer elements pass through unchanged. Used to
     /// produce inputs for benchmarking non-optimal code paths
@@ -215,6 +216,12 @@ enum Command {
         /// Clear `BlobHeader.indexdata` on every OsmData blob.
         #[arg(long)]
         strip_indexdata: bool,
+        /// Clear `BlobHeader.tagdata` (the per-blob tag key index) on every
+        /// OsmData blob, forcing `tags-filter`'s no-hint fallback path.
+        /// Leaves `indexdata` intact - a tagdata-stripped file is still
+        /// indexed.
+        #[arg(long)]
+        strip_tagdata: bool,
         /// Per-block element cap on the decode path. Hidden; used by
         /// the test suite so `--unsort` can fire on small fixtures
         /// without 8000+ elements per kind.
@@ -893,6 +900,7 @@ fn main() -> process::ExitCode {
                 unsort_intra,
                 strip_locations,
                 strip_indexdata,
+                strip_tagdata,
                 block_cap,
                 force,
                 compression,
@@ -906,6 +914,7 @@ fn main() -> process::ExitCode {
                 unsort_intra,
                 strip_locations,
                 strip_indexdata,
+                strip_tagdata,
                 block_cap,
                 force,
                 &compression.compression,
@@ -1743,6 +1752,7 @@ fn run_degrade(
     unsort_intra: bool,
     strip_locations: bool,
     strip_indexdata: bool,
+    strip_tagdata: bool,
     block_cap: usize,
     force: bool,
     compression: &str,
@@ -1756,6 +1766,7 @@ fn run_degrade(
         unsort_intra,
         strip_locations,
         strip_indexdata,
+        strip_tagdata,
     };
     let stats = pbfhogg::degrade::degrade(
         file,

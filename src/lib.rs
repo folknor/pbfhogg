@@ -175,8 +175,6 @@ pub use read::reader::{ElementReader, PipelinedBlocks};
 #[doc(hidden)]
 pub use commands::HeaderOverrides;
 #[doc(hidden)]
-pub use commands::has_indexdata;
-#[doc(hidden)]
 pub use commands::{
     altw, apply_changes, cat, degrade, diff, getid, getparents, inspect, merge_changes, renumber,
     repack, sort, tags_count, tags_filter, time_filter,
@@ -184,6 +182,8 @@ pub use commands::{
 #[cfg(feature = "commands")]
 #[doc(hidden)]
 pub use commands::{check, extract};
+#[doc(hidden)]
+pub use commands::{has_indexdata, has_tagdata};
 pub(crate) use read::file_reader;
 pub use read::{blob, block, dense, elements, indexed, reader};
 pub(crate) use write::file_writer;

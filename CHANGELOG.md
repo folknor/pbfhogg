@@ -12,6 +12,20 @@
 
 - **Minimum supported Rust version raised 1.87 → 1.96** (library and CLI). Required by the move to `if let` chains and `as_chunks` in the read and command paths.
 
+### Added
+
+- `degrade --strip-tagdata` clears the per-blob `BlobHeader.tagdata` tag key
+  index on every OsmData blob, so `tags-filter` runs its no-hint fallback
+  path against the output. Like `--strip-indexdata` it is a header-only
+  passthrough that leaves the blob payload, sortedness, and `indexdata`
+  intact (a tagdata-stripped file is still indexed), and it composes with
+  every other transformation flag. On the passthrough path both
+  `--strip-tagdata` and `--strip-indexdata` now preserve all other
+  `BlobHeader` fields byte-for-byte - the untargeted hint keeps its exact
+  original bytes (a v1 blob index stays v1 rather than being re-serialized
+  to v2), and `pbfhogg.WayMembers-v1` and any unknown header fields pass
+  through unchanged. Only the field the flag targets is cleared.
+
 ### Changed
 
 - `repack` now preserves `LocationsOnWays`: when the input header declares

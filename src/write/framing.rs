@@ -310,6 +310,52 @@ pub(crate) fn encode_blob_header_into(
     Ok(())
 }
 
+/// Re-emit a `BlobHeader` protobuf message, copying every field through
+/// verbatim except the field numbers listed in `strip_fields`, which are
+/// dropped.
+///
+/// Untargeted fields are copied at the byte level - tag and value together -
+/// straight from the original message, so nothing pbfhogg does not model is
+/// disturbed. In particular this preserves the original `indexdata` bytes
+/// exactly: a 26-byte v1 index stays v1 rather than being silently upgraded
+/// to the 42-byte v2 layout that a deserialize-then-`BlobIndex::serialize()`
+/// round-trip would produce, and an index that fails to deserialize is kept
+/// instead of dropped. It equally preserves `tagdata` (field 4), the
+/// `pbfhogg.WayMembers-v1` payload (field 5), and any unknown/extension
+/// fields. Only the targeted field number(s) are removed.
+///
+/// Used by `degrade`'s header-only passthrough so a strip changes exactly
+/// the field it targets (`indexdata` for `--strip-indexdata`, `tagdata` for
+/// `--strip-tagdata`) and leaves every other header field byte-for-byte
+/// identical. The blob payload it accompanies is unchanged, so the preserved
+/// `datasize` (field 3) stays consistent.
+pub(crate) fn strip_blob_header_fields(
+    header_bytes: &[u8],
+    strip_fields: &[u32],
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
+    use protohoggr::Cursor;
+    out.clear();
+    let mut cursor = Cursor::new(header_bytes);
+    loop {
+        let field_start = cursor.position();
+        let Some((field, wire_type)) = cursor
+            .read_tag()
+            .map_err(|e| io::Error::other(format!("BlobHeader parse: {e}")))?
+        else {
+            break;
+        };
+        cursor
+            .skip_field(wire_type)
+            .map_err(|e| io::Error::other(format!("BlobHeader parse: {e}")))?;
+        let field_end = cursor.position();
+        if !strip_fields.contains(&field) {
+            out.extend_from_slice(&header_bytes[field_start..field_end]);
+        }
+    }
+    Ok(())
+}
+
 /// Re-frame an already-compressed Blob with a new BlobHeader that includes indexdata.
 ///
 /// Takes the raw compressed Blob protobuf bytes (from a passthrough frame) and
@@ -380,6 +426,100 @@ mod tests {
             Ok(skipped) => assert!(skipped.waymembers.is_none()),
             Err(err) => panic!("failed to parse toggle-off header: {err}"),
         }
+    }
+
+    /// `strip_blob_header_fields` copies every untargeted field through
+    /// byte-for-byte and drops only the requested field number(s). This pins
+    /// the passthrough contract that a header-only strip touches exactly the
+    /// field it targets: a 26-byte v1 indexdata stays v1 (never upgraded to
+    /// the 42-byte v2 layout), the WayMembers-v1 payload (field 5) survives,
+    /// and an unknown/extension field pbfhogg does not model is preserved.
+    #[test]
+    fn strip_blob_header_fields_preserves_untargeted_fields_verbatim() {
+        use protohoggr::{encode_bytes_field, encode_int32_field, encode_varint_field};
+
+        // Hand-build a BlobHeader carrying every field the wire format models
+        // plus one unknown field. indexdata is a 26-byte v1 index (not the
+        // 42-byte v2 our writer emits) precisely to prove v1 stays v1.
+        let v1_index = [0xABu8; 26];
+        let tag_index = [1u8, 2, 3, 4];
+        let way_members = [1u8, 9, 0b1010_0101, 0b0000_0001];
+        let unknown = [0x77u8, 0x88];
+        let mut header = Vec::new();
+        encode_bytes_field(&mut header, 1, b"OSMData"); // field 1: type
+        encode_bytes_field(&mut header, 2, &v1_index); // field 2: indexdata (v1)
+        encode_int32_field(&mut header, 3, 4242); // field 3: datasize
+        encode_bytes_field(&mut header, 4, &tag_index); // field 4: tagdata
+        encode_bytes_field(&mut header, 5, &way_members); // field 5: waymembers
+        encode_varint_field(&mut header, 9, 0x0102); // field 9: unknown varint
+        encode_bytes_field(&mut header, 11, &unknown); // field 11: unknown bytes
+
+        // Strip nothing: output is byte-identical to the input header.
+        let mut out = Vec::new();
+        strip_blob_header_fields(&header, &[], &mut out).expect("strip none");
+        assert_eq!(out, header, "empty strip set must be an identity copy");
+
+        // Strip tagdata (field 4) only: every other field - including the
+        // 26-byte v1 index, the WayMembers payload, and both unknown fields -
+        // is preserved exactly.
+        let mut expect_no_tag = Vec::new();
+        encode_bytes_field(&mut expect_no_tag, 1, b"OSMData");
+        encode_bytes_field(&mut expect_no_tag, 2, &v1_index);
+        encode_int32_field(&mut expect_no_tag, 3, 4242);
+        encode_bytes_field(&mut expect_no_tag, 5, &way_members);
+        encode_varint_field(&mut expect_no_tag, 9, 0x0102);
+        encode_bytes_field(&mut expect_no_tag, 11, &unknown);
+        let mut out = Vec::new();
+        strip_blob_header_fields(&header, &[4], &mut out).expect("strip tagdata");
+        assert_eq!(
+            out, expect_no_tag,
+            "stripping field 4 must drop only tagdata and preserve v1 index, \
+             WayMembers, and unknown fields byte-for-byte"
+        );
+        // The preserved indexdata is still the 26-byte v1 payload verbatim.
+        let parsed = WireBlobHeader::parse(&out, true, true, true).expect("parse stripped header");
+        assert!(parsed.tagdata.is_none(), "tagdata must be gone");
+        assert_eq!(
+            parsed.waymembers.as_deref(),
+            Some(way_members.as_slice()),
+            "WayMembers-v1 must survive a tagdata strip"
+        );
+        assert_eq!(
+            &parsed.indexdata.expect("index present")[..26],
+            v1_index.as_slice(),
+            "v1 index bytes must be preserved unchanged"
+        );
+
+        // Strip indexdata (field 2) only: tagdata, WayMembers, and unknown
+        // fields all survive.
+        let mut expect_no_index = Vec::new();
+        encode_bytes_field(&mut expect_no_index, 1, b"OSMData");
+        encode_int32_field(&mut expect_no_index, 3, 4242);
+        encode_bytes_field(&mut expect_no_index, 4, &tag_index);
+        encode_bytes_field(&mut expect_no_index, 5, &way_members);
+        encode_varint_field(&mut expect_no_index, 9, 0x0102);
+        encode_bytes_field(&mut expect_no_index, 11, &unknown);
+        let mut out = Vec::new();
+        strip_blob_header_fields(&header, &[2], &mut out).expect("strip indexdata");
+        assert_eq!(
+            out, expect_no_index,
+            "stripping field 2 must drop only indexdata and preserve tagdata, \
+             WayMembers, and unknown fields byte-for-byte"
+        );
+
+        // Strip both header hints at once: only fields 1, 3, 5, 9, 11 remain.
+        let mut expect_neither = Vec::new();
+        encode_bytes_field(&mut expect_neither, 1, b"OSMData");
+        encode_int32_field(&mut expect_neither, 3, 4242);
+        encode_bytes_field(&mut expect_neither, 5, &way_members);
+        encode_varint_field(&mut expect_neither, 9, 0x0102);
+        encode_bytes_field(&mut expect_neither, 11, &unknown);
+        let mut out = Vec::new();
+        strip_blob_header_fields(&header, &[2, 4], &mut out).expect("strip both");
+        assert_eq!(
+            out, expect_neither,
+            "stripping fields 2 and 4 must leave WayMembers and unknown fields intact"
+        );
     }
 
     #[test]

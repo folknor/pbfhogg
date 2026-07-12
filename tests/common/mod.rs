@@ -693,6 +693,125 @@ pub fn assert_non_indexed(path: &Path) {
     );
 }
 
+/// Assert the PBF's first OsmData blob carries tagdata (`BlobHeader`
+/// field 4). Tagdata sibling of [`assert_indexed`]; used to prove a fixture
+/// really has a per-blob tag key index before a `--strip-tagdata` run so the
+/// removal is a meaningful assertion.
+pub fn assert_has_tagdata(path: &Path) {
+    let tagged = pbfhogg::has_tagdata(path, false).expect("probe tagdata");
+    assert!(
+        tagged,
+        "expected {} to carry tagdata on its first data blob",
+        path.display()
+    );
+}
+
+/// Assert the PBF's first OsmData blob has no tagdata. Pair with
+/// `--strip-tagdata` to confirm the field really landed cleared.
+pub fn assert_no_tagdata(path: &Path) {
+    let tagged = pbfhogg::has_tagdata(path, false).expect("probe tagdata");
+    assert!(
+        !tagged,
+        "expected {} to have no tagdata on its first data blob",
+        path.display()
+    );
+}
+
+/// Count OsmData blobs whose `BlobHeader` carries a `tagdata` field (field 4)
+/// by walking every blob frame in the file, not just the first.
+///
+/// `pbfhogg::has_tagdata` trusts the first data blob; this inspects the whole
+/// file so a `--strip-tagdata` run can be proven to have cleared *every* blob
+/// (and so a fixture can be proven to carry tagdata across more than one
+/// blob). Parses the outer PBF envelope directly: each frame is
+/// `[4-byte BE header_len][BlobHeader][Blob]`, and the walk reads the
+/// `BlobHeader` protobuf just far enough to find `datasize` (field 3, to
+/// advance past the Blob) and detect `tagdata` (field 4).
+pub fn count_tagdata_blobs(path: &Path) -> usize {
+    fn read_varint(buf: &[u8], pos: &mut usize) -> u64 {
+        let mut value = 0u64;
+        let mut shift = 0u32;
+        loop {
+            let byte = buf[*pos];
+            *pos += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        value
+    }
+
+    // Returns (datasize, has_tagdata) for one BlobHeader message.
+    fn scan_header(header: &[u8]) -> (usize, bool) {
+        let mut pos = 0usize;
+        let mut datasize = 0usize;
+        let mut has_tagdata = false;
+        while pos < header.len() {
+            let tag = read_varint(header, &mut pos);
+            let field = tag >> 3;
+            let wire = tag & 0x7;
+            match wire {
+                0 => {
+                    let v = read_varint(header, &mut pos);
+                    if field == 3 {
+                        datasize = usize::try_from(v).expect("datasize fits usize");
+                    }
+                }
+                2 => {
+                    let len = usize::try_from(read_varint(header, &mut pos))
+                        .expect("field len fits usize");
+                    pos += len;
+                    if field == 4 {
+                        has_tagdata = true;
+                    }
+                }
+                1 => pos += 8,
+                5 => pos += 4,
+                other => panic!("unexpected wire type {other} in BlobHeader"),
+            }
+        }
+        (datasize, has_tagdata)
+    }
+
+    let bytes = std::fs::read(path).expect("read pbf");
+    let mut pos = 0usize;
+    let mut count = 0usize;
+    while pos + 4 <= bytes.len() {
+        let header_len =
+            u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                as usize;
+        let hstart = pos + 4;
+        let hend = hstart + header_len;
+        assert!(
+            hend <= bytes.len(),
+            "truncated BlobHeader in {}",
+            path.display()
+        );
+        let (datasize, has_tagdata) = scan_header(&bytes[hstart..hend]);
+        if has_tagdata {
+            count += 1;
+        }
+        pos = hend + datasize;
+    }
+    count
+}
+
+/// Assert that *no* blob in the PBF carries tagdata, walking every blob
+/// frame rather than trusting the first. Strengthens [`assert_no_tagdata`]
+/// for `--strip-tagdata` output: a stripper that only cleared the first
+/// blob's tagdata would pass the O(1) first-blob probe but fail here.
+pub fn assert_no_tagdata_all_blobs(path: &Path) {
+    let n = count_tagdata_blobs(path);
+    assert_eq!(
+        n,
+        0,
+        "expected no blob in {} to carry tagdata, but {n} still do",
+        path.display()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // PBF header reading
 // ---------------------------------------------------------------------------

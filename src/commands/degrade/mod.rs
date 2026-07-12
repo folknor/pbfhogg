@@ -3,16 +3,21 @@
 //! code paths that require less-optimised inputs (unsorted, missing
 //! indexdata, scattered coords).
 //!
-//! v1 transformations: `--unsort`, `--unsort-intra`, `--strip-locations`,
-//! `--strip-indexdata`. Flags compose (except the two unsort modes, which
-//! are mutually exclusive).
+//! Transformations: `--unsort`, `--unsort-intra`, `--strip-locations`,
+//! `--strip-indexdata`, `--strip-tagdata`. Flags compose (except the two
+//! unsort modes, which are mutually exclusive).
 //!
 //! Implementation paths:
 //!
-//! - Pure passthrough (only `--strip-indexdata`): raw blob frames are
-//!   reframed with a cleared `BlobHeader.indexdata` field. Blob bytes
-//!   are bit-identical; only the header changes. Mirrors `cat`'s
-//!   passthrough but drops the index instead of adding one.
+//! - Pure passthrough (`--strip-indexdata` and/or `--strip-tagdata` with
+//!   no unsort/strip-locations): raw blob frames are reframed by copying
+//!   the original `BlobHeader` through byte-for-byte and clearing only the
+//!   targeted field(s) - `indexdata` (field 2) and/or `tagdata` (field 4).
+//!   Every other header field is preserved verbatim: the untouched hint's
+//!   original bytes (a v1 index stays v1), `WayMembers-v1` (field 5), and
+//!   any unknown/extension fields. Blob bytes are bit-identical; only the
+//!   targeted header field changes. Mirrors `cat`'s passthrough but drops
+//!   header hints instead of adding them.
 //! - Decode path (either unsort mode and/or `--strip-locations`): three
 //!   sequential per-kind phases driven by `parallel_classify_phase`.
 //!   Workers decode one input blob, filter to the current kind, and
@@ -68,7 +73,7 @@ use crate::owned::{
     read_dense_node, read_node, read_relation, read_way,
 };
 use crate::read::raw_frame::read_raw_frame;
-use crate::writer::{Compression, PbfWriter, encode_blob_header_into, frame_blob_pipelined};
+use crate::writer::{Compression, PbfWriter, frame_blob_pipelined, strip_blob_header_fields};
 use crate::{Element, ElementReader};
 
 /// Default per-block element cap. Matches the `BlockBuilder` default and
@@ -93,15 +98,25 @@ pub struct DegradeFlags {
     pub unsort_intra: bool,
     pub strip_locations: bool,
     pub strip_indexdata: bool,
+    /// Clear the per-blob `BlobHeader.tagdata` (field 4) tag key index so
+    /// `tags-filter`'s no-hint fallback path is exercised. Like
+    /// `--strip-indexdata` it is a header-only change, so it composes with
+    /// the passthrough path and leaves `indexdata` alone.
+    pub strip_tagdata: bool,
 }
 
 impl DegradeFlags {
     pub fn any(self) -> bool {
-        self.unsort || self.unsort_intra || self.strip_locations || self.strip_indexdata
+        self.unsort
+            || self.unsort_intra
+            || self.strip_locations
+            || self.strip_indexdata
+            || self.strip_tagdata
     }
 
-    /// Returns `true` if elements must be decoded and re-encoded. Only
-    /// `--strip-indexdata` alone can run as a pure blob-level passthrough.
+    /// Returns `true` if elements must be decoded and re-encoded. Only the
+    /// header-only strips (`--strip-indexdata` / `--strip-tagdata`, alone or
+    /// together) can run as a pure blob-level passthrough.
     fn needs_decode(self) -> bool {
         self.unsort || self.unsort_intra || self.strip_locations
     }
@@ -147,6 +162,9 @@ impl DegradeStats {
         if self.flags.strip_indexdata {
             applied.push("--strip-indexdata");
         }
+        if self.flags.strip_tagdata {
+            applied.push("--strip-tagdata");
+        }
         eprintln!(
             "Degraded {} elements across {} blobs (applied: {})",
             self.elements_written,
@@ -180,7 +198,8 @@ pub fn degrade(
 ) -> Result<DegradeStats> {
     if !flags.any() {
         return Err("degrade requires at least one transformation flag \
-                    (--unsort, --unsort-intra, --strip-locations, --strip-indexdata)"
+                    (--unsort, --unsort-intra, --strip-locations, \
+                     --strip-indexdata, --strip-tagdata)"
             .into());
     }
     if flags.unsort && flags.unsort_intra {
@@ -214,6 +233,7 @@ pub fn degrade(
         crate::debug::emit_counter("degrade_unsort_intra", i64::from(flags.unsort_intra));
         crate::debug::emit_counter("degrade_strip_locations", i64::from(flags.strip_locations));
         crate::debug::emit_counter("degrade_strip_indexdata", i64::from(flags.strip_indexdata));
+        crate::debug::emit_counter("degrade_strip_tagdata", i64::from(flags.strip_tagdata));
         crate::debug::emit_counter("degrade_block_cap", block_cap as i64);
     }
 
@@ -230,9 +250,10 @@ pub fn degrade(
             overrides,
         )?
     } else {
-        degrade_passthrough_strip_indexdata(
+        degrade_passthrough(
             input,
             output,
+            flags,
             compression,
             direct_io,
             io_uring,
@@ -250,20 +271,30 @@ pub fn degrade(
 }
 
 // ---------------------------------------------------------------------------
-// Passthrough: --strip-indexdata only
+// Passthrough: --strip-indexdata and/or --strip-tagdata only
 // ---------------------------------------------------------------------------
 
-/// Raw blob frame iteration with cleared `BlobHeader.indexdata`.
+/// Raw blob frame iteration that clears the requested header-only fields
+/// (`BlobHeader.indexdata` and/or `tagdata`) while preserving every other
+/// header field and the entire blob payload byte-for-byte.
 ///
-/// Blob payload bytes are forwarded verbatim - inline `LocationsOnWays`
-/// coordinates, sortedness, and every element-level property pass through
-/// unchanged. The output's `LocationsOnWays` and `Sort.Type_then_ID`
-/// header features are preserved when the input declared them, since the
-/// blob bytes still encode that data.
+/// Each output `BlobHeader` is the input header with only the targeted
+/// field(s) removed - so the untargeted hint keeps its exact original bytes
+/// (a v1 index is never upgraded to v2, an undeserializable index is never
+/// dropped), and `WayMembers-v1` (field 5) plus any unknown/extension fields
+/// carry through unchanged. Blob payload bytes are forwarded verbatim -
+/// inline `LocationsOnWays` coordinates, sortedness, and every element-level
+/// property pass through unchanged. The output's `LocationsOnWays` and
+/// `Sort.Type_then_ID` header features are preserved when the input declared
+/// them, since the blob bytes still encode that data. `indexdata` survives
+/// unless `--strip-indexdata` is set; `tagdata` survives unless
+/// `--strip-tagdata` is set - so `--strip-tagdata` alone yields a still-indexed
+/// file.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn degrade_passthrough_strip_indexdata(
+fn degrade_passthrough(
     input: &Path,
     output: &Path,
+    flags: DegradeFlags,
     compression: Compression,
     direct_io: bool,
     io_uring: bool,
@@ -293,9 +324,18 @@ fn degrade_passthrough_strip_indexdata(
         match &frame.blob_type {
             BlobKind::OsmHeader => {}
             BlobKind::OsmData => {
-                let blob_bytes = frame.blob_bytes();
-                let tagdata = frame.tagdata.as_deref();
-                let reframed = reframe_raw_without_index(blob_bytes, tagdata)?;
+                // Preserve every original BlobHeader field verbatim and clear
+                // only the field(s) the active strip flags target. Working
+                // from the original header bytes (not parsed values) keeps the
+                // untouched indexdata byte-identical - a v1 index stays v1 -
+                // and carries WayMembers-v1 and any unknown header fields
+                // through unchanged.
+                let reframed = reframe_raw(
+                    frame.header_bytes(),
+                    frame.blob_bytes(),
+                    flags.strip_indexdata,
+                    flags.strip_tagdata,
+                )?;
                 writer.write_raw_owned(reframed)?;
                 blobs_written += 1;
             }
@@ -311,30 +351,34 @@ fn degrade_passthrough_strip_indexdata(
     Ok(DegradeStats {
         blobs_written,
         elements_written: 0,
-        flags: DegradeFlags {
-            unsort: false,
-            unsort_intra: false,
-            strip_locations: false,
-            strip_indexdata: true,
-        },
+        flags,
     })
 }
 
-/// Reframe a raw OSMData blob with a `BlobHeader` that omits the
-/// `indexdata` field. `tagdata` is preserved (a separate flag will strip
-/// it; v1 only targets indexdata).
-fn reframe_raw_without_index(
+/// Reframe a raw OSMData blob, re-emitting its original `BlobHeader` with only
+/// the flagged hint fields removed - `indexdata` (field 2) under
+/// `strip_indexdata`, `tagdata` (field 4) under `strip_tagdata`. Every other
+/// header field is copied through byte-for-byte via `strip_blob_header_fields`,
+/// so the preserved `indexdata` keeps its exact on-wire form (a 26-byte v1
+/// index is never upgraded to the 42-byte v2 layout), and `WayMembers-v1`
+/// (field 5) plus any unknown/extension fields survive untouched. The blob
+/// payload bytes - and therefore the preserved `datasize` (field 3) - are
+/// copied verbatim.
+fn reframe_raw(
+    header_bytes: &[u8],
     blob_bytes: &[u8],
-    tagdata: Option<&[u8]>,
+    strip_indexdata: bool,
+    strip_tagdata: bool,
 ) -> std::io::Result<Vec<u8>> {
-    let datasize = i32::try_from(blob_bytes.len()).map_err(|_| {
-        std::io::Error::other(format!(
-            "blob datasize overflow: {} bytes",
-            blob_bytes.len()
-        ))
-    })?;
+    let mut strip_fields: Vec<u32> = Vec::with_capacity(2);
+    if strip_indexdata {
+        strip_fields.push(2);
+    }
+    if strip_tagdata {
+        strip_fields.push(4);
+    }
     let mut header_buf = Vec::new();
-    encode_blob_header_into("OSMData", datasize, None, tagdata, None, &mut header_buf)?;
+    strip_blob_header_fields(header_bytes, &strip_fields, &mut header_buf)?;
     let header_len = u32::try_from(header_buf.len()).map_err(|_| {
         std::io::Error::other(format!("header too large: {} bytes", header_buf.len()))
     })?;
@@ -347,7 +391,7 @@ fn reframe_raw_without_index(
 }
 
 // ---------------------------------------------------------------------------
-// Decode path: --unsort / --unsort-intra and/or --strip-locations (with optional --strip-indexdata)
+// Decode path: --unsort / --unsort-intra and/or --strip-locations (with optional --strip-indexdata / --strip-tagdata)
 // ---------------------------------------------------------------------------
 
 /// Trailing-partial payload: 0 to `cap-1` elements that didn't fill a
@@ -648,6 +692,7 @@ fn run_kind_phase(
                             compression,
                             writer,
                             flags.strip_indexdata,
+                            flags.strip_tagdata,
                         ) {
                             Ok(written) => blobs += written,
                             Err(e) => {
@@ -686,7 +731,13 @@ fn run_kind_phase(
                 pending.append(&mut output);
                 while pending.len() >= FRAME_BATCH {
                     let batch: Vec<OwnedBlock> = pending.drain(..FRAME_BATCH).collect();
-                    match frame_and_write_batch(batch, compression, writer, flags.strip_indexdata) {
+                    match frame_and_write_batch(
+                        batch,
+                        compression,
+                        writer,
+                        flags.strip_indexdata,
+                        flags.strip_tagdata,
+                    ) {
                         Ok(written) => blobs += written,
                         Err(e) => {
                             write_error = Some(e);
@@ -719,8 +770,13 @@ fn run_kind_phase(
     pending.append(&mut output);
     if !pending.is_empty() {
         let final_batch = std::mem::take(&mut pending);
-        let written =
-            frame_and_write_batch(final_batch, compression, writer, flags.strip_indexdata)?;
+        let written = frame_and_write_batch(
+            final_batch,
+            compression,
+            writer,
+            flags.strip_indexdata,
+            flags.strip_tagdata,
+        )?;
         blobs += written;
     }
 
@@ -844,6 +900,7 @@ fn worker_decode_kind(
                     owned_block,
                     compression,
                     flags.strip_indexdata,
+                    flags.strip_tagdata,
                 )?);
             }
         } else {
@@ -865,6 +922,7 @@ fn worker_decode_kind(
             owned_block,
             compression,
             flags.strip_indexdata,
+            flags.strip_tagdata,
         )?);
     }
 
@@ -981,6 +1039,7 @@ fn frame_owned(
     owned: OwnedBlock,
     compression: &Compression,
     strip_indexdata: bool,
+    strip_tagdata: bool,
 ) -> std::result::Result<Vec<u8>, String> {
     let OwnedBlock {
         bytes: block_bytes,
@@ -994,11 +1053,16 @@ fn frame_owned(
     } else {
         Some(indexdata_buf.as_slice())
     };
+    let tagdata = if strip_tagdata {
+        None
+    } else {
+        tagdata.as_deref()
+    };
     let blob = frame_blob_pipelined(
         &block_bytes,
         compression,
         indexdata,
-        tagdata.as_deref(),
+        tagdata,
         way_members.as_deref(),
     )
     .map_err(|e| e.to_string())?;
@@ -1011,6 +1075,7 @@ fn frame_and_write_batch(
     compression: Compression,
     writer: &mut PbfWriter<FileWriter>,
     strip_indexdata: bool,
+    strip_tagdata: bool,
 ) -> std::result::Result<u64, Box<dyn std::error::Error>> {
     use rayon::prelude::*;
 
@@ -1030,11 +1095,16 @@ fn frame_and_write_batch(
                 } else {
                     Some(indexdata_buf.as_slice())
                 };
+                let tagdata = if strip_tagdata {
+                    None
+                } else {
+                    tagdata.as_deref()
+                };
                 let blob = frame_blob_pipelined(
                     &block_bytes,
                     &compression,
                     indexdata,
-                    tagdata.as_deref(),
+                    tagdata,
                     way_members.as_deref(),
                 )?;
                 Ok(blob.into_vec())

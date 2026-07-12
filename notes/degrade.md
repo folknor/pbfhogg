@@ -19,6 +19,7 @@ pbfhogg degrade <input> -o <output> [--unsort]
                                      [--unsort-intra]
                                      [--strip-locations]
                                      [--strip-indexdata]
+                                     [--strip-tagdata]
                                      [--force]
                                      [--compression C]
                                      [--direct-io] [--io-uring]
@@ -43,15 +44,28 @@ includes every blob, so each blob is decoded by each phase).
 The implementation picks one of two paths up front based on the flag
 combination:
 
-- **Pure passthrough** (`--strip-indexdata` alone): raw blob frames
-  are iterated via `read_raw_frame`, the `BlobHeader.indexdata` field
-  is cleared, the rest of the frame (compressed Blob payload + any
-  `tagdata`) is forwarded verbatim. Sortedness, `LocationsOnWays`
-  inline coordinates, and every element-level property pass through
-  unchanged because the blob bytes are not touched. Accepts
-  non-indexed input (no precondition).
+- **Pure passthrough** (`--strip-indexdata` and/or `--strip-tagdata`,
+  with no unsort/strip-locations): raw blob frames are iterated via
+  `read_raw_frame`, and each output `BlobHeader` is the *original*
+  header copied through field-by-field with only the targeted hint
+  field(s) omitted - `indexdata` (field 2) under `--strip-indexdata`,
+  `tagdata` (field 4) under `--strip-tagdata`. This surgical wire-level
+  omission (`strip_blob_header_fields`) preserves every other header
+  field byte-for-byte: the untargeted hint keeps its exact original
+  bytes (a 26-byte v1 index stays v1, never upgraded to the 42-byte v2
+  layout, and an index that fails to deserialize is kept rather than
+  dropped), and `pbfhogg.WayMembers-v1` (field 5) plus any
+  unknown/extension fields survive untouched. The compressed Blob
+  payload is copied byte-for-byte, so the preserved `datasize` (field 3)
+  stays consistent. Sortedness, `LocationsOnWays` inline coordinates,
+  and every element-level property pass through unchanged because the
+  blob bytes are not touched. Accepts non-indexed input (no
+  precondition). `--strip-tagdata` alone therefore yields a still-sorted,
+  still-indexed file that only lacks the per-blob tag key index.
 - **Decode path** (any flag set involving `--unsort` or
-  `--strip-locations`): three sequential per-kind phases driven by
+  `--strip-locations`; `--strip-indexdata` / `--strip-tagdata` ride
+  along as `indexdata=None` / `tagdata=None` on the framing call):
+  three sequential per-kind phases driven by
   [`parallel_classify_phase`](../src/scan/classify.rs), mirroring
   [`repack`](../src/commands/repack/mod.rs). For each kind in
   `nodes -> ways -> relations`: workers decode one input blob,
@@ -165,16 +179,40 @@ because the loss is the explicit goal.
 
 #### `--strip-indexdata`
 
-Clears the `BlobHeader.indexdata` field on every OsmData blob.
-`tagdata` is preserved (`--strip-tagdata` is a separate, deferred
-flag). On the passthrough path the blob payload is not decompressed;
-on the decode path the framing call passes `indexdata=None`.
+Clears the `BlobHeader.indexdata` field (field 2) on every OsmData
+blob. `tagdata` is preserved unless `--strip-tagdata` is also set. On
+the passthrough path the blob payload is not decompressed and every
+other header field (including `tagdata`, `WayMembers-v1`, and any
+unknown fields) is copied through byte-for-byte; on the decode path
+the framing call passes `indexdata=None`.
+
+#### `--strip-tagdata`
+
+Clears the `BlobHeader.tagdata` field (field 4, the per-blob tag key
+index) on every OsmData blob, forcing `tags-filter`'s no-hint fallback
+path. Exact structural mirror of `--strip-indexdata` for a different
+header field: `indexdata` is preserved unless `--strip-indexdata` is
+also set, so a tagdata-stripped file is still indexed (and its index
+keeps its exact original bytes - a v1 index is not upgraded to v2). On
+the passthrough path the blob payload is not decompressed and only the
+targeted field is dropped, every other header field (indexdata,
+`WayMembers-v1`, unknown fields) passing through byte-for-byte; on the
+decode path the framing call passes `tagdata=None`
+in both `frame_owned` (worker full blocks) and `frame_and_write_batch`
+(merge-thread tail). Composes with every other flag, and alone is
+passthrough-eligible (does not force a decode).
 
 ### What v1 preserves
 
 On the passthrough path: every blob payload byte (including LOW
 inline coords), all element-level properties, the `Sort.Type_then_ID`
-header flag, and `LocationsOnWays` when the input declared them.
+header flag, and `LocationsOnWays` when the input declared them. Every
+`BlobHeader` field is copied through verbatim except the one(s) the
+active strip flags target - so the `indexdata` and `tagdata` hints are
+each preserved unless their own strip flag is set (and when preserved,
+their exact original bytes survive: a v1 index stays v1), and
+`pbfhogg.WayMembers-v1` (field 5) plus any unknown/extension header
+fields always pass through unchanged.
 
 On the decode path: element IDs, tags, refs, members, OsmMetadata,
 DenseNode encoding. `Sort.Type_then_ID` is preserved unless `--unsort`
@@ -230,6 +268,23 @@ the deferred-optimization motivation in
   preserved; element multiset round-trips.
 - `degrade_strip_locations_clears_low_and_preserves_elements` -
   output header has no `LocationsOnWays`; element data round-trips.
+- `degrade_strip_tagdata_drops_tagdata` - *no* OsmData blob carries
+  tagdata (`assert_no_tagdata_all_blobs` walks every blob, not just the
+  first); indexdata, sortedness, and the element multiset are all
+  preserved (passthrough path). Asserts a precondition
+  (`count_tagdata_blobs(input) > 1`) that the fixture carried tagdata in
+  more than one blob so the whole-file strip assertion is meaningful.
+  The fixture tags nodes in two node blobs plus a way and a relation.
+- `strip_blob_header_fields_preserves_untargeted_fields_verbatim`
+  (unit test, `src/write/framing.rs`) - pins the passthrough
+  field-preservation contract directly on the helper: stripping field 4
+  (or field 2, or both) drops only the targeted field and copies every
+  other field byte-for-byte, including a hand-built 26-byte v1 index
+  (stays v1), a `WayMembers-v1` payload (field 5), and an unknown
+  extension field. This is the regression pin for the two Medium review
+  findings; a full end-to-end PBF `WayMembers` fixture would need the
+  altw inject-prepass pipeline, so the invariant is pinned at the
+  helper level where a `WayMembers` payload is just bytes.
 - `degrade_unsort_creates_adjacent_overlap_per_kind` - output header
   has no `Sort.Type_then_ID`; each kind has exactly one adjacent
   same-kind blob pair with overlapping ID ranges and zero intra-blob
@@ -257,6 +312,15 @@ the deferred-optimization motivation in
   keeps its blob shape while `LocationsOnWays` is cleared.
 - `degrade_unsort_intra_and_strip_indexdata_compose` - intra-blob
   unsorted *and* unindexed.
+- `degrade_strip_tagdata_and_strip_indexdata_compose` - passthrough
+  path clears both header hints; payload and sortedness survive.
+- `degrade_unsort_and_strip_tagdata_compose` - decode path: exercises
+  the `frame_and_write_batch` `tagdata=None` path (merge thread) while
+  the stream is unsorted.
+- `degrade_strip_locations_and_strip_tagdata_compose` - decode path
+  with `--block-cap 10` against 20-element input blobs so workers
+  pre-frame full blocks: exercises the `frame_owned` `tagdata=None`
+  path while `LocationsOnWays` is cleared.
 - `degrade_requires_at_least_one_flag` - validation: no flags is a
   hard error.
 - `degrade_rejects_zero_block_cap` - validation: `--block-cap 0`
@@ -310,20 +374,8 @@ overlap-rewrite correctness gate.
 The deferred transformations from the design doc, ordered by likely
 demand. Pick them up as benchmarking work surfaces consumers.
 
-### v2.1 - `--strip-tagdata`
-
-**Goal:** clear the per-blob tagdata index (`BlobHeader` field 4) on
-OsmData blobs, forcing `tags-filter`'s no-hint fallback path.
-
-**Sketch:** mirrors `--strip-indexdata` exactly. On the passthrough
-path, the existing `reframe_raw_without_index` already passes tagdata
-through; a sibling helper would pass `tagdata=None`. On the decode
-path, the framing call already takes a tagdata argument; default it
-to `None` when the flag is set. Composes with everything.
-
-**Tests:** `--strip-tagdata` clears tagdata on every blob;
-`tags-filter` on the degraded output still produces correct results,
-just slower (hits the no-hint path).
+(v2.1 `--strip-tagdata` shipped - see the transformations and test
+inventory above.)
 
 ### v2.2 - `--strip-bbox`
 
@@ -479,7 +531,9 @@ other consumers.
 - [`src/write/block_builder.rs`](../src/write/block_builder.rs) -
   `BlockBuilder`; element-level transformations re-emit through it.
 - [`src/write/framing.rs`](../src/write/framing.rs) -
-  `frame_blob_pipelined` and `encode_blob_header_into`; the
-  decode-path flush goes through these directly when
-  `--strip-indexdata` composes, bypassing the indexdata-embedding
-  `write_primitive_block_owned` path.
+  `frame_blob_pipelined` and `encode_blob_header_into` (decode path),
+  and `strip_blob_header_fields`, the surgical wire-level field-omission
+  helper the passthrough path uses to preserve every untargeted
+  `BlobHeader` field byte-for-byte. The decode-path flush goes through
+  the framing helpers directly when `--strip-indexdata` composes,
+  bypassing the indexdata-embedding `write_primitive_block_owned` path.

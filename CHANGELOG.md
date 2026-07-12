@@ -59,6 +59,24 @@
 
 ### Fixed
 
+- **`repack` no longer emits non-monotonic elements across blob
+  boundaries.** When the target cap was smaller than the input's per-blob
+  element count (a shrink), the merge thread wrote worker "full" blocks
+  directly while routing the central builder's coalesced tail-blocks
+  through a delayed buffer, so an earlier input blob's lower-ID tail could
+  land after a later blob's higher-ID full block. The output then violated
+  the `Sort.Type_then_ID` ordering its own header still advertised, which
+  broke downstream consumers that trust the sorted flag (sort fast path,
+  streaming diff) - and `--as-snapshot` promoted the mis-ordered file into
+  the dataset graph. The merge thread now drains the central stream before
+  each run of direct full-block writes, restoring global order. Pure grows
+  (cap larger than every input blob) were never affected and their
+  cross-blob coalescing is unchanged. Trade: on a coalescing shrink the
+  output blob count now depends on the input-blob boundaries rather than
+  being exactly `ceil(elements / cap)` - each input blob whose element
+  count is not a multiple of the cap emits its tail as its own
+  possibly-under-cap block instead of packing tails across boundaries.
+
 - **Oversized declared `BlobHeader.datasize` is now rejected before
   allocation.** The read path capped only the *decompressed* blob content
   (32 MiB), so a hostile or corrupt `datasize` could drive the

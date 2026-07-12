@@ -64,12 +64,20 @@ fn elements_per_blob(path: &Path) -> Vec<(usize, usize, usize)> {
 /// packed at 20 elements/blob. Yields 3 node blobs + 1 way blob + 1
 /// relation blob = 5 OsmData blobs in the input.
 ///
-/// Sizes chosen so input blob size (20) is an exact multiple of the
-/// shrink-test cap (10), making per-kind output blob count match the
-/// `ceil(elements / cap)` prediction without per-worker fragmentation
-/// fudge factors. v1's per-worker cap means a non-multiple input blob
-/// size would produce extra partial output blobs at each input-blob
-/// boundary.
+/// Sizes chosen so the multi-blob kind (nodes) has an input blob size
+/// (20) that is an exact multiple of the shrink-test cap (10). Exact
+/// division means each input blob's `M % cap` tail is zero, so the
+/// merge-thread ordering guard (drain-before-direct-write) never fires
+/// and never splits a tail into its own under-cap block. That is what
+/// keeps the per-kind output blob count equal to `ceil(elements / cap)`
+/// for this fixture (see `repack_blob_count_matches_prediction`). The
+/// ceil identity is NOT general: on a shrink where the cap does not
+/// divide the per-input-blob element count, the guard flushes each input
+/// blob's tail as its own possibly-under-cap block, so the output blob
+/// count depends on the input-blob boundaries and can exceed
+/// `ceil(elements / cap)`. Ways (12) and relations (3) each occupy a
+/// single input blob, so even their non-dividing tails cannot cross an
+/// input-blob boundary and the ceil count still holds for them here.
 fn write_repack_fixture(path: &Path) -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>) {
     let mut nodes = generate_nodes(60, 1);
     nodes[0].tags = vec![("place", "city"), ("name", "Origo")];
@@ -130,9 +138,20 @@ fn repack_respects_element_cap() {
 
 /// Output blob count tracks the cap-prediction for each kind on shrinks.
 /// 60 nodes / cap 10 = 6 node blobs. 12 ways / cap 10 = 2 blobs (1 full +
-/// 1 partial of 2). 3 relations / cap 10 = 1 partial. v2.1's central-
-/// builder-per-kind makes the prediction `ceil(elements / cap)`
-/// regardless of the input blob layout (no per-input-blob fragmentation).
+/// 1 partial of 2). 3 relations / cap 10 = 1 partial.
+///
+/// This test still passes under the merge-thread ordering guard only
+/// because the fixture divides evenly: the multi-blob kind (nodes) has
+/// input blobs of 20 and cap 10 divides 20, so every input blob's tail is
+/// empty and the guard never fires - there is no per-input-blob
+/// fragmentation to inflate the count. Ways and relations each fit in a
+/// single input blob, so their (non-dividing) tails also cannot cross an
+/// input-blob boundary. The `ceil(elements / cap)` identity therefore
+/// holds here but is NOT general: whenever the cap fails to divide the
+/// per-input-blob element count on a multi-blob shrink, the guard emits
+/// each input blob's tail as its own under-cap block and the output blob
+/// count grows with the number of input blobs (accepted trade - see
+/// `notes/repack.md`).
 #[test]
 fn repack_blob_count_matches_prediction() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -317,4 +336,320 @@ fn repack_no_warning_when_cap_fires() {
         !stderr.contains("never fired"),
         "no-op-cap warning should not fire on a real shrink; stderr was:\n{stderr}"
     );
+}
+
+/// Collect element IDs of one kind in output order: blob by blob (as
+/// written), and within each blob in stored element order. This preserves
+/// the physical order a streaming consumer sees, so a monotonicity check
+/// over it detects the Sort.Type_then_ID lie that a reordered output
+/// commits. `read_normalized` deliberately canonicalizes order and so
+/// cannot see the violation; this raw walk can.
+fn relation_ids_in_output_order(path: &Path) -> Vec<i64> {
+    let reader = BlobReader::from_path(path).expect("open pbf");
+    let mut ids = Vec::new();
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") {
+            for element in block.elements() {
+                if let Element::Relation(r) = element {
+                    ids.push(r.id());
+                }
+            }
+        }
+    }
+    ids
+}
+
+/// Regression for the cross-blob non-monotonicity bug (TODO, 2026-07-12):
+/// repack wrote worker "full" blocks directly in seq order while the
+/// central builder's coalesced tail-blocks were emitted through a delayed
+/// buffer, so an earlier input blob's low-ID tail could land AFTER a later
+/// blob's higher-ID full block - producing output that violates the
+/// Sort.Type_then_ID ordering its own header still claims.
+///
+/// The repro needs relation input blobs LARGER than the target cap so the
+/// worker splits each blob into a direct full block (low IDs) plus a
+/// trailing tail (high IDs) that the central builder must carry across the
+/// input-blob boundary. Fixture: 40 relations, IDs 1..=40, packed 20 per
+/// input blob (2 relation blobs). Cap 12: each input blob yields one full
+/// block of 12 plus a tail of 8.
+///
+/// Before the fix, blob A's direct full block [1..=12] and blob B's direct
+/// full block [21..=32] were written first, and the coalesced tails
+/// ([13..=20] merged with [33..=36], then [37..=40]) were flushed only at
+/// the end - so ID 13 followed ID 32 in the output stream. After the fix
+/// the drain guard flushes blob A's tail before blob B's full block, so
+/// the output is globally [1..=12], [13..=20], [21..=32], [33..=40] and
+/// strictly increasing. The element multiset is preserved either way, so
+/// this ordering assertion is what pins the bug.
+#[test]
+fn repack_output_is_monotonic_across_coalesced_blob_boundaries() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    // A few nodes/ways keep the fixture a well-formed multi-kind PBF; the
+    // 40 relations across two 20-element input blobs are what force the
+    // cross-boundary coalescing with interleaved full blocks.
+    let nodes = generate_nodes(5, 1);
+    let ways = generate_ways(5, 1, 3, 1);
+    let rels = generate_relations(40, 1, 2, 1);
+    write_multi_block_test_pbf(&input, &nodes, &ways, &rels, 20);
+    assert!(read_header(&input).is_sorted(), "fixture must be sorted");
+
+    // Cap 12 < input relation blob size 20: every relation input blob
+    // splits into a direct full block plus a coalescing tail.
+    run_repack(&input, &output, 12);
+
+    // Header still claims Sort.Type_then_ID; the body must not lie about it.
+    assert!(
+        read_header(&output).is_sorted(),
+        "output dropped Sort.Type_then_ID"
+    );
+
+    // Element multiset is preserved (guards against the ordering fix
+    // dropping or duplicating relations).
+    let original = read_normalized(&input);
+    let repacked = read_normalized(&output);
+    assert_eq!(original.relations, repacked.relations);
+
+    let ids = relation_ids_in_output_order(&output);
+    assert_eq!(ids.len(), 40, "expected all 40 relations in the output");
+    for pair in ids.windows(2) {
+        assert!(
+            pair[1] > pair[0],
+            "relation IDs are non-monotonic in output order: {} follows {} \
+             (output violates the Sort.Type_then_ID it claims). full ID \
+             sequence: {ids:?}",
+            pair[1],
+            pair[0],
+        );
+    }
+}
+
+/// Collect node, way, and relation IDs in physical output order (blob by
+/// blob, element order within blob) as three separate vecs. Generalizes
+/// `relation_ids_in_output_order` to the other two kinds so the
+/// cross-kind monotonicity tests can walk the raw stream a consumer sees;
+/// `read_normalized` canonicalizes order and cannot detect the ordering
+/// lie these tests target.
+fn ids_in_output_order(path: &Path) -> (Vec<i64>, Vec<i64>, Vec<i64>) {
+    let reader = BlobReader::from_path(path).expect("open pbf");
+    let mut nodes = Vec::new();
+    let mut ways = Vec::new();
+    let mut rels = Vec::new();
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") {
+            for element in block.elements() {
+                match element {
+                    Element::Node(n) => nodes.push(n.id()),
+                    Element::DenseNode(dn) => nodes.push(dn.id()),
+                    Element::Way(w) => ways.push(w.id()),
+                    Element::Relation(r) => rels.push(r.id()),
+                    _ => {}
+                }
+            }
+        }
+    }
+    (nodes, ways, rels)
+}
+
+/// Assert `ids` is strictly increasing, panicking with the offending pair
+/// and the full sequence on the first inversion. `kind` names the element
+/// type for the message.
+fn assert_strictly_increasing(ids: &[i64], kind: &str) {
+    for pair in ids.windows(2) {
+        assert!(
+            pair[1] > pair[0],
+            "{kind} IDs are non-monotonic in output order: {} follows {} \
+             (output violates the Sort.Type_then_ID it claims). full ID \
+             sequence: {ids:?}",
+            pair[1],
+            pair[0],
+        );
+    }
+}
+
+/// Cross-kind coverage for the ordering fix (companion to the relation-only
+/// `repack_output_is_monotonic_across_coalesced_blob_boundaries`). Nodes
+/// (dense) and ways run through the same two-stream merge path - worker full
+/// blocks written directly, coalesced tails routed through the central
+/// builder - so they were equally exposed to the pre-fix reordering.
+///
+/// Fixture: 40 nodes and 40 ways, each laid out as two 20-element input
+/// blobs, cap 12. Every input blob splits into a direct full block of 12
+/// (low IDs) plus an 8-element coalescing tail (high IDs), so blob B's
+/// direct full block would land before blob A's tail without the drain
+/// guard - non-monotonic for both kinds. The relations are incidental (one
+/// small blob) and only keep the fixture a well-formed multi-kind PBF.
+#[test]
+fn repack_output_is_monotonic_for_nodes_and_ways() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    let nodes = generate_nodes(40, 1);
+    let ways = generate_ways(40, 1, 3, 1);
+    let rels = generate_relations(3, 1, 2, 1);
+    write_multi_block_test_pbf(&input, &nodes, &ways, &rels, 20);
+    assert!(read_header(&input).is_sorted(), "fixture must be sorted");
+
+    run_repack(&input, &output, 12);
+
+    assert!(
+        read_header(&output).is_sorted(),
+        "output dropped Sort.Type_then_ID"
+    );
+
+    // Multiset preserved (guards against the ordering path dropping or
+    // duplicating elements of either kind).
+    let original = read_normalized(&input);
+    let repacked = read_normalized(&output);
+    assert_eq!(original.nodes, repacked.nodes);
+    assert_eq!(original.ways, repacked.ways);
+
+    let (node_ids, way_ids, _) = ids_in_output_order(&output);
+    assert_eq!(node_ids.len(), 40, "expected all 40 nodes in the output");
+    assert_eq!(way_ids.len(), 40, "expected all 40 ways in the output");
+    assert_strictly_increasing(&node_ids, "node");
+    assert_strictly_increasing(&way_ids, "way");
+}
+
+/// Write a sorted, indexed multi-blob PBF whose relation section is split
+/// into consecutive input blobs of the given sizes (in order); nodes and
+/// ways each occupy a single blob. `write_multi_block_test_pbf` applies one
+/// uniform block size to every kind and so cannot place several small
+/// all-tail relation blobs ahead of a larger full-block-bearing one - the
+/// layout the pending-prepopulated guard test needs. Sync-writer blobs
+/// carry indexdata (`write_primitive_block` scans block IDs), so repack's
+/// indexdata requirement is satisfied. Allowlist-only (block_builder +
+/// writer).
+fn write_pbf_with_relation_blob_sizes(
+    path: &Path,
+    nodes: &[TestNode],
+    ways: &[TestWay],
+    relations: &[TestRelation],
+    rel_blob_sizes: &[usize],
+) {
+    use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
+    use pbfhogg::writer::{Compression, PbfWriter};
+
+    let total: usize = rel_blob_sizes.iter().sum();
+    assert_eq!(
+        total,
+        relations.len(),
+        "rel_blob_sizes must sum to the relation count"
+    );
+
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .sorted()
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+
+    // Nodes: one blob.
+    for n in nodes {
+        bb.add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), None);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    // Ways: one blob.
+    for w in ways {
+        bb.add_way(w.id, w.tags.iter().copied(), &w.refs, None);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    // Relations: one blob per requested size, in order.
+    let mut idx = 0usize;
+    for &sz in rel_blob_sizes {
+        for r in &relations[idx..idx + sz] {
+            let members: Vec<MemberData<'_>> = r
+                .members
+                .iter()
+                .map(|m| MemberData {
+                    id: m.id,
+                    role: m.role,
+                })
+                .collect();
+            bb.add_relation(r.id, r.tags.iter().copied(), &members, None);
+        }
+        idx += sz;
+        if let Some(bytes) = bb.take().expect("take") {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+    }
+
+    writer.flush().expect("flush");
+}
+
+/// Pins the ordering guard firing while the central-builder `pending`
+/// buffer is ALREADY non-empty at guard entry - the path the relation-only
+/// regression test never reaches (there the guard always enters with
+/// `pending` empty and fires solely because `bb` holds the prior blob's
+/// tail).
+///
+/// Layout: relation input blobs of sizes 5, 5, 5, 15 (30 relations, IDs
+/// 1..=30), cap 12. The three 5-element blobs are all-tail (5 < 12), so
+/// they feed the central builder without producing any direct full block
+/// or firing the guard. Their cumulative 15 relations overflow the cap
+/// once: the builder flushes a completed block (IDs 1..=12) into `pending`
+/// and retains IDs 13..=15. `pending` is now non-empty and stays that way
+/// (well under the FRAME_BATCH=32 drain threshold) when the fourth blob
+/// arrives. That blob (15 relations, IDs 16..=30) carries a direct full
+/// block of 12, so the guard fires with `pending` already holding the
+/// coalesced 1..=12 block - and must drain it (plus the retained 13..=15
+/// tail) before the direct 16..=27 write to stay ordered.
+///
+/// Before the fix the direct block 16..=27 was written first and the
+/// buffered low-ID blocks were flushed only at phase end, so ID 16
+/// preceded ID 1 in the output - non-monotonic. After the fix the guard
+/// drains 1..=12 and 13..=15 first, yielding 1..=30 in order.
+///
+/// Note: the guard's `!pending.is_empty()` disjunct here co-occurs with a
+/// non-empty `bb` (IDs 13..=15), so `bb` short-circuits the OR. The strict
+/// `bb`-empty-`pending`-non-empty state is not reachable: the block builder
+/// flushes lazily (only on overflow before an add, or an explicit flush),
+/// so every tail-consume that populates `pending` leaves `bb` holding a
+/// non-empty remainder, and the only thing that empties `bb` mid-stream is
+/// the guard itself, which then drains all of `pending`. The disjunct is
+/// therefore defensive; this test exercises the reachable pending-non-empty
+/// entry, which the existing regression does not.
+#[test]
+fn repack_output_is_monotonic_with_pending_prepopulated_at_guard() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    let nodes = generate_nodes(5, 1);
+    let ways = generate_ways(5, 1, 3, 1);
+    let rels = generate_relations(30, 1, 2, 1);
+    // Three small all-tail relation blobs (5 each) accumulate a completed
+    // block into `pending`, then a 15-element blob fires the guard.
+    write_pbf_with_relation_blob_sizes(&input, &nodes, &ways, &rels, &[5, 5, 5, 15]);
+    assert!(read_header(&input).is_sorted(), "fixture must be sorted");
+
+    run_repack(&input, &output, 12);
+
+    assert!(
+        read_header(&output).is_sorted(),
+        "output dropped Sort.Type_then_ID"
+    );
+
+    let original = read_normalized(&input);
+    let repacked = read_normalized(&output);
+    assert_eq!(original.relations, repacked.relations);
+
+    let (_, _, rel_ids) = ids_in_output_order(&output);
+    assert_eq!(rel_ids.len(), 30, "expected all 30 relations in the output");
+    assert_strictly_increasing(&rel_ids, "relation");
 }

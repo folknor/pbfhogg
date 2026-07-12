@@ -19,11 +19,16 @@
 //!
 //! The merge thread runs a single long-lived `BlockBuilder` per kind,
 //! configured with the requested cap, and consumes payloads in seq order
-//! via a `ReorderBuffer`. Per input blob it writes the worker's full
-//! framed blocks directly, then feeds the trailing `Owned*` slice into
-//! the central builder; mid-stream flushes are framed in parallel
-//! (`rayon::par_iter` over `FRAME_BATCH`-sized batches) and written
-//! serially.
+//! via a `ReorderBuffer`. Per input blob, when that blob carries direct
+//! full blocks it first drains the central stream (flush the builder,
+//! write all pending) so the earlier lower-ID tails precede this blob's
+//! higher-ID full blocks, then writes the worker's full framed blocks
+//! directly, then feeds the trailing `Owned*` slice into the central
+//! builder; mid-stream flushes are framed in parallel (`rayon::par_iter`
+//! over `FRAME_BATCH`-sized batches) and written serially. The drain
+//! guard keeps the two output streams globally `Sort.Type_then_ID`
+//! ordered; on a pure grow (empty `full_framed`) it never fires, so the
+//! central builder still coalesces across input-blob boundaries.
 //!
 //! Both shrink (planet's ~228 k/blob -> 8 k/blob) and grow (Geofabrik
 //! 8 k/blob -> 64 k/blob) work because the central builder spans
@@ -370,6 +375,45 @@ fn run_kind_phase(
                         let WorkerOutput { full_framed, tail } = out;
                         let full_count = full_framed.len() as u64 * elements_per_blob as u64;
                         let tail_n = tail.len();
+
+                        // Ordering guard (restores Sort.Type_then_ID monotonicity
+                        // across the two output streams). This input blob's full
+                        // blocks carry IDs strictly above every tail accumulated so
+                        // far: the source is type-then-ID sorted, and the worker
+                        // splits the low `M - M%cap` IDs into `full_framed` and the
+                        // high `M%cap` IDs into `tail`, so blob N's full blocks
+                        // outrank blob N-1's tail. The central stream (`bb` +
+                        // `pending`) holds those earlier lower-ID tails but is
+                        // otherwise flushed only in FRAME_BATCH-sized batches - a
+                        // delayed batch would land AFTER these direct writes and
+                        // emit lower IDs after higher ones. So before any direct
+                        // write, drain the central stream: flush `bb`, then write
+                        // everything `pending` holds. This leaves pure-grow
+                        // coalescing untouched - grows produce empty `full_framed`,
+                        // so the guard never fires and the central builder still
+                        // coalesces trailing slices across input-blob boundaries.
+                        // In the shrink/mixed case it splits each accumulated tail
+                        // into its own (possibly under-cap) block, which is the
+                        // correct trade: coalescing there was buying little and was
+                        // the source of the reordering.
+                        if !full_framed.is_empty() && (!bb.is_empty() || !pending.is_empty()) {
+                            if let Err(e) = flush_local(&mut bb, &mut output) {
+                                classify_error.get_or_insert(e);
+                                continue;
+                            }
+                            central_blobs += output.len() as u64;
+                            pending.append(&mut output);
+                            if !pending.is_empty() {
+                                let batch = std::mem::take(&mut pending);
+                                match frame_and_write_batch(batch, compression, writer) {
+                                    Ok(written) => blobs += written,
+                                    Err(e) => {
+                                        write_error = Some(e);
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
 
                         // Write the worker's already-framed full blocks directly.
                         for framed in full_framed {

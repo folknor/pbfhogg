@@ -37,17 +37,52 @@ to the current kind, and splits its `M` matching elements at the
 
 The merge thread runs a single long-lived `BlockBuilder` per kind,
 configured with the requested cap, and consumes worker outputs in
-seq order via a `ReorderBuffer`. For each input blob it writes the
-worker's full framed blocks directly, then feeds the trailing
-`Owned*` slice into the central builder; mid-stream flushes are
-framed in parallel via `rayon::par_iter` over `FRAME_BATCH`-sized
-batches and written serially.
+seq order via a `ReorderBuffer`. For each input blob, when that blob
+carries direct full blocks it first drains the central stream (flush
+the builder, write everything buffered) so the earlier lower-ID tails
+precede this blob's higher-ID full blocks, then writes the worker's
+full framed blocks directly, then feeds the trailing `Owned*` slice
+into the central builder; mid-stream flushes are framed in parallel
+via `rayon::par_iter` over `FRAME_BATCH`-sized batches and written
+serially.
 
 This hybrid keeps shrinks fast (when `cap` divides `M` cleanly all
 work happens in workers, matching v1) while supporting grows
 correctly: when `cap > M_per_input_blob` each worker emits 0 full
 blocks and ships everything as trailing, and the central builder
 spans input-blob boundaries to produce cap-sized output.
+
+### Output ordering guard and its density trade
+
+The two output streams - worker full blocks written directly, and the
+central builder's coalesced tail blocks flushed in `FRAME_BATCH`
+batches - are written to one file. Because the input is
+`Sort.Type_then_ID` sorted, an input blob's low `M - M%cap` IDs land
+in its direct full blocks and its high `M%cap` IDs land in the tail,
+so blob N's full blocks outrank blob N-1's tail. Writing the direct
+full blocks immediately while the tail sat in a delayed batch let a
+later blob's higher-ID full block precede an earlier blob's lower-ID
+tail, producing output that violated the `Sort.Type_then_ID` its own
+header still advertised (confirmed 2026-07-12 on planet 8k: 7
+non-monotonic relation violations). The fix: before writing any input
+blob's direct full blocks, drain the central stream (flush the builder,
+write all buffered blocks) so the earlier lower-ID tails go out first.
+
+**Accepted density change.** The guard flushes each input blob's tail
+as its own block instead of packing tails across input-blob
+boundaries. So on a coalescing shrink (cap smaller than the
+per-input-blob element count) the output blob count is NO LONGER the
+general `ceil(elements / cap)`: it now depends on the input-blob
+boundaries, because each input blob whose element count is not a
+multiple of the cap contributes an extra possibly-under-cap tail
+block, and parallel framing runs on smaller batches. This is a
+deliberate trade - coalescing in the shrink/mixed case was buying
+little and was the exact source of the reordering. `ceil(elements /
+cap)` still holds only when the cap divides the per-input-blob element
+count (zero tails, guard never fires) or when a kind occupies a single
+input blob (its tail cannot cross a boundary). Pure grows (empty
+`full_framed`) never trip the guard, so their cross-input-blob
+coalescing is unchanged.
 
 Validated on Denmark (commit 741e482, plantasjen):
 - cap=4000 (shrink, exact div): 2.8 s - within noise of v1's 2.7 s.
@@ -214,6 +249,26 @@ the round-trip drops.
   false-positive warnings on real shrinks.
 - `repack_grow_no_warning_when_cap_fires` - same sentinel for grows
   that fire the cap mid-stream.
+- `repack_output_is_monotonic_across_coalesced_blob_boundaries` -
+  ordering-guard regression: 40 relations across two 20-element input
+  blobs, cap 12, walks output-order relation IDs and asserts strictly
+  increasing. Fails pre-fix (ID 13 after ID 32), passes post-fix.
+- `repack_output_is_monotonic_for_nodes_and_ways` - same regression
+  extended to nodes (dense) and ways, which run the same two-stream
+  merge path: 40 of each across two 20-element blobs, cap 12.
+- `repack_output_is_monotonic_with_pending_prepopulated_at_guard` -
+  fires the guard while the central `pending` buffer is already
+  non-empty (relation blobs 5, 5, 5, 15 so three all-tail blobs queue a
+  coalesced block before a full-block-bearing blob arrives), covering
+  the path the base regression never reaches. The strict
+  `bb`-empty-`pending`-non-empty guard state is unreachable (lazy
+  builder flush always leaves `bb` a non-empty remainder), so its
+  disjunct is defensive.
+
+Note on the `_matches_prediction` tests: they assert `ceil(elements /
+cap)` because their fixtures divide evenly (cap 10 vs 20/blob input ->
+zero tails -> guard never fires). That identity is not general - see
+"Output ordering guard and its density trade" above.
 
 Cross-validation against osmium's `cat` re-block flag is **not** in
 the suite; deferred to v2.3.

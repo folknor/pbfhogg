@@ -1031,7 +1031,7 @@ fn tags_filter_two_pass(
             .enumerate()
             .map(|(i, &(data_offset, data_size))| (i, data_offset, data_size))
             .collect();
-        let mut willneed = crate::scan::classify::WillneedPrefetch::from_env(&decode_items)?;
+        let mut willneed = crate::scan::classify::WillneedPrefetch::new(&decode_items);
 
         type WorkerResult = (
             usize,

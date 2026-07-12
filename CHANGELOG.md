@@ -14,6 +14,15 @@
 
 ### Changed
 
+- Classify-schedule commands (`check-refs`, `tags-filter` two-pass, and
+  the other `parallel_classify_*` consumers) now issue a bounded
+  `POSIX_FADV_WILLNEED` prefetch over the blob-body ranges the scan is
+  about to read, in a 256 MiB sliding window. This reclaims the
+  page-warming the 2026-04-20 `POSIX_FADV_RANDOM` header-walk swap gave
+  up at mid-size scale: europe `check-refs` -6.2 %, `tags-filter`
+  -5.7 %. Planet is not over-prefetched; the window stays bounded to
+  what workers are about to consume.
+
 - The sequential read path (`ElementReader::for_each`, `Blob::decode`,
   `Blob::to_primitiveblock`, `IndexedReader` iteration) no longer pays a
   whole-buffer copy per decoded block: decompression now lands directly in

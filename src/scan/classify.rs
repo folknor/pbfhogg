@@ -32,29 +32,8 @@ use crate::BoxResult as Result;
 /// `data_size` address the blob's payload in the input PBF.
 pub(crate) type ScheduleEntry = (usize, u64, usize);
 
-const PREFETCH_WILLNEED_ENV: &str = "PBFHOGG_PREFETCH_WILLNEED";
 const WILLNEED_COALESCE_GAP_BYTES: u64 = 4 * 1024;
 const WILLNEED_WINDOW_BYTES: u64 = 256 * 1024 * 1024;
-
-/// Read the experimental schedule-prefetch gate at its sole environment
-/// boundary. `WillneedPrefetch` owns the resulting plain state, so tests need
-/// not mutate the process environment.
-fn prefetch_willneed_from_env() -> Result<bool> {
-    parse_prefetch_willneed(std::env::var(PREFETCH_WILLNEED_ENV))
-}
-
-fn parse_prefetch_willneed(value: std::result::Result<String, std::env::VarError>) -> Result<bool> {
-    match value {
-        Ok(value) if value == "1" => Ok(true),
-        Err(std::env::VarError::NotPresent) => Ok(false),
-        Ok(value) => {
-            Err(format!("{PREFETCH_WILLNEED_ENV} must be exactly 1 when set, got {value:?}").into())
-        }
-        Err(std::env::VarError::NotUnicode(_)) => {
-            Err(format!("{PREFETCH_WILLNEED_ENV} must be Unicode and exactly 1 when set").into())
-        }
-    }
-}
 
 /// Coalesce body ranges in a walker-derived schedule. Schedule entries retain
 /// file order, so bodies separated by up to a BlobHeader-sized gap are joined.
@@ -97,19 +76,14 @@ pub(crate) struct WillneedPrefetch {
 }
 
 impl WillneedPrefetch {
-    /// The one environment boundary for this experimental knob. It runs
-    /// before a caller can return early for an empty schedule.
-    pub(crate) fn from_env(schedule: &[ScheduleEntry]) -> Result<Self> {
-        let enabled = prefetch_willneed_from_env()?;
-        Ok(Self {
-            ranges: if enabled {
-                coalesce_willneed_ranges(schedule)
-            } else {
-                Vec::new()
-            },
+    /// Prepare unconditional sliding WILLNEED prefetching for a dispatch
+    /// schedule.
+    pub(crate) fn new(schedule: &[ScheduleEntry]) -> Self {
+        Self {
+            ranges: coalesce_willneed_ranges(schedule),
             next_range: 0,
             next_offset: 0,
-        })
+        }
     }
 
     /// Advise enough coalesced ranges to keep the window ahead of `entry`.
@@ -380,7 +354,7 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
-    let mut willneed = WillneedPrefetch::from_env(schedule)?;
+    let mut willneed = WillneedPrefetch::new(schedule);
     if schedule.is_empty() {
         return Ok(());
     }
@@ -483,7 +457,7 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
-    let mut willneed = WillneedPrefetch::from_env(schedule)?;
+    let mut willneed = WillneedPrefetch::new(schedule);
     if schedule.is_empty() {
         return Ok(());
     }
@@ -621,7 +595,7 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
-    let mut willneed = WillneedPrefetch::from_env(schedule)?;
+    let mut willneed = WillneedPrefetch::new(schedule);
     if schedule.is_empty() {
         return Ok(());
     }
@@ -707,20 +681,17 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{ScheduleEntry, coalesce_willneed_ranges, parse_prefetch_willneed};
+    use super::{ScheduleEntry, WillneedPrefetch, coalesce_willneed_ranges};
 
     #[test]
-    fn prefetch_willneed_gate_accepts_only_one_or_unset() {
-        assert!(parse_prefetch_willneed(Ok("1".to_owned())).unwrap());
-        assert!(!parse_prefetch_willneed(Err(std::env::VarError::NotPresent)).unwrap());
+    fn willneed_prefetch_defaults_to_coalesced_schedule() {
+        let schedule: [ScheduleEntry; 2] = [(0, 100, 20), (1, 144, 5)];
 
-        for value in ["", "0", "true", "01", "1 "] {
-            let error = parse_prefetch_willneed(Ok(value.to_owned())).unwrap_err();
-            assert!(
-                error.to_string().contains("PBFHOGG_PREFETCH_WILLNEED"),
-                "error must name the environment variable: {error}"
-            );
-        }
+        let prefetch = WillneedPrefetch::new(&schedule);
+
+        assert_eq!(prefetch.ranges, vec![(100, 49)]);
+        assert_eq!(prefetch.next_range, 0);
+        assert_eq!(prefetch.next_offset, 0);
     }
 
     #[test]

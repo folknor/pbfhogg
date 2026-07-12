@@ -16,13 +16,9 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Instant;
 
-type RawItem = (
-    usize,
-    crate::error::Result<crate::blob::Blob>,
-    Option<BytePermit>,
-);
+type RawItem = (usize, crate::error::Result<crate::blob::Blob>);
 type DecodedPayload = Option<crate::error::Result<PrimitiveBlock>>;
-type DecodedItem = (usize, DecodedPayload, Option<Permit>, Option<BytePermit>);
+type DecodedItem = (usize, DecodedPayload, Option<Permit>);
 
 /// Returns `true` if the blob should be skipped based on the filter.
 ///
@@ -48,49 +44,6 @@ pub(crate) const DEFAULT_READ_AHEAD: usize = 16;
 
 /// Number of decoded blocks that can be in-flight before backpressure stalls decode.
 pub(crate) const DEFAULT_DECODE_AHEAD: usize = 32;
-
-const COUNT_BACKSTOP_MULTIPLIER: usize = 16;
-
-// Planet primary occupies 87 GiB on disk across 50,816 blobs, or 1,838,309
-// compressed bytes/blob. PBFHOGG_READ_AHEAD_BYTES charges retained compressed
-// blob bytes, so its overnight suggestion remains 16 * 1,838,309 =
-// 29,412,944 bytes. PBFHOGG_DECODE_AHEAD_BYTES charges decoded_len_hint bytes;
-// using the approximately 2x zlib expansion estimate gives 3,676,618 decoded
-// bytes/blob and 32 * 3,676,618 = 117,651,776 bytes. The raised count
-// backstops admit the smaller 8k blobs.
-
-pub(crate) fn byte_budget_from_env(var: &str) -> Result<Option<usize>> {
-    match std::env::var(var) {
-        Ok(value) => {
-            let bytes = value.parse::<usize>().map_err(|_| {
-                crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("{var} must be a non-zero byte count, got {value:?}"),
-                )))
-            })?;
-            if bytes == 0 {
-                return Err(crate::error::new_error(crate::error::ErrorKind::Io(
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("{var} must be a non-zero byte count, got {value:?}"),
-                    ),
-                )));
-            }
-            Ok(Some(bytes))
-        }
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(crate::error::new_error(
-            crate::error::ErrorKind::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("{var} must be a non-zero Unicode byte count"),
-            )),
-        )),
-    }
-}
-
-pub(crate) fn block_queue_bytes_from_env() -> Result<Option<usize>> {
-    byte_budget_from_env("PBFHOGG_BLOCK_QUEUE_BYTES")
-}
 
 /// Bounds decode items admitted but not yet delivered from the reorder buffer.
 ///
@@ -192,8 +145,6 @@ pub(crate) mod test_hooks {
 pub(crate) struct PipelineConfig {
     pub(crate) read_ahead: usize,
     pub(crate) decode_ahead: usize,
-    pub(crate) read_ahead_bytes: Option<usize>,
-    pub(crate) decode_ahead_bytes: Option<usize>,
 }
 
 impl Default for PipelineConfig {
@@ -201,104 +152,13 @@ impl Default for PipelineConfig {
         Self {
             read_ahead: DEFAULT_READ_AHEAD,
             decode_ahead: DEFAULT_DECODE_AHEAD,
-            read_ahead_bytes: None,
-            decode_ahead_bytes: None,
         }
-    }
-}
-
-impl PipelineConfig {
-    pub(crate) fn from_env() -> Result<Self> {
-        Ok(Self {
-            read_ahead: DEFAULT_READ_AHEAD,
-            decode_ahead: DEFAULT_DECODE_AHEAD,
-            read_ahead_bytes: byte_budget_from_env("PBFHOGG_READ_AHEAD_BYTES")?,
-            decode_ahead_bytes: byte_budget_from_env("PBFHOGG_DECODE_AHEAD_BYTES")?,
-        })
-    }
-
-    pub(crate) fn read_ahead_byte_budget(mut self, bytes: usize) -> Self {
-        self.read_ahead_bytes = Some(bytes.max(1));
-        self
-    }
-
-    pub(crate) fn decode_ahead_byte_budget(mut self, bytes: usize) -> Self {
-        self.decode_ahead_bytes = Some(bytes.max(1));
-        self
-    }
-
-    fn effective_read_ahead(self) -> usize {
-        if self.read_ahead_bytes.is_some() {
-            DEFAULT_READ_AHEAD * COUNT_BACKSTOP_MULTIPLIER
-        } else {
-            self.read_ahead
-        }
-    }
-
-    fn effective_decode_ahead(self) -> usize {
-        if self.decode_ahead_bytes.is_some() {
-            DEFAULT_DECODE_AHEAD * COUNT_BACKSTOP_MULTIPLIER
-        } else {
-            self.decode_ahead
-        }
-    }
-}
-
-/// A byte-capacity gate for one producer stage.
-///
-/// Single-acquirer invariant: exactly one producer calls [`Self::acquire`] for
-/// each instance. Releases may come from other threads, so `release` can use
-/// `notify_one`; adding another acquirer requires `notify_all` or per-waiter
-/// wakeups.
-pub(crate) struct ByteBudget {
-    used: Mutex<usize>,
-    cond: Condvar,
-    cap: usize,
-}
-
-impl ByteBudget {
-    pub(crate) fn new(cap: usize) -> Self {
-        Self {
-            used: Mutex::new(0),
-            cond: Condvar::new(),
-            cap: cap.max(1),
-        }
-    }
-
-    pub(crate) fn acquire(self: &Arc<Self>, bytes: usize) -> BytePermit {
-        let mut used = self.used.lock().unwrap_or_else(PoisonError::into_inner);
-        while *used != 0 && used.saturating_add(bytes) > self.cap {
-            used = self.cond.wait(used).unwrap_or_else(PoisonError::into_inner);
-        }
-        *used = used.saturating_add(bytes);
-        BytePermit {
-            budget: Arc::clone(self),
-            bytes,
-        }
-    }
-
-    fn release(&self, bytes: usize) {
-        let mut used = self.used.lock().unwrap_or_else(PoisonError::into_inner);
-        *used = used.saturating_sub(bytes);
-        drop(used);
-        self.cond.notify_one();
-    }
-}
-
-pub(crate) struct BytePermit {
-    budget: Arc<ByteBudget>,
-    bytes: usize,
-}
-
-impl Drop for BytePermit {
-    fn drop(&mut self) {
-        self.budget.release(self.bytes);
     }
 }
 
 fn send_direct_error(tx: &SyncSender<DecodedItem>, seq: usize, e: crate::error::Error) -> bool {
     let t_send = Instant::now();
-    let sent = tx.send((seq, Some(Err(e)), None, None)).is_ok();
+    let sent = tx.send((seq, Some(Err(e)), None)).is_ok();
     PIPELINE_METRICS
         .decoded_send_wait_ns
         .fetch_add(elapsed_ns_u64(t_send), Relaxed);
@@ -312,7 +172,6 @@ struct DecodeTask {
     buffer_pool: Arc<DecompressPool>,
     blob_filter: Option<Arc<BlobFilter>>,
     permit: Permit,
-    decoded_byte_permit: Option<BytePermit>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -324,7 +183,6 @@ fn spawn_decode_task(decode_pool: &rayon::ThreadPool, task: DecodeTask) {
         buffer_pool,
         blob_filter,
         permit,
-        decoded_byte_permit,
         shutdown,
     } = task;
     decode_pool.spawn(move || {
@@ -372,10 +230,7 @@ fn spawn_decode_task(decode_pool: &rayon::ThreadPool, task: DecodeTask) {
             )))),
         };
         let t_send = Instant::now();
-        if tx
-            .send((seq, item, Some(permit), decoded_byte_permit))
-            .is_err()
-        {
+        if tx.send((seq, item, Some(permit))).is_err() {
             shutdown.store(true, Relaxed);
         }
         PIPELINE_METRICS
@@ -399,7 +254,7 @@ where
     // Early exit: returning from this helper drops `decoded_rx` before scoped
     // threads join. Blocked senders then fail, set shutdown, release permits,
     // wake the dispatcher, and let stage 1 stop at the raw channel.
-    let mut pending: ReorderBuffer<(DecodedPayload, Option<Permit>, Option<BytePermit>)> =
+    let mut pending: ReorderBuffer<(DecodedPayload, Option<Permit>)> =
         ReorderBuffer::with_capacity(decode_ahead);
 
     loop {
@@ -408,21 +263,20 @@ where
         PIPELINE_METRICS
             .decoded_recv_wait_ns
             .fetch_add(elapsed_ns_u64(t_recv), Relaxed);
-        let (seq, item, permit, byte_permit) = match next {
+        let (seq, item, permit) = match next {
             Ok(pair) => pair,
             Err(_) => break,
         };
-        pending.push(seq, (item, permit, byte_permit));
+        pending.push(seq, (item, permit));
         PIPELINE_METRICS.record_reorder_levels(pending.filled_len(), pending.pending_len());
         #[cfg(feature = "test-hooks")]
         test_hooks::record_reorder_levels(pending.filled_len(), pending.pending_len());
 
-        while let Some((item, permit, byte_permit)) = pending.pop_ready() {
+        while let Some((item, permit)) = pending.pop_ready() {
             match item {
                 Some(Ok(block)) => {
                     let result = block_fn(block);
                     drop(permit);
-                    drop(byte_permit);
                     result?;
                 }
                 Some(Err(e)) => return Err(e),
@@ -482,31 +336,15 @@ where
     blob_reader.set_parse_tagdata(has_tag_filter);
     blob_reader.set_parse_indexdata(blob_filter.is_some());
     let blob_filter = blob_filter.map(Arc::new);
-    let read_ahead = pipeline_config.effective_read_ahead();
-    let decode_ahead = pipeline_config.effective_decode_ahead();
-    let raw_budget = pipeline_config
-        .read_ahead_bytes
-        .map(ByteBudget::new)
-        .map(Arc::new);
-    let decoded_budget = pipeline_config
-        .decode_ahead_bytes
-        .map(ByteBudget::new)
-        .map(Arc::new);
-    let (raw_tx, raw_rx) = sync_channel::<RawItem>(read_ahead);
-    let (decoded_tx, decoded_rx) = sync_channel::<DecodedItem>(decode_ahead);
+    let (raw_tx, raw_rx) = sync_channel::<RawItem>(pipeline_config.read_ahead);
+    let (decoded_tx, decoded_rx) = sync_channel::<DecodedItem>(pipeline_config.decode_ahead);
 
     std::thread::scope(|scope| {
         // Stage 1: Sequential I/O reader thread
-        let raw_budget_for_reader = raw_budget.clone();
         scope.spawn(move || {
             for (seq, blob_result) in blob_reader.enumerate() {
-                let byte_permit = blob_result.as_ref().ok().and_then(|blob| {
-                    raw_budget_for_reader.as_ref().map(|budget| {
-                        budget.acquire(usize::try_from(blob.retained_len()).unwrap_or(usize::MAX))
-                    })
-                });
                 let t_send = Instant::now();
-                let send_result = raw_tx.send((seq, blob_result, byte_permit));
+                let send_result = raw_tx.send((seq, blob_result));
                 PIPELINE_METRICS
                     .raw_send_wait_ns
                     .fetch_add(elapsed_ns_u64(t_send), Relaxed);
@@ -562,14 +400,14 @@ where
                     let err = crate::error::new_error(crate::error::ErrorKind::Io(
                         std::io::Error::other(format!("failed to build decode pool: {e}")),
                     ));
-                    drop(dispatch_tx.send((0, Some(Err(err)), None, None)));
+                    drop(dispatch_tx.send((0, Some(Err(err)), None)));
                     return;
                 }
             };
             let buffer_pool = DecompressPool::new();
-            let gate = Arc::new(AdmissionGate::new(decode_ahead));
+            let gate = Arc::new(AdmissionGate::new(pipeline_config.decode_ahead));
             let shutdown = Arc::new(AtomicBool::new(false));
-            for (seq, blob_result, _raw_permit) in raw_rx {
+            for (seq, blob_result) in raw_rx {
                 if shutdown.load(Relaxed) {
                     break;
                 }
@@ -584,13 +422,6 @@ where
                             PIPELINE_METRICS.decode_admit_blocked.fetch_add(1, Relaxed);
                         }
                         let permit = Permit(Arc::clone(&gate));
-                        // Reserve before dispatch, in sequence order. Reserving only
-                        // after parallel decode can let later blocks fill a tiny byte
-                        // budget and strand the earlier sequence behind the reorder
-                        // buffer.
-                        let decoded_byte_permit = decoded_budget
-                            .as_ref()
-                            .map(|budget| budget.acquire(blob.decoded_len_hint()));
                         PIPELINE_METRICS.decode_tasks.fetch_add(1, Relaxed);
                         spawn_decode_task(
                             &decode_pool,
@@ -601,7 +432,6 @@ where
                                 buffer_pool: Arc::clone(&buffer_pool),
                                 blob_filter: blob_filter.clone(),
                                 permit,
-                                decoded_byte_permit,
                                 shutdown: Arc::clone(&shutdown),
                             },
                         );
@@ -619,7 +449,7 @@ where
         // Drop the original so the channel closes when all rayon task clones are done
         drop(decoded_tx);
 
-        let result = drain_decoded(decoded_rx, decode_ahead, &mut block_fn);
+        let result = drain_decoded(decoded_rx, pipeline_config.decode_ahead, &mut block_fn);
 
         // Emit reader-pipeline counters before returning so that even
         // an error path produces sidecar data. Mirrors the writer's
@@ -655,32 +485,16 @@ where
     blob_reader.set_parse_tagdata(has_tag_filter);
     blob_reader.set_parse_indexdata(blob_filter.is_some());
     let blob_filter = blob_filter.map(Arc::new);
-    let read_ahead = pipeline_config.effective_read_ahead();
-    let decode_ahead = pipeline_config.effective_decode_ahead();
-    let raw_budget = pipeline_config
-        .read_ahead_bytes
-        .map(ByteBudget::new)
-        .map(Arc::new);
-    let decoded_budget = pipeline_config
-        .decode_ahead_bytes
-        .map(ByteBudget::new)
-        .map(Arc::new);
-    let (raw_tx, raw_rx) = sync_channel::<RawItem>(read_ahead);
+    let (raw_tx, raw_rx) = sync_channel::<RawItem>(pipeline_config.read_ahead);
     type FusedPayload<T> = Option<crate::error::Result<T>>;
     let (decoded_tx, decoded_rx) =
-        sync_channel::<(usize, FusedPayload<T>, Option<Permit>, Option<BytePermit>)>(decode_ahead);
+        sync_channel::<(usize, FusedPayload<T>, Option<Permit>)>(pipeline_config.decode_ahead);
 
     std::thread::scope(|scope| {
-        let raw_budget_for_reader = raw_budget.clone();
         scope.spawn(move || {
             for (seq, blob_result) in blob_reader.enumerate() {
-                let byte_permit = blob_result.as_ref().ok().and_then(|blob| {
-                    raw_budget_for_reader.as_ref().map(|budget| {
-                        budget.acquire(usize::try_from(blob.retained_len()).unwrap_or(usize::MAX))
-                    })
-                });
                 let start = Instant::now();
-                let send_result = raw_tx.send((seq, blob_result, byte_permit));
+                let send_result = raw_tx.send((seq, blob_result));
                 PIPELINE_METRICS
                     .raw_send_wait_ns
                     .fetch_add(elapsed_ns_u64(start), Relaxed);
@@ -703,15 +517,15 @@ where
                     let error = crate::error::new_error(crate::error::ErrorKind::Io(
                         std::io::Error::other(format!("failed to build decode pool: {e}")),
                     ));
-                    drop(dispatch_tx.send((0, Some(Err(error)), None, None)));
+                    drop(dispatch_tx.send((0, Some(Err(error)), None)));
                     return;
                 }
             };
             let buffer_pool = DecompressPool::new();
-            let gate = Arc::new(AdmissionGate::new(decode_ahead));
+            let gate = Arc::new(AdmissionGate::new(pipeline_config.decode_ahead));
             let shutdown = Arc::new(AtomicBool::new(false));
             pool.in_place_scope(|task_scope| {
-                for (seq, blob_result, _raw_permit) in raw_rx {
+                for (seq, blob_result) in raw_rx {
                     if shutdown.load(Relaxed) {
                         break;
                     }
@@ -726,11 +540,6 @@ where
                                 PIPELINE_METRICS.decode_admit_blocked.fetch_add(1, Relaxed);
                             }
                             let permit = Permit(Arc::clone(&gate));
-                            // This charges decoded input size, not transformed output. AltW
-                            // can expand output, so the bound is count-times-bounded-payload.
-                            let byte_permit = decoded_budget
-                                .as_ref()
-                                .map(|budget| budget.acquire(blob.decoded_len_hint()));
                             let tx = dispatch_tx.clone();
                             let pool = Arc::clone(&buffer_pool);
                             let filter = blob_filter.clone();
@@ -788,7 +597,7 @@ where
                                     ))),
                                 };
                                 let start = Instant::now();
-                                if tx.send((seq, item, Some(permit), byte_permit)).is_err() {
+                                if tx.send((seq, item, Some(permit))).is_err() {
                                     shutdown.store(true, Relaxed);
                                 }
                                 PIPELINE_METRICS
@@ -799,7 +608,7 @@ where
                         Err(error) => {
                             let start = Instant::now();
                             if dispatch_tx
-                                .send((seq, Some(Err(error)), None, None))
+                                .send((seq, Some(Err(error)), None))
                                 .is_err()
                             {
                                 break;
@@ -813,7 +622,7 @@ where
             });
         });
         drop(decoded_tx);
-        let result = drain_fused(decoded_rx, decode_ahead, &mut consume);
+        let result = drain_fused(decoded_rx, pipeline_config.decode_ahead, &mut consume);
         PIPELINE_METRICS.emit();
         result
     })
@@ -821,12 +630,7 @@ where
 
 #[allow(clippy::needless_pass_by_value, clippy::type_complexity)]
 fn drain_fused<T, F>(
-    decoded_rx: Receiver<(
-        usize,
-        Option<crate::error::Result<T>>,
-        Option<Permit>,
-        Option<BytePermit>,
-    )>,
+    decoded_rx: Receiver<(usize, Option<crate::error::Result<T>>, Option<Permit>)>,
     decode_ahead: usize,
     consume: &mut F,
 ) -> Result<()>
@@ -840,20 +644,19 @@ where
         PIPELINE_METRICS
             .decoded_recv_wait_ns
             .fetch_add(elapsed_ns_u64(start), Relaxed);
-        let (seq, item, permit, byte_permit) = match next {
+        let (seq, item, permit) = match next {
             Ok(item) => item,
             Err(_) => break,
         };
-        pending.push(seq, (item, permit, byte_permit));
+        pending.push(seq, (item, permit));
         PIPELINE_METRICS.record_reorder_levels(pending.filled_len(), pending.pending_len());
         #[cfg(feature = "test-hooks")]
         test_hooks::record_reorder_levels(pending.filled_len(), pending.pending_len());
-        while let Some((item, permit, byte_permit)) = pending.pop_ready() {
+        while let Some((item, permit)) = pending.pop_ready() {
             match item {
                 Some(Ok(item)) => {
                     let result = consume(item);
                     drop(permit);
-                    drop(byte_permit);
                     result?;
                 }
                 Some(Err(error)) => return Err(error),
@@ -1044,13 +847,13 @@ mod tests {
     }
 
     #[test]
-    fn fused_tiny_byte_budgets_complete_in_order() {
+    fn fused_tiny_count_bounds_complete_in_order() {
         assert_eq!(
             fused_counts(
                 ElementReader::new(Cursor::new(fused_pbf(3)))
                     .unwrap()
-                    .read_ahead_bytes(1)
-                    .decode_ahead_bytes(1)
+                    .read_ahead(1)
+                    .decode_ahead(1)
             )
             .unwrap(),
             [1, 1, 1]

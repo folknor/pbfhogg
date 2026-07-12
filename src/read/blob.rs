@@ -239,13 +239,6 @@ impl Blob {
         u64::try_from(self.header.datasize).unwrap_or(0)
     }
 
-    /// Conservative retained-byte charge for a decoded primitive block.
-    pub(crate) fn decoded_len_hint(&self) -> usize {
-        self.blob
-            .estimated_capacity()
-            .max(usize::try_from(self.retained_len()).unwrap_or(usize::MAX))
-    }
-
     /// Returns the per-blob tag key index from the header's `tagdata` field, if present.
     ///
     /// PBFs written by pbfhogg embed tag key data automatically. Third-party PBFs

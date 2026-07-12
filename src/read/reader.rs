@@ -16,11 +16,6 @@ use std::thread::JoinHandle;
 
 /// Number of decoded blocks buffered between the pipeline and the consumer iterator.
 const BLOCK_QUEUE: usize = 8;
-const BLOCK_QUEUE_COUNT_BACKSTOP: usize = BLOCK_QUEUE * 16;
-// PBFHOGG_BLOCK_QUEUE_BYTES charges `PrimitiveBlock::decompressed_size()`.
-// With the approximately 2x zlib expansion estimate from pipeline.rs, planet
-// primary has 3,676,618 decoded bytes/blob, so its overnight suggestion is
-// 8 * 3,676,618 = 29,412,944 bytes.
 
 /// A reader for PBF files that gives access to the stored elements: nodes, ways and relations.
 ///
@@ -32,7 +27,6 @@ pub struct ElementReader<R: Read + Send> {
     header: HeaderBlock,
     decode_threads: Option<usize>,
     pipeline_config: PipelineConfig,
-    block_queue_bytes: Option<usize>,
     blob_filter: Option<BlobFilter>,
 }
 
@@ -63,8 +57,7 @@ impl<R: Read + Send> ElementReader<R> {
             blob_iter,
             header,
             decode_threads: None,
-            pipeline_config: PipelineConfig::from_env()?,
-            block_queue_bytes: super::pipeline::block_queue_bytes_from_env()?,
+            pipeline_config: PipelineConfig::default(),
             blob_filter: None,
         })
     }
@@ -112,27 +105,6 @@ impl<R: Read + Send> ElementReader<R> {
     /// Defaults to 32. Values <1 are clamped to 1.
     pub fn decode_ahead(mut self, n: usize) -> Self {
         self.pipeline_config.decode_ahead = n.max(1);
-        self
-    }
-
-    /// Sets a byte budget for raw blobs buffered between I/O and decode.
-    /// A configured budget raises the count backstop to 256 blobs.
-    pub fn read_ahead_bytes(mut self, bytes: usize) -> Self {
-        self.pipeline_config = self.pipeline_config.read_ahead_byte_budget(bytes);
-        self
-    }
-
-    /// Sets a byte budget for decoded blocks awaiting ordered delivery.
-    /// A configured budget raises the count backstop to 512 blocks.
-    pub fn decode_ahead_bytes(mut self, bytes: usize) -> Self {
-        self.pipeline_config = self.pipeline_config.decode_ahead_byte_budget(bytes);
-        self
-    }
-
-    /// Sets a byte budget for decoded blocks queued for an iterator consumer.
-    /// A configured budget raises the count backstop to 128 blocks.
-    pub fn block_queue_bytes(mut self, bytes: usize) -> Self {
-        self.block_queue_bytes = Some(bytes.max(1));
         self
     }
 
@@ -316,9 +288,6 @@ impl<R: Read + Send> ElementReader<R> {
     /// Ordered pipelined read with a per-block transform executed on the
     /// decode workers. The consumer remains serialized on the calling thread.
     ///
-    /// `PBFHOGG_BLOCK_QUEUE_BYTES` is intentionally inert here: the fused
-    /// path does not construct the iterator block queue. The raw and decoded
-    /// byte budgets continue to apply.
     pub(crate) fn for_each_fused_block<T, X, F>(self, transform: X, consume: F) -> Result<()>
     where
         T: Send,
@@ -356,27 +325,15 @@ impl<R: Read + Send> ElementReader<R> {
     where
         R: 'static,
     {
-        let block_queue_bytes = self.block_queue_bytes;
-        let queue_cap = if block_queue_bytes.is_some() {
-            BLOCK_QUEUE_COUNT_BACKSTOP
-        } else {
-            BLOCK_QUEUE
-        };
-        let (tx, rx) = sync_channel(queue_cap);
+        let (tx, rx) = sync_channel(BLOCK_QUEUE);
         let blob_iter = self.blob_iter;
         let decode_threads = self.decode_threads;
         let pipeline_config = self.pipeline_config;
         let blob_filter = self.blob_filter;
 
-        let queue_budget = block_queue_bytes
-            .map(super::pipeline::ByteBudget::new)
-            .map(Arc::new);
         let handle = std::thread::spawn(move || {
             let deliver = |block: PrimitiveBlock| {
-                let permit = queue_budget
-                    .as_ref()
-                    .map(|budget| budget.acquire(block.decompressed_size()));
-                tx.send((Ok(block), permit)).map_err(|_| {
+                tx.send(Ok(block)).map_err(|_| {
                     new_error(ErrorKind::Io(std::io::Error::other(
                         "pipeline consumer dropped",
                     )))
@@ -392,7 +349,7 @@ impl<R: Read + Send> ElementReader<R> {
             if let Err(e) = result {
                 // Deliver the error as the last iterator item.
                 // Ignore send failure - consumer may have already dropped.
-                drop(tx.send((Err(e), None)));
+                drop(tx.send(Err(e)));
             }
         });
 
@@ -981,8 +938,7 @@ impl ElementReader<FileReader> {
             blob_iter,
             header,
             decode_threads: None,
-            pipeline_config: PipelineConfig::from_env()?,
-            block_queue_bytes: super::pipeline::block_queue_bytes_from_env()?,
+            pipeline_config: PipelineConfig::default(),
             blob_filter: None,
         })
     }
@@ -996,8 +952,7 @@ impl ElementReader<FileReader> {
             blob_iter,
             header,
             decode_threads: None,
-            pipeline_config: PipelineConfig::from_env()?,
-            block_queue_bytes: super::pipeline::block_queue_bytes_from_env()?,
+            pipeline_config: PipelineConfig::default(),
             blob_filter: None,
         })
     }
@@ -1010,8 +965,7 @@ impl ElementReader<FileReader> {
             blob_iter,
             header,
             decode_threads: None,
-            pipeline_config: PipelineConfig::from_env()?,
-            block_queue_bytes: super::pipeline::block_queue_bytes_from_env()?,
+            pipeline_config: PipelineConfig::default(),
             blob_filter: None,
         })
     }
@@ -1051,7 +1005,7 @@ fn node_id(element: &Element<'_>) -> Option<i64> {
 /// runs in a background thread; blocks are delivered in file order via a bounded
 /// channel. Dropping this iterator signals the pipeline to shut down promptly.
 pub struct PipelinedBlocks {
-    rx: Option<Receiver<(Result<PrimitiveBlock>, Option<super::pipeline::BytePermit>)>>,
+    rx: Option<Receiver<Result<PrimitiveBlock>>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -1059,7 +1013,7 @@ impl Iterator for PipelinedBlocks {
     type Item = Result<PrimitiveBlock>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.rx.as_ref()?.recv().ok().map(|(item, _permit)| item)
+        self.rx.as_ref()?.recv().ok()
     }
 }
 

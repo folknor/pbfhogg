@@ -1,5 +1,18 @@
 # Hybrid batching for pread workers
 
+> **CLOSED 2026-07-13**, per this note's own recommended step 3 ("if
+> measurement shows overhead < 2s: close as not worth the complexity").
+> The note's own arithmetic bounds total mutex time at ~50-500 ms at
+> Europe scale (< 1 % of wall), and no hotpath or sidecar measurement
+> since (getparents, sort, geocode arcs, the 2026-07 blob-density
+> sweeps) has ever surfaced the dispatch lock as a cost. The
+> `Mutex<Receiver>` single-recv-per-lock shape still exists exactly as
+> described (`src/scan/classify.rs` worker pools, tags-filter pass 2,
+> multi-extract write workers; verified 2026-07-13) - it just does not
+> matter. No batch drain was ever implemented and none is warranted.
+> The original "~8s regression" claim that motivated this note was
+> never substantiated.
+
 ## Problem statement
 
 `parallel_classify_phase` and the tags-filter pass 2 write path use

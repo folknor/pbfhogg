@@ -1,5 +1,13 @@
 # Columnar decode integration research
 
+> **CLOSED 2026-07-13.** The prototype and every viable integration
+> shipped (`DenseNodeColumns`; single- and multi-extract node classify),
+> the per-blob-send API question was settled by the 2026-04-09 design
+> review, and the ways/relations and IdSetDense-accumulation questions
+> were answered in-document. Retained as the prerequisite record for
+> SIMD work (TODO.md Milestone B): the multi-bbox loop is the designated
+> SIMD target if classify ever becomes the bottleneck. No open work here.
+
 ## Current state
 
 Prototype shipped (commit `e0b0780`). `DenseNodeColumns` in

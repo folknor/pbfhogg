@@ -1,5 +1,12 @@
 # Way blob spatial bboxes: impact speculation
 
+> **STATUS 2026-07-13: speculative research, no work planned.**
+> Chronological way-ID assignment caps the realistic skip rate at
+> ~25-35 % for a Denmark-scale extract - far below what would justify
+> format work - and the transformative variant (geography-sorted way
+> blobs) breaks Sort.Type_then_ID. Linked from TODO.md's research /
+> stretch list.
+
 ## The geographic clustering problem
 
 In a Sort.Type_then_ID PBF, ways are sorted by OSM way ID. Way IDs

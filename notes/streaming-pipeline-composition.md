@@ -1,5 +1,12 @@
 # Streaming pipeline composition
 
+> **CLOSED (verdict reached in-document; header added 2026-07-13).**
+> The codebase already does the most valuable composition (inline
+> indexdata in every write path), and the expensive commands (ALTW,
+> extract, geocode builder) are inherently multi-pass and cannot consume
+> streams. See "Revised assessment" below. No work planned; TODO.md's
+> research list records the closure.
+
 ## Problem
 
 The production pipeline for a planet update runs 4 commands sequentially,

@@ -1,5 +1,14 @@
 # Write-path optimization plan
 
+> **STATUS 2026-07-13: mostly exhausted - see "Current state" at the
+> bottom.** The live remainder is the io_uring rail on a real command
+> path (items 5 / 5b) plus the API-surface questions (whether
+> `OutputChunk` / `FramedBlobParts` / `OutputSink` stay as the internal
+> writer shape, deferred header write, size hints). All
+> `PBFHOGG_WRITE_*` experiment env vars have been removed from the
+> tree; the OutputChunk/OutputSink types remain and are load-bearing
+> (`src/write/pipeline.rs`).
+
 This note is the working plan for the generic write / compression path shared
 by `cat`, `extract`, `merge`, `sort`, ALTW stage 4, and other PBF-producing
 commands.
@@ -101,9 +110,10 @@ So this plan treats the write path as two related rails:
 - `zstd` is already a proven internal-pipeline lever when interop does not
   matter
 - the repo already rejected at least one naive writer-memory idea:
-  `frame_blob_into` buffer recycling via shared mutex pool regressed throughput
-  (`notes/memory/p6-vectored-writer-framing.md`, referenced from
-  [src/write/writer.rs](../src/write/writer.rs))
+  `frame_blob_into` buffer recycling via shared mutex pool regressed
+  throughput (+12 %, commit `2bf438c`; the write-up lived in the retired
+  note `notes/memory/p6-vectored-writer-framing.md`, deleted in commit
+  `4591063` - recover from git history if needed)
 
 ## Harness ladder
 

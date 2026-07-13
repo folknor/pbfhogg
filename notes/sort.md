@@ -1,5 +1,16 @@
 # `sort` - optimization plan
 
+> **STATUS 2026-07-13: arc complete; one live opportunity.** Everything
+> measured here landed or was explicitly parked with reasons. The only
+> open code-level item is **opportunity #6** (reflink fast-path for
+> zero-overlap sorted input on btrfs / xfs-with-reflink), gated on
+> prerequisite 8 (a FICLONE probe on a reflink-capable fs). No
+> FICLONE/FICLONERANGE path exists in the tree today; the current
+> CopyRange path relies on whatever `copy_file_range` does on the
+> target fs (in-kernel copy on ext4, metadata-only on reflink fs).
+> This note stays as the measurement record (cited from
+> `reference/blob-density.md`).
+
 Target: `pbfhogg sort` - repairs unsorted PBFs into `Sort.Type_then_ID`
 order. Two-pass blob-level permutation sort: pass 1 scans all blobs
 and builds an index of `(element_type, min_id, max_id)`; pass 2

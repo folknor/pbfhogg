@@ -1,5 +1,12 @@
 # Spatial indexing in PBF format
 
+> **STATUS 2026-07-13: speculative research, no work planned.** The
+> impact assessment below caps the win at ~0.5 % for single extracts;
+> the only compelling consumer is multi-extract with many regions.
+> Linked from TODO.md's research / stretch list. Revisit only if
+> repeated small spatial queries against one planet file become a real
+> workload.
+
 ## Problem statement
 
 Planet-scale PBF files (87 GB) contain ~430K node blobs. To find elements

@@ -1,5 +1,16 @@
 # Zlib compression level tuning
 
+> **CLOSED 2026-07-13.** Answered by the write-path plan's compression
+> matrix ([write-path-optimization-plan.md](write-path-optimization-plan.md),
+> item 2, measured 2026-04-16): pipelined mode is flat across zlib and zstd
+> levels on Denmark and Japan (best-to-worst spread ~2.3 %), so no preset
+> change clears the >= 5 % gate. Sync mode strongly disfavors zlib:6; that
+> lesson is recorded there. The zstd:1 internal-pipeline recommendation
+> this note gestures at is now documented in README.md and
+> reference/performance.md. Nothing actionable remains; retained as
+> background. TODO.md already ranks this "extremely low priority,
+> investigated multiple times with no actionable outcome."
+
 ## Current state
 
 Default: `Compression::Zlib(6)` - matches osmium's `Z_DEFAULT_COMPRESSION`.

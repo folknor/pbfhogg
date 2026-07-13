@@ -1,7 +1,12 @@
 # Reverse Geocoding Index: Implementation Specification
 
-Parent document: [reverse-geocoding.md](reverse-geocoding.md) (problem statement and
-design direction).
+> **HISTORICAL 2026-07-13.** Original implementation spec for
+> `build-geocode-index`, which shipped. Kept as a format and design
+> record only: the shipped implementation deviated (see the note just
+> below), and all optimization work moved to
+> [geocode-build-opportunities.md](geocode-build-opportunities.md).
+> The parent problem-statement doc (`reverse-geocoding.md`) was retired
+> in commit `89c0149`; recover from git history if needed.
 
 **Note: implementation deviated from this spec.** Node coordinates use a compact
 rank-indexed array (via `IdSetDense` rank) instead of the spec's `DenseMmapIndex`.

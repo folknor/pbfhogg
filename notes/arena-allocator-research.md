@@ -1,5 +1,15 @@
 # Arena Allocator Research
 
+> **STATUS 2026-07-13: mostly complete; remaining steps gated on
+> re-profiling.** Steps 1/1a/1b (thread-local scratch, capacity
+> pre-reserve, iterator tag API) are DONE - `parse_and_inline` churn is
+> 94 % eliminated and the doc's own conclusion is that the decode path
+> is at libosmium parity with no remaining arena opportunity. Steps 2-5
+> (remaining scratch sites, bumpalo, arena-backed columnar,
+> pipelined-reader re-eval) are speculative and should only be picked
+> up after a fresh `--alloc` profile shows churn that matters; tracked
+> as Milestone A in TODO.md.
+
 ## Problem Statement
 
 PrimitiveBlock decoding allocates many small, short-lived objects per block
@@ -254,7 +264,9 @@ pbfhogg is at libosmium parity for the decode path.
 Iterator-based BlockBuilder API (commit `bb15e66`) eliminated the
 per-element `tags.collect::<Vec>()`. Callers pass `element.tags()`
 directly. Dual-buffer single-pass encoding for way/relation tag fields.
-See [notes/blockbuilder-iterator-api.md](blockbuilder-iterator-api.md).
+(The `blockbuilder-iterator-api.md` design note was retired in commit
+`6b12d26`; its residual member-scratch idea lives in TODO.md's
+"Per-relation members_scratch" bullet.)
 
 `write_single_node/way/relation` in `elements_pbf.rs` allocate
 `tags.collect::<Vec<(&str, &str)>>()` per element. Called from sort

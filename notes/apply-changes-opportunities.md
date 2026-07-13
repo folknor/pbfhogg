@@ -1,5 +1,14 @@
 # `apply-changes --locations-on-ways` - remaining optimization items
 
+> **CLOSED 2026-07-13.** The command sits at 80.9 s planet (-44 %),
+> comfortably inside any production budget. Of the three remaining
+> items: **#15 is DONE** - README.md and reference/performance.md now
+> carry the `--compression zstd:1` internal-pipeline recommendation.
+> **#11** (splice-in-place) and **#13** (exact-membership metadata)
+> stay deferred and are now tracked in TODO.md's apply-changes entry,
+> together with the open questions below. Historical record; update
+> TODO.md, not this file.
+
 Target: `pbfhogg apply-changes --locations-on-ways` on planet with a
 daily OSC.
 
@@ -53,6 +62,9 @@ Current on-disk metadata gives per-blob ID range only; pure creates
 inside an existing blob range force slow-path decode (the documented
 FalsePositive case at
 [`src/commands/apply_changes/classify.rs`](../src/commands/apply_changes/classify.rs)).
+(2026-07-13: that comment was rewritten in the streaming refactor - the
+distinction now lives on `block_overlaps_diff`'s doc comment,
+`range_overlaps` true vs `block_overlaps_diff` false for pure creates.)
 At planet today: 15,224 FalsePositive blobs / 92,677 slow-path blobs =
 16% of slow-path work burned on blobs that turn out not to overlap.
 

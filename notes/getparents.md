@@ -1,5 +1,16 @@
 # `getparents` - optimization plan
 
+> **STATUS 2026-07-13: headline resolved; residuals moved to TODO.md.**
+> The europe-vs-planet dispatch question was ratified as
+> [ADR-0006](../decisions/0006-blob-count-threshold-dispatch.md)
+> (150k-blob threshold). Of the two residual opportunities below, #3's
+> instrumentation has since landed (`getparents_schedule_blobs` /
+> `getparents_blobs_skipped` counters in
+> `src/commands/getparents/mod.rs`) - what remains of #3 and #4 is
+> tracked in TODO.md's getparents entry. This note stays as the
+> measurement record behind the ADR (and is cited from
+> `reference/blob-density.md`); update TODO.md, not this file.
+
 Target: `pbfhogg getparents` - whole-file scan listing the ways and
 relations that reference a given ID set. Input is a sorted PBF and
 a set of IDs; output is the IDs of parent elements (and optionally

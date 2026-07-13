@@ -1,5 +1,66 @@
 # pbfhogg TODO
 
+## Roadmap at a glance
+
+Open work is grouped here by what actually gates it. The completed
+record (formerly interleaved with the open items) lives at the bottom
+of this file, full text preserved. Detail stays in notes/ - closed
+notes carry a CLOSED/STATUS header pointing back here.
+
+**Waiting only on operator green-light**
+
+- Injected-prepass flag-ON planet bench (ADR-0007) - see "Blocked on
+  dataset / config".
+
+**Quick wins (hours, or docs-only)**
+
+- getparents blob-skip readout: MEASURED off existing run `21ed8d7c` -
+  64.6 % of blobs skipped; tail = CHANGELOG "~85 %" wording decision +
+  filter-semantics confirm (Item plans / getparents).
+- ElemKind reuse refactor across cat + repack (Item plans / repack
+  follow-ups) - when someone is in there anyway.
+
+**Active arcs (large open engineering, pick deliberately)**
+
+- Geocode builder rewrite G1-G5 + two S2 spikes
+  ([notes/geocode-build-opportunities.md](notes/geocode-build-opportunities.md)).
+- GeoJSON export v1 ([notes/geojson-export-design.md](notes/geojson-export-design.md)) -
+  Milestone 3.
+- Multi-extract v2 complete/smart strategies - Milestone 3.
+
+**Decisions needed (forks in the road, not tasks)**
+
+- Geocode index format v2 (element IDs in records) - prerequisite for
+  any incremental-update path
+  ([notes/incremental-geocode-index.md](notes/incremental-geocode-index.md)).
+- CLI UX: scratch-dir posture + `--index-type` replacement (Milestone 3
+  / Command surface).
+- diff `-j` default flip (Performance).
+- History-file support: in scope or explicitly out (Research / stretch).
+- Writer API surface: keep the OutputChunk/OutputSink shape? deferred
+  header write?
+  ([notes/write-path-optimization-plan.md](notes/write-path-optimization-plan.md)
+  "Current state").
+
+**Deferred with explicit triggers - do not chase without the trigger**
+
+- Shape-3 serial schedule walk / io_uring batched header walker
+  ([notes/header-walk-batching.md](notes/header-walk-batching.md);
+  trigger: a high-blob-count planet becomes a real workload).
+- Reflink sort fast-path ([notes/sort.md](notes/sort.md) opp #6;
+  trigger: a reflink-capable output fs matters in production).
+- io_uring output rail on a real command (write-path plan items 5/5b).
+- apply-changes #11 splice-in-place / #13 exact-membership metadata
+  (see the apply-changes entry below).
+- Milestones A/B/C + GPU (Non-traditional optimization research).
+- renumber polish ([notes/renumber-optimization.md](notes/renumber-optimization.md));
+  altw-external RAM/NVMe-gated tiers ([notes/altw-external.md](notes/altw-external.md));
+  time-filter items ([notes/time-filter-optimization.md](notes/time-filter-optimization.md),
+  gated on a history dataset).
+
+**Blocked on dataset / config** - see the section of that name under
+"Planet-scale validation coverage".
+
 ## Item/command-specific plans
 
 Three new docs capturing a cross-cutting insight and two new commands that fall out of it. All scaffolding-level; details drift as work lands.
@@ -8,56 +69,34 @@ Three new docs capturing a cross-cutting insight and two new commands that fall 
 
   - [ ] **Shape-3 serial schedule walk (`build_classify_schedules_split`).** The single-threaded `HeaderWalker` loop in `src/scan/classify.rs` does one QD=1 pread per blob (~70 us/blob), invisible at 50 k blobs (~3.5 s) but a fixed ~97-109 s at 1.45 M blobs. **Full six-caller 8k sweep done 2026-07-12** (table in `reference/blob-density.md` "Full shape-3 sweep"): the walk fraction splits the family, which **narrows the payoff** from the earlier "helps six commands" framing. Read-only callers are ~2/3 walk - `check --refs` 66 % (`1851f73a`), `check --ids` 67 % (dirty) - so flattening it roughly halves their 8k wall (~2.7x -> ~1.3x). Re-encoding callers are only 18-29 % walk - `extract --smart` 29 % (`4b82686f`), `cat --clean` 19 % (`3f4c222c`), `repack` 18 % (`8f275ebf`), `degrade` 18 % (`6f8a3e94`) - their 8k regression is dominated by framing + writing 1.45 M tiny blobs, which the walk fix does not touch. So: **if the primitive is ever built, it is a win for the read-only pair only** (and those two are the same commands whose getid/getparents selective-scan cousins already got ADR-0006 dispatch). The fix is the same io_uring batched-header-walker primitive that sort pass 1, the getparents walk term, and the getid walker arm all want - the four-call-site convergence, per-site payoff, why it cannot be trivially parallelized, and the rejected alternatives are consolidated in [`notes/header-walk-batching.md`](notes/header-walk-batching.md). Still deferred: near-zero production bite (production planet is 50 k blobs).
 
-- [x] ~~**[notes/repack.md](notes/repack.md)** - new command: re-encode a PBF with a configurable `--elements-per-blob N` cap.~~ **v1 + v2.1 LANDED.** Per-kind parallel scan mirrors `cat --clean`; `BlockBuilder::with_element_cap(n)` is the cap-plumbing primitive; CLI flags `--elements-per-blob`, `--compression`, `--direct-io`, `--io-uring`, `--force`. v2.1 added cross-input-blob coalescing (hybrid worker/central-builder shape), so grow caps fire correctly across input-blob boundaries. Planet 8 k bench validated twice: 380 s / 1.36 GB (UUID `0ae01c09`, `48685ba`, 2026-04-28) and 389.6 s / 1.31 GB (UUID `a4791ddc`, `8c1cf03`, 2026-07-10), both plantasjen. v2.2 (LocationsOnWays preservation) and v2.3 (osmium cross-validation) remain deferred - see the note.
+- [x] ~~**[notes/repack.md](notes/repack.md)** - new command: re-encode a PBF with a configurable `--elements-per-blob N` cap.~~ **v1 + v2.1 LANDED** (`BlockBuilder::with_element_cap(n)`, cross-input-blob coalescing so grow caps fire correctly across input-blob boundaries). Planet 8k bench ~380-390 s. v2.2 (LocationsOnWays preservation) and v2.3 (osmium cross-validation) remain deferred - see the note.
 
-  **v1.1 follow-ups (small, no benchmarking):**
-  - [x] ~~**Cap-message parity for `BlockBuilder::with_element_cap`.**~~ Landed: assertion text is now `"BlockBuilder::with_element_cap: --elements-per-blob must be > 0"`, sharing the substring `"--elements-per-blob must be > 0"` with the CLI Err for grep parity.
-  - [x] ~~**Warn on no-op grow cap.**~~ Landed: `run_kind_phase` returns a `cap_fired` flag (true whenever a worker emits >1 output blob from one input blob). `repack()` aggregates across phases and emits a stderr warning at end-of-run when the cap never fires and at least one element was written. Tier-1 tests in `tests/cli_repack.rs` cover both directions (warning fires on cap=8000 vs ~20-element input blobs, does NOT fire on cap=10 shrink).
-  - [ ] **`ElemKind` reuse audit (cross-command, low priority).** Both `cat --clean` (`src/commands/cat/mod.rs:433-435`) and `repack` (`src/commands/repack/mod.rs:35-37`) invented their own bare-`u8` `KIND_NODE/WAY/RELATION` constants instead of reusing the project's `pub(crate) enum ElemKind` (`src/blob_meta/mod.rs:20`). Repack mirrors cat by design - changing one without the other would just diverge them. Worth doing as one refactor across both commands when someone is in there for another reason; not worth a dedicated PR.
+  **v1.1 follow-ups:**
+  - [ ] **`ElemKind` reuse audit (cross-command, low priority).** Both `cat --clean` (`src/commands/cat/mod.rs:433-435`) and `repack` (`src/commands/repack/mod.rs:35-37`) invented their own bare-`u8` `KIND_NODE/WAY/RELATION` constants instead of reusing the project's `pub(crate) enum ElemKind` (`src/blob_meta/mod.rs:20`). Repack mirrors cat by design - changing one without the other would just diverge them. Worth doing as one refactor across both commands when someone is in there for another reason; not worth a dedicated PR. (2026-07-13: still true; a doc comment in `cat/mod.rs` even mentions `ElemKind` while the surrounding code uses the bare consts - drift the refactor would resolve.)
 
   **Correctness follow-up (found 2026-07-12 during the shape-3 8k sweep):**
-  - [x] ~~**`repack` emits non-monotonic relations across blob boundaries (CONFIRMED bug, 2026-07-12).**~~ Landed the targeted drain guard: in each `pop_ready` iteration, when the incoming blob carries direct full-blocks (`full_framed` non-empty) and the central stream is non-empty (`bb` non-empty OR `pending` non-empty), the merge thread now flushes `bb` and drains ALL of `pending` to the writer BEFORE the direct full-block writes, so the earlier lower-ID tails precede this blob's higher-ID full blocks and the output is globally `Sort.Type_then_ID` ordered again. The guard also checks `pending` (not just `bb`) so a pre-populated `pending` at guard entry is drained; the strict `bb`-empty-`pending`-non-empty variant is unreachable (the block builder flushes lazily, so any tail-consume that queues a `pending` block leaves `bb` a non-empty remainder), so that disjunct is defensive. Pure-grow coalescing is untouched (empty `full_framed` never trips the guard). **Accepted density trade:** on a coalescing shrink the output blob count is no longer the general `ceil(elements / cap)` - it now depends on input-blob boundaries because each input blob whose count is not a multiple of the cap emits its tail as its own possibly-under-cap block (documented in `notes/repack.md` and the `_matches_prediction` test comments; coalescing there was buying little and was the source of the reordering). Regression tests in `tests/cli_repack.rs`: `repack_output_is_monotonic_across_coalesced_blob_boundaries` (40 relations, IDs 1..=40, 2 input blobs of 20, cap 12: forces a direct full block + coalescing tail per blob; walks output-order relation IDs and asserts strictly increasing - fails pre-fix at ID 13 following ID 32, passes post-fix); `repack_output_is_monotonic_for_nodes_and_ways` (same layout for dense nodes and ways); and `repack_output_is_monotonic_with_pending_prepopulated_at_guard` (relation blobs 5, 5, 5, 15, cap 12, so three all-tail blobs queue a coalesced block into `pending` before a full-block-bearing blob fires the guard). Original diagnosis below for the record.<br>**`brokkr check-ids --dataset planet --snapshot 8k` scans clean through 10.4 B nodes and 1.2 B ways but reports **7 non-monotonic relation violations** (relation 24224 after 2500756, then at ~2.5-3 M-ID intervals: 2501113/5464175, 5474467/8518335, 8522568/12033207, 12036956/15515549, 15520630/18342025, 18343015/20246782). **Confirmed repack-introduced:** the primary dump is clean - `check-ids --dataset planet` on primary reports `ID integrity: OK` over the identical 14,124,889 relations (90.9 s, same source corpus), so repack's relation phase is reordering, the source is monotonic. **Root cause (pinned 2026-07-12, `run_kind_phase` in `src/commands/repack/mod.rs`):** the phase writes through two independent streams to one writer - worker "full" blocks go DIRECTLY via `write_raw_owned` in seq order, while the central-builder's coalesced tail-blocks go through a DELAYED `pending` buffer that only flushes every `FRAME_BATCH = 32` blocks. A coalesced tail-block holds the tails of many earlier input blobs (IDs below the full-blocks emitted between them) but is written 32-at-a-time, so it lands after later higher-ID direct blocks. Arithmetic confirms: relations `central_blobs = 210`, `210 / 32 = 6.56` -> **7 pending-flush events = the 7 violations** (each flush dumps 32 low-ID coalesced blocks after a run of higher-ID direct ones). Nodes and ways have `central_blobs = 1` / `coalesces = 0` (no mid-stream coalescing, single ordered direct stream) so they are clean - relations are the only kind whose large input blobs (31250/blob) vs the 8000 cap force real cross-boundary coalescing (449 coalesces). Shrink/mixed-only: a pure grow (8k->64k) has empty `full_framed` so there are no direct writes to interleave with and the central stream is the sole ordered output. **This is a correctness bug in a producer:** repack writes `pbf.indexed` with the `Sort.Type_then_ID` claim, and `--as-snapshot` promotes it into the dataset graph, so downstream consumers that trust the sorted flag (sort fast path, streaming diff) get a file that lies. Fix direction (targeted): in each `pop_ready` iteration, when the incoming blob carries direct full-blocks (`full_framed` non-empty) and the central builder `bb` is non-empty, flush `bb` FIRST - its accumulated tails all have IDs below this blob's full-blocks, so emitting them before the direct writes restores global order. This leaves pure-grow coalescing untouched (grow has empty `full_framed`, so the flush never triggers and 8-into-1 coalescing still fires) and only splits the tail into its own (possibly under-cap) block in the shrink/mixed case, where coalescing was buying little anyway. Alternative if under-cap blocks are unwanted: route the direct full-blocks through the same ordered `pending` stream instead of `write_raw_owned`, so there is a single ordered output path (costs the direct-write fast path). Needs a regression test: `check-ids`-style monotonicity assertion on repack output at a cap + input-blob size that forces cross-boundary coalescing with interleaved full-blocks (denmark `snapshot.1k|64k|320k` passed `verify all` clean, so the repro needs relation input blobs larger than the cap - a shrink on a dataset whose relation blobs exceed the target cap, or a synthetic multi-blob fixture). The 8k snapshot remains a valid blob-density *timing* control (walk cost is ID-order-independent), so the sweep numbers stand.
+  - [x] ~~**`repack` emits non-monotonic relations across blob boundaries (CONFIRMED bug, found + fixed 2026-07-12).**~~ Root cause (`run_kind_phase` in `src/commands/repack/mod.rs`): worker "full" blocks wrote directly via `write_raw_owned` in seq order, while the central builder's coalesced tail-blocks went through a `pending` buffer that only flushed every 32 blocks, so low-ID coalesced tails could land after later high-ID direct blocks. Fix: in each `pop_ready` iteration, when the incoming blob carries direct full-blocks and the central stream (`bb` or `pending`) is non-empty, flush the central stream first. **Accepted density trade:** on a coalescing shrink, output blob count is no longer the general `ceil(elements / cap)` - it now depends on input-blob boundaries, since each input blob whose count isn't a multiple of the cap emits its tail as its own possibly-under-cap block (documented in `notes/repack.md`). Regression tests in `tests/cli_repack.rs`: `repack_output_is_monotonic_across_coalesced_blob_boundaries`, `repack_output_is_monotonic_for_nodes_and_ways`, `repack_output_is_monotonic_with_pending_prepopulated_at_guard`.
 
   **Release / measurement follow-ups:**
   - [x] ~~**Register the 8 k-packed planet as a snapshot.**~~ Done 2026-07-10: UUID `8027765b` (377.5 s at `8c1cf03`, plantasjen) promoted its output to `data/planet-8k-with-indexdata.osm.pbf`, registered as `snapshot.8k` `pbf.indexed`. The two earlier bench runs (`0ae01c09`, `a4791ddc`) wrote to scratch and kept nothing. The snapshot is the input for every same-corpus-different-encoding pair the `reference/blob-density.md` matrix needs, and for the deferred `getparents` HeaderWalker dispatch decision (europe-regressing / planet-winning along the same blob-count axis); consumer commands reach it via `--snapshot 8k`.
 
 - [ ] **[notes/degrade.md](notes/degrade.md)** - adversarial-test tool, v1 shipped (`--unsort`, `--unsort-intra`, `--strip-locations`, `--strip-indexdata`, `--strip-tagdata`, `--drop-ids`; deferred: `--strip-bbox`, `--recompress`). The `--unsort` cross-blob bug (found 2026-07-10) was **fixed 2026-07-11**: `--unsort` now suppresses the per-input-blob boundary flush so the swap straddles a genuine output-blob boundary, and the old intra-blob shape is preserved as the deliberate `--unsort-intra` flag (keyed to the first two elements so it stays intra-blob for any input blob size). **Correctness gate CLOSED 2026-07-11**: snapshot regenerated post-fix, `verify sort --snapshot unsorted` PASS, and the overlap-rewrite path fires on the regenerated data - `sort_blobs_overlap=6`, `sort_overlap_runs=3`, `sort_blobs_rewritten=6` (one adjacent same-kind pair per kind, exactly the designed shape; UUID `11062bdd` at `29e4eab`, plantasjen). The pre-fix run `f5cd6522` saw 0 overlaps / full passthrough.
 
-- [x] ~~**`sort` correctness hole: intra-blob disorder is invisible**~~ **FIXED 2026-07-11.** Pass 1 tracks intra-blob monotonicity via `scan_block_ids_checked` (canonical OSM order, one compare per element) and routes any internally out-of-order blob into pass 2's decode + re-encode path - detected disorder is handled, not errored. The check keys on the header's `Sort.Type_then_ID` claim, NOT on indexdata presence: external review falsified "indexdata implies pbfhogg-sorted payload" (unsorted input -> `cat` -> indexed-but-unsorted blobs; `PbfWriter::write_primitive_block` likewise indexes caller blocks blindly). Indexed inputs WITHOUT the sorted claim now decode payloads in pass 1 (stderr notice); declared-sorted inputs keep the header-only fast path, with the claim itself documented as the producer precondition. No `--verify-blobs` flag; producers deliberately unchanged (indexdata range info is valid for unsorted blobs). Recorded in CORRECTNESS.md ("`sort`: intra-blob disorder"); tests in `tests/cli_sort.rs` (`sort_repairs_intra_blob_disorder_in_non_indexed_input`, `sort_repairs_intra_blob_disorder_in_catted_indexed_input`, `sort_sorted_non_indexed_input_stays_on_passthrough`).
-
-- [x] ~~**`read` parallel variant OOM**~~ **FIXED 2026-07-11.** The original framing was doubly wrong: blob count was irrelevant (parallel mode had never been run at planet primary - isolated repro showed it OOMs there identically), and the accumulation was `par_map_reduce`'s phase 1 (`collect_osm_data_blobs`) retaining EVERY compressed blob body before rayon starts; the ~0.4 RSS-to-bytes-read ratio was swap arithmetic on the 39 GB-swap host, not partial retention. Rewritten as a one-pass byte-and-count-bounded worker-resident parallel fold (256 MiB in-flight budget charging `Blob::retained_len`, closable batch queue, RAII cancel guards on both panic paths, read-error precedence preserved). Planet primary: SIGKILL -> **54 s / 616 MB peak anon**; planet 8k: SIGKILL -> **58 s / 170 MB**; exact element-count parity with sequential on both; stored 8k suite at `7532021` completes **4 of 4 variants** (parallel 72.5 s in suite context, `09eecc99`). Same-day `--commit` A/B on the fitting-in-RAM datasets confirmed no regression, all wins: denmark 502 -> 335 ms (-33 %), germany 4.54 -> 2.94 s (-35 %), europe 77.0 -> 21.6 s (-72 %; the pre cell swaps ~11 GB by design - "surviving" the old collect already meant degraded). UUIDs `84ac94d7`/`faabd8f1`/`9d75edfd` pre, `2a5ab39c`/`5e0cfc7d`/`8b5996bc` post. Zero production consumers of `par_map_reduce` existed, so no planet-safe pipeline was touched. Measured aside for the fadvise follow-up below: the blobreader bench arm's move to `from_path` enables per-blob `DONTNEED` eviction, and its 8k cell drifted 609.7 -> 647.6 s (confounded with the day's ambient drift, but consistent with 1.45 M advisory syscalls costing real time). Dual theorizing reports (codex sol xhigh + Fable), verbatim in git history; outcomes settled in [reference/performance-history.md](reference/performance-history.md) "Env-gated read-path batch".
-
-**Read-path follow-ups from the 2026-07-11 architecture reports** (outcomes settled in [reference/performance-history.md](reference/performance-history.md) "Env-gated read-path batch"; the verbatim reports live in git history):
-
-- [x] ~~**`BlobHeader.datasize` unvalidated on read**~~ **FIXED 2026-07-11.** New `MAX_BLOB_DATASIZE` const (`2 * MAX_BLOB_MESSAGE_SIZE` = the PBF spec's 64 MiB serialized-Blob hard limit) rejects an oversized declared `datasize` with the typed `BlobError::DataSizeTooBig` before any pre-decompression body allocation. Enforced at two funnels covering every read-side site: inline in `BlobReader::read_blob_header` (covers `next` + `next_header_skip_blob`), and in `parse_blob_header_with_index` (covers `read_raw_frame`, `read_blob_header_only`, and `HeaderWalker::next_header`, so every consumer's returned `data_size` and every `pread_data` is bounded). Well-formed files are byte-identical; only adversarial declared sizes error. Unit tests pin the boundary at both funnels (`blob_wire.rs`, `blob.rs`); integration tests in `tests/corrupt_input.rs` drive the three raw paths via `BlobReader`, `cat`, and `inspect`. CORRECTNESS.md records the invariant.
-- [x] ~~**Ordered-pipeline batch rebuild**~~ **BUILT env-gated, REVERTED 2026-07-12** (`aabb696`). Implemented as a byte-bounded ordered batch engine behind `PBFHOGG_BATCHED_PIPELINE` and measured in the overnight A/B (`a65cecc`). No isolated win: its only floor-clearing cell, getparents-8k -6.67 %, was redundant with fusion on the same cell, and the fused-plus-batched combination regressed +18.4 % vs fusion alone. At 1.45 M blobs the per-blob channel/task/permit/reorder seams cost *less* than both reports estimated - the batch engine's own coordination gave the difference back. Arc and empirical scorecard in [reference/performance-history.md](reference/performance-history.md) "Env-gated read-path batch".
-- [x] ~~**Command-transform fusion into decode workers**~~ **KEPT 2026-07-12** ([ADR-0009](decisions/0009-fused-command-transforms.md), `aabb696`). getid `--add-referenced` pass 2, getparents FullScan, single-pass tags-filter, and altw decode-all now run their transform inside the decode workers, deleting the 64-block (~90 MB) materialization and the second rayon dispatch. Overnight 8k walls: getid -7.68 %, getparents -6.51 %, tags-filter `-R` -6.97 %; getid primary pass-2 peak RSS 1.18 GB -> 596 MB. The altw europe-raw signal cell OOM-killed on the 23 GB host, so its large-scale wall is unmeasured - a follow-up night on a bigger host owes it.
-- [x] ~~**Sequential-path double copy**~~ **FIXED 2026-07-11** (`3ccc580`). Every sequential full-decode site routed onto the owned-Vec scratch constructors (`for_each`, `to_primitiveblock`, `decode_blob_to_primitiveblock`, cat/inspect/getid loops, altw passthrough via a new pooled-Vec route); `new_with_scratch` and `parse_primitive_block_from_bytes_owned` deleted. Same-day `--commit` A/B vs `29e4eab`, no regression in any of 16 cells: sequential denmark 3047 -> 3004 ms, germany 29166 -> 28073 ms (-3.7 %); blobreader germany 31113 -> 30128 ms (-3.2 %); parallel/pipelined flat-to-better. Equivalence test upgraded to full element materialization across Raw/Zlib/Zstd; 32 MiB Raw boundary reconciled across all decompress helpers.
-- [x] ~~**Count-only buffer knobs -> byte-aware**~~ **BUILT env-gated, REVERTED 2026-07-12** (`629d9ca`). Four byte gates (`read_ahead`, `decode_ahead`, `BLOCK_QUEUE`, command batches) measured in the overnight A/B; no knob improved anything and two regressed past the floor (8k pipelined +3.13 %, getid-8k command-batch +3.49 %). Count vs byte admission was not the binding constraint at either encoding. Reverted to count-only (`read_ahead 16`, `decode_ahead 32`, `BLOCK_QUEUE 8`).
-
-- [x] ~~**`diff --format osc` metadata fidelity - joint look with brokkr dev**~~ - **RESOLVED 2026-07-10, two distinct pbfhogg bugs found.** The failing roundtrip nodes were the multi-line-`inscription` memorials: (A) the OSC writer emitted raw newline/tab/CR inside XML attribute values; XML attribute-value normalization turns those into spaces at parse time, so applying a derived OSC silently corrupted multi-line tag values (byte-proven: `new` had `%0a%`, roundtrip had `%20%` via osmium OPL dump of n5900269010). **Fixed same day**: `push_attribute_escaped` in `src/osc/write.rs` emits `&#10;`/`&#13;`/`&#9;` character references (osmium parity), applied to tag k/v, member roles, and user names, with write->parse roundtrip regression tests. The `v0` in the verify printout was a red herring for the roundtrip failure but exposed bug B below.
-
-- [x] ~~**apply-changes drops OSC element metadata**~~ - **FIXED 2026-07-10, same day as found.** `CompactDiffOverlay` gained a fixed 29-byte metadata block per arena record (`flags`/`version`/`timestamp`/`changeset`/`uid`/interned `user`); the OSC parser reads the attributes (lenient, single pass, RFC 3339 parse via the library-ified `parse_rfc3339_utc`); all nine apply-changes write paths pass the metadata through. Companion fix: `diff --format osc` now emits the full metadata set (was version-only), so the derive -> apply circle is metadata-lossless end-to-end - pinned by `derive_then_apply_preserves_metadata` (tier 1) plus the updated `merge_metadata_preservation` (which had pinned the OLD lossy behavior as expected). Byte-proven on real data: n5900269010 in the verify-recreated `new` now carries `v2 t2026-02-20T21:39:49Z` matching the source OSC. Note: Geofabrik public diffs strip changeset/uid/user (GDPR), so those stay 0/empty on OSC-sourced elements with public-diff input - that is source data, not loss.
-
-**Open decision on `getparents`** (see [notes/getparents.md](notes/getparents.md) "Crossover measured"): the 8k-packed planet matrix landed 2026-07-10. Three cells: planet primary HW **23.5 s** vs scan 44.8 s; europe HW 44.2 s vs scan **26.4 s**; planet-8k HW 82.7 s (`425d1f1e`; walk 64.8 s at ~45 us/blob, decode 17.8 s) vs scan **52.8 s** (`2b3e496e` via `--commit 68e1ba0`). HeaderWalker loses on BOTH high-blob-count encodings; walk cost is linear in blob count, decode is encoding-invariant. **RESOLVED 2026-07-11**: threshold-dispatch on blob count landed for both `getparents` and `getid` (150 k-blob threshold, bounded header-probe estimator; see [`ADR-0006`](decisions/0006-blob-count-threshold-dispatch.md)). Matrix and gates recorded in the ADR and `notes/getparents.md`.
-
 - [ ] **[notes/sort.md](notes/sort.md)** - `sort` (repair unsorted PBFs into `Sort.Type_then_ID`). Drafted 2026-04-23. **Production reality**: Geofabrik / planet input is already sorted, so the overlap-count is ~zero and pass 2 is pure raw passthrough. The headline opportunity that helped the production case, **`copy_file_range` coalescing for passthrough runs**, LANDED (`244c6ec`: `try_extend_copy_run` + `flush_copy_run`; denmark run `11062bdd` coalesced 7387 passthrough blobs into 3 calls; see `notes/sort.md`). The bigger theoretical wins - parallel overlap-rewrite in pass 2 (1.5-3x) and HeaderWalker-based pass 1 (1.2-2x on non-indexed input) - only fire on genuinely-unsorted input, which has no dataset configured in `brokkr.toml` today. Planet hotpath + alloc captured 2026-04-27 overnight at `4fc8e35` (UUIDs `d64932d2` hotpath / `26fb329e` alloc): 115.4 s wall, **94 % in `pbfhogg::write::writer::flush`** (108.6 s) and 6 % in `build_blob_index` (6.77 s) - reaffirms the writer-side `copy_file_range` ceiling is the only lever for already-sorted input, with no allocation pressure (459 MB exclusive, all in `blob_wire::parse`). Hotpath wall sits below both the 124.6 s `68e1ba0` and 132.3 s `16e3694` bench baselines, softening the `+6-7 %` regression flag tracked in `reference/performance.md`. Anti-conversion rule (pipelined → sequential) explicitly off the table per `reference/pipelined-reader-paths.md:138`.
 
-- [ ] **[notes/getparents.md](notes/getparents.md)** - `getparents` (whole-file scan listing ways / relations referencing a given ID set). Drafted 2026-04-23, headline experiment landed 2026-04-24 (`783970a`). The HeaderWalker + `parallel_classify_phase` rewrite shipped: planet 44.8 s -> **23.5 s** (-46 %, UUID `11bc44dc` at `16e3694`), europe 26.4 s -> **44.2 s** (+68 %, blob-density asymmetry - see [reference/blob-density.md](reference/blob-density.md)). Original 4-8x estimate was wrong: blob indexdata stores `(min_id, max_id)` of *elements in the blob*, not the *ref/member IDs* the typical "find ways referencing these nodes" query cares about, so `IdSet::any_in_range()` pre-screen does not apply. Actual win comes from IO byte reduction (74.8 GB -> 30 GB at planet) by skipping blob kinds structurally incapable of producing matches. Planet hotpath at `4fc8e35` (UUID `00253c7d`): 23.0 s wall, 78 % in `parallel_classify_phase` - that **is** the post-experiment state, not headroom. The c912e4d Denmark 4.7x sequential-decode regression rule remains explicitly off the table (it targets sequential-decode conversions; `parallel_classify_phase` keeps decompression parallel via pread workers). **Open question is the europe regression**: revert / threshold-dispatch / accept - the crossover was measured 2026-07-10 on the 8k-packed planet (HW 82.7 s vs scan 52.8 s; walk ~45 us/blob, linear in blob count) and the note now recommends threshold-dispatch on blob count; see the "Open decision" paragraph above for the full matrix. Smaller residual opportunities in `notes/getparents.md`: blob-filter skip-rate verification (#3, hours scope), refs/members buf pre-sizing (#4, <1 % wall).
+- [ ] **[notes/getparents.md](notes/getparents.md)** - `getparents` (whole-file scan listing ways / relations referencing a given ID set). Drafted 2026-04-23, headline experiment landed 2026-04-24 (`783970a`). The HeaderWalker + `parallel_classify_phase` rewrite shipped: planet 44.8 s -> **23.5 s** (-46 %, UUID `11bc44dc` at `16e3694`), europe 26.4 s -> **44.2 s** (+68 %, blob-density asymmetry - see [reference/blob-density.md](reference/blob-density.md)). Original 4-8x estimate was wrong: blob indexdata stores `(min_id, max_id)` of *elements in the blob*, not the *ref/member IDs* the typical "find ways referencing these nodes" query cares about, so `IdSet::any_in_range()` pre-screen does not apply. Actual win comes from IO byte reduction (74.8 GB -> 30 GB at planet) by skipping blob kinds structurally incapable of producing matches. Planet hotpath at `4fc8e35` (UUID `00253c7d`): 23.0 s wall, 78 % in `parallel_classify_phase` - that **is** the post-experiment state, not headroom. The c912e4d Denmark 4.7x sequential-decode regression rule remains explicitly off the table (it targets sequential-decode conversions; `parallel_classify_phase` keeps decompression parallel via pread workers). **The europe-regression question (revert / threshold-dispatch / accept) is RESOLVED**: the crossover was measured 2026-07-10 on the 8k-packed planet (HW 82.7 s vs scan 52.8 s; walk ~45 us/blob, linear in blob count) and the dispatch was ratified as [`ADR-0006`](decisions/0006-blob-count-threshold-dispatch.md) (full matrix in [notes/getparents.md](notes/getparents.md) "Crossover measured"; the RESOLVED paragraph moved to the Completed record below). Residual opportunities, absorbed here from the note (2026-07-13):
+  - [ ] **#3 blob-filter skip-rate readout - MEASURED 2026-07-13** from the existing planet bench `21ed8d7c` (2026-07-12, `a65cecc`, `--bench 3`): `getparents_blobs_skipped` 32,835 / `walk_actual_osmdata_blobs` 50,816 = **64.6 % of blobs skipped** (schedule 17,981; counters sum exactly). Verdict: the CHANGELOG 0.3.0 "~85 % of blobs at planet scale" claim is overstated for the standard 3-ID query - actual is ~65 % of blobs; the module doc's "~75 % of planet bytes" is the bytes metric and stands. Remaining tail: decide whether to correct the historical CHANGELOG wording, and confirm the filter semantics for the "parent relations of a node still needs way blobs" case (a counter can't answer that; needs a targeted test or code read).
+  - [ ] **#4 refs/members buf pre-sizing (<1 % wall).** Skip unless an `--alloc` profile shows churn.
 
-- [x] ~~**altw-as-renumber (in-RAM coord-table thesis)**~~ - **EXPERIMENT FAILED (2026-04-16).** Implemented as `src/commands/altw_v2.rs`, OOM-killed at Europe. Measured unique-referenced count was 3.6 B → 29 GB coord table (plan estimated 2 B / 16 GB at planet; real planet ~10 B / ~80 GB). The in-RAM-coord-table thesis is disproven for Europe+; the existing 4-stage external-sort shape is load-bearing and correct. Post-mortem and numbers now live in [notes/altw-optimization-history.md](notes/altw-optimization-history.md). **Active ALTW work moves to** [notes/altw-external.md](notes/altw-external.md) **(live leads).**
-
-- [x] ~~**[notes/geocode-build-opportunities.md](notes/geocode-build-opportunities.md)**~~ - `build-geocode-index`. **ARC LANDED 2026-04-18.** Planet 1,255 s (20.9 min, TAINTED baseline) -> **432.9 s (7m12s)**, -65 % / 2.9x. Pass 1.5 peak anon 29.5 GB -> 3.0 GB (-90 %); governing peak migrated to Pass 3 Stage B at ~25 GB, comfortable on 27 GB hosts. All 10 ranked items (#1 Phase 2a+2b, #2, #3, #4, #5, #6, #7, #8, plus header-walk consolidation and direct coord_mmap writes) shipped. Remaining follow-ups in the note: #4 "needs another pass" (fused Stage A delivered only 2.8 s at Europe vs the 40-60 s planet prediction), Pass 2 interp resolve still sequential at 30.6 s planet, interpolation endpoint CSR for RSS hygiene.
+- [x] ~~**[notes/geocode-build-opportunities.md](notes/geocode-build-opportunities.md)**~~ - `build-geocode-index`. **ARC LANDED 2026-04-18**, planet 1255 s -> 432.9 s (-65%/2.9x), all 10 ranked items shipped. Remaining follow-ups in the note: Pass 2 interp resolve still sequential (30.6 s planet), interpolation endpoint CSR for RSS hygiene.
   - [ ] **Spike: exact S2 segment coverage for Pass 3.** `cover_segment` currently samples intermediate lat/lon points and clamps the walk at 256 steps. Prototype a proper S2 edge/cell traversal using `s2` 0.1.0 primitives (`RegionCoverer`, `Cell`, `Point`, `edgeutil::simple_crossing`, or equivalent direct cell-edge tests), then compare fine/coarse cell counts and geocode query results against the sampling path on Denmark/Europe before replacing it.
   - [ ] **Spike: admin interior hints via S2 region coverage.** Admin indexing currently edge-covers rings and flood-fills from an arithmetic exterior vertex mean; concave polygons whose mean falls outside skip interior hints and pay more query-time PIP checks. Prototype a polygon `Region` or other `RegionCoverer::interior_covering` path that preserves the current edge-vs-interior on-disk semantics, handles holes, and measure admin cell count/PIP-hit changes before any format or behavior change.
 
-- [x] ~~**check --refs**~~ - landed 2026-04-17 across commits `8f0ccbb` (step #1: `RoaringTreemap` → `IdSetDense`), `053def6` + `fbf591c` (step #2: three-phase parallel scan + one-pass schedule walk). Japan 56.7 s → **2.1 s** (27×). Europe 426.2 s → **33.6 s** (12.7×). Planet **1225 s → 53.8 s** (22.8×, UUID `7d9f5dfd` at commit `16e3694`, 2026-04-26; previously 72.5 s at `862547e4`), ~5-8× better than the 6-10 min plan floor. Peak RSS 2.17 GB. Step #3 (selective wire-format parser) was predicated on decompression and parse landing roughly co-equal; actual post-parallel split is ~162 s decompress vs ~2 s parse at Europe, putting the selective-parser ceiling at fractions of a second - so the next lever for check-refs perf is decompression throughput (zstd, io_uring, direct I/O), not selective parse. Load-bearing pin in `src/commands/check/refs.rs::check_refs` doc comment. Plan doc retired.
-
-- [ ] **[notes/apply-changes-opportunities.md](notes/apply-changes-opportunities.md)** - `apply-changes --locations-on-ways`. **P1 + P1.5 landed 2026-04-21 (`719f306`)**; parallel writer made the default 2026-04-21 (buffered path removed, `--parallel-writer` flag deleted). **Planet best: 80.9 s cross-disk + zstd:1** (-44 % vs 144.4 s pre-flip baseline; parallel pwrite, unaffected by the CopyRange bug). Same-disk zstd:1 best: **104.5 s** with parallel pwrite. The same-disk `--io-uring` column was re-measured 2026-04-26 at `16e3694` after the `fa8251d` CopyRange fix and is now uniformly slower than parallel pwrite at every same-disk compression level (none 137.5 s, zlib:6 137.4 s, zstd:1 126.3 s; UUIDs `9a5c25a7` / `70e5414b` / `0e6a5918`); the original 108.6 / 137.1 / 99.4 s numbers were tainted by the writer dropping a zero-page between OSMHeader and first OSMData blob. Cross-disk `--io-uring` rows (93.0 / 127.9 / 82.8 s) still need re-measurement on the fixed writer. Same-disk `--io-uring` no longer the recommended override; cross-disk `--compression none` + `--io-uring` is open until re-measured. Remaining open items: splice-in-place (#11, deferred - doesn't reduce output bytes on compressed output), multi-file output / RAID-0 (unlanded and lower priority given 80.9 s is comfortably inside any realistic production budget).
-
-- [x] ~~**getid include mode**~~ - landed 2026-04-20 via a shared `pread`-only `HeaderWalker` primitive (`src/read/header_walker.rs`). Planet **43.7 s → 6.1 s (7.2×, UUID `24362e36`)**, germany 200 ms, disk read 88 GB → 601 MB. Initial HeaderWalker landing hit 7.0 s with two preads per blob; the follow-up 1-pread probe walker (commit `d263d76`) trimmed a further 0.9 s (-13 %). Walker is syscall-bound; going lower would need io_uring batching - not pursued. Plan doc retired. **2026-07-10 blob-density follow-up**: full three-cell matrix measured - europe HW 40.2 s (`57ffbf49`) vs scan 17.9 s (`bc96d15d`), planet-8k HW 102.6 s (`aa5bc158`) vs scan 33.2 s (`c0d89d8f`); HW regresses +125 % / +209 % on high-blob-count encodings while the scan arm actually IMPROVES with density (indexdata prescreen selectivity). The resulting threshold dispatch is recorded in [`ADR-0006`](decisions/0006-blob-count-threshold-dispatch.md); sort pass 1 remains a separate follow-on.
-
-- [x] ~~**diff-snapshots (text and `--format osc`)**~~ - landed 2026-04-20. Planet baselines: text **2134 s / 35m34s**, osc **2225 s / 37m06s**. ID-range sharded parallel block-pair merge for both paths: text planet **227.5 s / 3m48s at `-j 16` (UUID `22a5eb55`, 9.5× speedup, temp-file shape, 586 MB peak anon)**, osc planet **293.8 s / 4m54s at `-j 16` (UUID `cdcaa4f1` at commit `16e3694`, 2026-04-26; 7.6× speedup, was 313.8 s at `9b3fc2b9` before the parallel `assemble_osc` gzip landed, 663 MB peak anon at the prior bench)**. CLI flag `-j/--jobs N` on `pbfhogg diff`. Germany text 16.5 s, germany osc 20.4 s at `-j 8`. Both paths now stream shard output to per-shard scratch temp files; an interim text-shape buffered each shard in a `Vec<u8>` (208.6 s, UUID `b02d86bc`, 2.29 GB peak anon) and was replaced with the temp-file shape for a 74 % RSS drop at a 10 % wall cost. Shard balance within 1.03× max/min. Both paths beat the 8-min aspirational target. Parallel `assemble_osc` (was the single-threaded gzip + concat of ~45 GB of XML fragments at 32.8 s) closed the OSC tail. Remaining follow-up: auto-enable parallel by default. Plan doc retired.
+- [ ] **[notes/apply-changes-opportunities.md](notes/apply-changes-opportunities.md)** - `apply-changes --locations-on-ways`. **P1 + P1.5 landed 2026-04-21 (`719f306`)**; parallel writer made the default 2026-04-21 (buffered path removed, `--parallel-writer` flag deleted). **Planet best: 80.9 s cross-disk + zstd:1** (-44 % vs 144.4 s pre-flip baseline; parallel pwrite, unaffected by the CopyRange bug). Same-disk zstd:1 best: **104.5 s** with parallel pwrite. The same-disk `--io-uring` column was re-measured 2026-04-26 at `16e3694` after the `fa8251d` CopyRange fix and is now uniformly slower than parallel pwrite at every same-disk compression level (none 137.5 s, zlib:6 137.4 s, zstd:1 126.3 s; UUIDs `9a5c25a7` / `70e5414b` / `0e6a5918`); the original 108.6 / 137.1 / 99.4 s numbers were tainted by the writer dropping a zero-page between OSMHeader and first OSMData blob. Cross-disk `--io-uring` rows (93.0 / 127.9 / 82.8 s) still need re-measurement on the fixed writer. Same-disk `--io-uring` no longer the recommended override; cross-disk `--compression none` + `--io-uring` is open until re-measured. Remaining open items: splice-in-place (#11, deferred - doesn't reduce output bytes on compressed output), multi-file output / RAID-0 (unlanded and lower priority given 80.9 s is comfortably inside any realistic production budget). **Note closed 2026-07-13** - its remaining items are tracked here now:
+  - [x] ~~**#15 document zstd:1 as the internal-pipeline recommendation**~~ - DONE (found landed 2026-07-13): README.md and reference/performance.md both carry the `--compression zstd:1` recommendation for pipelines that skip osmium interop.
+  - [ ] **#11 splice-in-place for low-touch rewrites (deferred).** For `NeedsRewrite` blobs with <=K affected elements (K~64), splice raw wire bytes for unmodified element runs instead of full decode + re-encode (~1.5-2 s at daily; scaffolding in `src/write/raw_passthrough.rs`). Saves classify/rewrite CPU but not output bytes, so it will not move the writer-bound wall. Revisit if the writer ceiling moves.
+  - [ ] **#13 exact-membership metadata / sidecar (format project).** Per-blob ID-range-only metadata forces slow-path decode on pure creates inside an existing range: 15,224 FalsePositive blobs / 92,677 slow-path = 16 % of slow-path work wasted at planet. The false-positive distinction is documented on `block_overlaps_diff` in `src/commands/apply_changes/classify.rs` (`range_overlaps` true for create IDs inside the blob's range, `block_overlaps_diff` false because no element in the block matches; the old `classify_only` "FalsePositive" comment the note pointed at was removed in the streaming refactor). Two fix shapes: (a) wire-format exact-overlap scanner on decompressed bytes; (b) per-blob membership sketch in indexdata. Not a quick cleanup.
+  - Open questions preserved from the note: actual overlap-blob ratio under larger OSCs (re-measure if input diffs grow; governs worker-pool load); byte-budget reorder capacity sizing (current setting works at planet; revisit on RSS/stall signals); scanner HeaderWalker vs worker throughput balance (no signal it's an issue).
 
 - [ ] **[notes/altw-external.md](notes/altw-external.md)** - `add-locations-to-ways --index-type external`. Current planet baseline: **546.0 s `--bench 1`** (UUID `7fd04130`, commit `16e3694`, 2026-04-26; was 603.7 s at `aa0dc719` post-A1, 661.2 s pre-A1) - **−115.2 s / −17.4 % vs pre-A1**, an extra **−9.6 %** since the post-A1 measurement attributable to commits between `0dc8ae1` and `16e3694`. Europe **270.8 s** post-A1 (was 291.6 s at `6d71053`). **Europe compression sweep landed 2026-04-27 overnight at `4fc8e35`** (`reference/performance.md` "Compression axis" subsection): `none` 246.8 s (UUID `16c35911`, ~6.5 GB anon), `zstd:1` **233.3 s** (UUID `e2fba1bf`, ~6.6 GB anon), vs the cross-commit zlib:6 reference 270.8 s at `0dc8ae1` - so zstd:1 is **−14 % vs default**, refreshing the stale 419→379 / −9.5 % claim from the older `f3c53a34`/`66e43a11` baselines. Same mechanism as before: relieves consumer/compression saturation in stage 4 with similar output size. A1 (rankless node-ID bucketed join) landed 2026-04-25 across 8 commits + 4 review fixups; pass B and the IdSet rank machinery deleted. Doc lists 20 live leads grouped by blocker (Tier 1 actionable now, Tier 2 speculative, Tier 3 hardware-gated, Tier 4 deep stretch) plus correctness invariants + implementation conventions. Failed attempts, measured numbers, physical floors, and meta-lessons live in [`notes/altw-optimization-history.md`](notes/altw-optimization-history.md). Dominant theme post-A1: the stage 2 → stage 3 → stage 4 disk-seam chain (now ~56 GB id shards instead of ~80 GB rank shards + ~112 GB slot buckets) and the new stage-2 sort cost (~87 s wall at planet, comparison-sort on `local_node_id`). Five ranked items landed earlier this sprint (#4 stage-2 de-ranking, #8 BlobLocationRouter, #9 L1+L2 relation scan, #2 streaming stage 3 → 4); remaining seam-shaped items are blocked on RAM (~25 GB host) or a faster second NVMe.
 
@@ -141,86 +180,9 @@ that are not currently driven by `overnight.sh`.
 + `ReorderBuffer` migrations: `check --ids` streaming (`516129e`),
 `cat --clean` (`b347c0a`), `time-filter` snapshot (`83183fb`),
 `tags-filter` way-deps phase (`17b116c`). README's "Not yet
-planet-safe" table is now empty.
-
-- [x] ~~**`check --ids` (streaming default mode)**~~ - **fixed
-  2026-04-27** (commit `516129e`). Rewrote streaming entry to use
-  `parallel_classify_phase` mirroring the co-located `--full` mode,
-  minus the IdSet population. Re-bench: planet **57 s wall, 504 MB
-  peak anon** (UUID `02595428`) vs the failed 26 s SIGKILL at
-  29.2 GB. Now the lowest peak RSS of any `check --ids` variant on
-  planet (`--full` is 2.17 GB). Behavior change on non-indexed
-  input: element-level type-order detection (mixed-type-blob
-  ordering) dropped, matching `--full`'s existing semantics on
-  non-indexed input.
-- [x] ~~**`cat --clean`**~~ - **fixed 2026-04-27** (commits
-  `6184602` + `b347c0a`). Rewrote `cat_filtered` to use
-  `parallel_classify_phase` per kind (mirroring the verify_ids
-  template) with the per-blob framed output streamed via
-  `ReorderBuffer` so that planet-scale phase output isn't
-  accumulated up-front (the first cut accumulated all framed
-  blobs before writing - 47K node blobs × ~1.6 MB framed each
-  ≈ 75 GB ceiling - and OOM'd at 28.9 GB on its own). Re-bench at
-  `4fc8e35`: planet **5m34s wall, 750 MB peak anon** (UUID
-  `f2315551`, 2026-04-27 overnight; was `7c4e03eb` 5m48s/835 MB
-  at the `b347c0a` re-bench) vs the failed 32 s SIGKILL at
-  28.9 GB - 38× peak-RSS reduction. Output ordering is type-sorted
-  (nodes, then ways, then relations); preserves structure on
-  already-type-sorted input, re-sorts unsorted input.
-- [x] ~~**`time-filter`**~~ - **LANDED 2026-04-28** (commit `83183fb`).
-  Snapshot path migrated from
-  `for_each_primitive_block_batch + par_iter().map(thread_local BB)`
-  + drain to `parallel_classify_phase` + `ReorderBuffer`, mirroring
-  the `cat --clean` (`b347c0a`) and `check --ids` (`516129e`)
-  precedents. Planet `--bench 1` (UUID `6d905564`):
-  **4m30s wall, 812 MB peak anon** (was 5x SIGKILL at ~28 GB).
-  Europe **2m27s / 324 MB** (was 1m32s / 16.9 GB; +59 % wall,
-  −98 % RSS). The 2026-04-28 instrumentation campaign across three
-  SIGKILL'd attempts (UUIDs `4800c0a` / `e06c6ad` / `9fffdc4`) ruled
-  out the iter-5 alloc-profile hypothesis (per-decode-thread scratch
-  was 60 MB total, not 4.4 GB) and ruled out allocator knobs
-  (`malloc_trim`, `M_MMAP_THRESHOLD=64K`, `decode_ahead=8` all
-  hit the same ceiling); mallinfo2 confirmed the ~28 GB working set
-  is structural to the parallel-decode + batch-collect + parallel-
-  write architecture, not retention. Migration also deleted the
-  iter-4 / iter-5 pool infrastructure (`buf_pool` module,
-  `take_owned_swap`, `write_primitive_block_owned_pooled`) since
-  nothing else in-tree referenced it. Plan doc:
-  [`notes/time-filter-optimization.md`](notes/time-filter-optimization.md).
-  History-path pending-group state machine (`time_filter_history`)
-  is sequential by design and would need a real refactor for
-  parallelism, but no history PBF is configured in `brokkr.toml`
-  so it doesn't show up in the snapshot-path planet bench - keep
-  separate from this entry.
-- [x] ~~**`tags-filter --invert-match w/highway=primary`**~~ -
-  **LANDED 2026-04-28** (commit `17b116c`). The 28.3 GB peak from
-  the earlier 16e3694 bench (UUID `6665605a`) was misattributed
-  to pass 2 in the prior diagnosis. The 2026-04-28 reproduction
-  on the time-filter-migration commit `4f16591` (UUID `9044c456`)
-  showed pass 2 only peaks at **7.04 GB** - it already uses the
-  right shape (custom pread-from-workers + ReorderBuffer, lines
-  852-961 of `tags_filter/mod.rs`). The actual 24.09 GB peak was
-  in **`collect_way_node_dependencies`**, which used
-  `parallel_classify_accumulate` with a per-worker `IdSet`: the
-  bitmap is sized by the node ID space (~1.5 GB at planet),
-  multiplied by ~30 decode threads. Documentation at
-  `scan/classify.rs:300-308` already flagged this exact pattern
-  as a known concern at 14.59 GB at planet. Migration: switched
-  to `parallel_classify_phase` so workers emit per-blob
-  `Vec<i64>` of way node-refs (bounded by blob size, ~640 KB max),
-  consumer merges into one shared IdSet through the 32-slot
-  result channel. Re-bench (UUID `7e74981a`): **planet 7m57s
-  wall, 6.97 GB peak anon** (was 8m08s / 24 GB; **−71 % RSS**,
-  wall ~unchanged). Default mode `tags-filter w/highway=primary`
-  re-bench (UUID `258a2e9a`): 1m57s / 2.59 GB (was 1m48s / 2.6 GB;
-  +8 % wall, RSS unchanged). `collect_relation_member_closure`
-  was NOT migrated despite using the same per-worker pattern -
-  its merge step needs `&mut included_relation_ids` while
-  classify needs `&included_relation_ids`, so they cannot
-  co-exist in one parallel_classify_phase invocation; the
-  per-worker accumulation there is also bounded enough (6.8 GB
-  peak even at planet invert-match). Pinned in a comment block
-  inside the function.
+planet-safe" table is now empty. Per-item record (numbers, root
+causes, the origin of the "shape != root cause" lesson) moved to the
+Completed record at the bottom of this file.
 
 ### Latent same-shape risks (not gating 1.0)
 
@@ -230,21 +192,12 @@ Two commands share the
 time-filter snapshot OOM. Neither has been benched at planet
 RSS-wise; neither blocks 1.0 today.
 
-**Critical lesson from the tags-filter investigation (2026-04-28):
-shape ≠ root cause. Always instrument first.** The pre-migration
-TODO entry for tags-filter `--invert-match` claimed the par_iter+collect
-shape was the 28.3 GB peak's root cause, by analogy with time-filter.
-The actual measurement showed pass 2 (which has that exact shape)
-peaks at only ~7 GB at planet. The 24 GB came from a sibling phase
-(`collect_way_node_dependencies`) using `parallel_classify_accumulate`
-with a per-worker `IdSet` bitmap whose size scales with ID space
-not element count. Both bugs are real, but they live in different
-phases and have different fixes. **Before assuming either of these
-two commands needs the par_iter+collect migration, run a planet bench
-with full sidecar instrumentation and read the per-phase RSS table.**
-The actual blocker may be a sibling phase (e.g. an
-`parallel_classify_accumulate` caller that's now visible because
-the headline phase isn't dominating).
+**Critical lesson (2026-04-28): shape != root cause, always instrument
+first.** See the tags-filter bullet above. Before assuming either of
+these two commands needs the par_iter+collect migration, run a planet
+bench with full sidecar instrumentation and read the per-phase RSS
+table - the actual blocker may be a sibling `parallel_classify_accumulate`
+caller instead.
 
 When you do bench, the data lives in `brokkr sidecar <UUID> --human`
 and won't survive a subsequent forced/failed run from any other
@@ -254,33 +207,16 @@ batch boundary leave fresh state in the FIFO - the time-filter
 migration set up that pattern in `src/commands/time_filter/mod.rs`;
 mirror it if you expect SIGKILL on the first attempt.
 
-- [x] ~~**`getid --add-referenced` pass 2**~~ - **PLANET-SAFE AT
-  CURRENT WORKLOAD, no migration needed.** Benched 2026-04-28 at
-  commit `afe3139` (UUID `dirty`, brokkr's hardcoded ID set: 3 ways
-  + 3 relations + ~76 referenced nodes via pass 1): planet wall
-  **96.3 s**, peak anon **1.26 GB** at the GETID_PASS2 phase
-  (par_iter+collect shape). Pass 1 (`parallel_classify_accumulate`
-  with per-worker `IdSet`) peaks at 499 MB - the per-worker bitmap
-  stayed small because only 3 way IDs needed scanning. The europe
-  9.03 GB pass 2 peak observed 2026-03-29 (UUID `c0d364c3` at
-  commit `7cf002c`) was on pre-`DecompressPool` /
-  pre-`parse_and_inline`-fix infrastructure; HEAD's pipelined-reader
-  memory profile is dramatically smaller. **Same lesson as
-  tags-filter (2026-04-28): shape ≠ root cause. The par_iter+collect
-  shape did not trigger the predicted peak because brokkr's tiny
-  hardcoded ID set yields ~zero output blobs per batch (29 framed
-  output items total at planet, 8 KB), so the `Vec<OwnedBlock>`
-  collected per batch is almost empty.** Pass 2 is read-bound, not
-  memory-bound: `writer_recv_wait_ns=72.4 s` of the 72.9 s pass 2
-  wall, `pipeline_decoded_recv_wait_ns=43.7 s`. Future risk is a
-  workload with a much larger / wider-spread input ID set
-  (millions of IDs hitting many blobs at high keep-rate), which
-  would re-introduce the result accumulation peak - but that's the
-  same axis as the deferred TODO line below ("Custom ID set
-  distributions for `getid` / `getparents`") and not gating 1.0.
-  Counter `getid_dep_node_ids` added 2026-04-28 (commit forthcoming)
-  emits the dep-set size between pass 1 and pass 2, so a future
-  run with a different ID set surfaces the size up-front before
+- [x] ~~**`getid --add-referenced` pass 2**~~ **PLANET-SAFE AT CURRENT
+  WORKLOAD, no migration needed.** Benched 2026-04-28: planet 96.3 s
+  wall, 1.26 GB peak anon (par_iter+collect shape) - didn't trigger
+  the feared peak because brokkr's tiny hardcoded ID set yields
+  ~zero output blobs per batch. Pass 2 is read-bound, not
+  memory-bound (`writer_recv_wait_ns` = 99% of wall). Same lesson as
+  tags-filter: shape != root cause. Future risk is a much larger /
+  wider-spread input ID set re-introducing the accumulation peak -
+  see "Custom ID set distributions" below, not gating 1.0. Counter
+  `getid_dep_node_ids` (2026-04-28) surfaces dep-set size before
   pass 2 starts.
 
 - [ ] **`altw` sparse path** (`src/commands/altw/mod.rs:485-510`
@@ -398,11 +334,20 @@ Known to work, no performance question open, but not in the results DB:
   Milestone 3.
 
 - [ ] **Expose phase events as a proper Rust event/hook API** - wrap
-  every instrumentation call in per-command `probes` modules, then swap
-  the backend from the current FIFO sink to `tracing` spans/events so
-  library consumers can subscribe. Full rollout (call-site shape,
-  coverage sweep, brokkr `--probes`, backend migration) in
-  [`notes/instrumentation-layering.md`](notes/instrumentation-layering.md).
+  instrumentation calls in per-command `probes` modules, then swap the
+  backend from the current FIFO sink to `tracing` spans/events so
+  library consumers can subscribe. **History (recovered 2026-07-13):**
+  a probes-module PoC on time-filter landed (`2eae6ff`) and was
+  reverted (`ddd6dc7`) after stress-testing against altw's ~140
+  counters / 26 markers showed the design does not absorb the real
+  aggregation shapes (AtomicU64 + thread::scope, channel-merged Stats,
+  post-blob nanosecond accumulators); the plan doc
+  (`notes/instrumentation-layering.md`) was retired with it (deleted in
+  `9770abc`, recoverable from git history). If revisited, start from
+  the revert message's guidance - cfg-gated empty-twin + ZST tuple-tail
+  composition, shaped per command's actual question - not from the old
+  rollout plan. No `probes` module or `tracing` usage exists in the
+  tree today.
 
 - [ ] **Reclaim europe's lost prefetch win after scan-audit.** The
   2026-04-20 scan-audit swap to `HeaderWalker` gave up ~14 s of
@@ -550,15 +495,11 @@ membership, not spatial).
 - [ ] **Complete/smart strategies** - per-region way/relation ID
   tracking. Memory: N × ~3 GB (bbox_node_ids + all_way_node_ids per
   region). Feasible for ~10 regions on 30 GB host, ~40 on 128 GB.
-- [x] ~~**Raw passthrough**~~ - CLOSED 2026-04-20 via shadow counter
-  (planet 5-region `--config --simple` at commit `57b01f9`, UUID
-  `dad573cb`): 0 / 32,835 node blobs qualify under any partial-passthrough
-  gate. Same outcome as tags-filter's earlier 0 / 50,364. Structural:
-  ID-sorted PBFs put chronologically-adjacent (geographically-scattered)
-  nodes in each blob, so a blob's geographic bbox is ~planet-wide and
-  cannot fit in a sub-planet region. The all-N-contained path stays
-  for the N=1 / fully-overlapping niche. Load-bearing pin in
-  `src/commands/extract/multi.rs::try_extract_multi_single_pass`.
+- [x] ~~**Raw passthrough**~~ - CLOSED 2026-04-20: shadow counter
+  measured 0/32,835 node blobs qualify (same outcome as tags-filter's
+  0/50,364). Structural: ID-sorted PBFs scatter geography per blob,
+  so a blob's bbox is ~planet-wide and can't fit a sub-planet region.
+  Pin in `src/commands/extract/multi.rs::try_extract_multi_single_pass`.
 
 ### Export (GeoJSON/GeoPackage)
 
@@ -672,16 +613,19 @@ single-pass, tag expression and bbox filtering.
 - [ ] Migration guide from other tools - command mapping table, behavioral
   differences, indexdata workflow explanation. Build on existing
   `reference/osmium-parity.md`.
-- [ ] **Document the `merge-changes -> apply-changes` pipeline pattern in
-  README.** When applying accumulated dailies (e.g. a week worth), squashing
-  them with `merge-changes` first and then running `apply-changes` once on
-  the result is the recommended shape - cheaper than running `apply-changes`
-  N times. The 5x speedup at planet 7-OSC (commit `99057fa`, 267 s -> 55 s)
-  makes this an unambiguous recommendation now; pre-parallel the squash itself
-  was 4m27s and the calculus was murkier. Original suggestion from the
-  apply-changes Q7 reviewer round (2026-04-21), retired from the now-deleted
-  `notes/merge-changes.md` plan doc 2026-04-28 when the parallel-drain work
-  shipped. Pure documentation; no code change needed.
+- [x] ~~**Document the `merge-changes -> apply-changes` pipeline pattern in
+  README.**~~ **DONE 2026-07-13** - README's CLI section now documents
+  squash-then-apply-once with the measured numbers. Original rationale
+  preserved: when applying accumulated dailies (e.g. a week worth),
+  squashing them with `merge-changes` first and then running
+  `apply-changes` once on the result is the recommended shape - cheaper
+  than running `apply-changes` N times. The 5x speedup at planet 7-OSC
+  (commit `99057fa`, 267 s -> 55 s) made this an unambiguous
+  recommendation; pre-parallel the squash itself was 4m27s and the
+  calculus was murkier. Original suggestion from the apply-changes Q7
+  reviewer round (2026-04-21), retired from the now-deleted
+  `notes/merge-changes.md` plan doc 2026-04-28 when the parallel-drain
+  work shipped.
 - [ ] **`renumber` - maintenance polish** (current: 204.5 s / 3m25s planet at `aee7727`,
   historical 194 s at `cb99106`, 3.3 GB peak anon, zero temp disk).
   Three candidate items (varint fast path, `way_id_set` vs schedule, reframe
@@ -695,6 +639,8 @@ single-pass, tag expression and bbox filtering.
 - [ ] CI status badge - `https://img.shields.io/github/actions/workflow/status/folknor/pbfhogg/ci.yml`
   (requires GitHub Actions CI workflow)
 - [ ] Add GitHub Actions CI - clippy, tests, rustfmt, doc build on Linux
+  (`.github/workflows/` has only `deploy.yml` + `docs.yml` today; no
+  clippy/test workflow)
 - [ ] Add GitHub Actions release pipeline - build binaries on tag push, attach to GitHub release
 - [ ] CI with benchmark regression guard.
 - [ ] API documentation for library consumers.
@@ -777,31 +723,17 @@ per-iteration allocations remain across the codebase, ordered by impact:
   Measured: multi-extract Japan node classify 1081ms → 748ms (-31%).
   See [notes/columnar-integration.md](notes/columnar-integration.md).
 
-- [x] **Smart-extract planet memory blocker - CLOSED 2026-04-11, ship
-  as-is.** The 2026-04-10/11 investigation (4 reviewer rounds, 6
-  commits) shipped a 29% wall improvement on Europe smart extract
-  (254s → 181s) and also delivered complete −17% and simple −15% via
-  the same `0b085b1` PASS1 schedule reuse. Planet measured on 2026-04-11
-  at commit `cadc3e6`, UUID `2d028196`, plantasjen (32 GB, 27.9 GB
-  avail), Europe bbox, `--bench 1` single sample: **279s wall / 11.17
-  GB peak anon RSS.** The Europe×2.6 = 26-28 GB projection was wrong
-  by ~2.4× because peak anon is dominated by PASS3 write work
-  (bbox-sized), not PASS1 scanning the input file. Per the round-4
-  decision tree, < 25 GB = ship as-is. The reusable packet pool,
-  compact payload, malloc_trim-at-boundary, and bumpalo arena options
-  from the round-4 mitigation menu are all **not needed** for this
-  workload and have been closed out.
-
-  Caveat: measured with Europe bbox. A substantially larger bbox
-  (beyond continent scale) would grow PASS3's touched working set
-  and could push peak anon higher. If extract-on-planet ever becomes
-  a recurring operation for bboxes > Europe, re-measure. Whole-planet
-  bbox isn't a real workload - use `cat` passthrough.
-
-  Mechanism: cold-arena-page residency cascade. Post-PASS1 header
-  scans touched glibc's bloated free-list pages that were previously
-  reserved but not resident; the fix (commits `d4ea760`, `0b085b1`)
-  plumbs the PASS1 schedule forward so PASS2/PASS3 don't rescan.
+- [x] **Smart-extract planet memory blocker** - CLOSED 2026-04-11,
+  ship as-is. The investigation shipped a 29% wall improvement on
+  Europe smart extract (254s -> 181s), plus complete -17% and simple
+  -15% via the same PASS1 schedule reuse (`0b085b1`). Planet: 279s
+  wall / 11.17 GB peak anon (bbox-sized PASS3 write work dominates,
+  not PASS1 scan). Mechanism: cold-arena-page residency cascade,
+  fixed by plumbing the PASS1 schedule forward so PASS2/PASS3 don't
+  rescan. **Caveat: measured with Europe bbox** - a substantially
+  larger bbox would grow PASS3's working set and could push peak
+  anon higher; re-measure if extract-on-planet with a bbox beyond
+  Europe scale becomes a recurring operation.
 
 **Milestone B: vectorization (after columnar layout stabilizes)**
 
@@ -883,15 +815,71 @@ per-iteration allocations remain across the codebase, ordered by impact:
   The codebase already does the most valuable composition (inline
   indexdata in all write paths). Multi-pass commands can't consume
   streams. See [notes/streaming-pipeline-composition.md](notes/streaming-pipeline-composition.md).
-- [x] ~~Dense ALTW compact rank-indexed array~~ - CLOSED 2026-04-30 by
-  commit `c6f08ff` (sparse rank-indexed flat) + `b70dd8c` (dense removed).
-  The proposed rank-indexed layout landed as the new sparse encoding,
-  which dominated dense at every measured scale (japan 4.3x faster) and
-  worked in regimes dense did not (europe survives where dense OOMs);
-  dense was then removed entirely. Reviewer items "parallel pass 1" and
-  "rank-compacted index" would have converged dense to the same encoding,
-  same access pattern, same wall - so maintaining two near-identical
-  implementations was not earned.
+- [x] ~~Dense ALTW compact rank-indexed array~~ - CLOSED 2026-04-30
+  (`c6f08ff` + `b70dd8c`). The proposed rank-indexed layout landed as
+  the new sparse encoding, dominating dense at every measured scale
+  (japan 4.3x faster, europe survives where dense OOMs); dense
+  removed entirely.
 - [ ] Verify GeoJSON polygon format coverage for extract (does `--polygon`
   accept GeoJSON, or only .poly format?).
 - [ ] History-file support - decide in-scope or explicitly out-of-scope.
+
+## Completed record
+
+Resolved items moved out of the open sections above (2026-07-13
+restructure), full text preserved. Nothing here is actionable; it
+exists so measured numbers, commit hashes, and pins against
+re-attempting stay greppable in one place.
+
+### Item-level completions
+
+- [x] ~~**`sort` correctness hole: intra-blob disorder is invisible**~~ **FIXED 2026-07-11.** Pass 1 now tracks intra-blob monotonicity (`scan_block_ids_checked`) keyed on the header's `Sort.Type_then_ID` claim, not indexdata presence, and routes any out-of-order blob into pass 2's decode + re-encode path. Recorded in CORRECTNESS.md; tests in `tests/cli_sort.rs`.
+
+- [x] ~~**`read` parallel variant OOM**~~ **FIXED 2026-07-11.** Rewritten as a one-pass byte-and-count-bounded worker-resident parallel fold (256 MiB in-flight budget). Planet: SIGKILL -> 54 s / 616 MB peak anon, exact element-count parity with sequential. Zero production consumers of `par_map_reduce` existed, so no planet-safe pipeline was touched. Full numbers and the fadvise follow-up aside are in [reference/performance-history.md](reference/performance-history.md) "Env-gated read-path batch".
+
+**Read-path follow-ups from the 2026-07-11 architecture reports** - outcomes settled in [reference/performance-history.md](reference/performance-history.md) "Env-gated read-path batch" (full detail there; verbatim reports live in git history). Summary: `BlobHeader.datasize` validation FIXED (`MAX_BLOB_DATASIZE` bound rejects oversized declared sizes pre-allocation, CORRECTNESS.md); ordered-pipeline batch rebuild BUILT then REVERTED (`aabb696`, no isolated win); command-transform fusion into decode workers KEPT ([ADR-0009](decisions/0009-fused-command-transforms.md), `aabb696`, -6.5 to -7.7% at 8k across getid/getparents/tags-filter); sequential-path double copy FIXED (`3ccc580`, owned-Vec scratch constructors, no regression across 16 cells); count-only buffer knobs BUILT env-gated then REVERTED (`629d9ca`, no knob improved anything).
+
+- [x] ~~**`diff --format osc` metadata fidelity**~~ **FIXED 2026-07-10.** OSC writer emitted raw newline/tab/CR inside XML attribute values, silently corrupting multi-line tags on apply (osmium parity fix: `push_attribute_escaped` in `src/osc/write.rs` now emits `&#10;`/`&#13;`/`&#9;`). Roundtrip regression tests added.
+
+- [x] ~~**apply-changes drops OSC element metadata**~~ **FIXED 2026-07-10.** `CompactDiffOverlay` gained a per-record metadata block (version/timestamp/changeset/uid/user); all apply-changes write paths pass it through, and `diff --format osc` now emits the full metadata set (was version-only) - the derive -> apply circle is metadata-lossless end-to-end. Note: Geofabrik public diffs strip changeset/uid/user (GDPR) - that's source data, not loss. Pinned by `derive_then_apply_preserves_metadata`.
+
+**Open decision on `getparents`** - **RESOLVED 2026-07-11**: threshold-dispatch on blob count landed for both `getparents` and `getid` (150k-blob threshold, bounded header-probe estimator; see [`ADR-0006`](decisions/0006-blob-count-threshold-dispatch.md)). Matrix in [notes/getparents.md](notes/getparents.md) "Crossover measured".
+
+- [x] ~~**altw-as-renumber (in-RAM coord-table thesis)**~~ **EXPERIMENT FAILED (2026-04-16)** - OOM-killed at Europe (real planet unique-referenced ~10B / ~80GB vs 2B/16GB estimate). Disproven for Europe+; the 4-stage external-sort shape is load-bearing. Post-mortem in [notes/altw-optimization-history.md](notes/altw-optimization-history.md). Active work moved to [notes/altw-external.md](notes/altw-external.md).
+
+- [x] ~~**check --refs**~~ - landed 2026-04-17. Planet 1225 s -> 53.8 s (22.8x, peak RSS 2.17 GB). Selective wire-format parser (step #3) was rejected: post-parallel split is ~162 s decompress vs ~2 s parse at Europe, so the next lever is decompression throughput, not selective parse. Pin in `src/commands/check/refs.rs::check_refs` doc comment.
+
+- [x] ~~**getid include mode**~~ - landed 2026-04-20 via the shared `pread`-only `HeaderWalker` primitive (`src/read/header_walker.rs`). Planet 43.7 s -> 6.1 s (7.2x), disk read 88 GB -> 601 MB. Walker is syscall-bound (io_uring batching not pursued). 2026-07-10 blob-density follow-up found HW regresses on high-blob-count encodings; threshold dispatch recorded in [`ADR-0006`](decisions/0006-blob-count-threshold-dispatch.md).
+
+- [x] ~~**diff-snapshots (text and `--format osc`)**~~ - landed 2026-04-20. ID-range sharded parallel block-pair merge, `-j/--jobs N` flag: planet text 2134 s -> 227.5 s (9.5x, `-j 16`), osc 2225 s -> 293.8 s (7.6x). Both beat the 8-min aspirational target. Remaining follow-up: auto-enable parallel by default.
+
+### 1.0 blockers, per-item record (all resolved 2026-04-27 / 2026-04-28)
+
+- [x] ~~**`check --ids` (streaming default mode)**~~ **fixed 2026-04-27**
+  (`516129e`) - rewrote to `parallel_classify_phase`. Planet: SIGKILL
+  at 29.2 GB -> 57 s wall / 504 MB peak anon.
+- [x] ~~**`cat --clean`**~~ **fixed 2026-04-27** (`6184602` + `b347c0a`)
+  - rewrote to `parallel_classify_phase` per kind with `ReorderBuffer`
+  streaming output. Planet: SIGKILL at 28.9 GB -> 5m34s wall / 750 MB
+  peak anon (38x RSS reduction). Output stays type-sorted (nodes,
+  ways, relations).
+- [x] ~~**`time-filter`**~~ **LANDED 2026-04-28** (`83183fb`) - migrated
+  to `parallel_classify_phase` + `ReorderBuffer`, mirroring the
+  `cat --clean`/`check --ids` precedents. Planet: SIGKILL at ~28 GB
+  -> 4m30s wall / 812 MB peak anon. Instrumentation confirmed the
+  ~28 GB working set was structural to the old parallel-decode +
+  batch-collect architecture, not buffer retention. Plan doc:
+  [notes/time-filter-optimization.md](notes/time-filter-optimization.md).
+- [x] ~~**`tags-filter --invert-match w/highway=primary`**~~
+  **LANDED 2026-04-28** (`17b116c`). The 28.3 GB peak was
+  misattributed to pass 2 (which only peaks at ~7 GB - it already
+  used the right shape). Actual culprit: `collect_way_node_dependencies`
+  used `parallel_classify_accumulate` with a per-worker `IdSet` sized
+  by node-ID-space (~1.5 GB) x ~30 decode threads. Migrated to
+  `parallel_classify_phase` (workers emit bounded per-blob `Vec<i64>`,
+  consumer merges into one shared IdSet). Planet: 24 GB -> 6.97 GB
+  peak anon (-71%), wall unchanged. `collect_relation_member_closure`
+  was NOT migrated (borrow conflict: merge needs `&mut`, classify
+  needs `&`) - pinned in a comment in the function. This is the
+  origin of the "shape != root cause" lesson recorded under "Latent
+  same-shape risks" above.

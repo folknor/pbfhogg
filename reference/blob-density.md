@@ -371,8 +371,8 @@ in TODO.md.
   adversarial test PBFs; the `--unsort` mode exercises `sort`'s
   overlap-run path which is orthogonal to but motivated alongside
   this work.
-- [`notes/sort.md`](../notes/sort.md) - the `HeaderWalker` pass-1
-  trade-off that first surfaced the asymmetry.
+- [`reference/performance-history.md`](performance-history.md) "Sort" -
+  the `HeaderWalker` pass-1 trade-off that first surfaced the asymmetry.
 - [`notes/getparents.md`](../notes/getparents.md) - second instance
   of the same asymmetry, larger magnitude.
 - [`reference/pipelined-reader-paths.md`](pipelined-reader-paths.md) -

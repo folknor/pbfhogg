@@ -817,8 +817,8 @@ fn sort_preserves_historical_information_feature() {
 /// A non-indexed blob that is internally unsorted but whose ID range does
 /// not overlap its neighbours must be repaired, not passed through.
 ///
-/// This is the correctness hole from `notes/sort.md` ("intra-blob disorder
-/// is invisible"): pass 1's blob-range overlap check sees nothing to fix, so
+/// This is the intra-blob-disorder correctness hole (ruling in
+/// CORRECTNESS.md): pass 1's blob-range overlap check sees nothing to fix, so
 /// pre-fix `sort` emitted a byte-identical copy stamped `Sort.Type_then_ID` -
 /// silent corruption. The non-indexed pass-1 fallback now tracks intra-blob
 /// monotonicity while it scans element IDs and routes any internally

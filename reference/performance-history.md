@@ -384,6 +384,126 @@ breakdown no longer maps onto the code.
 
 ---
 
+## Sort
+
+`pbfhogg sort` repairs unsorted PBFs into `Sort.Type_then_ID` order via a
+two-pass blob-level permutation sort: pass 1 walks blob headers and builds
+an index of `(element_type, min_id, max_id)`; pass 2 raw-passthroughs
+non-overlapping blobs and decode-merges overlapping ones through a binary
+heap. **Production reality: Geofabrik / planet input already ships
+sorted**, so overlap count is ~zero and pass 2 is pure blob-level
+`copy_file_range` passthrough - the command runs as a verify-and-reframe
+step, not a sort. The genuinely-unsorted path (osmosis output, hand-edited
+fixtures) is the only scenario exercising the decode-merge path and has no
+configured benchmark dataset.
+
+Optimization arc drafted 2026-04-23 in `notes/sort.md` (retired 2026-07-13;
+this is its durable record). All measurements plantasjen, NVMe->NVMe on one
+ext4 partition (`/dev/nvme1n1p1`; the `target=hdd` label in `brokkr env` is
+the cargo `target/` dir, not the sort scratch path).
+
+### Landed opportunities
+
+- **#1 `copy_file_range` coalescing (commit `244c6ec`).** Transplanted the
+  apply-changes drain coalescer: track an in-flight `(start, end)` range,
+  extend on contiguous-in-input blobs, flush as one `write_raw_copy` on
+  break. On already-sorted input the whole file collapses to a single CFR
+  call. Europe (`740ed14f`): producer syscalls 522,168 -> 1,
+  `sort_copy_range_coalesced` 522,167, `writer_pipeline_send_wait_ns` 35 s
+  -> 2.65 us. **Wall did not move** (53.0 -> 56.3 s, single-sample) because
+  the writer was already drain-limited by ext4 in-kernel CFR bandwidth -
+  the coalescer shifts time from `SORT_WRITE_LOOP` to `SORT_FLUSH` without
+  shortening either thread's real work. Useful for any future change that
+  unpins the writer.
+
+- **#4 `HeaderWalker` pass 1 (commit `1f97fae`).** Migrated pass 1 from
+  `FileReader` (BufReader + `fadvise(SEQUENTIAL)`) to `HeaderWalker` (pread
+  + `fadvise(RANDOM)`). Splits hard on blob density:
+
+  | scale | pass-1 disk read | pass-1 wall | total wall | verdict |
+  |---|---|---|---|---|
+  | europe (522k blobs) | ~34 GB -> 2.86 GB (-91%) | 16-18 s -> 27.4 s (+49%) | 56.3 -> 68.0 s (+21%) | regression |
+  | planet (50k blobs) | 32 GB -> 674 MB (-98%) | 18.94 -> 6.73 s (-65%) | 135.1 -> 123.3 s (-9%) | win |
+
+  Europe regresses because 522k serial QD=1 preads (~50 us NVMe
+  random-read latency each) lose to BufReader's overlapped readahead;
+  planet wins because at 50k blobs the walk is cheap AND the pass-2
+  page-cache-thrashing shutdown cost (`SORT_PASS2_END`: 32,788 majflt /
+  2.56 s, process pages evicted by the write loop) vanishes. **Production =
+  planet, so the walker is a net win in the scenario that matters.** The
+  cleanup-vanish is probabilistic (cache-state dependent): later planet
+  runs on `68e1ba0` saw `SORT_PASS2_END` return at ~2 s / ~31k majflt.
+
+- **#3 parallel overlap-rewrite in pass 2 (2026-04-24).** Overlap runs
+  (kind-bounded, self-contained) parallelise cleanly via
+  `overlap_runs.par_iter()` producing `Vec<OwnedBlock>` buffered before the
+  serial write loop; zero-cost on already-sorted input
+  (`overlap_runs.is_empty()` short-circuits). Predicted 1.5-3x on overlap
+  work, **unverified** - production input is already sorted (zero overlap
+  runs) and no unsorted dataset is configured. Memory: buffered overlap
+  output is uncapped; pathological unsorted input could approach input size
+  (fix if it bites: bounded rayon pipeline + reorder buffer).
+
+### Planet writer-side floor (storage-stack bound, not software)
+
+At planet the producer does one syscall and the writer does all the wall.
+Buffered: ~116 s of in-kernel ext4 CFR at ~800 MB/s (92 GB / 114.9 s).
+`--io-uring` (`7f6288c0`): ~111 s of ReadFixed+WriteFixed at ~827 MB/s,
+total 118.1 s (**-4%**) - but reintroduces the `SORT_PASS2_END` page-cache
+thrash (25,478 majflt / 1.65 s) that buffered post-walker eliminated,
+because uring reads payload bytes through the page cache while ext4
+in-kernel CFR bypasses it. Buffered stays the default; `--io-uring` only
+when 4% beats cache cleanliness.
+
+Both paths are single-thread-bound. An ext4 CFR concurrency probe
+(`probe_ext4_cfr.py`, deleted after use) measured 1 vs 2 concurrent
+`copy_file_range` on the same partition: 792 -> 931 MB/s aggregate
+(466 MB/s per thread under contention) = **1.18x**, ~21 s theoretical
+planet savings. The probe was optimistic (different inodes = less
+contention than same-file-different-offset), so real parallel-writer
+chunking scales <=1.18x. **#2 parallel-writer chunking parked**: days of
+`parallel_writer.rs` restructuring for <18% wall. The ~800 MB/s ceiling is
+an ext4-CFR characteristic, not pbfhogg code.
+
+Planet hotpath (`e42b0c8c`) + alloc (2026-04-27 at `4fc8e35`, UUIDs
+`d64932d2` / `26fb329e`): 115.4 s wall, **94% in the pool worker's
+`copy_range_to_fd`** (unannotated) inside `writer.flush()`; main thread
+Blocked 20% avg CPU waiting on the writer drain. No allocation pressure
+(459 MB exclusive, all `blob_wire::parse`; net diff 78.6 MB). Nothing to
+chase in software on this storage stack.
+
+### Do-not-reattempt
+
+- **Streaming `fadvise(DONTNEED)` on a BufReader walk ("M3").** Tried
+  2026-04-24 on top of `1f97fae`: europe 53.8 s (-21% vs walker, cleanup
+  majflt 35k -> 0) but planet **136.3 s (+11% vs walker)** because it reads
+  the whole file and gives up the walker's pass-1 IO reduction (20 s
+  BufReader vs 6.7 s walker on planet). Zero-sum across europe+planet;
+  walker wins the tiebreaker on the production scale.
+- **Parallel-writer CFR chunking.** Parked, <=1.18x (above).
+- **Pipelined -> sequential decode conversion.** Off the table per the
+  project-wide anti-conversion rule
+  (`reference/pipelined-reader-paths.md`); sort uses direct pread per blob,
+  correct for the two-pass shape.
+
+The io_uring batched-header-probe walker that would flatten the europe
+pass-1 regression (and the same primitive several other commands want) is
+consolidated in `notes/header-walk-batching.md`; deferred,
+production-negligible.
+
+### Correctness: intra-blob disorder (fixed 2026-07-11)
+
+Blob-level permutation sort assumed every blob is internally sorted and
+nothing checked it: a file whose blobs are internally unsorted but whose
+blob `(min_id, max_id)` ranges do not overlap passed through byte-identical
+and stamped `Sort.Type_then_ID` - silent corruption. Fixed by
+`scan_block_ids_checked` (tracks intra-blob monotonicity during the min/max
+scan), keyed on the header's `Sort.Type_then_ID` claim rather than
+indexdata presence; any out-of-order blob is folded into pass 2's decode +
+re-encode. Full ruling in CORRECTNESS.md; tests in `tests/cli_sort.rs`.
+
+---
+
 ## Extract
 
 ### PASS1 schedule reuse (commits `d4ea760`, `0b085b1`, 2026-04-10/11)
@@ -877,6 +997,8 @@ into the sections above (or the named durable home); the file names are
 preserved here as breadcrumbs for searching old commit messages and PR
 descriptions.
 
+- `notes/sort.md` (retired 2026-07-13; the `sort` optimization arc is
+  complete and its durable measurement record is the "Sort" section above).
 - `notes/diff-snapshots-opportunities.md` (Tier 1 items landed; sharded
   parallel block-pair merge is the canonical implementation).
 - `notes/getid-include-optimization.md` (HeaderWalker + 1-pread probe

@@ -704,8 +704,9 @@ other consumers.
   "generate adversarial test data" framing.
 - [`notes/repack.md`](repack.md) - companion command; shares input-
   read + output-write plumbing and the same v1/v2 split.
-- [`notes/sort.md`](sort.md) - primary consumer of `--unsort` for
-  the overlap-rewrite path measurement.
+- [`reference/performance-history.md`](../reference/performance-history.md)
+  "Sort" - `--unsort` is the primary consumer of the overlap-rewrite
+  path it measures.
 - [`src/commands/degrade/mod.rs`](../src/commands/degrade/mod.rs) -
   the implementation.
 - [`src/commands/sort/mod.rs`](../src/commands/sort/mod.rs) -

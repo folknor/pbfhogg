@@ -471,10 +471,10 @@ mod tests {
         FULL_SCAN_ARM_MIN_BLOBS, GetparentsOptions, ScanArm, getparents_dispatched,
         getparents_with_arm,
     };
-    use crate::block_builder::{BlockBuilder, HeaderBuilder};
+    use crate::block_builder::{BlockBuilder, HeaderBuilder, MemberData};
     use crate::commands::getid::parse_ids;
     use crate::writer::{Compression, PbfWriter};
-    use crate::{Element, ElementReader, HeaderOverrides};
+    use crate::{Element, ElementReader, HeaderOverrides, MemberId};
 
     /// Write a node block, then optionally a way block, which can be written
     /// without indexdata to model a partially indexed input.
@@ -611,6 +611,99 @@ mod tests {
         let input = dir.path().join("input.pbf");
         write_blocks(&input, &[1, 2], Some((10, &[1, 2])), false);
         assert_eq!(ids_from_both_arms(&input, &["n1"], false), vec![10]);
+    }
+
+    /// Fixture exercising cross-kind blob skipping. Each kind lands in its
+    /// own indexed blob so the walker's `needed_blob_kinds` skip applies per
+    /// kind, and the relation-of-relation pins single-level parent semantics:
+    ///   node blob:     nodes 1, 2
+    ///   way blob:      way 10 -> refs [1, 2]
+    ///   relation blob: rel 100 -> [node 1, way 10]; rel 101 -> [rel 100]
+    fn write_rich_fixture(path: &std::path::Path) {
+        let file = std::fs::File::create(path).expect("create fixture");
+        let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+        writer
+            .write_header(&HeaderBuilder::new().sorted().build().expect("header"))
+            .expect("write header");
+        let mut block = BlockBuilder::new();
+        for id in [1i64, 2] {
+            block.add_node(id, 0, 0, std::iter::empty::<(&str, &str)>(), None);
+        }
+        writer
+            .write_primitive_block(block.take().expect("node block").expect("nodes"))
+            .expect("write nodes");
+        block.add_way(10, std::iter::empty::<(&str, &str)>(), &[1, 2], None);
+        writer
+            .write_primitive_block(block.take().expect("way block").expect("way"))
+            .expect("write way");
+        let rel100 = [
+            MemberData {
+                id: MemberId::Node(1),
+                role: "",
+            },
+            MemberData {
+                id: MemberId::Way(10),
+                role: "",
+            },
+        ];
+        block.add_relation(100, std::iter::empty::<(&str, &str)>(), &rel100, None);
+        let rel101 = [MemberData {
+            id: MemberId::Relation(100),
+            role: "",
+        }];
+        block.add_relation(101, std::iter::empty::<(&str, &str)>(), &rel101, None);
+        writer
+            .write_primitive_block(block.take().expect("relation block").expect("relations"))
+            .expect("write relations");
+        writer.flush().expect("flush fixture");
+    }
+
+    // The four tests below assert against hand-computed parent sets, NOT just
+    // walker-vs-pipelined agreement: both arms share `needed_blob_kinds`, so a
+    // wrong kind-mapping would drop the same parent in both and cross-arm
+    // equality alone would still pass. The expected literals are the oracle.
+
+    /// A node query must scan relation blobs: relations can hold a node member
+    /// directly. Confirms node blobs are skipped without dropping the relation
+    /// parent, and that single-level semantics exclude rel 101 (which only
+    /// references rel 100, not the queried node).
+    #[test]
+    fn node_query_scans_relation_blobs_for_relation_parents() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = dir.path().join("input.pbf");
+        write_rich_fixture(&input);
+        assert_eq!(ids_from_both_arms(&input, &["n1"], false), vec![10, 100]);
+    }
+
+    /// A way query skips way blobs (nothing references a way from a way) but
+    /// must still scan relation blobs for the relation that holds way 10 as a
+    /// member. Without --add-self the queried way itself is not emitted.
+    #[test]
+    fn way_query_skips_way_blobs_but_finds_relation_parents() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = dir.path().join("input.pbf");
+        write_rich_fixture(&input);
+        assert_eq!(ids_from_both_arms(&input, &["w10"], false), vec![100]);
+    }
+
+    /// A relation query skips node and way blobs (neither can reference a
+    /// relation) and finds only the relation-of-relation parent.
+    #[test]
+    fn relation_query_scans_relation_blobs_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = dir.path().join("input.pbf");
+        write_rich_fixture(&input);
+        assert_eq!(ids_from_both_arms(&input, &["r100"], false), vec![101]);
+    }
+
+    /// --add-self on a node query flips node blobs back on: the queried node
+    /// appears alongside its way and relation parents from the other blobs.
+    #[test]
+    fn add_self_node_query_emits_node_and_all_parent_kinds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = dir.path().join("input.pbf");
+        write_rich_fixture(&input);
+        assert_eq!(ids_from_both_arms(&input, &["n1"], true), vec![1, 10, 100]);
     }
 
     #[test]

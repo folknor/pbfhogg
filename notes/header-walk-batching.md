@@ -1,7 +1,7 @@
 # Header-walk batching - one primitive, several call sites
 
 Transient plan note. Consolidates a convergence that was living scattered
-across `notes/sort.md`, `notes/getparents.md`, and the TODO. Retire this
+across the sort/getparents optimization notes and the TODO. Retire this
 file when the primitive lands (its context moves into code comments then)
 or when the lever is definitively rejected. The durable *evidence* behind
 it - the encoder asymmetry, the shape taxonomy, the measured 8k walls -
@@ -34,7 +34,7 @@ it is.
 | `getid` include walker arm | `HeaderWalker` | ~103 s (walk-dominated) | same - dispatch currently routes to the full scan instead |
 | `check --refs` / `check --ids` | `build_classify_schedules_split` | ~101 s (**~2/3 of wall**) | **substantial** - roughly halves the 8k wall |
 | `cat --clean` / `repack` / `degrade` / `extract --smart` | `build_classify_schedules_split` | ~97-109 s (**18-29 % of wall**) | marginal - re-encode/write of 1.45 M tiny blobs dominates, not the walk |
-| `apply_changes::scanner`, `inspect/scan.rs` | `HeaderWalker` | unmeasured | listed in `notes/sort.md` opportunity 2 as beneficiaries if the primitive is generalized |
+| `apply_changes::scanner`, `inspect/scan.rs` | `HeaderWalker` | unmeasured | beneficiaries if the primitive is generalized |
 
 The two selective/verify read-only sites (`getparents`/`getid` walker
 arms, `check --refs`/`check --ids`) are where the walk is most of the
@@ -50,8 +50,9 @@ submit K header preads in flight, harvest completions, resubmit to keep
 the queue full. The call site stays single-threaded; `fadvise(RANDOM)`
 is preserved; NVMe queue-depth concurrency is recovered at the primitive
 level, collapsing the QD=1 latency term. One generalized primitive
-serves every call site above. Independently arrived at as
-`notes/sort.md` opportunity 2 and the `notes/getparents.md` walk lever.
+serves every call site above. Independently arrived at as the sort pass-1
+io_uring lever (`reference/performance-history.md` "Sort") and the
+`notes/getparents.md` walk lever.
 
 ## Why it is not trivial, and the alternatives
 
@@ -63,15 +64,16 @@ dependency; sharding does not work without a way to resync to a blob
 boundary blind.
 
 - **Buffered-sequential walk, dispatched on high blob count.** MEASURED
-  and rejected for `sort` (the "M3" experiment, `notes/sort.md`
-  opportunity 3): europe -21 %, but planet **+11 %** because it reads the
+  and rejected for `sort` (the "M3" experiment;
+  `reference/performance-history.md` "Sort" do-not-reattempt): europe
+  -21 %, but planet **+11 %** because it reads the
   whole file and gives up the walker's IO reduction (20 s BufReader vs
   6.7 s walker on planet). Zero-sum across europe+planet; walker wins the
   tiebreaker because planet is production. A blob-count dispatch could
   pick it only for high-blob-count inputs, but that is a second-choice
   fallback to the io_uring primitive.
-- **Worker-sharded seek-to-next-`BlobHeader` scan** (`notes/sort.md`
-  opportunity 1): each worker seeks into its file region and resyncs to
+- **Worker-sharded seek-to-next-`BlobHeader` scan** (the sort
+  sharded-walker mitigation): each worker seeks into its file region and resyncs to
   the next parseable blob header, walks serially, results reassembled in
   offset order. Needs a "sync to next BlobHeader" primitive that does not
   exist in the tree. Days of work; also recovers NVMe concurrency.
@@ -95,9 +97,9 @@ becomes real - then it is one primitive, not four separate fixes.
   matrices). Durable; outlives this note.
 - [`decisions/0006-blob-count-threshold-dispatch.md`](../decisions/0006-blob-count-threshold-dispatch.md) -
   the shipped alternative for `getid`/`getparents` (dispatch, not batch).
-- [`notes/sort.md`](sort.md) - opportunities 1/2/3 (the sharded scan,
-  the io_uring walker, the rejected M3 buffered walk) with sort-specific
-  numbers.
+- [`reference/performance-history.md`](../reference/performance-history.md)
+  "Sort" - the sharded scan, the io_uring walker, and the rejected M3
+  buffered walk with sort-specific numbers.
 - [`notes/getparents.md`](getparents.md) - the walk lever in context.
 - `src/read/header_walker.rs`,
   `src/scan/classify.rs::build_classify_schedules_split` - the code.

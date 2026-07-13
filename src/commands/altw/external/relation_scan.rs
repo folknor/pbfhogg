@@ -24,6 +24,7 @@ pub(super) struct RelationScanOutput {
     pub(super) member_way_ids: Option<IdSet>,
 }
 
+#[hotpath::measure]
 pub(super) fn collect_relation_member_ids_indexed(
     input: &Path,
     blob_meta: &[BlobMeta],

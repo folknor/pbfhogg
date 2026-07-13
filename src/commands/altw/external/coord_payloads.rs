@@ -117,6 +117,11 @@ pub(super) struct ConcurrentBlobLocationRouter {
     aborted: std::sync::atomic::AtomicBool,
     producer_done: std::sync::atomic::AtomicBool,
     abort_error: std::sync::Mutex<Option<String>>,
+    // Depth-gated WAIT span for stage-4 threads blocked in `wait_ready`
+    // (stage 3 behind stage 4); drives `brokkr sidecar --stalls`
+    // category S4_ROUTER. Only the slow path below touches it, so the
+    // already-published fast path stays lock-free.
+    wait_gauge: super::StallGauge,
     // Counters emitted by mod.rs after the scope joins.
     pub(super) stats: std::sync::Mutex<ConcurrentRouterStats>,
 }
@@ -167,6 +172,7 @@ impl ConcurrentBlobLocationRouter {
             aborted: std::sync::atomic::AtomicBool::new(false),
             producer_done: std::sync::atomic::AtomicBool::new(false),
             abort_error: std::sync::Mutex::new(None),
+            wait_gauge: super::StallGauge::new("WAIT_S4_ROUTER_START", "WAIT_S4_ROUTER_END"),
             stats: std::sync::Mutex::new(stats),
         })
     }
@@ -346,6 +352,10 @@ impl ConcurrentBlobLocationRouter {
             }
         }
         // Slow path: wait on the global Condvar, re-checking predicates.
+        // Genuinely blocked from here on (the fast path above returned
+        // for published slots), so the WAIT_S4_ROUTER stall span never
+        // fires on the hot path.
+        let _stall = self.wait_gauge.track();
         loop {
             let mu_guard = self
                 .notify_mu
@@ -690,6 +700,7 @@ pub(super) fn encode_blob_payload(
 
 /// Delta-encode one blob's coord slice using the raw sidecar record for that
 /// blob instead of a pre-decoded `&[u32]`.
+#[hotpath::measure]
 pub(super) fn encode_blob_payload_from_record(
     coord_bytes: &[u8],
     record: &[u8],

@@ -21,6 +21,39 @@ use super::blob_meta::BlobMeta;
 use super::radix::{NUM_BUCKETS, ScratchDir};
 use super::{BucketLayout, ID_RECORD_SIZE, IdRecord, NodeBlobInfo};
 
+/// `io::Write` shim between the id-shard `BufWriter`s and their files
+/// that attributes real write calls (BufWriter buffer drains, 256 KB
+/// granularity). `s1a_id_emit_ms` times the whole emission loop -
+/// locate + closure staging + record encode + BufWriter memcpy + any
+/// drains it triggers - so without this split, "CPU-limited emit" and
+/// "disk-limited writeback" are indistinguishable in one run. The
+/// atomics are shared across workers; at ~583 K drains per planet run
+/// the fetch_add cost is noise.
+struct TimedShardWriter<'a> {
+    file: std::fs::File,
+    write_ns: &'a std::sync::atomic::AtomicU64,
+    write_calls: &'a std::sync::atomic::AtomicU64,
+}
+
+impl std::io::Write for TimedShardWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let t = std::time::Instant::now();
+        let n = self.file.write(buf)?;
+        #[allow(clippy::cast_possible_truncation)]
+        self.write_ns.fetch_add(
+            t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.write_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
 /// Way-blob schedule entry for the parallel way scans.
 pub(super) struct WayBlobTask {
     pub(super) seq: u32,
@@ -115,6 +148,8 @@ pub(super) fn stage1_pass_a(
     let s1a_id_records_emitted = std::sync::atomic::AtomicU64::new(0);
     let s1a_id_records_skipped = std::sync::atomic::AtomicU64::new(0);
     let s1a_id_shard_bytes_written = std::sync::atomic::AtomicU64::new(0);
+    let s1a_id_shard_write_ns = std::sync::atomic::AtomicU64::new(0);
+    let s1a_id_shard_write_calls = std::sync::atomic::AtomicU64::new(0);
     let s1a_id_shard_flush_err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     // Per-(id-bucket) record counts. Each worker tallies into a local
     // `Vec<u64>` (no atomic in the hot loop - the per-record cost
@@ -141,6 +176,8 @@ pub(super) fn stage1_pass_a(
         let s1a_id_emitted_ref = &s1a_id_records_emitted;
         let s1a_id_skipped_ref = &s1a_id_records_skipped;
         let s1a_id_bytes_ref = &s1a_id_shard_bytes_written;
+        let s1a_id_shard_write_ns_ref = &s1a_id_shard_write_ns;
+        let s1a_id_shard_write_calls_ref = &s1a_id_shard_write_calls;
         let s1a_id_flush_err_ref = &s1a_id_shard_flush_err;
         let s1a_id_bucket_counts_workers_ref = &s1a_id_bucket_counts_workers;
         let layout_ref = layout;
@@ -159,7 +196,8 @@ pub(super) fn stage1_pass_a(
                     // Lazy-initialised on first blob so creation errors
                     // flow into the per-blob IIFE result and propagate
                     // through the existing tx/rx channel.
-                    let mut id_shard_writers: Vec<Option<BufWriter<std::fs::File>>> = Vec::new();
+                    let mut id_shard_writers: Vec<Option<BufWriter<TimedShardWriter<'_>>>> =
+                        Vec::new();
                     let mut id_rec_buf = [0u8; ID_RECORD_SIZE];
                     let mut id_bucket_local_counts: Vec<u64> = vec![0; NUM_BUCKETS];
 
@@ -225,7 +263,11 @@ pub(super) fn stage1_pass_a(
                                     })?;
                                     id_shard_writers.push(Some(BufWriter::with_capacity(
                                         super::radix::BUCKET_BUF_SIZE,
-                                        f,
+                                        TimedShardWriter {
+                                            file: f,
+                                            write_ns: s1a_id_shard_write_ns_ref,
+                                            write_calls: s1a_id_shard_write_calls_ref,
+                                        },
                                     )));
                                 }
                             }
@@ -401,6 +443,14 @@ pub(super) fn stage1_pass_a(
         crate::debug::emit_counter(
             "s1a_id_shard_bytes_written",
             s1a_id_shard_bytes_written.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s1a_id_shard_write_ms",
+            (s1a_id_shard_write_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000) as i64,
+        );
+        crate::debug::emit_counter(
+            "s1a_id_shard_write_calls",
+            s1a_id_shard_write_calls.load(std::sync::atomic::Ordering::Relaxed) as i64,
         );
     }
     crate::debug::emit_marker("EXTJOIN_S1_PASS_A_END");

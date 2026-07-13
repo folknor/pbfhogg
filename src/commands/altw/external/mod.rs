@@ -469,6 +469,62 @@ pub(super) fn raise_nofile_to_hard_cap() -> FdBudget {
     }
 }
 
+/// Depth-gated stall span shared by concurrent blockers.
+///
+/// `brokkr sidecar --stalls` pairs `WAIT_<CATEGORY>_START/_END` markers
+/// by name, which breaks if N threads emit interleaved pairs for the
+/// same category. The gauge collapses concurrent blockers into one
+/// non-overlapping span per busy period: START when depth goes 0 -> 1,
+/// END when it returns to 0. The mutex is held only across the depth
+/// transition + marker emit, and callers must gate `track()` behind a
+/// try_* fast path so unblocked operations never touch it.
+pub(super) struct StallGauge {
+    start_marker: &'static str,
+    end_marker: &'static str,
+    depth: std::sync::Mutex<u64>,
+}
+
+/// RAII exit for [`StallGauge::track`]; decrements depth on drop so
+/// early returns and error paths cannot leak an open WAIT span.
+pub(super) struct StallGuard<'a>(&'a StallGauge);
+
+impl StallGauge {
+    pub(super) fn new(start_marker: &'static str, end_marker: &'static str) -> Self {
+        Self {
+            start_marker,
+            end_marker,
+            depth: std::sync::Mutex::new(0),
+        }
+    }
+
+    /// Enter the stall; the returned guard exits it on drop.
+    pub(super) fn track(&self) -> StallGuard<'_> {
+        let mut depth = self
+            .depth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *depth == 0 {
+            crate::debug::emit_marker(self.start_marker);
+        }
+        *depth += 1;
+        StallGuard(self)
+    }
+}
+
+impl Drop for StallGuard<'_> {
+    fn drop(&mut self) {
+        let mut depth = self
+            .0
+            .depth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *depth = depth.saturating_sub(1);
+        if *depth == 0 {
+            crate::debug::emit_marker(self.0.end_marker);
+        }
+    }
+}
+
 /// Size of an id-bucketed occurrence record:
 /// `(local_node_id: u32, blob_idx: u32, blob_local_slot: u32)` = 12 bytes.
 pub(super) const ID_RECORD_SIZE: usize = 12;
@@ -825,10 +881,41 @@ pub fn external_join(
 
     let (s1_minflt_after, s1_majflt_after) = crate::debug::read_page_faults();
     let total_id_records: u64 = stage1_out.id_bucket_counts.iter().sum();
+    // Partition-balance diagnostics (max/min-per-shard convention, cf.
+    // derivepar_*_shard_max/min): min is taken over nonempty buckets so
+    // small fixtures that leave buckets unused still report the spread
+    // of the buckets that actually carry records.
+    let id_bucket_max_records: u64 = stage1_out
+        .id_bucket_counts
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    let id_bucket_min_records: u64 = stage1_out
+        .id_bucket_counts
+        .iter()
+        .copied()
+        .filter(|&c| c > 0)
+        .min()
+        .unwrap_or(0);
+    let id_buckets_nonempty = stage1_out
+        .id_bucket_counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .count();
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("extjoin_total_slots", stage1_out.total_slots as i64);
         crate::debug::emit_counter("extjoin_total_id_records", total_id_records as i64);
+        crate::debug::emit_counter(
+            "extjoin_id_bucket_max_records",
+            id_bucket_max_records as i64,
+        );
+        crate::debug::emit_counter(
+            "extjoin_id_bucket_min_records",
+            id_bucket_min_records as i64,
+        );
+        crate::debug::emit_counter("extjoin_id_buckets_nonempty", id_buckets_nonempty as i64);
         crate::debug::emit_counter(
             "s1_minflt_delta",
             (s1_minflt_after - s1_minflt_before) as i64,
@@ -976,6 +1063,24 @@ pub fn external_join(
                 .unwrap_or(0)
         })
         .collect();
+    // Slot-bucket balance twin of the id-bucket counters above; min is
+    // over nonempty buckets.
+    {
+        let max_entries: u64 = slot_entry_counts.iter().copied().max().unwrap_or(0);
+        let min_entries: u64 = slot_entry_counts
+            .iter()
+            .copied()
+            .filter(|&c| c > 0)
+            .min()
+            .unwrap_or(0);
+        let nonempty = slot_entry_counts.iter().filter(|&&c| c > 0).count();
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            crate::debug::emit_counter("extjoin_slot_bucket_max_entries", max_entries as i64);
+            crate::debug::emit_counter("extjoin_slot_bucket_min_entries", min_entries as i64);
+            crate::debug::emit_counter("extjoin_slot_buckets_nonempty", nonempty as i64);
+        }
+    }
     let slot_paths: Vec<std::path::PathBuf> = (0..slot_bucket_count)
         .map(|i| scratch_dir.bucket_path("slot", i))
         .collect();

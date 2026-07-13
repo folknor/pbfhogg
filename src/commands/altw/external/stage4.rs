@@ -338,6 +338,13 @@ pub(super) fn stage4_assembly(
     let way_reframe_counters = WayReframeCounters::new();
     let way_reframe_cref = &way_reframe_counters;
 
+    // Depth-gated WAIT span for decode workers blocked handing results
+    // to the consumer (writer backpressure); drives `brokkr sidecar
+    // --stalls` category S4_SEND. Entered only after a failed try_send,
+    // so unblocked sends never touch the gauge lock.
+    let s4_send_stall = super::StallGauge::new("WAIT_S4_SEND_START", "WAIT_S4_SEND_END");
+    let s4_send_stall_ref = &s4_send_stall;
+
     // Consumer-side counters.
     let mut s4_recv_ms: u64 = 0;
     let mut s4_write_ms: u64 = 0;
@@ -591,8 +598,15 @@ pub(super) fn stage4_assembly(
                             }
                         }
                     }
-                    if tx.send((desc.seq, result)).is_err() {
-                        break;
+                    match tx.try_send((desc.seq, result)) {
+                        Ok(()) => {}
+                        Err(std::sync::mpsc::TrySendError::Full(item)) => {
+                            let _stall = s4_send_stall_ref.track();
+                            if tx.send(item).is_err() {
+                                break;
+                            }
+                        }
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
                     }
                     #[allow(clippy::cast_possible_truncation)]
                     s4_send_ref.fetch_add(
@@ -1151,6 +1165,7 @@ impl WayReframeScratch {
 /// computed once in `external_join` as `total_slots - stage2_resolved_count`
 /// so it matches the dense path's per-ref counter without paying a per-ref
 /// decode in this hot loop.
+#[hotpath::measure]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn reframe_way_blob_with_locations(
     decompressed: &[u8],

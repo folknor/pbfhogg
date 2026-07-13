@@ -53,6 +53,7 @@ pub(super) struct IntegratedInputs<'a> {
     pub inject_prepass: bool,
 }
 
+#[hotpath::measure]
 fn scatter_bucket_entries(
     data_buf: &[u8],
     bucket_idx: usize,
@@ -119,7 +120,6 @@ pub(super) fn stage3_slot_reorder(
     let next_idx = std::sync::atomic::AtomicUsize::new(0);
     let s3_open_ms = std::sync::atomic::AtomicU64::new(0);
     let s3_read_ms = std::sync::atomic::AtomicU64::new(0);
-    let s3_parse_ms = std::sync::atomic::AtomicU64::new(0);
     let s3_scatter_ms = std::sync::atomic::AtomicU64::new(0);
     let s3_buckets_loaded = std::sync::atomic::AtomicU64::new(0);
     let s3_bytes_read = std::sync::atomic::AtomicU64::new(0);
@@ -133,6 +133,8 @@ pub(super) fn stage3_slot_reorder(
     let s3_integ_encode_ms = std::sync::atomic::AtomicU64::new(0);
     let s3_integ_straddler_copy_ms = std::sync::atomic::AtomicU64::new(0);
     let s3_integ_worker_tmp_bytes = std::sync::atomic::AtomicU64::new(0);
+    let s3_tmp_pwrite_ns = std::sync::atomic::AtomicU64::new(0);
+    let s3_tmp_pwrite_calls = std::sync::atomic::AtomicU64::new(0);
 
     let next_ref = &next_idx;
     let s3_open_ref = &s3_open_ms;
@@ -153,6 +155,8 @@ pub(super) fn stage3_slot_reorder(
     let s3_integ_encode_ref = &s3_integ_encode_ms;
     let s3_integ_straddler_copy_ref = &s3_integ_straddler_copy_ms;
     let s3_integ_worker_tmp_bytes_ref = &s3_integ_worker_tmp_bytes;
+    let s3_tmp_pwrite_ns_ref = &s3_tmp_pwrite_ns;
+    let s3_tmp_pwrite_calls_ref = &s3_tmp_pwrite_calls;
 
     let ctx = integrated;
     let router = ctx.router;
@@ -232,6 +236,7 @@ pub(super) fn stage3_slot_reorder(
                                 &mut tmp_byte_pos, tmp_file,
                                 s3_integ_encode_ref, s3_integ_straddler_copy_ref,
                                 s3_integ_worker_tmp_bytes_ref,
+                                s3_tmp_pwrite_ns_ref, s3_tmp_pwrite_calls_ref,
                             )?;
                             Ok(())
                         })();
@@ -314,6 +319,7 @@ pub(super) fn stage3_slot_reorder(
                             &mut tmp_byte_pos, tmp_file,
                             s3_integ_encode_ref, s3_integ_straddler_copy_ref,
                             s3_integ_worker_tmp_bytes_ref,
+                            s3_tmp_pwrite_ns_ref, s3_tmp_pwrite_calls_ref,
                         )?;
 
                         Ok(())
@@ -374,7 +380,6 @@ pub(super) fn stage3_slot_reorder(
         use std::sync::atomic::Ordering::Relaxed;
         crate::debug::emit_counter("s3_open_ms", s3_open_ms.load(Relaxed) as i64);
         crate::debug::emit_counter("s3_read_ms", s3_read_ms.load(Relaxed) as i64);
-        crate::debug::emit_counter("s3_parse_ms", s3_parse_ms.load(Relaxed) as i64);
         crate::debug::emit_counter("s3_scatter_ms", s3_scatter_ms.load(Relaxed) as i64);
         crate::debug::emit_counter("s3_buckets_loaded", s3_buckets_loaded.load(Relaxed) as i64);
         crate::debug::emit_counter("s3_bytes_read", s3_bytes_read.load(Relaxed) as i64);
@@ -394,6 +399,14 @@ pub(super) fn stage3_slot_reorder(
             "s3_worker_tmp_bytes",
             s3_integ_worker_tmp_bytes.load(Relaxed) as i64,
         );
+        crate::debug::emit_counter(
+            "s3_tmp_pwrite_ms",
+            (s3_tmp_pwrite_ns.load(Relaxed) / 1_000_000) as i64,
+        );
+        crate::debug::emit_counter(
+            "s3_tmp_pwrite_calls",
+            s3_tmp_pwrite_calls.load(Relaxed) as i64,
+        );
     }
 
     Ok(())
@@ -404,6 +417,7 @@ pub(super) fn stage3_slot_reorder(
 /// router as `BlobLocation::Worker`. Straddler halves are published via
 /// `router.publish_straddler_half`; the worker that lands the second
 /// half also encodes and transitions the slot to `Straddler`.
+#[hotpath::measure]
 #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
 fn emit_integrated_intersections(
     intersections: &[BlobBucketIntersection],
@@ -418,6 +432,8 @@ fn emit_integrated_intersections(
     s3_integ_encode_ref: &std::sync::atomic::AtomicU64,
     s3_integ_straddler_copy_ref: &std::sync::atomic::AtomicU64,
     s3_integ_worker_tmp_bytes_ref: &std::sync::atomic::AtomicU64,
+    s3_tmp_pwrite_ns_ref: &std::sync::atomic::AtomicU64,
+    s3_tmp_pwrite_calls_ref: &std::sync::atomic::AtomicU64,
 ) -> std::result::Result<(), String> {
     use std::os::unix::fs::FileExt as _;
     use std::sync::atomic::Ordering::Relaxed;
@@ -456,9 +472,13 @@ fn emit_integrated_intersections(
 
                 let byte_offset = *tmp_byte_pos;
                 let byte_length = encode_scratch.len() as u64;
+                let t_pw = std::time::Instant::now();
                 tmp_file
                     .write_all_at(encode_scratch, byte_offset)
                     .map_err(|e| format!("write worker tmp blob {blob_idx}: {e}"))?;
+                #[allow(clippy::cast_possible_truncation)]
+                s3_tmp_pwrite_ns_ref.fetch_add(t_pw.elapsed().as_nanos() as u64, Relaxed);
+                s3_tmp_pwrite_calls_ref.fetch_add(1, Relaxed);
                 *tmp_byte_pos += byte_length;
                 s3_integ_worker_tmp_bytes_ref.fetch_add(byte_length, Relaxed);
                 // Publish immediately: the pwrite has durably landed the

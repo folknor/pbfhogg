@@ -67,6 +67,7 @@ struct PreparedBucket {
     sort_ms: u64,
 }
 
+#[hotpath::measure]
 #[allow(clippy::cast_possible_truncation)]
 fn prepare_bucket(
     bucket_idx: usize,

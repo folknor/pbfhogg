@@ -51,6 +51,7 @@ pub(super) struct WayReframeStats {
 ///
 /// Errors are returned as `String` to match the existing par_iter result
 /// channel in `process_slot_batch`.
+#[hotpath::measure]
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(super) fn reframe_way_blob_with_locations(
     decompressed: &[u8],

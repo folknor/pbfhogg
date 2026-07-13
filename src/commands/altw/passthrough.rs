@@ -25,7 +25,7 @@
 
 use std::os::unix::fs::FileExt as _;
 use std::path::Path;
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
 
 use crate::blob::{BlobKind, DecompressPool, decompress_blob_raw};
 use crate::blob_meta::{BlobIndex, ElemKind};
@@ -75,8 +75,23 @@ struct BlobDescriptor {
     count: u64,
 }
 
+/// Cumulative pass-2 worker counters. Ns accumulators (blob-level
+/// timing granularity), converted to ms at emit time.
+#[derive(Default)]
+struct Pass2Counters {
+    pread_ns: AtomicU64,
+    decompress_ns: AtomicU64,
+    way_reframe_ns: AtomicU64,
+    nonway_ns: AtomicU64,
+    send_ns: AtomicU64,
+    bytes_read: AtomicU64,
+    way_blobs: AtomicU64,
+    nonway_blobs: AtomicU64,
+}
+
 /// Walk all blob headers and build the schedule. The first OsmHeader
 /// blob is consumed and used to build the output header bytes.
+#[hotpath::measure]
 fn build_schedule(
     input: &Path,
     overrides: &HeaderOverrides,
@@ -177,7 +192,8 @@ impl WorkerScratch {
 /// Decode one descriptor. Way blobs go through the wire-format
 /// reframe; everything else (Node decode, Unknown decode) goes through
 /// the existing `PrimitiveBlock` + `BlockBuilder` path.
-#[allow(clippy::too_many_arguments)]
+#[hotpath::measure]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn decode_one(
     desc: &BlobDescriptor,
     file: &std::sync::Arc<std::fs::File>,
@@ -188,15 +204,30 @@ fn decode_one(
     shared_node_ids: Option<&IdSet>,
     inject_prepass: bool,
     scratch: &mut WorkerScratch,
+    counters: &Pass2Counters,
 ) -> std::result::Result<(Vec<OwnedBlock>, Stats), String> {
+    let t_pread = std::time::Instant::now();
     scratch.read_buf.resize(desc.data_size, 0);
     file.read_exact_at(&mut scratch.read_buf, desc.data_offset)
         .map_err(|e| format!("pass 2 pread: {e}"))?;
+    #[allow(clippy::cast_possible_truncation)]
+    counters
+        .pread_ns
+        .fetch_add(t_pread.elapsed().as_nanos() as u64, Relaxed);
+    counters
+        .bytes_read
+        .fetch_add(desc.data_size as u64, Relaxed);
     scratch.output.clear();
 
     if desc.is_way_blob {
+        let t_dc = std::time::Instant::now();
         decompress_blob_raw(&scratch.read_buf, &mut scratch.decompress_buf)
             .map_err(|e| e.to_string())?;
+        #[allow(clippy::cast_possible_truncation)]
+        counters
+            .decompress_ns
+            .fetch_add(t_dc.elapsed().as_nanos() as u64, Relaxed);
+        let t_reframe = std::time::Instant::now();
         let stats = reframe_way_blob_with_locations(
             &scratch.decompress_buf,
             node_index,
@@ -232,6 +263,11 @@ fn decode_one(
             blobs_decoded: 1,
             ..Stats::default()
         };
+        #[allow(clippy::cast_possible_truncation)]
+        counters
+            .way_reframe_ns
+            .fetch_add(t_reframe.elapsed().as_nanos() as u64, Relaxed);
+        counters.way_blobs.fetch_add(1, Relaxed);
         return Ok((std::mem::take(&mut scratch.output), block_stats));
     }
 
@@ -244,8 +280,14 @@ fn decode_one(
     // `Bytes -> to_vec` incurred. Also skips the `WireBlob::parse_slice` copy the
     // old route paid, going straight from the framed blob bytes via
     // `decompress_blob_raw` - the same wire-level path the way branch above uses.
+    let t_dc = std::time::Instant::now();
     let mut decompressed = crate::blob::pool_get_pub(&scratch.pool, 0);
     decompress_blob_raw(&scratch.read_buf, &mut decompressed).map_err(|e| e.to_string())?;
+    #[allow(clippy::cast_possible_truncation)]
+    counters
+        .decompress_ns
+        .fetch_add(t_dc.elapsed().as_nanos() as u64, Relaxed);
+    let t_nonway = std::time::Instant::now();
     let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
         decompressed,
         &scratch.pool,
@@ -281,6 +323,11 @@ fn decode_one(
     flush_local(&mut scratch.bb, &mut scratch.output)?;
     let mut block_stats = block_stats;
     block_stats.blobs_decoded = 1;
+    #[allow(clippy::cast_possible_truncation)]
+    counters
+        .nonway_ns
+        .fetch_add(t_nonway.elapsed().as_nanos() as u64, Relaxed);
+    counters.nonway_blobs.fetch_add(1, Relaxed);
     Ok((std::mem::take(&mut scratch.output), block_stats))
 }
 
@@ -309,11 +356,53 @@ pub(super) fn write_output_passthrough(
         .map(|n| n.get().saturating_sub(2).max(1))
         .unwrap_or(4);
 
+    // Schedule composition diagnostics.
+    {
+        let (mut way_blobs, mut node_blobs, mut relation_blobs): (i64, i64, i64) = (0, 0, 0);
+        for d in &schedule {
+            match d.kind {
+                Some(ElemKind::Way) => way_blobs += 1,
+                Some(ElemKind::Node) => node_blobs += 1,
+                Some(ElemKind::Relation) => relation_blobs += 1,
+                None => {}
+            }
+        }
+        crate::debug::emit_counter("altw_pass2_way_blobs", way_blobs);
+        crate::debug::emit_counter("altw_pass2_node_blobs", node_blobs);
+        crate::debug::emit_counter("altw_pass2_relation_blobs", relation_blobs);
+    }
+
     // Partition: passthrough items are pre-seeded into the reorder
     // buffer at their global seq positions; decode items go through
     // the worker channel.
     let (decode_items, passthrough_items): (Vec<BlobDescriptor>, Vec<BlobDescriptor>) =
         schedule.into_iter().partition(|d| !d.is_passthrough);
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("altw_pass2_decode_items", decode_items.len() as i64);
+        crate::debug::emit_counter(
+            "altw_pass2_passthrough_items",
+            passthrough_items.len() as i64,
+        );
+        crate::debug::emit_counter("altw_pass2_decode_threads", decode_threads as i64);
+    }
+
+    // Worker-side cumulative counters + the depth-gated WAIT span for
+    // workers blocked handing results to the consumer (same StallGauge
+    // rationale as external stage 4: N concurrent blockers collapse to
+    // one non-overlapping span per busy period so `--stalls` can pair
+    // the markers; entered only after a failed try_send).
+    let p2_counters = Pass2Counters::default();
+    let p2_send_stall = super::external::StallGauge::new("WAIT_P2_SEND_START", "WAIT_P2_SEND_END");
+    let p2_counters_ref = &p2_counters;
+    let p2_send_stall_ref = &p2_send_stall;
+
+    // Consumer-side counters (single thread; plain locals).
+    let mut p2_recv_ns: u64 = 0;
+    let mut p2_write_ns: u64 = 0;
+    let mut p2_pt_pread_ns: u64 = 0;
+    let mut p2_pt_bytes: u64 = 0;
+    let mut p2_pt_blobs: u64 = 0;
 
     type DecodedItem = (usize, std::result::Result<(Vec<OwnedBlock>, Stats), String>);
     let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<BlobDescriptor>(16);
@@ -360,10 +449,23 @@ pub(super) fn write_output_passthrough(
                         shared_node_ids,
                         inject_prepass,
                         &mut scratch,
+                        p2_counters_ref,
                     );
-                    if tx.send((desc.seq, result)).is_err() {
-                        break;
+                    let t_send = std::time::Instant::now();
+                    match tx.try_send((desc.seq, result)) {
+                        Ok(()) => {}
+                        Err(std::sync::mpsc::TrySendError::Full(item)) => {
+                            let _stall = p2_send_stall_ref.track();
+                            if tx.send(item).is_err() {
+                                break;
+                            }
+                        }
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
                     }
+                    #[allow(clippy::cast_possible_truncation)]
+                    p2_counters_ref
+                        .send_ns
+                        .fetch_add(t_send.elapsed().as_nanos() as u64, Relaxed);
                 }
             });
         }
@@ -402,10 +504,10 @@ pub(super) fn write_output_passthrough(
 
         let mut frame_read_buf: Vec<u8> = Vec::new();
 
-        let drain = |reorder: &mut ReorderBuffer<ConsumerItem>,
-                     total_stats: &mut Stats,
-                     frame_read_buf: &mut Vec<u8>,
-                     writer: &mut PbfWriter<crate::file_writer::FileWriter>|
+        let mut drain = |reorder: &mut ReorderBuffer<ConsumerItem>,
+                         total_stats: &mut Stats,
+                         frame_read_buf: &mut Vec<u8>,
+                         writer: &mut PbfWriter<crate::file_writer::FileWriter>|
          -> Result<()> {
             while let Some(item) = reorder.pop_ready() {
                 match item {
@@ -413,6 +515,7 @@ pub(super) fn write_output_passthrough(
                         let (blocks, block_stats) =
                             result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                         total_stats.merge(&block_stats);
+                        let t_write = std::time::Instant::now();
                         for OwnedBlock {
                             bytes: block_bytes,
                             index,
@@ -427,10 +530,19 @@ pub(super) fn write_output_passthrough(
                                 way_members.as_deref(),
                             )?;
                         }
+                        #[allow(clippy::cast_possible_truncation)]
+                        {
+                            p2_write_ns += t_write.elapsed().as_nanos() as u64;
+                        }
+                        // Emit the progress counter every 64 blobs (the
+                        // decode-all path's cadence); per-blob emission was
+                        // ~22 K FIFO writes at europe for no extra signal.
                         let n = batches_dispatched
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                             + 1;
-                        crate::debug::emit_counter("altw_pass2_blobs_dispatched", n);
+                        if n % 64 == 0 {
+                            crate::debug::emit_counter("altw_pass2_blobs_dispatched", n);
+                        }
                     }
                     ConsumerItem::Passthrough {
                         frame_offset,
@@ -438,14 +550,26 @@ pub(super) fn write_output_passthrough(
                         count,
                         kind,
                     } => {
+                        let t_pt = std::time::Instant::now();
                         frame_read_buf.resize(frame_size, 0);
                         shared_file
                             .read_exact_at(frame_read_buf, frame_offset)
                             .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                        #[allow(clippy::cast_possible_truncation)]
+                        {
+                            p2_pt_pread_ns += t_pt.elapsed().as_nanos() as u64;
+                        }
+                        p2_pt_bytes += frame_size as u64;
+                        p2_pt_blobs += 1;
+                        let t_write = std::time::Instant::now();
                         writer.write_raw_owned(std::mem::replace(
                             frame_read_buf,
                             Vec::with_capacity(frame_size),
                         ))?;
+                        #[allow(clippy::cast_possible_truncation)]
+                        {
+                            p2_write_ns += t_write.elapsed().as_nanos() as u64;
+                        }
                         total_stats.blobs_passthrough += 1;
                         match kind {
                             Some(ElemKind::Node) => {
@@ -480,7 +604,12 @@ pub(super) fn write_output_passthrough(
         )?;
 
         loop {
+            let t_recv = std::time::Instant::now();
             let msg = decoded_rx.recv();
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                p2_recv_ns += t_recv.elapsed().as_nanos() as u64;
+            }
             let (seq_num, item) = match msg {
                 Ok(v) => v,
                 Err(_) => break,
@@ -507,5 +636,51 @@ pub(super) fn write_output_passthrough(
     })?;
 
     writer.flush()?;
+
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        let ns_to_ms = |ns: u64| (ns / 1_000_000) as i64;
+        crate::debug::emit_counter(
+            "altw_pass2_pread_ms",
+            ns_to_ms(p2_counters.pread_ns.load(Relaxed)),
+        );
+        crate::debug::emit_counter(
+            "altw_pass2_decompress_ms",
+            ns_to_ms(p2_counters.decompress_ns.load(Relaxed)),
+        );
+        crate::debug::emit_counter(
+            "altw_pass2_way_reframe_ms",
+            ns_to_ms(p2_counters.way_reframe_ns.load(Relaxed)),
+        );
+        crate::debug::emit_counter(
+            "altw_pass2_nonway_ms",
+            ns_to_ms(p2_counters.nonway_ns.load(Relaxed)),
+        );
+        crate::debug::emit_counter(
+            "altw_pass2_send_ms",
+            ns_to_ms(p2_counters.send_ns.load(Relaxed)),
+        );
+        crate::debug::emit_counter(
+            "altw_pass2_bytes_read",
+            p2_counters.bytes_read.load(Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "altw_pass2_way_blobs_decoded",
+            p2_counters.way_blobs.load(Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "altw_pass2_nonway_blobs_decoded",
+            p2_counters.nonway_blobs.load(Relaxed) as i64,
+        );
+        crate::debug::emit_counter("altw_pass2_consumer_recv_ms", ns_to_ms(p2_recv_ns));
+        crate::debug::emit_counter("altw_pass2_consumer_write_ms", ns_to_ms(p2_write_ns));
+        crate::debug::emit_counter("altw_pass2_passthrough_pread_ms", ns_to_ms(p2_pt_pread_ns));
+        crate::debug::emit_counter("altw_pass2_passthrough_bytes", p2_pt_bytes as i64);
+        crate::debug::emit_counter("altw_pass2_passthrough_blobs", p2_pt_blobs as i64);
+        crate::debug::emit_counter(
+            "altw_pass2_blobs_dispatched",
+            batches_dispatched.load(std::sync::atomic::Ordering::Relaxed),
+        );
+    }
     Ok(total_stats)
 }

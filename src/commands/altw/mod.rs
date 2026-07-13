@@ -39,8 +39,10 @@ use self::sparse::{SparseArrayIndex, build_node_index_sparse};
 pub enum IndexType {
     /// Rank-indexed flat sparse array. Pre-allocates
     /// `referenced.total_count() * 8` bytes (~29 GB at europe, ~60 GB at
-    /// planet); workers `pwrite` coords at byte offset
-    /// `IdSet::rank_if_set(node_id) << 3`. Fast at small / medium scale,
+    /// planet); workers store coords via relaxed `AtomicU64` mmap stores
+    /// at byte offset `IdSet::rank_if_set(node_id) << 3` (not pwrites -
+    /// no syscall per tuple; the distinction matters when evaluating
+    /// write-path alternatives). Fast at small / medium scale,
     /// survives europe at ~6 minutes on a 27 GB-RAM host. Likely thrashes
     /// at planet (working set exceeds free page cache); use `external`
     /// for planet.
@@ -239,9 +241,9 @@ pub fn add_locations_to_ways(
         if reader.header().is_sorted() {
             eprintln!(
                 "hint: this sorted indexed PBF is eligible for --index-type external, \
-                 which uses bounded memory and sequential I/O. External is faster than \
-                 sparse on sorted indexed inputs at every scale, and the only mode that \
-                 survives at planet on memory-constrained hosts."
+                 which uses bounded memory and sequential I/O. External wins at large \
+                 scale (europe and up) and is the only mode that survives at planet on \
+                 memory-constrained hosts; sparse is typically faster below that."
             );
         }
     }
@@ -465,6 +467,12 @@ fn collect_way_referenced_node_ids(
     )?;
     let mut referenced = IdSet::new();
     let mut shared = inject_prepass.then(IdSet::new);
+    // Union-side attribution: the drain below runs on the main thread
+    // and is the suspected pass-0 wall at scale (~4.7 B set calls at
+    // europe). Timed per drained blob so `altw_pass0_union_ms` vs the
+    // phase wall separates serial-union cost from worker scan cost.
+    let mut union_ns: u64 = 0;
+    let mut union_refs_total: u64 = 0;
     crate::scan::classify::parallel_scan_blobs_raw(
         &shared_file,
         &schedule,
@@ -492,6 +500,8 @@ fn collect_way_referenced_node_ids(
             Ok(refs_vec)
         },
         |_seq, refs_vec| {
+            let t_union = std::time::Instant::now();
+            union_refs_total += refs_vec.len() as u64;
             for &node_id in &refs_vec {
                 if referenced.get(node_id) {
                     if let Some(shared) = &mut shared {
@@ -501,8 +511,23 @@ fn collect_way_referenced_node_ids(
                     referenced.set(node_id);
                 }
             }
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                union_ns += t_union.elapsed().as_nanos() as u64;
+            }
         },
     )?;
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("altw_pass0_union_ms", (union_ns / 1_000_000) as i64);
+        crate::debug::emit_counter("altw_pass0_refs_total", union_refs_total as i64);
+    }
+    if let Some(shared_set) = &shared {
+        crate::debug::emit_counter(
+            "altw_pass0_shared_node_ids",
+            i64::try_from(shared_set.iter().count()).unwrap_or(i64::MAX),
+        );
+    }
     Ok((referenced, shared))
 }
 

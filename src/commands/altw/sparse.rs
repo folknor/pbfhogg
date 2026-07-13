@@ -131,8 +131,16 @@ pub(super) fn build_node_index_sparse(
     scratch_dir: &Path,
     mut referenced: IdSet,
 ) -> Result<SparseArrayIndex> {
+    let t_rank = std::time::Instant::now();
     referenced.build_rank_index();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    crate::debug::emit_counter(
+        "altw_pass1_rank_index_ms",
+        t_rank.elapsed().as_millis() as i64,
+    );
     let total_bytes = referenced.total_count().saturating_mul(8);
+    #[allow(clippy::cast_possible_wrap)]
+    crate::debug::emit_counter("altw_pass1_store_bytes", total_bytes as i64);
 
     let temp_path = scratch_dir.join(format!(".pbfhogg-sparse-index-{}", std::process::id()));
     let file = std::fs::OpenOptions::new()
@@ -164,8 +172,21 @@ pub(super) fn build_node_index_sparse(
         Some(crate::blob_meta::ElemKind::Node),
     )?;
 
+    // Per-blob rank-span accounting: on sorted inputs each blob's
+    // referenced nodes occupy one contiguous rank interval, so
+    // sum(span) / stored is the write-amplification a per-blob
+    // buffered-pwrite pass 1 would pay before it starts (the P5 gate
+    // in notes/altw.md). Ratio near 1.0 = dense intervals; materially
+    // above 1.0 = hole-heavy, buffered rewrite disqualified.
+    let tuples_scanned = std::sync::atomic::AtomicU64::new(0);
+    let coords_stored = std::sync::atomic::AtomicU64::new(0);
+    let rank_span_slots = std::sync::atomic::AtomicU64::new(0);
+
     let referenced_ref = &referenced;
     let writer_ref = &writer;
+    let tuples_scanned_ref = &tuples_scanned;
+    let coords_stored_ref = &coords_stored;
+    let rank_span_slots_ref = &rank_span_slots;
     type Scratch = (Vec<crate::scan::node::NodeTuple>, Vec<(usize, usize)>);
     crate::scan::classify::parallel_scan_blobs_raw(
         &shared_input,
@@ -175,18 +196,49 @@ pub(super) fn build_node_index_sparse(
         |decompressed, (tuples, group_starts)| -> crate::error::Result<()> {
             tuples.clear();
             crate::scan::node::extract_node_tuples(decompressed, tuples, group_starts)?;
+            let mut blob_stored: u64 = 0;
+            let mut blob_min_rank: u64 = u64::MAX;
+            let mut blob_max_rank: u64 = 0;
             for tup in tuples.iter() {
                 if tup.id < 0 {
                     continue;
                 }
                 if let Some(rank) = referenced_ref.rank_if_set(tup.id) {
                     writer_ref.insert(rank, tup.lat, tup.lon);
+                    blob_stored += 1;
+                    if rank < blob_min_rank {
+                        blob_min_rank = rank;
+                    }
+                    if rank > blob_max_rank {
+                        blob_max_rank = rank;
+                    }
                 }
+            }
+            tuples_scanned_ref.fetch_add(tuples.len() as u64, Ordering::Relaxed);
+            if blob_stored > 0 {
+                coords_stored_ref.fetch_add(blob_stored, Ordering::Relaxed);
+                rank_span_slots_ref.fetch_add(blob_max_rank - blob_min_rank + 1, Ordering::Relaxed);
             }
             Ok(())
         },
         |_seq, ()| {},
     )?;
+
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter(
+            "altw_pass1_tuples_scanned",
+            tuples_scanned.load(Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "altw_pass1_coords_stored",
+            coords_stored.load(Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "altw_pass1_rank_span_slots",
+            rank_span_slots.load(Ordering::Relaxed) as i64,
+        );
+    }
 
     Ok(SparseArrayIndex {
         referenced,

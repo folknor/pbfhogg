@@ -813,7 +813,9 @@ impl Reader {
 
     // -- Admin search --------------------------------------------------------
 
-    /// Ranked admin: one per level, smallest area, with interior cell optimization.
+    /// Ranked admin: one per level, smallest area. The interior high bit is
+    /// read but ignored as a PIP bypass; every candidate still runs
+    /// admin_polygon_contains (see the comment below).
     fn search_admin_ranked<'a>(&'a self, ctx: &QueryContext) -> Vec<AdminMatch<'a>> {
         let (cells, count) = cell_neighborhood(ctx.lat, ctx.lon, self.header.admin_cell_level);
         let cell_count = self.admin_cells.len() / ADMIN_CELL_SIZE;
@@ -823,7 +825,7 @@ impl Reader {
             let Some(ac) = binary_search_admin_cells(&self.admin_cells, cell_count, cell_id) else {
                 continue;
             };
-            for (poly_idx, is_interior) in
+            for (poly_idx, _is_interior) in
                 AdminEntryIter::new(&self.admin_entries, ac.entries_offset)
             {
                 let poly = self.read_admin_polygon(poly_idx);
@@ -831,8 +833,16 @@ impl Reader {
                 if level >= 12 || poly.area >= best_by_level[level].1 {
                     continue;
                 }
-                // Interior hint: skip PIP test (accepted approximation per spec)
-                if is_interior || self.admin_polygon_contains(ctx, &poly) {
+                // The interior high bit is only a hint: the reader still runs the
+                // point-in-polygon test unconditionally. pbfhogg's builder (pass 3
+                // flood-fill, cell-center sampling, no interior erosion / geometric
+                // covering) does not guarantee that a flagged cell is fully inside
+                // the polygon, so honoring the flag as a PIP bypass would mis-attribute
+                // near-boundary and neighbor-cell queries. A false flag now only costs
+                // wasted work, never a wrong answer. Re-enabling the skip requires the
+                // traccar-parity builder (interior erosion + geometric covering); see
+                // TODO.md "Geocode reader interior-hint PIP skip".
+                if self.admin_polygon_contains(ctx, &poly) {
                     best_by_level[level] = (Some(poly_idx), poly.area);
                 }
             }
@@ -864,14 +874,18 @@ impl Reader {
             let Some(ac) = binary_search_admin_cells(&self.admin_cells, cell_count, cell_id) else {
                 continue;
             };
-            for (poly_idx, is_interior) in
+            for (poly_idx, _is_interior) in
                 AdminEntryIter::new(&self.admin_entries, ac.entries_offset)
             {
                 if seen.contains(&poly_idx) {
                     continue;
                 }
                 let poly = self.read_admin_polygon(poly_idx);
-                if is_interior || self.admin_polygon_contains(ctx, &poly) {
+                // Interior high bit is a hint only; always run the PIP test. See the
+                // note in search_admin_ranked and TODO.md - pbfhogg's builder does not
+                // make the interior-skip sound, so a bypass mis-attributes near-boundary
+                // and neighbor-cell queries.
+                if self.admin_polygon_contains(ctx, &poly) {
                     seen.push(poly_idx);
                     result.push(AdminMatch {
                         admin_level: poly.admin_level,

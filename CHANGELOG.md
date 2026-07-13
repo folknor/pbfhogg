@@ -116,6 +116,21 @@
 
 ### Fixed
 
+- **Reverse geocoding no longer attributes near-boundary points to the
+  wrong admin region via the interior-cell hint.** The admin-cell "interior"
+  bit is a builder-emitted hint (a cell whose S2 center sampled inside the
+  polygon); `search_admin_ranked` and `search_admin_all` in
+  `src/geocode_index/reader.rs` treated it as a point-in-polygon bypass
+  (`is_interior || admin_polygon_contains(...)`), so a query point just
+  outside a boundary - but adjacent to a genuinely interior-flagged
+  neighbor cell - was accepted into that region without ever being tested
+  against its geometry. In ranked mode this could even prefer the
+  wrong-side polygon over the correct one when it happened to have a
+  smaller area. The reader now always runs the point-in-polygon test; the
+  interior bit is read but no longer bypasses it. Only queries within one
+  admin-cell width of a boundary (~8 km at the default admin cell level)
+  were affected.
+
 - **`repack` no longer emits non-monotonic elements across blob
   boundaries.** When the target cap was smaller than the input's per-blob
   element count (a shrink), the merge thread wrote worker "full" blocks

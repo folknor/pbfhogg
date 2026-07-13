@@ -894,10 +894,41 @@ refactor would be needed for smaller hosts.
 | Pass 3 coarse Stage B | 13.0 s | 5.3 | 14.57 GB |
 | Misc (flush/mmap/write/admin index/cleanup) | ~22 s | - | - |
 
-Pass 2b dominates at 124 s / 29 % of wall. Pass 2 interp resolve is the
-only sequential-by-design phase left (30.6 s / 7 %); parallelising it
-is an unclaimed follow-up worth ~25 s at planet if driven under 7 min
-becomes a goal.
+Pass 2b dominates at 124 s / 29 % of wall. Pass 2 interp resolve was the
+only sequential-by-design phase left at this commit (30.6 s / 7 %); it
+was replaced with a parallel sorted-CSR build plus parallel endpoint
+resolution - see "Interpolation endpoint CSR (interp resolve
+parallelized)" below.
+
+### Interpolation endpoint CSR (interp resolve parallelized)
+
+`resolve_interpolation_endpoints_mmap` (`src/geocode_index/builder/interp.rs`)
+replaced its transient `FxHashMap<u64, Vec<u32>>` spatial index with a
+sorted CSR (compressed-sparse-row) built in parallel, and parallelized
+endpoint resolution over interpolation ways. Single-run, dirty-tree
+validation (host plantasjen, base commit `7d5f6c1`, `--bench 1 --force`
+phase spans from `brokkr sidecar` durations - honest caveat: not a
+`--bench 3` verdict and not stored in `.brokkr/results.db`):
+
+| Dataset | Phase | Before (sequential) | After (parallel CSR) | Speedup |
+|---|---|---:|---:|---:|
+| Planet | `GEOCODE_PASS2_INTERP_RESOLVE` total | 30.6 s | 2.76 s | ~11x |
+| Planet | INDEX/CSR-build | (included above) | 2.64 s | - |
+| Planet | ENDPOINTS | (included above) | 0.092 s | - |
+| Europe | interp-resolve total | ~15 s (INDEX ~12 s + ENDPOINTS ~3 s) | 1.29 s | ~11.6x |
+| Europe | INDEX/CSR-build | ~12 s | 1.25 s | - |
+| Europe | ENDPOINTS | ~3 s | 0.018 s | - |
+
+The win is the CSR data-structure replacement (the parallel sorted
+build), not the endpoint parallelism - endpoint resolution is only
+92 ms at planet, negligible against the 2.64 s CSR build. A prior
+naive attempt (fold/reduce hashmap merge, commit `363c579`, reverted)
+regressed Europe's index build to 23.7 s; the sort-based CSR avoids
+that failure mode because its merge step is a linear group-by over
+already-sorted pairs, not a hashmap union.
+
+Correctness: Germany build reported 71/78 interpolation ways resolved,
+identical to the pre-change baseline.
 
 traccar's index is more compact (18 GB planet) because it uses f32 coords,
 u8 node counts, u32 offsets everywhere, whole-way indexing (4 bytes/entry),

@@ -207,23 +207,6 @@ per-cell grouping.
 **Classification.** Full Pass 3 finalizer rewrite. High value after G1, and
 possibly the first rewrite if the immediate goal is more RAM headroom.
 
-### G5. Contained local change: interpolation endpoint resolver
-
-`resolve_interpolation_endpoints_mmap` is ~31 s and still sequential. The
-naive Rayon fold/reduce approach regressed because per-worker hash maps plus
-merge work cost more than sequential insertion. The better shape is not
-"parallelize the existing map"; it is to replace the data structure:
-
-- Build `Vec<(cell_id, addr_idx)>` in parallel from `addr_points.bin`.
-- Sort by `cell_id`.
-- Use a CSR-style offsets/values representation or binary-search ranges for
-  endpoint lookup.
-- Then parallelize endpoint resolution over interpolation ways when planet
-  interp counts are large enough to amortize Rayon overhead.
-
-**Classification.** Medium-value contained rewrite. Useful, but it should not
-distract from G1 unless the builder needs a quick isolated benchmark.
-
 ### Target end-state pipeline
 
 The cleanest end state I currently see is:
@@ -276,65 +259,6 @@ a small positive win.
 - **Accept.** Planet projection from the Europe ratio is ~7 s saved;
   complexity cost is real but contained to one function.
 
-### Pass 2 interp resolve - local follow-up, not the main rewrite
-
-The 2026-04-18 planet bench surfaced `resolve_interpolation_endpoints_mmap`
-at **30.6 s / 7 % of planet wall, single-threaded (1.0 avg cores)**.
-Wasn't in the original plan because Germany hides it (3.2 s / 10 %).
-
-**Attempted and reverted (commit `363c579` -> reverted at `7cb807b`,
-results invalidated via `brokkr invalidate --commit 363c579`).** Naive
-approach: rayon fold+reduce for the spatial-index build (per-worker
-partial `FxHashMap<u64, Vec<u32>>`, merged at end) + `par_iter_mut()`
-with `AtomicU32` for the endpoint-resolution loop. Added sub-markers
-`GEOCODE_INTERP_RESOLVE_INDEX_{START,END}` and
-`GEOCODE_INTERP_RESOLVE_ENDPOINTS_{START,END}` so the split could be
-measured.
-
-Measured Europe **183.4 s -> 199.1 s (+15.7 s net regression)**.
-Sub-phase breakdown:
-
-| Sub-phase | Parallel (Europe) | Pre-change combined |
-|---|---:|---:|
-| INDEX_BUILD | 23.7 s @ 10.3 cores | ~12 s sequential |
-| ENDPOINTS | 3.6 s @ 1.0 cores | ~3 s sequential |
-
-Two lessons:
-
-1. **Fold+reduce hashmap merge is slower than sequential insertion at
-   this scale.** Europe has ~20 M addr points; the fold produces ~12
-   per-worker maps of ~1.7 M entries each. The reduce step walks each
-   side-map and appends Vecs into the final map - roughly 20 M
-   lookup+push operations that sequential insertion never does. With a
-   fast single-threaded insert path (FxHashMap is already fast), the
-   merge overhead dominates.
-2. **`par_iter_mut()` on endpoints doesn't help at Germany/Europe
-   scale.** Interp way count is small (~78 Germany, ~1-2k Europe) so
-   per-thread chunk sizes default to 1 and overhead dwarfs work. Avg
-   cores measured 1.0 at Europe. Planet with ~50-100k interp ways
-   might benefit, but the index-build regression would have to be
-   fixed first for the phase to net positive.
-
-**Current stance.** This is still a valid local follow-up, but it is not the
-main rewrite. Do not parallelize the existing map. Replace it with the G5
-shape: parallel collect `Vec<(cell, idx)>`, sort by cell, then use a CSR-style
-or binary-search lookup in `find_endpoint_house_number_mmap`. Only then
-parallelize endpoint resolution over interpolation ways.
-
-### Interpolation endpoint CSR - data structure for G5
-
-`resolve_interpolation_endpoints_mmap` builds a transient
-`FxHashMap<u64, Vec<u32>>` mapping S2 cell IDs to address-point
-indices. At planet this is ~1 GB heap (~150 M address points across
-~10 M distinct S2 cells, each an individually allocated `Vec`).
-
-A CSR-style layout (one contiguous offsets array + one contiguous
-values array, sorted by cell_id, binary-search lookup) is now the preferred
-shape for G5. It should reduce heap fragmentation/peak and also enable a
-parallel collection path that does not pay the failed fold/reduce hashmap
-merge cost. Treat this as a data-structure replacement, not a small
-parallelism tweak.
-
 ## Suggested ordering
 
 If picking up this note cold:
@@ -348,8 +272,6 @@ If picking up this note cold:
    way pass intact.
 4. **G3 relation wire scan + one metadata schedule.** Worth doing after the
    hotter node/way paths, or earlier if relation profiling becomes dominant.
-5. **G5 interpolation resolver CSR.** Good contained work, but not the main
-   architectural lever.
 
 ## Former "leave alone" guidance, revised
 

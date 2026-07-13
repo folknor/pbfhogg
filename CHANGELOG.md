@@ -61,6 +61,15 @@
 
 ### Changed
 
+- `build-geocode-index`'s interpolation endpoint resolver replaces its
+  transient hashmap spatial index with a sorted CSR built in parallel,
+  and parallelizes endpoint resolution across interpolation ways.
+  Single-run measurement (plantasjen): planet interp-resolve phase
+  30.6 s -> 2.76 s (~11x); Europe ~15 s -> 1.29 s (~11.6x). The win is
+  the CSR data-structure replacement, not the endpoint parallelism
+  (92 ms at planet, negligible against the 2.64 s CSR build).
+  Resolved-way counts are unchanged (Germany 71/78).
+
 - `diff` now runs parallel by default: `-j` defaults to `0`
   (auto-pick from available cores) instead of `1` (sequential), for
   both `--format text` and `--format osc`. Measured at planet scale

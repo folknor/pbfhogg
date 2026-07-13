@@ -70,7 +70,9 @@ Every command listed below runs on the full planet on normal hardware. Measured 
 | `tags-filter -R highway=primary` | 52s | 688 MB |
 | `time-filter` (snapshot, cutoff 2024-01-01) | 4m30s | 812 MB |
 
-Three commands write temp files to the output's parent directory: `add-locations-to-ways --index-type external` (~246 GB), `diff -j 16` (~30 GB text shards), `diff --format osc -j 16` (~45 GB XML shards). The others are scratch-free.
+Three commands write temp files to the output's parent directory: `add-locations-to-ways --index-type external` (~246 GB), `diff` (parallel by default; ~30 GB text shards at planet), `diff --format osc` (~45 GB XML shards). The others are scratch-free. `diff -j 1` restores the scratch-free sequential path if temp disk is scarce.
+
+History-shaped input (per-element version history and visibility, consumed by `time-filter` on multi-version files) is functional but deliberately outside this validation surface: no history dataset is configured or benchmarked, and the table above says nothing about it.
 
 Per-command phase breakdowns are in [reference/performance.md](reference/performance.md); per-command optimization arcs and retired phase breakdowns at older architectures are in [reference/performance-history.md](reference/performance-history.md). Note that recorded results always track the latest git head and may not match the released version.
 

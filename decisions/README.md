@@ -124,6 +124,11 @@ The skeleton has exactly two sections. `Context`, `Consequences`, and
   insurance for latent-only invariants: triage rule of
   `debug_assert` + comment / doc-only / drop-from-triage, no
   blanket sweep.
+- [ADR-0006](0006-blob-count-threshold-dispatch.md) - `getid` and
+  `getparents` dispatch on estimated OSMData blob count (bounded
+  header probe): `HeaderWalker` below 150,000 blobs, full scan at or
+  above - resolves the HeaderWalker regression on high-blob-count
+  encodings.
 - [ADR-0007](0007-injected-prepass-wire-extensions.md) - Private,
   opt-in PBF wire extensions (`pbfhogg.WayMembers-v1` BlobHeader
   field 5, `pbfhogg.SharedNodePins-v1` Way field 20) for
@@ -134,3 +139,7 @@ The skeleton has exactly two sections. `Context`, `Consequences`, and
   transforms run in decode workers; decoded-input admission remains the
   memory budget, while command-side batches and their byte override are
   retired.
+
+Numbering gaps are deliberate, per the never-reuse rule: 0001 was a
+transient process note retired at the 0.3.0 release (commit `30ca861`);
+0008 was never assigned to a landed decision.

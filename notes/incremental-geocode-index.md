@@ -35,7 +35,8 @@ up at 20 min, 10 min, or 5 min.
 
 Four full-file passes: Pass 1 collects admin relation boundaries, Pass
 1.5 collects the node IDs referenced by geocode-relevant ways (streets,
-interpolation, admin boundary ways) into an `IdSetDense`, Pass 2 is a
+interpolation, admin boundary ways) into an `IdSet` (formerly
+`IdSetDense`), Pass 2 is a
 fused node+way scan that emits address points + street ways +
 interpolation ways and resolves their coordinates through a compact
 rank-indexed coord array, and Pass 3 buckets everything by S2 cell

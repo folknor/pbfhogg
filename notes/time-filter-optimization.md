@@ -6,7 +6,35 @@ sequential.
 
 Code: [`src/commands/time_filter/mod.rs`](../src/commands/time_filter/mod.rs).
 
-## Remaining work
+## History-file support: OUT OF SCOPE for 1.0 (decided 2026-07-13)
+
+pbfhogg's history-file handling (per-element version history and
+visibility, consumed by `time_filter_history`) is **functional but
+deliberately outside the 1.0 planet-scale validation surface**. The
+code stays; nothing is deleted. Rationale:
+
+- History has the weakest demand signal of anything in the roadmap:
+  nothing in the project's own pipeline consumes history PBFs and no
+  consumer has asked. Every other deferred item is gated on a
+  demonstrated workload; 1.0-validating history would be the one place
+  we build ahead of any consumer.
+- "In scope" is a commitment, not a checkbox: `brokkr.toml` has no
+  history variant on any dataset, so every time-filter bench to date
+  runs a regular PBF and measures a near-no-op (every timestamp
+  compare decides keep). Real validation means downloading a history
+  dataset (planet history is ~120 GB; europe is the realistic
+  iteration size), benching the actual multi-version workload,
+  building the parallel history path below, and extending the
+  32 GB-host planet-safety bar to a new input shape whose per-element
+  version fan-out changes memory behavior.
+
+**Re-entry trigger**: a real history consumer appears. First step is
+then a europe history variant in `brokkr.toml` (exercise the path
+without claiming planet safety), then a bench of the actual workload,
+then the parallel history path. README's planet table carries a
+footnote pointing at this scope decision.
+
+## Remaining work (gated on the re-entry trigger above)
 
 ### Parallel history-input path
 

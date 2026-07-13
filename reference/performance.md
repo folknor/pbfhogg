@@ -355,7 +355,7 @@ The consolidated headline table. All rows `--bench 1` unless noted.
 | extract --smart (Europe bbox) | `--bench 1` | 267.5 s | `07dcdae3` | |
 | multi-extract --simple (5 regions, Europe bbox) | `--bench 1` | **883.6 s** | `68cecf88` | |
 | multi-extract --smart (5 regions, Europe bbox) | `--bench 1` | 837.6 s | `2c842414` | |
-| add-locations-to-ways `--index-type external` | `--bench 1` | **546.0 s** | `7fd04130` (2026-04-26) | |
+| add-locations-to-ways `--index-type external` | `--bench 1` | 636.6 s | `abe2ebf2` (856efc3, 2026-07-13) | was **546.0 s** `7fd04130` (2026-04-26); see ALTW drift flag + inject-prepass A/B below |
 | apply-changes (daily diff, `--osc-seq 4920`) | `--bench 1` | 756.3 s | `8e940f71` | |
 | renumber | `--bench 3` | 204.5 s | `abd74459` | see Renumber +10 s below |
 | diff-snapshots text `-j 16` | `--bench 1` | **227.5 s** | `22a5eb55` | |
@@ -380,6 +380,24 @@ The consolidated headline table. All rows `--bench 1` unless noted.
 > data point is consistent with "drift not real" rather than "drift
 > confirmed". Possible drivers if the regression *were* real remain the
 > truncation-handling commits (`436998b`, `12699db`).
+
+> **ALTW drift flag + `--inject-prepass` A/B (2026-07-13, `856efc3`,
+> plantasjen).** Same-commit single-sample pair: flag-OFF **636.6 s**
+> (`abe2ebf2`), flag-ON `--inject-prepass` **602.9 s** (`b3b79a62`).
+> The flag-ON run measured 33.7 s FASTER than flag-OFF despite doing
+> strictly more work (2.63 B pinned refs, 535.3 M field-20 bitmaps,
+> 145.8 MB of field-5 payload), so single-sample noise on this command
+> is at least ~35 s / ~6 % - the injection cost is below `--bench 1`
+> resolution, and ADR-0007's planet regression gate closes as "no
+> measurable regression". Separately, BOTH runs sit +10-17 % above the
+> 546.0 s April baseline (`7fd04130` at `16e3694`, 2026-04-26): larger
+> than the observed noise band, so genuine drift across the ~2.5 months
+> of commits is plausible but unconfirmed - a `--bench 3` pair (HEAD vs
+> `--commit 16e3694`, grouped per the build-thrash rule) would settle
+> it. Injection counters, first end-to-end exercise, all plausible:
+> `altw_member_ways` 37.2 M, `altw_pinned_refs` 2.63 B (21 % of the
+> 12.44 B way refs), `altw_field20_ways_emitted` 535.3 M (46 % of
+> 1.166 B way messages), `altw_field5_bytes` 145.8 MB.
 
 > **`cat --dedupe` planet 133-minute wall.** Single `MERGEPBF` phase,
 > peak anon RSS only 1.4 GB, avg cores 1.3 - the path is essentially

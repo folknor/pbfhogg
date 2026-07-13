@@ -1,13 +1,13 @@
 # Write-path optimization plan
 
-> **STATUS 2026-07-13: mostly exhausted - see "Current state" at the
-> bottom.** The live remainder is the io_uring rail on a real command
-> path (items 5 / 5b) plus the API-surface questions (whether
-> `OutputChunk` / `FramedBlobParts` / `OutputSink` stay as the internal
-> writer shape, deferred header write, size hints). All
-> `PBFHOGG_WRITE_*` experiment env vars have been removed from the
-> tree; the OutputChunk/OutputSink types remain and are load-bearing
-> (`src/write/pipeline.rs`).
+> **STATUS 2026-07-13: exhausted except one item.** The API-surface
+> questions were all resolved 2026-07-13 (see "Current state" at the
+> bottom): OutputChunk / FramedBlobParts / OutputSink are the settled
+> internal writer shape (keep), deferred header write is parked behind
+> a real-caller trigger, and item 11's consolidation closed as
+> overtaken by code drift. All `PBFHOGG_WRITE_*` experiment env vars
+> are gone from the tree. The single live item is the io_uring rail on
+> a real command path (items 5 / 5b).
 
 This note is the working plan for the generic write / compression path shared
 by `cat`, `extract`, `merge`, `sort`, ALTW stage 4, and other PBF-producing
@@ -939,6 +939,15 @@ Why here:
 - genuinely new capability, not on the measured backlog
 - should not jump the measured items, but should not be forgotten either
 
+Result (2026-07-13):
+
+- **Parked with trigger.** The discard gate ("no current or planned
+  caller needs deferred header write") holds: nothing in the roadmap
+  wants a data-derived header (bbox from data, counts). Do not build
+  capability ahead of a consumer. Re-entry trigger: a real caller
+  wanting post-hoc header fields shows up - the reserved-slot +
+  `pwrite`-at-finish design above is the starting point then.
+
 ### 9. `fallocate` + `posix_fadvise` on buffered output
 
 Hypothesis:
@@ -1104,6 +1113,25 @@ Why here:
 - worth doing, but should not delay anything with measured signal
 - naturally folded into item 6's "borrowed rescan" cleanup
 
+Result (2026-07-13):
+
+- **CLOSED - overtaken by code drift; the consolidation effectively
+  already happened piecemeal.** Verified against the tree: the public
+  surface is now `write_header`, `write_primitive_block`,
+  `write_primitive_block_no_indexdata`, `write_raw`,
+  `write_raw_owned`, `write_raw_chunks`, `flush` plus the cfg-gated
+  `write_raw_copy`; **`write_primitive_block_owned` is `pub(crate)`**,
+  so the owned fast path this item wanted to "push all callers onto"
+  was instead internalized - library consumers never see the overlap,
+  and the ~35 production call sites are all in-crate commands.
+  `writer_mut()` is a *private* method whose `expect()` is a
+  documented internal invariant on the sync path ("writer consumed by
+  pipeline - call flush() first"), not a public API panic. With both
+  premises gone, the two-type split would be churn with no payoff.
+  Also noting for posterity: the "do this pre-1.0" framing was wrong -
+  this project's 1.0 is the planet-safety bar, not an API freeze, so
+  there is no stability window the split would need to beat.
+
 ## Hypotheticals not yet measured
 
 These came out of the same fresh code read and are worth recording so
@@ -1201,28 +1229,25 @@ answered, deferred for good reason, too permutation-heavy to justify
 more Europe/planet time, or dependent on item 7 having turned into a
 robust win, which it did not.
 
-That does **not** mean the note is done. It still contains unresolved
-API and surface-design questions that are separate from pure
-performance:
+The API and surface-design questions were **all resolved 2026-07-13**:
 
-- whether `OutputChunk`, `FramedBlobParts`, and `OutputSink` should
-  remain the internal writer shape even if the vectored sink behavior
-  does not ship
-- whether deferred header write is a real future capability or just an
-  interesting idea
-- whether buffered size hints / preallocation should ever become a real
-  builder surface
+- `OutputChunk`, `FramedBlobParts`, and `OutputSink` are the **settled
+  internal writer shape - keep, no longer provisional.** They are
+  load-bearing today (sort's coalesced `copy_file_range` ships through
+  `OutputChunk::CopyRange`) and model payload variety the writer
+  genuinely has (framed bytes / framed chunks / copy ranges),
+  independent of the vectored experiment that spawned them. If a
+  framed-heavy consumer ever justifies revisiting vectored writes, the
+  item-7 Japan result (-21.9 %) says this shape is where to restart.
+- Deferred header write: **parked with a real-caller trigger** - see
+  item 8's Result block.
+- Buffered size hints / preallocation: stays dead per item 9's probe
+  (no win, hook removed); revisit only as a coherent real API if ever.
+- Item 11's `PbfWriter` consolidation: **closed as overtaken by code
+  drift** - see item 11's Result block. The public surface already
+  consolidated itself piecemeal (`write_primitive_block_owned` went
+  `pub(crate)`, `writer_mut` is a private documented invariant).
 
-The cleanup pass already removed the writer experiment env vars. So the
-remaining surface question is no longer "which knobs survive?" but
-"which internal abstractions are worth keeping now that the knobs are
-gone?" That is the healthier state: structure that still makes sense,
-without carrying experiment routing in the shipped code.
-
-So the practical read of this note now is:
-
-- if the goal is more write-path performance work, the next real item
-  is `io_uring`
-- if the goal is reducing surface pollution and clarifying what we
-  actually intend to support, this note should feed a separate cleanup
-  plan rather than keep growing more experiment switches
+So the practical read of this note now is one line: the only live item
+is the `io_uring` rail on a real command path (items 5 / 5b). Nothing
+else here is open.

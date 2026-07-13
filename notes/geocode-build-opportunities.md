@@ -385,7 +385,8 @@ If picking up this note cold:
   makes Phase 2a/2b a clean barrier.
 - **Disjoint rank ranges across node blobs.** Phase 2a writes to
   `coord_mmap` concurrently via `CoordMmapShared::write_coord` without
-  atomics; correctness depends on `IdSetDense::rank(id)` being unique
+  atomics; correctness depends on `IdSet::rank(id)` (formerly
+  `IdSetDense`) being unique
   per set ID + sorted PBF guaranteeing each ID in at most one blob.
   `debug_assert!` in `write_coord` catches bounds regressions.
 - **Bucket-order cell_id monotonicity.** Pass 3 Stage B asserts

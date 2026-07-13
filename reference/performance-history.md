@@ -500,7 +500,8 @@ tests per node amortize setup); tracked under TODO.md Milestone B.
 
 ### IdSetDense accumulation: Vec-push-then-drain wins (do-not-reattempt, `e94c3c8`)
 
-Replacing the hot-loop `Vec::push` with a direct `IdSetDense::set()` per
+Replacing the hot-loop `Vec::push` with a direct `IdSetDense::set()` (the
+type has since been renamed `IdSet`) per
 matched ID (commit `e94c3c8`, plantasjen) cut allocation hard but
 regressed wall by an order of magnitude:
 
@@ -870,10 +871,11 @@ durable record.
 
 ## Retired plan docs
 
-These plan docs lived in `notes/` while their work was active and were
-deleted on landing. Their durable findings are absorbed into the sections
-above; the file names are preserved here as breadcrumbs for searching old
-commit messages and PR descriptions.
+These docs lived in `notes/` while their work was active and were
+deleted on landing or on closure. Their durable findings are absorbed
+into the sections above (or the named durable home); the file names are
+preserved here as breadcrumbs for searching old commit messages and PR
+descriptions.
 
 - `notes/diff-snapshots-opportunities.md` (Tier 1 items landed; sharded
   parallel block-pair merge is the canonical implementation).
@@ -891,3 +893,24 @@ commit messages and PR descriptions.
   plan of record plus the fusion and batched-pipeline specs; verdicts
   in "Env-gated read-path batch" above, fusion kept as ADR-0009, the
   batched engine and byte knobs reverted).
+- `notes/columnar-integration.md`, `notes/hybrid-batching-research.md`
+  (deleted 2026-07-13; measured findings absorbed into the "Parallel
+  classify" section above).
+- `notes/apply-changes-opportunities.md` (deleted 2026-07-13; all items
+  landed or absorbed into TODO.md's apply-changes entry - 80.9 s planet
+  best, deferred #11 splice-in-place and #13 exact-membership metadata
+  tracked there).
+- `notes/zlib-level-tuning.md` (deleted 2026-07-13; superseded by the
+  write-path plan's item-2 compression matrix; the zstd:1
+  internal-pipeline recommendation lives in README.md and
+  `reference/performance.md`).
+- `notes/streaming-pipeline-composition.md` (deleted 2026-07-13;
+  closed - the valuable composition, inline indexdata in all write
+  paths, already ships; multi-pass commands cannot consume streams).
+- `notes/reverse-geocoding-spec.md` (deleted 2026-07-13; original
+  implementation spec for `build-geocode-index` - the shipped
+  implementation deviated, format truth is
+  `src/geocode_index/format.rs` doc comments).
+- `notes/spatial-index-in-pbf.md`, `notes/way-blob-bbox-speculation.md`
+  (deleted 2026-07-13; speculative research, no measurements;
+  conclusions retained in TODO.md's research / stretch list).

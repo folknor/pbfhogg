@@ -7,21 +7,27 @@ record (formerly interleaved with the open items) lives at the bottom
 of this file, full text preserved. Detail stays in notes/ - closed
 notes carry a CLOSED/STATUS header pointing back here.
 
-**Waiting only on operator green-light**
-
-- Injected-prepass flag-ON planet bench (ADR-0007) - see "Blocked on
-  dataset / config".
-
 **Quick wins (hours, or docs-only)**
 
-- Investigate the geocode reader interior-hint contradiction: code skips
-  PIP on interior-flagged admin cells while the retired spec said
-  hint-only, always PIP (Item plans / geocode entry).
+- ALTW drift settle (optional, ~1 h machine time): both 2026-07-13
+  planet runs sit +10-17 % above the April 546.0 s baseline, beyond
+  the observed ~6 % single-sample noise - a `--bench 3` pair at HEAD
+  vs `--commit 16e3694` would confirm or dismiss real drift
+  (Performance section). The injected-prepass gate itself is CLOSED:
+  no measurable regression.
+
+- Geocode reader interior-hint PIP skip: investigated 2026-07-13,
+  UNSOUND (wrong admin matches near boundaries). Fix A is a two-line
+  reader change, Fix B is builder-side erosion that re-enables the
+  skip later - decision pending (Item plans / geocode entry).
 - getparents blob-skip readout: MEASURED off existing run `21ed8d7c` -
-  64.6 % of blobs skipped; tail = CHANGELOG "~85 %" wording decision +
-  filter-semantics confirm (Item plans / getparents).
-- ElemKind reuse refactor across cat + repack (Item plans / repack
-  follow-ups) - when someone is in there anyway.
+  64.6 % of primary-planet blobs; the CHANGELOG "~85 %" discrepancy is
+  RESOLVED as metric confusion (element share vs blob share), CHANGELOG
+  stays untouched. Remaining tail = filter-semantics confirm only
+  (Item plans / getparents).
+- ElemKind reuse refactor: cat + repack DONE 2026-07-13; a third copy
+  in degrade remains, deferred because its u8 kind is a `--drop-ids`
+  hash/reproducibility contract (Item plans / repack follow-ups).
 
 **Active arcs (large open engineering, pick deliberately)**
 
@@ -33,17 +39,20 @@ notes carry a CLOSED/STATUS header pointing back here.
 
 **Decisions needed (forks in the road, not tasks)**
 
-- Geocode index format v2 (element IDs in records) - prerequisite for
-  any incremental-update path
-  ([notes/incremental-geocode-index.md](notes/incremental-geocode-index.md)).
 - CLI UX: scratch-dir posture + `--index-type` replacement (Milestone 3
   / Command surface).
-- diff `-j` default flip (Performance).
-- History-file support: in scope or explicitly out (Research / stretch).
-- Writer API surface: keep the OutputChunk/OutputSink shape? deferred
-  header write?
-  ([notes/write-path-optimization-plan.md](notes/write-path-optimization-plan.md)
-  "Current state").
+- ~~diff `-j` default flip~~ DECIDED + IMPLEMENTED 2026-07-13:
+  `-j 0` default, temp-disk cost documented in `--help` + README +
+  CHANGELOG (Performance).
+- ~~History-file support~~ DECIDED 2026-07-13: explicitly OUT of the
+  1.0 scope; recorded in notes/time-filter-optimization.md + README
+  footnote.
+- ~~Writer API surface~~ RESOLVED 2026-07-13: OutputChunk/OutputSink
+  shape settled-keep; deferred header write parked with a real-caller
+  trigger; the PbfWriter consolidation closed as overtaken by code
+  drift. Record in
+  [notes/write-path-optimization-plan.md](notes/write-path-optimization-plan.md)
+  "Current state"; no scheduled work.
 
 **Deferred with explicit triggers - do not chase without the trigger**
 
@@ -75,7 +84,7 @@ Three new docs capturing a cross-cutting insight and two new commands that fall 
 - [x] ~~**[notes/repack.md](notes/repack.md)** - new command: re-encode a PBF with a configurable `--elements-per-blob N` cap.~~ **v1 + v2.1 LANDED** (`BlockBuilder::with_element_cap(n)`, cross-input-blob coalescing so grow caps fire correctly across input-blob boundaries). Planet 8k bench ~380-390 s. v2.2 (LocationsOnWays preservation) and v2.3 (osmium cross-validation) remain deferred - see the note.
 
   **v1.1 follow-ups:**
-  - [ ] **`ElemKind` reuse audit (cross-command, low priority).** Both `cat --clean` (`src/commands/cat/mod.rs:433-435`) and `repack` (`src/commands/repack/mod.rs:35-37`) invented their own bare-`u8` `KIND_NODE/WAY/RELATION` constants instead of reusing the project's `pub(crate) enum ElemKind` (`src/blob_meta/mod.rs:20`). Repack mirrors cat by design - changing one without the other would just diverge them. Worth doing as one refactor across both commands when someone is in there for another reason; not worth a dedicated PR. (2026-07-13: still true; a doc comment in `cat/mod.rs` even mentions `ElemKind` while the surrounding code uses the bare consts - drift the refactor would resolve.)
+  - [ ] **`ElemKind` reuse audit (cross-command).** **cat + repack DONE 2026-07-13**: both commands' bare-`u8` `KIND_NODE/WAY/RELATION` constants replaced with `crate::blob_meta::ElemKind` throughout (phase params, `KindPayload`, worker matches - now exhaustive, deleting repack's dead `invalid kind constant` error arm and `KindPayload::empty` fallback). `brokkr check` tier1 both sweeps + the repack monotonicity tier-2 test pass. **Remaining: `degrade` is a THIRD copy the original audit missed** (`src/commands/degrade/mod.rs`, ~30 sites) and it is NOT a mechanical swap: `drop_hash` feeds the u8 kind *numerically* into the splitmix64 hash that selects `--drop-ids N:SEED` victims, and `DropKey` derives `Ord` over the u8 - the 0/1/2 mapping is a reproducibility contract (same seed must drop the same elements across builds). Correct shape if converted: plumb `ElemKind` through the phases but keep an explicit `fn hash_kind(ElemKind) -> u8` boundary pinning Node=0/Way=1/Relation=2 with a comment naming the contract. Deferred - requires the degrade design context (notes/degrade.md) to confirm no other consumer of the numeric values.
 
   **Correctness follow-up (found 2026-07-12 during the shape-3 8k sweep):**
   - [x] ~~**`repack` emits non-monotonic relations across blob boundaries (CONFIRMED bug, found + fixed 2026-07-12).**~~ Root cause (`run_kind_phase` in `src/commands/repack/mod.rs`): worker "full" blocks wrote directly via `write_raw_owned` in seq order, while the central builder's coalesced tail-blocks went through a `pending` buffer that only flushed every 32 blocks, so low-ID coalesced tails could land after later high-ID direct blocks. Fix: in each `pop_ready` iteration, when the incoming blob carries direct full-blocks and the central stream (`bb` or `pending`) is non-empty, flush the central stream first. **Accepted density trade:** on a coalescing shrink, output blob count is no longer the general `ceil(elements / cap)` - it now depends on input-blob boundaries, since each input blob whose count isn't a multiple of the cap emits its tail as its own possibly-under-cap block (documented in `notes/repack.md`). Regression tests in `tests/cli_repack.rs`: `repack_output_is_monotonic_across_coalesced_blob_boundaries`, `repack_output_is_monotonic_for_nodes_and_ways`, `repack_output_is_monotonic_with_pending_prepopulated_at_guard`.
@@ -88,11 +97,17 @@ Three new docs capturing a cross-cutting insight and two new commands that fall 
 - [ ] **[notes/sort.md](notes/sort.md)** - `sort` (repair unsorted PBFs into `Sort.Type_then_ID`). Drafted 2026-04-23. **Production reality**: Geofabrik / planet input is already sorted, so the overlap-count is ~zero and pass 2 is pure raw passthrough. The headline opportunity that helped the production case, **`copy_file_range` coalescing for passthrough runs**, LANDED (`244c6ec`: `try_extend_copy_run` + `flush_copy_run`; denmark run `11062bdd` coalesced 7387 passthrough blobs into 3 calls; see `notes/sort.md`). The bigger theoretical wins - parallel overlap-rewrite in pass 2 (1.5-3x) and HeaderWalker-based pass 1 (1.2-2x on non-indexed input) - only fire on genuinely-unsorted input, which has no dataset configured in `brokkr.toml` today. Planet hotpath + alloc captured 2026-04-27 overnight at `4fc8e35` (UUIDs `d64932d2` hotpath / `26fb329e` alloc): 115.4 s wall, **94 % in `pbfhogg::write::writer::flush`** (108.6 s) and 6 % in `build_blob_index` (6.77 s) - reaffirms the writer-side `copy_file_range` ceiling is the only lever for already-sorted input, with no allocation pressure (459 MB exclusive, all in `blob_wire::parse`). Hotpath wall sits below both the 124.6 s `68e1ba0` and 132.3 s `16e3694` bench baselines, softening the `+6-7 %` regression flag tracked in `reference/performance.md`. Anti-conversion rule (pipelined → sequential) explicitly off the table per `reference/pipelined-reader-paths.md:138`.
 
 - [ ] **[notes/getparents.md](notes/getparents.md)** - `getparents` (whole-file scan listing ways / relations referencing a given ID set). Drafted 2026-04-23, headline experiment landed 2026-04-24 (`783970a`). The HeaderWalker + `parallel_classify_phase` rewrite shipped: planet 44.8 s -> **23.5 s** (-46 %, UUID `11bc44dc` at `16e3694`), europe 26.4 s -> **44.2 s** (+68 %, blob-density asymmetry - see [reference/blob-density.md](reference/blob-density.md)). Original 4-8x estimate was wrong: blob indexdata stores `(min_id, max_id)` of *elements in the blob*, not the *ref/member IDs* the typical "find ways referencing these nodes" query cares about, so `IdSet::any_in_range()` pre-screen does not apply. Actual win comes from IO byte reduction (74.8 GB -> 30 GB at planet) by skipping blob kinds structurally incapable of producing matches. Planet hotpath at `4fc8e35` (UUID `00253c7d`): 23.0 s wall, 78 % in `parallel_classify_phase` - that **is** the post-experiment state, not headroom. The c912e4d Denmark 4.7x sequential-decode regression rule remains explicitly off the table (it targets sequential-decode conversions; `parallel_classify_phase` keeps decompression parallel via pread workers). **The europe-regression question (revert / threshold-dispatch / accept) is RESOLVED**: the crossover was measured 2026-07-10 on the 8k-packed planet (HW 82.7 s vs scan 52.8 s; walk ~45 us/blob, linear in blob count) and the dispatch was ratified as [`ADR-0006`](decisions/0006-blob-count-threshold-dispatch.md) (full matrix in [notes/getparents.md](notes/getparents.md) "Crossover measured"; the RESOLVED paragraph moved to the Completed record below). Residual opportunities, absorbed here from the note (2026-07-13):
-  - [ ] **#3 blob-filter skip-rate readout - MEASURED 2026-07-13** from the existing planet bench `21ed8d7c` (2026-07-12, `a65cecc`, `--bench 3`): `getparents_blobs_skipped` 32,835 / `walk_actual_osmdata_blobs` 50,816 = **64.6 % of blobs skipped** (schedule 17,981; counters sum exactly). Verdict: the CHANGELOG 0.3.0 "~85 % of blobs at planet scale" claim is overstated for the standard 3-ID query - actual is ~65 % of blobs; the module doc's "~75 % of planet bytes" is the bytes metric and stands. Remaining tail: decide whether to correct the historical CHANGELOG wording, and confirm the filter semantics for the "parent relations of a node still needs way blobs" case (a counter can't answer that; needs a targeted test or code read).
+  - [ ] **#3 blob-filter skip-rate readout - MEASURED 2026-07-13** from the existing planet bench `21ed8d7c` (2026-07-12, `a65cecc`, `--bench 3`): `getparents_blobs_skipped` 32,835 / `walk_actual_osmdata_blobs` 50,816 = **64.6 % of blobs skipped** (schedule 17,981; counters sum exactly). The CHANGELOG 0.3.0 "~85 % of blobs at planet scale" claim vs this 64.6 % is **RESOLVED as metric confusion, not an error to correct** - three different metrics collide: nodes are **~90 % of elements** (encoding-independent; ~10.4 B of 11.6 B), **64.6 % of blobs on the byte-packed primary planet** (node blobs avg ~317 k elements vs way blobs ~66 k, so way blobs are overrepresented in blob count), **~90 % of blobs on the 8k-uniform encoding** (blob share = element share when every blob holds 8,000 elements), and **~75 % of planet bytes** (the module doc's metric). The "~85 %" was element share mislabeled as blob share, written 2026-04-27 - months before repack and any blob-density awareness. **Decision (2026-07-13): CHANGELOG.md stays untouched** - historical release record, defensible under the element-share reading; this entry is the durable explanation. Remaining tail: confirm the filter semantics for the "parent relations of a node still needs way blobs" case (a counter can't answer that; needs a targeted test or code read).
   - [ ] **#4 refs/members buf pre-sizing (<1 % wall).** Skip unless an `--alloc` profile shows churn.
 
 - [x] ~~**[notes/geocode-build-opportunities.md](notes/geocode-build-opportunities.md)**~~ - `build-geocode-index`. **ARC LANDED 2026-04-18**, planet 1255 s -> 432.9 s (-65%/2.9x), all 10 ranked items shipped. Remaining follow-ups in the note: Pass 2 interp resolve still sequential (30.6 s planet), interpolation endpoint CSR for RSS hygiene.
-  - [ ] **Investigate: geocode reader interior-hint skips PIP, contradicting the retired spec (found 2026-07-13).** The original spec (`reverse-geocoding-spec.md`, deleted 2026-07-13, in git history; sections 3.4 and 4.11) defined the admin-cell interior high bit as a *hint only*: the reader "still performs a point-in-polygon test" on interior-flagged cells, using the flag for test priority and early exit, so a false flag costs wasted work, never a wrong answer. The shipped reader does the opposite: `src/geocode_index/reader.rs` short-circuits with `is_interior || admin_polygon_contains(...)`, accepting the polygon with NO PIP test, and the adjacent comment claims this is "accepted approximation per spec" - which the spec text contradicts. Consequence if a builder-side interior flag is ever wrong (flood-fill from a bad seed, boundary-adjacent cells): a wrong admin match is returned. Investigate: (a) is the skip deliberate - then fix the comment wording and document the accuracy trade honestly; or (b) restore PIP-first-with-early-exit as designed - then measure the query-time cost on interior cells before deciding. Either way the "per spec" comment must stop citing a spec that says the reverse.
+  - [ ] **Geocode reader interior-hint PIP skip is UNSOUND - investigated 2026-07-13, fix decision pending.** The admin-cell interior high bit is honored as a PIP bypass (`is_interior || admin_polygon_contains(...)` in `src/geocode_index/reader.rs`, both `search_admin_ranked` and `search_admin_all`), introduced at `f365f7f` with a comment claiming "accepted approximation per spec". Investigation findings:
+    - **The spec said the opposite.** The retired spec (`reverse-geocoding-spec.md`, deleted 2026-07-13, in git history; sections 3.4 and 4.11) defined the flag as a hint only - the reader "still performs a point-in-polygon test" on interior-flagged cells, using the flag for priority and same-level early exit, so a false flag costs wasted work, never a wrong answer. The "per spec" comment is a misreading and must be corrected whichever fix lands.
+    - **What `f365f7f` actually restored is the traccar-geocoder precedent.** `research/traccar-geocoder/server/src/main.rs` does the identical `is_interior || point_in_polygon(...)` over the query cell plus all 8 neighbors. Reader-side, pbfhogg is traccar parity.
+    - **But traccar's builder makes that skip sound and pbfhogg's does not.** traccar (`builder/src/build_index.cpp` `cover_polygon`) uses S2's geometric `GetInteriorCovering(polygon)` AND erodes the interior by one cell ("only mark a cell interior if all its edge neighbors are also interior"). With erosion, any query cell adjacent to a flagged cell is itself fully inside the polygon, so neighbor-flag acceptance is correct (residual hole: erosion uses 4 edge neighbors while the reader iterates 8 including diagonals). pbfhogg's pass 3 (`src/geocode_index/builder/pass3.rs`) instead flood-fills from the centroid, tests only cell centers, excludes edge cells derived from the sampled 256-step-clamped `cover_segment` - no erosion, no geometric covering. pbfhogg inherited the optimization while dropping both of its preconditions.
+    - **Two concrete wrongness modes in the shipped reader.** (1) Neighbor-cell acceptance: a query point in boundary cell C, outside polygon P, is accepted into P via an adjacent genuinely-interior cell N - fires for near-boundary queries within one admin-cell width (~8 km at level 10), and ranked mode's smallest-area-per-level then prefers the wrong-side polygon when it is smaller (e.g. standing in Germany near the border, Denmark wins level 2). Wrong even with a perfect builder. (2) False interior flags: an edge cell missed by the sampled `cover_segment` whose center lies inside gets flagged interior with the boundary running through it - the exact gap the open "exact S2 segment coverage" spike tracks.
+    - **Fix A (recommended first): restore spec behavior.** Drop the bypass at both call sites - always run `admin_polygon_contains`; keep `is_interior` at most as a test-ordering hint. One-line change per site plus honest comment plus a regression test for the neighbor-cell case. Sound regardless of builder quality; cost is one ray-cast against a max-500-vertex simplified polygon per candidate entry.
+    - **Fix B (later, re-enables the optimization): traccar-parity builder.** Add interior erosion (use all 8 neighbors, not traccar's 4, to close the diagonal hole) and geometric interior covering to pass 3, then the reader skip becomes sound and can return as a measured optimization. Format-compatible (same flag bit) but requires an index rebuild; dovetails with the open "Spike: exact S2 segment coverage for Pass 3" item above.
   - [ ] **Spike: exact S2 segment coverage for Pass 3.** `cover_segment` currently samples intermediate lat/lon points and clamps the walk at 256 steps. Prototype a proper S2 edge/cell traversal using `s2` 0.1.0 primitives (`RegionCoverer`, `Cell`, `Point`, `edgeutil::simple_crossing`, or equivalent direct cell-edge tests), then compare fine/coarse cell counts and geocode query results against the sampling path on Denmark/Europe before replacing it.
   - [ ] **Spike: admin interior hints via S2 region coverage.** Admin indexing currently edge-covers rings and flood-fills from an arithmetic exterior vertex mean; concave polygons whose mean falls outside skip interior hints and pay more query-time PIP checks. Prototype a polygon `Region` or other `RegionCoverer::interior_covering` path that preserves the current edge-vs-interior on-disk semantics, handles holes, and measure admin cell count/PIP-hit changes before any format or behavior change.
 
@@ -117,7 +132,7 @@ Three new docs capturing a cross-cutting insight and two new commands that fall 
   **Already shared:**
   - **HeaderWalker** (scan-audit round migrated both commands).
   - **`copy_file_range` coalescing** (apply-changes drain *ported from* `altw/passthrough.rs`, so the flow direction already ran).
-  - **`IdSetDense::set_atomic_if_new`** primitive (used by both for parallel set-membership).
+  - **`IdSet::set_atomic_if_new`** primitive (used by both for parallel set-membership; type formerly named `IdSetDense`).
 
   Rough prioritization if a day were available: cross-disk bench first (10 min, tells us where the ALTW ceiling actually lives), then worker-framed-bytes if Stage 4 is writer-bound.
 
@@ -285,22 +300,31 @@ add it here with the per-worker upper bound at planet scale.
 
 ### Blocked on dataset / config
 
-- [ ] **Injected-prepass flag-ON planet verdict**. The producer landed
+- [x] ~~**Injected-prepass flag-ON planet verdict**~~. The producer landed
   2026-07-11 (`29e4eab`, ADR-0007) with flag-OFF neutrality shown. The
   brokkr `--inject-prepass` passthrough LANDED the same day (brokkr
   `e50a679`; the flag lands in recorded cli_args like `--direct-io`
-  does, no separate variant column needed), so the flag-ON planet
-  bench - the altw regression bound against the 546.0 s baseline and
-  the first end-to-end exercise of the four `altw_*` sidecar counters -
-  now waits ONLY on an explicit user green-light for the run. See
-  `reference/pipeline.md` for the full gate context.
-- [ ] **History PBF for `time-filter`**. pbfhogg supports per-element
-  version history and visibility, but `brokkr.toml` has no history
-  variant on any dataset. `time-filter` benches on a regular PBF
-  record near-no-op walls (every timestamp compare decides keep).
-  Configure a history PBF variant (planet history is ~120 GB; europe
-  history is more realistic for iteration) to unlock the actual
-  workload.
+  does, no separate variant column needed). **VERDICT REACHED
+  2026-07-13** via a same-commit `--bench 1` A/B at `856efc3`
+  (plantasjen): flag-ON **602.9 s** (`b3b79a62`) vs flag-OFF
+  **636.6 s** (`abe2ebf2`) - flag-ON measured 33.7 s FASTER despite
+  doing strictly more work, so single-sample noise on this command is
+  at least ~35 s / ~6 % and **the injection cost is below `--bench 1`
+  resolution: no measurable planet regression; the ADR-0007 gate is
+  closed**. The four injection counters exercised end-to-end for the
+  first time, all plausible: `altw_member_ways` 37.2 M,
+  `altw_pinned_refs` 2.63 B (21 % of the 12.44 B way refs),
+  `altw_field20_ways_emitted` 535.3 M (46 % of 1.166 B way messages),
+  `altw_field5_bytes` 145.8 MB. Full record in
+  `reference/performance.md` "ALTW drift flag + inject-prepass A/B";
+  gate context in `reference/pipeline.md`. **Follow-up spun off
+  below**: both runs sit +10-17 % above the April 546.0 s baseline -
+  see the ALTW drift item under Performance.
+- [x] ~~**History PBF for `time-filter`**~~ - RETIRED 2026-07-13:
+  history-file support declared OUT OF SCOPE for 1.0. Full decision,
+  rationale, and re-entry trigger in
+  [notes/time-filter-optimization.md](notes/time-filter-optimization.md);
+  README's planet table carries the user-facing footnote.
 - [ ] **Additional planet snapshots** for `diff-snapshots`. Current
   `brokkr.toml` has only one alternate (`snapshot.20260411`), so the
   snapshot-range axis is a single pairing. Downloading another
@@ -331,11 +355,43 @@ Known to work, no performance question open, but not in the results DB:
 
 ## Performance
 
-- [ ] **Consider auto-enabling diff `-j`**. Currently `pbfhogg diff`
-  defaults to `-j 1` (sequential). `-j 0` maps to
-  `available_parallelism()`. Evaluate flipping the default from 1
-  to 0 once the parallel path has more field miles. Wait until
-  Milestone 3.
+- [ ] **ALTW planet drift: confirm or dismiss (+10-17 % vs April).**
+  Both 2026-07-13 `--bench 1` runs at `856efc3` (flag-OFF 636.6 s
+  `abe2ebf2`, flag-ON 602.9 s `b3b79a62`) sit well above the 546.0 s
+  baseline (`7fd04130` at `16e3694`, 2026-04-26). The A/B pair proved
+  single-sample noise is at least ~35 s / ~6 % on this command, which
+  does NOT cover the 57-91 s gap - so real drift across the ~2.5
+  months of commits is plausible but unconfirmed (cache state and the
+  32 GB host's memory pressure differ across runs too). To settle: a
+  `--bench 3` pair, HEAD vs `--commit 16e3694`, grouped per the
+  build-thrash rule (~1 h machine time). Full record in
+  `reference/performance.md` "ALTW drift flag + inject-prepass A/B".
+
+- [x] ~~**Auto-enable diff `-j`**~~ - **DECIDED + IMPLEMENTED
+  2026-07-13.** Flipped the default from `-j 1` to `-j 0`
+  (`available_parallelism()`). Implementation note: `diff-snapshots`
+  is brokkr's name for `pbfhogg diff` on two independent files - one
+  command, one flag, so a single default flip covers both bench
+  surfaces, and it applies to both `--format text` and `osc` (the old
+  `--help` claim that parallelism was text-only was stale; both
+  dispatchers resolve `jobs == 0`). Rationale: 9.5x/7.6x planet wins,
+  ~3 months of field miles, fault-injection coverage on the shard
+  path. The one real cost is scratch surprise (parallel diff writes
+  ~30-45 GB of shards to the output's parent at planet; sequential
+  needs zero), handled by documentation not code: `--help`, README's
+  planet-table note, and a CHANGELOG "Changed" entry all state the
+  temp-disk requirement and that `-j 1` restores the scratch-free
+  sequential path. No size-based auto-threshold. Existing
+  `derive_changes_jobs_parity_roundtrips_to_same_output` pins
+  sequential == parallel output. **Gap found by the flip:** the
+  parallel text path never implemented `-v/--verbose` per-field
+  detail lines (acceptable while parallel was opt-in; four cli_diff
+  tests caught it the moment parallel became the default). Fix:
+  verbose diffs always dispatch to the sequential path
+  (`src/commands/diff/mod.rs`, `!options.verbose` in the parallel
+  guard), documented in `--help` and CHANGELOG. If parallel verbose
+  is ever wanted, the shard workers need per-field detail emission -
+  new work, not scheduled.
 
 - [ ] **Expose phase events as a proper Rust event/hook API** - wrap
   instrumentation calls in per-command `probes` modules, then swap the
@@ -833,7 +889,10 @@ per-iteration allocations remain across the codebase, ordered by impact:
   removed entirely.
 - [ ] Verify GeoJSON polygon format coverage for extract (does `--polygon`
   accept GeoJSON, or only .poly format?).
-- [ ] History-file support - decide in-scope or explicitly out-of-scope.
+- [x] ~~History-file support - decide in-scope or explicitly
+  out-of-scope.~~ DECIDED 2026-07-13: explicitly OUT OF SCOPE for 1.0,
+  code kept, best-effort thereafter; see
+  [notes/time-filter-optimization.md](notes/time-filter-optimization.md).
 
 ## Completed record
 

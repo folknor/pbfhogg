@@ -469,6 +469,114 @@ Full journey: 366.7s → 107.5s (3.4x total improvement).
 
 ---
 
+## Parallel classify: columnar decode, accumulation shape, dispatch
+
+Durable landing record for the columnar decode prototype and the
+`parallel_classify_phase` / `parallel_classify_accumulate` accumulation
+model. Absorbed from `notes/columnar-integration.md` and
+`notes/hybrid-batching-research.md` on 2026-07-13 before those notes were
+deleted. The current per-command state lives in `performance.md`; this is
+the "how we got here" plus the do-not-reattempt pins.
+
+### Columnar dense-node decode (prototype `e0b0780`)
+
+`DenseNodeColumns` (`src/read/columnar.rs`) batch-decodes IDs, lats, lons
+into contiguous arrays. `collect_matching_ids_bbox` (single region) and
+`collect_matching_ids_multi_bbox` (N regions) test each node against the
+bbox set in one pass and push matches to a `Vec`. Shipped in single- and
+multi-extract node classification. The `IdSetDense` output variants
+(`set_matching_ids_bbox` / `set_matching_ids_multi_bbox`) were removed in
+`c4c7b9e` as unused - see the accumulation finding below for why direct
+set() lost to Vec push.
+
+Multi-extract Japan 5-region node classify (commit `c3b271f`, plantasjen):
+1081 ms -> 748 ms (-31%) columnar vs element-by-element; total 8.1 s ->
+7.3 s.
+
+ASM inspection confirms LLVM does NOT autovectorize the bbox loop - the
+`push()` side effect blocks it, so explicit AVX2 intrinsics are the only
+SIMD path. The multi-bbox loop is the designated SIMD target (N region
+tests per node amortize setup); tracked under TODO.md Milestone B.
+
+### IdSetDense accumulation: Vec-push-then-drain wins (do-not-reattempt, `e94c3c8`)
+
+Replacing the hot-loop `Vec::push` with a direct `IdSetDense::set()` per
+matched ID (commit `e94c3c8`, plantasjen) cut allocation hard but
+regressed wall by an order of magnitude:
+
+| Path | Vec::push | Direct IdSetDense::set() | Delta |
+|---|---:|---:|---|
+| Alloc (single-extract) | 8.7 GB | **20.5 MB** | -99.8% |
+| Node classify | 713 ms | **20.5 s** | **29x slower** |
+| Way classify | 943 ms | **3.7 s** | **4x slower** |
+
+Root cause: `IdSetDense::set()` does a chunk lookup + byte offset +
+bitmask per ID (random access); `Vec::push()` is a sequential L1-friendly
+append. IDs arrive already sorted from the columnar decode, so the
+randomness is in the chunk access pattern, not ID order. Verdict (2
+perf reviewers): hybrid is correct - Vec push in the hot loop, drain once
+into IdSetDense; direct `set()` is fine only for sparse paths (polygon,
+relation, way deps) where filter work dominates and match counts are low.
+A `set_sorted_batch()` would amortize the chunk lookup but still loses to
+push on cold-line read-modify-write. Do not re-attempt direct set() in a
+dense classify hot loop.
+
+### Per-worker accumulation drops single-extract alloc (Japan)
+
+Single-extract Japan alloc, `parallel_classify_phase` per-worker
+accumulation (baseline `ec43a8b` -> final `201a4cf`, plantasjen): total
+alloc 6.4 GB -> **2.0 GB (-69%)**; `parallel_classify_phase` fell from
+5.0 GB (48.8% of churn) out of the top 10. Workers accumulate `Vec<i64>`
+across all blobs and send once at scope exit - no per-blob allocation
+through the channel.
+
+### Accumulation is not planet-safe for dense paths (2026-04-09 design review)
+
+A 10-reviewer design review (2026-04-09) settled the two-function split:
+`parallel_classify_phase<S, R>` (per-blob `R` sends with persistent
+scratch `S`) for dense paths, `parallel_classify_accumulate<S>`
+(per-worker accumulation) for sparse paths. Per-worker Vec accumulation is
+NOT planet-safe on dense paths - per-worker planet estimates: node
+classify multi/5-region `Vec<Vec<i64>>` ~3.5 GB, way classify single
+1.6 GB way + 9.5 GB refs, way classify multi/5-region 8 GB, tags_filter
+pass 1 2.9 GB - all "per-blob send". Sparse paths stay on accumulate:
+relation classify (3x IdSetDense) ~68 MB, tags_filter relation closure
+~13 MB. The live audit checklist of remaining `parallel_classify_accumulate`
+callers and their per-worker planet bounds lives in TODO.md
+"Other parallel_classify_accumulate callers".
+
+Note: the review's original *mechanism* diagnosis (a chunk-spread model
+pinning the planet blocker on `extract.rs:2813`) was investigated over
+four rounds 2026-04-10/11 and proved wrong end-to-end. The real mechanism
+was a cold-arena-page residency cascade (post-PASS1 header scans touching
+glibc's reserved-but-unpopulated pages), unrelated to chunk spread. The
+architectural fix (`extract.rs:2813` -> per-blob send, `cc19d26`) was kept
+anyway (correct in principle, -23% PASS2 wall) and the PASS1 schedule-reuse
+landings (`d4ea760` PASS2, `0b085b1` PASS3) removed the triggering scans
+for ~29% cumulative Europe smart-extract wall. Planet smart extract at
+`cadc3e6` (UUID `2d028196`, Europe bbox): 11.17 GB peak anon / 279 s - see
+the Extract section above and the `performance.md` Extract planet footnote.
+
+### Mutex<Receiver> blob dispatch is not a bottleneck (do-not-reattempt)
+
+The shared `Mutex<Receiver>` single-recv-per-lock dispatch used by the
+`src/scan/classify.rs` worker pools, tags-filter pass 2, and multi-extract
+write workers was flagged by 4/6 reviewers (2026-03-29) as a suspected
+~8 s regression in the pipelined-reader -> pread-worker conversion. Closed
+2026-07-13 without a batch-drain: the arithmetic bounds total mutex time at
+~50-500 ms at Europe scale (500K blobs x ~100 ns uncontended futex, even at
+10x contention overhead), under 1% of wall, and no hotpath or sidecar
+measurement since (getparents, sort, geocode, the 2026-07 blob-density
+sweeps) has surfaced the dispatch lock as a cost. The "~8 s regression"
+claim was never substantiated; the real conversion win was the Europe
+tags-filter two-pass drop from 366 s (sequential BlobReader, `1e6e70c`) to
+105 s (pread workers, `75ad21d`: pass 1 classify 34 s / closure+deps 33 s /
+pass 2 write 37 s), a 3.4x improvement whose accounting is the tags-filter
+arc above. Do not build a batch-drain over this dispatch on "one lock per
+blob" reasoning without first measuring the lock is the binding cost.
+
+---
+
 ## Pipeline end-to-end
 
 ### ALTW external optimization arc (post-`3d977a0`)

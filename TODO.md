@@ -14,6 +14,9 @@ notes carry a CLOSED/STATUS header pointing back here.
 
 **Quick wins (hours, or docs-only)**
 
+- Investigate the geocode reader interior-hint contradiction: code skips
+  PIP on interior-flagged admin cells while the retired spec said
+  hint-only, always PIP (Item plans / geocode entry).
 - getparents blob-skip readout: MEASURED off existing run `21ed8d7c` -
   64.6 % of blobs skipped; tail = CHANGELOG "~85 %" wording decision +
   filter-semantics confirm (Item plans / getparents).
@@ -89,10 +92,11 @@ Three new docs capturing a cross-cutting insight and two new commands that fall 
   - [ ] **#4 refs/members buf pre-sizing (<1 % wall).** Skip unless an `--alloc` profile shows churn.
 
 - [x] ~~**[notes/geocode-build-opportunities.md](notes/geocode-build-opportunities.md)**~~ - `build-geocode-index`. **ARC LANDED 2026-04-18**, planet 1255 s -> 432.9 s (-65%/2.9x), all 10 ranked items shipped. Remaining follow-ups in the note: Pass 2 interp resolve still sequential (30.6 s planet), interpolation endpoint CSR for RSS hygiene.
+  - [ ] **Investigate: geocode reader interior-hint skips PIP, contradicting the retired spec (found 2026-07-13).** The original spec (`reverse-geocoding-spec.md`, deleted 2026-07-13, in git history; sections 3.4 and 4.11) defined the admin-cell interior high bit as a *hint only*: the reader "still performs a point-in-polygon test" on interior-flagged cells, using the flag for test priority and early exit, so a false flag costs wasted work, never a wrong answer. The shipped reader does the opposite: `src/geocode_index/reader.rs` short-circuits with `is_interior || admin_polygon_contains(...)`, accepting the polygon with NO PIP test, and the adjacent comment claims this is "accepted approximation per spec" - which the spec text contradicts. Consequence if a builder-side interior flag is ever wrong (flood-fill from a bad seed, boundary-adjacent cells): a wrong admin match is returned. Investigate: (a) is the skip deliberate - then fix the comment wording and document the accuracy trade honestly; or (b) restore PIP-first-with-early-exit as designed - then measure the query-time cost on interior cells before deciding. Either way the "per spec" comment must stop citing a spec that says the reverse.
   - [ ] **Spike: exact S2 segment coverage for Pass 3.** `cover_segment` currently samples intermediate lat/lon points and clamps the walk at 256 steps. Prototype a proper S2 edge/cell traversal using `s2` 0.1.0 primitives (`RegionCoverer`, `Cell`, `Point`, `edgeutil::simple_crossing`, or equivalent direct cell-edge tests), then compare fine/coarse cell counts and geocode query results against the sampling path on Denmark/Europe before replacing it.
   - [ ] **Spike: admin interior hints via S2 region coverage.** Admin indexing currently edge-covers rings and flood-fills from an arithmetic exterior vertex mean; concave polygons whose mean falls outside skip interior hints and pay more query-time PIP checks. Prototype a polygon `Region` or other `RegionCoverer::interior_covering` path that preserves the current edge-vs-interior on-disk semantics, handles holes, and measure admin cell count/PIP-hit changes before any format or behavior change.
 
-- [ ] **[notes/apply-changes-opportunities.md](notes/apply-changes-opportunities.md)** - `apply-changes --locations-on-ways`. **P1 + P1.5 landed 2026-04-21 (`719f306`)**; parallel writer made the default 2026-04-21 (buffered path removed, `--parallel-writer` flag deleted). **Planet best: 80.9 s cross-disk + zstd:1** (-44 % vs 144.4 s pre-flip baseline; parallel pwrite, unaffected by the CopyRange bug). Same-disk zstd:1 best: **104.5 s** with parallel pwrite. The same-disk `--io-uring` column was re-measured 2026-04-26 at `16e3694` after the `fa8251d` CopyRange fix and is now uniformly slower than parallel pwrite at every same-disk compression level (none 137.5 s, zlib:6 137.4 s, zstd:1 126.3 s; UUIDs `9a5c25a7` / `70e5414b` / `0e6a5918`); the original 108.6 / 137.1 / 99.4 s numbers were tainted by the writer dropping a zero-page between OSMHeader and first OSMData blob. Cross-disk `--io-uring` rows (93.0 / 127.9 / 82.8 s) still need re-measurement on the fixed writer. Same-disk `--io-uring` no longer the recommended override; cross-disk `--compression none` + `--io-uring` is open until re-measured. Remaining open items: splice-in-place (#11, deferred - doesn't reduce output bytes on compressed output), multi-file output / RAID-0 (unlanded and lower priority given 80.9 s is comfortably inside any realistic production budget). **Note closed 2026-07-13** - its remaining items are tracked here now:
+- [ ] **apply-changes** (plan note `apply-changes-opportunities.md` deleted 2026-07-13, content absorbed here; git history has the full record) - `apply-changes --locations-on-ways`. **P1 + P1.5 landed 2026-04-21 (`719f306`)**; parallel writer made the default 2026-04-21 (buffered path removed, `--parallel-writer` flag deleted). **Planet best: 80.9 s cross-disk + zstd:1** (-44 % vs 144.4 s pre-flip baseline; parallel pwrite, unaffected by the CopyRange bug). Same-disk zstd:1 best: **104.5 s** with parallel pwrite. The same-disk `--io-uring` column was re-measured 2026-04-26 at `16e3694` after the `fa8251d` CopyRange fix and is now uniformly slower than parallel pwrite at every same-disk compression level (none 137.5 s, zlib:6 137.4 s, zstd:1 126.3 s; UUIDs `9a5c25a7` / `70e5414b` / `0e6a5918`); the original 108.6 / 137.1 / 99.4 s numbers were tainted by the writer dropping a zero-page between OSMHeader and first OSMData blob. Cross-disk `--io-uring` rows (93.0 / 127.9 / 82.8 s) still need re-measurement on the fixed writer. Same-disk `--io-uring` no longer the recommended override; cross-disk `--compression none` + `--io-uring` is open until re-measured. Remaining open items: splice-in-place (#11, deferred - doesn't reduce output bytes on compressed output), multi-file output / RAID-0 (unlanded and lower priority given 80.9 s is comfortably inside any realistic production budget). **Note closed 2026-07-13** - its remaining items are tracked here now:
   - [x] ~~**#15 document zstd:1 as the internal-pipeline recommendation**~~ - DONE (found landed 2026-07-13): README.md and reference/performance.md both carry the `--compression zstd:1` recommendation for pipelines that skip osmium interop.
   - [ ] **#11 splice-in-place for low-touch rewrites (deferred).** For `NeedsRewrite` blobs with <=K affected elements (K~64), splice raw wire bytes for unmodified element runs instead of full decode + re-encode (~1.5-2 s at daily; scaffolding in `src/write/raw_passthrough.rs`). Saves classify/rewrite CPU but not output bytes, so it will not move the writer-bound wall. Revisit if the writer ceiling moves.
   - [ ] **#13 exact-membership metadata / sidecar (format project).** Per-blob ID-range-only metadata forces slow-path decode on pure creates inside an existing range: 15,224 FalsePositive blobs / 92,677 slow-path = 16 % of slow-path work wasted at planet. The false-positive distinction is documented on `block_overlaps_diff` in `src/commands/apply_changes/classify.rs` (`range_overlaps` true for create IDs inside the blob's range, `block_overlaps_diff` false because no element in the block matches; the old `classify_only` "FalsePositive" comment the note pointed at was removed in the streaming refactor). Two fix shapes: (a) wire-format exact-overlap scanner on decompressed bytes; (b) per-blob membership sketch in indexdata. Not a quick cleanup.
@@ -443,7 +447,9 @@ See [notes/SIMD.md](notes/SIMD.md) for the varint research.
 times in the project's history with no actionable outcome. Default
 level 6 matches osmium and is the right choice for interop. zstd is
 better for internal pipelines but the production pipeline already
-works. See [notes/zlib-level-tuning.md](notes/zlib-level-tuning.md).
+works. The measured level matrix and closure verdict live in
+[notes/write-path-optimization-plan.md](notes/write-path-optimization-plan.md)
+item 2 (the `zlib-level-tuning.md` note was deleted 2026-07-13).
 
 **Zstd:1 vs zlib:6 for ALTW external** (measured 2026-04-14): for
 pipelines that can opt out of osmium interop, `--compression zstd:1`
@@ -721,7 +727,11 @@ per-iteration allocations remain across the codebase, ordered by impact:
   contiguous arrays. `collect_matching_ids_multi_bbox` does single-pass
   N-region bbox test. Used in multi-extract and single-extract.
   Measured: multi-extract Japan node classify 1081ms → 748ms (-31%).
-  See [notes/columnar-integration.md](notes/columnar-integration.md).
+  Record (including the IdSet 29x accumulation pin and the per-path
+  planet-safety analysis) consolidated in
+  [reference/performance-history.md](reference/performance-history.md)
+  "Parallel classify" (the `columnar-integration.md` note was deleted
+  2026-07-13).
 
 - [x] **Smart-extract planet memory blocker** - CLOSED 2026-04-11,
   ship as-is. The investigation shipped a 29% wall improvement on
@@ -805,8 +815,9 @@ per-iteration allocations remain across the codebase, ordered by impact:
   elements outside the bbox.
 - [ ] Spatial indexing in PBF format (R-tree over blob offsets for
   O(log N) spatial queries on planet files).
-  See [notes/spatial-index-in-pbf.md](notes/spatial-index-in-pbf.md)
-  and [notes/way-blob-bbox-speculation.md](notes/way-blob-bbox-speculation.md).
+  (The two research notes, `spatial-index-in-pbf.md` and
+  `way-blob-bbox-speculation.md`, were deleted 2026-07-13 - speculative
+  only, conclusions retained here, full analysis in git history.)
   Node blob header scan is already fast (~0.5s planet). Way blob spatial
   bboxes are limited by chronological ID ordering (~30% skip for Denmark,
   not 50-80%). Geography-sorted way blobs (Hilbert curve) would give
@@ -814,7 +825,7 @@ per-iteration allocations remain across the codebase, ordered by impact:
 - [x] Streaming pipeline composition - CLOSED, limited benefit.
   The codebase already does the most valuable composition (inline
   indexdata in all write paths). Multi-pass commands can't consume
-  streams. See [notes/streaming-pipeline-composition.md](notes/streaming-pipeline-composition.md).
+  streams. (Note deleted 2026-07-13; analysis in git history.)
 - [x] ~~Dense ALTW compact rank-indexed array~~ - CLOSED 2026-04-30
   (`c6f08ff` + `b70dd8c`). The proposed rank-indexed layout landed as
   the new sparse encoding, dominating dense at every measured scale

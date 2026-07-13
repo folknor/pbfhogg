@@ -44,6 +44,12 @@ impl IdSet {
         self.chunks.iter().filter(|chunk| chunk.is_some()).count()
     }
 
+    /// Perf note: do not call this per element inside a dense classify
+    /// hot loop - the chunk lookup is random access and measured 29x
+    /// slower than `Vec::push` there. Accumulate matches in a `Vec<i64>`
+    /// and drain into the set afterwards; direct `set()` is fine on
+    /// sparse paths. See `reference/performance-history.md`
+    /// "IdSetDense accumulation".
     #[allow(clippy::cast_sign_loss)]
     pub fn set(&mut self, id: i64) {
         if id < 0 {

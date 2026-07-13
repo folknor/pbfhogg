@@ -7,6 +7,7 @@ use quick_xml::Writer;
 use quick_xml::events::{BytesEnd, BytesStart, Event};
 
 use crate::MemberId;
+use crate::coord_fmt::{format_coord, from_decimicro};
 
 /// Push an attribute whose value is OSM user data (tag key/value, member
 /// role, user name) and may therefore contain control characters.
@@ -142,30 +143,6 @@ pub(crate) fn members_equal(a: &[OwnedMember], b: &[OwnedMember]) -> bool {
 
 pub(crate) fn relations_equal(a: &OwnedRelation, b: &OwnedRelation) -> bool {
     a.tags == b.tags && members_equal(&a.members, &b.members)
-}
-
-// ---------------------------------------------------------------------------
-// Coordinate conversion
-// ---------------------------------------------------------------------------
-
-pub(crate) fn from_decimicro(d: i32) -> f64 {
-    f64::from(d) / 1e7
-}
-
-// ---------------------------------------------------------------------------
-// Coordinate formatting
-// ---------------------------------------------------------------------------
-
-/// Format a coordinate, stripping unnecessary trailing zeros.
-/// Writes directly into a provided buffer to avoid intermediate allocations.
-pub(crate) fn format_coord(buf: &mut String, deg: f64) {
-    use std::fmt::Write;
-    buf.clear();
-    // Use 7 decimal places (matches decimicrodegree precision)
-    // write! to String is infallible (String::write_str never fails)
-    write!(buf, "{deg:.7}").ok();
-    let trimmed = buf.trim_end_matches('0').trim_end_matches('.');
-    buf.truncate(trimmed.len());
 }
 
 // ---------------------------------------------------------------------------

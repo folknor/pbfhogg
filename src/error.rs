@@ -62,6 +62,8 @@ pub enum ErrorKind {
     WireFormat { msg: &'static str },
     /// The first blob in the PBF file is not an `OsmHeader` blob.
     MissingHeader,
+    /// The input header does not declare a feature required by the operation.
+    MissingFeature(&'static str),
 }
 
 /// An error that occurs when decoding a blob.
@@ -129,6 +131,7 @@ impl StdError for Error {
             ErrorKind::Blob(_) => None,
             ErrorKind::WireFormat { .. } => None,
             ErrorKind::MissingHeader => None,
+            ErrorKind::MissingFeature(_) => None,
         }
     }
 }
@@ -166,6 +169,13 @@ impl fmt::Display for Error {
             }
             ErrorKind::MissingHeader => {
                 write!(f, "PBF file does not start with an OsmHeader blob")
+            }
+            ErrorKind::MissingFeature(feature) => {
+                write!(f, "input PBF is missing required feature: {feature}")?;
+                if feature == "LocationsOnWays" {
+                    write!(f, "; use --type node or an altw input")?;
+                }
+                Ok(())
             }
         }
     }

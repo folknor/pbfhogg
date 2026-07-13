@@ -685,6 +685,11 @@ impl<'a> Info<'a> {
         self.info.visible.unwrap_or(true)
     }
 
+    /// Return visibility only when the source info message carries the field.
+    pub(crate) fn visible_opt(&self) -> Option<bool> {
+        self.info.visible
+    }
+
     /// Returns true if the element was deleted.
     // wontfix(name-is-has-bool): inherited from osmpbf public API
     #[inline]

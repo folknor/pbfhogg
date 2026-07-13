@@ -22,7 +22,8 @@ enum Kind {
     Dir,
 }
 
-pub(crate) struct PathGuard {
+#[doc(hidden)]
+pub struct PathGuard {
     path: Option<PathBuf>,
     kind: Kind,
 }
@@ -30,7 +31,7 @@ pub(crate) struct PathGuard {
 impl PathGuard {
     /// Guard a file path. On Drop without `commit()`, `remove_file` is
     /// attempted best-effort.
-    pub(crate) fn file(path: PathBuf) -> Self {
+    pub fn file(path: PathBuf) -> Self {
         Self {
             path: Some(path),
             kind: Kind::File,
@@ -39,7 +40,7 @@ impl PathGuard {
 
     /// Guard a directory path. On Drop without `commit()`,
     /// `remove_dir_all` is attempted best-effort.
-    pub(crate) fn dir(path: PathBuf) -> Self {
+    pub fn dir(path: PathBuf) -> Self {
         Self {
             path: Some(path),
             kind: Kind::Dir,
@@ -48,7 +49,7 @@ impl PathGuard {
 
     /// Release the guard so the path survives Drop. Returns the path
     /// for convenience at the commit site (e.g. renaming into place).
-    pub(crate) fn commit(mut self) -> PathBuf {
+    pub fn commit(mut self) -> PathBuf {
         self.path
             .take()
             .expect("PathGuard::commit called after path released")

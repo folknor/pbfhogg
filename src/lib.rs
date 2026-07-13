@@ -115,6 +115,7 @@ writer.flush()?;
 pub(crate) mod blob_meta;
 #[doc(hidden)]
 pub mod commands;
+pub(crate) mod coord_fmt;
 pub mod debug;
 mod error;
 pub mod geo;
@@ -123,7 +124,8 @@ pub(crate) mod idset;
 pub mod osc;
 pub(crate) mod osm_id;
 pub(crate) mod owned;
-pub(crate) mod path_guard;
+#[doc(hidden)]
+pub mod path_guard;
 pub mod read;
 pub(crate) mod reorder_buffer;
 pub(crate) mod scan;
@@ -181,7 +183,7 @@ pub use commands::{
 };
 #[cfg(feature = "commands")]
 #[doc(hidden)]
-pub use commands::{check, extract};
+pub use commands::{check, export, extract};
 #[doc(hidden)]
 pub use commands::{has_indexdata, has_tagdata};
 pub(crate) use read::file_reader;

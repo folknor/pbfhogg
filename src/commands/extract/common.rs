@@ -11,42 +11,14 @@ use super::super::{
     Result, ensure_node_capacity_local, ensure_relation_capacity_local, ensure_way_capacity_local,
     flush_local,
 };
+pub(super) use crate::commands::spatial::BboxInt;
 use crate::idset::IdSet;
 
-use super::{Bbox, ExtractStats};
+use super::ExtractStats;
 
 // ---------------------------------------------------------------------------
 // Integer bbox + spatial filter
 // ---------------------------------------------------------------------------
-
-/// Precomputed integer bounding box in decimicrodegrees (10^-7) for fast containment testing.
-///
-/// Avoids the i64→f64 conversion and float comparison that `Bbox::contains` requires
-/// on every node. The integer bbox is computed once from the f64 Bbox at startup.
-pub(super) struct BboxInt {
-    pub(super) min_lon: i32,
-    pub(super) min_lat: i32,
-    pub(super) max_lon: i32,
-    pub(super) max_lat: i32,
-}
-
-impl BboxInt {
-    /// Convert a float Bbox to integer decimicrodegrees.
-    #[allow(clippy::cast_possible_truncation)]
-    pub(super) fn from_bbox(bbox: &Bbox) -> Self {
-        Self {
-            min_lon: (bbox.min_lon * 1e7).floor() as i32,
-            min_lat: (bbox.min_lat * 1e7).floor() as i32,
-            max_lon: (bbox.max_lon * 1e7).ceil() as i32,
-            max_lat: (bbox.max_lat * 1e7).ceil() as i32,
-        }
-    }
-
-    /// Returns `true` if the point (lat, lon) in decimicrodegrees falls within this bbox.
-    pub(super) fn contains(&self, lat: i32, lon: i32) -> bool {
-        lat >= self.min_lat && lat <= self.max_lat && lon >= self.min_lon && lon <= self.max_lon
-    }
-}
 
 /// Build a [`BlobFilter`] that accepts all element types but spatially filters
 /// node blobs: only node blobs whose coordinate bbox intersects the extraction

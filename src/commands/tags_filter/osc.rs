@@ -11,9 +11,8 @@ use quick_xml::name::QName;
 use quick_xml::{Reader, Writer};
 
 use crate::BoxResult as Result;
-use crate::osc::write::{
-    OwnedMember, OwnedNode, OwnedRelation, OwnedWay, format_coord, from_decimicro,
-};
+use crate::coord_fmt::{format_coord, from_decimicro};
+use crate::osc::write::{OwnedMember, OwnedNode, OwnedRelation, OwnedWay};
 use crate::tag_expr::{Expression, parse_expressions, tag_matches};
 use crate::{MemberId, MemberType};
 

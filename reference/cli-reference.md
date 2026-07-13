@@ -258,6 +258,36 @@ pbfhogg tags-filter [OPTIONS] --output <OUTPUT> <FILE> [EXPRESSIONS]...
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
+### export
+
+Stream a PBF to GeoJSON. Tagged nodes become Points. Tagged ways become
+LineStrings, or Polygons when they are closed and satisfy the built-in area
+rules. Untagged nodes and ways are skipped. Relation features are not emitted.
+Way export requires the input header to declare `LocationsOnWays`; `--type
+node` works without it.
+
+The default `geojsonseq` format writes one Feature object per newline with no
+RFC 8142 record-separator byte. `geojson` writes one FeatureCollection.
+
+```
+pbfhogg export [OPTIONS] <FILE> [EXPRESSIONS]...
+```
+
+| Flag | Description |
+|------|-------------|
+| `-o, --output <FILE>` | Write to a guarded file instead of stdout |
+| `--format <FORMAT>` | `geojsonseq` (default) or `geojson` |
+| `--type <TYPE>` | Export only `node` or `way` |
+| `-e, --expressions <FILE>` | Read tag expressions from a file, one per line |
+| `--properties <KEYS>` | Comma-separated whitelist of tag property keys |
+| `--bbox <BBOX>` | `min_lon,min_lat,max_lon,max_lat`; ways match by vertex containment only, so crossing or enclosing geometry without an inside vertex is omitted |
+| `--metadata` | Add available `@version`, `@timestamp`, `@changeset`, `@uid`, `@user`, and `@visible` properties |
+
+Every feature includes `@id` and `@type`. Metadata timestamps are RFC 3339 UTC
+strings. Tags that collide with emitted reserved property names are omitted.
+Polygon exterior rings are closed and counterclockwise. Ways with invalid
+geometry are skipped and reported in the stderr summary.
+
 ### diff
 
 Compare two PBF files and show differences. Uses content equality (coordinates, tags, refs, members) rather than version/timestamp ordering - deterministic regardless of metadata completeness (see [DEVIATIONS](DEVIATIONS.md#diff-content-equality-vs-version-ordering)).
@@ -457,6 +487,7 @@ Which commands support `--direct-io` (O_DIRECT bypass of page cache) and `--io-u
 | renumber | Yes | Yes | Yes (R+W) | - | |
 | extract | Yes | Yes | Yes (R+W) | - | All strategies |
 | tags-filter | Yes | Yes | Yes (R+W) | - | Both single-pass and two-pass |
+| export | Yes | No | No | - | GeoJSON output to stdout or a regular file |
 | getid | Yes | Yes | Yes (R+W) | - | Including --add-referenced |
 | getid --invert | Yes | Yes | Yes (R+W) | - | |
 | getparents | Yes | Yes | Yes (R+W) | - | |

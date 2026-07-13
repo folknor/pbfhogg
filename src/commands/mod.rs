@@ -6,6 +6,8 @@ pub mod check;
 pub mod degrade;
 pub mod diff;
 #[cfg(feature = "commands")]
+pub mod export;
+#[cfg(feature = "commands")]
 pub mod extract;
 pub mod getid;
 pub mod getparents;
@@ -14,6 +16,8 @@ pub mod merge_changes;
 pub mod renumber;
 pub mod repack;
 pub mod sort;
+#[cfg(feature = "commands")]
+pub(crate) mod spatial;
 pub mod tags_count;
 pub mod tags_filter;
 pub mod time_filter;

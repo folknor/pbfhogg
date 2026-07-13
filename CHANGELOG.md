@@ -14,6 +14,12 @@
 
 ### Added
 
+- `export` streams tagged nodes and tagged enriched ways to newline-delimited
+  GeoJSON or a wrapped FeatureCollection. It supports element and tag filters,
+  property selection, vertex-based bounding boxes, OSM metadata properties,
+  polygon area detection and winding correction, stdout or guarded file
+  output, and rejects way export when `LocationsOnWays` is unavailable.
+
 - `degrade --drop-ids <N:SEED>` deterministically removes exactly N elements
   from the output, selected by a global (hash, kind, id) ordering seeded by
   `SEED` (splitmix64-based, fully specified so selection is reproducible

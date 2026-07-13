@@ -30,13 +30,12 @@ pub mod derive_parallel_test_hooks {
 
 use super::Result;
 use crate::blob_meta::ElemKind;
+use crate::coord_fmt::{format_coord, from_decimicro};
 use crate::osc::merge_join::{
     BlockMergeAction, BlockPairMergeState, MergeJoinAction, MergeJoinElement, StreamingBlocks,
     block_pair_merge_phase, merge_join_phase,
 };
-use crate::osc::write::{
-    OwnedMember, OwnedNode, OwnedRelation, OwnedWay, format_coord, from_decimicro,
-};
+use crate::osc::write::{OwnedMember, OwnedNode, OwnedRelation, OwnedWay};
 use crate::owned::TypeFilter;
 use crate::{Element, MemberType};
 use std::collections::{HashMap, HashSet};

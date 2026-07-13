@@ -11,7 +11,7 @@ Performance below).
 
 Add `pbfhogg export`: a streaming PBF -> GeoJSON / GeoJSONSeq converter.
 v1 emits Point features from tagged nodes and LineString / Polygon
-features from ways, reading way geometry exclusively from inline
+features from tagged ways, reading way geometry exclusively from inline
 `LocationsOnWays` coordinates (the `altw` variant). Output defaults to
 newline-delimited GeoJSON on stdout; a wrapped `FeatureCollection` mode
 is available.
@@ -33,7 +33,7 @@ Filters (all optional, all composable): `--type`, tag `--expressions`,
 
 ### In scope (v1)
 - Nodes with >= 1 tag -> `Point`.
-- Ways -> `LineString`, or `Polygon` when closed and area-tagged.
+- Ways with >= 1 tag -> `LineString`, or `Polygon` when closed and area-tagged.
 - GeoJSONSeq (newline-delimited; NOT RFC 8142, no `0x1e`) and wrapped
   GeoJSON.
 - Tag/type/bbox filtering; property key selection; `@id`/`@type`
@@ -238,6 +238,7 @@ pub struct ExportStats {
     pub ways: u64,                     // way features emitted
     pub features: u64,                 // nodes + ways emitted after filtering
     pub skipped_untagged_nodes: u64,
+    pub skipped_untagged_ways: u64,
     pub skipped_invalid_ways: u64,     // ways dropped by geometry validation (R2 finding 9)
 }
 
@@ -275,7 +276,7 @@ Data flow inside `export`:
      sparse nodes go through the generic property/metadata abstraction
      (3.1 properties.rs).
    - `Way`: skip unless `types` admits ways (`All` or `WaysOnly`); skip
-     if expressions non-empty and no match; build geometry by walking
+     if untagged; skip if expressions non-empty and no match; build geometry by walking
      `node_locations()` into a coordinate vector, then validate
      (cardinality/closure/winding, see geometry.rs); if the geometry is
      invalid, bump `skipped_invalid_ways` and emit nothing; if bbox set,
@@ -653,7 +654,8 @@ expected GeoJSON, covering at minimum:
   escaping on a tag value containing a quote and a backslash.
 - Way -> LineString for a `highway` way; Polygon for a `building` way
   with the ring closed (first coordinate repeated) and the exterior ring
-  **counterclockwise** (R2 finding 9).
+  **counterclockwise** (R2 finding 9); an untagged way is skipped and
+  counted in `skipped_untagged_ways`.
 - Polygon validity (R2 finding 9): a synthetic enriched way whose
   coordinate stream is shorter than its ref count is a counted skip
   (`skipped_invalid_ways`), emits no feature, and never a malformed

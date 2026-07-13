@@ -3,6 +3,26 @@
 Intentional behavioral differences from osmium. These are deliberate design
 choices, not bugs.
 
+## export: area detection and property model
+
+**osmium behavior:** Area classification uses osmium's configurable export
+rules, and property emission depends on its attributes configuration.
+
+**pbfhogg behavior:** `export` always emits `@id` and `@type`, with the
+remaining OSM metadata behind `--metadata`. Tags colliding with emitted
+reserved names are suppressed. Closed ways become polygons only through the
+fixed area-key list and `area=yes` or `area=no` overrides defined by
+[ADR-0010](decisions/0010-geojson-export-format-and-area-heuristic.md).
+
+**Impact:** Feature classification and property sets are intentionally not
+byte-identical to `osmium export`. Coordinate order and GeoJSON validity still
+follow RFC 7946, but osmium output is not a golden byte-level oracle for this
+command.
+
+**Rationale:** Stable identity properties and a compact, documented area rule
+make the initial streaming format predictable without importing osmium's
+configuration surface.
+
 ## add-locations-to-ways: relation-member nodes always preserved
 
 **osmium behavior:** Requires `--keep-member-nodes` flag. Without it, untagged

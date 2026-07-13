@@ -139,6 +139,9 @@ The skeleton has exactly two sections. `Context`, `Consequences`, and
   transforms run in decode workers; decoded-input admission remains the
   memory budget, while command-side batches and their byte override are
   retired.
+- [ADR-0010](0010-geojson-export-format-and-area-heuristic.md) - GeoJSON
+  export framing, identity properties, reserved-name precedence, area
+  detection, and polygon validity rules.
 
 Numbering gaps are deliberate, per the never-reuse rule: 0001 was a
 transient process note retired at the 0.3.0 release (commit `30ca861`);

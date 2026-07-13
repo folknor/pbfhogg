@@ -103,6 +103,18 @@ enum DefaultTypeArg {
     Relation,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum ExportFormatArg {
+    Geojsonseq,
+    Geojson,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ExportTypeArg {
+    Node,
+    Way,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Concatenate PBF files with optional type filtering
@@ -314,6 +326,34 @@ enum Command {
         jobs: usize,
         #[command(flatten)]
         header: HeaderOverrideArg,
+    },
+    /// Export a PBF to GeoJSON or newline-delimited GeoJSONSeq.
+    Export {
+        /// Input PBF. LocationsOnWays is required for way export.
+        file: PathBuf,
+        /// Output file. Omit to write to stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Output format: geojsonseq or geojson.
+        #[arg(long = "format", default_value = "geojsonseq")]
+        format: ExportFormatArg,
+        /// Only export this element type.
+        #[arg(long = "type")]
+        type_filter: Option<ExportTypeArg>,
+        /// Read filter expressions from file, one per line.
+        #[arg(short = 'e', long = "expressions")]
+        expressions_file: Option<PathBuf>,
+        /// Tag filter expressions, such as highway or w/building=yes.
+        expressions: Vec<String>,
+        /// Comma-separated whitelist of tag keys to retain.
+        #[arg(long = "properties", value_delimiter = ',')]
+        properties: Option<Vec<String>>,
+        /// Spatial filter min_lon,min_lat,max_lon,max_lat. Way overlap is vertex-only and lossy.
+        #[arg(long = "bbox")]
+        bbox: Option<String>,
+        /// Include OSM metadata properties.
+        #[arg(long = "metadata")]
+        metadata: bool,
     },
     /// Compare two PBF files and show differences.
     ///
@@ -1006,6 +1046,27 @@ fn main() -> process::ExitCode {
                 ),
             }
             }
+            Command::Export {
+                file,
+                output,
+                format,
+                type_filter,
+                expressions_file,
+                expressions,
+                properties,
+                bbox,
+                metadata,
+            } => run_export(
+                &file,
+                output.as_deref(),
+                format,
+                type_filter,
+                expressions_file.as_deref(),
+                &expressions,
+                properties,
+                bbox.as_deref(),
+                metadata,
+            ),
             Command::Diff {
                 old,
                 new,
@@ -1922,6 +1983,98 @@ fn run_tags_filter_osc(
     }
     let stats = pbfhogg::tags_filter::osc::tags_filter_osc(changes, output, &all_expressions)?;
     stats.print_summary();
+    Ok(())
+}
+
+fn paths_alias(input: &std::path::Path, output: &std::path::Path) -> std::io::Result<bool> {
+    let input_canonical = std::fs::canonicalize(input)?;
+    if output.exists() {
+        let output_canonical = std::fs::canonicalize(output)?;
+        if input_canonical == output_canonical {
+            return Ok(true);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let input_meta = std::fs::metadata(&input_canonical)?;
+            let output_meta = std::fs::metadata(&output_canonical)?;
+            return Ok(
+                input_meta.dev() == output_meta.dev() && input_meta.ino() == output_meta.ino()
+            );
+        }
+        #[cfg(not(unix))]
+        return Ok(false);
+    }
+
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let parent = std::fs::canonicalize(parent)?;
+    let Some(name) = output.file_name() else {
+        return Ok(false);
+    };
+    Ok(input_canonical == parent.join(name))
+}
+
+fn run_export_to<W: std::io::Write>(
+    file: &std::path::Path,
+    writer: W,
+    options: &pbfhogg::export::ExportOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stats = pbfhogg::export::export(file, writer, options)?;
+    stats.print_summary();
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_export(
+    file: &std::path::Path,
+    output: Option<&std::path::Path>,
+    format: ExportFormatArg,
+    type_filter: Option<ExportTypeArg>,
+    expressions_file: Option<&std::path::Path>,
+    expressions: &[String],
+    properties: Option<Vec<String>>,
+    bbox: Option<&str>,
+    metadata: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let expressions = combine_expressions(expressions_file, expressions)?;
+    let format = match format {
+        ExportFormatArg::Geojsonseq => pbfhogg::export::ExportFormat::GeoJsonSeq,
+        ExportFormatArg::Geojson => pbfhogg::export::ExportFormat::GeoJson,
+    };
+    let types = match type_filter {
+        None => pbfhogg::export::ExportTypes::All,
+        Some(ExportTypeArg::Node) => pbfhogg::export::ExportTypes::NodesOnly,
+        Some(ExportTypeArg::Way) => pbfhogg::export::ExportTypes::WaysOnly,
+    };
+    let options = pbfhogg::export::ExportOptions::new(
+        format,
+        types,
+        &expressions,
+        properties,
+        bbox,
+        metadata,
+    )?;
+
+    if let Some(output) = output {
+        if paths_alias(file, output)? {
+            return Err(format!(
+                "export output '{}' aliases input '{}'",
+                output.display(),
+                file.display()
+            )
+            .into());
+        }
+        let file_out = std::fs::File::create(output)?;
+        let guard = pbfhogg::path_guard::PathGuard::file(output.to_path_buf());
+        run_export_to(file, std::io::BufWriter::new(file_out), &options)?;
+        guard.commit();
+    } else {
+        let stdout = std::io::stdout();
+        run_export_to(file, stdout.lock(), &options)?;
+    }
     Ok(())
 }
 

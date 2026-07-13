@@ -574,10 +574,13 @@ Fix (option (a) plus the deliberate second shape):
   elements) would have made the shared cap-boundary swap produce
   cross-blob overlap instead.
 
-Remaining follow-up (pending, run by the orchestrator): regenerate the
-`unsorted` snapshot with `degrade --unsort --as-snapshot unsorted
---replace-snapshot`, then `verify sort --snapshot unsorted` as the
-overlap-rewrite correctness gate.
+Correctness gate CLOSED 2026-07-11: the `unsorted` snapshot was
+regenerated post-fix and `verify sort --snapshot unsorted` PASSED, with
+the overlap-rewrite path firing on the regenerated data
+(`sort_blobs_overlap=6`, `sort_overlap_runs=3`, `sort_blobs_rewritten=6` -
+one adjacent same-kind pair per kind, exactly the designed shape; UUID
+`11062bdd` at `29e4eab`, plantasjen). The pre-fix run `f5cd6522` saw 0
+overlaps / full passthrough.
 
 ## v2 scope
 

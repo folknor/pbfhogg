@@ -188,8 +188,8 @@ enum Command {
     /// At least one flag is required, and flags compose - except
     /// `--unsort` and `--unsort-intra`, which are mutually exclusive (they
     /// request opposite blob shapes). Supports `--unsort`, `--unsort-intra`,
-    /// `--strip-locations`, `--strip-indexdata`, `--strip-tagdata`, and
-    /// `--drop-ids`. Both
+    /// `--strip-locations`, `--strip-indexdata`, `--strip-tagdata`,
+    /// `--strip-bbox`, and `--drop-ids`. Both
     /// unsort modes perturb
     /// exactly one same-kind pair per kind that has more than `block_cap`
     /// elements; kinds with fewer elements pass through unchanged. Used to
@@ -223,6 +223,11 @@ enum Command {
         /// indexed.
         #[arg(long)]
         strip_tagdata: bool,
+        /// Clear the `HeaderBlock.bbox` from the OSMHeader so the output
+        /// declares no file-level bounding box. Header-only change; every
+        /// OsmData blob passes through untouched.
+        #[arg(long)]
+        strip_bbox: bool,
         /// Drop exactly N elements chosen deterministically from their kind,
         /// ID, and SEED. Format: N:SEED (for example 5000:42).
         #[arg(long = "drop-ids", value_name = "N:SEED")]
@@ -910,6 +915,7 @@ fn main() -> process::ExitCode {
                 strip_locations,
                 strip_indexdata,
                 strip_tagdata,
+                strip_bbox,
                 drop_ids,
                 block_cap,
                 force,
@@ -925,6 +931,7 @@ fn main() -> process::ExitCode {
                 strip_locations,
                 strip_indexdata,
                 strip_tagdata,
+                strip_bbox,
                 drop_ids,
                 block_cap,
                 force,
@@ -1764,6 +1771,7 @@ fn run_degrade(
     strip_locations: bool,
     strip_indexdata: bool,
     strip_tagdata: bool,
+    strip_bbox: bool,
     drop_ids: Option<String>,
     block_cap: usize,
     force: bool,
@@ -1783,6 +1791,7 @@ fn run_degrade(
         strip_locations,
         strip_indexdata,
         strip_tagdata,
+        strip_bbox,
         drop_ids: drop_spec,
     };
     let stats = pbfhogg::degrade::degrade(

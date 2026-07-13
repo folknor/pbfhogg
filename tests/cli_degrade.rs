@@ -22,6 +22,8 @@ use common::{
     generate_nodes, generate_relations, generate_ways, read_header, read_normalized,
     write_multi_block_test_pbf,
 };
+use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData, Metadata};
+use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element};
 
 /// Build a sorted, multi-blob fixture: 60 nodes, 12 ways, 6 relations,
@@ -44,6 +46,355 @@ fn write_degrade_fixture(path: &Path) -> (Vec<TestNode>, Vec<TestWay>, Vec<TestR
     let mut rels = generate_relations(6, 1, 2, 1);
     rels[0].tags = vec![("type", "route")];
     write_multi_block_test_pbf(path, &nodes, &ways, &rels, 20);
+    (nodes, ways, rels)
+}
+
+/// The `HeaderBlock.bbox` the bbox fixture declares, in
+/// `HeaderBuilder::bbox` order (left/bottom/right/top degrees). Chosen to
+/// enclose every `generate_nodes` coordinate (node `n` sits at
+/// `n * 1e-4` degrees, so `1..60` land in `[1e-4, 6e-3]`).
+const FIXTURE_BBOX: (f64, f64, f64, f64) = (0.0, 0.0, 0.01, 0.01);
+
+// Rich HeaderBlock metadata the bbox fixture carries beyond the bbox. Every
+// one of these is a field that a `HeaderBuilder::from_header` rebuild would
+// silently drop or replace (source and custom optional features have no
+// `HeaderBuilder` encoder; the writingprogram would be reset to "pbfhogg"),
+// so asserting they SURVIVE `--strip-bbox` pins that the passthrough path
+// preserves the input HeaderBlock payload verbatim instead of rebuilding it.
+const FIXTURE_WRITING_PROGRAM: &str = "degrade-test-writer/3.1";
+const FIXTURE_SOURCE: &str = "survey-import-2019";
+const FIXTURE_CUSTOM_FEATURE: &str = "Custom.Extension-v9";
+const FIXTURE_REPL_TS: i64 = 1_700_000_000;
+const FIXTURE_REPL_SEQ: i64 = 4242;
+const FIXTURE_REPL_URL: &str = "https://example.org/replication";
+
+/// Append a base-128 varint to `buf` (protobuf wire encoding).
+fn push_varint(buf: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            buf.push(byte | 0x80);
+        } else {
+            buf.push(byte);
+            break;
+        }
+    }
+}
+
+/// Append a length-delimited (wire type 2) field to a protobuf message.
+fn push_len_field(buf: &mut Vec<u8>, field: u32, data: &[u8]) {
+    push_varint(buf, (u64::from(field) << 3) | 2);
+    push_varint(buf, data.len() as u64);
+    buf.extend_from_slice(data);
+}
+
+/// Build the rich HeaderBlock protobuf bytes the bbox fixtures share: a bbox,
+/// sorted flag, a non-default writingprogram, a custom optional feature, the
+/// three osmosis replication fields, and a `source` (field 17). `HeaderBuilder`
+/// cannot emit `source`, so it is appended at the wire level.
+fn rich_bbox_header_bytes() -> Vec<u8> {
+    let (left, bottom, right, top) = FIXTURE_BBOX;
+    let mut header = HeaderBuilder::new()
+        .sorted()
+        .bbox(left, bottom, right, top)
+        .writing_program(FIXTURE_WRITING_PROGRAM)
+        .optional_feature(FIXTURE_CUSTOM_FEATURE)
+        .replication_timestamp(FIXTURE_REPL_TS)
+        .replication_sequence_number(FIXTURE_REPL_SEQ)
+        .replication_base_url(FIXTURE_REPL_URL)
+        .build()
+        .expect("build header");
+    // Field 17: source. Protobuf fields may appear in any order, so appending
+    // is valid; the reader picks it up as HeaderBlock.source.
+    push_len_field(&mut header, 17, FIXTURE_SOURCE.as_bytes());
+    header
+}
+
+/// Write the three element kinds into `writer`, one block per kind.
+fn write_fixture_elements(
+    writer: &mut PbfWriter<impl std::io::Write>,
+    nodes: &[TestNode],
+    ways: &[TestWay],
+    rels: &[TestRelation],
+) {
+    let no_meta: Option<&Metadata> = None;
+    let mut bb = BlockBuilder::new();
+    for n in nodes {
+        bb.add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), no_meta);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write nodes");
+    }
+    for w in ways {
+        bb.add_way(w.id, w.tags.iter().copied(), &w.refs, no_meta);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write ways");
+    }
+    for r in rels {
+        let members: Vec<MemberData<'_>> = r
+            .members
+            .iter()
+            .map(|m| MemberData {
+                id: m.id,
+                role: m.role,
+            })
+            .collect();
+        bb.add_relation(r.id, r.tags.iter().copied(), &members, no_meta);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer
+            .write_primitive_block(bytes)
+            .expect("write relations");
+    }
+}
+
+/// Build a sorted, indexed, multi-blob fixture that carries a rich header:
+/// a `HeaderBlock.bbox`, a non-default writingprogram, a custom optional
+/// feature, replication metadata, and a `source`. Written via
+/// `PbfWriter::to_path`, which embeds `indexdata`, so the output is both
+/// indexed (extractable) and bbox-bearing.
+fn write_bbox_fixture(path: &Path) -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>) {
+    let nodes = generate_nodes(60, 1);
+    let ways = generate_ways(12, 1, 3, 1);
+    let rels = generate_relations(6, 1, 2, 1);
+
+    let header = rich_bbox_header_bytes();
+    let mut writer =
+        PbfWriter::to_path(path, Compression::default(), &header).expect("create writer");
+    write_fixture_elements(&mut writer, &nodes, &ways, &rels);
+    writer.flush().expect("flush");
+    (nodes, ways, rels)
+}
+
+/// Assert the rich non-bbox header fields the bbox fixture declares are all
+/// present. Used as an input precondition so the survival assertions after a
+/// `--strip-bbox` are not vacuous.
+fn assert_rich_header_fields_present(path: &Path) {
+    let h = read_header(path);
+    assert_eq!(h.writing_program(), Some(FIXTURE_WRITING_PROGRAM));
+    assert_eq!(h.source(), Some(FIXTURE_SOURCE));
+    assert_eq!(h.osmosis_replication_timestamp(), Some(FIXTURE_REPL_TS));
+    assert_eq!(
+        h.osmosis_replication_sequence_number(),
+        Some(FIXTURE_REPL_SEQ)
+    );
+    assert_eq!(h.osmosis_replication_base_url(), Some(FIXTURE_REPL_URL));
+    assert!(
+        h.optional_features()
+            .iter()
+            .any(|f| f == FIXTURE_CUSTOM_FEATURE),
+        "fixture must declare the custom optional feature"
+    );
+    assert!(h.is_sorted());
+    assert!(h.bbox().is_some());
+}
+
+/// Assert every rich non-bbox header field survived a transform verbatim.
+fn assert_rich_header_fields_survived(path: &Path) {
+    let h = read_header(path);
+    assert_eq!(
+        h.writing_program(),
+        Some(FIXTURE_WRITING_PROGRAM),
+        "writingprogram must survive (a HeaderBuilder rebuild would reset it to pbfhogg)"
+    );
+    assert_eq!(
+        h.source(),
+        Some(FIXTURE_SOURCE),
+        "source (field 17) must survive (HeaderBuilder cannot even emit it)"
+    );
+    assert_eq!(h.osmosis_replication_timestamp(), Some(FIXTURE_REPL_TS));
+    assert_eq!(
+        h.osmosis_replication_sequence_number(),
+        Some(FIXTURE_REPL_SEQ)
+    );
+    assert_eq!(h.osmosis_replication_base_url(), Some(FIXTURE_REPL_URL));
+    assert!(
+        h.optional_features()
+            .iter()
+            .any(|f| f == FIXTURE_CUSTOM_FEATURE),
+        "custom optional feature must survive (a HeaderBuilder rebuild drops it)"
+    );
+    assert!(h.is_sorted(), "Sort.Type_then_ID must survive");
+}
+
+/// Extract the raw byte frames of every `OSMData` blob in `path`, in file
+/// order. Used to assert the passthrough path copies OsmData frames verbatim
+/// (byte-for-byte) rather than re-encoding them. Walks the PBF wire envelope
+/// `[4-byte BE header_len][BlobHeader][Blob]` directly and parses each
+/// BlobHeader's type (field 1) and datasize (field 3).
+fn osm_data_frames(path: &Path) -> Vec<Vec<u8>> {
+    fn read_varint_at(buf: &[u8], pos: &mut usize) -> u64 {
+        let mut result = 0u64;
+        let mut shift = 0u32;
+        loop {
+            let byte = buf[*pos];
+            *pos += 1;
+            result |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        result
+    }
+
+    let data = std::fs::read(path).expect("read pbf");
+    let mut pos = 0usize;
+    let mut frames = Vec::new();
+    while pos < data.len() {
+        let frame_start = pos;
+        let header_len =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+        let header_end = pos + header_len;
+        let mut hpos = pos;
+        let mut blob_type = String::new();
+        let mut datasize = 0usize;
+        while hpos < header_end {
+            let tag = read_varint_at(&data, &mut hpos);
+            let field = tag >> 3;
+            let wire = tag & 7;
+            match (field, wire) {
+                (1, 2) => {
+                    let len = usize::try_from(read_varint_at(&data, &mut hpos)).expect("len fits");
+                    blob_type = String::from_utf8(data[hpos..hpos + len].to_vec()).expect("utf8");
+                    hpos += len;
+                }
+                (3, 0) => {
+                    datasize =
+                        usize::try_from(read_varint_at(&data, &mut hpos)).expect("datasize fits");
+                }
+                (_, 0) => {
+                    read_varint_at(&data, &mut hpos);
+                }
+                (_, 2) => {
+                    let len = usize::try_from(read_varint_at(&data, &mut hpos)).expect("len fits");
+                    hpos += len;
+                }
+                _ => panic!("unexpected wire type {wire} in BlobHeader"),
+            }
+        }
+        let frame_end = header_end + datasize;
+        if blob_type == "OSMData" {
+            frames.push(data[frame_start..frame_end].to_vec());
+        }
+        pos = frame_end;
+    }
+    frames
+}
+
+/// Build a non-indexed, bbox-bearing fixture via the sync `PbfWriter::new`
+/// path (which does not embed `indexdata`). Carries the same rich header as
+/// `write_bbox_fixture`. Used to prove `--strip-bbox` needs no indexdata
+/// precondition: the passthrough path never calls `require_indexdata`, so the
+/// run must succeed on a non-indexed input without `--force` (the decode path
+/// would error out).
+fn write_non_indexed_bbox_fixture(path: &Path) -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>) {
+    let nodes = generate_nodes(60, 1);
+    let ways = generate_ways(12, 1, 3, 1);
+    let rels = generate_relations(6, 1, 2, 1);
+
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::new(file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = rich_bbox_header_bytes();
+    writer.write_header(&header).expect("write header");
+
+    // write_primitive_block_no_indexdata keeps the OsmData BlobHeaders free of
+    // the indexdata field, so the fixture is genuinely non-indexed.
+    let no_meta: Option<&Metadata> = None;
+    let mut bb = BlockBuilder::new();
+    for n in &nodes {
+        bb.add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), no_meta);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer
+            .write_primitive_block_no_indexdata(bytes)
+            .expect("write nodes");
+    }
+    for w in &ways {
+        bb.add_way(w.id, w.tags.iter().copied(), &w.refs, no_meta);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer
+            .write_primitive_block_no_indexdata(bytes)
+            .expect("write ways");
+    }
+    for r in &rels {
+        let members: Vec<MemberData<'_>> = r
+            .members
+            .iter()
+            .map(|m| MemberData {
+                id: m.id,
+                role: m.role,
+            })
+            .collect();
+        bb.add_relation(r.id, r.tags.iter().copied(), &members, no_meta);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer
+            .write_primitive_block_no_indexdata(bytes)
+            .expect("write relations");
+    }
+    writer.flush().expect("flush");
+    (nodes, ways, rels)
+}
+
+/// Build a sorted, indexed fixture whose ways carry inline `LocationsOnWays`
+/// coordinates and whose header declares the `LocationsOnWays` optional
+/// feature. Used to make the standalone `--strip-locations` assertion
+/// non-vacuous: the input genuinely declares LOW, so clearing it is a real
+/// change rather than a no-op on a header that never had it.
+fn write_low_fixture(path: &Path) -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>) {
+    let nodes = generate_nodes(60, 1);
+    let ways = generate_ways(12, 1, 3, 1);
+    let rels = generate_relations(6, 1, 2, 1);
+
+    let header = HeaderBuilder::new()
+        .sorted()
+        .optional_feature("LocationsOnWays")
+        .build()
+        .expect("build header");
+    let mut writer =
+        PbfWriter::to_path(path, Compression::default(), &header).expect("create writer");
+
+    let no_meta: Option<&Metadata> = None;
+    let mut bb = BlockBuilder::new();
+    for n in &nodes {
+        bb.add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), no_meta);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write nodes");
+    }
+    for w in &ways {
+        // Give every ref an inline coordinate so the way genuinely carries
+        // LocationsOnWays data (not just the header feature flag). Exact
+        // values are irrelevant to the strip; a fixed decimicro pair suffices.
+        let locations: Vec<(i32, i32)> = w.refs.iter().map(|_| (1_000_000, 2_000_000)).collect();
+        bb.add_way_with_locations(w.id, w.tags.iter().copied(), &w.refs, &locations, no_meta);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write ways");
+    }
+    for r in &rels {
+        let members: Vec<MemberData<'_>> = r
+            .members
+            .iter()
+            .map(|m| MemberData {
+                id: m.id,
+                role: m.role,
+            })
+            .collect();
+        bb.add_relation(r.id, r.tags.iter().copied(), &members, no_meta);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer
+            .write_primitive_block(bytes)
+            .expect("write relations");
+    }
+    writer.flush().expect("flush");
     (nodes, ways, rels)
 }
 
@@ -271,17 +622,25 @@ fn degrade_strip_indexdata_drops_indexdata() {
 // --strip-locations
 // ---------------------------------------------------------------------------
 
-/// `--strip-locations` clears the `LocationsOnWays` header feature.
-/// (The fixture doesn't set LOW, so this test focuses on the sentinel
-/// that the flag does not silently re-introduce LOW.) Element data
-/// round-trips through the BlockBuilder.
+/// `--strip-locations` clears the `LocationsOnWays` header feature. The
+/// fixture genuinely declares LOW (its ways carry inline coordinates and the
+/// header sets the optional feature), so the assertion below is non-vacuous:
+/// the flag really removes a feature the input had, rather than confirming a
+/// no-op on a header that never declared it. Element data (ids, tags, refs,
+/// members) round-trips through the BlockBuilder re-encode.
 #[test]
 fn degrade_strip_locations_clears_low_and_preserves_elements() {
     let dir = tempfile::tempdir().expect("tempdir");
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
-    write_degrade_fixture(&input);
+    write_low_fixture(&input);
+    // Precondition: the input actually declares LocationsOnWays, so clearing
+    // it is a real change.
+    assert!(
+        read_header(&input).has_locations_on_ways(),
+        "fixture must declare LocationsOnWays for the strip to be meaningful"
+    );
 
     CliInvoker::new()
         .arg("degrade")
@@ -356,6 +715,306 @@ fn degrade_strip_tagdata_drops_tagdata() {
     );
 
     // Element semantics preserved.
+    let original = read_normalized(&input);
+    let degraded = read_normalized(&output);
+    assert_eq!(original.nodes, degraded.nodes);
+    assert_eq!(original.ways, degraded.ways);
+    assert_eq!(original.relations, degraded.relations);
+}
+
+// ---------------------------------------------------------------------------
+// --strip-bbox
+// ---------------------------------------------------------------------------
+
+/// `--strip-bbox` clears the `HeaderBlock.bbox` while leaving every OsmData
+/// blob untouched: it is a header-only passthrough, so indexdata, tagdata,
+/// sortedness, and the element multiset all survive.
+#[test]
+fn degrade_strip_bbox_clears_header_bbox() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    write_bbox_fixture(&input);
+    // Precondition: the fixture actually declares a bbox AND a full set of
+    // other header fields, so the strip is meaningful and the survival
+    // assertions below are not vacuous.
+    assert!(
+        read_header(&input).bbox().is_some(),
+        "fixture must declare a HeaderBlock.bbox for the strip to be meaningful"
+    );
+    assert_rich_header_fields_present(&input);
+    assert_indexed(&input);
+
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--strip-bbox")
+        .assert_success();
+
+    assert!(
+        read_header(&output).bbox().is_none(),
+        "--strip-bbox output must not declare a HeaderBlock.bbox"
+    );
+
+    // The bbox is the ONLY header field that changes: source, writingprogram,
+    // the custom optional feature, replication metadata, and sortedness all
+    // survive verbatim. A HeaderBuilder rebuild would have dropped or reset
+    // several of these, so this pins the verbatim-passthrough contract.
+    assert_rich_header_fields_survived(&output);
+
+    // Header-only passthrough: indexdata is untouched.
+    assert_indexed(&output);
+
+    // The OsmData blob frames are copied byte-for-byte - the strip touches
+    // only the OSMHeader.
+    assert_eq!(
+        osm_data_frames(&output),
+        osm_data_frames(&input),
+        "--strip-bbox must leave every OsmData frame byte-identical"
+    );
+
+    let original = read_normalized(&input);
+    let degraded = read_normalized(&output);
+    assert_eq!(original.nodes, degraded.nodes);
+    assert_eq!(original.ways, degraded.ways);
+    assert_eq!(original.relations, degraded.relations);
+}
+
+/// `--strip-bbox` on a *non-indexed* bbox-bearing input succeeds without
+/// `--force`, proving it carries no indexdata precondition and does not
+/// switch to the decode path. The decode path calls `require_indexdata` and
+/// would error on a non-indexed input without `--force`; a clean success
+/// therefore proves the run stayed on the header-only passthrough. The output
+/// stays non-indexed, the bbox is gone, the other header fields survive, and
+/// the OsmData frames are copied verbatim.
+#[test]
+fn degrade_strip_bbox_no_indexdata_uses_passthrough() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    write_non_indexed_bbox_fixture(&input);
+    assert_non_indexed(&input);
+    assert!(read_header(&input).bbox().is_some());
+    assert_rich_header_fields_present(&input);
+
+    // No --force: a decode-path dispatch would fail the indexdata precondition.
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--strip-bbox")
+        .assert_success();
+
+    assert!(read_header(&output).bbox().is_none());
+    // Passthrough on a non-indexed input leaves it non-indexed.
+    assert_non_indexed(&output);
+    assert_rich_header_fields_survived(&output);
+    assert_eq!(
+        osm_data_frames(&output),
+        osm_data_frames(&input),
+        "non-indexed --strip-bbox must copy OsmData frames byte-for-byte"
+    );
+
+    let original = read_normalized(&input);
+    let degraded = read_normalized(&output);
+    assert_eq!(original.nodes, degraded.nodes);
+    assert_eq!(original.ways, degraded.ways);
+    assert_eq!(original.relations, degraded.relations);
+}
+
+/// `--strip-bbox --strip-indexdata` composes on the passthrough path: the
+/// bbox is dropped from the OSMHeader *and* indexdata is cleared from every
+/// OsmData blob, while sortedness and the element multiset survive.
+#[test]
+fn degrade_strip_bbox_and_strip_indexdata_compose() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    write_bbox_fixture(&input);
+    assert!(read_header(&input).bbox().is_some());
+    assert_indexed(&input);
+
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--strip-bbox")
+        .arg("--strip-indexdata")
+        .assert_success();
+
+    assert!(read_header(&output).bbox().is_none());
+    assert_non_indexed(&output);
+    assert!(read_header(&output).is_sorted());
+
+    let original = read_normalized(&input);
+    let degraded = read_normalized(&output);
+    assert_eq!(original.nodes, degraded.nodes);
+    assert_eq!(original.ways, degraded.ways);
+    assert_eq!(original.relations, degraded.relations);
+}
+
+/// `--strip-bbox --strip-locations` composes across the path boundary:
+/// `--strip-locations` forces the decode path, and `--strip-bbox` must still
+/// drop the bbox from the rebuilt output header. Confirms the bbox strip is
+/// wired into the decode path's header construction, not just the
+/// passthrough path's.
+#[test]
+fn degrade_strip_bbox_and_strip_locations_compose() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    write_bbox_fixture(&input);
+    assert!(read_header(&input).bbox().is_some());
+
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--strip-bbox")
+        .arg("--strip-locations")
+        .assert_success();
+
+    assert!(
+        read_header(&output).bbox().is_none(),
+        "--strip-bbox output must not declare a HeaderBlock.bbox (decode path)"
+    );
+    assert!(
+        !read_header(&output).has_locations_on_ways(),
+        "--strip-locations output must not declare LocationsOnWays"
+    );
+
+    let original = read_normalized(&input);
+    let degraded = read_normalized(&output);
+    assert_eq!(original.nodes, degraded.nodes);
+    assert_eq!(original.ways, degraded.ways);
+    assert_eq!(original.relations, degraded.relations);
+}
+
+/// `extract --bbox` on the stripped output produces the same elements as
+/// `extract --bbox` on the original bbox-bearing input. `extract` derives
+/// its region purely from the CLI `--bbox` argument and prunes blobs with
+/// the per-blob `indexdata` bboxes; it never consults the `HeaderBlock`
+/// bbox, so removing it is inert for extract correctness. This pins that
+/// invariant end-to-end: the degraded file stays a valid extract input.
+#[test]
+fn degrade_strip_bbox_extract_bbox_matches_original() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let stripped = dir.path().join("stripped.osm.pbf");
+    let extract_orig = dir.path().join("extract_orig.osm.pbf");
+    let extract_stripped = dir.path().join("extract_stripped.osm.pbf");
+
+    write_bbox_fixture(&input);
+
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&input)
+        .arg("-o")
+        .arg(&stripped)
+        .arg("--strip-bbox")
+        .assert_success();
+    assert!(read_header(&stripped).bbox().is_none());
+
+    // A sub-region of the fixture's coordinate span so the extract is
+    // non-empty but not the whole file. osmium order: minlon,minlat,maxlon,maxlat.
+    let region = "0.0,0.0,0.00055,0.00055";
+    for (src, out) in [(&input, &extract_orig), (&stripped, &extract_stripped)] {
+        CliInvoker::new()
+            .arg("extract")
+            .arg(src)
+            .arg("-o")
+            .arg(out)
+            .arg("--bbox")
+            .arg(region)
+            .assert_success();
+    }
+
+    let orig = read_normalized(&extract_orig);
+    let strip = read_normalized(&extract_stripped);
+    let full = read_normalized(&input);
+    // Guard against a vacuous (empty) extract passing trivially.
+    assert!(
+        !orig.nodes.is_empty(),
+        "extract region must select at least one node"
+    );
+    // Prove the spatial filter really ran: the sub-region must select
+    // strictly fewer nodes than the whole file. If extract returned every
+    // element the "matches" comparison below would be trivially satisfiable
+    // by a no-op passthrough.
+    assert!(
+        orig.nodes.len() < full.nodes.len(),
+        "extract must select strictly fewer than all {} nodes, got {}",
+        full.nodes.len(),
+        orig.nodes.len()
+    );
+    assert_eq!(orig.nodes, strip.nodes);
+    assert_eq!(orig.ways, strip.ways);
+    assert_eq!(orig.relations, strip.relations);
+}
+
+/// `--strip-bbox --generator <name>` on a passthrough-eligible bbox-bearing
+/// input takes the *rebuild* branch of `passthrough_header_bytes`, not the
+/// verbatim-forward branch: `--generator` is a `HeaderOverrides` override, so
+/// `passthrough_header_bytes` rebuilds the header via `HeaderBuilder` (bbox
+/// omitted under `--strip-bbox`) instead of forwarding the decompressed
+/// `HeaderBlock` protobuf field-for-field. Two independent signals pin this:
+/// the bbox is gone (proving the strip still applied) AND `writingprogram`
+/// equals the override rather than the fixture's original value (proving the
+/// override actually took effect, which only happens on the rebuild path -
+/// the verbatim path has no override plumbing at all). Without this test the
+/// rebuild branch in `passthrough_header_bytes` had no direct coverage; every
+/// other `--strip-bbox` test above exercises only the verbatim branch.
+#[test]
+fn degrade_strip_bbox_with_generator_override_rebuilds_header() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    write_bbox_fixture(&input);
+    assert!(
+        read_header(&input).bbox().is_some(),
+        "fixture must declare a HeaderBlock.bbox for the strip to be meaningful"
+    );
+    assert_eq!(
+        read_header(&input).writing_program(),
+        Some(FIXTURE_WRITING_PROGRAM),
+        "fixture's original writingprogram must differ from the override below"
+    );
+
+    const OVERRIDE_GENERATOR: &str = "degrade-rebuild-override/9.0";
+
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--strip-bbox")
+        .arg("--generator")
+        .arg(OVERRIDE_GENERATOR)
+        .assert_success();
+
+    let out_header = read_header(&output);
+    assert!(
+        out_header.bbox().is_none(),
+        "--strip-bbox must still clear HeaderBlock.bbox on the override-rebuild path"
+    );
+    assert_eq!(
+        out_header.writing_program(),
+        Some(OVERRIDE_GENERATOR),
+        "--generator must win on the rebuild path, proving passthrough_header_bytes \
+         took the HeaderBuilder rebuild branch rather than the verbatim-forward branch"
+    );
+
+    // Element semantics preserved: only the header changed.
     let original = read_normalized(&input);
     let degraded = read_normalized(&output);
     assert_eq!(original.nodes, degraded.nodes);

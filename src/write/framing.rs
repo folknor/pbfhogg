@@ -322,7 +322,16 @@ pub(crate) fn encode_blob_header_into(
 /// round-trip would produce, and an index that fails to deserialize is kept
 /// instead of dropped. It equally preserves `tagdata` (field 4), the
 /// `pbfhogg.WayMembers-v1` payload (field 5), and any unknown/extension
-/// fields. Only the targeted field number(s) are removed.
+/// fields whose wire type this can skip. Only the targeted field number(s)
+/// are removed.
+///
+/// Wire-type coverage: fields using varint (0), 64-bit (1), length-delimited
+/// (2), or 32-bit (5) wire types are copied verbatim regardless of field
+/// number - the only wire types `BlobHeader` and `HeaderBlock` actually use.
+/// The deprecated protobuf group wire types (3 = `SGROUP`, 4 = `EGROUP`) are
+/// not supported by the underlying cursor and return a clean parse error
+/// instead of being silently dropped or miscopied; neither message type
+/// emits them, so this is not expected to trigger in practice.
 ///
 /// Used by `degrade`'s header-only passthrough so a strip changes exactly
 /// the field it targets (`indexdata` for `--strip-indexdata`, `tagdata` for
@@ -334,23 +343,58 @@ pub(crate) fn strip_blob_header_fields(
     strip_fields: &[u32],
     out: &mut Vec<u8>,
 ) -> io::Result<()> {
+    strip_message_fields(header_bytes, strip_fields, out, "BlobHeader")
+}
+
+/// Re-emit a `HeaderBlock` protobuf message (the decompressed OSMHeader
+/// payload), copying every field through verbatim except the field numbers
+/// listed in `strip_fields`, which are dropped.
+///
+/// The counterpart of [`strip_blob_header_fields`] for the file-level
+/// `HeaderBlock`. Used by `degrade`'s header-only passthrough so
+/// `--strip-bbox` removes exactly the bbox (field 1) while leaving every
+/// other HeaderBlock field byte-for-byte identical: `writingprogram`
+/// (field 16), `source` (field 17), the required/optional feature lists
+/// (fields 4/5, including custom extension features like
+/// `pbfhogg.WayMembers-v1` and `SharedNodePins-v1`), the osmosis
+/// replication metadata (fields 32/33/34), and any unknown/extension
+/// fields whose wire type this can skip (see the wire-type coverage note
+/// on [`strip_blob_header_fields`]). Rebuilding through `HeaderBuilder`
+/// would silently drop several of those; this preserves them.
+pub(crate) fn strip_header_block_fields(
+    header_block_bytes: &[u8],
+    strip_fields: &[u32],
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
+    strip_message_fields(header_block_bytes, strip_fields, out, "HeaderBlock")
+}
+
+/// Shared protobuf field-copy core for the two strippers above. Copies every
+/// top-level field's tag+value bytes verbatim except the field numbers in
+/// `strip_fields`. `ctx` names the message in parse errors.
+fn strip_message_fields(
+    msg_bytes: &[u8],
+    strip_fields: &[u32],
+    out: &mut Vec<u8>,
+    ctx: &str,
+) -> io::Result<()> {
     use protohoggr::Cursor;
     out.clear();
-    let mut cursor = Cursor::new(header_bytes);
+    let mut cursor = Cursor::new(msg_bytes);
     loop {
         let field_start = cursor.position();
         let Some((field, wire_type)) = cursor
             .read_tag()
-            .map_err(|e| io::Error::other(format!("BlobHeader parse: {e}")))?
+            .map_err(|e| io::Error::other(format!("{ctx} parse: {e}")))?
         else {
             break;
         };
         cursor
             .skip_field(wire_type)
-            .map_err(|e| io::Error::other(format!("BlobHeader parse: {e}")))?;
+            .map_err(|e| io::Error::other(format!("{ctx} parse: {e}")))?;
         let field_end = cursor.position();
         if !strip_fields.contains(&field) {
-            out.extend_from_slice(&header_bytes[field_start..field_end]);
+            out.extend_from_slice(&msg_bytes[field_start..field_end]);
         }
     }
     Ok(())
@@ -519,6 +563,85 @@ mod tests {
         assert_eq!(
             out, expect_neither,
             "stripping fields 2 and 4 must leave WayMembers and unknown fields intact"
+        );
+    }
+
+    /// `strip_header_block_fields` copies every untargeted HeaderBlock field
+    /// through byte-for-byte and drops only the requested field number(s).
+    /// This pins the passthrough contract behind `degrade --strip-bbox`: the
+    /// bbox (field 1) disappears while `writingprogram` (16), `source` (17),
+    /// the optional-feature list (5, including custom extension features),
+    /// the osmosis replication metadata (32/33/34), and any unknown field
+    /// pbfhogg does not model all survive exactly - precisely the fields a
+    /// `HeaderBuilder::from_header` rebuild would silently drop.
+    #[test]
+    fn strip_header_block_fields_preserves_untargeted_fields_verbatim() {
+        use protohoggr::{encode_bytes_field, encode_int64_field, encode_varint_field};
+
+        // Hand-build a HeaderBlock carrying a bbox plus every metadata field,
+        // a custom optional feature, and one unknown field.
+        let bbox = [1u8, 2, 3, 4];
+        let source = b"survey-import-2019";
+        let custom_feature = b"Custom.Extension-v9";
+        let unknown = [0x77u8, 0x88];
+        let mut header = Vec::new();
+        encode_bytes_field(&mut header, 1, &bbox); // field 1: bbox (submessage)
+        encode_bytes_field(&mut header, 4, b"OsmSchema-V0.6"); // field 4: required
+        encode_bytes_field(&mut header, 5, b"Sort.Type_then_ID"); // field 5: optional
+        encode_bytes_field(&mut header, 5, custom_feature); // field 5: custom optional
+        encode_bytes_field(&mut header, 16, b"my-writer/2.0"); // field 16: writingprogram
+        encode_bytes_field(&mut header, 17, source); // field 17: source
+        encode_int64_field(&mut header, 32, 1_700_000_000); // field 32: repl timestamp
+        encode_int64_field(&mut header, 33, 4242); // field 33: repl seq
+        encode_bytes_field(&mut header, 34, b"https://example.org/repl"); // field 34: repl url
+        encode_varint_field(&mut header, 60, 0x0102); // field 60: unknown varint
+        encode_bytes_field(&mut header, 61, &unknown); // field 61: unknown bytes
+
+        // Strip nothing: identity copy.
+        let mut out = Vec::new();
+        strip_header_block_fields(&header, &[], &mut out).expect("strip none");
+        assert_eq!(out, header, "empty strip set must be an identity copy");
+
+        // Strip the bbox (field 1) only: everything else survives byte-for-byte.
+        let mut expect = Vec::new();
+        encode_bytes_field(&mut expect, 4, b"OsmSchema-V0.6");
+        encode_bytes_field(&mut expect, 5, b"Sort.Type_then_ID");
+        encode_bytes_field(&mut expect, 5, custom_feature);
+        encode_bytes_field(&mut expect, 16, b"my-writer/2.0");
+        encode_bytes_field(&mut expect, 17, source);
+        encode_int64_field(&mut expect, 32, 1_700_000_000);
+        encode_int64_field(&mut expect, 33, 4242);
+        encode_bytes_field(&mut expect, 34, b"https://example.org/repl");
+        encode_varint_field(&mut expect, 60, 0x0102);
+        encode_bytes_field(&mut expect, 61, &unknown);
+        let mut out = Vec::new();
+        strip_header_block_fields(&header, &[1], &mut out).expect("strip bbox");
+        assert_eq!(
+            out, expect,
+            "stripping field 1 must drop only the bbox and preserve source, \
+             writingprogram, custom optional features, replication metadata, \
+             and unknown fields byte-for-byte"
+        );
+
+        // The re-parsed HeaderBlock confirms the bbox is gone but the rest
+        // reads back intact.
+        let parsed = crate::read::block::HeaderBlock::parse_from_bytes(&out).expect("parse");
+        assert!(parsed.bbox().is_none(), "bbox must be gone");
+        assert_eq!(parsed.source(), Some("survey-import-2019"));
+        assert_eq!(parsed.writing_program(), Some("my-writer/2.0"));
+        assert!(parsed.is_sorted());
+        assert!(
+            parsed
+                .optional_features()
+                .iter()
+                .any(|f| f == "Custom.Extension-v9"),
+            "custom optional feature must survive"
+        );
+        assert_eq!(parsed.osmosis_replication_timestamp(), Some(1_700_000_000));
+        assert_eq!(parsed.osmosis_replication_sequence_number(), Some(4242));
+        assert_eq!(
+            parsed.osmosis_replication_base_url(),
+            Some("https://example.org/repl")
         );
     }
 

@@ -92,6 +92,17 @@ impl<'a> HeaderBuilder<'a> {
         self
     }
 
+    /// Clear any bounding box carried over from [`from_header`](Self::from_header).
+    ///
+    /// The built header omits field 1 entirely, so a consumer sees a file
+    /// with no declared bbox. Used by `degrade --strip-bbox` to produce an
+    /// adversarial input whose file-level extent is absent.
+    #[must_use]
+    pub fn without_bbox(mut self) -> Self {
+        self.bbox = None;
+        self
+    }
+
     /// Set the replication timestamp (seconds since UNIX epoch).
     #[must_use]
     pub fn replication_timestamp(mut self, ts: i64) -> Self {

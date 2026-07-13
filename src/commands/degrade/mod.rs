@@ -4,15 +4,29 @@
 //! indexdata, scattered coords).
 //!
 //! Transformations: `--unsort`, `--unsort-intra`, `--strip-locations`,
-//! `--strip-indexdata`, `--strip-tagdata`, `--drop-ids`. Flags compose (except the two
-//! unsort modes, which are mutually exclusive).
+//! `--strip-indexdata`, `--strip-tagdata`, `--strip-bbox`, `--drop-ids`.
+//! Flags compose (except the two unsort modes, which are mutually
+//! exclusive).
 //!
 //! Implementation paths:
 //!
-//! - Pure passthrough (`--strip-indexdata` and/or `--strip-tagdata` with
-//!   no unsort/strip-locations): raw blob frames are reframed by copying
+//! - Pure passthrough (`--strip-indexdata`, `--strip-tagdata`, and/or
+//!   `--strip-bbox` with no unsort/strip-locations/drop-ids): with no
+//!   `--generator`/`--output-header` override the input `HeaderBlock`
+//!   payload is preserved verbatim (the outer Blob envelope is
+//!   re-compressed, so the decompressed `HeaderBlock` protobuf is
+//!   field-identical, not blob-byte-identical) - it is forwarded
+//!   field-for-field and only the bbox (field 1) is surgically removed under
+//!   `--strip-bbox`, so `source`, custom optional features
+//!   (`pbfhogg.WayMembers-v1`, `SharedNodePins-v1`), a non-default
+//!   `writingprogram`, replication metadata, and unknown fields all survive
+//!   byte-for-byte. (When a header override is set the header is rebuilt via
+//!   `HeaderBuilder` so the override wins, dropping the bbox under
+//!   `--strip-bbox`.) Raw OsmData blob frames are then reframed by copying
 //!   the original `BlobHeader` through byte-for-byte and clearing only the
 //!   targeted field(s) - `indexdata` (field 2) and/or `tagdata` (field 4).
+//!   `--strip-bbox` is entirely an OSMHeader change; it never touches an
+//!   OsmData `BlobHeader` or payload.
 //!   Every other header field is preserved verbatim: the untouched hint's
 //!   original bytes (a v1 index stays v1), `WayMembers-v1` (field 5), and
 //!   any unknown/extension fields. Blob bytes are bit-identical; only the
@@ -76,7 +90,10 @@ use crate::owned::{
     read_dense_node, read_node, read_relation, read_way,
 };
 use crate::read::raw_frame::read_raw_frame;
-use crate::writer::{Compression, PbfWriter, frame_blob_pipelined, strip_blob_header_fields};
+use crate::writer::{
+    Compression, PbfWriter, frame_blob_pipelined, strip_blob_header_fields,
+    strip_header_block_fields,
+};
 use crate::{Element, ElementReader};
 
 /// Default per-block element cap. Matches the `BlockBuilder` default and
@@ -206,6 +223,12 @@ pub struct DegradeFlags {
     /// `--strip-indexdata` it is a header-only change, so it composes with
     /// the passthrough path and leaves `indexdata` alone.
     pub strip_tagdata: bool,
+    /// Clear the `HeaderBlock.bbox` (field 1) from the OSMHeader so the
+    /// output declares no file-level bounding box. Purely an OSMHeader
+    /// rewrite - every OsmData blob passes through untouched - so like the
+    /// other header-only strips it composes with the passthrough path and
+    /// carries no indexdata precondition.
+    pub strip_bbox: bool,
     /// Deterministically remove exactly this many unique element IDs.
     pub drop_ids: Option<DropSpec>,
 }
@@ -217,12 +240,14 @@ impl DegradeFlags {
             || self.strip_locations
             || self.strip_indexdata
             || self.strip_tagdata
+            || self.strip_bbox
             || self.drop_ids.is_some()
     }
 
     /// Returns `true` if elements must be decoded and re-encoded. Only the
-    /// header-only strips (`--strip-indexdata` / `--strip-tagdata`, alone or
-    /// together) can run as a pure blob-level passthrough.
+    /// header-only strips (`--strip-indexdata` / `--strip-tagdata` /
+    /// `--strip-bbox`, alone or together) can run as a pure blob-level
+    /// passthrough.
     fn needs_decode(self) -> bool {
         self.unsort || self.unsort_intra || self.strip_locations || self.drop_ids.is_some()
     }
@@ -272,6 +297,9 @@ impl DegradeStats {
         if self.flags.strip_tagdata {
             applied.push("--strip-tagdata");
         }
+        if self.flags.strip_bbox {
+            applied.push("--strip-bbox");
+        }
         if self.flags.drop_ids.is_some() {
             applied.push("--drop-ids");
         }
@@ -315,7 +343,7 @@ pub fn degrade(
     if !flags.any() {
         return Err("degrade requires at least one transformation flag \
                     (--unsort, --unsort-intra, --strip-locations, \
-                     --strip-indexdata, --strip-tagdata)"
+                     --strip-indexdata, --strip-tagdata, --strip-bbox)"
             .into());
     }
     if flags.unsort && flags.unsort_intra {
@@ -350,6 +378,7 @@ pub fn degrade(
         crate::debug::emit_counter("degrade_strip_locations", i64::from(flags.strip_locations));
         crate::debug::emit_counter("degrade_strip_indexdata", i64::from(flags.strip_indexdata));
         crate::debug::emit_counter("degrade_strip_tagdata", i64::from(flags.strip_tagdata));
+        crate::debug::emit_counter("degrade_strip_bbox", i64::from(flags.strip_bbox));
         crate::debug::emit_counter("degrade_drop_ids", i64::from(flags.drop_ids.is_some()));
         if let Some(spec) = flags.drop_ids {
             crate::debug::emit_counter("degrade_drop_n", spec.n as i64);
@@ -412,6 +441,74 @@ pub fn degrade(
 /// unless `--strip-indexdata` is set; `tagdata` survives unless
 /// `--strip-tagdata` is set - so `--strip-tagdata` alone yields a still-indexed
 /// file.
+/// Build the OSMHeader payload (raw `HeaderBlock` protobuf bytes) for the
+/// passthrough path.
+///
+/// With no `--generator` / `--output-header` override the input `HeaderBlock`
+/// payload is preserved verbatim (the outer Blob envelope is re-compressed,
+/// so this is field-identical, not blob-byte-identical): the decompressed
+/// `HeaderBlock` protobuf is forwarded field-for-field, and only the bbox
+/// (field 1) is surgically removed under
+/// `--strip-bbox`. So `source` (field 17), custom/optional features
+/// (`pbfhogg.WayMembers-v1`, `SharedNodePins-v1`, `LocationsOnWays`,
+/// `Sort.Type_then_ID`), a non-default `writingprogram`, the osmosis
+/// replication metadata, and any unknown/extension fields all survive
+/// byte-for-byte. This matters because rebuilding through
+/// [`HeaderBuilder::from_header`](crate::block_builder::HeaderBuilder::from_header)
+/// deliberately drops `source`, custom optional features, and unknown fields
+/// and replaces a non-default `writingprogram` - so a plain `--strip-bbox`
+/// (or `--strip-indexdata` / `--strip-tagdata`) would otherwise silently
+/// mutate far more than its target field.
+///
+/// When an override *is* present the user is explicitly rewriting header
+/// fields, so the header is rebuilt through `HeaderBuilder` (with the bbox
+/// omitted under `--strip-bbox`) and the overrides applied. `LocationsOnWays`
+/// is re-declared on this rebuild path when the input carried it, since the
+/// blob payloads still encode inline way coordinates.
+fn passthrough_header_bytes(
+    input: &Path,
+    flags: DegradeFlags,
+    overrides: &HeaderOverrides,
+    direct_io: bool,
+) -> Result<Vec<u8>> {
+    if overrides.is_empty() {
+        // Verbatim path: forward the original HeaderBlock protobuf, removing
+        // only the bbox field when requested. The OSMHeader is always the
+        // first blob in a well-formed PBF.
+        let mut reader = FileReader::open(input, direct_io)?;
+        let mut file_offset: u64 = 0;
+        let frame = read_raw_frame(&mut reader, &mut file_offset)?
+            .ok_or("input PBF is empty: no OSMHeader blob")?;
+        if !matches!(frame.blob_type, BlobKind::OsmHeader) {
+            return Err("input PBF does not start with an OSMHeader blob".into());
+        }
+        let mut header_block = Vec::new();
+        crate::read::decompress::decompress_blob_data_into(frame.blob_bytes(), &mut header_block)?;
+        if flags.strip_bbox {
+            let mut stripped = Vec::with_capacity(header_block.len());
+            strip_header_block_fields(&header_block, &[1], &mut stripped)?;
+            Ok(stripped)
+        } else {
+            Ok(header_block)
+        }
+    } else {
+        // Override present: rebuild so --generator / --output-header take
+        // effect. This is the lossy-but-intentional path.
+        let reader = ElementReader::open(input, direct_io)?;
+        let header = reader.header().clone();
+        build_output_header(&header, header.is_sorted(), overrides, |hb| {
+            let mut hb = hb;
+            if header.has_locations_on_ways() {
+                hb = hb.optional_feature("LocationsOnWays");
+            }
+            if flags.strip_bbox {
+                hb = hb.without_bbox();
+            }
+            hb
+        })
+    }
+}
+
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn degrade_passthrough(
     input: &Path,
@@ -422,17 +519,7 @@ fn degrade_passthrough(
     io_uring: bool,
     overrides: &HeaderOverrides,
 ) -> Result<DegradeStats> {
-    let header_bytes = {
-        let reader = ElementReader::open(input, direct_io)?;
-        let header = reader.header().clone();
-        build_output_header(&header, header.is_sorted(), overrides, |hb| {
-            let mut hb = hb;
-            if header.has_locations_on_ways() {
-                hb = hb.optional_feature("LocationsOnWays");
-            }
-            hb
-        })?
-    };
+    let header_bytes = passthrough_header_bytes(input, flags, overrides, direct_io)?;
 
     let mut writer =
         writer_from_header_bytes(output, compression, &header_bytes, direct_io, io_uring)?;
@@ -660,7 +747,13 @@ fn degrade_decode_path(
     };
 
     let preserve_sorted = !flags.unsort_any() && header.is_sorted();
-    let header_bytes = build_output_header(&header, preserve_sorted, overrides, |hb| hb)?;
+    let header_bytes = build_output_header(&header, preserve_sorted, overrides, |hb| {
+        if flags.strip_bbox {
+            hb.without_bbox()
+        } else {
+            hb
+        }
+    })?;
     let mut writer =
         writer_from_header_bytes(output, compression, &header_bytes, direct_io, io_uring)?;
 

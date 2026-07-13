@@ -39,6 +39,16 @@
   to v2), and `pbfhogg.WayMembers-v1` and any unknown header fields pass
   through unchanged. Only the field the flag targets is cleared.
 
+- `degrade --strip-bbox` clears the file-level `HeaderBlock.bbox` so the
+  output declares no bounding box, for exercising `inspect`'s bbox handling
+  and downstream/external-consumer tolerance of a file with no declared
+  extent. It is entirely a header-level change - no OsmData blob is
+  touched - and composes with every other transformation flag. On the
+  passthrough path it is a header-only strip: `source`, a non-default
+  `writingprogram`, custom optional features, replication metadata, and
+  unknown/extension fields all survive byte-for-byte alongside the bbox
+  removal.
+
 - `multi-extract`'s node classification now prunes candidate regions with
   a CSR grid (3600x1800 cells of 0.1 degree over the region bounding
   boxes) instead of testing every node against every region. The grid
@@ -115,6 +125,20 @@
   file in the background.
 
 ### Fixed
+
+- **`degrade`'s header-only passthrough no longer silently drops OSMHeader
+  fields.** With no `--generator`/`--output-header` override,
+  `--strip-indexdata` and `--strip-tagdata` previously rebuilt the output
+  header through `HeaderBuilder::from_header`, which drops `source`,
+  custom optional features, and unknown/extension fields, and resets a
+  non-default `writingprogram` to `pbfhogg` - none of which those flags
+  were meant to touch. The passthrough path now forwards the input
+  `HeaderBlock` payload verbatim (field-identical; the outer Blob envelope
+  is still re-compressed) via a surgical wire-level field stripper, so
+  only the field(s) the active strip flags actually target change. The
+  lossy `HeaderBuilder` rebuild still runs when `--generator`/
+  `--output-header` is passed, since that is an explicit request to
+  rewrite the header.
 
 - **Reverse geocoding no longer attributes near-boundary points to the
   wrong admin region via the interior-cell hint.** The admin-cell "interior"

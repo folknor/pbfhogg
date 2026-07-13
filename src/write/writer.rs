@@ -28,7 +28,7 @@ pub use crate::write::compression::{Compression, ParseCompressionError};
 use super::framing::{FrameScratch, PIPELINE_SCRATCH, encode_blob_body, frame_blob_into};
 pub(crate) use super::framing::{
     encode_blob_header_into, frame_blob, frame_blob_pipelined, reframe_raw_with_index,
-    strip_blob_header_fields,
+    strip_blob_header_fields, strip_header_block_fields,
 };
 
 // Pipeline plumbing (ordered channel items, sink trait, permit pool, writer

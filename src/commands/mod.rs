@@ -248,6 +248,18 @@ impl HeaderOverrides {
         Ok(ov)
     }
 
+    /// Returns `true` when no header override was supplied, i.e. the user
+    /// passed neither `--generator` nor any `--output-header` key. In that
+    /// case a passthrough command is free to preserve the input header's
+    /// fields verbatim; when an override *is* present the header must be
+    /// rebuilt so the override can take effect.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.generator.is_none()
+            && self.replication_timestamp.is_none()
+            && self.replication_sequence_number.is_none()
+            && self.replication_base_url.is_none()
+    }
+
     /// Apply overrides to a header builder. Called after the command-specific
     /// configure closure so CLI flags always win.
     pub(crate) fn apply<'a>(&'a self, mut hb: HeaderBuilder<'a>) -> HeaderBuilder<'a> {

@@ -20,6 +20,7 @@ pbfhogg degrade <input> -o <output> [--unsort]
                                      [--strip-locations]
                                      [--strip-indexdata]
                                      [--strip-tagdata]
+                                     [--strip-bbox]
                                      [--drop-ids N:SEED]
                                      [--force]
                                      [--compression C]
@@ -45,28 +46,51 @@ includes every blob, so each blob is decoded by each phase).
 The implementation picks one of two paths up front based on the flag
 combination:
 
-- **Pure passthrough** (`--strip-indexdata` and/or `--strip-tagdata`,
-  with no unsort/strip-locations): raw blob frames are iterated via
-  `read_raw_frame`, and each output `BlobHeader` is the *original*
-  header copied through field-by-field with only the targeted hint
-  field(s) omitted - `indexdata` (field 2) under `--strip-indexdata`,
-  `tagdata` (field 4) under `--strip-tagdata`. This surgical wire-level
-  omission (`strip_blob_header_fields`) preserves every other header
-  field byte-for-byte: the untargeted hint keeps its exact original
-  bytes (a 26-byte v1 index stays v1, never upgraded to the 42-byte v2
-  layout, and an index that fails to deserialize is kept rather than
-  dropped), and `pbfhogg.WayMembers-v1` (field 5) plus any
-  unknown/extension fields survive untouched. The compressed Blob
-  payload is copied byte-for-byte, so the preserved `datasize` (field 3)
-  stays consistent. Sortedness, `LocationsOnWays` inline coordinates,
-  and every element-level property pass through unchanged because the
-  blob bytes are not touched. Accepts non-indexed input (no
-  precondition). `--strip-tagdata` alone therefore yields a still-sorted,
-  still-indexed file that only lacks the per-blob tag key index.
+- **Pure passthrough** (`--strip-indexdata`, `--strip-tagdata`, and/or
+  `--strip-bbox`, with no unsort/strip-locations/drop-ids): this is a
+  header-and-blob passthrough, split into two independent surgical
+  strips that share one wire-level helper
+  (`strip_message_fields` in `src/write/framing.rs`, exposed as
+  `strip_blob_header_fields` for the per-blob `BlobHeader` and
+  `strip_header_block_fields` for the file-level `HeaderBlock`):
+  - *OSMHeader*: with no `--generator`/`--output-header` override, the
+    input `HeaderBlock` payload (the decompressed OSMHeader blob body)
+    is forwarded field-for-field via `strip_header_block_fields`, with
+    only the bbox (field 1) removed under `--strip-bbox` -
+    `passthrough_header_bytes`' verbatim branch. When an override *is*
+    present, `passthrough_header_bytes` instead rebuilds the header
+    through `HeaderBuilder::from_header` (bbox omitted under
+    `--strip-bbox`) so the override can apply; this rebuild path is a
+    lossy one (see "What v1 preserves" below) and only fires when the
+    user explicitly asked for a header rewrite.
+  - *OsmData blobs*: raw blob frames are iterated via `read_raw_frame`,
+    and each output `BlobHeader` is the *original* header copied
+    through field-by-field with only the targeted hint field(s) omitted
+    - `indexdata` (field 2) under `--strip-indexdata`, `tagdata` (field
+    4) under `--strip-tagdata`. `--strip-bbox` alone never touches an
+    OsmData `BlobHeader` or payload - it is entirely a HeaderBlock
+    change.
+
+  This surgical wire-level omission preserves every other targeted
+  message's field byte-for-byte: the untargeted indexdata hint keeps
+  its exact original bytes (a 26-byte v1 index stays v1, never upgraded
+  to the 42-byte v2 layout, and an index that fails to deserialize is
+  kept rather than dropped), and `pbfhogg.WayMembers-v1` (field 5) plus
+  any unknown/extension fields survive untouched, on both the
+  `BlobHeader` and the `HeaderBlock`. The compressed Blob payload is
+  copied byte-for-byte, so the preserved `datasize` (field 3) stays
+  consistent. Sortedness, `LocationsOnWays` inline coordinates, and
+  every element-level property pass through unchanged because the blob
+  bytes are not touched. Accepts non-indexed input (no precondition).
+  `--strip-tagdata` alone therefore yields a still-sorted, still-indexed
+  file that only lacks the per-blob tag key index; `--strip-bbox` alone
+  yields an otherwise-untouched file with no declared file-level
+  extent.
 - **Decode path** (any flag set involving `--unsort`, `--strip-locations`,
   or `--drop-ids`; `--strip-indexdata` / `--strip-tagdata` ride
-  along as `indexdata=None` / `tagdata=None` on the framing call):
-  three sequential per-kind phases driven by
+  along as `indexdata=None` / `tagdata=None` on the framing call;
+  `--strip-bbox` rides along by omitting the bbox from the rebuilt
+  output header): three sequential per-kind phases driven by
   [`parallel_classify_phase`](../src/scan/classify.rs), mirroring
   [`repack`](../src/commands/repack/mod.rs). For each kind in
   `nodes -> ways -> relations`: workers decode one input blob,
@@ -204,6 +228,34 @@ in both `frame_owned` (worker full blocks) and `frame_and_write_batch`
 (merge-thread tail). Composes with every other flag, and alone is
 passthrough-eligible (does not force a decode).
 
+#### `--strip-bbox`
+
+Clears the `HeaderBlock.bbox` field (field 1) so the output declares no
+file-level bounding box. Entirely an OSMHeader change - it never
+touches an OsmData `BlobHeader` or blob payload, so it composes for
+free with every element-level transformation. On the passthrough path
+(no override) the bbox is removed via `strip_header_block_fields`
+while every other `HeaderBlock` field - `source`, a non-default
+`writingprogram`, custom optional features, the osmosis replication
+metadata, and unknown/extension fields - survives byte-for-byte; on
+the decode path the bbox is simply omitted from the `HeaderBuilder`
+rebuild the decode path already performs. Accepts non-indexed input
+(no precondition): the passthrough branch never calls
+`require_indexdata`.
+
+**Motivation.** Not an `extract` fallback trigger: `extract --bbox`
+derives its region purely from the CLI `--bbox` argument and prunes
+blobs via the per-blob `indexdata` bboxes, so it never reads
+`HeaderBlock.bbox` at all, and a `--strip-bbox` output is exactly as
+extractable as the original
+(`degrade_strip_bbox_extract_bbox_matches_original` pins this). The
+honest rationale is that `HeaderBlock.bbox` *is* read operationally in
+two other places, and both need adversarial "bbox absent" coverage:
+`inspect`'s `extract_header_metadata` and the `inspect --get
+header.bbox` fast path. Beyond `inspect`, `--strip-bbox` also exercises
+downstream metadata propagation and interop with external tools that
+declare or expect a file-level extent.
+
 #### `--drop-ids N:SEED`
 
 Deterministically removes exactly `N` elements from the output so that
@@ -256,6 +308,25 @@ each preserved unless their own strip flag is set (and when preserved,
 their exact original bytes survive: a v1 index stays v1), and
 `pbfhogg.WayMembers-v1` (field 5) plus any unknown/extension header
 fields always pass through unchanged.
+
+The same is now true one level up, at the file-level OSMHeader: with no
+`--generator`/`--output-header` override, `passthrough_header_bytes`
+forwards the input `HeaderBlock` payload verbatim (field-identical -
+the outer Blob envelope is still re-compressed, so it is not
+blob-byte-identical) via `strip_header_block_fields`, clearing only the
+bbox (field 1) under `--strip-bbox`. This closed a pre-existing gap:
+before this change, *any* passthrough-eligible run (including a plain
+`--strip-indexdata` or `--strip-tagdata` with no bbox involvement at
+all) rebuilt the output header through
+`HeaderBuilder::from_header`, which silently drops `source`, custom
+optional features, and unknown/extension fields, and resets a
+non-default `writingprogram` to `pbfhogg` - none of which those flags
+were ever supposed to touch. The verbatim `HeaderBlock` forward fixes
+that silent loss for every passthrough-eligible flag combination, not
+just `--strip-bbox`. The lossy `HeaderBuilder::from_header` rebuild
+still runs, deliberately, when `--generator`/`--output-header` is
+present - the user asked for a header rewrite, so the override wins
+and the bbox (if `--strip-bbox` is set) is omitted from the rebuild.
 
 On the decode path: element IDs, tags, refs, members, OsmMetadata,
 DenseNode encoding. `Sort.Type_then_ID` is preserved unless `--unsort`
@@ -331,6 +402,47 @@ the deferred-optimization motivation in
   findings; a full end-to-end PBF `WayMembers` fixture would need the
   altw inject-prepass pipeline, so the invariant is pinned at the
   helper level where a `WayMembers` payload is just bytes.
+- `strip_header_block_fields_preserves_untargeted_fields_verbatim`
+  (unit test, `src/write/framing.rs`) - the `HeaderBlock` counterpart:
+  stripping the bbox (field 1) from a hand-built `HeaderBlock` carrying
+  a bbox, `source`, a non-default `writingprogram`, a custom optional
+  feature, and the three osmosis replication fields drops only the
+  bbox and copies every other field byte-for-byte, re-parsed back to
+  confirm `source`, `writingprogram`, the custom feature, sortedness,
+  and the replication metadata all survive.
+- `degrade_strip_bbox_clears_header_bbox` - `--strip-bbox` on an
+  indexed, rich-header bbox fixture: output has no `HeaderBlock.bbox`;
+  `source`, `writingprogram`, the custom optional feature, replication
+  metadata, and sortedness all survive verbatim
+  (`assert_rich_header_fields_survived`); indexdata is untouched; every
+  OsmData blob frame is byte-identical to the input
+  (`osm_data_frames`); element multiset round-trips.
+- `degrade_strip_bbox_no_indexdata_uses_passthrough` - `--strip-bbox`
+  on a *non-indexed* bbox-bearing input succeeds without `--force`,
+  proving the run stayed on the header-only passthrough (the decode
+  path's `require_indexdata` precondition would otherwise fail it);
+  output stays non-indexed, bbox is gone, other header fields survive,
+  OsmData frames are byte-identical.
+- `degrade_strip_bbox_and_strip_indexdata_compose` - bbox dropped from
+  the header *and* indexdata cleared from every OsmData blob;
+  sortedness and element multiset survive.
+- `degrade_strip_bbox_and_strip_locations_compose` - composes across
+  the path boundary: `--strip-locations` forces the decode path and
+  `--strip-bbox` still clears the bbox from the rebuilt output header,
+  confirming the bbox strip is wired into both paths.
+- `degrade_strip_bbox_extract_bbox_matches_original` - end-to-end pin
+  of the motivation section's "not an extract fallback" claim:
+  `extract --bbox` on the stripped output and on the original
+  bbox-bearing input select the identical element set (with a guard
+  that the sub-region extract is both non-empty and strictly smaller
+  than the whole file, so the comparison is not vacuous).
+- `degrade_strip_bbox_with_generator_override_rebuilds_header` -
+  `--strip-bbox --generator <name>` takes `passthrough_header_bytes`'
+  rebuild branch instead of the verbatim branch: the bbox is still gone
+  (the strip still applied) AND `writingprogram` equals the override
+  rather than the fixture's original value (the override only takes
+  effect on the rebuild path). Direct coverage for the rebuild branch,
+  which none of the other `--strip-bbox` tests above exercise.
 - `degrade_unsort_creates_adjacent_overlap_per_kind` - output header
   has no `Sort.Type_then_ID`; each kind has exactly one adjacent
   same-kind blob pair with overlapping ID ranges and zero intra-blob
@@ -472,20 +584,8 @@ overlap-rewrite correctness gate.
 The deferred transformations from the design doc, ordered by likely
 demand. Pick them up as benchmarking work surfaces consumers.
 
-(v2.1 `--strip-tagdata` and v2.4 `--drop-ids` shipped - see the
-transformations and test inventory above.)
-
-### v2.2 - `--strip-bbox`
-
-**Goal:** clear the HeaderBlock bbox so `extract`'s spatial-scan
-fallback fires.
-
-**Sketch:** header-only transformation. Builds the output header via
-`HeaderBuilder::from_header` minus the `bbox` field. Composes with
-everything. No element-level work.
-
-**Tests:** output header has no bbox; `extract --bbox` on the
-degraded output still produces correct results.
+(v2.1 `--strip-tagdata`, v2.2 `--strip-bbox`, and v2.4 `--drop-ids`
+shipped - see the transformations and test inventory above.)
 
 ### v2.3 - `--recompress C`
 
@@ -615,8 +715,10 @@ other consumers.
   `BlockBuilder`; element-level transformations re-emit through it.
 - [`src/write/framing.rs`](../src/write/framing.rs) -
   `frame_blob_pipelined` and `encode_blob_header_into` (decode path),
-  and `strip_blob_header_fields`, the surgical wire-level field-omission
-  helper the passthrough path uses to preserve every untargeted
-  `BlobHeader` field byte-for-byte. The decode-path flush goes through
+  and `strip_blob_header_fields` / `strip_header_block_fields`, the
+  surgical wire-level field-omission helpers (sharing one
+  `strip_message_fields` core) the passthrough path uses to preserve
+  every untargeted `BlobHeader` field and `HeaderBlock` field
+  byte-for-byte, respectively. The decode-path flush goes through
   the framing helpers directly when `--strip-indexdata` composes,
   bypassing the indexdata-embedding `write_primitive_block_owned` path.

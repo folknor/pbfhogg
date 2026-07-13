@@ -44,6 +44,7 @@ use super::{
     HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
     ensure_way_capacity_local, flush_local, require_indexdata, writer_from_header,
 };
+use crate::blob_meta::ElemKind;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::owned::{
     OwnedNode, OwnedRelation, OwnedWay, dense_node_metadata, element_metadata, read_dense_node,
@@ -52,10 +53,6 @@ use crate::owned::{
 };
 use crate::writer::{Compression, PbfWriter, frame_blob_pipelined};
 use crate::{Element, ElementReader};
-
-const KIND_NODE: u8 = 0;
-const KIND_WAY: u8 = 1;
-const KIND_RELATION: u8 = 2;
 
 /// Batch size for the parallel-framing fan-out on the merge thread. The
 /// merge thread accumulates `OwnedBlock`s in seq order as the central
@@ -88,14 +85,6 @@ enum KindPayload {
 }
 
 impl KindPayload {
-    fn empty(kind: u8) -> Self {
-        match kind {
-            KIND_WAY => Self::Ways(Vec::new()),
-            KIND_RELATION => Self::Relations(Vec::new()),
-            _ => Self::Nodes(Vec::new()),
-        }
-    }
-
     fn len(&self) -> u64 {
         let n = match self {
             Self::Nodes(v) => v.len(),
@@ -227,7 +216,7 @@ pub fn repack(
     let node_stats = run_kind_phase(
         &shared_file,
         &node_schedule,
-        KIND_NODE,
+        ElemKind::Node,
         elements_per_blob,
         compression,
         preserve_locations,
@@ -246,7 +235,7 @@ pub fn repack(
     let way_stats = run_kind_phase(
         &shared_file,
         &way_schedule,
-        KIND_WAY,
+        ElemKind::Way,
         elements_per_blob,
         compression,
         preserve_locations,
@@ -265,7 +254,7 @@ pub fn repack(
     let rel_stats = run_kind_phase(
         &shared_file,
         &rel_schedule,
-        KIND_RELATION,
+        ElemKind::Relation,
         elements_per_blob,
         compression,
         preserve_locations,
@@ -361,7 +350,7 @@ fn emit_phase_counters(kind: &str, s: &PhaseStats) {
 fn run_kind_phase(
     shared_file: &std::sync::Arc<std::fs::File>,
     schedule: &[(usize, u64, usize)],
-    kind: u8,
+    kind: ElemKind,
     elements_per_blob: usize,
     compression: Compression,
     preserve_locations: bool,
@@ -609,25 +598,24 @@ fn encode_way_full_block(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn worker_split_blob(
     block: &crate::PrimitiveBlock,
-    kind: u8,
+    kind: ElemKind,
     cap: usize,
     preserve_locations: bool,
     compression: &Compression,
 ) -> std::result::Result<WorkerOutput, String> {
     let total = match kind {
-        KIND_NODE => block
+        ElemKind::Node => block
             .elements()
             .filter(|e| matches!(e, Element::DenseNode(_) | Element::Node(_)))
             .count(),
-        KIND_WAY => block
+        ElemKind::Way => block
             .elements()
             .filter(|e| matches!(e, Element::Way(_)))
             .count(),
-        KIND_RELATION => block
+        ElemKind::Relation => block
             .elements()
             .filter(|e| matches!(e, Element::Relation(_)))
             .count(),
-        _ => return Err(format!("invalid kind constant: {kind}")),
     };
     let tail_size = total % cap;
     let full_count = total - tail_size;
@@ -636,10 +624,9 @@ fn worker_split_blob(
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut full_framed: Vec<Vec<u8>> = Vec::new();
     let mut tail: KindPayload = match kind {
-        KIND_NODE => KindPayload::Nodes(Vec::with_capacity(tail_size)),
-        KIND_WAY => KindPayload::Ways(Vec::with_capacity(tail_size)),
-        KIND_RELATION => KindPayload::Relations(Vec::with_capacity(tail_size)),
-        _ => KindPayload::empty(kind),
+        ElemKind::Node => KindPayload::Nodes(Vec::with_capacity(tail_size)),
+        ElemKind::Way => KindPayload::Ways(Vec::with_capacity(tail_size)),
+        ElemKind::Relation => KindPayload::Relations(Vec::with_capacity(tail_size)),
     };
 
     let mut idx: usize = 0;
@@ -649,9 +636,9 @@ fn worker_split_blob(
     for element in block.elements() {
         let is_match = matches!(
             (&element, kind),
-            (Element::DenseNode(_) | Element::Node(_), KIND_NODE)
-                | (Element::Way(_), KIND_WAY)
-                | (Element::Relation(_), KIND_RELATION)
+            (Element::DenseNode(_) | Element::Node(_), ElemKind::Node)
+                | (Element::Way(_), ElemKind::Way)
+                | (Element::Relation(_), ElemKind::Relation)
         );
         if !is_match {
             continue;
@@ -661,7 +648,7 @@ fn worker_split_blob(
             // Full-block path: re-encode through the per-worker builder
             // exactly like v1. Frame any output produced by `ensure_*`.
             match (&element, kind) {
-                (Element::DenseNode(dn), KIND_NODE) => {
+                (Element::DenseNode(dn), ElemKind::Node) => {
                     ensure_node_capacity_local(&mut bb, &mut output)?;
                     let meta = dense_node_metadata(dn);
                     bb.add_node(
@@ -672,7 +659,7 @@ fn worker_split_blob(
                         meta.as_ref(),
                     );
                 }
-                (Element::Node(n), KIND_NODE) => {
+                (Element::Node(n), ElemKind::Node) => {
                     ensure_node_capacity_local(&mut bb, &mut output)?;
                     let meta = element_metadata(&n.info());
                     bb.add_node(
@@ -683,7 +670,7 @@ fn worker_split_blob(
                         meta.as_ref(),
                     );
                 }
-                (Element::Way(w), KIND_WAY) => {
+                (Element::Way(w), ElemKind::Way) => {
                     ensure_way_capacity_local(&mut bb, &mut output)?;
                     encode_way_full_block(
                         &mut bb,
@@ -693,7 +680,7 @@ fn worker_split_blob(
                         preserve_locations,
                     );
                 }
-                (Element::Relation(r), KIND_RELATION) => {
+                (Element::Relation(r), ElemKind::Relation) => {
                     ensure_relation_capacity_local(&mut bb, &mut output)?;
                     members_buf.clear();
                     members_buf.extend(r.members().map(|m| MemberData {

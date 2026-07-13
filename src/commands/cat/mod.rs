@@ -491,7 +491,7 @@ fn cat_filtered(
             let (b, e) = run_kind_phase(
                 &shared_file,
                 &node_schedule,
-                KIND_NODE,
+                crate::blob_meta::ElemKind::Node,
                 clean,
                 compression,
                 &mut writer,
@@ -505,7 +505,7 @@ fn cat_filtered(
             let (b, e) = run_kind_phase(
                 &shared_file,
                 &way_schedule,
-                KIND_WAY,
+                crate::blob_meta::ElemKind::Way,
                 clean,
                 compression,
                 &mut writer,
@@ -519,7 +519,7 @@ fn cat_filtered(
             let (b, e) = run_kind_phase(
                 &shared_file,
                 &rel_schedule,
-                KIND_RELATION,
+                crate::blob_meta::ElemKind::Relation,
                 clean,
                 compression,
                 &mut writer,
@@ -539,10 +539,6 @@ fn cat_filtered(
     })
 }
 
-const KIND_NODE: u8 = 0;
-const KIND_WAY: u8 = 1;
-const KIND_RELATION: u8 = 2;
-
 /// Run one per-kind phase: pread workers decode + clean + frame each blob
 /// of the given kind; main thread streams framed bytes to the writer in seq
 /// order via a `ReorderBuffer`.
@@ -556,11 +552,12 @@ const KIND_RELATION: u8 = 2;
 fn run_kind_phase(
     shared_file: &std::sync::Arc<std::fs::File>,
     schedule: &[(usize, u64, usize)],
-    kind: u8,
+    kind: crate::blob_meta::ElemKind,
     clean: &CleanAttrs,
     compression: Compression,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
 ) -> Result<(u64, u64)> {
+    use crate::blob_meta::ElemKind;
     use crate::reorder_buffer::ReorderBuffer;
 
     if schedule.is_empty() {
@@ -568,9 +565,9 @@ fn run_kind_phase(
     }
 
     let kind_filter = TypeFilter {
-        nodes: kind == KIND_NODE,
-        ways: kind == KIND_WAY,
-        relations: kind == KIND_RELATION,
+        nodes: kind == ElemKind::Node,
+        ways: kind == ElemKind::Way,
+        relations: kind == ElemKind::Relation,
     };
 
     type PhaseResult = std::result::Result<(Vec<Vec<u8>>, u64), String>;

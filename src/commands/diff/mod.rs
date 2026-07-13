@@ -227,7 +227,13 @@ pub fn diff(
 
     crate::debug::emit_marker("DIFF_SCAN_START");
 
-    let stats = if both_indexed && options.jobs > 1 {
+    // Verbose always takes the sequential path: the parallel shard
+    // workers emit summary lines only (per-field modification details
+    // are not implemented there), and silently losing detail lines
+    // would be worse than the wall-time cost of a sequential verbose
+    // diff. Verbose is a human-inspection mode; the parallel default
+    // serves the common non-verbose case.
+    let stats = if both_indexed && options.jobs > 1 && !options.verbose {
         parallel::diff_block_pair_parallel(
             old_path,
             new_path,

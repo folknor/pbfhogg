@@ -51,6 +51,19 @@
 
 ### Changed
 
+- `diff` now runs parallel by default: `-j` defaults to `0`
+  (auto-pick from available cores) instead of `1` (sequential), for
+  both `--format text` and `--format osc`. Measured at planet scale
+  the parallel path is 9.5x faster on text (2134 s -> 227.5 s) and
+  7.6x on osc, with byte-identical output. `-v/--verbose` diffs
+  always take the sequential path (per-field detail lines are
+  sequential-only), so verbose output is unchanged. Trade-off: the
+  parallel path writes shard temp files next to the output (~30 GB
+  text / ~45 GB osc XML at planet scale, removed on completion);
+  pass `-j 1` to restore the scratch-free sequential path. The `-j`
+  help text previously claimed parallelism was text-only; it applies
+  to both formats.
+
 - `repack` now preserves `LocationsOnWays`: when the input header declares
   the feature, the output re-advertises it and every inline way-node
   coordinate round-trips exactly, instead of being silently dropped. Inputs

@@ -342,12 +342,16 @@ enum Command {
         /// Filter by element type (comma-separated: node, way, relation)
         #[arg(short = 't', long = "type")]
         type_filter: Option<String>,
-        /// Number of parallel shards for the block-pair merge. `1` (default)
-        /// keeps the sequential path; `0` auto-picks from available cores;
-        /// higher values partition the ID space across that many worker
-        /// threads. Only applies when both inputs are indexed and when
-        /// --format is text (not osc).
-        #[arg(short = 'j', long = "jobs", default_value = "1")]
+        /// Number of parallel shards for the block-pair merge. `0` (default)
+        /// auto-picks from available cores; `1` restores the sequential,
+        /// scratch-free path; higher values partition the ID space across
+        /// that many worker threads. Applies to both --format text and osc;
+        /// parallel sharding requires both inputs to be indexed, and
+        /// `-v/--verbose` always uses the sequential path (per-field detail
+        /// lines are sequential-only). The parallel path writes shard temp
+        /// files (planet scale: ~30 GB text, ~45 GB osc XML), removed on
+        /// completion - pass `-j 1` if temp disk is scarce.
+        #[arg(short = 'j', long = "jobs", default_value = "0")]
         jobs: usize,
         /// Output format: text (default) or osc
         #[arg(long, default_value = "text")]

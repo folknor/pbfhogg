@@ -539,9 +539,9 @@ fn element_merge(
                             let new_ver = element_version(&n);
                             emit_modified(out, type_char, o_id, old_ver, new_ver)?;
                             // Verbose details are not supported on the parallel
-                            // path yet. Callers that need verbose should use the
-                            // sequential `diff_block_pair` (parallel shards are
-                            // opt-in via env var).
+                            // path. The dispatcher in mod.rs routes verbose
+                            // diffs to the sequential `diff_block_pair`, so
+                            // this arm never runs with verbose set.
                             let _ = options.verbose;
                             stats.modified += 1;
                         }

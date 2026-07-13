@@ -1,184 +1,106 @@
 # GeoJSON export design
 
-## Goal
+`pbfhogg export` streams a PBF to GeoJSON or newline-delimited GeoJSONSeq -
+the bridge to the GIS ecosystem (otherwise ogr2ogr / osmium export /
+osm2pgsql + PostGIS).
 
-`pbfhogg export` - streaming PBF → GeoJSON/GeoJSONSeq. The bridge to
-the GIS ecosystem. Every OSM analyst needs this; currently requires
-ogr2ogr, osmium-export, or osm2pgsql + PostGIS.
+**v1 shipped 2026-07-13.** This doc is now the forward-looking record:
+what shipped, in brief, and the deferred work. Durable homes for the
+shipped surface are the code (`src/commands/export/`), the CLI reference
+(`reference/cli-reference.md`), the format / area / property decisions
+([ADR-0010](../decisions/0010-geojson-export-format-and-area-heuristic.md)),
+and the osmium deviation (`DEVIATIONS.md`). The implementation spec that
+drove the landing was retired on completion; its deferred items are all
+folded into "Deferred / future work" below.
 
-## Output formats
+## Shipped in v1
 
-### GeoJSONSeq (primary, line-delimited)
+- Point features from tagged nodes; LineString / Polygon from tagged ways
+  (closed + area-tagged -> Polygon, CCW exterior ring per RFC 7946),
+  geometry read from inline `LocationsOnWays` coordinates only.
+- Two formats: newline-delimited GeoJSONSeq (default, one Feature per
+  `\n`, no `0x1e` record separator - NOT RFC 8142) and a wrapped
+  `FeatureCollection`.
+- Filters, all composable: `--type` (node/way), tag `--expressions`
+  (positional + `-e file`), `--properties` key whitelist, `--bbox`
+  (vertex-overlap), `--metadata`. Every feature carries `@id` and `@type`.
+- Hard-errors when ways are requested from input lacking `LocationsOnWays`
+  (`--type node` works without it).
+- Sequential streaming, O(1) memory, PathGuard-protected `--output` file,
+  stats to stderr so stdout stays pipeable.
 
-One GeoJSON Feature per line, newline-delimited (RFC 8142). No wrapping
-FeatureCollection. Streamable - each line is independently valid JSON.
+## Deferred / future work
 
-```
-{"type":"Feature","geometry":{"type":"Point","coordinates":[12.5,55.6]},"properties":{"name":"Copenhagen"}}
-{"type":"Feature","geometry":{"type":"LineString","coordinates":[[12.5,55.6],[12.6,55.7]]},"properties":{"highway":"primary"}}
-```
+Each is a separate TODO; none is scheduled. Every open design question from
+v1 (id property, coordinate precision, area heuristic, multipolygon,
+enriched-input requirement) was resolved in ADR-0010 and the shipped code.
 
-Pros: streaming-friendly, works with `jq`, importable by QGIS/PostGIS.
-Cons: not a valid GeoJSON document (no FeatureCollection wrapper).
+### In-workspace (no brokkr dependency)
 
-### GeoJSON (secondary, wrapped)
+- **Relations -> MultiPolygon.** v1 emits zero relation features (not even
+  a single closed way promoted from a relation). v2 needs ring assembly
+  from member ways - joined end-to-end, outer/inner rings by winding or
+  member `role`, holes. `src/geo.rs` already carries ring assembly and
+  hole detection, and extract's smart strategy already assembles relation
+  members. Significant effort.
+- **Raw-PBF fallback via an in-memory node index.** v1 hard-errors when
+  ways are requested from a non-`LocationsOnWays` input rather than
+  building a coordinate index. The index path (same shape as altw's
+  coordinate scatter) would lift that requirement at a memory cost.
+- **GeoPackage / binary output.** Needs an SQLite dependency; the
+  desktop-GIS standard but out of scope entirely for the text formats.
+- **Parallel / fused export.** v1 decodes sequentially. `is_area_way`
+  walks `refs()`/`tags()` while `collect_coords` walks `node_locations()`
+  - two passes per way plus `tags()` for expression matching; a future
+  parallel or fused rework should know those walks exist.
+- **Configurable coordinate precision.** Fixed at 7 dp (decimicrodegree),
+  trailing zeros trimmed.
+- **Configurable area rules.** v1 uses the fixed `AREA_KEYS` list plus
+  `area=yes`/`area=no`; osmium uses a config file. A config surface is
+  deferred.
+- **Early-abort on a broken pipe.** `ElementReader::for_each`'s
+  `()`-returning closure cannot stop the decode, so v1 captures the first
+  write/serialize error and surfaces it only after decoding to EOF (a
+  consumer like `head` exiting does not abort the run early). A fallible
+  reader callback is the named follow-up; the file path is
+  PathGuard-protected so no partial file survives regardless.
+- **True bbox overlap for ways.** v1's way bbox filter is vertex-only and
+  lossy: a way whose edge crosses the box with no vertex inside, or a
+  polygon that encloses the whole box, is dropped. Real overlap / clipping
+  is future work.
 
-Standard GeoJSON FeatureCollection. Requires buffering or two-pass
-(write features, then close the collection). For small extracts.
+### Orchestrator-owned (require brokkr changes)
 
-```json
-{"type":"FeatureCollection","features":[
-  {"type":"Feature","geometry":...,"properties":...},
-  ...
-]}
-```
+These cannot be built from inside the pbfhogg workspace; they need the
+`brokkr` dev tool extended.
 
-### GeoPackage (future)
+- **osmium cross-check / `brokkr verify export`.** Must be *strict*, not a
+  permissive intersection comparator: exact feature identity, non-area
+  geometry within 1e-7, the *expected* property set (an intersection-of-
+  keys comparator cannot detect pbfhogg dropping a tag), and an
+  independent area fixture matrix with expected classifications and
+  geometry. The osmium invocation must be pinned to one that emits
+  `@id`/`@type` (e.g. `osmium export -f geojsonseq` with `--add-unique-id`
+  or an attributes config naming `id`/`type`). Additive confidence only -
+  the in-tree golden-file tests already assert area / winding / collision
+  strictly.
+- **Denmark ALTW artifact.** Denmark defines only `indexed` and `raw`
+  variants (only europe and planet have `altw`). A Denmark altw artifact
+  must be produced and registered in `brokkr.toml` before any
+  `--variant altw` Denmark export/verify resolves.
+- **Throughput baseline.** `brokkr export` is not a registered subcommand
+  and brokkr has no GeoJSON scratch output kind, so no bench cell can run
+  today. Once that plumbing and the Denmark altw artifact exist, establish
+  the v1 export throughput baseline (host + commit recorded) in
+  `reference/performance.md`. A first-ever baseline needs no
+  performance-history arc.
 
-Binary SQLite-based format. Requires an SQLite dependency. Much more
-complex but the standard for desktop GIS. Out of scope for v1.
+## Cross-references
 
-## Element → geometry mapping
-
-### Nodes → Point
-
-```json
-{"type":"Point","coordinates":[lon, lat]}
-```
-
-Straightforward. Requires the node to have tags (untagged nodes are
-typically way members, not standalone features).
-
-### Ways → LineString or Polygon
-
-Ways with `area=yes` or certain tag keys (building, landuse, natural,
-leisure, amenity) are polygons. All others are linestrings.
-
-**Requires coordinates.** Two sources:
-1. **ALTW-enriched PBF** - `Way::node_locations()` provides inline
-   coordinates. No external lookup needed.
-2. **Raw PBF + dense index** - build a node coordinate index (same as
-   ALTW), then look up coordinates per way ref. Memory-intensive.
-
-For v1, require ALTW-enriched input. This keeps the implementation
-simple and avoids the memory overhead of building a coordinate index.
-
-```json
-{"type":"LineString","coordinates":[[12.5,55.6],[12.6,55.7],[12.7,55.65]]}
-```
-
-For closed ways (first ref == last ref) that are area-tagged:
-```json
-{"type":"Polygon","coordinates":[[[12.5,55.6],[12.6,55.7],[12.7,55.65],[12.5,55.6]]]}
-```
-
-### Relations → MultiPolygon (multipolygon/boundary types only)
-
-Multipolygon relations need ring assembly from member ways. The code
-for this exists in `src/geo.rs` (ring assembly, hole detection).
-
-**Requires:** all member way coordinates available. With ALTW-enriched
-input, member ways have inline coordinates. But the relation's member
-ways must be read and assembled.
-
-**Complexity:** ring assembly is non-trivial (ways may be in arbitrary
-order, need to be joined end-to-end into rings, outer/inner rings
-determined by winding order or `role` tag).
-
-For v1, skip relations entirely or handle only simple cases. Full
-multipolygon support is a significant implementation effort.
-
-## Tag → property mapping
-
-### Default: all tags as properties
-
-Every tag becomes a GeoJSON property. Simple, lossless.
-
-```json
-{"properties":{"name":"Copenhagen","population":"1345562","capital":"yes"}}
-```
-
-### Filtered: expression-based
-
-Reuse the existing tag expression parser (`src/commands/tag_expr.rs`).
-Only export elements matching the expression(s).
-
-```
-pbfhogg export --expressions "highway" enriched.osm.pbf > highways.geojsonseq
-```
-
-### Key selection
-
-`--properties name,highway,surface` - only include specified keys in
-the output properties. Reduces file size significantly.
-
-### Type filter
-
-`--type node` / `--type way` / `--type relation` - same as other commands.
-
-## Architecture
-
-### v1: streaming GeoJSONSeq from ALTW-enriched PBF
-
-```
-pbfhogg export enriched.osm.pbf > output.geojsonseq
-pbfhogg export --type way --expressions "highway" enriched.osm.pbf > highways.geojsonseq
-pbfhogg export --bbox 12.4,55.6,12.7,55.8 enriched.osm.pbf > copenhagen.geojsonseq
-```
-
-Implementation:
-1. Open input with BlobReader (sequential, no pipelined retention)
-2. Iterate elements via `elements()` (need metadata for `id` property)
-3. For each element:
-   a. Check type filter
-   b. Check tag expression filter
-   c. Check bbox filter (spatial)
-   d. Build geometry from coordinates
-   e. Build properties from tags
-   f. Write GeoJSON feature as one line to stdout/file
-4. Flush and close
-
-### JSON serialization
-
-Use `serde_json` (already a dependency) for property serialization.
-Coordinates can be written directly (avoid `serde_json::Value` overhead
-for geometry - format `[lon,lat]` strings directly).
-
-### Performance considerations
-
-- **No parallel decode for v1** - sequential streaming is simpler and
-  GeoJSON writing is I/O-bound (text output is verbose)
-- **Coordinate formatting** - `format!("{:.7}", coord)` is slow per
-  element. Use `ryu` or `dtoa` for fast float-to-string. Or use the
-  existing `format_coord` in `elements_xml.rs` which strips trailing
-  zeros.
-- **String escaping** - tag values may contain JSON-special characters
-  (quotes, backslashes, control chars). Must use proper JSON escaping.
-  `serde_json` handles this correctly.
-- **Memory** - streaming output means O(1) memory (one element at a time).
-  No need to buffer the entire feature collection.
-
-## Relationship to existing code
-
-- `src/geo.rs` - point-in-polygon, ring assembly, simplification
-- `src/commands/tag_expr.rs` - tag expression parsing and matching
-- `src/commands/elements_xml.rs` - coordinate formatting, metadata access
-- `src/commands/extract.rs` - spatial bbox filtering (reuse `BboxInt`)
-- `Way::node_locations()` - inline coordinate access from ALTW PBFs
-
-## Open questions
-
-1. **ID property:** include `@id`, `@type`, `@version` as properties?
-   osmium-export uses `@id`, `@type`. Useful for round-tripping.
-
-2. **Coordinate precision:** 7 decimal places (decimicrodegree precision)
-   or configurable? 7 is standard for OSM.
-
-3. **Area detection heuristic:** hard-code the key list (building,
-   landuse, etc.) or make configurable? osmium-export uses a config file.
-
-4. **Multipolygon assembly:** defer to v2 or include a basic version?
-   Basic = single-way closed polygons only (no ring assembly).
-
-5. **Enriched input requirement:** error if input lacks LocationsOnWays,
-   or fall back to building a coordinate index in memory?
+- Code: `src/commands/export/` (`mod` / `geometry` / `properties` /
+  `writer`), `src/commands/spatial.rs` (`BboxInt`), `src/coord_fmt.rs`.
+- [ADR-0010](../decisions/0010-geojson-export-format-and-area-heuristic.md)
+  - format framing, `@id`/`@type` identity model, `AREA_KEYS` + closed-ring
+  area rule, reserved-key collision precedence, polygon validity/winding.
+- `DEVIATIONS.md` "export" - why output is not osmium byte-parity.
+- `reference/cli-reference.md` "export" - the user-facing flag surface.

@@ -33,7 +33,9 @@ notes carry a CLOSED/STATUS header pointing back here.
 
 - Geocode builder rewrite G1-G4 + two S2 spikes
   ([notes/geocode-build-opportunities.md](notes/geocode-build-opportunities.md)).
-- GeoJSON export v1 ([notes/geojson-export-design.md](notes/geojson-export-design.md)) -
+- GeoJSON export follow-ups ([notes/geojson-export-design.md](notes/geojson-export-design.md)) -
+  v1 shipped 2026-07-13 (ADR-0010); relations/MultiPolygon, raw-PBF index
+  fallback, and the brokkr-side verify + throughput baseline remain.
   Milestone 3.
 - Multi-extract v2 complete/smart strategies - Milestone 3.
 
@@ -567,13 +569,12 @@ export. The pieces exist in the codebase:
   or inline coordinate resolution via the sparse/external index
 - Multipolygons: relation member assembly is in extract's smart strategy
 
-The export command would iterate elements, resolve geometry (points for
-nodes, linestrings for ways, polygons for multipolygon relations), and
-write GeoJSON features to stdout or a file. Tag mapping (which tags
-become GeoJSON properties) needs a configuration model.
-See [notes/geojson-export-design.md](notes/geojson-export-design.md)
-for the v1 design: GeoJSONSeq from ALTW-enriched PBFs, streaming
-single-pass, tag expression and bbox filtering.
+**v1 shipped 2026-07-13** (nodes -> Point, ways -> LineString/Polygon,
+both formats, tag/type/bbox/property filters, metadata; ADR-0010). The
+remaining v2 work (relations -> MultiPolygon, raw-PBF index fallback,
+GeoPackage, and the brokkr-side verify + throughput baseline) and the full
+deferred ledger live in
+[notes/geojson-export-design.md](notes/geojson-export-design.md).
 
 ### Command surface
 

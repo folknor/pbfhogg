@@ -95,27 +95,44 @@ Consequences, both of which change plans:
   near-neutral" to the item that owns the actual planet streaming
   constraint.
 
-### `--inject-prepass` A/B: still unresolved, cell design was wrong
+### `--inject-prepass` A/B: SETTLED 2026-07-14 - cost is under 1 % at planet
 
-Matched `--bench 3` at `dcc445e`: flag-OFF 592.2 s (`b65fcad0`),
-flag-ON 624.6 s (`b1d9ba16`), +5.5 %. **Do not record this as the
-injection cost.** Flag-OFF ran first at 05:30 on a rested drive and
-flag-ON at 06:01 directly behind it - the same run-order confound that
-manufactured the original drift artifact, and the drift verdict above
-measures that confound at up to +31 % on I/O-bound stages.
+**Six interleaved `--bench 1` cells at `fb743f6`, ON leading, alternating
+ON/OFF/ON/OFF/ON/OFF:**
 
-The sign also flipped: the 2026-07-13 `--bench 1` pair at `856efc3` had
-flag-ON 5.3 % *faster* (602.9 s vs 636.6 s) while doing strictly more
-work. Two measurements, opposite signs, both ~5 %: **the flag's effect
-is below what this cell design can resolve, and more samples will not
-fix it.** Matched `--bench 3` was necessary but not sufficient; the
-missing ingredient is order-swapping (run flag-ON first in one suite,
-flag-OFF first in the next) or interleaving iterations within one cell.
+| pair | ON | OFF | delta |
+|---|---:|---:|---:|
+| 1 | 627.4 s (`8267419a`) | 621.8 s (`4ff288fb`) | ON +0.90 % |
+| 2 | 644.6 s (`8333cbca`) | 645.4 s (`8cc542eb`) | ON -0.12 % |
+| 3 | 646.3 s (`2a5b109a`) | 655.0 s (`2205c7d5`) | ON -1.33 % |
 
-Status: ADR-0007's planet regression gate stays closed at
-"no measurable regression"; the bound stays |effect| <~ 6 %, un-tightened.
-N7 (gate the closure/pins staging behind the flag) is the cheap way to
-shrink the thing being measured before trying again.
+**Median ON 644.6 s vs median OFF 645.4 s: a 0.12 % gap, with the sign
+flipping across all three pairs.** The injection cost is not measurable
+at planet by wall. Record the bound as **<1 %**, close ADR-0007's gate
+for good, and **stop measuring this** - a fourth attempt cannot resolve
+what three designs could not.
+
+The interleave earned its keep, and the run confirms why the previous
+two attempts failed. Drift across the suite was large and monotonic
+(walls climb 627 -> 655 s, +4.5 % in an hour), and the free readout
+proves it on byte-identical work: first cell `s1a_id_shard_write_ms`
+1,174,295 ms vs last cell 1,515,132 ms - **+29 % on exactly
+149,225,518,932 shard bytes both times.** Any blocked A/B design would
+have handed that +29 % to whichever arm ran last and called it a result.
+That is precisely what produced the +5.5 % (2026-07-14 blocked
+`--bench 3`) and the -5.3 % (2026-07-13 `--bench 1`) - same question,
+opposite signs, both pure run order.
+
+**Method note worth keeping:** matched sample counts are necessary but
+not sufficient. `--bench N` is best-of-N *within* a cell, so a blocked
+pair still samples one point in drive-state time. Alternate `--bench 1`
+cells and compare medians; weigh sign consistency across pairs above the
+median gap.
+
+N7 (gate the closure/pins staging behind the flag) is no longer needed
+as a measurement aid - there is nothing left to measure. It remains
+worth doing on its own merits: it is free, and its sparse analogue was
+measured at ~2.3 ns/ref (see `notes/altw.md`).
 
 ### Drift verdict: drive state, not code (SETTLED 2026-07-14)
 
@@ -330,8 +347,15 @@ One `pbfhogg cat` extension, three consumers:
   write/read.
 - **File-level blob directory** (frame/data offsets, sizes, kind, id
   bounds, count, tag state, compression codec per blob) - collapses the
-  7.3 s serial HeaderWalker meta scan to one pread. Alone this is 1 % of
-  wall and would rank last; as the N1 enabler it rides along.
+  7.3 s serial HeaderWalker meta scan to one pread. For *external* alone
+  this is 1 % of wall and would rank last; as the N1 enabler it rides
+  along. **But it is worth far more to sparse** (measured 2026-07-14):
+  sparse walks all headers four separate times, 107.4 s of a 363.1 s
+  europe wall (`notes/altw.md` P4). The frame/kind/count columns listed
+  above are exactly what sparse's pass-2 `BlobDescriptor` needs and what
+  the existing `build_classify_schedules_split` cannot supply. If N2
+  lands, sparse P4's second half is free - coordinate the column set with
+  P4 rather than designing it for external's needs alone.
 - **Codec field per blob** - prerequisite bookkeeping for any future
   per-blob-codec input experiments (see tier 2), and useful to degrade /
   repack diagnostics generally.
@@ -436,6 +460,14 @@ problem enough that this dies quietly - check again after they land.
 
 ### N7. Gate the closure/pins work on `--inject-prepass` (small, free)
 
+**Scope: EXTERNAL ONLY.** `closure_slots` staging lives solely in
+`external/stage1.rs`; the sparse backend has no closure staging. Do not
+cite N7 as a suspect for sparse regressions - `notes/altw.md`'s japan
+flag briefly did on 2026-07-14 and it was retracted the same day. Sparse
+has its *own* unconditional-prepass-cost bug (an ungated
+`referenced.get` per ref in the pass-0 serial union); same shape, same
+root cause in the prepass landings, different code path, tracked there.
+
 Stage 1 computes `closed = refs.first() == refs.last()` and stages a
 per-blob `closure_slots: Vec<bool>` (12.4 B pushes per planet run)
 whether or not prepass injection is on; the flag is only ever consumed
@@ -443,6 +475,11 @@ by the stage-2 pin logic, which is gated. Thread `inject_prepass`
 (already a parameter, currently unused in pass A) into the emission loop
 and skip the staging + flag OR on the plain path. Small but strictly
 free; belongs bundled with the next stage-1 touch (N1).
+
+Worth doing as a pair with the sparse fix: the prepass landings
+(`58743ba` / `29e4eab`) added an ungated cost to the plain path of
+**both** backends, which is a pattern, not two coincidences. Whatever
+review missed it once missed it twice.
 
 ---
 

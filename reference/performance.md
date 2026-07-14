@@ -344,17 +344,17 @@ suite; the rest still carry their older commit in the Notes column.
 
 | Command | Mode | Wall | UUID | Notes |
 |---|---|---:|---|---|
-| cat (indexdata generation) | `--bench 1` | **87.2 s** | `f2c1e220` | commit `dcc445e`, 2026-07-14; was 86.5 s `5d90623f` (`aee7727`) |
+| cat (indexdata generation) | `--bench 1` | **87.2 s** | `f2c1e220` | commit `dcc445e`, 2026-07-14; was 86.5 s `5d90623f` (`aee7727`). A same-day re-run at the very end of a second suite measured **108.1 s** (`cdf95e0d`, `fb743f6`, +24 %) - identical code, exhausted drive. **Treat that spread as the honest error bar on any single planet `cat` number**, not as a regression |
 | cat --type way | `--bench 3` | 45.3 s | `2fe62148` | |
 | cat --type relation | `--bench 1` | 47.7 s | `fba6e13e` | |
 | cat --clean version | `--bench 1` | **333.8 s (5m34s)** | `f2315551` (4fc8e35, 2026-04-27 overnight) | `parallel_classify_phase` + reorder-buffer streaming, 750 MB peak anon |
 | cat --dedupe | `--bench 1` | **7,981 s (133m)** | `1794f8a6` | single-threaded MERGEPBF path - see callout below |
-| check --refs | `--bench 1` | **60.2 s** | `f75bedc6` | commit `dcc445e`, 2026-07-14; was 53.8 s `7d9f5dfd`. +11.9 % is inside the ~8 % drift band on a single sample - not a regression |
+| check --refs | `--bench 1` | **60.2 s** | `f75bedc6` | commit `dcc445e`, 2026-07-14; was 53.8 s `7d9f5dfd`. +11.9 % on a single sample, inside the ~8 % drift band. Briefly re-opened 2026-07-14 on a `4776b92` suspicion that the getparents phase split then killed; **stays closed**. If ever re-examined, check the schedule-phase disk read first - check-refs walks headers too |
 | check --ids (streaming, default) | `--bench 1` | **56.6 s** | `55e87d85` | commit `dcc445e`, 2026-07-14; was 56.4 s `b1fc4d2e` (4fc8e35) - flat |
 | check --ids --full | `--bench 1` | **63.2 s** | post-`01c67da` | |
 | getid (include mode) | `--bench 1` | **6.8 s cold / 0.2 s warm** | `264d9dbf` / `12e74756` | dispatch landing `19d3a62`, 2026-07-11; cache-state dominated, see ADR-0006 gates below |
 | getid --invert | `--bench 1` | 91.0 s | `40f5bd52` | |
-| getparents | `--bench 3` | **22.2 s** | `ca49bcdf` | commit `dcc445e`, 2026-07-14; was 19.0 s `a7c064eb` (`2306fd9`). **+16.8 % and the new number is a best-of-3 vs a single sample - the one Q6 regression that survives the drift band.** See flag below |
+| getparents | `--bench 3` | **22.8 s** | `39570d10` | commit `fb743f6`, 2026-07-14. Matched same-day pair vs `--commit 2306fd9` 24.4 s (`da60663d`): **HEAD is 6.6 % faster**. The 19.0 s `a7c064eb` figure is retired - it was a warm-header-walk artifact, see flag below |
 | inspect default (index-only) | `--bench 1` | **6.5 s** | `c146f2bb` | |
 | inspect --nodes `-j 16` | `--bench 1` | **49.4 s** | post-`01c67da` | |
 | inspect --tags `-j 16` | `--bench 1` | **168.3 s** | `9d741341` / post-`01c67da` | |
@@ -374,7 +374,7 @@ suite; the rest still carry their older commit in the Notes column.
 | extract --smart (Europe bbox) | `--bench 1` | 267.5 s | `07dcdae3` | |
 | multi-extract --simple (5 regions, Europe bbox) | `--bench 1` | **883.6 s** | `68cecf88` | |
 | multi-extract --smart (5 regions, Europe bbox) | `--bench 1` | 837.6 s | `2c842414` | |
-| add-locations-to-ways `--index-type external` | `--bench 3` | **592.2 s** | `b65fcad0` | commit `dcc445e`, 2026-07-14. Drift flag CLOSED (drive state, not code) - see below |
+| add-locations-to-ways `--index-type external` | `--bench 3` | **592.2 s** | `b65fcad0` | commit `dcc445e`, 2026-07-14, first cell of a suite on a rested drive - **this is a best case, not a typical wall**. Six same-day `--bench 1` cells at `fb743f6` measured **621.8 - 655.0 s** on identical code as the drive tired (`4ff288fb` / `8cc542eb` / `2205c7d5` flag-OFF). Quote the range, not a point |
 | add-locations-to-ways `--index-type external --compression zstd:1` | `--bench 1` | 648.4 s | `0e9d93cc` | commit `dcc445e`, 2026-07-14. **Total wall is drift-confounded; the finding is the phase split** - see the planet compression ceiling callout below |
 | apply-changes (daily diff, `--osc-seq 4920`) | `--bench 1` | **465.7 s** | `aaed129a` | commit `dcc445e`, 2026-07-14; was 756.3 s `8e940f71`. **-38.4 % despite the ~8 % drift headwind - understated win, unattributed** |
 | repack (default cap, planet -> planet) | `--bench 1` | **374.6 s** | `33f2c448` | commit `dcc445e`, 2026-07-14; was 377.5 s `8027765b` (`8c1cf03`) - flat |
@@ -420,19 +420,32 @@ suite; the rest still carry their older commit in the Notes column.
 > this host carry a ~5-8 % environmental band and run order within a
 > suite is a real variable.**
 
-> **`--inject-prepass` A/B - STILL UNRESOLVED; the cell design is the
-> problem, not the sample count.** Matched `--bench 3` at `dcc445e`:
-> flag-OFF 592.2 s (`b65fcad0`), flag-ON 624.6 s (`b1d9ba16`), +5.5 %.
-> **Do not record this as the injection cost.** Flag-OFF ran first at
-> 05:30 on a rested drive, flag-ON at 06:01 directly behind it - the
-> exact run-order confound the drift verdict above measures at up to
-> +31 % on I/O-bound stages. The sign also flipped from the 2026-07-13
-> `--bench 1` pair at `856efc3` (flag-ON 602.9 s vs flag-OFF 636.6 s,
-> 5.3 % *faster* while doing strictly more work). Two measurements,
-> opposite signs, both ~5 %: the effect is below what adjacent-cell A/B
-> can resolve at planet. Fixing it needs order-swapping or interleaved
-> iterations, not more samples. ADR-0007's planet regression gate stays
-> closed as "no measurable regression"; the bound stays |effect| <~ 6 %.
+> **`--inject-prepass` A/B - SETTLED 2026-07-14: cost is under 1 % at
+> planet. Stop measuring this.** Six interleaved `--bench 1` cells at
+> `fb743f6`, ON leading, alternating:
+>
+> | pair | ON | OFF | delta |
+> |---|---:|---:|---:|
+> | 1 | 627.4 s (`8267419a`) | 621.8 s (`4ff288fb`) | ON +0.90 % |
+> | 2 | 644.6 s (`8333cbca`) | 645.4 s (`8cc542eb`) | ON -0.12 % |
+> | 3 | 646.3 s (`2a5b109a`) | 655.0 s (`2205c7d5`) | ON -1.33 % |
+>
+> **Median ON 644.6 s vs OFF 645.4 s = 0.12 %, sign flipping across all
+> three pairs.** ADR-0007's planet regression gate closes for good;
+> record the bound as **<1 %**.
+>
+> Why the two earlier attempts failed, and the method that worked: drift
+> across this suite was large and monotonic (walls climb 627 -> 655 s,
+> +4.5 % in an hour) and is proven on byte-identical work - first cell
+> `s1a_id_shard_write_ms` 1,174,295 ms vs last cell 1,515,132 ms, **+29 %
+> over exactly 149,225,518,932 shard bytes both times**. A blocked pair
+> hands that drift to whichever arm runs last: that is the +5.5 %
+> (2026-07-14 blocked `--bench 3`) and the -5.3 % (2026-07-13
+> `--bench 1`) - same question, opposite signs, both pure run order.
+> Interleaving alternating `--bench 1` cells samples both arms across the
+> same drift and cancels it. **Matched sample counts are necessary but
+> not sufficient; `--bench N` is best-of-N within one cell and cannot
+> cancel between-cell drift.**
 > Injection counters (2026-07-13, first end-to-end exercise, all
 > plausible): `altw_member_ways` 37.2 M, `altw_pinned_refs` 2.63 B (21 %
 > of the 12.44 B way refs), `altw_field20_ways_emitted` 535.3 M (46 % of
@@ -472,12 +485,21 @@ suite; the rest still carry their older commit in the Notes column.
 
 > **Renumber `+10 s` - CLOSED 2026-07-14, no regression.** The matched
 > `--bench 3` pair the flag asked for has run: HEAD **191.1 s**
-> (`43041dd4`) vs `--commit cb99106` **200.4 s** (`9755cafc`), same day,
-> grouped per the build-thrash rule. **HEAD is 4.6 % faster than the
-> pre-drift commit**, and also faster than that commit's own historical
-> 194 s. The `cb99106` re-run landing at 200.4 s vs its historical 194 s
-> (+3.3 %) is the same environmental drift seen everywhere else in this
-> suite. The 204.5 s `abd74459` figure is retired.
+> (`43041dd4`) vs `--commit cb99106` **200.4 s** (`9755cafc`), same day.
+> HEAD is faster than the pre-drift commit, and also faster than that
+> commit's own historical 194 s. The `cb99106` re-run landing at 200.4 s
+> vs its historical 194 s (+3.3 %) is the same environmental drift seen
+> everywhere else in this suite. The 204.5 s `abd74459` figure is retired.
+>
+> **Read the direction, not the 4.6 % gap.** The two cells ran 2h47m
+> apart (HEAD 06:10, `cb99106` 08:57) because the suite grouped worktree
+> cells under what turned out to be an **obsolete** build-thrash rule
+> (brokkr has isolated worktree target dirs since `38e20a6`, 2026-07-07 -
+> see AGENTS.md). So `cb99106` was measured on a much more tired drive
+> and its 200.4 s is inflated; matched, the two are probably near-equal.
+> The conclusion is safe in the conservative direction - the old commit
+> got the *worse* conditions and still did not beat HEAD - but the
+> magnitude is not a real 4.6 % code win. Do not cite it as one.
 
 ### Blob-count threshold dispatch landing gates (ADR-0006, plantasjen, 2026-07-11)
 
@@ -502,11 +524,78 @@ kind filter and prescreen skip decompression, not bytes); the walker
 cells read only headers plus matching bodies. The 8k profiles confirm
 the mechanism: no schedule/walk phase on the FullScan arm.
 
-> **getparents planet-primary `+16.8 %` flag (2026-07-14, OPEN).**
-> 19.0 s (`a7c064eb`, `2306fd9`) -> **22.2 s** (`ca49bcdf`, `dcc445e`).
-> This is the only 2026-07-14 re-baseline that survives the ~8 % drift
-> band, and it is understated: the new number is a **best-of-3** while
-> the old was a single sample, so 16.8 % is a floor-to-floor delta.
+> **getparents planet-primary `+16.8 %` flag - CLOSED 2026-07-14 the
+> same day it was opened: header-walk cache state, not code.** The phase
+> split settles it without needing a bench cell:
+>
+> | phase | `a7c064eb` 19.0 s | `ca49bcdf` 22.2 s | delta |
+> |---|---:|---:|---:|
+> | schedule walk | **97 ms**, 0 kB read | **4457 ms**, 405 MB read | **+4.36 s** |
+> | decode | 18.857 s, 29.36 GB, 19.3 cores | 17.672 s, 27.85 GB, 20.1 cores | **-1.19 s** |
+>
+> Net +3.17 s = the whole +3.2 s "regression". **The 19.0 s baseline read
+> ZERO BYTES on its schedule walk** - the headers were already in page
+> cache from whatever ran before it on 2026-07-11. Today's walked them
+> cold (405 MB, 59,838 preads, 0.1 avg cores). `HeaderWalker` uses
+> `fadvise(RANDOM)`, so a cold walk is ~88 us/blob and a warm one is
+> free: a ~45x swing on identical code. **The decode phase, meanwhile,
+> got 6.3 % FASTER.** 19.0 s is the anomaly; 22.2 s is the honest
+> cold-cache number. Retire 19.0 s.
+>
+> Independent corroboration: `21ed8d7c` (getparents planet `--bench 3` at
+> `a65cecc`, 2026-07-12, 21.7 GB RAM) measured **25.5 s** - so the series
+> runs 19.0 -> 25.5 -> 22.2 across three days with 24.2 / 21.7 / 28.9 GB
+> of available memory. Non-monotonic, tracking RAM and preceding
+> workload, not commits.
+>
+> **`4776b92` ("make WILLNEED classify prefetch unconditional") is
+> EXONERATED**, twice over: it only touches the decode phase, which
+> improved; and `21ed8d7c` sits *before* it in history while measuring
+> slower than HEAD. The suspicion below was raised from its commit
+> message and killed by the phase split - recorded because the reasoning
+> was seductive and wrong.
+>
+> **The matched same-day pair ran and confirms it (2026-07-14 10:24
+> suite):** HEAD **22.8 s** (`39570d10`) vs `--commit 2306fd9` **24.4 s**
+> (`da60663d`), `--bench 3` each. **HEAD is 6.6 % FASTER than the commit
+> the 19.0 s came from.** Phase split, cache-matched (both cold):
+>
+> | | schedule walk | decode | wall |
+> |---|---:|---:|---:|
+> | HEAD run 0 | 4773 ms | 17905 ms | 22678 ms |
+> | HEAD run 1 | 4791 ms | 17860 ms | 22651 ms |
+> | `2306fd9` run 0 | **6381 ms** | 18627 ms | 25009 ms |
+> | `a7c064eb` (19.0 s, same commit as above) | **97 ms** | 18857 ms | 19000 ms |
+>
+> The `2306fd9` **decode is ~18.6-18.9 s in both** the 19.0 s run and
+> today's 24.4 s run - identical work, identical time. The only thing
+> that ever moved is the walk: **97 ms warm vs 6381 ms cold**, a 6.3 s
+> swing that is the entire "regression". The feared cache confound (cell
+> 9 finding cell 7's headers warm) did not materialise: the intervening
+> worktree cargo build scrubbed the page cache, so both cells walked
+> cold. That was luck, not design.
+>
+> Note the walk **never warms** at planet across `--bench N` iterations
+> (all three HEAD runs ~4.78 s): each iteration reads ~30 GB and evicts
+> the headers it just read. Unlike japan sparse, best-of-3 cannot escape
+> the cold walk here.
+>
+> **New baseline: 22.8 s `--bench 3` (`39570d10`, `fb743f6`).** Retire
+> 19.0 s.
+>
+> **Standing lesson: getparents/getid planet walls are header-cache
+> dominated.** The command family was already documented as cache-state
+> dominated (getid planet: 6.8 s cold / 0.2 s warm) and the *walk* has
+> the same property. Never compare two getparents planet walls without
+> comparing their schedule-phase disk read first. This also softens
+> ADR-0006's threshold derivation, which assumed a ~45 us/blob walk cost:
+> that figure is a cold-cache number and the real cost swings ~45x with
+> cache state. The dispatch decision is not in question at these blob
+> counts, but the threshold is softer than the ADR implies.
+>
+> ---
+> **Superseded reasoning, kept as a negative result** (the suspicion the
+> phase split killed):
 > Phase shape is unchanged and the ADR-0006 dispatch still picks the
 > Walker arm correctly (`getparents_schedule_blobs` 17,981,
 > `getparents_blobs_skipped` 32,835 - the same 64.6 % skip rate as
@@ -515,8 +604,30 @@ the mechanism: no schedule/walk phase on the FullScan arm.
 > `decompress_blob_raw` is 59.9 % of allocations, `parallel_classify_phase`
 > 17.66 s of the 22.5 s wall. Suspect the decode path between `2306fd9`
 > and `dcc445e`, not the dispatch. **Not a release blocker** (22 s wall)
-> but it is the one real Q6 finding; a matched `--bench 3` pair via
-> `brokkr getparents --commit 2306fd9` would localise it in one cell.
+> but it is the one real Q6 finding.
+>
+> **Prime suspect (code read 2026-07-14): `4776b92` "scan: make WILLNEED
+> classify prefetch unconditional".** It promotes `posix_fadvise(WILLNEED)`
+> over coalesced classify-schedule payload ranges to unconditional across
+> all four classify consumers - including `parallel_classify_phase`, which
+> IS getparents' hot phase (17.66 s of a 22.5 s wall). Its own commit
+> message is the tell: the A/B that justified it was **europe-only**
+> (check-refs 56.8 -> 53.3 s, tags-filter 61.8 -> 58.3 s) and planet
+> safety is asserted rather than measured - *"planet is not
+> over-prefetched even though the win is europe-scale."* That is the
+> regime-transfer trap this file already documents twice (the ALTW
+> europe-vs-planet compression axis; the zstd:1 ceiling cell).
+> Corroboration: **check-refs at planet also came back +11.9 %** in the
+> same suite, and check-refs is the very command whose *europe* number
+> justified the commit - so the "drift" dismissal on that row above may
+> be wrong. Counter-evidence: check-ids is also a classify consumer and
+> came back flat (+0.4 %), so the story is not clean.
+> ~~Cheapest test: `brokkr getparents --commit 4776b92` vs
+> `--commit 4776b92^`.~~ **Not needed - the phase split above closed it
+> first, for free.** The WILLNEED window was also read and found sound:
+> it correctly slides 256 MiB ahead of the dispatched entry, so the
+> "planet is over-prefetched" story had no mechanism behind it either.
+> Two cells saved by reading a sidecar before queueing a bench.
 
 **Same-day A/B rule for I/O-bound cells.** The 8k cells missed their
 pre-registered absolute bounds (52.8 s + 10 %, 33.2 s + 10 %) for a

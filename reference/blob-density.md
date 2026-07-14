@@ -304,10 +304,33 @@ structural "check-refs is parallel classify, expect it fine on 8k"
 inference was wrong by 2.85x because the shared scanner hides a
 serial shape-1 loop.
 
-Disposition: real regression, low production bite (production planet is
-50 k blobs). Not chased. If a high-blob-count workload becomes real,
-the fix axis is the serial `build_classify_schedules_split` walk (shared
-by six commands), not the parallel classify phases.
+Disposition: real regression, low production bite *at planet*
+(production planet is 50 k blobs). Not chased there. If a
+high-blob-count workload becomes real, the fix axis is the serial
+`build_classify_schedules_split` walk (shared by six commands), not the
+parallel classify phases.
+
+> **The high-blob-count workload is already real, and it is not the 8k
+> snapshot: it is europe (2026-07-14).** Geofabrik europe is 522,168
+> blobs *natively*, so the serial walk costs ~26 s there per call - not
+> the ~3.5 s it costs on planet primary. That alone is 7 % of a sparse
+> ALTW europe wall.
+>
+> Worse, **ALTW sparse is a seventh shape-3 command that never adopted
+> `build_classify_schedules_split`** and instead calls the single-kind
+> `build_classify_schedule` three times (Way / Node / Relation), plus a
+> fourth private walk in `passthrough.rs::build_schedule` for pass 2.
+> Measured at europe (`4ac11326`): **26.6 + 25.0 + 29.3 + 26.5 =
+> 107.4 s of a 363.1 s wall = 29.6 %**, all at 0.1 avg cores. Same
+> ~50 us/blob serial walk this section already characterises, paid four
+> times on a production dataset.
+>
+> This makes the "low production bite" disposition above planet-specific
+> rather than general. The fix for sparse is the one this section
+> already names - adopt the shared scanner - and it is tracked as P4 in
+> [`notes/altw.md`](../notes/altw.md). **Instrument-first vindicated a
+> fourth time:** the walk was assumed cheap because it is cheap at
+> planet, and nobody had looked at europe.
 
 ### Full shape-3 sweep (2026-07-12, all six callers, plantasjen `5dc07c4`)
 

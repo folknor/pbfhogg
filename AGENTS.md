@@ -55,16 +55,10 @@ brokkr <command> [--dataset D] --commit <ref>   # build+bench an old commit in a
 worktree and stores the result tagged to that commit - pass it to capture a
 before/after baseline from your own branch.
 
-**`--commit` build-thrash warning:** dev hosts export a global
-`CARGO_TARGET_DIR`, which overrides the worktree's local `target/` - so
-worktree builds and HEAD builds share ONE artifact directory and clobber
-each other (different lockfiles, same output paths). Every HEAD/worktree
-alternation costs a full release rebuild of whichever side runs next.
-**Group `--commit` benches together**: run all HEAD cells consecutively,
-then all worktree cells (or vice versa), and end on a HEAD build so the
-shared target is left in HEAD state for whatever follows. A
-dataset-grouped order that alternates commits doubles the total build
-count.
+Each worktree builds into its own `CARGO_TARGET_DIR`, so `--commit` cells
+interleave freely with HEAD cells. The first build per commit is a cold
+rebuild; worktrees persist and are reused, so that cost is once per
+commit, not per cell (`brokkr clean --worktrees` removes them).
 
 `--stop MARKER` requires a measured mode. Kills process after the named marker. Accepts three spellings: verbatim (`--stop RENUMBER_EXT_STAGE2D_END`), the `-` sigil (`--stop -RENUMBER_EXT_STAGE2D` → resolves to `RENUMBER_EXT_STAGE2D_END`), and the bare-name fallback (`--stop RENUMBER_EXT_STAGE2D` → also resolves to `RENUMBER_EXT_STAGE2D_END`; the sidecar log line shows the resolved form).
 
@@ -75,7 +69,11 @@ Markers are point-in-time bookmarks - the FIFO protocol is `<timestamp_us> <name
 Brokkr is convention-free at the protocol layer. Two optional naming conventions unlock richer views:
 
 - **`FOO_START` / `FOO_END` marker pairs** drive `--durations` (per-span wall time) and anchor `--stop` alias resolution. Emit both markers around any phase you want to time.
-- **`WAIT_<CATEGORY>_START` / `WAIT_<CATEGORY>_END` stall spans** drive `brokkr sidecar <uuid> --stalls`. Wrap blocking points (channel sends, spill waits, backpressure) in marker pairs whose name begins `WAIT_`. `--stalls` sums durations by category and reports each as a fraction of run wall-clock. Categories are free-form - pick names that match the blocking points you want to attribute (`WAIT_WRITER`, `WAIT_PAYLOAD`, `WAIT_SPILL`, etc.). Runs from before the convention simply report "no WAIT_* marker pairs" rather than empty output. **Only emit `WAIT_*` pairs on genuine blocks** - gate them behind a `try_send` / `try_recv` fast path, otherwise every non-blocking poll produces a zero-width pair and the FIFO floods.
+- **`<category>_wait_ns` counters** drive `brokkr sidecar <uuid> --stalls`. The target accumulates blocking time per category into a strictly-monotonic counter (one atomic add per blocking event); `--stalls` takes the max per name, strips the `_wait_ns` suffix for the category, and reports total stall time as a fraction of run wall-clock. That fraction can exceed 100 % when waits are summed across concurrent threads - read it as "average threads parked in this category". The writer's `writer_permit_wait_ns` / `writer_pipeline_send_wait_ns` / `writer_recv_wait_ns` are the worked examples.
+
+  **`WAIT_*` marker pairs do NOT feed `--stalls`** (verified 2026-07-14). This doc previously claimed they did, and pbfhogg's `WAIT_P2_SEND` / `WAIT_S4_SEND` / `WAIT_S4_ROUTER` spans were built against that claim - they are real and useful, but they surface in `--durations` (as collapsed repeated spans), not in `--stalls`. To attribute a blocking point in `--stalls`, emit a `*_wait_ns` counter; the marker pair is for span timing. Emitting both is fine and they answer different questions.
+
+  **Only emit `WAIT_*` pairs on genuine blocks** - gate them behind a `try_send` / `try_recv` fast path, otherwise every non-blocking poll produces a zero-width pair and the FIFO floods.
 
 Both conventions are additive. The default phase summary already shows per-phase user/kernel core split, `majflt`/`minflt` deltas, voluntary/involuntary context switches, and peak thread count - derived from `/proc` samples, so older sidecar rows get the enriched view retroactively on next query.
 
@@ -104,16 +102,21 @@ I/O flags (`--direct-io`, `--io-uring`) create named variants in results. `--for
 - `brokkr check [--profile <name>] [-- args]` - clippy + tests across every `[[check]]` sweep in `brokkr.toml`. Default profile is `tier1` (fast contracts; skips `tier2::`/`tier3::`/`platform::`/`serial::` modules). Other profiles: `full` (tier 3, includes ignored tests), `platform` (`--direct-io`/`--io-uring` tests), `serial` (`--test-threads=1`), `sort` (per-command tier-2 precedent). Each sweep rebuilds `pbfhogg-cli` with matching features via `build_packages`; `BROKKR_TEST_BIN_DIR` is exported so test code finds the right binary. Output minified: one-line summaries with file:line.
 - `brokkr test <NAME> [--sweep <sweep>] [--timeout <secs>] [--raw]` - run one integration test by exact name with `--include-ignored` + `--nocapture` + single-threaded. Builds release unless `[test] debug = true` in `brokkr.toml` (debug builds compile much faster for iteration; compute-heavy tests run slower). Runs every `[[check]]` sweep configured in `brokkr.toml` (today: `all` + `consumer`) unless `--sweep <name>` narrows to one. Per-test hang watchdog defaults to 20 s; `--timeout` raises it, range 20-280. Footer prints `[test] PASS/FAIL` with wall time per sweep; `NO MATCH` indicates the name filter matched zero tests under that sweep (useful when a test is `#[cfg]`-gated behind a feature absent from the consumer build). `--raw` streams the unfiltered cargo output. Example: `brokkr test merge_cross_validate_osmium --sweep all --timeout 120`.
 - **The 20 s per-test watchdog is fixed on `brokkr check`** - `--sweep`/`--timeout` exist only on `brokkr test`, and check profiles have no timeout override. Consequence: no test that runs longer than 20 s can ever pass any `brokkr check`, including `--profile full` with its include-ignored slow tests (`roundtrip_denmark` ~54 s, `geocode_index` ~154 s). Slow tests must be `#[ignore]`d out of the check profiles' reach and exercised individually via `brokkr test <name> --timeout <secs>`; a watchdog kill reports the victim as "did not finish within 20s" with a `futex_do_wait` wchan snapshot in `.brokkr/test-hung/`, which looks like a deadlock but usually just means the test is slower than the watchdog.
+- `brokkr --version` - stamps brokkr's own git hash, a `-dirty` suffix, and build time. brokkr installs via `cargo install --path`, so when brokkr behaves unlike its source, check this first: a stale installed binary is the usual answer, and reinstalling beats working around a bug that is already fixed.
 - `brokkr env` - hostname, kernel, governor, memory, drives, datasets. Also computes missing hashes.
 - `brokkr results` - table of the last 20 results. `brokkr results [UUID]` - specific result.
-- `brokkr results [--commit X] [--compare A B] [--command CMD] [--mode M] [--grep STR] [--dataset D] [--meta K=V] [-n N] [--top N]` - query/compare from SQLite. `--command` exact-matches the bare subcommand id (no `bench `/`hotpath ` prefix); `--mode` filters by measurement mode (`bench`/`hotpath`/`alloc`); `--grep STR` substring-matches against both `cli_args` and `brokkr_args` (use it to find runs by flag/axis, e.g. `--grep zstd:1` or `--grep snap-20260411`); `--dataset` substring match on input file; `--meta` exact match, composable with AND.
+- `brokkr results [--commit X] [--compare A B] [--command CMD] [--mode M] [--grep STR] [--grep-v STR] [--dataset D] [--meta K=V] [--env K=V] [-n N] [--top N]` - query/compare from SQLite. `--command` substring-matches; `--mode` filters by measurement mode (`bench`/`hotpath`/`alloc`); `--dataset` substring match on input file; `--meta` / `--env` exact match, composable with AND.
+  - `--grep STR` substring-matches against both `cli_args` and `brokkr_args`, repeatable with AND semantics (`--grep apply-changes --grep zstd:1`).
+  - `--grep-v STR` excludes; repeatable, excludes on ANY match; composes with `--grep`. **This is how you select the arm of an A/B distinguished only by an absent flag** - `--grep add-locations-to-ways --grep-v inject-prepass` gets the flag-OFF arm, which `--grep` alone cannot express. Both work with `--compare`.
+- `brokkr results <uuid>` renders per-iteration walls for `--bench N` runs. **The iteration order is the diagnostic**: iteration 1 slow then 2/3 fast is a cold page cache; iteration 1 fast then 3 slow is drive-state exhaustion. These are opposite diagnoses, so never read a `--bench N` row as a single number when the walls disagree.
 - `brokkr sidecar <UUID>` - per-phase JSONL summary (default view). Pass `--human` for a fixed-width table.
+- `brokkr sidecar <UUID> --run N|all` - pick an iteration within a `--bench N` result (default: the best run). **The sidecar stores every iteration even though older `results` rows kept only the best wall** - this is how you recover a cold-vs-warm story from an already-recorded bench.
 - `brokkr sidecar <UUID> --samples` - raw /proc samples as JSONL. Composable: `--fields`, `--where`, `--every`, `--head`/`--tail`, `--phase`, `--range`.
 - `brokkr sidecar <UUID> --stat FIELD` - min/max/avg/p50/p95 for a /proc field (composes with `--phase`, `--range`, `--where`).
 - `brokkr sidecar <UUID> --markers` - raw marker events (JSONL).
-- `brokkr sidecar <UUID> --durations` - START/END pair timings. JSONL by default; `--human` for the table.
-- `brokkr sidecar <UUID> --counters` - application counters. JSONL by default; `--human` for the table.
-- `brokkr sidecar --compare <A> <B>` - phase-aligned delta (JSONL by default; `--human` for the table).
+- `brokkr sidecar <UUID> --durations` - START/END pair timings. JSONL by default; `--human` for the table. Under `--human`, high-cardinality repeated spans collapse into one row with count/total/min/avg/max (keyed on observed cardinality, not on any name convention; disabled under `--run all`). **The min/max on a collapsed row is often the finding** - e.g. `SCHEDULE_SCAN_LOOP x3 min 22.6ms max 3087.4ms` is a cold walk and two warm ones in a single line. JSONL keeps one object per span.
+- `brokkr sidecar <UUID> --counters [--grep SUBSTR]` - application counters. `--grep` keeps only counters whose name contains the substring; without it a run emitting a progress counter every 64 blobs buries the lines that matter. JSONL by default; `--human` for the table.
+- `brokkr sidecar --compare <A> <B>` - phase-aligned delta (JSONL by default; `--human` for the table). Annotates host differences (memory / governor / kernel) between the two runs - **check it first**, since available RAM has explained more of our cross-run deltas than code has.
 - `brokkr sidecar dirty` - sidecar data from the most recent forced/failed run (even if OOM-killed). UUID is required; `dirty` is the alias for that latest non-DB run.
 - All `[sidecar]` narration lines (run provenance, run-index hints) go to stderr so stdout stays pure JSONL for piping into `jq`.
 - `brokkr download <region> [--osc-seq N] [--as-snapshot <key> | --refresh] [--force]` - download datasets. Primary PBF: no-op once configured (use `--refresh` to rotate). OSC: rolls forward. Indexed PBF: regenerated on cache miss. `--as-snapshot <key>` registers additional snapshot. `--refresh` archives primary into `snapshot.<key>` and downloads new. Planet uses planet.openstreetmap.org; others use Geofabrik. Short aliases (denmark, europe) or full paths (europe/france).
@@ -166,6 +169,11 @@ Commands requiring indexdata: `apply-changes`, `sort`, `add-locations-to-ways`, 
 ## Benchmarking Rules
 - **NEVER run benchmark, profiling, or verify commands in parallel.** ONE AT A TIME. Always wait for each to fully complete before starting the next.
 - Multiple benchmark runs in an optimization workflow: run sequentially, report between runs.
+- **Read the phase split before calling any delta a regression.** `brokkr sidecar <uuid> --human` attributes per-phase disk read, majflt and cores. Planet wall deltas are routinely environmental; one sidecar read regularly saves a bisect.
+- **Interleave matched A/B cells.** `--bench N` is best-of-N *within* one cell, so it cannot cancel drift *between* cells - two adjacent `--bench 3` cells are still confounded. Alternate `--bench 1` cells, compare medians, and check sign consistency across pairs.
+- **A same-day matched pair beats any historical number.** Old baselines were recorded under uncontrolled drive and page-cache state; when they disagree with a fresh matched pair, retire the historical figure rather than defend it.
+
+Drive-state and cache-state evidence, with dates and UUIDs, lives in [`reference/performance.md`](reference/performance.md) - it is volatile and does not belong here.
 
 ## Workspace
 Cargo workspace: **`pbfhogg`** (root, library) + **`pbfhogg-cli`** (`cli/`, binary, produces `pbfhogg`). Library users: `default-features = false` skips `commands` feature. `pbfhogg-cli` carries a no-op `commands` feature so brokkr can apply `--features commands` symmetrically across both crates - the CLI's lib dep already always pulls in `pbfhogg/commands`.

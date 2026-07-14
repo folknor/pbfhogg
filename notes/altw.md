@@ -56,7 +56,7 @@ Code:
 | Scale | Wall | UUID | Commit | Date | Note |
 |---|---:|---|---|---|---|
 | denmark | 4.0 s | `7bd88e83` | `6d6e158` | 2026-07-10 | default sparse |
-| japan | **15.5 s** | `a3c46737` | `dcc445e` | 2026-07-14 | current; **+30 % vs 11.9 s @ `c6f08ff` - see flag below** |
+| japan | **12.3 s** | `26203e64` | `fb743f6` | 2026-07-14 | current, `--bench 3`. Retires 15.5 s (`a3c46737`, cold-walk single sample) and 11.9 s (pre-prepass). ~0.9 s of the gap to 11.9 s is real - see P0 |
 | germany | **25.7 s** | `61f6c231` | `dcc445e` | 2026-07-14 | first sparse pin at this scale (P1 cell) |
 | north-america | **116.4 s** | `340ba366` | `dcc445e` | 2026-07-14 | first sparse pin at this scale (P1 cell) |
 | europe | **363.1 s** | `4ac11326` | `dcc445e` | 2026-07-14 | current; flat vs 359.7 s @ `c6f08ff` (+0.9 %) |
@@ -70,29 +70,99 @@ Europe phase profile at `dcc445e` (`4ac11326`): pass 0 52.2 s, pass 1
 46.6 s (28.94 GB store), rel-member 29.8 s, pass 2 230.5 s. Prior
 profile (`f9a61784`, `c6f08ff`): pass 0 63.2 s, pass 1 57.7 s (29 GB,
 avg cores 11.6), rel-member 1.2 s, pass 2 197.0 s (6.8 M majflt, 251 GB
-disk read, avg cores 13.9). Note rel-member moved 1.2 -> 29.8 s and
-pass 2 197 -> 230 s while the total stayed flat; both deserve a look
-before P3 uses the pass-2 number as its gate.
+disk read, avg cores 13.9).
 
-> **japan sparse +30 % flag (2026-07-14).** 11.9 s (`c6f08ff`) -> 15.5 s
-> (`a3c46737`). Beyond the drift band, and *inverted from scale
-> expectations*: europe sparse is flat over the same commit range. Japan
-> is small enough that fixed per-run costs dominate, and N7 in the
-> external doc records that pass-0 closure detection + `closure_slots`
-> staging currently run **unconditionally**, even with `--inject-prepass`
-> off - that is the live suspect. **Re-pin japan before any P-item
-> keep/revert uses it as a gate** (this is exactly the caution the
-> measurement notes below already carried).
+> **The rel-member "1.2 -> 29.8 s regression" is NOT one** (resolved
+> 2026-07-14). 29.3 s of the 29.8 s is the phase's *schedule header
+> walk*, not the scan - see P4. The old profile's phases summed to
+> 319 s against a 359.7 s wall, so ~40 s was simply unattributed back
+> then; the walk was always there. The actual rel-member scan is still
+> ~0.5-1 s, consistent with the `66cfa4a` shared-IdSet migration.
+> Instrumentation coverage improved, the command did not regress.
+
+Pass-0 anatomy is now exact: 26.6 s schedule walk + 25.5 s serial
+union = 52.1 s of the 52.2 s phase. **The worker scan is fully hidden
+behind the serial union** - there is essentially nothing else in the
+phase. P2 attacks the 25.5 s, P4 attacks the 26.6 s, and together they
+are the whole phase.
+
+> **japan sparse +30 % flag - RESOLVED 2026-07-14. Two causes: ~3.1 s of
+> cold-walk artifact, plus a real ~0.9 s pass-0 regression.** The
+> `--commit c6f08ff` pair settles it (`26203e64` HEAD 12.3 s vs
+> `33e0bb07` c6f08ff 11.4 s, both `--bench 3`, run 14 min apart).
+>
+> **Cause 1, the artifact (~3.1 s of the 3.6 s):** the flagged 15.5 s
+> (`a3c46737`) was a `--bench 1` whose single iteration walked japan's
+> headers cold. Today's HEAD `--bench 3` reproduces it exactly in
+> iteration 0 and then escapes it:
+>
+> | HEAD `26203e64` | wall | pass 0 | schedule walks (collapsed) |
+> |---|---:|---:|---|
+> | run 0 | **15393 ms** | 5238 ms | x3, min 22.6 ms, **max 3087.4 ms** |
+> | run 1 | 12231 ms | 2365 ms | x3, min 25.7 ms, max 54.4 ms |
+>
+> Run 0 is the 15.5 s. One cold walk (3087 ms) against two warm ones
+> (22.6 / 54.4 ms) - japan's 2.4 GB file stays cached once touched, so
+> only the *first* walk of a session pays. `a3c46737` ran seconds after
+> the europe sparse hotpath evicted japan's headers, with no warm
+> iteration to win best-of-N. Same artifact as the getparents planet
+> "+16.8 % regression" closed the same day (reference/performance.md).
+>
+> **Cause 2, a real regression (~0.9 s):** comparing warm-walk iterations
+> only, HEAD run 1 vs `c6f08ff` run 0:
+>
+> | phase | HEAD | `c6f08ff` | delta |
+> |---|---:|---:|---:|
+> | pass 0 | 2365 ms | 1463 ms | **+902 ms** |
+> | pass 1 | 899 ms | 921 ms | -22 ms |
+> | rel-member | 97 ms | 86 ms | +11 ms |
+> | pass 2 | 7380 ms | 7146 ms | +234 ms |
+>
+> **The entire residual is pass 0** - which is exactly where the ungated
+> `referenced.get` lives. Quantified: `altw_pass0_union_ms` 2128 ms over
+> `altw_pass0_refs_total` 322.8 M refs = **6.6 ns/ref at HEAD**, against
+> `c6f08ff`'s ~1400 ms pass-0 union = **~4.3 ns/ref**. The ungated `get`
+> costs **~2.3 ns/ref**, i.e. ~740-900 ms at japan (matching the measured
+> +902 ms) and **~10 s at europe's 4.37 B refs** (invisible there under a
+> ~±18 s drift band, which is why europe looked flat).
+>
+> **The N7 suspect first named here was WRONG and is retracted** (code
+> read): N7 is an *external* item - `closure_slots` staging exists only
+> in `external/stage1.rs` and sparse has no closure staging. The right
+> suspect was the sparse-local `get`, and it is now confirmed by
+> measurement rather than inference.
+>
+> **New japan baseline: 12.3 s `--bench 3` (`26203e64`, `fb743f6`).**
+> Retire 15.5 s (cold-walk single sample) and 11.9 s (pre-prepass).
+> Re-pin japan with a *warm* first walk or the number measures cache
+> state - and prefer `--bench 3`, whose best-of-N escapes the cold walk
+> by construction.
 
 Sparse-vs-external, all at `dcc445e` (2026-07-14) - see P1 for how to
 read this:
 
 | Dataset | pass-1 store | sparse | external | winner |
 |---|---:|---:|---:|---|
-| japan | ~2 GB | **15.5 s** | (not pinned) | sparse |
+| japan | ~2 GB | **12.3 s** (`26203e64`, bench 3) | (not pinned) | sparse |
 | germany | 3.32 GB | 25.7 s | 25.2 s | tie (external +2 %) |
 | north-america | 18.75 GB | **116.4 s** | 158.3 s | **sparse -26 %** |
 | europe | 28.94 GB | 363.1 s | **285.7 s** | **external -21 %** |
+
+**Read the margins, not the digits.** Two caveats, one of which matters:
+
+- germany and north-america are `--bench 1` on *both* arms - matched, so
+  those rows are fair, though both arms paid a cold first walk.
+- **The europe row is NOT matched: sparse 363.1 s is `--bench 1`
+  (`4ac11326`) while external 285.7 s is `--bench 3` (`cdfa9453`).**
+  Sparse got one cold-walk sample; external got best-of-3. Sparse's four
+  walks cost ~107 s at europe (P4), so a `--bench 3` sparse cell would
+  land nearer ~337 s. External still wins, but by ~15 % rather than the
+  21 % the table shows. **Do not quote the europe margin without
+  re-running sparse at `--bench 3`.**
+
+The ordering (sparse wins to north-america, external wins at europe) is
+robust to both caveats - the crossover conclusion in P1 stands. The
+margins are not.
 
 ## Findings
 
@@ -201,7 +271,16 @@ downstream geometry consumers, byte-parity with the external backend:
   `altw_member_ways`).
 
 Cost when the flag is off: closure-ref trimming in pass 0 (cheap);
-the shared-detection `get` is gated. No pass-1/2 cost.
+no pass-1/2 cost. **The shared-detection `get` is NOT gated** - the
+previous edition claimed it was, and that was wrong (code read
+2026-07-14). `collect_way_referenced_node_ids` runs
+`if referenced.get(node_id) { .. } else { referenced.set(node_id) }` on
+every ref whether or not `--inject-prepass` is set; only the
+`shared.set` inside the taken branch is gated behind
+`if let Some(shared)`. The plain path therefore pays a `get` per ref on
+the *serial main-thread* union that it did not pay pre-prepass, where
+the loop was a bare `set`. See the japan +30 % flag above; the fix is to
+split the loop on `shared` rather than branch inside it.
 
 ## Instrumentation added 2026-07-13 (lands in every subsequent sidecar)
 
@@ -296,6 +375,42 @@ Caveats to respect when implementing:
 Also fixed alongside this item: the sparse-selection hint text no
 longer claims external wins at every scale (corrected 2026-07-13).
 
+### P0. Gate the pass-0 shared-detection `get` (MEASURED, small, free - do this first)
+
+`collect_way_referenced_node_ids` (`altw/mod.rs`) runs
+`referenced.get(node_id)` on **every ref regardless of
+`--inject-prepass`**; only the `shared.set` inside the taken branch is
+gated behind `if let Some(shared)`. Pre-prepass the loop was a bare
+`set`. The prepass landings (`58743ba` / `29e4eab`) therefore added a
+`get` per ref to the *serial main-thread* union for every plain-path
+user.
+
+Measured 2026-07-14 (japan, warm-walk iterations, HEAD vs `c6f08ff`):
+pass 0 **2365 ms vs 1463 ms = +902 ms**, with the whole residual in
+pass 0 and none in passes 1/2. Union cost **6.6 ns/ref at HEAD vs
+~4.3 ns/ref at `c6f08ff`** = **~2.3 ns/ref** for the ungated `get`.
+Extrapolates to **~10 s at europe** (4.37 B refs) - real, but inside
+europe's drift band, which is why only japan surfaced it.
+
+Fix: split the loop on `shared` instead of branching inside it, so the
+plain path restores the bare-`set` shape:
+
+```rust
+match &mut shared {
+    Some(shared) => for &id in &refs_vec {
+        if referenced.get(id) { shared.set(id) } else { referenced.set(id) }
+    },
+    None => for &id in &refs_vec { referenced.set(id) },
+}
+```
+
+Expected: -0.9 s japan (~7 % of a 12.3 s wall), ~-10 s europe (~3 %).
+Keep/revert against `26203e64` (japan 12.3 s) and `4ac11326` (europe
+363.1 s). P2 supersedes this loop entirely, so if P2 lands first, fold
+the gate into it rather than doing both. The external twin is N7 in
+`notes/altw-external.md` - same bug, same landing, different backend;
+fix them together.
+
 ### P2. Pass-0 parallel union via `set_atomic_if_new`
 
 Replace the serial main-thread union with worker-side atomic bit
@@ -332,14 +447,102 @@ reproduces external's readahead-loss regression, record and close.
 Aimed directly at the 197 s dominant phase - highest
 information-per-engineering-minute item on this list.
 
-### P4. Shared blob-metadata plan (Reviewer 4's item, upgraded to enabler)
+### P4. Shared blob-metadata plan - MEASURED 2026-07-14, now the TOP sparse lever
 
-One header walk (or, later, one cat-TOC pread - external doc N2)
-feeding: auto selection (node counts for P1's real selector), pass 0
-(max-id bound for P2), pass 1 schedule, rel-member scan, and pass 2
-descriptors. Today these are four separate walks/schedule builds.
-Converges with external N2; whichever lands first should carry the
-other's requirements.
+**Promoted from "enabler" to first item.** It was ranked fourth on the
+assumption that the redundant walks were a rounding error. They are
+30 % of europe sparse wall.
+
+Sparse builds its blob schedule **four separate times**, and at
+europe/north-america scale each build is a cold serial header walk over
+every blob in the file. From `4ac11326` (europe, `dcc445e`) durations
+plus the phase table:
+
+| Phase | schedule walk | avg cores | header bytes read |
+|---|---:|---:|---:|
+| pass 0 (`build_classify_schedule(Way)`) | 26.6 s | 0.1 | 2.59 GB |
+| pass 1 (`build_classify_schedule(Node)`) | 25.0 s | 0.1 | 2.39 GB |
+| rel-member (`build_classify_schedule(Relation)`) | 29.3 s | 0.1 | 2.63 GB |
+| pass 2 (`passthrough.rs::build_schedule`) | 26.5 s | 0.1 | 2.56 GB |
+| **total** | **107.4 s of a 363.1 s wall = 29.6 %** | | |
+
+Each walk is ~522,168 QD=1 header preads at ~50 us/blob and ~374 K
+voluntary context switches, single-threaded. That rate independently
+matches `notes/getparents.md` (~45 us/blob) and
+`reference/blob-density.md`. The headers do not survive in page cache
+between phases because pass 1 writes a 29 GB store and pass 2 reads
+251 GB, evicting everything in between. External does not have this
+problem - it does ONE `EXTJOIN_META_SCAN` (7.4 s at planet).
+
+**Half the fix already exists and sparse just never adopted it.**
+`scan::classify::build_classify_schedules_split` does one walk and
+returns all three per-kind schedules. Its own docstring describes this
+exact bug:
+
+> "At planet / Europe scale the header walk is itself ~15 s; callers
+> that need all three kinds (currently `check_refs`) would otherwise pay
+> that cost three times."
+
+Sparse needs all three kinds (Way pass 0, Node pass 1, Relation
+rel-member) and calls the single-kind builder three times. Swapping
+those three calls for one `build_classify_schedules_split` at command
+entry is a small, mechanical change:
+
+- europe: 26.6 + 25.0 + 29.3 = 80.9 s becomes ~26.6 s. **Saves ~54 s,
+  ~15 % of wall.**
+- north-america: 21.6 + 0.2 + 18.1 = 39.9 s becomes ~21.6 s. **Saves
+  ~18 s, ~15.6 % of wall.** (Note na's pass-1 walk was only 183 ms - its
+  headers survived from pass 0 - while rel-member's was cold again at
+  18.1 s. The eviction pattern varies by scale; the redundancy does not.)
+- Semantics already match: the split builder includes indexdata-less
+  blobs in all three schedules, exactly as `build_classify_schedule(..,
+  Some(kind))` does. Memory is trivial (~12.5 MB of entries at europe).
+- The rel schedule is built unconditionally even when the rel-member
+  scan does not fire; that is ~1,029 entries at europe. Ignore it.
+
+**Pass 2's walk is the remaining half and needs real work.**
+`passthrough.rs::build_schedule` builds `BlobDescriptor`s carrying
+`frame_offset`, `frame_size`, `kind` and `count`, plus it reads the
+OSMHeader blob body to construct the output header. `ScheduleEntry` is
+only `(seq, data_offset, data_size)`, so the existing split builder
+cannot serve pass 2 as-is. Extending the shared walk to carry the
+frame/kind/count columns pulls pass 2 in too and takes the total to
+~81 s saved (~22 %); a cat TOC (external N2) collapses the surviving
+walk to a single pread and takes it to ~107 s (~30 %).
+
+Precedents worth copying rather than re-deriving: `extract/smart.rs`
+reuses its PASS1 schedule and documents "~16 % wall on Europe" for
+exactly this move; the geocode builder consolidated its walker for the
+same reason (`geocode_index/builder/pass1_5.rs`).
+
+`reference/blob-density.md` already classifies the commands that call
+`build_classify_schedules_split` (check-refs, check-ids, cat --clean,
+repack, degrade, extract --smart) as "shape 3": one single-threaded
+serial schedule walk that regresses on blob count. **Sparse ALTW is a
+shape-3 command that never joined the family and pays the walk four
+times instead of once** - it belongs in that table, and adopting the
+split builder is what moves it there.
+
+**Second argument for P4, independent of the wall win: the walk is the
+single most cache-sensitive thing sparse does, and it is why sparse's
+small-scale benches are untrustworthy.** A cold walk costs ~50-88 us per
+blob; a warm one is ~free. Measured swings on identical code: japan pass
+0 walk 3116 ms cold vs 29 ms warm two phases later (45x+); getparents
+planet 4457 ms / 405 MB cold vs 97 ms / **0 kB** warm
+(reference/performance.md). Both of the 2026-07-14 "regressions" were
+this artifact wearing a code-regression costume. Four walks means four
+independent chances to be measured cold; one walk means one, and a cat
+TOC (external N2) means none. **Every walk deleted is a benchmark made
+reproducible**, which at japan/germany scale matters more than the
+seconds do.
+
+Suggested split: land the `build_classify_schedules_split` swap first
+(small, ~15 %, primitive already exists and is already exercised by
+check-refs / check-ids / repack / degrade / cat), then decide whether
+the pass-2 descriptor merge rides here or waits for external N2. This
+still feeds P1's real selector (node counts) and P2's max-id bound, so
+it remains their enabler - it is simply worth doing on its own merits
+first.
 
 ### P5. Pass-1 per-blob buffered pwrite (demoted; gated on a counter)
 

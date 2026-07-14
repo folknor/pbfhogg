@@ -502,13 +502,26 @@ fn collect_way_referenced_node_ids(
         |_seq, refs_vec| {
             let t_union = std::time::Instant::now();
             union_refs_total += refs_vec.len() as u64;
-            for &node_id in &refs_vec {
-                if referenced.get(node_id) {
-                    if let Some(shared) = &mut shared {
-                        shared.set(node_id);
+            // Split on `shared` rather than branching per ref: the plain
+            // path must not pay the shared-detection `get`, which only
+            // exists to feed prepass injection. Branching inside the loop
+            // cost ~2.3 ns/ref on every ref regardless of the flag
+            // (union 6.6 ns/ref vs 4.3), since `get` is a real probe of a
+            // multi-GB set and the branch predictor cannot elide it.
+            match &mut shared {
+                Some(shared) => {
+                    for &node_id in &refs_vec {
+                        if referenced.get(node_id) {
+                            shared.set(node_id);
+                        } else {
+                            referenced.set(node_id);
+                        }
                     }
-                } else {
-                    referenced.set(node_id);
+                }
+                None => {
+                    for &node_id in &refs_vec {
+                        referenced.set(node_id);
+                    }
                 }
             }
             #[allow(clippy::cast_possible_truncation)]

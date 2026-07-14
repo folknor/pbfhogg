@@ -375,7 +375,7 @@ Caveats to respect when implementing:
 Also fixed alongside this item: the sparse-selection hint text no
 longer claims external wins at every scale (corrected 2026-07-13).
 
-### P0. Gate the pass-0 shared-detection `get` (MEASURED, small, free - do this first)
+### P0. Gate the pass-0 shared-detection `get` (LANDED 2026-07-14, measurement pending)
 
 `collect_way_referenced_node_ids` (`altw/mod.rs`) runs
 `referenced.get(node_id)` on **every ref regardless of
@@ -410,6 +410,13 @@ Keep/revert against `26203e64` (japan 12.3 s) and `4ac11326` (europe
 the gate into it rather than doing both. The external twin is N7 in
 `notes/altw-external.md` - same bug, same landing, different backend;
 fix them together.
+
+**LANDED 2026-07-14** with the loop split exactly as sketched above, and
+N7 in the same commit - the prepass landings added an ungated plain-path
+cost to *both* backends, which is one pattern rather than two
+coincidences. `brokkr check` passes; `verify add-locations-to-ways
+--dataset denmark` passes on both `--mode sparse` and `--mode external`.
+Walls not yet measured; the keep/revert comparands above stand.
 
 ### P2. Pass-0 parallel union via `set_atomic_if_new`
 

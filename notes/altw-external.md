@@ -458,7 +458,7 @@ cache-hit evidence first; implement as a scratch-only I/O backend, not
 coupled to the input `--direct-io` flag. N3 and N5 may shrink the
 problem enough that this dies quietly - check again after they land.
 
-### N7. Gate the closure/pins work on `--inject-prepass` (small, free)
+### N7. Gate the closure/pins work on `--inject-prepass` (LANDED 2026-07-14)
 
 **Scope: EXTERNAL ONLY.** `closure_slots` staging lives solely in
 `external/stage1.rs`; the sparse backend has no closure staging. Do not
@@ -480,6 +480,22 @@ Worth doing as a pair with the sparse fix: the prepass landings
 (`58743ba` / `29e4eab`) added an ungated cost to the plain path of
 **both** backends, which is a pattern, not two coincidences. Whatever
 review missed it once missed it twice.
+
+**LANDED 2026-07-14**, paired with sparse P0 as advised. `inject_prepass`
+is threaded into pass A for real; `closure_slots` stays empty on the
+plain path and the emission loop short-circuits on the flag before
+indexing it. **The safety argument, verified rather than assumed:** the
+plain path previously set `CLOSURE_FLAG` in every `IdRecord` and now
+never sets it, so it only stays correct because the sole read of that bit
+(the stage-2 pin run-scan) is inside `if inject_prepass`; every other
+site masks the bit off through `LOCAL_ID_MASK` unconditionally and cannot
+observe the difference. If a future change reads `CLOSURE_FLAG` outside
+that gate, this optimization breaks silently - the flag-OFF path would
+see a bit that is no longer written. `verify add-locations-to-ways
+--dataset denmark --mode external` passes, as do the tier-1 prepass tests
+(`inject_prepass_external_emits_feature_flags`,
+`backend_parity_inject_prepass`, `inject_prepass_oracle_roundtrip`),
+which cover the flag-ON path.
 
 ---
 

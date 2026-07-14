@@ -118,7 +118,7 @@ pub(super) fn stage1_pass_a(
     layout: &BucketLayout,
     ref_count_sidecar: &Path,
     per_way_refcount_sidecar: &Path,
-    _inject_prepass: bool,
+    inject_prepass: bool,
 ) -> Result<(u64, Vec<u64>)> {
     use std::os::unix::fs::FileExt as _;
 
@@ -233,11 +233,20 @@ pub(super) fn stage1_pass_a(
                                 &mut refs_buf,
                                 &mut group_starts,
                                 |_way_id, refs| {
-                                    let closed = refs.len() >= 4 && refs.first() == refs.last();
                                     blob_node_ids.extend_from_slice(refs);
-                                    closure_slots.extend(
-                                        (0..refs.len()).map(|i| closed && i + 1 == refs.len()),
-                                    );
+                                    // Closure flags exist only to feed the
+                                    // stage-2 pin logic, which is gated on
+                                    // the flag. Staging them unconditionally
+                                    // cost 12.4 B pushes per planet run on
+                                    // the plain path; `closure_slots` stays
+                                    // empty when the flag is off and the
+                                    // emission loop below must not index it.
+                                    if inject_prepass {
+                                        let closed = refs.len() >= 4 && refs.first() == refs.last();
+                                        closure_slots.extend(
+                                            (0..refs.len()).map(|i| closed && i + 1 == refs.len()),
+                                        );
+                                    }
                                     #[allow(clippy::cast_possible_truncation)]
                                     per_way_rcs.push(refs.len() as u32);
                                 },
@@ -287,7 +296,7 @@ pub(super) fn stage1_pass_a(
                                 if let Some((bucket_idx, local_node_id)) = location {
                                     let rec = IdRecord {
                                         local_node_id: local_node_id
-                                            | if closure_slots[i] {
+                                            | if inject_prepass && closure_slots[i] {
                                                 super::CLOSURE_FLAG
                                             } else {
                                                 0

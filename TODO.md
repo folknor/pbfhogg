@@ -34,8 +34,12 @@ notes carry a CLOSED/STATUS header pointing back here.
   alternating `--bench 1` cells, compare medians, weigh sign consistency
   above the gap.
 
-- **ALTW sparse P0: gate the pass-0 shared-detection `get`** (small,
-  free, MEASURED 2026-07-14). `collect_way_referenced_node_ids` runs
+- **ALTW sparse P0: gate the pass-0 shared-detection `get`** - **CODE
+  LANDED 2026-07-14 (sparse P0 + external N7 together); walls not yet
+  measured.** `brokkr check` + denmark verify pass on both backends. The
+  keep/revert comparands stand: japan 12.3 s (`26203e64`, expect
+  -0.9 s) and europe 363.1 s (`4ac11326`, expect ~-10 s). Original
+  diagnosis, unchanged: `collect_way_referenced_node_ids` runs
   `referenced.get(node_id)` on every ref regardless of
   `--inject-prepass`; only the `shared.set` inside is gated. Costs
   **~2.3 ns/ref** on the serial main-thread union: japan pass 0 2365 ms

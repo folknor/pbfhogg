@@ -29,6 +29,12 @@ Code:
 
 ## Phases
 
+Each phase builds its own blob schedule via its own header walk. That
+looks like an obvious 4x redundancy and it is not worth fixing: the
+redundant walks are nearly free whenever the headers are still cached,
+and they are only expensive at scales where sparse is the wrong backend
+anyway. Built and reverted twice; see P4 before touching it.
+
 1. **Pass 0** (`collect_way_referenced_node_ids`) -
    `parallel_scan_blobs_raw` wire-only way scan; workers emit per-blob
    `Vec<i64>` of refs, the **main thread serially unions** them into
@@ -56,10 +62,10 @@ Code:
 | Scale | Wall | UUID | Commit | Date | Note |
 |---|---:|---|---|---|---|
 | denmark | 4.0 s | `7bd88e83` | `6d6e158` | 2026-07-10 | default sparse |
-| japan | **12.3 s** | `26203e64` | `fb743f6` | 2026-07-14 | current, `--bench 3`. Retires 15.5 s (`a3c46737`, cold-walk single sample) and 11.9 s (pre-prepass). ~0.9 s of the gap to 11.9 s is real - see P0 |
+| japan | **11.3 s** | `13347065` | `add8d03` | 2026-07-14 | current, `--bench 3`. P0 recovered the ~0.9 s prepass regression; at/below the 11.4 s pre-prepass mark. Retires 12.3 s (`26203e64`), 15.5 s (`a3c46737`, cold-walk single sample) and 11.9 s |
 | germany | **25.7 s** | `61f6c231` | `dcc445e` | 2026-07-14 | first sparse pin at this scale (P1 cell) |
 | north-america | **116.4 s** | `340ba366` | `dcc445e` | 2026-07-14 | first sparse pin at this scale (P1 cell) |
-| europe | **363.1 s** | `4ac11326` | `dcc445e` | 2026-07-14 | current; flat vs 359.7 s @ `c6f08ff` (+0.9 %) |
+| europe | **363.1 s** | `4ac11326` | `dcc445e` | 2026-07-14 | current; flat vs 359.7 s @ `c6f08ff` (+0.9 %). Post-P0 `89683dda` (`add8d03`) measured 369.8 s - NOT a regression and NOT a new baseline: single `--bench 1` cells 6 h apart, +1.8 % is inside the drift band, and P0 cut europe's pass-0 union -8.3 s on identical refs. Interleave before quoting any europe sparse wall delta |
 | planet | untried | - | - | - | ~60 GB working set vs ~25 GB cache; expected thrash. External owns planet. |
 
 Europe hotpath at `dcc445e`: `c790eb34` (310.5 s) - the first sparse
@@ -85,6 +91,12 @@ union = 52.1 s of the 52.2 s phase. **The worker scan is fully hidden
 behind the serial union** - there is essentially nothing else in the
 phase. P2 attacks the 25.5 s, P4 attacks the 26.6 s, and together they
 are the whole phase.
+
+> The 26.6 s walk is not P4's to reclaim - that was measured and reverted
+> twice (see P4). Read this split as the anatomy of one `dcc445e` profile,
+> not as a stable property: the walk term is 26.6 s only when that walk
+> ran cold, and it cannot be summed with the other phases' walk durations.
+> P2 attacking the 25.5 s union is the live half of this paragraph.
 
 > **japan sparse +30 % flag - RESOLVED 2026-07-14. Two causes: ~3.1 s of
 > cold-walk artifact, plus a real ~0.9 s pass-0 regression.** The
@@ -375,7 +387,7 @@ Caveats to respect when implementing:
 Also fixed alongside this item: the sparse-selection hint text no
 longer claims external wins at every scale (corrected 2026-07-13).
 
-### P0. Gate the pass-0 shared-detection `get` (LANDED 2026-07-14, measurement pending)
+### P0. Gate the pass-0 shared-detection `get` (LANDED + MEASURED 2026-07-14, KEEP - CLOSED)
 
 `collect_way_referenced_node_ids` (`altw/mod.rs`) runs
 `referenced.get(node_id)` on **every ref regardless of
@@ -411,12 +423,41 @@ the gate into it rather than doing both. The external twin is N7 in
 `notes/altw-external.md` - same bug, same landing, different backend;
 fix them together.
 
-**LANDED 2026-07-14** with the loop split exactly as sketched above, and
-N7 in the same commit - the prepass landings added an ungated plain-path
-cost to *both* backends, which is one pattern rather than two
-coincidences. `brokkr check` passes; `verify add-locations-to-ways
---dataset denmark` passes on both `--mode sparse` and `--mode external`.
-Walls not yet measured; the keep/revert comparands above stand.
+**LANDED + MEASURED 2026-07-14 (`add8d03`), KEEP.** The loop split went
+in exactly as sketched above, with N7 in the same commit - the prepass
+landings added an ungated plain-path cost to *both* backends, one pattern
+rather than two coincidences. `verify add-locations-to-ways --dataset
+denmark` passes on both `--mode sparse` and `--mode external`.
+
+**`altw_pass0_union_ms` is the load-bearing readout, not the wall.** Both
+cells union over a byte-identical ref count, so the counter is immune to
+the drive drift that makes europe walls unreadable at this effect size:
+
+| cell | refs | union before | union after | delta |
+|---|---|---|---|---|
+| japan (`26203e64` -> `13347065`) | 322,807,555 | 2128 ms | 1235 ms | **-893 ms** |
+| europe (`4ac11326` -> `89683dda`) | 4,372,934,465 | 25522 ms | 17176 ms | **-8.3 s** |
+
+Japan `--bench 3`, medians 2134 -> 1389 ms, distributions non-overlapping
+(new 1235/1389/1539 vs old 2128/2134/2318). Union **6.61 -> 4.30 ns/ref
+at the median**, and 4.30 matches `c6f08ff`'s pre-prepass 4.3 almost
+exactly: the gate *restores* the pre-prepass union shape rather than
+merely improving it. Japan wall 12.3 s -> **11.3 s** (-1.0 s, predicted
+-0.9 s), at/below `c6f08ff`'s 11.4 s, with no cold-walk outlier in any
+iteration.
+
+**Europe's wall is NOT evidence here and no wall claim is made.** The
+cell measured 369.8 s against the 363.1 s comparand - **+1.8 %, opposite
+sign to the -8.3 s the counter proves**. Both are single `--bench 1`
+cells ~6 h apart, and a ~2.8 % expected win is inside this host's 5-8 %
+drift band. Six interleaved cells could settle it; not worth ~40 min and
+the drive wear to confirm a mechanism the drift-immune counter already
+establishes on a strictly-less-work change. If someone later wants the
+europe wall number, interleave it - do not quote 369.8 s as a regression.
+
+Note `c6f08ff` predates the `altw_pass0_union_ms` counter and emits no
+`pass0` counters at all, so its "4.3 ns/ref" was inferred from the phase
+wall, not measured. The 6.6 ns/ref figure is directly confirmed.
 
 ### P2. Pass-0 parallel union via `set_atomic_if_new`
 
@@ -454,14 +495,29 @@ reproduces external's readahead-loss regression, record and close.
 Aimed directly at the 197 s dominant phase - highest
 information-per-engineering-minute item on this list.
 
-### P4. Shared blob-metadata plan - MEASURED 2026-07-14, now the TOP sparse lever
+### P4. Unify the redundant header walks - CLOSED 2026-07-14, BUILT AND REVERTED. DO NOT RE-ATTEMPT.
 
-**Promoted from "enabler" to first item.** It was ranked fourth on the
-assumption that the redundant walks were a rounding error. They are
-30 % of europe sparse wall.
+> **This is the second failure of this idea in six months. It buys
+> nothing. Read this section before proposing it a third time - the
+> arithmetic below is what the wall numbers hide, and the item is
+> seductive precisely because the naive accounting says +30 %.**
+>
+> Both attempts were built, measured, and reverted. The 2026-07-14 attempt
+> reached a full single-walk implementation, passed every correctness gate,
+> and *still* bought nothing. Passing tests and a plausible mechanism are
+> not the bar; the bar is a wall delta that survives the baseline's own
+> variance, and this one does not.
+>
+> The verdict in one line: **the saving equals the baseline's cold-walk
+> penalty and nothing more, and at the scales where sparse is the right
+> backend the baseline usually pays no such penalty.**
+
+The original write-up follows, preserved because its numbers are real and
+its conclusion is wrong; the "Why it buys nothing" section after it is the
+disposition.
 
 Sparse builds its blob schedule **four separate times**, and at
-europe/north-america scale each build is a cold serial header walk over
+europe/north-america scale each build is a serial header walk over
 every blob in the file. From `4ac11326` (europe, `dcc445e`) durations
 plus the phase table:
 
@@ -550,6 +606,107 @@ the pass-2 descriptor merge rides here or waits for external N2. This
 still feeds P1's real selector (node counts) and P2's max-id bound, so
 it remains their enabler - it is simply worth doing on its own merits
 first.
+
+#### Why it buys nothing (2026-07-14, built and reverted)
+
+Everything above this line is the case for the item. It does not survive
+contact with a matched baseline. Two arrangements were built on top of
+`add8d03` and measured at north-america against same-day `--commit
+add8d03` cells:
+
+- **Consolidate passes 0/1/rel only** (the "suggested split" above, using
+  the existing `build_classify_schedules_split`): 120.4 s, 133.7 s.
+- **One walk serving all four phases** (new `build_blob_table` ->
+  `BlobTable` carrying frame/data offsets + kind + count + the OSMHeader
+  body location; pass 2 projects `BlobDescriptor`s off it instead of
+  walking): 105.2 s, 101.3 s.
+
+Both were correct - `verify add-locations-to-ways --mode sparse`, `verify
+check-refs` and `verify cat` all passed, `brokkr check` clean. Both were
+reverted.
+
+**Subtract pass 2 - the phase neither arrangement changes the work of -
+and the effect disappears.** "rest" is walk + pass 0 + pass 1 + rel, i.e.
+exactly what this item touches:
+
+| run | wall | pass 2 | **rest** |
+|---|---:|---:|---:|
+| baseline, morning (`340ba366`) | 115.1 s | 49.8 s | **65.3 s** |
+| baseline, afternoon (`cd213ac5`) | 114.5 s | 66.4 s | **48.1 s** |
+| one-walk, run 1 | 103.5 s | 55.1 s | **48.4 s** |
+| one-walk, run 2 | 99.8 s | 55.5 s | **44.3 s** |
+
+**The afternoon baseline's rest is 48.1 s. The one-walk build's rest is
+48.4 s. That is a tie** - and the afternoon baseline is the one whose
+walks came back warm (24.9 s of classify walk: 22.07 + 0.18 + 2.65).
+The two baselines differ from *each other* by 17.2 s, which is larger than
+the effect being claimed, and pass-2 work swings 48.8 -> 66.4 s across
+runs of code nobody touched. **The -11 % that this section originally
+reported was that variance, read in the favourable direction.**
+
+**The structural reason, which is the part that generalises.** The saving
+is exactly equal to the baseline's cold-walk penalty and nothing more. A
+walk is only expensive if something evicted the headers since the last
+one; pass 1's store write is the only thing in sparse that does. So:
+
+- **Where the store fits page cache, the baseline's extra walks are
+  already free and unifying them recovers zero.** north-america's store is
+  18.75 GB against a ~25 GB budget (75 %) - it usually does not evict, and
+  the afternoon baseline's warm 0.18 s / 2.65 s walks are what that looks
+  like. The morning baseline's cold 18.1 s rel-member walk is the coin
+  landing the other way; the win at this scale is a coin flip between 0 s
+  and ~18 s, and it is not separable from pass-2 noise of the same size.
+- **Where the walks reliably cost, sparse is the wrong backend.** Europe's
+  28.94 GB store guarantees eviction, so the europe baseline really does
+  pay ~2-3 cold walks and unifying really does save ~50 s there. But that
+  is the regime **P1 exists to route to external**. The win lives only in
+  the configuration P1 removes.
+
+That is the whole disposition: **P4 pays off only where P1 says do not be
+here.** No arrangement of the walks changes that, which is why this has now
+failed twice.
+
+**The half-measure is worse than doing nothing** (+3.8 %), and that part is
+solid: it saved 20.7 s across the three consolidated phases and lost 24.1 s
+in pass 2, because it deleted pass 2's free ride and forced it to walk cold
+on the far side of pass 1's eviction. **Pass 2's walk measured 23.0 s cold**
+via the new `ALTW_PASS2_SCHEDULE_WALK` marker, against ~1 s when the
+relation-member scan walked just before it. If anyone proposes the
+`build_classify_schedules_split` swap again, this is the answer.
+
+**The 107.4 s / 29.6 % figure in the table above is an overcount and is the
+main reason this item keeps coming back.** It sums four durations that are
+not four independent costs. Two baseline runs of byte-identical code prove
+it by disagreeing about *where* the cost landed while agreeing on the
+total: morning had classify walks 39.8 s (rel-member cold 18.1 s) and pass
+2 at 49.8 s; afternoon had classify walks 24.9 s (rel-member warm 2.6 s)
+and pass 2 at 66.4 s - phase totals 113.7 s vs 113.1 s. Whichever phase
+walks first after the eviction pays; the next rides free.
+
+**Rules that outlive this item:**
+- **Never sum per-phase walk durations.** The sum is an upper bound that is
+  only reached if every walk is cold. This applies to every shape-3 command
+  in `reference/blob-density.md`, not just sparse.
+- **Never read a wall delta on sparse north-america/europe without
+  subtracting pass 2.** Pass-2 work varies ~±15 % run to run and is over
+  half the wall; it will manufacture any result you want at this effect
+  size.
+- **A walk below pass 1 costs a full cold walk** (23.0 s at
+  north-america) however cheap the walks above it look. Pinned at
+  `passthrough.rs::build_schedule`.
+
+**What was kept:** only the `ALTW_PASS2_SCHEDULE_WALK` marker pair. Pass
+2's walk was invisible before it, and this argument cannot be had without
+it. Everything else was reverted to `add8d03`.
+
+**Not evidence, recorded to stop it being re-litigated:** the europe cells
+run during this work (baseline 372.5 s `7b84e6c0` / 351.7 s `18237ed9`, one
+one-walk cell at 321.6 s, three OOM kills across both arms) are
+RAM-confounded - the host gained 2.75 GB mid-suite when an unrelated
+process exited, and europe sparse straddles the page-cache budget. The OOMs
+hit **both** arms (baseline 2 of 3 succeeded, one-walk 1 of 3) and are a
+property of europe sparse at 116 % of budget, **not** of this change - they
+are P1's argument, and they say nothing about the walks either way.
 
 ### P5. Pass-1 per-blob buffered pwrite (demoted; gated on a counter)
 
@@ -679,6 +836,18 @@ hard parse error with a migration hint.
 
 ## Don't re-attempt
 
+- **Unifying the four header walks (any arrangement). Built and reverted
+  TWICE - 2026-01-ish and 2026-07-14.** It buys nothing, and the naive
+  accounting says +30 %, which is why it keeps coming back. The saving
+  equals the baseline's cold-walk penalty and no more: where the store fits
+  page cache the redundant walks are already free (north-america rest 48.1 s
+  baseline vs 48.4 s unified - a tie), and where they reliably cost, sparse
+  is the wrong backend and P1 routes away. **The partial version
+  (`build_classify_schedules_split` for passes 0/1/rel, leaving pass 2 to
+  walk) is strictly worse than doing nothing** (+3.8 %): it deletes pass 2's
+  free ride and forces a 23.0 s cold walk. Full arithmetic, both
+  arrangements, and the baseline-variance trap in P4. Do not re-open on the
+  strength of the 107.4 s figure - that figure is the overcount.
 - **Output-compression knob sweeps.** Settled; japan sweep above,
   europe axis in `reference/performance.md`, zstd:1 guidance shipped.
   The external doc's single-planet-cell reopen condition was **spent

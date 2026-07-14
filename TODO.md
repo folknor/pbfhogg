@@ -34,20 +34,25 @@ notes carry a CLOSED/STATUS header pointing back here.
   alternating `--bench 1` cells, compare medians, weigh sign consistency
   above the gap.
 
-- **ALTW sparse P0: gate the pass-0 shared-detection `get`** - **CODE
-  LANDED 2026-07-14 (sparse P0 + external N7 together); walls not yet
-  measured.** `brokkr check` + denmark verify pass on both backends. The
-  keep/revert comparands stand: japan 12.3 s (`26203e64`, expect
-  -0.9 s) and europe 363.1 s (`4ac11326`, expect ~-10 s). Original
-  diagnosis, unchanged: `collect_way_referenced_node_ids` runs
+- [x] ~~**ALTW sparse P0: gate the pass-0 shared-detection `get`**~~
+  **LANDED + MEASURED 2026-07-14 (`add8d03`), KEEP - sparse P0 and
+  external N7 together.** `collect_way_referenced_node_ids` probed
   `referenced.get(node_id)` on every ref regardless of
-  `--inject-prepass`; only the `shared.set` inside is gated. Costs
-  **~2.3 ns/ref** on the serial main-thread union: japan pass 0 2365 ms
-  (HEAD) vs 1463 ms (`c6f08ff`) = **+902 ms**, union 6.6 ns/ref vs
-  ~4.3 ns/ref. Extrapolates to **~10 s at europe**. Fix is a loop split
-  on `shared` (notes/altw.md P0). External N7 is the same bug in the
-  other backend from the same landing - fix both together. P2 supersedes
-  the loop, so fold this in if P2 lands first.
+  `--inject-prepass`, gating only the `shared.set` inside; the loop now
+  splits on `shared` and restores the pre-prepass bare-`set` shape.
+  Verdict rests on `altw_pass0_union_ms` over byte-identical ref counts,
+  not walls: **japan 2128 -> 1235 ms** (322.8 M refs) and **europe
+  25522 -> 17176 ms** (4.37 B refs, **-8.3 s**, predicted ~-10 s). Japan
+  union **6.61 -> 4.30 ns/ref at the median**, which matches `c6f08ff`'s
+  pre-prepass 4.3 - a restoration, not just an improvement. Japan wall
+  **12.3 -> 11.3 s**, at/below the 11.4 s pre-prepass mark; new baseline
+  `13347065`. **Europe's wall measured +1.8 % (369.8 s) - opposite sign
+  to the counter, inside the drift band, and deliberately NOT chased:
+  single cells 6 h apart cannot resolve a 2.8 % effect, and the
+  drift-immune counter already proves the mechanism on a strictly-
+  less-work change.** Do not read 369.8 s as a regression. P2 still
+  supersedes this loop if it ever lands. Detail in notes/altw.md P0 /
+  notes/altw-external.md N7.
 
 - ALTW P1 `auto` routing threshold: **MEASURED 2026-07-14, ready to
   implement.** The germany + north-america sparse/external grid ran; the
@@ -58,22 +63,34 @@ notes carry a CLOSED/STATUS header pointing back here.
   computed from runtime RAM, never a hardcoded byte constant. Needs P4
   (blob-metadata node counts) for the clean selector (notes/altw.md P1).
 
-- **ALTW sparse P4: four redundant header walks = 30 % of europe wall
-  (MEASURED 2026-07-14; now the top sparse item).** Sparse builds its
-  blob schedule four times and each build is a cold serial walk over
-  every header: pass 0 26.6 s + pass 1 25.0 s + rel-member 29.3 s +
-  pass 2 26.5 s = **107.4 s of a 363.1 s europe wall** (`4ac11326`), all
-  at 0.1 avg cores. External does one meta scan and does not have this
-  problem. **Half the fix already exists**: `build_classify_schedules_split`
-  does one walk -> three per-kind schedules, its docstring names this
-  exact bug, and check-refs / check-ids / repack / degrade / cat already
-  use it - sparse just never adopted it. Swapping sparse's three
-  single-kind calls for one split call is mechanical and worth ~54 s at
-  europe / ~18 s at north-america (~15 % either way). Pass 2's walk needs
-  a richer descriptor (frame offsets, kind, count) so it rides on the
-  fuller shared-metadata table or on external N2. Precedents:
-  `extract/smart.rs` (documents ~16 % europe for the same move), geocode
-  builder's consolidated walker. Full write-up in notes/altw.md P4.
+- [x] ~~**ALTW sparse P4: four redundant header walks**~~ **CLOSED
+  2026-07-14: BUILT AND REVERTED, buys nothing. This was the SECOND
+  attempt in six months; do not open a third.** Both arrangements were
+  implemented, passed every correctness gate, and were reverted:
+  consolidating passes 0/1/rel via `build_classify_schedules_split` (the
+  planned "~15 % first increment") measures **+3.8 %, worse than doing
+  nothing**, and a full one-walk `BlobTable` serving all four phases is a
+  **tie**.
+  **The arithmetic, because the wall numbers hide it:** subtract pass 2
+  (whose work neither arrangement touches) and the effect vanishes -
+  baseline rest 48.1 s (`cd213ac5`) vs one-walk rest 48.4 s. The two
+  baselines differ from each other by 17.2 s, more than the claimed effect,
+  and pass-2 work swings 48.8 -> 66.4 s on untouched code.
+  **The structural reason:** the saving equals the baseline's cold-walk
+  penalty and no more. A walk only costs if something evicted the headers
+  since the last one, and only pass 1's store write does. Where the store
+  fits page cache (north-america, 18.75 GB of ~25 GB) the extra walks are
+  already free, so unifying recovers zero; where they reliably cost
+  (europe, 28.94 GB) sparse is the wrong backend and **P1 routes to
+  external**. P4 pays off only where P1 says don't be here.
+  **Rules that outlive it:** never sum per-phase walk durations (the
+  107.4 s / 30 %-of-europe figure that motivated this item is that
+  overcount - two baselines of identical code disagreed on *where* the walk
+  cost landed while agreeing on the total, 113.7 vs 113.1 s); never read a
+  sparse wall delta without subtracting pass 2; a walk below pass 1 costs a
+  full cold walk (23.0 s) however cheap the walks above it look. **Kept:**
+  the `ALTW_PASS2_SCHEDULE_WALK` marker only - pass 2's walk was invisible
+  before it. Full record in notes/altw.md P4 + "Don't re-attempt".
 
 - [x] ~~getparents planet `+16.8 %` regression~~ **CLOSED 2026-07-14:
   header-walk cache state, not code - and HEAD is actually faster.** The
@@ -167,7 +184,7 @@ notes carry a CLOSED/STATUS header pointing back here.
 
 Three new docs capturing a cross-cutting insight and two new commands that fall out of it. All scaffolding-level; details drift as work lands.
 
-- [ ] **[reference/blob-density.md](reference/blob-density.md)** - the insight: Geofabrik-style PBFs (~8k elements/blob, ~522 k blobs on europe) scale very differently from `planet.openstreetmap.org`-style PBFs (~300k elements/blob, ~50 k blobs on planet). The `HeaderWalker`-touching commands split into three shapes (measured 2026-07-10 -> 2026-07-12 via `snapshot.8k`): **shape 1 selective header-walk** (`getid`, `getparents`) regresses on density and is now **RESOLVED** by ADR-0006 blob-count dispatch (150 k threshold); **shape 2 pure parallel-classify** (`tags-filter`) *gains* on density (-14 % at 8k, no action needed); **shape 3 hybrid** (`check --refs`, `check --ids`, `cat --clean`, `repack`, `degrade`, `extract --smart` - all via `build_classify_schedules_split`) carries a single-threaded serial schedule walk that regresses on high blob count (check-refs +185 % / 153.5 s at 8k, 66 % of it the serial walk; UUID `1851f73a`), but with near-zero production bite since production planet is 50 k blobs. `sort` pass 1 stays separately priced (seek-skip mechanism, excluded from ADR-0006). README's "Planet scale" table and `notes/*.md` "N seconds at planet" predictions remain measured on the sparse-blob (50 k) encoding. Shapes 1 and 2 need no further work. **Shape 3's "near-zero production bite" disposition was planet-specific and is now partly overtaken (2026-07-14): europe is 522 k blobs natively, where the serial walk costs ~26 s per call, and ALTW sparse turns out to be a seventh shape-3 command that never adopted `build_classify_schedules_split` - it walks four times for 107.4 s of a 363.1 s europe wall (29.6 %).** That is tracked as sparse P4 (notes/altw.md) and is the highest-value sparse item. The original disposition still holds for the other six callers at planet scale: do NOT chase them unless a high-blob-count *planet* becomes a real workload.
+- [ ] **[reference/blob-density.md](reference/blob-density.md)** - the insight: Geofabrik-style PBFs (~8k elements/blob, ~522 k blobs on europe) scale very differently from `planet.openstreetmap.org`-style PBFs (~300k elements/blob, ~50 k blobs on planet). The `HeaderWalker`-touching commands split into three shapes (measured 2026-07-10 -> 2026-07-12 via `snapshot.8k`): **shape 1 selective header-walk** (`getid`, `getparents`) regresses on density and is now **RESOLVED** by ADR-0006 blob-count dispatch (150 k threshold); **shape 2 pure parallel-classify** (`tags-filter`) *gains* on density (-14 % at 8k, no action needed); **shape 3 hybrid** (`check --refs`, `check --ids`, `cat --clean`, `repack`, `degrade`, `extract --smart` - all via `build_classify_schedules_split`) carries a single-threaded serial schedule walk that regresses on high blob count (check-refs +185 % / 153.5 s at 8k, 66 % of it the serial walk; UUID `1851f73a`), but with near-zero production bite since production planet is 50 k blobs. `sort` pass 1 stays separately priced (seek-skip mechanism, excluded from ADR-0006). README's "Planet scale" table and `notes/*.md` "N seconds at planet" predictions remain measured on the sparse-blob (50 k) encoding. Shapes 1 and 2 need no further work. **Shape 3's "near-zero production bite" disposition still holds, and 2026-07-14 hardened the reasoning behind it.** ALTW sparse looked like a seventh shape-3 command walking four times instead of once, worth ~30 % of europe wall. It was built both ways and reverted (sparse P4): **per-phase walk durations cannot be summed.** A walk is only expensive if the preceding phase evicted the headers, so a command that walks N times does not pay N walks - it pays roughly one per eviction, and consolidating some-but-not-all walks can *lose* time by deleting a later walk's free ride (measured +3.8 %). Any future estimate of a shape-3 walk win needs the eviction pattern, not the duration sum - and the 66 % / 67 % walk fractions in the 8k sweep below are single-run attributions subject to exactly this. Do NOT chase the six callers unless a high-blob-count *planet* becomes a real workload.
 
   - [ ] **Shape-3 serial schedule walk (`build_classify_schedules_split`).** The single-threaded `HeaderWalker` loop in `src/scan/classify.rs` does one QD=1 pread per blob (~70 us/blob), invisible at 50 k blobs (~3.5 s) but a fixed ~97-109 s at 1.45 M blobs. **Full six-caller 8k sweep done 2026-07-12** (table in `reference/blob-density.md` "Full shape-3 sweep"): the walk fraction splits the family, which **narrows the payoff** from the earlier "helps six commands" framing. Read-only callers are ~2/3 walk - `check --refs` 66 % (`1851f73a`), `check --ids` 67 % (dirty) - so flattening it roughly halves their 8k wall (~2.7x -> ~1.3x). Re-encoding callers are only 18-29 % walk - `extract --smart` 29 % (`4b82686f`), `cat --clean` 19 % (`3f4c222c`), `repack` 18 % (`8f275ebf`), `degrade` 18 % (`6f8a3e94`) - their 8k regression is dominated by framing + writing 1.45 M tiny blobs, which the walk fix does not touch. So: **if the primitive is ever built, it is a win for the read-only pair only** (and those two are the same commands whose getid/getparents selective-scan cousins already got ADR-0006 dispatch). The fix is the same io_uring batched-header-walker primitive that sort pass 1, the getparents walk term, and the getid walker arm all want - the four-call-site convergence, per-site payoff, why it cannot be trivially parallelized, and the rejected alternatives are consolidated in [`notes/header-walk-batching.md`](notes/header-walk-batching.md). Still deferred: near-zero production bite (production planet is 50 k blobs).
 

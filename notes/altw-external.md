@@ -481,7 +481,12 @@ Worth doing as a pair with the sparse fix: the prepass landings
 **both** backends, which is a pattern, not two coincidences. Whatever
 review missed it once missed it twice.
 
-**LANDED 2026-07-14**, paired with sparse P0 as advised. `inject_prepass`
+**LANDED 2026-07-14 (`add8d03`)**, paired with sparse P0 as advised.
+Not separately benched: the plain-path win here is removing 12.4 B
+`Vec<bool>` pushes per planet run, and no planet external cell has run
+since. Sparse P0's counter evidence carries the shared diagnosis; if an
+external planet cell runs anyway, `s1a_scan_way_refs_ms` is the term to
+watch. `inject_prepass`
 is threaded into pass A for real; `closure_slots` stays empty on the
 plain path and the emission loop short-circuits on the flag before
 indexing it. **The safety argument, verified rather than assumed:** the

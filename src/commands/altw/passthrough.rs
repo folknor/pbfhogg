@@ -91,6 +91,15 @@ struct Pass2Counters {
 
 /// Walk all blob headers and build the schedule. The first OsmHeader
 /// blob is consumed and used to build the output header bytes.
+///
+/// This is the fourth header walk on the sparse path, and the marker pair
+/// exists because its cost is invisible otherwise and swings enormously:
+/// a walk is ~50 us/blob cold and near free warm, decided entirely by
+/// whether the preceding phase left the headers in page cache. Measured
+/// 2026-07-14 at north-america: ~1 s when the relation-member scan walked
+/// just before it, 23.0 s when it did not. Do not try to remove the
+/// redundant walks on the strength of their durations - see notes/altw.md
+/// P4, where that was measured and does not pay.
 #[hotpath::measure]
 fn build_schedule(
     input: &Path,
@@ -98,6 +107,7 @@ fn build_schedule(
     keep_untagged_nodes: bool,
     inject_prepass: bool,
 ) -> Result<(Vec<BlobDescriptor>, Vec<u8>, std::sync::Arc<std::fs::File>)> {
+    crate::debug::emit_marker("ALTW_PASS2_SCHEDULE_WALK_START");
     let mut walker = HeaderWalker::open(input)?;
     let mut header_bytes: Option<Vec<u8>> = None;
     let mut schedule: Vec<BlobDescriptor> = Vec::new();
@@ -150,6 +160,7 @@ fn build_schedule(
     let header_bytes = header_bytes
         .ok_or_else(|| -> Box<dyn std::error::Error> { "no OSMHeader blob found".into() })?;
     let shared_file = std::sync::Arc::clone(walker.shared_file());
+    crate::debug::emit_marker("ALTW_PASS2_SCHEDULE_WALK_END");
     Ok((schedule, header_bytes, shared_file))
 }
 

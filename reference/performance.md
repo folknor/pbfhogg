@@ -319,23 +319,42 @@ co-pinned. Order of magnitude matches the prior 2026-04-14 finding
 baselines): zstd:1 wins by relieving consumer/compression saturation
 in stage 4, with similar output size.
 
-### Current planet baselines (commit `16e3694`, plantasjen)
+> **This table is Europe-only and does not generalise to planet.** The
+> 2026-07-14 planet cell (`0e9d93cc` vs `ed5dd6c5`, both `dcc445e`)
+> found the planet streaming phase is *not* compression-bound: -80 % of
+> compression CPU bought <=5 % of streaming wall, and the constraint
+> moved to stage-3 -> stage-4 payload readiness instead. The "relieving
+> consumer/compression saturation" mechanism above is real at europe and
+> absent at planet. See the planet compression-ceiling callout below the
+> planet baselines table before quoting -13.9 % at any other scale.
+
+### Current planet baselines (plantasjen)
 
 The consolidated headline table. All rows `--bench 1` unless noted.
+Rows marked `dcc445e` were re-baselined in the 2026-07-14 overnight
+suite; the rest still carry their older commit in the Notes column.
+
+> **Read the April-to-July deltas as environment, not code.** The
+> 2026-07-14 suite proved the host drifted ~+8 % on byte-identical code
+> (`16e3694` ALTW: 546.0 s in April, 589.9 s today - see the ALTW drift
+> verdict below). Every pre-July baseline on this page is therefore ~8 %
+> optimistic relative to today's drive, and a "+11 % regression" against
+> one is not a finding. Commands that came back *faster* despite that
+> headwind (apply-changes, build-geocode-index) are understated wins.
 
 | Command | Mode | Wall | UUID | Notes |
 |---|---|---:|---|---|
-| cat (indexdata generation) | `--bench 1` | **86.5 s** | `5d90623f` | commit `aee7727` |
+| cat (indexdata generation) | `--bench 1` | **87.2 s** | `f2c1e220` | commit `dcc445e`, 2026-07-14; was 86.5 s `5d90623f` (`aee7727`) |
 | cat --type way | `--bench 3` | 45.3 s | `2fe62148` | |
 | cat --type relation | `--bench 1` | 47.7 s | `fba6e13e` | |
 | cat --clean version | `--bench 1` | **333.8 s (5m34s)** | `f2315551` (4fc8e35, 2026-04-27 overnight) | `parallel_classify_phase` + reorder-buffer streaming, 750 MB peak anon |
 | cat --dedupe | `--bench 1` | **7,981 s (133m)** | `1794f8a6` | single-threaded MERGEPBF path - see callout below |
-| check --refs | `--bench 1` | **53.8 s** | `7d9f5dfd` | |
-| check --ids (streaming, default) | `--bench 1` | **56.4 s** | `b1fc4d2e` (4fc8e35, 2026-04-27 overnight) | parallel_classify_phase port, 457 MB peak anon |
+| check --refs | `--bench 1` | **60.2 s** | `f75bedc6` | commit `dcc445e`, 2026-07-14; was 53.8 s `7d9f5dfd`. +11.9 % is inside the ~8 % drift band on a single sample - not a regression |
+| check --ids (streaming, default) | `--bench 1` | **56.6 s** | `55e87d85` | commit `dcc445e`, 2026-07-14; was 56.4 s `b1fc4d2e` (4fc8e35) - flat |
 | check --ids --full | `--bench 1` | **63.2 s** | post-`01c67da` | |
 | getid (include mode) | `--bench 1` | **6.8 s cold / 0.2 s warm** | `264d9dbf` / `12e74756` | dispatch landing `19d3a62`, 2026-07-11; cache-state dominated, see ADR-0006 gates below |
 | getid --invert | `--bench 1` | 91.0 s | `40f5bd52` | |
-| getparents | `--bench 1` | **19.0 s** | `a7c064eb` | dispatch landing `2306fd9`, 2026-07-11; was 23.5 s (`11bc44dc`) |
+| getparents | `--bench 3` | **22.2 s** | `ca49bcdf` | commit `dcc445e`, 2026-07-14; was 19.0 s `a7c064eb` (`2306fd9`). **+16.8 % and the new number is a best-of-3 vs a single sample - the one Q6 regression that survives the drift band.** See flag below |
 | inspect default (index-only) | `--bench 1` | **6.5 s** | `c146f2bb` | |
 | inspect --nodes `-j 16` | `--bench 1` | **49.4 s** | post-`01c67da` | |
 | inspect --tags `-j 16` | `--bench 1` | **168.3 s** | `9d741341` / post-`01c67da` | |
@@ -343,8 +362,8 @@ The consolidated headline table. All rows `--bench 1` unless noted.
 | inspect --tags --type way | `--bench 1` | 82.9 s | `959bda7c` | |
 | inspect --tags --type relation | `--bench 1` | 8.8 s | `8daf5f04` | |
 | inspect --extended | `--bench 1` | **820.7 s (13m41s)** | `19db1512` | full decode + extended counters |
-| sort (already-sorted input) | `--bench 1` | 132.3 s | `b9c10a41` | see Sort regression flag below |
-| sort `--io-uring` | `--bench 1` | 126.8 s | `9ce80125` | see Sort regression flag below |
+| sort (already-sorted input) | `--bench 1` | **147.0 s** | `e278faff` | commit `dcc445e`, 2026-07-14; was 132.3 s `b9c10a41` (`16e3694`). Regression flag CLOSED - see below |
+| sort `--io-uring` | `--bench 1` | 126.8 s | `9ce80125` (`16e3694`) | **not re-pinned**: host `RLIMIT_MEMLOCK` soft limit is 8 MB, io_uring preflight needs >= 16 MB. Raise via `/etc/security/limits.conf` and re-queue |
 | tags-filter -R | `--bench 1` | 51.8 s | `cf116a6b` | |
 | tags-filter (transitive) | `--bench 1` | **108.2 s** | `7e4301f9` | |
 | tags-filter --invert-match | `--bench 1` | 461.2 s (7m41s) | `6665605a` | 4.3× the match path; ~99 % of ways kept |
@@ -355,49 +374,92 @@ The consolidated headline table. All rows `--bench 1` unless noted.
 | extract --smart (Europe bbox) | `--bench 1` | 267.5 s | `07dcdae3` | |
 | multi-extract --simple (5 regions, Europe bbox) | `--bench 1` | **883.6 s** | `68cecf88` | |
 | multi-extract --smart (5 regions, Europe bbox) | `--bench 1` | 837.6 s | `2c842414` | |
-| add-locations-to-ways `--index-type external` | `--bench 1` | 636.6 s | `abe2ebf2` (856efc3, 2026-07-13) | was **546.0 s** `7fd04130` (2026-04-26); see ALTW drift flag + inject-prepass A/B below |
-| apply-changes (daily diff, `--osc-seq 4920`) | `--bench 1` | 756.3 s | `8e940f71` | |
-| renumber | `--bench 3` | 204.5 s | `abd74459` | see Renumber +10 s below |
+| add-locations-to-ways `--index-type external` | `--bench 3` | **592.2 s** | `b65fcad0` | commit `dcc445e`, 2026-07-14. Drift flag CLOSED (drive state, not code) - see below |
+| add-locations-to-ways `--index-type external --compression zstd:1` | `--bench 1` | 648.4 s | `0e9d93cc` | commit `dcc445e`, 2026-07-14. **Total wall is drift-confounded; the finding is the phase split** - see the planet compression ceiling callout below |
+| apply-changes (daily diff, `--osc-seq 4920`) | `--bench 1` | **465.7 s** | `aaed129a` | commit `dcc445e`, 2026-07-14; was 756.3 s `8e940f71`. **-38.4 % despite the ~8 % drift headwind - understated win, unattributed** |
+| repack (default cap, planet -> planet) | `--bench 1` | **374.6 s** | `33f2c448` | commit `dcc445e`, 2026-07-14; was 377.5 s `8027765b` (`8c1cf03`) - flat |
+| time-filter (snapshot, cutoff 2024-01-01) | `--bench 1` | **263.8 s** | `8781ad14` | commit `dcc445e`, 2026-07-14; was ~270 s (`83183fb`-era) - flat |
+| tags-filter (default two-pass, `w/highway=primary`) | `--bench 1` | **115.2 s** | `cd401093` | commit `dcc445e`, 2026-07-14; was ~117 s (`cf116a6b`-era) - flat |
+| renumber | `--bench 3` | **191.1 s** | `43041dd4` | commit `dcc445e`, 2026-07-14; was 204.5 s `abd74459`. +10 s flag CLOSED - see below |
 | diff-snapshots text `-j 16` | `--bench 1` | **227.5 s** | `22a5eb55` | |
 | diff-snapshots osc `-j 16` | `--bench 1` | **293.8 s** | `cdcaa4f1` | |
-| build-geocode-index | `--bench 1` | **424.8 s** | `2b412af4` (2026-04-26) | |
-| merge-changes (planet, `--osc-seq 4913`, 1-OSC) | `--bench 1` | 44.2 s | `941a5784` (2026-04-28) | |
-| merge-changes (planet, `--osc-range 4914..4920`, 7-OSC) | `--bench 1` | **54.7 s** | `b6e964cc` (2026-04-28) | parallel-drain landed (was 267.2 s `bef0f1fa`) |
+| build-geocode-index | `--bench 1` | **347.0 s** | `57878b0f` | commit `dcc445e`, 2026-07-14; was 424.8 s `2b412af4` (2026-04-26). **-18.3 % despite the ~8 % drift headwind - understated win, unattributed** |
+| merge-changes (planet, `--osc-seq 4913`, 1-OSC) | `--bench 1` | 44.2 s | `941a5784` (2026-04-28) | not re-pinned in the 2026-07-14 suite |
+| merge-changes (planet, `--osc-range 4914..4920`, 7-OSC) | `--bench 1` | **53.8 s** | `f4de3f8d` | commit `dcc445e`, 2026-07-14; was 54.7 s `b6e964cc` - flat. Parallel-drain landed earlier (was 267.2 s `bef0f1fa`) |
 | merge-changes (planet, `--osc-range 4914..4920 --simplify`, 7-OSC) | `--bench 1` | **73.7 s** | `3e3ef119` (2026-04-28) | parallel parse + parallel write_simplified landed (was 262.2 s `c0d140b6`) |
 
-> **Sort `+6-7 %` regression flag - softened by 4fc8e35 hotpath.**
-> Both default and `--io-uring` sort on planet drifted slightly slower
-> at `16e3694` vs the prior `1f97fae` / `68e1ba0` baselines from
-> 2026-04-24. Inside single-shot bench noise on a sub-150-s wall, but
-> the direction was consistent across both backends. A `sort --hotpath`
-> at `4fc8e35` (UUID `d64932d2`, 2026-04-27 overnight) ran in **115.4 s**
-> total - of which 108.6 s (94 %) was `pbfhogg::write::writer::flush`
-> and 6.77 s (6 %) was `build_blob_index`. That hotpath wall sits
-> *below* both the 124.6 s `68e1ba0` baseline and the 132.3 s `16e3694`
-> regression on the same writer-flush-dominated phase mix. Hotpath has
-> single-digit-percent instrumentation overhead on this command shape,
-> so a fresh `--bench 1` is still wanted to settle cleanly, but the
-> data point is consistent with "drift not real" rather than "drift
-> confirmed". Possible drivers if the regression *were* real remain the
-> truncation-handling commits (`436998b`, `12699db`).
+> **Sort `+6-7 %` regression flag - CLOSED 2026-07-14, not a code
+> regression.** The flag tracked default and `--io-uring` sort drifting
+> slower at `16e3694` vs the 2026-04-24 `1f97fae` / `68e1ba0`
+> baselines. The 2026-07-14 suite settles it from the environment side:
+> ALTW's `16e3694` binary re-ran at +8.0 % on byte-identical code, so
+> the host itself moved by more than the flagged delta. Sort's fresh
+> `--bench 1` (`e278faff`, 147.0 s) is +11.1 % on the same single-sample
+> basis - fully absorbed by that band plus normal single-shot noise on a
+> sub-150-s wall. The `4fc8e35` hotpath (`d64932d2`, **115.4 s** total;
+> 108.6 s / 94 % in `pbfhogg::write::writer::flush`, 6.77 s / 6 % in
+> `build_blob_index`) already sat *below* both baselines on the same
+> writer-flush-dominated mix and pointed the same way. The truncation
+> commits (`436998b`, `12699db`) are exonerated. **Do not chase this;
+> re-open only against a matched-commit `--bench 3` pair.**
 
-> **ALTW drift flag + `--inject-prepass` A/B (2026-07-13, `856efc3`,
-> plantasjen).** Same-commit single-sample pair: flag-OFF **636.6 s**
-> (`abe2ebf2`), flag-ON `--inject-prepass` **602.9 s** (`b3b79a62`).
-> The flag-ON run measured 33.7 s FASTER than flag-OFF despite doing
-> strictly more work (2.63 B pinned refs, 535.3 M field-20 bitmaps,
-> 145.8 MB of field-5 payload), so single-sample noise on this command
-> is at least ~35 s / ~6 % - the injection cost is below `--bench 1`
-> resolution, and ADR-0007's planet regression gate closes as "no
-> measurable regression". Separately, BOTH runs sit +10-17 % above the
-> 546.0 s April baseline (`7fd04130` at `16e3694`, 2026-04-26): larger
-> than the observed noise band, so genuine drift across the ~2.5 months
-> of commits is plausible but unconfirmed - a `--bench 3` pair (HEAD vs
-> `--commit 16e3694`, grouped per the build-thrash rule) would settle
-> it. Injection counters, first end-to-end exercise, all plausible:
-> `altw_member_ways` 37.2 M, `altw_pinned_refs` 2.63 B (21 % of the
-> 12.44 B way refs), `altw_field20_ways_emitted` 535.3 M (46 % of
+> **ALTW drift flag - CLOSED 2026-07-14: drive state, not code.** The
+> matched `--bench 3` pair settles it on the same-commit comparison:
+> `16e3694` measured **546.0 s in April and 589.9 s today**
+> (`dc62a437`), +8.0 % on byte-identical code. HEAD is 592.2 s
+> (`b65fcad0`), 0.4 % away - and conservative, since the April cell ran
+> late in the suite on a tired drive and still matched rested HEAD.
+> No bisect needed; the 546.0 s baseline is retired, not regressed
+> against. The mechanism was caught inside the same suite: the zstd:1
+> (`0e9d93cc`) and zlib:6 (`ed5dd6c5`) cells are the same binary an hour
+> apart, `--compression` never touches stage 1, both wrote **exactly**
+> 149,225,518,932 bytes of id shards - and `s1a_id_shard_write_ms` was
+> 1140.7 s vs 1495.6 s cum, **+31 % write time on identical bytes**.
+> Drive is 87 % full (469 G free of 3.6 T) and each ALTW planet run
+> pushes ~705 GB of scratch through it. **Planet single-sample walls on
+> this host carry a ~5-8 % environmental band and run order within a
+> suite is a real variable.**
+
+> **`--inject-prepass` A/B - STILL UNRESOLVED; the cell design is the
+> problem, not the sample count.** Matched `--bench 3` at `dcc445e`:
+> flag-OFF 592.2 s (`b65fcad0`), flag-ON 624.6 s (`b1d9ba16`), +5.5 %.
+> **Do not record this as the injection cost.** Flag-OFF ran first at
+> 05:30 on a rested drive, flag-ON at 06:01 directly behind it - the
+> exact run-order confound the drift verdict above measures at up to
+> +31 % on I/O-bound stages. The sign also flipped from the 2026-07-13
+> `--bench 1` pair at `856efc3` (flag-ON 602.9 s vs flag-OFF 636.6 s,
+> 5.3 % *faster* while doing strictly more work). Two measurements,
+> opposite signs, both ~5 %: the effect is below what adjacent-cell A/B
+> can resolve at planet. Fixing it needs order-swapping or interleaved
+> iterations, not more samples. ADR-0007's planet regression gate stays
+> closed as "no measurable regression"; the bound stays |effect| <~ 6 %.
+> Injection counters (2026-07-13, first end-to-end exercise, all
+> plausible): `altw_member_ways` 37.2 M, `altw_pinned_refs` 2.63 B (21 %
+> of the 12.44 B way refs), `altw_field20_ways_emitted` 535.3 M (46 % of
 > 1.166 B way messages), `altw_field5_bytes` 145.8 MB.
+
+> **Planet ALTW streaming is NOT compression-bound (2026-07-14,
+> `dcc445e`).** The single planet compression cell licensed by the
+> do-not-retry reopen condition has been spent, and it inverted the
+> prior model. Matched HEAD `--bench 1` pair, zstd:1 (`0e9d93cc`) vs
+> zlib:6 (`ed5dd6c5`): `writer_compress_ns` **3855.2 s -> 767.8 s cum
+> (-80 %, -3087 core-seconds)** while streaming wall (s3+s4) moved only
+> **252.8 s -> 240.0 s (-5.1 %)**. Deleting 80 % of compression CPU
+> bought at most 12.8 s. Under zstd:1 the constraint moves to stage-3 ->
+> stage-4 payload readiness (`s4_readiness_wait_ms` 667.0 -> 1395.2 s
+> cum, ~63 s per decode thread of a 240 s phase) while `s4_send_ms`
+> collapses 705.2 -> 59.3 s cum; output grows 91.17 -> 95.20 GB. **The
+> europe -13.9 % zstd:1 result does not transfer to planet** - regime
+> transfer, exactly as `notes/altw-external.md` warns. Read the
+> direction, not the magnitude: total wall says zstd:1 is *worse*
+> (648.4 s vs 628.2 s) purely because +31.7 s of drive drift in the
+> codec-independent stages 1+2 swamped the streaming win, which is also
+> the cleanest illustration on file of why planet single-sample
+> total-wall comparisons cannot be trusted here. Consequence: the
+> ceiling-gated items (ALTW S2 DenseNodes wire filter, the
+> A2/output-executor family) lose their gating premise - freed stage-4
+> CPU has nowhere to go under *either* codec. See
+> `notes/altw-external.md` S2 + N3.
 
 > **`cat --dedupe` planet 133-minute wall.** Single `MERGEPBF` phase,
 > peak anon RSS only 1.4 GB, avg cores 1.3 - the path is essentially
@@ -408,10 +470,14 @@ The consolidated headline table. All rows `--bench 1` unless noted.
 > parallelisation opportunity if `cat --dedupe` becomes a recurring
 > planet workload.
 
-> **Renumber `+10 s` (194 → 204.5 s).** The only headline row pointing
-> the wrong way; both `--bench 3`, several dozen unrelated commits
-> in-between, ~5 % is inside variance but not comfortably. Not a
-> release blocker and not steady-state critical; shelved.
+> **Renumber `+10 s` - CLOSED 2026-07-14, no regression.** The matched
+> `--bench 3` pair the flag asked for has run: HEAD **191.1 s**
+> (`43041dd4`) vs `--commit cb99106` **200.4 s** (`9755cafc`), same day,
+> grouped per the build-thrash rule. **HEAD is 4.6 % faster than the
+> pre-drift commit**, and also faster than that commit's own historical
+> 194 s. The `cb99106` re-run landing at 200.4 s vs its historical 194 s
+> (+3.3 %) is the same environmental drift seen everywhere else in this
+> suite. The 204.5 s `abd74459` figure is retired.
 
 ### Blob-count threshold dispatch landing gates (ADR-0006, plantasjen, 2026-07-11)
 
@@ -424,7 +490,7 @@ Gate cells, all measured at HEAD of the day:
 
 | cell | arm (estimate) | wall | UUID | reference (2026-07-10) | verdict |
 |---|---|---:|---|---:|---|
-| getparents planet primary | Walker (36,063) | **19.0 s** | `a7c064eb` | 23.5 s walker | pass |
+| getparents planet primary | Walker (36,063) | **19.0 s** | `a7c064eb` | 23.5 s walker | pass at the time; **now 22.2 s bench 3 (`ca49bcdf`, `dcc445e`) - see flag below** |
 | getparents europe `--bench` | FullScan (458,132) | **22.2 s** | `9f8602a2` | 26.4 s scan | pass |
 | getparents planet 8k | FullScan (899,866) | 62.0 s | `595e8d7e` | 52.8 s scan (`2b3e496e`) | pass by same-day A/B: `68e1ba0` re-run today 69.4 s (`0e2c2313`), HEAD -11 % |
 | getid planet primary | Walker (36,063) | 6.8 s cold / **0.2 s warm** | `264d9dbf` / `12e74756` | 6.1 s walker | pass; cache-state dominated |
@@ -435,6 +501,22 @@ Disk read on the 8k FullScan cells is the whole file (~96 GB - the
 kind filter and prescreen skip decompression, not bytes); the walker
 cells read only headers plus matching bodies. The 8k profiles confirm
 the mechanism: no schedule/walk phase on the FullScan arm.
+
+> **getparents planet-primary `+16.8 %` flag (2026-07-14, OPEN).**
+> 19.0 s (`a7c064eb`, `2306fd9`) -> **22.2 s** (`ca49bcdf`, `dcc445e`).
+> This is the only 2026-07-14 re-baseline that survives the ~8 % drift
+> band, and it is understated: the new number is a **best-of-3** while
+> the old was a single sample, so 16.8 % is a floor-to-floor delta.
+> Phase shape is unchanged and the ADR-0006 dispatch still picks the
+> Walker arm correctly (`getparents_schedule_blobs` 17,981,
+> `getparents_blobs_skipped` 32,835 - the same 64.6 % skip rate as
+> before), so this is not a dispatch misroute. The alloc profile
+> (`f83c8cf1`) is clean and rules out allocator churn:
+> `decompress_blob_raw` is 59.9 % of allocations, `parallel_classify_phase`
+> 17.66 s of the 22.5 s wall. Suspect the decode path between `2306fd9`
+> and `dcc445e`, not the dispatch. **Not a release blocker** (22 s wall)
+> but it is the one real Q6 finding; a matched `--bench 3` pair via
+> `brokkr getparents --commit 2306fd9` would localise it in one cell.
 
 **Same-day A/B rule for I/O-bound cells.** The 8k cells missed their
 pre-registered absolute bounds (52.8 s + 10 %, 33.2 s + 10 %) for a

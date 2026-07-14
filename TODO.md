@@ -9,12 +9,52 @@ notes carry a CLOSED/STATUS header pointing back here.
 
 **Quick wins (hours, or docs-only)**
 
-- ALTW drift settle (optional, ~1 h machine time): both 2026-07-13
-  planet runs sit +10-17 % above the April 546.0 s baseline, beyond
-  the observed ~6 % single-sample noise - a `--bench 3` pair at HEAD
-  vs `--commit 16e3694` would confirm or dismiss real drift
-  (Performance section). The injected-prepass gate itself is CLOSED:
-  no measurable regression.
+- ~~ALTW drift settle~~ **CLOSED 2026-07-14: drive state, not code.**
+  The matched `--bench 3` pair ran: `16e3694` measures 546.0 s (April)
+  vs **589.9 s today** (`dc62a437`) on byte-identical code, and HEAD is
+  592.2 s (`b65fcad0`) - 0.4 % apart. No bisect; the 546.0 s baseline is
+  retired. Fallout recorded in reference/performance.md + the
+  ALTW notes: **planet single-sample walls on plantasjen carry a ~5-8 %
+  environmental band** (SSD 87 % full; ~705 GB scratch per ALTW run),
+  and the sort `+6-7 %` and renumber `+10 s` flags both close as the
+  same artifact. The injected-prepass gate stays CLOSED (no measurable
+  regression) but its **bound is NOT tightened** - the A/B's two cells
+  ran adjacently and are order-confounded; see below.
+
+- ALTW `--inject-prepass` A/B redesign (~1 h machine time, low
+  priority): the 2026-07-14 matched `--bench 3` pair came back +5.5 %
+  flag-ON, but with the opposite sign to the 2026-07-13 `--bench 1`
+  pair (-5.3 %) and with flag-OFF on a rested drive and flag-ON
+  directly behind it. **Matched sample counts are necessary but not
+  sufficient at planet** - adjacent cells do not share drive state.
+  Re-run order-swapped (flag-ON first) or with interleaved iterations.
+  Cheaper first move: land external N7 (gate the unconditional
+  closure/`closure_slots` staging behind the flag) to shrink the thing
+  being measured (notes/altw-external.md N7).
+
+- ALTW P1 `auto` routing threshold: **MEASURED 2026-07-14, ready to
+  implement.** The germany + north-america sparse/external grid ran; the
+  knee is store-vs-page-cache, not file size and not where the walls
+  cross (walls are non-monotonic: germany ties, north-america sparse
+  wins 26 %, europe external wins 21 %). Rule:
+  `referenced_node_ids * 8 > ~0.8 * page_cache_budget` -> external,
+  computed from runtime RAM, never a hardcoded byte constant. Needs P4
+  (blob-metadata node counts) for the clean selector (notes/altw.md P1).
+
+- getparents planet `+16.8 %` regression (2026-07-14, OPEN): 19.0 s
+  (`a7c064eb`) -> 22.2 s best-of-3 (`ca49bcdf`). The only Q6
+  re-baseline that survives the drift band, and understated (best-of-3
+  vs single sample). Dispatch is not misrouting (skip rate still
+  64.6 %) and the alloc profile is clean, so suspect the decode path
+  between `2306fd9` and `dcc445e`. One `brokkr getparents --commit
+  2306fd9 --bench 3` cell localises it (Performance section).
+
+- japan sparse ALTW `+30 %` regression (2026-07-14, OPEN): 11.9 s
+  (`c6f08ff`) -> 15.5 s (`a3c46737`), while europe sparse stayed flat
+  over the same range - inverted from scale expectations. Live suspect
+  is the unconditional pass-0 closure detection + `closure_slots`
+  staging (external N7). Re-pin japan before any sparse P-item uses it
+  as a keep/revert gate (notes/altw.md).
 
 - Geocode reader interior-hint PIP skip: investigated 2026-07-13,
   UNSOUND (wrong admin matches near boundaries). Fix A (always run
@@ -93,7 +133,7 @@ Three new docs capturing a cross-cutting insight and two new commands that fall 
 
 - [ ] **[notes/getparents.md](notes/getparents.md)** - `getparents` (whole-file scan listing ways / relations referencing a given ID set). Drafted 2026-04-23, headline experiment landed 2026-04-24 (`783970a`). The HeaderWalker + `parallel_classify_phase` rewrite shipped: planet 44.8 s -> **23.5 s** (-46 %, UUID `11bc44dc` at `16e3694`), europe 26.4 s -> **44.2 s** (+68 %, blob-density asymmetry - see [reference/blob-density.md](reference/blob-density.md)). Original 4-8x estimate was wrong: blob indexdata stores `(min_id, max_id)` of *elements in the blob*, not the *ref/member IDs* the typical "find ways referencing these nodes" query cares about, so `IdSet::any_in_range()` pre-screen does not apply. Actual win comes from IO byte reduction (74.8 GB -> 30 GB at planet) by skipping blob kinds structurally incapable of producing matches. Planet hotpath at `4fc8e35` (UUID `00253c7d`): 23.0 s wall, 78 % in `parallel_classify_phase` - that **is** the post-experiment state, not headroom. The c912e4d Denmark 4.7x sequential-decode regression rule remains explicitly off the table (it targets sequential-decode conversions; `parallel_classify_phase` keeps decompression parallel via pread workers). **The europe-regression question (revert / threshold-dispatch / accept) is RESOLVED**: the crossover was measured 2026-07-10 on the 8k-packed planet (HW 82.7 s vs scan 52.8 s; walk ~45 us/blob, linear in blob count) and the dispatch was ratified as [`ADR-0006`](decisions/0006-blob-count-threshold-dispatch.md) (full matrix in [notes/getparents.md](notes/getparents.md) "Crossover measured"; the RESOLVED paragraph moved to the Completed record below). Residual opportunities, absorbed here from the note (2026-07-13):
   - [x] ~~**#3 blob-filter skip-rate readout - MEASURED 2026-07-13**~~ from the existing planet bench `21ed8d7c` (2026-07-12, `a65cecc`, `--bench 3`): `getparents_blobs_skipped` 32,835 / `walk_actual_osmdata_blobs` 50,816 = **64.6 % of blobs skipped** (schedule 17,981; counters sum exactly). The CHANGELOG 0.3.0 "~85 % of blobs at planet scale" claim vs this 64.6 % is **RESOLVED as metric confusion, not an error to correct** - three different metrics collide: nodes are **~90 % of elements** (encoding-independent; ~10.4 B of 11.6 B), **64.6 % of blobs on the byte-packed primary planet** (node blobs avg ~317 k elements vs way blobs ~66 k, so way blobs are overrepresented in blob count), **~90 % of blobs on the 8k-uniform encoding** (blob share = element share when every blob holds 8,000 elements), and **~75 % of planet bytes** (the module doc's metric). The "~85 %" was element share mislabeled as blob share, written 2026-04-27 - months before repack and any blob-density awareness. **Decision (2026-07-13): CHANGELOG.md stays untouched** - historical release record, defensible under the element-share reading; this entry is the durable explanation. **Filter-semantics confirm CLOSED 2026-07-13.** `needed_blob_kinds` (`src/commands/getparents/mod.rs`) is sound for all seven non-empty query shapes: node queries scan way + relation blobs, way queries scan relation blobs (way blobs skipped - nothing references a way from a way), relation queries scan relation blobs only. The "parent relations of a node still needs way blobs" worry was a misconception - a relation parent of node N holds N *directly* as a member and is found in the relation blob; way blobs are needed on a node query in their own right (ways are direct parents of nodes), which `need_way_blobs` already covers. Key subtlety found: both scan arms share `needed_blob_kinds` (walker schedule + pipelined `BlobFilter`), so the pre-existing walker-vs-pipelined equality tests could NOT catch a wrong kind-mapping - both arms would drop the same parent. Pinned instead by four hand-computed-oracle tests over a relations-bearing fixture (`node_query_scans_relation_blobs_for_relation_parents`, `way_query_skips_way_blobs_but_finds_relation_parents`, `relation_query_scans_relation_blobs_only`, `add_self_node_query_emits_node_and_all_parent_kinds`). #3 fully resolved.
-  - [ ] **#4 refs/members buf pre-sizing (<1 % wall).** Skip unless an `--alloc` profile shows churn.
+  - [x] ~~**#4 refs/members buf pre-sizing (<1 % wall).**~~ **CLOSED 2026-07-14 as SKIP - the decision rule fired exactly as predicted.** The gating `--alloc` profile ran at planet on the post-`783970a` HeaderWalker path (UUID `f83c8cf1`, `dcc445e`; none existed before). No churn in the refs/members buffers: `getparents::getparents` - the frame that owns `refs_buf` / `members_buf` - accounts for **2.2 MB of exclusive allocation, 0.07 % of the profile**. Decompression dominates as expected: `decompress_blob_raw` 2.0 GB / **59.9 %**, `parse_and_inline_with_scratch` 886.6 MB / 26.1 %, `blob_wire::parse` 465.1 MB / 13.7 %. Timing agrees (`parallel_classify_phase` 17.66 s of the 22.5 s wall; total alloc/dealloc 122.9 / 122.6 GB, diff 306.5 MB - no leak, no growth pattern). Pre-sizing a buffer responsible for 0.07 % of allocations cannot pay for the code. **Do not re-open**; the profile is the record. (Note the separate, unrelated `+16.8 %` getparents wall regression opened the same day - that one is a decode-path question, not an allocation question.)
 
 - [x] ~~**[notes/geocode-build-opportunities.md](notes/geocode-build-opportunities.md)**~~ - `build-geocode-index`. **ARC LANDED 2026-04-18**, planet 1255 s -> 432.9 s (-65%/2.9x), all 10 ranked items shipped. **G5 interpolation endpoint CSR LANDED 2026-07-13** (sorted CSR replaces the transient hashmap, built in parallel with parallel endpoint resolution; planet interp-resolve 30.6 s -> 2.76 s, ~11x - see CHANGELOG.md and git history for the commit). Remaining follow-ups in the note: G1-G4 architectural rewrites, two S2 spikes.
   - [ ] **Geocode reader interior-hint PIP skip was UNSOUND - investigated 2026-07-13, Fix A landed 2026-07-13, Fix B open.** The admin-cell interior high bit used to be honored as a PIP bypass (`is_interior || admin_polygon_contains(...)` in `src/geocode_index/reader.rs`, both `search_admin_ranked` and `search_admin_all`), introduced at `f365f7f` with a comment claiming "accepted approximation per spec". Investigation findings:
@@ -112,7 +152,7 @@ Three new docs capturing a cross-cutting insight and two new commands that fall 
   - [ ] **#13 exact-membership metadata / sidecar (format project).** Per-blob ID-range-only metadata forces slow-path decode on pure creates inside an existing range: 15,224 FalsePositive blobs / 92,677 slow-path = 16 % of slow-path work wasted at planet. The false-positive distinction is documented on `block_overlaps_diff` in `src/commands/apply_changes/classify.rs` (`range_overlaps` true for create IDs inside the blob's range, `block_overlaps_diff` false because no element in the block matches; the old `classify_only` "FalsePositive" comment the note pointed at was removed in the streaming refactor). Two fix shapes: (a) wire-format exact-overlap scanner on decompressed bytes; (b) per-blob membership sketch in indexdata. Not a quick cleanup.
   - Open questions preserved from the note: actual overlap-blob ratio under larger OSCs (re-measure if input diffs grow; governs worker-pool load); byte-budget reorder capacity sizing (current setting works at planet; revisit on RSS/stall signals); scanner HeaderWalker vs worker throughput balance (no signal it's an issue).
 
-- [ ] **[notes/altw-external.md](notes/altw-external.md)** - `add-locations-to-ways --index-type external`. Current planet baseline: **546.0 s `--bench 1`** (UUID `7fd04130`, commit `16e3694`, 2026-04-26; was 603.7 s at `aa0dc719` post-A1, 661.2 s pre-A1) - **−115.2 s / −17.4 % vs pre-A1**, an extra **−9.6 %** since the post-A1 measurement attributable to commits between `0dc8ae1` and `16e3694`. Europe **270.8 s** post-A1 (was 291.6 s at `6d71053`). **Europe compression sweep landed 2026-04-27 overnight at `4fc8e35`** (`reference/performance.md` "Compression axis" subsection): `none` 246.8 s (UUID `16c35911`, ~6.5 GB anon), `zstd:1` **233.3 s** (UUID `e2fba1bf`, ~6.6 GB anon), vs the cross-commit zlib:6 reference 270.8 s at `0dc8ae1` - so zstd:1 is **−14 % vs default**, refreshing the stale 419→379 / −9.5 % claim from the older `f3c53a34`/`66e43a11` baselines. Same mechanism as before: relieves consumer/compression saturation in stage 4 with similar output size. A1 (rankless node-ID bucketed join) landed 2026-04-25 across 8 commits + 4 review fixups; pass B and the IdSet rank machinery deleted. **Doc rewritten 2026-07-13** (full code re-read + codex critique) around the measured planet cost model at `856efc3`: queue is now N1-N7 (packed u64 IdRecord + cat metadata enabler at the top, then payload RAM handoff, stage-2 worker sweep, scratch split), with a disposition ledger mapping the old L1-L20 and output-compression knob sweeps moved to do-not-retry. 2026-07-13 planet runs measured 636.6 s plain / 602.9 s `--inject-prepass` (`abe2ebf2` / `b3b79a62`, commit `856efc3`) - +90 s vs the 546.0 s baseline, attributed entirely to scratch I/O throughput on identical byte volumes (stage 1 +32 s, stage 2 +52 s, streaming flat); drive-state vs code verdict pending the overnight bench. Failed attempts, measured numbers, physical floors, and meta-lessons live in [`notes/altw-optimization-history.md`](notes/altw-optimization-history.md).
+- [ ] **[notes/altw-external.md](notes/altw-external.md)** - `add-locations-to-ways --index-type external`. Current planet baseline: **546.0 s `--bench 1`** (UUID `7fd04130`, commit `16e3694`, 2026-04-26; was 603.7 s at `aa0dc719` post-A1, 661.2 s pre-A1) - **−115.2 s / −17.4 % vs pre-A1**, an extra **−9.6 %** since the post-A1 measurement attributable to commits between `0dc8ae1` and `16e3694`. Europe **270.8 s** post-A1 (was 291.6 s at `6d71053`). **Europe compression sweep landed 2026-04-27 overnight at `4fc8e35`** (`reference/performance.md` "Compression axis" subsection): `none` 246.8 s (UUID `16c35911`, ~6.5 GB anon), `zstd:1` **233.3 s** (UUID `e2fba1bf`, ~6.6 GB anon), vs the cross-commit zlib:6 reference 270.8 s at `0dc8ae1` - so zstd:1 is **−14 % vs default**, refreshing the stale 419→379 / −9.5 % claim from the older `f3c53a34`/`66e43a11` baselines. Same mechanism as before: relieves consumer/compression saturation in stage 4 with similar output size. A1 (rankless node-ID bucketed join) landed 2026-04-25 across 8 commits + 4 review fixups; pass B and the IdSet rank machinery deleted. **Doc rewritten 2026-07-13** (full code re-read + codex critique) around the measured planet cost model at `856efc3`: queue is now N1-N7 (packed u64 IdRecord + cat metadata enabler at the top, then payload RAM handoff, stage-2 worker sweep, scratch split), with a disposition ledger mapping the old L1-L20 and output-compression knob sweeps moved to do-not-retry. **Re-baselined 2026-07-14 (`dcc445e`): planet 592.2 s `--bench 3` (`b65fcad0`), europe 285.7 s `--bench 3` (`cdfa9453`)**, with pre-N1 europe hotpath (`2db37ded`) + alloc (`a6806e34`) reference profiles captured at the same commit. **The drift question is CLOSED: drive state, not code** - `16e3694` re-ran at 589.9 s today (`dc62a437`) vs its own 546.0 s April number, +8.0 % on byte-identical code, so the 546.0 s figure above is retired rather than regressed against. **The planet compression ceiling was also disproved** (`0e9d93cc` vs `ed5dd6c5`): -80 % compression CPU bought <=5 % streaming wall, so the europe -14 % zstd:1 result does not transfer to planet, S2's ceiling gate is falsified, and N3 (payload RAM handoff) now owns the measured streaming constraint. Failed attempts, measured numbers, physical floors, and meta-lessons live in [`notes/altw-optimization-history.md`](notes/altw-optimization-history.md).
 
   **Apply-changes transfer candidates (all three resolved since 2026-04-21):**
   - **Worker-emits-framed-bytes (P1.5 pattern): tried and reverted** (A2 milestone 1, `b641095` -> `1050111`, 2026-04-25). Mechanism worked exactly as designed (permit/send waits -99 %) but planet stage-4 wall regressed +30 s: the pattern removed the implicit parallelism between decode workers and the writer's rayon pool. Do not re-try without a coordinated multi-stage rework; details in `notes/altw-optimization-history.md`.
@@ -311,10 +351,13 @@ add it here with the per-worker upper bound at planet scale.
   `altw_pinned_refs` 2.63 B (21 % of the 12.44 B way refs),
   `altw_field20_ways_emitted` 535.3 M (46 % of 1.166 B way messages),
   `altw_field5_bytes` 145.8 MB. Full record in
-  `reference/performance.md` "ALTW drift flag + inject-prepass A/B";
-  gate context in `reference/pipeline.md`. **Follow-up spun off
-  below**: both runs sit +10-17 % above the April 546.0 s baseline -
-  see the ALTW drift item under Performance.
+  `reference/performance.md` "`--inject-prepass` A/B"; gate context in
+  `reference/pipeline.md`. **Both follow-ups resolved 2026-07-14**: the
+  +10-17 % gap vs the April 546.0 s baseline was **drive state, not
+  code** (`16e3694` re-runs at 589.9 s today), and the gate stays closed
+  - but the *bound* is still un-tightened, because the 2026-07-14
+  `--bench 3` pair ran its two cells adjacently and is order-confounded.
+  See the A/B-redesign item under Quick wins.
 - [x] ~~**History PBF for `time-filter`**~~ - RETIRED 2026-07-13:
   history-file support declared OUT OF SCOPE for 1.0. Full decision,
   rationale, and re-entry trigger in
@@ -350,17 +393,23 @@ Known to work, no performance question open, but not in the results DB:
 
 ## Performance
 
-- [ ] **ALTW planet drift: confirm or dismiss (+10-17 % vs April).**
-  Both 2026-07-13 `--bench 1` runs at `856efc3` (flag-OFF 636.6 s
-  `abe2ebf2`, flag-ON 602.9 s `b3b79a62`) sit well above the 546.0 s
-  baseline (`7fd04130` at `16e3694`, 2026-04-26). The A/B pair proved
-  single-sample noise is at least ~35 s / ~6 % on this command, which
-  does NOT cover the 57-91 s gap - so real drift across the ~2.5
-  months of commits is plausible but unconfirmed (cache state and the
-  32 GB host's memory pressure differ across runs too). To settle: a
-  `--bench 3` pair, HEAD vs `--commit 16e3694`, grouped per the
-  build-thrash rule (~1 h machine time). Full record in
-  `reference/performance.md` "ALTW drift flag + inject-prepass A/B".
+- [x] ~~**ALTW planet drift: confirm or dismiss (+10-17 % vs April).**~~
+  **DISMISSED 2026-07-14 - drive state, not code.** The `--bench 3`
+  pair ran (grouped per the build-thrash rule): `16e3694` re-measures
+  **589.9 s today** (`dc62a437`) against its own **546.0 s** April
+  number (`7fd04130`) - **+8.0 % on byte-identical code** - while HEAD
+  sits at 592.2 s (`b65fcad0`), 0.4 % away. The gap was the host, not
+  the ~2.5 months of commits; no bisect, and the 546.0 s baseline is
+  retired rather than regressed against. Mechanism caught inside the
+  same suite: two cells an hour apart wrote **exactly** 149,225,518,932
+  bytes of stage-1 id shards - work `--compression` cannot touch - in
+  1140.7 s vs 1495.6 s cum, **+31 % on identical bytes** (SSD 87 % full;
+  ~705 GB scratch per ALTW planet run). **Standing consequence for every
+  planet bench on plantasjen: single-sample walls carry a ~5-8 %
+  environmental band, and run order within a suite is a real variable -
+  adjacent cells do not share drive state.** This closed the sort
+  `+6-7 %` and renumber `+10 s` flags as the same artifact. Full record
+  in `reference/performance.md` "ALTW drift flag".
 
 - [x] ~~**Auto-enable diff `-j`**~~ - **DECIDED + IMPLEMENTED
   2026-07-13.** Flipped the default from `-j 1` to `-j 0`

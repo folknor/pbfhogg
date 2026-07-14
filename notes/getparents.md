@@ -228,14 +228,22 @@ Verification work, not code change:
 Hours scope. Cheap, diagnostic, unblocks any future work that
 assumes the number.
 
-### 4. Result-set pre-sizing (micro)
+### 4. Result-set pre-sizing (micro) - CLOSED 2026-07-14 as SKIP
 
 `refs_buf` / `members_buf` grow dynamically inside the hot loop.
 Pre-sizing based on typical refs-per-way or members-per-relation
 counts would avoid a few `Vec` reallocs.
 
 <1 % wall; decompression dominates per the c912e4d evidence. Skip
-unless allocator profile in tomorrow's `--alloc` run shows churn.
+unless allocator profile shows churn.
+
+**The gating profile ran** (planet `--alloc`, UUID `f83c8cf1` at
+`dcc445e`, 2026-07-14 - the first allocation profile of the
+post-`783970a` HeaderWalker path). **No churn**: `getparents::getparents`,
+the frame owning both buffers, is 2.2 MB exclusive = **0.07 %** of
+allocations. `decompress_blob_raw` is 2.0 GB / 59.9 %. The prediction
+("decompression dominates, likely outcome skip") was exactly right.
+Closed in TODO.md; do not re-open.
 
 ## Things that deliberately do not change
 
@@ -244,16 +252,17 @@ unless allocator profile in tomorrow's `--alloc` run shows churn.
 - **`IdSet` stays as the lookup primitive.** Already the modern
   chunked sparse bitset.
 
-## Prerequisites before shipping anything
+## Prerequisites - both satisfied
 
-1. **Planet baseline** scheduled for `overnight.sh:276-278` tonight.
-   Baseline lands 2026-04-24.
-2. **`--alloc` allocator breakdown** (also in `overnight.sh`) to
-   confirm whether #4 is worth touching.
-
-Both prerequisites satisfy in a single overnight run. Tomorrow's
-morning sidecar + alloc data is enough to size #1 and #2 properly
-and to discard #4 if the allocator profile is clean.
+1. ~~**Planet baseline**~~ landed 2026-04-24; superseded several times
+   since. Current planet number lives in `reference/performance.md`, not
+   here: **22.2 s** `--bench 3` (`ca49bcdf`, `dcc445e`, 2026-07-14),
+   carrying an open **+16.8 % regression flag** vs 19.0 s (`a7c064eb`,
+   `2306fd9`). Dispatch is not the cause (skip rate unchanged at 64.6 %);
+   the suspect is the decode path between those commits. Tracked in
+   TODO.md + the performance.md flag - not here.
+2. ~~**`--alloc` allocator breakdown**~~ ran 2026-07-14 (`f83c8cf1`);
+   the profile was clean and #4 is closed as SKIP - see #4 above.
 
 ## Cross-references
 

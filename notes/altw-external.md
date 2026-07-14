@@ -22,38 +22,129 @@ All plantasjen (Ryzen 5900X 12c/24t, ~26 GB available RAM, Samsung 990 PRO
 
 | Scale | Wall | UUID | Commit | Date | Status |
 |---|---:|---|---|---|---|
-| planet | **546.0 s** | `7fd04130` | `16e3694` | 2026-04-27 | reference baseline |
-| planet | 636.6 s | `abe2ebf2` | `856efc3` | 2026-07-13 | drift-suspect, see below |
-| planet `--inject-prepass` | 602.9 s | `b3b79a62` | `856efc3` | 2026-07-13 | drift-suspect |
-| europe | 270.8 s | `0b89f986` | `0dc8ae1` | 2026-04-25 | stale-ish; pre-`16e3694` gains not re-measured at europe |
+| planet | **592.2 s** (bench 3) | `b65fcad0` | `dcc445e` | 2026-07-14 | **current reference baseline** |
+| planet | 589.9 s (bench 3) | `dc62a437` | `16e3694` | 2026-07-14 | April commit re-run today; see drift verdict |
+| planet | 628.2 s (bench 1) | `ed5dd6c5` | `dcc445e` | 2026-07-14 | tired-drive control, run late in the suite |
+| planet `--inject-prepass` | 624.6 s (bench 3) | `b1d9ba16` | `dcc445e` | 2026-07-14 | run-order confounded; see A/B section |
+| planet | 546.0 s | `7fd04130` | `16e3694` | 2026-04-27 | **retired** - same commit measures 589.9 s today |
+| europe | **285.7 s** (bench 3) | `cdfa9453` | `dcc445e` | 2026-07-14 | current reference; N1 keep/revert comparand |
+| europe | 270.8 s | `0b89f986` | `0dc8ae1` | 2026-04-25 | superseded |
+
+Pre-N1 europe reference profiles at `dcc445e` (2026-07-14), captured so
+the packed-u64-IdRecord work has a matched-commit comparand: hotpath
+`2db37ded` (257.5 s), alloc `a6806e34` (246.2 s). No function-level or
+allocation profile existed for external at europe before these.
 
 Compression axis at europe is **measured and settled** - see
 `reference/performance.md` "Compression axis": `none` 246.8 s, `zstd:1`
 233.3 s (-13.9 %) vs the zlib:6 270.8 s reference. zstd:1 for
 closed pipelines is already documented in README.md and
 `reference/performance.md`. Do not re-propose output-compression knob
-sweeps; see the do-not-retry section for the reopen condition.
+sweeps.
 
-### 2026-07-13 drift (pending overnight bench verdict)
+**The europe compression result does not transfer to planet.** See "The
+planet streaming phase is not compression-bound" below - the reopen
+condition is now spent, and the answer changed the S2/A2 gating story.
 
-Today's 636.6 s vs the 546.0 s baseline is +90.6 s, distributed as:
-meta scan +3.9 s, stage 1 +32 s, stage 2 +52 s, streaming +1 s. Byte
-volumes are identical run-to-run (146.8 GB stage-1 scratch writes, ~204 GB
-stage-2 disk reads, same input, same record counts). Every stage-2 CPU
-counter is flat or better than April (sort 476.8 s cum today vs 520.2 s at
-`aa0dc719`; parse 37.8 vs 47.2); the regression is entirely I/O: stage-1
-write bandwidth 2.96 -> 1.79 GB/s, stage-2 shard read-back +180 s cum,
-node pread +99 s cum, majflt 0 -> 35 K. The streaming phase - the only
-compression-bound phase - did not move at all.
+### The planet streaming phase is not compression-bound (NEW 2026-07-14)
 
-Working hypothesis: **drive state, not code**. Today's plain run started
-3 minutes after the prepass run had pushed ~700 GB of scratch through the
-SSD (SLC-cache exhaustion signature), and the drive is now 87 % full
-(469 G free of 3.6 T), which shrinks the dynamic SLC window in general.
-If the overnight bench on rested cells reproduces ~630 s anyway, suspects
-are the commits between `16e3694` and `856efc3` that touch I/O behaviour;
-the zlib-rs/flate2 bump (`91f1786`) does not fit the profile (CPU counters
-improved). Bisect stage-2 wall with `brokkr --commit` in that case.
+The single planet compression cell that the do-not-retry reopen condition
+allowed has been spent. Matched HEAD `--bench 1` pair, zstd:1
+(`0e9d93cc`) vs zlib:6 (`ed5dd6c5`):
+
+| | zlib:6 | zstd:1 | Delta |
+|---|---:|---:|---:|
+| `writer_compress_ns` | 3855.2 s cum | 767.8 s cum | **-80 %** (-3087 core-s) |
+| streaming wall (s3+s4) | 252.8 s | 240.0 s | -5.1 % |
+| `s4_send_ms` | 705.2 s cum | 59.3 s cum | -92 % |
+| `s4_readiness_wait_ms` | 667.0 s cum | 1395.2 s cum | **+109 %** |
+| `writer_pipeline_send_wait_ns` | 20.5 s cum | 399.9 s cum | +20x |
+| output bytes | 91.17 GB | 95.20 GB | +4.4 % |
+
+**Deleting 3087 core-seconds of compression bought at most 12.8 s of
+wall.** The phase is not compression-bound at planet. This is the
+"regime transfer is a trap" meta-lesson landing on the doc that wrote
+it: the compression-saturated reading came from europe plus the zlib:6
+planet counters (4306 core-s over a 248 s phase looks like saturation),
+but core-seconds of a resource are not evidence that the resource binds.
+
+Under zstd:1 the constraint moves to **stage-3 -> stage-4 payload
+readiness**: `s4_readiness_wait_ms` doubles to 1395 s cum, ~63 s per
+decode thread of a 240 s phase. That is N3's exact target.
+
+Read the direction, not the magnitude. Total wall says zstd:1 is *worse*
+(648.4 s vs 628.2 s) because +31.7 s of drive drift in the
+codec-independent stages 1+2 swamped the -12.8 s streaming win. The
+robust claim rests on the counter ratio (-80 % CPU for <=-5 % wall), not
+on either wall number. This cell is also the cleanest illustration on
+file of why planet single-sample total-wall comparisons cannot be
+trusted here.
+
+Consequences, both of which change plans:
+
+- **S2's gating premise is false.** It was shelved as "invisible under
+  zlib:6; becomes a wall item if the compression ceiling ever moves."
+  The ceiling is not compression, so freed stage-4 assemble CPU has
+  nowhere to go under *either* codec. S2 is dead at planet today, not
+  merely parked. Re-evaluate only after N3 moves the payload-readiness
+  constraint - and re-derive the ceiling then rather than assuming.
+- **The A2 / output-executor family loses the same story.** It was
+  already shelved on measurement (pool consolidation lost 30 s planet);
+  this removes the theory that would have revived it.
+- **N3 is promoted** (see tier 1) from "cheap insurance, wall
+  near-neutral" to the item that owns the actual planet streaming
+  constraint.
+
+### `--inject-prepass` A/B: still unresolved, cell design was wrong
+
+Matched `--bench 3` at `dcc445e`: flag-OFF 592.2 s (`b65fcad0`),
+flag-ON 624.6 s (`b1d9ba16`), +5.5 %. **Do not record this as the
+injection cost.** Flag-OFF ran first at 05:30 on a rested drive and
+flag-ON at 06:01 directly behind it - the same run-order confound that
+manufactured the original drift artifact, and the drift verdict above
+measures that confound at up to +31 % on I/O-bound stages.
+
+The sign also flipped: the 2026-07-13 `--bench 1` pair at `856efc3` had
+flag-ON 5.3 % *faster* (602.9 s vs 636.6 s) while doing strictly more
+work. Two measurements, opposite signs, both ~5 %: **the flag's effect
+is below what this cell design can resolve, and more samples will not
+fix it.** Matched `--bench 3` was necessary but not sufficient; the
+missing ingredient is order-swapping (run flag-ON first in one suite,
+flag-OFF first in the next) or interleaving iterations within one cell.
+
+Status: ADR-0007's planet regression gate stays closed at
+"no measurable regression"; the bound stays |effect| <~ 6 %, un-tightened.
+N7 (gate the closure/pins staging behind the flag) is the cheap way to
+shrink the thing being measured before trying again.
+
+### Drift verdict: drive state, not code (SETTLED 2026-07-14)
+
+The matched `--bench 3` pair settles it on the same-commit comparison:
+`16e3694` measured **546.0 s in April and 589.9 s today** (`dc62a437`),
++8.0 % on byte-identical code. HEAD is 592.2 s (`b65fcad0`), 0.4 % from
+the April commit re-run - inside noise, and conservative in the right
+direction: the April cell ran late in the suite on a tired drive and
+still matched rested HEAD. **There is no code regression between
+`16e3694` and HEAD.** Do not bisect; the 546.0 s baseline is retired
+rather than regressed against.
+
+The mechanism was caught directly inside the same suite. The zstd:1
+(`0e9d93cc`) and zlib:6 (`ed5dd6c5`) cells are the same binary an hour
+apart, and `--compression` never touches stage 1. Both wrote **exactly**
+149,225,518,932 bytes of id shards; `s1a_id_shard_write_ms` was 1140.7 s
+cum vs 1495.6 s cum - **+31 % write time on identical bytes**. Stages 1+2
+together (both codec-independent) differ by +31.7 s between those two
+cells. That is the drift, measured live, on work that provably cannot
+depend on the variable under test.
+
+Bench-infra caveat, load-bearing for every planet number here: the SSD is
+87 % full (469 G free of 3.6 T), which shrinks the dynamic SLC window, and
+each ALTW planet run pushes ~705 GB of scratch through it. **Planet
+single-sample walls on this host carry a ~5-8 % environmental band, and
+run order inside a suite is a real variable.** Any A/B that matters needs
+matched sample counts AND order-swapped or interleaved cells - adjacent
+cells do not share drive state. See the inject-prepass A/B below for what
+happens when this is ignored.
 
 ## Current architecture and planet cost model
 
@@ -103,10 +194,14 @@ Load-bearing regime facts:
   decompression in stage 1 is attacking 12 s of wall.
 - Stage 2's six workers average 3.7 cores: the workers stall on I/O,
   not on the dispatch cap per se.
-- The streaming phase is compression-saturated: 4306 core-seconds of
-  zlib:6 with `s4_send_ms` 1587 s cum of decode workers blocked on the
-  writer, and permit waits (166 s cum) confirm the queue is backed up
-  behind compression CPU, not an artificial permit cap (pool = 64).
+- The streaming phase **looks** compression-saturated under zlib:6 (4306
+  core-seconds of zlib:6, `s4_send_ms` 1587 s cum of decode workers
+  blocked on the writer) but **is not compression-bound**: removing 80 %
+  of that CPU via zstd:1 moved wall <=5 % (2026-07-14, `0e9d93cc` vs
+  `ed5dd6c5`). Once the writer is cheap the phase binds on stage-3 ->
+  stage-4 payload readiness instead (`s4_readiness_wait_ms` 1395 s cum).
+  The zlib:6 `s4_send_ms` figure measures *where workers queue*, not
+  *what limits throughput* - do not read it as a ceiling.
 - The P1b node-blob skip never fires at planet:
   `s4_node_blobs_kept_by_tags` = 32,835 of 32,835. Every node blob is
   decoded and rebuilt on the default (drop untagged) path.
@@ -145,9 +240,14 @@ Instrumentation added 2026-07-13 (lands in every subsequent sidecar):
   (history doc: 1B batching predicted -6 s, measured +22.9 s; altw_v2
   sizing off 4-5x). Bound estimates with micro-benchmarks or skip to a
   small-dataset measurement.
-- **Writer ceiling diagnostic.** Real stage-4 CPU wins are invisible on
-  wall under zlib:6 output because freed decoder CPU refills the writer
-  queue. Measure stage-4-side keep/reverts under both zlib:6 and zstd:1.
+- **Writer ceiling diagnostic - scope corrected 2026-07-14.** At *europe*
+  real stage-4 CPU wins are invisible on wall under zlib:6 because freed
+  decoder CPU refills the writer queue. **At planet this is false**: the
+  zstd:1 cell removed 80 % of compression CPU for <=5 % of streaming wall
+  (section above). Still measure stage-4-side keep/reverts under both
+  codecs - but to *find* the ceiling, not to confirm a ceiling you have
+  assumed. Core-seconds burned by a resource are not evidence that the
+  resource binds; only removing it and watching wall is.
 - **Physical NVMe floor.** Designs that do not reduce bytes moved cannot
   beat the device. The largest byte streams are now the two 149 GB
   scratch permutations, not the coord read.
@@ -246,13 +346,27 @@ vs trailing sidecar table. The `--inject-prepass` field-5/field-20 layer
 Scope: cat encoder + reader plumbing + ALTW consumption. Moderate.
 Payoff: enables N1(a); deletes sidecar round trip; -7 s meta scan.
 
-### N3. Delete the payload tmp round trip: bounded in-RAM handoff (new)
+### N3. Delete the payload tmp round trip: bounded in-RAM handoff (PROMOTED 2026-07-14)
+
+**This item now owns the measured planet streaming constraint.** The
+zstd:1 cell (section above) showed the phase is not compression-bound;
+once the writer is cheap, decode threads block on payload readiness
+(`s4_readiness_wait_ms` 1395 s cum, ~63 s per thread of a 240 s phase).
+N3 is what removes that. It stays behind N1/N2 in the ordering only
+because N1 shrinks the two largest byte streams and is the bigger
+join-side win; if N1 slips, N3 is the next thing to start.
+
+**The round trip is read-dominated 32:1** (`s4_coord_payload_pread_ms`
+771.7 s cum vs `s3_tmp_pwrite_ms` 24.1 s cum at `ed5dd6c5`). Frame this
+as deleting a *read*, not a write - the write half is already nearly
+free, so a design that only defers or batches the pwrite side is
+attacking 24 s of cum time and will measure flat.
 
 Stage 3 pwrites 54.0 GB of payloads that stage 4 preads back seconds
-later (`s3_worker_tmp_bytes` 54.0 GB, `s4_coord_payload_pread_ms` 573 s
-cum), inside the most contended phase. Way-blob payload production order
-(slot order) is way-file order - the same order stage 4 consumes - and
-the router already holds straddler payloads in RAM (0.8 GB at planet).
+later (`s3_worker_tmp_bytes` 54.0 GB), inside the most contended phase.
+Way-blob payload production order (slot order) is way-file order - the
+same order stage 4 consumes - and the router already holds straddler
+payloads in RAM (0.8 GB at planet).
 
 Design constraints (codex-hardened):
 
@@ -269,10 +383,11 @@ Design constraints (codex-hardened):
   cancellation tests (AbortOnDrop paths).
 
 Expected effect: -108 GB device traffic per run (real SSD wear win on
-every bench), reduced page-cache churn in the streaming phase. Wall may
-be near-neutral while zlib:6 compression remains the phase ceiling -
-accept that; the item is cheap insurance that payload I/O never becomes
-the next ceiling, and it compounds with N5/N6.
+every bench), reduced page-cache churn in the streaming phase, and -
+per the zstd:1 cell - the readiness stall that actually binds the phase
+once compression is not in the way. Under zlib:6 output the wall win may
+still be muted; measure under both codecs, and treat the zstd:1 cell as
+the one that shows N3's ceiling.
 
 ### N4. Stage-2 worker sweep, after N1 (absorbs L13)
 
@@ -358,18 +473,29 @@ zlib). Measure way-only first: stage-specific decompress counters,
 stage walls, `writer_compress_ns`, input file size delta (~+10-15 % for
 the way section).
 
-### S2. A3 / wire-format DenseNodes filter (kept, still ceiling-gated)
+### S2. A3 / wire-format DenseNodes filter (DEMOTED 2026-07-14 - its gate was falsified)
 
-Unchanged thesis: the non-way stage-4 path decodes + BlockBuilder-rebuilds
-all 32,835 node blobs (`s4_nonway_assemble_ms` 933 s cum) because the
-tag-based blob skip never fires at planet. A wire-level DenseNodes
-filter (preserve string table wholesale, decode columns in lockstep,
-keep tagged/member nodes, fresh indexdata/tagdata) removes most of that
-CPU. Shelved evidence (`4910fd9`): the win is real (-53 % nonway
-assemble at europe) but invisible on wall under zlib:6. It becomes a
-wall item for zstd:1-output users today, and for the default path only
-if the compression ceiling ever moves. Keep; do not start while zlib:6
-is the confirmed phase ceiling.
+Mechanism unchanged: the non-way stage-4 path decodes +
+BlockBuilder-rebuilds all 32,835 node blobs (`s4_nonway_assemble_ms`
+865 s cum at `ed5dd6c5`) because the tag-based blob skip never fires at
+planet. A wire-level DenseNodes filter (preserve string table wholesale,
+decode columns in lockstep, keep tagged/member nodes, fresh
+indexdata/tagdata) removes most of that CPU, and the CPU win is real
+(-53 % nonway assemble at europe, `4910fd9`).
+
+**The gate that kept this alive is gone.** The old reasoning was
+"invisible under zlib:6, but a wall item for zstd:1-output users, and
+for the default path if the compression ceiling ever moves." The zstd:1
+planet cell says the ceiling is not compression at all - so under zstd:1
+the phase is bound by payload readiness, and S2's freed assemble CPU has
+nowhere to go there either. **S2 does not become a wall item under
+either codec at planet today.** It is not "waiting for the ceiling to
+move"; the ceiling it was waiting on does not exist.
+
+Reopen condition, narrowed: only after N3 removes the payload-readiness
+stall, and only if a fresh planet measurement then shows stage-4 CPU
+binding the phase. Do not start on the strength of the europe CPU number
+alone - that is the regime-transfer trap twice over.
 
 ### S3. Coord payload format: shared-base encoding (absorbs L10/L11)
 
@@ -450,7 +576,7 @@ third, which weakens the case further. Fallback territory only.
 | L6 consolidated writers | kept, fallback | S6 |
 | L7/A2 output executor | stays shelved - milestone 1 measured on this host: pool consolidation lost 30 s planet; permit pool (64) is not the cap, compression CPU is | history doc |
 | L8 zstd:1 output note | settled + documented (README, performance.md); removed as a lever | do-not-retry |
-| L9/A3 DenseNodes filter | kept, ceiling-gated | S2 |
+| L9/A3 DenseNodes filter | **demoted 2026-07-14** - its ceiling gate was falsified by the planet zstd:1 cell | S2 |
 | L10/L11 payload format | kept, weakened by N3 | S3 |
 | L12 presence-bitmap carry-along | still a carry-along: any stage-2 inner-loop reshape (N1) may carry a presence bit for free; do not land alone | note here |
 | L13 worker caps | absorbed | N4 |
@@ -469,9 +595,12 @@ Preserved as negative results so these do not get re-proposed:
   measured `none` -8.9 % / `zstd:1` -13.9 % (2026-04-27, `4fc8e35`);
   zstd:1 guidance for closed pipelines is already shipped documentation.
   The zlib:6 default is an ecosystem contract, not a tuning oversight.
-  *Sole reopen condition:* one planet-scale ALTW cell (zstd:1 or none)
-  to co-pin the planet ceiling if and when a ceiling-gated item (S2,
-  A2-family) needs a decision number - a single run, not a sweep.
+  *The sole reopen condition is now SPENT (2026-07-14, `0e9d93cc`):* the
+  one allowed planet cell ran, and the answer was that planet streaming
+  is not compression-bound at all (-80 % compression CPU for <=-5 % wall;
+  see the section above). The axis is closed in both directions - zstd:1
+  is not a planet lever, and no further cell is licensed. Any future
+  reopen needs a *new* reason, not this one.
   libdeflate-at-planet is owned by
   `notes/write-path-optimization-plan.md` item 2b; if it lands there,
   re-measure the ALTW streaming phase, do not fork the work here.
@@ -577,15 +706,21 @@ Load-bearing patterns; apply to any lead above.
 
 ## Suggested ordering
 
-1. Wait out the overnight bench; settle the 546-vs-636 drift question
-   (drive state vs code) before trusting any new keep/revert delta.
+1. ~~Settle the drift question~~ **DONE 2026-07-14: drive state, not
+   code.** Keep/revert deltas are trustworthy again, subject to the
+   ~5-8 % planet band and the order-swap requirement in the drift
+   verdict section.
 2. **N2 + N1 together** (metadata enabler, packed u64 record, N7 riding
    along), stage 2 frozen at 6 workers. This is the biggest join-side
-   change and it shrinks the two largest byte streams.
+   change and it shrinks the two largest byte streams. Keep/revert
+   comparand: europe `cdfa9453` 285.7 s bench 3, with hotpath
+   `2db37ded` / alloc `a6806e34` at the same commit.
 3. **Sort algorithm cell**: comparison vs radix on packed records.
-4. **N4** stage-2 worker sweep.
-5. **N3** payload RAM handoff.
+4. **N3** payload RAM handoff - moved up: it owns the measured planet
+   streaming constraint now that the compression ceiling is disproved.
+5. **N4** stage-2 worker sweep.
 6. **N5** scratch split when the second drive is real (re-sweep N4
    after).
-7. **S1 / S4 / S2** as measurement budget allows, in that order; S2 only
-   with a ceiling story (see do-not-retry reopen condition).
+7. **S1 / S4** as measurement budget allows. **S2 is not on this list
+   any more** - its gate was falsified; see S2 for the narrowed reopen
+   condition (post-N3 measurement only).

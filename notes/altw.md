@@ -56,17 +56,43 @@ Code:
 | Scale | Wall | UUID | Commit | Date | Note |
 |---|---:|---|---|---|---|
 | denmark | 4.0 s | `7bd88e83` | `6d6e158` | 2026-07-10 | default sparse |
-| japan | 11.9 s | `158a86d7`-era | `c6f08ff` | 2026-04-30 | pre-prepass era |
-| europe | 359.7 s (5:59) | `f9a61784` | `c6f08ff` | 2026-04-30 | pre-prepass era; refresh queued in tonight's suite |
+| japan | **15.5 s** | `a3c46737` | `dcc445e` | 2026-07-14 | current; **+30 % vs 11.9 s @ `c6f08ff` - see flag below** |
+| germany | **25.7 s** | `61f6c231` | `dcc445e` | 2026-07-14 | first sparse pin at this scale (P1 cell) |
+| north-america | **116.4 s** | `340ba366` | `dcc445e` | 2026-07-14 | first sparse pin at this scale (P1 cell) |
+| europe | **363.1 s** | `4ac11326` | `dcc445e` | 2026-07-14 | current; flat vs 359.7 s @ `c6f08ff` (+0.9 %) |
 | planet | untried | - | - | - | ~60 GB working set vs ~25 GB cache; expected thrash. External owns planet. |
 
-Europe phase profile (`f9a61784`): pass 0 63.2 s, pass 1 57.7 s
-(29 GB store written, avg cores 11.6), rel-member 1.2 s, pass 2
-197.0 s (6.8 M majflt, 251 GB disk read, avg cores 13.9).
+Europe hotpath at `dcc445e`: `c790eb34` (310.5 s) - the first sparse
+function-level profile below the phase wrappers, and the reference set
+for P1-P3 keep/reverts.
 
-Sparse-vs-external at europe: sparse 359.7 s vs external 270.8 s
-(`0b89f986`, both April baselines; tonight's suite re-pins both at
-HEAD). At denmark and japan the ordering inverts hard - see P1.
+Europe phase profile at `dcc445e` (`4ac11326`): pass 0 52.2 s, pass 1
+46.6 s (28.94 GB store), rel-member 29.8 s, pass 2 230.5 s. Prior
+profile (`f9a61784`, `c6f08ff`): pass 0 63.2 s, pass 1 57.7 s (29 GB,
+avg cores 11.6), rel-member 1.2 s, pass 2 197.0 s (6.8 M majflt, 251 GB
+disk read, avg cores 13.9). Note rel-member moved 1.2 -> 29.8 s and
+pass 2 197 -> 230 s while the total stayed flat; both deserve a look
+before P3 uses the pass-2 number as its gate.
+
+> **japan sparse +30 % flag (2026-07-14).** 11.9 s (`c6f08ff`) -> 15.5 s
+> (`a3c46737`). Beyond the drift band, and *inverted from scale
+> expectations*: europe sparse is flat over the same commit range. Japan
+> is small enough that fixed per-run costs dominate, and N7 in the
+> external doc records that pass-0 closure detection + `closure_slots`
+> staging currently run **unconditionally**, even with `--inject-prepass`
+> off - that is the live suspect. **Re-pin japan before any P-item
+> keep/revert uses it as a gate** (this is exactly the caution the
+> measurement notes below already carried).
+
+Sparse-vs-external, all at `dcc445e` (2026-07-14) - see P1 for how to
+read this:
+
+| Dataset | pass-1 store | sparse | external | winner |
+|---|---:|---:|---:|---|
+| japan | ~2 GB | **15.5 s** | (not pinned) | sparse |
+| germany | 3.32 GB | 25.7 s | 25.2 s | tie (external +2 %) |
+| north-america | 18.75 GB | **116.4 s** | 158.3 s | **sparse -26 %** |
+| europe | 28.94 GB | 363.1 s | **285.7 s** | **external -21 %** |
 
 ## Findings
 
@@ -112,14 +138,25 @@ from somewhere between japan (2.4 GB) and europe (33.6 GB). The
 sparse-selection hint text made the same false "at every scale" claim
 (fixed 2026-07-13). P1 fixes the routing.
 
-### Pass 0's serial union is the phase
+### Pass 0's serial union is half the phase (CORRECTED 2026-07-14)
 
 Workers scan wire-only and emit per-blob ref vectors; the main thread
-performs ~4.7 B `IdSet::set` calls single-threaded at europe. At
-~5-10 ns per call that is most of the 63 s phase wall. P2 attacks
-this. (Prepass doubles the serial work - a `get` before every `set`
-for shared-node detection - so the win compounds under
-`--inject-prepass`.)
+performs the union single-threaded at europe. `altw_pass0_union_ms` now
+measures this directly instead of inferring it: **25.5 s of the 52.2 s
+pass-0 wall (49 %)** at `4ac11326`, over `altw_pass0_refs_total`
+4.37 B refs (~5.8 ns per set call).
+
+This **corrects the previous edition**, which claimed the union was
+"most of the 63 s phase wall" from a desk estimate. It is half, and the
+phase is smaller than it was. **P2's ceiling is 25.5 s, not 63 s** -
+size the item against that. The other ~26 s is worker scan + dispatch,
+which P2 does not touch. (Prepass doubles the serial work - a `get`
+before every `set` for shared-node detection - so the win compounds
+under `--inject-prepass`.)
+
+This is the desk-estimate lesson from the external doc, reproduced
+locally: the inference was off by 2x in the direction that flattered the
+proposed item.
 
 ### Pass 2 floor at zlib:6 is compression CPU (hotpath UUID `aa4fe496`)
 
@@ -197,28 +234,67 @@ the shared-detection `get` is gated. No pass-1/2 cost.
 
 ## The queue (2026-07-13)
 
-### P1. Scale-aware `auto` routing (user-facing defect; top item)
+### P1. Scale-aware `auto` routing (user-facing defect; top item) - MEASURED 2026-07-14, ready to implement
 
 Route `auto` on input size: external only when sorted + indexed AND
-above a threshold; sparse otherwise. Conservative threshold - routing
-a smallish input to external wastes seconds; routing an oversized
-input to sparse costs minutes of cache thrash - so bias toward
-external near the boundary.
+above a threshold; sparse otherwise. The measurement cells have run
+(germany + north-america, sparse and external, all at `dcc445e`); the
+grid is in the Baselines section above.
 
-Measurement first (codex-hardened): compressed file size is only a
-proxy for the 8-byte-per-referenced-node working set (repack level /
-blob size moves file size without moving the store). Run sparse and
-external sequentially on **germany** and **north-america** (both
-registered datasets, sitting inside the 2.4-33.6 GB gap), capture
-total + phase walls, store bytes, pass-2 majflt and disk read, and
-set the threshold below the point where sparse pass-2 disk read goes
-nonlinear - not merely where the walls cross. Sanity-check against a
-repacked variant of the same region.
+**The walls are non-monotonic, which settles the criterion question.**
+Germany ties, north-america (bigger) sparse wins by 26 %, europe
+(bigger still) external wins by 21 %. A threshold fitted to "where the
+walls cross" would have to cross twice and would misroute
+north-america. P1's original rule - set the threshold from where sparse
+pass-2 goes nonlinear, not from wall crossings - is vindicated; use it.
 
-The eventual clean selector estimates the store from node counts in
-blob metadata (P4) instead of file size. Also fixed alongside this
-item: the sparse-selection hint text no longer claims external wins
-at every scale (corrected 2026-07-13).
+**The nonlinearity is clean and it is store-vs-page-cache.** Sparse
+pass-2 `way_reframe_ms` per ref (this is the phase where every ref does
+a random lookup into the mmap store):
+
+| Dataset | store | refs | `way_reframe_ms` cum | per ref |
+|---|---:|---:|---:|---:|
+| north-america | 18.75 GB | 2.60 B | 376.0 s | 0.145 us |
+| europe | 28.94 GB | 4.37 B | 3374.5 s | **0.772 us** |
+
+**5.3x the per-ref cost for 1.68x the refs.** Pass 1 shows the same
+knee (0.42 -> 0.65 -> 1.61 s/GB across germany / north-america /
+europe). The host has ~28 GB RAM and the process holds ~2-3 GB anon, so
+the page-cache budget is ~25 GB: north-america's 18.75 GB store is
+~75 % of budget and behaves linearly; europe's 28.94 GB is ~116 % and
+thrashes. This is the "working set is the ceiling" finding quantified,
+and it is the same mechanism, not a new one.
+
+**Threshold rule:** route to external when
+`referenced_node_ids * 8 > ~0.8 * page_cache_budget`, where the budget
+is derived from *runtime available RAM* minus the expected anon
+footprint. **Do not hardcode a byte constant** - the knee is defined
+relative to the host's RAM, and a constant fitted to this 28 GB box
+misroutes every other machine. On this host the rule puts the boundary
+near a ~20 GB store, which routes north-america to sparse (correct,
+sparse wins by 26 %) and europe to external (correct, external wins by
+21 %).
+
+Caveats to respect when implementing:
+
+- **The bracket is wide.** Two points 1.54x apart in store bracket the
+  knee (18.75 GB fine, 28.94 GB thrashing). The 0.8 coefficient is a
+  bias-toward-external choice inside that gap, not a measured optimum.
+  A tighter threshold needs a dataset between north-america and europe;
+  do not over-fit what is there now.
+- Bias toward external near the boundary stands: routing a smallish
+  input to external wastes seconds, routing an oversized input to
+  sparse costs minutes.
+- Compressed file size remains only a proxy for the store (repack level
+  / blob size move file size without moving the store) - germany and
+  north-america differ 5.6x in store, which no file-size heuristic
+  tracks reliably. The selector must estimate the store from node
+  counts in blob metadata (P4). P4 is therefore P1's real prerequisite
+  for the clean version; a file-size stopgap would reintroduce the
+  defect on repacked inputs.
+
+Also fixed alongside this item: the sparse-selection hint text no
+longer claims external wins at every scale (corrected 2026-07-13).
 
 ### P2. Pass-0 parallel union via `set_atomic_if_new`
 
@@ -281,11 +357,35 @@ neighbour blob's coords if id ranges overlap - the fast path would
 need a range-disjointness proof (P4 metadata), not just the sorted
 header flag.
 
-Gate: add per-blob rank-span/resolved/hole counters first and compute
-`sum(rank_span_bytes) / resolved_bytes`. If materially above 1.0 the
-path has write amplification before it starts. Only A/B at europe if
-the ratio is clean AND P2 has landed. Expected direction per codex:
-uncertain, flat-or-worse plausible.
+**Gate result (2026-07-14): PASSED, and it proved more than it was asked
+to.** `altw_pass1_rank_span_slots / altw_pass1_coords_stored` is
+**exactly 1.000** on all three datasets - germany 414,849,582 /
+414,849,582; north-america 2,344,309,356 / 2,344,309,356; europe
+3,617,893,513 / 3,617,893,513. Zero write amplification.
+
+Exact equality is stronger than "the intervals are dense". Since the
+counter sums `blob_max_rank - blob_min_rank + 1` per blob, `sum(span) ==
+total_stored` can only hold if the per-blob rank intervals are dense
+**and mutually disjoint** - which is precisely the range-disjointness
+proof the correctness landmine above demanded (zero-filled spans
+clobbering a neighbour blob's coords). Both of P5's gates are therefore
+clear on sorted + indexed input.
+
+Read this carefully before treating it as a green light:
+
+- **The equality is structural, not lucky.** Ranks are assigned over
+  referenced ids in ascending order, and sorted node blobs cover
+  disjoint id ranges, so a blob's referenced nodes *must* occupy one
+  contiguous hole-free rank interval. The counter will read 1.000 on any
+  sorted + indexed input forever; its discriminating power exists only
+  for unsorted input. Do not re-run this to "confirm" it.
+- **Passing the gate removes a disqualifier; it does not make P5 a win.**
+  Codex's substantive objections are untouched: buffered pwrite dirties
+  the same page cache, the current mmap stores on sorted input are
+  already near-sequential, and the pwrite path adds zero-fill +
+  userspace scatter + kernel copy that atomic stores do not pay. P5
+  stays demoted, and the A/B still waits on P2. Expected direction
+  remains uncertain, flat-or-worse plausible.
 
 ### Parked (unchanged from previous edition, reasoning intact)
 
@@ -371,8 +471,11 @@ hard parse error with a migration hint.
 
 - **Output-compression knob sweeps.** Settled; japan sweep above,
   europe axis in `reference/performance.md`, zstd:1 guidance shipped.
-  Same reopen condition as the external doc (a single planet cell if
-  a ceiling-gated item needs a decision number), owned there.
+  The external doc's single-planet-cell reopen condition was **spent
+  2026-07-14** and came back negative (planet streaming is not
+  compression-bound: -80 % compression CPU for <=5 % wall). The axis is
+  closed in both directions and no further cell is licensed - a reopen
+  now needs a genuinely new reason, not "we never measured planet".
 - **`parallel_classify_accumulate` with per-worker IdSet at scale.**
   See the classify.rs choice criteria; the rel-member scan was the
   worked example (+9.7 GB anon at europe).
@@ -386,9 +489,13 @@ hard parse error with a migration hint.
   stores during the `c6f08ff` work). P5's per-blob buffered variant
   is a different shape but carries its own gate - see P5.
 - **Untagged-node skip-entirely.** Zero blobs qualified at japan
-  (every node blob has a tagged node or member overlap); also
-  writer-ceiling-gated. Re-attempt only at planet scale under
-  zstd:1/none, and only if the skip predicate actually fires.
+  (every node blob has a tagged node or member overlap). The
+  "re-attempt at planet under zstd:1/none" escape is **narrower than it
+  looks**: the planet zstd:1 cell (external doc) found no compression
+  ceiling to relieve, so a CPU win there has nowhere to go either. The
+  binding gate is now the skip predicate itself - and it does not fire
+  (external's `s4_node_blobs_kept_by_tags` is 32,835 of 32,835 at
+  planet). Re-attempt only if the predicate starts firing.
 - **Treating shape as the diagnosis.** The rayon-collect pattern was
   twice suspected, twice exonerated by measurement.
 - **Batched merge-join as a backend replacement (Reviewer 2,
@@ -440,15 +547,24 @@ hard parse error with a migration hint.
 - Pass-2 CPU wins can be invisible under zlib:6 (writer ceiling);
   measure under both zlib:6 and zstd:1/none. Shared lesson with the
   external doc.
-- Sparse numbers above predate the 2026-05..07 tree (zlib-rs bump
-  `91f1786`, prepass landings, fused transforms, MSRV 1.96). Tonight's
-  suite (2026-07-13) re-pins denmark-era numbers at europe; japan is
-  not queued and should be re-pinned before any P-item keep/revert
-  uses it as a gate.
-- The `--inject-prepass` A/B at planet external showed run-order /
-  drive-state effects larger than most single-item wins (see the
-  external doc's drift section). Sparse europe cells inherit the same
-  caution: matched sample counts, rested drive.
+- ~~Sparse numbers predate the 2026-05..07 tree~~ **re-pinned
+  2026-07-14** at `dcc445e` (japan, germany, north-america, europe -
+  see Baselines). Europe came back flat; japan came back +30 % and is
+  flagged above. The caution that produced that flag was correct and is
+  worth keeping: re-pin before gating on a stale number.
+- **Run order is a variable, not a nuisance.** The external doc's drift
+  verdict measured +31 % write time on byte-identical stage-1 work
+  between two cells an hour apart in the same suite. Planet single
+  samples carry a ~5-8 % environmental band. Sparse europe cells inherit
+  this: matched sample counts are necessary but **not sufficient** - an
+  A/B whose two cells run adjacently is confounded by drive state
+  regardless of sample count. Order-swap or interleave.
+- **Core-seconds are not a ceiling.** The external doc assumed
+  compression bound the planet streaming phase because it burned 4306
+  core-seconds; removing 80 % of it moved wall <=5 %. Before gating any
+  sparse item on "X dominates the phase", check that removing X actually
+  moves wall. This applies directly to the pass-2 zlib:6 writer-ceiling
+  reasoning cited above, which is a *japan* result.
 
 ## Cross-references
 

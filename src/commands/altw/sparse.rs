@@ -240,9 +240,36 @@ pub(super) fn build_node_index_sparse(
         );
     }
 
+    advise_random_store(&mmap);
+
     Ok(SparseArrayIndex {
         referenced,
         mmap,
         _file: file,
     })
+}
+
+/// Advise the kernel that subsequent access to the store is random.
+///
+/// Pass 2's lookups are genuinely random per ref (way refs scatter
+/// uniformly over the id space), but the kernel's default readahead
+/// speculates adjacent pages on every fault: europe measured ~37 KB of
+/// disk read per major fault against a store where a lookup needs one
+/// 4 KB page. MADV_RANDOM disables that speculation for the store.
+/// Called after pass 1 completes so the near-sequential write pass
+/// keeps default behaviour. Advisory only - correctness is unaffected
+/// if the call fails - but the counter records whether it applied so a
+/// flat measurement can be told apart from a probe that never fired.
+/// Counter-signal on file: external's stage-4 coord mmap measured
+/// MADV_RANDOM as a regression (killed useful readahead under 6
+/// workers streaming semi-ordered payloads); sparse pass 2 has no such
+/// ordering, which is exactly what this probe tests (notes/altw.md P3).
+fn advise_random_store(mmap: &memmap2::MmapMut) {
+    #[cfg(unix)]
+    {
+        let advised = mmap.advise(memmap2::Advice::Random).is_ok();
+        crate::debug::emit_counter("altw_pass1_madvise_random", i64::from(advised));
+    }
+    #[cfg(not(unix))]
+    let _ = mmap;
 }

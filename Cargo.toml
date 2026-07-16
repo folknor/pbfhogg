@@ -81,7 +81,13 @@ rustc-hash = "2.1.3"
 zstd = "0.13"
 hotpath = "0.21.2"
 quick-xml = "0.41.0"
-serde_json = { version = "1.0.150", optional = true }
+# float_roundtrip: serde_json's default float parse is best-effort and can
+# land 1 ULP off the correctly-rounded value std::str::FromStr produces.
+# Extract bboxes cross that ULP into a different decimicrodegree after
+# floor/ceil, so `extract --config`/GeoJSON coordinates would disagree with
+# the byte-identical `--bbox` CLI string (found via a one-node multi-extract
+# vs sequential-extract mismatch at a strip boundary).
+serde_json = { version = "1.0.150", optional = true, features = ["float_roundtrip"] }
 s2 = { version = "0.1.0", default-features = false, features = ["float_extras"], optional = true }
 io-uring = { version = "0.7.13", optional = true }
 libc = "0.2.186"

@@ -67,6 +67,21 @@
 
 ### Changed
 
+- `add-locations-to-ways --index-type auto` is now scale-aware. It
+  previously picked `external` for every sorted + indexed input, which
+  misroutes small and medium inputs (denmark: sparse 5.8 s vs external
+  12.3 s; north-america: sparse wins by 26 %) - external's fixed
+  scratch round trips only pay off once the sparse store outgrows the
+  page cache. Auto now estimates the sparse store from per-blob
+  indexdata node counts (8 bytes per node) and picks `external` only
+  when the input is sorted + indexed AND the estimate exceeds 80 % of
+  the host's available RAM; the threshold is computed at runtime, so
+  the same file can route differently on differently-sized hosts (that
+  is the point). The routing decision and both numbers are printed to
+  stderr. When the estimate is unavailable (missing indexdata mid-file,
+  no `/proc/meminfo`), sorted + indexed inputs fall back to `external`
+  as before. Explicit `--index-type sparse|external` is unaffected.
+
 - `build-geocode-index`'s interpolation endpoint resolver replaces its
   transient hashmap spatial index with a sorted CSR built in parallel,
   and parallelizes endpoint resolution across interpolation ways.
@@ -140,6 +155,20 @@
   file in the background.
 
 ### Fixed
+
+- **`extract --config` and GeoJSON polygon coordinates now parse floats
+  identically to CLI `--bbox` strings.** serde_json's default float
+  parsing is best-effort and can land 1 ULP off the correctly-rounded
+  value on high-precision inputs (e.g. `12.639999999999999` parsed as
+  the f64 of `12.64`); after the floor/ceil decimicrodegree conversion
+  that ULP becomes a whole coordinate step, so the byte-identical bbox
+  could include a boundary node when passed via `-b` but exclude it via
+  `--config` or a GeoJSON file. Found as a persistent 1-node
+  multi-extract-vs-sequential mismatch at a denmark strip boundary
+  (node 5446477279 at longitude 12.6399999, sitting exactly on a
+  `12.4 + 4*0.06` strip edge). Fixed by enabling serde_json's
+  `float_roundtrip` feature; the parse-cost increase only touches
+  config/GeoJSON files, not PBF data.
 
 - **`degrade`'s header-only passthrough no longer silently drops OSMHeader
   fields.** With no `--generator`/`--output-header` override,

@@ -864,6 +864,80 @@ fn multi_extract_two_bbox_regions() {
     assert_eq!(relation_ids(&cb), vec![101]);
 }
 
+/// The config path parses bbox floats with serde_json, the CLI `-b` path
+/// with std `FromStr`. serde_json's default float parse is best-effort
+/// and can land 1 ULP off the correctly-rounded value on 17-digit inputs
+/// like 12.639999999999999; after the floor/ceil decimicrodegree
+/// conversion that ULP becomes a whole coordinate step, so a node sitting
+/// exactly on the boundary silently changes membership between `--config`
+/// and `-b` runs of the byte-identical bbox. Found as a persistent 1-node
+/// multi-extract-vs-sequential verify failure at a denmark strip boundary
+/// (n5446477279, lon 12.6399999, against boundary 12.4 + 4*0.06); fixed
+/// by serde_json's `float_roundtrip` feature, which this test pins.
+#[test]
+fn config_bbox_floats_parse_identically_to_cli_bbox() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let out_cli = dir.path().join("cli.osm.pbf");
+    let config = dir.path().join("config.json");
+
+    // Node 1 sits exactly on the boundary decimicro column: 12.6399999
+    // degrees = 126399999. The bbox min_lon 12.639999999999999 floors to
+    // 126399999 only when parsed correctly rounded (best-effort parsing
+    // yields the f64 of 12.64, which floors to 126400000 and drops the
+    // node). Node 2 is safely interior so both outputs are non-empty
+    // regardless.
+    let nodes = vec![
+        TestNode {
+            id: 1,
+            lat: 557_000_000,
+            lon: 126_399_999,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 2,
+            lat: 557_000_000,
+            lon: 126_500_000,
+            tags: vec![],
+            meta: None,
+        },
+    ];
+    write_test_pbf_sorted(&input, &nodes, &[], &[]);
+
+    run_extract(
+        &input,
+        &out_cli,
+        &RegionArg::Bbox("12.639999999999999,55.6,12.7,55.8"),
+        Strategy::Simple,
+    );
+
+    let config_json = format!(
+        r#"{{
+            "directory": "{}",
+            "extracts": [
+                {{ "output": "cfg.osm.pbf", "bbox": [12.639999999999999, 55.6, 12.7, 55.8] }}
+            ]
+        }}"#,
+        dir.path().display(),
+    );
+    std::fs::write(&config, config_json).expect("write config");
+    run_extract_multi(&input, &config, Strategy::Simple);
+
+    let cli_elements = read_all_elements(&out_cli);
+    let cfg_elements = read_all_elements(&dir.path().join("cfg.osm.pbf"));
+    assert_eq!(
+        node_ids(&cli_elements),
+        vec![1, 2],
+        "CLI -b must include the boundary node"
+    );
+    assert_eq!(
+        node_ids(&cfg_elements),
+        node_ids(&cli_elements),
+        "--config and -b must agree on the byte-identical bbox"
+    );
+}
+
 #[test]
 fn multi_extract_grid_matches_linear_bbox() {
     let dir = TempDir::new().expect("tempdir");

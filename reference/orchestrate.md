@@ -13,10 +13,10 @@ stage is auditable after the fact.
   Never delegates the commit.
 - **Claude Opus agents (Agent tool)** author and repair: they write the spec,
   co-review it, and review-and-fix the implementation.
-- **Codex xhigh** (`scripts/codex-review.py`) is the deepest reasoner in the
+- **Codex xhigh** (`review bare --profile deep`) is the deepest reasoner in the
   system. That depth is spent where an error is cheapest to catch: critiquing
   the spec document, before any code exists.
-- **Codex medium** (`scripts/codex-implement.py`) implements. This is not a
+- **Codex medium** (`review goal --profile build`) implements. This is not a
   cost compromise - it is the falsifiability test of
   `reference/technical-implementation-spec.md` itself. The contract promises
   "two implementers working from it independently produce the same artifact"
@@ -26,25 +26,26 @@ stage is auditable after the fact.
 
 ### Codex invocation
 
-Two scripts wrap the canonical `codex exec` call, one per role. Launch in the
-background, one Bash call, nothing before or after it:
+The `review` tool wraps the canonical codex launch; archetypes and profiles
+in `.review.toml` carry the role defaults. Launch in the background, one Bash
+call, nothing before or after it (piping into `review` is the sanctioned
+exception to the no-pipes rule):
 
-- Critique: `python3 scripts/codex-review.py '<prompt>'` (gpt-5.6-sol at
-  xhigh).
-- Implement: `python3 scripts/codex-implement.py '<prompt>'` (gpt-5.6-terra at
-  medium; the script adds the `/goal` prefix).
+- Critique: `echo '<prompt>' | review bare --profile deep` (gpt-5.6-sol at
+  xhigh, read-only sandbox).
+- Implement: `echo '<prompt>' | review goal --profile build` (gpt-5.6-terra
+  at medium, workspace-write; the `goal` archetype prepends `/goal `).
 
-The single argument is the prompt: one line, no linebreaks, plain ascii, no
-escapes or quoting tricks, single-quoted; substitute X and Y with plain paths.
-Each script sets the role's defaults - the model, the reasoning effort, the
-workspace-write sandbox, and `/goal` - so the caller normally owns only the
-prompt. Two defaults are overridable when a step explicitly calls for it:
-`--model <name>` on either script (defaults: review gpt-5.6-sol, implement
-gpt-5.6-terra), and `--effort <low|medium|high|xhigh>` on codex-implement.py
-(default medium; e.g. `--effort xhigh` to staff a hard landing at a stronger
-implementer tier). codex-review.py is fixed at xhigh; the sandbox and `/goal`
-are not overridable. The canonical default model lives in one place,
-`MODEL` at the top of `scripts/codex_common.py`.
+The piped prompt: one line, no linebreaks, plain ascii, no escapes or quoting
+tricks, single-quoted; substitute X and Y with plain paths. The `bare`
+archetype is deliberately empty - the prompt is the whole instruction, no
+persona primes the critique - which is what keeps every stage auditable. The
+canonical models, efforts, and sandboxes live in one place, the profile
+tables in `.review.toml`. `deep` is read-only BY DESIGN (a spec reviewer that
+can edit the tree is a bug), so staffing a hard landing at a stronger
+implementer tier means adding a workspace-write profile at the higher effort
+to `.review.toml` - an orchestrator-owned config edit - never pointing `goal`
+at `deep`.
 
 The sandbox is also network-isolated: no outbound connections, no git fetch,
 no cargo download. The load-bearing consequence is that codex cannot add a
@@ -59,20 +60,19 @@ crate will fail at compile time with no path to recovery inside that run;
 the mitigation belongs in the spec review (steps 2-3) or a pre-step-4
 side-step, not inside the codex run itself.
 
-The script keeps the raw NDJSON inside its own process and prints a clean
-digest at exit: the final agent message in full, the token usage, and any
-plain-text log lines codex emitted (surfaced, not dropped). The final message
-is captured via `--output-last-message`, so it survives even when a mid-run
-codex error halts the stream. There is nothing to peek at and nothing to flood
-context: a run is opaque until it exits, and its exit IS the signal.
+`review` prints the new session ID and the agent's closing response when the
+run exits. There is nothing to peek at and nothing to flood context: a run is
+opaque until it exits, and its exit IS the signal.
 
 We never resume a codex thread. A run that ends with its goal unmet - a gate
 honestly reported unpassed, bricks left unbuilt, victory wrongly declared - is
-replaced by a FRESH `codex-implement.py` run pointed at what remains, never
-`codex exec resume`. Fresh-from-spec is the methodology: the spec is the only
-communication channel, so a second implementer reads it exactly as the first.
+replaced by a FRESH `review goal --profile build` run pointed at what remains,
+never `review --session` (the flag exists for interactive follow-ups outside
+this loop and is never used inside it). Fresh-from-spec is the methodology:
+the spec is the only communication channel, so a second implementer reads it
+exactly as the first.
 
-The `/goal` prefix (added by codex-implement.py) is mechanical, not
+The `/goal` prefix (the `goal` archetype's priming prefix) is mechanical, not
 motivational: whenever the agent yields - a status report, a question, a
 premature wrap-up - the harness auto-replies "that is not what the user said,
 continue work" and the agent resumes. It structurally cannot hand back control
@@ -170,7 +170,7 @@ more.
 Launch simultaneously, both background:
 
 - Agent(opus)
-- codex `gpt-5.6-sol` at `xhigh`
+- codex via `review bare --profile deep`
 
 Both get the same prompt:
 
@@ -224,19 +224,19 @@ recoverable; it does not license the instruction.
 
 ### 4. Implement
 
-Launch `scripts/codex-implement.py`, background, with the prompt (the script
-adds `/goal`):
+Launch `review goal --profile build`, background, with the prompt piped on
+stdin (the `goal` archetype adds `/goal`):
 
 > Please implement Y from beginning to end. If you hit a gate, please try
 > honestly to overcome it. Do not commit.
 
-When the run ends, read the digest - do not take "done" on faith. If
-`final_message_captured: false`, the run ended without a final report
-(crashed, killed, or yielded out); if it is `true` but the message says the
-goal is unmet (a gate honestly reported unpassed, bricks left unbuilt, victory
-wrongly declared), it is likewise not done. In either case launch a FRESH
-`codex-implement.py` run whose prompt names what remains. Never resume. Repeat
-until the implementation is whole, then go to step 5.
+When the run ends, read the closing response in full - do not take "done" on
+faith. A run that ended without a final report (crashed, killed, or yielded
+out) is not done; one whose report says the goal is unmet (a gate honestly
+reported unpassed, bricks left unbuilt, victory wrongly declared) is likewise
+not done. In either case launch a FRESH `review goal --profile build` run
+whose prompt names what remains. Never resume. Repeat until the
+implementation is whole, then go to step 5.
 
 ### 5. Review and fix
 
@@ -406,10 +406,9 @@ nested second return into the work, and never reconstruct a contract document
 
 ## Telemetry
 
-`codex-review.py` and `codex-implement.py` print a digest at exit: the final
-agent message in full, the summed token usage, and any plain-text log lines
-codex emitted. Read the final message in full when a run ends - never a
-truncated excerpt. The closing report is where deferred work, honest gate
-failures, and wrongly-declared victories surface; a capped read is how they get
-missed. Each codex call's usage folds into the per-item cost ledger alongside
-the Agent calls, so each landed item gets a true cost figure.
+`review` prints the session ID and the agent's closing response at exit. Read
+the closing response in full when a run ends - never a truncated excerpt. The
+closing report is where deferred work, honest gate failures, and
+wrongly-declared victories surface; a capped read is how they get missed. Each
+codex run's reported usage folds into the per-item cost ledger alongside the
+Agent calls, so each landed item gets a true cost figure.

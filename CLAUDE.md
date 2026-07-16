@@ -49,11 +49,11 @@ The user can allow things that contravene these rules, for example allowing comm
 
 If and when the users asks for the orchestration loop, read `reference/orchestrate.md` before proceeding.
 
-Competitor reference sources remain available for research: `research/planetiler/` (Java), `research/tilemaker/` (C++), `research/tippecanoe/` (C++), `research/stedsplakat/` (TypeScript/JSTS Overpass→SVG poster renderer).
+Competitor reference sources remain available for research: `research/libosmium/` (C++ OSM library, the reference implementation), `research/osmium-tool/` (C++ CLI on libosmium, the direct competitor and `brokkr verify` oracle), `research/traccar-geocoder/` (reverse geocoder, the geocode_index precedent). The `competitors` group in `.review.toml` fans a question out to consultant archetypes grounded in these trees.
 
-- `scripts/codex-review.py '<prompt>'` - codex gpt-5.5 at xhigh reasoning, no goal. Spec critique before code exists.
-- `scripts/codex-implement.py [--effort LEVEL] '<prompt>'` - codex gpt-5.5, /goal-driven, medium default. Implements from a spec.
-- `scripts/codex_common.py` - shared launcher: runs `codex exec`, captures NDJSON internally, prints a clean digest (final message, usage, transcript path). Never resume a run; relaunch fresh.
+- `echo '<prompt>' | review bare --profile deep` - codex gpt-5.6-sol at xhigh, read-only sandbox, no persona. Spec critique before code exists.
+- `echo '<prompt>' | review goal --profile build` - codex gpt-5.6-terra at medium, workspace-write, /goal-driven. Implements from a spec.
+- Archetypes and profiles live in `.review.toml` (profiles are depth/access tiers, not roles). `review sessions` lists past runs; never resume a run inside the loop - relaunch fresh.
 
 ## Subagents
 

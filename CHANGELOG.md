@@ -127,6 +127,17 @@
   -5.7 %. Planet is not over-prefetched; the window stays bounded to
   what workers are about to consume.
 
+- `add-locations-to-ways --index-type sparse` advises the coordinate
+  store `MADV_RANDOM` once pass 1 has populated it, so pass 2's
+  genuinely-random lookups stop paying kernel readahead speculation
+  (~43 KB of disk read per major fault drops to ~4.8 KB). At europe
+  scale, where the store straddles the page-cache budget, the matched
+  A/B measured pass-2 disk read -57 % (600 GB to 260 GB) and total
+  wall -6.5 %. The win grows with cache pressure up to a point but
+  inverts under severe external memory pressure, where the
+  no-readahead trade multiplies synchronous fault round-trips; inputs
+  whose store fits comfortably in RAM are unaffected either way.
+
 - The sequential read path (`ElementReader::for_each`, `Blob::decode`,
   `Blob::to_primitiveblock`, `IndexedReader` iteration) no longer pays a
   whole-buffer copy per decoded block: decompression now lands directly in

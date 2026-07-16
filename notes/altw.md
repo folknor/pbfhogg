@@ -65,7 +65,7 @@ anyway. Built and reverted twice; see P4 before touching it.
 | japan | **11.3 s** | `13347065` | `add8d03` | 2026-07-14 | current, `--bench 3`. P0 recovered the ~0.9 s prepass regression; at/below the 11.4 s pre-prepass mark. Retires 12.3 s (`26203e64`), 15.5 s (`a3c46737`, cold-walk single sample) and 11.9 s |
 | germany | **25.7 s** | `61f6c231` | `dcc445e` | 2026-07-14 | first sparse pin at this scale (P1 cell) |
 | north-america | **116.4 s** | `340ba366` | `dcc445e` | 2026-07-14 | first sparse pin at this scale (P1 cell) |
-| europe | **363.1 s** | `4ac11326` | `dcc445e` | 2026-07-14 | current; flat vs 359.7 s @ `c6f08ff` (+0.9 %). Post-P0 `89683dda` (`add8d03`) measured 369.8 s - NOT a regression and NOT a new baseline: single `--bench 1` cells 6 h apart, +1.8 % is inside the drift band, and P0 cut europe's pass-0 union -8.3 s on identical refs. Interleave before quoting any europe sparse wall delta |
+| europe | **359 s** | `3027542f` | `25cb0df` | 2026-07-16 | current (P3 `MADV_RANDOM` kept; quiet host, post-trim). Supersedes 363.1 s (`4ac11326`, `dcc445e`) as bookkeeping only - the cells are not comparable (host load, trim state, P0 landed between). P3's matched quiet pair is the evidence: pass-2 work -11.3 %, pass-2 disk read -57 % vs same-day baseline `c45b45ee`. Interleave before quoting any europe sparse wall delta |
 | planet | untried | - | - | - | ~60 GB working set vs ~25 GB cache; expected thrash. External owns planet. |
 
 Europe hotpath at `dcc445e`: `c790eb34` (310.5 s) - the first sparse
@@ -198,17 +198,19 @@ touch the whole store; with cache < store, the fault count is set by
 twice (chunk-format OOM; per-block sorted resolve identical kill
 point). Full record preserved below in the history sections.
 
-### NEW 2026-07-13: europe pass 2 reads ~37 KB per major fault
+### Europe pass 2 reads ~37 KB per major fault (found 2026-07-13, FIXED by P3 2026-07-16)
 
 251 GB disk read / 6.8 M majflt is ~37 KB per fault against a store
 where a lookup needs one 4 KB page. That ratio points at mmap
 readahead amplification on a random access pattern - the kernel is
-speculating adjacent pages that mostly miss. This motivates the P3
-`MADV_RANDOM` probe. Counter-signal to respect: external's stage-4
-history measured `MADV_RANDOM` as *worse* on its 37 GB coord mmap
-(killed useful readahead, majflt 374 K -> 9.2 M) - but that regime had
-6 workers streaming semi-ordered payloads; sparse pass 2 is genuinely
-random per ref. One cell decides it.
+speculating adjacent pages that mostly miss. This motivated the P3
+`MADV_RANDOM` probe. Counter-signal that was respected: external's
+stage-4 history measured `MADV_RANDOM` as *worse* on its 37 GB coord
+mmap (killed useful readahead, majflt 374 K -> 9.2 M) - but that
+regime had 6 workers streaming semi-ordered payloads; sparse pass 2 is
+genuinely random per ref. **The probe ran 2026-07-16 and was KEPT**:
+~43 KB/fault dropped to ~4.8 KB/fault and pass-2 disk read fell -57 %
+on the matched pair. Full record in P3 below.
 
 ### NEW 2026-07-13: `--index-type auto` is scale-blind and misroutes small inputs
 
@@ -528,14 +530,66 @@ count, peak anon, and exact set-equality against the serial
 implementation (closure ways, repeated refs, dangling high refs,
 corrupt-indexdata fixtures).
 
-### P3. `MADV_RANDOM` probe on the pass-2 coord mmap (one cell)
+### P3. `MADV_RANDOM` probe on the pass-2 coord mmap - MEASURED 2026-07-16, KEEP (`25cb0df`)
 
-One `madvise` call on the sparse store before pass 2, one europe
-bench. Justified by the 37 KB-per-majflt readahead signal above;
-risked by external's opposite result in a different regime. If wall
-improves or disk read collapses without wall regression, keep; if it
-reproduces external's readahead-loss regression, record and close.
-Aimed directly at the 197 s dominant phase - highest
+**Landed and kept.** `advise_random_store` in `sparse.rs` advises the
+store mapping `MADV_RANDOM` after pass 1 completes (the write pass
+keeps default readahead); `altw_pass1_madvise_random` records whether
+the call applied. Six europe `--bench 1` cells at `25cb0df` (probe) vs
+`--commit 13910d2` (baseline), 2026-07-16, plantasjen, all same-day:
+
+| cell | arm | conditions | pass 2 minus walk | pass-2 disk read | pass-2 majflt | KB/fault |
+|---|---|---|---:|---:|---:|---:|
+| 1 `53763e55` | baseline | loaded | 329.1 s | 888 GB | 20.3 M | 44 |
+| 2 `7027481c` | probe | loaded | 200.8 s | 245 GB | 50.5 M | 4.9 |
+| 3 `9a72b914` | baseline | loaded | 339.9 s | 797 GB | 18.5 M | 43 |
+| 4 `6b9942e5` | probe | **external memory pressure** | 405.9 s | 462 GB | 104.2 M | 4.4 |
+| 5 `3027542f` | probe | quiet | 231.2 s | 260 GB | 54.3 M | 4.8 |
+| 6 `c45b45ee` | baseline | quiet | 260.8 s | 600 GB | 15.1 M | 40 |
+
+The matched quiet pair (5 vs 6, adjacent cells): pass-2 work
+**-11.3 %**, pass-2 disk read **-57 %** (600 -> 260 GB), total wall
+**-6.5 %** (384 -> 359 s) - the pre-registered keep criterion met on
+both counts. Uncontaminated pass-2-work distributions do not overlap
+(probe max 231.2 s < baseline min 260.8 s), and on disk read even the
+contaminated probe cell beat the best baseline cell. The ~43 KB/fault
+readahead-amplification signature drops to ~4.8 KB/fault, directly
+confirming the mechanism this probe was aimed at.
+
+**The caveat cell 4 buys, worth the wear:** `MADV_RANDOM` trades bytes
+for fault round-trips - ~3x fewer bytes read, 2.5-5x more major
+faults, each a synchronous ~4 KB read. Where the cache budget is
+adequate the byte win dominates. Under external memory pressure
+(cell 4 ran concurrently with an unrelated heavy job) pages refault
+~2x as often for identical work, the round-trip count explodes, and
+the wall win can invert. That cell had no matched baseline under the
+same pressure, so it adjudicates nothing arm-vs-arm - but it maps the
+failure regime honestly: the win compresses as free RAM shrinks. This
+is the same trade external's stage-4 measured as a net loss on its
+semi-ordered access pattern; sparse pass 2's genuinely-random pattern
+is why the sign differs here.
+
+**Method notes:** cell 5's pass-2 window carried a 38.2 s cold
+schedule walk while cell 6's walk was warm at 0.35 s - the raw pass-2
+walls read as a probe *loss* (269.4 vs 261.2 s) until the walk is
+subtracted per the P4 rule. And the six cells ran under visibly
+varying host load (walls 359-527 s on byte-identical baseline work),
+which is why the verdict rests on the adjacent matched pair plus the
+drift-immune KB/fault signature, not on cross-cell wall medians.
+
+New europe sparse reference: **359 s `--bench 1`** (`3027542f`,
+`25cb0df`, quiet host, post-trim). Supersedes 363.1 s (`4ac11326`) -
+note the two are NOT comparable cells (different host load, trim
+state, and P0 landed between them); the matched pair above is the
+evidence, this line is just the bookkeeping.
+
+The original probe rationale, for the record: one `madvise` call on
+the sparse store before pass 2. Justified by the 37 KB-per-majflt
+readahead signal above; risked by external's opposite result in a
+different regime. If wall improves or disk read collapses without
+wall regression, keep; if it reproduces external's readahead-loss
+regression, record and close. Aimed directly at the dominant phase -
+highest
 information-per-engineering-minute item on this list.
 
 ### P4. Unify the redundant header walks - CLOSED 2026-07-14, BUILT AND REVERTED. DO NOT RE-ATTEMPT.

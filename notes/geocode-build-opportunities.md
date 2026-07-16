@@ -5,7 +5,8 @@
 
 > **Scope.** This plan targets wall-time for the *full-rebuild* path -
 > `build-geocode-index` against a cold PBF. Complementary effort in
-> [incremental-geocode-index.md](incremental-geocode-index.md) targets
+> the incremental-update plan (TODO.md "Research / stretch ideas";
+> its analysis note retired to git history 2026-07-16) targets
 > *avoiding* the full rebuild on daily diffs (currently blocked on a
 > format-v2 element-ID change; see that doc for the design sketches).
 

@@ -23,8 +23,8 @@ count - not byte size - is the scaling signal**.
 
 Drafted 2026-04-24 after `getparents` `HeaderWalker` conversion revealed
 a sharp europe vs planet asymmetry. This doc captures the insight and the
-measurement plan; concrete numbers fill in once the `repack` command
-(`notes/repack.md`) can produce same-corpus-different-encoding pairs.
+measurement plan; concrete numbers filled in once the `repack` command
+could produce same-corpus-different-encoding pairs.
 
 ## The asymmetry
 
@@ -242,7 +242,41 @@ The dispatch rule this supports: HeaderWalker wins iff
 `blob_count × ~45 µs < bytes_skipped / scan_rate`. Crossover for
 getparents-shaped workloads sits between 51 k and 522 k blobs.
 io_uring-batched header probes would flatten the walk term entirely
-(known non-pursued lever in `notes/getparents.md`).
+(known non-pursued lever; see "The unbuilt batched-walker primitive"
+below).
+
+### The unbuilt batched-walker primitive (deferred; do not build speculatively)
+
+Consolidated from `notes/header-walk-batching.md` (retired 2026-07-16;
+full text in git history). Every serial-schedule-walk cost in this
+document shares one physical term: `HeaderWalker::next_header` is a
+single-threaded QD=1 pread per blob, ~45-70 µs, linear in blob count -
+~3.5 s at 50 k production-planet blobs (invisible), ~100 s at 1.45 M
+8k blobs (dominant). The one primitive that would flatten it is an
+**io_uring batched-header-probe walker**: submit K header preads in
+flight, harvest completions, resubmit - call site stays
+single-threaded, `fadvise(RANDOM)` preserved, NVMe queue-depth
+concurrency recovered. Four call-site families would share it: sort
+pass 1, the getparents/getid walker arms, `check --refs`/`--ids` (the
+big winners, ~2/3 walk at 8k), and the re-encoding
+`build_classify_schedules_split` callers (marginal, 18-29 % walk).
+
+Why it is not trivial: the PBF stream has no top-level blob index, so
+blob N+1's offset is only known after reading blob N's header -
+sharding across threads cannot work without a resync-to-blob-boundary
+primitive that does not exist. Batching hides the latency without
+breaking the dependency. Rejected alternatives: buffered-sequential
+walk dispatched on blob count (measured for sort as the "M3"
+experiment - europe -21 % but planet +11 %, see
+`reference/performance-history.md` "Sort"), and a worker-sharded
+resync scan (days of work, needs the missing primitive).
+
+Deferred because production planet is 50 k blobs and production sort
+input is already sorted: the lever only pays on high-blob-count or
+unsorted-at-scale workloads, neither configured nor real today. Build
+it the day one becomes real - it is one primitive, not four fixes.
+Estimating its payoff requires the eviction pattern, never the sum of
+per-phase walk durations (the P4 lesson, `notes/altw.md`).
 
 ### getid include mode confirms, steeper (2026-07-10)
 
@@ -388,16 +422,19 @@ in TODO.md.
 
 ## Cross-references
 
-- [`notes/repack.md`](../notes/repack.md) - command that produces the
-  alternate-packing planet for measurements.
-- [`notes/degrade.md`](../notes/degrade.md) - command for producing
+- `repack` (`reference/cli-reference.md`) - the command that produces
+  the alternate-packing planet for measurements (its retired design
+  note lives in git history: `notes/repack.md`, deleted 2026-07-16).
+- `degrade` (`reference/cli-reference.md`) - command for producing
   adversarial test PBFs; the `--unsort` mode exercises `sort`'s
   overlap-run path which is orthogonal to but motivated alongside
-  this work.
+  this work (retired note: `notes/degrade.md`, git history).
 - [`reference/performance-history.md`](performance-history.md) "Sort" -
   the `HeaderWalker` pass-1 trade-off that first surfaced the asymmetry.
-- [`notes/getparents.md`](../notes/getparents.md) - second instance
-  of the same asymmetry, larger magnitude.
+- getparents - second instance of the same asymmetry, larger
+  magnitude; its full measurement record (retired note:
+  `notes/getparents.md`, git history) is condensed into the matrix
+  above and TODO.md's getparents entry.
 - [`reference/pipelined-reader-paths.md`](pipelined-reader-paths.md) -
   existing callers of `into_blocks_pipelined`, candidates for
   threshold dispatch.

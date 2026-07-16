@@ -670,9 +670,10 @@ Preserved as negative results so these do not get re-proposed:
   see the section above). The axis is closed in both directions - zstd:1
   is not a planet lever, and no further cell is licensed. Any future
   reopen needs a *new* reason, not this one.
-  libdeflate-at-planet is owned by
-  `notes/write-path-optimization-plan.md` item 2b; if it lands there,
-  re-measure the ALTW streaming phase, do not fork the work here.
+  libdeflate-at-planet is owned by the write-path deferred entry in
+  TODO.md (formerly write-path plan item 2b; the plan note retired to
+  git history 2026-07-16); if it lands there, re-measure the ALTW
+  streaming phase, do not fork the work here.
 - #1 epoch-spill with the 16-byte spill record (2026-04-21, +10 %
   planet). Any retry must use the L16 12-byte form.
 - #3 scratch-spool in any buffered/varint form (two attempts). zlib-rs

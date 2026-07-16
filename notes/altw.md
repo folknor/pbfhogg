@@ -628,7 +628,7 @@ plus the phase table:
 
 Each walk is ~522,168 QD=1 header preads at ~50 us/blob and ~374 K
 voluntary context switches, single-threaded. That rate independently
-matches `notes/getparents.md` (~45 us/blob) and
+matches `reference/blob-density.md` (~45 us/blob) and
 `reference/blob-density.md`. The headers do not survive in page cache
 between phases because pass 1 writes a 29 GB store and pass 2 reads
 251 GB, evicting everything in between. External does not have this

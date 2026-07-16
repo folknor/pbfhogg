@@ -150,8 +150,10 @@ fn repack_respects_element_cap() {
 /// holds here but is NOT general: whenever the cap fails to divide the
 /// per-input-blob element count on a multi-blob shrink, the guard emits
 /// each input blob's tail as its own under-cap block and the output blob
-/// count grows with the number of input blobs (accepted trade - see
-/// `notes/repack.md`).
+/// count grows with the number of input blobs (accepted trade: the
+/// ordering guard that keeps output monotonic across coalesced blob
+/// boundaries flushes the central builder before each input blob's
+/// direct full blocks, which is what fragments non-dividing tails).
 #[test]
 fn repack_blob_count_matches_prediction() {
     let dir = tempfile::tempdir().expect("tempdir");

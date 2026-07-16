@@ -488,8 +488,8 @@ chase in software on this storage stack.
 
 The io_uring batched-header-probe walker that would flatten the europe
 pass-1 regression (and the same primitive several other commands want) is
-consolidated in `notes/header-walk-batching.md`; deferred,
-production-negligible.
+consolidated in `reference/blob-density.md` "The unbuilt batched-walker
+primitive"; deferred, production-negligible.
 
 ### Correctness: intra-blob disorder (fixed 2026-07-11)
 

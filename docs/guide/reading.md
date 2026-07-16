@@ -291,6 +291,42 @@ for blob in &mut reader {
 
 `BlobReader::open(path, true)` opens with O_DIRECT, same as `ElementReader::open`.
 
+### WayMembers-v1 / SharedNodePins-v1 (opt-in)
+
+`add-locations-to-ways --inject-prepass` writes two private wire extensions
+for downstream reuse: a per-way-blob bitmap in BlobHeader field 5
+(`pbfhogg.WayMembers-v1`) and a per-way bitmap in `Way` field 20
+(`pbfhogg.SharedNodePins-v1`). Reading them back requires opting in - way-member
+parsing is disabled by default to avoid allocating metadata unused by normal
+reads:
+
+```rust
+use pbfhogg::{BlobReader, BlobDecode, Element};
+
+let mut reader = BlobReader::from_path("tests/test.osm.pbf")?;
+reader.set_parse_waymembers(true);
+
+for blob in &mut reader {
+    let blob = blob?;
+    // Raw bitmap + encoded way count, or None if absent/disabled/malformed.
+    let _bitmap = blob.way_members();
+    let _count = blob.way_member_count();
+
+    if let BlobDecode::OsmData(block) = blob.decode()? {
+        for element in block.elements() {
+            if let Element::Way(way) = element {
+                let _pins = way.shared_node_pins(); // raw field-20 bitmap
+            }
+        }
+    }
+}
+# Ok::<(), std::io::Error>(())
+```
+
+Both accessors return raw bitmap bytes, not a typed structure - this is
+low-level plumbing for tools that want to reuse pbfhogg's own prepass rather
+than a general-purpose API. Most library consumers will never need it.
+
 ## IndexedReader - filtered reads
 
 `IndexedReader` builds an in-memory index of blob positions and ID ranges, then seeks directly to relevant blobs. Useful when you need specific elements by ID from a large file.

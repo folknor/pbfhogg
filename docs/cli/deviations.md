@@ -36,7 +36,8 @@ is substituted and the total count is reported in the summary line as
 extract boundaries reference nodes outside the extract. Failing by default
 forces every user to discover and pass `--ignore-missing-nodes`, which is the
 right behavior in virtually all cases. The substituted `(0, 0)` is consistent
-with the Null Island sentinel used by `DenseMmapIndex` (see [Correctness](/guide/correctness)).
+with the Null Island sentinel used by the node coordinate indexes (see
+[Correctness](/guide/correctness)).
 
 ## diff: content equality vs version ordering
 

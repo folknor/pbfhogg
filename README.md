@@ -10,7 +10,7 @@
 <p align="center">
   <a href="https://crates.io/crates/pbfhogg"><img src="https://img.shields.io/crates/v/pbfhogg" alt="crates.io"></a>
   <a href="https://docs.rs/pbfhogg"><img src="https://img.shields.io/docsrs/pbfhogg" alt="docs.rs"></a>
-  <img src="https://img.shields.io/badge/rust-1.87+-orange?logo=rust" alt="MSRV 1.87">
+  <img src="https://img.shields.io/badge/rust-1.96+-orange?logo=rust" alt="MSRV 1.96">
   <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue" alt="License"></a>
 </p>
 
@@ -82,7 +82,7 @@ The goal for pbfhogg 1.0 is that every CLI command must be planet-scale safe on 
 
 ```toml
 [dependencies]
-pbfhogg = "0.4"
+pbfhogg = "0.5"
 ```
 
 ```rust

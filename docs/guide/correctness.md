@@ -86,14 +86,20 @@ users who need to handle Osmosis input should check for `-1` themselves. The tra
 is accepted: the dense iterator is too hot to add branches for a single producer's
 non-standard encoding.
 
-## Null Island ambiguity in dense mmap index
+## Null Island ambiguity in coordinate indexes
 
-**Status:** Known, accepted. Documented in code.
+**Status:** Known, accepted. Documented in code at every affected site.
 
-**Context:** `DenseMmapIndex` (used by `add-locations-to-ways`) stores node coordinates
-as `(lat: i32, lon: i32)` pairs in a direct-addressed array, using `(0, 0)` as the
-"unset" sentinel. This means a node at exactly `0.0000000, 0.0000000` (Null Island)
-is treated as missing.
+**Context:** Every index that stores node coordinates as `(lat: i32, lon: i32)`
+pairs in a zero-initialized backing store uses `(0, 0)` as the "unset" sentinel:
+`add-locations-to-ways`'s `SparseArrayIndex` (the default `sparse` index type)
+treats a packed `(lat, lon) == 0` as absent, its `external` mode's resolved-count
+pass treats a coordinate tuple `== (0, 0)` as unresolved, and the geocode index
+builder's way-coordinate collection filters out `(0, 0)` pairs the same way. This
+means a node at exactly `0.0000000, 0.0000000` (Null Island) is treated as missing
+by all three. The former `DenseMmapIndex` (removed - see [Advanced
+Topics](./advanced#add-locations-to-ways-index-types)) had the same sentinel and the
+same limitation.
 
 **Impact:** Ways referencing nodes at exactly `(0, 0)` - decimicrodegree precision,
 so within ~11mm of the intersection of the prime meridian and equator - will not

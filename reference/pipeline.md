@@ -39,7 +39,7 @@ Single-threaded: `BlobReader` → decompress → `PrimitiveBlock` on the calling
 
 Used by:
 - `diff` / `derive-changes` (via `StreamingBlocks::new_sequential()`) - two files read in lockstep
-- `tags-count` - avoids 25+ GB heap retention at planet scale
+- `inspect tags` (internally `tags_count`, osmium's `tags-count`) - avoids 25+ GB heap retention at planet scale
 
 ### Blob Filtering (pre-decode)
 
@@ -113,8 +113,27 @@ K-way sorted merge of multiple PBFs. Blob-level passthrough for non-overlapping 
 ### sort
 
 Two-pass blob-level permutation sort.
-1. Scan all blobs, build index of (element_type, min_id, max_id)
-2. Non-overlapping blobs: raw passthrough. Overlapping blobs: decode → binary heap merge → re-encode.
+1. Scan all blobs, build index of (element_type, min_id, max_id). For
+   inputs whose header does not declare `Sort.Type_then_ID` (including
+   indexed inputs - blob indexdata alone does not prove intra-blob
+   order), pass 1 decodes every blob payload and checks intra-blob ID
+   monotonicity along the way, flagging any internally out-of-order
+   blob for the rewrite path even when its range does not overlap its
+   neighbours. Declared-sorted inputs keep the header-only fast path
+   (index built from indexdata, no payload decode) and trust the
+   header's claim.
+2. Non-overlapping, intra-sorted blobs: raw passthrough. Overlapping or
+   intra-unsorted blobs: decode → binary heap merge → re-encode.
+
+### export
+
+Single sequential `ElementReader::for_each` pass, no parallelism. Rejects
+up front if way export is requested and the header lacks
+`LocationsOnWays`. Per element: tag filter → (for ways) geometry
+assembly and area/winding classification → property serialization →
+streamed to a `FeatureWriter` (`geojsonseq`: one Feature per line;
+`geojson`: buffered into one FeatureCollection). Untagged nodes/ways and
+ways with invalid geometry are skipped and counted, not errored.
 
 ### apply-changes (merge)
 
@@ -144,6 +163,12 @@ Geographic extraction with three strategies:
 - `--smart` - three passes: also completes multipolygon/boundary relation members
 
 Multi-extract via `--config` JSON: single pass producing multiple output files.
+Node classification against N regions prunes candidates with a CSR grid
+(`RegionGrid`, `src/read/region_grid.rs`; 3600x1800 cells of 0.1 degree over
+the region bboxes) once `N >= 16` and the grid fits a 256 MiB coverage
+budget; below either threshold it falls back to the linear per-region scan.
+Output is identical either way - the grid only narrows which regions get
+tested per node.
 
 ### tags-filter
 
@@ -157,8 +182,21 @@ Also supports `--input-kind osc` for filtering OSC change files.
 
 ### getid / getparents
 
-- `getid`: indexed seek (via `IndexedReader`) or full scan. Optional `--add-referenced` (two-pass) and `--invert` (removeid).
-- `getparents`: full scan, reverse-lookup of ways/relations referencing given IDs.
+Both commands' include mode (the default query path, not `--invert`)
+dispatch between two scan arms via the shared `dispatch_scan_arm`
+(ADR-0006): a pread `HeaderWalker` walk (single-threaded, one pread per
+blob header, skips blob bodies it doesn't need) or a full pipelined scan.
+Non-indexed input is pinned to the walker arm. Indexed input estimates
+the OSMData blob count and picks the walker below
+`FULL_SCAN_ARM_MIN_BLOBS` (150,000 blobs), full scan at or above it -
+the walker wins on low-blob-count planet-shaped encodings, the scan
+wins once per-blob pread overhead dominates on high-blob-count
+encodings (see `reference/blob-density.md`). `getid --invert`
+(removeid) is pinned to the walker arm; its streaming full-scan
+counterpart doesn't exist yet.
+
+- `getid`: optional `--add-referenced` (two-pass, pulls in referenced nodes of matching ways).
+- `getparents`: reverse-lookup of ways/relations referencing given IDs.
 
 ### add-locations-to-ways
 
@@ -166,11 +204,17 @@ Embeds node coordinates in ways. Index strategies (`--index-type`, default
 `sparse`; `dense` was removed 2026-04 - sparse is faster at every measured
 scale):
 
-**Sparse** (default): rank-indexed flat file. Builds an `IdSet` of
-way-referenced nodes; workers pwrite packed `(lat, lon)` at byte offset
-`rank << 3` into a values file (`referenced_count * 8` bytes, ~29 GB at
-europe), read back via mmap with batched sorted access. Small-to-europe
-scale; likely thrashes at planet.
+**Sparse** (default): rank-indexed flat mmap. Builds an `IdSet` of
+way-referenced nodes; pass 1 workers store packed `(lat, lon)` at byte
+offset `rank_if_set(node_id) << 3` via relaxed `AtomicU64::store`
+directly into a pre-allocated, `MmapMut`-mapped values file
+(`referenced_count * 8` bytes, ~29 GB at europe) - no chunk format, no
+serial writer bottleneck. Pass 2's `get(node_id)` is
+`rank_if_set(node_id)` plus an `AtomicU64::load` at the same offset;
+once pass 1 finishes, the store is advised `MADV_RANDOM` so pass 2's
+genuinely-random per-ref lookups stop paying kernel readahead
+speculation (matched A/B at europe: pass-2 disk read -57%, total wall
+-6.5%). Small-to-europe scale; likely thrashes at planet.
 
 **External** (`altw/external/`, 4-stage bounded-memory join; requires
 sorted + indexed input):
@@ -233,8 +277,6 @@ OSC-only: merges multiple OSC XML files into one. Optional `--simplify` keeps on
 
 ---
 
----
-
 ## Author's Production Pipeline
 
 _The following describes the specific deployment that drives pbfhogg's development. It documents how the author uses pbfhogg in a planet-scale OSM refresh pipeline feeding tile generation and reverse geocoding. It is not part of the library's public API or general documentation - it records operational context, allocation budgets, and performance measurements specific to this ecosystem._
@@ -274,11 +316,11 @@ Consequences:
 - The production merge drops `--locations-on-ways`. The feature stays in
   the library and CLI for users who do not re-enrich; it is just no
   longer load-bearing for this pipeline.
-- Enrichment injection is flag-gated (working name `--inject-prepass`);
-  default altw output stays byte-identical, brokkr passes the flag when
-  enriching, and sparse implements both fields too so the backend-parity
-  canary keeps covering them (decision 2 of the same note, ratified
-  alongside).
+- Enrichment injection is flag-gated (`add-locations-to-ways
+  --inject-prepass`); default altw output stays byte-identical, brokkr
+  passes the flag when enriching, and sparse implements both fields too
+  so the backend-parity canary keeps covering them (decision 2 of the
+  same note, ratified alongside).
 - Daily write volume roughly doubles at planet: apply-changes rewrites
   ~92% of blobs (~90 GB output) and altw writes the full enriched file
   again. Wall stays comfortable (~17-18 min for the whole loop); NVMe

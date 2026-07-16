@@ -18,15 +18,47 @@ command count.
 | `renumber` | `renumber` | Same |
 | `add-locations-to-ways` | `add-locations-to-ways` | Same |
 | `time-filter` | `time-filter` | Same |
-| `diff` | `diff` | Content equality instead of version ordering (see [DEVIATIONS](DEVIATIONS.md#diff-content-equality-vs-version-ordering)) |
+| `diff` | `diff` | Content equality instead of version ordering (see [DEVIATIONS](../DEVIATIONS.md#diff-content-equality-vs-version-ordering)) |
 | `apply-changes` | `apply-changes` | Same |
 | `merge-changes` | `merge-changes` | Same |
+| `export` | `export` | Fixed area rule and property model, not osmium's configurable export rules - see `export: area detection and property model` below |
 | `fileinfo` | `inspect` | Different name, more capabilities |
 | `check-refs` | `check --refs` | Consolidated into `check` |
 | `merge` | `cat --dedupe` | Consolidated into `cat` |
 | `derive-changes` | `diff --format osc` | Consolidated into `diff` |
 | `removeid` | `getid --invert` | Consolidated into `getid` |
 | `tags-count` | `inspect tags` | Consolidated into `inspect` |
+
+## export: area detection and property model
+
+osmium's `export` reads a user-supplied JSON config that can override
+per-element geometry type, property inclusion, and area classification.
+pbfhogg's `export` has no config file - the rules are fixed:
+
+- **Area detection** (`src/commands/export/geometry.rs::is_area_way`,
+  `is_area_tags`): a way becomes a `Polygon` only if it is closed
+  (`first ref == last ref`, at least 4 refs) AND its tags pass the area
+  heuristic - `area=no` always disqualifies; otherwise `area=yes` or the
+  presence of any of `building`, `landuse`, `natural`, `leisure`,
+  `amenity`, `boundary`, `waterway` (`AREA_KEYS`) qualifies. Every other
+  way (open, or closed but untagged for area) becomes a `LineString`.
+  Polygon exterior rings are re-wound counterclockwise
+  (`write_way_geometry`'s signed-area check) and always explicitly
+  closed in the output, regardless of whether the source way repeats
+  its first node ID. A closed way with fewer than 3 geometrically
+  distinct positions is rejected as invalid geometry, not silently
+  emitted as a degenerate polygon.
+- **Property model** (`src/commands/export/properties.rs::write_properties`):
+  every feature gets `@id` and `@type`. `--metadata` adds `@version`,
+  `@timestamp` (RFC 3339 UTC), `@changeset`, `@uid`, `@user`, `@visible`
+  when present on the source element. Remaining OSM tags are emitted as
+  properties in source order, first-occurrence-wins on a duplicate key,
+  filtered by `--properties` (whitelist) when given, and skipped
+  entirely if the key collides with a reserved `@`-prefixed name (the
+  tag is dropped, not renamed or errored).
+
+There is no equivalent to osmium's config-driven per-element overrides;
+every input is classified by the same fixed rule.
 
 ## Consolidated commands
 
@@ -91,7 +123,7 @@ and vice versa for `--increment-version` / `--update-timestamp`.
 **Lossless deletes:** pbfhogg's `diff --format osc` produces a perfect roundtrip
 - applying the derived OSC to the old PBF reproduces the new PBF exactly.
 osmium's `derive-changes` can lose deletes when the deleted element is absent
-from both input files (see [DEVIATIONS](DEVIATIONS.md#derive-changes-lossless-delete-roundtrip)).
+from both input files (see [DEVIATIONS](../DEVIATIONS.md#derive-changes-lossless-delete-roundtrip)).
 
 ### merge is now `cat --dedupe`
 
@@ -208,7 +240,6 @@ These osmium flags have no pbfhogg equivalent:
 
 | osmium command | Status |
 |----------------|--------|
-| `export` | Planned (GeoJSON export design exists, not yet implemented) |
 | `changeset-filter` | Not planned. Changeset processing is a niche use case. |
 | `create-locations-index` / `query-locations-index` | Not needed. pbfhogg builds indexes in-memory via anonymous mmap. |
 | `show` | Implemented via `inspect --show <TYPE_ID>` |

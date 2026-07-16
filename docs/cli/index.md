@@ -6,7 +6,7 @@ pbfhogg includes a command-line toolkit for common OSM PBF operations. Install i
 cargo install pbfhogg-cli
 ```
 
-The binary is called `pbfhogg`. Requires Rust 1.87+.
+The binary is called `pbfhogg`. Requires Rust 1.96+.
 
 ## Commands at a Glance
 
@@ -16,8 +16,11 @@ The binary is called `pbfhogg`. Requires Rust 1.87+.
 | `check` | Validate IDs and referential integrity |
 | `cat` | Concatenate PBFs with optional type filtering |
 | `sort` | Sort into standard order (nodes, ways, relations by ID) |
+| `repack` | Re-encode a PBF with a configurable per-blob element cap |
+| `degrade` | Produce a valid-but-adversarial PBF for benchmarking non-optimal paths |
 | `extract` | Extract by bounding box or GeoJSON polygon (simple/complete/smart) |
 | `tags-filter` | Filter elements by tag expressions (PBF or OSC input) |
+| `export` | Stream tagged nodes/ways to GeoJSON or GeoJSONSeq |
 | `diff` | Compare two PBFs; `--format osc` generates an OSC diff |
 | `getid` | Extract or remove elements by ID |
 | `getparents` | Find ways/relations referencing given IDs |

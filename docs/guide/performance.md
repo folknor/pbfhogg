@@ -115,9 +115,11 @@ Generate an indexed PBF once with `pbfhogg cat`, then use it for all subsequent 
 |------|----------|-----------|
 | `sparse` (default) | Small to europe scale | Rank-indexed flat mmap (~8 bytes per referenced node); needs `referenced_count * 8` bytes of temp disk |
 | `external` | Planet-scale, memory-constrained hosts | Bounded memory, all sequential I/O; needs sorted input + indexdata + ~256 GB temp disk at planet |
-| `auto` | Recommended default | external if sorted+indexed, else sparse |
+| `auto` | Recommended default | scale-aware: sparse unless the input is sorted+indexed and the estimated node store exceeds ~80% of available RAM |
 
 At planet scale on a 30 GB machine, `external` is the only mode that survives. A previous `dense` mode was removed: sparse rank-indexed flat dominates dense at every measured scale.
+
+`auto`'s threshold is computed at runtime from per-blob indexdata node counts, so the same file can route to `sparse` on one host and `external` on another. Below the threshold, `external`'s fixed scratch round trips cost more than they save - denmark measured sparse 5.8s vs external 12.3s, and north-america favors sparse by 26%.
 
 ### O_DIRECT for planet-scale I/O
 

@@ -13,6 +13,7 @@ command count.
 | `sort` | `sort` | Same |
 | `extract` | `extract` | `--strategy` replaced by `--simple` / `--smart` flags |
 | `tags-filter` | `tags-filter` | Also handles OSC input (see below) |
+| `export` | `export` | GeoJSON/GeoJSONSeq only; nodes and ways only (see below) |
 | `getid` | `getid` | Same |
 | `getparents` | `getparents` | Same |
 | `renumber` | `renumber` | Same |
@@ -140,6 +141,25 @@ pbfhogg tags-filter --input-kind osc -o out.osc changes.osc.gz highway=primary
 OSC mode always preserves deletes. PBF-only flags (`-R`, `-i`, `-t`) are
 rejected in OSC mode.
 
+### export
+
+```
+# osmium
+osmium export -o out.geojson input.pbf
+
+# pbfhogg
+pbfhogg export input.pbf -o out.geojson --format geojson
+pbfhogg export input.pbf                                  # geojsonseq to stdout, the default
+```
+
+**Scope differences:** pbfhogg's `export` only emits GeoJSON / GeoJSONSeq
+(osmium also supports text, JSON, and OPL output formats). Only tagged nodes
+(as Points) and tagged, closed-or-open ways (as Polygons or LineStrings) are
+exported - relation features are never emitted, and untagged nodes/ways are
+skipped. Way export requires the input header to declare `LocationsOnWays`;
+`--type node` works without it. See [Commands](./commands#export) for filter,
+property, bbox, and metadata flags.
+
 ### fileinfo is now `inspect`
 
 ```
@@ -203,12 +223,12 @@ These osmium flags have no pbfhogg equivalent:
 | `--output-header` | Most write commands | Set replication header fields |
 | `--json` | inspect, check | Machine-readable output |
 | `--index-type` | add-locations-to-ways | `sparse` (default), `external`, `auto` (different values from osmium's `-i`) |
+| `--inject-prepass` | add-locations-to-ways | Emit opt-in `pbfhogg.WayMembers-v1` / `pbfhogg.SharedNodePins-v1` metadata for downstream reuse |
 
 ## Commands pbfhogg doesn't have
 
 | osmium command | Status |
 |----------------|--------|
-| `export` | Planned (GeoJSON export design exists, not yet implemented) |
 | `changeset-filter` | Not planned. Changeset processing is a niche use case. |
 | `create-locations-index` / `query-locations-index` | Not needed. pbfhogg builds indexes in-memory via anonymous mmap. |
 | `show` | Implemented via `inspect --show <TYPE_ID>` |

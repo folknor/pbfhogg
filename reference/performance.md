@@ -303,6 +303,29 @@ merge-walk. See `notes/altw-external.md` for the full A1 chain.
 (~16 GB) exceeds available RAM, causing thrashing. External's sequential
 I/O stays bounded.
 
+### Sparse `MADV_RANDOM` on the coord store (europe, plantasjen, 2026-07-16, commit `25cb0df`)
+
+Pass 2's random lookups no longer pay kernel readahead speculation: the
+store mapping is advised `MADV_RANDOM` once pass 1 has populated it.
+Adjudicated on the matched quiet pair (cells adjacent, same day,
+post-trim; full six-cell record in notes/altw.md P3):
+
+| | probe `3027542f` (`25cb0df`) | baseline `c45b45ee` (`13910d2`) | delta |
+|---|---:|---:|---:|
+| pass 2 minus schedule walk | 231.2 s | 260.8 s | **-11.3 %** |
+| pass-2 disk read | 260 GB | 600 GB | **-57 %** |
+| pass-2 KB per major fault | ~4.8 | ~43 | mechanism confirmed |
+| total wall | **359 s** | 384 s | -6.5 % |
+
+**359 s (`3027542f`) is the current europe sparse reference** (quiet
+host, post-trim, `--bench 1`), superseding 363.1 s (`4ac11326`) as
+bookkeeping only - the cells are not comparable. Caveat carried from
+the adjudication: under severe external memory pressure the
+no-readahead trade multiplies synchronous fault round-trips (104 M vs
+54 M faults for identical work in the contaminated cell) and the wall
+win can invert; inputs whose store fits comfortably in RAM are
+unaffected either way.
+
 ### Compression axis (Europe external, plantasjen, `--bench 1`)
 
 | Compression | Wall | Peak anon | UUID | Commit | Δ vs zlib:6 |
@@ -1185,9 +1208,11 @@ pbfhogg CLI underneath; different measurement.
 corresponding April-11 snapshot registered under the planet dataset's
 snapshot key.
 
-Shard-based block-pair merge (opt-in via `-j/--jobs N`, commit
-`06628d8` 2026-04-20, `--bench 1`). Both text and `--format osc`
-paths parallelise over the same ID-range shard plan.
+Shard-based block-pair merge (`-j/--jobs N`, commit `06628d8`
+2026-04-20, `--bench 1`; sharding was opt-in via explicit `-j N` at
+measurement time, and became the default with `-j` defaulting to `0`
+in 0.5.0 - see CHANGELOG.md). Both text and `--format osc` paths
+parallelise over the same ID-range shard plan.
 
 | UUID | Args | Wall | Peak anon RSS | vs sequential |
 |---|---|---:|---:|---:|

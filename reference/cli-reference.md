@@ -1,6 +1,6 @@
 # pbfhogg CLI Reference
 
-Version 0.4.1. Generated from `pbfhogg --help` output.
+Version 0.5.0. Generated from `pbfhogg --help` output.
 
 ## Global flags
 
@@ -154,7 +154,7 @@ pbfhogg repack [OPTIONS] --output <OUTPUT> <FILE>
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
-**v1 limitation:** the cap fires per worker invocation, so output blobs cannot grow beyond the input blob size. Shrinking (e.g. planet 228 k -> 8 k) produces multiple output blobs per input blob and the cap fires correctly. Growing (e.g. europe 8 k -> 64 k) emits at-most-input-sized output blobs; cross-input-blob coalescing is deferred to v2.
+Growing (e.g. europe 8 k -> 64 k) coalesces elements across input-blob boundaries, so caps larger than the input blob size fire correctly. On a coalescing shrink the output blob count is not the general `ceil(elements / cap)`: each input blob whose element count is not a multiple of the cap emits its tail as its own possibly-under-cap block (the deliberate trade that keeps output ID-monotonic across coalesced boundaries). When the input header declares `LocationsOnWays`, the output re-advertises it and every inline way-node coordinate round-trips exactly; the two `pbfhogg.*` prepass features (`WayMembers-v1`, `SharedNodePins-v1`) are dropped with a warning.
 
 ### degrade
 
@@ -290,7 +290,7 @@ geometry are skipped and reported in the stderr summary.
 
 ### diff
 
-Compare two PBF files and show differences. Uses content equality (coordinates, tags, refs, members) rather than version/timestamp ordering - deterministic regardless of metadata completeness (see [DEVIATIONS](DEVIATIONS.md#diff-content-equality-vs-version-ordering)).
+Compare two PBF files and show differences. Uses content equality (coordinates, tags, refs, members) rather than version/timestamp ordering - deterministic regardless of metadata completeness (see [DEVIATIONS](../DEVIATIONS.md#diff-content-equality-vs-version-ordering)).
 
 With `--format osc`, generates an OSC diff file instead of text output. Text-only flags (`-c`, `-v`, `-s`/`--osmium-summary`, `-q`, `-t`) are not valid with `--format osc`. OSC-only flags (`--increment-version`, `--update-timestamp`) are not valid with `--format text`.
 
@@ -307,15 +307,12 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 | `-q, --quiet` | Exit-code only, suppress output (text only) |
 | `-o, --output <FILE>` | Write output to file (required for `--format osc`) |
 | `-t, --type <TYPE>` | Filter by element type (text only) |
-| `-j, --jobs <N>` | Parallel shard count. `1` (default) keeps the sequential merge-join; `0` auto-picks from `available_parallelism()`; higher values partition the ID space across N worker threads. Applies to both text and `--format osc`. |
+| `-j, --jobs <N>` | Parallel shard count. `0` (default) auto-picks from `available_parallelism()`; `1` restores the sequential, scratch-free path; higher values partition the ID space across N worker threads. Applies to both text and `--format osc`; parallel sharding requires both inputs to be indexed, and `-v/--verbose` always uses the sequential path. The parallel path writes shard temp files next to the output (planet scale: ~30 GB text, ~45 GB osc XML), removed on completion. |
 | `--increment-version` | Bump version of deleted elements by 1 (osc only) |
 | `--update-timestamp` | Set delete timestamp to current time (osc only) |
-| `--ignore-changeset` | Compatibility flag (already ignored by content-equality mode) |
-| `--ignore-uid` | Compatibility flag (already ignored by content-equality mode) |
-| `--ignore-user` | Compatibility flag (already ignored by content-equality mode) |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 
-With `--format osc`, produces a lossless roundtrip - applying the derived OSC to the old PBF reproduces the new PBF exactly (see [DEVIATIONS](DEVIATIONS.md#derive-changes-lossless-delete-roundtrip)).
+With `--format osc`, produces a lossless roundtrip - applying the derived OSC to the old PBF reproduces the new PBF exactly (see [DEVIATIONS](../DEVIATIONS.md#derive-changes-lossless-delete-roundtrip)).
 
 ### getid
 
@@ -368,7 +365,7 @@ pbfhogg getparents [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 Embed node coordinates in ways. Two index strategies:
 
 - **sparse** (default) - Rank-indexed flat mmap array. Pre-allocates `referenced.total_count() * 8` bytes; workers store `(lat, lon)` at byte offset `IdSet::rank_if_set(node_id) << 3` via atomic stores. Fast at small / medium scale; survives Europe at ~6 minutes on a 27 GB-RAM host. Likely thrashes at planet (working set exceeds free page cache) - use `external` for planet.
-- **external** - Double radix permutation via 4-stage pipeline. Bounded memory (~17 GB at planet). The only mode that survives at planet on memory-constrained hosts. Requires sorted PBF (Sort.Type\_then\_ID) and indexdata. Uses ~112 GB temp disk at Europe, ~256 GB at planet.
+- **external** - Double radix permutation via 4-stage pipeline. Bounded memory (~8.7 GB measured peak anon at planet). The only mode that survives at planet on memory-constrained hosts. Requires sorted PBF (Sort.Type\_then\_ID) and indexdata. Uses ~224 GB temp disk at planet.
 
 `--index-type dense` was removed - sparse rank-indexed flat dominated dense at every measured scale (japan dense 51.6 s vs sparse 11.9 s). Passing `--index-type dense` errors with a pointer to `sparse`.
 
@@ -383,6 +380,7 @@ pbfhogg add-locations-to-ways [OPTIONS] --output <OUTPUT> <FILE>
 | `-o, --output <FILE>` | Output file |
 | `--index-type <TYPE>` | Node index type: `sparse` (default), `external`, or `auto` (scale-aware: sparse unless the input is sorted+indexed and the estimated node store exceeds ~80 % of available RAM) |
 | `--keep-untagged-nodes` | Keep all untagged nodes in output |
+| `--inject-prepass` | Emit the opt-in `pbfhogg.WayMembers-v1` and `pbfhogg.SharedNodePins-v1` metadata into the output header, readable back via `Blob::way_members` / `Way::shared_node_pins` |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--force` | Proceed even if input lacks indexdata |
@@ -441,6 +439,7 @@ pbfhogg merge-changes [OPTIONS] --output <OUTPUT> <CHANGES>...
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `--simplify` | Keep only the last change per object (type + id) |
+| `-j, --jobs <N>` | Parallel worker threads. `1` forces sequential, `0` (default) auto-picks from `available_parallelism()`, higher values cap the pool. Affects both the per-input parse fan-out (capped by input count) and the simplify path's chunk fan-out. |
 
 ### build-geocode-index
 
@@ -461,6 +460,7 @@ pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
 | `--max-admin-vertices <N>` | Douglas-Peucker vertex cap per admin polygon [default: 500] |
 | `--search-radius <M>` | Fine-level max search distance in meters [default: 75] |
 | `--coarse-search-radius <M>` | Coarse-level max search distance in meters [default: 1000] |
+| `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--force` | Proceed without indexdata / overwrite existing index |
 
 Outputs 19 binary files. Denmark (465 MB PBF): ~7s, 172 MB index. Europe (32.4 GB): 524s (8.7 min), 7.5 GB RSS. Planet (87 GB): 1,255s (20.9 min), 29.5 GB peak RSS (pass-1.5 transient).

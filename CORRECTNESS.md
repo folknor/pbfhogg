@@ -94,17 +94,18 @@ non-standard encoding.
 pairs in a zero-initialized backing store uses `(0, 0)` as the "unset"
 sentinel:
 
-- `DenseMmapIndex::get` treats `packed == 0` as absent
-  (`src/commands/add_locations_to_ways.rs`, `DenseMmapIndex::get`).
-- `SparseArrayIndex::get_at_offset` treats `lat == 0 && lon == 0` as absent
-  (`src/commands/add_locations_to_ways.rs`, `SparseArrayIndex::get_at_offset`).
-- External-join stage 2 counts an entry as resolved only when
-  `lat != 0 || lon != 0` (`src/commands/altw/stage2.rs`, `is_resolved`), and
-  `Stats.missing_locations = total_slots - resolved_count`.
+(The dense index this section was named for was removed at `b70dd8c`;
+the sentinel convention survives in its successors, listed below.)
+
+- `SparseArrayIndex::get` treats `packed == 0` as absent
+  (`src/commands/altw/sparse.rs`).
+- External-join stage 2 counts a slot as resolved only when its coord
+  tuple is `!= (0, 0)`, and
+  `stats.missing_locations = total_slots - resolved_count`
+  (`src/commands/altw/external/mod.rs`).
 - Geocode builder Pass 2 filters ways' `(lat, lon)` coords with
   `if lat == 0 && lon == 0 { None }` inside the `way.refs()` filter_map
-  (`src/geocode_index/builder.rs`, the `coords` collection in the
-  per-way handler).
+  (`src/geocode_index/builder/pass2.rs`).
 
 All sites therefore treat a node at exactly `0.0000000, 0.0000000` (Null
 Island) as missing, with identical user-visible behavior. Each site carries

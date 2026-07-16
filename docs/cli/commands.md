@@ -1,6 +1,6 @@
 # pbfhogg CLI Reference
 
-Version 0.4.1. Generated from `pbfhogg --help` output.
+Version 0.5.0. Generated from `pbfhogg --help` output.
 
 ## Global flags
 
@@ -38,6 +38,7 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 |------|-------------|
 | `--indexed` | Check if PBF has blob-level indexdata (exit code 0 = yes, 1 = no) |
 | `--nodes` | Analyze node coordinate statistics for FOR compression sizing |
+| `-j, --jobs <N>` | Parallel worker threads for `--nodes` (only). `0` (default) auto-picks from `available_parallelism()`, `1` forces sequential, higher values cap the pool. Other inspect modes ignore this flag |
 | `--blocks [N]` | Show per-block distribution stats and optional block listing (N limits to first/last N blocks) |
 | `--id-ranges` | Show min/max element IDs per type and monotonicity |
 | `--locations` | Show locations-on-ways diagnostics |
@@ -60,6 +61,7 @@ Count tag key=value frequencies (subcommand of `inspect`).
 | `-s, --sort <ORDER>` | Sort order: count-desc (default), count-asc, name-asc, name-desc |
 | `-e, --expressions <FILE>` | Read tag expressions from file (one per line, # comments) |
 | `-t, --type <TYPE>` | Filter by element type: node, way, or relation |
+| `-j, --jobs <N>` | Parallel worker threads. `0` (default) auto-picks from `available_parallelism()`, `1` forces sequential, higher values cap the pool |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--force` | Proceed even if input lacks indexdata (slower fallback path) |
 
@@ -154,7 +156,7 @@ pbfhogg repack [OPTIONS] --output <OUTPUT> <FILE>
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
-**v1 limitation:** the cap fires per worker invocation, so output blobs cannot grow beyond the input blob size. Shrinking (e.g. planet 228 k -> 8 k) produces multiple output blobs per input blob and the cap fires correctly. Growing (e.g. europe 8 k -> 64 k) emits at-most-input-sized output blobs; cross-input-blob coalescing is deferred to v2.
+Growing (e.g. europe 8 k -> 64 k) coalesces elements across input-blob boundaries, so caps larger than the input blob size fire correctly. On a coalescing shrink the output blob count is not the general `ceil(elements / cap)`: each input blob whose element count is not a multiple of the cap emits its tail as its own possibly-under-cap block (the deliberate trade that keeps output ID-monotonic across coalesced boundaries). When the input header declares `LocationsOnWays`, the output re-advertises it and every inline way-node coordinate round-trips exactly; the two `pbfhogg.*` prepass features (`WayMembers-v1`, `SharedNodePins-v1`) are dropped with a warning.
 
 ### degrade
 
@@ -174,6 +176,7 @@ pbfhogg degrade [OPTIONS] --output <OUTPUT> <FILE>
 | `--strip-locations` | Drop the `LocationsOnWays` header feature. Inline way-node coordinates are not preserved. |
 | `--strip-indexdata` | Clear `BlobHeader.indexdata` on every OsmData blob. Forces commands into their `--force` / non-indexed fallback paths (`sort`, `getid`, `tags-filter`). Blob payloads are not decompressed. |
 | `--strip-tagdata` | Clear `BlobHeader.tagdata` (the per-blob tag key index) on every OsmData blob, forcing `tags-filter`'s no-hint fallback path. Leaves `indexdata` intact. |
+| `--strip-bbox` | Clear `HeaderBlock.bbox` so the output declares no file-level extent. Header-only change; no OsmData blob is touched. Does not affect `extract --bbox`, which derives its region from the CLI argument and per-blob indexdata bboxes rather than the header. |
 | `--drop-ids <N:SEED>` | Deterministically remove exactly N elements selected globally by kind, ID, and seed. Surviving references to removed elements intentionally dangle. |
 | `--force` | Skip the indexdata precondition required by the decode path (falls back to scanning every blob for every kind; slower). |
 | `--compression` | Blob compression [default: zlib] |
@@ -182,9 +185,9 @@ pbfhogg degrade [OPTIONS] --output <OUTPUT> <FILE>
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
-`--strip-indexdata` alone runs as a blob-level passthrough (raw frames reframed with cleared `indexdata`, payload bit-identical). Any combination involving `--unsort`, `--strip-locations`, or `--drop-ids` decodes elements and re-encodes via `BlockBuilder`. `--drop-ids` requires `N:SEED`, rejects zero N, and is reproducible for a given input and seed.
+`--strip-indexdata`, `--strip-tagdata`, and/or `--strip-bbox` (with no `--unsort`/`--strip-locations`/`--drop-ids`) run as a header-and-blob-level passthrough: only the targeted field is cleared and every other header and blob-header field survives byte-for-byte, including `source`, custom optional features, replication metadata, and unknown/extension fields. Any combination involving `--unsort`, `--strip-locations`, or `--drop-ids` decodes elements and re-encodes via `BlockBuilder`. `--drop-ids` requires `N:SEED`, rejects zero N, and is reproducible for a given input and seed.
 
-Other transformations from the design doc (`--strip-bbox`, `--recompress`) are deferred.
+`--recompress` from the design doc remains deferred; so do configurable `--unsort` chaos modes (rotate / shuffle / reverse).
 
 ### renumber
 
@@ -236,7 +239,7 @@ pbfhogg extract [OPTIONS] <FILE>
 
 Filter elements by tag expressions. Default mode resolves relation members transitively (matched relations pull in member ways, nodes, and nested relations). With `-R`, only directly matched elements are emitted.
 
-With `--input-kind osc` (or autodetected from `.osc`/`.osc.gz` extension), filters an OSC change file instead, always preserving deletes. PBF-only flags (`-R`, `-i`, `-t`) are not valid in OSC mode.
+With `--input-kind osc` (or autodetected from `.osc`/`.osc.gz` extension), filters an OSC change file instead, always preserving deletes. PBF-only flags (`-R`, `-i`, `-t`, `-j`) are not valid in OSC mode (OSC parsing is single-threaded).
 
 Expressions use osmium syntax: `highway=primary`, `amenity`, `w/building=yes`, etc.
 
@@ -252,11 +255,44 @@ pbfhogg tags-filter [OPTIONS] --output <OUTPUT> <FILE> [EXPRESSIONS]...
 | `-i, --invert-match` | Invert match: exclude matching objects, keep non-matching (PBF only) |
 | `-t, --remove-tags` | Remove tags from referenced objects not directly matched (use without -R; PBF only) |
 | `-e, --expressions <FILE>` | Read filter expressions from file (one per line, # comments) |
+| `-j, --jobs <N>` | Worker-pool size for the parallel classify phases (PBF only). `0` (default) uses rayon's `available_parallelism()`. Two-pass mode only: combining `-j` with `-R` is an error since the single-pass path uses the pipelined reader, not the parallel classify path |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--force` | Proceed even if input lacks indexdata |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
+
+### export
+
+> **0.5.0**
+
+Stream a PBF to GeoJSON. Tagged nodes become Points. Tagged ways become
+LineStrings, or Polygons when they are closed and satisfy the built-in area
+rules. Untagged nodes and ways are skipped. Relation features are not emitted.
+Way export requires the input header to declare `LocationsOnWays`; `--type
+node` works without it.
+
+The default `geojsonseq` format writes one Feature object per newline with no
+RFC 8142 record-separator byte. `geojson` writes one FeatureCollection.
+
+```
+pbfhogg export [OPTIONS] <FILE> [EXPRESSIONS]...
+```
+
+| Flag | Description |
+|------|-------------|
+| `-o, --output <FILE>` | Write to a guarded file instead of stdout |
+| `--format <FORMAT>` | `geojsonseq` (default) or `geojson` |
+| `--type <TYPE>` | Export only `node` or `way` |
+| `-e, --expressions <FILE>` | Read tag expressions from a file, one per line |
+| `--properties <KEYS>` | Comma-separated whitelist of tag property keys |
+| `--bbox <BBOX>` | `min_lon,min_lat,max_lon,max_lat`; ways match by vertex containment only, so crossing or enclosing geometry without an inside vertex is omitted |
+| `--metadata` | Add available `@version`, `@timestamp`, `@changeset`, `@uid`, `@user`, and `@visible` properties |
+
+Every feature includes `@id` and `@type`. Metadata timestamps are RFC 3339 UTC
+strings. Tags that collide with emitted reserved property names are omitted.
+Polygon exterior rings are closed and counterclockwise. Ways with invalid
+geometry are skipped and reported in the stderr summary.
 
 ### diff
 
@@ -272,16 +308,14 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 |------|-------------|
 | `--format <FORMAT>` | Output format: `text` (default) or `osc` |
 | `-c, --suppress-common` | Hide unchanged elements (text only) |
-| `-v, --verbose` | Show detailed changes for modified elements (text only) |
-| `-s, --summary` | Show summary on stderr (text only) |
+| `-v, --verbose` | Show detailed changes for modified elements (text only). Always takes the sequential path regardless of `-j` |
+| `-s, --osmium-summary` | Print osmium-style summary (left/right/same/different counts) to stderr instead of the default pbfhogg-format summary (text only). The pbfhogg-format summary always fires on stderr unless `--quiet` - this flag only swaps the format |
 | `-q, --quiet` | Exit-code only, suppress output (text only) |
 | `-o, --output <FILE>` | Write output to file (required for `--format osc`) |
 | `-t, --type <TYPE>` | Filter by element type (text only) |
+| `-j, --jobs <N>` | Parallel shard count for the block-pair merge. `0` (default) auto-picks from available cores; `1` restores the sequential, scratch-free path; higher values partition the ID space across that many worker threads. Applies to both `--format text` and `osc`; requires both inputs indexed; `-v/--verbose` always uses the sequential path. The parallel path writes shard temp files (planet scale: ~30 GB text, ~45 GB osc XML), removed on completion |
 | `--increment-version` | Bump version of deleted elements by 1 (osc only) |
 | `--update-timestamp` | Set delete timestamp to current time (osc only) |
-| `--ignore-changeset` | Compatibility flag (already ignored by content-equality mode) |
-| `--ignore-uid` | Compatibility flag (already ignored by content-equality mode) |
-| `--ignore-user` | Compatibility flag (already ignored by content-equality mode) |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 
 With `--format osc`, produces a lossless roundtrip - applying the derived OSC to the old PBF reproduces the new PBF exactly (see [DEVIATIONS](/cli/deviations#derive-changes-lossless-delete-roundtrip)).
@@ -352,6 +386,7 @@ pbfhogg add-locations-to-ways [OPTIONS] --output <OUTPUT> <FILE>
 | `-o, --output <FILE>` | Output file |
 | `--index-type <TYPE>` | Node index type: `sparse` (default), `external`, or `auto` (scale-aware: sparse unless the input is sorted+indexed and the estimated node store exceeds ~80 % of available RAM) |
 | `--keep-untagged-nodes` | Keep all untagged nodes in output |
+| `--inject-prepass` | Emit the opt-in `pbfhogg.WayMembers-v1` and `pbfhogg.SharedNodePins-v1` metadata for downstream reuse |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--force` | Proceed even if input lacks indexdata |
@@ -390,6 +425,7 @@ pbfhogg apply-changes [OPTIONS] --output <OUTPUT> <BASE> <CHANGES>
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `--locations-on-ways` | Preserve and update way-node locations through the merge (requires base PBF with LocationsOnWays) |
+| `-j, --jobs <N>` | Worker-pool size for the descriptor-first pipeline. `0` (default) uses the `nproc - 2` heuristic (leaves two cores for the scanner + drain threads, min 1) |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--io-uring` | Use io_uring for output I/O |
@@ -409,6 +445,7 @@ pbfhogg merge-changes [OPTIONS] --output <OUTPUT> <CHANGES>...
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `--simplify` | Keep only the last change per object (type + id) |
+| `-j, --jobs <N>` | Parallel worker threads. `1` forces sequential, `0` (default) auto-picks from `available_parallelism()`, higher values cap the worker pool. Affects both the per-input parse fan-out and the simplify path's chunk fan-out |
 
 ### build-geocode-index
 
@@ -429,6 +466,7 @@ pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
 | `--max-admin-vertices <N>` | Douglas-Peucker vertex cap per admin polygon [default: 500] |
 | `--search-radius <M>` | Fine-level max search distance in meters [default: 75] |
 | `--coarse-search-radius <M>` | Coarse-level max search distance in meters [default: 1000] |
+| `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--force` | Proceed without indexdata / overwrite existing index |
 
 Outputs 19 binary files. Denmark (465 MB PBF): ~7s, 172 MB index. Europe (32.4 GB): 524s (8.7 min), 7.5 GB RSS. Planet (87 GB): 1,255s (20.9 min), 29.5 GB peak RSS (pass-1.5 transient).

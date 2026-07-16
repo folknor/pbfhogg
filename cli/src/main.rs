@@ -541,10 +541,10 @@ enum Command {
         ///              Fast at small / medium scale; survives europe at ~6 minutes
         ///              on a 27 GB-RAM host. Works on any PBF. Needs temp disk equal
         ///              to referenced_nodes * 8 bytes.
-        ///   external - double radix permutation. Bounded memory (~17 GB planet),
+        ///   external - double radix permutation. Bounded memory (~8.7 GB planet),
         ///              all sequential I/O. The only mode that survives at planet
         ///              on memory-constrained hosts. Requires sorted PBF and
-        ///              indexdata. ~256 GB temp disk at planet.
+        ///              indexdata. ~224 GB temp disk at planet.
         #[arg(long, default_value = "sparse")]
         index_type: String,
         /// Emit pbfhogg's opt-in WayMembers-v1 and SharedNodePins-v1 metadata.

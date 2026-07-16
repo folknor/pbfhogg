@@ -64,11 +64,13 @@ pbfhogg add-locations-to-ways input.osm.pbf -o output.osm.pbf --index-type exter
 |------|--------|------|-----------------|----------|
 | `sparse` (default) | ~540 MB + IdSet/rank index | `referenced_count * 8` bytes (japan 2 GB, europe ~29 GB) | no | Small to europe scale; survives europe at ~6 minutes on a 27 GB-RAM host |
 | `external` | ~8.7 GB | ~256 GB (planet) | yes + indexdata | Planet-scale, the only mode that survives at planet on memory-constrained hosts |
-| `auto` | varies | varies | external if sorted+indexed, else sparse | Recommended default |
+| `auto` | varies | varies | scale-aware (see below) | Recommended default |
 
 **sparse** is a rank-indexed flat mmap array (~8 bytes per referenced node). Builds a referenced-id IdSet in pass 1, then writes locations in pass 2 indexed by rank within that set. Works on any PBF.
 
 **external** uses a rank-bucketed counting sort with parallel stages and bounded memory. Requires sorted input with indexdata. ~256 GB temp disk at planet scale.
+
+**auto** is scale-aware, not a fixed choice: it estimates the sparse store size from per-blob indexdata node counts (8 bytes per node) and routes to `external` only when the input is sorted + indexed AND the estimate exceeds ~80% of the host's available RAM - otherwise it picks `sparse`. The threshold is computed at runtime, so identical input can route differently on differently-sized hosts. Auto previously routed every sorted + indexed input to `external`, which misrouted small and medium inputs (denmark: sparse 5.8s vs external 12.3s) since external's fixed scratch round trips only pay off once the sparse store outgrows the page cache. When the estimate is unavailable (missing indexdata mid-file, no `/proc/meminfo`), sorted + indexed inputs fall back to `external`. The routing decision and both numbers are printed to stderr. Explicit `--index-type sparse|external` is unaffected.
 
 A previous `dense` mode (a direct-mapped mmap array indexed by node ID) was removed: the rank-indexed flat sparse layout dominated dense at every measured scale (japan 4.3x faster) and worked in regimes dense did not (europe survives where dense OOMs).
 
@@ -120,5 +122,5 @@ The index can be queried from Rust using the `geocode-reader` feature:
 
 ```toml
 [dependencies]
-pbfhogg = { version = "0.4", default-features = false, features = ["geocode-reader"] }
+pbfhogg = { version = "0.5", default-features = false, features = ["geocode-reader"] }
 ```

@@ -48,9 +48,10 @@ pub enum IndexType {
     /// for planet.
     #[default]
     Sparse,
-    /// External join via double radix permutation. Bounded memory (<1 GB),
-    /// all sequential I/O. Uses ~224 GB temp disk at planet scale. The
-    /// only mode that survives at planet on a memory-constrained host.
+    /// External join via double radix permutation. Bounded memory
+    /// (~8.7 GB at planet), all sequential I/O. Uses ~224 GB temp disk at
+    /// planet scale. The only mode that survives at planet on a
+    /// memory-constrained host.
     External,
     /// Auto-select on scale. Sparse unless the input is sorted + indexed
     /// (external's precondition) AND the estimated sparse store exceeds

@@ -43,6 +43,19 @@ mechanism, not the tiering model.
 Tiers 1-3 are `brokkr check` profiles. Tiers 4-5 are separate
 brokkr commands.
 
+`brokkr check` enforces a fixed 20 s per-test watchdog with no
+override, on every profile including `--profile full`. Tests slower
+than that can never pass a `check` profile, so `brokkr.toml`'s
+`[test.profiles.full]` carries a by-name `skip` list for the
+over-watchdog tests (`merge_cross_validate_osmium`,
+`sort_cross_validate_osmium`, `roundtrip_denmark`, and the six
+`geocode_index` real-data tests) - without it the profile could
+never pass, by construction. Those tests are `#[ignore]`d out of
+`check`'s reach and must be exercised individually via `brokkr test
+<name> --timeout <secs>`, which raises the per-test timeout up to
+280 s. See TODO.md's "Important: ignored tests" for the current
+by-name list and runbook.
+
 `mod platform` and `mod serial` are orthogonal config overlays, not
 tiers. Same for `#[ignore = "external"]` (escape hatch for in-tree
 osmium checks).

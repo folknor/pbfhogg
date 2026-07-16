@@ -64,12 +64,29 @@ skip = ["tier2::", "tier3::", "platform::", "serial::"]
 include_ignored = false
 
 # Tier 3 - full in-project correctness gate (pre-merge). include_ignored
-# picks up slow real-data tests (roundtrip_denmark, geocode_index, etc)
-# that #[ignore] keeps out of tier 1. Platform tier handled separately.
+# picks up fast ignored tests that #[ignore] keeps out of tier 1.
+# Platform tier handled separately. The over-watchdog tests (anything
+# slower than brokkr check's fixed 20 s per-test kill - the two osmium
+# cross-validations, roundtrip_denmark, and the six geocode_index
+# real-data tests) are skipped here BY NAME and must be run
+# individually via `brokkr test <name> --timeout <secs>`; before this
+# skip list existed the profile could never pass, by construction
+# (first hit 2026-07-16 on merge_cross_validate_osmium).
 [test.profiles.full]
-description = "Full in-project correctness gate (tier 3, pre-merge)"
+description = "Full in-project correctness gate (tier 3, pre-merge); over-watchdog tests run individually via brokkr test"
 sweeps = ["all"]
-skip = ["platform::"]
+skip = [
+    "platform::",
+    "merge_cross_validate_osmium",
+    "sort_cross_validate_osmium",
+    "roundtrip_denmark",
+    "build_denmark_index",
+    "query_copenhagen",
+    "query_rural_jutland",
+    "query_north_sea",
+    "api_equivalence",
+    "coarse_fallback",
+]
 include_ignored = true
 
 # Platform-sensitive tests: --direct-io, --io-uring, MEMLOCK-dependent

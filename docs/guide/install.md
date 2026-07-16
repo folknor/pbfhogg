@@ -8,7 +8,7 @@ Install the `pbfhogg` binary from crates.io:
 cargo install pbfhogg-cli
 ```
 
-This builds from source with fat LTO. The binary is called `pbfhogg`. Requires Rust 1.87+.
+This builds from source with fat LTO. The binary is called `pbfhogg`. Requires Rust 1.96+.
 
 ## Library
 
@@ -16,14 +16,14 @@ Add the library to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pbfhogg = "0.4"
+pbfhogg = "0.5"
 ```
 
 This enables the default `commands` feature. If you only need read/write (no extract, check-refs, or geocode index), disable it to skip `serde_json` and `s2` dependencies:
 
 ```toml
 [dependencies]
-pbfhogg = { version = "0.4", default-features = false }
+pbfhogg = { version = "0.5", default-features = false }
 ```
 
 ### Feature flags
@@ -39,7 +39,7 @@ For reverse geocoding queries without the full `commands` feature:
 
 ```toml
 [dependencies]
-pbfhogg = { version = "0.4", default-features = false, features = ["geocode-reader"] }
+pbfhogg = { version = "0.5", default-features = false, features = ["geocode-reader"] }
 ```
 
 ## Building from source
@@ -58,7 +58,7 @@ cargo install --path cli --features linux-direct-io,linux-io-uring
 
 ### Build requirements
 
-- Rust 1.87 or later
+- Rust 1.96 or later
 - No C compiler required - all protobuf encoding is hand-rolled wire format, and zlib uses `zlib-rs` (pure Rust)
 - No `protoc` or Protocol Buffers toolchain needed
 

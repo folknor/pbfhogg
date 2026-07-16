@@ -34,7 +34,7 @@ linux-io-uring = ["pbfhogg/linux-io-uring"]
 test-hooks = ["pbfhogg/test-hooks"]
 
 [dependencies]
-pbfhogg = { version = "0.4", path = "..", default-features = false, features = ["commands"] }
+pbfhogg = { version = "0.5", path = "..", default-features = false, features = ["commands"] }
 clap = { version = "4.6.1", features = ["derive"] }
 # float_roundtrip must match the library's serde_json (see root Cargo.toml):
 # correctly-rounded float parsing keeps config/GeoJSON coordinates identical

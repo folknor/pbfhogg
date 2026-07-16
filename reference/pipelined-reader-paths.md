@@ -89,7 +89,7 @@ the file.
 - **Surface:** fused (`for_each_fused_block`)
 - **Path:** `src/commands/getparents/mod.rs`, FullScan arm
 - **Scale:** high-blob-count encodings only. ADR-0006 dispatches
-  low-blob-count planet (~36 k blobs) to the `HeaderWalker` arm; the
+  low-blob-count planet (~50 k blobs) to the `HeaderWalker` arm; the
   FullScan arm runs at ~150 k+ estimated OSMData blobs (Geofabrik-style
   8k encodings).
 - **Per-block work:** light - membership check per element, matched

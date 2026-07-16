@@ -8,7 +8,7 @@ Fast command-line toolkit for OpenStreetMap PBF files. Built on the [pbfhogg](ht
 cargo install pbfhogg-cli
 ```
 
-Requires Rust 1.87+. The binary is called `pbfhogg`.
+Requires Rust 1.96+. The binary is called `pbfhogg`.
 
 ## Commands
 
@@ -19,7 +19,9 @@ Requires Rust 1.87+. The binary is called `pbfhogg`.
 | `cat` | Concatenate PBFs with optional type filtering; `--dedupe` for sorted merge |
 | `sort` | Sort into standard order (nodes, ways, relations by ID) |
 | `repack` | Re-encode a PBF at a configurable `--elements-per-blob N` cap |
+| `degrade` | Produce a valid-but-adversarial PBF: unsort, strip hints/locations/bbox, drop elements |
 | `extract` | Extract by bounding box or GeoJSON polygon (simple/complete/smart) |
+| `export` | Stream tagged nodes and ways to GeoJSON / GeoJSONSeq |
 | `tags-filter` | Filter elements by tag expressions (also supports OSC input) |
 | `diff` | Compare two PBFs; `--format osc` generates an OSC diff |
 | `getid` | Extract or remove (`--invert`) elements by ID |

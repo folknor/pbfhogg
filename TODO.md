@@ -54,14 +54,18 @@ notes carry a CLOSED/STATUS header pointing back here.
   supersedes this loop if it ever lands. Detail in notes/altw.md P0 /
   notes/altw-external.md N7.
 
-- ALTW P1 `auto` routing threshold: **MEASURED 2026-07-14, ready to
-  implement.** The germany + north-america sparse/external grid ran; the
+- [x] ~~ALTW P1 `auto` routing threshold~~ **IMPLEMENTED 2026-07-16.**
+  The germany + north-america sparse/external grid ran 2026-07-14; the
   knee is store-vs-page-cache, not file size and not where the walls
   cross (walls are non-monotonic: germany ties, north-america sparse
-  wins 26 %, europe external wins 21 %). Rule:
-  `referenced_node_ids * 8 > ~0.8 * page_cache_budget` -> external,
-  computed from runtime RAM, never a hardcoded byte constant. Needs P4
-  (blob-metadata node counts) for the clean selector (notes/altw.md P1).
+  wins 26 %, europe external wins 21 %). Landed rule: sorted + indexed
+  AND `estimated_store > 80 % of (MemAvailable - 3 GB)` -> external,
+  else sparse; store estimated as total-node-count x 8 from per-blob
+  indexdata via a decision-time header walk (self-amortizing - the next
+  phase's walk rides warm, so no P4 machinery was needed). Unestimable
+  cases fall back to external, the pre-P1 behavior. Unit tests pin the
+  measured grid; CLI tests pin both routing paths; denmark verify PASS.
+  Full implementation record in notes/altw.md P1.
 
 - [x] ~~**ALTW sparse P4: four redundant header walks**~~ **CLOSED
   2026-07-14: BUILT AND REVERTED, buys nothing. This was the SECOND
@@ -658,12 +662,24 @@ membership, not spatial).
 
 **Known issues:**
 
-- [ ] **strip-4 verify failure** - `brokkr verify multi-extract --regions 5`
-  on Denmark: strip-4 has 1 fewer node than sequential (41643 vs 41644).
-  Passes with 3 and 4 regions. Only fails with 5 regions where strip
-  boundaries fall at exact integer longitudes (8,9,10,11,12,13). Likely
-  a floating-point rounding issue in brokkr's bbox strip generation,
-  not a pbfhogg bug. Pre-existing since multi-extract shipped.
+- [x] ~~**strip-4 verify failure**~~ **ROOT-CAUSED + FIXED 2026-07-16 -
+  it was a pbfhogg bug, and the old "likely brokkr float rounding"
+  suspicion was wrong** (as was this entry's "integer longitudes 8..13"
+  claim - brokkr strips the dataset's configured bbox 12.4..12.7, giving
+  a strip-4 edge of `12.4 + 4*0.06 = 12.639999999999999`). Mechanism:
+  serde_json's default best-effort float parse landed 1 ULP high on that
+  17-digit value (yielding the f64 of `12.64`), while the sequential
+  arm's `-b` string went through std's correctly-rounded `FromStr`;
+  after `BboxInt`'s floor, the two arms disagreed by one decimicrodegree
+  and node 5446477279 (lon exactly 12.6399999) fell out of the config
+  arm. Both pbfhogg paths agree when fed identical f64s - reproduced
+  bidirectionally with controlled bboxes before touching code. Fixed by
+  enabling serde_json `float_roundtrip` (root + cli Cargo.toml);
+  regression test `config_bbox_floats_parse_identically_to_cli_bbox`
+  (tests/cli_extract.rs) pins config/CLI parse equivalence and was
+  confirmed to fail without the feature. `brokkr verify multi-extract
+  --dataset denmark --regions 5` now PASSES. Also hardens GeoJSON
+  polygon coordinates, which parse through the same serde_json path.
 
 **v2 improvements:**
 
@@ -999,8 +1015,17 @@ per-iteration allocations remain across the codebase, ordered by impact:
   the new sparse encoding, dominating dense at every measured scale
   (japan 4.3x faster, europe survives where dense OOMs); dense
   removed entirely.
-- [ ] Verify GeoJSON polygon format coverage for extract (does `--polygon`
-  accept GeoJSON, or only .poly format?).
+- [x] ~~Verify GeoJSON polygon format coverage for extract~~ **VERIFIED
+  2026-07-16: GeoJSON only.** `extract --polygon` dispatches
+  unconditionally to `parse_geojson` (`src/commands/extract/mod.rs`),
+  which accepts a bare Polygon/MultiPolygon geometry, a Feature, or a
+  FeatureCollection (first feature only; holes supported as interior
+  rings). Osmosis `.poly` files are NOT accepted anywhere - they fail at
+  the JSON parse. This is a parity difference vs osmium, whose
+  `extract -p` accepts `.poly`, GeoJSON, and OSM files; now recorded in
+  the reference/osmium-parity.md flag-differences table. Adding a
+  `.poly` parser would be small (simple line format) but is a feature
+  decision, not scheduled.
 - [x] ~~History-file support - decide in-scope or explicitly
   out-of-scope.~~ DECIDED 2026-07-13: explicitly OUT OF SCOPE for 1.0,
   code kept, best-effort thereafter; see

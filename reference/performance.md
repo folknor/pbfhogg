@@ -420,6 +420,38 @@ suite; the rest still carry their older commit in the Notes column.
 > this host carry a ~5-8 % environmental band and run order within a
 > suite is a real variable.**
 
+> **Drive health + trim state (checked 2026-07-16).** Follow-up to the
+> drift verdict, from a SMART + fstrim pass on the 990 PRO:
+>
+> - **The drive is healthy. "Drive state" throughout these docs means
+>   trim debt and garbage collection on a near-full consumer NVMe -
+>   normal firmware behaviour - never hardware degradation.**
+>   `smartctl -x /dev/nvme0`: 0 media and data integrity errors, 0
+>   error-log entries, 100 % available spare, 4 % percentage-used,
+>   142 TB written of the 4 TB 990 PRO's 2400 TBW rating (~6 % of
+>   rated endurance; roughly 3,200 more ALTW planet runs at
+>   ~705 GB/run). The 970 EVO Plus is likewise clean (its 2,520
+>   error-log entries are all benign "Invalid Field in Command" from
+>   tooling probing unsupported NVMe 1.3 log pages).
+> - **A manual `fstrim -av` reclaimed 518 GiB** on the data drive
+>   (`/dev/nvme0n1p1`, 2026-07-16). The weekly `fstrim.timer` cadence
+>   cannot keep up with ~705 GB of scratch churn per ALTW planet run:
+>   dead blocks accumulate for up to a week, and the controller saw
+>   ~97 % namespace utilization (3.89 of 4.00 TB allocated) during the
+>   2026-07-14 suite even though `df` reported 469 G free. That trim
+>   debt - GC shuffling dead scratch blocks with almost no free flash
+>   to work with - is the mechanism behind the +31 % same-bytes write
+>   drift.
+>
+> Consequences: (1) **trim before any matched A/B suite** (and between
+> cells of a long one) - it does not replace interleaving, but it
+> shrinks the band interleaving has to cancel; (2) **every 2026-07-14
+> planet baseline above was measured under worst-case trim debt** -
+> post-trim runs may come in systematically faster for drive-state
+> reasons, so a new-vs-2026-07-14 improvement needs a same-day matched
+> pair before it is credited to code. The ~5-8 % band stands until
+> re-measured post-trim.
+
 > **`--inject-prepass` A/B - SETTLED 2026-07-14: cost is under 1 % at
 > planet. Stop measuring this.** Six interleaved `--bench 1` cells at
 > `fb743f6`, ON leading, alternating:

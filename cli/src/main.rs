@@ -532,7 +532,11 @@ enum Command {
         #[arg(long)]
         keep_untagged_nodes: bool,
         /// Node coordinate index type:
-        ///   auto     - external if sorted + indexed, sparse otherwise (recommended).
+        ///   auto     - route on scale (recommended): sparse unless the input is
+        ///              sorted + indexed (external's precondition) AND the estimated
+        ///              node store (8 bytes per node, from blob indexdata) exceeds
+        ///              ~80% of this host's available RAM, where sparse's random
+        ///              lookups start thrashing the page cache.
         ///   sparse   - rank-indexed flat mmap array (~8 bytes per referenced node).
         ///              Fast at small / medium scale; survives europe at ~6 minutes
         ///              on a 27 GB-RAM host. Works on any PBF. Needs temp disk equal

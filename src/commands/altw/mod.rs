@@ -52,7 +52,15 @@ pub enum IndexType {
     /// all sequential I/O. Uses ~224 GB temp disk at planet scale. The
     /// only mode that survives at planet on a memory-constrained host.
     External,
-    /// Auto-select: external if sorted + indexed, sparse otherwise.
+    /// Auto-select on scale. Sparse unless the input is sorted + indexed
+    /// (external's precondition) AND the estimated sparse store exceeds
+    /// the host's page-cache budget - the measured knee where sparse
+    /// pass 2 goes nonlinear (5.3x per-ref cost at 116 % of budget vs
+    /// linear at 75 %). Unsorted or unindexed inputs always route sparse;
+    /// when the store or budget cannot be estimated, sorted + indexed
+    /// inputs route external (the cheap direction to be wrong in:
+    /// misrouting a small input to external wastes seconds, an oversized
+    /// input on sparse costs minutes).
     Auto,
 }
 
@@ -206,7 +214,8 @@ pub fn add_locations_to_ways(
     options: &AltwOptions,
     overrides: &HeaderOverrides,
 ) -> Result<Stats> {
-    // Auto-select: external if sorted + indexed, sparse otherwise.
+    // Auto-select: sparse unless the input qualifies for external AND the
+    // estimated store exceeds the page-cache budget (see IndexType::Auto).
     let index_type = if options.index_type == IndexType::Auto {
         auto_select_index_type(input, options.direct_io)?
     } else {
@@ -235,8 +244,11 @@ pub fn add_locations_to_ways(
          decompressed and re-encoded (significantly slower).",
     )?;
 
-    // Suggest external index for sorted indexed PBFs on sparse selection.
-    if index_type == IndexType::Sparse && indexdata_present {
+    // Suggest external index for sorted indexed PBFs on *explicit* sparse
+    // selection only. When auto resolved to sparse it did so because the
+    // store fits the page-cache budget; hinting external there would
+    // contradict the routing it just explained on stderr.
+    if options.index_type == IndexType::Sparse && indexdata_present {
         let reader = crate::ElementReader::open(input, options.direct_io)?;
         if reader.header().is_sorted() {
             eprintln!(
@@ -332,7 +344,25 @@ pub fn add_locations_to_ways(
     Ok(stats)
 }
 
-// Auto-select: external if sorted + indexed, sparse otherwise.
+/// Route to external when the estimated sparse store exceeds this many
+/// percent of the page-cache budget. The knee is bracketed, not
+/// pinpointed: north-america's 18.75 GB store (~75 % of the measuring
+/// host's ~25 GB budget) ran linear while europe's 28.94 GB (~116 %)
+/// thrashed at 5.3x the per-ref cost, and 80 % is the
+/// bias-toward-external choice inside that gap (notes/altw.md P1).
+const AUTO_STORE_BUDGET_PCT: u64 = 80;
+
+/// Anon footprint a sparse run holds outside the mmap store (IdSet, decode
+/// buffers, writer queues): ~2-3 GB measured at europe. Subtracted from
+/// `MemAvailable` before applying [`AUTO_STORE_BUDGET_PCT`], so the budget
+/// reflects what the page cache can actually keep resident for the store.
+const AUTO_ANON_HEADROOM_BYTES: u64 = 3 << 30;
+
+// Auto-select: sparse unless the input qualifies for external (sorted +
+// indexed) AND the estimated sparse store exceeds the page-cache budget.
+// The threshold is relative to runtime RAM, never a hardcoded byte
+// constant: the knee is defined by store-vs-cache, and a constant fitted
+// to one host misroutes every other machine (notes/altw.md P1).
 fn auto_select_index_type(input: &Path, direct_io: bool) -> Result<IndexType> {
     let reader = crate::ElementReader::open(input, direct_io)?;
     let sorted = reader.header().is_sorted();
@@ -347,13 +377,111 @@ fn auto_select_index_type(input: &Path, direct_io: bool) -> Result<IndexType> {
     })()
     .unwrap_or(false);
 
-    let chosen = if sorted && has_index {
-        IndexType::External
+    if !(sorted && has_index) {
+        // External cannot run (it requires sorted + indexdata); no
+        // estimate needed.
+        eprintln!("auto-selected --index-type sparse (sorted={sorted}, indexed={has_index})");
+        return Ok(IndexType::Sparse);
+    }
+
+    // Both backends can run: route on scale. The walk is priced like any
+    // other header walk (~50 us/blob cold, ~free warm) and self-amortizes:
+    // whichever backend runs next starts with its own header walk, which
+    // now rides warm on this one, so the command's total cold-walk count
+    // does not increase (the P4 arithmetic, notes/altw.md).
+    crate::debug::emit_marker("ALTW_AUTO_ESTIMATE_WALK_START");
+    let store = estimate_sparse_store_bytes(input)?;
+    crate::debug::emit_marker("ALTW_AUTO_ESTIMATE_WALK_END");
+    let budget = page_cache_budget_bytes();
+    let chosen = route_sorted_indexed(store, budget);
+
+    crate::debug::emit_counter(
+        "altw_auto_store_estimate_bytes",
+        store.map_or(-1, |b| i64::try_from(b).unwrap_or(i64::MAX)),
+    );
+    crate::debug::emit_counter(
+        "altw_auto_cache_budget_bytes",
+        budget.map_or(-1, |b| i64::try_from(b).unwrap_or(i64::MAX)),
+    );
+
+    if let (Some(store), Some(budget)) = (store, budget) {
+        let rel = if chosen == IndexType::External {
+            ">"
+        } else {
+            "<="
+        };
+        eprintln!(
+            "auto-selected --index-type {chosen} (store estimate {:.1} GB {rel} \
+             {AUTO_STORE_BUDGET_PCT} % of {:.1} GB page-cache budget)",
+            store as f64 / 1e9,
+            budget as f64 / 1e9,
+        );
     } else {
-        IndexType::Sparse
-    };
-    eprintln!("auto-selected --index-type {chosen} (sorted={sorted}, indexed={has_index})");
+        eprintln!(
+            "auto-selected --index-type {chosen} (sorted=true, indexed=true; \
+             store or budget estimate unavailable)"
+        );
+    }
     Ok(chosen)
+}
+
+/// Pure routing decision for an input both backends can handle (sorted +
+/// indexed). External iff the estimated store exceeds
+/// [`AUTO_STORE_BUDGET_PCT`] of the page-cache budget. An unavailable
+/// store or budget estimate routes external - the pre-scale-aware
+/// behavior for these inputs, and the cheap direction to be wrong in
+/// (seconds wasted vs minutes of pass-2 thrash).
+fn route_sorted_indexed(store_bytes: Option<u64>, budget_bytes: Option<u64>) -> IndexType {
+    match (store_bytes, budget_bytes) {
+        (Some(store), Some(budget)) => {
+            if store.saturating_mul(100) > budget.saturating_mul(AUTO_STORE_BUDGET_PCT) {
+                IndexType::External
+            } else {
+                IndexType::Sparse
+            }
+        }
+        _ => IndexType::External,
+    }
+}
+
+/// Estimate the sparse store size for an indexed input: total node count
+/// from per-blob indexdata, times 8 bytes per rank slot. Total nodes is
+/// an upper bound on referenced nodes (the store is sized by
+/// way-referenced ids only) - tight where the knee lives (95-98 % of
+/// nodes are way-referenced at regional scale) and loose at planet
+/// (~69 %), which errs toward external, the cheap direction. Returns
+/// `None` when any OsmData blob lacks indexdata, since the sum would
+/// silently undercount.
+fn estimate_sparse_store_bytes(input: &Path) -> Result<Option<u64>> {
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
+    let mut node_count: u64 = 0;
+    while let Some(meta) = walker.next_header()? {
+        if meta.blob_type != crate::blob::BlobKind::OsmData {
+            continue;
+        }
+        match meta.index.as_ref() {
+            Some(idx) => {
+                if idx.kind == crate::blob_meta::ElemKind::Node {
+                    node_count = node_count.saturating_add(idx.count);
+                }
+            }
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(node_count.saturating_mul(8)))
+}
+
+/// Page-cache budget for the sparse store: `MemAvailable` minus the anon
+/// headroom the sparse run itself needs. `None` when `/proc/meminfo` is
+/// unavailable (non-Linux) or unparsable.
+fn page_cache_budget_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = meminfo.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(
+        kb.saturating_mul(1024)
+            .saturating_sub(AUTO_ANON_HEADROOM_BYTES),
+    )
 }
 
 /// Process-global instrumentation for the injected-prepass producer.
@@ -856,4 +984,74 @@ fn process_block(
     }
 
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AUTO_STORE_BUDGET_PCT, IndexType, route_sorted_indexed};
+
+    const GB: u64 = 1_000_000_000;
+
+    /// The measured grid this routing rule was fitted to (notes/altw.md
+    /// P1, all at `dcc445e`): north-america's 18.75 GB store against the
+    /// measuring host's ~25 GB budget ran linear (sparse won by 26 %),
+    /// europe's 28.94 GB thrashed (external won by 21 %).
+    #[test]
+    fn route_reproduces_the_measured_grid() {
+        let budget = Some(25 * GB);
+        assert_eq!(
+            route_sorted_indexed(Some(18_750_000_000), budget),
+            IndexType::Sparse,
+            "north-america-shaped store must route sparse"
+        );
+        assert_eq!(
+            route_sorted_indexed(Some(28_940_000_000), budget),
+            IndexType::External,
+            "europe-shaped store must route external"
+        );
+    }
+
+    #[test]
+    fn route_threshold_is_strictly_greater_than() {
+        let budget = 10 * GB;
+        let threshold = budget * AUTO_STORE_BUDGET_PCT / 100;
+        assert_eq!(
+            route_sorted_indexed(Some(threshold), Some(budget)),
+            IndexType::Sparse,
+            "exactly at the threshold stays sparse"
+        );
+        assert_eq!(
+            route_sorted_indexed(Some(threshold + 1), Some(budget)),
+            IndexType::External,
+            "one byte over the threshold routes external"
+        );
+    }
+
+    /// Unknown store or budget routes external: the pre-scale-aware
+    /// behavior for sorted + indexed inputs, and the direction where a
+    /// wrong guess costs seconds rather than minutes of pass-2 thrash.
+    #[test]
+    fn route_unknowns_fall_back_to_external() {
+        assert_eq!(
+            route_sorted_indexed(None, Some(25 * GB)),
+            IndexType::External
+        );
+        assert_eq!(route_sorted_indexed(Some(GB), None), IndexType::External);
+        assert_eq!(route_sorted_indexed(None, None), IndexType::External);
+    }
+
+    #[test]
+    fn route_survives_extreme_inputs_without_overflow() {
+        assert_eq!(
+            route_sorted_indexed(Some(u64::MAX), Some(25 * GB)),
+            IndexType::External,
+            "a store big enough to overflow the pct math must saturate \
+             toward external, never wrap into a sparse verdict"
+        );
+        assert_eq!(
+            route_sorted_indexed(Some(0), Some(0)),
+            IndexType::Sparse,
+            "zero store on a zero budget is not greater-than"
+        );
+    }
 }

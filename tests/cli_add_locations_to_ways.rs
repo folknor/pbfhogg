@@ -708,6 +708,72 @@ fn backend_parity_sparse_external_auto() {
     assert_elements_equivalent(&out_external, &out_auto);
 }
 
+/// Scale-aware auto routing (notes/altw.md P1): sorted + indexed no
+/// longer implies external. A small input's estimated node store sits
+/// far below any real host's page-cache budget, so auto must route it
+/// to sparse and say why on stderr. Reads `/proc/meminfo`, hence
+/// Linux-gated: elsewhere the budget probe returns unavailable and
+/// auto deliberately falls back to external.
+#[test]
+#[cfg(target_os = "linux")]
+fn auto_routes_small_sorted_indexed_input_to_sparse() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_indexed_pbf(&input, &test_nodes(), &test_ways(), &[]);
+
+    let out = run_altw(&input, &output, false, IndexBackend::Auto, false);
+    assert!(
+        out.status.success(),
+        "auto backend failed; stderr:\n{}",
+        out.stderr_str(),
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("auto-selected --index-type sparse"),
+        "small sorted+indexed input must route to sparse; stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("store estimate") && stderr.contains("page-cache budget"),
+        "routing must go through the scale estimate, not the \
+         eligibility fallback; stderr:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("hint: this sorted indexed PBF is eligible"),
+        "auto-resolved sparse must not be second-guessed by the \
+         explicit-sparse hint; stderr:\n{stderr}",
+    );
+}
+
+/// Inputs external cannot handle (no indexdata) skip the scale estimate
+/// entirely and route to sparse via the eligibility check.
+#[test]
+fn auto_routes_non_indexed_input_to_sparse_without_estimate() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+
+    let out = run_altw(&input, &output, false, IndexBackend::Auto, false);
+    assert!(
+        out.status.success(),
+        "auto backend failed; stderr:\n{}",
+        out.stderr_str(),
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("auto-selected --index-type sparse (sorted="),
+        "non-indexed input must route sparse via eligibility; stderr:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("store estimate"),
+        "no scale estimate should run when external is ineligible; \
+         stderr:\n{stderr}",
+    );
+}
+
 /// Regression: `--index-type external --force` against a non-indexed
 /// PBF must reject the combination up front with a clear migration
 /// hint, not accept `--force` and fail much later with an opaque

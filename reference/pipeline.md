@@ -184,7 +184,18 @@ sorted + indexed input):
 ~8.7 GB RAM, ~224 GB temp disk at planet; the only mode that survives
 planet on a 30 GB-class host.
 
-**Auto**: external if sorted + indexed, sparse otherwise.
+**Auto**: scale-aware routing (2026-07-16). Sparse unless the input is
+sorted + indexed (external's precondition) AND the estimated sparse
+store - total node count from per-blob indexdata, times 8 bytes -
+exceeds 80 % of the page-cache budget (`MemAvailable` minus ~3 GB anon
+headroom, computed at runtime, never a hardcoded byte constant). The
+knee is store-vs-cache: sparse pass 2 ran linear at 75 % of budget
+(north-america) and thrashed 5.3x at 116 % (europe); walls are
+non-monotonic in file size, so only the store estimate routes correctly
+(notes/altw.md P1). When the store or budget cannot be estimated
+(missing indexdata mid-file, no `/proc/meminfo`), sorted + indexed
+inputs fall back to external - the pre-2026-07-16 behavior, and the
+cheap direction to be wrong in.
 
 ### renumber
 

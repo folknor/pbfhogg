@@ -173,6 +173,7 @@ worth knowing about.
 |--------|---------|----------|
 | `-t, --object-type` | `-t, --type` | cat, diff, inspect tags, check |
 | `--strategy simple\|complete_ways\|smart` | `--simple` / `--smart` (default: complete) | extract |
+| `-p, --polygon` (accepts `.poly`, GeoJSON, or OSM file) | `-p, --polygon` (GeoJSON only: bare Polygon/MultiPolygon geometry, Feature, or FeatureCollection - first feature only; Osmosis `.poly` files are not accepted) | extract |
 
 ### Flags pbfhogg doesn't have
 
@@ -188,7 +189,7 @@ These osmium flags have no pbfhogg equivalent:
 | `--fsync` | Always enabled (no flag needed) |
 | `-H, --with-history` | Current-snapshot tool, no history file support |
 | `--buffer-data` | Pipelined writer handles buffering internally |
-| `--index-type` | `sparse` (default), `external` (bounded memory, sequential I/O, only mode that survives at planet on memory-constrained hosts), `auto` (external if sorted+indexed, sparse otherwise). Different valid values from osmium's `-i, --index-type`. |
+| `--index-type` | `sparse` (default), `external` (bounded memory, sequential I/O, only mode that survives at planet on memory-constrained hosts), `auto` (scale-aware: sparse unless the input is sorted+indexed and the estimated node store exceeds ~80 % of available RAM; see reference/pipeline.md). Different valid values from osmium's `-i, --index-type`. |
 
 ### Flags only pbfhogg has
 

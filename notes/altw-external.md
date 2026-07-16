@@ -163,6 +163,17 @@ matched sample counts AND order-swapped or interleaved cells - adjacent
 cells do not share drive state. See the inject-prepass A/B below for what
 happens when this is ignored.
 
+**2026-07-16 follow-up: the drive is healthy; the mechanism is trim debt,
+not wear.** SMART is clean (0 media errors, 100 % spare, 4 % used - ~6 %
+of rated TBW), and a manual `fstrim -av` reclaimed **518 GiB** the weekly
+timer had not kept up with - the controller saw ~97 % namespace
+utilization during the 2026-07-14 suite. "Tired drive" in this doc means
+GC working through accumulated trim debt, nothing more. Trim before
+matched suites, and expect post-trim walls to run somewhat faster than
+the 2026-07-14 baselines for drive-state reasons - re-pin with a matched
+pair before crediting code. Full record in `reference/performance.md`
+"Drive health + trim state".
+
 ## Current architecture and planet cost model
 
 Shape (post-A1 rankless join, `--inject-prepass` capable):

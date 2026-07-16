@@ -162,7 +162,7 @@ Commands requiring indexdata: `apply-changes`, `sort`, `add-locations-to-ways`, 
 |------|--------|-----------|----------|
 | `sparse` (default) | ~540 MB + IdSet/rank index | `referenced_count * 8` bytes (japan 2 GB, europe ~29 GB) | rank-indexed flat mmap; small to europe scale |
 | `external` | ~8.7 GB | ~256 GB (planet) | rank-bucketed counting sort, parallel stages; the only mode that survives at planet on 30 GB-class hosts |
-| `auto` | (one of the above) | (one of the above) | external if sorted+indexed, sparse otherwise |
+| `auto` | (one of the above) | (one of the above) | scale-aware: sparse unless sorted+indexed AND estimated node store (nodes x 8 B from indexdata) exceeds 80 % of available RAM; falls back to external when the estimate is unavailable (reference/pipeline.md) |
 
 `dense` was removed - sparse rank-indexed flat is faster than the prior dense path at every measured scale and works in regimes dense didn't (europe survives at ~6 minutes on a 27 GB-RAM host). See `notes/altw.md` "Don't re-attempt" and "Status".
 
@@ -172,6 +172,7 @@ Commands requiring indexdata: `apply-changes`, `sort`, `add-locations-to-ways`, 
 - **Read the phase split before calling any delta a regression.** `brokkr sidecar <uuid> --human` attributes per-phase disk read, majflt and cores. Planet wall deltas are routinely environmental; one sidecar read regularly saves a bisect.
 - **Interleave matched A/B cells.** `--bench N` is best-of-N *within* one cell, so it cannot cancel drift *between* cells - two adjacent `--bench 3` cells are still confounded. Alternate `--bench 1` cells, compare medians, and check sign consistency across pairs.
 - **A same-day matched pair beats any historical number.** Old baselines were recorded under uncontrolled drive and page-cache state; when they disagree with a fresh matched pair, retire the historical figure rather than defend it.
+- **Trim before a matched A/B suite** (`sudo fstrim -av`). The weekly fstrim timer cannot keep up with planet-scale scratch churn, and accumulated trim debt widens the drive-state band that interleaving has to cancel. "Drive state" in these docs means trim debt + SLC/GC behaviour on a near-full healthy drive (SMART-verified), never failing hardware.
 
 Drive-state and cache-state evidence, with dates and UUIDs, lives in [`reference/performance.md`](reference/performance.md) - it is volatile and does not belong here.
 

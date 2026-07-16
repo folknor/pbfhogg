@@ -218,7 +218,7 @@ rule is wrong below europe scale: denmark sparse 5.8 s vs external
 fixed scratch round trips dwarf japan-sized inputs). External wins
 from somewhere between japan (2.4 GB) and europe (33.6 GB). The
 sparse-selection hint text made the same false "at every scale" claim
-(fixed 2026-07-13). P1 fixes the routing.
+(fixed 2026-07-13). P1 fixed the routing (landed 2026-07-16).
 
 ### Pass 0's serial union is half the phase (CORRECTED 2026-07-14)
 
@@ -325,7 +325,7 @@ split the loop on `shared` rather than branch inside it.
 
 ## The queue (2026-07-13)
 
-### P1. Scale-aware `auto` routing (user-facing defect; top item) - MEASURED 2026-07-14, ready to implement
+### P1. Scale-aware `auto` routing (user-facing defect; top item) - IMPLEMENTED 2026-07-16
 
 Route `auto` on input size: external only when sorted + indexed AND
 above a threshold; sparse otherwise. The measurement cells have run
@@ -380,12 +380,55 @@ Caveats to respect when implementing:
   / blob size move file size without moving the store) - germany and
   north-america differ 5.6x in store, which no file-size heuristic
   tracks reliably. The selector must estimate the store from node
-  counts in blob metadata (P4). P4 is therefore P1's real prerequisite
-  for the clean version; a file-size stopgap would reintroduce the
-  defect on repacked inputs.
+  counts in blob metadata; a file-size stopgap would reintroduce the
+  defect on repacked inputs. (This was originally framed as a P4
+  prerequisite; it resolved without P4 - see the implementation record
+  below.)
 
 Also fixed alongside this item: the sparse-selection hint text no
 longer claims external wins at every scale (corrected 2026-07-13).
+
+**IMPLEMENTED 2026-07-16** (`auto_select_index_type` +
+`route_sorted_indexed` + `estimate_sparse_store_bytes` in
+`altw/mod.rs`). Decisions worth recording:
+
+- **The P4 dependency resolved without P4.** The selector reads node
+  counts from per-blob indexdata via its own header walk at decision
+  time - "node counts in blob metadata" never needed the shared-walk
+  machinery, only the counts. The walk self-amortizes by the P4
+  arithmetic run in reverse: whichever backend runs next opens with its
+  own header walk (sparse pass 0 / external meta scan), which now rides
+  warm on the decision walk, so the command's total cold-walk count is
+  unchanged. Instrumented as `ALTW_AUTO_ESTIMATE_WALK_START/END`.
+- **The estimate is total nodes x 8, an upper bound on the true store**
+  (referenced nodes x 8). Tight where the knee lives (95-98 % of nodes
+  are way-referenced at regional scale), loose at planet (~69 %), and
+  the error direction is the bias the caveats above demanded - toward
+  external.
+- **Budget = `MemAvailable` - 3 GB anon headroom; threshold = 80 %.**
+  Both constants documented at the definition
+  (`AUTO_STORE_BUDGET_PCT`, `AUTO_ANON_HEADROOM_BYTES`). No hardcoded
+  byte threshold anywhere, per the caveat above.
+- **Every unestimable case routes external** (indexdata missing
+  mid-file, `/proc/meminfo` unreadable e.g. non-Linux) - exactly the
+  pre-P1 behavior for sorted + indexed inputs, so degradation is to
+  the old rule, never to a new failure mode.
+- **The explicit-sparse hint no longer fires on auto-resolved sparse**
+  (it would contradict the routing auto just printed); it still fires
+  on explicit `--index-type sparse` over sorted + indexed input.
+- Diagnostics: decision + both numbers on stderr;
+  `altw_auto_store_estimate_bytes` / `altw_auto_cache_budget_bytes`
+  counters (-1 = unavailable). Tests: unit tests pin the measured grid
+  (na-shaped store routes sparse, europe-shaped external), the
+  strictly-greater-than threshold edge, unknown/overflow fallbacks;
+  CLI tests pin small-sorted-indexed -> sparse via the estimate path
+  and non-indexed -> sparse via the eligibility path.
+  `verify add-locations-to-ways --dataset denmark` PASS at landing.
+
+Still true post-landing: the bracket is wide (the 0.8 coefficient is a
+bias choice inside a 1.54x gap, not a measured optimum - see the
+caveats above), and external N2's cat TOC would collapse the decision
+walk to a single pread when it lands.
 
 ### P0. Gate the pass-0 shared-detection `get` (LANDED + MEASURED 2026-07-14, KEEP - CLOSED)
 

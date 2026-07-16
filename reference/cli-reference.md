@@ -381,7 +381,7 @@ pbfhogg add-locations-to-ways [OPTIONS] --output <OUTPUT> <FILE>
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
-| `--index-type <TYPE>` | Node index type: `sparse` (default), `external`, or `auto` (external if sorted+indexed, sparse otherwise) |
+| `--index-type <TYPE>` | Node index type: `sparse` (default), `external`, or `auto` (scale-aware: sparse unless the input is sorted+indexed and the estimated node store exceeds ~80 % of available RAM) |
 | `--keep-untagged-nodes` | Keep all untagged nodes in output |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |

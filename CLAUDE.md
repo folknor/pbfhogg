@@ -47,9 +47,9 @@ The user can allow things that contravene these rules, for example allowing comm
 
 ## Orchestration loop
 
-If and when the users asks for the orchestration loop, read `reference/orchestrate.md` before proceeding.
+If and when the users asks for the orchestration loop, run `orchestrate` before proceeding.
 
-Competitor reference sources remain available for research: `research/libosmium/` (C++ OSM library, the reference implementation), `research/osmium-tool/` (C++ CLI on libosmium, the direct competitor and `brokkr verify` oracle), `research/traccar-geocoder/` (reverse geocoder, the geocode_index precedent). The `competitors` group in `.review.toml` fans a question out to consultant archetypes grounded in these trees.
+Competitor reference sources remain available for research: `research/libosmium/` (C++ OSM library, the reference implementation), `research/osmium-tool/` (C++ CLI on libosmium, the direct competitor and `brokkr verify` oracle), `research/traccar-geocoder/` (reverse geocoder, the geocode_index precedent). The `competitors` group in `.review.toml` fans a question out to consultant archetypes grounded in these trees. `research/geoparquet/` is the GeoParquet spec repository (spec, JSON schema, examples, test data) backing the standalone `geoparquet` archetype - a standards consultant, not a competitor.
 
 - `echo '<prompt>' | review bare --profile deep` - codex gpt-5.6-sol at xhigh, read-only sandbox, no persona. Spec critique before code exists.
 - `echo '<prompt>' | review goal --profile build` - codex gpt-5.6-terra at medium, workspace-write, /goal-driven. Implements from a spec.
@@ -64,7 +64,7 @@ subagents (Explore, general-purpose, fork, anything) is a separate decision the
 user makes explicitly. Before any `Agent`/`Task` launch, stop and ask in chat -
 name what you want to spawn and why - then wait for a yes. Doing the
 investigation yourself with Read/Grep/Bash needs no permission; only delegating
-to subagents does. The sole exception is the orchestrate.md spec-loop, which the
+to subagents does. The sole exception is the orchestrate spec-loop, which the
 user invokes by name and which carries its own standing authorization.
 
 **Do NOT use git worktree isolation for parallel agents.** Worktrees create merge conflicts that silently drop agent work. Instead, launch agents in the same tree with strict file ownership - zero overlap.

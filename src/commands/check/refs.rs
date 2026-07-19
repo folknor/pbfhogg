@@ -154,7 +154,7 @@ pub fn check_refs(
 
     // Prelude: cap glibc arenas at 2 to prevent cross-thread alloc/free
     // fragmentation from the pread worker pool. Scoped to this command.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
         libc::mallopt(libc::M_ARENA_MAX, 2);
     }

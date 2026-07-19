@@ -277,7 +277,7 @@ fn verify_ids_streaming_parallel(
     // allocation (just reads + push to a small per-blob within_violations
     // Vec), so the regression measured on time-filter (where workers do
     // allocation-heavy BlockBuilder re-encode) doesn't apply here.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
         libc::mallopt(libc::M_ARENA_MAX, 2);
     }
@@ -520,7 +520,7 @@ fn verify_ids_full_parallel(path: &Path, opts: &VerifyIdsOptions<'_>) -> Result<
     // mallopt prelude - same motivation as check_refs step #2: cap glibc
     // arenas at 2 to prevent cross-thread alloc/free fragmentation in the
     // pread worker pool.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
         libc::mallopt(libc::M_ARENA_MAX, 2);
     }

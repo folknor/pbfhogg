@@ -456,7 +456,7 @@ fn cat_filtered(
     // alloc/free cycle is confined to a single worker thread, so the pattern
     // that regresses time-filter (cross-blob scratch reuse defeated by arena
     // capping) doesn't apply.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
         libc::mallopt(libc::M_ARENA_MAX, 2);
     }

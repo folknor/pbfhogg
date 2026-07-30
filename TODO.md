@@ -1,5 +1,56 @@
 # pbfhogg TODO
 
+## 0.6.0 headline items
+
+Picked 2026-07-30, right after the 0.5.0 release.
+
+- [ ] **GeoParquet export**
+  ([notes/geoparquet-export.md](notes/geoparquet-export.md)).
+  `pbfhogg export --format geoparquet`: stream tagged nodes and
+  enriched ways into a conformant GeoParquet 2.0 file (1.1 fallback
+  rail). Parked research note + vendored spec repo
+  (`research/geoparquet/`) are the raw material; goes through the
+  orchestrate spec loop before implementation. Supersedes the parked
+  GeoPackage idea under Milestone 3.
+
+- [ ] **CLI output contract: full stdout/stderr/exit-code audit and
+  streamlining.** Complete inventory and rethink of what every
+  subcommand writes to stdout vs stderr, and what status codes it
+  returns. Questions the audit must answer, per command:
+  - Is stdout reserved for the command's actual product (data, JSON,
+    report) and stderr for narration/progress/warnings, per Unix
+    convention? Are we compliant where we should be?
+  - Does the stdout content make sense - is it consumable by a
+    script/pipe without filtering?
+  - Which commands support `--json`? For each: is the output ONE pure
+    JSON object/stream and nothing else on stdout? Any command that
+    emits anything in addition to the JSON on stdout is a bug to fix.
+  - Exit codes: 0 success, nonzero failure - but are partial-success,
+    verify-mismatch, and "check found problems" cases (`inspect
+    --indexed` already does exit 0/1 deliberately) coherent across
+    commands? Document the contract.
+  Deliverable: an inventory table (command x stdout/stderr/--json/exit
+  codes), the fixes, and a durable contract in reference/ so new
+  commands conform by construction.
+
+- [ ] **CLI UX decision pair** (details under Milestone 3 / Command
+  surface): pick and apply the scratch-dir posture uniformly across
+  every large-scratch command, and replace `--index-type` on
+  add-locations-to-ways with auto-default + a single `--in-memory`
+  override. Both are breaking CLI changes; the analysis is already
+  done in the Command surface entry. Same arc as the output-contract
+  audit - one coherent CLI-surface cleanup for 0.6.0.
+
+- [ ] **GeoJSON export v2**
+  ([notes/geojson-export-design.md](notes/geojson-export-design.md)):
+  relations -> MultiPolygon, raw-PBF index fallback, brokkr-side
+  verify + throughput baseline. Same `export` command GeoParquet
+  extends, so touch it once for both formats.
+
+- [ ] **Multi-extract v2 complete/smart strategies** (details under
+  Milestone 3 / Multi-extract): per-region way/relation ID tracking,
+  N x ~3 GB memory budget (~10 regions on a 30 GB host).
+
 ## Roadmap at a glance
 
 Open work is grouped here by what actually gates it. The completed

@@ -8,10 +8,7 @@ Rust library and CLI tool for reading and writing OpenStreetMap PBF files.
 - Dont use gremlins! Em-dash, en-dash, strange quotes, whatever - they're all verboten!
 - Dont remind the user of CLAUDE.md rules. They wrote them, so they know them.
 - The user can exempt you from any rule at any time.
-- ./notes/* documents are transient. Do not reference them from code comments. Code comments should contain the full context - it will outlive the docs.
-- ./reference/* is durable and lives on. Code comments may reference these.
 - ./research/* holds full vendored source for related projects, readable from any agent sandbox.
-- In ./notes/ documents try to refrain from referencing direct line numbers in the rust source. You can use line numbers, but they drift fast.
 - When asked to write a plan or a specification, read `reference/technical-implementation-spec.md` first; it defines what such a document must contain.
 
 ### Memory rules
@@ -20,22 +17,6 @@ Do not use your Memory functionality. Update CLAUDE.md instead. This project is 
 ### Bash rules
 - Never capture stdout into env vars (`UUID=$(...)`).
 - Never run raw cargo, curl, pkill. Use `brokkr`.
-
-### git commit rules
-- Always run `brokkr fmt` before a commit.
-- Never commit markdown changes and/or results.db alone. Bundle them with upcoming code commits.
-- When committing other changes: always tag along brokkrs 'results.db' and markdown files if dirty.
-- Write substantive engineering-focused commit messages.
-- Hard-wrap the message body at ~72 columns, matching the existing history; the
-  subject stays one concise line. The wall-of-text we keep producing comes from
-  `git commit -m "<whole paragraph>"`: a single `-m` is recorded as ONE unwrapped
-  line. Embed real line breaks so every body line wraps at ~72 (one `-m` per
-  paragraph is fine only when each paragraph already carries its own newlines).
-  Newlines are not metacharacters, so this composes with the no-metacharacters-in
-  `-m` rule (CLAUDE.md Bash rules) - wrap with literal newlines while still
-  avoiding braces, brackets, parens, angle brackets and the hash sign.
-- Has `Cargo.lock` changed? Commit it.
-- Never `git push` unless the user explicitly asks. Stop after the commit.
 
 ## 'brokkr' tool
 
@@ -212,3 +193,37 @@ CLI-driven integration tests live in `tests/cli_*.rs` and drive the compiled `pb
 - `linux-io-uring`: io_uring writer (requires `io-uring` + `libc`, Linux 5.1+)
 
 Zlib backend: `zlib-rs` (pure Rust, no C). No feature flags for backend selection.
+
+## Document folders
+
+The standing layout, across every project. Three live folders plus one retired,
+split by durability first, subject second.
+
+| Folder | Contents | Rule |
+|---|---|---|
+| `reference/` | Durable in-repo reference for anyone working on or with the code - how the thing is built and why: `architecture.md`, `technical-implementation-spec.md`, `performance.md` (the durable record of measured numbers over time), invariants, protocol contracts | Citable from source as a source of truth. What it says must be true. |
+| `docs/` | Durable in-repo documentation of how the thing is used - guides, CLI reference, the consumer-facing API surface. Sometimes exposed as a hand-edited VitePress gh-pages site | Same must-be-true rule. |
+| `notes/` | Transient - work items (`todo.md`), future plans, hypotheticals, bug reports, research, analysis. Things that will die | No truth guarantee. Nothing durable cites it. |
+| `plans/` | Retired | Plan documents are transient: they go in `notes/`. |
+
+`reference/` and `docs/` are both durable and both binding. The difference is
+subject, not audience: `reference/` covers how the thing is built and why - what
+you need in order to change it safely - while `docs/` covers how it is used. A
+developer or library consumer reads both. Where a project publishes a site,
+`docs/` is what gets published; the folder means the same thing either way.
+`notes/` is neither durable nor binding, which is the whole point of keeping it
+separate: a document that may be wrong must not sit where a document that must
+be right is expected.
+
+The dependency direction is therefore one-way. `notes/` may cite `docs/` and
+`reference/`; nothing durable may cite `notes/` - not a code comment, not
+`docs/`, not `reference/`. A code comment must carry its full context, because
+it outlives the note.
+
+**Root-level convention files are exempt.** `AGENTS.md`, `CLAUDE.md`,
+`README.md`, `LICENSE`, `CHANGELOG.md` and their kin are found by tooling and by
+convention at the repository root, and stay there. These folders govern
+documents we chose where to put, not files whose location is dictated.
+
+In `notes/`, `docs/` and `reference/` alike, avoid citing source line numbers -
+they drift fast.

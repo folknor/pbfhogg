@@ -395,9 +395,17 @@ impl<R: Read + Send> BlobReader<R> {
     }
 
     fn handle_error<T>(&mut self, error: crate::error::Error) -> Option<Result<T>> {
+        // Stamp the position before clearing it: the framing layer is the
+        // lowest layer that knows where in the stream the failure sits, and
+        // without it a wire-format error from a 90 GB planet file says
+        // nothing about where to look.
+        let at = self.offset;
         self.offset = None;
         self.last_blob_ok = false;
-        Some(Err(error))
+        Some(Err(match at {
+            Some(o) => error.at(o),
+            None => error,
+        }))
     }
 
     /// Enable or disable tagdata parsing (BlobHeader field 4).
@@ -467,9 +475,11 @@ impl<R: Read + Send> BlobReader<R> {
 
         if header_size >= MAX_BLOB_HEADER_SIZE {
             self.last_blob_ok = false;
-            return Some(Err(new_blob_error(BlobError::HeaderTooBig {
-                size: header_size,
-            })));
+            let err = new_blob_error(BlobError::HeaderTooBig { size: header_size });
+            return Some(Err(match self.offset {
+                Some(o) => err.at(o),
+                None => err,
+            }));
         }
 
         let mut reader = self.reader.by_ref().take(header_size);
@@ -489,14 +499,23 @@ impl<R: Read + Send> BlobReader<R> {
             let header_start = self.offset.map_or(0, |x| x.0);
             let got = self.header_buf.len() as u64;
             let trunc_at = header_start + got;
-            return self.handle_error(new_error(ErrorKind::Io(::std::io::Error::new(
+            let err = new_error(ErrorKind::Io(::std::io::Error::new(
                 ::std::io::ErrorKind::UnexpectedEof,
                 format!(
                     "BlobHeader truncated at byte {trunc_at} (shape 3): \
                          declared {header_size} bytes from offset \
                          {header_start}, got {got}"
                 ),
-            ))));
+            )));
+            // Stamp the exact truncation byte here. `handle_error` would
+            // otherwise attach `header_start`, which points at the start of
+            // the frame rather than at the byte that failed - the message and
+            // the accessor would then disagree.
+            let err = match self.offset {
+                Some(_) => err.at(ByteOffset(trunc_at)),
+                None => err,
+            };
+            return self.handle_error(err);
         }
 
         let header = match WireBlobHeader::parse(
@@ -528,9 +547,11 @@ impl<R: Read + Send> BlobReader<R> {
         let datasize = header.datasize as u64;
         if datasize >= MAX_BLOB_DATASIZE {
             self.last_blob_ok = false;
-            return Some(Err(new_blob_error(BlobError::DataSizeTooBig {
-                size: datasize,
-            })));
+            let err = new_blob_error(BlobError::DataSizeTooBig { size: datasize });
+            return Some(Err(match self.offset {
+                Some(o) => err.at(o),
+                None => err,
+            }));
         }
 
         self.offset = self.offset.map(|x| ByteOffset(x.0 + header_size));
@@ -663,14 +684,21 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
             let payload_start = self.offset.map_or(0, |x| x.0);
             let got = blob_data.len() as u64;
             let trunc_at = payload_start + got;
-            return self.handle_error(new_error(ErrorKind::Io(::std::io::Error::new(
+            let err = new_error(ErrorKind::Io(::std::io::Error::new(
                 ::std::io::ErrorKind::UnexpectedEof,
                 format!(
                     "Blob payload truncated at byte {trunc_at} (shape 4): \
                          declared {} bytes from offset {payload_start}, got {got}",
                     header.datasize
                 ),
-            ))));
+            )));
+            // As above: the exact truncation byte beats the payload start
+            // that `handle_error` would otherwise stamp.
+            let err = match self.offset {
+                Some(_) => err.at(ByteOffset(trunc_at)),
+                None => err,
+            };
+            return self.handle_error(err);
         }
 
         let blob_bytes = Bytes::from(blob_data);
@@ -857,9 +885,19 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
         // MAX_BLOB_DATASIZE upstream. Comfortably fits in i64.
         #[allow(clippy::cast_possible_wrap)]
         let signed = (n - 1) as i64;
+        // Capture the position before any error path clears it: header-only
+        // consumers (`next_header_skip_blob`) return this error verbatim, so
+        // if the offset is not stamped here it is lost for good and
+        // `Error::byte_offset` reports `None` on exactly the truncation
+        // errors it exists to locate.
+        let at = self.offset;
         if let Err(e) = self.reader.skip_relative(signed) {
             self.offset = None;
-            return Err(e.into());
+            let err: crate::error::Error = e.into();
+            return Err(match at {
+                Some(o) => err.at(o),
+                None => err,
+            });
         }
         let mut sentinel = [0u8; 1];
         match self.reader.read_exact(&mut sentinel) {
@@ -875,18 +913,30 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
                 let payload_start = self.offset.map_or(0, |x| x.0);
                 let trunc_at = payload_start + n - 1;
                 self.offset = None;
-                Err(new_error(ErrorKind::Io(::std::io::Error::new(
+                let err = new_error(ErrorKind::Io(::std::io::Error::new(
                     ::std::io::ErrorKind::UnexpectedEof,
                     format!(
                         "Blob payload truncated at byte {trunc_at} (shape 4): \
                          declared {n} bytes from offset {payload_start}, \
                          file ended early"
                     ),
-                ))))
+                )));
+                // The exact byte we failed to read, not the payload start -
+                // but only when the reader was actually tracking a position;
+                // `payload_start` falls back to 0 when it was not, and a
+                // confidently wrong offset is worse than none.
+                Err(match at {
+                    Some(_) => err.at(ByteOffset(trunc_at)),
+                    None => err,
+                })
             }
             Err(e) => {
                 self.offset = None;
-                Err(e.into())
+                let err: crate::error::Error = e.into();
+                Err(match at {
+                    Some(o) => err.at(o),
+                    None => err,
+                })
             }
         }
     }

@@ -30,7 +30,7 @@ reader.for_each(|element| {
 
 println!("Number of ways: {ways}");
 # assert_eq!(ways, 1);
-# Ok::<(), std::io::Error>(())
+# Ok::<(), pbfhogg::Error>(())
 ```
 
 ## Example: Count ways in parallel
@@ -57,7 +57,7 @@ let ways = reader.par_map_reduce(
 
 println!("Number of ways: {ways}");
 # assert_eq!(ways, 1);
-# Ok::<(), std::io::Error>(())
+# Ok::<(), pbfhogg::Error>(())
 ```
 
 ## Example: Write a PBF file
@@ -86,7 +86,30 @@ if let Some(block_bytes) = bb.take()? {
     writer.write_primitive_block(block_bytes)?;
 }
 writer.flush()?;
-# Ok::<(), std::io::Error>(())
+# Ok::<(), pbfhogg::Error>(())
+```
+
+## Example: inspecting an error
+
+Every fallible entry point returns [`Error`], which keeps the typed
+[`ErrorKind`] and - for failures detected by the framing layer - the byte
+offset in the input. Converting to `std::io::Error` (via the [`From`] impl)
+boxes both away, so match on the kind instead:
+
+```rust
+use pbfhogg::{ElementReader, ErrorKind};
+
+match ElementReader::from_path("does-not-exist.osm.pbf") {
+    Ok(_reader) => {}
+    Err(e) => {
+        if let ErrorKind::Io(io_err) = e.kind() {
+            println!("I/O error: {io_err}");
+        }
+        if let Some(offset) = e.byte_offset() {
+            println!("detected at byte {}", offset.0);
+        }
+    }
+}
 ```
 
 ## Example: In-memory writing
@@ -105,7 +128,7 @@ writer.write_header(&header_bytes)?;
 let mut bb = BlockBuilder::new();
 // ... add elements, write blocks synchronously ...
 writer.flush()?;
-# Ok::<(), std::io::Error>(())
+# Ok::<(), pbfhogg::Error>(())
 ```
 */
 

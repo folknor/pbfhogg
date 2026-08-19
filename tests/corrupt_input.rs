@@ -89,6 +89,87 @@ fn header_too_big() {
     }
 }
 
+/// A framing error must say *where*. `BlobReader::new` cannot know the
+/// stream position (an arbitrary reader may start anywhere), but the
+/// file-backed constructors every command uses do, and a blob error from a
+/// 90 GB planet file is unactionable without it.
+#[test]
+fn framing_error_carries_byte_offset() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("header-too-big.osm.pbf");
+    std::fs::write(&path, 65536u32.to_be_bytes()).expect("write fixture");
+    let mut reader = BlobReader::from_path(&path).expect("open fixture");
+    let err = reader.next().expect("an item").expect_err("HeaderTooBig");
+    assert_eq!(
+        err.byte_offset().map(|o| o.0),
+        Some(4),
+        "offset should point past the consumed 4-byte length prefix"
+    );
+}
+
+/// Build a one-block PBF truncated `got` bytes into the second blob's
+/// payload, and return it alongside the payload start offset. Shape 4.
+fn truncated_in_payload(got: usize) -> (Vec<u8>, u64) {
+    let full = write_one_block_pbf();
+    let frame_start = {
+        let mut r = BlobReader::new_seekable(Cursor::new(full.as_slice())).unwrap();
+        let _ = r.next().unwrap().unwrap(); // header blob
+        let second = r.next().unwrap().unwrap(); // data blob
+        second.offset().unwrap().0 as usize
+    };
+    let header_size =
+        u32::from_be_bytes(full[frame_start..frame_start + 4].try_into().unwrap()) as usize;
+    let payload_start = frame_start + 4 + header_size;
+    assert!(
+        payload_start + got < full.len(),
+        "fixture must actually be truncated"
+    );
+    (full[..payload_start + got].to_vec(), payload_start as u64)
+}
+
+/// The reported offset must be the byte that could not be read, not the
+/// start of the frame it lives in. Those differ by the whole payload, so a
+/// frame-start offset points the user at the wrong place in the file.
+#[test]
+fn truncated_payload_offset_is_the_exact_truncation_byte() {
+    let got = 3usize;
+    let (data, payload_start) = truncated_in_payload(got);
+    let mut reader = BlobReader::new_seekable(Cursor::new(data)).unwrap();
+    let _ = reader.next().unwrap().unwrap(); // header blob
+    let err = reader.next().unwrap().unwrap_err();
+    assert_eq!(
+        err.byte_offset().map(|o| o.0),
+        Some(payload_start + got as u64),
+        "offset must be the truncation byte, not the payload start"
+    );
+    assert!(
+        format!("{err}").contains(&format!("{}", payload_start + got as u64)),
+        "Display and byte_offset must agree: {err}"
+    );
+}
+
+/// Header-only consumers (`next_header_skip_blob`, the fast structural
+/// walk) return the skip error verbatim, so the offset has to be stamped
+/// inside `skip_blob_body` - the layer that clears the running position.
+#[test]
+fn header_only_consumer_gets_offset_on_truncated_payload() {
+    let (data, payload_start) = truncated_in_payload(3);
+    let full_len = write_one_block_pbf().len() as u64;
+    let declared_end = full_len - 1; // sentinel byte at payload_start + datasize - 1
+    let mut reader = BlobReader::new_seekable(Cursor::new(data)).unwrap();
+    let _ = reader.next_header_skip_blob().unwrap().unwrap(); // header blob
+    let err = reader.next_header_skip_blob().unwrap().unwrap_err();
+    assert_eq!(
+        err.byte_offset().map(|o| o.0),
+        Some(declared_end),
+        "skip path must report where the declared payload ran off the end"
+    );
+    assert!(
+        declared_end > payload_start,
+        "sanity: the sentinel sits past the payload start"
+    );
+}
+
 /// Valid length prefix but too few bytes for the declared BlobHeader.
 /// Per `reference/truncation-handling.md` shape 3, this is a hard
 /// error - the BlobReader's post-`read_to_end` length check catches

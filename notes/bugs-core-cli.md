@@ -92,52 +92,32 @@ documented.
 
 Confidence: high.
 
-### `getparents --full-scan-min-blobs` still has no bound checking
-
-Documented in `reference/cli-reference.md` as an unsupported hidden test
-instrument, which was the round-2 fix for the doc/code drift finding. The
-underlying observation stands: the flag reaches a separate library entry point
-(`getparents_with_min_blobs`) straight from CLI input with no range check, so
-`--full-scan-min-blobs 0` silently pins the FullScan arm. Harmless today
-because it is hidden and test-only.
-
-Confidence: high.
-
 ## Smaller / lower confidence
 
-- `src/debug.rs`: the marker clock is `Instant::now()` captured lazily inside
-  `OnceLock::get_or_init` at the first marker, not at process start,
-  contradicting the doc comment "microseconds since process start". Every marker
-  timestamp is offset by the pre-first-marker startup time, which matters when
-  correlating against brokkr's `/proc` samples. Confidence: high that the doc is
-  wrong, medium that it has misled a measurement.
-- `src/debug.rs`: `O_NONBLOCK` is a hand-rolled `const` defined only under
-  `target_os = "linux"` / `"macos"` inside a `cfg(unix)` block - any other unix
-  (BSD, illumos) fails to compile with an undefined constant. `libc` is a
-  mandatory dependency; use `libc::O_NONBLOCK`.
-- `src/debug.rs`: `write_all` on an `O_NONBLOCK` FIFO can return `WouldBlock`
-  after a partial write, emitting a torn marker line into the protocol stream
-  rather than dropping the marker cleanly as documented. Also one `format!`
-  allocation per marker/counter.
-- `src/error.rs`: `ErrorKind` carries no file path, blob index, or byte offset on
-  any variant. A `WireFormat { msg: &'static str }` from a 90 GB planet file
-  tells the user nothing about where. Given the crate's own `ByteOffset` type,
-  adding blob offset to `Blob` / `WireFormat` variants is cheap and would
-  materially improve every truncation/corruption report.
-- `src/error.rs`: `From<Error> for io::Error` via `io::Error::other` boxes the
-  typed error; the doc examples in `lib.rs` use `Ok::<(), std::io::Error>(())`,
-  so the public reader API's canonical usage immediately discards the typed
-  `ErrorKind`.
-- `src/path_guard.rs`: `commit(mut self)` takes `self` by value, so `path` is
-  always `Some`; the `.expect("PathGuard::commit called after path released")` is
-  unreachable. Also, `PathGuard::file` on a user-supplied `--output` deletes a
-  pre-existing file of that name on any error, so `export -o important.json` on a
-  failing input deletes `important.json`. The input/output aliasing check now
-  rejects the case where the output *is* the input, but any other pre-existing
-  file named as the output is still destroyed by a mid-run failure.
-- `src/path_guard.rs`: the tests write to `std::env::temp_dir()` with
-  `process::id()`-only names, contravening the project's "never `/tmp`" rule and
-  colliding across concurrent sweeps. `tempfile` is already a dev-dependency.
+- NOT A BUG, recorded so it is not re-filed: `src/debug.rs` marker emission was
+  reported as able to tear a line across a partial `write_all` on the
+  `O_NONBLOCK` FIFO. It cannot. Marker and counter lines are tens of bytes, and
+  POSIX makes a write of at most `PIPE_BUF` (4096 on Linux) to a FIFO atomic -
+  on a non-blocking fd it transfers every byte or none and fails with `EAGAIN`.
+  Investigated round 3, 2026-08-20. Confidence: high.
+- `src/error.rs`: errors still do not name the *file* or the *blob index* they
+  came from. `Error::byte_offset()` gives the position within a stream, but
+  `BlobReader` does not retain the path it was opened from, so an error from a
+  multi-input command (`cat a.pbf b.pbf`, `apply-changes`, `merge-changes`)
+  still does not say which input failed. Closing it means threading the path
+  through `BlobReader` and `FileReader`. Confidence: high that the gap is real,
+  low urgency.
+- `decisions/0003-error-path-hygiene-via-pathguard.md` claims "every final
+  output path is wrapped in `PathGuard::file`", but only `renumber` ever did.
+  `sort`, `cat`, `extract`, `tags-filter`, `time-filter`, `apply-changes`,
+  `merge-changes`, `repack`, `degrade` and the rest construct their writer on
+  the user's `--output` path with no guard at all, so a mid-run failure leaves
+  a truncated partial file behind under the user's chosen name. Round 3 fixed
+  the two paths the report named (`export`, `renumber`) by routing them through
+  the new `path_guard::OutputFile` (scratch sibling + rename on commit); the
+  remaining commands should be converted to the same primitive, which also
+  closes the truncate-on-open half for them. Surfaced by the round-3 fix pass.
+  Confidence: high.
 - `src/reorder_buffer.rs`: `push` resizes `pending` to whatever seq arrives, so a
   stalled producer slot grows the buffer without bound; the bound lives entirely
   in the callers' permit accounting. A `max_window` field would make the

@@ -626,7 +626,15 @@ enum Command {
         #[arg(short = 's', long = "add-self")]
         add_self: bool,
         /// Test instrument: override the ADR-0006 FullScan dispatch threshold.
-        #[arg(long, hide = true)]
+        // Bounded at the CLI boundary rather than trusted raw into the
+        // library entry point: 0 is not a threshold, it just pins the
+        // FullScan arm unconditionally, and the upper bound keeps the
+        // instrument inside the range a blob count can actually reach.
+        #[arg(
+            long,
+            hide = true,
+            value_parser = clap::value_parser!(u64).range(1..=1_000_000_000)
+        )]
         full_scan_min_blobs: Option<u64>,
         /// Read IDs from text file (one per line, e.g. n123)
         #[arg(short = 'i', long = "id-file")]
@@ -2328,10 +2336,12 @@ fn run_export(
             )
             .into());
         }
-        let file_out = std::fs::File::create(output)?;
-        let guard = pbfhogg::path_guard::PathGuard::file(output.to_path_buf());
+        // Write through a scratch sibling: a mid-run failure must not
+        // truncate or delete a pre-existing file the user named as output.
+        let out = pbfhogg::path_guard::OutputFile::new(output)?;
+        let file_out = std::fs::File::create(out.path())?;
         run_export_to(file, std::io::BufWriter::new(file_out), &options)?;
-        guard.commit();
+        out.commit()?;
     } else {
         let stdout = std::io::stdout();
         run_export_to(file, stdout.lock(), &options)?;

@@ -24,7 +24,7 @@ use protohoggr::{encode_bytes_field, encode_int64_field, encode_sint64_field_alw
 ///     .bbox(9.0, 54.0, 13.0, 58.0)
 ///     .sorted()
 ///     .build()?;
-/// # Ok::<(), std::io::Error>(())
+/// # Ok::<(), pbfhogg::Error>(())
 /// ```
 pub struct HeaderBuilder<'a> {
     bbox: Option<(f64, f64, f64, f64)>,

@@ -310,6 +310,30 @@ notes carry a CLOSED/STATUS header pointing back here.
 **Blocked on dataset / config** - see the section of that name under
 "Planet-scale validation coverage".
 
+## Cross-repo: sidecar marker clock epoch changed (2026-08-20)
+
+pbfhogg's `src/debug.rs` used to timestamp FIFO markers as microseconds
+since the *first marker*, while its own doc comment - and the sidecar
+consumer's phase math - said "since process start". It now derives the true
+process-start epoch from `/proc/self/stat` field 22 (`starttime`) plus
+`/proc/uptime`, so every marker timestamp is larger than before by the
+process's pre-first-marker startup time (dynamic loading, arg parsing,
+header probe - tens of milliseconds, more on a cold binary).
+
+Nothing in the wire protocol changed: it is still `<timestamp_us> <name>`
+and `<timestamp_us> @<name>=<value>`, one line per event, so no consumer
+change is required and nothing breaks. But two consequences are worth a
+look on the consumer side:
+
+- Marker timestamps now line up with wall-clock elapsed since the child
+  was spawned, which is what a `/proc`-sample correlation wants. If the
+  consumer had a fudge factor compensating for the old skew, it is now
+  double-counting.
+- The very first marker is no longer at or near t=0. Any code that assumed
+  the first marker anchors the timeline should use spawn time instead.
+
+Deltas between markers are unchanged, so `--durations` output is unaffected.
+
 ## Item/command-specific plans
 
 Three new docs capturing a cross-cutting insight and two new commands that fall out of it. All scaffolding-level; details drift as work lands.

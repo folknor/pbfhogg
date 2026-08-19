@@ -376,4 +376,24 @@ fn file_output_is_guarded_against_input_aliases() {
         ])
         .assert_failure();
     assert!(!partial.exists(), "partial output survived decode failure");
+
+    // A failing export must not touch a pre-existing file that merely
+    // shares the output name - not delete it, not truncate it.
+    let precious = temp.path().join("important.geojson");
+    std::fs::write(&precious, b"user data").unwrap();
+    CliInvoker::new()
+        .args([
+            "export",
+            corrupt.to_str().unwrap(),
+            "--format",
+            "geojson",
+            "--output",
+            precious.to_str().unwrap(),
+        ])
+        .assert_failure();
+    assert_eq!(
+        std::fs::read(&precious).unwrap(),
+        b"user data",
+        "a failing export destroyed a pre-existing file of the output name"
+    );
 }

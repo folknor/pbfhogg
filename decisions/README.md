@@ -13,7 +13,7 @@ context in which the decision was made.
 Add one when any of the following holds:
 
 - The decision establishes a project-wide convention (e.g. "all commands
-  with file output must wrap the output path in a `PathGuard`").
+  with file output must route the output path through `path_guard`").
 - The decision is a policy call with multiple defensible alternatives and
   the rationale is non-obvious from the code.
 - The decision changes or cements how pbfhogg diverges from a reference
@@ -114,8 +114,8 @@ The skeleton has exactly two sections. `Context`, `Consequences`, and
   getid, `debug_assert` in diff / derive shard planners, silent
   inheritance through `IdSet` for tags-filter / altw-external.
 - [ADR-0003](0003-error-path-hygiene-via-pathguard.md) - Error path
-  hygiene via a shared `PathGuard` RAII primitive plus a
-  counters-after-write rule.
+  hygiene via shared RAII primitives - `PathGuard` for run-owned paths,
+  `OutputFile` for user-named outputs - plus a counters-after-write rule.
 - [ADR-0004](0004-defensive-input-errors-and-fixtures.md) -
   Defensive handling of adversarial or malformed input: promote
   indexdata/varint/sortedness-trust sites to hard errors at

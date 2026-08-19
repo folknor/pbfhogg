@@ -421,3 +421,30 @@ fn cat_rejects_truncated_node_blob_payload() {
     // is "no panic on adversarial node payload"; the broader
     // "non-zero exit on truncation" contract lives in the sweep.
 }
+
+/// `--full-scan-min-blobs` is a hidden test instrument that reaches a
+/// separate library entry point straight from CLI input. Zero is not a
+/// threshold - it pins the ADR-0006 FullScan arm unconditionally - so the
+/// CLI boundary range-checks it. Rejection must happen in clap, before any
+/// input is opened, which is why this passes a path that does not exist:
+/// if the bound were dropped the command would get as far as the file and
+/// fail with a different message.
+#[test]
+fn getparents_rejects_zero_full_scan_min_blobs() {
+    let dir = TempDir::new().expect("tempdir");
+    let output = dir.path().join("out.osm.pbf");
+    // Every other argument is well-formed, so the range check is the only
+    // thing left that can reject this invocation.
+    let out = CliInvoker::new()
+        .args(["getparents", "/nonexistent/never-opened.osm.pbf"])
+        .arg("-o")
+        .arg(&output)
+        .args(["--full-scan-min-blobs", "0", "n1"])
+        .assert_failure();
+    out.assert_stderr_contains("invalid value");
+    let stderr = out.stderr_str();
+    assert!(
+        !stderr.contains("never-opened"),
+        "argument validation must reject before touching the input; stderr:\n{stderr}",
+    );
+}

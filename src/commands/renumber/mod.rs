@@ -218,8 +218,12 @@ pub fn renumber_external(
     } else {
         compression
     };
+    // The final output path is not opened until the run succeeds: on any
+    // mid-stream error a pre-existing file of that name must survive
+    // untouched, which an in-place open would already have truncated.
+    let output_guard = crate::path_guard::OutputFile::new(output)?;
     let mut writer = writer_from_header(
-        output,
+        output_guard.path(),
         effective_compression,
         &header,
         true,
@@ -229,12 +233,6 @@ pub fn renumber_external(
         direct_io,
         false,
     )?;
-    // On any mid-stream error below (pass1 count mismatch, stage 2d
-    // failure, relation rewrite failure, final flush) the partially
-    // written output must not survive. Guard removes it on Drop unless
-    // `commit()` is called at the end of the success path.
-    let output_guard = crate::path_guard::PathGuard::file(output.to_path_buf());
-
     let mut stats = RenumberStats {
         nodes_written: 0,
         ways_written: 0,
@@ -412,7 +410,7 @@ pub fn renumber_external(
     crate::debug::emit_marker("RENUMBER_EXT_END");
 
     // Output is fully written; release the guard so the file survives.
-    output_guard.commit();
+    output_guard.commit()?;
 
     Ok(stats)
 }

@@ -217,7 +217,10 @@ pbfhogg degrade [OPTIONS] --output <OUTPUT> <FILE>
 (`hide = true`) test instruments: they override an internal threshold so
 the suite can fire a code path without building a full-scale fixture.
 They are not part of the supported surface and may change or disappear
-without a deprecation cycle.
+without a deprecation cycle. `--full-scan-min-blobs` is nevertheless
+range-checked at the CLI boundary (1 to 1,000,000,000): the library entry
+point behind it takes the value raw, and 0 is not a threshold - it pins the
+FullScan arm unconditionally.
 
 `--recompress` from the design doc remains deferred. The `--unsort` perturbation is the minimum-viable swap that triggers `sort`'s overlap detector; configurable chaos modes (rotate / shuffle / reverse) are deferred.
 

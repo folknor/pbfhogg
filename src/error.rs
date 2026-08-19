@@ -5,43 +5,79 @@ use std::result;
 use std::str;
 use std::str::Utf8Error;
 
+use crate::read::blob::ByteOffset;
+
 // Error data structures are modeled on the `csv` crate by BurntSushi.
 // Manual Display/StdError impls are intentional - avoids a thiserror dependency
 // for a small, stable enum that rarely changes.
 
 #[cold]
 pub(crate) fn new_error(kind: ErrorKind) -> Error {
-    Error(Box::new(kind))
+    Error(Box::new(Inner { kind, at: None }))
 }
 
 #[cold]
 pub(crate) fn new_blob_error(kind: BlobError) -> Error {
-    Error(Box::new(ErrorKind::Blob(kind)))
+    new_error(ErrorKind::Blob(kind))
 }
 
 #[cold]
 pub(crate) fn new_wire_error(msg: &'static str) -> Error {
-    Error(Box::new(ErrorKind::WireFormat { msg }))
+    new_error(ErrorKind::WireFormat { msg })
 }
 
 /// A type alias for `Result<T, pbfhogg::Error>`.
 pub type Result<T> = result::Result<T, Error>;
 
+#[derive(Debug)]
+struct Inner {
+    kind: ErrorKind,
+    at: Option<ByteOffset>,
+}
+
 /// An error that can occur when reading or writing PBF files.
 #[derive(Debug)]
-pub struct Error(Box<ErrorKind>);
+pub struct Error(Box<Inner>);
 
 impl Error {
     /// Return the specific type of this error.
     #[inline]
     pub fn kind(&self) -> &ErrorKind {
-        &self.0
+        &self.0.kind
     }
 
     /// Unwrap this error into its underlying type.
+    ///
+    /// Note that this discards the byte offset; use [`Error::byte_offset`]
+    /// first if the location matters.
     #[inline]
     pub fn into_kind(self) -> ErrorKind {
-        *self.0
+        self.0.kind
+    }
+
+    /// Byte offset into the input stream at which the error was detected,
+    /// when the detecting layer knew it.
+    ///
+    /// A wire-format or blob error carries no useful diagnosis on its own
+    /// when the input is a 90 GB planet file; this is the "where". Errors
+    /// raised below the framing layer (decompression, element decoding) do
+    /// not know their own position and report `None`.
+    #[inline]
+    pub fn byte_offset(&self) -> Option<ByteOffset> {
+        self.0.at
+    }
+
+    /// Attach the byte offset at which this error was detected. Called by
+    /// the framing layer, which is the lowest layer that knows the position.
+    /// An offset already attached by an inner layer wins - the innermost
+    /// frame is the more precise one.
+    #[cold]
+    #[must_use]
+    pub(crate) fn at(mut self, offset: ByteOffset) -> Error {
+        if self.0.at.is_none() {
+            self.0.at = Some(offset);
+        }
+        self
     }
 }
 
@@ -124,7 +160,7 @@ impl From<Error> for io::Error {
 // so they return None.
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match *self.0 {
+        match self.0.kind {
             ErrorKind::Io(ref err) => Some(err),
             ErrorKind::StringtableUtf8 { ref err, .. } => Some(err),
             ErrorKind::StringtableIndexOutOfBounds { .. } => None,
@@ -138,8 +174,20 @@ impl StdError for Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self.0 {
-            ErrorKind::Io(ref err) => err.fmt(f),
+        self.fmt_kind(f)?;
+        // The "where". Only the framing layer knows it, so most errors
+        // still print exactly as they did before this was added.
+        if let Some(at) = self.0.at {
+            write!(f, " (at byte offset {})", at.0)?;
+        }
+        Ok(())
+    }
+}
+
+impl Error {
+    fn fmt_kind(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self.0.kind {
+            ErrorKind::Io(ref err) => fmt::Display::fmt(err, f),
             ErrorKind::StringtableUtf8 { ref err, index } => {
                 write!(f, "invalid UTF-8 at string table index {index}: {err}")
             }

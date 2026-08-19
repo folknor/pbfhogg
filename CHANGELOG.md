@@ -2,7 +2,34 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A failing run no longer destroys a pre-existing file that shares the
+  output name.** `export -o important.json` and `renumber -o out.osm.pbf`
+  used to open the destination immediately (truncating it) and, on a
+  mid-run error, delete it - so a bad input cost you an unrelated file of
+  that name. Both now write to a scratch sibling in the same directory and
+  rename it into place only after the run succeeds. The destination is
+  untouched until then, and replaced by a single `rename` - atomic on
+  Unix. A side effect worth knowing: while the run is in flight the
+  output directory holds a dot-prefixed scratch file next to the
+  destination, and a hard kill leaves it behind.
+
 ### Breaking changes
+
+- Library: errors detected by the blob framing layer now carry the byte
+  offset at which they were found, reachable via `Error::byte_offset()`
+  and appended to the `Display` output as ` (at byte offset N)`. A
+  wire-format or blob error from a 90 GB file previously said nothing
+  about where. `ErrorKind` is unchanged; code matching on error *text*
+  for these variants may need updating. For a truncated blob the offset
+  is the exact byte that could not be read, not the start of the frame
+  it sits in, and it is reported identically by the full-read path and
+  by the header-only structural walk `next_header_skip_blob`. Offsets
+  are present only for readers that know their stream position
+  (`BlobReader::from_path` / `open` / `new_seekable`, and everything
+  built on them - not `BlobReader::new`, which wraps an arbitrary
+  reader).
 
 - **Exit codes now distinguish "the answer is no" from "the command
   failed".** A command that ran to completion and answered negatively

@@ -826,6 +826,94 @@ fn simple_sorted_polygon_filters_nodes() {
 // Multi-extract via --config
 // ---------------------------------------------------------------------------
 
+/// `parse_extract_config` rejects *lexically* identical output paths, but two
+/// slots that spell the same file differently slip past it and open two
+/// independent writers on one file: the second `File::create` truncates what
+/// the first is producing and the two element streams interleave. `sub/..`
+/// normalizes away only under canonicalization, which is what the CLI-side
+/// pairwise check does.
+#[test]
+fn multi_extract_rejects_outputs_that_normalize_to_one_path() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let config = dir.path().join("config.json");
+    std::fs::create_dir(dir.path().join("sub")).expect("create subdir");
+
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+
+    let config_json = format!(
+        r#"{{
+            "directory": "{}",
+            "extracts": [
+                {{ "output": "dup.osm.pbf", "bbox": [12.4, 55.6, 12.7, 55.8] }},
+                {{ "output": "sub/../dup.osm.pbf", "bbox": [13.5, 55.5, 14.5, 55.9] }}
+            ]
+        }}"#,
+        dir.path().display(),
+    );
+    std::fs::write(&config, config_json).expect("write config");
+
+    let result = CliInvoker::new()
+        .arg("extract")
+        .arg(&input)
+        .arg("--config")
+        .arg(&config)
+        .arg("--simple")
+        .arg("--set-bounds")
+        .arg("--force")
+        .assert_failure();
+    result.assert_stderr_contains("resolve to the same file");
+    assert!(
+        !dir.path().join("dup.osm.pbf").exists(),
+        "no writer may be opened once a collision is detected"
+    );
+}
+
+/// Distinct output *names* can still be one file. The collision check must
+/// use the same symlink and hardlink aware notion of identity as the
+/// input/output check, not bare path equality.
+#[cfg(unix)]
+#[test]
+fn multi_extract_rejects_symlinked_output_paths() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let config = dir.path().join("config.json");
+    let real = dir.path().join("a.osm.pbf");
+    let link = dir.path().join("b.osm.pbf");
+
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+    std::fs::write(&real, b"placeholder").expect("seed output");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink output");
+
+    let config_json = format!(
+        r#"{{
+            "directory": "{}",
+            "extracts": [
+                {{ "output": "a.osm.pbf", "bbox": [12.4, 55.6, 12.7, 55.8] }},
+                {{ "output": "b.osm.pbf", "bbox": [13.5, 55.5, 14.5, 55.9] }}
+            ]
+        }}"#,
+        dir.path().display(),
+    );
+    std::fs::write(&config, config_json).expect("write config");
+
+    let result = CliInvoker::new()
+        .arg("extract")
+        .arg(&input)
+        .arg("--config")
+        .arg(&config)
+        .arg("--simple")
+        .arg("--set-bounds")
+        .arg("--force")
+        .assert_failure();
+    result.assert_stderr_contains("resolve to the same file");
+    assert_eq!(
+        std::fs::read(&real).expect("read seeded output"),
+        b"placeholder",
+        "the aliased target must not be truncated"
+    );
+}
+
 #[test]
 fn multi_extract_two_bbox_regions() {
     let dir = TempDir::new().expect("tempdir");

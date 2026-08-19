@@ -37,6 +37,11 @@ impl<'a> DenseNode<'a> {
         self.info.as_ref()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_user_sid(&mut self, user_sid: i32) {
+        self.info.as_mut().expect("dense node metadata").user_sid = user_sid;
+    }
+
     /// Returns the latitude coordinate in nanodegrees (10^-9).
     #[inline]
     pub fn nano_lat(&self) -> i64 {

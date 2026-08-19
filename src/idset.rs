@@ -13,7 +13,7 @@
 /// for empty ranges. For Denmark's 52M nodes: 2 chunks = 8MB. For planet
 /// (12B node IDs): ~364 chunks = 1.5GB.
 pub struct IdSet {
-    chunks: Vec<Option<Box<[u8; CHUNK_SIZE]>>>,
+    chunks: Vec<Option<Box<[std::sync::atomic::AtomicU64]>>>,
     /// Rank index for O(1) rank queries. Built on demand via `build_rank_index()`.
     /// `chunk_prefix[cid]` = total set bits in chunks 0..cid.
     /// `block_prefix[cid][block]` = set bits in chunk `cid` before block `block`.
@@ -24,6 +24,13 @@ pub struct IdSet {
 
 const CHUNK_BITS: usize = 22;
 const CHUNK_SIZE: usize = 1 << CHUNK_BITS;
+const WORDS_PER_CHUNK: usize = CHUNK_SIZE / std::mem::size_of::<u64>();
+
+fn new_chunk() -> Box<[std::sync::atomic::AtomicU64]> {
+    std::iter::repeat_with(|| std::sync::atomic::AtomicU64::new(0))
+        .take(WORDS_PER_CHUNK)
+        .collect()
+}
 
 impl IdSet {
     pub fn new() -> Self {
@@ -55,14 +62,15 @@ impl IdSet {
         if id < 0 {
             return;
         } // Negative IDs are not valid OSM element IDs
+        self.drop_rank_index();
         let id = id as u64;
         let cid = (id >> (CHUNK_BITS + 3)) as usize;
         if cid >= self.chunks.len() {
             self.chunks.resize_with(cid + 1, || None);
         }
-        let chunk = self.chunks[cid].get_or_insert_with(|| Box::new([0u8; CHUNK_SIZE]));
-        let offset = ((id >> 3) & ((1u64 << CHUNK_BITS) - 1)) as usize;
-        chunk[offset] |= 1u8 << (id & 7);
+        let chunk = self.chunks[cid].get_or_insert_with(new_chunk);
+        let word = ((id >> 6) & ((WORDS_PER_CHUNK as u64) - 1)) as usize;
+        *chunk[word].get_mut() |= 1u64 << (id & 63);
     }
 
     /// Set a bit and report whether it was previously unset. Returns `true`
@@ -77,16 +85,18 @@ impl IdSet {
         if id < 0 {
             return false;
         }
+        self.drop_rank_index();
         let id = id as u64;
         let cid = (id >> (CHUNK_BITS + 3)) as usize;
         if cid >= self.chunks.len() {
             self.chunks.resize_with(cid + 1, || None);
         }
-        let chunk = self.chunks[cid].get_or_insert_with(|| Box::new([0u8; CHUNK_SIZE]));
-        let offset = ((id >> 3) & ((1u64 << CHUNK_BITS) - 1)) as usize;
-        let bit = 1u8 << (id & 7);
-        let was_set = (chunk[offset] & bit) != 0;
-        chunk[offset] |= bit;
+        let chunk = self.chunks[cid].get_or_insert_with(new_chunk);
+        let word = ((id >> 6) & ((WORDS_PER_CHUNK as u64) - 1)) as usize;
+        let bit = 1u64 << (id & 63);
+        let value = chunk[word].get_mut();
+        let was_set = (*value & bit) != 0;
+        *value |= bit;
         !was_set
     }
 
@@ -117,13 +127,14 @@ impl IdSet {
         if max_id < 0 {
             return;
         }
+        self.drop_rank_index();
         let max_cid = (max_id as u64 >> (CHUNK_BITS + 3)) as usize;
         if max_cid >= self.chunks.len() {
             self.chunks.resize_with(max_cid + 1, || None);
         }
         for slot in &mut self.chunks {
             if slot.is_none() {
-                *slot = Some(Box::new([0u8; CHUNK_SIZE]));
+                *slot = Some(new_chunk());
             }
         }
     }
@@ -154,15 +165,9 @@ impl IdSet {
         let id = id as u64;
         let cid = (id >> (CHUNK_BITS + 3)) as usize;
         let chunk = self.chunk_for_atomic(cid, id, "set_atomic");
-        let offset = ((id >> 3) & ((1u64 << CHUNK_BITS) - 1)) as usize;
-        let bit = 1u8 << (id & 7);
-        // SAFETY: AtomicU8 and u8 have identical size/alignment. The chunk
-        // is pre-allocated and lives for the duration of the parallel phase.
-        // Relaxed ordering is sufficient - we only need visibility after
-        // the thread::scope join barrier.
-        let atomic =
-            unsafe { &*(std::ptr::addr_of!(chunk[offset]).cast::<std::sync::atomic::AtomicU8>()) };
-        atomic.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+        let word = ((id >> 6) & ((WORDS_PER_CHUNK as u64) - 1)) as usize;
+        let bit = 1u64 << (id & 63);
+        chunk[word].fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Atomic set + duplicate detection. Returns `true` the first time an
@@ -181,13 +186,9 @@ impl IdSet {
         let id = id as u64;
         let cid = (id >> (CHUNK_BITS + 3)) as usize;
         let chunk = self.chunk_for_atomic(cid, id, "set_atomic_if_new");
-        let offset = ((id >> 3) & ((1u64 << CHUNK_BITS) - 1)) as usize;
-        let bit = 1u8 << (id & 7);
-        // SAFETY: same as set_atomic. fetch_or returns the previous byte,
-        // from which we extract the prior state of this specific bit.
-        let atomic =
-            unsafe { &*(std::ptr::addr_of!(chunk[offset]).cast::<std::sync::atomic::AtomicU8>()) };
-        let prev = atomic.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+        let word = ((id >> 6) & ((WORDS_PER_CHUNK as u64) - 1)) as usize;
+        let bit = 1u64 << (id & 63);
+        let prev = chunk[word].fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
         (prev & bit) == 0
     }
 
@@ -197,7 +198,12 @@ impl IdSet {
     /// pre-allocated range, so indexdata/max-id bugs are diagnosable from
     /// a single panic line rather than an opaque "not pre-allocated".
     #[inline]
-    fn chunk_for_atomic(&self, cid: usize, id: u64, fn_name: &'static str) -> &[u8; CHUNK_SIZE] {
+    fn chunk_for_atomic(
+        &self,
+        cid: usize,
+        id: u64,
+        fn_name: &'static str,
+    ) -> &[std::sync::atomic::AtomicU64] {
         if cid >= self.chunks.len() {
             let max_covered = if self.chunks.is_empty() {
                 "<none - pre_allocate was never called>".to_string()
@@ -239,8 +245,8 @@ impl IdSet {
         match &self.chunks[cid] {
             None => false,
             Some(chunk) => {
-                let offset = ((id >> 3) & ((1u64 << CHUNK_BITS) - 1)) as usize;
-                (chunk[offset] & (1u8 << (id & 7))) != 0
+                let word = ((id >> 6) & ((WORDS_PER_CHUNK as u64) - 1)) as usize;
+                (chunk[word].load(std::sync::atomic::Ordering::Relaxed) & (1u64 << (id & 63))) != 0
             }
         }
     }
@@ -287,11 +293,18 @@ impl IdSet {
                     ((CHUNK_SIZE as u64) << 3) - 1
                 };
 
-                // Check byte range for any set bits.
-                let start_byte = (range_start >> 3) as usize;
-                let end_byte = ((range_end >> 3) as usize).min(CHUNK_SIZE - 1);
-                for byte in &chunk[start_byte..=end_byte] {
-                    if *byte != 0 {
+                let start_word = (range_start >> 6) as usize;
+                let end_word = ((range_end >> 6) as usize).min(WORDS_PER_CHUNK - 1);
+                for (word_idx, word) in chunk[start_word..=end_word].iter().enumerate() {
+                    let absolute_word = start_word + word_idx;
+                    let mut value = word.load(std::sync::atomic::Ordering::Relaxed);
+                    if absolute_word == start_word {
+                        value &= u64::MAX << (range_start & 63);
+                    }
+                    if absolute_word == end_word && (range_end & 63) != 63 {
+                        value &= (1u64 << ((range_end & 63) + 1)) - 1;
+                    }
+                    if value != 0 {
                         return true;
                     }
                 }
@@ -305,11 +318,12 @@ impl IdSet {
         self.chunks.iter().enumerate().flat_map(|(cid, chunk)| {
             let chunk_base = (cid as u64) << (CHUNK_BITS + 3);
             chunk.iter().flat_map(move |data| {
-                data.iter().enumerate().flat_map(move |(byte_idx, &byte)| {
-                    (0..8u8).filter_map(move |bit| {
-                        if byte & (1 << bit) != 0 {
+                data.iter().enumerate().flat_map(move |(word_idx, word)| {
+                    let value = word.load(std::sync::atomic::Ordering::Relaxed);
+                    (0..64u8).filter_map(move |bit| {
+                        if value & (1 << bit) != 0 {
                             #[allow(clippy::cast_possible_wrap)]
-                            Some((chunk_base + (byte_idx as u64) * 8 + u64::from(bit)) as i64)
+                            Some((chunk_base + (word_idx as u64) * 64 + u64::from(bit)) as i64)
                         } else {
                             None
                         }
@@ -321,14 +335,15 @@ impl IdSet {
 
     /// Merge all set bits from `other` into `self` (union).
     pub fn merge_from(&mut self, other: &IdSet) {
+        self.drop_rank_index();
         if other.chunks.len() > self.chunks.len() {
             self.chunks.resize_with(other.chunks.len(), || None);
         }
         for (cid, src) in other.chunks.iter().enumerate() {
             if let Some(src_chunk) = src {
-                let dst = self.chunks[cid].get_or_insert_with(|| Box::new([0u8; CHUNK_SIZE]));
+                let dst = self.chunks[cid].get_or_insert_with(new_chunk);
                 for (d, s) in dst.iter_mut().zip(src_chunk.iter()) {
-                    *d |= *s;
+                    *d.get_mut() |= s.load(std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -349,15 +364,13 @@ impl IdSet {
         for chunk in &self.chunks {
             chunk_prefix.push(cumulative);
             if let Some(data) = chunk {
-                let words: &[u64] = unsafe {
-                    std::slice::from_raw_parts(data.as_ptr().cast::<u64>(), CHUNK_SIZE / 8)
-                };
                 let mut bp = Vec::with_capacity(BLOCKS_PER_CHUNK);
                 let mut within_chunk: u32 = 0;
                 for block_idx in 0..BLOCKS_PER_CHUNK {
                     bp.push(within_chunk);
                     let start = block_idx * WORDS_PER_BLOCK;
-                    for &w in &words[start..start + WORDS_PER_BLOCK] {
+                    for word in &data[start..start + WORDS_PER_BLOCK] {
+                        let w = word.load(std::sync::atomic::Ordering::Relaxed);
                         within_chunk += w.count_ones();
                     }
                 }
@@ -405,16 +418,15 @@ impl IdSet {
             }
 
             // Scan only the remaining words within the block (max 31 words).
-            let words: &[u64] =
-                unsafe { std::slice::from_raw_parts(chunk.as_ptr().cast::<u64>(), CHUNK_SIZE / 8) };
             let block_start_word = block_idx * WORDS_PER_BLOCK;
             let target_word = target_byte / 8;
-            for &w in &words[block_start_word..target_word] {
+            for word in &chunk[block_start_word..target_word] {
+                let w = word.load(std::sync::atomic::Ordering::Relaxed);
                 r += u64::from(w.count_ones());
             }
 
             // Count bits in the partial word up to (but not including) target bit.
-            let word = words[target_word];
+            let word = chunk[target_word].load(std::sync::atomic::Ordering::Relaxed);
             let bit_in_word = ((target_byte & 7) << 3) + target_bit;
             if bit_in_word > 0 {
                 let mask = (1u64 << bit_in_word) - 1;
@@ -455,7 +467,10 @@ impl IdSet {
         let bit_offset = (uid & (((CHUNK_SIZE as u64) << 3) - 1)) as usize;
         let target_byte = bit_offset >> 3;
         let target_bit = bit_offset & 7;
-        if (chunk[target_byte] & (1u8 << target_bit)) == 0 {
+        let target_word = target_byte / 8;
+        let word = chunk[target_word].load(std::sync::atomic::Ordering::Relaxed);
+        let bit_in_word = ((target_byte & 7) << 3) + target_bit;
+        if (word & (1u64 << bit_in_word)) == 0 {
             return id; // not set → orphan
         }
 
@@ -476,16 +491,12 @@ impl IdSet {
             r += u64::from(bp[block_idx]);
         }
 
-        let words: &[u64] =
-            unsafe { std::slice::from_raw_parts(chunk.as_ptr().cast::<u64>(), CHUNK_SIZE / 8) };
         let block_start_word = block_idx * WORDS_PER_BLOCK;
-        let target_word = target_byte / 8;
-        for &w in &words[block_start_word..target_word] {
+        for item in &chunk[block_start_word..target_word] {
+            let w = item.load(std::sync::atomic::Ordering::Relaxed);
             r += u64::from(w.count_ones());
         }
 
-        let word = words[target_word];
-        let bit_in_word = ((target_byte & 7) << 3) + target_bit;
         if bit_in_word > 0 {
             let mask = (1u64 << bit_in_word) - 1;
             r += u64::from((word & mask).count_ones());
@@ -514,7 +525,10 @@ impl IdSet {
         let bit_offset = (uid & (((CHUNK_SIZE as u64) << 3) - 1)) as usize;
         let target_byte = bit_offset >> 3;
         let target_bit = bit_offset & 7;
-        if (chunk[target_byte] & (1u8 << target_bit)) == 0 {
+        let target_word = target_byte / 8;
+        let word = chunk[target_word].load(std::sync::atomic::Ordering::Relaxed);
+        let bit_in_word = ((target_byte & 7) << 3) + target_bit;
+        if (word & (1u64 << bit_in_word)) == 0 {
             return None;
         }
 
@@ -528,16 +542,12 @@ impl IdSet {
             r += u64::from(bp[block_idx]);
         }
 
-        let words: &[u64] =
-            unsafe { std::slice::from_raw_parts(chunk.as_ptr().cast::<u64>(), CHUNK_SIZE / 8) };
         let block_start_word = block_idx * WORDS_PER_BLOCK;
-        let target_word = target_byte / 8;
-        for &w in &words[block_start_word..target_word] {
+        for item in &chunk[block_start_word..target_word] {
+            let w = item.load(std::sync::atomic::Ordering::Relaxed);
             r += u64::from(w.count_ones());
         }
 
-        let word = words[target_word];
-        let bit_in_word = ((target_byte & 7) << 3) + target_bit;
         if bit_in_word > 0 {
             let mask = (1u64 << bit_in_word) - 1;
             r += u64::from((word & mask).count_ones());
@@ -613,6 +623,7 @@ impl IdSet {
     /// processes a contiguous ID range), chunks are moved with zero copying.
     /// For overlapping chunks, byte-level OR is applied.
     pub fn merge(&mut self, other: Self) {
+        self.drop_rank_index();
         if other.chunks.len() > self.chunks.len() {
             self.chunks.resize_with(other.chunks.len(), || None);
         }
@@ -621,7 +632,7 @@ impl IdSet {
                 match &mut self.chunks[i] {
                     Some(sc) => {
                         for (a, b) in sc.iter_mut().zip(oc.iter()) {
-                            *a |= *b;
+                            *a.get_mut() |= b.load(std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                     slot @ None => {
@@ -689,9 +700,8 @@ mod tests {
         assert!(s.any_in_range(190, 210));
 
         // Range that does not contain any set ID
-        // Note: any_in_range uses byte-level granularity, so we need ranges
-        // that don't share a byte with any set ID. ID 50 is in byte 6 (bits 48-55),
-        // ID 200 is in byte 25 (bits 200-207).
+        // any_in_range masks the partial words at both ends, so these are
+        // exact and not merely word-granular over-approximations.
         assert!(!s.any_in_range(56, 199));
         assert!(!s.any_in_range(0, 47));
         assert!(!s.any_in_range(208, 300));
@@ -871,5 +881,65 @@ mod tests {
         // No build_rank_index() - rank_if_set returns None because
         // rank prefix arrays are None.
         assert_eq!(s.rank_if_set(42), None);
+    }
+
+    #[test]
+    fn set_invalidates_rank_index() {
+        let mut s = IdSet::new();
+        s.set(10);
+        s.build_rank_index();
+        s.set(5);
+        assert_eq!(s.rank_if_set(10), None);
+        s.build_rank_index();
+        assert_eq!(s.rank_if_set(10), Some(1));
+    }
+
+    // Kept as two tests rather than one: a single test asserting after both
+    // merges only ever proves the first mutator invalidates, because it
+    // panics before reaching the second assertion.
+    #[test]
+    fn merge_from_invalidates_rank_index() {
+        let mut left = IdSet::new();
+        left.set(10);
+        left.build_rank_index();
+        let mut borrowed = IdSet::new();
+        borrowed.set(5);
+        left.merge_from(&borrowed);
+        assert_eq!(left.rank_if_set(10), None);
+        left.build_rank_index();
+        assert_eq!(left.rank_if_set(10), Some(1));
+    }
+
+    #[test]
+    fn merge_invalidates_rank_index() {
+        let mut left = IdSet::new();
+        left.set(10);
+        left.build_rank_index();
+        let mut owned = IdSet::new();
+        owned.set(3);
+        left.merge(owned);
+        assert_eq!(left.rank_if_set(10), None);
+        left.build_rank_index();
+        assert_eq!(left.rank_if_set(10), Some(1));
+    }
+
+    #[test]
+    fn atomic_storage_is_u64_aligned_and_parallel_fill_survives_rank_build() {
+        let mut s = IdSet::new();
+        s.pre_allocate(10_000);
+        let chunk = s.chunks[0].as_ref().expect("allocated chunk");
+        assert_eq!((chunk.as_ptr() as usize) % std::mem::align_of::<u64>(), 0);
+        std::thread::scope(|scope| {
+            for offset in 0..8 {
+                let shared = &s;
+                scope.spawn(move || {
+                    for id in (offset..10_000).step_by(8) {
+                        shared.set_atomic(id);
+                    }
+                });
+            }
+        });
+        s.build_rank_index();
+        assert_eq!(s.total_count(), 10_000);
     }
 }

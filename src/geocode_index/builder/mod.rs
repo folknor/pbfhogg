@@ -65,6 +65,62 @@ impl Default for BuildConfig {
     }
 }
 
+impl BuildConfig {
+    fn validate(&self) -> Result<()> {
+        const MAX_S2_LEVEL: u8 = 30;
+        for (name, level) in [
+            ("street", self.street_level),
+            ("coarse", self.coarse_level),
+            ("admin", self.admin_level),
+        ] {
+            if level > MAX_S2_LEVEL {
+                return Err(
+                    format!("{name} S2 level must be in 0..={MAX_S2_LEVEL}, got {level}").into(),
+                );
+            }
+        }
+        if self.coarse_level >= self.street_level {
+            return Err(format!(
+                "coarse S2 level ({}) must be less than street S2 level ({})",
+                self.coarse_level, self.street_level
+            )
+            .into());
+        }
+        for (name, radius) in [
+            ("search radius", self.fine_search_radius_m),
+            ("coarse search radius", self.coarse_search_radius_m),
+        ] {
+            if !radius.is_finite() || radius < 0.0 {
+                return Err(
+                    format!("{name} must be a finite non-negative number, got {radius}").into(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::BuildConfig;
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn rejects_invalid_levels_and_radii() {
+        let mut config = BuildConfig::default();
+        config.street_level = 31;
+        assert!(config.validate().is_err());
+        config.street_level = 17;
+        config.coarse_level = 17;
+        assert!(config.validate().is_err());
+        config.coarse_level = 14;
+        config.fine_search_radius_m = f32::NAN;
+        assert!(config.validate().is_err());
+        config.fine_search_radius_m = -1.0;
+        assert!(config.validate().is_err());
+    }
+}
+
 /// Build statistics.
 #[derive(Debug, Default)]
 pub struct BuildStats {
@@ -91,6 +147,7 @@ pub struct BuildStats {
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 #[hotpath::measure]
 pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
+    config.validate()?;
     // Cap glibc arenas at 2 to prevent cross-thread free fragmentation in
     // the Pass 2a pread worker pool. Without this, PrimitiveBlock Vec<u8>s
     // allocated on decode workers and freed on the main-thread merge path

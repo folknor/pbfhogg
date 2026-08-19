@@ -44,6 +44,30 @@ struct OutputArg {
     output: PathBuf,
 }
 
+fn parse_type_filter(value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        return Err("type filter must not be empty".to_string());
+    }
+    for kind in value.split(',') {
+        if !matches!(kind, "node" | "way" | "relation") {
+            return Err(format!(
+                "invalid element type '{kind}' (expected node, way, or relation)"
+            ));
+        }
+    }
+    Ok(value.to_string())
+}
+
+fn parse_single_type(value: &str) -> Result<String, String> {
+    if matches!(value, "node" | "way" | "relation") {
+        Ok(value.to_string())
+    } else {
+        Err(format!(
+            "invalid element type '{value}' (expected node, way, or relation)"
+        ))
+    }
+}
+
 #[derive(Args)]
 struct CompressionArg {
     /// Compression: none, zlib (default), zstd. Append :LEVEL for custom (e.g. zlib:9, zstd:19)
@@ -129,7 +153,7 @@ enum Command {
         #[arg(short = 'c', long = "clean", value_name = "ATTR")]
         clean: Vec<String>,
         /// Filter by element type (comma-separated: node, way, relation)
-        #[arg(short = 't', long = "type")]
+        #[arg(short = 't', long = "type", value_parser = parse_type_filter)]
         type_filter: Option<String>,
         /// Sorted k-way merge with dedup by (type, id). Requires sorted inputs.
         #[arg(long)]
@@ -385,7 +409,7 @@ enum Command {
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
         /// Filter by element type (comma-separated: node, way, relation)
-        #[arg(short = 't', long = "type")]
+        #[arg(short = 't', long = "type", value_parser = parse_type_filter)]
         type_filter: Option<String>,
         /// Number of parallel shards for the block-pair merge. `0` (default)
         /// auto-picks from available cores; `1` restores the sequential,
@@ -689,7 +713,7 @@ enum Command {
         #[arg(long)]
         full: bool,
         /// Filter by element type for ID check (comma-separated: node, way, relation)
-        #[arg(short = 't', long = "type")]
+        #[arg(short = 't', long = "type", value_parser = parse_type_filter)]
         type_filter: Option<String>,
         /// Stop after N violations per check (0 = unlimited)
         #[arg(long, default_value = "100")]
@@ -790,7 +814,7 @@ enum InspectCommand {
         /// Tag filter expressions (e.g. "highway", "amenity", "w/building=yes")
         expressions: Vec<String>,
         /// Filter by element type: node, way, or relation
-        #[arg(short = 't', long = "type")]
+        #[arg(short = 't', long = "type", value_parser = parse_single_type)]
         type_filter: Option<String>,
         /// Parallel worker threads. `1` forces sequential, `0` auto-picks
         /// from `available_parallelism()`, higher values cap the worker
@@ -869,6 +893,7 @@ fn main() -> process::ExitCode {
     let cli = Cli::parse();
 
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        validate_input_output_aliases(&cli.command)?;
         match cli.command {
             Command::Cat {
                 files,
@@ -2010,15 +2035,118 @@ fn paths_alias(input: &std::path::Path, output: &std::path::Path) -> std::io::Re
         return Ok(false);
     }
 
-    let parent = output
+    let Some(planned) = planned_path(output)? else {
+        return Ok(false);
+    };
+    Ok(input_canonical == planned)
+}
+
+/// Resolve the location a not-yet-created file will occupy: the canonical
+/// parent directory joined with the final component. Returns `None` when the
+/// path has no file name (e.g. a bare `..`), which can never be a valid output.
+fn planned_path(path: &std::path::Path) -> std::io::Result<Option<PathBuf>> {
+    let parent = path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
     let parent = std::fs::canonicalize(parent)?;
-    let Some(name) = output.file_name() else {
-        return Ok(false);
-    };
-    Ok(input_canonical == parent.join(name))
+    Ok(path.file_name().map(|name| parent.join(name)))
+}
+
+/// Alias check between two *outputs*, where neither side is required to exist
+/// yet. Whenever at least one side is already present on disk this delegates to
+/// `paths_alias`, so symlink and hardlink identity is decided in exactly one
+/// place; only when both are still absent does it fall back to comparing the
+/// planned destinations.
+fn outputs_alias(a: &std::path::Path, b: &std::path::Path) -> std::io::Result<bool> {
+    if a.exists() {
+        return paths_alias(a, b);
+    }
+    if b.exists() {
+        return paths_alias(b, a);
+    }
+    match (planned_path(a)?, planned_path(b)?) {
+        (Some(a), Some(b)) => Ok(a == b),
+        _ => Ok(false),
+    }
+}
+
+fn reject_aliases(
+    inputs: &[&std::path::Path],
+    output: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for input in inputs {
+        if paths_alias(input, output)? {
+            return Err(format!(
+                "output '{}' aliases input '{}'",
+                output.display(),
+                input.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_input_output_aliases(command: &Command) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        Command::Cat { files, output, .. } => {
+            let inputs: Vec<&std::path::Path> = files.iter().map(PathBuf::as_path).collect();
+            reject_aliases(&inputs, &output.output)
+        }
+        Command::Sort { file, output, .. }
+        | Command::Repack { file, output, .. }
+        | Command::Degrade { file, output, .. }
+        | Command::Renumber { file, output, .. }
+        | Command::TagsFilter { file, output, .. }
+        | Command::Getid { file, output, .. }
+        | Command::Getparents { file, output, .. }
+        | Command::AddLocationsToWays { file, output, .. }
+        | Command::TimeFilter { file, output, .. } => reject_aliases(&[file], &output.output),
+        Command::Export {
+            file,
+            output: Some(output),
+            ..
+        } => reject_aliases(&[file], output),
+        Command::Diff {
+            old,
+            new,
+            output: Some(output),
+            ..
+        } => reject_aliases(&[old, new], output),
+        Command::Extract {
+            file,
+            output: Some(output),
+            ..
+        } => reject_aliases(&[file], output),
+        Command::ApplyChanges {
+            base,
+            changes,
+            output,
+            ..
+        } => reject_aliases(&[base, changes], &output.output),
+        Command::MergeChanges {
+            changes, output, ..
+        } => {
+            let inputs: Vec<&std::path::Path> = changes.iter().map(PathBuf::as_path).collect();
+            reject_aliases(&inputs, &output.output)
+        }
+        Command::BenchMerge {
+            base,
+            changes,
+            output,
+            ..
+        } => reject_aliases(&[base, changes], &output.output),
+        Command::Export { output: None, .. }
+        | Command::Diff { output: None, .. }
+        | Command::Extract { output: None, .. }
+        | Command::Inspect { .. }
+        | Command::Check { .. }
+        | Command::BenchRead { .. }
+        | Command::BenchWrite { .. }
+        | Command::BuildGeocodeIndex { .. } => Ok(()),
+    }
 }
 
 fn run_export_to<W: std::io::Write>(
@@ -2466,6 +2594,26 @@ fn run_extract_config(
             // Re-resolve output relative to new directory
             if let Ok(relative) = slot.output.strip_prefix(old_dir) {
                 slot.output = dir.join(relative);
+            }
+        }
+    }
+
+    for slot in &slots {
+        reject_aliases(&[file], &slot.output)?;
+    }
+    // Two config slots resolving to the same file (identical path, a symlink,
+    // or a hardlink) would open two independent writers on it: the second
+    // File::create truncates what the first is producing and the two streams
+    // interleave. Reject the collision before any writer is opened.
+    for (i, slot) in slots.iter().enumerate() {
+        for other in &slots[i + 1..] {
+            if outputs_alias(&slot.output, &other.output)? {
+                return Err(format!(
+                    "extract outputs '{}' and '{}' resolve to the same file",
+                    slot.output.display(),
+                    other.output.display()
+                )
+                .into());
             }
         }
     }

@@ -285,6 +285,32 @@ fn cat_type_filter_node_way() {
     );
 }
 
+#[test]
+fn cat_rejects_unknown_type_without_creating_output() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_test_pbf(&input, &[], &[], &[]);
+
+    let result = run_cat(&[&input], &output, Some("nodes"), &[], false);
+    assert!(!result.status.success());
+    assert!(result.stderr_str().contains("invalid element type 'nodes'"));
+    assert!(!output.exists());
+}
+
+#[test]
+fn cat_rejects_input_output_alias_before_truncation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    write_test_pbf(&input, &[], &[], &[]);
+    let before = std::fs::read(&input).expect("read input before command");
+
+    let result = run_cat(&[&input], &input, None, &[], false);
+    assert!(!result.status.success());
+    assert!(result.stderr_str().contains("aliases input"));
+    assert_eq!(std::fs::read(&input).expect("read preserved input"), before);
+}
+
 // ---------------------------------------------------------------------------
 // Multi-file concatenation
 // ---------------------------------------------------------------------------

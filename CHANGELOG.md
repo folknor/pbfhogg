@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Commands that write a PBF now reject an output that aliases one of their
+  inputs before opening any writer, rather than truncating the input and
+  failing partway through. The check resolves symlinks and compares device
+  and inode, so `pbfhogg sort in.osm.pbf -o link-to-in.osm.pbf` is caught,
+  not just a literal repeat of the same path. `extract --config` additionally
+  rejects two config slots whose outputs resolve to the same file; previously
+  only lexically identical output paths were caught, so differently spelled
+  paths and symlinked outputs opened two writers on one file and produced
+  truncated, interleaved output.
+
+- `--type` is now validated at parse time on `cat`, `diff`, `check` and
+  `inspect tags`. An unrecognised element type is a usage error naming the
+  offending value instead of a silently empty filter that produced an empty
+  output file.
+
+- `build-geocode-index` validates its configuration before doing any work:
+  S2 levels must be in `0..=30`, the coarse level must be shallower than the
+  street level, and the search radii must be finite and non-negative. Values
+  outside those ranges previously panicked in debug or produced a silently
+  wrong index in release.
+
+### Fixed
+
+- A dense node whose metadata carries an out-of-range user string index no
+  longer loses its entire metadata record. Version, timestamp, changeset,
+  uid and visibility are preserved and only the user name falls back to
+  empty, so a single bad string-table reference in an input no longer
+  strips authorship from the surrounding node on the way through.
+
 ## 0.5.0 - 2026-07-16
 
 ### Breaking changes

@@ -331,7 +331,7 @@ pub(crate) fn read_dense_node(dn: &crate::DenseNode<'_>) -> OwnedNode {
                     info.changeset()
                 },
                 uid: info.uid(),
-                user: info.user().ok()?.to_owned(),
+                user: info.user().unwrap_or("").to_owned(),
                 visible: info.visible(),
             })
         }),
@@ -574,4 +574,50 @@ pub(crate) fn write_single_relation_local(
         meta.as_ref(),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_dense_node;
+    use crate::block_builder::{BlockBuilder, Metadata};
+    use crate::{Element, PrimitiveBlock};
+
+    #[test]
+    fn corrupt_dense_user_sid_preserves_other_metadata() {
+        let mut builder = BlockBuilder::new();
+        builder.add_node(
+            1,
+            10,
+            20,
+            [],
+            Some(&Metadata {
+                version: 7,
+                timestamp: 11_000,
+                changeset: 13,
+                uid: 17,
+                user: "user",
+                visible: false,
+            }),
+        );
+        let bytes = builder
+            .take()
+            .expect("encode block")
+            .expect("block bytes")
+            .to_vec();
+        let block = PrimitiveBlock::new(bytes::Bytes::from(bytes)).expect("parse block");
+        let mut dense = match block.elements().next().expect("dense node") {
+            Element::DenseNode(node) => node,
+            _ => panic!("expected dense node"),
+        };
+        dense.set_test_user_sid(i32::MAX);
+
+        let owned = read_dense_node(&dense);
+        let metadata = owned.metadata.expect("metadata must survive bad user sid");
+        assert_eq!(metadata.version, 7);
+        assert_eq!(metadata.timestamp, 11_000);
+        assert_eq!(metadata.changeset, 13);
+        assert_eq!(metadata.uid, 17);
+        assert_eq!(metadata.user, "");
+        assert!(!metadata.visible);
+    }
 }

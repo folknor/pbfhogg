@@ -991,6 +991,89 @@ enum InspectCommand {
     },
 }
 
+/// Write-side flags shared by every command that produces an output file.
+///
+/// These four travelled as four positional parameters through twenty `run_*`
+/// functions, three of them adjacent `bool`s: transposing `direct_io` and
+/// `force` at a call site compiled silently and changed what the command
+/// did. As a struct they are written by field name at the one place that
+/// knows their values, and the compiler catches a missing one.
+///
+/// Commands whose clap surface has no `--io-uring` or `--force` set the
+/// corresponding field to `false` explicitly at the dispatch site.
+#[derive(Clone, Copy)]
+struct WriteOpts {
+    compression: Compression,
+    direct_io: bool,
+    io_uring: bool,
+    force: bool,
+}
+
+/// `getid`'s three independent booleans, same hazard as [`WriteOpts`].
+#[derive(Clone, Copy)]
+struct GetidFlags {
+    add_referenced: bool,
+    remove_tags: bool,
+    verbose_ids: bool,
+}
+
+/// `tags-filter`'s three matching-mode booleans.
+#[derive(Clone, Copy)]
+struct TagsFilterFlags {
+    omit_referenced: bool,
+    invert_match: bool,
+    remove_tags: bool,
+}
+
+/// `check`'s selectors and reporting booleans.
+#[derive(Clone, Copy)]
+struct CheckFlags {
+    ids: bool,
+    refs: bool,
+    check_relations: bool,
+    show_ids: bool,
+    full: bool,
+    json: bool,
+    quiet: bool,
+}
+
+/// `inspect`'s section selectors. `blocks` and `get` stay out: they carry
+/// values rather than being part of the interchangeable-boolean run.
+#[derive(Clone, Copy)]
+struct InspectFlags {
+    indexed: bool,
+    nodes: bool,
+    id_ranges: bool,
+    locations: bool,
+    anomalies: bool,
+    extended: bool,
+    json: bool,
+    force: bool,
+}
+
+/// `diff`'s output-shape booleans.
+#[derive(Clone, Copy)]
+struct DiffFlags {
+    suppress_common: bool,
+    verbose: bool,
+    osmium_summary: bool,
+    quiet: bool,
+}
+
+/// The geocode index's S2 levels and search radii. The three `u8` levels
+/// were adjacent positional parameters, as were the two `f32` radii - the
+/// same silent-transposition hazard as the boolean runs, and harder to
+/// notice because a wrong level still builds a valid-looking index.
+#[derive(Clone, Copy)]
+struct GeocodeLevels {
+    street_level: u8,
+    coarse_level: u8,
+    admin_level: u8,
+    max_admin_vertices: u16,
+    search_radius: f32,
+    coarse_search_radius: f32,
+}
+
 fn detect_input_kind(path: &std::path::Path) -> InputKind {
     // Content sniffing: read first bytes to distinguish PBF from OSC
     if let Ok(kind) = sniff_input_kind(path) {
@@ -1053,7 +1136,25 @@ fn main() -> process::ExitCode {
         .functions_limit(0)
         .build();
 
-    let cli = Cli::parse();
+    // `Cli::parse()` ends a parse error - and `--help` / `--version` - with
+    // `clap::Error::exit`, which calls `process::exit` and so skips every
+    // destructor, including the hotpath guard built two lines up. That is
+    // exactly the hazard `ExitWithCode` exists to avoid on the command
+    // paths, so the argument path uses `try_parse` and returns instead.
+    // `Error::print` writes to the same stream clap would have used
+    // (stdout for help and version, stderr for a usage error) and
+    // `Error::exit_code` is clap's own code for the case, so neither the
+    // text nor the status a caller sees changes.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            let code = err.exit_code();
+            drop(err.print());
+            return process::ExitCode::from(
+                u8::try_from(code).unwrap_or(ExitStatus::Failed.code()),
+            );
+        }
+    };
 
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         validate_input_output_aliases(&cli.command)?;
@@ -1071,6 +1172,12 @@ fn main() -> process::ExitCode {
                 header,
             } => {
                 let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                let write = WriteOpts {
+                    compression: compression.compression,
+                    direct_io: io.direct_io,
+                    io_uring: uring.io_uring,
+                    force: force.force,
+                };
                 if dedupe {
                     if type_filter.is_some() {
                         return Err("--type is not valid with --dedupe".into());
@@ -1078,29 +1185,23 @@ fn main() -> process::ExitCode {
                     if !clean.is_empty() {
                         return Err("--clean is not valid with --dedupe".into());
                     }
-                    run_merge_pbf(
-                        &files,
-                        &output.output,
-                        compression.compression,
-                        io.direct_io,
-                        uring.io_uring,
-                        force.force,
-                        &overrides,
-                    )
+                    guarded_output(&output.output, |out| {
+                        run_merge_pbf(&files, out, &write, &overrides)
+                    })
                 } else {
                     if uring.io_uring {
                         return Err("--io-uring is only valid with --dedupe".into());
                     }
-                    run_cat(
-                        &files,
-                        &output.output,
-                        type_filter,
-                        &clean_attrs(&clean),
-                        compression.compression,
-                        io.direct_io,
-                        force.force,
-                        &overrides,
-                    )
+                    guarded_output(&output.output, |out| {
+                        run_cat(
+                            &files,
+                            out,
+                            type_filter,
+                            &clean_attrs(&clean),
+                            &write,
+                            &overrides,
+                        )
+                    })
                 }
             }
             Command::Sort {
@@ -1111,15 +1212,18 @@ fn main() -> process::ExitCode {
                 uring,
                 force,
                 header,
-            } => run_sort(
-                &file,
-                &output.output,
-                compression.compression,
-                io.direct_io,
-                uring.io_uring,
-                force.force,
-                &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-            ),
+            } => {
+                let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                let write = WriteOpts {
+                    compression: compression.compression,
+                    direct_io: io.direct_io,
+                    io_uring: uring.io_uring,
+                    force: force.force,
+                };
+                guarded_output(&output.output, |out| {
+                    run_sort(&file, out, &write, &overrides)
+                })
+            }
             Command::Repack {
                 file,
                 output,
@@ -1129,16 +1233,18 @@ fn main() -> process::ExitCode {
                 uring,
                 force,
                 header,
-            } => run_repack(
-                &file,
-                &output.output,
-                elements_per_blob,
-                compression.compression,
-                io.direct_io,
-                uring.io_uring,
-                force.force,
-                &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-            ),
+            } => {
+                let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                let write = WriteOpts {
+                    compression: compression.compression,
+                    direct_io: io.direct_io,
+                    io_uring: uring.io_uring,
+                    force: force.force,
+                };
+                guarded_output(&output.output, |out| {
+                    run_repack(&file, out, elements_per_blob, &write, &overrides)
+                })
+            }
             Command::Degrade {
                 file,
                 output,
@@ -1155,23 +1261,33 @@ fn main() -> process::ExitCode {
                 io,
                 uring,
                 header,
-            } => run_degrade(
-                &file,
-                &output.output,
-                unsort,
-                unsort_intra,
-                strip_locations,
-                strip_indexdata,
-                strip_tagdata,
-                strip_bbox,
-                drop_ids,
-                block_cap,
-                force,
-                compression.compression,
-                io.direct_io,
-                uring.io_uring,
-                &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-            ),
+            } => {
+                let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                let write = WriteOpts {
+                    compression: compression.compression,
+                    direct_io: io.direct_io,
+                    io_uring: uring.io_uring,
+                    force,
+                };
+                // Six adjacent `bool`s used to be six positional arguments
+                // here; the library's own `DegradeFlags` already names them,
+                // so build it where the flags are read.
+                let flags = pbfhogg::degrade::DegradeFlags {
+                    unsort,
+                    unsort_intra,
+                    strip_locations,
+                    strip_indexdata,
+                    strip_tagdata,
+                    strip_bbox,
+                    drop_ids: drop_ids
+                        .as_deref()
+                        .map(pbfhogg::degrade::DropSpec::parse)
+                        .transpose()?,
+                };
+                guarded_output(&output.output, |out| {
+                    run_degrade(&file, out, flags, block_cap, &write, &overrides)
+                })
+            }
             Command::Renumber {
                 file,
                 output,
@@ -1179,14 +1295,18 @@ fn main() -> process::ExitCode {
                 compression,
                 io,
                 header,
-            } => run_renumber(
-                &file,
-                &output.output,
-                &start_id,
-                compression.compression,
-                io.direct_io,
-                &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-            ),
+            } => {
+                let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                let write = WriteOpts {
+                    compression: compression.compression,
+                    direct_io: io.direct_io,
+                    io_uring: false,
+                    force: false,
+                };
+                guarded_output(&output.output, |out| {
+                    run_renumber(&file, out, &start_id, &write, &overrides)
+                })
+            }
             Command::TagsFilter {
                 file,
                 output,
@@ -1217,25 +1337,40 @@ fn main() -> process::ExitCode {
                     if jobs != 0 {
                         return Err("-j/--jobs is not valid in OSC mode (OSC parse is single-threaded)".into());
                     }
-                    run_tags_filter_osc(&file, &output.output, expressions_file.as_deref(), &expressions)
+                    guarded_output(&output.output, |out| {
+                        run_tags_filter_osc(&file, out, expressions_file.as_deref(), &expressions)
+                    })
                 }
                 InputKind::Pbf if omit_referenced && jobs != 0 => {
                     Err("-j/--jobs has no effect with -R/--omit-referenced (single-pass mode uses the pipelined reader, not the parallel classify path). Drop -R or drop -j.".into())
                 }
-                InputKind::Pbf => run_tags_filter(
-                    &file,
-                    &output.output,
-                    expressions_file.as_deref(),
-                    &expressions,
-                    omit_referenced,
-                    invert_match,
-                    remove_tags,
-                    compression.compression,
-                    io.direct_io,
-                    force.force,
-                    jobs,
-                    &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-                ),
+                InputKind::Pbf => {
+                    let overrides =
+                        HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                    let write = WriteOpts {
+                        compression: compression.compression,
+                        direct_io: io.direct_io,
+                        io_uring: false,
+                        force: force.force,
+                    };
+                    let flags = TagsFilterFlags {
+                        omit_referenced,
+                        invert_match,
+                        remove_tags,
+                    };
+                    guarded_output(&output.output, |out| {
+                        run_tags_filter(
+                            &file,
+                            out,
+                            expressions_file.as_deref(),
+                            &expressions,
+                            flags,
+                            &write,
+                            jobs,
+                            &overrides,
+                        )
+                    })
+                }
             }
             }
             Command::Export {
@@ -1291,15 +1426,17 @@ fn main() -> process::ExitCode {
                     if type_filter.is_some() {
                         return Err("--type is not valid with --format osc".into());
                     }
-                    run_derive_changes(
-                        &old,
-                        &new,
-                        &output,
-                        io.direct_io,
-                        increment_version,
-                        update_timestamp,
-                        jobs,
-                    )
+                    guarded_output(&output, |out| {
+                        run_derive_changes(
+                            &old,
+                            &new,
+                            out,
+                            io.direct_io,
+                            increment_version,
+                            update_timestamp,
+                            jobs,
+                        )
+                    })
                 }
                 DiffFormat::Text => {
                     if increment_version {
@@ -1308,18 +1445,26 @@ fn main() -> process::ExitCode {
                     if update_timestamp {
                         return Err("--update-timestamp is only valid with --format osc".into());
                     }
-                    run_diff(
-                        &old,
-                        &new,
+                    let flags = DiffFlags {
                         suppress_common,
                         verbose,
                         osmium_summary,
                         quiet,
-                        output.as_deref(),
-                        type_filter,
-                        jobs,
-                        io.direct_io,
-                    )
+                    };
+                    match output.as_deref() {
+                        Some(path) => guarded_output(path, |out| {
+                            run_diff(
+                                &old,
+                                &new,
+                                flags,
+                                Some(out),
+                                type_filter,
+                                jobs,
+                                io.direct_io,
+                            )
+                        }),
+                        None => run_diff(&old, &new, flags, None, type_filter, jobs, io.direct_io),
+                    }
                 }
             },
             Command::Getid {
@@ -1338,35 +1483,45 @@ fn main() -> process::ExitCode {
                 io,
                 header,
             } => {
+                let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                let write = WriteOpts {
+                    compression: compression.compression,
+                    direct_io: io.direct_io,
+                    io_uring: false,
+                    force: force.force,
+                };
                 if invert {
-                    run_removeid(
-                        &file,
-                        &output.output,
-                        id_file.as_deref(),
-                        id_osm_file.as_deref(),
-                        default_type,
-                        &ids,
-                        compression.compression,
-                        io.direct_io,
-                        force.force,
-                        &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-                    )
+                    guarded_output(&output.output, |out| {
+                        run_removeid(
+                            &file,
+                            out,
+                            id_file.as_deref(),
+                            id_osm_file.as_deref(),
+                            default_type,
+                            &ids,
+                            &write,
+                            &overrides,
+                        )
+                    })
                 } else {
-                    run_getid(
-                        &file,
-                        &output.output,
+                    let flags = GetidFlags {
                         add_referenced,
                         remove_tags,
                         verbose_ids,
-                        id_file.as_deref(),
-                        id_osm_file.as_deref(),
-                        default_type,
-                        &ids,
-                        compression.compression,
-                        io.direct_io,
-                        force.force,
-                        &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-                    )
+                    };
+                    guarded_output(&output.output, |out| {
+                        run_getid(
+                            &file,
+                            out,
+                            flags,
+                            id_file.as_deref(),
+                            id_osm_file.as_deref(),
+                            default_type,
+                            &ids,
+                            &write,
+                            &overrides,
+                        )
+                    })
                 }
             }
             Command::Getparents {
@@ -1381,19 +1536,29 @@ fn main() -> process::ExitCode {
                 compression,
                 io,
                 header,
-            } => run_getparents(
-                &file,
-                &output.output,
-                add_self,
-                id_file.as_deref(),
-                id_osm_file.as_deref(),
-                default_type,
-                &ids,
-                compression.compression,
-                io.direct_io,
-                &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-                full_scan_min_blobs,
-            ),
+            } => {
+                let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                let write = WriteOpts {
+                    compression: compression.compression,
+                    direct_io: io.direct_io,
+                    io_uring: false,
+                    force: false,
+                };
+                guarded_output(&output.output, |out| {
+                    run_getparents(
+                        &file,
+                        out,
+                        add_self,
+                        id_file.as_deref(),
+                        id_osm_file.as_deref(),
+                        default_type,
+                        &ids,
+                        &write,
+                        &overrides,
+                        full_scan_min_blobs,
+                    )
+                })
+            }
             Command::Extract {
                 file,
                 output,
@@ -1411,6 +1576,12 @@ fn main() -> process::ExitCode {
                 header,
             } => {
                 let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                let write = WriteOpts {
+                    compression: compression.compression,
+                    direct_io: io.direct_io,
+                    io_uring: false,
+                    force: force.force,
+                };
                 if let Some(config_path) = config.as_deref() {
                     run_extract_config(
                         &file,
@@ -1419,25 +1590,23 @@ fn main() -> process::ExitCode {
                         extract_strategy(simple, smart),
                         set_bounds,
                         &clean_attrs(&clean),
-                        compression.compression,
-                        io.direct_io,
-                        force.force,
+                        &write,
                         &overrides,
                     )
                 } else if let Some(output) = output.as_ref() {
-                    run_extract(
-                        &file,
-                        output,
-                        bbox.as_deref(),
-                        polygon.as_deref(),
-                        extract_strategy(simple, smart),
-                        set_bounds,
-                        &clean_attrs(&clean),
-                        compression.compression,
-                        io.direct_io,
-                        force.force,
-                        &overrides,
-                    )
+                    guarded_output(output, |out| {
+                        run_extract(
+                            &file,
+                            out,
+                            bbox.as_deref(),
+                            polygon.as_deref(),
+                            extract_strategy(simple, smart),
+                            set_bounds,
+                            &clean_attrs(&clean),
+                            &write,
+                            &overrides,
+                        )
+                    })
                 } else {
                     Err("--output is required without --config".into())
                 }
@@ -1452,17 +1621,27 @@ fn main() -> process::ExitCode {
                 force,
                 io,
                 header,
-            } => run_add_locations_to_ways(
-                &file,
-                &output.output,
-                keep_untagged_nodes,
-                index_type.resolve()?,
-                inject_prepass,
-                compression.compression,
-                io.direct_io,
-                force.force,
-                &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-            ),
+            } => {
+                let index_type = index_type.resolve()?;
+                let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                let write = WriteOpts {
+                    compression: compression.compression,
+                    direct_io: io.direct_io,
+                    io_uring: false,
+                    force: force.force,
+                };
+                guarded_output(&output.output, |out| {
+                    run_add_locations_to_ways(
+                        &file,
+                        out,
+                        keep_untagged_nodes,
+                        index_type,
+                        inject_prepass,
+                        &write,
+                        &overrides,
+                    )
+                })
+            }
             Command::TimeFilter {
                 file,
                 output,
@@ -1470,14 +1649,18 @@ fn main() -> process::ExitCode {
                 compression,
                 io,
                 header,
-            } => run_time_filter(
-                &file,
-                &output.output,
-                &timestamp,
-                compression.compression,
-                io.direct_io,
-                &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-            ),
+            } => {
+                let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                let write = WriteOpts {
+                    compression: compression.compression,
+                    direct_io: io.direct_io,
+                    io_uring: false,
+                    force: false,
+                };
+                guarded_output(&output.output, |out| {
+                    run_time_filter(&file, out, &timestamp, &write, &overrides)
+                })
+            }
             Command::Inspect {
                 subcommand,
                 file,
@@ -1527,18 +1710,20 @@ fn main() -> process::ExitCode {
                     }
                     run_inspect(
                         &file,
-                        indexed,
-                        nodes,
+                        InspectFlags {
+                            indexed,
+                            nodes,
+                            id_ranges,
+                            locations,
+                            anomalies,
+                            extended,
+                            json,
+                            force,
+                        },
                         jobs,
                         blocks,
-                        id_ranges,
-                        locations,
-                        anomalies,
-                        extended,
                         get.as_deref(),
-                        json,
                         io.direct_io,
-                        force,
                     )
                 }
             }
@@ -1553,24 +1738,34 @@ fn main() -> process::ExitCode {
                 locations_on_ways,
                 jobs,
                 header,
-            } => run_apply_changes(
-                &base,
-                &changes,
-                &output.output,
-                compression.compression,
-                io.direct_io,
-                uring.io_uring,
-                force.force,
-                locations_on_ways,
-                jobs,
-                &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-            ),
+            } => {
+                let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                let write = WriteOpts {
+                    compression: compression.compression,
+                    direct_io: io.direct_io,
+                    io_uring: uring.io_uring,
+                    force: force.force,
+                };
+                guarded_output(&output.output, |out| {
+                    run_apply_changes(
+                        &base,
+                        &changes,
+                        out,
+                        &write,
+                        locations_on_ways,
+                        jobs,
+                        &overrides,
+                    )
+                })
+            }
             Command::MergeChanges {
                 changes,
                 output,
                 simplify,
                 jobs,
-            } => run_merge_changes(&changes, &output.output, simplify, jobs),
+            } => guarded_output(&output.output, |out| {
+                run_merge_changes(&changes, out, simplify, jobs)
+            }),
             Command::Check {
                 file,
                 ids,
@@ -1585,15 +1780,17 @@ fn main() -> process::ExitCode {
                 io,
             } => run_check(
                 &file,
-                ids,
-                refs,
-                check_relations,
-                show_ids,
-                full,
+                CheckFlags {
+                    ids,
+                    refs,
+                    check_relations,
+                    show_ids,
+                    full,
+                    json,
+                    quiet,
+                },
                 type_filter,
                 max_errors,
-                json,
-                quiet,
                 io.direct_io,
             ),
             Command::BuildGeocodeIndex {
@@ -1610,12 +1807,14 @@ fn main() -> process::ExitCode {
             } => run_build_geocode_index(
                 &file,
                 &output_dir,
-                street_level,
-                coarse_level,
-                admin_level,
-                max_admin_vertices,
-                search_radius,
-                coarse_search_radius,
+                GeocodeLevels {
+                    street_level,
+                    coarse_level,
+                    admin_level,
+                    max_admin_vertices,
+                    search_radius,
+                    coarse_search_radius,
+                },
                 io.direct_io,
                 force.force,
             ),
@@ -1652,16 +1851,10 @@ fn main() -> process::ExitCode {
     // returned `ExitCode` is converted to the process exit status.
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_build_geocode_index(
     file: &std::path::Path,
     output_dir: &std::path::Path,
-    street_level: u8,
-    coarse_level: u8,
-    admin_level: u8,
-    max_admin_vertices: u16,
-    search_radius: f32,
-    coarse_search_radius: f32,
+    levels: GeocodeLevels,
     direct_io: bool,
     force: bool,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -1670,12 +1863,12 @@ fn run_build_geocode_index(
         output_dir: output_dir.to_path_buf(),
         force,
         direct_io,
-        street_level,
-        coarse_level,
-        admin_level,
-        max_admin_vertices,
-        fine_search_radius_m: search_radius,
-        coarse_search_radius_m: coarse_search_radius,
+        street_level: levels.street_level,
+        coarse_level: levels.coarse_level,
+        admin_level: levels.admin_level,
+        max_admin_vertices: levels.max_admin_vertices,
+        fine_search_radius_m: levels.search_radius,
+        coarse_search_radius_m: levels.coarse_search_radius,
     };
     let stats = pbfhogg::geocode_index::builder::build_geocode_index(&config)?;
     eprintln!(
@@ -1691,24 +1884,23 @@ fn run_build_geocode_index(
     Ok(())
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity
-)]
+#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 fn run_check(
     path: &std::path::Path,
-    ids: bool,
-    refs: bool,
-    check_relations: bool,
-    show_ids: bool,
-    full: bool,
+    flags: CheckFlags,
     type_filter: Option<TypeFilter>,
     max_errors: usize,
-    json: bool,
-    quiet: bool,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let CheckFlags {
+        ids,
+        refs,
+        check_relations,
+        show_ids,
+        full,
+        json,
+        quiet,
+    } = flags;
     // Default: run both checks when neither --ids nor --refs specified
     let run_ids = ids || !refs;
     let run_refs = refs || !ids;
@@ -1910,15 +2102,12 @@ fn run_tags_count(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_cat(
     files: &[PathBuf],
     output: &std::path::Path,
     type_filter: Option<TypeFilter>,
     clean: &CleanAttrs,
-    compression: Compression,
-    direct_io: bool,
-    force: bool,
+    write: &WriteOpts,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let paths: Vec<&std::path::Path> = files.iter().map(AsRef::as_ref).collect();
@@ -1927,9 +2116,9 @@ fn run_cat(
         output,
         type_filter,
         clean,
-        compression,
-        direct_io,
-        force,
+        write.compression,
+        write.direct_io,
+        write.force,
         overrides,
     )?;
     stats.print_summary();
@@ -1939,101 +2128,69 @@ fn run_cat(
 fn run_sort(
     file: &std::path::Path,
     output: &std::path::Path,
-    compression: Compression,
-    direct_io: bool,
-    io_uring: bool,
-    force: bool,
+    write: &WriteOpts,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let opts = pbfhogg::sort::SortOptions {
-        compression,
-        direct_io,
-        io_uring,
-        force,
+        compression: write.compression,
+        direct_io: write.direct_io,
+        io_uring: write.io_uring,
+        force: write.force,
     };
     let stats = pbfhogg::sort::sort(file, output, &opts, overrides)?;
     stats.print_summary();
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_repack(
     file: &std::path::Path,
     output: &std::path::Path,
     elements_per_blob: usize,
-    compression: Compression,
-    direct_io: bool,
-    io_uring: bool,
-    force: bool,
+    write: &WriteOpts,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stats = pbfhogg::repack::repack(
         file,
         output,
         elements_per_blob,
-        compression,
-        direct_io,
-        io_uring,
-        force,
+        write.compression,
+        write.direct_io,
+        write.io_uring,
+        write.force,
         overrides,
     )?;
     stats.print_summary();
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_degrade(
     file: &std::path::Path,
     output: &std::path::Path,
-    unsort: bool,
-    unsort_intra: bool,
-    strip_locations: bool,
-    strip_indexdata: bool,
-    strip_tagdata: bool,
-    strip_bbox: bool,
-    drop_ids: Option<String>,
+    flags: pbfhogg::degrade::DegradeFlags,
     block_cap: usize,
-    force: bool,
-    compression: Compression,
-    direct_io: bool,
-    io_uring: bool,
+    write: &WriteOpts,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let drop_spec = drop_ids
-        .as_deref()
-        .map(pbfhogg::degrade::DropSpec::parse)
-        .transpose()?;
-    let flags = pbfhogg::degrade::DegradeFlags {
-        unsort,
-        unsort_intra,
-        strip_locations,
-        strip_indexdata,
-        strip_tagdata,
-        strip_bbox,
-        drop_ids: drop_spec,
-    };
     let stats = pbfhogg::degrade::degrade(
         file,
         output,
         flags,
         block_cap,
-        compression,
-        direct_io,
-        io_uring,
-        force,
+        write.compression,
+        write.direct_io,
+        write.io_uring,
+        write.force,
         overrides,
     )?;
     stats.print_summary();
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_renumber(
     file: &std::path::Path,
     output: &std::path::Path,
     start_id: &str,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOpts,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let parts: Vec<&str> = start_id.split(',').collect();
@@ -2078,8 +2235,8 @@ fn run_renumber(
         file,
         output,
         &opts,
-        compression,
-        direct_io,
+        write.compression,
+        write.direct_io,
         overrides,
     )?;
     stats.print_summary();
@@ -2087,21 +2244,21 @@ fn run_renumber(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn run_tags_filter(
     file: &std::path::Path,
     output: &std::path::Path,
     expressions_file: Option<&std::path::Path>,
     expressions: &[String],
-    omit_referenced: bool,
-    invert_match: bool,
-    remove_tags: bool,
-    compression: Compression,
-    direct_io: bool,
-    force: bool,
+    flags: TagsFilterFlags,
+    write: &WriteOpts,
     jobs: usize,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let TagsFilterFlags {
+        omit_referenced,
+        invert_match,
+        remove_tags,
+    } = flags;
     let all_expressions = combine_expressions(expressions_file, expressions)?;
     if all_expressions.is_empty() {
         return Err("no filter expressions provided (use positional args or -e FILE)".into());
@@ -2116,9 +2273,9 @@ fn run_tags_filter(
         omit_referenced,
         invert: invert_match,
         remove_tags,
-        compression,
-        direct_io,
-        force,
+        compression: write.compression,
+        direct_io: write.direct_io,
+        force: write.force,
         jobs: if jobs == 0 { None } else { Some(jobs) },
     };
     let stats = pbfhogg::tags_filter::tags_filter(file, output, &opts, overrides)?;
@@ -2142,7 +2299,16 @@ fn run_tags_filter_osc(
 }
 
 fn paths_alias(input: &std::path::Path, output: &std::path::Path) -> std::io::Result<bool> {
-    let input_canonical = std::fs::canonicalize(input)?;
+    // An input that does not exist cannot alias anything, and reporting it
+    // from here would replace the command's own "failed to open <path>"
+    // with a bare aliasing-check IO error that never names the file. The
+    // check runs before every command, so it must stay silent about
+    // problems that are not aliasing and let the command speak first.
+    let input_canonical = match std::fs::canonicalize(input) {
+        Ok(path) => path,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
     if output.exists() {
         let output_canonical = std::fs::canonicalize(output)?;
         if input_canonical == output_canonical {
@@ -2272,6 +2438,41 @@ fn validate_input_output_aliases(command: &Command) -> Result<(), Box<dyn std::e
         | Command::BenchRead { .. }
         | Command::BenchWrite { .. }
         | Command::BuildGeocodeIndex { .. } => Ok(()),
+    }
+}
+
+/// Run a command that writes one final output file, through a scratch
+/// sibling that is renamed into place only once the command succeeded.
+///
+/// Every user-named `--output` goes through here. Without it a mid-run
+/// failure leaves a truncated partial file under the name the user chose -
+/// and, worse, `File::create` truncates a pre-existing file of that name
+/// before the first byte of new output exists. The closure receives the
+/// scratch path, so the command never learns the destination at all.
+///
+/// The scratch file is a dot-prefixed sibling in the destination directory
+/// (so `commit`'s rename never crosses a filesystem), and keeps the
+/// destination's suffix so extension-sniffing writers behave identically.
+fn guarded_output<F>(output: &std::path::Path, run: F) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnOnce(&std::path::Path) -> Result<(), Box<dyn std::error::Error>>,
+{
+    let out = pbfhogg::path_guard::OutputFile::new(output)?;
+    match run(out.path()) {
+        Ok(()) => {
+            out.commit()?;
+            Ok(())
+        }
+        // `ExitWithCode` is not a failure: the command ran to completion and
+        // its answer is merely negative (`diff` found differences). Its
+        // output is complete and must be published, or a `diff -o` that
+        // found differences - the ordinary case - would delete its own
+        // result on the way out.
+        Err(e) if e.downcast_ref::<ExitWithCode>().is_some() => {
+            out.commit()?;
+            Err(e)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -2447,16 +2648,20 @@ fn print_missing_ids(requested: &pbfhogg::getid::ElementIds, found: &pbfhogg::ge
 fn run_diff(
     old: &std::path::Path,
     new: &std::path::Path,
-    suppress_common: bool,
-    verbose: bool,
-    osmium_summary: bool,
-    quiet: bool,
+    flags: DiffFlags,
     output_path: Option<&std::path::Path>,
     type_filter: Option<TypeFilter>,
     jobs: usize,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
+
+    let DiffFlags {
+        suppress_common,
+        verbose,
+        osmium_summary,
+        quiet,
+    } = flags;
 
     let jobs_resolved = if jobs == 0 {
         std::thread::available_parallelism()
@@ -2533,19 +2738,20 @@ fn run_derive_changes(
 fn run_getid(
     file: &std::path::Path,
     output: &std::path::Path,
-    add_referenced: bool,
-    remove_tags: bool,
-    verbose_ids: bool,
+    flags: GetidFlags,
     id_file: Option<&std::path::Path>,
     id_osm_file: Option<&std::path::Path>,
     default_type: Option<DefaultTypeArg>,
     ids: &[String],
-    compression: Compression,
-    direct_io: bool,
-    force: bool,
+    write: &WriteOpts,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, direct_io)?;
+    let GetidFlags {
+        add_referenced,
+        remove_tags,
+        verbose_ids,
+    } = flags;
+    let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, write.direct_io)?;
 
     if remove_tags && !add_referenced {
         eprintln!(
@@ -2567,9 +2773,9 @@ fn run_getid(
         output,
         &id_set,
         &opts,
-        compression,
-        direct_io,
-        force,
+        write.compression,
+        write.direct_io,
+        write.force,
         overrides,
     )?;
     stats.print_summary();
@@ -2590,12 +2796,11 @@ fn run_getparents(
     id_osm_file: Option<&std::path::Path>,
     default_type: Option<DefaultTypeArg>,
     ids: &[String],
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOpts,
     overrides: &HeaderOverrides,
     full_scan_min_blobs: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, direct_io)?;
+    let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, write.direct_io)?;
     let opts = pbfhogg::getparents::GetparentsOptions { add_self };
     let stats = if let Some(min_blobs) = full_scan_min_blobs {
         pbfhogg::getparents::getparents_with_min_blobs(
@@ -2603,8 +2808,8 @@ fn run_getparents(
             output,
             &id_set,
             &opts,
-            compression,
-            direct_io,
+            write.compression,
+            write.direct_io,
             overrides,
             min_blobs,
         )?
@@ -2614,8 +2819,8 @@ fn run_getparents(
             output,
             &id_set,
             &opts,
-            compression,
-            direct_io,
+            write.compression,
+            write.direct_io,
             overrides,
         )?
     };
@@ -2631,19 +2836,17 @@ fn run_removeid(
     id_osm_file: Option<&std::path::Path>,
     default_type: Option<DefaultTypeArg>,
     ids: &[String],
-    compression: Compression,
-    direct_io: bool,
-    force: bool,
+    write: &WriteOpts,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, direct_io)?;
+    let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, write.direct_io)?;
     let stats = pbfhogg::getid::removeid(
         file,
         output,
         &id_set,
-        compression,
-        direct_io,
-        force,
+        write.compression,
+        write.direct_io,
+        write.force,
         overrides,
     )?;
     stats.print_summary();
@@ -2669,9 +2872,7 @@ fn run_extract(
     strategy: pbfhogg::extract::ExtractStrategy,
     set_bounds: bool,
     clean: &CleanAttrs,
-    compression: Compression,
-    direct_io: bool,
-    force: bool,
+    write: &WriteOpts,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let region = match (bbox_str, polygon_path) {
@@ -2690,12 +2891,51 @@ fn run_extract(
         strategy,
         set_bounds,
         clean,
-        compression,
-        direct_io,
-        force,
+        write.compression,
+        write.direct_io,
+        write.force,
         overrides,
     )?;
     stats.print_summary();
+    Ok(())
+}
+
+/// Check every destination a multi-output command is about to publish
+/// *before* the first of them is published.
+///
+/// `OutputFile::commit` renames a scratch sibling over the destination.
+/// Renaming over a directory fails, as does renaming into a directory that
+/// no longer exists - and once one rename has succeeded, a later failure
+/// leaves the output set half replaced. Running these checks over the whole
+/// set first turns the common causes into a clean refusal that publishes
+/// nothing. It is a narrowing, not a guarantee: see the call site.
+///
+/// Write access to the parent is not probed here; it is already proven by
+/// the scratch file the run wrote into that same directory.
+fn preflight_publishable(paths: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
+    for path in paths {
+        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let parent = if parent.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            parent
+        };
+        if !parent.is_dir() {
+            return Err(format!(
+                "cannot publish '{}': directory '{}' does not exist",
+                path.display(),
+                parent.display()
+            )
+            .into());
+        }
+        if path.is_dir() {
+            return Err(format!(
+                "cannot publish '{}': it is an existing directory",
+                path.display()
+            )
+            .into());
+        }
+    }
     Ok(())
 }
 
@@ -2707,9 +2947,7 @@ fn run_extract_config(
     strategy: pbfhogg::extract::ExtractStrategy,
     set_bounds: bool,
     clean: &CleanAttrs,
-    compression: Compression,
-    direct_io: bool,
-    force: bool,
+    write: &WriteOpts,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (config_dir, mut slots) = pbfhogg::extract::parse_extract_config(config_path)?;
@@ -2748,6 +2986,21 @@ fn run_extract_config(
         }
     }
 
+    // Guard each destination and redirect the slot at its scratch sibling.
+    // Order matters: both alias checks above ran on the *final* paths, which
+    // is the only place the user's collision can be seen - two scratch names
+    // never collide, so checking them would silently pass a config that
+    // writes two extracts to one file.
+    let final_paths: Vec<PathBuf> = slots.iter().map(|slot| slot.output.clone()).collect();
+    preflight_publishable(&final_paths)?;
+    let guards: Vec<pbfhogg::path_guard::OutputFile> = final_paths
+        .iter()
+        .map(|path| pbfhogg::path_guard::OutputFile::new(path))
+        .collect::<Result<_, _>>()?;
+    for (slot, guard) in slots.iter_mut().zip(&guards) {
+        slot.output = guard.path().to_path_buf();
+    }
+
     eprintln!("Multi-extract: {} extracts from config", slots.len());
     let all_stats = pbfhogg::extract::extract_multi(
         file,
@@ -2755,35 +3008,48 @@ fn run_extract_config(
         strategy,
         set_bounds,
         clean,
-        compression,
-        direct_io,
-        force,
+        write.compression,
+        write.direct_io,
+        write.force,
         overrides,
     )?;
+    // Extraction is all-or-nothing: a failure above drops every guard and no
+    // destination was ever opened, so nothing is published at all. What
+    // follows is *not* a transaction. Publication is a preflighted sequence
+    // of renames: the preflight is repeated here, immediately before the
+    // first rename, so the ordinary reasons a rename fails - a destination
+    // that is a directory, a parent directory that vanished - become a
+    // refusal with nothing published rather than a partial set. It cannot be
+    // made airtight: another process may still change a destination between
+    // this check and the rename that reaches it, and if a rename fails after
+    // an earlier one succeeded the output set is partial. POSIX offers no
+    // N-way atomic rename, and the rollback log that would close the gap is
+    // out of proportion to this command.
+    preflight_publishable(&final_paths)?;
+    for guard in guards {
+        guard.commit()?;
+    }
     for (i, stats) in all_stats.iter().enumerate() {
-        eprint!("  [{}] {} - ", i + 1, slots[i].output.display());
+        eprint!("  [{}] {} - ", i + 1, final_paths[i].display());
         stats.print_summary();
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_add_locations_to_ways(
     file: &std::path::Path,
     output: &std::path::Path,
     keep_untagged_nodes: bool,
     index_type: IndexType,
     inject_prepass: bool,
-    compression: Compression,
-    direct_io: bool,
-    force: bool,
+    write: &WriteOpts,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let options = pbfhogg::altw::AltwOptions {
         keep_untagged_nodes,
-        compression,
-        direct_io,
-        force,
+        compression: write.compression,
+        direct_io: write.direct_io,
+        force: write.force,
         index_type,
         inject_prepass,
     };
@@ -2796,13 +3062,18 @@ fn run_time_filter(
     file: &std::path::Path,
     output: &std::path::Path,
     timestamp: &str,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOpts,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cutoff = parse_timestamp(timestamp)?;
-    let stats =
-        pbfhogg::time_filter::time_filter(file, output, cutoff, compression, direct_io, overrides)?;
+    let stats = pbfhogg::time_filter::time_filter(
+        file,
+        output,
+        cutoff,
+        write.compression,
+        write.direct_io,
+        overrides,
+    )?;
     stats.print_summary();
     Ok(())
 }
@@ -2814,7 +3085,6 @@ fn parse_timestamp(input: &str) -> Result<i64, Box<dyn std::error::Error>> {
     pbfhogg::commands::parse_rfc3339_utc(input).map_err(|e| format!("{e} (or UNIX seconds)").into())
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_show_element(
     path: &std::path::Path,
     spec: &str,
@@ -2865,23 +3135,25 @@ fn parse_element_spec(
     Ok((elem_type, id))
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn run_inspect(
     path: &std::path::Path,
-    indexed: bool,
-    nodes: bool,
+    flags: InspectFlags,
     jobs: usize,
     blocks: Option<usize>,
-    id_ranges: bool,
-    locations: bool,
-    anomalies: bool,
-    extended: bool,
     get: Option<&str>,
-    json: bool,
     direct_io: bool,
-    force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let InspectFlags {
+        indexed,
+        nodes,
+        id_ranges,
+        locations,
+        anomalies,
+        extended,
+        json,
+        force,
+    } = flags;
     // --indexed only: quick check without full inspect
     let has_other_flags = extended
         || id_ranges
@@ -3036,24 +3308,20 @@ fn run_inspect(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_apply_changes(
     base: &std::path::Path,
     changes: &std::path::Path,
     output: &std::path::Path,
-    compression: Compression,
-    direct_io: bool,
-    io_uring: bool,
-    force: bool,
+    write: &WriteOpts,
     locations_on_ways: bool,
     jobs: usize,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let opts = pbfhogg::apply_changes::MergeOptions {
-        compression,
-        direct_io,
-        io_uring,
-        force,
+        compression: write.compression,
+        direct_io: write.direct_io,
+        io_uring: write.io_uring,
+        force: write.force,
         locations_on_ways,
         jobs: if jobs == 0 { None } else { Some(jobs) },
         #[cfg(feature = "test-hooks")]
@@ -3067,18 +3335,15 @@ fn run_apply_changes(
 fn run_merge_pbf(
     inputs: &[PathBuf],
     output: &std::path::Path,
-    compression: Compression,
-    direct_io: bool,
-    io_uring: bool,
-    force: bool,
+    write: &WriteOpts,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let paths: Vec<&std::path::Path> = inputs.iter().map(AsRef::as_ref).collect();
     let opts = pbfhogg::cat::dedupe::MergePbfOptions {
-        compression,
-        direct_io,
-        io_uring,
-        force,
+        compression: write.compression,
+        direct_io: write.direct_io,
+        io_uring: write.io_uring,
+        force: write.force,
     };
     let stats = pbfhogg::cat::dedupe::merge_pbf(&paths, output, &opts, overrides)?;
     stats.print_summary();

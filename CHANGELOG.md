@@ -5,15 +5,51 @@
 ### Fixed
 
 - **A failing run no longer destroys a pre-existing file that shares the
-  output name.** `export -o important.json` and `renumber -o out.osm.pbf`
-  used to open the destination immediately (truncating it) and, on a
-  mid-run error, delete it - so a bad input cost you an unrelated file of
-  that name. Both now write to a scratch sibling in the same directory and
-  rename it into place only after the run succeeds. The destination is
-  untouched until then, and replaced by a single `rename` - atomic on
-  Unix. A side effect worth knowing: while the run is in flight the
-  output directory holds a dot-prefixed scratch file next to the
-  destination, and a hard kill leaves it behind.
+  output name.** Every command that writes a `--output` used to open the
+  destination immediately, truncating it before the first byte of new
+  output existed, and a mid-run error left a partial file under the name
+  the user chose. Pointing `-o` at an unrelated file cost you that file.
+
+  This now applies to *every* command with an output, not only `export`
+  and `renumber`: `sort`, `cat` (both plain and `--dedupe`), `repack`,
+  `degrade`, `renumber`, `tags-filter` (PBF and OSC), `export`, `diff`
+  (text `-o` and `--format osc`), `getid`, `getparents`,
+  `extract` (single and `--config` multi-extract),
+  `add-locations-to-ways`, `time-filter`, `apply-changes` and
+  `merge-changes`. Each writes to a scratch sibling in the destination's
+  directory and renames it into place only once the run has succeeded, so
+  the destination is untouched until then and is replaced by a single
+  `rename` - atomic on Unix. The one exclusion is `bench-write`'s sibling
+  `bench-merge`, a synthetic benchmark, where the rename would land in the
+  region being measured.
+
+  A multi-extract extracts all-or-nothing: no region is published unless
+  every region succeeded. Publishing them is not a transaction, though -
+  it is a sequence of renames, and there is no N-way atomic rename. Every
+  destination is now checked immediately before the first one is
+  published, so the ordinary reasons a rename fails (the destination is a
+  directory, its parent has gone) refuse the whole publication with
+  nothing written. Another process changing a destination between that
+  check and the rename that reaches it can still leave a partial set.
+
+  Three side effects worth knowing. While a run is in flight the output
+  directory holds a dot-prefixed `.pbfhogg-tmp-*` file next to the
+  destination, and a hard kill leaves it behind. A destination whose
+  *directory* is not writable now fails, where overwriting an existing
+  writable file in a read-only directory used to work. And the output
+  does not appear at its final path until the run finishes, so anything
+  polling for the file's existence to gauge progress will no longer see
+  it grow.
+
+- Errors from the blob framing layer now name the input file and the blob
+  index, not only the byte offset: `... (in planet.osm.pbf, blob 4312, at
+  byte offset 91827364)`. On `cat a.pbf b.pbf`, `apply-changes` and
+  `merge-changes` an offset alone did not say which input failed. New
+  accessors `Error::source_path()` and `Error::blob_index()` expose them;
+  both are `None` for readers built from a bare `Read`, which have no
+  path to report. Failing to open an input now names the path as well
+  (`failed to open <path>: ...`) instead of a bare
+  `No such file or directory (os error 2)`.
 
 ### Breaking changes
 

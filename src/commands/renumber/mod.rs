@@ -218,12 +218,14 @@ pub fn renumber_external(
     } else {
         compression
     };
-    // The final output path is not opened until the run succeeds: on any
-    // mid-stream error a pre-existing file of that name must survive
-    // untouched, which an in-place open would already have truncated.
-    let output_guard = crate::path_guard::OutputFile::new(output)?;
+    // `output` is written in place. Protecting a *user-named* destination
+    // from a mid-run failure is the front end's job, not this function's:
+    // only the caller knows whether the path it passed is a name a user
+    // chose or a scratch file the run created. `pbfhogg-cli` routes every
+    // `--output` through `path_guard::OutputFile` for exactly that reason,
+    // so this entry point is already handed a scratch sibling.
     let mut writer = writer_from_header(
-        output_guard.path(),
+        output,
         effective_compression,
         &header,
         true,
@@ -408,9 +410,6 @@ pub fn renumber_external(
     writer.flush()?;
 
     crate::debug::emit_marker("RENUMBER_EXT_END");
-
-    // Output is fully written; release the guard so the file survives.
-    output_guard.commit()?;
 
     Ok(stats)
 }

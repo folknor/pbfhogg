@@ -914,6 +914,63 @@ fn multi_extract_rejects_symlinked_output_paths() {
     );
 }
 
+/// Publication is a sequence of renames, not a transaction. A destination
+/// that cannot be renamed over - here, one that is a directory - must be
+/// caught by the preflight so that *nothing* is published, rather than
+/// discovered halfway through the commit loop with the earlier destinations
+/// already replaced.
+///
+/// The assertion that bites is the second one: dropping the preflight still
+/// fails the command, because the doomed rename returns an error either way.
+/// What changes is that the first destination has already been overwritten
+/// by then.
+#[test]
+fn multi_extract_refuses_when_a_destination_cannot_be_published() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let config = dir.path().join("config.json");
+    let out_a = dir.path().join("a.osm.pbf");
+
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+    std::fs::write(&out_a, b"placeholder").expect("seed first destination");
+    // The second destination is a directory: `rename` over it always fails.
+    std::fs::create_dir(dir.path().join("b.osm.pbf")).expect("create blocking dir");
+
+    let config_json = format!(
+        r#"{{
+            "directory": "{}",
+            "extracts": [
+                {{ "output": "a.osm.pbf", "bbox": [12.4, 55.6, 12.7, 55.8] }},
+                {{ "output": "b.osm.pbf", "bbox": [13.5, 55.5, 14.5, 55.9] }}
+            ]
+        }}"#,
+        dir.path().display(),
+    );
+    std::fs::write(&config, config_json).expect("write config");
+
+    let result = CliInvoker::new()
+        .arg("extract")
+        .arg(&input)
+        .arg("--config")
+        .arg(&config)
+        .arg("--simple")
+        .arg("--set-bounds")
+        .arg("--force")
+        .assert_failure();
+    result.assert_stderr_contains("existing directory");
+    assert_eq!(
+        std::fs::read(&out_a).expect("read first destination"),
+        b"placeholder",
+        "no destination may be published when another one cannot be"
+    );
+    let strays: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("read dir")
+        .filter_map(|e| e.ok().map(|e| e.file_name()))
+        .filter(|n| n.to_string_lossy().starts_with(".pbfhogg-tmp-"))
+        .collect();
+    assert!(strays.is_empty(), "scratch file leaked: {strays:?}");
+}
+
 #[test]
 fn multi_extract_two_bbox_regions() {
     let dir = TempDir::new().expect("tempdir");

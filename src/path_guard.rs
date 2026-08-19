@@ -125,9 +125,14 @@ impl OutputFile {
         // collide on the scratch name.
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let mut temp_name = std::ffi::OsString::from(".");
+        // The marker is a *prefix*, not a suffix, so the scratch name still
+        // ends with the name the user chose. Several writers decide their
+        // encoding from the tail of the output path - `merge-changes` gzips
+        // when it ends in `.gz` - and a suffixed scratch name would silently
+        // flip that decision for the bytes actually written.
+        let mut temp_name =
+            std::ffi::OsString::from(format!(".pbfhogg-tmp-{}-{seq}.", std::process::id()));
         temp_name.push(name);
-        temp_name.push(format!(".pbfhogg-tmp-{}-{seq}", std::process::id()));
         let temp = final_path.with_file_name(temp_name);
         Ok(Self {
             temp,
@@ -239,6 +244,32 @@ mod tests {
             .filter(|n| n != "important.json")
             .collect();
         assert!(leftovers.is_empty(), "scratch file leaked: {leftovers:?}");
+    }
+
+    /// Writers that decide their encoding from the tail of the output path
+    /// (`merge-changes` gzips when it ends in `.gz`) must see the same tail
+    /// on the scratch file, so the uniquifying marker goes in front of the
+    /// name, never behind it.
+    #[test]
+    fn scratch_path_keeps_the_destination_suffix() {
+        let dir = scratch();
+        let dest = dir.path().join("changes.osc.gz");
+        let out = OutputFile::new(&dest).expect("derive scratch path");
+        let name = out
+            .path()
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("scratch has a utf8 file name");
+        assert!(
+            name.ends_with(".osc.gz"),
+            "scratch name {name} lost the destination suffix"
+        );
+        assert!(name.starts_with('.'), "scratch name {name} is not hidden");
+        assert_eq!(
+            out.path().parent(),
+            dest.parent(),
+            "scratch must be a sibling so commit's rename stays intra-filesystem"
+        );
     }
 
     #[test]

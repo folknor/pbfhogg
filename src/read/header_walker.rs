@@ -162,9 +162,17 @@ pub(crate) struct BlobHeaderMeta {
 /// data payload on demand.
 pub(crate) struct HeaderWalker {
     file: Arc<std::fs::File>,
+    /// The file this walker was opened from. Stamped onto every error it
+    /// raises, for the same reason `BlobReader` keeps one: a byte offset
+    /// on a multi-input command does not say which input it indexes, and
+    /// this walker is the preflight that most multi-input commands fail
+    /// in first.
+    path: Arc<Path>,
     offset: u64,
     file_size: u64,
     header_buf: Vec<u8>,
+    /// 0-based index of the blob whose header was last returned.
+    blob_index: u64,
 }
 
 impl HeaderWalker {
@@ -207,10 +215,20 @@ impl HeaderWalker {
         }
         Ok(Self {
             file: Arc::new(file),
+            path: Arc::from(path),
             offset: 0,
             file_size,
             header_buf: Vec::new(),
+            blob_index: 0,
         })
+    }
+
+    /// Attach this walker's input identity to an error. Every error path
+    /// out of `next_header` goes through here; one that does not makes
+    /// `Error::source_path` lie by omission on that path only, which is
+    /// worse than never having had it.
+    fn stamp(&self, err: crate::error::Error) -> crate::error::Error {
+        err.in_input(Some(&self.path), self.blob_index)
     }
 
     /// Shared `Arc<File>` for worker threads to `pread` data bodies.
@@ -240,6 +258,19 @@ impl HeaderWalker {
     /// bit more). A second `pread` is only needed for the rare header that
     /// extends past the probe window.
     pub(crate) fn next_header(&mut self) -> Result<Option<BlobHeaderMeta>> {
+        // One funnel for both the success counter and the error stamp, so
+        // no early return inside the walk can escape unattributed.
+        match self.next_header_inner() {
+            Ok(Some(meta)) => {
+                self.blob_index += 1;
+                Ok(Some(meta))
+            }
+            Ok(None) => Ok(None),
+            Err(err) => Err(self.stamp(err)),
+        }
+    }
+
+    fn next_header_inner(&mut self) -> Result<Option<BlobHeaderMeta>> {
         use std::os::unix::fs::FileExt as _;
 
         if self.offset >= self.file_size {

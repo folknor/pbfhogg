@@ -100,52 +100,68 @@ Confidence: high.
   POSIX makes a write of at most `PIPE_BUF` (4096 on Linux) to a FIFO atomic -
   on a non-blocking fd it transfers every byte or none and fails with `EAGAIN`.
   Investigated round 3, 2026-08-20. Confidence: high.
-- `src/error.rs`: errors still do not name the *file* or the *blob index* they
-  came from. `Error::byte_offset()` gives the position within a stream, but
-  `BlobReader` does not retain the path it was opened from, so an error from a
-  multi-input command (`cat a.pbf b.pbf`, `apply-changes`, `merge-changes`)
-  still does not say which input failed. Closing it means threading the path
-  through `BlobReader` and `FileReader`. Confidence: high that the gap is real,
-  low urgency.
-- `decisions/0003-error-path-hygiene-via-pathguard.md` claims "every final
-  output path is wrapped in `PathGuard::file`", but only `renumber` ever did.
-  `sort`, `cat`, `extract`, `tags-filter`, `time-filter`, `apply-changes`,
-  `merge-changes`, `repack`, `degrade` and the rest construct their writer on
-  the user's `--output` path with no guard at all, so a mid-run failure leaves
-  a truncated partial file behind under the user's chosen name. Round 3 fixed
-  the two paths the report named (`export`, `renumber`) by routing them through
-  the new `path_guard::OutputFile` (scratch sibling + rename on commit); the
-  remaining commands should be converted to the same primitive, which also
-  closes the truncate-on-open half for them. Surfaced by the round-3 fix pass.
+- The raw-frame passthrough path (`src/read/raw_frame.rs`, and the byte-level
+  reader in `src/commands/cat/dedupe.rs`) raises `io::Error`s that name neither
+  the input file nor the blob. Round 4 gave `BlobReader` and `HeaderWalker` an
+  input identity (`Error::source_path()` / `Error::blob_index()`, stamped at
+  every error return in both), which covers the decode and preflight paths, but
+  `raw_frame` is generic over a bare `Read` and has no path to report: plain
+  `pbfhogg cat a.pbf b.pbf` on a corrupt passthrough blob still fails with a
+  bare `failed to fill whole buffer`. Closing it means threading a path (an
+  `Arc<Path>`, to match the two readers that now carry one) through the
+  raw-frame helpers and their callers. Surfaced by the round-4 fix pass.
   Confidence: high.
-- `src/reorder_buffer.rs`: `push` resizes `pending` to whatever seq arrives, so a
-  stalled producer slot grows the buffer without bound; the bound lives entirely
-  in the callers' permit accounting. A `max_window` field would make the
-  invariant local.
-- `src/idset.rs`: `merge_from(&IdSet)` and `merge(Self)` are near-duplicate
-  implementations; the owned form's zero-copy chunk move is the only difference.
-  Pick one.
-- `cli/src/main.rs`: duplicated `#[allow(clippy::too_many_arguments)]`
-  attributes, and `run_show_element` (3 parameters) carries
-  `too_many_arguments` + `too_many_lines`. Symptomatic of the wider issue: 20+
-  `run_*` functions take 8-14 positional arguments because every command's
-  options are splatted rather than passed as the option struct the library
-  already defines.
-- `cli/src/main.rs`: `validate_input_output_aliases` canonicalizes inputs for
-  *every* command up front, so a nonexistent input now surfaces as an
-  aliasing-check IO error before the command's own error path ever runs. No
-  command accepts `-`/stdin, so nothing functionally breaks, but the error text
-  for a missing input file changed shape. Either canonicalize lazily or map the
-  aliasing check's IO failure back to the command's own missing-input error.
-  Surfaced by the round-1 fix-and-commit agent, 79ba805a. Confidence: high.
-- Root-level `DOC-CONVENTIONS-AUDIT.md` violates the document-folder convention
-  in `AGENTS.md`: the root exemption list is `AGENTS.md`, `CLAUDE.md`,
-  `README.md`, `LICENSE`, `CHANGELOG.md` and their kin. It is a transient audit
-  and belongs in `notes/`. Confidence: high.
-- `cli/Cargo.toml`: the five-line comment justifying `serde_json`'s
-  `float_roundtrip` feature is duplicated verbatim, immediately after itself,
-  above the `serde_json` dependency line. Cosmetic; delete one copy.
-  Confidence: high.
-- `cli/src/main.rs`: `Cli::parse()` calls `process::exit` on a parse error,
-  bypassing the hotpath guard drop that the `ExitWithCode` machinery exists to
-  protect. Use `Cli::try_parse()` if that report matters on the failure path.
+- The per-command "a failed run leaves the destination byte-identical"
+  property is only partly testable from the CLI. The round-4 fix pass reported
+  it as *un*testable everywhere and filed the whole thing as a gap; the audit
+  found that claim too strong. A multi-input re-encode fails after its writer
+  is open: `cat good.pbf corrupt.pbf -c version -o dest` writes the first
+  input out, then dies reading the second, so
+  `cat_failure_leaves_preexisting_destination_intact` in
+  `tests/cli_output_guard.rs` covers the survival property end to end and is
+  confirmed to fail when `guarded_output` is pointed at the destination.
+  What remains genuinely uncovered is the *single-input* commands: `sort`,
+  `tags-filter`, `getid`, `getparents`, `time-filter`, `repack`, `degrade`,
+  `renumber`, `add-locations-to-ways` all fail before their writer opens for
+  every corrupt-input fixture available - a truncated PBF dies in the
+  header-walk preflight, a corrupted blob payload dies in pass 1. Those are
+  covered only for wiring. Closing that wants a `test-hooks`-gated
+  fault-injection flag on the CLI, of the same shape as `apply_changes`'s
+  existing `panic_at_blob_seq`. Confidence: high.
+- `bench-merge`'s `--output` is the one output-producing command not routed
+  through `guarded_output`. Deliberate: it is a synthetic write benchmark, and
+  the guard would add a `rename` inside the region being measured. The
+  consequence is that `pbfhogg bench-merge -o existing.pbf` still truncates
+  `existing.pbf` up front and leaves a partial file if the run dies - the
+  pre-guard behaviour, on a command no one points at real data. If the guard
+  is ever wanted there, the honest shape is to commit *outside* the timed
+  region rather than to wrap the whole run. Surfaced by the round-4 fix pass.
+  Confidence: high, low urgency.
+- Harness precedent, not a product bug: during round 4 a single
+  `brokkr test` run reported `sort_failure_leaves_destination_intact` as
+  "did not finish within 20s" with a `futex_do_wait` wchan snapshot, and the
+  same test passed in well under a second on every subsequent run and every
+  full `brokkr check`. Nothing in the test blocked, and the test has since been
+  deleted (it could not bite). Read as a harness flake in the watchdog or the
+  test-binary launch, recorded so a second sighting has something to match
+  against rather than being investigated from scratch as a deadlock.
+- `ReorderBuffer::with_capacity(N)` is called at ~20 sites with an `N` that is a
+  tuning guess rather than the caller's true permit window - `time_filter` asks
+  for 64 with no matching semaphore anywhere in the file. Round 4 added a
+  `max_window` bound so the buffer can no longer grow without limit, but had to
+  default it to a deliberately generous 65_536 for exactly that reason. The
+  sites whose window *is* known (the `WRITE_AHEAD` writers,
+  `read/pipeline`'s `decode_ahead`) could pin it exactly with
+  `ReorderBuffer::with_max_window` and do not, because verifying each one is
+  concurrency reasoning the round had no budget for and a bound set too low
+  turns a memory-growth smell into a production panic. Confidence: high.
+- `cli/src/main.rs`: the argument-splatting cleanup is partial. Round 4
+  introduced `WriteOpts` (compression + direct_io + io_uring + force) and
+  per-command flag structs for `getid`, `tags-filter`, `check`, `inspect`,
+  `diff` and the geocode-index levels, which removes every run of three or more
+  adjacent same-typed parameters - the class where a transposition compiles
+  silently. What remains is length rather than hazard: `run_tags_filter`,
+  `run_getid`, `run_getparents`, `run_removeid`, `run_extract`,
+  `run_extract_config`, `run_diff`, `run_derive_changes` and `run_tags_count`
+  still carry `#[allow(clippy::too_many_arguments)]` with 8-10 parameters of
+  mixed types. Surfaced by the round-4 fix pass. Confidence: high, low urgency.

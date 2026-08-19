@@ -341,6 +341,16 @@ pub struct BlobReader<R: Read + Send> {
     reader: R,
     /// Current reader offset in bytes from the start of the stream.
     offset: Option<ByteOffset>,
+    /// The file this reader was opened from, when it was opened from a
+    /// path at all. Stamped onto every error the framing layer raises, so
+    /// a failure on a multi-input command says *which* input failed.
+    /// `BlobReader::new` takes an arbitrary `Read` and has no path to
+    /// record; it leaves this `None` rather than guessing.
+    source: Option<std::sync::Arc<Path>>,
+    /// 0-based index of the blob currently being read. Paired with
+    /// `source` on every error; `BlobHeader`s are variable-width, so a
+    /// byte offset alone does not tell you which blob to look at.
+    blob_index: u64,
     last_blob_ok: bool,
     /// Reusable buffer for reading blob header bytes. Cleared and refilled each
     /// iteration to avoid allocating a new Vec per blob (~16K allocs per Denmark,
@@ -384,6 +394,9 @@ impl<R: Read + Send> BlobReader<R> {
         BlobReader {
             reader,
             offset: None,
+            // No path exists for a bare `Read`. Absent, not guessed.
+            source: None,
+            blob_index: 0,
             last_blob_ok: true,
             header_buf: Vec::new(),
             parse_tagdata: false,
@@ -394,6 +407,16 @@ impl<R: Read + Send> BlobReader<R> {
         }
     }
 
+    /// Attach this reader's input identity to an error.
+    ///
+    /// Every path out of the framing layer must go through here or through
+    /// [`BlobReader::handle_error`]: an error that escapes unstamped makes
+    /// `Error::source_path` lie by omission, and a caller that has learned
+    /// to trust it on one code path will trust it on all of them.
+    fn stamp_input(&self, error: crate::error::Error) -> crate::error::Error {
+        error.in_input(self.source.as_ref(), self.blob_index)
+    }
+
     fn handle_error<T>(&mut self, error: crate::error::Error) -> Option<Result<T>> {
         // Stamp the position before clearing it: the framing layer is the
         // lowest layer that knows where in the stream the failure sits, and
@@ -402,10 +425,11 @@ impl<R: Read + Send> BlobReader<R> {
         let at = self.offset;
         self.offset = None;
         self.last_blob_ok = false;
-        Some(Err(match at {
+        let error = match at {
             Some(o) => error.at(o),
             None => error,
-        }))
+        };
+        Some(Err(self.stamp_input(error)))
     }
 
     /// Enable or disable tagdata parsing (BlobHeader field 4).
@@ -448,7 +472,7 @@ impl<R: Read + Send> BlobReader<R> {
                     // denied, etc.) instead of masking it as InvalidHeaderSize.
                     self.offset = None;
                     self.last_blob_ok = false;
-                    return Some(Err(e.into()));
+                    return Some(Err(self.stamp_input(e.into())));
                 }
             }
             match self.reader.read_exact(&mut buf[1..]) {
@@ -468,7 +492,7 @@ impl<R: Read + Send> BlobReader<R> {
                     // etc.) - propagate the real cause.
                     self.offset = None;
                     self.last_blob_ok = false;
-                    return Some(Err(e.into()));
+                    return Some(Err(self.stamp_input(e.into())));
                 }
             }
         };
@@ -476,10 +500,10 @@ impl<R: Read + Send> BlobReader<R> {
         if header_size >= MAX_BLOB_HEADER_SIZE {
             self.last_blob_ok = false;
             let err = new_blob_error(BlobError::HeaderTooBig { size: header_size });
-            return Some(Err(match self.offset {
+            return Some(Err(self.stamp_input(match self.offset {
                 Some(o) => err.at(o),
                 None => err,
-            }));
+            })));
         }
 
         let mut reader = self.reader.by_ref().take(header_size);
@@ -548,10 +572,10 @@ impl<R: Read + Send> BlobReader<R> {
         if datasize >= MAX_BLOB_DATASIZE {
             self.last_blob_ok = false;
             let err = new_blob_error(BlobError::DataSizeTooBig { size: datasize });
-            return Some(Err(match self.offset {
+            return Some(Err(self.stamp_input(match self.offset {
                 Some(o) => err.at(o),
                 None => err,
-            }));
+            })));
         }
 
         self.offset = self.offset.map(|x| ByteOffset(x.0 + header_size));
@@ -591,6 +615,8 @@ impl BlobReader<FileReader> {
         Ok(BlobReader {
             reader,
             offset: Some(ByteOffset(0)),
+            source: Some(std::sync::Arc::from(path.as_ref())),
+            blob_index: 0,
             last_blob_ok: true,
             header_buf: Vec::new(),
             parse_tagdata: false,
@@ -611,6 +637,8 @@ impl BlobReader<FileReader> {
         Ok(BlobReader {
             reader,
             offset: Some(ByteOffset(0)),
+            source: Some(std::sync::Arc::from(path.as_ref())),
+            blob_index: 0,
             last_blob_ok: true,
             header_buf: Vec::new(),
             parse_tagdata: false,
@@ -639,6 +667,8 @@ impl BlobReader<FileReader> {
         Ok(BlobReader {
             reader,
             offset: Some(ByteOffset(0)),
+            source: Some(std::sync::Arc::from(path.as_ref())),
+            blob_index: 0,
             last_blob_ok: true,
             header_buf: Vec::new(),
             parse_tagdata: false,
@@ -732,6 +762,7 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
             };
         }
 
+        self.blob_index += 1;
         Some(Ok(Blob::new(header, blob, prev_offset)))
     }
 }
@@ -762,6 +793,10 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
         Ok(BlobReader {
             reader,
             offset: Some(ByteOffset(pos)),
+            // `new_seekable` is generic over any seekable reader; the path
+            // (if any) is the caller's, not something this can recover.
+            source: None,
+            blob_index: 0,
             last_blob_ok: true,
             header_buf: Vec::new(),
             parse_tagdata: false,
@@ -967,9 +1002,10 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
         #[allow(clippy::cast_sign_loss)]
         if let Err(err) = self.skip_blob_body(header.datasize as u64) {
             self.last_blob_ok = false;
-            return Some(Err(err));
+            return Some(Err(self.stamp_input(err)));
         }
 
+        self.blob_index += 1;
         Some(Ok((BlobHeader::new(header), prev_offset)))
     }
 }
@@ -1003,7 +1039,11 @@ impl BlobReader<BufReader<File>> {
         // mostly used for sequential iteration with occasional seek-back, where the
         // large buffer is still beneficial.
         let buf_reader = BufReader::with_capacity(256 * 1024, f);
-        Self::new_seekable(buf_reader)
+        let mut reader = Self::new_seekable(buf_reader)?;
+        // `new_seekable` is generic and cannot know the path; this entry
+        // point does, so it fills the input identity back in.
+        reader.source = Some(std::sync::Arc::from(path.as_ref()));
+        Ok(reader)
     }
 }
 

@@ -115,7 +115,8 @@ The skeleton has exactly two sections. `Context`, `Consequences`, and
   inheritance through `IdSet` for tags-filter / altw-external.
 - [ADR-0003](0003-error-path-hygiene-via-pathguard.md) - Error path
   hygiene via shared RAII primitives - `PathGuard` for run-owned paths,
-  `OutputFile` for user-named outputs - plus a counters-after-write rule.
+  `OutputFile` for user-named outputs, guarded at the CLI front end rather
+  than in the library - plus a counters-after-write rule.
 - [ADR-0004](0004-defensive-input-errors-and-fixtures.md) -
   Defensive handling of adversarial or malformed input: promote
   indexdata/varint/sortedness-trust sites to hard errors at

@@ -23,13 +23,26 @@ pub enum FileReader {
     Direct(DirectReader),
 }
 
+/// Name the file an open failed on, preserving the original
+/// [`io::ErrorKind`] so callers matching on `NotFound` still match.
+///
+/// A bare `No such file or directory (os error 2)` is what a user saw for
+/// a mistyped input path: true, and useless on a command with several
+/// inputs. The path is known here and nowhere below here.
+fn open_error(path: &Path, err: &io::Error) -> io::Error {
+    io::Error::new(
+        err.kind(),
+        format!("failed to open {}: {err}", path.display()),
+    )
+}
+
 impl FileReader {
     /// Open a file for buffered reading (256 KB `BufReader`).
     ///
     /// On Linux, advises the kernel for sequential readahead via
     /// `posix_fadvise(POSIX_FADV_SEQUENTIAL)`.
     pub fn buffered(path: &Path) -> io::Result<Self> {
-        let f = File::open(path)?;
+        let f = File::open(path).map_err(|e| open_error(path, &e))?;
         #[cfg(all(
             target_os = "linux",
             any(feature = "linux-direct-io", feature = "linux-io-uring")
@@ -46,7 +59,9 @@ impl FileReader {
     /// Open a file for O_DIRECT reading with page-aligned buffers.
     #[cfg(feature = "linux-direct-io")]
     pub fn direct(path: &Path) -> io::Result<Self> {
-        Ok(Self::Direct(DirectReader::open(path)?))
+        Ok(Self::Direct(
+            DirectReader::open(path).map_err(|e| open_error(path, &e))?,
+        ))
     }
 
     /// Open a file, selecting buffered or O_DIRECT based on the `direct` flag.

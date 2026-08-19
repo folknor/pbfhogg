@@ -41,11 +41,6 @@ clap = { version = "4.6.1", features = ["derive"] }
 # to their CLI-string-parsed equivalents. Feature unification would apply it
 # anyway when both crates build together; stating it here makes the
 # guarantee explicit rather than an artifact of the build graph.
-# float_roundtrip must match the library's serde_json (see root Cargo.toml):
-# correctly-rounded float parsing keeps config/GeoJSON coordinates identical
-# to their CLI-string-parsed equivalents. Feature unification would apply it
-# anyway when both crates build together; stating it here makes the
-# guarantee explicit rather than an artifact of the build graph.
 serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
 hotpath = "0.23.3"
 

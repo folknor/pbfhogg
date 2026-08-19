@@ -335,17 +335,21 @@ impl IdSet {
 
     /// Merge all set bits from `other` into `self` (union).
     pub fn merge_from(&mut self, other: &IdSet) {
-        self.drop_rank_index();
-        if other.chunks.len() > self.chunks.len() {
-            self.chunks.resize_with(other.chunks.len(), || None);
-        }
-        for (cid, src) in other.chunks.iter().enumerate() {
+        self.prepare_merge(other.chunks.len());
+        for (slot, src) in self.chunks.iter_mut().zip(other.chunks.iter()) {
             if let Some(src_chunk) = src {
-                let dst = self.chunks[cid].get_or_insert_with(new_chunk);
-                for (d, s) in dst.iter_mut().zip(src_chunk.iter()) {
-                    *d.get_mut() |= s.load(std::sync::atomic::Ordering::Relaxed);
-                }
+                or_chunk_into(slot.get_or_insert_with(new_chunk), src_chunk);
             }
+        }
+    }
+
+    /// Shared prologue of both merge forms: the rank index is derived from
+    /// the bits and cannot survive them changing, and `self` must be at
+    /// least as long as `other` before the two are zipped.
+    fn prepare_merge(&mut self, other_chunks: usize) {
+        self.drop_rank_index();
+        if other_chunks > self.chunks.len() {
+            self.chunks.resize_with(other_chunks, || None);
         }
     }
 
@@ -623,24 +627,30 @@ impl IdSet {
     /// processes a contiguous ID range), chunks are moved with zero copying.
     /// For overlapping chunks, byte-level OR is applied.
     pub fn merge(&mut self, other: Self) {
-        self.drop_rank_index();
-        if other.chunks.len() > self.chunks.len() {
-            self.chunks.resize_with(other.chunks.len(), || None);
-        }
-        for (i, other_chunk) in other.chunks.into_iter().enumerate() {
-            if let Some(oc) = other_chunk {
-                match &mut self.chunks[i] {
-                    Some(sc) => {
-                        for (a, b) in sc.iter_mut().zip(oc.iter()) {
-                            *a.get_mut() |= b.load(std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
-                    slot @ None => {
-                        *slot = Some(oc);
-                    }
+        self.prepare_merge(other.chunks.len());
+        for (slot, src) in self.chunks.iter_mut().zip(other.chunks) {
+            if let Some(src_chunk) = src {
+                match slot {
+                    Some(dst) => or_chunk_into(dst, &src_chunk),
+                    // The reason the owned form exists: an absent
+                    // destination chunk takes the source allocation whole,
+                    // with no 4 MB copy and no word-by-word OR.
+                    None => *slot = Some(src_chunk),
                 }
             }
         }
+    }
+}
+
+/// OR `src`'s words into `dst`. The one place the two merge forms agree on
+/// what merging a chunk means; they differ only in the owned form's ability
+/// to move a chunk instead of calling this.
+fn or_chunk_into(
+    dst: &mut Box<[std::sync::atomic::AtomicU64]>,
+    src: &[std::sync::atomic::AtomicU64],
+) {
+    for (d, s) in dst.iter_mut().zip(src.iter()) {
+        *d.get_mut() |= s.load(std::sync::atomic::Ordering::Relaxed);
     }
 }
 

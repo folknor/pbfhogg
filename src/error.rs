@@ -13,7 +13,12 @@ use crate::read::blob::ByteOffset;
 
 #[cold]
 pub(crate) fn new_error(kind: ErrorKind) -> Error {
-    Error(Box::new(Inner { kind, at: None }))
+    Error(Box::new(Inner {
+        kind,
+        at: None,
+        file: None,
+        blob: None,
+    }))
 }
 
 #[cold]
@@ -33,6 +38,12 @@ pub type Result<T> = result::Result<T, Error>;
 struct Inner {
     kind: ErrorKind,
     at: Option<ByteOffset>,
+    /// The input this error came from, when the reader was opened from a
+    /// path. `BlobReader::new` is handed an arbitrary `Read` and has no
+    /// path to record, so it leaves this `None` rather than inventing one.
+    file: Option<std::sync::Arc<std::path::Path>>,
+    /// 0-based index of the blob being read when the error was detected.
+    blob: Option<u64>,
 }
 
 /// An error that can occur when reading or writing PBF files.
@@ -76,6 +87,45 @@ impl Error {
     pub(crate) fn at(mut self, offset: ByteOffset) -> Error {
         if self.0.at.is_none() {
             self.0.at = Some(offset);
+        }
+        self
+    }
+
+    /// The input file this error came from, when the reader knew one.
+    ///
+    /// A byte offset alone is ambiguous on a command with several inputs -
+    /// `cat a.pbf b.pbf`, `apply-changes`, `merge-changes` all report a
+    /// position with no way to tell which stream it indexes. `None` means
+    /// the reader was constructed from a bare `Read` and genuinely has no
+    /// path, never that the path was unavailable at the reporting site.
+    #[inline]
+    pub fn source_path(&self) -> Option<&std::path::Path> {
+        self.0.file.as_deref()
+    }
+
+    /// 0-based index of the blob being read when the error was detected.
+    #[inline]
+    pub fn blob_index(&self) -> Option<u64> {
+        self.0.blob
+    }
+
+    /// Attach the input file and blob index. Same innermost-wins rule as
+    /// [`Error::at`]: an inner reader that already named its own input is
+    /// the more precise attribution, and an outer one must not overwrite
+    /// it with the file *it* happens to be reading.
+    #[cold]
+    #[must_use]
+    pub(crate) fn in_input(
+        mut self,
+        file: Option<&std::sync::Arc<std::path::Path>>,
+        blob: u64,
+    ) -> Error {
+        // Stamped as a pair, never field by field: a file from one reader
+        // and a blob index from another would read as a precise location
+        // and point nowhere.
+        if self.0.blob.is_none() {
+            self.0.blob = Some(blob);
+            self.0.file = file.map(std::sync::Arc::clone);
         }
         self
     }
@@ -175,10 +225,22 @@ impl StdError for Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         self.fmt_kind(f)?;
-        // The "where". Only the framing layer knows it, so most errors
-        // still print exactly as they did before this was added.
+        // The "where": which input, which blob, which byte. Only the
+        // framing layer knows any of it, so an error raised below that
+        // layer still prints exactly as it did before this was added.
+        let mut sep = " (";
+        if let Some(path) = self.0.file.as_deref() {
+            write!(f, "{sep}in {}", path.display())?;
+            sep = ", ";
+        }
+        if let Some(blob) = self.0.blob {
+            write!(f, "{sep}blob {blob}")?;
+            sep = ", ";
+        }
         if let Some(at) = self.0.at {
-            write!(f, " (at byte offset {})", at.0)?;
+            write!(f, "{sep}at byte offset {})", at.0)?;
+        } else if sep == ", " {
+            write!(f, ")")?;
         }
         Ok(())
     }

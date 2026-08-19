@@ -7,14 +7,45 @@ use std::collections::VecDeque;
 pub(crate) struct ReorderBuffer<T> {
     next_seq: usize,
     filled: usize,
+    max_window: usize,
     pending: VecDeque<Option<T>>,
 }
 
+/// Slots ahead of `next_seq` a buffer will grow to before it calls the
+/// producer a runaway.
+///
+/// `push` sizes `pending` from the sequence number it is handed, so before
+/// this bound existed a producer that ran away from a stalled slot could
+/// grow the buffer to an arbitrary size and the only thing stopping it was
+/// permit accounting in the caller - an invariant that lived nowhere near
+/// the code that depended on it, and that every one of the twenty call
+/// sites had to re-establish for itself.
+///
+/// The default is deliberately far above any real pipeline window (the
+/// largest caller asks for a few hundred slots) so it never fires on a
+/// working configuration: it converts an unbounded memory-exhaustion vector
+/// into a localised panic that names the buffer. Callers that know their
+/// exact permit count can pin it with
+/// [`ReorderBuffer::with_max_window`].
+pub(crate) const DEFAULT_MAX_WINDOW: usize = 65_536;
+
 impl<T> ReorderBuffer<T> {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self::with_max_window(capacity, DEFAULT_MAX_WINDOW.max(capacity))
+    }
+
+    /// As [`ReorderBuffer::with_capacity`], but with an explicit ceiling on
+    /// how far ahead of the next expected sequence number a pushed item may
+    /// sit. `max_window` must be at least `capacity`.
+    pub(crate) fn with_max_window(capacity: usize, max_window: usize) -> Self {
+        assert!(
+            max_window >= capacity,
+            "reorder buffer max_window ({max_window}) below its capacity ({capacity})"
+        );
         Self {
             next_seq: 0,
             filled: 0,
+            max_window,
             pending: VecDeque::with_capacity(capacity),
         }
     }
@@ -35,6 +66,13 @@ impl<T> ReorderBuffer<T> {
             self.next_seq
         );
         let slot_idx = seq - self.next_seq;
+        assert!(
+            slot_idx < self.max_window,
+            "reorder buffer window exceeded: seq {seq} is {slot_idx} ahead of \
+             {} (max {})",
+            self.next_seq,
+            self.max_window
+        );
         if slot_idx >= self.pending.len() {
             self.pending.resize_with(slot_idx + 1, || None);
         }
@@ -133,6 +171,31 @@ mod tests {
         assert_eq!(rb.pop_ready(), Some("y"));
         assert_eq!(rb.pop_ready(), Some("z"));
         assert_eq!(rb.pop_ready(), None);
+    }
+
+    /// The bound is the point of the field: a producer that runs away from
+    /// a stalled slot must be stopped here, not by whatever accounting the
+    /// caller happens to do.
+    #[test]
+    #[should_panic(expected = "reorder buffer window exceeded")]
+    fn push_beyond_max_window_panics() {
+        let mut rb = ReorderBuffer::with_max_window(4, 4);
+        rb.push(0, "a");
+        // seq 4 is 4 slots ahead of next_seq 0, one past the window.
+        rb.push(4, "e");
+    }
+
+    #[test]
+    fn push_at_the_window_edge_is_accepted() {
+        let mut rb = ReorderBuffer::with_max_window(4, 4);
+        rb.push(3, "d");
+        assert_eq!(rb.pending_len(), 4);
+        // Draining moves the window forward, so what was out of range
+        // becomes reachable rather than permanently rejected.
+        rb.push(0, "a");
+        assert_eq!(rb.pop_ready(), Some("a"));
+        rb.push(4, "e");
+        assert_eq!(rb.filled_len(), 2);
     }
 
     #[test]

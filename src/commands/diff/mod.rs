@@ -105,8 +105,8 @@ pub struct DiffOptions {
     pub verbose: bool,
     /// Show summary on stderr (left/right/same/different counts).
     pub summary: bool,
-    /// Comma-separated type filter (e.g. "node,way").
-    pub type_filter: Option<String>,
+    /// Restrict the comparison to these element types. `None` = all.
+    pub type_filter: Option<TypeFilter>,
     /// Number of parallel shards for the block-pair merge. `1` runs the
     /// sequential path (default); `>=2` dispatches N shards across
     /// worker threads. The caller is responsible for resolving `0` =
@@ -208,10 +208,7 @@ pub fn diff(
     options: &DiffOptions,
     direct_io: bool,
 ) -> Result<DiffStats> {
-    let filter = match options.type_filter.as_deref() {
-        Some(s) => TypeFilter::parse(s),
-        None => TypeFilter::all(),
-    };
+    let filter = TypeFilter::or_all(options.type_filter);
 
     // Single-pass: check sorted headers + indexdata from one file open each.
     let (old_sorted, old_indexed) = check_sorted_and_indexed(old_path, direct_io)?;

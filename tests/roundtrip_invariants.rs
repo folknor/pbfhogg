@@ -87,6 +87,7 @@ fn sort_idempotence() {
 /// `extract(x, bbox)`. The second extract on an already-clipped PBF
 /// shouldn't change anything: every surviving element is within the
 /// bbox by construction.
+#[cfg(feature = "commands")] // uses pbfhogg::extract, gated behind `commands`
 #[test]
 fn extract_simple_idempotence() {
     let dir = TempDir::new().expect("tempdir");

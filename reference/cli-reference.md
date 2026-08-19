@@ -1,10 +1,35 @@
 # pbfhogg CLI Reference
 
-Version 0.5.0. Generated from `pbfhogg --help` output.
+Version 0.5.0 (plus unreleased 0.6.0 changes). Generated from
+`pbfhogg --help` output.
+
+Every enumerated flag value (`--compression`, `--type`, `--index-type`,
+`--clean`, `inspect tags --sort`, the `bench-*` modes) is parsed once at
+the argument boundary, so `--help` lists the accepted values and shell
+completion offers them.
 
 ## Global flags
 
 All commands support `-h, --help` and `-V, --version`.
+
+## Exit codes
+
+Every command uses the same three-band contract. `1` is reserved for a
+command that ran to completion and whose answer is negative; a command
+that could not run at all exits `2`, so a script can branch on the
+answer without swallowing failures.
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success. |
+| `1` | The command ran and its answer is negative. Only four commands can produce it: `diff` (differences found), `inspect --indexed` (no blob-level indexdata), `inspect --show` (element not in the file), and `check` (integrity violations). Nothing is printed to stderr for it beyond the command's normal output. |
+| `2` | The command failed: missing or unreadable input, an invalid argument combination, a malformed PBF, an I/O error. `Error: ...` goes to stderr. Argument-parsing errors from clap also land here. |
+
+Before 0.6.0 every one of these outcomes exited `1`, so "the files
+differ" and "the file does not exist" were indistinguishable. Callers
+that branch on `1` for the semantic answer are unaffected; callers that
+treat any non-zero as failure are unaffected. Only a caller that read
+`1` as "the command failed" needs to widen to `!= 0`.
 
 ## Common flags
 
@@ -38,17 +63,17 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 |------|-------------|
 | `--indexed` | Check if PBF has blob-level indexdata (exit code 0 = yes, 1 = no) |
 | `--nodes` | Analyze node coordinate statistics for FOR compression sizing |
-| `-j, --jobs <N>` | Parallel worker count for `--nodes` (only). `0` auto-picks from `available_parallelism()`, `1` forces sequential, higher values cap the pool. Other inspect modes ignore this flag. |
+| `-j, --jobs <N>` | Parallel worker count for `--nodes`. `0` auto-picks from `available_parallelism()`, `1` forces sequential, higher values cap the pool. **Requires `--nodes`**: no other inspect mode reads it, so passing it elsewhere is an error rather than a no-op. |
 | `--blocks [N]` | Show per-block distribution stats and optional block listing (N limits to first/last N blocks) |
 | `--id-ranges` | Show min/max element IDs per type and monotonicity |
 | `--locations` | Show locations-on-ways diagnostics |
 | `--anomalies` | Show only anomalous blocks (<50% or >150% of median, plus mixed blocks) |
 | `-e, --extended` | Extended scan: timestamp range, data bbox, metadata coverage, ordering |
-| `-g, --get <KEY>` | Get a single value by key path (e.g. `header.bbox`, `data.timestamp.first`) |
-| `--json` | Machine-readable JSON output |
-| `--show <TYPE_ID>` | Display a single element by ID (e.g. `n123`, `w456`, `r789`). Uses indexdata to skip non-matching blobs, early exit on sorted PBFs |
+| `-g, --get <KEY>` | Get a single value by key path (e.g. `header.bbox`, `data.timestamp.first`). Not combinable with `--json`. |
+| `--json` | Machine-readable JSON output. Not combinable with `--nodes` (node stats have no JSON form) or `--get`. |
+| `--show <TYPE_ID>` | Display a single element by ID (e.g. `n123`, `w456`, `r789`). Uses indexdata to skip non-matching blobs, early exit on sorted PBFs. **A mode of its own**: mutually exclusive with every other `inspect` flag (`--indexed`, `--nodes`, `-j`, `--blocks`, `--id-ranges`, `--locations`, `--anomalies`, `-e`, `--get`, `--json`, `--force`), which it used to accept and discard. |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
-| `--force` | Proceed even if input lacks indexdata (for `--nodes`) |
+| `--force` | Proceed even if input lacks indexdata. **Requires `--nodes`**: it is threaded only into the node-stats scan, so passing it to another mode is an error rather than a no-op. |
 
 #### inspect tags
 
@@ -58,7 +83,7 @@ Count tag key=value frequencies (subcommand of `inspect`).
 |------|-------------|
 | `--min-count <N>` | Only show tags with at least this many occurrences [default: 1] |
 | `-M, --max-count <N>` | Only show tags with at most this many occurrences |
-| `-s, --sort <ORDER>` | Sort order: count-desc (default), count-asc, name-asc, name-desc |
+| `-s, --sort <ORDER>` | Sort order: count-desc (default), count-asc, name-asc, name-desc. `count` and `name` are accepted as aliases for `count-desc` and `name-asc`. |
 | `-e, --expressions <FILE>` | Read tag expressions from file (one per line, # comments) |
 | `-t, --type <TYPE>` | Filter by element type: node, way, or relation |
 | `-j, --jobs <N>` | Parallel worker count. `0` auto-picks from `available_parallelism()`, `1` forces sequential, higher values cap the pool. |
@@ -85,8 +110,13 @@ pbfhogg check [OPTIONS] <FILE>
 | `--check-relations` | Also check relation member references (applies to ref check) |
 | `--show-ids` | Show IDs of missing objects, format: `n123 in w456` (applies to ref check) |
 | `--json` | Machine-readable JSON output |
-| `--quiet` | Exit-code only, no output |
+| `--quiet` | Exit-code only, no output. Not combinable with `--json`. |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
+
+`--full` and `-t/--type` apply to the ID check and are rejected under
+`--refs` alone; `--check-relations` and `--show-ids` apply to the ref
+check and are rejected under `--ids` alone. Violations exit `1`, not
+`2` - see [Exit codes](#exit-codes).
 
 For missing relation-to-relation members, reports unique missing IDs with occurrence count when they differ: `Missing relation members: 706 (777 references)`.
 
@@ -105,12 +135,12 @@ pbfhogg cat [OPTIONS] --output <OUTPUT> <FILES>...
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
-| `-t, --type <TYPE>` | Filter by element type (comma-separated: node, way, relation) |
-| `-c, --clean <ATTR>` | Strip metadata attribute (repeatable: version, timestamp, changeset, uid, user) |
-| `--dedupe` | K-way sorted merge with dedup (all inputs must be sorted) |
+| `-t, --type <TYPE>` | Filter by element type (comma-separated: node, way, relation). Not valid with `--dedupe`. |
+| `-c, --clean <ATTR>` | Strip metadata attribute (repeatable: version, timestamp, changeset, uid, user). Not valid with `--dedupe`. |
+| `--dedupe` | K-way sorted merge with dedup (all inputs must be sorted). Rejects `--type` and `--clean`: the dedupe path is blob-level passthrough and implements neither. |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
-| `--io-uring` | Use io_uring for output I/O (only with `--dedupe`) |
+| `--io-uring` | Use io_uring for output I/O. Only valid with `--dedupe` - the plain `cat` path has no io_uring writer, and passing it there is an error. |
 | `--force` | Proceed even if input lacks indexdata |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
@@ -182,6 +212,12 @@ pbfhogg degrade [OPTIONS] --output <OUTPUT> <FILE>
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
 **Implementation paths:** `--strip-indexdata`, `--strip-tagdata`, and/or `--strip-bbox` (with no `--unsort`/`--strip-locations`/`--drop-ids`) run as a header-and-blob-level passthrough: with no `--generator`/`--output-header` override, the input `HeaderBlock` payload is forwarded field-for-field via a surgical wire-level field stripper, with only the bbox (field 1) removed under `--strip-bbox`, and raw OsmData frames are reframed by copying the original `BlobHeader` through byte-for-byte with only `indexdata` (field 2) and/or `tagdata` (field 4) cleared as targeted. This preserves every other header and blob-header field byte-for-byte - `source`, custom optional features, a non-default `writingprogram`, replication metadata, `WayMembers-v1`, and unknown/extension fields all survive - rather than losing them to a `HeaderBuilder` rebuild. When a header override (`--generator`/`--output-header`) is present, the header is instead rebuilt through `HeaderBuilder` with the override applied (and the bbox omitted under `--strip-bbox`). Any combination involving `--unsort`, `--strip-locations`, or `--drop-ids` decodes elements, re-encodes via `BlockBuilder`, and frames with `indexdata=None` when `--strip-indexdata` composes; `--strip-bbox` on this path clears the bbox from the rebuilt output header. `--drop-ids` requires `N:SEED`, rejects zero N, and is reproducible for a given input and seed.
+
+`degrade --block-cap` and `getparents --full-scan-min-blobs` are hidden
+(`hide = true`) test instruments: they override an internal threshold so
+the suite can fire a code path without building a full-scale fixture.
+They are not part of the supported surface and may change or disappear
+without a deprecation cycle.
 
 `--recompress` from the design doc remains deferred. The `--unsort` perturbation is the minimum-viable swap that triggers `sort`'s overlap detector; configurable chaos modes (rotate / shuffle / reverse) are deferred.
 
@@ -307,7 +343,7 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 | `-q, --quiet` | Exit-code only, suppress output (text only) |
 | `-o, --output <FILE>` | Write output to file (required for `--format osc`) |
 | `-t, --type <TYPE>` | Filter by element type (text only) |
-| `-j, --jobs <N>` | Parallel shard count. `0` (default) auto-picks from `available_parallelism()`; `1` restores the sequential, scratch-free path; higher values partition the ID space across N worker threads. Applies to both text and `--format osc`; parallel sharding requires both inputs to be indexed, and `-v/--verbose` always uses the sequential path. The parallel path writes shard temp files next to the output (planet scale: ~30 GB text, ~45 GB osc XML), removed on completion. |
+| `-j, --jobs <N>` | Parallel shard count. `0` (default) auto-picks from `available_parallelism()`; `1` restores the sequential, scratch-free path; higher values partition the ID space across N worker threads. Applies to both text and `--format osc`; parallel sharding requires both inputs to be indexed. **Rejected with `-v/--verbose`**, which is sequential-only - an explicit `-j` there used to be accepted and discarded. The parallel path writes shard temp files next to the output (planet scale: ~30 GB text, ~45 GB osc XML), removed on completion. |
 | `--increment-version` | Bump version of deleted elements by 1 (osc only) |
 | `--update-timestamp` | Set delete timestamp to current time (osc only) |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
@@ -330,7 +366,7 @@ pbfhogg getid [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 | `--invert` | Invert selection: remove listed IDs instead of keeping them |
 | `-r, --add-referenced` | Include referenced nodes of matching ways (two-pass; not with `--invert`) |
 | `-t, --remove-tags` | Remove tags from referenced objects (use with -r; not with `--invert`) |
-| `--verbose-ids` | Print requested IDs and report which were not found (not with `--invert`) |
+| `--verbose-ids` | Print requested IDs, then report which were not found (not with `--invert`). Both lists go to stderr. The found set is collected on the write path, so this costs no extra pass over the output. |
 | `-i, --id-file <FILE>` | Read IDs from text file (one per line) |
 | `-I, --id-osm-file <FILE>` | Read IDs from an OSM/PBF file (all element IDs are collected) |
 | `--default-type <TYPE>` | Default type for bare numeric IDs: node, way, relation |
@@ -367,7 +403,7 @@ Embed node coordinates in ways. Two index strategies:
 - **sparse** (default) - Rank-indexed flat mmap array. Pre-allocates `referenced.total_count() * 8` bytes; workers store `(lat, lon)` at byte offset `IdSet::rank_if_set(node_id) << 3` via atomic stores. Fast at small / medium scale; survives Europe at ~6 minutes on a 27 GB-RAM host. Likely thrashes at planet (working set exceeds free page cache) - use `external` for planet.
 - **external** - Double radix permutation via 4-stage pipeline. Bounded memory (~8.7 GB measured peak anon at planet). The only mode that survives at planet on memory-constrained hosts. Requires sorted PBF (Sort.Type\_then\_ID) and indexdata. Uses ~224 GB temp disk at planet.
 
-`--index-type dense` was removed - sparse rank-indexed flat dominated dense at every measured scale (japan dense 51.6 s vs sparse 11.9 s). Passing `--index-type dense` errors with a pointer to `sparse`.
+`--index-type dense` was removed - sparse rank-indexed flat dominated dense at every measured scale (japan dense 51.6 s vs sparse 11.9 s). `dense` survives as a hidden value (absent from `--help` and from completion) purely so passing it errors with a pointer to `sparse` rather than a bare "invalid value".
 
 By default, untagged nodes not referenced by a relation are dropped from output.
 

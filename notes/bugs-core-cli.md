@@ -7,93 +7,101 @@ Findings only, unverified.
 
 ## Argument-surface and exit-code design
 
-### Exit code 1 means both "diff found differences" and "the command failed"
+### Disclosed boundary: the exit-code split is unverified against brokkr's runner
 
-`cli/src/main.rs`: `ExitWithCode(1)` for `diff` differences and
-`inspect --indexed` false collapses onto `ExitCode::FAILURE` == 1, which is also
-every error path. A caller scripting `pbfhogg diff` cannot distinguish "files
-differ" from "file not found". osmium uses 1 for the semantic answer and 2 for
-errors; `ExitWithCode` already exists to carry a code, so making generic errors
-exit 2 is a one-line change plus a doc entry. `reference/cli-reference.md`
-documents no exit-code semantics at all beyond `--indexed`.
+The 0.6.0 exit-code split (0 success, 1 semantic-negative answer, 2 failure)
+has *not* been verified by source inspection against brokkr, which shells out
+to `pbfhogg` for every one of its subcommands: `~/Programs/brokkr` is not
+readable from the sandboxes this loop ran in, on either the fix side or the
+orchestrating side.
 
-Confidence: high.
+What was verified, empirically from this side: `brokkr inspect --force
+--dataset denmark` and `brokkr inspect --force --dataset denmark --nodes` both
+run clean, and neither injects `-j`, so neither the new `requires = "nodes"`
+on `inspect -j`/`--force` nor the new `diff -v` + explicit `-j` conflict fires
+under brokkr's own invocations. brokkr's `--force` is its own clean-tree
+override and is not forwarded to the child.
 
-### Silently-ignored flag combinations in `inspect`
+The remaining theoretical exposure: a consumer - brokkr or any script - that
+special-cases `== 1` as "the command failed" rather than testing `!= 0`. Such
+a consumer now sees `2` where it used to see `1` for every genuine failure.
+`1` itself kept its meaning for all four semantic answers, so the reverse
+direction is safe. Tracked cross-repo in `TODO.md`.
 
-`--show` returns early before every other flag is examined:
-`inspect --show n1 --json --blocks --extended` runs `show_element` and discards
-the rest with no diagnostic, while `--nodes --json` and `--get --json` are hard
-errors. `--force` is threaded only into `node_stats`, so
-`inspect --blocks --force` on an unindexed file silently ignores it. `-j/--jobs`
-is documented as ignored outside `--nodes` and indeed is. The `run_inspect` mode
-dispatcher (four overlapping early-return blocks, each recomputing its own
-`has_other_flags`) is where these leak from; it wants to be an explicit mode enum
-resolved once.
+Confidence: high that the exposure is narrow; unresolved only because the
+other tree is unreadable.
 
-### Free-form `String` flags parsed by hand at four different layers
+### `run_inspect`'s mode dispatcher is still four overlapping early returns
 
-`--compression`, `--index-type`, `inspect tags --sort`, `bench-read --mode`,
-`bench-write --writer`, `bench-merge --io-mode`, `--type`, `--clean` are all
-`String`, validated (or not) in `main.rs`, in `commands/`, or via `FromStr` in
-the library. Consequences: no shell completion, no `--help` enumeration of valid
-values and inconsistent error phrasing. `--type` is now validated by a
-hand-written `value_parser` in `main.rs`, which is the pattern this finding wants
-replaced rather than repeated. `DiffFormat` / `InputKind` / `ExportTypeArg` show the intended pattern.
-Converting the rest to `ValueEnum` (with `Compression` keeping a custom parser
-for the `:LEVEL` suffix) removes a whole class of finding.
+Round 2 fixed the *silence*: `--show` is now `conflicts_with_all` against
+every other inspect flag, and `-j/--jobs` / `--force` carry
+`requires = "nodes"`, so none of these combinations is accepted-and-discarded
+any more (clap rejects them at parse time, and `tests/cli_exit_codes.rs`
+covers each one). What was not done is the shape the original finding also
+asked for: `run_inspect` still has four early-return blocks (`--indexed`
+alone, `--nodes` alone, `--get` on a header-only key, then the full scan), two
+of which recompute their own local `has_other_flags`. Now that the illegal
+combinations are rejected up front, several of those guards are dead weight
+and the function wants an explicit mode enum resolved once. Behavioural risk
+is low; this is a legibility item.
 
-### `getid --verbose-ids` re-reads the entire output PBF
-
-`cli/src/main.rs` -> `print_missing_ids` -> `parse_ids_from_pbf`. A full second
-decode pass over the just-written output, undocumented in
-`reference/cli-reference.md` ("Print requested IDs and report which were not
-found"). At planet scale this roughly doubles the command's runtime for a
-diagnostic. The information is available for free inside `getid` itself, which
-already knows which requested IDs it emitted.
-
-### Doc/code drift in `reference/cli-reference.md`
-
-- `cat`: code rejects `--type` and `--clean` when combined with `--dedupe`; the
-  doc does not mention it.
-- `check`: code has `--quiet` `conflicts_with = "json"`; not documented.
-- `diff`: `-j` is silently ignored under `-v/--verbose` (the doc admits verbose
-  is sequential but does not say `-j` is accepted-and-ignored, unlike the
-  `tags-filter` `-R`+`-j` case which is a hard error). The inconsistency between
-  "reject" and "ignore" for the same situation is itself a design flaw.
-- `degrade`: `--block-cap` and `getparents --full-scan-min-blobs` are
-  `hide = true` test instruments - acceptable, but `--full-scan-min-blobs`
-  reaches a separate library entry point (`getparents_with_min_blobs`) from CLI
-  input with no bound checking.
-- `AGENTS.md` lists `roaring` as a `commands` dependency; `Cargo.toml` no longer
-  has it.
+Confidence: high that the shape is still there, low that it hides a bug.
 
 ## Feature gating
 
-### `default-features = false` is claimed to work but is never built
+### `src/commands/` is still not gated as a whole
 
-`brokkr.toml`'s `consumer` sweep sets `no_default_features = true` but then
-re-enables `features = ["commands"]`, so no CI configuration ever compiles the
-crate without `commands`. `src/commands/` is not gated as a whole - only `check`,
-`export`, `extract`, `inspect::json`, and `geocode_index::builder` are - so
-`altw`, `apply_changes`, `cat`, `degrade`, `diff`, `getid`, `getparents`,
-`inspect`, `merge_changes`, `renumber`, `repack`, `sort`, `tags_count`,
-`tags_filter`, `time_filter` all compile into a "library-only" build.
-`AGENTS.md`'s "`default-features = false` skips `commands` feature" is
-misleading, and the configuration is untested. Add a third sweep with genuinely
-no features.
+Round 2 added the `minimal` sweep (`no_default_features`, `features = []`, no
+`build_packages`), so the no-`commands` configuration is now compiled and
+linted on every check run. Six test files that reach into the gated modules
+carry a file-level or per-test `#![cfg(feature = "commands")]` so they drop
+out there.
+
+What remains is the underlying asymmetry the original finding named: the
+`commands` feature gates only `check`, `export`, `extract`,
+`commands::spatial`, `inspect::json` and the geocode builder. `altw`,
+`apply_changes`, `cat`, `degrade`, `diff`, `getid`, `getparents`, `inspect`,
+`merge_changes`, `renumber`, `repack`, `sort`, `tags_count`, `tags_filter`
+and `time_filter` compile into a "library-only" build regardless. `AGENTS.md`
+now describes that accurately rather than claiming the feature skips the whole
+command layer, so the documentation is no longer wrong - but whether the
+feature *should* gate the module wholesale is an open design question, and
+answering it "yes" is a much larger change than a bug-fix round (every command
+module, the `lib.rs` re-exports, and roughly 30 test files).
+
+Confidence: high (this is a description of the current state, not a claim).
 
 ### The library/CLI boundary is porous by design
 
-`lib.rs` re-exports the entire command layer plus `path_guard`, `tag_expr` and
-`HeaderOverrides` as `#[doc(hidden)] pub` purely so `pbfhogg-cli` (a separate
-crate) can call them. Every internal refactor of `commands/` is therefore a
-semver-visible change disguised by `doc(hidden)`, and library consumers get a
-large accidental API. The right shape pre-1.0 is a third crate
-(`pbfhogg-commands`) between the format library and the binary, or making these
-genuinely public and documented. Related: `error.rs` bakes CLI advice ("use
-`--type node` or an altw input") into a library `Display` impl - the library
-should not know CLI flag names.
+The concrete leak the original finding named is fixed:
+`ErrorKind::MissingFeature("LocationsOnWays")` no longer writes
+`; use --type node or an altw input` into a library `Display` impl, and
+`ParseIndexTypeError` for the removed `dense` index type no longer names
+`--index-type`. The CLI re-attaches its own flag advice in `export_error` in
+`cli/src/main.rs`, where the flags actually exist.
+
+The structural half is untouched, deliberately - the round-2 brief said to fix
+the leak without restructuring the workspace. `lib.rs` still re-exports the
+entire command layer plus `path_guard`, `tag_expr` and `HeaderOverrides` as
+`#[doc(hidden)] pub` purely so `pbfhogg-cli` (a separate crate) can call them,
+so every internal refactor of `commands/` is still a semver-visible change
+disguised by `doc(hidden)`, and library consumers still get a large accidental
+API. The right shape pre-1.0 is a third crate (`pbfhogg-commands`) between the
+format library and the binary, or making these genuinely public and
+documented.
+
+Confidence: high.
+
+### `getparents --full-scan-min-blobs` still has no bound checking
+
+Documented in `reference/cli-reference.md` as an unsupported hidden test
+instrument, which was the round-2 fix for the doc/code drift finding. The
+underlying observation stands: the flag reaches a separate library entry point
+(`getparents_with_min_blobs`) straight from CLI input with no range check, so
+`--full-scan-min-blobs 0` silently pins the FullScan arm. Harmless today
+because it is hidden and test-only.
+
+Confidence: high.
 
 ## Smaller / lower confidence
 
@@ -143,6 +151,21 @@ should not know CLI flag names.
   `run_*` functions take 8-14 positional arguments because every command's
   options are splatted rather than passed as the option struct the library
   already defines.
+- `cli/src/main.rs`: `validate_input_output_aliases` canonicalizes inputs for
+  *every* command up front, so a nonexistent input now surfaces as an
+  aliasing-check IO error before the command's own error path ever runs. No
+  command accepts `-`/stdin, so nothing functionally breaks, but the error text
+  for a missing input file changed shape. Either canonicalize lazily or map the
+  aliasing check's IO failure back to the command's own missing-input error.
+  Surfaced by the round-1 fix-and-commit agent, 79ba805a. Confidence: high.
+- Root-level `DOC-CONVENTIONS-AUDIT.md` violates the document-folder convention
+  in `AGENTS.md`: the root exemption list is `AGENTS.md`, `CLAUDE.md`,
+  `README.md`, `LICENSE`, `CHANGELOG.md` and their kin. It is a transient audit
+  and belongs in `notes/`. Confidence: high.
+- `cli/Cargo.toml`: the five-line comment justifying `serde_json`'s
+  `float_roundtrip` feature is duplicated verbatim, immediately after itself,
+  above the `serde_json` dependency line. Cosmetic; delete one copy.
+  Confidence: high.
 - `cli/src/main.rs`: `Cli::parse()` calls `process::exit` on a parse error,
   bypassing the hotpath guard drop that the `ExitWithCode` machinery exists to
   protect. Use `Cli::try_parse()` if that report matters on the failure path.

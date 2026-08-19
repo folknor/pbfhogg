@@ -21,6 +21,7 @@ fn default_opts() -> GetidOptions {
     GetidOptions {
         add_referenced: false,
         remove_tags: false,
+        report_found: false,
     }
 }
 
@@ -28,6 +29,7 @@ fn add_ref_opts() -> GetidOptions {
     GetidOptions {
         add_referenced: true,
         remove_tags: false,
+        report_found: false,
     }
 }
 
@@ -126,6 +128,154 @@ fn read_raw_way_meta(path: &std::path::Path) -> Vec<RawWayMeta> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// `report_found` collects the requested IDs that were written, on the
+/// write path. The set must be exactly the requested IDs present in the
+/// input - not the requested set (which would hide misses) and not every
+/// written element (which would report referenced nodes nobody asked
+/// for). `None` when the caller did not ask, so "not requested" stays
+/// distinguishable from "requested, found nothing".
+#[test]
+fn getid_reports_found_ids_without_rereading_output() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(
+        &input,
+        &[
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[],
+        &[],
+    );
+
+    // Not asked for: no set at all.
+    let id_set = parse_ids(&ids(&["n1"])).expect("parse ids");
+    let stats = getid(
+        &input,
+        &output,
+        &id_set,
+        &default_opts(),
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("getid");
+    assert!(
+        stats.found.is_none(),
+        "found must be None unless report_found was set",
+    );
+
+    // Asked for: n1 exists, n99 does not.
+    let id_set = parse_ids(&ids(&["n1", "n99"])).expect("parse ids");
+    let opts = GetidOptions {
+        add_referenced: false,
+        remove_tags: false,
+        report_found: true,
+    };
+    let stats = getid(
+        &input,
+        &output,
+        &id_set,
+        &opts,
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("getid");
+    let found = stats.found.expect("report_found was set");
+    assert!(found.node_ids.get(1), "n1 was written and must be reported");
+    assert!(
+        !found.node_ids.get(99),
+        "n99 is absent from the input and must not be reported as found",
+    );
+}
+
+/// With `--add-referenced` the output also carries nodes pulled in by a
+/// matched way. Those were never requested, so they must not appear in
+/// the found set - otherwise the "did not find" report would go silent
+/// on genuinely missing IDs. This path runs `process_block` on decode
+/// worker threads, so it exercises the parallel collection route.
+#[test]
+fn getid_found_ids_exclude_referenced_pull_ins() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(
+        &input,
+        &[
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![],
+            meta: None,
+        }],
+        &[],
+    );
+
+    let id_set = parse_ids(&ids(&["w10", "w11"])).expect("parse ids");
+    let opts = GetidOptions {
+        add_referenced: true,
+        remove_tags: false,
+        report_found: true,
+    };
+    let stats = getid(
+        &input,
+        &output,
+        &id_set,
+        &opts,
+        Compression::default(),
+        false,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("getid");
+    let found = stats.found.expect("report_found was set");
+    assert!(
+        found.way_ids.get(10),
+        "w10 was written and must be reported"
+    );
+    assert!(
+        !found.way_ids.get(11),
+        "w11 does not exist and must not be reported as found",
+    );
+    assert!(
+        !found.node_ids.has_any(),
+        "referenced nodes 1 and 2 were pulled in, not requested, and must not be reported",
+    );
+}
 
 #[test]
 fn getid_nodes() {
@@ -974,6 +1124,7 @@ fn getid_remove_tags_strips_referenced_nodes() {
     let opts = GetidOptions {
         add_referenced: true,
         remove_tags: true,
+        report_found: false,
     };
     let stats = getid(
         &input,

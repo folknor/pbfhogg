@@ -49,6 +49,26 @@ no_default_features = true
 features = ["commands"]
 build_packages = ["pbfhogg-cli"]
 
+# "minimal" = the configuration the crate advertises but never built.
+# `consumer` sets no_default_features and then re-enables `commands`, so
+# until this entry existed no sweep ever compiled pbfhogg without it and
+# `default-features = false` was an untested claim.
+#
+# No build_packages, deliberately. pbfhogg-cli pins its lib dep as
+# `default-features = false, features = ["commands"]`, so the moment the
+# CLI joins the build cargo's feature unification turns `commands` back
+# on and the sweep silently stops testing what it is named for. This
+# sweep must stay scoped to the library package alone.
+#
+# Integration tests that reach into the feature-gated modules
+# (`check`, `export`, `extract`, `inspect::json`, `geocode_index`) carry
+# a file-level `#![cfg(feature = "commands")]` so they drop out here and
+# still run in full under `all` and `consumer`.
+[[check]]
+name = "minimal"
+no_default_features = true
+features = []
+
 [test]
 debug = true
 default_package = "pbfhogg"
@@ -56,10 +76,12 @@ default_profile = "tier1"
 
 # Tier 1 - fast contracts. brokkr check's inner-loop signal during
 # refactor. Skips the tier2/tier3/platform/serial submodules; runs
-# everything else across both sweeps.
+# everything else across all three sweeps. `minimal` contributes
+# mostly a compile + clippy gate: the commands-gated test files cfg
+# themselves out there.
 [test.profiles.tier1]
 description = "Fast edit loop used by brokkr check (tier 1)"
-sweeps = ["all", "consumer"]
+sweeps = ["all", "consumer", "minimal"]
 skip = ["tier2::", "tier3::", "platform::", "serial::"]
 include_ignored = false
 

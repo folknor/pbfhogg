@@ -1,5 +1,10 @@
 //! Reverse-geocode coverage: default synthetic smoke tests plus ignored
 //! Denmark-scale integration tests.
+//!
+//! The index builder lives behind the `commands` feature (and the
+//! reader behind `geocode-reader`, which `commands` enables), so this
+//! file compiles out of the no-features sweep rather than breaking it.
+#![cfg(feature = "commands")]
 
 mod common;
 

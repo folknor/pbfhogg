@@ -1648,3 +1648,47 @@ fn diff_block_pair_parallel_matches_sequential_on_multi_blob() {
         "parallel text diverges from sequential on multi-blob input"
     );
 }
+
+/// `-v/--verbose` always runs the sequential path, so an explicit
+/// `-j/--jobs` alongside it was accepted and thrown away. `tags-filter`
+/// already made the equivalent `-R` + `-j` a hard error; the two agree
+/// now. The default `-j 0` must keep working with `-v` - only an
+/// explicit value is a conflict.
+#[test]
+fn diff_rejects_explicit_jobs_with_verbose() {
+    let dir = TempDir::new().unwrap();
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+    let nodes = generate_nodes(4, 1);
+    write_test_pbf_sorted(&old, &nodes, &[], &[]);
+    write_test_pbf_sorted(&new, &nodes, &[], &[]);
+
+    let out = CliInvoker::new()
+        .arg("diff")
+        .arg(&old)
+        .arg(&new)
+        .arg("-v")
+        .arg("-j")
+        .arg("4")
+        .run();
+    assert!(
+        !out.status.success(),
+        "-v with an explicit -j must be rejected, not silently ignored; stderr:\n{}",
+        out.stderr_str(),
+    );
+
+    // Verbose on its own is unaffected: `jobs` defaults to 0 and a
+    // default value must not trip the conflict.
+    let out = CliInvoker::new()
+        .arg("diff")
+        .arg(&old)
+        .arg(&new)
+        .arg("-v")
+        .arg("-q")
+        .run();
+    assert!(
+        out.status.success(),
+        "-v alone must still run on identical inputs; stderr:\n{}",
+        out.stderr_str(),
+    );
+}

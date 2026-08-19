@@ -297,7 +297,12 @@ fn metadata_types_and_locations_gate() {
     CliInvoker::new()
         .args(["export", raw.to_str().unwrap()])
         .assert_failure()
-        .assert_stderr_contains("use --type node or an altw input");
+        // The library half of the message must stay flag-free; the
+        // `--type node` half is added by the CLI, not by `ErrorKind`.
+        .assert_stderr_contains(
+            "way geometry needs an input carrying inline way-node coordinates; \
+             use --type node to export nodes only",
+        );
     CliInvoker::new()
         .args(["export", raw.to_str().unwrap(), "--type", "node"])
         .assert_success();

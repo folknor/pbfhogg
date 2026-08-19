@@ -2,7 +2,59 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- **Exit codes now distinguish "the answer is no" from "the command
+  failed".** A command that ran to completion and answered negatively
+  exits `1` - `diff` with differences, `inspect --indexed` on a
+  non-indexed file, `inspect --show` on an absent element, `check` with
+  integrity violations. Every failure path now exits `2` (matching what
+  clap already returned for a usage error). Previously both meanings
+  shared `1`, so `pbfhogg diff a.osm.pbf missing.osm.pbf` was
+  indistinguishable from "the files differ". Scripts branching on `1`
+  for the semantic answer, or on any non-zero for failure, are
+  unaffected; a script reading `1` as "failed" must widen to `!= 0`.
+  See the exit-code table in `reference/cli-reference.md`.
+
+- `inspect` rejects the flag combinations it used to accept and discard.
+  `--show` is now mutually exclusive with every other `inspect` flag
+  (it returned early and threw the rest away), and `-j/--jobs` and
+  `--force` require `--nodes`, the only mode that reads them.
+
+- `diff` rejects an explicit `-j/--jobs` together with `-v/--verbose`.
+  Verbose output is sequential-only, so the job count was accepted and
+  ignored; `tags-filter` already rejected the equivalent `-R` + `-j`.
+
+- Library: `cat::cat`, `diff::DiffOptions`, `check::verify_ids::
+  VerifyIdsOptions` and `tags_count::TagCountOptions` take a typed
+  `Option<TypeFilter>` instead of an unvalidated type string, and
+  `VerifyIdsOptions` loses its lifetime parameter. `TypeFilter` is now
+  public and implements `FromStr`, which rejects unknown types instead
+  of quietly matching nothing.
+
+- Library: `getid::GetidOptions` gains `report_found` and
+  `getid::GetidStats` gains `found`.
+
+- `ErrorKind::MissingFeature("LocationsOnWays")` no longer names CLI
+  flags in its `Display` output; the `--type node` hint is added by the
+  CLI. Same for the `dense` index-type parse error.
+
 ### Changed
+
+- `getid --verbose-ids` no longer decodes the finished output PBF a
+  second time to work out which requested IDs were missing. The found
+  set is collected on the write path, so the diagnostic no longer
+  roughly doubles the command's runtime at planet scale.
+
+- Enumerated flag values are parsed once, at the argument boundary, into
+  a typed value: `--compression`, `--type`, `--clean`, `--index-type`,
+  `inspect tags --sort` and the `bench-*` modes. `--help` now lists the
+  accepted values and shell completion offers them, and the error
+  wording is consistent across commands. `inspect tags --sort` keeps
+  `count` and `name` as aliases; `--index-type dense` keeps its
+  migration pointer at `sparse` as a hidden value. `-t/--type` rejects
+  an unknown or misspelled element type on every command that takes it,
+  rather than letting it degrade into a filter that matches nothing.
 
 - Commands that write a PBF now reject an output that aliases one of their
   inputs before opening any writer, rather than truncating the input and

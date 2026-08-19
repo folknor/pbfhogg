@@ -29,6 +29,56 @@ pub struct ElementIds {
     pub relation_ids: IdSet,
 }
 
+impl ElementIds {
+    /// An empty set.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            node_ids: IdSet::new(),
+            way_ids: IdSet::new(),
+            relation_ids: IdSet::new(),
+        }
+    }
+
+    /// True when no ID of any type is present.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.node_ids.has_any() && !self.way_ids.has_any() && !self.relation_ids.has_any()
+    }
+
+    fn insert(&mut self, kind: ElemKindTag, id: i64) {
+        match kind {
+            ElemKindTag::Node => self.node_ids.set(id),
+            ElemKindTag::Way => self.way_ids.set(id),
+            ElemKindTag::Relation => self.relation_ids.set(id),
+        }
+    }
+}
+
+/// Which of the three `ElementIds` sets a collected ID belongs to.
+///
+/// `process_block` runs on decode-worker threads, so it cannot write
+/// into a shared `ElementIds`; it hands back a small owned list instead
+/// and the sequential consumer merges. The list stays empty unless the
+/// caller asked for found-ID reporting, so the parallel path pays
+/// nothing when `--verbose-ids` is off.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ElemKindTag {
+    Node,
+    Way,
+    Relation,
+}
+
+/// What one `process_block` call emitted.
+struct BlockOutcome {
+    nodes: u64,
+    ways: u64,
+    relations: u64,
+    /// Requested IDs that were actually written. Empty unless the caller
+    /// set `GetidOptions::report_found`.
+    found: Vec<(ElemKindTag, i64)>,
+}
+
 /// Element type used as default when parsing bare numeric IDs.
 #[derive(Clone, Copy)]
 pub enum DefaultType {
@@ -108,11 +158,7 @@ pub fn parse_ids_with_default_type(
     specs: &[String],
     default_type: Option<DefaultType>,
 ) -> Result<ElementIds> {
-    let mut set = ElementIds {
-        node_ids: IdSet::new(),
-        way_ids: IdSet::new(),
-        relation_ids: IdSet::new(),
-    };
+    let mut set = ElementIds::empty();
     for spec in specs {
         let (prefix, id) = parse_id_spec(spec, default_type)?;
         match prefix {
@@ -151,11 +197,7 @@ pub fn parse_ids_from_file_with_default_type(
 /// returned `ElementIds`. No member or reference IDs are collected - only
 /// top-level element IDs (matching osmium's `--id-osm-file` behavior).
 pub fn parse_ids_from_pbf(path: &Path, _direct_io: bool) -> Result<ElementIds> {
-    let mut set = ElementIds {
-        node_ids: IdSet::new(),
-        way_ids: IdSet::new(),
-        relation_ids: IdSet::new(),
-    };
+    let mut set = ElementIds::empty();
 
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(path, None)?;
 
@@ -220,6 +262,14 @@ pub struct GetidOptions {
     /// Strip tags from referenced objects not explicitly requested.
     /// Only meaningful with `add_referenced`.
     pub remove_tags: bool,
+    /// Collect the requested IDs that were actually written, into
+    /// [`GetidStats::found`].
+    ///
+    /// This is what `--verbose-ids` reports on. It is gathered on the
+    /// write path, where each emitted element is already in hand;
+    /// the alternative - decoding the finished output a second time -
+    /// roughly doubled the command's runtime for a diagnostic.
+    pub report_found: bool,
 }
 
 /// Statistics from a getid/removeid operation.
@@ -227,6 +277,10 @@ pub struct GetidStats {
     pub nodes_written: u64,
     pub ways_written: u64,
     pub relations_written: u64,
+    /// The requested IDs that were written, when
+    /// [`GetidOptions::report_found`] was set. `None` otherwise -
+    /// distinguishing "not asked for" from "asked for, found nothing".
+    pub found: Option<ElementIds>,
 }
 
 impl GetidStats {
@@ -312,6 +366,7 @@ fn getid_dispatched(
             direct_io,
             overrides,
             arm,
+            opts.report_found,
         )?;
         (Some(arm), stats)
     };
@@ -361,6 +416,7 @@ pub fn removeid(
         direct_io,
         overrides,
         ScanArm::Walker,
+        false,
     )
 }
 
@@ -382,6 +438,7 @@ fn filter_by_id(
     direct_io: bool,
     overrides: &HeaderOverrides,
     arm: ScanArm,
+    report_found: bool,
 ) -> Result<GetidStats> {
     match arm {
         ScanArm::Walker => filter_by_id_walker(
@@ -392,6 +449,7 @@ fn filter_by_id(
             compression,
             direct_io,
             overrides,
+            report_found,
         ),
         ScanArm::FullScan => {
             debug_assert!(
@@ -399,7 +457,15 @@ fn filter_by_id(
                 "the streaming full-scan arm implements include mode only; \
                  removeid is pinned to ScanArm::Walker"
             );
-            filter_by_id_streaming(input, output, ids, compression, direct_io, overrides)
+            filter_by_id_streaming(
+                input,
+                output,
+                ids,
+                compression,
+                direct_io,
+                overrides,
+                report_found,
+            )
         }
     }
 }
@@ -414,6 +480,7 @@ fn filter_by_id_walker(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    report_found: bool,
 ) -> Result<GetidStats> {
     use crate::blob::{BlobKind, decode_blob_to_headerblock};
     use crate::read::header_walker::HeaderWalker;
@@ -439,6 +506,7 @@ fn filter_by_id_walker(
         nodes_written: 0,
         ways_written: 0,
         relations_written: 0,
+        found: report_found.then(ElementIds::empty),
     };
     let blob_filter = BlobFilter::new(
         ids.node_ids.has_any(),
@@ -522,7 +590,7 @@ fn filter_by_id_walker(
                     &mut gr_scratch,
                 )?;
                 output_blocks.clear();
-                let (nodes, ways, relations) = process_block(
+                let outcome = process_block(
                     &block,
                     &mut bb,
                     &mut output_blocks,
@@ -530,6 +598,7 @@ fn filter_by_id_walker(
                     include,
                     None,
                     false,
+                    report_found,
                 )
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                 flush_local(&mut bb, &mut output_blocks)
@@ -548,9 +617,14 @@ fn filter_by_id_walker(
                         way_members.as_deref(),
                     )?;
                 }
-                stats.nodes_written += nodes;
-                stats.ways_written += ways;
-                stats.relations_written += relations;
+                stats.nodes_written += outcome.nodes;
+                stats.ways_written += outcome.ways;
+                stats.relations_written += outcome.relations;
+                if let Some(found) = stats.found.as_mut() {
+                    for (kind, id) in outcome.found {
+                        found.insert(kind, id);
+                    }
+                }
             }
             _ => {}
         }
@@ -584,6 +658,7 @@ fn filter_by_id_walker(
 /// (permit accounting, rayon dispatch, channel hops) times millions of
 /// small blobs loses to a plain sequential read loop.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn filter_by_id_streaming(
     input: &Path,
     output: &Path,
@@ -591,6 +666,7 @@ fn filter_by_id_streaming(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    report_found: bool,
 ) -> Result<GetidStats> {
     use crate::blob::{BlobKind, decode_blob_to_headerblock};
     use crate::file_reader::FileReader;
@@ -608,6 +684,7 @@ fn filter_by_id_streaming(
         nodes_written: 0,
         ways_written: 0,
         relations_written: 0,
+        found: report_found.then(ElementIds::empty),
     };
     let mut blobs_skipped: u64 = 0;
     let mut osmdata_blobs: u64 = 0;
@@ -669,9 +746,17 @@ fn filter_by_id_streaming(
                     &mut gr_scratch,
                 )?;
                 output_blocks.clear();
-                let (nodes, ways, relations) =
-                    process_block(&block, &mut bb, &mut output_blocks, ids, true, None, false)
-                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                let outcome = process_block(
+                    &block,
+                    &mut bb,
+                    &mut output_blocks,
+                    ids,
+                    true,
+                    None,
+                    false,
+                    report_found,
+                )
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                 flush_local(&mut bb, &mut output_blocks)
                     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                 for OwnedBlock {
@@ -688,9 +773,14 @@ fn filter_by_id_streaming(
                         way_members.as_deref(),
                     )?;
                 }
-                stats.nodes_written += nodes;
-                stats.ways_written += ways;
-                stats.relations_written += relations;
+                stats.nodes_written += outcome.nodes;
+                stats.ways_written += outcome.ways;
+                stats.relations_written += outcome.relations;
+                if let Some(found) = stats.found.as_mut() {
+                    for (kind, id) in outcome.found {
+                        found.insert(kind, id);
+                    }
+                }
             }
             _ => {}
         }
@@ -727,6 +817,7 @@ fn getid_with_refs(
         nodes_written: 0,
         ways_written: 0,
         relations_written: 0,
+        found: opts.report_found.then(ElementIds::empty),
     };
 
     // Pass 1: Collect ref node IDs from matching ways. Uses IdSet for O(1)
@@ -814,12 +905,20 @@ fn getid_with_refs(
         |block| {
             let mut bb = BlockBuilder::new();
             let mut output = Vec::new();
-            let counts =
-                process_block(&block, &mut bb, &mut output, ids, true, dep_ref, strip_tags)?;
+            let outcome = process_block(
+                &block,
+                &mut bb,
+                &mut output,
+                ids,
+                true,
+                dep_ref,
+                strip_tags,
+                opts.report_found,
+            )?;
             flush_local(&mut bb, &mut output)?;
-            Ok((output, counts))
+            Ok((output, outcome))
         },
-        |(blocks, (nodes, ways, relations))| {
+        |(blocks, outcome)| {
             for OwnedBlock {
                 bytes,
                 index,
@@ -834,9 +933,14 @@ fn getid_with_refs(
                     way_members.as_deref(),
                 )?;
             }
-            stats.nodes_written += nodes;
-            stats.ways_written += ways;
-            stats.relations_written += relations;
+            stats.nodes_written += outcome.nodes;
+            stats.ways_written += outcome.ways;
+            stats.relations_written += outcome.relations;
+            if let Some(found) = stats.found.as_mut() {
+                for (kind, id) in outcome.found {
+                    found.insert(kind, id);
+                }
+            }
             Ok(())
         },
     )?;
@@ -846,11 +950,56 @@ fn getid_with_refs(
     Ok(stats)
 }
 
+/// Whether the element is covered by the query: requested by ID, or -
+/// for nodes under `--add-referenced` - pulled in as a way's node ref.
+///
+/// Include mode emits dominated elements; invert mode emits the rest.
+fn is_dominated(
+    ids: &ElementIds,
+    dep_node_ids: Option<&crate::idset::IdSet>,
+    element: &Element<'_>,
+) -> bool {
+    match element {
+        Element::DenseNode(dn) => {
+            ids.node_ids.get(dn.id()) || dep_node_ids.is_some_and(|deps| deps.get(dn.id()))
+        }
+        Element::Node(n) => {
+            ids.node_ids.get(n.id()) || dep_node_ids.is_some_and(|deps| deps.get(n.id()))
+        }
+        Element::Way(w) => ids.way_ids.get(w.id()),
+        Element::Relation(r) => ids.relation_ids.get(r.id()),
+    }
+}
+
+/// Note the element about to be written, if the user actually asked for
+/// it by ID.
+///
+/// Only *requested* IDs count: in `--add-referenced` mode a node can be
+/// emitted because a matched way refers to it, which is not the same as
+/// the user having asked for it, and reporting those would make the
+/// "did not find" list go silent on genuine misses. Ways and relations
+/// reach the write path in include mode only when they matched
+/// directly, so they need no such guard.
+fn record_found(found: &mut Vec<(ElemKindTag, i64)>, ids: &ElementIds, element: &Element<'_>) {
+    match element {
+        Element::DenseNode(dn) if ids.node_ids.get(dn.id()) => {
+            found.push((ElemKindTag::Node, dn.id()));
+        }
+        Element::Node(n) if ids.node_ids.get(n.id()) => {
+            found.push((ElemKindTag::Node, n.id()));
+        }
+        Element::Way(w) => found.push((ElemKindTag::Way, w.id())),
+        Element::Relation(r) => found.push((ElemKindTag::Relation, r.id())),
+        _ => {}
+    }
+}
+
 /// Process a single `PrimitiveBlock` through the ID filter, writing matching
 /// elements into the thread-local `BlockBuilder` and flushing complete blocks
-/// into `output`. Returns `(nodes, ways, relations)` counts.
+/// into `output`. Returns the per-block [`BlockOutcome`].
 ///
 /// Called on the decode-worker threads via `for_each_fused_block`.
+#[allow(clippy::too_many_arguments)]
 fn process_block(
     block: &PrimitiveBlock,
     bb: &mut BlockBuilder,
@@ -859,28 +1008,25 @@ fn process_block(
     include: bool,
     dep_node_ids: Option<&crate::idset::IdSet>,
     strip_tags: bool,
-) -> std::result::Result<(u64, u64, u64), String> {
+    report_found: bool,
+) -> std::result::Result<BlockOutcome, String> {
     let mut nodes: u64 = 0;
     let mut ways: u64 = 0;
     let mut relations: u64 = 0;
+    let mut found: Vec<(ElemKindTag, i64)> = Vec::new();
 
     let mut refs_buf: Vec<i64> = Vec::new();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 
     for element in block.elements() {
-        let dominated = match &element {
-            Element::DenseNode(dn) => {
-                ids.node_ids.get(dn.id()) || dep_node_ids.is_some_and(|deps| deps.get(dn.id()))
-            }
-            Element::Node(n) => {
-                ids.node_ids.get(n.id()) || dep_node_ids.is_some_and(|deps| deps.get(n.id()))
-            }
-            Element::Way(w) => ids.way_ids.get(w.id()),
-            Element::Relation(r) => ids.relation_ids.get(r.id()),
-        };
+        let dominated = is_dominated(ids, dep_node_ids, &element);
         let emit = if include { dominated } else { !dominated };
         if !emit {
             continue;
+        }
+
+        if report_found && include {
+            record_found(&mut found, ids, &element);
         }
 
         match &element {
@@ -957,7 +1103,12 @@ fn process_block(
         }
     }
 
-    Ok((nodes, ways, relations))
+    Ok(BlockOutcome {
+        nodes,
+        ways,
+        relations,
+        found,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1145,6 +1296,7 @@ mod tests {
         let opts = GetidOptions {
             add_referenced: true,
             remove_tags: false,
+            report_found: false,
         };
         let output = dir.path().join("output.pbf");
         getid_with_refs(
@@ -1178,6 +1330,7 @@ mod tests {
                 false,
                 &HeaderOverrides::default(),
                 arm,
+                false,
             )
             .unwrap();
         }
@@ -1227,6 +1380,7 @@ mod tests {
         let opts = GetidOptions {
             add_referenced: false,
             remove_tags: false,
+            report_found: false,
         };
         for (min_blobs, expected_arm) in [
             (1, ScanArm::FullScan),

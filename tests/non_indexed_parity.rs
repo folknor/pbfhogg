@@ -80,6 +80,9 @@ fn write_both(indexed: &Path, non_indexed: &Path) {
     assert_non_indexed(non_indexed);
 }
 
+// Only `extract --smart` needs this fixture, and that test is gated on
+// `commands`.
+#[cfg(feature = "commands")]
 fn write_smart_both(indexed: &Path, non_indexed: &Path) {
     let nodes = vec![
         TestNode {
@@ -260,6 +263,7 @@ fn tags_filter_non_indexed_parity() {
 // the id sets grew. Fixed 2026-04-23 by kind-scoping the pass-2 writer
 // (see `extract_block_pass2`'s `phase_kind` parameter).
 
+#[cfg(feature = "commands")] // uses pbfhogg::extract, gated behind `commands`
 #[test]
 fn extract_simple_non_indexed_parity() {
     let dir = TempDir::new().expect("tempdir");
@@ -317,6 +321,7 @@ fn getid_include_non_indexed_parity() {
     let opts = pbfhogg::getid::GetidOptions {
         add_referenced: false,
         remove_tags: false,
+        report_found: false,
     };
     let compression = Compression::default();
     let hdr = pbfhogg::HeaderOverrides::default();
@@ -438,6 +443,7 @@ fn apply_changes_non_indexed_parity() {
 // what extract --simple got wrong. Pin that check_refs counts survive
 // the triple-scan shape.
 
+#[cfg(feature = "commands")] // uses pbfhogg::check, gated behind `commands`
 #[test]
 fn check_refs_non_indexed_parity() {
     let dir = TempDir::new().expect("tempdir");
@@ -536,6 +542,7 @@ fn show_element_non_indexed_parity() {
 // runs skip it and rely on the sequential element-level check for
 // the non-`--full` path.
 
+#[cfg(feature = "commands")] // uses pbfhogg::check, gated behind `commands`
 #[test]
 fn check_ids_non_indexed_parity() {
     let dir = TempDir::new().expect("tempdir");
@@ -712,6 +719,7 @@ fn renumber_external_rejects_non_indexed() {
 // already kind-filter at the element level, so mismatched blobs
 // safely no-op.
 
+#[cfg(feature = "commands")] // uses pbfhogg::extract, gated behind `commands`
 #[test]
 fn extract_multi_complete_ways_non_indexed_parity() {
     let dir = TempDir::new().expect("tempdir");
@@ -772,6 +780,7 @@ fn extract_multi_complete_ways_non_indexed_parity() {
 // Shares a root cause with the CompleteWays case above - the sorted
 // pass-1 scheduler dropped non-indexed blobs on the floor - and was
 // fixed by the same change in `smart.rs::collect_pass1_generic`.
+#[cfg(feature = "commands")] // uses pbfhogg::extract, gated behind `commands`
 #[test]
 fn extract_smart_non_indexed_parity() {
     let dir = TempDir::new().expect("tempdir");

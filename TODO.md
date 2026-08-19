@@ -33,6 +33,33 @@ Picked 2026-07-30, right after the 0.5.0 release.
   codes), the fixes, and a durable contract in reference/ so new
   commands conform by construction.
 
+  Partially delivered already: exit codes now split into 0 success,
+  1 semantic-negative answer, 2 failure, documented in
+  `reference/cli-reference.md` and `docs/cli/commands.md`. The
+  stdout/stderr half of the audit is untouched.
+
+- [ ] **Cross-repo: confirm brokkr does not read pbfhogg exit code 1 as
+  failure.** pbfhogg's exit codes used to be 0 or 1, where 1 meant both
+  "the answer is no" and "the command failed". As of the 0.6.0 split, 1
+  is reserved for the semantic-negative answer of exactly four commands
+  (`diff` differences, `inspect --indexed` no, `inspect --show` not
+  found, `check` violations) and every failure path exits 2. The
+  symptom, if brokkr gets it wrong: a brokkr subcommand that shells out
+  to one of those four and treats any nonzero as a failed run would now
+  see a code it never saw before (2) - harmless if it tests `!= 0`, and
+  a behavior change only if it tests `== 1`. What the other side would
+  have to ship: nothing, unless its runner special-cases 1.
+
+  What was done here instead: the split was verified empirically from
+  the pbfhogg side rather than by reading brokkr's source, because
+  `~/Programs/brokkr` is not readable from the sandboxes this work ran
+  in. `brokkr inspect --force --dataset denmark` and the same with
+  `--nodes` both run clean, and brokkr's own `--force` is a
+  clean-tree override that is not forwarded to pbfhogg. What remains
+  merely disclosed: no source-level confirmation that brokkr's runner
+  never tests `== 1`. Close this by reading brokkr's process-exit
+  handling once from a host where that tree is readable.
+
 - [ ] **CLI UX decision pair** (details under Milestone 3 / Command
   surface): pick and apply the scratch-dir posture uniformly across
   every large-scratch command, and replace `--index-type` on

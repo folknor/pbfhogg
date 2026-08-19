@@ -2,8 +2,11 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use pbfhogg::HeaderOverrides;
+use pbfhogg::altw::IndexType;
+use pbfhogg::cat::CleanAttrs;
+use pbfhogg::tags_count::TagCountSort;
 use pbfhogg::writer::Compression;
+use pbfhogg::{HeaderOverrides, TypeFilter};
 
 // hotpath 0.15 installed CountingAllocator internally under hotpath-alloc; as
 // of 0.16 it is a plain generic type the consumer must declare - the crate no
@@ -14,17 +17,47 @@ use pbfhogg::writer::Compression;
 #[global_allocator]
 static ALLOC: hotpath::CountingAllocator = hotpath::CountingAllocator::new();
 
+/// The exit statuses `pbfhogg` guarantees to callers.
+///
+/// The split follows the `diff`/`grep` convention: a command that ran to
+/// completion and answered "no" is not the same event as a command that
+/// could not run at all. Scripts can therefore branch on the answer
+/// (`1`) without swallowing failures (`2`), which the previous
+/// everything-is-`1` scheme made impossible.
+///
+/// `2` also matches what clap already returns for a usage error, so the
+/// "the invocation did not work" band is contiguous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitStatus {
+    /// `1` - the command ran to completion and its answer is negative:
+    /// `diff` found differences, `check` found violations,
+    /// `inspect --indexed` found no index, `inspect --show` found no
+    /// element. Not an error; nothing is printed to stderr for it.
+    AnswerNegative,
+    /// `2` - the command failed. Every error path lands here.
+    Failed,
+}
+
+impl ExitStatus {
+    const fn code(self) -> u8 {
+        match self {
+            Self::AnswerNegative => 1,
+            Self::Failed => 2,
+        }
+    }
+}
+
 /// Non-fatal exit code carrier. Subcommands that need to signal a
 /// specific non-zero exit status (e.g. `diff` with differences found)
 /// return this via the error channel instead of calling `process::exit`.
 /// `process::exit` skips destructors, which prevents the hotpath guard
 /// in `main` from flushing its JSON report.
 #[derive(Debug)]
-struct ExitWithCode(u8);
+struct ExitWithCode(ExitStatus);
 
 impl std::fmt::Display for ExitWithCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "exit with code {}", self.0)
+        write!(f, "exit with code {}", self.0.code())
     }
 }
 
@@ -44,35 +77,33 @@ struct OutputArg {
     output: PathBuf,
 }
 
-fn parse_type_filter(value: &str) -> Result<String, String> {
-    if value.is_empty() {
-        return Err("type filter must not be empty".to_string());
-    }
-    for kind in value.split(',') {
-        if !matches!(kind, "node" | "way" | "relation") {
-            return Err(format!(
-                "invalid element type '{kind}' (expected node, way, or relation)"
-            ));
-        }
-    }
-    Ok(value.to_string())
+/// Every free-form flag is parsed exactly once, here at the argument
+/// boundary, into the typed value the library consumes. Nothing
+/// downstream re-parses a user string: `run_*` takes `Compression`,
+/// `TypeFilter`, `IndexType` and friends, not `&str`.
+fn parse_type_filter(value: &str) -> Result<TypeFilter, String> {
+    value.parse::<TypeFilter>().map_err(|e| e.to_string())
 }
 
-fn parse_single_type(value: &str) -> Result<String, String> {
-    if matches!(value, "node" | "way" | "relation") {
-        Ok(value.to_string())
-    } else {
-        Err(format!(
-            "invalid element type '{value}' (expected node, way, or relation)"
-        ))
+fn parse_single_type(value: &str) -> Result<TypeFilter, String> {
+    let filter = parse_type_filter(value)?;
+    if filter.count() != 1 {
+        return Err(format!(
+            "invalid element type '{value}' (expected exactly one of node, way, or relation)"
+        ));
     }
+    Ok(filter)
+}
+
+fn parse_compression(value: &str) -> Result<Compression, String> {
+    value.parse::<Compression>().map_err(|e| e.to_string())
 }
 
 #[derive(Args)]
 struct CompressionArg {
     /// Compression: none, zlib (default), zstd. Append :LEVEL for custom (e.g. zlib:9, zstd:19)
-    #[arg(long, default_value = "zlib")]
-    compression: String,
+    #[arg(long, default_value = "zlib", value_parser = parse_compression)]
+    compression: Compression,
 }
 
 #[derive(Args)]
@@ -139,6 +170,106 @@ enum ExportTypeArg {
     Way,
 }
 
+/// Metadata attribute accepted by `--clean`. The set is closed, so it is
+/// a `ValueEnum` rather than a string matched in a helper: `--help`
+/// enumerates it and shell completion knows it.
+#[derive(Clone, Copy, ValueEnum)]
+enum CleanAttrArg {
+    Version,
+    Changeset,
+    Timestamp,
+    Uid,
+    User,
+}
+
+fn clean_attrs(attrs: &[CleanAttrArg]) -> CleanAttrs {
+    let mut clean = CleanAttrs::default();
+    for attr in attrs {
+        match attr {
+            CleanAttrArg::Version => clean.version = true,
+            CleanAttrArg::Changeset => clean.changeset = true,
+            CleanAttrArg::Timestamp => clean.timestamp = true,
+            CleanAttrArg::Uid => clean.uid = true,
+            CleanAttrArg::User => clean.user = true,
+        }
+    }
+    clean
+}
+
+/// Node-index strategy for `add-locations-to-ways`.
+///
+/// `Dense` is hidden rather than absent: it was a real value until it was
+/// removed, and a user carrying an old command line deserves the pointer
+/// at `sparse` instead of a bare "invalid value".
+#[derive(Clone, Copy, ValueEnum)]
+enum IndexTypeArg {
+    Auto,
+    Sparse,
+    External,
+    #[value(hide = true)]
+    Dense,
+}
+
+impl IndexTypeArg {
+    fn resolve(self) -> Result<IndexType, Box<dyn std::error::Error>> {
+        match self {
+            Self::Auto => Ok(IndexType::Auto),
+            Self::Sparse => Ok(IndexType::Sparse),
+            Self::External => Ok(IndexType::External),
+            Self::Dense => Err(
+                "index type 'dense' was removed in favor of 'sparse'. Sparse \
+                 (rank-indexed flat) is faster than dense at every measured \
+                 scale and works in regimes dense doesn't. Use \
+                 --index-type sparse instead."
+                    .into(),
+            ),
+        }
+    }
+}
+
+/// `count` and `name` were accepted as shorthands by the hand-written
+/// parser this replaced; they stay, as hidden aliases.
+#[derive(Clone, Copy, ValueEnum)]
+enum TagSortArg {
+    #[value(alias = "count")]
+    CountDesc,
+    CountAsc,
+    #[value(alias = "name")]
+    NameAsc,
+    NameDesc,
+}
+
+impl From<TagSortArg> for TagCountSort {
+    fn from(value: TagSortArg) -> Self {
+        match value {
+            TagSortArg::CountDesc => Self::CountDesc,
+            TagSortArg::CountAsc => Self::CountAsc,
+            TagSortArg::NameAsc => Self::NameAsc,
+            TagSortArg::NameDesc => Self::NameDesc,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum BenchReadMode {
+    Sequential,
+    Parallel,
+    Pipelined,
+    Blobreader,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum BenchWriterMode {
+    Sync,
+    Pipelined,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum BenchIoMode {
+    Buffered,
+    Uring,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Concatenate PBF files with optional type filtering
@@ -151,10 +282,10 @@ enum Command {
         /// Strip metadata attribute (version, timestamp, changeset, uid, user).
         /// Can be specified multiple times, e.g. -c changeset -c uid -c user
         #[arg(short = 'c', long = "clean", value_name = "ATTR")]
-        clean: Vec<String>,
+        clean: Vec<CleanAttrArg>,
         /// Filter by element type (comma-separated: node, way, relation)
         #[arg(short = 't', long = "type", value_parser = parse_type_filter)]
-        type_filter: Option<String>,
+        type_filter: Option<TypeFilter>,
         /// Sorted k-way merge with dedup by (type, id). Requires sorted inputs.
         #[arg(long)]
         dedupe: bool,
@@ -410,7 +541,7 @@ enum Command {
         output: Option<PathBuf>,
         /// Filter by element type (comma-separated: node, way, relation)
         #[arg(short = 't', long = "type", value_parser = parse_type_filter)]
-        type_filter: Option<String>,
+        type_filter: Option<TypeFilter>,
         /// Number of parallel shards for the block-pair merge. `0` (default)
         /// auto-picks from available cores; `1` restores the sequential,
         /// scratch-free path; higher values partition the ID space across
@@ -420,7 +551,17 @@ enum Command {
         /// lines are sequential-only). The parallel path writes shard temp
         /// files (planet scale: ~30 GB text, ~45 GB osc XML), removed on
         /// completion - pass `-j 1` if temp disk is scarce.
-        #[arg(short = 'j', long = "jobs", default_value = "0")]
+        ///
+        /// Rejected with `-v/--verbose`: per-field detail lines are
+        /// sequential-only, so an explicit `-j` there was accepted and
+        /// discarded. `tags-filter` already rejects the equivalent
+        /// `-R` + `-j`; the two now agree.
+        #[arg(
+            short = 'j',
+            long = "jobs",
+            default_value = "0",
+            conflicts_with = "verbose"
+        )]
         jobs: usize,
         /// Output format: text (default) or osc
         #[arg(long, default_value = "text")]
@@ -536,7 +677,7 @@ enum Command {
         /// Strip metadata attribute (version, timestamp, changeset, uid, user).
         /// Can be specified multiple times, e.g. --clean changeset --clean uid
         #[arg(long = "clean", value_name = "ATTR")]
-        clean: Vec<String>,
+        clean: Vec<CleanAttrArg>,
         #[command(flatten)]
         compression: CompressionArg,
         #[command(flatten)]
@@ -570,7 +711,7 @@ enum Command {
         ///              on memory-constrained hosts. Requires sorted PBF and
         ///              indexdata. ~224 GB temp disk at planet.
         #[arg(long, default_value = "sparse")]
-        index_type: String,
+        index_type: IndexTypeArg,
         /// Emit pbfhogg's opt-in WayMembers-v1 and SharedNodePins-v1 metadata.
         #[arg(long)]
         inject_prepass: bool,
@@ -614,8 +755,8 @@ enum Command {
         nodes: bool,
         /// Parallel worker threads for `--nodes` (only). `1` forces sequential,
         /// `0` auto-picks from `available_parallelism()`, higher values cap
-        /// the worker pool. Other inspect modes ignore this flag.
-        #[arg(short = 'j', long = "jobs", default_value = "0")]
+        /// the worker pool. Rejected outside `--nodes` rather than ignored.
+        #[arg(short = 'j', long = "jobs", default_value = "0", requires = "nodes")]
         jobs: usize,
         /// Show per-block distribution stats and optional block listing
         #[arg(long, num_args = 0..=1, default_missing_value = "0")]
@@ -632,8 +773,19 @@ enum Command {
         /// Extended scan: timestamp range, data bbox, metadata coverage, ordering
         #[arg(short, long)]
         extended: bool,
-        /// Show a single element by type/ID (e.g. "n123", "w456", "r789")
-        #[arg(long, value_name = "TYPE_ID")]
+        /// Show a single element by type/ID (e.g. "n123", "w456", "r789").
+        ///
+        /// A mode of its own: it returns one element and nothing else, so
+        /// every other inspect flag is rejected alongside it rather than
+        /// silently discarded (which is what used to happen).
+        #[arg(
+            long,
+            value_name = "TYPE_ID",
+            conflicts_with_all = [
+                "indexed", "nodes", "jobs", "blocks", "id_ranges", "locations",
+                "anomalies", "extended", "get", "json", "force",
+            ],
+        )]
         show: Option<String>,
         /// Get a single value by key path (e.g. "header.bbox", "data.timestamp.first")
         #[arg(short, long, value_name = "KEY")]
@@ -643,8 +795,11 @@ enum Command {
         json: bool,
         #[command(flatten)]
         io: DirectIoArg,
-        #[command(flatten)]
-        force: ForceArg,
+        /// Proceed even if the input lacks indexdata (slower fallback path).
+        /// Only the `--nodes` scan has such a fallback, so the flag is
+        /// rejected outside `--nodes` rather than ignored.
+        #[arg(long, requires = "nodes")]
+        force: bool,
     },
     /// Apply OSC diffs to a PBF file
     ApplyChanges {
@@ -714,7 +869,7 @@ enum Command {
         full: bool,
         /// Filter by element type for ID check (comma-separated: node, way, relation)
         #[arg(short = 't', long = "type", value_parser = parse_type_filter)]
-        type_filter: Option<String>,
+        type_filter: Option<TypeFilter>,
         /// Stop after N violations per check (0 = unlimited)
         #[arg(long, default_value = "100")]
         max_errors: usize,
@@ -733,18 +888,18 @@ enum Command {
         file: PathBuf,
         /// Read mode: sequential, parallel, pipelined, blobreader
         #[arg(long)]
-        mode: String,
+        mode: BenchReadMode,
     },
     /// Benchmark: decode + write all elements through BlockBuilder (emits kv to stderr)
     BenchWrite {
         /// Input PBF file
         file: PathBuf,
         /// Compression spec (e.g. none, zlib:6, zstd:3)
-        #[arg(long, default_value = "zlib:6")]
-        compression: String,
+        #[arg(long, default_value = "zlib:6", value_parser = parse_compression)]
+        compression: Compression,
         /// Writer mode: sync or pipelined
         #[arg(long, default_value = "sync")]
-        writer: String,
+        writer: BenchWriterMode,
     },
     /// Benchmark: merge base PBF with OSC diff (emits kv to stderr)
     BenchMerge {
@@ -755,11 +910,11 @@ enum Command {
         #[command(flatten)]
         output: OutputArg,
         /// Compression spec (e.g. none, zlib, zstd:3)
-        #[arg(long, default_value = "zlib")]
-        compression: String,
+        #[arg(long, default_value = "zlib", value_parser = parse_compression)]
+        compression: Compression,
         /// I/O mode: buffered, uring
         #[arg(long, default_value = "buffered")]
-        io_mode: String,
+        io_mode: BenchIoMode,
     },
     /// Build a reverse geocoding index from a PBF file
     BuildGeocodeIndex {
@@ -807,7 +962,7 @@ enum InspectCommand {
         max_count: Option<u64>,
         /// Sort order: count-desc (default), count-asc, name-asc, name-desc
         #[arg(short = 's', long, default_value = "count-desc")]
-        sort: String,
+        sort: TagSortArg,
         /// Read tag expressions from file (one per line, # comments)
         #[arg(short = 'e', long = "expressions")]
         expressions_file: Option<PathBuf>,
@@ -815,7 +970,7 @@ enum InspectCommand {
         expressions: Vec<String>,
         /// Filter by element type: node, way, or relation
         #[arg(short = 't', long = "type", value_parser = parse_single_type)]
-        type_filter: Option<String>,
+        type_filter: Option<TypeFilter>,
         /// Parallel worker threads. `1` forces sequential, `0` auto-picks
         /// from `available_parallelism()`, higher values cap the worker
         /// pool.
@@ -918,7 +1073,7 @@ fn main() -> process::ExitCode {
                     run_merge_pbf(
                         &files,
                         &output.output,
-                        &compression.compression,
+                        compression.compression,
                         io.direct_io,
                         uring.io_uring,
                         force.force,
@@ -931,9 +1086,9 @@ fn main() -> process::ExitCode {
                     run_cat(
                         &files,
                         &output.output,
-                        type_filter.as_deref(),
-                        &clean,
-                        &compression.compression,
+                        type_filter,
+                        &clean_attrs(&clean),
+                        compression.compression,
                         io.direct_io,
                         force.force,
                         &overrides,
@@ -951,7 +1106,7 @@ fn main() -> process::ExitCode {
             } => run_sort(
                 &file,
                 &output.output,
-                &compression.compression,
+                compression.compression,
                 io.direct_io,
                 uring.io_uring,
                 force.force,
@@ -970,7 +1125,7 @@ fn main() -> process::ExitCode {
                 &file,
                 &output.output,
                 elements_per_blob,
-                &compression.compression,
+                compression.compression,
                 io.direct_io,
                 uring.io_uring,
                 force.force,
@@ -1004,7 +1159,7 @@ fn main() -> process::ExitCode {
                 drop_ids,
                 block_cap,
                 force,
-                &compression.compression,
+                compression.compression,
                 io.direct_io,
                 uring.io_uring,
                 &HeaderOverrides::parse(header.generator, &header.output_headers)?,
@@ -1020,7 +1175,7 @@ fn main() -> process::ExitCode {
                 &file,
                 &output.output,
                 &start_id,
-                &compression.compression,
+                compression.compression,
                 io.direct_io,
                 &HeaderOverrides::parse(header.generator, &header.output_headers)?,
             ),
@@ -1067,7 +1222,7 @@ fn main() -> process::ExitCode {
                     omit_referenced,
                     invert_match,
                     remove_tags,
-                    &compression.compression,
+                    compression.compression,
                     io.direct_io,
                     force.force,
                     jobs,
@@ -1153,7 +1308,7 @@ fn main() -> process::ExitCode {
                         osmium_summary,
                         quiet,
                         output.as_deref(),
-                        type_filter.as_deref(),
+                        type_filter,
                         jobs,
                         io.direct_io,
                     )
@@ -1183,7 +1338,7 @@ fn main() -> process::ExitCode {
                         id_osm_file.as_deref(),
                         default_type,
                         &ids,
-                        &compression.compression,
+                        compression.compression,
                         io.direct_io,
                         force.force,
                         &HeaderOverrides::parse(header.generator, &header.output_headers)?,
@@ -1199,7 +1354,7 @@ fn main() -> process::ExitCode {
                         id_osm_file.as_deref(),
                         default_type,
                         &ids,
-                        &compression.compression,
+                        compression.compression,
                         io.direct_io,
                         force.force,
                         &HeaderOverrides::parse(header.generator, &header.output_headers)?,
@@ -1226,7 +1381,7 @@ fn main() -> process::ExitCode {
                 id_osm_file.as_deref(),
                 default_type,
                 &ids,
-                &compression.compression,
+                compression.compression,
                 io.direct_io,
                 &HeaderOverrides::parse(header.generator, &header.output_headers)?,
                 full_scan_min_blobs,
@@ -1255,8 +1410,8 @@ fn main() -> process::ExitCode {
                         directory.as_deref(),
                         extract_strategy(simple, smart),
                         set_bounds,
-                        &clean,
-                        &compression.compression,
+                        &clean_attrs(&clean),
+                        compression.compression,
                         io.direct_io,
                         force.force,
                         &overrides,
@@ -1269,8 +1424,8 @@ fn main() -> process::ExitCode {
                         polygon.as_deref(),
                         extract_strategy(simple, smart),
                         set_bounds,
-                        &clean,
-                        &compression.compression,
+                        &clean_attrs(&clean),
+                        compression.compression,
                         io.direct_io,
                         force.force,
                         &overrides,
@@ -1293,9 +1448,9 @@ fn main() -> process::ExitCode {
                 &file,
                 &output.output,
                 keep_untagged_nodes,
-                &index_type,
+                index_type.resolve()?,
                 inject_prepass,
-                &compression.compression,
+                compression.compression,
                 io.direct_io,
                 force.force,
                 &HeaderOverrides::parse(header.generator, &header.output_headers)?,
@@ -1311,7 +1466,7 @@ fn main() -> process::ExitCode {
                 &file,
                 &output.output,
                 &timestamp,
-                &compression.compression,
+                compression.compression,
                 io.direct_io,
                 &HeaderOverrides::parse(header.generator, &header.output_headers)?,
             ),
@@ -1349,10 +1504,10 @@ fn main() -> process::ExitCode {
                         &tags_file,
                         min_count,
                         max_count,
-                        &sort,
+                        sort.into(),
                         expressions_file.as_deref(),
                         &expressions,
-                        type_filter.as_deref(),
+                        type_filter,
                         tags_jobs,
                         tags_io.direct_io,
                         tags_force.force,
@@ -1375,7 +1530,7 @@ fn main() -> process::ExitCode {
                         get.as_deref(),
                         json,
                         io.direct_io,
-                        force.force,
+                        force,
                     )
                 }
             }
@@ -1394,7 +1549,7 @@ fn main() -> process::ExitCode {
                 &base,
                 &changes,
                 &output.output,
-                &compression.compression,
+                compression.compression,
                 io.direct_io,
                 uring.io_uring,
                 force.force,
@@ -1427,7 +1582,7 @@ fn main() -> process::ExitCode {
                 check_relations,
                 show_ids,
                 full,
-                type_filter.as_deref(),
+                type_filter,
                 max_errors,
                 json,
                 quiet,
@@ -1456,19 +1611,19 @@ fn main() -> process::ExitCode {
                 io.direct_io,
                 force.force,
             ),
-            Command::BenchRead { file, mode } => run_bench_read(&file, &mode),
+            Command::BenchRead { file, mode } => run_bench_read(&file, mode),
             Command::BenchWrite {
                 file,
                 compression,
                 writer,
-            } => run_bench_write(&file, &compression, &writer),
+            } => run_bench_write(&file, compression, writer),
             Command::BenchMerge {
                 base,
                 changes,
                 output,
                 compression,
                 io_mode,
-            } => run_bench_merge(&base, &changes, &output.output, &compression, &io_mode),
+            } => run_bench_merge(&base, &changes, &output.output, compression, io_mode),
         }
     })();
 
@@ -1478,10 +1633,10 @@ fn main() -> process::ExitCode {
             if let Some(exit) = e.downcast_ref::<ExitWithCode>() {
                 // Silent exit with a specific code (e.g. `diff` found
                 // differences). Not an error worth printing.
-                process::ExitCode::from(exit.0)
+                process::ExitCode::from(exit.0.code())
             } else {
                 eprintln!("Error: {e}");
-                process::ExitCode::FAILURE
+                process::ExitCode::from(ExitStatus::Failed.code())
             }
         }
     }
@@ -1540,7 +1695,7 @@ fn run_check(
     check_relations: bool,
     show_ids: bool,
     full: bool,
-    type_filter: Option<&str>,
+    type_filter: Option<TypeFilter>,
     max_errors: usize,
     json: bool,
     quiet: bool,
@@ -1708,35 +1863,24 @@ fn run_check(
     }
 
     if failed {
-        return Err(Box::new(ExitWithCode(1)));
+        return Err(Box::new(ExitWithCode(ExitStatus::AnswerNegative)));
     }
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn run_tags_count(
     path: &std::path::Path,
     min_count: u64,
     max_count: Option<u64>,
-    sort_str: &str,
+    sort: TagCountSort,
     expressions_file: Option<&std::path::Path>,
     expressions: &[String],
-    type_filter: Option<&str>,
+    type_filter: Option<TypeFilter>,
     jobs: usize,
     direct_io: bool,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let sort = match sort_str {
-        "count-desc" | "count" => pbfhogg::tags_count::TagCountSort::CountDesc,
-        "count-asc" => pbfhogg::tags_count::TagCountSort::CountAsc,
-        "name-asc" | "name" => pbfhogg::tags_count::TagCountSort::NameAsc,
-        "name-desc" => pbfhogg::tags_count::TagCountSort::NameDesc,
-        _ => return Err(format!(
-            "unknown sort order: {sort_str} (expected count-desc, count-asc, name-asc, name-desc)"
-        )
-        .into()),
-    };
     let all_expressions = combine_expressions(expressions_file, expressions)?;
     let opts = pbfhogg::tags_count::TagCountOptions {
         min_count,
@@ -1758,44 +1902,23 @@ fn run_tags_count(
     Ok(())
 }
 
-fn parse_clean_attrs(
-    attrs: &[String],
-) -> Result<pbfhogg::cat::CleanAttrs, Box<dyn std::error::Error>> {
-    let mut clean = pbfhogg::cat::CleanAttrs::default();
-    for attr in attrs {
-        match attr.as_str() {
-            "version" => clean.version = true,
-            "changeset" => clean.changeset = true,
-            "timestamp" => clean.timestamp = true,
-            "uid" => clean.uid = true,
-            "user" => clean.user = true,
-            other => return Err(format!(
-                "unknown clean attribute: {other} (expected version, changeset, timestamp, uid, user)"
-            ).into()),
-        }
-    }
-    Ok(clean)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn run_cat(
     files: &[PathBuf],
     output: &std::path::Path,
-    type_filter: Option<&str>,
-    clean_attrs: &[String],
-    compression: &str,
+    type_filter: Option<TypeFilter>,
+    clean: &CleanAttrs,
+    compression: Compression,
     direct_io: bool,
     force: bool,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let compression: Compression = compression.parse()?;
-    let clean = parse_clean_attrs(clean_attrs)?;
     let paths: Vec<&std::path::Path> = files.iter().map(AsRef::as_ref).collect();
     let stats = pbfhogg::cat::cat(
         &paths,
         output,
         type_filter,
-        &clean,
+        clean,
         compression,
         direct_io,
         force,
@@ -1808,13 +1931,12 @@ fn run_cat(
 fn run_sort(
     file: &std::path::Path,
     output: &std::path::Path,
-    compression: &str,
+    compression: Compression,
     direct_io: bool,
     io_uring: bool,
     force: bool,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let compression: Compression = compression.parse()?;
     let opts = pbfhogg::sort::SortOptions {
         compression,
         direct_io,
@@ -1831,13 +1953,12 @@ fn run_repack(
     file: &std::path::Path,
     output: &std::path::Path,
     elements_per_blob: usize,
-    compression: &str,
+    compression: Compression,
     direct_io: bool,
     io_uring: bool,
     force: bool,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let compression: Compression = compression.parse()?;
     let stats = pbfhogg::repack::repack(
         file,
         output,
@@ -1865,12 +1986,11 @@ fn run_degrade(
     drop_ids: Option<String>,
     block_cap: usize,
     force: bool,
-    compression: &str,
+    compression: Compression,
     direct_io: bool,
     io_uring: bool,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let compression: Compression = compression.parse()?;
     let drop_spec = drop_ids
         .as_deref()
         .map(pbfhogg::degrade::DropSpec::parse)
@@ -1904,11 +2024,10 @@ fn run_renumber(
     file: &std::path::Path,
     output: &std::path::Path,
     start_id: &str,
-    compression: &str,
+    compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let compression: Compression = compression.parse()?;
     let parts: Vec<&str> = start_id.split(',').collect();
     let opts =
         match parts.len() {
@@ -1969,13 +2088,12 @@ fn run_tags_filter(
     omit_referenced: bool,
     invert_match: bool,
     remove_tags: bool,
-    compression: &str,
+    compression: Compression,
     direct_io: bool,
     force: bool,
     jobs: usize,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let compression: Compression = compression.parse()?;
     let all_expressions = combine_expressions(expressions_file, expressions)?;
     if all_expressions.is_empty() {
         return Err("no filter expressions provided (use positional args or -e FILE)".into());
@@ -2154,9 +2272,20 @@ fn run_export_to<W: std::io::Write>(
     writer: W,
     options: &pbfhogg::export::ExportOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stats = pbfhogg::export::export(file, writer, options)?;
+    let stats = pbfhogg::export::export(file, writer, options).map_err(export_error)?;
     stats.print_summary();
     Ok(())
+}
+
+/// The library reports a missing header feature without naming any CLI
+/// flag - a `Display` impl in a library has no idea which front end is
+/// reading it. Naming `--type node` is this binary's job, so the advice
+/// is attached here, where the flag actually exists.
+fn export_error(err: pbfhogg::Error) -> Box<dyn std::error::Error> {
+    if matches!(err.kind(), pbfhogg::ErrorKind::MissingFeature(f) if *f == "LocationsOnWays") {
+        return format!("{err}; use --type node to export nodes only").into();
+    }
+    Box::new(err)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2234,7 +2363,7 @@ fn resolve_ids(
         let pbf_ids = pbfhogg::getid::parse_ids_from_pbf(path, direct_io)?;
         pbfhogg::getid::merge_id_sets(&mut id_set, &pbf_ids);
     }
-    if !id_set.node_ids.has_any() && !id_set.way_ids.has_any() && !id_set.relation_ids.has_any() {
+    if id_set.is_empty() {
         return Err("no IDs specified (use positional args, -i FILE, or -I OSM-FILE)".into());
     }
     Ok(id_set)
@@ -2265,14 +2394,12 @@ fn print_requested_ids(ids: &pbfhogg::getid::ElementIds) {
     }
 }
 
-fn print_missing_ids(
-    output: &std::path::Path,
-    requested: &pbfhogg::getid::ElementIds,
-    direct_io: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Scan the output PBF to find which requested IDs are present.
-    let found = pbfhogg::getid::parse_ids_from_pbf(output, direct_io)?;
-
+/// Report the requested IDs that never made it into the output.
+///
+/// `found` comes from `getid`'s own write path. This used to decode the
+/// finished output PBF a second time, which roughly doubled the
+/// command's runtime at planet scale for what is only a diagnostic.
+fn print_missing_ids(requested: &pbfhogg::getid::ElementIds, found: &pbfhogg::getid::ElementIds) {
     let missing_nodes: Vec<_> = requested
         .node_ids
         .iter()
@@ -2304,7 +2431,6 @@ fn print_missing_ids(
             eprintln!("  r{id}");
         }
     }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2316,7 +2442,7 @@ fn run_diff(
     osmium_summary: bool,
     quiet: bool,
     output_path: Option<&std::path::Path>,
-    type_filter: Option<&str>,
+    type_filter: Option<TypeFilter>,
     jobs: usize,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2334,7 +2460,7 @@ fn run_diff(
         suppress_common,
         verbose,
         summary: osmium_summary,
-        type_filter: type_filter.map(String::from),
+        type_filter,
         jobs: jobs_resolved,
     };
     let stats = if quiet {
@@ -2358,7 +2484,7 @@ fn run_diff(
         }
     }
     if stats.has_differences() {
-        return Err(Box::new(ExitWithCode(1)));
+        return Err(Box::new(ExitWithCode(ExitStatus::AnswerNegative)));
     }
     Ok(())
 }
@@ -2404,12 +2530,11 @@ fn run_getid(
     id_osm_file: Option<&std::path::Path>,
     default_type: Option<DefaultTypeArg>,
     ids: &[String],
-    compression: &str,
+    compression: Compression,
     direct_io: bool,
     force: bool,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let compression: Compression = compression.parse()?;
     let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, direct_io)?;
 
     if remove_tags && !add_referenced {
@@ -2425,6 +2550,7 @@ fn run_getid(
     let opts = pbfhogg::getid::GetidOptions {
         add_referenced,
         remove_tags,
+        report_found: verbose_ids,
     };
     let stats = pbfhogg::getid::getid(
         file,
@@ -2438,8 +2564,8 @@ fn run_getid(
     )?;
     stats.print_summary();
 
-    if verbose_ids {
-        print_missing_ids(output, &id_set, direct_io)?;
+    if let Some(found) = stats.found.as_ref() {
+        print_missing_ids(&id_set, found);
     }
 
     Ok(())
@@ -2454,12 +2580,11 @@ fn run_getparents(
     id_osm_file: Option<&std::path::Path>,
     default_type: Option<DefaultTypeArg>,
     ids: &[String],
-    compression: &str,
+    compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
     full_scan_min_blobs: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let compression: Compression = compression.parse()?;
     let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, direct_io)?;
     let opts = pbfhogg::getparents::GetparentsOptions { add_self };
     let stats = if let Some(min_blobs) = full_scan_min_blobs {
@@ -2496,12 +2621,11 @@ fn run_removeid(
     id_osm_file: Option<&std::path::Path>,
     default_type: Option<DefaultTypeArg>,
     ids: &[String],
-    compression: &str,
+    compression: Compression,
     direct_io: bool,
     force: bool,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let compression: Compression = compression.parse()?;
     let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, direct_io)?;
     let stats = pbfhogg::getid::removeid(
         file,
@@ -2534,14 +2658,12 @@ fn run_extract(
     polygon_path: Option<&std::path::Path>,
     strategy: pbfhogg::extract::ExtractStrategy,
     set_bounds: bool,
-    clean_attrs: &[String],
-    compression: &str,
+    clean: &CleanAttrs,
+    compression: Compression,
     direct_io: bool,
     force: bool,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let compression: Compression = compression.parse()?;
-    let clean = parse_clean_attrs(clean_attrs)?;
     let region = match (bbox_str, polygon_path) {
         (Some(s), None) => {
             let bbox = pbfhogg::extract::parse_bbox(s)?;
@@ -2557,7 +2679,7 @@ fn run_extract(
         &region,
         strategy,
         set_bounds,
-        &clean,
+        clean,
         compression,
         direct_io,
         force,
@@ -2574,14 +2696,12 @@ fn run_extract_config(
     directory_override: Option<&std::path::Path>,
     strategy: pbfhogg::extract::ExtractStrategy,
     set_bounds: bool,
-    clean_attrs: &[String],
-    compression: &str,
+    clean: &CleanAttrs,
+    compression: Compression,
     direct_io: bool,
     force: bool,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let compression: Compression = compression.parse()?;
-    let clean = parse_clean_attrs(clean_attrs)?;
     let (config_dir, mut slots) = pbfhogg::extract::parse_extract_config(config_path)?;
 
     // If -d/--directory is given on CLI, override the config's directory
@@ -2624,7 +2744,7 @@ fn run_extract_config(
         &slots,
         strategy,
         set_bounds,
-        &clean,
+        clean,
         compression,
         direct_io,
         force,
@@ -2638,20 +2758,17 @@ fn run_extract_config(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn run_add_locations_to_ways(
     file: &std::path::Path,
     output: &std::path::Path,
     keep_untagged_nodes: bool,
-    index_type: &str,
+    index_type: IndexType,
     inject_prepass: bool,
-    compression: &str,
+    compression: Compression,
     direct_io: bool,
     force: bool,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let compression: Compression = compression.parse()?;
-    let index_type: pbfhogg::altw::IndexType = index_type.parse()?;
     let options = pbfhogg::altw::AltwOptions {
         keep_untagged_nodes,
         compression,
@@ -2669,11 +2786,10 @@ fn run_time_filter(
     file: &std::path::Path,
     output: &std::path::Path,
     timestamp: &str,
-    compression: &str,
+    compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let compression: Compression = compression.parse()?;
     let cutoff = parse_timestamp(timestamp)?;
     let stats =
         pbfhogg::time_filter::time_filter(file, output, cutoff, compression, direct_io, overrides)?;
@@ -2698,7 +2814,7 @@ fn run_show_element(
     let found = pbfhogg::inspect::show_element(path, elem_type, id, direct_io)?;
     if !found {
         eprintln!("Element not found: {spec}");
-        return Err(Box::new(ExitWithCode(1)));
+        return Err(Box::new(ExitWithCode(ExitStatus::AnswerNegative)));
     }
     Ok(())
 }
@@ -2774,7 +2890,7 @@ fn run_inspect(
             println!("Indexed: no");
         }
         if !has_index {
-            return Err(Box::new(ExitWithCode(1)));
+            return Err(Box::new(ExitWithCode(ExitStatus::AnswerNegative)));
         }
         return Ok(());
     }
@@ -2905,7 +3021,7 @@ fn run_inspect(
     }
 
     if exit_not_indexed {
-        return Err(Box::new(ExitWithCode(1)));
+        return Err(Box::new(ExitWithCode(ExitStatus::AnswerNegative)));
     }
     Ok(())
 }
@@ -2915,7 +3031,7 @@ fn run_apply_changes(
     base: &std::path::Path,
     changes: &std::path::Path,
     output: &std::path::Path,
-    compression: &str,
+    compression: Compression,
     direct_io: bool,
     io_uring: bool,
     force: bool,
@@ -2923,7 +3039,6 @@ fn run_apply_changes(
     jobs: usize,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let compression: Compression = compression.parse()?;
     let opts = pbfhogg::apply_changes::MergeOptions {
         compression,
         direct_io,
@@ -2942,13 +3057,12 @@ fn run_apply_changes(
 fn run_merge_pbf(
     inputs: &[PathBuf],
     output: &std::path::Path,
-    compression: &str,
+    compression: Compression,
     direct_io: bool,
     io_uring: bool,
     force: bool,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let compression: Compression = compression.parse()?;
     let paths: Vec<&std::path::Path> = inputs.iter().map(AsRef::as_ref).collect();
     let opts = pbfhogg::cat::dedupe::MergePbfOptions {
         compression,
@@ -2974,87 +3088,85 @@ fn run_merge_changes(
     Ok(())
 }
 
-fn run_bench_read(path: &std::path::Path, mode: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn run_bench_read(
+    path: &std::path::Path,
+    mode: BenchReadMode,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::time::Instant;
 
-    let (elapsed_ms, nodes, ways, rels): (u128, u64, u64, u64) =
-        match mode {
-            "sequential" => {
-                let reader = pbfhogg::ElementReader::from_path(path)?;
-                let mut nodes = 0u64;
-                let mut ways = 0u64;
-                let mut rels = 0u64;
-                let start = Instant::now();
-                reader.for_each(|el| match el {
-                    pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => nodes += 1,
-                    pbfhogg::Element::Way(_) => ways += 1,
-                    pbfhogg::Element::Relation(_) => rels += 1,
-                    _ => {}
-                })?;
-                (start.elapsed().as_millis(), nodes, ways, rels)
-            }
-            "parallel" => {
-                let reader = pbfhogg::ElementReader::from_path(path)?;
-                let start = Instant::now();
-                let (nodes, ways, rels) = reader.par_map_reduce(
-                    |el| match el {
-                        pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => {
-                            (1u64, 0u64, 0u64)
-                        }
-                        pbfhogg::Element::Way(_) => (0, 1, 0),
-                        pbfhogg::Element::Relation(_) => (0, 0, 1),
-                        _ => (0, 0, 0),
-                    },
-                    || (0, 0, 0),
-                    |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
-                )?;
-                (start.elapsed().as_millis(), nodes, ways, rels)
-            }
-            "pipelined" => {
-                let reader = pbfhogg::ElementReader::from_path(path)?;
-                let mut nodes = 0u64;
-                let mut ways = 0u64;
-                let mut rels = 0u64;
-                let start = Instant::now();
-                reader.for_each_pipelined(|el| match el {
-                    pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => nodes += 1,
-                    pbfhogg::Element::Way(_) => ways += 1,
-                    pbfhogg::Element::Relation(_) => rels += 1,
-                    _ => {}
-                })?;
-                (start.elapsed().as_millis(), nodes, ways, rels)
-            }
-            "blobreader" => {
-                // Route through the library's buffered path (256 KiB FileReader)
-                // so this arm measures decode architecture, not the syscall
-                // overhead of a default 8 KiB BufReader.
-                let reader = pbfhogg::BlobReader::from_path(path)?;
-                let mut nodes = 0u64;
-                let mut ways = 0u64;
-                let mut rels = 0u64;
-                let start = Instant::now();
-                for blob_result in reader {
-                    let blob = blob_result?;
-                    if let pbfhogg::BlobDecode::OsmData(block) = blob.decode()? {
-                        for el in block.elements() {
-                            match el {
-                                pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => {
-                                    nodes += 1;
-                                }
-                                pbfhogg::Element::Way(_) => ways += 1,
-                                pbfhogg::Element::Relation(_) => rels += 1,
-                                _ => {}
+    let (elapsed_ms, nodes, ways, rels): (u128, u64, u64, u64) = match mode {
+        BenchReadMode::Sequential => {
+            let reader = pbfhogg::ElementReader::from_path(path)?;
+            let mut nodes = 0u64;
+            let mut ways = 0u64;
+            let mut rels = 0u64;
+            let start = Instant::now();
+            reader.for_each(|el| match el {
+                pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => nodes += 1,
+                pbfhogg::Element::Way(_) => ways += 1,
+                pbfhogg::Element::Relation(_) => rels += 1,
+                _ => {}
+            })?;
+            (start.elapsed().as_millis(), nodes, ways, rels)
+        }
+        BenchReadMode::Parallel => {
+            let reader = pbfhogg::ElementReader::from_path(path)?;
+            let start = Instant::now();
+            let (nodes, ways, rels) = reader.par_map_reduce(
+                |el| match el {
+                    pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => {
+                        (1u64, 0u64, 0u64)
+                    }
+                    pbfhogg::Element::Way(_) => (0, 1, 0),
+                    pbfhogg::Element::Relation(_) => (0, 0, 1),
+                    _ => (0, 0, 0),
+                },
+                || (0, 0, 0),
+                |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
+            )?;
+            (start.elapsed().as_millis(), nodes, ways, rels)
+        }
+        BenchReadMode::Pipelined => {
+            let reader = pbfhogg::ElementReader::from_path(path)?;
+            let mut nodes = 0u64;
+            let mut ways = 0u64;
+            let mut rels = 0u64;
+            let start = Instant::now();
+            reader.for_each_pipelined(|el| match el {
+                pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => nodes += 1,
+                pbfhogg::Element::Way(_) => ways += 1,
+                pbfhogg::Element::Relation(_) => rels += 1,
+                _ => {}
+            })?;
+            (start.elapsed().as_millis(), nodes, ways, rels)
+        }
+        BenchReadMode::Blobreader => {
+            // Route through the library's buffered path (256 KiB FileReader)
+            // so this arm measures decode architecture, not the syscall
+            // overhead of a default 8 KiB BufReader.
+            let reader = pbfhogg::BlobReader::from_path(path)?;
+            let mut nodes = 0u64;
+            let mut ways = 0u64;
+            let mut rels = 0u64;
+            let start = Instant::now();
+            for blob_result in reader {
+                let blob = blob_result?;
+                if let pbfhogg::BlobDecode::OsmData(block) = blob.decode()? {
+                    for el in block.elements() {
+                        match el {
+                            pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => {
+                                nodes += 1;
                             }
+                            pbfhogg::Element::Way(_) => ways += 1,
+                            pbfhogg::Element::Relation(_) => rels += 1,
+                            _ => {}
                         }
                     }
                 }
-                (start.elapsed().as_millis(), nodes, ways, rels)
             }
-            other => return Err(format!(
-                "unknown read mode: {other} (expected: sequential, parallel, pipelined, blobreader)"
-            )
-            .into()),
-        };
+            (start.elapsed().as_millis(), nodes, ways, rels)
+        }
+    };
 
     eprintln!("elapsed_ms={elapsed_ms}");
     eprintln!("nodes={nodes}");
@@ -3146,17 +3258,16 @@ fn bench_write_loop<W: std::io::Write>(
 
 fn run_bench_write(
     path: &std::path::Path,
-    compression: &str,
-    writer_mode: &str,
+    compression: Compression,
+    writer_mode: BenchWriterMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use pbfhogg::block_builder::HeaderBuilder;
     use std::time::Instant;
 
-    let compression: Compression = compression.parse()?;
     let header_bytes = HeaderBuilder::new().build()?;
 
     let (elapsed_ms, nodes, ways, rels) = match writer_mode {
-        "sync" => {
+        BenchWriterMode::Sync => {
             let file = std::fs::File::create("/dev/null")?;
             let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
             let mut writer = pbfhogg::writer::PbfWriter::new(buf, compression);
@@ -3166,7 +3277,7 @@ fn run_bench_write(
             let elapsed_ms = start.elapsed().as_millis();
             (elapsed_ms, nodes, ways, rels)
         }
-        "pipelined" => {
+        BenchWriterMode::Pipelined => {
             let mut writer = pbfhogg::writer::PbfWriter::to_path(
                 std::path::Path::new("/dev/null"),
                 compression,
@@ -3177,9 +3288,6 @@ fn run_bench_write(
             drop(writer);
             let elapsed_ms = start.elapsed().as_millis();
             (elapsed_ms, nodes, ways, rels)
-        }
-        other => {
-            return Err(format!("unknown writer mode: {other} (expected: sync, pipelined)").into());
         }
     };
 
@@ -3215,19 +3323,12 @@ fn run_bench_merge(
     base: &std::path::Path,
     changes: &std::path::Path,
     output: &std::path::Path,
-    compression: &str,
-    io_mode: &str,
+    compression: Compression,
+    io_mode: BenchIoMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::time::Instant;
 
-    let compression: Compression = compression.parse()?;
-    let io_uring = match io_mode {
-        "buffered" => false,
-        "uring" => true,
-        other => {
-            return Err(format!("unknown I/O mode: {other} (expected: buffered, uring)").into());
-        }
-    };
+    let io_uring = matches!(io_mode, BenchIoMode::Uring);
 
     drop(std::fs::remove_file(output));
 

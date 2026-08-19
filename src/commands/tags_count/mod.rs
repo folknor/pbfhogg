@@ -39,7 +39,7 @@ pub struct TagCountOptions<'a> {
     pub max_count: Option<u64>,
     pub sort: TagCountSort,
     pub expressions: &'a [String],
-    pub type_filter: Option<&'a str>,
+    pub type_filter: Option<TypeFilter>,
     pub direct_io: bool,
     pub force: bool,
     /// Parallel worker count. `0` picks from `available_parallelism()`;
@@ -49,8 +49,8 @@ pub struct TagCountOptions<'a> {
 
 /// Count tag key=value frequencies in a PBF file.
 ///
-/// If `type_filter` is set, only count tags on elements of that type
-/// ("node", "way", or "relation"). Results are sorted by count descending,
+/// If `type_filter` is set, only count tags on elements of those types.
+/// Results are sorted by count descending,
 /// then by key, then by value. Entries below `min_count` are excluded.
 ///
 /// If `expressions` is non-empty, only tags matching at least one
@@ -83,13 +83,10 @@ pub fn tags_count(path: &Path, opts: &TagCountOptions<'_>) -> Result<Vec<TagCoun
         Some(parse_expressions(opts.expressions)?)
     };
 
-    let tf = TypeFilter::from_single(opts.type_filter);
-    let kind_filter = match opts.type_filter {
-        Some("node") => Some(crate::blob_meta::ElemKind::Node),
-        Some("way") => Some(crate::blob_meta::ElemKind::Way),
-        Some("relation") => Some(crate::blob_meta::ElemKind::Relation),
-        _ => None,
-    };
+    let tf = TypeFilter::or_all(opts.type_filter);
+    // Narrow the blob schedule only when the filter names exactly one
+    // kind; a two-kind filter still has to visit both kinds' blobs.
+    let kind_filter = tf.single_kind();
 
     crate::debug::emit_marker("TAGSCOUNT_START");
 

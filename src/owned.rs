@@ -15,16 +15,22 @@ pub(crate) use crate::osc::write::OwnedMember;
 // ---------------------------------------------------------------------------
 
 /// Boolean filter for which element types to include.
+///
+/// This is the parsed form of every command's `--type` argument. It is
+/// public so callers parse the user's string exactly once, at their own
+/// argument boundary, and hand the library a value that cannot be
+/// misspelled: no command option takes an unvalidated type string.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TypeFilter {
-    pub(crate) nodes: bool,
-    pub(crate) ways: bool,
-    pub(crate) relations: bool,
+pub struct TypeFilter {
+    pub nodes: bool,
+    pub ways: bool,
+    pub relations: bool,
 }
 
 impl TypeFilter {
     /// All types included.
-    pub(crate) fn all() -> Self {
+    #[must_use]
+    pub fn all() -> Self {
         Self {
             nodes: true,
             ways: true,
@@ -32,40 +38,98 @@ impl TypeFilter {
         }
     }
 
-    /// Parse a comma-separated type list (e.g. "node,way,relation").
-    pub(crate) fn parse(s: &str) -> Self {
+    /// No types included.
+    #[must_use]
+    pub fn none() -> Self {
         Self {
-            nodes: s.split(',').any(|t| t.trim() == "node"),
-            ways: s.split(',').any(|t| t.trim() == "way"),
-            relations: s.split(',').any(|t| t.trim() == "relation"),
+            nodes: false,
+            ways: false,
+            relations: false,
         }
     }
 
-    /// Single type filter, or all types if `None`.
-    pub(crate) fn from_single(s: Option<&str>) -> Self {
-        match s {
-            None => Self::all(),
-            Some("node") => Self {
-                nodes: true,
-                ways: false,
-                relations: false,
-            },
-            Some("way") => Self {
-                nodes: false,
-                ways: true,
-                relations: false,
-            },
-            Some("relation") => Self {
-                nodes: false,
-                ways: false,
-                relations: true,
-            },
-            Some(_) => Self {
-                nodes: false,
-                ways: false,
-                relations: false,
-            },
+    /// How many of the three element types this filter admits.
+    #[must_use]
+    pub fn count(self) -> usize {
+        usize::from(self.nodes) + usize::from(self.ways) + usize::from(self.relations)
+    }
+
+    /// The filter's sole element kind, when it admits exactly one.
+    /// Drives the blob-level classify schedule.
+    pub(crate) fn single_kind(self) -> Option<crate::blob_meta::ElemKind> {
+        match (self.nodes, self.ways, self.relations) {
+            (true, false, false) => Some(crate::blob_meta::ElemKind::Node),
+            (false, true, false) => Some(crate::blob_meta::ElemKind::Way),
+            (false, false, true) => Some(crate::blob_meta::ElemKind::Relation),
+            _ => None,
         }
+    }
+
+    /// The given filter, or all types if `None`.
+    #[must_use]
+    pub fn or_all(filter: Option<Self>) -> Self {
+        filter.unwrap_or_else(Self::all)
+    }
+}
+
+/// Parse error for [`TypeFilter`] strings.
+#[derive(Debug, Clone)]
+pub struct ParseTypeFilterError(String);
+
+impl std::fmt::Display for ParseTypeFilterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ParseTypeFilterError {}
+
+impl std::str::FromStr for TypeFilter {
+    type Err = ParseTypeFilterError;
+
+    /// Parse a comma-separated element-type list. Unknown types and an
+    /// empty list are errors - a `--type` the user misspelled must not
+    /// quietly become "match nothing".
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        if s.is_empty() {
+            return Err(ParseTypeFilterError(
+                "type filter must not be empty".to_string(),
+            ));
+        }
+        let mut filter = Self::none();
+        for kind in s.split(',') {
+            match kind.trim() {
+                "node" => filter.nodes = true,
+                "way" => filter.ways = true,
+                "relation" => filter.relations = true,
+                other => {
+                    return Err(ParseTypeFilterError(format!(
+                        "invalid element type '{other}' (expected node, way, or relation)"
+                    )));
+                }
+            }
+        }
+        Ok(filter)
+    }
+}
+
+impl std::fmt::Display for TypeFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut first = true;
+        for (on, name) in [
+            (self.nodes, "node"),
+            (self.ways, "way"),
+            (self.relations, "relation"),
+        ] {
+            if on {
+                if !first {
+                    f.write_str(",")?;
+                }
+                f.write_str(name)?;
+                first = false;
+            }
+        }
+        Ok(())
     }
 }
 

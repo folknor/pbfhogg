@@ -170,10 +170,18 @@ impl fmt::Display for Error {
             ErrorKind::MissingHeader => {
                 write!(f, "PBF file does not start with an OsmHeader blob")
             }
+            // No CLI flag names here. This is a library `Display` impl and
+            // it has no idea which front end is reading it; naming
+            // `--type node` made the library a dependency of the CLI's
+            // argument surface. The hint stays, phrased in terms of the
+            // file, so any caller can act on it.
             ErrorKind::MissingFeature(feature) => {
                 write!(f, "input PBF is missing required feature: {feature}")?;
                 if feature == "LocationsOnWays" {
-                    write!(f, "; use --type node or an altw input")?;
+                    write!(
+                        f,
+                        "; way geometry needs an input carrying inline way-node coordinates"
+                    )?;
                 }
                 Ok(())
             }

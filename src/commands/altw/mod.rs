@@ -97,11 +97,13 @@ impl FromStr for IndexType {
             "sparse" => Ok(Self::Sparse),
             "external" => Ok(Self::External),
             "auto" => Ok(Self::Auto),
+            // No CLI flag name here - this is a library parse error and
+            // the CLI carries its own copy of the advice.
             "dense" => Err(ParseIndexTypeError(
                 "index type 'dense' was removed in favor of 'sparse'. Sparse \
                  (rank-indexed flat) is faster than dense at every measured \
-                 scale and works in regimes dense doesn't. Use \
-                 --index-type sparse instead."
+                 scale and works in regimes dense doesn't. Use 'sparse' \
+                 instead."
                     .to_string(),
             )),
             _ => Err(ParseIndexTypeError(format!(

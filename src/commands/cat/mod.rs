@@ -60,15 +60,15 @@ impl CatStats {
 
 /// Concatenate one or more PBF files into a single output.
 ///
-/// If `type_filter` is set (comma-separated: "node", "way", "relation"),
-/// only elements of matching types are included (requires full decode).
-/// Without a filter, blobs are passed through as raw bytes (zero decode).
+/// If `type_filter` is set, only elements of matching types are included
+/// (requires full decode). Without a filter, blobs are passed through as
+/// raw bytes (zero decode).
 #[allow(clippy::too_many_arguments)]
 #[hotpath::measure]
 pub fn cat(
     files: &[&Path],
     output: &Path,
-    type_filter: Option<&str>,
+    type_filter: Option<TypeFilter>,
     clean: &CleanAttrs,
     compression: Compression,
     direct_io: bool,
@@ -93,7 +93,7 @@ pub fn cat(
         (None, true) => cat_filtered(
             files,
             output,
-            "node,way,relation",
+            TypeFilter::all(),
             clean,
             compression,
             direct_io,
@@ -223,12 +223,11 @@ fn cat_passthrough(
 fn cat_type_passthrough(
     files: &[&Path],
     output: &Path,
-    filter: &str,
+    tf: TypeFilter,
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<CatStats> {
-    let tf = TypeFilter::parse(filter);
     let single_file = files.len() == 1;
     let blob_filter = BlobFilter::new(tf.nodes, tf.ways, tf.relations);
 
@@ -441,13 +440,12 @@ use super::clean_metadata;
 fn cat_filtered(
     files: &[&Path],
     output: &Path,
-    filter: &str,
+    tf: TypeFilter,
     clean: &CleanAttrs,
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<CatStats> {
-    let tf = TypeFilter::parse(filter);
     let single_file = files.len() == 1;
 
     // Cap glibc arenas to prevent cross-thread alloc/free fragmentation

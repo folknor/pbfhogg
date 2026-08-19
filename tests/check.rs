@@ -1,3 +1,9 @@
+//! `check` command coverage.
+//!
+//! `pbfhogg::check` lives behind the `commands` feature, so this file
+//! compiles out of the no-features sweep rather than breaking it.
+#![cfg(feature = "commands")]
+
 mod common;
 
 use common::{TestMember, TestNode, TestRelation, TestWay, write_test_pbf_sorted};

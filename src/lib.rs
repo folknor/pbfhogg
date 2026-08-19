@@ -110,6 +110,15 @@ writer.flush()?;
 */
 
 #![recursion_limit = "1024"]
+// A no-`commands` build drops the geocode builder and the check / export /
+// extract commands, and with them the only consumers of several internals
+// (`scan::way`'s geocode tag scanning, `read::columnar`, `read::region_grid`,
+// `commands::drain_batch_results`, ...). Those items having no caller in that
+// configuration is the configuration working as intended, not dead code: the
+// `all` and `consumer` sweeps still build them with their consumers present
+// and still fail on genuinely unreachable code. Scoped to the library; the
+// binary is never built without `commands`.
+#![cfg_attr(not(feature = "commands"), allow(dead_code))]
 
 // Module tree
 pub(crate) mod blob_meta;
@@ -154,6 +163,7 @@ pub(crate) type BoxResult<T> = std::result::Result<T, Box<dyn std::error::Error>
 // Explicit re-exports: flat public API (`pbfhogg::Element`, `pbfhogg::BlobReader`, etc.)
 pub use blob_meta::{BlobBbox, BlobFilter};
 pub use error::{BlobError, Error, ErrorKind, Result};
+pub use owned::{ParseTypeFilterError, TypeFilter};
 pub use read::blob::{
     Blob, BlobDecode, BlobHeader, BlobReader, BlobReaderSource, BlobType, ByteOffset,
     MAX_BLOB_DATASIZE, MAX_BLOB_HEADER_SIZE, MAX_BLOB_MESSAGE_SIZE,

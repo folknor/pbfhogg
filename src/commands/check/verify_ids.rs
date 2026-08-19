@@ -12,13 +12,12 @@ use crate::owned::TypeFilter;
 // ---------------------------------------------------------------------------
 
 /// Configuration for the `verify_ids` command.
-pub struct VerifyIdsOptions<'a> {
+pub struct VerifyIdsOptions {
     /// When true, use `IdSet` per type to detect duplicate IDs.
     /// Increases memory usage but catches duplicates that monotonicity alone cannot.
     pub full: bool,
-    /// Filter by element type (comma-separated: "node", "way", "relation").
-    /// `None` means check all types.
-    pub type_filter: Option<&'a str>,
+    /// Restrict the check to these element types. `None` = all types.
+    pub type_filter: Option<TypeFilter>,
     /// Maximum number of violations to store in the report (capped for memory).
     pub max_errors: usize,
     /// Whether to use O_DIRECT for reading.
@@ -248,7 +247,7 @@ fn violation_to_json(v: &IdViolation) -> serde_json::Value {
 /// for `set_atomic_if_new` (workers panic on unallocated chunks). Total
 /// full-mode RSS at planet: ~1.8 GB.
 #[hotpath::measure]
-pub fn verify_ids(path: &Path, opts: &VerifyIdsOptions<'_>) -> Result<VerifyIdsReport> {
+pub fn verify_ids(path: &Path, opts: &VerifyIdsOptions) -> Result<VerifyIdsReport> {
     if opts.full {
         return verify_ids_full_parallel(path, opts);
     }
@@ -265,10 +264,7 @@ pub fn verify_ids(path: &Path, opts: &VerifyIdsOptions<'_>) -> Result<VerifyIdsR
 // translation step.
 
 #[allow(clippy::too_many_lines)]
-fn verify_ids_streaming_parallel(
-    path: &Path,
-    opts: &VerifyIdsOptions<'_>,
-) -> Result<VerifyIdsReport> {
+fn verify_ids_streaming_parallel(path: &Path, opts: &VerifyIdsOptions) -> Result<VerifyIdsReport> {
     use crate::Element;
 
     crate::debug::emit_marker("VERIFYIDS_SCAN_START");
@@ -287,9 +283,7 @@ fn verify_ids_streaming_parallel(
         .is_sorted();
     let indexed = crate::commands::has_indexdata(path, opts.direct_io)?;
 
-    let type_filter = opts
-        .type_filter
-        .map_or_else(TypeFilter::all, TypeFilter::parse);
+    let type_filter = TypeFilter::or_all(opts.type_filter);
 
     let (node_schedule, way_schedule, rel_schedule, shared_file) =
         crate::scan::classify::build_classify_schedules_split(path)?;
@@ -512,7 +506,7 @@ impl BlobVerifyResult {
 /// per-kind duplicates), so phase ordering is purely for phase-wall
 /// attribution in the sidecar.
 #[allow(clippy::too_many_lines)]
-fn verify_ids_full_parallel(path: &Path, opts: &VerifyIdsOptions<'_>) -> Result<VerifyIdsReport> {
+fn verify_ids_full_parallel(path: &Path, opts: &VerifyIdsOptions) -> Result<VerifyIdsReport> {
     use crate::Element;
 
     crate::debug::emit_marker("VERIFYIDS_SCAN_START");
@@ -533,9 +527,7 @@ fn verify_ids_full_parallel(path: &Path, opts: &VerifyIdsOptions<'_>) -> Result<
         .is_sorted();
     let indexed = crate::commands::has_indexdata(path, opts.direct_io)?;
 
-    let type_filter = opts
-        .type_filter
-        .map_or_else(TypeFilter::all, TypeFilter::parse);
+    let type_filter = TypeFilter::or_all(opts.type_filter);
 
     // Pre-allocate IdSets for the kinds we intend to verify.
     let mut node_ids = IdSet::new();

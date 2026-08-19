@@ -228,7 +228,7 @@ impl HeaderWalker {
     /// `Error::source_path` lie by omission on that path only, which is
     /// worse than never having had it.
     fn stamp(&self, err: crate::error::Error) -> crate::error::Error {
-        err.in_input(Some(&self.path), self.blob_index)
+        err.in_input(Some(&self.path), Some(self.blob_index))
     }
 
     /// Shared `Arc<File>` for worker threads to `pread` data bodies.

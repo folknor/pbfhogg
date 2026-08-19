@@ -118,13 +118,17 @@ impl Error {
     pub(crate) fn in_input(
         mut self,
         file: Option<&std::sync::Arc<std::path::Path>>,
-        blob: u64,
+        blob: Option<u64>,
     ) -> Error {
         // Stamped as a pair, never field by field: a file from one reader
         // and a blob index from another would read as a precise location
-        // and point nowhere.
-        if self.0.blob.is_none() {
-            self.0.blob = Some(blob);
+        // and point nowhere. Either field being present means an inner
+        // reader already stamped, so the whole pair is left alone - a
+        // reader that seeked away from the stream start has a file but no
+        // trustworthy blob count, and an outer stamp must not "complete"
+        // it with a count from a different stream.
+        if self.0.blob.is_none() && self.0.file.is_none() {
+            self.0.blob = blob;
             self.0.file = file.map(std::sync::Arc::clone);
         }
         self

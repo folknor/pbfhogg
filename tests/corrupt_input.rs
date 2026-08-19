@@ -188,6 +188,61 @@ fn truncated_header_data() {
     }
 }
 
+/// The blob index stamped onto a framing error counts sequential
+/// iteration from the stream start - and is dropped, not guessed, once a
+/// seek breaks that sequence. A stale count would name the wrong blob,
+/// which is worse than naming none; a rewind to offset 0 restarts the
+/// count because the sequence is genuinely restarting.
+#[test]
+fn blob_index_attribution_survives_iteration_but_not_seeks() {
+    let (data, _) = truncated_in_payload(3);
+
+    // The failing data blob's frame start, from the intact fixture.
+    let second_offset = {
+        let full = write_one_block_pbf();
+        let mut r = BlobReader::new_seekable(Cursor::new(full.as_slice())).unwrap();
+        let _ = r.next().unwrap().unwrap(); // header blob
+        r.next().unwrap().unwrap().offset().unwrap() // data blob
+    };
+    assert_ne!(second_offset.0, 0, "sanity: the data blob is not at 0");
+
+    // Sequential from the start: the failing data blob is blob 1.
+    let mut reader = BlobReader::new_seekable(Cursor::new(data.as_slice())).unwrap();
+    let _ = reader.next().unwrap().unwrap();
+    let err = reader.next().unwrap().unwrap_err();
+    assert_eq!(
+        err.blob_index(),
+        Some(1),
+        "sequential iteration must attribute the error to blob 1"
+    );
+
+    // Seek away from the start: the count is no longer knowable.
+    let mut reader = BlobReader::new_seekable(Cursor::new(data.as_slice())).unwrap();
+    reader.seek(second_offset).unwrap();
+    let err = reader.next().unwrap().unwrap_err();
+    assert_eq!(
+        err.blob_index(),
+        None,
+        "an error after a non-zero seek must not claim a blob index"
+    );
+    assert!(
+        err.byte_offset().is_some(),
+        "the byte offset is still known and must survive"
+    );
+
+    // Rewind to 0: sequential counting restarts from blob 0.
+    let mut reader = BlobReader::new_seekable(Cursor::new(data.as_slice())).unwrap();
+    let _ = reader.next().unwrap().unwrap();
+    reader.seek(pbfhogg::ByteOffset(0)).unwrap();
+    let _ = reader.next().unwrap().unwrap(); // header again, blob 0
+    let err = reader.next().unwrap().unwrap_err();
+    assert_eq!(
+        err.blob_index(),
+        Some(1),
+        "a rewind to the stream start restarts the count"
+    );
+}
+
 /// Valid header length with garbage bytes → wire-format parse error.
 #[test]
 fn garbage_header() {

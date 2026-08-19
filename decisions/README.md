@@ -143,6 +143,14 @@ The skeleton has exactly two sections. `Context`, `Consequences`, and
 - [ADR-0010](0010-geojson-export-format-and-area-heuristic.md) - GeoJSON
   export framing, identity properties, reserved-name precedence, area
   detection, and polygon validity rules.
+- [ADR-0011](0011-commands-feature-stays-partial.md) - The `commands`
+  feature gates optional dependencies and clearly optional surface, not
+  the command layer wholesale; the `minimal` check sweep keeps the
+  no-features build honest.
+- [ADR-0012](0012-cli-bridge-stays-doc-hidden.md) - The `doc(hidden)`
+  re-exports bridging `pbfhogg-cli` into the library stay as they are
+  until the 1.0 API freeze forces the `pbfhogg-commands` split or a
+  documented public command API.
 
 Numbering gaps are deliberate, per the never-reuse rule: 0001 was a
 transient process note retired at the 0.3.0 release (commit `30ca861`);

@@ -47,9 +47,17 @@
   `merge-changes` an offset alone did not say which input failed. New
   accessors `Error::source_path()` and `Error::blob_index()` expose them;
   both are `None` for readers built from a bare `Read`, which have no
-  path to report. Failing to open an input now names the path as well
+  path to report, and the blob index is only stamped while iteration is
+  sequential from the stream start - a seek away from offset 0 drops it
+  rather than reporting a count that no longer matches the position. Failing to open an input now names the path as well
   (`failed to open <path>: ...`) instead of a bare
   `No such file or directory (os error 2)`.
+
+- A dense node whose metadata carries an out-of-range user string index no
+  longer loses its entire metadata record. Version, timestamp, changeset,
+  uid and visibility are preserved and only the user name falls back to
+  empty, so a single bad string-table reference in an input no longer
+  strips authorship from the surrounding node on the way through.
 
 ### Breaking changes
 
@@ -139,14 +147,6 @@
   street level, and the search radii must be finite and non-negative. Values
   outside those ranges previously panicked in debug or produced a silently
   wrong index in release.
-
-### Fixed
-
-- A dense node whose metadata carries an out-of-range user string index no
-  longer loses its entire metadata record. Version, timestamp, changeset,
-  uid and visibility are preserved and only the user name falls back to
-  empty, so a single bad string-table reference in an input no longer
-  strips authorship from the surrounding node on the way through.
 
 ## 0.5.0 - 2026-07-16
 

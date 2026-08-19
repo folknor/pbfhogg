@@ -3135,6 +3135,53 @@ fn parse_element_spec(
     Ok((elem_type, id))
 }
 
+/// Which of `run_inspect`'s four execution shapes a flag combination
+/// resolves to, decided once up front.
+///
+/// The distinction is *alone vs combined*, and it is a live one: clap
+/// rejects `--show` alongside anything and `-j`/`--force` outside
+/// `--nodes`, but `--indexed --extended` and friends remain legal - a
+/// combined run does the full scan and folds the extra reports in, while
+/// a flag alone gets its fast path that skips the scan entirely.
+enum InspectMode<'a> {
+    /// `--indexed` alone: header probe only, no full inspect.
+    IndexedOnly,
+    /// `--nodes` alone: node stats only, no full inspect.
+    NodesOnly,
+    /// `--get` with a header/file key and nothing else: read just the
+    /// header blob.
+    HeaderGet(&'a str),
+    /// Everything else: full scan, with any requested extras folded in.
+    Full,
+}
+
+impl<'a> InspectMode<'a> {
+    fn resolve(flags: &InspectFlags, blocks: Option<usize>, get: Option<&'a str>) -> Self {
+        let scan_extras = flags.extended
+            || flags.id_ranges
+            || flags.locations
+            || flags.anomalies
+            || blocks.is_some();
+        if flags.indexed && !scan_extras && !flags.nodes && get.is_none() {
+            return Self::IndexedOnly;
+        }
+        if flags.nodes && !scan_extras && !flags.indexed && get.is_none() {
+            return Self::NodesOnly;
+        }
+        if let Some(key) = get {
+            let needs_full_scan = key.starts_with("data.")
+                || key.starts_with("metadata.")
+                || key.starts_with("elements.")
+                || key.starts_with("blocks.")
+                || key == "indexed";
+            if !needs_full_scan && !scan_extras && !flags.nodes && !flags.indexed {
+                return Self::HeaderGet(key);
+            }
+        }
+        Self::Full
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_inspect(
     path: &std::path::Path,
@@ -3144,6 +3191,7 @@ fn run_inspect(
     get: Option<&str>,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mode = InspectMode::resolve(&flags, blocks, get);
     let InspectFlags {
         indexed,
         nodes,
@@ -3154,64 +3202,39 @@ fn run_inspect(
         json,
         force,
     } = flags;
-    // --indexed only: quick check without full inspect
-    let has_other_flags = extended
-        || id_ranges
-        || locations
-        || anomalies
-        || nodes
-        || blocks.is_some()
-        || get.is_some();
-    if indexed && !has_other_flags {
-        let has_index = pbfhogg::has_indexdata(path, direct_io)?;
-        if json {
-            println!("{}", serde_json::json!({"indexed": has_index}));
-        } else if has_index {
-            println!("Indexed: yes");
-        } else {
-            println!("Indexed: no");
-        }
-        if !has_index {
-            return Err(Box::new(ExitWithCode(ExitStatus::AnswerNegative)));
-        }
-        return Ok(());
-    }
 
+    // JSON pairings that have no output shape, rejected up front for every
+    // mode. (`--indexed --json` alone is fine and handled below.)
     if nodes && json {
         return Err(
             "--nodes and --json cannot be used together (node stats have no JSON output)".into(),
         );
     }
-
-    // --nodes only: run node stats without full inspect
-    if nodes
-        && !indexed
-        && !extended
-        && !id_ranges
-        && !locations
-        && !anomalies
-        && blocks.is_none()
-        && get.is_none()
-    {
-        let report = pbfhogg::inspect::node_stats::node_stats(path, direct_io, force, jobs)?;
-        report.print_report();
-        return Ok(());
-    }
-
     if get.is_some() && json {
         return Err("--get and --json cannot be used together".into());
     }
 
-    // --get header.* or file.* only: read just the header blob, skip full scan
-    if let Some(key) = get {
-        let needs_full_scan = key.starts_with("data.")
-            || key.starts_with("metadata.")
-            || key.starts_with("elements.")
-            || key.starts_with("blocks.")
-            || key == "indexed";
-        let has_other_flags =
-            extended || id_ranges || locations || anomalies || nodes || indexed || blocks.is_some();
-        if !needs_full_scan && !has_other_flags {
+    match mode {
+        InspectMode::IndexedOnly => {
+            let has_index = pbfhogg::has_indexdata(path, direct_io)?;
+            if json {
+                println!("{}", serde_json::json!({"indexed": has_index}));
+            } else if has_index {
+                println!("Indexed: yes");
+            } else {
+                println!("Indexed: no");
+            }
+            if !has_index {
+                return Err(Box::new(ExitWithCode(ExitStatus::AnswerNegative)));
+            }
+            return Ok(());
+        }
+        InspectMode::NodesOnly => {
+            let report = pbfhogg::inspect::node_stats::node_stats(path, direct_io, force, jobs)?;
+            report.print_report();
+            return Ok(());
+        }
+        InspectMode::HeaderGet(key) => {
             let mut reader = pbfhogg::BlobReader::open(path, direct_io)?;
             let header = match reader.next() {
                 Some(Ok(blob)) => match blob.decode()? {
@@ -3248,6 +3271,7 @@ fn run_inspect(
             }
             return Ok(());
         }
+        InspectMode::Full => {}
     }
 
     // --get with data.* keys requires --extended

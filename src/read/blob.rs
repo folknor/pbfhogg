@@ -350,7 +350,11 @@ pub struct BlobReader<R: Read + Send> {
     /// 0-based index of the blob currently being read. Paired with
     /// `source` on every error; `BlobHeader`s are variable-width, so a
     /// byte offset alone does not tell you which blob to look at.
-    blob_index: u64,
+    /// `None` after a seek away from the stream start: the count is only
+    /// meaningful while iteration is sequential from blob 0, and a stale
+    /// index is a precise-looking attribution pointing at the wrong blob,
+    /// which is worse than none.
+    blob_index: Option<u64>,
     last_blob_ok: bool,
     /// Reusable buffer for reading blob header bytes. Cleared and refilled each
     /// iteration to avoid allocating a new Vec per blob (~16K allocs per Denmark,
@@ -396,7 +400,7 @@ impl<R: Read + Send> BlobReader<R> {
             offset: None,
             // No path exists for a bare `Read`. Absent, not guessed.
             source: None,
-            blob_index: 0,
+            blob_index: Some(0),
             last_blob_ok: true,
             header_buf: Vec::new(),
             parse_tagdata: false,
@@ -616,7 +620,7 @@ impl BlobReader<FileReader> {
             reader,
             offset: Some(ByteOffset(0)),
             source: Some(std::sync::Arc::from(path.as_ref())),
-            blob_index: 0,
+            blob_index: Some(0),
             last_blob_ok: true,
             header_buf: Vec::new(),
             parse_tagdata: false,
@@ -638,7 +642,7 @@ impl BlobReader<FileReader> {
             reader,
             offset: Some(ByteOffset(0)),
             source: Some(std::sync::Arc::from(path.as_ref())),
-            blob_index: 0,
+            blob_index: Some(0),
             last_blob_ok: true,
             header_buf: Vec::new(),
             parse_tagdata: false,
@@ -668,7 +672,7 @@ impl BlobReader<FileReader> {
             reader,
             offset: Some(ByteOffset(0)),
             source: Some(std::sync::Arc::from(path.as_ref())),
-            blob_index: 0,
+            blob_index: Some(0),
             last_blob_ok: true,
             header_buf: Vec::new(),
             parse_tagdata: false,
@@ -762,7 +766,7 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
             };
         }
 
-        self.blob_index += 1;
+        self.blob_index = self.blob_index.map(|i| i + 1);
         Some(Ok(Blob::new(header, blob, prev_offset)))
     }
 }
@@ -796,7 +800,9 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
             // `new_seekable` is generic over any seekable reader; the path
             // (if any) is the caller's, not something this can recover.
             source: None,
-            blob_index: 0,
+            // Only a stream handed over at its start can be counted from
+            // blob 0; mid-stream the index is unknowable, not zero.
+            blob_index: (pos == 0).then_some(0),
             last_blob_ok: true,
             header_buf: Vec::new(),
             parse_tagdata: false,
@@ -859,6 +865,12 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
         match self.reader.seek(SeekFrom::Start(pos.0)) {
             Ok(offset) => {
                 self.offset = Some(ByteOffset(offset));
+                // The blob count is only meaningful while iteration runs
+                // sequentially from the stream start. A rewind to 0
+                // restarts it; any other target invalidates it - a stale
+                // index stamped onto a later error would name the wrong
+                // blob, which is worse than naming none.
+                self.blob_index = (offset == 0).then_some(0);
                 Ok(())
             }
             Err(e) => {
@@ -883,6 +895,8 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
         match self.reader.seek(pos) {
             Ok(offset) => {
                 self.offset = Some(ByteOffset(offset));
+                // Same invalidation rule as `seek`.
+                self.blob_index = (offset == 0).then_some(0);
                 self.last_blob_ok = true;
                 Ok(offset)
             }
@@ -1005,7 +1019,7 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
             return Some(Err(self.stamp_input(err)));
         }
 
-        self.blob_index += 1;
+        self.blob_index = self.blob_index.map(|i| i + 1);
         Some(Ok((BlobHeader::new(header), prev_offset)))
     }
 }

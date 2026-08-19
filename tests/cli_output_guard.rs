@@ -28,8 +28,9 @@
 //! and a corrupted blob payload dies in `sort`'s pass 1. A survival test
 //! built on either passes with the guard removed - it proves nothing, and a
 //! test that still passes when the production change is reverted is worse
-//! than no test. Closing that remaining gap needs a fault-injection hook on
-//! the CLI, recorded as a follow-up in `notes/bugs-core-cli.md`.
+//! than no test. Closing that remaining gap needs a `test-hooks`-gated
+//! fault-injection flag on the CLI, of the same shape as `apply_changes`'s
+//! existing `panic_at_blob_seq`.
 //!
 //! What is tested here is the wiring, against the failure modes the wiring
 //! actually has: a guard that never commits (output missing), a guard whose

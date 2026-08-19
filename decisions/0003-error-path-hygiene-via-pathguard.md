@@ -75,8 +75,11 @@ user-facing summary counters must match output.
 
   One command is deliberately outside the helper: `bench-merge`, a
   synthetic write benchmark, where a `rename` would land inside the
-  region being measured. It is not user-facing output and is recorded in
-  `notes/bugs-core-cli.md`.
+  region being measured. Its output is not user-facing data, so
+  `bench-merge -o existing.pbf` keeps the pre-guard behaviour
+  (truncate up front, partial file on failure). If a guard is ever
+  wanted there, commit *outside* the timed region rather than wrapping
+  the whole run.
 - **A command with several user-named outputs gets a guard each, and a
   preflight before the first commit.** `extract --config` is the only
   such command today. Extraction is all-or-nothing - a failure drops

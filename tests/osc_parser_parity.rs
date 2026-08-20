@@ -42,6 +42,15 @@ fn write_gz(path: &Path, xml: &str) {
     enc.finish().unwrap();
 }
 
+fn read_gz(path: &Path) -> String {
+    use std::io::Read;
+    let file = File::open(path).unwrap();
+    let mut dec = flate2::read::MultiGzDecoder::new(file);
+    let mut xml = String::new();
+    dec.read_to_string(&mut xml).unwrap();
+    xml
+}
+
 /// The outcome each consumer reached for one input: `Ok(())`, or the
 /// error text.
 type Verdict = Result<(), String>;
@@ -256,24 +265,38 @@ fn every_consumer_agrees_on_metadata_leniency() {
         &input,
         "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  <create>\n    \
          <node id=\"1\" lat=\"1.0\" lon=\"2.0\" timestamp=\"1970-01-02T00:00:00Z\" \
-         changeset=\"7\" uid=\"9\" user=\"m\"/>\n  </create>\n</osmChange>",
+         changeset=\"7\" uid=\"9\" user=\"m\"><tag k=\"highway\" v=\"primary\"/>\
+         </node>\n  </create>\n</osmChange>",
     );
     assert_all_accept(dir.path(), &input, "metadata without a version");
 
-    // The metadata really does survive the re-emit paths, and no sink
-    // invents a version the producer never claimed.
-    let out = dir.path().join("meta-out.osc");
-    pbfhogg::commands::merge_changes::merge_changes(&[&input], &out, false, Some(1), false)
+    // The metadata really does survive BOTH re-emit paths, and no sink
+    // invents a version the producer never claimed. tags-filter is
+    // asserted on its own emitted bytes, not just its exit verdict:
+    // "metadata: None on every kept element" was a real bug there, and
+    // a verdict-only parity check would have stayed green through it.
+    let merge_out = dir.path().join("meta-out.osc");
+    pbfhogg::commands::merge_changes::merge_changes(&[&input], &merge_out, false, Some(1), false)
         .unwrap();
-    let xml = std::fs::read_to_string(&out).unwrap();
-    assert!(
-        xml.contains("timestamp=") && xml.contains("uid=") && xml.contains("user="),
-        "metadata must survive an absent version; output was:\n{xml}"
-    );
-    assert!(
-        !xml.contains("version=\"0\""),
-        "no sink may invent version 0 for an element that claimed none; output was:\n{xml}"
-    );
+    let filter_out = dir.path().join("meta-out-filter.osc.gz");
+    tags_filter_osc(&input, &filter_out, &["highway=primary".to_string()]).unwrap();
+    for (name, xml) in [
+        (
+            "merge-changes",
+            std::fs::read_to_string(&merge_out).unwrap(),
+        ),
+        ("tags-filter", read_gz(&filter_out)),
+    ] {
+        assert!(
+            xml.contains("timestamp=") && xml.contains("uid=") && xml.contains("user="),
+            "{name}: metadata must survive an absent version; output was:\n{xml}"
+        );
+        assert!(
+            !xml.contains("version=\"0\""),
+            "{name}: no sink may invent version 0 for an element that claimed none; \
+             output was:\n{xml}"
+        );
+    }
 
     // `version` is the one metadata attribute every sink interprets -
     // the version-precedence gate compares it - so an unparsable one is
@@ -326,7 +349,8 @@ fn only_the_overlay_interprets_changeset_uid_and_timestamp() {
             &input,
             &format!(
                 "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  <create>\n    \
-                 <node {attrs}/>\n  </create>\n</osmChange>"
+                 <node {attrs}><tag k=\"highway\" v=\"primary\"/></node>\n  \
+                 </create>\n</osmChange>"
             ),
         );
         let err = overlay_verdict(&input).expect_err("the overlay must refuse to store a lie");
@@ -335,17 +359,82 @@ fn only_the_overlay_interprets_changeset_uid_and_timestamp() {
             "overlay must name the unparsable value; got: {err}"
         );
 
-        let out = dir.path().join("verbatim-out.osc");
-        pbfhogg::commands::merge_changes::merge_changes(&[&input], &out, false, Some(1), false)
-            .expect("a re-emit path never interprets these, so it has nothing to refuse");
-        let xml = std::fs::read_to_string(&out).unwrap();
+        let merge_out = dir.path().join("verbatim-out.osc");
+        pbfhogg::commands::merge_changes::merge_changes(
+            &[&input],
+            &merge_out,
+            false,
+            Some(1),
+            false,
+        )
+        .expect("a re-emit path never interprets these, so it has nothing to refuse");
+        let filter_out = dir.path().join("verbatim-out-filter.osc.gz");
+        tags_filter_osc(&input, &filter_out, &["highway=primary".to_string()])
+            .expect("tags-filter is the other re-emit path and must agree");
         let (name, value) = attrs
             .rsplit_once('=')
             .map(|(head, v)| (head.rsplit(' ').next().unwrap_or(head), v.trim_matches('"')))
             .unwrap();
+        for (consumer, xml) in [
+            (
+                "merge-changes",
+                std::fs::read_to_string(&merge_out).unwrap(),
+            ),
+            ("tags-filter", read_gz(&filter_out)),
+        ] {
+            assert!(
+                xml.contains(&format!("{name}=\"{value}\"")),
+                "{consumer} must copy {name} through byte for byte; output was:\n{xml}"
+            );
+        }
+    }
+}
+
+/// The re-emit sinks escape OSM user data identically, asserted on the
+/// bytes each one emits. tags-filter used to push tag keys, tag values
+/// and member roles as raw attributes, so a value containing a quote or
+/// an ampersand produced malformed XML there and well-formed XML from
+/// `merge-changes` for the same input - a payload divergence that a
+/// verdict-only parity check cannot see, since both commands exit 0.
+#[test]
+fn re_emit_sinks_escape_user_data_identically() {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("escape.osc.gz");
+    // Raw `&amp;` / `&quot;` / `&#10;` in the source decode to `&`, `"`
+    // and a newline in the parsed value; the writers must re-escape all
+    // three on the way out.
+    write_gz(
+        &input,
+        "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  <create>\n    \
+         <node id=\"1\" lat=\"1.0\" lon=\"2.0\" version=\"1\">\
+         <tag k=\"name\" v=\"a &quot;b&quot; &amp; c&#10;line2\"/>\
+         <tag k=\"highway\" v=\"primary\"/></node>\n  </create>\n</osmChange>",
+    );
+
+    let merge_out = dir.path().join("escape-out.osc");
+    pbfhogg::commands::merge_changes::merge_changes(&[&input], &merge_out, false, Some(1), false)
+        .unwrap();
+    let filter_out = dir.path().join("escape-out-filter.osc.gz");
+    tags_filter_osc(&input, &filter_out, &["highway=primary".to_string()]).unwrap();
+
+    for (consumer, xml) in [
+        (
+            "merge-changes",
+            std::fs::read_to_string(&merge_out).unwrap(),
+        ),
+        ("tags-filter", read_gz(&filter_out)),
+    ] {
         assert!(
-            xml.contains(&format!("{name}=\"{value}\"")),
-            "the re-emit path must copy {name} through byte for byte; output was:\n{xml}"
+            xml.contains("&quot;") && xml.contains("&amp;") && xml.contains("&#10;"),
+            "{consumer} must escape quote, ampersand and newline in a tag value; \
+             output was:\n{xml}"
+        );
+        // No raw quote may survive inside the attribute value: the value
+        // written must parse back to the same bytes, which an unescaped
+        // quote makes impossible.
+        assert!(
+            !xml.contains("v=\"a \"b\""),
+            "{consumer} emitted an unescaped quote inside an attribute; output was:\n{xml}"
         );
     }
 }

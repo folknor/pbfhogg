@@ -39,6 +39,32 @@ and did not have a measurement budget. Note that the two-pass shape now has
 to preserve the version-precedence gate, which currently runs during the
 single dedupe pass and would move into pass one.
 
+## Version gate: an unversioned modify resets the floor a delete would keep
+
+Found during the close pass. Medium confidence that it matters in practice,
+high confidence in the mechanism.
+
+The version-regression gate compares only when both sides claim a version
+(`src/osc/parse.rs::check_version_advance`), and an unversioned **delete**
+still carries the live record's version forward in its tombstone
+(`record_tombstone`), so `create v9 -> delete (no version) -> modify v9`
+is refused. But an unversioned **modify** replaces the live record with
+one that claims nothing, and `KindStore::stored_version` reads only the
+current record - so `modify v9 -> modify (no version) -> modify v8` is
+accepted. The delete path preserves the version floor across a claimless
+change; the modify path launders it.
+
+**Left open deliberately.** The behaviour is inside the documented
+contract ("both sides must claim a version"; DEVIATIONS.md), and it is
+pinned as deliberate by `test_version_advance_and_unversioned_still_accepted`.
+Real replication diffs always carry `version`, so reaching the laundering
+sequence requires a producer that emits versions inconsistently - at which
+point positional order is the only signal available anyway. Closing it
+means a per-id version-floor map updated on every claimless overwrite (the
+tombstone maps could be generalised into that), plus the matching change
+in `merge_changes::check_version_advance`, which tracks only the current
+map entry per key and has the same shape. Do both together or neither.
+
 ## Absent-versus-zero survives in the PBF metadata representation
 
 Found while unifying the OSC parsers in round 2, outside the original hunt.

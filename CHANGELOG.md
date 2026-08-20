@@ -2,7 +2,73 @@
 
 ## Unreleased
 
+### Changed
+
+- **A corrupt element inside a blob is now a hard error instead of a
+  silently dropped element.** This is a breaking behaviour change for
+  anyone reading damaged or hostile PBFs. The rule that a truncation is a
+  hard error rather than silent data loss was implemented at the frame
+  layer and stopped at the blob boundary; below it, every element-level
+  decode failure was swallowed. A malformed `Node`, `Way` or `Relation`
+  was skipped, a malformed `DenseNodes` group of up to 8000 nodes became
+  an empty iterator, a dense group whose `lat` array was shorter than its
+  `id` array truncated the node run, a wire error ended the element
+  stream mid-group, and a corrupt `Info` became default metadata
+  indistinguishable from absent metadata. `pbfhogg cat corrupt.pbf -o
+  out.pbf` therefore exited 0 having written fewer elements than it read.
+
+  Every `PrimitiveBlock` is now structurally validated at construction:
+  group framing, each element sub-message, each element's `Info`, every
+  packed array on those elements, the parallel-array invariants their
+  iterators zip on (`keys` against `vals`, a way's `lat`/`lon` against
+  its `refs`, a relation's `roles_sid`/`memids`/`types`), the
+  `DenseNodes` message, and the equal length of its packed `id`/`lat`/
+  `lon` arrays. Any failure is an error from the read path, so the
+  command exits non-zero. There is no lenient mode. Files that pbfhogg
+  read "successfully" before may now fail - that is the point: the
+  earlier success was reporting a subset of the data as if it were all of
+  it.
+
+  Two dense-node cases are knowingly **not** covered and still truncate
+  silently: a `DenseInfo` array shorter than the id array drops metadata
+  from that point on, and a `keys_vals` run without a trailing delimiter
+  mis-assigns the final tag. Both are documented in
+  `reference/truncation-handling.md`.
+
+- **A `BlobHeader` frame declaring zero length is rejected.** Such a
+  frame consumes four bytes and describes nothing, so a run of zero bytes
+  used to read as a stream of empty blobs that every consumer skipped: a
+  valid header followed by 64 zero bytes read as 16 extra blobs, exit 0,
+  empty output. A `BlobHeader` carrying no `type` field is rejected for
+  the same reason.
+
 ### Fixed
+
+- **A truncated or corrupt zlib blob no longer hangs.** A deflate stream
+  that ended before its final block left the inflate loop consuming
+  nothing, producing nothing and never reaching stream end - spinning at
+  100 % CPU with no output, no timeout and no diagnostic, and presenting
+  as a deadlock when it happened on a parallel decode worker. It is now a
+  typed error naming the byte counts at the point of failure.
+
+- **Decompression bombs are bounded during inflation.** The 32 MiB
+  decompressed-content cap was only checked after decompression had run
+  to completion, so a blob whose compressed size passed the pre-read
+  guard could inflate to tens of GB (far more with zstd) and exhaust
+  memory before the guard fired. Inflation now stops one byte past the
+  cap for both zlib and zstd and reports `MessageTooBig`. Relatedly, the
+  `Blob.raw_size` capacity hint - an unvalidated `int32` - is clamped to
+  the same cap before it reaches `Vec::reserve`, where it could
+  previously request 2 GiB.
+
+- **A malformed dense block no longer panics `extract --strategy smart`
+  or `multi-extract`.** The columnar decoder built its id, lat and lon
+  arrays in three independent loops and then indexed lat and lon by the
+  id count, so a dense group with a truncated or absent `lat` array
+  panicked with index-out-of-bounds on untrusted input. Such a group is
+  now rejected at block construction, and the columnar node count is the
+  shortest of the three columns so positional indexing cannot go out of
+  range regardless.
 
 - **A failing run no longer destroys a pre-existing file that shares the
   output name.** Every command that writes a `--output` used to open the

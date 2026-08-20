@@ -304,6 +304,14 @@ impl HeaderWalker {
             self.header_buf[2],
             self.header_buf[3],
         ]) as usize;
+        // Match BlobReader's zero-length guard: a 4-byte frame declaring an
+        // empty BlobHeader advances the walk without describing a blob, so a
+        // run of zero bytes would walk to EOF reporting nothing but success.
+        if header_len == 0 {
+            return Err(crate::error::new_blob_error(
+                crate::error::BlobError::InvalidHeaderSize,
+            ));
+        }
         // Match BlobReader's MAX_BLOB_HEADER_SIZE guard (blob.rs:390).
         // Without this cap, an adversarial or corrupted length prefix
         // forces `header_buf.resize(header_end, 0)` below to attempt a

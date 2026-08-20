@@ -108,6 +108,15 @@ impl WireBlobHeader {
             }
         }
 
+        // `type` is a required field. A header that omits it (or carries an
+        // empty string) is not a valid frame descriptor, but it parses to
+        // `Unknown("")` with `datasize == 0`, which every consumer skips as an
+        // unrecognised blob type - so garbage would read as clean success.
+        // Rejecting here covers all four frame decoders at one site.
+        if matches!(&blob_type, BlobKind::Unknown(s) if s.is_empty()) {
+            return Err(new_wire_error("BlobHeader has no type field"));
+        }
+
         Ok(WireBlobHeader {
             blob_type,
             datasize,
@@ -189,9 +198,16 @@ impl WireBlob {
 
     /// Returns the declared `raw_size` as a `usize` capacity hint for buffer
     /// pre-allocation, or 0 if absent or negative.
-    #[allow(clippy::cast_sign_loss)]
+    ///
+    /// Clamped to [`MAX_BLOB_MESSAGE_SIZE`]. `raw_size` is an unvalidated
+    /// `int32` straight off the wire, so a corrupt or hostile blob can declare
+    /// up to 2 GiB and drive the pre-decompression `Vec::reserve` into an
+    /// outsized allocation ahead of every guard that runs during inflation. No
+    /// legitimate blob decompresses past the cap, so a larger hint is a lie and
+    /// clamping costs a truthful writer nothing.
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     pub fn estimated_capacity(&self) -> usize {
-        self.raw_size.unwrap_or(0).max(0) as usize
+        (self.raw_size.unwrap_or(0).max(0) as usize).min(MAX_BLOB_MESSAGE_SIZE as usize)
     }
 }
 
@@ -361,5 +377,47 @@ mod tests {
             parse_blob_header_with_index(&header_with_datasize(1234)).unwrap();
         assert_eq!(blob_type, BlobKind::OsmData);
         assert_eq!(data_size, 1234);
+    }
+
+    /// A `BlobHeader` with no `type` field is rejected here, at the one site
+    /// every frame decoder funnels through.
+    ///
+    /// `type` is required by the format, but an absent (or empty) one used to
+    /// parse to `BlobKind::Unknown("")`, which every consumer skips as an
+    /// unrecognised blob type - so a garbage frame read as clean success with
+    /// no output. Rejecting inside `WireBlobHeader::parse` covers
+    /// `BlobReader`, `read_raw_frame`, `read_blob_header_only`,
+    /// `HeaderWalker::next_header` and the `cat --dedupe` frame loop at once,
+    /// which is why the check lives here rather than at each decoder.
+    ///
+    /// An unknown but non-empty type stays acceptable: forward compatibility
+    /// with future blob types is a property of the format, and conflating
+    /// "a type this build does not know" with "no type at all" would break it.
+    #[test]
+    fn blob_header_without_a_type_field_is_rejected() {
+        // Field 3 (datasize) = 100, and nothing else. A structurally valid
+        // protobuf message that is not a valid frame descriptor.
+        let no_type = vec![0x18, 100];
+        let err = parse_blob_header_with_index(&no_type).unwrap_err();
+        assert!(
+            matches!(err.into_kind(), ErrorKind::WireFormat { .. }),
+            "a typeless BlobHeader must be a wire-format error"
+        );
+
+        // An empty type string is the same defect spelled differently.
+        let empty_type = vec![0x0A, 0x00, 0x18, 100];
+        parse_blob_header_with_index(&empty_type)
+            .expect_err("an empty type string must be rejected too");
+
+        // A completely empty header - what a zero-length frame decodes to.
+        parse_blob_header_with_index(&[]).expect_err("an empty header must be rejected");
+
+        // An unrecognised but non-empty type still parses, so the check has not
+        // cost the format its forward compatibility.
+        let future_type = vec![0x0A, 0x06, b'O', b'S', b'M', b'F', b'o', b'o', 0x18, 100];
+        let (blob_type, data_size, _, _) = parse_blob_header_with_index(&future_type)
+            .expect("an unknown but named blob type must still parse");
+        assert_eq!(blob_type, BlobKind::Unknown("OSMFoo".to_string()));
+        assert_eq!(data_size, 100);
     }
 }

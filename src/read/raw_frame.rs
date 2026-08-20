@@ -71,6 +71,14 @@ pub(crate) fn read_raw_frame<R: Read>(
         Err(e) => return Err(e.into()),
     }
     let header_len = u32::from_be_bytes(len_buf) as usize;
+    // Match BlobReader's zero-length guard: a 4-byte frame declaring an empty
+    // BlobHeader carries no type and no payload, so a run of zero bytes would
+    // otherwise decode as a stream of skippable empty frames and exit clean.
+    if header_len == 0 {
+        return Err(
+            crate::error::new_blob_error(crate::error::BlobError::InvalidHeaderSize).into(),
+        );
+    }
     // Match BlobReader's MAX_BLOB_HEADER_SIZE guard (blob.rs:390).
     // Without this cap, an adversarial or corrupted length prefix
     // forces the `vec![0u8; header_len]` allocation below into a
@@ -147,8 +155,13 @@ pub(crate) fn read_blob_header_only(
         Err(e) => return Err(e.into()),
     }
     let header_len = u32::from_be_bytes(len_buf) as usize;
+    // See `read_raw_frame` above for both guards' rationale.
+    if header_len == 0 {
+        return Err(
+            crate::error::new_blob_error(crate::error::BlobError::InvalidHeaderSize).into(),
+        );
+    }
     // Match BlobReader's MAX_BLOB_HEADER_SIZE guard (blob.rs:390).
-    // See `read_raw_frame` above for the same guard's rationale.
     if header_len as u64 >= MAX_BLOB_HEADER_SIZE {
         return Err(
             crate::error::new_blob_error(crate::error::BlobError::HeaderTooBig {

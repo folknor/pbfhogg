@@ -134,20 +134,136 @@ pub(crate) fn pool_wrap(decoded: Vec<u8>, pool: Option<&Arc<DecompressPool>>) ->
     }
 }
 
+/// Clamp a writer-declared `raw_size` capacity hint to the decompressed-content
+/// cap.
+///
+/// `raw_size` is an unvalidated `int32` read straight off the wire, so a hostile
+/// or corrupt blob can declare up to 2 GiB and drive the `Vec::reserve` that
+/// precedes decompression into an outsized allocation - before the inflation
+/// bound below ever runs. No legitimate blob decompresses past
+/// `MAX_BLOB_MESSAGE_SIZE`, so any hint above it is a lie and clamping loses
+/// nothing: a truthful hint below the cap still pre-sizes exactly.
+pub(super) fn clamp_capacity_hint(hint: usize) -> usize {
+    #[allow(clippy::cast_possible_truncation)]
+    let cap = MAX_BLOB_MESSAGE_SIZE as usize;
+    hint.min(cap)
+}
+
+/// Decompress zstd data into `buf`, bounded during inflation.
+///
+/// `zstd::stream::copy_decode` runs to completion before any size check can
+/// fire, so a small blob declaring a huge dictionary-free expansion (zstd
+/// reaches ratios around 10^5 trivially) would exhaust memory ahead of the
+/// guard. Reading through a `take` capped at one byte past
+/// `MAX_BLOB_MESSAGE_SIZE` bounds the allocation at the cap and still leaves
+/// exactly enough evidence (one surplus byte) to distinguish "at the cap" from
+/// "over the cap".
+fn zstd_decompress_into(compressed: &[u8], buf: &mut Vec<u8>) -> Result<()> {
+    use std::io::Read as _;
+
+    let start = buf.len();
+    let limit = MAX_BLOB_MESSAGE_SIZE + 1;
+    let decoder = zstd::stream::read::Decoder::new(Cursor::new(compressed))?;
+    decoder.take(limit).read_to_end(buf)?;
+    let size = (buf.len() - start) as u64;
+    if size > MAX_BLOB_MESSAGE_SIZE {
+        return Err(new_blob_error(BlobError::MessageTooBig { size }));
+    }
+    Ok(())
+}
+
 /// Decompress zlib data into `buf` using the thread-local reusable decompressor.
 ///
 /// Resets the decompressor state between calls instead of allocating a fresh
-/// ~32 KB inflate state per blob. Enforces `MAX_BLOB_MESSAGE_SIZE`.
-#[allow(clippy::cast_possible_truncation)] // total_in delta bounded by input.len() (usize)
+/// ~32 KB inflate state per blob.
+///
+/// Two adversarial-input bounds are enforced *by construction*, both inside the
+/// inflate loop rather than after it:
+///
+/// * **Output size.** Growth stops one byte past `MAX_BLOB_MESSAGE_SIZE` and
+///   the surplus byte is reported as `MessageTooBig`. Inflating a decompression
+///   bomb to completion in order to discover it was too big has already done
+///   the damage the cap exists to prevent.
+/// * **Progress.** `Decompress::decompress_vec` reports a truncated deflate
+///   stream (input exhausted with no final block) as `Ok(Status::BufError)`,
+///   not `Err`. With the input empty and output space still available, the loop
+///   would then consume nothing, produce nothing and never see `StreamEnd` -
+///   spinning at 100 % CPU forever. An iteration that moves neither counter is
+///   terminal and surfaces as a typed error.
+///
+/// # Why the budget cannot be left to the destination buffer
+///
+/// `decompress_vec` fills the destination to its *capacity*, so capacity - not
+/// any limit this function computes - is what actually bounds one inflate step.
+/// Every caller here hands in a reusable, caller-owned buffer whose capacity is
+/// a function of what previous blobs happened to need, so a buffer that already
+/// carries more than `MAX_BLOB_MESSAGE_SIZE` of spare capacity would let a bomb
+/// inflate to that capacity in a single call, before the loop ever re-checked.
+/// A bound a caller's allocation history can defeat is not a bound, so the
+/// spare capacity is brought under the budget first and only then inflated
+/// into.
+// MAX_BLOB_MESSAGE_SIZE is 32 MiB, so the cast is exact on any target this
+// crate builds for; the same allow covers `clamp_capacity_hint` above.
+#[allow(clippy::cast_possible_truncation)]
 fn zlib_decompress_into(compressed: &[u8], buf: &mut Vec<u8>) -> Result<()> {
+    let budget = MAX_BLOB_MESSAGE_SIZE as usize + 1;
+
+    if buf.capacity() - buf.len() > budget {
+        // Rare: only reachable when a pooled buffer has been grown past 32 MiB
+        // of spare capacity by an earlier blob. Inflate through a fresh
+        // destination - whose capacity starts at zero and is grown only by the
+        // budget-respecting loop below - then append. The extra copy costs
+        // nothing on the hot path because the branch is not taken there.
+        let mut bounded = Vec::new();
+        zlib_inflate_bounded(compressed, &mut bounded, budget)?;
+        buf.extend_from_slice(&bounded);
+        return Ok(());
+    }
+
+    zlib_inflate_bounded(compressed, buf, budget)
+}
+
+/// Inflate `compressed` onto the end of `buf`, producing at most `budget` bytes.
+///
+/// # Precondition
+///
+/// `buf.capacity() - buf.len() <= budget`. This is what makes the budget real:
+/// `decompress_vec` writes up to `capacity`, so an oversized spare capacity
+/// would overshoot the budget within a single call no matter what the loop
+/// checks afterwards. [`zlib_decompress_into`] establishes the precondition;
+/// the `debug_assert` pins it for any future caller.
+#[allow(clippy::cast_possible_truncation)] // total_in delta bounded by input.len() (usize)
+fn zlib_inflate_bounded(compressed: &[u8], buf: &mut Vec<u8>, budget: usize) -> Result<()> {
     ZLIB_DECOMPRESS.with_borrow_mut(|decompress| {
         decompress.reset(true);
+        let start = buf.len();
+        let limit = start + budget;
+        debug_assert!(
+            buf.capacity() <= limit,
+            "zlib_inflate_bounded requires spare capacity within the budget"
+        );
         let mut input = compressed;
         loop {
+            if buf.len() >= limit {
+                // Inflation is stopped at the detection point rather than run
+                // to completion, so the true decompressed size is unknown by
+                // design; `size` reports the one-byte-past-the-cap boundary.
+                // For a payload that is merely one byte over, that is the exact
+                // size - matching the Raw and Zstd branches.
+                buf.truncate(limit);
+                return Err(new_blob_error(BlobError::MessageTooBig {
+                    size: MAX_BLOB_MESSAGE_SIZE + 1,
+                }));
+            }
             if buf.len() == buf.capacity() {
-                buf.reserve(input.len().max(4096));
+                // Double, but never reserve past the bound: `decompress_vec`
+                // fills to `capacity`, so capacity is what actually caps a
+                // single inflate step's output.
+                let want = buf.capacity().max(4096).min(limit - buf.len());
+                buf.reserve_exact(want);
             }
             let before_in = decompress.total_in();
+            let before_out = buf.len();
             let status = decompress
                 .decompress_vec(input, buf, flate2::FlushDecompress::None)
                 .map_err(|e| {
@@ -160,12 +276,21 @@ fn zlib_decompress_into(compressed: &[u8], buf: &mut Vec<u8>) -> Result<()> {
             if matches!(status, flate2::Status::StreamEnd) {
                 break;
             }
-            // Output buffer was full - grow and retry.
-            if buf.len() == buf.capacity() {
-                buf.reserve(buf.len().max(4096));
+            if consumed == 0 && buf.len() == before_out {
+                // No input consumed, no output produced, no stream end: the
+                // deflate stream cannot be completed from the bytes we have.
+                return Err(new_error(ErrorKind::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "zlib stream ended before the final deflate block: \
+                         {} compressed bytes consumed, {} bytes decompressed",
+                        decompress.total_in(),
+                        buf.len() - start
+                    ),
+                ))));
             }
         }
-        let size = buf.len() as u64;
+        let size = (buf.len() - start) as u64;
         if size > MAX_BLOB_MESSAGE_SIZE {
             return Err(new_blob_error(BlobError::MessageTooBig { size }));
         }
@@ -218,12 +343,7 @@ pub(super) fn decompress_parsed_blob_into(blob: &WireBlob, buf: &mut Vec<u8>) ->
             if cap > 0 {
                 buf.reserve(cap.saturating_sub(buf.capacity()));
             }
-            zstd::stream::copy_decode(Cursor::new(&**bytes), &mut *buf)?;
-            let size = buf.len() as u64;
-            if size > MAX_BLOB_MESSAGE_SIZE {
-                return Err(new_blob_error(BlobError::MessageTooBig { size }));
-            }
-            Ok(())
+            zstd_decompress_into(bytes, buf)
         }
         None => Err(new_blob_error(BlobError::Empty)),
     }
@@ -270,7 +390,7 @@ pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<
                     && rs > 0
                 {
                     #[allow(clippy::cast_sign_loss)]
-                    buf.reserve((rs as usize).saturating_sub(buf.capacity()));
+                    buf.reserve(clamp_capacity_hint(rs as usize).saturating_sub(buf.capacity()));
                 }
                 zlib_decompress_into(slice, buf)?;
                 found = true;
@@ -282,13 +402,9 @@ pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<
                     && rs > 0
                 {
                     #[allow(clippy::cast_sign_loss)]
-                    buf.reserve((rs as usize).saturating_sub(buf.capacity()));
+                    buf.reserve(clamp_capacity_hint(rs as usize).saturating_sub(buf.capacity()));
                 }
-                zstd::stream::copy_decode(std::io::Cursor::new(slice), &mut *buf)?;
-                let size = buf.len() as u64;
-                if size > MAX_BLOB_MESSAGE_SIZE {
-                    return Err(new_blob_error(BlobError::MessageTooBig { size }));
-                }
+                zstd_decompress_into(slice, buf)?;
                 found = true;
             }
             _ => cursor.skip_field(wire_type)?,
@@ -318,20 +434,24 @@ pub(crate) fn decompress_blob(
         }
         Some(BlobData::Zlib(bytes)) => {
             let est = blob.estimated_capacity();
-            let capacity = if est > 0 { est } else { bytes.len() * 4 };
+            let capacity = if est > 0 {
+                est
+            } else {
+                clamp_capacity_hint(bytes.len().saturating_mul(4))
+            };
             let mut decoded_bytes = pool_get(pool, capacity);
             zlib_decompress_into(bytes, &mut decoded_bytes)?;
             Ok(pool_wrap(decoded_bytes, pool))
         }
         Some(BlobData::Zstd(bytes)) => {
             let est = blob.estimated_capacity();
-            let capacity = if est > 0 { est } else { bytes.len() * 4 };
+            let capacity = if est > 0 {
+                est
+            } else {
+                clamp_capacity_hint(bytes.len().saturating_mul(4))
+            };
             let mut decoded_bytes = pool_get(pool, capacity);
-            zstd::stream::copy_decode(Cursor::new(&**bytes), &mut decoded_bytes)?;
-            let size = decoded_bytes.len() as u64;
-            if size > MAX_BLOB_MESSAGE_SIZE {
-                return Err(new_blob_error(BlobError::MessageTooBig { size }));
-            }
+            zstd_decompress_into(bytes, &mut decoded_bytes)?;
             Ok(pool_wrap(decoded_bytes, pool))
         }
         None => Err(new_blob_error(BlobError::Empty)),
@@ -365,11 +485,7 @@ pub(crate) fn decompress_wire_blob_into(blob: &WireBlob, buf: &mut Vec<u8>) -> R
             if est > 0 {
                 buf.reserve(est);
             }
-            zstd::stream::copy_decode(Cursor::new(&**bytes), &mut *buf)?;
-            let size = buf.len() as u64;
-            if size > MAX_BLOB_MESSAGE_SIZE {
-                return Err(new_blob_error(BlobError::MessageTooBig { size }));
-            }
+            zstd_decompress_into(bytes, buf)?;
         }
         None => return Err(new_blob_error(BlobError::Empty)),
     }
@@ -492,5 +608,235 @@ mod tests {
 
             assert_too_big(decompress_blob(&blob, None).map(|_| ()), over_len as u64);
         }
+    }
+
+    /// A deflate stream that ends before its final block must terminate with a
+    /// typed error.
+    ///
+    /// `Decompress::decompress_vec` reports this as `Ok(Status::BufError)`, not
+    /// `Err`: the input is exhausted, nothing is consumed, nothing is produced,
+    /// and `StreamEnd` never arrives. The inflate loop used to spin on that
+    /// forever at 100 % CPU with no output and no diagnostic - and every read
+    /// path in the crate funnels through it, so on a rayon decode worker the
+    /// spin presents as a deadlock.
+    ///
+    /// The watchdog is the point of the test: it runs the decompression on a
+    /// worker thread and fails if no answer arrives, so a regression surfaces
+    /// as a bounded failure rather than as a hung test suite. The budget is
+    /// deliberately well inside the 20 s per-test watchdog `brokkr check`
+    /// enforces - a correct implementation answers in microseconds.
+    #[test]
+    fn truncated_zlib_stream_errors_instead_of_hanging() {
+        // Compressible payload, then cut the deflate stream in half: the
+        // prefix is byte-valid deflate, it just never reaches a final block.
+        let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let full = zlib_compress(&payload);
+        assert!(full.len() > 64, "need a stream long enough to bisect");
+        let truncated = full[..full.len() / 2].to_vec();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let blob = WireBlob {
+                data: Some(BlobData::Zlib(Bytes::from(truncated))),
+                raw_size: Some(200_000),
+            };
+            let mut out = Vec::new();
+            let result = decompress_wire_blob_into(&blob, &mut out);
+            // Send failure means the receiver already gave up on the watchdog.
+            let _sent = tx.send(result.is_err());
+        });
+
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(is_err) => {
+                handle.join().expect("decompress thread must not panic");
+                assert!(
+                    is_err,
+                    "a truncated deflate stream must be an error, not a short read"
+                );
+            }
+            Err(_) => panic!(
+                "zlib decompression of a truncated stream did not terminate \
+                 within 5s - the no-progress guard is gone"
+            ),
+        }
+    }
+
+    /// The decompressed-size cap is enforced *during* inflation, not after.
+    ///
+    /// A blob whose declared `datasize` sits under the 32 MiB pre-read cap can
+    /// inflate to orders of magnitude more (zlib reaches ~1000x on zeroes;
+    /// zstd reaches ~10^5), so a post-hoc `buf.len() > MAX` check fires only
+    /// once the process has already allocated the bomb. The surfaced size is
+    /// the assertion that bites: it is exactly one byte past the cap, which is
+    /// only possible if inflation stopped there. Before the fix the same call
+    /// inflated the whole payload and reported its full size.
+    #[test]
+    fn decompression_bomb_is_bounded_during_inflation() {
+        let cap = MAX_BLOB_MESSAGE_SIZE as usize;
+        // Four times the cap, all zeroes: compresses to a few hundred KB of
+        // zlib and a few hundred bytes of zstd.
+        let bomb = vec![0u8; cap * 2];
+
+        for (kind, compressed) in [
+            (Kind::Zlib, zlib_compress(&bomb)),
+            (Kind::Zstd, zstd_compress(&bomb)),
+        ] {
+            assert!(
+                compressed.len() < cap,
+                "{kind:?} bomb must be small enough to pass the datasize guard"
+            );
+            let blob = WireBlob {
+                data: Some(match kind {
+                    Kind::Zlib => BlobData::Zlib(Bytes::from(compressed)),
+                    _ => BlobData::Zstd(Bytes::from(compressed)),
+                }),
+                // A lying raw_size: 2 GiB, the largest an int32 can declare.
+                // The capacity hint must be clamped or this alone allocates it.
+                raw_size: Some(i32::MAX),
+            };
+
+            let mut out = Vec::new();
+            assert_too_big(
+                decompress_wire_blob_into(&blob, &mut out),
+                MAX_BLOB_MESSAGE_SIZE + 1,
+            );
+            assert!(
+                out.len() <= cap + 1,
+                "{kind:?} inflated {} bytes past the cap before erroring",
+                out.len() - cap
+            );
+
+            let mut parsed = Vec::new();
+            assert_too_big(
+                decompress_parsed_blob_into(&blob, &mut parsed),
+                MAX_BLOB_MESSAGE_SIZE + 1,
+            );
+
+            assert_too_big(
+                decompress_blob(&blob, None).map(|_| ()),
+                MAX_BLOB_MESSAGE_SIZE + 1,
+            );
+        }
+    }
+
+    /// A `raw_size` hint above the decompressed-content cap is a lie no
+    /// legitimate writer tells, and it is read straight off the wire with no
+    /// validation - so it must not reach `Vec::reserve` unclamped. Pins the
+    /// clamp independently of the inflation bound above, which would otherwise
+    /// be the only thing standing between a 5-byte field and a 2 GiB
+    /// allocation.
+    #[test]
+    fn raw_size_capacity_hint_is_clamped_to_the_cap() {
+        let blob = WireBlob {
+            data: Some(BlobData::Zlib(Bytes::from(zlib_compress(b"tiny")))),
+            raw_size: Some(i32::MAX),
+        };
+        assert_eq!(
+            blob.estimated_capacity(),
+            MAX_BLOB_MESSAGE_SIZE as usize,
+            "an over-cap raw_size must clamp to the cap, not pass through"
+        );
+
+        let mut out = Vec::new();
+        decompress_wire_blob_into(&blob, &mut out).expect("a tiny blob still decodes");
+        assert_eq!(out, b"tiny");
+        assert!(
+            out.capacity() <= MAX_BLOB_MESSAGE_SIZE as usize,
+            "buffer capacity followed the unclamped hint: {}",
+            out.capacity()
+        );
+    }
+
+    /// The inflation bound must not depend on the destination buffer's
+    /// allocation history.
+    ///
+    /// Every zlib caller in this module hands in a reusable, caller-owned
+    /// buffer, and `Decompress::decompress_vec` fills the destination to its
+    /// *capacity* - so a buffer an earlier large blob already grew past the cap
+    /// let a bomb inflate to that whole capacity in one call, before any loop
+    /// check ran again. The cap was computed correctly and then not enforced.
+    ///
+    /// The pre-sized buffer is the entire point: the same bomb through a fresh
+    /// `Vec` (asserted above) stays bounded even with the bug present, which is
+    /// why the passing suite did not catch this. Both assertions bite - with
+    /// the bound defeated the surfaced size is the bomb's full 64 MiB rather
+    /// than the one-byte-past-the-cap boundary, and `reused` holds all of it.
+    #[test]
+    fn a_prewarmed_buffer_cannot_widen_the_inflation_bound() {
+        let cap = MAX_BLOB_MESSAGE_SIZE as usize;
+        let bomb = vec![0u8; cap * 2];
+        let blob = WireBlob {
+            data: Some(BlobData::Zlib(Bytes::from(zlib_compress(&bomb)))),
+            raw_size: Some(i32::MAX),
+        };
+
+        // A pooled buffer that a previous blob grew well past the cap. Cleared
+        // for reuse, so `len` is 0 and only the capacity carries over - exactly
+        // the state `DecompressPool` recycles buffers in.
+        let mut reused = Vec::with_capacity(cap * 2 + 4096);
+        reused.push(0u8);
+        reused.clear();
+        assert!(
+            reused.capacity() > cap + 1,
+            "fixture must start with more spare capacity than the cap permits"
+        );
+
+        assert_too_big(
+            decompress_wire_blob_into(&blob, &mut reused),
+            MAX_BLOB_MESSAGE_SIZE + 1,
+        );
+        assert!(
+            reused.len() <= cap + 1,
+            "the bomb inflated to {} bytes - the caller's spare capacity, not the cap, bounded it",
+            reused.len()
+        );
+    }
+
+    /// The bounded-destination path must still decode a legitimate blob
+    /// correctly, not just refuse bombs.
+    ///
+    /// A pre-sized buffer routes through a different branch of
+    /// `zlib_decompress_into` than the hot path does, and that branch inflates
+    /// into a fresh vector and appends. Appending is the part that can go
+    /// wrong: `zlib_decompress_into` appends at `buf.len()`, and the rare
+    /// branch has to reproduce that through a temporary. Getting it wrong
+    /// would corrupt output rather than fail loudly.
+    ///
+    /// Both levels are checked. Every public entry point clears its
+    /// destination, so the append contract is only observable by calling
+    /// `zlib_decompress_into` directly - which is also the only way to reach
+    /// the branch with a non-empty buffer at all.
+    #[test]
+    fn a_prewarmed_buffer_still_decodes_and_appends_correctly() {
+        let cap = MAX_BLOB_MESSAGE_SIZE as usize;
+        let payload: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let compressed = zlib_compress(&payload);
+
+        // Append contract, straight at the helper.
+        let mut appended = Vec::with_capacity(cap * 2 + 4096);
+        appended.extend_from_slice(b"prefix");
+        assert!(
+            appended.capacity() - appended.len() > cap + 1,
+            "fixture must take the bounded-destination branch"
+        );
+        super::zlib_decompress_into(&compressed, &mut appended).expect("a legitimate blob decodes");
+        assert_eq!(&appended[..6], b"prefix", "existing content must survive");
+        assert_eq!(
+            &appended[6..],
+            &payload[..],
+            "the decoded payload must be appended intact"
+        );
+
+        // And through a public entry point, whose `clear()` leaves the
+        // oversized capacity in place so the branch is still taken.
+        let blob = WireBlob {
+            data: Some(BlobData::Zlib(Bytes::from(compressed))),
+            raw_size: Some(i32::try_from(payload.len()).unwrap()),
+        };
+        let mut reused = Vec::with_capacity(cap * 2 + 4096);
+        reused.push(0u8);
+        reused.clear();
+        decompress_wire_blob_into(&blob, &mut reused).expect("a legitimate blob still decodes");
+        assert_eq!(reused, payload, "the decoded payload must be intact");
     }
 }

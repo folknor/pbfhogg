@@ -3,159 +3,49 @@
 Hunt date 2026-08-12. Single Opus hunter, scope: `src/read/` in full plus
 `src/reorder_buffer.rs` as consumed by the pipeline. Findings only, unverified.
 
-## Truncated/corrupt zlib stream = infinite loop (hang), not an error
+## Dense `keys_vals` and `denseinfo` array lengths are still unvalidated
 
-`src/read/decompress.rs`, `zlib_decompress_into`.
+`src/read/block.rs`, `validate_groups_strict`.
 
-```rust
-loop {
-    let status = decompress.decompress_vec(input, buf, FlushDecompress::None)?;
-    let consumed = ...; input = &input[consumed..];
-    if matches!(status, Status::StreamEnd) { break; }
-    if buf.len() == buf.capacity() { buf.reserve(...); }
-}
-```
+Strict block validation now length-checks every packed array on regular
+elements and the dense `id`/`lat`/`lon` triple, but two dense arrays are
+excluded because array-length equality does not express their invariant:
 
-`Decompress::decompress_vec` returns `Err` only on a genuine `DecompressError`.
-When the deflate stream simply ends early (no final block, input exhausted),
-zlib-rs returns `Status::BufError`, which flate2 maps to `Ok(Status::BufError)`
-(verified in `flate2-1.1.9/src/ffi/zlib_rs.rs` and `mem.rs`). The loop then spins
-forever: `input` is empty, `consumed` is 0, `buf` has spare capacity so no
-growth, no `StreamEnd`, no error. 100 % CPU, no output, no timeout, no
-diagnostic.
+- `DenseNodes.keys_vals` is a single flat array of zero-terminated per-node
+  runs, so establishing that it describes exactly `n` nodes needs a stateful
+  walk counting delimiters, not a varint count. A short or over-long
+  `keys_vals` therefore still mis-assigns tags, and the `DenseNodeIter`
+  tag-run boundary bug below is the same array seen from the other side.
+- `DenseNodes.denseinfo` carries six parallel arrays that must each match the
+  node count. Today a short one silently drops metadata from that point on
+  (see the `DenseNodeInfoIter` entry under Minor).
 
-Reachable whenever a byte-valid frame carries a truncated-but-not-otherwise-
-corrupt deflate payload (partial copy that also mangled a length prefix, a
-hand-crafted blob, a writer that wrote `datasize` correctly but a short
-`zlib_data`). This is exactly shape 5 in `reference/truncation-handling.md`,
-which the doc pins as "hard error". The code hangs instead. Every read path
-funnels through this function (`decompress_blob`, `decompress_blob_raw`,
-`decompress_wire_blob_into`, `decompress_parsed_blob_into`), so the whole scope
-inherits it, including all rayon decode workers, where the hang looks like a
-deadlock rather than a spin.
+Both are genuine silent-truncation paths of the same class as the resolved
+element-drop finding, and both are excluded deliberately rather than
+overlooked. Validating them means walking `keys_vals` once per block, which is
+the only check in this pass that is not a byte scan - worth measuring before
+adopting.
 
-Fix: treat "no progress and input exhausted" as `Err`. Track
-`consumed == 0 && bytes_written == 0` and bail with a typed error.
+Confidence: high on the gap; the cost of closing it was not measured.
 
-Confidence: high (code plus dependency source read; not executed).
+## `cat --dedupe` reads a 4-byte length prefix with no size guard
 
-## Decompression bomb: `MAX_BLOB_MESSAGE_SIZE` is enforced after full inflation
+`src/commands/cat/dedupe.rs`, the frame loop.
 
-`src/read/decompress.rs`.
+It reads the 4-byte big-endian prefix and immediately does
+`header_buf.resize(header_len, 0)` with no `MAX_BLOB_HEADER_SIZE` check - the
+guard that `BlobReader`, `read_raw_frame`, `read_blob_header_only` and
+`HeaderWalker::next_header` all carry. Four bytes of corrupt input therefore
+request up to a 4 GiB allocation before anything inspects them. This is a fifth
+copy of the frame decoder that the "four hand-rolled copies" finding below does
+not count, and it is the one copy missing a guard the other four share, which
+is the argument for that refactor in miniature.
 
-The doc comment says "Enforces `MAX_BLOB_MESSAGE_SIZE`". It does not. Both
-compression branches decompress to completion and only then compare:
-
-- zlib: `zlib_decompress_into` grows `buf` unboundedly, checks
-  `buf.len() > MAX` at the end.
-- zstd: `zstd::stream::copy_decode(..., &mut *buf)` runs to completion, then
-  checks length.
-
-A blob whose declared `datasize` is just under the 32 MiB cap (which is enforced
-pre-read) can inflate to tens of GB with zlib, and far more with zstd (ratios
-around 10^5 are trivially constructible). The process OOMs or thrashes before the
-guard fires. `MAX_BLOB_DATASIZE`'s doc comment carefully explains that it exists
-precisely to bound pre-decompression allocation, and then the post-decompression
-bound it hands off to is not actually a bound.
-
-Fix is mechanical: cap the zlib output loop at `MAX_BLOB_MESSAGE_SIZE + 1` bytes
-and error on overflow; wrap the zstd reader in `.take(MAX_BLOB_MESSAGE_SIZE + 1)`
-or use `zstd::Decoder` with a bounded write target. The existing boundary test
-(`decompress_helpers_agree_at_message_size_boundary`) only exercises payloads
-that fit in RAM, so it passes today and would keep passing.
+The zero-length case is already covered here, but only indirectly: an empty
+header slice parses to an empty type and is rejected by the shared
+`WireBlobHeader::parse` funnel rather than by a local check.
 
 Confidence: high.
-
-## Element-level decode silently drops malformed elements
-
-`src/read/wire.rs`, `src/read/block.rs`, `src/read/elements.rs`.
-
-The framing layer is rigorously guarded (six documented contract sites, typed
-errors, offsets in the message). Everything below the blob boundary does the
-opposite:
-
-- `WireMessageIter::next` (`wire.rs`): `self.cursor.read_tag().ok()??` and
-  `if self.cursor.skip_field(wire_type).is_err() { return None }` - a wire error
-  silently ends the element stream mid-group.
-- `BlockElementsIter::step`, `GroupNodeIter`, `GroupWayIter`,
-  `GroupRelationIter` (`block.rs`): `if let Ok(x) = WireX::parse(data) { ... }`
-  with the `Err` arm falling through to the next element - malformed elements
-  are skipped without a trace.
-- `PrimitiveGroup::dense_nodes` / `BlockElementsIter::step`: a
-  `WireDenseNodes::parse` error yields `DenseNodeIter::empty(...)` - an entire
-  dense group of up to 8000 nodes vanishes into an empty iterator.
-- `DenseNodeIter::next`: stops as soon as any of the id/lat/lon packed arrays
-  runs out, so mismatched array lengths truncate the node run.
-- `elements.rs`: `info_data.and_then(|d| WireInfo::parse(d).ok())
-  .unwrap_or_default()` - corrupt metadata becomes default metadata (version 0,
-  timestamp 0), indistinguishable from genuinely absent.
-
-Net effect: `pbfhogg cat corrupt.pbf -o out.pbf` exits 0 with silently fewer
-elements. That is precisely the failure mode `reference/truncation-handling.md`
-was written to prevent ("Returning `Ok` with fewer-than-declared elements would
-silently ship corrupt output to downstream consumers") - the stance was
-implemented at the frame layer and never carried into the block layer. The doc's
-claim that the contract is complete is false for anything inside a blob.
-
-This is a design problem, not a line bug. `Iterator` returning `Element` rather
-than `Result<Element>` is what forces every one of these `.ok()`s. Pre-1.0, the
-hunter would change the iterators to `Result<Element>`, or (cheaper, less
-invasive on consumers) have `PrimitiveBlock` validate the group structure
-eagerly at construction - it already walks every group to inline the ranges, so
-a strict pass costs almost nothing and turns all of the above into one hard
-error at `finish()`.
-
-Confidence: high on the behavior; the fix shape is a judgement call.
-
-## Panic on malformed dense block via the columnar path
-
-`src/read/columnar.rs`, `decode_append`.
-
-`decode_append` decodes ids, lats, lons in three independent loops, each pushing
-to its own `Vec`. Nothing ties their lengths together. `len()` returns
-`ids.len()`. Then:
-
-```rust
-for i in 0..n { let lat = lats[i]; let lon = lons[i]; ... }
-```
-
-A dense group with more ids than lats (packed `lat` field truncated, or absent
-entirely while `id` is present) gives `lats.len() < ids.len()` and the loop
-panics with index-out-of-bounds. Same in `collect_matching_ids_multi_bbox` and
-`collect_matching_ids_multi_bbox_grid`.
-
-Reachable from user input via `extract --strategy smart`
-(`commands/extract/smart.rs`) and `multi-extract`
-(`commands/extract/multi.rs`), which are the only callers. Note the
-element-iteration path (`DenseNodeIter`) handles the same malformed input
-gracefully (it stops), so the two decoders disagree on the same bytes, one
-silently truncating and one panicking. Fix: after the three loops, require all
-three lengths equal and return an error otherwise (this function should be
-fallible).
-
-Confidence: high.
-
-## `header_len == 0` frames are accepted - infinite garbage reads as clean success
-
-All four frame decoders accept a 4-byte length prefix of `0`:
-`read_blob_header` (`blob.rs`), `read_raw_frame` and `read_blob_header_only`
-(`raw_frame.rs`), `HeaderWalker::next_header` (`header_walker.rs`). A
-zero-length `BlobHeader` parses to `BlobKind::Unknown("")` with `datasize == 0`,
-forming a legal 4-byte frame that every consumer then skips as "unknown blob
-type".
-
-Consequence: a file consisting of a valid OSMHeader followed by N zero bytes is
-read as N/4 empty unknown blobs, all silently skipped, exit 0, empty output.
-Same for any run of zeros appended to or substituted into a real file.
-`ElementReader::for_each` and the pipeline both explicitly document "skip
-non-OsmData without decode", so nothing anywhere notices.
-
-A `BlobHeader` with no `type` field is not a valid PBF frame. Reject
-`header_len == 0`, and reject `BlobKind::Unknown("")` (empty type string) at the
-same place.
-
-Confidence: high on the mechanism; severity depends on how much silent success
-on garbage input matters.
 
 ## Four hand-rolled copies of the same frame decoder
 
@@ -179,13 +69,15 @@ Each copy differs in ways that matter and are not obviously intentional:
   and `FileReader::skip` use the seek-then-sentinel-byte trick; `HeaderWalker`
   compares against `file_size`. Three mechanisms, three failure messages, three
   chances to drift.
-- `header_len == 0` (finding above) is wrong in all four, identically.
+- The `header_len == 0` rejection had to be added to all four independently,
+  and to `cat --dedupe`'s fifth copy it was never added at all (see above) -
+  a worked example of the cost of the duplication rather than a hypothetical.
 
 Pre-1.0, collapse this to one `FrameDecoder` that owns prefix, EOF policy, both
 size guards, and header parse, parameterised only by "materialise payload / skip
 payload / record offsets". The four call sites become thin. That deletes the
-six-contract-site table from the doc and makes the `header_len == 0` finding a
-one-line fix instead of a four-line fix.
+six-contract-site table from the doc and makes the next framing guard a
+one-line fix instead of a five-line one.
 
 Confidence: high that this is the right shape; it is a real refactor.
 
@@ -296,17 +188,13 @@ Confidence: high on the API smell; the perf cost was not measured.
   (`drop(h.join())`). A panicking pipeline currently reads as "file ended".
   Confidence: high on the mechanism, low on frequency.
 
-## Hunter's suggested order
+## Suggested order
 
-1. The zlib hang and the decompression bomb are the only two that turn a hostile
-   or merely damaged file into a hang or an OOM. Both are localized to
-   `zlib_decompress_into` and the zstd branches; both are ~20 lines.
-2. The columnar `decode_append` panic is reachable from two shipped commands.
-3. The element-drop finding deserves an actual design decision rather than a
-   patch: the crate has a well-argued, well-tested stance on silent data loss
-   that stops at the blob boundary, and the block layer contradicts it in a dozen
-   places. Deciding it (strict validation at `PrimitiveBlock::finish` is the
-   hunter's recommendation - cheapest, one error site, no consumer churn) is more
-   valuable than any individual `.ok()` fix.
-4. The frame-decoder collapse makes the `header_len == 0` finding and future
-   framing bugs one-line fixes instead of four.
+1. The `cat --dedupe` missing size guard is the one remaining place where four
+   bytes of corrupt input drive an unbounded allocation. It is a two-line fix.
+2. The dense `keys_vals` / `denseinfo` length checks close the last known
+   silent-truncation paths inside a block, finishing what strict block
+   validation started.
+3. The frame-decoder collapse makes future framing guards a one-line fix
+   instead of a five-line one, and would have prevented the `cat --dedupe` gap
+   outright.

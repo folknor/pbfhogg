@@ -82,6 +82,11 @@ there is no per-command relaxation. The contract sites are:
   consumers (`has_indexdata`, `diff::process`, `cat::dedupe`,
   `altw::passthrough`)
 - `PrimitiveBlock::new` (`src/read/block.rs`) for shape 5
+- `zlib_decompress_into` / `zstd_decompress_into`
+  (`src/read/decompress.rs`) for shape 5 - the actual
+  decompressors, reached by every `decompress_*` entry point
+- `validate_groups_strict` (`src/read/block.rs`) for the
+  block-layer contract below
 
 A truncation that reaches any of those entry points must surface
 as `Err(ErrorKind::Io)` (or a more specific variant) before the
@@ -96,6 +101,88 @@ Commands that consume `BlobReader` / `ElementReader` /
 the read path propagates up through the command's `run()` and out
 to the CLI's `main`, which exits non-zero with the error message
 on stderr.
+
+## Inside the blob: the block-layer contract
+
+The stance above was originally implemented at the frame layer
+only. Everything below the blob boundary did the opposite, because
+`Iterator::next` cannot return an error: `WireMessageIter::next`
+ended the element stream on a wire error, the per-kind group
+iterators skipped any element whose `parse` failed, a malformed
+`DenseNodes` message became an empty iterator, mismatched dense
+array lengths truncated the node run, and a corrupt `Info`
+sub-message became default metadata. A corrupt blob therefore
+produced fewer elements and exit code 0 - the exact failure this
+document exists to prevent, one layer in.
+
+Since 2026-08-20 the block layer is strict too. Every
+`PrimitiveBlock` constructor funnels through `finish`, which runs
+`validate_groups_strict` before the block is handed out. Per
+group, in order:
+
+1. the group's own top-level field framing,
+2. every `Node` / `Way` / `Relation` sub-message parses,
+3. every element's optional `Info` sub-message parses,
+4. every packed array on those elements holds only complete,
+   bounded varints, and the parallel-array invariants the zipping
+   iterators depend on hold: `keys` against `vals` on all three
+   kinds, `lat` against `lon` against `refs` on ways, and
+   `roles_sid` against `memids` against `types` on relations,
+5. the `DenseNodes` sub-message parses, and its packed `id`,
+   `lat` and `lon` arrays are well-formed and of equal length.
+
+Step 4 matters as much as the rest: parsing an element only
+records the bounds of its packed fields, so a `vals` array one
+entry short, a `types` array that drops the last relation member,
+or a `lon` array that turns a closed way into an open one all
+parse cleanly and then truncate inside an infallible iterator that
+zips them. Those are silent geometry and tag changes, not just
+missing elements.
+
+Any failure is `Err` from the constructor, so it propagates like
+any other read error. The order matters: the framing walk is what
+makes the element iterators used in steps 2-4 unable to terminate
+early, so running them first would silently examine a prefix.
+
+This is a structural pass, not a second decode - sub-message
+parsing walks field headers and records slice bounds without
+decoding any packed array, and the dense length check is a byte
+scan. On a matched interleaved A/B over Denmark
+(`add-locations-to-ways`, commit `40cbae08`, host `bygg`) the cost
+was at or below run-to-run noise: 2201 ms / 2100 ms / 2100 ms for
+on / off / on.
+
+The consequence for consumers is that the `Err` arms remaining in
+the element iterators are now unreachable rather than silent: a
+block that constructed successfully cannot contain an element that
+fails to parse. There is deliberately **no lenient mode**. A
+reader that wants partial data from a corrupt file gets a hard
+error and the byte offset instead.
+
+Two dense-metadata cases are knowingly *not* covered and remain
+silent: a `DenseInfo` array shorter than the id array (metadata
+disappears from that point on) and a `keys_vals` run without a
+trailing delimiter. Both are on the read-path bug list.
+
+## Decompression bounds (shape 5)
+
+Shape 5 is enforced during decompression, not after it:
+
+- A deflate stream that ends before its final block is a typed
+  error. `flate2` reports it as `Ok(Status::BufError)` rather than
+  `Err`, so the inflate loop terminates on "no input consumed and
+  no output produced" instead of spinning.
+- The `MAX_BLOB_MESSAGE_SIZE` cap is applied *during* inflation
+  for both zlib and zstd. A blob whose declared `datasize` passes
+  the 32 MiB pre-read guard can still inflate to orders of
+  magnitude more, so a post-hoc length check fires only after the
+  process has allocated the bomb. Inflation stops one byte past
+  the cap and reports `MessageTooBig`; the true decompressed size
+  is unknown by design.
+- The `Blob.raw_size` capacity hint is clamped to the same cap
+  before it reaches `Vec::reserve`. It is an unvalidated `int32`,
+  so a corrupt blob could otherwise declare 2 GiB of
+  pre-decompression allocation from five bytes on the wire.
 
 ## Tests
 
@@ -139,14 +226,46 @@ shared `BlobReader` / `HeaderWalker` / `FileReader::skip`
 primitives - any command that goes through them inherits the
 contract.
 
-A regression at any of the six contract sites surfaces as a
+**Block and decompression layer** (unit tests beside the code):
+
+- `src/read/block.rs::strict_validation_tests` - hand-encoded
+  blocks pinning each check, each paired with a well-formed
+  counterpart so the test cannot pass against a constructor that
+  rejects everything. The mid-varint fixtures additionally keep
+  every array count equal, so only the truncation check can be
+  what rejects them; an earlier fixture did not, and passed with
+  the truncation check disabled because the length-equality check
+  fired instead.
+- `src/read/decompress.rs::tests::truncated_zlib_stream_errors_instead_of_hanging` -
+  runs the decompression on a worker thread behind a 5 s watchdog,
+  so the hang regression surfaces as a bounded failure rather than
+  as a hung suite.
+- `src/read/decompress.rs::tests::decompression_bomb_is_bounded_during_inflation`
+  and `raw_size_capacity_hint_is_clamped_to_the_cap` - pin the
+  during-inflation bound and the capacity-hint clamp separately.
+- `tests/corrupt_input.rs::zero_length_blob_header_is_rejected`
+  and `trailing_zero_run_after_valid_blobs_is_rejected` - a
+  `header_len` of 0 is a committed frame that must error, and a
+  zero run appended to a real file must not read as extra empty
+  blobs.
+- `src/read/columnar.rs::tests::short_coordinate_columns_do_not_panic_any_pass` -
+  the classification passes run before any assertion about
+  `len()`, so a regression reproduces the index-out-of-bounds
+  panic rather than tripping a cheaper structural assert first.
+
+A regression at any of the contract sites surfaces as a
 reader-layer test failure (the sweep is the end-to-end backstop
 for the six commands listed above specifically).
 
 ## Implementation status
 
-Aligned. All six contract sites listed above hard-error on shapes
-2-4. Initial alignment landed in commit `436998b` (covering
+Aligned. All contract sites listed above hard-error on shapes
+2-4. The list grew from six to eight on 2026-08-20, when the two
+decompressors and `validate_groups_strict` were added; the six
+framing sites are the ones the end-to-end sweep drives, and the
+two new ones are pinned by unit tests instead.
+
+Initial alignment landed in commit `436998b` (covering
 `BlobReader::next`, `skip_blob_body`, and `HeaderWalker::next_header`);
 the `FileReader::skip` site landed in commit `12699db` after a
 post-pass review surfaced the `read_blob_header_only` caller-side

@@ -424,6 +424,8 @@ impl PrimitiveBlock {
         let data: &[u8] = &bytes;
         let block = WireBlock::from_inline(data, meta);
 
+        validate_groups_strict(&block)?;
+
         // Validate every stringtable entry once at construction time.
         for index in 0..block.stringtable.len() {
             if let Some(raw) = block.stringtable.get(index) {
@@ -594,6 +596,9 @@ impl PrimitiveBlock {
     ///
     /// This is the columnar alternative to iterating `elements()` / `elements_skip_metadata()`
     /// for classification passes that only need ID + coordinates.
+    /// A malformed dense group cannot reach here: [`PrimitiveBlock::finish`]
+    /// rejects a block whose dense `id`/`lat`/`lon` arrays disagree in length
+    /// or fail to parse, so the `Ok` guards below are structure, not recovery.
     pub(crate) fn decode_dense_columns(
         &self,
         columns: &mut super::columnar::DenseNodeColumns,
@@ -638,6 +643,242 @@ impl PrimitiveBlock {
                 f(Element::Relation(relation));
             }
         }
+    }
+}
+
+/// Count the values in a packed varint array, rejecting one that ends
+/// mid-varint.
+///
+/// A varint's last byte has the continuation bit clear, so the value count is
+/// the number of such bytes and a trailing continuation byte means the array
+/// was truncated. This is a byte scan, not a decode - no value is
+/// reconstructed.
+#[inline]
+fn packed_varint_count(data: &[u8]) -> Result<usize> {
+    let mut count = 0usize;
+    let mut open = false;
+    for &b in data {
+        if b & 0x80 == 0 {
+            count += 1;
+            open = false;
+        } else {
+            open = true;
+        }
+    }
+    if open {
+        return Err(new_wire_error("packed varint array ends mid-varint"));
+    }
+    Ok(count)
+}
+
+/// Structural validation of every group in a block, run once at construction.
+///
+/// # Why this exists
+///
+/// `Iterator::next` cannot return an error, so every element-level decode site
+/// below the blob boundary used to swallow one: `WireMessageIter::next` ended
+/// the stream on a wire error, the `GroupNodeIter` / `GroupWayIter` /
+/// `GroupRelationIter` loops skipped any element whose `parse` failed, a
+/// malformed `DenseNodes` message became an empty iterator, and mismatched
+/// dense array lengths truncated the node run. A corrupt blob therefore
+/// produced *fewer elements* and exit code 0 - the silent data loss that
+/// `reference/truncation-handling.md` pins as a hard error at the frame layer
+/// but which was never carried into the block layer.
+///
+/// Validating once at construction fixes all of them at a single fallible site
+/// and leaves the iterators' signatures alone: after this passes, none of those
+/// `Err` arms is reachable, so the skips are dead code rather than silent loss.
+///
+/// # What is checked
+///
+/// Per group, in order: the group's own top-level field framing; each `Node`,
+/// `Way` and `Relation` sub-message parses; each element's `Info` sub-message
+/// parses; every packed array on those elements holds only complete, bounded
+/// varints; the parallel-array invariants the zipping iterators depend on hold
+/// (`keys`/`vals` on all three kinds, `lat`/`lon`/`refs` on ways,
+/// `roles_sid`/`memids`/`types` on relations); the `DenseNodes` sub-message
+/// parses; and its packed `id`, `lat` and `lon` arrays are well-formed and of
+/// equal length.
+///
+/// The framing walk comes first deliberately - it is the check that makes the
+/// element iterators used below unable to terminate early, so running the
+/// element walk first would silently examine a prefix.
+///
+/// This is a structural pass, not a decode: sub-message parsing walks field
+/// headers and records slice bounds without decoding any packed array, and the
+/// dense length check is a byte scan. No stringtable index is resolved (that
+/// is `str_from_stringtable`'s job, which is already fallible).
+///
+/// # What is deliberately not checked
+///
+/// Two dense-node arrays are out of scope for this round and remain sources of
+/// silent truncation - both are tracked as open findings in
+/// `notes/bugs-read-path.md`:
+///
+/// * `DenseNodes.keys_vals`, whose zero-terminated per-node structure needs a
+///   full stateful walk rather than a byte scan to length-check.
+/// * `DenseNodes.denseinfo`, whose six parallel arrays must each match the node
+///   count.
+///
+/// Neither can be validated by the array-length equality this function applies,
+/// so asserting them here would mean claiming a check that is not performed.
+///
+/// No error raised here carries a byte offset. These sites sit below the
+/// framing layer and cannot know their position in the file; the enclosing
+/// `BlobReader` stamps the blob's offset on the way out, and the innermost-wins
+/// rule means an absent inner offset never displaces a more precise one.
+fn validate_groups_strict(block: &WireBlock<'_>) -> Result<()> {
+    use super::wire::Cursor;
+
+    for index in 0..block.group_count() {
+        let data = block.group(index);
+
+        // 1. The group's own field framing. Everything below walks this same
+        //    byte range through iterators that cannot report an error.
+        let mut cursor = Cursor::new(data);
+        while let Some((_field, wire_type)) = cursor.read_tag()? {
+            cursor.skip_field(wire_type)?;
+        }
+
+        let group = WireGroup::new(data);
+
+        // 2. Every element sub-message, its optional Info sub-message, and
+        //    every packed array it carries - both well-formedness and the
+        //    parallel-array invariants the zipping iterators depend on.
+        for element in group.nodes() {
+            let node = WireNode::parse(element)?;
+            validate_info(node.info_data)?;
+            validate_tag_arrays(
+                node.keys_data,
+                node.vals_data,
+                "node has mismatched keys/vals tag array lengths",
+            )?;
+        }
+        for element in group.ways() {
+            let way = WireWay::parse(element)?;
+            validate_info(way.info_data)?;
+            validate_tag_arrays(
+                way.keys_data,
+                way.vals_data,
+                "way has mismatched keys/vals tag array lengths",
+            )?;
+            validate_way_geometry_arrays(&way)?;
+        }
+        for element in group.relations() {
+            let relation = WireRelation::parse(element)?;
+            validate_info(relation.info_data)?;
+            validate_tag_arrays(
+                relation.keys_data,
+                relation.vals_data,
+                "relation has mismatched keys/vals tag array lengths",
+            )?;
+            validate_relation_member_arrays(&relation)?;
+        }
+
+        // 3. The dense group, and the parallel-array invariant every dense
+        //    consumer indexes on.
+        if let Some(dense_data) = group.dense()? {
+            let dense = WireDenseNodes::parse(dense_data)?;
+            let ids = packed_varint_count(dense.id_data)?;
+            let lats = packed_varint_count(dense.lat_data)?;
+            let lons = packed_varint_count(dense.lon_data)?;
+            if ids != lats || ids != lons {
+                return Err(new_wire_error(
+                    "dense group has mismatched id/lat/lon array lengths",
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate an element's packed `keys` / `vals` tag arrays.
+///
+/// `TagIter` and `RawTagIter` zip the two arrays and stop at the shorter one,
+/// so a `vals` array one entry short drops the final tag and reports success.
+/// The two arrays are parallel by definition - a tag is a (key, val) pair -
+/// so any disagreement is corruption, never a shorter-but-valid encoding.
+///
+/// `mismatch` names the element kind in the error text; `ErrorKind::WireFormat`
+/// carries a `&'static str`, so the caller supplies the message rather than
+/// this function formatting one.
+#[inline]
+fn validate_tag_arrays(keys_data: &[u8], vals_data: &[u8], mismatch: &'static str) -> Result<()> {
+    let keys = packed_varint_count(keys_data)?;
+    let vals = packed_varint_count(vals_data)?;
+    if keys != vals {
+        return Err(new_wire_error(mismatch));
+    }
+    Ok(())
+}
+
+/// Validate a way's packed `refs` array and its optional `LocationsOnWays`
+/// coordinate arrays.
+///
+/// `WayRefIter` walks `refs` alone, so a `refs` array ending mid-varint simply
+/// yields one node fewer. `WayNodeLocationsIter` zips `lat` against `lon` and
+/// stops at the shorter, so a truncated `lon` silently shortens the geometry -
+/// which for a closed way turns a ring into an open line and changes what
+/// point-in-polygon answers.
+///
+/// The coordinate arrays are optional as a pair: a way written without the
+/// `LocationsOnWays` optional feature carries neither. When either is present
+/// both must be, and both must run parallel to `refs` - libosmium and this
+/// crate's own writer emit one coordinate per node reference in a single loop,
+/// so a partial coordinate run is not a shape any writer produces.
+#[inline]
+fn validate_way_geometry_arrays(way: &WireWay<'_>) -> Result<()> {
+    let refs = packed_varint_count(way.refs_data)?;
+    let lats = packed_varint_count(way.lat_data)?;
+    let lons = packed_varint_count(way.lon_data)?;
+
+    if lats == 0 && lons == 0 {
+        // No LocationsOnWays payload: refs alone, already length-checked.
+        return Ok(());
+    }
+    if lats != lons {
+        return Err(new_wire_error(
+            "way has mismatched lat/lon node-location array lengths",
+        ));
+    }
+    if lats != refs {
+        return Err(new_wire_error(
+            "way has a node-location count that disagrees with its node-reference count",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a relation's three parallel member arrays.
+///
+/// `RelMemberIter` zips `roles_sid`, `memids` and `types` and ends as soon as
+/// any one runs out, so a short `types` array drops trailing members from a
+/// multipolygon without any error - the ring assembler then sees an incomplete
+/// relation and produces a wrong geometry rather than a failure.
+#[inline]
+fn validate_relation_member_arrays(relation: &WireRelation<'_>) -> Result<()> {
+    let roles = packed_varint_count(relation.roles_sid_data)?;
+    let memids = packed_varint_count(relation.memids_data)?;
+    let types = packed_varint_count(relation.types_data)?;
+    if roles != memids || roles != types {
+        return Err(new_wire_error(
+            "relation has mismatched roles_sid/memids/types member array lengths",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate an element's optional `Info` sub-message.
+///
+/// `elements.rs` reads info as `WireInfo::parse(d).ok().unwrap_or_default()`,
+/// which turns corrupt metadata into default metadata (version 0, timestamp 0)
+/// that is indistinguishable from genuinely absent metadata.
+#[inline]
+fn validate_info(info_data: Option<&[u8]>) -> Result<()> {
+    match info_data {
+        Some(data) => super::wire::WireInfo::parse(data).map(|_| ()),
+        None => Ok(()),
     }
 }
 
@@ -954,5 +1195,278 @@ pub(crate) fn get_stringtable_key_value<'a>(
             }
         }
         _ => None,
+    }
+}
+
+// Tests use `unwrap()`/`expect()` because panicking is the correct failure mode
+// for unit tests; see the note in `blob_wire.rs`'s test module for the
+// crate-wide `unwrap_used = "deny"` exemption.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod strict_validation_tests {
+    use super::PrimitiveBlock;
+
+    /// Wrap `body` as protobuf field `field`, wire type 2 (length-delimited).
+    /// Every fixture here is small enough for a single-byte length varint,
+    /// which keeps the hand-encoding readable.
+    fn len_field(field: u8, body: &[u8]) -> Vec<u8> {
+        assert!(body.len() < 128, "fixture bodies stay single-byte-length");
+        #[allow(clippy::cast_possible_truncation)]
+        let mut out = vec![(field << 3) | 2, body.len() as u8];
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A `PrimitiveBlock` carrying a one-entry (empty string) StringTable and
+    /// the given PrimitiveGroup bodies.
+    fn block_with_groups(groups: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = len_field(1, &len_field(1, &[]));
+        for group in groups {
+            out.extend_from_slice(&len_field(2, group));
+        }
+        out
+    }
+
+    /// A DenseNodes group whose packed id/lat/lon arrays hold the given counts
+    /// of one-byte varints.
+    fn dense_group(ids: usize, lats: usize, lons: usize) -> Vec<u8> {
+        let mut dense = len_field(1, &vec![0x02u8; ids]);
+        dense.extend_from_slice(&len_field(8, &vec![0x02u8; lats]));
+        dense.extend_from_slice(&len_field(9, &vec![0x02u8; lons]));
+        len_field(2, &dense)
+    }
+
+    /// A dense group whose `lat` array is shorter than its `id` array is a
+    /// hard error at construction, not a silently truncated node run.
+    ///
+    /// The equal-length case is asserted first and must succeed - without it
+    /// this test would pass just as well against a `from_vec` that rejects
+    /// every block.
+    #[test]
+    fn dense_group_with_mismatched_array_lengths_is_rejected() {
+        PrimitiveBlock::from_vec(block_with_groups(&[dense_group(4, 4, 4)]))
+            .expect("a dense group with equal-length arrays is valid");
+
+        let err = PrimitiveBlock::from_vec(block_with_groups(&[dense_group(4, 2, 4)]))
+            .expect_err("a short lat array must be rejected");
+        assert!(
+            format!("{err}").contains("mismatched"),
+            "expected a mismatched-array error, got: {err}"
+        );
+
+        PrimitiveBlock::from_vec(block_with_groups(&[dense_group(4, 4, 3)]))
+            .expect_err("a short lon array must be rejected");
+    }
+
+    /// A packed array whose last varint is cut mid-value is rejected rather
+    /// than silently yielding one value fewer.
+    ///
+    /// The fixture is built so that only the mid-varint check can reject it.
+    /// The `id` array's trailing continuation byte contributes no value to the
+    /// count, so `id` counts 2 - and `lat`/`lon` carry 2 complete varints each
+    /// to match. With equal counts the array-length equality check is satisfied
+    /// and cannot fire, which is the whole point: an earlier version of this
+    /// fixture gave `lat`/`lon` three values each, so disabling the mid-varint
+    /// check still failed the block on the length mismatch and the test passed
+    /// while testing nothing.
+    #[test]
+    fn dense_packed_array_ending_mid_varint_is_rejected() {
+        // Two complete ids plus a dangling continuation byte; lat/lon carry
+        // exactly two complete varints, so all three counts are 2.
+        let mut dense = len_field(1, &[0x02, 0x02, 0x82]);
+        dense.extend_from_slice(&len_field(8, &[0x02, 0x02]));
+        dense.extend_from_slice(&len_field(9, &[0x02, 0x02]));
+        let err = PrimitiveBlock::from_vec(block_with_groups(&[len_field(2, &dense)]))
+            .expect_err("a packed array ending mid-varint must be rejected");
+        assert!(
+            format!("{err}").contains("mid-varint"),
+            "the mid-varint check must be what rejects this, not the length \
+             equality check; got: {err}"
+        );
+
+        // The same fixture with the dangling byte completed is valid, so the
+        // rejection above is attributable to the truncation and not to the
+        // fixture being malformed in some other way.
+        let mut good = len_field(1, &[0x02, 0x02]);
+        good.extend_from_slice(&len_field(8, &[0x02, 0x02]));
+        good.extend_from_slice(&len_field(9, &[0x02, 0x02]));
+        PrimitiveBlock::from_vec(block_with_groups(&[len_field(2, &good)]))
+            .expect("the untruncated fixture must parse");
+    }
+
+    /// A malformed element sub-message is a hard error, not a skipped element.
+    ///
+    /// Each fixture pairs one valid element with one whose `keys` field
+    /// declares more bytes than the sub-message contains. Before strict
+    /// validation the block constructed cleanly and iteration simply yielded
+    /// the valid element, so `pbfhogg cat corrupt.pbf` exited 0 having written
+    /// fewer elements than it read.
+    #[test]
+    fn malformed_element_submessage_is_rejected() {
+        // field 2 (keys), length-delimited, declares 5 bytes and supplies none.
+        let truncated = [0x12u8, 0x05];
+        // field 1 (id) = 1: a minimal valid element of any of the three kinds.
+        let valid = [0x08u8, 0x01];
+
+        for field in [1u8, 3, 4] {
+            let mut group = len_field(field, &valid);
+            PrimitiveBlock::from_vec(block_with_groups(&[group.clone()]))
+                .unwrap_or_else(|e| panic!("field {field}: valid element must parse: {e}"));
+
+            group.extend_from_slice(&len_field(field, &truncated));
+            assert!(
+                PrimitiveBlock::from_vec(block_with_groups(&[group])).is_err(),
+                "field {field}: a malformed element sub-message must be rejected"
+            );
+        }
+    }
+
+    /// A packed varint array holding `count` one-byte values.
+    fn packed(field: u8, count: usize) -> Vec<u8> {
+        len_field(field, &vec![0x02u8; count])
+    }
+
+    /// Mismatched `keys`/`vals` tag arrays are a hard error on every element
+    /// kind, not a silently dropped final tag.
+    ///
+    /// `TagIter` and `RawTagIter` zip the two arrays and stop at the shorter,
+    /// so before this check a way whose `vals` array lost its last entry kept
+    /// every other tag and reported success - `pbfhogg tags-filter` would then
+    /// silently fail to match on the dropped tag.
+    ///
+    /// The matched-length case is asserted first for each kind and must
+    /// succeed, so the test cannot pass against a validator that rejects
+    /// everything.
+    #[test]
+    fn mismatched_keys_vals_arrays_are_rejected_on_every_element_kind() {
+        // Group field 1 = Node, 3 = Way, 4 = Relation.
+        for field in [1u8, 3, 4] {
+            let mut ok = vec![0x08u8, 0x01];
+            ok.extend_from_slice(&packed(2, 3));
+            ok.extend_from_slice(&packed(3, 3));
+            PrimitiveBlock::from_vec(block_with_groups(&[len_field(field, &ok)]))
+                .unwrap_or_else(|e| panic!("field {field}: equal keys/vals must parse: {e}"));
+
+            let mut short = vec![0x08u8, 0x01];
+            short.extend_from_slice(&packed(2, 3));
+            short.extend_from_slice(&packed(3, 2));
+            let err = PrimitiveBlock::from_vec(block_with_groups(&[len_field(field, &short)]))
+                .expect_err("a short vals array must be rejected");
+            assert!(
+                format!("{err}").contains("keys/vals"),
+                "field {field}: expected a keys/vals error, got: {err}"
+            );
+        }
+    }
+
+    /// A packed array on a regular element that ends mid-varint is rejected
+    /// rather than silently yielding one value fewer.
+    ///
+    /// The dense equivalent is covered above; this is the regular-element path,
+    /// which reaches a different validator.
+    #[test]
+    fn regular_element_packed_array_ending_mid_varint_is_rejected() {
+        // A way whose refs array's final varint sets the continuation bit and
+        // has no successor byte.
+        let mut way = vec![0x08u8, 0x01];
+        way.extend_from_slice(&len_field(8, &[0x02, 0x02, 0x82]));
+        PrimitiveBlock::from_vec(block_with_groups(&[len_field(3, &way)]))
+            .expect_err("a refs array ending mid-varint must be rejected");
+
+        // The same way with a complete final varint is valid.
+        let mut good = vec![0x08u8, 0x01];
+        good.extend_from_slice(&len_field(8, &[0x02, 0x02, 0x02]));
+        PrimitiveBlock::from_vec(block_with_groups(&[len_field(3, &good)]))
+            .expect("a complete refs array must parse");
+    }
+
+    /// A way's `LocationsOnWays` coordinate arrays must run parallel to each
+    /// other and to `refs`.
+    ///
+    /// `WayNodeLocationsIter` zips `lat` against `lon` and stops at the
+    /// shorter, so a truncated `lon` silently shortens the geometry - for a
+    /// closed way that turns a ring into an open line and changes what
+    /// point-in-polygon answers, with no error anywhere.
+    ///
+    /// A way with no coordinate arrays at all is the common case (no
+    /// `LocationsOnWays` feature) and must stay valid; it is asserted first.
+    #[test]
+    fn way_node_location_arrays_must_match_refs() {
+        let with_refs_only = {
+            let mut way = vec![0x08u8, 0x01];
+            way.extend_from_slice(&packed(8, 3));
+            way
+        };
+        PrimitiveBlock::from_vec(block_with_groups(&[len_field(3, &with_refs_only)]))
+            .expect("a way without node locations must stay valid");
+
+        let build = |refs: usize, lats: usize, lons: usize| {
+            let mut way = vec![0x08u8, 0x01];
+            way.extend_from_slice(&packed(8, refs));
+            way.extend_from_slice(&packed(9, lats));
+            way.extend_from_slice(&packed(10, lons));
+            block_with_groups(&[len_field(3, &way)])
+        };
+
+        PrimitiveBlock::from_vec(build(3, 3, 3))
+            .expect("parallel refs/lat/lon arrays must be valid");
+
+        let err = PrimitiveBlock::from_vec(build(3, 3, 2))
+            .expect_err("a short lon array must be rejected");
+        assert!(
+            format!("{err}").contains("lat/lon"),
+            "expected a lat/lon mismatch error, got: {err}"
+        );
+
+        PrimitiveBlock::from_vec(build(3, 2, 2))
+            .expect_err("coordinates that do not cover every node ref must be rejected");
+    }
+
+    /// A relation's three parallel member arrays must agree in length.
+    ///
+    /// `RelMemberIter` zips `roles_sid`, `memids` and `types` and ends as soon
+    /// as any one runs out, so a short `types` array drops trailing members
+    /// from a multipolygon - the ring assembler then builds a wrong geometry
+    /// from an incomplete member list rather than failing.
+    #[test]
+    fn mismatched_relation_member_arrays_are_rejected() {
+        let build = |roles: usize, memids: usize, types: usize| {
+            let mut rel = vec![0x08u8, 0x01];
+            rel.extend_from_slice(&packed(8, roles));
+            rel.extend_from_slice(&packed(9, memids));
+            rel.extend_from_slice(&packed(10, types));
+            block_with_groups(&[len_field(4, &rel)])
+        };
+
+        PrimitiveBlock::from_vec(build(3, 3, 3)).expect("parallel member arrays must be valid");
+
+        let err = PrimitiveBlock::from_vec(build(3, 3, 2))
+            .expect_err("a short types array must be rejected");
+        assert!(
+            format!("{err}").contains("member array"),
+            "expected a member-array mismatch error, got: {err}"
+        );
+
+        PrimitiveBlock::from_vec(build(3, 2, 3))
+            .expect_err("a short memids array must be rejected");
+    }
+
+    /// A corrupt `Info` sub-message is a hard error rather than silently
+    /// becoming default metadata (version 0, timestamp 0), which is
+    /// indistinguishable from genuinely absent metadata.
+    #[test]
+    fn malformed_element_info_is_rejected() {
+        // Node with field 4 (info) whose body is a varint field with no value.
+        let bad_info = len_field(4, &[0x08]);
+        let mut node = vec![0x08u8, 0x01];
+        node.extend_from_slice(&bad_info);
+        PrimitiveBlock::from_vec(block_with_groups(&[len_field(1, &node)]))
+            .expect_err("a truncated Info sub-message must be rejected");
+
+        // Same node with a well-formed info (version = 1) still parses.
+        let mut good = vec![0x08u8, 0x01];
+        good.extend_from_slice(&len_field(4, &[0x08, 0x01]));
+        PrimitiveBlock::from_vec(block_with_groups(&[len_field(1, &good)]))
+            .expect("a well-formed Info sub-message must parse");
     }
 }

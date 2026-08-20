@@ -34,9 +34,22 @@ impl DenseNodeColumns {
     }
 
     /// Number of nodes.
+    ///
+    /// The three columns are decoded by three independent loops, so their
+    /// lengths are only equal because the wire data said so. Reporting
+    /// `ids.len()` made every `for i in 0..len { lats[i]; lons[i] }` below a
+    /// panic waiting for a dense group with a truncated (or absent) `lat`
+    /// array - reachable from untrusted input via `extract --strategy smart`
+    /// and `multi-extract`. Taking the minimum makes positional indexing
+    /// total: no length can be out of range for any column.
+    ///
+    /// This is the panic-proofing, not the correctness guard. A dense group
+    /// whose arrays disagree is a hard error at block construction
+    /// (`validate_groups_strict` in `block.rs`), so a short column never
+    /// reaches here and this `min` never actually truncates anything.
     #[inline]
     pub fn len(&self) -> usize {
-        self.ids.len()
+        self.ids.len().min(self.lats.len()).min(self.lons.len())
     }
 
     /// Clear all columns for reuse.
@@ -53,6 +66,12 @@ impl DenseNodeColumns {
     ///
     /// **Does not clear** - call `clear()` before the first group if needed.
     /// This allows multiple dense groups in a single block to be appended.
+    ///
+    /// The three arrays are decoded independently and their lengths are only
+    /// equal because the wire data said so; [`Self::len`] takes the minimum so
+    /// that a disagreement cannot become an out-of-bounds index downstream,
+    /// and `validate_groups_strict` in `block.rs` rejects the disagreement
+    /// outright at block construction.
     #[allow(clippy::cast_possible_truncation)]
     pub fn decode_append(
         &mut self,
@@ -252,5 +271,57 @@ mod tests {
         columns.collect_matching_ids_multi_bbox(&bboxes, &mut linear);
         columns.collect_matching_ids_multi_bbox_grid(&bboxes, &grid, &mut pruned);
         assert_eq!(pruned, linear);
+    }
+
+    /// Columns whose `lat`/`lon` arrays are shorter than `ids` must not panic
+    /// any classification pass.
+    ///
+    /// This is the shape a dense group with a truncated (or absent) packed
+    /// `lat` field decodes to: three independent decode loops, three different
+    /// lengths. Every pass here indexes `lats[i]` / `lons[i]` with `i` drawn
+    /// from `len()`, so while `len()` reported `ids.len()` all three were an
+    /// index-out-of-bounds panic on untrusted input, reachable from
+    /// `extract --strategy smart` and `multi-extract`.
+    #[test]
+    fn short_coordinate_columns_do_not_panic_any_pass() {
+        let mut columns = DenseNodeColumns::new();
+        for id in 0..64_i64 {
+            columns.ids.push(id);
+        }
+        // Coordinates for only the first 10 nodes, and one column shorter
+        // still - `len()` must respect the shortest of the three.
+        for i in 0..10_i32 {
+            columns.lats.push(i * 1_000_000);
+        }
+        for i in 0..7_i32 {
+            columns.lons.push(i * 1_000_000);
+        }
+        // The passes run FIRST, before any assertion about `len()` itself: a
+        // structural `assert_eq!(columns.len(), 7)` up here would trip before
+        // the indexing loops ever executed, so a regression would surface as a
+        // failed length assertion rather than as the panic this test exists to
+        // prevent - and a reader would never learn whether the panic was back.
+        let bboxes = [(-900_000_000, 900_000_000, -1_800_000_000, 1_800_000_000)];
+        let grid = RegionGrid::build(&bboxes).expect("fixture is within budget");
+
+        let mut out = vec![Vec::new()];
+        columns.collect_matching_ids_multi_bbox(&bboxes, &mut out);
+        assert_eq!(out[0].len(), 7);
+
+        let mut pruned = vec![Vec::new()];
+        columns.collect_matching_ids_multi_bbox_grid(&bboxes, &grid, &mut pruned);
+        assert_eq!(pruned[0].len(), 7);
+
+        let mut single = Vec::new();
+        columns.collect_matching_ids_bbox(
+            -900_000_000,
+            900_000_000,
+            -1_800_000_000,
+            1_800_000_000,
+            &mut single,
+        );
+        assert_eq!(single.len(), 7);
+
+        assert_eq!(columns.len(), 7, "len() must be the shortest column");
     }
 }

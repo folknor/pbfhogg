@@ -74,6 +74,62 @@ fn truncated_header_size() {
     }
 }
 
+/// A zero-length `BlobHeader` is rejected, so a run of zero bytes cannot read
+/// as a stream of empty frames.
+///
+/// A `header_len` of 0 forms a legal-looking 4-byte frame: the header parses to
+/// an unknown blob type with `datasize == 0`, which every consumer skips
+/// without decoding. A file of `N` zero bytes therefore used to read as `N/4`
+/// empty blobs - exit 0, empty output, no diagnostic. That is worse than a hard
+/// error and worse than a hang: it silently substitutes an empty result for the
+/// user's data.
+#[test]
+fn zero_length_blob_header_is_rejected() {
+    let data = 0u32.to_be_bytes().to_vec();
+    let mut reader = BlobReader::new(Cursor::new(data));
+    let err = reader
+        .next()
+        .expect("a complete 4-byte length prefix is a committed frame, not EOF")
+        .unwrap_err();
+    assert!(
+        matches!(
+            err.into_kind(),
+            ErrorKind::Blob(BlobError::InvalidHeaderSize)
+        ),
+        "a zero-length BlobHeader must be InvalidHeaderSize"
+    );
+}
+
+/// The same rejection applies mid-file: zeros appended to (or substituted
+/// into) an otherwise valid PBF must not read as clean success.
+#[test]
+fn trailing_zero_run_after_valid_blobs_is_rejected() {
+    let mut data = write_one_block_pbf();
+    let good_blobs = BlobReader::new(Cursor::new(data.clone()))
+        .filter(Result::is_ok)
+        .count();
+    assert!(good_blobs >= 2, "fixture must have header + data blobs");
+
+    data.extend_from_slice(&[0u8; 64]);
+    let mut reader = BlobReader::new(Cursor::new(data));
+    let mut seen = 0;
+    let mut errored = false;
+    for result in reader.by_ref() {
+        match result {
+            Ok(_) => seen += 1,
+            Err(_) => {
+                errored = true;
+                break;
+            }
+        }
+    }
+    assert_eq!(seen, good_blobs, "the real blobs must still be readable");
+    assert!(
+        errored,
+        "a 64-byte zero run must surface as an error, not 16 empty blobs"
+    );
+}
+
 /// Header size >= MAX_BLOB_HEADER_SIZE (64 KB) triggers HeaderTooBig.
 #[test]
 fn header_too_big() {

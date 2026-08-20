@@ -14,8 +14,43 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 
-/// Maximum number of framed blobs in-flight before backpressure stalls senders.
-pub(crate) const WRITE_AHEAD: usize = 32;
+/// Capacity of the ordered channel between producers and the writer thread.
+///
+/// # Why this equals [`PIPELINE_DISPATCH_PERMITS`]
+///
+/// This is a liveness bound, not a memory bound. Memory is already bounded by
+/// the permit pool, and a *second*, smaller bound here does not save anything -
+/// it only creates a deadlock.
+///
+/// The shape of that deadlock: rayon framing closures block in `tx.send` while
+/// holding a rayon worker thread, and the writer thread pops strictly in seq
+/// order. Let the task for seq *k* still be sitting in rayon's injector queue
+/// while later-seq results fill the channel and every remaining rayon thread
+/// blocks in `send`. Nothing can progress - the writer waits for *k*, and *k*
+/// cannot be stolen, because every thread that could run it is parked inside a
+/// `send`. The old 32-slot channel made this reachable at a reorder distance of
+/// 33, and the only thing standing between the pipeline and a hung
+/// planet-scale write was that rayon's FIFO injector *tends* to start spawns in
+/// order. That is an observed habit of a third-party scheduler, not a
+/// documented guarantee, and "very unlikely" is not a liveness argument.
+///
+/// Sizing the channel to the permit count removes the possibility outright,
+/// with an argument that needs to know nothing about how rayon schedules:
+///
+/// * every send path holds a dispatch permit across its send, so the number of
+///   produced-but-not-yet-delivered items never exceeds
+///   `PIPELINE_DISPATCH_PERMITS`;
+/// * a sender that is *about* to send holds one of those permits itself, so at
+///   most `PIPELINE_DISPATCH_PERMITS - 1` items can already be buffered;
+/// * with `WRITE_AHEAD >= PIPELINE_DISPATCH_PERMITS` the channel therefore
+///   always has a free slot for it, so **no send can ever block on a full
+///   channel**, so no thread can be parked holding work the writer is waiting
+///   for.
+///
+/// Backpressure is unchanged: it now comes entirely from `permit_rx.recv()` on
+/// the producer thread, which is where it belonged. Peak memory is unchanged
+/// too, because the permits - not the channel - were always the real cap.
+pub(crate) const WRITE_AHEAD: usize = PIPELINE_DISPATCH_PERMITS;
 
 /// Maximum number of in-flight rayon dispatches in the pipelined writer.
 ///
@@ -33,6 +68,19 @@ pub(crate) const WRITE_AHEAD: usize = 32;
 /// compared to the 2.79 GB stage-2b peak.
 pub(crate) const PIPELINE_DISPATCH_PERMITS: usize = 64;
 
+/// The pipeline's liveness invariant, enforced at compile time.
+///
+/// A channel smaller than the permit pool lets a sender block on a full
+/// channel, and a blocked rayon worker cannot run the earlier-seq task the
+/// writer thread is waiting for. See [`WRITE_AHEAD`] for the full argument.
+/// Anyone who lowers `WRITE_AHEAD` or raises `PIPELINE_DISPATCH_PERMITS` in
+/// isolation gets a build failure rather than an intermittent hang.
+const _: () = assert!(
+    WRITE_AHEAD >= PIPELINE_DISPATCH_PERMITS,
+    "WRITE_AHEAD must be at least PIPELINE_DISPATCH_PERMITS or a full channel \
+     can deadlock the pipeline"
+);
+
 /// One unit of output the writer thread can consume, independent of backend.
 ///
 /// `Framed` is the common case (a compressed `OSMData` blob). `Raw` and
@@ -46,10 +94,20 @@ pub(crate) enum OutputChunk {
     /// Multiple framed blob chunks, written sequentially. Avoids
     /// concatenating passthrough frames into a single Vec.
     RawChunks(Vec<Vec<u8>>),
-    /// Kernel-space copy from input fd (avoids userspace copy for passthrough).
+    /// Kernel-space copy from the input file (avoids a userspace copy for
+    /// passthrough).
+    ///
+    /// The input is carried as an `Arc<File>`, not a `RawFd`. A raw descriptor
+    /// number queued into another thread's channel has no lifetime tie to the
+    /// `File` that owns it: close the input before `flush()`, or let the fd
+    /// number be recycled by an unrelated `open`, and the copy splices
+    /// whatever now sits at that descriptor - no error, wrong bytes, from a
+    /// path whose whole point is byte-exact passthrough. Every in-tree caller
+    /// happened to keep its input alive, but nothing made them. An `Arc` costs
+    /// one refcount per passthrough run and makes the guarantee structural.
     #[cfg(feature = "linux-direct-io")]
     CopyRange {
-        in_fd: std::os::unix::io::RawFd,
+        in_file: std::sync::Arc<std::fs::File>,
         offset: u64,
         len: u64,
     },
@@ -155,7 +213,13 @@ impl OutputSink for FileOutputSink {
                 Ok(())
             }
             #[cfg(feature = "linux-direct-io")]
-            OutputChunk::CopyRange { in_fd, offset, len } => {
+            OutputChunk::CopyRange {
+                in_file,
+                offset,
+                len,
+            } => {
+                use std::os::unix::io::AsRawFd;
+                let in_fd = in_file.as_raw_fd();
                 let t_write = std::time::Instant::now();
                 let out_fd = self.writer.flush_and_raw_fd()?.ok_or_else(|| {
                     io::Error::new(
@@ -164,6 +228,8 @@ impl OutputSink for FileOutputSink {
                     )
                 })?;
                 super::copy_range::copy_range(in_fd, out_fd, offset, len)?;
+                // Hold the input open until the splice has actually happened.
+                drop(in_file);
                 WRITER_METRICS
                     .write_ns
                     .fetch_add(elapsed_ns_u64(t_write), Relaxed);
@@ -173,8 +239,15 @@ impl OutputSink for FileOutputSink {
         }
     }
 
+    /// End of stream: finalize *and* make durable.
+    ///
+    /// `OutputSink::flush` is the pipeline's finalization hook, not a
+    /// `Write::flush`, so it asks for the durability explicitly. The two used
+    /// to be the same method on [`FileWriter`], which meant every incidental
+    /// `flush()` anywhere bought an `fsync`; the sibling uring and parallel
+    /// backends already `sync_all` by name at this point.
     fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
+        self.writer.sync()
     }
 }
 
@@ -192,6 +265,8 @@ pub(super) struct WritePipeline {
     /// End-of-stream handshake shared with the writer thread. `flush`
     /// announces `seq` into it before dropping `tx`; see [`SeqTotal`].
     pub(super) expected: SeqTotal,
+    /// Death notice from the framing closures; see [`WriterGone`].
+    pub(super) writer_gone: WriterGone,
 }
 
 /// Build a fresh permit pool pre-filled with `PIPELINE_DISPATCH_PERMITS`
@@ -234,6 +309,47 @@ impl Drop for PermitGuard {
         // Failure here means the main thread already dropped its receiver
         // (shutting down); safe to ignore.
         self.0.send(()).ok();
+    }
+}
+
+/// The framing closures' death notice: "the writer thread is already gone".
+///
+/// The counterpart to [`SeqTotal`]. `SeqTotal` carries information *forward*
+/// from the producer to the writer thread at end of stream; this carries it
+/// *back* from the framing closures to the producer, mid-stream.
+///
+/// `write_raw` and `write_raw_copy` send from the producer's own thread, so a
+/// failed send is a `Result` they can return - and `pipeline_send_error` in
+/// `writer.rs` joins the dead writer thread and surfaces its real cause.
+/// `write_primitive_block*` cannot:
+/// the send happens inside a `rayon::spawn` closure whose return value goes
+/// nowhere, so it ended in `drop(tx.send(...))` and a writer thread that died
+/// on ENOSPC stayed invisible until `flush()`. Nothing throttles the producer
+/// either - the permit pool keeps handing out permits because the closures
+/// keep *completing* - so a full disk let an entire planet-scale dataset be
+/// read, decoded and framed before anything was reported.
+///
+/// The closure therefore records the failed send here, and the next
+/// `write_primitive_block*` on the producer thread reads the flag, joins the
+/// writer, and returns its real error. Reporting lags by at most the blocks
+/// already in flight; correctness is unchanged either way, since `flush()`
+/// always joined and reported in the end.
+#[derive(Clone, Default)]
+pub(crate) struct WriterGone(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl WriterGone {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that a send to the writer thread failed, which happens only
+    /// because the receiver was dropped, i.e. the thread has already exited.
+    pub(super) fn record(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(super) fn observed(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -353,9 +469,7 @@ pub(super) fn writer_thread<S: OutputSink>(
             Ok(item) => item,
             Err(_) => break,
         };
-        WRITER_METRICS
-            .recv_wait_ns
-            .fetch_add(elapsed_ns_u64(t_recv), Relaxed);
+        WRITER_METRICS.record_recv_wait(t_recv);
         pending.push(item.seq, item.data);
         WRITER_METRICS.record_reorder_high_water(pending.pending_len());
 

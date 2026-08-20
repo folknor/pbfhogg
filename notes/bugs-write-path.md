@@ -3,117 +3,9 @@
 Hunt date 2026-08-12. Single Opus hunter, scope: `src/write/` in full. Findings
 only, unverified. Ordered roughly by severity as the hunter ranked them.
 
-## Large `--elements-per-blob` hard-fails on the BlobHeader size cap, via tagdata
-
-`src/write/block_builder.rs` plus `framing.rs::encode_blob_header_into`.
-
-`encode_block` serializes every distinct tag key in the block into `tagdata`,
-which becomes BlobHeader field 4. `encode_blob_header_into` rejects any header
-`>= 65536` bytes. At the default 8000-element cap the tagdata is already tens of
-KB; `repack --elements-per-blob 228000` (an advertised, benchmarked use case -
-planet-style densities) will routinely blow past 64 KB and abort the whole write
-with an opaque "BlobHeader for OSMData is N bytes" error. There is no fallback
-(truncate the key set, drop tagdata, split the blob).
-
-Confidence: medium-high on the mechanism; worth an actual repack-at-density
-test.
-
-Secondary, currently masked by the above: `count as u16` and `key_len as u16` in
-the tagdata serializer (and in `blob_meta/tag_index.rs::serialize`) truncate
-silently. Since tagdata is consumed as a skip filter, a truncated key list would
-make `tags-filter` skip blobs that do contain the key - wrong results, not just
-slow ones. Add an explicit cap/error rather than relying on the header limit to
-catch it first.
-
-## `write_primitive_block*` cannot detect a dead writer thread
-
-`src/write/writer.rs`.
-
-The `write_raw*` / `write_raw_copy` send-failure paths now join the writer
-thread and surface its real error, but `write_primitive_block*` still hands its
-result to a rayon closure that ends in `drop(tx.send(...))`. A writer thread
-that died on ENOSPC is therefore invisible until `flush()`, so a full disk lets
-the whole dataset be processed before anything is reported. The permit pool is
-the only backpressure, and it keeps handing out permits because the closures
-keep completing.
-
-Filed standalone from the (resolved) "Real I/O errors are replaced by writer
-thread terminated" finding, whose fix covers only the paths that had a `Result`
-to return.
-
-Confidence: high on the mechanism; the cost is latency of reporting, not
-correctness.
-
-## `AlignedBufferPool` is freed while io_uring writes may still reference it
-
-`src/write/uring_writer.rs`, error paths out of `uring_main_loop` /
-`flush_final`.
-
-On any error return, `UringState` is dropped without `drain()`. Field order
-drops `ring` before `pool`, but closing the ring fd does not synchronously
-complete or cancel in-flight `WriteFixed` SQEs; the kernel keeps the registered
-pages pinned while userspace `dealloc`s the virtual range, which the allocator
-can hand back out. A subsequent allocation can then be overwritten by a
-completing DMA. Narrow (error paths only) but it is a memory-corruption class
-bug, not a data bug. Best fix: make teardown attempt `drain()` (best-effort,
-ignoring errors) before the pool is released.
-
-Confidence: medium - depends on kernel teardown ordering; worth confirming
-against `io_uring_release` semantics.
-
-Same file: `user_data` packs `buf_idx` in the low 16 bits but `ud_buf_idx` masks
-`0x3F`. Raising `NUM_BUFS` above 64 silently returns the wrong index to the free
-list - two writers sharing one buffer, i.e. corrupt output, with no compile-time
-guard. Add a `const _: () = assert!(NUM_BUFS <= 64);`.
-
-## `Write::flush` means `fsync` - surprising and expensive
-
-`src/write/file_writer.rs`.
-
-`FileWriter::flush` calls `sync_all()` on both variants. Any incidental `flush()`
-(a wrapping `BufWriter`, a generic helper, a library consumer following `Write`
-semantics) triggers a full fsync. Should be a distinct `sync()` method; `flush`
-should flush.
-
-Confidence: high, low blast radius today because the pipeline flushes once.
-
-Mirror issue in `parallel_gzip.rs`: `flush()` is a documented no-op, so a caller
-who flushes and checks the error gets `Ok(())` with nothing written and no way to
-know.
-
-## `CopyRange` carries a bare `RawFd` across a thread boundary
-
-`src/write/pipeline.rs`, `writer.rs::write_raw_copy`,
-`parallel_writer::WriteOp::CopyRange`.
-
-The input fd is queued into another thread's channel with no lifetime tie to the
-owning `File`. If the caller closes the input before `flush()` (or the fd number
-is recycled), the copy silently splices whatever is now at that descriptor - no
-error, wrong bytes. Current in-tree callers (`apply_changes/drain.rs`,
-`sort/mod.rs`) happen to keep the input alive, but nothing enforces it. Carry an
-`Arc<File>` in the variant instead of a `RawFd`; the cost is one refcount per
-passthrough run.
-
-Confidence: high on the hazard, no current bug.
-
-## Liveness of the pipeline depends on rayon scheduling order
-
-`src/write/writer.rs` plus `pipeline.rs`.
-
-Rayon workers block in `tx.send` on a 32-slot channel while holding a rayon
-thread. The writer thread only drains in seq order. If the task for seq k is
-still queued while 32 later-seq results fill the channel and the remaining rayon
-threads all block in `send`, nothing can make progress: blocked rayon threads
-cannot steal seq k. `PIPELINE_DISPATCH_PERMITS = 64` bounds memory but not
-reorder distance. In practice rayon's FIFO injector makes a 48-job inversion very
-unlikely, but the design has no structural guarantee - the invariant is "rayon
-happens to run spawns roughly in order", which is not a documented rayon
-property. If open to restructuring: replace `rayon::spawn` plus bounded channel
-with an explicit fixed-size framing worker pool pulling from an ordered queue,
-which makes liveness provable.
-
-Confidence: low probability, high consequence; flagged as design fragility
-rather than a bug.
+Rounds 1 and 2 are landed; their resolved findings are removed rather than
+archived - git history is the record. What remains below is what is still
+open: one coverage gap, and the structural notes the next round owns.
 
 ## Smaller / structural notes
 
@@ -153,3 +45,28 @@ rather than a bug.
   `finish() -> io::Result<()>` that is the only place `set_len` plus `sync_all`
   happen, and make `Drop` without `finish` a loud error rather than a silent
   best-effort.
+
+## OPEN: the io_uring writer changes are unexercised on real data here
+
+Not a bug - a coverage gap that the release gate has to see.
+
+Round 2 changed three things inside `src/write/uring_writer.rs`: the `Drop`
+teardown drain (`drain_best_effort`), the `NUM_BUFS <= 64` compile-time
+assertion against the six-bit mask in `ud_buf_idx`, and
+`OutputChunk::CopyRange` carrying an `Arc<File>` rather than a `RawFd`. All
+three have compile-time and unit coverage. None has been run against a real
+PBF, because this host's `RLIMIT_MEMLOCK` soft limit is 8 MB and the writer
+registers 64 x 256 KB = 16 MB, so the io_uring preflight refuses before any
+SQE is submitted. `brokkr check` (both profiles) and `brokkr verify all
+--dataset denmark` are green, and neither runs an `--io-uring` variant.
+
+Close it by running one `--io-uring` command on a host whose limit is raised
+(the same `limits.conf` change that blocks the sort `--io-uring` re-pin and
+the io_uring output-rail characterisation - see TODO.md, "Deferred with
+explicit triggers"). Do not raise the limit from inside a work session; it is
+a host-configuration change, not a code change.
+
+The corrected diagnosis of the teardown hazard itself - real asymmetry, but
+not memory corruption while `WriteFixed` is the only opcode submitted - is
+recorded durably on `impl Drop for UringState` in the source, which is where
+it has to live to survive this note.

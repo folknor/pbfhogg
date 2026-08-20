@@ -16,7 +16,7 @@ use flate2::FlushCompress;
 use flate2::Status;
 use protohoggr::{encode_bytes_field, encode_int32_field};
 
-use crate::read::blob_wire::MAX_BLOB_HEADER_SIZE;
+use crate::read::blob_wire::{MAX_BLOB_DATASIZE, MAX_BLOB_HEADER_SIZE};
 use crate::write::metrics::WRITER_METRICS;
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -135,6 +135,20 @@ pub(super) fn frame_blob_into(
         .fetch_add(elapsed_ns_u64(t_compress), Relaxed);
     let t_frame = std::time::Instant::now();
 
+    // The format caps a Blob body at `MAX_BLOB_DATASIZE`, and our own reader
+    // enforces it on the way back in ("blob header declares datasize too
+    // big"). Without this guard the writer happily emitted a larger body and
+    // the check fired only when someone later tried to *read* the file - found
+    // by repacking Denmark at `--elements-per-blob 20000000`, which produced a
+    // 143 MB blob body and a PBF that pbfhogg itself refuses to open. Fail at
+    // the point where the knob that caused it can still be named.
+    if scratch.blob_buf.len() as u64 >= MAX_BLOB_DATASIZE {
+        return Err(io::Error::other(format!(
+            "blob body for {blob_type} is {} bytes, must be smaller than \
+             {MAX_BLOB_DATASIZE} (lower --elements-per-blob)",
+            scratch.blob_buf.len()
+        )));
+    }
     let datasize = i32::try_from(scratch.blob_buf.len()).map_err(|_| {
         io::Error::other(format!(
             "blob datasize overflow: {} bytes",
@@ -276,6 +290,33 @@ fn compress_zlib(uncompressed: &[u8], level: u32, scratch: &mut FrameScratch) ->
 /// routinely exceed this. Filed as <https://github.com/osmcode/libosmium/issues/405>.
 /// Not a problem for pbfhogg's own reader or the production pipeline - only
 /// affects users who open pbfhogg-generated PBFs with osmium-tool.
+///
+/// # Oversize headers
+///
+/// The 64 KiB cap is a hard format limit, and `tagdata` is the one header
+/// field whose size scales with the number of elements packed into the blob:
+/// it lists every distinct tag key in the block, so a large
+/// `--elements-per-blob` grows it without bound. Measured on the Denmark
+/// extract, the whole-file key set serializes to 48 043 bytes, i.e. 73 % of
+/// the cap for a single small country - a planet-scale blob at
+/// `--elements-per-blob 228000` can exceed it outright.
+///
+/// When the header would overflow, `tagdata` is **dropped**, never truncated.
+/// Truncation is the dangerous option: `tagdata` is consumed as a skip filter,
+/// so a key list missing entries makes `tags-filter` skip blobs that *do*
+/// contain the key - wrong results, not merely slow ones. Absence, by
+/// contrast, is already the format's spelling of "decode this blob", so a
+/// dropped index costs only the skip optimization. Drops are counted in
+/// `WRITER_METRICS.tagdata_dropped_oversize` (sidecar counter
+/// `writer_tagdata_dropped_oversize`) so the loss is observable rather than
+/// silent.
+///
+/// `indexdata` and `way_members` are *not* droppable. Both are consumed as
+/// claims about blob contents rather than as hints: an absent `WayMembers-v1`
+/// bitmap on one blob of a file whose `HeaderBlock` advertises the feature
+/// reads as "this blob has no way-member nodes", which would silently drop
+/// nodes. If the header still overflows once `tagdata` is gone, that is a
+/// hard error naming the field responsible.
 pub(crate) fn encode_blob_header_into(
     blob_type: &str,
     datasize: i32,
@@ -284,6 +325,42 @@ pub(crate) fn encode_blob_header_into(
     way_members: Option<&[u8]>,
     buf: &mut Vec<u8>,
 ) -> io::Result<()> {
+    encode_blob_header_fields(blob_type, datasize, indexdata, tagdata, way_members, buf);
+    if (buf.len() as u64) < MAX_BLOB_HEADER_SIZE {
+        return Ok(());
+    }
+    if tagdata.is_some() {
+        // Retry without the skip index before giving up: see the doc block.
+        encode_blob_header_fields(blob_type, datasize, indexdata, None, way_members, buf);
+        if (buf.len() as u64) < MAX_BLOB_HEADER_SIZE {
+            WRITER_METRICS
+                .tagdata_dropped_oversize
+                .fetch_add(1, Relaxed);
+            return Ok(());
+        }
+    }
+    let culprit = if way_members.is_some_and(|d| d.len() > 1024) {
+        " (the WayMembers-v1 bitmap, which cannot be dropped without \
+          misreporting way-member nodes; lower --elements-per-blob)"
+    } else {
+        " (lower --elements-per-blob)"
+    };
+    Err(io::Error::other(format!(
+        "BlobHeader for {blob_type} is {} bytes, must be smaller than \
+         {MAX_BLOB_HEADER_SIZE}{culprit}",
+        buf.len()
+    )))
+}
+
+/// Serialize the `BlobHeader` fields into `buf` with no size policy applied.
+fn encode_blob_header_fields(
+    blob_type: &str,
+    datasize: i32,
+    indexdata: Option<&[u8]>,
+    tagdata: Option<&[u8]>,
+    way_members: Option<&[u8]>,
+    buf: &mut Vec<u8>,
+) {
     buf.clear();
     // Field 1: type (string = len-delimited bytes)
     encode_bytes_field(buf, 1, blob_type.as_bytes());
@@ -301,13 +378,6 @@ pub(crate) fn encode_blob_header_into(
     if let Some(data) = way_members {
         encode_bytes_field(buf, 5, data);
     }
-    if buf.len() as u64 >= MAX_BLOB_HEADER_SIZE {
-        return Err(io::Error::other(format!(
-            "BlobHeader for {blob_type} is {} bytes, must be smaller than {MAX_BLOB_HEADER_SIZE}",
-            buf.len()
-        )));
-    }
-    Ok(())
 }
 
 /// Re-emit a `BlobHeader` protobuf message, copying every field through
@@ -670,5 +740,224 @@ mod tests {
         let err = encode_blob_header_into("OSMData", 1, None, None, Some(&fail_payload), &mut buf)
             .expect_err("65,536-byte header must error");
         assert!(err.to_string().contains("BlobHeader"));
+    }
+
+    /// Hand-rolled `BlobHeader` field scanner.
+    ///
+    /// Deliberately shares no code with the encoder under test: `encode_block`
+    /// and `parse_blob_header_with_index` are two halves of the same model, so
+    /// round-tripping through them proves only self-consistency. This walks
+    /// raw protobuf tags and returns `(field_number, payload)` for every
+    /// length-delimited field, so "was tagdata actually emitted" is answered
+    /// from the bytes.
+    fn scan_len_delimited_fields(buf: &[u8]) -> Vec<(u32, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < buf.len() {
+            let (mut key, mut shift) = (0u64, 0u32);
+            loop {
+                let b = buf[i];
+                i += 1;
+                key |= u64::from(b & 0x7f) << shift;
+                shift += 7;
+                if b & 0x80 == 0 {
+                    break;
+                }
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let field = (key >> 3) as u32;
+            match key & 7 {
+                0 => {
+                    while buf[i] & 0x80 != 0 {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                2 => {
+                    let (mut len, mut shift) = (0usize, 0u32);
+                    loop {
+                        let b = buf[i];
+                        i += 1;
+                        len |= (b as usize & 0x7f) << shift;
+                        shift += 7;
+                        if b & 0x80 == 0 {
+                            break;
+                        }
+                    }
+                    out.push((field, buf[i..i + len].to_vec()));
+                    i += len;
+                }
+                w => panic!("unexpected wire type {w}"),
+            }
+        }
+        out
+    }
+
+    /// An oversize `tagdata` must be dropped, not truncated and not fatal.
+    ///
+    /// This is the failure the `--elements-per-blob 228000` workflow hits:
+    /// `tagdata` lists every distinct tag key in the block, so a dense blob
+    /// pushes the `BlobHeader` past the 64 KiB format cap and used to abort
+    /// the entire write. Truncating the key set instead would be worse than
+    /// failing - a short key list makes `tags-filter` skip blobs that do carry
+    /// the key - so the index is dropped whole.
+    #[test]
+    fn oversize_tagdata_is_dropped_not_truncated() {
+        let before = WRITER_METRICS.tagdata_dropped_oversize.load(Relaxed);
+        let indexdata = vec![0xABu8; 42];
+        let way_members = vec![0xCDu8; 64];
+        let tagdata = vec![0x11u8; 70_000];
+        let mut buf = Vec::new();
+        encode_blob_header_into(
+            "OSMData",
+            4242,
+            Some(&indexdata),
+            Some(&tagdata),
+            Some(&way_members),
+            &mut buf,
+        )
+        .expect("an oversize tag index must be dropped, never fatal");
+
+        assert!(
+            (buf.len() as u64) < MAX_BLOB_HEADER_SIZE,
+            "header must land under the format cap, got {}",
+            buf.len()
+        );
+        let fields = scan_len_delimited_fields(&buf);
+        assert!(
+            !fields.iter().any(|(f, _)| *f == 4),
+            "tagdata must be absent entirely, not truncated: a short key list \
+             is read as a complete one and makes tags-filter skip matching blobs"
+        );
+        assert_eq!(
+            fields.iter().find(|(f, _)| *f == 1).map(|(_, v)| v.clone()),
+            Some(b"OSMData".to_vec()),
+            "blob type must survive the retry"
+        );
+        assert_eq!(
+            fields.iter().find(|(f, _)| *f == 2).map(|(_, v)| v.clone()),
+            Some(indexdata),
+            "indexdata must survive the retry"
+        );
+        assert_eq!(
+            fields.iter().find(|(f, _)| *f == 5).map(|(_, v)| v.clone()),
+            Some(way_members),
+            "WayMembers-v1 must survive the retry"
+        );
+        // Drop three more, so the observed delta cannot be explained by the
+        // single drop the sibling boundary test performs concurrently.
+        for _ in 0..3 {
+            encode_blob_header_into("OSMData", 1, None, Some(&tagdata), None, &mut buf)
+                .expect("oversize tag index must be dropped");
+        }
+        let delta = WRITER_METRICS.tagdata_dropped_oversize.load(Relaxed) - before;
+        assert!(
+            delta >= 4,
+            "a dropped tag index must be counted, not lost silently; \
+             saw only {delta} of 4 drops"
+        );
+    }
+
+    /// A tagdata that fits must be emitted - the drop is a last resort, not a
+    /// policy. Guards against a fix that simply stops writing tagdata.
+    #[test]
+    fn fitting_tagdata_is_preserved() {
+        let tagdata = vec![0x11u8; 20_000];
+        let mut buf = Vec::new();
+        encode_blob_header_into("OSMData", 1, None, Some(&tagdata), None, &mut buf)
+            .expect("a 20 KB tag index fits and must encode");
+        let fields = scan_len_delimited_fields(&buf);
+        assert_eq!(
+            fields.iter().find(|(f, _)| *f == 4).map(|(_, v)| v.clone()),
+            Some(tagdata),
+            "a tag index that fits must be written verbatim"
+        );
+    }
+
+    /// The drop must trigger only at the cap, not one byte early. The retry
+    /// path and the strict `>=` bound are separate decisions and a fix that
+    /// got the bound right for the error path can still get it wrong here.
+    #[test]
+    fn tagdata_at_exact_boundary_is_kept() {
+        let mut buf = Vec::new();
+        let probe = vec![0u8; 60_000];
+        encode_blob_header_into("OSMData", 1, None, Some(&probe), None, &mut buf)
+            .expect("probe header must encode");
+        let overhead = buf.len() - probe.len();
+        let cap = usize::try_from(MAX_BLOB_HEADER_SIZE).unwrap_or(usize::MAX);
+
+        let at_limit = vec![0x22u8; cap - 1 - overhead];
+        encode_blob_header_into("OSMData", 1, None, Some(&at_limit), None, &mut buf)
+            .expect("65,535-byte header must encode");
+        assert_eq!(buf.len() as u64, MAX_BLOB_HEADER_SIZE - 1);
+        assert!(
+            scan_len_delimited_fields(&buf).iter().any(|(f, _)| *f == 4),
+            "a tag index landing exactly on the last legal byte must be kept"
+        );
+
+        let over_limit = vec![0x22u8; cap - overhead];
+        encode_blob_header_into("OSMData", 1, None, Some(&over_limit), None, &mut buf)
+            .expect("one byte over must drop tagdata rather than fail");
+        assert!(
+            !scan_len_delimited_fields(&buf).iter().any(|(f, _)| *f == 4),
+            "one byte over the cap must drop the tag index"
+        );
+    }
+
+    /// A blob body past the format's datasize cap must fail at write time.
+    ///
+    /// It used to be written out happily, and the only thing that noticed was
+    /// a *reader* - `pbfhogg sort` on a Denmark repacked at
+    /// `--elements-per-blob 20000000` died with "blob header declares datasize
+    /// too big: 143773494 bytes", pointing at the file rather than at the flag
+    /// that made it. The writer knows both.
+    #[test]
+    fn an_oversize_blob_body_fails_at_write_time_naming_the_knob() {
+        let cap = usize::try_from(MAX_BLOB_DATASIZE).unwrap_or(usize::MAX);
+        // Incompressible payload, so `Compression::None` keeps the body size.
+        let body = vec![0x5Au8; cap + 1];
+        let mut scratch = FrameScratch::new();
+        let result = frame_blob_into(
+            "OSMData",
+            &body,
+            &crate::write::compression::Compression::None,
+            None,
+            None,
+            None,
+            &mut scratch,
+        );
+        let Err(err) = result else {
+            panic!("a blob body past the datasize cap must not be written");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("blob body for OSMData") && msg.contains("--elements-per-blob"),
+            "the writer must name the cap and the knob, got: {msg}"
+        );
+    }
+
+    /// An oversize `WayMembers-v1` bitmap is a hard error, and the message
+    /// says so. It cannot take the tagdata escape hatch: absence of the bitmap
+    /// on one blob of a file whose HeaderBlock advertises the feature reads as
+    /// "no way-member nodes here", which silently drops nodes.
+    #[test]
+    fn oversize_way_members_is_a_named_hard_error() {
+        let way_members = vec![0xCDu8; 70_000];
+        let tagdata = vec![0x11u8; 4_000];
+        let mut buf = Vec::new();
+        let err = encode_blob_header_into(
+            "OSMData",
+            1,
+            None,
+            Some(&tagdata),
+            Some(&way_members),
+            &mut buf,
+        )
+        .expect_err("an oversize WayMembers bitmap must not be silently dropped");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("WayMembers-v1 bitmap, which cannot be dropped"),
+            "the error must name the undroppable field, got: {msg}"
+        );
     }
 }

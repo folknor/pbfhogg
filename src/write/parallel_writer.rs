@@ -68,12 +68,16 @@ pub(crate) const PER_WORKER_CAPACITY: usize = 8;
 enum WriteOp {
     /// Plain `pwrite` at `offset`.
     Write { offset: u64, bytes: Vec<u8> },
-    /// Kernel-space `copy_file_range` from `(in_fd, src_offset)` to
+    /// Kernel-space `copy_file_range` from `(in_file, src_offset)` to
     /// `(out_fd, out_offset)` for `len` bytes.
+    ///
+    /// Holds the input as an `Arc<File>` rather than a `RawFd` so the
+    /// descriptor cannot be closed - or recycled onto an unrelated file - by
+    /// the producer while this op sits in a pool worker's queue.
     #[cfg(feature = "linux-direct-io")]
     CopyRange {
         out_offset: u64,
-        in_fd: RawFd,
+        in_file: Arc<std::fs::File>,
         src_offset: u64,
         len: u64,
     },
@@ -215,10 +219,7 @@ fn parallel_writer_thread_inner(
 
     let t_sync = std::time::Instant::now();
     shared_file.sync_all()?;
-    WRITER_METRICS.sync_all_ns.fetch_add(
-        u64::try_from(t_sync.elapsed().as_nanos()).unwrap_or(u64::MAX),
-        Ordering::Relaxed,
-    );
+    WRITER_METRICS.record_sync_all(t_sync);
 
     Ok(())
 }
@@ -237,7 +238,17 @@ fn dispatch_loop(
     let mut current_offset: u64 = header_len;
     let mut next_worker: usize = 0;
 
-    while let Ok(item) = rx.recv() {
+    loop {
+        // Same `writer_recv_wait_ns` accounting as the pipelined and io_uring
+        // writer loops. This backend used to omit it, so a parallel-backend
+        // run reported as never having waited on its producer - the same
+        // one-backend-only counter shape as the `sync_all_calls` gap.
+        let t_recv = std::time::Instant::now();
+        let item = match rx.recv() {
+            Ok(item) => item,
+            Err(_) => break,
+        };
+        WRITER_METRICS.record_recv_wait(t_recv);
         pending.push(item.seq, item.data);
         WRITER_METRICS.record_reorder_high_water(pending.pending_len());
 
@@ -329,7 +340,7 @@ fn dispatch_chunk(
         }
         #[cfg(feature = "linux-direct-io")]
         OutputChunk::CopyRange {
-            in_fd,
+            in_file,
             offset: src_offset,
             len,
         } => {
@@ -338,7 +349,7 @@ fn dispatch_chunk(
                 next_worker,
                 WriteOp::CopyRange {
                     out_offset: *current_offset,
-                    in_fd,
+                    in_file,
                     src_offset,
                     len,
                 },
@@ -413,10 +424,17 @@ fn worker_loop(rx: Receiver<WriteOp>, file: &File, err_slot: &ErrSlot) {
             #[cfg(feature = "linux-direct-io")]
             WriteOp::CopyRange {
                 out_offset,
-                in_fd,
+                in_file,
                 src_offset,
                 len,
-            } => copy_range_to_fd(file, in_fd, src_offset, out_offset, len),
+            } => {
+                use std::os::unix::io::AsRawFd;
+                let r = copy_range_to_fd(file, in_file.as_raw_fd(), src_offset, out_offset, len);
+                // The Arc is held across the splice, so the input cannot be
+                // closed out from under the kernel copy.
+                drop(in_file);
+                r
+            }
         };
         WRITER_METRICS.write_ns.fetch_add(
             u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX),

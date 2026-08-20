@@ -74,6 +74,23 @@ fn compression_level() -> flate2::Compression {
     flate2::Compression::fast()
 }
 
+/// One unit of work handed to the compressor pool.
+///
+/// `Barrier` is not compressed: it rides the same seq-ordered path as a
+/// chunk so that by the time the writer thread reaches it, every chunk
+/// dispatched before it has already been written. See
+/// [`ParallelGzipWriter::flush`].
+enum Job {
+    Compress(Vec<u8>),
+    Barrier(SyncSender<io::Result<()>>),
+}
+
+/// One unit of output handed to the writer thread, reordered by seq.
+enum Out {
+    Bytes(Vec<u8>),
+    Barrier(SyncSender<io::Result<()>>),
+}
+
 /// Writer that buffers bytes, dispatches chunks to a worker pool for
 /// gzip compression, and emits compressed chunks in order to an inner
 /// writer.
@@ -86,7 +103,7 @@ pub struct ParallelGzipWriter<W: Write + Send + 'static> {
     chunk_size: usize,
     current: Vec<u8>,
     next_seq: u64,
-    raw_tx: Option<SyncSender<(u64, Vec<u8>)>>,
+    raw_tx: Option<SyncSender<(u64, Job)>>,
     writer_handle: Option<JoinHandle<io::Result<W>>>,
     worker_handles: Vec<JoinHandle<()>>,
 }
@@ -101,8 +118,8 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
         let worker_count = worker_count.max(1);
         let raw_cap = worker_count * QUEUE_SLOTS_PER_WORKER;
         let compressed_cap = worker_count * QUEUE_SLOTS_PER_WORKER;
-        let (raw_tx, raw_rx) = sync_channel::<(u64, Vec<u8>)>(raw_cap);
-        let (compressed_tx, compressed_rx) = sync_channel::<(u64, Vec<u8>)>(compressed_cap);
+        let (raw_tx, raw_rx) = sync_channel::<(u64, Job)>(raw_cap);
+        let (compressed_tx, compressed_rx) = sync_channel::<(u64, Out)>(compressed_cap);
 
         let raw_rx = std::sync::Arc::new(std::sync::Mutex::new(raw_rx));
 
@@ -130,21 +147,26 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
         }
     }
 
-    /// Dispatch the current buffer as a raw chunk to the worker pool.
-    fn flush_current(&mut self) -> io::Result<()> {
-        if self.current.is_empty() {
-            return Ok(());
-        }
-        let chunk = std::mem::replace(&mut self.current, Vec::with_capacity(self.chunk_size));
+    /// Send one job to the pool under the next sequence number.
+    fn dispatch(&mut self, job: Job) -> io::Result<()> {
         let seq = self.next_seq;
         self.next_seq += 1;
         let tx = self
             .raw_tx
             .as_ref()
             .ok_or_else(|| io::Error::other("ParallelGzipWriter: already finished"))?;
-        tx.send((seq, chunk))
+        tx.send((seq, job))
             .map_err(|_| io::Error::other("ParallelGzipWriter: worker pool dropped"))?;
         Ok(())
+    }
+
+    /// Dispatch the current buffer as a raw chunk to the worker pool.
+    fn flush_current(&mut self) -> io::Result<()> {
+        if self.current.is_empty() {
+            return Ok(());
+        }
+        let chunk = std::mem::replace(&mut self.current, Vec::with_capacity(self.chunk_size));
+        self.dispatch(Job::Compress(chunk))
     }
 
     /// Flush any buffered bytes, drop the raw-send channel so workers
@@ -187,11 +209,63 @@ impl<W: Write + Send + 'static> Write for ParallelGzipWriter<W> {
         Ok(buf.len())
     }
 
-    /// `flush` on `Write` is a no-op: forcing a gzip member boundary on
-    /// every buffered-writer flush would fragment compression badly.
-    /// Call `finish()` to get the bytes out.
+    /// Push every buffered byte through the pool and the writer thread into
+    /// the inner writer, flush the inner writer, and report any error the
+    /// journey produced.
+    ///
+    /// This used to be `Ok(())` - a documented no-op, on the reasoning that
+    /// forcing a gzip member boundary on every flush would fragment
+    /// compression. The reasoning is sound; returning `Ok(())` was not. A
+    /// caller who flushes and checks the result was told the bytes went
+    /// somewhere when they were still sitting in `self.current`, and got no
+    /// way to find out otherwise - the worst shape an error report can take.
+    /// A `Write` implementation may make `flush` cheap; it may not make it a
+    /// lie.
+    ///
+    /// Dispatching the buffered chunk to the pool was the first attempt at a
+    /// fix and was still a lie, just a shorter one: `flush` returned before
+    /// the compressor had run, before the writer thread had written, and
+    /// therefore before any compression or destination-I/O error existed to
+    /// report. "Handed to a queue" is not what `Write::flush` promises.
+    ///
+    /// So `flush` now installs an **acknowledgement barrier**. The buffered
+    /// chunk is dispatched, then a `Barrier` job carrying a one-shot ack
+    /// channel is dispatched behind it under the next sequence number. The
+    /// barrier is not compressed - a worker forwards it untouched - and the
+    /// writer thread's reorder buffer will not reach it until every
+    /// lower-numbered chunk has been written. On reaching it the writer thread
+    /// flushes the inner writer and sends back the result, including any
+    /// deferred write error from an earlier chunk. `flush` blocks on that ack.
+    ///
+    /// Liveness: the producer holds no other channel capacity while it waits,
+    /// the pool drains the bounded raw queue, and the writer thread drains the
+    /// bounded compressed queue, so there is no cycle. Ordering is by seq, not
+    /// by which worker happened to pick the barrier up.
+    ///
+    /// `finish()` is still the call that closes the pipeline, joins every
+    /// thread, and returns the inner writer, and it is what a caller who is
+    /// done writing must use. `flush` is for a caller who needs the bytes so
+    /// far to be out and any error so far to be visible, mid-stream.
+    ///
+    /// The fragmentation cost of the forced member boundary is real but is now
+    /// the caller's to control by not flushing gratuitously, rather than being
+    /// paid for with a silent data loss. In-tree the only consumer is
+    /// `diff::derive`, whose `copy_section` flushes once per non-empty
+    /// `create` / `modify` / `delete` section - at most three barriers and
+    /// three extra gzip members per assembled OSC, against thousands of
+    /// members, so the cost is noise. Those three flushes used to be no-ops
+    /// that happened to be harmless because `quick_xml` writes straight
+    /// through and holds no buffer of its own; they now do what their comment
+    /// there always claimed.
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        self.flush_current()?;
+        let (ack_tx, ack_rx) = sync_channel::<io::Result<()>>(1);
+        self.dispatch(Job::Barrier(ack_tx))?;
+        ack_rx.recv().map_err(|_| {
+            io::Error::other(
+                "ParallelGzipWriter: writer thread exited before the flush barrier was reached",
+            )
+        })?
     }
 }
 
@@ -229,8 +303,8 @@ impl<W: Write + Send + 'static> Drop for ParallelGzipWriter<W> {
 /// worker panic in either path cannot poison this mutex and take
 /// down the rest of the pool.
 fn worker_loop(
-    raw_rx: &std::sync::Mutex<Receiver<(u64, Vec<u8>)>>,
-    compressed_tx: &SyncSender<(u64, Vec<u8>)>,
+    raw_rx: &std::sync::Mutex<Receiver<(u64, Job)>>,
+    compressed_tx: &SyncSender<(u64, Out)>,
 ) {
     loop {
         let item = {
@@ -241,9 +315,22 @@ fn worker_loop(
             };
             guard.recv()
         };
-        let (seq, raw) = match item {
+        let (seq, job) = match item {
             Ok(v) => v,
             Err(_) => return, // channel closed, producer done
+        };
+
+        // A barrier carries no payload: forward it in place so the writer
+        // thread sees it in seq order behind every earlier chunk. Compressing
+        // it would be meaningless and dropping it would hang `flush`.
+        let raw = match job {
+            Job::Compress(raw) => raw,
+            Job::Barrier(ack) => {
+                if compressed_tx.send((seq, Out::Barrier(ack))).is_err() {
+                    return;
+                }
+                continue;
+            }
         };
 
         // Test-only: arm via `test_hooks::PANIC_AT_POOL_OP_COUNT`.
@@ -262,7 +349,7 @@ fn worker_loop(
             Ok(v) => v,
             Err(_) => return, // writer thread will see an incomplete stream and error
         };
-        if compressed_tx.send((seq, compressed)).is_err() {
+        if compressed_tx.send((seq, Out::Bytes(compressed))).is_err() {
             return;
         }
     }
@@ -286,16 +373,54 @@ fn compress_one(raw: &[u8]) -> io::Result<Vec<u8>> {
 /// Writer: pull compressed chunks in arbitrary order, reorder by seq,
 /// write to inner in sequence. Takes `compressed_rx` by value so the
 /// receiver is dropped (and the channel released) on return.
+///
+/// A write error does **not** return early. It is recorded in `fatal` and the
+/// loop keeps draining, for one reason: a producer blocked on a flush barrier
+/// further down the stream would otherwise wait on an ack channel whose sender
+/// went out of scope with this function, and would learn only that the thread
+/// "exited" rather than why. Draining lets every outstanding barrier be
+/// answered with the real error. The error is still returned at the end, so
+/// `finish()` sees it too. Subsequent chunks are dropped rather than written,
+/// so a fatal error does not produce a file with a hole in it.
 #[allow(clippy::needless_pass_by_value)]
-fn writer_loop<W: Write>(mut inner: W, compressed_rx: Receiver<(u64, Vec<u8>)>) -> io::Result<W> {
-    let mut pending: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+fn writer_loop<W: Write>(mut inner: W, compressed_rx: Receiver<(u64, Out)>) -> io::Result<W> {
+    let mut pending: BTreeMap<u64, Out> = BTreeMap::new();
     let mut expected: u64 = 0;
-    while let Ok((seq, bytes)) = compressed_rx.recv() {
-        pending.insert(seq, bytes);
-        while let Some(b) = pending.remove(&expected) {
-            inner.write_all(&b)?;
+    let mut fatal: Option<io::Error> = None;
+    while let Ok((seq, out)) = compressed_rx.recv() {
+        pending.insert(seq, out);
+        while let Some(item) = pending.remove(&expected) {
             expected += 1;
+            match item {
+                Out::Bytes(b) => {
+                    if fatal.is_none()
+                        && let Err(e) = inner.write_all(&b)
+                    {
+                        fatal = Some(e);
+                    }
+                }
+                Out::Barrier(ack) => {
+                    if fatal.is_none()
+                        && let Err(e) = inner.flush()
+                    {
+                        fatal = Some(e);
+                    }
+                    // `io::Error` is not `Clone`; the ack carries a faithful
+                    // restatement (same `ErrorKind`, same message) while the
+                    // original goes on to `finish()`.
+                    let reply = fatal.as_ref().map_or(Ok(()), |e| {
+                        Err(io::Error::new(
+                            e.kind(),
+                            format!("parallel gzip writer: {e}"),
+                        ))
+                    });
+                    drop(ack.send(reply));
+                }
+            }
         }
+    }
+    if let Some(e) = fatal {
+        return Err(e);
     }
     // Producer closed. `pending` should be empty if every seq arrived;
     // if there is a gap, workers died mid-stream.
@@ -422,6 +547,151 @@ mod tests {
         assert!(out[0..128].iter().all(|&b| b == 7));
         assert!(out[128..256].iter().all(|&b| b == 9));
         assert!(out[256..320].iter().all(|&b| b == 11));
+    }
+
+    /// Inner writer that records what actually reached it, how long each
+    /// write took to land, and how many times it was flushed.
+    ///
+    /// The `delay` is the whole point: it makes "dispatched to the pool" and
+    /// "written to the inner writer" separable in wall-clock terms, so a
+    /// `flush` that only dispatches fails the assertions below rather than
+    /// racing past them.
+    #[derive(Clone)]
+    struct ProbeSink {
+        data: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        flushes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        delay: std::time::Duration,
+        fail: bool,
+    }
+
+    impl ProbeSink {
+        fn new(delay_ms: u64, fail: bool) -> Self {
+            Self {
+                data: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                flushes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                delay: std::time::Duration::from_millis(delay_ms),
+                fail,
+            }
+        }
+    }
+
+    impl Write for ProbeSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            std::thread::sleep(self.delay);
+            if self.fail {
+                return Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "probe sink: ENOSPC",
+                ));
+            }
+            self.data
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    /// `flush` must not return until the bytes are in the inner writer.
+    ///
+    /// The previous fix made `flush` dispatch the buffered chunk to the
+    /// compressor pool and return, which passes any test that only checks
+    /// "did flush return Ok". The sink here sleeps 40 ms per write, so at the
+    /// moment a dispatch-only `flush` returns, nothing has been written yet
+    /// and the recorded byte count is zero. Only a flush that waits for the
+    /// writer thread sees a complete gzip stream.
+    #[test]
+    fn flush_waits_for_bytes_to_reach_the_inner_writer() {
+        let sink = ProbeSink::new(40, false);
+        let seen = std::sync::Arc::clone(&sink.data);
+        let flushes = std::sync::Arc::clone(&sink.flushes);
+        let mut gz = ParallelGzipWriter::new(sink, 1024, 4);
+
+        let payload = [42u8; 4096];
+        gz.write_all(&payload).unwrap();
+        gz.flush().unwrap();
+
+        let recorded = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            !recorded.is_empty(),
+            "flush returned before any byte reached the inner writer"
+        );
+        let mut out = Vec::new();
+        MultiGzDecoder::new(recorded.as_slice())
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(
+            out.len(),
+            payload.len(),
+            "flush must deliver every buffered byte, not a prefix"
+        );
+        assert!(
+            flushes.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "flush must also flush the inner writer"
+        );
+    }
+
+    /// `flush` must surface a destination-I/O error that happened downstream.
+    ///
+    /// This is the half a dispatch-only flush structurally cannot deliver:
+    /// when `flush` returns before the writer thread has run, the error does
+    /// not exist yet, so `Ok(())` is the only answer it can give.
+    #[test]
+    fn flush_propagates_a_downstream_write_error() {
+        let sink = ProbeSink::new(0, true);
+        let mut gz = ParallelGzipWriter::new(sink, 1024, 2);
+        gz.write_all(&[7u8; 4096]).unwrap();
+        let err = gz.flush().expect_err("flush must report the sink's ENOSPC");
+        assert_eq!(err.kind(), io::ErrorKind::StorageFull);
+        assert!(
+            err.to_string().contains("probe sink: ENOSPC"),
+            "flush must report the underlying cause, got {err}"
+        );
+    }
+
+    /// A flush on an empty buffer is still a flush: it must reach the inner
+    /// writer. Otherwise `flush_current`'s empty-buffer early return would
+    /// quietly reintroduce the no-op for exactly the caller who flushes twice.
+    #[test]
+    fn flush_with_nothing_buffered_still_reaches_the_inner_writer() {
+        let sink = ProbeSink::new(0, false);
+        let flushes = std::sync::Arc::clone(&sink.flushes);
+        let mut gz = ParallelGzipWriter::new(sink, 1024, 2);
+        gz.flush().unwrap();
+        assert!(
+            flushes.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "flush with an empty buffer must still flush the inner writer"
+        );
+    }
+
+    /// Flushing mid-stream must not corrupt the stream: the barrier rides the
+    /// same seq space as the chunks, so an off-by-one there would drop or
+    /// reorder a member.
+    #[test]
+    fn interleaved_flushes_preserve_the_stream() {
+        let sink: Vec<u8> = Vec::new();
+        let mut gz = ParallelGzipWriter::new(sink, 512, 4);
+        let mut expected = Vec::new();
+        for i in 0..8u8 {
+            let block = [i; 700];
+            gz.write_all(&block).unwrap();
+            expected.extend_from_slice(&block);
+            gz.flush().unwrap();
+        }
+        let compressed = gz.finish().unwrap();
+        let mut out = Vec::new();
+        MultiGzDecoder::new(compressed.as_slice())
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(out, expected);
     }
 
     #[test]

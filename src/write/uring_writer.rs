@@ -85,6 +85,17 @@ const BUF_SIZE: usize = 256 * 1024;
 /// Charged against `RLIMIT_MEMLOCK`.
 const NUM_BUFS: u16 = 64;
 
+/// `user_data` packs `buf_idx` into the low 16 bits, but [`ud_buf_idx`] masks
+/// `0x3F` - six bits. The two disagree for any `NUM_BUFS` above 64, and the
+/// disagreement is silent: a CQE for buffer 64 returns index 0 to the free
+/// list, so two writers end up filling the same registered buffer and the
+/// output is corrupt with nothing reported. Widening the pool means widening
+/// the mask.
+const _: () = assert!(
+    NUM_BUFS <= 64,
+    "NUM_BUFS exceeds the 6-bit mask in ud_buf_idx; widen the mask first"
+);
+
 // ---------------------------------------------------------------------------
 // AlignedBufferPool - contiguous page-aligned allocation with free-list
 // ---------------------------------------------------------------------------
@@ -395,6 +406,29 @@ impl UringState {
         Ok(())
     }
 
+    /// Drain in-flight SQEs on the teardown path, ignoring their outcomes.
+    ///
+    /// [`drain`](Self::drain) stops at the first failing CQE, which is exactly
+    /// the case teardown has to survive: `reap_cqes` decrements `in_flight`
+    /// before returning the error, so the remaining completions are still
+    /// pending when the state is dropped. This keeps reaping until the ring is
+    /// quiet.
+    ///
+    /// Termination is bounded twice over: every iteration reaps at least one
+    /// CQE (`submit_and_wait(1)`), and the loop gives up after more rounds
+    /// than there are buffers, so a kernel that stops producing completions
+    /// costs a leaked pin rather than a hung writer thread.
+    fn drain_best_effort(&mut self) {
+        let mut rounds = 0_u32;
+        while self.in_flight > 0 && rounds < u32::from(NUM_BUFS) * 4 {
+            rounds += 1;
+            if self.reap_cqes(true).is_err() {
+                // The CQE carried an error; `in_flight` still went down.
+                // Keep going - the point is quiescence, not success.
+            }
+        }
+    }
+
     /// Flush the current partial buffer, drain all in-flight writes,
     /// truncate to logical size, and sync to disk.
     fn flush_final(&mut self, file: &File) -> io::Result<()> {
@@ -403,10 +437,38 @@ impl UringState {
         file.set_len(self.logical_size)?;
         let t_sync = std::time::Instant::now();
         file.sync_all()?;
-        WRITER_METRICS
-            .sync_all_ns
-            .fetch_add(elapsed_ns_u64(t_sync), Relaxed);
+        WRITER_METRICS.record_sync_all(t_sync);
         Ok(())
+    }
+}
+
+/// Quiesce the ring before the registered buffers are deallocated.
+///
+/// Every error path out of `uring_init_and_run` - a failed `write`, an error
+/// from `uring_main_loop`, a failed `flush_final` - drops `UringState` with
+/// SQEs still in flight. Field order drops `ring` before `pool`, but closing
+/// the ring fd is **not** a synchronous barrier: `io_uring_release` hands the
+/// context to `io_ring_exit_work` on a workqueue, which cancels requests and
+/// only then runs `io_sqe_buffers_unregister` to unpin the registered pages.
+/// Userspace returns from `close(2)` long before that finishes, so `pool`'s
+/// `dealloc` can hand the virtual range back to the allocator while the kernel
+/// still holds pins on it.
+///
+/// The consequence today is bounded, and narrower than it first looks: the
+/// only opcode this writer ever submits is `WriteFixed`, which the kernel
+/// *reads* from. A completing SQE therefore cannot scribble into memory the
+/// allocator has re-issued - it can only copy whatever now lives there into an
+/// output file that is being abandoned anyway. That is not memory corruption.
+/// It would become memory corruption the moment any read-side opcode is added
+/// (the `ReadFixed` chain this writer used to submit for `CopyRange` was
+/// exactly that shape), and it is a pin leak either way.
+///
+/// Draining first removes the window entirely, and is nearly free: on the
+/// error paths there are at most `NUM_BUFS` completions outstanding, and they
+/// have already been submitted.
+impl Drop for UringState {
+    fn drop(&mut self) {
+        self.drain_best_effort();
     }
 }
 
@@ -636,9 +698,7 @@ fn uring_main_loop(
             Ok(item) => item,
             Err(_) => break,
         };
-        WRITER_METRICS
-            .recv_wait_ns
-            .fetch_add(elapsed_ns_u64(t_recv), Relaxed);
+        WRITER_METRICS.record_recv_wait(t_recv);
         pending.push(item.seq, item.data);
         WRITER_METRICS.record_reorder_high_water(pending.pending_len());
 
@@ -693,9 +753,16 @@ fn uring_main_loop(
                     WRITER_METRICS.bytes_written.fetch_add(total_bytes, Relaxed);
                 }
                 #[cfg(feature = "linux-direct-io")]
-                OutputChunk::CopyRange { in_fd, offset, len } => {
+                OutputChunk::CopyRange {
+                    in_file,
+                    offset,
+                    len,
+                } => {
+                    use std::os::unix::io::AsRawFd;
                     let t_write = std::time::Instant::now();
-                    handle_copy_range_uring(state, in_fd, offset, len)?;
+                    handle_copy_range_uring(state, in_file.as_raw_fd(), offset, len)?;
+                    // The Arc keeps the input open across the pread loop.
+                    drop(in_file);
                     WRITER_METRICS
                         .write_ns
                         .fetch_add(elapsed_ns_u64(t_write), Relaxed);

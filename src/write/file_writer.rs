@@ -13,10 +13,6 @@ use std::sync::atomic::Ordering::Relaxed;
 use super::direct_writer::DirectWriter;
 use super::metrics::WRITER_METRICS;
 
-fn elapsed_ns_u64(start: std::time::Instant) -> u64 {
-    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
-}
-
 /// A file writer that is either buffered (normal) or direct I/O (`O_DIRECT`).
 ///
 /// Implements [`Write`] by delegating to the active variant.
@@ -44,6 +40,29 @@ impl FileWriter {
     #[cfg(feature = "linux-direct-io")]
     pub fn direct(path: &Path) -> io::Result<Self> {
         Ok(FileWriter::Direct(DirectWriter::create(path)?))
+    }
+
+    /// Flush buffered bytes and then `fsync` the file: finish *and* make
+    /// durable.
+    ///
+    /// This is the operation the pipeline's end-of-stream finalization wants,
+    /// and it used to be what [`Write::flush`] did. That was wrong: `flush` is
+    /// a `Write`-trait method with published semantics of "push buffered bytes
+    /// onward", and any incidental call - a wrapping `BufWriter`, a generic
+    /// helper, a library consumer doing the ordinary thing - silently bought a
+    /// full `fsync`. On a planet-scale write that is not a small surprise.
+    ///
+    /// Durability is now something a caller asks for by name. `flush` flushes.
+    pub fn sync(&mut self) -> io::Result<()> {
+        self.flush()?;
+        let t_sync = std::time::Instant::now();
+        let result = match self {
+            FileWriter::Buffered(w) => w.get_ref().sync_all(),
+            #[cfg(feature = "linux-direct-io")]
+            FileWriter::Direct(w) => w.sync_all(),
+        };
+        WRITER_METRICS.record_sync_all(t_sync);
+        result
     }
 }
 
@@ -90,27 +109,70 @@ impl Write for FileWriter {
         }
     }
 
+    /// Push buffered bytes onward - and nothing more.
+    ///
+    /// Explicitly *not* an `fsync`; see [`FileWriter::sync`] for that. Note
+    /// that the `Direct` variant's own `flush` still finalizes its page-
+    /// aligned tail and `set_len`s the file, because for an `O_DIRECT` writer
+    /// that padding removal is part of pushing the bytes onward, not part of
+    /// durability.
     fn flush(&mut self) -> io::Result<()> {
         match self {
-            FileWriter::Buffered(w) => {
-                w.flush()?;
-                let t_sync = std::time::Instant::now();
-                let result = w.get_ref().sync_all();
-                WRITER_METRICS
-                    .sync_all_ns
-                    .fetch_add(elapsed_ns_u64(t_sync), Relaxed);
-                result
-            }
+            FileWriter::Buffered(w) => w.flush(),
             #[cfg(feature = "linux-direct-io")]
-            FileWriter::Direct(w) => {
-                w.flush()?;
-                let t_sync = std::time::Instant::now();
-                let result = w.sync_all();
-                WRITER_METRICS
-                    .sync_all_ns
-                    .fetch_add(elapsed_ns_u64(t_sync), Relaxed);
-                result
-            }
+            FileWriter::Direct(w) => w.flush(),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::{FileWriter, WRITER_METRICS};
+    use std::io::Write;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// `Write::flush` must push bytes onward, and must not `fsync`.
+    ///
+    /// `FileWriter::flush` used to call `sync_all()`, so every incidental
+    /// flush - a wrapping `BufWriter`, a generic helper, a library consumer
+    /// following `Write` semantics - bought a full fsync. The loop below is
+    /// exactly that kind of caller. The bound is deliberately loose enough to
+    /// tolerate an unrelated `sync()` from a concurrent test and still bite:
+    /// if `flush` synced, the delta would be at least one per iteration.
+    #[test]
+    fn flush_pushes_bytes_onward_without_fsyncing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("flush-is-not-fsync.bin");
+        let mut w = FileWriter::buffered(&path).unwrap();
+
+        const FLUSHES: usize = 64;
+        let before = WRITER_METRICS.sync_all_calls.load(Relaxed);
+        for i in 0..FLUSHES {
+            w.write_all(&[u8::try_from(i % 256).unwrap()]).unwrap();
+            w.flush().unwrap();
+        }
+        let after_flushes = WRITER_METRICS.sync_all_calls.load(Relaxed);
+        assert!(
+            after_flushes - before < FLUSHES as u64,
+            "Write::flush must not fsync; {FLUSHES} flushes produced \
+             {} fsync calls",
+            after_flushes - before
+        );
+
+        // ...and flush must actually have pushed the bytes out, or "does not
+        // fsync" would be trivially satisfied by doing nothing at all.
+        assert_eq!(
+            std::fs::read(&path).unwrap().len(),
+            FLUSHES,
+            "flush must make buffered bytes visible in the file"
+        );
+
+        // The durability that `flush` gave up is available by name.
+        w.sync().unwrap();
+        assert!(
+            WRITER_METRICS.sync_all_calls.load(Relaxed) > after_flushes,
+            "sync() must fsync"
+        );
     }
 }

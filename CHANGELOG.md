@@ -25,6 +25,15 @@
   comma in its key, or surrounding spaces, will now select elements it
   previously did not.
 
+- **`PbfWriter::write_raw_copy` takes an `&Arc<File>` instead of a `RawFd`.**
+  In pipelined mode the splice is queued into the writer thread and runs
+  later, so a bare descriptor number had no lifetime tie to anything: a
+  caller who closed the input before `flush()`, or whose fd number was
+  recycled by an unrelated `open`, got a silent copy of whatever now sat at
+  that descriptor - wrong bytes, no error, on the one path whose purpose is
+  byte-exact passthrough. Migration: wrap the input `File` in an `Arc` and
+  pass a reference to it.
+
 - **`pbfhogg::inspect::inspect` takes an `InspectOptions` struct** instead of
   five positional `bool`s, which is where the new `distrust_metadata`
   setting lives. Migration is mechanical: name the fields.
@@ -168,6 +177,60 @@
   must be left untouched.
 
 ### Fixed
+
+- **A large `--elements-per-blob` no longer aborts the whole write on the
+  `BlobHeader` size cap.** `tagdata` (the per-blob tag key index) lists
+  every distinct tag key in the block, so it grows with the element count,
+  and the format caps a `BlobHeader` at 64 KiB. A dense blob pushed it over
+  and the write failed with an opaque byte-count error - on
+  `repack --elements-per-blob 228000`, an advertised configuration. The
+  index is now **dropped** for that blob rather than the write failing.
+  Dropping is the only safe fallback: `tagdata` is consumed as a skip
+  filter, so a *truncated* key list would make `tags-filter` skip blobs that
+  do contain the key, while an absent one already means "decode this blob".
+  The cost is the skip optimisation on the affected blobs and nothing else.
+  Drops are counted in the new `writer_tagdata_dropped_oversize` sidecar
+  counter. An oversize `WayMembers-v1` bitmap remains a hard error, because
+  its absence is a claim about blob contents rather than a missing hint;
+  the message now names it.
+
+- **A `--elements-per-blob` large enough to exceed the format's blob-body
+  cap is rejected at write time instead of producing an unreadable file.**
+  `repack --elements-per-blob 20000000` on Denmark wrote 143 MB blob bodies
+  and exited zero; the failure only surfaced later, in a *reader*, as "blob
+  header declares datasize too big". The writer now refuses, and names the
+  flag responsible.
+
+- **`FileWriter::flush` no longer means `fsync`.** It called `sync_all()`,
+  so any incidental `flush()` - a wrapping `BufWriter`, a generic helper, a
+  library consumer following `Write` semantics - bought a full fsync.
+  `flush` now flushes; durability is available by name via the new
+  `FileWriter::sync()`, which is what the pipeline's end-of-stream
+  finalisation calls. Every `PbfWriter` constructed from a path
+  (`to_path`, `to_path_direct`, `to_path_uring`, `to_path_parallel`) still
+  fsyncs its output when `flush()` completes. A `PbfWriter::new` built by
+  hand over a `FileWriter` does not: there, `flush` now means `flush`, and a
+  caller who wants durability calls `FileWriter::sync()` itself.
+
+- **`ParallelGzipWriter::flush` no longer reports success without writing
+  anything.** It was a documented no-op returning `Ok(())`, so a caller who
+  flushed and checked the result was told the bytes had gone somewhere while
+  they sat in the internal buffer. `flush` now blocks until every buffered
+  byte has been compressed, written to the inner writer and the inner writer
+  flushed, and it returns any compression or destination-I/O error that
+  happened along the way - including one deferred from an earlier chunk.
+  Each `flush` forces a gzip member boundary, so flushing gratuitously costs
+  compression ratio. `finish()` is still the call that closes the pipeline,
+  joins every thread and returns the inner writer.
+
+- **A dead writer thread now stops `write_primitive_block*`, not just
+  `write_raw*`.** The framing work runs in a `rayon::spawn` closure whose
+  send result went nowhere, so a writer thread that died on ENOSPC stayed
+  invisible until `flush()` - and nothing throttled the producer, because
+  the dispatch permits are released when a closure *completes*, not when its
+  result is delivered. A full disk therefore let an entire dataset be read,
+  decoded and framed before anything was reported. The producer now notices
+  and surfaces the writer thread's own error.
 
 - **`check --ids` judged ID monotonicity by raw `i64` comparison while
   everything else used canonical OSM order.** Canonical order is `0`, then

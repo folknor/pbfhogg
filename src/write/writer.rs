@@ -35,7 +35,7 @@ pub(crate) use super::framing::{
 // thread) lives in the sibling `pipeline` module.
 use super::pipeline::{
     FileOutputSink, OutputChunk, PermitGuard, PipelineItem, SeqTotal, WRITE_AHEAD, WritePipeline,
-    elapsed_ns_u64, new_permit_pool, record_send_wait, writer_thread,
+    WriterGone, elapsed_ns_u64, new_permit_pool, record_send_wait, writer_thread,
 };
 
 /// Returned when a write is attempted on a `PbfWriter` whose inner writer was
@@ -70,6 +70,28 @@ fn pipeline_send_error(pipeline: &mut WritePipeline) -> io::Error {
         // and surfaced whatever it found.
         None => io::Error::other("writer thread terminated"),
     }
+}
+
+/// Take one dispatch permit, blocking until one is free, and return the guard
+/// that gives it back.
+///
+/// Used by the producer's own send paths (`write_raw*`). The rayon framing
+/// closures build their [`PermitGuard`] inside the closure instead, because
+/// the permit has to outlive the spawn rather than the call.
+///
+/// Holding a permit across *every* send is what makes the pipeline's liveness
+/// argument hold without any assumption about rayon's scheduling order; see
+/// [`WRITE_AHEAD`].
+fn acquire_permit(pipeline: &WritePipeline) -> io::Result<PermitGuard> {
+    let t_permit = std::time::Instant::now();
+    pipeline
+        .permit_rx
+        .recv()
+        .map_err(|_| io::Error::other("pipelined writer permit pool disconnected"))?;
+    WRITER_METRICS
+        .permit_wait_ns
+        .fetch_add(elapsed_ns_u64(t_permit), Relaxed);
+    Ok(PermitGuard::new(pipeline.permit_tx.clone()))
 }
 
 /// Writes PBF files as a sequence of framed, compressed blobs.
@@ -210,6 +232,7 @@ impl PbfWriter<FileWriter> {
                 permit_tx,
                 permit_rx,
                 expected,
+                writer_gone: WriterGone::new(),
             }),
             scratch: FrameScratch::new(),
         })
@@ -280,6 +303,7 @@ impl PbfWriter<FileWriter> {
                 permit_tx,
                 permit_rx,
                 expected,
+                writer_gone: WriterGone::new(),
             }),
             scratch: FrameScratch::new(),
         })
@@ -314,6 +338,7 @@ impl PbfWriter<FileWriter> {
                 permit_tx,
                 permit_rx,
                 expected,
+                writer_gone: WriterGone::new(),
             }),
             scratch: FrameScratch::new(),
         })
@@ -364,6 +389,13 @@ impl<W: Write> PbfWriter<W> {
             // from growing without bound (see `PIPELINE_DISPATCH_PERMITS`
             // doc comment for the planet-scale OOM story that motivated
             // this).
+            // A framing closure already found the writer thread gone. Join
+            // it now and return its real cause, rather than framing the rest
+            // of the dataset into a channel nobody is reading. See
+            // `WriterGone`.
+            if pipeline.writer_gone.observed() {
+                return Err(pipeline_send_error(pipeline));
+            }
             let t_permit = std::time::Instant::now();
             pipeline
                 .permit_rx
@@ -378,6 +410,7 @@ impl<W: Write> PbfWriter<W> {
             let uncompressed = block_bytes.to_vec();
             let tx = pipeline.tx.clone();
             let permit_tx = pipeline.permit_tx.clone();
+            let writer_gone = pipeline.writer_gone.clone();
             rayon::spawn(move || {
                 // Constructed first so it drops last - the permit is released
                 // after `tx.send` below, and also on the unwind path if any
@@ -404,10 +437,19 @@ impl<W: Write> PbfWriter<W> {
                         .fetch_add(parts.total_len(), Relaxed);
                 }
                 let t_send = std::time::Instant::now();
-                drop(tx.send(PipelineItem {
-                    seq,
-                    data: result.map(OutputChunk::Framed),
-                }));
+                // A failed send means the writer thread has already exited,
+                // and this closure has no `Result` to return it in. Record it
+                // so the producer's next call can join and surface the real
+                // cause instead of grinding on to `flush()`. See `WriterGone`.
+                if tx
+                    .send(PipelineItem {
+                        seq,
+                        data: result.map(OutputChunk::Framed),
+                    })
+                    .is_err()
+                {
+                    writer_gone.record();
+                }
                 record_send_wait(t_send);
             });
             Ok(())
@@ -441,6 +483,13 @@ impl<W: Write> PbfWriter<W> {
     #[hotpath::measure]
     pub fn write_primitive_block_no_indexdata(&mut self, block_bytes: &[u8]) -> io::Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
+            // A framing closure already found the writer thread gone. Join
+            // it now and return its real cause, rather than framing the rest
+            // of the dataset into a channel nobody is reading. See
+            // `WriterGone`.
+            if pipeline.writer_gone.observed() {
+                return Err(pipeline_send_error(pipeline));
+            }
             let t_permit = std::time::Instant::now();
             pipeline
                 .permit_rx
@@ -455,6 +504,7 @@ impl<W: Write> PbfWriter<W> {
             let uncompressed = block_bytes.to_vec();
             let tx = pipeline.tx.clone();
             let permit_tx = pipeline.permit_tx.clone();
+            let writer_gone = pipeline.writer_gone.clone();
             rayon::spawn(move || {
                 // Drops last - releases the permit after `tx.send`, and on
                 // the unwind path too. See `PermitGuard`.
@@ -477,10 +527,19 @@ impl<W: Write> PbfWriter<W> {
                         .fetch_add(parts.total_len(), Relaxed);
                 }
                 let t_send = std::time::Instant::now();
-                drop(tx.send(PipelineItem {
-                    seq,
-                    data: result.map(OutputChunk::Framed),
-                }));
+                // A failed send means the writer thread has already exited,
+                // and this closure has no `Result` to return it in. Record it
+                // so the producer's next call can join and surface the real
+                // cause instead of grinding on to `flush()`. See `WriterGone`.
+                if tx
+                    .send(PipelineItem {
+                        seq,
+                        data: result.map(OutputChunk::Framed),
+                    })
+                    .is_err()
+                {
+                    writer_gone.record();
+                }
                 record_send_wait(t_send);
             });
             Ok(())
@@ -513,6 +572,13 @@ impl<W: Write> PbfWriter<W> {
             // Bound in-flight rayon dispatches - see the sibling
             // `write_primitive_block` above and the
             // `PIPELINE_DISPATCH_PERMITS` doc comment for why.
+            // A framing closure already found the writer thread gone. Join
+            // it now and return its real cause, rather than framing the rest
+            // of the dataset into a channel nobody is reading. See
+            // `WriterGone`.
+            if pipeline.writer_gone.observed() {
+                return Err(pipeline_send_error(pipeline));
+            }
             let t_permit = std::time::Instant::now();
             pipeline
                 .permit_rx
@@ -528,6 +594,7 @@ impl<W: Write> PbfWriter<W> {
             let tagdata_owned = tagdata.map(<[u8]>::to_vec);
             let way_members_owned = way_members.map(<[u8]>::to_vec);
             let permit_tx = pipeline.permit_tx.clone();
+            let writer_gone = pipeline.writer_gone.clone();
             rayon::spawn(move || {
                 // Drops last - releases the permit after `tx.send`, and on
                 // the unwind path too. See `PermitGuard`.
@@ -550,10 +617,19 @@ impl<W: Write> PbfWriter<W> {
                         .fetch_add(parts.total_len(), Relaxed);
                 }
                 let t_send = std::time::Instant::now();
-                drop(tx.send(PipelineItem {
-                    seq,
-                    data: result.map(OutputChunk::Framed),
-                }));
+                // A failed send means the writer thread has already exited,
+                // and this closure has no `Result` to return it in. Record it
+                // so the producer's next call can join and surface the real
+                // cause instead of grinding on to `flush()`. See `WriterGone`.
+                if tx
+                    .send(PipelineItem {
+                        seq,
+                        data: result.map(OutputChunk::Framed),
+                    })
+                    .is_err()
+                {
+                    writer_gone.record();
+                }
                 record_send_wait(t_send);
             });
             Ok(())
@@ -578,6 +654,10 @@ impl<W: Write> PbfWriter<W> {
     /// (no rayon task needed since there is no compression work).
     pub fn write_raw(&mut self, raw_framed_bytes: &[u8]) -> io::Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
+            // Hold a dispatch permit across the send. This is what makes the
+            // "no send can block on a full channel" argument in `WRITE_AHEAD`
+            // cover the producer's own sends as well as the rayon framers'.
+            let _permit = acquire_permit(pipeline)?;
             let seq = pipeline.seq;
             pipeline.seq += 1;
             WRITER_METRICS.payload_raw_items.fetch_add(1, Relaxed);
@@ -607,6 +687,10 @@ impl<W: Write> PbfWriter<W> {
     /// with `std::mem::take`).
     pub fn write_raw_owned(&mut self, raw_framed_bytes: Vec<u8>) -> io::Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
+            // Hold a dispatch permit across the send. This is what makes the
+            // "no send can block on a full channel" argument in `WRITE_AHEAD`
+            // cover the producer's own sends as well as the rayon framers'.
+            let _permit = acquire_permit(pipeline)?;
             let seq = pipeline.seq;
             pipeline.seq += 1;
             WRITER_METRICS.payload_raw_items.fetch_add(1, Relaxed);
@@ -635,6 +719,10 @@ impl<W: Write> PbfWriter<W> {
     /// Used by passthrough coalescers to avoid `extend_from_slice` memcpy.
     pub fn write_raw_chunks(&mut self, chunks: Vec<Vec<u8>>) -> io::Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
+            // Hold a dispatch permit across the send. This is what makes the
+            // "no send can block on a full channel" argument in `WRITE_AHEAD`
+            // cover the producer's own sends as well as the rayon framers'.
+            let _permit = acquire_permit(pipeline)?;
             let seq = pipeline.seq;
             pipeline.seq += 1;
             let total_bytes: u64 = chunks.iter().map(|c| c.len() as u64).sum();
@@ -823,18 +911,27 @@ impl PbfWriter<FileWriter> {
     /// to copy directly between file descriptors. On filesystems with reflink
     /// support (btrfs, xfs), this is a metadata-only operation.
     ///
-    /// `in_fd` is the input file descriptor (from `FileReader::raw_fd()`).
+    /// `in_file` is the open input PBF, shared rather than borrowed: the
+    /// pipelined path queues this request into the writer thread and returns
+    /// immediately, so the input has to stay open until the splice actually
+    /// runs. Passing a bare `RawFd` could not express that - see
+    /// [`OutputChunk::CopyRange`](crate::write::pipeline::OutputChunk).
     /// `offset` and `len` describe the framed blob's position in the input file.
     ///
     /// Callers must not use this when the output writer is O_DIRECT - use
     /// [`write_raw`](Self::write_raw) instead.
     pub fn write_raw_copy(
         &mut self,
-        in_fd: std::os::unix::io::RawFd,
+        in_file: &std::sync::Arc<std::fs::File>,
         offset: u64,
         len: u64,
     ) -> io::Result<()> {
+        use std::os::unix::io::AsRawFd;
         if let Some(ref mut pipeline) = self.pipeline {
+            // Hold a dispatch permit across the send. This is what makes the
+            // "no send can block on a full channel" argument in `WRITE_AHEAD`
+            // cover the producer's own sends as well as the rayon framers'.
+            let _permit = acquire_permit(pipeline)?;
             let seq = pipeline.seq;
             pipeline.seq += 1;
             WRITER_METRICS
@@ -846,7 +943,11 @@ impl PbfWriter<FileWriter> {
             let t_send = std::time::Instant::now();
             let sent = pipeline.tx.send(PipelineItem {
                 seq,
-                data: Ok(OutputChunk::CopyRange { in_fd, offset, len }),
+                data: Ok(OutputChunk::CopyRange {
+                    in_file: std::sync::Arc::clone(in_file),
+                    offset,
+                    len,
+                }),
             });
             if sent.is_err() {
                 return Err(pipeline_send_error(pipeline));
@@ -865,7 +966,7 @@ impl PbfWriter<FileWriter> {
                         "copy_file_range incompatible with O_DIRECT output",
                     )
                 })?;
-            copy_range(in_fd, out_fd, offset, len)
+            copy_range(in_file.as_raw_fd(), out_fd, offset, len)
         }
     }
 }
@@ -873,7 +974,7 @@ impl PbfWriter<FileWriter> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{Compression, PbfWriter, WritePipeline};
+    use super::{Compression, PbfWriter, WritePipeline, WriterGone};
     use crate::write::framing::FrameScratch;
     use crate::write::pipeline::{PipelineItem, SeqTotal, new_permit_pool};
     use std::io;
@@ -902,6 +1003,7 @@ mod tests {
                 permit_tx,
                 permit_rx,
                 expected,
+                writer_gone: WriterGone::new(),
             }),
             scratch: FrameScratch::new(),
         }
@@ -963,6 +1065,183 @@ mod tests {
         assert!(
             err.to_string().contains("no further writes are possible"),
             "got: {err}"
+        );
+    }
+
+    /// A dead writer thread must stop `write_primitive_block` too, not just
+    /// the `write_raw*` family.
+    ///
+    /// `write_primitive_block*` hands its framed result to a `rayon::spawn`
+    /// closure that used to end in `drop(tx.send(...))`, so a writer thread
+    /// that died on ENOSPC was invisible until `flush()`. Nothing throttled
+    /// the producer, because the permit pool releases on closure *completion*,
+    /// not on delivery - a full disk let a whole planet-scale dataset be read,
+    /// decoded and framed before anything was reported. The loop below is the
+    /// producer grinding on: it must terminate with the writer thread's own
+    /// error long before the cap.
+    #[test]
+    fn write_primitive_block_stops_once_the_writer_thread_is_dead() {
+        let mut w = writer_with_dead_thread(Err(io::Error::new(
+            io::ErrorKind::StorageFull,
+            "no space left on device",
+        )));
+        // A minimal but real PrimitiveBlock: an empty PrimitiveGroup (field 2).
+        let block = [0x12u8, 0x00];
+        let mut err = None;
+        for _ in 0..2_000 {
+            if let Err(e) = w.write_primitive_block(&block) {
+                err = Some(e);
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let err = err.expect(
+            "the producer must notice the dead writer thread; \
+             it ran 2,000 blocks without a single report",
+        );
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::StorageFull,
+            "the ENOSPC kind must reach the caller, not a generic substitute"
+        );
+        assert!(
+            err.to_string().contains("no space left on device"),
+            "the thread's own message must reach the caller, got: {err}"
+        );
+    }
+
+    /// A queued `CopyRange` must survive the caller dropping its input handle.
+    ///
+    /// `write_raw_copy` used to take a bare `RawFd`, queued into the writer
+    /// thread with no lifetime tie to the `File` that owned it. The caller
+    /// closing the input before `flush()` - or simply letting the fd number be
+    /// recycled by an unrelated `open` - meant the splice read whatever now
+    /// sat at that descriptor: no error, wrong bytes, on the one path whose
+    /// entire purpose is byte-exact passthrough.
+    ///
+    /// The decoy below is what turns that from a race into a certainty: Linux
+    /// hands out the lowest free descriptor, so if dropping the handle really
+    /// closed the input, the decoy takes its number and the splice copies the
+    /// decoy's bytes.
+    #[cfg(feature = "linux-direct-io")]
+    #[test]
+    fn a_queued_copy_range_outlives_the_callers_handle() {
+        use std::sync::Arc;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let input_path = dir.path().join("input.bin");
+        let decoy_path = dir.path().join("decoy.bin");
+        let out_path = dir.path().join("out.osm.pbf");
+
+        let payload: Vec<u8> = (0..8192u32)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        let decoy = vec![0xEEu8; payload.len()];
+        std::fs::write(&input_path, &payload).unwrap();
+        std::fs::write(&decoy_path, &decoy).unwrap();
+
+        let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
+        let mut w = PbfWriter::to_path(&out_path, Compression::None, &header).unwrap();
+
+        let input = Arc::new(std::fs::File::open(&input_path).unwrap());
+        w.write_raw_copy(&input, 0, payload.len() as u64).unwrap();
+
+        // The caller is done with its handle. The writer thread has not
+        // necessarily run the splice yet.
+        drop(input);
+        // Claim the descriptor the input would have vacated.
+        let _decoy_handle = std::fs::File::open(&decoy_path).unwrap();
+
+        w.flush().unwrap();
+
+        let out = std::fs::read(&out_path).unwrap();
+        assert!(
+            out.ends_with(&payload),
+            "the splice must copy the input the caller named, not whatever \
+             later took its descriptor number"
+        );
+    }
+
+    /// End-of-stream finalization must still `fsync`.
+    ///
+    /// `FileWriter::flush` stopped meaning `fsync` this round, and
+    /// `FileOutputSink::flush` was changed to call the new `sync()` instead so
+    /// that a completed write is still durable. Only the first half of that
+    /// pair had a test: `flush_pushes_bytes_onward_without_fsyncing` pins
+    /// `FileWriter`'s new behaviour, and nothing at all pinned the sink that
+    /// has to ask for the durability the writer stopped providing. Revert
+    /// `FileOutputSink::flush` to `self.writer.flush()` and every pipelined
+    /// write silently loses its fsync with a green suite - which is precisely
+    /// the "tested the producer, forgot the consumer" shape.
+    #[test]
+    fn end_of_stream_finalization_still_fsyncs() {
+        use crate::write::metrics::WRITER_METRICS;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("durable.osm.pbf");
+        let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
+
+        let before = WRITER_METRICS.sync_all_calls.load(Relaxed);
+        let mut w = PbfWriter::to_path(&path, Compression::None, &header).unwrap();
+        w.write_primitive_block(&[0x12u8, 0x00]).unwrap();
+        w.flush().unwrap();
+        assert!(
+            WRITER_METRICS.sync_all_calls.load(Relaxed) > before,
+            "a completed pipelined write must fsync its output; \
+             FileOutputSink::flush has to call FileWriter::sync, not \
+             FileWriter::flush"
+        );
+    }
+
+    /// The same gap, on the owned-bytes and no-indexdata siblings.
+    ///
+    /// All three `write_primitive_block*` methods carry their own copy of the
+    /// rayon-spawn body, so a fix applied to the representative one leaves the
+    /// others silently broken. Every shape gets tested.
+    #[test]
+    fn every_primitive_block_variant_stops_once_the_writer_thread_is_dead() {
+        let block = [0x12u8, 0x00];
+        let index = crate::blob_meta::BlobIndex {
+            kind: crate::blob_meta::ElemKind::Node,
+            min_id: 0,
+            max_id: 0,
+            count: 0,
+            bbox: None,
+        };
+
+        let mut w = writer_with_dead_thread(Err(io::Error::new(
+            io::ErrorKind::StorageFull,
+            "owned variant: no space left on device",
+        )));
+        let mut err = None;
+        for _ in 0..2_000 {
+            if let Err(e) = w.write_primitive_block_owned(block.to_vec(), index, None, None) {
+                err = Some(e);
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            err.is_some_and(|e| e.to_string().contains("owned variant")),
+            "write_primitive_block_owned must surface the writer thread's error"
+        );
+
+        let mut w = writer_with_dead_thread(Err(io::Error::new(
+            io::ErrorKind::StorageFull,
+            "no-indexdata variant: no space left on device",
+        )));
+        let mut err = None;
+        for _ in 0..2_000 {
+            if let Err(e) = w.write_primitive_block_no_indexdata(&block) {
+                err = Some(e);
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            err.is_some_and(|e| e.to_string().contains("no-indexdata variant")),
+            "write_primitive_block_no_indexdata must surface the writer thread's error"
         );
     }
 }

@@ -214,14 +214,12 @@ pub fn sort(
     // Open input for random-access reads
     let mut input_file = File::open(input)?;
 
-    // copy_file_range / CopyRange setup
-    #[cfg(feature = "linux-direct-io")]
-    let input_fd = {
-        use std::os::unix::io::AsRawFd;
-        input_file.as_raw_fd()
-    };
-    #[cfg(not(feature = "linux-direct-io"))]
-    let input_fd = 0i32;
+    // copy_file_range / CopyRange setup. The writer thread splices from this
+    // handle asynchronously, so it gets its own `dup`ed descriptor owned by an
+    // `Arc` that outlives every queued CopyRange - see
+    // `PbfWriter::write_raw_copy`. `input_file` stays untouched for the
+    // random-access reads below.
+    let input_shared = std::sync::Arc::new(input_file.try_clone()?);
     // io_uring uses linked ReadFixed+WriteFixed for CopyRange.
     // Buffered output supports copy_file_range. O_DIRECT cannot.
     let use_copy_range = io_uring || (!direct_io && cfg!(feature = "linux-direct-io"));
@@ -285,7 +283,12 @@ pub fn sort(
     let mut i = 0;
     while i < entries.len() {
         if overlaps[i] {
-            flush_copy_run(&mut copy_run, &mut writer, input_fd, &mut copy_run_calls)?;
+            flush_copy_run(
+                &mut copy_run,
+                &mut writer,
+                &input_shared,
+                &mut copy_run_calls,
+            )?;
             let start = i;
             let run_kind = entries[i].index.kind;
             while i < entries.len() && overlaps[i] && entries[i].index.kind == run_kind {
@@ -319,13 +322,18 @@ pub fn sort(
                 entry,
                 use_copy_range,
                 &mut writer,
-                input_fd,
+                &input_shared,
                 &mut copy_run_calls,
             )? {
                 CopyRunStep::Extended => copy_run_coalesced += 1,
                 CopyRunStep::Started => {}
                 CopyRunStep::Fallback => {
-                    flush_copy_run(&mut copy_run, &mut writer, input_fd, &mut copy_run_calls)?;
+                    flush_copy_run(
+                        &mut copy_run,
+                        &mut writer,
+                        &input_shared,
+                        &mut copy_run_calls,
+                    )?;
                     write_passthrough_blob(entry, &mut input_file, &mut writer, &mut frame_buf)?;
                 }
             }
@@ -334,7 +342,12 @@ pub fn sort(
             i += 1;
         }
     }
-    flush_copy_run(&mut copy_run, &mut writer, input_fd, &mut copy_run_calls)?;
+    flush_copy_run(
+        &mut copy_run,
+        &mut writer,
+        &input_shared,
+        &mut copy_run_calls,
+    )?;
     debug_assert!(
         overlap_iter.next().is_none(),
         "overlap outputs not fully drained"
@@ -634,7 +647,7 @@ fn try_extend_copy_run(
     entry: &BlobEntry,
     use_copy_range: bool,
     writer: &mut PbfWriter<FileWriter>,
-    input_fd: i32,
+    input: &std::sync::Arc<std::fs::File>,
     calls: &mut u64,
 ) -> Result<CopyRunStep> {
     if !(entry.has_indexdata && use_copy_range) {
@@ -648,7 +661,7 @@ fn try_extend_copy_run(
                 Ok(CopyRunStep::Extended)
             }
             _ => {
-                flush_copy_run(run, writer, input_fd, calls)?;
+                flush_copy_run(run, writer, input, calls)?;
                 *run = Some((entry.file_offset, entry.file_offset + entry.frame_len));
                 Ok(CopyRunStep::Started)
             }
@@ -664,11 +677,11 @@ fn try_extend_copy_run(
 fn flush_copy_run(
     run: &mut Option<(u64, u64)>,
     writer: &mut PbfWriter<FileWriter>,
-    input_fd: std::os::unix::io::RawFd,
+    input: &std::sync::Arc<std::fs::File>,
     calls: &mut u64,
 ) -> Result<()> {
     if let Some((start, end)) = run.take() {
-        writer.write_raw_copy(input_fd, start, end - start)?;
+        writer.write_raw_copy(input, start, end - start)?;
         *calls += 1;
     }
     Ok(())
@@ -680,7 +693,7 @@ fn flush_copy_run(
 fn flush_copy_run(
     run: &mut Option<(u64, u64)>,
     _writer: &mut PbfWriter<FileWriter>,
-    _input_fd: i32,
+    _input: &std::sync::Arc<std::fs::File>,
     _calls: &mut u64,
 ) -> Result<()> {
     debug_assert!(

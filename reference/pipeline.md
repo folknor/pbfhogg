@@ -428,7 +428,11 @@ full file per step: passthrough saves little there.
 - Thread-local `PIPELINE_SCRATCH` - per-rayon-thread, reused across blobs
 - `frame_blob_into()` - allocates **one Vec per blob** for final framed output (exact capacity)
 - `compress_zlib()` - `flate2::Compress` with `reset()`, reuses `compress_buf`
-- Pipelined writer thread - VecDeque reorder buffer (WRITE_AHEAD=32)
+- Pipelined writer thread - VecDeque reorder buffer, `WRITE_AHEAD` =
+  `PIPELINE_DISPATCH_PERMITS` (64). The channel is deliberately not the
+  memory bound - the permit pool is - and sizing it below the permit count
+  lets a rayon framer block in `send` while holding the earlier-seq task the
+  writer thread is waiting for. A compile-time assertion pins the relation.
 
 ## Compression Summary
 

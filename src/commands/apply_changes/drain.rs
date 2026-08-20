@@ -83,12 +83,14 @@ pub(super) struct DrainConfig<'a> {
     /// `false` under `--direct-io`; in that case the drain only ever
     /// sees `OwnedBytes` for passthroughs (workers preread the frame).
     pub use_copy_range: bool,
-    /// `RawFd` of the input PBF, used by `write_raw_copy` for
-    /// kernel-space splice. Ignored when `use_copy_range == false`.
-    /// Type is `i32` rather than `RawFd` so the field exists under
-    /// non-Linux builds; it just isn't used.
+    /// The open input PBF, spliced from by `write_raw_copy`. Ignored when
+    /// `use_copy_range == false`.
+    ///
+    /// An `Arc<File>` rather than a `RawFd`: the splice is queued into the
+    /// writer thread and runs later, so the descriptor has to be owned for
+    /// that long rather than merely happening to still be open.
     #[cfg_attr(not(feature = "linux-direct-io"), allow(dead_code))]
-    pub input_fd: i32,
+    pub input_file: std::sync::Arc<std::fs::File>,
     /// `--locations-on-ways` mode is on. Drain merges `CoordSlots` at
     /// the node→way barrier and signals the scanner.
     pub locations_on_ways: bool,
@@ -719,7 +721,7 @@ fn dispatch_variant(
 }
 
 /// Flush the in-flight contiguous `copy_file_range` run as a single
-/// `write_raw_copy(input_fd, start, len)` call. Only callable when
+/// `write_raw_copy(&input_file, start, len)` call. Only callable when
 /// `cfg.use_copy_range` is true (which itself requires the
 /// `linux-direct-io` feature in the binding at `rewrite.rs`).
 #[cfg(feature = "linux-direct-io")]
@@ -734,7 +736,7 @@ fn flush_copy_range(
     };
     let len = end - start;
     writer
-        .write_raw_copy(cfg.input_fd, start, len)
+        .write_raw_copy(&cfg.input_file, start, len)
         .map_err(io_err)?;
     counters.copy_range_calls.fetch_add(1, Ordering::Relaxed);
     Ok(())

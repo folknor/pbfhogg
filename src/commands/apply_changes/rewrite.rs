@@ -307,16 +307,17 @@ pub fn merge(
         .try_into()
         .unwrap_or(i64::MAX);
 
-    // copy_file_range fd setup. Mirrors the legacy path so direct-io
-    // and io_uring routing remain correct.
+    // copy_file_range input setup. Mirrors the legacy path so direct-io and
+    // io_uring routing remain correct. The handle is shared rather than
+    // borrowed: `write_raw_copy` queues the splice into the writer thread, so
+    // the input has to stay open past the point this function returns from the
+    // call. This used to be a bare `RawFd` kept alive by a `_copy_fd_file`
+    // binding whose only job was to not be dropped.
+    let input_file = std::sync::Arc::new(std::fs::File::open(base_pbf)?);
     #[cfg(feature = "linux-direct-io")]
-    let (_copy_fd_file, input_fd, use_copy_range) = {
-        let f = FileReader::buffered(base_pbf)?;
-        let fd = f.raw_fd();
-        (f, fd, io_uring || !direct_io)
-    };
+    let use_copy_range = io_uring || !direct_io;
     #[cfg(not(feature = "linux-direct-io"))]
-    let (input_fd, use_copy_range) = (0i32, false);
+    let use_copy_range = false;
 
     // Worker count: `-j N` override if supplied (non-zero), else the
     // default `nproc - 2` heuristic (leaves two cores for the scanner
@@ -433,7 +434,7 @@ pub fn merge(
         ranges: &ranges,
         diff: &diff,
         use_copy_range,
-        input_fd,
+        input_file,
         locations_on_ways,
         coord_slots,
         barrier_tx: barrier_tx_opt,

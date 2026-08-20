@@ -328,6 +328,18 @@ notes carry a CLOSED/STATUS header pointing back here.
   RLIMIT_MEMLOCK soft limit is 8 MB, io_uring preflight needs >= 16 MB
   (limits.conf change + re-login), which also blocks the sort
   `--io-uring` re-pin.
+
+  **Release-gate consequence, 2026-08-20.** The same limit means the
+  io_uring writer cannot be exercised on real data on this host at all,
+  and the write-path bug hunt landed three changes inside it that
+  therefore have compile-and-unit coverage only: the `Drop` teardown
+  drain (`drain_best_effort`), the `NUM_BUFS <= 64` compile-time
+  assertion, and `OutputChunk::CopyRange` carrying an `Arc<File>`
+  instead of a `RawFd`. `brokkr check` and `brokkr verify all` are both
+  green, but neither runs a `--io-uring` variant, so whoever owns the
+  release gate should run one `--io-uring` command on a host with the
+  raised limit before shipping. Nothing about the changes is
+  host-specific; the gap is coverage, not suspicion.
 - **libdeflate at planet apply-changes** (formerly write-path plan item
   2b). The sync-mode 1.92x compression win is measured and banked
   (`2cd6ed6`); the pipelined null result was Denmark-scale only, where

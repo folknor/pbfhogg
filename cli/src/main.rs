@@ -1003,7 +1003,7 @@ enum Command {
         /// S2 cell level for admin boundaries (0-19)
         #[arg(long, default_value = "10")]
         admin_level: u8,
-        /// Douglas-Peucker cap for local admins; larger levels retain up to 16x
+        /// Douglas-Peucker cap for local admin polygons; levels 5, 4, 3, and 2 retain up to 2x, 4x, 8x, and 16x this value
         #[arg(long, default_value = "500")]
         max_admin_vertices: u16,
         /// Fine-level max search distance in meters

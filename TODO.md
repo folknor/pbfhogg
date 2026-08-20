@@ -473,6 +473,29 @@ normalise-then-compare treatment the existing OSC arms use.
 Until it lands, treat a green `brokkr verify all` as saying nothing about
 `merge-changes`.
 
+## Cross-repo: no real dataset crosses the antimeridian (2026-08-20)
+
+Every configured dataset (denmark, europe, japan, planet subsets used in
+verifies) lies entirely between -180 and +180 without touching the seam, so
+no real-data test can ever exercise longitude-wrap behavior. The geocode
+bug-hunt round found FOUR independent antimeridian defects in one command
+(`approx_distance_sq` raw subtraction, `snap_lon` long-arc interpolation,
+`cover_segment` sampling the 359.8-degree way around, and the interpolation
+endpoint matcher's raw i32 subtraction - the last one also an integer
+overflow), and the six Denmark real-data numbers were byte-identical across
+all of them: Denmark is structurally blind to this entire defect class. The
+synthetic fixtures added in `tests/geocode_index.rs` and the unit tests in
+`src/geo.rs` now pin each fixed site, but synthetic coverage only pins the
+variants an author imagined - the pattern of this hunt.
+
+What brokkr would have to ship: register a small dataset that genuinely
+crosses +/-180 - Geofabrik's `australia-oceania/fiji` is the natural pick
+(tens of MB, real admin boundaries and addresses straddling the seam) - and
+let `brokkr build-geocode-index --dataset fiji` plus a handful of pinned
+query values join the release-gate list the way `build_denmark_index` /
+`query_copenhagen` do. Until then, treat every green real-data gate as
+evidence about the non-wrapping hemisphere of the code only.
+
 ## Item/command-specific plans
 
 Three new docs capturing a cross-cutting insight and two new commands that fall out of it. All scaffolding-level; details drift as work lands.

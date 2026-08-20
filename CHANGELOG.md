@@ -28,7 +28,12 @@
   against a segment length of a fraction of a degree, and interpolated house
   numbers on such a segment could be wildly wrong. The builder's S2 segment
   sampler unwraps too, so a segment crossing the dateline covers the cells it
-  actually passes through instead of a band around the whole planet.
+  actually passes through instead of a band around the whole planet. The
+  builder's interpolation endpoint matcher is the last member of the family: it
+  now measures endpoint-to-address distance on the short arc as well, so an
+  address point just across the dateline from a way endpoint is preferred over
+  a farther one on the same side (the raw subtraction also overflowed `i32`
+  there).
 
 - **Geocode coarse fallback for interpolation now depends on whether a fine hit
   resolves, not on whether one exists.** A nearby interpolation way with

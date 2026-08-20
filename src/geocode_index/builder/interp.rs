@@ -253,8 +253,13 @@ fn find_endpoint_house_number_mmap(
             if pt.street_offset != street_offset {
                 continue;
             }
-            let dlat = (pt.lat_e7 - lat_e7) as i64;
-            let dlon = (pt.lon_e7 - lon_e7) as i64;
+            let dlat = i64::from(pt.lat_e7) - i64::from(lat_e7);
+            // Same species as the pass3/reader antimeridian bugs: an S2 cell
+            // straddling +/-180 degrees holds points whose raw E7 longitudes
+            // differ by ~3.6e9. Unwrapped, the near candidate looks half a
+            // world away (and the raw i32 subtraction overflows outright).
+            let dlon =
+                crate::geo::wrapped_longitude_delta_e7(i64::from(pt.lon_e7) - i64::from(lon_e7));
             let dist_sq = dlat * dlat + dlon * dlon;
             let is_exact = dlat.abs() <= 1 && dlon.abs() <= 1;
 
@@ -338,6 +343,56 @@ mod tests {
     #[should_panic(expected = "address CSR cannot exceed")]
     fn csr_offset_refuses_truncation() {
         let _ = csr_offset(u32::MAX as usize + 1);
+    }
+
+    /// An address point 0.0001 degrees away ACROSS the antimeridian must beat
+    /// one 0.0009 degrees away on the same side. Before the wrap fix the raw
+    /// i32 longitude subtraction saw the across-seam candidate as ~360 degrees
+    /// away (and overflowed i32 outright in debug builds), so the decoy won.
+    #[test]
+    fn endpoint_matching_takes_the_short_arc_across_the_antimeridian() {
+        let street_level = 17;
+        let endpoint = (100_000_000, 1_799_999_000); // 10N, 179.9999E
+        let mut strings = StringPool::new();
+        let near_across_seam = strings.intern("20");
+        let far_same_side = strings.intern("10");
+        let street_offset = strings.intern("Dateline Road");
+        let mut bytes = Vec::new();
+        // True delta 2000 e7-units, raw delta ~3.6e9 (would overflow i32).
+        append_point(
+            &mut bytes,
+            AddrPoint {
+                lat_e7: endpoint.0,
+                lon_e7: -1_799_999_000,
+                housenumber_offset: near_across_seam,
+                street_offset,
+                postcode_offset: 0,
+            },
+        );
+        // True delta 9000 e7-units, same side.
+        append_point(
+            &mut bytes,
+            AddrPoint {
+                lat_e7: endpoint.0,
+                lon_e7: 1_799_990_000,
+                housenumber_offset: far_same_side,
+                street_offset,
+                postcode_offset: 0,
+            },
+        );
+
+        let csr = build_cell_addr_csr(&bytes, street_level);
+        assert_eq!(
+            find_endpoint_house_number_mmap(
+                endpoint,
+                street_offset,
+                &bytes,
+                &strings,
+                &csr,
+                street_level,
+            ),
+            Some(20)
+        );
     }
 
     #[test]

@@ -343,7 +343,8 @@ mod tests {
     /// wrong numbers, reached by the other spelling.
     #[test]
     fn writer_counters_are_emitted_only_from_the_process_exit_hook() {
-        const SOURCES: [(&str, &str); 5] = [
+        const SOURCES: [(&str, &str); 6] = [
+            ("direct_writer.rs", include_str!("direct_writer.rs")),
             ("file_writer.rs", include_str!("file_writer.rs")),
             ("parallel_writer.rs", include_str!("parallel_writer.rs")),
             ("uring_writer.rs", include_str!("uring_writer.rs")),
@@ -393,7 +394,12 @@ mod tests {
     /// deliberately not scanned.
     #[test]
     fn backends_record_paired_counters_only_through_the_funnel() {
-        const SOURCES: [(&str, &str); 5] = [
+        // `direct_writer.rs` is scanned even though it records nothing today:
+        // it is the one backend file that owns a bare `File`, which makes it
+        // the most natural landing spot for a future hand-rolled
+        // `sync_all_ns.fetch_add` - exactly the bypass this scan exists for.
+        const SOURCES: [(&str, &str); 6] = [
+            ("direct_writer.rs", include_str!("direct_writer.rs")),
             ("file_writer.rs", include_str!("file_writer.rs")),
             ("parallel_writer.rs", include_str!("parallel_writer.rs")),
             ("uring_writer.rs", include_str!("uring_writer.rs")),

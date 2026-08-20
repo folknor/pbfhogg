@@ -201,11 +201,6 @@ impl<'a> WireStringTable<'a> {
 pub(crate) struct WireBlock<'a> {
     buffer: &'a [u8],
     pub stringtable: WireStringTable<'a>,
-    /// Raw StringTable protobuf bytes location (for per-group raw passthrough).
-    #[allow(dead_code)]
-    st_raw_offset: u32,
-    #[allow(dead_code)]
-    st_raw_len: u32,
     group_ranges_offset: u32,
     group_ranges_count: u32,
     pub granularity: i32,
@@ -328,8 +323,6 @@ impl<'a> WireBlock<'a> {
         #[allow(clippy::cast_possible_truncation)]
         Ok(WireBlockMeta {
             proto_len,
-            st_raw_offset: stringtable_offset as u32,
-            st_raw_len: stringtable_len as u32,
             st_inline_offset,
             st_inline_count,
             gr_inline_offset,
@@ -346,8 +339,6 @@ impl<'a> WireBlock<'a> {
         Self {
             buffer,
             stringtable: WireStringTable::new(buffer, meta.st_inline_offset, meta.st_inline_count),
-            st_raw_offset: meta.st_raw_offset,
-            st_raw_len: meta.st_raw_len,
             group_ranges_offset: meta.gr_inline_offset,
             group_ranges_count: meta.gr_inline_count,
             granularity: meta.granularity,
@@ -387,9 +378,6 @@ impl<'a> WireBlock<'a> {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WireBlockMeta {
     pub proto_len: u32,
-    /// Raw StringTable protobuf bytes: offset and length within the proto region.
-    pub st_raw_offset: u32,
-    pub st_raw_len: u32,
     pub st_inline_offset: u32,
     pub st_inline_count: u32,
     pub gr_inline_offset: u32,

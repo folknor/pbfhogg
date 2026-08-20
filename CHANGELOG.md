@@ -242,7 +242,10 @@
   happened along the way - including one deferred from an earlier chunk.
   Each `flush` forces a gzip member boundary, so flushing gratuitously costs
   compression ratio. `finish()` is still the call that closes the pipeline,
-  joins every thread and returns the inner writer.
+  joins every thread and returns the inner writer. A compress worker that
+  dies mid-chunk now reports the gap through the data path, so a `flush`
+  waiting on the acknowledgement barrier gets an error instead of hanging
+  forever behind a seq that will never arrive.
 
 - **A dead writer thread now stops `write_primitive_block*`, not just
   `write_raw*`.** The framing work runs in a `rayon::spawn` closure whose

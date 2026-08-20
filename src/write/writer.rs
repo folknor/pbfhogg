@@ -844,6 +844,18 @@ impl<W: Write> PbfWriter<W> {
             .compress_ns
             .fetch_add(elapsed_ns_u64(t_compress), Relaxed);
         let t_frame = std::time::Instant::now();
+        // Same guard as `frame_blob_into`: the format caps a Blob body at
+        // `MAX_BLOB_DATASIZE` and our own reader enforces it, so the sync
+        // path must refuse here too or a `PbfWriter::new` writer emits a file
+        // that only fails when somebody tries to read it.
+        if self.scratch.blob_buf.len() as u64 >= crate::read::blob_wire::MAX_BLOB_DATASIZE {
+            return Err(io::Error::other(format!(
+                "blob body for {blob_type} is {} bytes, must be smaller than \
+                 {} (lower --elements-per-blob)",
+                self.scratch.blob_buf.len(),
+                crate::read::blob_wire::MAX_BLOB_DATASIZE
+            )));
+        }
         let datasize = i32::try_from(self.scratch.blob_buf.len()).map_err(|_| {
             io::Error::other(format!(
                 "blob datasize overflow: {} bytes",
@@ -1113,6 +1125,31 @@ mod tests {
         assert!(
             err.to_string().contains("no space left on device"),
             "the thread's own message must reach the caller, got: {err}"
+        );
+    }
+
+    /// The sync (non-pipelined) path must refuse an oversize blob body too.
+    ///
+    /// The `MAX_BLOB_DATASIZE` guard first landed in `frame_blob_into`, which
+    /// covers every pipelined constructor plus `frame_blob` - but
+    /// `write_framed_blob` duplicates the framing inline for the
+    /// `PbfWriter::new` sync path, so a sync-mode writer kept emitting a body
+    /// the crate's own reader refuses ("blob header declares datasize too
+    /// big"), with exit zero. Same cap, same knob-naming error message.
+    #[test]
+    fn the_sync_path_refuses_an_oversize_blob_body() {
+        let cap = usize::try_from(crate::read::blob_wire::MAX_BLOB_DATASIZE).unwrap();
+        // Incompressible only in the sense that Compression::None keeps the
+        // body length; content is irrelevant to the size guard.
+        let body = vec![0x5Au8; cap + 1];
+        let mut w = PbfWriter::new(Vec::new(), Compression::None);
+        let err = w
+            .write_header(&body)
+            .expect_err("a blob body past the datasize cap must not be written by the sync path");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("blob body for OSMHeader") && msg.contains("--elements-per-blob"),
+            "the sync path must name the cap and the knob, got: {msg}"
         );
     }
 

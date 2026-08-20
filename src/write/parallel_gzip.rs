@@ -89,6 +89,36 @@ enum Job {
 enum Out {
     Bytes(Vec<u8>),
     Barrier(SyncSender<io::Result<()>>),
+    /// A worker dequeued this seq and died before producing its bytes -
+    /// panic, or a `compress_one` error. Sent by [`DeathNotice`] so the seq
+    /// space has no permanent gap: without it, a mid-stream worker death
+    /// leaves the writer thread parked forever short of any barrier queued
+    /// behind the gap, and a producer blocked in [`ParallelGzipWriter::flush`]
+    /// hangs while the surviving workers keep the channel open. `finish()`
+    /// would have caught the death at join time; `flush` never joins, so the
+    /// gap has to be reported through the data path itself.
+    WorkerDied,
+}
+
+/// Fills a dead worker's seq slot; see [`Out::WorkerDied`].
+///
+/// Armed immediately after a `Compress` job is dequeued and disarmed just
+/// before its result is sent, so every exit in between - the unwind path of a
+/// worker panic, the `compress_one` error return - delivers the notice from
+/// `Drop`. A failed send means the writer thread is already gone, and with it
+/// everyone who could have waited on the gap.
+struct DeathNotice<'a> {
+    seq: u64,
+    tx: &'a SyncSender<(u64, Out)>,
+    armed: bool,
+}
+
+impl Drop for DeathNotice<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            drop(self.tx.send((self.seq, Out::WorkerDied)));
+        }
+    }
 }
 
 /// Writer that buffers bytes, dispatches chunks to a worker pool for
@@ -240,7 +270,12 @@ impl<W: Write + Send + 'static> Write for ParallelGzipWriter<W> {
     /// Liveness: the producer holds no other channel capacity while it waits,
     /// the pool drains the bounded raw queue, and the writer thread drains the
     /// bounded compressed queue, so there is no cycle. Ordering is by seq, not
-    /// by which worker happened to pick the barrier up.
+    /// by which worker happened to pick the barrier up. The no-cycle argument
+    /// does not cover worker *death* - a worker that panics mid-chunk while
+    /// its siblings keep the channel open would leave a permanent seq gap in
+    /// front of the barrier - so a dying worker fills its slot with an
+    /// [`Out::WorkerDied`] notice and the barrier is answered with that error
+    /// instead of never being reached.
     ///
     /// `finish()` is still the call that closes the pipeline, joins every
     /// thread, and returns the inner writer, and it is what a caller who is
@@ -333,6 +368,14 @@ fn worker_loop(
             }
         };
 
+        // From here until the result send, any exit must fill this seq's slot
+        // or a barrier queued behind it waits forever. See `Out::WorkerDied`.
+        let mut notice = DeathNotice {
+            seq,
+            tx: compressed_tx,
+            armed: true,
+        };
+
         // Test-only: arm via `test_hooks::PANIC_AT_POOL_OP_COUNT`.
         // Simulates an OOM or internal unwrap inside a compress
         // worker. Release builds compile this block out entirely.
@@ -347,8 +390,9 @@ fn worker_loop(
 
         let compressed = match compress_one(&raw) {
             Ok(v) => v,
-            Err(_) => return, // writer thread will see an incomplete stream and error
+            Err(_) => return, // DeathNotice reports the gap; writer_loop errors
         };
+        notice.armed = false;
         if compressed_tx.send((seq, Out::Bytes(compressed))).is_err() {
             return;
         }
@@ -390,8 +434,17 @@ fn writer_loop<W: Write>(mut inner: W, compressed_rx: Receiver<(u64, Out)>) -> i
     while let Ok((seq, out)) = compressed_rx.recv() {
         pending.insert(seq, out);
         while let Some(item) = pending.remove(&expected) {
+            let item_seq = expected;
             expected += 1;
             match item {
+                Out::WorkerDied => {
+                    if fatal.is_none() {
+                        fatal = Some(io::Error::other(format!(
+                            "parallel gzip: a compress worker died at chunk {item_seq}; \
+                             its bytes were never produced"
+                        )));
+                    }
+                }
                 Out::Bytes(b) => {
                     if fatal.is_none()
                         && let Err(e) = inner.write_all(&b)

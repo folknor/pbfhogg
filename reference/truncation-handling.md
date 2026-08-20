@@ -91,6 +91,23 @@ there is no per-command relaxation. The contract sites are:
   caller-side payload-skip used by `read_blob_header_only`
   consumers (`has_indexdata`, `diff::process`, `cat::dedupe`,
   `altw::passthrough`)
+
+Shape 4 is the one shape `read::frame` could not unify, because
+each site has only the mechanism its I/O shape offers: a streaming
+reader counts the bytes `read_to_end` delivered against the
+declared `datasize`, a seeking reader skips the payload and reads
+one sentinel byte to find out whether the seek landed inside the
+file, and a pread walker compares the payload extent against the
+file size it captured at `open()`. Unifying them needs a
+seekable-source abstraction that answers "how many bytes are
+available from here" and degrades to the read-and-count arm when
+the source cannot say - a refactor rather than a guard, and not
+one worth doing for its own sake while nothing is wrong at any of
+the three. What keeps them from drifting in the meantime is
+`all_three_shape_four_detectors_reject_the_same_file` in
+`src/read/blob.rs`, which walks one payload-truncated file through
+all three and fails if any of them stops hard-erroring. The three
+messages still differ; only the outcome is pinned.
 - `zlib_decompress_into` / `zstd_decompress_into`
   (`src/read/decompress.rs`) for shape 5 - the actual
   decompressors, reached by every `decompress_*` entry point
@@ -101,7 +118,7 @@ there is no per-command relaxation. The contract sites are:
   declared `Blob.raw_size` against the payload they produced.
 - `validate_groups_strict` (`src/read/block.rs`) for the
   block-layer contract below. Every `PrimitiveBlock` constructor -
-  `new`, `from_vec`, `from_vec_with_scratch`,
+  `from_vec`, `from_vec_with_scratch`,
   `from_vec_pooled_with_scratch` - funnels through `finish` and so
   through this check. Note that no `PrimitiveBlock` constructor is
   a shape-5 site: they take already-decompressed bytes and cannot
@@ -178,10 +195,73 @@ fails to parse. There is deliberately **no lenient mode**. A
 reader that wants partial data from a corrupt file gets a hard
 error and the byte offset instead.
 
-Two dense-metadata cases are knowingly *not* covered and remain
-silent: a `DenseInfo` array shorter than the id array (metadata
-disappears from that point on) and a `keys_vals` run without a
-trailing delimiter. Both are on the read-path bug list.
+The two dense-node arrays that array-length equality could not
+express are covered as well. `keys_vals` is a single flat array of
+zero-terminated per-node tag runs, so it is walked once per block
+and must yield exactly as many runs as the `id` array has entries;
+this is the only check in the pass that is not a byte scan. Every
+`denseinfo` array must be either absent or exactly as long as the
+`id` array, and a `denseinfo` carrying only some of its five
+metadata arrays is rejected, because `DenseNodeInfoIter` zips them
+and stops at the shortest - which blanks metadata from that point
+on while reporting success.
+
+Two encodings stay legal and are not truncation: an absent
+`keys_vals`, meaning no node in the group has tags; and a final
+tag run that ends at the end of the array without its `0`
+terminator, which some writers emit.
+
+## Which wire forms of a packed field count as present
+
+The checks above are only worth as much as the parser's notion of
+"this array is empty". Protobuf lets a packed repeated field be
+written either length-delimited (one packed segment, what every
+OSM writer emits) or varint (individually tagged, unpacked
+values), and lets it appear more than once, with concatenation
+semantics.
+
+Until 2026-08-20 `src/read/wire.rs` matched only the
+length-delimited form on every packed field of `Node`, `Way`,
+`Relation`, `DenseNodes` and `DenseInfo`. An unpacked field fell
+through to `skip_field` and left the slot empty, which meant an
+unpacked `DenseNodes.keys_vals` decoded as "no node in this block
+has tags" - and sailed straight through the emptiness early-return
+in the validator above. A spec-legal encoding therefore produced
+exactly the silent data loss this document exists to prevent.
+libosmium accepts both forms for every one of these fields, so
+such a file is not hypothetical corruption; it is a file the
+reference implementation reads.
+
+Current behavior, in `take_packed`:
+
+- **Length-delimited**: accepted, zero-copy, unchanged.
+- **Varint (unpacked)**: accepted. A single unpacked value is
+  byte-identical to a one-element packed segment, so the field's
+  own bytes are captured as that segment with no copy and every
+  downstream iterator is unaffected.
+- **Two or more occurrences that both carry data**: rejected, with
+  an error naming the message and field. Empty occurrences are
+  ignored in either position, since an empty segment contributes
+  nothing to a concatenation.
+
+The rejection is a deliberate strictness delta, of the same kind
+as the multi-payload-blob rejection below. Spec-correct handling
+is to concatenate every occurrence in order, which cannot be
+expressed as the single borrowed slice the read path is built on -
+and the measured cost of strict validation depends on that slice
+staying borrowed. The alternative is what this parser used to do
+and what libosmium still does: keep the last occurrence and drop
+the rest, silently. Between rejecting a shape no known writer
+produces and silently dropping element data, we reject. Multiple
+unpacked values of the same field hit the same rule, which is why
+unpacked support is exact for a one-element array and an error
+beyond it, where libosmium keeps only the last value.
+
+This applies to the read path's own parsers. The independent
+scanners under `src/scan/`, `src/blob_meta/scan_ids.rs`,
+`src/commands/renumber/wire_rewrite.rs` and
+`src/commands/altw/reframe.rs` walk the same messages for their
+own purposes and still match the length-delimited form only.
 
 ## Decompression bounds (shape 5)
 
@@ -346,9 +426,9 @@ added five times, and the `cat --dedupe` copy - which this
 document never listed - had received neither the zero-length
 rejection nor the `MAX_BLOB_HEADER_SIZE` cap, so four bytes of
 corrupt input drove an unbounded allocation there. The same pass
-corrected a longstanding error in this list: it named
-`PrimitiveBlock::new` as the shape-5 site, which it never was.
-That constructor receives already-decompressed bytes; shape 5
+corrected a longstanding error in this list: it named the
+`PrimitiveBlock` constructor as the shape-5 site, which it never
+was. That constructor receives already-decompressed bytes; shape 5
 lives in `decompress.rs`, which the list did not mention until
 the decompressors were added on 2026-08-20.
 

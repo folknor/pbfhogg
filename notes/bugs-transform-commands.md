@@ -5,6 +5,39 @@ repack, degrade, renumber, getid, getparents, inspect, tags_count, tags_filter,
 check, export, mod.rs), `src/blob_meta/`, `src/tag_expr.rs`. Findings only,
 unverified.
 
+## Filed 2026-08-20 from the read-path round-3 fix pass: the independent scanners only match the length-delimited wire form
+
+`src/read/wire.rs` was fixed to accept a packed repeated field in either of its
+two legal wire forms (a length-delimited packed segment, or individually tagged
+varints), because matching only the first meant an unpacked `keys_vals` decoded
+as "this block has no tags" with no error, and libosmium accepts both. See
+`reference/truncation-handling.md`, "Which wire forms of a packed field count as
+present".
+
+The read path is not the only place that walks these messages. These scanners
+carry their own hand-rolled parsers, and every one of them still matches
+`WIRE_LEN` only on packed fields:
+
+- `src/scan/node.rs`, `src/scan/way.rs`
+- `src/blob_meta/scan_ids.rs`
+- `src/commands/renumber/wire_rewrite.rs`
+- `src/commands/altw/reframe.rs`
+
+The impact is not identical to the read path's, because these mostly consume
+`id` / `refs` arrays rather than `keys_vals`, and an unpacked-encoded file is
+rare enough that nobody has hit one. But the failure mode is the same shape: the
+array reads as empty, the scanner concludes the blob has no ways or no refs, and
+the result is a silently wrong index or a silently wrong reframe rather than an
+error. `renumber` in particular bases ID assignment on what `scan_ids` reports.
+
+Note that these are five more copies of a message parser `wire.rs` already has -
+the same duplication that made the frame-envelope guards have to be written five
+times before `src/read/frame.rs` unified them. Whether the fix is "apply
+`take_packed`'s policy five more times" or "route these through `wire.rs`" is a
+design question, not a mechanical one.
+
+Not fixed in the read-path round because it is outside that document's scope.
+
 ## HIGH
 
 ### Overlap-run detection is pairwise-adjacent, not transitive - `sort` and `cat --dedupe` can emit unsorted output stamped `Sort.Type_then_ID`

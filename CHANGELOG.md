@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### Breaking
+
+- **`PrimitiveBlock::new(Bytes)` is removed; use
+  `PrimitiveBlock::from_vec(Vec<u8>)`.** The parser extends the buffer in
+  place with its inlined string-table and group entries, so a `Bytes`
+  could only be handled by copying it first - a full decompressed-block
+  memcpy, on the order of 1.4 MB per block, on what is otherwise a
+  zero-copy path. Every internal caller had already been migrated off it;
+  `new` remained as a public API whose only implementation was the slow
+  path the internals were rewritten to avoid. `from_vec` is that path,
+  and it is now public. Migration: decompress into a `Vec<u8>` and pass
+  it by value instead of converting to `Bytes`.
+
+### Added
+
+- **`BlobReader::evict_page_cache(bool)` and
+  `ElementReader::evict_page_cache(bool)`.** The buffered file
+  constructors advise `POSIX_FADV_DONTNEED` over the consumed prefix
+  after every blob, which is what keeps a sequential pass over a
+  planet-sized file out of RSS - but the page cache is shared, so this
+  silently leaves the file cold for anything that reads it next: a
+  two-pass command, a test suite, an `osmium` running alongside. There
+  was no opt-out short of switching to O_DIRECT, which is a different I/O
+  mode entirely. The default is unchanged; pass `false` to leave the page
+  cache alone.
+
+  On `ElementReader` the builder can only govern the blobs it has not read
+  yet: every file constructor decodes the header blob before returning, so
+  a post-hoc `evict_page_cache(false)` spares the element blobs but not
+  the header. `ElementReader::from_path_with_eviction(path, false)` makes
+  the decision up front and is the one to use when the whole file's cache
+  must be left untouched.
+
 ### Changed
 
 - **`cat --dedupe` now bounds its frame-header allocation.** Its pass-1
@@ -70,11 +103,20 @@
   earlier success was reporting a subset of the data as if it were all of
   it.
 
-  Two dense-node cases are knowingly **not** covered and still truncate
-  silently: a `DenseInfo` array shorter than the id array drops metadata
-  from that point on, and a `keys_vals` run without a trailing delimiter
-  mis-assigns the final tag. Both are documented in
-  `reference/truncation-handling.md`.
+  The two dense-node arrays that array-length equality could not express
+  are now covered as well. `DenseNodes.keys_vals` is one flat array of
+  zero-terminated per-node tag runs, so it is walked once per block and
+  must describe exactly as many runs as there are ids: a short array used
+  to leave the trailing nodes untagged and a long one used to discard its
+  tail, both silently. Every array in `DenseNodes.denseinfo` must now be
+  either absent or exactly as long as the id array - a short one used to
+  make metadata vanish for every node from that point on. A `denseinfo`
+  carrying only some of its five metadata arrays is rejected too, because
+  it produces the same silent loss here.
+
+  Two encodings stay legal, because both occur in the wild: an absent
+  `keys_vals` (no node in the group has tags), and a final tag run that
+  ends at the end of the array without its `0` terminator.
 
 - **A `BlobHeader` frame declaring zero length is rejected.** Such a
   frame consumes four bytes and describes nothing, so a run of zero bytes
@@ -84,6 +126,48 @@
   the same reason.
 
 ### Fixed
+
+- **Packed repeated fields written in the unpacked wire form are no
+  longer read as empty.** Protobuf allows a packed repeated field to be
+  written either as a packed segment or as individually tagged varints,
+  and libosmium accepts both for every packed field of `Node`, `Way`,
+  `Relation`, `DenseNodes` and `DenseInfo`. Our parser matched only the
+  packed segment; the unpacked form was skipped and the field decoded as
+  empty. For `DenseNodes.keys_vals` that meant "no node in this block has
+  tags" - a whole block's tags lost, with no error, from a spec-legal
+  encoding that the reference implementation reads correctly. The
+  unpacked form is now accepted for every packed field on the read path,
+  with no copy.
+
+  In the same pass, a packed field that appears twice with data in both
+  occurrences is now a hard error naming the message and field. The spec
+  says concatenate; this parser used to keep the last occurrence and drop
+  the rest, silently, as libosmium still does. No known writer emits the
+  shape, and the read path cannot express a concatenation without giving
+  up the borrowed slices that make strict validation free, so it is
+  rejected rather than silently truncated.
+
+- **The last tag of a dense node survives a `keys_vals` run that ends
+  without its delimiter.** The dense iterator derived the end of a tag
+  run by subtracting one byte from its cursor, assuming the run always
+  ended at a `0` delimiter. When the array ran out instead, that chopped
+  the last byte off the final value varint and the tag was dropped with
+  no signal.
+
+- **A panicking pipeline thread no longer reads as a clean end of file.**
+  `ElementReader::into_blocks_pipelined` delivers blocks over a channel
+  whose only sender lives on the pipeline thread, so an unwind there
+  closed the channel exactly as normal completion does - and the
+  iterator's `Drop` joins and discards the panic. A crashed pipeline
+  therefore looked like a file that had simply ended, with a zero exit
+  code. The iterator now yields an error in that case.
+
+- **A `BlobHeader.indexdata` of an unrecognised length is reported.** A
+  length that is neither 26 nor 42 is still ignored - the blob reads as
+  "no index" and consumers conservatively fall back to a full decode,
+  which is the safe direction - but it was completely invisible, so a
+  systematically corrupt index silently degraded every filtered read with
+  no way to tell from the outside. One warning per process now says so.
 
 - **A truncated or corrupt zlib blob no longer hangs.** A deflate stream
   that ended before its final block left the inflate loop consuming

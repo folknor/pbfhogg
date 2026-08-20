@@ -3,8 +3,8 @@
 use super::dense::DenseNodeIter;
 use super::elements::{Element, Node, Relation, Way};
 use super::wire::{
-    WireBlock, WireBlockMeta, WireDenseNodes, WireGroup, WireMessageIter, WireNode, WireRelation,
-    WireWay,
+    WireBlock, WireBlockMeta, WireDenseInfo, WireDenseNodes, WireGroup, WireMessageIter, WireNode,
+    WireRelation, WireWay,
 };
 use crate::error::{ErrorKind, Result, new_error, new_wire_error};
 use bytes::Bytes;
@@ -396,25 +396,6 @@ impl std::fmt::Debug for PrimitiveBlock {
 }
 
 impl PrimitiveBlock {
-    /// Parse a `PrimitiveBlock` from decompressed protobuf bytes.
-    ///
-    /// Validates every entry in the stringtable as UTF-8. This up-front validation
-    /// allows all later stringtable lookups to skip per-access UTF-8 checks.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ErrorKind::StringtableUtf8` if any stringtable entry contains invalid
-    /// UTF-8 bytes. Returns `ErrorKind::WireFormat` if the protobuf wire format is invalid.
-    // Takes `Bytes` by value to compose with `and_then(PrimitiveBlock::new)`
-    // at decompress-boundary callers. The body copies via `to_vec()` so
-    // ownership is not strictly needed internally, but the by-value signature
-    // is the idiomatic shape at those call sites.
-    #[hotpath::measure]
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn new(buffer: Bytes) -> Result<PrimitiveBlock> {
-        Self::from_vec(buffer.to_vec())
-    }
-
     /// Validate stringtable entries and construct a `PrimitiveBlock` from already-inlined data.
     ///
     /// Shared finishing step for all constructors: builds the `WireBlock` from
@@ -443,8 +424,22 @@ impl PrimitiveBlock {
         })
     }
 
-    /// Parse from a mutable Vec, inlining string table entries and group ranges
-    /// into the buffer itself. Zero separate heap allocations beyond the buffer.
+    /// Parse a `PrimitiveBlock` from decompressed protobuf bytes, inlining
+    /// string table entries and group ranges into the buffer itself. Zero
+    /// separate heap allocations beyond the buffer.
+    ///
+    /// This takes an owned `Vec<u8>` rather than `Bytes` because the buffer is
+    /// extended in place with the inline entry data; a `Bytes` would have to be
+    /// copied first. The former public constructor `new(Bytes)` did exactly
+    /// that copy - a full decompressed-block memcpy, ~1.4 MB per block - and
+    /// every internal caller had already been migrated off it. Callers holding
+    /// `Bytes` should decompress into a `Vec` instead of converting.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ErrorKind::StringtableUtf8` if any stringtable entry contains
+    /// invalid UTF-8 bytes. Returns `ErrorKind::WireFormat` if the protobuf
+    /// wire format is invalid or a group fails structural validation.
     ///
     /// This eliminates the cross-thread `Box<[(u32, u32)]>` retention that caused
     /// 25+ GB OOM at Europe scale (520K blocks) with the pipelined reader.
@@ -452,7 +447,7 @@ impl PrimitiveBlock {
     ///
     /// The buffer is extended with inline entry data. After conversion to `Bytes`,
     /// the block references both the protobuf data and the appended entries.
-    pub(crate) fn from_vec(mut buffer: Vec<u8>) -> Result<PrimitiveBlock> {
+    pub fn from_vec(mut buffer: Vec<u8>) -> Result<PrimitiveBlock> {
         let meta = WireBlock::parse_and_inline(&mut buffer)?;
         Self::finish(Bytes::from(buffer), &meta)
     }
@@ -579,8 +574,9 @@ impl PrimitiveBlock {
     pub fn string_table_entry(&self, index: usize) -> Option<&str> {
         self.block.stringtable.get(index).map(|bytes| {
             // SAFETY: All stringtable entries were validated as UTF-8 in
-            // PrimitiveBlock::new(). The PrimitiveBlock struct does not expose any
-            // mutable access to the underlying buffer.
+            // PrimitiveBlock::finish, which every constructor funnels through.
+            // The PrimitiveBlock struct does not expose any mutable access to
+            // the underlying buffer.
             unsafe { std::str::from_utf8_unchecked(bytes) }
         })
     }
@@ -697,31 +693,22 @@ fn packed_varint_count(data: &[u8]) -> Result<usize> {
 /// varints; the parallel-array invariants the zipping iterators depend on hold
 /// (`keys`/`vals` on all three kinds, `lat`/`lon`/`refs` on ways,
 /// `roles_sid`/`memids`/`types` on relations); the `DenseNodes` sub-message
-/// parses; and its packed `id`, `lat` and `lon` arrays are well-formed and of
-/// equal length.
+/// parses; its packed `id`, `lat` and `lon` arrays are well-formed and of
+/// equal length; its `keys_vals` array describes exactly as many per-node tag
+/// runs as there are ids; and every array in its optional `denseinfo`
+/// sub-message is either absent or exactly as long as the id array.
 ///
 /// The framing walk comes first deliberately - it is the check that makes the
 /// element iterators used below unable to terminate early, so running the
 /// element walk first would silently examine a prefix.
 ///
 /// This is a structural pass, not a decode: sub-message parsing walks field
-/// headers and records slice bounds without decoding any packed array, and the
-/// dense length check is a byte scan. No stringtable index is resolved (that
-/// is `str_from_stringtable`'s job, which is already fallible).
-///
-/// # What is deliberately not checked
-///
-/// Two dense-node arrays are out of scope for this round and remain sources of
-/// silent truncation - both are tracked as open findings in
-/// `notes/bugs-read-path.md`:
-///
-/// * `DenseNodes.keys_vals`, whose zero-terminated per-node structure needs a
-///   full stateful walk rather than a byte scan to length-check.
-/// * `DenseNodes.denseinfo`, whose six parallel arrays must each match the node
-///   count.
-///
-/// Neither can be validated by the array-length equality this function applies,
-/// so asserting them here would mean claiming a check that is not performed.
+/// headers and records slice bounds without decoding any packed array. Every
+/// check but one is a byte scan; the exception is `keys_vals`, whose
+/// zero-terminated per-node runs have to be walked varint by varint because
+/// nothing in the encoding states how many nodes an array describes.
+/// No stringtable index is resolved (that is `str_from_stringtable`'s job,
+/// which is already fallible).
 ///
 /// No error raised here carries a byte offset. These sites sit below the
 /// framing layer and cannot know their position in the file; the enclosing
@@ -787,6 +774,10 @@ fn validate_groups_strict(block: &WireBlock<'_>) -> Result<()> {
                     "dense group has mismatched id/lat/lon array lengths",
                 ));
             }
+            validate_dense_keys_vals(dense.keys_vals_data, ids)?;
+            if let Some(info_data) = dense.info_data {
+                validate_dense_info_arrays(info_data, ids)?;
+            }
         }
     }
 
@@ -809,6 +800,125 @@ fn validate_tag_arrays(keys_data: &[u8], vals_data: &[u8], mismatch: &'static st
     let vals = packed_varint_count(vals_data)?;
     if keys != vals {
         return Err(new_wire_error(mismatch));
+    }
+    Ok(())
+}
+
+/// Validate that `keys_vals` describes exactly `node_count` per-node tag runs.
+///
+/// `keys_vals` is one flat array holding the tags of every node in the dense
+/// group as `(key, val)` varint pairs, each node's run terminated by a single
+/// `0` varint. Nothing in the encoding records how many nodes it covers, so a
+/// short array cannot be caught by comparing lengths the way the `id` / `lat` /
+/// `lon` triple is: it has to be walked. `DenseNodeIter` walks it lazily and
+/// cannot report an error, so a short array silently gives the trailing nodes
+/// no tags and a long one silently discards the tail - both of which this
+/// rejects.
+///
+/// Two encodings of the same content are accepted, because both occur in the
+/// wild:
+///
+/// * an empty array, which means "no node in this group has tags"; and
+/// * a final run that ends at the end of the array without its `0` terminator,
+///   which is what a writer that omits the trailing delimiter produces. It is
+///   counted as a complete run, matching what `DenseNodeIter` now yields.
+///
+/// A run whose final key varint has no matching value varint is corruption and
+/// is rejected: `DenseTagIter` would drop that tag with no signal.
+fn validate_dense_keys_vals(keys_vals_data: &[u8], node_count: usize) -> Result<()> {
+    use super::wire::Cursor;
+
+    if keys_vals_data.is_empty() {
+        return Ok(());
+    }
+
+    let mut cursor = Cursor::new(keys_vals_data);
+    let mut runs = 0usize;
+    let mut in_run = false;
+    while !cursor.is_empty() {
+        let key = cursor.read_varint()?;
+        if key == 0 {
+            runs += 1;
+            in_run = false;
+            continue;
+        }
+        if cursor.is_empty() {
+            return Err(new_wire_error(
+                "dense keys_vals ends with a key that has no value",
+            ));
+        }
+        cursor.read_varint()?;
+        in_run = true;
+    }
+    // A trailing run with no terminating 0 still describes one node.
+    if in_run {
+        runs += 1;
+    }
+
+    if runs != node_count {
+        return Err(new_wire_error(
+            "dense keys_vals describes a different number of nodes than the id array",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the six parallel arrays of a dense group's `denseinfo`.
+///
+/// `DenseNodeInfoIter` zips them and stops at the shortest, so one short array
+/// makes metadata vanish for every node from that point on while iteration
+/// reports success. Each array must therefore be either absent (length 0) or
+/// exactly `node_count` long.
+///
+/// libosmium tolerates an individually absent array - it tests each for
+/// emptiness per node - so absence alone is not corruption. What it cannot
+/// express, and what this additionally rejects, is a `denseinfo` that carries
+/// *some* of the five core arrays and not the others: our iterator yields
+/// `None` for every node in that case, which is the same silent metadata loss
+/// as a short array. Either all five core arrays are present at full length or
+/// none of them is.
+fn validate_dense_info_arrays(info_data: &[u8], node_count: usize) -> Result<()> {
+    let info = WireDenseInfo::parse(info_data)?;
+    let core = [
+        info.version_data,
+        info.timestamp_data,
+        info.changeset_data,
+        info.uid_data,
+        info.user_sid_data,
+    ];
+
+    let mut present = 0usize;
+    for data in core {
+        let count = packed_varint_count(data)?;
+        if count == 0 {
+            continue;
+        }
+        if count != node_count {
+            return Err(new_wire_error(
+                "dense denseinfo array length does not match the id array",
+            ));
+        }
+        present += 1;
+    }
+
+    // `visible` is genuinely optional - it only appears in history files - so
+    // it is length-checked but never required.
+    let visible = packed_varint_count(info.visible_data)?;
+    if visible != 0 && visible != node_count {
+        return Err(new_wire_error(
+            "dense denseinfo visible array length does not match the id array",
+        ));
+    }
+
+    if present != 0 && present != core.len() {
+        return Err(new_wire_error(
+            "dense denseinfo has some but not all of its parallel arrays",
+        ));
+    }
+    if present == 0 && visible != 0 {
+        return Err(new_wire_error(
+            "dense denseinfo has a visible array but no metadata arrays",
+        ));
     }
     Ok(())
 }
@@ -1164,14 +1274,15 @@ impl<'a> Iterator for GroupRelationIter<'a> {
 /// Look up a stringtable entry by index, returning it as a `&str`.
 ///
 /// Uses `from_utf8_unchecked` - the safety relies on the invariant established
-/// by `PrimitiveBlock::new()`, which validates every stringtable entry at
-/// construction time.
+/// by `PrimitiveBlock::finish`, which every constructor funnels through and
+/// which validates every stringtable entry at construction time.
 pub(crate) fn str_from_stringtable<'a>(block: &'a WireBlock<'_>, index: usize) -> Result<&'a str> {
     if let Some(bytes) = block.stringtable.get(index) {
         // SAFETY: All stringtable entries were validated as UTF-8 in
-        // PrimitiveBlock::new(). The PrimitiveBlock struct does not expose any
-        // mutable access to the underlying buffer, so entries cannot have been
-        // modified since construction.
+        // PrimitiveBlock::finish, which every constructor funnels through. The
+        // PrimitiveBlock struct does not expose any mutable access to the
+        // underlying buffer, so entries cannot have been modified since
+        // construction.
         Ok(unsafe { std::str::from_utf8_unchecked(bytes) })
     } else {
         Err(new_error(ErrorKind::StringtableIndexOutOfBounds { index }))
@@ -1250,8 +1361,10 @@ mod strict_validation_tests {
         let err = PrimitiveBlock::from_vec(block_with_groups(&[dense_group(4, 2, 4)]))
             .expect_err("a short lat array must be rejected");
         assert!(
-            format!("{err}").contains("mismatched"),
-            "expected a mismatched-array error, got: {err}"
+            // "mismatched" alone also appears in the way and relation array
+            // messages, so name the dense guard specifically.
+            format!("{err}").contains("dense group has mismatched id/lat/lon"),
+            "expected the dense id/lat/lon mismatch error, got: {err}"
         );
 
         PrimitiveBlock::from_vec(block_with_groups(&[dense_group(4, 4, 3)]))
@@ -1468,5 +1581,197 @@ mod strict_validation_tests {
         good.extend_from_slice(&len_field(4, &[0x08, 0x01]));
         PrimitiveBlock::from_vec(block_with_groups(&[len_field(1, &good)]))
             .expect("a well-formed Info sub-message must parse");
+    }
+
+    /// A dense group with `n` one-byte ids/lats/lons plus a raw `keys_vals`
+    /// body and an optional raw `denseinfo` body.
+    fn dense_group_with(n: usize, keys_vals: &[u8], denseinfo: Option<&[u8]>) -> Vec<u8> {
+        let mut dense = len_field(1, &vec![0x02u8; n]);
+        if let Some(info) = denseinfo {
+            dense.extend_from_slice(&len_field(5, info));
+        }
+        dense.extend_from_slice(&len_field(8, &vec![0x02u8; n]));
+        dense.extend_from_slice(&len_field(9, &vec![0x02u8; n]));
+        dense.extend_from_slice(&len_field(10, keys_vals));
+        len_field(2, &dense)
+    }
+
+    /// `keys_vals` must describe exactly as many per-node tag runs as there
+    /// are ids.
+    ///
+    /// Nothing in the encoding states the node count, so a short array used to
+    /// leave the trailing nodes silently untagged and a long one silently
+    /// discarded its tail - `DenseNodeIter` walks it lazily and cannot report
+    /// either. Every assertion below is on the run-count message specifically,
+    /// which only `validate_dense_keys_vals` produces: the id/lat/lon length
+    /// equality and the mid-varint scan both hold for these fixtures, so
+    /// neither can be what fires.
+    #[test]
+    fn dense_keys_vals_run_count_must_match_the_id_array() {
+        // Two nodes, two terminated runs.
+        PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
+            2,
+            &[0x01, 0x01, 0x00, 0x02, 0x02, 0x00],
+            None,
+        )]))
+        .expect("two runs for two nodes must parse");
+
+        // An absent keys_vals means "no node here has tags" and stays legal.
+        PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(2, &[], None)]))
+            .expect("an empty keys_vals must parse");
+
+        let short = PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
+            2,
+            &[0x01, 0x01, 0x00],
+            None,
+        )]))
+        .expect_err("one run for two nodes must be rejected");
+        assert!(
+            format!("{short}").contains("keys_vals describes a different number of nodes"),
+            "the run-count check must be what rejects this, got: {short}"
+        );
+
+        let long = PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
+            2,
+            &[0x01, 0x01, 0x00, 0x02, 0x02, 0x00, 0x03, 0x03, 0x00],
+            None,
+        )]))
+        .expect_err("three runs for two nodes must be rejected");
+        assert!(
+            format!("{long}").contains("keys_vals describes a different number of nodes"),
+            "the run-count check must be what rejects this, got: {long}"
+        );
+
+        // A final run that ends without its 0 terminator still describes one
+        // node - some writers omit the trailing delimiter, and rejecting that
+        // would reject conforming-enough real files.
+        PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
+            2,
+            &[0x01, 0x01, 0x00, 0x02, 0x02],
+            None,
+        )]))
+        .expect("a final run without a trailing delimiter must parse");
+
+        // A key with no value is corruption: DenseTagIter would drop the tag.
+        let dangling = PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
+            2,
+            &[0x01, 0x01, 0x00, 0x02],
+            None,
+        )]))
+        .expect_err("a key with no value must be rejected");
+        assert!(
+            format!("{dangling}").contains("keys_vals ends with a key that has no value"),
+            "the dangling-key check must be what rejects this, got: {dangling}"
+        );
+    }
+
+    /// Every `denseinfo` array must be either absent or exactly as long as the
+    /// id array.
+    ///
+    /// `DenseNodeInfoIter` zips the six arrays and stops at the shortest, so a
+    /// short one made metadata vanish for every node from that point on while
+    /// iteration reported success. The fixtures keep id/lat/lon equal and every
+    /// packed array complete, so only the denseinfo check can fire.
+    #[test]
+    fn dense_denseinfo_arrays_must_match_the_id_array() {
+        // version, timestamp, changeset, uid, user_sid - fields 1..=5.
+        let full: Vec<u8> = (1u8..=5).flat_map(|f| packed(f, 2)).collect();
+        PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(2, &[], Some(&full))]))
+            .expect("five full-length info arrays must parse");
+
+        // Absent denseinfo entirely is legal - metadata is optional.
+        PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(2, &[], None)]))
+            .expect("an absent denseinfo must parse");
+
+        let mut short: Vec<u8> = packed(1, 1);
+        short.extend((2u8..=5).flat_map(|f| packed(f, 2)));
+        let err =
+            PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(2, &[], Some(&short))]))
+                .expect_err("a short version array must be rejected");
+        assert!(
+            format!("{err}").contains("denseinfo array length does not match"),
+            "the denseinfo length check must be what rejects this, got: {err}"
+        );
+
+        // Some but not all of the five core arrays: our iterator yields None
+        // for every node, which is the same silent loss as a short array.
+        let partial: Vec<u8> = (1u8..=2).flat_map(|f| packed(f, 2)).collect();
+        let err = PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
+            2,
+            &[],
+            Some(&partial),
+        )]))
+        .expect_err("a partially populated denseinfo must be rejected");
+        assert!(
+            format!("{err}").contains("some but not all"),
+            "the all-or-nothing check must be what rejects this, got: {err}"
+        );
+
+        // `visible` (field 6) is optional but must be full length when present.
+        let mut with_visible = full.clone();
+        with_visible.extend(packed(6, 2));
+        PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
+            2,
+            &[],
+            Some(&with_visible),
+        )]))
+        .expect("a full-length visible array must parse");
+
+        let mut short_visible = full.clone();
+        short_visible.extend(packed(6, 1));
+        let err = PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
+            2,
+            &[],
+            Some(&short_visible),
+        )]))
+        .expect_err("a short visible array must be rejected");
+        assert!(
+            format!("{err}").contains("visible array length"),
+            "the visible-length check must be what rejects this, got: {err}"
+        );
+    }
+
+    /// The last tag of a node whose `keys_vals` run ends without a trailing
+    /// `0` delimiter must survive.
+    ///
+    /// `DenseNodeIter` used to derive the end of the tag run by subtracting one
+    /// byte from the cursor position, on the assumption that the run always
+    /// ended at a delimiter. When it ended at the end of the array instead, that
+    /// chopped the last byte off the final value varint - so the fixture below
+    /// uses a two-byte value varint (index 130), where the truncation is the
+    /// difference between one decoded tag and none. A single-byte value index
+    /// would leave a complete varint behind and the test would pass either way.
+    #[test]
+    fn final_tag_run_without_a_trailing_delimiter_keeps_its_last_tag() {
+        // A stringtable big enough that index 130 exists, so the block is a
+        // legal one rather than one that happens to survive validation.
+        let mut entries = Vec::new();
+        for _ in 0..200 {
+            entries.extend_from_slice(&len_field(1, &[]));
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let st_len = [(entries.len() as u8) | 0x80, (entries.len() >> 7) as u8];
+        let mut block = vec![0x0a];
+        block.extend_from_slice(&st_len);
+        block.extend_from_slice(&entries);
+
+        // One node, one tag: key index 1, value index 130 (0x82 0x01), and no
+        // trailing 0 delimiter.
+        block.extend_from_slice(&len_field(
+            2,
+            &dense_group_with(1, &[0x01, 0x82, 0x01], None),
+        ));
+
+        let parsed = PrimitiveBlock::from_vec(block).expect("fixture block must parse");
+        let node = match parsed.elements().next().expect("one element") {
+            super::Element::DenseNode(node) => node,
+            other => panic!("expected a dense node, got {other:?}"),
+        };
+        let tags: Vec<(i32, i32)> = node.raw_tags().collect();
+        assert_eq!(
+            tags,
+            vec![(1, 130)],
+            "the final tag must survive a run that ends without a delimiter"
+        );
     }
 }

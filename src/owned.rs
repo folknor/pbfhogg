@@ -668,7 +668,7 @@ mod tests {
             .expect("encode block")
             .expect("block bytes")
             .to_vec();
-        let block = PrimitiveBlock::new(bytes::Bytes::from(bytes)).expect("parse block");
+        let block = PrimitiveBlock::from_vec(bytes).expect("parse block");
         let mut dense = match block.elements().next().expect("dense node") {
             Element::DenseNode(node) => node,
             _ => panic!("expected dense node"),

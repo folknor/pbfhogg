@@ -27,7 +27,6 @@ use std::io::Cursor;
 
 use std::collections::BTreeMap;
 
-use bytes::Bytes;
 use common::{
     generate_nodes, generate_nodes_with_negatives, generate_relations, generate_ways,
     read_normalized, write_test_pbf_sorted,
@@ -42,7 +41,7 @@ proptest! {
         ..ProptestConfig::default()
     })]
 
-    /// `PrimitiveBlock::new` must accept any byte buffer and return Ok
+    /// `PrimitiveBlock::from_vec` must accept any byte buffer and return Ok
     /// or Err. Adversarial input must never trigger a panic, OOM, or
     /// stack overflow during the wire-format walk inside
     /// `WireBlock::parse_and_inline`.
@@ -50,7 +49,7 @@ proptest! {
     fn primitive_block_from_arbitrary_bytes_never_panics(
         bytes in proptest::collection::vec(any::<u8>(), 0..2048),
     ) {
-        match PrimitiveBlock::new(Bytes::from(bytes)) {
+        match PrimitiveBlock::from_vec(bytes) {
             Ok(_) | Err(_) => {}
         }
     }

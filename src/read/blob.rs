@@ -375,6 +375,16 @@ pub struct BlobReader<R: Read + Send> {
     /// Only set for buffered FileReader - O_DIRECT has no pages to evict.
     #[cfg(target_os = "linux")]
     evict_fd: Option<std::os::unix::io::RawFd>,
+    /// Count of `posix_fadvise(DONTNEED)` calls this reader has issued.
+    ///
+    /// Exists so a test can tell "never evicted anything" apart from "evicted,
+    /// then had eviction switched off" - a distinction the `evict_fd` field
+    /// alone cannot express, because a reader that already advised the header
+    /// blob away looks identical to one that never advised at all once the fd
+    /// is cleared. One increment inside a branch that is already making a
+    /// syscall.
+    #[cfg(target_os = "linux")]
+    evict_calls: u64,
 }
 
 impl<R: Read + Send> BlobReader<R> {
@@ -408,6 +418,8 @@ impl<R: Read + Send> BlobReader<R> {
             parse_waymembers: false,
             #[cfg(target_os = "linux")]
             evict_fd: None,
+            #[cfg(target_os = "linux")]
+            evict_calls: 0,
         }
     }
 
@@ -592,7 +604,78 @@ impl<R: Read + Send> BlobReader<R> {
     }
 }
 
+/// The raw fd to advise `POSIX_FADV_DONTNEED` on, or `None` when there is
+/// nothing to evict.
+///
+/// Only the buffered arm has page cache behind it; an O_DIRECT reader never
+/// populates it, so advising on one is a syscall that can only do harm.
+#[cfg(target_os = "linux")]
+fn buffered_evict_fd(reader: &FileReader) -> Option<std::os::unix::io::RawFd> {
+    use std::os::unix::io::AsRawFd;
+    match reader {
+        FileReader::Buffered(r) => Some(r.get_ref().as_raw_fd()),
+        #[cfg(feature = "linux-direct-io")]
+        FileReader::Direct(_) => None,
+    }
+}
+
 impl BlobReader<FileReader> {
+    /// Enable or disable page-cache eviction behind the read head.
+    ///
+    /// The file-backed constructors advise `POSIX_FADV_DONTNEED` over the
+    /// consumed prefix after every blob, which is what keeps a sequential pass
+    /// over a 90 GB planet file from pulling the whole file into RSS. That
+    /// default is right for the streaming one-pass workloads this library is
+    /// built for, but it is a *global* effect: the page cache is shared, so a
+    /// second pass over the same file - a two-pass command, a test suite, an
+    /// `osmium` running alongside - is guaranteed to read cold. Until now there
+    /// was no way to say no short of switching to O_DIRECT, which is a
+    /// different I/O mode entirely.
+    ///
+    /// Passing `false` leaves the page cache alone. Passing `true` restores the
+    /// default. Re-enabling has no effect on an O_DIRECT reader, which has no
+    /// cached pages to drop, and the whole method is a no-op off Linux.
+    ///
+    /// ```
+    /// # fn foo() -> pbfhogg::Result<()> {
+    /// // Keep the file warm for a second pass.
+    /// let reader = pbfhogg::BlobReader::from_path("tests/test.osm.pbf")?
+    ///     .evict_page_cache(false);
+    /// # Ok(())
+    /// # }
+    /// # foo().unwrap();
+    /// ```
+    ///
+    /// Note that this is a *builder*, so it can only govern reads that have not
+    /// happened yet. `BlobReader` reads nothing at construction, so on this type
+    /// that covers the whole file - but `ElementReader` decodes the header blob
+    /// eagerly, which is why it also carries
+    /// [`ElementReader::from_path_with_eviction`](crate::ElementReader::from_path_with_eviction).
+    #[must_use]
+    pub fn evict_page_cache(mut self, enabled: bool) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            self.evict_fd = if enabled {
+                buffered_evict_fd(&self.reader)
+            } else {
+                None
+            };
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = enabled;
+        self
+    }
+
+    /// How many `posix_fadvise(DONTNEED)` calls this reader has issued so far.
+    ///
+    /// Crate-internal: lets a test distinguish a reader that never evicted from
+    /// one that evicted and was then switched off.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code, reason = "read only from the reader.rs eviction test")]
+    pub(crate) fn evict_call_count(&self) -> u64 {
+        self.evict_calls
+    }
+
     /// Tries to open the file at the given path and constructs a `BlobReader` from this.
     /// If there are no errors, each blob will have a valid ([`Some`]) offset.
     ///
@@ -612,14 +695,7 @@ impl BlobReader<FileReader> {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let reader = FileReader::buffered(path.as_ref())?;
         #[cfg(target_os = "linux")]
-        let evict_fd = Some({
-            use std::os::unix::io::AsRawFd;
-            match &reader {
-                FileReader::Buffered(r) => r.get_ref().as_raw_fd(),
-                #[cfg(feature = "linux-direct-io")]
-                FileReader::Direct(r) => r.raw_fd(),
-            }
-        });
+        let evict_fd = buffered_evict_fd(&reader);
         Ok(BlobReader {
             reader,
             offset: Some(ByteOffset(0)),
@@ -632,6 +708,8 @@ impl BlobReader<FileReader> {
             parse_waymembers: false,
             #[cfg(target_os = "linux")]
             evict_fd,
+            #[cfg(target_os = "linux")]
+            evict_calls: 0,
         })
     }
 
@@ -653,6 +731,7 @@ impl BlobReader<FileReader> {
             parse_indexdata: true,
             parse_waymembers: false,
             evict_fd: None, // O_DIRECT: no pages to evict
+            evict_calls: 0,
         })
     }
 
@@ -660,18 +739,7 @@ impl BlobReader<FileReader> {
     pub fn open<P: AsRef<Path>>(path: P, direct: bool) -> Result<Self> {
         let reader = FileReader::open(path.as_ref(), direct)?;
         #[cfg(target_os = "linux")]
-        let evict_fd = if direct {
-            None
-        } else {
-            Some({
-                use std::os::unix::io::AsRawFd;
-                match &reader {
-                    FileReader::Buffered(r) => r.get_ref().as_raw_fd(),
-                    #[cfg(feature = "linux-direct-io")]
-                    FileReader::Direct(r) => r.raw_fd(),
-                }
-            })
-        };
+        let evict_fd = buffered_evict_fd(&reader);
         Ok(BlobReader {
             reader,
             offset: Some(ByteOffset(0)),
@@ -684,6 +752,8 @@ impl BlobReader<FileReader> {
             parse_waymembers: false,
             #[cfg(target_os = "linux")]
             evict_fd,
+            #[cfg(target_os = "linux")]
+            evict_calls: 0,
         })
     }
 }
@@ -754,6 +824,15 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
         // pages for the consumed byte range are never accessed again. Advising
         // DONTNEED prevents sequential reads from accumulating the entire file
         // in RSS - critical for 30+ GB PBFs on memory-constrained hosts.
+        // Opt out with `BlobReader::evict_page_cache(false)`.
+        //
+        // The advised range is the whole consumed prefix `0..offset`, re-issued
+        // per blob, where `prev_offset..offset` would express the same intent
+        // over a bounded range. That looks like an easy win and is left alone
+        // deliberately: the cost was never measured, and changing which pages
+        // get dropped changes the cache state every subsequent benchmark on a
+        // host observes, so it is not a change to make on inspection alone.
+        // Tracked in notes/bugs-read-path.md.
         #[cfg(target_os = "linux")]
         if let Some(fd) = self.evict_fd
             && let Some(offset) = self.offset
@@ -768,6 +847,7 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
                     libc::POSIX_FADV_DONTNEED,
                 )
             };
+            self.evict_calls += 1;
         }
 
         self.blob_index = self.blob_index.map(|i| i + 1);
@@ -814,6 +894,8 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
             parse_waymembers: false,
             #[cfg(target_os = "linux")]
             evict_fd: None,
+            #[cfg(target_os = "linux")]
+            evict_calls: 0,
         })
     }
 
@@ -1125,6 +1207,161 @@ pub(crate) fn decode_headerblock(
 #[allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
+
+    /// Truncate `tests/test.osm.pbf` inside the payload of its last blob and
+    /// return the file, its path kept alive by the returned tempdir.
+    ///
+    /// The cut point is derived from the real frame layout rather than guessed,
+    /// so the fixture is provably shape 4 ("EOF inside the Blob payload") and
+    /// not shape 1-3, which have their own unified detection in `frame.rs` and
+    /// would make the test below pass for the wrong reason.
+    fn pbf_truncated_inside_the_last_payload() -> (tempfile::TempDir, std::path::PathBuf) {
+        let full = std::fs::read("tests/test.osm.pbf").unwrap();
+
+        let mut walker = BlobReader::new_seekable(std::io::Cursor::new(full.as_slice())).unwrap();
+        let mut last_payload_start = 0u64;
+        let mut last_payload_end = 0u64;
+        while let Some(item) = walker.next_header_skip_blob() {
+            let (header, frame_start) = item.unwrap();
+            let frame_start = frame_start.unwrap().0;
+            // 4-byte length prefix + BlobHeader + payload. The payload start is
+            // the position the reader reached after consuming the header, which
+            // is `frame_start + 4 + header_len`; recovering `header_len` from
+            // the file is simpler than threading it out of the reader.
+            let header_len = u32::from_be_bytes(
+                full[frame_start as usize..frame_start as usize + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as u64;
+            last_payload_start = frame_start + 4 + header_len;
+            last_payload_end = last_payload_start + u64::try_from(header.get_blob_size()).unwrap();
+        }
+        assert_eq!(
+            last_payload_end,
+            full.len() as u64,
+            "the fixture's last frame should end exactly at EOF"
+        );
+
+        // Cut three bytes into the last payload: past its first byte, so the
+        // header is fully committed and only the payload is short.
+        let cut = last_payload_start + 3;
+        assert!(cut < last_payload_end, "cut must land inside the payload");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shape4.osm.pbf");
+        std::fs::write(&path, &full[..cut as usize]).unwrap();
+        (dir, path)
+    }
+
+    /// All three shape-4 detectors must agree on the same file.
+    ///
+    /// "EOF inside the Blob payload" is the one truncation shape `frame.rs`
+    /// could not unify, because each site has only the mechanism its I/O shape
+    /// offers: `BlobReader::next` compares the byte count returned by
+    /// `read_to_end` against the declared `datasize`; `next_header_skip_blob`
+    /// seeks past the payload and reads one sentinel byte; `HeaderWalker`
+    /// compares the payload extent against the file size captured at `open`.
+    /// Unifying them needs a seekable-source abstraction that reports "bytes
+    /// available from here", which is a refactor rather than a guard.
+    ///
+    /// Until that exists, this test is what keeps the three from drifting: if
+    /// any one of them ever stops hard-erroring - the silent-truncation failure
+    /// the whole shape catalogue exists to prevent - it fails here rather than
+    /// in the field. The intact file is walked by all three arms first, so a
+    /// blanket "everything errors" regression cannot make this pass.
+    #[test]
+    fn all_three_shape_four_detectors_reject_the_same_file() {
+        let intact = std::path::Path::new("tests/test.osm.pbf");
+        let (_dir, truncated) = pbf_truncated_inside_the_last_payload();
+
+        // Arm 1: full-payload read, counting bytes delivered.
+        let read_arm = |path: &std::path::Path| -> Result<usize> {
+            let mut count = 0;
+            for blob in BlobReader::from_path(path)? {
+                blob?;
+                count += 1;
+            }
+            Ok(count)
+        };
+        // Arm 2: header walk that seeks past each payload and probes for EOF.
+        let skip_arm = |path: &std::path::Path| -> Result<usize> {
+            let file = std::fs::File::open(path).unwrap();
+            let mut reader = BlobReader::new_seekable(std::io::BufReader::new(file))?;
+            let mut count = 0;
+            while let Some(item) = reader.next_header_skip_blob() {
+                item?;
+                count += 1;
+            }
+            Ok(count)
+        };
+        // Arm 3: pread walk that checks each payload extent against file size.
+        let walk_arm = |path: &std::path::Path| -> Result<usize> {
+            let mut walker = super::super::header_walker::HeaderWalker::open(path)?;
+            let mut count = 0;
+            while walker.next_header()?.is_some() {
+                count += 1;
+            }
+            Ok(count)
+        };
+
+        let intact_counts = [
+            read_arm(intact).expect("read arm on the intact file"),
+            skip_arm(intact).expect("skip arm on the intact file"),
+            walk_arm(intact).expect("walk arm on the intact file"),
+        ];
+        assert!(
+            intact_counts[0] > 1 && intact_counts.iter().all(|c| *c == intact_counts[0]),
+            "the three arms must see the same intact file: {intact_counts:?}"
+        );
+
+        for (name, result) in [
+            ("read", read_arm(&truncated)),
+            ("skip", skip_arm(&truncated)),
+            ("walk", walk_arm(&truncated)),
+        ] {
+            assert!(
+                result.is_err(),
+                "the {name} arm must hard-error on a payload-truncated file, \
+                 got Ok({result:?}) - shape 4 has drifted apart"
+            );
+        }
+    }
+
+    /// `evict_page_cache(false)` must actually disarm the eviction, and must
+    /// not change what the reader delivers.
+    ///
+    /// The default is on, so the opt-out is only worth having if it is
+    /// observable: the assertion is on the `evict_fd` the syscall reads, not on
+    /// the blob count alone, which would pass just as well against a method
+    /// that did nothing at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn evict_page_cache_opt_out_disarms_eviction_without_changing_the_read() {
+        let path = std::path::Path::new("tests/test.osm.pbf");
+
+        let default_on = BlobReader::from_path(path).unwrap();
+        assert!(
+            default_on.evict_fd.is_some(),
+            "buffered file reads must evict by default"
+        );
+
+        let off = BlobReader::from_path(path).unwrap().evict_page_cache(false);
+        assert!(off.evict_fd.is_none(), "opting out must clear the fd");
+
+        let back_on = off.evict_page_cache(true);
+        assert!(
+            back_on.evict_fd.is_some(),
+            "re-enabling must restore the fd"
+        );
+
+        let with = BlobReader::from_path(path).unwrap().count();
+        let without = BlobReader::from_path(path)
+            .unwrap()
+            .evict_page_cache(false)
+            .count();
+        assert_eq!(with, without, "eviction must not change what is delivered");
+        assert!(with > 1, "the fixture must contain more than one blob");
+    }
 
     /// Hand-encode `[4-byte BE header_len][BlobHeader]` for an `OSMData` blob
     /// declaring the given datasize, with no Blob payload following. Lets a

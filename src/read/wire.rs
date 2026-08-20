@@ -5,11 +5,103 @@
 //! parsers: PrimitiveBlock, PrimitiveGroup, Node, Way, Relation, DenseNodes,
 //! DenseInfo, Info, and StringTable.
 
-use crate::error::Result;
+use crate::error::{Result, new_wire_error};
 pub(crate) use protohoggr::{
     Cursor, PackedBoolIter, PackedInt32Iter, PackedSint32Iter, PackedSint64Iter, PackedUint32Iter,
     WIRE_LEN, WIRE_VARINT,
 };
+
+/// Record one occurrence of a packed repeated field into `slot`.
+///
+/// Protobuf permits a packed repeated field to be written in either wire form:
+/// length-delimited (one packed segment, which is what every OSM writer in
+/// existence emits) or varint (an individually tagged, unpacked value).
+/// libosmium accepts both forms for every packed field on the OSM read path -
+/// see the paired `length_delimited` / `varint` cases throughout
+/// `research/libosmium/include/osmium/io/detail/pbf_decoder.hpp` - and so do we.
+/// A single unpacked value is byte-identical to a one-element packed segment,
+/// so it is captured with no copy: `read_raw_field` hands back exactly the
+/// varint's own bytes.
+///
+/// Before this helper existed, only `WIRE_LEN` was matched. An unpacked field
+/// fell through to `skip_field` and the slot stayed empty, so an unpacked
+/// `DenseNodes.keys_vals` decoded as "this block has no tags at all" with no
+/// diagnostic - the silent-data-loss class this parser exists to prevent,
+/// reachable through a spec-legal encoding.
+///
+/// The spec also permits a packed field to appear as *several* occurrences,
+/// whose semantics are concatenation of every occurrence in field order. A
+/// concatenation cannot be expressed as one borrowed slice, and the read path
+/// is built on borrowed slices for a measured reason - so we do not support it.
+/// We do not silently keep the last occurrence either, which is what this
+/// parser used to do and what libosmium still does (`ids = ...` plainly
+/// overwrites): that drops element data with no diagnostic. Instead a second
+/// non-empty occurrence is a hard error naming the field. Empty occurrences are
+/// ignored in either position, since an empty segment contributes nothing to a
+/// concatenation - so the only rejected shape is two occurrences that both
+/// carry data, which no known writer produces.
+#[inline]
+fn take_packed<'a>(
+    cursor: &mut Cursor<'a>,
+    wire_type: u32,
+    slot: &mut &'a [u8],
+    dup_msg: &'static str,
+) -> Result<()> {
+    let bytes = if wire_type == WIRE_LEN {
+        cursor.read_len_delimited()?
+    } else {
+        cursor.read_raw_field(WIRE_VARINT)?
+    };
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    if !slot.is_empty() {
+        return Err(new_wire_error(dup_msg));
+    }
+    *slot = bytes;
+    Ok(())
+}
+
+// Per-field duplicate-occurrence messages. Each names exactly one field of one
+// message, so a test asserting on one of these cannot be satisfied by any other
+// guard in the decoder.
+const DUP_NODE_KEYS: &str = "Node.keys appears twice with data; packed field split across segments";
+const DUP_NODE_VALS: &str = "Node.vals appears twice with data; packed field split across segments";
+const DUP_WAY_KEYS: &str = "Way.keys appears twice with data; packed field split across segments";
+const DUP_WAY_VALS: &str = "Way.vals appears twice with data; packed field split across segments";
+const DUP_WAY_REFS: &str = "Way.refs appears twice with data; packed field split across segments";
+const DUP_WAY_LAT: &str = "Way.lat appears twice with data; packed field split across segments";
+const DUP_WAY_LON: &str = "Way.lon appears twice with data; packed field split across segments";
+const DUP_REL_KEYS: &str =
+    "Relation.keys appears twice with data; packed field split across segments";
+const DUP_REL_VALS: &str =
+    "Relation.vals appears twice with data; packed field split across segments";
+const DUP_REL_ROLES: &str =
+    "Relation.roles_sid appears twice with data; packed field split across segments";
+const DUP_REL_MEMIDS: &str =
+    "Relation.memids appears twice with data; packed field split across segments";
+const DUP_REL_TYPES: &str =
+    "Relation.types appears twice with data; packed field split across segments";
+const DUP_DENSE_ID: &str =
+    "DenseNodes.id appears twice with data; packed field split across segments";
+const DUP_DENSE_LAT: &str =
+    "DenseNodes.lat appears twice with data; packed field split across segments";
+const DUP_DENSE_LON: &str =
+    "DenseNodes.lon appears twice with data; packed field split across segments";
+const DUP_DENSE_KV: &str =
+    "DenseNodes.keys_vals appears twice with data; packed field split across segments";
+const DUP_DI_VERSION: &str =
+    "DenseInfo.version appears twice with data; packed field split across segments";
+const DUP_DI_TIMESTAMP: &str =
+    "DenseInfo.timestamp appears twice with data; packed field split across segments";
+const DUP_DI_CHANGESET: &str =
+    "DenseInfo.changeset appears twice with data; packed field split across segments";
+const DUP_DI_UID: &str =
+    "DenseInfo.uid appears twice with data; packed field split across segments";
+const DUP_DI_USER_SID: &str =
+    "DenseInfo.user_sid appears twice with data; packed field split across segments";
+const DUP_DI_VISIBLE: &str =
+    "DenseInfo.visible appears twice with data; packed field split across segments";
 
 // ---------------------------------------------------------------------------
 // WireStringTable - zero-copy indexed string table
@@ -444,8 +536,12 @@ impl<'a> WireNode<'a> {
         while let Some((field, wire_type)) = cursor.read_tag()? {
             match (field, wire_type) {
                 (1, WIRE_VARINT) => id = cursor.read_sint64()?,
-                (2, WIRE_LEN) => keys_data = cursor.read_len_delimited()?,
-                (3, WIRE_LEN) => vals_data = cursor.read_len_delimited()?,
+                (2, WIRE_LEN | WIRE_VARINT) => {
+                    take_packed(&mut cursor, wire_type, &mut keys_data, DUP_NODE_KEYS)?;
+                }
+                (3, WIRE_LEN | WIRE_VARINT) => {
+                    take_packed(&mut cursor, wire_type, &mut vals_data, DUP_NODE_VALS)?;
+                }
                 (4, WIRE_LEN) => info_data = Some(cursor.read_len_delimited()?),
                 (8, WIRE_VARINT) => lat = cursor.read_sint64()?,
                 (9, WIRE_VARINT) => lon = cursor.read_sint64()?,
@@ -491,12 +587,22 @@ impl<'a> WireWay<'a> {
         while let Some((field, wire_type)) = cursor.read_tag()? {
             match (field, wire_type) {
                 (1, WIRE_VARINT) => id = cursor.read_varint_i64()?,
-                (2, WIRE_LEN) => keys_data = cursor.read_len_delimited()?,
-                (3, WIRE_LEN) => vals_data = cursor.read_len_delimited()?,
+                (2, WIRE_LEN | WIRE_VARINT) => {
+                    take_packed(&mut cursor, wire_type, &mut keys_data, DUP_WAY_KEYS)?;
+                }
+                (3, WIRE_LEN | WIRE_VARINT) => {
+                    take_packed(&mut cursor, wire_type, &mut vals_data, DUP_WAY_VALS)?;
+                }
                 (4, WIRE_LEN) => info_data = Some(cursor.read_len_delimited()?),
-                (8, WIRE_LEN) => refs_data = cursor.read_len_delimited()?,
-                (9, WIRE_LEN) => lat_data = cursor.read_len_delimited()?,
-                (10, WIRE_LEN) => lon_data = cursor.read_len_delimited()?,
+                (8, WIRE_LEN | WIRE_VARINT) => {
+                    take_packed(&mut cursor, wire_type, &mut refs_data, DUP_WAY_REFS)?;
+                }
+                (9, WIRE_LEN | WIRE_VARINT) => {
+                    take_packed(&mut cursor, wire_type, &mut lat_data, DUP_WAY_LAT)?;
+                }
+                (10, WIRE_LEN | WIRE_VARINT) => {
+                    take_packed(&mut cursor, wire_type, &mut lon_data, DUP_WAY_LON)?;
+                }
                 (20, WIRE_LEN) => pins_data = Some(cursor.read_len_delimited()?),
                 _ => cursor.skip_field(wire_type)?,
             }
@@ -540,12 +646,22 @@ impl<'a> WireRelation<'a> {
         while let Some((field, wire_type)) = cursor.read_tag()? {
             match (field, wire_type) {
                 (1, WIRE_VARINT) => id = cursor.read_varint_i64()?,
-                (2, WIRE_LEN) => keys_data = cursor.read_len_delimited()?,
-                (3, WIRE_LEN) => vals_data = cursor.read_len_delimited()?,
+                (2, WIRE_LEN | WIRE_VARINT) => {
+                    take_packed(&mut cursor, wire_type, &mut keys_data, DUP_REL_KEYS)?;
+                }
+                (3, WIRE_LEN | WIRE_VARINT) => {
+                    take_packed(&mut cursor, wire_type, &mut vals_data, DUP_REL_VALS)?;
+                }
                 (4, WIRE_LEN) => info_data = Some(cursor.read_len_delimited()?),
-                (8, WIRE_LEN) => roles_sid_data = cursor.read_len_delimited()?,
-                (9, WIRE_LEN) => memids_data = cursor.read_len_delimited()?,
-                (10, WIRE_LEN) => types_data = cursor.read_len_delimited()?,
+                (8, WIRE_LEN | WIRE_VARINT) => {
+                    take_packed(&mut cursor, wire_type, &mut roles_sid_data, DUP_REL_ROLES)?;
+                }
+                (9, WIRE_LEN | WIRE_VARINT) => {
+                    take_packed(&mut cursor, wire_type, &mut memids_data, DUP_REL_MEMIDS)?;
+                }
+                (10, WIRE_LEN | WIRE_VARINT) => {
+                    take_packed(&mut cursor, wire_type, &mut types_data, DUP_REL_TYPES)?;
+                }
                 _ => cursor.skip_field(wire_type)?,
             }
         }
@@ -562,7 +678,7 @@ impl<'a> WireRelation<'a> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct WireDenseNodes<'a> {
     pub id_data: &'a [u8],
     pub lat_data: &'a [u8],
@@ -582,11 +698,19 @@ impl<'a> WireDenseNodes<'a> {
 
         while let Some((field, wire_type)) = cursor.read_tag()? {
             match (field, wire_type) {
-                (1, WIRE_LEN) => id_data = cursor.read_len_delimited()?,
+                (1, WIRE_LEN | WIRE_VARINT) => {
+                    take_packed(&mut cursor, wire_type, &mut id_data, DUP_DENSE_ID)?;
+                }
                 (5, WIRE_LEN) => info_data = Some(cursor.read_len_delimited()?),
-                (8, WIRE_LEN) => lat_data = cursor.read_len_delimited()?,
-                (9, WIRE_LEN) => lon_data = cursor.read_len_delimited()?,
-                (10, WIRE_LEN) => keys_vals_data = cursor.read_len_delimited()?,
+                (8, WIRE_LEN | WIRE_VARINT) => {
+                    take_packed(&mut cursor, wire_type, &mut lat_data, DUP_DENSE_LAT)?;
+                }
+                (9, WIRE_LEN | WIRE_VARINT) => {
+                    take_packed(&mut cursor, wire_type, &mut lon_data, DUP_DENSE_LON)?;
+                }
+                (10, WIRE_LEN | WIRE_VARINT) => {
+                    take_packed(&mut cursor, wire_type, &mut keys_vals_data, DUP_DENSE_KV)?;
+                }
                 _ => cursor.skip_field(wire_type)?,
             }
         }
@@ -601,7 +725,7 @@ impl<'a> WireDenseNodes<'a> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct WireDenseInfo<'a> {
     pub version_data: &'a [u8],
     pub timestamp_data: &'a [u8],
@@ -623,12 +747,34 @@ impl<'a> WireDenseInfo<'a> {
 
         while let Some((field, wire_type)) = cursor.read_tag()? {
             match (field, wire_type) {
-                (1, WIRE_LEN) => version_data = cursor.read_len_delimited()?,
-                (2, WIRE_LEN) => timestamp_data = cursor.read_len_delimited()?,
-                (3, WIRE_LEN) => changeset_data = cursor.read_len_delimited()?,
-                (4, WIRE_LEN) => uid_data = cursor.read_len_delimited()?,
-                (5, WIRE_LEN) => user_sid_data = cursor.read_len_delimited()?,
-                (6, WIRE_LEN) => visible_data = cursor.read_len_delimited()?,
+                (1, WIRE_LEN | WIRE_VARINT) => {
+                    take_packed(&mut cursor, wire_type, &mut version_data, DUP_DI_VERSION)?;
+                }
+                (2, WIRE_LEN | WIRE_VARINT) => {
+                    take_packed(
+                        &mut cursor,
+                        wire_type,
+                        &mut timestamp_data,
+                        DUP_DI_TIMESTAMP,
+                    )?;
+                }
+                (3, WIRE_LEN | WIRE_VARINT) => {
+                    take_packed(
+                        &mut cursor,
+                        wire_type,
+                        &mut changeset_data,
+                        DUP_DI_CHANGESET,
+                    )?;
+                }
+                (4, WIRE_LEN | WIRE_VARINT) => {
+                    take_packed(&mut cursor, wire_type, &mut uid_data, DUP_DI_UID)?;
+                }
+                (5, WIRE_LEN | WIRE_VARINT) => {
+                    take_packed(&mut cursor, wire_type, &mut user_sid_data, DUP_DI_USER_SID)?;
+                }
+                (6, WIRE_LEN | WIRE_VARINT) => {
+                    take_packed(&mut cursor, wire_type, &mut visible_data, DUP_DI_VISIBLE)?;
+                }
                 _ => cursor.skip_field(wire_type)?,
             }
         }
@@ -729,5 +875,171 @@ mod tests {
         let without_pins = [0x08, 0x01, 0x42, 0x01, 0x00];
         let way = WireWay::parse(&without_pins).unwrap();
         assert_eq!(way.pins_data, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Packed repeated fields: unpacked wire form, and duplicate occurrences.
+    // -----------------------------------------------------------------------
+
+    /// Tag byte for a single-byte field number and wire type.
+    fn tag(field: u32, wire_type: u32) -> u8 {
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            ((field << 3) | wire_type) as u8
+        }
+    }
+
+    #[test]
+    fn dense_keys_vals_written_unpacked_is_not_silently_empty() {
+        // DenseNodes with id packed [0x02] and keys_vals written UNPACKED as a
+        // single varint-typed field 10 rather than a packed segment. Both forms
+        // are legal protobuf; libosmium accepts both. Before take_packed the
+        // varint form fell through to skip_field and keys_vals decoded as
+        // empty, i.e. "no tags in this block" with no diagnostic.
+        let unpacked = [
+            tag(1, WIRE_LEN),
+            0x01,
+            0x02, // id = packed [1]
+            tag(10, WIRE_VARINT),
+            0x07, // keys_vals = 7, unpacked
+        ];
+        let dn = WireDenseNodes::parse(&unpacked).unwrap();
+        assert_eq!(
+            dn.keys_vals_data,
+            [0x07u8].as_slice(),
+            "unpacked keys_vals must decode to the same one-element varint stream \
+             a packed segment would produce, not to an empty slice"
+        );
+
+        // The packed spelling of the identical value produces identical bytes.
+        let packed = [tag(1, WIRE_LEN), 0x01, 0x02, tag(10, WIRE_LEN), 0x01, 0x07];
+        let dn_packed = WireDenseNodes::parse(&packed).unwrap();
+        assert_eq!(dn_packed.keys_vals_data, dn.keys_vals_data);
+    }
+
+    #[test]
+    fn way_refs_written_unpacked_is_not_silently_empty() {
+        let unpacked = [
+            0x08,
+            0x01, // id = 1
+            tag(8, WIRE_VARINT),
+            0x04, // refs = 4, unpacked
+        ];
+        let way = WireWay::parse(&unpacked).unwrap();
+        assert_eq!(way.refs_data, [0x04u8].as_slice());
+    }
+
+    #[test]
+    fn dense_keys_vals_in_two_data_bearing_segments_is_a_named_error() {
+        let two_segments = [
+            tag(1, WIRE_LEN),
+            0x01,
+            0x02,
+            tag(10, WIRE_LEN),
+            0x01,
+            0x07, // keys_vals segment 1
+            tag(10, WIRE_LEN),
+            0x01,
+            0x09, // keys_vals segment 2
+        ];
+        let err = WireDenseNodes::parse(&two_segments).unwrap_err();
+        // Assert on the field-specific text. Only the keys_vals duplicate guard
+        // can produce it: every other duplicate guard names a different field,
+        // and a generic truncation or tag error names neither.
+        assert!(
+            err.to_string()
+                .contains("DenseNodes.keys_vals appears twice"),
+            "expected the keys_vals duplicate guard, got: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_guard_names_the_field_that_actually_repeated() {
+        // Same shape as above but on DenseNodes.lat. If the guard were shared
+        // or the message generic, this test and the keys_vals one could not
+        // both pass.
+        let two_segments = [tag(8, WIRE_LEN), 0x01, 0x02, tag(8, WIRE_LEN), 0x01, 0x04];
+        let err = WireDenseNodes::parse(&two_segments).unwrap_err();
+        assert!(
+            err.to_string().contains("DenseNodes.lat appears twice"),
+            "expected the lat duplicate guard, got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_empty_packed_segment_does_not_shadow_a_later_one() {
+        // Concatenation semantics: an empty occurrence contributes nothing, so
+        // empty-then-data and data-then-empty must both yield the data, not an
+        // error and not the empty slice.
+        let empty_first = [
+            tag(10, WIRE_LEN),
+            0x00, // keys_vals = empty segment
+            tag(10, WIRE_LEN),
+            0x01,
+            0x07,
+        ];
+        assert_eq!(
+            WireDenseNodes::parse(&empty_first).unwrap().keys_vals_data,
+            [0x07u8].as_slice()
+        );
+
+        let empty_last = [tag(10, WIRE_LEN), 0x01, 0x07, tag(10, WIRE_LEN), 0x00];
+        assert_eq!(
+            WireDenseNodes::parse(&empty_last).unwrap().keys_vals_data,
+            [0x07u8].as_slice()
+        );
+    }
+
+    #[test]
+    fn dense_info_accepts_the_unpacked_form() {
+        let unpacked = [
+            tag(1, WIRE_VARINT),
+            0x03, // version = 3, unpacked
+            tag(2, WIRE_LEN),
+            0x01,
+            0x08, // timestamp = packed [8]
+        ];
+        let di = WireDenseInfo::parse(&unpacked).unwrap();
+        assert_eq!(di.version_data, [0x03u8].as_slice());
+        assert_eq!(di.timestamp_data, [0x08u8].as_slice());
+    }
+
+    #[test]
+    fn node_and_relation_packed_fields_accept_the_unpacked_form() {
+        let node = [
+            0x08,
+            0x02, // id (sint64) = 1
+            tag(2, WIRE_VARINT),
+            0x05, // keys = 5, unpacked
+            tag(3, WIRE_VARINT),
+            0x06, // vals = 6, unpacked
+        ];
+        let n = WireNode::parse(&node).unwrap();
+        assert_eq!(n.keys_data, [0x05u8].as_slice());
+        assert_eq!(n.vals_data, [0x06u8].as_slice());
+
+        let rel = [
+            0x08,
+            0x01,
+            tag(9, WIRE_VARINT),
+            0x0A, // memids = 10, unpacked
+            tag(10, WIRE_VARINT),
+            0x01, // types = 1, unpacked
+        ];
+        let r = WireRelation::parse(&rel).unwrap();
+        assert_eq!(r.memids_data, [0x0Au8].as_slice());
+        assert_eq!(r.types_data, [0x01u8].as_slice());
+    }
+
+    #[test]
+    fn multi_byte_unpacked_varint_keeps_all_its_bytes() {
+        // read_raw_field must hand back the whole varint, not just the first
+        // byte: 300 encodes as 0xAC 0x02.
+        let unpacked = [tag(10, WIRE_VARINT), 0xAC, 0x02];
+        let dn = WireDenseNodes::parse(&unpacked).unwrap();
+        assert_eq!(dn.keys_vals_data, [0xACu8, 0x02].as_slice());
+        let mut it = PackedInt32Iter::new(dn.keys_vals_data);
+        assert_eq!(it.next(), Some(300));
+        assert_eq!(it.next(), None);
     }
 }

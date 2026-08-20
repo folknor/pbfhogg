@@ -47,9 +47,13 @@ pub(crate) const DEFAULT_DECODE_AHEAD: usize = 32;
 
 /// Bounds decode items admitted but not yet delivered from the reorder buffer.
 ///
-/// Single-acquirer invariant: only the one stage-2 dispatcher thread calls
-/// `acquire`. `release` can therefore use `notify_one`; adding a second
-/// acquirer requires changing this to `notify_all` or per-waiter wakeups.
+/// Today only the one stage-2 dispatcher thread calls `acquire`, so a single
+/// wakeup would suffice - but `release` notifies all waiters anyway. With one
+/// waiter the two are the same call; with two, `notify_one` can wake the thread
+/// that still cannot proceed and leave the pipeline hung with permits free.
+/// Paying nothing now to remove a load-bearing invariant that nothing in the
+/// type could enforce is the better trade: a future second acquirer is a
+/// correctness question about *this* comment, not a silent deadlock under load.
 struct AdmissionGate {
     count: Mutex<usize>,
     cond: Condvar,
@@ -84,7 +88,7 @@ impl AdmissionGate {
         assert!(*count > 0, "decode admission permit released below zero");
         *count -= 1;
         drop(count);
-        self.cond.notify_one();
+        self.cond.notify_all();
     }
 }
 

@@ -34,6 +34,32 @@ pub(crate) struct WireBlobHeader {
     pub waymembers: Option<Box<[u8]>>,
 }
 
+/// Warn once per process about a `BlobHeader.indexdata` of an unrecognised
+/// length.
+///
+/// A length that is neither 26 (v1) nor 42 (v2) is dropped and the blob then
+/// reads as "no index", which every consumer treats as "cannot pre-filter this
+/// blob" and conservatively passes through. That is the safe direction, so it
+/// is not worth failing the whole file over an advisory index - especially as
+/// `indexdata` is an optional field a third-party writer is free to use for
+/// something else. It was, however, completely invisible: a systematically
+/// corrupt index silently degraded every filtered read to a full decode with no
+/// way to tell from the outside. One line on stderr is the difference between a
+/// mystery and a diagnosis.
+///
+/// Warning once rather than per blob is deliberate: planet has ~2.5 M blobs,
+/// and a per-blob warning would be worse than silence.
+fn warn_unrecognised_indexdata(len: usize) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "warning: BlobHeader.indexdata has an unrecognised length ({len} bytes; \
+             expected 26 or 42) - blob index ignored, reads fall back to full decode. \
+             Further occurrences are not reported."
+        );
+    });
+}
+
 impl WireBlobHeader {
     /// Parse a BlobHeader from raw protobuf bytes.
     ///
@@ -81,6 +107,8 @@ impl WireBlobHeader {
                         let mut buf = [0u8; crate::blob_meta::INDEX_SIZE];
                         buf[..len].copy_from_slice(bytes);
                         indexdata = Some(buf);
+                    } else if len != 0 {
+                        warn_unrecognised_indexdata(len);
                     }
                 }
                 3 => {

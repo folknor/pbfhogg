@@ -326,6 +326,11 @@ impl<R: Read + Send> ElementReader<R> {
         R: 'static,
     {
         let (tx, rx) = sync_channel(BLOCK_QUEUE);
+        // Set by the pipeline thread as its last act. A dropped sender with
+        // this still false means the thread unwound rather than finished, and
+        // the consumer must not read that as end-of-file.
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_completed = std::sync::Arc::clone(&completed);
         let blob_iter = self.blob_iter;
         let decode_threads = self.decode_threads;
         let pipeline_config = self.pipeline_config;
@@ -351,11 +356,13 @@ impl<R: Read + Send> ElementReader<R> {
                 // Ignore send failure - consumer may have already dropped.
                 drop(tx.send(Err(e)));
             }
+            thread_completed.store(true, std::sync::atomic::Ordering::Release);
         });
 
         PipelinedBlocks {
             rx: Some(rx),
             handle: Some(handle),
+            completed,
         }
     }
 
@@ -957,6 +964,53 @@ impl ElementReader<FileReader> {
         })
     }
 
+    /// Open a file, choosing page-cache eviction up front.
+    ///
+    /// Forwards to [`BlobReader::evict_page_cache`]; see that method for what
+    /// the default does and why you might not want it. Eviction is on by
+    /// default for the buffered file constructors.
+    ///
+    /// This is the constructor to use when the point is to leave the *whole*
+    /// file's cache alone. [`ElementReader::from_path`] reads and decodes the
+    /// header blob before it returns, and the eviction decision has to be made
+    /// before that read - see [`ElementReader::evict_page_cache`].
+    ///
+    /// ```
+    /// # fn foo() -> pbfhogg::Result<()> {
+    /// // Keep the file warm for a second pass, header included.
+    /// let reader = pbfhogg::ElementReader::from_path_with_eviction("tests/test.osm.pbf", false)?;
+    /// # Ok(())
+    /// # }
+    /// # foo().unwrap();
+    /// ```
+    pub fn from_path_with_eviction<P: AsRef<Path>>(path: P, enabled: bool) -> Result<Self> {
+        let mut blob_iter = BlobReader::from_path(path)?.evict_page_cache(enabled);
+        let header = read_header_blob(&mut blob_iter)?;
+        Ok(ElementReader {
+            blob_iter,
+            header,
+            decode_threads: None,
+            pipeline_config: PipelineConfig::default(),
+            blob_filter: None,
+        })
+    }
+
+    /// Enable or disable page-cache eviction behind the read head, from the
+    /// *next* blob onwards.
+    ///
+    /// Forwards to [`BlobReader::evict_page_cache`]. Note the "from the next
+    /// blob onwards": every `ElementReader` file constructor reads and decodes
+    /// the header blob before returning, so by the time this method can be
+    /// called the header's pages have already been advised away under the
+    /// default. Passing `false` here therefore spares the element blobs but not
+    /// the header. Use [`ElementReader::from_path_with_eviction`] when the
+    /// whole file must be left untouched.
+    #[must_use]
+    pub fn evict_page_cache(mut self, enabled: bool) -> Self {
+        self.blob_iter = self.blob_iter.evict_page_cache(enabled);
+        self
+    }
+
     /// Open a file, selecting buffered or O_DIRECT based on the `direct` flag.
     pub fn open<P: AsRef<Path>>(path: P, direct: bool) -> Result<Self> {
         let mut blob_iter = BlobReader::open(path, direct)?;
@@ -1007,13 +1061,36 @@ fn node_id(element: &Element<'_>) -> Option<i64> {
 pub struct PipelinedBlocks {
     rx: Option<Receiver<Result<PrimitiveBlock>>>,
     handle: Option<JoinHandle<()>>,
+    /// Set by the pipeline thread immediately before it returns. Distinguishes
+    /// "the sender was dropped because the work finished" from "the sender was
+    /// dropped because the thread unwound".
+    completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Iterator for PipelinedBlocks {
     type Item = Result<PrimitiveBlock>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.rx.as_ref()?.recv().ok()
+        match self.rx.as_ref()?.recv() {
+            Ok(item) => Some(item),
+            Err(_) => {
+                // The channel closed. On the normal path the pipeline thread
+                // has already sent every block (and any error) and set
+                // `completed` before dropping its sender, so this is
+                // end-of-iteration. On a panic it dropped the sender while
+                // unwinding with `completed` still false - and `Drop` below
+                // joins and discards that panic, so returning `None` here
+                // would report a crashed pipeline as a cleanly ended file.
+                self.rx = None;
+                if self.completed.load(std::sync::atomic::Ordering::Acquire) {
+                    None
+                } else {
+                    Some(Err(new_error(ErrorKind::Io(std::io::Error::other(
+                        "pipeline thread terminated without completing (panicked)",
+                    )))))
+                }
+            }
+        }
     }
 }
 
@@ -1034,12 +1111,55 @@ impl Drop for PipelinedBlocks {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{Batch, BatchQueue, ByteBudget, ElementReader, par_fold_blobs};
+    use super::{Batch, BatchQueue, ByteBudget, ElementReader, PipelinedBlocks, par_fold_blobs};
     use crate::error::{BlobError, ErrorKind};
     use std::io::{Cursor, Read};
     use std::sync::Arc;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    /// The eviction opt-out has to be supplied before the header blob is read,
+    /// or it cannot deliver what it promises.
+    ///
+    /// The distinction this test exists to draw is "no eviction at all" versus
+    /// "eviction of the header only". A reader in either state has a cleared
+    /// `evict_fd`, so the fd cannot tell them apart; the fadvise call count can,
+    /// and it is what the kernel actually saw.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn eviction_opt_out_must_be_supplied_before_the_header_blob_is_read() {
+        let path = "tests/test.osm.pbf";
+
+        // Post-hoc opt-out: the header blob was read under the default, so one
+        // fadvise has already been issued by the time the caller can say no.
+        let late = ElementReader::from_path(path)
+            .unwrap()
+            .evict_page_cache(false);
+        assert_eq!(
+            late.blob_iter.evict_call_count(),
+            1,
+            "from_path reads the header eagerly, so a post-hoc opt-out cannot \
+             un-advise the header blob - if this is 0 the constructor stopped \
+             reading the header and the doc comment on evict_page_cache is stale"
+        );
+
+        // Up-front opt-out: nothing is ever advised away.
+        let early = ElementReader::from_path_with_eviction(path, false).unwrap();
+        assert_eq!(
+            early.blob_iter.evict_call_count(),
+            0,
+            "from_path_with_eviction(false) must leave the whole file's cache \
+             alone, header included"
+        );
+
+        // And the default still evicts, so the assertion above is not vacuous.
+        let default_on = ElementReader::from_path(path).unwrap();
+        assert_eq!(
+            default_on.blob_iter.evict_call_count(),
+            1,
+            "the buffered default must still evict the header blob"
+        );
+    }
 
     // The `par_map_reduce` frame pump admits blobs against `ByteBudget` before
     // reading further; these pin that bounded-admission contract deterministically
@@ -1341,5 +1461,98 @@ mod tests {
             matches!(err.kind(), ErrorKind::Blob(BlobError::HeaderTooBig { .. })),
             "framing/read error must win over the decode error, got {err:?}"
         );
+    }
+
+    /// A pipeline thread that dies without finishing must surface as an error,
+    /// not as a clean end of file.
+    ///
+    /// `PipelinedBlocks::next` receives from a channel whose only sender lives
+    /// on the pipeline thread, so a panic there closes the channel exactly as
+    /// normal completion does - and `Drop` joins and discards the panic. Mapping
+    /// the receive failure straight to `None` therefore reported a crashed
+    /// pipeline as "the file ended", which is silent data loss with a zero exit
+    /// code. The `completed` flag is what tells the two apart.
+    ///
+    /// Both halves are asserted: a thread that completes normally must still
+    /// end iteration with `None`, or this test would pass against an iterator
+    /// that always reports an error.
+    #[test]
+    fn a_panicking_pipeline_thread_is_not_reported_as_end_of_file() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let build = |panics: bool| {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let completed = Arc::new(AtomicBool::new(false));
+            let thread_completed = Arc::clone(&completed);
+            let handle = std::thread::spawn(move || {
+                let _tx = tx;
+                if panics {
+                    // Emulate an unwind on the pipeline thread: the sender is
+                    // dropped without `completed` ever being set.
+                    panic!("pipeline thread died");
+                }
+                thread_completed.store(true, Ordering::Release);
+            });
+            PipelinedBlocks {
+                rx: Some(rx),
+                handle: Some(handle),
+                completed,
+            }
+        };
+
+        // Silence the panic backtrace this test deliberately provokes.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let mut crashed = build(true);
+        let item = crashed.next();
+        std::panic::set_hook(previous);
+
+        let err = item
+            .expect("a dead pipeline must yield an item, not end-of-iteration")
+            .expect_err("and that item must be an error");
+        assert!(
+            format!("{err}").contains("terminated without completing"),
+            "expected the pipeline-death error, got: {err}"
+        );
+        assert!(
+            crashed.next().is_none(),
+            "the error must be reported once, then iteration ends"
+        );
+
+        let mut clean = build(false);
+        assert!(
+            clean.next().is_none(),
+            "a pipeline that completed must end iteration cleanly"
+        );
+
+        // The two halves above exercise the iterator against a hand-built
+        // channel. This one pins the wiring: the real pipeline thread must
+        // actually set the flag, or every pipelined read in the crate would end
+        // with the spurious error asserted above.
+        let real = ElementReader::from_path("tests/test.osm.pbf")
+            .unwrap()
+            .into_blocks_pipelined();
+        let mut blocks = 0;
+        for block in real {
+            block.expect("a well-formed file must not yield a pipeline error");
+            blocks += 1;
+        }
+        assert!(
+            blocks > 0,
+            "the fixture must deliver at least one block, or the loop above \
+             asserts nothing"
+        );
+
+        // Early termination must stay clean too: dropping the iterator part-way
+        // is a supported use (zipping, `take`), and must not turn into an error
+        // on the next call.
+        let mut partial = ElementReader::from_path("tests/test.osm.pbf")
+            .unwrap()
+            .into_blocks_pipelined();
+        partial
+            .next()
+            .expect("at least one block")
+            .expect("first block must decode");
+        drop(partial);
     }
 }

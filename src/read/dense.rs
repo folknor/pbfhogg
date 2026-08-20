@@ -183,6 +183,14 @@ impl<'a> Iterator for DenseNodeIter<'a> {
                 //   Each node's tags are a run of (key_index, val_index) pairs,
                 //   terminated by a single 0 varint delimiter.
                 let tag_start = self.kv_pos;
+                // `tag_end` trails `kv_pos`: it advances only over complete
+                // (key, val) pairs, so it never includes the 0 delimiter and
+                // never includes a partial trailing varint. Deriving it by
+                // subtracting one byte from `kv_pos` instead - on the
+                // assumption that the run always ended at a delimiter - chopped
+                // the last byte of the final value varint whenever `keys_vals`
+                // ran out without a trailing delimiter.
+                let mut tag_end = self.kv_pos;
                 let mut cursor = Cursor::new(&self.kv_data[self.kv_pos..]);
 
                 // Scan forward, decoding varints until we hit a 0 key.
@@ -190,32 +198,30 @@ impl<'a> Iterator for DenseNodeIter<'a> {
                     let before = cursor.remaining();
                     match cursor.read_varint() {
                         Ok(0) => {
-                            // 0 delimiter found. Record position past the delimiter.
-                            let consumed = before - cursor.remaining();
-                            self.kv_pos += consumed;
+                            // 0 delimiter found. Step kv_pos past the
+                            // delimiter; tag_end stays before it.
+                            self.kv_pos += before - cursor.remaining();
                             break;
                         }
                         Ok(_key) => {
-                            // Skip the corresponding value varint
+                            // Skip the corresponding value varint. A key with
+                            // no value is malformed input; leave both cursors
+                            // at the last complete pair and stop.
                             if cursor.read_varint().is_err() {
+                                self.kv_pos = self.kv_data.len();
                                 break;
                             }
-                            let consumed = before - cursor.remaining();
-                            self.kv_pos += consumed;
+                            self.kv_pos += before - cursor.remaining();
+                            tag_end = self.kv_pos;
                         }
-                        Err(_) => break,
+                        Err(_) => {
+                            self.kv_pos = self.kv_data.len();
+                            break;
+                        }
                     }
                 }
 
-                // tag_bytes covers the key-value pairs for this node (before the 0 delimiter).
-                // The kv_pos now points past the 0 delimiter for the next node.
-                let tag_end = self.kv_pos.saturating_sub(if tag_start < self.kv_pos {
-                    // Subtract the size of the 0 delimiter varint (always 1 byte: 0x00)
-                    1
-                } else {
-                    0
-                });
-                let tag_bytes = &self.kv_data[tag_start..tag_end.min(self.kv_data.len())];
+                let tag_bytes = &self.kv_data[tag_start..tag_end];
 
                 Some(DenseNode {
                     block: self.block,
@@ -318,6 +324,15 @@ impl<'a> DenseNodeInfo<'a> {
 }
 
 /// An iterator over dense nodes info. It decodes the delta encoded values.
+///
+/// `next` returns `None` as soon as any of the five core arrays runs out,
+/// which on a short array would silently blank the metadata of every remaining
+/// node in the group rather than reporting corruption. `Iterator::next` cannot
+/// report anything, so the invariant is enforced one layer up instead:
+/// `validate_dense_info_arrays` in `block.rs` runs at every `PrimitiveBlock`
+/// constructor and rejects a `denseinfo` whose arrays are neither absent nor
+/// exactly as long as the id array. By the time this iterator exists, the only
+/// way to run out early is to have had nothing to begin with.
 pub struct DenseNodeInfoIter<'a> {
     block: &'a WireBlock<'static>,
     versions: PackedInt32Iter<'a>,

@@ -90,6 +90,7 @@ pub(super) struct SlimInterpWay {
 #[derive(Default)]
 struct NodeBlobOut {
     addr_points: Vec<PendingAddrPoint>,
+    error: Option<String>,
 }
 
 /// Pending address point - used by both Phase 2a (addr-tagged nodes) and
@@ -125,6 +126,14 @@ struct CoordMmapShared {
     len: usize,
 }
 
+// The coordinate mmap spells absence with the crate's one slot encoding -
+// latitude biased by 90 degrees so bit 31 is a free presence flag - rather
+// than with an all-zero word. Spelling absence as all-zero used to make a
+// node at Null Island indistinguishable from an unwritten slot, silently
+// dropping the way that referenced it. The encoding is shared with the ALTW
+// sparse store; see `crate::coord_pack` for the layout and its tests.
+use crate::coord_pack::{pack as pack_coord, unpack as unpack_coord};
+
 // SAFETY: `ptr` is only dereferenced through `write_coord`, which writes
 // 8 bytes at a disjoint offset per call. See the invariants on the
 // struct docs.
@@ -138,7 +147,7 @@ impl CoordMmapShared {
     ///
     /// See struct-level docs. Caller must ensure no two workers pass the
     /// same `rank` concurrently, and that `rank * 8 + 8 <= self.len`.
-    unsafe fn write_coord(&self, rank: u64, lat_e7: i32, lon_e7: i32) {
+    unsafe fn write_coord(&self, rank: u64, packed: u64) {
         #[allow(clippy::cast_possible_truncation)]
         let off = (rank as usize) * 8;
         debug_assert!(
@@ -146,14 +155,12 @@ impl CoordMmapShared {
             "CoordMmapShared: rank {rank} (offset {off}) out of bounds (len {})",
             self.len
         );
-        let lat_bytes = lat_e7.to_le_bytes();
-        let lon_bytes = lon_e7.to_le_bytes();
+        let bytes = packed.to_le_bytes();
         // SAFETY: caller guarantees disjoint ranks and in-bounds `off`
         // (debug_assert above catches regressions during testing).
         unsafe {
             let p = self.ptr.add(off);
-            std::ptr::copy_nonoverlapping(lat_bytes.as_ptr(), p, 4);
-            std::ptr::copy_nonoverlapping(lon_bytes.as_ptr(), p.add(4), 4);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, 8);
         }
     }
 }
@@ -252,30 +259,8 @@ fn classify_way_into(
             #[allow(clippy::cast_possible_truncation)]
             let r = referenced_nodes.rank(nid) as usize;
             let off = r * 8;
-            let lat = i32::from_le_bytes(coord_slice.get(off..off + 4)?.try_into().ok()?);
-            let lon = i32::from_le_bytes(coord_slice.get(off + 4..off + 8)?.try_into().ok()?);
-            // KNOWN LIMITATION: (0, 0) doubles as the "unresolved" sentinel
-            // for the coord mmap (zero-filled on creation, see Pass 2 write
-            // path) AND as a legitimate OSM node at Null Island off the
-            // African coast. A real node at 0, 0 - periodically created by
-            // broken edits, test fixtures, and GPS-zero errors - is
-            // silently dropped here.
-            //
-            // This is now the last coordinate index in the crate that spells
-            // absence as all-zero. add-locations-to-ways stopped doing so:
-            // its sparse store biases latitude by 90 degrees, which puts
-            // every legal latitude below 2^31 and frees bit 31 of the low
-            // word as an explicit presence flag - exact, and no extra memory
-            // or extra pass, so the "presence bitmap is too expensive"
-            // argument that used to justify this site no longer holds. The
-            // same trick fits this eight-byte slot. See
-            // `src/commands/altw/sparse.rs` and CORRECTNESS.md "Null Island
-            // ambiguity in coordinate indexes".
-            if lat == 0 && lon == 0 {
-                None
-            } else {
-                Some((lat, lon))
-            }
+            let packed = u64::from_le_bytes(coord_slice.get(off..off + 8)?.try_into().ok()?);
+            unpack_coord(packed)
         })
         .collect();
     if coords.is_empty() {
@@ -445,6 +430,7 @@ pub(super) fn run_pass2(
         };
         let coord_ref = &coord_shared;
         let mut merge_err: Option<std::io::Error> = None;
+        let mut semantic_err: Option<String> = None;
         crate::scan::classify::parallel_classify_phase(
             shared_file,
             node_schedule,
@@ -452,42 +438,61 @@ pub(super) fn run_pass2(
             NodeBlobOut::default,
             |block, state: &mut NodeBlobOut| -> NodeBlobOut {
                 for element in block.elements_skip_metadata() {
-                    if let Element::DenseNode(node) = element {
-                        let lat_e7 = node.decimicro_lat();
-                        let lon_e7 = node.decimicro_lon();
-                        if let Some(rank) = referenced_ref.rank_if_set(node.id()) {
-                            // SAFETY: disjoint ranks guaranteed by sorted PBF +
-                            // unique rank-per-id in IdSet. See CoordMmapShared docs.
-                            unsafe {
-                                coord_ref.write_coord(rank, lat_e7, lon_e7);
+                    macro_rules! process_node {
+                        ($node:expr) => {{
+                            let node = $node;
+                            let lat_e7 = node.decimicro_lat();
+                            let lon_e7 = node.decimicro_lon();
+                            let Some(packed) = pack_coord(lat_e7, lon_e7) else {
+                                state.error = Some(format!(
+                                    "node {} has coordinates outside the geographic domain (lat {lat_e7}, lon {lon_e7} in decimicrodegrees)",
+                                    node.id()
+                                ));
+                                continue;
+                            };
+                            if let Some(rank) = referenced_ref.rank_if_set(node.id()) {
+                                // SAFETY: disjoint ranks guaranteed by sorted PBF +
+                                // unique rank-per-id in IdSet. See CoordMmapShared docs.
+                                unsafe {
+                                    coord_ref.write_coord(rank, packed);
+                                }
                             }
-                        }
-                        let mut hn: Option<&str> = None;
-                        let mut st: Option<&str> = None;
-                        let mut pc: Option<&str> = None;
-                        for (k, v) in node.tags() {
-                            match k {
-                                "addr:housenumber" => hn = Some(v),
-                                "addr:street" => st = Some(v),
-                                "addr:postcode" => pc = Some(v),
-                                _ => {}
+                            let mut hn: Option<&str> = None;
+                            let mut st: Option<&str> = None;
+                            let mut pc: Option<&str> = None;
+                            for (k, v) in node.tags() {
+                                match k {
+                                    "addr:housenumber" => hn = Some(v),
+                                    "addr:street" => st = Some(v),
+                                    "addr:postcode" => pc = Some(v),
+                                    _ => {}
+                                }
                             }
-                        }
-                        if let (Some(h), Some(s)) = (hn, st) {
-                            state.addr_points.push(PendingAddrPoint {
-                                lat_e7,
-                                lon_e7,
-                                hn: h.into(),
-                                st: s.into(),
-                                pc: pc.map(Into::into),
-                            });
-                        }
+                            if let (Some(h), Some(s)) = (hn, st) {
+                                state.addr_points.push(PendingAddrPoint {
+                                    lat_e7,
+                                    lon_e7,
+                                    hn: h.into(),
+                                    st: s.into(),
+                                    pc: pc.map(Into::into),
+                                });
+                            }
+                        }};
+                    }
+                    match element {
+                        Element::DenseNode(node) => process_node!(node),
+                        Element::Node(node) => process_node!(node),
+                        _ => {}
                     }
                 }
                 std::mem::take(state)
             },
             |_seq, out| {
-                if merge_err.is_some() {
+                if merge_err.is_some() || semantic_err.is_some() {
+                    return;
+                }
+                if let Some(error) = out.error {
+                    semantic_err = Some(error);
                     return;
                 }
                 for pap in out.addr_points {
@@ -514,6 +519,9 @@ pub(super) fn run_pass2(
             },
         )?;
         if let Some(e) = merge_err {
+            return Err(e.into());
+        }
+        if let Some(e) = semantic_err {
             return Err(e.into());
         }
     }

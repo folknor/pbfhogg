@@ -822,6 +822,505 @@ fn synthetic_build_query_and_api_equivalence() {
 }
 
 #[test]
+fn null_island_street_vertex_is_not_treated_as_absent() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+    write_test_pbf_sorted(
+        &input,
+        &[
+            TestNode {
+                id: 1,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 0,
+                lon: 10_000,
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "residential"), ("name", "Null Island Road")],
+            meta: None,
+        }],
+        &[],
+    );
+    let stats = pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir.clone(),
+            force: false,
+            ..Default::default()
+        },
+    )
+    .expect("Null Island is a real coordinate");
+    assert_eq!(stats.street_ways, 1);
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("open index");
+    let result = reader.query(0.0, 0.0);
+    assert_eq!(
+        result.street.expect("street at Null Island").name,
+        "Null Island Road"
+    );
+}
+
+#[test]
+fn legal_non_dense_nodes_build_a_queryable_index() {
+    let dir = TempDir::new().expect("tempdir");
+    let dense = dir.path().join("dense.osm.pbf");
+    let input = dir.path().join("non-dense.osm.pbf");
+    let index_dir = dir.path().join("index");
+    write_synthetic_indexed_input(&dense);
+    let status = std::process::Command::new("osmium")
+        .args(["cat", "-f", "pbf,pbf_dense_nodes=false", "-o"])
+        .arg(&input)
+        .arg(&dense)
+        .status()
+        .expect("run osmium to produce a legal non-dense fixture");
+    assert!(status.success(), "osmium fixture conversion failed");
+    let stats = pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir.clone(),
+            force: true,
+            ..Default::default()
+        },
+    )
+    .expect("legal non-dense Node messages must be indexed");
+    assert_eq!(stats.addr_points, 1);
+    assert_eq!(stats.street_ways, 1);
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("open index");
+    let result = reader.query(55.70005, 12.5005);
+    assert!(
+        result.address.is_some(),
+        "non-dense address node must be queryable"
+    );
+    assert!(
+        result.street.is_some(),
+        "way coordinates from non-dense nodes must be queryable"
+    );
+}
+
+#[test]
+fn builder_refuses_a_truly_empty_index() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+    write_test_pbf_sorted(
+        &input,
+        &[TestNode {
+            id: 1,
+            lat: 557_000_000,
+            lon: 125_000_000,
+            tags: vec![],
+            meta: None,
+        }],
+        &[],
+        &[],
+    );
+    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir,
+            force: false,
+            ..Default::default()
+        },
+    )
+    .expect_err("a build with no queryable records must fail");
+    assert!(
+        err.to_string()
+            .contains("refusing to publish an empty index"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn reader_rejects_hostile_entry_offset_instead_of_panicking() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+    write_synthetic_indexed_input(&input);
+    pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir.clone(),
+            force: false,
+            ..Default::default()
+        },
+    )
+    .expect("build index");
+    let cells_path = index_dir.join("geo_cells.bin");
+    let mut cells = std::fs::read(&cells_path).expect("read cells");
+    cells[16..24].copy_from_slice(&(u64::MAX - 1).to_le_bytes());
+    std::fs::write(&cells_path, cells).expect("corrupt offset");
+    let err = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
+        .err()
+        .expect("hostile offset must be a typed open error");
+    assert!(
+        err.to_string().contains("address entry offset"),
+        "unexpected error: {err}"
+    );
+}
+
+/// A forced rebuild whose *input* is bad must not touch the existing index.
+/// Invalidation is destructive and irreversible - a geocode index is a
+/// directory of 19 files with no atomic replace - so it may only happen after
+/// every read-only check on the input has passed. A typo in the input path is
+/// the commonest way to reach this code, and it must cost nothing.
+/// Reader open-time validation must cover every offset-into-a-file
+/// relationship in the format, not just the geo entry lists. Validating some
+/// of the kinds and not the others is how a truncated file opens successfully
+/// and then silently answers with incomplete results: every read path is
+/// individually bounds-safe and returns "nothing here" rather than an error,
+/// so the caller cannot tell a truncated list from an empty one.
+#[test]
+fn reader_rejects_every_out_of_bounds_offset_kind() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let good = dir.path().join("good");
+    write_all_record_kinds_input(&input);
+    let stats = pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: good.clone(),
+            force: false,
+            ..Default::default()
+        },
+    )
+    .expect("build index");
+    assert!(
+        stats.addr_points > 0
+            && stats.street_ways > 0
+            && stats.interp_ways > 0
+            && stats.admin_polygons > 0,
+        "fixture must populate every record kind, got {stats:?}"
+    );
+    pbfhogg::geocode_index::reader::Reader::open(&good)
+        .expect("the pristine index must open, or every case below is vacuous");
+
+    // (file to corrupt, byte range holding the offset, substring of the
+    // expected error). One case per offset kind in the format.
+    let cases: &[(&str, std::ops::Range<usize>, &str)] = &[
+        ("admin_cells.bin", 8..12, "admin entry"),
+        ("street_ways.bin", 0..8, "street way node"),
+        ("interp_ways.bin", 0..8, "interpolation way node"),
+        ("admin_polygons.bin", 4..8, "admin polygon vertex"),
+    ];
+    for (file, range, expected) in cases {
+        let index_dir = dir.path().join(format!("case-{file}"));
+        copy_dir(&good, &index_dir);
+        let path = index_dir.join(file);
+        let mut bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {file}: {e}"));
+        assert!(
+            bytes.len() >= range.end,
+            "{file} is empty in the fixture, so this case proves nothing"
+        );
+        let poison = vec![0xFEu8; range.len()];
+        bytes[range.clone()].copy_from_slice(&poison);
+        std::fs::write(&path, bytes).unwrap_or_else(|e| panic!("write {file}: {e}"));
+
+        let err = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
+            .err()
+            .unwrap_or_else(|| panic!("{file}: out-of-bounds offset must fail open, not open"));
+        assert!(
+            err.to_string().contains(expected),
+            "{file}: expected an error mentioning {expected}, got: {err}"
+        );
+    }
+}
+
+/// One input that populates every record kind at once: address points,
+/// street ways, interpolation ways and admin polygons. The offset-validation
+/// test needs all four non-empty, or its cases are vacuous.
+fn write_all_record_kinds_input(path: &Path) {
+    write_test_pbf_sorted(
+        path,
+        &all_record_kinds_nodes(),
+        &[
+            TestWay {
+                id: 10,
+                refs: vec![1, 2],
+                tags: vec![("highway", "residential"), ("name", "Main Street")],
+                meta: None,
+            },
+            TestWay {
+                id: 20,
+                refs: vec![10, 11, 12, 13, 10],
+                tags: vec![],
+                meta: None,
+            },
+            TestWay {
+                id: 200,
+                refs: vec![100, 101],
+                tags: vec![
+                    ("addr:interpolation", "even"),
+                    ("addr:street", "Interp Street"),
+                ],
+                meta: None,
+            },
+        ],
+        &[TestRelation {
+            id: 30,
+            members: vec![TestMember {
+                id: MemberId::Way(20),
+                role: "outer",
+            }],
+            tags: vec![
+                ("type", "boundary"),
+                ("boundary", "administrative"),
+                ("admin_level", "2"),
+                ("name", "Syntheticland"),
+                ("ISO3166-1:alpha2", "SL"),
+            ],
+            meta: None,
+        }],
+    );
+}
+
+fn all_record_kinds_nodes() -> Vec<TestNode> {
+    vec![
+        TestNode {
+            id: 1,
+            lat: 557_000_000,
+            lon: 125_000_000,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 2,
+            lat: 557_000_000,
+            lon: 125_010_000,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 3,
+            lat: 557_000_500,
+            lon: 125_005_000,
+            tags: vec![
+                ("addr:housenumber", "10"),
+                ("addr:street", "Main Street"),
+                ("addr:postcode", "1234"),
+            ],
+            meta: None,
+        },
+        TestNode {
+            id: 10,
+            lat: 556_990_000,
+            lon: 124_990_000,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 11,
+            lat: 556_990_000,
+            lon: 125_020_000,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 12,
+            lat: 557_010_000,
+            lon: 125_020_000,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 13,
+            lat: 557_010_000,
+            lon: 124_990_000,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 100,
+            lat: 557_002_000,
+            lon: 125_000_000,
+            tags: vec![("addr:housenumber", "10"), ("addr:street", "Interp Street")],
+            meta: None,
+        },
+        TestNode {
+            id: 101,
+            lat: 557_002_000,
+            lon: 125_006_000,
+            tags: vec![("addr:housenumber", "30"), ("addr:street", "Interp Street")],
+            meta: None,
+        },
+    ]
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("create dir");
+    for entry in std::fs::read_dir(from).expect("read_dir") {
+        let entry = entry.expect("dir entry");
+        if entry.file_type().expect("file type").is_file() {
+            std::fs::copy(entry.path(), to.join(entry.file_name())).expect("copy");
+        }
+    }
+}
+
+#[test]
+fn force_with_bad_input_leaves_the_existing_index_intact() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+    write_synthetic_indexed_input(&input);
+    pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir.clone(),
+            force: false,
+            ..Default::default()
+        },
+    )
+    .expect("initial build");
+    let before = std::fs::read(index_dir.join("geocode_header.bin")).expect("header exists");
+
+    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: dir.path().join("missing.pbf"),
+            output_dir: index_dir.clone(),
+            force: true,
+            ..Default::default()
+        },
+    )
+    .expect_err("a forced rebuild from a nonexistent input must fail");
+
+    let after = std::fs::read(index_dir.join("geocode_header.bin")).unwrap_or_else(|e| {
+        panic!(
+            "a failed force rebuild must not remove the existing header ({e}); build error: {err}"
+        )
+    });
+    assert_eq!(
+        before, after,
+        "a failed force rebuild must leave the header byte-identical"
+    );
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
+        .expect("the surviving index must still open and answer queries");
+    assert!(
+        reader.query(55.70005, 12.5005).address.is_some(),
+        "the surviving index must still resolve what it resolved before"
+    );
+}
+
+/// The other half of the same contract: a forced rebuild that gets *past*
+/// input validation and then dies must leave a directory that fails to open,
+/// not one that opens and mixes two vintages. The header is removed before
+/// Pass 2 writes, so a mid-build death is detectable.
+#[test]
+fn force_invalidates_the_header_before_pass_two_writes() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+    write_synthetic_indexed_input(&input);
+    pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input.clone(),
+            output_dir: index_dir.clone(),
+            force: false,
+            ..Default::default()
+        },
+    )
+    .expect("initial build");
+
+    // A second input that passes every read-only check but yields nothing
+    // indexable, so the build fails in Pass 2 - after invalidation.
+    let empty = dir.path().join("empty.osm.pbf");
+    write_test_pbf_sorted(
+        &empty,
+        &[TestNode {
+            id: 1,
+            lat: 557_000_000,
+            lon: 125_000_000,
+            tags: vec![],
+            meta: None,
+        }],
+        &[],
+        &[],
+    );
+    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: empty,
+            output_dir: index_dir.clone(),
+            force: true,
+            ..Default::default()
+        },
+    )
+    .expect_err("a build with no queryable records must fail");
+    assert!(
+        !index_dir.join("geocode_header.bin").exists(),
+        "a rebuild that died after invalidation must leave no valid-looking \
+         header; error: {err}"
+    );
+    assert!(
+        pbfhogg::geocode_index::reader::Reader::open(&index_dir).is_err(),
+        "the half-rewritten directory must not open"
+    );
+}
+
+/// The sampling budget is enforced at config validation, before any input is
+/// read, because that is the only place the work can be bounded without ever
+/// discarding coverage. This asserts the bound is *enforced*, not that a
+/// typical segment happens to be cheap: level 20 is a legal S2 level and a
+/// legal value for the CLI flag, and it must be refused.
+#[test]
+fn levels_past_the_sampling_budget_are_refused_before_reading_input() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+    write_synthetic_indexed_input(&input);
+    let cases: [(&str, u8, u8, u8); 3] = [
+        ("street", 20, 14, 10),
+        ("coarse", 21, 20, 10),
+        ("admin", 17, 14, 20),
+    ];
+    for (name, street, coarse, admin) in cases {
+        let err = pbfhogg::geocode_index::builder::build_geocode_index(
+            &pbfhogg::geocode_index::builder::BuildConfig {
+                input_path: input.clone(),
+                output_dir: index_dir.clone(),
+                force: true,
+                street_level: street,
+                coarse_level: coarse,
+                admin_level: admin,
+                ..Default::default()
+            },
+        )
+        .expect_err("a level past the sampling budget must be refused");
+        assert!(
+            err.to_string().contains("S2 level must be in 0..=19"),
+            "{name}: unexpected error: {err}"
+        );
+        assert!(
+            !index_dir.exists(),
+            "{name}: rejection must happen before any output directory is created"
+        );
+    }
+
+    // The boundary is a boundary, not a blanket refusal: the highest accepted
+    // level must actually build. Without this the test above would still pass
+    // if the cap were lowered to zero.
+    pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir,
+            force: true,
+            street_level: 19,
+            coarse_level: 14,
+            admin_level: 10,
+            ..Default::default()
+        },
+    )
+    .expect("the highest accepted level must build");
+}
+
+#[test]
 fn coarse_fallback_recovers_hits_outside_fine_radius() {
     let dir = TempDir::new().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");

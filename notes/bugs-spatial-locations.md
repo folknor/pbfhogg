@@ -51,6 +51,37 @@ The recursion and stack-overflow defect was fixed in round 2 with explicit
 stacks. This topology sub-point remains open because no topology-preserving
 replacement or biting real caller-order fixture was established in this round.
 
+Precise scope, so this does not have to be rediscovered:
+
+- **Producer.** `src/geo.rs` Douglas-Peucker, called from
+  `geocode_index/builder/admin.rs::assemble_one_relation`, which simplifies
+  every outer and inner ring of every admin relation.
+- **Knob.** `--max-admin-vertices`, default 500. It is a *vertex count*, not a
+  distance tolerance, so the effective simplification epsilon is whatever it
+  takes to reach 500 vertices. A country boundary is therefore simplified far
+  more aggressively than a municipality, which makes a topology flip most
+  likely exactly where the ring is longest. This is the same finding as the
+  uniform-cap entry in `notes/bugs-geocode-index.md`, seen from the other end.
+- **Consumer, and why it matters most here.**
+  `geocode_index/reader.rs` runs `geo::point_in_polygon` against the simplified
+  rings for every admin result. A self-intersection near the boundary makes the
+  even-odd crossing count wrong on one side of the fold, so a query resolves to
+  the wrong administrative area - a wrong answer, not a missing one, and one
+  that no validation in the reader can detect because the ring is well-formed
+  as a byte sequence.
+- **Blast radius.** Bounded to points within the simplification error of a
+  boundary, which for a country-scale ring at 500 vertices can be kilometres.
+- **What a fix needs.** Either a topology-preserving simplifier (reject a
+  candidate removal whose new segment crosses another segment of the same or a
+  sibling ring), or a metric tolerance in place of the vertex cap so the error
+  is bounded in metres rather than in vertices. The structural rewrite proposed
+  in `notes/bugs-geocode-index.md` - an `s2::RegionCoverer` over a real loop
+  region - would let the cap become a tolerance, which is why the two are
+  worth doing together.
+- **What is missing to act.** A fixture: a ring whose DP simplification at a
+  given cap provably self-intersects, plus a query point whose containment
+  flips. Round 2 did not establish one, and without it any fix is unfalsifiable.
+
 ## Round-2 closing notes (2026-08-20)
 
 **A fifth exact-versus-conservative bypass existed.** Round 2 separated

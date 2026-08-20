@@ -11,6 +11,7 @@ use std::path::Path;
 
 use s2::cellid::CellID;
 use s2::latlng::LatLng;
+use s2::metric::MIN_WIDTHMETRIC;
 
 use super::Result;
 use super::admin::AssembledPolygon;
@@ -55,12 +56,84 @@ pub(super) struct AdminCellEntry {
 // S2 cell covering for line segments
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Segment sampling budget
+//
+// `cover_segment` walks a segment in steps of a fixed fraction of the
+// globally smallest S2 cell width for the level, so the sample count for one
+// segment is `segment_span / step(level)` and `step(level)` halves with every
+// level. The count therefore doubles per level, without limit.
+//
+// The previous implementation capped the walk at 256 steps, which bounded the
+// work but silently returned an incomplete cover for anything longer - the bug
+// this pass set out to fix. Lifting the cap without bounding the level trades
+// silent under-coverage for unbounded work: at level 30 a single
+// antimeridian-crossing segment needs on the order of 10^10 samples and the
+// same number of hash-set insertions, which is a hang and an OOM, not a build.
+//
+// Both are wrong, so the work is bounded at the only place where it can be
+// bounded without ever discarding coverage: the level. The segment span is not
+// data-dependent in the way it first appears - `pack`/`unpack` (see
+// `crate::coord_pack`) refuse any coordinate outside +/-90 latitude and +/-180
+// longitude, so two legal endpoints are at most `hypot(180, 360)` degrees apart
+// in the flat metric this sampler measures with. The worst-case sample count is
+// therefore a pure function of the level, computable up front, and
+// `MAX_BUILD_S2_LEVEL` is the largest level whose worst case still fits the
+// budget. `BuildConfig::validate` rejects anything higher with an explicit
+// error before a single blob is read.
+//
+// This is a bound, not the right long-term answer. Sampling a segment at
+// sub-cell resolution is inherently quadratic in the wrong places; the
+// structural fix is an exact S2 edge traversal, or an `S2RegionCoverer` over a
+// loop region as in `research/traccar-geocoder`. That rewrite is tracked in
+// `notes/bugs-geocode-index.md` and is deliberately not attempted here.
+// ---------------------------------------------------------------------------
+
+/// Per-segment sampling budget: 2^24 points. In the pathological case that
+/// is roughly 270 MB of dedup set on one rayon worker and a few seconds; in
+/// every real case - OSM segments are a small fraction of a degree - it is a
+/// handful of samples and the budget never comes near being spent.
+const MAX_SEGMENT_SAMPLES: f64 = 16_777_216.0;
+
+/// Largest separation two legal coordinates can have in the flat degree
+/// metric `cover_segment` measures with: `hypot(180, 360)` = 402.5, rounded
+/// up. Latitude spans at most 180 degrees and longitude at most 360.
+const MAX_SEGMENT_SPAN_DEG: f64 = 405.0;
+
+/// Highest S2 level the builder accepts for any of its three cell levels.
+///
+/// Pinned to `MAX_SEGMENT_SAMPLES` by `level_exceeds_sampling_budget` and by
+/// the unit test below, which walks every level and asserts this is exactly
+/// the boundary - raising the constant without raising the budget fails the
+/// test rather than reintroducing the hang.
+pub(in crate::geocode_index) const MAX_BUILD_S2_LEVEL: u8 = 19;
+
+/// Sampling step for `level`, in degrees: a little under half the globally
+/// smallest S2 cell width at that level, so no cell can be stepped over.
+fn segment_step_degrees(level: u8) -> f64 {
+    MIN_WIDTHMETRIC.value(level).to_degrees() * 0.4
+}
+
+/// Samples the longest legal segment would need at `level`.
+fn worst_case_segment_samples(level: u8) -> f64 {
+    MAX_SEGMENT_SPAN_DEG / segment_step_degrees(level)
+}
+
+/// Whether `level` can make a single segment exceed the sampling budget.
+pub(in crate::geocode_index) fn level_exceeds_sampling_budget(level: u8) -> bool {
+    worst_case_segment_samples(level) > MAX_SEGMENT_SAMPLES
+}
+
 /// Cover a line segment by sampling intermediate points to find all S2 cells
 /// the segment passes through at the given level.
 ///
-/// Calls `emit(cell_id)` for each unique cell the segment crosses. No heap
-/// allocation - uses a small stack buffer for deduplication (most segments
-/// cross 1-4 cells).
+/// Calls `emit(cell_id)` once for each sampled cell the segment crosses.
+///
+/// `level` must have passed [`level_exceeds_sampling_budget`] - that is what
+/// `BuildConfig::validate` enforces. Given that, the sample count for any
+/// legal pair of endpoints is at most `MAX_SEGMENT_SAMPLES`; the clamp below
+/// is unreachable defense in depth against the formula and the domain drifting
+/// apart, and the debug assertion fires in tests if they ever do.
 fn cover_segment(
     lat1_e7: i32,
     lon1_e7: i32,
@@ -77,50 +150,40 @@ fn cover_segment(
     let c1 = CellID::from(LatLng::from_degrees(lat1, lon1)).parent(level as u64);
     let c2 = CellID::from(LatLng::from_degrees(lat2, lon2)).parent(level as u64);
 
-    emit(c1.0);
-    if c1.0 == c2.0 {
-        return;
-    }
-
-    // Walk intermediate points. Step size < half cell edge to catch crossings.
+    // Sample at less than half the globally-smallest S2 cell width for this
+    // level. Unlike the old hand-written table, this covers every valid level,
+    // and unlike the old 256-step cap it never returns a partial cover for a
+    // long segment: the work is bounded by rejecting the level, not by
+    // truncating the walk. See the budget commentary above.
     let dlat = lat2 - lat1;
     let dlon = lon2 - lon1;
     let seg_len_deg = (dlat.powi(2) + dlon.powi(2)).sqrt();
 
-    let step_deg = match level {
-        17 => 0.0003,
-        14 => 0.003,
-        10 => 0.005,
-        _ => 0.001,
-    };
+    let step_deg = segment_step_degrees(level);
 
+    let exact_steps = (seg_len_deg / step_deg).ceil();
+    debug_assert!(
+        exact_steps <= MAX_SEGMENT_SAMPLES,
+        "cover_segment at level {level} wants {exact_steps} samples, over the \
+         {MAX_SEGMENT_SAMPLES} budget: BuildConfig::validate should have \
+         rejected this level"
+    );
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    let steps = ((seg_len_deg / step_deg).ceil() as usize).clamp(2, 256);
-
-    // Stack-based dedup for the common case (1-8 cells per segment)
-    let mut seen = [0u64; 8];
-    seen[0] = c1.0;
-    let mut seen_count = 1usize;
-
-    for i in 1..steps {
+    let steps = (exact_steps.min(MAX_SEGMENT_SAMPLES) as usize).max(1);
+    let mut seen = rustc_hash::FxHashSet::default();
+    for i in 0..=steps {
         let t = i as f64 / steps as f64;
         let lat = lat1 + t * (lat2 - lat1);
         let lon = lon1 + t * (lon2 - lon1);
         let c = CellID::from(LatLng::from_degrees(lat, lon))
             .parent(level as u64)
             .0;
-        let already = seen[..seen_count].contains(&c);
-        if !already {
+        if seen.insert(c) {
             emit(c);
-            if seen_count < seen.len() {
-                seen[seen_count] = c;
-                seen_count += 1;
-            }
         }
     }
-    if !seen[..seen_count].contains(&c2.0) {
-        emit(c2.0);
-    }
+    debug_assert!(seen.contains(&c1.0));
+    debug_assert!(seen.contains(&c2.0));
 }
 
 // ---------------------------------------------------------------------------
@@ -833,36 +896,28 @@ fn admin_cells_for_polygon(
         })
         .collect();
 
-    // Interior cells: flood-fill from centroid using point_in_polygon (with holes)
-    let exterior_end = poly
-        .vertices
-        .iter()
-        .position(|v| *v == RING_SENTINEL)
-        .unwrap_or(poly.vertices.len());
-    let exterior = &poly.vertices[..exterior_end];
-    if exterior.len() < 3 {
-        return entries;
-    }
-
-    let (sum_lat, sum_lon, count) = exterior.iter().fold((0i64, 0i64, 0i64), |(sl, sn, c), v| {
-        (sl + v.lat_e7 as i64, sn + v.lon_e7 as i64, c + 1)
-    });
-    if count == 0 {
-        return entries;
-    }
-    let clat = sum_lat as f64 / count as f64 * 1e-7;
-    let clon = sum_lon as f64 / count as f64 * 1e-7;
-
-    // Centroid must be inside the polygon (exterior AND not in any hole)
-    if !crate::geo::point_in_polygon(clon, clat, &ext_f64, &hole_slices) {
-        return entries;
-    }
-
-    let seed = CellID::from(LatLng::from_degrees(clat, clon)).parent(admin_level as u64);
+    // Seed from every inside neighbor of every edge cell. This produces real
+    // interior points for concave polygons and reaches disconnected pockets
+    // that a single representative point cannot reach.
     let mut visited = rustc_hash::FxHashSet::default();
     let mut queue = std::collections::VecDeque::new();
-    visited.insert(seed.0);
-    queue.push_back(seed);
+    for &edge_id in &edge_cells {
+        let edge = CellID(edge_id);
+        for seed in edge.all_neighbors(admin_level as u64) {
+            if edge_cells.contains(&seed.0) || !visited.insert(seed.0) {
+                continue;
+            }
+            let center = LatLng::from(seed);
+            if crate::geo::point_in_polygon(
+                center.lng.deg(),
+                center.lat.deg(),
+                &ext_f64,
+                &hole_slices,
+            ) {
+                queue.push_back(seed);
+            }
+        }
+    }
 
     while let Some(cell) = queue.pop_front() {
         if edge_cells.contains(&cell.0) {
@@ -960,5 +1015,202 @@ mod tests {
 
         assert!(cells.contains(&c1), "first endpoint cell must be included");
         assert!(cells.contains(&c2), "second endpoint cell must be included");
+    }
+
+    /// The old implementation capped the walk at 256 steps, so it could emit
+    /// at most 257 cells for a segment of any length. The lower bound here is
+    /// what makes that a failure rather than a pass.
+    #[test]
+    fn cover_segment_long_segment_is_complete_and_unique() {
+        let mut cells = Vec::new();
+        cover_segment(
+            550_000_000,
+            120_000_000,
+            550_000_000,
+            130_000_000,
+            MAX_BUILD_S2_LEVEL,
+            |c| cells.push(c),
+        );
+        let unique: rustc_hash::FxHashSet<_> = cells.iter().copied().collect();
+        assert_eq!(
+            cells.len(),
+            unique.len(),
+            "each crossed cell must be emitted once"
+        );
+        assert!(
+            cells.len() > 1_000,
+            "the old 256-step cap must not survive: got {} cells",
+            cells.len()
+        );
+    }
+
+    /// `MAX_BUILD_S2_LEVEL` is not a taste judgement, it is exactly the
+    /// boundary of `MAX_SEGMENT_SAMPLES`. Walking every level and asserting
+    /// the boundary lands where the constant says it does means the constant
+    /// cannot be raised without raising the budget it is derived from - which
+    /// is the whole enforcement mechanism for the unbounded-work hazard.
+    #[test]
+    fn max_build_level_is_exactly_the_sampling_budget_boundary() {
+        for level in 0..=MAX_BUILD_S2_LEVEL {
+            assert!(
+                !level_exceeds_sampling_budget(level),
+                "level {level} is accepted but its worst case is {} samples, over the \
+                 {MAX_SEGMENT_SAMPLES} budget",
+                worst_case_segment_samples(level)
+            );
+        }
+        assert!(
+            level_exceeds_sampling_budget(MAX_BUILD_S2_LEVEL + 1),
+            "level {} must be over budget, otherwise the cap is lower than it needs to be \
+             and rejects levels that build fine",
+            MAX_BUILD_S2_LEVEL + 1
+        );
+        // The budget must actually bind somewhere below the S2 format limit,
+        // or the whole bound is vacuous.
+        assert!(
+            level_exceeds_sampling_budget(30),
+            "level 30 must be over budget: it is the level that motivated the bound"
+        );
+    }
+
+    /// The analytic worst case is only a bound if the implementation really
+    /// respects it. A full-longitude segment is the widest thing a legal pair
+    /// of coordinates can produce, so its actual emission count must fall
+    /// under `worst_case_segment_samples` for the level.
+    #[test]
+    fn widest_legal_segment_stays_under_its_analytic_worst_case() {
+        const LEVEL: u8 = 12;
+        let mut emitted = 0usize;
+        cover_segment(
+            -900_000_000,
+            -1_800_000_000,
+            900_000_000,
+            1_800_000_000,
+            LEVEL,
+            |_| emitted += 1,
+        );
+        let bound = worst_case_segment_samples(LEVEL);
+        assert!(
+            (emitted as f64) <= bound,
+            "widest legal segment emitted {emitted} cells at level {LEVEL}, over the \
+             analytic bound of {bound}"
+        );
+        assert!(
+            emitted > 1_000,
+            "the widest legal segment must produce a real cover, got {emitted} cells"
+        );
+    }
+
+    #[test]
+    fn concave_polygon_gets_interior_cells_when_vertex_mean_is_outside() {
+        // A U shape whose vertex average lies in the open notch.
+        let vertices = vec![
+            (0, 0),
+            (0, 60_000_000),
+            (60_000_000, 60_000_000),
+            (60_000_000, 40_000_000),
+            (20_000_000, 40_000_000),
+            (20_000_000, 20_000_000),
+            (60_000_000, 20_000_000),
+            (60_000_000, 0),
+            (0, 0),
+        ]
+        .into_iter()
+        .map(|(lat_e7, lon_e7)| NodeCoord { lat_e7, lon_e7 })
+        .collect();
+        let poly = AssembledPolygon {
+            admin_level: 8,
+            name_offset: 0,
+            country_code_offset: 0,
+            area: 1.0,
+            vertices,
+        };
+        // The fixture is only meaningful if its vertex average really does
+        // land in the open notch: that average is what the old centroid seed
+        // used, and a fixture whose average happened to be inside would pass
+        // against the bug it was written to catch.
+        let (sum_lat, sum_lon, n) = poly
+            .vertices
+            .iter()
+            .fold((0i64, 0i64, 0i64), |(sl, sn, c), v| {
+                (sl + i64::from(v.lat_e7), sn + i64::from(v.lon_e7), c + 1)
+            });
+        let (mean_lat, mean_lon) = (
+            sum_lat as f64 / n as f64 * 1e-7,
+            sum_lon as f64 / n as f64 * 1e-7,
+        );
+        let (ext, holes) = parse_polygon_rings(&poly.vertices);
+        let hole_slices: Vec<&[(f64, f64)]> = holes.iter().map(Vec::as_slice).collect();
+        assert!(
+            !crate::geo::point_in_polygon(mean_lon, mean_lat, &ext, &hole_slices),
+            "fixture is not concave enough: the vertex mean ({mean_lat}, {mean_lon}) is \
+             inside the polygon, so the old centroid seed would have worked"
+        );
+
+        let entries = admin_cells_for_polygon(0, &poly, 8);
+        assert!(
+            entries.iter().any(|entry| entry.is_interior),
+            "concave polygon must retain interior coverage"
+        );
+    }
+
+    /// A U shape and a shape with two separate lobes are different tests. The
+    /// U only proves the seed can find *an* interior point; this proves the
+    /// seeding reaches interior regions that are disconnected from each other
+    /// in the cell grid.
+    ///
+    /// Two 3-degree square lobes joined by a corridor 0.01 degrees tall. A
+    /// level-8 cell is roughly 1.4 degrees across, so every corridor cell is
+    /// an edge cell and the two lobes' interior cells cannot reach each other
+    /// by flood fill. Any seeding strategy that starts from one point reaches
+    /// at most one lobe.
+    #[test]
+    fn two_disconnected_interior_lobes_are_both_covered() {
+        let vertices = vec![
+            (0, 0),
+            (30_000_000, 0),
+            (30_000_000, 30_000_000),
+            (15_100_000, 30_000_000),
+            (15_100_000, 100_000_000),
+            (30_000_000, 100_000_000),
+            (30_000_000, 130_000_000),
+            (0, 130_000_000),
+            (0, 100_000_000),
+            (15_000_000, 100_000_000),
+            (15_000_000, 30_000_000),
+            (0, 30_000_000),
+            (0, 0),
+        ]
+        .into_iter()
+        .map(|(lat_e7, lon_e7)| NodeCoord { lat_e7, lon_e7 })
+        .collect();
+        let poly = AssembledPolygon {
+            admin_level: 8,
+            name_offset: 0,
+            country_code_offset: 0,
+            area: 1.0,
+            vertices,
+        };
+
+        let entries = admin_cells_for_polygon(0, &poly, 8);
+        let mut west = 0usize;
+        let mut east = 0usize;
+        for entry in entries.iter().filter(|e| e.is_interior) {
+            let lon = LatLng::from(CellID(entry.cell_id)).lng.deg();
+            if lon < 3.0 {
+                west += 1;
+            } else if lon > 10.0 {
+                east += 1;
+            }
+        }
+        assert!(
+            west > 0,
+            "the west lobe must have interior cells (west {west}, east {east})"
+        );
+        assert!(
+            east > 0,
+            "the east lobe must have interior cells - a single seed reaches only one \
+             lobe (west {west}, east {east})"
+        );
     }
 }

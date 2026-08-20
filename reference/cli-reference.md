@@ -621,14 +621,50 @@ pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
 | Flag | Description |
 |------|-------------|
 | `--output-dir <DIR>` | Output directory for index files |
-| `--street-level <N>` | S2 cell level for streets/addresses [default: 17] |
-| `--coarse-level <N>` | Fallback cell level for rural areas [default: 14] |
-| `--admin-level <N>` | S2 cell level for admin boundaries [default: 10] |
+| `--street-level <N>` | S2 cell level for streets/addresses, 0-19 [default: 17] |
+| `--coarse-level <N>` | Fallback cell level for rural areas, 0-19 [default: 14] |
+| `--admin-level <N>` | S2 cell level for admin boundaries, 0-19 [default: 10] |
 | `--max-admin-vertices <N>` | Douglas-Peucker vertex cap per admin polygon [default: 500] |
 | `--search-radius <M>` | Fine-level max search distance in meters [default: 75] |
 | `--coarse-search-radius <M>` | Coarse-level max search distance in meters [default: 1000] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--force` | Proceed without indexdata / overwrite existing index |
+
+### S2 level bounds
+
+All three cell levels are validated before any input is read, and a violation
+exits 2 with an explicit message:
+
+- Each level must be in `0..=19`. The upper bound is 19, not the S2 format
+  limit of 30, because cell covering samples each way segment at a fraction of
+  the cell width for the level: the per-segment sample count doubles with every
+  level, and past 19 a single long or antimeridian-crossing segment exceeds the
+  builder's per-segment budget of 2^24 samples. Accepting such a level would
+  produce a build that never finishes rather than one that is merely slow.
+- `--coarse-level` must be strictly less than `--street-level`. The coarse
+  index is the fallback for rural queries and must be the coarser of the two.
+
+The *reader* is deliberately looser and accepts levels up to the S2 limit of
+30, since reading does no cell covering: an index written at a higher level by
+another producer stays readable.
+
+### Overwriting an existing index
+
+A geocode index is a directory of 19 files, and there is no atomic replace for
+a non-empty directory. `--force` therefore invalidates rather than swaps: it
+removes the header file so that a build which dies partway leaves a directory
+that fails to open, rather than one that opens and answers from a mixture of
+two vintages.
+
+Invalidation happens only after every read-only check on the input has passed -
+config validation, the indexdata requirement, the PBF header, and the relation
+and referenced-node passes. A bad input path, a missing file or a malformed PBF
+leaves the existing index untouched.
+
+A build that finds nothing queryable at all - no address points, no streets, no
+interpolation ways and no admin polygons - fails rather than publishing an empty
+index. Indexes containing only some of those kinds, such as an admin-boundaries
+extract, are legitimate and still build.
 
 Outputs 19 binary files. Denmark (465 MB PBF): ~7s, 172 MB index. Europe (32.4 GB): 524s (8.7 min), 7.5 GB RSS. Planet (87 GB): 1,255s (20.9 min), 29.5 GB peak RSS (pass-1.5 transient).
 

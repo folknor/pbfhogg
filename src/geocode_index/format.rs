@@ -14,8 +14,11 @@ pub const HEADER_MAGIC: [u8; 4] = *b"GIDX";
 /// (addr_offset and interp_offset changed from u32 to u64).
 pub const FORMAT_VERSION: u32 = 2;
 
-/// Sentinel value for "no data" in u32 offset fields.
 /// Sentinel value for "no data" in u64 offset fields.
+///
+/// There is no u32 counterpart: `AdminCell.entries_offset` is the only u32
+/// list offset and every admin cell has entries, so absence never needs
+/// spelling there.
 pub const NO_DATA_U64: u64 = u64::MAX;
 
 /// Interior cell hint flag (high bit on a u32 polygon index).
@@ -86,11 +89,29 @@ impl Header {
         if version != FORMAT_VERSION {
             return Err(FormatError::UnsupportedVersion(version));
         }
+        let street = buf[8];
+        let coarse = buf[9];
+        let admin = buf[10];
+        // 30 is the S2 format limit, deliberately looser than the builder's
+        // own `MAX_BUILD_S2_LEVEL`. The builder's cap comes from its segment
+        // sampling budget - a cost of *writing* an index, not a property of
+        // one - so an index written at a higher level by some other producer
+        // stays readable. Reading does no cell covering.
+        if street > 30 || coarse > 30 || admin > 30 {
+            return Err(FormatError::InvalidMetadata(format!(
+                "S2 cell levels must be in 0..=30, got street={street}, coarse={coarse}, admin={admin}"
+            )));
+        }
+        if coarse >= street {
+            return Err(FormatError::InvalidMetadata(format!(
+                "coarse S2 level ({coarse}) must be less than street S2 level ({street})"
+            )));
+        }
         Ok(Self {
             format_version: version,
-            street_cell_level: buf[8],
-            coarse_cell_level: buf[9],
-            admin_cell_level: buf[10],
+            street_cell_level: street,
+            coarse_cell_level: coarse,
+            admin_cell_level: admin,
             max_admin_vertices: u16::from_le_bytes([buf[12], buf[13]]),
             fine_search_radius_m: f32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
             coarse_search_radius_m: f32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]),
@@ -512,6 +533,7 @@ pub const FILE_STRINGS: &str = "strings.bin";
 pub enum FormatError {
     BadMagic,
     UnsupportedVersion(u32),
+    InvalidMetadata(String),
 }
 
 impl std::fmt::Display for FormatError {
@@ -523,6 +545,9 @@ impl std::fmt::Display for FormatError {
                     f,
                     "unsupported geocode index version {v} (expected {FORMAT_VERSION})"
                 )
+            }
+            Self::InvalidMetadata(message) => {
+                write!(f, "invalid geocode index metadata: {message}")
             }
         }
     }
@@ -537,6 +562,68 @@ impl std::error::Error for FormatError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn valid_header_bytes() -> [u8; HEADER_SIZE] {
+        Header {
+            format_version: FORMAT_VERSION,
+            street_cell_level: 17,
+            coarse_cell_level: 14,
+            admin_cell_level: 10,
+            max_admin_vertices: 500,
+            fine_search_radius_m: 75.0,
+            coarse_search_radius_m: 1000.0,
+            replication_sequence: 0,
+            replication_timestamp: 0,
+            addr_point_count: 0,
+            street_way_count: 0,
+            interp_way_count: 0,
+            admin_polygon_count: 0,
+            geo_cell_count: 0,
+            coarse_cell_count: 0,
+            admin_cell_count: 0,
+        }
+        .to_bytes()
+    }
+
+    /// Every level field, not just the street level. A test that pokes one of
+    /// three byte positions cannot tell a check on all three from a check on
+    /// the one it happens to poke.
+    #[test]
+    fn header_rejects_out_of_range_s2_levels_in_every_field() {
+        assert!(
+            Header::from_bytes(&valid_header_bytes()).is_ok(),
+            "the baseline header must parse, or every case below is vacuous"
+        );
+        for (name, byte) in [("street", 8usize), ("coarse", 9), ("admin", 10)] {
+            let mut header = valid_header_bytes();
+            header[byte] = 31;
+            let err = Header::from_bytes(&header)
+                .expect_err("an out-of-range S2 level must be rejected while reading");
+            assert!(
+                err.to_string().contains("S2 cell levels must be in 0..=30"),
+                "{name}: unexpected error: {err}"
+            );
+        }
+    }
+
+    /// The ordering rule is a separate rule from the range rule and needs its
+    /// own case: a header with coarse >= street is in range on every field,
+    /// so the range check above cannot catch it. Without this the ordering
+    /// check could be deleted outright and nothing would fail.
+    #[test]
+    fn header_rejects_coarse_level_not_finer_than_street_level() {
+        for coarse in [17u8, 18, 30] {
+            let mut header = valid_header_bytes();
+            header[9] = coarse;
+            let err = Header::from_bytes(&header)
+                .expect_err("coarse level at or above street level must be rejected");
+            assert!(
+                err.to_string()
+                    .contains("must be less than street S2 level"),
+                "coarse={coarse}: unexpected error: {err}"
+            );
+        }
+    }
 
     #[test]
     fn header_roundtrip() {

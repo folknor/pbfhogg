@@ -4,6 +4,30 @@
 
 ### Breaking
 
+- **The geocode index builder now rejects an index with no queryable records,
+  and readers reject invalid S2 levels, mismatched fixed-record
+  file lengths, and out-of-bounds entry lists.** These conditions previously
+  produced an empty but apparently successful index, trusted corrupt metadata,
+  or could panic while querying a hostile index.
+
+- **A forced geocode index rebuild invalidates the old header before rewriting
+  data files.** If the rebuild is interrupted, the directory is now visibly
+  incomplete and `Reader::open` fails instead of pairing the old header with
+  partial new data. Invalidation happens only after every read-only check on
+  the input has passed, so a bad input path, a missing file or a malformed PBF
+  leaves the existing index untouched. A geocode index is a directory of 19
+  files and has no atomic replace, which is why this is invalidation rather
+  than a scratch-and-rename swap.
+
+- **`build-geocode-index` now caps `--street-level`, `--coarse-level` and
+  `--admin-level` at 19, down from the S2 limit of 30.** Cell covering samples
+  each way segment at a fraction of the cell width, so the per-segment cost
+  doubles with every level; past 19 a single long or antimeridian-crossing
+  segment can require billions of samples, which is a build that never
+  finishes. The levels are validated before any input is read and a violation
+  exits 2. Readers are unaffected and still accept indexes written at levels up
+  to 30.
+
 - **`apply-changes --locations-on-ways` now fails when a way node reference
   cannot be resolved.** Unresolvable references were written as `(0, 0)`,
   which is Null Island - a real coordinate - so the placeholder vertices
@@ -388,6 +412,26 @@
   must be left untouched.
 
 ### Fixed
+
+- **Geocode indexes now accept legal non-dense Node messages and retain way
+  vertices at Null Island.** The coordinate store uses the same explicit
+  latitude-bias presence bit as `add-locations-to-ways`.
+
+- **Geocode cell coverage is complete for configured S2 levels and long
+  segments, emits each cell once, and seeds administrative interiors from
+  actual inside cell centers.** A 256-step cap previously truncated the cover
+  of any long segment. Concave boundaries no longer lose all interior coverage
+  when their vertex average lies outside the polygon, and boundaries whose
+  interior splits into regions that are disconnected at cell resolution now get
+  coverage in every region rather than only the one containing the seed.
+
+- **`geocode_index::Reader::open` now validates every offset-into-a-file
+  relationship in the format**, not just the geo-cell entry lists: admin cell
+  entry lists, street and interpolation way node spans, admin polygon vertex
+  spans, and string-pool offsets. A truncated or hostile index file previously
+  opened successfully and then returned silently incomplete results, since
+  every read path stops at the end of the mapping and reports nothing rather
+  than an error.
 
 - **`extract` and `multi-extract` no longer include points just outside a
   `--bbox`.** Point membership was decided against integer bounds widened by

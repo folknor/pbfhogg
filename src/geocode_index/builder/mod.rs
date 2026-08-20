@@ -67,17 +67,30 @@ impl Default for BuildConfig {
 
 impl BuildConfig {
     fn validate(&self) -> Result<()> {
-        const MAX_S2_LEVEL: u8 = 30;
+        // The upper bound is the segment sampling budget, not the S2 format
+        // limit of 30. Cell covering samples each segment at a fraction of the
+        // cell width, so the per-segment work doubles with every level; past
+        // `MAX_BUILD_S2_LEVEL` a single long or antimeridian-crossing segment
+        // can need billions of samples, which is a hang rather than a build.
+        // See the budget commentary in `pass3.rs`. Rejecting here is the whole
+        // enforcement mechanism, so it must happen before any input is read.
+        let max_level = pass3::MAX_BUILD_S2_LEVEL;
         for (name, level) in [
             ("street", self.street_level),
             ("coarse", self.coarse_level),
             ("admin", self.admin_level),
         ] {
-            if level > MAX_S2_LEVEL {
-                return Err(
-                    format!("{name} S2 level must be in 0..={MAX_S2_LEVEL}, got {level}").into(),
-                );
+            if level > max_level {
+                return Err(format!(
+                    "{name} S2 level must be in 0..={max_level}, got {level}. Levels above \
+                     {max_level} exceed the builder's per-segment cell-covering budget."
+                )
+                .into());
             }
+            debug_assert!(
+                !pass3::level_exceeds_sampling_budget(level),
+                "level {level} passed validation but exceeds the sampling budget"
+            );
         }
         if self.coarse_level >= self.street_level {
             return Err(format!(
@@ -173,7 +186,6 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         )
         .into());
     }
-
     std::fs::create_dir_all(&config.output_dir)?;
 
     // Validate input
@@ -259,6 +271,32 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     #[cfg(feature = "hotpath")]
     let pass2_start = std::time::Instant::now();
 
+    // Invalidate the index we are about to overwrite.
+    //
+    // A geocode index is a directory of 19 files, not a single file, so the
+    // scratch-and-rename that `DestinationGuard` gives single-file commands
+    // does not transplant: atomically replacing a non-empty directory needs a
+    // directory-transaction mechanism we do not have. Invalidation is the
+    // honest substitute - remove the header first, so a build that dies
+    // partway leaves a directory that fails to open rather than one that opens
+    // and answers with a mixture of two vintages.
+    //
+    // It happens HERE, and not next to the `--force` check at the top,
+    // because everything above this point is read-only input validation:
+    // config, indexdata, the PBF header, Pass 1 and Pass 1.5. A typo in the
+    // input path, a missing file or a malformed PBF must leave the existing
+    // index exactly as it was. Pass 2 is the first thing that writes into the
+    // output directory, so this is the last moment at which failing is free.
+    if config.force {
+        match std::fs::remove_file(&header_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!("failed to invalidate existing geocode index: {e}").into());
+            }
+        }
+    }
+
     crate::debug::emit_marker("GEOCODE_PASS2_SCAN_START");
     let pass2::Pass2Output {
         addr_point_count,
@@ -291,6 +329,19 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     drop(way_geom);
     eprintln!("  {} admin polygons assembled", admin_polygons.len());
     crate::debug::emit_marker("GEOCODE_PASS2_ADMIN_ASSEMBLY_END");
+    // Deliberately a conjunction, not a disjunction. An admin-only index (a
+    // boundaries extract with no addressable content) and an
+    // interpolation-only index are both legitimate; only an index with
+    // nothing queryable at all is a build that should have failed. The
+    // admin-only direction is pinned by the five admin query tests, which all
+    // build from inputs with zero address points and zero streets.
+    if addr_point_count == 0
+        && street_way_count == 0
+        && interp_ways.is_empty()
+        && admin_polygons.is_empty()
+    {
+        return Err("geocode build found zero address points, streets, interpolation ways, and admin polygons; refusing to publish an empty index".into());
+    }
 
     #[cfg(feature = "hotpath")]
     let pass2_ms = pass2_start.elapsed().as_millis();

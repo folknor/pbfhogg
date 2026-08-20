@@ -148,6 +148,7 @@ pub(crate) mod blob_meta;
 #[doc(hidden)]
 pub mod commands;
 pub(crate) mod coord_fmt;
+pub(crate) mod coord_pack;
 pub mod debug;
 mod error;
 pub mod geo;

@@ -88,8 +88,8 @@ non-standard encoding.
 
 ## Null Island ambiguity in coordinate indexes
 
-**Status:** Fixed in `add-locations-to-ways`. Still open in the geocode index
-builder.
+**Status:** Fixed. This class is closed - no index in the crate spells absence
+as an all-zero coordinate any more.
 
 **Context:** An index that stores node coordinates as `(lat: i32, lon: i32)` in a
 zero-initialized backing store is tempted to spell "unset" as `(0, 0)`. That is
@@ -97,23 +97,32 @@ Null Island, a real coordinate in the Gulf of Guinea, so the sentinel collides
 with data: a node genuinely at `0, 0` reports as missing, and a missing node is
 written into a way as if it were there.
 
-`add-locations-to-ways` no longer does this. The `sparse` index stores latitude
-biased by 90 degrees, which leaves bit 31 of the low word free as an explicit
-presence flag; an untouched slot still reads as absent because `set_len`
-zero-fills, but no coordinate can set that bit by accident. The `external`
-backend counts a reference as resolved when its id was *found* in the node
-stream, not when the coordinate it found was non-zero. Both backends therefore
-give the same answer for a node at Null Island, and both are pinned by
-`null_island_real_node_is_not_reported_missing`.
+`add-locations-to-ways` and the geocode index builder no longer do this. Both
+rank-indexed coordinate stores share one encoding: latitude biased by 90
+degrees, which puts every legal latitude below `2^31` and leaves bit 31 of the
+low word free as an explicit presence flag, with longitude verbatim in the high
+word. An untouched slot still reads as absent because the backing store
+zero-fills, but no coordinate can set that bit by accident, and a coordinate
+outside the geographic domain is refused rather than stored as some other
+place. The encoding is defined once and used by both callers, so the two cannot
+drift apart; its layout, domain and Null Island behaviour are pinned by unit
+tests beside it, and the end-to-end behaviour by
+`null_island_real_node_is_not_reported_missing` and
+`null_island_street_vertex_is_not_treated_as_absent`.
 
-The geocode index builder's way-coordinate collection still filters out `(0, 0)`
-pairs and retains the ambiguity.
+The `external` ALTW backend reaches the same answer differently: it counts a
+reference as resolved when its id was *found* in the node stream, not when the
+coordinate it found was non-zero. All three paths therefore agree about a node
+at Null Island.
 
-**Impact of the remaining case:** a geocode index built from data containing a
-way vertex at exactly `(0, 0)` - decimicrodegree precision, so within ~11 mm of
-the intersection of the prime meridian and the equator - drops that vertex. The
-nearest land is ~570 km away.
+The one remaining all-zero sentinel of this shape, the blob index's "no bbox",
+was also retired: `(0, 0, 0, 0)` is the legal bbox of a single-node blob at Null
+Island, so index v3 spells absence as an inverted box that no well-formed bbox
+can equal. v2 files keep their original reading, because that is what their
+writer meant.
 
 **Related:** unresolvable way node references are now a hard error rather than a
 silent `(0, 0)` fill; pass `--ignore-missing-nodes` to accept the placeholders.
-See [Deviations](./deviations).
+That filler is still `(0, 0)`, but it is opt-in, counted, and gated by a
+post-write check, so it is a deliberate output rather than an ambiguous
+sentinel. See [Deviations](./deviations).

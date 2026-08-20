@@ -3,108 +3,6 @@
 Hunt date 2026-08-12. Single Opus hunter, scope: format.rs, builder/, reader.rs,
 mod.rs. Findings only, unverified.
 
-## Pass 2a ignores non-dense nodes; a legitimate PBF silently yields an empty index
-
-`src/geocode_index/builder/pass2.rs`, Phase 2a closure matches only
-`Element::DenseNode(..)`. `Element::Node` is a first-class variant
-(`src/read/elements.rs`) that the rest of the codebase handles everywhere (cat,
-getid, tags_filter, degrade, extract). A PBF encoding nodes as
-`PrimitiveGroup.nodes` (osmconvert output, hand-built fixtures, any producer that
-does not dense-pack) gives: zero coordinates written into the rank coord array,
-so every way's refs resolve to the (0,0) sentinel, `coords.is_empty()`, every way
-dropped; zero address nodes. Build "succeeds", writes a valid header, exits 0.
-The only guard is the build-time smoke test, and it is gated on
-`addr_point_count > 0`, which is exactly 0 in this case - so not even the warning
-fires.
-
-Confidence: high. Fix is one match arm plus an unconditional "0 streets and 0
-addr points" hard error.
-
-## Admin interior coverage collapses for any polygon whose vertex-average is outside it
-
-`pass3.rs::admin_cells_for_polygon`: interior cells come solely from a flood-fill
-seeded at the arithmetic mean of the exterior ring vertices, and
-`if !point_in_polygon(centroid) { return entries; }` - i.e. only the edge cells
-survive. Vertex-mean is not a centroid and is outside the polygon for any
-strongly concave or archipelagic boundary (Norway, Croatia,
-Denmark-with-islands, most coastal municipalities, any relation with several
-outer rings where one ring is a thin strip). Result: reverse-geocoding a point
-deep inside such a boundary returns no admin match at that level, silently, while
-a point near its edge does. There is also no fallback seed and no diagnostic
-counter for "polygon got 0 interior cells".
-
-Confidence: high on the mechanism, high that it bites real data. The hunter calls
-this the single largest correctness hole in the scope; a real fix is a proper
-interior seed (point-on-surface / label point, or seed from every edge cell's
-inside-neighbours), not a tweak.
-
-## `cover_segment` silently under-covers long segments and silently duplicates on short ones
-
-`pass3.rs`. Three defects in one function:
-
-- `step_deg` is a hardcoded `match level { 17 | 14 | 10 | _ => 0.001 }`.
-  `--street-level`, `--coarse-level`, `--admin-level` are settable per run, and
-  `BuildConfig::validate` only range-checks and orders them - it says nothing
-  about the step table, so any non-default level gets a 0.001 degree step (~110 m)
-  regardless of the cell size at that level. At level 20 (~10 m cells) coverage
-  is essentially random.
-- `steps` is clamped to 256, so max reliably-covered segment length is
-  `256 * step_deg`: ~0.077 degrees (~8.5 km) at level 17, ~1.28 degrees at level
-  10. Longer segments are sampled coarser than a cell, so intermediate cells are
-  dropped with no diagnostic. At the admin level this matters most, because
-  `assemble_one_relation` Douglas-Peucker-simplifies country rings down to
-  `max_admin_vertices` (default 500) - a country ring at 500 vertices has
-  segments hundreds of km long, so its edge-cell ring is full of holes.
-- The dedup buffer is a fixed `[u64; 8]`; once a segment touches more than 8
-  distinct cells, `seen` stops growing and cells get `emit`ed repeatedly.
-  Duplicates flow straight into the bucket records and end up as duplicate
-  `SegmentRef`s in a cell's entry list (inflating the per-cell u16 count and
-  query work). Harmless to answers, wasteful, and it makes the "1-4 cells per
-  segment" comment load-bearing when nothing enforces it.
-
-## Cell levels read off disk are unvalidated in `Header::from_bytes`
-
-`Header::from_bytes` reads the three level bytes out of the index file with no
-range check. `s2::CellID::parent(level)` computes `1 << (2 * (30 - level))`, so
-`level > 30` underflows `MAX_LEVEL - level` - panic in debug, silent garbage cell
-IDs in release. A corrupt, truncated or hand-edited header therefore propagates
-that panic into every `Reader::query`. Nothing enforces `coarse_level <
-street_level` on the read side either, and the query path parents fine cells to
-the coarse level, which is only meaningful when coarse is the shallower of the
-two.
-
-This is a different trust boundary from the builder: `BuildConfig::validate` now
-rejects out-of-range and mis-ordered levels at build time, but the reader must
-not trust bytes it did not write. Range-check the levels at parse time and fail
-with a format error rather than a panic.
-
-Confidence: high.
-
-## Adversarial index files can panic the reader (integer overflow to OOB index)
-
-`reader.rs` `U32EntryIter::new` / `SegmentEntryIter::new` do
-`let off = offset as usize; if off + 2 > mmap.len()`. `offset` is a `u64`
-straight off disk. For `offset >= usize::MAX - 1` the add wraps in release
-(`off + 2` == 1), the bounds check passes, and `mmap[off]` panics with
-index-out-of-bounds; in debug it panics on the add. Only `NO_DATA_U64` is
-special-cased. Same shape in `read_record::<N>(mmap, offset)` where `offset`
-derives from `way.node_offset as usize + segment_index * 8`. The reader is
-otherwise carefully bounds-checked, so this reads as an oversight, not a policy.
-Use `checked_add` / `offset.try_into()`.
-
-## Header written last, everything else first - a crashed `--force` rebuild leaves a mismatched index
-
-`builder/mod.rs`: the guard only refuses when `geocode_header.bin` exists and
-`--force` is absent. With `--force`, all 18 data files are recreated in place
-while the old header remains on disk. If the build dies anywhere (ENOSPC, OOM,
-SIGKILL - all realistic at planet scale), the directory now pairs the previous
-run's header (counts, cell levels, replication sequence, search radii) with this
-run's partial data. `Reader::open` validates magic and version only; it never
-cross-checks `geo_cell_count` etc. against file lengths. A reader opens it
-happily and answers wrong. Fix: unlink the header first thing (or build into a
-temp dir and rename), and have `Reader::open` verify each file length against the
-header counts.
-
 ## Stage B's parallelisation defeats the bucketing it parallelises
 
 `pass3.rs::run_stage_b` collects `sorted_buckets: Vec<Vec<ParsedBucketEntry>>`
@@ -177,6 +75,17 @@ one). Collapse to one traversal parameterised by a sink trait.
   `None`. A truncated `addr_points.bin` therefore yields address matches at
   lat/lon 0 with empty strings instead of an error - silent wrong answers built
   on top of a silent read failure.
+
+  Round 1 narrowed but did not close this. `Reader::open` now validates every
+  offset-into-a-file relationship in the format, so a file truncated *relative
+  to its header count or to a referring offset* is rejected at open. What
+  remains is the read functions' own habit of answering with a zeroed record
+  instead of `None` for any index that gets past open validation - a
+  defence-in-depth gap rather than a reachable one today, but it will become
+  reachable again the moment a new record kind is added without a matching
+  `validate_*` arm. The durable fix is to make the read functions return
+  `Option` and force callers to handle absence, not to keep adding validation
+  arms.
 - `u32` offset fields with hard-error guards but no headroom.
   `AdminCell.entries_offset` and `AdminPolygon.vertex_offset` cap
   `admin_entries.bin` / `admin_vertices.bin` at 4 GiB. The builder guards these
@@ -185,8 +94,8 @@ one). Collapse to one traversal parameterised by a sink trait.
   `GeoCell` was already widened to u64 in FORMAT_VERSION 2, widening these two in
   the same spirit costs one version bump and removes a class of "planet build
   dies at minute 18".
-- `format.rs` - the doc comment "Sentinel value for 'no data' in u32 offset
-  fields" is orphaned above `NO_DATA_U64`; the u32 constant it described is gone.
+- `format.rs` - the orphaned "u32 offset fields" doc comment above
+  `NO_DATA_U64` was fixed in round 1. Still wrong:
   `GEO_CELL_SIZE`'s section header still says "24 bytes per record" while the
   constant is 32; `StreetWay` says "14 bytes per record" (correct) but
   `AdminPolygon` says 22 with a reserved byte that is undocumented in the header
@@ -208,30 +117,6 @@ one). Collapse to one traversal parameterised by a sink trait.
   counter and no warning. At planet scale you cannot tell 100 dropped boundaries
   from 0.
 
-## The way-coordinate collection still spells absence as `(0, 0)`
-
-Filed 2026-08-20 from the spatial/locations round, which fixed the same defect in
-`add-locations-to-ways`. `builder/pass2.rs` reads the rank coord mmap and drops
-the pair when `lat == 0 && lon == 0`, so a way vertex genuinely at Null Island is
-discarded from the geometry - and, in the other direction, an unresolved
-reference is indistinguishable from a real one. This is now the last coordinate
-index in the crate that does it; `CORRECTNESS.md` "Null Island ambiguity in
-coordinate indexes" and `docs/guide/correctness.md` both scope their remaining
-entry to this site plus `apply-changes --locations-on-ways`.
-
-The comment at the filter site used to justify itself with "a proper fix would be
-a presence bitmap; not worth the extra pass". That argument is now dead: the
-sparse ALTW store solved it with no extra memory and no extra pass by storing
-latitude biased by 90 degrees, which puts every legal latitude below `2^31` and
-frees bit 31 of the low word as an explicit presence flag. The slot here is the
-same eight bytes (`lat: i32`, `lon: i32`), so the same encoding drops straight
-in - see `pack` / `unpack` in `src/commands/altw/sparse.rs`. The zero-filled mmap
-still reads as absent, so nothing else about the pass changes.
-
-Note the interaction with the first finding in this document: while Pass 2a
-ignores non-dense nodes, every ref resolves to the sentinel, so fixing that one
-first makes this one's blast radius visible rather than universal.
-
 ## What the hunter would rewrite rather than patch
 
 The admin-interior, `cover_segment` and `max-admin-vertices` findings are one
@@ -245,3 +130,84 @@ region would fix under-coverage, kill the duplicate emissions, make the interior
 flag sound (re-enabling the PIP skip), remove the level-hardcoded step table, and
 let the DP cap be a metric tolerance instead of a vertex count. That is the
 high-payoff structural change in this scope; everything else here is repair work.
+
+Round 1 bounded `cover_segment`'s work rather than rewriting it: the 256-step
+cap that silently under-covered is gone, and the unbounded sampling that
+replaced it is now bounded by capping the configurable S2 levels at 19, derived
+from a per-segment budget of 2^24 samples and the widest separation two legal
+coordinates can have. That is a stopgap with a proof attached, not a fix. The
+sampler is still sampling; a `RegionCoverer` would make the level cap
+unnecessary, because an exact traversal's cost scales with the cells actually
+covered rather than with the cell width.
+
+## Cross-reference: Douglas-Peucker topology (open, and worst here)
+
+`notes/bugs-spatial-locations.md`, "Ring simplification can change polygon
+topology", is a spatial-locations finding whose worst consumer is this scope:
+the geocode reader runs point-in-polygon against exactly the rings DP
+simplified, so a self-intersection introduced by simplification resolves a
+query to the wrong administrative area. That entry carries the precise
+producer, knob, consumer, blast radius and the missing fixture. It is listed
+here so a later round of *this* document does not rediscover it from the
+reader's end.
+
+## Round-1 closing notes (2026-08-20)
+
+**The round's own fix opened a new hole, and the review caught it.** Removing
+`cover_segment`'s 256-step cap was correct - it silently under-covered - but
+removing it without bounding the work replaced silent under-coverage with
+unbounded work, since the configuration accepted S2 levels through 30 and the
+sample count doubles per level. Both are wrong. The bound now sits on the
+level, validated before any input is read: the widest separation two legal
+coordinates can have is a constant, so worst-case samples per segment is a pure
+function of the level, and level 19 is exactly where that worst case meets the
+2^24-sample budget. A unit test walks every level and asserts the boundary
+lands where the constant says, so the constant cannot be raised without raising
+the budget it is derived from.
+
+**Two more defective tests, both in this round's own work.**
+
+- *Thirty-fourth, species ASSERTING THE BUG AS CORRECT.* Found by the reviewer,
+  not the author. `--force` removed the old header before `require_indexdata`
+  and `ElementReader::open`, so a typo in the input path destroyed a valid
+  index; the new test asserted that the header was gone, codifying the
+  destruction as the contract. Invalidation moved to immediately before Pass 2
+  - the first output mutation - and the test was replaced by two: one asserting
+  a bad input leaves the index byte-identical and still queryable, one
+  asserting a build that dies *after* invalidation leaves a directory that
+  fails to open. The pair is what pins the contract; either alone is satisfiable
+  by the wrong implementation.
+- *Thirty-fifth, species COVERS ONLY THE VARIANT ITS AUTHOR IMAGINED.*
+  `header_rejects_invalid_s2_levels_on_read` poked one of three level bytes and
+  asserted only the range rule. The same fix added a coarse-versus-street
+  ordering rule that no test touched: a header with `coarse >= street` is in
+  range on every field, so the ordering check could have been deleted outright
+  with nothing failing. Split into a range test over all three fields and a
+  dedicated ordering test.
+
+**The reviewer's guess that a fourth unvalidated offset existed was low.** There
+were four more, not one: `AdminCell.entries_offset`, `StreetWay.node_offset`,
+`InterpWay.node_offset` and `AdminPolygon.vertex_offset`, plus the whole
+string-pool offset class. All are validated at open now, and the new test drives
+one corruption per kind rather than one corruption.
+
+**The presence encoding was re-derived, not reused.** The geocode builder
+carried a verbatim copy of the ALTW sparse store's `pack`/`unpack` - same
+constants, same layout, separate code. That is the drift risk the carry-forward
+warned about, realised. The encoding now lives once in `src/coord_pack.rs` with
+its layout, domain and Null Island tests, and both callers import it. A
+divergent third copy is now a code review question rather than an invisible
+corruption.
+
+**Disconnected interior pockets are genuinely handled.** Seeding from every
+inside neighbour of every edge cell reaches every interior region, because
+every component of a polygon's interior is bounded by part of its boundary. A
+two-lobe fixture confirms it empirically: restricted to a single seed the
+builder produces 64 interior cells in the west lobe and 0 in the east.
+
+**Null Island as a class is closed.** The geocode way-coordinate collection was
+the last coordinate index in the crate spelling absence as all-zero. The blob
+index's "no bbox" was retired earlier by v3's inverted box. The only remaining
+`(0, 0)` is the ALTW `--ignore-missing-nodes` filler, which is opt-in, counted
+and gated by a post-write check - a deliberate output, not an ambiguous
+sentinel. `docs/guide/correctness.md` states the class closed.

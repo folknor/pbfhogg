@@ -994,13 +994,13 @@ enum Command {
         /// Output directory for index files
         #[arg(long)]
         output_dir: PathBuf,
-        /// S2 cell level for streets/addresses
+        /// S2 cell level for streets/addresses (0-19, must exceed --coarse-level)
         #[arg(long, default_value = "17")]
         street_level: u8,
-        /// Fallback cell level for rural areas
+        /// Fallback cell level for rural areas (0-19, must be below --street-level)
         #[arg(long, default_value = "14")]
         coarse_level: u8,
-        /// S2 cell level for admin boundaries
+        /// S2 cell level for admin boundaries (0-19)
         #[arg(long, default_value = "10")]
         admin_level: u8,
         /// Douglas-Peucker vertex cap per admin polygon

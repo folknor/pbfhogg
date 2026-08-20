@@ -560,13 +560,31 @@ pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
 | Flag | Description |
 |------|-------------|
 | `--output-dir <DIR>` | Output directory for index files |
-| `--street-level <N>` | S2 cell level for streets/addresses [default: 17] |
-| `--coarse-level <N>` | Fallback cell level for rural areas [default: 14] |
-| `--admin-level <N>` | S2 cell level for admin boundaries [default: 10] |
+| `--street-level <N>` | S2 cell level for streets/addresses, 0-19 [default: 17] |
+| `--coarse-level <N>` | Fallback cell level for rural areas, 0-19 [default: 14] |
+| `--admin-level <N>` | S2 cell level for admin boundaries, 0-19 [default: 10] |
 | `--max-admin-vertices <N>` | Douglas-Peucker vertex cap per admin polygon [default: 500] |
 | `--search-radius <M>` | Fine-level max search distance in meters [default: 75] |
 | `--coarse-search-radius <M>` | Coarse-level max search distance in meters [default: 1000] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--force` | Proceed without indexdata / overwrite existing index |
+
+The three cell levels are validated before any input is read; a violation exits
+2 with an explicit message. Each must be in `0..=19`, and `--coarse-level` must
+be strictly below `--street-level`. The upper bound is 19 rather than the S2
+limit of 30 because the per-segment cell-covering cost doubles with every
+level, and beyond 19 a single long segment exceeds the builder's sampling
+budget. Readers still accept indexes written at levels up to 30.
+
+`--force` invalidates the existing index rather than swapping it: a geocode
+index is a directory of 19 files with no atomic replace, so the header is
+removed first and a build that dies partway leaves a directory that fails to
+open instead of one that answers from two vintages. Invalidation happens only
+after every read-only check on the input has passed, so a bad input path leaves
+the existing index untouched.
+
+A build that finds nothing queryable at all fails rather than publishing an
+empty index. Indexes holding only some record kinds, such as an
+admin-boundaries extract, still build.
 
 Outputs 19 binary files. Denmark (465 MB PBF): ~7s, 172 MB index. Europe (32.4 GB): 524s (8.7 min), 7.5 GB RSS. Planet (87 GB): 1,255s (20.9 min), 29.5 GB peak RSS (pass-1.5 transient).

@@ -118,6 +118,15 @@ impl TagIndex {
         self.keys.is_empty()
     }
 
+    /// The sorted, deduplicated key set.
+    ///
+    /// Exposed for `check --index`, which diffs a stored tag index against the
+    /// one it scans out of the blob itself and therefore needs the key set as
+    /// a set rather than as a membership predicate.
+    pub(crate) fn keys(&self) -> &[Box<[u8]>] {
+        &self.keys
+    }
+
     /// Returns `true` if any of the given keys is present in this tag index.
     pub fn has_any_key(&self, required: &[Box<[u8]>]) -> bool {
         required

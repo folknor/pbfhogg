@@ -277,6 +277,17 @@ pub struct GetidStats {
     pub nodes_written: u64,
     pub ways_written: u64,
     pub relations_written: u64,
+    /// Elements in blobs that were copied through raw, as *claimed* by their
+    /// `BlobHeader.indexdata`.
+    ///
+    /// Kept apart from the `*_written` counters on purpose. Those are counted
+    /// from elements this command actually decoded; a raw-passthrough blob is
+    /// never decoded, so the only number available for it is the one the file
+    /// claims about itself - and nothing verifies that claim (`check --index`
+    /// exists to). Folding it in produced one "Wrote N elements" line mixing
+    /// observation with hearsay, and a lying indexdata moved N with no way for
+    /// the reader to tell. Reporting them separately keeps the headline true.
+    pub passthrough_claimed: u64,
     /// The requested IDs that were written, when
     /// [`GetidOptions::report_found`] was set. `None` otherwise -
     /// distinguishing "not asked for" from "asked for, found nothing".
@@ -290,6 +301,13 @@ impl GetidStats {
             "Wrote {total} elements: {} nodes, {} ways, {} relations",
             self.nodes_written, self.ways_written, self.relations_written,
         );
+        if self.passthrough_claimed > 0 {
+            eprintln!(
+                "Plus {} elements in raw-passthrough blobs, per their indexdata \
+                 (unverified - run `pbfhogg check --index` to check it)",
+                self.passthrough_claimed,
+            );
+        }
     }
 }
 
@@ -504,6 +522,7 @@ fn filter_by_id_walker(
     let mut output_blocks: Vec<crate::block_builder::OwnedBlock> = Vec::new();
     let mut stats = GetidStats {
         nodes_written: 0,
+        passthrough_claimed: 0,
         ways_written: 0,
         relations_written: 0,
         found: report_found.then(ElementIds::empty),
@@ -563,13 +582,11 @@ fn filter_by_id_walker(
                         // need the full frame bytes (length prefix +
                         // header + data) to write verbatim.
                         walker.pread_data(meta.frame_start, meta.frame_size, &mut frame_buf)?;
-                        match idx.kind {
-                            crate::blob_meta::ElemKind::Node => stats.nodes_written += idx.count,
-                            crate::blob_meta::ElemKind::Way => stats.ways_written += idx.count,
-                            crate::blob_meta::ElemKind::Relation => {
-                                stats.relations_written += idx.count;
-                            }
-                        }
+                        // The blob is copied verbatim and never decoded, so
+                        // `idx.count` is what the file says about itself, not
+                        // something this command observed. It goes in its own
+                        // counter rather than into `*_written`.
+                        stats.passthrough_claimed += idx.count;
                         w.write_raw_owned(std::mem::take(&mut frame_buf))?;
                         blobs_passthrough += 1;
                         continue;
@@ -682,6 +699,7 @@ fn filter_by_id_streaming(
     let mut writer: Option<PbfWriter<FileWriter>> = None;
     let mut stats = GetidStats {
         nodes_written: 0,
+        passthrough_claimed: 0,
         ways_written: 0,
         relations_written: 0,
         found: report_found.then(ElementIds::empty),
@@ -815,6 +833,7 @@ fn getid_with_refs(
 ) -> Result<GetidStats> {
     let mut stats = GetidStats {
         nodes_written: 0,
+        passthrough_claimed: 0,
         ways_written: 0,
         relations_written: 0,
         found: opts.report_found.then(ElementIds::empty),

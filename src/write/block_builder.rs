@@ -231,15 +231,43 @@ impl BlockBuilder {
     ///
     /// Panics if `cap == 0`.
     pub fn with_element_cap(cap: usize) -> Self {
+        Self::with_element_cap_prealloc(cap, usize::MAX)
+    }
+
+    /// [`with_element_cap`](Self::with_element_cap) with a separate ceiling on
+    /// how much is *pre-allocated*.
+    ///
+    /// `cap` is a policy: how many elements go in a block before it is flushed.
+    /// The pre-allocation is only an optimization - the vectors grow if they
+    /// need to - so the two do not have to be the same number, and on an
+    /// attacker-shaped input they must not be. `repack --elements-per-blob N`
+    /// takes N straight off the command line and hands it to one `BlockBuilder`
+    /// per worker plus a central one; at `N = usize::MAX / 2` that was several
+    /// unbounded allocations requested by a single integer, before a byte of
+    /// input had been read.
+    ///
+    /// `prealloc_bound` is the caller's honest ceiling on how many elements
+    /// could actually arrive - for `repack`, derived from the input file, since
+    /// a block can never hold more elements than the file contains. This is the
+    /// same shape as `check`'s `id_alloc_bound`: not a hard-coded constant that
+    /// the passage of time invalidates, but a number that tracks the input, so
+    /// no honest request is ever clipped in a way that costs anything beyond a
+    /// vector growth that will never happen.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cap == 0`.
+    pub fn with_element_cap_prealloc(cap: usize, prealloc_bound: usize) -> Self {
         assert!(
             cap > 0,
             "BlockBuilder::with_element_cap: --elements-per-blob must be > 0"
         );
+        let prealloc = cap.min(prealloc_bound.max(1));
         // dense_keys_vals carries 2*N entries on average for tagless nodes
         // (one key/val pair plus a 0 delimiter is more typical, but the
         // historical pre-alloc is 2*cap; preserved here). saturating_mul
         // guards against pathological caps near usize::MAX.
-        let kv_cap = cap.saturating_mul(2);
+        let kv_cap = prealloc.saturating_mul(2);
         BlockBuilder {
             string_table: StringTable::new(),
             block_type: None,
@@ -256,17 +284,17 @@ impl BlockBuilder {
             tag_key_scratch: Vec::new(),
             last_tagdata: None,
 
-            dense_ids: Vec::with_capacity(cap),
-            dense_lats: Vec::with_capacity(cap),
-            dense_lons: Vec::with_capacity(cap),
+            dense_ids: Vec::with_capacity(prealloc),
+            dense_lats: Vec::with_capacity(prealloc),
+            dense_lons: Vec::with_capacity(prealloc),
             dense_keys_vals: Vec::with_capacity(kv_cap),
 
-            dense_versions: Vec::with_capacity(cap),
-            dense_timestamps: Vec::with_capacity(cap),
-            dense_changesets: Vec::with_capacity(cap),
-            dense_uids: Vec::with_capacity(cap),
-            dense_user_sids: Vec::with_capacity(cap),
-            dense_visibles: Vec::with_capacity(cap),
+            dense_versions: Vec::with_capacity(prealloc),
+            dense_timestamps: Vec::with_capacity(prealloc),
+            dense_changesets: Vec::with_capacity(prealloc),
+            dense_uids: Vec::with_capacity(prealloc),
+            dense_user_sids: Vec::with_capacity(prealloc),
+            dense_visibles: Vec::with_capacity(prealloc),
             has_dense_metadata: false,
 
             last_dense_id: 0,
@@ -1075,5 +1103,72 @@ impl BlockBuilder {
 
         // Reset string table (reuse allocation, clear content).
         self.string_table.clear();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::BlockBuilder;
+
+    /// The pre-allocation bound must clamp only the pre-allocation.
+    ///
+    /// `cap` is a policy - how many elements go in a block before it is
+    /// flushed - and it lands verbatim in the output's blob sizes.
+    /// `prealloc_bound` is an allocation ceiling and nothing else. Conflating
+    /// them would not be a memory bug but a *format* bug: a builder whose cap
+    /// had silently become the byte-derived bound would write blobs of a
+    /// different size than the caller asked for, on some inputs and not
+    /// others. The split shipped with no test at all, which is how a
+    /// conflation would have reached a release unnoticed.
+    #[test]
+    fn the_prealloc_bound_clamps_allocation_without_moving_the_cap() {
+        // Bound far below the cap: the flush point must still be the cap.
+        let mut bb = BlockBuilder::with_element_cap_prealloc(5, 1);
+        for id in 1..=5 {
+            assert!(
+                !bb.should_flush(),
+                "the builder wanted to flush after {} elements with a cap of \
+                 5, so the pre-allocation bound has been mistaken for the cap",
+                id - 1
+            );
+            bb.add_node(id, 0, 0, [("k", "v")], None);
+        }
+        assert!(bb.should_flush(), "a cap of 5 must flush at 5 elements");
+
+        // A bound of zero is still a legal request and must not panic or
+        // collapse the cap - only `cap == 0` is rejected.
+        let mut bb = BlockBuilder::with_element_cap_prealloc(2, 0);
+        bb.add_node(1, 0, 0, [("k", "v")], None);
+        assert!(!bb.should_flush());
+        bb.add_node(2, 0, 0, [("k", "v")], None);
+        assert!(bb.should_flush());
+
+        // Paired counterpart: a bound above the cap changes nothing, so the
+        // assertions above are about the clamp rather than about the cap
+        // having been broken generally.
+        let mut bb = BlockBuilder::with_element_cap_prealloc(5, usize::MAX);
+        for id in 1..=4 {
+            bb.add_node(id, 0, 0, [("k", "v")], None);
+        }
+        assert!(!bb.should_flush());
+        bb.add_node(5, 0, 0, [("k", "v")], None);
+        assert!(bb.should_flush());
+    }
+
+    /// A cap no input can reach must not be pre-allocated.
+    ///
+    /// `repack --elements-per-blob N` takes N off the command line and builds
+    /// one `BlockBuilder` per worker plus a central one. Before the bound
+    /// existed, a single integer requested several unbounded allocations
+    /// before a byte of input had been read. This constructs at the shape that
+    /// used to abort the process and asserts the builder is merely empty.
+    #[test]
+    fn an_absurd_cap_does_not_allocate_absurdly() {
+        let bb = BlockBuilder::with_element_cap_prealloc(usize::MAX / 2, 64);
+        assert!(
+            !bb.should_flush(),
+            "a fresh builder holds nothing regardless of its cap"
+        );
     }
 }

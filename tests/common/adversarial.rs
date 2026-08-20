@@ -134,7 +134,9 @@ pub fn mutate_blob_header_indexdata(
     } else {
         Some(indexdata.as_slice())
     };
-    let new_header = build_blob_header(&blob_type, indexdata_for_emit, datasize);
+    let tagdata = read_bytes_field(header, 4);
+    let new_header =
+        build_blob_header(&blob_type, indexdata_for_emit, datasize, tagdata.as_deref());
 
     splice_frame(
         pbf,
@@ -155,8 +157,13 @@ pub fn mutate_blob_header_indexdata(
 /// Returns a new PBF buffer with the change applied. The frame is
 /// re-emitted with the payload as a raw (uncompressed) Blob, and the
 /// BlobHeader.datasize and frame length prefix are recomputed. The
-/// indexdata field is preserved verbatim - tests that need to mutate
-/// it use [`mutate_blob_header_indexdata`].
+/// indexdata and tagdata fields are preserved verbatim - tests that need
+/// to mutate indexdata use [`mutate_blob_header_indexdata`].
+///
+/// Preserving them verbatim across a payload rewrite is the point, not an
+/// oversight: it is how a fixture ends up with sidecar metadata that no
+/// longer describes its own payload, which is exactly the file
+/// `check --index` exists to catch.
 ///
 /// **Scope.** This helper is byte-level: the inner protobuf encoding
 /// produced by the original `BlockBuilder` is preserved unchanged.
@@ -180,8 +187,14 @@ pub fn mutate_blob_payload(pbf: &[u8], blob_idx: usize, f: impl FnOnce(&mut Vec<
     let header = &pbf[target.header_start..target.header_end];
     let blob_type = read_bytes_field(header, 1).expect("BlobHeader.type missing");
     let indexdata = locate_indexdata(header).map(|(s, e)| header[s..e].to_vec());
+    let tagdata = read_bytes_field(header, 4);
     let new_size = u32::try_from(new_blob.len()).expect("blob fits in u32 datasize");
-    let new_header = build_blob_header(&blob_type, indexdata.as_deref(), new_size);
+    let new_header = build_blob_header(
+        &blob_type,
+        indexdata.as_deref(),
+        new_size,
+        tagdata.as_deref(),
+    );
 
     splice_frame(pbf, target, &new_header, &new_blob)
 }
@@ -495,7 +508,20 @@ fn emit_blob_raw(payload: &[u8]) -> Vec<u8> {
     out
 }
 
-fn build_blob_header(blob_type: &[u8], indexdata: Option<&[u8]>, datasize: u32) -> Vec<u8> {
+/// Emit a BlobHeader carrying type (field 1), optional indexdata (field 2),
+/// datasize (field 3) and optional tagdata (field 4).
+///
+/// tagdata is emitted because the mutators are used to build fixtures for
+/// `check --index`, whose whole subject is the relationship between a blob's
+/// payload and the sidecar metadata in its header. A helper that dropped field
+/// 4 on every rewrite could only ever produce files with no tag index, so the
+/// tagdata half of the verifier would have been untestable end to end.
+fn build_blob_header(
+    blob_type: &[u8],
+    indexdata: Option<&[u8]>,
+    datasize: u32,
+    tagdata: Option<&[u8]>,
+) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(0x0A);
     write_varint(
@@ -513,6 +539,14 @@ fn build_blob_header(blob_type: &[u8], indexdata: Option<&[u8]>, datasize: u32) 
     }
     out.push(0x18);
     write_varint(&mut out, u64::from(datasize));
+    if let Some(td) = tagdata {
+        out.push(0x22);
+        write_varint(
+            &mut out,
+            u64::try_from(td.len()).expect("tagdata len fits in u64"),
+        );
+        out.extend_from_slice(td);
+    }
     out
 }
 

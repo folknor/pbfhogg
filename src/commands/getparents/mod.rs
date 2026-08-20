@@ -255,7 +255,7 @@ fn getparents_walker(
     // at the end of the phase.
     let mut write_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
 
-    crate::scan::classify::parallel_classify_phase(
+    crate::scan::classify::parallel_classify_phase_abortable(
         &shared_file,
         &schedule,
         None,
@@ -272,9 +272,15 @@ fn getparents_walker(
             flush_local(&mut bb, &mut output)?;
             Ok((output, counts))
         },
+        // Returning `Break` on the first failure stops the scan. This used to
+        // just set `write_err` and return, which short-circuited the merge but
+        // left `parallel_classify_phase` running the whole schedule to
+        // completion - so at planet scale a failed first write cost the entire
+        // decode before the error surfaced.
         |seq, result| {
+            use std::ops::ControlFlow;
             if write_err.is_some() {
-                return;
+                return ControlFlow::Break(());
             }
             reorder.push(seq, result);
             while let Some(item) = reorder.pop_ready() {
@@ -294,7 +300,7 @@ fn getparents_walker(
                                 way_members.as_deref(),
                             ) {
                                 write_err = Some(Box::new(e));
-                                return;
+                                return ControlFlow::Break(());
                             }
                         }
                         stats.nodes_written += n;
@@ -303,10 +309,11 @@ fn getparents_walker(
                     }
                     Err(e) => {
                         write_err = Some(e.into());
-                        return;
+                        return ControlFlow::Break(());
                     }
                 }
             }
+            ControlFlow::Continue(())
         },
     )?;
 

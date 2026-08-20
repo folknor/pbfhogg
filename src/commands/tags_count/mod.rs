@@ -90,8 +90,31 @@ pub fn tags_count(path: &Path, opts: &TagCountOptions<'_>) -> Result<Vec<TagCoun
 
     crate::debug::emit_marker("TAGSCOUNT_START");
 
-    let (schedule, shared_file) =
-        crate::scan::classify::build_classify_schedule(path, kind_filter)?;
+    // Apply the same blob-level tag index `tags-filter` uses.
+    //
+    // `tags-count -e highway=*` counts only tags matching an expression, so a
+    // blob whose tag index carries none of the required keys cannot contribute
+    // a single count - and skipping it means never decompressing it. Without
+    // this the command parsed the identical expressions and then decoded every
+    // blob in the file anyway.
+    //
+    // The filter has to come from `blob_filter_from_expressions`, not be
+    // rebuilt here: that helper clears the entire key set when any expression
+    // carries a key matcher it cannot express as key-set membership, because
+    // the filter's semantics are a union and a partial clear would silently
+    // skip blobs the unconstrained expression could still match.
+    let blob_filter = expressions
+        .as_deref()
+        .and_then(crate::commands::tags_filter::blob_filter_from_expressions);
+    let (schedule, shared_file, blobs_skipped_by_tag) =
+        crate::scan::classify::build_classify_schedule_blob_filtered(
+            path,
+            kind_filter,
+            blob_filter.as_ref(),
+        )?;
+    if blobs_skipped_by_tag > 0 {
+        eprintln!("[tags-count] {blobs_skipped_by_tag} blobs skipped by tag index");
+    }
     let thread_override = (opts.jobs > 0).then_some(opts.jobs);
     let mut counts: CountMap = FxHashMap::default();
 

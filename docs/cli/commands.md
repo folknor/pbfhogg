@@ -83,7 +83,9 @@ Count tag key=value frequencies (subcommand of `inspect`).
 
 Validate PBF file integrity (IDs + referential integrity).
 
-With no flags, runs both ID and referential integrity checks. Use `--ids` or `--refs` to run only one.
+With no flags, runs the ID and referential integrity checks. Use `--ids`,
+`--refs` or `--index` to select. `--index` is not part of the default pair: it
+decompresses every blob in the file, so it is opt-in.
 
 ```
 pbfhogg check [OPTIONS] <FILE>
@@ -93,6 +95,7 @@ pbfhogg check [OPTIONS] <FILE>
 |------|-------------|
 | `--ids` | Check ID uniqueness and ordering only |
 | `--refs` | Check referential integrity only |
+| `--index` | Verify blob-level metadata (`BlobHeader` indexdata and tagdata) against the blobs themselves. Decompresses every blob |
 | `--full` | Full duplicate detection via bitmap (slower, more memory; applies to ID check) |
 | `-t, --type <TYPE>` | Filter by element type (comma-separated: node, way, relation; applies to ID check) |
 | `--max-errors <N>` | Stop after N violations (0 = unlimited) [default: 100] |
@@ -107,6 +110,44 @@ For missing relation-to-relation members, reports unique missing IDs with occurr
 The ID check judges monotonicity by canonical OSM order (`0`, then negative IDs
 by ascending absolute value, then positives) - the order `sort` produces. On a
 positive-only file that is plain `i64` order.
+
+#### `--index`: verifying blob-level metadata
+
+`BlobHeader.indexdata` (element kind, ID range, element count, spatial bbox) and
+`BlobHeader.tagdata` (the blob's tag key set) are hints a reader believes without
+opening the blob: `cat --type` passes a blob through raw on the strength of the
+kind, `tags-filter` skips whole blobs on the strength of the tag index, and the
+spatial filter skips node blobs on the strength of the bbox. Nothing in the
+format signs those claims. `check --index` decompresses every blob, re-derives
+the metadata from the payload, and reports each disagreement with its blob
+ordinal and byte offset.
+
+It never routes on the metadata it is checking - no blob filter, no
+`require_indexdata`, every OSMData blob decompressed - so there is no
+`--distrust-metadata` flag to pass: distrust is the only mode it has.
+
+A blob that carries no indexdata or no tagdata makes no claim and is not
+reported; that is the ordinary state of a third-party PBF. Metadata that is
+present but *unreadable* is a different matter and is reported: an indexdata of
+an unrecognised length or version, a malformed tag index, or a tag index
+attached to a blob whose element kinds are mixed (where no key set can be
+complete). Ordinary reads treat all of those as "no metadata, decode the blob",
+which is safe for a reader and useless in a verifier.
+
+Two of the checks are containment rather than equality:
+
+- A stored **bbox** must contain every coordinate in the blob. A wider box is
+  sound (and is what a non-default `granularity` legitimately produces), an
+  absent box is no claim at all, and only a box that is present and too small
+  can make a spatial filter skip a blob it should have read.
+- A stored **tag key set** that omits a key the blob carries makes `tags-filter`
+  skip a blob holding matches; one that lists a key the blob does not carry only
+  costs a needless decode. Both are reported, as distinct violations.
+
+Kind, count and ID range are checked for exact equality, because every consumer
+treats them as exact.
+
+Exit 1 means mismatches were found; exit 2 means the check could not run.
 
 The ref check reports element IDs it could not track (negative IDs, or IDs above
 the range sized from the file's own indexdata) on their own

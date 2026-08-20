@@ -7,7 +7,12 @@
 //! - v1 (26 bytes): element type, ID range, count.
 //! - v2 (42 bytes): v1 fields + spatial bbox (min/max lat/lon in decimicrodegrees)
 //!   for node blobs. Enables the pipeline to skip decompression of node blobs
-//!   outside an extraction bbox.
+//!   outside an extraction bbox. Spells "no bbox" as four zero words, which is
+//!   also the exact bbox of a blob at (0, 0) - see [`BBOX_ABSENT`].
+//! - v3 (42 bytes, current): identical layout, absence spelled as an inverted
+//!   box instead of zeros, so every real bbox is representable.
+//!
+//! All three versions are read. New indexdata is written as v3.
 
 mod scan_ids;
 mod tag_index;
@@ -81,19 +86,41 @@ pub(crate) struct BlobIndex {
 
 /// Indexdata wire format version.
 const INDEX_VERSION_V1: u8 = 0x01;
-/// Current version (v2 with spatial bbox).
-const INDEX_VERSION: u8 = 0x02;
+/// v2: adds the spatial bbox, with all-zero meaning "no bbox".
+const INDEX_VERSION_V2: u8 = 0x02;
+/// Current version. Same 42-byte layout as v2; the only change is how an
+/// absent bbox is spelled - see [`BBOX_ABSENT`].
+const INDEX_VERSION: u8 = 0x03;
+
+/// The bbox an index writes when it has none: an inverted (empty) box.
+///
+/// v2 spelled "no bbox" as four zero words, a sentinel drawn from the value
+/// space it was describing - `(0, 0, 0, 0)` is also the exact, legal bbox of a
+/// single-node blob at Null Island, and v2 cannot tell the two apart. The
+/// consequence was small but real and one-directional: such a blob read back
+/// with `bbox: None` and lost spatial filtering, and the encoding had no way to
+/// say what was true.
+///
+/// v3 picks a value the field genuinely cannot take. A bbox is well-formed only
+/// when `min <= max` on both axes, so `min = i32::MAX`, `max = i32::MIN` is
+/// unconstructible as a real box - it describes the empty set - and every real
+/// box, `(0, 0, 0, 0)` included, is now distinguishable from absence.
+///
+/// v2 files keep their original reading (all-zero means absent), because that
+/// is what their writer meant; only v3 files get the exact one.
+const BBOX_ABSENT: [i32; 4] = [i32::MAX, i32::MIN, i32::MAX, i32::MIN];
 
 /// v1 serialized size: 1 version + 1 type + 8 min_id + 8 max_id + 8 count = 26 bytes.
 const INDEX_SIZE_V1: usize = 26;
 
-/// v2 serialized size: v1 fields + 4×i32 bbox = 42 bytes.
+/// v2/v3 serialized size: v1 fields + 4×i32 bbox = 42 bytes.
 pub const INDEX_SIZE: usize = 42;
 
 impl BlobIndex {
-    /// Serialize to the 42-byte v2 indexdata format.
+    /// Serialize to the 42-byte v3 indexdata format.
     ///
-    /// Node blobs include their spatial bbox. Way/relation blobs have zero bbox fields.
+    /// Node blobs include their spatial bbox. Way/relation blobs, and node
+    /// blobs whose coordinates could not be scanned, write [`BBOX_ABSENT`].
     pub fn serialize(&self) -> [u8; INDEX_SIZE] {
         let mut buf = [0u8; INDEX_SIZE];
         buf[0] = INDEX_VERSION;
@@ -105,16 +132,21 @@ impl BlobIndex {
         buf[2..10].copy_from_slice(&self.min_id.to_le_bytes());
         buf[10..18].copy_from_slice(&self.max_id.to_le_bytes());
         buf[18..26].copy_from_slice(&self.count.to_le_bytes());
-        if let Some(ref bbox) = self.bbox {
-            buf[26..30].copy_from_slice(&bbox.min_lat.to_le_bytes());
-            buf[30..34].copy_from_slice(&bbox.max_lat.to_le_bytes());
-            buf[34..38].copy_from_slice(&bbox.min_lon.to_le_bytes());
-            buf[38..42].copy_from_slice(&bbox.max_lon.to_le_bytes());
-        }
+        // Always write all four bbox words. Absence is the explicit
+        // `BBOX_ABSENT` inverted box, never a run of zeros that a real box at
+        // (0, 0) would also produce.
+        let bbox = self.bbox.map_or(BBOX_ABSENT, |b| {
+            [b.min_lat, b.max_lat, b.min_lon, b.max_lon]
+        });
+        buf[26..30].copy_from_slice(&bbox[0].to_le_bytes());
+        buf[30..34].copy_from_slice(&bbox[1].to_le_bytes());
+        buf[34..38].copy_from_slice(&bbox[2].to_le_bytes());
+        buf[38..42].copy_from_slice(&bbox[3].to_le_bytes());
         buf
     }
 
-    /// Deserialize from indexdata bytes. Accepts both v1 (26 bytes) and v2 (42 bytes).
+    /// Deserialize from indexdata bytes. Accepts v1 (26 bytes), v2 and v3
+    /// (42 bytes).
     ///
     /// Returns `None` if the data is invalid, too short, or has an unrecognized version.
     pub fn deserialize(data: &[u8]) -> Option<Self> {
@@ -122,7 +154,7 @@ impl BlobIndex {
             return None;
         }
         let version = data[0];
-        if version != INDEX_VERSION_V1 && version != INDEX_VERSION {
+        if version != INDEX_VERSION_V1 && version != INDEX_VERSION_V2 && version != INDEX_VERSION {
             return None;
         }
         let kind = match data[1] {
@@ -135,27 +167,34 @@ impl BlobIndex {
         let max_id = i64::from_le_bytes(data[10..18].try_into().ok()?);
         let count = u64::from_le_bytes(data[18..26].try_into().ok()?);
 
-        // v2: parse spatial bbox for node blobs
-        let bbox = if version == INDEX_VERSION && data.len() >= INDEX_SIZE && kind == ElemKind::Node
-        {
-            let min_lat = i32::from_le_bytes(data[26..30].try_into().ok()?);
-            let max_lat = i32::from_le_bytes(data[30..34].try_into().ok()?);
-            let min_lon = i32::from_le_bytes(data[34..38].try_into().ok()?);
-            let max_lon = i32::from_le_bytes(data[38..42].try_into().ok()?);
-            // All zeros means no meaningful bbox (way/relation or missing coordinates)
-            if min_lat == 0 && max_lat == 0 && min_lon == 0 && max_lon == 0 {
-                None
+        // v2/v3: parse the spatial bbox for node blobs.
+        let bbox =
+            if version != INDEX_VERSION_V1 && data.len() >= INDEX_SIZE && kind == ElemKind::Node {
+                let min_lat = i32::from_le_bytes(data[26..30].try_into().ok()?);
+                let max_lat = i32::from_le_bytes(data[30..34].try_into().ok()?);
+                let min_lon = i32::from_le_bytes(data[34..38].try_into().ok()?);
+                let max_lon = i32::from_le_bytes(data[38..42].try_into().ok()?);
+                let words = [min_lat, max_lat, min_lon, max_lon];
+                // v3 spells absence as the inverted box; v2 spelled it with zeros,
+                // so v2 files keep that reading - and keep the ambiguity their
+                // writer baked in. Any inverted box is absence under both versions,
+                // since no well-formed bbox can be inverted.
+                let absent = (version == INDEX_VERSION_V2 && words == [0, 0, 0, 0])
+                    || min_lat > max_lat
+                    || min_lon > max_lon;
+                if absent {
+                    None
+                } else {
+                    Some(BlobBbox {
+                        min_lat,
+                        max_lat,
+                        min_lon,
+                        max_lon,
+                    })
+                }
             } else {
-                Some(BlobBbox {
-                    min_lat,
-                    max_lat,
-                    min_lon,
-                    max_lon,
-                })
-            }
-        } else {
-            None
-        };
+                None
+            };
 
         Some(BlobIndex {
             kind,
@@ -398,6 +437,91 @@ mod tests {
         assert_eq!(recovered.max_id, 100);
         assert_eq!(recovered.count, 100);
         assert!(recovered.bbox.is_none(), "v1 data should have no bbox");
+    }
+
+    /// The bug v3 exists to fix: a genuine single-node blob at exactly
+    /// (0, 0) has the exact bbox `(0, 0, 0, 0)`, which v2 wrote as four zero
+    /// words and read back as "no bbox" - silently dropping spatial filtering
+    /// for that blob, with no way for the encoding to say what was true.
+    #[test]
+    fn a_real_bbox_at_null_island_survives_the_roundtrip() {
+        let index = BlobIndex {
+            kind: ElemKind::Node,
+            min_id: 1,
+            max_id: 1,
+            count: 1,
+            bbox: Some(BlobBbox::new(0, 0, 0, 0)),
+        };
+        let bytes = index.serialize();
+        let recovered = BlobIndex::deserialize(&bytes).expect("deserialize should succeed");
+        let bbox = recovered
+            .bbox
+            .expect("a real (0,0,0,0) bbox must not read back as absence");
+        assert_eq!(
+            (bbox.min_lat, bbox.max_lat, bbox.min_lon, bbox.max_lon),
+            (0, 0, 0, 0)
+        );
+
+        // Paired counterpart, so this is not satisfied by "always report a
+        // bbox": a genuinely absent bbox must still read back as absent, and
+        // must NOT be spelled with zeros any more.
+        let none = BlobIndex {
+            bbox: None,
+            ..index
+        };
+        let none_bytes = none.serialize();
+        assert_ne!(
+            &none_bytes[26..42],
+            &[0u8; 16],
+            "v3 must not spell absence with the zero bytes that a real \
+             (0,0,0,0) box also produces"
+        );
+        assert!(
+            BlobIndex::deserialize(&none_bytes)
+                .expect("deserialize should succeed")
+                .bbox
+                .is_none()
+        );
+    }
+
+    /// v2 files keep the reading their writer intended. Decoding an old file
+    /// under the new rules would change what existing indexed PBFs mean.
+    #[test]
+    fn v2_still_reads_all_zero_as_absence() {
+        let mut bytes = BlobIndex {
+            kind: ElemKind::Node,
+            min_id: 1,
+            max_id: 1,
+            count: 1,
+            bbox: Some(BlobBbox::new(0, 0, 0, 0)),
+        }
+        .serialize();
+        bytes[0] = INDEX_VERSION_V2;
+        bytes[26..42].fill(0);
+        assert!(
+            BlobIndex::deserialize(&bytes)
+                .expect("v2 must still deserialize")
+                .bbox
+                .is_none(),
+            "a v2 index's all-zero bbox means absence, as its writer meant"
+        );
+
+        // Counterpart: a v2 index with a real box still reads it.
+        let mut bytes = BlobIndex {
+            kind: ElemKind::Node,
+            min_id: 1,
+            max_id: 1,
+            count: 1,
+            bbox: Some(BlobBbox::new(10, 20, 30, 40)),
+        }
+        .serialize();
+        bytes[0] = INDEX_VERSION_V2;
+        let bbox = BlobIndex::deserialize(&bytes)
+            .expect("v2 must still deserialize")
+            .bbox
+            .expect("a v2 index with a real box still carries it");
+        assert_eq!(bbox.min_lat, 10);
+        assert_eq!(bbox.max_lon, 40);
     }
 
     #[test]

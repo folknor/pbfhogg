@@ -45,6 +45,35 @@
 
 ### Added
 
+- **`pbfhogg check --index`: verify a file's blob-level metadata against the
+  blobs themselves.** `BlobHeader.indexdata` (element kind, ID range, count,
+  spatial bbox) and `BlobHeader.tagdata` (the blob's tag key set) are hints
+  every fast path in this crate believes without opening the blob - `cat
+  --type` passes a blob through raw on the declared kind, `renumber` assigns
+  IDs from the declared count, `tags-filter` skips whole blobs on the tag
+  index - and nothing in the format signs them. `--distrust-metadata` let a
+  consumer decline to believe them, but there was still no way to ask whether
+  they were true. The new selector decompresses every blob, re-derives the
+  metadata from the payload, and reports each disagreement with its blob
+  ordinal and byte offset; `--json` carries the same verdict. It exits `1`
+  when it finds mismatches and `2` when it cannot run.
+
+  It is opt-in rather than part of the default `--ids` + `--refs` pair,
+  because it decompresses the whole file, and passing it suppresses that
+  default. There is deliberately no `--distrust-metadata` on it: a verifier
+  that consulted the metadata to decide what to look at would be worthless,
+  so it installs no blob filter and decompresses every blob unconditionally.
+  Absence is not a claim - a blob with no indexdata or no tagdata is not
+  reported - and the bbox and tag-key checks are containment rather than
+  equality, so an honest third-party file cannot be reported as lying.
+  Metadata that is present but unreadable is reported, however: an indexdata
+  of an unrecognised length or version, a malformed tag index, and a tag index
+  attached to a blob whose group mixes element kinds (where no key set can be
+  complete, and where `tags-filter` would skip the blob on the strength of it).
+  Ordinary reads treat all three as "no metadata, decode the blob", which is
+  the right call for a reader and no answer at all from a verifier. See
+  [the CLI reference](reference/cli-reference.md#check).
+
 - **`--distrust-metadata` on `tags-filter` and `inspect`.** Both commands
   make decisions from per-blob sidecar metadata that nothing validates
   against the payload it describes: `tags-filter` skips whole blobs on
@@ -221,6 +250,52 @@
   bitset message. It is now an input error naming the problem.
 
 ### Changed
+
+- **Indexdata is now written as format v3, which can represent a bbox at
+  (0, 0).** v2 spelled "this blob has no bounding box" as four zero words -
+  which is also the exact bbox of a single-node blob at Null Island, so such a
+  blob read back as having no bbox and silently lost spatial filtering, with no
+  way for the encoding to say what was true. v3 keeps the same 42-byte layout
+  and marks absence with an inverted box instead, a value no well-formed bbox
+  can take. v1, v2 and v3 are all still read, and v2 files keep their original
+  reading, so existing indexed PBFs are unaffected; only newly written
+  indexdata changes. A pbfhogg older than this release will not recognise v3
+  and will treat such a file as unindexed - correct output, slower paths.
+
+- **`removeid` and `sort` no longer report unverified indexdata as elements
+  they wrote.** Both fold whole blobs through without decoding them, and both
+  counted those blobs' elements from the `BlobHeader.indexdata` count - a
+  number nothing verifies and the command never observed. The headline counts
+  now cover only what was actually decoded, and the passthrough total is
+  reported on its own line as coming from the file's own (unverified) claim.
+  Scripts parsing `Wrote N elements` from `removeid`, or `Sorted N nodes`
+  from `sort`, will see smaller numbers on files with passthrough blobs.
+
+- **`tags-count -e <expr>` now skips blobs on the tag index.** It parses the
+  same expressions as `tags-filter` but built no blob filter, so it
+  decompressed every blob in the file even when the tag index proved a blob
+  could not contribute a single count. Counts are unchanged.
+
+- **`cat --clean` refuses an input without indexdata unless `--force` is
+  passed.** `--clean` routes through the per-kind classify pipeline, whose
+  schedules cannot tell which kind an unindexed blob holds and therefore
+  schedule it as all three - so every blob was read and decompressed three
+  times. The output was correct, which is why it went unnoticed; the guard
+  previously fired only for `--type`. `check --ids` on an unindexed input
+  warns about the same three passes rather than refusing, since `check` must
+  keep working on third-party files.
+
+- **`repack --elements-per-blob N` no longer pre-allocates from `N`
+  unbounded.** `N` came straight off the command line and sized one
+  `BlockBuilder` per worker plus a central one, so a pathological value was
+  several unbounded allocations before a byte of input had been read. The
+  per-block element cap is unchanged; only the pre-allocation is now bounded
+  by what the input could actually deliver.
+
+- **`getparents` stops decoding when a write fails.** The first write error
+  was captured and reported, but the scan still ran the whole schedule to
+  completion, so a planet-scale run whose first write failed paid the entire
+  decode before the error surfaced.
 
 - **`cat --dedupe` now bounds its frame-header allocation.** Its pass-1
   frame loop read the 4-byte big-endian length prefix and resized its

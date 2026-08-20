@@ -74,15 +74,25 @@ pub fn cat(
     force: bool,
     overrides: &HeaderOverrides,
 ) -> Result<CatStats> {
-    if type_filter.is_some() {
+    // The indexdata requirement belongs to `cat_filtered`, not to `--type`.
+    //
+    // It used to be spelled `type_filter.is_some()`, which let `--clean` alone
+    // through: that combination also routes to `cat_filtered`, and
+    // `build_classify_schedules_split` replicates every *unindexed* blob into
+    // all three per-kind schedules, so each blob is read and decompressed three
+    // times. The output is correct, which is why nobody noticed - it is three
+    // times the work with no warning at all.
+    if type_filter.is_some() || clean.any() {
+        let reason = if type_filter.is_some() {
+            "input PBF has no blob-level indexdata. Without indexdata, the type \
+             filter is a no-op - all blobs are decompressed (significantly slower)."
+        } else {
+            "input PBF has no blob-level indexdata. Without indexdata, --clean \
+             decompresses every blob three times - once per element kind - \
+             because an unindexed blob has to be scheduled as all three."
+        };
         for file in files {
-            require_indexdata(
-                file,
-                direct_io,
-                force,
-                "input PBF has no blob-level indexdata. Without indexdata, the type \
-                 filter is a no-op - all blobs are decompressed (significantly slower).",
-            )?;
+            require_indexdata(file, direct_io, force, reason)?;
         }
     }
 

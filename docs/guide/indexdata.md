@@ -14,13 +14,27 @@ A 42-byte fixed-size blob per BlobHeader containing:
 - **ID range** - minimum and maximum element ID in the blob
 - **Spatial bounding box** - min/max latitude and longitude in decimicrodegrees (`i32` coordinates)
 
+The leading byte is a format version. Three are read: v1 (`0x01`, 26 bytes, no
+bbox), v2 (`0x02`, 42 bytes, "no bbox" spelled as four zero words) and v3
+(`0x03`, 42 bytes, current). v3 differs from v2 only in how an absent bbox is
+encoded - as an inverted, unconstructible box rather than as zeros, which are
+also the exact bbox of a blob at (0, 0). New files are written as v3; existing
+v1 and v2 files keep working unchanged.
+
 This enables O(1) blob classification. For example, `apply-changes` determines which blobs are affected by a changeset by comparing ID ranges, passing through ~92% of blobs as raw bytes without decompression.
 
 ### Tagdata (BlobHeader field 4)
 
 A variable-length blob containing the set of unique tag key strings present in the blob. Wire format: version byte (`0x01`) + key count (`u16` LE) + repeated `[key_len (u16 LE) + key_bytes]`.
 
-This enables `tags-filter` and filtered reads to skip decompression of blobs that provably lack required tag keys. For example, `tags-filter highway=primary` skips all blobs without a `highway` key.
+This enables `tags-filter`, `tags-count` and filtered reads to skip decompression of blobs that provably lack required tag keys. For example, `tags-filter highway=primary` skips all blobs without a `highway` key.
+
+## Verifying indexdata
+
+Neither field is signed or checked by the format, and every fast path above
+believes them. `pbfhogg check --index` decompresses every blob and diffs what it
+finds against what the header claims, exiting `1` when they disagree. See
+[check](/cli/commands#check).
 
 ## Generating indexed PBFs
 

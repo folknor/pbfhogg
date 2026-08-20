@@ -902,6 +902,11 @@ enum Command {
         /// Check referential integrity
         #[arg(long)]
         refs: bool,
+        /// Verify blob-level metadata (BlobHeader indexdata + tagdata) against
+        /// the blobs themselves. Decompresses every blob. Opt-in: not part of
+        /// the default --ids + --refs pair.
+        #[arg(long)]
+        index: bool,
         /// Also check relation member references (use with --refs)
         #[arg(long)]
         check_relations: bool,
@@ -1067,6 +1072,7 @@ struct TagsFilterFlags {
 struct CheckFlags {
     ids: bool,
     refs: bool,
+    index: bool,
     check_relations: bool,
     show_ids: bool,
     full: bool,
@@ -1827,6 +1833,7 @@ fn main() -> process::ExitCode {
                 file,
                 ids,
                 refs,
+                index,
                 check_relations,
                 show_ids,
                 full,
@@ -1840,6 +1847,7 @@ fn main() -> process::ExitCode {
                 CheckFlags {
                     ids,
                     refs,
+                    index,
                     check_relations,
                     show_ids,
                     full,
@@ -1952,15 +1960,24 @@ fn run_check(
     let CheckFlags {
         ids,
         refs,
+        index,
         check_relations,
         show_ids,
         full,
         json,
         quiet,
     } = flags;
-    // Default: run both checks when neither --ids nor --refs specified
-    let run_ids = ids || !refs;
-    let run_refs = refs || !ids;
+    // Default: run the --ids + --refs pair when no selector is given.
+    //
+    // `--index` is a selector like the other two, but it is NOT part of the
+    // default set: it decompresses the entire file to re-derive every blob's
+    // metadata, so folding it into a bare `check` would silently multiply the
+    // cost of the command everyone already runs. It does suppress the default,
+    // so `check --index` runs only the metadata verification.
+    let any_selector = ids || refs || index;
+    let run_ids = ids || !any_selector;
+    let run_refs = refs || !any_selector;
+    let run_index = index;
 
     // Validate flags that only apply to one check mode
     if !run_ids {
@@ -2006,6 +2023,23 @@ fn run_check(
         None
     };
 
+    let index_report = if run_index {
+        use pbfhogg::check::index::CheckIndexOptions;
+        let report = pbfhogg::check::index::check_index(
+            path,
+            &CheckIndexOptions {
+                max_errors,
+                direct_io,
+            },
+        )?;
+        if !report.passed() {
+            failed = true;
+        }
+        Some(report)
+    } else {
+        None
+    };
+
     let refs_result = if run_refs {
         let result = pbfhogg::check::refs::check_refs(path, check_relations, show_ids, direct_io)?;
         if !result.is_valid() {
@@ -2021,6 +2055,9 @@ fn run_check(
         let mut combined = serde_json::Map::new();
         if let Some(ref report) = ids_report {
             combined.insert("ids".to_string(), report.to_json_value(file_name));
+        }
+        if let Some(ref report) = index_report {
+            combined.insert("index".to_string(), report.to_json_value(file_name));
         }
         if let Some(ref result) = refs_result {
             let mut refs_obj = serde_json::json!({
@@ -2061,6 +2098,14 @@ fn run_check(
         if let Some(ref report) = ids_report {
             report.print_human(file_name);
         }
+        if let Some(ref report) = index_report {
+            if ids_report.is_some() {
+                println!();
+                println!("---");
+                println!();
+            }
+            report.print_human(file_name);
+        }
         if let Some(ref result) = refs_result {
             if show_ids {
                 for mref in &result.missing_refs {
@@ -2073,7 +2118,7 @@ fn run_check(
                     );
                 }
             }
-            if ids_report.is_some() {
+            if ids_report.is_some() || index_report.is_some() {
                 println!();
                 println!("---");
                 println!();

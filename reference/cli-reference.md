@@ -95,7 +95,14 @@ Count tag key=value frequencies (subcommand of `inspect`).
 
 Validate PBF file integrity (IDs + referential integrity).
 
-With no flags, runs both ID and referential integrity checks. Use `--ids` or `--refs` to run only one.
+Validate PBF integrity along three independent axes, selected by flag. With no
+flag, the ID and referential integrity checks both run.
+
+`--index` is a selector like the other two but is deliberately **not** in the
+default set: it decompresses every blob in the file, and folding that into a
+bare `check` would multiply the cost of the command everyone already runs.
+Passing it suppresses the default pair; combine it with `--ids` / `--refs` to
+run more than one.
 
 ```
 pbfhogg check [OPTIONS] <FILE>
@@ -105,6 +112,7 @@ pbfhogg check [OPTIONS] <FILE>
 |------|-------------|
 | `--ids` | Check ID uniqueness and ordering only |
 | `--refs` | Check referential integrity only |
+| `--index` | Verify blob-level metadata against the blobs. Decompresses every blob |
 | `--full` | Full duplicate detection via bitmap (slower, more memory; applies to ID check) |
 | `-t, --type <TYPE>` | Filter by element type (comma-separated: node, way, relation; applies to ID check) |
 | `--max-errors <N>` | Stop after N violations (0 = unlimited) [default: 100] |
@@ -126,6 +134,62 @@ negative IDs by ascending absolute value, then the positives - which is the
 order `sort` produces. On a positive-only file (every production PBF) that is
 plain `i64` order; on a file carrying negative IDs the two differ, and the
 canonical one is the definition.
+
+#### `--index`: the metadata trust boundary
+
+`BlobHeader.indexdata` (element kind, ID range, element count, spatial bbox) and
+`BlobHeader.tagdata` (the blob's tag key set) are hints every fast path in this
+crate believes without opening the blob. `cat --type` passes a blob through raw
+on the strength of the declared kind, `renumber` assigns IDs from the declared
+count, `tags-filter` skips whole blobs on the strength of the tag index, and the
+spatial filter skips node blobs on the strength of the bbox. Nothing in the
+format signs any of it, and `degrade --corrupt-indexdata` /
+`--corrupt-indexdata-kind` / `--corrupt-tagdata` exist precisely to manufacture
+files whose hints are well-formed and false.
+
+`check --index` is the other side of that boundary. It decompresses every
+OSMData blob, re-derives the metadata from the payload with `scan_block_ids`
+and `scan_block_tags`, and reports each disagreement with the blob's ordinal and
+byte offset.
+
+Those are the same two scanners the writer's passthrough path uses, so on a
+re-framed blob the check cannot catch a bug *in the scanner itself* - it can
+only catch metadata that has since diverged from its payload. Against the
+ordinary write path it is genuinely independent: `BlockBuilder` derives its
+index incrementally as elements are added and never rescans the bytes it
+emitted, so a disagreement between the two is a real finding either way.
+
+**There is no `--distrust-metadata` flag on it, by design.** A verifier that
+consulted the thing it is verifying in order to decide what to look at would be
+worthless, so the command installs no blob filter, never calls
+`require_indexdata`, and decompresses every blob unconditionally - including
+blobs whose stored index claims a kind nobody asked about. Distrust is the only
+mode it has.
+
+Absence is not a claim. A blob with no indexdata, or no tagdata, is not
+reported; that is the ordinary state of any third-party PBF, and of every v1
+(26-byte) index, which has no bbox field at all.
+
+**Unreadable is not the same as absent.** Indexdata whose length, version byte
+or element-kind byte the reader does not recognise is reported as a violation
+even though every *reader* collapses it to "no index" and decodes the blob.
+The safe reading is right for a reader and wrong for a verifier: a file that
+claims something it cannot back up is not a file that claims nothing.
+Malformed tagdata is reported the same way, and so is a well-formed tagdata
+attached to a blob this crate refuses to index at all - a group mixing element
+kinds, where any key set is necessarily incomplete because the scanner sees
+only the first element field, and `tags-filter` would skip the blob on the
+strength of it.
+
+Two checks are containment rather than equality:
+
+| Field | Test | Why |
+|-------|------|-----|
+| kind, count, min_id, max_id | exact equality | every consumer treats them as exact |
+| bbox | stored must **contain** the blob's coordinates | the scan rounds outward through `granularity`/`lat_offset`/`lon_offset`, so a stored box narrower than the scan is the only shape that can make a spatial filter skip a blob it should have read. A wider box is sound; an absent box is no claim |
+| tag key set | stored must contain every key the blob carries | an omitted key makes `tags-filter` skip a blob holding matches. A key listed but not present is sound - it only costs a decode - and is reported as a separate, distinct violation |
+
+Exit `1` means mismatches were found, exit `2` that the check could not run.
 
 The ref check reports element IDs it could not track - negative IDs, or IDs
 above the range it sized from the file's own indexdata - as a separate
@@ -578,6 +642,7 @@ Which commands support `--direct-io` (O_DIRECT bypass of page cache) and `--io-u
 | inspect --nodes | Yes | - | Yes | - | Read-only |
 | check --ids | Yes | - | Yes | - | Read-only |
 | check --refs | Yes | - | Yes | - | Read-only |
+| check --index | Yes | - | Yes | - | Read-only; decompresses every blob |
 | cat | Yes | Yes | Yes (R+W) | - | Passthrough + filtered paths |
 | cat --dedupe | Yes | Yes | Yes (R+W) | Yes | Via merge-pbf path |
 | sort | Yes | Yes | Yes (R+W) | Yes | |

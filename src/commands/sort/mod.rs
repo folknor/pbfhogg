@@ -37,6 +37,10 @@ pub struct SortStats {
     pub nodes: u64,
     pub ways: u64,
     pub relations: u64,
+    /// Elements in passthrough blobs whose count came from unverified
+    /// `BlobHeader.indexdata` rather than from a decode. See
+    /// [`BlobEntry::index_scanned`].
+    pub passthrough_claimed: u64,
     pub blobs_passthrough: u64,
     pub blobs_rewritten: u64,
     pub blobs_total: u64,
@@ -53,6 +57,13 @@ impl SortStats {
             self.blobs_passthrough,
             self.blobs_rewritten,
         );
+        if self.passthrough_claimed > 0 {
+            eprintln!(
+                "  plus {} elements in blobs copied through without decoding, per \
+                 their indexdata (unverified - `pbfhogg check --index` checks it)",
+                self.passthrough_claimed,
+            );
+        }
     }
 }
 
@@ -82,6 +93,15 @@ struct BlobEntry {
     /// reorders it, even when its (min_id, max_id) range does not overlap
     /// any neighbour.
     intra_unsorted: bool,
+    /// True when `index` was derived by decoding the blob's payload, false
+    /// when it was read out of the `BlobHeader` and believed.
+    ///
+    /// Only the element counters need this. A passthrough blob's elements are
+    /// never decoded on the declared-sorted fast path, so `index.count` there
+    /// is the file's own unverified claim about itself; folding it into
+    /// "Sorted N nodes" reported hearsay as observation, and a lying
+    /// `indexdata` moved the number with nothing to say so.
+    index_scanned: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +230,7 @@ pub fn sort(
         nodes: 0,
         ways: 0,
         relations: 0,
+        passthrough_claimed: 0,
         blobs_passthrough: 0,
         blobs_rewritten: 0,
         blobs_total: entries.len() as u64,
@@ -396,6 +417,7 @@ fn build_blob_index(
                 // scan below.
                 let header_claims_sorted =
                     header.as_ref().is_some_and(crate::HeaderBlock::is_sorted);
+                let mut index_scanned = true;
                 let (index, intra_unsorted) = match meta.index.filter(|_| header_claims_sorted) {
                     // Declared-sorted input: pass 1 reads only the indexdata
                     // header and never touches the payload. Intra-blob order
@@ -403,7 +425,10 @@ fn build_blob_index(
                     // itself, upheld by pbfhogg's own sorted producers and
                     // trusted here exactly as ElementReader trusts it (see
                     // CORRECTNESS.md).
-                    Some(idx) => (idx, false),
+                    Some(idx) => {
+                        index_scanned = false;
+                        (idx, false)
+                    }
                     None => {
                         // No indexdata, or indexdata on an input that does
                         // not declare itself sorted (e.g. unsorted input run
@@ -427,6 +452,7 @@ fn build_blob_index(
                     has_indexdata,
                     tagdata: meta.tagdata,
                     intra_unsorted,
+                    index_scanned,
                 });
             }
             _ => {
@@ -694,6 +720,13 @@ fn extract_blob_bytes(frame: &[u8]) -> Result<&[u8]> {
 
 /// Add element counts from a blob entry to stats.
 fn count_entry(entry: &BlobEntry, stats: &mut SortStats) {
+    if !entry.index_scanned {
+        // Declared-sorted fast path: the payload was never touched, so the
+        // only count available is the one the header claims. Keep it out of
+        // the observed totals.
+        stats.passthrough_claimed += entry.index.count;
+        return;
+    }
     match entry.index.kind {
         ElemKind::Node => stats.nodes += entry.index.count,
         ElemKind::Way => stats.ways += entry.index.count,
@@ -904,6 +937,7 @@ mod tests {
             has_indexdata: true,
             tagdata: None,
             intra_unsorted: false,
+            index_scanned: true,
         }
     }
 

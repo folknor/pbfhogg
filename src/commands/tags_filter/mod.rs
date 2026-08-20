@@ -39,7 +39,7 @@ use super::Result;
 /// refuses to constrain would have turned newly-valid expressions into
 /// silently-skipped blobs, which is exactly the class of bug the rewrite was
 /// closing.
-fn blob_filter_from_expressions(expressions: &[Expression]) -> Option<BlobFilter> {
+pub(crate) fn blob_filter_from_expressions(expressions: &[Expression]) -> Option<BlobFilter> {
     let mut need_nodes = false;
     let mut need_ways = false;
     let mut need_relations = false;
@@ -630,47 +630,6 @@ fn filter_block_pass2(
 // Two-pass filter (default mode, include references)
 // ---------------------------------------------------------------------------
 
-/// Classify-phase blob filter. Returns `(skip, tag_skip)`: `skip=true` means
-/// the caller should skip the blob; `tag_skip=true` means the skip was driven
-/// by the tag-index filter (the caller should bump its tag-skip counter).
-///
-/// Takes the already-parsed `BlobIndex` and raw `tagdata` bytes so callers
-/// can feed it from either a `BlobHeader` (via `hdr.index()` / `hdr.tag_index()`
-/// materialisation) or a `HeaderWalker` `BlobHeaderMeta` (which already
-/// parses `index` up-front and holds raw `tagdata` bytes).
-fn classify_blob_filter_check(
-    index: Option<&crate::blob_meta::BlobIndex>,
-    tagdata: Option<&[u8]>,
-    filter: Option<&BlobFilter>,
-) -> (bool, bool) {
-    let Some(filter) = filter else {
-        return (false, false);
-    };
-    if let Some(idx) = index {
-        let dominated = matches!(
-            idx.kind,
-            crate::blob_meta::ElemKind::Node if !filter.want_nodes
-        ) || matches!(
-            idx.kind,
-            crate::blob_meta::ElemKind::Way if !filter.want_ways
-        ) || matches!(
-            idx.kind,
-            crate::blob_meta::ElemKind::Relation if !filter.want_relations
-        );
-        if dominated {
-            return (true, false);
-        }
-    }
-    if filter.has_tag_filter()
-        && let Some(bytes) = tagdata
-        && let Some(tag_idx) = crate::blob_meta::TagIndex::deserialize(bytes)
-        && !filter.wants_tag_index(&tag_idx)
-    {
-        return (true, true);
-    }
-    (false, false)
-}
-
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
@@ -743,7 +702,7 @@ fn tags_filter_two_pass(
             if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
                 continue;
             }
-            let (skip, tag_skip) = classify_blob_filter_check(
+            let (skip, tag_skip) = crate::scan::classify::blob_filter_check(
                 meta.index.as_ref(),
                 meta.tagdata.as_deref(),
                 expr_filter.as_ref(),

@@ -28,6 +28,17 @@ pub(crate) struct WireBlobHeader {
     pub datasize: i32,
     /// Blob-level index: 42 bytes (v2) or 26 bytes (v1, zero-padded), stored inline.
     pub indexdata: Option<[u8; crate::blob_meta::INDEX_SIZE]>,
+    /// Whether field 2 was present and non-empty on the wire, *regardless* of
+    /// whether its length was one this crate recognises.
+    ///
+    /// Every read path collapses an unrecognised-length indexdata to
+    /// `indexdata: None` and treats the blob as unindexed, which is the safe
+    /// direction for a reader but erases the distinction a *verifier* needs:
+    /// "this blob makes no claim" and "this blob makes a claim I cannot read"
+    /// are different facts about the file, and `check --index` must be able to
+    /// tell them apart. Only `parse_indexdata` parses can set this; a parse
+    /// that skips field 2 leaves it `false`.
+    pub indexdata_present: bool,
     /// Per-blob tag key index (BlobHeader field 4). Variable-length.
     pub tagdata: Option<Box<[u8]>>,
     /// Per-blob way-member bitmap (BlobHeader field 5). Variable-length.
@@ -82,6 +93,7 @@ impl WireBlobHeader {
         let mut blob_type = BlobKind::Unknown(String::new());
         let mut datasize: i32 = 0;
         let mut indexdata: Option<[u8; crate::blob_meta::INDEX_SIZE]> = None;
+        let mut indexdata_present = false;
         let mut tagdata: Option<Box<[u8]>> = None;
         let mut waymembers: Option<Box<[u8]>> = None;
 
@@ -103,6 +115,7 @@ impl WireBlobHeader {
                     // indexdata: bytes (len-delimited) - accept v1 (26) or v2 (42) sizes
                     let bytes = cursor.read_len_delimited()?;
                     let len = bytes.len();
+                    indexdata_present |= len != 0;
                     if len == crate::blob_meta::INDEX_SIZE || len == 26 {
                         let mut buf = [0u8; crate::blob_meta::INDEX_SIZE];
                         buf[..len].copy_from_slice(bytes);
@@ -149,6 +162,7 @@ impl WireBlobHeader {
             blob_type,
             datasize,
             indexdata,
+            indexdata_present,
             tagdata,
             waymembers,
         })
@@ -338,10 +352,16 @@ pub const MAX_BLOB_MESSAGE_SIZE: u64 = 32 * 1024 * 1024;
 /// explicit.
 pub const MAX_BLOB_DATASIZE: u64 = MAX_BLOB_MESSAGE_SIZE;
 
-/// Parse a blob header and extract type, datasize, indexdata, and tagdata.
+/// Parse a blob header and extract type, datasize, indexdata, whether an
+/// indexdata field was present at all, and tagdata.
 ///
 /// Used by the pread-from-workers pattern to classify and dispatch raw
 /// blobs without decompression. The tagdata contains per-blob tag key metadata.
+///
+/// The fourth element is deliberately separate from the third: an indexdata of
+/// an unrecognised length parses to `None` here, and every reader is right to
+/// treat that as "no index". A verifier is not - see
+/// [`WireBlobHeader::indexdata_present`].
 #[allow(clippy::type_complexity)]
 pub(crate) fn parse_blob_header_with_index(
     header_bytes: &[u8],
@@ -349,6 +369,7 @@ pub(crate) fn parse_blob_header_with_index(
     BlobKind,
     usize,
     Option<[u8; crate::blob_meta::INDEX_SIZE]>,
+    bool,
     Option<Box<[u8]>>,
 )> {
     let header = WireBlobHeader::parse(header_bytes, true, true, false)?;
@@ -379,6 +400,7 @@ pub(crate) fn parse_blob_header_with_index(
         header.blob_type,
         header.datasize as usize,
         header.indexdata,
+        header.indexdata_present,
         header.tagdata,
     ))
 }
@@ -429,7 +451,7 @@ mod tests {
     fn datasize_at_or_over_cap_is_rejected() {
         // One below the cap: accepted, size flows through unchanged.
         let max_legal = MAX_BLOB_DATASIZE - 1;
-        let (_, data_size, _, _) =
+        let (_, data_size, _, _, _) =
             parse_blob_header_with_index(&header_with_datasize(max_legal)).unwrap();
         assert_eq!(data_size as u64, max_legal);
 
@@ -459,7 +481,7 @@ mod tests {
     /// cap, so well-formed blobs parse exactly as before.
     #[test]
     fn small_datasize_parses_normally() {
-        let (blob_type, data_size, _, _) =
+        let (blob_type, data_size, _, _, _) =
             parse_blob_header_with_index(&header_with_datasize(1234)).unwrap();
         assert_eq!(blob_type, BlobKind::OsmData);
         assert_eq!(data_size, 1234);
@@ -501,7 +523,7 @@ mod tests {
         // An unrecognised but non-empty type still parses, so the check has not
         // cost the format its forward compatibility.
         let future_type = vec![0x0A, 0x06, b'O', b'S', b'M', b'F', b'o', b'o', 0x18, 100];
-        let (blob_type, data_size, _, _) = parse_blob_header_with_index(&future_type)
+        let (blob_type, data_size, _, _, _) = parse_blob_header_with_index(&future_type)
             .expect("an unknown but named blob type must still parse");
         assert_eq!(blob_type, BlobKind::Unknown("OSMFoo".to_string()));
         assert_eq!(data_size, 100);

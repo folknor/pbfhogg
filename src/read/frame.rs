@@ -83,6 +83,12 @@ pub(crate) struct FrameHeader {
     /// Declared payload length. Bounded by `MAX_BLOB_DATASIZE`.
     pub(crate) data_size: usize,
     pub(crate) raw_index: Option<[u8; crate::blob_meta::INDEX_SIZE]>,
+    /// Whether the header carried a non-empty `indexdata` field at all, even
+    /// one whose length this crate does not recognise and therefore did not
+    /// keep in `raw_index`. Only `check --index` reads it; see
+    /// `WireBlobHeader::indexdata_present` for why a verifier needs the
+    /// distinction every reader is right to collapse.
+    pub(crate) raw_index_present: bool,
     pub(crate) tagdata: Option<Box<[u8]>>,
 }
 
@@ -117,12 +123,14 @@ pub(crate) fn read_frame_header<R: Read>(
     // (>= MAX_BLOB_DATASIZE) before returning, so `data_size` is bounded here
     // and no caller can be driven into an outsized payload allocation by a
     // hostile `BlobHeader.datasize`.
-    let (blob_type, data_size, raw_index, tagdata) = parse_blob_header_with_index(header_buf)?;
+    let (blob_type, data_size, raw_index, raw_index_present, tagdata) =
+        parse_blob_header_with_index(header_buf)?;
     Ok(Some(FrameHeader {
         header_len,
         blob_type,
         data_size,
         raw_index,
+        raw_index_present,
         tagdata,
     }))
 }

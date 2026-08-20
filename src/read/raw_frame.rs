@@ -27,8 +27,17 @@ pub(crate) struct RawBlobFrame {
     pub(crate) blob_type: BlobKind,
     /// Byte offset within `frame_bytes` where the Blob protobuf starts.
     pub(crate) blob_offset: usize,
-    /// Blob-level index from BlobHeader indexdata, if present.
+    /// Blob-level index from BlobHeader indexdata, if present *and* readable.
     pub(crate) index: Option<BlobIndex>,
+    /// Whether the header carried a non-empty indexdata field at all.
+    ///
+    /// `index` collapses "absent" and "present but unreadable" into `None`,
+    /// which is correct for every reader - an index it cannot read is an index
+    /// it must not act on - and wrong for `check --index`, whose entire job is
+    /// to notice that the file claims something it cannot back up. Malformed
+    /// indexdata was passing verification silently until this field existed.
+    #[allow(dead_code)]
+    pub(crate) index_present: bool,
     /// Per-blob tag key data from BlobHeader field 4, if present.
     /// Populated by `read_raw_frame` for downstream callers; current
     /// readers (extract, cat, diff, etc.) don't access it directly,
@@ -88,6 +97,7 @@ pub(crate) fn read_raw_frame<R: Read>(
         blob_type: header.blob_type,
         blob_offset,
         index,
+        index_present: header.raw_index_present,
         tagdata: header.tagdata,
         file_offset: frame_start,
     }))

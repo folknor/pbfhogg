@@ -1225,6 +1225,25 @@ fn removeid_multi_blob_passthrough() {
     );
     // Ways untouched.
     assert_eq!(way_ids(&c), (1_000..1_005).collect::<Vec<_>>());
-    assert_eq!(stats.nodes_written, 30);
-    assert_eq!(stats.ways_written, 5);
+    // Every surviving element here rides through on the raw-passthrough
+    // branch, which never decodes the blob - so `removeid` observed none of
+    // them. The counts it can report are the ones its `BlobHeader.indexdata`
+    // claims, and those are reported separately rather than folded into
+    // "elements written", which used to present unverified metadata as an
+    // observation. The output itself is checked element-by-element above, so
+    // this is only about which number the command is entitled to print.
+    assert_eq!(
+        (
+            stats.nodes_written,
+            stats.ways_written,
+            stats.relations_written
+        ),
+        (0, 0, 0),
+        "nothing was decoded on the passthrough branch, so nothing is observed"
+    );
+    assert_eq!(
+        stats.passthrough_claimed, 35,
+        "30 surviving nodes + 5 ways, per the indexdata of the blobs copied \
+         through without decoding"
+    );
 }

@@ -60,6 +60,41 @@ Picked 2026-07-30, right after the 0.5.0 release.
   never tests `== 1`. Close this by reading brokkr's process-exit
   handling once from a host where that tree is readable.
 
+- [ ] **Cross-repo: brokkr has no `check-index` subcommand.** Every
+  pbfhogg CLI command is normally reachable as a brokkr subcommand, which
+  is what gives it a timed run, a `--bench` row in `.brokkr/results.db`,
+  a sidecar phase profile, `--snapshot` addressing into the dataset
+  graph, and a place in `brokkr suite pbfhogg`. `check --index` is new in
+  0.6.0 and has none of that. The symptom here: it is the most expensive
+  read-only command in the tool - it decompresses every OSMData blob in
+  the file, so it costs roughly a full `cat --clean` pass - and there is
+  currently no way to measure that cost, watch it across commits, or run
+  it against a registered snapshot rather than a hand-typed path. It also
+  cannot join the release-gate suite, so a regression that made the
+  verifier slower, or made it stop looking at blobs, would not show up in
+  any tracked number.
+
+  What brokkr would have to ship: a `check-index` subcommand mapping to
+  `pbfhogg check --index <input>`, with the standard `--dataset` /
+  `--variant` / `--snapshot` resolution the other read-only consumers
+  already get, and an entry in the `pbfhogg` suite. It needs no new
+  measurement machinery - the command already emits `CHECK_INDEX_START` /
+  `CHECK_INDEX_END` markers, so `--bench` and `brokkr sidecar
+  --durations` would work the day the subcommand exists. One wrinkle for
+  whoever writes it: `check --index` exits 1 when it finds a lying blob,
+  which is a successful run reporting a negative answer, not a failed
+  command - a runner that treats any nonzero exit as failure would record
+  a corrupt-file benchmark as a broken build. That is the same exit-code
+  concern as the item above, reached from the other direction.
+
+  What was done here instead: the command was exercised by hand against
+  the real Denmark files (the 464 MB v1-indexdata extract among them) and
+  by the CLI integration tests in `tests/cli_check_index.rs`, which cover
+  the honest, corrupt, unreadable and unindexable cases plus both exit
+  codes. What remains merely disclosed: there is no recorded timing for
+  `check --index` at any scale, and no automated run of it over a
+  dataset larger than a test fixture.
+
 - [ ] **CLI UX decision pair** (details under Milestone 3 / Command
   surface): pick and apply the scratch-dir posture uniformly across
   every large-scratch command, and replace `--index-type` on

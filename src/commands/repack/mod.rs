@@ -205,6 +205,16 @@ pub fn repack(
         );
     }
 
+    // Pre-allocation ceiling for every BlockBuilder in this run, derived from
+    // the input rather than fixed: a file cannot deliver more elements than it
+    // has bytes. See `BlockBuilder::with_element_cap_prealloc`.
+    let prealloc_bound = usize::try_from(
+        std::fs::metadata(input)
+            .map(|m| m.len())
+            .unwrap_or(u64::MAX),
+    )
+    .unwrap_or(usize::MAX);
+
     let mut blobs_written: u64 = 0;
     let mut elements_written: u64 = 0;
     let mut total_coalesces: u64 = 0;
@@ -218,6 +228,7 @@ pub fn repack(
         &node_schedule,
         ElemKind::Node,
         elements_per_blob,
+        prealloc_bound,
         compression,
         preserve_locations,
         &mut writer,
@@ -237,6 +248,7 @@ pub fn repack(
         &way_schedule,
         ElemKind::Way,
         elements_per_blob,
+        prealloc_bound,
         compression,
         preserve_locations,
         &mut writer,
@@ -256,6 +268,7 @@ pub fn repack(
         &rel_schedule,
         ElemKind::Relation,
         elements_per_blob,
+        prealloc_bound,
         compression,
         preserve_locations,
         &mut writer,
@@ -345,13 +358,14 @@ fn emit_phase_counters(kind: &str, s: &PhaseStats) {
 /// framed in parallel; trailing partial owned-and-shipped); the merge
 /// thread writes full blocks directly and runs a single long-lived
 /// `BlockBuilder` for cross-input-blob coalescing on the trailing slices.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn run_kind_phase(
     shared_file: &std::sync::Arc<std::fs::File>,
     schedule: &[(usize, u64, usize)],
     kind: ElemKind,
     elements_per_blob: usize,
+    prealloc_bound: usize,
     compression: Compression,
     preserve_locations: bool,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
@@ -374,7 +388,12 @@ fn run_kind_phase(
     // without holding too many decoded payloads in flight.
     let mut reorder: ReorderBuffer<PhaseResult> = ReorderBuffer::with_capacity(32);
 
-    let mut bb = BlockBuilder::with_element_cap(elements_per_blob);
+    // Same bound as the workers', derived from the input instead of a block:
+    // the file cannot deliver more elements than it has bytes (an element
+    // needs at least one byte on the wire). Undershooting only costs a vector
+    // growth that in practice never happens; not bounding it at all let a
+    // single CLI integer request an unbounded allocation.
+    let mut bb = BlockBuilder::with_element_cap_prealloc(elements_per_blob, prealloc_bound);
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut pending: Vec<OwnedBlock> = Vec::with_capacity(FRAME_BATCH);
     let mut blobs: u64 = 0;
@@ -620,7 +639,11 @@ fn worker_split_blob(
     let tail_size = total % cap;
     let full_count = total - tail_size;
 
-    let mut bb = BlockBuilder::with_element_cap(cap);
+    // `cap` is user input; `total` is what this block actually holds. A block
+    // can never fill more than `total` slots, so that is the honest
+    // pre-allocation bound - `repack --elements-per-blob 9000000000000000000`
+    // must not ask for a 9-exabyte vector per worker.
+    let mut bb = BlockBuilder::with_element_cap_prealloc(cap, total);
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut full_framed: Vec<Vec<u8>> = Vec::new();
     let mut tail: KindPayload = match kind {

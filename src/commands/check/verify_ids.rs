@@ -302,6 +302,29 @@ pub fn verify_ids(path: &Path, opts: &VerifyIdsOptions) -> Result<VerifyIdsRepor
 // translation step.
 
 #[allow(clippy::too_many_lines)]
+/// Warn that an unindexed input costs three decompression passes.
+///
+/// `build_classify_schedules_split` cannot tell which kind an unindexed blob
+/// holds, so it replicates that blob into all three per-kind schedules and each
+/// one gets read and decompressed three times. The answer is correct - which is
+/// why this went unnoticed - but it is three times the work, silently.
+///
+/// This is a warning rather than a refusal (the `require_indexdata` treatment
+/// the transform commands get) because `check` is a validation command with no
+/// `--force`: refusing would make it impossible to validate exactly the
+/// third-party files most in need of validating.
+fn warn_unindexed_triple_scan(indexed: bool) {
+    if !indexed {
+        eprintln!(
+            "warning: input has no blob-level indexdata, so every blob is \
+             decompressed three times - once per element kind, because an \
+             unindexed blob has to be scheduled as all three. Generate an \
+             indexed copy with `pbfhogg cat input.osm.pbf -o indexed.osm.pbf` \
+             to check it in a single pass."
+        );
+    }
+}
+
 fn verify_ids_streaming_parallel(path: &Path, opts: &VerifyIdsOptions) -> Result<VerifyIdsReport> {
     use crate::Element;
 
@@ -320,6 +343,7 @@ fn verify_ids_streaming_parallel(path: &Path, opts: &VerifyIdsOptions) -> Result
         .header()
         .is_sorted();
     let indexed = crate::commands::has_indexdata(path, opts.direct_io)?;
+    warn_unindexed_triple_scan(indexed);
 
     let type_filter = TypeFilter::or_all(opts.type_filter);
 
@@ -568,6 +592,7 @@ fn verify_ids_full_parallel(path: &Path, opts: &VerifyIdsOptions) -> Result<Veri
         .header()
         .is_sorted();
     let indexed = crate::commands::has_indexdata(path, opts.direct_io)?;
+    warn_unindexed_triple_scan(indexed);
 
     let type_filter = TypeFilter::or_all(opts.type_filter);
 

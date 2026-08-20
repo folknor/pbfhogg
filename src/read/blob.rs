@@ -1473,6 +1473,7 @@ mod tests {
                 blob_type: kind.clone(),
                 datasize: 0,
                 indexdata: None,
+                indexdata_present: false,
                 tagdata: None,
                 waymembers: None,
             };
@@ -1497,6 +1498,7 @@ mod tests {
             blob_type: BlobKind::OsmData,
             datasize: 1_000_000,
             indexdata: None,
+            indexdata_present: false,
             tagdata: None,
             waymembers: None,
         };
@@ -1517,6 +1519,7 @@ mod tests {
             blob_type: BlobKind::OsmData,
             datasize: -1,
             indexdata: None,
+            indexdata_present: false,
             tagdata: None,
             waymembers: None,
         };
@@ -1532,6 +1535,7 @@ mod tests {
             blob_type: BlobKind::OsmData,
             datasize: 0,
             indexdata: None,
+            indexdata_present: false,
             tagdata: None,
             waymembers: waymembers.map(Vec::into_boxed_slice),
         };

@@ -882,6 +882,66 @@ fn cat_type_way_passthrough_across_multiple_blobs() {
     );
 }
 
+/// `--clean` on an unindexed input must refuse without `--force`.
+///
+/// `--clean` routes through `cat_filtered`, whose per-kind schedules cannot
+/// tell which kind an unindexed blob holds and therefore replicate it into all
+/// three - so every blob is read and decompressed three times. The output is
+/// correct, which is why this went unnoticed: the guard used to key on
+/// `--type` alone and let `--clean` past silently.
+#[test]
+fn clean_on_an_unindexed_input_refuses_without_force() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let indexed = dir.path().join("indexed.osm.pbf");
+    let unindexed = dir.path().join("unindexed.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    write_clean_fixture(&indexed);
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&indexed)
+        .arg("-o")
+        .arg(&unindexed)
+        .arg("--strip-indexdata")
+        .assert_success();
+
+    let out = CliInvoker::new()
+        .arg("cat")
+        .arg(&unindexed)
+        .arg("-o")
+        .arg(&output)
+        .arg("-c")
+        .arg("version")
+        .run();
+    assert!(
+        !out.status.success(),
+        "--clean on an unindexed input costs three decode passes and must say \
+         so; stderr:\n{}",
+        out.stderr_str(),
+    );
+    out.assert_stderr_contains("three times");
+
+    // Two paired counterparts, so this is not satisfied by "cat now refuses
+    // everything": --force proceeds, and the same file with an index is fine.
+    CliInvoker::new()
+        .arg("cat")
+        .arg(&unindexed)
+        .arg("-o")
+        .arg(&output)
+        .arg("-c")
+        .arg("version")
+        .arg("--force")
+        .assert_success();
+    CliInvoker::new()
+        .arg("cat")
+        .arg(&indexed)
+        .arg("-o")
+        .arg(&output)
+        .arg("-c")
+        .arg("version")
+        .assert_success();
+}
+
 // ---------------------------------------------------------------------------
 // Platform tier
 // ---------------------------------------------------------------------------

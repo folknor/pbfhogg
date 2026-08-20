@@ -587,6 +587,46 @@ enum BlobKindLabel {
 /// "the consumer fell back to decoding because the bytes were garbage" - two
 /// outcomes that look identical from the consumer's output.
 fn declared_indexdata(path: &Path) -> Vec<(BlobKindLabel, i64, i64, u64)> {
+    let mut out = Vec::new();
+    for bytes in declared_index_bytes(path) {
+        assert!(
+            bytes.len() >= 26,
+            "a well-formed index is at least the 26-byte v1 layout, got {}",
+            bytes.len()
+        );
+        // v1 (26 bytes, no bbox), v2 (42 bytes, absence spelled as zeros) and
+        // v3 (42 bytes, absence spelled as an inverted box) are the versions
+        // `BlobIndex::deserialize` accepts. A corrupt index has to declare one
+        // of them or the reader rejects it outright, and every consumer test
+        // built on it would be proving that rejection works rather than that
+        // the consumer stopped believing a plausible lie.
+        assert!(
+            matches!(bytes[0], 0x01..=0x03),
+            "a well-formed index declares a version the reader recognises, got {:#04x}",
+            bytes[0]
+        );
+        let kind = match bytes[1] {
+            0 => BlobKindLabel::Node,
+            1 => BlobKindLabel::Way,
+            2 => BlobKindLabel::Relation,
+            other => panic!("a well-formed index declares a known element kind, got {other}"),
+        };
+        let min_id = i64::from_le_bytes(bytes[2..10].try_into().expect("8 bytes"));
+        let max_id = i64::from_le_bytes(bytes[10..18].try_into().expect("8 bytes"));
+        let count = u64::from_le_bytes(bytes[18..26].try_into().expect("8 bytes"));
+        out.push((kind, min_id, max_id, count));
+    }
+    out
+}
+
+/// Every OsmData blob's raw `BlobHeader` field 2 bytes, walked out of the file
+/// by hand.
+///
+/// Split out from [`declared_indexdata`] so the bbox half of the layout - the
+/// only thing indexdata v3 changed - can be decoded independently too. The
+/// version bump added a producer, and a producer verified only by the decoder
+/// that ships with it is verified by its own opinion.
+fn declared_index_bytes(path: &Path) -> Vec<Vec<u8>> {
     fn read_varint_at(buf: &[u8], pos: &mut usize) -> u64 {
         let mut result = 0u64;
         let mut shift = 0u32;
@@ -625,29 +665,79 @@ fn declared_indexdata(path: &Path) -> Vec<(BlobKindLabel, i64, i64, u64)> {
                 _ => panic!("unexpected wire type {wire} in BlobHeader"),
             }
         }
-        let bytes = indexdata.expect("every blob in these fixtures carries indexdata");
-        assert!(
-            bytes.len() >= 26,
-            "a well-formed index is at least the 26-byte v1 layout, got {}",
-            bytes.len()
+        out.push(
+            indexdata
+                .expect("every blob in these fixtures carries indexdata")
+                .to_vec(),
         );
-        assert!(
-            bytes[0] == 0x01 || bytes[0] == 0x02,
-            "a well-formed index declares a version the reader recognises, got {:#04x}",
-            bytes[0]
-        );
-        let kind = match bytes[1] {
-            0 => BlobKindLabel::Node,
-            1 => BlobKindLabel::Way,
-            2 => BlobKindLabel::Relation,
-            other => panic!("a well-formed index declares a known element kind, got {other}"),
-        };
-        let min_id = i64::from_le_bytes(bytes[2..10].try_into().expect("8 bytes"));
-        let max_id = i64::from_le_bytes(bytes[10..18].try_into().expect("8 bytes"));
-        let count = u64::from_le_bytes(bytes[18..26].try_into().expect("8 bytes"));
-        out.push((kind, min_id, max_id, count));
     }
     out
+}
+
+/// The indexdata v3 encoding, checked against a decoder that shares no code
+/// with the encoder.
+///
+/// v3 changed exactly one thing: how an absent bbox is spelled. v2 used four
+/// zero words, which are also the exact box of a blob at Null Island, so the
+/// encoding could not say what was true. v3 uses an inverted box - `min` at
+/// `i32::MAX`, `max` at `i32::MIN` - which no well-formed box can be.
+///
+/// The round-trip tests in `src/blob_meta/mod.rs` cover this through
+/// `BlobIndex::deserialize`, which is the same module that writes the bytes: if
+/// the sentinel and the reader's notion of absence drifted together, they would
+/// agree with each other and pass. This decodes the four words by hand and
+/// asserts the property directly.
+#[test]
+fn a_written_index_spells_an_absent_bbox_as_an_inverted_box() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    write_degrade_fixture(&input);
+
+    let mut way_or_rel_blobs = 0_usize;
+    let mut node_blobs_with_a_box = 0_usize;
+    for bytes in declared_index_bytes(&input) {
+        assert_eq!(bytes[0], 0x03, "new indexdata must be written as v3");
+        assert_eq!(bytes.len(), 42, "v3 is the 42-byte layout");
+        let word = |i: usize| {
+            i32::from_le_bytes(bytes[26 + i * 4..30 + i * 4].try_into().expect("4 bytes"))
+        };
+        let (min_lat, max_lat, min_lon, max_lon) = (word(0), word(1), word(2), word(3));
+        let sentinel =
+            [min_lat, max_lat, min_lon, max_lon] == [i32::MAX, i32::MIN, i32::MAX, i32::MIN];
+
+        if bytes[1] == 0 {
+            // Node blob: the fixture's nodes are not all at (0, 0), so a real
+            // box must be there, and it must be well-formed.
+            assert!(!sentinel, "a node blob in this fixture has a real bbox");
+            assert!(
+                min_lat <= max_lat && min_lon <= max_lon,
+                "a stored bbox must be well-formed: \
+                 [{min_lat},{max_lat},{min_lon},{max_lon}]"
+            );
+            node_blobs_with_a_box += 1;
+        } else {
+            // Way and relation blobs carry no coordinates, so their box is
+            // absent - and under v3 that must NOT be the four zero words v2
+            // used, because those are a real box.
+            way_or_rel_blobs += 1;
+            assert!(
+                sentinel,
+                "an absent bbox must be the inverted sentinel, got \
+                 [{min_lat},{max_lat},{min_lon},{max_lon}]"
+            );
+            assert_ne!(
+                [min_lat, max_lat, min_lon, max_lon],
+                [0, 0, 0, 0],
+                "v3 must not spell absence with the zero words that are also \
+                 the exact bbox of a blob at Null Island"
+            );
+        }
+    }
+    assert!(
+        way_or_rel_blobs > 0 && node_blobs_with_a_box > 0,
+        "the fixture must exercise both the present and the absent case \
+         ({node_blobs_with_a_box} node blobs, {way_or_rel_blobs} other blobs)"
+    );
 }
 
 // ---------------------------------------------------------------------------

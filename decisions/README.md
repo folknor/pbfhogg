@@ -151,6 +151,11 @@ The skeleton has exactly two sections. `Context`, `Consequences`, and
   re-exports bridging `pbfhogg-cli` into the library stay as they are
   until the 1.0 API freeze forces the `pbfhogg-commands` split or a
   documented public command API.
+- [ADR-0013](0013-blob-metadata-is-trusted-by-default-and-verified-on-demand.md) -
+  `BlobHeader` `indexdata` and `tagdata` stay trusted on every read path;
+  verification is opt-in via `check --index`, which by construction gets no
+  `--distrust-metadata` flag, and anything sized from the metadata must
+  survive it being wrong.
 
 Numbering gaps are deliberate, per the never-reuse rule: 0001 was a
 transient process note retired at the 0.3.0 release (commit `30ca861`);

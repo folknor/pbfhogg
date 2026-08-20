@@ -168,6 +168,53 @@ fn resolve_thread_count(threads: Option<usize>) -> usize {
     }
 }
 
+/// Classify-phase blob filter. Returns `(skip, tag_skip)`: `skip=true` means
+/// the caller should skip the blob; `tag_skip=true` means the skip was driven
+/// by the tag-index filter (the caller should bump its tag-skip counter).
+///
+/// Takes the already-parsed `BlobIndex` and raw `tagdata` bytes so callers
+/// can feed it from either a `BlobHeader` (via `hdr.index()` / `hdr.tag_index()`
+/// materialisation) or a `HeaderWalker` `BlobHeaderMeta` (which already
+/// parses `index` up-front and holds raw `tagdata` bytes).
+///
+/// Lives here rather than in `tags_filter` because the tag index is a
+/// schedule-building concern: `tags_count` reaches the same blobs through
+/// [`build_classify_schedule_blob_filtered`] and must apply the identical rule,
+/// and two copies of "when may I skip this blob" is exactly how a filter starts
+/// dropping matches on one path and not the other.
+pub(crate) fn blob_filter_check(
+    index: Option<&crate::blob_meta::BlobIndex>,
+    tagdata: Option<&[u8]>,
+    filter: Option<&crate::blob_meta::BlobFilter>,
+) -> (bool, bool) {
+    let Some(filter) = filter else {
+        return (false, false);
+    };
+    if let Some(idx) = index {
+        let dominated = matches!(
+            idx.kind,
+            crate::blob_meta::ElemKind::Node if !filter.want_nodes
+        ) || matches!(
+            idx.kind,
+            crate::blob_meta::ElemKind::Way if !filter.want_ways
+        ) || matches!(
+            idx.kind,
+            crate::blob_meta::ElemKind::Relation if !filter.want_relations
+        );
+        if dominated {
+            return (true, false);
+        }
+    }
+    if filter.has_tag_filter()
+        && let Some(bytes) = tagdata
+        && let Some(tag_idx) = crate::blob_meta::TagIndex::deserialize(bytes)
+        && !filter.wants_tag_index(&tag_idx)
+    {
+        return (true, true);
+    }
+    (false, false)
+}
+
 /// Build a classification schedule from a header-only scan, optionally
 /// filtering by element type. Returns `(schedule, shared_file)` ready for
 /// [`parallel_classify_phase`].
@@ -181,11 +228,31 @@ fn resolve_thread_count(threads: Option<usize>) -> usize {
 /// shared `Arc<File>` handed back for `pread`-based body reads is the
 /// walker's own file handle (opened with `posix_fadvise(RANDOM)`),
 /// reused to avoid a second `open` at scan end.
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn build_classify_schedule(
     input: &std::path::Path,
     kind_filter: Option<crate::blob_meta::ElemKind>,
 ) -> Result<(Vec<ScheduleEntry>, std::sync::Arc<std::fs::File>)> {
+    let (schedule, file, _skipped) =
+        build_classify_schedule_blob_filtered(input, kind_filter, None)?;
+    Ok((schedule, file))
+}
+
+/// [`build_classify_schedule`] plus an optional blob-level tag filter.
+///
+/// The third return value is how many blobs the tag index let us skip, for the
+/// caller to report.
+///
+/// `blob_filter` must be derived from the *same* expressions the per-element
+/// pass will apply, or blobs holding matches get dropped. `tags_filter`'s
+/// `blob_filter_from_expressions` is the one producer; it deliberately clears
+/// the whole key set when any expression's key matcher cannot be expressed as
+/// key-set membership, because the filter is a union.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) fn build_classify_schedule_blob_filtered(
+    input: &std::path::Path,
+    kind_filter: Option<crate::blob_meta::ElemKind>,
+    blob_filter: Option<&crate::blob_meta::BlobFilter>,
+) -> Result<(Vec<ScheduleEntry>, std::sync::Arc<std::fs::File>, u64)> {
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
     let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
     // Consume the first blob (expected OSMHeader). Bug-for-bug equivalent
@@ -201,6 +268,7 @@ pub(crate) fn build_classify_schedule(
     let file_size = walker.file_size();
     let mut schedule: Vec<ScheduleEntry> = Vec::new();
     let mut seq: usize = 0;
+    let mut blobs_skipped_by_tag: u64 = 0;
     while let Some(meta) = walker.next_header()? {
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
@@ -209,6 +277,14 @@ pub(crate) fn build_classify_schedule(
             && let Some(idx) = &meta.index
             && idx.kind != filter_kind
         {
+            continue;
+        }
+        let (skip, tag_skip) =
+            blob_filter_check(meta.index.as_ref(), meta.tagdata.as_deref(), blob_filter);
+        if skip {
+            if tag_skip {
+                blobs_skipped_by_tag += 1;
+            }
             continue;
         }
         // Reject bogus blob-header data_size before it flows to pread
@@ -236,7 +312,9 @@ pub(crate) fn build_classify_schedule(
 
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("schedule_blobs", schedule.len() as i64);
-    Ok((schedule, shared_file))
+    #[allow(clippy::cast_possible_wrap)]
+    crate::debug::emit_counter("schedule_tagidx_skipped_blobs", blobs_skipped_by_tag as i64);
+    Ok((schedule, shared_file, blobs_skipped_by_tag))
 }
 
 /// Like [`build_classify_schedule`] but returns three per-kind schedules
@@ -366,6 +444,40 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
     classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> R + Send + Sync,
     mut merge: impl FnMut(usize, R),
 ) -> Result<()> {
+    parallel_classify_phase_abortable(
+        shared_file,
+        schedule,
+        threads,
+        worker_init,
+        classify,
+        |seq, r| {
+            merge(seq, r);
+            std::ops::ControlFlow::Continue(())
+        },
+    )
+}
+
+/// [`parallel_classify_phase`] whose merge closure can stop the scan.
+///
+/// The merge runs on the calling thread and cannot return a `Result`, so
+/// callers that write output from it capture the first write error in a local
+/// and check it once the phase returns. Capturing alone does not *stop*
+/// anything: the schedule still ran to completion, so a planet-scale run whose
+/// very first write failed paid the entire decode before surfacing the error.
+/// Returning `Break` drops the result receiver, which fails the workers' sends
+/// and then the dispatcher's, unwinding the scan promptly.
+///
+/// Aborting is not cancellation: blobs already in flight still finish, and the
+/// caller remains responsible for reporting why it stopped.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
+    shared_file: &std::sync::Arc<std::fs::File>,
+    schedule: &[ScheduleEntry],
+    threads: Option<usize>,
+    worker_init: impl Fn() -> S + Send + Sync,
+    classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> R + Send + Sync,
+    mut merge: impl FnMut(usize, R) -> std::ops::ControlFlow<()>,
+) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
     let mut willneed = WillneedPrefetch::new(schedule);
@@ -436,7 +548,13 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
         drop(result_tx);
 
         for (seq, result) in result_rx {
-            merge(seq, result?);
+            if merge(seq, result?).is_break() {
+                // Dropping the receiver - the `for` loop owns it, and it falls
+                // out of scope right after this statement - fails the workers'
+                // `tx.send`, breaking their loops, which in turn fails the
+                // dispatcher's `desc_tx.send`.
+                break;
+            }
         }
         Ok(())
     })?;
@@ -696,6 +814,97 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{ScheduleEntry, WillneedPrefetch, coalesce_willneed_ranges};
+
+    /// Write a PBF with `blobs` single-node OSMData blobs and return its path.
+    fn write_many_blob_pbf(dir: &std::path::Path, blobs: usize) -> std::path::PathBuf {
+        use crate::block_builder::{BlockBuilder, HeaderBuilder};
+        use crate::writer::{Compression, PbfWriter};
+
+        let path = dir.join("many.osm.pbf");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::None);
+        writer
+            .write_header(&HeaderBuilder::new().build().unwrap())
+            .unwrap();
+        for i in 0..blobs {
+            let mut block = BlockBuilder::new();
+            block.add_node(i64::try_from(i).unwrap() + 1, 0, 0, [("k", "v")], None);
+            writer
+                .write_primitive_block(block.take().unwrap().unwrap())
+                .unwrap();
+        }
+        writer.flush().unwrap();
+        path
+    }
+
+    /// A merge closure returning `Break` must stop the scan, not merely stop
+    /// merging.
+    ///
+    /// `getparents` and `repack` capture the first write error in a local
+    /// because the merge cannot return a `Result`. Capturing alone left the
+    /// phase running the whole schedule: at planet scale a failed first write
+    /// cost the entire decode before the error surfaced. This pins that
+    /// `Break` actually unwinds the dispatcher and the workers.
+    #[test]
+    fn a_breaking_merge_stops_the_scan_rather_than_draining_it() {
+        let dir = tempfile::tempdir().unwrap();
+        const BLOBS: usize = 400;
+        let path = write_many_blob_pbf(dir.path(), BLOBS);
+
+        let (schedule, shared_file) = super::build_classify_schedule(&path, None).unwrap();
+        assert_eq!(
+            schedule.len(),
+            BLOBS,
+            "the fixture must actually have many blobs, or 'stopped early' is \
+             indistinguishable from 'finished'"
+        );
+
+        let classified = std::sync::atomic::AtomicUsize::new(0);
+        let mut merged = 0_usize;
+        super::parallel_classify_phase_abortable(
+            &shared_file,
+            &schedule,
+            Some(2),
+            || (),
+            |_block, ()| {
+                classified.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            },
+            |_seq, ()| {
+                merged += 1;
+                std::ops::ControlFlow::Break(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(merged, 1, "the merge broke on its first call");
+        // The descriptor and result channels are bounded (16 and 32), so at
+        // most a few dozen blobs can be in flight when the receiver drops.
+        // Half the schedule is a wide margin that still fails decisively
+        // against the old behaviour, which classified all 400.
+        let classified = classified.into_inner();
+        assert!(
+            classified < BLOBS / 2,
+            "breaking must unwind the scan; {classified} of {BLOBS} blobs were \
+             decoded after the merge asked to stop"
+        );
+
+        // Paired counterpart: a merge that never breaks must still see every
+        // blob, so the assertion above is about `Break` and not about the
+        // phase having become lossy.
+        let all = std::sync::atomic::AtomicUsize::new(0);
+        super::parallel_classify_phase(
+            &shared_file,
+            &schedule,
+            Some(2),
+            || (),
+            |_block, ()| {},
+            |_seq, ()| {
+                all.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            },
+        )
+        .unwrap();
+        assert_eq!(all.into_inner(), BLOBS, "a non-breaking scan is exhaustive");
+    }
 
     #[test]
     fn willneed_prefetch_defaults_to_coalesced_schedule() {

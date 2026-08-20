@@ -359,8 +359,10 @@ pub(crate) fn strip_blob_header_fields(
 /// `pbfhogg.WayMembers-v1` and `SharedNodePins-v1`), the osmosis
 /// replication metadata (fields 32/33/34), and any unknown/extension
 /// fields whose wire type this can skip (see the wire-type coverage note
-/// on [`strip_blob_header_fields`]). Rebuilding through `HeaderBuilder`
-/// would silently drop several of those; this preserves them.
+/// on [`strip_blob_header_fields`]). `HeaderBuilder` carries the fields it
+/// models, but it cannot model unknown/extension fields, and it drops the
+/// optional-feature list by design (`from_header` does not copy field 5).
+/// This preserves everything.
 pub(crate) fn strip_header_block_fields(
     header_block_bytes: &[u8],
     strip_fields: &[u32],

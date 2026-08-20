@@ -3,87 +3,6 @@
 Hunt date 2026-08-12. Single Opus hunter, scope: `src/write/` in full. Findings
 only, unverified. Ordered roughly by severity as the hunter ranked them.
 
-## The default writer thread has no reorder-gap check - silent truncation reported as success
-
-`src/write/pipeline.rs::writer_thread`.
-
-`writer_thread` loops on `rx.recv()`, and on channel close simply `break`s, calls
-`sink.flush()` and returns `Ok(())`. If a rayon framing closure spawned by
-`write_primitive_block*` never sends its `PipelineItem` (panic inside
-`scan_block_ids` / `frame_blob_into` / allocation failure - rayon catches spawn
-panics and drops the closure's captured `tx`), every seq after the missing one
-sits in the `ReorderBuffer` forever, gets dropped, and the writer reports
-success. The output PBF is short by an arbitrary number of blobs and `flush()`
-returns `Ok`.
-
-Both sibling backends explicitly guard this exact case and say so in comments:
-`parallel_writer::dispatch_loop` and `uring_writer::uring_main_loop` both return
-`Err("... item(s) still in reorder buffer ...")`. The default backend - the one
-every command uses without `--io-uring` / `--direct-io` on a non-parallel path -
-is the one that does not. This directly violates the "no silent data loss"
-stance in `reference/truncation-handling.md`.
-
-Confidence: high; three-line fix (mirror the `pending_len() > 0` check).
-
-Related: repeated rayon panics also leak dispatch permits (`permit_tx.send` in
-the closure never runs), so after 64 such panics `write_primitive_block` blocks
-forever on `permit_rx.recv()` with no timeout and no diagnostic.
-
-## `DirectWriter` corrupts or drops data if `write` follows `flush`
-
-`src/write/direct_writer.rs`.
-
-`flush()` calls `flush_final()`, which pads the buffer to a page, writes it,
-`set_len(logical_size)`, and latches `flushed = true`. Nothing prevents further
-`write()` calls. If they happen:
-
-- the fd position is now past the zero padding, so subsequent data lands after a
-  mid-file zero gap (readers see nulls where a BlobHeader should be - exactly the
-  bug the uring `CopyRange` comment describes having already been fixed once);
-- the final partial buffer is silently dropped, because `flush_final` early-
-  returns on `flushed`, and `Drop` calls the same latched function.
-
-`DirectWriter` is a `pub` type implementing `Write`, so this is reachable by
-contract-conforming use. Either make post-flush writes a hard error, or reset
-`flushed` / reposition on write.
-
-Confidence: high.
-
-Same file: `flush_buf` treats any `libc::write` return `< 0` as fatal, including
-`EINTR`, unlike the `pread` loop in `parallel_writer::copy_range_fallback_pwrite`
-which retries. Inconsistent and needlessly fragile.
-
-## `PbfWriter::flush()` doc is false, and misuse panics
-
-`src/write/writer.rs`.
-
-The doc says "After flush, the pipeline is stopped and subsequent writes go
-through the direct (non-pipelined) path." For every pipelined constructor
-(`to_path`, `to_path_direct`, `to_path_uring`, `to_path_parallel`)
-`self.writer` is `None` - the file was moved into the writer thread - so any
-post-flush write hits `writer_mut()`'s `.expect("writer consumed by pipeline")`
-and panics. The documented recovery path does not exist.
-
-Confidence: high.
-
-## Real I/O errors are replaced by "writer thread terminated"
-
-`src/write/writer.rs`.
-
-When the writer thread dies (ENOSPC, EIO, uring short write), the receiver
-drops, so the next `write_raw` / `write_raw_owned` / `write_raw_chunks` /
-`write_raw_copy` returns a synthetic `io::Error::other("writer thread
-terminated")`. The caller typically `?`-bails on that, which drops `PbfWriter`,
-and `Drop` discards the join result - so the actual ENOSPC error is thrown away
-and the user is told "writer thread terminated". The fix is for the send-failure
-path to join the handle and surface the thread's error.
-
-Confidence: high.
-
-Note also the asymmetry: `write_primitive_block*` cannot detect this at all (the
-rayon closure `drop(tx.send(...))`s), so a full disk lets the whole dataset be
-processed before anything is reported.
-
 ## Large `--elements-per-blob` hard-fails on the BlobHeader size cap, via tagdata
 
 `src/write/block_builder.rs` plus `framing.rs::encode_blob_header_into`.
@@ -106,46 +25,24 @@ make `tags-filter` skip blobs that do contain the key - wrong results, not just
 slow ones. Add an explicit cap/error rather than relying on the header limit to
 catch it first.
 
-## `add_way_with_locations` silently drops node refs on a length mismatch
+## `write_primitive_block*` cannot detect a dead writer thread
 
-`src/write/block_builder.rs` plus `encode.rs`.
+`src/write/writer.rs`.
 
-The length invariant is only a `debug_assert_eq!`. In release,
-`encode_way_with_locations` zips `refs.iter().zip(locations.iter())`, so if
-`locations` is shorter the way is written with fewer refs than it has - a
-silently corrupted way, no error anywhere. Given the ALTW paths feed this,
-promote to a hard `assert!` / `io::Error`.
+The `write_raw*` / `write_raw_copy` send-failure paths now join the writer
+thread and surface its real error, but `write_primitive_block*` still hands its
+result to a rayon closure that ends in `drop(tx.send(...))`. A writer thread
+that died on ENOSPC is therefore invisible until `flush()`, so a full disk lets
+the whole dataset be processed before anything is reported. The permit pool is
+the only backpressure, and it keeps handing out permits because the closures
+keep completing.
 
-Confidence: high.
+Filed standalone from the (resolved) "Real I/O errors are replaced by writer
+thread terminated" finding, whose fix covers only the paths that had a `Result`
+to return.
 
-## Unknown relation member types are silently rewritten as nodes
-
-`src/write/block_builder.rs::member_type_value`.
-
-`MemberType::Unknown(_) => 0` turns an unmodelled member type into a node member
-on write. The comment shifts responsibility to callers ("should filter these
-out"); nothing enforces it. A round-trip of a future PBF extension silently
-produces wrong data. This should be an error at the encode boundary, not a
-defaulted enum.
-
-Confidence: high.
-
-## `HeaderBuilder` drops `source`, and `build`'s doc claims otherwise
-
-`src/write/header_builder.rs`.
-
-`from_header` copies bbox / replication / historical but not `source` (field 17),
-and `build()` has no code path that emits field 17 at all - while its own doc
-comment lists `source (string, field 17)` among the fields it writes. Every
-command that rewrites a header via `HeaderBuilder` therefore silently loses
-`source`. `framing.rs::strip_header_block_fields` even documents this
-("Rebuilding through `HeaderBuilder` would silently drop several of those"). Fix
-the builder or fix the doc; today the durable doc is false.
-
-Confidence: high.
-
-Also here: `replication_timestamp` / `replication_sequence_number` go through
-`encode_int64_field`, which skips zero - sequence number 0 is silently dropped.
+Confidence: high on the mechanism; the cost is latency of reporting, not
+correctness.
 
 ## `AlignedBufferPool` is freed while io_uring writes may still reference it
 

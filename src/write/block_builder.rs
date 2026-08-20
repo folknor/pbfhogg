@@ -113,9 +113,10 @@ pub(super) fn member_type_value(mt: MemberType) -> i32 {
         MemberType::Node => 0,
         MemberType::Way => 1,
         MemberType::Relation => 2,
-        // Unknown member types from newer PBF producers - round-trip as Node
-        // since the protobuf enum has no "unknown" value. Callers should filter
-        // these out before writing if lossless preservation is needed.
+        // Unreachable on the encode path: `BlockBuilder::add_relation` rejects
+        // a member whose type has no enum value and poisons the builder, so no
+        // `Unknown` ever reaches the encoder. The arm exists only because the
+        // enum is non-exhaustive by construction; 0 is never written for one.
         MemberType::Unknown(_) => 0,
     }
 }
@@ -196,6 +197,16 @@ pub struct BlockBuilder {
     // True when the string table has been pre-seeded from an input block (merge only).
     // Reset to false by take()/reset(). Checked by merge to re-seed after mid-block flushes.
     pre_seeded: bool,
+
+    // Sticky poison. Set by an `add_*` method that was handed input it cannot
+    // encode without corrupting the output (a way whose ref and location
+    // counts disagree, a relation member whose type has no protobuf enum
+    // value). The offending element is not encoded, and `encode_block` refuses
+    // to produce a block from that point on, so no such element can reach a
+    // file. Deliberately NOT cleared by `reset()`: once a caller has fed the
+    // builder something unencodable, every later block from the same builder
+    // is suspect, and a writer that keeps going has already lost the element.
+    poison: Option<String>,
 }
 
 impl Default for BlockBuilder {
@@ -316,6 +327,7 @@ impl BlockBuilder {
             encode_buf: Vec::new(),
 
             pre_seeded: false,
+            poison: None,
         }
     }
 
@@ -323,6 +335,17 @@ impl BlockBuilder {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.count == 0
+    }
+
+    /// Record an unencodable element and refuse to produce blocks from here on.
+    ///
+    /// First poison wins: the earliest unencodable element is the one that
+    /// explains the failure, and a later one is just a consequence of the
+    /// caller not having checked yet.
+    fn poison(&mut self, reason: String) {
+        if self.poison.is_none() {
+            self.poison = Some(reason);
+        }
     }
 
     /// Track an element ID for BlobIndex min/max range.
@@ -566,6 +589,11 @@ impl BlockBuilder {
     ///
     /// `refs` are absolute node IDs, `locations` are `(decimicro_lat, decimicro_lon)` pairs.
     /// Both slices must have the same length.
+    ///
+    /// A length mismatch is not encoded: the encoder zips the two slices, so
+    /// the shorter one would silently decide the way's node count and the way
+    /// would be written with refs missing. The builder is poisoned instead and
+    /// the next [`take`](Self::take) / `take_owned` fails.
     #[allow(clippy::too_many_arguments)]
     pub fn add_way_with_locations<'t>(
         &mut self,
@@ -575,7 +603,15 @@ impl BlockBuilder {
         locations: &[(i32, i32)],
         metadata: Option<&Metadata<'_>>,
     ) {
-        debug_assert_eq!(refs.len(), locations.len(), "refs and locations must match");
+        if refs.len() != locations.len() {
+            self.poison(format!(
+                "way {id}: {} node ref(s) but {} location(s); encoding it would \
+                 silently drop refs",
+                refs.len(),
+                locations.len(),
+            ));
+            return;
+        }
         assert!(
             self.can_add_way(),
             "cannot add way: block full or wrong type"
@@ -604,6 +640,15 @@ impl BlockBuilder {
     /// Add a relation.
     ///
     /// `members` are absolute member IDs (the builder handles delta encoding internally).
+    ///
+    /// Every member type must be one of node / way / relation. A
+    /// [`MemberType::Unknown`] carries a wire value the `Relation.MemberType`
+    /// protobuf enum cannot express, and writing it as anything else produces
+    /// a file that is valid PBF and semantically wrong - no downstream check
+    /// catches that. Such a member poisons the builder instead, and the next
+    /// [`take`](Self::take) / `take_owned` fails.
+    ///
+    /// [`MemberType::Unknown`]: crate::MemberType::Unknown
     pub fn add_relation<'t>(
         &mut self,
         id: i64,
@@ -611,6 +656,16 @@ impl BlockBuilder {
         members: &[MemberData<'_>],
         metadata: Option<&Metadata<'_>>,
     ) {
+        if let Some(raw) = members.iter().find_map(|m| match m.id.member_type() {
+            MemberType::Unknown(raw) => Some(raw),
+            _ => None,
+        }) {
+            self.poison(format!(
+                "relation {id}: member type {raw} has no Relation.MemberType enum \
+                 value; encoding it would rewrite the member as a node",
+            ));
+            return;
+        }
         assert!(
             self.can_add_relation(),
             "cannot add relation: block full or wrong type"
@@ -833,6 +888,11 @@ impl BlockBuilder {
     /// `PrimitiveBlock` bytes and the returned `BlobIndex` describes the block
     /// contents (element type, ID range, count).
     fn encode_block(&mut self) -> io::Result<Option<BlobIndex>> {
+        if let Some(reason) = self.poison.as_deref() {
+            return Err(io::Error::other(format!(
+                "BlockBuilder refused to encode a block: {reason}"
+            )));
+        }
         let block_type = match self.block_type {
             Some(t) => t,
             None => return Ok(None),
@@ -1109,7 +1169,170 @@ impl BlockBuilder {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::BlockBuilder;
+    use super::{BlockBuilder, MemberData};
+    use crate::{MemberId, MemberType};
+
+    /// A ref/location length mismatch must not reach the encoder.
+    ///
+    /// `encode_way_with_locations` zips the two slices, so the shorter one
+    /// decides the way's node count: a way silently written with fewer refs
+    /// than it has. Only a `debug_assert_eq!` stood between that and a
+    /// release build. The assertion here is on the refusal to produce the
+    /// block at all, not on any message the builder shares with another
+    /// guard - the way count and the location count are strings only this
+    /// check can produce.
+    #[test]
+    fn a_way_whose_refs_and_locations_disagree_never_reaches_a_block() {
+        let mut bb = BlockBuilder::new();
+        bb.add_way_with_locations(
+            42,
+            [("highway", "residential")],
+            &[1, 2, 3],
+            &[(10, 20), (30, 40)],
+            None,
+        );
+        let err = bb
+            .take()
+            .expect_err("a way with 3 refs and 2 locations must not encode");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("way 42") && msg.contains("3 node ref(s) but 2 location(s)"),
+            "the error must name the way and the two counts, got: {msg}"
+        );
+
+        // Sticky: the caller cannot flush past it into a later block.
+        bb.add_node(1, 0, 0, [("k", "v")], None);
+        assert!(
+            bb.take().is_err(),
+            "poison must survive reset - a builder that was handed an \
+             unencodable element stays refused"
+        );
+    }
+
+    /// `take_owned` must refuse a poisoned builder too.
+    ///
+    /// The poison doc promises "the next `take` / `take_owned` fails", and
+    /// `take_owned` is the emit path production actually uses - the flush
+    /// helper in `commands` and every `time_filter` flush go through it,
+    /// while `take` is the borrowing convenience. Testing only `take`
+    /// establishes nothing about the path that carries the data: if the
+    /// guard had been placed in `take` rather than in the shared
+    /// `encode_block`, every real writer would still have emitted the
+    /// corrupt block and the existing tests would still be green.
+    #[test]
+    fn take_owned_refuses_a_poisoned_builder_as_well_as_take() {
+        let mut bb = BlockBuilder::new();
+        bb.add_way_with_locations(
+            42,
+            [("highway", "residential")],
+            &[1, 2, 3],
+            &[(10, 20)],
+            None,
+        );
+        // `OwnedBlock` is not `Debug`, so unwrap the Result by hand.
+        let msg = match bb.take_owned() {
+            Ok(_) => panic!("take_owned must refuse a poisoned builder"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("way 42") && msg.contains("3 node ref(s) but 1 location(s)"),
+            "take_owned must surface the same diagnosis as take, got: {msg}"
+        );
+
+        // The relation poison must reach `take_owned` as well - both setters
+        // funnel through the same check, and that is the claim under test.
+        let mut bb = BlockBuilder::new();
+        let members = [MemberData {
+            id: MemberId::Unknown(7, 99),
+            role: "future",
+        }];
+        bb.add_relation(500, [("type", "multipolygon")], &members, None);
+        assert!(
+            bb.take_owned().is_err(),
+            "an unmodelled member type must not slip out through take_owned"
+        );
+    }
+
+    /// Passing counterpart: `take_owned` on a clean builder still yields a
+    /// block. Without it, a regression that poisoned every builder would
+    /// leave the refusal tests above green.
+    #[test]
+    fn take_owned_still_encodes_an_unpoisoned_builder() {
+        let mut bb = BlockBuilder::new();
+        bb.add_way_with_locations(
+            42,
+            [("highway", "residential")],
+            &[1, 2, 3],
+            &[(10, 20), (30, 40), (50, 60)],
+            None,
+        );
+        assert!(
+            bb.take_owned().unwrap().is_some(),
+            "matched refs and locations must encode exactly as before"
+        );
+    }
+
+    /// A relation member whose type has no enum value must not be encoded.
+    ///
+    /// `member_type_value` mapped `Unknown(_)` to 0, i.e. NODE. That writes a
+    /// file that is valid PBF and semantically wrong: no reader, no
+    /// `check --index`, no osmium cross-validation catches a member that
+    /// changed kind. The rejection has to happen at the encode boundary.
+    #[test]
+    fn a_relation_member_with_no_enum_value_never_reaches_a_block() {
+        let mut bb = BlockBuilder::new();
+        let members = [
+            MemberData {
+                id: MemberId::Node(1),
+                role: "outer",
+            },
+            MemberData {
+                id: MemberId::Unknown(7, 99),
+                role: "future",
+            },
+        ];
+        bb.add_relation(500, [("type", "multipolygon")], &members, None);
+        let err = bb
+            .take()
+            .expect_err("a member of type 7 must not be encoded as a node");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("relation 500") && msg.contains("member type 7"),
+            "the error must name the relation and the unmodelled wire value, got: {msg}"
+        );
+    }
+
+    /// The three modelled member types must still encode - the guard above
+    /// must reject exactly `Unknown`, not relations in general.
+    #[test]
+    fn a_relation_with_only_modelled_member_types_still_encodes() {
+        let mut bb = BlockBuilder::new();
+        let members = [
+            MemberData {
+                id: MemberId::Node(1),
+                role: "a",
+            },
+            MemberData {
+                id: MemberId::Way(2),
+                role: "b",
+            },
+            MemberData {
+                id: MemberId::Relation(3),
+                role: "c",
+            },
+        ];
+        bb.add_relation(500, [("type", "multipolygon")], &members, None);
+        assert!(
+            bb.take().unwrap().is_some(),
+            "node/way/relation members must encode as they always did"
+        );
+        assert_eq!(
+            MemberId::Unknown(7, 99).member_type(),
+            MemberType::Unknown(7),
+            "fixture sanity: Unknown must survive the MemberId round-trip, \
+             or the rejection test above proves nothing"
+        );
+    }
 
     /// The pre-allocation bound must clamp only the pre-allocation.
     ///

@@ -147,7 +147,14 @@ impl DirectWriter {
                 )
             };
             if n < 0 {
-                return Err(io::Error::last_os_error());
+                let err = io::Error::last_os_error();
+                // A signal delivered mid-write is not a write failure. The
+                // `pread` loop in `parallel_writer::copy_range_fallback_pwrite`
+                // has always retried it; this loop used to treat it as fatal.
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
             }
             written += n.cast_unsigned();
         }
@@ -183,6 +190,20 @@ impl DirectWriter {
 
 impl Write for DirectWriter {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        // `flush` is final for this type: it pads the buffer to a page,
+        // writes it, and `ftruncate`s the file back to the logical size.
+        // The fd offset is then past zero padding that the truncation just
+        // removed, so anything written afterwards would land after a
+        // mid-file zero gap - readers see nulls where a BlobHeader belongs -
+        // and the final partial buffer would be dropped silently, because
+        // `flush_final` early-returns on the latch and `Drop` calls the same
+        // latched function. Refuse instead of producing that file.
+        if self.flushed {
+            return Err(io::Error::other(
+                "DirectWriter: write after flush; the file has already been \
+                 padded and truncated to its final size",
+            ));
+        }
         self.logical_size += data.len() as u64;
         let mut offset = 0;
         while offset < data.len() {
@@ -232,5 +253,41 @@ mod tests {
 
         buf.clear();
         assert_eq!(buf.len, 0);
+    }
+
+    /// `flush` is final: a later `write` must be refused, not accepted.
+    ///
+    /// `flush_final` pads to a page, writes, `ftruncate`s to the logical
+    /// size, and latches. Nothing stopped a further `write`, and the result
+    /// was a file with a mid-file zero gap plus a silently dropped final
+    /// partial buffer - `flush_final` early-returns on the latch and `Drop`
+    /// calls the same latched function. `DirectWriter` is `pub` and
+    /// implements `Write`, so this is contract-conforming use.
+    ///
+    /// The file is created without `O_DIRECT` involvement in the assertion
+    /// itself; only the refusal is under test, so this runs anywhere.
+    #[test]
+    fn write_after_flush_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("direct.bin");
+        let mut w = match DirectWriter::create(&path) {
+            Ok(w) => w,
+            // tmpfs and some filesystems reject O_DIRECT outright; the guard
+            // under test is filesystem-independent, so skip rather than fail.
+            Err(_) => return,
+        };
+        w.write_all(b"first").unwrap();
+        w.flush().unwrap();
+        let err = w
+            .write(b"second")
+            .expect_err("a write after the final flush must be refused");
+        assert!(err.to_string().contains("write after flush"), "got: {err}");
+        drop(w);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"first",
+            "the refused bytes must not have reached the file, and the \
+             zero padding must still have been truncated away"
+        );
     }
 }

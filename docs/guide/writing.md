@@ -29,10 +29,12 @@ let header_bytes = HeaderBuilder::new()
 | `new()` | Create a blank header builder |
 | `bbox(left, bottom, right, top)` | Set the bounding box (f64 degrees) |
 | `sorted()` | Declare elements are sorted by type then ID |
-| `from_header(&existing_header)` | Copy bbox and replication metadata from an existing `HeaderBlock` |
+| `source(s)` | Set `source` (field 17), e.g. the URL the data came from |
+| `without_source()` | Clear a `source` carried over by `from_header` |
+| `from_header(&existing_header)` | Copy bbox, `source`, and replication metadata from an existing `HeaderBlock` |
 | `build()` | Serialize to protobuf bytes |
 
-`from_header` is useful for commands that transform data while preserving metadata:
+`from_header` is useful for commands that transform data while preserving metadata. It copies bbox, `source`, replication timestamp / sequence number / base URL, and the historical-information flag. It does **not** copy the optional-feature list (call `.sorted()` explicitly if the output is sorted) and it cannot carry unknown or extension fields - a rebuild through `HeaderBuilder` keeps only what the builder models.
 
 ```rust
 use pbfhogg::ElementReader;

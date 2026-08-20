@@ -12,7 +12,9 @@
 use std::collections::VecDeque;
 
 use crate::reorder_buffer::ReorderBuffer;
-use crate::write::pipeline::{OutputChunk, PipelineItem, WRITE_AHEAD};
+use crate::write::pipeline::{
+    OutputChunk, PipelineItem, SeqTotal, WRITE_AHEAD, check_stream_complete,
+};
 use io_uring::IoUring;
 use io_uring::opcode;
 use io_uring::types::Fixed;
@@ -509,8 +511,9 @@ pub(crate) fn uring_writer_thread(
     path: PathBuf,
     framed_header: Vec<u8>,
     init_tx: SyncSender<io::Result<()>>,
+    expected: &SeqTotal,
 ) -> io::Result<()> {
-    let result = uring_init_and_run(&rx, &path, &framed_header, &init_tx);
+    let result = uring_init_and_run(&rx, &path, &framed_header, &init_tx, expected);
     if let Err(ref e) = result {
         eprintln!("[uring_writer] error: {e}");
     }
@@ -527,6 +530,7 @@ fn uring_init_and_run(
     path: &std::path::Path,
     framed_header: &[u8],
     init_tx: &SyncSender<io::Result<()>>,
+    expected: &SeqTotal,
 ) -> io::Result<()> {
     // Step 1: Allocate buffer pool.
     let pool = AlignedBufferPool::new(NUM_BUFS, BUF_SIZE)?;
@@ -608,7 +612,7 @@ fn uring_init_and_run(
     state.write(framed_header)?;
 
     // Step 8: Main reorder + write loop (same as writer_thread in writer.rs).
-    uring_main_loop(rx, &mut state)?;
+    uring_main_loop(rx, &mut state, expected)?;
 
     // Step 9: Flush and finalize.
     state.flush_final(&file)?;
@@ -618,7 +622,11 @@ fn uring_init_and_run(
 
 /// Reorder and write loop using the shared sequence-number reorder buffer,
 /// then dispatches to [`UringState::write`].
-fn uring_main_loop(rx: &Receiver<PipelineItem>, state: &mut UringState) -> io::Result<()> {
+fn uring_main_loop(
+    rx: &Receiver<PipelineItem>,
+    state: &mut UringState,
+    expected: &SeqTotal,
+) -> io::Result<()> {
     let mut pending: ReorderBuffer<io::Result<OutputChunk>> =
         ReorderBuffer::with_capacity(WRITE_AHEAD);
 
@@ -700,19 +708,19 @@ fn uring_main_loop(rx: &Receiver<PipelineItem>, state: &mut UringState) -> io::R
         state.reap_cqes(false)?;
     }
 
-    // Channel closed. If the reorder buffer still holds items blocked
-    // on a missing earlier seq, an upstream framer panicked / was
-    // dropped. Mirror the parallel-pwrite writer: surface the gap as
-    // an error so the caller sees a hard failure rather than a
-    // silently-truncated file.
-    if pending.pending_len() > 0 {
-        return Err(io::Error::other(format!(
-            "uring writer: channel closed with {} item(s) still in reorder buffer; \
-             an upstream framer dropped without sending an earlier seq",
-            pending.pending_len(),
-        )));
-    }
-    Ok(())
+    // Channel closed. A dead upstream framer closes the channel exactly the
+    // way a finished one does, so completeness has to be proved rather than
+    // assumed - for a gap that stranded later items AND for a gap at the tail
+    // that stranded nothing. Getting this wrong here is worse than in the
+    // other backends: step 9 would go on to `flush_final`, padding and
+    // `set_len`-ing a short file into a well-formed-looking one. See
+    // `check_stream_complete`.
+    check_stream_complete(
+        "uring writer",
+        pending.pending_len(),
+        pending.next_seq(),
+        expected,
+    )
 }
 
 // ---------------------------------------------------------------------------

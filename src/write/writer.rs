@@ -34,9 +34,43 @@ pub(crate) use super::framing::{
 // Pipeline plumbing (ordered channel items, sink trait, permit pool, writer
 // thread) lives in the sibling `pipeline` module.
 use super::pipeline::{
-    FileOutputSink, OutputChunk, PipelineItem, WRITE_AHEAD, WritePipeline, elapsed_ns_u64,
-    new_permit_pool, record_send_wait, writer_thread,
+    FileOutputSink, OutputChunk, PermitGuard, PipelineItem, SeqTotal, WRITE_AHEAD, WritePipeline,
+    elapsed_ns_u64, new_permit_pool, record_send_wait, writer_thread,
 };
+
+/// Returned when a write is attempted on a `PbfWriter` whose inner writer was
+/// moved into a pipeline writer thread (every pipelined constructor, and every
+/// writer after `flush()`).
+const WRITER_CONSUMED: &str = "PbfWriter: the pipelined writer owns the output file; \
+                               no further writes are possible after flush()";
+
+/// Recover the writer thread's own error after a pipeline `send` failed.
+///
+/// A `send` on the pipeline channel only fails because the receiver was
+/// dropped, which means the writer thread has already exited - so the join
+/// returns immediately and carries the real cause: ENOSPC, EIO, a short uring
+/// write, a reorder gap. Every one of these call sites used to substitute
+/// `io::Error::other("writer thread terminated")`, the caller `?`-bailed on
+/// that, `Drop` discarded the join result, and the only description of what
+/// actually went wrong was gone. Wrapping the innermost real cause is fine;
+/// replacing it is not.
+///
+/// Takes the join handle, so a later `flush()` will not try to join twice; the
+/// error it recovered has already been returned to the caller by then.
+fn pipeline_send_error(pipeline: &mut WritePipeline) -> io::Error {
+    match pipeline.join_handle.take() {
+        Some(handle) => match handle.join() {
+            Ok(Err(e)) => e,
+            Ok(Ok(())) => io::Error::other(
+                "writer thread finished before all blobs were sent; output is incomplete",
+            ),
+            Err(_) => io::Error::other("writer thread panicked"),
+        },
+        // Already joined - flush() or an earlier send failure took the handle
+        // and surfaced whatever it found.
+        None => io::Error::other("writer thread terminated"),
+    }
+}
 
 /// Writes PBF files as a sequence of framed, compressed blobs.
 ///
@@ -132,8 +166,16 @@ impl PbfWriter<FileWriter> {
 
         let (tx, rx) = sync_channel(WRITE_AHEAD);
         let path_owned = path.to_path_buf();
+        let expected = SeqTotal::new();
+        let thread_expected = expected.clone();
         let handle = std::thread::spawn(move || {
-            uring_writer::uring_writer_thread(rx, path_owned, framed_header, init_tx)
+            uring_writer::uring_writer_thread(
+                rx,
+                path_owned,
+                framed_header,
+                init_tx,
+                &thread_expected,
+            )
         });
 
         // Wait for the writer thread to complete initialization.
@@ -167,6 +209,7 @@ impl PbfWriter<FileWriter> {
                 join_handle: Some(handle),
                 permit_tx,
                 permit_rx,
+                expected,
             }),
             scratch: FrameScratch::new(),
         })
@@ -194,8 +237,16 @@ impl PbfWriter<FileWriter> {
         let (init_tx, init_rx) = sync_channel(1);
         let (tx, rx) = sync_channel(WRITE_AHEAD);
         let path_owned = path.to_path_buf();
+        let expected = SeqTotal::new();
+        let thread_expected = expected.clone();
         let handle = std::thread::spawn(move || {
-            parallel_writer::parallel_writer_thread(rx, path_owned, framed_header, init_tx)
+            parallel_writer::parallel_writer_thread(
+                rx,
+                path_owned,
+                framed_header,
+                init_tx,
+                &thread_expected,
+            )
         });
 
         // Propagate init errors eagerly - mirrors to_path_uring.
@@ -228,6 +279,7 @@ impl PbfWriter<FileWriter> {
                 join_handle: Some(handle),
                 permit_tx,
                 permit_rx,
+                expected,
             }),
             scratch: FrameScratch::new(),
         })
@@ -245,7 +297,11 @@ impl PbfWriter<FileWriter> {
 
         // Spawn the writer thread and hand it the writer wrapped in a sink.
         let (tx, rx) = sync_channel(WRITE_AHEAD);
-        let handle = std::thread::spawn(move || writer_thread(rx, FileOutputSink::new(writer)));
+        let expected = SeqTotal::new();
+        let thread_expected = expected.clone();
+        let handle = std::thread::spawn(move || {
+            writer_thread(rx, FileOutputSink::new(writer), &thread_expected)
+        });
 
         let (permit_tx, permit_rx) = new_permit_pool();
         Ok(PbfWriter {
@@ -257,6 +313,7 @@ impl PbfWriter<FileWriter> {
                 join_handle: Some(handle),
                 permit_tx,
                 permit_rx,
+                expected,
             }),
             scratch: FrameScratch::new(),
         })
@@ -322,6 +379,10 @@ impl<W: Write> PbfWriter<W> {
             let tx = pipeline.tx.clone();
             let permit_tx = pipeline.permit_tx.clone();
             rayon::spawn(move || {
+                // Constructed first so it drops last - the permit is released
+                // after `tx.send` below, and also on the unwind path if any
+                // of the framing work panics. See `PermitGuard`.
+                let _permit = PermitGuard::new(permit_tx);
                 let indexdata = blob_meta::scan_block_ids(&uncompressed).map(|idx| idx.serialize());
                 let tagdata =
                     blob_meta::scan_block_tags(&uncompressed).and_then(|ti| ti.serialize());
@@ -348,13 +409,6 @@ impl<W: Write> PbfWriter<W> {
                     data: result.map(OutputChunk::Framed),
                 }));
                 record_send_wait(t_send);
-                // Release the permit so the main thread can dispatch more
-                // work. Must happen AFTER `tx.send` above so the in-flight
-                // count stays correct while the result is waiting in the
-                // writer channel.
-                // Failure here means the main thread already dropped its
-                // receiver (shutting down); safe to ignore.
-                permit_tx.send(()).ok();
             });
             Ok(())
         } else {
@@ -402,6 +456,9 @@ impl<W: Write> PbfWriter<W> {
             let tx = pipeline.tx.clone();
             let permit_tx = pipeline.permit_tx.clone();
             rayon::spawn(move || {
+                // Drops last - releases the permit after `tx.send`, and on
+                // the unwind path too. See `PermitGuard`.
+                let _permit = PermitGuard::new(permit_tx);
                 let result = PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
                     frame_blob_into(
                         "OSMData",
@@ -425,7 +482,6 @@ impl<W: Write> PbfWriter<W> {
                     data: result.map(OutputChunk::Framed),
                 }));
                 record_send_wait(t_send);
-                permit_tx.send(()).ok();
             });
             Ok(())
         } else {
@@ -473,6 +529,9 @@ impl<W: Write> PbfWriter<W> {
             let way_members_owned = way_members.map(<[u8]>::to_vec);
             let permit_tx = pipeline.permit_tx.clone();
             rayon::spawn(move || {
+                // Drops last - releases the permit after `tx.send`, and on
+                // the unwind path too. See `PermitGuard`.
+                let _permit = PermitGuard::new(permit_tx);
                 let result = PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
                     frame_blob_into(
                         "OSMData",
@@ -496,9 +555,6 @@ impl<W: Write> PbfWriter<W> {
                     data: result.map(OutputChunk::Framed),
                 }));
                 record_send_wait(t_send);
-                // Failure here means the main thread already dropped its
-                // receiver (shutting down); safe to ignore.
-                permit_tx.send(()).ok();
             });
             Ok(())
         } else {
@@ -529,17 +585,17 @@ impl<W: Write> PbfWriter<W> {
                 .payload_raw_bytes
                 .fetch_add(raw_framed_bytes.len() as u64, Relaxed);
             let t_send = std::time::Instant::now();
-            pipeline
-                .tx
-                .send(PipelineItem {
-                    seq,
-                    data: Ok(OutputChunk::Raw(raw_framed_bytes.to_vec())),
-                })
-                .map_err(|_| io::Error::other("writer thread terminated"))?;
+            let sent = pipeline.tx.send(PipelineItem {
+                seq,
+                data: Ok(OutputChunk::Raw(raw_framed_bytes.to_vec())),
+            });
+            if sent.is_err() {
+                return Err(pipeline_send_error(pipeline));
+            }
             record_send_wait(t_send);
             Ok(())
         } else {
-            self.writer_mut().write_all(raw_framed_bytes)
+            self.writer_mut()?.write_all(raw_framed_bytes)
         }
     }
 
@@ -558,17 +614,17 @@ impl<W: Write> PbfWriter<W> {
                 .payload_raw_bytes
                 .fetch_add(raw_framed_bytes.len() as u64, Relaxed);
             let t_send = std::time::Instant::now();
-            pipeline
-                .tx
-                .send(PipelineItem {
-                    seq,
-                    data: Ok(OutputChunk::Raw(raw_framed_bytes)),
-                })
-                .map_err(|_| io::Error::other("writer thread terminated"))?;
+            let sent = pipeline.tx.send(PipelineItem {
+                seq,
+                data: Ok(OutputChunk::Raw(raw_framed_bytes)),
+            });
+            if sent.is_err() {
+                return Err(pipeline_send_error(pipeline));
+            }
             record_send_wait(t_send);
             Ok(())
         } else {
-            self.writer_mut().write_all(&raw_framed_bytes)
+            self.writer_mut()?.write_all(&raw_framed_bytes)
         }
     }
 
@@ -587,17 +643,17 @@ impl<W: Write> PbfWriter<W> {
                 .payload_raw_chunk_bytes
                 .fetch_add(total_bytes, Relaxed);
             let t_send = std::time::Instant::now();
-            pipeline
-                .tx
-                .send(PipelineItem {
-                    seq,
-                    data: Ok(OutputChunk::RawChunks(chunks)),
-                })
-                .map_err(|_| io::Error::other("writer thread terminated"))?;
+            let sent = pipeline.tx.send(PipelineItem {
+                seq,
+                data: Ok(OutputChunk::RawChunks(chunks)),
+            });
+            if sent.is_err() {
+                return Err(pipeline_send_error(pipeline));
+            }
             record_send_wait(t_send);
             Ok(())
         } else {
-            let w = self.writer_mut();
+            let w = self.writer_mut()?;
             for chunk in &chunks {
                 w.write_all(chunk)?;
             }
@@ -608,12 +664,24 @@ impl<W: Write> PbfWriter<W> {
     /// Flush the underlying writer.
     ///
     /// In pipelined mode, this joins the writer thread and propagates any
-    /// deferred compression or I/O errors. After flush, the pipeline is
-    /// stopped and subsequent writes go through the direct (non-pipelined) path.
+    /// deferred compression or I/O errors.
+    ///
+    /// `flush` finishes the writer. It does not reopen a direct path: a
+    /// pipelined `PbfWriter` never held the output file in the first place
+    /// (every pipelined constructor moves it into the writer thread), so
+    /// there is nothing for a later write to fall back to. Any write after
+    /// `flush` on a pipelined writer fails with "the pipelined writer owns
+    /// the output file". Calling `flush` twice is harmless.
     #[hotpath::measure]
     pub fn flush(&mut self) -> io::Result<()> {
         let t_flush = std::time::Instant::now();
         if let Some(mut pipeline) = self.pipeline.take() {
+            // State the final item count BEFORE dropping the sender, so the
+            // store is ordered ahead of the disconnect the writer thread
+            // observes. Without it the writer cannot tell a complete stream
+            // from one whose last framing task died: both close a channel
+            // with an empty reorder buffer. See `SeqTotal`.
+            pipeline.expected.announce(pipeline.seq);
             // Drop sender to signal the writer thread that no more items are coming.
             drop(pipeline.tx);
             if let Some(handle) = pipeline.join_handle.take() {
@@ -645,13 +713,18 @@ impl<W: Write> PbfWriter<W> {
         self.writer.take().expect("writer consumed by pipeline")
     }
 
-    // Panics on misuse (calling after pipeline consumed the writer). This is an
-    // internal invariant - all public callers go through write_blob/write_raw which
-    // are only valid in sync mode or before pipeline handoff.
-    fn writer_mut(&mut self) -> &mut W {
+    /// The inner writer, for the non-pipelined path.
+    ///
+    /// `writer` is `None` for every pipelined constructor (the file was moved
+    /// into the writer thread) and stays `None` after `flush()` joins that
+    /// thread. Reaching here in that state means a write was attempted on a
+    /// finished pipelined writer - which used to panic out of a public `&mut
+    /// self` method. It is a caller error, but a caller error on a public API
+    /// is an error to return, not a panic.
+    fn writer_mut(&mut self) -> io::Result<&mut W> {
         self.writer
             .as_mut()
-            .expect("writer consumed by pipeline - call flush() first")
+            .ok_or_else(|| io::Error::other(WRITER_CONSUMED))
     }
 
     // wontfix(type-no-stringly): blob_type is &str matching protobuf wire format;
@@ -705,7 +778,10 @@ impl<W: Write> PbfWriter<W> {
             .bytes_framed
             .fetch_add(total_len as u64, Relaxed);
         // Write the 3 frame parts directly - no intermediate `out` Vec.
-        let writer = self.writer.as_mut().expect("writer consumed by pipeline");
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| io::Error::other(WRITER_CONSUMED))?;
         let t_write = std::time::Instant::now();
         writer.write_all(&header_len.to_be_bytes())?;
         writer.write_all(&self.scratch.header_buf)?;
@@ -768,21 +844,20 @@ impl PbfWriter<FileWriter> {
                 .payload_copy_range_bytes
                 .fetch_add(len, Relaxed);
             let t_send = std::time::Instant::now();
-            pipeline
-                .tx
-                .send(PipelineItem {
-                    seq,
-                    data: Ok(OutputChunk::CopyRange { in_fd, offset, len }),
-                })
-                .map_err(|_| io::Error::other("writer thread terminated"))?;
+            let sent = pipeline.tx.send(PipelineItem {
+                seq,
+                data: Ok(OutputChunk::CopyRange { in_fd, offset, len }),
+            });
+            if sent.is_err() {
+                return Err(pipeline_send_error(pipeline));
+            }
             record_send_wait(t_send);
             Ok(())
         } else {
-            // Same invariant as writer_mut - programming error if None.
             let out_fd = self
                 .writer
                 .as_mut()
-                .expect("writer consumed by pipeline")
+                .ok_or_else(|| io::Error::other(WRITER_CONSUMED))?
                 .flush_and_raw_fd()?
                 .ok_or_else(|| {
                     io::Error::new(
@@ -792,5 +867,102 @@ impl PbfWriter<FileWriter> {
                 })?;
             copy_range(in_fd, out_fd, offset, len)
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::{Compression, PbfWriter, WritePipeline};
+    use crate::write::framing::FrameScratch;
+    use crate::write::pipeline::{PipelineItem, SeqTotal, new_permit_pool};
+    use std::io;
+    use std::sync::mpsc::sync_channel;
+
+    /// A `PbfWriter` whose writer thread has already exited with `outcome`.
+    ///
+    /// The receiver is dropped before the writer is handed back, so the very
+    /// next send fails - which is exactly the shape of a writer thread that
+    /// died on ENOSPC halfway through a planet write.
+    fn writer_with_dead_thread(outcome: io::Result<()>) -> PbfWriter<Vec<u8>> {
+        let (tx, rx) = sync_channel::<PipelineItem>(1);
+        // Drop the receiver before the thread even starts, so every send is
+        // guaranteed to fail without a race to synchronise against.
+        drop(rx);
+        let handle = std::thread::spawn(move || outcome);
+        let (permit_tx, permit_rx) = new_permit_pool();
+        let expected = SeqTotal::new();
+        PbfWriter {
+            writer: None,
+            compression: Compression::None,
+            pipeline: Some(WritePipeline {
+                tx,
+                seq: 0,
+                join_handle: Some(handle),
+                permit_tx,
+                permit_rx,
+                expected,
+            }),
+            scratch: FrameScratch::new(),
+        }
+    }
+
+    /// The writer thread's real error must survive, not be replaced.
+    ///
+    /// Every send-failure path returned `io::Error::other("writer thread
+    /// terminated")`. The caller `?`-bailed, `Drop` discarded the join
+    /// result, and the only description of the actual failure - a full disk,
+    /// a permission problem - was thrown away. The assertions here are on the
+    /// kind and message the *thread* produced, which no synthetic substitute
+    /// can supply.
+    #[test]
+    fn a_dead_writer_thread_surfaces_its_own_error_not_a_generic_one() {
+        let mut w = writer_with_dead_thread(Err(io::Error::new(
+            io::ErrorKind::StorageFull,
+            "no space left on device",
+        )));
+        let err = w.write_raw(b"blob").expect_err("the send must fail");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::StorageFull,
+            "the ENOSPC kind must reach the caller"
+        );
+        assert!(
+            err.to_string().contains("no space left on device"),
+            "the thread's own message must reach the caller, got: {err}"
+        );
+    }
+
+    /// A writer thread that exited cleanly mid-stream is still a short file.
+    #[test]
+    fn a_writer_thread_that_exited_clean_mid_stream_is_reported_as_incomplete() {
+        let mut w = writer_with_dead_thread(Ok(()));
+        let err = w.write_raw_owned(b"blob".to_vec()).expect_err("send fails");
+        assert!(
+            err.to_string().contains("output is incomplete"),
+            "got: {err}"
+        );
+    }
+
+    /// Writing after `flush` must be an error, not a panic.
+    ///
+    /// The `flush` doc promised "subsequent writes go through the direct
+    /// (non-pipelined) path". For every pipelined constructor the file was
+    /// moved into the writer thread, so `writer` is `None` and the documented
+    /// recovery path hit `.expect("writer consumed by pipeline")`.
+    #[test]
+    fn writing_after_flush_on_a_pipelined_writer_errors_instead_of_panicking() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("post-flush.osm.pbf");
+        let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
+        let mut w = PbfWriter::to_path(&path, Compression::None, &header).unwrap();
+        w.flush().unwrap();
+        let err = w
+            .write_raw(b"anything")
+            .expect_err("the pipelined writer is finished; this must not panic");
+        assert!(
+            err.to_string().contains("no further writes are possible"),
+            "got: {err}"
+        );
     }
 }

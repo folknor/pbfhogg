@@ -97,6 +97,16 @@ impl<T> ReorderBuffer<T> {
         item
     }
 
+    /// The sequence number the buffer will accept next, which is also the
+    /// count of items already popped in order.
+    ///
+    /// End-of-stream completeness checks compare this against the producer's
+    /// announced total: `pending_len() == 0` only proves no item is *blocked*
+    /// behind a gap, and a gap at the tail leaves nothing blocked at all.
+    pub(crate) fn next_seq(&self) -> usize {
+        self.next_seq
+    }
+
     pub(crate) fn filled_len(&self) -> usize {
         self.filled
     }

@@ -45,7 +45,9 @@ use std::thread::JoinHandle;
 
 use crate::reorder_buffer::ReorderBuffer;
 use crate::write::metrics::WRITER_METRICS;
-use crate::write::pipeline::{OutputChunk, PipelineItem, WRITE_AHEAD};
+use crate::write::pipeline::{
+    OutputChunk, PipelineItem, SeqTotal, WRITE_AHEAD, check_stream_complete,
+};
 
 /// Number of worker threads doing `pwrite`s / `copy_file_range`s in
 /// parallel. 8 saturates NVMe queue depth on the plantasjen bench
@@ -129,8 +131,9 @@ pub(crate) fn parallel_writer_thread(
     path: PathBuf,
     framed_header: Vec<u8>,
     init_tx: SyncSender<io::Result<()>>,
+    expected: &SeqTotal,
 ) -> io::Result<()> {
-    let result = parallel_writer_thread_inner(rx, path, framed_header, init_tx);
+    let result = parallel_writer_thread_inner(rx, path, framed_header, init_tx, expected);
     if let Err(ref e) = result {
         eprintln!("[parallel_writer] thread exit: {e}");
     }
@@ -143,6 +146,7 @@ fn parallel_writer_thread_inner(
     path: PathBuf,
     framed_header: Vec<u8>,
     init_tx: SyncSender<io::Result<()>>,
+    expected: &SeqTotal,
 ) -> io::Result<()> {
     let file = match File::create(&path) {
         Ok(f) => f,
@@ -181,7 +185,13 @@ fn parallel_writer_thread_inner(
         }));
     }
 
-    let result = dispatch_loop(&rx, &worker_txs, &err_slot, framed_header.len() as u64);
+    let result = dispatch_loop(
+        &rx,
+        &worker_txs,
+        &err_slot,
+        framed_header.len() as u64,
+        expected,
+    );
 
     // Close pool channels to signal EOI; join workers.
     drop(worker_txs);
@@ -220,6 +230,7 @@ fn dispatch_loop(
     worker_txs: &[SyncSender<WriteOp>],
     err_slot: &ErrSlot,
     header_len: u64,
+    expected: &SeqTotal,
 ) -> io::Result<()> {
     let mut pending: ReorderBuffer<io::Result<OutputChunk>> =
         ReorderBuffer::with_capacity(WRITE_AHEAD);
@@ -241,20 +252,18 @@ fn dispatch_loop(
             )?;
         }
     }
-    // Channel closed cleanly. If the reorder buffer still holds items
-    // that never popped, an upstream framer panicked or was dropped
-    // with a seq gap still pending. Returning `Ok(())` here would
-    // silently truncate the output; surface it as an error instead
-    // so the caller closes with a non-Ok result and the user sees a
-    // hard failure rather than a short file claimed as success.
-    if pending.pending_len() > 0 {
-        return Err(io::Error::other(format!(
-            "parallel writer: channel closed with {} item(s) still in reorder buffer; \
-             an upstream framer dropped without sending an earlier seq",
-            pending.pending_len(),
-        )));
-    }
-    Ok(())
+    // Channel closed cleanly. That proves nothing about completeness on its
+    // own: an upstream framer that died took its `tx` clone with it, so the
+    // close looks identical either way. Returning `Ok(())` without checking
+    // would claim success for a truncated file - and the check has to cover
+    // BOTH a gap that stranded later items and a gap at the tail that
+    // stranded nothing. See `check_stream_complete`.
+    check_stream_complete(
+        "parallel writer",
+        pending.pending_len(),
+        pending.next_seq(),
+        expected,
+    )
 }
 
 /// Dispatch one `OutputChunk` to the pool. Handles each variant,
@@ -548,7 +557,11 @@ mod tests {
         let header = b"HDR".to_vec();
 
         let path = out.clone();
-        let handle = std::thread::spawn(move || parallel_writer_thread(rx, path, header, init_tx));
+        let seq_total = SeqTotal::new();
+        let thread_total = seq_total.clone();
+        let handle = std::thread::spawn(move || {
+            parallel_writer_thread(rx, path, header, init_tx, &thread_total)
+        });
 
         // Wait for init.
         init_rx
@@ -564,6 +577,7 @@ mod tests {
             })
             .map_err(|_| io::Error::other("send"))?;
         }
+        seq_total.announce(16);
         drop(tx);
 
         handle
@@ -609,12 +623,77 @@ mod tests {
         let worker_txs: Vec<SyncSender<WriteOp>> = Vec::new();
         let err_slot: ErrSlot = Arc::new(Mutex::new(None));
 
-        let result = dispatch_loop(&rx, &worker_txs, &err_slot, 0);
+        let seq_total = SeqTotal::new();
+        seq_total.announce(3);
+        let result = dispatch_loop(&rx, &worker_txs, &err_slot, 0, &seq_total);
         let err = result.expect_err("gap at channel close must surface as Err");
         let msg = err.to_string();
         assert!(
             msg.contains("reorder buffer"),
             "error should name the reorder-buffer state, got: {msg}",
         );
+    }
+
+    /// The tail-gap shape the reorder buffer cannot see.
+    ///
+    /// `dispatch_loop_surfaces_gap_at_channel_close` covers an INTERIOR gap,
+    /// where the surviving items pile up behind the missing seq and
+    /// `pending_len` is non-zero. If the FINAL framer dies instead, seq 0
+    /// pops cleanly, the buffer drains to empty, and the channel closes with
+    /// nothing stranded - so `pending_len` alone reports a short file as a
+    /// complete one. Only the announced total catches it.
+    #[test]
+    fn dispatch_loop_surfaces_a_missing_tail_with_an_empty_reorder_buffer() {
+        use std::sync::{Arc, Mutex};
+
+        let (worker_tx, worker_rx) = sync_channel::<WriteOp>(4);
+        let (tx, rx) = sync_channel::<PipelineItem>(4);
+        tx.send(PipelineItem {
+            seq: 0,
+            data: Ok(OutputChunk::Raw(vec![0u8; 8])),
+        })
+        .expect("send seq=0");
+        drop(tx);
+
+        let worker_txs = vec![worker_tx];
+        let err_slot: ErrSlot = Arc::new(Mutex::new(None));
+        let seq_total = SeqTotal::new();
+        // Two blobs were dispatched upstream; only seq 0 ever arrived.
+        seq_total.announce(2);
+
+        let result = dispatch_loop(&rx, &worker_txs, &err_slot, 0, &seq_total);
+        let msg = result
+            .expect_err("a missing final seq is a short file, not a success")
+            .to_string();
+        assert!(
+            msg.contains("after 1 of 2"),
+            "error must name what arrived vs what was expected, got: {msg}",
+        );
+        drop(worker_rx);
+    }
+
+    /// Passing counterpart: the same one-item stream, correctly announced,
+    /// must still succeed. Guards against a regression that fails every run.
+    #[test]
+    fn dispatch_loop_accepts_a_complete_stream() {
+        use std::sync::{Arc, Mutex};
+
+        let (worker_tx, worker_rx) = sync_channel::<WriteOp>(4);
+        let (tx, rx) = sync_channel::<PipelineItem>(4);
+        tx.send(PipelineItem {
+            seq: 0,
+            data: Ok(OutputChunk::Raw(vec![0u8; 8])),
+        })
+        .expect("send seq=0");
+        drop(tx);
+
+        let worker_txs = vec![worker_tx];
+        let err_slot: ErrSlot = Arc::new(Mutex::new(None));
+        let seq_total = SeqTotal::new();
+        seq_total.announce(1);
+
+        dispatch_loop(&rx, &worker_txs, &err_slot, 0, &seq_total)
+            .expect("a complete one-item stream is not a truncation");
+        drop(worker_rx);
     }
 }

@@ -43,6 +43,52 @@
   and it is now public. Migration: decompress into a `Vec<u8>` and pass
   it by value instead of converting to `Bytes`.
 
+- **The writer now refuses to produce a file it would have to corrupt or
+  truncate, where it previously produced one and exited zero.** Four
+  cases, all of which used to succeed silently:
+  - A framing task dropped without sending its blob - leaving the output
+    short by an arbitrary number of blobs - is now an error on every
+    backend. Previously the default backend (used by every command without
+    an I/O flag) did not check at all, and the `--io-uring` and parallel
+    pwrite backends checked only for a gap that stranded *later* blobs in
+    the reorder buffer. A gap at the tail strands nothing, so a lost final
+    blob - or a single-blob write that vanished entirely - passed all
+    three. The writer is now told the final blob count before the stream
+    closes and refuses to finalise a file that is short of it.
+  - `BlockBuilder::add_relation` with a member whose type is
+    `MemberType::Unknown` now poisons the builder, and the next `take()` /
+    `take_owned()` fails. The member used to be written as a **node** - a
+    file that is valid PBF and semantically wrong, which no reader,
+    `check --index`, or osmium cross-validation catches.
+  - `BlockBuilder::add_way_with_locations` with mismatched `refs` and
+    `locations` lengths now poisons the builder the same way. In release
+    builds the encoder zipped the two slices, so the way was written with
+    refs missing; only a `debug_assert_eq!` stood in the way.
+  - `DirectWriter::write` after `DirectWriter::flush` is now an error. It
+    used to append after a mid-file zero gap and silently drop the final
+    partial buffer.
+
+- **`PbfWriter` surfaces the writer thread's real I/O error.** When the
+  writer thread died - ENOSPC, EIO, a short io_uring write - the next
+  `write_raw` / `write_raw_owned` / `write_raw_chunks` / `write_raw_copy`
+  returned a synthetic "writer thread terminated" and the actual cause was
+  discarded by `Drop`. These paths now join the thread and return its own
+  error, kind and message intact.
+
+- **`HeaderBuilder` writes `source` (HeaderBlock field 17).** `build`'s doc
+  had always listed it; no code path emitted it, so every command that
+  rewrote a header through `HeaderBuilder` dropped the field. New
+  `.source()` / `.without_source()` builder methods, and `from_header` now
+  copies it. Related: replication timestamp / sequence number are emitted
+  unconditionally when set, so sequence number 0 is no longer silently
+  dropped.
+
+- **Writing to a `PbfWriter` after `flush()` returns an error instead of
+  panicking.** The `flush` doc claimed "subsequent writes go through the
+  direct (non-pipelined) path"; for every pipelined constructor the file
+  had been moved into the writer thread, so that path hit an `expect`. The
+  doc has been corrected and the panic replaced with an `io::Error`.
+
 ### Added
 
 - **`pbfhogg check --index`: verify a file's blob-level metadata against the

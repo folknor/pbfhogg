@@ -54,6 +54,31 @@ fn write_synthetic_indexed_input(path: &Path) {
     );
 }
 
+fn assert_invalid_queries_are_rejected(reader: &pbfhogg::geocode_index::reader::Reader) {
+    use pbfhogg::geocode_index::reader::QueryError;
+
+    assert!(matches!(
+        reader.query(f64::NAN, 12.0),
+        Err(QueryError::NonFiniteLatitude(value)) if value.is_nan()
+    ));
+    assert!(matches!(
+        reader.query(55.0, f64::INFINITY),
+        Err(QueryError::NonFiniteLongitude(value)) if value.is_infinite()
+    ));
+    assert_eq!(
+        reader
+            .query(90.000_000_1, 100.0)
+            .expect_err("invalid latitude"),
+        QueryError::LatitudeOutOfRange(90.000_000_1)
+    );
+    assert_eq!(
+        reader
+            .candidates(80.0, -180.000_000_1)
+            .expect_err("invalid longitude"),
+        QueryError::LongitudeOutOfRange(-180.000_000_1)
+    );
+}
+
 fn write_synthetic_admin_input(path: &Path) {
     write_test_pbf_sorted(
         path,
@@ -451,6 +476,108 @@ fn write_synthetic_unresolved_interpolation_input(path: &Path) {
     );
 }
 
+/// An interpolation way spanning the antimeridian: 179.9E to 179.9W, a
+/// segment 0.2 degrees wide whose midpoint is at +/-180, not at 0.
+fn write_synthetic_antimeridian_interpolation_input(path: &Path) {
+    write_test_pbf_sorted(
+        path,
+        &[
+            TestNode {
+                id: 120,
+                lat: 0,
+                lon: 1_799_000_000,
+                tags: vec![
+                    ("addr:housenumber", "10"),
+                    ("addr:street", "Dateline Street"),
+                ],
+                meta: None,
+            },
+            TestNode {
+                id: 121,
+                lat: 0,
+                lon: -1_799_000_000,
+                tags: vec![
+                    ("addr:housenumber", "30"),
+                    ("addr:street", "Dateline Street"),
+                ],
+                meta: None,
+            },
+        ],
+        &[TestWay {
+            id: 220,
+            refs: vec![120, 121],
+            tags: vec![
+                ("addr:interpolation", "even"),
+                ("addr:street", "Dateline Street"),
+            ],
+            meta: None,
+        }],
+        &[],
+    );
+}
+
+/// A near but UNRESOLVABLE interpolation way (node 131 carries no house
+/// number, so the way's end number stays 0) plus a farther resolvable one.
+/// The near way is inside the fine radius, the far one only inside coarse.
+fn write_synthetic_shadowed_interpolation_input(path: &Path) {
+    write_test_pbf_sorted(
+        path,
+        &[
+            // ~10 m north of the query point: unresolvable.
+            TestNode {
+                id: 130,
+                lat: 557_000_898,
+                lon: 125_000_000,
+                tags: vec![("addr:housenumber", "10"), ("addr:street", "Near Street")],
+                meta: None,
+            },
+            TestNode {
+                id: 131,
+                lat: 557_000_898,
+                lon: 125_060_000,
+                tags: vec![],
+                meta: None,
+            },
+            // ~100 m north of the query point: fully resolvable.
+            TestNode {
+                id: 132,
+                lat: 557_008_983,
+                lon: 125_000_000,
+                tags: vec![("addr:housenumber", "10"), ("addr:street", "Far Street")],
+                meta: None,
+            },
+            TestNode {
+                id: 133,
+                lat: 557_008_983,
+                lon: 125_060_000,
+                tags: vec![("addr:housenumber", "30"), ("addr:street", "Far Street")],
+                meta: None,
+            },
+        ],
+        &[
+            TestWay {
+                id: 230,
+                refs: vec![130, 131],
+                tags: vec![
+                    ("addr:interpolation", "all"),
+                    ("addr:street", "Near Street"),
+                ],
+                meta: None,
+            },
+            TestWay {
+                id: 231,
+                refs: vec![132, 133],
+                tags: vec![
+                    ("addr:interpolation", "even"),
+                    ("addr:street", "Far Street"),
+                ],
+                meta: None,
+            },
+        ],
+        &[],
+    );
+}
+
 fn write_synthetic_postal_boundary_input(path: &Path) {
     write_test_pbf_sorted(
         path,
@@ -727,7 +854,7 @@ fn write_addr_cell_overflow_input(path: &Path) {
 }
 
 #[test]
-fn synthetic_build_query_and_api_equivalence() {
+fn synthetic_build_query_matches_low_level_api() {
     let dir = TempDir::new().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
@@ -764,7 +891,9 @@ fn synthetic_build_query_and_api_equivalence() {
     let reader =
         pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
 
-    let result = reader.query(55.70005, 12.5005);
+    assert_invalid_queries_are_rejected(&reader);
+
+    let result = reader.query(55.70005, 12.5005).expect("valid query");
     let addr = result
         .address
         .as_ref()
@@ -783,7 +912,10 @@ fn synthetic_build_query_and_api_equivalence() {
     );
     assert!(result.admin.is_empty(), "fixture has no admin polygons");
 
-    let via_candidates = reader.candidates(55.70005, 12.5005).into_result(&reader);
+    let via_candidates = reader
+        .candidates(55.70005, 12.5005)
+        .expect("valid query")
+        .into_result(&reader);
     let cand_addr = via_candidates
         .address
         .as_ref()
@@ -805,7 +937,7 @@ fn synthetic_build_query_and_api_equivalence() {
         "fixture has no admin polygons"
     );
 
-    let far = reader.query(0.0, 0.0);
+    let far = reader.query(0.0, 0.0).expect("valid query");
     assert!(
         far.address.is_none(),
         "far-away query must not invent an address"
@@ -863,7 +995,7 @@ fn null_island_street_vertex_is_not_treated_as_absent() {
     .expect("Null Island is a real coordinate");
     assert_eq!(stats.street_ways, 1);
     let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("open index");
-    let result = reader.query(0.0, 0.0);
+    let result = reader.query(0.0, 0.0).expect("valid query");
     assert_eq!(
         result.street.expect("street at Null Island").name,
         "Null Island Road"
@@ -896,7 +1028,7 @@ fn legal_non_dense_nodes_build_a_queryable_index() {
     assert_eq!(stats.addr_points, 1);
     assert_eq!(stats.street_ways, 1);
     let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("open index");
-    let result = reader.query(55.70005, 12.5005);
+    let result = reader.query(55.70005, 12.5005).expect("valid query");
     assert!(
         result.address.is_some(),
         "non-dense address node must be queryable"
@@ -1007,10 +1139,10 @@ fn reader_rejects_every_out_of_bounds_offset_kind() {
     // (file to corrupt, byte range holding the offset, substring of the
     // expected error). One case per offset kind in the format.
     let cases: &[(&str, std::ops::Range<usize>, &str)] = &[
-        ("admin_cells.bin", 8..12, "admin entry"),
+        ("admin_cells.bin", 8..16, "admin entry"),
         ("street_ways.bin", 0..8, "street way node"),
         ("interp_ways.bin", 0..8, "interpolation way node"),
-        ("admin_polygons.bin", 4..8, "admin polygon vertex"),
+        ("admin_polygons.bin", 4..12, "admin polygon vertex"),
     ];
     for (file, range, expected) in cases {
         let index_dir = dir.path().join(format!("case-{file}"));
@@ -1204,7 +1336,11 @@ fn force_with_bad_input_leaves_the_existing_index_intact() {
     let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
         .expect("the surviving index must still open and answer queries");
     assert!(
-        reader.query(55.70005, 12.5005).address.is_some(),
+        reader
+            .query(55.70005, 12.5005)
+            .expect("valid query")
+            .address
+            .is_some(),
         "the surviving index must still resolve what it resolved before"
     );
 }
@@ -1321,7 +1457,7 @@ fn levels_past_the_sampling_budget_are_refused_before_reading_input() {
 }
 
 #[test]
-fn coarse_fallback_recovers_hits_outside_fine_radius() {
+fn fallback_recovers_hits_outside_fine_radius() {
     let dir = TempDir::new().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");
     let no_fallback_dir = dir.path().join("index_no_fallback");
@@ -1351,7 +1487,9 @@ fn coarse_fallback_recovers_hits_outside_fine_radius() {
 
     let no_fallback =
         pbfhogg::geocode_index::reader::Reader::open(&no_fallback_dir).expect("reader should open");
-    let no_fallback_result = no_fallback.query(query_lat, query_lon);
+    let no_fallback_result = no_fallback
+        .query(query_lat, query_lon)
+        .expect("valid query");
     assert!(
         no_fallback_result.address.is_none(),
         "1m fine radius should miss the address"
@@ -1363,7 +1501,9 @@ fn coarse_fallback_recovers_hits_outside_fine_radius() {
 
     let with_fallback = pbfhogg::geocode_index::reader::Reader::open(&coarse_fallback_dir)
         .expect("reader should open");
-    let with_fallback_result = with_fallback.query(query_lat, query_lon);
+    let with_fallback_result = with_fallback
+        .query(query_lat, query_lon)
+        .expect("valid query");
     let addr = with_fallback_result
         .address
         .as_ref()
@@ -1378,6 +1518,49 @@ fn coarse_fallback_recovers_hits_outside_fine_radius() {
     assert!(
         with_fallback_result.admin.is_empty(),
         "fixture has no admin polygons"
+    );
+}
+
+#[test]
+fn fallback_fills_address_when_fine_street_exists() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+    write_synthetic_indexed_input(&input);
+    pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir.clone(),
+            fine_search_radius_m: 2.0,
+            coarse_search_radius_m: 100.0,
+            ..Default::default()
+        },
+    )
+    .expect("build should succeed");
+
+    let reader =
+        pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
+    let result = reader.query(55.7, 12.5005).expect("valid query");
+    assert!(result.street.is_some(), "fine search must find the street");
+    assert_eq!(
+        result.address.as_ref().map(|address| address.postcode),
+        Some(Some("1234")),
+        "coarse search must independently fill the missing address and postcode"
+    );
+
+    let candidates = reader.candidates(55.7, 12.5005).expect("valid query");
+    assert!(
+        !candidates.streets.is_empty(),
+        "fine candidates keep the street"
+    );
+    assert!(
+        !candidates.addresses.is_empty(),
+        "coarse fill must add the address"
+    );
+    let ranked = candidates.into_result(&reader);
+    assert_eq!(
+        ranked.address.and_then(|address| address.postcode),
+        Some("1234")
     );
 }
 
@@ -1412,7 +1595,7 @@ fn synthetic_admin_polygon_query_returns_country_match() {
     let reader =
         pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
 
-    let inside = reader.query(55.7000, 12.5005);
+    let inside = reader.query(55.7000, 12.5005).expect("valid query");
     assert!(
         inside.address.is_none(),
         "admin-only fixture has no addresses"
@@ -1430,7 +1613,7 @@ fn synthetic_admin_polygon_query_returns_country_match() {
     assert_eq!(country.name, "Syntheticland");
     assert_eq!(country.country_code, Some("SL"));
 
-    let outside = reader.query(55.7020, 12.5005);
+    let outside = reader.query(55.7020, 12.5005).expect("valid query");
     assert!(
         outside.admin.is_empty(),
         "query outside the polygon must not match the country boundary"
@@ -1466,7 +1649,9 @@ fn nested_same_level_admin_prefers_smallest_polygon() {
     let query_lat = 55.7000;
     let query_lon = 12.5005;
 
-    let raw_candidates = reader.candidates(query_lat, query_lon);
+    let raw_candidates = reader
+        .candidates(query_lat, query_lon)
+        .expect("valid query");
     let raw_level8: Vec<_> = raw_candidates
         .admin
         .iter()
@@ -1481,7 +1666,7 @@ fn nested_same_level_admin_prefers_smallest_polygon() {
     assert!(raw_level8.contains(&"Bigshire"));
     assert!(raw_level8.contains(&"Smallshire"));
 
-    let collapsed = reader.query(query_lat, query_lon);
+    let collapsed = reader.query(query_lat, query_lon).expect("valid query");
     let collapsed_level8: Vec<_> = collapsed
         .admin
         .iter()
@@ -1494,7 +1679,10 @@ fn nested_same_level_admin_prefers_smallest_polygon() {
     );
     assert_eq!(collapsed_level8[0].name, "Smallshire");
 
-    let via_into_result = reader.candidates(query_lat, query_lon).into_result(&reader);
+    let via_into_result = reader
+        .candidates(query_lat, query_lon)
+        .expect("valid query")
+        .into_result(&reader);
     let into_result_level8: Vec<_> = via_into_result
         .admin
         .iter()
@@ -1534,7 +1722,7 @@ fn admin_polygon_hole_excludes_queries_inside_the_hole() {
     let reader =
         pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
 
-    let shell = reader.query(55.6992, 12.4992);
+    let shell = reader.query(55.6992, 12.4992).expect("valid query");
     let shell_admin = shell
         .admin
         .iter()
@@ -1542,13 +1730,13 @@ fn admin_polygon_hole_excludes_queries_inside_the_hole() {
         .expect("query inside the shell should match the admin polygon");
     assert_eq!(shell_admin.name, "Holeland");
 
-    let hole = reader.query(55.7000, 12.5005);
+    let hole = reader.query(55.7000, 12.5005).expect("valid query");
     assert!(
         hole.admin.iter().all(|admin| admin.admin_level != 6),
         "query inside the inner ring must not match the polygon"
     );
 
-    let raw_hole = reader.candidates(55.7000, 12.5005);
+    let raw_hole = reader.candidates(55.7000, 12.5005).expect("valid query");
     assert!(
         raw_hole.admin.iter().all(|admin| admin.admin_level != 6),
         "candidates() must also respect admin holes"
@@ -1557,8 +1745,8 @@ fn admin_polygon_hole_excludes_queries_inside_the_hole() {
 
 /// Walk admin_cells.bin + admin_entries.bin and map every admin S2 cell id to
 /// whether it carries an entry with the interior high bit set. On-disk layout
-/// (see `src/geocode_index/format.rs`): admin_cells.bin is fixed 12-byte
-/// records (cell_id u64, entries_offset u32); admin_entries.bin holds, at
+/// (see `src/geocode_index/format.rs`): admin_cells.bin is fixed 16-byte
+/// records (cell_id u64, entries_offset u64); admin_entries.bin holds, at
 /// each cell's entries_offset, a u16 count followed by that many u32 entries
 /// whose top bit (`INTERIOR_FLAG`) marks an interior hint. Keyed by cell id
 /// (rather than a single yes/anywhere bool) so callers can ask "is *this*
@@ -1578,12 +1766,10 @@ fn admin_cell_interior_flags(index_dir: &Path) -> std::collections::HashMap<u64,
     for i in 0..cell_count {
         let base = i * ADMIN_CELL_SIZE;
         let cell_id = u64::from_le_bytes(cells[base..base + 8].try_into().expect("8 bytes"));
-        let entries_offset = u32::from_le_bytes([
-            cells[base + 8],
-            cells[base + 9],
-            cells[base + 10],
-            cells[base + 11],
-        ]) as usize;
+        let entries_offset = usize::try_from(u64::from_le_bytes(
+            cells[base + 8..base + 16].try_into().expect("8 bytes"),
+        ))
+        .expect("test platform must address the entries file");
 
         let mut has_interior = false;
         if entries_offset + 2 <= entries.len() {
@@ -1661,7 +1847,7 @@ fn admin_interior_hint_does_not_bypass_point_in_polygon() {
     let interior_flags = admin_cell_interior_flags(&index_dir);
 
     // Sanity: a point well inside the polygon resolves to the boundary.
-    let inside = reader.query(55.5, 11.5);
+    let inside = reader.query(55.5, 11.5).expect("valid query");
     let inside_admin = inside
         .admin
         .iter()
@@ -1710,13 +1896,20 @@ fn admin_interior_hint_does_not_bypass_point_in_polygon() {
             exercised_neighbor_bypass = true;
         }
 
-        let ranked = reader.query(outside_lat, lon);
+        let ranked = reader.query(outside_lat, lon).expect("valid query");
         assert!(
             ranked.admin.iter().all(|admin| admin.name != "Bigland"),
             "query() at ({outside_lat}, {lon}) is outside the polygon and must \
              not be attributed to Bigland via an interior-flagged neighbor cell"
         );
-        let raw = reader.candidates(outside_lat, lon);
+        #[cfg(feature = "test-hooks")]
+        reader.reset_admin_pip_calls();
+        let raw = reader.candidates(outside_lat, lon).expect("valid query");
+        #[cfg(feature = "test-hooks")]
+        assert!(
+            reader.admin_pip_calls() <= 1,
+            "one polygon shared by neighboring cells must be containment-tested at most once"
+        );
         assert!(
             raw.admin.iter().all(|admin| admin.name != "Bigland"),
             "candidates() at ({outside_lat}, {lon}) is outside the polygon and \
@@ -1763,7 +1956,7 @@ fn synthetic_interpolation_query_resolves_even_house_number() {
 
     let query_lat = 55.7000;
     let query_lon = 12.5030;
-    let result = reader.query(query_lat, query_lon);
+    let result = reader.query(query_lat, query_lon).expect("valid query");
     assert!(
         result.address.is_none(),
         "midpoint query should stay outside the fine address radius"
@@ -1780,12 +1973,17 @@ fn synthetic_interpolation_query_resolves_even_house_number() {
     );
     assert!(result.admin.is_empty(), "fixture has no admin polygons");
 
-    let candidates = reader.candidates(query_lat, query_lon);
+    let candidates = reader
+        .candidates(query_lat, query_lon)
+        .expect("valid query");
     assert!(
         !candidates.interpolations.is_empty(),
         "candidates should expose the raw interpolation hit"
     );
-    let via_candidates = reader.candidates(query_lat, query_lon).into_result(&reader);
+    let via_candidates = reader
+        .candidates(query_lat, query_lon)
+        .expect("valid query")
+        .into_result(&reader);
     let cand_interp = via_candidates
         .interpolation
         .as_ref()
@@ -1827,7 +2025,7 @@ fn unresolved_interpolation_stays_hidden_behind_zero_sentinel() {
 
     let query_lat = 55.7000;
     let query_lon = 12.5030;
-    let result = reader.query(query_lat, query_lon);
+    let result = reader.query(query_lat, query_lon).expect("valid query");
     assert!(
         result.address.is_none(),
         "midpoint query should not hit the lone endpoint address"
@@ -1837,23 +2035,21 @@ fn unresolved_interpolation_stays_hidden_behind_zero_sentinel() {
         "unresolved endpoints stay at 0/0 and must not surface as an interpolation result"
     );
 
-    let candidates = reader.candidates(query_lat, query_lon);
-    let candidate = candidates
-        .interpolations
-        .iter()
-        .min_by(|a, b| {
-            a.distance_m
-                .partial_cmp(&b.distance_m)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .expect("raw candidates should still expose the interpolation segment");
+    // candidates() must NOT expose a segment it cannot resolve. Its emptiness
+    // is the coarse-fallback gate, so a candidate that yields no house number
+    // would silently suppress a coarse hit that would have. This assertion was
+    // previously the other way round - it pinned exactly that bug as correct.
+    let candidates = reader
+        .candidates(query_lat, query_lon)
+        .expect("valid query");
     assert!(
-        reader.interpolate(candidate).is_none(),
-        "reader.interpolate() should hide unresolved 0/0 interpolation endpoints"
+        candidates.interpolations.is_empty(),
+        "a 0/0 interpolation way is unresolvable and must not be offered as a candidate"
     );
     assert!(
         reader
             .candidates(query_lat, query_lon)
+            .expect("valid query")
             .into_result(&reader)
             .interpolation
             .is_none(),
@@ -1862,7 +2058,7 @@ fn unresolved_interpolation_stays_hidden_behind_zero_sentinel() {
 }
 
 #[test]
-fn coarse_fallback_recovers_interpolation_outside_fine_radius() {
+fn fallback_recovers_interpolation_outside_fine_radius() {
     let dir = TempDir::new().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");
     let no_fallback_dir = dir.path().join("index_no_fallback");
@@ -1892,7 +2088,9 @@ fn coarse_fallback_recovers_interpolation_outside_fine_radius() {
 
     let no_fallback =
         pbfhogg::geocode_index::reader::Reader::open(&no_fallback_dir).expect("reader should open");
-    let no_fallback_result = no_fallback.query(query_lat, query_lon);
+    let no_fallback_result = no_fallback
+        .query(query_lat, query_lon)
+        .expect("valid query");
     assert!(
         no_fallback_result.address.is_none(),
         "fine-only lookup should miss the endpoint addresses"
@@ -1908,7 +2106,9 @@ fn coarse_fallback_recovers_interpolation_outside_fine_radius() {
 
     let with_fallback = pbfhogg::geocode_index::reader::Reader::open(&coarse_fallback_dir)
         .expect("reader should open");
-    let with_fallback_result = with_fallback.query(query_lat, query_lon);
+    let with_fallback_result = with_fallback
+        .query(query_lat, query_lon)
+        .expect("valid query");
     assert!(
         with_fallback_result.address.is_none(),
         "coarse interpolation fallback should not invent an endpoint address"
@@ -1924,11 +2124,143 @@ fn coarse_fallback_recovers_interpolation_outside_fine_radius() {
     assert_eq!(interp.street, "Interp Street");
     assert_eq!(interp.house_number, 20);
 
-    let candidates = with_fallback.candidates(query_lat, query_lon);
+    let candidates = with_fallback
+        .candidates(query_lat, query_lon)
+        .expect("valid query");
     assert!(
         !candidates.interpolations.is_empty(),
         "coarse candidates should expose the raw interpolation hit"
     );
+}
+
+/// `point_to_segment_distance_sq` computes `t` in a longitude frame unwrapped
+/// around the segment start, so the snap point has to be interpolated in that
+/// same frame. Interpolating the raw E7 values instead put the midpoint of a
+/// 179.9E -> 179.9W segment at longitude 0 rather than 180 - a snap point on
+/// the far side of the planet, which the interpolation path then fed into
+/// `accumulated_length_radians` as a ~180 degree partial length against a 0.2
+/// degree total. The assertion that bites is therefore the HOUSE NUMBER, not
+/// the snap coordinate: a snap-point check alone would not show how wrong the
+/// user-visible answer got.
+#[test]
+fn antimeridian_interpolation_snaps_on_the_short_arc() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+
+    write_synthetic_antimeridian_interpolation_input(&input);
+
+    pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir.clone(),
+            force: false,
+            ..Default::default()
+        },
+    )
+    .expect("build should succeed");
+
+    let reader =
+        pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
+
+    // Exactly on the segment, at its midpoint.
+    let result = reader.query(0.0, 180.0).expect("valid query");
+    let interp = result
+        .interpolation
+        .as_ref()
+        .expect("the query point lies on the interpolation segment");
+    assert_eq!(interp.street, "Dateline Street");
+    assert_eq!(
+        interp.house_number, 20,
+        "midpoint of a 10..30 even interpolation is 20; a long-arc snap point \
+         drives the accumulated length far past the way length and produces a \
+         wildly wrong number"
+    );
+
+    // The snap point itself must also stay on the short arc. +/-180 are the
+    // same meridian, so accept either sign, but nothing near 0.
+    let candidate = reader
+        .candidates(0.0, 180.0)
+        .expect("valid query")
+        .interpolations
+        .into_iter()
+        .next()
+        .expect("segment should be a raw candidate too");
+    let snap_lon_deg = f64::from(candidate.snap_lon_e7) * 1e-7;
+    assert!(
+        snap_lon_deg.abs() > 179.0,
+        "snap longitude {snap_lon_deg} should sit on the antimeridian, not at 0"
+    );
+}
+
+/// Coarse fallback eligibility must depend on whether a fine hit RESOLVES,
+/// not on whether a fine segment exists. A nearby interpolation way whose
+/// endpoint numbers are unusable used to both produce no house number and
+/// suppress the coarse interpolation that would have produced one.
+#[test]
+fn unresolvable_fine_interpolation_does_not_shadow_the_fallback() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+
+    write_synthetic_shadowed_interpolation_input(&input);
+
+    let stats = pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir.clone(),
+            force: false,
+            fine_search_radius_m: 30.0,
+            coarse_search_radius_m: 300.0,
+            ..Default::default()
+        },
+    )
+    .expect("build should succeed");
+    assert_eq!(
+        stats.interp_ways, 2,
+        "both the unresolvable near way and the resolvable far way are indexed"
+    );
+
+    let reader =
+        pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
+
+    let (lat, lon) = (55.7, 12.503);
+    let result = reader.query(lat, lon).expect("valid query");
+    let interp = result
+        .interpolation
+        .as_ref()
+        .expect("the unresolvable near way must not suppress the coarse fallback");
+    assert_eq!(interp.street, "Far Street");
+    assert_eq!(interp.house_number, 20);
+
+    // candidates() gates its fallback the same way, and into_result() ranks
+    // what candidates() collected - all three surfaces must agree.
+    let candidates = reader.candidates(lat, lon).expect("valid query");
+    assert!(
+        candidates
+            .interpolations
+            .iter()
+            .all(|c| reader.interpolate(c).is_some()),
+        "candidates() must not emit an interpolation it cannot resolve, or its \
+         emptiness gate means something different from query()'s"
+    );
+    assert!(
+        candidates
+            .interpolations
+            .iter()
+            .any(|c| c.street == "Far Street"),
+        "coarse fallback should have run for candidates() too"
+    );
+    let ranked = reader
+        .candidates(lat, lon)
+        .expect("valid query")
+        .into_result(&reader);
+    let ranked_interp = ranked
+        .interpolation
+        .as_ref()
+        .expect("into_result() must agree with query()");
+    assert_eq!(ranked_interp.street, interp.street);
+    assert_eq!(ranked_interp.house_number, interp.house_number);
 }
 
 #[test]
@@ -1957,7 +2289,7 @@ fn synthetic_postal_boundary_query_returns_level_11_match() {
     let reader =
         pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
 
-    let inside = reader.query(55.7000, 12.5005);
+    let inside = reader.query(55.7000, 12.5005).expect("valid query");
     let postal = inside
         .admin
         .iter()
@@ -1969,7 +2301,7 @@ fn synthetic_postal_boundary_query_returns_level_11_match() {
         "postal-code boundaries should not fabricate a country code"
     );
 
-    let outside = reader.query(55.7020, 12.5005);
+    let outside = reader.query(55.7020, 12.5005).expect("valid query");
     assert!(
         outside.admin.iter().all(|admin| admin.admin_level != 11),
         "query outside the polygon must not match the postal boundary"
@@ -2178,7 +2510,9 @@ fn output_dir() -> std::path::PathBuf {
 
 fn ensure_index_exists() -> Option<std::path::PathBuf> {
     let dir = output_dir();
-    if dir.join("geocode_header.bin").exists() {
+    if dir.join("geocode_header.bin").exists()
+        && pbfhogg::geocode_index::reader::Reader::open(&dir).is_ok()
+    {
         return Some(dir);
     }
     // Try building (only reasonable in release mode)
@@ -2283,7 +2617,7 @@ fn query_copenhagen() {
     let reader = pbfhogg::geocode_index::reader::Reader::open(&dir).expect("reader should open");
 
     // 55.6761°N, 12.5683°E - Copenhagen City Hall / Rådhuspladsen
-    let result = reader.query(55.6761, 12.5683);
+    let result = reader.query(55.6761, 12.5683).expect("valid query");
 
     assert!(
         result.address.is_some() || result.street.is_some(),
@@ -2324,7 +2658,7 @@ fn query_rural_jutland() {
     let reader = pbfhogg::geocode_index::reader::Reader::open(&dir).expect("reader should open");
 
     // 57.5°N, 10.0°E - sparse area in northern Jutland
-    let result = reader.query(57.5, 10.0);
+    let result = reader.query(57.5, 10.0).expect("valid query");
     let country = result.admin.iter().find(|a| a.admin_level == 2);
     assert!(country.is_some(), "rural point should resolve country");
 }
@@ -2340,7 +2674,7 @@ fn query_north_sea() {
     let reader = pbfhogg::geocode_index::reader::Reader::open(&dir).expect("reader should open");
 
     // 56.0°N, 4.0°E - North Sea
-    let result = reader.query(56.0, 4.0);
+    let result = reader.query(56.0, 4.0).expect("valid query");
     assert!(result.address.is_none(), "no address in the North Sea");
     assert!(result.street.is_none(), "no street in the North Sea");
 }
@@ -2358,8 +2692,11 @@ fn api_equivalence() {
     let points = [(55.6761, 12.5683), (56.15, 10.2), (55.4, 12.3)];
 
     for &(lat, lon) in &points {
-        let rq = reader.query(lat, lon);
-        let rc = reader.candidates(lat, lon).into_result(&reader);
+        let rq = reader.query(lat, lon).expect("valid query");
+        let rc = reader
+            .candidates(lat, lon)
+            .expect("valid query")
+            .into_result(&reader);
 
         assert_eq!(
             rq.address.is_some(),
@@ -2399,7 +2736,7 @@ fn coarse_fallback() {
     let reader = pbfhogg::geocode_index::reader::Reader::open(&dir).expect("reader should open");
 
     // Thy National Park, northern Jutland: 56.92°N, 8.52°E
-    let result = reader.query(56.92, 8.52);
+    let result = reader.query(56.92, 8.52).expect("valid query");
 
     // Admin should resolve regardless
     let country = result.admin.iter().find(|a| a.admin_level == 2);

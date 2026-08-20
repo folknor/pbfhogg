@@ -27,10 +27,17 @@ struct CellAddrCsr {
     cell_ids: Vec<u64>,
     /// Length `cell_ids.len() + 1`. Row `i` occupies
     /// `values[offsets[i]..offsets[i + 1]]`.
+    /// This is u32 because every value is an address-point index and the
+    /// on-disk header caps the total address-point count at u32::MAX.
     offsets: Vec<u32>,
     /// Address-point indices, grouped by cell in `cell_ids` order, ascending
     /// within each group.
     values: Vec<u32>,
+}
+
+fn csr_offset(len: usize) -> u32 {
+    u32::try_from(len)
+        .expect("address CSR cannot exceed the u32 address-point count encoded by the index format")
 }
 
 impl CellAddrCsr {
@@ -88,7 +95,7 @@ fn build_cell_addr_csr(addr_mmap: &[u8], street_level: u8) -> CellAddrCsr {
             values.push(pairs[index].1);
             index += 1;
         }
-        offsets.push(values.len() as u32);
+        offsets.push(csr_offset(values.len()));
     }
 
     CellAddrCsr {
@@ -324,6 +331,13 @@ mod tests {
         assert!(csr.cell_ids.is_empty());
         assert_eq!(csr.offsets, vec![0]);
         assert_eq!(csr.get(0), &[] as &[u32]);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    #[should_panic(expected = "address CSR cannot exceed")]
+    fn csr_offset_refuses_truncation() {
+        let _ = csr_offset(u32::MAX as usize + 1);
     }
 
     #[test]

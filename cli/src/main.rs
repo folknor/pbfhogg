@@ -1003,7 +1003,7 @@ enum Command {
         /// S2 cell level for admin boundaries (0-19)
         #[arg(long, default_value = "10")]
         admin_level: u8,
-        /// Douglas-Peucker vertex cap per admin polygon
+        /// Douglas-Peucker cap for local admins; larger levels retain up to 16x
         #[arg(long, default_value = "500")]
         max_admin_vertices: u16,
         /// Fine-level max search distance in meters
@@ -1975,11 +1975,12 @@ fn run_build_geocode_index(
     };
     let stats = pbfhogg::geocode_index::builder::build_geocode_index(&config)?;
     eprintln!(
-        "Index built: {} addr, {} streets, {} interp, {} admin, {} fine cells, {} coarse cells, {} admin cells",
+        "Index built: {} addr, {} streets, {} interp, {} admin ({} relations dropped), {} fine cells, {} coarse cells, {} admin cells",
         stats.addr_points,
         stats.street_ways,
         stats.interp_ways,
         stats.admin_polygons,
+        stats.dropped_admin_relations,
         stats.fine_cells,
         stats.coarse_cells,
         stats.admin_cells,

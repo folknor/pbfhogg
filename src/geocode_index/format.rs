@@ -10,15 +10,15 @@
 /// Magic bytes for the index header: `GIDX`.
 pub const HEADER_MAGIC: [u8; 4] = *b"GIDX";
 
-/// Current format version. Version 2: GeoCell widened from 24 to 32 bytes
-/// (addr_offset and interp_offset changed from u32 to u64).
-pub const FORMAT_VERSION: u32 = 2;
+/// Current format version. Version 3 widens `AdminCell.entries_offset` and
+/// `AdminPolygon.vertex_offset` from u32 to u64. Readers deliberately reject
+/// older versions: existing indexes must be rebuilt.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Sentinel value for "no data" in u64 offset fields.
 ///
-/// There is no u32 counterpart: `AdminCell.entries_offset` is the only u32
-/// list offset and every admin cell has entries, so absence never needs
-/// spelling there.
+/// Every optional offset in format v3 is u64. Admin offsets are mandatory, so
+/// they never use this sentinel.
 pub const NO_DATA_U64: u64 = u64::MAX;
 
 /// Interior cell hint flag (high bit on a u32 polygon index).
@@ -131,7 +131,7 @@ impl Header {
 }
 
 // ---------------------------------------------------------------------------
-// geo_cells.bin (24 bytes per record)
+// geo_cells.bin (32 bytes per record)
 // ---------------------------------------------------------------------------
 
 /// Merged street-level cell index entry.
@@ -322,22 +322,22 @@ impl InterpWay {
 }
 
 // ---------------------------------------------------------------------------
-// admin_cells.bin (12 bytes per record)
+// admin_cells.bin (16 bytes per record)
 // ---------------------------------------------------------------------------
 
-pub const ADMIN_CELL_SIZE: usize = 12;
+pub const ADMIN_CELL_SIZE: usize = 16;
 
 #[derive(Debug, Clone, Copy)]
 pub struct AdminCell {
     pub cell_id: u64,
-    pub entries_offset: u32,
+    pub entries_offset: u64,
 }
 
 impl AdminCell {
     pub fn to_bytes(&self) -> [u8; ADMIN_CELL_SIZE] {
         let mut buf = [0u8; ADMIN_CELL_SIZE];
         buf[0..8].copy_from_slice(&self.cell_id.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.entries_offset.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.entries_offset.to_le_bytes());
         buf
     }
 
@@ -346,23 +346,25 @@ impl AdminCell {
             cell_id: u64::from_le_bytes([
                 buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
             ]),
-            entries_offset: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+            entries_offset: u64::from_le_bytes([
+                buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+            ]),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// admin_polygons.bin (22 bytes per record)
+// admin_polygons.bin (26 bytes per record)
 // ---------------------------------------------------------------------------
 
-pub const ADMIN_POLYGON_SIZE: usize = 22;
+pub const ADMIN_POLYGON_SIZE: usize = 26;
 
 #[derive(Debug, Clone, Copy)]
 pub struct AdminPolygon {
     /// Approximate area in square degrees (for smallest-polygon selection).
     pub area: f32,
     /// Byte offset into admin_vertices.bin.
-    pub vertex_offset: u32,
+    pub vertex_offset: u64,
     pub vertex_count: u32,
     pub name_offset: u32,
     /// String offset for ISO 3166-1 alpha2 country code (0 = none).
@@ -377,23 +379,25 @@ impl AdminPolygon {
     pub fn to_bytes(&self) -> [u8; ADMIN_POLYGON_SIZE] {
         let mut buf = [0u8; ADMIN_POLYGON_SIZE];
         buf[0..4].copy_from_slice(&self.area.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.vertex_offset.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.vertex_count.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.name_offset.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.country_code_offset.to_le_bytes());
-        buf[20] = self.admin_level;
-        // buf[21] reserved
+        buf[4..12].copy_from_slice(&self.vertex_offset.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.vertex_count.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.name_offset.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.country_code_offset.to_le_bytes());
+        buf[24] = self.admin_level;
+        // buf[25] reserved for future flags; writers emit zero and readers ignore it.
         buf
     }
 
     pub fn from_bytes(buf: &[u8; ADMIN_POLYGON_SIZE]) -> Self {
         Self {
             area: f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
-            vertex_offset: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
-            vertex_count: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
-            name_offset: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
-            country_code_offset: u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
-            admin_level: buf[20],
+            vertex_offset: u64::from_le_bytes([
+                buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+            ]),
+            vertex_count: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
+            name_offset: u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
+            country_code_offset: u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]),
+            admin_level: buf[24],
         }
     }
 }
@@ -482,22 +486,17 @@ pub fn parse_polygon_rings(
 
 /// Read a null-terminated UTF-8 string from a byte slice at the given offset.
 ///
-/// Returns an empty string for offset 0 or out-of-bounds offsets. If the bytes
-/// are not valid UTF-8, returns an empty string.
-pub fn read_nul_string(data: &[u8], offset: u32) -> &str {
+/// Offset 0 is the format's genuine empty string. Invalid offsets, missing NUL
+/// terminators, and invalid UTF-8 return `None` so corruption cannot collapse
+/// to the same value.
+pub fn read_nul_string(data: &[u8], offset: u32) -> Option<&str> {
     if offset == 0 {
-        return "";
+        return data.first().is_some_and(|byte| *byte == 0).then_some("");
     }
     let start = offset as usize;
-    if start >= data.len() {
-        return "";
-    }
-    let remaining = &data[start..];
-    let end = remaining
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(remaining.len());
-    std::str::from_utf8(&remaining[..end]).unwrap_or("")
+    let remaining = data.get(start..)?;
+    let end = remaining.iter().position(|&b| b == 0)?;
+    std::str::from_utf8(&remaining[..end]).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -543,7 +542,9 @@ impl std::fmt::Display for FormatError {
             Self::UnsupportedVersion(v) => {
                 write!(
                     f,
-                    "unsupported geocode index version {v} (expected {FORMAT_VERSION})"
+                    "unsupported geocode index version {v} (this build reads \
+                     version {FORMAT_VERSION}): rebuild the index with \
+                     build-geocode-index"
                 )
             }
             Self::InvalidMetadata(message) => {
@@ -688,6 +689,25 @@ mod tests {
     }
 
     #[test]
+    fn version_two_requires_rebuild() {
+        let mut bytes = valid_header_bytes();
+        bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
+        let err = Header::from_bytes(&bytes).expect_err("version 2 must be rejected");
+        assert!(matches!(err, FormatError::UnsupportedVersion(2)));
+        // The message is the entire user-facing surface for this - there is no
+        // CLI query command - so it must name the remedy, not just the number.
+        let message = err.to_string();
+        assert!(
+            message.contains("rebuild"),
+            "v2 rejection must tell the user to rebuild, got: {message}"
+        );
+        assert!(
+            message.contains("build-geocode-index"),
+            "v2 rejection must name the command that rebuilds, got: {message}"
+        );
+    }
+
+    #[test]
     fn geo_cell_roundtrip() {
         let cell = GeoCell {
             cell_id: 0x1234_5678_9ABC_DEF0,
@@ -770,7 +790,7 @@ mod tests {
     fn admin_polygon_roundtrip() {
         let poly = AdminPolygon {
             area: 123.456,
-            vertex_offset: 8000,
+            vertex_offset: u64::from(u32::MAX) + 8000,
             vertex_count: 500,
             name_offset: 400,
             country_code_offset: 42, // string pool offset for "DK"
@@ -778,13 +798,50 @@ mod tests {
         };
         let bytes = poly.to_bytes();
         assert_eq!(bytes.len(), ADMIN_POLYGON_SIZE);
+        assert_eq!(
+            u64::from_le_bytes(bytes[4..12].try_into().expect("8-byte vertex offset")),
+            poly.vertex_offset,
+            "independent byte decoder must see the full producer offset"
+        );
         let parsed = AdminPolygon::from_bytes(&bytes);
         assert!((parsed.area - 123.456).abs() < 0.001);
-        assert_eq!(parsed.vertex_offset, 8000);
+        assert_eq!(parsed.vertex_offset, u64::from(u32::MAX) + 8000);
         assert_eq!(parsed.vertex_count, 500);
         assert_eq!(parsed.name_offset, 400);
         assert_eq!(parsed.country_code_offset, 42);
         assert_eq!(parsed.admin_level, 2);
+    }
+
+    #[test]
+    fn admin_cell_roundtrip_preserves_offset_past_four_gibibytes() {
+        let cell = AdminCell {
+            cell_id: 0x1234_5678_9abc_def0,
+            entries_offset: u64::from(u32::MAX) + 123,
+        };
+        let bytes = cell.to_bytes();
+        assert_eq!(
+            u64::from_le_bytes(bytes[8..16].try_into().expect("8-byte entries offset")),
+            cell.entries_offset,
+            "independent byte decoder must see the full producer offset"
+        );
+        let parsed = AdminCell::from_bytes(&bytes);
+        assert_eq!(parsed.cell_id, cell.cell_id);
+        assert_eq!(parsed.entries_offset, cell.entries_offset);
+    }
+
+    #[test]
+    fn nul_string_distinguishes_empty_from_corruption() {
+        let pool = b"\0valid\0bad\xff\0unterminated";
+        assert_eq!(read_nul_string(pool, 0), Some(""));
+        assert_eq!(read_nul_string(pool, 1), Some("valid"));
+        assert_eq!(read_nul_string(pool, 7), None, "invalid UTF-8");
+        assert_eq!(read_nul_string(pool, 12), None, "missing NUL");
+        assert_eq!(read_nul_string(pool, 99), None, "out-of-bounds offset");
+        assert_eq!(
+            read_nul_string(b"not-empty", 0),
+            None,
+            "offset zero needs NUL"
+        );
     }
 
     #[test]

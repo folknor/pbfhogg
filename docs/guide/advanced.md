@@ -124,3 +124,12 @@ The index can be queried from Rust using the `geocode-reader` feature:
 [dependencies]
 pbfhogg = { version = "0.5", default-features = false, features = ["geocode-reader"] }
 ```
+
+`Reader::query` and `Reader::candidates` return a `Result`: a non-finite or
+out-of-range latitude or longitude is a typed `QueryError` rather than a
+silently wrong cell lookup.
+
+The on-disk format is version 3. Readers reject older versions outright with a
+message naming `build-geocode-index` as the remedy, so an index built by an
+earlier release must be rebuilt rather than migrated - the index is a directory
+of regenerable derived files, not a document.

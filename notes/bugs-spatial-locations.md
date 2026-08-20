@@ -56,12 +56,19 @@ Precise scope, so this does not have to be rediscovered:
 - **Producer.** `src/geo.rs` Douglas-Peucker, called from
   `geocode_index/builder/admin.rs::assemble_one_relation`, which simplifies
   every outer and inner ring of every admin relation.
-- **Knob.** `--max-admin-vertices`, default 500. It is a *vertex count*, not a
-  distance tolerance, so the effective simplification epsilon is whatever it
-  takes to reach 500 vertices. A country boundary is therefore simplified far
-  more aggressively than a municipality, which makes a topology flip most
-  likely exactly where the ring is longest. This is the same finding as the
-  uniform-cap entry in `notes/bugs-geocode-index.md`, seen from the other end.
+- **Knob.** `--max-admin-vertices`, default 500. The geocode round-2 fix pass
+  changed how this is applied: `geocode_index/builder/admin.rs::admin_vertex_cap`
+  now reads the flag as the *local-boundary* budget and multiplies it by admin
+  level - 16x at levels 0 to 2, 8x at 3, 4x at 4, 2x at 5, 1x below that - so a
+  country gets 8000 vertices where a municipality gets 500. That removes the
+  worst of the disparity, and it is the change that raised the Denmark admin
+  cell count from 1224 to 1223 by no longer under-covering Danmark's own coarse
+  ring. It does NOT close this finding. The knob is still a *vertex count*, not
+  a distance tolerance: the effective simplification epsilon is whatever it
+  takes to reach the budget, so the error stays unbounded in metres and a
+  topology flip is still possible on any ring long enough to be simplified at
+  all. The level scaling only makes the remaining error more evenly distributed
+  across levels.
 - **Consumer, and why it matters most here.**
   `geocode_index/reader.rs` runs `geo::point_in_polygon` against the simplified
   rings for every admin result. A self-intersection near the boundary makes the

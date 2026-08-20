@@ -37,4 +37,5 @@ impl StringPool {
 /// Read a null-terminated string from the pool by offset.
 pub(super) fn read_string_from_pool(pool: &StringPool, offset: u32) -> &str {
     super::super::format::read_nul_string(&pool.data, offset)
+        .expect("StringPool only contains NUL-terminated UTF-8 strings")
 }

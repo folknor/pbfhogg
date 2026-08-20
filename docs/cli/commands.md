@@ -563,7 +563,7 @@ pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
 | `--street-level <N>` | S2 cell level for streets/addresses, 0-19 [default: 17] |
 | `--coarse-level <N>` | Fallback cell level for rural areas, 0-19 [default: 14] |
 | `--admin-level <N>` | S2 cell level for admin boundaries, 0-19 [default: 10] |
-| `--max-admin-vertices <N>` | Douglas-Peucker vertex cap per admin polygon [default: 500] |
+| `--max-admin-vertices <N>` | Douglas-Peucker cap for local admin polygons; levels 5, 4, 3, and 2 retain up to 2x, 4x, 8x, and 16x this value [default: 500] |
 | `--search-radius <M>` | Fine-level max search distance in meters [default: 75] |
 | `--coarse-search-radius <M>` | Coarse-level max search distance in meters [default: 1000] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |

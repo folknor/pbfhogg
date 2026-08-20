@@ -13,6 +13,8 @@ use s2::cellid::CellID;
 use s2::latlng::LatLng;
 use s2::metric::MIN_WIDTHMETRIC;
 
+use crate::geo;
+
 use super::Result;
 use super::admin::AssembledPolygon;
 use super::interp::{read_addr_point_mmap, read_node_at};
@@ -114,6 +116,17 @@ fn segment_step_degrees(level: u8) -> f64 {
     MIN_WIDTHMETRIC.value(level).to_degrees() * 0.4
 }
 
+/// Fold a possibly-unwrapped longitude in degrees back into (-180, 180].
+fn normalize_longitude_degrees(lon_deg: f64) -> f64 {
+    let folded = (lon_deg + 180.0).rem_euclid(360.0) - 180.0;
+    // `rem_euclid` yields exactly -180.0 only for an input that is an exact
+    // multiple of 360 below it, so this is a representable-value test, not an
+    // approximate one.
+    #[allow(clippy::float_cmp)]
+    let on_west_edge = folded == -180.0;
+    if on_west_edge { 180.0 } else { folded }
+}
+
 /// Samples the longest legal segment would need at `level`.
 fn worst_case_segment_samples(level: u8) -> f64 {
     MAX_SEGMENT_SPAN_DEG / segment_step_degrees(level)
@@ -145,7 +158,12 @@ fn cover_segment(
     let lat1 = lat1_e7 as f64 * 1e-7;
     let lon1 = lon1_e7 as f64 * 1e-7;
     let lat2 = lat2_e7 as f64 * 1e-7;
-    let lon2 = lon2_e7 as f64 * 1e-7;
+    // Unwrap the far endpoint around the near one. A segment from 179.9 to
+    // -179.9 is 0.2 degrees wide, not 359.8: sampling it in the raw frame
+    // walks the long way around the globe and covers half the planet in
+    // cells. Sampled longitudes are normalized again below.
+    let lon2 = lon1
+        + geo::wrapped_longitude_delta_e7(i64::from(lon2_e7) - i64::from(lon1_e7)) as f64 * 1e-7;
 
     let c1 = CellID::from(LatLng::from_degrees(lat1, lon1)).parent(level as u64);
     let c2 = CellID::from(LatLng::from_degrees(lat2, lon2)).parent(level as u64);
@@ -174,7 +192,7 @@ fn cover_segment(
     for i in 0..=steps {
         let t = i as f64 / steps as f64;
         let lat = lat1 + t * (lat2 - lat1);
-        let lon = lon1 + t * (lon2 - lon1);
+        let lon = normalize_longitude_degrees(lon1 + t * (lon2 - lon1));
         let c = CellID::from(LatLng::from_degrees(lat, lon))
             .parent(level as u64)
             .0;
@@ -197,6 +215,8 @@ fn cover_segment(
 const NUM_BUCKETS: usize = 256;
 const STREET_CHUNK: usize = 100_000;
 const ADDR_CHUNK: usize = 500_000;
+const INTERP_CHUNK: usize = 100_000;
+const STAGE_B_SORT_WINDOW: usize = 8;
 
 /// Tagged bucket record: 15 bytes on disk.
 /// cell_id (8) + entry_type (1) + way_or_addr_index (4) + segment_index (2)
@@ -529,64 +549,76 @@ pub(super) fn bucketed_cell_assignment_fused(
 
     // Interpolation (fused fine + coarse, same shape as streets)
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_INTERP_START");
-    #[allow(clippy::type_complexity)]
-    let interp_entries: Vec<(u64, Option<u64>, u32, u16)> = (0..interp_ways.len())
-        .into_par_iter()
-        .flat_map_iter(|way_idx| {
-            let iw = &interp_ways[way_idx];
-            let nc = iw.node_count as usize;
-            let mut out = Vec::new();
-            if nc >= 2 {
-                out.reserve(nc * 2);
-                for seg_idx in 0..nc - 1 {
-                    let off1 = iw.node_file_offset as usize + seg_idx * NODE_COORD_SIZE;
-                    let off2 = off1 + NODE_COORD_SIZE;
-                    if let (Some(n1), Some(n2)) = (
-                        read_node_at(interp_nodes_mmap, off1 as u64),
-                        read_node_at(interp_nodes_mmap, off2 as u64),
-                    ) {
-                        let mut coarse_seen = [0u64; 4];
-                        let mut coarse_n = 0usize;
-                        cover_segment(n1.0, n1.1, n2.0, n2.1, fine_level, |fine_cid| {
-                            let coarse_cid = CellID(fine_cid).parent(coarse_level as u64).0;
-                            let coarse_to_emit = if coarse_seen[..coarse_n].contains(&coarse_cid) {
-                                None
-                            } else {
-                                if coarse_n < coarse_seen.len() {
-                                    coarse_seen[coarse_n] = coarse_cid;
-                                    coarse_n += 1;
-                                }
-                                Some(coarse_cid)
-                            };
-                            out.push((fine_cid, coarse_to_emit, way_idx as u32, seg_idx as u16));
-                        });
+    let mut interp_chunk_start = 0usize;
+    while interp_chunk_start < interp_ways.len() {
+        let interp_chunk_end = (interp_chunk_start + INTERP_CHUNK).min(interp_ways.len());
+        #[allow(clippy::type_complexity)]
+        let interp_entries: Vec<(u64, Option<u64>, u32, u16)> = (interp_chunk_start
+            ..interp_chunk_end)
+            .into_par_iter()
+            .flat_map_iter(|way_idx| {
+                let iw = &interp_ways[way_idx];
+                let nc = iw.node_count as usize;
+                let mut out = Vec::new();
+                if nc >= 2 {
+                    out.reserve(nc * 2);
+                    for seg_idx in 0..nc - 1 {
+                        let off1 = iw.node_file_offset as usize + seg_idx * NODE_COORD_SIZE;
+                        let off2 = off1 + NODE_COORD_SIZE;
+                        if let (Some(n1), Some(n2)) = (
+                            read_node_at(interp_nodes_mmap, off1 as u64),
+                            read_node_at(interp_nodes_mmap, off2 as u64),
+                        ) {
+                            let mut coarse_seen = [0u64; 4];
+                            let mut coarse_n = 0usize;
+                            cover_segment(n1.0, n1.1, n2.0, n2.1, fine_level, |fine_cid| {
+                                let coarse_cid = CellID(fine_cid).parent(coarse_level as u64).0;
+                                let coarse_to_emit =
+                                    if coarse_seen[..coarse_n].contains(&coarse_cid) {
+                                        None
+                                    } else {
+                                        if coarse_n < coarse_seen.len() {
+                                            coarse_seen[coarse_n] = coarse_cid;
+                                            coarse_n += 1;
+                                        }
+                                        Some(coarse_cid)
+                                    };
+                                out.push((
+                                    fine_cid,
+                                    coarse_to_emit,
+                                    way_idx as u32,
+                                    seg_idx as u16,
+                                ));
+                            });
+                        }
                     }
                 }
-            }
-            out.into_iter()
-        })
-        .collect();
-    for &(fine_cid, coarse_opt, wi, si) in &interp_entries {
-        let b = bucket_for_cell(fine_cid);
-        ensure_bucket_writer(&mut fine_writers, b, &fine_bucket_dir)?;
-        write_bucket_record(
-            fine_writers[b].as_mut().expect("ensured"),
-            fine_cid,
-            ENTRY_TYPE_INTERP,
-            wi,
-            si,
-        )?;
-        if let Some(coarse_cid) = coarse_opt {
-            let b = bucket_for_cell(coarse_cid);
-            ensure_bucket_writer(&mut coarse_writers, b, &coarse_bucket_dir)?;
+                out.into_iter()
+            })
+            .collect();
+        for &(fine_cid, coarse_opt, wi, si) in &interp_entries {
+            let b = bucket_for_cell(fine_cid);
+            ensure_bucket_writer(&mut fine_writers, b, &fine_bucket_dir)?;
             write_bucket_record(
-                coarse_writers[b].as_mut().expect("ensured"),
-                coarse_cid,
+                fine_writers[b].as_mut().expect("ensured"),
+                fine_cid,
                 ENTRY_TYPE_INTERP,
                 wi,
                 si,
             )?;
+            if let Some(coarse_cid) = coarse_opt {
+                let b = bucket_for_cell(coarse_cid);
+                ensure_bucket_writer(&mut coarse_writers, b, &coarse_bucket_dir)?;
+                write_bucket_record(
+                    coarse_writers[b].as_mut().expect("ensured"),
+                    coarse_cid,
+                    ENTRY_TYPE_INTERP,
+                    wi,
+                    si,
+                )?;
+            }
         }
+        interp_chunk_start = interp_chunk_end;
     }
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_INTERP_END");
 
@@ -663,159 +695,166 @@ fn run_stage_b(
     let mut total_cells: u32 = 0;
     let mut prev_cell_id: u64 = 0;
 
-    let sorted_buckets: Vec<Vec<ParsedBucketEntry>> = (0..NUM_BUCKETS)
-        .into_par_iter()
-        .map(|bucket_idx| -> std::io::Result<Vec<ParsedBucketEntry>> {
-            let bucket_path = bucket_dir.join(format!("{bucket_idx:03}"));
-            if !bucket_path.exists() {
-                return Ok(Vec::new());
-            }
-            let data = std::fs::read(&bucket_path)?;
-            std::fs::remove_file(&bucket_path)?;
-            if data.is_empty() {
-                return Ok(Vec::new());
-            }
-            let mut entries = parse_bucket_file(&data)?;
-            drop(data);
-            entries.sort_unstable_by_key(|e| e.cell_id);
-            Ok(entries)
-        })
-        .collect::<std::io::Result<_>>()?;
-
-    for entries in &sorted_buckets {
-        if entries.is_empty() {
-            continue;
-        }
-
-        let mut i = 0;
-        let mut streets: Vec<&ParsedBucketEntry> = Vec::new();
-        let mut addrs: Vec<&ParsedBucketEntry> = Vec::new();
-        let mut interps: Vec<&ParsedBucketEntry> = Vec::new();
-        while i < entries.len() {
-            let cell_id = entries[i].cell_id;
-            let group_start = i;
-            while i < entries.len() && entries[i].cell_id == cell_id {
-                i += 1;
-            }
-            let group = &entries[group_start..i];
-            let cell_token = CellID(cell_id);
-
-            streets.clear();
-            addrs.clear();
-            interps.clear();
-            for e in group {
-                match e.etype {
-                    ENTRY_TYPE_STREET => streets.push(e),
-                    ENTRY_TYPE_ADDR => addrs.push(e),
-                    ENTRY_TYPE_INTERP => interps.push(e),
-                    _ => {}
+    // Bound the parse/sort lookahead. Keeping every sorted bucket alive here
+    // defeats the external bucketing and costs more RAM than the 15-byte
+    // scratch records because ParsedBucketEntry is padded to 16 bytes.
+    for window_start in (0..NUM_BUCKETS).step_by(STAGE_B_SORT_WINDOW) {
+        let window_end = (window_start + STAGE_B_SORT_WINDOW).min(NUM_BUCKETS);
+        let sorted_buckets: Vec<Vec<ParsedBucketEntry>> = (window_start..window_end)
+            .into_par_iter()
+            .map(|bucket_idx| -> std::io::Result<Vec<ParsedBucketEntry>> {
+                let bucket_path = bucket_dir.join(format!("{bucket_idx:03}"));
+                if !bucket_path.exists() {
+                    return Ok(Vec::new());
                 }
+                let data = std::fs::read(&bucket_path)?;
+                std::fs::remove_file(&bucket_path)?;
+                if data.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let mut entries = parse_bucket_file(&data)?;
+                drop(data);
+                entries.sort_unstable_by_key(|e| e.cell_id);
+                Ok(entries)
+            })
+            .collect::<std::io::Result<_>>()?;
+
+        for entries in &sorted_buckets {
+            if entries.is_empty() {
+                continue;
             }
 
-            // Write street entries.
-            // INVARIANT: the on-disk count field is u16 (see `format::SegmentEntryIter`
-            // and `U32EntryIter` reader-side decoders). Hard-error if any cell's
-            // per-type entry count exceeds `u16::MAX`, rather than silently truncating.
-            // If this ever fires in practice, bump the on-disk count to u32 and
-            // increment `FORMAT_VERSION`. Do NOT restore a `.min(u16::MAX)` here -
-            // silent truncation made this a latent bug for a long time.
-            let has_streets = !streets.is_empty();
-            if has_streets {
-                let count = u16::try_from(streets.len()).map_err(|_| {
+            let mut i = 0;
+            let mut streets: Vec<&ParsedBucketEntry> = Vec::new();
+            let mut addrs: Vec<&ParsedBucketEntry> = Vec::new();
+            let mut interps: Vec<&ParsedBucketEntry> = Vec::new();
+            while i < entries.len() {
+                let cell_id = entries[i].cell_id;
+                let group_start = i;
+                while i < entries.len() && entries[i].cell_id == cell_id {
+                    i += 1;
+                }
+                let group = &entries[group_start..i];
+                let cell_token = CellID(cell_id);
+
+                streets.clear();
+                addrs.clear();
+                interps.clear();
+                for e in group {
+                    match e.etype {
+                        ENTRY_TYPE_STREET => streets.push(e),
+                        ENTRY_TYPE_ADDR => addrs.push(e),
+                        ENTRY_TYPE_INTERP => interps.push(e),
+                        _ => {}
+                    }
+                }
+
+                // Write street entries.
+                // INVARIANT: the on-disk count field is u16 (see `format::SegmentEntryIter`
+                // and `U32EntryIter` reader-side decoders). Hard-error if any cell's
+                // per-type entry count exceeds `u16::MAX`, rather than silently truncating.
+                // If this ever fires in practice, bump the on-disk count to u32 and
+                // increment `FORMAT_VERSION`. Do NOT restore a `.min(u16::MAX)` here -
+                // silent truncation made this a latent bug for a long time.
+                let has_streets = !streets.is_empty();
+                if has_streets {
+                    let count = u16::try_from(streets.len()).map_err(|_| {
                     format!(
                         "geocode Stage B: cell {cell_token} ({cell_id}) has {} street entries, exceeds u16::MAX. \
                      Bump on-disk count to u32 and increment FORMAT_VERSION.",
                         streets.len()
                     )
                 })?;
-                street_out.write_all(&count.to_le_bytes())?;
-                for e in &streets {
-                    street_out.write_all(
-                        &SegmentRef {
-                            way_index: e.index,
-                            segment_index: e.segment,
-                        }
-                        .to_bytes(),
-                    )?;
+                    street_out.write_all(&count.to_le_bytes())?;
+                    for e in &streets {
+                        street_out.write_all(
+                            &SegmentRef {
+                                way_index: e.index,
+                                segment_index: e.segment,
+                            }
+                            .to_bytes(),
+                        )?;
+                    }
                 }
-            }
 
-            let has_addrs = !addrs.is_empty();
-            if has_addrs {
-                let count = u16::try_from(addrs.len()).map_err(|_| {
+                let has_addrs = !addrs.is_empty();
+                if has_addrs {
+                    let count = u16::try_from(addrs.len()).map_err(|_| {
                     format!(
                         "geocode Stage B: cell {cell_token} ({cell_id}) has {} addr entries, exceeds u16::MAX. \
                      Bump on-disk count to u32 and increment FORMAT_VERSION.",
                         addrs.len()
                     )
                 })?;
-                addr_out.write_all(&count.to_le_bytes())?;
-                for e in &addrs {
-                    addr_out.write_all(&e.index.to_le_bytes())?;
+                    addr_out.write_all(&count.to_le_bytes())?;
+                    for e in &addrs {
+                        addr_out.write_all(&e.index.to_le_bytes())?;
+                    }
                 }
-            }
 
-            let has_interps = !interps.is_empty();
-            if has_interps {
-                let count = u16::try_from(interps.len()).map_err(|_| {
+                let has_interps = !interps.is_empty();
+                if has_interps {
+                    let count = u16::try_from(interps.len()).map_err(|_| {
                     format!(
                         "geocode Stage B: cell {cell_token} ({cell_id}) has {} interp entries, exceeds u16::MAX. \
                      Bump on-disk count to u32 and increment FORMAT_VERSION.",
                         interps.len()
                     )
                 })?;
-                interp_out.write_all(&count.to_le_bytes())?;
-                for e in &interps {
-                    interp_out.write_all(
-                        &SegmentRef {
-                            way_index: e.index,
-                            segment_index: e.segment,
-                        }
-                        .to_bytes(),
-                    )?;
+                    interp_out.write_all(&count.to_le_bytes())?;
+                    for e in &interps {
+                        interp_out.write_all(
+                            &SegmentRef {
+                                way_index: e.index,
+                                segment_index: e.segment,
+                            }
+                            .to_bytes(),
+                        )?;
+                    }
+                }
+
+                let gc = GeoCell {
+                    cell_id,
+                    street_offset: if has_streets {
+                        street_byte_offset
+                    } else {
+                        NO_DATA_U64
+                    },
+                    addr_offset: if has_addrs {
+                        addr_byte_offset
+                    } else {
+                        NO_DATA_U64
+                    },
+                    interp_offset: if has_interps {
+                        interp_byte_offset
+                    } else {
+                        NO_DATA_U64
+                    },
+                };
+                cells_out.write_all(&gc.to_bytes())?;
+                debug_assert!(
+                    cell_id > prev_cell_id || total_cells == 0,
+                    "bucket ordering violated: cell {} ({cell_id}) <= prev {} ({prev_cell_id})",
+                    CellID(cell_id),
+                    CellID(prev_cell_id),
+                );
+                prev_cell_id = cell_id;
+                total_cells += 1;
+
+                // The per-type `u16::try_from` above guarantees `X.len() <= u16::MAX`
+                // so these `* SIZE as u64` casts won't overflow.
+                if has_streets {
+                    street_byte_offset += 2 + (streets.len() * SEGMENT_REF_SIZE) as u64;
+                }
+                if has_addrs {
+                    addr_byte_offset += 2 + (addrs.len() * 4) as u64;
+                }
+                if has_interps {
+                    interp_byte_offset += 2 + (interps.len() * SEGMENT_REF_SIZE) as u64;
                 }
             }
-
-            let gc = GeoCell {
-                cell_id,
-                street_offset: if has_streets {
-                    street_byte_offset
-                } else {
-                    NO_DATA_U64
-                },
-                addr_offset: if has_addrs {
-                    addr_byte_offset
-                } else {
-                    NO_DATA_U64
-                },
-                interp_offset: if has_interps {
-                    interp_byte_offset
-                } else {
-                    NO_DATA_U64
-                },
-            };
-            cells_out.write_all(&gc.to_bytes())?;
-            debug_assert!(
-                cell_id > prev_cell_id || total_cells == 0,
-                "bucket ordering violated: cell {} ({cell_id}) <= prev {} ({prev_cell_id})",
-                CellID(cell_id),
-                CellID(prev_cell_id),
-            );
-            prev_cell_id = cell_id;
-            total_cells += 1;
-
-            // The per-type `u16::try_from` above guarantees `X.len() <= u16::MAX`
-            // so these `* SIZE as u64` casts won't overflow.
-            if has_streets {
-                street_byte_offset += 2 + (streets.len() * SEGMENT_REF_SIZE) as u64;
-            }
-            if has_addrs {
-                addr_byte_offset += 2 + (addrs.len() * 4) as u64;
-            }
-            if has_interps {
-                interp_byte_offset += 2 + (interps.len() * SEGMENT_REF_SIZE) as u64;
-            }
         }
+        // `sorted_buckets` drops here before the next lookahead window.
     }
 
     cells_out.flush()?;
@@ -957,6 +996,21 @@ fn parse_polygon_rings(vertices: &[NodeCoord]) -> (Vec<(f64, f64)>, Vec<Vec<(f64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_b_retains_at_most_eight_sorted_buckets() {
+        let window = std::hint::black_box(STAGE_B_SORT_WINDOW);
+        assert!(window > 0);
+        assert!(window <= 8);
+        assert!(window < NUM_BUCKETS);
+    }
+
+    #[test]
+    fn interpolation_stage_a_has_a_finite_chunk_bound() {
+        let chunk = std::hint::black_box(INTERP_CHUNK);
+        assert!(chunk > 0);
+        assert!(chunk <= ADDR_CHUNK);
+    }
 
     #[test]
     fn cover_segment_same_cell() {

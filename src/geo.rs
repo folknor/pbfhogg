@@ -118,8 +118,44 @@ pub fn approx_distance_sq(
     cos_lat: f64,
 ) -> f64 {
     let dlat = lat2_rad - lat1_rad;
-    let dlon = lon2_rad - lon1_rad;
+    let dlon = wrapped_longitude_delta(lon2_rad - lon1_rad);
     dlat * dlat + dlon * dlon * cos_lat * cos_lat
+}
+
+/// Normalize a longitude delta in radians to the shortest path across the
+/// antimeridian. Inputs produced from legal longitudes are at most 2 PI apart,
+/// but `rem_euclid` also keeps this total for larger finite inputs.
+#[inline]
+fn wrapped_longitude_delta(delta: f64) -> f64 {
+    (delta + PI).rem_euclid(2.0 * PI) - PI
+}
+
+/// One full turn of longitude in decimicrodegrees (10⁻⁷ degrees).
+pub const LON_FULL_TURN_E7: i64 = 3_600_000_000;
+
+/// Shortest-path longitude delta in decimicrodegrees.
+///
+/// The radian twin of this is [`point_to_segment_distance_sq`]'s internal
+/// unwrapping. Any caller that interpolates along a segment in the E7 domain
+/// must unwrap with this first, otherwise a segment spanning ±180° is
+/// interpolated the long way around the globe.
+#[inline]
+pub fn wrapped_longitude_delta_e7(delta_e7: i64) -> i64 {
+    (delta_e7 + LON_FULL_TURN_E7 / 2).rem_euclid(LON_FULL_TURN_E7) - LON_FULL_TURN_E7 / 2
+}
+
+/// Fold an unwrapped longitude in decimicrodegrees back into (-180°, +180°].
+///
+/// Exactly ±180° is reported as +180° (`1_800_000_000`), matching the
+/// convention that the antimeridian is the eastern edge of the domain.
+#[inline]
+pub fn normalize_longitude_e7(lon_e7: i64) -> i64 {
+    let folded = wrapped_longitude_delta_e7(lon_e7);
+    if folded == -LON_FULL_TURN_E7 / 2 {
+        LON_FULL_TURN_E7 / 2
+    } else {
+        folded
+    }
 }
 
 /// Convert a distance in meters to radians² for comparison with [`approx_distance_sq`].
@@ -150,6 +186,10 @@ pub fn point_to_segment_distance_sq(
     by: f64,
     cos_lat: f64,
 ) -> (f64, f64) {
+    // Work in a longitude frame unwrapped around A. Without this, a short
+    // segment crossing +/-180 degrees is treated as almost a full world wide.
+    let bx = ax + wrapped_longitude_delta(bx - ax);
+    let px = ax + wrapped_longitude_delta(px - ax);
     let dx = (bx - ax) * cos_lat;
     let dy = by - ay;
     let len_sq = dx * dx + dy * dy;
@@ -574,6 +614,62 @@ mod tests {
     fn distance_same_point() {
         let d = approx_distance_sq(1.0, 2.0, 1.0, 2.0, 1.0_f64.cos());
         assert!(d < 1e-20);
+    }
+
+    #[test]
+    fn distance_uses_short_antimeridian_delta() {
+        let lat = 10.0_f64.to_radians();
+        let west = 179.9_f64.to_radians();
+        let east = (-179.9_f64).to_radians();
+        let actual = approx_distance_sq(lat, west, lat, east, lat.cos()).sqrt();
+        let expected = 0.2_f64.to_radians() * lat.cos();
+        assert!((actual - expected).abs() < 1e-12, "{actual} != {expected}");
+    }
+
+    /// The E7 helpers are the domain twin of the radian unwrapping above.
+    /// They exist because `point_to_segment_distance_sq` returns a `t` in an
+    /// unwrapped frame, and any caller interpolating raw E7 coordinates with
+    /// that `t` silently takes the long way around the globe.
+    #[test]
+    fn e7_longitude_helpers_take_the_short_arc() {
+        // 179.9E to 179.9W is 0.2 degrees east, not 359.8 west.
+        assert_eq!(
+            wrapped_longitude_delta_e7(-1_799_000_000 - 1_799_000_000),
+            2_000_000
+        );
+        // And the reverse.
+        assert_eq!(
+            wrapped_longitude_delta_e7(1_799_000_000 - -1_799_000_000),
+            -2_000_000
+        );
+        // A delta entirely inside the domain is untouched.
+        assert_eq!(wrapped_longitude_delta_e7(5_000_000), 5_000_000);
+
+        // Midpoint of that segment, computed in the unwrapped frame, is the
+        // antimeridian itself - the value the old code produced as 0.
+        let midpoint = 1_799_000_000 + 1_000_000;
+        assert_eq!(normalize_longitude_e7(midpoint), 1_800_000_000);
+        // Past the antimeridian folds to the western side.
+        assert_eq!(normalize_longitude_e7(1_801_000_000), -1_799_000_000);
+        // Legal longitudes are fixed points.
+        assert_eq!(normalize_longitude_e7(125_000_000), 125_000_000);
+        assert_eq!(normalize_longitude_e7(-1_799_000_000), -1_799_000_000);
+    }
+
+    #[test]
+    fn segment_distance_crosses_antimeridian_on_short_arc() {
+        let lat = 10.0_f64.to_radians();
+        let (t, distance) = point_to_segment_distance_sq(
+            PI,
+            lat,
+            179.9_f64.to_radians(),
+            lat,
+            (-179.9_f64).to_radians(),
+            lat,
+            lat.cos(),
+        );
+        assert!((t - 0.5).abs() < 1e-12, "t={t}");
+        assert!(distance < 1e-24, "distance={distance}");
     }
 
     #[test]

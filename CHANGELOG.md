@@ -4,6 +4,51 @@
 
 ### Breaking
 
+- **Geocode index format version 3 widens admin entry and vertex byte offsets
+  to 64 bits.** Version 2 indexes are rejected at `Reader::open` with a message
+  naming `build-geocode-index` as the remedy; there is no migration, and an
+  existing index must be rebuilt. This removes the 4 GiB limits on
+  `admin_entries.bin` and `admin_vertices.bin`.
+
+- **`geocode_index::Reader::query` and `candidates` now return `Result`.** NaN,
+  infinite, and out-of-range latitude or longitude are rejected with a typed
+  `QueryError` instead of being converted into arbitrary S2 cell IDs.
+
+- **Coarse geocode fallback now fills each missing result class independently.**
+  A fine street no longer prevents a coarse address and postcode from being
+  considered, and missing interpolation results also trigger coarse lookup.
+
+- **Geocode distances, snap points, and cell coverage now use the short
+  longitude arc across the antimeridian.** Addresses, streets, interpolation
+  segments, and interpolation lengths straddling +/-180 degrees are no longer
+  silently discarded as almost a world away. The snapped point on a street or
+  interpolation segment is now interpolated in the same unwrapped frame the
+  distance used, so it lands on the antimeridian rather than on the opposite
+  meridian - previously the resulting partial length ran roughly half the globe
+  against a segment length of a fraction of a degree, and interpolated house
+  numbers on such a segment could be wildly wrong. The builder's S2 segment
+  sampler unwraps too, so a segment crossing the dateline covers the cells it
+  actually passes through instead of a band around the whole planet.
+
+- **Geocode coarse fallback for interpolation now depends on whether a fine hit
+  resolves, not on whether one exists.** A nearby interpolation way with
+  unusable endpoint house numbers used to yield no result AND suppress the
+  coarse interpolation that would have produced one. `candidates()` no longer
+  returns an interpolation candidate that `interpolate()` cannot resolve, so
+  `query()`, `candidates()`, and `Candidates::into_result()` agree.
+
+- **`--max-admin-vertices` is now a local-boundary budget rather than one cap
+  applied uniformly to every admin level.** Levels 5 through 2 retain
+  progressively more vertices, up to 16 times the configured value for
+  countries. This reduces permanent border displacement. Douglas-Peucker can
+  still introduce self-intersections, but the larger high-level budgets reduce
+  both its tolerance and affected border band; they do not close that residual.
+
+- **Corrupt geocode strings and out-of-bounds fixed-record reads no longer
+  become empty names or zero-coordinate records.** The low-level decoders now
+  distinguish missing data from real empty values, and query consumers skip a
+  missing defensive read instead of fabricating a match.
+
 - **The geocode index builder now rejects an index with no queryable records,
   and readers reject invalid S2 levels, mismatched fixed-record
   file lengths, and out-of-bounds entry lists.** These conditions previously

@@ -17,6 +17,21 @@ pub(super) struct RawAdminRelation {
     pub(super) inner_way_ids: Vec<i64>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BoundaryRole {
+    Outer,
+    Inner,
+    Ignore,
+}
+
+fn boundary_role(role: &str) -> BoundaryRole {
+    match role {
+        "inner" => BoundaryRole::Inner,
+        "outer" | "" => BoundaryRole::Outer,
+        _ => BoundaryRole::Ignore,
+    }
+}
+
 /// Scan relation blobs and build:
 /// - the list of admin/postal boundary relations we care about,
 /// - the set of way IDs those relations reference (outer + inner members).
@@ -87,10 +102,10 @@ pub(super) fn run_pass1(
                         for m in rel.members() {
                             if let MemberId::Way(wid) = m.id {
                                 let role = m.role().unwrap_or("");
-                                if role == "inner" {
-                                    inner.push(wid);
-                                } else {
-                                    outer.push(wid);
+                                match boundary_role(role) {
+                                    BoundaryRole::Inner => inner.push(wid),
+                                    BoundaryRole::Outer => outer.push(wid),
+                                    BoundaryRole::Ignore => {}
                                 }
                             }
                         }
@@ -120,4 +135,19 @@ pub(super) fn run_pass1(
     }
 
     Ok((admin_relations, needed_admin_ways))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_libosmium_boundary_roles_contribute_geometry() {
+        assert!(matches!(boundary_role(""), BoundaryRole::Outer));
+        assert!(matches!(boundary_role("outer"), BoundaryRole::Outer));
+        assert!(matches!(boundary_role("inner"), BoundaryRole::Inner));
+        for role in ["subarea", "label", "admin_centre", "stop"] {
+            assert!(matches!(boundary_role(role), BoundaryRole::Ignore));
+        }
+    }
 }

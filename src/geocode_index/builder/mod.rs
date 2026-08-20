@@ -141,6 +141,9 @@ pub struct BuildStats {
     pub street_ways: u64,
     pub interp_ways: u64,
     pub admin_polygons: u64,
+    /// Relations that produced no polygon because their boundary geometry was
+    /// missing, unclosed, or degenerated during simplification.
+    pub dropped_admin_relations: u64,
     pub fine_cells: u64,
     pub coarse_cells: u64,
     pub admin_cells: u64,
@@ -325,9 +328,11 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
 
     // Ring assembly + simplification
     crate::debug::emit_marker("GEOCODE_PASS2_ADMIN_ASSEMBLY_START");
-    let admin_polygons = admin::assemble_admin_polygons(&admin_relations, &way_geom, config);
+    let (admin_polygons, dropped_admin_relations) =
+        admin::assemble_admin_polygons(&admin_relations, &way_geom, config);
     drop(way_geom);
     eprintln!("  {} admin polygons assembled", admin_polygons.len());
+    eprintln!("  {dropped_admin_relations} admin relations dropped");
     crate::debug::emit_marker("GEOCODE_PASS2_ADMIN_ASSEMBLY_END");
     // Deliberately a conjunction, not a disjunction. An admin-only index (a
     // boundaries extract with no addressable content) and an
@@ -475,7 +480,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
             let result = test_reader.query(
                 first_addr_lat_e7 as f64 * 1e-7,
                 first_addr_lon_e7 as f64 * 1e-7,
-            );
+            )?;
             if result.address.is_none() && result.street.is_none() {
                 eprintln!("  WARNING: smoke test query returned no address or street match");
             }
@@ -507,6 +512,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         street_ways: u64::from(street_way_count),
         interp_ways: interp_way_count as u64,
         admin_polygons: admin_polygons.len() as u64,
+        dropped_admin_relations: dropped_admin_relations as u64,
         fine_cells: u64::from(fine_count),
         coarse_cells: u64::from(coarse_count),
         admin_cells: u64::from(admin_count),

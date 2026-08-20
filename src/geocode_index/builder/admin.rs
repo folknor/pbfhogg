@@ -25,7 +25,7 @@ pub(super) fn assemble_admin_polygons(
     relations: &[RawAdminRelation],
     way_geom: &FxHashMap<i64, Vec<(i32, i32)>>,
     config: &BuildConfig,
-) -> Vec<AssembledPolygon> {
+) -> (Vec<AssembledPolygon>, usize) {
     use rayon::prelude::*;
 
     let max_verts = config.max_admin_vertices as usize;
@@ -36,10 +36,36 @@ pub(super) fn assemble_admin_polygons(
     // preserves input order so the output `Vec<AssembledPolygon>` is
     // byte-identical to the previous sequential path. Europe phase was
     // 50.6 s at UUID `bf8f2038` - expected ~5× on plantasjen's 12 cores.
-    relations
+    let per_relation: Vec<Vec<AssembledPolygon>> = relations
         .par_iter()
-        .flat_map_iter(|rel| assemble_one_relation(rel, way_geom, max_verts).into_iter())
-        .collect()
+        .map(|rel| {
+            assemble_one_relation(rel, way_geom, admin_vertex_cap(rel.admin_level, max_verts))
+        })
+        .collect();
+    let dropped = per_relation
+        .iter()
+        .filter(|polygons| polygons.is_empty())
+        .count();
+    let polygons = per_relation.into_iter().flatten().collect();
+    (polygons, dropped)
+}
+
+/// Interpret the CLI cap as the local-boundary budget and retain progressively
+/// more detail for larger administrative levels. This reduces border
+/// displacement without making a country and a municipality share one
+/// arbitrary vertex budget.
+fn admin_vertex_cap(admin_level: u8, base: usize) -> usize {
+    if base == 0 {
+        return 0;
+    }
+    let multiplier = match admin_level {
+        0..=2 => 16,
+        3 => 8,
+        4 => 4,
+        5 => 2,
+        _ => 1,
+    };
+    base.saturating_mul(multiplier)
 }
 
 /// Decide whether `hole` belongs to the outer ring `outer_f64`.
@@ -189,14 +215,7 @@ fn assemble_one_relation(
 pub(super) fn write_admin_data(dir: &Path, polygons: &[AssembledPolygon]) -> Result<()> {
     let mut poly_out = BufWriter::new(std::fs::File::create(dir.join(FILE_ADMIN_POLYGONS))?);
     let mut vert_out = BufWriter::new(std::fs::File::create(dir.join(FILE_ADMIN_VERTICES))?);
-    // `vertex_offset` is a u32 byte-offset into admin_vertices.bin (see
-    // `AdminPolygon.vertex_offset` in format.rs). Hard-error on
-    // overflow rather than silently wrapping; a wrap would make every
-    // subsequent polygon point at the wrong vertex span. If this fires,
-    // widen `vertex_offset` to u64 and bump FORMAT_VERSION. Matches the
-    // sibling u16::MAX hard-error at `write_admin_index` for
-    // admin-entry counts.
-    let mut offset: u32 = 0;
+    let mut offset: u64 = 0;
     for p in polygons {
         let vertex_count =
             u32::try_from(p.vertices.len()).map_err(|_| -> Box<dyn std::error::Error> {
@@ -228,20 +247,14 @@ pub(super) fn write_admin_data(dir: &Path, polygons: &[AssembledPolygon]) -> Res
                 .into()
             },
         )?;
-        let step_u32 = u32::try_from(step_bytes).map_err(|_| -> Box<dyn std::error::Error> {
-            format!(
-                "write_admin_data: one polygon contributes {step_bytes} vertex bytes, \
-                 exceeds u32::MAX. Widen AdminPolygon.vertex_offset to u64 and increment FORMAT_VERSION."
-            )
-            .into()
-        })?;
+        let step_u64 = u64::try_from(step_bytes)
+            .map_err(|_| "write_admin_data: polygon vertex bytes exceed u64")?;
         offset = offset
-            .checked_add(step_u32)
+            .checked_add(step_u64)
             .ok_or_else(|| -> Box<dyn std::error::Error> {
                 format!(
-                    "write_admin_data: cumulative admin-vertex byte offset overflows u32 \
-                     (current {offset}, step {step_u32}; total exceeds 4 GiB). Widen \
-                     AdminPolygon.vertex_offset to u64 and increment FORMAT_VERSION."
+                    "write_admin_data: cumulative admin-vertex byte offset overflows u64 \
+                     (current {offset}, step {step_u64})"
                 )
                 .into()
             })?;
@@ -264,12 +277,7 @@ pub(super) fn write_admin_index(
 
     let mut entries_out = BufWriter::new(std::fs::File::create(dir.join(FILE_ADMIN_ENTRIES))?);
     let mut cells_out = BufWriter::new(std::fs::File::create(dir.join(FILE_ADMIN_CELLS))?);
-    // `entries_offset` is a u32 byte-offset into admin_entries.bin (see
-    // `AdminCell.entries_offset` in format.rs). Hard-error on overflow
-    // rather than silently wrapping; a wrap would make every
-    // subsequent cell read entries from the wrong byte range. Widen to
-    // u64 and bump FORMAT_VERSION if this fires.
-    let mut byte_off: u32 = 0;
+    let mut byte_off: u64 = 0;
     let mut i = 0;
 
     for &cid in &cell_ids {
@@ -304,9 +312,8 @@ pub(super) fn write_admin_index(
         entries_out.write_all(&count.to_le_bytes())?;
         byte_off = byte_off.checked_add(2).ok_or_else(|| {
             format!(
-                "write_admin_index: admin-entries byte offset overflows u32 at cell {cell_token} ({cid}) \
-             (current {byte_off}; total exceeds 4 GiB). Widen AdminCell.entries_offset \
-             to u64 and increment FORMAT_VERSION."
+                "write_admin_index: admin-entries byte offset overflows u64 at cell {cell_token} ({cid}) \
+             (current {byte_off})"
             )
         })?;
         for e in &entries[start..i] {
@@ -332,9 +339,8 @@ pub(super) fn write_admin_index(
             entries_out.write_all(&val.to_le_bytes())?;
             byte_off = byte_off.checked_add(4).ok_or_else(|| {
                 format!(
-                    "write_admin_index: admin-entries byte offset overflows u32 at cell {cell_token} ({cid}) \
-                 (current {byte_off}; total exceeds 4 GiB). Widen AdminCell.entries_offset \
-                 to u64 and increment FORMAT_VERSION."
+                    "write_admin_index: admin-entries byte offset overflows u64 at cell {cell_token} ({cid}) \
+                 (current {byte_off})"
                 )
             })?;
         }
@@ -347,7 +353,77 @@ pub(super) fn write_admin_index(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::hole_inside_outer;
+    use rustc_hash::FxHashMap;
+
+    use super::{admin_vertex_cap, assemble_admin_polygons, hole_inside_outer};
+    use crate::geocode_index::builder::BuildConfig;
+    use crate::geocode_index::builder::pass1::RawAdminRelation;
+
+    #[test]
+    fn admin_vertex_budget_scales_by_level() {
+        assert_eq!(admin_vertex_cap(8, 500), 500);
+        assert_eq!(admin_vertex_cap(5, 500), 1_000);
+        assert_eq!(admin_vertex_cap(4, 500), 2_000);
+        assert_eq!(admin_vertex_cap(3, 500), 4_000);
+        assert_eq!(admin_vertex_cap(2, 500), 8_000);
+        assert_eq!(admin_vertex_cap(2, usize::MAX), usize::MAX);
+        assert_eq!(admin_vertex_cap(2, 0), 0);
+    }
+
+    #[test]
+    fn relations_without_assembled_geometry_are_counted() {
+        // The MIXED case is what makes this discriminating: an implementation
+        // that simply reported `relations.len()`, or one that reported zero,
+        // would pass an all-dropped or all-kept fixture. One of each is the
+        // only shape that pins the count to the relations that actually
+        // failed to assemble.
+        let mut way_geom: FxHashMap<i64, Vec<(i32, i32)>> = FxHashMap::default();
+        way_geom.insert(
+            7,
+            vec![
+                (550_000_000, 120_000_000),
+                (550_000_000, 121_000_000),
+                (551_000_000, 121_000_000),
+                (551_000_000, 120_000_000),
+                (550_000_000, 120_000_000),
+            ],
+        );
+
+        let relations = vec![
+            // Names a way that has no geometry: dropped.
+            RawAdminRelation {
+                admin_level: 8,
+                name_offset: 1,
+                country_code_offset: 0,
+                outer_way_ids: vec![99],
+                inner_way_ids: Vec::new(),
+            },
+            // Names no ways at all: dropped.
+            RawAdminRelation {
+                admin_level: 8,
+                name_offset: 2,
+                country_code_offset: 0,
+                outer_way_ids: Vec::new(),
+                inner_way_ids: Vec::new(),
+            },
+            // Closed ring: assembles, and must NOT be counted as dropped.
+            RawAdminRelation {
+                admin_level: 8,
+                name_offset: 3,
+                country_code_offset: 0,
+                outer_way_ids: vec![7],
+                inner_way_ids: Vec::new(),
+            },
+        ];
+        let (polygons, dropped) =
+            assemble_admin_polygons(&relations, &way_geom, &BuildConfig::default());
+        assert_eq!(polygons.len(), 1, "the closed ring should assemble");
+        assert_eq!(polygons[0].name_offset, 3);
+        assert_eq!(
+            dropped, 2,
+            "only the two geometry-less relations are dropped"
+        );
+    }
 
     /// Build a closed axis-aligned rectangle ring in `(lon, lat)` degrees,
     /// which is the orientation `hole_inside_outer` expects for its outer.

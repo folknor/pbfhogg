@@ -94,6 +94,14 @@ include_ignored = false
 # individually via `brokkr test <name> --timeout <secs>`; before this
 # skip list existed the profile could never pass, by construction
 # (first hit 2026-07-16 on merge_cross_validate_osmium).
+#
+# WARNING, and it has bitten once (2026-08-20): these entries are SUBSTRING
+# matches, not exact test names. Every fast synthetic test whose name merely
+# CONTAINS one of them is silently excluded from this gate too - it still
+# passes under tier1, so nothing goes red and nothing announces the loss.
+# `coarse_fallback` and `api_equivalence` were swallowing four synthetic
+# geocode tests that way. Before adding a short name here, grep the suite for
+# it; before naming a new test, check it does not contain an entry below.
 [test.profiles.full]
 description = "Full in-project correctness gate (tier 3, pre-merge); over-watchdog tests run individually via brokkr test"
 sweeps = ["all"]

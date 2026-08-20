@@ -865,6 +865,12 @@ enum Command {
         /// Requires the base PBF to have LocationsOnWays and be sorted.
         #[arg(long)]
         locations_on_ways: bool,
+        /// Accept a change whose version does not advance past the one
+        /// already held for that object. Off by default: a repeated or
+        /// out-of-order diff otherwise downgrades objects to an older
+        /// state and reports success.
+        #[arg(long)]
+        allow_version_regression: bool,
         /// Worker-pool size for the descriptor-first pipeline.
         /// `0` (default) uses the `nproc - 2` heuristic (leaves two
         /// cores for the scanner + drain threads, min 1). Pass a
@@ -884,6 +890,13 @@ enum Command {
         /// Keep only the last change per object (type + id)
         #[arg(long)]
         simplify: bool,
+        /// Accept an incoming change whose version does not advance past
+        /// the one it replaces. Off by default: --simplify keeps the LAST
+        /// change per object by input position, so inputs listed out of
+        /// sequence order otherwise downgrade objects to older versions
+        /// and report success.
+        #[arg(long)]
+        allow_version_regression: bool,
         /// Parallel worker threads. `1` forces sequential, `0` auto-picks
         /// from `available_parallelism()`, higher values cap the worker
         /// pool. Affects both the per-input parse fan-out (capped by
@@ -1799,6 +1812,7 @@ fn main() -> process::ExitCode {
                 io,
                 uring,
                 locations_on_ways,
+                allow_version_regression,
                 jobs,
                 header,
             } => {
@@ -1816,6 +1830,7 @@ fn main() -> process::ExitCode {
                         out,
                         &write,
                         locations_on_ways,
+                        allow_version_regression,
                         jobs,
                         &overrides,
                     )
@@ -1825,9 +1840,10 @@ fn main() -> process::ExitCode {
                 changes,
                 output,
                 simplify,
+                allow_version_regression,
                 jobs,
             } => guarded_output(&output.output, |out| {
-                run_merge_changes(&changes, out, simplify, jobs)
+                run_merge_changes(&changes, out, simplify, jobs, allow_version_regression)
             }),
             Command::Check {
                 file,
@@ -3486,6 +3502,7 @@ fn run_apply_changes(
     output: &std::path::Path,
     write: &WriteOpts,
     locations_on_ways: bool,
+    allow_version_regression: bool,
     jobs: usize,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -3496,6 +3513,7 @@ fn run_apply_changes(
         force: write.force,
         locations_on_ways,
         jobs: if jobs == 0 { None } else { Some(jobs) },
+        allow_version_regression,
         #[cfg(feature = "test-hooks")]
         panic_at_blob_seq: None,
     };
@@ -3527,10 +3545,17 @@ fn run_merge_changes(
     output: &std::path::Path,
     simplify: bool,
     jobs: usize,
+    allow_version_regression: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let inputs: Vec<&std::path::Path> = changes.iter().map(AsRef::as_ref).collect();
     let jobs = if jobs == 0 { None } else { Some(jobs) };
-    let stats = pbfhogg::merge_changes::merge_changes(&inputs, output, simplify, jobs)?;
+    let stats = pbfhogg::merge_changes::merge_changes(
+        &inputs,
+        output,
+        simplify,
+        jobs,
+        allow_version_regression,
+    )?;
     stats.print_summary();
     Ok(())
 }
@@ -3787,6 +3812,7 @@ fn run_bench_merge(
         force: true,
         locations_on_ways: false,
         jobs: None,
+        allow_version_regression: false,
         #[cfg(feature = "test-hooks")]
         panic_at_blob_seq: None,
     };

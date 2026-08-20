@@ -199,6 +199,7 @@ fn derive_then_apply_roundtrip() {
         force: true,
         locations_on_ways: false,
         jobs: None,
+        allow_version_regression: false,
         #[cfg(feature = "test-hooks")]
         panic_at_blob_seq: None,
     };
@@ -321,6 +322,7 @@ fn derive_then_apply_preserves_metadata() {
         force: true,
         locations_on_ways: false,
         jobs: None,
+        allow_version_regression: false,
         #[cfg(feature = "test-hooks")]
         panic_at_blob_seq: None,
     };

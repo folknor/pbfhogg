@@ -381,3 +381,322 @@ fn simplify_create_then_delete_yields_only_delete() {
         "simplified output should not contain create for a deleted element"
     );
 }
+
+// ---------------------------------------------------------------------------
+// One parser, one leniency
+// ---------------------------------------------------------------------------
+
+/// Run `merge-changes` expecting failure; returns stderr.
+fn merge_changes_failure(inputs: &[&Path], output: &Path, extra: &[&str]) -> String {
+    let mut cli = CliInvoker::new().arg("merge-changes");
+    for input in inputs {
+        cli = cli.arg(*input);
+    }
+    cli = cli.arg("-o").arg(output);
+    for a in extra {
+        cli = cli.arg(*a);
+    }
+    cli.assert_failure().stderr_str()
+}
+
+/// `merge-changes` must not throw away metadata just because `version`
+/// is absent.
+///
+/// `parse_metadata` used to open with
+/// `let version = parse_i32_attr_optional(e, b"version")?;` and return
+/// `None` for any element without one - dropping timestamp, changeset,
+/// uid, user and visible along with it. `apply-changes`, reading the
+/// very same file through the other parser, kept all of them. That is
+/// the finding: one input, two answers.
+///
+/// Asserted on the emitted OSC bytes, not by re-parsing through our own
+/// parser: the parser is the thing under test, so round-tripping would
+/// let a matched pair of bugs cancel out. The output must carry the
+/// attributes the input carried and must NOT invent `version="0"` for
+/// an element whose producer never claimed a version.
+#[test]
+fn metadata_survives_an_absent_version() {
+    let dir = TempDir::new().expect("tempdir");
+    let in1 = dir.path().join("001.osc.gz");
+    let out = dir.path().join("out.osc");
+
+    write_osc_gz(
+        &in1,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="1" lat="1.0" lon="2.0" timestamp="2025-06-15T12:00:00Z" uid="99" user="bob"/>
+  </modify>
+</osmChange>"#,
+    );
+
+    run_merge_changes(&[&in1], &out, false);
+    let xml = read_osc_plain(&out);
+
+    assert!(
+        xml.contains(r#"timestamp="2025-06-15T12:00:00Z""#),
+        "timestamp must survive an absent version; output was:\n{xml}"
+    );
+    assert!(
+        xml.contains(r#"uid="99""#) && xml.contains(r#"user="bob""#),
+        "uid and user must survive an absent version; output was:\n{xml}"
+    );
+    assert!(
+        !xml.contains("version=\"0\""),
+        "an absent version must not be emitted as version=\"0\"; output was:\n{xml}"
+    );
+    // The `version` attribute must be absent entirely on the ELEMENT.
+    // Checked on the element's own line, so the XML declaration's
+    // `version="1.0"` and the osmChange root's `version="0.6"` - both
+    // legitimately present - cannot satisfy this by accident.
+    let node_line = xml
+        .lines()
+        .find(|l| l.contains("<node "))
+        .unwrap_or_else(|| panic!("no node element in output:\n{xml}"));
+    assert!(
+        !node_line.contains("version="),
+        "an absent version must not be emitted at all; node line was:\n{node_line}"
+    );
+}
+
+/// A created or modified `<node>` without usable coordinates is a hard
+/// error in `merge-changes` too.
+///
+/// This half of the parser used to do
+/// `parse_f64_attr_optional(..).unwrap_or(0.0)` and a saturating
+/// `as i32`, so a coordinate-less node was silently re-emitted at 0/0
+/// (a real place, in the Gulf of Guinea) and `lat="1e30"` was clamped
+/// to `i32::MAX`. The overlay parser was fixed for this; this one was
+/// not, because it was a second copy.
+#[test]
+fn merge_changes_refuses_a_node_without_usable_coords() {
+    let dir = TempDir::new().expect("tempdir");
+    let out = dir.path().join("out.osc.gz");
+
+    for (name, attrs) in [
+        ("missing", r#"id="1" version="1""#),
+        ("unparsable", r#"id="1" lat="abc" lon="2.0" version="1""#),
+        (
+            "out_of_range",
+            r#"id="1" lat="100.0" lon="2.0" version="1""#,
+        ),
+    ] {
+        let input = dir.path().join(format!("{name}.osc.gz"));
+        write_osc_gz(
+            &input,
+            &format!(
+                "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  <modify>\n    \
+                 <node {attrs}/>\n  </modify>\n</osmChange>"
+            ),
+        );
+        let stderr = merge_changes_failure(&[&input], &out, &[]);
+        assert!(
+            stderr.contains("OSC node 1") && stderr.contains("lat"),
+            "{name}: error must name the node and the attribute; stderr:\n{stderr}"
+        );
+    }
+}
+
+/// A `<delete>` node carries no coordinates by design and must keep
+/// working - the counterpart that stops the test above from being
+/// satisfied by refusing every node.
+#[test]
+fn merge_changes_delete_needs_no_coords() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("001.osc.gz");
+    let out = dir.path().join("out.osc");
+    write_osc_gz(
+        &input,
+        r#"<?xml version="1.0"?>
+<osmChange version="0.6">
+  <delete>
+    <node id="9" version="3"/>
+  </delete>
+</osmChange>"#,
+    );
+    run_merge_changes(&[&input], &out, false);
+    let xml = read_osc_plain(&out);
+    assert!(xml.contains("<delete>") && xml.contains(r#"id="9""#));
+}
+
+/// A truncated OSC - complete gzip member, no closing `</osmChange>` -
+/// must be refused rather than merged as though it were whole.
+#[test]
+fn merge_changes_refuses_a_truncated_input() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("cut.osc.gz");
+    let out = dir.path().join("out.osc.gz");
+    write_osc_gz(
+        &input,
+        "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  <create>\n    \
+         <node id=\"1\" lat=\"1.0\" lon=\"2.0\" version=\"1\"/>\n  </create>\n",
+    );
+    let stderr = merge_changes_failure(&[&input], &out, &[]);
+    assert!(
+        stderr.contains("closing </osmChange>"),
+        "error must name the missing closing tag; stderr:\n{stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Version precedence
+// ---------------------------------------------------------------------------
+
+/// `--simplify` keeps the LAST change per object by input position and
+/// never consulted `version`, so listing the inputs out of sequence
+/// order silently regressed objects to older versions and reported
+/// success. That is data corruption, and it is now refused.
+#[test]
+fn simplify_refuses_a_version_regression() {
+    let dir = TempDir::new().expect("tempdir");
+    let newer = dir.path().join("002.osc.gz");
+    let older = dir.path().join("001.osc.gz");
+    let out = dir.path().join("out.osc.gz");
+
+    write_osc_gz(
+        &newer,
+        r#"<?xml version="1.0"?>
+<osmChange version="0.6">
+  <modify><node id="1" lat="9.0" lon="9.0" version="9"/></modify>
+</osmChange>"#,
+    );
+    write_osc_gz(
+        &older,
+        r#"<?xml version="1.0"?>
+<osmChange version="0.6">
+  <modify><node id="1" lat="8.0" lon="8.0" version="8"/></modify>
+</osmChange>"#,
+    );
+
+    // Inputs listed newest-first: the older change would win on
+    // position and downgrade node 1 from version 9 to version 8.
+    let stderr = merge_changes_failure(&[&newer, &older], &out, &["--simplify"]);
+    assert!(
+        stderr.contains("does not advance past version 9"),
+        "error must name the regression; stderr:\n{stderr}"
+    );
+
+    // The same inputs in sequence order are fine.
+    let stderr = run_merge_changes(&[&older, &newer], &out, true);
+    assert!(stderr.contains("-> 1 output changes (simplified)"));
+    let xml = read_osc_gz(&out);
+    assert!(
+        xml.contains(r#"version="9""#),
+        "in-order simplify must keep the newer version; output was:\n{xml}"
+    );
+
+    // And the escape hatch really is an escape hatch.
+    let out2 = dir.path().join("out2.osc.gz");
+    let mut cli = CliInvoker::new().arg("merge-changes");
+    for input in [&newer, &older] {
+        cli = cli.arg(input);
+    }
+    cli.arg("-o")
+        .arg(&out2)
+        .arg("--simplify")
+        .arg("--allow-version-regression")
+        .assert_success();
+    let xml = read_osc_gz(&out2);
+    assert!(
+        xml.contains(r#"version="8""#),
+        "--allow-version-regression must restore the positional rule; output was:\n{xml}"
+    );
+}
+
+/// The overlay parser's version gate had a hole at `<delete>`: a delete
+/// dropped the live index entry, taking the stored version with it, so
+/// the next stale change found nothing to be compared against and
+/// resurrected an older version. `--simplify` keeps deletes in its
+/// dedupe map as ordinary changes, so the same shape is gated here too -
+/// this test pins that, because "one of the two places the gate was
+/// added has a hole" is exactly the kind of asymmetry only a test
+/// notices.
+///
+/// Both shapes: several actions inside one OSC, and one per file.
+#[test]
+fn simplify_gates_a_stale_change_after_a_delete() {
+    let dir = TempDir::new().expect("tempdir");
+    let out = dir.path().join("out.osc.gz");
+
+    let one_file = dir.path().join("one.osc.gz");
+    write_osc_gz(
+        &one_file,
+        r#"<?xml version="1.0"?>
+<osmChange version="0.6">
+  <delete><node id="1" version="9"/></delete>
+  <modify><node id="1" lat="8.0" lon="8.0" version="8"/></modify>
+</osmChange>"#,
+    );
+    let stderr = merge_changes_failure(&[&one_file], &out, &["--simplify"]);
+    assert!(
+        stderr.contains("does not advance past version 9"),
+        "a stale modify after a delete in one OSC must be refused; stderr:\n{stderr}"
+    );
+
+    let del = dir.path().join("002.osc.gz");
+    let stale = dir.path().join("001.osc.gz");
+    write_osc_gz(
+        &del,
+        r#"<?xml version="1.0"?>
+<osmChange version="0.6">
+  <delete><node id="1" version="9"/></delete>
+</osmChange>"#,
+    );
+    write_osc_gz(
+        &stale,
+        r#"<?xml version="1.0"?>
+<osmChange version="0.6">
+  <modify><node id="1" lat="8.0" lon="8.0" version="8"/></modify>
+</osmChange>"#,
+    );
+    let stderr = merge_changes_failure(&[&del, &stale], &out, &["--simplify"]);
+    assert!(
+        stderr.contains("does not advance past version 9"),
+        "a stale modify in a later file must be refused; stderr:\n{stderr}"
+    );
+
+    // The counterpart: an undelete that genuinely advances is accepted.
+    let undelete = dir.path().join("003.osc.gz");
+    write_osc_gz(
+        &undelete,
+        r#"<?xml version="1.0"?>
+<osmChange version="0.6">
+  <delete><node id="1" version="9"/></delete>
+  <create><node id="1" lat="1.0" lon="1.0" version="10"/></create>
+</osmChange>"#,
+    );
+    let stderr = run_merge_changes(&[&undelete], &out, true);
+    assert!(stderr.contains("-> 1 output changes (simplified)"));
+    let xml = read_osc_gz(&out);
+    assert!(
+        xml.contains(r#"version="10""#),
+        "the advancing undelete must win; output was:\n{xml}"
+    );
+}
+
+/// The counterpart: elements that claim no version at all are still
+/// deduped positionally, because there is nothing to compare.
+#[test]
+fn simplify_still_dedupes_unversioned_elements() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("001.osc.gz");
+    let out = dir.path().join("out.osc");
+    write_osc_gz(
+        &input,
+        r#"<?xml version="1.0"?>
+<osmChange version="0.6">
+  <create><node id="1" lat="1.0" lon="1.0"/></create>
+  <modify><node id="1" lat="2.0" lon="2.0"/></modify>
+</osmChange>"#,
+    );
+    let stderr = run_merge_changes(&[&input], &out, true);
+    assert!(
+        stderr.contains("2 input changes -> 1 output changes"),
+        "stats line unexpected; stderr:\n{stderr}"
+    );
+    let xml = read_osc_plain(&out);
+    assert!(
+        xml.contains(r#"lat="2""#) && !xml.contains(r#"lat="1""#),
+        "the later unversioned change should win; output was:\n{xml}"
+    );
+}

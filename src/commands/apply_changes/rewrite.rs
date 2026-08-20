@@ -9,7 +9,6 @@ use rustc_hash::FxHashMap;
 
 use crate::blob::{BlobKind, decode_blob_to_headerblock};
 use crate::file_reader::FileReader;
-use crate::osc::parse_osc_file;
 use crate::writer::Compression;
 
 use crate::commands::{
@@ -54,6 +53,10 @@ pub struct MergeOptions {
     /// has a deadlock hazard on mid-stream worker panic and no
     /// production use case (2+ workers is strictly faster).
     pub jobs: Option<usize>,
+    /// Accept a change whose `version` does not advance past the version
+    /// already held for that object in the overlay. Off by default; see
+    /// [`crate::osc::CompactDiffOverlay::allow_version_regression`].
+    pub allow_version_regression: bool,
     /// Test-only: panic in the worker loop when a blob with this seq
     /// is dequeued, to exercise the worker-panic → scope-join →
     /// scratch-cleanup recovery path. Only compiled when the
@@ -80,6 +83,7 @@ impl Default for MergeOptions {
             force: false,
             locations_on_ways: false,
             jobs: None,
+            allow_version_regression: false,
             #[cfg(feature = "test-hooks")]
             panic_at_blob_seq: None,
         }
@@ -198,6 +202,7 @@ pub fn merge(
         force,
         locations_on_ways,
         jobs,
+        allow_version_regression: _,
         #[cfg(feature = "test-hooks")]
         panic_at_blob_seq,
     } = *opts;
@@ -232,7 +237,12 @@ pub fn merge(
 
     let osc_start = std::time::Instant::now();
     eprintln!("Parsing OSC diff: {}", osc_file.display());
-    let diff = Arc::new(parse_osc_file(osc_file)?);
+    let diff = Arc::new({
+        let mut overlay = crate::osc::CompactDiffOverlay::new();
+        overlay.allow_version_regression(opts.allow_version_regression);
+        crate::osc::parse_osc_file_into(osc_file, &mut overlay)?;
+        overlay
+    });
     eprintln!(
         "Diff: {} nodes, {} ways, {} relations ({} del nodes, {} del ways, {} del rels)",
         diff.node_count(),

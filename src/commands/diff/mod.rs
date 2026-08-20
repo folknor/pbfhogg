@@ -165,7 +165,7 @@ trait DiffMeta {
 
 impl DiffMeta for OwnedNode {
     fn version(&self) -> Option<i32> {
-        self.metadata.as_ref().map(|m| m.version)
+        self.metadata.as_ref().and_then(|m| m.version)
     }
     fn type_char() -> char {
         'n'
@@ -174,7 +174,7 @@ impl DiffMeta for OwnedNode {
 
 impl DiffMeta for OwnedWay {
     fn version(&self) -> Option<i32> {
-        self.metadata.as_ref().map(|m| m.version)
+        self.metadata.as_ref().and_then(|m| m.version)
     }
     fn type_char() -> char {
         'w'
@@ -183,7 +183,7 @@ impl DiffMeta for OwnedWay {
 
 impl DiffMeta for OwnedRelation {
     fn version(&self) -> Option<i32> {
-        self.metadata.as_ref().map(|m| m.version)
+        self.metadata.as_ref().and_then(|m| m.version)
     }
     fn type_char() -> char {
         'r'

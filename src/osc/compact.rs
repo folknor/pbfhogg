@@ -93,6 +93,18 @@ pub(super) struct ArenaMeta {
     pub(super) user_id: u32,
 }
 
+impl ArenaMeta {
+    /// The version this element claims, or `None` when it carried no
+    /// `version` attribute at all. Distinct from `version == 0`.
+    pub(super) fn version_claim(&self) -> Option<i32> {
+        if self.flags & META_FLAG_HAS_VERSION == 0 {
+            None
+        } else {
+            Some(self.version)
+        }
+    }
+}
+
 /// Metadata block size in bytes.
 pub(super) const META_LEN: usize = 29;
 /// Set when the source element carried at least one metadata attribute.
@@ -102,6 +114,29 @@ pub(super) const META_FLAG_HIDDEN: u8 = 2;
 /// Set when the source element carried a `user` attribute (distinguishes
 /// intern id 0 from "no user").
 pub(super) const META_FLAG_HAS_USER: u8 = 4;
+/// Set when the source element carried a `version` attribute. Needed
+/// because `version` is a plain `i32` in the record and `version="0"` is
+/// representable, so the value alone cannot distinguish "no version
+/// claimed" from "version zero" - and the version-regression gate in
+/// `CompactDiffOverlay` must not treat the former as a claim.
+pub(super) const META_FLAG_HAS_VERSION: u8 = 8;
+
+/// Byte offset of the metadata block inside a node record.
+pub(super) const NODE_META_OFF: usize = 20;
+/// Byte offset of the metadata block inside a way record.
+pub(super) const WAY_META_OFF: usize = 16;
+/// Byte offset of the metadata block inside a relation record.
+pub(super) const RELATION_META_OFF: usize = 16;
+
+/// Read the version an arena record claims, or `None` when the source
+/// element carried no `version` attribute.
+pub(super) fn version_at(data: &[u8], record_offset: usize, meta_off: usize) -> Option<i32> {
+    let flags = data[record_offset + meta_off];
+    if flags & META_FLAG_HAS_VERSION == 0 {
+        return None;
+    }
+    Some(read_i32_le(data, record_offset + meta_off + 1))
+}
 
 fn arena_append_meta(arena: &mut Vec<u8>, meta: &ArenaMeta) {
     arena.push(meta.flags);
@@ -365,9 +400,9 @@ pub struct CompactNodeRef<'a> {
 
 impl<'a> CompactNodeRef<'a> {
     /// Header size: 8 (id) + 4 (lat) + 4 (lon) + 4 (tag_count) + 29 (meta) = 49 bytes.
-    const HEADER_LEN: usize = 20 + META_LEN;
+    const HEADER_LEN: usize = NODE_META_OFF + META_LEN;
     /// Byte offset of the metadata block within the record.
-    const META_OFF: usize = 20;
+    const META_OFF: usize = NODE_META_OFF;
 
     /// Returns the node ID.
     pub fn id(&self) -> i64 {
@@ -416,9 +451,9 @@ pub struct CompactWayRef<'a> {
 
 impl<'a> CompactWayRef<'a> {
     /// Header size: 8 (id) + 4 (ref_count) + 4 (tag_count) + 29 (meta) = 45 bytes.
-    const HEADER_LEN: usize = 16 + META_LEN;
+    const HEADER_LEN: usize = WAY_META_OFF + META_LEN;
     /// Byte offset of the metadata block within the record.
-    const META_OFF: usize = 16;
+    const META_OFF: usize = WAY_META_OFF;
 
     /// Returns the way ID.
     pub fn id(&self) -> i64 {
@@ -472,9 +507,9 @@ pub struct CompactRelationRef<'a> {
 
 impl<'a> CompactRelationRef<'a> {
     /// Header size: 8 (id) + 4 (member_count) + 4 (tag_count) + 29 (meta) = 45 bytes.
-    const HEADER_LEN: usize = 16 + META_LEN;
+    const HEADER_LEN: usize = RELATION_META_OFF + META_LEN;
     /// Byte offset of the metadata block within the record.
-    const META_OFF: usize = 16;
+    const META_OFF: usize = RELATION_META_OFF;
 
     /// Per-member size: 8 (ref_id) + 1 (type) + 4 (role_intern_id) = 13 bytes.
     const MEMBER_SIZE: usize = 13;

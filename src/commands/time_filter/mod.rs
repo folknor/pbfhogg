@@ -164,7 +164,13 @@ fn time_filter_history(
         if flush_error.is_err() {
             return;
         }
-        let (kind, id, timestamp) = element_identity_and_timestamp(&element);
+        let (kind, id, timestamp) = match element_identity_and_timestamp(&element) {
+            Ok(v) => v,
+            Err(e) => {
+                flush_error = Err(e.into());
+                return;
+            }
+        };
         stats.versions_seen += 1;
 
         let group_changed = pending
@@ -388,21 +394,25 @@ fn time_filter_snapshot(
 /// timestamp check and the visibility check. Updates `stats` for the drop
 /// counters along the way. Returning `None` means the caller should `continue`.
 fn snapshot_gate(
-    ts: i64,
+    ts: Option<i64>,
+    ident: (&str, i64),
     visible: bool,
     cutoff_timestamp: i64,
     stats: &mut TimeFilterStats,
-) -> Option<()> {
+) -> std::result::Result<Option<()>, String> {
+    // An element with no timestamp is not an element from before the
+    // cutoff. See the timestamp section at the bottom of this file.
+    let ts = require_timestamp(ts, ident.0, ident.1)?;
     if ts > cutoff_timestamp {
         stats.dropped_no_snapshot_version += 1;
-        return None;
+        return Ok(None);
     }
     stats.versions_before_cutoff += 1;
     if !visible {
         stats.dropped_deleted += 1;
-        return None;
+        return Ok(None);
     }
-    Some(())
+    Ok(Some(()))
 }
 
 #[hotpath::measure]
@@ -430,10 +440,12 @@ fn filter_block_snapshot(
             Element::DenseNode(dn) => {
                 let Some(()) = snapshot_gate(
                     dense_timestamp(dn),
+                    ("node", dn.id()),
                     dense_visible(dn),
                     cutoff_timestamp,
                     &mut stats,
-                ) else {
+                )?
+                else {
                     continue;
                 };
                 ensure_node_capacity_local(bb, output)?;
@@ -452,10 +464,12 @@ fn filter_block_snapshot(
             Element::Node(n) => {
                 let Some(()) = snapshot_gate(
                     node_timestamp(n),
+                    ("node", n.id()),
                     node_visible(n),
                     cutoff_timestamp,
                     &mut stats,
-                ) else {
+                )?
+                else {
                     continue;
                 };
                 ensure_node_capacity_local(bb, output)?;
@@ -474,10 +488,12 @@ fn filter_block_snapshot(
             Element::Way(w) => {
                 let Some(()) = snapshot_gate(
                     way_timestamp(w),
+                    ("way", w.id()),
                     way_visible(w),
                     cutoff_timestamp,
                     &mut stats,
-                ) else {
+                )?
+                else {
                     continue;
                 };
                 ensure_way_capacity_local(bb, output)?;
@@ -492,10 +508,12 @@ fn filter_block_snapshot(
             Element::Relation(r) => {
                 let Some(()) = snapshot_gate(
                     relation_timestamp(r),
+                    ("relation", r.id()),
                     relation_visible(r),
                     cutoff_timestamp,
                     &mut stats,
-                ) else {
+                )?
+                else {
                     continue;
                 };
                 ensure_relation_capacity_local(bb, output)?;
@@ -651,29 +669,71 @@ fn write_owned_element(
     Ok(())
 }
 
-fn element_identity_and_timestamp(element: &Element<'_>) -> (ElementKind, i64, i64) {
-    match element {
-        Element::DenseNode(dn) => (ElementKind::Node, dn.id(), dense_timestamp(dn)),
-        Element::Node(n) => (ElementKind::Node, n.id(), node_timestamp(n)),
-        Element::Way(w) => (ElementKind::Way, w.id(), way_timestamp(w)),
-        Element::Relation(r) => (ElementKind::Relation, r.id(), relation_timestamp(r)),
-    }
+fn element_identity_and_timestamp(
+    element: &Element<'_>,
+) -> std::result::Result<(ElementKind, i64, i64), String> {
+    let (kind, id, kind_name, ts) = match element {
+        Element::DenseNode(dn) => (ElementKind::Node, dn.id(), "node", dense_timestamp(dn)),
+        Element::Node(n) => (ElementKind::Node, n.id(), "node", node_timestamp(n)),
+        Element::Way(w) => (ElementKind::Way, w.id(), "way", way_timestamp(w)),
+        Element::Relation(r) => (
+            ElementKind::Relation,
+            r.id(),
+            "relation",
+            relation_timestamp(r),
+        ),
+    };
+    Ok((kind, id, require_timestamp(ts, kind_name, id)?))
 }
 
-fn dense_timestamp(dn: &DenseNode<'_>) -> i64 {
-    dn.info().map_or(0, |i| i.milli_timestamp() / 1000)
+// ---------------------------------------------------------------------------
+// Timestamps
+//
+// Absent is not the epoch. Every one of these used to end in
+// `unwrap_or(0)`, so an element with no `Info` - or an `Info` with no
+// timestamp field, which is what `osmium --drop-metadata` and several
+// pbfhogg paths produce - reported timestamp 0. Zero is at or below every
+// plausible cutoff, so `snapshot_gate` kept the element and counted it in
+// `versions_before_cutoff`, and `time-filter` printed "N versions scanned,
+// N <= cutoff, N elements written" having filtered nothing at all. A
+// command that reports success having done nothing is the worst shape of
+// bug in this domain, so a metadata-stripped input is now a hard error
+// naming the element.
+// ---------------------------------------------------------------------------
+
+/// `None` means the element carries no timestamp at all.
+fn dense_timestamp(dn: &DenseNode<'_>) -> Option<i64> {
+    // `DenseNodeInfo::milli_timestamp` is infallible: DenseInfo carries a
+    // parallel timestamp array, so if the block has DenseInfo at all it
+    // has a timestamp for this node. Absence is `info()` returning None,
+    // which is exactly what a metadata-stripped dense block looks like.
+    Some(dn.info()?.milli_timestamp() / 1000)
 }
 
-fn node_timestamp(n: &Node<'_>) -> i64 {
-    n.info().milli_timestamp().unwrap_or(0) / 1000
+fn node_timestamp(n: &Node<'_>) -> Option<i64> {
+    Some(n.info().milli_timestamp()? / 1000)
 }
 
-fn way_timestamp(w: &Way<'_>) -> i64 {
-    w.info().milli_timestamp().unwrap_or(0) / 1000
+fn way_timestamp(w: &Way<'_>) -> Option<i64> {
+    Some(w.info().milli_timestamp()? / 1000)
 }
 
-fn relation_timestamp(r: &Relation<'_>) -> i64 {
-    r.info().milli_timestamp().unwrap_or(0) / 1000
+fn relation_timestamp(r: &Relation<'_>) -> Option<i64> {
+    Some(r.info().milli_timestamp()? / 1000)
+}
+
+/// Turn an absent timestamp into the error that names it.
+fn require_timestamp(ts: Option<i64>, kind: &str, id: i64) -> std::result::Result<i64, String> {
+    ts.ok_or_else(|| {
+        format!(
+            "time-filter: {kind} {id} carries no timestamp. Filtering by time needs one, and \
+             treating an absent timestamp as the Unix epoch would place every such element at \
+             or below any cutoff - so the command would keep the entire input, write it out \
+             unchanged, and report success having filtered nothing. The input has had its \
+             metadata stripped (osmium --drop-metadata and several pbfhogg write paths do \
+             this); re-run time-filter against an input that still carries element metadata."
+        )
+    })
 }
 
 #[hotpath::measure]

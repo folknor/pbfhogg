@@ -447,6 +447,32 @@ Two things would close it, and they are independent:
 Until one of them lands, treat a green `brokkr verify all` as evidence about
 the parallel diff path only.
 
+## Cross-repo: `brokkr verify` has no `merge-changes` arm (2026-08-20)
+
+`brokkr verify all --dataset denmark` runs twelve commands and
+`merge-changes` is not among them; `brokkr verify merge` resolves to
+`apply-changes`. So the only real-data exercise `merge-changes` gets is
+`brokkr merge-changes`, which runs the command and reports a change count
+but compares its output against nothing.
+
+This is why a real divergence went unnoticed for a long time. Until
+2026-08-20 `merge-changes` and `apply-changes` had separate hand-rolled OSC
+parsers that disagreed about metadata: `merge-changes` dropped `timestamp`,
+`changeset`, `uid`, `user` and `visible` from any element lacking a
+`version`, while `apply-changes` preserved them from the very same file.
+Both commands "worked" on Denmark. No oracle ever compared what they
+produced, because there was no oracle.
+
+The osmium equivalent exists (`osmium merge-changes`, with and without
+`--simplify`), so the oracle is available; what is missing is the verify
+arm. Worth noting that the comparison is not byte-equality - pbfhogg now
+deliberately diverges from osmium on version precedence (see
+DEVIATIONS.md), so the arm needs the same
+normalise-then-compare treatment the existing OSC arms use.
+
+Until it lands, treat a green `brokkr verify all` as saying nothing about
+`merge-changes`.
+
 ## Item/command-specific plans
 
 Three new docs capturing a cross-cutting insight and two new commands that fall out of it. All scaffolding-level; details drift as work lands.

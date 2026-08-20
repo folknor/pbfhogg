@@ -1,20 +1,24 @@
 //! Filter OSC files by tag expressions while preserving all delete actions.
 
 use std::fs::File;
-use std::io::{self, BufReader, Write};
+use std::io;
 use std::path::Path;
 
-use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
+use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, Event};
-use quick_xml::name::QName;
-use quick_xml::{Reader, Writer};
 
 use crate::BoxResult as Result;
-use crate::coord_fmt::{format_coord, from_decimicro};
-use crate::osc::write::{OwnedMember, OwnedNode, OwnedRelation, OwnedWay};
+use crate::MemberId;
+use crate::osc::write::{
+    OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay, write_delete_xml,
+    write_node_xml, write_relation_xml, write_way_xml,
+};
+use crate::osc::xml_parse::{
+    ElemKind, OscAction, OscSink, coord_to_decimicro, parse_i64_attr, parse_member_type,
+    parse_osc_path, parse_owned_metadata, parse_str_attr, parse_str_attr_optional,
+};
 use crate::tag_expr::{Expression, parse_expressions, tag_matches};
-use crate::{MemberId, MemberType};
 
 fn matches_any(expressions: &[Expression], tags: &[(String, String)], element_type: char) -> bool {
     for (key, value) in tags {
@@ -37,20 +41,15 @@ fn matches_any(expressions: &[Expression], tags: &[(String, String)], element_ty
 // OSC model used by this command
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Section {
-    None,
-    Create,
-    Modify,
-    Delete,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ElemKind {
-    Node,
-    Way,
-    Relation,
-}
+/// This command speaks the shared parser's vocabulary. It used to carry
+/// its own `Section` and `ElemKind` around a third hand-rolled copy of
+/// the OSC state machine - one the change-stream bug hunt did not even
+/// find, and which had drifted the same way the other two had: node
+/// coordinates defaulting to 0/0 in the Gulf of Guinea, a
+/// `MemberId::Unknown` arm the other parsers refuse, no truncation
+/// check, and an unconditional `MultiGzDecoder` that made
+/// `tags-filter --input-kind osc` unable to read a plain `.osc`.
+type Section = OscAction;
 
 struct CurrentElem {
     kind: ElemKind,
@@ -60,10 +59,21 @@ struct CurrentElem {
     tags: Vec<(String, String)>,
     refs: Vec<i64>,
     members: Vec<OwnedMember>,
+    /// The element's `version` / `timestamp` / `changeset` / `uid` /
+    /// `user` / `visible`, or `None` when it carried none.
+    ///
+    /// This field did not exist: every element this filter kept was
+    /// re-emitted with a hardcoded `metadata: None`, so running a change
+    /// stream through `tags-filter --input-kind osc` silently erased the
+    /// metadata from every surviving change. It is the same data loss
+    /// that `merge-changes` was fixed for, in the sink the hunt found
+    /// last, and it is worse here because a filter is expected to drop
+    /// only what does not match.
+    metadata: Option<crate::osc::write::OwnedMetadata>,
 }
 
 impl CurrentElem {
-    fn new(kind: ElemKind, id: i64) -> Self {
+    fn new(kind: ElemKind, id: i64, metadata: Option<crate::osc::write::OwnedMetadata>) -> Self {
         Self {
             kind,
             id,
@@ -72,6 +82,7 @@ impl CurrentElem {
             tags: Vec::new(),
             refs: Vec::new(),
             members: Vec::new(),
+            metadata,
         }
     }
 }
@@ -83,9 +94,9 @@ struct FilteredOsc {
     modify_nodes: Vec<OwnedNode>,
     modify_ways: Vec<OwnedWay>,
     modify_relations: Vec<OwnedRelation>,
-    delete_node_ids: Vec<i64>,
-    delete_way_ids: Vec<i64>,
-    delete_relation_ids: Vec<i64>,
+    delete_node_ids: Vec<(i64, Option<OwnedMetadata>)>,
+    delete_way_ids: Vec<(i64, Option<OwnedMetadata>)>,
+    delete_relation_ids: Vec<(i64, Option<OwnedMetadata>)>,
 }
 
 impl FilteredOsc {
@@ -158,192 +169,119 @@ fn parse_and_filter_osc(
     input: &Path,
     expressions: &[Expression],
 ) -> Result<(FilteredOsc, TagsFilterOscStats)> {
-    let file = File::open(input)?;
-    let decoder = MultiGzDecoder::new(file);
-    let mut reader = Reader::from_reader(BufReader::new(decoder));
-    reader.config_mut().trim_text(true);
-
-    let mut filtered = FilteredOsc::new();
-    let mut stats = TagsFilterOscStats::default();
-    let mut section = Section::None;
-    let mut current: Option<CurrentElem> = None;
-    let mut buf: Vec<u8> = Vec::new();
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) => {
-                handle_event_start_like(
-                    e,
-                    false,
-                    &mut section,
-                    &mut current,
-                    &mut filtered,
-                    &mut stats,
-                    expressions,
-                )?;
-            }
-            Ok(Event::Empty(ref e)) => {
-                handle_event_start_like(
-                    e,
-                    true,
-                    &mut section,
-                    &mut current,
-                    &mut filtered,
-                    &mut stats,
-                    expressions,
-                )?;
-            }
-            Ok(Event::End(ref e)) => match e.name().as_ref() {
-                b"create" | b"modify" | b"delete" => section = Section::None,
-                b"node" | b"way" | b"relation" => {
-                    finalize_current(
-                        section,
-                        &mut current,
-                        &mut filtered,
-                        &mut stats,
-                        expressions,
-                    );
-                }
-                _ => {}
-            },
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(e) => return Err(Box::new(e)),
-        }
-        buf.clear();
-    }
-
-    Ok((filtered, stats))
+    let mut sink = FilterSink {
+        filtered: FilteredOsc::new(),
+        stats: TagsFilterOscStats::default(),
+        expressions,
+        section: Section::Create,
+        current: None,
+    };
+    parse_osc_path(input, &mut sink)?;
+    Ok((sink.filtered, sink.stats))
 }
 
-fn handle_event_start_like(
-    e: &BytesStart<'_>,
-    is_empty: bool,
-    section: &mut Section,
-    current: &mut Option<CurrentElem>,
-    filtered: &mut FilteredOsc,
-    stats: &mut TagsFilterOscStats,
-    expressions: &[Expression],
-) -> Result<()> {
-    match e.name().as_ref() {
-        b"create" => *section = Section::Create,
-        b"modify" => *section = Section::Modify,
-        b"delete" => *section = Section::Delete,
-        b"node" => {
-            start_element(e, *section, ElemKind::Node, current, filtered, stats)?;
-            if is_empty {
-                finalize_current(*section, current, filtered, stats, expressions);
-            }
-        }
-        b"way" => {
-            start_element(e, *section, ElemKind::Way, current, filtered, stats)?;
-            if is_empty {
-                finalize_current(*section, current, filtered, stats, expressions);
-            }
-        }
-        b"relation" => {
-            start_element(e, *section, ElemKind::Relation, current, filtered, stats)?;
-            if is_empty {
-                finalize_current(*section, current, filtered, stats, expressions);
-            }
-        }
-        b"tag" => append_tag(e, current)?,
-        b"nd" => append_ref(e, current)?,
-        b"member" => append_member(e, current)?,
-        _ => {}
-    }
-    Ok(())
-}
-
-fn append_tag(e: &BytesStart<'_>, current: &mut Option<CurrentElem>) -> Result<()> {
-    if let Some(cur) = current.as_mut() {
-        let k = attr_string(e, b"k")?;
-        let v = attr_string(e, b"v")?;
-        cur.tags.push((k, v));
-    }
-    Ok(())
-}
-
-fn append_ref(e: &BytesStart<'_>, current: &mut Option<CurrentElem>) -> Result<()> {
-    if let Some(cur) = current.as_mut()
-        && cur.kind == ElemKind::Way
-    {
-        cur.refs.push(attr_i64(e, b"ref")?);
-    }
-    Ok(())
-}
-
-fn append_member(e: &BytesStart<'_>, current: &mut Option<CurrentElem>) -> Result<()> {
-    if let Some(cur) = current.as_mut()
-        && cur.kind == ElemKind::Relation
-    {
-        let member_type = match attr_string(e, b"type")?.as_str() {
-            "node" => MemberType::Node,
-            "way" => MemberType::Way,
-            "relation" => MemberType::Relation,
-            other => {
-                return Err(format!("unknown relation member type: '{other}'").into());
-            }
-        };
-        let id = attr_i64(e, b"ref")?;
-        let role = attr_string(e, b"role").unwrap_or_default();
-        let member_id = match member_type {
-            MemberType::Node => MemberId::Node(id),
-            MemberType::Way => MemberId::Way(id),
-            MemberType::Relation => MemberId::Relation(id),
-            MemberType::Unknown(v) => MemberId::Unknown(v, id),
-        };
-        cur.members.push(OwnedMember {
-            id: member_id,
-            role,
-        });
-    }
-    Ok(())
-}
-
-fn start_element(
-    e: &BytesStart<'_>,
+/// Sink that keeps the create/modify elements matching `expressions`
+/// and forwards every delete unconditionally.
+struct FilterSink<'a> {
+    filtered: FilteredOsc,
+    stats: TagsFilterOscStats,
+    expressions: &'a [Expression],
     section: Section,
-    kind: ElemKind,
-    current: &mut Option<CurrentElem>,
-    filtered: &mut FilteredOsc,
-    stats: &mut TagsFilterOscStats,
-) -> Result<()> {
-    let id = attr_i64(e, b"id")?;
+    current: Option<CurrentElem>,
+}
 
-    match section {
-        Section::Delete => {
-            stats.deletes_in += 1;
-            stats.deletes_out += 1;
+impl OscSink for FilterSink<'_> {
+    fn begin_element(&mut self, action: Section, kind: ElemKind, e: &BytesStart<'_>) -> Result<()> {
+        let id = parse_i64_attr(e, b"id")?;
+        self.section = action;
+        // Read on every action, delete included: a `<delete>` carries
+        // the version of the state it supersedes, and the shared
+        // `write_delete_xml` emits it. Dropping it here is how this
+        // filter used to turn a metadata-bearing change stream into an
+        // anonymous one.
+        let metadata = parse_owned_metadata(e)?;
+
+        if action == Section::Delete {
+            self.stats.deletes_in += 1;
+            self.stats.deletes_out += 1;
             match kind {
-                ElemKind::Node => filtered.delete_node_ids.push(id),
-                ElemKind::Way => filtered.delete_way_ids.push(id),
-                ElemKind::Relation => filtered.delete_relation_ids.push(id),
+                ElemKind::Node => self.filtered.delete_node_ids.push((id, metadata)),
+                ElemKind::Way => self.filtered.delete_way_ids.push((id, metadata)),
+                ElemKind::Relation => self.filtered.delete_relation_ids.push((id, metadata)),
             }
-            *current = None;
+            self.current = None;
             return Ok(());
         }
-        Section::Create => {
-            stats.creates_in += 1;
+        if action == Section::Create {
+            self.stats.creates_in += 1;
+        } else {
+            self.stats.modifies_in += 1;
         }
-        Section::Modify => {
-            stats.modifies_in += 1;
+
+        let mut cur = CurrentElem::new(kind, id, metadata);
+        if kind == ElemKind::Node {
+            cur.decimicro_lat = coord_to_decimicro(e, b"lat", id)?;
+            cur.decimicro_lon = coord_to_decimicro(e, b"lon", id)?;
         }
-        Section::None => {}
+        self.current = Some(cur);
+        Ok(())
     }
 
-    let mut cur = CurrentElem::new(kind, id);
-    if kind == ElemKind::Node {
-        let lat = attr_f64(e, b"lat").unwrap_or(0.0);
-        let lon = attr_f64(e, b"lon").unwrap_or(0.0);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        {
-            cur.decimicro_lat = (lat * 1e7).round() as i32;
-            cur.decimicro_lon = (lon * 1e7).round() as i32;
+    fn tag(&mut self, e: &BytesStart<'_>) -> Result<()> {
+        if let Some(cur) = self.current.as_mut() {
+            let k = parse_str_attr(e, b"k")?;
+            let v = parse_str_attr(e, b"v")?;
+            cur.tags.push((k, v));
         }
+        Ok(())
     }
-    *current = Some(cur);
-    Ok(())
+
+    fn nd(&mut self, e: &BytesStart<'_>) -> Result<()> {
+        let id = parse_i64_attr(e, b"ref")?;
+        if let Some(cur) = self.current.as_mut() {
+            cur.refs.push(id);
+        }
+        Ok(())
+    }
+
+    fn member(&mut self, e: &BytesStart<'_>) -> Result<()> {
+        let id = parse_i64_attr(e, b"ref")?;
+        let role = parse_str_attr_optional(e, b"role").unwrap_or_default();
+        // The shared `parse_member_type` refuses anything that is not
+        // node/way/relation, so there is no `MemberId::Unknown` arm to
+        // write here any more. This parser used to construct one - and
+        // `osc::write::member_type_str` refuses to emit it, so a
+        // relation with an exotic member type was accepted at parse and
+        // then failed at write.
+        let member_id = match parse_member_type(&parse_str_attr(e, b"type")?)? {
+            crate::MemberType::Node => MemberId::Node(id),
+            crate::MemberType::Way => MemberId::Way(id),
+            crate::MemberType::Relation => MemberId::Relation(id),
+            crate::MemberType::Unknown(v) => {
+                return Err(format!("unknown relation member type value '{v}'").into());
+            }
+        };
+        if let Some(cur) = self.current.as_mut() {
+            cur.members.push(OwnedMember {
+                id: member_id,
+                role,
+            });
+        }
+        Ok(())
+    }
+
+    fn end_element(&mut self) -> Result<()> {
+        let section = self.section;
+        let expressions = self.expressions;
+        finalize_current(
+            section,
+            &mut self.current,
+            &mut self.filtered,
+            &mut self.stats,
+            expressions,
+        );
+        Ok(())
+    }
 }
 
 fn finalize_current(
@@ -373,7 +311,7 @@ fn finalize_current(
                 decimicro_lat: cur.decimicro_lat,
                 decimicro_lon: cur.decimicro_lon,
                 tags: cur.tags,
-                metadata: None,
+                metadata: cur.metadata,
             });
         }
         (Section::Create, ElemKind::Way) => {
@@ -382,7 +320,7 @@ fn finalize_current(
                 id: cur.id,
                 tags: cur.tags,
                 refs: cur.refs,
-                metadata: None,
+                metadata: cur.metadata,
             });
         }
         (Section::Create, ElemKind::Relation) => {
@@ -391,7 +329,7 @@ fn finalize_current(
                 id: cur.id,
                 tags: cur.tags,
                 members: cur.members,
-                metadata: None,
+                metadata: cur.metadata,
             });
         }
         (Section::Modify, ElemKind::Node) => {
@@ -401,7 +339,7 @@ fn finalize_current(
                 decimicro_lat: cur.decimicro_lat,
                 decimicro_lon: cur.decimicro_lon,
                 tags: cur.tags,
-                metadata: None,
+                metadata: cur.metadata,
             });
         }
         (Section::Modify, ElemKind::Way) => {
@@ -410,7 +348,7 @@ fn finalize_current(
                 id: cur.id,
                 tags: cur.tags,
                 refs: cur.refs,
-                metadata: None,
+                metadata: cur.metadata,
             });
         }
         (Section::Modify, ElemKind::Relation) => {
@@ -419,44 +357,11 @@ fn finalize_current(
                 id: cur.id,
                 tags: cur.tags,
                 members: cur.members,
-                metadata: None,
+                metadata: cur.metadata,
             });
         }
         _ => {}
     }
-}
-
-fn attr_i64(e: &BytesStart<'_>, name: &[u8]) -> Result<i64> {
-    for attr_result in e.attributes() {
-        let attr = attr_result?;
-        if attr.key == QName(name) {
-            let val = std::str::from_utf8(&attr.value)?;
-            return Ok(val.parse::<i64>()?);
-        }
-    }
-    Err(format!("missing attribute '{}'", String::from_utf8_lossy(name)).into())
-}
-
-fn attr_f64(e: &BytesStart<'_>, name: &[u8]) -> Result<f64> {
-    for attr_result in e.attributes() {
-        let attr = attr_result?;
-        if attr.key == QName(name) {
-            let val = std::str::from_utf8(&attr.value)?;
-            return Ok(val.parse::<f64>()?);
-        }
-    }
-    Err(format!("missing attribute '{}'", String::from_utf8_lossy(name)).into())
-}
-
-fn attr_string(e: &BytesStart<'_>, name: &[u8]) -> Result<String> {
-    for attr_result in e.attributes() {
-        let attr = attr_result?;
-        if attr.key == QName(name) {
-            let val = attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)?;
-            return Ok(val.into_owned());
-        }
-    }
-    Err(format!("missing attribute '{}'", String::from_utf8_lossy(name)).into())
 }
 
 fn write_filtered_osc(output: &Path, filtered: &FilteredOsc) -> Result<()> {
@@ -475,13 +380,13 @@ fn write_filtered_osc(output: &Path, filtered: &FilteredOsc) -> Result<()> {
     {
         writer.write_event(Event::Start(BytesStart::new("create")))?;
         for node in &filtered.create_nodes {
-            write_node(&mut writer, node)?;
+            write_node_xml(&mut writer, node)?;
         }
         for way in &filtered.create_ways {
-            write_way(&mut writer, way)?;
+            write_way_xml(&mut writer, way)?;
         }
         for rel in &filtered.create_relations {
-            write_relation(&mut writer, rel)?;
+            write_relation_xml(&mut writer, rel)?;
         }
         writer.write_event(Event::End(BytesEnd::new("create")))?;
     }
@@ -492,13 +397,13 @@ fn write_filtered_osc(output: &Path, filtered: &FilteredOsc) -> Result<()> {
     {
         writer.write_event(Event::Start(BytesStart::new("modify")))?;
         for node in &filtered.modify_nodes {
-            write_node(&mut writer, node)?;
+            write_node_xml(&mut writer, node)?;
         }
         for way in &filtered.modify_ways {
-            write_way(&mut writer, way)?;
+            write_way_xml(&mut writer, way)?;
         }
         for rel in &filtered.modify_relations {
-            write_relation(&mut writer, rel)?;
+            write_relation_xml(&mut writer, rel)?;
         }
         writer.write_event(Event::End(BytesEnd::new("modify")))?;
     }
@@ -508,14 +413,14 @@ fn write_filtered_osc(output: &Path, filtered: &FilteredOsc) -> Result<()> {
         || !filtered.delete_relation_ids.is_empty()
     {
         writer.write_event(Event::Start(BytesStart::new("delete")))?;
-        for id in &filtered.delete_node_ids {
-            write_delete_id(&mut writer, "node", *id)?;
+        for (id, meta) in &filtered.delete_node_ids {
+            write_delete_xml(&mut writer, "node", *id, meta.as_ref())?;
         }
-        for id in &filtered.delete_way_ids {
-            write_delete_id(&mut writer, "way", *id)?;
+        for (id, meta) in &filtered.delete_way_ids {
+            write_delete_xml(&mut writer, "way", *id, meta.as_ref())?;
         }
-        for id in &filtered.delete_relation_ids {
-            write_delete_id(&mut writer, "relation", *id)?;
+        for (id, meta) in &filtered.delete_relation_ids {
+            write_delete_xml(&mut writer, "relation", *id, meta.as_ref())?;
         }
         writer.write_event(Event::End(BytesEnd::new("delete")))?;
     }
@@ -526,96 +431,13 @@ fn write_filtered_osc(output: &Path, filtered: &FilteredOsc) -> Result<()> {
     Ok(())
 }
 
-fn write_node<W: Write>(writer: &mut Writer<W>, node: &OwnedNode) -> Result<()> {
-    let mut elem = BytesStart::new("node");
-    let id_str = node.id.to_string();
-    let mut coord_buf = String::new();
-    format_coord(&mut coord_buf, from_decimicro(node.decimicro_lat));
-    let lat_str = coord_buf.clone();
-    format_coord(&mut coord_buf, from_decimicro(node.decimicro_lon));
-    elem.push_attribute(("id", id_str.as_str()));
-    elem.push_attribute(("lat", lat_str.as_str()));
-    elem.push_attribute(("lon", coord_buf.as_str()));
-
-    if node.tags.is_empty() {
-        writer.write_event(Event::Empty(elem))?;
-    } else {
-        writer.write_event(Event::Start(elem))?;
-        for (k, v) in &node.tags {
-            let mut tag = BytesStart::new("tag");
-            tag.push_attribute(("k", k.as_str()));
-            tag.push_attribute(("v", v.as_str()));
-            writer.write_event(Event::Empty(tag))?;
-        }
-        writer.write_event(Event::End(BytesEnd::new("node")))?;
-    }
-    Ok(())
-}
-
-fn write_way<W: Write>(writer: &mut Writer<W>, way: &OwnedWay) -> Result<()> {
-    let mut elem = BytesStart::new("way");
-    let id_str = way.id.to_string();
-    elem.push_attribute(("id", id_str.as_str()));
-
-    if way.refs.is_empty() && way.tags.is_empty() {
-        writer.write_event(Event::Empty(elem))?;
-    } else {
-        writer.write_event(Event::Start(elem))?;
-        for r in &way.refs {
-            let mut nd = BytesStart::new("nd");
-            let r_str = r.to_string();
-            nd.push_attribute(("ref", r_str.as_str()));
-            writer.write_event(Event::Empty(nd))?;
-        }
-        for (k, v) in &way.tags {
-            let mut tag = BytesStart::new("tag");
-            tag.push_attribute(("k", k.as_str()));
-            tag.push_attribute(("v", v.as_str()));
-            writer.write_event(Event::Empty(tag))?;
-        }
-        writer.write_event(Event::End(BytesEnd::new("way")))?;
-    }
-    Ok(())
-}
-
-fn write_relation<W: Write>(writer: &mut Writer<W>, rel: &OwnedRelation) -> Result<()> {
-    let mut elem = BytesStart::new("relation");
-    let id_str = rel.id.to_string();
-    elem.push_attribute(("id", id_str.as_str()));
-
-    if rel.members.is_empty() && rel.tags.is_empty() {
-        writer.write_event(Event::Empty(elem))?;
-    } else {
-        writer.write_event(Event::Start(elem))?;
-        for m in &rel.members {
-            let mut member = BytesStart::new("member");
-            let type_str = match m.id.member_type() {
-                MemberType::Node => "node",
-                MemberType::Way => "way",
-                MemberType::Relation => "relation",
-                MemberType::Unknown(_) => "node",
-            };
-            let ref_str = m.id.id().to_string();
-            member.push_attribute(("type", type_str));
-            member.push_attribute(("ref", ref_str.as_str()));
-            member.push_attribute(("role", m.role.as_str()));
-            writer.write_event(Event::Empty(member))?;
-        }
-        for (k, v) in &rel.tags {
-            let mut tag = BytesStart::new("tag");
-            tag.push_attribute(("k", k.as_str()));
-            tag.push_attribute(("v", v.as_str()));
-            writer.write_event(Event::Empty(tag))?;
-        }
-        writer.write_event(Event::End(BytesEnd::new("relation")))?;
-    }
-    Ok(())
-}
-
-fn write_delete_id<W: Write>(writer: &mut Writer<W>, tag_name: &str, id: i64) -> Result<()> {
-    let mut elem = BytesStart::new(tag_name);
-    let id_str = id.to_string();
-    elem.push_attribute(("id", id_str.as_str()));
-    writer.write_event(Event::Empty(elem))?;
-    Ok(())
-}
+// The local `write_node` / `write_way` / `write_relation` /
+// `write_delete_id` that used to sit here are gone. They were
+// near-copies of `osc::write`'s writers that had drifted in two ways
+// nobody intended: they dropped element metadata entirely (a filter that
+// erases version, timestamp, changeset, uid and user from every change
+// it keeps), and they pushed tag keys, tag values and member roles as
+// raw attributes rather than through `push_attribute_escaped`, so a tag
+// value containing a quote or an ampersand produced malformed XML here
+// and well-formed XML from `merge-changes`. Same input, two answers -
+// the exact defect this hunt was about, one layer above the parser.

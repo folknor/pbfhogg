@@ -4,6 +4,87 @@
 
 ### Breaking
 
+- **`time-filter` now refuses input whose elements carry no timestamps.**
+  Every timestamp accessor ended in `unwrap_or(0)`, so an element with no
+  `Info` - which is what `osmium --drop-metadata` and several pbfhogg write
+  paths produce - reported timestamp 0. Zero is at or below every plausible
+  cutoff, so the snapshot gate kept the element and counted it as "before
+  cutoff", and the command printed `N versions scanned, N <= cutoff, N
+  elements written` having filtered nothing whatsoever. The result was a
+  full copy of the input, reported as a successful filter, with nothing
+  downstream able to tell it apart from a cutoff that genuinely kept
+  everything. Both the history and snapshot paths now error, naming the
+  first element that lacks a timestamp. Re-run against an input that still
+  carries element metadata.
+
+- **A truncated OSC is now a hard error in every command that reads one.**
+  A `.osc.gz` cut at a gzip member boundary decompresses cleanly, so
+  quick-xml simply reported end-of-input and `apply-changes`,
+  `merge-changes` and `tags-filter --input-kind osc` all treated the
+  partial document as the whole change stream - `apply-changes` wrote a
+  partially-applied PBF and exited 0. The parser now requires the closing
+  `</osmChange>` tag (the self-closing `<osmChange .../>` empty-document
+  form is still accepted).
+
+- **An OSC element outside any `<create>`, `<modify>` or `<delete>` section
+  is now refused.** The three OSC parsers previously gave three different
+  answers: the change overlay treated it as a create and applied it,
+  `merge-changes` errored for the self-closing form and silently dropped
+  the other, and `tags-filter` dropped it. None of them could know which
+  change the producer meant.
+
+- **An OSC metadata attribute that is present but unparsable is now an
+  error.** `version="abc"` used to be recorded as `version = 0`. Absent and
+  unparsable are both distinct from the value zero, and the new
+  version-precedence gate compares these numbers.
+
+- **`merge-changes` and `tags-filter --input-kind osc` now reject a created
+  or modified `<node>` without usable coordinates.** Both used
+  `unwrap_or(0.0)` plus a saturating `as i32`, so a coordinate-less node
+  was silently placed at 0/0 - a real location in the Gulf of Guinea - and
+  `lat="1e30"` was clamped to `i32::MAX`. `apply-changes` already rejected
+  these; now all three agree. Deletes still need no coordinates.
+
+- **Version precedence: a change that does not advance an object's version
+  is refused.** Neither the change overlay (later parse wins) nor
+  `merge-changes --simplify` (`BTreeMap` insert, input order wins) ever
+  consulted `version`, so precedence was purely positional. Applying the
+  same OSC twice, or listing inputs out of sequence order - which is easy
+  to do by accident - silently regressed objects to older versions and
+  reported success. Both now refuse an incoming change whose version is at
+  or below the version it would replace, naming both versions. Elements
+  that claim no version are unaffected, since there is nothing to compare.
+  Opt out with `apply-changes --allow-version-regression`,
+  `merge-changes --allow-version-regression`, or
+  `CompactDiffOverlay::allow_version_regression(true)`.
+
+  A `<delete>` participates in the gate on both sides. It is version-gated
+  like any other change, and it leaves a *versioned tombstone* rather than
+  simply dropping the object from the live index - otherwise a delete
+  erased the object's version history and the very next stale change had
+  nothing to be compared against. Delete node 1 version 9 then modify node
+  1 version 8, in one OSC or across two, and version 8 was resurrected
+  past the gate. The tombstone carries forward the higher of the delete's
+  own claim and the version the live record held.
+
+- **`tags-filter --input-kind osc` no longer strips element metadata from
+  the changes it keeps.** Every surviving element was re-emitted with no
+  metadata at all, so filtering a change stream silently erased `version`,
+  `timestamp`, `changeset`, `uid`, `user` and `visible` from every change
+  that passed the filter - deletes included. A filter is expected to drop
+  what does not match, not to anonymise what does. It also re-emitted tag
+  keys, tag values and member roles as raw attributes rather than escaping
+  them, so a tag value containing a quote or an ampersand produced
+  malformed XML here and well-formed XML from `merge-changes` for the same
+  input; both commands now share one writer.
+
+- **`osc::load_all_diffs` errors on a directory whose files all failed to
+  match.** It accepted exactly `<sequence>.osc.gz`, so a directory of
+  `changes-4705.osc.gz`, plain `.osc`, or Geofabrik's nested layout matched
+  nothing, returned an empty overlay, and printed a cheerful "Loaded 0
+  diffs" - after which the caller applied no changes and reported success.
+  An empty directory is still a legitimate no-op.
+
 - **`tags-filter` / `inspect tags` expressions now follow osmium's matcher,
   which changes what existing expressions select.** Both commands are
   advertised as osmium equivalents, but the parser understood only exact
@@ -156,6 +237,14 @@
 
 ### Added
 
+- **`apply-changes` and `tags-filter --input-kind osc` accept uncompressed
+  `.osc` input.** Both wrapped every input in a gzip decoder unconditionally
+  and failed on plain XML with a raw "invalid gzip header", while
+  `merge-changes` sniffed the magic bytes and handled both. Compression is
+  now detected from the file's leading bytes in one shared place, so all
+  three agree. `osc::load_all_diffs` correspondingly accepts
+  `<sequence>.osc` alongside `<sequence>.osc.gz`.
+
 - **`pbfhogg::write::emit_writer_counters()`.** Publishes the `writer_*`
   sidecar counters, at most once per process. Emission used to happen inside
   `PbfWriter::flush`, but the counters are a process-global total, so a
@@ -245,6 +334,18 @@
   must be left untouched.
 
 ### Fixed
+
+- **A failed `pbfhogg::commands::merge_changes::merge_changes` no longer
+  overwrites the destination it was given.** The single-input path created
+  the output file and streamed XML into it during the parse, so a truncated
+  or otherwise invalid input left the destination holding a partial
+  document - and a pre-existing file of that name was already truncated
+  before the first byte of new output existed. Library callers only: the
+  CLI has been safe since every user-named `--output` started going through
+  a scratch sibling that is renamed into place on success. The library now
+  guards its own writes, choosing a plain remove-on-failure guard when it
+  created the file and a scratch-and-rename when it would overwrite an
+  existing one, so nothing is guarded twice.
 
 - **`apply-changes` no longer emits an out-of-order create.** A pure create
   whose ID fell inside a base blob's ID span matched no element in that blob,
@@ -477,6 +578,19 @@
   bitset message. It is now an input error naming the problem.
 
 ### Changed
+
+- **`merge-changes` no longer strips element metadata from an element that
+  omits `version`.** Its metadata parser began with
+  `let version = parse_i32_attr_optional(e, b"version")?;` and returned
+  "no metadata" the moment `version` was absent - discarding `timestamp`,
+  `changeset`, `uid`, `user` and `visible` along with it. `apply-changes`,
+  reading the very same file through the other parser, kept all of them.
+  Metadata is now recognised by *presence*: an element carrying any
+  metadata attribute has metadata, and every attribute it carried is
+  preserved. Correspondingly, an element that claims no `version` no longer
+  has `version="0"` invented for it on output - the attribute is simply
+  absent. This also affects the `diff --format osc` / `derive-changes`
+  delete writers.
 
 - **Indexdata is now written as format v3, which can represent a bbox at
   (0, 0).** v2 spelled "this blob has no bounding box" as four zero words -

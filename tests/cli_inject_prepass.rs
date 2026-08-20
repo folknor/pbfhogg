@@ -453,7 +453,14 @@ fn rewriting_commands_drop_enrichment_flags() {
             ..way(11, vec![3, 4, 5])
         },
     ];
-    let relations = vec![mp_relation(20, 10)];
+    // The relation needs metadata like the nodes and ways above: this
+    // sweep drives `time-filter`, which now refuses an element with no
+    // timestamp rather than treating absence as the Unix epoch (which
+    // silently kept everything and reported success).
+    let relations = vec![TestRelation {
+        meta: Some(TestMeta::default()),
+        ..mp_relation(20, 10)
+    }];
     write_indexed_pbf(&raw, &nodes, &ways, &relations);
 
     // Keep untagged nodes so downstream commands see a complete node+way graph.

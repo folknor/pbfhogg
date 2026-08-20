@@ -15,7 +15,7 @@ mod interner;
 pub(crate) mod merge_join;
 pub mod parse;
 pub(crate) mod write;
-mod xml_parse;
+pub(crate) mod xml_parse;
 
 // Box<dyn Error> is intentional - OSC parsing is CLI-internal, callers only
 // display errors. String errors include the missing attribute name for context.

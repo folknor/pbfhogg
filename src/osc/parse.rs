@@ -5,21 +5,17 @@
 // layouts with interned tag keys and relation member roles.
 
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::BufReader;
 use std::path::Path;
 
-use flate2::read::MultiGzDecoder;
-use quick_xml::Reader;
-use quick_xml::events::Event;
 use rustc_hash::FxHashMap;
 
 use super::ParseResult;
-use super::compact::{ArenaMeta, arena_append_node, arena_append_relation, arena_append_way};
-use super::interner::StringInterner;
-use super::xml_parse::{
-    ParserState, handle_empty_event_compact, handle_end_event_compact, handle_start_event_compact,
+use super::compact::{
+    ArenaMeta, NODE_META_OFF, RELATION_META_OFF, WAY_META_OFF, arena_append_node,
+    arena_append_relation, arena_append_way, version_at,
 };
+use super::interner::StringInterner;
+use super::xml_parse::{CompactSink, parse_osc_path};
 
 pub use super::compact::{
     CompactMemberIter, CompactNodeRef, CompactRefIter, CompactRelationRef, CompactTagIter,
@@ -57,7 +53,53 @@ pub struct CompactDiffOverlay {
     pub deleted_nodes: HashSet<i64>,
     pub deleted_ways: HashSet<i64>,
     pub deleted_relations: HashSet<i64>,
+    // Versioned tombstones. A delete drops the live index entry, which is
+    // where the version-regression gate reads the stored version from, so
+    // without these a delete erases the object's version history and the
+    // very next stale change sails through the gate: delete node 1
+    // version 9, then modify node 1 version 8, and version 8 is
+    // resurrected. These maps carry the highest version ever seen for a
+    // deleted id - the delete's own claim, and whatever the live record
+    // held before it was removed - so the gate has a floor to compare
+    // against after the index entry is gone. Only deleted ids are stored,
+    // so the cost is proportional to the delete count, not the change
+    // count.
+    deleted_node_versions: FxHashMap<i64, i32>,
+    deleted_way_versions: FxHashMap<i64, i32>,
+    deleted_relation_versions: FxHashMap<i64, i32>,
     interner: StringInterner,
+    /// When false (the default), an incoming change whose `version` is at
+    /// or below the version of the record it would replace is a hard
+    /// error. See [`CompactDiffOverlay::allow_version_regression`].
+    allow_version_regression: bool,
+}
+
+/// A read-only view of one element kind's storage: the arena, the live
+/// index, the versioned tombstones, and where the metadata block sits in
+/// a record of that kind. Bundled because the version-regression gate
+/// needs all four together and each of the three kinds supplies its own.
+#[derive(Clone, Copy)]
+struct KindStore<'a> {
+    arena: &'a [u8],
+    index: &'a FxHashMap<i64, usize>,
+    tombstones: &'a FxHashMap<i64, i32>,
+    meta_off: usize,
+}
+
+impl KindStore<'_> {
+    /// The highest version this overlay already holds for `id`, live or
+    /// deleted, or `None` when nothing stored for it ever claimed one.
+    fn stored_version(&self, id: i64) -> Option<i32> {
+        let live = self
+            .index
+            .get(&id)
+            .and_then(|&offset| version_at(self.arena, offset, self.meta_off));
+        let dead = self.tombstones.get(&id).copied();
+        match (live, dead) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
 }
 
 impl CompactDiffOverlay {
@@ -73,8 +115,69 @@ impl CompactDiffOverlay {
             deleted_nodes: HashSet::new(),
             deleted_ways: HashSet::new(),
             deleted_relations: HashSet::new(),
+            deleted_node_versions: FxHashMap::default(),
+            deleted_way_versions: FxHashMap::default(),
+            deleted_relation_versions: FxHashMap::default(),
             interner: StringInterner::new(),
+            allow_version_regression: false,
         }
+    }
+
+    /// Opt out of the version-regression gate.
+    ///
+    /// The overlay's conflict rule is purely positional: the last change
+    /// parsed into it wins, whatever version it claims. That is fine when
+    /// the changes arrive in order and is silent data corruption when
+    /// they do not - applying the same OSC twice, or an older one after a
+    /// newer one, downgrades objects to earlier versions and reports
+    /// success. The overlay already stores the version, so by default it
+    /// refuses: an incoming change that would replace a record with a
+    /// version at or below the stored one is an error naming both.
+    ///
+    /// Set this to restore the old positional behaviour, for the case
+    /// where a caller genuinely intends to replay history backwards.
+    pub fn allow_version_regression(&mut self, allow: bool) {
+        self.allow_version_regression = allow;
+    }
+
+    /// Refuse an incoming change that does not move the object forward.
+    ///
+    /// Both sides must claim a version for the comparison to mean
+    /// anything: a change with no `version` attribute makes no claim, and
+    /// neither does a stored record that had none. Only an actual
+    /// backwards or repeated claim is refused.
+    ///
+    /// "Stored" spans both the live index and the versioned tombstone
+    /// map, so a delete is as much a version claim as a create is.
+    fn check_version_advance(
+        &self,
+        kind: &str,
+        id: i64,
+        store: KindStore<'_>,
+        incoming: &ArenaMeta,
+    ) -> ParseResult<()> {
+        if self.allow_version_regression {
+            return Ok(());
+        }
+        let Some(incoming_version) = incoming.version_claim() else {
+            return Ok(());
+        };
+        let Some(stored) = store.stored_version(id) else {
+            return Ok(());
+        };
+        if incoming_version > stored {
+            return Ok(());
+        }
+        Err(format!(
+            "OSC {kind} {id} carries version {incoming_version}, which does not advance past \
+             version {stored} already held for it in this change overlay. Accepting it would \
+             silently downgrade the object to an older state and report success - the usual \
+             cause is applying the same diff twice, or feeding diffs out of sequence order. \
+             Re-order the inputs, or call \
+             `CompactDiffOverlay::allow_version_regression(true)` if replaying backwards is \
+             genuinely intended."
+        )
+        .into())
     }
 
     /// Returns true if the overlay contains no data at all.
@@ -183,6 +286,12 @@ impl CompactDiffOverlay {
         total += self.deleted_ways.capacity() * delete_entry_size;
         total += self.deleted_relations.capacity() * delete_entry_size;
 
+        // Versioned tombstones: FxHashMap<i64, i32>, (i64, i32) + control byte.
+        let tombstone_entry_size = std::mem::size_of::<(i64, i32)>() + 1;
+        total += self.deleted_node_versions.capacity() * tombstone_entry_size;
+        total += self.deleted_way_versions.capacity() * tombstone_entry_size;
+        total += self.deleted_relation_versions.capacity() * tombstone_entry_size;
+
         // Interner
         total += self.interner.heap_size_estimate();
 
@@ -199,6 +308,39 @@ impl CompactDiffOverlay {
     // in `xml_parse.rs`) from having to remember the pairing.
     // -----------------------------------------------------------------------
 
+    /// The node kind's storage as one view for the version gate.
+    #[inline]
+    fn node_store(&self) -> KindStore<'_> {
+        KindStore {
+            arena: &self.node_arena,
+            index: &self.node_index,
+            tombstones: &self.deleted_node_versions,
+            meta_off: NODE_META_OFF,
+        }
+    }
+
+    /// The way kind's storage as one view for the version gate.
+    #[inline]
+    fn way_store(&self) -> KindStore<'_> {
+        KindStore {
+            arena: &self.way_arena,
+            index: &self.way_index,
+            tombstones: &self.deleted_way_versions,
+            meta_off: WAY_META_OFF,
+        }
+    }
+
+    /// The relation kind's storage as one view for the version gate.
+    #[inline]
+    fn relation_store(&self) -> KindStore<'_> {
+        KindStore {
+            arena: &self.relation_arena,
+            index: &self.relation_index,
+            tombstones: &self.deleted_relation_versions,
+            meta_off: RELATION_META_OFF,
+        }
+    }
+
     /// Append a node to the arena and register it in the node index.
     #[inline]
     pub(super) fn push_node(
@@ -209,6 +351,7 @@ impl CompactDiffOverlay {
         tags: &[(u32, &str)],
         meta: &ArenaMeta,
     ) -> ParseResult<()> {
+        self.check_version_advance("node", id, self.node_store(), meta)?;
         let offset = arena_append_node(&mut self.node_arena, id, lat, lon, tags, meta)?;
         self.node_index.insert(id, offset);
         Ok(())
@@ -223,6 +366,7 @@ impl CompactDiffOverlay {
         tags: &[(u32, &str)],
         meta: &ArenaMeta,
     ) -> ParseResult<()> {
+        self.check_version_advance("way", id, self.way_store(), meta)?;
         let offset = arena_append_way(&mut self.way_arena, id, refs, tags, meta)?;
         self.way_index.insert(id, offset);
         Ok(())
@@ -237,30 +381,67 @@ impl CompactDiffOverlay {
         tags: &[(u32, &str)],
         meta: &ArenaMeta,
     ) -> ParseResult<()> {
+        self.check_version_advance("relation", id, self.relation_store(), meta)?;
         let offset = arena_append_relation(&mut self.relation_arena, id, members, tags, meta)?;
         self.relation_index.insert(id, offset);
         Ok(())
     }
 
     /// Mark a node as deleted and drop any live entry from the node index.
+    ///
+    /// The delete is version-gated exactly like a create or modify, and
+    /// records a versioned tombstone so a later stale change still has a
+    /// version to be measured against.
     #[inline]
-    pub(super) fn delete_node(&mut self, id: i64) {
+    pub(super) fn delete_node(&mut self, id: i64, meta: &ArenaMeta) -> ParseResult<()> {
+        self.check_version_advance("node", id, self.node_store(), meta)?;
+        let carried = self.node_store().stored_version(id);
+        Self::record_tombstone(&mut self.deleted_node_versions, id, carried, meta);
         self.deleted_nodes.insert(id);
         self.node_index.remove(&id);
+        Ok(())
     }
 
     /// Mark a way as deleted and drop any live entry from the way index.
     #[inline]
-    pub(super) fn delete_way(&mut self, id: i64) {
+    pub(super) fn delete_way(&mut self, id: i64, meta: &ArenaMeta) -> ParseResult<()> {
+        self.check_version_advance("way", id, self.way_store(), meta)?;
+        let carried = self.way_store().stored_version(id);
+        Self::record_tombstone(&mut self.deleted_way_versions, id, carried, meta);
         self.deleted_ways.insert(id);
         self.way_index.remove(&id);
+        Ok(())
     }
 
     /// Mark a relation as deleted and drop any live entry from the relation index.
     #[inline]
-    pub(super) fn delete_relation(&mut self, id: i64) {
+    pub(super) fn delete_relation(&mut self, id: i64, meta: &ArenaMeta) -> ParseResult<()> {
+        self.check_version_advance("relation", id, self.relation_store(), meta)?;
+        let carried = self.relation_store().stored_version(id);
+        Self::record_tombstone(&mut self.deleted_relation_versions, id, carried, meta);
         self.deleted_relations.insert(id);
         self.relation_index.remove(&id);
+        Ok(())
+    }
+
+    /// Store the highest version known for a now-deleted id: the version
+    /// the live record held before removal, and the delete's own claim.
+    #[inline]
+    fn record_tombstone(
+        tombstones: &mut FxHashMap<i64, i32>,
+        id: i64,
+        carried: Option<i32>,
+        meta: &ArenaMeta,
+    ) {
+        let highest = match (carried, meta.version_claim()) {
+            (Some(a), Some(b)) => a.max(b),
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => return,
+        };
+        tombstones
+            .entry(id)
+            .and_modify(|v| *v = (*v).max(highest))
+            .or_insert(highest);
     }
 
     /// Intern a tag key or relation member role, returning its interned ID.
@@ -280,39 +461,18 @@ impl Default for CompactDiffOverlay {
 // Main parser
 // ---------------------------------------------------------------------------
 
-/// Parse a single .osc.gz file into an existing `CompactDiffOverlay`.
+/// Parse a single OSC file into an existing `CompactDiffOverlay`.
+///
+/// Accepts both gzip-compressed (`.osc.gz`) and plain (`.osc`) input -
+/// the format is sniffed from the file's leading bytes, not its name.
 ///
 /// This is the streaming entry point: call it multiple times with the same
-/// overlay to accumulate multiple diff files (later diffs win for conflicts).
+/// overlay to accumulate multiple diff files. Later diffs win for
+/// conflicts, but only when they actually move the object forward: see
+/// [`CompactDiffOverlay::allow_version_regression`].
 pub fn parse_osc_file_into(path: &Path, overlay: &mut CompactDiffOverlay) -> ParseResult<()> {
-    let file = File::open(path)?;
-    let decoder = MultiGzDecoder::new(file);
-    let buf_reader = BufReader::new(decoder);
-    let mut reader = Reader::from_reader(buf_reader);
-    reader.config_mut().trim_text(true);
-
-    let mut state = ParserState::new();
-    let mut buf = Vec::new();
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) => {
-                handle_start_event_compact(e, &mut state, overlay)?;
-            }
-            Ok(Event::Empty(ref e)) => {
-                handle_empty_event_compact(e, &mut state, overlay)?;
-            }
-            Ok(Event::End(ref e)) => {
-                handle_end_event_compact(e, &mut state, overlay)?;
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {} // text, comments, decl, etc.
-            Err(e) => return Err(Box::new(e)),
-        }
-        buf.clear();
-    }
-
-    Ok(())
+    let mut sink = CompactSink::new(overlay);
+    parse_osc_path(path, &mut sink)
 }
 
 /// Parse a single .osc.gz file into a new `CompactDiffOverlay`.
@@ -327,9 +487,12 @@ pub fn parse_osc_file(path: &Path) -> ParseResult<CompactDiffOverlay> {
 // ---------------------------------------------------------------------------
 
 /// Parse the numeric sequence number from an OSC filename.
-/// E.g. "4705.osc.gz" -> stem "4705.osc" -> strip ".osc" -> 4705.
+///
+/// E.g. "4705.osc.gz" -> "4705.osc" -> "4705" -> 4705. Plain "4705.osc"
+/// is accepted too, now that the parser sniffs compression from the
+/// file's bytes rather than trusting its name.
 fn parse_sequence_number(filename: &str) -> Option<u64> {
-    let stem = filename.strip_suffix(".gz")?;
+    let stem = filename.strip_suffix(".gz").unwrap_or(filename);
     let num_str = stem.strip_suffix(".osc")?;
     num_str.parse::<u64>().ok()
 }
@@ -339,20 +502,46 @@ fn parse_sequence_number(filename: &str) -> Option<u64> {
 /// because `parse_osc_file_into` overwrites existing entries.
 pub fn load_all_diffs(diffs_dir: &Path) -> ParseResult<CompactDiffOverlay> {
     let mut entries: Vec<(u64, std::path::PathBuf)> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
 
     for entry in std::fs::read_dir(diffs_dir)? {
         let entry = entry?;
         let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
         let filename = match path.file_name().and_then(|f| f.to_str()) {
             Some(f) => f.to_string(),
             None => continue,
         };
-        if !filename.ends_with(".gz") {
-            continue;
+        match parse_sequence_number(&filename) {
+            Some(seq) => entries.push((seq, path)),
+            None => skipped.push(filename),
         }
-        if let Some(seq) = parse_sequence_number(&filename) {
-            entries.push((seq, path));
+    }
+
+    // Silence was the defect. `parse_sequence_number` accepts exactly
+    // `<digits>.osc.gz`, so a directory of `changes-4705.osc.gz`, plain
+    // `.osc`, or Geofabrik's nested `000/004/705.osc.gz` matched nothing
+    // and this function returned an empty overlay with a cheerful
+    // "Loaded 0 diffs" - the caller then applied no changes at all and
+    // reported success. An empty directory is a legitimate no-op; a
+    // directory full of files none of which matched is an operator
+    // error, and gets said out loud.
+    if entries.is_empty() && !skipped.is_empty() {
+        let mut shown: Vec<&str> = skipped.iter().map(String::as_str).take(5).collect();
+        if skipped.len() > shown.len() {
+            shown.push("...");
         }
+        return Err(format!(
+            "no OSC diffs matched in {}: {} file(s) are present but none is named \
+             `<sequence>.osc.gz`, which is the only naming this loader recognises (saw: {}). \
+             Loading them as zero diffs would apply no changes and report success.",
+            diffs_dir.display(),
+            skipped.len(),
+            shown.join(", ")
+        )
+        .into());
     }
 
     entries.sort_by_key(|(seq, _)| *seq);
@@ -397,6 +586,7 @@ mod tests {
     use crate::read::elements::MemberType;
     use flate2::Compression;
     use flate2::write::GzEncoder;
+    use std::fs::File;
     use std::io::Write;
 
     /// Create a unique temp directory for test isolation.
@@ -780,6 +970,481 @@ mod tests {
     fn test_delete_node_needs_no_coords() -> ParseResult<()> {
         let overlay = parse_single_node("delete_no_coords", "delete", r#"id="7" version="3""#)?;
         assert!(overlay.deleted_nodes.contains(&7));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Input framing: truncation and compression
+    // -----------------------------------------------------------------------
+
+    /// A `.osc.gz` whose gzip member is complete but whose XML stops
+    /// short of `</osmChange>` must be a hard error.
+    ///
+    /// This is the shape that made it dangerous: the gzip layer is
+    /// intact, so `MultiGzDecoder` returns a clean EOF, quick-xml
+    /// reports `Event::Eof`, and every caller treated the partial
+    /// document as the whole change stream. `apply-changes` then wrote a
+    /// partially-applied PBF and reported success. Only the closing tag
+    /// proves the document is whole.
+    #[test]
+    fn test_truncated_osc_is_a_parse_error() {
+        let dir = make_test_dir("truncated");
+        // Deliberately no `</osmChange>` - and note the gzip member IS
+        // properly finished, so nothing below the XML layer can notice.
+        let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                   <osmChange version=\"0.6\">\n  <create>\n    \
+                   <node id=\"1\" lat=\"1.0\" lon=\"2.0\" version=\"1\"/>\n  </create>\n";
+        write_osc_gz(&dir, "cut.osc.gz", xml);
+        let err = parse_osc_file(&dir.join("cut.osc.gz"))
+            .err()
+            .expect("a truncated OSC must not parse as a complete one");
+        let text = err.to_string();
+        assert!(
+            text.contains("closing </osmChange>") && text.contains("truncated"),
+            "error must name the missing closing tag; got: {text}"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// The counterpart that keeps the test above from being satisfied by
+    /// rejecting everything: a whole document still parses, including
+    /// the self-closing empty form `<osmChange version="0.6"/>`, which
+    /// never produces a closing tag at all.
+    #[test]
+    fn test_complete_osc_forms_still_parse() -> ParseResult<()> {
+        let dir = make_test_dir("complete_forms");
+        write_osc_gz(
+            &dir,
+            "whole.osc.gz",
+            "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  <create>\n    \
+             <node id=\"1\" lat=\"1.0\" lon=\"2.0\" version=\"1\"/>\n  \
+             </create>\n</osmChange>",
+        );
+        assert!(parse_osc_file(&dir.join("whole.osc.gz"))?.has_node(1));
+
+        write_osc_gz(
+            &dir,
+            "empty.osc.gz",
+            "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\"/>",
+        );
+        assert!(parse_osc_file(&dir.join("empty.osc.gz"))?.is_empty());
+
+        drop(std::fs::remove_dir_all(&dir));
+        Ok(())
+    }
+
+    /// An uncompressed `.osc` parses. `parse_osc_file_into` used to wrap
+    /// every input in `MultiGzDecoder` unconditionally and fail with a
+    /// raw gzip error, while `merge-changes` sniffed the magic and
+    /// handled both - the same file, two answers.
+    #[test]
+    fn test_uncompressed_osc_is_accepted() -> ParseResult<()> {
+        let dir = make_test_dir("uncompressed");
+        let path = dir.join("plain.osc");
+        std::fs::write(
+            &path,
+            "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  <create>\n    \
+             <node id=\"7\" lat=\"1.0\" lon=\"2.0\" version=\"1\"/>\n  \
+             </create>\n</osmChange>",
+        )?;
+        let overlay = parse_osc_file(&path)?;
+        assert!(overlay.has_node(7));
+        drop(std::fs::remove_dir_all(&dir));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Framing: elements outside a change section
+    // -----------------------------------------------------------------------
+
+    /// An element outside `<create>` / `<modify>` / `<delete>` is
+    /// malformed and refused. The compact parser used to treat it as a
+    /// create and put it in the overlay; `merge-changes` errored on the
+    /// self-closing form and silently dropped the other. Three code
+    /// paths, three answers.
+    #[test]
+    fn test_element_outside_section_is_refused() {
+        let dir = make_test_dir("outside_section");
+        for xml in [
+            "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  \
+             <node id=\"5\" lat=\"1.0\" lon=\"2.0\" version=\"1\"/>\n</osmChange>",
+            "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  \
+             <node id=\"5\" lat=\"1.0\" lon=\"2.0\" version=\"1\">\n    \
+             <tag k=\"a\" v=\"b\"/>\n  </node>\n</osmChange>",
+        ] {
+            write_osc_gz(&dir, "loose.osc.gz", xml);
+            let err = parse_osc_file(&dir.join("loose.osc.gz"))
+                .err()
+                .expect("element outside a section must not parse");
+            let text = err.to_string();
+            assert!(
+                text.contains("outside any <create>") && text.contains("node 5"),
+                "error must name the element and the missing section; got: {text}"
+            );
+        }
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    // -----------------------------------------------------------------------
+    // Metadata leniency: presence, not version-gating
+    // -----------------------------------------------------------------------
+
+    /// An element carrying `timestamp` but no `version` has metadata,
+    /// and every attribute it did carry survives. `version` itself
+    /// stays absent rather than becoming 0.
+    #[test]
+    fn test_metadata_without_version_is_kept() -> ParseResult<()> {
+        let overlay = parse_single_node(
+            "meta_no_version",
+            "create",
+            r#"id="1" lat="1.0" lon="2.0" timestamp="1970-01-02T00:00:00Z" user="m""#,
+        )?;
+        let node = overlay.get_node(1).ok_or("node 1 missing")?;
+        let meta = node
+            .metadata()
+            .ok_or("metadata must survive an absent version")?;
+        assert_eq!(meta.timestamp, 86_400);
+        assert_eq!(meta.user, "m");
+        Ok(())
+    }
+
+    /// A metadata attribute that is present but unparsable is an error,
+    /// not a silent zero. The old parser folded `version="abc"` into
+    /// `version = 0` - the same absent-versus-zero collapse the
+    /// coordinate and `push_info_attrs` fixes had to undo, and now
+    /// load-bearing because the version-regression gate compares these
+    /// numbers.
+    #[test]
+    fn test_unparsable_metadata_is_refused() {
+        for attrs in [
+            r#"id="1" lat="1.0" lon="2.0" version="abc""#,
+            r#"id="1" lat="1.0" lon="2.0" version="""#,
+            r#"id="1" lat="1.0" lon="2.0" version="1" changeset="not-a-number""#,
+            r#"id="1" lat="1.0" lon="2.0" version="1" uid="x""#,
+            r#"id="1" lat="1.0" lon="2.0" version="1" timestamp="yesterday""#,
+        ] {
+            let err = parse_single_node("bad_meta", "create", attrs)
+                .err()
+                .unwrap_or_else(|| panic!("must not accept `{attrs}`"));
+            let text = err.to_string();
+            assert!(
+                text.contains("unparsable value"),
+                "error must name the unparsable metadata value; got: {text}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Version precedence
+    // -----------------------------------------------------------------------
+
+    /// Build a two-file overlay from `(section, attrs)` pairs.
+    fn accumulate(suffix: &str, files: &[(&str, &str)]) -> ParseResult<CompactDiffOverlay> {
+        let dir = make_test_dir(suffix);
+        let mut overlay = CompactDiffOverlay::new();
+        let mut result = Ok(());
+        for (i, (section, attrs)) in files.iter().enumerate() {
+            let name = format!("{i:03}.osc.gz");
+            write_osc_gz(
+                &dir,
+                &name,
+                &format!(
+                    "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  <{section}>\n    \
+                     <node {attrs}/>\n  </{section}>\n</osmChange>"
+                ),
+            );
+            result = parse_osc_file_into(&dir.join(&name), &mut overlay);
+            if result.is_err() {
+                break;
+            }
+        }
+        drop(std::fs::remove_dir_all(&dir));
+        result?;
+        Ok(overlay)
+    }
+
+    /// Applying the same diff twice, or an older one after a newer one,
+    /// used to silently downgrade the object and report success. The
+    /// overlay already stored the version; now it compares it.
+    #[test]
+    fn test_version_regression_is_refused() {
+        for (suffix, files) in [
+            // The same OSC applied twice: equal version, no advance.
+            (
+                "same_twice",
+                [
+                    ("modify", r#"id="1" lat="1.0" lon="2.0" version="7""#),
+                    ("modify", r#"id="1" lat="1.0" lon="2.0" version="7""#),
+                ],
+            ),
+            // Out-of-sequence: an older diff after a newer one.
+            (
+                "backwards",
+                [
+                    ("modify", r#"id="1" lat="1.0" lon="2.0" version="9""#),
+                    ("modify", r#"id="1" lat="3.0" lon="4.0" version="8""#),
+                ],
+            ),
+            // Within a single accumulation, create-then-lower-modify.
+            (
+                "create_then_older",
+                [
+                    ("create", r#"id="1" lat="1.0" lon="2.0" version="4""#),
+                    ("modify", r#"id="1" lat="3.0" lon="4.0" version="2""#),
+                ],
+            ),
+        ] {
+            let err = accumulate(suffix, &files)
+                .err()
+                .unwrap_or_else(|| panic!("{suffix}: version regression must be refused"));
+            let text = err.to_string();
+            assert!(
+                text.contains("does not advance past version"),
+                "{suffix}: error must name the regression; got: {text}"
+            );
+        }
+    }
+
+    /// The counterparts that stop the gate from being satisfied by
+    /// refusing every repeat: a genuine forward step is accepted, and so
+    /// is a repeat where neither side claims a version (no claim, no
+    /// comparison). The opt-out restores the old positional behaviour.
+    #[test]
+    fn test_version_advance_and_unversioned_still_accepted() -> ParseResult<()> {
+        let overlay = accumulate(
+            "forward",
+            &[
+                ("create", r#"id="1" lat="1.0" lon="2.0" version="1""#),
+                ("modify", r#"id="1" lat="3.0" lon="4.0" version="2""#),
+            ],
+        )?;
+        let node = overlay.get_node(1).ok_or("node 1 missing")?;
+        assert_eq!(node.decimicro_lat(), 30_000_000);
+
+        // Neither element claims a version, so there is nothing to
+        // compare and the positional rule stands.
+        let overlay = accumulate(
+            "unversioned",
+            &[
+                ("create", r#"id="1" lat="1.0" lon="2.0""#),
+                ("modify", r#"id="1" lat="3.0" lon="4.0""#),
+            ],
+        )?;
+        let node = overlay.get_node(1).ok_or("node 1 missing")?;
+        assert_eq!(node.decimicro_lat(), 30_000_000);
+
+        // And the escape hatch really is an escape hatch.
+        let dir = make_test_dir("regression_allowed");
+        let mut overlay = CompactDiffOverlay::new();
+        overlay.allow_version_regression(true);
+        for (i, v) in [(0, "9"), (1, "8")] {
+            let name = format!("{i:03}.osc.gz");
+            write_osc_gz(
+                &dir,
+                &name,
+                &format!(
+                    "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  <modify>\n    \
+                     <node id=\"1\" lat=\"5.0\" lon=\"6.0\" version=\"{v}\"/>\n  \
+                     </modify>\n</osmChange>"
+                ),
+            );
+            parse_osc_file_into(&dir.join(&name), &mut overlay)?;
+        }
+        assert!(overlay.has_node(1));
+        drop(std::fs::remove_dir_all(&dir));
+        Ok(())
+    }
+
+    /// Parse one XML document into a fresh overlay. Unlike `accumulate`,
+    /// the caller supplies the whole document, so several actions on the
+    /// same object inside a single OSC are expressible.
+    fn parse_one_xml(suffix: &str, body: &str) -> ParseResult<CompactDiffOverlay> {
+        let dir = make_test_dir(suffix);
+        let xml =
+            format!("<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n{body}\n</osmChange>");
+        write_osc_gz(&dir, "000.osc.gz", &xml);
+        let result = parse_osc_file(&dir.join("000.osc.gz"));
+        drop(std::fs::remove_dir_all(&dir));
+        result
+    }
+
+    /// A delete used to erase the object's version history: it dropped
+    /// the live index entry, which is the only place the gate read a
+    /// stored version from, so the very next stale change found nothing
+    /// to be compared against and resurrected an older version. Delete
+    /// node 1 version 9 then modify node 1 version 8, and version 8
+    /// won - past a gate whose whole purpose is to stop exactly that.
+    ///
+    /// Both shapes the hole reached: several actions inside one OSC,
+    /// and one action per file across an accumulated overlay.
+    #[test]
+    fn test_delete_leaves_a_versioned_tombstone() {
+        // Within one OSC: delete v9, then a stale modify v8.
+        let err = parse_one_xml(
+            "tombstone_one_file",
+            "  <delete>\n    <node id=\"1\" version=\"9\"/>\n  </delete>\n  \
+             <modify>\n    <node id=\"1\" lat=\"1.0\" lon=\"2.0\" version=\"8\"/>\n  </modify>",
+        )
+        .err()
+        .expect("a stale modify after a delete must be refused");
+        assert!(
+            err.to_string().contains("does not advance past version 9"),
+            "error must name the deleted version as the floor; got: {err}"
+        );
+
+        // A stale create is the same hole wearing a different action.
+        let err = parse_one_xml(
+            "tombstone_stale_create",
+            "  <delete>\n    <node id=\"1\" version=\"9\"/>\n  </delete>\n  \
+             <create>\n    <node id=\"1\" lat=\"1.0\" lon=\"2.0\" version=\"9\"/>\n  </create>",
+        )
+        .err()
+        .expect("a stale create after a delete must be refused");
+        assert!(err.to_string().contains("does not advance past version 9"));
+
+        // And a second delete may not walk the version backwards either.
+        let err = parse_one_xml(
+            "tombstone_double_delete",
+            "  <delete>\n    <node id=\"1\" version=\"9\"/>\n    \
+             <node id=\"1\" version=\"8\"/>\n  </delete>",
+        )
+        .err()
+        .expect("a stale delete after a delete must be refused");
+        assert!(err.to_string().contains("does not advance past version 9"));
+
+        // Across files: the multi-file overlay accumulation.
+        let err = accumulate(
+            "tombstone_multi_file",
+            &[
+                ("delete", r#"id="1" version="9""#),
+                ("modify", r#"id="1" lat="1.0" lon="2.0" version="8""#),
+            ],
+        )
+        .err()
+        .expect("a stale modify in a later file must be refused");
+        assert!(err.to_string().contains("does not advance past version 9"));
+
+        // A delete carrying no version of its own still cannot erase the
+        // version the live record held: the tombstone carries it forward.
+        let err = parse_one_xml(
+            "tombstone_carries_live_version",
+            "  <create>\n    <node id=\"1\" lat=\"1.0\" lon=\"2.0\" version=\"9\"/>\n  \
+             </create>\n  <delete>\n    <node id=\"1\"/>\n  </delete>\n  \
+             <modify>\n    <node id=\"1\" lat=\"3.0\" lon=\"4.0\" version=\"9\"/>\n  </modify>",
+        )
+        .err()
+        .expect("an unversioned delete must not discard the live version");
+        assert!(err.to_string().contains("does not advance past version 9"));
+    }
+
+    /// The counterparts, so the tombstone is not satisfied by refusing
+    /// every post-delete change: a genuine undelete that advances the
+    /// version is accepted, an unversioned pair is still positional, and
+    /// the escape hatch still escapes.
+    #[test]
+    fn test_delete_then_forward_change_is_accepted() -> ParseResult<()> {
+        let overlay = parse_one_xml(
+            "tombstone_forward",
+            "  <delete>\n    <node id=\"1\" version=\"9\"/>\n  </delete>\n  \
+             <create>\n    <node id=\"1\" lat=\"1.0\" lon=\"2.0\" version=\"10\"/>\n  </create>",
+        )?;
+        assert!(overlay.has_node(1), "the undelete must be live again");
+        assert!(!overlay.deleted_nodes.contains(&1));
+
+        let overlay = parse_one_xml(
+            "tombstone_unversioned",
+            "  <delete>\n    <node id=\"1\"/>\n  </delete>\n  \
+             <modify>\n    <node id=\"1\" lat=\"3.0\" lon=\"4.0\"/>\n  </modify>",
+        )?;
+        assert!(overlay.has_node(1), "no claim on either side, no gate");
+
+        let dir = make_test_dir("tombstone_allowed");
+        let mut overlay = CompactDiffOverlay::new();
+        overlay.allow_version_regression(true);
+        write_osc_gz(
+            &dir,
+            "000.osc.gz",
+            "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  <delete>\n    \
+             <node id=\"1\" version=\"9\"/>\n  </delete>\n  <modify>\n    \
+             <node id=\"1\" lat=\"3.0\" lon=\"4.0\" version=\"8\"/>\n  \
+             </modify>\n</osmChange>",
+        );
+        let result = parse_osc_file_into(&dir.join("000.osc.gz"), &mut overlay);
+        drop(std::fs::remove_dir_all(&dir));
+        result?;
+        assert!(overlay.has_node(1));
+        Ok(())
+    }
+
+    /// Ways and relations get the same tombstone, not just nodes: the
+    /// hole was one line per kind, and a node-only test would have let
+    /// two thirds of it survive.
+    #[test]
+    fn test_delete_tombstone_covers_ways_and_relations() {
+        for (suffix, body) in [
+            (
+                "tombstone_way",
+                "  <delete>\n    <way id=\"5\" version=\"4\"/>\n  </delete>\n  \
+                 <modify>\n    <way id=\"5\" version=\"3\"><nd ref=\"1\"/></way>\n  </modify>",
+            ),
+            (
+                "tombstone_relation",
+                "  <delete>\n    <relation id=\"6\" version=\"4\"/>\n  </delete>\n  \
+                 <modify>\n    <relation id=\"6\" version=\"3\">\
+                 <member type=\"node\" ref=\"1\" role=\"\"/></relation>\n  </modify>",
+            ),
+        ] {
+            let err = parse_one_xml(suffix, body)
+                .err()
+                .unwrap_or_else(|| panic!("{suffix}: stale change after delete must be refused"));
+            assert!(
+                err.to_string().contains("does not advance past version 4"),
+                "{suffix}: error must name the deleted version; got: {err}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // load_all_diffs
+    // -----------------------------------------------------------------------
+
+    /// A directory whose files are all named something this loader does
+    /// not recognise is an operator error, not zero diffs. It used to
+    /// return an empty overlay and print "Loaded 0 diffs", after which
+    /// the caller applied nothing and reported success.
+    #[test]
+    fn test_load_all_diffs_errors_when_nothing_matched() {
+        let dir = make_test_dir("no_match");
+        let xml = "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\"/>";
+        write_osc_gz(&dir, "changes-4705.osc.gz", xml);
+        write_osc_gz(&dir, "planet-latest.osc.gz", xml);
+        let err = load_all_diffs(&dir)
+            .err()
+            .expect("a directory of unmatched files must not load as zero diffs");
+        let text = err.to_string();
+        assert!(
+            text.contains("none is named") && text.contains("changes-4705.osc.gz"),
+            "error must name what was skipped; got: {text}"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// The counterparts: a genuinely empty directory is a legitimate
+    /// no-op, and a plain `.osc` now counts as a match because the
+    /// parser sniffs compression from the bytes rather than the name.
+    #[test]
+    fn test_load_all_diffs_empty_dir_and_plain_osc() -> ParseResult<()> {
+        let dir = make_test_dir("empty_dir");
+        assert!(load_all_diffs(&dir)?.is_empty());
+
+        std::fs::write(
+            dir.join("4705.osc"),
+            "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  <create>\n    \
+             <node id=\"3\" lat=\"1.0\" lon=\"2.0\" version=\"1\"/>\n  \
+             </create>\n</osmChange>",
+        )?;
+        assert!(load_all_diffs(&dir)?.has_node(3));
+        drop(std::fs::remove_dir_all(&dir));
         Ok(())
     }
 

@@ -526,6 +526,7 @@ pbfhogg apply-changes [OPTIONS] --output <OUTPUT> <BASE> <CHANGES>
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--io-uring` | Use io_uring for output I/O |
 | `--force` | Proceed even if input lacks indexdata |
+| `--allow-version-regression` | Accept a change whose `version` does not advance past the version already held for that object. Off by default: applying the same OSC twice, or feeding diffs out of sequence order, is refused rather than silently downgrading objects to an older state. A delete leaves a versioned tombstone, so a stale change after a delete is refused too. Elements that claim no `version` are unaffected |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
@@ -541,6 +542,7 @@ pbfhogg merge-changes [OPTIONS] --output <OUTPUT> <CHANGES>...
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `--simplify` | Keep only the last change per object (type + id) |
+| `--allow-version-regression` | Only meaningful with `--simplify`, the mode that resolves conflicts. Accepts a later change whose `version` does not advance past one seen earlier in input order. Off by default, so listing the input files out of sequence order is an error rather than a silent downgrade |
 | `-j, --jobs <N>` | Parallel worker threads. `1` forces sequential, `0` (default) auto-picks from `available_parallelism()`, higher values cap the worker pool. Affects both the per-input parse fan-out and the simplify path's chunk fan-out |
 
 ### build-geocode-index

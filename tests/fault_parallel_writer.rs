@@ -99,6 +99,7 @@ mod parallel_writer {
                     force: true,
                     locations_on_ways: false,
                     jobs: Some(2),
+                    allow_version_regression: false,
                     panic_at_blob_seq: None,
                 },
                 &pbfhogg::HeaderOverrides::default(),

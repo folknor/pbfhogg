@@ -1,96 +1,64 @@
 # Bug hunt: change stream (`src/osc/`, apply-changes, merge-changes, diff, time-filter)
 
-Hunt date 2026-08-12. Single Opus hunter. Findings only, unverified. Ranked by
-severity as the hunter ranked them.
+Hunt date 2026-08-12. Single Opus hunter. Two fix rounds applied plus a
+close pass on 2026-08-20; what remains below was left open deliberately,
+with the reason stated. Everything else is fixed and removed from this
+file - `git log` has the history.
 
-## `time-filter` silently no-ops on metadata-stripped input
+## Resource shape: arena garbage in `CompactDiffOverlay`
 
-Where: `src/commands/time_filter/mod.rs::dense_timestamp` / `node_timestamp` /
-etc., all `unwrap_or(0)`.
+Every `push_node` / `push_way` / `push_relation` appends a fresh record and
+orphans the previous one; the index is overwritten but the bytes are never
+reclaimed. Accumulating N OSCs that repeatedly touch the same objects grows
+the arena by the sum of all versions, not the live set.
 
-An element with no `Info` gets timestamp 0, which is `<= cutoff` for every
-plausible cutoff, so `snapshot_gate` keeps it and counts it in
-`versions_before_cutoff`. A PBF written without metadata (common: osmium
-`--drop-metadata`, and several pbfhogg paths) therefore produces "time-filter
-succeeded, N elements written" with zero filtering applied. The command should
-detect absent timestamps and either error or report them distinctly rather than
-folding them into "before cutoff". Same issue in the history path: a versionless
-element becomes the selected "latest <= cutoff".
+**Left open deliberately.** The version-regression gate added in round 2
+takes most of the pressure off: the accumulation pattern that produced the
+worst garbage - the same objects touched over and over by out-of-order or
+repeated diffs - is now refused outright, so the remaining growth is bounded
+by genuine forward version churn across a catch-up range. Reclaiming the
+orphaned bytes means either compaction or a free list threaded through the
+arena, both of which touch the offset-width work landed in round 1
+(`388eb4b3`) and neither of which can be justified without a planet-scale
+`load_all_diffs` measurement showing the arena is actually the ceiling. Do
+that measurement first.
 
-Confidence: medium-high.
+## Resource shape: `merge-changes --simplify` is fully in-memory
 
-## Two divergent OSC parsers, and the doc comment about them is false
+`build_simplify_stream` materialises every `Change` (owned `String` tags,
+refs, members) for all inputs before dedupe. The code's own comment cites
+26.3 M changes at planet 7-OSC. Since the dedupe key is `(u8, i64)` and only
+the last change per object survives, a two-pass shape - scan for
+last-occurrence offsets, then re-parse and emit - would cut peak RSS by
+roughly the whole stream.
 
-`src/osc/xml_parse.rs::parse_meta_attrs` sets `META_FLAG_PRESENT` when any
-metadata attribute is seen, and its doc says this mirrors
-`merge_changes::parse_metadata`'s leniency. It does not:
-`src/commands/merge_changes/mod.rs::parse_metadata` starts with `let version =
-parse_i32_attr_optional(e, b"version")?;` and returns `None` - dropping
-timestamp, changeset, uid, user and visible - for any element lacking `version`.
-So the same input file yields different metadata depending on which command reads
-it, and `merge-changes` silently strips metadata that `apply-changes` preserves.
+**Left open deliberately.** This is a genuine rewrite, not a tweak, and per
+AGENTS.md it needs an interleaved matched A/B at planet scale to justify
+itself rather than an asserted improvement. Round 2 was a correctness round
+and did not have a measurement budget. Note that the two-pass shape now has
+to preserve the version-precedence gate, which currently runs during the
+single dedupe pass and would move into pass one.
 
-More broadly: there are two full hand-rolled quick-xml OSC state machines
-(`osc/xml_parse.rs` and `merge_changes/mod.rs::handle_start_like` /
-`handle_start_like_streaming` - the latter itself duplicated twice with only the
-sink differing). They disagree on metadata leniency, on unknown member types
-(`osc/xml_parse.rs` errors; `merge_changes` errors; but `MemberType::Unknown` is
-representable and silently truncated elsewhere), and on input framing (see the
-gzip finding below). This should be one parser with a sink trait. Pre-1.0, just
-do it.
+## Absent-versus-zero survives in the PBF metadata representation
 
-Confidence: high.
+Found while unifying the OSC parsers in round 2, outside the original hunt.
 
-## `apply-changes` cannot read an uncompressed `.osc`
+`osc::compact::ArenaMeta` and `write::block_builder::Metadata` have no
+per-field presence bit. An OSC element carrying `version="4"` and nothing
+else is written to the PBF with `uid = 0`, `changeset = 0` and
+`timestamp = 0` - real values, indistinguishable from a genuine user 0 or a
+genuine epoch timestamp. This is the same collapse already fixed for
+coordinates, for `push_info_attrs`, and (in round 2) for OSC `version`; it
+survives here because absence and zero share one representation all the way
+through the PBF write path.
 
-`src/osc/parse.rs::parse_osc_file_into` wraps the file in `MultiGzDecoder`
-unconditionally. `merge_changes::parse_osc_into` sniffs the `1f 8b` magic and
-handles both. Feeding a plain `.osc` to apply-changes fails with a raw gzip error
-rather than working (or saying something useful). Lift the magic sniff into the
-shared parser.
+`tests/cli_apply_changes.rs::merge_metadata_preservation` currently pins
+this behaviour. It has been re-documented so that it records the collapse
+rather than endorsing it, and its assertion message says what must change -
+but until the representation gains presence bits, a test does assert the
+bug.
 
-Confidence: high, easy.
-
-## `load_all_diffs` silently loads nothing
-
-`src/osc/parse.rs::parse_sequence_number` requires exactly `<digits>.osc.gz`. Any
-other naming (`.osc`, `changes-4705.osc.gz`, Geofabrik's
-`000/004/705.osc.gz`) is skipped without a word, and the function returns an
-empty overlay with a cheerful "Loaded 0 diffs" summary. It should error on a
-directory where files were present but none matched.
-
-Confidence: medium, low severity.
-
-## Design-level: no version precedence anywhere in the change stream
-
-Neither `CompactDiffOverlay` (later `parse_osc_file_into` call wins) nor
-`merge-changes --simplify` (`BTreeMap::insert` in input order wins) ever consults
-`version`. Precedence is purely positional. Consequences: `load_all_diffs` on a
-directory with a gap or an out-of-order sequence silently produces a wrong
-overlay; `merge-changes` with inputs listed out of order silently regresses
-objects to older versions; applying the same OSC twice, or an older one after a
-newer one, silently downgrades the PBF. This is arguably osmium-parity, but it is
-undefended - there is not even a warning when an incoming change carries a
-version <= the one it replaces. Given the overlay already stores
-`ArenaMeta.version`, a "reject/warn on version regression" gate is cheap and
-would catch the whole class of operator errors that `brokkr`'s `--osc-range`
-makes easy to commit.
-
-## Resource shape
-
-- Arena garbage: every `push_node/way/relation` appends a fresh record and
-  orphans the previous one; the index is overwritten but the bytes are never
-  reclaimed. Accumulating N OSCs that repeatedly touch the same objects grows the
-  arena by the sum of all versions, not the live set - and interacts directly
-  with the 4 GiB cliff above.
-- `merge-changes --simplify` is fully in-memory: `build_simplify_stream`
-  materialises every `Change` (owned `String` tags, refs, members) for all inputs
-  before dedupe. The code's own comment cites 26.3 M changes at planet 7-OSC.
-  Since the dedupe key is `(u8, i64)` and only the last change per object
-  survives, a two-pass shape (scan for last-occurrence offsets, then re-parse and
-  emit) would cut peak RSS by roughly the whole stream. Worth a rewrite, not a
-  tweak.
-- Truncated `.osc.gz` at a gzip member boundary: `MultiGzDecoder` returns clean
-  EOF, quick-xml returns `Eof`, and apply-changes happily writes a partially-
-  applied PBF. Mid-member truncation does error. A trailing `</osmChange>` check
-  in the parser would close this.
+**Left open deliberately.** The fix is per-field presence in both types plus
+`Option`-shaped fields through `BlockBuilder`, which is a PBF-write-path
+change rather than a change-stream one, and is wide enough to deserve its
+own round.

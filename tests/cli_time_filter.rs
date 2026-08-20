@@ -284,6 +284,68 @@ fn write_history_input(path: &Path) {
     writer.flush().expect("flush");
 }
 
+// ---------------------------------------------------------------------------
+// Metadata-stripped input
+// ---------------------------------------------------------------------------
+
+/// Write a sorted snapshot PBF whose elements carry NO metadata at all -
+/// what `osmium --drop-metadata` and several pbfhogg write paths
+/// produce.
+fn write_metadata_stripped_input(path: &Path) {
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .sorted()
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+    bb.add_node(1, 10, 10, [("name", "a")], None);
+    bb.add_node(2, 20, 20, [("name", "b")], None);
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+    writer.flush().expect("flush");
+}
+
+/// `time-filter` must refuse an input whose elements carry no
+/// timestamps rather than silently filtering nothing.
+///
+/// Every timestamp accessor used to end in `unwrap_or(0)`. Zero is at or
+/// below every plausible cutoff, so `snapshot_gate` kept every element
+/// and counted it in `versions_before_cutoff` - and the command printed
+/// "N versions scanned, N <= cutoff, N elements written" having applied
+/// no filtering whatsoever. Success plus a full copy of the input is the
+/// worst possible failure mode here, because nothing downstream can tell
+/// it apart from a cutoff that genuinely kept everything.
+#[test]
+fn time_filter_refuses_metadata_stripped_input() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("stripped.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    write_metadata_stripped_input(&input);
+
+    let out = CliInvoker::new()
+        .arg("time-filter")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("250")
+        .assert_failure();
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("carries no timestamp"),
+        "error must name the missing timestamp; stderr:\n{stderr}"
+    );
+    // Naming the element is what makes the error actionable.
+    assert!(
+        stderr.contains("node 1"),
+        "error must name the offending element; stderr:\n{stderr}"
+    );
+}
+
 fn snapshot_meta(version: i32, timestamp: i64, visible: bool) -> Metadata<'static> {
     Metadata {
         version,

@@ -3,19 +3,14 @@
 //! Default mode preserves the full change stream in input order.
 //! `--simplify` keeps only the last change per object (type + id).
 
-use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{self, BufReader, Seek, Write};
+use std::io::{self, Write};
 use std::path::Path;
-use std::rc::Rc;
-use std::time::{Duration, Instant};
 
-use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
+use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, Event};
-use quick_xml::name::QName;
-use quick_xml::{Reader, Writer};
 use rayon::prelude::*;
 
 use super::Result;
@@ -24,35 +19,13 @@ use crate::osc::write::{
     OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay, write_delete_xml,
     write_node_xml, write_relation_xml, write_way_xml,
 };
+use crate::osc::xml_parse::{
+    ElemKind, OscAction, OscSink, coord_to_decimicro, parse_i64_attr, parse_member_type,
+    parse_osc_path, parse_owned_metadata, parse_str_attr, parse_str_attr_optional,
+};
 
-/// Wraps an `io::Read` and accumulates wall time spent in `read()` calls.
-///
-/// Used to attribute the gzip-decompress portion of `parse_osc_streaming`
-/// and `parse_osc_into` separately from the surrounding `quick_xml` parse
-/// machinery via the `merge_changes_decompress_ns` sidecar counter. The
-/// shared `Rc<Cell<Duration>>` lets the wrapped reader live behind a
-/// `Box<dyn io::Read>` while the outer parse function still recovers the
-/// total at end-of-call.
-struct TimedRead<R: io::Read> {
-    inner: R,
-    total: Rc<Cell<Duration>>,
-}
-
-impl<R: io::Read> io::Read for TimedRead<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let start = Instant::now();
-        let result = self.inner.read(buf);
-        self.total.set(self.total.get() + start.elapsed());
-        result
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Action {
-    Create,
-    Modify,
-    Delete,
-}
+/// `merge-changes` speaks the same three actions as the shared parser.
+type Action = OscAction;
 
 #[derive(Clone, Debug)]
 enum ChangeElement {
@@ -107,32 +80,6 @@ impl MergeChangesStats {
             eprintln!("Merged {} files: {} changes", self.files, self.changes_out);
         }
     }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Section {
-    None,
-    Create,
-    Modify,
-    Delete,
-}
-
-impl Section {
-    fn as_action(self) -> Option<Action> {
-        match self {
-            Self::Create => Some(Action::Create),
-            Self::Modify => Some(Action::Modify),
-            Self::Delete => Some(Action::Delete),
-            Self::None => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ElemKind {
-    Node,
-    Way,
-    Relation,
 }
 
 struct CurrentElem {
@@ -191,6 +138,7 @@ pub fn merge_changes(
     output: &Path,
     simplify: bool,
     jobs: Option<usize>,
+    allow_version_regression: bool,
 ) -> Result<MergeChangesStats> {
     if inputs.is_empty() {
         return Err("at least one input OSC file is required".into());
@@ -234,24 +182,68 @@ pub fn merge_changes(
     // The closure converts errors to String so it is Send across the
     // pool.install boundary; the project's `BoxResult` wraps a non-Send
     // `Box<dyn Error>` which `rayon::ThreadPool::install` cannot bridge.
-    let do_work = || -> std::result::Result<(u64, u64), String> {
+    let do_work = |write_path: &Path| -> std::result::Result<(u64, u64), String> {
         if simplify {
             let stream = build_simplify_stream(inputs)?;
             let changes_in = stream.changes.len() as u64;
             let changes_out =
-                write_simplified(output, stream, worker_count).map_err(|e| e.to_string())? as u64;
+                write_simplified(write_path, stream, worker_count, allow_version_regression)
+                    .map_err(|e| e.to_string())? as u64;
             Ok((changes_in, changes_out))
         } else {
-            let changes_out = write_streaming(inputs, output).map_err(|e| e.to_string())?;
+            let changes_out = write_streaming(inputs, write_path).map_err(|e| e.to_string())?;
             Ok((changes_out, changes_out))
         }
     };
 
-    let (changes_in, changes_out) = match &pool {
-        Some(p) => p.install(do_work),
-        None => do_work(),
-    }
-    .map_err(|s| -> Box<dyn std::error::Error> { s.into() })?;
+    let (changes_in, changes_out) = {
+        // Failure hygiene for the library entry point.
+        //
+        // `write_streaming`'s single-input path creates the destination and
+        // streams XML into it while parsing, so a truncated input - a
+        // missing closing `osmChange`, an I/O error halfway - used to leave
+        // the destination holding a partial document. Under the CLI that is
+        // already harmless: `guarded_output` hands this function a scratch
+        // sibling that does not exist yet and removes it on failure. A
+        // library caller has no such front end.
+        //
+        // So the guard chosen here depends on what is at the destination,
+        // which also keeps it from duplicating the CLI's work:
+        //
+        //   - destination absent (every CLI call, since the scratch path is
+        //     fresh): a plain `PathGuard` deletes the file this call
+        //     created if the call fails. No second scratch, no second
+        //     rename.
+        //   - destination present (a library caller overwriting a real
+        //     file): route the writes through an `OutputFile` scratch
+        //     sibling so the existing file is untouched until success.
+        let existing = output.exists();
+        let scratch = if existing {
+            Some(crate::path_guard::OutputFile::new(output)?)
+        } else {
+            None
+        };
+        let write_path: &Path = scratch.as_ref().map_or(output, |s| s.path());
+        let created = if existing {
+            None
+        } else {
+            Some(crate::path_guard::PathGuard::file(output.to_path_buf()))
+        };
+
+        let result = match &pool {
+            Some(p) => p.install(|| do_work(write_path)),
+            None => do_work(write_path),
+        }
+        .map_err(|s| -> Box<dyn std::error::Error> { s.into() })?;
+
+        if let Some(scratch) = scratch {
+            scratch.commit()?;
+        }
+        if let Some(created) = created {
+            drop(created.commit());
+        }
+        result
+    };
 
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("merge_changes_changes_out", changes_out as i64);
@@ -341,231 +333,144 @@ fn parse_one_into_stream(path: &Path, stream: &mut ChangeStream) -> Result<()> {
     result
 }
 
+// ---------------------------------------------------------------------------
+// The owned-element sink
+//
+// There used to be two copies of this state machine - `handle_start_like`
+// and `handle_start_like_streaming` - identical apart from whether the
+// finished element went into a `ChangeStream` or straight out through an
+// `OscWriter`, and both differed from the compact overlay's machine in
+// ways nobody intended. The framing now lives in
+// `osc::xml_parse::drive_osc`; the destination is the only thing that
+// varies, and it varies behind this one trait.
+// ---------------------------------------------------------------------------
+
+/// Where a finished change goes.
+trait ChangeDest {
+    fn accept(&mut self, change: Change) -> Result<()>;
+}
+
+struct StreamDest<'a> {
+    stream: &'a mut ChangeStream,
+}
+
+impl ChangeDest for StreamDest<'_> {
+    fn accept(&mut self, change: Change) -> Result<()> {
+        self.stream.push(change.action, change.element);
+        Ok(())
+    }
+}
+
+struct WriterDest<'a, W: io::Write> {
+    writer: &'a mut OscWriter<W>,
+    open_action: &'a mut Option<Action>,
+    count: &'a mut u64,
+}
+
+impl<W: io::Write> ChangeDest for WriterDest<'_, W> {
+    fn accept(&mut self, change: Change) -> Result<()> {
+        emit_change(self.writer, self.open_action, &change)?;
+        *self.count += 1;
+        Ok(())
+    }
+}
+
+struct OwnedSink<D: ChangeDest> {
+    dest: D,
+    action: Action,
+    current: Option<CurrentElem>,
+}
+
+impl<D: ChangeDest> OwnedSink<D> {
+    fn new(dest: D) -> Self {
+        Self {
+            dest,
+            action: Action::Create,
+            current: None,
+        }
+    }
+}
+
+impl<D: ChangeDest> OscSink for OwnedSink<D> {
+    fn begin_element(
+        &mut self,
+        action: Action,
+        kind: ElemKind,
+        e: &BytesStart<'_>,
+    ) -> crate::BoxResult<()> {
+        let id = parse_i64_attr(e, b"id")?;
+        let metadata = parse_owned_metadata(e)?;
+        let mut elem = CurrentElem::new(kind, id, metadata);
+
+        // Coordinates are required of a created or modified node and
+        // meaningless on a delete. This used to be
+        // `parse_f64_attr_optional(...).unwrap_or(0.0)` followed by a
+        // saturating `as i32`, which put a coordinate-less node at 0/0 in
+        // the Gulf of Guinea and clamped `lat="1e30"` to `i32::MAX`.
+        // Same rule as the overlay parser now, because it is the same
+        // function.
+        if kind == ElemKind::Node && action != Action::Delete {
+            elem.decimicro_lat = coord_to_decimicro(e, b"lat", id)?;
+            elem.decimicro_lon = coord_to_decimicro(e, b"lon", id)?;
+        }
+
+        self.action = action;
+        self.current = Some(elem);
+        Ok(())
+    }
+
+    fn tag(&mut self, e: &BytesStart<'_>) -> crate::BoxResult<()> {
+        if let Some(cur) = self.current.as_mut() {
+            let k = parse_str_attr(e, b"k")?;
+            let v = parse_str_attr(e, b"v")?;
+            cur.tags.push((k, v));
+        }
+        Ok(())
+    }
+
+    fn nd(&mut self, e: &BytesStart<'_>) -> crate::BoxResult<()> {
+        let rf = parse_i64_attr(e, b"ref")?;
+        if let Some(cur) = self.current.as_mut() {
+            cur.refs.push(rf);
+        }
+        Ok(())
+    }
+
+    fn member(&mut self, e: &BytesStart<'_>) -> crate::BoxResult<()> {
+        let ref_id = parse_i64_attr(e, b"ref")?;
+        let role = parse_str_attr_optional(e, b"role").unwrap_or_default();
+        let member_id = match parse_member_type(&parse_str_attr(e, b"type")?)? {
+            crate::MemberType::Node => MemberId::Node(ref_id),
+            crate::MemberType::Way => MemberId::Way(ref_id),
+            crate::MemberType::Relation => MemberId::Relation(ref_id),
+            crate::MemberType::Unknown(v) => {
+                return Err(format!("unknown relation member type value '{v}'").into());
+            }
+        };
+        if let Some(cur) = self.current.as_mut() {
+            cur.members.push(OwnedMember {
+                id: member_id,
+                role,
+            });
+        }
+        Ok(())
+    }
+
+    fn end_element(&mut self) -> crate::BoxResult<()> {
+        let Some(elem) = self.current.take() else {
+            return Ok(());
+        };
+        self.dest.accept(Change {
+            action: self.action,
+            element: elem.into_change_element(),
+        })
+    }
+}
+
 #[hotpath::measure]
 fn parse_osc_into(path: &Path, stream: &mut ChangeStream) -> Result<()> {
-    let mut file = File::open(path)?;
-    let mut magic = [0u8; 2];
-    io::Read::read_exact(&mut file, &mut magic)?;
-    file.seek(io::SeekFrom::Start(0))?;
-
-    let decompress_total = Rc::new(Cell::new(Duration::ZERO));
-    let reader: Reader<BufReader<Box<dyn io::Read>>> = if magic == [0x1f, 0x8b] {
-        let timed = TimedRead {
-            inner: MultiGzDecoder::new(file),
-            total: Rc::clone(&decompress_total),
-        };
-        Reader::from_reader(BufReader::new(Box::new(timed)))
-    } else {
-        let timed = TimedRead {
-            inner: file,
-            total: Rc::clone(&decompress_total),
-        };
-        Reader::from_reader(BufReader::new(Box::new(timed)))
-    };
-    let mut reader = reader;
-    reader.config_mut().trim_text(true);
-
-    let mut section = Section::None;
-    let mut current: Option<CurrentElem> = None;
-    let mut buf = Vec::new();
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) => {
-                handle_start_like(e, false, &mut section, &mut current, stream)?;
-            }
-            Ok(Event::Empty(ref e)) => {
-                handle_start_like(e, true, &mut section, &mut current, stream)?;
-            }
-            Ok(Event::End(ref e)) => match e.name().as_ref() {
-                b"create" | b"modify" | b"delete" => section = Section::None,
-                b"node" | b"way" | b"relation" => {
-                    finalize_current(section, &mut current, stream);
-                }
-                _ => {}
-            },
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(e) => return Err(Box::new(e)),
-        }
-        buf.clear();
-    }
-
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    crate::debug::emit_counter(
-        "merge_changes_decompress_ns",
-        decompress_total.get().as_nanos() as i64,
-    );
-    Ok(())
-}
-
-fn handle_start_like(
-    e: &BytesStart<'_>,
-    is_empty: bool,
-    section: &mut Section,
-    current: &mut Option<CurrentElem>,
-    stream: &mut ChangeStream,
-) -> Result<()> {
-    match e.name().as_ref() {
-        b"create" => *section = Section::Create,
-        b"modify" => *section = Section::Modify,
-        b"delete" => *section = Section::Delete,
-        b"node" | b"way" | b"relation" => {
-            let kind = match e.name().as_ref() {
-                b"node" => ElemKind::Node,
-                b"way" => ElemKind::Way,
-                _ => ElemKind::Relation,
-            };
-            let id = parse_i64_attr(e, b"id")?;
-            let metadata = parse_metadata(e);
-            let mut elem = CurrentElem::new(kind, id, metadata);
-
-            if kind == ElemKind::Node {
-                let lat = parse_f64_attr_optional(e, b"lat").unwrap_or(0.0);
-                let lon = parse_f64_attr_optional(e, b"lon").unwrap_or(0.0);
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    elem.decimicro_lat = (lat * 1e7).round() as i32;
-                    elem.decimicro_lon = (lon * 1e7).round() as i32;
-                }
-            }
-
-            if is_empty || *section == Section::Delete {
-                let action = section
-                    .as_action()
-                    .ok_or_else(|| "element outside create/modify/delete section".to_string())?;
-                stream.push(action, elem.into_change_element());
-            } else {
-                *current = Some(elem);
-            }
-        }
-        b"tag" => {
-            if let Some(cur) = current {
-                let k = parse_str_attr(e, b"k")?;
-                let v = parse_str_attr(e, b"v")?;
-                cur.tags.push((k, v));
-            }
-        }
-        b"nd" => {
-            if let Some(cur) = current
-                && cur.kind == ElemKind::Way
-            {
-                let rf = parse_i64_attr(e, b"ref")?;
-                cur.refs.push(rf);
-            }
-        }
-        b"member" => {
-            if let Some(cur) = current
-                && cur.kind == ElemKind::Relation
-            {
-                let ref_id = parse_i64_attr(e, b"ref")?;
-                let role = parse_str_attr_optional(e, b"role").unwrap_or_default();
-                let member_id = match parse_str_attr(e, b"type")?.as_str() {
-                    "node" => MemberId::Node(ref_id),
-                    "way" => MemberId::Way(ref_id),
-                    "relation" => MemberId::Relation(ref_id),
-                    other => {
-                        return Err(format!("unknown relation member type '{other}'").into());
-                    }
-                };
-                cur.members.push(OwnedMember {
-                    id: member_id,
-                    role,
-                });
-            }
-        }
-        _ => {}
-    }
-
-    if is_empty {
-        match e.name().as_ref() {
-            b"create" | b"modify" | b"delete" => *section = Section::None,
-            _ => {}
-        }
-    }
-
-    Ok(())
-}
-
-fn finalize_current(
-    section: Section,
-    current: &mut Option<CurrentElem>,
-    stream: &mut ChangeStream,
-) {
-    let Some(elem) = current.take() else {
-        return;
-    };
-    if let Some(action) = section.as_action() {
-        stream.push(action, elem.into_change_element());
-    }
-}
-
-fn parse_i64_attr(e: &BytesStart<'_>, name: &[u8]) -> Result<i64> {
-    for attr in e.attributes() {
-        let attr = attr?;
-        if attr.key == QName(name) {
-            return Ok(std::str::from_utf8(&attr.value)?.parse::<i64>()?);
-        }
-    }
-    Err(format!("missing attribute '{}'", String::from_utf8_lossy(name)).into())
-}
-
-fn parse_metadata(e: &BytesStart<'_>) -> Option<OwnedMetadata> {
-    let version = parse_i32_attr_optional(e, b"version")?;
-    Some(OwnedMetadata {
-        version,
-        timestamp: parse_str_attr_optional(e, b"timestamp").unwrap_or_default(),
-        changeset: parse_str_attr_optional(e, b"changeset").unwrap_or_default(),
-        uid: parse_str_attr_optional(e, b"uid").unwrap_or_default(),
-        user: parse_str_attr_optional(e, b"user").unwrap_or_default(),
-        visible: parse_str_attr_optional(e, b"visible").unwrap_or_default(),
-    })
-}
-
-fn parse_i32_attr_optional(e: &BytesStart<'_>, name: &[u8]) -> Option<i32> {
-    for attr in e.attributes().flatten() {
-        if attr.key == QName(name) {
-            let text = std::str::from_utf8(&attr.value).ok()?;
-            let parsed = text.parse::<i32>().ok()?;
-            return Some(parsed);
-        }
-    }
-    None
-}
-
-fn parse_f64_attr_optional(e: &BytesStart<'_>, name: &[u8]) -> Option<f64> {
-    for attr in e.attributes().flatten() {
-        if attr.key == QName(name) {
-            let text = std::str::from_utf8(&attr.value).ok()?;
-            let parsed = text.parse::<f64>().ok()?;
-            return Some(parsed);
-        }
-    }
-    None
-}
-
-fn parse_str_attr(e: &BytesStart<'_>, name: &[u8]) -> Result<String> {
-    for attr in e.attributes() {
-        let attr = attr?;
-        if attr.key == QName(name) {
-            return Ok(attr
-                .normalized_value(quick_xml::XmlVersion::Implicit1_0)?
-                .into_owned());
-        }
-    }
-    Err(format!("missing attribute '{}'", String::from_utf8_lossy(name)).into())
-}
-
-fn parse_str_attr_optional(e: &BytesStart<'_>, name: &[u8]) -> Option<String> {
-    for attr in e.attributes().flatten() {
-        if attr.key == QName(name) {
-            return attr
-                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-                .ok()
-                .map(std::borrow::Cow::into_owned);
-        }
-    }
-    None
+    let mut sink = OwnedSink::new(StreamDest { stream });
+    parse_osc_path(path, &mut sink)
 }
 
 enum OscWriter<W: io::Write> {
@@ -788,180 +693,12 @@ fn parse_osc_streaming<W: io::Write>(
     open_action: &mut Option<Action>,
     count: &mut u64,
 ) -> Result<()> {
-    let mut file = File::open(path)?;
-    let mut magic = [0u8; 2];
-    io::Read::read_exact(&mut file, &mut magic)?;
-    file.seek(io::SeekFrom::Start(0))?;
-
-    let decompress_total = Rc::new(Cell::new(Duration::ZERO));
-    let reader: Reader<BufReader<Box<dyn io::Read>>> = if magic == [0x1f, 0x8b] {
-        let timed = TimedRead {
-            inner: MultiGzDecoder::new(file),
-            total: Rc::clone(&decompress_total),
-        };
-        Reader::from_reader(BufReader::new(Box::new(timed)))
-    } else {
-        let timed = TimedRead {
-            inner: file,
-            total: Rc::clone(&decompress_total),
-        };
-        Reader::from_reader(BufReader::new(Box::new(timed)))
-    };
-    let mut reader = reader;
-    reader.config_mut().trim_text(true);
-
-    let mut section = Section::None;
-    let mut current: Option<CurrentElem> = None;
-    let mut buf = Vec::new();
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) => {
-                handle_start_like_streaming(
-                    e,
-                    false,
-                    &mut section,
-                    &mut current,
-                    writer,
-                    open_action,
-                    count,
-                )?;
-            }
-            Ok(Event::Empty(ref e)) => {
-                handle_start_like_streaming(
-                    e,
-                    true,
-                    &mut section,
-                    &mut current,
-                    writer,
-                    open_action,
-                    count,
-                )?;
-            }
-            Ok(Event::End(ref e)) => match e.name().as_ref() {
-                b"create" | b"modify" | b"delete" => section = Section::None,
-                b"node" | b"way" | b"relation" => {
-                    if let Some(elem) = current.take()
-                        && let Some(action) = section.as_action()
-                    {
-                        let change = Change {
-                            action,
-                            element: elem.into_change_element(),
-                        };
-                        emit_change(writer, open_action, &change)?;
-                        *count += 1;
-                    }
-                }
-                _ => {}
-            },
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(e) => return Err(Box::new(e)),
-        }
-        buf.clear();
-    }
-
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    crate::debug::emit_counter(
-        "merge_changes_decompress_ns",
-        decompress_total.get().as_nanos() as i64,
-    );
-    Ok(())
-}
-
-fn handle_start_like_streaming<W: io::Write>(
-    e: &BytesStart<'_>,
-    is_empty: bool,
-    section: &mut Section,
-    current: &mut Option<CurrentElem>,
-    writer: &mut OscWriter<W>,
-    open_action: &mut Option<Action>,
-    count: &mut u64,
-) -> Result<()> {
-    match e.name().as_ref() {
-        b"create" => *section = Section::Create,
-        b"modify" => *section = Section::Modify,
-        b"delete" => *section = Section::Delete,
-        b"node" | b"way" | b"relation" => {
-            let kind = match e.name().as_ref() {
-                b"node" => ElemKind::Node,
-                b"way" => ElemKind::Way,
-                _ => ElemKind::Relation,
-            };
-            let id = parse_i64_attr(e, b"id")?;
-            let metadata = parse_metadata(e);
-            let mut elem = CurrentElem::new(kind, id, metadata);
-
-            if kind == ElemKind::Node {
-                let lat = parse_f64_attr_optional(e, b"lat").unwrap_or(0.0);
-                let lon = parse_f64_attr_optional(e, b"lon").unwrap_or(0.0);
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    elem.decimicro_lat = (lat * 1e7).round() as i32;
-                    elem.decimicro_lon = (lon * 1e7).round() as i32;
-                }
-            }
-
-            if is_empty || *section == Section::Delete {
-                let action = section
-                    .as_action()
-                    .ok_or_else(|| "element outside create/modify/delete section".to_string())?;
-                let change = Change {
-                    action,
-                    element: elem.into_change_element(),
-                };
-                emit_change(writer, open_action, &change)?;
-                *count += 1;
-            } else {
-                *current = Some(elem);
-            }
-        }
-        b"tag" => {
-            if let Some(cur) = current {
-                let k = parse_str_attr(e, b"k")?;
-                let v = parse_str_attr(e, b"v")?;
-                cur.tags.push((k, v));
-            }
-        }
-        b"nd" => {
-            if let Some(cur) = current
-                && cur.kind == ElemKind::Way
-            {
-                let rf = parse_i64_attr(e, b"ref")?;
-                cur.refs.push(rf);
-            }
-        }
-        b"member" => {
-            if let Some(cur) = current
-                && cur.kind == ElemKind::Relation
-            {
-                let ref_id = parse_i64_attr(e, b"ref")?;
-                let role = parse_str_attr_optional(e, b"role").unwrap_or_default();
-                let member_id = match parse_str_attr(e, b"type")?.as_str() {
-                    "node" => MemberId::Node(ref_id),
-                    "way" => MemberId::Way(ref_id),
-                    "relation" => MemberId::Relation(ref_id),
-                    other => {
-                        return Err(format!("unknown relation member type '{other}'").into());
-                    }
-                };
-                cur.members.push(OwnedMember {
-                    id: member_id,
-                    role,
-                });
-            }
-        }
-        _ => {}
-    }
-
-    if is_empty {
-        match e.name().as_ref() {
-            b"create" | b"modify" | b"delete" => *section = Section::None,
-            _ => {}
-        }
-    }
-
-    Ok(())
+    let mut sink = OwnedSink::new(WriterDest {
+        writer,
+        open_action,
+        count,
+    });
+    parse_osc_path(path, &mut sink)
 }
 
 fn emit_change<W: io::Write>(
@@ -979,14 +716,66 @@ fn emit_change<W: io::Write>(
     write_change_to(writer, change)
 }
 
+/// The version an element claims, or `None` when it carried none.
+fn change_version(change: &Change) -> Option<i32> {
+    let meta = match &change.element {
+        ChangeElement::Node(n) => n.metadata.as_ref(),
+        ChangeElement::Way(w) => w.metadata.as_ref(),
+        ChangeElement::Relation(r) => r.metadata.as_ref(),
+    };
+    meta.and_then(|m| m.version)
+}
+
+/// Refuse a `--simplify` dedupe in which the later change does not
+/// advance the object's version.
+///
+/// `--simplify` keeps the last change per `(kind, id)` in **input**
+/// order and never looked at `version`, so listing the inputs out of
+/// sequence order - which `brokkr`'s `--osc-range` makes easy to do by
+/// accident - silently regressed objects to older versions and reported
+/// success. That is data corruption, not a preference, so it is refused
+/// by default. Both sides must claim a version for the comparison to
+/// mean anything.
+fn check_version_advance(previous: &Change, incoming: &Change) -> Result<()> {
+    let (Some(prev), Some(next)) = (change_version(previous), change_version(incoming)) else {
+        return Ok(());
+    };
+    if next > prev {
+        return Ok(());
+    }
+    let (kind, id) = match &incoming.element {
+        ChangeElement::Node(n) => ("node", n.id),
+        ChangeElement::Way(w) => ("way", w.id),
+        ChangeElement::Relation(r) => ("relation", r.id),
+    };
+    Err(format!(
+        "merge-changes --simplify: {kind} {id} appears again with version {next}, which does \
+         not advance past version {prev} seen earlier in the input order. --simplify keeps the \
+         LAST change per object by position, so accepting this would silently downgrade the \
+         object to an older state and report success - the usual cause is listing the input \
+         OSC files out of sequence order. Re-order the inputs, or pass \
+         --allow-version-regression to restore the old positional behaviour."
+    )
+    .into())
+}
+
 #[hotpath::measure]
-fn write_simplified(output: &Path, stream: ChangeStream, worker_count: usize) -> Result<usize> {
+fn write_simplified(
+    output: &Path,
+    stream: ChangeStream,
+    worker_count: usize,
+    allow_version_regression: bool,
+) -> Result<usize> {
     crate::debug::emit_marker("MERGECHANGES_SIMPLIFY_START");
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("merge_changes_changes_in", stream.changes.len() as i64);
     let mut last_by_object: BTreeMap<(u8, i64), Change> = BTreeMap::new();
     for change in stream.changes {
-        last_by_object.insert(change.element.key(), change);
+        let key = change.element.key();
+        if !allow_version_regression && let Some(previous) = last_by_object.get(&key) {
+            check_version_advance(previous, &change)?;
+        }
+        last_by_object.insert(key, change);
     }
 
     let mut creates = Vec::new();
@@ -1069,11 +858,7 @@ fn write_simplified(output: &Path, stream: ChangeStream, worker_count: usize) ->
 }
 
 fn action_tag(action: Action) -> &'static str {
-    match action {
-        Action::Create => "create",
-        Action::Modify => "modify",
-        Action::Delete => "delete",
-    }
+    action.tag()
 }
 
 fn write_change_to<W: io::Write>(writer: &mut OscWriter<W>, change: &Change) -> Result<()> {
@@ -1102,5 +887,125 @@ fn write_change_element<W: Write>(
             ChangeElement::Way(way) => write_way_xml(writer, way),
             ChangeElement::Relation(rel) => write_relation_xml(writer, rel),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        // Inside the repo tree, never the system temp dir: the project
+        // keeps its scratch where the concurrent check sweeps cannot
+        // collide on a pid-only name.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("merge-changes-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_gz(path: &Path, xml: &str) {
+        let file = File::create(path).unwrap();
+        let mut enc = GzEncoder::new(file, flate2::Compression::fast());
+        enc.write_all(xml.as_bytes()).unwrap();
+        enc.finish().unwrap();
+    }
+
+    /// A truncated input - complete gzip member, no closing
+    /// `</osmChange>` - is refused, and the destination the caller named
+    /// must be untouched by the attempt.
+    ///
+    /// The CLI has been safe here since `guarded_output` started handing
+    /// every user-named output a scratch sibling, so this is not
+    /// reachable through the binary. A library caller has no such front
+    /// end: the single-input path creates the destination and streams
+    /// XML into it during the parse, so before this guard a failed merge
+    /// replaced a pre-existing file with a partial document. Tested at
+    /// the library layer because that is the only layer it was ever
+    /// broken at.
+    #[test]
+    fn a_failed_merge_leaves_a_pre_existing_destination_intact() {
+        let dir = scratch("failed-merge");
+        let input = dir.join("cut.osc.gz");
+        let dest = dir.join("out.osc.gz");
+        write_gz(
+            &input,
+            "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  <create>\n    \
+             <node id=\"1\" lat=\"1.0\" lon=\"2.0\" version=\"1\"/>\n  </create>\n",
+        );
+        std::fs::write(&dest, b"precious user data").unwrap();
+
+        let err = merge_changes(&[&input], &dest, false, Some(1), false)
+            .expect_err("a truncated input must be refused");
+        assert!(
+            err.to_string().contains("closing </osmChange>"),
+            "error must name the missing closing tag; got: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"precious user data",
+            "the destination must be byte-identical after a failed merge"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// The same failure against a destination that did not exist must
+    /// not leave a partial file behind either - and must not leave the
+    /// scratch sibling lying around.
+    #[test]
+    fn a_failed_merge_creates_no_partial_destination() {
+        let dir = scratch("partial-merge");
+        let input = dir.join("cut.osc.gz");
+        let dest = dir.join("out.osc.gz");
+        write_gz(
+            &input,
+            "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  <create>\n    \
+             <node id=\"1\" lat=\"1.0\" lon=\"2.0\" version=\"1\"/>\n  </create>\n",
+        );
+
+        merge_changes(&[&input], &dest, false, Some(1), false)
+            .expect_err("a truncated input must be refused");
+        assert!(
+            !dest.exists(),
+            "a failed merge must not leave a partial destination"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n != "cut.osc.gz")
+            .collect();
+        assert!(leftovers.is_empty(), "scratch leaked: {leftovers:?}");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// A successful merge still lands at the path the caller named, with
+    /// the encoding the suffix implies - the counterpart that stops the
+    /// two tests above from being satisfied by never writing anything.
+    #[test]
+    fn a_successful_merge_lands_at_the_named_path() {
+        let dir = scratch("ok-merge");
+        let input = dir.join("in.osc.gz");
+        let dest = dir.join("out.osc.gz");
+        write_gz(
+            &input,
+            "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  <create>\n    \
+             <node id=\"1\" lat=\"1.0\" lon=\"2.0\" version=\"1\"/>\n  \
+             </create>\n</osmChange>",
+        );
+        std::fs::write(&dest, b"stale").unwrap();
+        let stats = merge_changes(&[&input], &dest, false, Some(1), false).unwrap();
+        assert_eq!(stats.changes_out, 1);
+        let bytes = std::fs::read(&dest).unwrap();
+        assert_eq!(
+            &bytes[..2],
+            b"\x1f\x8b",
+            "a .gz destination must still be gzip, so the scratch sibling kept the suffix"
+        );
+        drop(std::fs::remove_dir_all(&dir));
     }
 }

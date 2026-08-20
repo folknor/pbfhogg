@@ -50,7 +50,11 @@ fn push_attribute_escaped<'a>(elem: &mut BytesStart<'a>, key: &'a str, value: &s
 
 #[derive(Clone, Debug)]
 pub(crate) struct OwnedMetadata {
-    pub(crate) version: i32,
+    /// `None` when the source element carried no `version` attribute at
+    /// all. Absent is not zero: emitting `version="0"` for an element
+    /// whose producer never claimed a version invents data, and the
+    /// version-precedence gates compare this field.
+    pub(crate) version: Option<i32>,
     pub(crate) timestamp: String,
     pub(crate) changeset: String,
     pub(crate) uid: String,
@@ -61,7 +65,7 @@ pub(crate) struct OwnedMetadata {
 impl OwnedMetadata {
     pub(crate) fn version_only(version: i32) -> Self {
         Self {
-            version,
+            version: Some(version),
             timestamp: String::new(),
             changeset: String::new(),
             uid: String::new(),
@@ -71,8 +75,10 @@ impl OwnedMetadata {
     }
 
     pub(crate) fn push_attrs(&self, elem: &mut quick_xml::events::BytesStart<'_>) {
-        let v = self.version.to_string();
-        elem.push_attribute(("version", v.as_str()));
+        if let Some(version) = self.version {
+            let v = version.to_string();
+            elem.push_attribute(("version", v.as_str()));
+        }
         if !self.timestamp.is_empty() {
             elem.push_attribute(("timestamp", self.timestamp.as_str()));
         }
@@ -159,7 +165,7 @@ pub(crate) fn relations_equal(a: &OwnedRelation, b: &OwnedRelation) -> bool {
 /// derived change stream silently corrupts referential integrity. This is
 /// the OSC-side twin of the `BlockBuilder` poison flag on the PBF side, and
 /// takes the same answer: refuse to write it.
-fn member_type_str(id: MemberId, relation_id: i64) -> crate::BoxResult<&'static str> {
+pub(crate) fn member_type_str(id: MemberId, relation_id: i64) -> crate::BoxResult<&'static str> {
     match id {
         MemberId::Node(_) => Ok("node"),
         MemberId::Way(_) => Ok("way"),

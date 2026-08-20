@@ -81,6 +81,39 @@ identical content.
 **Rationale:** Content equality is deterministic regardless of metadata completeness.
 It answers "did anything actually change?" rather than "which version is newer?"
 
+## Change stream: version precedence is enforced, not merely positional
+
+**osmium behavior:** `osmium apply-changes` and `osmium merge-changes`
+resolve conflicts positionally - the last change seen for an object wins,
+whatever version it claims. Feeding the same diff twice, or feeding diffs
+out of sequence order, downgrades objects to an older state and exits 0.
+osmium offers no check and no warning.
+
+**pbfhogg behavior:** An incoming change whose `version` is at or below the
+version already held for that object is a hard error naming both versions.
+This applies to `CompactDiffOverlay` accumulation (so `apply-changes` and
+`osc::load_all_diffs`) and to `merge-changes --simplify`. The comparison is
+only made when **both** sides claim a version: an element with no `version`
+attribute makes no claim, and the positional rule stands for it unchanged.
+The default `merge-changes` mode is untouched - it preserves the full
+change stream in input order by design and resolves nothing, so there is
+nothing to regress.
+
+Opt back into osmium's behavior with
+`apply-changes --allow-version-regression`,
+`merge-changes --allow-version-regression`, or
+`CompactDiffOverlay::allow_version_regression(true)`.
+
+**Rationale:** Positional precedence is defensible when the operator
+controls the order, and indefensible as a silent default when they do not.
+Regressing an object to an older version is data corruption that produces a
+plausible-looking output file and a success exit code, so nothing
+downstream can detect it; the overlay already stored the version, making
+the check nearly free. Rejecting by default rather than warning follows the
+project rule that a command must not report success having done something
+other than what was asked. The escape hatch exists because replaying a
+change stream backwards is a legitimate, if rare, thing to want.
+
 ## derive-changes: lossless delete roundtrip
 
 **osmium behavior:** `osmium derive-changes` loses deletes when generating an OSC

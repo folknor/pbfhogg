@@ -593,11 +593,14 @@ fn write_delete_element<W: Write>(
     let mut elem = BytesStart::new(tag_name);
     let id_str = id.to_string();
     elem.push_attribute(("id", id_str.as_str()));
-    if let Some(meta) = metadata {
+    // Emitted only when the source claimed a version. Absent is not
+    // zero, and `version="0"` on a delete is a claim the input never
+    // made.
+    if let Some(version) = metadata.and_then(|m| m.version) {
         let version = if increment_version {
-            meta.version.saturating_add(1)
+            version.saturating_add(1)
         } else {
-            meta.version
+            version
         };
         let v_str = version.to_string();
         elem.push_attribute(("version", v_str.as_str()));

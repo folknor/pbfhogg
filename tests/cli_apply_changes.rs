@@ -1005,8 +1005,26 @@ fn merge_stats_accuracy() {
 
 /// Metadata (version/timestamp/changeset/uid/user) from base PBF nodes
 /// survives a merge, and OSC replacements carry the metadata attributes
-/// from the OSC element (node 2's `version="4"` below; attributes the
-/// OSC omits stay at their defaults, e.g. uid 0).
+/// from the OSC element (node 2's `version="4"` below).
+///
+/// # A known collapse this test PINS but does not endorse
+///
+/// The `uid == 0` assertion below records what the code does, not what
+/// it should do. The OSC element carries no `uid` at all, and the
+/// written PBF records `uid = 0` - a real user id, indistinguishable
+/// from a genuine user 0. This is the same absent-versus-zero collapse
+/// that has been fixed for coordinates, for `push_info_attrs`, and for
+/// OSC `version`; it survives here because `osc::compact::ArenaMeta`
+/// and `block_builder::Metadata` have no per-field presence bit, so
+/// "attribute absent" and "attribute is zero" share one representation
+/// all the way through the PBF write path.
+///
+/// Closing it means per-field presence in both types - a change across
+/// the PBF write path, not the change stream - so it is filed rather
+/// than done here. Do NOT read this assertion as the intended contract:
+/// when the representation gains presence bits, this expectation must
+/// change to "no uid field at all", and the assertion message is worded
+/// so that a future reader is not misled into preserving the bug.
 #[test]
 fn merge_metadata_preservation() {
     let dir = TempDir::new().expect("tempdir");
@@ -1109,7 +1127,12 @@ fn merge_metadata_preservation() {
     assert_eq!(node_meta[1].0, 2);
     let (version, uid) = node_meta[1].1.expect("node 2 meta");
     assert_eq!(version, 4, "OSC-sourced version must be carried");
-    assert_eq!(uid, 0, "uid absent from the OSC stays default");
+    assert_eq!(
+        uid, 0,
+        "KNOWN COLLAPSE, not a contract: an absent uid is recorded as uid 0 because \
+         ArenaMeta and block_builder::Metadata have no presence bit for it. See this \
+         test's doc comment - when that is fixed, this must become 'no uid field'."
+    );
     assert_eq!(node_meta[2].0, 3);
     let (version, uid) = node_meta[2].1.expect("node 3 meta");
     assert_eq!(version, 1);
@@ -1620,6 +1643,88 @@ fn merge_type_transition_node_to_relation_skipping_ways() {
 // ---------------------------------------------------------------------------
 // Error paths
 // ---------------------------------------------------------------------------
+
+/// The version-precedence gate, and its escape hatch, reaching
+/// `apply-changes` through the CLI.
+///
+/// The gate lives in two places - `CompactDiffOverlay` for this command
+/// and the `--simplify` dedupe for `merge-changes` - and only the second
+/// half had a CLI test. So `apply-changes --allow-version-regression`
+/// existed as a flag with nothing at all asserting that it reached
+/// `CompactDiffOverlay::allow_version_regression`: unwiring the call in
+/// `rewrite.rs` broke no test. Every arm is pinned here - the refusal,
+/// the escape hatch, and a genuine advance - because a gate that is
+/// merely inert also passes "the flag parsed".
+#[test]
+fn merge_refuses_a_version_regression_and_honours_the_escape_hatch() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &base,
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![],
+            meta: None,
+        }],
+        &[],
+        &[],
+    );
+
+    // A delete followed by a stale modify: before the versioned
+    // tombstone the delete erased the stored version and version 8 was
+    // resurrected past a gate meant to stop exactly that.
+    let osc = dir.path().join("regress.osc.gz");
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <delete><node id="1" version="9"/></delete>
+  <modify><node id="1" lat="8.0" lon="8.0" version="8"/></modify>
+</osmChange>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, ApplyOpts::default());
+    assert!(
+        !out.status.success(),
+        "a stale change after a delete must be refused"
+    );
+    assert!(
+        out.stderr_str().contains("does not advance past version 9"),
+        "error must name the regression; stderr:\n{}",
+        out.stderr_str()
+    );
+
+    // The escape hatch restores the old positional rule.
+    let out = CliInvoker::new()
+        .arg("apply-changes")
+        .arg(&base)
+        .arg(&osc)
+        .arg("-o")
+        .arg(&output)
+        .arg("--allow-version-regression")
+        .arg("--force")
+        .run();
+    assert!(
+        out.status.success(),
+        "--allow-version-regression must accept it; stderr:\n{}",
+        out.stderr_str()
+    );
+
+    // And a genuine advance was never in question.
+    let forward = dir.path().join("forward.osc.gz");
+    write_osc(
+        &forward,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <delete><node id="1" version="9"/></delete>
+  <create><node id="1" lat="8.0" lon="8.0" version="10"/></create>
+</osmChange>"#,
+    );
+    run_apply_ok(&base, &forward, &output);
+}
 
 /// Regression: `apply-changes --force --locations-on-ways` against a
 /// non-indexed base PBF must reject the combination up front.

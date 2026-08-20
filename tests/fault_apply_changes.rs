@@ -90,6 +90,7 @@ mod apply_changes {
             force: true,
             locations_on_ways: false,
             jobs: Some(2),
+            allow_version_regression: false,
             panic_at_blob_seq: Some(3),
         };
 

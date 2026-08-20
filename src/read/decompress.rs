@@ -312,6 +312,14 @@ pub(crate) fn decompress_blob_data_into(blob_bytes: &[u8], buf: &mut Vec<u8>) ->
 /// Decompress a parsed Blob protobuf into a caller-provided buffer.
 #[allow(clippy::cast_sign_loss)]
 pub(super) fn decompress_parsed_blob_into(blob: &WireBlob, buf: &mut Vec<u8>) -> Result<()> {
+    decompress_parsed_blob_body(blob, buf)?;
+    // A `raw_size` that disagrees with what actually came out is a corruption
+    // signal, not a stale hint - see `check_raw_size`.
+    super::blob_wire::check_raw_size(blob.raw_size, buf.len())
+}
+
+#[allow(clippy::cast_sign_loss)]
+fn decompress_parsed_blob_body(blob: &WireBlob, buf: &mut Vec<u8>) -> Result<()> {
     buf.clear();
     match &blob.data {
         Some(BlobData::Raw(bytes)) => {
@@ -362,19 +370,22 @@ pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<
 
     let mut cursor = Cursor::new(raw_blob);
     let mut raw_size: Option<i32> = None;
-    let mut found = false;
+    // The payload field, recorded rather than acted on: `raw_size` (field 2)
+    // may follow the payload on the wire, and the whole envelope has to be
+    // walked anyway to detect a second payload field. This loop used to
+    // `return` on the first `raw`, which both skipped the multi-field check
+    // and made this parser disagree with `WireBlob::parse` (last-field-wins)
+    // about which payload an adversarial two-field blob carried.
+    let mut payload: Option<(u32, &[u8])> = None;
 
     while let Some((field, wire_type)) = cursor.read_tag()? {
         match field {
-            1 => {
-                // raw (uncompressed): bytes
+            1 | 3 | 7 => {
                 let slice = cursor.read_len_delimited()?;
-                let size = slice.len() as u64;
-                if size > MAX_BLOB_MESSAGE_SIZE {
-                    return Err(new_blob_error(BlobError::MessageTooBig { size }));
+                if payload.is_some() {
+                    return Err(crate::read::blob_wire::multiple_payload_fields());
                 }
-                buf.extend_from_slice(slice);
-                return Ok(());
+                payload = Some((field, slice));
             }
             2 => {
                 // raw_size: int32
@@ -383,39 +394,33 @@ pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<
                     raw_size = Some(cursor.read_varint()? as i32);
                 }
             }
-            3 => {
-                // zlib_data: bytes
-                let slice = cursor.read_len_delimited()?;
-                if let Some(rs) = raw_size
-                    && rs > 0
-                {
-                    #[allow(clippy::cast_sign_loss)]
-                    buf.reserve(clamp_capacity_hint(rs as usize).saturating_sub(buf.capacity()));
-                }
-                zlib_decompress_into(slice, buf)?;
-                found = true;
-            }
-            7 => {
-                // zstd_data: bytes
-                let slice = cursor.read_len_delimited()?;
-                if let Some(rs) = raw_size
-                    && rs > 0
-                {
-                    #[allow(clippy::cast_sign_loss)]
-                    buf.reserve(clamp_capacity_hint(rs as usize).saturating_sub(buf.capacity()));
-                }
-                zstd_decompress_into(slice, buf)?;
-                found = true;
-            }
             _ => cursor.skip_field(wire_type)?,
         }
     }
 
-    if found {
-        Ok(())
+    let Some((field, slice)) = payload else {
+        return Err(new_blob_error(BlobError::Empty));
+    };
+    if field == 1 {
+        let size = slice.len() as u64;
+        if size > MAX_BLOB_MESSAGE_SIZE {
+            return Err(new_blob_error(BlobError::MessageTooBig { size }));
+        }
+        buf.extend_from_slice(slice);
     } else {
-        Err(new_blob_error(BlobError::Empty))
+        if let Some(rs) = raw_size
+            && rs > 0
+        {
+            #[allow(clippy::cast_sign_loss)]
+            buf.reserve(clamp_capacity_hint(rs as usize).saturating_sub(buf.capacity()));
+        }
+        if field == 3 {
+            zlib_decompress_into(slice, buf)?;
+        } else {
+            zstd_decompress_into(slice, buf)?;
+        }
     }
+    crate::read::blob_wire::check_raw_size(raw_size, buf.len())
 }
 
 /// Decompress a parsed WireBlob into an owned `Bytes`.
@@ -423,6 +428,12 @@ pub(crate) fn decompress_blob(
     blob: &WireBlob,
     pool: Option<&Arc<DecompressPool>>,
 ) -> Result<Bytes> {
+    let decoded = decompress_blob_body(blob, pool)?;
+    super::blob_wire::check_raw_size(blob.raw_size, decoded.len())?;
+    Ok(decoded)
+}
+
+fn decompress_blob_body(blob: &WireBlob, pool: Option<&Arc<DecompressPool>>) -> Result<Bytes> {
     match &blob.data {
         Some(BlobData::Raw(bytes)) => {
             let size = bytes.len() as u64;
@@ -489,7 +500,7 @@ pub(crate) fn decompress_wire_blob_into(blob: &WireBlob, buf: &mut Vec<u8>) -> R
         }
         None => return Err(new_blob_error(BlobError::Empty)),
     }
-    Ok(())
+    super::blob_wire::check_raw_size(blob.raw_size, buf.len())
 }
 
 // Tests use `unwrap()` throughout because panicking is the correct failure mode
@@ -608,6 +619,133 @@ mod tests {
 
             assert_too_big(decompress_blob(&blob, None).map(|_| ()), over_len as u64);
         }
+    }
+
+    /// Hand-encode a `Blob` protobuf from `(field, payload)` pairs, so a test
+    /// can build the two-payload-field envelope no writer produces.
+    fn encode_blob(fields: &[(u32, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (field, payload) in fields {
+            out.push(u8::try_from((field << 3) | 2).unwrap());
+            let mut len = payload.len() as u64;
+            loop {
+                let mut byte = (len & 0x7f) as u8;
+                len >>= 7;
+                if len != 0 {
+                    byte |= 0x80;
+                }
+                out.push(byte);
+                if len == 0 {
+                    break;
+                }
+            }
+            out.extend_from_slice(payload);
+        }
+        out
+    }
+
+    /// A `Blob` carrying two payload fields is rejected by both parsers.
+    ///
+    /// The three payload fields are three encodings of one payload, so a blob
+    /// carrying two of them has no defined content. The two parsers used to
+    /// disagree about it and neither rejected it: `WireBlob::parse` was
+    /// last-field-wins, so `raw` + `zlib_data` decoded as the zlib content,
+    /// while `decompress_blob_raw` returned on the first `raw` field it saw
+    /// and decoded the same bytes as the raw content. One adversarial blob,
+    /// two different blocks, decided by which read path reached it.
+    ///
+    /// The fixture puts distinguishable content in each field precisely so a
+    /// regression that picks a winner instead of rejecting shows up as the
+    /// wrong bytes rather than as a silent pass: `decompress_blob_raw` writes
+    /// into `out`, so its content is asserted too.
+    #[test]
+    fn a_blob_with_two_payload_fields_is_rejected_by_both_parsers() {
+        let zlib = zlib_compress(b"from-zlib");
+        let blob = encode_blob(&[(1, b"from-raw"), (3, &zlib)]);
+
+        let mut out = Vec::new();
+        let err = super::decompress_blob_raw(&blob, &mut out)
+            .expect_err("decompress_blob_raw must reject a two-payload blob");
+        assert!(
+            matches!(err.into_kind(), ErrorKind::WireFormat { .. }),
+            "a multi-payload Blob must be a wire-format error"
+        );
+        assert!(
+            out.is_empty(),
+            "no payload may be produced for an ambiguous blob, got {out:?}"
+        );
+
+        WireBlob::parse_slice(&blob)
+            .expect_err("WireBlob::parse must reject a two-payload blob too");
+
+        // Field order reversed: the defect was order-dependent, so both orders
+        // have to be covered or the test only pins half the fix.
+        let reversed = encode_blob(&[(3, &zlib), (1, b"from-raw")]);
+        let mut out = Vec::new();
+        super::decompress_blob_raw(&reversed, &mut out)
+            .expect_err("decompress_blob_raw must reject either field order");
+        WireBlob::parse_slice(&reversed)
+            .expect_err("WireBlob::parse must reject either field order");
+
+        // A single payload field with the same content still decodes, so the
+        // rejection costs a conforming blob nothing.
+        let single = encode_blob(&[(1, b"from-raw")]);
+        let mut out = Vec::new();
+        super::decompress_blob_raw(&single, &mut out).expect("a single-payload blob still decodes");
+        assert_eq!(out, b"from-raw");
+    }
+
+    /// A `raw_size` that disagrees with the payload actually produced is
+    /// corruption, and is rejected rather than silently ignored as a stale
+    /// capacity hint. libosmium cross-checks the same field.
+    #[test]
+    fn a_lying_raw_size_is_rejected() {
+        let payload = b"exactly-fifteen";
+        let honest = i32::try_from(payload.len()).unwrap();
+
+        for kind in [Kind::Raw, Kind::Zlib, Kind::Zstd] {
+            let mut blob = make_blob(kind, payload);
+            assert_eq!(blob.raw_size, Some(honest));
+
+            // Honest: accepted, and yields the payload.
+            let mut out = Vec::new();
+            decompress_wire_blob_into(&blob, &mut out).expect("an honest raw_size decodes");
+            assert_eq!(out, payload);
+
+            // Off by one in each direction. Both must be rejected: a
+            // one-sided check would pass a truncating writer.
+            for lie in [honest - 1, honest + 1] {
+                blob.raw_size = Some(lie);
+                let mut out = Vec::new();
+                assert!(
+                    matches!(
+                        decompress_wire_blob_into(&blob, &mut out)
+                            .map_err(crate::error::Error::into_kind),
+                        Err(ErrorKind::WireFormat { .. })
+                    ),
+                    "{kind:?}: raw_size {lie} against {honest} bytes must be rejected"
+                );
+                let mut out = Vec::new();
+                assert!(
+                    decompress_parsed_blob_into(&blob, &mut out).is_err(),
+                    "{kind:?}: the pipelined helper must agree with the sequential one"
+                );
+                assert!(
+                    decompress_blob(&blob, None).is_err(),
+                    "{kind:?}: the Bytes helper must agree too"
+                );
+            }
+        }
+
+        // An absent raw_size stays legal - our own writer omits it on
+        // uncompressed blobs, so requiring it would reject our own output.
+        let blob = WireBlob {
+            data: Some(BlobData::Raw(Bytes::from_static(b"no declared size"))),
+            raw_size: None,
+        };
+        let mut out = Vec::new();
+        decompress_wire_blob_into(&blob, &mut out).expect("an absent raw_size is legal");
+        assert_eq!(out, b"no declared size");
     }
 
     /// A deflate stream that ends before its final block must terminate with a
@@ -737,8 +875,18 @@ mod tests {
             "an over-cap raw_size must clamp to the cap, not pass through"
         );
 
+        // The blob still inflates - the clamp governs the `reserve`, not the
+        // decode - but a `raw_size` this far from the four bytes actually
+        // produced is now rejected as corruption by `check_raw_size`. The
+        // capacity assertion below is the one under test here and is unaffected
+        // by that rejection: it reads the buffer the clamped hint sized.
         let mut out = Vec::new();
-        decompress_wire_blob_into(&blob, &mut out).expect("a tiny blob still decodes");
+        let err = decompress_wire_blob_into(&blob, &mut out)
+            .expect_err("a raw_size of i32::MAX over a 4-byte payload is a lie");
+        assert!(
+            matches!(err.into_kind(), ErrorKind::WireFormat { .. }),
+            "a raw_size mismatch must be a wire-format error"
+        );
         assert_eq!(out, b"tiny");
         assert!(
             out.capacity() <= MAX_BLOB_MESSAGE_SIZE as usize,

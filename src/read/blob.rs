@@ -501,25 +501,13 @@ impl<R: Read + Send> BlobReader<R> {
             }
         };
 
-        // A zero-length BlobHeader consumes 4 bytes and declares nothing: no
-        // type, `datasize == 0`. Accepting it turns a run of zero bytes into a
-        // stream of legal empty frames that every consumer skips as "unknown
-        // blob type", so infinite garbage reads as a clean success with empty
-        // output - the silent-data-loss failure mode
-        // `reference/truncation-handling.md` exists to prevent. A frame that
-        // advances 4 bytes and yields nothing is never valid.
-        if header_size == 0 {
+        // Both length-prefix guards (zero-length and MAX_BLOB_HEADER_SIZE)
+        // come from `read::frame`, the one owner of frame policy. This decoder
+        // keeps its own I/O because it stamps a byte offset between each step,
+        // which the streaming helper deliberately does not do.
+        #[allow(clippy::cast_possible_truncation)]
+        if let Err(err) = crate::frame::check_header_len(header_size as u32) {
             self.last_blob_ok = false;
-            let err = new_blob_error(BlobError::InvalidHeaderSize);
-            return Some(Err(self.stamp_input(match self.offset {
-                Some(o) => err.at(o),
-                None => err,
-            })));
-        }
-
-        if header_size >= MAX_BLOB_HEADER_SIZE {
-            self.last_blob_ok = false;
-            let err = new_blob_error(BlobError::HeaderTooBig { size: header_size });
             return Some(Err(self.stamp_input(match self.offset {
                 Some(o) => err.at(o),
                 None => err,

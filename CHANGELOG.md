@@ -4,6 +4,47 @@
 
 ### Changed
 
+- **`cat --dedupe` now bounds its frame-header allocation.** Its pass-1
+  frame loop read the 4-byte big-endian length prefix and resized its
+  header buffer straight from it, with neither the
+  `MAX_BLOB_HEADER_SIZE` cap nor the zero-length rejection the other
+  frame decoders carry. Four bytes of corrupt or hostile input therefore
+  requested an allocation of up to 4 GiB before anything inspected them.
+  Both guards now apply, so such input is a typed error. Every blob-frame
+  decoder in the crate shares one implementation of the length prefix,
+  the end-of-file policy and both size guards, so they can no longer
+  drift apart.
+
+- **A `Blob` carrying more than one payload field is rejected.** `raw`,
+  `zlib_data` and `zstd_data` are three encodings of one payload, so a
+  blob carrying two of them has no defined content - and the two Blob
+  parsers disagreed about which one won, meaning one such blob decoded to
+  two different blocks depending on which read path reached it. Both
+  parsers now reject it rather than picking a winner.
+
+  **Compatibility:** a file that read successfully before may now be
+  rejected. Repeating a non-repeated protobuf field is legal wire
+  encoding with last-one-wins semantics, so such a blob is unusual rather
+  than provably corrupt. No known writer produces one - libosmium emits
+  exactly one payload field per blob - but its *reader* does tolerate the
+  shape, with a third policy again (first `raw` wins, otherwise the last
+  compressed field), which is the argument for rejecting rather than for
+  copying it. If you hit this, the file was not written by a conforming
+  writer: re-fetch it, or re-encode it with a reader that accepts it. The
+  error names the offending fields.
+
+- **A `Blob.raw_size` that disagrees with the decompressed payload is
+  rejected.** It was used only as a buffer-sizing hint, so a lying value
+  was silently ignored; libosmium cross-checks the same field and now so
+  do we. An absent `raw_size` remains legal.
+
+  **Compatibility:** same shape of change - a file with a wrong
+  `raw_size` used to read fine and now errors. We are stricter than
+  libosmium in one direction: it sizes its output buffer to `raw_size`
+  and lets zlib fail when the value is too small, but an oversized value
+  succeeds there and silently yields a payload zero-padded to the
+  declared length. Both directions are rejected here.
+
 - **A corrupt element inside a blob is now a hard error instead of a
   silently dropped element.** This is a breaking behaviour change for
   anyone reading damaged or hostile PBFs. The rule that a truncation is a

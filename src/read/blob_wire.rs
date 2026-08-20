@@ -112,7 +112,7 @@ impl WireBlobHeader {
         // empty string) is not a valid frame descriptor, but it parses to
         // `Unknown("")` with `datasize == 0`, which every consumer skips as an
         // unrecognised blob type - so garbage would read as clean success.
-        // Rejecting here covers all four frame decoders at one site.
+        // Rejecting here covers every frame decoder at one site.
         if matches!(&blob_type, BlobKind::Unknown(s) if s.is_empty()) {
             return Err(new_wire_error("BlobHeader has no type field"));
         }
@@ -133,6 +133,66 @@ pub(crate) enum BlobData {
     Raw(Bytes),
     Zlib(Bytes),
     Zstd(Bytes),
+}
+
+/// A `Blob` carrying more than one of `raw` / `zlib_data` / `zstd_data`.
+///
+/// The three payload fields are mutually exclusive by construction: they are
+/// three encodings of one payload, not three payloads. A blob carrying two of
+/// them has no defined content, and the crate's two Blob parsers used to
+/// disagree about which one won - `WireBlob::parse` was last-field-wins, while
+/// `decompress_blob_raw` returned on the first `raw` field it saw, so one
+/// adversarial blob decoded to two different blocks depending on which read
+/// path reached it. Picking a winner would enshrine that ambiguity; rejecting
+/// removes it, and costs a conforming writer nothing.
+///
+/// Repeating a non-repeated protobuf scalar is legal wire encoding with
+/// last-one-wins semantics, so such a blob is unusual rather than provably
+/// corrupt, and a file carrying one used to read successfully here. No known
+/// writer produces one: libosmium's PBF output builder emits exactly one
+/// payload field per blob, chosen by a switch on the compression mode. The
+/// reference *reader* does tolerate the shape, and with a third policy again -
+/// it returns immediately on `raw` and otherwise keeps the last compressed
+/// field - which is the argument for rejecting rather than for copying it. The
+/// message names the offending fields because a user hitting this has to know
+/// what to look for in a file they did not write.
+pub(crate) fn multiple_payload_fields() -> crate::error::Error {
+    new_wire_error(
+        "Blob carries more than one of the mutually exclusive payload fields \
+         raw, zlib_data and zstd_data. The three are alternative encodings of \
+         one payload, so a blob with two of them has no defined content and is \
+         rejected rather than guessed at. Re-fetch or re-encode the file with a \
+         conforming writer, and report the bug to whatever produced it.",
+    )
+}
+
+/// Cross-check a `Blob.raw_size` against the payload length actually produced.
+///
+/// `raw_size` is the writer's declaration of the decompressed size. Every read
+/// path here used it only as a `Vec::reserve` hint, so a lying value was
+/// silently ignored; the reference implementation (libosmium) treats a
+/// mismatch as corruption, and so do we. An absent `raw_size` is legal - our
+/// own writer omits it on uncompressed blobs, as libosmium does - and is not
+/// checked.
+///
+/// We are strictly stricter than libosmium in one direction. It sizes its
+/// output buffer to `raw_size` and calls `uncompress`, so an undersized
+/// `raw_size` fails with `Z_BUF_ERROR`, while an *oversized* one succeeds and
+/// silently yields a buffer padded with trailing zeros to the declared length.
+/// Both directions are rejected here.
+pub(crate) fn check_raw_size(declared: Option<i32>, actual: usize) -> Result<()> {
+    match declared {
+        Some(d) if i64::from(d) != i64::try_from(actual).unwrap_or(i64::MAX) => {
+            Err(new_wire_error(
+                "Blob raw_size disagrees with the payload that came out of it. \
+                 raw_size declares the decompressed length, so a mismatch means \
+                 the payload is truncated, padded, or not what the writer \
+                 intended, and the block is rejected rather than decoded from a \
+                 length nothing agrees on. Re-fetch or re-encode the file.",
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Parsed Blob envelope from protobuf wire format.
@@ -158,11 +218,20 @@ impl WireBlob {
 
         while let Some((field, wire_type)) = cursor.read_tag()? {
             match field {
-                1 => {
-                    // raw: bytes (len-delimited)
+                1 | 3 | 7 => {
+                    // raw (1) / zlib_data (3) / zstd_data (7): the three
+                    // mutually exclusive payload encodings.
                     let slice = cursor.read_len_delimited()?;
                     let offset = slice.as_ptr() as usize - input.as_ptr() as usize;
-                    data = Some(BlobData::Raw(input.slice(offset..offset + slice.len())));
+                    let payload = input.slice(offset..offset + slice.len());
+                    if data.is_some() {
+                        return Err(multiple_payload_fields());
+                    }
+                    data = Some(match field {
+                        1 => BlobData::Raw(payload),
+                        3 => BlobData::Zlib(payload),
+                        _ => BlobData::Zstd(payload),
+                    });
                 }
                 2 => {
                     // raw_size: int32 (varint)
@@ -170,18 +239,6 @@ impl WireBlob {
                     {
                         raw_size = Some(cursor.read_varint()? as i32);
                     }
-                }
-                3 => {
-                    // zlib_data: bytes (len-delimited)
-                    let slice = cursor.read_len_delimited()?;
-                    let offset = slice.as_ptr() as usize - input.as_ptr() as usize;
-                    data = Some(BlobData::Zlib(input.slice(offset..offset + slice.len())));
-                }
-                7 => {
-                    // zstd_data: bytes (len-delimited)
-                    let slice = cursor.read_len_delimited()?;
-                    let offset = slice.as_ptr() as usize - input.as_ptr() as usize;
-                    data = Some(BlobData::Zstd(input.slice(offset..offset + slice.len())));
                 }
                 _ => cursor.skip_field(wire_type)?,
             }
@@ -274,8 +331,9 @@ pub(crate) fn parse_blob_header_with_index(
     }
     // Reject an oversized declared datasize before any downstream site
     // preallocates or preads the compressed body. This is the shared funnel
-    // for `read_raw_frame`, `read_blob_header_only`, and
-    // `HeaderWalker::next_header`; enforcing here bounds the `data_size`
+    // for `HeaderWalker::next_header` and for `read::frame::read_frame_header`
+    // (hence `read_raw_frame`, `read_blob_header_only` and the `cat --dedupe`
+    // frame loop); enforcing here bounds the `data_size`
     // every one of those returns, so none can drive an outsized allocation
     // ahead of the 32 MiB post-decompression `MAX_BLOB_MESSAGE_SIZE` guard.
     // `BlobReader::read_blob_header` bypasses this funnel and carries the

@@ -72,21 +72,40 @@ data.
 Every command that reads PBF input adheres to the same contract -
 there is no per-command relaxation. The contract sites are:
 
-- `BlobReader::next` (`src/read/blob.rs`)
+- `read::frame` (`src/read/frame.rs`) - the frame decoder. Owns
+  the length prefix, the shape-1 EOF policy, and both size guards
+  (zero-length and `MAX_BLOB_HEADER_SIZE`) for every decoder in
+  the crate. The streaming decoders (`read_raw_frame`,
+  `read_blob_header_only`, and the `cat --dedupe` pass-1 loop)
+  call it end to end; the two that cannot share the I/O -
+  `BlobReader::read_blob_header`, which stamps a byte offset
+  between each step, and `HeaderWalker::next_header`, which preads
+  - call `check_header_len` and keep only their own reads.
+- `BlobReader::next` (`src/read/blob.rs`) - shapes 2-4 on the
+  sequential path, including the byte-offset stamping
 - `BlobReader::skip_blob_body` (`src/read/blob.rs`) - the
   payload-skip path used by the header-only fast scans
-- `read_raw_frame` (`src/read/raw_frame.rs`)
-- `HeaderWalker::next_header` (`src/read/header_walker.rs`)
+- `HeaderWalker::next_header` (`src/read/header_walker.rs`) -
+  shape 4 against the file size captured at `open()`
 - `FileReader::skip` (`src/read/file_reader.rs`) - the
   caller-side payload-skip used by `read_blob_header_only`
   consumers (`has_indexdata`, `diff::process`, `cat::dedupe`,
   `altw::passthrough`)
-- `PrimitiveBlock::new` (`src/read/block.rs`) for shape 5
 - `zlib_decompress_into` / `zstd_decompress_into`
   (`src/read/decompress.rs`) for shape 5 - the actual
   decompressors, reached by every `decompress_*` entry point
+- `WireBlob::parse` (`src/read/blob_wire.rs`) and
+  `decompress_blob_raw` (`src/read/decompress.rs`) - the two Blob
+  envelope parsers. Both reject a blob carrying more than one of
+  `raw` / `zlib_data` / `zstd_data`, and both cross-check a
+  declared `Blob.raw_size` against the payload they produced.
 - `validate_groups_strict` (`src/read/block.rs`) for the
-  block-layer contract below
+  block-layer contract below. Every `PrimitiveBlock` constructor -
+  `new`, `from_vec`, `from_vec_with_scratch`,
+  `from_vec_pooled_with_scratch` - funnels through `finish` and so
+  through this check. Note that no `PrimitiveBlock` constructor is
+  a shape-5 site: they take already-decompressed bytes and cannot
+  observe a decompression failure.
 
 A truncation that reaches any of those entry points must surface
 as `Err(ErrorKind::Io)` (or a more specific variant) before the
@@ -183,6 +202,36 @@ Shape 5 is enforced during decompression, not after it:
   before it reaches `Vec::reserve`. It is an unvalidated `int32`,
   so a corrupt blob could otherwise declare 2 GiB of
   pre-decompression allocation from five bytes on the wire.
+- Once decompression has run, the same `Blob.raw_size` is
+  cross-checked against the payload actually produced. A hint used
+  only for sizing means a lying value is invisible; a value that
+  disagrees with the result is corruption. An absent `raw_size`
+  stays legal - our own writer omits it on uncompressed blobs, as
+  libosmium does. We are stricter than libosmium in one direction:
+  it sizes its output buffer to `raw_size` and calls `uncompress`,
+  so an undersized value fails with `Z_BUF_ERROR` but an oversized
+  one succeeds and silently yields a payload zero-padded to the
+  declared length.
+- A `Blob` carrying more than one of `raw` / `zlib_data` /
+  `zstd_data` is rejected by both parsers. They are three
+  encodings of one payload, not three payloads. The two parsers
+  previously disagreed about such a blob - `WireBlob::parse` was
+  last-field-wins, `decompress_blob_raw` returned on the first
+  `raw` it saw - so one adversarial blob decoded to two different
+  blocks depending on which read path reached it. Rejecting
+  removes the ambiguity rather than enshrining a winner.
+
+  This is a deliberate compatibility cost, not a free win. Repeating
+  a non-repeated protobuf field is legal wire encoding with
+  last-one-wins semantics, so a file that read successfully before
+  may now be rejected. No known writer produces the shape -
+  libosmium's PBF output builder emits exactly one payload field per
+  blob - but its reader tolerates it, with a third policy again
+  (returns on the first `raw`, otherwise keeps the last compressed
+  field). Three readers, three answers, is the argument for
+  rejecting rather than for copying the reference implementation.
+  The error message names the offending fields so a user can act on
+  a file they did not write.
 
 ## Tests
 
@@ -243,6 +292,27 @@ contract.
 - `src/read/decompress.rs::tests::decompression_bomb_is_bounded_during_inflation`
   and `raw_size_capacity_hint_is_clamped_to_the_cap` - pin the
   during-inflation bound and the capacity-hint clamp separately.
+- `src/read/frame.rs::tests` - the shared guards and the shape-1
+  EOF policy at their boundaries: a 0-3 byte tail is `Ok(None)`, a
+  complete prefix never is, and a prefix of `0xFFFFFFFF` is
+  refused by the size guard rather than by the allocator. This
+  covers the three decoders that share the helper's I/O; the other
+  two spell the same policy themselves and are pinned at their own
+  call sites, by the two `trailing_partial_length_prefix_*` tests
+  above for `BlobReader` and by
+  `src/read/header_walker.rs::tests::the_walk_tolerates_a_short_tail_but_not_a_complete_prefix`
+  for the pread walk.
+- `tests/merge_pbf.rs::merge_rejects_a_corrupt_frame_prefix_without_allocating` -
+  the `cat --dedupe` frame loop specifically, which had no
+  coverage of either guard while it had neither guard. Each arm
+  asserts its own guard's message, not a shared substring: with a
+  bare "header" check the zero-length arm passed with the
+  zero-length guard disabled, because an empty `BlobHeader` is then
+  caught one layer down by the no-type-field rejection, whose
+  message also says "header".
+- `src/read/decompress.rs::tests::a_blob_with_two_payload_fields_is_rejected_by_both_parsers`
+  and `a_lying_raw_size_is_rejected` - the Blob-envelope checks,
+  driven through both parsers and in both field orders.
 - `tests/corrupt_input.rs::zero_length_blob_header_is_rejected`
   and `trailing_zero_run_after_valid_blobs_is_rejected` - a
   `header_len` of 0 is a committed frame that must error, and a
@@ -260,19 +330,27 @@ for the six commands listed above specifically).
 ## Implementation status
 
 Aligned. All contract sites listed above hard-error on shapes
-2-4. The list grew from six to eight on 2026-08-20, when the two
-decompressors and `validate_groups_strict` were added; the six
-framing sites are the ones the end-to-end sweep drives, and the
-two new ones are pinned by unit tests instead.
+2-4.
 
 Initial alignment landed in commit `436998b` (covering
 `BlobReader::next`, `skip_blob_body`, and `HeaderWalker::next_header`);
 the `FileReader::skip` site landed in commit `12699db` after a
 post-pass review surfaced the `read_blob_header_only` caller-side
-payload-skip path as a silent shape-4 hole. `read_raw_frame` and
-`PrimitiveBlock::new` were already aligned by their existing
-patterns (`read_exact` end-to-end and Cursor-based protobuf walk
-respectively).
+payload-skip path as a silent shape-4 hole. `read_raw_frame` was
+already aligned by its end-to-end `read_exact` pattern.
+
+The list was reworked on 2026-08-20 around `read::frame`. Before
+that, the frame envelope was hand-rolled at five sites and this
+table had to enumerate each of them; the guards then had to be
+added five times, and the `cat --dedupe` copy - which this
+document never listed - had received neither the zero-length
+rejection nor the `MAX_BLOB_HEADER_SIZE` cap, so four bytes of
+corrupt input drove an unbounded allocation there. The same pass
+corrected a longstanding error in this list: it named
+`PrimitiveBlock::new` as the shape-5 site, which it never was.
+That constructor receives already-decompressed bytes; shape 5
+lives in `decompress.rs`, which the list did not mention until
+the decompressors were added on 2026-08-20.
 
 `mutate_blob_payload`-based regression tests
 (`tests/cli_defensive_input.rs`) exercise shape 5 (decompression

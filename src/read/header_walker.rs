@@ -26,7 +26,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::blob::{BlobKind, MAX_BLOB_HEADER_SIZE, parse_blob_header_with_index};
+use crate::blob::{BlobKind, parse_blob_header_with_index};
 use crate::blob_meta::BlobIndex;
 use crate::error::Result;
 
@@ -303,26 +303,11 @@ impl HeaderWalker {
             self.header_buf[1],
             self.header_buf[2],
             self.header_buf[3],
-        ]) as usize;
-        // Match BlobReader's zero-length guard: a 4-byte frame declaring an
-        // empty BlobHeader advances the walk without describing a blob, so a
-        // run of zero bytes would walk to EOF reporting nothing but success.
-        if header_len == 0 {
-            return Err(crate::error::new_blob_error(
-                crate::error::BlobError::InvalidHeaderSize,
-            ));
-        }
-        // Match BlobReader's MAX_BLOB_HEADER_SIZE guard (blob.rs:390).
-        // Without this cap, an adversarial or corrupted length prefix
-        // forces `header_buf.resize(header_end, 0)` below to attempt a
-        // multi-GB allocation on the fallback path.
-        if header_len as u64 >= MAX_BLOB_HEADER_SIZE {
-            return Err(crate::error::new_blob_error(
-                crate::error::BlobError::HeaderTooBig {
-                    size: header_len as u64,
-                },
-            ));
-        }
+        ]);
+        // Both length-prefix guards come from `read::frame`, the one owner of
+        // frame policy. The walk preads rather than streams, so it shares the
+        // policy but not the I/O.
+        let header_len = crate::frame::check_header_len(header_len)?;
         let header_end = 4 + header_len;
 
         if header_end > probe_len {
@@ -446,6 +431,57 @@ mod tests {
                 .expect("write block");
         }
         writer.flush().expect("flush fixture");
+    }
+
+    /// The walk's own spelling of the shared EOF policy, pinned at the call
+    /// site rather than only in `read::frame`.
+    ///
+    /// `read::frame` owns one policy - a 0-3 byte tail at a frame boundary is
+    /// clean EOF, a complete 4-byte prefix is a committed frame - but only the
+    /// three streaming decoders share its I/O. `HeaderWalker` preads, so it
+    /// spells the same rule as `probe_len < 4` and a unit test of the helper
+    /// cannot reach it; `BlobReader`'s third spelling is pinned by
+    /// `tests/read_paths.rs::trailing_partial_length_prefix_*`. Without this
+    /// test the walk could drift back to erroring on a tolerated tail, or to
+    /// swallowing a committed frame as EOF, with both gates green.
+    #[test]
+    fn the_walk_tolerates_a_short_tail_but_not_a_complete_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("base.pbf");
+        write_fixture(&base, true);
+        let good = std::fs::read(&base).expect("read fixture");
+
+        let count_headers = |path: &std::path::Path| -> super::Result<usize> {
+            let mut walker = super::HeaderWalker::open(path)?;
+            let mut n = 0;
+            while walker.next_header()?.is_some() {
+                n += 1;
+            }
+            Ok(n)
+        };
+
+        let baseline = count_headers(&base).expect("the intact fixture walks");
+        assert!(baseline >= 2, "fixture must have header + data blobs");
+
+        for tail in 0..4usize {
+            let path = dir.path().join(format!("tail{tail}.pbf"));
+            let mut bytes = good.clone();
+            bytes.extend(std::iter::repeat_n(0xAAu8, tail));
+            std::fs::write(&path, &bytes).expect("write tail fixture");
+            assert_eq!(
+                count_headers(&path).unwrap_or_else(|e| panic!("{tail}-byte tail: {e:?}")),
+                baseline,
+                "a {tail}-byte tail must read as clean EOF after every real blob"
+            );
+        }
+
+        // A complete prefix is a committed frame. 0xFFFFFFFF is the
+        // unbounded-allocation case `check_header_len` exists for.
+        let path = dir.path().join("tail4.pbf");
+        let mut bytes = good.clone();
+        bytes.extend_from_slice(&[0xFFu8; 4]);
+        std::fs::write(&path, &bytes).expect("write committed-frame fixture");
+        count_headers(&path).expect_err("a complete prefix must not be excused as EOF");
     }
 
     #[test]

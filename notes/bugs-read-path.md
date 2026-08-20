@@ -28,86 +28,36 @@ adopting.
 
 Confidence: high on the gap; the cost of closing it was not measured.
 
-## `cat --dedupe` reads a 4-byte length prefix with no size guard
+## Shape-4 detection is three mechanisms with three failure messages
 
-`src/commands/cat/dedupe.rs`, the frame loop.
+Deliberately left alone when the frame decoder was collapsed into
+`src/read/frame.rs` (2026-08-20), and re-filed here so the decision stays
+actionable rather than merely made. `frame.rs` unified the length prefix, the
+end-of-file policy and both size guards; it could not unify shape 4 ("EOF inside
+the Blob payload"), because each site detects it with the only mechanism its I/O
+shape offers:
 
-It reads the 4-byte big-endian prefix and immediately does
-`header_buf.resize(header_len, 0)` with no `MAX_BLOB_HEADER_SIZE` check - the
-guard that `BlobReader`, `read_raw_frame`, `read_blob_header_only` and
-`HeaderWalker::next_header` all carry. Four bytes of corrupt input therefore
-request up to a 4 GiB allocation before anything inspects them. This is a fifth
-copy of the frame decoder that the "four hand-rolled copies" finding below does
-not count, and it is the one copy missing a guard the other four share, which
-is the argument for that refactor in miniature.
+- `BlobReader::next` (`blob.rs`) compares the count returned by
+  `Take::read_to_end` against the declared `datasize`.
+- `BlobReader::skip_blob_body` (`blob.rs`) and `FileReader::skip`
+  (`file_reader.rs`) seek past the payload and then read one sentinel byte to
+  find out whether the seek landed inside the file.
+- `HeaderWalker::next_header` (`header_walker.rs`) compares
+  `data_offset + data_size` against the `file_size` captured at `open()`.
 
-The zero-length case is already covered here, but only indirectly: an empty
-header slice parses to an empty type and is rejected by the shared
-`WireBlobHeader::parse` funnel rather than by a local check.
+Streaming has no file size, and pread has no stream position, so unifying them
+needs a seekable-source abstraction that reports "bytes available from here"
+and degrades to the read-and-count arm when the source cannot answer. That is a
+real refactor, not a guard to add, which is why it was not folded into the
+frame collapse.
 
-Confidence: high.
+Nothing is known to be wrong at any of the three today - every one of them hard
+errors, which is the contract. The cost is drift risk and three different
+messages for one shape, and the concrete symptom is that
+`reference/truncation-handling.md` has to enumerate the sites individually
+where shapes 1-3 now need only `read::frame`.
 
-## Four hand-rolled copies of the same frame decoder
-
-`BlobReader::read_blob_header`, `read_raw_frame`, `read_blob_header_only`,
-`HeaderWalker::next_header` each independently implement: read 4-byte BE prefix,
-EOF tolerance policy, `MAX_BLOB_HEADER_SIZE` guard, read header bytes, parse,
-`MAX_BLOB_DATASIZE` guard, payload handling. Three of them share
-`parse_blob_header_with_index` for the last two steps; `BlobReader` deliberately
-does not and carries an inline twin of the datasize check (its own comment says
-so). The truncation doc has to enumerate "six contract sites" and the test suite
-has to drive six different commands to cover them - that enumeration is a
-symptom.
-
-Each copy differs in ways that matter and are not obviously intentional:
-
-- EOF tolerance: `read_blob_header` distinguishes 0 vs 1-3 trailing bytes with a
-  two-part `read_exact`; `read_raw_frame` treats any `UnexpectedEof` on the
-  prefix as clean EOF (so a 2-byte tail is EOF, matching by luck);
-  `HeaderWalker` uses `probe_len < 4`.
-- Shape-4 detection: `BlobReader` compares `read_to_end` count; `skip_blob_body`
-  and `FileReader::skip` use the seek-then-sentinel-byte trick; `HeaderWalker`
-  compares against `file_size`. Three mechanisms, three failure messages, three
-  chances to drift.
-- The `header_len == 0` rejection had to be added to all four independently,
-  and to `cat --dedupe`'s fifth copy it was never added at all (see above) -
-  a worked example of the cost of the duplication rather than a hypothetical.
-
-Pre-1.0, collapse this to one `FrameDecoder` that owns prefix, EOF policy, both
-size guards, and header parse, parameterised only by "materialise payload / skip
-payload / record offsets". The four call sites become thin. That deletes the
-six-contract-site table from the doc and makes the next framing guard a
-one-line fix instead of a five-line one.
-
-Confidence: high that this is the right shape; it is a real refactor.
-
-## Divergent Blob-envelope semantics between the two parsers
-
-`WireBlob::parse` (`blob_wire.rs`) is last-field-wins: a blob carrying both
-`raw` (field 1) and `zlib_data` (field 3) decodes as zlib. `decompress_blob_raw`
-(`decompress.rs`) returns immediately on field 1, so the same bytes decode as
-raw. Two read paths, two different decoded contents for one adversarial blob.
-Neither rejects the multi-field case.
-
-Also, neither errors when `raw_size` disagrees with the actual decompressed
-length - it is used only as a capacity hint, so a lying `raw_size` is silently
-ignored (osmium cross-checks it). Low practical impact today; it is a latent
-divergence in a place where "two paths must agree" is a stated goal (see the
-`decompress_helpers_agree_at_message_size_boundary` test, written for exactly
-this class of bug at a neighbouring boundary).
-
-Confidence: high on the divergence, low on current exploitability.
-
-## `reference/truncation-handling.md` names a contract site that isn't one
-
-The doc lists "`PrimitiveBlock::new` (`src/read/block.rs`) for shape 5" and says
-it "was already aligned by [its] existing pattern (Cursor-based protobuf walk)".
-`PrimitiveBlock::new` takes already-decompressed `Bytes`; it never touches a
-compressed payload and cannot detect a decompression failure. Shape 5 actually
-lives in `decompress.rs`, which is not mentioned anywhere in the doc - and, per
-the first two findings, is where the stance is violated. A durable-folder
-document that must be true is currently pointing at the wrong file for the one
-shape that is broken.
+Confidence: high that the divergence is real, high that it is currently benign.
 
 ## `PrimitiveBlock::new` copies the whole buffer on a zero-copy path
 
@@ -190,11 +140,10 @@ Confidence: high on the API smell; the perf cost was not measured.
 
 ## Suggested order
 
-1. The `cat --dedupe` missing size guard is the one remaining place where four
-   bytes of corrupt input drive an unbounded allocation. It is a two-line fix.
-2. The dense `keys_vals` / `denseinfo` length checks close the last known
+1. The dense `keys_vals` / `denseinfo` length checks close the last known
    silent-truncation paths inside a block, finishing what strict block
    validation started.
-3. The frame-decoder collapse makes future framing guards a one-line fix
-   instead of a five-line one, and would have prevented the `cat --dedupe` gap
-   outright.
+2. The shape-4 unification is the remaining half of the frame-decoder collapse.
+   Nothing is broken there today, so it is a refactor to schedule rather than a
+   bug to fix - do it when the seekable-source abstraction is wanted for its own
+   sake.

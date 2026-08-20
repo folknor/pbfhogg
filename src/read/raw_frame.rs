@@ -12,9 +12,10 @@
 use std::io::Read;
 
 use crate::BoxResult as Result;
-use crate::blob::{BlobKind, MAX_BLOB_HEADER_SIZE, parse_blob_header_with_index};
+use crate::blob::BlobKind;
 use crate::blob_meta::BlobIndex;
 use crate::file_reader::FileReader;
+use crate::frame::read_frame_header;
 
 /// A raw blob frame for passthrough or selective decode.
 ///
@@ -64,58 +65,30 @@ pub(crate) fn read_raw_frame<R: Read>(
 ) -> Result<Option<RawBlobFrame>> {
     let frame_start = *file_offset;
 
-    let mut len_buf = [0u8; 4];
-    match reader.read_exact(&mut len_buf) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
-    }
-    let header_len = u32::from_be_bytes(len_buf) as usize;
-    // Match BlobReader's zero-length guard: a 4-byte frame declaring an empty
-    // BlobHeader carries no type and no payload, so a run of zero bytes would
-    // otherwise decode as a stream of skippable empty frames and exit clean.
-    if header_len == 0 {
-        return Err(
-            crate::error::new_blob_error(crate::error::BlobError::InvalidHeaderSize).into(),
-        );
-    }
-    // Match BlobReader's MAX_BLOB_HEADER_SIZE guard (blob.rs:390).
-    // Without this cap, an adversarial or corrupted length prefix
-    // forces the `vec![0u8; header_len]` allocation below into a
-    // multi-GB alloc that aborts the process.
-    if header_len as u64 >= MAX_BLOB_HEADER_SIZE {
-        return Err(
-            crate::error::new_blob_error(crate::error::BlobError::HeaderTooBig {
-                size: header_len as u64,
-            })
-            .into(),
-        );
-    }
+    // Prefix, EOF policy, both size guards and the header parse all live in
+    // `read::frame` - see that module for why they are not spelled out here.
+    let mut header_bytes = Vec::new();
+    let Some(header) = read_frame_header(reader, &mut header_bytes)? else {
+        return Ok(None);
+    };
+    let index = header
+        .raw_index
+        .and_then(|ref data| BlobIndex::deserialize(data));
 
-    let mut header_bytes = vec![0u8; header_len];
-    reader.read_exact(&mut header_bytes)?;
-
-    // parse_blob_header_with_index rejects an oversized declared datasize
-    // (>= MAX_BLOB_DATASIZE) before returning, so `data_size` here is already
-    // bounded and the `vec![0u8; frame_len]` allocation below cannot be driven
-    // to an outsized size by a hostile BlobHeader.datasize.
-    let (blob_type, data_size, raw_index, tagdata) = parse_blob_header_with_index(&header_bytes)?;
-    let index = raw_index.and_then(|ref data| BlobIndex::deserialize(data));
-
-    let blob_offset = 4 + header_len;
-    let frame_len = blob_offset + data_size;
+    let blob_offset = header.payload_offset();
+    let frame_len = blob_offset + header.data_size;
     *file_offset += frame_len as u64;
     let mut frame_bytes = vec![0u8; frame_len];
-    frame_bytes[..4].copy_from_slice(&len_buf);
+    frame_bytes[..4].copy_from_slice(&u32::to_be_bytes(header.header_len as u32));
     frame_bytes[4..blob_offset].copy_from_slice(&header_bytes);
     reader.read_exact(&mut frame_bytes[blob_offset..])?;
 
     Ok(Some(RawBlobFrame {
         frame_bytes,
-        blob_type,
+        blob_type: header.blob_type,
         blob_offset,
         index,
-        tagdata,
+        tagdata: header.tagdata,
         file_offset: frame_start,
     }))
 }
@@ -148,41 +121,20 @@ pub(crate) fn read_blob_header_only(
     reader: &mut FileReader,
     file_offset: &mut u64,
 ) -> Result<Option<BlobHeaderInfo>> {
-    let mut len_buf = [0u8; 4];
-    match reader.read_exact(&mut len_buf) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
-    }
-    let header_len = u32::from_be_bytes(len_buf) as usize;
-    // See `read_raw_frame` above for both guards' rationale.
-    if header_len == 0 {
-        return Err(
-            crate::error::new_blob_error(crate::error::BlobError::InvalidHeaderSize).into(),
-        );
-    }
-    // Match BlobReader's MAX_BLOB_HEADER_SIZE guard (blob.rs:390).
-    if header_len as u64 >= MAX_BLOB_HEADER_SIZE {
-        return Err(
-            crate::error::new_blob_error(crate::error::BlobError::HeaderTooBig {
-                size: header_len as u64,
-            })
-            .into(),
-        );
-    }
+    let mut header_bytes = Vec::new();
+    let Some(header) = read_frame_header(reader, &mut header_bytes)? else {
+        return Ok(None);
+    };
+    let index = header
+        .raw_index
+        .and_then(|ref data| BlobIndex::deserialize(data));
 
-    let mut header_bytes = vec![0u8; header_len];
-    reader.read_exact(&mut header_bytes)?;
-
-    let (blob_type, data_size, raw_index, tagdata) = parse_blob_header_with_index(&header_bytes)?;
-    let index = raw_index.and_then(|ref data| BlobIndex::deserialize(data));
-
-    *file_offset += (4 + header_len) as u64;
+    *file_offset += header.payload_offset() as u64;
 
     Ok(Some(BlobHeaderInfo {
-        blob_type,
-        data_size,
+        blob_type: header.blob_type,
+        data_size: header.data_size,
         index,
-        has_tagdata: tagdata.is_some(),
+        has_tagdata: header.tagdata.is_some(),
     }))
 }

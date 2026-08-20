@@ -657,3 +657,84 @@ fn merge_three_files_overlapping_ids() {
         "3 duplicates: node 3 ×2 + node 5 ×1"
     );
 }
+
+/// A corrupt 4-byte frame prefix in a merge input must be rejected by the size
+/// guard, not honoured as an allocation request.
+///
+/// `cat --dedupe`'s pass-1 frame loop was the fifth hand-rolled copy of the
+/// blob-frame decoder, and the only one that carried neither the
+/// `MAX_BLOB_HEADER_SIZE` cap nor the zero-length rejection: it resized its
+/// header buffer straight from the unvalidated prefix, so four bytes of
+/// corrupt input asked for up to a 4 GiB allocation before anything inspected
+/// them. The loop now shares `read::frame`'s decoder with the other four
+/// sites.
+///
+/// A trailing `0xFFFFFFFF` prefix is the worst case expressible in four bytes.
+/// The other arm of the same guard is checked alongside it: a zero-length
+/// prefix advances four bytes while declaring no type and no payload, so
+/// accepting it would let a run of zero bytes read as a clean, empty success.
+///
+/// Each arm asserts the *specific* guard's message rather than a shared
+/// substring. That is load-bearing, not pedantry: with only a "header" check,
+/// the zero-length arm passed with the zero-length guard disabled, because a
+/// zero-length prefix then parses an empty `BlobHeader` and is caught one layer
+/// down by `WireBlobHeader::parse`'s no-type-field rejection - whose message
+/// also says "header". The arm tested that a corrupt file is rejected, which
+/// was never in doubt, instead of testing the guard it was written for.
+#[test]
+fn merge_rejects_a_corrupt_frame_prefix_without_allocating() {
+    use std::io::Write as _;
+
+    for (label, prefix, expected) in [
+        (
+            "0xFFFFFFFF",
+            [0xFFu8, 0xFF, 0xFF, 0xFF],
+            "blob header is too big: 4294967295 bytes",
+        ),
+        ("zero-length", [0u8, 0, 0, 0], "blob header size is zero"),
+    ] {
+        let dir = TempDir::new().expect("tempdir");
+        let a = dir.path().join("a.osm.pbf");
+        let output = dir.path().join("output.osm.pbf");
+
+        write_test_pbf_sorted(
+            &a,
+            &[TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            }],
+            &[],
+            &[],
+        );
+        // The file is valid up to here, so the corrupt prefix sits at a frame
+        // boundary and the decoder reaches it having succeeded on every
+        // preceding frame. Four bytes is a *complete* prefix, which the EOF
+        // policy must treat as a committed frame rather than as a tolerable
+        // 1-3 byte tail.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&a)
+            .expect("reopen fixture");
+        f.write_all(&prefix).expect("append corrupt prefix");
+        drop(f);
+
+        let inputs: Vec<&std::path::Path> = vec![a.as_path()];
+        let err = merge_pbf(
+            &inputs,
+            &output,
+            &default_opts(),
+            &pbfhogg::HeaderOverrides::default(),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("a {label} frame prefix must be rejected, not merged"));
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains(expected),
+            "a {label} prefix must fail on its own frame-prefix guard \
+             (expected {expected:?}), got: {msg}"
+        );
+    }
+}

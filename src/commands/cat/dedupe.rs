@@ -17,12 +17,12 @@ use std::path::Path;
 use crate::Element;
 use crate::blob::{
     BlobKind, decode_blob_to_headerblock, decode_blob_to_primitiveblock, decompress_blob_data_into,
-    parse_blob_header_with_index,
 };
 use crate::blob_meta::{BlobIndex, ElemKind, scan_block_ids};
 use crate::block_builder::BlockBuilder;
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
+use crate::frame::read_frame_header;
 use crate::writer::{Compression, PbfWriter, reframe_raw_with_index};
 
 use crate::BoxResult as Result;
@@ -268,24 +268,25 @@ fn build_blob_index(
         loop {
             let frame_start = file_offset;
 
-            let mut len_buf = [0u8; 4];
-            match reader.read_exact(&mut len_buf) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e.into()),
-            }
-            #[allow(clippy::cast_possible_truncation)]
-            let header_len = u32::from_be_bytes(len_buf) as usize;
-
-            header_buf.resize(header_len, 0);
-            reader.read_exact(&mut header_buf)?;
-
-            let (blob_type, data_size, raw_index, tagdata) =
-                parse_blob_header_with_index(&header_buf)?;
-            let index = raw_index.as_ref().and_then(|d| BlobIndex::deserialize(d));
+            // Prefix, EOF policy, the zero-length and MAX_BLOB_HEADER_SIZE
+            // guards, and the header parse all come from `read::frame`. This
+            // loop previously resized `header_buf` straight from the
+            // unvalidated 4-byte prefix, so four bytes of corrupt input asked
+            // for up to a 4 GiB allocation - the one frame decoder that had
+            // neither guard.
+            let Some(frame) = read_frame_header(&mut reader, &mut header_buf)? else {
+                break;
+            };
+            let index = frame
+                .raw_index
+                .as_ref()
+                .and_then(|d| BlobIndex::deserialize(d));
             let has_indexdata = index.is_some();
+            let frame_len = (frame.payload_offset() + frame.data_size) as u64;
+            let blob_type = frame.blob_type;
+            let data_size = frame.data_size;
+            let tagdata = frame.tagdata;
 
-            let frame_len = (4 + header_len + data_size) as u64;
             file_offset += frame_len;
 
             match &blob_type {

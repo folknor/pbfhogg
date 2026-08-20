@@ -261,7 +261,15 @@ impl Error {
                 write!(f, "stringtable index out of bounds: {index}")
             }
             ErrorKind::Blob(BlobError::InvalidHeaderSize) => {
-                write!(f, "blob header size could not be decoded")
+                // The only producer is the zero-length frame prefix in
+                // `read::frame::check_header_len`. The old wording ("could not
+                // be decoded") described a decode failure that never happens:
+                // the four bytes decode fine, they just declare nothing.
+                write!(
+                    f,
+                    "blob header size is zero: a frame must describe a blob, so a run of \
+                     zero bytes is a corrupt file rather than a stream of empty frames"
+                )
             }
             ErrorKind::Blob(BlobError::HeaderTooBig { size }) => {
                 write!(f, "blob header is too big: {size} bytes")

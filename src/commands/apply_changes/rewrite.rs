@@ -46,6 +46,9 @@ pub struct MergeOptions {
     pub io_uring: bool,
     pub force: bool,
     pub locations_on_ways: bool,
+    /// Permit unresolved way-node references to retain the legacy `(0, 0)`
+    /// fallback under `--locations-on-ways`.
+    pub ignore_missing_nodes: bool,
     /// Override the worker-pool size used by the descriptor-first
     /// pipeline. `None` (or `Some(0)`) keeps the default `nproc - 2`
     /// heuristic (leaves two cores for scanner + drain, minimum 2
@@ -82,6 +85,7 @@ impl Default for MergeOptions {
             io_uring: false,
             force: false,
             locations_on_ways: false,
+            ignore_missing_nodes: false,
             jobs: None,
             allow_version_regression: false,
             #[cfg(feature = "test-hooks")]
@@ -201,6 +205,7 @@ pub fn merge(
         io_uring,
         force,
         locations_on_ways,
+        ignore_missing_nodes,
         jobs,
         allow_version_regression: _,
         #[cfg(feature = "test-hooks")]
@@ -508,16 +513,29 @@ pub fn merge(
     if locations_on_ways {
         final_stats.loc_nodes_needed = loc_stats_pre.0;
         final_stats.loc_nodes_from_diff = loc_stats_pre.1;
-        // from_base / missing populated by drain via worker-side counters
-        // and the published map (post-barrier inspection).
-        let extracted = worker_counters
-            .coord_pairs_extracted
+        // Resolution is counted from the merged map's UNIQUE KEYS, never
+        // from the worker tuple counter. `coord_pairs_extracted` increments
+        // once per extracted tuple, including when `local_coords.insert`
+        // replaces an id already seen - so a base PBF carrying two records
+        // for one required node would inflate the count and let it cover a
+        // genuinely absent id, silently reinstating the (0,0) fallback that
+        // the guard below exists to refuse.
+        let resolved = drain_counters
+            .barrier_loc_map_size
             .load(std::sync::atomic::Ordering::Relaxed);
-        final_stats.loc_nodes_from_base = extracted;
-        final_stats.loc_missing = loc_stats_pre.2.saturating_sub(extracted);
+        final_stats.loc_nodes_from_base = resolved.saturating_sub(loc_stats_pre.1);
+        final_stats.loc_missing = loc_stats_pre.0.saturating_sub(resolved);
         final_stats.loc_node_blobs_scanned = worker_counters
             .blobs_processed
             .load(std::sync::atomic::Ordering::Relaxed);
+    }
+
+    if locations_on_ways && final_stats.loc_missing != 0 && !ignore_missing_nodes {
+        return Err(format!(
+            "cannot write LocationsOnWays: {} referenced node(s) could not be resolved; use --ignore-missing-nodes to retain the legacy (0,0) fallback",
+            final_stats.loc_missing
+        )
+        .into());
     }
 
     final_stats.print_summary();

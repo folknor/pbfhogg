@@ -408,6 +408,7 @@ fn apply_changes_non_indexed_parity() {
         io_uring: false,
         force: true,
         locations_on_ways: false,
+        ignore_missing_nodes: false,
         jobs: None,
         allow_version_regression: false,
         #[cfg(feature = "test-hooks")]

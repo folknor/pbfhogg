@@ -60,6 +60,18 @@ survive a pipeline. Absence has to be reported as absence. `--ignore-missing-nod
 still produces exactly the old output for callers who want it, and the summary
 line is unchanged.
 
+## apply-changes: missing LocationsOnWays nodes are an error
+
+**osmium behavior:** Under `--locations-on-ways`, an unresolved way-node
+reference is written with `(0, 0)` as its coordinate and no warning.
+
+**pbfhogg behavior:** The command fails and does not publish its output. Pass
+`--ignore-missing-nodes` to request the osmium-compatible `(0, 0)` fallback.
+
+**Rationale:** Null Island is a valid coordinate, so a sentinel-bearing output
+cannot distinguish missing data from real data. Failure by default matches
+`add-locations-to-ways` and keeps the lossy behavior explicit.
+
 ## diff: content equality vs version ordering
 
 **osmium behavior:** Matches elements by `(type, id, version, timestamp)` ordering,

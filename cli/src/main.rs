@@ -871,6 +871,9 @@ enum Command {
         /// Requires the base PBF to have LocationsOnWays and be sorted.
         #[arg(long)]
         locations_on_ways: bool,
+        /// Permit unresolved references to use the legacy (0,0) fallback.
+        #[arg(long, requires = "locations_on_ways")]
+        ignore_missing_nodes: bool,
         /// Accept a change whose version does not advance past the one
         /// already held for that object. Off by default: a repeated or
         /// out-of-order diff otherwise downgrades objects to an older
@@ -1820,6 +1823,7 @@ fn main() -> process::ExitCode {
                 io,
                 uring,
                 locations_on_ways,
+                ignore_missing_nodes,
                 allow_version_regression,
                 jobs,
                 header,
@@ -1838,6 +1842,7 @@ fn main() -> process::ExitCode {
                         out,
                         &write,
                         locations_on_ways,
+                        ignore_missing_nodes,
                         allow_version_regression,
                         jobs,
                         &overrides,
@@ -3512,6 +3517,7 @@ fn run_apply_changes(
     output: &std::path::Path,
     write: &WriteOpts,
     locations_on_ways: bool,
+    ignore_missing_nodes: bool,
     allow_version_regression: bool,
     jobs: usize,
     overrides: &HeaderOverrides,
@@ -3522,6 +3528,7 @@ fn run_apply_changes(
         io_uring: write.io_uring,
         force: write.force,
         locations_on_ways,
+        ignore_missing_nodes,
         jobs: if jobs == 0 { None } else { Some(jobs) },
         allow_version_regression,
         #[cfg(feature = "test-hooks")]
@@ -3821,6 +3828,7 @@ fn run_bench_merge(
         io_uring,
         force: true,
         locations_on_ways: false,
+        ignore_missing_nodes: false,
         jobs: None,
         allow_version_regression: false,
         #[cfg(feature = "test-hooks")]

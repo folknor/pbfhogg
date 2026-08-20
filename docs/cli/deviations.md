@@ -40,6 +40,20 @@ pipeline. `--ignore-missing-nodes` still produces exactly the old output for
 callers who want it, and the summary line is unchanged. See
 [Correctness](/guide/correctness).
 
+## apply-changes: missing LocationsOnWays nodes are an error
+
+**osmium behavior:** Under `--locations-on-ways`, an unresolved way-node
+reference is written with `(0, 0)` as its coordinate and no warning.
+
+**pbfhogg behavior:** The command fails and does not publish its output. Pass
+`--ignore-missing-nodes` to request the osmium-compatible `(0, 0)` fallback.
+
+**Rationale:** Null Island is a valid coordinate, so a sentinel-bearing output
+cannot distinguish missing data from real data. Failure by default matches
+`add-locations-to-ways` and keeps the lossy behavior explicit. The escape
+hatch matters for incremental extracts, where a regional base plus a
+full-planet change stream legitimately references nodes outside the region.
+
 ## diff: content equality vs version ordering
 
 **osmium behavior:** Uses version/timestamp ordering to determine which element is

@@ -338,6 +338,11 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     // fall back to element-by-element iteration.
     crate::debug::emit_marker("PASS1_NODE_CLASSIFY_START");
     let use_columnar = matches!(region, Region::Bbox(_));
+    // The columnar classifier decides point membership, not blob candidacy,
+    // so it must run against the exact box. `bbox_int` is deliberately
+    // widened and would admit nodes up to one decimicrodegree outside the
+    // requested bbox - the same defect fixed in the multi-extract classifier.
+    let exact_bbox = BboxInt::inside_bbox(region.bbox());
     crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &node_schedule,
@@ -353,10 +358,10 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             if use_columnar {
                 block.decode_dense_columns(columns);
                 columns.collect_matching_ids_bbox(
-                    bbox_int.min_lat,
-                    bbox_int.max_lat,
-                    bbox_int.min_lon,
-                    bbox_int.max_lon,
+                    exact_bbox.min_lat,
+                    exact_bbox.max_lat,
+                    exact_bbox.min_lon,
+                    exact_bbox.max_lon,
                     ids,
                 );
             } else {

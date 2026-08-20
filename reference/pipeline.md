@@ -225,7 +225,7 @@ sorted + indexed input):
    delta-varint `coord_payloads`
 4. Assembly → pread workers reframe way blobs, splicing coord payloads
 
-~8.7 GB RAM, ~224 GB temp disk at planet; the only mode that survives
+~8.7 GB RAM, ~256 GB peak temp disk at planet; the only mode that survives
 planet on a 30 GB-class host.
 
 **Auto**: scale-aware routing (2026-07-16). Sparse unless the input is

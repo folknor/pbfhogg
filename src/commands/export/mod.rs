@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
 
-use crate::commands::spatial::BboxInt;
+use crate::commands::extract::Bbox;
 use crate::error::{ErrorKind, new_error};
 use crate::owned::TypeFilter;
 use crate::tag_expr::{Expression, parse_expressions, tag_matches};
@@ -38,7 +38,7 @@ pub struct ExportOptions {
     types: ExportTypes,
     expressions: Vec<Expression>,
     properties: Option<HashSet<String>>,
-    bbox: Option<BboxInt>,
+    bbox: Option<Bbox>,
     metadata: bool,
 }
 
@@ -56,14 +56,12 @@ impl ExportOptions {
         })?;
         let bbox = bbox
             .map(|value| {
-                crate::commands::extract::parse_bbox(value)
-                    .map(|bbox| BboxInt::from_bbox(&bbox))
-                    .map_err(|error| {
-                        crate::Error::from(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            error.to_string(),
-                        ))
-                    })
+                crate::commands::extract::parse_bbox(value).map_err(|error| {
+                    crate::Error::from(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        error.to_string(),
+                    ))
+                })
             })
             .transpose()?;
         Ok(Self {
@@ -141,11 +139,11 @@ fn way_kind() -> TypeFilter {
     }
 }
 
-#[allow(clippy::cast_possible_truncation)]
-fn way_hits_bbox(coords: &[(f64, f64)], bbox: &BboxInt) -> bool {
-    coords
-        .iter()
-        .any(|&(lon, lat)| bbox.contains((lat * 1e7).round() as i32, (lon * 1e7).round() as i32))
+/// The exported geometry carries f64 degrees, and the user's bbox is f64
+/// degrees, so membership is decided in degrees. Round-tripping either side
+/// through decimicrodegrees introduces a boundary disagreement for no gain.
+fn way_hits_bbox(coords: &[(f64, f64)], bbox: &Bbox) -> bool {
+    coords.iter().any(|&(lon, lat)| bbox.contains(lat, lon))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -167,96 +165,101 @@ pub fn export<W: Write>(input: &Path, out: W, opts: &ExportOptions) -> crate::Re
         if first_err.is_some() {
             return;
         }
-        let result =
-            match element {
-                Element::Node(node) if admits_nodes(opts.types) => {
-                    let tags = node.tags();
-                    if tags.clone().next().is_none() {
-                        stats.skipped_untagged_nodes += 1;
-                        return;
-                    }
-                    if opts.bbox.as_ref().is_some_and(|bbox| {
-                        !bbox.contains(node.decimicro_lat(), node.decimicro_lon())
-                    }) || !matches_expressions(&opts.expressions, &tags, &node_kind())
-                    {
-                        return;
-                    }
-                    write_point(&mut geometry, &mut coord_scratch, node.lon(), node.lat());
-                    let info = node.info();
-                    let meta = MetaView::from_info(&info);
-                    write_properties(&mut properties, node.id(), "node", tags, Some(&meta), opts)
-                        .and_then(|()| {
-                            writer.write_feature_geometry_props(&geometry, &properties)?;
-                            stats.nodes += 1;
-                            stats.features += 1;
-                            Ok(())
-                        })
+        let result = match element {
+            Element::Node(node) if admits_nodes(opts.types) => {
+                let tags = node.tags();
+                if tags.clone().next().is_none() {
+                    stats.skipped_untagged_nodes += 1;
+                    return;
                 }
-                Element::DenseNode(node) if admits_nodes(opts.types) => {
-                    let tags = node.tags();
-                    if tags.clone().next().is_none() {
-                        stats.skipped_untagged_nodes += 1;
-                        return;
-                    }
-                    if opts.bbox.as_ref().is_some_and(|bbox| {
-                        !bbox.contains(node.decimicro_lat(), node.decimicro_lon())
-                    }) || !matches_expressions(&opts.expressions, &tags, &node_kind())
-                    {
-                        return;
-                    }
-                    write_point(&mut geometry, &mut coord_scratch, node.lon(), node.lat());
-                    let meta = node.info().map(MetaView::from_dense);
-                    write_properties(
-                        &mut properties,
-                        node.id(),
-                        "node",
-                        tags,
-                        meta.as_ref(),
-                        opts,
+                if opts.bbox.as_ref().is_some_and(|bbox| {
+                    !bbox.contains(
+                        f64::from(node.decimicro_lat()) * 1e-7,
+                        f64::from(node.decimicro_lon()) * 1e-7,
                     )
+                }) || !matches_expressions(&opts.expressions, &tags, &node_kind())
+                {
+                    return;
+                }
+                write_point(&mut geometry, &mut coord_scratch, node.lon(), node.lat());
+                let info = node.info();
+                let meta = MetaView::from_info(&info);
+                write_properties(&mut properties, node.id(), "node", tags, Some(&meta), opts)
                     .and_then(|()| {
                         writer.write_feature_geometry_props(&geometry, &properties)?;
                         stats.nodes += 1;
                         stats.features += 1;
                         Ok(())
                     })
+            }
+            Element::DenseNode(node) if admits_nodes(opts.types) => {
+                let tags = node.tags();
+                if tags.clone().next().is_none() {
+                    stats.skipped_untagged_nodes += 1;
+                    return;
                 }
-                Element::Way(way) if admits_ways(opts.types) => {
-                    let tags = way.tags();
-                    if tags.clone().next().is_none() {
-                        stats.skipped_untagged_ways += 1;
-                        return;
-                    }
-                    if !matches_expressions(&opts.expressions, &tags, &way_kind()) {
-                        return;
-                    }
-                    let is_area = is_area_way(&way);
-                    collect_coords(&way, &mut coords);
-                    if write_way_geometry(&mut geometry, &mut coord_scratch, &coords, is_area)
-                        == WayGeom::Invalid
-                    {
-                        stats.skipped_invalid_ways += 1;
-                        return;
-                    }
-                    if opts
-                        .bbox
-                        .as_ref()
-                        .is_some_and(|bbox| !way_hits_bbox(&coords, bbox))
-                    {
-                        return;
-                    }
-                    let info = way.info();
-                    let meta = MetaView::from_info(&info);
-                    write_properties(&mut properties, way.id(), "way", tags, Some(&meta), opts)
-                        .and_then(|()| {
-                            writer.write_feature_geometry_props(&geometry, &properties)?;
-                            stats.ways += 1;
-                            stats.features += 1;
-                            Ok(())
-                        })
+                if opts.bbox.as_ref().is_some_and(|bbox| {
+                    !bbox.contains(
+                        f64::from(node.decimicro_lat()) * 1e-7,
+                        f64::from(node.decimicro_lon()) * 1e-7,
+                    )
+                }) || !matches_expressions(&opts.expressions, &tags, &node_kind())
+                {
+                    return;
                 }
-                _ => return,
-            };
+                write_point(&mut geometry, &mut coord_scratch, node.lon(), node.lat());
+                let meta = node.info().map(MetaView::from_dense);
+                write_properties(
+                    &mut properties,
+                    node.id(),
+                    "node",
+                    tags,
+                    meta.as_ref(),
+                    opts,
+                )
+                .and_then(|()| {
+                    writer.write_feature_geometry_props(&geometry, &properties)?;
+                    stats.nodes += 1;
+                    stats.features += 1;
+                    Ok(())
+                })
+            }
+            Element::Way(way) if admits_ways(opts.types) => {
+                let tags = way.tags();
+                if tags.clone().next().is_none() {
+                    stats.skipped_untagged_ways += 1;
+                    return;
+                }
+                if !matches_expressions(&opts.expressions, &tags, &way_kind()) {
+                    return;
+                }
+                let is_area = is_area_way(&way);
+                collect_coords(&way, &mut coords);
+                if write_way_geometry(&mut geometry, &mut coord_scratch, &coords, is_area)
+                    == WayGeom::Invalid
+                {
+                    stats.skipped_invalid_ways += 1;
+                    return;
+                }
+                if opts
+                    .bbox
+                    .as_ref()
+                    .is_some_and(|bbox| !way_hits_bbox(&coords, bbox))
+                {
+                    return;
+                }
+                let info = way.info();
+                let meta = MetaView::from_info(&info);
+                write_properties(&mut properties, way.id(), "way", tags, Some(&meta), opts)
+                    .and_then(|()| {
+                        writer.write_feature_geometry_props(&geometry, &properties)?;
+                        stats.ways += 1;
+                        stats.features += 1;
+                        Ok(())
+                    })
+            }
+            _ => return,
+        };
         if let Err(error) = result {
             first_err = Some(error);
         }

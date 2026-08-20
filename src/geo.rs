@@ -71,6 +71,7 @@ pub fn ring_crosses_antimeridian(ring: &[(f64, f64)]) -> bool {
     }
     ring.windows(2)
         .any(|segment| (segment[1].0 - segment[0].0).abs() > 180.0)
+        || (ring[ring.len() - 1].0 - ring[0].0).abs() > 180.0
 }
 
 /// Unwrap longitudes into a continuous sequence to avoid the ±180° discontinuity.
@@ -240,15 +241,22 @@ fn dp_count(ring: &[(f64, f64)], epsilon: f64) -> usize {
     if ring.len() <= 2 {
         return ring.len();
     }
-    // 2 for first and last, plus recursive count of interior kept vertices
-    2 + dp_count_range(ring, 0, ring.len() - 1, epsilon)
+    let mut count = 2;
+    let mut stack = vec![(0, ring.len() - 1)];
+    while let Some((start, end)) = stack.pop() {
+        if let Some(max_idx) = dp_split(ring, start, end, epsilon * epsilon) {
+            count += 1;
+            stack.push((start, max_idx));
+            stack.push((max_idx, end));
+        }
+    }
+    count
 }
 
-/// Count vertices kept by Douglas-Peucker in the open range (start, end).
-/// Uses the same clamped segment-distance metric as `dp_mark`.
-fn dp_count_range(pts: &[(f64, f64)], start: usize, end: usize, epsilon: f64) -> usize {
+/// Return the most significant interior vertex when it exceeds `epsilon_sq`.
+fn dp_split(pts: &[(f64, f64)], start: usize, end: usize, epsilon_sq: f64) -> Option<usize> {
     if end <= start + 1 {
-        return 0;
+        return None;
     }
     let (ax, ay) = pts[start];
     let (bx, by) = pts[end];
@@ -274,52 +282,18 @@ fn dp_count_range(pts: &[(f64, f64)], start: usize, end: usize, epsilon: f64) ->
             max_idx = i;
         }
     }
-    if max_dist > epsilon * epsilon {
-        1 + dp_count_range(pts, start, max_idx, epsilon)
-            + dp_count_range(pts, max_idx, end, epsilon)
-    } else {
-        0
-    }
+    (max_dist > epsilon_sq).then_some(max_idx)
 }
 
-/// Mark vertices to keep using Douglas-Peucker recursion.
+/// Mark vertices to keep using an explicit stack.
 fn dp_mark(pts: &[(f64, f64)], start: usize, end: usize, epsilon: f64, keep: &mut [bool]) {
-    if end <= start + 1 {
-        return;
-    }
-
-    let ax = pts[start].0;
-    let ay = pts[start].1;
-    let bx = pts[end].0;
-    let by = pts[end].1;
-    let dx = bx - ax;
-    let dy = by - ay;
-    let len_sq = dx * dx + dy * dy;
-
-    let mut max_dist = 0.0_f64;
-    let mut max_idx = start;
-
-    for (i, pt) in pts.iter().enumerate().take(end).skip(start + 1) {
-        let px = pt.0 - ax;
-        let py = pt.1 - ay;
-        let dist = if len_sq < 1e-30 {
-            (px * px + py * py).sqrt()
-        } else {
-            let t = ((px * dx + py * dy) / len_sq).clamp(0.0, 1.0);
-            let proj_x = t * dx - px;
-            let proj_y = t * dy - py;
-            (proj_x * proj_x + proj_y * proj_y).sqrt()
-        };
-        if dist > max_dist {
-            max_dist = dist;
-            max_idx = i;
+    let mut stack = vec![(start, end)];
+    while let Some((range_start, range_end)) = stack.pop() {
+        if let Some(max_idx) = dp_split(pts, range_start, range_end, epsilon * epsilon) {
+            keep[max_idx] = true;
+            stack.push((range_start, max_idx));
+            stack.push((max_idx, range_end));
         }
-    }
-
-    if max_dist > epsilon {
-        keep[max_idx] = true;
-        dp_mark(pts, start, max_idx, epsilon, keep);
-        dp_mark(pts, max_idx, end, epsilon, keep);
     }
 }
 
@@ -333,12 +307,8 @@ fn dp_mark(pts: &[(f64, f64)], start: usize, end: usize, epsilon: f64, keep: &mu
 /// decimicrodegrees). Segments are joined by matching endpoints. Returns
 /// closed rings as vectors of coordinate pairs. Unclosed chains are dropped.
 ///
-/// **Limitation:** This is a greedy assembler - it follows the first available
-/// continuation at each endpoint without backtracking. On ambiguous endpoint
-/// graphs (where multiple unused segments share an endpoint), an unlucky
-/// branch can consume segments into a dead-end chain and prevent a valid
-/// closed ring from being assembled later. This is acceptable for OSM admin
-/// boundary relations, which produce well-formed endpoint graphs in practice.
+/// Ambiguous endpoint graphs are explored with an explicit backtracking stack,
+/// so a dead-end branch neither loses its segments nor hides a valid ring.
 pub fn assemble_rings(segments: &[&[(i32, i32)]]) -> Vec<Vec<(i32, i32)>> {
     if segments.is_empty() {
         return Vec::new();
@@ -369,7 +339,24 @@ pub fn assemble_rings(segments: &[&[(i32, i32)]]) -> Vec<Vec<(i32, i32)>> {
         let mut ring: Vec<(i32, i32)> = segments[start_idx].to_vec();
         let ring_start = ring[0];
 
-        loop {
+        struct SearchFrame {
+            candidates: Vec<usize>,
+            next_candidate: usize,
+            chosen_segment: Option<usize>,
+            ring_len_before: usize,
+        }
+        let candidates = endpoint_map
+            .get(ring.last().expect("nonempty ring"))
+            .cloned()
+            .unwrap_or_default();
+        let mut search = vec![SearchFrame {
+            candidates,
+            next_candidate: 0,
+            chosen_segment: None,
+            ring_len_before: ring.len(),
+        }];
+
+        while !search.is_empty() {
             let current_end = ring[ring.len() - 1];
 
             // Ring is closed
@@ -377,17 +364,24 @@ pub fn assemble_rings(segments: &[&[(i32, i32)]]) -> Vec<Vec<(i32, i32)>> {
                 break;
             }
 
-            // Find an unused segment that connects at current_end
-            let next = endpoint_map
-                .get(&current_end)
-                .and_then(|indices| indices.iter().find(|&&idx| !used[idx]))
-                .copied();
-
-            let Some(next_idx) = next else {
-                break; // Dead end - chain is unclosed
+            let frame = search.last_mut().expect("search is nonempty");
+            let next = frame.candidates[frame.next_candidate..]
+                .iter()
+                .position(|&idx| !used[idx])
+                .map(|offset| frame.next_candidate + offset);
+            let Some(candidate_pos) = next else {
+                let exhausted = search.pop().expect("search is nonempty");
+                if let Some(segment_idx) = exhausted.chosen_segment {
+                    used[segment_idx] = false;
+                    ring.truncate(exhausted.ring_len_before);
+                }
+                continue;
             };
+            frame.next_candidate = candidate_pos + 1;
+            let next_idx = frame.candidates[candidate_pos];
 
             used[next_idx] = true;
+            let ring_len_before = ring.len();
             let seg = segments[next_idx];
             let seg_start = seg[0];
             let seg_end = seg[seg.len() - 1];
@@ -401,13 +395,26 @@ pub fn assemble_rings(segments: &[&[(i32, i32)]]) -> Vec<Vec<(i32, i32)>> {
                     ring.push(pt);
                 }
             } else {
-                break; // Should not happen
+                used[next_idx] = false;
+                continue;
             }
+            let candidates = endpoint_map
+                .get(ring.last().expect("nonempty ring"))
+                .cloned()
+                .unwrap_or_default();
+            search.push(SearchFrame {
+                candidates,
+                next_candidate: 0,
+                chosen_segment: Some(next_idx),
+                ring_len_before,
+            });
         }
 
         // Only keep closed rings
         if ring.len() > 2 && ring[ring.len() - 1] == ring_start {
             rings.push(ring);
+        } else {
+            used[start_idx] = false;
         }
     }
 
@@ -416,18 +423,27 @@ pub fn assemble_rings(segments: &[&[(i32, i32)]]) -> Vec<Vec<(i32, i32)>> {
 
 /// Compute the signed area of a ring in decimicrodegree² units.
 ///
-/// Positive = counter-clockwise (exterior), negative = clockwise (hole).
-/// Uses the shoelace formula.
+/// Tuples are `(lat_e7, lon_e7)`, matching [`assemble_rings`]. Positive means
+/// counter-clockwise on the map (exterior), negative means clockwise (hole).
+/// Uses a ring-local origin to avoid cancellation of world-scale coordinates.
 pub fn signed_area(ring: &[(i32, i32)]) -> f64 {
     if ring.len() < 3 {
         return 0.0;
     }
     let mut area = 0.0_f64;
+    let origin_lat = f64::from(ring[0].0);
+    let origin_lon = f64::from(ring[0].1);
     let n = ring.len();
     for i in 0..n {
         let j = (i + 1) % n;
-        let (xi, yi) = (ring[i].0 as f64, ring[i].1 as f64);
-        let (xj, yj) = (ring[j].0 as f64, ring[j].1 as f64);
+        let (xi, yi) = (
+            f64::from(ring[i].1) - origin_lon,
+            f64::from(ring[i].0) - origin_lat,
+        );
+        let (xj, yj) = (
+            f64::from(ring[j].1) - origin_lon,
+            f64::from(ring[j].0) - origin_lat,
+        );
         area += xi * yj;
         area -= xj * yi;
     }
@@ -496,6 +512,39 @@ mod tests {
         assert!(point_in_ring_with_antimeridian(179.5, 11.0, &ring));
         assert!(point_in_ring_with_antimeridian(-179.5, 11.0, &ring));
         assert!(!point_in_ring_with_antimeridian(0.0, 11.0, &ring));
+    }
+
+    /// The guard added for the implicit closing edge needs a fixture where
+    /// only that edge crosses. The original fixture stepped -179 -> -170 ->
+    /// 179, whose SECOND window is already a 349-degree jump, so the
+    /// pre-existing `windows(2)` scan answered true and the new clause was
+    /// never reached: it passed identically with the fix reverted.
+    ///
+    /// Here every explicit step walks through 0 and stays under 180. Only
+    /// the closing segment, from 179 back to -179, crosses.
+    #[test]
+    fn unclosed_ring_checks_implicit_closing_segment_for_antimeridian() {
+        let ring = vec![
+            (-179.0, 0.0),
+            (-90.0, 1.0),
+            (0.0, 2.0),
+            (90.0, 3.0),
+            (179.0, 4.0),
+        ];
+        assert!(
+            ring.windows(2)
+                .all(|s: &[(f64, f64)]| (s[1].0 - s[0].0).abs() <= 180.0),
+            "fixture is only meaningful while no explicit segment crosses"
+        );
+        assert!(ring_crosses_antimeridian(&ring));
+    }
+
+    /// A ring that crosses nothing must stay false, closing edge included -
+    /// the clause must not be a blanket "first and last differ".
+    #[test]
+    fn ring_without_any_crossing_stays_false_including_the_closing_edge() {
+        let ring = vec![(10.0, 0.0), (20.0, 1.0), (30.0, 2.0), (15.0, 3.0)];
+        assert!(!ring_crosses_antimeridian(&ring));
     }
 
     // -- point_in_polygon (with holes) ---------------------------------------
@@ -574,6 +623,127 @@ mod tests {
         assert!(result.len() >= 3);
     }
 
+    /// Reference implementation: the recursive Douglas-Peucker marker that
+    /// the explicit-stack version replaced, transcribed verbatim (sqrt
+    /// distance against a non-squared epsilon, as it was).
+    fn dp_mark_recursive_reference(
+        pts: &[(f64, f64)],
+        start: usize,
+        end: usize,
+        epsilon: f64,
+        keep: &mut [bool],
+    ) {
+        if end <= start + 1 {
+            return;
+        }
+        let (ax, ay) = pts[start];
+        let (bx, by) = pts[end];
+        let dx = bx - ax;
+        let dy = by - ay;
+        let len_sq = dx * dx + dy * dy;
+        let mut max_dist = 0.0_f64;
+        let mut max_idx = start;
+        for (i, pt) in pts.iter().enumerate().take(end).skip(start + 1) {
+            let px = pt.0 - ax;
+            let py = pt.1 - ay;
+            let dist = if len_sq < 1e-30 {
+                (px * px + py * py).sqrt()
+            } else {
+                let t = ((px * dx + py * dy) / len_sq).clamp(0.0, 1.0);
+                let proj_x = t * dx - px;
+                let proj_y = t * dy - py;
+                (proj_x * proj_x + proj_y * proj_y).sqrt()
+            };
+            if dist > max_dist {
+                max_dist = dist;
+                max_idx = i;
+            }
+        }
+        if max_dist > epsilon {
+            keep[max_idx] = true;
+            dp_mark_recursive_reference(pts, start, max_idx, epsilon, keep);
+            dp_mark_recursive_reference(pts, max_idx, end, epsilon, keep);
+        }
+    }
+
+    /// Replacing recursion with a stack must not move a single vertex.
+    /// A stack-depth test cannot see a geometry change, and a changed
+    /// simplification would be invisible right up to the point-in-polygon
+    /// answers it feeds, so the equivalence is asserted directly - kept-set
+    /// for the marker, count for the epsilon search - over shapes chosen to
+    /// exercise both the collinear and the degenerate-chord branches.
+    #[test]
+    fn iterative_douglas_peucker_matches_the_recursive_version_exactly() {
+        let mut state = 0x1234_5678_9abc_def0_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut rings: Vec<Vec<(f64, f64)>> = Vec::new();
+        // Comb: worst case for recursion depth, and every split peels one.
+        rings.push((0..400).map(|i| (f64::from(i), f64::from(i % 2))).collect());
+        // Perfectly collinear: no split ever exceeds epsilon.
+        rings.push((0..50).map(|i| (f64::from(i), 0.0)).collect());
+        // Degenerate chord: first and last coincide, so len_sq < 1e-30.
+        rings.push(
+            (0..60)
+                .map(|i| {
+                    let a = f64::from(i) / 59.0 * std::f64::consts::TAU;
+                    (a.cos(), a.sin())
+                })
+                .collect(),
+        );
+        // Random scatter.
+        for _ in 0..8 {
+            rings.push(
+                (0..120)
+                    .map(|_| {
+                        #[allow(clippy::cast_precision_loss)]
+                        let x = (next() % 10_000) as f64 / 100.0;
+                        #[allow(clippy::cast_precision_loss)]
+                        let y = (next() % 10_000) as f64 / 100.0;
+                        (x, y)
+                    })
+                    .collect(),
+            );
+        }
+
+        for ring in &rings {
+            for &epsilon in &[0.0, 1e-9, 0.001, 0.05, 0.5, 3.0, 100.0] {
+                let last = ring.len() - 1;
+                let mut iterative = vec![false; ring.len()];
+                dp_mark(ring, 0, last, epsilon, &mut iterative);
+                let mut recursive = vec![false; ring.len()];
+                dp_mark_recursive_reference(ring, 0, last, epsilon, &mut recursive);
+                assert_eq!(
+                    iterative,
+                    recursive,
+                    "dp_mark diverged at epsilon {epsilon} for a {}-point ring",
+                    ring.len()
+                );
+                let expected = 2 + recursive.iter().filter(|k| **k).count();
+                assert_eq!(
+                    dp_count(ring, epsilon),
+                    expected,
+                    "dp_count diverged at epsilon {epsilon}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn simplify_ring_handles_deep_path_without_recursion() {
+        let ring: Vec<_> = (0..20_000)
+            .map(|i| (i as f64, if i % 2 == 0 { 0.0 } else { 1.0 }))
+            .collect();
+        let simplified = simplify_ring(&ring, 64);
+        assert!(simplified.len() <= 64);
+        assert_eq!(simplified.first(), ring.first());
+        assert_eq!(simplified.last(), ring.last());
+    }
+
     // -- assemble_rings ------------------------------------------------------
 
     #[test]
@@ -621,54 +791,73 @@ mod tests {
 
     // -- signed_area ---------------------------------------------------------
 
-    /// Positive for a ring that is counter-clockwise when the tuples are
-    /// read as `(x, y)`.
+    /// Rings reach `signed_area` from `assemble_rings`, which produces
+    /// `(lat_e7, lon_e7)` tuples. The shoelace therefore has to read the
+    /// second component as x and the first as y; reading them positionally
+    /// as `(x, y)` inverts the sign for every real caller.
     ///
-    /// Read the fixture carefully: this pins the shoelace as the function
-    /// computes it, on its own `(x, y)` reading of the tuple. It is NOT the
-    /// orientation of the same ring on a map, because every ring that
-    /// actually reaches this function comes from `assemble_rings` and is
-    /// `(lat_e7, lon_e7)` - that is `(y, x)`, which flips the sign. See
-    /// `signed_area_sign_is_inverted_for_real_assemble_rings_output`.
+    /// This fixture is clockwise ON THE MAP: as `(lon, lat)` it walks
+    /// (0,0) -> (0,10) -> (10,10) -> (10,0), which turns right.
     #[test]
-    fn signed_area_ccw_in_the_functions_own_xy_reading() {
-        let ring = vec![(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)];
-        assert!(signed_area(&ring) > 0.0);
+    fn signed_area_is_negative_for_a_clockwise_map_ring() {
+        let clockwise_on_the_map = vec![(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)];
+        assert!(signed_area(&clockwise_on_the_map) < 0.0);
     }
 
-    /// Negative counterpart of the above, same caveat.
+    /// Counter-clockwise counterpart, same `(lat, lon)` reading.
     #[test]
-    fn signed_area_cw_in_the_functions_own_xy_reading() {
-        let ring = vec![(0, 0), (0, 10), (10, 10), (10, 0), (0, 0)];
-        assert!(signed_area(&ring) < 0.0);
+    fn signed_area_is_positive_for_a_counter_clockwise_map_ring() {
+        let ccw_on_the_map = vec![(0, 0), (0, 10), (10, 10), (10, 0), (0, 0)];
+        assert!(signed_area(&ccw_on_the_map) > 0.0);
     }
 
-    /// The landmine, pinned as it currently behaves.
+    /// The canary. It was written when the convention was inverted, pinning
+    /// the wrong sign so that correcting it could not land silently; it has
+    /// now been flipped to pin the CORRECT sign, and it keeps that job.
     ///
-    /// `signed_area` documents "positive = counter-clockwise (exterior)",
-    /// and binds `(xi, yi) = (ring[i].0, ring[i].1)`. But its rings come
-    /// from `assemble_rings`, documented and implemented as
-    /// `(lat_e7, lon_e7)` - `(y, x)` - so the shoelace sign is inverted for
-    /// every real caller. The two tests above hid this by labelling their
-    /// fixtures with the `(x, y)` reading, which is the reading no caller
-    /// uses.
-    ///
-    /// Nothing notices today because the only call site
-    /// (`geocode_index/builder/admin.rs`) immediately takes `.abs()`. This
-    /// test exists so that the next caller cannot walk into it, and so that
-    /// correcting the convention is a deliberate change that fails here
-    /// rather than a silent one.
+    /// Nothing notices a sign error today because the only call site
+    /// (`geocode_index/builder/admin.rs`) immediately takes `.abs()`. That
+    /// is exactly why this test has to exist: the next caller that reads the
+    /// sign must not walk into an undocumented inversion, and any future
+    /// change of convention must fail here rather than pass quietly.
     #[test]
-    fn signed_area_sign_is_inverted_for_real_assemble_rings_output() {
+    fn signed_area_sign_matches_real_assemble_rings_output() {
         // A square that is counter-clockwise on the map, written in the
         // `(lat_e7, lon_e7)` order `assemble_rings` produces: going
         // (lon 0, lat 0) -> (10, 0) -> (10, 10) -> (0, 10).
         let ccw_on_the_map = vec![(0, 0), (0, 10), (10, 10), (10, 0), (0, 0)];
         assert!(
-            signed_area(&ccw_on_the_map) < 0.0,
-            "documented as positive for a counter-clockwise exterior; it is \
-             negative, because the ring is (lat, lon) and the shoelace reads \
-             it as (x, y)"
+            signed_area(&ccw_on_the_map) > 0.0,
+            "counter-clockwise map ring in (lat, lon) order must have positive area"
+        );
+        // And the mirror image must be the opposite sign, not merely
+        // nonzero - a magnitude-only assertion would survive the inversion
+        // this canary exists to catch.
+        let mut reversed = ccw_on_the_map.clone();
+        reversed.reverse();
+        assert!(signed_area(&reversed) < 0.0);
+        assert!(
+            (signed_area(&reversed) + signed_area(&ccw_on_the_map)).abs() < f64::EPSILON,
+            "reversing a ring must negate its area exactly"
+        );
+    }
+
+    /// The local-origin subtraction must not change the answer, only the
+    /// conditioning. Planet-scale coordinates are where naive shoelace
+    /// cancellation loses precision, so the check runs there.
+    #[test]
+    fn signed_area_is_translation_invariant_at_world_scale() {
+        let ring = vec![(0, 0), (0, 1000), (1000, 1000), (1000, 0), (0, 0)];
+        let shifted: Vec<(i32, i32)> = ring
+            .iter()
+            .map(|&(lat, lon)| (lat + 500_000_000, lon + 1_700_000_000))
+            .collect();
+        let a = signed_area(&ring);
+        let b = signed_area(&shifted);
+        assert!(a > 0.0);
+        assert!(
+            (a - b).abs() / a < 1e-9,
+            "world-scale translation changed the area: {a} vs {b}"
         );
     }
 
@@ -676,5 +865,16 @@ mod tests {
     fn signed_area_degenerate() {
         assert!(signed_area(&[]).abs() < f64::EPSILON);
         assert!(signed_area(&[(0, 0), (1, 1)]).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn assemble_rings_backtracks_at_ambiguous_junction() {
+        let start = [(0, 0), (0, 1)];
+        let dead_end = [(0, 1), (0, 2)];
+        let good = [(0, 1), (1, 1)];
+        let close = [(1, 1), (0, 0)];
+        let rings = assemble_rings(&[&start, &dead_end, &good, &close]);
+        assert_eq!(rings.len(), 1);
+        assert_eq!(rings[0], vec![(0, 0), (0, 1), (1, 1), (0, 0)]);
     }
 }

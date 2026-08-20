@@ -67,6 +67,10 @@ pub(super) fn try_extract_multi_single_pass(
         .iter()
         .map(|s| BboxInt::from_bbox(s.region.bbox()))
         .collect();
+    let inside_bbox_ints: Vec<BboxInt> = slots
+        .iter()
+        .map(|s| BboxInt::inside_bbox(s.region.bbox()))
+        .collect();
 
     // Union bbox for blob-level spatial skip.
     let union_bbox = BboxInt {
@@ -162,7 +166,8 @@ pub(super) fn try_extract_multi_single_pass(
                     // polygon boundary or inside holes.
                     let mut contained_in: Vec<usize> = Vec::new();
                     if let Some(ref blob_bbox) = idx.bbox {
-                        for (i, (bi, slot)) in bbox_ints.iter().zip(slots.iter()).enumerate() {
+                        for (i, (bi, slot)) in inside_bbox_ints.iter().zip(slots.iter()).enumerate()
+                        {
                             if matches!(slot.region, Region::Bbox(_)) {
                                 let region_bbox = crate::BlobBbox::new(
                                     bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon,
@@ -252,7 +257,7 @@ pub(super) fn try_extract_multi_single_pass(
     // Polygon regions fall back to element-by-element iteration.
     let all_bbox = slots.iter().all(|s| matches!(s.region, Region::Bbox(_)));
     const GRID_REGION_THRESHOLD: usize = 16;
-    let region_bboxes: Vec<(i32, i32, i32, i32)> = bbox_ints
+    let region_bboxes: Vec<(i32, i32, i32, i32)> = inside_bbox_ints
         .iter()
         .map(|bi| (bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon))
         .collect();
@@ -363,6 +368,9 @@ pub(super) fn try_extract_multi_single_pass(
             let mut counts = vec![0u64; n];
             for element in block.elements() {
                 match &element {
+                    // The `any` prefilter is a pure fast path over the same
+                    // sets the inner loop tests: it keeps metadata decode off
+                    // the overwhelmingly common no-region-matches node.
                     Element::DenseNode(dn) if bbox_node_ids.iter().any(|s| s.get(dn.id())) => {
                         let id = dn.id();
                         let meta = dense_node_metadata(dn);
@@ -425,10 +433,24 @@ pub(super) fn try_extract_multi_single_pass(
             for v in scratch.iter_mut() {
                 v.clear();
             }
+            let mut region_mask = vec![false; n];
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element {
-                    for i in 0..n {
-                        if w.refs().any(|r| bbox_node_ids[i].get(r)) {
+                    region_mask.fill(false);
+                    let mut remaining = n;
+                    for node_id in w.refs() {
+                        for i in 0..n {
+                            if !region_mask[i] && bbox_node_ids[i].get(node_id) {
+                                region_mask[i] = true;
+                                remaining -= 1;
+                            }
+                        }
+                        if remaining == 0 {
+                            break;
+                        }
+                    }
+                    for (i, &matched) in region_mask.iter().enumerate() {
+                        if matched {
                             scratch[i].push(w.id());
                         }
                     }

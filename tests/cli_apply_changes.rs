@@ -66,6 +66,7 @@ fn write_osc(path: &Path, xml: &str) {
 #[derive(Default, Clone, Copy)]
 struct ApplyOpts {
     locations_on_ways: bool,
+    ignore_missing_nodes: bool,
     jobs: Option<usize>,
     direct_io: bool,
     io_uring: bool,
@@ -80,6 +81,9 @@ fn run_apply_changes(base: &Path, osc: &Path, output: &Path, opts: ApplyOpts) ->
         .arg(output);
     if opts.locations_on_ways {
         cli = cli.arg("--locations-on-ways");
+    }
+    if opts.ignore_missing_nodes {
+        cli = cli.arg("--ignore-missing-nodes");
     }
     if let Some(j) = opts.jobs {
         cli = cli.arg("-j").arg(j.to_string());
@@ -1424,6 +1428,125 @@ fn merge_locations_on_ways_osc_node_coords() {
         way10.1,
         vec![(100_000_000, 200_000_000), (550_000_000, 120_000_000)]
     );
+}
+
+#[test]
+fn merge_locations_on_ways_rejects_missing_node_unless_explicitly_ignored() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_with_locations(
+        &base,
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![],
+            meta: None,
+        }],
+        &[(1, vec![1], vec![(100_000_000, 200_000_000)], vec![])],
+        &[],
+    );
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6"><create><way id="10" version="1"><nd ref="999"/></way></create></osmChange>"#,
+    );
+
+    let rejected = run_apply_changes(
+        &base,
+        &osc,
+        &output,
+        ApplyOpts {
+            locations_on_ways: true,
+            ..ApplyOpts::default()
+        },
+    );
+    assert_eq!(rejected.status.code(), Some(2));
+    rejected.assert_stderr_contains("1 referenced node(s) could not be resolved");
+    assert!(
+        !output.exists(),
+        "guarded output must discard the failed merge"
+    );
+
+    let accepted = run_apply_changes(
+        &base,
+        &osc,
+        &output,
+        ApplyOpts {
+            locations_on_ways: true,
+            ignore_missing_nodes: true,
+            ..ApplyOpts::default()
+        },
+    );
+    assert!(
+        accepted.status.success(),
+        "stderr:\n{}",
+        accepted.stderr_str()
+    );
+    let locations = read_way_locations(&output);
+    let way = locations.iter().find(|(id, _)| *id == 10).expect("way 10");
+    assert_eq!(way.1, vec![(0, 0)]);
+}
+
+/// A duplicate node record in the base must not conceal a genuinely
+/// missing one.
+///
+/// The guard above compares "required" against "resolved". Resolution used
+/// to be counted per extracted tuple, and the per-worker coordinate map is
+/// keyed by id - so a base carrying node 1 twice contributed two to the
+/// count while adding one key. Two required ids, one of them absent, and
+/// the arithmetic balanced: the guard passed and the missing node silently
+/// took the (0,0) fallback that `--ignore-missing-nodes` is supposed to be
+/// the only way to get.
+///
+/// The fixture therefore needs BOTH a duplicated present id and a genuinely
+/// absent one; either alone leaves the counting bug invisible.
+#[test]
+fn merge_locations_on_ways_duplicate_base_records_cannot_mask_a_missing_node() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    let dup = || TestNode {
+        id: 1,
+        lat: 100_000_000,
+        lon: 200_000_000,
+        tags: vec![],
+        meta: None,
+    };
+    write_test_pbf_with_locations(
+        &base,
+        &[dup(), dup()],
+        &[(1, vec![1], vec![(100_000_000, 200_000_000)], vec![])],
+        &[],
+    );
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6"><create><way id="10" version="1"><nd ref="1"/><nd ref="999"/></way></create></osmChange>"#,
+    );
+
+    let rejected = run_apply_changes(
+        &base,
+        &osc,
+        &output,
+        ApplyOpts {
+            locations_on_ways: true,
+            ..ApplyOpts::default()
+        },
+    );
+    assert_eq!(
+        rejected.status.code(),
+        Some(2),
+        "the duplicate record must not pay for node 999. stderr:\n{}",
+        rejected.stderr_str()
+    );
+    rejected.assert_stderr_contains("1 referenced node(s) could not be resolved");
+    assert!(!output.exists(), "failed merge must leave no output");
 }
 
 /// Merge with --locations-on-ways requires LocationsOnWays in base PBF.

@@ -1117,12 +1117,9 @@ fn multi_extract_two_bbox_regions() {
 /// with std `FromStr`. serde_json's default float parse is best-effort
 /// and can land 1 ULP off the correctly-rounded value on 17-digit inputs
 /// like 12.639999999999999; after the floor/ceil decimicrodegree
-/// conversion that ULP becomes a whole coordinate step, so a node sitting
-/// exactly on the boundary silently changes membership between `--config`
-/// and `-b` runs of the byte-identical bbox. Found as a persistent 1-node
-/// multi-extract-vs-sequential verify failure at a denmark strip boundary
-/// (n5446477279, lon 12.6399999, against boundary 12.4 + 4*0.06); fixed
-/// by serde_json's `float_roundtrip` feature, which this test pins.
+/// conversion that ULP becomes a whole coordinate step. Both parsers must
+/// retain the exact f64 boundary, without promoting the conservative blob
+/// bounds into point membership.
 #[test]
 fn config_bbox_floats_parse_identically_to_cli_bbox() {
     let dir = TempDir::new().expect("tempdir");
@@ -1130,12 +1127,8 @@ fn config_bbox_floats_parse_identically_to_cli_bbox() {
     let out_cli = dir.path().join("cli.osm.pbf");
     let config = dir.path().join("config.json");
 
-    // Node 1 sits exactly on the boundary decimicro column: 12.6399999
-    // degrees = 126399999. The bbox min_lon 12.639999999999999 floors to
-    // 126399999 only when parsed correctly rounded (best-effort parsing
-    // yields the f64 of 12.64, which floors to 126400000 and drops the
-    // node). Node 2 is safely interior so both outputs are non-empty
-    // regardless.
+    // Node 1 is one e7 unit below the requested boundary and must not match.
+    // Node 2 is safely interior.
     let nodes = vec![
         TestNode {
             id: 1,
@@ -1177,13 +1170,99 @@ fn config_bbox_floats_parse_identically_to_cli_bbox() {
     let cfg_elements = read_all_elements(&dir.path().join("cfg.osm.pbf"));
     assert_eq!(
         node_ids(&cli_elements),
-        vec![1, 2],
-        "CLI -b must include the boundary node"
+        vec![2],
+        "CLI -b must exclude the point below the exact boundary"
     );
     assert_eq!(
         node_ids(&cfg_elements),
         node_ids(&cli_elements),
         "--config and -b must agree on the byte-identical bbox"
+    );
+}
+
+/// Boundary where the two decimicrodegree conversions genuinely disagree.
+///
+/// `55.6 / 1e-7` is exactly `556_000_000`, but `556_000_000 as f64 * 1e-7`
+/// is strictly BELOW `55.6`. So a lower bound derived by division admits a
+/// node the f64 comparison every consumer runs would reject. A fixture at a
+/// round boundary such as 55.0 or 56.0 cannot see this: there the two
+/// conversions agree and the test passes either way.
+///
+/// The exclusion has to hold at every layer that decides membership -
+/// element-by-element classification, the columnar bbox classifier used by
+/// `smart` and by multi-extract, and the raw-blob passthrough proof, which
+/// would copy the whole blob through untouched and smuggle the node in.
+#[test]
+fn bbox_lower_boundary_excludes_the_node_the_f64_comparison_rejects() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+
+    // Node 1 sits exactly on the integer column division produces for
+    // 55.6. Node 2 is the first column whose forward conversion is truly
+    // inside. Node 3 is interior, so no output is trivially empty.
+    let nodes = vec![
+        TestNode {
+            id: 1,
+            lat: 556_000_000,
+            lon: 126_500_000,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 2,
+            lat: 556_000_001,
+            lon: 126_500_000,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 3,
+            lat: 557_000_000,
+            lon: 126_500_000,
+            tags: vec![],
+            meta: None,
+        },
+    ];
+    write_test_pbf_sorted(&input, &nodes, &[], &[]);
+
+    for (name, strategy) in [
+        ("simple", Strategy::Simple),
+        ("smart", Strategy::Smart),
+        ("complete", Strategy::CompleteWays),
+    ] {
+        let out = dir.path().join(format!("{name}.osm.pbf"));
+        run_extract(
+            &input,
+            &out,
+            &RegionArg::Bbox("12.4,55.6,12.7,55.8"),
+            strategy,
+        );
+        assert_eq!(
+            node_ids(&read_all_elements(&out)),
+            vec![2, 3],
+            "{name} must exclude the node below the exact 55.6 boundary"
+        );
+    }
+
+    let config = dir.path().join("config.json");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{
+                "directory": "{}",
+                "extracts": [
+                    {{ "output": "m.osm.pbf", "bbox": [12.4, 55.6, 12.7, 55.8] }}
+                ]
+            }}"#,
+            dir.path().display(),
+        ),
+    )
+    .expect("write config");
+    run_extract_multi(&input, &config, Strategy::Simple);
+    assert_eq!(
+        node_ids(&read_all_elements(&dir.path().join("m.osm.pbf"))),
+        vec![2, 3],
+        "multi-extract must exclude the node below the exact 55.6 boundary"
     );
 }
 

@@ -35,6 +35,12 @@ pub(crate) type ScheduleEntry = (usize, u64, usize);
 const WILLNEED_COALESCE_GAP_BYTES: u64 = 4 * 1024;
 const WILLNEED_WINDOW_BYTES: u64 = 256 * 1024 * 1024;
 
+fn blob_body_within_file(data_offset: u64, data_size: usize, file_size: u64) -> bool {
+    data_offset
+        .checked_add(data_size as u64)
+        .is_some_and(|end| end <= file_size)
+}
+
 /// Coalesce body ranges in a walker-derived schedule. Schedule entries retain
 /// file order, so bodies separated by up to a BlobHeader-sized gap are joined.
 /// A zero-sized body has no range to advise: passing length zero to
@@ -293,7 +299,7 @@ pub(crate) fn build_classify_schedule_blob_filtered(
         // later in `read_exact_at` with an opaque UnexpectedEof, after
         // workers have already accepted the schedule. Cheap integer
         // check here catches the whole family.
-        if meta.data_offset + meta.data_size as u64 > file_size {
+        if !blob_body_within_file(meta.data_offset, meta.data_size, file_size) {
             return Err(format!(
                 "blob at offset {} claims data_size {} but file is only {} bytes",
                 meta.data_offset, meta.data_size, file_size,
@@ -367,7 +373,7 @@ pub(crate) fn build_classify_schedules_split(
         // past-EOF blob bodies before the schedule is handed to pread
         // workers. Replicated across both schedule builders since they
         // share the same downstream consumer pattern.
-        if meta.data_offset + meta.data_size as u64 > file_size {
+        if !blob_body_within_file(meta.data_offset, meta.data_size, file_size) {
             return Err(format!(
                 "blob at offset {} claims data_size {} but file is only {} bytes",
                 meta.data_offset, meta.data_size, file_size,
@@ -813,7 +819,9 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{ScheduleEntry, WillneedPrefetch, coalesce_willneed_ranges};
+    use super::{
+        ScheduleEntry, WillneedPrefetch, blob_body_within_file, coalesce_willneed_ranges,
+    };
 
     /// Write a PBF with `blobs` single-node OSMData blobs and return its path.
     fn write_many_blob_pbf(dir: &std::path::Path, blobs: usize) -> std::path::PathBuf {
@@ -943,5 +951,16 @@ mod tests {
             coalesce_willneed_ranges(&schedule),
             vec![(100, 4_155), (8_352, 10)]
         );
+    }
+
+    /// The unchecked form was `data_offset + data_size as u64 > file_size`,
+    /// which wraps in release for a corrupt header advertising a huge size -
+    /// so the check that exists specifically to catch corrupt blobs passed.
+    #[test]
+    fn corrupt_blob_body_range_cannot_wrap_past_eof() {
+        assert!(!blob_body_within_file(u64::MAX - 4, 8, u64::MAX));
+        assert!(!blob_body_within_file(0, usize::MAX, 100));
+        assert!(blob_body_within_file(92, 8, 100));
+        assert!(!blob_body_within_file(93, 8, 100));
     }
 }

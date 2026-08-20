@@ -4,6 +4,24 @@
 
 ### Breaking
 
+- **`apply-changes --locations-on-ways` now fails when a way node reference
+  cannot be resolved.** Unresolvable references were written as `(0, 0)`,
+  which is Null Island - a real coordinate - so the placeholder vertices
+  were indistinguishable from genuine geometry in the output PBF. Pass
+  `--ignore-missing-nodes` for exactly the previous behaviour. This brings
+  the command into line with `add-locations-to-ways`, which withdrew the
+  same deviation, and replaces the corresponding open item in
+  `reference/osmium-parity.md` with a recorded deviation.
+
+- **Polygon extracts reject GeoJSON vertices outside the WGS84 domain.**
+  Latitude must be within -90 and 90, longitude within -180 and 180. Matches
+  the `--bbox` domain guard.
+
+- **A GeoJSON FeatureCollection now contributes every polygonal feature.**
+  Only the first feature's geometry was used, so a multi-feature region file
+  silently extracted a fraction of the requested area. Applies to both
+  `--polygon` and the `polygon` key in a `--config` entry.
+
 - **`add-locations-to-ways` now fails when a way node reference cannot be
   resolved.** Unresolvable references were filled with `(0, 0)` and counted
   in the stderr summary as `missing locations`. `(0, 0)` is Null Island, a
@@ -362,6 +380,28 @@
   must be left untouched.
 
 ### Fixed
+
+- **`extract` and `multi-extract` no longer include points just outside a
+  `--bbox`.** Point membership was decided against integer bounds widened by
+  `floor`/`ceil`, which is correct for choosing candidate blobs and wrong as
+  the answer: a node up to one decimicrodegree outside the requested box
+  matched. The widened bounds are now confined to blob selection, and every
+  membership decision - element-by-element classification, the columnar
+  classifier used by `smart` and `multi-extract`, and the raw-blob
+  passthrough proof - uses bounds that agree exactly with the floating-point
+  comparison. Affects all four strategies and `export --bbox`.
+
+- **`assemble_rings` backtracks at ambiguous junctions.** The greedy
+  assembler followed the first available continuation and could consume
+  segments into a dead-end chain, losing a ring that was assemblable.
+
+- **`ring_crosses_antimeridian` checks the implicit closing edge.** An
+  unclosed ring whose only crossing was between its last and first vertex
+  was treated as not crossing, so the point-in-polygon path skipped
+  longitude unwrapping.
+
+- **`altw --index-type sparse` no longer leaves its temporary store behind
+  when preallocation fails.**
 
 - **`extract` on an unsorted input no longer silently drops ways and
   relations.** The unsorted fallback shared by the `simple`, `complete` and

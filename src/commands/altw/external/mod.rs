@@ -708,7 +708,7 @@ pub(super) fn slot_bucket_bounds(
 
 /// Run the full external join pipeline for add-locations-to-ways.
 ///
-/// Bounded memory (<1 GB), all sequential I/O. Uses ~224 GB temp disk at
+/// Bounded memory, all sequential I/O. Uses ~256 GB peak temp disk at
 /// planet scale. See module docs for the algorithm.
 #[hotpath::measure]
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]

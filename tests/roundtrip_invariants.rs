@@ -198,6 +198,7 @@ fn derive_then_apply_roundtrip() {
         io_uring: false,
         force: true,
         locations_on_ways: false,
+        ignore_missing_nodes: false,
         jobs: None,
         allow_version_regression: false,
         #[cfg(feature = "test-hooks")]
@@ -321,6 +322,7 @@ fn derive_then_apply_preserves_metadata() {
         io_uring: false,
         force: true,
         locations_on_ways: false,
+        ignore_missing_nodes: false,
         jobs: None,
         allow_version_regression: false,
         #[cfg(feature = "test-hooks")]

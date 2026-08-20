@@ -27,7 +27,7 @@ pub struct Bbox {
 
 impl Bbox {
     /// Returns `true` if the point (lat, lon) in degrees falls within this bbox.
-    fn contains(&self, lat: f64, lon: f64) -> bool {
+    pub(crate) fn contains(&self, lat: f64, lon: f64) -> bool {
         lat >= self.min_lat && lat <= self.max_lat && lon >= self.min_lon && lon <= self.max_lon
     }
 }
@@ -147,7 +147,10 @@ impl Region {
     /// conversion done only for those points).
     fn contains_decimicro(&self, bbox_int: &common::BboxInt, lat: i32, lon: i32) -> bool {
         match self {
-            Region::Bbox(_) => bbox_int.contains(lat, lon),
+            // `bbox_int` is deliberately widened for conservative blob
+            // selection. Exact point membership must retain the user's f64
+            // boundary, or a point up to one e7 unit outside can match.
+            Region::Bbox(bbox) => bbox.contains(lat as f64 * 1e-7, lon as f64 * 1e-7),
             Region::Polygon { polygons, .. } => {
                 if !bbox_int.contains(lat, lon) {
                     return false;
@@ -197,49 +200,57 @@ use crate::geo::ring_crosses_antimeridian;
 /// Accepts:
 /// - A bare Geometry with type "Polygon" or "MultiPolygon"
 /// - A Feature with a Polygon/MultiPolygon geometry
-/// - A FeatureCollection whose first feature has a Polygon/MultiPolygon geometry
+/// - A FeatureCollection whose Polygon/MultiPolygon features are all included
 pub fn parse_geojson(path: &Path) -> Result<Region> {
     let data = std::fs::read_to_string(path)?;
     let value: serde_json::Value = serde_json::from_str(&data)?;
-    let geometry = extract_geometry(&value)?;
-    let geo_type = geometry
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("geometry missing 'type' field")?;
-    let coords = geometry
-        .get("coordinates")
-        .ok_or("geometry missing 'coordinates' field")?;
-    let polygons = parse_geometry_by_type(geo_type, coords)?;
+    let geometries = extract_geometries(&value)?;
+    let mut polygons = Vec::new();
+    for geometry in geometries {
+        let geo_type = geometry
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("geometry missing 'type' field")?;
+        let coords = geometry
+            .get("coordinates")
+            .ok_or("geometry missing 'coordinates' field")?;
+        polygons.extend(parse_geometry_by_type(geo_type, coords)?);
+    }
     let bbox = bbox_from_polygons(&polygons)?;
     Ok(Region::Polygon { polygons, bbox })
 }
 
 /// Navigate Feature/FeatureCollection to find the geometry object.
-fn extract_geometry(value: &serde_json::Value) -> Result<serde_json::Value> {
+fn extract_geometries(value: &serde_json::Value) -> Result<Vec<&serde_json::Value>> {
     let obj_type = value
         .get("type")
         .and_then(serde_json::Value::as_str)
         .ok_or("GeoJSON missing 'type' field")?;
     match obj_type {
-        "Polygon" | "MultiPolygon" => Ok(value.clone()),
+        "Polygon" | "MultiPolygon" => Ok(vec![value]),
         "Feature" => {
             let geom = value
                 .get("geometry")
                 .ok_or("Feature missing 'geometry' field")?;
-            Ok(geom.clone())
+            Ok(vec![geom])
         }
         "FeatureCollection" => {
             let features = value
                 .get("features")
                 .and_then(serde_json::Value::as_array)
                 .ok_or("FeatureCollection missing 'features' array")?;
-            let first = features
-                .first()
-                .ok_or("FeatureCollection has no features")?;
-            let geom = first
-                .get("geometry")
-                .ok_or("first Feature missing 'geometry' field")?;
-            Ok(geom.clone())
+            if features.is_empty() {
+                return Err("FeatureCollection has no features".into());
+            }
+            features
+                .iter()
+                .enumerate()
+                .map(|(i, feature)| {
+                    feature.get("geometry").ok_or_else(|| {
+                        format!("FeatureCollection feature {i} missing 'geometry' field").into()
+                    })
+                })
+                .collect()
         }
         other => Err(format!("unsupported GeoJSON type: {other}").into()),
     }
@@ -295,6 +306,16 @@ fn parse_ring(ring: &serde_json::Value) -> Result<Vec<(f64, f64)>> {
         }
         let lon = pair[0].as_f64().ok_or("coordinate lon must be a number")?;
         let lat = pair[1].as_f64().ok_or("coordinate lat must be a number")?;
+        if !lon.is_finite() || !(-180.0..=180.0).contains(&lon) {
+            return Err(
+                format!("polygon longitude ({lon}) must be within -180 and 180 degrees").into(),
+            );
+        }
+        if !lat.is_finite() || !(-90.0..=90.0).contains(&lat) {
+            return Err(
+                format!("polygon latitude ({lat}) must be within -90 and 90 degrees").into(),
+            );
+        }
         result.push((lon, lat));
     }
     Ok(result)
@@ -474,39 +495,26 @@ fn parse_extract_geometry(
         let max_lat = arr[3]
             .as_f64()
             .ok_or_else(|| format!("extract[{index}] bbox[3] must be a number"))?;
-        if min_lon >= max_lon {
-            return Err(format!(
-                "extract[{index}] bbox min_lon ({min_lon}) must be less than max_lon ({max_lon})"
-            )
-            .into());
-        }
-        if min_lat >= max_lat {
-            return Err(format!(
-                "extract[{index}] bbox min_lat ({min_lat}) must be less than max_lat ({max_lat})"
-            )
-            .into());
-        }
-        return Ok(Region::Bbox(Bbox {
-            min_lon,
-            min_lat,
-            max_lon,
-            max_lat,
-        }));
+        return parse_bbox(&format!("{min_lon},{min_lat},{max_lon},{max_lat}"))
+            .map(Region::Bbox)
+            .map_err(|e| format!("extract[{index}] bbox: {e}").into());
     }
 
     if has_polygon {
         let geom = entry
             .get("polygon")
             .ok_or_else(|| format!("extract[{index}] missing 'polygon'"))?;
-        let geometry = extract_geometry(geom)?;
-        let geo_type = geometry
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| format!("extract[{index}] polygon missing 'type' field"))?;
-        let coords = geometry
-            .get("coordinates")
-            .ok_or_else(|| format!("extract[{index}] polygon missing 'coordinates' field"))?;
-        let polygons = parse_geometry_by_type(geo_type, coords)?;
+        let mut polygons = Vec::new();
+        for geometry in extract_geometries(geom)? {
+            let geo_type = geometry
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("extract[{index}] polygon missing 'type' field"))?;
+            let coords = geometry
+                .get("coordinates")
+                .ok_or_else(|| format!("extract[{index}] polygon missing 'coordinates' field"))?;
+            polygons.extend(parse_geometry_by_type(geo_type, coords)?);
+        }
         let bbox = bbox_from_polygons(&polygons)?;
         return Ok(Region::Polygon { polygons, bbox });
     }
@@ -1257,12 +1265,40 @@ mod tests {
                         [[1.0, 1.0], [3.0, 1.0], [3.0, 3.0], [1.0, 3.0], [1.0, 1.0]]
                     ]
                 }
+            }, {
+                "type": "Feature",
+                "properties": {},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [[10.0, 10.0], [12.0, 10.0], [12.0, 12.0], [10.0, 12.0], [10.0, 10.0]]
+                    ]
+                }
             }]
         }"#;
         let path = write_temp_geojson(&dir, "fc.geojson", json);
         let region = parse_geojson(&path).unwrap();
         assert!(region.contains(2.0, 2.0));
+        assert!(region.contains(11.0, 11.0));
         assert!(!region.contains(0.0, 0.0));
+    }
+
+    #[test]
+    fn parse_geojson_rejects_out_of_domain_ring_coordinate() {
+        let dir = TempDir::new().unwrap();
+        let path = write_temp_geojson(
+            &dir,
+            "bad-domain.geojson",
+            r#"{"type":"Polygon","coordinates":[[[0,0],[181,0],[0,1],[0,0]]]}"#,
+        );
+        let err = parse_geojson(&path)
+            .err()
+            .expect("longitude must be rejected");
+        assert!(
+            err.to_string()
+                .contains("polygon longitude (181) must be within -180 and 180 degrees"),
+            "wrong guard: {err}"
+        );
     }
 
     #[test]

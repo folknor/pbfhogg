@@ -256,7 +256,7 @@ required in either tool.
 | `<create>` on existing ID | present | Silent overwrite (treated as modify). Base record is replaced with the OSC record. |
 | `<modify>` on absent ID | absent | Silent insert (treated as create). OSC record is written. |
 | `<delete>` on absent ID | absent | Silent no-op. |
-| way/relation ref to absent node | absent from base AND from OSC | pbfhogg under `--locations-on-ways`: `(0, 0)` sentinel coord; missing-node count is reported in the summary as `loc_missing` (derived post-hoc from `needed - resolved`, not per-site incremented). pbfhogg without `--locations-on-ways`: the ref is written bare, no coordinate lookup. osmium with `--locations-on-ways`: identical `(0, 0)` fallback via `location_index.get_noexcept` + `if (location)` guard; no warning. |
+| way/relation ref to absent node | absent from base AND from OSC | pbfhogg under `--locations-on-ways`: fails without publishing output; `--ignore-missing-nodes` explicitly restores the `(0, 0)` fallback. Without `--locations-on-ways`, the ref is written bare. osmium with `--locations-on-ways` writes `(0, 0)` without warning. |
 
 **Rationale (applies to both projects).** The motivating workload is
 incremental-extract - region-extracted base PBF plus a full-planet
@@ -266,16 +266,9 @@ extend outside the region) that are not in the base. Failing by
 default would force every such user to pass an opt-out flag that is
 the right behaviour in virtually all cases.
 
-The `(0, 0)` coordinate sentinel under `--locations-on-ways` means
-ways referencing nodes exactly at Null Island are indistinguishable
-from ways referencing absent nodes. This affects zero real-world
-nodes (nearest land ~570 km). Note that `add-locations-to-ways` no
-longer shares this convention: its sparse store carries an explicit
-presence bit and its default policy is to refuse an output with
-unresolvable references (see [CORRECTNESS.md](../CORRECTNESS.md)
-"Null Island ambiguity in coordinate indexes"). Bringing
-`apply-changes --locations-on-ways` into line is open work, not a
-decision that has been made the other way.
+The default differs deliberately because `(0, 0)` is a real coordinate and
+cannot safely encode absence. See `DEVIATIONS.md`. The escape hatch retains
+osmium compatibility for incomplete regional change streams.
 
 **pbfhogg implementation anchors:**
 

@@ -43,6 +43,100 @@ use crate::idset::IdSet;
 
 use super::Result;
 
+#[cfg(target_os = "linux")]
+fn preallocate_sparse_file(file: &std::fs::File, scratch_dir: &Path, bytes: u64) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = CString::new(scratch_dir.as_os_str().as_bytes())
+        .map_err(|_| "scratch directory path contains a NUL byte")?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // Safety: `path` is NUL-terminated and `stats` points to writable storage.
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(format!(
+            "failed to query free space for sparse index in {}: {}",
+            scratch_dir.display(),
+            std::io::Error::last_os_error()
+        )
+        .into());
+    }
+    // Safety: statvfs initialized `stats` on success.
+    let stats = unsafe { stats.assume_init() };
+    let available = stats.f_bavail.saturating_mul(stats.f_frsize);
+    if available < bytes {
+        return Err(format!(
+            "insufficient free space for sparse node index: need {bytes} bytes, have {available} bytes in {}",
+            scratch_dir.display()
+        )
+        .into());
+    }
+    let length: libc::off_t = bytes
+        .try_into()
+        .map_err(|_| "sparse index size does not fit the platform file-offset type")?;
+    // Safety: `file` owns a valid writable descriptor and length is nonnegative.
+    let rc = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, length) };
+    if rc != 0 {
+        return Err(format!(
+            "failed to allocate {bytes} bytes for sparse node index: {}",
+            std::io::Error::from_raw_os_error(rc)
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn preallocate_sparse_file(file: &std::fs::File, _scratch_dir: &Path, bytes: u64) -> Result<()> {
+    file.set_len(bytes)
+        .map_err(|e| format!("failed to size sparse index file ({bytes} bytes): {e}").into())
+}
+
+/// Create, preallocate and immediately unlink the sparse node store, handing
+/// back the still-open descriptor.
+///
+/// The file is PID-named and therefore reachable by name for the window
+/// between `create_new` and the unlink. Preallocation can fail inside that
+/// window *after* `posix_fallocate` has reserved blocks, so the window is
+/// covered by a `PathGuard`: without it a failed run leaves a partially
+/// allocated, potentially multi-gigabyte file in scratch until some later
+/// run happens to be assigned the same PID and clears it. The guard is
+/// committed only once the unlink has succeeded, at which point the path is
+/// already gone.
+fn open_anonymous_sparse_file(scratch_dir: &Path, total_bytes: u64) -> Result<std::fs::File> {
+    let temp_path = scratch_dir.join(format!(".pbfhogg-sparse-index-{}", std::process::id()));
+    match std::fs::remove_file(&temp_path) {
+        Ok(()) => eprintln!(
+            "removed stale sparse index temp file {}",
+            temp_path.display()
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "failed to remove stale sparse index temp file {}: {e}",
+                temp_path.display()
+            )
+            .into());
+        }
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|e| format!("failed to create sparse index temp file: {e}"))?;
+    let guard = crate::path_guard::PathGuard::file(temp_path.clone());
+    preallocate_sparse_file(&file, scratch_dir, total_bytes)?;
+    std::fs::remove_file(&temp_path).map_err(|e| {
+        format!(
+            "failed to unlink sparse index temp file {} after allocation: {e}",
+            temp_path.display()
+        )
+    })?;
+    drop(guard.commit());
+    Ok(file)
+}
+
 /// Latitude bias, in decimicrodegrees: 90 degrees.
 const LAT_BIAS: i64 = 900_000_000;
 /// Presence flag. Set on every written slot; unreachable by any biased
@@ -195,7 +289,11 @@ impl SharedSparseWriter {
 /// the shared input file handle on worker threads, incompatible with
 /// `O_DIRECT` alignment requirements.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines
+)]
 pub(super) fn build_node_index_sparse(
     input: &Path,
     _direct_io: bool,
@@ -213,17 +311,7 @@ pub(super) fn build_node_index_sparse(
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("altw_pass1_store_bytes", total_bytes as i64);
 
-    let temp_path = scratch_dir.join(format!(".pbfhogg-sparse-index-{}", std::process::id()));
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .map_err(|e| format!("failed to create sparse index temp file: {e}"))?;
-    drop(std::fs::remove_file(&temp_path));
-
-    file.set_len(total_bytes)
-        .map_err(|e| format!("failed to size sparse index file ({total_bytes} bytes): {e}"))?;
+    let file = open_anonymous_sparse_file(scratch_dir, total_bytes)?;
 
     // SAFETY: file is exclusively owned, opened read+write, sized to total_bytes.
     let mut mmap = unsafe {
@@ -415,5 +503,51 @@ mod tests {
              same number is a legal longitude"
         );
         assert!(pack(0, 1_000_000_000).is_some(), "100 degrees east is real");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sparse_store_precheck_reports_insufficient_space_before_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(dir.path().join("store")).unwrap();
+        let err = super::preallocate_sparse_file(&file, dir.path(), u64::MAX)
+            .expect_err("impossible allocation must be rejected");
+        assert!(
+            err.to_string()
+                .contains("insufficient free space for sparse node index"),
+            "wrong guard: {err}"
+        );
+        assert_eq!(file.metadata().unwrap().len(), 0);
+    }
+
+    /// The preallocation failure path used to `?` out between `create_new`
+    /// and the unlink, leaving the PID-named store behind - after
+    /// `posix_fallocate` may already have reserved its blocks. The guard has
+    /// to hold from creation all the way through a successful unlink, so the
+    /// assertion is on the scratch directory being empty, not on the error.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_preallocation_leaves_no_file_in_scratch() {
+        let dir = tempfile::tempdir().unwrap();
+        super::open_anonymous_sparse_file(dir.path(), u64::MAX)
+            .expect_err("impossible allocation must be rejected");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "failed preallocation leaked scratch files: {leftovers:?}"
+        );
+    }
+
+    /// And the success path must unlink too: the store is anonymous by
+    /// design, held open only through the returned descriptor.
+    #[test]
+    fn successful_allocation_unlinks_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = super::open_anonymous_sparse_file(dir.path(), 4096).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 4096);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }

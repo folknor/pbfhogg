@@ -528,7 +528,7 @@ pbfhogg getparents [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 Embed node coordinates in ways. Two index strategies:
 
 - **sparse** (default) - Rank-indexed flat mmap array. Pre-allocates `referenced.total_count() * 8` bytes; workers store `(lat, lon)` at byte offset `IdSet::rank_if_set(node_id) << 3` via atomic stores. Fast at small / medium scale; survives Europe at ~6 minutes on a 27 GB-RAM host. Likely thrashes at planet (working set exceeds free page cache) - use `external` for planet.
-- **external** - Double radix permutation via 4-stage pipeline. Bounded memory (~8.7 GB measured peak anon at planet). The only mode that survives at planet on memory-constrained hosts. Requires sorted PBF (Sort.Type\_then\_ID) and indexdata. Uses ~224 GB temp disk at planet.
+- **external** - Double radix permutation via 4-stage pipeline. Bounded memory (~8.7 GB measured peak anon at planet). The only mode that survives at planet on memory-constrained hosts. Requires sorted PBF (Sort.Type\_then\_ID) and indexdata. Uses ~256 GB peak temp disk at planet.
 
 `--index-type dense` was removed - sparse rank-indexed flat dominated dense at every measured scale (japan dense 51.6 s vs sparse 11.9 s). `dense` survives as a hidden value (absent from `--help` and from completion) purely so passing it errors with a pointer to `sparse` rather than a bare "invalid value".
 
@@ -583,6 +583,7 @@ pbfhogg apply-changes [OPTIONS] --output <OUTPUT> <BASE> <CHANGES>
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `--locations-on-ways` | Preserve and update way-node locations through the merge (requires base PBF with LocationsOnWays) |
+| `--ignore-missing-nodes` | With `--locations-on-ways`, permit unresolved references to retain the legacy `(0,0)` fallback instead of failing |
 | `-j, --jobs <N>` | Worker-pool size for the descriptor-first pipeline. `0` (default) uses the `nproc - 2` heuristic (leaves two cores for scanner + drain, min 1). Pass a specific N to measure scaling or constrain CPU use. |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |

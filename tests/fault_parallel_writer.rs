@@ -98,6 +98,7 @@ mod parallel_writer {
                     io_uring: false,
                     force: true,
                     locations_on_ways: false,
+                    ignore_missing_nodes: false,
                     jobs: Some(2),
                     allow_version_regression: false,
                     panic_at_blob_seq: None,

@@ -158,6 +158,55 @@ fn assert_refused_for_missing_nodes(out: &CliOutput, context: &str) {
     );
 }
 
+/// A referenced node whose coordinates are outside the geographic domain
+/// must be refused by BOTH backends, on the same guard.
+///
+/// The sparse backend refuses because its slot encoding cannot represent a
+/// latitude past 90 degrees without decoding as some other place. That is a
+/// representational necessity, but the refusal is a command-level contract:
+/// `--index-type` is a performance knob, and a knob that flips a run between
+/// hard error and silent pass-through is a semantic switch. The external
+/// backend can represent the value, so its guard exists purely to agree.
+#[test]
+fn out_of_domain_node_coordinates_are_refused_by_both_backends() {
+    let nodes = vec![TestNode {
+        id: 1,
+        lat: 1_000_000_000, // 100 degrees north: a fine longitude, no latitude
+        lon: 120_000_000,
+        tags: vec![],
+        meta: None,
+    }];
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![1],
+        tags: vec![("highway", "primary")],
+        meta: None,
+    }];
+
+    for backend in [IndexBackend::Sparse, IndexBackend::External] {
+        let dir = TempDir::new().expect("tempdir");
+        let input = dir.path().join("input.osm.pbf");
+        let output = dir.path().join("output.osm.pbf");
+        write_indexed_pbf(&input, &nodes, &ways, &[]);
+
+        let out = run_altw(&input, &output, true, backend, false);
+        assert!(
+            !out.status.success(),
+            "an out-of-domain referenced node must fail the run; stderr:\n{}",
+            out.stderr_str(),
+        );
+        assert!(
+            out.stderr_str().contains("outside the geographic domain"),
+            "expected the domain guard specifically; stderr:\n{}",
+            out.stderr_str(),
+        );
+        assert!(
+            !output.exists(),
+            "a refused run must publish no output file"
+        );
+    }
+}
+
 /// Convenience: run with default index, assert success.
 fn run_altw_ok(input: &Path, output: &Path, keep_untagged_nodes: bool) -> CliOutput {
     let out = run_altw(

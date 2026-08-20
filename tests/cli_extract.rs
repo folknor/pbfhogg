@@ -1127,13 +1127,19 @@ fn config_bbox_floats_parse_identically_to_cli_bbox() {
     let out_cli = dir.path().join("cli.osm.pbf");
     let config = dir.path().join("config.json");
 
-    // Node 1 is one e7 unit below the requested boundary and must not match.
-    // Node 2 is safely interior.
+    // Node 1 sits on the ONE column whose membership depends on which f64
+    // the bbox string parses to. Correctly rounded, "12.639999999999999" is
+    // 0x1.947ae147ae147p+3, and `126_400_000 as f64 * 1e-7` is that exact
+    // value, so the node is inside. serde_json's best-effort parse (without
+    // the `float_roundtrip` feature) lands 1 ULP up on 12.64 =
+    // 0x1.947ae147ae148p+3, which excludes the column - so this node is the
+    // fixture that fails if the feature ever drops off. A node any lower is
+    // excluded under both parses and pins nothing. Node 2 is safely interior.
     let nodes = vec![
         TestNode {
             id: 1,
             lat: 557_000_000,
-            lon: 126_399_999,
+            lon: 126_400_000,
             tags: vec![],
             meta: None,
         },
@@ -1170,8 +1176,9 @@ fn config_bbox_floats_parse_identically_to_cli_bbox() {
     let cfg_elements = read_all_elements(&dir.path().join("cfg.osm.pbf"));
     assert_eq!(
         node_ids(&cli_elements),
-        vec![2],
-        "CLI -b must exclude the point below the exact boundary"
+        vec![1, 2],
+        "CLI -b parses with std FromStr (always correctly rounded), so the \
+         boundary column must be inside"
     );
     assert_eq!(
         node_ids(&cfg_elements),

@@ -44,6 +44,14 @@
   zero, which is what every osmium and pbfhogg producer writes.
   `pbfhogg cat --clean` re-encodes an odd input into the default framing.
 
+- **`add-locations-to-ways` refuses a referenced node whose coordinates are
+  outside the geographic domain.** A latitude past +/-90 or a longitude past
+  +/-180 degrees is representable in the wire format but is not a place;
+  writing it through would relocate the vertex silently. Both the `sparse`
+  and `external` backends fail with the same error, so `--index-type`
+  remains a performance knob rather than a semantic switch. Nodes not
+  referenced by any way are unaffected.
+
 - **`extract --bbox` rejects coordinates outside the geographic domain.**
   Latitude must be within -90 and 90, longitude within -180 and 180. Only
   `min < max` was checked before, and `--bbox 200,0,300,1` then saturated to

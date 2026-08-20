@@ -82,9 +82,3 @@ Resolution is now read from the merged map's unique key count
 `add-locations-to-ways` backend was checked and is NOT exposed: it counts way
 ref slots on both sides of the subtraction, and the tuple pointer stops at the
 first record for an id, so a duplicate base record adds nothing.
-
-## Smaller notes
-
-- `docs/cli/commands.md` states the external ALTW backend peaks at "~17 GB at
-  planet"; every other document says ~8.7 GB measured peak anon. One is stale.
-  Not touched here - it belongs to whoever next measures that path.

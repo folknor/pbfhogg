@@ -89,7 +89,7 @@ non-standard encoding.
 ## Null Island ambiguity in coordinate indexes
 
 **Status:** Fixed in `add-locations-to-ways`. Still open in the geocode
-index builder and in `apply-changes --locations-on-ways`.
+index builder.
 
 **Context:** An index that stores node coordinates as `(lat: i32, lon: i32)`
 in a zero-initialized backing store is tempted to spell "unset" as `(0, 0)`.
@@ -120,22 +120,18 @@ Remaining sites:
 - Geocode builder Pass 2 filters ways' `(lat, lon)` coords with
   `if lat == 0 && lon == 0 { None }` inside the `way.refs()` filter_map
   (`src/geocode_index/builder/pass2.rs`).
-- `apply-changes --locations-on-ways` substitutes `(0, 0)` for an
-  unresolvable reference and reports the total post-hoc as `loc_missing`
-  (`reference/osmium-parity.md`). osmium has the same fallback there, so
-  changing it is a deliberate divergence and needs a DEVIATIONS entry.
 
-**Impact of the remaining sites:** a way vertex at exactly `0.0000000,
+**Impact of the remaining site:** a way vertex at exactly `0.0000000,
 0.0000000` - decimicrodegree precision, so within ~11 mm of the
 intersection of the prime meridian and the equator - is silently dropped
-from a geocode index's geometry, and is indistinguishable from an
-unresolvable reference under `apply-changes --locations-on-ways`. The
-nearest land is ~570 km away.
+from a geocode index's geometry. The nearest land is ~570 km away.
 
-**Related:** unresolvable way node references are a hard error in
-`add-locations-to-ways` rather than a silent `(0, 0)` fill; pass
-`--ignore-missing-nodes` to accept the placeholders. That withdrew a
-documented osmium deviation - see `DEVIATIONS.md`.
+**Related:** unresolvable way node references are a hard error in both
+`add-locations-to-ways` and `apply-changes --locations-on-ways` rather
+than a silent `(0, 0)` fill; pass `--ignore-missing-nodes` to accept the
+placeholders (only under that flag does the placeholder ambiguity
+reappear, now opt-in). The first withdrew a documented osmium deviation
+and the second added one - see `DEVIATIONS.md`.
 
 ## Geocode index: interpolation unresolved-endpoint sentinel
 

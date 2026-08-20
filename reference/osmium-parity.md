@@ -246,10 +246,12 @@ These osmium flags have no pbfhogg equivalent:
 
 ## apply-changes: permissive missing-element semantics (parity)
 
-Both tools silently tolerate every missing-element edge case in
-`apply-changes`. This is positive parity, not a deviation - users
-migrating from osmium can rely on the same behaviour. No flag is
-required in either tool.
+Both tools silently tolerate the missing-element edge cases in
+`apply-changes` - with one deliberate exception: an unresolvable
+way-node reference under `--locations-on-ways` is a hard error in
+pbfhogg (last table row; see `DEVIATIONS.md`). The other rows are
+positive parity - users migrating from osmium can rely on the same
+behaviour, no flag required in either tool.
 
 | OSC op | Element state in base | Outcome (both tools) |
 |---|---|---|
@@ -262,12 +264,13 @@ required in either tool.
 incremental-extract - region-extracted base PBF plus a full-planet
 daily OSC, then re-extract by bbox. Such pipelines routinely
 reference OSC elements (nodes outside the region, ways whose refs
-extend outside the region) that are not in the base. Failing by
-default would force every such user to pass an opt-out flag that is
-the right behaviour in virtually all cases.
+extend outside the region) that are not in the base. That is why the
+upsert / delete rows tolerate silently in both tools, and why osmium
+also tolerates the missing-location case.
 
-The default differs deliberately because `(0, 0)` is a real coordinate and
-cannot safely encode absence. See `DEVIATIONS.md`. The escape hatch retains
+For the missing-location row pbfhogg's default differs deliberately:
+`(0, 0)` is a real coordinate and cannot safely encode absence, so the
+run fails instead. See `DEVIATIONS.md`. `--ignore-missing-nodes` retains
 osmium compatibility for incomplete regional change streams.
 
 **pbfhogg implementation anchors:**
@@ -284,9 +287,11 @@ osmium compatibility for incomplete regional change streams.
   `locations.push((0, 0))`).
 - `loc_missing` counter: defined in
   `src/commands/apply_changes/stats.rs`, computed in
-  `src/commands/apply_changes/rewrite.rs` via
-  `loc_stats_pre.2.saturating_sub(extracted)`, and reported in the
-  summary line by `MergeStats::print_summary`.
+  `src/commands/apply_changes/rewrite.rs` as the required-id total minus
+  the merged coordinate map's unique key count
+  (`barrier_loc_map_size`), and reported in the summary line by
+  `MergeStats::print_summary`. Unique keys, not extracted-tuple counts:
+  a duplicate base record must not pay for a genuinely absent id.
 
 **osmium implementation anchors:**
 

@@ -819,9 +819,7 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{
-        ScheduleEntry, WillneedPrefetch, blob_body_within_file, coalesce_willneed_ranges,
-    };
+    use super::{ScheduleEntry, WillneedPrefetch, blob_body_within_file, coalesce_willneed_ranges};
 
     /// Write a PBF with `blobs` single-node OSMData blobs and return its path.
     fn write_many_blob_pbf(dir: &std::path::Path, blobs: usize) -> std::path::PathBuf {

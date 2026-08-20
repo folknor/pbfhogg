@@ -63,10 +63,12 @@ pub fn parse_bbox(s: &str) -> Result<Bbox> {
 
     // Domain check before the ordering check: 200,0,300,1 satisfies
     // min < max on both axes and is still not a place. `BboxInt::from_bbox`
-    // multiplies by 1e7 and casts to i32, and Rust float-to-int casts
-    // saturate rather than wrap, so an out-of-domain bbox used to reach the
-    // extract as `i32::MAX` bounds and produce an empty output with exit
-    // code 0 - a wrong answer reported as a successful run.
+    // used to multiply by 1e7 and cast to i32 (Rust float-to-int casts
+    // saturate rather than wrap), so an out-of-domain bbox reached the
+    // extract as `i32::MAX` bounds and produced an empty output with exit
+    // code 0 - a wrong answer reported as a successful run. Today the
+    // conversion clamps instead of saturating, but an out-of-domain bbox is
+    // still not a place and is still refused here.
     //
     // Latitude and longitude are checked separately, and separately from
     // representability: they have different domains, and a value can be a
@@ -763,9 +765,10 @@ mod tests {
     }
 
     /// A bbox outside the geographic domain used to parse cleanly, then
-    /// saturate to `i32::MAX` inside `BboxInt::from_bbox` (Rust float-to-int
-    /// casts saturate rather than wrap) and produce an empty extract with
-    /// exit code 0 - a wrong answer reported as a successful run.
+    /// saturate to `i32::MAX` inside the old `BboxInt::from_bbox` (Rust
+    /// float-to-int casts saturate rather than wrap) and produce an empty
+    /// extract with exit code 0 - a wrong answer reported as a successful
+    /// run.
     ///
     /// Latitude and longitude are checked separately because their domains
     /// differ: 100 degrees is a perfectly good longitude and not a latitude

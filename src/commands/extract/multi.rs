@@ -97,7 +97,13 @@ pub(super) fn try_extract_multi_single_pass(
     };
     let spatial_filter = spatial_blob_filter(&union_bbox);
 
-    // Open N sync-mode writers.
+    // Open N sync-mode writers. All N outputs are therefore compressed serially
+    // on the consumer thread. Switching to the parallel writer was tried and
+    // reverted on 2026-08-20: two interleaved Denmark 5-region pairs came out
+    // with opposite signs (parallel/sync 1200/1100 ms, then 501/1101 ms), which
+    // is inconclusive, not evidence of a speedup. Do not re-attempt without a
+    // stable matched measurement at a larger scale - the single-region writer's
+    // shape is not known to transfer to N concurrent outputs.
     let mut writers: Vec<PbfWriter<BufWriter<std::fs::File>>> = Vec::with_capacity(n);
     for slot in slots {
         let bbox = slot.region.bbox();

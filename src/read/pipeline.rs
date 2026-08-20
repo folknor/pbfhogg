@@ -404,6 +404,11 @@ where
                     let err = crate::error::new_error(crate::error::ErrorKind::Io(
                         std::io::Error::other(format!("failed to build decode pool: {e}")),
                     ));
+                    // Seq 0 is correct here, not a magic value that can collide
+                    // with a real item: the pool is built before the loop over
+                    // `raw_rx` below, so nothing has been dispatched yet and 0
+                    // is legitimately the reorder buffer's first push. Keep the
+                    // build above the loop if this is ever restructured.
                     drop(dispatch_tx.send((0, Some(Err(err)), None)));
                     return;
                 }
@@ -521,6 +526,10 @@ where
                     let error = crate::error::new_error(crate::error::ErrorKind::Io(
                         std::io::Error::other(format!("failed to build decode pool: {e}")),
                     ));
+                    // Seq 0 is correct here for the same reason as in the
+                    // block-oriented variant above: the pool is built before
+                    // the loop over `raw_rx`, so no item has been dispatched
+                    // and 0 is the reorder buffer's first legitimate push.
                     drop(dispatch_tx.send((0, Some(Err(error)), None)));
                     return;
                 }

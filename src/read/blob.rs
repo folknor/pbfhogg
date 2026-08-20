@@ -832,7 +832,7 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
         // deliberately: the cost was never measured, and changing which pages
         // get dropped changes the cache state every subsequent benchmark on a
         // host observes, so it is not a change to make on inspection alone.
-        // Tracked in notes/bugs-read-path.md.
+        // Tracked in TODO.md, "Bug-hunt carry-over".
         #[cfg(target_os = "linux")]
         if let Some(fd) = self.evict_fd
             && let Some(offset) = self.offset

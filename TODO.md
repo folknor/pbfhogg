@@ -388,6 +388,18 @@ notes carry a CLOSED/STATUS header pointing back here.
 **Blocked on dataset / config** - see the section of that name under
 "Planet-scale validation coverage".
 
+## Cross-repo: one unexplained `brokkr test` watchdog kill (2026-08-20)
+
+Not a product bug - recorded so a second sighting has something to match
+against instead of being investigated from scratch as a deadlock. During the
+bug-hunt fix rounds, a single `brokkr test` run reported
+`sort_failure_leaves_destination_intact` as "did not finish within 20s" with a
+`futex_do_wait` wchan snapshot in `.brokkr/test-hung/`. The same test passed in
+well under a second on every subsequent run and every full `brokkr check`, and
+nothing in it blocked. The test has since been deleted (it could not bite), so
+the reproduction is gone. Read as a flake in brokkr's watchdog or its
+test-binary launch, not as a pbfhogg deadlock.
+
 ## Cross-repo: sidecar marker clock epoch changed (2026-08-20)
 
 pbfhogg's `src/debug.rs` used to timestamp FIFO markers as microseconds
@@ -495,6 +507,227 @@ let `brokkr build-geocode-index --dataset fiji` plus a handful of pinned
 query values join the release-gate list the way `build_denmark_index` /
 `query_copenhagen` do. Until then, treat every green real-data gate as
 evidence about the non-wrapping hemisphere of the code only.
+
+## Bug-hunt carry-over (hunt 2026-08-12, closed out 2026-08-20)
+
+The seven `notes/bugs-*.md` documents are retired; `git log` holds the full
+hunt record and the fixes. Everything those documents left deliberately open
+is restated here, with the reason it was left open, because that is the part
+that has to outlive the notes. Refuted findings did not move here - they are
+recorded as comments at the code they concern (`src/debug.rs` on FIFO marker
+atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
+`src/commands/extract/multi.rs` on the reverted parallel writer,
+`impl Drop for UringState` on the teardown asymmetry).
+
+### Change stream (`src/osc/`, apply-changes, merge-changes, diff)
+
+- [ ] **`CompactDiffOverlay` never reclaims superseded arena records.** Every
+  `push_node` / `push_way` / `push_relation` appends a fresh record and orphans
+  the previous one; the index is overwritten, the bytes are not. Accumulating
+  N OSCs that repeatedly touch the same objects grows the arena by the sum of
+  all versions, not the live set. Pressure is largely off since the
+  version-regression gate refuses the worst accumulation pattern outright, so
+  remaining growth is bounded by genuine forward version churn across a
+  catch-up range. Reclaiming means compaction or a free list threaded through
+  the arena, both touching the offset-width work in `388eb4b3`. **Trigger: a
+  planet-scale `load_all_diffs` measurement showing the arena is the ceiling.**
+  Do that measurement first.
+
+- [ ] **`merge-changes --simplify` is fully in-memory.** `build_simplify_stream`
+  materialises every `Change` - owned tag strings, refs, members - for all
+  inputs before dedupe; the code's own comment cites 26.3 M changes at planet
+  7-OSC. The dedupe key is `(u8, i64)` and only the last change per object
+  survives, so a two-pass shape (scan for last-occurrence offsets, then
+  re-parse and emit) would cut peak RSS by roughly the whole stream. This is a
+  rewrite, not a tweak, so per AGENTS.md it needs an interleaved matched A/B at
+  planet scale rather than an asserted improvement. Note the two-pass shape must
+  preserve the version-precedence gate, which today runs during the single
+  dedupe pass and would move into pass one.
+
+- [ ] **An unversioned modify launders a version floor that a delete keeps.**
+  `check_version_advance` (`src/osc/parse.rs`) compares only when both sides
+  claim a version, and an unversioned delete carries the live record's version
+  into its tombstone, so `create v9 -> delete (no version) -> modify v9` is
+  refused. An unversioned modify instead replaces the live record with one that
+  claims nothing, and `KindStore::stored_version` reads only the current record,
+  so `modify v9 -> modify (no version) -> modify v8` is accepted. Inside the
+  documented contract (DEVIATIONS.md) and pinned deliberately by
+  `test_version_advance_and_unversioned_still_accepted`; real replication diffs
+  always carry `version`, so reaching the laundering sequence needs a producer
+  that emits versions inconsistently, at which point positional order is the
+  only signal left. Closing it means a per-id version-floor map updated on every
+  claimless overwrite (the tombstone maps generalise into that), plus the
+  matching change in `merge_changes::check_version_advance`, which has the same
+  shape. Do both together or neither.
+
+- [ ] **Absent-versus-zero survives in the PBF metadata representation.**
+  `osc::compact::ArenaMeta` and `write::block_builder::Metadata` carry no
+  per-field presence bit, so an OSC element with `version="4"` and nothing else
+  is written with `uid = 0`, `changeset = 0`, `timestamp = 0` - indistinguishable
+  from a genuine user 0 or a genuine epoch timestamp. Same collapse already
+  fixed for coordinates, for `push_info_attrs` and for OSC `version`; it
+  survives here because absence and zero share one representation through the
+  whole PBF write path. `tests/cli_apply_changes.rs::merge_metadata_preservation`
+  currently asserts the bug - it is documented to record the collapse rather
+  than endorse it, and its assertion message says what must change. The fix is
+  per-field presence in both types plus `Option`-shaped fields through
+  `BlockBuilder`: a write-path change, wide enough to deserve its own round.
+
+### Core infrastructure and CLI
+
+- [ ] **Raw-frame passthrough errors name neither file nor blob.** Round 4 gave
+  `BlobReader` and `HeaderWalker` an input identity (`Error::source_path()` /
+  `Error::blob_index()`), covering the decode and preflight paths, but
+  `src/read/raw_frame.rs` is generic over a bare `Read` and has no path to
+  report - so `pbfhogg cat a.pbf b.pbf` on a corrupt passthrough blob still
+  fails with a bare `failed to fill whole buffer`. Same gap in the byte-level
+  reader in `src/commands/cat/dedupe.rs`. Closing it means threading an
+  `Arc<Path>`, matching the two readers that now carry one, through the
+  raw-frame helpers and their callers.
+
+- [ ] **"A failed run leaves the destination byte-identical" is untested for
+  single-input commands.** The multi-input case is covered end to end:
+  `cat good.pbf corrupt.pbf -c version -o dest` fails after its writer is open,
+  and `cat_failure_leaves_preexisting_destination_intact` in
+  `tests/cli_output_guard.rs` is confirmed to fail when `guarded_output` is
+  pointed at the destination. What is uncovered is `sort`, `tags-filter`,
+  `getid`, `getparents`, `time-filter`, `repack`, `degrade`, `renumber` and
+  `add-locations-to-ways`: every corrupt-input fixture available makes them fail
+  *before* the writer opens (a truncated PBF dies in the header-walk preflight,
+  a corrupted payload dies in pass 1), so they are covered for wiring only.
+  Closing it wants a `test-hooks`-gated fault-injection flag on the CLI, shaped
+  like `apply_changes`'s existing `panic_at_blob_seq`.
+
+- [ ] **`bench-merge --output` is the one output-producing command outside
+  `guarded_output`.** Deliberate: it is a synthetic write benchmark and the
+  guard would put a `rename` inside the measured region. Consequence:
+  `pbfhogg bench-merge -o existing.pbf` still truncates up front and leaves a
+  partial file if the run dies - pre-guard behaviour, on a command no one points
+  at real data. If the guard is ever wanted there, commit *outside* the timed
+  region rather than wrapping the whole run. Low urgency.
+
+- [ ] **`ReorderBuffer::with_capacity(N)` is a tuning guess at ~20 sites.** The
+  `N` passed is rarely the caller's true permit window - `time_filter` asks for
+  64 with no matching semaphore anywhere in the file. Round 4 added a
+  `max_window` bound so the buffer can no longer grow without limit, but had to
+  default it to a deliberately generous 65_536 for exactly that reason. The
+  sites whose window *is* known (the `WRITE_AHEAD` writers, `read/pipeline`'s
+  `decode_ahead`) could pin it exactly with `ReorderBuffer::with_max_window` and
+  do not, because verifying each one is concurrency reasoning and a bound set
+  too low turns a memory-growth smell into a production panic.
+
+- [ ] **`cli/src/main.rs` argument splatting is partially cleaned up.** Round 4
+  introduced `WriteOpts` and per-command flag structs for `getid`,
+  `tags-filter`, `check`, `inspect`, `diff` and the geocode-index levels, which
+  removed every run of three or more adjacent same-typed parameters - the class
+  where a transposition compiles silently. What remains is length rather than
+  hazard: `run_tags_filter`, `run_getid`, `run_getparents`, `run_removeid`,
+  `run_extract`, `run_extract_config`, `run_diff`, `run_derive_changes` and
+  `run_tags_count` still carry `#[allow(clippy::too_many_arguments)]` with 8-10
+  parameters of mixed types. Low urgency.
+
+### Read path
+
+- [ ] **`BlobReader::from_path` advises `POSIX_FADV_DONTNEED` over `0..offset`.**
+  The API half is closed - `BlobReader::evict_page_cache(bool)`,
+  `ElementReader::evict_page_cache(bool)` and
+  `ElementReader::from_path_with_eviction` give the public surface a whole-file
+  opt-out, default unchanged. What remains open is the syscall shape: the
+  advised range is the whole consumed prefix `0..current_offset`, re-issued per
+  blob, so planet issues ~2.5 M `posix_fadvise` calls each nominally covering a
+  growing prefix where `offset_prev..offset` would express the same intent over
+  a bounded range. The kernel side is cheap per already-evicted page, so this
+  may well be worth nothing. **Do not "fix" it on inspection.** Changing *which*
+  pages get dropped changes the page-cache state every subsequent benchmark on
+  the host observes, so the measurement perturbs its own baseline: closing this
+  means a scheduled interleaved matched A/B at planet scale on a trimmed drive,
+  with the host's cache state accepted as spent for the duration. It has
+  survived four rounds untouched for that reason.
+
+### Spatial and node-location resolution
+
+- [ ] **The PBF read path does not validate coordinate ranges.** `parse_bbox`
+  now rejects a latitude outside -90..90 or a longitude outside -180..180, and
+  the sparse node store refuses to index a node whose coordinates leave the same
+  domain. The general read path (`read/elements.rs`, the dense node iterators)
+  still hands out whatever the file says. Recorded because the bbox work made
+  the asymmetry visible; changing the read path is a deliberate decision, not a
+  follow-up.
+
+- [ ] **Duplicated pread consumer drains.** `pread_execute`
+  (`extract/common.rs`) duplicates its entire consumer body twice - in-loop
+  drain and post-loop drain - and `multi_extract_pread_write` does the same.
+  Copy-paste that will drift. Left open as a maintenance refactor with no
+  reproduced correctness failure; changing both ordered drains adds risk without
+  fixing a demonstrated wrong answer.
+
+- [ ] **Ring simplification can change polygon topology.** Douglas-Peucker can
+  introduce self-intersections that flip containment near a boundary. The
+  recursion / stack-overflow defect is fixed (explicit stacks); the topology
+  sub-point is open because no topology-preserving replacement and no biting
+  real caller-order fixture was established. Precise scope so it is not
+  rediscovered:
+  - **Producer.** `src/geo.rs` Douglas-Peucker, called from
+    `geocode_index/builder/admin.rs::assemble_one_relation`, which simplifies
+    every outer and inner ring of every admin relation.
+  - **Knob.** `--max-admin-vertices`, default 500. `admin_vertex_cap` now reads
+    it as the *local-boundary* budget and multiplies by admin level (16x at
+    levels 0-2, 8x at 3, 4x at 4, 2x at 5, 1x below), so a country gets 8000
+    vertices where a municipality gets 500. That removed the worst disparity -
+    and raised the Denmark admin cell count from 1224 to 1223 by no longer
+    under-covering Danmark's own coarse ring - but does NOT close this. The knob
+    is still a vertex count, not a distance tolerance: the effective epsilon is
+    whatever it takes to reach the budget, so the error stays unbounded in
+    metres and a topology flip remains possible on any ring long enough to be
+    simplified at all.
+  - **Consumer, and why it matters most.** `geocode_index/reader.rs` runs
+    `geo::point_in_polygon` against the simplified rings for every admin result.
+    A self-intersection near the boundary makes the even-odd crossing count
+    wrong on one side of the fold, so a query resolves to the *wrong*
+    administrative area - a wrong answer, not a missing one, and undetectable in
+    the reader because the ring is well-formed as a byte sequence.
+  - **Blast radius.** Points within the simplification error of a boundary,
+    which at a country-scale ring and 500 vertices can be kilometres.
+  - **What a fix needs.** Either a topology-preserving simplifier (reject a
+    candidate removal whose new segment crosses another segment of the same or a
+    sibling ring), or a metric tolerance in place of the vertex cap so the error
+    is bounded in metres. The geocode `RegionCoverer` rewrite below would let
+    the cap become a tolerance, which is why the two are worth doing together.
+  - **What is missing to act.** A fixture: a ring whose DP simplification at a
+    given cap provably self-intersects, plus a query point whose containment
+    flips. Without it any fix is unfalsifiable.
+
+### Geocode index
+
+- [ ] **Admin coverage is sampled, not covered - the `RegionCoverer` rewrite.**
+  Deferred by
+  [ADR-0015](decisions/0015-defer-s2-admin-region-coverer.md) until the selected
+  S2 implementation supplies polygon and loop regions usable by `RegionCoverer`,
+  or pbfhogg adopts one that does. The admin-interior, `cover_segment` and
+  `max-admin-vertices` findings are one problem in three hats: admin coverage is
+  built from ad-hoc sampling and a guessed seed instead of a real region
+  coverer, `research/traccar-geocoder/` is the precedent, and the reader's own
+  comment admits the interior flag is untrustworthy because of this - the
+  PIP-skip optimisation is disabled permanently to compensate. Replacing
+  `cover_segment` plus centroid flood-fill with `s2::RegionCoverer` over a
+  proper loop/polygon region would fix under-coverage, kill the duplicate
+  emissions, make the interior flag sound (re-enabling the PIP skip), remove the
+  level-hardcoded step table, and let the DP cap become a metric tolerance.
+  Everything else in that scope was repair work; this is the structural change.
+
+  Two stopgaps stand in front of it, both deliberate. The 256-step cap that
+  silently under-covered is gone, and the unbounded sampling that replaced it is
+  bounded by capping the configurable S2 levels at 19 - derived from a
+  per-segment budget of 2^24 samples and the widest separation two legal
+  coordinates can have. That is a stopgap with a proof attached, not a fix: a
+  `RegionCoverer` would make the level cap unnecessary, because an exact
+  traversal's cost scales with the cells actually covered rather than with the
+  cell width. Separately the sampler now unwraps the antimeridian - it unwraps
+  the far endpoint around the near one before stepping, so a 179.9E to 179.9W
+  segment is sampled as the 0.2-degree segment it is - which leaves
+  `MAX_SEGMENT_SPAN_DEG` of 405 a loose over-estimate against a true worst case
+  of about 255 degrees. Conservative in the safe direction, left alone
+  deliberately; a `RegionCoverer` retires the constant along with the sampler.
 
 ## Item/command-specific plans
 

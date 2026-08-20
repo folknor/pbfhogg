@@ -88,7 +88,8 @@ pub(super) struct AdminCellEntry {
 // sub-cell resolution is inherently quadratic in the wrong places; the
 // structural fix is an exact S2 edge traversal, or an `S2RegionCoverer` over a
 // loop region as in `research/traccar-geocoder`. That rewrite is tracked in
-// `notes/bugs-geocode-index.md` and is deliberately not attempted here.
+// ADR-0015 (`decisions/0015-defer-s2-admin-region-coverer.md`) and in TODO.md
+// under "Bug-hunt carry-over"; it is deliberately not attempted here.
 // ---------------------------------------------------------------------------
 
 /// Per-segment sampling budget: 2^24 points. In the pathological case that

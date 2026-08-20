@@ -5,160 +5,25 @@ repack, degrade, renumber, getid, getparents, inspect, tags_count, tags_filter,
 check, export, mod.rs), `src/blob_meta/`, `src/tag_expr.rs`. Findings only,
 unverified.
 
-## Filed 2026-08-20 from the read-path round-3 fix pass: the independent scanners only match the length-delimited wire form
+## Filed 2026-08-20 from this document's own round-1 fix pass
 
-`src/read/wire.rs` was fixed to accept a packed repeated field in either of its
-two legal wire forms (a length-delimited packed segment, or individually tagged
-varints), because matching only the first meant an unpacked `keys_vals` decoded
-as "this block has no tags" with no error, and libosmium accepts both. See
-`reference/truncation-handling.md`, "Which wire forms of a packed field count as
-present".
+### `check --refs` drops an unrecordable node ID silently, then reports its refs as missing
 
-The read path is not the only place that walks these messages. These scanners
-carry their own hand-rolled parsers, and every one of them still matches
-`WIRE_LEN` only on packed fields:
+`src/commands/check/refs.rs` populates `node_ids` / `way_ids` / `relation_ids`
+with `IdSet::set_atomic_checked` and discards the returned `bool`. `false` means
+the ID fell outside the pre-allocated range - now bounded both by the file's
+indexdata and by `check::id_alloc_bound` - so the element is never entered into
+the set and every ref pointing at it is subsequently reported as a missing ref.
 
-- `src/scan/node.rs`, `src/scan/way.rs`
-- `src/blob_meta/scan_ids.rs`
-- `src/commands/renumber/wire_rewrite.rs`
-- `src/commands/altw/reframe.rs`
+That is a deliberate over-report rather than a panic (the previous behaviour),
+and the report is not wrong in the sense of hiding anything. But it is
+indistinguishable from a genuinely dangling ref, so a user reading the output
+has no way to tell "your file references a node that isn't in it" from "your
+file contains a node whose ID this check could not track". `verify_ids` faces
+the identical situation and does report it, as `IdViolation::IdOutOfRange`;
+`check --refs` should say something equivalent, at minimum a count on stderr.
 
-The impact is not identical to the read path's, because these mostly consume
-`id` / `refs` arrays rather than `keys_vals`, and an unpacked-encoded file is
-rare enough that nobody has hit one. But the failure mode is the same shape: the
-array reads as empty, the scanner concludes the blob has no ways or no refs, and
-the result is a silently wrong index or a silently wrong reframe rather than an
-error. `renumber` in particular bases ID assignment on what `scan_ids` reports.
-
-Note that these are five more copies of a message parser `wire.rs` already has -
-the same duplication that made the frame-envelope guards have to be written five
-times before `src/read/frame.rs` unified them. Whether the fix is "apply
-`take_packed`'s policy five more times" or "route these through `wire.rs`" is a
-design question, not a mechanical one.
-
-Not fixed in the read-path round because it is outside that document's scope.
-
-## HIGH
-
-### Overlap-run detection is pairwise-adjacent, not transitive - `sort` and `cat --dedupe` can emit unsorted output stamped `Sort.Type_then_ID`
-
-`src/commands/sort/mod.rs::detect_overlaps` and the identical copy in
-`src/commands/cat/dedupe.rs::detect_overlaps` mark `overlaps[i]` /
-`overlaps[i+1]` only when adjacent entries in the min-key-sorted list overlap.
-Overlap is not transitive under that test.
-
-Concrete failure (same kind, sorted by first key): A=[1..1000], B=[2..3],
-C=[500..600].
-
-- A/B overlap, both flagged. B/C: `B.max=3 < C.min=500`, so C is not flagged.
-- The run is `[A,B]`. `sweep_merge_local` flushes the heap "below the next
-  entry's first id" and, at end of run, flushes everything remaining - emitting
-  A's ids 500..1000.
-- C is then written as a passthrough blob (ids 500..600) after those.
-- Output is not sorted, yet `build_output_header(..., |hb| hb.sorted())`
-  unconditionally stamps `Sort.Type_then_ID`.
-
-In `cat/dedupe.rs` this additionally means A/C duplicates are never deduped, so
-the "exact duplicates removed" contract silently fails. This is realistic for
-`merge` of extracts, where per-blob ID ranges are wide and sparse. `degrade
---unsort` only produces one adjacent overlapping pair per kind, so the test
-corpus cannot reach this case.
-
-Fix: replace the pairwise scan with a running-max sweep
-(`run_max = max(run_max, entry.last_key)`; extend the run while
-`next.first_key <= run_max`), kind-bounded as today.
-
-Confidence: high (derived from the code, not executed).
-
-### `check --ids --full` panics on IDs outside hardcoded ceilings - including negative IDs and near-future way IDs
-
-`src/commands/check/verify_ids.rs::verify_ids_full_parallel` pre-allocates
-`node_ids.pre_allocate(14_000_000_000)`, `way_ids.pre_allocate(1_500_000_000)`,
-`relation_ids.pre_allocate(25_000_000)`, and workers call
-`IdSet::set_atomic_if_new`, which does `let id = id as u64` and panics
-(`chunk_for_atomic`) when the chunk was not pre-allocated.
-
-- Any negative ID (JOSM staging IDs, which `getid` explicitly rejects with a
-  friendly message) becomes a huge `u64`, so guaranteed panic.
-- The way ceiling is 1.5e9. Live OSM way IDs are already ~1.4e9.
-  `check --ids --full` on a future planet will panic rather than report.
-- A degraded or hostile file with any out-of-range ID panics a worker rather than
-  producing a violation report - which is exactly the file `check` exists to
-  diagnose.
-
-The verifier should clamp or bounds-check and report an `IdViolation` (or grow
-the set), never panic.
-
-Confidence: high.
-
-### Mixed-kind within a single PrimitiveGroup is undetected - indexdata and tag index both lie, and five commands act on it
-
-`src/blob_meta/scan_ids.rs::scan_primitive_group` returns at the first element
-field it encounters (`(3,2)` Way to `scan_repeated_element_ids(..., 3, Way)`), so
-a group containing e.g. ways and relations is indexed as `kind=Way` with `count`
-= ways only. The mixed-kind guard in `scan_block_ids_checked` only compares
-across groups, so it never fires. `tag_index.rs::scan_group_tag_keys` has the
-same shape (returns after the first kind), so the tag index omits the off-kind
-elements' keys.
-
-Downstream consequences, all silent:
-
-- `cat --type way` passes the blob through raw, so relations appear in a way-only
-  output. `cat --type relation` skips it, so those relations vanish.
-- `sort`: `compute_overlap_run_local`'s kind-gated `extract` closure drops
-  off-kind elements (`_ => {}`) if the blob lands in an overlap run; if not, it
-  passes through raw with a wrong index.
-- `repack`: the blob is only in the way schedule, so its relations are never
-  emitted.
-- `renumber`: `build_all_blob_schedules` files it under Way; the wire-splice
-  rewrites only way IDs, leaving off-kind elements with unrenumbered IDs in the
-  way stream.
-- `tags-filter`: the incomplete tag index can cause an over-eager blob skip
-  (missing matches).
-
-The scanner already knows how to say "I cannot index this" - return `None` for a
-group that contains more than one element field, exactly as the cross-group case
-does.
-
-Confidence: high on the scanner behaviour; the downstream consequences follow
-mechanically.
-
-### `TagIndex::serialize` truncates to `u16` and produces an unparseable or undersized index
-
-`src/blob_meta/tag_index.rs`: both `self.keys.len() as u16` and
-`key.len() as u16` truncate silently.
-
-- A key longer than 65535 bytes writes a wrapped length followed by the full
-  bytes, so `deserialize` desynchronizes and yields garbage keys from that point,
-  or bails and returns `None`.
-- More than 65535 distinct keys in one blob writes a wrapped count, so
-  `deserialize` returns a truncated key set that still looks valid.
-  `tags_filter::classify_blob_filter_check` then skips blobs whose keys were
-  dropped, so `pbfhogg tags-filter` produces silently incomplete output with a
-  cheerful "N blobs skipped by tag index" line.
-
-Neither bound is checked and neither is reachable from OSM data today, but
-`degrade`'s whole premise is that inputs may be hostile. The writer should emit
-no tag index at all when it cannot encode one faithfully.
-
-### `renumber` derives ID assignment from unverified indexdata
-
-`src/commands/renumber/schedule.rs` takes `element_count` and `max_id` straight
-from `BlobIndex` and `mod.rs` uses them to precompute each blob's `base_new_id`
-before any decode, and to size the node `IdSet` (`pre_allocate(max_node_id)`).
-
-- A wrong `count` on a way or relation blob produces overlapping new ID ranges,
-  i.e. duplicate IDs in output. Only the node total is cross-checked ("pass1 node
-  count mismatch"); ways and relations have no equivalent guard.
-- A `max_id` smaller than the true max makes `IdSet::set_atomic` panic with the
-  "pre_allocate only covers..." message the code comment explicitly says it
-  wanted to avoid (it defends against a false `sorted` claim but not against
-  false indexdata).
-- Negative node IDs give `id as u64` and the same panic. Unlike `getid`,
-  `renumber` has no negative-ID rejection.
-
-Add the same count-mismatch assertion for ways and relations, and reject negative
-IDs up front.
+Confidence: high (read from the code; the discarded `bool` is explicit).
 
 ## MEDIUM
 
@@ -259,12 +124,9 @@ indexdata kind/count boundary - which `renumber` bases ID assignment on and
 `cat --type` bases raw passthrough on - is not documented as a trust boundary at
 all.
 
-The hunter would do two things structurally, both breaking:
+The hunter would do one thing structurally, breaking:
 
-1. Make `scan_block_ids` refuse to index anything ambiguous (single-group mixed
-   kinds), so "indexdata exists" means "kind and count are exact" as a
-   scanner-level invariant rather than an assumption spread across five commands.
-2. Add one verification path - `pbfhogg check --index` plus a global
+1. Add one verification path - `pbfhogg check --index` plus a global
    `--distrust-metadata` - instead of each command inventing its own
    `require_indexdata` / `--force` pairing. `degrade` already exists to generate
    the adversarial corpus; there is currently nothing on the other side to catch

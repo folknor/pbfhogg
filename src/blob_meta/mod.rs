@@ -13,7 +13,7 @@ mod scan_ids;
 mod tag_index;
 
 pub(crate) use scan_ids::{scan_block_ids, scan_block_ids_checked};
-pub(crate) use tag_index::{TAG_INDEX_VERSION, TagIndex, scan_block_tags};
+pub(crate) use tag_index::{TagIndex, encode_tag_index, scan_block_tags};
 
 /// Element type stored in a blob index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

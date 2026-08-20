@@ -511,18 +511,48 @@ fn mark_intra_unsorted_for_rewrite(entries: &[BlobEntry], overlaps: &mut [bool])
     count
 }
 
+/// Flag every blob that belongs to a range-overlap run.
+///
+/// Entries arrive sorted by first key within a kind. The test is a
+/// running-maximum sweep, not a pairwise-adjacent comparison, because overlap
+/// is **not transitive**: with A=[1..1000], B=[2..3], C=[500..600], A/B overlap
+/// but B/C do not (`B.max=3 < C.min=500`), so a pairwise scan leaves C
+/// unflagged. The sweep-merge then emits A's ids 500..1000 and C follows as a
+/// raw passthrough blob carrying ids 500..600 - output that is not sorted while
+/// the header still stamps `Sort.Type_then_ID`, and (in `cat --dedupe`) A/C
+/// duplicates that the "exact duplicates removed" contract promised to drop.
+///
+/// Extending the run while `next.first_key <= run_max` closes that: once a blob
+/// joins a run, every later blob whose first key falls inside the run's widest
+/// reach so far joins too. Runs stay kind-bounded, exactly as before - the
+/// downstream sweep is kind-gated and silently drops off-kind elements handed
+/// to it.
 fn detect_overlaps(entries: &[BlobEntry]) -> Vec<bool> {
     let mut overlaps = vec![false; entries.len()];
-    for i in 0..entries.len().saturating_sub(1) {
-        if entries[i].index.kind == entries[i + 1].index.kind
-            && crate::osm_id::blob_osm_last_key(entries[i].index.min_id, entries[i].index.max_id)
-                >= crate::osm_id::blob_osm_first_key(
-                    entries[i + 1].index.min_id,
-                    entries[i + 1].index.max_id,
-                )
+    let mut i = 0;
+    while i < entries.len() {
+        let kind = entries[i].index.kind;
+        let mut run_max =
+            crate::osm_id::blob_osm_last_key(entries[i].index.min_id, entries[i].index.max_id);
+        let mut j = i + 1;
+        while j < entries.len()
+            && entries[j].index.kind == kind
+            && crate::osm_id::blob_osm_first_key(entries[j].index.min_id, entries[j].index.max_id)
+                <= run_max
         {
-            overlaps[i] = true;
-            overlaps[i + 1] = true;
+            run_max = run_max.max(crate::osm_id::blob_osm_last_key(
+                entries[j].index.min_id,
+                entries[j].index.max_id,
+            ));
+            j += 1;
+        }
+        if j > i + 1 {
+            for flag in &mut overlaps[i..j] {
+                *flag = true;
+            }
+            i = j;
+        } else {
+            i += 1;
         }
     }
     overlaps
@@ -853,5 +883,103 @@ impl HasId for OwnedWay {
 impl HasId for OwnedRelation {
     fn id(&self) -> i64 {
         self.id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(kind: ElemKind, min_id: i64, max_id: i64) -> BlobEntry {
+        BlobEntry {
+            file_offset: 0,
+            frame_len: 0,
+            index: BlobIndex {
+                kind,
+                min_id,
+                max_id,
+                count: 1,
+                bbox: None,
+            },
+            has_indexdata: true,
+            tagdata: None,
+            intra_unsorted: false,
+        }
+    }
+
+    /// The transitivity failure. Entries are in first-key order:
+    /// A=[1..1000], B=[2..3], C=[500..600].
+    ///
+    /// A/B overlap. B/C do NOT (`B.max=3 < C.min=500`), so a pairwise-adjacent
+    /// scan leaves C unflagged - yet C's range sits squarely inside A's. The
+    /// run [A,B] then flushes A's ids 500..1000 and C is written afterwards as
+    /// a raw passthrough blob carrying ids 500..600, so the output is not
+    /// sorted while the header unconditionally stamps `Sort.Type_then_ID`.
+    #[test]
+    fn overlap_runs_are_transitive_not_pairwise() {
+        let entries = vec![
+            entry(ElemKind::Node, 1, 1000),
+            entry(ElemKind::Node, 2, 3),
+            entry(ElemKind::Node, 500, 600),
+        ];
+        assert_eq!(
+            detect_overlaps(&entries),
+            vec![true, true, true],
+            "C=[500..600] lies inside A=[1..1000] and must join the run even \
+             though it does not overlap its immediate predecessor B=[2..3]"
+        );
+    }
+
+    /// Passing counterpart: genuinely disjoint blobs must stay unflagged, so a
+    /// "flag everything" regression cannot satisfy the test above.
+    #[test]
+    fn disjoint_blobs_are_not_flagged_as_overlapping() {
+        let entries = vec![
+            entry(ElemKind::Node, 1, 10),
+            entry(ElemKind::Node, 11, 20),
+            entry(ElemKind::Node, 21, 30),
+        ];
+        assert_eq!(detect_overlaps(&entries), vec![false, false, false]);
+    }
+
+    /// Runs stay kind-bounded: the sweep-merge is kind-gated and silently
+    /// drops off-kind elements handed to it.
+    #[test]
+    fn a_run_never_crosses_a_kind_boundary() {
+        let entries = vec![
+            entry(ElemKind::Node, 1, 1000),
+            entry(ElemKind::Node, 2, 3),
+            entry(ElemKind::Way, 5, 6),
+        ];
+        assert_eq!(
+            detect_overlaps(&entries),
+            vec![true, true, false],
+            "the way blob shares an id range with the node run but is a \
+             different kind, so it must not be pulled into it"
+        );
+    }
+
+    /// A run that ends must not tint the blob that follows it.
+    #[test]
+    fn a_new_run_starts_after_the_previous_one_ends() {
+        let entries = vec![
+            entry(ElemKind::Node, 1, 100),
+            entry(ElemKind::Node, 50, 60),
+            entry(ElemKind::Node, 200, 300),
+            entry(ElemKind::Node, 250, 260),
+        ];
+        assert_eq!(detect_overlaps(&entries), vec![true, true, true, true]);
+
+        let entries = vec![
+            entry(ElemKind::Node, 1, 100),
+            entry(ElemKind::Node, 50, 60),
+            entry(ElemKind::Node, 200, 300),
+        ];
+        assert_eq!(
+            detect_overlaps(&entries),
+            vec![true, true, false],
+            "the blob after a run must be judged on its own, not inherit the \
+             run's flag"
+        );
     }
 }

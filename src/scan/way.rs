@@ -132,41 +132,35 @@ pub(crate) fn scan_way_refs(
 }
 
 /// Parse a single Way message and extract id + refs.
-#[allow(clippy::cast_possible_wrap)]
+///
+/// Routes through [`WireWay::parse`] rather than hand-rolling a third Way
+/// parser. That matters for more than duplication: `wire.rs` accepts a packed
+/// repeated field in *either* legal protobuf wire form (a length-delimited
+/// packed segment, or individually tagged varints), and this scanner used to
+/// match `WIRE_LEN` only. On a spec-legal unpacked encoding the old code saw
+/// `refs` as absent, invoked no callback at all, and the caller concluded the
+/// way had no node references - a silently truncated node index, not an error.
+/// See `reference/truncation-handling.md`, "Which wire forms of a packed field
+/// count as present".
 fn parse_way_refs(
     way_data: &[u8],
     refs_buf: &mut Vec<i64>,
     callback: &mut impl FnMut(i64, &[i64]),
 ) -> Result<()> {
-    use crate::read::wire::{Cursor, PackedSint64Iter, WIRE_LEN, WIRE_VARINT};
+    use crate::read::wire::{PackedSint64Iter, WireWay};
 
-    let mut cursor = Cursor::new(way_data);
-    let mut way_id: i64 = 0;
-    let mut refs_data: Option<&[u8]> = None;
-
-    while let Some((field, wire_type)) = cursor.read_tag()? {
-        match (field, wire_type) {
-            (1, WIRE_VARINT) => {
-                way_id = cursor.read_varint_i64()?;
-            }
-            (8, WIRE_LEN) => {
-                refs_data = Some(cursor.read_len_delimited()?);
-            }
-            _ => {
-                cursor.skip_field(wire_type)?;
-            }
-        }
+    let way = WireWay::parse(way_data)?;
+    if way.refs_data.is_empty() {
+        return Ok(());
     }
 
-    if let Some(rd) = refs_data {
-        refs_buf.clear();
-        let mut cum: i64 = 0;
-        for delta in PackedSint64Iter::new(rd) {
-            cum += delta;
-            refs_buf.push(cum);
-        }
-        callback(way_id, refs_buf);
+    refs_buf.clear();
+    let mut cum: i64 = 0;
+    for delta in PackedSint64Iter::new(way.refs_data) {
+        cum += delta;
+        refs_buf.push(cum);
     }
+    callback(way.id, refs_buf);
 
     Ok(())
 }
@@ -331,33 +325,17 @@ fn parse_way_tagged_refs(
     refs_buf: &mut Vec<i64>,
     callback: &mut impl FnMut(i64, WayGeocodeFlags, &[i64]),
 ) -> Result<()> {
-    use crate::read::wire::{Cursor, PackedSint64Iter, PackedUint32Iter, WIRE_LEN, WIRE_VARINT};
+    use crate::read::wire::{PackedSint64Iter, PackedUint32Iter, WireWay};
 
-    let mut cursor = Cursor::new(way_data);
-    let mut way_id: i64 = 0;
-    let mut keys_data: Option<&[u8]> = None;
-    let mut vals_data: Option<&[u8]> = None;
-    let mut refs_data: Option<&[u8]> = None;
-
-    while let Some((field, wire_type)) = cursor.read_tag()? {
-        match (field, wire_type) {
-            (1, WIRE_VARINT) => {
-                way_id = cursor.read_varint_i64()?;
-            }
-            (2, WIRE_LEN) => {
-                keys_data = Some(cursor.read_len_delimited()?);
-            }
-            (3, WIRE_LEN) => {
-                vals_data = Some(cursor.read_len_delimited()?);
-            }
-            (8, WIRE_LEN) => {
-                refs_data = Some(cursor.read_len_delimited()?);
-            }
-            _ => {
-                cursor.skip_field(wire_type)?;
-            }
-        }
-    }
+    // Same routing rationale as `parse_way_refs`: `WireWay::parse` accepts
+    // both legal wire forms of a packed field, where this scanner's own
+    // matcher accepted only the length-delimited one and read an unpacked
+    // `keys` / `vals` / `refs` as empty.
+    let way = WireWay::parse(way_data)?;
+    let way_id = way.id;
+    let keys_data = (!way.keys_data.is_empty()).then_some(way.keys_data);
+    let vals_data = (!way.vals_data.is_empty()).then_some(way.vals_data);
+    let refs_data = (!way.refs_data.is_empty()).then_some(way.refs_data);
 
     // Classify by iterating keys/vals in lockstep. Flags track key
     // presence + the specific highway value for the excluded-set check.
@@ -429,4 +407,110 @@ fn parse_way_tagged_refs(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// PrimitiveBlock holding one PrimitiveGroup holding one Way. `refs` is
+    /// written packed when `packed`, unpacked (one varint-typed field 8 per
+    /// delta) otherwise. Both spellings are legal protobuf.
+    fn way_block(way_id: i64, refs: &[i64], packed: bool) -> Vec<u8> {
+        fn varint(mut v: u64, out: &mut Vec<u8>) {
+            loop {
+                #[allow(clippy::cast_possible_truncation)]
+                let mut b = (v & 0x7f) as u8;
+                v >>= 7;
+                if v != 0 {
+                    b |= 0x80;
+                }
+                out.push(b);
+                if v == 0 {
+                    break;
+                }
+            }
+        }
+        #[allow(clippy::cast_sign_loss)]
+        fn zigzag(v: i64) -> u64 {
+            ((v << 1) ^ (v >> 63)) as u64
+        }
+
+        let mut way = Vec::new();
+        way.push(0x08); // field 1 (id), varint
+        #[allow(clippy::cast_sign_loss)]
+        varint(way_id as u64, &mut way);
+
+        let mut deltas = Vec::new();
+        let mut prev = 0_i64;
+        for &r in refs {
+            deltas.push(zigzag(r - prev));
+            prev = r;
+        }
+        if packed {
+            let mut seg = Vec::new();
+            for &d in &deltas {
+                varint(d, &mut seg);
+            }
+            way.push(0x42); // field 8, LEN
+            varint(seg.len() as u64, &mut way);
+            way.extend_from_slice(&seg);
+        } else {
+            for &d in &deltas {
+                way.push(0x40); // field 8, VARINT
+                varint(d, &mut way);
+            }
+        }
+
+        let mut group = Vec::new();
+        group.push(0x1A); // field 3 (ways), LEN
+        varint(way.len() as u64, &mut group);
+        group.extend_from_slice(&way);
+
+        let mut block = Vec::new();
+        block.push(0x12); // PrimitiveBlock field 2, LEN
+        varint(group.len() as u64, &mut block);
+        block.extend_from_slice(&group);
+        block
+    }
+
+    fn collect(block: &[u8]) -> Vec<(i64, Vec<i64>)> {
+        let mut out = Vec::new();
+        let mut refs_buf = Vec::new();
+        let mut group_starts = Vec::new();
+        scan_way_refs(block, &mut refs_buf, &mut group_starts, |id, refs| {
+            out.push((id, refs.to_vec()));
+        })
+        .unwrap();
+        out
+    }
+
+    #[test]
+    fn a_single_unpacked_ref_is_not_read_as_no_refs() {
+        // The old matcher took `(8, WIRE_LEN)` only, so an unpacked `refs`
+        // fell to `skip_field`, `refs_data` stayed `None`, and the callback
+        // never fired: the caller concluded the way referenced no nodes and
+        // the node index came out silently short. A single unpacked varint is
+        // byte-identical to a one-element packed segment.
+        let unpacked = collect(&way_block(42, &[7], false));
+        assert_eq!(
+            unpacked,
+            vec![(42, vec![7])],
+            "an unpacked Way.refs must decode to the same refs a packed one does"
+        );
+
+        // Passing counterpart in the same shape: the packed spelling of the
+        // identical way must give the identical answer, so this is not
+        // satisfied by a scanner that emits refs unconditionally.
+        assert_eq!(collect(&way_block(42, &[7], true)), unpacked);
+    }
+
+    #[test]
+    fn a_way_with_no_refs_yields_no_callback() {
+        assert!(
+            collect(&way_block(42, &[], true)).is_empty(),
+            "a way with an empty refs array contributes nothing"
+        );
+    }
 }

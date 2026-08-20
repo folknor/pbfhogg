@@ -95,6 +95,16 @@ pub(crate) fn scan_block_ids_checked(raw: &[u8]) -> Option<(BlobIndex, bool)> {
     let mut sorted = true;
     let mut prev_last: Option<i64> = None;
     for group_data in groups {
+        // Refuse to index the whole blob when any group mixes element kinds:
+        // `scan_primitive_group` stops at the first element field, so its
+        // `kind` and `count` would describe only part of the group and the
+        // cross-group guard below could never see it. Bailing out on the blob
+        // (not just skipping the group) is the point - skipping would leave a
+        // BlobIndex built from the blob's *other* groups, which understates
+        // `count` just as badly. See `group_mixes_element_kinds`.
+        if group_mixes_element_kinds(group_data) {
+            return None;
+        }
         if let Some(scan) = scan_primitive_group(group_data, granularity, lat_offset, lon_offset) {
             if !scan.sorted {
                 sorted = false;
@@ -140,6 +150,40 @@ fn merge_bbox(a: Option<BlobBbox>, b: Option<BlobBbox>) -> Option<BlobBbox> {
         (Some(x), None) | (None, Some(x)) => Some(x),
         (None, None) => None,
     }
+}
+
+/// Report whether a `PrimitiveGroup` carries more than one element field.
+///
+/// `PrimitiveGroup` has four element fields - 1 `nodes`, 2 `dense`, 3 `ways`,
+/// 4 `relations` - and the OSM PBF spec says a group holds exactly one kind.
+/// Nothing enforces it on the wire, and every scanner in this crate stops at
+/// the first element field it meets, so a group holding e.g. ways *and*
+/// relations gets indexed as `kind=Way` with a `count` covering only the ways.
+/// The cross-group mixed-kind guard in [`scan_block_ids_checked`] never fires,
+/// because the mixing is inside one group.
+///
+/// That lie is load-bearing downstream: `cat --type way` passes such a blob
+/// through raw (relations leak into a way-only output) while `cat --type
+/// relation` skips it (those relations vanish), `repack` only schedules it as
+/// ways, and `renumber` splices only way IDs and leaves the off-kind elements
+/// carrying un-renumbered IDs. So a group we cannot describe exactly must not
+/// be described at all - the caller returns `None`, which every consumer
+/// already handles as "no indexdata, decode it".
+///
+/// A group with zero or one element field is fine: zero contributes nothing
+/// and one is exactly describable. Only two or more is the ambiguous case.
+pub(super) fn group_mixes_element_kinds(raw: &[u8]) -> bool {
+    let mut cur = Cursor::new(raw);
+    let mut seen: u32 = 0;
+    while let Ok(Some((tag, wire_type))) = cur.read_tag() {
+        if matches!(tag, 1..=4) && wire_type == 2 {
+            seen |= 1 << tag;
+        }
+        if cur.skip_field(wire_type).is_err() {
+            break;
+        }
+    }
+    seen.count_ones() > 1
 }
 
 /// Scan a PrimitiveGroup submessage for element type + IDs + bbox + order.
@@ -198,23 +242,21 @@ fn scan_dense_nodes(
     lat_offset: i64,
     lon_offset: i64,
 ) -> Option<GroupScan> {
-    let mut cur = Cursor::new(raw);
-    let mut ids_data: Option<&[u8]> = None;
-    let mut lat_data: Option<&[u8]> = None;
-    let mut lon_data: Option<&[u8]> = None;
-
-    // Collect all relevant packed fields
-    while let Some((tag, wire_type)) = cur.read_tag().ok()? {
-        match (tag, wire_type) {
-            (1, 2) => ids_data = Some(cur.read_len_delimited().ok()?),
-            (8, 2) => lat_data = Some(cur.read_len_delimited().ok()?),
-            (9, 2) => lon_data = Some(cur.read_len_delimited().ok()?),
-            _ => cur.skip_field(wire_type).ok()?,
-        }
-    }
+    // Route through the shared DenseNodes parser rather than matching the
+    // packed fields here. Protobuf permits a packed repeated field in either
+    // of two wire forms - one length-delimited segment, or individually tagged
+    // varints - and this scanner used to match only the length-delimited one.
+    // An unpacked `id` array then read as empty, the scan returned `None`, and
+    // the blob silently got no indexdata at all (or, where a sibling group did
+    // index, a `count` that understated the blob). `WireDenseNodes::parse`
+    // accepts both forms and errors on the one genuinely ambiguous shape (two
+    // occurrences that both carry data). See `src/read/wire.rs::take_packed`.
+    let dense = crate::read::wire::WireDenseNodes::parse(raw).ok()?;
+    let lat_data = (!dense.lat_data.is_empty()).then_some(dense.lat_data);
+    let lon_data = (!dense.lon_data.is_empty()).then_some(dense.lon_data);
 
     // Process IDs (required)
-    let ids_data = ids_data?;
+    let ids_data = dense.id_data;
     let mut id_cur = Cursor::new(ids_data);
     let mut min_id = i64::MAX;
     let mut max_id = i64::MIN;
@@ -610,6 +652,101 @@ mod tests {
             "a within-group non-dense node inversion must be detected"
         );
         assert_eq!(index.kind, ElemKind::Node);
+    }
+
+    // --- Unpacked wire form of DenseNodes.id ----------------------------
+
+    /// PrimitiveGroup body whose DenseNodes writes `ids` in the UNPACKED wire
+    /// form: each delta as its own varint-typed field 1 rather than one packed
+    /// length-delimited segment. Both spellings are legal protobuf.
+    fn dense_group_body_unpacked(ids: &[i64]) -> Vec<u8> {
+        let mut dense_msg = Vec::new();
+        let mut prev = 0i64;
+        for &id in ids {
+            write_tag(1, 0, &mut dense_msg);
+            encode_varint(zigzag(id - prev), &mut dense_msg);
+            prev = id;
+        }
+        let mut group_body = Vec::new();
+        write_len_delimited(2, &dense_msg, &mut group_body);
+        group_body
+    }
+
+    #[test]
+    fn unpacked_dense_ids_are_indexed_not_read_as_absent() {
+        // A single unpacked value is byte-identical to a one-element packed
+        // segment, so this is the shape the scanner has to accept. Matching
+        // WIRE_LEN only made `ids_data` None and the whole blob unindexable -
+        // silently, since "no indexdata" is a legal state.
+        let g = dense_group_body_unpacked(&[7]);
+        let block = block_from_groups(&[&g]);
+        let (index, _sorted) = scan_block_ids_checked(&block)
+            .expect("an unpacked DenseNodes.id array must still produce a BlobIndex");
+        assert_eq!(index.kind, ElemKind::Node);
+        assert_eq!(index.count, 1);
+        assert_eq!(index.min_id, 7);
+        assert_eq!(index.max_id, 7);
+
+        // Passing counterpart: the packed spelling of the same single node
+        // must produce the identical index, so a reject-everything or
+        // accept-nothing regression cannot pass both halves.
+        let packed = block_from_groups(&[&dense_group_body(&[7])]);
+        let (packed_index, _) = scan_block_ids_checked(&packed).unwrap();
+        assert_eq!(packed_index.count, index.count);
+        assert_eq!(packed_index.min_id, index.min_id);
+    }
+
+    // --- Mixed-kind groups ----------------------------------------------
+
+    /// One PrimitiveGroup body carrying both a Way (field 3) and a Relation
+    /// (field 4) message - spec-illegal but wire-legal, and undetectable by
+    /// the cross-group kind guard because it is all one group.
+    fn mixed_way_relation_group_body(way_id: i64, rel_id: i64) -> Vec<u8> {
+        let mut group_body = Vec::new();
+        write_len_delimited(3, &element_msg(way_id), &mut group_body);
+        write_len_delimited(4, &element_msg(rel_id), &mut group_body);
+        group_body
+    }
+
+    #[test]
+    fn a_group_mixing_ways_and_relations_is_not_indexed() {
+        let g = mixed_way_relation_group_body(1, 2);
+        let block = block_from_groups(&[&g]);
+        assert!(
+            scan_block_ids_checked(&block).is_none(),
+            "a group holding both a way and a relation cannot be described by a \
+             single (kind, count) pair, so it must yield no indexdata at all - \
+             indexing it as kind=Way with count=1 makes `cat --type relation` \
+             drop the relation and `renumber` leave its id unrenumbered"
+        );
+    }
+
+    #[test]
+    fn a_mixed_group_poisons_the_whole_blob_not_just_itself() {
+        // Skipping only the offending group would leave an index built from
+        // the clean group - correct `kind`, but a `count` that understates the
+        // blob. Every consumer treats `count` as exact.
+        let clean = repeated_group_body(3, &[10, 11]);
+        let mixed = mixed_way_relation_group_body(12, 2);
+        let block = block_from_groups(&[&clean, &mixed]);
+        assert!(
+            scan_block_ids_checked(&block).is_none(),
+            "one mixed group must make the whole blob unindexable"
+        );
+    }
+
+    #[test]
+    fn single_kind_groups_still_index() {
+        // Passing counterpart to the two rejections above: the guard must not
+        // have turned into "refuse every multi-group blob".
+        let a = repeated_group_body(3, &[1, 2]);
+        let b = repeated_group_body(3, &[3, 4]);
+        let block = block_from_groups(&[&a, &b]);
+        let (index, sorted) = scan_block_ids_checked(&block)
+            .expect("two single-kind way groups must still be indexable");
+        assert!(sorted);
+        assert_eq!(index.kind, ElemKind::Way);
+        assert_eq!(index.count, 4);
     }
 
     #[test]

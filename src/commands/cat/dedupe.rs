@@ -356,18 +356,48 @@ fn type_order(kind: ElemKind) -> u8 {
     }
 }
 
+/// Flag every blob that belongs to a range-overlap run.
+///
+/// Entries arrive sorted by first key within a kind. The test is a
+/// running-maximum sweep, not a pairwise-adjacent comparison, because overlap
+/// is **not transitive**: with A=[1..1000], B=[2..3], C=[500..600], A/B overlap
+/// but B/C do not (`B.max=3 < C.min=500`), so a pairwise scan leaves C
+/// unflagged. The sweep-merge then emits A's ids 500..1000 and C follows as a
+/// raw passthrough blob carrying ids 500..600 - output that is not sorted while
+/// the header still stamps `Sort.Type_then_ID`, and (in `cat --dedupe`) A/C
+/// duplicates that the "exact duplicates removed" contract promised to drop.
+///
+/// Extending the run while `next.first_key <= run_max` closes that: once a blob
+/// joins a run, every later blob whose first key falls inside the run's widest
+/// reach so far joins too. Runs stay kind-bounded, exactly as before - the
+/// downstream sweep is kind-gated and silently drops off-kind elements handed
+/// to it.
 fn detect_overlaps(entries: &[BlobEntry]) -> Vec<bool> {
     let mut overlaps = vec![false; entries.len()];
-    for i in 0..entries.len().saturating_sub(1) {
-        if entries[i].index.kind == entries[i + 1].index.kind
-            && crate::osm_id::blob_osm_last_key(entries[i].index.min_id, entries[i].index.max_id)
-                >= crate::osm_id::blob_osm_first_key(
-                    entries[i + 1].index.min_id,
-                    entries[i + 1].index.max_id,
-                )
+    let mut i = 0;
+    while i < entries.len() {
+        let kind = entries[i].index.kind;
+        let mut run_max =
+            crate::osm_id::blob_osm_last_key(entries[i].index.min_id, entries[i].index.max_id);
+        let mut j = i + 1;
+        while j < entries.len()
+            && entries[j].index.kind == kind
+            && crate::osm_id::blob_osm_first_key(entries[j].index.min_id, entries[j].index.max_id)
+                <= run_max
         {
-            overlaps[i] = true;
-            overlaps[i + 1] = true;
+            run_max = run_max.max(crate::osm_id::blob_osm_last_key(
+                entries[j].index.min_id,
+                entries[j].index.max_id,
+            ));
+            j += 1;
+        }
+        if j > i + 1 {
+            for flag in &mut overlaps[i..j] {
+                *flag = true;
+            }
+            i = j;
+        } else {
+            i += 1;
         }
     }
     overlaps
@@ -580,4 +610,91 @@ fn flush_heap_below_dedup<T: Ord + HasId>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(kind: ElemKind, min_id: i64, max_id: i64) -> BlobEntry {
+        BlobEntry {
+            file_offset: 0,
+            frame_len: 0,
+            index: BlobIndex {
+                kind,
+                min_id,
+                max_id,
+                count: 1,
+                bbox: None,
+            },
+            has_indexdata: true,
+            tagdata: None,
+            file_index: 0,
+        }
+    }
+
+    /// The transitivity failure, in the merge/dedupe copy. A=[1..1000],
+    /// B=[2..3], C=[500..600] in first-key order: A/B overlap, B/C do not, so
+    /// a pairwise-adjacent scan leaves C out of the run. C's elements are then
+    /// written as a raw passthrough blob and never reach `sweep_merge_dedup`,
+    /// so A/C duplicates survive - the "exact duplicates removed" contract
+    /// failing silently - and the output is unsorted under a `Sort.Type_then_ID`
+    /// stamp. Realistic for merging extracts, whose per-blob ID ranges are wide
+    /// and sparse.
+    #[test]
+    fn overlap_runs_are_transitive_not_pairwise() {
+        let entries = vec![
+            entry(ElemKind::Node, 1, 1000),
+            entry(ElemKind::Node, 2, 3),
+            entry(ElemKind::Node, 500, 600),
+        ];
+        assert_eq!(
+            detect_overlaps(&entries),
+            vec![true, true, true],
+            "C=[500..600] lies inside A=[1..1000] and must join the run even \
+             though it does not overlap its immediate predecessor B=[2..3]"
+        );
+    }
+
+    /// Passing counterpart: disjoint blobs must stay on the passthrough path,
+    /// which is the whole point of the blob-level merge.
+    #[test]
+    fn disjoint_blobs_are_not_flagged_as_overlapping() {
+        let entries = vec![
+            entry(ElemKind::Node, 1, 10),
+            entry(ElemKind::Node, 11, 20),
+            entry(ElemKind::Node, 21, 30),
+        ];
+        assert_eq!(detect_overlaps(&entries), vec![false, false, false]);
+    }
+
+    #[test]
+    fn a_run_never_crosses_a_kind_boundary() {
+        let entries = vec![
+            entry(ElemKind::Node, 1, 1000),
+            entry(ElemKind::Node, 2, 3),
+            entry(ElemKind::Way, 5, 6),
+        ];
+        assert_eq!(
+            detect_overlaps(&entries),
+            vec![true, true, false],
+            "handing a mixed-kind run to the kind-gated sweep silently drops \
+             the off-kind elements"
+        );
+    }
+
+    #[test]
+    fn a_new_run_starts_after_the_previous_one_ends() {
+        let entries = vec![
+            entry(ElemKind::Node, 1, 100),
+            entry(ElemKind::Node, 50, 60),
+            entry(ElemKind::Node, 200, 300),
+        ];
+        assert_eq!(
+            detect_overlaps(&entries),
+            vec![true, true, false],
+            "the blob after a run must be judged on its own, not inherit the \
+             run's flag"
+        );
+    }
 }

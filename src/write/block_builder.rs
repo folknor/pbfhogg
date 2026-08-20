@@ -858,10 +858,14 @@ impl BlockBuilder {
             }
         }
 
-        // Build tagdata from tracked tag key indices.
-        // Sort indices by their string table byte content and serialize directly,
-        // avoiding per-key Box<[u8]> allocations and the TagIndex intermediary.
-        // Wire format: version (u8) + key_count (u16 LE) + repeated [key_len (u16 LE) + key bytes].
+        // Build tagdata from tracked tag key indices. Sorting indices by their
+        // string table byte content avoids per-key Box<[u8]> allocations and
+        // the TagIndex intermediary; the encoding itself routes through
+        // `blob_meta::encode_tag_index` so the wire format has exactly one
+        // implementation. This used to be a second copy of it, carrying its own
+        // pair of silent `as u16` truncations on the key count and each key
+        // length - the encoder now refuses to emit an index it cannot
+        // represent, and a `None` tagdata simply means "decode this blob".
         self.last_tagdata = if self.tag_key_indices.is_empty() {
             None
         } else {
@@ -877,24 +881,11 @@ impl BlockBuilder {
                     .as_bytes()
                     .cmp(self.string_table.strings[b as usize].as_bytes())
             });
-            let total: usize = 3 + self
-                .tag_key_scratch
-                .iter()
-                .map(|&idx| 2 + self.string_table.strings[idx as usize].len())
-                .sum::<usize>();
-            let mut buf = Vec::with_capacity(total);
-            buf.push(crate::blob_meta::TAG_INDEX_VERSION);
-            #[allow(clippy::cast_possible_truncation)]
-            let count = self.tag_key_scratch.len() as u16;
-            buf.extend_from_slice(&count.to_le_bytes());
-            for &idx in &self.tag_key_scratch {
-                let key = self.string_table.strings[idx as usize].as_bytes();
-                #[allow(clippy::cast_possible_truncation)]
-                let key_len = key.len() as u16;
-                buf.extend_from_slice(&key_len.to_le_bytes());
-                buf.extend_from_slice(key);
-            }
-            Some(buf)
+            crate::blob_meta::encode_tag_index(
+                self.tag_key_scratch
+                    .iter()
+                    .map(|&idx| self.string_table.strings[idx as usize].as_bytes()),
+            )
         };
 
         self.reset();

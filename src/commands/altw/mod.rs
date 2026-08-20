@@ -136,12 +136,21 @@ impl std::fmt::Display for IndexType {
 /// rather than reshape the dispatch.
 enum NodeIndex {
     Sparse(SparseArrayIndex),
+    /// Test-only in-memory index. `SparseArrayIndex` is mmap-backed and only
+    /// constructible by running a full node pass over a real file, which puts
+    /// `reframe`'s wire-format behaviour out of reach of a unit test. This
+    /// variant exists so that behaviour can be asserted directly; it is
+    /// `cfg(test)` so no production path can reach it.
+    #[cfg(test)]
+    InMemory(std::collections::HashMap<i64, (i32, i32)>),
 }
 
 impl NodeIndex {
     fn get(&self, node_id: i64) -> Option<(i32, i32)> {
         match self {
             Self::Sparse(idx) => idx.get(node_id),
+            #[cfg(test)]
+            Self::InMemory(map) => map.get(&node_id).copied(),
         }
     }
 }

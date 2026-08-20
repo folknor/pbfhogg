@@ -10,6 +10,63 @@ use protohoggr::Cursor;
 /// Tag key index version.
 pub(crate) const TAG_INDEX_VERSION: u8 = 0x01;
 
+/// Largest key count the wire format can represent (`key_count` is u16 LE).
+const TAG_INDEX_MAX_KEYS: usize = u16::MAX as usize;
+
+/// Largest single key length the wire format can represent (`key_len` is u16 LE).
+const TAG_INDEX_MAX_KEY_LEN: usize = u16::MAX as usize;
+
+/// Encode a sorted key set into the tag index wire format.
+///
+/// Format: version (u8) + key_count (u16 LE) + repeated [key_len (u16 LE) +
+/// key bytes].
+///
+/// Returns `None` when the key set cannot be represented faithfully - more
+/// than [`TAG_INDEX_MAX_KEYS`] keys, or any key longer than
+/// [`TAG_INDEX_MAX_KEY_LEN`] bytes. Both bounds used to be silent `as u16`
+/// truncations at the producer, which is the worst possible failure mode for
+/// this structure: a wrapped `key_len` desynchronizes `deserialize` (garbage
+/// keys from that point on), and a wrapped `key_count` yields a *shorter* key
+/// set that still parses cleanly, so `tags_filter` skips blobs whose keys were
+/// dropped and reports a cheerful "N blobs skipped by tag index" while
+/// silently omitting matches. The tag index is a pure optimization - a blob
+/// with no tagdata is decoded rather than skipped - so emitting nothing is
+/// always correct where emitting a lie is not.
+///
+/// This is the single encoder. `BlockBuilder::encode_block` builds its tagdata
+/// straight from string-table indices without materializing a [`TagIndex`],
+/// and routes through here rather than carrying its own copy of the format.
+pub(crate) fn encode_tag_index<'a, I>(keys: I) -> Option<Vec<u8>>
+where
+    I: ExactSizeIterator<Item = &'a [u8]>,
+{
+    let count = keys.len();
+    if count > TAG_INDEX_MAX_KEYS {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(3 + count * 2);
+    buf.push(TAG_INDEX_VERSION);
+    #[allow(clippy::cast_possible_truncation)]
+    buf.extend_from_slice(&(count as u16).to_le_bytes());
+    let mut written = 0_usize;
+    for key in keys {
+        if key.len() > TAG_INDEX_MAX_KEY_LEN {
+            return None;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        buf.extend_from_slice(&(key.len() as u16).to_le_bytes());
+        buf.extend_from_slice(key);
+        written += 1;
+    }
+    // A mismatch here would write a count that does not describe the payload.
+    // `ExactSizeIterator` promises this cannot happen; refuse to emit rather
+    // than trust an unsound implementation.
+    if written != count {
+        return None;
+    }
+    Some(buf)
+}
+
 /// Per-blob tag key index: the set of unique tag keys present in a blob.
 #[derive(Debug, Clone)]
 pub(crate) struct TagIndex {
@@ -20,22 +77,12 @@ pub(crate) struct TagIndex {
 impl TagIndex {
     /// Serialize to the tag index wire format.
     ///
-    /// Format: version (u8) + key_count (u16 LE) + repeated [key_len (u16 LE) + key bytes].
+    /// Returns `None` when the key set exceeds what the format can represent -
+    /// see [`encode_tag_index`] for why emitting nothing beats emitting a
+    /// truncated index.
     #[hotpath::measure]
-    pub fn serialize(&self) -> Vec<u8> {
-        let total: usize = 3 + self.keys.iter().map(|k| 2 + k.len()).sum::<usize>();
-        let mut buf = Vec::with_capacity(total);
-        buf.push(TAG_INDEX_VERSION);
-        #[allow(clippy::cast_possible_truncation)]
-        let count = self.keys.len() as u16;
-        buf.extend_from_slice(&count.to_le_bytes());
-        for key in &self.keys {
-            #[allow(clippy::cast_possible_truncation)]
-            let key_len = key.len() as u16;
-            buf.extend_from_slice(&key_len.to_le_bytes());
-            buf.extend_from_slice(key);
-        }
-        buf
+    pub fn serialize(&self) -> Option<Vec<u8>> {
+        encode_tag_index(self.keys.iter().map(std::convert::AsRef::as_ref))
     }
 
     /// Deserialize from tag index bytes (BlobHeader field 4).
@@ -139,6 +186,16 @@ pub(crate) fn scan_block_tags(raw: &[u8]) -> Option<TagIndex> {
 
     let mut key_indices: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for group_data in groups {
+        // A group carrying more than one element field is not something this
+        // scanner can index: it stops at the first element field it finds, so
+        // the off-kind elements' keys would be missing from the index while
+        // the index still looks complete. `tags_filter` skips whole blobs on
+        // that index, so an incomplete one silently drops matches. Refuse to
+        // emit a tag index at all for such a blob - no tagdata means "decode
+        // this blob", which is always correct, just slower.
+        if super::scan_ids::group_mixes_element_kinds(group_data) {
+            return None;
+        }
         scan_group_tag_keys(group_data, &mut key_indices);
     }
 
@@ -273,6 +330,7 @@ fn scan_remaining_element_tag_keys(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::blob_meta::BlobFilter;
@@ -280,7 +338,7 @@ mod tests {
     #[test]
     fn tag_index_roundtrip_empty() {
         let ti = TagIndex { keys: Vec::new() };
-        let bytes = ti.serialize();
+        let bytes = ti.serialize().expect("empty key set is encodable");
         let recovered = TagIndex::deserialize(&bytes).expect("should deserialize");
         assert!(recovered.keys.is_empty());
     }
@@ -290,7 +348,7 @@ mod tests {
         let ti = TagIndex {
             keys: vec![b"highway"[..].into()],
         };
-        let bytes = ti.serialize();
+        let bytes = ti.serialize().expect("one short key is encodable");
         let recovered = TagIndex::deserialize(&bytes).expect("should deserialize");
         assert_eq!(recovered.keys.len(), 1);
         assert_eq!(&*recovered.keys[0], b"highway");
@@ -306,7 +364,7 @@ mod tests {
                 b"name"[..].into(),
             ],
         };
-        let bytes = ti.serialize();
+        let bytes = ti.serialize().expect("four short keys are encodable");
         let recovered = TagIndex::deserialize(&bytes).expect("should deserialize");
         assert_eq!(recovered.keys.len(), 4);
         assert_eq!(&*recovered.keys[0], b"addr:city");
@@ -317,7 +375,9 @@ mod tests {
 
     #[test]
     fn tag_index_deserialize_rejects_bad_version() {
-        let mut bytes = TagIndex { keys: Vec::new() }.serialize();
+        let mut bytes = TagIndex { keys: Vec::new() }
+            .serialize()
+            .expect("empty key set is encodable");
         bytes[0] = 0xFF;
         assert!(TagIndex::deserialize(&bytes).is_none());
     }
@@ -326,6 +386,112 @@ mod tests {
     fn tag_index_deserialize_rejects_truncated() {
         assert!(TagIndex::deserialize(&[0x01]).is_none());
         assert!(TagIndex::deserialize(&[]).is_none());
+    }
+
+    // --- Encoder bounds -------------------------------------------------
+
+    #[test]
+    fn encode_refuses_a_key_longer_than_the_length_field() {
+        // 65536 bytes wraps `key_len as u16` to 0, after which `deserialize`
+        // reads the key's own bytes as the next key_len and yields garbage.
+        let huge = vec![b'k'; TAG_INDEX_MAX_KEY_LEN + 1];
+        assert!(
+            encode_tag_index(std::iter::once(huge.as_slice())).is_none(),
+            "a key the length field cannot express must produce no index"
+        );
+
+        // Passing counterpart at the exact boundary: one byte shorter is
+        // representable and must still encode and round-trip, so this is not
+        // satisfied by a refuse-everything regression.
+        let at_limit = vec![b'k'; TAG_INDEX_MAX_KEY_LEN];
+        let bytes = encode_tag_index(std::iter::once(at_limit.as_slice()))
+            .expect("a key of exactly the maximum length is representable");
+        let recovered = TagIndex::deserialize(&bytes).expect("should deserialize");
+        assert_eq!(recovered.keys.len(), 1);
+        assert_eq!(recovered.keys[0].len(), TAG_INDEX_MAX_KEY_LEN);
+    }
+
+    #[test]
+    fn encode_refuses_more_keys_than_the_count_field() {
+        // 65536 keys wraps `key_count as u16` to 0. That is the dangerous
+        // half: the result still parses, as an index with no keys, so
+        // `tags_filter` skips the blob entirely and drops every match in it.
+        let keys: Vec<Vec<u8>> = (0..=TAG_INDEX_MAX_KEYS)
+            .map(|i| i.to_string().into_bytes())
+            .collect();
+        assert!(
+            encode_tag_index(keys.iter().map(std::vec::Vec::as_slice)).is_none(),
+            "a key count the count field cannot express must produce no index"
+        );
+
+        let at_limit = &keys[..TAG_INDEX_MAX_KEYS];
+        let bytes = encode_tag_index(at_limit.iter().map(std::vec::Vec::as_slice))
+            .expect("exactly the maximum key count is representable");
+        let recovered = TagIndex::deserialize(&bytes).expect("should deserialize");
+        assert_eq!(recovered.keys.len(), TAG_INDEX_MAX_KEYS);
+    }
+
+    // --- Mixed-kind groups ----------------------------------------------
+
+    #[test]
+    fn a_group_mixing_element_kinds_yields_no_tag_index() {
+        // PrimitiveBlock: StringTable ["", "highway", "boundary"], one group
+        // holding a Way (field 3) with key 1 and a Relation (field 4) with
+        // key 2. `scan_group_tag_keys` stops after the ways, so the index
+        // would claim {"highway"} and `tags_filter -e boundary=...` would skip
+        // the blob and lose the relation.
+        let mut st = Vec::new();
+        for s in [
+            b"".as_slice(),
+            b"highway".as_slice(),
+            b"boundary".as_slice(),
+        ] {
+            st.push(0x0A);
+            st.push(u8::try_from(s.len()).unwrap());
+            st.extend_from_slice(s);
+        }
+        // Way message: field 2 (keys) packed [1].
+        let way = [0x12u8, 0x01, 0x01];
+        // Relation message: field 2 (keys) packed [2].
+        let rel = [0x12u8, 0x01, 0x02];
+        let mut group = Vec::new();
+        group.push(0x1A); // field 3, LEN
+        group.push(u8::try_from(way.len()).unwrap());
+        group.extend_from_slice(&way);
+        group.push(0x22); // field 4, LEN
+        group.push(u8::try_from(rel.len()).unwrap());
+        group.extend_from_slice(&rel);
+
+        let mut block = Vec::new();
+        block.push(0x0A); // PrimitiveBlock field 1, StringTable
+        block.push(u8::try_from(st.len()).unwrap());
+        block.extend_from_slice(&st);
+        block.push(0x12); // PrimitiveBlock field 2, PrimitiveGroup
+        block.push(u8::try_from(group.len()).unwrap());
+        block.extend_from_slice(&group);
+
+        assert!(
+            scan_block_tags(&block).is_none(),
+            "a group whose off-kind elements' keys the scanner cannot see must \
+             produce no tag index; an incomplete index makes tags-filter skip \
+             blobs that do contain matches"
+        );
+
+        // Passing counterpart: the same block with the relation removed is a
+        // clean single-kind group and must still produce {"highway"}.
+        let mut clean_group = Vec::new();
+        clean_group.push(0x1A);
+        clean_group.push(u8::try_from(way.len()).unwrap());
+        clean_group.extend_from_slice(&way);
+        let mut clean_block = Vec::new();
+        clean_block.push(0x0A);
+        clean_block.push(u8::try_from(st.len()).unwrap());
+        clean_block.extend_from_slice(&st);
+        clean_block.push(0x12);
+        clean_block.push(u8::try_from(clean_group.len()).unwrap());
+        clean_block.extend_from_slice(&clean_group);
+        let ti = scan_block_tags(&clean_block).expect("a single-kind group still indexes");
+        assert!(ti.has_any_key(&[b"highway"[..].into()]));
     }
 
     #[test]

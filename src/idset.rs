@@ -192,6 +192,61 @@ impl IdSet {
         (prev & bit) == 0
     }
 
+    /// Non-panicking counterpart of [`Self::set_atomic`].
+    ///
+    /// Returns `false` - having set nothing - when `id` is negative or falls
+    /// outside the pre-allocated range, instead of panicking. For callers
+    /// processing untrusted input, an out-of-range ID is a property of the
+    /// *file*, not a bug in the caller, so it has to be reportable rather than
+    /// fatal: a panic on attacker-controlled input is a denial-of-service
+    /// surface, and in `check`'s case it aborts the very diagnosis the user
+    /// asked for.
+    ///
+    /// Callers that genuinely control the ID range (their `pre_allocate`
+    /// argument provably covers every ID they will pass) should keep using
+    /// `set_atomic`, whose panic catches a real caller bug.
+    #[allow(clippy::cast_sign_loss)]
+    pub fn set_atomic_checked(&self, id: i64) -> bool {
+        let Some((chunk, id)) = self.chunk_for_atomic_opt(id) else {
+            return false;
+        };
+        let word = ((id >> 6) & ((WORDS_PER_CHUNK as u64) - 1)) as usize;
+        chunk[word].fetch_or(1u64 << (id & 63), std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
+    /// Non-panicking counterpart of [`Self::set_atomic_if_new`].
+    ///
+    /// `None` means the ID could not be recorded at all - negative, or outside
+    /// the pre-allocated range. `Some(true)` / `Some(false)` carry the usual
+    /// first-seen / already-seen answer. See [`Self::set_atomic_checked`] for
+    /// why the out-of-range case is a return value here rather than a panic.
+    #[allow(clippy::cast_sign_loss)]
+    pub fn set_atomic_if_new_checked(&self, id: i64) -> Option<bool> {
+        let (chunk, id) = self.chunk_for_atomic_opt(id)?;
+        let word = ((id >> 6) & ((WORDS_PER_CHUNK as u64) - 1)) as usize;
+        let bit = 1u64 << (id & 63);
+        let prev = chunk[word].fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+        Some((prev & bit) == 0)
+    }
+
+    /// Chunk lookup that reports failure instead of panicking.
+    ///
+    /// The bounds check is `Vec::get` plus the `Option<chunk>` slot, so it
+    /// covers negative IDs too without a separate branch: `-1 as u64` is
+    /// `u64::MAX`, whose chunk index is 2^45, which no `pre_allocate` can ever
+    /// reach. Negative IDs are legal in an OSM file (JOSM editor-local staging
+    /// IDs), so landing here is an input property, not a corrupt-state signal
+    /// - which is precisely why the caller gets `None` rather than a panic.
+    #[inline]
+    #[allow(clippy::cast_sign_loss)]
+    fn chunk_for_atomic_opt(&self, id: i64) -> Option<(&[std::sync::atomic::AtomicU64], u64)> {
+        let id = id as u64;
+        let cid = (id >> (CHUNK_BITS + 3)) as usize;
+        let chunk = self.chunks.get(cid)?.as_ref()?;
+        Some((chunk, id))
+    }
+
     /// Shared chunk-lookup helper for `set_atomic` / `set_atomic_if_new`.
     /// Produces a detailed panic message when the caller's `pre_allocate`
     /// budget was exceeded - callers see exactly which ID fell outside the
@@ -657,6 +712,44 @@ fn or_chunk_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Non-panicking atomic setters -----------------------------------
+
+    #[test]
+    fn checked_atomic_setters_report_out_of_range_instead_of_panicking() {
+        let mut s = IdSet::new();
+        s.pre_allocate(1_000);
+
+        // In range: normal behaviour, and the bit really lands.
+        assert_eq!(s.set_atomic_if_new_checked(500), Some(true));
+        assert_eq!(
+            s.set_atomic_if_new_checked(500),
+            Some(false),
+            "the second insert of the same id must report already-seen, not \
+             a fresh insert - otherwise duplicate detection is vacuous"
+        );
+        assert!(s.get(500));
+        assert!(s.set_atomic_checked(600));
+        assert!(s.get(600));
+
+        // Above the pre-allocated range: reported, not fatal. This is the
+        // assertion that isolates the new behaviour - `set_atomic` /
+        // `set_atomic_if_new` panic on exactly this input, which on an
+        // untrusted file aborts the very check meant to diagnose it.
+        let far = 1_i64 << 40;
+        assert_eq!(s.set_atomic_if_new_checked(far), None);
+        assert!(!s.set_atomic_checked(far));
+
+        // Negative IDs are legal OSM (JOSM editor-local staging IDs) and must
+        // not panic either. Note this is a *contract* assertion, not a guard
+        // assertion: `-1 as u64` is u64::MAX, so the bounds check above
+        // already rejects it and no separate negative branch is needed. Said
+        // plainly so nobody later reads this as coverage for a guard that
+        // does not exist.
+        assert_eq!(s.set_atomic_if_new_checked(-1), None);
+        assert!(!s.set_atomic_checked(-1));
+        assert!(!s.get(-1));
+    }
 
     #[test]
     fn set_get_basic_ids() {

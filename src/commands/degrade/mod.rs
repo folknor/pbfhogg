@@ -731,7 +731,7 @@ fn degrade_decode_path(
         reader.header().clone()
     };
 
-    let (node_schedule, way_schedule, rel_schedule, shared_file) =
+    let (node_schedule, way_schedule, rel_schedule, shared_file, _max_ids) =
         crate::scan::classify::build_classify_schedules_split(input)?;
 
     // Selection must finish before opening the writer: an over-large N must

@@ -323,7 +323,8 @@ impl<W: Write> PbfWriter<W> {
             let permit_tx = pipeline.permit_tx.clone();
             rayon::spawn(move || {
                 let indexdata = blob_meta::scan_block_ids(&uncompressed).map(|idx| idx.serialize());
-                let tagdata = blob_meta::scan_block_tags(&uncompressed).map(|ti| ti.serialize());
+                let tagdata =
+                    blob_meta::scan_block_tags(&uncompressed).and_then(|ti| ti.serialize());
                 let result = PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
                     frame_blob_into(
                         "OSMData",
@@ -358,7 +359,7 @@ impl<W: Write> PbfWriter<W> {
             Ok(())
         } else {
             let indexdata = blob_meta::scan_block_ids(block_bytes).map(|idx| idx.serialize());
-            let tagdata = blob_meta::scan_block_tags(block_bytes).map(|ti| ti.serialize());
+            let tagdata = blob_meta::scan_block_tags(block_bytes).and_then(|ti| ti.serialize());
             self.write_framed_blob(
                 "OSMData",
                 block_bytes,

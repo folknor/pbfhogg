@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use crate::{Element, MemberId};
 
+use super::{NODE_ID_FLOOR, RELATION_ID_FLOOR, WAY_ID_FLOOR};
 use crate::BoxResult as Result;
 use crate::idset::IdSet;
 use crate::scan::classify::{build_classify_schedules_split, parallel_classify_phase};
@@ -159,17 +160,6 @@ pub fn check_refs(
         libc::mallopt(libc::M_ARENA_MAX, 2);
     }
 
-    // IdSet pre-allocated to the current OSM ID ceilings. Required
-    // before any set_atomic call - set_atomic panics on unallocated chunks.
-    let mut node_ids = IdSet::new();
-    node_ids.pre_allocate(14_000_000_000);
-    let mut way_ids = IdSet::new();
-    let mut relation_ids = IdSet::new();
-    if check_relations {
-        way_ids.pre_allocate(1_500_000_000);
-        relation_ids.pre_allocate(25_000_000);
-    }
-
     let mut result = RefCheckResult {
         node_count: 0,
         way_count: 0,
@@ -197,8 +187,35 @@ pub fn check_refs(
     // Single header-chain walk building all three per-kind schedules at
     // once. At Europe scale the header walk is ~15 s; three separate
     // `build_classify_schedule` calls would triple that cost.
-    let (node_schedule, way_schedule, rel_schedule, shared_file) =
+    let (node_schedule, way_schedule, rel_schedule, shared_file, max_ids) =
         build_classify_schedules_split(path)?;
+
+    // IdSets sized from what the file itself reports, floored at the current
+    // OSM ID ceilings so a file whose indexdata understates its range (or
+    // carries none) still gets a sensible allocation. The floors used to be
+    // the whole story, which made the way ceiling of 1.5e9 a time bomb: live
+    // OSM way IDs are already ~1.4e9, and every ID past the ceiling panicked a
+    // worker in `set_atomic`. Population now goes through `set_atomic_checked`,
+    // so an ID outside the range is simply not recorded - refs to it are
+    // reported missing, which over-reports rather than aborting the check.
+    //
+    // `id_alloc_bound` caps the other direction: indexdata is unverified, so a
+    // blob claiming `max_id = i64::MAX` would otherwise turn this sizing hint
+    // into an unbounded allocation before any element is read.
+    let file_len = std::fs::metadata(path).map_or(0, |m| m.len());
+    let mut node_ids = IdSet::new();
+    node_ids.pre_allocate(super::id_alloc_bound(max_ids[0], NODE_ID_FLOOR, file_len));
+    let mut way_ids = IdSet::new();
+    let mut relation_ids = IdSet::new();
+    if check_relations {
+        way_ids.pre_allocate(super::id_alloc_bound(max_ids[1], WAY_ID_FLOOR, file_len));
+        relation_ids.pre_allocate(super::id_alloc_bound(
+            max_ids[2],
+            RELATION_ID_FLOOR,
+            file_len,
+        ));
+    }
+
     let node_blobs = node_schedule.len() as u64;
     let way_blobs = way_schedule.len() as u64;
     let relation_blobs_total = rel_schedule.len() as u64;
@@ -219,11 +236,11 @@ pub fn check_refs(
                 for el in block.elements_skip_metadata() {
                     match el {
                         Element::DenseNode(dn) => {
-                            node_ids_ref.set_atomic(dn.id());
+                            node_ids_ref.set_atomic_checked(dn.id());
                             count += 1;
                         }
                         Element::Node(n) => {
-                            node_ids_ref.set_atomic(n.id());
+                            node_ids_ref.set_atomic_checked(n.id());
                             count += 1;
                         }
                         _ => {}
@@ -259,7 +276,7 @@ pub fn check_refs(
                     if let Element::Way(w) = el {
                         let wid = w.id();
                         if check_relations {
-                            way_ids_ref.set_atomic(wid);
+                            way_ids_ref.set_atomic_checked(wid);
                         }
                         r.way_count += 1;
                         for nref in w.refs() {
@@ -319,7 +336,7 @@ pub fn check_refs(
                     for el in block.elements_skip_metadata() {
                         if let Element::Relation(rel) = el {
                             let rid = rel.id();
-                            relation_ids_ref.set_atomic(rid);
+                            relation_ids_ref.set_atomic_checked(rid);
                             r.relation_count += 1;
                             for mem in rel.members() {
                                 match mem.id {

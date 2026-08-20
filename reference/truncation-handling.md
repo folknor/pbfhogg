@@ -257,11 +257,83 @@ unpacked values of the same field hit the same rule, which is why
 unpacked support is exact for a one-element array and an error
 beyond it, where libosmium keeps only the last value.
 
-This applies to the read path's own parsers. The independent
-scanners under `src/scan/`, `src/blob_meta/scan_ids.rs`,
-`src/commands/renumber/wire_rewrite.rs` and
-`src/commands/altw/reframe.rs` walk the same messages for their
-own purposes and still match the length-delimited form only.
+### The independent scanners
+
+Several components walk these same messages without going through
+`ElementReader`, and each carried its own matcher. As of 2026-08-20
+they answer the same way `wire.rs` does, by two different routes.
+
+**Routed through `wire.rs`** - the scanner no longer has a message
+parser of its own, so the policy cannot drift again:
+
+- `src/scan/way.rs` parses each Way via `WireWay::parse`. It had
+  matched `WIRE_LEN` only on `refs`, `keys` and `vals`; an unpacked
+  `refs` invoked no callback at all and the caller concluded the way
+  referenced no nodes - a silently short node index.
+- `src/blob_meta/scan_ids.rs` parses DenseNodes via
+  `WireDenseNodes::parse`. An unpacked `id` array read as empty, so
+  the blob silently got no indexdata.
+- `src/scan/node.rs` already routed through `WireDenseNodes::parse`
+  and never had the defect; its own top-level matcher touches only
+  submessages and scalar fields, neither of which can be packed.
+
+**Handled locally, because routing is impossible:**
+
+- `src/commands/renumber/wire_rewrite.rs` is a byte-level splicer.
+  It needs a field's *byte range* inside the enclosing message so
+  every other field can be copied verbatim; `wire.rs` yields the
+  *value* as a borrowed slice and deliberately does not expose
+  ranges. It therefore rejects the unpacked form of `DenseNodes.id`,
+  `Way.refs`, `Relation.memids` and `Relation.types` with an error
+  naming the field. Previously an unpacked `memids` left the memids
+  range unset, so the relation took the "zero-member" branch and its
+  member IDs were copied through **un-renumbered** into output that
+  claims to be renumbered.
+- `src/commands/altw/reframe.rs` accepts both forms for `Way.refs`
+  and normalizes the unpacked spelling to the packed one on output;
+  it re-emits that field itself, so it can. Matching `WIRE_LEN` only
+  meant an unpacked `refs` fell to the verbatim copy arm, no
+  coordinates were appended, and the way came out of
+  `add-locations-to-ways` with no locations at all. It also strips
+  both forms of the stale `lat` / `lon` / pins fields, so an unpacked
+  stale coordinate can no longer survive next to the fresh one. The
+  normalization is byte-exact for every packed input, including an
+  empty packed segment: `add-locations-to-ways` output is compared
+  byte-wise against osmium in `brokkr verify`, so re-emitting the
+  packed form has to be a no-op.
+
+Where a component rejects rather than accepts, the observable
+contract still holds: a legal encoding is never silently
+mis-handled.
+
+### Repeated occurrences in the two rewriters
+
+The unpacked form is only half the policy. Protobuf also permits a
+packed repeated field to occur several times, with concatenation
+semantics: two length-delimited segments of `Way.refs` are one ref
+array. `take_packed` refuses that shape because the read path is
+built on a single borrowed slice; the two rewriters have to refuse
+it for a sharper reason, and both now do, per field, with an error
+naming the message and field:
+
+- `renumber`'s splice replaces one contiguous byte range and copies
+  everything else verbatim, so keeping only the last occurrence left
+  the earlier segment's IDs **un-renumbered** inside output that
+  claims otherwise - for `DenseNodes.id`, `Way.refs` and
+  `Relation.memids` alike. `Relation.types` is not spliced but drives
+  the per-member node/way/relation dispatch, so keeping one segment
+  either desynchronizes it from `memids` (caught by the count
+  cross-check, with a misleading message) or types every member
+  against the wrong ID space.
+- `add-locations-to-ways` builds one ref list per way, so a second
+  data-bearing occurrence would append coordinates for only part of
+  the way. Because each unpacked value is its own occurrence, this is
+  also where its unpacked support ends: exact for a one-element
+  array, an error beyond it, matching `take_packed` exactly.
+
+Empty occurrences are ignored in either position in both rewriters,
+as in `take_packed` - a zero-length segment carries no elements and
+cannot participate in a concatenation.
 
 ## Decompression bounds (shape 5)
 

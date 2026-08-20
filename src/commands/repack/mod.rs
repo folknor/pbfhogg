@@ -191,7 +191,7 @@ pub fn repack(
         io_uring,
     )?;
 
-    let (node_schedule, way_schedule, rel_schedule, shared_file) =
+    let (node_schedule, way_schedule, rel_schedule, shared_file, _max_ids) =
         crate::scan::classify::build_classify_schedules_split(input)?;
 
     #[allow(clippy::cast_possible_wrap)]

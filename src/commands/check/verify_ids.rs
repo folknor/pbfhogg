@@ -43,6 +43,17 @@ pub enum IdViolation {
         found: &'static str,
         after: &'static str,
     },
+    /// An element ID lies outside the range `--full` can track for duplicates:
+    /// negative, or above the pre-allocated ceiling for its type.
+    ///
+    /// Duplicate detection needs one bit per possible ID, and the bitset
+    /// cannot grow once the parallel phase has started. Rather than panicking
+    /// a worker - which is what used to happen, and which aborts exactly the
+    /// diagnosis `check` exists to produce - the ID is reported. Negative IDs
+    /// are legal OSM (JOSM editor-local staging IDs) but are not
+    /// duplicate-checkable here; an ID above the ceiling means the file
+    /// outgrew what the verifier sized from its own indexdata.
+    IdOutOfRange { elem_type: &'static str, id: i64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +182,9 @@ fn print_single_violation(v: &IdViolation) {
         IdViolation::TypeOrder { found, after } => {
             println!("  type order: {found} after {after}");
         }
+        IdViolation::IdOutOfRange { elem_type, id } => {
+            println!("  {elem_type} {id}: outside the duplicate-detection ID range");
+        }
     }
 }
 
@@ -212,6 +226,11 @@ fn violation_to_json(v: &IdViolation) -> serde_json::Value {
             "type": "type_order",
             "found": found,
             "after": after,
+        }),
+        IdViolation::IdOutOfRange { elem_type, id } => serde_json::json!({
+            "type": "id_out_of_range",
+            "elem_type": elem_type,
+            "id": id,
         }),
     }
 }
@@ -285,7 +304,7 @@ fn verify_ids_streaming_parallel(path: &Path, opts: &VerifyIdsOptions) -> Result
 
     let type_filter = TypeFilter::or_all(opts.type_filter);
 
-    let (node_schedule, way_schedule, rel_schedule, shared_file) =
+    let (node_schedule, way_schedule, rel_schedule, shared_file, _max_ids) =
         crate::scan::classify::build_classify_schedules_split(path)?;
 
     let mut node_count: u64 = 0;
@@ -486,6 +505,9 @@ struct BlobVerifyResult {
     /// distinct duplicate occurrences count separately, matching the
     /// pre-swap RoaringTreemap::insert-returns-false semantics).
     duplicate_ids: Vec<i64>,
+    /// IDs the shared IdSet could not represent at all - negative, or above
+    /// the pre-allocated ceiling. Reported as `IdOutOfRange` violations.
+    out_of_range_ids: Vec<i64>,
 }
 
 impl BlobVerifyResult {
@@ -496,6 +518,7 @@ impl BlobVerifyResult {
             count: 0,
             within_violations: Vec::new(),
             duplicate_ids: Vec::new(),
+            out_of_range_ids: Vec::new(),
         }
     }
 }
@@ -529,22 +552,49 @@ fn verify_ids_full_parallel(path: &Path, opts: &VerifyIdsOptions) -> Result<Veri
 
     let type_filter = TypeFilter::or_all(opts.type_filter);
 
-    // Pre-allocate IdSets for the kinds we intend to verify.
+    let (node_schedule, way_schedule, rel_schedule, shared_file, max_ids) =
+        crate::scan::classify::build_classify_schedules_split(path)?;
+
+    // Pre-allocate IdSets for the kinds we intend to verify, sized from the
+    // file's own indexdata and floored at the live OSM ID space. The floors
+    // were previously fixed ceilings, which is wrong in both directions on a
+    // command whose job is to diagnose bad files: a near-future planet
+    // (way IDs are already ~1.4e9 against the old 1.5e9 cap) or any
+    // out-of-range ID in a degraded file panicked a worker instead of
+    // producing the violation report the user asked for. Population now uses
+    // `set_atomic_if_new_checked`, which reports rather than panics - see
+    // `IdViolation::IdOutOfRange`.
+    //
+    // `id_alloc_bound` caps the opposite direction. Indexdata is unverified,
+    // so sizing straight from it let a blob claiming `max_id = i64::MAX` ask
+    // `pre_allocate` for an exabyte-scale bitset and take the process down
+    // before the checked setters could report anything - a denial of service
+    // introduced by the same change that removed the hard-coded ceilings.
+    let file_len = std::fs::metadata(path).map_or(0, |m| m.len());
     let mut node_ids = IdSet::new();
     let mut way_ids = IdSet::new();
     let mut relation_ids = IdSet::new();
     if type_filter.nodes {
-        node_ids.pre_allocate(14_000_000_000);
+        node_ids.pre_allocate(super::id_alloc_bound(
+            max_ids[0],
+            super::NODE_ID_FLOOR,
+            file_len,
+        ));
     }
     if type_filter.ways {
-        way_ids.pre_allocate(1_500_000_000);
+        way_ids.pre_allocate(super::id_alloc_bound(
+            max_ids[1],
+            super::WAY_ID_FLOOR,
+            file_len,
+        ));
     }
     if type_filter.relations {
-        relation_ids.pre_allocate(25_000_000);
+        relation_ids.pre_allocate(super::id_alloc_bound(
+            max_ids[2],
+            super::RELATION_ID_FLOOR,
+            file_len,
+        ));
     }
-
-    let (node_schedule, way_schedule, rel_schedule, shared_file) =
-        crate::scan::classify::build_classify_schedules_split(path)?;
 
     // Accumulators for the report.
     let mut node_count: u64 = 0;
@@ -704,8 +754,16 @@ fn verify_single_kind_parallel(
                         });
                     }
                     prev = Some(id);
-                    if !id_set.set_atomic_if_new(id) {
-                        r.duplicate_ids.push(id);
+                    // `None` = the ID is negative or above the pre-allocated
+                    // ceiling, so duplicate detection cannot cover it. Report
+                    // it as its own violation instead of panicking the worker
+                    // (which is what `set_atomic_if_new` does, and which
+                    // aborts the whole check on exactly the malformed input
+                    // it exists to diagnose).
+                    match id_set.set_atomic_if_new_checked(id) {
+                        Some(true) => {}
+                        Some(false) => r.duplicate_ids.push(id),
+                        None => r.out_of_range_ids.push(id),
                     }
                 }
             }
@@ -746,6 +804,12 @@ fn verify_single_kind_parallel(
             total_violations += 1;
             if violations.len() < max_errors_remaining {
                 violations.push(IdViolation::Duplicate { elem_type, id });
+            }
+        }
+        for id in r.out_of_range_ids {
+            total_violations += 1;
+            if violations.len() < max_errors_remaining {
+                violations.push(IdViolation::IdOutOfRange { elem_type, id });
             }
         }
         if r.last_id.is_some() {

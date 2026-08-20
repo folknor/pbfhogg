@@ -35,6 +35,103 @@
   the decision up front and is the one to use when the whole file's cache
   must be left untouched.
 
+### Fixed
+
+- **`sort` and `cat --dedupe` no longer emit unsorted output stamped
+  `Sort.Type_then_ID`.** Overlap-run detection compared only adjacent
+  blobs in the first-key-sorted list, but range overlap is not
+  transitive: with blob ranges `[1..1000]`, `[2..3]`, `[500..600]` the
+  third does not overlap its predecessor and so was left out of the run,
+  written out afterwards as a raw passthrough blob, and landed after ids
+  the run had already emitted. Detection is now a running-maximum sweep,
+  so a blob is pulled into the run if its first key falls inside the
+  run's widest reach so far. For `cat --dedupe` this also restores the
+  "exact duplicates removed" contract, which the excluded blob's
+  elements silently escaped. Most likely to have been hit when merging
+  geographic extracts, whose per-blob ID ranges are wide and sparse.
+
+- **`check --ids --full` and `check --refs` report out-of-range IDs
+  instead of panicking.** Both sized their duplicate-detection bitsets to
+  hard-coded ID ceilings and then crashed a worker on any ID past them -
+  including every negative ID, which is legal OSM (JOSM editor-local
+  staging IDs), and, before long, ordinary way IDs: the way ceiling was
+  1.5e9 against a live OSM maximum already near 1.4e9. A crash on
+  untrusted input is the worst outcome for the one command whose job is
+  to diagnose bad files. The bitsets are now sized from the file's own
+  indexdata, floored at the live OSM ID space, and an ID still outside
+  that range is reported - `check --ids --full` emits a new
+  `id_out_of_range` violation (`IdViolation::IdOutOfRange`) rather than
+  aborting the run.
+
+- **A blob whose `PrimitiveGroup` mixes element kinds is no longer given
+  false indexdata or a false tag index.** The scanners stop at the first
+  element field in a group, so a group holding both ways and relations
+  was indexed as ways-only with a count covering only the ways. Nothing
+  detected it - the existing mixed-kind guard compares across groups -
+  and five commands acted on the lie: `cat --type relation` dropped the
+  relations, `cat --type way` leaked them into a way-only output,
+  `repack` never emitted them, `renumber` left their IDs unrenumbered in
+  the way stream, and `tags-filter` could skip the blob entirely. Such a
+  blob now carries no indexdata and no tag index, so every command
+  decodes it - slower, and correct.
+
+- **The per-blob tag index is no longer silently truncated to `u16`.**
+  Both the key count and each key length were written with an unchecked
+  `as u16`. A wrapped key length desynchronizes the parser into garbage
+  keys; a wrapped key count is worse, producing a shorter key set that
+  still parses cleanly, so `tags-filter` skipped blobs whose keys had
+  been dropped and reported a cheerful "N blobs skipped by tag index"
+  while omitting real matches. The encoder now refuses to emit an index
+  it cannot represent, and a blob with no tag index is decoded rather
+  than skipped. Neither bound is reachable from OSM data today.
+
+- **Packed repeated fields written in the unpacked wire form are handled
+  by every scanner, not just the read path.** Protobuf permits a packed
+  field as either one length-delimited segment or individually tagged
+  varints; `src/read/wire.rs` was taught to accept both, but the
+  independent scanners still matched the length-delimited form only and
+  read an unpacked array as empty. Consequences, all silent: a way's
+  `refs` read as absent produced a short node index, an unpacked
+  `DenseNodes.id` produced a blob with no indexdata,
+  `add-locations-to-ways` emitted ways with no coordinates, and
+  `renumber` copied a relation's member IDs through **un-renumbered**
+  into output that claims to be renumbered. The way and dense scanners
+  now route through the shared parser; `add-locations-to-ways` accepts
+  both forms and normalizes on output; `renumber`'s byte-level splice
+  rewriter, which cannot use the shared parser, rejects the unpacked form
+  with an error naming the field. No known writer emits this encoding.
+
+- **`renumber` and `add-locations-to-ways` reject a packed field split
+  across several data-bearing occurrences instead of renumbering only the
+  last one.** Protobuf gives repeated packed segments concatenation
+  semantics, so `Way.refs` written as two length-delimited segments is
+  one ref array. Both tools patch a single contiguous byte range, so they
+  kept only the last segment's range: the earlier segment was copied
+  through verbatim while the tail was rewritten, producing partially
+  renumbered output - or, for `Relation.types`, a member array dispatched
+  against the wrong ID spaces - with no error at all. `DenseNodes.id`,
+  `Way.refs`, `Relation.memids` and `Relation.types` now each fail with
+  an error naming the field; empty occurrences are still ignored. This
+  matches the read path's existing duplicate-occurrence policy and makes
+  pbfhogg stricter than libosmium here, which keeps the last occurrence.
+  Re-encode such an input with `pbfhogg cat --clean` first.
+
+- **`check --ids --full` and `check --refs` bound their ID-bitset
+  allocation by the input file's size.** Sizing the bitset from the
+  file's own indexdata (above) trusted an unverified number in both
+  directions: a blob header claiming `max_id = i64::MAX` asked for an
+  exabyte-scale allocation and took the process down before any element
+  was read. The bitset may now never exceed the size of the input file,
+  floored at the live OSM ID space, so the sizing still tracks real files
+  of any scale while a small hostile one cannot request an unbounded
+  allocation. An ID above the chosen bound is reported, as above.
+
+- **`renumber` reports rather than panics when a file's indexdata
+  understates its own ID range.** The node bitset is sized from
+  indexdata, which nothing verifies, so a stale or hand-edited index made
+  a node ID overshoot the allocation and crash a worker with an opaque
+  bitset message. It is now an input error naming the problem.
+
 ### Changed
 
 - **`cat --dedupe` now bounds its frame-header allocation.** Its pass-1

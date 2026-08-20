@@ -202,6 +202,7 @@ fn process_group(
 /// (input was already a LocationsOnWays PBF) since we own the
 /// coordinates. Then appends fresh fields 9 / 10 from `node_index`
 /// lookups.
+#[allow(clippy::too_many_lines)]
 fn splice_way_locations(
     way_bytes: &[u8],
     node_index: &NodeIndex,
@@ -219,6 +220,7 @@ fn splice_way_locations(
 
     let mut way_id: i64 = 0;
     let mut have_id = false;
+    let mut have_refs = false;
 
     let mut way_cursor = Cursor::new(way_bytes);
     while let Some((wf, wt)) = way_cursor
@@ -233,20 +235,67 @@ fn splice_way_locations(
                 have_id = true;
                 encode_int64_field(&mut scratch.reframed_way, 1, way_id);
             }
-            (8, WIRE_LEN) => {
-                let refs_data = way_cursor
-                    .read_len_delimited()
-                    .map_err(|e| format!("reframe wrefs: {e}"))?;
-                let mut cum: i64 = 0;
-                for delta in PackedSint64Iter::new(refs_data) {
-                    cum += delta;
-                    scratch.refs.push(cum);
+            // Both legal wire forms of the packed `refs` field. Matching only
+            // WIRE_LEN meant a spec-legal unpacked `refs` fell to the verbatim
+            // `_` arm: `scratch.refs` stayed empty, so no lat / lon fields were
+            // appended and the way came out of add-locations-to-ways with no
+            // locations at all - silently, since the raw bytes still copied
+            // through. A single unpacked varint is byte-identical to a
+            // one-element packed segment, so it is normalized to the packed
+            // spelling on output. Mirrors `src/read/wire.rs::take_packed`.
+            (8, WIRE_LEN | WIRE_VARINT) => {
+                let refs_data = if wt == WIRE_LEN {
+                    way_cursor
+                        .read_len_delimited()
+                        .map_err(|e| format!("reframe wrefs: {e}"))?
+                } else {
+                    way_cursor
+                        .read_raw_field(WIRE_VARINT)
+                        .map_err(|e| format!("reframe wrefs: {e}"))?
+                };
+                if !refs_data.is_empty() {
+                    if have_refs {
+                        // Same policy, and the same boundary, as the read
+                        // path: two data-bearing occurrences of a packed field
+                        // mean concatenation, which this single-slice rewriter
+                        // cannot express. That covers both a packed field
+                        // split across segments and more than one unpacked
+                        // value, since each unpacked value is its own
+                        // occurrence - which is why unpacked support here is
+                        // exact for a one-element array and an error beyond
+                        // it, matching `src/read/wire.rs::take_packed`.
+                        return Err(
+                            "reframe: Way.refs appears twice with data - a packed field \
+                             split across segments, or more than one unpacked value. Re-encode \
+                             the input first, e.g. `pbfhogg cat --clean`."
+                                .to_string(),
+                        );
+                    }
+                    have_refs = true;
+                    let mut cum: i64 = 0;
+                    for delta in PackedSint64Iter::new(refs_data) {
+                        cum += delta;
+                        scratch.refs.push(cum);
+                    }
+                    encode_tag(&mut scratch.reframed_way, 8, WIRE_LEN);
+                    encode_varint(&mut scratch.reframed_way, refs_data.len() as u64);
+                    scratch.reframed_way.extend_from_slice(refs_data);
+                } else if wt == WIRE_LEN {
+                    // An empty packed occurrence carries no refs, but dropping
+                    // it would change the output bytes for an input this
+                    // rewriter used to copy through unchanged. `add-locations-
+                    // to-ways` output is compared byte-wise against osmium in
+                    // `brokkr verify`, so the normalization must be a no-op on
+                    // every packed input, including the degenerate one.
+                    encode_tag(&mut scratch.reframed_way, 8, WIRE_LEN);
+                    encode_varint(&mut scratch.reframed_way, 0);
                 }
-                encode_tag(&mut scratch.reframed_way, 8, WIRE_LEN);
-                encode_varint(&mut scratch.reframed_way, refs_data.len() as u64);
-                scratch.reframed_way.extend_from_slice(refs_data);
             }
-            (9 | 10 | 20, WIRE_LEN) => {
+            // Stripped: we own the coordinates. Both wire forms, or an
+            // unpacked stale lat / lon would survive alongside the fresh
+            // packed one we append below and the way would carry two
+            // occurrences of field 9.
+            (9 | 10 | 20, WIRE_LEN | WIRE_VARINT) => {
                 let _ = way_cursor
                     .read_raw_field(wt)
                     .map_err(|e| format!("reframe wstrip: {e}"))?;
@@ -328,4 +377,189 @@ pub(super) fn way_members_payload(way_count: u64, members: &[bool]) -> Vec<u8> {
     }
     payload.extend_from_slice(&bits);
     payload
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::{NodeIndex, WayReframeScratch, reframe_way_blob_with_locations};
+
+    fn varint(mut v: u64, out: &mut Vec<u8>) {
+        loop {
+            #[allow(clippy::cast_possible_truncation)]
+            let mut b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                b |= 0x80;
+            }
+            out.push(b);
+            if v == 0 {
+                break;
+            }
+        }
+    }
+
+    fn len_delimited(field: u32, payload: &[u8], out: &mut Vec<u8>) {
+        varint(u64::from((field << 3) | 2), out);
+        varint(payload.len() as u64, out);
+        out.extend_from_slice(payload);
+    }
+
+    #[allow(clippy::cast_sign_loss)]
+    fn zz(v: i64) -> u64 {
+        ((v << 1) ^ (v >> 63)) as u64
+    }
+
+    /// PrimitiveBlock: empty StringTable, one group, one Way with `refs`
+    /// written packed or unpacked. Both spellings are legal protobuf and mean
+    /// the same way.
+    fn way_block(way_id: i64, refs: &[i64], packed: bool) -> Vec<u8> {
+        let mut way = Vec::new();
+        way.push(0x08); // field 1 (id), varint
+        #[allow(clippy::cast_sign_loss)]
+        varint(way_id as u64, &mut way);
+
+        let mut deltas = Vec::new();
+        let mut prev = 0_i64;
+        for &r in refs {
+            deltas.push(zz(r - prev));
+            prev = r;
+        }
+        if packed {
+            let mut seg = Vec::new();
+            for &d in &deltas {
+                varint(d, &mut seg);
+            }
+            len_delimited(8, &seg, &mut way);
+        } else {
+            for &d in &deltas {
+                way.push(0x40); // field 8, VARINT - the unpacked spelling
+                varint(d, &mut way);
+            }
+        }
+
+        let mut group = Vec::new();
+        len_delimited(3, &way, &mut group);
+        let mut block = Vec::new();
+        len_delimited(1, &[], &mut block);
+        len_delimited(2, &group, &mut block);
+        block
+    }
+
+    fn try_run(block: &[u8]) -> std::result::Result<(Vec<u8>, u64, u64), String> {
+        let index = NodeIndex::InMemory([(7_i64, (100_i32, 200_i32))].into_iter().collect());
+        let mut out = Vec::new();
+        let mut scratch = WayReframeScratch::default();
+        let stats = reframe_way_blob_with_locations(
+            block,
+            &index,
+            &mut out,
+            &mut scratch,
+            None,
+            None,
+            false,
+        )?;
+        Ok((out, stats.way_count, stats.missing_locations))
+    }
+
+    fn run(block: &[u8]) -> (Vec<u8>, u64, u64) {
+        try_run(block).expect("reframe must succeed")
+    }
+
+    /// The silent-output bug. `refs` written in the unpacked wire form fell to
+    /// the verbatim-copy arm, so `scratch.refs` stayed empty, the `lat`/`lon`
+    /// append was skipped entirely, and `add-locations-to-ways` emitted a way
+    /// with NO locations - no error, no missing-location count, nothing to
+    /// notice.
+    ///
+    /// The single ref is deliberate. Exactly as in `src/read/wire.rs`, a
+    /// one-element unpacked array is byte-identical to a one-element packed
+    /// segment and is therefore accepted; two or more unpacked values are two
+    /// data-bearing occurrences of the same field, which is the refused shape
+    /// (see `unpacked_multi_value_refs_are_refused_not_half_handled`). Node 9
+    /// is absent from the index, so a correct walk reports it missing - a zero
+    /// there is exactly the bug, and indistinguishable from a way with no refs.
+    #[test]
+    fn unpacked_way_refs_still_get_locations_appended() {
+        let (out, ways, missing) = run(&way_block(42, &[9], false));
+        assert_eq!(ways, 1);
+        assert_eq!(
+            missing, 1,
+            "the ref must be resolved against the index; a zero means the refs \
+             were never walked at all"
+        );
+        assert!(
+            out.contains(&0x4A),
+            "the reframed way must carry a packed field 9 (lat); appending no \
+             locations is the observable symptom of the bug"
+        );
+    }
+
+    /// The normalization must be exact, in both directions.
+    ///
+    /// `add-locations-to-ways` output is compared byte-wise against osmium in
+    /// `brokkr verify`, so re-emitting the packed form must be a no-op for
+    /// every packed input - and the unpacked spelling of the same way must
+    /// normalize to precisely the bytes the packed spelling produces.
+    #[test]
+    fn packed_and_unpacked_spellings_produce_identical_output_bytes() {
+        let (packed_out, _, packed_missing) = run(&way_block(42, &[9], true));
+        let (unpacked_out, _, unpacked_missing) = run(&way_block(42, &[9], false));
+        assert_eq!(packed_missing, unpacked_missing);
+        assert_eq!(
+            packed_out, unpacked_out,
+            "the two legal spellings of the same way must reframe to the same \
+             bytes"
+        );
+
+        // And the packed input's own refs segment survives verbatim: the
+        // rewriter re-emits field 8 itself, so a normalization that changed
+        // the encoding would silently diverge from osmium byte-for-byte. This
+        // is also the assertion that a multi-ref packed way must not disturb:
+        // the packed path is untouched by the unpacked-form acceptance.
+        let refs_segment = [0x42_u8, 0x01, 0x12]; // field 8, len 1, zigzag(9) = 18
+        assert!(
+            packed_out
+                .windows(refs_segment.len())
+                .any(|w| w == refs_segment),
+            "the packed refs field must be re-emitted byte-identically"
+        );
+
+        // Multi-ref packed ways - the overwhelmingly common shape - are
+        // likewise untouched: two refs, both walked, one resolvable.
+        let (multi_out, ways, missing) = run(&way_block(42, &[7, 9], true));
+        assert_eq!(ways, 1);
+        assert_eq!(missing, 1, "node 7 hits and node 9 misses");
+        let multi_segment = [0x42_u8, 0x02, 0x0E, 0x04]; // len 2, zigzag(7), zigzag(2)
+        assert!(
+            multi_out
+                .windows(multi_segment.len())
+                .any(|w| w == multi_segment),
+            "a two-ref packed segment must survive byte-identically too"
+        );
+    }
+
+    /// Two unpacked values are two data-bearing occurrences of `refs`, which
+    /// protobuf concatenates and this single-slice rewriter cannot express.
+    /// Refusing is the point: keeping only one occurrence would append
+    /// coordinates for half the way's nodes, which is worse than appending
+    /// none. Same policy, and same boundary, as `src/read/wire.rs`.
+    #[test]
+    fn unpacked_multi_value_refs_are_refused_not_half_handled() {
+        let err = try_run(&way_block(42, &[7, 9], false))
+            .expect_err("two unpacked refs values must be refused");
+        assert!(
+            err.contains("Way.refs appears twice with data"),
+            "expected the repeated-occurrence guard specifically. Got: {err}"
+        );
+    }
+
+    /// Passing counterpart: a way whose refs are genuinely absent still gets
+    /// no locations, so the fix is not "append locations unconditionally".
+    #[test]
+    fn a_way_with_no_refs_gets_no_locations() {
+        let (_out, ways, missing) = run(&way_block(42, &[], true));
+        assert_eq!(ways, 1);
+        assert_eq!(missing, 0);
+    }
 }

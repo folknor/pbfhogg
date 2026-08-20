@@ -186,8 +186,9 @@ fn cat_passthrough(
                             }
                         };
                         let tagdata = scan_block_tags(&decompress_buf);
-                        let tagdata_bytes =
-                            tagdata.as_ref().map(crate::blob_meta::TagIndex::serialize);
+                        let tagdata_bytes = tagdata
+                            .as_ref()
+                            .and_then(crate::blob_meta::TagIndex::serialize);
                         let reframed = reframe_raw_with_index(
                             blob_bytes,
                             &index.serialize(),
@@ -481,7 +482,7 @@ fn cat_filtered(
     let mut elements: u64 = 0;
 
     for file in files {
-        let (node_schedule, way_schedule, rel_schedule, shared_file) =
+        let (node_schedule, way_schedule, rel_schedule, shared_file, _max_ids) =
             crate::scan::classify::build_classify_schedules_split(file)?;
 
         if tf.nodes {

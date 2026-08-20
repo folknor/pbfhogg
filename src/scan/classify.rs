@@ -249,6 +249,14 @@ pub(crate) fn build_classify_schedule(
 /// which only skips blobs whose indexdata reports a mismatched kind).
 /// Each schedule's `seq` is local to that schedule (so each is a valid
 /// contiguous 0..n range ready for `parallel_classify_phase`).
+///
+/// The fifth return value is the highest `max_id` indexdata reports per kind,
+/// indexed `[node, way, relation]`, or 0 for a kind whose blobs carry no
+/// indexdata. It is a *sizing hint only* - indexdata is not verified anywhere,
+/// so a consumer that allocates from it must still cope with an ID that
+/// exceeds it (see `verify_ids`, which reports such an ID rather than
+/// panicking). It exists so allocations track the file instead of a hard-coded
+/// ceiling that the passage of time invalidates.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_classify_schedules_split(
@@ -258,6 +266,7 @@ pub(crate) fn build_classify_schedules_split(
     Vec<ScheduleEntry>,
     Vec<ScheduleEntry>,
     std::sync::Arc<std::fs::File>,
+    [i64; 3],
 )> {
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
     let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
@@ -271,6 +280,7 @@ pub(crate) fn build_classify_schedules_split(
     let mut nodes: Vec<ScheduleEntry> = Vec::new();
     let mut ways: Vec<ScheduleEntry> = Vec::new();
     let mut rels: Vec<ScheduleEntry> = Vec::new();
+    let mut max_ids: [i64; 3] = [0; 3];
     while let Some(meta) = walker.next_header()? {
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
@@ -286,14 +296,18 @@ pub(crate) fn build_classify_schedules_split(
             )
             .into());
         }
+        let reported_max = meta.index.as_ref().map_or(0, |i| i.max_id);
         match meta.index.as_ref().map(|i| i.kind) {
             Some(crate::blob_meta::ElemKind::Node) => {
+                max_ids[0] = max_ids[0].max(reported_max);
                 nodes.push((nodes.len(), meta.data_offset, meta.data_size));
             }
             Some(crate::blob_meta::ElemKind::Way) => {
+                max_ids[1] = max_ids[1].max(reported_max);
                 ways.push((ways.len(), meta.data_offset, meta.data_size));
             }
             Some(crate::blob_meta::ElemKind::Relation) => {
+                max_ids[2] = max_ids[2].max(reported_max);
                 rels.push((rels.len(), meta.data_offset, meta.data_size));
             }
             None => {
@@ -318,7 +332,7 @@ pub(crate) fn build_classify_schedules_split(
         crate::debug::emit_counter("schedule_way_blobs", ways.len() as i64);
         crate::debug::emit_counter("schedule_relation_blobs", rels.len() as i64);
     }
-    Ok((nodes, ways, rels, shared_file))
+    Ok((nodes, ways, rels, shared_file, max_ids))
 }
 
 /// Run a parallel classification phase: pread workers decompress and classify

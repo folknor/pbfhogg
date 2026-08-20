@@ -19,7 +19,10 @@ bbox), v2 (`0x02`, 42 bytes, "no bbox" spelled as four zero words) and v3
 (`0x03`, 42 bytes, current). v3 differs from v2 only in how an absent bbox is
 encoded - as an inverted, unconstructible box rather than as zeros, which are
 also the exact bbox of a blob at (0, 0). New files are written as v3; existing
-v1 and v2 files keep working unchanged.
+v1 and v2 files keep working unchanged. The reverse direction degrades
+gracefully: a pbfhogg release older than the v3 bump does not recognise `0x03`
+and treats a v3 file as unindexed - output stays correct, but on the slower
+full-decode paths (or with `--force` where indexdata is required).
 
 This enables O(1) blob classification. For example, `apply-changes` determines which blobs are affected by a changeset by comparing ID ranges, passing through ~92% of blobs as raw bytes without decompression.
 

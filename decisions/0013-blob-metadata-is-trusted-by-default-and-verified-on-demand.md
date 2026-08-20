@@ -38,6 +38,13 @@ Three consequences follow, and are binding on new code:
    `check_refs` report an out-of-range ID as an input property rather than
    panicking; `repack` bounds its `BlockBuilder` pre-allocation the same way.
    A new consumer that allocates from `indexdata` inherits this obligation.
+   Two pre-existing sites are known not to meet it yet: `renumber` and the
+   geocode-index builder both `IdSet::pre_allocate` straight from the schedule's
+   indexdata `max_id`, so an overstated claim buys an arbitrarily large eager
+   bitset. Neither can adopt `check`'s clamp as-is - an ID beyond the clamp is a
+   reportable property for a verifier but a hard functional requirement for
+   them, and an honest sparse file may legitimately carry a huge ID - so closing
+   these requires an index-structure change, tracked in TODO.md.
 
 3. **A verifier must not inherit a reader's safe collapse.** Every read path in
    this crate turns metadata it cannot parse into "no metadata, decode the

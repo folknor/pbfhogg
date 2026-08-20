@@ -112,7 +112,7 @@ impl WireBlobHeader {
                     };
                 }
                 2 if parse_indexdata => {
-                    // indexdata: bytes (len-delimited) - accept v1 (26) or v2 (42) sizes
+                    // indexdata: bytes (len-delimited) - accept v1 (26) or v2/v3 (42) sizes
                     let bytes = cursor.read_len_delimited()?;
                     let len = bytes.len();
                     indexdata_present |= len != 0;

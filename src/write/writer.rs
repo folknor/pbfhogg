@@ -375,7 +375,7 @@ impl<W: Write> PbfWriter<W> {
     ///
     /// `write_primitive_block` always scans the serialized block for the
     /// id range and present tag keys and emits both `indexdata` (field 2,
-    /// 42-byte v2 blob index) and `tagdata` (field 3, tag bloom). Some
+    /// 42-byte v3 blob index) and `tagdata` (field 4, tag key index). Some
     /// consumers want to produce byte-for-byte PBFs matching third-party
     /// tools that do not emit either field, or to exercise read paths
     /// (`diff_element_stream`, `ElementReader` fallback) that only fire

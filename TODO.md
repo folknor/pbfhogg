@@ -95,6 +95,37 @@ Picked 2026-07-30, right after the 0.5.0 release.
   `check --index` at any scale, and no automated run of it over a
   dataset larger than a test fixture.
 
+- [ ] **`renumber` and the geocode-index builder size an eager bitset from
+  unverified indexdata `max_id`.** ADR-0013's second consequence - anything
+  sized from unverified metadata must survive that metadata being wrong - is
+  met in `check` (`id_alloc_bound`, `src/commands/check/mod.rs`) and `repack`
+  (`with_element_cap_prealloc`), but two pre-existing consumers still trust
+  the claim at allocation time: `renumber` takes
+  `max(schedule.max_id)` straight from each blob's indexdata
+  (`src/commands/renumber/schedule.rs`, consumed at
+  `src/commands/renumber/mod.rs` `node_id_set.pre_allocate(max_node_id)`)
+  and the geocode builder does the same in
+  `src/geocode_index/builder/pass1_5.rs`. `IdSet::pre_allocate` populates
+  every chunk eagerly (required for lock-free `set_atomic`), so a blob
+  header claiming `max_id` near `i64::MAX` buys an exabyte-scale
+  allocation and the OOM killer before a single element is decoded -
+  the same denial-of-service shape `id_alloc_bound` closed in `check`.
+
+  Why the `check` fix does not transplant: `check` may clamp because an
+  ID beyond the bound is a *reportable input property* there. For
+  renumber the bitset is a functional requirement - every real node ID
+  must land in it - and an honest file may legitimately be small yet
+  carry a huge sparse ID, so a file-length-derived clamp would reject or
+  panic on legal input. Note the flip side already exists today: that
+  same honest sparse-huge-ID file already OOMs these commands with
+  truthful metadata. Closing both ends means an index-structure change
+  (e.g. lazily-populated chunks behind a lock-free publication scheme,
+  or a sign-off two-level map), not a bound. Until then the exposure is:
+  adversarial or corrupt indexdata can OOM `renumber` and
+  `build-geocode-index` at startup; `check --index` detects such a file
+  first. Found at the close pass of the transform-commands hunt,
+  confidence high (code-read, both call sites verified unclamped).
+
 - [ ] **CLI UX decision pair** (details under Milestone 3 / Command
   surface): pick and apply the scratch-dir posture uniformly across
   every large-scratch command, and replace `--index-type` on

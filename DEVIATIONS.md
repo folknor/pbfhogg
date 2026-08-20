@@ -363,9 +363,11 @@ and an error is recoverable where a silent zero-match is not.
 `get_filter_expression` splits on the first `/` anywhere in the expression and
 hands the prefix to `get_types`, which throws on any character outside
 `n`, `w`, `r`, `a`. So `addr:full/name` is a hard error under osmium. pbfhogg
-applies the type prefix only when every character before the `/` is one of
-`n`, `w`, `r`, and otherwise treats the whole string as the tag expression, so
-`addr:full/name` filters on that literal key.
+applies the type prefix only when the text before the `/` is non-empty and
+every character of it is one of `n`, `w`, `r`, and otherwise treats the whole
+string as the tag expression, so `addr:full/name` filters on that literal key.
+The empty prefix is part of the same rule: osmium reads `/name` as the key
+`name` applied to all types, while pbfhogg filters on the literal key `/name`.
 
 **There is no area (`a`) type.** osmium's `get_types` accepts `a` and routes
 matching expressions to a separate area filter. pbfhogg has no area concept in

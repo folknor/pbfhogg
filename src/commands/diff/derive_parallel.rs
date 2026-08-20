@@ -72,6 +72,9 @@ fn walk_file(path: &Path) -> Result<WalkedFile> {
     let mut ways: Vec<BlobDesc> = Vec::new();
     let mut rels: Vec<BlobDesc> = Vec::new();
     let mut first = true;
+    // See `diff::parallel::walk_file`: bucketing by kind discards file
+    // order, so the guard has to run before the bucketing does.
+    let mut order = crate::osc::merge_join::BlobOrderGuard::new();
 
     while let Some(meta) = walker.next_header()? {
         if first {
@@ -90,6 +93,9 @@ fn walk_file(path: &Path) -> Result<WalkedFile> {
                 ),
             )));
         };
+        order.observe(&index).map_err(|msg| {
+            crate::error::new_error(crate::error::ErrorKind::Io(io::Error::other(msg)))
+        })?;
         let desc = BlobDesc {
             data_offset: meta.data_offset,
             data_size: meta.data_size,

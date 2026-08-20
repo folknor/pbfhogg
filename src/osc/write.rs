@@ -149,6 +149,30 @@ pub(crate) fn relations_equal(a: &OwnedRelation, b: &OwnedRelation) -> bool {
 // OSC XML element writing (shared by derive_changes and merge_changes)
 // ---------------------------------------------------------------------------
 
+/// The `type` attribute for one relation member.
+///
+/// `MemberId::Unknown` has no OSC spelling. Writing it as `type="node"` -
+/// which both member writers used to do - produces a well-formed OSC file
+/// in which the member points at a completely different object: ref 42 of
+/// some unknown type becomes **node 42**, an unrelated element that very
+/// likely exists. Nothing downstream can detect the substitution, so the
+/// derived change stream silently corrupts referential integrity. This is
+/// the OSC-side twin of the `BlockBuilder` poison flag on the PBF side, and
+/// takes the same answer: refuse to write it.
+fn member_type_str(id: MemberId, relation_id: i64) -> crate::BoxResult<&'static str> {
+    match id {
+        MemberId::Node(_) => Ok("node"),
+        MemberId::Way(_) => Ok("way"),
+        MemberId::Relation(_) => Ok("relation"),
+        MemberId::Unknown(member_id, type_value) => Err(format!(
+            "relation {relation_id} has a member (ref {member_id}) with unknown type value \
+             {type_value}; OSC has no spelling for it, and writing it as a node member would \
+             silently repoint the member at an unrelated object"
+        )
+        .into()),
+    }
+}
+
 pub(crate) fn write_node_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     node: &OwnedNode,
@@ -220,12 +244,7 @@ pub(crate) fn write_relation_xml<W: std::io::Write>(
         writer.write_event(Event::Start(elem))?;
         for m in &rel.members {
             let mut member = BytesStart::new("member");
-            let type_str = match m.id {
-                MemberId::Node(_) => "node",
-                MemberId::Way(_) => "way",
-                MemberId::Relation(_) => "relation",
-                MemberId::Unknown(_, _) => "node",
-            };
+            let type_str = member_type_str(m.id, rel.id)?;
             let member_id = m.id.id().to_string();
             member.push_attribute(("type", type_str));
             member.push_attribute(("ref", member_id.as_str()));
@@ -287,32 +306,41 @@ fn write_borrowed_tags_xml<'a, W: std::io::Write>(
 
 /// Emit the metadata attribute set from a borrowed element's info fields.
 ///
-/// Each attribute is emitted only when its value is meaningful (version and
-/// changeset and uid positive, timestamp nonzero, user non-empty), matching
-/// what osmium's OSC writer produces. Full emission (not just version)
-/// keeps the derive -> apply roundtrip metadata-lossless now that
-/// apply-changes carries OSC metadata into its output.
+/// **Presence, not truthiness.** Each attribute is emitted exactly when the
+/// source element carried it, which is why every parameter is an `Option`
+/// rather than a value plus a `> 0` test. The previous shape gated on
+/// `version > 0`, `changeset > 0` and `uid > 0`, which silently dropped
+/// legitimate zero-valued metadata - `uid="0"` is the anonymous mapper that
+/// old OSM data is full of - and, when every field happened to be zero,
+/// shipped the element with no metadata attributes at all. The parse side
+/// then set no `META_FLAG_PRESENT` and apply-changes wrote the element with
+/// no info block, so `--format osc`'s documented lossless roundtrip did not
+/// hold at exactly those margins.
+///
+/// `user` keeps its non-empty test: an empty user name is not
+/// distinguishable from an absent one in the string table, and emitting
+/// `user=""` would assert an anonymous edit that the source never claimed.
 fn push_info_attrs(
     elem: &mut BytesStart<'_>,
-    version: i32,
-    milli_timestamp: i64,
-    changeset: i64,
-    uid: i32,
+    version: Option<i32>,
+    milli_timestamp: Option<i64>,
+    changeset: Option<i64>,
+    uid: Option<i32>,
     user: Option<&str>,
 ) {
-    if version > 0 {
+    if let Some(version) = version {
         let v_str = version.to_string();
         elem.push_attribute(("version", v_str.as_str()));
     }
-    if milli_timestamp > 0 {
+    if let Some(milli_timestamp) = milli_timestamp {
         let ts = crate::commands::format_epoch_secs((milli_timestamp / 1000).cast_unsigned());
         elem.push_attribute(("timestamp", ts.as_str()));
     }
-    if changeset > 0 {
+    if let Some(changeset) = changeset {
         let c_str = changeset.to_string();
         elem.push_attribute(("changeset", c_str.as_str()));
     }
-    if uid > 0 {
+    if let Some(uid) = uid {
         let u_str = uid.to_string();
         elem.push_attribute(("uid", u_str.as_str()));
     }
@@ -355,12 +383,16 @@ fn write_dense_node_xml<W: std::io::Write>(
     if let Some(info) = node.info()
         && info.version() != -1
     {
+        // A DenseInfo block delta-decodes every field for every element, so
+        // once past the `version() != -1` per-element absence sentinel above,
+        // all of these are genuinely present - unlike the non-dense path,
+        // where each field is independently optional.
         push_info_attrs(
             &mut elem,
-            info.version(),
-            info.milli_timestamp(),
-            info.changeset(),
-            info.uid(),
+            Some(info.version()),
+            Some(info.milli_timestamp()),
+            Some(info.changeset()),
+            Some(info.uid()),
             info.user().ok(),
         );
     }
@@ -390,16 +422,19 @@ fn write_borrowed_node_xml<W: std::io::Write>(
     elem.push_attribute(("lat", lat_str.as_str()));
     elem.push_attribute(("lon", coord_buf.as_str()));
     let info = node.info();
-    if let Some(v) = info.version() {
-        push_info_attrs(
-            &mut elem,
-            v,
-            info.milli_timestamp().unwrap_or(0),
-            info.changeset().unwrap_or(0),
-            info.uid().unwrap_or(0),
-            info.user().and_then(Result::ok),
-        );
-    }
+    // Called unconditionally: every field is independently optional in the
+    // wire format, so gating the whole call on `version` being present would
+    // discard a timestamp, changeset, uid or user carried by an Info block
+    // that happens to omit `version`. `push_info_attrs` emits per field on
+    // presence, so an entirely empty Info contributes no attributes.
+    push_info_attrs(
+        &mut elem,
+        info.version(),
+        info.milli_timestamp(),
+        info.changeset(),
+        info.uid(),
+        info.user().and_then(Result::ok),
+    );
 
     let mut tags = node.tags().peekable();
     if tags.peek().is_none() {
@@ -420,16 +455,16 @@ fn write_borrowed_way_xml<W: std::io::Write>(
     let id_str = way.id().to_string();
     elem.push_attribute(("id", id_str.as_str()));
     let info = way.info();
-    if let Some(v) = info.version() {
-        push_info_attrs(
-            &mut elem,
-            v,
-            info.milli_timestamp().unwrap_or(0),
-            info.changeset().unwrap_or(0),
-            info.uid().unwrap_or(0),
-            info.user().and_then(Result::ok),
-        );
-    }
+    // Unconditional for the same reason as the node path above: presence is
+    // per field, not gated on `version`.
+    push_info_attrs(
+        &mut elem,
+        info.version(),
+        info.milli_timestamp(),
+        info.changeset(),
+        info.uid(),
+        info.user().and_then(Result::ok),
+    );
 
     let mut refs = way.refs().peekable();
     let mut tags = way.tags().peekable();
@@ -457,16 +492,16 @@ fn write_borrowed_relation_xml<W: std::io::Write>(
     let id_str = rel.id().to_string();
     elem.push_attribute(("id", id_str.as_str()));
     let info = rel.info();
-    if let Some(v) = info.version() {
-        push_info_attrs(
-            &mut elem,
-            v,
-            info.milli_timestamp().unwrap_or(0),
-            info.changeset().unwrap_or(0),
-            info.uid().unwrap_or(0),
-            info.user().and_then(Result::ok),
-        );
-    }
+    // Unconditional for the same reason as the node path above: presence is
+    // per field, not gated on `version`.
+    push_info_attrs(
+        &mut elem,
+        info.version(),
+        info.milli_timestamp(),
+        info.changeset(),
+        info.uid(),
+        info.user().and_then(Result::ok),
+    );
 
     let mut members = rel.members().peekable();
     let mut tags = rel.tags().peekable();
@@ -476,12 +511,7 @@ fn write_borrowed_relation_xml<W: std::io::Write>(
         writer.write_event(Event::Start(elem))?;
         for m in members {
             let mut member = BytesStart::new("member");
-            let type_str = match m.id {
-                crate::MemberId::Node(_) => "node",
-                crate::MemberId::Way(_) => "way",
-                crate::MemberId::Relation(_) => "relation",
-                crate::MemberId::Unknown(_, _) => "node",
-            };
+            let type_str = member_type_str(m.id, rel.id())?;
             let member_id = m.id.id().to_string();
             member.push_attribute(("type", type_str));
             member.push_attribute(("ref", member_id.as_str()));
@@ -604,6 +634,299 @@ mod tests {
         assert_eq!(members[0].2, role);
 
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// A relation member of an unknown type must not be written as a node
+    /// member. `type="node"` is well-formed OSC pointing at a different
+    /// object, and nothing downstream can tell.
+    #[test]
+    fn unknown_member_type_is_refused_not_written_as_node() {
+        let rel = OwnedRelation {
+            id: 200,
+            tags: Vec::new(),
+            members: vec![OwnedMember {
+                id: MemberId::Unknown(42, 9),
+                role: "outer".to_string(),
+            }],
+            metadata: None,
+        };
+
+        let mut writer = Writer::new(Vec::new());
+        let err = write_relation_xml(&mut writer, &rel)
+            .expect_err("an unknown member type must not be written");
+        let text = err.to_string();
+        assert!(
+            text.contains("relation 200") && text.contains("unknown type value 9"),
+            "error should name the relation and the type value; got: {text}"
+        );
+
+        // Independent of the error: nothing that looks like a node member may
+        // have reached the byte stream. Asserting on the emitted bytes rather
+        // than on our own parser is the point - the previous behaviour
+        // produced output our parser accepts without complaint.
+        let xml = String::from_utf8_lossy(&writer.into_inner()).into_owned();
+        assert!(
+            !xml.contains("type=\"node\""),
+            "no node member may be emitted for an unknown type; got: {xml}"
+        );
+    }
+
+    /// Build a one-element PBF block through `BlockBuilder` and hand the
+    /// borrowed element to `write_element_xml`, returning the emitted XML.
+    /// Goes through the borrowed writers, which is where `push_info_attrs`
+    /// lives; the owned writers use `OwnedMetadata::push_attrs` instead.
+    fn borrowed_way_xml(
+        meta: &crate::write::block_builder::Metadata<'_>,
+    ) -> crate::BoxResult<String> {
+        let mut bb = crate::write::block_builder::BlockBuilder::new();
+        bb.add_way(7, [("highway", "residential")], &[1, 2], Some(meta));
+        let bytes = bb
+            .take()?
+            .ok_or("block builder produced no block")?
+            .to_vec();
+        let block = crate::PrimitiveBlock::from_vec(bytes)?;
+
+        let mut writer = Writer::new(Vec::new());
+        let mut coord_buf = String::new();
+        for element in block.elements() {
+            write_element_xml(&mut writer, &element, &mut coord_buf)?;
+        }
+        Ok(String::from_utf8(writer.into_inner())?)
+    }
+
+    /// Zero-valued metadata is legitimate - `uid="0"` is the anonymous mapper
+    /// that old OSM data is full of - and must survive into the OSC. The
+    /// writer used to gate each attribute on `> 0`, so a zero changeset or uid
+    /// vanished, and an element whose metadata was all zeros shipped with no
+    /// metadata attributes at all. The parse side then recorded no metadata
+    /// present and apply-changes wrote the element without an info block,
+    /// breaking the documented lossless `--format osc` roundtrip.
+    #[test]
+    fn zero_valued_metadata_is_emitted_not_dropped() -> crate::BoxResult<()> {
+        let xml = borrowed_way_xml(&crate::write::block_builder::Metadata {
+            version: 1,
+            timestamp: 0,
+            changeset: 0,
+            uid: 0,
+            user: "",
+            visible: true,
+        })?;
+        // Assert on the emitted bytes directly rather than round-tripping
+        // through our own parser.
+        assert!(
+            xml.contains("changeset=\"0\""),
+            "changeset=0 must be emitted; got: {xml}"
+        );
+        assert!(
+            xml.contains("uid=\"0\""),
+            "uid=0 must be emitted; got: {xml}"
+        );
+        assert!(
+            xml.contains("timestamp=\"1970-01-01T00:00:00Z\""),
+            "timestamp=0 must be emitted; got: {xml}"
+        );
+        // An empty user name stays absent: it is not distinguishable from no
+        // user at all, so emitting it would assert something the source never
+        // claimed.
+        assert!(
+            !xml.contains("user="),
+            "an empty user must not be emitted; got: {xml}"
+        );
+        Ok(())
+    }
+
+    /// Non-zero metadata still comes through unchanged, so the test above is
+    /// not satisfied by a writer that emits every attribute unconditionally
+    /// with a wrong value.
+    #[test]
+    fn nonzero_metadata_still_roundtrips_through_the_writer() -> crate::BoxResult<()> {
+        let xml = borrowed_way_xml(&crate::write::block_builder::Metadata {
+            version: 7,
+            // `Metadata::timestamp` is epoch SECONDS; the reader scales by the
+            // block's date granularity to get the milliseconds the writer formats.
+            timestamp: 86_400,
+            changeset: 123_456,
+            uid: 42,
+            user: "mapper one",
+            visible: true,
+        })?;
+        assert!(xml.contains("version=\"7\""), "got: {xml}");
+        assert!(xml.contains("changeset=\"123456\""), "got: {xml}");
+        assert!(xml.contains("uid=\"42\""), "got: {xml}");
+        assert!(xml.contains("user=\"mapper one\""), "got: {xml}");
+        assert!(
+            xml.contains("timestamp=\"1970-01-02T00:00:00Z\""),
+            "got: {xml}"
+        );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Independent protobuf emitter.
+    //
+    // `BlockBuilder::Metadata` carries a non-optional `version`, so our own
+    // writer physically cannot produce an `Info` that omits it - yet the
+    // wire format makes every `Info` field independently optional, and real
+    // producers do omit fields. Constructing the adversarial block by hand
+    // is the only way to reach that shape, and hand-encoding it here keeps
+    // the fixture independent of the encoder under test.
+    // -----------------------------------------------------------------
+
+    /// Append a protobuf varint.
+    fn pb_varint(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let byte = u8::try_from(v & 0x7f).expect("masked to 7 bits");
+            v >>= 7;
+            if v == 0 {
+                out.push(byte);
+                return;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    /// Append a varint-typed field (wire type 0).
+    fn pb_field_varint(out: &mut Vec<u8>, field: u64, v: u64) {
+        pb_varint(out, field << 3);
+        pb_varint(out, v);
+    }
+
+    /// Append a length-delimited field (wire type 2).
+    fn pb_field_bytes(out: &mut Vec<u8>, field: u64, body: &[u8]) {
+        pb_varint(out, (field << 3) | 2);
+        pb_varint(out, body.len() as u64);
+        out.extend_from_slice(body);
+    }
+
+    /// Hand-encode a `PrimitiveBlock` holding one bare `Way` whose `Info`
+    /// carries exactly the fields named, each field emitted only when
+    /// `Some`. `version` deliberately reachable as `None`.
+    fn handmade_way_block(
+        version: Option<i32>,
+        timestamp: Option<i64>,
+        changeset: Option<i64>,
+        uid: Option<i32>,
+    ) -> Vec<u8> {
+        // Info: 1=version, 2=timestamp, 3=changeset, 4=uid.
+        let mut info = Vec::new();
+        if let Some(v) = version {
+            pb_field_varint(&mut info, 1, u64::try_from(v).expect("non-negative"));
+        }
+        if let Some(t) = timestamp {
+            pb_field_varint(&mut info, 2, u64::try_from(t).expect("non-negative"));
+        }
+        if let Some(c) = changeset {
+            pb_field_varint(&mut info, 3, u64::try_from(c).expect("non-negative"));
+        }
+        if let Some(u) = uid {
+            pb_field_varint(&mut info, 4, u64::try_from(u).expect("non-negative"));
+        }
+
+        // Way: 1=id, 4=info. No keys/vals/refs - a bare way is legal.
+        let mut way = Vec::new();
+        pb_field_varint(&mut way, 1, 7);
+        pb_field_bytes(&mut way, 4, &info);
+
+        // PrimitiveGroup: 3=ways.
+        let mut group = Vec::new();
+        pb_field_bytes(&mut group, 3, &way);
+
+        // StringTable: 1=repeated bytes s. Index 0 must be the empty string.
+        let mut stringtable = Vec::new();
+        pb_field_bytes(&mut stringtable, 1, b"");
+
+        // PrimitiveBlock: 1=stringtable, 2=primitivegroup. granularity (17)
+        // and date_granularity (19) are left at their protobuf defaults of
+        // 100 and 1000, which is what a real producer emits.
+        let mut block = Vec::new();
+        pb_field_bytes(&mut block, 1, &stringtable);
+        pb_field_bytes(&mut block, 2, &group);
+        block
+    }
+
+    /// Run the handmade block through the borrowed writers and return the
+    /// emitted XML bytes as a string.
+    fn handmade_way_xml(
+        version: Option<i32>,
+        timestamp: Option<i64>,
+        changeset: Option<i64>,
+        uid: Option<i32>,
+    ) -> crate::BoxResult<String> {
+        let block = crate::PrimitiveBlock::from_vec(handmade_way_block(
+            version, timestamp, changeset, uid,
+        ))?;
+        let mut writer = Writer::new(Vec::new());
+        let mut coord_buf = String::new();
+        for element in block.elements() {
+            write_element_xml(&mut writer, &element, &mut coord_buf)?;
+        }
+        Ok(String::from_utf8(writer.into_inner())?)
+    }
+
+    /// The emitter itself must be able to produce the ordinary shape, or the
+    /// absence test below would be satisfied by a fixture that decodes to
+    /// nothing at all.
+    #[test]
+    fn handmade_emitter_produces_a_readable_way_with_full_metadata() -> crate::BoxResult<()> {
+        let xml = handmade_way_xml(Some(3), Some(86), Some(555), Some(9))?;
+        assert!(xml.contains("id=\"7\""), "got: {xml}");
+        assert!(xml.contains("version=\"3\""), "got: {xml}");
+        assert!(xml.contains("changeset=\"555\""), "got: {xml}");
+        assert!(xml.contains("uid=\"9\""), "got: {xml}");
+        assert!(
+            xml.contains("timestamp=\"1970-01-01T00:01:26Z\""),
+            "got: {xml}"
+        );
+        Ok(())
+    }
+
+    /// An `Info` with no `version` must still contribute every other field
+    /// it carries. The borrowed writers used to call `push_info_attrs` only
+    /// when `info.version().is_some()`, so a valid protobuf `Info` holding a
+    /// timestamp, changeset and uid but no version lost ALL of its metadata
+    /// in derived OSC output - the same shape of defect as the `> 0` gating
+    /// `push_info_attrs` was rewritten to fix, one layer up at the call
+    /// sites.
+    #[test]
+    fn metadata_without_version_is_not_discarded() -> crate::BoxResult<()> {
+        let xml = handmade_way_xml(None, Some(86), Some(555), Some(9))?;
+        // Assert on the emitted bytes rather than round-tripping through our
+        // own parser: the previous output was well-formed OSC that our
+        // parser accepts without complaint, just missing the metadata.
+        assert!(
+            xml.contains("changeset=\"555\""),
+            "changeset must survive an Info with no version; got: {xml}"
+        );
+        assert!(
+            xml.contains("uid=\"9\""),
+            "uid must survive an Info with no version; got: {xml}"
+        );
+        assert!(
+            xml.contains("timestamp=\"1970-01-01T00:01:26Z\""),
+            "timestamp must survive an Info with no version; got: {xml}"
+        );
+        // The absent field stays absent - the fix must not invent a version.
+        assert!(
+            !xml.contains("version="),
+            "an absent version must not be fabricated; got: {xml}"
+        );
+        Ok(())
+    }
+
+    /// The complement: an `Info` present but entirely empty contributes no
+    /// attributes at all. Without this, the test above is satisfied by a
+    /// writer that emits defaults for everything.
+    #[test]
+    fn empty_info_emits_no_metadata_attributes() -> crate::BoxResult<()> {
+        let xml = handmade_way_xml(None, None, None, None)?;
+        for attr in ["version=", "timestamp=", "changeset=", "uid=", "user="] {
+            assert!(
+                !xml.contains(attr),
+                "an empty Info must contribute no {attr} attribute; got: {xml}"
+            );
+        }
+        assert!(xml.contains("id=\"7\""), "the way itself must be emitted");
         Ok(())
     }
 }

@@ -162,11 +162,20 @@ fn stats_block(stderr: &str) -> Vec<&str> {
 }
 
 // ---------------------------------------------------------------------------
-// Cursor rule: Passthrough / FalsePositive slots must NOT advance the cursor.
+// Cursor rule: Passthrough / FalsePositive slots must NOT advance the cursor -
+// but a blob may only take the passthrough slot when no upsert lands inside its
+// ID span. A pure create in a blob's interior matches no base element, so the
+// precise `block_overlaps_diff` check says "false positive" while the create is
+// still owed inside that range; passing the blob through verbatim then emits
+// the create after larger IDs, under a header that stamps Sort.Type_then_ID.
+//
+// These two tests previously asserted the misordered output as the expected
+// answer ("blob-tail order, not OSM-sorted"). They now assert the ordering the
+// header claims.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cursor_rule_false_positive_blob_emits_create_after() {
+fn interior_create_in_false_positive_blob_stays_sorted() {
     let dir = TempDir::new().expect("tempdir");
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
@@ -226,16 +235,16 @@ fn cursor_rule_false_positive_blob_emits_create_after() {
     );
     assert_eq!(
         node_ids,
-        vec![1, 2, 10, 5],
-        "FalsePositive blob is passed through verbatim, then id=5 emitted \
-         on the type transition Node -> Way (blob-tail order, not OSM-sorted)."
+        vec![1, 2, 5, 10],
+        "id=5 falls inside the blob's [1, 10] span, so it must be interleaved \
+         at its sorted position rather than trailing the blob"
     );
 
     assert_eq!(c.ways.iter().map(|w| w.0).collect::<Vec<_>>(), vec![100]);
 }
 
 #[test]
-fn cursor_rule_false_positive_blob_emits_create_at_tail() {
+fn interior_create_in_final_false_positive_blob_stays_sorted() {
     let dir = TempDir::new().expect("tempdir");
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
@@ -283,9 +292,112 @@ fn cursor_rule_false_positive_blob_emits_create_at_tail() {
     );
     assert_eq!(
         node_ids,
-        vec![1, 10, 5],
-        "Trailing-create after FalsePositive blob: blob-tail order [1, 10, 5]"
+        vec![1, 5, 10],
+        "id=5 falls inside the only blob's [1, 10] span, so it must be \
+         interleaved at its sorted position even though nothing follows"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Output sortedness: `build_header_bytes` stamps `Sort.Type_then_ID`
+// unconditionally, so the drain must refuse to write blobs that contradict it.
+// ---------------------------------------------------------------------------
+
+/// The base header's `is_sorted()` gate is a claim, not proof - `degrade
+/// --unsort` exists to produce files where the two disagree. When the base is
+/// unsorted underneath a sorted stamp, apply-changes used to copy the
+/// disorder into the output and re-stamp it as sorted, handing every
+/// downstream consumer a file that lies about its ordering.
+#[test]
+fn unsorted_base_under_a_sorted_stamp_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    // Two node blobs whose ID spans go backwards: 10..20 then 5..6. The
+    // header still stamps Sort.Type_then_ID (write_multi_block_test_pbf
+    // always does), which is exactly the shape being guarded against.
+    let nodes: Vec<TestNode> = [10, 20, 5, 6]
+        .into_iter()
+        .map(|id| TestNode {
+            id,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![],
+            meta: None,
+        })
+        .collect();
+    write_multi_block_test_pbf(&base, &nodes, &[], &[], 2);
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <node id="99" lat="40.0" lon="40.0" version="1"/>
+  </create>
+</osmChange>"#,
+    );
+
+    let out = CliInvoker::new()
+        .arg("apply-changes")
+        .arg(&base)
+        .arg(&osc)
+        .arg("-o")
+        .arg(&output)
+        .arg("--force")
+        .run();
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an unsorted base must fail rather than yield a falsely-stamped file; stderr:\n{}",
+        out.stderr_str(),
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("refusing to write an unsorted PBF"),
+        "error should say what it refused to write; got:\n{stderr}"
+    );
+}
+
+/// The same fixture shape, but honestly ordered, must still succeed - without
+/// this the guard above would be satisfied by a build that refused every
+/// multi-blob input.
+#[test]
+fn sorted_multi_blob_base_still_succeeds() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    let nodes: Vec<TestNode> = [5, 6, 10, 20]
+        .into_iter()
+        .map(|id| TestNode {
+            id,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![],
+            meta: None,
+        })
+        .collect();
+    write_multi_block_test_pbf(&base, &nodes, &[], &[], 2);
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <node id="99" lat="40.0" lon="40.0" version="1"/>
+  </create>
+</osmChange>"#,
+    );
+
+    run_apply_simple(&base, &osc, &output);
+    let c = read_all_elements(&output);
+    let ids: Vec<i64> = c.nodes.iter().map(|n| n.0).collect();
+    assert_eq!(ids, vec![5, 6, 10, 20, 99]);
 }
 
 // ---------------------------------------------------------------------------

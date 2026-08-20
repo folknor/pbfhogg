@@ -33,7 +33,7 @@ pub use super::compact::{
 /// Arena-packed diff overlay for OSC change files.
 ///
 /// Instead of per-element heap allocations (`HashMap<i64, OscNode>` etc.), all
-/// element data is packed into flat `Vec<u8>` arenas with a `FxHashMap<i64, u32>`
+/// element data is packed into flat `Vec<u8>` arenas with a `FxHashMap<i64, usize>`
 /// index mapping element IDs to byte offsets. Tag keys and relation member roles
 /// are interned via `StringInterner` to eliminate duplicate string storage.
 ///
@@ -43,9 +43,17 @@ pub struct CompactDiffOverlay {
     node_arena: Vec<u8>,
     way_arena: Vec<u8>,
     relation_arena: Vec<u8>,
-    node_index: FxHashMap<i64, u32>,
-    way_index: FxHashMap<i64, u32>,
-    relation_index: FxHashMap<i64, u32>,
+    // Arena offsets are `usize`, not `u32`. A per-kind arena crossing 4 GiB
+    // is reachable on a catch-up diff or a `load_all_diffs` accumulation
+    // (node records are 49 B plus tags, so ~85 M node changes), and a
+    // truncating `u32` offset points the index at an arbitrary earlier
+    // record - `get_node` then hands back another element's bytes and
+    // apply-changes writes them under this ID. `(i64, usize)` and
+    // `(i64, u32)` are both 16 bytes after padding, so the width costs
+    // nothing.
+    node_index: FxHashMap<i64, usize>,
+    way_index: FxHashMap<i64, usize>,
+    relation_index: FxHashMap<i64, usize>,
     pub deleted_nodes: HashSet<i64>,
     pub deleted_ways: HashSet<i64>,
     pub deleted_relations: HashSet<i64>,
@@ -83,7 +91,7 @@ impl CompactDiffOverlay {
     pub fn get_node(&self, id: i64) -> Option<CompactNodeRef<'_>> {
         let &offset = self.node_index.get(&id)?;
         Some(CompactNodeRef {
-            data: &self.node_arena[offset as usize..],
+            data: &self.node_arena[offset..],
             interner: &self.interner,
         })
     }
@@ -92,7 +100,7 @@ impl CompactDiffOverlay {
     pub fn get_way(&self, id: i64) -> Option<CompactWayRef<'_>> {
         let &offset = self.way_index.get(&id)?;
         Some(CompactWayRef {
-            data: &self.way_arena[offset as usize..],
+            data: &self.way_arena[offset..],
             interner: &self.interner,
         })
     }
@@ -101,7 +109,7 @@ impl CompactDiffOverlay {
     pub fn get_relation(&self, id: i64) -> Option<CompactRelationRef<'_>> {
         let &offset = self.relation_index.get(&id)?;
         Some(CompactRelationRef {
-            data: &self.relation_arena[offset as usize..],
+            data: &self.relation_arena[offset..],
             interner: &self.interner,
         })
     }
@@ -163,8 +171,8 @@ impl CompactDiffOverlay {
         total += self.way_arena.capacity();
         total += self.relation_arena.capacity();
 
-        // Indexes: FxHashMap<i64, u32>, each bucket is (i64, u32) + 1 control byte.
-        let index_entry_size = std::mem::size_of::<(i64, u32)>() + 1;
+        // Indexes: FxHashMap<i64, usize>, each bucket is (i64, usize) + 1 control byte.
+        let index_entry_size = std::mem::size_of::<(i64, usize)>() + 1;
         total += self.node_index.capacity() * index_entry_size;
         total += self.way_index.capacity() * index_entry_size;
         total += self.relation_index.capacity() * index_entry_size;
@@ -200,9 +208,10 @@ impl CompactDiffOverlay {
         lon: i32,
         tags: &[(u32, &str)],
         meta: &ArenaMeta,
-    ) {
-        let offset = arena_append_node(&mut self.node_arena, id, lat, lon, tags, meta);
+    ) -> ParseResult<()> {
+        let offset = arena_append_node(&mut self.node_arena, id, lat, lon, tags, meta)?;
         self.node_index.insert(id, offset);
+        Ok(())
     }
 
     /// Append a way to the arena and register it in the way index.
@@ -213,9 +222,10 @@ impl CompactDiffOverlay {
         refs: &[i64],
         tags: &[(u32, &str)],
         meta: &ArenaMeta,
-    ) {
-        let offset = arena_append_way(&mut self.way_arena, id, refs, tags, meta);
+    ) -> ParseResult<()> {
+        let offset = arena_append_way(&mut self.way_arena, id, refs, tags, meta)?;
         self.way_index.insert(id, offset);
+        Ok(())
     }
 
     /// Append a relation to the arena and register it in the relation index.
@@ -226,9 +236,10 @@ impl CompactDiffOverlay {
         members: &[(i64, u8, u32)],
         tags: &[(u32, &str)],
         meta: &ArenaMeta,
-    ) {
-        let offset = arena_append_relation(&mut self.relation_arena, id, members, tags, meta);
+    ) -> ParseResult<()> {
+        let offset = arena_append_relation(&mut self.relation_arena, id, members, tags, meta)?;
         self.relation_index.insert(id, offset);
+        Ok(())
     }
 
     /// Mark a node as deleted and drop any live entry from the node index.
@@ -254,7 +265,7 @@ impl CompactDiffOverlay {
 
     /// Intern a tag key or relation member role, returning its interned ID.
     #[inline]
-    pub(super) fn intern(&mut self, s: &str) -> u32 {
+    pub(super) fn intern(&mut self, s: &str) -> ParseResult<u32> {
         self.interner.intern(s)
     }
 }
@@ -292,7 +303,7 @@ pub fn parse_osc_file_into(path: &Path, overlay: &mut CompactDiffOverlay) -> Par
                 handle_empty_event_compact(e, &mut state, overlay)?;
             }
             Ok(Event::End(ref e)) => {
-                handle_end_event_compact(e, &mut state, overlay);
+                handle_end_event_compact(e, &mut state, overlay)?;
             }
             Ok(Event::Eof) => break,
             Ok(_) => {} // text, comments, decl, etc.
@@ -653,6 +664,125 @@ mod tests {
         Ok(())
     }
 
+    /// Build a one-node OSC in `section` with the given attribute string and
+    /// try to parse it. Returns the parse result so callers can assert on
+    /// either the value or the error text.
+    fn parse_single_node(
+        dir_suffix: &str,
+        section: &str,
+        attrs: &str,
+    ) -> ParseResult<CompactDiffOverlay> {
+        let dir = make_test_dir(dir_suffix);
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <osmChange version=\"0.6\">\n  <{section}>\n    <node {attrs}/>\n  \
+             </{section}>\n</osmChange>"
+        );
+        write_osc_gz(&dir, "coords.osc.gz", &xml);
+        let result = parse_osc_file(&dir.join("coords.osc.gz"));
+        drop(std::fs::remove_dir_all(&dir));
+        result
+    }
+
+    /// A create/modify `<node>` without usable coordinates must be a hard
+    /// parse error. It used to be accepted and stored at (0, 0) - which is a
+    /// real coordinate in the Gulf of Guinea, so the corrupted node was
+    /// indistinguishable from a genuine one, and under `--locations-on-ways`
+    /// the (0, 0) propagated into every way referencing it.
+    #[test]
+    fn test_node_without_usable_coords_is_a_parse_error() {
+        // (attribute string, the substring the error must name)
+        let cases = [
+            (r#"id="1" lon="12.0" version="1""#, "lat"),
+            (r#"id="1" lat="55.0" version="1""#, "lon"),
+            (r#"id="1" lat="" lon="12.0" version="1""#, "lat"),
+            (r#"id="1" lat="abc" lon="12.0" version="1""#, "lat"),
+            // `as i32` used to saturate this to i32::MAX.
+            (r#"id="1" lat="1e30" lon="12.0" version="1""#, "lat"),
+            // `as i32` used to map NaN to 0 - Null Island again.
+            (r#"id="1" lat="NaN" lon="12.0" version="1""#, "lat"),
+        ];
+        for (i, (attrs, expect_attr)) in cases.into_iter().enumerate() {
+            let err = parse_single_node(&format!("bad_coords_{i}"), "create", attrs)
+                .err()
+                .unwrap_or_else(|| panic!("must not accept `{attrs}`"));
+            let text = err.to_string();
+            assert!(
+                text.contains("OSC node 1") && text.contains(expect_attr),
+                "error should name the node and the attribute; got: {text}"
+            );
+        }
+    }
+
+    /// Coordinates outside the valid geographic range must be a hard parse
+    /// error, not merely coordinates that overflow `i32`.
+    ///
+    /// `lat="100"` scales to 1_000_000_000 decimicrodegrees, which fits an
+    /// `i32` comfortably, so the representation check alone waves it through
+    /// and the node enters the overlay looking like any other. Nothing
+    /// downstream re-validates it: under `--locations-on-ways` it propagates
+    /// into every way that references it, and the resulting PBF carries a
+    /// latitude no projection can place. This is the same finding as the
+    /// test above, one layer up - the earlier fix closed the fits-in-i32
+    /// case and stopped there.
+    #[test]
+    fn test_out_of_range_coords_are_a_parse_error() {
+        let cases = [
+            (r#"id="1" lat="100.0" lon="12.0" version="1""#, "lat"),
+            (r#"id="1" lat="-90.0000001" lon="12.0" version="1""#, "lat"),
+            (r#"id="1" lat="55.0" lon="200.0" version="1""#, "lon"),
+            (r#"id="1" lat="55.0" lon="-180.0000001" version="1""#, "lon"),
+            // Well inside i32 after scaling, so only a geographic check
+            // catches it. 91 degrees is 910_000_000, an ordinary i32.
+            (r#"id="1" lat="91.0" lon="12.0" version="1""#, "lat"),
+        ];
+        for (i, (attrs, expect_attr)) in cases.into_iter().enumerate() {
+            let err = parse_single_node(&format!("oob_coords_{i}"), "create", attrs)
+                .err()
+                .unwrap_or_else(|| panic!("must not accept `{attrs}`"));
+            let text = err.to_string();
+            assert!(
+                text.contains("OSC node 1") && text.contains(expect_attr),
+                "error should name the node and the attribute; got: {text}"
+            );
+        }
+    }
+
+    /// The counterpart the above test needs in order to mean anything: a node
+    /// genuinely AT 0/0 still parses, and so does one at the representable
+    /// extremes. Rejecting everything would satisfy the test above.
+    #[test]
+    fn test_genuine_null_island_node_still_parses() -> ParseResult<()> {
+        let overlay = parse_single_node(
+            "null_island",
+            "create",
+            r#"id="1" lat="0.0" lon="0.0" version="1""#,
+        )?;
+        let node = overlay.get_node(1).ok_or("node 1 missing")?;
+        assert_eq!((node.decimicro_lat(), node.decimicro_lon()), (0, 0));
+
+        let overlay = parse_single_node(
+            "coord_extremes",
+            "create",
+            r#"id="1" lat="-90.0" lon="180.0" version="1""#,
+        )?;
+        let node = overlay.get_node(1).ok_or("node 1 missing")?;
+        assert_eq!(
+            (node.decimicro_lat(), node.decimicro_lon()),
+            (-900_000_000, 1_800_000_000)
+        );
+        Ok(())
+    }
+
+    /// A `<delete>` node carries no coordinates by design and must keep
+    /// parsing - the coordinate requirement applies to create/modify only.
+    #[test]
+    fn test_delete_node_needs_no_coords() -> ParseResult<()> {
+        let overlay = parse_single_node("delete_no_coords", "delete", r#"id="7" version="3""#)?;
+        assert!(overlay.deleted_nodes.contains(&7));
+        Ok(())
+    }
+
     #[test]
     fn test_empty_overlay() {
         let overlay = CompactDiffOverlay::new();
@@ -685,27 +815,41 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_interner_roundtrip() {
+    fn test_interner_roundtrip() -> ParseResult<()> {
         let mut interner = StringInterner::new();
-        let id_hello = interner.intern("hello");
-        let id_world = interner.intern("world");
-        let id_empty = interner.intern("");
+        let id_hello = interner.intern("hello")?;
+        let id_world = interner.intern("world")?;
+        let id_empty = interner.intern("")?;
 
         assert_eq!(interner.resolve(id_hello), "hello");
         assert_eq!(interner.resolve(id_world), "world");
         assert_eq!(interner.resolve(id_empty), "");
         assert_eq!(id_empty, 0); // empty string is always intern_id 0
+        Ok(())
+    }
+
+    /// `resolve` answers an id it never handed out with the empty string
+    /// rather than panicking out of a read-side accessor mid-iteration.
+    #[test]
+    fn test_interner_resolve_unknown_id() -> ParseResult<()> {
+        let mut interner = StringInterner::new();
+        let known = interner.intern("highway")?;
+        assert_eq!(interner.resolve(known), "highway");
+        assert_eq!(interner.resolve(known + 1), "");
+        assert_eq!(interner.resolve(u32::MAX), "");
+        Ok(())
     }
 
     #[test]
-    fn test_interner_dedup() {
+    fn test_interner_dedup() -> ParseResult<()> {
         let mut interner = StringInterner::new();
-        let id1 = interner.intern("highway");
-        let id2 = interner.intern("highway");
-        let id3 = interner.intern("name");
+        let id1 = interner.intern("highway")?;
+        let id2 = interner.intern("highway")?;
+        let id3 = interner.intern("name")?;
 
         assert_eq!(id1, id2); // same string -> same id
         assert_ne!(id1, id3); // different string -> different id
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -713,10 +857,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_node_roundtrip() {
+    fn test_node_roundtrip() -> ParseResult<()> {
         let mut interner = StringInterner::new();
-        let key_name = interner.intern("name");
-        let key_place = interner.intern("place");
+        let key_name = interner.intern("name")?;
+        let key_place = interner.intern("place")?;
 
         let mut arena = Vec::new();
         let tags: Vec<(u32, &str)> = vec![(key_name, "Test City"), (key_place, "city")];
@@ -727,10 +871,10 @@ mod tests {
             125_700_000,
             &tags,
             &ArenaMeta::default(),
-        );
+        )?;
 
         let node = CompactNodeRef {
-            data: &arena[offset as usize..],
+            data: &arena[offset..],
             interner: &interner,
         };
 
@@ -742,20 +886,21 @@ mod tests {
         let tag_vec: Vec<(&str, &str)> = node.tags().collect();
         assert_eq!(tag_vec[0], ("name", "Test City"));
         assert_eq!(tag_vec[1], ("place", "city"));
+        Ok(())
     }
 
     #[test]
-    fn test_way_roundtrip() {
+    fn test_way_roundtrip() -> ParseResult<()> {
         let mut interner = StringInterner::new();
-        let key_highway = interner.intern("highway");
+        let key_highway = interner.intern("highway")?;
 
         let mut arena = Vec::new();
         let refs = vec![1, 2, 3, 4, 5];
         let tags: Vec<(u32, &str)> = vec![(key_highway, "residential")];
-        let offset = arena_append_way(&mut arena, 99, &refs, &tags, &ArenaMeta::default());
+        let offset = arena_append_way(&mut arena, 99, &refs, &tags, &ArenaMeta::default())?;
 
         let way = CompactWayRef {
-            data: &arena[offset as usize..],
+            data: &arena[offset..],
             interner: &interner,
         };
 
@@ -768,30 +913,29 @@ mod tests {
 
         let tag_vec: Vec<(&str, &str)> = way.tags().collect();
         assert_eq!(tag_vec[0], ("highway", "residential"));
+        Ok(())
     }
 
     #[test]
-    fn test_relation_roundtrip() {
+    fn test_relation_roundtrip() -> ParseResult<()> {
         let mut interner = StringInterner::new();
-        let key_type = interner.intern("type");
-        let role_outer = interner.intern("outer");
-        let role_inner = interner.intern("inner");
+        let key_type = interner.intern("type")?;
+        let role_outer = interner.intern("outer")?;
+        let role_inner = interner.intern("inner")?;
+        let role_empty = interner.intern("")?;
 
         let mut arena = Vec::new();
         let members = vec![
-            (10, member_type_to_byte(MemberType::Way), role_outer),
-            (20, member_type_to_byte(MemberType::Way), role_inner),
-            (
-                30,
-                member_type_to_byte(MemberType::Node),
-                interner.intern(""),
-            ),
+            (10, member_type_to_byte(MemberType::Way)?, role_outer),
+            (20, member_type_to_byte(MemberType::Way)?, role_inner),
+            (30, member_type_to_byte(MemberType::Node)?, role_empty),
         ];
         let tags: Vec<(u32, &str)> = vec![(key_type, "multipolygon")];
-        let offset = arena_append_relation(&mut arena, 500, &members, &tags, &ArenaMeta::default());
+        let offset =
+            arena_append_relation(&mut arena, 500, &members, &tags, &ArenaMeta::default())?;
 
         let rel = CompactRelationRef {
-            data: &arena[offset as usize..],
+            data: &arena[offset..],
             interner: &interner,
         };
 
@@ -806,6 +950,26 @@ mod tests {
 
         let tag_vec: Vec<(&str, &str)> = rel.tags().collect();
         assert_eq!(tag_vec[0], ("type", "multipolygon"));
+        Ok(())
+    }
+
+    /// `MemberType::Unknown` has no faithful single-byte encoding in the
+    /// arena - 0/1/2 are node/way/relation - so it is refused rather than
+    /// stored as some other type.
+    #[test]
+    fn test_member_type_unknown_is_refused() {
+        for value in [3, 1, 257, -1] {
+            let err = member_type_to_byte(MemberType::Unknown(value))
+                .expect_err("Unknown member type must not encode");
+            let text = err.to_string();
+            assert!(
+                text.contains("unknown type value") && text.contains(&value.to_string()),
+                "error should name the rejected type value: {text}"
+            );
+        }
+        assert_eq!(member_type_to_byte(MemberType::Node).ok(), Some(0));
+        assert_eq!(member_type_to_byte(MemberType::Way).ok(), Some(1));
+        assert_eq!(member_type_to_byte(MemberType::Relation).ok(), Some(2));
     }
 
     /// F57: End-to-end test parsing an OSC file with way `<nd>` children

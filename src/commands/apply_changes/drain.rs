@@ -396,12 +396,28 @@ pub(super) fn run_drain(
         Some(ElemKind::Way) => &[ElemKind::Way, ElemKind::Relation][..],
         Some(ElemKind::Relation) => &[ElemKind::Relation][..],
     };
-    let loc_map_ref = state.loc_map.as_deref();
+    // Cloned rather than borrowed from `state`: the trailing loop now takes
+    // `&mut state` for the sortedness guard, so an outstanding `&state`
+    // borrow across it would not compile. The clone is one Arc refcount.
+    let loc_map_owned = state.loc_map.clone();
+    let loc_map_ref = loc_map_owned.as_deref();
     for &kind in types_to_flush {
-        let (cursor, upserts) = state.cursors.get_mut(kind, cfg.ranges);
-        while *cursor < upserts.len() {
+        loop {
+            let (cursor, upserts) = state.cursors.get(kind, cfg.ranges);
+            let Some(&id) = upserts.get(cursor) else {
+                break;
+            };
+            // Trailing creates are a second emission channel: they do not
+            // pass through `dispatch_item`, so without this call the
+            // sortedness guard would be blind to exactly the last thing
+            // written - the same shape of trailing blindness the write
+            // path's stream-completeness check had. A single ID is its own
+            // one-element span. `upserts` is sorted with `osm_id_cmp`, so a
+            // run of trailing creates never trips the guard on its own; a
+            // create ordered before base output already emitted does.
+            check_output_order(&mut state, kind, id, id)?;
             emit_create_for_output(
-                upserts[*cursor],
+                id,
                 kind,
                 cfg.diff,
                 &mut state.bb,
@@ -410,6 +426,7 @@ pub(super) fn run_drain(
                 loc_map_ref,
             )
             .map_err(|e| new_error(ErrorKind::Io(std::io::Error::other(e.to_string()))))?;
+            let (cursor, _) = state.cursors.get_mut(kind, cfg.ranges);
             *cursor += 1;
             counters
                 .trailing_creates_emitted
@@ -457,6 +474,10 @@ struct DrainState {
     /// Set true once the node→way barrier has been crossed and
     /// `loc_map_out` published. Stays true for the rest of the run.
     barrier_done: bool,
+    /// Running (kind, `osm_id_key`) high-water mark across every item
+    /// already dispatched. Drives [`check_output_order`]; see there for
+    /// why this is a running max rather than a pairwise-adjacent check.
+    order_watermark: Option<(ElemKind, (u8, i64), i64)>,
 }
 
 impl DrainState {
@@ -472,8 +493,97 @@ impl DrainState {
             passthrough_chunks: Vec::new(),
             loc_map: None,
             barrier_done: false,
+            order_watermark: None,
         }
     }
+}
+
+/// Ordinal of an element kind in canonical OSM order (nodes, then ways,
+/// then relations). `ElemKind` deliberately does not derive `Ord`, so the
+/// ordering used for the output-sortedness guard is spelled out here
+/// rather than inherited from a derive that could be reordered.
+fn kind_ordinal(kind: ElemKind) -> u8 {
+    match kind {
+        ElemKind::Node => 0,
+        ElemKind::Way => 1,
+        ElemKind::Relation => 2,
+    }
+}
+
+fn kind_name(kind: ElemKind) -> &'static str {
+    match kind {
+        ElemKind::Node => "node",
+        ElemKind::Way => "way",
+        ElemKind::Relation => "relation",
+    }
+}
+
+/// Refuse to emit an out-of-order blob into a file whose header stamps
+/// `Sort.Type_then_ID`.
+///
+/// `build_header_bytes` writes `hb.sorted()` unconditionally, and it gates
+/// on the *base* header's `is_sorted()` - but a header can lie (`degrade
+/// --unsort` exists precisely to produce such files), and a pipeline bug
+/// can misplace a create even when the base is honestly sorted. Either way
+/// the failure mode is the worst shape available in this domain: a file
+/// that claims an ordering it does not have, which every downstream
+/// consumer then trusts. So the drain checks what it actually emits.
+///
+/// The comparison is against a running high-water mark, not against the
+/// immediately-previous item: a pairwise-adjacent check passes on the
+/// sequence `10..30, 5..8, 40..50` because each *adjacent* pair looks fine
+/// only if you forget 30. This mirrors the transitive overlap detection
+/// `sort` and `cat --dedupe` already use.
+///
+/// The bound compared is the blob's OSM-order *first* id, via
+/// `osm_id_key`, so negative IDs (0, -1, -2, ..., 1, 2, ...) order the
+/// same way `osm_id_cmp` orders them everywhere else. Equality is allowed
+/// through: a shared boundary ID between two blobs is a duplicate-ID
+/// problem, not an ordering one, and is not this guard's business.
+fn check_output_order(
+    state: &mut DrainState,
+    kind: ElemKind,
+    min_id: i64,
+    max_id: i64,
+) -> Result<()> {
+    let first_id = crate::osm_id::blob_osm_first_id(min_id, max_id);
+    let last_id = crate::osm_id::blob_osm_last_id(min_id, max_id);
+    let first_key = crate::osm_id::osm_id_key(first_id);
+    let last_key = crate::osm_id::osm_id_key(last_id);
+
+    let mut watermark = (kind, last_key, last_id);
+    if let Some((prev_kind, prev_key, prev_id)) = state.order_watermark {
+        let prev_ord = kind_ordinal(prev_kind);
+        let this_ord = kind_ordinal(kind);
+        if this_ord < prev_ord {
+            return Err(new_error(ErrorKind::Io(std::io::Error::other(format!(
+                "apply-changes: refusing to write an unsorted PBF under a Sort.Type_then_ID \
+                 header - a {} blob follows a {} blob. The base PBF's header claims \
+                 Sort.Type_then_ID but its blobs are not in canonical order; re-sort it \
+                 first with `pbfhogg sort`.",
+                kind_name(kind),
+                kind_name(prev_kind),
+            )))));
+        }
+        if this_ord == prev_ord {
+            if first_key < prev_key {
+                return Err(new_error(ErrorKind::Io(std::io::Error::other(format!(
+                    "apply-changes: refusing to write an unsorted PBF under a \
+                     Sort.Type_then_ID header - a {} blob starting at id {first_id} follows \
+                     {} output already reaching id {prev_id}. The base PBF's header claims \
+                     Sort.Type_then_ID but its blobs are not in canonical order; re-sort it \
+                     first with `pbfhogg sort`.",
+                    kind_name(kind),
+                    kind_name(prev_kind),
+                )))));
+            }
+            if prev_key > last_key {
+                watermark = (kind, prev_key, prev_id);
+            }
+        }
+    }
+    state.order_watermark = Some(watermark);
+    Ok(())
 }
 
 /// Handle a type transition (`prev != item_kind`). Flushes coalescers,
@@ -586,6 +696,10 @@ fn process_item(
     // upsert of `item_kind` as a gap-create. The dispatch below still writes
     // the rewritten blob; trailing-creates picks up any legitimate upserts.
     if min_id <= max_id {
+        // Sortedness guard runs on the same non-sentinel condition as
+        // gap-creates: the reversed sentinel `(i64::MAX, i64::MIN)` names
+        // no real ID span, so it carries no ordering claim.
+        check_output_order(state, item_kind, min_id, max_id)?;
         let osm_first = crate::osm_id::blob_osm_first_id(min_id, max_id);
         handle_gap_creates(item_kind, osm_first, cfg, state, writer, stats, counters)?;
     }

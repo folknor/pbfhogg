@@ -412,6 +412,41 @@ look on the consumer side:
 
 Deltas between markers are unchanged, so `--durations` output is unaffected.
 
+## Cross-repo: `brokkr verify` cannot reach the sequential diff path (2026-08-20)
+
+`brokkr verify diff` (and `verify all`, which includes it) runs `pbfhogg
+diff` with no `-j`, so it always exercises the DEFAULT parallel path.
+brokkr's verify surface exposes no `-j` at all. Consequence: the sequential
+block-pair merge in `src/osc/merge_join.rs` is never cross-validated against
+real Denmark indexdata by any verify run. Everything it does that the
+parallel path does not - `check_claimed_max`, the `osm_id_cmp` merge
+boundary and non-overlap tests, the residual bookkeeping in
+`merge_decoded_pair` - is covered only by synthetic fixtures in
+`tests/cli_merge_join_trust.rs` and `tests/cli_diff.rs`.
+
+This is not hypothetical. The two paths genuinely disagreed until
+2026-08-20: on a PBF whose header stamps `Sort.Type_then_ID` while its blobs
+are not in canonical order, `pbfhogg diff` returned exit 2 with "blobs are
+not in canonical order" at `-j 1` and exit 0 with "Files are identical" at
+the default `-j`. Both now refuse, but the episode is the argument: a
+divergence between the two paths is exactly the class of defect a verify
+oracle should catch, and the oracle could only ever see one of them. The
+suite's own seq-vs-parallel parity test could not see it either, because its
+fixture generator can only emit canonically-ordered blobs.
+
+Two things would close it, and they are independent:
+
+- **brokkr side.** Add a `-j` (or a `--variant seq`) to `brokkr verify
+  <cmd>`, so `verify diff` can be run once per path and the osmium/osmosis
+  oracle adjudicates both. This is the higher-value half: it turns "the two
+  paths agree" from a unit-test assertion into a real-data one.
+- **pbfhogg side.** Nothing is blocked on brokkr. A tier-2 test that runs
+  both paths over the Denmark fixture and asserts byte-identical output
+  would cover most of the same ground without touching another repo.
+
+Until one of them lands, treat a green `brokkr verify all` as evidence about
+the parallel diff path only.
+
 ## Item/command-specific plans
 
 Three new docs capturing a cross-cutting insight and two new commands that fall out of it. All scaffolding-level; details drift as work lands.

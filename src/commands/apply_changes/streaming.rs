@@ -526,7 +526,34 @@ fn handle_candidate(
         flush_local_coords(slot, local_coords);
     }
 
-    if !overlaps {
+    // On the --force path the scanner fills `desc` with a placeholder
+    // `kind=Node` and `id_range=None` because it can't distinguish blob
+    // kinds without decompressing. Recover both from the parsed block so
+    // the drain credits `base_*` on the real kind, the rewrite slice
+    // lookup and create dispatch see correct values, and type-transition
+    // logic doesn't fire spurious Way->Node/Relation->Node flushes that
+    // would drain remaining upserts as trailing creates. Indexed
+    // descriptors carry authoritative values already (the scanner sets
+    // `id_range` exactly when `index` is present).
+    let (effective_kind, effective_min_id, effective_max_id) = match desc.id_range {
+        Some((min, max)) => (desc.kind, min, max),
+        None => infer_kind_and_range(&block),
+    };
+    let inline_upserts = upsert_slice(ranges, effective_kind, effective_min_id, effective_max_id);
+
+    // Passthrough is only sound when the blob needs no edit AND no create
+    // lands inside its ID span. `block_overlaps_diff` answers the first
+    // question only: a pure create whose ID falls in the blob's interior
+    // matches no base element, so `overlaps` is false while
+    // `inline_upserts` is non-empty. Shipping the blob verbatim then
+    // leaves that create to the *next* blob's gap-create pass (or to the
+    // type transition), i.e. emitted after larger IDs - and
+    // `build_header_bytes` stamps `Sort.Type_then_ID` unconditionally, so
+    // the result is a PBF that claims an ordering it does not have.
+    // Forcing the rewrite lets `rewrite_block_parallel` interleave the
+    // create at its sorted position and lets the drain advance the upsert
+    // cursor past this blob's range.
+    if !overlaps && inline_upserts.is_empty() {
         counters
             .blobs_false_positive
             .fetch_add(1, Ordering::Relaxed);
@@ -539,20 +566,7 @@ fn handle_candidate(
             .index
             .as_ref()
             .map_or_else(|| count_block_elements(&block), |i| i.count);
-        // On the --force path the scanner fills `desc` with a
-        // placeholder `kind=Node` and `id_range=None` because it can't
-        // distinguish blob kinds without decompressing. Recover both
-        // from the parsed block so the drain credits `base_*` on the
-        // real kind and type-transition logic doesn't fire spurious
-        // Way->Node/Relation->Node flushes that would drain remaining
-        // upserts as trailing creates. Indexed descriptors carry
-        // authoritative values already.
-        let (effective_kind, effective_id_range) = if desc.index.is_some() {
-            (desc.kind, desc.id_range.unwrap_or((0, 0)))
-        } else {
-            let (k, min_id, max_id) = infer_kind_and_range(&block);
-            (k, (min_id, max_id))
-        };
+        let effective_id_range = (effective_min_id, effective_max_id);
         if use_copy_range {
             let mut patched = desc.clone();
             patched.kind = effective_kind;
@@ -578,23 +592,6 @@ fn handle_candidate(
             Some((effective_kind, effective_id_range)),
         );
     }
-
-    // For indexed blobs, trust the indexdata-derived kind + range. For
-    // non-indexed blobs (the --force path), the scanner had to emit a
-    // placeholder `kind=Node` with `id_range=None` because it walks
-    // headers only; recover the true kind + range from the parsed block
-    // so the rewrite slice lookup, create dispatch, and the drain's
-    // cursor advancement (`drain.rs::dispatch_variant` Rewritten arm)
-    // and type-transition routing all see correct values. Without this,
-    // non-indexed blobs emit `DrainItem::Rewritten { id_range: (0, 0) }`
-    // and the drain never advances its per-kind upsert cursor, so
-    // upserts already handled inline (modifies to base elements) get
-    // re-emitted as trailing creates at end-of-stream.
-    let (effective_kind, effective_min_id, effective_max_id) = match desc.id_range {
-        Some((min, max)) => (desc.kind, min, max),
-        None => infer_kind_and_range(&block),
-    };
-    let inline_upserts = upsert_slice(ranges, effective_kind, effective_min_id, effective_max_id);
 
     // The drain publishes `loc_map` at the node→way barrier; for
     // way/relation blobs after the barrier, read it via the shared

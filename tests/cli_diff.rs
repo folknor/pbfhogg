@@ -1609,6 +1609,17 @@ fn diff_block_pair_covers_all_four_branches() {
     assert_eq!(stats.created, 10, "blob-new-C BlobNewOnly");
 }
 
+/// Seq-vs-parallel parity on an honestly-sorted multi-blob pair.
+///
+/// **This fixture proves less than the test name suggests, by construction.**
+/// `write_multi_block_test_pbf` can only emit blobs in canonical order, and
+/// the two paths agree trivially on such input - which is why this test
+/// passed throughout the entire period when `diff` returned exit 0 "Files
+/// are identical" at the default `-j` and exit 2 "blobs are not in canonical
+/// order" at `-j 1`, on the same pair of files. The parity case with real
+/// power needs a fixture laid out in an order this helper cannot produce,
+/// and lives in `tests/cli_merge_join_trust.rs`. Keep this one for the
+/// ordinary path; do not read it as covering seq-vs-parallel generally.
 #[test]
 fn diff_block_pair_parallel_matches_sequential_on_multi_blob() {
     let dir = TempDir::new().expect("tempdir");

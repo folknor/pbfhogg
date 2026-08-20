@@ -76,3 +76,58 @@ pub(crate) fn blob_osm_first_id(min_id: i64, max_id: i64) -> i64 {
         0
     }
 }
+
+/// The ID of the "last" element of a blob in OSM sort order.
+///
+/// Mirror of [`blob_osm_first_id`]: for positive-only blobs this is
+/// `max_id`, for negative-only blobs `min_id` (furthest from 0), and for
+/// mixed-sign blobs `max_id` (the positives sort last). Kept id-valued
+/// rather than key-valued so error messages can name a real OSM ID.
+#[inline]
+pub(crate) fn blob_osm_last_id(min_id: i64, max_id: i64) -> i64 {
+    if max_id <= 0 && min_id < 0 {
+        min_id
+    } else {
+        max_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The id-valued and key-valued blob-bound helpers must agree: callers
+    /// mix them (an error message names the ID while the comparison uses the
+    /// key), and a disagreement would put the two on different elements.
+    /// Covers positive-only, negative-only, mixed-sign and degenerate spans.
+    #[test]
+    fn blob_bound_id_and_key_helpers_agree() {
+        let spans = [
+            (1_i64, 100_i64),
+            (0, 0),
+            (0, 100),
+            (-100, -1),
+            (-100, 0),
+            (-100, 100),
+            (5, 5),
+            (-5, -5),
+            (i64::MIN + 1, i64::MAX),
+        ];
+        for (min_id, max_id) in spans {
+            assert_eq!(
+                osm_id_key(blob_osm_first_id(min_id, max_id)),
+                blob_osm_first_key(min_id, max_id),
+                "first bound disagrees for span ({min_id}, {max_id})"
+            );
+            assert_eq!(
+                osm_id_key(blob_osm_last_id(min_id, max_id)),
+                blob_osm_last_key(min_id, max_id),
+                "last bound disagrees for span ({min_id}, {max_id})"
+            );
+            assert!(
+                blob_osm_first_key(min_id, max_id) <= blob_osm_last_key(min_id, max_id),
+                "first must not sort after last for span ({min_id}, {max_id})"
+            );
+        }
+    }
+}

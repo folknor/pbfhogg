@@ -98,6 +98,62 @@
   had been moved into the writer thread, so that path hit an `expect`. The
   doc has been corrected and the panic replaced with an `io::Error`.
 
+- **An OSC `<node>` in a `<create>` or `<modify>` section must now carry
+  usable `lat` and `lon`.** A missing, empty, unparsable, out-of-range or
+  non-finite coordinate used to be accepted and stored at exactly (0, 0).
+  That is a real coordinate in the Gulf of Guinea, so the corrupted node was
+  indistinguishable from a genuine one, and under `--locations-on-ways` the
+  (0, 0) propagated into every way referencing it. Such a node is now a parse
+  error naming the node ID and the attribute. Nodes genuinely at 0/0 are
+  unaffected, and `<delete>` nodes still need no coordinates.
+
+  "Out of range" means the geographic range, not merely what fits an `i32`
+  after scaling to decimicrodegrees. `lat="100"` scales to 1_000_000_000,
+  which an `i32` holds comfortably, so a representation check alone accepted
+  it. Latitude must now be within -90 to 90 and longitude within -180 to 180,
+  inclusive, checked before the cast so the conversion is exact rather than
+  saturating.
+
+- **A relation member of an unknown type is now refused rather than written
+  to OSC as `type="node"`.** The substitution produced well-formed OSC in
+  which the member pointed at a different object - node 42 instead of
+  unknown-type 42 - which nothing downstream could detect. `derive-changes`,
+  `diff --format osc` and the compact OSC overlay all error instead, matching
+  the treatment the PBF write path already gives an unknown member type.
+
+- **`apply-changes` refuses to write an unsorted PBF under a
+  `Sort.Type_then_ID` header.** It stamps that header unconditionally while
+  gating only on the *base* header's claim, and a header can lie (`degrade
+  --unsort` produces such files). The output is now checked as it is written,
+  against a running high-water mark in canonical OSM ID order.
+
+- **`diff` and `derive-changes` reject an input whose blobs contradict its
+  sorted header.** A blob of an earlier element kind turning up after that
+  kind's phase had ended used to be skipped, discarding it and every element
+  in it silently; a mixed-type block had its other-kind elements consumed by
+  whichever phase read it first and lost. Both now error.
+
+  Both the sequential and the parallel path enforce this, and they needed
+  separate work. The sequential path walks blobs in file order and sees the
+  disorder structurally; the parallel planner buckets every blob by kind
+  before any ordering is examined, so file order never reached it. Until both
+  were closed, `pbfhogg diff` on the same pair of files answered "blobs are
+  not in canonical order" with exit 2 at `-j 1` and "Files are identical"
+  with exit 0 at the default `-j`. The parallel walk now additionally rejects
+  a per-kind blob list whose ID spans go backwards - a layout its own
+  sharding assumes cannot occur.
+
+- **`diff` and `derive-changes` reject a blob whose stored `max_id`
+  understates its contents.** The block-pair merge takes its merge boundary
+  from the two blobs' claimed last IDs; a short claim put the boundary
+  mid-block and dropped the rest of that block, silently, with no count
+  anomaly - the count that would have disagreed comes from the same wrong
+  metadata. The residual decision is now made from what the element walk
+  actually saw, and a claim contradicting the block is an error naming the
+  file. Per ADR-0013 this needs no new flag: the merge no longer sizes
+  anything from metadata, so it stops needing the trust rather than gating
+  it.
+
 ### Added
 
 - **`pbfhogg::write::emit_writer_counters()`.** Publishes the `writer_*`
@@ -189,6 +245,44 @@
   must be left untouched.
 
 ### Fixed
+
+- **`apply-changes` no longer emits an out-of-order create.** A pure create
+  whose ID fell inside a base blob's ID span matched no element in that blob,
+  so the precise overlap check called the blob a false positive and shipped it
+  verbatim - leaving the create to be emitted after larger IDs, in a file
+  whose header stamps `Sort.Type_then_ID`. A blob is now rewritten whenever an
+  upsert lands in its range, and the create is interleaved at its sorted
+  position. Base 10/20/30 with creates 5/15/35 produced `5, 10, 20, 30, 15, 35`
+  and now produces `5, 10, 15, 20, 30, 35`.
+
+- **Zero-valued element metadata survives into derived OSC.** The writer
+  emitted `version`, `changeset` and `uid` only when positive, so `uid="0"` -
+  the anonymous mapper that old OSM data is full of - and a zero changeset
+  vanished; when every field was zero the element shipped with no metadata
+  attributes at all, and applying it back produced a PBF element with no info
+  block. Presence, not truthiness, now decides. This closes the gap in the
+  `--format osc` lossless-roundtrip guarantee at those margins.
+
+  The same guarantee now holds for an element whose `Info` omits `version`
+  entirely. Every `Info` field is independently optional on the wire, but the
+  three borrowed writers emitted metadata only when `version` was present, so
+  a valid element carrying a timestamp, changeset, uid or user but no version
+  lost all of it. Each field is now emitted on its own presence.
+
+- **`apply-changes` checks trailing creates for ordering too.** Creates
+  emitted after the last base blob go through a second output channel that
+  the sortedness guard did not cover, leaving it blind to exactly the last
+  thing written.
+
+- **The compact OSC overlay no longer truncates arena offsets to 32 bits.**
+  Per-kind arena offsets were stored as `u32`; past 4 GiB in one arena - about
+  85 M node changes, reachable on a catch-up diff or a multi-OSC accumulation -
+  the offset wrapped and the index pointed at an arbitrary earlier record, so
+  `apply-changes` wrote one element's data under another's ID. Offsets are now
+  `usize` (no size cost: both are 16 bytes after padding in the index map), and
+  the remaining `u32` fields in the record layout - tag/ref/member counts, tag
+  value lengths, and the string interner's offsets, lengths and IDs - error on
+  overflow instead of truncating.
 
 - **A zero-length block can no longer produce a `Blob` message with no fields
   at all.** The payload field (`raw`, `zlib_data`, or `zstd_data`) was written

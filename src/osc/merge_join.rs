@@ -84,9 +84,10 @@ impl StreamingBlocks {
 /// Fill `buffer` with owned elements of type `T` from the next matching block.
 ///
 /// Uses [`BlockType`] as a fast path (1-byte classification, no element parsing)
-/// to skip blocks of the wrong type. `Mixed` and `Empty` blocks always fall
-/// through to element-level conversion - mandatory for safety with malformed
-/// files that claim `Sort.Type_then_ID` but have mixed blocks.
+/// to skip blocks of the wrong type. `Mixed` and `Empty` blocks fall through to
+/// element-level conversion, which is where a file claiming `Sort.Type_then_ID`
+/// while carrying mixed blocks is caught: a mixed block is an error, because
+/// consuming it here would discard its other-kind elements for good.
 ///
 /// When a non-matching block is encountered, it is stashed for the next phase.
 /// Returns `true` if elements were added to the buffer, `false` if the phase
@@ -125,21 +126,25 @@ fn fill_buffer<T>(
             }
         }
 
-        // If we saw wrong-type elements in a Mixed block but also got some
-        // matching elements, we consumed the matching ones. The wrong-type
-        // elements are lost - but in a properly sorted PBF this never happens
-        // (blocks are single-type). For truly mixed blocks, this is acceptable
-        // lossy behavior consistent with requiring sorted input.
+        // A wrong-type element in a block this phase consumed is an element
+        // that leaves the stream entirely: the block is gone by the time the
+        // later phase for its kind runs, and a partially-consumed block
+        // cannot be stashed. This used to be waved through with a comment
+        // calling it "acceptable lossy behavior", which made a mixed block
+        // silently shorten the diff. Sorted input is a documented
+        // precondition of this merge, so a mixed block means the input does
+        // not meet it - say so rather than quietly dropping elements.
+        if wrong_type_seen {
+            return Err(
+                "streaming merge-join: input contains a mixed-type block, so elements \
+                        of a later type would be consumed and discarded by an earlier phase. \
+                        This merge requires Sort.Type_then_ID input with one element type per \
+                        block; re-sort the file first with `pbfhogg sort`."
+                    .into(),
+            );
+        }
 
         if buffer.is_empty() {
-            // Empty block or all elements were wrong type - skip and try next.
-            if wrong_type_seen {
-                // We consumed the block but got nothing. The wrong-type elements
-                // are from a later phase, but we can't stash a partially consumed
-                // block. This only happens with malformed Mixed blocks in
-                // nominally sorted PBFs. Continue to the next block.
-                continue;
-            }
             // Truly empty block - keep going.
             continue;
         }
@@ -591,7 +596,22 @@ fn next_blob_for_kind(
                 *stash = Some(blob);
                 return Ok(None);
             }
-            continue;
+            // An EARLIER kind at this point cannot be reached on sorted
+            // input: the phase for that kind ran first and drained every
+            // blob of it before stopping at the first later-kind blob. So
+            // reaching here means the file's header claims
+            // Sort.Type_then_ID while its blobs are not in canonical order -
+            // exactly what `degrade --unsort` produces. This used to
+            // `continue`, which discarded the blob and every element in it
+            // for the rest of the run, with no error and no count anomaly.
+            return Err(format!(
+                "block-pair merge: found a {} blob during the {} phase. The input's header \
+                 claims Sort.Type_then_ID but its blobs are not in canonical order \
+                 (nodes, then ways, then relations); re-sort it first with `pbfhogg sort`.",
+                kind_name(index.kind),
+                kind_name(kind),
+            )
+            .into());
         }
         return Ok(Some(PendingBlob { blob, index }));
     }
@@ -625,6 +645,85 @@ fn kind_order(kind: ElemKind) -> u8 {
         ElemKind::Node => 0,
         ElemKind::Way => 1,
         ElemKind::Relation => 2,
+    }
+}
+
+/// Human-readable name for an `ElemKind`, for error messages.
+fn kind_name(kind: ElemKind) -> &'static str {
+    match kind {
+        ElemKind::Node => "node",
+        ElemKind::Way => "way",
+        ElemKind::Relation => "relation",
+    }
+}
+
+/// Running canonical-order check over one file's blob sequence, in FILE
+/// order.
+///
+/// The sequential block-pair merge discovers a mis-ordered file structurally:
+/// it walks blobs in file order, so an earlier-kind blob turning up after
+/// that kind's phase closed is unmissable ([`next_blob_for_kind`]). The
+/// parallel planners cannot discover it that way, because `walk_file`
+/// buckets every blob by kind before any ordering is looked at - file order
+/// never reaches them. That asymmetry made `diff` answer differently
+/// depending on `-j`: `-j 1` refused the file while the default `-j`
+/// reported "Files are identical", on the same pair of inputs.
+///
+/// Sorted blob order is also a precondition of the shard planners
+/// themselves, which binary-search each per-kind list assuming it ascends.
+/// So this is not only about agreeing with the sequential path; an
+/// unsorted bucket is an input the planner has no defined answer for.
+///
+/// Both checks use `osm_id` blob-range keys, not raw `i64`, so negative IDs
+/// order the way `osm_id_cmp` orders them everywhere else.
+pub(crate) struct BlobOrderGuard {
+    prev: Option<(ElemKind, (u8, i64))>,
+}
+
+impl BlobOrderGuard {
+    pub(crate) fn new() -> Self {
+        Self { prev: None }
+    }
+
+    /// Observe the next blob in file order. Returns the error message a
+    /// caller should surface, or `Ok(())`.
+    pub(crate) fn observe(&mut self, index: &crate::blob_meta::BlobIndex) -> Result<(), String> {
+        let first_key = crate::osm_id::blob_osm_first_key(index.min_id, index.max_id);
+        let last_key = crate::osm_id::blob_osm_last_key(index.min_id, index.max_id);
+        // Transitive watermark, not the immediately-previous blob: the
+        // sequence 10..30, 5..8, 40..50 passes every adjacent-pair test
+        // only if you forget 30. Same shape as the drain's output guard.
+        let mut watermark = last_key.max(first_key);
+        if let Some((prev_kind, prev_last)) = self.prev {
+            let prev_ord = kind_order(prev_kind);
+            let this_ord = kind_order(index.kind);
+            if this_ord < prev_ord {
+                return Err(format!(
+                    "block-pair merge: found a {} blob after a {} blob. The input's header \
+                     claims Sort.Type_then_ID but its blobs are not in canonical order \
+                     (nodes, then ways, then relations); re-sort it first with `pbfhogg sort`.",
+                    kind_name(index.kind),
+                    kind_name(prev_kind),
+                ));
+            }
+            if this_ord == prev_ord && first_key < prev_last {
+                return Err(format!(
+                    "block-pair merge: a {} blob starting at id {} follows a {} blob \
+                     already reaching id {}. The input's header claims Sort.Type_then_ID \
+                     but its blobs are not in canonical order; re-sort it first with \
+                     `pbfhogg sort`.",
+                    kind_name(index.kind),
+                    crate::osm_id::blob_osm_first_id(index.min_id, index.max_id),
+                    kind_name(prev_kind),
+                    prev_last.1,
+                ));
+            }
+            if this_ord == prev_ord {
+                watermark = watermark.max(prev_last);
+            }
+        }
+        self.prev = Some((index.kind, watermark));
+        Ok(())
     }
 }
 
@@ -789,8 +888,21 @@ fn merge_decoded_pair(
     let mut os = old_decoded.take().expect("checked Some");
     let mut ns = new_decoded.take().expect("checked Some");
 
-    let merge_up_to = os.index.max_id.min(ns.index.max_id);
-    let (old_consumed, new_consumed) = element_merge_pair(
+    // The merge boundary is the earlier of the two blobs' OSM-order last
+    // IDs. `osm_id_cmp` (not raw `i64` order) throughout, because the merge
+    // itself orders by `osm_id_cmp`: for negative IDs, which `osm_id.rs`
+    // explicitly supports as 0, -1, -2, ..., 1, 2, ..., a raw `min` picks a
+    // boundary that cuts the streams in a different place than the order
+    // they are being merged in.
+    let old_last = blob_last(&os.index);
+    let new_last = blob_last(&ns.index);
+    let merge_up_to = if crate::osm_id::osm_id_cmp(old_last, new_last).is_le() {
+        old_last
+    } else {
+        new_last
+    };
+
+    let outcome = element_merge_pair(
         &os.block,
         os.skip_count,
         &ns.block,
@@ -800,13 +912,71 @@ fn merge_decoded_pair(
         on_action,
     )?;
 
-    if os.index.max_id > merge_up_to {
-        os.skip_count += old_consumed;
+    // ADR-0013: metadata is trusted by default, but nothing load-bearing may
+    // break when it turns out to be wrong. The residual decision below is
+    // "does this blob still hold elements past the boundary", and asking
+    // `index.max_id` is only a proxy for it. When a blob's stored `max_id`
+    // understates its real contents, the proxy says "finished" while the
+    // block still holds elements - and the block is then dropped, taking
+    // them with it, with no error and no infinite loop to notice. Compare
+    // the proxy against what the iterator actually saw, and reject the
+    // mismatch instead of losing elements to it.
+    check_claimed_max(&os.index, outcome.old_has_more, merge_up_to, "old")?;
+    check_claimed_max(&ns.index, outcome.new_has_more, merge_up_to, "new")?;
+
+    if outcome.old_has_more {
+        os.skip_count += outcome.old_consumed;
         *old_decoded = Some(os);
     }
-    if ns.index.max_id > merge_up_to {
-        ns.skip_count += new_consumed;
+    if outcome.new_has_more {
+        ns.skip_count += outcome.new_consumed;
         *new_decoded = Some(ns);
+    }
+    Ok(())
+}
+
+/// The OSM-order last ID a blob's index claims to cover.
+fn blob_last(index: &crate::blob_meta::BlobIndex) -> i64 {
+    crate::osm_id::blob_osm_last_id(index.min_id, index.max_id)
+}
+
+/// True when blob `a` ends, in OSM order, strictly before blob `b` begins -
+/// i.e. the two ID spans do not overlap and `a` comes first.
+///
+/// Uses the `osm_id` blob-range keys rather than raw `max_id < min_id`, so
+/// the non-overlap test agrees with the order the elements are merged in.
+fn blob_entirely_before(a: &crate::blob_meta::BlobIndex, b: &crate::blob_meta::BlobIndex) -> bool {
+    crate::osm_id::blob_osm_last_key(a.min_id, a.max_id)
+        < crate::osm_id::blob_osm_first_key(b.min_id, b.max_id)
+}
+
+/// Verify a blob's stored `max_id` against what the element walk found.
+///
+/// `has_more` true means the block still holds elements past `merge_up_to`.
+/// If the blob's own claimed last ID is at or before the boundary, the
+/// stored metadata contradicts the block's contents. Erroring here is also
+/// what keeps [`merge_decoded_pair`] from looping: a side is only retained
+/// as a residual when it genuinely has more, and the boundary is the earlier
+/// of the two claimed lasts, so both sides retaining would require both
+/// claims to be understated - which this rejects.
+fn check_claimed_max(
+    index: &crate::blob_meta::BlobIndex,
+    has_more: bool,
+    merge_up_to: i64,
+    side: &str,
+) -> BoxResult<()> {
+    if !has_more {
+        return Ok(());
+    }
+    let claimed_last = blob_last(index);
+    if crate::osm_id::osm_id_cmp(claimed_last, merge_up_to).is_le() {
+        return Err(format!(
+            "block-pair merge: the {side} blob's indexdata claims its last ID is \
+             {claimed_last}, but the block still holds elements past the merge boundary \
+             {merge_up_to}. The stored blob metadata does not match the blob's contents; \
+             re-generate the file's indexdata (for example with `pbfhogg cat`)."
+        )
+        .into());
     }
     Ok(())
 }
@@ -865,7 +1035,7 @@ pub(crate) fn block_pair_merge_phase(
                     break;
                 }
                 (Some(op), Some(np)) => {
-                    if op.index.max_id < np.index.min_id {
+                    if blob_entirely_before(&op.index, &np.index) {
                         let os = decode_pending(
                             op,
                             &mut state.old_buf,
@@ -877,7 +1047,7 @@ pub(crate) fn block_pair_merge_phase(
                         state.new_stash = Some(np.blob);
                         continue;
                     }
-                    if np.index.max_id < op.index.min_id {
+                    if blob_entirely_before(&np.index, &op.index) {
                         let ns = decode_pending(
                             np,
                             &mut state.new_buf,
@@ -947,12 +1117,12 @@ pub(crate) fn block_pair_merge_phase(
                 emit_block(&ns, false, on_action, &mut state.stats)?;
             }
             (Some(os), Some(ns)) => {
-                if os.index.max_id < ns.index.min_id {
+                if blob_entirely_before(&os.index, &ns.index) {
                     let os = old_decoded.take().expect("checked");
                     emit_block(&os, true, on_action, &mut state.stats)?;
                     continue;
                 }
-                if ns.index.max_id < os.index.min_id {
+                if blob_entirely_before(&ns.index, &os.index) {
                     let ns = new_decoded.take().expect("checked");
                     emit_block(&ns, false, on_action, &mut state.stats)?;
                     continue;
@@ -982,8 +1152,9 @@ fn blobs_byte_equal(a: &PendingBlob, b: &PendingBlob) -> bool {
 /// Processes elements up to `merge_up_to` ID (inclusive). Elements beyond that
 /// boundary in either block are left unconsumed for the caller to handle.
 ///
-/// Returns `(old_consumed, new_consumed)` - the number of elements consumed
-/// from each side, so the caller can update skip counts without re-scanning.
+/// Returns a [`MergePairOutcome`] - how many elements were consumed from each
+/// side, so the caller can update skip counts without re-scanning, and whether
+/// either side still holds elements past the boundary.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn element_merge_pair(
     old_block: &PrimitiveBlock,
@@ -993,19 +1164,20 @@ fn element_merge_pair(
     merge_up_to: i64,
     type_char: char,
     on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> BoxResult<()>,
-) -> BoxResult<(usize, usize)> {
+) -> BoxResult<MergePairOutcome> {
     let mut old_iter = old_block.elements().skip(old_skip).peekable();
     let mut new_iter = new_block.elements().skip(new_skip).peekable();
     let mut old_consumed: usize = 0;
     let mut new_consumed: usize = 0;
 
     loop {
-        let old_in_range = old_iter
-            .peek()
-            .is_some_and(|e| element_id(e) <= merge_up_to);
-        let new_in_range = new_iter
-            .peek()
-            .is_some_and(|e| element_id(e) <= merge_up_to);
+        // `osm_id_cmp`, not raw `<=`: every ordering decision below already
+        // uses it, and for negative IDs the two disagree - a raw boundary
+        // test would cut the streams somewhere the merge order does not.
+        let in_range =
+            |e: &Element<'_>| crate::osm_id::osm_id_cmp(element_id(e), merge_up_to).is_le();
+        let old_in_range = old_iter.peek().is_some_and(in_range);
+        let new_in_range = new_iter.peek().is_some_and(in_range);
 
         match (old_in_range, new_in_range) {
             (false, false) => break,
@@ -1054,5 +1226,22 @@ fn element_merge_pair(
         }
     }
 
-    Ok((old_consumed, new_consumed))
+    Ok(MergePairOutcome {
+        old_consumed,
+        new_consumed,
+        old_has_more: old_iter.peek().is_some(),
+        new_has_more: new_iter.peek().is_some(),
+    })
+}
+
+/// What one [`element_merge_pair`] call did, and what it left behind.
+///
+/// `*_has_more` is what the iterator actually observed, not what the blob's
+/// indexdata claims. The residual decision is made from these, so an
+/// understated `max_id` cannot silently drop a block's tail.
+struct MergePairOutcome {
+    old_consumed: usize,
+    new_consumed: usize,
+    old_has_more: bool,
+    new_has_more: bool,
 }

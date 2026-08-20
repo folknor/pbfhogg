@@ -20,6 +20,15 @@ pub(super) struct StringInterner {
     lookup: FxHashMap<String, u32>,
 }
 
+fn interner_overflow(what: &str) -> Box<dyn std::error::Error> {
+    format!(
+        "OSC string interner overflowed: more than {} {what}. The overlay cannot address \
+         them without silently aliasing one string onto another",
+        u32::MAX
+    )
+    .into()
+}
+
 impl StringInterner {
     pub(super) fn new() -> Self {
         let mut interner = Self {
@@ -35,25 +44,51 @@ impl StringInterner {
 
     /// Intern a string, returning its unique ID. Deduplicates: if the string
     /// was already interned, returns the existing ID without allocating.
-    #[allow(clippy::cast_possible_truncation)]
-    pub(super) fn intern(&mut self, s: &str) -> u32 {
+    ///
+    /// Errors rather than truncating when the flat buffer, the string, or
+    /// the id space would overflow `u32`. All three are `u32` in the table
+    /// layout; an `as u32` on any of them hands back an id whose `(offset,
+    /// len)` names some earlier string's bytes, which then silently
+    /// substitutes one tag key, member role or user name for another.
+    /// Widening the table instead would double its memory for a limit that
+    /// only distinct strings can reach, so the cliff is refused, not moved.
+    pub(super) fn intern(&mut self, s: &str) -> super::ParseResult<u32> {
         if let Some(&id) = self.lookup.get(s) {
-            return id;
+            return Ok(id);
         }
-        let offset = self.data.len() as u32;
-        let len = s.len() as u32;
+        let offset =
+            u32::try_from(self.data.len()).map_err(|_| interner_overflow("string bytes"))?;
+        let len = u32::try_from(s.len()).map_err(|_| interner_overflow("a single string"))?;
+        // Guard the read-side `offset + len` too: both fit u32 individually
+        // yet their sum need not, and `resolve` slices with that sum.
+        offset
+            .checked_add(len)
+            .ok_or_else(|| interner_overflow("string bytes"))?;
+        let id =
+            u32::try_from(self.table.len()).map_err(|_| interner_overflow("distinct strings"))?;
         self.data.extend_from_slice(s.as_bytes());
-        let id = self.table.len() as u32;
         self.table.push((offset, len));
         self.lookup.insert(s.to_string(), id);
-        id
+        Ok(id)
     }
 
     /// Resolve an intern ID back to the original string.
+    ///
+    /// Returns `""` for an id this interner never handed out. Every id
+    /// reaching here was produced by [`Self::intern`] on this same
+    /// interner, so an out-of-range id means the arena bytes were
+    /// misinterpreted; answering with the empty string keeps a read-side
+    /// accessor from panicking mid-iteration.
     pub(super) fn resolve(&self, id: u32) -> &str {
-        let (offset, len) = self.table[id as usize];
-        let bytes = &self.data[offset as usize..(offset + len) as usize];
-        std::str::from_utf8(bytes).unwrap_or("")
+        let Some(&(offset, len)) = self.table.get(id as usize) else {
+            return "";
+        };
+        let start = offset as usize;
+        let end = start + len as usize;
+        match self.data.get(start..end) {
+            Some(bytes) => std::str::from_utf8(bytes).unwrap_or(""),
+            None => "",
+        }
     }
 
     /// Estimate the heap memory used by this interner in bytes.

@@ -81,6 +81,10 @@ fn walk_file(path: &Path) -> Result<WalkedFile> {
     let mut ways: Vec<BlobDesc> = Vec::new();
     let mut rels: Vec<BlobDesc> = Vec::new();
     let mut first = true;
+    // Blobs are bucketed by kind below, which throws file order away. The
+    // guard sees them in file order first, so this path refuses exactly what
+    // the sequential block-pair merge refuses instead of silently answering.
+    let mut order = crate::osc::merge_join::BlobOrderGuard::new();
 
     while let Some(meta) = walker.next_header()? {
         // Skip the required leading OsmHeader blob; subsequent OsmData
@@ -96,6 +100,9 @@ fn walk_file(path: &Path) -> Result<WalkedFile> {
             crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
                 "block-pair merge requires indexdata but blob has none",
             )))
+        })?;
+        order.observe(&index).map_err(|msg| {
+            crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(msg)))
         })?;
         let desc = BlobDesc {
             data_offset: meta.data_offset,

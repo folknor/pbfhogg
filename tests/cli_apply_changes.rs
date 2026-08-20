@@ -418,7 +418,7 @@ fn merge_multi_block_partial_rewrite() {
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <modify>
-    <node id="10" lat="99.0" lon="99.0" version="2">
+    <node id="10" lat="89.0" lon="99.0" version="2">
       <tag k="name" v="new"/>
     </node>
   </modify>
@@ -443,7 +443,9 @@ fn merge_multi_block_partial_rewrite() {
     assert_eq!(c.nodes[1].0, 2);
     assert_eq!(c.nodes[2].0, 3);
     assert_eq!(c.nodes[3].0, 10);
-    assert_eq!(c.nodes[3].1, 990_000_000);
+    // 89 degrees, not 99: a latitude past 90 is not a place, and the OSC
+    // parser now refuses it rather than storing it as an ordinary node.
+    assert_eq!(c.nodes[3].1, 890_000_000);
     assert_eq!(c.nodes[3].3, vec![("name".to_string(), "new".to_string())]);
     assert_eq!(c.nodes[4].0, 12);
     assert_eq!(
@@ -1531,15 +1533,9 @@ fn merge_gap_creates_between_blobs() {
     let c = read_all_elements(&output);
 
     let nids = node_ids(&c);
-    assert_eq!(nids.len(), 6);
-    for id in [5, 10, 15, 20, 30, 35] {
-        assert!(nids.contains(&id), "missing node {id}");
-    }
+    assert_eq!(nids, vec![5, 10, 15, 20, 30, 35], "node order");
     let wids = way_ids(&c);
-    assert_eq!(wids.len(), 4);
-    for id in [50, 100, 150, 200] {
-        assert!(wids.contains(&id), "missing way {id}");
-    }
+    assert_eq!(wids, vec![50, 100, 150, 200], "way order");
 
     let stderr = out.stderr_str();
     assert!(stderr.contains("Base: 3 nodes, 2 ways"), "stats: {stderr}");

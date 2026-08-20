@@ -167,7 +167,7 @@ fn parse_meta_attrs(
             }
             b"user" => {
                 let val = attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)?;
-                meta.user_id = overlay.intern(&val);
+                meta.user_id = overlay.intern(&val)?;
                 meta.flags |= META_FLAG_PRESENT | META_FLAG_HAS_USER;
             }
             b"visible" => {
@@ -184,7 +184,7 @@ fn parse_meta_attrs(
 
 /// Finalize the current element: build the tag slice, append to the appropriate
 /// arena, insert into the index, and clear staging.
-fn finalize_element(state: &mut ParserState, overlay: &mut CompactDiffOverlay) {
+fn finalize_element(state: &mut ParserState, overlay: &mut CompactDiffOverlay) -> ParseResult<()> {
     let tags: Vec<(u32, &str)> = state
         .tag_keys
         .iter()
@@ -192,30 +192,78 @@ fn finalize_element(state: &mut ParserState, overlay: &mut CompactDiffOverlay) {
         .map(|(&k, v)| (k, v.as_str()))
         .collect();
 
-    match state.current_elem {
-        CurrentElem::Node => {
-            overlay.push_node(
-                state.current_id,
-                state.current_lat,
-                state.current_lon,
-                &tags,
-                &state.current_meta,
-            );
-        }
+    let result = match state.current_elem {
+        CurrentElem::Node => overlay.push_node(
+            state.current_id,
+            state.current_lat,
+            state.current_lon,
+            &tags,
+            &state.current_meta,
+        ),
         CurrentElem::Way => {
-            overlay.push_way(state.current_id, &state.refs, &tags, &state.current_meta);
+            overlay.push_way(state.current_id, &state.refs, &tags, &state.current_meta)
         }
         CurrentElem::Relation => {
-            overlay.push_relation(state.current_id, &state.members, &tags, &state.current_meta);
+            overlay.push_relation(state.current_id, &state.members, &tags, &state.current_meta)
         }
-        CurrentElem::None => {}
-    }
+        CurrentElem::None => Ok(()),
+    };
 
     state.clear_staging();
+    result
+}
+
+/// Convert one OSC coordinate attribute to decimicrodegrees.
+///
+/// Geometry is not metadata, so the leniency `parse_meta_attrs` documents
+/// does not extend here. A create/modify `<node>` whose `lat`/`lon` is
+/// missing, empty or unparsable used to land at exactly (0, 0) - and 0/0
+/// is a real coordinate in the Gulf of Guinea, so the result was
+/// indistinguishable from a genuine node there. Worse, under
+/// `--locations-on-ways` that (0, 0) propagates into every way referencing
+/// the node. Out-of-range and non-finite values were equally silent: `as
+/// i32` saturates `lat="1e30"` to `i32::MAX` and maps `NaN` to 0.
+fn coord_to_decimicro(e: &quick_xml::events::BytesStart, name: &[u8], id: i64) -> ParseResult<i32> {
+    let degrees = parse_f64_attr(e, name).map_err(|err| -> Box<dyn std::error::Error> {
+        format!(
+            "OSC node {id}: {} attribute is missing or unparsable ({err}). A created or \
+             modified node must carry usable coordinates; storing it at 0/0 would silently \
+             move it to the Gulf of Guinea.",
+            String::from_utf8_lossy(name)
+        )
+        .into()
+    })?;
+    // Two independent checks. The geographic one comes first because it is
+    // the one a caller can reason about: lat="100" is not a place, and an
+    // i32 happily holds 1_000_000_000 decimicrodegrees, so the
+    // representation check below would wave it through. Such a node would
+    // enter the overlay as an ordinary node and could propagate into
+    // LocationsOnWays, where nothing downstream re-validates it.
+    let limit = if name == b"lat" { 90.0_f64 } else { 180.0_f64 };
+    if !(degrees.is_finite() && degrees.abs() <= limit) {
+        return Err(format!(
+            "OSC node {id}: {} value {degrees} is outside the valid geographic range \
+             -{limit} to {limit}",
+            String::from_utf8_lossy(name)
+        )
+        .into());
+    }
+    let scaled = degrees * 1e7;
+    if !scaled.is_finite() || scaled < f64::from(i32::MIN) || scaled > f64::from(i32::MAX) {
+        return Err(format!(
+            "OSC node {id}: {} value {degrees} is outside the range representable in \
+             decimicrodegrees",
+            String::from_utf8_lossy(name)
+        )
+        .into());
+    }
+    // The bounds check above rules out every value `as i32` would saturate
+    // or map to 0, so the cast is exact.
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(scaled.round() as i32)
 }
 
 /// Handle the opening tag (or self-closing tag) for a node/way/relation element.
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn handle_elem_start(
     e: &quick_xml::events::BytesStart,
     elem_kind: CurrentElem,
@@ -254,18 +302,14 @@ fn handle_elem_start(
     state.current_meta = parse_meta_attrs(e, overlay)?;
 
     if elem_kind == CurrentElem::Node {
-        let lat = parse_f64_attr(e, b"lat").unwrap_or(0.0);
-        let lon = parse_f64_attr(e, b"lon").unwrap_or(0.0);
-        state.current_lat = (lat * 1e7).round() as i32;
-        state.current_lon = (lon * 1e7).round() as i32;
+        state.current_lat = coord_to_decimicro(e, b"lat", id)?;
+        state.current_lon = coord_to_decimicro(e, b"lon", id)?;
     }
 
+    state.current_elem = elem_kind;
     if is_empty {
         // Self-closing element: immediately finalize with empty tags/refs/members.
-        state.current_elem = elem_kind;
-        finalize_element(state, overlay);
-    } else {
-        state.current_elem = elem_kind;
+        finalize_element(state, overlay)?;
     }
 
     Ok(())
@@ -282,7 +326,7 @@ fn handle_tag_compact(
     }
     let k = parse_str_attr(e, b"k")?;
     let v = parse_str_attr(e, b"v")?;
-    let key_id = overlay.intern(&k);
+    let key_id = overlay.intern(&k)?;
     state.tag_keys.push(key_id);
     state.tag_values.push(v);
     Ok(())
@@ -314,8 +358,8 @@ fn handle_member_compact(
     let member_type = parse_member_type(&member_type_str)?;
     let ref_id = parse_i64_attr(e, b"ref")?;
     let role = parse_str_attr(e, b"role").unwrap_or_default();
-    let type_byte = member_type_to_byte(member_type);
-    let role_id = overlay.intern(&role);
+    let type_byte = member_type_to_byte(member_type)?;
+    let role_id = overlay.intern(&role)?;
     state.members.push((ref_id, type_byte, role_id));
     Ok(())
 }
@@ -364,12 +408,13 @@ pub(super) fn handle_end_event_compact(
     e: &quick_xml::events::BytesEnd,
     state: &mut ParserState,
     overlay: &mut CompactDiffOverlay,
-) {
+) -> ParseResult<()> {
     match e.name().as_ref() {
         b"create" | b"modify" | b"delete" => state.section = Section::None,
         b"node" | b"way" | b"relation" if state.current_elem != CurrentElem::None => {
-            finalize_element(state, overlay);
+            finalize_element(state, overlay)?;
         }
         _ => {}
     }
+    Ok(())
 }

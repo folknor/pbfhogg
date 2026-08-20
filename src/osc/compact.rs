@@ -5,6 +5,7 @@
 
 use crate::read::elements::MemberType;
 
+use super::ParseResult;
 use super::interner::StringInterner;
 
 // ---------------------------------------------------------------------------
@@ -33,13 +34,27 @@ fn read_u32_le(data: &[u8], offset: usize) -> u32 {
 // MemberType <-> byte conversion
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub(super) fn member_type_to_byte(mt: MemberType) -> u8 {
+/// Encode a relation member type as the single arena byte.
+///
+/// The arena's member record has exactly one byte for the type, and the
+/// values 0/1/2 are already spoken for by node/way/relation. There is no
+/// encoding left for `MemberType::Unknown`: `Unknown(1)` would read back
+/// as a **way**, and `Unknown(257)` would truncate to `Unknown(1)` and
+/// read back as a way as well. Both are silent referential-integrity
+/// corruption, so this errors instead of inventing an encoding - the same
+/// treatment `BlockBuilder` gives an unknown member type on the PBF side.
+pub(super) fn member_type_to_byte(mt: MemberType) -> ParseResult<u8> {
     match mt {
-        MemberType::Node => 0,
-        MemberType::Way => 1,
-        MemberType::Relation => 2,
-        MemberType::Unknown(v) => v as u8,
+        MemberType::Node => Ok(0),
+        MemberType::Way => Ok(1),
+        MemberType::Relation => Ok(2),
+        MemberType::Unknown(v) => Err(format!(
+            "relation member has unknown type value {v} (expected node, way or relation); \
+             refusing to store it, because the compact OSC overlay has no faithful \
+             encoding for it and any substitute would silently change what the member \
+             points at"
+        )
+        .into()),
     }
 }
 
@@ -132,7 +147,6 @@ fn read_meta<'a>(
 /// then per tag: `[key_intern_id:u32 LE][value_len:u32 LE][value_bytes]`
 ///
 /// Returns the byte offset where this node starts in the arena.
-#[allow(clippy::cast_possible_truncation)]
 pub(super) fn arena_append_node(
     arena: &mut Vec<u8>,
     id: i64,
@@ -140,21 +154,37 @@ pub(super) fn arena_append_node(
     lon: i32,
     tags: &[(u32, &str)],
     meta: &ArenaMeta,
-) -> u32 {
-    let offset = arena.len() as u32;
+) -> ParseResult<usize> {
+    let offset = arena.len();
     arena.extend_from_slice(&id.to_le_bytes());
     arena.extend_from_slice(&lat.to_le_bytes());
     arena.extend_from_slice(&lon.to_le_bytes());
-    let tag_count = tags.len() as u32;
-    arena.extend_from_slice(&tag_count.to_le_bytes());
+    arena.extend_from_slice(&count_u32(tags.len(), "tags", "node", id)?.to_le_bytes());
     arena_append_meta(arena, meta);
+    append_tags(arena, tags, "node", id)?;
+    Ok(offset)
+}
+
+/// Narrow a collection length to the `u32` the arena layout stores, or
+/// error naming what overflowed. These counts are `u32` in the on-disk
+/// record shape; a silent `as u32` here would make the reader walk the
+/// wrong number of items and read a neighbouring record's bytes.
+fn count_u32(len: usize, what: &str, kind: &str, id: i64) -> ParseResult<u32> {
+    u32::try_from(len).map_err(|_| -> Box<dyn std::error::Error> {
+        format!("OSC {kind} {id} has {len} {what}, which exceeds the {} the compact overlay can address", u32::MAX).into()
+    })
+}
+
+/// Append the shared `[key_intern_id:u32][value_len:u32][value_bytes]`
+/// tag section used identically by all three record kinds.
+fn append_tags(arena: &mut Vec<u8>, tags: &[(u32, &str)], kind: &str, id: i64) -> ParseResult<()> {
     for &(key_id, value) in tags {
         arena.extend_from_slice(&key_id.to_le_bytes());
-        let value_len = value.len() as u32;
-        arena.extend_from_slice(&value_len.to_le_bytes());
+        arena
+            .extend_from_slice(&count_u32(value.len(), "tag value bytes", kind, id)?.to_le_bytes());
         arena.extend_from_slice(value.as_bytes());
     }
-    offset
+    Ok(())
 }
 
 /// Append a way to the arena in packed binary layout.
@@ -163,31 +193,25 @@ pub(super) fn arena_append_node(
 /// then `ref_count` x `[ref_id:i64 LE]`, then tags (same format as nodes).
 ///
 /// Returns the byte offset where this way starts in the arena.
-#[allow(clippy::cast_possible_truncation)]
 pub(super) fn arena_append_way(
     arena: &mut Vec<u8>,
     id: i64,
     refs: &[i64],
     tags: &[(u32, &str)],
     meta: &ArenaMeta,
-) -> u32 {
-    let offset = arena.len() as u32;
+) -> ParseResult<usize> {
+    let ref_count = count_u32(refs.len(), "node refs", "way", id)?;
+    let tag_count = count_u32(tags.len(), "tags", "way", id)?;
+    let offset = arena.len();
     arena.extend_from_slice(&id.to_le_bytes());
-    let ref_count = refs.len() as u32;
     arena.extend_from_slice(&ref_count.to_le_bytes());
-    let tag_count = tags.len() as u32;
     arena.extend_from_slice(&tag_count.to_le_bytes());
     arena_append_meta(arena, meta);
     for &r in refs {
         arena.extend_from_slice(&r.to_le_bytes());
     }
-    for &(key_id, value) in tags {
-        arena.extend_from_slice(&key_id.to_le_bytes());
-        let value_len = value.len() as u32;
-        arena.extend_from_slice(&value_len.to_le_bytes());
-        arena.extend_from_slice(value.as_bytes());
-    }
-    offset
+    append_tags(arena, tags, "way", id)?;
+    Ok(offset)
 }
 
 /// Append a relation to the arena in packed binary layout.
@@ -197,19 +221,18 @@ pub(super) fn arena_append_way(
 /// then tags (same format as nodes).
 ///
 /// Returns the byte offset where this relation starts in the arena.
-#[allow(clippy::cast_possible_truncation)]
 pub(super) fn arena_append_relation(
     arena: &mut Vec<u8>,
     id: i64,
     members: &[(i64, u8, u32)],
     tags: &[(u32, &str)],
     meta: &ArenaMeta,
-) -> u32 {
-    let offset = arena.len() as u32;
+) -> ParseResult<usize> {
+    let member_count = count_u32(members.len(), "members", "relation", id)?;
+    let tag_count = count_u32(tags.len(), "tags", "relation", id)?;
+    let offset = arena.len();
     arena.extend_from_slice(&id.to_le_bytes());
-    let member_count = members.len() as u32;
     arena.extend_from_slice(&member_count.to_le_bytes());
-    let tag_count = tags.len() as u32;
     arena.extend_from_slice(&tag_count.to_le_bytes());
     arena_append_meta(arena, meta);
     for &(ref_id, type_byte, role_id) in members {
@@ -217,13 +240,8 @@ pub(super) fn arena_append_relation(
         arena.push(type_byte);
         arena.extend_from_slice(&role_id.to_le_bytes());
     }
-    for &(key_id, value) in tags {
-        arena.extend_from_slice(&key_id.to_le_bytes());
-        let value_len = value.len() as u32;
-        arena.extend_from_slice(&value_len.to_le_bytes());
-        arena.extend_from_slice(value.as_bytes());
-    }
-    offset
+    append_tags(arena, tags, "relation", id)?;
+    Ok(offset)
 }
 
 // ---------------------------------------------------------------------------

@@ -81,6 +81,257 @@ fn run_filter(input: &Path, output: &Path, expressions: &[&str], omit_referenced
     )
 }
 
+/// Blob-level tag-index skipping is a trust boundary: nothing validates that a
+/// blob's `tagdata` describes its payload, so a file whose index lies makes
+/// `tags-filter` skip blobs whose elements match and emit a short answer
+/// without a hint that anything went wrong.
+///
+/// `degrade --corrupt-tagdata` produces exactly that file - it did not exist
+/// before, because `--strip-tagdata` only *removes* the index and a missing
+/// index is decoded rather than trusted - and `--distrust-metadata` is the
+/// escape hatch that gets the right answer back out of it.
+#[test]
+fn distrust_metadata_recovers_matches_a_lying_tag_index_would_hide() {
+    let dir = TempDir::new().expect("tempdir");
+    let pristine = dir.path().join("pristine.osm.pbf");
+    let corrupt = dir.path().join("corrupt.osm.pbf");
+
+    common::write_indexed_pbf(
+        &pristine,
+        &[
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("amenity", "bench")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![("name", "foo")],
+                meta: None,
+            },
+        ],
+        &[],
+        &[],
+    );
+
+    // Baseline on the honest file: the tag index agrees with the payload, so
+    // the fast path and the right answer coincide.
+    let out = dir.path().join("pristine-out.osm.pbf");
+    run_filter(&pristine, &out, &["amenity"], false);
+    assert_eq!(
+        node_ids(&read_all_elements(&out)),
+        vec![1],
+        "the fixture itself must match, or the assertions below prove nothing"
+    );
+
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&pristine)
+        .arg("-o")
+        .arg(&corrupt)
+        .arg("--corrupt-tagdata")
+        .assert_success();
+
+    // Default: the index is believed, the blob is skipped unread, and n1 is
+    // silently missing from the output. This is the documented trust boundary,
+    // asserted so a change to it cannot pass unnoticed.
+    let believed = dir.path().join("believed.osm.pbf");
+    let stderr = run_filter(&corrupt, &believed, &["amenity"], false);
+    assert!(
+        node_ids(&read_all_elements(&believed)).is_empty(),
+        "a lying tag index makes tags-filter skip a blob whose elements match"
+    );
+    assert!(
+        stderr.contains("skipped by tag index"),
+        "the skip is reported as a cheerful optimisation; stderr was:\n{stderr}"
+    );
+
+    // With --distrust-metadata the answer depends only on element data.
+    let distrusted = dir.path().join("distrusted.osm.pbf");
+    CliInvoker::new()
+        .arg("tags-filter")
+        .arg(&corrupt)
+        .arg("-o")
+        .arg(&distrusted)
+        .arg("--distrust-metadata")
+        .arg("amenity")
+        .assert_success();
+    assert_eq!(
+        node_ids(&read_all_elements(&distrusted)),
+        vec![1],
+        "--distrust-metadata must decode the blob the tag index disowned"
+    );
+}
+
+/// `--distrust-metadata` has to hold on the *reference-expansion* scans, not
+/// only on the pass that finds direct matches.
+///
+/// Relation closure and way-dependency collection each build a per-kind blob
+/// schedule, and `build_classify_schedule` selects blobs on the kind their
+/// indexdata declares - the exact claim the flag says it will not believe.
+/// The first version of the flag left both narrowed, so on a file with
+/// mislabelled blob kinds the direct match was found and written while its
+/// referenced members were never collected: an output missing required
+/// dependencies, produced by a run that promised the opposite, with nothing
+/// on stderr to notice.
+///
+/// The fixture bites through both helpers at once. `boundary` matches only
+/// r100, so w10 can enter the output solely through relation closure and n1/n2
+/// solely through way-dependency collection off a non-direct way.
+/// `degrade --corrupt-indexdata-kind` rotates every blob's declared kind, so
+/// the relation blob claims Node and the way blob claims Relation and each
+/// narrowed schedule comes back empty.
+#[test]
+fn distrust_metadata_holds_through_reference_expansion() {
+    let dir = TempDir::new().expect("tempdir");
+    let pristine = dir.path().join("pristine.osm.pbf");
+    let corrupt = dir.path().join("corrupt.osm.pbf");
+
+    common::write_indexed_pbf(
+        &pristine,
+        &[
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("name", "member way")],
+            meta: None,
+        }],
+        &[TestRelation {
+            id: 100,
+            members: vec![TestMember {
+                id: MemberId::Way(10),
+                role: "outer",
+            }],
+            tags: vec![("boundary", "administrative")],
+            meta: None,
+        }],
+    );
+
+    // Baseline on the honest file: closure pulls w10 in, way deps pull n1/n2.
+    let out = dir.path().join("pristine-out.osm.pbf");
+    run_filter(&pristine, &out, &["boundary"], false);
+    let c = read_all_elements(&out);
+    assert_eq!(relation_ids(&c), vec![100]);
+    assert_eq!(
+        way_ids(&c),
+        vec![10],
+        "w10 is not a direct match; it can only arrive through relation closure"
+    );
+    assert_eq!(
+        node_ids(&c),
+        vec![1, 2],
+        "n1/n2 are untagged; they can only arrive through way-dependency collection"
+    );
+
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&pristine)
+        .arg("-o")
+        .arg(&corrupt)
+        .arg("--corrupt-indexdata-kind")
+        .assert_success();
+
+    // The default run on the corrupt file must lose the expanded references.
+    // Without this arm the test below would pass just as happily if
+    // `--corrupt-indexdata-kind` were a no-op - the fixture would simply be
+    // honest and the distrust assertion would succeed for the wrong reason.
+    let believed = dir.path().join("believed.osm.pbf");
+    run_filter(&corrupt, &believed, &["boundary"], false);
+    let c = read_all_elements(&believed);
+    assert_eq!(
+        relation_ids(&c),
+        vec![100],
+        "pass 1 and pass 2 already decline blob filtering here, so the direct \
+         match survives - it is the expansion that a mislabelled kind breaks"
+    );
+    assert!(
+        way_ids(&c).is_empty() && node_ids(&c).is_empty(),
+        "a relation blob mislabelled as Node empties the closure schedule, so \
+         nothing is pulled in through membership; got ways {:?} nodes {:?}",
+        way_ids(&c),
+        node_ids(&c),
+    );
+
+    // With --distrust-metadata every scan reads every blob and decides on
+    // decoded elements, so the mislabelling changes nothing about the answer.
+    let distrusted = dir.path().join("distrusted.osm.pbf");
+    CliInvoker::new()
+        .arg("tags-filter")
+        .arg(&corrupt)
+        .arg("-o")
+        .arg(&distrusted)
+        .arg("--distrust-metadata")
+        .arg("boundary")
+        .assert_success();
+    let c = read_all_elements(&distrusted);
+    assert_eq!(relation_ids(&c), vec![100]);
+    assert_eq!(
+        way_ids(&c),
+        vec![10],
+        "relation closure must not select blobs on the kind indexdata declares"
+    );
+    assert_eq!(
+        node_ids(&c),
+        vec![1, 2],
+        "way-dependency collection must not select blobs on the kind indexdata declares"
+    );
+}
+
+/// `--distrust-metadata` is meaningless on OSC input, which has no blobs, and
+/// says so instead of accepting a flag that would do nothing.
+#[test]
+fn distrust_metadata_is_rejected_on_osc_input() {
+    let dir = TempDir::new().expect("tempdir");
+    let osc = dir.path().join("changes.osc.gz");
+    {
+        use std::io::Write;
+        let file = std::fs::File::create(&osc).expect("create osc");
+        let mut enc = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        enc.write_all(b"<?xml version='1.0'?>\n<osmChange version=\"0.6\"></osmChange>\n")
+            .expect("write xml");
+        enc.finish().expect("finish gz");
+    }
+    let out = dir.path().join("out.osc.gz");
+
+    let failure = CliInvoker::new()
+        .arg("tags-filter")
+        .arg(&osc)
+        .arg("-o")
+        .arg(&out)
+        .arg("--distrust-metadata")
+        .arg("amenity")
+        .assert_failure();
+    failure.assert_stderr_contains("carries no blob metadata");
+
+    // Passing counterpart: the same OSC run without the flag is accepted.
+    CliInvoker::new()
+        .arg("tags-filter")
+        .arg(&osc)
+        .arg("-o")
+        .arg(&out)
+        .arg("amenity")
+        .assert_success();
+}
+
 #[test]
 fn key_only_filter() {
     let dir = TempDir::new().expect("tempdir");

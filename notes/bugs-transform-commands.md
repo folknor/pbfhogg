@@ -5,87 +5,33 @@ repack, degrade, renumber, getid, getparents, inspect, tags_count, tags_filter,
 check, export, mod.rs), `src/blob_meta/`, `src/tag_expr.rs`. Findings only,
 unverified.
 
-## Filed 2026-08-20 from this document's own round-1 fix pass
-
-### `check --refs` drops an unrecordable node ID silently, then reports its refs as missing
-
-`src/commands/check/refs.rs` populates `node_ids` / `way_ids` / `relation_ids`
-with `IdSet::set_atomic_checked` and discards the returned `bool`. `false` means
-the ID fell outside the pre-allocated range - now bounded both by the file's
-indexdata and by `check::id_alloc_bound` - so the element is never entered into
-the set and every ref pointing at it is subsequently reported as a missing ref.
-
-That is a deliberate over-report rather than a panic (the previous behaviour),
-and the report is not wrong in the sense of hiding anything. But it is
-indistinguishable from a genuinely dangling ref, so a user reading the output
-has no way to tell "your file references a node that isn't in it" from "your
-file contains a node whose ID this check could not track". `verify_ids` faces
-the identical situation and does report it, as `IdViolation::IdOutOfRange`;
-`check --refs` should say something equivalent, at minimum a count on stderr.
-
-Confidence: high (read from the code; the discarded `bool` is explicit).
-
 ## MEDIUM
 
-### `check --ids` uses raw `<=` while everything else uses canonical OSM ordering
+### `pbfhogg check --index` does not exist
 
-`verify_ids.rs` compares `id <= p` and `fi <= pl`. `src/osm_id.rs::osm_id_cmp`
-defines canonical order as 0, -1, -2, ..., 1, 2, ... and is what `sort`,
-`scan_block_ids_checked` and the blob overlap logic use. So on a file with
-negative IDs, `sort`'s own correctly-ordered output is reported non-monotonic by
-`check --ids`, and a raw-i64-sorted file passes `check` while `sort` considers it
-unsorted. The verifier is the one place that must agree with the definition.
+Filed 2026-08-20 from this document's round-2 fix pass, which closed the
+opt-out half of the blob-level-trust finding but not the verification half.
 
-### `tag_expr` silently mis-parses osmium-compatible expressions instead of erroring
+There is still no command that decodes every blob and diffs what it finds
+against what the blob's own `BlobHeader` claims - `indexdata` (kind, count,
+min/max ID, bbox) and `tagdata` (the tag key set). Every consumer of that
+metadata now either trusts it or can be told not to (`--distrust-metadata` on
+`tags-filter` and `inspect`), but nothing can answer "is this file's metadata
+true?", so a file with a lying hint is only detectable by running two commands
+and comparing.
 
-`src/tag_expr.rs::parse_tag_matcher` vs
-`research/osmium-tool/src/util.cpp::get_string_matcher`:
+The adversarial corpus for such a command now exists: `degrade
+--corrupt-tagdata`, `--corrupt-indexdata` and `--corrupt-indexdata-kind`
+produce well-formed hints that lie about, respectively, the tag key set, the
+count and ID range, and the element kind. All three are already used by the
+`--distrust-metadata` tests, and `tests/cli_degrade.rs` verifies against an
+independent decoder that what they write is well-formed rather than garbage -
+so a `check --index` built on them would be exercising belief, not rejection.
 
-- osmium supports `*` prefix/suffix/substring matching on keys and values
-  (`highway=res*`, `name=*strasse`, `*:name`). pbfhogg supports only a key ending
-  in `:*` - `highway=res*` becomes an exact match on the literal string `res*`
-  and matches nothing. No error, empty output.
-- osmium supports `*` alone as "any value": `highway=*`. pbfhogg matches the
-  literal `*`.
-- osmium supports comma lists on keys as well as values (`highway,railway`).
-  pbfhogg only on values; `amenity,shop` becomes one literal key.
-- osmium strips whitespace around key and value. pbfhogg does not, so
-  `highway = primary` from an `--expressions` file yields the key `"highway "`.
-
-Every one of these fails as "zero matches" rather than "bad expression". Given
-`tags-filter` / `tags-count` are advertised as osmium equivalents, either
-implement the matcher or reject unsupported syntax loudly. (The `#` inline-comment
-stripping in `read_expressions_file` is osmium-faithful - the hunter checked; not
-a finding.)
-
-### Blob-level tag-index skipping is an unverifiable trust boundary with no opt-out
-
-`tags_filter` skips whole blobs on `TagIndex` content in both the `-R` single
-pass and two-pass pass 1. Nothing ever validates that a blob's tagdata matches its
-payload, `degrade --strip-tagdata` only removes it (never corrupts it, so no test
-covers a wrong index), and there is no `--no-blob-skip` escape hatch. Combined
-with the mixed-kind and u16-truncation findings this is the most likely route to
-silently-wrong output in this scope. At minimum there should be a global "do not
-trust sidecar metadata" flag, and ideally a `pbfhogg check --index` that decodes
-every blob and diffs the scanned index and tag index against the stored one. That
-command does not exist today.
-
-### `inspect`'s index-only fast path is not defeatable
-
-`src/commands/inspect/scan.rs::try_index_only_scan` reports counts, ID ranges and
-per-block stats purely from indexdata whenever `--locations` / `--extended` are
-absent, and there is no flag to force a decode. `inspect` is the tool you reach
-for when a file is suspect, and on a suspect file it reports the file's own claims
-as measurements. Add `--no-index` (or make `--anomalies` imply full decode).
-
-### `cat` of multiple files keeps only the first file's header
-
-`cat_passthrough` / `cat_type_passthrough` / `cat_filtered` build the output
-header from `files[0]` only. The bbox is not unioned across inputs and
-replication fields are taken from an arbitrary file, so a multi-file `cat` output
-advertises a bbox that does not cover its own data. `single_file` correctly drops
-the sorted flag, so this is bbox/metadata only - but it is wrong output metadata,
-not just cosmetics.
+Shape: `pbfhogg check --index` reporting per-blob mismatches, routed through
+`ExitStatus::AnswerNegative` (exit 1) for "found mismatches" rather than a new
+exit code, and added to the exhaustive `validate_input_output_aliases` match in
+`cli/src/main.rs`.
 
 ## LOW / lateral
 

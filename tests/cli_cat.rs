@@ -366,6 +366,244 @@ fn cat_multi_file() {
     assert_eq!(way_ids(&c), vec![10]);
 }
 
+/// Write a node-only PBF whose header carries an explicit bbox and a full set
+/// of replication fields, so a `cat` of two of them has something to
+/// reconcile.
+fn write_pbf_with_header(
+    path: &Path,
+    node_id: i64,
+    bbox: (f64, f64, f64, f64),
+    replication: (i64, i64, &str),
+) {
+    use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder};
+    use pbfhogg::writer::{Compression, PbfWriter};
+
+    let (left, bottom, right, top) = bbox;
+    let (timestamp, sequence, url) = replication;
+    let header = HeaderBuilder::new()
+        .bbox(left, bottom, right, top)
+        .replication_timestamp(timestamp)
+        .replication_sequence_number(sequence)
+        .replication_base_url(url)
+        .build()
+        .expect("build header");
+    let mut writer =
+        PbfWriter::to_path(path, Compression::default(), &header).expect("create writer");
+    let mut bb = BlockBuilder::new();
+    bb.add_node(node_id, 0, 0, [("name", "x")], None);
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+    writer.flush().expect("flush");
+}
+
+/// A multi-input `cat` output must not advertise a bounding box that fails to
+/// cover its own data. All three cat paths built the output header from the
+/// first input alone, so the second input's elements fell outside the declared
+/// extent and the replication fields described whichever file was listed
+/// first.
+#[test]
+fn cat_multi_file_unions_the_bbox_and_reconciles_replication() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let west = dir.path().join("west.osm.pbf");
+    let east = dir.path().join("east.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    // Disjoint boxes, and replication fields that agree on the base URL but
+    // disagree on timestamp and sequence.
+    write_pbf_with_header(
+        &west,
+        1,
+        (1.0, 10.0, 2.0, 20.0),
+        (1_700_000_000, 100, "https://example.invalid/replication"),
+    );
+    write_pbf_with_header(
+        &east,
+        2,
+        (30.0, 40.0, 40.0, 50.0),
+        (1_800_000_000, 200, "https://example.invalid/replication"),
+    );
+
+    let out = run_cat(&[&west, &east], &output, None, &[], false);
+    assert!(
+        out.status.success(),
+        "cat multi-file failed; stderr:\n{}",
+        out.stderr_str()
+    );
+
+    let header = common::read_header(&output);
+    let bbox = header
+        .bbox()
+        .expect("both inputs declare a bbox, so the output must declare their union");
+    let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    assert!(
+        close(bbox.left, 1.0)
+            && close(bbox.bottom, 10.0)
+            && close(bbox.right, 40.0)
+            && close(bbox.top, 50.0),
+        "expected the union (1, 10, 40, 50), got ({}, {}, {}, {}) - the first \
+         input's box alone does not cover the second input's elements",
+        bbox.left,
+        bbox.bottom,
+        bbox.right,
+        bbox.top,
+    );
+
+    assert_eq!(
+        header.osmosis_replication_timestamp(),
+        None,
+        "the inputs disagree on the replication timestamp; dropping it is honest, \
+         inheriting whichever file was listed first is not"
+    );
+    assert_eq!(
+        header.osmosis_replication_sequence_number(),
+        None,
+        "same for the sequence number"
+    );
+    assert_eq!(
+        header.osmosis_replication_base_url(),
+        Some("https://example.invalid/replication"),
+        "the one replication field both inputs agree on must survive"
+    );
+}
+
+/// The single-input counterpart: nothing to reconcile, so the header is
+/// carried through unchanged. Without this, a fix that simply blanked the
+/// header for every `cat` would pass the test above.
+#[test]
+fn cat_single_file_preserves_the_input_header() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    write_pbf_with_header(
+        &input,
+        1,
+        (1.0, 10.0, 2.0, 20.0),
+        (1_700_000_000, 100, "https://example.invalid/replication"),
+    );
+
+    let out = run_cat(&[&input], &output, None, &[], false);
+    assert!(out.status.success(), "cat failed:\n{}", out.stderr_str());
+
+    let header = common::read_header(&output);
+    let bbox = header.bbox().expect("bbox preserved");
+    let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    assert!(close(bbox.left, 1.0) && close(bbox.right, 2.0));
+    assert_eq!(
+        header.osmosis_replication_timestamp(),
+        Some(1_700_000_000),
+        "a single input has nothing to disagree with"
+    );
+    assert_eq!(header.osmosis_replication_sequence_number(), Some(100));
+}
+
+/// `cat` has three output paths - plain passthrough, the `--type` blob-filter
+/// passthrough, and the full-decode filtered path - and each built the output
+/// header independently from `files[0]`. The reconciliation test above drives
+/// only the first of them, so a fix applied to one path and not the others
+/// would look complete. This drives the remaining two over the same inputs and
+/// demands the same header.
+#[test]
+fn cat_reconciles_the_header_on_every_output_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let west = dir.path().join("west.osm.pbf");
+    let east = dir.path().join("east.osm.pbf");
+
+    write_pbf_with_header(
+        &west,
+        1,
+        (1.0, 10.0, 2.0, 20.0),
+        (1_700_000_000, 100, "https://example.invalid/replication"),
+    );
+    write_pbf_with_header(
+        &east,
+        2,
+        (30.0, 40.0, 40.0, 50.0),
+        (1_800_000_000, 200, "https://example.invalid/replication"),
+    );
+
+    // (label, --type, -c attrs): the type-filter passthrough, then the
+    // full-decode filtered path.
+    let cases: [(&str, Option<&str>, &[&str]); 2] =
+        [("type", Some("node"), &[]), ("clean", None, &["version"])];
+
+    for (label, type_filter, clean) in cases {
+        let output = dir.path().join(format!("out-{label}.osm.pbf"));
+        let out = run_cat(&[&west, &east], &output, type_filter, clean, false);
+        assert!(
+            out.status.success(),
+            "cat ({label}) failed:\n{}",
+            out.stderr_str()
+        );
+
+        let header = common::read_header(&output);
+        let bbox = header
+            .bbox()
+            .unwrap_or_else(|| panic!("{label}: the union of two declared boxes is known"));
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+        assert!(
+            close(bbox.left, 1.0)
+                && close(bbox.bottom, 10.0)
+                && close(bbox.right, 40.0)
+                && close(bbox.top, 50.0),
+            "{label}: expected the union (1, 10, 40, 50), got ({}, {}, {}, {})",
+            bbox.left,
+            bbox.bottom,
+            bbox.right,
+            bbox.top,
+        );
+        assert_eq!(
+            header.osmosis_replication_timestamp(),
+            None,
+            "{label}: the inputs disagree, so the field must be dropped"
+        );
+        assert_eq!(
+            header.osmosis_replication_base_url(),
+            Some("https://example.invalid/replication"),
+            "{label}: the agreed field must survive"
+        );
+    }
+}
+
+/// A missing bbox on any input makes the union unknown, so the output must
+/// declare no bbox rather than the boxes it happens to know about.
+#[test]
+fn cat_multi_file_drops_the_bbox_when_an_input_declares_none() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let boxed = dir.path().join("boxed.osm.pbf");
+    let unboxed = dir.path().join("unboxed.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    write_pbf_with_header(
+        &boxed,
+        1,
+        (1.0, 10.0, 2.0, 20.0),
+        (1_700_000_000, 100, "https://example.invalid/replication"),
+    );
+    write_test_pbf(
+        &unboxed,
+        &[TestNode {
+            id: 2,
+            lat: 0,
+            lon: 0,
+            tags: vec![],
+            meta: None,
+        }],
+        &[],
+        &[],
+    );
+
+    let out = run_cat(&[&boxed, &unboxed], &output, None, &[], false);
+    assert!(out.status.success(), "cat failed:\n{}", out.stderr_str());
+
+    let header = common::read_header(&output);
+    assert!(
+        header.bbox().is_none(),
+        "an input of unknown extent makes the union unknown"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // CleanAttrs field stripping
 // ---------------------------------------------------------------------------

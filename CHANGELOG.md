@@ -4,6 +4,34 @@
 
 ### Breaking
 
+- **`tags-filter` / `inspect tags` expressions now follow osmium's matcher,
+  which changes what existing expressions select.** Both commands are
+  advertised as osmium equivalents, but the parser understood only exact
+  matches, comma lists on the value half, and a key ending in `:*`.
+  Everything else osmium accepts parsed as an exact match on a literal
+  containing a star and matched nothing at all - `highway=res*`,
+  `name=*strasse`, `highway=*`, `amenity,shop` each produced empty output
+  with no error to notice. Now, on **both** halves of an expression:
+  `foo*` is a prefix match, `*foo` and `*foo*` are substring matches
+  (osmium has no suffix matcher), a bare `*` matches anything, and a comma
+  list is a set of alternatives. Spaces around each half and around each
+  comma-list element are stripped, so `highway = primary` from an
+  `--expressions` file names the key `highway` rather than `"highway "`.
+  The expression now splits at the **first** `=`, so `a=b!=c` means key
+  `a`, value `b!=c`. Inversion is marked by a `!` that is the last
+  character of the *raw* key, tested before the space stripping above, as
+  `get_tag_matcher` does: `highway !=x` inverts, while `highway ! = x`
+  names the literal key `highway !`. Any expression containing `*` or a
+  comma in its key, or surrounding spaces, will now select elements it
+  previously did not.
+
+- **`pbfhogg::inspect::inspect` takes an `InspectOptions` struct** instead of
+  five positional `bool`s, which is where the new `distrust_metadata`
+  setting lives. Migration is mechanical: name the fields.
+
+- **`check --refs` (`RefCheckResult`) gained an `untrackable_ids: [u64; 3]`
+  field** and a `total_untrackable()` accessor.
+
 - **`PrimitiveBlock::new(Bytes)` is removed; use
   `PrimitiveBlock::from_vec(Vec<u8>)`.** The parser extends the buffer in
   place with its inlined string-table and group entries, so a `Bytes`
@@ -16,6 +44,35 @@
   it by value instead of converting to `Bytes`.
 
 ### Added
+
+- **`--distrust-metadata` on `tags-filter` and `inspect`.** Both commands
+  make decisions from per-blob sidecar metadata that nothing validates
+  against the payload it describes: `tags-filter` skips whole blobs on
+  their tag index, and `inspect` reports counts, ID ranges and per-block
+  stats straight out of `indexdata` whenever every blob has some. A file
+  whose tag index omits a key its elements carry therefore loses those
+  elements from `tags-filter` output silently - a wrong answer, not a slow
+  one - and `inspect`, the tool you reach for when a file is suspect,
+  reports that same suspect file's claims as measurements. The new flag
+  decodes every blob instead, so the answer depends only on element data.
+  On `tags-filter` it also waives the indexdata precondition; on `inspect`
+  it applies to the scanning report and is rejected alongside `--indexed`,
+  `--nodes` and a `header.*` `--get` key, which do not consult metadata
+  contents at all.
+
+- **`degrade --corrupt-tagdata`, `--corrupt-indexdata` and
+  `--corrupt-indexdata-kind`.** The existing `--strip-*` flags only
+  *remove* a hint, and a blob with no hint is decoded rather than trusted -
+  so no degraded file could ever exercise a *wrong* hint, which is the
+  failure mode that matters. These write a well-formed hint that lies: a
+  tag index naming a key the blob does not carry; an index overstating the
+  blob's count and max ID by 1,000,000; and a rotated element kind
+  (node to way to relation to node) with the counts left honest. The kind
+  is the field per-kind blob schedules select on, so it is the corruption
+  that makes a consumer skip a blob outright rather than misreport it,
+  which is why it is a flag of its own. All three are header-only rewrites,
+  mutually exclusive with their `--strip-` counterparts and with any flag
+  that re-encodes blobs.
 
 - **`BlobReader::evict_page_cache(bool)` and
   `ElementReader::evict_page_cache(bool)`.** The buffered file
@@ -36,6 +93,37 @@
   must be left untouched.
 
 ### Fixed
+
+- **`check --ids` judged ID monotonicity by raw `i64` comparison while
+  everything else used canonical OSM order.** Canonical order is `0`, then
+  the negative IDs by ascending absolute value, then the positives - the
+  order `sort`, the blob-overlap logic and the ID scanners all use. The two
+  agree on positive-only files, so production PBFs were unaffected, but on a
+  file carrying negative IDs (JOSM editor-local staging IDs) they disagreed
+  in both directions at once: `sort`'s own correctly-ordered output was
+  reported non-monotonic, and a raw-`i64`-sorted file that `sort` considers
+  unsorted passed the check. The verifier is the one place that has to agree
+  with the definition.
+
+- **`check --refs` reported untrackable element IDs as missing references,
+  indistinguishably from real ones.** An ID the tracking bitset cannot
+  represent - a negative ID, or one above the range sized from the file's
+  own indexdata - is never recorded as present, so every reference to it is
+  counted missing. That over-report is deliberate (the alternative was a
+  panicking worker), but it was silent: the reader could not tell "your file
+  references a node it does not contain" from "your file contains a node
+  this check could not track". The count is now reported on its own line and
+  in the JSON output, matching how `--ids --full` already reports the same
+  situation as `id_out_of_range`.
+
+- **`cat` of multiple files advertised a bounding box that did not cover its
+  own data.** All three cat paths built the output header from the first
+  input alone, so the bbox described one input while the file contained
+  several, and the replication fields came from whichever file was listed
+  first. The header is now reconciled across every input: the bbox is the
+  union and is dropped entirely if any input declares none, each replication
+  field survives only if every input agrees on it, and
+  `HistoricalInformation` is the OR. Single-input `cat` is unchanged.
 
 - **`sort` and `cat --dedupe` no longer emit unsorted output stamped
   `Sort.Type_then_ID`.** Overlap-run detection compared only adjacent

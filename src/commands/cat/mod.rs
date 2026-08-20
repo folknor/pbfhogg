@@ -7,7 +7,6 @@ use std::path::Path;
 use super::{
     HeaderOverrides, build_output_header, ensure_node_capacity_local,
     ensure_relation_capacity_local, ensure_way_capacity_local, require_indexdata,
-    writer_from_header,
 };
 use crate::blob::{BlobKind, decode_blob_to_headerblock, decompress_blob_data_into};
 use crate::blob_meta::{scan_block_ids, scan_block_tags};
@@ -15,7 +14,7 @@ use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_reader::FileReader;
 use crate::owned::{TypeFilter, dense_node_metadata, element_metadata};
 use crate::writer::{Compression, PbfWriter, reframe_raw_with_index};
-use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
+use crate::{BlobFilter, Element, PrimitiveBlock};
 
 use super::{Result, flush_local};
 use crate::read::raw_frame::read_raw_frame;
@@ -123,6 +122,136 @@ pub fn cat(
 }
 
 // ---------------------------------------------------------------------------
+// Output header
+// ---------------------------------------------------------------------------
+
+/// Read one file's `OSMHeader` block.
+fn read_header(file: &Path, direct_io: bool) -> Result<crate::HeaderBlock> {
+    let mut reader = FileReader::open(file, direct_io)?;
+    let mut file_offset: u64 = 0;
+    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
+        if frame.blob_type == BlobKind::OsmHeader {
+            return Ok(decode_blob_to_headerblock(frame.blob_bytes())?);
+        }
+    }
+    Err("no OSMHeader blob found in input file".into())
+}
+
+/// Build the output header bytes for a `cat` run over `files`.
+///
+/// Single input: the input header, minus anything `build_output_header` drops.
+///
+/// Multiple inputs: every input's header is read and reconciled, because a
+/// concatenation's metadata has to describe the concatenation. Previously all
+/// three cat paths built the output header from `files[0]` alone, so the
+/// output advertised the first input's bounding box over data drawn from all
+/// of them - a file whose declared extent does not cover its own contents,
+/// which is worse than declaring none - and carried replication fields from
+/// whichever file happened to be first.
+///
+/// The reconciliation rules, chosen so the header can only ever understate:
+///
+/// - **bbox**: the union, and only when *every* input declares one. An input
+///   without a bbox has unknown extent, so the union is unknown too and the
+///   field is omitted rather than guessed.
+/// - **replication timestamp / sequence / base URL**: kept per field, only
+///   when every input agrees on that field's value. Two inputs from different
+///   replication states have no single correct answer, and dropping the field
+///   is more honest than picking one.
+/// - **`HistoricalInformation`**: the OR. It is a required feature declaring
+///   that history metadata *may* be present, so one input carrying history
+///   makes it true of the output.
+///
+/// osmium's `cat` writes a completely blank header for multiple inputs
+/// (`command_cat.cpp`), which is the same honesty rule applied bluntly. This
+/// keeps whatever the inputs actually agree on, and is documented as a
+/// deliberate deviation.
+fn cat_output_header_bytes(
+    files: &[&Path],
+    direct_io: bool,
+    overrides: &HeaderOverrides,
+) -> Result<Vec<u8>> {
+    if let [single] = files {
+        let header = read_header(single, direct_io)?;
+        super::warn_locations_on_ways_loss(&header);
+        return build_output_header(&header, true, overrides, |hb| hb);
+    }
+
+    let headers: Vec<crate::HeaderBlock> = files
+        .iter()
+        .map(|f| read_header(f, direct_io))
+        .collect::<Result<Vec<_>>>()?;
+    for header in &headers {
+        super::warn_locations_on_ways_loss(header);
+    }
+
+    let mut hb = crate::block_builder::HeaderBuilder::new();
+
+    if headers.iter().all(|h| h.bbox().is_some()) {
+        let boxes: Vec<_> = headers
+            .iter()
+            .filter_map(crate::HeaderBlock::bbox)
+            .collect();
+        let fold = |pick: fn(f64, f64) -> f64, get: fn(&crate::HeaderBBox) -> f64| {
+            boxes.iter().map(get).fold(
+                f64::NAN,
+                |acc, v| {
+                    if acc.is_nan() { v } else { pick(acc, v) }
+                },
+            )
+        };
+        hb = hb.bbox(
+            fold(f64::min, |b| b.left),
+            fold(f64::min, |b| b.bottom),
+            fold(f64::max, |b| b.right),
+            fold(f64::max, |b| b.top),
+        );
+    }
+
+    if let Some(ts) = agreed(&headers, crate::HeaderBlock::osmosis_replication_timestamp) {
+        hb = hb.replication_timestamp(ts);
+    }
+    if let Some(seq) = agreed(
+        &headers,
+        crate::HeaderBlock::osmosis_replication_sequence_number,
+    ) {
+        hb = hb.replication_sequence_number(seq);
+    }
+    // Borrowed from `headers`, which outlives `hb` within this function.
+    let urls: Vec<Option<&str>> = headers
+        .iter()
+        .map(crate::HeaderBlock::osmosis_replication_base_url)
+        .collect();
+    if let Some(first) = urls[0]
+        && urls.iter().all(|u| *u == urls[0])
+    {
+        hb = hb.replication_base_url(first);
+    }
+
+    if headers
+        .iter()
+        .any(crate::HeaderBlock::has_historical_information)
+    {
+        hb = hb.historical();
+    }
+
+    Ok(overrides.apply(hb).build()?)
+}
+
+/// The value every header agrees on for one optional field, or `None` when
+/// any header lacks it or they disagree.
+fn agreed<T: PartialEq + Copy>(
+    headers: &[crate::HeaderBlock],
+    get: impl Fn(&crate::HeaderBlock) -> Option<T>,
+) -> Option<T> {
+    let first = get(&headers[0])?;
+    headers
+        .iter()
+        .all(|h| get(h) == Some(first))
+        .then_some(first)
+}
+
+// ---------------------------------------------------------------------------
 // Passthrough path: no type filter, zero decode
 // ---------------------------------------------------------------------------
 
@@ -133,27 +262,7 @@ fn cat_passthrough(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<CatStats> {
-    let single_file = files.len() == 1;
-
-    let header_bytes = {
-        let mut reader = FileReader::open(files[0], direct_io)?;
-        let mut file_offset: u64 = 0;
-        let mut hdr_bytes = None;
-        while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
-            if frame.blob_type == BlobKind::OsmHeader {
-                let header = decode_blob_to_headerblock(frame.blob_bytes())?;
-                super::warn_locations_on_ways_loss(&header);
-                hdr_bytes = Some(build_output_header(
-                    &header,
-                    single_file,
-                    overrides,
-                    |hb| hb,
-                )?);
-                break;
-            }
-        }
-        hdr_bytes.ok_or("no OSMHeader blob found in first input file")?
-    };
+    let header_bytes = cat_output_header_bytes(files, direct_io, overrides)?;
 
     let mut writer =
         super::writer_from_header_bytes(output, compression, &header_bytes, direct_io, false)?;
@@ -229,28 +338,9 @@ fn cat_type_passthrough(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<CatStats> {
-    let single_file = files.len() == 1;
     let blob_filter = BlobFilter::new(tf.nodes, tf.ways, tf.relations);
 
-    let header_bytes = {
-        let mut reader = FileReader::open(files[0], direct_io)?;
-        let mut file_offset: u64 = 0;
-        let mut hdr_bytes = None;
-        while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
-            if frame.blob_type == BlobKind::OsmHeader {
-                let header = decode_blob_to_headerblock(frame.blob_bytes())?;
-                super::warn_locations_on_ways_loss(&header);
-                hdr_bytes = Some(build_output_header(
-                    &header,
-                    single_file,
-                    overrides,
-                    |hb| hb,
-                )?);
-                break;
-            }
-        }
-        hdr_bytes.ok_or("no OSMHeader blob found in first input file")?
-    };
+    let header_bytes = cat_output_header_bytes(files, direct_io, overrides)?;
 
     let mut writer =
         super::writer_from_header_bytes(output, compression, &header_bytes, direct_io, false)?;
@@ -447,8 +537,6 @@ fn cat_filtered(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<CatStats> {
-    let single_file = files.len() == 1;
-
     // Cap glibc arenas to prevent cross-thread alloc/free fragmentation
     // in the per-blob worker pool. Same precedent as check --refs / verify_ids.
     // The workers do BlockBuilder re-encode (allocation-heavy) but each blob's
@@ -461,22 +549,11 @@ fn cat_filtered(
     }
 
     // -----------------------------------------------------------------------
-    // Read header from first file
+    // Output header: reconciled across every input (see `cat_output_header_bytes`)
     // -----------------------------------------------------------------------
-    let first_reader = ElementReader::open(files[0], direct_io)?;
-    super::warn_locations_on_ways_loss(first_reader.header());
-    let header = first_reader.header().clone();
-    let mut writer = writer_from_header(
-        output,
-        compression,
-        &header,
-        single_file,
-        overrides,
-        |hb| hb,
-        direct_io,
-        false,
-    )?;
-    drop(first_reader);
+    let header_bytes = cat_output_header_bytes(files, direct_io, overrides)?;
+    let mut writer =
+        super::writer_from_header_bytes(output, compression, &header_bytes, direct_io, false)?;
 
     let mut blobs_decoded: u64 = 0;
     let mut elements: u64 = 0;

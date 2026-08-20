@@ -11,7 +11,7 @@ use super::{
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::idset::IdSet;
 use crate::owned::{dense_node_metadata, element_metadata};
-use crate::tag_expr::{Expression, TagMatcher, parse_expressions, tag_matches};
+use crate::tag_expr::{Expression, StringMatcher, parse_expressions, tag_matches};
 use crate::writer::Compression;
 use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
 
@@ -21,31 +21,56 @@ use super::Result;
 ///
 /// Returns `None` only if all types are needed AND no tag keys can be extracted
 /// (no benefit from filtering at blob level).
+///
+/// # Key matchers that constrain nothing
+///
+/// The blob-level filter can only express "this blob's tag index contains one
+/// of these exact keys, or a key under one of these prefixes". A
+/// [`StringMatcher::Substring`] key (`*:name`) or a
+/// [`StringMatcher::Always`] key (`*`) fits neither, and there is no
+/// conservative approximation of a substring in a key-set membership test. An
+/// expression carrying one therefore disables tag-level blob filtering
+/// **entirely** - keys and prefixes contributed by the *other* expressions
+/// included, since the filter's semantics are a union and skipping a blob on
+/// the union would skip blobs the unconstrained expression could still match.
+///
+/// This is the layer above the matcher rewrite, and the place it could have
+/// gone wrong: widening the matcher without widening what the blob filter
+/// refuses to constrain would have turned newly-valid expressions into
+/// silently-skipped blobs, which is exactly the class of bug the rewrite was
+/// closing.
 fn blob_filter_from_expressions(expressions: &[Expression]) -> Option<BlobFilter> {
     let mut need_nodes = false;
     let mut need_ways = false;
     let mut need_relations = false;
     let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut prefixes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut key_unconstrained = false;
 
     for expr in expressions {
         need_nodes |= expr.type_filter.nodes;
         need_ways |= expr.type_filter.ways;
         need_relations |= expr.type_filter.relations;
 
-        match &expr.matcher {
-            TagMatcher::KeyOnly { key } => {
+        match &expr.matcher.key {
+            StringMatcher::Equal(key) => {
                 keys.insert(key.clone());
             }
-            TagMatcher::KeyPrefix { prefix } => {
+            StringMatcher::List(alternatives) => {
+                keys.extend(alternatives.iter().cloned());
+            }
+            StringMatcher::Prefix(prefix) => {
                 prefixes.insert(prefix.clone());
             }
-            TagMatcher::ExactValue { key, .. }
-            | TagMatcher::MultiValue { key, .. }
-            | TagMatcher::NotValue { key, .. } => {
-                keys.insert(key.clone());
+            StringMatcher::Substring(_) | StringMatcher::Always => {
+                key_unconstrained = true;
             }
         }
+    }
+
+    if key_unconstrained {
+        keys.clear();
+        prefixes.clear();
     }
 
     let all_types = need_nodes && need_ways && need_relations;
@@ -63,6 +88,23 @@ fn blob_filter_from_expressions(expressions: &[Expression]) -> Option<BlobFilter
         filter = filter.with_required_tag_prefixes(prefixes.into_iter().collect());
     }
     Some(filter)
+}
+
+/// The blob filter to run with, or `None` to decode every blob.
+///
+/// Two reasons to decline blob-level filtering: `invert` (we want the blobs
+/// the filter would reject), and `distrust_metadata` (the caller has said the
+/// file's own claims about its blobs are not to be believed - see
+/// [`TagsFilterOptions::distrust_metadata`]).
+fn trusted_blob_filter(
+    expressions: &[Expression],
+    invert: bool,
+    distrust_metadata: bool,
+) -> Option<BlobFilter> {
+    if invert || distrust_metadata {
+        return None;
+    }
+    blob_filter_from_expressions(expressions)
 }
 
 /// Check if an element's tags match any applicable expression (OR semantics).
@@ -161,6 +203,19 @@ pub struct TagsFilterOptions<'a> {
     /// `parallel_classify_*`); the CLI rejects that combination
     /// upfront.
     pub jobs: Option<usize>,
+    /// Do not trust the per-blob sidecar metadata. Every blob is decompressed
+    /// and every element examined, regardless of what the blob's `indexdata`
+    /// and tag index claim about its contents.
+    ///
+    /// Blob-level skipping on the tag index is a trust boundary with nothing
+    /// on the other side of it: no code path validates that a blob's tag index
+    /// matches its payload, so a file whose tag index omits a key its elements
+    /// actually carry silently loses those elements from the output. That is a
+    /// *wrong answer*, not a slow one, and it is invisible - the skipped blob
+    /// was never decoded, so nothing can notice. This flag is the escape
+    /// hatch: it costs the blob-skip speedup and buys an answer that depends
+    /// only on element data.
+    pub distrust_metadata: bool,
 }
 
 /// Filter a PBF file by tag expressions.
@@ -175,8 +230,10 @@ pub fn tags_filter(
     opts: &TagsFilterOptions<'_>,
     overrides: &HeaderOverrides,
 ) -> Result<TagsFilterStats> {
-    // Blob-level filtering can't help in invert mode (we want non-matching blobs).
-    if !opts.invert {
+    // Blob-level filtering can't help in invert mode (we want non-matching
+    // blobs), and `--distrust-metadata` declines to use it at all - demanding
+    // indexdata the run will not consult would be a pointless refusal.
+    if !opts.invert && !opts.distrust_metadata {
         require_indexdata(
             input,
             opts.direct_io,
@@ -198,6 +255,7 @@ pub fn tags_filter(
             output,
             &expressions,
             opts.invert,
+            opts.distrust_metadata,
             opts.compression,
             opts.direct_io,
             overrides,
@@ -218,6 +276,7 @@ pub fn tags_filter(
             output,
             &expressions,
             opts.invert,
+            opts.distrust_metadata,
             opts.remove_tags,
             opts.compression,
             opts.direct_io,
@@ -348,12 +407,13 @@ fn filter_block_parallel(
 }
 
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn tags_filter_single_pass(
     input: &Path,
     output: &Path,
     expressions: &[Expression],
     invert: bool,
+    distrust_metadata: bool,
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
@@ -362,13 +422,9 @@ fn tags_filter_single_pass(
     let reader = ElementReader::open(input, direct_io)?;
     super::warn_locations_on_ways_loss(reader.header());
     // Blob-level filtering can't help in invert mode - we want non-matching blobs.
-    let reader = if invert {
-        reader
-    } else {
-        match blob_filter_from_expressions(expressions) {
-            Some(filter) => reader.with_blob_filter(filter),
-            None => reader,
-        }
+    let reader = match trusted_blob_filter(expressions, invert, distrust_metadata) {
+        Some(filter) => reader.with_blob_filter(filter),
+        None => reader,
     };
     let mut writer = writer_from_header(
         output,
@@ -623,6 +679,7 @@ fn tags_filter_two_pass(
     output: &Path,
     expressions: &[Expression],
     invert: bool,
+    distrust_metadata: bool,
     remove_tags: bool,
     compression: Compression,
     direct_io: bool,
@@ -677,11 +734,7 @@ fn tags_filter_two_pass(
             .next_header()?
             .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
 
-        let expr_filter = if invert {
-            None
-        } else {
-            blob_filter_from_expressions(expressions)
-        };
+        let expr_filter = trusted_blob_filter(expressions, invert, distrust_metadata);
 
         let mut schedule: Vec<(usize, u64, usize)> = Vec::new();
         let mut blobs_skipped_by_tag: u64 = 0;
@@ -815,6 +868,7 @@ fn tags_filter_two_pass(
         let closure = collect_relation_member_closure(
             input,
             direct_io,
+            distrust_metadata,
             &mut included_relation_ids,
             &mut included_way_ids,
             &mut relation_dep_node_ids,
@@ -830,6 +884,7 @@ fn tags_filter_two_pass(
     collect_way_node_dependencies(
         input,
         direct_io,
+        distrust_metadata,
         &included_way_ids,
         Some(&direct_way_ids),
         &mut relation_dep_node_ids,
@@ -863,7 +918,10 @@ fn tags_filter_two_pass(
     // Build pass 2 schedule. Skip blob types not needed (type filter only -
     // no tag index filtering because elements can be included via relation
     // closure without having the matching tag key).
-    let blob_filter: Option<BlobFilter> = if invert {
+    // `distrust_metadata` drops this filter too: its element-kind decision
+    // comes from each blob's indexdata, so a blob whose indexdata mislabels
+    // its kind would be skipped with its contents unexamined.
+    let blob_filter: Option<BlobFilter> = if invert || distrust_metadata {
         None
     } else {
         Some(BlobFilter::new(
@@ -1131,10 +1189,15 @@ struct RelationClosureSummary {
 /// Starts from already-included relation IDs and repeatedly scans relation blobs:
 /// included relation -> include member nodes/ways/relations.
 /// Recursion terminates when no new relation IDs are discovered.
+///
+/// `distrust_metadata` widens the schedule to every OsmData blob. See
+/// [`kind_schedule_filter`].
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
+#[allow(clippy::too_many_arguments)]
 fn collect_relation_member_closure(
     input: &Path,
     _direct_io: bool,
+    distrust_metadata: bool,
     included_relation_ids: &mut IdSet,
     included_way_ids: &mut IdSet,
     relation_dep_node_ids: &mut IdSet,
@@ -1145,7 +1208,7 @@ fn collect_relation_member_closure(
     // Build schedule once - reused across convergence iterations.
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
-        Some(crate::blob_meta::ElemKind::Relation),
+        kind_schedule_filter(crate::blob_meta::ElemKind::Relation, distrust_metadata),
     )?;
 
     struct ClosureResult {
@@ -1226,11 +1289,36 @@ fn collect_relation_member_closure(
     Ok(summary)
 }
 
+/// The `build_classify_schedule` kind filter for a reference-expansion scan.
+///
+/// A per-kind schedule selects blobs on the kind their *indexdata* declares,
+/// which is exactly the claim `--distrust-metadata` says it will not believe.
+/// Leaving these two scans narrowed was the flag's second layer: the initial
+/// pass switched off blob filtering for the direct-match pass and for pass 2,
+/// so a mislabelled way or relation blob had its matches found and written,
+/// but its *referenced members* were never collected - the output silently
+/// omitted required dependencies while the flag promised an answer that
+/// depends only on element data. Under `--distrust-metadata` the schedule is
+/// every OsmData blob and the per-element `if let Element::Way(_)` /
+/// `Element::Relation(_)` match inside each scan does the kind selection from
+/// decoded data instead.
+fn kind_schedule_filter(
+    kind: crate::blob_meta::ElemKind,
+    distrust_metadata: bool,
+) -> Option<crate::blob_meta::ElemKind> {
+    if distrust_metadata { None } else { Some(kind) }
+}
+
 /// Scan all way blobs and add node refs for ways selected for output.
+///
+/// `distrust_metadata` widens the schedule to every OsmData blob. See
+/// [`kind_schedule_filter`].
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
+#[allow(clippy::too_many_arguments)]
 fn collect_way_node_dependencies(
     input: &Path,
     _direct_io: bool,
+    distrust_metadata: bool,
     included_way_ids: &IdSet,
     skip_way_ids: Option<&IdSet>,
     relation_dep_node_ids: &mut IdSet,
@@ -1238,7 +1326,7 @@ fn collect_way_node_dependencies(
 ) -> Result<()> {
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
-        Some(crate::blob_meta::ElemKind::Way),
+        kind_schedule_filter(crate::blob_meta::ElemKind::Way, distrust_metadata),
     )?;
 
     // Per-blob node-ref accumulation. Earlier this function used
@@ -1301,6 +1389,74 @@ mod tests {
     use crate::owned::TypeFilter;
     use crate::writer::PbfWriter;
 
+    fn filter_for(expressions: &[&str]) -> Option<BlobFilter> {
+        let strs: Vec<String> = expressions.iter().map(|s| (*s).to_string()).collect();
+        blob_filter_from_expressions(&parse_expressions(&strs).expect("parse"))
+    }
+
+    fn sorted_keys(keys: Option<&[Box<[u8]>]>) -> Vec<String> {
+        let mut out: Vec<String> = keys
+            .map(|ks| {
+                ks.iter()
+                    .map(|k| String::from_utf8_lossy(k).into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    /// The blob-level tag filter is a key-set membership test, so it can carry
+    /// exact keys and key prefixes and nothing else. A key matcher the set
+    /// cannot express has to disable tag-level blob skipping outright -
+    /// including the keys contributed by the *other* expressions, since the
+    /// filter is a union and skipping on the union would skip blobs the
+    /// unconstrained expression could still match.
+    #[test]
+    fn blob_filter_drops_tag_keys_when_a_key_matcher_cannot_be_expressed() {
+        // Constrainable forms, one per matcher shape.
+        let f = filter_for(&["highway=primary"]).expect("filter");
+        assert_eq!(sorted_keys(f.required_tag_keys.as_deref()), vec!["highway"]);
+
+        let f = filter_for(&["amenity,shop"]).expect("filter");
+        assert_eq!(
+            sorted_keys(f.required_tag_keys.as_deref()),
+            vec!["amenity", "shop"],
+            "every alternative of a key list is a key the blob may carry"
+        );
+
+        let f = filter_for(&["addr:*"]).expect("filter");
+        assert!(f.required_tag_keys.is_none());
+        assert_eq!(
+            sorted_keys(f.required_tag_prefixes.as_deref()),
+            vec!["addr:"]
+        );
+
+        // A substring key matcher constrains nothing expressible, so the
+        // whole tag filter goes - `highway` included. Without this, widening
+        // the matcher to accept `*:name` would have made it skip every blob
+        // whose index lacks a literal `highway` key.
+        let f = filter_for(&["highway=primary", "*:name"]);
+        assert!(
+            f.is_none(),
+            "no type narrowing and no expressible tag key leaves nothing to filter on"
+        );
+
+        // Same, but with a type narrowing worth keeping: the blob filter
+        // survives for its type bits while the tag keys are dropped.
+        let f = filter_for(&["n/highway=primary", "n/*:name"]).expect("filter");
+        assert!(f.want_nodes);
+        assert!(!f.want_ways);
+        assert!(
+            f.required_tag_keys.is_none() && f.required_tag_prefixes.is_none(),
+            "a substring key matcher must not leave `highway` behind as a blob-skip criterion"
+        );
+
+        // And a bare `*` key is the same story.
+        let f = filter_for(&["n/amenity", "n/*"]).expect("filter");
+        assert!(f.required_tag_keys.is_none());
+    }
+
     #[test]
     fn single_pass_filters_matching_elements() {
         let dir = tempfile::tempdir().unwrap();
@@ -1324,6 +1480,7 @@ mod tests {
             &input,
             &output,
             &expressions,
+            false,
             false,
             Compression::default(),
             false,
@@ -1351,9 +1508,9 @@ mod tests {
                 ways: true,
                 relations: false,
             },
-            matcher: TagMatcher::KeyOnly {
-                key: "highway".to_string(),
-            },
+            matcher: crate::tag_expr::parse_expression("highway")
+                .expect("parse")
+                .matcher,
         };
         let tags = [("highway", "primary")];
         assert!(!element_matches(
@@ -1384,16 +1541,15 @@ mod tests {
         let exprs = vec![
             Expression {
                 type_filter: TypeFilter::all(),
-                matcher: TagMatcher::KeyOnly {
-                    key: "amenity".to_string(),
-                },
+                matcher: crate::tag_expr::parse_expression("amenity")
+                    .expect("parse")
+                    .matcher,
             },
             Expression {
                 type_filter: TypeFilter::all(),
-                matcher: TagMatcher::ExactValue {
-                    key: "highway".to_string(),
-                    value: "primary".to_string(),
-                },
+                matcher: crate::tag_expr::parse_expression("highway=primary")
+                    .expect("parse")
+                    .matcher,
             },
         ];
         assert!(element_matches(

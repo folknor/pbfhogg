@@ -312,3 +312,62 @@ pbfhogg-unique - it's an ecosystem-wide gap.
 **Impact:** Users with JOSM-local staging data must resolve negative
 IDs before running pbfhogg commands that touch the invariant sites.
 This affects only hand-edited files that haven't been uploaded.
+
+## cat: multi-input header is reconciled, not blanked
+
+`osmium cat` writes a default-constructed `osmium::io::Header` whenever it is
+given more than one input file - in `command_cat.cpp::run`, only the
+`m_input_files.size() == 1` branch copies the reader's header. Every input's
+bounding box, replication timestamp, replication sequence number and
+replication base URL is discarded.
+
+`pbfhogg cat` reconciles instead. It reads every input's header and keeps only
+what the inputs collectively support:
+
+- **bbox**: the union, and only when *every* input declares one. An input
+  without a declared box has unknown extent, so the union is unknown and the
+  field is omitted.
+- **replication timestamp / sequence number / base URL**: kept per field, and
+  only when every input agrees on that field's value.
+- **`HistoricalInformation`**: the logical OR, since it declares that history
+  metadata *may* be present.
+
+Both designs obey the same rule - a header must never claim more than the data
+supports - and both can only ever understate. osmium applies it bluntly;
+pbfhogg applies it per field. The practical difference is that a `cat` of two
+adjacent extracts from the same replication source keeps a usable bbox and base
+URL here and loses them under osmium.
+
+This is a deviation from *osmium*, not from pbfhogg's own prior behaviour,
+which was worse than either: all three cat paths built the output header from
+the first input alone, so the output advertised one input's bounding box over
+data drawn from all of them.
+
+## tags-filter: expression-syntax edge cases
+
+The matcher is built to match `osmium-tool/src/util.cpp::get_string_matcher`
+and `get_tag_matcher` rule for rule, including the order in which the `!`
+inversion marker is tested relative to whitespace stripping - the marker counts
+only when it is the last character of the raw key, so `highway !=x` inverts
+while `highway ! = x` means the literal key `highway !`. Three edges deviate
+deliberately.
+
+**An empty key is an error, not an empty-string match.** `get_string_matcher`
+returns `equal{""}` for an empty key, so osmium accepts `=value` and matches
+tags whose key is the empty string. pbfhogg rejects `=value` and `!=value` with
+`empty key in expression`. A PBF may technically carry an empty key, but an
+expression that produces one is far more likely to be a typo than an intent,
+and an error is recoverable where a silent zero-match is not.
+
+**An unrecognised type prefix is treated as part of the key, not an error.**
+`get_filter_expression` splits on the first `/` anywhere in the expression and
+hands the prefix to `get_types`, which throws on any character outside
+`n`, `w`, `r`, `a`. So `addr:full/name` is a hard error under osmium. pbfhogg
+applies the type prefix only when every character before the `/` is one of
+`n`, `w`, `r`, and otherwise treats the whole string as the tag expression, so
+`addr:full/name` filters on that literal key.
+
+**There is no area (`a`) type.** osmium's `get_types` accepts `a` and routes
+matching expressions to a separate area filter. pbfhogg has no area concept in
+`tags-filter`, so `a` is not a recognised prefix character and an expression
+using it falls through to the key-literal rule above.

@@ -236,6 +236,51 @@ pub struct DegradeFlags {
     /// `--strip-indexdata` it is a header-only change, so it composes with
     /// the passthrough path and leaves `indexdata` alone.
     pub strip_tagdata: bool,
+    /// Replace every blob's `BlobHeader.tagdata` (field 4) with a *valid but
+    /// wrong* tag key index: a well-formed index naming one key no OSM file
+    /// uses, so it parses cleanly and claims the blob carries none of the keys
+    /// it actually carries.
+    ///
+    /// This is the adversarial case `--strip-tagdata` cannot produce.
+    /// Stripping removes the hint, and a blob with no hint is decoded rather
+    /// than skipped, so a stripped file only exercises the slow path and can
+    /// never produce a wrong answer. A *lying* hint makes `tags-filter` skip
+    /// blobs whose elements match, emit fewer elements than it should, and
+    /// report a cheerful "N blobs skipped by tag index" while doing it. That
+    /// is the failure mode blob-level tag-index skipping risks, and until this
+    /// flag existed there was no way to write a test that produced it.
+    ///
+    /// Header-only, so it composes with the passthrough path. Mutually
+    /// exclusive with `--strip-tagdata`: both target field 4.
+    pub corrupt_tagdata: bool,
+    /// Replace every blob's `BlobHeader.indexdata` (field 2) with a *valid but
+    /// wrong* index: same element kind, inflated `count`, widened `max_id`.
+    ///
+    /// The counterpart of `corrupt_tagdata` for the other sidecar hint, and
+    /// the fixture `inspect --distrust-metadata` exists for. `inspect`
+    /// answers counts and ID ranges straight out of indexdata whenever every
+    /// blob has some, so on a file with a lying index it reports the lie as a
+    /// measurement. The kind is preserved deliberately: mislabelling it would
+    /// derail the per-kind classify schedules everywhere and obscure the one
+    /// property under test.
+    ///
+    /// Header-only, and mutually exclusive with `--strip-indexdata`.
+    pub corrupt_indexdata: bool,
+    /// Rotate every blob's `BlobHeader.indexdata` element *kind* - node ->
+    /// way -> relation -> node - leaving count, ID range and bbox honest.
+    ///
+    /// The kind is the field the per-kind classify schedules select blobs on
+    /// (`build_classify_schedule`), so mislabelling it is the corruption that
+    /// makes a consumer skip a blob outright rather than merely misreport it.
+    /// `--corrupt-indexdata` deliberately preserves the kind so its own
+    /// fixture stays readable; this flag is the separate mode for the
+    /// blob-selection question, and it is what makes a
+    /// `tags-filter --distrust-metadata` test bite through reference
+    /// expansion rather than only through the direct-match pass.
+    ///
+    /// Header-only, mutually exclusive with `--strip-indexdata`, and
+    /// combinable with `--corrupt-indexdata`.
+    pub corrupt_indexdata_kind: bool,
     /// Clear the `HeaderBlock.bbox` (field 1) from the OSMHeader so the
     /// output declares no file-level bounding box. Purely an OSMHeader
     /// rewrite - every OsmData blob passes through untouched - so like the
@@ -253,6 +298,9 @@ impl DegradeFlags {
             || self.strip_locations
             || self.strip_indexdata
             || self.strip_tagdata
+            || self.corrupt_tagdata
+            || self.corrupt_indexdata
+            || self.corrupt_indexdata_kind
             || self.strip_bbox
             || self.drop_ids.is_some()
     }
@@ -310,6 +358,15 @@ impl DegradeStats {
         if self.flags.strip_tagdata {
             applied.push("--strip-tagdata");
         }
+        if self.flags.corrupt_tagdata {
+            applied.push("--corrupt-tagdata");
+        }
+        if self.flags.corrupt_indexdata {
+            applied.push("--corrupt-indexdata");
+        }
+        if self.flags.corrupt_indexdata_kind {
+            applied.push("--corrupt-indexdata-kind");
+        }
         if self.flags.strip_bbox {
             applied.push("--strip-bbox");
         }
@@ -356,8 +413,40 @@ pub fn degrade(
     if !flags.any() {
         return Err("degrade requires at least one transformation flag \
                     (--unsort, --unsort-intra, --strip-locations, \
-                     --strip-indexdata, --strip-tagdata, --strip-bbox)"
+                     --strip-indexdata, --strip-tagdata, --corrupt-tagdata, \
+                     --corrupt-indexdata, --corrupt-indexdata-kind, --strip-bbox)"
             .into());
+    }
+    // The decode path rebuilds each blob's hints from the elements it just
+    // re-encoded, so a corrupt hint written there would be overwritten by a
+    // correct one. Refuse rather than accept a flag that would do nothing.
+    if (flags.corrupt_tagdata || flags.corrupt_indexdata || flags.corrupt_indexdata_kind)
+        && flags.needs_decode()
+    {
+        return Err(
+            "--corrupt-tagdata, --corrupt-indexdata and --corrupt-indexdata-kind are \
+                    header-only rewrites and cannot be combined with a transformation \
+                    that re-encodes blobs \
+                    (--unsort, --unsort-intra, --strip-locations, --drop-ids), which \
+                    would rebuild the hint correctly"
+                .into(),
+        );
+    }
+    if flags.strip_tagdata && flags.corrupt_tagdata {
+        return Err(
+            "--strip-tagdata and --corrupt-tagdata are mutually exclusive: \
+                    both rewrite BlobHeader field 4, one to nothing and one to a \
+                    deliberately wrong index"
+                .into(),
+        );
+    }
+    if flags.strip_indexdata && (flags.corrupt_indexdata || flags.corrupt_indexdata_kind) {
+        return Err(
+            "--strip-indexdata is mutually exclusive with --corrupt-indexdata and \
+                    --corrupt-indexdata-kind: all three rewrite BlobHeader field 2, \
+                    one to nothing and the others to a deliberately wrong index"
+                .into(),
+        );
     }
     if flags.unsort && flags.unsort_intra {
         return Err(
@@ -391,6 +480,15 @@ pub fn degrade(
         crate::debug::emit_counter("degrade_strip_locations", i64::from(flags.strip_locations));
         crate::debug::emit_counter("degrade_strip_indexdata", i64::from(flags.strip_indexdata));
         crate::debug::emit_counter("degrade_strip_tagdata", i64::from(flags.strip_tagdata));
+        crate::debug::emit_counter("degrade_corrupt_tagdata", i64::from(flags.corrupt_tagdata));
+        crate::debug::emit_counter(
+            "degrade_corrupt_indexdata",
+            i64::from(flags.corrupt_indexdata),
+        );
+        crate::debug::emit_counter(
+            "degrade_corrupt_indexdata_kind",
+            i64::from(flags.corrupt_indexdata_kind),
+        );
         crate::debug::emit_counter("degrade_strip_bbox", i64::from(flags.strip_bbox));
         crate::debug::emit_counter("degrade_drop_ids", i64::from(flags.drop_ids.is_some()));
         if let Some(spec) = flags.drop_ids {
@@ -552,11 +650,14 @@ fn degrade_passthrough(
                 // untouched indexdata byte-identical - a v1 index stays v1 -
                 // and carries WayMembers-v1 and any unknown header fields
                 // through unchanged.
+                let corrupt_index = corrupted_index(frame.index, flags);
                 let reframed = reframe_raw(
                     frame.header_bytes(),
                     frame.blob_bytes(),
-                    flags.strip_indexdata,
-                    flags.strip_tagdata,
+                    flags.strip_indexdata || corrupt_index.is_some(),
+                    flags.strip_tagdata || flags.corrupt_tagdata,
+                    flags.corrupt_tagdata,
+                    corrupt_index,
                 )?;
                 writer.write_raw_owned(reframed)?;
                 blobs_written += 1;
@@ -578,6 +679,48 @@ fn degrade_passthrough(
     })
 }
 
+/// The key a `--corrupt-tagdata` index claims the blob carries. Chosen so no
+/// real OSM tag can collide with it: any expression naming it would have to be
+/// written on purpose.
+const CORRUPT_TAGDATA_KEY: &[u8] = b"pbfhogg:degrade:no-such-key";
+
+/// How far a `--corrupt-indexdata` index overstates the blob it describes.
+/// Large enough that no honest count could coincide with it.
+const CORRUPT_INDEXDATA_INFLATION: i64 = 1_000_000;
+
+/// The lying `BlobIndex` to write for one blob, or `None` when no
+/// index-corrupting flag is active.
+///
+/// Both corruptions go through `BlobIndex::serialize`, the same encoder the
+/// honest path uses, so what lands on the wire is a structurally valid v2
+/// index that deserializes to exactly the values set here. That is the whole
+/// point: a malformed index would be rejected by the reader's own validation
+/// and every test built on it would be proving that validation works rather
+/// than that the consumer stops believing a plausible lie.
+fn corrupted_index(
+    base: Option<crate::blob_meta::BlobIndex>,
+    flags: DegradeFlags,
+) -> Option<crate::blob_meta::BlobIndex> {
+    if !flags.corrupt_indexdata && !flags.corrupt_indexdata_kind {
+        return None;
+    }
+    let mut index = base?;
+    if flags.corrupt_indexdata {
+        index.count = index
+            .count
+            .saturating_add(CORRUPT_INDEXDATA_INFLATION.cast_unsigned());
+        index.max_id = index.max_id.saturating_add(CORRUPT_INDEXDATA_INFLATION);
+    }
+    if flags.corrupt_indexdata_kind {
+        index.kind = match index.kind {
+            crate::blob_meta::ElemKind::Node => crate::blob_meta::ElemKind::Way,
+            crate::blob_meta::ElemKind::Way => crate::blob_meta::ElemKind::Relation,
+            crate::blob_meta::ElemKind::Relation => crate::blob_meta::ElemKind::Node,
+        };
+    }
+    Some(index)
+}
+
 /// Reframe a raw OSMData blob, re-emitting its original `BlobHeader` with only
 /// the flagged hint fields removed - `indexdata` (field 2) under
 /// `strip_indexdata`, `tagdata` (field 4) under `strip_tagdata`. Every other
@@ -592,6 +735,8 @@ fn reframe_raw(
     blob_bytes: &[u8],
     strip_indexdata: bool,
     strip_tagdata: bool,
+    corrupt_tagdata: bool,
+    corrupt_index: Option<crate::blob_meta::BlobIndex>,
 ) -> std::io::Result<Vec<u8>> {
     let mut strip_fields: Vec<u32> = Vec::with_capacity(2);
     if strip_indexdata {
@@ -602,6 +747,18 @@ fn reframe_raw(
     }
     let mut header_buf = Vec::new();
     strip_blob_header_fields(header_bytes, &strip_fields, &mut header_buf)?;
+    if let Some(index) = corrupt_index {
+        // Field 2 was just removed above; re-emit the lying index built by
+        // `corrupted_index`.
+        protohoggr::encode_bytes_field(&mut header_buf, 2, &index.serialize());
+    }
+    if corrupt_tagdata {
+        // Field 4 was just removed above; re-emit it carrying an index that
+        // parses cleanly and describes a blob other than this one.
+        let bogus = crate::blob_meta::encode_tag_index(std::iter::once(CORRUPT_TAGDATA_KEY))
+            .ok_or_else(|| std::io::Error::other("could not encode the corrupt tag index"))?;
+        protohoggr::encode_bytes_field(&mut header_buf, 4, &bogus);
+    }
     let header_len = u32::try_from(header_buf.len()).map_err(|_| {
         std::io::Error::other(format!("header too large: {} bytes", header_buf.len()))
     })?;

@@ -576,6 +576,285 @@ enum BlobKindLabel {
     Relation,
 }
 
+/// One OsmData blob's *declared* index, read straight out of `BlobHeader`
+/// field 2 and decoded by hand: `(kind, min_id, max_id, count)`.
+///
+/// Deliberately not routed through the library's `BlobIndex::deserialize`.
+/// The corruption modes below are the foundation every `--distrust-metadata`
+/// test stands on, and what they have to produce is a *well-formed* lie: an
+/// index that a reader accepts and acts on. Checking it with an independent
+/// decoder is what distinguishes "the consumer believed a plausible lie" from
+/// "the consumer fell back to decoding because the bytes were garbage" - two
+/// outcomes that look identical from the consumer's output.
+fn declared_indexdata(path: &Path) -> Vec<(BlobKindLabel, i64, i64, u64)> {
+    fn read_varint_at(buf: &[u8], pos: &mut usize) -> u64 {
+        let mut result = 0u64;
+        let mut shift = 0u32;
+        loop {
+            let byte = buf[*pos];
+            *pos += 1;
+            result |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        result
+    }
+
+    let mut out = Vec::new();
+    for frame in osm_data_frames(path) {
+        let header_len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+        let header_end = 4 + header_len;
+        let mut hpos = 4usize;
+        let mut indexdata: Option<&[u8]> = None;
+        while hpos < header_end {
+            let tag = read_varint_at(&frame, &mut hpos);
+            let (field, wire) = (tag >> 3, tag & 7);
+            match wire {
+                0 => {
+                    read_varint_at(&frame, &mut hpos);
+                }
+                2 => {
+                    let len = usize::try_from(read_varint_at(&frame, &mut hpos)).expect("len");
+                    if field == 2 {
+                        indexdata = Some(&frame[hpos..hpos + len]);
+                    }
+                    hpos += len;
+                }
+                _ => panic!("unexpected wire type {wire} in BlobHeader"),
+            }
+        }
+        let bytes = indexdata.expect("every blob in these fixtures carries indexdata");
+        assert!(
+            bytes.len() >= 26,
+            "a well-formed index is at least the 26-byte v1 layout, got {}",
+            bytes.len()
+        );
+        assert!(
+            bytes[0] == 0x01 || bytes[0] == 0x02,
+            "a well-formed index declares a version the reader recognises, got {:#04x}",
+            bytes[0]
+        );
+        let kind = match bytes[1] {
+            0 => BlobKindLabel::Node,
+            1 => BlobKindLabel::Way,
+            2 => BlobKindLabel::Relation,
+            other => panic!("a well-formed index declares a known element kind, got {other}"),
+        };
+        let min_id = i64::from_le_bytes(bytes[2..10].try_into().expect("8 bytes"));
+        let max_id = i64::from_le_bytes(bytes[10..18].try_into().expect("8 bytes"));
+        let count = u64::from_le_bytes(bytes[18..26].try_into().expect("8 bytes"));
+        out.push((kind, min_id, max_id, count));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// --corrupt-tagdata / --corrupt-indexdata / --corrupt-indexdata-kind
+// ---------------------------------------------------------------------------
+
+/// `--corrupt-indexdata` must overstate every blob through a *valid* index.
+///
+/// The three consumer-side `--distrust-metadata` tests all stand on these
+/// modes, and each would still pass if the corruption produced malformed
+/// bytes: the consumer would fall back to decoding, get the right answer, and
+/// the assertion would succeed while proving nothing about the trust boundary.
+/// So the corruption is checked here, at the producer, against an independent
+/// decoder - and the payload is checked to be untouched, since a header-only
+/// rewrite that damaged the elements would make every downstream count wrong
+/// for an unrelated reason.
+#[test]
+fn degrade_corrupt_indexdata_writes_a_valid_but_overstated_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    write_degrade_fixture(&input);
+    assert_indexed(&input);
+    let before = declared_indexdata(&input);
+    assert!(before.len() > 1, "fixture must have several blobs");
+
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--corrupt-indexdata")
+        .assert_success();
+
+    assert_indexed(&output);
+    let after = declared_indexdata(&output);
+    assert_eq!(after.len(), before.len(), "every blob is carried through");
+    for (i, (b, a)) in before.iter().zip(&after).enumerate() {
+        assert_eq!(a.0, b.0, "blob {i}: --corrupt-indexdata preserves the kind");
+        assert_eq!(a.1, b.1, "blob {i}: min_id is left honest");
+        assert_eq!(a.2, b.2 + 1_000_000, "blob {i}: max_id is widened");
+        assert_eq!(a.3, b.3 + 1_000_000, "blob {i}: count is inflated");
+    }
+
+    // Payload untouched: the lie is in the header and nowhere else.
+    let original = read_normalized(&input);
+    let degraded = read_normalized(&output);
+    assert_eq!(original.nodes, degraded.nodes);
+    assert_eq!(original.ways, degraded.ways);
+    assert_eq!(original.relations, degraded.relations);
+}
+
+/// `--corrupt-indexdata-kind` rotates the declared kind and nothing else. The
+/// kind is what per-kind blob schedules select on, so this is the corruption
+/// that makes a consumer skip a blob rather than merely misreport it.
+#[test]
+fn degrade_corrupt_indexdata_kind_rotates_only_the_declared_kind() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    write_degrade_fixture(&input);
+    assert_indexed(&input);
+    let before = declared_indexdata(&input);
+    let real_kinds: Vec<BlobKindLabel> = blob_index_summary(&input).iter().map(|b| b.0).collect();
+    assert_eq!(
+        before.iter().map(|b| b.0).collect::<Vec<_>>(),
+        real_kinds,
+        "the input's declared kinds must start out honest, or the rotation below \
+         proves nothing"
+    );
+
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--corrupt-indexdata-kind")
+        .assert_success();
+
+    assert_indexed(&output);
+    let after = declared_indexdata(&output);
+    let rotate = |k: BlobKindLabel| match k {
+        BlobKindLabel::Node => BlobKindLabel::Way,
+        BlobKindLabel::Way => BlobKindLabel::Relation,
+        BlobKindLabel::Relation => BlobKindLabel::Node,
+    };
+    for (i, (b, a)) in before.iter().zip(&after).enumerate() {
+        assert_eq!(a.0, rotate(b.0), "blob {i}: kind rotates");
+        assert_ne!(
+            a.0, real_kinds[i],
+            "blob {i}: the declared kind must now disagree with the payload"
+        );
+        assert_eq!(
+            (a.1, a.2, a.3),
+            (b.1, b.2, b.3),
+            "blob {i}: ID range and count stay honest"
+        );
+    }
+
+    let original = read_normalized(&input);
+    let degraded = read_normalized(&output);
+    assert_eq!(original.nodes, degraded.nodes);
+    assert_eq!(original.ways, degraded.ways);
+    assert_eq!(original.relations, degraded.relations);
+}
+
+/// `--corrupt-tagdata` replaces field 4 and leaves field 2 and the payload
+/// alone. A tag index that no longer parses would be caught by the reader
+/// rather than believed, so the survival of `indexdata` and the elements is
+/// what makes the corruption a *lie* rather than damage.
+#[test]
+fn degrade_corrupt_tagdata_keeps_indexdata_and_elements_intact() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    write_degrade_fixture(&input);
+    assert_has_tagdata(&input);
+    assert_indexed(&input);
+    let tagged_blobs = count_tagdata_blobs(&input);
+    assert!(
+        tagged_blobs > 1,
+        "fixture must carry tagdata in several blobs"
+    );
+
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--corrupt-tagdata")
+        .assert_success();
+
+    assert_eq!(
+        declared_indexdata(&output),
+        declared_indexdata(&input),
+        "--corrupt-tagdata targets field 4 only; field 2 must be byte-equivalent"
+    );
+    assert_has_tagdata(&output);
+    assert!(
+        count_tagdata_blobs(&output) >= count_tagdata_blobs(&input),
+        "every blob gets a tag index, including blobs that had none"
+    );
+
+    let original = read_normalized(&input);
+    let degraded = read_normalized(&output);
+    assert_eq!(original.nodes, degraded.nodes);
+    assert_eq!(original.ways, degraded.ways);
+    assert_eq!(original.relations, degraded.relations);
+}
+
+/// The corruption modes are header-only rewrites. Combining one with a
+/// transformation that re-encodes blobs would silently produce an *honest*
+/// file, because the decode path rebuilds each hint from the elements it just
+/// wrote - a fixture that quietly stopped lying would make every
+/// `--distrust-metadata` test pass for the wrong reason. Likewise, corrupting
+/// and stripping the same field is a contradiction rather than a precedence
+/// question. All four are rejected, not resolved.
+#[test]
+fn degrade_rejects_contradictory_corruption_combinations() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    write_degrade_fixture(&input);
+
+    let reject = |flags: &[&str], expect: &str| {
+        let output = dir.path().join(format!("out-{}.osm.pbf", flags.join("-")));
+        let mut inv = CliInvoker::new();
+        inv = inv.arg("degrade").arg(&input).arg("-o").arg(&output);
+        for f in flags {
+            inv = inv.arg(*f);
+        }
+        inv.assert_failure().assert_stderr_contains(expect);
+    };
+
+    reject(
+        &["--corrupt-indexdata", "--unsort"],
+        "cannot be combined with a transformation that re-encodes blobs",
+    );
+    reject(
+        &["--corrupt-tagdata", "--strip-locations"],
+        "cannot be combined with a transformation that re-encodes blobs",
+    );
+    reject(
+        &["--corrupt-indexdata-kind", "--unsort"],
+        "cannot be combined with a transformation that re-encodes blobs",
+    );
+
+    // Passing counterpart: each corruption flag on its own is accepted, so the
+    // rejections above are about the combination and not about the flag.
+    for flag in [
+        "--corrupt-indexdata",
+        "--corrupt-tagdata",
+        "--corrupt-indexdata-kind",
+    ] {
+        let output = dir.path().join(format!("ok{flag}.osm.pbf"));
+        CliInvoker::new()
+            .arg("degrade")
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .arg(flag)
+            .assert_success();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // --strip-indexdata
 // ---------------------------------------------------------------------------

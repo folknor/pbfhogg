@@ -10,6 +10,6 @@ mod scan;
 mod show_element;
 mod types;
 
-pub use scan::inspect;
+pub use scan::{InspectOptions, inspect};
 pub use show_element::{ShowElementType, show_element};
 pub use types::InspectReport;

@@ -36,6 +36,20 @@ pub struct RefCheckResult {
     /// Every missing reference occurrence (populated when `show_ids` is true).
     /// Not deduplicated - each occurrence is a separate entry.
     pub missing_refs: Vec<MissingRef>,
+    /// Element IDs that could not be entered into the tracking `IdSet` at all -
+    /// negative, or above the bound `id_alloc_bound` allowed for the kind.
+    ///
+    /// These are *not* missing references, but every reference that points at
+    /// one is reported as missing, because the element was never recorded as
+    /// present. Without this counter that over-report is indistinguishable
+    /// from a genuinely dangling reference - the reader has no way to tell
+    /// "your file references a node it does not contain" from "your file
+    /// contains a node this check could not track". `verify_ids` reports the
+    /// identical situation as `IdViolation::IdOutOfRange`; the two commands
+    /// answer the same question, so they say the same thing.
+    ///
+    /// Indexed by kind: nodes, ways, relations.
+    pub untrackable_ids: [u64; 3],
 }
 
 impl RefCheckResult {
@@ -45,6 +59,14 @@ impl RefCheckResult {
             && self.missing_way_refs == 0
             && self.missing_node_members == 0
             && self.missing_relation_members == 0
+    }
+
+    /// Total number of element IDs that could not be tracked, across kinds.
+    ///
+    /// Non-zero means the missing-reference counts above are an upper bound
+    /// rather than an exact answer.
+    pub fn total_untrackable(&self) -> u64 {
+        self.untrackable_ids[0] + self.untrackable_ids[1] + self.untrackable_ids[2]
     }
 
     /// Total number of missing references.
@@ -61,6 +83,8 @@ impl RefCheckResult {
 #[derive(Default)]
 struct WayBlobResult {
     way_count: u64,
+    /// Way IDs `way_ids.set_atomic_checked` refused (see `untrackable_ids`).
+    untrackable_way_ids: u64,
     way_refs_checked: u64,
     missing_node_refs: Vec<i64>,
     /// Populated only when `show_ids` is true.
@@ -71,6 +95,8 @@ struct WayBlobResult {
 #[derive(Default)]
 struct RelBlobResult {
     relation_count: u64,
+    /// Relation IDs `relation_ids.set_atomic_checked` refused.
+    untrackable_relation_ids: u64,
     rel_node_members_checked: u64,
     rel_way_members_checked: u64,
     rel_rel_members_deferred: u64,
@@ -170,6 +196,7 @@ pub fn check_refs(
         missing_relation_members: 0,
         missing_relation_member_occurrences: 0,
         missing_refs: Vec::new(),
+        untrackable_ids: [0; 3],
     };
 
     let mut missing_node_refs_vec: Vec<i64> = Vec::new();
@@ -231,25 +258,29 @@ pub fn check_refs(
             &node_schedule,
             None,
             || (),
-            |block, &mut ()| -> u64 {
+            // `set_atomic_checked` returning false means the ID is outside the
+            // range this IdSet can represent, so the node is never recorded as
+            // present and every way ref pointing at it will be reported
+            // missing. Counting those is what keeps that over-report legible.
+            |block, &mut ()| -> (u64, u64) {
                 let mut count: u64 = 0;
+                let mut untrackable: u64 = 0;
                 for el in block.elements_skip_metadata() {
-                    match el {
-                        Element::DenseNode(dn) => {
-                            node_ids_ref.set_atomic_checked(dn.id());
-                            count += 1;
-                        }
-                        Element::Node(n) => {
-                            node_ids_ref.set_atomic_checked(n.id());
-                            count += 1;
-                        }
-                        _ => {}
+                    let id = match el {
+                        Element::DenseNode(dn) => dn.id(),
+                        Element::Node(n) => n.id(),
+                        _ => continue,
+                    };
+                    if !node_ids_ref.set_atomic_checked(id) {
+                        untrackable += 1;
                     }
+                    count += 1;
                 }
-                count
+                (count, untrackable)
             },
-            |_seq, count| {
+            |_seq, (count, untrackable)| {
                 result.node_count += count;
+                result.untrackable_ids[0] += untrackable;
             },
         )?;
     }
@@ -275,8 +306,8 @@ pub fn check_refs(
                 for el in block.elements_skip_metadata() {
                     if let Element::Way(w) = el {
                         let wid = w.id();
-                        if check_relations {
-                            way_ids_ref.set_atomic_checked(wid);
+                        if check_relations && !way_ids_ref.set_atomic_checked(wid) {
+                            r.untrackable_way_ids += 1;
                         }
                         r.way_count += 1;
                         for nref in w.refs() {
@@ -299,6 +330,7 @@ pub fn check_refs(
             },
             |_seq, r| {
                 result.way_count += r.way_count;
+                result.untrackable_ids[1] += r.untrackable_way_ids;
                 way_refs_checked += r.way_refs_checked;
                 missing_node_refs_vec.extend(r.missing_node_refs);
                 if show_ids {
@@ -336,7 +368,9 @@ pub fn check_refs(
                     for el in block.elements_skip_metadata() {
                         if let Element::Relation(rel) = el {
                             let rid = rel.id();
-                            relation_ids_ref.set_atomic_checked(rid);
+                            if !relation_ids_ref.set_atomic_checked(rid) {
+                                r.untrackable_relation_ids += 1;
+                            }
                             r.relation_count += 1;
                             for mem in rel.members() {
                                 match mem.id {
@@ -387,6 +421,7 @@ pub fn check_refs(
                 },
                 |_seq, r| {
                     result.relation_count += r.relation_count;
+                    result.untrackable_ids[2] += r.untrackable_relation_ids;
                     rel_node_members_checked += r.rel_node_members_checked;
                     rel_way_members_checked += r.rel_way_members_checked;
                     rel_rel_members_deferred += r.rel_rel_members_deferred;
@@ -468,6 +503,18 @@ pub fn check_refs(
         crate::debug::emit_counter(
             "checkrefs_missing_relation_members",
             result.missing_relation_members as i64,
+        );
+        crate::debug::emit_counter(
+            "checkrefs_untrackable_node_ids",
+            result.untrackable_ids[0] as i64,
+        );
+        crate::debug::emit_counter(
+            "checkrefs_untrackable_way_ids",
+            result.untrackable_ids[1] as i64,
+        );
+        crate::debug::emit_counter(
+            "checkrefs_untrackable_relation_ids",
+            result.untrackable_ids[2] as i64,
         );
 
         // One-shot post-pass timers.

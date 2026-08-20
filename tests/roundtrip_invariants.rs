@@ -371,6 +371,7 @@ fn tags_filter_idempotence() {
 
     let exprs = vec!["w/building=yes".to_string()];
     let opts = pbfhogg::tags_filter::TagsFilterOptions {
+        distrust_metadata: false,
         expression_strs: &exprs,
         omit_referenced: true,
         invert: false,
@@ -454,6 +455,7 @@ fn tags_filter_blob_layout_independence() {
 
     let exprs = vec!["w/highway=primary".to_string()];
     let opts = pbfhogg::tags_filter::TagsFilterOptions {
+        distrust_metadata: false,
         expression_strs: &exprs,
         omit_referenced: false,
         invert: false,
@@ -607,6 +609,7 @@ fn tags_filter_compression_level_parity() {
 
     for (_label, compression, path) in &outputs {
         let opts = pbfhogg::tags_filter::TagsFilterOptions {
+            distrust_metadata: false,
             expression_strs: &exprs,
             omit_referenced: false,
             invert: false,

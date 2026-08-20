@@ -472,7 +472,17 @@ fn inspect_rejects_oversized_header_length_via_walker() {
     let path = dir.path().join("adversarial.osm.pbf");
     std::fs::write(&path, 65536u32.to_be_bytes()).unwrap();
 
-    let result = pbfhogg::inspect::inspect(&path, false, false, false, false, false);
+    let result = pbfhogg::inspect::inspect(
+        &path,
+        &pbfhogg::inspect::InspectOptions {
+            show_blocks: false,
+            show_id_ranges: false,
+            show_locations: false,
+            extended: false,
+            distrust_metadata: false,
+            direct_io: false,
+        },
+    );
     let err = match result {
         Ok(_) => panic!("expected inspect() to error on adversarial file"),
         Err(e) => e,
@@ -627,7 +637,17 @@ fn inspect_rejects_oversized_datasize_via_walker() {
     append_oversized_datasize_frame(&mut data, MAX_BLOB_DATASIZE);
     std::fs::write(&path, &data).unwrap();
 
-    let result = pbfhogg::inspect::inspect(&path, false, false, false, false, false);
+    let result = pbfhogg::inspect::inspect(
+        &path,
+        &pbfhogg::inspect::InspectOptions {
+            show_blocks: false,
+            show_id_ranges: false,
+            show_locations: false,
+            extended: false,
+            distrust_metadata: false,
+            direct_io: false,
+        },
+    );
     let err = match result {
         Ok(_) => panic!("expected inspect() to error on adversarial datasize"),
         Err(e) => e,

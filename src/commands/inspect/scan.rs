@@ -18,31 +18,51 @@ use crate::read::raw_frame::read_raw_frame;
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// What to report, and how much of the file's own word to take for it.
+pub struct InspectOptions {
+    /// Per-block distribution stats and block listing.
+    pub show_blocks: bool,
+    /// Min/max element IDs per type and monotonicity.
+    pub show_id_ranges: bool,
+    /// Locations-on-ways diagnostics. Forces a full decode.
+    pub show_locations: bool,
+    /// Extended scan: timestamp range, data bbox, metadata coverage, ordering.
+    /// Forces a full decode.
+    pub extended: bool,
+    /// Decode every blob instead of reporting from `indexdata`.
+    ///
+    /// Without this, `inspect` answers from each blob's own `indexdata`
+    /// whenever every blob has some - counts, ID ranges and per-block stats
+    /// alike. Nothing validates indexdata against the payload it describes, so
+    /// on precisely the file you reached for `inspect` to diagnose, the report
+    /// is a transcription of the file's claims rather than a measurement of
+    /// its contents. A tool used to answer "is this file lying to me?" has to
+    /// have a mode that does not consult the part that might be lying.
+    pub distrust_metadata: bool,
+    /// Use O_DIRECT for the full-decode path.
+    pub direct_io: bool,
+}
+
 #[hotpath::measure]
-pub fn inspect(
-    path: &Path,
-    show_blocks: bool,
-    show_id_ranges: bool,
-    show_locations: bool,
-    extended: bool,
-    direct_io: bool,
-) -> Result<InspectReport> {
+pub fn inspect(path: &Path, opts: &InspectOptions) -> Result<InspectReport> {
     // Index-only fast path: skip decompression when all blobs have indexdata.
     // --locations and --extended require per-element data, so they need full decode.
-    if !show_locations
-        && !extended
-        && let Some(report) = try_index_only_scan(path, show_blocks, show_id_ranges, direct_io)?
+    if !opts.show_locations
+        && !opts.extended
+        && !opts.distrust_metadata
+        && let Some(report) =
+            try_index_only_scan(path, opts.show_blocks, opts.show_id_ranges, opts.direct_io)?
     {
         return Ok(report);
     }
 
     full_decode_scan(
         path,
-        show_blocks,
-        show_id_ranges,
-        show_locations,
-        extended,
-        direct_io,
+        opts.show_blocks,
+        opts.show_id_ranges,
+        opts.show_locations,
+        opts.extended,
+        opts.direct_io,
     )
 }
 

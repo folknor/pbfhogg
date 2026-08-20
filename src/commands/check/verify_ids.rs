@@ -5,7 +5,26 @@ use std::path::Path;
 use crate::BoxResult as Result;
 use crate::ElementReader;
 use crate::idset::IdSet;
+use crate::osm_id::osm_id_cmp;
 use crate::owned::TypeFilter;
+
+/// True when `id` does not strictly follow `prev` in canonical OSM ID order.
+///
+/// Canonical order is `0`, then the negative IDs by ascending absolute value,
+/// then the positives - the order [`crate::osm_id::osm_id_cmp`] defines and
+/// the one `sort`, `scan_block_ids_checked` and the blob-overlap logic all
+/// use. `check --ids` used raw `i64` comparison here, which is the same thing
+/// only for positive-only files: on a file carrying negative IDs (JOSM
+/// editor-local staging IDs are the everyday case) the two definitions
+/// disagree in both directions at once. `sort`'s own correctly-ordered output
+/// was reported non-monotonic, and a raw-`i64`-sorted file passed `check`
+/// while `sort` considered it unsorted. A verifier that disagrees with the
+/// definition it verifies is worse than no verifier, so this is the one place
+/// that has to route through `osm_id_cmp`.
+#[inline]
+fn not_after(id: i64, prev: i64) -> bool {
+    osm_id_cmp(id, prev) != std::cmp::Ordering::Greater
+}
 
 // ---------------------------------------------------------------------------
 // Options
@@ -431,7 +450,7 @@ fn verify_single_kind_streaming(
                     }
                     r.last_id = Some(id);
                     if let Some(p) = prev
-                        && id <= p
+                        && not_after(id, p)
                     {
                         r.within_violations.push(IdViolation::NonMonotonic {
                             elem_type,
@@ -466,7 +485,7 @@ fn verify_single_kind_streaming(
             }
         }
         if let (Some(pl), Some(fi)) = (prev_last, r.first_id)
-            && fi <= pl
+            && not_after(fi, pl)
         {
             total_violations += 1;
             if violations.len() < max_errors_remaining {
@@ -745,7 +764,7 @@ fn verify_single_kind_parallel(
                     }
                     r.last_id = Some(id);
                     if let Some(p) = prev
-                        && id <= p
+                        && not_after(id, p)
                     {
                         r.within_violations.push(IdViolation::NonMonotonic {
                             elem_type,
@@ -789,7 +808,7 @@ fn verify_single_kind_parallel(
             }
         }
         if let (Some(pl), Some(fi)) = (prev_last, r.first_id)
-            && fi <= pl
+            && not_after(fi, pl)
         {
             total_violations += 1;
             if violations.len() < max_errors_remaining {

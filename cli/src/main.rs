@@ -114,6 +114,14 @@ struct DirectIoArg {
 }
 
 #[derive(Args)]
+struct DistrustMetadataArg {
+    /// Ignore per-blob sidecar metadata (indexdata, tag index) and decode every
+    /// blob. Slower, but the answer then depends only on element data.
+    #[arg(long = "distrust-metadata")]
+    distrust_metadata: bool,
+}
+
+#[derive(Args)]
 struct ForceArg {
     /// Proceed even if input lacks indexdata (slower fallback path)
     #[arg(long)]
@@ -390,6 +398,29 @@ enum Command {
         /// indexed.
         #[arg(long)]
         strip_tagdata: bool,
+        /// Replace `BlobHeader.tagdata` on every OsmData blob with a
+        /// well-formed tag key index naming one key the blob does not carry.
+        /// The result parses cleanly and lies, so `tags-filter` skips blobs
+        /// whose elements match - the adversarial case `--strip-tagdata`
+        /// cannot produce, since a missing index is decoded rather than
+        /// trusted. Header-only, so it cannot be combined with a
+        /// blob-re-encoding flag.
+        #[arg(long = "corrupt-tagdata", conflicts_with = "strip_tagdata")]
+        corrupt_tagdata: bool,
+        /// Replace `BlobHeader.indexdata` on every OsmData blob with a
+        /// well-formed index that overstates the blob: same element kind,
+        /// inflated count, widened max ID. Produces the file `inspect`
+        /// reports from without decoding anything, which is what
+        /// `inspect --distrust-metadata` exists to see through.
+        #[arg(long = "corrupt-indexdata", conflicts_with = "strip_indexdata")]
+        corrupt_indexdata: bool,
+        /// Rotate the element *kind* in every OsmData blob's
+        /// `BlobHeader.indexdata` - node to way to relation to node - leaving
+        /// count and ID range honest. The kind is what per-kind blob
+        /// schedules select on, so this is the corruption that makes a
+        /// consumer skip a blob entirely rather than misreport it. Header-only.
+        #[arg(long = "corrupt-indexdata-kind", conflicts_with = "strip_indexdata")]
+        corrupt_indexdata_kind: bool,
         /// Clear the `HeaderBlock.bbox` from the OSMHeader so the output
         /// declares no file-level bounding box. Header-only change; every
         /// OsmData blob passes through untouched.
@@ -474,6 +505,8 @@ enum Command {
         io: DirectIoArg,
         #[command(flatten)]
         force: ForceArg,
+        #[command(flatten)]
+        distrust: DistrustMetadataArg,
         /// Worker-pool size for the parallel classify phases.
         /// `0` (default) uses rayon's `available_parallelism()`.
         /// Pass a specific N to measure scaling or constrain CPU use.
@@ -792,6 +825,7 @@ enum Command {
             conflicts_with_all = [
                 "indexed", "nodes", "jobs", "blocks", "id_ranges", "locations",
                 "anomalies", "extended", "get", "json", "force",
+                "distrust_metadata",
             ],
         )]
         show: Option<String>,
@@ -803,6 +837,8 @@ enum Command {
         json: bool,
         #[command(flatten)]
         io: DirectIoArg,
+        #[command(flatten)]
+        distrust: DistrustMetadataArg,
         /// Proceed even if the input lacks indexdata (slower fallback path).
         /// Only the `--nodes` scan has such a fallback, so the flag is
         /// rejected outside `--nodes` rather than ignored.
@@ -1023,6 +1059,7 @@ struct TagsFilterFlags {
     omit_referenced: bool,
     invert_match: bool,
     remove_tags: bool,
+    distrust_metadata: bool,
 }
 
 /// `check`'s selectors and reporting booleans.
@@ -1049,6 +1086,7 @@ struct InspectFlags {
     extended: bool,
     json: bool,
     force: bool,
+    distrust_metadata: bool,
 }
 
 /// `diff`'s output-shape booleans.
@@ -1253,6 +1291,9 @@ fn main() -> process::ExitCode {
                 strip_locations,
                 strip_indexdata,
                 strip_tagdata,
+                corrupt_tagdata,
+                corrupt_indexdata,
+                corrupt_indexdata_kind,
                 strip_bbox,
                 drop_ids,
                 block_cap,
@@ -1278,6 +1319,9 @@ fn main() -> process::ExitCode {
                     strip_locations,
                     strip_indexdata,
                     strip_tagdata,
+                    corrupt_tagdata,
+                    corrupt_indexdata,
+                    corrupt_indexdata_kind,
                     strip_bbox,
                     drop_ids: drop_ids
                         .as_deref()
@@ -1318,6 +1362,7 @@ fn main() -> process::ExitCode {
                 expressions,
                 compression,
                 force,
+                distrust,
                 io,
                 jobs,
                 header,
@@ -1333,6 +1378,15 @@ fn main() -> process::ExitCode {
                     }
                     if remove_tags {
                         return Err("-t/--remove-tags is not valid in OSC mode".into());
+                    }
+                    // OSC is XML: there are no blobs and no sidecar metadata,
+                    // so nothing to distrust. Rejecting says that; accepting
+                    // would imply the OSC path had a trust boundary it does
+                    // not have.
+                    if distrust.distrust_metadata {
+                        return Err(
+                            "--distrust-metadata is not valid in OSC mode (OSC input carries no blob metadata)".into(),
+                        );
                     }
                     if jobs != 0 {
                         return Err("-j/--jobs is not valid in OSC mode (OSC parse is single-threaded)".into());
@@ -1357,6 +1411,7 @@ fn main() -> process::ExitCode {
                         omit_referenced,
                         invert_match,
                         remove_tags,
+                        distrust_metadata: distrust.distrust_metadata,
                     };
                     guarded_output(&output.output, |out| {
                         run_tags_filter(
@@ -1676,6 +1731,7 @@ fn main() -> process::ExitCode {
                 get,
                 json,
                 io,
+                distrust,
                 force,
             } => {
                 if let Some(InspectCommand::Tags {
@@ -1719,6 +1775,7 @@ fn main() -> process::ExitCode {
                             extended,
                             json,
                             force,
+                            distrust_metadata: distrust.distrust_metadata,
                         },
                         jobs,
                         blocks,
@@ -1975,6 +2032,9 @@ fn run_check(
                 "missing_node_members": result.missing_node_members,
                 "missing_relation_members": result.missing_relation_members,
                 "missing_relation_member_occurrences": result.missing_relation_member_occurrences,
+                "untrackable_node_ids": result.untrackable_ids[0],
+                "untrackable_way_ids": result.untrackable_ids[1],
+                "untrackable_relation_ids": result.untrackable_ids[2],
                 "passed": result.is_valid(),
             });
             if show_ids {
@@ -2050,6 +2110,16 @@ fn run_check(
                         );
                     }
                 }
+            }
+            // An untrackable ID is not itself a missing reference, but every
+            // reference to one is counted as missing above. Say so, or the
+            // over-report reads as a genuinely dangling ref.
+            if result.total_untrackable() > 0 {
+                println!(
+                    "Untrackable element IDs: {} nodes, {} ways, {} relations \
+                     - references to these are counted as missing",
+                    result.untrackable_ids[0], result.untrackable_ids[1], result.untrackable_ids[2],
+                );
             }
             if result.is_valid() {
                 println!("Referential integrity: OK");
@@ -2258,6 +2328,7 @@ fn run_tags_filter(
         omit_referenced,
         invert_match,
         remove_tags,
+        distrust_metadata,
     } = flags;
     let all_expressions = combine_expressions(expressions_file, expressions)?;
     if all_expressions.is_empty() {
@@ -2277,6 +2348,7 @@ fn run_tags_filter(
         direct_io: write.direct_io,
         force: write.force,
         jobs: if jobs == 0 { None } else { Some(jobs) },
+        distrust_metadata,
     };
     let stats = pbfhogg::tags_filter::tags_filter(file, output, &opts, overrides)?;
     stats.print_summary();
@@ -3201,7 +3273,20 @@ fn run_inspect(
         extended,
         json,
         force,
+        distrust_metadata,
     } = flags;
+
+    // `--distrust-metadata` only means something for the scanning report:
+    // `--indexed` asks whether indexdata is present (distrusting its contents
+    // does not change the answer), `--nodes` decodes every node already, and
+    // `--get header.*` reads the header blob directly. Rejecting says so
+    // rather than accepting a flag that would do nothing.
+    if distrust_metadata && !matches!(mode, InspectMode::Full) {
+        return Err(
+            "--distrust-metadata applies to the scanning report only, not to --indexed, --nodes or a header --get key"
+                .into(),
+        );
+    }
 
     // JSON pairings that have no output shape, rejected up front for every
     // mode. (`--indexed --json` alone is fine and handled below.)
@@ -3285,8 +3370,17 @@ fn run_inspect(
     } else {
         blocks
     };
-    let mut report =
-        pbfhogg::inspect::inspect(path, show_blocks, id_ranges, locations, extended, direct_io)?;
+    let mut report = pbfhogg::inspect::inspect(
+        path,
+        &pbfhogg::inspect::InspectOptions {
+            show_blocks,
+            show_id_ranges: id_ranges,
+            show_locations: locations,
+            extended,
+            distrust_metadata,
+            direct_io,
+        },
+    )?;
 
     // --indexed combined with other flags: check and report, set exit code
     let mut exit_not_indexed = false;

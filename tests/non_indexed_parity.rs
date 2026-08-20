@@ -224,6 +224,7 @@ fn tags_filter_non_indexed_parity() {
 
     let expression_strs = vec!["w/highway=primary".to_string()];
     let opts = pbfhogg::tags_filter::TagsFilterOptions {
+        distrust_metadata: false,
         expression_strs: &expression_strs,
         omit_referenced: false,
         invert: false,

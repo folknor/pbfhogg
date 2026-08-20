@@ -81,14 +81,139 @@ fn write_nodes_blocks(path: &std::path::Path, blocks: &[usize]) {
     writer.flush().expect("flush");
 }
 
+fn inspect_opts(show_id_ranges: bool, distrust_metadata: bool) -> pbfhogg::inspect::InspectOptions {
+    pbfhogg::inspect::InspectOptions {
+        show_blocks: false,
+        show_id_ranges,
+        show_locations: false,
+        extended: false,
+        distrust_metadata,
+        direct_io: false,
+    }
+}
+
+/// `inspect` is the tool you reach for when a file is suspect, and its
+/// index-only fast path answers counts and ID ranges out of that same suspect
+/// file's `indexdata` without decoding a single element. On a file whose index
+/// lies, the report is a transcription of the lie. `--distrust-metadata` is
+/// the way to make it measure instead.
+#[test]
+fn inspect_distrust_metadata_measures_instead_of_quoting_the_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let honest = dir.path().join("honest.osm.pbf");
+    let lying = dir.path().join("lying.osm.pbf");
+
+    // Three nodes, two ways, one relation, written through the pipelined
+    // writer so every blob carries indexdata.
+    write_indexed_simple_pbf(&honest);
+
+    // Honest file: both modes agree, which is the counterpart that keeps the
+    // divergence below meaningful.
+    let quoted = pbfhogg::inspect::inspect(&honest, &inspect_opts(false, false)).expect("inspect");
+    let measured = pbfhogg::inspect::inspect(&honest, &inspect_opts(false, true)).expect("inspect");
+    assert_eq!(quoted.to_json(None)["elements"]["nodes"], 3);
+    assert_eq!(measured.to_json(None)["elements"]["nodes"], 3);
+
+    pbfhogg::degrade::degrade(
+        &honest,
+        &lying,
+        pbfhogg::degrade::DegradeFlags {
+            corrupt_indexdata: true,
+            ..Default::default()
+        },
+        pbfhogg::degrade::DEFAULT_BLOCK_CAP,
+        Compression::default(),
+        false,
+        false,
+        false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("degrade --corrupt-indexdata");
+
+    let quoted = pbfhogg::inspect::inspect(&lying, &inspect_opts(false, false)).expect("inspect");
+    assert_eq!(
+        quoted.to_json(None)["elements"]["nodes"],
+        1_000_003_u64,
+        "the default fast path reports the file's own inflated claim as a measurement"
+    );
+
+    let measured = pbfhogg::inspect::inspect(&lying, &inspect_opts(false, true)).expect("inspect");
+    let json = measured.to_json(None);
+    assert_eq!(
+        json["elements"]["nodes"], 3,
+        "--distrust-metadata must decode and count, not read the index"
+    );
+    assert_eq!(json["elements"]["ways"], 2);
+    assert_eq!(json["elements"]["relations"], 1);
+}
+
+fn write_indexed_simple_pbf(path: &std::path::Path) {
+    common::write_indexed_pbf(
+        path,
+        &[
+            TestNode {
+                id: 1,
+                lat: 510_000_000,
+                lon: -1_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 520_000_000,
+                lon: -2_000_000,
+                tags: vec![("name", "foo")],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 530_000_000,
+                lon: -3_000_000,
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[
+            TestWay {
+                id: 10,
+                refs: vec![1, 2, 3],
+                tags: vec![("highway", "residential")],
+                meta: None,
+            },
+            TestWay {
+                id: 11,
+                refs: vec![2, 3],
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[TestRelation {
+            id: 100,
+            members: vec![],
+            tags: vec![("type", "route")],
+            meta: None,
+        }],
+    );
+}
+
 #[test]
 fn inspect_json_base() {
     let dir = tempfile::tempdir().expect("tempdir");
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
-    let report =
-        pbfhogg::inspect::inspect(&input, false, false, false, false, false).expect("inspect");
+    let report = pbfhogg::inspect::inspect(
+        &input,
+        &pbfhogg::inspect::InspectOptions {
+            show_blocks: false,
+            show_id_ranges: false,
+            show_locations: false,
+            extended: false,
+            distrust_metadata: false,
+            direct_io: false,
+        },
+    )
+    .expect("inspect");
     let json = report.to_json(None);
 
     // Schema version
@@ -139,8 +264,18 @@ fn inspect_json_with_id_ranges() {
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
-    let report =
-        pbfhogg::inspect::inspect(&input, false, true, false, false, false).expect("inspect");
+    let report = pbfhogg::inspect::inspect(
+        &input,
+        &pbfhogg::inspect::InspectOptions {
+            show_blocks: false,
+            show_id_ranges: true,
+            show_locations: false,
+            extended: false,
+            distrust_metadata: false,
+            direct_io: false,
+        },
+    )
+    .expect("inspect");
     let json = report.to_json(None);
 
     // id_ranges should be an object, not null
@@ -169,8 +304,18 @@ fn inspect_json_with_blocks() {
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
-    let report =
-        pbfhogg::inspect::inspect(&input, true, false, false, false, false).expect("inspect");
+    let report = pbfhogg::inspect::inspect(
+        &input,
+        &pbfhogg::inspect::InspectOptions {
+            show_blocks: true,
+            show_id_ranges: false,
+            show_locations: false,
+            extended: false,
+            distrust_metadata: false,
+            direct_io: false,
+        },
+    )
+    .expect("inspect");
     let json = report.to_json(Some(0));
 
     // blocks_detail should be an array, not null
@@ -192,8 +337,18 @@ fn inspect_json_blocks_limit_honored() {
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
-    let report =
-        pbfhogg::inspect::inspect(&input, true, false, false, false, false).expect("inspect");
+    let report = pbfhogg::inspect::inspect(
+        &input,
+        &pbfhogg::inspect::InspectOptions {
+            show_blocks: true,
+            show_id_ranges: false,
+            show_locations: false,
+            extended: false,
+            distrust_metadata: false,
+            direct_io: false,
+        },
+    )
+    .expect("inspect");
 
     let json_all = report.to_json(Some(0));
     let total = json_all["blocks_detail"].as_array().expect("value").len();
@@ -215,8 +370,18 @@ fn inspect_json_combined_flags() {
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
-    let report =
-        pbfhogg::inspect::inspect(&input, true, true, false, false, false).expect("inspect");
+    let report = pbfhogg::inspect::inspect(
+        &input,
+        &pbfhogg::inspect::InspectOptions {
+            show_blocks: true,
+            show_id_ranges: true,
+            show_locations: false,
+            extended: false,
+            distrust_metadata: false,
+            direct_io: false,
+        },
+    )
+    .expect("inspect");
     let json = report.to_json(Some(0));
 
     // All optional fields should be present
@@ -253,8 +418,18 @@ fn inspect_json_blocks_anomalies_only() {
     // Median=100, so the 10-element block is anomalously small (<50% of median).
     write_nodes_blocks(&input, &[100, 100, 10]);
 
-    let report =
-        pbfhogg::inspect::inspect(&input, true, false, false, false, false).expect("inspect");
+    let report = pbfhogg::inspect::inspect(
+        &input,
+        &pbfhogg::inspect::InspectOptions {
+            show_blocks: true,
+            show_id_ranges: false,
+            show_locations: false,
+            extended: false,
+            distrust_metadata: false,
+            direct_io: false,
+        },
+    )
+    .expect("inspect");
     let json = report.to_json_filtered(Some(0), true);
 
     assert!(json["anomalies_only"].as_bool().expect("bool"));
@@ -273,8 +448,18 @@ fn inspect_extended() {
     write_simple_pbf(&input);
 
     // extended=true forces full decode and collects timestamps, bbox, metadata
-    let report =
-        pbfhogg::inspect::inspect(&input, false, false, false, true, false).expect("inspect");
+    let report = pbfhogg::inspect::inspect(
+        &input,
+        &pbfhogg::inspect::InspectOptions {
+            show_blocks: false,
+            show_id_ranges: false,
+            show_locations: false,
+            extended: true,
+            distrust_metadata: false,
+            direct_io: false,
+        },
+    )
+    .expect("inspect");
     let json = report.to_json(None);
 
     // Extended automatically enables id_ranges
@@ -297,8 +482,18 @@ fn inspect_get_value() {
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
-    let report =
-        pbfhogg::inspect::inspect(&input, false, false, false, true, false).expect("inspect");
+    let report = pbfhogg::inspect::inspect(
+        &input,
+        &pbfhogg::inspect::InspectOptions {
+            show_blocks: false,
+            show_id_ranges: false,
+            show_locations: false,
+            extended: true,
+            distrust_metadata: false,
+            direct_io: false,
+        },
+    )
+    .expect("inspect");
 
     // Basic keys
     assert_eq!(report.get_value("file.format"), Some("PBF".to_string()));

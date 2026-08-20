@@ -60,6 +60,7 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 | `-g, --get <KEY>` | Get a single value by key path (e.g. `header.bbox`, `data.timestamp.first`) |
 | `--json` | Machine-readable JSON output |
 | `--show <TYPE_ID>` | Display a single element by ID (e.g. `n123`, `w456`, `r789`). Uses indexdata to skip non-matching blobs, early exit on sorted PBFs. **A mode of its own**: mutually exclusive with every other `inspect` flag, which it used to accept and discard |
+| `--distrust-metadata` | Decode every blob instead of reporting counts, ID ranges and per-block stats out of the blobs' own indexdata. Nothing validates indexdata against the payload it describes, so on a file you are inspecting because you suspect it, the fast path reports the file's claims rather than its contents. Scanning report only: rejected with `--indexed`, `--nodes`, and a `header.*` `--get` key |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--force` | Proceed even if input lacks indexdata. **Requires `--nodes`**, the only mode that reads it |
 
@@ -103,6 +104,17 @@ pbfhogg check [OPTIONS] <FILE>
 
 For missing relation-to-relation members, reports unique missing IDs with occurrence count when they differ: `Missing relation members: 706 (777 references)`.
 
+The ID check judges monotonicity by canonical OSM order (`0`, then negative IDs
+by ascending absolute value, then positives) - the order `sort` produces. On a
+positive-only file that is plain `i64` order.
+
+The ref check reports element IDs it could not track (negative IDs, or IDs above
+the range sized from the file's own indexdata) on their own
+`Untrackable element IDs` line, and as `untrackable_node_ids` /
+`untrackable_way_ids` / `untrackable_relation_ids` under `--json`. References to
+such an element are counted as missing, so a non-zero count means the
+missing-reference numbers are an upper bound.
+
 ---
 
 ### cat
@@ -127,6 +139,12 @@ pbfhogg cat [OPTIONS] --output <OUTPUT> <FILES>...
 | `--force` | Proceed even if input lacks indexdata |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
+
+With several inputs the output header is reconciled across all of them rather
+than copied from the first: the bbox is the union, and is omitted unless every
+input declares one; each replication field is kept only when every input agrees
+on it; `HistoricalInformation` is the OR. osmium writes a blank header for
+multiple inputs, so keeping the agreed fields is a deliberate deviation.
 
 ### sort
 
@@ -189,6 +207,9 @@ pbfhogg degrade [OPTIONS] --output <OUTPUT> <FILE>
 | `--strip-locations` | Drop the `LocationsOnWays` header feature. Inline way-node coordinates are not preserved. |
 | `--strip-indexdata` | Clear `BlobHeader.indexdata` on every OsmData blob. Forces commands into their `--force` / non-indexed fallback paths (`sort`, `getid`, `tags-filter`). Blob payloads are not decompressed. |
 | `--strip-tagdata` | Clear `BlobHeader.tagdata` (the per-blob tag key index) on every OsmData blob, forcing `tags-filter`'s no-hint fallback path. Leaves `indexdata` intact. |
+| `--corrupt-tagdata` | Replace `BlobHeader.tagdata` on every OsmData blob with a well-formed tag key index naming a key the blob does not carry. Parses cleanly and lies, so `tags-filter` skips blobs whose elements match - the adversarial case `--strip-tagdata` cannot produce, since a missing index is decoded rather than trusted. Mutually exclusive with `--strip-tagdata` and with any blob-re-encoding flag. |
+| `--corrupt-indexdata` | Replace `BlobHeader.indexdata` on every OsmData blob with a well-formed index that overstates the blob (same kind, inflated count and max ID). Produces the file `inspect --distrust-metadata` exists for. Mutually exclusive with `--strip-indexdata` and with any blob-re-encoding flag. |
+| `--corrupt-indexdata-kind` | Rotate the element kind declared by `BlobHeader.indexdata` on every OsmData blob (node to way to relation to node), leaving count and ID range honest. The kind is what per-kind blob schedules select on, so this makes a consumer skip a blob outright rather than misreport it. Mutually exclusive with `--strip-indexdata`; combinable with `--corrupt-indexdata`. |
 | `--strip-bbox` | Clear `HeaderBlock.bbox` so the output declares no file-level extent. Header-only change; no OsmData blob is touched. Does not affect `extract --bbox`, which derives its region from the CLI argument and per-blob indexdata bboxes rather than the header. |
 | `--drop-ids <N:SEED>` | Deterministically remove exactly N elements selected globally by kind, ID, and seed. Surviving references to removed elements intentionally dangle. |
 | `--force` | Skip the indexdata precondition required by the decode path (falls back to scanning every blob for every kind; slower). |
@@ -256,6 +277,26 @@ With `--input-kind osc` (or autodetected from `.osc`/`.osc.gz` extension), filte
 
 Expressions use osmium syntax: `highway=primary`, `amenity`, `w/building=yes`, etc.
 
+An expression is `[nwr/]KEY[!]=VALUE` or `[nwr/]KEY`. Key and value are matched
+by the same rules, following osmium's `get_string_matcher`:
+
+| Form | Meaning |
+|------|---------|
+| `foo` | exact match |
+| `foo,bar` | any one of the alternatives (both halves, keys included) |
+| `foo*` | prefix match |
+| `*foo`, `*foo*` | substring match (there is no separate suffix matcher) |
+| `*` | matches anything |
+
+Spaces around each half, and around each comma-list element, are stripped. The
+expression splits at the first `=`; a `!` inverts the value match, which still
+requires the key to match.
+
+The `!` is tested on the raw key, before that space stripping, as osmium does.
+So it marks an inversion only when it is the last character before the `=`:
+`highway !=primary` inverts, while `highway ! = primary` and
+`highway! = primary` name the literal keys `highway !` and `highway!`.
+
 ```
 pbfhogg tags-filter [OPTIONS] --output <OUTPUT> <FILE> [EXPRESSIONS]...
 ```
@@ -264,6 +305,7 @@ pbfhogg tags-filter [OPTIONS] --output <OUTPUT> <FILE> [EXPRESSIONS]...
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `--input-kind <KIND>` | Input kind override: `pbf` or `osc` (autodetect from extension by default) |
+| `--distrust-metadata` | Do not skip blobs on their indexdata or tag index; decode every blob (PBF only). Nothing validates a blob's tag index against its payload, so a file whose index omits a key its elements carry silently loses those elements. Trades the skip speedup for an answer that depends only on element data, and waives the indexdata precondition |
 | `-R, --omit-referenced` | Omit referenced objects (faster, single pass, direct matches only; PBF only) |
 | `-i, --invert-match` | Invert match: exclude matching objects, keep non-matching (PBF only) |
 | `-t, --remove-tags` | Remove tags from referenced objects not directly matched (use without -R; PBF only) |

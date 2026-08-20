@@ -118,6 +118,46 @@ fn run_altw(
     cli.arg("--force").run()
 }
 
+/// Same as [`run_altw`] but adds `--ignore-missing-nodes`, which is what a
+/// caller must now pass to accept `(0, 0)` placeholders for unresolvable
+/// way refs. Without it the run fails.
+fn run_altw_ignoring_missing(
+    input: &Path,
+    output: &Path,
+    keep_untagged_nodes: bool,
+    backend: IndexBackend,
+) -> CliOutput {
+    let mut cli = CliInvoker::new()
+        .arg("add-locations-to-ways")
+        .arg(input)
+        .arg("-o")
+        .arg(output)
+        .arg("--ignore-missing-nodes");
+    if keep_untagged_nodes {
+        cli = cli.arg("--keep-untagged-nodes");
+    }
+    if let Some(name) = backend.flag() {
+        cli = cli.arg("--index-type").arg(name);
+    }
+    cli.arg("--force").run()
+}
+
+/// Assert a run refused because of unresolvable node references, on that
+/// guard's own wording rather than on "it failed somehow".
+fn assert_refused_for_missing_nodes(out: &CliOutput, context: &str) {
+    assert!(
+        !out.status.success(),
+        "{context}: unresolvable way node refs must fail the run; stderr:\n{}",
+        out.stderr_str(),
+    );
+    assert!(
+        out.stderr_str()
+            .contains("could not be resolved to a node location"),
+        "{context}: expected the missing-locations guard specifically; stderr:\n{}",
+        out.stderr_str(),
+    );
+}
+
 /// Convenience: run with default index, assert success.
 fn run_altw_ok(input: &Path, output: &Path, keep_untagged_nodes: bool) -> CliOutput {
     let out = run_altw(
@@ -285,6 +325,14 @@ fn keep_untagged_nodes() {
     assert_eq!(read_node_ids(&output), vec![1, 2, 3]);
 }
 
+/// Unresolvable refs are refused by default and filled with `(0, 0)` only
+/// when the caller says so.
+///
+/// The default half is the one that bites: `(0, 0)` is Null Island, a real
+/// coordinate off the coast of Ghana, so a placeholder vertex written into a
+/// well-formed PBF is indistinguishable from genuine data to every reader.
+/// The opt-in half pins that the escape hatch still produces exactly the old
+/// geometry, so the guard is a policy change and not a capability loss.
 #[test]
 fn missing_node_refs_get_zero_coordinates() {
     let dir = TempDir::new().expect("tempdir");
@@ -306,8 +354,16 @@ fn missing_node_refs_get_zero_coordinates() {
     }];
 
     write_test_pbf(&input, &nodes, &ways, &[]);
-    let out = run_altw_ok(&input, &output, true);
 
+    let refused = run_altw(&input, &output, true, IndexBackend::Default, false);
+    assert_refused_for_missing_nodes(&refused, "default policy");
+
+    let out = run_altw_ignoring_missing(&input, &output, true, IndexBackend::Default);
+    assert!(
+        out.status.success(),
+        "--ignore-missing-nodes must accept the input; stderr:\n{}",
+        out.stderr_str(),
+    );
     assert!(
         out.stderr_str().contains("1 missing locations"),
         "expected '1 missing locations'; stderr:\n{}",
@@ -621,7 +677,10 @@ fn missing_node_refs_get_zero_coordinates_sparse() {
     }];
     write_test_pbf(&input, &test_nodes(), &ways, &[]);
 
-    let out = run_altw(&input, &output, true, IndexBackend::Sparse, false);
+    let refused = run_altw(&input, &output, true, IndexBackend::Sparse, false);
+    assert_refused_for_missing_nodes(&refused, "sparse");
+
+    let out = run_altw_ignoring_missing(&input, &output, true, IndexBackend::Sparse);
     assert!(
         out.status.success(),
         "sparse missing-refs failed; stderr:\n{}",
@@ -926,28 +985,21 @@ mod platform {
 // Tier B contract gaps from 2026-04-26 review
 // ---------------------------------------------------------------------------
 
-/// B1 - Null Island sentinel collision (CORRECTNESS.md "Null Island
-/// ambiguity"). Every coordinate index uses `(0, 0)` as the
-/// "absent" sentinel - so a real node at exactly Null Island is
-/// indistinguishable from a missing reference. The four sites
-/// (`DenseMmapIndex::get`, `SparseArrayIndex::get_at_offset`, ALTW
-/// external stage 2 `is_resolved`, geocode Pass 2) all share this
-/// behavior. CORRECTNESS.md documents the limitation as accepted;
-/// fixing it requires a separate occupancy bitmap (~550 MB at planet
-/// scale).
+/// B1 - a real node at Null Island is present, not missing.
 ///
-/// This test pins the documented status quo: a way referencing a
-/// node at exactly `(lat: 0, lon: 0)` produces a "1 missing
-/// locations" report, even though the node is present and at its
-/// stored coordinates. If a future change introduces an occupancy
-/// bitmap (or any other fix), this test fails - prompting a
-/// deliberate update to both the test AND the CORRECTNESS entry.
+/// The coordinate stores used to spell "absent" as `(0, 0)`, which is a real
+/// place in the Gulf of Guinea. That made a genuine node at exactly `0, 0`
+/// report as a missing location, and it made a missing reference come out of
+/// the writer as if the node were there. Absence is now a flag bit in the
+/// sparse slot encoding, and the external backend counts on presence rather
+/// than on the coordinate being non-zero.
+///
+/// Both backends are exercised on the same fixture: they answer the same
+/// question and must not disagree about it. The run must also SUCCEED, since
+/// the missing-locations guard now fails any run with a nonzero count - so a
+/// regression to the old sentinel shows up twice over.
 #[test]
-fn null_island_real_node_treated_as_missing() {
-    let dir = TempDir::new().expect("tempdir");
-    let input = dir.path().join("input.osm.pbf");
-    let output = dir.path().join("output.osm.pbf");
-
+fn null_island_real_node_is_not_reported_missing() {
     let nodes = vec![TestNode {
         id: 1,
         lat: 0,
@@ -961,26 +1013,41 @@ fn null_island_real_node_treated_as_missing() {
         tags: vec![("highway", "primary")],
         meta: None,
     }];
-    write_test_pbf(&input, &nodes, &ways, &[]);
 
-    let out = run_altw_ok(&input, &output, true);
-    assert!(
-        out.stderr_str().contains("1 missing locations"),
-        "Null Island sentinel collision: a real node at (0, 0) must \
-         be reported as missing per CORRECTNESS.md 'Null Island \
-         ambiguity'. If this assertion fails because altw now \
-         distinguishes real (0,0) from missing, update the \
-         CORRECTNESS.md entry too. stderr:\n{}",
-        out.stderr_str(),
-    );
+    for backend in [IndexBackend::Sparse, IndexBackend::External] {
+        let dir = TempDir::new().expect("tempdir");
+        let input = dir.path().join("input.osm.pbf");
+        let output = dir.path().join("output.osm.pbf");
+        // External needs indexdata to build its I/O schedule; sparse is
+        // happy either way, so the indexed fixture serves both.
+        write_indexed_pbf(&input, &nodes, &ways, &[]);
+
+        let out = run_altw(&input, &output, true, backend, false);
+        assert!(
+            out.status.success(),
+            "a node at Null Island is present; the run must not fail. \
+             stderr:\n{}",
+            out.stderr_str(),
+        );
+        assert!(
+            out.stderr_str().contains("0 missing locations"),
+            "a real node at (0, 0) must not be reported missing; stderr:\n{}",
+            out.stderr_str(),
+        );
+        // And the coordinate itself survives, so this is not satisfied by a
+        // backend that merely stopped counting.
+        assert_eq!(read_way_locations(&output), vec![(10, vec![(0, 0)])]);
+    }
 }
 
-/// B2 - missing-node tolerance for `--index-type external`.
-/// DEVIATIONS.md says missing nodes are tolerated by default, with
-/// `(0, 0)` substituted. Pre-batch tests pinned this for sparse
-/// (`missing_node_refs_get_zero_coordinates_sparse`); the external
-/// variant was unpinned. Same fixture, same expected output - this
-/// test makes the contract uniform across both backends.
+/// B2 - missing-node handling for `--index-type external`.
+///
+/// Missing refs are refused by default and substituted with `(0, 0)` under
+/// `--ignore-missing-nodes`. Pre-batch tests pinned this for sparse
+/// (`missing_node_refs_get_zero_coordinates_sparse`); the external variant
+/// was unpinned. Same fixture, same expected output - this test makes the
+/// contract uniform across both backends, which is exactly where they used
+/// to disagree.
 #[test]
 fn missing_node_refs_get_zero_coordinates_external() {
     let dir = TempDir::new().expect("tempdir");
@@ -999,7 +1066,10 @@ fn missing_node_refs_get_zero_coordinates_external() {
     // to full-decode without indexdata; external does not.
     write_indexed_pbf(&input, &test_nodes(), &ways, &[]);
 
-    let out = run_altw(&input, &output, true, IndexBackend::External, false);
+    let refused = run_altw(&input, &output, true, IndexBackend::External, false);
+    assert_refused_for_missing_nodes(&refused, "external");
+
+    let out = run_altw_ignoring_missing(&input, &output, true, IndexBackend::External);
     assert!(
         out.status.success(),
         "external missing-refs failed; stderr:\n{}",

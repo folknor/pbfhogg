@@ -75,6 +75,16 @@ pub struct AltwOptions {
     pub index_type: IndexType,
     /// Emit the private WayMembers-v1 and SharedNodePins-v1 prepass metadata.
     pub inject_prepass: bool,
+    /// Accept ways whose node references cannot be resolved, filling the
+    /// unresolved vertices with `(0, 0)`.
+    ///
+    /// Off by default. A `(0, 0)` filler is Null Island, a real coordinate
+    /// off the coast of Ghana, so an unresolved reference written that way is
+    /// indistinguishable from a genuine one and silently relocates geometry.
+    /// Absence is not zero: with this off, an input that cannot be fully
+    /// resolved is refused rather than quietly degraded. Matches osmium's
+    /// `--ignore-missing-nodes` in name and in default.
+    pub ignore_missing_nodes: bool,
 }
 
 /// Parse error for [`IndexType`].
@@ -236,16 +246,20 @@ pub fn add_locations_to_ways(
 
     // External join has its own pipeline - dispatch early.
     if index_type == IndexType::External {
-        return external::external_join(
+        let dest = DestinationGuard::new(output)?;
+        let stats = external::external_join(
             input,
-            output,
+            dest.path(),
             options.keep_untagged_nodes,
             options.compression,
             options.direct_io,
             options.force,
             overrides,
             options.inject_prepass,
-        );
+        )?;
+        enforce_missing_locations_policy(&stats, options.ignore_missing_nodes)?;
+        dest.commit()?;
+        return Ok(stats);
     }
 
     let indexdata_present = require_indexdata(
@@ -272,6 +286,7 @@ pub fn add_locations_to_ways(
         }
     }
 
+    let dest = DestinationGuard::new(output)?;
     let scratch_dir = output.parent().unwrap_or(Path::new("."));
 
     // Pass 0: collect the set of node IDs referenced by ways. Only these
@@ -332,7 +347,7 @@ pub fn add_locations_to_ways(
     crate::debug::emit_marker("ALTW_PASS2_START");
     let stats = write_output_checked(
         input,
-        output,
+        dest.path(),
         &index,
         options.keep_untagged_nodes,
         relation_scan.0.as_ref(),
@@ -353,7 +368,115 @@ pub fn add_locations_to_ways(
             .map_or(0, |set| set.iter().count() as u64);
         inject_metrics::emit(member_ways);
     }
+    enforce_missing_locations_policy(&stats, options.ignore_missing_nodes)?;
+    dest.commit()?;
     Ok(stats)
+}
+
+/// Failure hygiene for the library entry point, on the merge-changes
+/// precedent.
+///
+/// The write and the missing-locations gate are necessarily separate steps:
+/// the external backend only learns its resolved count when its final stage
+/// completes, so the gate has to run after a complete output exists. That
+/// leaves a window in which a run that is about to fail has already written
+/// a well-formed PBF full of fabricated `(0, 0)` vertices. Under the CLI
+/// this is already harmless - `guarded_output` hands this function a fresh
+/// scratch sibling and never renames it into place on a failing exit - but a
+/// library caller has no such front end, and would be left holding a
+/// plausible-looking file at the path it named.
+///
+/// So the guard is chosen from what is at the destination, which also keeps
+/// it from duplicating the CLI's work rather than double-guarding:
+///
+///   - destination absent (every CLI call, since the scratch path is fresh):
+///     a plain `PathGuard` deletes the file this call created if the call
+///     fails. No second scratch, no second rename.
+///   - destination present (a library caller overwriting a real file): route
+///     the writes through an `OutputFile` scratch sibling, so the existing
+///     file is untouched until success.
+struct DestinationGuard {
+    scratch: Option<crate::path_guard::OutputFile>,
+    created: Option<crate::path_guard::PathGuard>,
+    final_path: std::path::PathBuf,
+}
+
+impl DestinationGuard {
+    fn new(output: &Path) -> Result<Self> {
+        let existing = output.exists();
+        Ok(Self {
+            scratch: if existing {
+                Some(crate::path_guard::OutputFile::new(output)?)
+            } else {
+                None
+            },
+            created: if existing {
+                None
+            } else {
+                Some(crate::path_guard::PathGuard::file(output.to_path_buf()))
+            },
+            final_path: output.to_path_buf(),
+        })
+    }
+
+    /// The path the backends must write to. Not necessarily the destination
+    /// the caller named.
+    fn path(&self) -> &Path {
+        self.scratch
+            .as_ref()
+            .map_or(self.final_path.as_path(), |s| s.path())
+    }
+
+    /// Publish the output. Until this call the destination either does not
+    /// exist or still holds its previous contents.
+    fn commit(self) -> Result<()> {
+        if let Some(scratch) = self.scratch {
+            scratch.commit()?;
+        }
+        if let Some(created) = self.created {
+            drop(created.commit());
+        }
+        Ok(())
+    }
+}
+
+/// Refuse an output that carries placeholder vertices, unless the caller
+/// explicitly asked for them.
+///
+/// Every backend that cannot resolve a way's node reference pushes `(0, 0)`
+/// and bumps `missing_locations`. `(0, 0)` is Null Island - a legal
+/// coordinate in the Gulf of Guinea - so the placeholder is not
+/// distinguishable from real data by anything downstream: the file is
+/// well-formed, the numbers are plausible, and no reader can tell. Absence
+/// has to be reported as absence, so the run fails.
+///
+/// The check runs after the write rather than mid-stream because the
+/// external backend only learns its resolved count when its final stage
+/// completes; a single post-pass gate is the one place that provably covers
+/// all three backends. The output written in the meantime is never published:
+/// [`DestinationGuard`] holds it at a scratch path and drops it when this
+/// gate refuses, so no caller is left holding a file of fabricated
+/// coordinates.
+///
+/// The message deliberately does not name the output path. Under the CLI the
+/// path this function knows is `guarded_output`'s scratch sibling, not the
+/// `-o` the user typed, so quoting it would have shown the operator a
+/// dot-prefixed temp name they never chose - and there is no output to point
+/// at in any case, since nothing is published.
+fn enforce_missing_locations_policy(stats: &Stats, ignore_missing_nodes: bool) -> Result<()> {
+    if stats.missing_locations == 0 || ignore_missing_nodes {
+        return Ok(());
+    }
+    Err(format!(
+        "{} way node references could not be resolved to a node location. \
+         Those vertices can only be written as (0, 0), which is a real \
+         coordinate off the coast of Ghana and cannot be told apart from \
+         genuine data by any reader, so no output was written. Supply a \
+         complete input, or pass --ignore-missing-nodes to accept the \
+         placeholder coordinates.",
+        stats.missing_locations,
+    )
+    .into())
 }
 
 /// Route to external when the estimated sparse store exceeds this many

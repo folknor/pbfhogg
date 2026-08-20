@@ -86,43 +86,56 @@ users who need to handle Osmosis input should check for `-1` themselves. The tra
 is accepted: the dense iterator is too hot to add branches for a single producer's
 non-standard encoding.
 
-## Null Island ambiguity in dense mmap index
+## Null Island ambiguity in coordinate indexes
 
-**Status:** Known, accepted. Documented in code at every affected site.
+**Status:** Fixed in `add-locations-to-ways`. Still open in the geocode
+index builder and in `apply-changes --locations-on-ways`.
 
-**Context:** Every index that stores node coordinates as `(lat: i32, lon: i32)`
-pairs in a zero-initialized backing store uses `(0, 0)` as the "unset"
-sentinel:
+**Context:** An index that stores node coordinates as `(lat: i32, lon: i32)`
+in a zero-initialized backing store is tempted to spell "unset" as `(0, 0)`.
+That is Null Island, a real coordinate in the Gulf of Guinea, so the
+sentinel collides with data in both directions: a node genuinely at `0, 0`
+reports as missing, and a missing node is written into a way as if it were
+there. All-zero as an absence sentinel is the same mistake indexdata v3
+already corrected by spelling an absent bbox as an inverted box.
 
-(The dense index this section was named for was removed at `b70dd8c`;
-the sentinel convention survives in its successors, listed below.)
+Fixed sites:
 
-- `SparseArrayIndex::get` treats `packed == 0` as absent
-  (`src/commands/altw/sparse.rs`).
-- External-join stage 2 counts a slot as resolved only when its coord
-  tuple is `!= (0, 0)`, and
-  `stats.missing_locations = total_slots - resolved_count`
-  (`src/commands/altw/external/mod.rs`).
+- `SparseArrayIndex` (`src/commands/altw/sparse.rs`) stores latitude biased
+  by 90 degrees, which puts every legal latitude below `2^31` and frees bit
+  31 of the low word as an explicit presence flag. The slot is still eight
+  bytes and `set_len` still zero-fills, so an untouched slot still reads as
+  absent - but no coordinate can set that bit by accident. No bitmap, no
+  extra memory, exact across the whole domain.
+- External-join stage 2 (`src/commands/altw/external/mod.rs`) counts a slot
+  as resolved when its id was *found* in the id-sorted node stream, not when
+  the coordinate it found was non-zero. Before this the two backends
+  disagreed about the same input.
+
+Both are pinned by `null_island_real_node_is_not_reported_missing` in
+`tests/cli_add_locations_to_ways.rs`, which runs on both backends.
+
+Remaining sites:
+
 - Geocode builder Pass 2 filters ways' `(lat, lon)` coords with
   `if lat == 0 && lon == 0 { None }` inside the `way.refs()` filter_map
   (`src/geocode_index/builder/pass2.rs`).
+- `apply-changes --locations-on-ways` substitutes `(0, 0)` for an
+  unresolvable reference and reports the total post-hoc as `loc_missing`
+  (`reference/osmium-parity.md`). osmium has the same fallback there, so
+  changing it is a deliberate divergence and needs a DEVIATIONS entry.
 
-All sites therefore treat a node at exactly `0.0000000, 0.0000000` (Null
-Island) as missing, with identical user-visible behavior. Each site carries
-a `KNOWN LIMITATION` comment cross-linking to the others so a future
-sentinel-contract change covers all of them at once.
+**Impact of the remaining sites:** a way vertex at exactly `0.0000000,
+0.0000000` - decimicrodegree precision, so within ~11 mm of the
+intersection of the prime meridian and the equator - is silently dropped
+from a geocode index's geometry, and is indistinguishable from an
+unresolvable reference under `apply-changes --locations-on-ways`. The
+nearest land is ~570 km away.
 
-**Impact:** Ways referencing nodes at exactly `(0, 0)` - decimicrodegree
-precision, so within ~11 mm of the intersection of the prime meridian and
-equator - will not have locations added. In the geocode builder, streets or
-address ways with a node at exactly `(0, 0)` will have that coordinate
-silently dropped from their geometry. This affects zero real-world nodes.
-The nearest land is ~570 km away (Gulf of Guinea).
-
-**Why not fix:** Fixing requires either a separate occupancy bitmap (1 bit
-per node, ~550 MB at planet scale) or reserving an impossible sentinel
-with explicit valid-bit tracking. Both add memory overhead and complexity
-for a case that affects no real data.
+**Related:** unresolvable way node references are a hard error in
+`add-locations-to-ways` rather than a silent `(0, 0)` fill; pass
+`--ignore-missing-nodes` to accept the placeholders. That withdrew a
+documented osmium deviation - see `DEVIATIONS.md`.
 
 ## Geocode index: interpolation unresolved-endpoint sentinel
 

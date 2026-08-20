@@ -351,3 +351,126 @@ fn block_builder_capacity_boundary() {
         "expected 2 data blobs for 8001 nodes at cap 8000"
     );
 }
+
+// ---------------------------------------------------------------------------
+// add-locations-to-ways: a refused run must publish nothing
+// ---------------------------------------------------------------------------
+
+/// A fixture whose single way references a node that is not in the file, so
+/// the backend reports one missing location and the default policy refuses
+/// the run.
+fn write_unresolvable_way_pbf(path: &std::path::Path) {
+    let nodes = vec![TestNode {
+        id: 1,
+        lat: 550_000_000,
+        lon: 120_000_000,
+        tags: vec![("name", "present")],
+        meta: None,
+    }];
+    let ways = vec![TestWay {
+        id: 10,
+        // Node 999 is absent from the file.
+        refs: vec![1, 999],
+        tags: vec![("highway", "primary")],
+        meta: None,
+    }];
+    write_test_pbf_sorted(path, &nodes, &ways, &[]);
+}
+
+fn altw_options() -> pbfhogg::altw::AltwOptions {
+    pbfhogg::altw::AltwOptions {
+        keep_untagged_nodes: true,
+        compression: Compression::default(),
+        direct_io: false,
+        force: true,
+        index_type: pbfhogg::altw::IndexType::Sparse,
+        inject_prepass: false,
+        ignore_missing_nodes: false,
+    }
+}
+
+/// The library entry point, not the CLI.
+///
+/// The missing-locations gate can only run after a complete output exists -
+/// the external backend does not know its resolved count until its last
+/// stage - so the write happens before the refusal. Under the CLI that is
+/// already covered: `guarded_output` hands the command a scratch sibling and
+/// never renames it into place on a failing exit. A library caller has no
+/// such front end, and used to be handed an error together with a
+/// well-formed PBF at the path it named, full of fabricated `(0, 0)`
+/// vertices that no reader can tell from genuine data.
+#[test]
+fn altw_refusal_writes_no_output_for_a_library_caller() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    write_unresolvable_way_pbf(&input);
+
+    // `Stats` is not `Debug`, so no `expect_err` here.
+    let Err(err) = pbfhogg::altw::add_locations_to_ways(
+        &input,
+        &output,
+        &altw_options(),
+        &pbfhogg::HeaderOverrides::default(),
+    ) else {
+        panic!("an unresolvable way ref must fail the default policy");
+    };
+    assert!(
+        err.to_string().contains("could not be resolved"),
+        "expected the missing-locations guard specifically. Got: {err}"
+    );
+    assert!(
+        !output.exists(),
+        "a refused run must not leave a plausible-looking output behind"
+    );
+
+    // Passing counterpart: the same input with the policy waived does
+    // publish an output, so the assertion above is not satisfied by a
+    // command that simply never writes anything.
+    let mut opts = altw_options();
+    opts.ignore_missing_nodes = true;
+    pbfhogg::altw::add_locations_to_ways(
+        &input,
+        &output,
+        &opts,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("--ignore-missing-nodes must accept the input");
+    assert!(output.exists(), "an accepted run must publish its output");
+}
+
+/// The overwrite half: a library caller pointing at an existing file must
+/// get that file back byte-identical when the run is refused, not a
+/// truncated or replaced one. Opening the destination for write would have
+/// destroyed it before the gate ever ran.
+#[test]
+fn altw_refusal_leaves_a_preexisting_destination_intact() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("precious.osm.pbf");
+    write_unresolvable_way_pbf(&input);
+    std::fs::write(&output, b"user data").expect("write pre-existing destination");
+
+    assert!(
+        pbfhogg::altw::add_locations_to_ways(
+            &input,
+            &output,
+            &altw_options(),
+            &pbfhogg::HeaderOverrides::default(),
+        )
+        .is_err(),
+        "an unresolvable way ref must fail the default policy"
+    );
+
+    assert_eq!(
+        std::fs::read(&output).expect("destination still readable"),
+        b"user data",
+        "a refused run must leave the pre-existing destination untouched"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("read dir")
+        .filter_map(|e| e.ok().map(|e| e.file_name()))
+        .filter(|n| n != "precious.osm.pbf" && n != "in.osm.pbf")
+        .collect();
+    assert!(leftovers.is_empty(), "scratch file leaked: {leftovers:?}");
+}

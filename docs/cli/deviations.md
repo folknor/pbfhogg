@@ -23,21 +23,22 @@ referenced as members into an `IdSet` bitset. During the write pass,
 untagged nodes are kept if they appear in this set. The pass is skipped entirely
 when `--keep-untagged-nodes` is set (all nodes are kept anyway).
 
-## add-locations-to-ways: missing nodes tolerated by default
+## add-locations-to-ways: missing nodes are an error (no longer a deviation)
 
 **osmium behavior:** Fails on missing node coordinates unless
 `--ignore-missing-nodes` is passed.
 
-**pbfhogg behavior:** Missing nodes are always tolerated. A `(0, 0)` coordinate
-is substituted and the total count is reported in the summary line as
-`missing locations`. No flag needed.
+**pbfhogg behavior:** The same. This used to be a deviation - missing nodes were
+always tolerated, `(0, 0)` was substituted, and the count appeared in the summary
+line as `missing locations`.
 
-**Rationale:** Missing nodes are normal when processing extracts - ways near
-extract boundaries reference nodes outside the extract. Failing by default
-forces every user to discover and pass `--ignore-missing-nodes`, which is the
-right behavior in virtually all cases. The substituted `(0, 0)` is consistent
-with the Null Island sentinel used by the node coordinate indexes (see
-[Correctness](/guide/correctness)).
+**Why the deviation was withdrawn:** the substituted `(0, 0)` is Null Island, a
+real coordinate off the coast of Ghana. The output is well-formed PBF and the
+numbers are plausible, so nothing downstream can tell a placeholder vertex from a
+genuine one - the stderr summary was the only signal, and it does not survive a
+pipeline. `--ignore-missing-nodes` still produces exactly the old output for
+callers who want it, and the summary line is unchanged. See
+[Correctness](/guide/correctness).
 
 ## diff: content equality vs version ordering
 

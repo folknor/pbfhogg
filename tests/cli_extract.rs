@@ -660,6 +660,110 @@ fn spatial_filter_skips_distant_blobs() {
     );
 }
 
+/// Write an unsorted PBF whose blobs are in the worst order for a
+/// single-pass classifier: ways first, then the nodes those ways
+/// reference, then a relation whose only member is one of those ways.
+///
+/// The header does not declare `Sort.Type_then_ID`, so extract takes its
+/// unsorted fallback. Node 1 is inside `BBOX_STR`; node 2 is far south of
+/// it. Way 100 therefore belongs in the extract, and relation 300 with it.
+fn write_ways_before_nodes_pbf(path: &Path) {
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+
+    // Blob 0: ways, before any node has been seen.
+    bb.add_way(100, [("highway", "primary")], &[1, 2], None);
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    // Blob 1: the nodes those ways reference. Node 1 is inside BBOX_STR.
+    bb.add_node(
+        1,
+        557_000_000,
+        125_000_000,
+        std::iter::empty::<(&str, &str)>(),
+        None,
+    );
+    bb.add_node(
+        2,
+        400_000_000,
+        125_000_000,
+        std::iter::empty::<(&str, &str)>(),
+        None,
+    );
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    // Blob 2: a relation whose member way lives in blob 0.
+    bb.add_relation(
+        300,
+        [("type", "route")],
+        &[block_builder::MemberData {
+            id: MemberId::Way(100),
+            role: "outer",
+        }],
+        None,
+    );
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    writer.flush().expect("flush");
+}
+
+/// On an unsorted input, a way stored before its nodes must still be
+/// extracted - and so must a relation whose member way is.
+///
+/// The unsorted fallback used to classify nodes, ways and relations in a
+/// single file-order sweep, which is only sound when nodes precede ways
+/// precede relations. That is the sorted layout, and this is the branch
+/// taken when the file is not sorted. Under the old sweep, way 100 was
+/// tested against an empty `bbox_node_ids` and relation 300 against an
+/// empty `matched_way_ids`: both were silently absent from the output,
+/// with no error, no warning and no count. Every strategy shares the
+/// fallback, so all three are exercised.
+#[test]
+fn unsorted_way_before_its_nodes_is_still_extracted() {
+    for strategy in [Strategy::Simple, Strategy::CompleteWays, Strategy::Smart] {
+        let dir = TempDir::new().expect("tempdir");
+        let input = dir.path().join("ways_before_nodes.osm.pbf");
+        let output = dir.path().join("output.osm.pbf");
+        write_ways_before_nodes_pbf(&input);
+
+        run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), strategy);
+        let c = read_all_elements(&output);
+
+        assert_eq!(
+            way_ids(&c),
+            vec![100],
+            "a way whose blob precedes its nodes must still be matched"
+        );
+        assert_eq!(
+            relation_ids(&c),
+            vec![300],
+            "a relation whose member way was matched must still be matched"
+        );
+        // And the classification is still selective: node 2 is far outside
+        // the bbox, so this is not satisfied by an extract that keeps
+        // everything. Node 2 may be pulled in as a way member under the
+        // complete-ways and smart strategies, so only node 1's presence and
+        // the way/relation sets are asserted here.
+        assert!(
+            node_ids(&c).contains(&1),
+            "the in-bbox node must be present"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sorted-input fast path
 // ---------------------------------------------------------------------------

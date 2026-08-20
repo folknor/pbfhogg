@@ -22,15 +22,25 @@
 //! confirmed to fail when `guarded_output` is made to run against the
 //! destination path.
 //!
-//! It is *not* covered for the single-input commands, deliberately. Every
-//! corrupt-input fixture reachable from the CLI makes those fail before
-//! their writer opens: a truncated file dies in the header-walk preflight,
-//! and a corrupted blob payload dies in `sort`'s pass 1. A survival test
-//! built on either passes with the guard removed - it proves nothing, and a
-//! test that still passes when the production change is reverted is worse
-//! than no test. Closing that remaining gap needs a `test-hooks`-gated
-//! fault-injection flag on the CLI, of the same shape as `apply_changes`'s
-//! existing `panic_at_blob_seq`.
+//! It is also covered for one single-input command:
+//! `add-locations-to-ways`. Its missing-locations policy can only be
+//! evaluated once a complete output exists - the external backend does not
+//! learn its resolved count until its last stage - so a way referencing an
+//! absent node is a CLI-reachable failure that lands *after* the writer has
+//! finished, which is exactly the shape this file could not previously
+//! reach. `altw_missing_nodes_leave_preexisting_destination_intact` covers
+//! it, and needs no fault injection: a two-node fixture with a dangling ref
+//! is enough.
+//!
+//! It remains uncovered for the *other* single-input commands, deliberately.
+//! Every corrupt-input fixture reachable from the CLI makes those fail
+//! before their writer opens: a truncated file dies in the header-walk
+//! preflight, and a corrupted blob payload dies in `sort`'s pass 1. A
+//! survival test built on either passes with the guard removed - it proves
+//! nothing, and a test that still passes when the production change is
+//! reverted is worse than no test. Closing that remaining gap needs a
+//! `test-hooks`-gated fault-injection flag on the CLI, of the same shape as
+//! `apply_changes`'s existing `panic_at_blob_seq`.
 //!
 //! What is tested here is the wiring, against the failure modes the wiring
 //! actually has: a guard that never commits (output missing), a guard whose
@@ -340,6 +350,90 @@ fn cat_failure_leaves_preexisting_destination_intact() {
     );
     let strays = scratch_leftovers(dir.path());
     assert!(strays.is_empty(), "scratch file leaked: {strays:?}");
+}
+
+/// A PBF whose single way references a node that is not in the file.
+/// `add-locations-to-ways` writes a complete output and only then refuses,
+/// which is the post-writer CLI failure this file otherwise has no way to
+/// produce.
+fn write_dangling_ref_fixture(path: &Path) {
+    let file = std::fs::File::create(path).unwrap();
+    let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+    writer
+        .write_header(&HeaderBuilder::new().build().unwrap())
+        .unwrap();
+    let mut builder = BlockBuilder::new();
+    builder.add_node(1, 100_000_000, 100_000_000, [("amenity", "cafe")], None);
+    if let Some(bytes) = builder.take().unwrap() {
+        writer.write_primitive_block(bytes).unwrap();
+    }
+    // Node 999 is absent, so the run fails its missing-locations policy.
+    builder.add_way(10, [("highway", "primary")], &[1, 999], None);
+    if let Some(bytes) = builder.take().unwrap() {
+        writer.write_primitive_block(bytes).unwrap();
+    }
+}
+
+/// The single-input, post-writer case: `add-locations-to-ways` produces a
+/// complete PBF and only then refuses it, so the guard is the only thing
+/// standing between a failed run and a destroyed destination.
+///
+/// Unlike a truncated-input fixture, this genuinely fails after the writer
+/// closed - point the dispatch site at the destination instead of the
+/// scratch sibling and this test reports `precious.osm.pbf` replaced by a
+/// PBF full of fabricated `(0, 0)` vertices.
+#[test]
+fn altw_missing_nodes_leave_preexisting_destination_intact() {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("in.osm.pbf");
+    write_dangling_ref_fixture(&input);
+    let dest = dir.path().join("precious.osm.pbf");
+    std::fs::write(&dest, b"user data").unwrap();
+
+    let out = CliInvoker::new()
+        .args([
+            "add-locations-to-ways",
+            input.to_str().unwrap(),
+            "--force",
+            "-o",
+            dest.to_str().unwrap(),
+        ])
+        .run();
+    assert!(
+        !out.status.success(),
+        "an unresolvable way node ref must fail the run; stderr:\n{}",
+        out.stderr_str()
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        b"user data",
+        "a failed run destroyed the pre-existing destination"
+    );
+    let strays = scratch_leftovers(dir.path());
+    assert!(strays.is_empty(), "scratch file leaked: {strays:?}");
+}
+
+/// Passing counterpart, so the test above is not satisfied by a command
+/// that never publishes anything: the same fixture with the policy waived
+/// replaces the destination through the guard, leaving no scratch behind.
+#[test]
+fn altw_publishes_through_the_guard() {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("in.osm.pbf");
+    write_dangling_ref_fixture(&input);
+    let dest = dir.path().join("out.osm.pbf");
+    assert_output_published(
+        dir.path(),
+        &dest,
+        &[
+            "add-locations-to-ways",
+            input.to_str().unwrap(),
+            "--ignore-missing-nodes",
+            "--force",
+            "-o",
+            dest.to_str().unwrap(),
+        ],
+    );
 }
 
 /// A usage error keeps clap's own exit code and its own message. The switch

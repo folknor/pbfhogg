@@ -266,12 +266,16 @@ extend outside the region) that are not in the base. Failing by
 default would force every such user to pass an opt-out flag that is
 the right behaviour in virtually all cases.
 
-The `(0, 0)` coordinate sentinel under `--locations-on-ways` is
-consistent with the Null Island convention used elsewhere in pbfhogg
-(see [CORRECTNESS.md](../CORRECTNESS.md) "Null Island ambiguity in
-dense mmap index"); ways referencing nodes exactly at Null Island
-are indistinguishable from ways referencing absent nodes. This
-affects zero real-world nodes (nearest land ~570 km).
+The `(0, 0)` coordinate sentinel under `--locations-on-ways` means
+ways referencing nodes exactly at Null Island are indistinguishable
+from ways referencing absent nodes. This affects zero real-world
+nodes (nearest land ~570 km). Note that `add-locations-to-ways` no
+longer shares this convention: its sparse store carries an explicit
+presence bit and its default policy is to refuse an output with
+unresolvable references (see [CORRECTNESS.md](../CORRECTNESS.md)
+"Null Island ambiguity in coordinate indexes"). Bringing
+`apply-changes --locations-on-ways` into line is open work, not a
+decision that has been made the other way.
 
 **pbfhogg implementation anchors:**
 

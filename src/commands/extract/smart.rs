@@ -110,6 +110,14 @@ impl RelationHandler for SmartRelationHandler {
     }
 }
 
+/// Which element kind the unsorted fallback's current file sweep resolves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnsortedPhase {
+    Nodes,
+    Ways,
+    Relations,
+}
+
 /// Collect pass 1 ID sets with strategy-specific relation handling.
 ///
 /// Reads all elements via sequential BlobReader + DecompressPool, collecting:
@@ -145,51 +153,73 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     let mut decompress_buf: Vec<u8> = Vec::new();
 
     if !is_sorted {
-        for blob_result in &mut blob_reader {
-            let blob = blob_result?;
-            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
-                continue;
-            }
-            if let Some(idx) = blob.index()
-                && !filter.wants_index(&idx)
-            {
-                continue;
-            }
-            blob.decompress_into(&mut decompress_buf)?;
-            let block = PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))?;
-            for element in block.elements_skip_metadata() {
-                match &element {
-                    Element::DenseNode(dn)
-                        if region.contains_decimicro(
-                            bbox_int,
-                            dn.decimicro_lat(),
-                            dn.decimicro_lon(),
-                        ) =>
-                    {
-                        bbox_node_ids.set(dn.id());
-                    }
-                    Element::Node(n)
-                        if region.contains_decimicro(
-                            bbox_int,
-                            n.decimicro_lat(),
-                            n.decimicro_lon(),
-                        ) =>
-                    {
-                        bbox_node_ids.set(n.id());
-                    }
-                    Element::Way(w) if w.refs().any(|r| bbox_node_ids.get(r)) => {
-                        matched_way_ids.set(w.id());
-                        for r in w.refs() {
-                            all_way_node_ids.set(r);
+        drop(blob_reader);
+        // One sweep per element kind, for the same reason the simple
+        // strategy's unsorted fallback does it: matching a way needs
+        // `bbox_node_ids` already complete, and matching a relation needs
+        // `matched_way_ids` already complete. A single file-order sweep only
+        // supplies that ordering on a sorted file, and this branch is the one
+        // taken when the file is not sorted - so any way stored before its
+        // nodes, or relation stored before its members, was silently dropped
+        // from the extract.
+        for phase in [
+            UnsortedPhase::Nodes,
+            UnsortedPhase::Ways,
+            UnsortedPhase::Relations,
+        ] {
+            let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+            blob_reader.set_parse_indexdata(true);
+            blob_reader
+                .next()
+                .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+            for blob_result in &mut blob_reader {
+                let blob = blob_result?;
+                if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+                    continue;
+                }
+                if let Some(idx) = blob.index()
+                    && !filter.wants_index(&idx)
+                {
+                    continue;
+                }
+                blob.decompress_into(&mut decompress_buf)?;
+                let block = PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))?;
+                for element in block.elements_skip_metadata() {
+                    match (phase, &element) {
+                        (UnsortedPhase::Nodes, Element::DenseNode(dn))
+                            if region.contains_decimicro(
+                                bbox_int,
+                                dn.decimicro_lat(),
+                                dn.decimicro_lon(),
+                            ) =>
+                        {
+                            bbox_node_ids.set(dn.id());
                         }
+                        (UnsortedPhase::Nodes, Element::Node(n))
+                            if region.contains_decimicro(
+                                bbox_int,
+                                n.decimicro_lat(),
+                                n.decimicro_lon(),
+                            ) =>
+                        {
+                            bbox_node_ids.set(n.id());
+                        }
+                        (UnsortedPhase::Ways, Element::Way(w))
+                            if w.refs().any(|r| bbox_node_ids.get(r)) =>
+                        {
+                            matched_way_ids.set(w.id());
+                            for r in w.refs() {
+                                all_way_node_ids.set(r);
+                            }
+                        }
+                        (UnsortedPhase::Relations, Element::Relation(r))
+                            if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) =>
+                        {
+                            matched_relation_ids.set(r.id());
+                            handler.handle_relation(r);
+                        }
+                        _ => {}
                     }
-                    Element::Relation(r)
-                        if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) =>
-                    {
-                        matched_relation_ids.set(r.id());
-                        handler.handle_relation(r);
-                    }
-                    _ => {}
                 }
             }
         }

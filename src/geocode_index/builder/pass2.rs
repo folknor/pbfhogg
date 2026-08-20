@@ -257,14 +257,20 @@ fn classify_way_into(
             // KNOWN LIMITATION: (0, 0) doubles as the "unresolved" sentinel
             // for the coord mmap (zero-filled on creation, see Pass 2 write
             // path) AND as a legitimate OSM node at Null Island off the
-            // African coast. A real node at 0°, 0° - periodically created
-            // by broken edits, test fixtures, and GPS-zero errors - is
-            // silently dropped here. A proper fix would be a presence
-            // bitmap alongside the coord array (one bit per node); not
-            // worth the extra pass unless actually observed in production.
-            // Same convention is used in ALTW stage 2 (see
-            // `src/commands/altw/stage2.rs` `is_resolved`) - fix both
-            // together if we ever change the sentinel contract.
+            // African coast. A real node at 0, 0 - periodically created by
+            // broken edits, test fixtures, and GPS-zero errors - is
+            // silently dropped here.
+            //
+            // This is now the last coordinate index in the crate that spells
+            // absence as all-zero. add-locations-to-ways stopped doing so:
+            // its sparse store biases latitude by 90 degrees, which puts
+            // every legal latitude below 2^31 and frees bit 31 of the low
+            // word as an explicit presence flag - exact, and no extra memory
+            // or extra pass, so the "presence bitmap is too expensive"
+            // argument that used to justify this site no longer holds. The
+            // same trick fits this eight-byte slot. See
+            // `src/commands/altw/sparse.rs` and CORRECTNESS.md "Null Island
+            // ambiguity in coordinate indexes".
             if lat == 0 && lon == 0 {
                 None
             } else {

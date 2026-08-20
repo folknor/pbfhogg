@@ -73,6 +73,12 @@ fn run_inject(input: &Path, output: &Path, backend: &str) {
         .arg("--index-type")
         .arg(backend)
         .arg("--inject-prepass")
+        // Several fixtures here reference node ids that are deliberately
+        // absent, since the subject under test is the prepass metadata and
+        // not coordinate completeness. Unresolvable refs are otherwise a
+        // hard error now, so say so explicitly rather than having this
+        // file's failures come from a guard it is not about.
+        .arg("--ignore-missing-nodes")
         .run();
     assert!(
         out.status.success(),

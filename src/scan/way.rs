@@ -131,6 +131,29 @@ pub(crate) fn scan_way_refs(
     Ok(())
 }
 
+/// Delta-decode a packed `Way.refs` payload into `refs_buf`.
+///
+/// The accumulator is checked. `refs_data` is untrusted wire content, and an
+/// unchecked `cum += delta` on a crafted or corrupt blob panics in debug and
+/// wraps to an arbitrary node id in release - a wrapped id then quietly
+/// resolves against the node index or quietly does not, which is a silent
+/// wrong answer rather than a rejected file.
+fn accumulate_refs(refs_data: &[u8], refs_buf: &mut Vec<i64>) -> Result<()> {
+    use crate::read::wire::PackedSint64Iter;
+
+    let mut cum: i64 = 0;
+    for delta in PackedSint64Iter::new(refs_data) {
+        cum = cum.checked_add(delta).ok_or_else(|| {
+            crate::error::new_wire_error(
+                "Way.refs delta accumulator overflowed i64; the blob's node \
+                 references are corrupt",
+            )
+        })?;
+        refs_buf.push(cum);
+    }
+    Ok(())
+}
+
 /// Parse a single Way message and extract id + refs.
 ///
 /// Routes through [`WireWay::parse`] rather than hand-rolling a third Way
@@ -147,7 +170,7 @@ fn parse_way_refs(
     refs_buf: &mut Vec<i64>,
     callback: &mut impl FnMut(i64, &[i64]),
 ) -> Result<()> {
-    use crate::read::wire::{PackedSint64Iter, WireWay};
+    use crate::read::wire::WireWay;
 
     let way = WireWay::parse(way_data)?;
     if way.refs_data.is_empty() {
@@ -155,11 +178,7 @@ fn parse_way_refs(
     }
 
     refs_buf.clear();
-    let mut cum: i64 = 0;
-    for delta in PackedSint64Iter::new(way.refs_data) {
-        cum += delta;
-        refs_buf.push(cum);
-    }
+    accumulate_refs(way.refs_data, refs_buf)?;
     callback(way.id, refs_buf);
 
     Ok(())
@@ -325,7 +344,7 @@ fn parse_way_tagged_refs(
     refs_buf: &mut Vec<i64>,
     callback: &mut impl FnMut(i64, WayGeocodeFlags, &[i64]),
 ) -> Result<()> {
-    use crate::read::wire::{PackedSint64Iter, PackedUint32Iter, WireWay};
+    use crate::read::wire::{PackedUint32Iter, WireWay};
 
     // Same routing rationale as `parse_way_refs`: `WireWay::parse` accepts
     // both legal wire forms of a packed field, where this scanner's own
@@ -385,15 +404,9 @@ fn parse_way_tagged_refs(
     // outside this function and needs every way's refs when the id
     // matches. Cheap because refs are already size-capped by the OSM
     // 2000-ref convention.
+    refs_buf.clear();
     if let Some(rd) = refs_data {
-        refs_buf.clear();
-        let mut cum: i64 = 0;
-        for delta in PackedSint64Iter::new(rd) {
-            cum += delta;
-            refs_buf.push(cum);
-        }
-    } else {
-        refs_buf.clear();
+        accumulate_refs(rd, refs_buf)?;
     }
 
     callback(

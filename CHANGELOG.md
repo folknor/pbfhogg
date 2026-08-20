@@ -4,6 +4,34 @@
 
 ### Breaking
 
+- **`add-locations-to-ways` now fails when a way node reference cannot be
+  resolved.** Unresolvable references were filled with `(0, 0)` and counted
+  in the stderr summary as `missing locations`. `(0, 0)` is Null Island, a
+  real coordinate in the Gulf of Guinea, so the placeholder vertices went
+  into a well-formed PBF that no reader could distinguish from genuine
+  geometry, and the only signal was a stderr line that does not survive a
+  pipeline. Pass `--ignore-missing-nodes` for exactly the previous
+  behaviour, including the summary line. This withdraws a documented
+  deviation from osmium, which has always failed by default.
+
+- **`add-locations-to-ways` refuses a way blob whose coordinate framing is
+  not the PBF default.** The wire-level reframe path used by both the
+  `sparse` and `external` backends writes way coordinates in
+  decimicrodegrees while copying the source block's `granularity`,
+  `lat_offset` and `lon_offset` verbatim. The reader reconstructs
+  `lat = lat_offset + granularity * value`, so a block declaring
+  `granularity = 1000` produced way coordinates ten times too large - as
+  valid PBF that reads back cleanly, with nothing downstream able to notice.
+  Blocks are now rejected unless `granularity` is 100 and both offsets are
+  zero, which is what every osmium and pbfhogg producer writes.
+  `pbfhogg cat --clean` re-encodes an odd input into the default framing.
+
+- **`extract --bbox` rejects coordinates outside the geographic domain.**
+  Latitude must be within -90 and 90, longitude within -180 and 180. Only
+  `min < max` was checked before, and `--bbox 200,0,300,1` then saturated to
+  `i32::MAX` bounds inside the integer conversion and produced an empty
+  extract with exit code 0 - a wrong answer reported as a successful run.
+
 - **`time-filter` now refuses input whose elements carry no timestamps.**
   Every timestamp accessor ended in `unwrap_or(0)`, so an element with no
   `Info` - which is what `osmium --drop-metadata` and several pbfhogg write
@@ -334,6 +362,60 @@
   must be left untouched.
 
 ### Fixed
+
+- **`extract` on an unsorted input no longer silently drops ways and
+  relations.** The unsorted fallback shared by the `simple`, `complete` and
+  `smart` strategies classified nodes, ways and relations in a single
+  file-order sweep. That ordering is only sound on a sorted file - and this
+  is the branch taken when the file is not sorted. A way stored before the
+  blob holding its bounding-box nodes was tested against an empty node set
+  and never matched; likewise a relation whose members came later. Those
+  elements were simply absent from the output, with no error, no warning
+  and no count. The fallback now sweeps the file once per element kind.
+  Sorted inputs are unaffected - they already took the three-phase path.
+
+- **A node at exactly `(0, 0)` is no longer reported as a missing location
+  by `add-locations-to-ways`.** Both backends spelled "absent" as the
+  coordinate `(0, 0)`, which is Null Island. The `sparse` store now carries
+  an explicit presence bit (latitude is stored biased by 90 degrees, freeing
+  bit 31), and the `external` backend counts a reference as resolved when
+  its id was found rather than when the coordinate it found was non-zero.
+  The two backends previously disagreed about the same input.
+
+- **Admin-boundary holes crossing the antimeridian are assigned to the
+  right outer ring.** The geocode index builder decided hole ownership with
+  the plain ray cast rather than the antimeridian-aware variant used
+  everywhere else, so holes in relations spanning +/-180 degrees (Russia,
+  Fiji, the Antarctic claims) went to the wrong outer or were dropped.
+  Ownership is also now decided from several vertices spread around the
+  hole instead of from its first vertex alone, which for an admin boundary
+  is very often a node shared with the outer ring - exactly on the
+  boundary, where ray casting is undefined.
+
+- **Hostile PBF metadata can no longer corrupt or crash the node scanner.**
+  `granularity` was read straight off the wire and multiplied by every
+  accumulated coordinate delta with no validation and no overflow check:
+  a value above `i64::MAX` became a negative granularity, a huge one
+  panicked in debug and wrapped in release, and the final narrowing to
+  `i32` truncated an out-of-range coordinate into a plausible position
+  somewhere else on Earth. Granularity is now bounded, the delta
+  accumulators are checked, and the narrowing errors instead of
+  truncating. The way-ref scanner's reference accumulator is checked too.
+  This scanner feeds `add-locations-to-ways` pass 1, the external
+  backend's stage 2, and simple-extract node classification.
+
+- **A refused `pbfhogg::altw::add_locations_to_ways` no longer leaves an
+  output behind.** The missing-locations policy can only be evaluated once a
+  complete output exists - the external backend does not learn its resolved
+  count until its last stage - so the write necessarily precedes the
+  refusal. Under the CLI that was already harmless, but a library caller was
+  handed an error together with a well-formed PBF at the path it named, full
+  of fabricated `(0, 0)` vertices, and a pre-existing file of that name had
+  already been destroyed. The write now goes to a scratch path that is
+  published only after the policy check passes, on the same
+  destination-dependent shape `merge_changes` uses, so the CLI's own guard
+  is not duplicated. The error message no longer names an output path,
+  because there no longer is one.
 
 - **A failed `pbfhogg::commands::merge_changes::merge_changes` no longer
   overwrites the destination it was given.** The single-input path created

@@ -621,18 +621,55 @@ mod tests {
 
     // -- signed_area ---------------------------------------------------------
 
+    /// Positive for a ring that is counter-clockwise when the tuples are
+    /// read as `(x, y)`.
+    ///
+    /// Read the fixture carefully: this pins the shoelace as the function
+    /// computes it, on its own `(x, y)` reading of the tuple. It is NOT the
+    /// orientation of the same ring on a map, because every ring that
+    /// actually reaches this function comes from `assemble_rings` and is
+    /// `(lat_e7, lon_e7)` - that is `(y, x)`, which flips the sign. See
+    /// `signed_area_sign_is_inverted_for_real_assemble_rings_output`.
     #[test]
-    fn signed_area_ccw() {
-        // CCW square: positive area
+    fn signed_area_ccw_in_the_functions_own_xy_reading() {
         let ring = vec![(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)];
         assert!(signed_area(&ring) > 0.0);
     }
 
+    /// Negative counterpart of the above, same caveat.
     #[test]
-    fn signed_area_cw() {
-        // CW square: negative area
+    fn signed_area_cw_in_the_functions_own_xy_reading() {
         let ring = vec![(0, 0), (0, 10), (10, 10), (10, 0), (0, 0)];
         assert!(signed_area(&ring) < 0.0);
+    }
+
+    /// The landmine, pinned as it currently behaves.
+    ///
+    /// `signed_area` documents "positive = counter-clockwise (exterior)",
+    /// and binds `(xi, yi) = (ring[i].0, ring[i].1)`. But its rings come
+    /// from `assemble_rings`, documented and implemented as
+    /// `(lat_e7, lon_e7)` - `(y, x)` - so the shoelace sign is inverted for
+    /// every real caller. The two tests above hid this by labelling their
+    /// fixtures with the `(x, y)` reading, which is the reading no caller
+    /// uses.
+    ///
+    /// Nothing notices today because the only call site
+    /// (`geocode_index/builder/admin.rs`) immediately takes `.abs()`. This
+    /// test exists so that the next caller cannot walk into it, and so that
+    /// correcting the convention is a deliberate change that fails here
+    /// rather than a silent one.
+    #[test]
+    fn signed_area_sign_is_inverted_for_real_assemble_rings_output() {
+        // A square that is counter-clockwise on the map, written in the
+        // `(lat_e7, lon_e7)` order `assemble_rings` produces: going
+        // (lon 0, lat 0) -> (10, 0) -> (10, 10) -> (0, 10).
+        let ccw_on_the_map = vec![(0, 0), (0, 10), (10, 10), (10, 0), (0, 0)];
+        assert!(
+            signed_area(&ccw_on_the_map) < 0.0,
+            "documented as positive for a counter-clockwise exterior; it is \
+             negative, because the ring is (lat, lon) and the shoelace reads \
+             it as (x, y)"
+        );
     }
 
     #[test]

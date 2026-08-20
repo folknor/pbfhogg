@@ -208,6 +208,30 @@ one). Collapse to one traversal parameterised by a sink trait.
   counter and no warning. At planet scale you cannot tell 100 dropped boundaries
   from 0.
 
+## The way-coordinate collection still spells absence as `(0, 0)`
+
+Filed 2026-08-20 from the spatial/locations round, which fixed the same defect in
+`add-locations-to-ways`. `builder/pass2.rs` reads the rank coord mmap and drops
+the pair when `lat == 0 && lon == 0`, so a way vertex genuinely at Null Island is
+discarded from the geometry - and, in the other direction, an unresolved
+reference is indistinguishable from a real one. This is now the last coordinate
+index in the crate that does it; `CORRECTNESS.md` "Null Island ambiguity in
+coordinate indexes" and `docs/guide/correctness.md` both scope their remaining
+entry to this site plus `apply-changes --locations-on-ways`.
+
+The comment at the filter site used to justify itself with "a proper fix would be
+a presence bitmap; not worth the extra pass". That argument is now dead: the
+sparse ALTW store solved it with no extra memory and no extra pass by storing
+latitude biased by 90 degrees, which puts every legal latitude below `2^31` and
+frees bit 31 of the low word as an explicit presence flag. The slot here is the
+same eight bytes (`lat: i32`, `lon: i32`), so the same encoding drops straight
+in - see `pack` / `unpack` in `src/commands/altw/sparse.rs`. The zero-filled mmap
+still reads as absent, so nothing else about the pass changes.
+
+Note the interaction with the first finding in this document: while Pass 2a
+ignores non-dense nodes, every ref resolves to the sentinel, so fixing that one
+first makes this one's blast radius visible rather than universal.
+
 ## What the hunter would rewrite rather than patch
 
 The admin-interior, `cover_segment` and `max-admin-vertices` findings are one

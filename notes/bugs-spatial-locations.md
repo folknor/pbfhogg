@@ -4,99 +4,11 @@ Hunt date 2026-08-12. Single Opus hunter, scope: `src/geo.rs`, `src/scan/`,
 `src/commands/spatial.rs`, `src/commands/extract/`, `src/commands/altw/`, and
 `src/idset.rs` as used from this scope. Findings only, unverified.
 
-## `reframe.rs` writes decimicrodegree way coordinates while copying the source block's granularity/offsets
-
-`src/commands/altw/reframe.rs` - `parse_block_top` copies PrimitiveBlock fields
-17-20 verbatim into the output block (`scratch.scalar_fields`), and
-`splice_way_locations` then writes fields 9/10 from `NodeIndex::get`, which
-returns decimicrodegrees (`scan/node.rs` normalizes with
-`(lat_offset + granularity*raw)/100`).
-
-The reader side (`read/elements.rs::WayNodeLocationsIter`) reconstructs
-`lat = lat_offset + granularity * value`. So the round trip is only correct when
-the way blob has `granularity == 100` and zero offsets. An input with
-`granularity = 1000`, or a non-zero `lat_offset`, produces way locations that are
-10x off or doubly-offset - silently, with no warning and no validation anywhere
-on this path. `external/stage4.rs` does the same "append scalar fields" thing.
-
-Note the internal inconsistency: `write/block_builder.rs` deliberately omits
-17-20 and relies on the defaults, so altw's decode-all fallback is correct on the
-same input where the production reframe path is wrong. Fix: either normalize
-(drop fields 17/19/20 from the reframe output, keeping only `date_granularity`)
-or reject non-default granularity up front.
-
-Confidence: high on the code reading; requires a non-default-granularity producer
-to trigger.
-
-## Unsorted-input fallbacks classify in a single file-order pass, silently dropping ways and relations
-
-`src/commands/extract/simple.rs::extract_simple_two_pass` and
-`src/commands/extract/smart.rs::collect_pass1_generic` (`if !is_sorted` branch)
-both build `bbox_node_ids`, then `matched_way_ids` (from
-`w.refs().any(|r| bbox_node_ids.get(r))`), then `matched_relation_ids`, in one
-sequential pass over blobs in file order. That is only sound if nodes precede
-ways precede relations - i.e. if the file is sorted. These are precisely the code
-paths taken when it is not.
-
-Failure: any way whose blob appears before the blob holding its bbox nodes is
-never matched, and is silently absent from the output; likewise relations whose
-members appear later. Same problem inside a single `BlockType::Mixed` block,
-since elements are processed in stream order. This affects `simple`, `complete`,
-and `smart`. The fix is real work: the unsorted fallback needs to be genuinely
-multi-pass (nodes pass, then ways pass, then relations pass), not one pass with
-three branches.
-
-## altw sparse drops out-of-range coordinates silently
-
-`SharedSparseWriter::insert` (`src/commands/altw/sparse.rs`) silently returns
-when `byte_offset + 8 > capacity_bytes`, and `SparseArrayIndex::get` silently
-returns `None` past the end. Any rank/capacity mismatch therefore turns into
-silently dropped coordinates, then `missing_locations`, then `(0,0)` in the
-output, with no error anywhere. The writer bounds violation should be a panic,
-not a no-op: by construction the rank can never exceed the allocation, so
-reaching that branch is a bug that must be loud.
-
-Confidence: high.
-
-## `point_in_ring` (not the antimeridian-aware variant) used for hole ownership
-
-`src/geocode_index/builder/admin.rs` uses
-`crate::geo::point_in_ring(hp.0, hp.1, &outer_f64)` to decide which outer ring
-owns each hole. Everywhere else in the codebase the antimeridian-aware
-`point_in_ring_with_antimeridian` is used. For an admin relation crossing +/-180
-degrees (Russia, Fiji, Antarctica-adjacent), the outer ring's longitudes are
-discontinuous and holes will be assigned to the wrong outer or dropped entirely.
-Also, the test point is `hole[0]` - the hole's first vertex, which for admin
-boundaries is very often a node shared with the outer ring, i.e. exactly on the
-boundary, where ray casting is undefined. A centroid or an interior point would
-be far more robust.
-
-## `scan/node.rs` does unchecked arithmetic on attacker-controlled `granularity`
-
-`granularity = cursor.read_varint()? as i64` with no validation (zero, negative,
-or huge all accepted), then `lat_offset + granularity * cum_lat` unchecked -
-panic in debug, wraps in release. `blob_meta/scan_ids.rs` explicitly uses checked
-arithmetic here and comments on why; `scan/node.rs` - used by ALTW pass 1,
-external stage 2, and simple-extract node classify - does not. Same class:
-`parse_way_refs` / `parse_way_tagged_refs` accumulate `cum += delta` unchecked
-with no cap on ref count.
-
 ## `build_classify_schedule` EOF check can overflow
 
 `src/scan/classify.rs`: `meta.data_offset + meta.data_size as u64 > file_size`.
 On a corrupt header advertising a huge `data_size`, this wraps in release and the
 check that exists specifically to catch corrupt blobs passes. Use `checked_add`.
-
-## Missing node locations become `(0, 0)` with no way to tell them apart
-
-`altw/mod.rs::process_block` and `reframe.rs` both push `(0,0)` for unresolvable
-refs and bump `missing_locations`. `(0,0)` is a valid coordinate (Null Island),
-and the sparse index's "unwritten" sentinel is also `(0,0)`, so a genuine node at
-exactly 0/0 is reported as missing and a missing node is written as if it were at
-0/0. This is documented in several places as accepted, but the consumer-visible
-effect - geometry silently teleported to the Gulf of Guinea - has no CLI-level
-guard (no `--ignore-missing-nodes` / hard-fail switch, unlike osmium). Worth an
-explicit flag rather than a comment.
 
 ## `parse_geojson` silently uses only the first feature of a FeatureCollection
 
@@ -104,25 +16,56 @@ explicit flag rather than a comment.
 handing in a 5-polygon FeatureCollection gets a 1-polygon extract with no
 warning. Either union all features into a `MultiPolygon` or error out.
 
-## No lat/lon domain validation on bbox input
+## `BboxInt::from_bbox` and `Bbox::contains` disagree at the boundary
 
-`parse_bbox` and the config `bbox` parser only check `min < max`.
-`BboxInt::from_bbox` then does `(v * 1e7).floor() as i32`, and Rust float-to-int
-casts saturate: `--bbox 200,0,300,1` yields `min_lon = i32::MAX` and an empty
-extract with exit code 0. Also `BboxInt::from_bbox` widens by floor/ceil while
-`Bbox::contains` (f64) does not, so the two containment paths disagree by up to 1
-decimicrodegree at the boundary.
+`BboxInt::from_bbox` widens by floor/ceil while `Bbox::contains` (f64) does not,
+so the two containment paths disagree by up to 1 decimicrodegree at the edge of
+the box. Filed standalone when the parent finding (no lat/lon domain validation
+on bbox input) was fixed: the domain check landed, this did not. The widening is
+deliberate on the blob-filter side, where being conservative is correct, so any
+fix has to separate "which blobs might contain a match" from "does this point
+match" rather than changing `from_bbox` for both. `brokkr verify extract`
+compares byte-wise against osmium, so the boundary rule is load-bearing.
 
-## Sparse index temp file: ENOSPC becomes SIGBUS
+## `--polygon` geometry bypasses the bbox domain check
 
-`altw/sparse.rs` - `set_len(total_bytes)` on a sparse file then `MmapMut` and
-store into it. If the scratch filesystem fills mid-pass (europe ~29 GB, planet
-~60 GB), the store faults and the process dies with SIGBUS and no diagnostic.
-There is no free-space precheck and no `fallocate`. Also
-`drop(std::fs::remove_file(&temp_path))` discards the unlink error, so on the
-unlikely failure path a multi-GB file leaks silently; and `create_new(true)` on a
-pid-named path turns a stale file from a crashed run into a hard failure with a
-confusing message.
+Filed 2026-08-20, one layer up from the `parse_bbox` domain fix. `extract --bbox`
+now rejects a latitude outside -90..90 or a longitude outside -180..180, but
+`Region::Polygon` derives its `Bbox` from the GeoJSON ring coordinates rather
+than from `parse_bbox`, so a `--polygon` file containing out-of-domain vertices
+still reaches `BboxInt::from_bbox` and still saturates. Same symptom the bbox fix
+removed: an empty extract with exit code 0. The fix is to validate the ring
+coordinates as they are parsed, which is also where the FeatureCollection
+handling above needs work, so the two are probably one change.
+
+## `apply-changes --locations-on-ways` still uses the `(0, 0)` Null Island sentinel
+
+Filed 2026-08-20 while fixing the same defect in `add-locations-to-ways`. That
+command now carries an explicit presence bit in its sparse store, counts
+resolution on presence rather than on a non-zero coordinate in its external
+backend, and refuses by default to write an output containing unresolvable
+references. `apply-changes --locations-on-ways` was untouched and still
+substitutes `(0, 0)` for an unresolvable ref, reporting the total post-hoc as
+`loc_missing`. `reference/osmium-parity.md` documents the current behaviour and
+now says plainly that bringing it into line is open work. osmium has the same
+`(0, 0)` fallback there, so any change is a deliberate divergence and needs a
+DEVIATIONS entry.
+
+## The geocode index builder still filters way coordinates on `(0, 0)`
+
+Same defect, third site, also filed 2026-08-20. The builder's way-coordinate
+collection drops `(0, 0)` pairs as "unset", so a way vertex genuinely at Null
+Island is discarded. `docs/guide/correctness.md` now scopes its Null Island entry
+to this site alone.
+
+## The PBF read path does not validate coordinate ranges
+
+Filed 2026-08-20, alongside the bbox domain check. `parse_bbox` now rejects a
+latitude outside -90..90 or a longitude outside -180..180, and the sparse node
+store refuses to index a node whose coordinates are outside the same domain. The
+general read path (`read/elements.rs`, the dense node iterators) still hands out
+whatever the file says. Closed-document territory - recorded here because the
+bbox work made the asymmetry visible, not as a request to change the read path.
 
 ## `simplify_ring` is O(20 n depth) with unbounded recursion
 
@@ -145,6 +88,17 @@ Separately, the shoelace accumulates products up to ~1.6e18 in f64 (ulp ~256)
 with full cancellation; subtracting a ring-local origin first would recover ~8
 orders of magnitude for free.
 
+**Test defect found 2026-08-20 (round 1 audit).** `signed_area_ccw` and
+`signed_area_cw` were asserting the bug as correct: both fixtures were labelled
+"CCW square" / "CW square" under the `(x, y)` reading the function performs
+internally, which is the reading no caller uses. That labelling is why the
+inverted sign was never noticed from the test suite. Both are renamed to say
+which reading they pin, and
+`signed_area_sign_is_inverted_for_real_assemble_rings_output` now pins the
+actual behaviour for a ring in `assemble_rings` order, so correcting the
+convention has to be a deliberate change that fails a test rather than a silent
+one. The convention itself is still unfixed and still belongs to this entry.
+
 ## `multi-extract` re-probes every region per element, and compresses single-threaded
 
 `extract/multi.rs`: the way classify does
@@ -166,6 +120,17 @@ which also discards the spatial filter it already had. `notes/altw.md` P4
 documents that removing redundant walks does not pay on the altw path (they ride
 warm), but this one is between two heavy phases rather than adjacent, and the
 schedule it rebuilds is already in hand.
+
+## Sparse index temp file: ENOSPC becomes SIGBUS
+
+`altw/sparse.rs` - `set_len(total_bytes)` on a sparse file then `MmapMut` and
+store into it. If the scratch filesystem fills mid-pass (europe ~29 GB, planet
+~60 GB), the store faults and the process dies with SIGBUS and no diagnostic.
+There is no free-space precheck and no `fallocate`. Also
+`drop(std::fs::remove_file(&temp_path))` discards the unlink error, so on the
+unlikely failure path a multi-GB file leaks silently; and `create_new(true)` on a
+pid-named path turns a stale file from a crashed run into a hard failure with a
+confusing message.
 
 ## Smaller notes
 

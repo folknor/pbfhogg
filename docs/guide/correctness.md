@@ -88,24 +88,32 @@ non-standard encoding.
 
 ## Null Island ambiguity in coordinate indexes
 
-**Status:** Known, accepted. Documented in code at every affected site.
+**Status:** Fixed in `add-locations-to-ways`. Still open in the geocode index
+builder.
 
-**Context:** Every index that stores node coordinates as `(lat: i32, lon: i32)`
-pairs in a zero-initialized backing store uses `(0, 0)` as the "unset" sentinel:
-`add-locations-to-ways`'s `SparseArrayIndex` (the default `sparse` index type)
-treats a packed `(lat, lon) == 0` as absent, its `external` mode's resolved-count
-pass treats a coordinate tuple `== (0, 0)` as unresolved, and the geocode index
-builder's way-coordinate collection filters out `(0, 0)` pairs the same way. This
-means a node at exactly `0.0000000, 0.0000000` (Null Island) is treated as missing
-by all three. The former `DenseMmapIndex` (removed - see [Advanced
-Topics](./advanced#add-locations-to-ways-index-types)) had the same sentinel and the
-same limitation.
+**Context:** An index that stores node coordinates as `(lat: i32, lon: i32)` in a
+zero-initialized backing store is tempted to spell "unset" as `(0, 0)`. That is
+Null Island, a real coordinate in the Gulf of Guinea, so the sentinel collides
+with data: a node genuinely at `0, 0` reports as missing, and a missing node is
+written into a way as if it were there.
 
-**Impact:** Ways referencing nodes at exactly `(0, 0)` - decimicrodegree precision,
-so within ~11mm of the intersection of the prime meridian and equator - will not
-have locations added. This affects zero real-world nodes. The nearest land is ~570 km
-away (Gulf of Guinea).
+`add-locations-to-ways` no longer does this. The `sparse` index stores latitude
+biased by 90 degrees, which leaves bit 31 of the low word free as an explicit
+presence flag; an untouched slot still reads as absent because `set_len`
+zero-fills, but no coordinate can set that bit by accident. The `external`
+backend counts a reference as resolved when its id was *found* in the node
+stream, not when the coordinate it found was non-zero. Both backends therefore
+give the same answer for a node at Null Island, and both are pinned by
+`null_island_real_node_is_not_reported_missing`.
 
-**Why not fix:** Fixing requires either a separate occupancy bitmap (1 bit per node,
-~550 MB at planet scale) or reserving an impossible sentinel with explicit valid-bit
-tracking. Both add memory overhead and complexity for a case that affects no real data.
+The geocode index builder's way-coordinate collection still filters out `(0, 0)`
+pairs and retains the ambiguity.
+
+**Impact of the remaining case:** a geocode index built from data containing a
+way vertex at exactly `(0, 0)` - decimicrodegree precision, so within ~11 mm of
+the intersection of the prime meridian and the equator - drops that vertex. The
+nearest land is ~570 km away.
+
+**Related:** unresolvable way node references are now a hard error rather than a
+silent `(0, 0)` fill; pass `--ignore-missing-nodes` to accept the placeholders.
+See [Deviations](./deviations).

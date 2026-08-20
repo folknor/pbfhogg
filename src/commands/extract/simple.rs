@@ -23,121 +23,78 @@ use super::{ExtractStats, Region};
 /// to rayon.
 const BATCH_SIZE: usize = 64;
 
+/// Which element kind a classification sweep is resolving.
+///
+/// Classification is inherently ordered - a way is matched by looking up its
+/// refs in `bbox_node_ids`, and a relation by looking up its members in
+/// `bbox_node_ids` and `matched_way_ids`. On a sorted file, file order
+/// already supplies that order. On an unsorted one it does not, which is why
+/// the unsorted fallback sweeps the file once per kind instead of deciding
+/// all three in a single file-order walk.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClassifyPhase {
+    Nodes,
+    Ways,
+    Relations,
+}
+
 /// Classify elements in a single block for simple extract (populate ID sets).
 ///
-/// Iterates elements without metadata (faster) and marks matching IDs:
+/// `phase` selects which kind is resolved; elements of other kinds are
+/// ignored. Iterates elements without metadata (faster) and marks matching
+/// IDs:
 /// - Nodes: bbox containment → set `bbox_node_ids`
 /// - Ways: any ref in `bbox_node_ids` → set `matched_way_ids`
 /// - Relations: matched node/way member → set `matched_relation_ids`
 ///
-/// Returns `true` if any element in the block matched (the block should be
-/// included in the write batch). Returns `false` if the block is empty for
-/// this extract - callers can skip it to avoid parsing elements with full
-/// metadata in the write path.
-///
-/// Uses `block_type()` (1 byte per group) to branch by type phase,
-/// eliminating dead match arms in the hot inner loop for sorted PBFs.
+/// Uses `block_type()` (1 byte per group) to skip whole blocks that hold no
+/// element of the phase's kind, keeping the sorted path's fast rejection.
+/// `BlockType::Mixed` blocks are walked element by element under the same
+/// phase rule, so a mixed block cannot smuggle a way past the node sweep.
 #[hotpath::measure]
 fn classify_block_simple(
     block: &PrimitiveBlock,
+    phase: ClassifyPhase,
     region: &Region,
     bbox_int: &BboxInt,
     bbox_node_ids: &mut IdSet,
     matched_way_ids: &mut IdSet,
     matched_relation_ids: &mut IdSet,
-) -> bool {
-    let mut matched = false;
-    match block.block_type() {
-        BlockType::DenseNodes | BlockType::Nodes => {
-            for element in block.elements_skip_metadata() {
-                match &element {
-                    Element::DenseNode(dn)
-                        if region.contains_decimicro(
-                            bbox_int,
-                            dn.decimicro_lat(),
-                            dn.decimicro_lon(),
-                        ) =>
-                    {
-                        bbox_node_ids.set(dn.id());
-                        matched = true;
-                    }
-                    Element::Node(n)
-                        if region.contains_decimicro(
-                            bbox_int,
-                            n.decimicro_lat(),
-                            n.decimicro_lon(),
-                        ) =>
-                    {
-                        bbox_node_ids.set(n.id());
-                        matched = true;
-                    }
-                    _ => {}
-                }
+) {
+    let relevant = match block.block_type() {
+        BlockType::Empty => false,
+        BlockType::Mixed => true,
+        BlockType::DenseNodes | BlockType::Nodes => phase == ClassifyPhase::Nodes,
+        BlockType::Ways => phase == ClassifyPhase::Ways,
+        BlockType::Relations => phase == ClassifyPhase::Relations,
+    };
+    if !relevant {
+        return;
+    }
+
+    for element in block.elements_skip_metadata() {
+        match (phase, &element) {
+            (ClassifyPhase::Nodes, Element::DenseNode(dn))
+                if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
+            {
+                bbox_node_ids.set(dn.id());
             }
-        }
-        BlockType::Ways => {
-            for element in block.elements_skip_metadata() {
-                if let Element::Way(w) = &element
-                    && w.refs().any(|r| bbox_node_ids.get(r))
-                {
-                    matched_way_ids.set(w.id());
-                    matched = true;
-                }
+            (ClassifyPhase::Nodes, Element::Node(n))
+                if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
+            {
+                bbox_node_ids.set(n.id());
             }
-        }
-        BlockType::Relations => {
-            for element in block.elements_skip_metadata() {
-                if let Element::Relation(r) = &element
-                    && relation_has_matched_member(r, bbox_node_ids, matched_way_ids)
-                {
-                    matched_relation_ids.set(r.id());
-                    matched = true;
-                }
+            (ClassifyPhase::Ways, Element::Way(w)) if w.refs().any(|r| bbox_node_ids.get(r)) => {
+                matched_way_ids.set(w.id());
             }
-        }
-        BlockType::Empty => {
-            // Empty blocks have no elements - skip.
-        }
-        BlockType::Mixed => {
-            // Fallback for mixed blocks - check all element types.
-            for element in block.elements_skip_metadata() {
-                match &element {
-                    Element::DenseNode(dn)
-                        if region.contains_decimicro(
-                            bbox_int,
-                            dn.decimicro_lat(),
-                            dn.decimicro_lon(),
-                        ) =>
-                    {
-                        bbox_node_ids.set(dn.id());
-                        matched = true;
-                    }
-                    Element::Node(n)
-                        if region.contains_decimicro(
-                            bbox_int,
-                            n.decimicro_lat(),
-                            n.decimicro_lon(),
-                        ) =>
-                    {
-                        bbox_node_ids.set(n.id());
-                        matched = true;
-                    }
-                    Element::Way(w) if w.refs().any(|r| bbox_node_ids.get(r)) => {
-                        matched_way_ids.set(w.id());
-                        matched = true;
-                    }
-                    Element::Relation(r)
-                        if relation_has_matched_member(r, bbox_node_ids, matched_way_ids) =>
-                    {
-                        matched_relation_ids.set(r.id());
-                        matched = true;
-                    }
-                    _ => {}
-                }
+            (ClassifyPhase::Relations, Element::Relation(r))
+                if relation_has_matched_member(r, bbox_node_ids, matched_way_ids) =>
+            {
+                matched_relation_ids.set(r.id());
             }
+            _ => {}
         }
     }
-    matched
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -223,33 +180,49 @@ fn extract_simple_two_pass(
     let bbox_int = BboxInt::from_bbox(region.bbox());
     let spatial_filter = spatial_blob_filter(&bbox_int);
 
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    blob_reader.set_parse_indexdata(true);
-    blob_reader
-        .next()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    // One sweep per element kind. A single file-order sweep deciding all
+    // three kinds is only sound when nodes precede ways precede relations,
+    // i.e. when the file is sorted - and this is exactly the branch taken
+    // when it is not. Under the old single sweep, a way whose blob appeared
+    // before the blob holding its bbox nodes never matched and was simply
+    // absent from the output: no error, no warning, no count. Three sweeps
+    // cost two extra reads of an input that is already on the slow path, and
+    // they decide from what the sweep actually saw rather than from where
+    // the producer happened to put the blob.
     let mut decompress_buf: Vec<u8> = Vec::new();
+    for phase in [
+        ClassifyPhase::Nodes,
+        ClassifyPhase::Ways,
+        ClassifyPhase::Relations,
+    ] {
+        let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+        blob_reader.set_parse_indexdata(true);
+        blob_reader
+            .next()
+            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
 
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
-            continue;
+        for blob_result in &mut blob_reader {
+            let blob = blob_result?;
+            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+                continue;
+            }
+            if let Some(idx) = blob.index()
+                && !spatial_filter.wants_index(&idx)
+            {
+                continue;
+            }
+            blob.decompress_into(&mut decompress_buf)?;
+            let block = PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))?;
+            classify_block_simple(
+                &block,
+                phase,
+                region,
+                &bbox_int,
+                &mut bbox_node_ids,
+                &mut matched_way_ids,
+                &mut matched_relation_ids,
+            );
         }
-        if let Some(idx) = blob.index()
-            && !spatial_filter.wants_index(&idx)
-        {
-            continue;
-        }
-        blob.decompress_into(&mut decompress_buf)?;
-        let block = PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))?;
-        classify_block_simple(
-            &block,
-            region,
-            &bbox_int,
-            &mut bbox_node_ids,
-            &mut matched_way_ids,
-            &mut matched_relation_ids,
-        );
     }
     crate::debug::emit_marker("SIMPLE_UNSORTED_PASS1_END");
 

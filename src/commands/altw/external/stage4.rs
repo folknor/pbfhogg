@@ -1213,6 +1213,11 @@ fn reframe_way_blob_with_locations(
                 let raw = cursor
                     .read_raw_field(wire_type)
                     .map_err(|e| format!("reframe scalar: {e}"))?;
+                // Same coordinate-framing refusal as the sparse arm; see
+                // `altw::reframe::check_default_coord_framing`. This path
+                // appends decimicrodegree fields 9 / 10 alongside a copied
+                // granularity / offset triple exactly as that one does.
+                super::super::reframe::check_default_coord_framing(field, raw)?;
                 protohoggr::encode_tag(&mut scratch.scalar_fields, field, wire_type);
                 scratch.scalar_fields.extend_from_slice(raw);
             }

@@ -756,6 +756,12 @@ enum Command {
         /// Emit pbfhogg's opt-in WayMembers-v1 and SharedNodePins-v1 metadata.
         #[arg(long)]
         inject_prepass: bool,
+        /// Accept ways whose node references are missing from the input,
+        /// writing those vertices as (0, 0). Without this the run fails:
+        /// (0, 0) is Null Island, a real coordinate, so a placeholder vertex
+        /// is indistinguishable from genuine data in the output.
+        #[arg(long)]
+        ignore_missing_nodes: bool,
         #[command(flatten)]
         compression: CompressionArg,
         #[command(flatten)]
@@ -1691,6 +1697,7 @@ fn main() -> process::ExitCode {
                 keep_untagged_nodes,
                 index_type,
                 inject_prepass,
+                ignore_missing_nodes,
                 compression,
                 force,
                 io,
@@ -1711,6 +1718,7 @@ fn main() -> process::ExitCode {
                         keep_untagged_nodes,
                         index_type,
                         inject_prepass,
+                        ignore_missing_nodes,
                         &write,
                         &overrides,
                     )
@@ -3184,6 +3192,7 @@ fn run_add_locations_to_ways(
     keep_untagged_nodes: bool,
     index_type: IndexType,
     inject_prepass: bool,
+    ignore_missing_nodes: bool,
     write: &WriteOpts,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -3194,6 +3203,7 @@ fn run_add_locations_to_ways(
         force: write.force,
         index_type,
         inject_prepass,
+        ignore_missing_nodes,
     };
     let stats = pbfhogg::altw::add_locations_to_ways(file, output, &options, overrides)?;
     stats.print_summary();

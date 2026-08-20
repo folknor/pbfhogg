@@ -42,6 +42,43 @@ pub(super) fn assemble_admin_polygons(
         .collect()
 }
 
+/// Decide whether `hole` belongs to the outer ring `outer_f64`.
+///
+/// Two things this must get right, both of which the previous
+/// `point_in_ring(hole[0])` did not:
+///
+/// 1. **Antimeridian.** Every other point-in-ring call in the codebase goes
+///    through `point_in_ring_with_antimeridian`. An admin boundary crossing
+///    +/-180 (Russia, Fiji, the Antarctic claims) has a longitude-
+///    discontinuous outer ring, and the plain ray cast assigns its holes to
+///    the wrong outer or drops them. This runs on planet data, so those
+///    relations are present.
+///
+/// 2. **Boundary vertices.** `hole[0]` for an admin boundary is very often a
+///    node shared with the outer ring, i.e. exactly on the boundary, where
+///    ray casting is undefined and answers either way. Sampling several
+///    vertices spread around the hole and taking the majority means one
+///    degenerate vertex no longer decides ownership. Vertices, not a
+///    centroid: the centroid of a non-convex hole can fall outside both the
+///    hole and its outer.
+fn hole_inside_outer(hole: &[(i32, i32)], outer_f64: &[(f64, f64)]) -> bool {
+    const SAMPLES: usize = 5;
+    let step = (hole.len() / SAMPLES).max(1);
+    let mut inside = 0_usize;
+    let mut tested = 0_usize;
+    for &(lat, lon) in hole.iter().step_by(step).take(SAMPLES) {
+        tested += 1;
+        if crate::geo::point_in_ring_with_antimeridian(
+            lon as f64 * 1e-7,
+            lat as f64 * 1e-7,
+            outer_f64,
+        ) {
+            inside += 1;
+        }
+    }
+    tested > 0 && inside * 2 > tested
+}
+
 /// Assemble all `AssembledPolygon`s produced by a single relation
 /// (one per outer ring, each carrying any inner rings that fall inside
 /// it). Pure function - no shared mutable state, safe to call from
@@ -111,8 +148,7 @@ fn assemble_one_relation(
             if hole.is_empty() {
                 continue;
             }
-            let hp = (hole[0].1 as f64 * 1e-7, hole[0].0 as f64 * 1e-7);
-            if !crate::geo::point_in_ring(hp.0, hp.1, &outer_f64) {
+            if !hole_inside_outer(hole, &outer_f64) {
                 continue;
             }
 
@@ -306,4 +342,79 @@ pub(super) fn write_admin_index(
     cells_out.flush()?;
     entries_out.flush()?;
     Ok(cell_ids.len() as u32)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::hole_inside_outer;
+
+    /// Build a closed axis-aligned rectangle ring in `(lon, lat)` degrees,
+    /// which is the orientation `hole_inside_outer` expects for its outer.
+    fn rect_lonlat(lon0: f64, lat0: f64, lon1: f64, lat1: f64) -> Vec<(f64, f64)> {
+        vec![
+            (lon0, lat0),
+            (lon1, lat0),
+            (lon1, lat1),
+            (lon0, lat1),
+            (lon0, lat0),
+        ]
+    }
+
+    /// Same rectangle as an assembled ring, which carries `(lat_e7, lon_e7)`.
+    #[allow(clippy::cast_possible_truncation)]
+    fn rect_ring_e7(lon0: f64, lat0: f64, lon1: f64, lat1: f64) -> Vec<(i32, i32)> {
+        rect_lonlat(lon0, lat0, lon1, lat1)
+            .into_iter()
+            .map(|(lon, lat)| ((lat * 1e7) as i32, (lon * 1e7) as i32))
+            .collect()
+    }
+
+    /// An outer ring crossing the antimeridian has discontinuous
+    /// longitudes, so the plain ray cast puts its holes outside it. Every
+    /// other point-in-ring call in the codebase is antimeridian-aware; this
+    /// one was not, and it runs on planet data where Russia and Fiji are.
+    #[test]
+    fn hole_in_an_antimeridian_crossing_outer_is_owned_by_it() {
+        // Outer spans 175E to 175W across the dateline.
+        let outer = rect_lonlat(175.0, -5.0, -175.0, 5.0);
+        let hole = rect_ring_e7(179.0, -1.0, 179.5, 1.0);
+        assert!(
+            hole_inside_outer(&hole, &outer),
+            "a hole inside an antimeridian-crossing outer must be owned by it"
+        );
+
+        // Passing counterpart: a hole on the far side of the planet is not
+        // owned, so this is not satisfied by a function that always agrees.
+        let elsewhere = rect_ring_e7(0.0, -1.0, 0.5, 1.0);
+        assert!(!hole_inside_outer(&elsewhere, &outer));
+    }
+
+    /// The hole's first vertex is very often a node shared with the outer
+    /// ring, i.e. exactly on the boundary, where ray casting is undefined.
+    /// Sampling several vertices means one degenerate vertex no longer
+    /// decides ownership on its own.
+    #[test]
+    fn a_hole_touching_the_outer_boundary_is_still_owned() {
+        let outer = rect_lonlat(0.0, 0.0, 10.0, 10.0);
+        // First vertex sits exactly on the outer's eastern edge, where the
+        // ray cast answers "outside"; the rest of the hole is unambiguously
+        // inside. Testing hole[0] alone therefore disowns the whole hole.
+        let mut hole = vec![(50_000_000_i32, 100_000_000_i32)];
+        hole.extend(rect_ring_e7(1.0, 4.0, 3.0, 6.0));
+        assert!(
+            hole_inside_outer(&hole, &outer),
+            "a hole sharing a vertex with the outer boundary must still be \
+             owned by it"
+        );
+    }
+
+    /// Ordinary case, and the guard against a majority rule that always
+    /// says yes: a hole wholly outside the outer belongs to nobody.
+    #[test]
+    fn a_hole_outside_the_outer_is_not_owned() {
+        let outer = rect_lonlat(0.0, 0.0, 10.0, 10.0);
+        let hole = rect_ring_e7(20.0, 20.0, 22.0, 22.0);
+        assert!(!hole_inside_outer(&hole, &outer));
+    }
 }

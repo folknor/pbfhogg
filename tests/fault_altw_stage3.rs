@@ -59,6 +59,7 @@ mod altw_external_stage3 {
                     force: true,
                     index_type: IndexType::External,
                     inject_prepass: false,
+                    ignore_missing_nodes: true,
                 },
                 &pbfhogg::HeaderOverrides::default(),
             )

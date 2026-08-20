@@ -61,6 +61,27 @@ pub fn parse_bbox(s: &str) -> Result<Bbox> {
         .parse()
         .map_err(|_| format!("invalid max_lat: {}", parts[3]))?;
 
+    // Domain check before the ordering check: 200,0,300,1 satisfies
+    // min < max on both axes and is still not a place. `BboxInt::from_bbox`
+    // multiplies by 1e7 and casts to i32, and Rust float-to-int casts
+    // saturate rather than wrap, so an out-of-domain bbox used to reach the
+    // extract as `i32::MAX` bounds and produce an empty output with exit
+    // code 0 - a wrong answer reported as a successful run.
+    //
+    // Latitude and longitude are checked separately, and separately from
+    // representability: they have different domains, and a value can be a
+    // perfectly good f64 while being no latitude at all.
+    for (name, value) in [("min_lat", min_lat), ("max_lat", max_lat)] {
+        if !value.is_finite() || !(-90.0..=90.0).contains(&value) {
+            return Err(format!("{name} ({value}) must be within -90 and 90 degrees").into());
+        }
+    }
+    for (name, value) in [("min_lon", min_lon), ("max_lon", max_lon)] {
+        if !value.is_finite() || !(-180.0..=180.0).contains(&value) {
+            return Err(format!("{name} ({value}) must be within -180 and 180 degrees").into());
+        }
+    }
+
     if min_lon >= max_lon {
         return Err(format!("min_lon ({min_lon}) must be less than max_lon ({max_lon})").into());
     }
@@ -731,6 +752,42 @@ mod tests {
     fn parse_bbox_min_ge_max() {
         assert!(parse_bbox("12.7,55.6,12.4,55.8").is_err());
         assert!(parse_bbox("12.4,55.8,12.7,55.6").is_err());
+    }
+
+    /// A bbox outside the geographic domain used to parse cleanly, then
+    /// saturate to `i32::MAX` inside `BboxInt::from_bbox` (Rust float-to-int
+    /// casts saturate rather than wrap) and produce an empty extract with
+    /// exit code 0 - a wrong answer reported as a successful run.
+    ///
+    /// Latitude and longitude are checked separately because their domains
+    /// differ: 100 degrees is a perfectly good longitude and not a latitude
+    /// at all.
+    #[test]
+    fn parse_bbox_rejects_values_outside_the_geographic_domain() {
+        for (input, expected) in [
+            ("200,0,300,1", "min_lon"),
+            ("0,0,181,1", "max_lon"),
+            ("0,-91,1,1", "min_lat"),
+            ("0,0,1,91", "max_lat"),
+            ("0,0,1,inf", "max_lat"),
+            ("-181,0,1,1", "min_lon"),
+        ] {
+            let err = parse_bbox(input)
+                .err()
+                .unwrap_or_else(|| panic!("{input} must be refused"))
+                .to_string();
+            assert!(
+                err.contains(expected) && err.contains("degrees"),
+                "expected the domain guard naming {expected} for {input}. Got: {err}"
+            );
+        }
+
+        // Passing counterparts: the exact corners of the domain are legal
+        // places, so the guard must not be an off-by-one on the boundary.
+        assert!(parse_bbox("-180,-90,180,90").is_ok());
+        // And 100 degrees east is a real longitude even though 100 degrees
+        // north is not a latitude.
+        assert!(parse_bbox("99,0,100,1").is_ok());
     }
 
     #[test]

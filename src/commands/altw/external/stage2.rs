@@ -218,7 +218,8 @@ impl SharedSlotBuckets {
 /// id range, decode those blobs, walk records and node tuples in
 /// lockstep, and emit `ResolvedEntry` to per-bucket slot writers
 /// (256 files total, per-bucket mutex). Returns the count of records
-/// resolved to non-zero coordinates.
+/// that found their node in the id-sorted tuple stream - presence, not
+/// non-zero-ness; see the counting site below.
 #[hotpath::measure]
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(super) fn stage2_node_join(
@@ -577,9 +578,16 @@ pub(super) fn stage2_node_join(
                                     entry.write_to(bucket_start, &mut entry_buf);
                                     slot_bufs[bucket].extend_from_slice(&entry_buf);
                                     slot_counts[bucket] += 1;
-                                    if tuple.lat != 0 || tuple.lon != 0 {
-                                        local_resolved += 1;
-                                    }
+                                    // Count on presence, not on truthiness.
+                                    // `resolved` already means the id was
+                                    // found in the node stream; gating the
+                                    // increment on a non-zero coordinate
+                                    // additionally reported every genuine
+                                    // node at Null Island as missing, so the
+                                    // external backend disagreed with the
+                                    // sparse one about the same input. Absent
+                                    // is not zero.
+                                    local_resolved += 1;
                                     if slot_bufs[bucket].len() >= FLUSH_THRESHOLD {
                                         let t_lock = std::time::Instant::now();
                                         let mut w = slot_buckets.writers[bucket]

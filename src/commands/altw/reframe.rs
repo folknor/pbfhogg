@@ -136,6 +136,7 @@ fn parse_block_top(
                 let raw = cursor
                     .read_raw_field(wire_type)
                     .map_err(|e| format!("reframe scalar: {e}"))?;
+                check_default_coord_framing(field, raw)?;
                 encode_tag(&mut scratch.scalar_fields, field, wire_type);
                 scratch.scalar_fields.extend_from_slice(raw);
             }
@@ -146,6 +147,54 @@ fn parse_block_top(
     }
 
     stringtable_range.ok_or_else(|| "reframe: no StringTable in PrimitiveBlock".to_string())
+}
+
+/// Refuse a way blob whose coordinate framing is not the PBF default.
+///
+/// The reframe path writes `Way.lat` / `Way.lon` (fields 9 / 10) straight
+/// from `NodeIndex`, which stores decimicrodegrees, while copying the source
+/// block's `granularity` (17), `lat_offset` (19) and `lon_offset` (20)
+/// verbatim into the output. The reader reconstructs
+/// `lat = lat_offset + granularity * value`, so the round trip is only
+/// correct when `granularity == 100` and both offsets are zero. On a block
+/// declaring, say, `granularity = 1000` every way coordinate this path emits
+/// is off by a factor of ten - and it is emitted as well-formed PBF that
+/// reads back cleanly, so nothing downstream ever notices.
+///
+/// Dropping the fields instead is not safe in general: a mixed blob's
+/// DenseNodes are copied through verbatim and would be reinterpreted under
+/// the new framing. Refusing is the honest option. `write/block_builder.rs`
+/// omits 17 / 19 / 20 entirely and relies on the defaults, so every pbfhogg
+/// and osmium producer passes this check; field 18 (`date_granularity`) does
+/// not affect coordinates and is copied unexamined.
+pub(in crate::commands::altw) fn check_default_coord_framing(
+    field: u32,
+    raw: &[u8],
+) -> std::result::Result<(), String> {
+    let (name, default) = match field {
+        17 => ("granularity", 100_u64),
+        19 => ("lat_offset", 0),
+        20 => ("lon_offset", 0),
+        // 18 is date_granularity - irrelevant to coordinates.
+        _ => return Ok(()),
+    };
+    let mut value: u64 = 0;
+    for (i, byte) in raw.iter().enumerate() {
+        value |= u64::from(byte & 0x7f) << (i * 7);
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    if value == default {
+        return Ok(());
+    }
+    Err(format!(
+        "reframe: PrimitiveBlock.{name} is {value}, not the default {default}. \
+         add-locations-to-ways writes way coordinates in decimicrodegrees and \
+         cannot honour a non-default coordinate framing on this path; the \
+         output would be silently wrong. Re-encode the input first, e.g. \
+         `pbfhogg cat --clean`."
+    ))
 }
 
 /// Walk one `PrimitiveGroup`. Way submessages get reframed (locations
@@ -551,6 +600,76 @@ mod tests {
         assert!(
             err.contains("Way.refs appears twice with data"),
             "expected the repeated-occurrence guard specifically. Got: {err}"
+        );
+    }
+
+    /// Append a `PrimitiveBlock` scalar varint field (17 / 19 / 20) to a
+    /// block built by `way_block`.
+    #[allow(clippy::cast_sign_loss)]
+    fn with_scalar(mut block: Vec<u8>, field: u32, value: i64) -> Vec<u8> {
+        varint(u64::from(field << 3), &mut block); // VARINT wire type = 0
+        varint(value as u64, &mut block);
+        block
+    }
+
+    /// A block whose coordinate framing is not the PBF default must be
+    /// refused, not reframed.
+    ///
+    /// This path writes fields 9 / 10 straight from `NodeIndex`, which holds
+    /// decimicrodegrees, while copying `granularity` / `lat_offset` /
+    /// `lon_offset` verbatim into the output. The reader reconstructs
+    /// `lat = lat_offset + granularity * value`, so on a `granularity = 1000`
+    /// block every way coordinate came out ten times too large - written as
+    /// well-formed PBF that reads back cleanly, with no downstream check able
+    /// to notice.
+    #[test]
+    fn non_default_coordinate_framing_is_refused() {
+        for (field, value, name) in [
+            (17_u32, 1000_i64, "granularity"),
+            (19, 500_000_000, "lat_offset"),
+            (20, -500_000_000, "lon_offset"),
+        ] {
+            let block = with_scalar(way_block(42, &[7], true), field, value);
+            let err = try_run(&block).expect_err("non-default framing must be refused");
+            assert!(
+                err.contains(name) && err.contains("not the default"),
+                "expected the coordinate-framing guard naming {name}. Got: {err}"
+            );
+        }
+    }
+
+    /// The guard must not fire on the framing every real producer writes.
+    /// Explicit defaults are legal protobuf and must reframe exactly as an
+    /// absent field does, and `date_granularity` (18) must pass untouched -
+    /// it has nothing to do with coordinates.
+    #[test]
+    fn default_coordinate_framing_and_date_granularity_still_pass() {
+        let plain = run(&way_block(42, &[7], true)).0;
+
+        let explicit = with_scalar(
+            with_scalar(with_scalar(way_block(42, &[7], true), 17, 100), 19, 0),
+            20,
+            0,
+        );
+        let (explicit_out, ways, missing) = run(&explicit);
+        assert_eq!((ways, missing), (1, 0));
+        // The reframed output is the group bytes followed by the copied
+        // scalar fields, so an explicitly-default block must produce exactly
+        // the implicit-default output plus those three fields verbatim.
+        let mut expected = plain.clone();
+        expected.extend_from_slice(&[0x88, 0x01, 100, 0x98, 0x01, 0, 0xA0, 0x01, 0]);
+        assert_eq!(
+            explicit_out, expected,
+            "explicitly-default framing must reframe identically and copy \
+             fields 17 / 19 / 20 through unchanged"
+        );
+
+        let dated = with_scalar(way_block(42, &[7], true), 18, 1000);
+        let (_, ways, missing) = run(&dated);
+        assert_eq!(
+            (ways, missing),
+            (1, 0),
+            "date_granularity is not a coordinate framing field"
         );
     }
 

@@ -20,11 +20,21 @@
 //!   ~440 MB + ~100 MB at planet, vs the chunk format's ~440 MB
 //!   `offsets`+`start_pad`. Net RAM is roughly flat.
 //!
-//! The sentinel for "node id was referenced but never written" is
-//! `(lat, lon) == (0, 0)`. `set_len` zero-fills the file, so unwritten
-//! slots return `None` from `get`. This matches the prior chunk-format
-//! semantics; the rare collision (a real OSM node at exactly `(0, 0)`
-//! decimicrodegrees) was already silently absent under the old code.
+//! # Absence is a flag bit, not a coordinate
+//!
+//! "Referenced but never written" used to be spelled `(lat, lon) == (0, 0)`,
+//! which is Null Island - a real, legal OSM coordinate. A node genuinely at
+//! `0, 0` was reported missing, and a missing node was written into a way as
+//! if it sat in the Gulf of Guinea. All-zero as an absence sentinel is the
+//! same mistake indexdata v3 already corrected by spelling an absent bbox as
+//! an inverted box rather than an all-zero one.
+//!
+//! The slot is still eight bytes and `set_len` still zero-fills, so an
+//! untouched slot still reads as absent - but presence is now carried by an
+//! explicit bit that no coordinate can set by accident. Latitude is stored
+//! biased by `LAT_BIAS`, which puts every legal latitude in `0 ..= 1.8e9`,
+//! below `2^31`; bit 31 is therefore free and means "written". Longitude
+//! occupies the upper word verbatim. See [`pack`] / [`unpack`].
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,6 +42,46 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::idset::IdSet;
 
 use super::Result;
+
+/// Latitude bias, in decimicrodegrees: 90 degrees.
+const LAT_BIAS: i64 = 900_000_000;
+/// Presence flag. Set on every written slot; unreachable by any biased
+/// latitude, since the biased range tops out at `1.8e9 < 2^31`.
+const PRESENT: u64 = 1 << 31;
+/// Longitude bound in decimicrodegrees: 180 degrees.
+const LON_LIMIT: i64 = 1_800_000_000;
+
+/// Pack a geographic coordinate into one slot word, with the presence bit
+/// set. Returns `None` when the coordinate is outside the geographic domain
+/// and therefore not representable - the caller must refuse rather than
+/// store a value that would decode as some other place.
+///
+/// The range check is deliberately geographic, not merely representational:
+/// every `(i32, i32)` pair is representable in 64 bits, but only latitudes
+/// within +/-90 and longitudes within +/-180 are coordinates.
+fn pack(lat: i32, lon: i32) -> Option<u64> {
+    let lat = i64::from(lat);
+    let lon = i64::from(lon);
+    if !(-LAT_BIAS..=LAT_BIAS).contains(&lat) || !(-LON_LIMIT..=LON_LIMIT).contains(&lon) {
+        return None;
+    }
+    #[allow(clippy::cast_sign_loss)]
+    let biased_lat = (lat + LAT_BIAS) as u64;
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let lon_bits = u64::from(lon as i32 as u32);
+    Some(biased_lat | PRESENT | (lon_bits << 32))
+}
+
+/// Inverse of [`pack`]. `None` means the slot was never written.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn unpack(packed: u64) -> Option<(i32, i32)> {
+    if packed & PRESENT == 0 {
+        return None;
+    }
+    let lat = ((packed & 0x7fff_ffff) as i64 - LAT_BIAS) as i32;
+    let lon = (packed >> 32) as u32 as i32;
+    Some((lat, lon))
+}
 
 /// Rank-indexed flat node coordinate store.
 pub(super) struct SparseArrayIndex {
@@ -48,9 +98,17 @@ impl SparseArrayIndex {
     pub(super) fn get(&self, node_id: i64) -> Option<(i32, i32)> {
         let rank = self.referenced.rank_if_set(node_id)?;
         let byte_offset = (rank * 8) as usize;
-        if byte_offset + 8 > self.mmap.len() {
-            return None;
-        }
+        // Not a "node absent" case: `rank_if_set` just said the id is in the
+        // IdSet the store was sized from, so a rank past the end is a broken
+        // invariant, not a miss. Reporting `None` here made a store/IdSet
+        // mismatch indistinguishable from an unreferenced node - it became a
+        // missing location and then a (0, 0) coordinate in the output.
+        assert!(
+            byte_offset + 8 <= self.mmap.len(),
+            "sparse index rank {rank} for node {node_id} is outside the {} \
+             byte store built from the same IdSet",
+            self.mmap.len()
+        );
         // SAFETY: byte_offset + 8 <= mmap.len(), pointer is 8-byte aligned
         // (page-aligned base + 8*rank). Atomic load pairs with atomic
         // stores in `SharedSparseWriter::insert` to eliminate data-race UB.
@@ -58,12 +116,7 @@ impl SparseArrayIndex {
             let ptr = self.mmap.as_ptr().add(byte_offset).cast::<AtomicU64>();
             (*ptr).load(Ordering::Relaxed)
         };
-        if packed == 0 {
-            return None;
-        }
-        let lat = packed as i32;
-        let lon = (packed >> 32) as i32;
-        Some((lat, lon))
+        unpack(packed)
     }
 }
 
@@ -87,13 +140,30 @@ unsafe impl Sync for SharedSparseWriter {}
 
 impl SharedSparseWriter {
     /// Insert a referenced node's coordinates at byte offset `rank * 8`.
+    ///
+    /// Errors when the coordinate is outside the geographic domain, because
+    /// the slot encoding cannot represent it and storing a truncated value
+    /// would put the node somewhere else on Earth without saying so.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    fn insert(&self, rank: u64, lat: i32, lon: i32) {
+    fn insert(&self, node_id: i64, rank: u64, lat: i32, lon: i32) -> crate::error::Result<()> {
+        let packed = pack(lat, lon).ok_or_else(|| {
+            crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(format!(
+                "node {node_id} has coordinates outside the geographic domain \
+                 (lat {lat}, lon {lon} in decimicrodegrees; latitude must be \
+                 within +/-90 degrees and longitude within +/-180). Refusing \
+                 to build a node index from it."
+            ))))
+        })?;
         let byte_offset = (rank * 8) as usize;
-        if byte_offset + 8 > self.capacity_bytes {
-            return;
-        }
-        let packed = u64::from(lat as u32) | (u64::from(lon as u32) << 32);
+        assert!(
+            byte_offset + 8 <= self.capacity_bytes,
+            "sparse index rank {rank} is outside the {} byte store built from \
+             the same IdSet that produced it. Returning quietly here dropped \
+             the coordinate, which resurfaced downstream as a missing \
+             location and then as a (0, 0) way vertex, with no error \
+             anywhere.",
+            self.capacity_bytes
+        );
         // SAFETY: byte_offset + 8 <= capacity_bytes = mmap length.
         // Pointer is 8-byte aligned (page-aligned base + 8*rank).
         // Atomic store eliminates data-race UB even with duplicate ids.
@@ -101,6 +171,7 @@ impl SharedSparseWriter {
             let ptr = self.base.add(byte_offset).cast::<AtomicU64>();
             (*ptr).store(packed, Ordering::Relaxed);
         }
+        Ok(())
     }
 }
 
@@ -204,7 +275,7 @@ pub(super) fn build_node_index_sparse(
                     continue;
                 }
                 if let Some(rank) = referenced_ref.rank_if_set(tup.id) {
-                    writer_ref.insert(rank, tup.lat, tup.lon);
+                    writer_ref.insert(tup.id, rank, tup.lat, tup.lon)?;
                     blob_stored += 1;
                     if rank < blob_min_rank {
                         blob_min_rank = rank;
@@ -272,4 +343,77 @@ fn advise_random_store(mmap: &memmap2::MmapMut) {
     }
     #[cfg(not(unix))]
     let _ = mmap;
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::{LAT_BIAS, PRESENT, pack, unpack};
+
+    /// The slot encoding is asserted on its bits, not on a round trip
+    /// through itself: a `pack` / `unpack` pair can agree with each other
+    /// while both being wrong about the layout everything else depends on.
+    #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
+    fn packed_layout_is_biased_latitude_presence_bit_and_raw_longitude() {
+        let packed = pack(550_000_000, -120_000_000).unwrap();
+        assert_ne!(packed & PRESENT, 0, "a written slot carries the flag bit");
+        assert_eq!(
+            (packed & 0x7fff_ffff) as i64 - LAT_BIAS,
+            550_000_000,
+            "the low word is the latitude biased by 90 degrees"
+        );
+        assert_eq!(
+            (packed >> 32) as u32,
+            (-120_000_000_i32) as u32,
+            "the high word is the longitude verbatim"
+        );
+    }
+
+    /// The whole point of the flag bit: Null Island is a real place, so a
+    /// zero coordinate must decode as present while a zero *slot* - what
+    /// `set_len` leaves behind - decodes as absent.
+    #[test]
+    fn null_island_is_present_and_an_untouched_slot_is_absent() {
+        assert_eq!(unpack(0), None, "an untouched slot is absent");
+        let packed = pack(0, 0).unwrap();
+        assert_ne!(packed, 0, "a node at Null Island must not encode as zero");
+        assert_eq!(unpack(packed), Some((0, 0)));
+    }
+
+    /// Every legal coordinate survives exactly, including both extremes of
+    /// each axis, where the bias is tightest against the flag bit.
+    #[test]
+    fn every_legal_coordinate_survives_exactly() {
+        for lat in [-900_000_000, -1, 0, 1, 900_000_000] {
+            for lon in [-1_800_000_000, -1, 0, 1, 1_800_000_000] {
+                let packed = pack(lat, lon).unwrap_or_else(|| {
+                    panic!("({lat}, {lon}) is a legal coordinate and must pack")
+                });
+                assert_eq!(unpack(packed), Some((lat, lon)), "({lat}, {lon})");
+            }
+        }
+    }
+
+    /// Out-of-domain values are refused rather than stored as some other
+    /// place. Latitude and longitude have different domains and are checked
+    /// separately - a longitude of 100 degrees is fine, a latitude of 100
+    /// degrees is not.
+    #[test]
+    fn out_of_domain_coordinates_are_refused() {
+        assert!(pack(900_000_001, 0).is_none(), "latitude past 90 degrees");
+        assert!(pack(-900_000_001, 0).is_none(), "latitude past -90 degrees");
+        assert!(pack(0, 1_800_000_001).is_none(), "longitude past 180");
+        assert!(pack(0, -1_800_000_001).is_none(), "longitude past -180");
+        assert!(
+            pack(1_000_000_000, 0).is_none(),
+            "a latitude of 100 degrees is not a latitude, even though the \
+             same number is a legal longitude"
+        );
+        assert!(pack(0, 1_000_000_000).is_some(), "100 degrees east is real");
+    }
 }

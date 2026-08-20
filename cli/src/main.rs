@@ -1899,6 +1899,15 @@ fn main() -> process::ExitCode {
         }
     })();
 
+    // Emit the `writer_*` sidecar counters exactly once, here rather than
+    // from `PbfWriter::flush`. The counters are a process-global static, so
+    // flush-time emission published the same running totals once per writer -
+    // once per region for `multi-extract` - which reads as a per-region
+    // breakdown and is not one. This is the single point every command path
+    // passes through, success or failure, and it runs before the hotpath
+    // guard drops.
+    pbfhogg::write::emit_writer_counters();
+
     match result {
         Ok(()) => process::ExitCode::SUCCESS,
         Err(e) => {

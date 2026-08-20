@@ -21,16 +21,26 @@
 //!   any order; file contents are correct because offsets were
 //!   assigned in seq order on the writer thread.
 //! - On channel close, writer thread closes pool channels, joins pool
-//!   workers, truncates to logical size, `sync_all`, returns.
+//!   workers, `sync_all`s, returns. It does **not** truncate: workers
+//!   `pwrite` at absolute offsets and the kernel extends EOF to the
+//!   highest offset written, so there is no over-allocated tail to cut
+//!   back. This bullet used to say "truncates to logical size", which
+//!   contradicted `parallel_writer_thread`'s own doc and the premise of
+//!   `decisions/0014-output-backends-stay-separate.md`, whose argument
+//!   turns on this backend sharing none of the accumulate / align /
+//!   `set_len` shape the other backends are assumed to duplicate.
 //!
-//! ## Status: scaffold (2026-04-21)
+//! ## Status: live, and the default backend
 //!
-//! Skeleton + worker loop shape committed behind
-//! `#![allow(dead_code)]`. `to_path_parallel` / integration into
-//! `PbfWriter` and CLI-flag exposure land in a follow-up commit after
-//! correctness is sanity-checked on Denmark.
-
-#![allow(dead_code)]
+//! This is not scaffolding. `PbfWriter::to_path_parallel` is integrated
+//! and this backend is the **default** for `apply-changes` and for
+//! `add-locations-to-ways` pass 2. The module doc carried "Status:
+//! scaffold (2026-04-21) ... integration lands in a follow-up commit"
+//! long after that follow-up commit landed, and the module-wide
+//! `#![allow(dead_code)]` that the scaffold needed outlived it too -
+//! suppressing genuine dead-code detection across a backend on the hot
+//! path. Both are gone; anything here that is truly unused must now say
+//! so at its own definition, with a reason.
 
 use std::fs::File;
 use std::io;
@@ -50,16 +60,21 @@ use crate::write::pipeline::{
 };
 
 /// Number of worker threads doing `pwrite`s / `copy_file_range`s in
-/// parallel. 8 saturates NVMe queue depth on the plantasjen bench
-/// host (measured 2026-04-21); 4 leaves disk bandwidth on the table.
-/// Could become a CLI flag later.
+/// parallel. 16 is the empirical planet-bench value (commit `80b37dfb`,
+/// 2026-04-21, raising it from 4); the smaller settings leave disk
+/// bandwidth on the table. Could become a CLI flag later.
+///
+/// The doc here used to justify 8 while the constant read 16, because
+/// that commit changed the number and rewrote the prose around a value
+/// it did not use.
 pub(crate) const POOL_SIZE: usize = 16;
 
 /// Per-worker channel capacity. Kept small so the writer thread's
 /// dispatch doesn't outrun the pool; each WriteOp holds a full owned
-/// `Vec<u8>` (~800 KB for the rewrite path), so 8 × 4 workers ×
-/// 800 KB ≈ 26 MB buffered across the pool - comfortably under the
-/// pipeline's existing memory budget.
+/// `Vec<u8>` (~800 KB for the rewrite path), so
+/// `PER_WORKER_CAPACITY` × `POOL_SIZE` × 800 KB ≈ 100 MB buffered
+/// across the pool at the current 8 × 16 - within the pipeline's
+/// existing memory budget, but note it scales with `POOL_SIZE`.
 pub(crate) const PER_WORKER_CAPACITY: usize = 8;
 
 /// One unit of work dispatched from the writer-thread to the pool.

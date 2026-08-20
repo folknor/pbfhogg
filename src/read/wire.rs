@@ -364,23 +364,6 @@ impl<'a> WireBlock<'a> {
         self.group_ranges_count as usize
     }
 
-    /// Raw StringTable protobuf bytes (field 1 of PrimitiveBlock).
-    /// Scaffolding for future per-group raw passthrough.
-    #[inline]
-    #[allow(dead_code)]
-    pub fn raw_stringtable(&self) -> &'a [u8] {
-        &self.buffer
-            [self.st_raw_offset as usize..self.st_raw_offset as usize + self.st_raw_len as usize]
-    }
-
-    /// Raw protobuf bytes for the entire PrimitiveBlock (before inline entries).
-    /// The first `proto_len` bytes of the buffer.
-    #[inline]
-    #[allow(dead_code)]
-    pub fn raw_proto(&self) -> &'a [u8] {
-        &self.buffer[..self.proto_len as usize]
-    }
-
     #[inline]
     pub fn group(&self, index: usize) -> &'a [u8] {
         let base = self.group_ranges_offset as usize + index * 8;

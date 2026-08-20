@@ -14,7 +14,7 @@ use flate2::Compress;
 use flate2::Compression as FlateCompression;
 use flate2::FlushCompress;
 use flate2::Status;
-use protohoggr::{encode_bytes_field, encode_int32_field};
+use protohoggr::{encode_bytes_field, encode_bytes_field_always, encode_int32_field};
 
 use crate::read::blob_wire::{MAX_BLOB_DATASIZE, MAX_BLOB_HEADER_SIZE};
 use crate::write::metrics::WRITER_METRICS;
@@ -37,6 +37,12 @@ pub(super) struct FrameScratch {
     zlib_compressor: Option<(u32, Compress)>,
     /// Reusable zstd compressor (lazy-initialized on first zstd blob).
     zstd_compressor: Option<(i32, zstd::bulk::Compressor<'static>)>,
+    /// High-water capacity observed for `blob_buf`. `frame_blob_into` hands
+    /// the filled buffer to the caller and installs a replacement reserved to
+    /// this size, so the next blob does not re-grow from zero.
+    blob_cap: usize,
+    /// High-water capacity observed for `header_buf`; see `blob_cap`.
+    header_cap: usize,
 }
 
 impl FrameScratch {
@@ -47,7 +53,21 @@ impl FrameScratch {
             compress_buf: Vec::new(),
             zlib_compressor: None,
             zstd_compressor: None,
+            blob_cap: 0,
+            header_cap: 0,
         }
+    }
+
+    /// Hand out `buf`'s contents and leave a replacement behind, reserved to
+    /// the high-water capacity recorded in `cap`.
+    ///
+    /// This is the capacity-preserving alternative to `buf.clone()`: the
+    /// caller receives the bytes without a copy, and the scratch slot keeps
+    /// its warmed-up capacity because the replacement is allocated at the
+    /// high-water mark rather than empty.
+    fn take_with_capacity(buf: &mut Vec<u8>, cap: &mut usize) -> Vec<u8> {
+        *cap = (*cap).max(buf.capacity());
+        std::mem::replace(buf, Vec::with_capacity(*cap))
     }
 }
 
@@ -108,9 +128,31 @@ pub(crate) fn frame_blob_pipelined(
 
 /// Compress and frame a blob using reusable scratch buffers.
 ///
-/// Returns an owned `Vec<u8>` suitable for sending through a pipeline channel.
-/// The scratch buffers are cleared and reused - after warmup, only the returned
-/// `out` Vec is allocated per call.
+/// Returns owned buffers suitable for sending through a pipeline channel.
+///
+/// # Per-call cost
+///
+/// The compression scratch (`compress_buf`) and both compressors are reused
+/// across calls and allocate nothing after warmup. The two buffers that *are*
+/// handed to the caller - the `BlobHeader` and the `Blob` body - are swapped
+/// out rather than copied out, so each call allocates exactly two
+/// `Vec<u8>`s - the replacements installed in the scratch - and performs zero
+/// memcpys of blob-sized data.
+///
+/// This block previously claimed the same steady-state behaviour while the
+/// code below cloned both buffers: two allocations *and* two full memcpys per
+/// blob, on the hottest write path there is.
+///
+/// **The swap is not a measured speedup.** Six interleaved matched cells of
+/// `repack --dataset japan --compression none --bench 1` on `bygg` at commit
+/// `eea35d27` gave swap 8.6 / 8.6 / 8.3 s against clone 8.3 / 8.5 / 8.5 s -
+/// sign-inconsistent across the three pairs and inside the reported
+/// granularity. `--compression none` is the arrangement that maximizes the
+/// memcpy (the blob body is the whole uncompressed block), and it still did
+/// not show. The copies are also spread across rayon workers, so they dilute
+/// into wall time rather than adding to it. Keep the swap because the code
+/// now does what the doc says and because it removes real per-blob work, not
+/// because it made anything faster; do not cite a throughput win for it.
 ///
 /// NOTE: Buffer recycling pool was attempted to eliminate this per-call
 /// allocation via `Arc<Mutex<Vec<Vec<u8>>>>` shared between rayon workers and
@@ -178,14 +220,17 @@ pub(super) fn frame_blob_into(
         .bytes_framed
         .fetch_add(total_len as u64, Relaxed);
 
-    // Clone (not swap) so `scratch.header_buf` / `scratch.blob_buf` retain
-    // their high-water capacity across blobs. Swap would leave the scratch
-    // with empty Vecs, forcing both buffers to re-grow from zero on every
-    // subsequent blob - breaking the reuse invariant documented above.
+    // Swap out, do not clone. A plain `swap` would leave the scratch holding
+    // empty Vecs that re-grow from zero on every subsequent blob, which is why
+    // this used to clone; `take_with_capacity` installs a replacement already
+    // reserved to the high-water mark, so the reuse invariant holds *and* the
+    // two per-blob memcpys are gone.
+    let header = FrameScratch::take_with_capacity(&mut scratch.header_buf, &mut scratch.header_cap);
+    let blob = FrameScratch::take_with_capacity(&mut scratch.blob_buf, &mut scratch.blob_cap);
     Ok(FramedBlobParts {
         prefix: header_len.to_be_bytes(),
-        header: scratch.header_buf.clone(),
-        blob: scratch.blob_buf.clone(),
+        header,
+        blob,
     })
 }
 
@@ -194,6 +239,22 @@ pub(super) fn frame_blob_into(
 /// Uses `compress_buf` as an intermediate for zlib/zstd compression output.
 /// Both zlib and zstd compressors are lazy-initialized and reused to avoid
 /// ~312 KB (zlib) or ~512 KB (zstd) of compressor state allocation per blob.
+///
+/// # Why the payload field is always emitted
+///
+/// The payload (`raw`, `zlib_data`, or `zstd_data`) is written with the
+/// `_always` encoder, not the skip-if-empty one. A `Blob` carries exactly one
+/// payload field and it is what identifies the blob's encoding; with
+/// skip-if-empty, a zero-length payload produced a `Blob` message with *no
+/// fields at all* for `Compression::None`, which no reader can distinguish
+/// from a corrupt or truncated blob. An empty block is not reachable from any
+/// current caller - `BlockBuilder` never emits an element-free block - but a
+/// format writer must not have a path that emits a malformed message at all,
+/// and "unreachable today" is a property of the callers, not of this encoder.
+///
+/// This is the sibling of `encode_blob_header_fields`, where the opposite rule
+/// holds: there the optional hint fields are genuinely optional and absence is
+/// meaningful. Here absence is not a spelling of anything.
 pub(super) fn encode_blob_body(
     uncompressed: &[u8],
     compression: &Compression,
@@ -202,8 +263,9 @@ pub(super) fn encode_blob_body(
     scratch.blob_buf.clear();
     match compression {
         Compression::None => {
-            // Blob field 1: raw (bytes, len-delimited)
-            encode_bytes_field(&mut scratch.blob_buf, 1, uncompressed);
+            // Blob field 1: raw (bytes, len-delimited). Always emitted; see
+            // the doc block.
+            encode_bytes_field_always(&mut scratch.blob_buf, 1, uncompressed);
         }
         Compression::Zlib(level) => {
             compress_zlib(uncompressed, *level, scratch)?;
@@ -233,8 +295,8 @@ pub(super) fn encode_blob_body(
             })?;
             // Blob field 2: raw_size (int32, varint)
             encode_int32_field(&mut scratch.blob_buf, 2, raw_size);
-            // Blob field 7: zstd_data (bytes, len-delimited)
-            encode_bytes_field(&mut scratch.blob_buf, 7, &scratch.compress_buf);
+            // Blob field 7: zstd_data (bytes, len-delimited). Always emitted.
+            encode_bytes_field_always(&mut scratch.blob_buf, 7, &scratch.compress_buf);
         }
     }
     Ok(())
@@ -275,7 +337,8 @@ fn compress_zlib(uncompressed: &[u8], level: u32, scratch: &mut FrameScratch) ->
         ))
     })?;
     encode_int32_field(&mut scratch.blob_buf, 2, raw_size);
-    encode_bytes_field(&mut scratch.blob_buf, 3, &scratch.compress_buf);
+    // Blob field 3: zlib_data. Always emitted; see `encode_blob_body`.
+    encode_bytes_field_always(&mut scratch.blob_buf, 3, &scratch.compress_buf);
     Ok(())
 }
 
@@ -526,6 +589,176 @@ pub(crate) fn reframe_raw_with_index_scratch(
 mod tests {
     use super::*;
     use crate::read::blob_wire::WireBlobHeader;
+
+    /// An empty payload must still produce a `Blob` with its payload field.
+    ///
+    /// With the skip-if-empty encoder, `Compression::None` on a zero-length
+    /// block emitted a `Blob` message of length zero - no fields at all - and
+    /// nothing downstream could tell it from a truncated blob. The assertion
+    /// is on the encoded bytes rather than on a round-trip, because a reader
+    /// that tolerates the malformed form would hide exactly this defect: an
+    /// empty message decodes "successfully" into a default `Blob`.
+    ///
+    /// # Only the `None` arm can fail
+    ///
+    /// Said plainly, because an arm that cannot fail is worth exactly nothing
+    /// unless its reader knows that. Zlib and zstd both turn a zero-byte
+    /// input into a non-empty stream - a header and an end marker - so their
+    /// payload field is non-empty whichever encoder writes it, and reverting
+    /// those two call sites to `encode_bytes_field` would leave this test
+    /// green. `Compression::None` is the arm that carries the property: it is
+    /// the only path where the payload bytes are the block's bytes and are
+    /// therefore empty when the block is. The compressed arms are kept as
+    /// field-numbering and no-panic regression cover, not as evidence for the
+    /// `_always` rule, and `no_payload_bytes_reach_the_output_uncompressed`
+    /// below asserts the `None` case on exact bytes so the property has a
+    /// check that bites rather than a loop that merely includes it.
+    #[test]
+    fn empty_payload_still_emits_the_blob_payload_field() {
+        for compression in [
+            Compression::None,
+            Compression::Zlib(1),
+            Compression::Zstd(1),
+        ] {
+            let mut scratch = FrameScratch::new();
+            encode_blob_body(&[], &compression, &mut scratch).expect("empty body must encode");
+            assert!(
+                !scratch.blob_buf.is_empty(),
+                "{compression:?}: an empty payload produced a Blob message \
+                 with no fields at all"
+            );
+            // Field 1 (raw) / 3 (zlib_data) / 7 (zstd_data).
+            let payload_field: u32 = match compression {
+                Compression::None => 1,
+                Compression::Zlib(_) => 3,
+                Compression::Zstd(_) => 7,
+            };
+            let present = present_field_numbers(&scratch.blob_buf);
+            assert!(
+                present.contains(&payload_field),
+                "{compression:?}: encoded Blob carries fields {present:?}, \
+                 missing the payload field {payload_field}"
+            );
+        }
+    }
+
+    /// The exact bytes of an empty uncompressed `Blob`.
+    ///
+    /// This is the assertion that actually bites for the `_always` rule:
+    /// swap `encode_bytes_field_always` back to `encode_bytes_field` in the
+    /// `Compression::None` arm of `encode_blob_body` and the output becomes
+    /// zero bytes instead of these two.
+    #[test]
+    fn no_payload_bytes_reach_the_output_uncompressed() {
+        let mut scratch = FrameScratch::new();
+        encode_blob_body(&[], &Compression::None, &mut scratch).expect("empty body must encode");
+        assert_eq!(
+            scratch.blob_buf.as_slice(),
+            // Field 1, wire type 2 (0x0a), length 0.
+            &[0x0a, 0x00],
+            "an empty uncompressed Blob must still spell out its `raw` field \
+             with a zero length, not serialize to nothing"
+        );
+    }
+
+    /// Minimal independent protobuf field-number scanner.
+    ///
+    /// Deliberately not reusing the crate's own `Blob` reader: a decoder that
+    /// tolerates a field-less message is exactly what would hide the defect
+    /// the caller is asserting against.
+    fn present_field_numbers(mut bytes: &[u8]) -> Vec<u32> {
+        let mut out = Vec::new();
+        let read_varint = |b: &mut &[u8]| -> u64 {
+            let mut value = 0u64;
+            let mut shift = 0;
+            loop {
+                let byte = *b.first().expect("truncated varint in encoded Blob");
+                *b = &b[1..];
+                value |= u64::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    return value;
+                }
+                shift += 7;
+            }
+        };
+        while !bytes.is_empty() {
+            let key = read_varint(&mut bytes);
+            #[allow(clippy::cast_possible_truncation)]
+            out.push((key >> 3) as u32);
+            match key & 7 {
+                0 => {
+                    read_varint(&mut bytes);
+                }
+                2 => {
+                    let len = usize::try_from(read_varint(&mut bytes))
+                        .expect("length-delimited field length must fit usize");
+                    assert!(len <= bytes.len(), "length-delimited field overruns");
+                    bytes = &bytes[len..];
+                }
+                other => panic!("unexpected wire type {other} in encoded Blob"),
+            }
+        }
+        out
+    }
+
+    /// Framing must hand out its buffers without copying them, and must not
+    /// leave the scratch to re-grow from zero.
+    ///
+    /// Both halves matter and each on its own is satisfiable by the bug the
+    /// other one describes: `clone()` preserves the scratch capacity but pays
+    /// two memcpys per blob, and a bare `swap` skips the memcpys but empties
+    /// the scratch. The observable proxy for "swapped, not cloned" is that
+    /// the scratch buffer no longer holds the bytes it just produced.
+    #[test]
+    fn framing_swaps_buffers_out_and_keeps_scratch_capacity() {
+        let mut scratch = FrameScratch::new();
+        let payload = vec![7u8; 64 * 1024];
+        let first = frame_blob_into(
+            "OSMData",
+            &payload,
+            &Compression::None,
+            None,
+            None,
+            None,
+            &mut scratch,
+        )
+        .expect("first blob must frame");
+        assert!(!first.blob.is_empty(), "framed blob must carry bytes");
+        assert!(
+            scratch.blob_buf.is_empty() && scratch.header_buf.is_empty(),
+            "buffers must be swapped out, not cloned out"
+        );
+        let warmed_blob_cap = scratch.blob_buf.capacity();
+        let warmed_header_cap = scratch.header_buf.capacity();
+        assert!(
+            warmed_blob_cap >= payload.len(),
+            "the replacement blob buffer must be reserved to the high-water \
+             capacity, got {warmed_blob_cap} for a {} byte payload",
+            payload.len()
+        );
+        assert!(
+            warmed_header_cap > 0,
+            "the replacement header buffer must be reserved, got 0"
+        );
+
+        // A second, smaller blob must neither re-grow nor shrink the scratch.
+        let second = frame_blob_into(
+            "OSMData",
+            &[1, 2, 3],
+            &Compression::None,
+            None,
+            None,
+            None,
+            &mut scratch,
+        )
+        .expect("second blob must frame");
+        assert_eq!(second.blob.len(), 5, "3 payload bytes plus tag and length");
+        assert!(
+            scratch.blob_buf.capacity() >= warmed_blob_cap,
+            "scratch capacity regressed from {warmed_blob_cap} to {}",
+            scratch.blob_buf.capacity()
+        );
+    }
 
     #[test]
     fn way_members_header_roundtrip_respects_toggle() {

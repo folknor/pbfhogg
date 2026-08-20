@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 pub(crate) struct WriterMetrics {
     pub permit_wait_ns: AtomicU64,
@@ -50,6 +50,10 @@ pub(crate) struct WriterMetrics {
     /// output is correct but some blobs lost their tag skip-index; see
     /// `encode_blob_header_into`.
     pub tagdata_dropped_oversize: AtomicU64,
+
+    /// Latch for [`WriterMetrics::emit_once`], so a process emits the
+    /// counter set exactly once no matter how many writers it flushes.
+    emitted: AtomicBool,
 }
 
 impl WriterMetrics {
@@ -85,6 +89,7 @@ impl WriterMetrics {
             uring_submit_and_wait_ns: AtomicU64::new(0),
             uring_cq_wait_ns: AtomicU64::new(0),
             tagdata_dropped_oversize: AtomicU64::new(0),
+            emitted: AtomicBool::new(false),
         }
     }
 
@@ -127,13 +132,45 @@ impl WriterMetrics {
         }
     }
 
-    pub fn emit(&self) {
+    /// Emit the counters, at most once per process.
+    ///
+    /// [`WriterMetrics`] is a process-global static that no writer instance
+    /// owns, so its numbers are process totals and nothing else. `emit` used
+    /// to be called from `PbfWriter::flush`, which meant a command that
+    /// constructs several writers - `multi-extract` builds one per region,
+    /// and holds them all open at once - emitted the same running cumulative
+    /// totals once per region. Verified on Denmark with `--regions 3`: three
+    /// `writer_bytes_framed` samples, all carrying the combined
+    /// three-region total. The totals were right; what they appeared to say
+    /// (one sample per region, therefore per-region numbers) was not.
+    ///
+    /// Emitting exactly once removes the false per-writer reading. It does
+    /// **not** provide per-writer attribution - see the module docs on
+    /// [`WRITER_METRICS`] for what that would take.
+    ///
+    /// A process that never wrote anything emits nothing at all: moving
+    /// emission to the process exit hook means every command reaches it,
+    /// including the read-only ones that never construct a `PbfWriter`, and
+    /// those would otherwise publish a full set of zeroes that a sidecar
+    /// reader has to recognise and discard.
+    ///
+    /// Returns `true` if this call did the emitting.
+    pub fn emit_once(&self) -> bool {
+        if self.emitted.swap(true, Relaxed) {
+            return false;
+        }
+        self.emit()
+    }
+
+    /// Returns `true` if anything was emitted.
+    fn emit(&self) -> bool {
+        let mut counters: Vec<(&'static str, i64)> = Vec::new();
         macro_rules! emit {
             ($name:literal, $field:ident) => {
-                crate::debug::emit_counter(
+                counters.push((
                     $name,
                     i64::try_from(self.$field.load(Relaxed)).unwrap_or(i64::MAX),
-                );
+                ));
             };
         }
 
@@ -173,9 +210,42 @@ impl WriterMetrics {
         emit!("writer_uring_submit_and_wait_ns", uring_submit_and_wait_ns);
         emit!("writer_uring_cq_wait_ns", uring_cq_wait_ns);
         emit!("writer_tagdata_dropped_oversize", tagdata_dropped_oversize);
+
+        // An all-zero set means no writer ever ran in this process. Say
+        // nothing rather than publishing thirty zeroes for every `inspect`.
+        if counters.iter().all(|&(_, value)| value == 0) {
+            return false;
+        }
+        for (name, value) in counters {
+            crate::debug::emit_counter(name, value);
+        }
+        true
     }
 }
 
+/// Process-global writer counters.
+///
+/// # These are process totals, not per-writer numbers
+///
+/// Every `writer_*` sidecar counter is a sum across every `PbfWriter` the
+/// process ever constructed. For the single-writer commands - which is nearly
+/// all of them - that distinction is invisible. For `multi-extract`, which
+/// opens one `PbfWriter` per region and writes to all of them interleaved
+/// from parallel scopes, it means per-region attribution is simply not
+/// available: `writer_frame_ns` for a five-region run is the five regions'
+/// framing time added together.
+///
+/// Emitting once per process ([`WriterMetrics::emit_once`]) makes that
+/// reading unambiguous rather than merely true. Real per-writer attribution
+/// is a separate, larger change and is **not** done: it needs a
+/// `&WriterMetrics` handle threaded through every recording site - roughly
+/// 85 of them across `framing.rs`, `writer.rs`, `pipeline.rs`,
+/// `file_writer.rs`, `parallel_writer.rs` and `uring_writer.rs` - including
+/// the rayon-worker framing path, which reaches its scratch through a
+/// thread-local and today has no way to name the writer it is framing for.
+/// A per-instance scheme would also have to answer what the emitted counter
+/// names look like when N writers are live, since the current names are
+/// unsuffixed and every existing sidecar comparison depends on them.
 pub(crate) static WRITER_METRICS: WriterMetrics = WriterMetrics::new();
 
 #[cfg(test)]
@@ -203,6 +273,110 @@ mod tests {
         assert!(
             WRITER_METRICS.sync_all_ns.load(Relaxed) > ns_before,
             "record_sync_all must accumulate the elapsed time"
+        );
+    }
+
+    /// `emit_once` emits exactly once, however many times it is called.
+    ///
+    /// Tested on a fresh instance rather than on the global static, because
+    /// the global's latch may already have been tripped by another test in
+    /// the same binary - which would make an assertion against it pass for
+    /// the wrong reason.
+    #[test]
+    fn emit_once_latches_after_the_first_call() {
+        let metrics = super::WriterMetrics::new();
+        // Record some writer activity first. On a pristine instance every
+        // counter is zero, and `emit_once` correctly declines to emit that -
+        // so asserting `emit_once() == true` on a fresh instance would fail
+        // for a reason that has nothing to do with the latch.
+        metrics.bytes_written.fetch_add(4096, Relaxed);
+        assert!(
+            metrics.emit_once(),
+            "the first emit_once must be the one that emits"
+        );
+        for _ in 0..4 {
+            assert!(
+                !metrics.emit_once(),
+                "emit_once must not emit a second time; that is exactly the \
+                 per-region re-emission it exists to stop"
+            );
+        }
+    }
+
+    /// A process with no writer activity emits nothing.
+    ///
+    /// Emission moved to the CLI exit path, which every command reaches -
+    /// including `inspect` and the other read-only ones that never construct
+    /// a `PbfWriter`. Without this gate each of them would publish a full set
+    /// of zeroed `writer_*` counters.
+    #[test]
+    fn an_untouched_metrics_set_emits_nothing() {
+        let metrics = super::WriterMetrics::new();
+        assert!(
+            !metrics.emit_once(),
+            "an all-zero counter set must not be emitted"
+        );
+        // ...and the gate must be on the values, not a second latch: once
+        // there is real activity, emission happens.
+        let active = super::WriterMetrics::new();
+        active.bytes_framed.fetch_add(1, Relaxed);
+        assert!(
+            active.emit_once(),
+            "a counter set with real activity must still emit"
+        );
+    }
+
+    /// Nothing but the one process-exit hook may emit the writer counters.
+    ///
+    /// The defect this guards is not "emit is wrong" - it is "emit is called
+    /// from a per-writer code path", which no test of `emit_once` can see and
+    /// which shows up only as N sidecar samples of a process total that a
+    /// reader takes for N per-writer numbers. `PbfWriter::flush` was that
+    /// call site. Restore it and this fails.
+    ///
+    /// Both spellings of the call are scanned for. Checking only
+    /// `WRITER_METRICS.emit` would cover just the variant the defect
+    /// happened to take: a backend that re-introduced per-writer emission as
+    /// `crate::write::emit_writer_counters()` would slip through, and the
+    /// `emit_once` latch would then make the *first* writer's flush publish
+    /// partial totals and turn the process-exit call into a no-op - the same
+    /// wrong numbers, reached by the other spelling.
+    #[test]
+    fn writer_counters_are_emitted_only_from_the_process_exit_hook() {
+        const SOURCES: [(&str, &str); 5] = [
+            ("file_writer.rs", include_str!("file_writer.rs")),
+            ("parallel_writer.rs", include_str!("parallel_writer.rs")),
+            ("uring_writer.rs", include_str!("uring_writer.rs")),
+            ("pipeline.rs", include_str!("pipeline.rs")),
+            ("writer.rs", include_str!("writer.rs")),
+        ];
+        for (name, src) in SOURCES {
+            let squashed: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+            for spelling in ["WRITER_METRICS.emit", "emit_writer_counters("] {
+                assert!(
+                    !squashed.contains(spelling),
+                    "{name} emits the writer counters via `{spelling}`; \
+                     emission belongs to pbfhogg::write::emit_writer_counters, \
+                     called once per process, because WRITER_METRICS is a \
+                     process-global total"
+                );
+            }
+        }
+        // ...and the hook must actually be wired up, or "nothing emits" is
+        // satisfied by nothing emitting at all.
+        // Strip `//` line comments before scanning: a commented-out call
+        // would otherwise satisfy the scan, which is the vacuous-assertion
+        // trap this whole check exists to avoid.
+        let main_rs: String = include_str!("../../cli/src/main.rs")
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .flat_map(str::chars)
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            main_rs.contains("emit_writer_counters()"),
+            "the CLI must call pbfhogg::write::emit_writer_counters on its \
+             exit path, or no run emits writer_* counters at all"
         );
     }
 

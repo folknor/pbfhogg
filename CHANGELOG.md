@@ -100,6 +100,18 @@
 
 ### Added
 
+- **`pbfhogg::write::emit_writer_counters()`.** Publishes the `writer_*`
+  sidecar counters, at most once per process. Emission used to happen inside
+  `PbfWriter::flush`, but the counters are a process-global total, so a
+  command that opens several writers - `multi-extract` opens one per region
+  and writes to all of them at once - published the same running totals once
+  per region, which reads as a per-region breakdown and is not one. Library
+  consumers who want the counters should call this once on the way out, as
+  the CLI now does; the counters remain process totals and per-writer
+  attribution is not available. A process that never wrote anything emits
+  nothing at all, so the read-only commands - which now also reach the exit
+  hook - do not publish a set of zeroed `writer_*` counters.
+
 - **`pbfhogg check --index`: verify a file's blob-level metadata against the
   blobs themselves.** `BlobHeader.indexdata` (element kind, ID range, count,
   spatial bbox) and `BlobHeader.tagdata` (the blob's tag key set) are hints
@@ -177,6 +189,15 @@
   must be left untouched.
 
 ### Fixed
+
+- **A zero-length block can no longer produce a `Blob` message with no fields
+  at all.** The payload field (`raw`, `zlib_data`, or `zstd_data`) was written
+  with a skip-if-empty encoder, so an empty uncompressed payload serialized to
+  an empty `Blob` - indistinguishable from a truncated or corrupt one, and
+  carrying no indication of which encoding it used. The payload field is now
+  always emitted. No in-tree caller can reach an element-free block, so this
+  closes a latent malformed-output path rather than fixing observed breakage;
+  output for every non-empty block is byte-identical.
 
 - **A large `--elements-per-blob` no longer aborts the whole write on the
   `BlobHeader` size cap.** `tagdata` (the per-blob tag key index) lists

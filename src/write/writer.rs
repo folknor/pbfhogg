@@ -784,7 +784,13 @@ impl<W: Write> PbfWriter<W> {
         WRITER_METRICS
             .flush_ns
             .fetch_add(elapsed_ns_u64(t_flush), Relaxed);
-        WRITER_METRICS.emit();
+        // Deliberately does NOT emit the writer counters. `WRITER_METRICS` is
+        // process-global, so emitting here made a multi-writer command
+        // (`multi-extract` opens one writer per region) publish the same
+        // running process totals once per region flush, which reads as a
+        // per-region breakdown and is not one. The counters are emitted once
+        // per process instead - `pbfhogg::write::emit_writer_counters`, which
+        // the CLI calls on its single exit path.
         Ok(())
     }
 

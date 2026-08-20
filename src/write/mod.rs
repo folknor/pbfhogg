@@ -1,3 +1,21 @@
+//! PBF write path: block building, blob framing, and the output backends.
+//!
+//! # Four backends, deliberately not unified
+//!
+//! `FileWriter` (buffered), `DirectWriter` (`O_DIRECT`), `UringState`
+//! (`io_uring`) and `parallel_writer`'s `pwrite` pool sit behind the
+//! `OutputSink` boundary as four separate implementations. That is a
+//! decision, not drift - see `decisions/0014-output-backends-stay-separate.md`
+//! for why, including the correction that only two of the four ever
+//! duplicated the page-alignment logic that unification proposals cite.
+//!
+//! What the backends must share, they share by name rather than by
+//! inheritance: the `SeqTotal` / `check_stream_complete` end-of-stream
+//! handshake, the `PermitGuard` write-ahead discipline, the
+//! `WriterMetrics::record_sync_all` / `record_recv_wait` funnels, and the
+//! `flush`-versus-`sync` split. Each of those is enforced or asserted
+//! somewhere concrete; changing one is the trigger to re-read the ADR.
+
 pub mod block_builder;
 pub mod compression;
 #[cfg(feature = "linux-direct-io")]
@@ -38,7 +56,19 @@ pub mod uring_writer_test_hooks {
     pub use super::uring_writer::test_hooks::{DISPATCH_COUNT, PANIC_AT_DISPATCH_COUNT, reset};
 }
 pub(crate) mod metrics;
-pub(crate) mod raw_passthrough;
+
+/// Emit the `writer_*` sidecar counters, at most once per process.
+///
+/// Call this once, on the way out, after every `PbfWriter` in the process has
+/// been flushed - the CLI does so on its single exit path. Repeat calls are
+/// no-ops, so an early-return path may call it too.
+///
+/// The counters are process totals rather than per-writer numbers; see
+/// [`metrics::WRITER_METRICS`] for why, and for what per-writer attribution
+/// would cost.
+pub fn emit_writer_counters() {
+    metrics::WRITER_METRICS.emit_once();
+}
 #[cfg(feature = "linux-io-uring")]
 pub mod uring_writer;
 pub mod writer;

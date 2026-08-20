@@ -156,6 +156,11 @@ The skeleton has exactly two sections. `Context`, `Consequences`, and
   verification is opt-in via `check --index`, which by construction gets no
   `--distrust-metadata` flag, and anything sized from the metadata must
   survive it being wrong.
+- [ADR-0014](0014-output-backends-stay-separate.md) - The buffered,
+  `O_DIRECT`, `io_uring` and `pwrite`-pool output backends stay four
+  separate implementations; what they must share is shared explicitly and
+  by name, and only two of the four ever duplicated the alignment logic
+  that unification proposals cite.
 
 Numbering gaps are deliberate, per the never-reuse rule: 0001 was a
 transient process note retired at the 0.3.0 release (commit `30ca861`);

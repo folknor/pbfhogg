@@ -35,8 +35,8 @@ fn push_attribute_escaped<'a>(elem: &mut BytesStart<'a>, key: &'a str, value: &s
             }
         }
         elem.push_attribute(quick_xml::events::attributes::Attribute {
-            key: quick_xml::name::QName(key.as_bytes()),
-            value: std::borrow::Cow::Owned(out.into_bytes()),
+            key: quick_xml::name::QName(key),
+            value: std::borrow::Cow::Owned(out),
         });
     } else {
         elem.push_attribute((key, value));

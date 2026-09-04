@@ -1164,6 +1164,16 @@
   outside those ranges previously panicked in debug or produced a silently
   wrong index in release.
 
+### Dependencies
+
+- `hotpath` 0.23.3 → 0.25.0, `quick-xml` 0.41.0 → 0.42.0. The `quick-xml`
+  bump moved event attribute names and values from bytes to `str`; OSC
+  parsing migrated accordingly (same behavior).
+- **`s2` 0.1.0 → 0.2.0** (optional, behind `geocode-reader`/`commands`).
+  Upstream removed the `float_extras` feature in favor of std's
+  `f64::next_up`/`next_down`, so the pin drops it; still
+  `default-features = false`.
+
 ## 0.5.0 - 2026-07-16
 
 ### Breaking changes

@@ -398,7 +398,7 @@ impl<D: ChangeDest> OscSink for OwnedSink<D> {
         kind: ElemKind,
         e: &BytesStart<'_>,
     ) -> crate::BoxResult<()> {
-        let id = parse_i64_attr(e, b"id")?;
+        let id = parse_i64_attr(e, "id")?;
         let metadata = parse_owned_metadata(e)?;
         let mut elem = CurrentElem::new(kind, id, metadata);
 
@@ -410,8 +410,8 @@ impl<D: ChangeDest> OscSink for OwnedSink<D> {
         // Same rule as the overlay parser now, because it is the same
         // function.
         if kind == ElemKind::Node && action != Action::Delete {
-            elem.decimicro_lat = coord_to_decimicro(e, b"lat", id)?;
-            elem.decimicro_lon = coord_to_decimicro(e, b"lon", id)?;
+            elem.decimicro_lat = coord_to_decimicro(e, "lat", id)?;
+            elem.decimicro_lon = coord_to_decimicro(e, "lon", id)?;
         }
 
         self.action = action;
@@ -421,15 +421,15 @@ impl<D: ChangeDest> OscSink for OwnedSink<D> {
 
     fn tag(&mut self, e: &BytesStart<'_>) -> crate::BoxResult<()> {
         if let Some(cur) = self.current.as_mut() {
-            let k = parse_str_attr(e, b"k")?;
-            let v = parse_str_attr(e, b"v")?;
+            let k = parse_str_attr(e, "k")?;
+            let v = parse_str_attr(e, "v")?;
             cur.tags.push((k, v));
         }
         Ok(())
     }
 
     fn nd(&mut self, e: &BytesStart<'_>) -> crate::BoxResult<()> {
-        let rf = parse_i64_attr(e, b"ref")?;
+        let rf = parse_i64_attr(e, "ref")?;
         if let Some(cur) = self.current.as_mut() {
             cur.refs.push(rf);
         }
@@ -437,9 +437,9 @@ impl<D: ChangeDest> OscSink for OwnedSink<D> {
     }
 
     fn member(&mut self, e: &BytesStart<'_>) -> crate::BoxResult<()> {
-        let ref_id = parse_i64_attr(e, b"ref")?;
-        let role = parse_str_attr_optional(e, b"role").unwrap_or_default();
-        let member_id = match parse_member_type(&parse_str_attr(e, b"type")?)? {
+        let ref_id = parse_i64_attr(e, "ref")?;
+        let role = parse_str_attr_optional(e, "role").unwrap_or_default();
+        let member_id = match parse_member_type(&parse_str_attr(e, "type")?)? {
             crate::MemberType::Node => MemberId::Node(ref_id),
             crate::MemberType::Way => MemberId::Way(ref_id),
             crate::MemberType::Relation => MemberId::Relation(ref_id),

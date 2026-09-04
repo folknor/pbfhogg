@@ -42,12 +42,25 @@ capture_env = ["PBFHOGG*", "MALLOC*"]
 name = "all"
 features = ["test-hooks", "linux-direct-io", "linux-io-uring"]
 build_packages = ["pbfhogg-cli"]
+# `parallel = {}` runs the sweep's test binaries concurrently - prebuilt
+# binaries executed directly, budget = tests in flight, defaulting to the L3
+# cache domain (the right default for a compute-bound suite). Until 2026-09-02
+# every profile here ran libtest's serial default, so this is the first
+# parallelism the suite has seen; the per-test 20s watchdog is kept. Two-run
+# ritual to judge it: the first run weights by test count (always the slow
+# one), and `claims 1-1` on the second means the budget needs raising (see
+# brokkr man config parallel). New exposure to watch: the cli_*.rs tests spawn
+# the CLI concurrently across binaries now - the fault-injection split made
+# tests per-binary race-free, and cross-binary races over shared scratch are
+# the class to suspect first if a test starts flaking here.
+parallel = {}
 
 [[check]]
 name = "consumer"
 no_default_features = true
 features = ["commands"]
 build_packages = ["pbfhogg-cli"]
+parallel = {}
 
 # "minimal" = the configuration the crate advertises but never built.
 # `consumer` sets no_default_features and then re-enables `commands`, so
@@ -68,6 +81,7 @@ build_packages = ["pbfhogg-cli"]
 name = "minimal"
 no_default_features = true
 features = []
+parallel = {}
 
 [test]
 debug = true
@@ -132,6 +146,10 @@ env = { BROKKR_TEST_PLATFORM = "1" }
 # Tests requiring --test-threads=1. The fault-injection split
 # (2026-04-25) made the previously-serial fault tests per-binary and
 # race-free; this profile is reserved for any future serial-only test.
+# Note the entries now carry `parallel` (2026-09-02): if a serial:: test
+# ever materializes, give this profile a parallel-free twin of `all`
+# (same build shape, clippy dedupes) rather than running it through the
+# fan-out - the nautilus config is the worked example of that split.
 [test.profiles.serial]
 description = "Serial tests requiring --test-threads=1"
 sweeps = ["all"]

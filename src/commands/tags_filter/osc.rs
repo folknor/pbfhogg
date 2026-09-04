@@ -192,7 +192,7 @@ struct FilterSink<'a> {
 
 impl OscSink for FilterSink<'_> {
     fn begin_element(&mut self, action: Section, kind: ElemKind, e: &BytesStart<'_>) -> Result<()> {
-        let id = parse_i64_attr(e, b"id")?;
+        let id = parse_i64_attr(e, "id")?;
         self.section = action;
         // Read on every action, delete included: a `<delete>` carries
         // the version of the state it supersedes, and the shared
@@ -220,8 +220,8 @@ impl OscSink for FilterSink<'_> {
 
         let mut cur = CurrentElem::new(kind, id, metadata);
         if kind == ElemKind::Node {
-            cur.decimicro_lat = coord_to_decimicro(e, b"lat", id)?;
-            cur.decimicro_lon = coord_to_decimicro(e, b"lon", id)?;
+            cur.decimicro_lat = coord_to_decimicro(e, "lat", id)?;
+            cur.decimicro_lon = coord_to_decimicro(e, "lon", id)?;
         }
         self.current = Some(cur);
         Ok(())
@@ -229,15 +229,15 @@ impl OscSink for FilterSink<'_> {
 
     fn tag(&mut self, e: &BytesStart<'_>) -> Result<()> {
         if let Some(cur) = self.current.as_mut() {
-            let k = parse_str_attr(e, b"k")?;
-            let v = parse_str_attr(e, b"v")?;
+            let k = parse_str_attr(e, "k")?;
+            let v = parse_str_attr(e, "v")?;
             cur.tags.push((k, v));
         }
         Ok(())
     }
 
     fn nd(&mut self, e: &BytesStart<'_>) -> Result<()> {
-        let id = parse_i64_attr(e, b"ref")?;
+        let id = parse_i64_attr(e, "ref")?;
         if let Some(cur) = self.current.as_mut() {
             cur.refs.push(id);
         }
@@ -245,15 +245,15 @@ impl OscSink for FilterSink<'_> {
     }
 
     fn member(&mut self, e: &BytesStart<'_>) -> Result<()> {
-        let id = parse_i64_attr(e, b"ref")?;
-        let role = parse_str_attr_optional(e, b"role").unwrap_or_default();
+        let id = parse_i64_attr(e, "ref")?;
+        let role = parse_str_attr_optional(e, "role").unwrap_or_default();
         // The shared `parse_member_type` refuses anything that is not
         // node/way/relation, so there is no `MemberId::Unknown` arm to
         // write here any more. This parser used to construct one - and
         // `osc::write::member_type_str` refuses to emit it, so a
         // relation with an exotic member type was accepted at parse and
         // then failed at write.
-        let member_id = match parse_member_type(&parse_str_attr(e, b"type")?)? {
+        let member_id = match parse_member_type(&parse_str_attr(e, "type")?)? {
             crate::MemberType::Node => MemberId::Node(id),
             crate::MemberType::Way => MemberId::Way(id),
             crate::MemberType::Relation => MemberId::Relation(id),

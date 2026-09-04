@@ -102,32 +102,30 @@ pub(crate) trait OscSink {
 
 pub(crate) fn parse_i64_attr(
     e: &quick_xml::events::BytesStart<'_>,
-    name: &[u8],
+    name: &str,
 ) -> ParseResult<i64> {
     for attr_result in e.attributes() {
         let attr = attr_result?;
         if attr.key.as_ref() == name {
-            let val = std::str::from_utf8(&attr.value)?;
-            return Ok(val.parse::<i64>()?);
+            return Ok(attr.value.parse::<i64>()?);
         }
     }
-    Err(format!("missing attribute '{}'", String::from_utf8_lossy(name)).into())
+    Err(format!("missing attribute '{name}'").into())
 }
 
-fn parse_f64_attr(e: &quick_xml::events::BytesStart<'_>, name: &[u8]) -> ParseResult<f64> {
+fn parse_f64_attr(e: &quick_xml::events::BytesStart<'_>, name: &str) -> ParseResult<f64> {
     for attr_result in e.attributes() {
         let attr = attr_result?;
         if attr.key.as_ref() == name {
-            let val = std::str::from_utf8(&attr.value)?;
-            return Ok(val.parse::<f64>()?);
+            return Ok(attr.value.parse::<f64>()?);
         }
     }
-    Err(format!("missing attribute '{}'", String::from_utf8_lossy(name)).into())
+    Err(format!("missing attribute '{name}'").into())
 }
 
 pub(crate) fn parse_str_attr(
     e: &quick_xml::events::BytesStart<'_>,
-    name: &[u8],
+    name: &str,
 ) -> ParseResult<String> {
     for attr_result in e.attributes() {
         let attr = attr_result?;
@@ -136,12 +134,12 @@ pub(crate) fn parse_str_attr(
             return Ok(val.into_owned());
         }
     }
-    Err(format!("missing attribute '{}'", String::from_utf8_lossy(name)).into())
+    Err(format!("missing attribute '{name}'").into())
 }
 
 pub(crate) fn parse_str_attr_optional(
     e: &quick_xml::events::BytesStart<'_>,
-    name: &[u8],
+    name: &str,
 ) -> Option<String> {
     for attr in e.attributes().flatten() {
         if attr.key.as_ref() == name {
@@ -226,12 +224,12 @@ where
     for attr_result in e.attributes() {
         let attr = attr_result?;
         let field = match attr.key.as_ref() {
-            b"version" => MetaField::Version,
-            b"timestamp" => MetaField::Timestamp,
-            b"changeset" => MetaField::Changeset,
-            b"uid" => MetaField::Uid,
-            b"user" => MetaField::User,
-            b"visible" => MetaField::Visible,
+            "version" => MetaField::Version,
+            "timestamp" => MetaField::Timestamp,
+            "changeset" => MetaField::Changeset,
+            "uid" => MetaField::Uid,
+            "user" => MetaField::User,
+            "visible" => MetaField::Visible,
             _ => continue,
         };
         any = true;
@@ -250,7 +248,7 @@ pub(crate) fn meta_int<T: std::str::FromStr>(
 where
     T::Err: std::fmt::Display,
 {
-    let text = std::str::from_utf8(&attr.value)?;
+    let text = attr.value.as_ref();
     text.parse::<T>()
         .map_err(|err| -> Box<dyn std::error::Error> {
             format!(
@@ -332,20 +330,20 @@ pub(crate) fn open_osc_reader(path: &Path) -> ParseResult<(OscReader, Rc<Cell<Du
 // The driver
 // ---------------------------------------------------------------------------
 
-fn action_for(name: &[u8]) -> Option<OscAction> {
+fn action_for(name: &str) -> Option<OscAction> {
     match name {
-        b"create" => Some(OscAction::Create),
-        b"modify" => Some(OscAction::Modify),
-        b"delete" => Some(OscAction::Delete),
+        "create" => Some(OscAction::Create),
+        "modify" => Some(OscAction::Modify),
+        "delete" => Some(OscAction::Delete),
         _ => None,
     }
 }
 
-fn kind_for(name: &[u8]) -> Option<ElemKind> {
+fn kind_for(name: &str) -> Option<ElemKind> {
     match name {
-        b"node" => Some(ElemKind::Node),
-        b"way" => Some(ElemKind::Way),
-        b"relation" => Some(ElemKind::Relation),
+        "node" => Some(ElemKind::Node),
+        "way" => Some(ElemKind::Way),
+        "relation" => Some(ElemKind::Relation),
         _ => None,
     }
 }
@@ -357,11 +355,11 @@ struct DriveState {
 }
 
 /// The root element name, whose close proves the document is whole.
-const ROOT: &[u8] = b"osmChange";
+const ROOT: &str = "osmChange";
 
 /// Route a `tag` / `nd` / `member` child to the sink, if one can carry it.
 fn route_child<S: OscSink>(
-    name: &[u8],
+    name: &str,
     e: &quick_xml::events::BytesStart<'_>,
     state: &DriveState,
     sink: &mut S,
@@ -370,9 +368,9 @@ fn route_child<S: OscSink>(
         return Ok(());
     };
     match name {
-        b"tag" => sink.tag(e),
-        b"nd" if kind == ElemKind::Way => sink.nd(e),
-        b"member" if kind == ElemKind::Relation => sink.member(e),
+        "tag" => sink.tag(e),
+        "nd" if kind == ElemKind::Way => sink.nd(e),
+        "member" if kind == ElemKind::Relation => sink.member(e),
         _ => Ok(()),
     }
 }
@@ -413,8 +411,7 @@ fn handle_open<S: OscSink>(
                 "OSC {} {} appears outside any <create>, <modify> or <delete> section; \
                  refusing to guess which change it was meant to be",
                 kind.tag(),
-                parse_i64_attr(e, b"id")
-                    .map_or_else(|_| "(no id)".to_string(), |id| id.to_string())
+                parse_i64_attr(e, "id").map_or_else(|_| "(no id)".to_string(), |id| id.to_string())
             )
             .into()
         })?;
@@ -511,15 +508,14 @@ pub(crate) fn parse_osc_path<S: OscSink>(path: &Path, sink: &mut S) -> ParseResu
 /// i32` saturates `lat="1e30"` to `i32::MAX` and maps `NaN` to 0.
 pub(crate) fn coord_to_decimicro(
     e: &quick_xml::events::BytesStart<'_>,
-    name: &[u8],
+    name: &str,
     id: i64,
 ) -> ParseResult<i32> {
     let degrees = parse_f64_attr(e, name).map_err(|err| -> Box<dyn std::error::Error> {
         format!(
-            "OSC node {id}: {} attribute is missing or unparsable ({err}). A created or \
+            "OSC node {id}: {name} attribute is missing or unparsable ({err}). A created or \
              modified node must carry usable coordinates; storing it at 0/0 would silently \
-             move it to the Gulf of Guinea.",
-            String::from_utf8_lossy(name)
+             move it to the Gulf of Guinea."
         )
         .into()
     })?;
@@ -529,21 +525,19 @@ pub(crate) fn coord_to_decimicro(
     // representation check below would wave it through. Such a node would
     // enter the overlay as an ordinary node and could propagate into
     // LocationsOnWays, where nothing downstream re-validates it.
-    let limit = if name == b"lat" { 90.0_f64 } else { 180.0_f64 };
+    let limit = if name == "lat" { 90.0_f64 } else { 180.0_f64 };
     if !(degrees.is_finite() && degrees.abs() <= limit) {
         return Err(format!(
-            "OSC node {id}: {} value {degrees} is outside the valid geographic range \
-             -{limit} to {limit}",
-            String::from_utf8_lossy(name)
+            "OSC node {id}: {name} value {degrees} is outside the valid geographic range \
+             -{limit} to {limit}"
         )
         .into());
     }
     let scaled = degrees * 1e7;
     if !scaled.is_finite() || scaled < f64::from(i32::MIN) || scaled > f64::from(i32::MAX) {
         return Err(format!(
-            "OSC node {id}: {} value {degrees} is outside the range representable in \
-             decimicrodegrees",
-            String::from_utf8_lossy(name)
+            "OSC node {id}: {name} value {degrees} is outside the range representable in \
+             decimicrodegrees"
         )
         .into());
     }
@@ -559,7 +553,7 @@ pub(crate) fn coord_to_decimicro(
 ///
 /// Leniency is `scan_meta_attrs`': presence, not version-gating. The
 /// `merge-changes` copy used to open with `let version =
-/// parse_i32_attr_optional(e, b"version")?;` and return `None` when
+/// parse_i32_attr_optional(e, "version")?;` and return `None` when
 /// `version` was absent - throwing away timestamp, changeset, uid, user
 /// and visible along with it, so `merge-changes` silently stripped
 /// metadata that `apply-changes` preserved from the very same file.
@@ -622,7 +616,7 @@ fn arena_meta(
                 meta.flags |= META_FLAG_HAS_VERSION;
             }
             MetaField::Timestamp => {
-                let text = std::str::from_utf8(&attr.value)?;
+                let text = attr.value.as_ref();
                 meta.timestamp = crate::commands::parse_rfc3339_utc(text).map_err(
                     |err| -> Box<dyn std::error::Error> {
                         format!(
@@ -642,7 +636,7 @@ fn arena_meta(
                 );
             }
             MetaField::Visible => {
-                if attr.value.as_ref() == b"false" {
+                if attr.value.as_ref() == "false" {
                     meta.flags |= META_FLAG_HIDDEN;
                 }
             }
@@ -696,7 +690,7 @@ impl OscSink for CompactSink<'_> {
         kind: ElemKind,
         e: &quick_xml::events::BytesStart<'_>,
     ) -> ParseResult<()> {
-        let id = parse_i64_attr(e, b"id")?;
+        let id = parse_i64_attr(e, "id")?;
 
         if action == OscAction::Delete {
             // A delete's metadata is read for the same reason a
@@ -732,8 +726,8 @@ impl OscSink for CompactSink<'_> {
         let meta = arena_meta(e, self.overlay)?;
         let (lat, lon) = if kind == ElemKind::Node {
             (
-                coord_to_decimicro(e, b"lat", id)?,
-                coord_to_decimicro(e, b"lon", id)?,
+                coord_to_decimicro(e, "lat", id)?,
+                coord_to_decimicro(e, "lon", id)?,
             )
         } else {
             (0, 0)
@@ -757,8 +751,8 @@ impl OscSink for CompactSink<'_> {
         if self.staging.is_none() {
             return Ok(());
         }
-        let k = parse_str_attr(e, b"k")?;
-        let v = parse_str_attr(e, b"v")?;
+        let k = parse_str_attr(e, "k")?;
+        let v = parse_str_attr(e, "v")?;
         let key_id = self.overlay.intern(&k)?;
         if let Some(st) = self.staging.as_mut() {
             st.tag_keys.push(key_id);
@@ -768,7 +762,7 @@ impl OscSink for CompactSink<'_> {
     }
 
     fn nd(&mut self, e: &quick_xml::events::BytesStart<'_>) -> ParseResult<()> {
-        let ref_id = parse_i64_attr(e, b"ref")?;
+        let ref_id = parse_i64_attr(e, "ref")?;
         if let Some(st) = self.staging.as_mut() {
             st.refs.push(ref_id);
         }
@@ -779,9 +773,9 @@ impl OscSink for CompactSink<'_> {
         if self.staging.is_none() {
             return Ok(());
         }
-        let member_type = parse_member_type(&parse_str_attr(e, b"type")?)?;
-        let ref_id = parse_i64_attr(e, b"ref")?;
-        let role = parse_str_attr(e, b"role").unwrap_or_default();
+        let member_type = parse_member_type(&parse_str_attr(e, "type")?)?;
+        let ref_id = parse_i64_attr(e, "ref")?;
+        let role = parse_str_attr(e, "role").unwrap_or_default();
         let type_byte = member_type_to_byte(member_type)?;
         let role_id = self.overlay.intern(&role)?;
         if let Some(st) = self.staging.as_mut() {

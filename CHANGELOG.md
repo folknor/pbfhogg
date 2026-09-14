@@ -1173,6 +1173,7 @@
   Upstream removed the `float_extras` feature in favor of std's
   `f64::next_up`/`next_down`, so the pin drops it; still
   `default-features = false`.
+- `zstd` 0.13 → 0.14.
 
 ## 0.5.0 - 2026-07-16
 

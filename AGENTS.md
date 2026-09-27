@@ -5,18 +5,17 @@ Rust library and CLI tool for reading and writing OpenStreetMap PBF files.
 ## Rules
 
 ### General rules
-- Dont use gremlins! Em-dash, en-dash, strange quotes, whatever - they're all verboten!
-- Dont remind the user of CLAUDE.md rules. They wrote them, so they know them.
+
+- Don't use gremlins! Em-dash, en-dash, strange quotes, whatever - they're all verboten.
+- Don't remind the user of the rules. They wrote them, so they know them.
 - The user can exempt you from any rule at any time.
-- ./research/* holds full vendored source for related projects, readable from any agent sandbox.
+- ./research/* holds full vendored source for related projects, readable from any agent sandbox. Competitor reference sources available for research: `research/libosmium/` (C++ OSM library, the reference implementation), `research/osmium-tool/` (C++ CLI on libosmium, the direct competitor and `brokkr verify` oracle), `research/traccar-geocoder/` (reverse geocoder, the geocode_index precedent). `research/geoparquet/` is the GeoParquet spec repository (spec, JSON schema, examples, test data) - a standards reference, not a competitor.
 - When asked to write a plan or a specification, read `reference/technical-implementation-spec.md` first; it defines what such a document must contain.
 
-### Memory rules
-Do not use your Memory functionality. Update CLAUDE.md instead. This project is developed across several hosts and several users. Memories do not transfer across hosts or users. CLAUDE.md does.
-
 ### Bash rules
-- Never capture stdout into env vars (`UUID=$(...)`).
-- Never run raw cargo, curl, pkill. Use `brokkr`.
+
+- Never read or write from `/tmp`. All data lives in the project.
+- Never run raw `cargo`, `curl`, `pkill`. Use `brokkr`.
 
 ## 'brokkr' tool
 
@@ -83,10 +82,10 @@ I/O flags (`--direct-io`, `--io-uring`) create named variants in results. `--for
 - `brokkr check [--profile <name>] [-- args]` - clippy + tests across every `[[check]]` sweep in `brokkr.toml`. Default profile is `tier1` (fast contracts; skips `tier2::`/`tier3::`/`platform::`/`serial::` modules). Other profiles: `full` (tier 3, includes ignored tests), `platform` (`--direct-io`/`--io-uring` tests), `serial` (`--test-threads=1`), `sort` (per-command tier-2 precedent). Each sweep rebuilds `pbfhogg-cli` with matching features via `build_packages`; `BROKKR_TEST_BIN_DIR` is exported so test code finds the right binary. Output minified: one-line summaries with file:line.
 - `brokkr test <NAME> [--sweep <sweep>] [--timeout <secs>] [--raw]` - run one integration test by exact name with `--include-ignored` + `--nocapture` + single-threaded. Builds release unless `[test] debug = true` in `brokkr.toml` (debug builds compile much faster for iteration; compute-heavy tests run slower). Runs every `[[check]]` sweep configured in `brokkr.toml` (today: `all`, `consumer`, `minimal`) unless `--sweep <name>` narrows to one. Per-test hang watchdog defaults to 20 s; `--timeout` raises it, range 20-280. Footer prints `[test] PASS/FAIL` with wall time per sweep; `NO MATCH` indicates the name filter matched zero tests under that sweep (useful when a test is `#[cfg]`-gated behind a feature absent from the consumer build). `--raw` streams the unfiltered cargo output. Example: `brokkr test merge_cross_validate_osmium --sweep all --timeout 120`.
 - **The 20 s per-test watchdog is fixed on `brokkr check`** - `--sweep`/`--timeout` exist only on `brokkr test`, and check profiles have no timeout override. Consequence: no test that runs longer than 20 s can ever pass any `brokkr check`. The `full` profile therefore skips the over-watchdog tests BY NAME in its brokkr.toml skip list (the two osmium cross-validations, `roundtrip_denmark` ~54 s, the six `geocode_index` real-data tests ~154 s) - keep that list in sync when adding slow `#[ignore]` tests - and those tests are exercised individually via `brokkr test <name> --timeout <secs>` (the release-gate workflow). A watchdog kill reports the victim as "did not finish within 20s" with a `futex_do_wait` wchan snapshot in `.brokkr/test-hung/`, which looks like a deadlock but usually just means the test is slower than the watchdog. Note also that `brokkr check -- <args>` passes args to *cargo*, not libtest - per-test skips cannot be injected from the CLI, which is why the skip list lives in the profile.
-- `brokkr --version` - stamps brokkr's own git hash, a `-dirty` suffix, and build time. brokkr installs via `cargo install --path`, so when brokkr behaves unlike its source, check this first: a stale installed binary is the usual answer, and reinstalling beats working around a bug that is already fixed.
+- `brokkr --version` - stamps brokkr's own git hash, a `-dirty` suffix, and build time. brokkr installs via `brokkr install`, so when brokkr behaves unlike its source, check this first: a stale installed binary is the usual answer, and reinstalling beats working around a bug that is already fixed.
 - `brokkr env` - hostname, kernel, governor, memory, drives, datasets. Also computes missing hashes.
 - `brokkr results` - table of the last 20 results. `brokkr results [UUID]` - specific result.
-- `brokkr results [--commit X] [--compare A B] [--command CMD] [--mode M] [--grep STR] [--grep-v STR] [--dataset D] [--meta K=V] [--env K=V] [-n N] [--top N]` - query/compare from SQLite. `--command` substring-matches; `--mode` filters by measurement mode (`bench`/`hotpath`/`alloc`); `--dataset` substring match on input file; `--meta` / `--env` exact match, composable with AND.
+- `brokkr results [--commit X] [--compare A B] [--command CMD] [--mode M] [--grep STR] [--grep-v STR] [--dataset D] [--meta K=V] [--env K=V] [--top N]` - query/compare from SQLite. `--command` substring-matches; `--mode` filters by measurement mode (`bench`/`hotpath`/`alloc`); `--dataset` substring match on input file; `--meta` / `--env` exact match, composable with AND.
   - `--grep STR` substring-matches against both `cli_args` and `brokkr_args`, repeatable with AND semantics (`--grep apply-changes --grep zstd:1`).
   - `--grep-v STR` excludes; repeatable, excludes on ANY match; composes with `--grep`. **This is how you select the arm of an A/B distinguished only by an absent flag** - `--grep add-locations-to-ways --grep-v inject-prepass` gets the flag-OFF arm, which `--grep` alone cannot express. Both work with `--compare`.
 - `brokkr results <uuid>` renders per-iteration walls for `--bench N` runs. **The iteration order is the diagnostic**: iteration 1 slow then 2/3 fast is a cold page cache; iteration 1 fast then 3 slow is drive-state exhaustion. These are opposite diagnoses, so never read a `--bench N` row as a single number when the walls disagree.

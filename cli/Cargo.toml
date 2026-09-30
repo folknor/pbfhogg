@@ -42,7 +42,7 @@ clap = { version = "4.6.1", features = ["derive"] }
 # anyway when both crates build together; stating it here makes the
 # guarantee explicit rather than an artifact of the build graph.
 serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
-hotpath = "0.25.0"
+hotpath = "0.27.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"

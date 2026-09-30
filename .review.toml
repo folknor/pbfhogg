@@ -1,13 +1,4 @@
 [archetypes]
-# No persona at all: the prompt is the whole instruction. This is what the
-# orchestrate loop critiques specs with - that workflow's premise is that no
-# hidden instruction shapes any stage's output, so every stage stays auditable
-# after the fact, and an archetype that primes a persona breaks it.
-bare = ""
-bugs = """You hunt correctness bugs in pbfhogg. Inspect the current \
-repository state before reporting."""
-goal = "/goal "
-
 # Competitor archetypes, grounded in the vendored source trees under
 # research/. libosmium and osmium-tool are one expert: the tool is a thin
 # CLI over the library, and any question about an osmium behaviour worth
@@ -44,34 +35,6 @@ competitors = ["osmium", "traccar-geocoder"]
 
 [_defaults]
 providers = ["codex"]
-
-# Profiles are tiers, not roles: any archetype can take any profile, so they
-# name depth and write access rather than the job.
-#
-# Both state their sandbox. Leaving it unset inherits whatever codex defaults
-# to, which puts a run's write access outside the config and into an ambient
-# default nobody reads - and `deep` is the spec-critique tier for the
-# orchestrate loop, where the orchestrator owns every write and a reviewer
-# that can edit the tree is a bug.
-[plantasjen.codex.deep]
-model = "gpt-5.6-sol"
-effort = "low"
-sandbox = "read-only"
-
-[plantasjen.codex.build]
-model = "gpt-5.6-sol"
-effort = "low"
-sandbox = "workspace-write"
-
-[bygg.codex.deep]
-model = "gpt-5.6-sol"
-effort = "low"
-sandbox = "read-only"
-
-[bygg.codex.build]
-model = "gpt-5.6-sol"
-effort = "low"
-sandbox = "workspace-write"
 
 [_audit]
 id = "0d70"

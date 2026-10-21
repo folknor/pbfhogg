@@ -38,8 +38,9 @@ pub(super) struct BlobTask {
 #[hotpath::measure]
 pub(super) fn build_all_blob_schedules(
     input: &Path,
+    host: &crate::host::Host,
 ) -> Result<(Vec<BlobTask>, Vec<BlobTask>, Vec<BlobTask>)> {
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
     let _ = walker
         .next_header()?
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;

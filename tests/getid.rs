@@ -172,6 +172,7 @@ fn getid_reports_found_ids_without_rereading_output() {
         false,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("getid");
     assert!(
@@ -195,6 +196,7 @@ fn getid_reports_found_ids_without_rereading_output() {
         false,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("getid");
     let found = stats.found.expect("report_found was set");
@@ -258,6 +260,7 @@ fn getid_found_ids_exclude_referenced_pull_ins() {
         false,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("getid");
     let found = stats.found.expect("report_found was set");
@@ -320,6 +323,7 @@ fn getid_nodes() {
         false,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("getid");
     let c = read_all_elements(&output);
@@ -384,6 +388,7 @@ fn getid_mixed_types() {
         false,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("getid");
     let c = read_all_elements(&output);
@@ -454,6 +459,7 @@ fn getid_add_referenced() {
         false,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("getid");
     let c = read_all_elements(&output);
@@ -473,6 +479,7 @@ fn getid_add_referenced() {
         false,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("getid");
     let c = read_all_elements(&output2);
@@ -526,6 +533,7 @@ fn removeid_nodes() {
         false,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("removeid");
     let c = read_all_elements(&output);
@@ -597,6 +605,7 @@ fn removeid_mixed_types() {
         false,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("removeid");
     let c = read_all_elements(&output);
@@ -638,6 +647,7 @@ fn getid_empty_result() {
         false,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("getid");
     let c = read_all_elements(&output);
@@ -684,6 +694,7 @@ fn getid_preserves_tags() {
         false,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("getid");
     let c = read_all_elements(&output);
@@ -736,6 +747,7 @@ fn getid_normalizes_dense_node_version_minus_one_to_absent_metadata() {
         false,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("getid");
 
@@ -790,6 +802,7 @@ fn getid_normalizes_dense_node_changeset_minus_one_to_zero() {
         false,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("getid");
 
@@ -858,6 +871,7 @@ fn getid_normalizes_way_version_minus_one_to_absent_metadata() {
         false,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("getid");
 
@@ -926,6 +940,7 @@ fn getid_normalizes_way_changeset_minus_one_to_zero() {
         false,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("getid");
 
@@ -997,6 +1012,7 @@ fn getid_from_id_file() {
         false,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("getid");
     let c = read_all_elements(&output);
@@ -1065,6 +1081,7 @@ fn getid_add_referenced_plus_direct_node() {
         false,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("getid");
     let c = read_all_elements(&output);
@@ -1133,6 +1150,7 @@ fn getid_remove_tags_strips_referenced_nodes() {
         false,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("getid");
 
@@ -1211,6 +1229,7 @@ fn removeid_multi_blob_passthrough() {
         false,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("removeid");
 

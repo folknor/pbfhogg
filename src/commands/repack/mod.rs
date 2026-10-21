@@ -68,11 +68,14 @@ pub struct RepackStats {
 }
 
 impl RepackStats {
-    pub fn print_summary(&self) {
-        eprintln!(
+    pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        writeln!(
+            w,
             "Repacked {} elements into {} blobs (cap {} elements/blob)",
             self.elements_written, self.blobs_written, self.elements_per_blob,
-        );
+        )?;
+
+        Ok(())
     }
 }
 
@@ -107,9 +110,12 @@ struct WorkerOutput {
 /// preserves `LocationsOnWays` (see the coordinate-threading comment in
 /// [`repack`]) so it must not warn about that feature, but it still drops
 /// `pbfhogg.WayMembers-v1` and `pbfhogg.SharedNodePins-v1`.
-fn warn_way_metadata_loss(header: &crate::HeaderBlock) {
+fn warn_way_metadata_loss(header: &crate::HeaderBlock, host: &crate::host::Host) {
     if header.has_way_members_v1() || header.has_shared_node_pins_v1() {
-        eprintln!(
+        crate::host::diag!(
+            host.diagnostics,
+            Warning,
+            "repack.way_metadata_loss",
             "Warning: input PBF has way-level enrichment metadata. \
              Injected prepass metadata (WayMembers/SharedNodePins) is not preserved in the output."
         );
@@ -132,6 +138,7 @@ pub fn repack(
     io_uring: bool,
     force: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<RepackStats> {
     if elements_per_blob == 0 {
         return Err("--elements-per-blob must be > 0".into());
@@ -144,10 +151,11 @@ pub fn repack(
         "input PBF has no blob-level indexdata. repack uses the parallel \
          per-kind classify pipeline, which needs indexdata to build per-kind \
          blob schedules.",
+        host,
     )?;
 
     // Per-blob worker pool; same precedent as `cat --clean`.
-    crate::debug::cap_malloc_arenas();
+    host.process.cross_thread_alloc_pool();
 
     // Detect LocationsOnWays on the input header once, up front. Unlike
     // tags-filter / extract, repack round-trips way payloads verbatim, so it
@@ -165,9 +173,9 @@ pub fn repack(
     // (`pbfhogg.WayMembers-v1`, `pbfhogg.SharedNodePins-v1`), so those still
     // need a loss warning; see `warn_way_metadata_loss` below.
     let (header, preserve_locations) = {
-        let reader = ElementReader::open(input, direct_io)?;
+        let reader = ElementReader::open_in(input, direct_io, host)?;
         let preserve = reader.header().has_locations_on_ways();
-        warn_way_metadata_loss(reader.header());
+        warn_way_metadata_loss(reader.header(), host);
         (reader.header().clone(), preserve)
     };
     let mut writer = writer_from_header(
@@ -185,10 +193,11 @@ pub fn repack(
         },
         direct_io,
         io_uring,
+        host,
     )?;
 
     let (node_schedule, way_schedule, rel_schedule, shared_file, _max_ids) =
-        crate::scan::classify::build_classify_schedules_split(input)?;
+        crate::scan::classify::build_classify_schedules_split(input, &host.diagnostics)?;
 
     #[allow(clippy::cast_possible_wrap)]
     {
@@ -228,6 +237,7 @@ pub fn repack(
         compression,
         preserve_locations,
         &mut writer,
+        host,
     )?;
     crate::debug::emit_marker("REPACK_NODES_END");
     emit_phase_counters("nodes", &node_stats);
@@ -248,6 +258,7 @@ pub fn repack(
         compression,
         preserve_locations,
         &mut writer,
+        host,
     )?;
     crate::debug::emit_marker("REPACK_WAYS_END");
     emit_phase_counters("ways", &way_stats);
@@ -268,6 +279,7 @@ pub fn repack(
         compression,
         preserve_locations,
         &mut writer,
+        host,
     )?;
     crate::debug::emit_marker("REPACK_RELATIONS_END");
     emit_phase_counters("relations", &rel_stats);
@@ -298,7 +310,10 @@ pub fn repack(
     // central builder) and the output is one blob per non-empty kind.
     // Only meaningful when there was real work to do.
     if !any_cap_fired && elements_written > 0 {
-        eprintln!(
+        crate::host::diag!(
+            host.diagnostics,
+            Warning,
+            "repack.cap_never_fired",
             "Warning: --elements-per-blob {elements_per_blob} never fired; \
              every per-kind element count fits in a single output blob, \
              so the output is one blob per kind."
@@ -365,6 +380,7 @@ fn run_kind_phase(
     compression: Compression,
     preserve_locations: bool,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
+    host: &crate::host::Host,
 ) -> Result<PhaseStats> {
     use crate::reorder_buffer::ReorderBuffer;
 
@@ -533,6 +549,7 @@ fn run_kind_phase(
                 }
             }
         },
+        &*host.resources,
     )?;
 
     if let Some(e) = write_error {

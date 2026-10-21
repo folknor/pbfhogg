@@ -105,8 +105,18 @@ fn inspect_distrust_metadata_measures_instead_of_quoting_the_index() {
 
     // Honest file: both modes agree, which is the counterpart that keeps the
     // divergence below meaningful.
-    let quoted = pbfhogg::inspect::inspect(&honest, &inspect_opts(false, false)).expect("inspect");
-    let measured = pbfhogg::inspect::inspect(&honest, &inspect_opts(false, true)).expect("inspect");
+    let quoted = pbfhogg::inspect::inspect(
+        &honest,
+        &inspect_opts(false, false),
+        &crate::common::test_host(),
+    )
+    .expect("inspect");
+    let measured = pbfhogg::inspect::inspect(
+        &honest,
+        &inspect_opts(false, true),
+        &crate::common::test_host(),
+    )
+    .expect("inspect");
     assert_eq!(quoted.to_json(None)["elements"]["nodes"], 3);
     assert_eq!(measured.to_json(None)["elements"]["nodes"], 3);
 
@@ -123,17 +133,28 @@ fn inspect_distrust_metadata_measures_instead_of_quoting_the_index() {
         false,
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("degrade --corrupt-indexdata");
 
-    let quoted = pbfhogg::inspect::inspect(&lying, &inspect_opts(false, false)).expect("inspect");
+    let quoted = pbfhogg::inspect::inspect(
+        &lying,
+        &inspect_opts(false, false),
+        &crate::common::test_host(),
+    )
+    .expect("inspect");
     assert_eq!(
         quoted.to_json(None)["elements"]["nodes"],
         1_000_003_u64,
         "the default fast path reports the file's own inflated claim as a measurement"
     );
 
-    let measured = pbfhogg::inspect::inspect(&lying, &inspect_opts(false, true)).expect("inspect");
+    let measured = pbfhogg::inspect::inspect(
+        &lying,
+        &inspect_opts(false, true),
+        &crate::common::test_host(),
+    )
+    .expect("inspect");
     let json = measured.to_json(None);
     assert_eq!(
         json["elements"]["nodes"], 3,
@@ -208,6 +229,7 @@ fn inspect_json_base() {
             distrust_metadata: false,
             direct_io: false,
         },
+        &crate::common::test_host(),
     )
     .expect("inspect");
     let json = report.to_json(None);
@@ -270,6 +292,7 @@ fn inspect_json_with_id_ranges() {
             distrust_metadata: false,
             direct_io: false,
         },
+        &crate::common::test_host(),
     )
     .expect("inspect");
     let json = report.to_json(None);
@@ -310,6 +333,7 @@ fn inspect_json_with_blocks() {
             distrust_metadata: false,
             direct_io: false,
         },
+        &crate::common::test_host(),
     )
     .expect("inspect");
     let json = report.to_json(Some(0));
@@ -343,6 +367,7 @@ fn inspect_json_blocks_limit_honored() {
             distrust_metadata: false,
             direct_io: false,
         },
+        &crate::common::test_host(),
     )
     .expect("inspect");
 
@@ -376,6 +401,7 @@ fn inspect_json_combined_flags() {
             distrust_metadata: false,
             direct_io: false,
         },
+        &crate::common::test_host(),
     )
     .expect("inspect");
     let json = report.to_json(Some(0));
@@ -424,6 +450,7 @@ fn inspect_json_blocks_anomalies_only() {
             distrust_metadata: false,
             direct_io: false,
         },
+        &crate::common::test_host(),
     )
     .expect("inspect");
     let json = report.to_json_filtered(Some(0), true);
@@ -454,6 +481,7 @@ fn inspect_extended() {
             distrust_metadata: false,
             direct_io: false,
         },
+        &crate::common::test_host(),
     )
     .expect("inspect");
     let json = report.to_json(None);
@@ -488,6 +516,7 @@ fn inspect_get_value() {
             distrust_metadata: false,
             direct_io: false,
         },
+        &crate::common::test_host(),
     )
     .expect("inspect");
 
@@ -527,10 +556,22 @@ fn node_stats_parallel_classify_parity() {
     let nodes = generate_nodes(40, 1);
     write_multi_block_test_pbf(&input, &nodes, &[], &[], 10);
 
-    let seq =
-        pbfhogg::inspect::node_stats::node_stats(&input, false, true, 1).expect("node_stats seq");
-    let par =
-        pbfhogg::inspect::node_stats::node_stats(&input, false, true, 4).expect("node_stats par");
+    let seq = pbfhogg::inspect::node_stats::node_stats(
+        &input,
+        false,
+        true,
+        1,
+        &crate::common::test_host(),
+    )
+    .expect("node_stats seq");
+    let par = pbfhogg::inspect::node_stats::node_stats(
+        &input,
+        false,
+        true,
+        4,
+        &crate::common::test_host(),
+    )
+    .expect("node_stats par");
 
     // Raw totals must match exactly. These are simple sums /
     // min-reductions over blobs; if workers double-count or drop a
@@ -611,8 +652,15 @@ fn show_element_unsorted_pbf_finds_target_in_later_blob() {
 
     use pbfhogg::inspect::{ShowElementType, show_element_to};
     let mut out: Vec<u8> = Vec::new();
-    let found =
-        show_element_to(&input, ShowElementType::Node, 51, false, &mut out).expect("show_element");
+    let found = show_element_to(
+        &input,
+        ShowElementType::Node,
+        51,
+        false,
+        &mut out,
+        &crate::common::test_host(),
+    )
+    .expect("show_element");
     assert!(
         found,
         "node 51 lives in the second blob; must be found on unsorted PBF"
@@ -622,8 +670,15 @@ fn show_element_unsorted_pbf_finds_target_in_later_blob() {
 
     // Sanity: also find 100 (first blob).
     let mut out100: Vec<u8> = Vec::new();
-    let found100 = show_element_to(&input, ShowElementType::Node, 100, false, &mut out100)
-        .expect("show_element 100");
+    let found100 = show_element_to(
+        &input,
+        ShowElementType::Node,
+        100,
+        false,
+        &mut out100,
+        &crate::common::test_host(),
+    )
+    .expect("show_element 100");
     assert!(found100, "node 100 is in the first blob");
     let text100 = String::from_utf8(out100).expect("utf8 output");
     assert!(
@@ -633,8 +688,15 @@ fn show_element_unsorted_pbf_finds_target_in_later_blob() {
 
     // Miss path still works: id 999 doesn't exist anywhere.
     let mut out_miss: Vec<u8> = Vec::new();
-    let miss = show_element_to(&input, ShowElementType::Node, 999, false, &mut out_miss)
-        .expect("show miss");
+    let miss = show_element_to(
+        &input,
+        ShowElementType::Node,
+        999,
+        false,
+        &mut out_miss,
+        &crate::common::test_host(),
+    )
+    .expect("show miss");
     assert!(!miss, "node 999 shouldn't exist");
     assert!(out_miss.is_empty(), "a miss must write nothing");
 }

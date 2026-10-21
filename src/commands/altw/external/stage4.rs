@@ -116,6 +116,7 @@ pub(super) fn stage4_assembly(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<Stats> {
     use std::os::unix::fs::FileExt;
     // Build the blob schedule from the shared metadata scan.
@@ -123,7 +124,7 @@ pub(super) fn stage4_assembly(
     let t_schedule = std::time::Instant::now();
 
     // Also read the header for the writer (need a regular BlobReader for this).
-    let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
     let header_blob = header_reader
         .next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
@@ -249,11 +250,10 @@ pub(super) fn stage4_assembly(
         },
         direct_io,
         false,
+        host,
     )?;
 
-    let decode_threads = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(4);
+    let decode_threads = crate::host::sized_workers(&*host.resources, 2, 1, 4);
     // Pre-streaming baseline had no cap (ran 22 threads on a 24-core
     // host); the initial Commit B run capped at .min(4) and measured a
     // +11.5% Europe regression because stage 4 decode throughput fell

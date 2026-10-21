@@ -104,10 +104,17 @@ fn preallocate_sparse_file(file: &std::fs::File, _scratch_dir: &Path, bytes: u64
 /// run happens to be assigned the same PID and clears it. The guard is
 /// committed only once the unlink has succeeded, at which point the path is
 /// already gone.
-fn open_anonymous_sparse_file(scratch_dir: &Path, total_bytes: u64) -> Result<std::fs::File> {
+fn open_anonymous_sparse_file(
+    scratch_dir: &Path,
+    total_bytes: u64,
+    host: &crate::host::Host,
+) -> Result<std::fs::File> {
     let temp_path = scratch_dir.join(format!(".pbfhogg-sparse-index-{}", std::process::id()));
     match std::fs::remove_file(&temp_path) {
-        Ok(()) => eprintln!(
+        Ok(()) => crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "altw.sparse.stale_temp_removed",
             "removed stale sparse index temp file {}",
             temp_path.display()
         ),
@@ -267,6 +274,7 @@ pub(super) fn build_node_index_sparse(
     _direct_io: bool,
     scratch_dir: &Path,
     mut referenced: IdSet,
+    host: &crate::host::Host,
 ) -> Result<SparseArrayIndex> {
     let t_rank = std::time::Instant::now();
     referenced.build_rank_index();
@@ -279,7 +287,7 @@ pub(super) fn build_node_index_sparse(
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("altw_pass1_store_bytes", total_bytes as i64);
 
-    let file = open_anonymous_sparse_file(scratch_dir, total_bytes)?;
+    let file = open_anonymous_sparse_file(scratch_dir, total_bytes, host)?;
 
     // SAFETY: file is exclusively owned, opened read+write, sized to total_bytes.
     let mut mmap = unsafe {
@@ -297,6 +305,7 @@ pub(super) fn build_node_index_sparse(
     let (schedule, shared_input) = crate::scan::classify::build_classify_schedule(
         input,
         Some(crate::blob_meta::ElemKind::Node),
+        &host.diagnostics,
     )?;
 
     // Per-blob rank-span accounting: on sorted inputs each blob's
@@ -352,6 +361,7 @@ pub(super) fn build_node_index_sparse(
             Ok(())
         },
         |_seq, ()| {},
+        &*host.resources,
     )?;
 
     #[allow(clippy::cast_possible_wrap)]
@@ -433,7 +443,7 @@ mod tests {
     #[test]
     fn failed_preallocation_leaves_no_file_in_scratch() {
         let dir = tempfile::tempdir().unwrap();
-        super::open_anonymous_sparse_file(dir.path(), u64::MAX)
+        super::open_anonymous_sparse_file(dir.path(), u64::MAX, &crate::host::Host::for_tests())
             .expect_err("impossible allocation must be rejected");
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -450,7 +460,9 @@ mod tests {
     #[test]
     fn successful_allocation_unlinks_the_store() {
         let dir = tempfile::tempdir().unwrap();
-        let file = super::open_anonymous_sparse_file(dir.path(), 4096).unwrap();
+        let file =
+            super::open_anonymous_sparse_file(dir.path(), 4096, &crate::host::Host::for_tests())
+                .unwrap();
         assert_eq!(file.metadata().unwrap().len(), 4096);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }

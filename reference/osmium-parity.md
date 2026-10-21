@@ -290,7 +290,7 @@ osmium compatibility for incomplete regional change streams.
   `src/commands/apply_changes/rewrite.rs` as the required-id total minus
   the merged coordinate map's unique key count
   (`barrier_loc_map_size`), and reported in the summary line by
-  `MergeStats::print_summary`. Unique keys, not extracted-tuple counts:
+  `MergeStats::write_summary`. Unique keys, not extracted-tuple counts:
   a duplicate base record must not pay for a genuinely absent id.
 
 **osmium implementation anchors:**

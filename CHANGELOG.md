@@ -4,6 +4,27 @@
 
 ### Breaking
 
+- **Commands take an explicit `&Host`** (`pbfhogg::host`), which supplies the
+  caller's process actions, resource probes and diagnostics; there is no
+  default. The library no longer calls `mallopt`, raises `RLIMIT_NOFILE` or
+  reads `BROKKR_MARKER_FIFO` unless the caller asks: `ProcessActions` hooks
+  fire at the same program points the CLI used to mutate the process, and
+  sidecar markers are inert until `debug::enable_marker_fifo_from_env`.
+  `debug::cap_malloc_arenas`, `debug::set_mmap_threshold` and
+  `debug::malloc_trim` moved to `process::`. Thread counts and the altw
+  `auto` memory budget come from `host::Resources` (`MachineProbe` or
+  `Fixed`) instead of probing the machine directly.
+
+- **The library writes nothing to stderr.** Every former line is an event on
+  the caller's `host::Diagnostics` handle (`Progress`, `Warning`, `Note`,
+  `Summary`, `Developer`), so two runs in one process cannot interleave
+  output. `print_summary` and `print_osmium_summary` are replaced by
+  `write_summary` and `write_osmium_summary` into an `io::Write`.
+  `has_indexdata`, `has_tagdata` and `osc::parse::load_all_diffs` take
+  `&Diagnostics`. The unrecognised-indexdata warning is once per
+  `Diagnostics` handle (shareable through `OnceKeys`), not once per process.
+  `BlobReader` and `ElementReader` gain a `.diagnostics(d)` builder.
+
 - **Report types write into a caller-supplied `io::Write` instead of printing
   to stdout.** A library does not own its host's stdout. Renamed, each now
   returning `io::Result<()>`:

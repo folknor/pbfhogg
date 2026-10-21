@@ -80,8 +80,14 @@ fn empty_pbf_survives_sort() {
         io_uring: false,
         force: true,
     };
-    pbfhogg::commands::sort::sort(&input, &output, &opts, &pbfhogg::HeaderOverrides::default())
-        .expect("sort empty");
+    pbfhogg::commands::sort::sort(
+        &input,
+        &output,
+        &opts,
+        &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
+    )
+    .expect("sort empty");
 
     let c = read_normalized(&output);
     assert_eq!(c.nodes.len(), 0);
@@ -412,6 +418,7 @@ fn altw_refusal_writes_no_output_for_a_library_caller() {
         &output,
         &altw_options(),
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     ) else {
         panic!("an unresolvable way ref must fail the default policy");
     };
@@ -434,6 +441,7 @@ fn altw_refusal_writes_no_output_for_a_library_caller() {
         &output,
         &opts,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("--ignore-missing-nodes must accept the input");
     assert!(output.exists(), "an accepted run must publish its output");
@@ -457,6 +465,7 @@ fn altw_refusal_leaves_a_preexisting_destination_intact() {
             &output,
             &altw_options(),
             &pbfhogg::HeaderOverrides::default(),
+            &crate::common::test_host()
         )
         .is_err(),
         "an unresolvable way ref must fail the default policy"

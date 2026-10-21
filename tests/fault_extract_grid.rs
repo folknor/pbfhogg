@@ -141,6 +141,7 @@ mod grid_parity {
             false,
             true,
             &pbfhogg::HeaderOverrides::default(),
+            &crate::common::test_host(),
         )
         .expect("extract_multi");
         slots.into_iter().map(|s| s.output).collect()

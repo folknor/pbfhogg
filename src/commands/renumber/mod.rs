@@ -61,19 +61,23 @@ pub struct RenumberStats {
 }
 
 impl RenumberStats {
-    pub fn print_summary(&self) {
+    pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         let total = self.nodes_written + self.ways_written + self.relations_written;
-        eprintln!(
+        writeln!(
+            w,
             "Renumbered {total} elements: {} nodes, {} ways, {} relations",
             self.nodes_written, self.ways_written, self.relations_written,
-        );
+        )?;
         if self.orphan_refs > 0 {
-            eprintln!(
+            writeln!(
+                w,
                 "Warning: {} orphan refs preserved with old IDs (referenced \
                  elements not present in input)",
                 self.orphan_refs,
-            );
+            )?;
         }
+
+        Ok(())
     }
 }
 
@@ -179,25 +183,26 @@ pub fn renumber_external(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<RenumberStats> {
     // OwnedBlock Vec<u8>s are allocated on pass1/stage2d worker threads
     // and freed on rayon compression threads. Uncapped, the arenas grow
     // to ~26 GB anon RSS on planet; with 2 the peak stays under 1 GB.
-    crate::debug::cap_malloc_arenas();
+    host.process.cross_thread_alloc_pool();
 
     // ---- Header validation + output writer setup ----
     {
-        let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
+        let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
         let header_blob = header_reader
             .next()
             .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
         let header = header_blob.to_headerblock()?;
         require_sorted(&header, input, "Input PBF")?;
-        super::warn_locations_on_ways_loss(&header);
+        super::warn_locations_on_ways_loss(&header, host);
     }
     // Re-parse header for writer construction (the earlier reader is dropped).
     let header = {
-        let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
+        let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
         let header_blob = header_reader
             .next()
             .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
@@ -228,6 +233,7 @@ pub fn renumber_external(
         |hb| hb.sorted(),
         direct_io,
         false,
+        host,
     )?;
     let mut stats = RenumberStats {
         nodes_written: 0,
@@ -246,7 +252,7 @@ pub fn renumber_external(
 
     // ---- Blob schedule scan ----
     let t_sched = std::time::Instant::now();
-    let (pass1_schedule, way_schedule, relation_schedule) = build_all_blob_schedules(input)?;
+    let (pass1_schedule, way_schedule, relation_schedule) = build_all_blob_schedules(input, host)?;
     #[allow(clippy::cast_possible_truncation)]
     crate::debug::emit_counter(
         "renumber_ext_schedule_ms",
@@ -398,6 +404,7 @@ pub fn renumber_external(
         &relation_id_set,
         opts.start_relation_id,
         &mut stats,
+        host,
     )?;
     crate::debug::emit_marker("RENUMBER_EXT_R2D_END");
 

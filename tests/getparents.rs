@@ -87,6 +87,7 @@ fn ways_referencing_node() {
         Compression::default(),
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("getparents");
     let c = read_all_elements(&output);
@@ -153,6 +154,7 @@ fn relations_referencing_way() {
         Compression::default(),
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("getparents");
     let c = read_all_elements(&output);
@@ -206,6 +208,7 @@ fn add_self_includes_queried_objects() {
         Compression::default(),
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("getparents");
     let c = read_all_elements(&output);
@@ -260,6 +263,7 @@ fn no_transitive_relations() {
         Compression::default(),
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("getparents");
     let c = read_all_elements(&output);
@@ -304,6 +308,7 @@ fn empty_result() {
         Compression::default(),
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("getparents");
 

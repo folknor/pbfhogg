@@ -85,7 +85,7 @@ pub(super) struct ScannerConfig<'a> {
 /// will see `Disconnected` on their reads and exit.
 #[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub(super) fn run_scanner(cfg: ScannerConfig<'_>) -> Result<u64> {
+pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> Result<u64> {
     // Destructure so clippy sees us taking ownership of the channels,
     // which matters: the SyncSenders dropping at scanner exit is what
     // signals end-of-input to the worker pool and drain.
@@ -101,7 +101,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>) -> Result<u64> {
 
     crate::debug::emit_marker("MERGE_SCANNER_START");
 
-    let mut walker = HeaderWalker::open(base_pbf)?;
+    let mut walker = HeaderWalker::open(base_pbf, &host.diagnostics)?;
     let mut seq: u64 = 0;
     let mut pending_post_barrier: Vec<ScannerEmit> = Vec::new();
     let mut barrier_open = !locations_on_ways; // open by default when not --locations-on-ways

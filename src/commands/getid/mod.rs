@@ -196,10 +196,15 @@ pub fn parse_ids_from_file_with_default_type(
 /// Reads every node, way, and relation in the file and adds its ID to the
 /// returned `ElementIds`. No member or reference IDs are collected - only
 /// top-level element IDs (matching osmium's `--id-osm-file` behavior).
-pub fn parse_ids_from_pbf(path: &Path, _direct_io: bool) -> Result<ElementIds> {
+pub fn parse_ids_from_pbf(
+    path: &Path,
+    _direct_io: bool,
+    host: &crate::host::Host,
+) -> Result<ElementIds> {
     let mut set = ElementIds::empty();
 
-    let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(path, None)?;
+    let (schedule, shared_file) =
+        crate::scan::classify::build_classify_schedule(path, None, &host.diagnostics)?;
 
     struct IdBatch {
         node_ids: Vec<i64>,
@@ -239,6 +244,7 @@ pub fn parse_ids_from_pbf(path: &Path, _direct_io: bool) -> Result<ElementIds> {
                 set.relation_ids.set(id);
             }
         },
+        &*host.resources,
     )?;
 
     Ok(set)
@@ -295,19 +301,23 @@ pub struct GetidStats {
 }
 
 impl GetidStats {
-    pub fn print_summary(&self) {
+    pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         let total = self.nodes_written + self.ways_written + self.relations_written;
-        eprintln!(
+        writeln!(
+            w,
             "Wrote {total} elements: {} nodes, {} ways, {} relations",
             self.nodes_written, self.ways_written, self.relations_written,
-        );
+        )?;
         if self.passthrough_claimed > 0 {
-            eprintln!(
+            writeln!(
+                w,
                 "Plus {} elements in raw-passthrough blobs, per their indexdata \
                  (unverified - run `pbfhogg check --index` to check it)",
                 self.passthrough_claimed,
-            );
+            )?;
         }
+
+        Ok(())
     }
 }
 
@@ -330,6 +340,7 @@ pub fn getid(
     direct_io: bool,
     force: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<GetidStats> {
     let (_, stats) = getid_dispatched(
         input,
@@ -341,6 +352,7 @@ pub fn getid(
         force,
         overrides,
         FULL_SCAN_ARM_MIN_BLOBS,
+        host,
     )?;
     Ok(stats)
 }
@@ -360,6 +372,7 @@ fn getid_dispatched(
     force: bool,
     overrides: &HeaderOverrides,
     min_blobs: u64,
+    host: &crate::host::Host,
 ) -> Result<(Option<ScanArm>, GetidStats)> {
     let has_indexdata = require_indexdata(
         input,
@@ -368,13 +381,23 @@ fn getid_dispatched(
         "input PBF has no blob-level indexdata. Without indexdata, the type filter \
          based on requested ID types is a no-op - all blobs are decompressed \
          (significantly slower).",
+        host,
     )?;
 
     let (arm, result) = if opts.add_referenced {
-        let stats = getid_with_refs(input, output, ids, opts, compression, direct_io, overrides)?;
+        let stats = getid_with_refs(
+            input,
+            output,
+            ids,
+            opts,
+            compression,
+            direct_io,
+            overrides,
+            host,
+        )?;
         (None, stats)
     } else {
-        let arm = super::dispatch_scan_arm(input, has_indexdata, min_blobs)?;
+        let arm = super::dispatch_scan_arm(input, has_indexdata, min_blobs, host)?;
         let stats = filter_by_id(
             input,
             output,
@@ -385,6 +408,7 @@ fn getid_dispatched(
             overrides,
             arm,
             opts.report_found,
+            host,
         )?;
         (Some(arm), stats)
     };
@@ -413,7 +437,9 @@ pub fn removeid(
     direct_io: bool,
     force: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<GetidStats> {
+    let _ = host;
     require_indexdata(
         input,
         direct_io,
@@ -421,6 +447,7 @@ pub fn removeid(
         "input PBF has no blob-level indexdata. Without indexdata, the \
          invert-mode raw-passthrough fast path is unreachable and every \
          blob is decompressed and re-encoded (significantly slower).",
+        host,
     )?;
     // Invert mode is pinned to the walker arm. The streaming full-scan
     // arm implements include mode only; fusing invert's raw passthrough
@@ -435,6 +462,7 @@ pub fn removeid(
         overrides,
         ScanArm::Walker,
         false,
+        host,
     )
 }
 
@@ -457,6 +485,7 @@ fn filter_by_id(
     overrides: &HeaderOverrides,
     arm: ScanArm,
     report_found: bool,
+    host: &crate::host::Host,
 ) -> Result<GetidStats> {
     match arm {
         ScanArm::Walker => filter_by_id_walker(
@@ -468,6 +497,7 @@ fn filter_by_id(
             direct_io,
             overrides,
             report_found,
+            host,
         ),
         ScanArm::FullScan => {
             debug_assert!(
@@ -483,6 +513,7 @@ fn filter_by_id(
                 direct_io,
                 overrides,
                 report_found,
+                host,
             )
         }
     }
@@ -499,6 +530,7 @@ fn filter_by_id_walker(
     direct_io: bool,
     overrides: &HeaderOverrides,
     report_found: bool,
+    host: &crate::host::Host,
 ) -> Result<GetidStats> {
     use crate::blob::{BlobKind, decode_blob_to_headerblock};
     use crate::read::header_walker::HeaderWalker;
@@ -512,7 +544,7 @@ fn filter_by_id_walker(
     // frame bytes). Include mode with a small ID set thus reads only
     // the header index (~140 MB at planet) plus a handful of matching
     // blob bodies.
-    let mut walker = HeaderWalker::open(input)?;
+    let mut walker = HeaderWalker::open(input, &host.diagnostics)?;
     let mut data_buf: Vec<u8> = Vec::new();
     let mut frame_buf: Vec<u8> = Vec::new();
     let mut decompress_buf: Vec<u8> = Vec::new();
@@ -544,7 +576,7 @@ fn filter_by_id_walker(
             BlobKind::OsmHeader => {
                 walker.pread_data(meta.data_offset, meta.data_size, &mut data_buf)?;
                 let header = decode_blob_to_headerblock(&data_buf)?;
-                super::warn_locations_on_ways_loss(&header);
+                super::warn_locations_on_ways_loss(&header, host);
                 let header_bytes = super::build_output_header(&header, true, overrides, |hb| hb)?;
                 writer = Some(super::writer_from_header_bytes(
                     output,
@@ -552,6 +584,7 @@ fn filter_by_id_walker(
                     &header_bytes,
                     direct_io,
                     false,
+                    host,
                 )?);
             }
             BlobKind::OsmData => {
@@ -653,10 +686,20 @@ fn filter_by_id_walker(
         i64::try_from(osmdata_blobs).unwrap_or(i64::MAX),
     );
     if blobs_skipped > 0 {
-        eprintln!("[getid] {blobs_skipped} blobs skipped by ID range filter");
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "getid.blobs_skipped",
+            "[getid] {blobs_skipped} blobs skipped by ID range filter"
+        );
     }
     if blobs_passthrough > 0 {
-        eprintln!("[getid --invert] {blobs_passthrough} blobs passed through raw");
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "getid.invert.passthrough",
+            "[getid --invert] {blobs_passthrough} blobs passed through raw"
+        );
     }
     writer.flush()?;
     crate::debug::emit_marker("GETID_SCAN_END");
@@ -684,6 +727,7 @@ fn filter_by_id_streaming(
     direct_io: bool,
     overrides: &HeaderOverrides,
     report_found: bool,
+    host: &crate::host::Host,
 ) -> Result<GetidStats> {
     use crate::blob::{BlobKind, decode_blob_to_headerblock};
     use crate::file_reader::FileReader;
@@ -715,11 +759,11 @@ fn filter_by_id_streaming(
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
-    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
+    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics)? {
         match frame.blob_type {
             BlobKind::OsmHeader if writer.is_none() => {
                 let header = decode_blob_to_headerblock(frame.blob_bytes())?;
-                super::warn_locations_on_ways_loss(&header);
+                super::warn_locations_on_ways_loss(&header, host);
                 let header_bytes = super::build_output_header(&header, true, overrides, |hb| hb)?;
                 writer = Some(super::writer_from_header_bytes(
                     output,
@@ -727,6 +771,7 @@ fn filter_by_id_streaming(
                     &header_bytes,
                     direct_io,
                     false,
+                    host,
                 )?);
             }
             BlobKind::OsmData => {
@@ -810,7 +855,12 @@ fn filter_by_id_streaming(
         i64::try_from(osmdata_blobs).unwrap_or(i64::MAX),
     );
     if blobs_skipped > 0 {
-        eprintln!("[getid] {blobs_skipped} blobs skipped by ID range filter");
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "getid.blobs_skipped",
+            "[getid] {blobs_skipped} blobs skipped by ID range filter"
+        );
     }
     writer.flush()?;
     crate::debug::emit_marker("GETID_SCAN_END");
@@ -830,6 +880,7 @@ fn getid_with_refs(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<GetidStats> {
     let mut stats = GetidStats {
         nodes_written: 0,
@@ -851,6 +902,7 @@ fn getid_with_refs(
         let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
             input,
             Some(crate::blob_meta::ElemKind::Way),
+            &host.diagnostics,
         )?;
 
         crate::scan::classify::parallel_classify_accumulate(
@@ -875,6 +927,7 @@ fn getid_with_refs(
                 }
                 dep_node_ids.merge(worker_node_ids);
             },
+            &*host.resources,
         )?;
     }
     // When --remove-tags is set, referenced-only nodes (not explicitly requested)
@@ -894,8 +947,8 @@ fn getid_with_refs(
     // Pass 2: Write matching elements + dependent nodes (transform fused into
     // the decode workers).
     crate::debug::emit_marker("GETID_PASS2_START");
-    let reader = ElementReader::open(input, direct_io)?;
-    super::warn_locations_on_ways_loss(reader.header());
+    let reader = ElementReader::open_in(input, direct_io, host)?;
+    super::warn_locations_on_ways_loss(reader.header(), host);
     // Skip blob types not needed: nodes if no node IDs and no dependent nodes,
     // ways always needed (add-referenced mode), relations if no relation IDs.
     let reader = reader.with_blob_filter(BlobFilter::new(
@@ -912,6 +965,7 @@ fn getid_with_refs(
         |hb| hb,
         direct_io,
         false,
+        host,
     )?;
 
     let dep_ref = if has_dep_nodes {
@@ -1291,9 +1345,9 @@ mod tests {
         writer.flush().unwrap();
     }
 
-    fn read_ids(path: &Path) -> Vec<i64> {
+    fn read_ids(path: &Path, host: &crate::host::Host) -> Vec<i64> {
         let mut found = Vec::new();
-        ElementReader::from_path(path)
+        ElementReader::open_in(path, false, host)
             .unwrap()
             .for_each(|element| match element {
                 Element::DenseNode(node) => found.push(node.id()),
@@ -1326,14 +1380,18 @@ mod tests {
             Compression::default(),
             false,
             &HeaderOverrides::default(),
+            &crate::host::Host::for_tests(),
         )
         .unwrap();
-        assert_eq!(read_ids(&output), vec![1, 2, 10]);
+        assert_eq!(
+            read_ids(&output, &crate::host::Host::for_tests()),
+            vec![1, 2, 10]
+        );
     }
 
     /// Run the same include-mode query under both arms, assert they emit
     /// identical element sets, and return that common (sorted) ID list.
-    fn ids_from_both_arms(input: &Path, query: &[&str]) -> Vec<i64> {
+    fn ids_from_both_arms(input: &Path, query: &[&str], host: &crate::host::Host) -> Vec<i64> {
         let dir = tempfile::tempdir().unwrap();
         let query: Vec<String> = query.iter().map(|s| (*s).to_owned()).collect();
         let query = parse_ids(&query).unwrap();
@@ -1350,11 +1408,12 @@ mod tests {
                 &HeaderOverrides::default(),
                 arm,
                 false,
+                host,
             )
             .unwrap();
         }
-        let walker_ids = read_ids(&walker);
-        assert_eq!(walker_ids, read_ids(&full_scan));
+        let walker_ids = read_ids(&walker, host);
+        assert_eq!(walker_ids, read_ids(&full_scan, host));
         walker_ids
     }
 
@@ -1363,7 +1422,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("input.pbf");
         write_blocks(&input, &[1, 2], Some((10, &[1, 2])), true);
-        assert_eq!(ids_from_both_arms(&input, &["n1", "w10"]), vec![1, 10]);
+        assert_eq!(
+            ids_from_both_arms(&input, &["n1", "w10"], &crate::host::Host::for_tests()),
+            vec![1, 10]
+        );
     }
 
     #[test]
@@ -1371,7 +1433,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("input.pbf");
         write_blocks(&input, &[1, 2], Some((10, &[1, 2])), true);
-        assert!(ids_from_both_arms(&input, &["n999"]).is_empty());
+        assert!(ids_from_both_arms(&input, &["n999"], &crate::host::Host::for_tests()).is_empty());
     }
 
     #[test]
@@ -1379,7 +1441,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("input.pbf");
         write_blocks(&input, &[1, 2], None, true);
-        assert_eq!(ids_from_both_arms(&input, &["n2"]), vec![2]);
+        assert_eq!(
+            ids_from_both_arms(&input, &["n2"], &crate::host::Host::for_tests()),
+            vec![2]
+        );
     }
 
     #[test]
@@ -1387,7 +1452,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("input.pbf");
         write_blocks(&input, &[1, 2], Some((10, &[1, 2])), false);
-        assert_eq!(ids_from_both_arms(&input, &["n1", "w10"]), vec![1, 10]);
+        assert_eq!(
+            ids_from_both_arms(&input, &["n1", "w10"], &crate::host::Host::for_tests()),
+            vec![1, 10]
+        );
     }
 
     #[test]
@@ -1416,10 +1484,14 @@ mod tests {
                 false,
                 &HeaderOverrides::default(),
                 min_blobs,
+                &crate::host::Host::for_tests(),
             )
             .unwrap();
             assert_eq!(arm, Some(expected_arm));
-            assert_eq!(read_ids(&output), vec![1, 10]);
+            assert_eq!(
+                read_ids(&output, &crate::host::Host::for_tests()),
+                vec![1, 10]
+            );
         }
     }
 }

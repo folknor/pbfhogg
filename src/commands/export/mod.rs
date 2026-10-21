@@ -86,8 +86,9 @@ pub struct ExportStats {
 }
 
 impl ExportStats {
-    pub fn print_summary(&self) {
-        eprintln!(
+    pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        writeln!(
+            w,
             "Exported {} features ({} nodes, {} ways); skipped {} untagged nodes, {} untagged ways, and {} invalid ways",
             self.features,
             self.nodes,
@@ -95,7 +96,9 @@ impl ExportStats {
             self.skipped_untagged_nodes,
             self.skipped_untagged_ways,
             self.skipped_invalid_ways
-        );
+        )?;
+
+        Ok(())
     }
 }
 
@@ -147,8 +150,13 @@ fn way_hits_bbox(coords: &[(f64, f64)], bbox: &Bbox) -> bool {
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn export<W: Write>(input: &Path, out: W, opts: &ExportOptions) -> crate::Result<ExportStats> {
-    let reader = ElementReader::from_path(input)?;
+pub fn export<W: Write>(
+    input: &Path,
+    out: W,
+    opts: &ExportOptions,
+    host: &crate::host::Host,
+) -> crate::Result<ExportStats> {
+    let reader = ElementReader::open_in(input, false, host)?;
     if admits_ways(opts.types) && !reader.header().has_locations_on_ways() {
         return Err(new_error(ErrorKind::MissingFeature("LocationsOnWays")));
     }

@@ -13,9 +13,8 @@
 //! the module prefix only prepends.
 //!
 //! Every module here shares one process with every other, concurrently. The
-//! process-wide state they share: the global rayon pool; the glibc arena cap
-//! the library's commands set through `pbfhogg::debug::cap_malloc_arenas`;
-//! `RLIMIT_NOFILE`, which altw's external backend raises; and every
+//! process-wide state they share: the global rayon pool;
+//! `RLIMIT_NOFILE`, raised once by `common::test_host()`; and every
 //! `test-hooks` static in the library, which nothing here may arm. A test that arms a process-global hook, or
 //! needs any of this state to itself, gets its own `[[test]]` target in
 //! `Cargo.toml` with the reason beside it - see the `fault_*` targets.
@@ -79,3 +78,5 @@ mod tags_filter_osc;
 
 #[cfg(all(feature = "commands", target_os = "linux", target_env = "gnu"))]
 mod cli_host_identity;
+
+mod host_contract;

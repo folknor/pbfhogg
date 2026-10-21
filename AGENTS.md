@@ -179,6 +179,7 @@ CLI-driven integration tests live in `tests/cli_*.rs` and drive the compiled `pb
 **Geometry:** `geo.rs` - point-in-polygon, ring assembly, Douglas-Peucker, antimeridian, cos-projection distance.
 
 ## Conventions
+- Library code never mutates process state, reads the environment or writes stderr; see ADR-0016.
 - Performance numbers in markdown must include commit hash and hostname. Results auto-stored in `.brokkr/results.db`.
 - Strict clippy: `unwrap_used = "deny"`, `cognitive_complexity = "deny"`.
 - Coordinates: decimicrodegrees (10^-7 degrees) for node I/O.

@@ -103,6 +103,7 @@ mod apply_changes {
                 &output,
                 &opts,
                 &pbfhogg::HeaderOverrides::default(),
+                &crate::common::test_host(),
             )
         }));
         let silently_succeeded = matches!(result, Ok(Ok(_)));

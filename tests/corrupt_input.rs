@@ -371,7 +371,8 @@ fn has_indexdata_rejects_oversized_header_length() {
     // depend on allocator behaviour for very large sizes.
     std::fs::write(&path, 65536u32.to_be_bytes()).unwrap();
 
-    let err = pbfhogg::has_indexdata(&path, false).unwrap_err();
+    let err =
+        pbfhogg::has_indexdata(&path, false, &pbfhogg::host::Diagnostics::discard()).unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("header") && (msg.contains("too big") || msg.contains("65536")),
@@ -397,6 +398,7 @@ fn cat_rejects_oversized_header_length() {
         false,
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     );
     let err = match result {
         Ok(_) => panic!("expected cat() to error on adversarial file"),
@@ -439,9 +441,11 @@ fn check_refs_rejects_schedule_entry_past_eof() {
     // with an opaque `read_exact_at` UnexpectedEof. Post-fix: the
     // schedule builder catches the mismatch up front.
     let result = pbfhogg::check::refs::check_refs(
-        &input, false, // check_relations
+        &input,
+        false, // check_relations
         false, // show_ids
         false, // direct_io
+        &crate::common::test_host(),
     );
     let err = match result {
         Ok(_) => panic!("expected check_refs to error on truncated PBF"),
@@ -482,6 +486,7 @@ fn inspect_rejects_oversized_header_length_via_walker() {
             distrust_metadata: false,
             direct_io: false,
         },
+        &crate::common::test_host(),
     );
     let err = match result {
         Ok(_) => panic!("expected inspect() to error on adversarial file"),
@@ -599,6 +604,7 @@ fn cat_rejects_oversized_datasize() {
         false,
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     );
     let err = match result {
         Ok(_) => panic!("expected cat() to error on adversarial datasize"),
@@ -622,7 +628,8 @@ fn has_indexdata_rejects_oversized_datasize() {
     append_oversized_datasize_frame(&mut data, MAX_BLOB_DATASIZE);
     std::fs::write(&path, &data).unwrap();
 
-    let err = pbfhogg::has_indexdata(&path, false).unwrap_err();
+    let err =
+        pbfhogg::has_indexdata(&path, false, &pbfhogg::host::Diagnostics::discard()).unwrap_err();
     assert_datasize_too_big(err, MAX_BLOB_DATASIZE);
 }
 
@@ -647,6 +654,7 @@ fn inspect_rejects_oversized_datasize_via_walker() {
             distrust_metadata: false,
             direct_io: false,
         },
+        &crate::common::test_host(),
     );
     let err = match result {
         Ok(_) => panic!("expected inspect() to error on adversarial datasize"),

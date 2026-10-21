@@ -839,8 +839,8 @@ R2d: parallel with inline rank() dispatch (relation_map replaced by
 `node_id_set.rank()` + `way_id_set.rank()` inline - no flat temp
 files. Zero scratch disk usage. Single shared input fd across all
 phases. Atomic index dispatch (no `Arc<Mutex<Receiver>>`). Output
-defaults to zlib:1. `mallopt(M_ARENA_MAX, 2)` inside
-`renumber_external()` prevents glibc cross-thread arena fragmentation.
+defaults to zlib:1. the arena cap requested at the start of `renumber_external()` through the
+caller's process actions (the CLI applies it) prevents glibc cross-thread arena fragmentation.
 
 ### Planet (87.7 GB indexed, 11.6B elements, plantasjen)
 
@@ -852,7 +852,7 @@ Element counts: 10,447,738,627 nodes / 1,165,589,744 ways /
 Peak anon 3.3 GB (commit `cb99106`). Single shared `IdSetDense` with
 `AtomicU8::fetch_or` for concurrent pass 1 writes (~1.5 GB node bitset
 + rank index, ~200 MB way bitset + rank, ~20 MB relation bitset).
-Zero temp disk. `mallopt(M_ARENA_MAX, 2)` inside `renumber_external()`
+Zero temp disk. the arena cap requested at the start of `renumber_external()` through the caller's process actions (the CLI applies it)
 caps glibc arena growth from cross-thread OwnedBlock `Vec<u8>` frees.
 
 ### Phase breakdown (commit `cb99106`, planet, `--bench 1`, UUID `f9098cab`)

@@ -69,10 +69,22 @@ fn sort_idempotence() {
         io_uring: false,
         force: true,
     };
-    pbfhogg::commands::sort::sort(&input, &once, &opts, &pbfhogg::HeaderOverrides::default())
-        .expect("sort once");
-    pbfhogg::commands::sort::sort(&once, &twice, &opts, &pbfhogg::HeaderOverrides::default())
-        .expect("sort twice");
+    pbfhogg::commands::sort::sort(
+        &input,
+        &once,
+        &opts,
+        &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
+    )
+    .expect("sort once");
+    pbfhogg::commands::sort::sort(
+        &once,
+        &twice,
+        &opts,
+        &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
+    )
+    .expect("sort twice");
 
     assert_elements_equivalent(&once, &twice);
 }
@@ -109,6 +121,7 @@ fn extract_simple_idempotence() {
             false,
             true,
             &pbfhogg::HeaderOverrides::default(),
+            &crate::common::test_host(),
         )
         .expect("extract");
     };
@@ -179,9 +192,14 @@ fn derive_then_apply_roundtrip() {
 
     // derive_changes(base, modified) -> delta.osc.gz
     let stats = pbfhogg::diff::derive::derive_changes(
-        &base, &modified, &osc, false, true, // increment_version
+        &base,
+        &modified,
+        &osc,
+        false,
+        true, // increment_version
         true, // update_timestamp
         1,
+        &crate::common::test_host(),
     )
     .expect("derive_changes");
     assert!(
@@ -208,6 +226,7 @@ fn derive_then_apply_roundtrip() {
         &reconstructed,
         &opts,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("apply_changes");
 
@@ -225,6 +244,7 @@ fn derive_then_apply_roundtrip() {
 /// derive emitted only `version` and apply-changes dropped OSC metadata
 /// entirely (every OSC-sourced element in merged output carried v0).
 #[test]
+#[allow(clippy::too_many_lines)]
 fn derive_then_apply_preserves_metadata() {
     use crate::common::TestMeta;
 
@@ -304,9 +324,14 @@ fn derive_then_apply_preserves_metadata() {
     write_test_pbf_sorted(&modified, &mod_nodes, &mod_ways, &mod_relations);
 
     let stats = pbfhogg::diff::derive::derive_changes(
-        &base, &modified, &osc, false, false, // increment_version: keep raw metadata
+        &base,
+        &modified,
+        &osc,
+        false,
+        false, // increment_version: keep raw metadata
         false, // update_timestamp: keep raw metadata
         1,
+        &crate::common::test_host(),
     )
     .expect("derive_changes");
     assert!(
@@ -332,6 +357,7 @@ fn derive_then_apply_preserves_metadata() {
         &reconstructed,
         &opts,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("apply_changes");
 
@@ -384,10 +410,22 @@ fn tags_filter_idempotence() {
         jobs: None,
     };
 
-    pbfhogg::tags_filter::tags_filter(&input, &once, &opts, &pbfhogg::HeaderOverrides::default())
-        .expect("tags_filter once");
-    pbfhogg::tags_filter::tags_filter(&once, &twice, &opts, &pbfhogg::HeaderOverrides::default())
-        .expect("tags_filter twice");
+    pbfhogg::tags_filter::tags_filter(
+        &input,
+        &once,
+        &opts,
+        &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
+    )
+    .expect("tags_filter once");
+    pbfhogg::tags_filter::tags_filter(
+        &once,
+        &twice,
+        &opts,
+        &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
+    )
+    .expect("tags_filter twice");
 
     assert_elements_equivalent(&once, &twice);
 }
@@ -467,12 +505,30 @@ fn tags_filter_blob_layout_independence() {
         force: true,
         jobs: None,
     };
-    pbfhogg::tags_filter::tags_filter(&b1, &out_1, &opts, &pbfhogg::HeaderOverrides::default())
-        .expect("tags_filter bs=1");
-    pbfhogg::tags_filter::tags_filter(&b5, &out_5, &opts, &pbfhogg::HeaderOverrides::default())
-        .expect("tags_filter bs=5");
-    pbfhogg::tags_filter::tags_filter(&b100, &out_100, &opts, &pbfhogg::HeaderOverrides::default())
-        .expect("tags_filter bs=100");
+    pbfhogg::tags_filter::tags_filter(
+        &b1,
+        &out_1,
+        &opts,
+        &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
+    )
+    .expect("tags_filter bs=1");
+    pbfhogg::tags_filter::tags_filter(
+        &b5,
+        &out_5,
+        &opts,
+        &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
+    )
+    .expect("tags_filter bs=5");
+    pbfhogg::tags_filter::tags_filter(
+        &b100,
+        &out_100,
+        &opts,
+        &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
+    )
+    .expect("tags_filter bs=100");
 
     assert_elements_equivalent(&out_1, &out_5);
     assert_elements_equivalent(&out_5, &out_100);
@@ -504,7 +560,15 @@ fn diff_blob_layout_independence() {
     };
     let diff_stats = |old: &Path, new: &Path| -> pbfhogg::diff::DiffStats {
         let mut sink: Vec<u8> = Vec::new();
-        pbfhogg::diff::diff(old, new, &mut sink, &opts, false).expect("diff")
+        pbfhogg::diff::diff(
+            old,
+            new,
+            &mut sink,
+            &opts,
+            false,
+            &crate::common::test_host(),
+        )
+        .expect("diff")
     };
 
     let s_1_1 = diff_stats(&old_b1, &new_b1);
@@ -579,8 +643,14 @@ fn sort_compression_level_parity() {
             io_uring: false,
             force: true,
         };
-        pbfhogg::commands::sort::sort(&input, path, &opts, &pbfhogg::HeaderOverrides::default())
-            .expect("sort");
+        pbfhogg::commands::sort::sort(
+            &input,
+            path,
+            &opts,
+            &pbfhogg::HeaderOverrides::default(),
+            &crate::common::test_host(),
+        )
+        .expect("sort");
     }
 
     // All three outputs must round-trip to element-equivalent sets.
@@ -626,6 +696,7 @@ fn tags_filter_compression_level_parity() {
             path,
             &opts,
             &pbfhogg::HeaderOverrides::default(),
+            &crate::common::test_host(),
         )
         .expect("tags_filter");
     }
@@ -656,8 +727,14 @@ fn none_compression_reads_back_identical() {
             io_uring: false,
             force: true,
         };
-        pbfhogg::commands::sort::sort(&input, output, &opts, &pbfhogg::HeaderOverrides::default())
-            .expect("sort");
+        pbfhogg::commands::sort::sort(
+            &input,
+            output,
+            &opts,
+            &pbfhogg::HeaderOverrides::default(),
+            &crate::common::test_host(),
+        )
+        .expect("sort");
     }
 
     assert_elements_equivalent(&out_none, &out_zlib);

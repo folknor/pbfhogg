@@ -83,56 +83,67 @@ impl MergeStats {
         self.bytes_rewritten += other.bytes_rewritten;
     }
 
-    pub fn print_summary(&self) {
+    pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         let total_blobs =
             self.blobs_passthrough + self.blobs_rewritten + self.blobs_skip_decompress;
-        eprintln!("Merge complete: {} elements written", self.total_elements());
-        eprintln!(
+        writeln!(
+            w,
+            "Merge complete: {} elements written",
+            self.total_elements()
+        )?;
+        writeln!(
+            w,
             "  Base: {} nodes, {} ways, {} relations",
             self.base_nodes, self.base_ways, self.base_relations,
-        );
-        eprintln!(
+        )?;
+        writeln!(
+            w,
             "  Diff: {} nodes, {} ways, {} relations",
             self.diff_nodes, self.diff_ways, self.diff_relations,
-        );
-        eprintln!("  Deleted: {}", self.deleted);
-        eprintln!(
+        )?;
+        writeln!(w, "  Deleted: {}", self.deleted)?;
+        writeln!(
+            w,
             "  Blobs: {} passthrough ({} index-hit, {} scan-only, {} skip-decompress), {} rewritten (of {total_blobs} total)",
             self.blobs_passthrough + self.blobs_skip_decompress,
             self.blobs_index_hit,
             self.blobs_scan_only,
             self.blobs_skip_decompress,
             self.blobs_rewritten,
-        );
+        )?;
         let total_bytes = self.bytes_passthrough + self.bytes_rewritten;
         if total_bytes > 0 {
             #[allow(clippy::cast_precision_loss)]
             let rewrite_pct = (self.bytes_rewritten as f64 / total_bytes as f64) * 100.0;
-            eprintln!(
+            writeln!(
+                w,
                 "  Bytes: {} passthrough, {} rewritten ({rewrite_pct:.1}% rewrite ratio)",
                 self.bytes_passthrough, self.bytes_rewritten,
-            );
+            )?;
         }
         if !self.blob_sizes.is_empty() {
             let mut sizes = self.blob_sizes.clone();
             let (p50, p95, p99) = percentiles_u32(&mut sizes);
-            eprintln!("  Blob sizes: p50={p50}, p95={p95}, p99={p99} bytes");
+            writeln!(w, "  Blob sizes: p50={p50}, p95={p95}, p99={p99} bytes")?;
         }
         if self.diff_heap_bytes > 0 {
             #[allow(clippy::cast_precision_loss)]
             let mb = self.diff_heap_bytes as f64 / (1024.0 * 1024.0);
-            eprintln!("  CompactDiffOverlay heap: {mb:.1} MB");
+            writeln!(w, "  CompactDiffOverlay heap: {mb:.1} MB")?;
         }
         if self.loc_nodes_needed > 0 {
-            eprintln!(
+            writeln!(
+                w,
                 "  Locations-on-ways: {} nodes needed, {} from diff, {} from base, {} missing, {} node blobs scanned",
                 self.loc_nodes_needed,
                 self.loc_nodes_from_diff,
                 self.loc_nodes_from_base,
                 self.loc_missing,
                 self.loc_node_blobs_scanned,
-            );
+            )?;
         }
+
+        Ok(())
     }
 }
 

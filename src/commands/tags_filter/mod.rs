@@ -154,7 +154,7 @@ pub struct TagsFilterStats {
 }
 
 impl TagsFilterStats {
-    pub fn print_summary(&self) {
+    pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         let total = self.nodes_matched
             + self.nodes_from_ways
             + self.nodes_from_relations
@@ -162,7 +162,8 @@ impl TagsFilterStats {
             + self.ways_from_relations
             + self.relations_matched
             + self.relations_from_relations;
-        eprintln!(
+        writeln!(
+            w,
             "Wrote {total} elements: {} nodes ({} direct + {} from ways + {} from relations), \
              {} ways ({} direct + {} from relations), {} relations ({} direct + {} from relations)",
             self.nodes_matched + self.nodes_from_ways + self.nodes_from_relations,
@@ -175,7 +176,9 @@ impl TagsFilterStats {
             self.relations_matched + self.relations_from_relations,
             self.relations_matched,
             self.relations_from_relations,
-        );
+        )?;
+
+        Ok(())
     }
 }
 
@@ -229,6 +232,7 @@ pub fn tags_filter(
     output: &Path,
     opts: &TagsFilterOptions<'_>,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<TagsFilterStats> {
     // Blob-level filtering can't help in invert mode (we want non-matching
     // blobs), and `--distrust-metadata` declines to use it at all - demanding
@@ -240,6 +244,7 @@ pub fn tags_filter(
             opts.force,
             "input PBF has no blob-level indexdata. Without indexdata, type and tag key \
              filters are no-ops - all blobs are decompressed (significantly slower).",
+            host,
         )?;
     }
 
@@ -259,6 +264,7 @@ pub fn tags_filter(
             opts.compression,
             opts.direct_io,
             overrides,
+            host,
         )?;
         #[allow(clippy::cast_possible_wrap)]
         {
@@ -282,6 +288,7 @@ pub fn tags_filter(
             opts.direct_io,
             opts.jobs,
             overrides,
+            host,
         )?;
         #[allow(clippy::cast_possible_wrap)]
         {
@@ -417,10 +424,11 @@ fn tags_filter_single_pass(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<TagsFilterStats> {
     crate::debug::emit_marker("TAGSFILTER_SCAN_START");
-    let reader = ElementReader::open(input, direct_io)?;
-    super::warn_locations_on_ways_loss(reader.header());
+    let reader = ElementReader::open_in(input, direct_io, host)?;
+    super::warn_locations_on_ways_loss(reader.header(), host);
     // Blob-level filtering can't help in invert mode - we want non-matching blobs.
     let reader = match trusted_blob_filter(expressions, invert, distrust_metadata) {
         Some(filter) => reader.with_blob_filter(filter),
@@ -435,6 +443,7 @@ fn tags_filter_single_pass(
         |hb| hb,
         direct_io,
         false,
+        host,
     )?;
     let mut stats = TagsFilterStats {
         nodes_matched: 0,
@@ -644,6 +653,7 @@ fn tags_filter_two_pass(
     direct_io: bool,
     jobs: Option<usize>,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<TagsFilterStats> {
     let mut stats = TagsFilterStats {
         nodes_matched: 0,
@@ -676,19 +686,19 @@ fn tags_filter_two_pass(
     // matching IDs into the IdSet collections.
     {
         // Read header for locations-on-ways warning.
-        let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
+        let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
         header_reader.set_parse_indexdata(true);
         let header_blob = header_reader
             .next()
             .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-        super::warn_locations_on_ways_loss(&header_blob.to_headerblock()?);
+        super::warn_locations_on_ways_loss(&header_blob.to_headerblock()?, host);
         drop(header_reader);
 
         // Build schedule from header-only scan via the pread-only HeaderWalker.
         // Avoids pulling blob bodies into the page cache for blobs we'll decide
         // to skip on the tag-index filter anyway.
         crate::debug::emit_marker("TAGSFILTER_SINGLE_PASS_SCHEDULE_SCAN_START");
-        let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
+        let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
         let _ = walker
             .next_header()?
             .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
@@ -717,7 +727,12 @@ fn tags_filter_two_pass(
             seq += 1;
         }
         if blobs_skipped_by_tag > 0 {
-            eprintln!("[tags-filter] {blobs_skipped_by_tag} blobs skipped by tag index");
+            crate::host::diag!(
+                host.diagnostics,
+                Note,
+                "tags_filter.blobs_skipped_by_tag",
+                "[tags-filter] {blobs_skipped_by_tag} blobs skipped by tag index"
+            );
         }
         crate::debug::emit_marker("TAGSFILTER_SINGLE_PASS_SCHEDULE_SCAN_END");
 
@@ -814,6 +829,7 @@ fn tags_filter_two_pass(
                     }
                 }
             },
+            &*host.resources,
         )?;
     }
 
@@ -832,6 +848,7 @@ fn tags_filter_two_pass(
             &mut included_way_ids,
             &mut relation_dep_node_ids,
             jobs,
+            host,
         )?;
         has_included_way |= closure.has_way;
         has_included_relation |= closure.has_relation;
@@ -848,6 +865,7 @@ fn tags_filter_two_pass(
         Some(&direct_way_ids),
         &mut relation_dep_node_ids,
         jobs,
+        host,
     )?;
     crate::debug::emit_marker("TAGSFILTER_WAYDEPS_END");
 
@@ -857,7 +875,7 @@ fn tags_filter_two_pass(
     // and filtered by parallel workers.
     crate::debug::emit_marker("TAGSFILTER_PASS2_START");
 
-    let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
     let header_blob = header_reader
         .next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
@@ -872,6 +890,7 @@ fn tags_filter_two_pass(
         |hb| hb,
         direct_io,
         false,
+        host,
     )?;
 
     // Build pass 2 schedule. Skip blob types not needed (type filter only -
@@ -891,7 +910,7 @@ fn tags_filter_two_pass(
     };
 
     crate::debug::emit_marker("TAGSFILTER_PASS2_SCHEDULE_SCAN_START");
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
     let _ = walker
         .next_header()?
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
@@ -935,7 +954,12 @@ fn tags_filter_two_pass(
     }
 
     if blobs_skipped > 0 {
-        eprintln!("[tags-filter] pass 2: {blobs_skipped} blobs skipped by type/tag index");
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "tags_filter.pass2_blobs_skipped",
+            "[tags-filter] pass 2: {blobs_skipped} blobs skipped by type/tag index"
+        );
     }
 
     let id_sets = Pass2IdSets {
@@ -987,9 +1011,7 @@ fn tags_filter_two_pass(
                 .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
         );
 
-        let decode_threads = std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(2).max(1))
-            .unwrap_or(4);
+        let decode_threads = crate::host::sized_workers(&*host.resources, 2, 1, 4);
 
         let decode_items: Vec<(usize, u64, usize)> = schedule
             .iter()
@@ -1161,6 +1183,7 @@ fn collect_relation_member_closure(
     included_way_ids: &mut IdSet,
     relation_dep_node_ids: &mut IdSet,
     jobs: Option<usize>,
+    host: &crate::host::Host,
 ) -> Result<RelationClosureSummary> {
     let mut summary = RelationClosureSummary::default();
 
@@ -1168,6 +1191,7 @@ fn collect_relation_member_closure(
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
         kind_schedule_filter(crate::blob_meta::ElemKind::Relation, distrust_metadata),
+        &host.diagnostics,
     )?;
 
     struct ClosureResult {
@@ -1218,6 +1242,7 @@ fn collect_relation_member_closure(
                 }
             },
             |cr| results.push(cr),
+            &*host.resources,
         )?;
 
         // Merge phase: mutate included sets.
@@ -1282,10 +1307,12 @@ fn collect_way_node_dependencies(
     skip_way_ids: Option<&IdSet>,
     relation_dep_node_ids: &mut IdSet,
     jobs: Option<usize>,
+    host: &crate::host::Host,
 ) -> Result<()> {
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
         kind_schedule_filter(crate::blob_meta::ElemKind::Way, distrust_metadata),
+        &host.diagnostics,
     )?;
 
     // Per-blob node-ref accumulation. Earlier this function used
@@ -1326,6 +1353,7 @@ fn collect_way_node_dependencies(
                 relation_dep_node_ids.set(id);
             }
         },
+        &*host.resources,
     )?;
 
     Ok(())
@@ -1444,10 +1472,11 @@ mod tests {
             Compression::default(),
             false,
             &HeaderOverrides::default(),
+            &crate::host::Host::for_tests(),
         )
         .unwrap();
         let mut ids = Vec::new();
-        ElementReader::from_path(&output)
+        ElementReader::open_in(&output, false, &crate::host::Host::for_tests())
             .unwrap()
             .for_each(|element| match element {
                 Element::DenseNode(node) => ids.push(node.id()),

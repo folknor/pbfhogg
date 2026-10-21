@@ -350,122 +350,6 @@ mod bucket_math_tests {
     }
 }
 
-/// Outcome of the `RLIMIT_NOFILE` self-raise attempt.
-pub(super) enum FdRaiseStatus {
-    /// `getrlimit` failed; caller is using the conservative fallback.
-    ProbeFailed,
-    /// Soft limit was already at the hard cap; nothing to raise.
-    AlreadyAtCap,
-    /// Soft raised from `from` up to the hard cap.
-    Raised { from: u64 },
-    /// Soft limit is below the hard cap but `setrlimit` rejected the
-    /// raise. Rare: unprivileged soft-raise to hard cap should always
-    /// succeed on Linux, but seccomp or LSM policies can block it.
-    RaiseFailed,
-}
-
-/// Result of probing + raising `RLIMIT_NOFILE`. `Display` prints a
-/// compact one-line summary suitable for stderr narration.
-pub(super) struct FdBudget {
-    /// Effective soft limit after the raise attempt, clamped to a sane
-    /// ceiling if the kernel reports `RLIM_INFINITY`.
-    pub(super) effective_soft: u64,
-    pub(super) status: FdRaiseStatus,
-}
-
-impl std::fmt::Display for FdBudget {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.status {
-            FdRaiseStatus::ProbeFailed => write!(
-                f,
-                "RLIMIT_NOFILE: probe failed; assuming {}",
-                self.effective_soft
-            ),
-            FdRaiseStatus::AlreadyAtCap => write!(
-                f,
-                "RLIMIT_NOFILE: {} (already at hard cap; no adjustment)",
-                self.effective_soft
-            ),
-            FdRaiseStatus::Raised { from } => write!(
-                f,
-                "RLIMIT_NOFILE: {from} -> {} (soft raised to hard cap)",
-                self.effective_soft
-            ),
-            FdRaiseStatus::RaiseFailed => write!(
-                f,
-                "RLIMIT_NOFILE: {} (raise to hard cap rejected; still at soft cap)",
-                self.effective_soft
-            ),
-        }
-    }
-}
-
-/// Self-raise `RLIMIT_NOFILE` soft limit to the current hard cap and
-/// report both the effective soft limit and the narrative of what
-/// happened.
-///
-/// External join's stage 1 pass B holds `num_workers * NUM_BUCKETS`
-/// (up to ~4096 on a 17-core host) rank-shard files open concurrently.
-/// Linux default soft ulimit is 1024 on many distros; some still cap
-/// hard at 4096. Without this raise, `add-locations-to-ways
-/// --index-type external` fails with EMFILE on a default-ulimit shell
-/// even though the hard cap is usually high enough. The unprivileged
-/// soft-raise up to hard cap is the standard pattern for servers
-/// (PostgreSQL, Redis, nginx).
-///
-/// Returns 1024 as a conservative fallback `effective_soft` if the
-/// probe itself fails, so callers can still compute a sensible cap.
-pub(super) fn raise_nofile_to_hard_cap() -> FdBudget {
-    // SAFETY: `getrlimit`/`setrlimit` are pure-data FFI calls. The
-    // rlimit struct is fully initialised before being passed as
-    // `&mut`, and we don't share it across threads.
-    unsafe {
-        let mut rlim = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
-            return FdBudget {
-                effective_soft: 1024,
-                status: FdRaiseStatus::ProbeFailed,
-            };
-        }
-        let soft_before: u64 = rlim.rlim_cur;
-        let hard: u64 = rlim.rlim_max;
-        if soft_before >= hard {
-            // `rlim_cur` can be `RLIM_INFINITY` (= `u64::MAX` on
-            // Linux); clamp so downstream arithmetic doesn't overflow.
-            return FdBudget {
-                effective_soft: soft_before.min(1 << 30),
-                status: FdRaiseStatus::AlreadyAtCap,
-            };
-        }
-        let target = libc::rlimit {
-            rlim_cur: hard,
-            rlim_max: hard,
-        };
-        let raise_ok = libc::setrlimit(libc::RLIMIT_NOFILE, &target) == 0;
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
-            return FdBudget {
-                effective_soft: 1024,
-                status: FdRaiseStatus::ProbeFailed,
-            };
-        }
-        let effective: u64 = rlim.rlim_cur.min(1 << 30);
-        if raise_ok {
-            FdBudget {
-                effective_soft: effective,
-                status: FdRaiseStatus::Raised { from: soft_before },
-            }
-        } else {
-            FdBudget {
-                effective_soft: effective,
-                status: FdRaiseStatus::RaiseFailed,
-            }
-        }
-    }
-}
-
 /// Depth-gated stall span shared by concurrent blockers.
 ///
 /// `brokkr sidecar --stalls` pairs `WAIT_<CATEGORY>_START/_END` markers
@@ -717,12 +601,14 @@ pub fn external_join(
     force: bool,
     overrides: &HeaderOverrides,
     inject_prepass: bool,
+    host: &crate::host::Host,
 ) -> Result<Stats> {
     let has_indexdata = require_indexdata(
         input,
         direct_io,
         force,
         "external join requires indexdata for efficient blob filtering",
+        host,
     )?;
 
     // External-join cannot function without indexdata: the stage-1/2
@@ -749,7 +635,7 @@ pub fn external_join(
     }
 
     {
-        let reader = ElementReader::open(input, direct_io)?;
+        let reader = ElementReader::open_in(input, direct_io, host)?;
         if !reader.header().is_sorted() {
             return Err("external join requires a sorted PBF (Sort.Type_then_ID). \
                         The single-pass node merge depends on ascending node ID order."
@@ -764,7 +650,7 @@ pub fn external_join(
 
     crate::debug::emit_marker("EXTJOIN_META_SCAN_START");
     let t_meta = std::time::Instant::now();
-    let blob_meta = blob_meta::scan_blob_metadata(input, !keep_untagged_nodes)?;
+    let blob_meta = blob_meta::scan_blob_metadata(input, !keep_untagged_nodes, host)?;
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     {
         crate::debug::emit_counter("extjoin_meta_scan_ms", t_meta.elapsed().as_millis() as i64);
@@ -822,6 +708,7 @@ pub fn external_join(
                     &ref_count_sidecar,
                     &per_way_refcount_sidecar,
                     inject_prepass,
+                    host,
                 )
                 .map_err(|e| e.to_string())
             });
@@ -983,6 +870,7 @@ pub fn external_join(
         &input_pbf,
         &node_blob_mapping,
         inject_prepass,
+        host,
     )?;
     slot_buckets.finish()?;
     let (s2_minflt_after, s2_majflt_after) = crate::debug::read_page_faults();
@@ -1023,10 +911,7 @@ pub fn external_join(
     // stage 3 and stage 4 worker buffers are now both resident at the
     // same time (streaming stage 3 -> 4 landed in `beb7838` + `f93d896`
     // + `eecb46c`).
-    let num_workers = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(4)
-        .min(4);
+    let num_workers = crate::host::sized_workers(&*host.resources, 2, 1, 4).min(4);
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("s3_worker_count", num_workers as i64);
 
@@ -1134,6 +1019,7 @@ pub fn external_join(
                 slot_bucket_count,
                 total_slots,
                 &integrated,
+                host,
             )
             .map_err(|e| e.to_string());
             // Signal the router that no more publishes are coming. Must
@@ -1159,6 +1045,7 @@ pub fn external_join(
                 compression,
                 direct_io,
                 overrides,
+                host,
             )
             .map_err(|e| e.to_string())
         });
@@ -1216,7 +1103,10 @@ pub fn external_join(
                 (s.straddler_encode_ns / 1_000_000) as i64,
             );
         }
-        eprintln!(
+        crate::host::diag!(
+            host.diagnostics,
+            Developer,
+            "altw.external.coord_payloads",
             "[coord_payloads] streaming router {} way blobs ({} worker / {} straddler / {} empty), \
              {} MB in worker tmps + {} KB straddler bytes in RAM",
             router.num_blobs(),

@@ -75,8 +75,8 @@ struct WalkedFile {
 /// Walk a PBF file's blob headers via the shared `HeaderWalker` primitive,
 /// collecting per-kind `BlobDesc` lists. Requires each OsmData blob to
 /// carry indexdata; returns an error if any OsmData blob lacks it.
-fn walk_file(path: &Path) -> Result<WalkedFile> {
-    let mut walker = HeaderWalker::open(path)?;
+fn walk_file(path: &Path, host: &crate::host::Host) -> Result<WalkedFile> {
+    let mut walker = HeaderWalker::open(path, &host.diagnostics)?;
     let mut nodes: Vec<BlobDesc> = Vec::new();
     let mut ways: Vec<BlobDesc> = Vec::new();
     let mut rels: Vec<BlobDesc> = Vec::new();
@@ -683,6 +683,7 @@ fn emit_modified(
 /// cases; drops the v1 byte-equal fast path (always zero fires on
 /// `diff-snapshots`, where this path is intended to be used).
 #[allow(clippy::too_many_lines)] // phase-orchestrator over 3 element kinds
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn diff_block_pair_parallel(
     old_path: &Path,
     new_path: &Path,
@@ -691,12 +692,13 @@ pub(crate) fn diff_block_pair_parallel(
     _direct_io: bool,
     filter: &TypeFilter,
     shard_count: usize,
+    host: &crate::host::Host,
 ) -> Result<DiffStats> {
     // DIFF_SCAN_START/END and diff_common/created/modified/deleted counters
     // are emitted by the calling `diff()` function in `mod.rs`; do not
     // re-emit here.
-    let old = walk_file(old_path)?;
-    let new = walk_file(new_path)?;
+    let old = walk_file(old_path, host)?;
+    let new = walk_file(new_path, host)?;
 
     // Scratch temp files live alongside the old input (its parent is assumed
     // to be on a writable, fast filesystem; this is the same assumption the

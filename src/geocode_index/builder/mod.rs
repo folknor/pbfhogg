@@ -141,13 +141,13 @@ pub struct BuildStats {
 ///   implementation works for regional extracts (Denmark, Germany, etc.).
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 #[hotpath::measure]
-pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
+pub fn build_geocode_index(config: &BuildConfig, host: &crate::host::Host) -> Result<BuildStats> {
     config.validate()?;
     // Pass 2a pread worker pool: PrimitiveBlock Vec<u8>s allocated on
     // decode workers and freed on the main-thread merge path. Uncapped,
     // arenas grow to 25+ GB anon RSS at planet scale (documented
     // rationale for the previous sequential-Pass-2 choice).
-    crate::debug::cap_malloc_arenas();
+    host.process.cross_thread_alloc_pool();
 
     let start_time = std::time::Instant::now();
 
@@ -170,10 +170,11 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         config.force,
         "input PBF has no blob-level indexdata. Without indexdata, \
          every blob must be decompressed (significantly slower).",
+        host,
     )?;
 
     // Read PBF header
-    let reader = ElementReader::open(&config.input_path, config.direct_io)?;
+    let reader = ElementReader::open_in(&config.input_path, config.direct_io, host)?;
     let pbf_header = reader.header();
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     let repl_seq = pbf_header
@@ -190,13 +191,24 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     // (Runs first so we know which way IDs to collect in pass 3.)
     // -----------------------------------------------------------------------
     crate::debug::emit_marker("GEOCODE_PASS1_START");
-    eprintln!("Pass 1: Relations...");
+    crate::host::diag!(
+        host.diagnostics,
+        Progress,
+        "geocode.pass1",
+        "Pass 1: Relations..."
+    );
     #[cfg(feature = "hotpath")]
     let pass1_start = std::time::Instant::now();
 
     let (admin_relations, needed_admin_ways) =
-        pass1::run_pass1(&config.input_path, config.direct_io, &mut strings)?;
-    eprintln!("  {} admin relations", admin_relations.len());
+        pass1::run_pass1(&config.input_path, config.direct_io, &mut strings, host)?;
+    crate::host::diag!(
+        host.diagnostics,
+        Progress,
+        "geocode.pass1.admin_relations",
+        "  {} admin relations",
+        admin_relations.len()
+    );
 
     #[cfg(feature = "hotpath")]
     let pass1_ms = pass1_start.elapsed().as_millis();
@@ -223,14 +235,24 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     // -----------------------------------------------------------------------
     crate::debug::emit_marker("GEOCODE_SCHEDULES_START");
     let (node_schedule, way_schedule, max_node_id, shared_file) =
-        pass1_5::build_pass2_schedules(&config.input_path)?;
+        pass1_5::build_pass2_schedules(&config.input_path, host)?;
     crate::debug::emit_marker("GEOCODE_SCHEDULES_END");
 
     crate::debug::emit_marker("GEOCODE_PASS1_5_START");
-    eprintln!("Pass 1.5: Referenced node collection...");
+    crate::host::diag!(
+        host.diagnostics,
+        Progress,
+        "geocode.pass1_5",
+        "Pass 1.5: Referenced node collection..."
+    );
 
-    let referenced_nodes =
-        pass1_5::run_pass1_5(&way_schedule, max_node_id, &shared_file, &needed_admin_ways)?;
+    let referenced_nodes = pass1_5::run_pass1_5(
+        &way_schedule,
+        max_node_id,
+        &shared_file,
+        &needed_admin_ways,
+        host,
+    )?;
     crate::debug::emit_marker("GEOCODE_PASS1_5_END");
 
     // -----------------------------------------------------------------------
@@ -242,7 +264,12 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     // ways (streets, buildings, interpolation, admin geometry).
     // -----------------------------------------------------------------------
     crate::debug::emit_marker("GEOCODE_PASS2_START");
-    eprintln!("Pass 2: Nodes + Ways...");
+    crate::host::diag!(
+        host.diagnostics,
+        Progress,
+        "geocode.pass2",
+        "Pass 2: Nodes + Ways..."
+    );
     #[cfg(feature = "hotpath")]
     let pass2_start = std::time::Instant::now();
 
@@ -292,6 +319,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         needed_admin_ways,
         referenced_nodes,
         &mut strings,
+        host,
     )?;
     drop(node_schedule);
     drop(way_schedule);
@@ -303,8 +331,19 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let (admin_polygons, dropped_admin_relations) =
         admin::assemble_admin_polygons(&admin_relations, &way_geom, config);
     drop(way_geom);
-    eprintln!("  {} admin polygons assembled", admin_polygons.len());
-    eprintln!("  {dropped_admin_relations} admin relations dropped");
+    crate::host::diag!(
+        host.diagnostics,
+        Progress,
+        "geocode.pass2.admin_polygons",
+        "  {} admin polygons assembled",
+        admin_polygons.len()
+    );
+    crate::host::diag!(
+        host.diagnostics,
+        Progress,
+        "geocode.pass2.admin_dropped",
+        "  {dropped_admin_relations} admin relations dropped"
+    );
     crate::debug::emit_marker("GEOCODE_PASS2_ADMIN_ASSEMBLY_END");
     // Deliberately a conjunction, not a disjunction. An admin-only index (a
     // boundaries extract with no addressable content) and an
@@ -334,7 +373,10 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         &strings,
         config.street_level,
     );
-    eprintln!(
+    crate::host::diag!(
+        host.diagnostics,
+        Progress,
+        "geocode.pass2.interp_resolved",
         "  {resolved}/{} interpolation ways resolved",
         interp_ways.len()
     );
@@ -374,7 +416,12 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     // partition into 256 buckets by top 8 bits of cell_id. Write tagged
     // entries to temp bucket files, then process one bucket at a time.
     // -----------------------------------------------------------------------
-    eprintln!("Pass 3: S2 cells + write (bucketed)...");
+    crate::host::diag!(
+        host.diagnostics,
+        Progress,
+        "geocode.pass3",
+        "Pass 3: S2 cells + write (bucketed)..."
+    );
     #[cfg(feature = "hotpath")]
     let pass4_start = std::time::Instant::now();
 
@@ -419,7 +466,12 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let admin_count = admin::write_admin_index(&config.output_dir, &mut { admin_cell_entries })?;
     crate::debug::emit_marker("GEOCODE_PASS3_ADMIN_INDEX_END");
 
-    eprintln!("  {fine_count} fine cells, {coarse_count} coarse cells, {admin_count} admin cells");
+    crate::host::diag!(
+        host.diagnostics,
+        Progress,
+        "geocode.pass3.cells",
+        "  {fine_count} fine cells, {coarse_count} coarse cells, {admin_count} admin cells"
+    );
 
     // Write header
     #[allow(clippy::cast_possible_truncation)]
@@ -446,7 +498,12 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     // Build-time smoke test
     #[cfg(feature = "geocode-reader")]
     {
-        eprintln!("  Running smoke test...");
+        crate::host::diag!(
+            host.diagnostics,
+            Progress,
+            "geocode.smoke_test",
+            "  Running smoke test..."
+        );
         let test_reader = super::reader::Reader::open(&config.output_dir)?;
         if addr_point_count > 0 {
             let result = test_reader.query(
@@ -454,7 +511,12 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
                 first_addr_lon_e7 as f64 * 1e-7,
             )?;
             if result.address.is_none() && result.street.is_none() {
-                eprintln!("  WARNING: smoke test query returned no address or street match");
+                crate::host::diag!(
+                    host.diagnostics,
+                    Warning,
+                    "geocode.smoke_test.no_match",
+                    "  WARNING: smoke test query returned no address or street match"
+                );
             }
         }
     }
@@ -463,19 +525,73 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let pass4_ms = pass4_start.elapsed().as_millis();
 
     let elapsed = start_time.elapsed();
-    eprintln!("Done in {:.1}s", elapsed.as_secs_f64());
+    crate::host::diag!(
+        host.diagnostics,
+        Progress,
+        "geocode.done",
+        "Done in {:.1}s",
+        elapsed.as_secs_f64()
+    );
 
     #[cfg(feature = "hotpath")]
     {
-        eprintln!("pass1_relations_ms={pass1_ms}");
-        eprintln!("pass2_nodes_ways_ms={pass2_ms}");
-        eprintln!("pass3_cells_ms={pass4_ms}");
-        eprintln!("addr_points={addr_point_count}");
-        eprintln!("street_ways={street_way_count}");
-        eprintln!("interp_ways={interp_way_count}");
-        eprintln!("admin_polygons={}", admin_polygons.len());
-        eprintln!("strings_bytes={}", strings.data.len());
-        eprintln!("strings_unique={}", strings.index.len());
+        crate::host::diag!(
+            host.diagnostics,
+            Developer,
+            "geocode.hotpath.pass1_relations_ms",
+            "pass1_relations_ms={pass1_ms}"
+        );
+        crate::host::diag!(
+            host.diagnostics,
+            Developer,
+            "geocode.hotpath.pass2_nodes_ways_ms",
+            "pass2_nodes_ways_ms={pass2_ms}"
+        );
+        crate::host::diag!(
+            host.diagnostics,
+            Developer,
+            "geocode.hotpath.pass3_cells_ms",
+            "pass3_cells_ms={pass4_ms}"
+        );
+        crate::host::diag!(
+            host.diagnostics,
+            Developer,
+            "geocode.hotpath.addr_points",
+            "addr_points={addr_point_count}"
+        );
+        crate::host::diag!(
+            host.diagnostics,
+            Developer,
+            "geocode.hotpath.street_ways",
+            "street_ways={street_way_count}"
+        );
+        crate::host::diag!(
+            host.diagnostics,
+            Developer,
+            "geocode.hotpath.interp_ways",
+            "interp_ways={interp_way_count}"
+        );
+        crate::host::diag!(
+            host.diagnostics,
+            Developer,
+            "geocode.hotpath.admin_polygons",
+            "admin_polygons={}",
+            admin_polygons.len()
+        );
+        crate::host::diag!(
+            host.diagnostics,
+            Developer,
+            "geocode.hotpath.strings_bytes",
+            "strings_bytes={}",
+            strings.data.len()
+        );
+        crate::host::diag!(
+            host.diagnostics,
+            Developer,
+            "geocode.hotpath.strings_unique",
+            "strings_unique={}",
+            strings.index.len()
+        );
     }
     crate::debug::emit_marker("GEOCODE_PASS3_END");
 

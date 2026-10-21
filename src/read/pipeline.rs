@@ -463,6 +463,7 @@ pub(crate) fn run_pipeline<R, F>(
     decode_thread_count: Option<usize>,
     pipeline_config: PipelineConfig,
     blob_filter: Option<BlobFilter>,
+    resources: Option<crate::host::ResourcesHandle>,
     mut block_fn: F,
 ) -> Result<()>
 where
@@ -525,11 +526,15 @@ where
         // thread will block forever on a full channel.
         scope.spawn(move || {
             let decode_threads = decode_thread_count.unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get().saturating_sub(2).max(1))
-                    // If available_parallelism() is unsupported (e.g. some WASM runtimes),
-                    // fall back to 4 threads as a reasonable default for most desktops.
-                    .unwrap_or(4)
+                crate::host::sized_workers(
+                    resources.as_ref().map_or(
+                        &crate::host::MachineProbe as &dyn crate::host::Resources,
+                        |r| &*r.0,
+                    ),
+                    2,
+                    1,
+                    4,
+                )
             });
             let decode_pool = match rayon::ThreadPoolBuilder::new()
                 .num_threads(decode_threads)
@@ -617,6 +622,7 @@ pub(crate) fn run_pipeline_fused<R, T, X, F>(
     decode_thread_count: Option<usize>,
     pipeline_config: PipelineConfig,
     blob_filter: Option<BlobFilter>,
+    resources: Option<crate::host::ResourcesHandle>,
     transform: &X,
     mut consume: F,
 ) -> Result<()>
@@ -652,9 +658,7 @@ where
         let dispatch_tx = decoded_tx.clone();
         scope.spawn(move || {
             let threads = decode_thread_count.unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get().saturating_sub(2).max(1))
-                    .unwrap_or(4)
+                crate::host::sized_workers(resources.as_ref().map_or(&crate::host::MachineProbe as &dyn crate::host::Resources, |r| &*r.0), 2, 1, 4)
             });
             let pool = match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
                 Ok(pool) => pool,

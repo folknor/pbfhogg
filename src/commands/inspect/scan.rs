@@ -44,14 +44,24 @@ pub struct InspectOptions {
 }
 
 #[hotpath::measure]
-pub fn inspect(path: &Path, opts: &InspectOptions) -> Result<InspectReport> {
+pub fn inspect(
+    path: &Path,
+    opts: &InspectOptions,
+    host: &crate::host::Host,
+) -> Result<InspectReport> {
+    let _ = host;
     // Index-only fast path: skip decompression when all blobs have indexdata.
     // --locations and --extended require per-element data, so they need full decode.
     if !opts.show_locations
         && !opts.extended
         && !opts.distrust_metadata
-        && let Some(report) =
-            try_index_only_scan(path, opts.show_blocks, opts.show_id_ranges, opts.direct_io)?
+        && let Some(report) = try_index_only_scan(
+            path,
+            opts.show_blocks,
+            opts.show_id_ranges,
+            opts.direct_io,
+            host,
+        )?
     {
         return Ok(report);
     }
@@ -63,6 +73,7 @@ pub fn inspect(path: &Path, opts: &InspectOptions) -> Result<InspectReport> {
         opts.show_locations,
         opts.extended,
         opts.direct_io,
+        host,
     )
 }
 
@@ -89,9 +100,13 @@ fn try_index_only_scan(
     show_blocks: bool,
     show_id_ranges: bool,
     direct_io: bool,
+    host: &crate::host::Host,
 ) -> Result<Option<InspectReport>> {
     if direct_io {
-        eprintln!(
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "inspect.direct_io_ignored",
             "[inspect] --direct-io not used on the index-only fast path; \
              HeaderWalker avoids page-cache pollution via \
              posix_fadvise(POSIX_FADV_RANDOM). If any blob lacks indexdata \
@@ -104,7 +119,7 @@ fn try_index_only_scan(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
 
-    let mut walker = HeaderWalker::open(path)?;
+    let mut walker = HeaderWalker::open(path, &host.diagnostics)?;
     let mut header_meta = HeaderMeta::default();
     let mut data_buf: Vec<u8> = Vec::new();
 
@@ -248,6 +263,7 @@ fn full_decode_scan(
     show_locations: bool,
     extended: bool,
     direct_io: bool,
+    host: &crate::host::Host,
 ) -> Result<InspectReport> {
     let meta = std::fs::metadata(path)?;
     let file_name = path
@@ -270,7 +286,7 @@ fn full_decode_scan(
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
-    while let Some(frame) = read_raw_frame(&mut reader, &mut offset)? {
+    while let Some(frame) = read_raw_frame(&mut reader, &mut offset, &host.diagnostics)? {
         match frame.blob_type {
             BlobKind::OsmHeader => {
                 let header = decode_blob_to_headerblock(frame.blob_bytes())?;

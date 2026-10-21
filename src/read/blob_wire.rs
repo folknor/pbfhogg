@@ -26,6 +26,7 @@ pub(crate) enum BlobKind {
 pub(crate) struct WireBlobHeader {
     pub blob_type: BlobKind,
     pub datasize: i32,
+    pub unrecognised_indexdata_len: Option<usize>,
     /// Blob-level index: 42 bytes (v2) or 26 bytes (v1, zero-padded), stored inline.
     pub indexdata: Option<[u8; crate::blob_meta::INDEX_SIZE]>,
     /// Whether field 2 was present and non-empty on the wire, *regardless* of
@@ -43,32 +44,6 @@ pub(crate) struct WireBlobHeader {
     pub tagdata: Option<Box<[u8]>>,
     /// Per-blob way-member bitmap (BlobHeader field 5). Variable-length.
     pub waymembers: Option<Box<[u8]>>,
-}
-
-/// Warn once per process about a `BlobHeader.indexdata` of an unrecognised
-/// length.
-///
-/// A length that is neither 26 (v1) nor 42 (v2) is dropped and the blob then
-/// reads as "no index", which every consumer treats as "cannot pre-filter this
-/// blob" and conservatively passes through. That is the safe direction, so it
-/// is not worth failing the whole file over an advisory index - especially as
-/// `indexdata` is an optional field a third-party writer is free to use for
-/// something else. It was, however, completely invisible: a systematically
-/// corrupt index silently degraded every filtered read to a full decode with no
-/// way to tell from the outside. One line on stderr is the difference between a
-/// mystery and a diagnosis.
-///
-/// Warning once rather than per blob is deliberate: planet has ~2.5 M blobs,
-/// and a per-blob warning would be worse than silence.
-fn warn_unrecognised_indexdata(len: usize) {
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    WARNED.call_once(|| {
-        eprintln!(
-            "warning: BlobHeader.indexdata has an unrecognised length ({len} bytes; \
-             expected 26 or 42) - blob index ignored, reads fall back to full decode. \
-             Further occurrences are not reported."
-        );
-    });
 }
 
 impl WireBlobHeader {
@@ -94,6 +69,7 @@ impl WireBlobHeader {
         let mut datasize: i32 = 0;
         let mut indexdata: Option<[u8; crate::blob_meta::INDEX_SIZE]> = None;
         let mut indexdata_present = false;
+        let mut unrecognised_indexdata_len = None;
         let mut tagdata: Option<Box<[u8]>> = None;
         let mut waymembers: Option<Box<[u8]>> = None;
 
@@ -121,7 +97,7 @@ impl WireBlobHeader {
                         buf[..len].copy_from_slice(bytes);
                         indexdata = Some(buf);
                     } else if len != 0 {
-                        warn_unrecognised_indexdata(len);
+                        unrecognised_indexdata_len = Some(len);
                     }
                 }
                 3 => {
@@ -163,6 +139,7 @@ impl WireBlobHeader {
             datasize,
             indexdata,
             indexdata_present,
+            unrecognised_indexdata_len,
             tagdata,
             waymembers,
         })
@@ -365,6 +342,7 @@ pub const MAX_BLOB_DATASIZE: u64 = MAX_BLOB_MESSAGE_SIZE;
 #[allow(clippy::type_complexity)]
 pub(crate) fn parse_blob_header_with_index(
     header_bytes: &[u8],
+    diagnostics: &crate::host::Diagnostics,
 ) -> Result<(
     BlobKind,
     usize,
@@ -373,6 +351,17 @@ pub(crate) fn parse_blob_header_with_index(
     Option<Box<[u8]>>,
 )> {
     let header = WireBlobHeader::parse(header_bytes, true, true, false)?;
+    if let Some(len) = header.unrecognised_indexdata_len {
+        crate::host::diag_once!(
+            diagnostics,
+            Warning,
+            "indexdata.unrecognised_length",
+            "warning: BlobHeader.indexdata has an unrecognised length ({len} bytes; \
+             expected 26 or 42) - blob index ignored, reads fall back to full decode. \
+             Further occurrences are not reported."
+        );
+    }
+
     if header.datasize < 0 {
         return Err(new_blob_error(BlobError::InvalidDataSize {
             size: header.datasize,
@@ -451,13 +440,19 @@ mod tests {
     fn datasize_at_or_over_cap_is_rejected() {
         // One below the cap: accepted, size flows through unchanged.
         let max_legal = MAX_BLOB_DATASIZE - 1;
-        let (_, data_size, _, _, _) =
-            parse_blob_header_with_index(&header_with_datasize(max_legal)).unwrap();
+        let (_, data_size, _, _, _) = parse_blob_header_with_index(
+            &header_with_datasize(max_legal),
+            &crate::host::Diagnostics::discard(),
+        )
+        .unwrap();
         assert_eq!(data_size as u64, max_legal);
 
         // Exactly at the cap: rejected.
-        let err =
-            parse_blob_header_with_index(&header_with_datasize(MAX_BLOB_DATASIZE)).unwrap_err();
+        let err = parse_blob_header_with_index(
+            &header_with_datasize(MAX_BLOB_DATASIZE),
+            &crate::host::Diagnostics::discard(),
+        )
+        .unwrap_err();
         match err.into_kind() {
             ErrorKind::Blob(BlobError::DataSizeTooBig { size }) => {
                 assert_eq!(size, MAX_BLOB_DATASIZE);
@@ -468,7 +463,11 @@ mod tests {
         // Comfortably over the cap: also rejected, and the surfaced size is the
         // declared value verbatim (the guard is `>=`, not `==`).
         let over = MAX_BLOB_DATASIZE + 4096;
-        let err = parse_blob_header_with_index(&header_with_datasize(over)).unwrap_err();
+        let err = parse_blob_header_with_index(
+            &header_with_datasize(over),
+            &crate::host::Diagnostics::discard(),
+        )
+        .unwrap_err();
         match err.into_kind() {
             ErrorKind::Blob(BlobError::DataSizeTooBig { size }) => {
                 assert_eq!(size, over);
@@ -481,8 +480,11 @@ mod tests {
     /// cap, so well-formed blobs parse exactly as before.
     #[test]
     fn small_datasize_parses_normally() {
-        let (blob_type, data_size, _, _, _) =
-            parse_blob_header_with_index(&header_with_datasize(1234)).unwrap();
+        let (blob_type, data_size, _, _, _) = parse_blob_header_with_index(
+            &header_with_datasize(1234),
+            &crate::host::Diagnostics::discard(),
+        )
+        .unwrap();
         assert_eq!(blob_type, BlobKind::OsmData);
         assert_eq!(data_size, 1234);
     }
@@ -506,7 +508,8 @@ mod tests {
         // Field 3 (datasize) = 100, and nothing else. A structurally valid
         // protobuf message that is not a valid frame descriptor.
         let no_type = vec![0x18, 100];
-        let err = parse_blob_header_with_index(&no_type).unwrap_err();
+        let err = parse_blob_header_with_index(&no_type, &crate::host::Diagnostics::discard())
+            .unwrap_err();
         assert!(
             matches!(err.into_kind(), ErrorKind::WireFormat { .. }),
             "a typeless BlobHeader must be a wire-format error"
@@ -514,17 +517,19 @@ mod tests {
 
         // An empty type string is the same defect spelled differently.
         let empty_type = vec![0x0A, 0x00, 0x18, 100];
-        parse_blob_header_with_index(&empty_type)
+        parse_blob_header_with_index(&empty_type, &crate::host::Diagnostics::discard())
             .expect_err("an empty type string must be rejected too");
 
         // A completely empty header - what a zero-length frame decodes to.
-        parse_blob_header_with_index(&[]).expect_err("an empty header must be rejected");
+        parse_blob_header_with_index(&[], &crate::host::Diagnostics::discard())
+            .expect_err("an empty header must be rejected");
 
         // An unrecognised but non-empty type still parses, so the check has not
         // cost the format its forward compatibility.
         let future_type = vec![0x0A, 0x06, b'O', b'S', b'M', b'F', b'o', b'o', 0x18, 100];
-        let (blob_type, data_size, _, _, _) = parse_blob_header_with_index(&future_type)
-            .expect("an unknown but named blob type must still parse");
+        let (blob_type, data_size, _, _, _) =
+            parse_blob_header_with_index(&future_type, &crate::host::Diagnostics::discard())
+                .expect("an unknown but named blob type must still parse");
         assert_eq!(blob_type, BlobKind::Unknown("OSMFoo".to_string()));
         assert_eq!(data_size, 100);
     }

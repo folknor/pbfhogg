@@ -248,6 +248,7 @@ pub fn node_stats(
     direct_io: bool,
     force: bool,
     jobs: usize,
+    host: &crate::host::Host,
 ) -> Result<NodeStatsReport> {
     require_indexdata(
         path,
@@ -255,6 +256,7 @@ pub fn node_stats(
         force,
         "input PBF has no blob-level indexdata. Without indexdata, the node-only \
          filter is a no-op - all blobs are decompressed (significantly slower).",
+        host,
     )?;
 
     crate::debug::emit_marker("NODESTATS_START");
@@ -262,6 +264,7 @@ pub fn node_stats(
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         path,
         Some(crate::blob_meta::ElemKind::Node),
+        &host.diagnostics,
     )?;
 
     // `jobs == 0` means auto; `parallel_classify_accumulate` interprets
@@ -336,6 +339,7 @@ pub fn node_stats(
             global.lon_stats.total_blocks += worker.lon_stats.total_blocks;
             global.lon_stats.total_bits_weighted += worker.lon_stats.total_bits_weighted;
         },
+        &*host.resources,
     )?;
 
     if global.node_count == 0 {

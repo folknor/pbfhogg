@@ -302,11 +302,15 @@ fn violation_to_json(v: &IdViolation) -> serde_json::Value {
 /// for `set_atomic_if_new` (workers panic on unallocated chunks). Total
 /// full-mode RSS at planet: ~1.8 GB.
 #[hotpath::measure]
-pub fn verify_ids(path: &Path, opts: &VerifyIdsOptions) -> Result<VerifyIdsReport> {
+pub fn verify_ids(
+    path: &Path,
+    opts: &VerifyIdsOptions,
+    host: &crate::host::Host,
+) -> Result<VerifyIdsReport> {
     if opts.full {
-        return verify_ids_full_parallel(path, opts);
+        return verify_ids_full_parallel(path, opts, host);
     }
-    verify_ids_streaming_parallel(path, opts)
+    verify_ids_streaming_parallel(path, opts, host)
 }
 
 // ---------------------------------------------------------------------------
@@ -329,9 +333,12 @@ pub fn verify_ids(path: &Path, opts: &VerifyIdsOptions) -> Result<VerifyIdsRepor
 /// the transform commands get) because `check` is a validation command with no
 /// `--force`: refusing would make it impossible to validate exactly the
 /// third-party files most in need of validating.
-fn warn_unindexed_triple_scan(indexed: bool) {
+fn warn_unindexed_triple_scan(indexed: bool, host: &crate::host::Host) {
     if !indexed {
-        eprintln!(
+        crate::host::diag!(
+            host.diagnostics,
+            Warning,
+            "check.ids.unindexed_triple_scan",
             "warning: input has no blob-level indexdata, so every blob is \
              decompressed three times - once per element kind, because an \
              unindexed blob has to be scheduled as all three. Generate an \
@@ -341,7 +348,11 @@ fn warn_unindexed_triple_scan(indexed: bool) {
     }
 }
 
-fn verify_ids_streaming_parallel(path: &Path, opts: &VerifyIdsOptions) -> Result<VerifyIdsReport> {
+fn verify_ids_streaming_parallel(
+    path: &Path,
+    opts: &VerifyIdsOptions,
+    host: &crate::host::Host,
+) -> Result<VerifyIdsReport> {
     use crate::Element;
 
     crate::debug::emit_marker("VERIFYIDS_SCAN_START");
@@ -351,18 +362,18 @@ fn verify_ids_streaming_parallel(path: &Path, opts: &VerifyIdsOptions) -> Result
     // Vec), so the contention cost measured on the pre-migration
     // time-filter snapshot path (allocation-heavy BlockBuilder scratch
     // reused across blobs) doesn't apply here.
-    crate::debug::cap_malloc_arenas();
+    host.process.cross_thread_alloc_pool();
 
-    let header_sorted = ElementReader::open(path, opts.direct_io)?
+    let header_sorted = ElementReader::open_in(path, opts.direct_io, host)?
         .header()
         .is_sorted();
-    let indexed = crate::commands::has_indexdata(path, opts.direct_io)?;
-    warn_unindexed_triple_scan(indexed);
+    let indexed = crate::commands::has_indexdata(path, opts.direct_io, &host.diagnostics)?;
+    warn_unindexed_triple_scan(indexed, host);
 
     let type_filter = TypeFilter::or_all(opts.type_filter);
 
     let (node_schedule, way_schedule, rel_schedule, shared_file, _max_ids) =
-        crate::scan::classify::build_classify_schedules_split(path)?;
+        crate::scan::classify::build_classify_schedules_split(path, &host.diagnostics)?;
 
     let mut node_count: u64 = 0;
     let mut way_count: u64 = 0;
@@ -396,6 +407,7 @@ fn verify_ids_streaming_parallel(path: &Path, opts: &VerifyIdsOptions) -> Result
                 Element::Node(n) => Some(n.id()),
                 _ => None,
             },
+            host,
         )?;
         node_count = count;
         total_violations += phase_total;
@@ -414,6 +426,7 @@ fn verify_ids_streaming_parallel(path: &Path, opts: &VerifyIdsOptions) -> Result
                 Element::Way(w) => Some(w.id()),
                 _ => None,
             },
+            host,
         )?;
         way_count = count;
         total_violations += phase_total;
@@ -432,6 +445,7 @@ fn verify_ids_streaming_parallel(path: &Path, opts: &VerifyIdsOptions) -> Result
                 Element::Relation(r) => Some(r.id()),
                 _ => None,
             },
+            host,
         )?;
         relation_count = count;
         total_violations += phase_total;
@@ -464,6 +478,7 @@ fn verify_single_kind_streaming(
     elem_type: &'static str,
     max_errors_remaining: usize,
     extract_id: impl Fn(&crate::Element) -> Option<i64> + Send + Sync,
+    host: &crate::host::Host,
 ) -> Result<(u64, Vec<IdViolation>, u64)> {
     if schedule.is_empty() {
         return Ok((0, Vec::new(), 0));
@@ -504,6 +519,7 @@ fn verify_single_kind_streaming(
         |seq, r| {
             per_blob[seq] = Some(r);
         },
+        &*host.resources,
     )?;
 
     // Serial merge in schedule (= file) order. duplicate_ids is always
@@ -586,27 +602,31 @@ impl BlobVerifyResult {
 /// per-kind duplicates), so phase ordering is purely for phase-wall
 /// attribution in the sidecar.
 #[allow(clippy::too_many_lines)]
-fn verify_ids_full_parallel(path: &Path, opts: &VerifyIdsOptions) -> Result<VerifyIdsReport> {
+fn verify_ids_full_parallel(
+    path: &Path,
+    opts: &VerifyIdsOptions,
+    host: &crate::host::Host,
+) -> Result<VerifyIdsReport> {
     use crate::Element;
 
     crate::debug::emit_marker("VERIFYIDS_SCAN_START");
 
     // Pread worker pool; same motivation as check_refs step #2.
-    crate::debug::cap_malloc_arenas();
+    host.process.cross_thread_alloc_pool();
 
     // Cheap: ElementReader::open reads the header and stops. Drop it
     // immediately; parallel_classify_phase reopens the file internally via
     // the shared_file from build_classify_schedules_split.
-    let header_sorted = ElementReader::open(path, opts.direct_io)?
+    let header_sorted = ElementReader::open_in(path, opts.direct_io, host)?
         .header()
         .is_sorted();
-    let indexed = crate::commands::has_indexdata(path, opts.direct_io)?;
-    warn_unindexed_triple_scan(indexed);
+    let indexed = crate::commands::has_indexdata(path, opts.direct_io, &host.diagnostics)?;
+    warn_unindexed_triple_scan(indexed, host);
 
     let type_filter = TypeFilter::or_all(opts.type_filter);
 
     let (node_schedule, way_schedule, rel_schedule, shared_file, max_ids) =
-        crate::scan::classify::build_classify_schedules_split(path)?;
+        crate::scan::classify::build_classify_schedules_split(path, &host.diagnostics)?;
 
     // Pre-allocate IdSets for the kinds we intend to verify, sized from the
     // file's own indexdata and floored at the live OSM ID space. The floors
@@ -698,6 +718,7 @@ fn verify_ids_full_parallel(path: &Path, opts: &VerifyIdsOptions) -> Result<Veri
                 Element::Node(n) => Some(n.id()),
                 _ => None,
             },
+            host,
         )?;
         node_count = count;
         total_violations += phase_total;
@@ -719,6 +740,7 @@ fn verify_ids_full_parallel(path: &Path, opts: &VerifyIdsOptions) -> Result<Veri
                 Element::Way(w) => Some(w.id()),
                 _ => None,
             },
+            host,
         )?;
         way_count = count;
         total_violations += phase_total;
@@ -740,6 +762,7 @@ fn verify_ids_full_parallel(path: &Path, opts: &VerifyIdsOptions) -> Result<Veri
                 Element::Relation(r) => Some(r.id()),
                 _ => None,
             },
+            host,
         )?;
         relation_count = count;
         total_violations += phase_total;
@@ -774,6 +797,7 @@ fn verify_single_kind_parallel(
     elem_type: &'static str,
     max_errors_remaining: usize,
     extract_id: impl Fn(&crate::Element) -> Option<i64> + Send + Sync,
+    host: &crate::host::Host,
 ) -> Result<(u64, Vec<IdViolation>, u64)> {
     if schedule.is_empty() {
         return Ok((0, Vec::new(), 0));
@@ -825,6 +849,7 @@ fn verify_single_kind_parallel(
         |seq, r| {
             per_blob[seq] = Some(r);
         },
+        &*host.resources,
     )?;
 
     // Serial merge in schedule (= file) order.

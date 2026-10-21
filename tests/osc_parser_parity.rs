@@ -62,21 +62,40 @@ fn overlay_verdict(input: &Path) -> Verdict {
 }
 
 fn merge_verdict(input: &Path, out: &Path) -> Verdict {
-    pbfhogg::commands::merge_changes::merge_changes(&[input], out, false, Some(1), false)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    pbfhogg::commands::merge_changes::merge_changes(
+        &[input],
+        out,
+        false,
+        Some(1),
+        false,
+        &crate::common::test_host(),
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
 }
 
 fn simplify_verdict(input: &Path, out: &Path) -> Verdict {
-    pbfhogg::commands::merge_changes::merge_changes(&[input], out, true, Some(1), false)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    pbfhogg::commands::merge_changes::merge_changes(
+        &[input],
+        out,
+        true,
+        Some(1),
+        false,
+        &crate::common::test_host(),
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
 }
 
 fn tags_filter_verdict(input: &Path, out: &Path) -> Verdict {
-    tags_filter_osc(input, out, &["highway=primary".to_string()])
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    tags_filter_osc(
+        input,
+        out,
+        &["highway=primary".to_string()],
+        &crate::common::test_host(),
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
 }
 
 /// Run one input through every consumer. Returns `(name, verdict)` per
@@ -276,10 +295,23 @@ fn every_consumer_agrees_on_metadata_leniency() {
     // "metadata: None on every kept element" was a real bug there, and
     // a verdict-only parity check would have stayed green through it.
     let merge_out = dir.path().join("meta-out.osc");
-    pbfhogg::commands::merge_changes::merge_changes(&[&input], &merge_out, false, Some(1), false)
-        .unwrap();
+    pbfhogg::commands::merge_changes::merge_changes(
+        &[&input],
+        &merge_out,
+        false,
+        Some(1),
+        false,
+        &crate::common::test_host(),
+    )
+    .unwrap();
     let filter_out = dir.path().join("meta-out-filter.osc.gz");
-    tags_filter_osc(&input, &filter_out, &["highway=primary".to_string()]).unwrap();
+    tags_filter_osc(
+        &input,
+        &filter_out,
+        &["highway=primary".to_string()],
+        &crate::common::test_host(),
+    )
+    .unwrap();
     for (name, xml) in [
         (
             "merge-changes",
@@ -366,11 +398,17 @@ fn only_the_overlay_interprets_changeset_uid_and_timestamp() {
             false,
             Some(1),
             false,
+            &crate::common::test_host(),
         )
         .expect("a re-emit path never interprets these, so it has nothing to refuse");
         let filter_out = dir.path().join("verbatim-out-filter.osc.gz");
-        tags_filter_osc(&input, &filter_out, &["highway=primary".to_string()])
-            .expect("tags-filter is the other re-emit path and must agree");
+        tags_filter_osc(
+            &input,
+            &filter_out,
+            &["highway=primary".to_string()],
+            &crate::common::test_host(),
+        )
+        .expect("tags-filter is the other re-emit path and must agree");
         let (name, value) = attrs
             .rsplit_once('=')
             .map(|(head, v)| (head.rsplit(' ').next().unwrap_or(head), v.trim_matches('"')))
@@ -412,10 +450,23 @@ fn re_emit_sinks_escape_user_data_identically() {
     );
 
     let merge_out = dir.path().join("escape-out.osc");
-    pbfhogg::commands::merge_changes::merge_changes(&[&input], &merge_out, false, Some(1), false)
-        .unwrap();
+    pbfhogg::commands::merge_changes::merge_changes(
+        &[&input],
+        &merge_out,
+        false,
+        Some(1),
+        false,
+        &crate::common::test_host(),
+    )
+    .unwrap();
     let filter_out = dir.path().join("escape-out-filter.osc.gz");
-    tags_filter_osc(&input, &filter_out, &["highway=primary".to_string()]).unwrap();
+    tags_filter_osc(
+        &input,
+        &filter_out,
+        &["highway=primary".to_string()],
+        &crate::common::test_host(),
+    )
+    .unwrap();
 
     for (consumer, xml) in [
         (

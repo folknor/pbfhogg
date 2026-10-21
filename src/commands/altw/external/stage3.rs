@@ -98,6 +98,7 @@ pub(super) fn stage3_slot_reorder(
     slot_bucket_count: usize,
     total_slots: u64,
     integrated: &IntegratedInputs<'_>,
+    host: &crate::host::Host,
 ) -> Result<()> {
     // Floor division: every bucket is `range_size` slots wide except
     // the LAST, which extends to `total_slots` and may be wider. This
@@ -112,10 +113,7 @@ pub(super) fn stage3_slot_reorder(
     // + `f93d896` + `eecb46c`). Back off from the pre-streaming `.min(6)`
     // so peak anon RSS doesn't balloon on a 30 GB planet host.
     // Must match the worker tmp file count allocated by mod.rs.
-    let num_workers = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(4)
-        .min(4);
+    let num_workers = crate::host::sized_workers(&*host.resources, 2, 1, 4).min(4);
 
     let next_idx = std::sync::atomic::AtomicUsize::new(0);
     let s3_open_ms = std::sync::atomic::AtomicU64::new(0);

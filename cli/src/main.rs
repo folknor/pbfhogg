@@ -1,3 +1,4 @@
+mod host;
 mod output;
 
 use std::io::Write;
@@ -1200,6 +1201,8 @@ fn combine_expressions(
 
 #[allow(clippy::too_many_lines)]
 fn main() -> process::ExitCode {
+    pbfhogg::debug::enable_marker_fifo_from_env();
+    let host = host::cli_host();
     let _guard = hotpath::HotpathGuardBuilder::new("pbfhogg::main")
         .percentiles(&[50.0, 95.0, 99.0])
         .functions_limit(0)
@@ -1255,7 +1258,7 @@ fn main() -> process::ExitCode {
                         return Err("--clean is not valid with --dedupe".into());
                     }
                     guarded_output(&output.output, |out| {
-                        run_merge_pbf(&files, out, &write, &overrides)
+                        run_merge_pbf(&files, out, &write, &overrides, &host)
                     })
                 } else {
                     if uring.io_uring {
@@ -1269,6 +1272,7 @@ fn main() -> process::ExitCode {
                             &clean_attrs(&clean),
                             &write,
                             &overrides,
+                            &host,
                         )
                     })
                 }
@@ -1290,7 +1294,7 @@ fn main() -> process::ExitCode {
                     force: force.force,
                 };
                 guarded_output(&output.output, |out| {
-                    run_sort(&file, out, &write, &overrides)
+                    run_sort(&file, out, &write, &overrides, &host)
                 })
             }
             Command::Repack {
@@ -1311,7 +1315,7 @@ fn main() -> process::ExitCode {
                     force: force.force,
                 };
                 guarded_output(&output.output, |out| {
-                    run_repack(&file, out, elements_per_blob, &write, &overrides)
+                    run_repack(&file, out, elements_per_blob, &write, &overrides, &host)
                 })
             }
             Command::Degrade {
@@ -1360,7 +1364,7 @@ fn main() -> process::ExitCode {
                         .transpose()?,
                 };
                 guarded_output(&output.output, |out| {
-                    run_degrade(&file, out, flags, block_cap, &write, &overrides)
+                    run_degrade(&file, out, flags, block_cap, &write, &overrides, &host)
                 })
             }
             Command::Renumber {
@@ -1379,7 +1383,7 @@ fn main() -> process::ExitCode {
                     force: false,
                 };
                 guarded_output(&output.output, |out| {
-                    run_renumber(&file, out, &start_id, &write, &overrides)
+                    run_renumber(&file, out, &start_id, &write, &overrides, &host)
                 })
             }
             Command::TagsFilter {
@@ -1423,7 +1427,7 @@ fn main() -> process::ExitCode {
                         return Err("-j/--jobs is not valid in OSC mode (OSC parse is single-threaded)".into());
                     }
                     guarded_output(&output.output, |out| {
-                        run_tags_filter_osc(&file, out, expressions_file.as_deref(), &expressions)
+                        run_tags_filter_osc(&file, out, expressions_file.as_deref(), &expressions, &host)
                     })
                 }
                 InputKind::Pbf if omit_referenced && jobs != 0 => {
@@ -1454,7 +1458,7 @@ fn main() -> process::ExitCode {
                             &write,
                             jobs,
                             &overrides,
-                        )
+                         &host)
                     })
                 }
             }
@@ -1479,6 +1483,7 @@ fn main() -> process::ExitCode {
                 properties,
                 bbox.as_deref(),
                 metadata,
+                &host,
             ),
             Command::Diff {
                 old,
@@ -1521,6 +1526,7 @@ fn main() -> process::ExitCode {
                             increment_version,
                             update_timestamp,
                             jobs,
+                            &host,
                         )
                     })
                 }
@@ -1547,9 +1553,19 @@ fn main() -> process::ExitCode {
                                 type_filter,
                                 jobs,
                                 io.direct_io,
+                                &host,
                             )
                         }),
-                        None => run_diff(&old, &new, flags, None, type_filter, jobs, io.direct_io),
+                        None => run_diff(
+                            &old,
+                            &new,
+                            flags,
+                            None,
+                            type_filter,
+                            jobs,
+                            io.direct_io,
+                            &host,
+                        ),
                     }
                 }
             },
@@ -1587,6 +1603,7 @@ fn main() -> process::ExitCode {
                             &ids,
                             &write,
                             &overrides,
+                            &host,
                         )
                     })
                 } else {
@@ -1606,6 +1623,7 @@ fn main() -> process::ExitCode {
                             &ids,
                             &write,
                             &overrides,
+                            &host,
                         )
                     })
                 }
@@ -1642,6 +1660,7 @@ fn main() -> process::ExitCode {
                         &write,
                         &overrides,
                         full_scan_min_blobs,
+                        &host,
                     )
                 })
             }
@@ -1678,6 +1697,7 @@ fn main() -> process::ExitCode {
                         &clean_attrs(&clean),
                         &write,
                         &overrides,
+                        &host,
                     )
                 } else if let Some(output) = output.as_ref() {
                     guarded_output(output, |out| {
@@ -1691,6 +1711,7 @@ fn main() -> process::ExitCode {
                             &clean_attrs(&clean),
                             &write,
                             &overrides,
+                            &host,
                         )
                     })
                 } else {
@@ -1727,7 +1748,7 @@ fn main() -> process::ExitCode {
                     ignore_missing_nodes,
                 };
                 guarded_output(&output.output, |out| {
-                    run_add_locations_to_ways(&file, out, &options, &overrides)
+                    run_add_locations_to_ways(&file, out, &options, &overrides, &host)
                 })
             }
             Command::TimeFilter {
@@ -1746,7 +1767,7 @@ fn main() -> process::ExitCode {
                     force: false,
                 };
                 guarded_output(&output.output, |out| {
-                    run_time_filter(&file, out, &timestamp, &write, &overrides)
+                    run_time_filter(&file, out, &timestamp, &write, &overrides, &host)
                 })
             }
             Command::Inspect {
@@ -1791,11 +1812,12 @@ fn main() -> process::ExitCode {
                         tags_jobs,
                         tags_io.direct_io,
                         tags_force.force,
+                        &host,
                     )
                 } else {
                     let file = file.ok_or("Input PBF file is required")?;
                     if let Some(ref show_id) = show {
-                        return run_show_element(&file, show_id, io.direct_io);
+                        return run_show_element(&file, show_id, io.direct_io, &host);
                     }
                     run_inspect(
                         &file,
@@ -1814,6 +1836,7 @@ fn main() -> process::ExitCode {
                         blocks,
                         get.as_deref(),
                         io.direct_io,
+                        &host,
                     )
                 }
             }
@@ -1851,7 +1874,7 @@ fn main() -> process::ExitCode {
                     panic_at_blob_seq: None,
                 };
                 guarded_output(&output.output, |out| {
-                    run_apply_changes(&base, &changes, out, &opts, &overrides)
+                    run_apply_changes(&base, &changes, out, &opts, &overrides, &host)
                 })
             }
             Command::MergeChanges {
@@ -1861,7 +1884,14 @@ fn main() -> process::ExitCode {
                 allow_version_regression,
                 jobs,
             } => guarded_output(&output.output, |out| {
-                run_merge_changes(&changes, out, simplify, jobs, allow_version_regression)
+                run_merge_changes(
+                    &changes,
+                    out,
+                    simplify,
+                    jobs,
+                    allow_version_regression,
+                    &host,
+                )
             }),
             Command::Check {
                 file,
@@ -1891,6 +1921,7 @@ fn main() -> process::ExitCode {
                 type_filter,
                 max_errors,
                 io.direct_io,
+                &host,
             ),
             Command::BuildGeocodeIndex {
                 file,
@@ -1916,6 +1947,7 @@ fn main() -> process::ExitCode {
                 },
                 io.direct_io,
                 force.force,
+                &host,
             ),
             Command::BenchRead { file, mode } => run_bench_read(&file, mode),
             Command::BenchWrite {
@@ -1929,7 +1961,7 @@ fn main() -> process::ExitCode {
                 output,
                 compression,
                 io_mode,
-            } => run_bench_merge(&base, &changes, &output.output, compression, io_mode),
+            } => run_bench_merge(&base, &changes, &output.output, compression, io_mode, &host),
         }
     })();
 
@@ -1972,6 +2004,7 @@ fn run_build_geocode_index(
     levels: GeocodeLevels,
     direct_io: bool,
     force: bool,
+    host: &pbfhogg::host::Host,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let config = pbfhogg::geocode_index::builder::BuildConfig {
         input_path: file.to_path_buf(),
@@ -1985,7 +2018,7 @@ fn run_build_geocode_index(
         fine_search_radius_m: levels.search_radius,
         coarse_search_radius_m: levels.coarse_search_radius,
     };
-    let stats = pbfhogg::geocode_index::builder::build_geocode_index(&config)?;
+    let stats = pbfhogg::geocode_index::builder::build_geocode_index(&config, host)?;
     eprintln!(
         "Index built: {} addr, {} streets, {} interp, {} admin ({} relations dropped), {} fine cells, {} coarse cells, {} admin cells",
         stats.addr_points,
@@ -2007,6 +2040,7 @@ fn run_check(
     type_filter: Option<TypeFilter>,
     max_errors: usize,
     direct_io: bool,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let CheckFlags {
         ids,
@@ -2065,7 +2099,7 @@ fn run_check(
             max_errors,
             direct_io,
         };
-        let report = pbfhogg::check::verify_ids::verify_ids(path, &opts)?;
+        let report = pbfhogg::check::verify_ids::verify_ids(path, &opts, host)?;
         if !report.passed {
             failed = true;
         }
@@ -2082,6 +2116,7 @@ fn run_check(
                 max_errors,
                 direct_io,
             },
+            host,
         )?;
         if !report.passed() {
             failed = true;
@@ -2092,7 +2127,8 @@ fn run_check(
     };
 
     let refs_result = if run_refs {
-        let result = pbfhogg::check::refs::check_refs(path, check_relations, show_ids, direct_io)?;
+        let result =
+            pbfhogg::check::refs::check_refs(path, check_relations, show_ids, direct_io, host)?;
         if !result.is_valid() {
             failed = true;
         }
@@ -2269,6 +2305,7 @@ fn run_tags_count(
     jobs: usize,
     direct_io: bool,
     force: bool,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let all_expressions = combine_expressions(expressions_file, expressions)?;
     let opts = pbfhogg::tags_count::TagCountOptions {
@@ -2281,7 +2318,7 @@ fn run_tags_count(
         force,
         jobs,
     };
-    let results = pbfhogg::tags_count::tags_count(path, &opts)?;
+    let results = pbfhogg::tags_count::tags_count(path, &opts, host)?;
 
     let mut out = output::buffered();
     for entry in &results {
@@ -2300,6 +2337,7 @@ fn run_cat(
     clean: &CleanAttrs,
     write: &WriteOpts,
     overrides: &HeaderOverrides,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let paths: Vec<&std::path::Path> = files.iter().map(AsRef::as_ref).collect();
     let stats = pbfhogg::cat::cat(
@@ -2311,8 +2349,9 @@ fn run_cat(
         write.direct_io,
         write.force,
         overrides,
+        host,
     )?;
-    stats.print_summary();
+    stats.write_summary(&mut host.diagnostics.summary_writer("cat.summary"))?;
     Ok(())
 }
 
@@ -2321,6 +2360,7 @@ fn run_sort(
     output: &std::path::Path,
     write: &WriteOpts,
     overrides: &HeaderOverrides,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let opts = pbfhogg::sort::SortOptions {
         compression: write.compression,
@@ -2328,8 +2368,8 @@ fn run_sort(
         io_uring: write.io_uring,
         force: write.force,
     };
-    let stats = pbfhogg::sort::sort(file, output, &opts, overrides)?;
-    stats.print_summary();
+    let stats = pbfhogg::sort::sort(file, output, &opts, overrides, host)?;
+    stats.write_summary(&mut host.diagnostics.summary_writer("sort.summary"))?;
     Ok(())
 }
 
@@ -2339,6 +2379,7 @@ fn run_repack(
     elements_per_blob: usize,
     write: &WriteOpts,
     overrides: &HeaderOverrides,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stats = pbfhogg::repack::repack(
         file,
@@ -2349,8 +2390,9 @@ fn run_repack(
         write.io_uring,
         write.force,
         overrides,
+        host,
     )?;
-    stats.print_summary();
+    stats.write_summary(&mut host.diagnostics.summary_writer("repack.summary"))?;
     Ok(())
 }
 
@@ -2361,6 +2403,7 @@ fn run_degrade(
     block_cap: usize,
     write: &WriteOpts,
     overrides: &HeaderOverrides,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stats = pbfhogg::degrade::degrade(
         file,
@@ -2372,8 +2415,9 @@ fn run_degrade(
         write.io_uring,
         write.force,
         overrides,
+        host,
     )?;
-    stats.print_summary();
+    stats.write_summary(&mut host.diagnostics.summary_writer("degrade.summary"))?;
     Ok(())
 }
 
@@ -2383,6 +2427,7 @@ fn run_renumber(
     start_id: &str,
     write: &WriteOpts,
     overrides: &HeaderOverrides,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let parts: Vec<&str> = start_id.split(',').collect();
     let opts =
@@ -2429,8 +2474,9 @@ fn run_renumber(
         write.compression,
         write.direct_io,
         overrides,
+        host,
     )?;
-    stats.print_summary();
+    stats.write_summary(&mut host.diagnostics.summary_writer("renumber.summary"))?;
     Ok(())
 }
 
@@ -2444,6 +2490,7 @@ fn run_tags_filter(
     write: &WriteOpts,
     jobs: usize,
     overrides: &HeaderOverrides,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let TagsFilterFlags {
         omit_referenced,
@@ -2471,8 +2518,8 @@ fn run_tags_filter(
         jobs: if jobs == 0 { None } else { Some(jobs) },
         distrust_metadata,
     };
-    let stats = pbfhogg::tags_filter::tags_filter(file, output, &opts, overrides)?;
-    stats.print_summary();
+    let stats = pbfhogg::tags_filter::tags_filter(file, output, &opts, overrides, host)?;
+    stats.write_summary(&mut host.diagnostics.summary_writer("tags_filter.summary"))?;
     Ok(())
 }
 
@@ -2481,13 +2528,15 @@ fn run_tags_filter_osc(
     output: &std::path::Path,
     expressions_file: Option<&std::path::Path>,
     expressions: &[String],
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let all_expressions = combine_expressions(expressions_file, expressions)?;
     if all_expressions.is_empty() {
         return Err("no filter expressions provided (use positional args or -e FILE)".into());
     }
-    let stats = pbfhogg::tags_filter::osc::tags_filter_osc(changes, output, &all_expressions)?;
-    stats.print_summary();
+    let stats =
+        pbfhogg::tags_filter::osc::tags_filter_osc(changes, output, &all_expressions, host)?;
+    stats.write_summary(&mut host.diagnostics.summary_writer("tags_filter.osc.summary"))?;
     Ok(())
 }
 
@@ -2673,9 +2722,10 @@ fn run_export_to<W: std::io::Write>(
     file: &std::path::Path,
     writer: W,
     options: &pbfhogg::export::ExportOptions,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stats = pbfhogg::export::export(file, writer, options).map_err(export_error)?;
-    stats.print_summary();
+    let stats = pbfhogg::export::export(file, writer, options, host).map_err(export_error)?;
+    stats.write_summary(&mut host.diagnostics.summary_writer("export_to.summary"))?;
     Ok(())
 }
 
@@ -2701,6 +2751,7 @@ fn run_export(
     properties: Option<Vec<String>>,
     bbox: Option<&str>,
     metadata: bool,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let expressions = combine_expressions(expressions_file, expressions)?;
     let format = match format {
@@ -2734,12 +2785,12 @@ fn run_export(
         // truncate or delete a pre-existing file the user named as output.
         let out = pbfhogg::path_guard::OutputFile::new(output)?;
         let file_out = std::fs::File::create(out.path())?;
-        run_export_to(file, std::io::BufWriter::new(file_out), &options)?;
+        run_export_to(file, std::io::BufWriter::new(file_out), &options, host)?;
         out.commit()?;
     } else {
         // `export` flushes its writer when it finishes, so a failed final
         // flush surfaces as an error rather than vanishing in a drop.
-        run_export_to(file, output::buffered(), &options)?;
+        run_export_to(file, output::buffered(), &options, host)?;
     }
     Ok(())
 }
@@ -2750,6 +2801,7 @@ fn resolve_ids(
     default_type: Option<DefaultTypeArg>,
     ids: &[String],
     direct_io: bool,
+    host: &pbfhogg::host::Host,
 ) -> Result<pbfhogg::getid::ElementIds, Box<dyn std::error::Error>> {
     let default_type = default_type.map(|kind| match kind {
         DefaultTypeArg::Node => pbfhogg::getid::DefaultType::Node,
@@ -2765,7 +2817,7 @@ fn resolve_ids(
     }
     // Merge IDs from OSM/PBF file
     if let Some(path) = id_osm_file {
-        let pbf_ids = pbfhogg::getid::parse_ids_from_pbf(path, direct_io)?;
+        let pbf_ids = pbfhogg::getid::parse_ids_from_pbf(path, direct_io, host)?;
         pbfhogg::getid::merge_id_sets(&mut id_set, &pbf_ids);
     }
     if id_set.is_empty() {
@@ -2847,6 +2899,7 @@ fn run_diff(
     type_filter: Option<TypeFilter>,
     jobs: usize,
     direct_io: bool,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let DiffFlags {
         suppress_common,
@@ -2872,11 +2925,11 @@ fn run_diff(
     };
     let stats = if quiet {
         let mut sink = std::io::sink();
-        pbfhogg::diff::diff(old, new, &mut sink, &options, direct_io)?
+        pbfhogg::diff::diff(old, new, &mut sink, &options, direct_io, host)?
     } else if let Some(path) = output_path {
         let file = std::fs::File::create(path)?;
         let mut out = std::io::BufWriter::new(file);
-        let stats = pbfhogg::diff::diff(old, new, &mut out, &options, direct_io)?;
+        let stats = pbfhogg::diff::diff(old, new, &mut out, &options, direct_io, host)?;
         out.flush()?;
         stats
     } else {
@@ -2884,15 +2937,17 @@ fn run_diff(
         // exists, so the run ends with success rather than with the
         // differences status `main` cannot know.
         let mut out = output::buffered();
-        let stats = pbfhogg::diff::diff(old, new, &mut out, &options, direct_io)?;
+        let stats = pbfhogg::diff::diff(old, new, &mut out, &options, direct_io, host)?;
         out.flush()?;
         stats
     };
     if !quiet {
         if osmium_summary {
-            stats.print_osmium_summary();
+            stats.write_osmium_summary(
+                &mut host.diagnostics.summary_writer("diff.osmium_summary"),
+            )?;
         } else {
-            stats.print_summary();
+            stats.write_summary(&mut host.diagnostics.summary_writer("diff.summary"))?;
         }
     }
     if stats.has_differences() {
@@ -2910,6 +2965,7 @@ fn run_derive_changes(
     increment_version: bool,
     update_timestamp: bool,
     jobs: usize,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let jobs_resolved = if jobs == 0 {
         std::thread::available_parallelism()
@@ -2926,8 +2982,9 @@ fn run_derive_changes(
         increment_version,
         update_timestamp,
         jobs_resolved,
+        host,
     )?;
-    stats.print_summary();
+    stats.write_summary(&mut host.diagnostics.summary_writer("derive.summary"))?;
     Ok(())
 }
 
@@ -2942,13 +2999,21 @@ fn run_getid(
     ids: &[String],
     write: &WriteOpts,
     overrides: &HeaderOverrides,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let GetidFlags {
         add_referenced,
         remove_tags,
         verbose_ids,
     } = flags;
-    let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, write.direct_io)?;
+    let id_set = resolve_ids(
+        id_file,
+        id_osm_file,
+        default_type,
+        ids,
+        write.direct_io,
+        host,
+    )?;
 
     if remove_tags && !add_referenced {
         eprintln!(
@@ -2974,8 +3039,9 @@ fn run_getid(
         write.direct_io,
         write.force,
         overrides,
+        host,
     )?;
-    stats.print_summary();
+    stats.write_summary(&mut host.diagnostics.summary_writer("getid.summary"))?;
 
     if let Some(found) = stats.found.as_ref() {
         print_missing_ids(&id_set, found);
@@ -2996,8 +3062,16 @@ fn run_getparents(
     write: &WriteOpts,
     overrides: &HeaderOverrides,
     full_scan_min_blobs: Option<u64>,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, write.direct_io)?;
+    let id_set = resolve_ids(
+        id_file,
+        id_osm_file,
+        default_type,
+        ids,
+        write.direct_io,
+        host,
+    )?;
     let opts = pbfhogg::getparents::GetparentsOptions { add_self };
     let stats = if let Some(min_blobs) = full_scan_min_blobs {
         pbfhogg::getparents::getparents_with_min_blobs(
@@ -3009,6 +3083,7 @@ fn run_getparents(
             write.direct_io,
             overrides,
             min_blobs,
+            host,
         )?
     } else {
         pbfhogg::getparents::getparents(
@@ -3019,9 +3094,10 @@ fn run_getparents(
             write.compression,
             write.direct_io,
             overrides,
+            host,
         )?
     };
-    stats.print_summary();
+    stats.write_summary(&mut host.diagnostics.summary_writer("getparents.summary"))?;
     Ok(())
 }
 
@@ -3035,8 +3111,16 @@ fn run_removeid(
     ids: &[String],
     write: &WriteOpts,
     overrides: &HeaderOverrides,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, write.direct_io)?;
+    let id_set = resolve_ids(
+        id_file,
+        id_osm_file,
+        default_type,
+        ids,
+        write.direct_io,
+        host,
+    )?;
     let stats = pbfhogg::getid::removeid(
         file,
         output,
@@ -3045,8 +3129,9 @@ fn run_removeid(
         write.direct_io,
         write.force,
         overrides,
+        host,
     )?;
-    stats.print_summary();
+    stats.write_summary(&mut host.diagnostics.summary_writer("getid.summary"))?;
     Ok(())
 }
 
@@ -3071,6 +3156,7 @@ fn run_extract(
     clean: &CleanAttrs,
     write: &WriteOpts,
     overrides: &HeaderOverrides,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let region = match (bbox_str, polygon_path) {
         (Some(s), None) => {
@@ -3092,8 +3178,9 @@ fn run_extract(
         write.direct_io,
         write.force,
         overrides,
+        host,
     )?;
-    stats.print_summary();
+    stats.write_summary(&mut host.diagnostics.summary_writer("extract.summary"))?;
     Ok(())
 }
 
@@ -3146,6 +3233,7 @@ fn run_extract_config(
     clean: &CleanAttrs,
     write: &WriteOpts,
     overrides: &HeaderOverrides,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (config_dir, mut slots) = pbfhogg::extract::parse_extract_config(config_path)?;
 
@@ -3209,6 +3297,7 @@ fn run_extract_config(
         write.direct_io,
         write.force,
         overrides,
+        host,
     )?;
     // Extraction is all-or-nothing: a failure above drops every guard and no
     // destination was ever opened, so nothing is published at all. What
@@ -3228,7 +3317,7 @@ fn run_extract_config(
     }
     for (i, stats) in all_stats.iter().enumerate() {
         eprint!("  [{}] {} - ", i + 1, final_paths[i].display());
-        stats.print_summary();
+        stats.write_summary(&mut host.diagnostics.summary_writer("extract.summary"))?;
     }
     Ok(())
 }
@@ -3238,9 +3327,10 @@ fn run_add_locations_to_ways(
     output: &std::path::Path,
     options: &pbfhogg::altw::AltwOptions,
     overrides: &HeaderOverrides,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stats = pbfhogg::altw::add_locations_to_ways(file, output, options, overrides)?;
-    stats.print_summary();
+    let stats = pbfhogg::altw::add_locations_to_ways(file, output, options, overrides, host)?;
+    stats.write_summary(&mut host.diagnostics.summary_writer("altw.summary"))?;
     Ok(())
 }
 
@@ -3250,6 +3340,7 @@ fn run_time_filter(
     timestamp: &str,
     write: &WriteOpts,
     overrides: &HeaderOverrides,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cutoff = parse_timestamp(timestamp)?;
     let stats = pbfhogg::time_filter::time_filter(
@@ -3259,8 +3350,9 @@ fn run_time_filter(
         write.compression,
         write.direct_io,
         overrides,
+        host,
     )?;
-    stats.print_summary();
+    stats.write_summary(&mut host.diagnostics.summary_writer("time_filter.summary"))?;
     Ok(())
 }
 
@@ -3275,10 +3367,11 @@ fn run_show_element(
     path: &std::path::Path,
     spec: &str,
     direct_io: bool,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (elem_type, id) = parse_element_spec(spec)?;
     let mut out = output::buffered();
-    let found = pbfhogg::inspect::show_element_to(path, elem_type, id, direct_io, &mut out)?;
+    let found = pbfhogg::inspect::show_element_to(path, elem_type, id, direct_io, &mut out, host)?;
     out.flush()?;
     if !found {
         eprintln!("Element not found: {spec}");
@@ -3378,6 +3471,7 @@ fn run_inspect(
     blocks: Option<usize>,
     get: Option<&str>,
     direct_io: bool,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mode = InspectMode::resolve(&flags, blocks, get);
     let InspectFlags {
@@ -3417,7 +3511,7 @@ fn run_inspect(
 
     match mode {
         InspectMode::IndexedOnly => {
-            let has_index = pbfhogg::has_indexdata(path, direct_io)?;
+            let has_index = pbfhogg::has_indexdata(path, direct_io, &host.diagnostics)?;
             let mut out = output::buffered();
             let printed = if json {
                 writeln!(out, "{}", serde_json::json!({"indexed": has_index}))
@@ -3435,14 +3529,16 @@ fn run_inspect(
             return Ok(());
         }
         InspectMode::NodesOnly => {
-            let report = pbfhogg::inspect::node_stats::node_stats(path, direct_io, force, jobs)?;
+            let report =
+                pbfhogg::inspect::node_stats::node_stats(path, direct_io, force, jobs, host)?;
             let mut out = output::buffered();
             report.write_report(&mut out)?;
             out.flush()?;
             return Ok(());
         }
         InspectMode::HeaderGet(key) => {
-            let mut reader = pbfhogg::BlobReader::open(path, direct_io)?;
+            let mut reader =
+                pbfhogg::BlobReader::open(path, direct_io)?.diagnostics(host.diagnostics.clone());
             let header = match reader.next() {
                 Some(Ok(blob)) => match blob.decode()? {
                     pbfhogg::blob::BlobDecode::OsmHeader(h) => *h,
@@ -3504,11 +3600,12 @@ fn run_inspect(
             distrust_metadata,
             direct_io,
         },
+        host,
     )?;
 
     // --indexed combined with other flags: check and report, set exit code
     let has_index = if indexed {
-        Some(pbfhogg::has_indexdata(path, direct_io)?)
+        Some(pbfhogg::has_indexdata(path, direct_io, &host.diagnostics)?)
     } else {
         None
     };
@@ -3517,7 +3614,7 @@ fn run_inspect(
     // --nodes combined with other flags: run node stats, printed below
     let node_report = if nodes {
         Some(pbfhogg::inspect::node_stats::node_stats(
-            path, direct_io, force, jobs,
+            path, direct_io, force, jobs, host,
         )?)
     } else {
         None
@@ -3569,9 +3666,10 @@ fn run_apply_changes(
     output: &std::path::Path,
     opts: &pbfhogg::apply_changes::MergeOptions,
     overrides: &HeaderOverrides,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stats = pbfhogg::apply_changes::merge(base, changes, output, opts, overrides)?;
-    stats.print_summary();
+    let stats = pbfhogg::apply_changes::merge(base, changes, output, opts, overrides, host)?;
+    stats.write_summary(&mut host.diagnostics.summary_writer("apply_changes.summary"))?;
     Ok(())
 }
 
@@ -3580,6 +3678,7 @@ fn run_merge_pbf(
     output: &std::path::Path,
     write: &WriteOpts,
     overrides: &HeaderOverrides,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let paths: Vec<&std::path::Path> = inputs.iter().map(AsRef::as_ref).collect();
     let opts = pbfhogg::cat::dedupe::MergePbfOptions {
@@ -3588,8 +3687,8 @@ fn run_merge_pbf(
         io_uring: write.io_uring,
         force: write.force,
     };
-    let stats = pbfhogg::cat::dedupe::merge_pbf(&paths, output, &opts, overrides)?;
-    stats.print_summary();
+    let stats = pbfhogg::cat::dedupe::merge_pbf(&paths, output, &opts, overrides, host)?;
+    stats.write_summary(&mut host.diagnostics.summary_writer("cat.dedupe.summary"))?;
     Ok(())
 }
 
@@ -3599,6 +3698,7 @@ fn run_merge_changes(
     simplify: bool,
     jobs: usize,
     allow_version_regression: bool,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let inputs: Vec<&std::path::Path> = changes.iter().map(AsRef::as_ref).collect();
     let jobs = if jobs == 0 { None } else { Some(jobs) };
@@ -3608,8 +3708,9 @@ fn run_merge_changes(
         simplify,
         jobs,
         allow_version_regression,
+        host,
     )?;
-    stats.print_summary();
+    stats.write_summary(&mut host.diagnostics.summary_writer("merge_changes.summary"))?;
     Ok(())
 }
 
@@ -3850,6 +3951,7 @@ fn run_bench_merge(
     output: &std::path::Path,
     compression: Compression,
     io_mode: BenchIoMode,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::time::Instant;
 
@@ -3870,8 +3972,14 @@ fn run_bench_merge(
         #[cfg(feature = "test-hooks")]
         panic_at_blob_seq: None,
     };
-    let stats =
-        pbfhogg::apply_changes::merge(base, changes, output, &opts, &HeaderOverrides::default())?;
+    let stats = pbfhogg::apply_changes::merge(
+        base,
+        changes,
+        output,
+        &opts,
+        &HeaderOverrides::default(),
+        host,
+    )?;
     let elapsed_ms = start.elapsed().as_millis();
 
     let output_mb = std::fs::metadata(output)

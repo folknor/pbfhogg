@@ -39,15 +39,18 @@ pub struct TimeFilterStats {
 }
 
 impl TimeFilterStats {
-    pub fn print_summary(&self) {
-        eprintln!(
+    pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        writeln!(
+            w,
             "time-filter: {} versions scanned, {} <= cutoff, {} elements written ({} deleted at cutoff, {} without version <= cutoff)",
             self.versions_seen,
             self.versions_before_cutoff,
             self.elements_written,
             self.dropped_deleted,
             self.dropped_no_snapshot_version,
-        );
+        )?;
+
+        Ok(())
     }
 }
 
@@ -76,13 +79,14 @@ pub fn time_filter(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<TimeFilterStats> {
     // History path: no arena cap. Snapshot path: calls
     // `cap_malloc_arenas` internally, post-migration - see the
     // in-function comment in time_filter_snapshot.
-    let reader = ElementReader::open(input, direct_io)?;
+    let reader = ElementReader::open_in(input, direct_io, host)?;
     require_sorted(reader.header(), input, "Input history PBF")?;
-    warn_locations_on_ways_loss(reader.header());
+    warn_locations_on_ways_loss(reader.header(), host);
 
     let is_history = reader.header().has_historical_information();
     let mut writer = writer_from_header(
@@ -94,6 +98,7 @@ pub fn time_filter(
         |hb| hb.replication_timestamp(cutoff_timestamp),
         direct_io,
         false,
+        host,
     )?;
 
     let stats = if is_history {
@@ -104,7 +109,7 @@ pub fn time_filter(
         // build_classify_schedule, not ElementReader, so holding the
         // reader open here would just keep an extra fd around.
         drop(reader);
-        time_filter_snapshot(input, &mut writer, cutoff_timestamp, compression)?
+        time_filter_snapshot(input, &mut writer, cutoff_timestamp, compression, host)?
     };
 
     writer.flush()?;
@@ -263,6 +268,7 @@ fn time_filter_snapshot(
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     cutoff_timestamp: i64,
     compression: Compression,
+    host: &crate::host::Host,
 ) -> Result<TimeFilterStats> {
     // Per-blob worker pool; same precedent as cat --clean and
     // check --refs / verify_ids. Post-migration, each blob's BlockBuilder
@@ -272,7 +278,7 @@ fn time_filter_snapshot(
     // -24 % anon on the pre-migration code, but that pre-migration code
     // had thread-local BlockBuilder state surviving across blobs on the
     // same rayon worker. parallel_classify_phase has no such state.
-    crate::debug::cap_malloc_arenas();
+    host.process.cross_thread_alloc_pool();
 
     let mut stats = TimeFilterStats {
         versions_seen: 0,
@@ -285,7 +291,7 @@ fn time_filter_snapshot(
     crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_START");
     crate::debug::emit_mallinfo2("timefilter_snapshot_start_mallinfo");
 
-    let (schedule, shared_file) = build_classify_schedule(input, None)?;
+    let (schedule, shared_file) = build_classify_schedule(input, None, &host.diagnostics)?;
 
     if schedule.is_empty() {
         crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_END");
@@ -372,6 +378,7 @@ fn time_filter_snapshot(
                 }
             }
         },
+        &*host.resources,
     )?;
 
     if let Some(e) = write_error {

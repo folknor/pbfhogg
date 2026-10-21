@@ -28,9 +28,13 @@ pub(super) struct BlobMeta {
 /// scan - stage 1 / stage 4 open their own fds and pread the bodies they
 /// need.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub(super) fn scan_blob_metadata(input: &Path, parse_tagdata: bool) -> Result<Vec<BlobMeta>> {
+pub(super) fn scan_blob_metadata(
+    input: &Path,
+    parse_tagdata: bool,
+    host: &crate::host::Host,
+) -> Result<Vec<BlobMeta>> {
     crate::debug::emit_marker("ALTW_BLOB_META_SCAN_START");
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
     let _ = walker
         .next_header()?
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;

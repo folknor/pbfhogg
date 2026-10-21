@@ -109,6 +109,7 @@ impl FrameHeader {
 pub(crate) fn read_frame_header<R: Read>(
     reader: &mut R,
     header_buf: &mut Vec<u8>,
+    diagnostics: &crate::host::Diagnostics,
 ) -> Result<Option<FrameHeader>> {
     let Some(header_len) = read_frame_prefix(reader)? else {
         return Ok(None);
@@ -124,7 +125,7 @@ pub(crate) fn read_frame_header<R: Read>(
     // and no caller can be driven into an outsized payload allocation by a
     // hostile `BlobHeader.datasize`.
     let (blob_type, data_size, raw_index, raw_index_present, tagdata) =
-        parse_blob_header_with_index(header_buf)?;
+        parse_blob_header_with_index(header_buf, diagnostics)?;
     Ok(Some(FrameHeader {
         header_len,
         blob_type,
@@ -212,7 +213,7 @@ mod tests {
         input.extend_from_slice(&[0x0A, 0x07, b'O']);
         let mut cursor = std::io::Cursor::new(input);
         let mut buf = Vec::new();
-        match read_frame_header(&mut cursor, &mut buf) {
+        match read_frame_header(&mut cursor, &mut buf, &crate::host::Diagnostics::discard()) {
             Err(err) => assert!(
                 matches!(err.into_kind(), ErrorKind::Io(_)),
                 "a truncated BlobHeader must surface as an I/O error"

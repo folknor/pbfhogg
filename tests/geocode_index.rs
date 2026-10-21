@@ -865,6 +865,7 @@ fn synthetic_build_query_matches_low_level_api() {
             force: false,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect("build should succeed");
 
@@ -988,6 +989,7 @@ fn null_island_street_vertex_is_not_treated_as_absent() {
             force: false,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect("Null Island is a real coordinate");
     assert_eq!(stats.street_ways, 1);
@@ -1020,6 +1022,7 @@ fn legal_non_dense_nodes_build_a_queryable_index() {
             force: true,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect("legal non-dense Node messages must be indexed");
     assert_eq!(stats.addr_points, 1);
@@ -1060,6 +1063,7 @@ fn builder_refuses_a_truly_empty_index() {
             force: false,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect_err("a build with no queryable records must fail");
     assert!(
@@ -1082,6 +1086,7 @@ fn reader_rejects_hostile_entry_offset_instead_of_panicking() {
             force: false,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect("build index");
     let cells_path = index_dir.join("geo_cells.bin");
@@ -1121,6 +1126,7 @@ fn reader_rejects_every_out_of_bounds_offset_kind() {
             force: false,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect("build index");
     assert!(
@@ -1307,6 +1313,7 @@ fn force_with_bad_input_leaves_the_existing_index_intact() {
             force: false,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect("initial build");
     let before = std::fs::read(index_dir.join("geocode_header.bin")).expect("header exists");
@@ -1318,6 +1325,7 @@ fn force_with_bad_input_leaves_the_existing_index_intact() {
             force: true,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect_err("a forced rebuild from a nonexistent input must fail");
 
@@ -1359,6 +1367,7 @@ fn force_invalidates_the_header_before_pass_two_writes() {
             force: false,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect("initial build");
 
@@ -1384,6 +1393,7 @@ fn force_invalidates_the_header_before_pass_two_writes() {
             force: true,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect_err("a build with no queryable records must fail");
     assert!(
@@ -1424,6 +1434,7 @@ fn levels_past_the_sampling_budget_are_refused_before_reading_input() {
                 admin_level: admin,
                 ..Default::default()
             },
+            &crate::common::test_host(),
         )
         .expect_err("a level past the sampling budget must be refused");
         assert!(
@@ -1449,6 +1460,7 @@ fn levels_past_the_sampling_budget_are_refused_before_reading_input() {
             admin_level: 10,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect("the highest accepted level must build");
 }
@@ -1475,6 +1487,7 @@ fn fallback_recovers_hits_outside_fine_radius() {
                 coarse_search_radius_m,
                 ..Default::default()
             },
+            &crate::common::test_host(),
         )
         .expect("build should succeed");
     }
@@ -1532,6 +1545,7 @@ fn fallback_fills_address_when_fine_street_exists() {
             coarse_search_radius_m: 100.0,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect("build should succeed");
 
@@ -1576,6 +1590,7 @@ fn synthetic_admin_polygon_query_returns_country_match() {
             force: false,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect("build should succeed");
 
@@ -1632,6 +1647,7 @@ fn nested_same_level_admin_prefers_smallest_polygon() {
             force: false,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect("build should succeed");
 
@@ -1708,6 +1724,7 @@ fn admin_polygon_hole_excludes_queries_inside_the_hole() {
             force: false,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect("build should succeed");
 
@@ -1832,6 +1849,7 @@ fn admin_interior_hint_does_not_bypass_point_in_polygon() {
             force: false,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect("build should succeed");
     assert_eq!(stats.admin_polygons, 1, "fixture has one admin boundary");
@@ -1938,6 +1956,7 @@ fn synthetic_interpolation_query_resolves_even_house_number() {
             coarse_search_radius_m: 1.0,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect("build should succeed");
 
@@ -2005,6 +2024,7 @@ fn unresolved_interpolation_stays_hidden_behind_zero_sentinel() {
             coarse_search_radius_m: 1.0,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect("build should succeed");
 
@@ -2076,6 +2096,7 @@ fn fallback_recovers_interpolation_outside_fine_radius() {
                 coarse_search_radius_m,
                 ..Default::default()
             },
+            &crate::common::test_host(),
         )
         .expect("build should succeed");
     }
@@ -2154,6 +2175,7 @@ fn antimeridian_interpolation_snaps_on_the_short_arc() {
             force: false,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect("build should succeed");
 
@@ -2211,6 +2233,7 @@ fn unresolvable_fine_interpolation_does_not_shadow_the_fallback() {
             coarse_search_radius_m: 300.0,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect("build should succeed");
     assert_eq!(
@@ -2275,6 +2298,7 @@ fn synthetic_postal_boundary_query_returns_level_11_match() {
             force: false,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect("build should succeed");
 
@@ -2320,6 +2344,7 @@ fn build_rejects_street_way_coord_count_over_u16_max() {
             force: false,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect_err("builder should hard-error on street node_count overflow");
 
@@ -2345,6 +2370,7 @@ fn build_rejects_interpolation_way_coord_count_over_u16_max() {
             force: false,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect_err("builder should hard-error on interpolation node_count overflow");
 
@@ -2370,6 +2396,7 @@ fn build_rejects_addr_entry_count_over_u16_max_for_one_cell() {
             force: false,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect_err("builder should hard-error on per-cell addr entry overflow");
 
@@ -2406,6 +2433,7 @@ fn build_rejects_street_entry_count_over_u16_max_for_one_cell() {
             force: false,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect_err("builder should hard-error on per-cell street entry overflow");
 
@@ -2439,6 +2467,7 @@ fn build_rejects_interp_entry_count_over_u16_max_for_one_cell() {
             force: false,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect_err("builder should hard-error on per-cell interp entry overflow");
 
@@ -2473,6 +2502,7 @@ fn build_rejects_admin_entry_count_over_u16_max_for_one_cell() {
             force: false,
             ..Default::default()
         },
+        &crate::common::test_host(),
     )
     .expect_err("builder should hard-error on per-cell admin entry overflow");
 
@@ -2527,7 +2557,8 @@ fn ensure_index_exists() -> Option<std::path::PathBuf> {
         force: false,
         ..Default::default()
     };
-    pbfhogg::geocode_index::builder::build_geocode_index(&config).ok()?;
+    pbfhogg::geocode_index::builder::build_geocode_index(&config, &crate::common::test_host())
+        .ok()?;
     Some(build_dir)
 }
 
@@ -2552,8 +2583,9 @@ fn build_denmark_index() {
         force: false,
         ..Default::default()
     };
-    let stats = pbfhogg::geocode_index::builder::build_geocode_index(&config)
-        .expect("build should succeed");
+    let stats =
+        pbfhogg::geocode_index::builder::build_geocode_index(&config, &crate::common::test_host())
+            .expect("build should succeed");
 
     assert!(
         stats.addr_points > 2_000_000,

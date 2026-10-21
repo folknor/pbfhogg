@@ -29,7 +29,8 @@ fn verify_node_ids(path: &std::path::Path) -> pbfhogg::check::verify_ids::Verify
         max_errors: 16,
         direct_io: false,
     };
-    pbfhogg::check::verify_ids::verify_ids(path, &opts).expect("verify_ids")
+    pbfhogg::check::verify_ids::verify_ids(path, &opts, &crate::common::test_host())
+        .expect("verify_ids")
 }
 
 /// `check --ids` must judge monotonicity by the same canonical OSM ID order
@@ -102,8 +103,14 @@ fn check_refs_reports_untrackable_ids_separately_from_missing_refs() {
         &[],
     );
 
-    let report = pbfhogg::check::refs::check_refs(&untrackable, true, false, false)
-        .expect("check_refs on negative IDs");
+    let report = pbfhogg::check::refs::check_refs(
+        &untrackable,
+        true,
+        false,
+        false,
+        &crate::common::test_host(),
+    )
+    .expect("check_refs on negative IDs");
     assert_eq!(report.node_count, 1);
     assert_eq!(
         report.untrackable_ids[0], 1,
@@ -141,8 +148,14 @@ fn check_refs_reports_untrackable_ids_separately_from_missing_refs() {
         }],
         &[],
     );
-    let report = pbfhogg::check::refs::check_refs(&trackable, true, false, false)
-        .expect("check_refs on positive IDs");
+    let report = pbfhogg::check::refs::check_refs(
+        &trackable,
+        true,
+        false,
+        false,
+        &crate::common::test_host(),
+    )
+    .expect("check_refs on positive IDs");
     assert_eq!(report.missing_node_refs, 1, "n6 is genuinely absent");
     assert_eq!(
         report.total_untrackable(),
@@ -208,8 +221,9 @@ fn check_refs_show_ids_reports_unique_counts_and_occurrences() {
         ],
     );
 
-    let report = pbfhogg::check::refs::check_refs(&input, true, true, false)
-        .expect("check_refs with show_ids");
+    let report =
+        pbfhogg::check::refs::check_refs(&input, true, true, false, &crate::common::test_host())
+            .expect("check_refs with show_ids");
 
     assert_eq!(report.node_count, 1);
     assert_eq!(report.way_count, 1);
@@ -267,8 +281,9 @@ fn check_refs_show_ids_reports_unique_counts_and_occurrences() {
         "show_ids should preserve every missing-ref occurrence, including duplicate relation members"
     );
 
-    let counts_only = pbfhogg::check::refs::check_refs(&input, true, false, false)
-        .expect("check_refs without show_ids");
+    let counts_only =
+        pbfhogg::check::refs::check_refs(&input, true, false, false, &crate::common::test_host())
+            .expect("check_refs without show_ids");
     assert!(
         counts_only.missing_refs.is_empty(),
         "show_ids=false should not materialize missing_refs"

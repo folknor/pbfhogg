@@ -60,8 +60,8 @@ pub(super) struct BlobDesc {
 
 /// Build a blob schedule from a header-only scan.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub(super) fn build_blob_schedule(input: &Path) -> Result<Vec<BlobDesc>> {
-    build_blob_schedule_with_passthrough(input, None)
+pub(super) fn build_blob_schedule(input: &Path, host: &crate::host::Host) -> Result<Vec<BlobDesc>> {
+    build_blob_schedule_with_passthrough(input, None, host)
 }
 
 /// Build a blob schedule, optionally tagging node blobs eligible for raw passthrough.
@@ -74,9 +74,10 @@ pub(super) fn build_blob_schedule(input: &Path) -> Result<Vec<BlobDesc>> {
 pub(super) fn build_blob_schedule_with_passthrough(
     input: &Path,
     extract_bbox: Option<&crate::BlobBbox>,
+    host: &crate::host::Host,
 ) -> Result<Vec<BlobDesc>> {
     crate::debug::emit_marker("EXTRACT_SCHEDULE_SCAN_START");
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
     let _ = walker
         .next_header()?
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
@@ -150,6 +151,7 @@ pub(super) fn pread_execute<F>(
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut ExtractStats,
     block_fn: F,
+    host: &crate::host::Host,
 ) -> Result<()>
 where
     F: Fn(
@@ -181,9 +183,7 @@ where
             .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
     );
 
-    let decode_threads = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(4);
+    let decode_threads = crate::host::sized_workers(&*host.resources, 2, 1, 4);
 
     type WorkerResult = (usize, crate::error::Result<(Vec<OwnedBlock>, ExtractStats)>);
 
@@ -381,6 +381,7 @@ pub(super) fn pread_write_pass<F>(
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut ExtractStats,
     block_fn: F,
+    host: &crate::host::Host,
 ) -> Result<()>
 where
     F: Fn(
@@ -393,10 +394,10 @@ where
 {
     crate::debug::emit_mallinfo2("MI_PRE_BLOB_SCHEDULE");
     crate::debug::emit_marker("PREAD_WRITE_BLOB_SCHEDULE_START");
-    let schedule = build_blob_schedule(input)?;
+    let schedule = build_blob_schedule(input, host)?;
     crate::debug::emit_marker("PREAD_WRITE_BLOB_SCHEDULE_END");
     crate::debug::emit_mallinfo2("MI_POST_BLOB_SCHEDULE");
-    pread_write_pass_with_schedule(input, &schedule, writer, stats, block_fn)
+    pread_write_pass_with_schedule(input, &schedule, writer, stats, block_fn, host)
 }
 
 /// Variant of [`pread_write_pass`] that takes a pre-built blob schedule
@@ -411,6 +412,7 @@ pub(super) fn pread_write_pass_with_schedule<F>(
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut ExtractStats,
     block_fn: F,
+    host: &crate::host::Host,
 ) -> Result<()>
 where
     F: Fn(
@@ -422,7 +424,7 @@ where
         + Sync,
 {
     crate::debug::emit_marker("PREAD_WRITE_EXECUTE_START");
-    pread_execute(input, schedule, writer, stats, block_fn)?;
+    pread_execute(input, schedule, writer, stats, block_fn, host)?;
     crate::debug::emit_marker("PREAD_WRITE_EXECUTE_END");
     crate::debug::emit_mallinfo2("MI_POST_EXECUTE");
     crate::debug::emit_marker("PREAD_WRITE_FLUSH_START");

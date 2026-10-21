@@ -62,6 +62,7 @@ mod altw_external_stage3 {
                     ignore_missing_nodes: true,
                 },
                 &pbfhogg::HeaderOverrides::default(),
+                &crate::common::test_host(),
             )
         }));
 

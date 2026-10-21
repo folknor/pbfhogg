@@ -192,3 +192,8 @@ codegen-units = 1
 
 [lints]
 workspace = true
+
+# Own process because it lowers its own soft RLIMIT_NOFILE.
+[[test]]
+name = "process_nofile"
+path = "tests/process_nofile.rs"

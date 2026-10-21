@@ -165,3 +165,5 @@ The skeleton has exactly two sections. `Context`, `Consequences`, and
 Numbering gaps are deliberate, per the never-reuse rule: 0001 was a
 transient process note retired at the 0.3.0 release (commit `30ca861`);
 0008 was never assigned to a landed decision.
+
+- [0016: The library does not own the process](0016-the-library-does-not-own-the-process.md)

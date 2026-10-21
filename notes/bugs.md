@@ -1002,3 +1002,28 @@ Reported by: CLI and plumbing.
 CLI output change is approved. bench-merge also gets the library summary.
 
 Reported by: library-use implementation survey.
+
+## BUG-069 - `brokkr verify all` has two arms red at the baseline
+
+`brokkr verify all --dataset denmark --variant indexed` is 10 of 12 at
+`fa94c6c7`, confirmed with `brokkr verify --commit fa94c6c7 <arm>` on bygg,
+2026-10-21. The last recorded green run is 2026-08-20 at `ffef6206`.
+
+- `add-locations-to-ways`, hash vs osmium: pbfhogg keeps 3,513,255 nodes
+  where osmium keeps 3,507,954 (3,507,954 tagged in both), so pbfhogg
+  retains about 5,300 untagged nodes osmium drops. The sparse and external
+  backends agree with hash, so the divergence is a policy question against
+  osmium, not a backend defect. Either a documented deviation is missing
+  from DEVIATIONS.md or the untagged-node rule regressed between
+  `ffef6206` and `fa94c6c7`.
+- `derive-changes`: the harness applies osmium's OSC with `osmium apply-changes`
+  (1.19.1), whose output carries no `Sort.Type_then_ID`, then runs
+  `pbfhogg diff` on it, which refuses an unsorted old file with exit 2.
+  pbfhogg's own roundtrip half passes. This is a harness problem (brokkr
+  should sort or `--force` the osmium roundtrip) unless the refusal itself
+  is judged wrong for files osmium just wrote in order.
+
+Neither arm is touched by the library-use bricks; the spec's verify gate
+for them is read as "same arms pass as at `fa94c6c7`".
+
+Reported by: library-use adjudication, B1 and B2 gating.

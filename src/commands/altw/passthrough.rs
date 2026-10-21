@@ -109,9 +109,10 @@ fn build_schedule(
     overrides: &HeaderOverrides,
     keep_untagged_nodes: bool,
     inject_prepass: bool,
+    host: &crate::host::Host,
 ) -> Result<(Vec<BlobDescriptor>, Vec<u8>, std::sync::Arc<std::fs::File>)> {
     crate::debug::emit_marker("ALTW_PASS2_SCHEDULE_WALK_START");
-    let mut walker = HeaderWalker::open(input)?;
+    let mut walker = HeaderWalker::open(input, &host.diagnostics)?;
     let mut header_bytes: Option<Vec<u8>> = None;
     let mut schedule: Vec<BlobDescriptor> = Vec::new();
     let mut seq: usize = 0;
@@ -359,16 +360,21 @@ pub(super) fn write_output_passthrough(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<Stats> {
     let (schedule, header_bytes, shared_file) =
-        build_schedule(input, overrides, keep_untagged_nodes, inject_prepass)?;
+        build_schedule(input, overrides, keep_untagged_nodes, inject_prepass, host)?;
 
-    let mut writer =
-        writer_from_header_bytes_parallel(output, compression, &header_bytes, direct_io, false)?;
+    let mut writer = writer_from_header_bytes_parallel(
+        output,
+        compression,
+        &header_bytes,
+        direct_io,
+        false,
+        host,
+    )?;
 
-    let decode_threads = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(4);
+    let decode_threads = crate::host::sized_workers(&*host.resources, 2, 1, 4);
 
     // Schedule composition diagnostics.
     {

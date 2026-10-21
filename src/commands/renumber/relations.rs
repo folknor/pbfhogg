@@ -172,15 +172,13 @@ pub(super) fn relation_r2d_assembly(
     relation_id_set: &IdSet,
     start_relation_id: i64,
     stats: &mut RenumberStats,
+    host: &crate::host::Host,
 ) -> Result<()> {
     if relation_schedule.is_empty() {
         return Ok(());
     }
 
-    let decode_threads = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(4)
-        .min(6);
+    let decode_threads = crate::host::sized_workers(&*host.resources, 2, 1, 4).min(6);
 
     // Each blob produces one OwnedBlock tuple + orphan count.
     type R2dItem = (

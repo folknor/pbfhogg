@@ -68,8 +68,11 @@ pub(crate) const FULL_SCAN_ARM_MIN_BLOBS: u64 = 150_000;
 ///
 /// The first header frame and unknown frames are intentionally excluded from
 /// the frame-size mean: only OSMData frame bytes predict OSMData count.
-pub(crate) fn estimate_blob_count(path: &Path) -> Result<BlobCountEstimate> {
-    let mut walker = HeaderWalker::open(path)?;
+pub(crate) fn estimate_blob_count(
+    path: &Path,
+    diagnostics: &crate::host::Diagnostics,
+) -> Result<BlobCountEstimate> {
+    let mut walker = HeaderWalker::open(path, diagnostics)?;
     let file_size = walker.file_size();
     if file_size == 0 {
         return Err(crate::error::new_error(
@@ -161,6 +164,7 @@ pub(crate) struct BlobHeaderMeta {
 /// until it returns `None`. Use [`Self::pread_data`] to fetch a blob's
 /// data payload on demand.
 pub(crate) struct HeaderWalker {
+    diagnostics: crate::host::Diagnostics,
     file: Arc<std::fs::File>,
     /// The file this walker was opened from. Stamped onto every error it
     /// raises, for the same reason `BlobReader` keeps one: a byte offset
@@ -187,7 +191,7 @@ impl HeaderWalker {
     /// body reads open their own worker fds alongside the walker's
     /// `shared_file()`, rather than flowing `--direct-io` through
     /// this helper.
-    pub(crate) fn open(path: &Path) -> Result<Self> {
+    pub(crate) fn open(path: &Path, diagnostics: &crate::host::Diagnostics) -> Result<Self> {
         let file = std::fs::File::open(path).map_err(|e| {
             crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(format!(
                 "failed to open {}: {e}",
@@ -214,6 +218,7 @@ impl HeaderWalker {
             }
         }
         Ok(Self {
+            diagnostics: diagnostics.clone(),
             file: Arc::new(file),
             path: Arc::from(path),
             offset: 0,
@@ -325,7 +330,7 @@ impl HeaderWalker {
         // and every `pread_data(data_offset, data_size, ..)` a consumer later
         // issues against it - is bounded, never a hostile multi-GB size.
         let (blob_type, data_size, raw_index, _index_present, tagdata) =
-            parse_blob_header_with_index(&self.header_buf[4..header_end])?;
+            parse_blob_header_with_index(&self.header_buf[4..header_end], &self.diagnostics)?;
         let index = raw_index.as_ref().and_then(|b| BlobIndex::deserialize(b));
 
         let data_offset = self.offset + header_end as u64;
@@ -452,7 +457,7 @@ mod tests {
         let good = std::fs::read(&base).expect("read fixture");
 
         let count_headers = |path: &std::path::Path| -> super::Result<usize> {
-            let mut walker = super::HeaderWalker::open(path)?;
+            let mut walker = super::HeaderWalker::open(path, &crate::host::Diagnostics::discard())?;
             let mut n = 0;
             while walker.next_header()?.is_some() {
                 n += 1;
@@ -523,7 +528,8 @@ mod tests {
         let header_only = dir.path().join("header-only.pbf");
         write_fixture(&header_only, false);
         assert_eq!(
-            estimate_blob_count(&header_only).expect("estimate"),
+            estimate_blob_count(&header_only, &crate::host::Diagnostics::discard())
+                .expect("estimate"),
             BlobCountEstimate {
                 osmdata_blobs: 0,
                 exact: true,
@@ -533,7 +539,8 @@ mod tests {
         let one_block = dir.path().join("one-block.pbf");
         write_fixture(&one_block, true);
         assert_eq!(
-            estimate_blob_count(&one_block).expect("estimate"),
+            estimate_blob_count(&one_block, &crate::host::Diagnostics::discard())
+                .expect("estimate"),
             BlobCountEstimate {
                 osmdata_blobs: 1,
                 exact: true,
@@ -546,7 +553,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let empty = dir.path().join("empty.pbf");
         std::fs::File::create(&empty).expect("create empty file");
-        assert!(estimate_blob_count(&empty).is_err());
+        assert!(estimate_blob_count(&empty, &crate::host::Diagnostics::discard()).is_err());
     }
 
     #[test]
@@ -582,7 +589,8 @@ mod tests {
         }
         writer.flush().expect("flush fixture");
 
-        let estimate = estimate_blob_count(&mixed).expect("estimate");
+        let estimate =
+            estimate_blob_count(&mixed, &crate::host::Diagnostics::discard()).expect("estimate");
         assert!(!estimate.exact);
         let error = estimate.osmdata_blobs.abs_diff(actual_blobs);
         assert!(

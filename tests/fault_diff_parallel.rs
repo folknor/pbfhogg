@@ -65,7 +65,14 @@ mod diff_parallel {
                 type_filter: None,
                 jobs: 3,
             };
-            diff(&old, &new, &mut out, &opts, false)
+            diff(
+                &old,
+                &new,
+                &mut out,
+                &opts,
+                false,
+                &crate::common::test_host(),
+            )
         }));
 
         diff_hooks::reset();

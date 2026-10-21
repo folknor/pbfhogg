@@ -19,6 +19,7 @@ pub(super) fn run_pass1_5(
     max_node_id: i64,
     shared_file: &std::sync::Arc<std::fs::File>,
     needed_admin_ways: &crate::idset::IdSet,
+    host: &crate::host::Host,
 ) -> Result<crate::idset::IdSet> {
     // One shared pre-allocated IdSet; workers write concurrently via
     // `set_atomic`. Replaces the previous per-worker `IdSet`
@@ -57,9 +58,7 @@ pub(super) fn run_pass1_5(
         let first_err: Mutex<Option<String>> = Mutex::new(None);
         let first_err_ref = &first_err;
 
-        let decode_threads = std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(2).max(1))
-            .unwrap_or(4);
+        let decode_threads = crate::host::sized_workers(&*host.resources, 2, 1, 4);
 
         std::thread::scope(|scope| {
             for _ in 0..decode_threads {
@@ -179,13 +178,14 @@ pub(super) fn run_pass1_5(
 #[allow(clippy::type_complexity)]
 pub(super) fn build_pass2_schedules(
     input_path: &Path,
+    host: &crate::host::Host,
 ) -> Result<(
     Vec<(usize, u64, usize)>, // node_schedule
     Vec<(usize, u64, usize)>, // way_schedule
     i64,                      // max_node_id
     std::sync::Arc<std::fs::File>,
 )> {
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input_path)?;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input_path, &host.diagnostics)?;
     let _ = walker
         .next_header()?
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;

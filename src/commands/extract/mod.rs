@@ -542,6 +542,7 @@ pub fn extract_multi(
     direct_io: bool,
     force: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<Vec<ExtractStats>> {
     // Try single-pass multi-extract for simple strategy on sorted input.
     if matches!(strategy, ExtractStrategy::Simple)
@@ -553,6 +554,7 @@ pub fn extract_multi(
             compression,
             direct_io,
             overrides,
+            host,
         )?
     {
         return Ok(stats);
@@ -561,7 +563,10 @@ pub fn extract_multi(
     // Sequential fallback: one extract at a time.
     let mut all_stats = Vec::with_capacity(slots.len());
     for (i, slot) in slots.iter().enumerate() {
-        eprintln!(
+        crate::host::diag!(
+            host.diagnostics,
+            Progress,
+            "extract.multi.slot",
             "[{}/{}] Extracting to {}",
             i + 1,
             slots.len(),
@@ -578,6 +583,7 @@ pub fn extract_multi(
             direct_io,
             force,
             overrides,
+            host,
         )?;
         all_stats.push(stats);
     }
@@ -612,11 +618,12 @@ pub struct ExtractStats {
 }
 
 impl ExtractStats {
-    pub fn print_summary(&self) {
+    pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         let total_nodes = self.nodes_in_bbox + self.nodes_from_ways + self.nodes_from_relations;
         let total_ways = self.ways_written + self.ways_from_relations;
         if self.nodes_from_relations > 0 || self.ways_from_relations > 0 {
-            eprintln!(
+            writeln!(
+                w,
                 "Extract ({}): {} nodes ({} in bbox, {} from ways, {} from relations), \
                  {} ways ({} from relations), {} relations",
                 self.strategy,
@@ -627,9 +634,10 @@ impl ExtractStats {
                 total_ways,
                 self.ways_from_relations,
                 self.relations_written,
-            );
+            )?;
         } else {
-            eprintln!(
+            writeln!(
+                w,
                 "Extract ({}): {} nodes ({} in bbox, {} from ways), {} ways, {} relations",
                 self.strategy,
                 total_nodes,
@@ -637,8 +645,10 @@ impl ExtractStats {
                 self.nodes_from_ways,
                 total_ways,
                 self.relations_written,
-            );
+            )?;
         }
+
+        Ok(())
     }
 }
 
@@ -660,6 +670,7 @@ pub fn extract(
     direct_io: bool,
     force: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<ExtractStats> {
     if !matches!(strategy, ExtractStrategy::Simple) {
         require_indexdata(
@@ -668,6 +679,7 @@ pub fn extract(
             force,
             "input PBF has no blob-level indexdata. Without indexdata, the spatial bbox \
              filter is a no-op - all blobs are decompressed (significantly slower).",
+            host,
         )?;
     }
     let result = match strategy {
@@ -680,6 +692,7 @@ pub fn extract(
             compression,
             direct_io,
             overrides,
+            host,
         ),
         ExtractStrategy::CompleteWays => complete::extract_complete_ways(
             input,
@@ -690,6 +703,7 @@ pub fn extract(
             compression,
             direct_io,
             overrides,
+            host,
         ),
         ExtractStrategy::Smart => smart::extract_smart(
             input,
@@ -700,6 +714,7 @@ pub fn extract(
             compression,
             direct_io,
             overrides,
+            host,
         ),
     }?;
     #[allow(clippy::cast_possible_wrap)]

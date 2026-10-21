@@ -51,8 +51,14 @@ mod derive_parallel {
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             derive_changes(
-                &old, &new, &osc, /* direct_io */ false, /* increment_version */ false,
-                /* update_timestamp */ false, /* jobs */ 3,
+                &old,
+                &new,
+                &osc,
+                /* direct_io */ false,
+                /* increment_version */ false,
+                /* update_timestamp */ false,
+                /* jobs */ 3,
+                &crate::common::test_host(),
             )
         }));
 

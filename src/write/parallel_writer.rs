@@ -258,10 +258,16 @@ pub(crate) fn parallel_writer_thread(
     framed_header: Vec<u8>,
     init_tx: SyncSender<io::Result<()>>,
     expected: &SeqTotal,
+    diagnostics: crate::host::Diagnostics,
 ) -> io::Result<()> {
     let result = parallel_writer_thread_inner(rx, path, framed_header, init_tx, expected);
     if let Err(ref e) = result {
-        eprintln!("[parallel_writer] thread exit: {e}");
+        crate::host::diag!(
+            diagnostics,
+            Developer,
+            "writer.parallel.thread_exit",
+            "[parallel_writer] thread exit: {e}"
+        );
     }
     result
 }
@@ -734,7 +740,14 @@ mod tests {
         let seq_total = SeqTotal::new();
         let thread_total = seq_total.clone();
         let handle = std::thread::spawn(move || {
-            parallel_writer_thread(rx, path, header, init_tx, &thread_total)
+            parallel_writer_thread(
+                rx,
+                path,
+                header,
+                init_tx,
+                &thread_total,
+                crate::host::Diagnostics::discard(),
+            )
         });
 
         // Wait for init.

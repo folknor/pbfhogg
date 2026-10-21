@@ -65,6 +65,7 @@ fn renumber_nodes_sequentially() {
         Compression::default(),
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("renumber");
 
@@ -125,6 +126,7 @@ fn renumber_custom_start_node_id() {
         Compression::default(),
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("renumber");
 
@@ -208,6 +210,7 @@ fn renumber_preserves_sorted_header_and_type_order() {
         Compression::default(),
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("renumber");
 
@@ -290,6 +293,7 @@ fn renumber_relations_end_to_end() {
         Compression::default(),
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("renumber");
 
@@ -373,6 +377,7 @@ fn renumber_relation_forward_ref() {
         Compression::default(),
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("renumber");
 
@@ -413,6 +418,7 @@ fn renumber_relation_self_reference() {
         Compression::default(),
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("renumber");
 
@@ -528,6 +534,7 @@ fn renumber_relation_mixed_member_types_interleaved() {
         Compression::default(),
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("renumber");
 
@@ -619,6 +626,7 @@ fn renumber_nodes_and_ways_end_to_end() {
         Compression::default(),
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("renumber");
 
@@ -698,6 +706,7 @@ fn renumber_custom_start_ids() {
         Compression::default(),
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("renumber");
 
@@ -741,6 +750,7 @@ fn renumber_rejects_negative_node_id() {
         Compression::default(),
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect_err("expected rejection of negative node id");
 
@@ -795,6 +805,7 @@ fn renumber_rejects_negative_way_ref() {
         Compression::default(),
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect_err("expected rejection of negative way ref");
 
@@ -855,6 +866,7 @@ fn renumber_orphan_way_ref_preserves_old_id() {
         Compression::default(),
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("renumber");
 
@@ -943,6 +955,7 @@ fn renumber_orphan_relation_member_preserves_old_id() {
         Compression::default(),
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("renumber");
 
@@ -1028,6 +1041,7 @@ fn renumber_rejects_negative_relation_member_ref() {
         Compression::default(),
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect_err("expected rejection of negative relation-member ref");
 

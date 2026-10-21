@@ -136,6 +136,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     bbox_int: &BboxInt,
     direct_io: bool,
     handler: &mut H,
+    host: &crate::host::Host,
 ) -> Result<Pass1Result> {
     let mut bbox_node_ids = IdSet::new();
     let mut matched_way_ids = IdSet::new();
@@ -143,7 +144,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     let mut matched_relation_ids = IdSet::new();
 
     // Sequential reader to avoid PrimitiveBlock cross-thread retention OOM.
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    let mut blob_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
     blob_reader.set_parse_indexdata(true);
     let header_blob = blob_reader
         .next()
@@ -167,7 +168,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             UnsortedPhase::Ways,
             UnsortedPhase::Relations,
         ] {
-            let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+            let mut blob_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
             blob_reader.set_parse_indexdata(true);
             blob_reader
                 .next()
@@ -242,7 +243,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
 
     // Build per-type schedules from header-only scan via pread-only HeaderWalker.
     crate::debug::emit_marker("SMART_PASS1_SCHEDULE_SCAN_START");
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
     let _ = walker
         .next_header()?
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
@@ -396,6 +397,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                 bbox_node_ids.set(id);
             }
         },
+        &*host.resources,
     )?;
     crate::debug::emit_marker("PASS1_NODE_CLASSIFY_END");
 
@@ -427,6 +429,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                 all_way_node_ids.set(id);
             }
         },
+        &*host.resources,
     )?;
     crate::debug::emit_marker("PASS1_WAY_CLASSIFY_END");
 
@@ -460,6 +463,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             matched_relation_ids.merge(worker_rel_ids);
             handler.merge_worker_extras(worker_extra_way_ids, worker_extra_node_ids);
         },
+        &*host.resources,
     )?;
     crate::debug::emit_marker("PASS1_RELATION_CLASSIFY_END");
 
@@ -488,6 +492,7 @@ pub(super) fn extract_smart(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<ExtractStats> {
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
@@ -503,7 +508,8 @@ pub(super) fn extract_smart(
     crate::debug::emit_marker("SMART_PASS1_START");
     let bbox_int = BboxInt::from_bbox(region.bbox());
     let mut handler = SmartRelationHandler::new();
-    let mut result = collect_pass1_generic(input, region, &bbox_int, direct_io, &mut handler)?;
+    let mut result =
+        collect_pass1_generic(input, region, &bbox_int, direct_io, &mut handler, host)?;
     let mut extra_node_ids = handler.extra_node_ids;
     crate::debug::emit_marker("SMART_PASS1_END");
     crate::debug::emit_mallinfo2("MI_PASS1_END");
@@ -524,6 +530,7 @@ pub(super) fn extract_smart(
             crate::scan::classify::build_classify_schedule(
                 input,
                 Some(crate::blob_meta::ElemKind::Way),
+                &host.diagnostics,
             )?
         } else {
             let shared_file = std::sync::Arc::new(
@@ -569,6 +576,7 @@ pub(super) fn extract_smart(
                     extra_node_ids.set(id);
                 }
             },
+            &*host.resources,
         )?;
         crate::debug::emit_marker("SMART_PASS2_CLASSIFY_END");
     }
@@ -579,13 +587,13 @@ pub(super) fn extract_smart(
     crate::debug::emit_marker("SMART_PASS3_START");
     crate::debug::emit_marker("SMART_PASS3_SETUP_START");
 
-    let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
     let header_blob = header_reader
         .next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
     let header = header_blob.to_headerblock()?;
     drop(header_reader);
-    super::super::warn_locations_on_ways_loss(&header);
+    super::super::warn_locations_on_ways_loss(&header, host);
     let bbox = region.bbox();
     let mut writer = writer_from_header(
         output,
@@ -603,6 +611,7 @@ pub(super) fn extract_smart(
         },
         direct_io,
         false,
+        host,
     )?;
 
     // Take the pre-built blob schedule BEFORE creating `ids`, since `ids`
@@ -630,6 +639,7 @@ pub(super) fn extract_smart(
             &mut writer,
             &mut stats,
             |block, bb, output_blocks| extract_block_pass3(block, &ids, clean, bb, output_blocks),
+            host,
         )?;
     } else {
         pread_write_pass_with_schedule(
@@ -638,6 +648,7 @@ pub(super) fn extract_smart(
             &mut writer,
             &mut stats,
             |block, bb, output_blocks| extract_block_pass3(block, &ids, clean, bb, output_blocks),
+            host,
         )?;
     }
     crate::debug::emit_marker("SMART_PASS3_WRITE_END");

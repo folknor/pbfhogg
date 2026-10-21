@@ -25,6 +25,7 @@ pub(super) fn extract_complete_ways(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<ExtractStats> {
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
@@ -40,20 +41,21 @@ pub(super) fn extract_complete_ways(
     crate::debug::emit_marker("COMPLETE_PASS1_START");
     let bbox_int = BboxInt::from_bbox(region.bbox());
     let mut handler = CompleteRelationHandler;
-    let mut result = collect_pass1_generic(input, region, &bbox_int, direct_io, &mut handler)?;
+    let mut result =
+        collect_pass1_generic(input, region, &bbox_int, direct_io, &mut handler, host)?;
     crate::debug::emit_marker("COMPLETE_PASS1_END");
 
     // --- Pass 2: Write matching elements via pread-from-workers ---
     crate::debug::emit_marker("COMPLETE_PASS2_START");
     crate::debug::emit_marker("COMPLETE_PASS2_SETUP_START");
 
-    let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
     let header_blob = header_reader
         .next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
     let header = header_blob.to_headerblock()?;
     drop(header_reader);
-    super::super::warn_locations_on_ways_loss(&header);
+    super::super::warn_locations_on_ways_loss(&header, host);
     let bbox = region.bbox();
     let mut writer = writer_from_header(
         output,
@@ -71,6 +73,7 @@ pub(super) fn extract_complete_ways(
         },
         direct_io,
         false,
+        host,
     )?;
 
     // Take the pre-built blob schedule BEFORE creating `ids`, since `ids`
@@ -98,6 +101,7 @@ pub(super) fn extract_complete_ways(
             |block, bb, output_blocks| {
                 extract_block_pass2(block, &ids, clean, None, bb, output_blocks)
             },
+            host,
         )?;
     } else {
         pread_write_pass_with_schedule(
@@ -108,6 +112,7 @@ pub(super) fn extract_complete_ways(
             |block, bb, output_blocks| {
                 extract_block_pass2(block, &ids, clean, None, bb, output_blocks)
             },
+            host,
         )?;
     }
     crate::debug::emit_marker("COMPLETE_PASS2_WRITE_END");

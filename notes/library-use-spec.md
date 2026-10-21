@@ -1,7 +1,19 @@
 # Library use: implementation spec (bz pbfhogg#1)
 
-Status: B0 landed (all five gates green on bygg, 2026-10-21). B1 through
-B6 have not started. The product tree still equals `fa94c6c7`.
+Status: B0 landed (all five gates green on bygg, 2026-10-21). B1 and B2
+landed together in one commit (adjudicator ruling, 2026-10-21): the
+implementer's run ended mid-B2 on a provider usage limit with the two
+bricks' edits interleaved across the same files, so the tree was finished
+and gated as a unit rather than untangled. Gates on that commit, bygg:
+`brokkr check`, `brokkr check --profile full`, `roundtrip_denmark`,
+`host_identity_matches_goldens` (57 pinned, the two uring scenarios
+skipped) and `stderr_closed_aborts_like_baseline` all green. `brokkr
+verify all --dataset denmark --variant indexed` is 10 of 12, and both red
+arms (`add-locations-to-ways` hash vs osmium, `derive-changes`) fail
+identically at `fa94c6c7` via `brokkr verify --commit fa94c6c7`; see
+`notes/bugs.md` BUG-069. B1's and B3's verify gate therefore reads
+"the same arms pass as at `fa94c6c7`", not "all pass". B3 through B6
+have not started.
 
 B0 changed one rule of section 5 (I2): the two `_uring` scenarios are an
 environment skip, not a precondition panic. The spec assumed io_uring runs

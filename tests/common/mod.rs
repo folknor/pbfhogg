@@ -729,7 +729,8 @@ pub fn generate_relations_with_negatives(
 /// and friends always emit indexed blobs, so this is a fast smoke check
 /// that a helper hasn't accidentally dropped indexdata.
 pub fn assert_indexed(path: &Path) {
-    let indexed = pbfhogg::has_indexdata(path, false).expect("probe indexdata");
+    let indexed = pbfhogg::has_indexdata(path, false, &pbfhogg::host::Diagnostics::discard())
+        .expect("probe indexdata");
     assert!(
         indexed,
         "expected {} to carry indexdata on its first data blob",
@@ -741,7 +742,8 @@ pub fn assert_indexed(path: &Path) {
 /// `write_test_pbf_non_indexed` (see the non-indexed writer helper) to
 /// confirm the blob really landed without the indexdata field.
 pub fn assert_non_indexed(path: &Path) {
-    let indexed = pbfhogg::has_indexdata(path, false).expect("probe indexdata");
+    let indexed = pbfhogg::has_indexdata(path, false, &pbfhogg::host::Diagnostics::discard())
+        .expect("probe indexdata");
     assert!(
         !indexed,
         "expected {} to have no indexdata on its first data blob",
@@ -754,7 +756,8 @@ pub fn assert_non_indexed(path: &Path) {
 /// really has a per-blob tag key index before a `--strip-tagdata` run so the
 /// removal is a meaningful assertion.
 pub fn assert_has_tagdata(path: &Path) {
-    let tagged = pbfhogg::has_tagdata(path, false).expect("probe tagdata");
+    let tagged = pbfhogg::has_tagdata(path, false, &pbfhogg::host::Diagnostics::discard())
+        .expect("probe tagdata");
     assert!(
         tagged,
         "expected {} to carry tagdata on its first data blob",
@@ -765,7 +768,8 @@ pub fn assert_has_tagdata(path: &Path) {
 /// Assert the PBF's first OsmData blob has no tagdata. Pair with
 /// `--strip-tagdata` to confirm the field really landed cleared.
 pub fn assert_no_tagdata(path: &Path) {
-    let tagged = pbfhogg::has_tagdata(path, false).expect("probe tagdata");
+    let tagged = pbfhogg::has_tagdata(path, false, &pbfhogg::host::Diagnostics::discard())
+        .expect("probe tagdata");
     assert!(
         !tagged,
         "expected {} to have no tagdata on its first data blob",
@@ -1517,4 +1521,17 @@ where
     }
     assert_scratch_unchanged(&before, &after);
     result
+}
+
+/// Explicit host policy for in-process library tests.
+pub(crate) fn test_host() -> pbfhogg::host::Host {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        pbfhogg::process::raise_nofile_to_hard_cap();
+    });
+    pbfhogg::host::Host {
+        diagnostics: pbfhogg::host::Diagnostics::discard(),
+        process: std::sync::Arc::new(pbfhogg::host::NoProcessActions),
+        resources: std::sync::Arc::new(pbfhogg::host::MachineProbe),
+    }
 }

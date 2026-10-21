@@ -65,7 +65,11 @@ pub struct TagCountOptions<'a> {
 /// emission keeps peak anon at a small multiple of one blob's
 /// distinct tags (~few MB) plus the single global map.
 #[hotpath::measure]
-pub fn tags_count(path: &Path, opts: &TagCountOptions<'_>) -> Result<Vec<TagCount>> {
+pub fn tags_count(
+    path: &Path,
+    opts: &TagCountOptions<'_>,
+    host: &crate::host::Host,
+) -> Result<Vec<TagCount>> {
     // Need indexdata either for the type-filter schedule or (when there
     // is no type filter) simply for the all-kinds schedule the parallel
     // path uses. `require_indexdata` gracefully accepts `force`.
@@ -75,6 +79,7 @@ pub fn tags_count(path: &Path, opts: &TagCountOptions<'_>) -> Result<Vec<TagCoun
         opts.force,
         "input PBF has no blob-level indexdata. Without indexdata, the type filter \
          is a no-op - all blobs are decompressed (significantly slower).",
+        host,
     )?;
 
     let expressions = if opts.expressions.is_empty() {
@@ -111,9 +116,15 @@ pub fn tags_count(path: &Path, opts: &TagCountOptions<'_>) -> Result<Vec<TagCoun
             path,
             kind_filter,
             blob_filter.as_ref(),
+            &host.diagnostics,
         )?;
     if blobs_skipped_by_tag > 0 {
-        eprintln!("[tags-count] {blobs_skipped_by_tag} blobs skipped by tag index");
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "tags_count.blobs_skipped_by_tag",
+            "[tags-count] {blobs_skipped_by_tag} blobs skipped by tag index"
+        );
     }
     let thread_override = (opts.jobs > 0).then_some(opts.jobs);
     let mut counts: CountMap = FxHashMap::default();
@@ -138,6 +149,7 @@ pub fn tags_count(path: &Path, opts: &TagCountOptions<'_>) -> Result<Vec<TagCoun
         |_seq, per_blob| {
             merge_counts(&mut counts, per_blob);
         },
+        &*host.resources,
     )?;
 
     let capacity: usize = counts.values().map(rustc_hash::FxHashMap::len).sum();

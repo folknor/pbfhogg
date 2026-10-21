@@ -40,10 +40,11 @@ pub(super) fn run_pass1(
     input_path: &Path,
     direct_io: bool,
     strings: &mut StringPool,
+    host: &crate::host::Host,
 ) -> Result<(Vec<RawAdminRelation>, crate::idset::IdSet)> {
     let mut admin_relations: Vec<RawAdminRelation> = Vec::new();
     {
-        let reader = ElementReader::open(input_path, direct_io)?;
+        let reader = ElementReader::open_in(input_path, direct_io, host)?;
         reader
             .with_blob_filter(BlobFilter::only_relations())
             .for_each_block_pipelined(|block| {

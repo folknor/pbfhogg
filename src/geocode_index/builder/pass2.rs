@@ -375,6 +375,7 @@ pub(super) fn run_pass2(
     needed_admin_ways: crate::idset::IdSet,
     mut referenced_nodes: crate::idset::IdSet,
     strings: &mut StringPool,
+    host: &crate::host::Host,
 ) -> Result<Pass2Output> {
     let mut interp_ways: Vec<SlimInterpWay> = Vec::new();
     // Compact rank-indexed coord array. Instead of a 128 GB sparse DenseMmapIndex
@@ -386,7 +387,10 @@ pub(super) fn run_pass2(
     referenced_nodes.build_rank_index();
     crate::debug::emit_marker("GEOCODE_PASS2_RANK_INDEX_END");
     let referenced_count = referenced_nodes.total_count();
-    eprintln!(
+    crate::host::diag!(
+        host.diagnostics,
+        Progress,
+        "geocode.pass2.referenced_nodes",
         "  {referenced_count} referenced nodes, compact index = {} MB",
         referenced_count * 8 / 1_000_000
     );
@@ -517,6 +521,7 @@ pub(super) fn run_pass2(
                     addr_point_count += 1;
                 }
             },
+            &*host.resources,
         )?;
         if let Some(e) = merge_err {
             return Err(e.into());
@@ -681,6 +686,7 @@ pub(super) fn run_pass2(
                     street_way_count += 1;
                 }
             },
+            &*host.resources,
         )?;
         if let Some(e) = merge_err {
             return Err(e.into());
@@ -699,7 +705,10 @@ pub(super) fn run_pass2(
     drop(addr_points_out);
     drop(interp_nodes_out);
 
-    eprintln!(
+    crate::host::diag!(
+        host.diagnostics,
+        Progress,
+        "geocode.pass2.counts",
         "  {} addr, {} streets, {} interp, {} admin way geoms",
         addr_point_count,
         street_way_count,

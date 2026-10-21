@@ -24,6 +24,7 @@ const BLOCK_QUEUE: usize = 8;
 #[derive(Clone, Debug)]
 pub struct ElementReader<R: Read + Send> {
     blob_iter: BlobReader<R>,
+    resources: Option<crate::host::ResourcesHandle>,
     header: HeaderBlock,
     decode_threads: Option<usize>,
     pipeline_config: PipelineConfig,
@@ -56,10 +57,18 @@ impl<R: Read + Send> ElementReader<R> {
         Ok(ElementReader {
             blob_iter,
             header,
+            resources: None,
             decode_threads: None,
             pipeline_config: PipelineConfig::default(),
             blob_filter: None,
         })
+    }
+
+    /// Attach per-run diagnostics to this reader.
+    #[must_use]
+    pub fn diagnostics(mut self, diagnostics: crate::host::Diagnostics) -> Self {
+        self.blob_iter = self.blob_iter.diagnostics(diagnostics);
+        self
     }
 
     /// Sets a blob-type filter for the pipelined reader.
@@ -281,6 +290,7 @@ impl<R: Read + Send> ElementReader<R> {
             self.decode_threads,
             self.pipeline_config,
             self.blob_filter,
+            self.resources,
             f,
         )
     }
@@ -299,6 +309,7 @@ impl<R: Read + Send> ElementReader<R> {
             self.decode_threads,
             self.pipeline_config,
             self.blob_filter,
+            self.resources,
             &transform,
             consume,
         )
@@ -335,6 +346,7 @@ impl<R: Read + Send> ElementReader<R> {
         let decode_threads = self.decode_threads;
         let pipeline_config = self.pipeline_config;
         let blob_filter = self.blob_filter;
+        let resources = self.resources;
 
         let handle = std::thread::spawn(move || {
             let deliver = |block: PrimitiveBlock| {
@@ -349,6 +361,7 @@ impl<R: Read + Send> ElementReader<R> {
                 decode_threads,
                 pipeline_config,
                 blob_filter,
+                resources,
                 deliver,
             );
             if let Err(e) = result {
@@ -436,9 +449,15 @@ impl<R: Read + Send> ElementReader<R> {
 
         // Reserve one thread for the frame pump (this thread); the rest decode.
         let worker_count = self.decode_threads.unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get().saturating_sub(1).max(1))
-                .unwrap_or(3)
+            crate::host::sized_workers(
+                self.resources.as_ref().map_or(
+                    &crate::host::MachineProbe as &dyn crate::host::Resources,
+                    |r| &*r.0,
+                ),
+                1,
+                1,
+                3,
+            )
         });
 
         par_fold_blobs(
@@ -944,6 +963,7 @@ impl ElementReader<FileReader> {
         Ok(ElementReader {
             blob_iter,
             header,
+            resources: None,
             decode_threads: None,
             pipeline_config: PipelineConfig::default(),
             blob_filter: None,
@@ -958,6 +978,7 @@ impl ElementReader<FileReader> {
         Ok(ElementReader {
             blob_iter,
             header,
+            resources: None,
             decode_threads: None,
             pipeline_config: PipelineConfig::default(),
             blob_filter: None,
@@ -989,6 +1010,7 @@ impl ElementReader<FileReader> {
         Ok(ElementReader {
             blob_iter,
             header,
+            resources: None,
             decode_threads: None,
             pipeline_config: PipelineConfig::default(),
             blob_filter: None,
@@ -1012,12 +1034,32 @@ impl ElementReader<FileReader> {
     }
 
     /// Open a file, selecting buffered or O_DIRECT based on the `direct` flag.
+    pub(crate) fn open_in<P: AsRef<Path>>(
+        path: P,
+        direct: bool,
+        host: &crate::host::Host,
+    ) -> Result<Self> {
+        let mut blob_iter = BlobReader::open_in(path, direct, host)?;
+        let header = read_header_blob(&mut blob_iter)?;
+        Ok(Self {
+            blob_iter,
+            header,
+            resources: Some(crate::host::ResourcesHandle(std::sync::Arc::clone(
+                &host.resources,
+            ))),
+            decode_threads: None,
+            pipeline_config: PipelineConfig::default(),
+            blob_filter: None,
+        })
+    }
+
     pub fn open<P: AsRef<Path>>(path: P, direct: bool) -> Result<Self> {
         let mut blob_iter = BlobReader::open(path, direct)?;
         let header = read_header_blob(&mut blob_iter)?;
         Ok(ElementReader {
             blob_iter,
             header,
+            resources: None,
             decode_threads: None,
             pipeline_config: PipelineConfig::default(),
             blob_filter: None,

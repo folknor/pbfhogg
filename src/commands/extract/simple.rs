@@ -107,16 +107,17 @@ pub(super) fn extract_simple(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<ExtractStats> {
     // Check if input is sorted - if so, classify + write in a single file pass.
     // We need a quick header check without keeping the reader open. Use BlobReader
     // to read just the first blob (header).
     let is_sorted = {
-        let mut br = crate::BlobReader::open(input, direct_io)?;
+        let mut br = crate::BlobReader::open_in(input, direct_io, host)?;
         match br.next() {
             Some(Ok(blob)) => match blob.decode()? {
                 crate::blob::BlobDecode::OsmHeader(h) => {
-                    super::super::warn_locations_on_ways_loss(&h);
+                    super::super::warn_locations_on_ways_loss(&h, host);
                     h.is_sorted()
                 }
                 _ => false,
@@ -135,6 +136,7 @@ pub(super) fn extract_simple(
             compression,
             direct_io,
             overrides,
+            host,
         );
     }
 
@@ -147,6 +149,7 @@ pub(super) fn extract_simple(
         compression,
         direct_io,
         overrides,
+        host,
     )
 }
 
@@ -161,6 +164,7 @@ fn extract_simple_two_pass(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<ExtractStats> {
     crate::debug::emit_marker("SIMPLE_UNSORTED_PASS1_START");
     let mut stats = ExtractStats {
@@ -195,7 +199,7 @@ fn extract_simple_two_pass(
         ClassifyPhase::Ways,
         ClassifyPhase::Relations,
     ] {
-        let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+        let mut blob_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
         blob_reader.set_parse_indexdata(true);
         blob_reader
             .next()
@@ -229,7 +233,7 @@ fn extract_simple_two_pass(
     crate::debug::emit_marker("SIMPLE_UNSORTED_PASS2_START");
     let all_way_node_ids = IdSet::new();
 
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    let mut blob_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
     blob_reader.set_parse_indexdata(true);
     let header_blob = blob_reader
         .next()
@@ -252,6 +256,7 @@ fn extract_simple_two_pass(
         },
         direct_io,
         false,
+        host,
     )?;
 
     let ids = ExtractPass2IdSets {
@@ -272,12 +277,12 @@ fn extract_simple_two_pass(
         let block = PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))?;
         batch.push(block);
         if batch.len() >= BATCH_SIZE {
-            process_extract_pass2_batch(&batch, &ids, clean, &mut writer, &mut stats)?;
+            process_extract_pass2_batch(&batch, &ids, clean, &mut writer, &mut stats, host)?;
             batch.clear();
         }
     }
     if !batch.is_empty() {
-        process_extract_pass2_batch(&batch, &ids, clean, &mut writer, &mut stats)?;
+        process_extract_pass2_batch(&batch, &ids, clean, &mut writer, &mut stats, host)?;
     }
 
     writer.flush()?;
@@ -310,6 +315,7 @@ fn extract_simple_single_pass(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<ExtractStats> {
     crate::debug::emit_marker("EXTRACT_SCAN_START");
     let mut stats = ExtractStats {
@@ -338,7 +344,8 @@ fn extract_simple_single_pass(
     } else {
         None
     };
-    let full_schedule = build_blob_schedule_with_passthrough(input, passthrough_bbox.as_ref())?;
+    let full_schedule =
+        build_blob_schedule_with_passthrough(input, passthrough_bbox.as_ref(), host)?;
     let node_schedule: Vec<&BlobDesc> = full_schedule
         .iter()
         .filter(|d| {
@@ -375,13 +382,13 @@ fn extract_simple_single_pass(
         .collect();
 
     // Open writer.
-    let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
     let header_blob = header_reader
         .next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
     let header = header_blob.to_headerblock()?;
     drop(header_reader);
-    super::super::warn_locations_on_ways_loss(&header);
+    super::super::warn_locations_on_ways_loss(&header, host);
     let bbox = region.bbox();
     let mut writer = writer_from_header(
         output,
@@ -399,6 +406,7 @@ fn extract_simple_single_pass(
         },
         direct_io,
         false,
+        host,
     )?;
 
     let mut bbox_node_ids = IdSet::new();
@@ -421,9 +429,7 @@ fn extract_simple_single_pass(
                 .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
         );
 
-        let decode_threads = std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(2).max(1))
-            .unwrap_or(4);
+        let decode_threads = crate::host::sized_workers(&*host.resources, 2, 1, 4);
 
         type ClassifyResult = (usize, crate::error::Result<Vec<i64>>);
         let (cls_tx, cls_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
@@ -542,6 +548,7 @@ fn extract_simple_single_pass(
                 flush_local(bb, output)?;
                 Ok(s)
             },
+            host,
         )?;
     }
 
@@ -555,9 +562,7 @@ fn extract_simple_single_pass(
             std::fs::File::open(input)
                 .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
         );
-        let decode_threads = std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(2).max(1))
-            .unwrap_or(4);
+        let decode_threads = crate::host::sized_workers(&*host.resources, 2, 1, 4);
 
         type WayClassifyResult = (usize, crate::error::Result<Vec<i64>>);
         let (cls_tx, cls_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
@@ -677,6 +682,7 @@ fn extract_simple_single_pass(
                 flush_local(bb, output)?;
                 Ok(s)
             },
+            host,
         )?;
     }
 
@@ -708,6 +714,7 @@ fn extract_simple_single_pass(
             |worker_ids| {
                 matched_relation_ids.merge(worker_ids);
             },
+            &*host.resources,
         )?;
     }
     crate::debug::emit_marker("SIMPLE_REL_CLASSIFY_END");
@@ -743,6 +750,7 @@ fn extract_simple_single_pass(
                 flush_local(bb, output)?;
                 Ok(s)
             },
+            host,
         )?;
     }
 
@@ -759,6 +767,7 @@ fn process_extract_pass2_batch(
     clean: &CleanAttrs,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut ExtractStats,
+    host: &crate::host::Host,
 ) -> Result<()> {
     type BatchResult = std::result::Result<(Vec<OwnedBlock>, ExtractStats), String>;
     let results: Vec<BatchResult> = batch
@@ -771,6 +780,6 @@ fn process_extract_pass2_batch(
         })
         .collect();
 
-    drain_batch_results(results, writer, |s| merge_extract_stats(stats, &s))?;
+    drain_batch_results(results, writer, |s| merge_extract_stats(stats, &s), host)?;
     Ok(())
 }

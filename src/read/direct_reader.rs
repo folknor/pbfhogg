@@ -266,9 +266,7 @@ mod tests {
                 reader.read_to_end(&mut buf).unwrap();
                 assert_eq!(buf, data);
             }
-            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
-                eprintln!("Skipping direct_reader test: O_DIRECT not supported (EINVAL)");
-            }
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
             Err(e) => panic!("unexpected error: {e}"),
         }
     }

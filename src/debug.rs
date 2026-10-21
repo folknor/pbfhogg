@@ -1,3 +1,14 @@
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+static ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Enable lazy marker FIFO initialization from the environment.
+pub fn enable_marker_fifo_from_env() {
+    ARMED.store(true, Relaxed);
+}
+
+/// No-op unless `enable_marker_fifo_from_env` has been called.
+///
 /// Emit a named phase marker to the sidecar profiler (if active).
 ///
 /// The marker is timestamped with monotonic microseconds since process start
@@ -47,6 +58,9 @@ pub fn emit_counter(name: &str, value: i64) {
 /// On non-glibc platforms this is a no-op.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub fn emit_mallinfo2(prefix: &str) {
+    if !ARMED.load(Relaxed) {
+        return;
+    }
     // SAFETY: mallinfo2 is a glibc function safe to call from any thread.
     let info = unsafe { libc::mallinfo2() };
     #[allow(clippy::cast_possible_wrap)]
@@ -63,96 +77,13 @@ pub fn emit_mallinfo2(prefix: &str) {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 pub fn emit_mallinfo2(_prefix: &str) {}
 
-/// Ask glibc to return free chunks above the trim threshold to the OS
-/// (`malloc_trim(0)`). Returns 1 if memory was released, 0 otherwise.
-///
-/// Use to fight the documented cross-thread `PrimitiveBlock` retention
-/// pattern (`src/read/pipeline.rs:66-89`): decoded blocks are
-/// allocated on rayon decode threads and dropped on the consumer
-/// thread; glibc retains those pages on the decode-thread arena's
-/// free list rather than returning them to the OS, which manifests
-/// as steadily-climbing anon RSS at scale. Calling `malloc_trim(0)`
-/// at a batch boundary forces a sweep across all arenas.
-///
-/// Cost: a few ms per call at planet scale (one pass over the
-/// free-list). Cheap enough to fire per snapshot batch (~140
-/// batches at planet, ~150 ms total).
-///
-/// On non-glibc / non-Linux this is a no-op returning 0.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-pub fn malloc_trim() -> i32 {
-    // SAFETY: malloc_trim is a glibc function safe to call from any thread.
-    unsafe { libc::malloc_trim(0) }
-}
-
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-pub fn malloc_trim() -> i32 {
-    0
-}
-
-/// Lower glibc's `M_MMAP_THRESHOLD` so allocations >= `bytes` route
-/// through `mmap`/`munmap` instead of brk. mmap-backed chunks are
-/// released back to the OS the moment they're freed, while brk-arena
-/// chunks accumulate as fragmentation when allocations interleave
-/// across threads.
-///
-/// Use to fight the cross-thread `PrimitiveBlock` retention pattern
-/// when mallinfo2 shows growth concentrated in `arena` (brk) with
-/// `hblkhd` (mmap) flat. Default glibc threshold is 128 KB and is
-/// also dynamic (climbs as the program runs, up to 32 MB). This
-/// pins it to a hard floor.
-///
-/// Call once early in the run; the setting is process-global. On
-/// non-glibc / non-Linux this is a no-op returning 0.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-pub fn set_mmap_threshold(bytes: i32) -> i32 {
-    // SAFETY: mallopt is glibc and safe to call from any thread
-    // before allocations grow past the desired threshold.
-    unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, bytes) }
-}
-
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-pub fn set_mmap_threshold(_bytes: i32) -> i32 {
-    0
-}
-
-/// Cap glibc's malloc arena count at 2 (`mallopt(M_ARENA_MAX, 2)`).
-///
-/// glibc gives each thread its own arena on contention, up to 8 x cores.
-/// When buffers are allocated on one thread and freed on another (decode
-/// or pread workers allocate, the merge / compression / consumer thread
-/// frees), the freed chunks land back on the allocating thread's arena
-/// and accumulate there as fragmentation instead of being reused or
-/// returned to the OS. At planet scale that is the cross-thread
-/// `PrimitiveBlock` retention pattern (`src/read/pipeline.rs`), and it
-/// shows as anon RSS climbing into the tens of GB. Two arenas force
-/// the worker pool to share free lists, which keeps the peak bounded.
-///
-/// The cost is lock contention on the shared arenas, which hurts
-/// workers that keep allocation-heavy scratch alive across blobs on the
-/// same thread. Call sites document why their worker shape is safe.
-///
-/// The setting is process-global and is never reset: once a command
-/// calls this, every later allocation in the process sees the cap, so a
-/// library caller that runs several commands in one process inherits it.
-/// Call it once, early, before the worker pool spins up. On non-glibc /
-/// non-Linux this is a no-op.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-pub fn cap_malloc_arenas() {
-    // SAFETY: mallopt is glibc and safe to call from any thread; the
-    // return value only reports an invalid parameter, which 2 is not.
-    unsafe {
-        libc::mallopt(libc::M_ARENA_MAX, 2);
-    }
-}
-
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-pub fn cap_malloc_arenas() {}
-
 /// Read cumulative (minor, major) page faults from `/proc/self/stat`.
 /// Returns `(minflt, majflt)`. Returns `(0, 0)` on failure or non-Linux.
 #[cfg(target_os = "linux")]
 pub fn read_page_faults() -> (u64, u64) {
+    if !ARMED.load(Relaxed) {
+        return (0, 0);
+    }
     let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
         return (0, 0);
     };
@@ -172,6 +103,9 @@ pub fn read_page_faults() -> (u64, u64) {
 
 #[cfg(not(target_os = "linux"))]
 pub fn read_page_faults() -> (u64, u64) {
+    if !ARMED.load(Relaxed) {
+        return (0, 0);
+    }
     (0, 0)
 }
 
@@ -272,6 +206,9 @@ fn micros_since_process_start() -> Option<u64> {
 
 /// Shared FIFO write logic for markers and counters.
 fn write_fifo(f: impl FnOnce(&std::fs::File, u128)) {
+    if !ARMED.load(Relaxed) {
+        return;
+    }
     use std::sync::OnceLock;
 
     /// The FIFO handle plus the marker-clock epoch: an `Instant` and the

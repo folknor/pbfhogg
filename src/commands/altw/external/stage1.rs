@@ -544,6 +544,7 @@ pub(super) fn stage1_way_pass(
     ref_count_sidecar: &Path,
     per_way_refcount_sidecar: &Path,
     inject_prepass: bool,
+    host: &crate::host::Host,
 ) -> Result<Stage1Output> {
     let schedule = build_way_schedule(blob_meta)?;
 
@@ -555,12 +556,17 @@ pub(super) fn stage1_way_pass(
     // floor the worker count to what actually fits. Narrate the outcome
     // to stderr so the user sees what adjustments we made on their
     // behalf.
-    let cpu_cap = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(4);
-    let fd_budget = super::raise_nofile_to_hard_cap();
-    eprintln!("[altw external] {fd_budget}");
-    let effective_soft = fd_budget.effective_soft;
+    let cpu_cap = crate::host::sized_workers(&*host.resources, 2, 1, 4);
+    let fd_budget = host
+        .process
+        .fd_allowance(cpu_cap as u64 * NUM_BUCKETS as u64 + 64);
+    crate::host::diag!(
+        host.diagnostics,
+        Developer,
+        "altw.external.nofile",
+        "[altw external] {fd_budget}"
+    );
+    let effective_soft = fd_budget.descriptors;
     // Headroom for input PBF, scratch dir, sidecars, stdin/stdout/stderr,
     // mpsc channel fds, rayon worker fds, page-cache probe fds, etc.
     const HEADROOM_FDS: u64 = 64;
@@ -579,12 +585,18 @@ pub(super) fn stage1_way_pass(
     let fd_cap = ((effective_soft - HEADROOM_FDS) / buckets_per_worker) as usize;
     let num_workers = cpu_cap.min(fd_cap).max(1);
     if num_workers < cpu_cap {
-        eprintln!(
+        crate::host::diag!(
+            host.diagnostics,
+            Developer,
+            "altw.external.workers",
             "[altw external] num_workers = {num_workers} \
              (capped from cpu={cpu_cap} by fd budget; each worker holds {NUM_BUCKETS} rank-shards)"
         );
     } else {
-        eprintln!(
+        crate::host::diag!(
+            host.diagnostics,
+            Developer,
+            "altw.external.workers",
             "[altw external] num_workers = {num_workers} \
              (cpu-bound; fd budget allows up to {fd_cap} workers)"
         );

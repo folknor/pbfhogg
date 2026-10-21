@@ -124,7 +124,7 @@ struct RelBlobResult {
 /// # Architecture
 ///
 /// Three-phase parallel scan following the renumber_external pattern.
-/// [`crate::debug::cap_malloc_arenas`] caps glibc arenas to prevent
+/// [`crate::host::ProcessActions::cross_thread_alloc_pool`] caps glibc arenas to prevent
 /// cross-thread alloc/free fragmentation from the pread worker pool. Each
 /// phase builds a per-kind schedule via [`build_classify_schedule`] and
 /// dispatches through [`parallel_classify_phase`]: workers pread +
@@ -171,6 +171,7 @@ pub fn check_refs(
     check_relations: bool,
     show_ids: bool,
     direct_io: bool,
+    host: &crate::host::Host,
 ) -> Result<RefCheckResult> {
     // `direct_io` is not plumbed through the parallel pread workers yet
     // (parallel_classify_phase opens the input via a shared Arc<File>
@@ -182,7 +183,7 @@ pub fn check_refs(
 
     // Pread worker pool allocates decoded blocks; the main thread frees
     // them after the merge.
-    crate::debug::cap_malloc_arenas();
+    host.process.cross_thread_alloc_pool();
 
     let mut result = RefCheckResult {
         node_count: 0,
@@ -213,7 +214,7 @@ pub fn check_refs(
     // once. At Europe scale the header walk is ~15 s; three separate
     // `build_classify_schedule` calls would triple that cost.
     let (node_schedule, way_schedule, rel_schedule, shared_file, max_ids) =
-        build_classify_schedules_split(path)?;
+        build_classify_schedules_split(path, &host.diagnostics)?;
 
     // IdSets sized from what the file itself reports, floored at the current
     // OSM ID ceilings so a file whose indexdata understates its range (or
@@ -280,6 +281,7 @@ pub fn check_refs(
                 result.node_count += count;
                 result.untrackable_ids[0] += untrackable;
             },
+            &*host.resources,
         )?;
     }
     crate::debug::emit_marker("CHECKREFS_NODES_END");
@@ -335,6 +337,7 @@ pub fn check_refs(
                     missing_refs.extend(r.missing_refs);
                 }
             },
+            &*host.resources,
         )?;
     }
     crate::debug::emit_marker("CHECKREFS_WAYS_END");
@@ -431,6 +434,7 @@ pub fn check_refs(
                         missing_refs.extend(r.missing_refs);
                     }
                 },
+                &*host.resources,
             )?;
         }
         crate::debug::emit_marker("CHECKREFS_RELATIONS_END");

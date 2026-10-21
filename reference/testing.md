@@ -56,9 +56,8 @@ NAME` list each harness in turn to find one test.
   harnesses. `fault_apply_changes` uses a per-instance hook and is a
   module of `all`.
 - **What the shared binary shares.** Every module of `all` runs
-  concurrently in one process with: the global rayon pool; the glibc
-  arena cap the library's commands set (`debug::cap_malloc_arenas`);
-  `RLIMIT_NOFILE`, which altw's external backend raises; and every
+  concurrently in one process with: the global rayon pool;
+  `RLIMIT_NOFILE`, raised once per process by `common::test_host()`; and every
   `test-hooks` static, which nothing in `all` may arm.
   A test that needs any of this to itself, or arms a static hook,
   takes a target of its own.
@@ -247,3 +246,7 @@ exception, not a tier - should not survive across many PRs.
   should ship with three tests: a worker-panic test, a `-j N` vs
   `-j 2` parity test, and a scratch-leak test. Worth considering as
   a CI gate.
+
+`pbfhogg::host` and `pbfhogg::process` are stable test imports. Library tests
+use `NoProcessActions`; the CLI applies its arena cap in a child. The
+`process_nofile` target owns its process because it needs an unraised limit.

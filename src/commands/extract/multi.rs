@@ -37,16 +37,17 @@ pub(super) fn try_extract_multi_single_pass(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<Option<Vec<ExtractStats>>> {
     use std::io::BufWriter;
 
     // Check if input is sorted.
     let header = {
-        let mut br = crate::BlobReader::open(input, direct_io)?;
+        let mut br = crate::BlobReader::open_in(input, direct_io, host)?;
         match br.next() {
             Some(Ok(blob)) => match blob.decode()? {
                 crate::blob::BlobDecode::OsmHeader(h) => {
-                    super::super::warn_locations_on_ways_loss(&h);
+                    super::super::warn_locations_on_ways_loss(&h, host);
                     if !h.is_sorted() {
                         return Ok(None); // fall back to sequential
                     }
@@ -60,7 +61,12 @@ pub(super) fn try_extract_multi_single_pass(
 
     let n = slots.len();
     crate::debug::emit_marker("MULTI_EXTRACT_START");
-    eprintln!("[multi-extract] single-pass: {n} regions, simple strategy");
+    crate::host::diag!(
+        host.diagnostics,
+        Progress,
+        "extract.multi.single_pass",
+        "[multi-extract] single-pass: {n} regions, simple strategy"
+    );
 
     // Precompute per-region integer bboxes.
     let bbox_ints: Vec<BboxInt> = slots
@@ -146,7 +152,7 @@ pub(super) fn try_extract_multi_single_pass(
     // page cache during the scan - the per-kind classification passes open
     // fresh fds and pread only the blobs they need.
     crate::debug::emit_marker("MULTI_SCHEDULE_SCAN_START");
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
     let _ = walker
         .next_header()?
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
@@ -303,6 +309,7 @@ pub(super) fn try_extract_multi_single_pass(
                     }
                 }
             },
+            &*host.resources,
         )?;
     } else {
         crate::scan::classify::parallel_classify_phase(
@@ -359,6 +366,7 @@ pub(super) fn try_extract_multi_single_pass(
                     }
                 }
             },
+            &*host.resources,
         )?;
     }
     crate::debug::emit_marker("MULTI_NODE_CLASSIFY_END");
@@ -418,6 +426,7 @@ pub(super) fn try_extract_multi_single_pass(
         },
         &mut writers,
         &mut stats,
+        host,
     )?;
     crate::debug::emit_marker("MULTI_NODE_WRITE_END");
 
@@ -471,6 +480,7 @@ pub(super) fn try_extract_multi_single_pass(
                 }
             }
         },
+        &*host.resources,
     )?;
     crate::debug::emit_marker("MULTI_WAY_CLASSIFY_END");
 
@@ -505,6 +515,7 @@ pub(super) fn try_extract_multi_single_pass(
         &mut writers,
         &mut stats,
         |s| &mut s.ways_written,
+        host,
     )?;
     crate::debug::emit_marker("MULTI_WAY_WRITE_END");
 
@@ -531,6 +542,7 @@ pub(super) fn try_extract_multi_single_pass(
                 matched_relation_ids[i].merge(worker_set);
             }
         },
+        &*host.resources,
     )?;
     crate::debug::emit_marker("MULTI_REL_CLASSIFY_END");
 
@@ -569,6 +581,7 @@ pub(super) fn try_extract_multi_single_pass(
         &mut writers,
         &mut stats,
         |s| &mut s.relations_written,
+        host,
     )?;
     crate::debug::emit_marker("MULTI_REL_WRITE_END");
 
@@ -583,7 +596,10 @@ pub(super) fn try_extract_multi_single_pass(
     for (i, slot) in slots.iter().enumerate() {
         let s = &stats[i];
         let total = s.nodes_in_bbox + s.ways_written + s.relations_written;
-        eprintln!(
+        crate::host::diag!(
+            host.diagnostics,
+            Progress,
+            "extract.multi.slot_counts",
             "  [{}] {}: {} elements ({} nodes, {} ways, {} relations)",
             i + 1,
             slot.output
@@ -642,6 +658,7 @@ struct NodeBlobInfo {
 
 #[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
+#[allow(clippy::too_many_arguments)]
 fn multi_extract_pread_write_nodes<F>(
     shared_file: &std::sync::Arc<std::fs::File>,
     schedule: &[(usize, u64, usize)],
@@ -650,6 +667,7 @@ fn multi_extract_pread_write_nodes<F>(
     block_fn: F,
     writers: &mut [PbfWriter<std::io::BufWriter<std::fs::File>>],
     stats: &mut [ExtractStats],
+    host: &crate::host::Host,
 ) -> Result<()>
 where
     F: Fn(
@@ -684,7 +702,12 @@ where
     if !passthrough_items.is_empty() {
         let pt = passthrough_items.len();
         let dc = decode_items.len();
-        eprintln!("  node blobs: {pt} passthrough, {dc} decoded");
+        crate::host::diag!(
+            host.diagnostics,
+            Progress,
+            "extract.multi.node_blobs",
+            "  node blobs: {pt} passthrough, {dc} decoded"
+        );
     }
 
     // If everything is passthrough, skip the thread scope entirely.
@@ -703,9 +726,7 @@ where
         return Ok(());
     }
 
-    let decode_threads = std::thread::available_parallelism()
-        .map(|t| t.get().saturating_sub(2).max(1))
-        .unwrap_or(4);
+    let decode_threads = crate::host::sized_workers(&*host.resources, 2, 1, 4);
 
     type WorkerResult = crate::error::Result<(Vec<Vec<OwnedBlock>>, Vec<u64>)>;
 
@@ -870,6 +891,7 @@ enum MultiNodeCI {
 /// writer in sequence order.
 #[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
+#[allow(clippy::too_many_arguments)]
 fn multi_extract_pread_write<F>(
     shared_file: &std::sync::Arc<std::fs::File>,
     schedule: &[(usize, u64, usize)],
@@ -878,6 +900,7 @@ fn multi_extract_pread_write<F>(
     writers: &mut [PbfWriter<std::io::BufWriter<std::fs::File>>],
     stats: &mut [ExtractStats],
     stat_field: fn(&mut ExtractStats) -> &mut u64,
+    host: &crate::host::Host,
 ) -> Result<()>
 where
     F: Fn(
@@ -895,9 +918,7 @@ where
         return Ok(());
     }
 
-    let decode_threads = std::thread::available_parallelism()
-        .map(|t| t.get().saturating_sub(2).max(1))
-        .unwrap_or(4);
+    let decode_threads = crate::host::sized_workers(&*host.resources, 2, 1, 4);
 
     // Worker result: per-region OwnedBlocks + per-region counts.
     type WorkerResult = crate::error::Result<(Vec<Vec<OwnedBlock>>, Vec<u64>)>;

@@ -165,12 +165,10 @@ impl WillneedPrefetch {
 /// comment in `src/read/pipeline.rs::run_pipeline`. `Some(0)` is
 /// treated identically to `None` so CLI flags that map "0 = auto"
 /// pass through cleanly. `Some(n)` forces exactly `n` threads.
-fn resolve_thread_count(threads: Option<usize>) -> usize {
+fn resolve_thread_count(threads: Option<usize>, resources: &dyn crate::host::Resources) -> usize {
     match threads {
         Some(n) if n > 0 => n,
-        _ => std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(2).max(1))
-            .unwrap_or(4),
+        _ => crate::host::sized_workers(resources, 2, 1, 4),
     }
 }
 
@@ -237,9 +235,10 @@ pub(crate) fn blob_filter_check(
 pub(crate) fn build_classify_schedule(
     input: &std::path::Path,
     kind_filter: Option<crate::blob_meta::ElemKind>,
+    diagnostics: &crate::host::Diagnostics,
 ) -> Result<(Vec<ScheduleEntry>, std::sync::Arc<std::fs::File>)> {
     let (schedule, file, _skipped) =
-        build_classify_schedule_blob_filtered(input, kind_filter, None)?;
+        build_classify_schedule_blob_filtered(input, kind_filter, None, diagnostics)?;
     Ok((schedule, file))
 }
 
@@ -258,9 +257,10 @@ pub(crate) fn build_classify_schedule_blob_filtered(
     input: &std::path::Path,
     kind_filter: Option<crate::blob_meta::ElemKind>,
     blob_filter: Option<&crate::blob_meta::BlobFilter>,
+    diagnostics: &crate::host::Diagnostics,
 ) -> Result<(Vec<ScheduleEntry>, std::sync::Arc<std::fs::File>, u64)> {
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input, diagnostics)?;
     // Consume the first blob (expected OSMHeader). Bug-for-bug equivalent
     // to the prior `next_header_skip_blob` call: on an empty file return
     // MissingHeader; on non-empty files the first blob is dropped without
@@ -345,6 +345,7 @@ pub(crate) fn build_classify_schedule_blob_filtered(
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_classify_schedules_split(
     input: &std::path::Path,
+    diagnostics: &crate::host::Diagnostics,
 ) -> Result<(
     Vec<ScheduleEntry>,
     Vec<ScheduleEntry>,
@@ -353,7 +354,7 @@ pub(crate) fn build_classify_schedules_split(
     [i64; 3],
 )> {
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input, diagnostics)?;
     let _ = walker
         .next_header()?
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
@@ -449,6 +450,7 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
     worker_init: impl Fn() -> S + Send + Sync,
     classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> R + Send + Sync,
     mut merge: impl FnMut(usize, R),
+    resources: &dyn crate::host::Resources,
 ) -> Result<()> {
     parallel_classify_phase_abortable(
         shared_file,
@@ -460,6 +462,7 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
             merge(seq, r);
             std::ops::ControlFlow::Continue(())
         },
+        resources,
     )
 }
 
@@ -483,6 +486,7 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
     worker_init: impl Fn() -> S + Send + Sync,
     classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> R + Send + Sync,
     mut merge: impl FnMut(usize, R) -> std::ops::ControlFlow<()>,
+    resources: &dyn crate::host::Resources,
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
@@ -491,7 +495,7 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
         return Ok(());
     }
 
-    let decode_threads = resolve_thread_count(threads);
+    let decode_threads = resolve_thread_count(threads, resources);
 
     let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<ScheduleEntry>(16);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
@@ -592,6 +596,7 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
     worker_init: impl Fn() -> S + Send + Sync,
     classify: impl Fn(&[u8], &mut S) -> crate::error::Result<R> + Send + Sync,
     mut merge: impl FnMut(usize, R),
+    resources: &dyn crate::host::Resources,
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
@@ -600,7 +605,7 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
         return Ok(());
     }
 
-    let decode_threads = resolve_thread_count(threads);
+    let decode_threads = resolve_thread_count(threads, resources);
 
     let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<ScheduleEntry>(16);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
@@ -730,6 +735,7 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
     worker_init: impl Fn() -> S + Send + Sync,
     classify: impl Fn(&crate::PrimitiveBlock, &mut S) + Send + Sync,
     mut merge: impl FnMut(S),
+    resources: &dyn crate::host::Resources,
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
@@ -738,7 +744,7 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
         return Ok(());
     }
 
-    let decode_threads = resolve_thread_count(threads);
+    let decode_threads = resolve_thread_count(threads, resources);
 
     let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<ScheduleEntry>(16);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
@@ -857,7 +863,9 @@ mod tests {
         const BLOBS: usize = 400;
         let path = write_many_blob_pbf(dir.path(), BLOBS);
 
-        let (schedule, shared_file) = super::build_classify_schedule(&path, None).unwrap();
+        let (schedule, shared_file) =
+            super::build_classify_schedule(&path, None, &crate::host::Diagnostics::discard())
+                .unwrap();
         assert_eq!(
             schedule.len(),
             BLOBS,
@@ -879,6 +887,7 @@ mod tests {
                 merged += 1;
                 std::ops::ControlFlow::Break(())
             },
+            &crate::host::MachineProbe,
         )
         .unwrap();
 
@@ -907,6 +916,7 @@ mod tests {
             |_seq, ()| {
                 all.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             },
+            &crate::host::MachineProbe,
         )
         .unwrap();
         assert_eq!(all.into_inner(), BLOBS, "a non-breaking scan is exhaustive");

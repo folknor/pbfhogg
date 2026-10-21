@@ -47,9 +47,10 @@ pub struct MergePbfStats {
 }
 
 impl MergePbfStats {
-    pub fn print_summary(&self) {
+    pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         let total = self.nodes + self.ways + self.relations;
-        eprintln!(
+        writeln!(
+            w,
             "Merged {total} elements: {} nodes, {} ways, {} relations \
              ({} blobs: {} passthrough, {} rewritten, {} duplicates removed)",
             self.nodes,
@@ -59,7 +60,9 @@ impl MergePbfStats {
             self.blobs_passthrough,
             self.blobs_rewritten,
             self.duplicates_removed,
-        );
+        )?;
+
+        Ok(())
     }
 }
 
@@ -132,6 +135,7 @@ pub fn merge_pbf(
     output: &Path,
     opts: &MergePbfOptions,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<MergePbfStats> {
     if inputs.is_empty() {
         return Err("no input files specified".into());
@@ -145,15 +149,24 @@ pub fn merge_pbf(
             opts.force,
             "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
              decompressed to scan element IDs (significantly slower).",
+            host,
         )?;
     }
 
     crate::debug::emit_marker("MERGEPBF_START");
     // Pass 1: Build blob index from all files
-    eprintln!("Pass 1: indexing blobs...");
-    let (header, mut entries) = build_blob_index(inputs, opts.direct_io)?;
-    crate::commands::warn_locations_on_ways_loss(&header);
-    eprintln!(
+    crate::host::diag!(
+        host.diagnostics,
+        Progress,
+        "cat.dedupe.pass1",
+        "Pass 1: indexing blobs..."
+    );
+    let (header, mut entries) = build_blob_index(inputs, opts.direct_io, host)?;
+    crate::commands::warn_locations_on_ways_loss(&header, host);
+    crate::host::diag!(
+        host.diagnostics,
+        Progress,
+        "cat.dedupe.indexed",
         "  {} OSMData blobs indexed from {} files",
         entries.len(),
         inputs.len()
@@ -171,11 +184,21 @@ pub fn merge_pbf(
     let overlaps = detect_overlaps(&entries);
     let overlap_count = overlaps.iter().filter(|&&b| b).count();
     if overlap_count > 0 {
-        eprintln!("  {overlap_count} blobs in overlap runs (decode + merge + dedup)");
+        crate::host::diag!(
+            host.diagnostics,
+            Progress,
+            "cat.dedupe.overlap_runs",
+            "  {overlap_count} blobs in overlap runs (decode + merge + dedup)"
+        );
     }
 
     // Pass 2: Write in sorted order
-    eprintln!("Pass 2: writing merged output...");
+    crate::host::diag!(
+        host.diagnostics,
+        Progress,
+        "cat.dedupe.pass2",
+        "Pass 2: writing merged output..."
+    );
     #[allow(clippy::redundant_closure_for_method_calls)]
     let header_bytes = build_output_header(&header, false, overrides, |hb| hb.sorted())?;
     let mut writer = writer_from_header_bytes(
@@ -184,6 +207,7 @@ pub fn merge_pbf(
         &header_bytes,
         opts.direct_io,
         opts.io_uring,
+        host,
     )?;
 
     // Open all input files for random access
@@ -227,6 +251,7 @@ pub fn merge_pbf(
                 &mut bb,
                 &mut writer,
                 &mut stats,
+                host,
             )?;
         } else {
             write_passthrough_blob(
@@ -254,6 +279,7 @@ pub fn merge_pbf(
 fn build_blob_index(
     inputs: &[&Path],
     direct_io: bool,
+    host: &crate::host::Host,
 ) -> Result<(crate::HeaderBlock, Vec<BlobEntry>)> {
     let mut entries = Vec::new();
     let mut header: Option<crate::HeaderBlock> = None;
@@ -274,7 +300,8 @@ fn build_blob_index(
             // unvalidated 4-byte prefix, so four bytes of corrupt input asked
             // for up to a 4 GiB allocation - the one frame decoder that had
             // neither guard.
-            let Some(frame) = read_frame_header(&mut reader, &mut header_buf)? else {
+            let Some(frame) = read_frame_header(&mut reader, &mut header_buf, &host.diagnostics)?
+            else {
                 break;
             };
             let index = frame
@@ -469,6 +496,7 @@ fn write_overlap_run(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     stats: &mut MergePbfStats,
+    host: &crate::host::Host,
 ) -> Result<()> {
     let kind = entries[0].index.kind;
     match kind {
@@ -484,6 +512,7 @@ fn write_overlap_run(
                     _ => {}
                 },
                 write_single_node,
+                host,
             )?;
             stats.nodes += c;
             stats.duplicates_removed += d;
@@ -500,6 +529,7 @@ fn write_overlap_run(
                     }
                 },
                 write_single_way,
+                host,
             )?;
             stats.ways += c;
             stats.duplicates_removed += d;
@@ -516,6 +546,7 @@ fn write_overlap_run(
                     }
                 },
                 write_single_relation,
+                host,
             )?;
             stats.relations += c;
             stats.duplicates_removed += d;
@@ -540,7 +571,9 @@ fn sweep_merge_dedup<T: Ord + HasId>(
     writer: &mut PbfWriter<FileWriter>,
     mut extract: impl FnMut(&Element<'_>, &mut BinaryHeap<Reverse<T>>),
     mut write_elem: impl FnMut(&T, &mut BlockBuilder, &mut PbfWriter<FileWriter>) -> Result<()>,
+    host: &crate::host::Host,
 ) -> Result<(u64, u64)> {
+    let _ = host;
     let mut heap: BinaryHeap<Reverse<T>> = BinaryHeap::new();
     let mut frame_buf: Vec<u8> = Vec::new();
     let mut count: u64 = 0;

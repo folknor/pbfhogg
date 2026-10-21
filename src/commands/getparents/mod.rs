@@ -42,17 +42,21 @@ pub struct GetparentsStats {
 }
 
 impl GetparentsStats {
-    pub fn print_summary(&self) {
+    pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         let total = self.nodes_written + self.ways_written + self.relations_written;
-        eprintln!(
+        writeln!(
+            w,
             "Wrote {total} elements: {} nodes, {} ways, {} relations",
             self.nodes_written, self.ways_written, self.relations_written,
-        );
+        )?;
+
+        Ok(())
     }
 }
 
 /// Find parent ways/relations referencing the given IDs.
 #[hotpath::measure]
+#[allow(clippy::too_many_arguments)]
 pub fn getparents(
     input: &Path,
     output: &Path,
@@ -61,6 +65,7 @@ pub fn getparents(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<GetparentsStats> {
     let (_, stats) = getparents_dispatched(
         input,
@@ -71,6 +76,7 @@ pub fn getparents(
         direct_io,
         overrides,
         FULL_SCAN_ARM_MIN_BLOBS,
+        host,
     )?;
     Ok(stats)
 }
@@ -87,6 +93,7 @@ pub fn getparents_with_min_blobs(
     direct_io: bool,
     overrides: &HeaderOverrides,
     min_blobs: u64,
+    host: &crate::host::Host,
 ) -> Result<GetparentsStats> {
     getparents_dispatched(
         input,
@@ -97,6 +104,7 @@ pub fn getparents_with_min_blobs(
         direct_io,
         overrides,
         min_blobs,
+        host,
     )
     .map(|(_, stats)| stats)
 }
@@ -114,8 +122,14 @@ fn getparents_dispatched(
     direct_io: bool,
     overrides: &HeaderOverrides,
     min_blobs: u64,
+    host: &crate::host::Host,
 ) -> Result<(ScanArm, GetparentsStats)> {
-    let arm = super::dispatch_scan_arm(input, super::has_indexdata(input, direct_io)?, min_blobs)?;
+    let arm = super::dispatch_scan_arm(
+        input,
+        super::has_indexdata(input, direct_io, &host.diagnostics)?,
+        min_blobs,
+        host,
+    )?;
     let stats = getparents_with_arm(
         input,
         output,
@@ -125,6 +139,7 @@ fn getparents_dispatched(
         direct_io,
         overrides,
         arm,
+        host,
     )?;
     Ok((arm, stats))
 }
@@ -139,14 +154,29 @@ pub(crate) fn getparents_with_arm(
     direct_io: bool,
     overrides: &HeaderOverrides,
     arm: ScanArm,
+    host: &crate::host::Host,
 ) -> Result<GetparentsStats> {
     match arm {
-        ScanArm::Walker => {
-            getparents_walker(input, output, ids, opts, compression, direct_io, overrides)
-        }
-        ScanArm::FullScan => {
-            getparents_pipelined(input, output, ids, opts, compression, direct_io, overrides)
-        }
+        ScanArm::Walker => getparents_walker(
+            input,
+            output,
+            ids,
+            opts,
+            compression,
+            direct_io,
+            overrides,
+            host,
+        ),
+        ScanArm::FullScan => getparents_pipelined(
+            input,
+            output,
+            ids,
+            opts,
+            compression,
+            direct_io,
+            overrides,
+            host,
+        ),
     }
 }
 
@@ -173,11 +203,12 @@ fn getparents_walker(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<GetparentsStats> {
     let (need_node_blobs, need_way_blobs, need_relation_blobs) = needed_blob_kinds(ids, opts);
 
     crate::debug::emit_marker("GETPARENTS_SCHEDULE_START");
-    let mut walker = HeaderWalker::open(input)?;
+    let mut walker = HeaderWalker::open(input, &host.diagnostics)?;
     let file_size = walker.file_size();
     let mut header_buf: Vec<u8> = Vec::new();
     let mut header_block: Option<crate::HeaderBlock> = None;
@@ -236,10 +267,10 @@ fn getparents_walker(
     }
     crate::debug::emit_marker("GETPARENTS_SCHEDULE_END");
 
-    super::warn_locations_on_ways_loss(&header);
+    super::warn_locations_on_ways_loss(&header, host);
     let header_bytes = super::build_output_header(&header, true, overrides, |hb| hb)?;
     let mut writer =
-        writer_from_header_bytes(output, compression, &header_bytes, direct_io, false)?;
+        writer_from_header_bytes(output, compression, &header_bytes, direct_io, false, host)?;
 
     let mut stats = GetparentsStats {
         nodes_written: 0,
@@ -315,6 +346,7 @@ fn getparents_walker(
             }
             ControlFlow::Continue(())
         },
+        &*host.resources,
     )?;
 
     if let Some(e) = write_err {
@@ -335,17 +367,18 @@ fn getparents_pipelined(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<GetparentsStats> {
     let (need_node_blobs, need_way_blobs, need_relation_blobs) = needed_blob_kinds(ids, opts);
-    let reader = ElementReader::open(input, direct_io)?.with_blob_filter(BlobFilter::new(
+    let reader = ElementReader::open_in(input, direct_io, host)?.with_blob_filter(BlobFilter::new(
         need_node_blobs,
         need_way_blobs,
         need_relation_blobs,
     ));
-    super::warn_locations_on_ways_loss(reader.header());
+    super::warn_locations_on_ways_loss(reader.header(), host);
     let header_bytes = super::build_output_header(reader.header(), true, overrides, |hb| hb)?;
     let mut writer =
-        writer_from_header_bytes(output, compression, &header_bytes, direct_io, false)?;
+        writer_from_header_bytes(output, compression, &header_bytes, direct_io, false, host)?;
     let mut stats = GetparentsStats {
         nodes_written: 0,
         ways_written: 0,
@@ -523,7 +556,7 @@ mod tests {
 
     fn ids(path: &std::path::Path) -> Vec<i64> {
         let mut ids = Vec::new();
-        ElementReader::from_path(path)
+        ElementReader::open_in(path, false, &crate::host::Host::for_tests())
             .expect("read output")
             .for_each(|element| match element {
                 Element::DenseNode(node) => ids.push(node.id()),
@@ -553,6 +586,7 @@ mod tests {
             false,
             &HeaderOverrides::default(),
             ScanArm::FullScan,
+            &crate::host::Host::for_tests(),
         )
         .expect("getparents");
         assert_eq!(ids(&output), vec![1, 10]);
@@ -577,6 +611,7 @@ mod tests {
                 false,
                 &HeaderOverrides::default(),
                 arm,
+                &crate::host::Host::for_tests(),
             )
             .expect("getparents");
         }
@@ -734,6 +769,7 @@ mod tests {
                 false,
                 &HeaderOverrides::default(),
                 min_blobs,
+                &crate::host::Host::for_tests(),
             )
             .expect("getparents");
             assert_eq!(arm, expected_arm);

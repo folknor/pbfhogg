@@ -47,8 +47,9 @@ pub struct SortStats {
 }
 
 impl SortStats {
-    pub fn print_summary(&self) {
-        eprintln!(
+    pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        writeln!(
+            w,
             "Sorted {} nodes, {} ways, {} relations ({} blobs: {} passthrough, {} rewritten)",
             self.nodes,
             self.ways,
@@ -56,14 +57,17 @@ impl SortStats {
             self.blobs_total,
             self.blobs_passthrough,
             self.blobs_rewritten,
-        );
+        )?;
         if self.passthrough_claimed > 0 {
-            eprintln!(
+            writeln!(
+                w,
                 "  plus {} elements in blobs copied through without decoding, per \
                  their indexdata (unverified - `pbfhogg check --index` checks it)",
                 self.passthrough_claimed,
-            );
+            )?;
         }
+
+        Ok(())
     }
 }
 
@@ -128,6 +132,7 @@ pub fn sort(
     output: &Path,
     opts: &SortOptions,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<SortStats> {
     let SortOptions {
         compression,
@@ -141,6 +146,7 @@ pub fn sort(
         force,
         "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
          decompressed to scan element IDs (significantly slower).",
+        host,
     )?;
 
     #[allow(clippy::cast_possible_wrap)]
@@ -150,12 +156,23 @@ pub fn sort(
 
     // Pass 1: Build blob index
     crate::debug::emit_marker("SORT_PASS1_START");
-    eprintln!("Pass 1: indexing blobs...");
+    crate::host::diag!(
+        host.diagnostics,
+        Progress,
+        "sort.pass1",
+        "Pass 1: indexing blobs..."
+    );
     crate::debug::emit_marker("SORT_INDEX_BUILD_START");
-    let (header, mut entries) = build_blob_index(input, direct_io)?;
+    let (header, mut entries) = build_blob_index(input, direct_io, host)?;
     crate::debug::emit_marker("SORT_INDEX_BUILD_END");
-    super::warn_locations_on_ways_loss(&header);
-    eprintln!("  {} OSMData blobs indexed", entries.len());
+    super::warn_locations_on_ways_loss(&header, host);
+    crate::host::diag!(
+        host.diagnostics,
+        Progress,
+        "sort.indexed",
+        "  {} OSMData blobs indexed",
+        entries.len()
+    );
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("sort_blobs_total", entries.len() as i64);
 
@@ -193,22 +210,43 @@ pub fn sort(
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("sort_blobs_intra_unsorted", intra_unsorted_blobs as i64);
     if overlap_count > 0 {
-        eprintln!("  {overlap_count} blobs in overlap runs (decode + re-encode)");
+        crate::host::diag!(
+            host.diagnostics,
+            Progress,
+            "sort.overlap_runs",
+            "  {overlap_count} blobs in overlap runs (decode + re-encode)"
+        );
     }
     if intra_unsorted_blobs > 0 {
-        eprintln!("  {intra_unsorted_blobs} blobs internally unsorted (decode + re-encode)");
+        crate::host::diag!(
+            host.diagnostics,
+            Progress,
+            "sort.intra_unsorted",
+            "  {intra_unsorted_blobs} blobs internally unsorted (decode + re-encode)"
+        );
     }
 
     crate::debug::emit_marker("SORT_PASS1_END");
 
     // Pass 2: Write in sorted order
     crate::debug::emit_marker("SORT_PASS2_START");
-    eprintln!("Pass 2: writing sorted output...");
+    crate::host::diag!(
+        host.diagnostics,
+        Progress,
+        "sort.pass2",
+        "Pass 2: writing sorted output..."
+    );
     crate::debug::emit_marker("SORT_WRITER_SETUP_START");
     #[allow(clippy::redundant_closure_for_method_calls)]
     let header_bytes = build_output_header(&header, false, overrides, |hb| hb.sorted())?;
-    let mut writer =
-        writer_from_header_bytes(output, compression, &header_bytes, direct_io, io_uring)?;
+    let mut writer = writer_from_header_bytes(
+        output,
+        compression,
+        &header_bytes,
+        direct_io,
+        io_uring,
+        host,
+    )?;
     crate::debug::emit_marker("SORT_WRITER_SETUP_END");
 
     // Open input for random-access reads
@@ -263,7 +301,7 @@ pub fn sort(
         let results: std::result::Result<Vec<_>, String> = overlap_runs
             .par_iter()
             .map(|(start, end, kind)| {
-                compute_overlap_run_local(&entries[*start..*end], *kind, input)
+                compute_overlap_run_local(&entries[*start..*end], *kind, input, host)
             })
             .collect();
         let out = results.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
@@ -408,8 +446,9 @@ pub fn sort(
 fn build_blob_index(
     input: &Path,
     _direct_io: bool,
+    host: &crate::host::Host,
 ) -> Result<(crate::HeaderBlock, Vec<BlobEntry>)> {
-    let mut walker = HeaderWalker::open(input)?;
+    let mut walker = HeaderWalker::open(input, &host.diagnostics)?;
     let mut entries = Vec::new();
     let mut header: Option<crate::HeaderBlock> = None;
     let mut data_buf: Vec<u8> = Vec::new();
@@ -450,7 +489,10 @@ fn build_blob_index(
                         // IDs with the intra-blob order check.
                         if has_indexdata && !warned_unclaimed_indexed {
                             warned_unclaimed_indexed = true;
-                            eprintln!(
+                            crate::host::diag!(
+                                host.diagnostics,
+                                Note,
+                                "sort.verify_unclaimed_order",
                                 "  input does not declare Sort.Type_then_ID; verifying \
                                  intra-blob order (pass 1 decodes every blob payload)"
                             );
@@ -794,6 +836,7 @@ fn compute_overlap_run_local(
     entries: &[BlobEntry],
     kind: ElemKind,
     input_path: &Path,
+    host: &crate::host::Host,
 ) -> std::result::Result<(Vec<OwnedBlock>, OverlapCounts), String> {
     let mut input_file = File::open(input_path).map_err(|e| e.to_string())?;
     let mut bb = BlockBuilder::new();
@@ -812,6 +855,7 @@ fn compute_overlap_run_local(
                     _ => {}
                 },
                 write_single_node_local,
+                host,
             )?;
         }
         ElemKind::Way => {
@@ -826,6 +870,7 @@ fn compute_overlap_run_local(
                     }
                 },
                 write_single_way_local,
+                host,
             )?;
         }
         ElemKind::Relation => {
@@ -840,6 +885,7 @@ fn compute_overlap_run_local(
                     }
                 },
                 write_single_relation_local,
+                host,
             )?;
         }
     };
@@ -861,7 +907,9 @@ fn sweep_merge_local<T: Ord + HasId>(
         &mut BlockBuilder,
         &mut Vec<OwnedBlock>,
     ) -> std::result::Result<(), String>,
+    host: &crate::host::Host,
 ) -> std::result::Result<u64, String> {
+    let _ = host;
     let mut heap: BinaryHeap<Reverse<T>> = BinaryHeap::new();
     let mut frame_buf: Vec<u8> = Vec::new();
     let mut count: u64 = 0;

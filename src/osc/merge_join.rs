@@ -31,8 +31,9 @@ impl StreamingBlocks {
     pub(crate) fn new_sequential(
         path: &std::path::Path,
         direct_io: bool,
+        host: &crate::host::Host,
     ) -> crate::error::Result<Self> {
-        let mut blob_reader = crate::blob::BlobReader::open(path, direct_io)?;
+        let mut blob_reader = crate::blob::BlobReader::open_in(path, direct_io, host)?;
         blob_reader.set_parse_indexdata(true);
         blob_reader
             .next()

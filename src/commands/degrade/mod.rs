@@ -341,7 +341,7 @@ pub struct DegradeStats {
 }
 
 impl DegradeStats {
-    pub fn print_summary(&self) {
+    pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         let mut applied: Vec<&str> = Vec::new();
         if self.flags.unsort {
             applied.push("--unsort");
@@ -378,13 +378,16 @@ impl DegradeStats {
         } else {
             String::new()
         };
-        eprintln!(
+        writeln!(
+            w,
             "Degraded {} elements across {} blobs{} (applied: {})",
             self.elements_written,
             self.blobs_written,
             dropped,
             applied.join(" "),
-        );
+        )?;
+
+        Ok(())
     }
 }
 
@@ -409,6 +412,7 @@ pub fn degrade(
     io_uring: bool,
     force: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<DegradeStats> {
     if !flags.any() {
         return Err("degrade requires at least one transformation flag \
@@ -509,6 +513,7 @@ pub fn degrade(
             io_uring,
             force,
             overrides,
+            host,
         )?
     } else {
         degrade_passthrough(
@@ -519,6 +524,7 @@ pub fn degrade(
             direct_io,
             io_uring,
             overrides,
+            host,
         )?
     };
 
@@ -581,6 +587,7 @@ fn passthrough_header_bytes(
     flags: DegradeFlags,
     overrides: &HeaderOverrides,
     direct_io: bool,
+    host: &crate::host::Host,
 ) -> Result<Vec<u8>> {
     if overrides.is_empty() {
         // Verbatim path: forward the original HeaderBlock protobuf, removing
@@ -588,7 +595,7 @@ fn passthrough_header_bytes(
         // first blob in a well-formed PBF.
         let mut reader = FileReader::open(input, direct_io)?;
         let mut file_offset: u64 = 0;
-        let frame = read_raw_frame(&mut reader, &mut file_offset)?
+        let frame = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics)?
             .ok_or("input PBF is empty: no OSMHeader blob")?;
         if !matches!(frame.blob_type, BlobKind::OsmHeader) {
             return Err("input PBF does not start with an OSMHeader blob".into());
@@ -605,7 +612,7 @@ fn passthrough_header_bytes(
     } else {
         // Override present: rebuild so --generator / --output-header take
         // effect. This is the lossy-but-intentional path.
-        let reader = ElementReader::open(input, direct_io)?;
+        let reader = ElementReader::open_in(input, direct_io, host)?;
         let header = reader.header().clone();
         build_output_header(&header, header.is_sorted(), overrides, |hb| {
             let mut hb = hb;
@@ -621,6 +628,7 @@ fn passthrough_header_bytes(
 }
 
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
+#[allow(clippy::too_many_arguments)]
 fn degrade_passthrough(
     input: &Path,
     output: &Path,
@@ -629,18 +637,25 @@ fn degrade_passthrough(
     direct_io: bool,
     io_uring: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<DegradeStats> {
-    let header_bytes = passthrough_header_bytes(input, flags, overrides, direct_io)?;
+    let header_bytes = passthrough_header_bytes(input, flags, overrides, direct_io, host)?;
 
-    let mut writer =
-        writer_from_header_bytes(output, compression, &header_bytes, direct_io, io_uring)?;
+    let mut writer = writer_from_header_bytes(
+        output,
+        compression,
+        &header_bytes,
+        direct_io,
+        io_uring,
+        host,
+    )?;
 
     let mut reader = FileReader::open(input, direct_io)?;
     let mut file_offset: u64 = 0;
     let mut blobs_written: u64 = 0;
 
     crate::debug::emit_marker("DEGRADE_PASSTHROUGH_START");
-    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
+    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics)? {
         match &frame.blob_type {
             BlobKind::OsmHeader => {}
             BlobKind::OsmData => {
@@ -860,6 +875,7 @@ fn degrade_decode_path(
     io_uring: bool,
     force: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<DegradeStats> {
     require_indexdata(
         input,
@@ -868,24 +884,25 @@ fn degrade_decode_path(
         "input PBF has no blob-level indexdata. degrade's decode path uses the \
          parallel per-kind classify pipeline, which needs indexdata to build \
          per-kind blob schedules.",
+        host,
     )?;
 
     // Per-blob worker pool; same precedent as `cat --clean` and `repack`.
-    crate::debug::cap_malloc_arenas();
+    host.process.cross_thread_alloc_pool();
 
     let header = {
-        let reader = ElementReader::open(input, direct_io)?;
+        let reader = ElementReader::open_in(input, direct_io, host)?;
         // Warn about LocationsOnWays loss on the decode path - BlockBuilder
         // does not preserve inline way-node coordinates. `--strip-locations`
         // makes the loss explicit, so suppress the warning in that case.
         if !flags.strip_locations {
-            super::warn_locations_on_ways_loss(reader.header());
+            super::warn_locations_on_ways_loss(reader.header(), host);
         }
         reader.header().clone()
     };
 
     let (node_schedule, way_schedule, rel_schedule, shared_file, _max_ids) =
-        crate::scan::classify::build_classify_schedules_split(input)?;
+        crate::scan::classify::build_classify_schedules_split(input, &host.diagnostics)?;
 
     // Selection must finish before opening the writer: an over-large N must
     // not leave a header-only output behind.
@@ -897,6 +914,7 @@ fn degrade_decode_path(
             &way_schedule,
             &rel_schedule,
             spec,
+            host,
         )?;
         crate::debug::emit_marker("DEGRADE_DROP_SELECT_END");
         Some(sets)
@@ -912,8 +930,14 @@ fn degrade_decode_path(
             hb
         }
     })?;
-    let mut writer =
-        writer_from_header_bytes(output, compression, &header_bytes, direct_io, io_uring)?;
+    let mut writer = writer_from_header_bytes(
+        output,
+        compression,
+        &header_bytes,
+        direct_io,
+        io_uring,
+        host,
+    )?;
 
     let mut blobs_written: u64 = 0;
     let mut elements_written: u64 = 0;
@@ -929,6 +953,7 @@ fn degrade_decode_path(
         compression,
         drop_sets.as_ref().map(|sets| sets.for_kind(ElemKind::Node)),
         &mut writer,
+        host,
     )?;
     crate::debug::emit_marker("DEGRADE_NODES_END");
     blobs_written += s.blobs;
@@ -945,6 +970,7 @@ fn degrade_decode_path(
         compression,
         drop_sets.as_ref().map(|sets| sets.for_kind(ElemKind::Way)),
         &mut writer,
+        host,
     )?;
     crate::debug::emit_marker("DEGRADE_WAYS_END");
     blobs_written += s.blobs;
@@ -963,6 +989,7 @@ fn degrade_decode_path(
             .as_ref()
             .map(|sets| sets.for_kind(ElemKind::Relation)),
         &mut writer,
+        host,
     )?;
     crate::debug::emit_marker("DEGRADE_RELATIONS_END");
     blobs_written += s.blobs;
@@ -994,6 +1021,7 @@ fn select_drop_sets(
     way_schedule: &[crate::scan::classify::ScheduleEntry],
     relation_schedule: &[crate::scan::classify::ScheduleEntry],
     spec: DropSpec,
+    host: &crate::host::Host,
 ) -> Result<DropSets> {
     let mut total = 0_u64;
     let mut heap = BinaryHeap::new();
@@ -1014,6 +1042,7 @@ fn select_drop_sets(
                     keep_smallest(&mut heap, spec.n, key);
                 }
             },
+            &*host.resources,
         )?;
     }
     if spec.n > total {
@@ -1088,6 +1117,7 @@ fn run_kind_phase(
     compression: Compression,
     drop: Option<&FxHashSet<i64>>,
     writer: &mut PbfWriter<FileWriter>,
+    host: &crate::host::Host,
 ) -> Result<PhaseStats> {
     use crate::reorder_buffer::ReorderBuffer;
 
@@ -1220,6 +1250,7 @@ fn run_kind_phase(
                 elements += full_count + tail_n;
             }
         },
+        &*host.resources,
     )?;
 
     if let Some(e) = write_error {

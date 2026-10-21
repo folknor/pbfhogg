@@ -70,15 +70,22 @@ pub struct MergeChangesStats {
 }
 
 impl MergeChangesStats {
-    pub fn print_summary(&self) {
+    pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         if self.simplified {
-            eprintln!(
+            writeln!(
+                w,
                 "Merged {} files: {} input changes -> {} output changes (simplified)",
                 self.files, self.changes_in, self.changes_out
-            );
+            )?;
         } else {
-            eprintln!("Merged {} files: {} changes", self.files, self.changes_out);
+            writeln!(
+                w,
+                "Merged {} files: {} changes",
+                self.files, self.changes_out
+            )?;
         }
+
+        Ok(())
     }
 }
 
@@ -139,6 +146,7 @@ pub fn merge_changes(
     simplify: bool,
     jobs: Option<usize>,
     allow_version_regression: bool,
+    host: &crate::host::Host,
 ) -> Result<MergeChangesStats> {
     if inputs.is_empty() {
         return Err("at least one input OSC file is required".into());
@@ -146,9 +154,7 @@ pub fn merge_changes(
 
     let worker_count = match jobs {
         Some(n) if n > 0 => n,
-        _ => std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(8),
+        _ => crate::host::sized_workers(&*host.resources, 0, 1, 8),
     };
 
     crate::debug::emit_marker("MERGECHANGES_START");
@@ -940,8 +946,15 @@ mod tests {
         );
         std::fs::write(&dest, b"precious user data").unwrap();
 
-        let err = merge_changes(&[&input], &dest, false, Some(1), false)
-            .expect_err("a truncated input must be refused");
+        let err = merge_changes(
+            &[&input],
+            &dest,
+            false,
+            Some(1),
+            false,
+            &crate::host::Host::for_tests(),
+        )
+        .expect_err("a truncated input must be refused");
         assert!(
             err.to_string().contains("closing </osmChange>"),
             "error must name the missing closing tag; got: {err}"
@@ -968,8 +981,15 @@ mod tests {
              <node id=\"1\" lat=\"1.0\" lon=\"2.0\" version=\"1\"/>\n  </create>\n",
         );
 
-        merge_changes(&[&input], &dest, false, Some(1), false)
-            .expect_err("a truncated input must be refused");
+        merge_changes(
+            &[&input],
+            &dest,
+            false,
+            Some(1),
+            false,
+            &crate::host::Host::for_tests(),
+        )
+        .expect_err("a truncated input must be refused");
         assert!(
             !dest.exists(),
             "a failed merge must not leave a partial destination"
@@ -998,7 +1018,15 @@ mod tests {
              </create>\n</osmChange>",
         );
         std::fs::write(&dest, b"stale").unwrap();
-        let stats = merge_changes(&[&input], &dest, false, Some(1), false).unwrap();
+        let stats = merge_changes(
+            &[&input],
+            &dest,
+            false,
+            Some(1),
+            false,
+            &crate::host::Host::for_tests(),
+        )
+        .unwrap();
         assert_eq!(stats.changes_out, 1);
         let bytes = std::fs::read(&dest).unwrap();
         assert_eq!(

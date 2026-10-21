@@ -463,7 +463,12 @@ fn diff_tagdata(stored_bytes: Option<&[u8]>, block: &[u8], out: &mut Vec<IndexVi
 
 /// Decompress every OSMData blob and diff its payload against the metadata its
 /// `BlobHeader` claims.
-pub fn check_index(path: &Path, opts: &CheckIndexOptions) -> Result<IndexReport> {
+pub fn check_index(
+    path: &Path,
+    opts: &CheckIndexOptions,
+    host: &crate::host::Host,
+) -> Result<IndexReport> {
+    let _ = host;
     let mut reader = FileReader::open(path, opts.direct_io)?;
     let mut file_offset: u64 = 0;
     let mut block = Vec::new();
@@ -471,7 +476,7 @@ pub fn check_index(path: &Path, opts: &CheckIndexOptions) -> Result<IndexReport>
     let mut found = Vec::new();
 
     crate::debug::emit_marker("CHECK_INDEX_START");
-    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
+    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics)? {
         if !matches!(frame.blob_type, BlobKind::OsmData) {
             continue;
         }

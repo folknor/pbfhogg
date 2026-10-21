@@ -53,12 +53,16 @@ use std::path::Path;
 /// read + decompress). Indexdata is probed from the first OsmData blob
 /// only - O(1) header read. Partially-indexed PBFs surface as a mid-run
 /// error at the consuming site rather than being detected up front.
-pub(crate) fn check_sorted_and_indexed(path: &Path, direct_io: bool) -> Result<(bool, bool)> {
+pub(crate) fn check_sorted_and_indexed(
+    path: &Path,
+    direct_io: bool,
+    host: &crate::host::Host,
+) -> Result<(bool, bool)> {
     use crate::blob::BlobKind;
 
     // Pass 1: read sorted flag from OsmHeader via BlobReader (reads ~1 blob).
     let sorted = {
-        let mut blob_reader = crate::blob::BlobReader::open(path, direct_io)?;
+        let mut blob_reader = crate::blob::BlobReader::open_in(path, direct_io, host)?;
         let mut s = false;
         for blob_result in &mut blob_reader {
             let blob = blob_result?;
@@ -78,7 +82,8 @@ pub(crate) fn check_sorted_and_indexed(path: &Path, direct_io: bool) -> Result<(
     let mut offset = 0u64;
     let mut indexed = false;
 
-    while let Some(info) = crate::read::raw_frame::read_blob_header_only(&mut reader, &mut offset)?
+    while let Some(info) =
+        crate::read::raw_frame::read_blob_header_only(&mut reader, &mut offset, &host.diagnostics)?
     {
         if matches!(info.blob_type, BlobKind::OsmData) {
             indexed = info.index.is_some();
@@ -130,27 +135,33 @@ impl DiffStats {
     }
 
     /// Print default summary to stderr (pbfhogg format).
-    pub fn print_summary(&self) {
+    pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         let total = self.created + self.modified + self.deleted;
         if total == 0 {
-            eprintln!("Files are identical ({} common elements)", self.common);
+            writeln!(w, "Files are identical ({} common elements)", self.common)?;
         } else {
-            eprintln!(
+            writeln!(
+                w,
                 "{total} differences: {} created, {} modified, {} deleted ({} common)",
                 self.created, self.modified, self.deleted, self.common,
-            );
+            )?;
         }
+
+        Ok(())
     }
 
     /// Print osmium-compatible summary to stderr (left/right/same/different).
-    pub fn print_osmium_summary(&self) {
+    pub fn write_osmium_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         let left = self.common + self.modified + self.deleted;
         let right = self.common + self.modified + self.created;
         let different = self.created + self.modified + self.deleted;
-        eprintln!(
+        writeln!(
+            w,
             "Summary: left={left} right={right} same={} different={different}",
             self.common,
-        );
+        )?;
+
+        Ok(())
     }
 }
 
@@ -207,12 +218,13 @@ pub fn diff(
     output: &mut impl Write,
     options: &DiffOptions,
     direct_io: bool,
+    host: &crate::host::Host,
 ) -> Result<DiffStats> {
     let filter = TypeFilter::or_all(options.type_filter);
 
     // Single-pass: check sorted headers + indexdata from one file open each.
-    let (old_sorted, old_indexed) = check_sorted_and_indexed(old_path, direct_io)?;
-    let (new_sorted, new_indexed) = check_sorted_and_indexed(new_path, direct_io)?;
+    let (old_sorted, old_indexed) = check_sorted_and_indexed(old_path, direct_io, host)?;
+    let (new_sorted, new_indexed) = check_sorted_and_indexed(new_path, direct_io, host)?;
     if !old_sorted {
         super::require_sorted_err(old_path, "Old PBF")?;
     }
@@ -238,11 +250,16 @@ pub fn diff(
             direct_io,
             &filter,
             options.jobs,
+            host,
         )?
     } else if both_indexed {
-        diff_block_pair(old_path, new_path, output, options, direct_io, &filter)?
+        diff_block_pair(
+            old_path, new_path, output, options, direct_io, &filter, host,
+        )?
     } else {
-        diff_element_stream(old_path, new_path, output, options, direct_io, &filter)?
+        diff_element_stream(
+            old_path, new_path, output, options, direct_io, &filter, host,
+        )?
     };
 
     crate::debug::emit_marker("DIFF_SCAN_END");
@@ -268,10 +285,11 @@ fn diff_block_pair(
     options: &DiffOptions,
     direct_io: bool,
     filter: &TypeFilter,
+    host: &crate::host::Host,
 ) -> Result<DiffStats> {
-    let mut old_reader = crate::blob::BlobReader::open(old_path, direct_io)?;
+    let mut old_reader = crate::blob::BlobReader::open_in(old_path, direct_io, host)?;
     old_reader.set_parse_indexdata(true);
-    let mut new_reader = crate::blob::BlobReader::open(new_path, direct_io)?;
+    let mut new_reader = crate::blob::BlobReader::open_in(new_path, direct_io, host)?;
     new_reader.set_parse_indexdata(true);
 
     let mut merge = BlockPairMergeState::new(old_reader, new_reader);
@@ -404,9 +422,10 @@ fn diff_element_stream(
     options: &DiffOptions,
     direct_io: bool,
     filter: &TypeFilter,
+    host: &crate::host::Host,
 ) -> Result<DiffStats> {
-    let mut old_src = StreamingBlocks::new_sequential(old_path, direct_io)?;
-    let mut new_src = StreamingBlocks::new_sequential(new_path, direct_io)?;
+    let mut old_src = StreamingBlocks::new_sequential(old_path, direct_io, host)?;
+    let mut new_src = StreamingBlocks::new_sequential(new_path, direct_io, host)?;
 
     let mut stats = DiffStats::default();
 

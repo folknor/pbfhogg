@@ -113,6 +113,7 @@ mod parallel_writer {
                     panic_at_blob_seq: None,
                 },
                 &pbfhogg::HeaderOverrides::default(),
+                &crate::common::test_host(),
             )
         }));
 

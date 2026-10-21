@@ -234,11 +234,9 @@ pub(super) fn stage2_node_join(
     input_pbf: &Arc<std::fs::File>,
     node_blob_mapping: &[NodeBlobInfo],
     inject_prepass: bool,
+    host: &crate::host::Host,
 ) -> Result<u64> {
-    let num_workers = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(4)
-        .min(6);
+    let num_workers = crate::host::sized_workers(&*host.resources, 2, 1, 4).min(6);
 
     use std::os::unix::fs::FileExt as _;
 

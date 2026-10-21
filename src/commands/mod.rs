@@ -118,7 +118,9 @@ pub(crate) fn drain_batch_results<S>(
     results: Vec<std::result::Result<(Vec<OwnedBlock>, S), String>>,
     writer: &mut PbfWriter<FileWriter>,
     mut merge: impl FnMut(S),
+    host: &crate::host::Host,
 ) -> Result<()> {
+    let _ = host;
     for result in results {
         let (blocks, stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         merge(stats);
@@ -192,12 +194,15 @@ pub(crate) fn ensure_relation_capacity_local(
 
 /// Warn if the input header declares way-level metadata that re-encoding does
 /// not propagate.
-pub(crate) fn warn_locations_on_ways_loss(header: &crate::HeaderBlock) {
+pub(crate) fn warn_locations_on_ways_loss(header: &crate::HeaderBlock, host: &crate::host::Host) {
     if header.has_locations_on_ways()
         || header.has_way_members_v1()
         || header.has_shared_node_pins_v1()
     {
-        eprintln!(
+        crate::host::diag!(
+            host.diagnostics,
+            Warning,
+            "header.way_metadata_loss",
             "Warning: input PBF has way-level enrichment metadata. \
              LocationsOnWays and injected prepass metadata are not preserved in the output."
         );
@@ -315,9 +320,17 @@ pub(crate) fn writer_from_header(
     configure: impl FnOnce(HeaderBuilder) -> HeaderBuilder,
     direct_io: bool,
     io_uring: bool,
+    host: &crate::host::Host,
 ) -> Result<PbfWriter<FileWriter>> {
     let header_bytes = build_output_header(header, preserve_sorted, overrides, configure)?;
-    writer_from_header_bytes(output, compression, &header_bytes, direct_io, io_uring)
+    writer_from_header_bytes(
+        output,
+        compression,
+        &header_bytes,
+        direct_io,
+        io_uring,
+        host,
+    )
 }
 
 /// Open an output writer from prebuilt header bytes with optional direct-io/io_uring modes.
@@ -327,11 +340,17 @@ pub(crate) fn writer_from_header_bytes(
     header_bytes: &[u8],
     direct_io: bool,
     io_uring: bool,
+    host: &crate::host::Host,
 ) -> Result<PbfWriter<FileWriter>> {
     if io_uring {
         #[cfg(feature = "linux-io-uring")]
         {
-            Ok(PbfWriter::to_path_uring(output, compression, header_bytes)?)
+            Ok(PbfWriter::to_path_uring_in(
+                output,
+                compression,
+                header_bytes,
+                host.diagnostics.clone(),
+            )?)
         }
         #[cfg(not(feature = "linux-io-uring"))]
         {
@@ -340,10 +359,11 @@ pub(crate) fn writer_from_header_bytes(
     } else if direct_io {
         #[cfg(feature = "linux-direct-io")]
         {
-            Ok(PbfWriter::to_path_direct(
+            Ok(PbfWriter::to_path_direct_in(
                 output,
                 compression,
                 header_bytes,
+                host.diagnostics.clone(),
             )?)
         }
         #[cfg(not(feature = "linux-direct-io"))]
@@ -351,7 +371,12 @@ pub(crate) fn writer_from_header_bytes(
             Err("--direct-io requires the linux-direct-io feature".into())
         }
     } else {
-        Ok(PbfWriter::to_path(output, compression, header_bytes)?)
+        Ok(PbfWriter::to_path_in(
+            output,
+            compression,
+            header_bytes,
+            host.diagnostics.clone(),
+        )?)
     }
 }
 
@@ -372,11 +397,17 @@ pub(crate) fn writer_from_header_bytes_parallel(
     header_bytes: &[u8],
     direct_io: bool,
     io_uring: bool,
+    host: &crate::host::Host,
 ) -> Result<PbfWriter<FileWriter>> {
     if io_uring {
         #[cfg(feature = "linux-io-uring")]
         {
-            Ok(PbfWriter::to_path_uring(output, compression, header_bytes)?)
+            Ok(PbfWriter::to_path_uring_in(
+                output,
+                compression,
+                header_bytes,
+                host.diagnostics.clone(),
+            )?)
         }
         #[cfg(not(feature = "linux-io-uring"))]
         {
@@ -385,10 +416,11 @@ pub(crate) fn writer_from_header_bytes_parallel(
     } else if direct_io {
         #[cfg(feature = "linux-direct-io")]
         {
-            Ok(PbfWriter::to_path_direct(
+            Ok(PbfWriter::to_path_direct_in(
                 output,
                 compression,
                 header_bytes,
+                host.diagnostics.clone(),
             )?)
         }
         #[cfg(not(feature = "linux-direct-io"))]
@@ -396,10 +428,11 @@ pub(crate) fn writer_from_header_bytes_parallel(
             Err("--direct-io requires the linux-direct-io feature".into())
         }
     } else {
-        Ok(PbfWriter::to_path_parallel(
+        Ok(PbfWriter::to_path_parallel_in(
             output,
             compression,
             header_bytes,
+            host.diagnostics.clone(),
         )?)
     }
 }
@@ -417,9 +450,17 @@ pub(crate) fn writer_from_header_parallel(
     configure: impl FnOnce(HeaderBuilder) -> HeaderBuilder,
     direct_io: bool,
     io_uring: bool,
+    host: &crate::host::Host,
 ) -> Result<PbfWriter<FileWriter>> {
     let header_bytes = build_output_header(header, preserve_sorted, overrides, configure)?;
-    writer_from_header_bytes_parallel(output, compression, &header_bytes, direct_io, io_uring)
+    writer_from_header_bytes_parallel(
+        output,
+        compression,
+        &header_bytes,
+        direct_io,
+        io_uring,
+        host,
+    )
 }
 
 /// Map Osmosis sentinel -1 to 0 (protobuf default for absent) in dense node
@@ -463,8 +504,9 @@ pub(crate) fn require_indexdata(
     direct_io: bool,
     force: bool,
     reason: &str,
+    host: &crate::host::Host,
 ) -> Result<bool> {
-    let present = has_indexdata(path, direct_io)?;
+    let present = has_indexdata(path, direct_io, &host.diagnostics)?;
     if !force && !present {
         return Err(format!(
             "{reason}\n\n\
@@ -532,12 +574,13 @@ pub(crate) fn dispatch_scan_arm(
     input: &Path,
     has_indexdata: bool,
     min_blobs: u64,
+    host: &crate::host::Host,
 ) -> Result<crate::read::header_walker::ScanArm> {
     use crate::read::header_walker::{ScanArm, choose_scan_arm_at, estimate_blob_count};
     if !has_indexdata {
         return Ok(ScanArm::Walker);
     }
-    let estimate = estimate_blob_count(input)?;
+    let estimate = estimate_blob_count(input, &host.diagnostics)?;
     crate::debug::emit_counter(
         "walk_estimated_blobs",
         i64::try_from(estimate.osmdata_blobs).unwrap_or(i64::MAX),
@@ -552,10 +595,15 @@ pub(crate) fn dispatch_scan_arm(
 /// file has no data blobs. Trusts the first blob to be representative;
 /// partially-indexed PBFs surface as a mid-run error at the consuming
 /// site rather than being detected up front.
-pub fn has_indexdata(path: &Path, direct_io: bool) -> Result<bool> {
+pub fn has_indexdata(
+    path: &Path,
+    direct_io: bool,
+    diagnostics: &crate::host::Diagnostics,
+) -> Result<bool> {
     let mut reader = FileReader::open(path, direct_io)?;
     let mut offset = 0u64;
-    while let Some(info) = crate::read::raw_frame::read_blob_header_only(&mut reader, &mut offset)?
+    while let Some(info) =
+        crate::read::raw_frame::read_blob_header_only(&mut reader, &mut offset, diagnostics)?
     {
         if matches!(info.blob_type, BlobKind::OsmData) {
             return Ok(info.index.is_some());
@@ -573,10 +621,15 @@ pub fn has_indexdata(path: &Path, direct_io: bool) -> Result<bool> {
 /// blob headers until the first OsmData blob and returns whether it carries
 /// tagdata. Returns false if the file has no data blobs. Trusts the first
 /// blob to be representative.
-pub fn has_tagdata(path: &Path, direct_io: bool) -> Result<bool> {
+pub fn has_tagdata(
+    path: &Path,
+    direct_io: bool,
+    diagnostics: &crate::host::Diagnostics,
+) -> Result<bool> {
     let mut reader = FileReader::open(path, direct_io)?;
     let mut offset = 0u64;
-    while let Some(info) = crate::read::raw_frame::read_blob_header_only(&mut reader, &mut offset)?
+    while let Some(info) =
+        crate::read::raw_frame::read_blob_header_only(&mut reader, &mut offset, diagnostics)?
     {
         if matches!(info.blob_type, BlobKind::OsmData) {
             return Ok(info.has_tagdata);

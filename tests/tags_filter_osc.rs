@@ -64,7 +64,13 @@ fn create_and_modify_are_filtered_but_deletes_are_preserved() {
 </osmChange>"#,
     );
 
-    let stats = tags_filter_osc(&input, &output, &exprs(&["highway=primary"])).expect("filter");
+    let stats = tags_filter_osc(
+        &input,
+        &output,
+        &exprs(&["highway=primary"]),
+        &crate::common::test_host(),
+    )
+    .expect("filter");
     let xml = read_osc_gz(&output);
 
     assert_eq!(stats.creates_in, 2);
@@ -119,7 +125,13 @@ fn type_prefix_applies_to_create_modify_only() {
 </osmChange>"#,
     );
 
-    let stats = tags_filter_osc(&input, &output, &exprs(&["w/amenity=bench"])).expect("filter");
+    let stats = tags_filter_osc(
+        &input,
+        &output,
+        &exprs(&["w/amenity=bench"]),
+        &crate::common::test_host(),
+    )
+    .expect("filter");
     let xml = read_osc_gz(&output);
 
     assert_eq!(stats.creates_out, 1);
@@ -156,7 +168,13 @@ fn multiple_expressions_use_or_semantics() {
 </osmChange>"#,
     );
 
-    let stats = tags_filter_osc(&input, &output, &exprs(&["amenity", "shop"])).expect("filter");
+    let stats = tags_filter_osc(
+        &input,
+        &output,
+        &exprs(&["amenity", "shop"]),
+        &crate::common::test_host(),
+    )
+    .expect("filter");
     let xml = read_osc_gz(&output);
 
     assert_eq!(stats.creates_in, 3);
@@ -194,7 +212,13 @@ fn plain_osc_input_is_accepted() {
     )
     .expect("write plain osc");
 
-    let stats = tags_filter_osc(&input, &output, &exprs(&["amenity"])).expect("filter");
+    let stats = tags_filter_osc(
+        &input,
+        &output,
+        &exprs(&["amenity"]),
+        &crate::common::test_host(),
+    )
+    .expect("filter");
     assert_eq!(stats.creates_out, 1);
     assert!(read_osc_gz(&output).contains(r#"<node id="1""#));
 }
@@ -212,8 +236,13 @@ fn truncated_osc_is_refused() {
         "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  <create>\n    \
          <node id=\"1\" lat=\"1.0\" lon=\"2.0\" version=\"1\"/>\n  </create>\n",
     );
-    let err = tags_filter_osc(&input, &output, &exprs(&["amenity"]))
-        .expect_err("a truncated OSC must not filter as a complete one");
+    let err = tags_filter_osc(
+        &input,
+        &output,
+        &exprs(&["amenity"]),
+        &crate::common::test_host(),
+    )
+    .expect_err("a truncated OSC must not filter as a complete one");
     assert!(
         err.to_string().contains("closing </osmChange>"),
         "error must name the missing closing tag; got: {err}"
@@ -237,8 +266,13 @@ fn node_without_usable_coords_is_refused() {
   </create>
 </osmChange>"#,
     );
-    let err = tags_filter_osc(&input, &output, &exprs(&["amenity"]))
-        .expect_err("a node without coordinates must not be filtered to 0/0");
+    let err = tags_filter_osc(
+        &input,
+        &output,
+        &exprs(&["amenity"]),
+        &crate::common::test_host(),
+    )
+    .expect_err("a node without coordinates must not be filtered to 0/0");
     let text = err.to_string();
     assert!(
         text.contains("OSC node 1") && text.contains("lat"),

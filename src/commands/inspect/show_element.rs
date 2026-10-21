@@ -27,8 +27,9 @@ pub fn show_element_to<W: Write>(
     target_id: i64,
     direct_io: bool,
     out: &mut W,
+    host: &crate::host::Host,
 ) -> Result<bool> {
-    let mut reader = crate::blob::BlobReader::open(path, direct_io)?;
+    let mut reader = crate::blob::BlobReader::open_in(path, direct_io, host)?;
     reader.set_parse_indexdata(true);
     let mut decompress_buf: Vec<u8> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();

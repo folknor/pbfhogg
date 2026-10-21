@@ -44,12 +44,15 @@ mod geocode_pass3 {
         pass3_hooks::PANIC_AT_STREETS_WAY_IDX.store(2, Ordering::Relaxed);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            build_geocode_index(&BuildConfig {
-                input_path: input.clone(),
-                output_dir: index_dir.clone(),
-                force: false,
-                ..Default::default()
-            })
+            build_geocode_index(
+                &BuildConfig {
+                    input_path: input.clone(),
+                    output_dir: index_dir.clone(),
+                    force: false,
+                    ..Default::default()
+                },
+                &crate::common::test_host(),
+            )
         }));
 
         pass3_hooks::reset();

@@ -130,8 +130,9 @@ pub struct TagsFilterOscStats {
 }
 
 impl TagsFilterOscStats {
-    pub fn print_summary(&self) {
-        eprintln!(
+    pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        writeln!(
+            w,
             "OSC filtered: create {}/{} kept, modify {}/{} kept, delete {}/{} preserved",
             self.creates_out,
             self.creates_in,
@@ -139,7 +140,9 @@ impl TagsFilterOscStats {
             self.modifies_in,
             self.deletes_out,
             self.deletes_in,
-        );
+        )?;
+
+        Ok(())
     }
 }
 
@@ -156,7 +159,9 @@ pub fn tags_filter_osc(
     input: &Path,
     output: &Path,
     expression_strs: &[String],
+    host: &crate::host::Host,
 ) -> Result<TagsFilterOscStats> {
+    let _ = host;
     let expressions = parse_expressions(expression_strs)?;
     crate::debug::emit_marker("TAGSFILTEROSC_START");
     let (filtered, stats) = parse_and_filter_osc(input, &expressions)?;

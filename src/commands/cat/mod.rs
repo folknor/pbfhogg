@@ -45,15 +45,18 @@ pub struct CatStats {
 }
 
 impl CatStats {
-    pub fn print_summary(&self) {
+    pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         if self.blobs_decoded > 0 {
-            eprintln!(
+            writeln!(
+                w,
                 "Decoded {} blobs, wrote {} elements",
                 self.blobs_decoded, self.elements_written,
-            );
+            )?;
         } else {
-            eprintln!("{} blobs passed through", self.blobs_passthrough);
+            writeln!(w, "{} blobs passed through", self.blobs_passthrough)?;
         }
+
+        Ok(())
     }
 }
 
@@ -73,6 +76,7 @@ pub fn cat(
     direct_io: bool,
     force: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<CatStats> {
     // The indexdata requirement belongs to `cat_filtered`, not to `--type`.
     //
@@ -92,13 +96,13 @@ pub fn cat(
              because an unindexed blob has to be scheduled as all three."
         };
         for file in files {
-            require_indexdata(file, direct_io, force, reason)?;
+            require_indexdata(file, direct_io, force, reason, host)?;
         }
     }
 
     crate::debug::emit_marker("CAT_SCAN_START");
     let result = match (type_filter, clean.any()) {
-        (None, false) => cat_passthrough(files, output, compression, direct_io, overrides),
+        (None, false) => cat_passthrough(files, output, compression, direct_io, overrides, host),
         (None, true) => cat_filtered(
             files,
             output,
@@ -107,10 +111,17 @@ pub fn cat(
             compression,
             direct_io,
             overrides,
+            host,
         ),
-        (Some(filter), false) => {
-            cat_type_passthrough(files, output, filter, compression, direct_io, overrides)
-        }
+        (Some(filter), false) => cat_type_passthrough(
+            files,
+            output,
+            filter,
+            compression,
+            direct_io,
+            overrides,
+            host,
+        ),
         (Some(filter), true) => cat_filtered(
             files,
             output,
@@ -119,6 +130,7 @@ pub fn cat(
             compression,
             direct_io,
             overrides,
+            host,
         ),
     }?;
     crate::debug::emit_marker("CAT_SCAN_END");
@@ -136,10 +148,14 @@ pub fn cat(
 // ---------------------------------------------------------------------------
 
 /// Read one file's `OSMHeader` block.
-fn read_header(file: &Path, direct_io: bool) -> Result<crate::HeaderBlock> {
+fn read_header(
+    file: &Path,
+    direct_io: bool,
+    host: &crate::host::Host,
+) -> Result<crate::HeaderBlock> {
     let mut reader = FileReader::open(file, direct_io)?;
     let mut file_offset: u64 = 0;
-    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
+    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics)? {
         if frame.blob_type == BlobKind::OsmHeader {
             return Ok(decode_blob_to_headerblock(frame.blob_bytes())?);
         }
@@ -180,19 +196,20 @@ fn cat_output_header_bytes(
     files: &[&Path],
     direct_io: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<Vec<u8>> {
     if let [single] = files {
-        let header = read_header(single, direct_io)?;
-        super::warn_locations_on_ways_loss(&header);
+        let header = read_header(single, direct_io, host)?;
+        super::warn_locations_on_ways_loss(&header, host);
         return build_output_header(&header, true, overrides, |hb| hb);
     }
 
     let headers: Vec<crate::HeaderBlock> = files
         .iter()
-        .map(|f| read_header(f, direct_io))
+        .map(|f| read_header(f, direct_io, host))
         .collect::<Result<Vec<_>>>()?;
     for header in &headers {
-        super::warn_locations_on_ways_loss(header);
+        super::warn_locations_on_ways_loss(header, host);
     }
 
     let mut hb = crate::block_builder::HeaderBuilder::new();
@@ -271,11 +288,18 @@ fn cat_passthrough(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<CatStats> {
-    let header_bytes = cat_output_header_bytes(files, direct_io, overrides)?;
+    let header_bytes = cat_output_header_bytes(files, direct_io, overrides, host)?;
 
-    let mut writer =
-        super::writer_from_header_bytes(output, compression, &header_bytes, direct_io, false)?;
+    let mut writer = super::writer_from_header_bytes(
+        output,
+        compression,
+        &header_bytes,
+        direct_io,
+        false,
+        host,
+    )?;
     let mut blobs: u64 = 0;
     let mut decompress_buf: Vec<u8> = Vec::new();
 
@@ -283,7 +307,9 @@ fn cat_passthrough(
         let mut reader = FileReader::open(file, direct_io)?;
         let mut file_offset: u64 = 0;
 
-        while let Some(mut frame) = read_raw_frame(&mut reader, &mut file_offset)? {
+        while let Some(mut frame) =
+            read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics)?
+        {
             match &frame.blob_type {
                 BlobKind::OsmHeader => {}
                 BlobKind::OsmData => {
@@ -347,13 +373,20 @@ fn cat_type_passthrough(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<CatStats> {
     let blob_filter = BlobFilter::new(tf.nodes, tf.ways, tf.relations);
 
-    let header_bytes = cat_output_header_bytes(files, direct_io, overrides)?;
+    let header_bytes = cat_output_header_bytes(files, direct_io, overrides, host)?;
 
-    let mut writer =
-        super::writer_from_header_bytes(output, compression, &header_bytes, direct_io, false)?;
+    let mut writer = super::writer_from_header_bytes(
+        output,
+        compression,
+        &header_bytes,
+        direct_io,
+        false,
+        host,
+    )?;
     let mut blobs_passthrough: u64 = 0;
     let mut blobs_decoded: u64 = 0;
     let mut elements_written: u64 = 0;
@@ -372,7 +405,9 @@ fn cat_type_passthrough(
         let mut reader = FileReader::open(file, direct_io)?;
         let mut file_offset: u64 = 0;
 
-        while let Some(mut frame) = read_raw_frame(&mut reader, &mut file_offset)? {
+        while let Some(mut frame) =
+            read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics)?
+        {
             match &frame.blob_type {
                 BlobKind::OsmHeader => {}
                 BlobKind::OsmData => {
@@ -546,27 +581,34 @@ fn cat_filtered(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<CatStats> {
     // Per-blob worker pool; same precedent as check --refs / verify_ids.
     // The workers do BlockBuilder re-encode (allocation-heavy) but each
     // blob's alloc/free cycle is confined to a single worker thread, so
     // the cross-blob scratch reuse that arena capping penalises (measured
     // on the pre-migration time-filter snapshot path) doesn't apply.
-    crate::debug::cap_malloc_arenas();
+    host.process.cross_thread_alloc_pool();
 
     // -----------------------------------------------------------------------
     // Output header: reconciled across every input (see `cat_output_header_bytes`)
     // -----------------------------------------------------------------------
-    let header_bytes = cat_output_header_bytes(files, direct_io, overrides)?;
-    let mut writer =
-        super::writer_from_header_bytes(output, compression, &header_bytes, direct_io, false)?;
+    let header_bytes = cat_output_header_bytes(files, direct_io, overrides, host)?;
+    let mut writer = super::writer_from_header_bytes(
+        output,
+        compression,
+        &header_bytes,
+        direct_io,
+        false,
+        host,
+    )?;
 
     let mut blobs_decoded: u64 = 0;
     let mut elements: u64 = 0;
 
     for file in files {
         let (node_schedule, way_schedule, rel_schedule, shared_file, _max_ids) =
-            crate::scan::classify::build_classify_schedules_split(file)?;
+            crate::scan::classify::build_classify_schedules_split(file, &host.diagnostics)?;
 
         if tf.nodes {
             crate::debug::emit_marker("CAT_NODES_START");
@@ -577,6 +619,7 @@ fn cat_filtered(
                 clean,
                 compression,
                 &mut writer,
+                host,
             )?;
             blobs_decoded += b;
             elements += e;
@@ -591,6 +634,7 @@ fn cat_filtered(
                 clean,
                 compression,
                 &mut writer,
+                host,
             )?;
             blobs_decoded += b;
             elements += e;
@@ -605,6 +649,7 @@ fn cat_filtered(
                 clean,
                 compression,
                 &mut writer,
+                host,
             )?;
             blobs_decoded += b;
             elements += e;
@@ -638,6 +683,7 @@ fn run_kind_phase(
     clean: &CleanAttrs,
     compression: Compression,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
+    host: &crate::host::Host,
 ) -> Result<(u64, u64)> {
     use crate::blob_meta::ElemKind;
     use crate::reorder_buffer::ReorderBuffer;
@@ -736,6 +782,7 @@ fn run_kind_phase(
                 }
             }
         },
+        &*host.resources,
     )?;
 
     if let Some(e) = write_error {

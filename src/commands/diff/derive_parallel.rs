@@ -66,8 +66,8 @@ struct WalkedFile {
     file: Arc<File>,
 }
 
-fn walk_file(path: &Path) -> Result<WalkedFile> {
-    let mut walker = HeaderWalker::open(path)?;
+fn walk_file(path: &Path, host: &crate::host::Host) -> Result<WalkedFile> {
+    let mut walker = HeaderWalker::open(path, &host.diagnostics)?;
     let mut nodes: Vec<BlobDesc> = Vec::new();
     let mut ways: Vec<BlobDesc> = Vec::new();
     let mut rels: Vec<BlobDesc> = Vec::new();
@@ -827,9 +827,10 @@ pub(crate) fn derive_changes_parallel(
     shard_count: usize,
     increment_version: bool,
     update_timestamp: bool,
+    host: &crate::host::Host,
 ) -> Result<DeriveChangesStats> {
-    let old = walk_file(old_path)?;
-    let new = walk_file(new_path)?;
+    let old = walk_file(old_path, host)?;
+    let new = walk_file(new_path, host)?;
 
     // Outer temp files that `assemble_osc_raw` consumes. Wrap each in
     // a `PathGuard` (see `decisions/0003-*`) so any early return
@@ -1034,6 +1035,7 @@ pub(crate) fn derive_changes_parallel(
         totals.creates,
         totals.modifies,
         totals.deletes,
+        host,
     )
     .map_err(map_emit_err)?;
     crate::debug::emit_marker("DERIVECHANGES_WRITE_END");

@@ -574,10 +574,16 @@ pub(crate) fn uring_writer_thread(
     framed_header: Vec<u8>,
     init_tx: SyncSender<io::Result<()>>,
     expected: &SeqTotal,
+    diagnostics: crate::host::Diagnostics,
 ) -> io::Result<()> {
     let result = uring_init_and_run(&rx, &path, &framed_header, &init_tx, expected);
     if let Err(ref e) = result {
-        eprintln!("[uring_writer] error: {e}");
+        crate::host::diag!(
+            diagnostics,
+            Developer,
+            "writer.uring.error",
+            "[uring_writer] error: {e}"
+        );
     }
     result
 }

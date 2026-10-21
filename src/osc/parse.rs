@@ -500,7 +500,10 @@ fn parse_sequence_number(filename: &str) -> Option<u64> {
 /// Load all .osc.gz diffs from a directory, sorted by sequence number, and
 /// parse them into a single `CompactDiffOverlay`. Later diffs win for conflicts
 /// because `parse_osc_file_into` overwrites existing entries.
-pub fn load_all_diffs(diffs_dir: &Path) -> ParseResult<CompactDiffOverlay> {
+pub fn load_all_diffs(
+    diffs_dir: &Path,
+    diagnostics: &crate::host::Diagnostics,
+) -> ParseResult<CompactDiffOverlay> {
     let mut entries: Vec<(u64, std::path::PathBuf)> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
 
@@ -550,7 +553,10 @@ pub fn load_all_diffs(diffs_dir: &Path) -> ParseResult<CompactDiffOverlay> {
     let total = entries.len();
 
     for (i, (seq, path)) in entries.iter().enumerate() {
-        eprintln!(
+        crate::host::diag!(
+            diagnostics,
+            Progress,
+            "osc.load.parsing",
             "[{}/{}] Parsing diff {} (sequence {seq})...",
             i + 1,
             total,
@@ -559,7 +565,10 @@ pub fn load_all_diffs(diffs_dir: &Path) -> ParseResult<CompactDiffOverlay> {
         parse_osc_file_into(path, &mut overlay)?;
     }
 
-    eprintln!(
+    crate::host::diag!(
+        diagnostics,
+        Progress,
+        "osc.load.loaded",
         "Loaded {total} diffs: {} nodes, {} ways, {} relations \
          ({} deleted nodes, {} deleted ways, {} deleted relations)",
         overlay.node_count(),
@@ -838,7 +847,7 @@ mod tests {
         write_osc_gz(&dir, "4705.osc.gz", xml_4705);
         write_osc_gz(&dir, "999.osc.gz", xml_999);
 
-        let overlay = load_all_diffs(&dir)?;
+        let overlay = load_all_diffs(&dir, &crate::host::Diagnostics::discard())?;
 
         // Node 1 should have been created by 999, then modified by 10000
         let node1 = overlay
@@ -1418,7 +1427,7 @@ mod tests {
         let xml = "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\"/>";
         write_osc_gz(&dir, "changes-4705.osc.gz", xml);
         write_osc_gz(&dir, "planet-latest.osc.gz", xml);
-        let err = load_all_diffs(&dir)
+        let err = load_all_diffs(&dir, &crate::host::Diagnostics::discard())
             .err()
             .expect("a directory of unmatched files must not load as zero diffs");
         let text = err.to_string();
@@ -1435,7 +1444,7 @@ mod tests {
     #[test]
     fn test_load_all_diffs_empty_dir_and_plain_osc() -> ParseResult<()> {
         let dir = make_test_dir("empty_dir");
-        assert!(load_all_diffs(&dir)?.is_empty());
+        assert!(load_all_diffs(&dir, &crate::host::Diagnostics::discard())?.is_empty());
 
         std::fs::write(
             dir.join("4705.osc"),
@@ -1443,7 +1452,7 @@ mod tests {
              <node id=\"3\" lat=\"1.0\" lon=\"2.0\" version=\"1\"/>\n  \
              </create>\n</osmChange>",
         )?;
-        assert!(load_all_diffs(&dir)?.has_node(3));
+        assert!(load_all_diffs(&dir, &crate::host::Diagnostics::discard())?.has_node(3));
         drop(std::fs::remove_dir_all(&dir));
         Ok(())
     }

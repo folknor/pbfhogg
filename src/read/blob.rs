@@ -338,6 +338,7 @@ impl<T: AsRef<[u8]>> BlobReaderSource for Cursor<T> {}
 // wontfix(type-generic-bounds): bounds on struct match osmpbf API and document intent
 #[derive(Clone, Debug)]
 pub struct BlobReader<R: Read + Send> {
+    diagnostics: crate::host::Diagnostics,
     reader: R,
     /// Current reader offset in bytes from the start of the stream.
     offset: Option<ByteOffset>,
@@ -404,6 +405,13 @@ impl<R: Read + Send> BlobReader<R> {
     /// # }
     /// # foo().unwrap();
     /// ```
+    /// Attach per-run diagnostics to this reader.
+    #[must_use]
+    pub fn diagnostics(mut self, diagnostics: crate::host::Diagnostics) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+
     pub fn new(reader: R) -> BlobReader<R> {
         BlobReader {
             reader,
@@ -413,6 +421,7 @@ impl<R: Read + Send> BlobReader<R> {
             blob_index: Some(0),
             last_blob_ok: true,
             header_buf: Vec::new(),
+            diagnostics: crate::host::Diagnostics::discard(),
             parse_tagdata: false,
             parse_indexdata: true,
             parse_waymembers: false,
@@ -571,6 +580,16 @@ impl<R: Read + Send> BlobReader<R> {
             Ok(header) => header,
             Err(e) => return self.handle_error(e),
         };
+        if let Some(len) = header.unrecognised_indexdata_len {
+            crate::host::diag_once!(
+                self.diagnostics,
+                Warning,
+                "indexdata.unrecognised_length",
+                "warning: BlobHeader.indexdata has an unrecognised length ({len} bytes; \
+             expected 26 or 42) - blob index ignored, reads fall back to full decode. \
+             Further occurrences are not reported."
+            );
+        }
 
         if header.datasize < 0 {
             return self.handle_error(new_blob_error(BlobError::InvalidDataSize {
@@ -703,6 +722,7 @@ impl BlobReader<FileReader> {
             blob_index: Some(0),
             last_blob_ok: true,
             header_buf: Vec::new(),
+            diagnostics: crate::host::Diagnostics::discard(),
             parse_tagdata: false,
             parse_indexdata: true,
             parse_waymembers: false,
@@ -727,6 +747,7 @@ impl BlobReader<FileReader> {
             blob_index: Some(0),
             last_blob_ok: true,
             header_buf: Vec::new(),
+            diagnostics: crate::host::Diagnostics::discard(),
             parse_tagdata: false,
             parse_indexdata: true,
             parse_waymembers: false,
@@ -736,6 +757,14 @@ impl BlobReader<FileReader> {
     }
 
     /// Open a file, selecting buffered or O_DIRECT based on the `direct` flag.
+    pub(crate) fn open_in<P: AsRef<Path>>(
+        path: P,
+        direct: bool,
+        host: &crate::host::Host,
+    ) -> Result<Self> {
+        Self::open(path, direct).map(|r| r.diagnostics(host.diagnostics.clone()))
+    }
+
     pub fn open<P: AsRef<Path>>(path: P, direct: bool) -> Result<Self> {
         let reader = FileReader::open(path.as_ref(), direct)?;
         #[cfg(target_os = "linux")]
@@ -747,6 +776,7 @@ impl BlobReader<FileReader> {
             blob_index: Some(0),
             last_blob_ok: true,
             header_buf: Vec::new(),
+            diagnostics: crate::host::Diagnostics::discard(),
             parse_tagdata: false,
             parse_indexdata: true,
             parse_waymembers: false,
@@ -889,6 +919,7 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
             blob_index: (pos == 0).then_some(0),
             last_blob_ok: true,
             header_buf: Vec::new(),
+            diagnostics: crate::host::Diagnostics::discard(),
             parse_tagdata: false,
             parse_indexdata: true,
             parse_waymembers: false,
@@ -1296,7 +1327,10 @@ mod tests {
         };
         // Arm 3: pread walk that checks each payload extent against file size.
         let walk_arm = |path: &std::path::Path| -> Result<usize> {
-            let mut walker = super::super::header_walker::HeaderWalker::open(path)?;
+            let mut walker = super::super::header_walker::HeaderWalker::open(
+                path,
+                &crate::host::Diagnostics::discard(),
+            )?;
             let mut count = 0;
             while walker.next_header()?.is_some() {
                 count += 1;
@@ -1474,6 +1508,7 @@ mod tests {
                 datasize: 0,
                 indexdata: None,
                 indexdata_present: false,
+                unrecognised_indexdata_len: None,
                 tagdata: None,
                 waymembers: None,
             };
@@ -1499,6 +1534,7 @@ mod tests {
             datasize: 1_000_000,
             indexdata: None,
             indexdata_present: false,
+            unrecognised_indexdata_len: None,
             tagdata: None,
             waymembers: None,
         };
@@ -1520,6 +1556,7 @@ mod tests {
             datasize: -1,
             indexdata: None,
             indexdata_present: false,
+            unrecognised_indexdata_len: None,
             tagdata: None,
             waymembers: None,
         };
@@ -1536,6 +1573,7 @@ mod tests {
             datasize: 0,
             indexdata: None,
             indexdata_present: false,
+            unrecognised_indexdata_len: None,
             tagdata: None,
             waymembers: waymembers.map(Vec::into_boxed_slice),
         };

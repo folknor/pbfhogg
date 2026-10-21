@@ -131,7 +131,7 @@ stage = "pre-clippy"
 # `cfg(all(target_os = "linux", target_env = "gnu"))` with a no-op fallback.
 # A call gated on `target_os = "linux"` alone also compiles for musl, where
 # these symbols do not exist, and nothing here builds against musl - so the
-# one way to keep musl building is to keep every call in the one gated file.
+# one way to keep musl building is to keep calls in gated debug/process wrappers.
 # Matches the `libc::` path, so callers of the `crate::debug` wrappers
 # (`cap_malloc_arenas`, `malloc_trim`, `emit_mallinfo2`) stay legal, and
 # `region = "code"` lets comments discuss the calls by name.
@@ -139,9 +139,9 @@ stage = "pre-clippy"
 name = "glibc-allocator-calls-live-in-debug"
 pattern = '\blibc::(?:mallopt|mallinfo2?|malloc_trim|malloc_stats|malloc_info|M_[A-Z_]+)\b'
 paths = ["src/**/*.rs", "cli/src/**/*.rs", "tests/**/*.rs", "benches/**/*.rs"]
-exclude = ["src/debug.rs"]
+exclude = ["src/debug.rs", "src/process.rs"]
 region = "code"
-message = "glibc-only allocator call outside src/debug.rs breaks the musl build; add a target_env gnu gated wrapper there and call it"
+message = "glibc-only allocator calls belong in target_env gnu gated debug/process wrappers"
 
 # Stdout discipline. `print!`/`println!` panic when stdout's reader goes away,
 # so `pbfhogg inspect x.pbf | head` used to die with exit 101. The CLI writes
@@ -1072,3 +1072,42 @@ download_date = "2026-07-10"
 [bygg.datasets.planet.snapshot.8k.pbf.indexed]
 file = "planet-8k-with-indexdata.osm.pbf"
 xxhash = "0725049652040e1d361f8a2471a6739f"
+
+[[textlint]]
+name = "no-process-mutation"
+pattern = '\blibc::(?:mallopt|setrlimit|prlimit|prlimit64)\b'
+paths = ["src/**/*.rs"]
+exclude = ["src/process.rs"]
+region = "code"
+message = "Process mutations belong to the caller's explicit process toolbox"
+
+# statvfs in altw/sparse.rs guards preallocation and sizes no host resource.
+[[textlint]]
+name = "no-host-probe"
+pattern = 'available_parallelism|/proc/meminfo'
+paths = ["src/**/*.rs"]
+exclude = ["src/host.rs"]
+region = "code"
+message = "Host probes must use Resources at the original program point"
+
+[[textlint]]
+name = "no-env-read"
+pattern = '\benv::(?:var|var_os|vars|vars_os)\b'
+paths = ["src/**/*.rs"]
+exclude = ["src/debug.rs"]
+region = "code"
+message = "Only explicitly armed sidecar instrumentation reads the environment"
+
+[[textlint]]
+name = "no-public-reader-in-commands"
+pattern = '\b(?:BlobReader|ElementReader)::(?:open|from_path|from_path_direct|from_path_with_eviction)\b'
+paths = ["src/commands/**/*.rs", "src/geocode_index/builder/**/*.rs", "src/scan/**/*.rs", "src/osc/**/*.rs"]
+region = "code"
+message = "Command readers must inherit the caller's host"
+
+[[textlint]]
+name = "no-eprint-macro"
+pattern = '\beprint(?:ln)?!'
+paths = ["src/**/*.rs"]
+region = "code"
+message = "Library diagnostics must use the caller's Diagnostics handle"

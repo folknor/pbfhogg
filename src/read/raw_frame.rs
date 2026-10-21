@@ -71,13 +71,14 @@ impl RawBlobFrame {
 pub(crate) fn read_raw_frame<R: Read>(
     reader: &mut R,
     file_offset: &mut u64,
+    diagnostics: &crate::host::Diagnostics,
 ) -> Result<Option<RawBlobFrame>> {
     let frame_start = *file_offset;
 
     // Prefix, EOF policy, both size guards and the header parse all live in
     // `read::frame` - see that module for why they are not spelled out here.
     let mut header_bytes = Vec::new();
-    let Some(header) = read_frame_header(reader, &mut header_bytes)? else {
+    let Some(header) = read_frame_header(reader, &mut header_bytes, diagnostics)? else {
         return Ok(None);
     };
     let index = header
@@ -130,9 +131,10 @@ pub(crate) struct BlobHeaderInfo {
 pub(crate) fn read_blob_header_only(
     reader: &mut FileReader,
     file_offset: &mut u64,
+    diagnostics: &crate::host::Diagnostics,
 ) -> Result<Option<BlobHeaderInfo>> {
     let mut header_bytes = Vec::new();
-    let Some(header) = read_frame_header(reader, &mut header_bytes)? else {
+    let Some(header) = read_frame_header(reader, &mut header_bytes, diagnostics)? else {
         return Ok(None);
     };
     let index = header

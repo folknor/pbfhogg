@@ -110,6 +110,7 @@ fn build_header_bytes(
     header: &crate::HeaderBlock,
     locations_on_ways: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<Vec<u8>> {
     // apply-changes requires Sort.Type_then_ID on the base PBF
     // regardless of --locations-on-ways: the upsert slicing in
@@ -141,7 +142,7 @@ fn build_header_bytes(
             hb.sorted().optional_feature("LocationsOnWays")
         })
     } else {
-        crate::commands::warn_locations_on_ways_loss(header);
+        crate::commands::warn_locations_on_ways_loss(header, host);
         build_output_header(header, false, overrides, |hb| hb.sorted())
     }
 }
@@ -151,14 +152,15 @@ fn read_header(
     direct_io: bool,
     locations_on_ways: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<Vec<u8>> {
     let mut reader = FileReader::open(base_pbf, direct_io)?;
     let mut offset: u64 = 0;
     loop {
-        match read_raw_frame(&mut reader, &mut offset)? {
+        match read_raw_frame(&mut reader, &mut offset, &host.diagnostics)? {
             Some(frame) if frame.blob_type == BlobKind::OsmHeader => {
                 let header = decode_blob_to_headerblock(frame.blob_bytes())?;
-                return build_header_bytes(&header, locations_on_ways, overrides);
+                return build_header_bytes(&header, locations_on_ways, overrides, host);
             }
             Some(_) => {}
             None => return Err("base PBF has no OSMHeader blob".into()),
@@ -198,6 +200,7 @@ pub fn merge(
     output_pbf: &Path,
     opts: &MergeOptions,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<MergeStats> {
     let MergeOptions {
         compression,
@@ -217,6 +220,7 @@ pub fn merge(
         force,
         "base PBF has no blob-level indexdata. Without indexdata, every blob must be \
          decompressed to classify elements (significantly slower).",
+        host,
     )?;
 
     // --force --locations-on-ways on a non-indexed base PBF is unsound:
@@ -241,14 +245,23 @@ pub fn merge(
     }
 
     let osc_start = std::time::Instant::now();
-    eprintln!("Parsing OSC diff: {}", osc_file.display());
+    crate::host::diag!(
+        host.diagnostics,
+        Progress,
+        "apply_changes.parse_osc",
+        "Parsing OSC diff: {}",
+        osc_file.display()
+    );
     let diff = Arc::new({
         let mut overlay = crate::osc::CompactDiffOverlay::new();
         overlay.allow_version_regression(opts.allow_version_regression);
         crate::osc::parse_osc_file_into(osc_file, &mut overlay)?;
         overlay
     });
-    eprintln!(
+    crate::host::diag!(
+        host.diagnostics,
+        Progress,
+        "apply_changes.diff_counts",
         "Diff: {} nodes, {} ways, {} relations ({} del nodes, {} del ways, {} del rels)",
         diff.node_count(),
         diff.way_count(),
@@ -271,7 +284,10 @@ pub fn merge(
         .as_millis()
         .try_into()
         .unwrap_or(i64::MAX);
-    eprintln!(
+    crate::host::diag!(
+        host.diagnostics,
+        Progress,
+        "apply_changes.diff_ranges",
         "Diff ID ranges: {} node IDs, {} way IDs, {} rel IDs",
         ranges.node_ids.len(),
         ranges.way_ids.len(),
@@ -288,7 +304,10 @@ pub fn merge(
         let total_needed = idx.locations.len() + idx.needed_set.len();
         let seeded = idx.locations.len();
         let still_needed = idx.needed_set.len();
-        eprintln!(
+        crate::host::diag!(
+            host.diagnostics,
+            Progress,
+            "apply_changes.low_needed",
             "  --locations-on-ways: {total_needed} node IDs needed, {seeded} from diff, {still_needed} from base"
         );
         (
@@ -301,7 +320,7 @@ pub fn merge(
     };
 
     let header_start = std::time::Instant::now();
-    let header_bytes = read_header(base_pbf, direct_io, locations_on_ways, overrides)?;
+    let header_bytes = read_header(base_pbf, direct_io, locations_on_ways, overrides, host)?;
     let header_read_ms = header_start
         .elapsed()
         .as_millis()
@@ -315,6 +334,7 @@ pub fn merge(
         &header_bytes,
         direct_io,
         io_uring,
+        host,
     )?;
     let writer_setup_ms = writer_setup_start
         .elapsed()
@@ -361,9 +381,7 @@ pub fn merge(
                 .into());
         }
         Some(n) if n > 1 => n,
-        _ => std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(2).max(2))
-            .unwrap_or(4),
+        _ => crate::host::sized_workers(&*host.resources, 2, 2, 4),
     };
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("merge_worker_count", worker_count as i64);
@@ -480,7 +498,7 @@ pub fn merge(
     // plumbing a shared "first cause" slot is engineering we haven't
     // needed in practice.
     let stats = std::thread::scope(|scope| -> Result<MergeStats> {
-        let scanner_handle = scope.spawn(move || scanner::run_scanner(scanner_cfg));
+        let scanner_handle = scope.spawn(move || scanner::run_scanner(scanner_cfg, host));
         let workers_counters_inner = Arc::clone(&worker_counters);
         let workers_handle = scope.spawn(move || {
             streaming::run_workers(streaming_cfg, streaming_channels, &workers_counters_inner)
@@ -538,7 +556,7 @@ pub fn merge(
         .into());
     }
 
-    final_stats.print_summary();
+    final_stats.write_summary(&mut host.diagnostics.summary_writer("apply_changes.summary"))?;
 
     // Surface phase counters that callers expect from the legacy shape.
     crate::debug::emit_counter("merge_osc_parse_ms", osc_parse_ms);

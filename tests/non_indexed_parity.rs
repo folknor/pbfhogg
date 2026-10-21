@@ -194,6 +194,7 @@ fn sort_non_indexed_parity() {
         &out_idx,
         &opts,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("sort indexed");
     pbfhogg::commands::sort::sort(
@@ -201,6 +202,7 @@ fn sort_non_indexed_parity() {
         &out_non,
         &opts,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("sort non-indexed");
 
@@ -237,6 +239,7 @@ fn tags_filter_non_indexed_parity() {
         &out_idx,
         &opts,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("tags_filter indexed");
     pbfhogg::tags_filter::tags_filter(
@@ -244,6 +247,7 @@ fn tags_filter_non_indexed_parity() {
         &out_non,
         &opts,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("tags_filter non-indexed");
 
@@ -290,6 +294,7 @@ fn extract_simple_non_indexed_parity() {
             false,
             true,
             &pbfhogg::HeaderOverrides::default(),
+            &crate::common::test_host(),
         )
         .expect("extract");
     };
@@ -334,6 +339,7 @@ fn getid_include_non_indexed_parity() {
         false,
         true,
         &hdr,
+        &crate::common::test_host(),
     )
     .expect("getid indexed");
     pbfhogg::getid::getid(
@@ -345,6 +351,7 @@ fn getid_include_non_indexed_parity() {
         false,
         true,
         &hdr,
+        &crate::common::test_host(),
     )
     .expect("getid non-indexed");
 
@@ -418,6 +425,7 @@ fn apply_changes_non_indexed_parity() {
         &out_idx,
         &opts,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("merge indexed");
     pbfhogg::apply_changes::merge(
@@ -426,6 +434,7 @@ fn apply_changes_non_indexed_parity() {
         &out_non,
         &opts,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("merge non-indexed");
 
@@ -453,9 +462,11 @@ fn check_refs_non_indexed_parity() {
     write_both(&in_idx, &in_non);
 
     let idx =
-        pbfhogg::check::refs::check_refs(&in_idx, true, false, false).expect("check_refs indexed");
-    let non = pbfhogg::check::refs::check_refs(&in_non, true, false, false)
-        .expect("check_refs non-indexed");
+        pbfhogg::check::refs::check_refs(&in_idx, true, false, false, &crate::common::test_host())
+            .expect("check_refs indexed");
+    let non =
+        pbfhogg::check::refs::check_refs(&in_non, true, false, false, &crate::common::test_host())
+            .expect("check_refs non-indexed");
 
     assert_eq!(idx.node_count, non.node_count, "node_count parity");
     assert_eq!(idx.way_count, non.way_count, "way_count parity");
@@ -503,7 +514,8 @@ fn show_element_non_indexed_parity() {
     // Render one lookup into a buffer: (found, output text).
     let show = |path: &std::path::Path, ty: ShowElementType, id: i64| -> (bool, String) {
         let mut out: Vec<u8> = Vec::new();
-        let found = show_element_to(path, ty, id, false, &mut out).expect("show_element_to");
+        let found = show_element_to(path, ty, id, false, &mut out, &crate::common::test_host())
+            .expect("show_element_to");
         (found, String::from_utf8(out).expect("utf8 output"))
     };
 
@@ -568,9 +580,10 @@ fn check_ids_non_indexed_parity() {
         max_errors: 100,
         direct_io: false,
     };
-    let idx = pbfhogg::check::verify_ids::verify_ids(&in_idx, &opts).expect("verify_ids indexed");
-    let non =
-        pbfhogg::check::verify_ids::verify_ids(&in_non, &opts).expect("verify_ids non-indexed");
+    let idx = pbfhogg::check::verify_ids::verify_ids(&in_idx, &opts, &crate::common::test_host())
+        .expect("verify_ids indexed");
+    let non = pbfhogg::check::verify_ids::verify_ids(&in_non, &opts, &crate::common::test_host())
+        .expect("verify_ids non-indexed");
 
     // `indexed` field deliberately WILL differ - that's its whole point.
     // All other report fields must match.
@@ -641,12 +654,28 @@ fn derive_changes_non_indexed_parity() {
     let osc_nn = dir.path().join("nn.osc.gz");
     write_derive_pair(&old_idx, &old_non, &new_idx, &new_non);
 
-    let stats_ii =
-        pbfhogg::diff::derive::derive_changes(&old_idx, &new_idx, &osc_ii, false, false, false, 1)
-            .expect("derive_changes indexed");
-    let stats_nn =
-        pbfhogg::diff::derive::derive_changes(&old_non, &new_non, &osc_nn, false, false, false, 1)
-            .expect("derive_changes non-indexed");
+    let stats_ii = pbfhogg::diff::derive::derive_changes(
+        &old_idx,
+        &new_idx,
+        &osc_ii,
+        false,
+        false,
+        false,
+        1,
+        &crate::common::test_host(),
+    )
+    .expect("derive_changes indexed");
+    let stats_nn = pbfhogg::diff::derive::derive_changes(
+        &old_non,
+        &new_non,
+        &osc_nn,
+        false,
+        false,
+        false,
+        1,
+        &crate::common::test_host(),
+    )
+    .expect("derive_changes non-indexed");
 
     assert_eq!(stats_ii.creates, stats_nn.creates, "creates parity");
     assert_eq!(stats_ii.modifies, stats_nn.modifies, "modifies parity");
@@ -692,6 +721,7 @@ fn renumber_external_rejects_non_indexed() {
         Compression::default(),
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("renumber must accept indexed input");
     assert!(
@@ -707,6 +737,7 @@ fn renumber_external_rejects_non_indexed() {
         Compression::default(),
         false,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect_err("renumber must reject non-indexed input");
     let msg = err.to_string();
@@ -768,6 +799,7 @@ fn extract_multi_complete_ways_non_indexed_parity() {
         false,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("extract_multi indexed");
     pbfhogg::commands::extract::extract_multi(
@@ -780,6 +812,7 @@ fn extract_multi_complete_ways_non_indexed_parity() {
         false,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("extract_multi non-indexed");
 
@@ -816,6 +849,7 @@ fn extract_smart_non_indexed_parity() {
         false,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("extract indexed");
     pbfhogg::commands::extract::extract(
@@ -829,6 +863,7 @@ fn extract_smart_non_indexed_parity() {
         false,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("extract non-indexed");
 
@@ -970,6 +1005,7 @@ fn merge_pbf_non_indexed_parity() {
         &out_idx,
         &opts,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("merge_pbf indexed");
     let stats_non = pbfhogg::cat::dedupe::merge_pbf(
@@ -977,6 +1013,7 @@ fn merge_pbf_non_indexed_parity() {
         &out_non,
         &opts,
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("merge_pbf non-indexed");
 

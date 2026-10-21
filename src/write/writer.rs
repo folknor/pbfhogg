@@ -136,6 +136,21 @@ impl PbfWriter<FileWriter> {
         compression: Compression,
         header_block_bytes: &[u8],
     ) -> io::Result<Self> {
+        Self::to_path_in(
+            path,
+            compression,
+            header_block_bytes,
+            crate::host::Diagnostics::discard(),
+        )
+    }
+
+    pub(crate) fn to_path_in(
+        path: &Path,
+        compression: Compression,
+        header_block_bytes: &[u8],
+        diagnostics: crate::host::Diagnostics,
+    ) -> io::Result<Self> {
+        drop(diagnostics);
         let writer = FileWriter::buffered(path)?;
         Self::start_pipeline(writer, compression, header_block_bytes)
     }
@@ -151,6 +166,22 @@ impl PbfWriter<FileWriter> {
         compression: Compression,
         header_block_bytes: &[u8],
     ) -> io::Result<Self> {
+        Self::to_path_direct_in(
+            path,
+            compression,
+            header_block_bytes,
+            crate::host::Diagnostics::discard(),
+        )
+    }
+
+    #[cfg(feature = "linux-direct-io")]
+    pub(crate) fn to_path_direct_in(
+        path: &Path,
+        compression: Compression,
+        header_block_bytes: &[u8],
+        diagnostics: crate::host::Diagnostics,
+    ) -> io::Result<Self> {
+        drop(diagnostics);
         let writer = FileWriter::direct(path)?;
         Self::start_pipeline(writer, compression, header_block_bytes)
     }
@@ -180,6 +211,21 @@ impl PbfWriter<FileWriter> {
         compression: Compression,
         header_block_bytes: &[u8],
     ) -> io::Result<Self> {
+        Self::to_path_uring_in(
+            path,
+            compression,
+            header_block_bytes,
+            crate::host::Diagnostics::discard(),
+        )
+    }
+
+    #[cfg(feature = "linux-io-uring")]
+    pub(crate) fn to_path_uring_in(
+        path: &Path,
+        compression: Compression,
+        header_block_bytes: &[u8],
+        diagnostics: crate::host::Diagnostics,
+    ) -> io::Result<Self> {
         use crate::write::uring_writer;
 
         let framed_header = frame_blob("OSMHeader", header_block_bytes, &compression, None)?;
@@ -198,6 +244,7 @@ impl PbfWriter<FileWriter> {
                 framed_header,
                 init_tx,
                 &thread_expected,
+                diagnostics,
             )
         });
 
@@ -254,6 +301,20 @@ impl PbfWriter<FileWriter> {
         compression: Compression,
         header_block_bytes: &[u8],
     ) -> io::Result<Self> {
+        Self::to_path_parallel_in(
+            path,
+            compression,
+            header_block_bytes,
+            crate::host::Diagnostics::discard(),
+        )
+    }
+
+    pub(crate) fn to_path_parallel_in(
+        path: &Path,
+        compression: Compression,
+        header_block_bytes: &[u8],
+        diagnostics: crate::host::Diagnostics,
+    ) -> io::Result<Self> {
         use crate::write::parallel_writer;
 
         let framed_header = frame_blob("OSMHeader", header_block_bytes, &compression, None)?;
@@ -270,6 +331,7 @@ impl PbfWriter<FileWriter> {
                 framed_header,
                 init_tx,
                 &thread_expected,
+                diagnostics,
             )
         });
 

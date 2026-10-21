@@ -79,6 +79,7 @@ fn merge_disjoint_node_files() {
         &output,
         &default_opts(),
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("merge_pbf");
     let c = read_all_elements(&output);
@@ -159,6 +160,7 @@ fn merge_overlapping_nodes_dedup() {
         &output,
         &default_opts(),
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("merge_pbf");
     let c = read_all_elements(&output);
@@ -239,6 +241,7 @@ fn merge_with_ways_and_relations() {
         &output,
         &default_opts(),
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("merge_pbf");
     let c = read_all_elements(&output);
@@ -285,6 +288,7 @@ fn merge_single_file() {
         &output,
         &default_opts(),
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("merge_pbf");
     let c = read_all_elements(&output);
@@ -345,6 +349,7 @@ fn merge_three_files() {
         &output,
         &default_opts(),
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("merge_pbf");
     let c = read_all_elements(&output);
@@ -370,6 +375,7 @@ fn merge_empty_files() {
         &output,
         &default_opts(),
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("merge_pbf");
 
@@ -526,6 +532,7 @@ fn merge_same_input_preserves_ways_and_relations() {
         &output,
         &default_opts(),
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("merge_pbf");
     let merged = read_all_elements(&output);
@@ -642,6 +649,7 @@ fn merge_three_files_overlapping_ids() {
         &output,
         &default_opts(),
         &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
     )
     .expect("merge_pbf");
     let c = read_all_elements(&output);
@@ -725,6 +733,7 @@ fn merge_rejects_a_corrupt_frame_prefix_without_allocating() {
             &output,
             &default_opts(),
             &pbfhogg::HeaderOverrides::default(),
+            &crate::common::test_host(),
         )
         .err()
         .unwrap_or_else(|| panic!("a {label} frame prefix must be rejected, not merged"));

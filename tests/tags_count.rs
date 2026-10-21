@@ -43,7 +43,8 @@ fn basic_tag_counting() {
     }
     write_multi_block_test_pbf(&input, &nodes, &ways, &[], 100);
 
-    let counts = tags_count(&input, &default_opts()).expect("tags_count");
+    let counts =
+        tags_count(&input, &default_opts(), &crate::common::test_host()).expect("tags_count");
 
     // With NameAsc sort, the order is amenity=cafe, highway=primary, shop=bakery.
     let find = |key: &str, value: &str| -> Option<&TagCount> {
@@ -80,10 +81,10 @@ fn tags_count_parallel_classify_parity() {
 
     let mut opts = default_opts();
     opts.jobs = 1;
-    let seq = tags_count(&input, &opts).expect("tags_count seq");
+    let seq = tags_count(&input, &opts, &crate::common::test_host()).expect("tags_count seq");
 
     opts.jobs = 4;
-    let par = tags_count(&input, &opts).expect("tags_count par");
+    let par = tags_count(&input, &opts, &crate::common::test_host()).expect("tags_count par");
 
     // Sort by (key, value) for order-independent comparison - NameAsc
     // sort above guarantees the orderings match, but be explicit.
@@ -157,8 +158,10 @@ fn expression_filtered_counts_are_identical_with_and_without_a_tag_index() {
     let mut opts = default_opts();
     opts.expressions = &exprs;
 
-    let with_index = tags_count(&indexed, &opts).expect("tags_count indexed");
-    let without_index = tags_count(&no_tagdata, &opts).expect("tags_count reference");
+    let with_index =
+        tags_count(&indexed, &opts, &crate::common::test_host()).expect("tags_count indexed");
+    let without_index =
+        tags_count(&no_tagdata, &opts, &crate::common::test_host()).expect("tags_count reference");
 
     let norm = |mut v: Vec<TagCount>| {
         v.sort_by_key(|t: &TagCount| (t.key.clone(), t.value.clone()));
@@ -244,7 +247,7 @@ fn an_unconstrainable_key_matcher_does_not_skip_blobs() {
     let exprs = vec!["amenity=cafe".to_string(), "*=yes".to_string()];
     let mut opts = default_opts();
     opts.expressions = &exprs;
-    let mut counts = tags_count(&input, &opts).expect("tags_count");
+    let mut counts = tags_count(&input, &opts, &crate::common::test_host()).expect("tags_count");
     counts.sort_by_key(|t: &TagCount| (t.key.clone(), t.value.clone()));
     let got: Vec<_> = counts
         .into_iter()

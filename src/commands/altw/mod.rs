@@ -196,8 +196,9 @@ impl Stats {
     }
 
     /// Print a summary of the operation to stderr.
-    pub fn print_summary(&self) {
-        eprintln!(
+    pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        writeln!(
+            w,
             "add-locations-to-ways: {} nodes read, {} written, {} dropped, \
              {} ways, {} relations, {} missing locations",
             self.nodes_read,
@@ -206,13 +207,16 @@ impl Stats {
             self.ways_written,
             self.relations_written,
             self.missing_locations,
-        );
+        )?;
         if self.blobs_passthrough > 0 {
-            eprintln!(
+            writeln!(
+                w,
                 "  Blobs: {} passthrough, {} decoded",
                 self.blobs_passthrough, self.blobs_decoded,
-            );
+            )?;
         }
+
+        Ok(())
     }
 }
 
@@ -235,11 +239,12 @@ pub fn add_locations_to_ways(
     output: &Path,
     options: &AltwOptions,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<Stats> {
     // Auto-select: sparse unless the input qualifies for external AND the
     // estimated store exceeds the page-cache budget (see IndexType::Auto).
     let index_type = if options.index_type == IndexType::Auto {
-        auto_select_index_type(input, options.direct_io)?
+        auto_select_index_type(input, options.direct_io, host)?
     } else {
         options.index_type
     };
@@ -256,6 +261,7 @@ pub fn add_locations_to_ways(
             options.force,
             overrides,
             options.inject_prepass,
+            host,
         )?;
         enforce_missing_locations_policy(&stats, options.ignore_missing_nodes)?;
         dest.commit()?;
@@ -268,6 +274,7 @@ pub fn add_locations_to_ways(
         options.force,
         "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
          decompressed and re-encoded (significantly slower).",
+        host,
     )?;
 
     // Suggest external index for sorted indexed PBFs on *explicit* sparse
@@ -275,9 +282,12 @@ pub fn add_locations_to_ways(
     // store fits the page-cache budget; hinting external there would
     // contradict the routing it just explained on stderr.
     if options.index_type == IndexType::Sparse && indexdata_present {
-        let reader = crate::ElementReader::open(input, options.direct_io)?;
+        let reader = crate::ElementReader::open_in(input, options.direct_io, host)?;
         if reader.header().is_sorted() {
-            eprintln!(
+            crate::host::diag!(
+                host.diagnostics,
+                Note,
+                "altw.external_hint",
                 "hint: this sorted indexed PBF is eligible for --index-type external, \
                  which uses bounded memory and sequential I/O. External wins at large \
                  scale (europe and up) and is the only mode that survives at planet on \
@@ -294,7 +304,7 @@ pub fn add_locations_to_ways(
     // scale this reduces touched mmap pages from ~80 GB to ~16 GB.
     crate::debug::emit_marker("ALTW_PASS0_START");
     let (referenced, shared) =
-        collect_way_referenced_node_ids(input, options.direct_io, options.inject_prepass)?;
+        collect_way_referenced_node_ids(input, options.direct_io, options.inject_prepass, host)?;
     crate::debug::emit_marker("ALTW_PASS0_END");
     // Cheap one-shot iter().count(); surfaces the way-ref IdSet size before
     // the index build so the counter survives SIGKILL during pass 1.
@@ -320,6 +330,7 @@ pub fn add_locations_to_ways(
         scratch_dir,
         referenced,
         index_type,
+        host,
     )?;
     crate::debug::emit_marker("ALTW_PASS1_END");
 
@@ -332,6 +343,7 @@ pub fn add_locations_to_ways(
             options.direct_io,
             !options.keep_untagged_nodes,
             options.inject_prepass,
+            host,
         )?;
         crate::debug::emit_marker("ALTW_REL_MEMBER_SCAN_END");
         #[allow(clippy::cast_possible_wrap)]
@@ -358,6 +370,7 @@ pub fn add_locations_to_ways(
         options.direct_io,
         indexdata_present,
         overrides,
+        host,
     )?;
     crate::debug::emit_marker("ALTW_PASS2_END");
     emit_stats_counters(&stats);
@@ -500,13 +513,17 @@ const AUTO_ANON_HEADROOM_BYTES: u64 = 3 << 30;
 // The threshold is relative to runtime RAM, never a hardcoded byte
 // constant: the knee is defined by store-vs-cache, and a constant fitted
 // to one host misroutes every other machine.
-fn auto_select_index_type(input: &Path, direct_io: bool) -> Result<IndexType> {
-    let reader = crate::ElementReader::open(input, direct_io)?;
+fn auto_select_index_type(
+    input: &Path,
+    direct_io: bool,
+    host: &crate::host::Host,
+) -> Result<IndexType> {
+    let reader = crate::ElementReader::open_in(input, direct_io, host)?;
     let sorted = reader.header().is_sorted();
     drop(reader);
     // Check indexdata presence without erroring (peek at first blob).
     let has_index = (|| -> Option<bool> {
-        let mut r = crate::blob::BlobReader::open(input, direct_io).ok()?;
+        let mut r = crate::blob::BlobReader::open_in(input, direct_io, host).ok()?;
         r.set_parse_indexdata(true);
         r.next()?.ok()?; // skip header
         let blob = r.next()?.ok()?;
@@ -517,7 +534,12 @@ fn auto_select_index_type(input: &Path, direct_io: bool) -> Result<IndexType> {
     if !(sorted && has_index) {
         // External cannot run (it requires sorted + indexdata); no
         // estimate needed.
-        eprintln!("auto-selected --index-type sparse (sorted={sorted}, indexed={has_index})");
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "altw.auto_select",
+            "auto-selected --index-type sparse (sorted={sorted}, indexed={has_index})"
+        );
         return Ok(IndexType::Sparse);
     }
 
@@ -528,9 +550,9 @@ fn auto_select_index_type(input: &Path, direct_io: bool) -> Result<IndexType> {
     // does not increase: a walk only costs when something evicted the
     // headers since the previous walk.
     crate::debug::emit_marker("ALTW_AUTO_ESTIMATE_WALK_START");
-    let store = estimate_sparse_store_bytes(input)?;
+    let store = estimate_sparse_store_bytes(input, host)?;
     crate::debug::emit_marker("ALTW_AUTO_ESTIMATE_WALK_END");
-    let budget = page_cache_budget_bytes();
+    let budget = page_cache_budget_bytes(host);
     let chosen = route_sorted_indexed(store, budget);
 
     crate::debug::emit_counter(
@@ -548,14 +570,20 @@ fn auto_select_index_type(input: &Path, direct_io: bool) -> Result<IndexType> {
         } else {
             "<="
         };
-        eprintln!(
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "altw.auto_select",
             "auto-selected --index-type {chosen} (store estimate {:.1} GB {rel} \
              {AUTO_STORE_BUDGET_PCT} % of {:.1} GB page-cache budget)",
             store as f64 / 1e9,
             budget as f64 / 1e9,
         );
     } else {
-        eprintln!(
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "altw.auto_select",
             "auto-selected --index-type {chosen} (sorted=true, indexed=true; \
              store or budget estimate unavailable)"
         );
@@ -590,8 +618,8 @@ fn route_sorted_indexed(store_bytes: Option<u64>, budget_bytes: Option<u64>) -> 
 /// (~69 %), which errs toward external, the cheap direction. Returns
 /// `None` when any OsmData blob lacks indexdata, since the sum would
 /// silently undercount.
-fn estimate_sparse_store_bytes(input: &Path) -> Result<Option<u64>> {
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input)?;
+fn estimate_sparse_store_bytes(input: &Path, host: &crate::host::Host) -> Result<Option<u64>> {
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
     let mut node_count: u64 = 0;
     while let Some(meta) = walker.next_header()? {
         if meta.blob_type != crate::blob::BlobKind::OsmData {
@@ -612,14 +640,10 @@ fn estimate_sparse_store_bytes(input: &Path) -> Result<Option<u64>> {
 /// Page-cache budget for the sparse store: `MemAvailable` minus the anon
 /// headroom the sparse run itself needs. `None` when `/proc/meminfo` is
 /// unavailable (non-Linux) or unparsable.
-fn page_cache_budget_bytes() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let line = meminfo.lines().find(|l| l.starts_with("MemAvailable:"))?;
-    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(
-        kb.saturating_mul(1024)
-            .saturating_sub(AUTO_ANON_HEADROOM_BYTES),
-    )
+fn page_cache_budget_bytes(host: &crate::host::Host) -> Option<u64> {
+    host.resources
+        .memory_available()
+        .map(|b| b.saturating_sub(AUTO_ANON_HEADROOM_BYTES))
 }
 
 /// Process-global instrumentation for the injected-prepass producer.
@@ -688,6 +712,7 @@ fn build_node_index(
     scratch_dir: &Path,
     referenced: IdSet,
     index_type: IndexType,
+    host: &crate::host::Host,
 ) -> Result<NodeIndex> {
     match index_type {
         IndexType::Sparse => {
@@ -695,7 +720,7 @@ fn build_node_index(
             // builds rank index on the IdSet and carries it through to
             // SparseArrayIndex so pass 2 lookups can do
             // rank_if_set(node_id) -> mmap read at rank * 8.
-            build_node_index_sparse(input, direct_io, scratch_dir, referenced)
+            build_node_index_sparse(input, direct_io, scratch_dir, referenced, host)
                 .map(NodeIndex::Sparse)
         }
         IndexType::External | IndexType::Auto => unreachable!("resolved before build_node_index"),
@@ -726,10 +751,12 @@ fn collect_way_referenced_node_ids(
     input: &Path,
     _direct_io: bool,
     inject_prepass: bool,
+    host: &crate::host::Host,
 ) -> Result<(IdSet, Option<IdSet>)> {
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
         Some(crate::blob_meta::ElemKind::Way),
+        &host.diagnostics,
     )?;
     let mut referenced = IdSet::new();
     let mut shared = inject_prepass.then(IdSet::new);
@@ -795,6 +822,7 @@ fn collect_way_referenced_node_ids(
                 union_ns += t_union.elapsed().as_nanos() as u64;
             }
         },
+        &*host.resources,
     )?;
     #[allow(clippy::cast_possible_wrap)]
     {
@@ -831,10 +859,12 @@ pub(crate) fn collect_relation_member_ids(
     _direct_io: bool,
     want_nodes: bool,
     want_ways: bool,
+    host: &crate::host::Host,
 ) -> Result<(Option<IdSet>, Option<IdSet>)> {
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
         Some(crate::blob_meta::ElemKind::Relation),
+        &host.diagnostics,
     )?;
     let mut member_node_ids = want_nodes.then(IdSet::new);
     let mut member_way_ids = want_ways.then(IdSet::new);
@@ -872,6 +902,7 @@ pub(crate) fn collect_relation_member_ids(
                 }
             }
         },
+        &*host.resources,
     )?;
     Ok((member_node_ids, member_way_ids))
 }
@@ -894,6 +925,7 @@ fn write_output_checked(
     direct_io: bool,
     indexdata_present: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<Stats> {
     if inject_prepass && !indexdata_present {
         return Err("--inject-prepass requires blob-level indexdata; --force cannot enable the decode-all fallback because it cannot attach per-blob WayMembers metadata".into());
@@ -911,6 +943,7 @@ fn write_output_checked(
             compression,
             direct_io,
             overrides,
+            host,
         )
     } else {
         write_output_decode_all(
@@ -922,6 +955,7 @@ fn write_output_checked(
             compression,
             direct_io,
             overrides,
+            host,
         )
     }
 }
@@ -941,10 +975,11 @@ fn write_output_decode_all(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
+    host: &crate::host::Host,
 ) -> Result<Stats> {
     let mut stats = Stats::default();
 
-    let reader = ElementReader::open(input, direct_io)?;
+    let reader = ElementReader::open_in(input, direct_io, host)?;
     let mut writer = writer_from_header_parallel(
         output,
         compression,
@@ -954,6 +989,7 @@ fn write_output_decode_all(
         |hb| hb.optional_feature("LocationsOnWays"),
         direct_io,
         false,
+        host,
     )?;
 
     let mut decoded_blocks = 0_u64;

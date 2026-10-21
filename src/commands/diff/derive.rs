@@ -35,12 +35,15 @@ pub struct DeriveChangesStats {
 }
 
 impl DeriveChangesStats {
-    pub fn print_summary(&self) {
+    pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         let total = self.creates + self.modifies + self.deletes;
-        eprintln!(
+        writeln!(
+            w,
             "{total} changes: {} creates, {} modifies, {} deletes",
             self.creates, self.modifies, self.deletes,
-        );
+        )?;
+
+        Ok(())
     }
 }
 
@@ -67,10 +70,11 @@ pub fn derive_changes(
     increment_version: bool,
     update_timestamp: bool,
     jobs: usize,
+    host: &crate::host::Host,
 ) -> Result<DeriveChangesStats> {
     // Single-pass: check sorted headers + indexdata from one file open each.
-    let (old_sorted, old_indexed) = super::check_sorted_and_indexed(old_path, direct_io)?;
-    let (new_sorted, new_indexed) = super::check_sorted_and_indexed(new_path, direct_io)?;
+    let (old_sorted, old_indexed) = super::check_sorted_and_indexed(old_path, direct_io, host)?;
+    let (new_sorted, new_indexed) = super::check_sorted_and_indexed(new_path, direct_io, host)?;
     if !old_sorted {
         crate::commands::require_sorted_err(old_path, "Old PBF")?;
     }
@@ -96,6 +100,7 @@ pub fn derive_changes(
             jobs,
             increment_version,
             update_timestamp,
+            host,
         )
         .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
         crate::debug::emit_marker("DERIVECHANGES_SCAN_END");
@@ -112,9 +117,9 @@ pub fn derive_changes(
 
     let result = (|| -> Result<DeriveChangesStats> {
         if both_indexed {
-            derive_changes_block_pair(old_path, new_path, direct_io, &mut sink)?;
+            derive_changes_block_pair(old_path, new_path, direct_io, &mut sink, host)?;
         } else {
-            derive_changes_element_stream(old_path, new_path, direct_io, &mut sink)?;
+            derive_changes_element_stream(old_path, new_path, direct_io, &mut sink, host)?;
         }
         sink.flush()?;
 
@@ -123,7 +128,7 @@ pub fn derive_changes(
         let stats = sink.stats();
 
         crate::debug::emit_marker("DERIVECHANGES_WRITE_START");
-        assemble_osc(output, &sink)?;
+        assemble_osc(output, &sink, host)?;
         crate::debug::emit_marker("DERIVECHANGES_WRITE_END");
         Ok(stats)
     })();
@@ -286,10 +291,11 @@ fn derive_changes_block_pair(
     new_path: &Path,
     direct_io: bool,
     sink: &mut ChangeSink,
+    host: &crate::host::Host,
 ) -> Result<()> {
-    let mut old_reader = crate::blob::BlobReader::open(old_path, direct_io)?;
+    let mut old_reader = crate::blob::BlobReader::open_in(old_path, direct_io, host)?;
     old_reader.set_parse_indexdata(true);
-    let mut new_reader = crate::blob::BlobReader::open(new_path, direct_io)?;
+    let mut new_reader = crate::blob::BlobReader::open_in(new_path, direct_io, host)?;
     new_reader.set_parse_indexdata(true);
 
     let mut merge = BlockPairMergeState::new(old_reader, new_reader);
@@ -385,11 +391,12 @@ fn derive_changes_element_stream(
     new_path: &Path,
     direct_io: bool,
     sink: &mut ChangeSink,
+    host: &crate::host::Host,
 ) -> Result<()> {
     use crate::osc::write::{OwnedNode, OwnedRelation, OwnedWay};
 
-    let mut old_src = StreamingBlocks::new_sequential(old_path, direct_io)?;
-    let mut new_src = StreamingBlocks::new_sequential(new_path, direct_io)?;
+    let mut old_src = StreamingBlocks::new_sequential(old_path, direct_io, host)?;
+    let mut new_src = StreamingBlocks::new_sequential(new_path, direct_io, host)?;
 
     let iv = sink.increment_version;
     let ut = sink.update_timestamp;
@@ -499,7 +506,7 @@ fn derive_changes_element_stream(
 /// Writes XML structure via quick_xml Writer, copies raw fragment bytes
 /// directly to the underlying parallel gzip writer (not through the XML
 /// writer).
-fn assemble_osc(output: &Path, sink: &ChangeSink) -> Result<()> {
+fn assemble_osc(output: &Path, sink: &ChangeSink, host: &crate::host::Host) -> Result<()> {
     assemble_osc_from_paths(
         output,
         &sink.creates_path,
@@ -508,6 +515,7 @@ fn assemble_osc(output: &Path, sink: &ChangeSink) -> Result<()> {
         sink.create_count,
         sink.modify_count,
         sink.delete_count,
+        host,
     )
 }
 
@@ -515,6 +523,7 @@ fn assemble_osc(output: &Path, sink: &ChangeSink) -> Result<()> {
 /// Same logic as `assemble_osc` but takes the paths + counts directly,
 /// so non-`ChangeSink` callers (e.g. the parallel derive path) can
 /// produce fragments however they like and feed them in.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble_osc_from_paths(
     output: &Path,
     creates_path: &Path,
@@ -523,6 +532,7 @@ pub(crate) fn assemble_osc_from_paths(
     create_count: u64,
     modify_count: u64,
     delete_count: u64,
+    host: &crate::host::Host,
 ) -> Result<()> {
     use crate::write::parallel_gzip::{DEFAULT_CHUNK_SIZE, ParallelGzipWriter};
 
@@ -534,9 +544,7 @@ pub(crate) fn assemble_osc_from_paths(
     // ~23k 2 MB members; the 18 B per-member framing is ~400 KB of
     // overhead, and the per-chunk dictionary reset costs ~1-3% on the
     // ratio. See the CHANGELOG for measured wall wins.
-    let worker_count = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(4);
+    let worker_count = crate::host::sized_workers(&*host.resources, 0, 1, 4);
     let gz = ParallelGzipWriter::new(buf, DEFAULT_CHUNK_SIZE, worker_count);
     let mut writer = Writer::new_with_indent(gz, b' ', 2);
 

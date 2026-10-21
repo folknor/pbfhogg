@@ -567,6 +567,55 @@ suite; the rest still carry their older commit in the Notes column.
 > got the *worse* conditions and still did not beat HEAD - but the
 > magnitude is not a real 4.6 % code win. Do not cite it as one.
 
+> **`apply-changes` parallel_writer join A/B - CLOSED 2026-10-21 (bygg):
+> no measurable regression; the +45 % was drive state.** Question: did
+> `548395f7` (parallel_writer joins every pool thread before returning)
+> regress `apply-changes` against its parent `f2321c21`? Europe,
+> `--osc-seq 4715`, default output (parallel_writer), `--bench 1` cells.
+>
+> | round | cells (walls) | read |
+> |---|---|---|
+> | untrimmed, mixed builds (HEAD from main-tree `target/`, baseline via `--commit` worktree) | before `04947db2` 35.2 s / after `00826907` 50.6 s; after `11b2f1b2` 63.3 s / before `a63a61b2` 43.3 s | looks like +45 % |
+> | untrimmed, both arms via `--commit` worktrees | after `d628550e` 51.6 s, before `d14c2ab8` 59.8 s, before `d4410440` 65.7 s, after `383efa61` 69.0 s | monotonic slowdown by position, either commit |
+> | after `sudo fstrim -av`, alternating pairs | before `f30a2af9` 51.9 / after `0b5c18c4` 57.1; after `90bb07ee` 61.7 / before `c464569e` 63.1; before `5b392e5c` 56.3 / after `08cf9360` 62.2; after `ea5c26b1` 63.4 / before `540cd0db` 61.4 | second cell of every pair is ~2-3 s slower; order-corrected effect ~ +3 s, within noise |
+>
+> **The same binary spanned 35-66 s over the session.** Europe
+> `apply-changes` moves ~35 GB in and ~35 GB out, enough to degrade the
+> drive within one session even immediately after a trim, so successive
+> cells slow by position, not by commit.
+>
+> **The stall-counter flip was a false mechanism.** The first pairs
+> showed the counters change shape (`brokkr sidecar <uuid> --stalls`):
+> `a63a61b2` (before, 43.0 s) `writer_pipeline_send` 14.7 s,
+> `writer_recv` 23.6 s, `merge_drain_reorder_gap` 3.9 s versus
+> `11b2f1b2` (after, 63 s) 0.07 s, 59.1 s, 13.3 s. That reads as "the
+> join moved the writer's blocking point", but the other pair
+> (`04947db2` before 35.0 s: send 0.08 s, recv 32.4 s, reorder 6.0 s;
+> `00826907` after 50.0 s: send 0.08 s, recv 47.8 s, reorder 12.0 s)
+> shows the same shape on both commits, with recv and reorder-gap just
+> scaling with wall. `writer_recv` is 92-94 % of wall in every cell but
+> the fast `a63a61b2` one: the writer is starved by a slower read/merge
+> side, which is what a slow drive looks like. A counter-shape change
+> between two cells that differ in drive state is not evidence of a code
+> cause.
+>
+> **Page-cache-resident cross-check (germany, `--bench 3`, input fits in
+> RAM, so drive state drops out).** Before: `8d80fefa` 3.2 / 3.1 / 3.6 s,
+> `62f5a663` 3.5 / 3.9 / 3.7 s. After: `4b869314` 3.3 / 4.2 / 3.2 s,
+> `e1d9bdb3` 3.3 / 3.7 / 3.2 s. Median 3.55 s vs 3.3 s: no regression
+> (after is nominally faster).
+>
+> Lessons: (1) for a hot-path change, run a page-cache-resident dataset
+> (germany) first - it isolates CPU and sync cost from drive state, and
+> here it settled the question in under a minute; (2) europe
+> `apply-changes` degrades the drive in-session even right after
+> `fstrim`, so cell position dominates and only alternating `--bench 1`
+> pairs with order correction are readable; (3) compare arms built the
+> same way - HEAD from the main tree against a baseline from a `--commit`
+> worktree adds a confound, so use `--commit` for both; (4) do not read a
+> stall-counter shape flip as mechanism until the same flip survives a
+> same-wall comparison.
+
 ### Blob-count threshold dispatch landing gates (ADR-0006, plantasjen, 2026-07-11)
 
 getparents and getid include mode dispatch between the pread header

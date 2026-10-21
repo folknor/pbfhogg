@@ -864,10 +864,11 @@ Reported by: CLI and plumbing.
 
 The read-pipeline decode hook itself is fixed: it is a locked gate with a
 bounded park that panics with a named message, and `reset()` frees a parked
-decode before clearing. What remains is enforcement: nothing checks that
-`test_hooks` statics are armed only from `tests/fault_*.rs` targets that hold
-one `#[test]` each, so a new test arming one inside `tests/all.rs` would race
-its neighbours silently. HYG-062 covers removing the globals outright.
+decode before clearing, and the brokkr textlint rule
+`static-test-hooks-only-in-fault-targets` refuses a `*_test_hooks` import
+outside `tests/fault_*.rs`. What remains: nothing checks that each fault
+target holds a single `#[test]`, so a second test added to one would share
+the armed static with the first. HYG-062 covers removing the globals outright.
 
 Reported by: test harness.
 

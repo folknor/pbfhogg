@@ -166,6 +166,19 @@ exclude = ["cli/src/output.rs"]
 region = "code"
 message = "only cli/src/output.rs acquires stdout; use output::buffered, or have the library take an io::Write"
 
+# Process-global fault hooks (the `*_test_hooks` modules) are armed only from
+# tests/fault_*.rs, each its own [[test]] target in Cargo.toml. A hook armed
+# from a module of the shared tests/all.rs binary fires in every concurrent
+# test that reaches the same code path, which is a flake nobody can trace.
+# Covers the import path; a hook re-exported under another name needs adding.
+[[textlint]]
+name = "static-test-hooks-only-in-fault-targets"
+pattern = '\b[a-z_]*_test_hooks\b'
+paths = ["tests/**/*.rs"]
+exclude = ["tests/fault_*.rs"]
+region = "code"
+message = "process-global test hooks are armed only from a tests/fault_*.rs target of its own (see Cargo.toml); do not arm them inside the shared all binary"
+
 [bin]
 default = "pbfhogg"
 install = ["pbfhogg-cli"]

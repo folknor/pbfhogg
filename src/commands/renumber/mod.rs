@@ -186,7 +186,7 @@ pub fn renumber_external(
     // threads cause glibc arena accumulation growing to ~26 GB anon
     // RSS on planet. With 2 arenas the peak stays under 1 GB.
     // Scoped to this command - other pbfhogg commands are unaffected.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
         libc::mallopt(libc::M_ARENA_MAX, 2);
     }

@@ -113,27 +113,6 @@ impl BuildConfig {
     }
 }
 
-#[cfg(test)]
-mod config_tests {
-    use super::BuildConfig;
-
-    #[test]
-    #[allow(clippy::field_reassign_with_default)]
-    fn rejects_invalid_levels_and_radii() {
-        let mut config = BuildConfig::default();
-        config.street_level = 31;
-        assert!(config.validate().is_err());
-        config.street_level = 17;
-        config.coarse_level = 17;
-        assert!(config.validate().is_err());
-        config.coarse_level = 14;
-        config.fine_search_radius_m = f32::NAN;
-        assert!(config.validate().is_err());
-        config.fine_search_radius_m = -1.0;
-        assert!(config.validate().is_err());
-    }
-}
-
 /// Build statistics.
 #[derive(Debug, Default)]
 pub struct BuildStats {
@@ -172,7 +151,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     // Scoped to this command; other pbfhogg paths unaffected. Same prelude
     // used by renumber_external / check_refs / verify_ids for the same
     // reason.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
         libc::mallopt(libc::M_ARENA_MAX, 2);
     }
@@ -517,4 +496,25 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         coarse_cells: u64::from(coarse_count),
         admin_cells: u64::from(admin_count),
     })
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::BuildConfig;
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn rejects_invalid_levels_and_radii() {
+        let mut config = BuildConfig::default();
+        config.street_level = 31;
+        assert!(config.validate().is_err());
+        config.street_level = 17;
+        config.coarse_level = 17;
+        assert!(config.validate().is_err());
+        config.coarse_level = 14;
+        config.fine_search_radius_m = f32::NAN;
+        assert!(config.validate().is_err());
+        config.fine_search_radius_m = -1.0;
+        assert!(config.validate().is_err());
+    }
 }

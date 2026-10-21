@@ -365,6 +365,14 @@
 
 ### Added
 
+- **Builds against musl (`x86_64-unknown-linux-musl` and friends).** The
+  glibc-only allocator tuning calls (`mallopt` arena caps, `malloc_trim`,
+  `mallinfo2`) are now gated on `target_env = "gnu"` and become no-ops
+  elsewhere, so static `FROM scratch` binaries can depend on pbfhogg.
+  Contributed by Steffen Trog (#2). musl's default allocator is markedly
+  slower under pbfhogg's multithreaded allocation load; consider a
+  replacement global allocator such as mimalloc in musl builds.
+
 - **`apply-changes` and `tags-filter --input-kind osc` accept uncompressed
   `.osc` input.** Both wrapped every input in a gzip decoder unconditionally
   and failed on plain XML with a raw "invalid gzip header", while

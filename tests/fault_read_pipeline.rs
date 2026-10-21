@@ -1,7 +1,7 @@
 //! Fault-injection test for the pipelined reader's decode admission.
 //!
-//! Arms `pbfhogg::read::pipeline_test_hooks`, process-global statics that
-//! every pipelined read in the process consults: `BLOCK_DECODE_SEQ` parks
+//! Arms `pbfhogg::read::pipeline_test_hooks`, process-global state that
+//! every pipelined read in the process consults: `arm_block_decode` parks
 //! whichever decode reaches that sequence number, and the reorder
 //! high-water marks are a max over every concurrent pipeline. That is why
 //! this test owns its process (its own `[[test]]` target in `Cargo.toml`):
@@ -22,7 +22,7 @@ mod read_pipeline {
 
     use pbfhogg::ElementReader;
     use pbfhogg::read::pipeline_test_hooks::{
-        BLOCK_DECODE_SEQ, BLOCKED_DECODE_READY, RELEASE_BLOCKED_DECODE, REORDER_FILLED_HIGH_WATER,
+        REORDER_FILLED_HIGH_WATER, arm_block_decode, blocked_decode_ready, release_blocked_decode,
         reset,
     };
     use tempfile::TempDir;
@@ -39,7 +39,7 @@ mod read_pipeline {
 
     impl Driver {
         fn release_and_join(&mut self) {
-            RELEASE_BLOCKED_DECODE.store(true, Relaxed);
+            release_blocked_decode();
             if let Some(handle) = self.handle.take()
                 && handle.join().is_err()
             {
@@ -62,7 +62,7 @@ mod read_pipeline {
         let path = dir.path().join("many.osm.pbf");
         write_many_block_pbf(&path, 16);
 
-        BLOCK_DECODE_SEQ.store(1, Relaxed);
+        arm_block_decode(1);
         let (done_tx, done_rx) = mpsc::sync_channel(1);
         let mut driver = Driver {
             handle: Some(std::thread::spawn(move || {
@@ -76,7 +76,7 @@ mod read_pipeline {
         };
 
         let start = Instant::now();
-        while !BLOCKED_DECODE_READY.load(Relaxed) {
+        while !blocked_decode_ready() {
             assert!(
                 start.elapsed() < Duration::from_secs(5),
                 "decode hook was not reached"
@@ -93,7 +93,7 @@ mod read_pipeline {
             std::thread::sleep(Duration::from_millis(1));
         }
 
-        RELEASE_BLOCKED_DECODE.store(true, Relaxed);
+        release_blocked_decode();
         let result = done_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("pipeline did not finish after releasing decode hook");

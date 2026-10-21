@@ -8,28 +8,12 @@ use super::super::Result;
 use crate::Element;
 use crate::blob_meta::ElemKind;
 
-/// Element type filter for `show_element`.
+/// Element type filter for `show_element_to`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ShowElementType {
     Node,
     Way,
     Relation,
-}
-
-/// Look up a single element by type and ID and print it to the process's
-/// stdout. Returns whether the element was found.
-///
-/// A convenience over [`show_element_to`], which renders into any writer.
-/// A failed stdout write - including the reader of a pipe going away - is
-/// returned as an error, never a panic.
-pub fn show_element(
-    path: &Path,
-    elem_type: ShowElementType,
-    target_id: i64,
-    direct_io: bool,
-) -> Result<bool> {
-    let mut out = io::stdout().lock();
-    show_element_to(path, elem_type, target_id, direct_io, &mut out)
 }
 
 /// Look up a single element by type and ID and write all its metadata,

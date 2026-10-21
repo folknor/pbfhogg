@@ -22,23 +22,31 @@ mod parallel_gzip_flush {
     ///
     /// `finish()` joins the workers, so a panicked worker was always caught
     /// there. `flush()` never joins: it queues an acknowledgement barrier
-    /// behind the dispatched chunks and blocks on the ack. Before the
-    /// `Out::WorkerDied` notice existed, a worker that died mid-chunk while a
-    /// sibling kept the channel open left a permanent seq gap in front of the
-    /// barrier, the writer thread parked short of it forever, and this test
+    /// behind the dispatched chunks and blocks on the ack. Before a failed
+    /// chunk's seq was filled with a placeholder (`Out::Dropped`), a worker
+    /// that died mid-chunk while a sibling kept the channel open left a
+    /// permanent seq gap in front of the barrier, the writer thread parked
+    /// short of it forever, and this test
     /// hung until the harness watchdog killed it - which is exactly how the
     /// defect would have presented in production `diff --format osc` runs.
     ///
     /// Two workers, panic on pool op #1: the surviving worker keeps the
     /// compressed channel open, so the hang - not a clean channel-closed
-    /// error - is the shape under test.
+    /// error - is the shape under test. The error must be the first
+    /// failure, panic payload included, not a description of the gap.
     #[test]
     fn fault_injection_parallel_gzip_worker_death_surfaces_via_flush() {
         gz_hooks::reset();
 
         let sink: Vec<u8> = Vec::new();
         let mut gz = gz_hooks::ParallelGzipWriter::new(sink, 1024, 2);
-        gz_hooks::PANIC_AT_POOL_OP_COUNT.store(1, Ordering::Relaxed);
+        gz_hooks::PANIC_AT_POOL_OP_COUNT.store(1, Ordering::SeqCst);
+        // The panicking worker holds off until flush's barrier is queued, so
+        // the failure lands in front of an outstanding barrier: the barrier
+        // can only be answered if the failed seq is filled. Without this the
+        // panic could be recorded before flush starts, flush would fail fast
+        // at dispatch, and the barrier path would go untested.
+        gz_hooks::PANIC_WAITS_FOR_BARRIER.store(true, Ordering::SeqCst);
 
         // Four chunks: the first dispatched op panics, later ones ride the
         // surviving worker so the channel stays open across the gap.
@@ -47,7 +55,15 @@ mod parallel_gzip_flush {
             gz.flush()
         }));
 
+        let timed_out = gz_hooks::HOOK_TIMED_OUT.load(Ordering::SeqCst);
+        let barriers = gz_hooks::BARRIERS_QUEUED.load(Ordering::SeqCst);
         gz_hooks::reset();
+
+        assert!(
+            !timed_out && barriers >= 1,
+            "the panic must land behind a queued flush barrier \
+             (timed out: {timed_out}, barriers queued: {barriers})"
+        );
 
         match flush_result {
             Ok(Ok(())) => panic!(
@@ -56,15 +72,13 @@ mod parallel_gzip_flush {
             ),
             Ok(Err(e)) => {
                 let msg = format!("{e}");
-                let acceptable = msg.contains("compress worker died")
-                    || msg.contains("worker pool dropped")
-                    || msg.contains("writer thread exited");
-                assert!(acceptable, "unexpected error message from flush(): {msg}");
+                assert!(
+                    msg.contains("parallel gzip worker panicked")
+                        && msg.contains("test-hooks: parallel_gzip pool op #1"),
+                    "flush() must report the first failure with its panic payload, got: {msg}"
+                );
             }
-            Err(_) => {
-                // The panic propagated through a blocking send; the writer
-                // did not claim success, which is the invariant under test.
-            }
+            Err(_) => panic!("a compress-worker panic must not unwind into the caller"),
         }
 
         // Teardown must not hang either: Drop's best-effort flush and joins

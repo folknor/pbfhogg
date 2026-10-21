@@ -489,8 +489,7 @@ fn check_refs_non_indexed_parity() {
 // `show_element` gates blob-skip on `blob.index()`; non-indexed blobs
 // are decompressed and element-scanned unconditionally. Finding the
 // target element must work regardless. These tests pin the outcome
-// (found / not-found) on both twins; they do not compare stdout since
-// the function prints directly.
+// (found / not-found) and the rendered header line on both twins.
 
 #[test]
 fn show_element_non_indexed_parity() {
@@ -499,34 +498,46 @@ fn show_element_non_indexed_parity() {
     let in_non = dir.path().join("in_non.osm.pbf");
     write_both(&in_idx, &in_non);
 
-    use pbfhogg::inspect::{ShowElementType, show_element};
+    use pbfhogg::inspect::{ShowElementType, show_element_to};
+
+    // Render one lookup into a buffer: (found, output text).
+    let show = |path: &std::path::Path, ty: ShowElementType, id: i64| -> (bool, String) {
+        let mut out: Vec<u8> = Vec::new();
+        let found = show_element_to(path, ty, id, false, &mut out).expect("show_element_to");
+        (found, String::from_utf8(out).expect("utf8 output"))
+    };
 
     // Hit: node 5 exists in the fixture.
-    let idx_hit =
-        show_element(&in_idx, ShowElementType::Node, 5, false).expect("show node indexed");
-    let non_hit =
-        show_element(&in_non, ShowElementType::Node, 5, false).expect("show node non-indexed");
+    let (idx_hit, idx_text) = show(&in_idx, ShowElementType::Node, 5);
+    let (non_hit, non_text) = show(&in_non, ShowElementType::Node, 5);
     assert!(idx_hit, "node 5 must be found on indexed fixture");
     assert!(non_hit, "node 5 must be found on non-indexed fixture");
+    assert!(idx_text.starts_with("node/5\n"), "got {idx_text:?}");
+    assert!(non_text.starts_with("node/5\n"), "got {non_text:?}");
 
     // Miss: no node at id 999.
-    let idx_miss =
-        show_element(&in_idx, ShowElementType::Node, 999, false).expect("show miss indexed");
-    let non_miss =
-        show_element(&in_non, ShowElementType::Node, 999, false).expect("show miss non-indexed");
+    let (idx_miss, idx_miss_text) = show(&in_idx, ShowElementType::Node, 999);
+    let (non_miss, non_miss_text) = show(&in_non, ShowElementType::Node, 999);
     assert!(!idx_miss, "node 999 must NOT be found on indexed fixture");
     assert!(
         !non_miss,
         "node 999 must NOT be found on non-indexed fixture"
     );
+    assert!(idx_miss_text.is_empty() && non_miss_text.is_empty());
 
     // Hit on a way.
-    let idx_way =
-        show_element(&in_idx, ShowElementType::Way, 1_000, false).expect("show way indexed");
-    let non_way =
-        show_element(&in_non, ShowElementType::Way, 1_000, false).expect("show way non-indexed");
+    let (idx_way, idx_way_text) = show(&in_idx, ShowElementType::Way, 1_000);
+    let (non_way, non_way_text) = show(&in_non, ShowElementType::Way, 1_000);
     assert!(idx_way, "way 1000 must be found on indexed fixture");
     assert!(non_way, "way 1000 must be found on non-indexed fixture");
+    assert!(
+        idx_way_text.starts_with("way/1000\n"),
+        "got {idx_way_text:?}"
+    );
+    assert!(
+        non_way_text.starts_with("way/1000\n"),
+        "got {non_way_text:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

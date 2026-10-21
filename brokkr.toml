@@ -149,9 +149,7 @@ message = "glibc-only allocator call outside src/debug.rs breaks the musl build;
 # the library never owns its host's stdout and renders into a caller-supplied
 # `io::Write` instead. Rule two matches the bare identifier, not the call, so
 # `use std::io::stdout as out;` cannot rename its way past it.
-# `show_element.rs` keeps a stdout wrapper for the old `show_element`
-# signature that tests still call; retire it with its exclusion once they
-# use `show_element_to`. `region = "code"` keeps doc examples, comments and
+# `region = "code"` keeps doc examples, comments and
 # clap help strings out of scope. `eprintln!` stays legal.
 [[textlint]]
 name = "no-print-macro"
@@ -164,7 +162,7 @@ message = "print!/println! panic when stdout's reader goes away (pbfhogg ... | h
 name = "no-stdout-handle"
 pattern = '\bstdout\b'
 paths = ["src/**/*.rs", "cli/src/**/*.rs"]
-exclude = ["cli/src/output.rs", "src/commands/inspect/show_element.rs"]
+exclude = ["cli/src/output.rs"]
 region = "code"
 message = "only cli/src/output.rs acquires stdout; use output::buffered, or have the library take an io::Write"
 

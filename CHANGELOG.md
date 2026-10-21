@@ -14,10 +14,10 @@
     `write_human(&mut w, file_name)`;
   - `VerifyIdsReport::print_human` becomes `write_human(&mut w, file_name)`.
 
-  `inspect::show_element_to(.., &mut w)` is new; `inspect::show_element`
-  keeps its signature, still writes to stdout, and now returns an error on
-  a failed write instead of panicking. Write errors in the inspect block
-  tables used to be silently discarded and are now returned.
+  `inspect::show_element` (which wrote to stdout) is removed, replaced by
+  `inspect::show_element_to(path, ty, id, direct_io, &mut w)`. Write errors
+  in the inspect block tables used to be silently discarded and are now
+  returned.
 
 - **Geocode index format version 3 widens admin entry and vertex byte offsets
   to 64 bits.** Version 2 indexes are rejected at `Reader::open` with a message
@@ -496,6 +496,16 @@
   errors, such as a full disk behind `> file`, still exit 2. `export`, `diff`
   and `tags-count` output to stdout is now block-buffered instead of
   line-buffered.
+
+- **A failed parallel write no longer keeps writing after it reports
+  failure.** When one worker of the default parallel output writer failed or
+  panicked, the writer returned the error while its other workers were still
+  writing to the output file, so a caller that removed or reused the path
+  could race them. Every worker is now stopped and joined before the error is
+  returned, and the error carries the panic's message instead of a bare
+  "writer thread panicked". The parallel gzip writer used by
+  `diff --format osc` reports the first failure, with its message, in the
+  same way.
 
 - **Parallel `diff` no longer leaves `diff-par-*.txt.tmp` files behind** when
   writing its output fails, for example when the reader of a stdout pipe goes

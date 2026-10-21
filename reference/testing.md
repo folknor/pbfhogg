@@ -58,20 +58,20 @@ NAME` list each harness in turn to find one test.
 - **What the shared binary shares.** Every module of `all` runs
   concurrently in one process with: the global rayon pool; the glibc
   arena cap the library's commands set (`debug::cap_malloc_arenas`);
-  `RLIMIT_NOFILE`, which altw's external backend raises; the
-  `geocode_index` reader's `ADMIN_PIP_CALLS` counter, one for every
-  `Reader` though `admin_pip_calls(&self)` reads like a per-reader
-  count; and every `test-hooks` static, which nothing in `all` may arm.
+  `RLIMIT_NOFILE`, which altw's external backend raises; and every
+  `test-hooks` static, which nothing in `all` may arm.
   A test that needs any of this to itself, or arms a static hook,
   takes a target of its own.
 - **Why the static-hook tests are not one lock-serialized binary.**
   Mutual exclusion inside one process is only equivalent to a process
   each if every thread that can read a hook has exited before the next
-  test arms one. `write::parallel_writer` returns on the first
-  panicked pool worker and detaches the rest, which keep draining
-  their queues and touching the hook counter; and the check watchdog
-  ages a test from its libtest start, so tests queued on a lock spend
-  their 20 s budget waiting. Per-instance hooks (one fault plan carried
+  test arms one. The write pools now guarantee that for themselves
+  (`write::parallel_writer` and `write::parallel_gzip` join every
+  thread they started before returning, and `fault_parallel_writer`
+  asserts it), but no audit has established it for every other
+  hooked pipeline; and the check watchdog ages a test from its
+  libtest start, so tests queued on a lock spend their 20 s budget
+  waiting. Per-instance hooks (one fault plan carried
   in each command's options) would let these tests fold into `all`
   with no lock at all.
 

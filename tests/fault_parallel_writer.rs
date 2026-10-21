@@ -3,20 +3,18 @@
 //!
 //! Split out of the former `apply_changes_invariants.rs` (2026-04-25).
 //! This file is its own `[[test]]` target in `Cargo.toml`, so the
-//! static `PANIC_AT_POOL_OP_COUNT` is per-process and race-free without `#[ignore]` or `--test-threads=1`. The
-//! hook shape was chosen over a per-instance `MergeOptions` field
-//! because pool workers are spawned deep inside
-//! `parallel_writer_thread_inner` - threading a config through
-//! every entry point would be invasive. The serialization cost
-//! that previously came from `--test-threads=1` is replaced by
-//! per-binary isolation here.
+//! static hooks are per-process and race-free without `#[ignore]` or
+//! `--test-threads=1`. The hook shape was chosen over a per-instance
+//! `MergeOptions` field because pool workers are spawned deep inside
+//! `parallel_writer_thread_inner` - threading a config through every
+//! entry point would be invasive.
 //!
 //! Note: `parallel_writer` assigns absolute `pwrite` offsets to
 //! every op up-front. If a pool worker panics holding queued ops
 //! in its channel, those ops' offsets go unwritten - the kernel
 //! leaves zero-filled holes at those byte ranges. The command
 //! must still return an error and must not claim success; that's
-//! the invariant this test locks. Whether the resulting file is
+//! one invariant this test locks. Whether the resulting file is
 //! truncated or merely malformed-and-holey is a secondary concern
 //! covered by CHANGELOG notes, not by the
 //! absence-or-truncation assertion (which is too strong for this
@@ -31,7 +29,8 @@ mod parallel_writer {
     use std::fs::File;
     use std::io::Write;
     use std::path::Path;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::Ordering::SeqCst;
+    use std::time::{Duration, Instant};
 
     use flate2::write::GzEncoder;
     use pbfhogg::apply_changes::{MergeOptions, merge};
@@ -48,14 +47,25 @@ mod parallel_writer {
         enc.finish().expect("finish gz");
     }
 
-    /// Pool-worker panic inside `write::parallel_writer` must surface as
-    /// a hard failure, not a silent short file.
+    /// A pool-worker panic inside `write::parallel_writer` must surface as
+    /// a hard failure carrying the panic's message - and the writer must not
+    /// return while any pool worker is still running.
+    ///
+    /// The second half is BUG-066: the writer used to return on the first
+    /// panicked join and detach the rest of the pool, which kept writing
+    /// into the output after `merge()` had already reported failure. The
+    /// hooks make that deterministic: worker 0 gets the first op and
+    /// panics only once a sibling is parked mid-op, and the parked sibling
+    /// is released only when the writer starts joining a non-panicked
+    /// worker. A writer that walks away from its pool never reaches that
+    /// join, so it returns with the sibling still parked and
+    /// `LIVE_POOL_WORKERS` non-zero. A writer that joins everything
+    /// releases the sibling, waits for it, and returns with zero live.
     #[test]
-    fn fault_injection_parallel_writer_pool_panic_surfaces_error() {
-        // Static hook is process-global; reset before and after to
+    fn fault_injection_parallel_writer_pool_panic_surfaces_error_and_joins_pool() {
+        // Static hooks are process-global; reset before and after to
         // avoid leaking state to sibling tests in this binary (there
-        // are none today, but keep the discipline so future additions
-        // don't reintroduce a race).
+        // are none, but keep the discipline).
         pw_hooks::reset();
 
         let dir = TempDir::new().expect("tempdir");
@@ -63,8 +73,9 @@ mod parallel_writer {
         let osc = dir.path().join("diff.osc.gz");
         let output = dir.path().join("output.osm.pbf");
 
-        // Multi-blob base so the parallel_writer pool dispatches multiple
-        // ops. 40 nodes in blocks of 5 + header = 9+ ops in flight.
+        // Multi-blob base so the parallel_writer pool dispatches several
+        // ops: 40 nodes in blocks of 5 = 8+ data blobs, so worker 1 gets
+        // the second op while worker 0 waits to panic.
         let nodes = generate_nodes(40, 1);
         write_multi_block_test_pbf(&base, &nodes, &[], &[], 5);
         write_osc(
@@ -82,9 +93,8 @@ mod parallel_writer {
 
         let before = common::snapshot_dir(dir.path());
 
-        // Arm: panic on the 3rd dispatched pool op. Low enough that many
-        // later ops are still in-flight when the panic fires.
-        pw_hooks::PANIC_AT_POOL_OP_COUNT.store(3, Ordering::Relaxed);
+        pw_hooks::HOLD_OTHER_POOL_WORKERS.store(true, SeqCst);
+        pw_hooks::PANIC_IN_POOL_WORKER.store(0, SeqCst);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             merge(
@@ -106,13 +116,53 @@ mod parallel_writer {
             )
         }));
 
-        // Always disarm; sibling tests must not inherit the hook.
-        pw_hooks::reset();
+        // Observe before releasing anything.
+        let live_at_return = pw_hooks::LIVE_POOL_WORKERS.load(SeqCst);
+        let join_reached = pw_hooks::JOIN_REACHED_HELD_WORKER.load(SeqCst);
+        let timed_out = pw_hooks::HOOK_TIMED_OUT.load(SeqCst);
 
-        let silently_succeeded = matches!(result, Ok(Ok(_)));
+        // Unconditional cleanup before any assertion, so a failing
+        // assertion cannot leave parked workers behind: release them and
+        // wait (bounded) for every pool thread to exit, then disarm.
+        pw_hooks::RELEASE_POOL_WORKERS.store(true, SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pw_hooks::LIVE_POOL_WORKERS.load(SeqCst) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let live_after_release = pw_hooks::LIVE_POOL_WORKERS.load(SeqCst);
+        pw_hooks::reset();
+        assert_eq!(
+            live_after_release, 0,
+            "parallel_writer pool workers still running 10 s after release"
+        );
+        // The handshake is what makes the assertions below meaningful: a
+        // sibling was parked when worker 0 panicked, and stayed parked until
+        // the writer started joining it. A timed-out wait means one of those
+        // did not happen and a detaching writer could have passed.
         assert!(
-            !silently_succeeded,
-            "parallel_writer pool-worker panic must not produce a silent success"
+            !timed_out,
+            "a test-hook handshake timed out; the detach check proved nothing"
+        );
+
+        let err = match result {
+            Ok(Ok(_)) => {
+                panic!("parallel_writer pool-worker panic must not produce a silent success")
+            }
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => panic!("merge() must report the pool-worker panic as an Err, not unwind"),
+        };
+        assert!(
+            err.contains("test-hooks: parallel_writer pool worker 0 panicking"),
+            "the surfaced error must carry the panic payload, got: {err}"
+        );
+        assert!(
+            join_reached,
+            "the writer returned without ever joining a parked pool worker - it detached its pool"
+        );
+        assert_eq!(
+            live_at_return, 0,
+            "merge() returned while {live_at_return} parallel_writer pool worker(s) were still \
+             running - the writer detached its pool"
         );
 
         let mut after = common::snapshot_dir(dir.path());

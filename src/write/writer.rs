@@ -15,6 +15,7 @@ use crate::blob_meta;
 use crate::write::copy_range::copy_range;
 use crate::write::file_writer::FileWriter;
 use crate::write::metrics::WRITER_METRICS;
+use crate::write::pool_failure::panic_error;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::Ordering::Relaxed;
@@ -64,7 +65,7 @@ fn pipeline_send_error(pipeline: &mut WritePipeline) -> io::Error {
             Ok(Ok(())) => io::Error::other(
                 "writer thread finished before all blobs were sent; output is incomplete",
             ),
-            Err(_) => io::Error::other("writer thread panicked"),
+            Err(payload) => panic_error("writer thread", payload.as_ref()),
         },
         // Already joined - flush() or an earlier send failure took the handle
         // and surfaced whatever it found.
@@ -216,7 +217,7 @@ impl PbfWriter<FileWriter> {
                 return Err(match handle.join() {
                     Ok(Ok(())) => io::Error::other("writer thread exited without init signal"),
                     Ok(Err(e)) => e,
-                    Err(_) => io::Error::other("writer thread panicked during init"),
+                    Err(payload) => panic_error("writer thread (during init)", payload.as_ref()),
                 });
             }
         }
@@ -287,7 +288,9 @@ impl PbfWriter<FileWriter> {
                         io::Error::other("parallel writer thread exited without init signal")
                     }
                     Ok(Err(e)) => e,
-                    Err(_) => io::Error::other("parallel writer thread panicked during init"),
+                    Err(payload) => {
+                        panic_error("parallel writer thread (during init)", payload.as_ref())
+                    }
                 });
             }
         }
@@ -775,7 +778,7 @@ impl<W: Write> PbfWriter<W> {
             if let Some(handle) = pipeline.join_handle.take() {
                 handle
                     .join()
-                    .map_err(|_| io::Error::other("writer thread panicked"))??;
+                    .map_err(|payload| panic_error("writer thread", payload.as_ref()))??;
             }
         }
         if let Some(ref mut w) = self.writer {

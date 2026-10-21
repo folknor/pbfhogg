@@ -113,14 +113,15 @@ path = "tests/all.rs"
 # the library's `test-hooks` code. An armed static fires in any concurrent
 # test of the same process that reaches that code path, so each keeps a
 # process to itself; one test per target. A shared binary serialized by a
-# lock is not equivalent while a pipeline can return with hook-reading
-# threads still alive (parallel_writer detaches its remaining pool workers
-# after the first panicked join) and while queueing on a lock ages the
-# check watchdog's per-test clock. `required-features` keeps them out of
-# sweeps without `test-hooks`, where they would be empty harnesses.
+# lock is not equivalent: queueing on a lock ages the check watchdog's
+# per-test clock, and only the write pools are known to join every thread
+# they start before returning - no audit has checked the other hooked
+# pipelines. `required-features` keeps them out of sweeps without
+# `test-hooks`, where they would be empty harnesses.
 
-# PANIC_AT_POOL_OP_COUNT in write::parallel_writer, reached by every
-# parallel-writer output.
+# The worker-panic and hold handshake hooks in write::parallel_writer
+# (PANIC_IN_POOL_WORKER and friends), reached by every parallel-writer
+# output.
 [[test]]
 name = "fault_parallel_writer"
 path = "tests/fault_parallel_writer.rs"
@@ -176,7 +177,7 @@ name = "fault_uring_writer"
 path = "tests/fault_uring_writer.rs"
 required-features = ["test-hooks", "linux-io-uring"]
 
-# BLOCK_DECODE_SEQ and the reorder high-water marks in read::pipeline,
+# The decode gate and the reorder high-water marks in read::pipeline,
 # consulted by every pipelined read in the process.
 [[test]]
 name = "fault_read_pipeline"

@@ -1525,8 +1525,7 @@ Hooks live as statics in about twelve modules (`read/pipeline.rs`,
 `mod.rs` files under four naming schemes (`read::pipeline_test_hooks`,
 `read::region_grid_test_hooks`, a `write::` re-export, an `altw::` re-export),
 so nothing answers "what can a test inject". Reset discipline differs:
-`parallel_writer` says reset at start and end, the `read/pipeline.rs` test skips
-the end reset on panic, `ADMIN_PIP_CALLS` has reset but no arm, `region_grid`
+`parallel_writer` says reset at start and end, `region_grid`
 resets both sides, stage 3's `PANIC_AT_BUCKET_IDX` doc says reset "at the start
 AND end of any test". The comments in `parallel_writer.rs`, `parallel_gzip.rs`,
 `uring_writer.rs` and `diff/parallel.rs` say tests serialise via
@@ -2338,15 +2337,3 @@ Reported by: geocode index.
 
 Reported by: CLI and plumbing, test harness.
 
-## HYG-107 - Two tests call the stdout-writing `show_element` and bypass libtest capture
-
-`tests/inspect.rs` and `tests/non_indexed_parity.rs` call
-`pbfhogg::inspect::show_element`, a convenience wrapper that still writes the
-element to the process stdout, so libtest's capture does not see it and the
-text leaks into the run output. `show_element_to` renders into any writer; the
-CLI already uses it. Fix: switch both tests to
-`show_element_to(.., &mut std::io::sink())`, then delete the `show_element`
-wrapper and the `src/commands/inspect/show_element.rs` entry in the
-`no-stdout-handle` textlint rule's `exclude` list in `brokkr.toml`.
-
-Reported by: CLI and plumbing, test harness.

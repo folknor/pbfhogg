@@ -19,9 +19,6 @@ use super::format::{
 };
 use crate::geo;
 
-#[cfg(feature = "test-hooks")]
-static ADMIN_PIP_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 // ---------------------------------------------------------------------------
 // Public result types
 // ---------------------------------------------------------------------------
@@ -185,9 +182,14 @@ impl<'a> Candidates<'a> {
 
 /// A memory-mapped reverse geocoding index reader.
 ///
-/// `Send + Sync` - all fields are `Mmap` (which is `Send + Sync`) or plain
-/// values.
+/// `Send + Sync` - all fields are `Mmap` (which is `Send + Sync`), plain
+/// values, or (under `test-hooks`) an atomic counter.
 pub struct Reader {
+    /// Admin point-in-polygon tests run by this reader since it was opened
+    /// or last reset. Per reader, so a test observes only its own queries.
+    #[cfg(feature = "test-hooks")]
+    admin_pip_calls: std::sync::atomic::AtomicUsize,
+
     header: Header,
     fine_max_dist_sq: f64,
     coarse_max_dist_sq: f64,
@@ -263,6 +265,8 @@ impl Reader {
         let coarse_radius_m = header.coarse_search_radius_m as f64;
 
         let reader = Self {
+            #[cfg(feature = "test-hooks")]
+            admin_pip_calls: std::sync::atomic::AtomicUsize::new(0),
             fine_max_dist_sq: geo::meters_to_radians_sq(fine_radius_m),
             coarse_max_dist_sq: geo::meters_to_radians_sq(coarse_radius_m),
             header,
@@ -701,14 +705,20 @@ impl Reader {
         self.header.admin_cell_level
     }
 
+    /// Zero this reader's admin point-in-polygon call count.
     #[cfg(feature = "test-hooks")]
     pub fn reset_admin_pip_calls(&self) {
-        ADMIN_PIP_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.admin_pip_calls
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Admin point-in-polygon tests this reader has run since it was opened
+    /// or last reset. Other readers do not contribute; concurrent queries on
+    /// this same reader do.
     #[cfg(feature = "test-hooks")]
     pub fn admin_pip_calls(&self) -> usize {
-        ADMIN_PIP_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+        self.admin_pip_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -1337,7 +1347,8 @@ impl Reader {
 
     fn admin_polygon_contains(&self, ctx: &QueryContext, poly: &AdminPolygon) -> bool {
         #[cfg(feature = "test-hooks")]
-        ADMIN_PIP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.admin_pip_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Ok(start) = usize::try_from(poly.vertex_offset) else {
             return false;
         };

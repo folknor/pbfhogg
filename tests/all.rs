@@ -15,11 +15,8 @@
 //! Every module here shares one process with every other, concurrently. The
 //! process-wide state they share: the global rayon pool; the glibc arena cap
 //! the library's commands set through `pbfhogg::debug::cap_malloc_arenas`;
-//! `RLIMIT_NOFILE`, which altw's external backend raises; the
-//! `ADMIN_PIP_CALLS` counter behind `geocode_index::reader::Reader`'s
-//! `admin_pip_calls` (one counter for every reader, which only
-//! `geocode_index` reads); and every `test-hooks` static in the library,
-//! which nothing here may arm. A test that arms a process-global hook, or
+//! `RLIMIT_NOFILE`, which altw's external backend raises; and every
+//! `test-hooks` static in the library, which nothing here may arm. A test that arms a process-global hook, or
 //! needs any of this state to itself, gets its own `[[test]]` target in
 //! `Cargo.toml` with the reason beside it - see the `fault_*` targets.
 

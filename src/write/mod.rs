@@ -29,6 +29,7 @@ pub mod header_builder;
 pub(crate) mod parallel_gzip;
 pub(crate) mod parallel_writer;
 mod pipeline;
+mod pool_failure;
 mod string_table;
 
 // Under the `test-hooks` feature, expose the static fault-injection
@@ -36,7 +37,10 @@ mod string_table;
 // `parallel_writer` stays crate-private.
 #[cfg(feature = "test-hooks")]
 pub mod parallel_writer_test_hooks {
-    pub use super::parallel_writer::test_hooks::{PANIC_AT_POOL_OP_COUNT, POOL_OP_COUNT, reset};
+    pub use super::parallel_writer::test_hooks::{
+        HELD_POOL_WORKERS, HOLD_OTHER_POOL_WORKERS, HOOK_TIMED_OUT, JOIN_REACHED_HELD_WORKER,
+        LIVE_POOL_WORKERS, PANIC_IN_POOL_WORKER, POOL_OP_COUNT, RELEASE_POOL_WORKERS, reset,
+    };
 }
 
 // Under the `test-hooks` feature, expose the parallel_gzip hooks and
@@ -44,7 +48,10 @@ pub mod parallel_writer_test_hooks {
 // writer directly.
 #[cfg(feature = "test-hooks")]
 pub mod parallel_gzip_test_hooks {
-    pub use super::parallel_gzip::test_hooks::{PANIC_AT_POOL_OP_COUNT, POOL_OP_COUNT, reset};
+    pub use super::parallel_gzip::test_hooks::{
+        BARRIERS_QUEUED, HOOK_TIMED_OUT, PANIC_AT_POOL_OP_COUNT, PANIC_WAITS_FOR_BARRIER,
+        POOL_OP_COUNT, reset,
+    };
     pub use super::parallel_gzip::{DEFAULT_CHUNK_SIZE, ParallelGzipWriter};
 }
 

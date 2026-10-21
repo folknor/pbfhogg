@@ -609,19 +609,32 @@ fn show_element_unsorted_pbf_finds_target_in_later_blob() {
     ];
     crate::common::write_test_pbf_impl(&input, &nodes, &[], &[], false, Some(2));
 
-    use pbfhogg::inspect::{ShowElementType, show_element};
-    let found = show_element(&input, ShowElementType::Node, 51, false).expect("show_element");
+    use pbfhogg::inspect::{ShowElementType, show_element_to};
+    let mut out: Vec<u8> = Vec::new();
+    let found =
+        show_element_to(&input, ShowElementType::Node, 51, false, &mut out).expect("show_element");
     assert!(
         found,
         "node 51 lives in the second blob; must be found on unsorted PBF"
     );
+    let text = String::from_utf8(out).expect("utf8 output");
+    assert!(text.starts_with("node/51\n"), "unexpected output: {text:?}");
 
     // Sanity: also find 100 (first blob).
-    let found100 =
-        show_element(&input, ShowElementType::Node, 100, false).expect("show_element 100");
+    let mut out100: Vec<u8> = Vec::new();
+    let found100 = show_element_to(&input, ShowElementType::Node, 100, false, &mut out100)
+        .expect("show_element 100");
     assert!(found100, "node 100 is in the first blob");
+    let text100 = String::from_utf8(out100).expect("utf8 output");
+    assert!(
+        text100.starts_with("node/100\n"),
+        "unexpected output: {text100:?}"
+    );
 
     // Miss path still works: id 999 doesn't exist anywhere.
-    let miss = show_element(&input, ShowElementType::Node, 999, false).expect("show miss");
+    let mut out_miss: Vec<u8> = Vec::new();
+    let miss = show_element_to(&input, ShowElementType::Node, 999, false, &mut out_miss)
+        .expect("show miss");
     assert!(!miss, "node 999 shouldn't exist");
+    assert!(out_miss.is_empty(), "a miss must write nothing");
 }

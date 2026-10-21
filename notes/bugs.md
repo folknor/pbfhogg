@@ -860,35 +860,16 @@ Reported by: CLI and plumbing.
 
 Reported by: CLI and plumbing.
 
-## BUG-059 - The decode hook's spin has no timeout and `reset()` cannot free a parked decode
+## BUG-059 - Nothing enforces one test per static-hook target
 
-Partly resolved: `admission_high_water_bounded_under_slow_first_decode` now
-lives alone in `tests/fault_read_pipeline.rs`, its own `[[test]]` target, so no
-sibling test shares its process, and it arms the hook through a guard that
-releases, joins and resets on every exit path. What is still open, in
-`src/read/pipeline.rs` `test_hooks`: `maybe_block_decode` spins on a `Relaxed`
-flag with `sleep(1ms)` and no timeout, so a test that fails to release it hangs
-until the check watchdog fires and reports an unrelated-looking futex wait; and
-`reset()` sets the release flag back to false, so it cannot free a decode that
-is already parked. Fix: give the spin a bounded wait that panics with a named
-message, and have `reset()` release before clearing. Enforce "one test per
-static-hook target" with a check that `test_hooks` is used only in
-`tests/fault_*.rs` files and each holds one `#[test]` (HYG-062 covers removing
-the globals).
+The read-pipeline decode hook itself is fixed: it is a locked gate with a
+bounded park that panics with a named message, and `reset()` frees a parked
+decode before clearing. What remains is enforcement: nothing checks that
+`test_hooks` statics are armed only from `tests/fault_*.rs` targets that hold
+one `#[test]` each, so a new test arming one inside `tests/all.rs` would race
+its neighbours silently. HYG-062 covers removing the globals outright.
 
 Reported by: test harness.
-
-## BUG-060 - `ADMIN_PIP_CALLS` is process-global but exposed as a per-reader count
-
-`geocode_index/reader.rs` keeps `static ADMIN_PIP_CALLS` and exposes
-`Reader::reset_admin_pip_calls(&self)` and `admin_pip_calls(&self)`. The
-`&self` signature says "this reader's count"; the value is every reader's.
-`tests/geocode_index.rs` (many tests, a module of the shared `all` test binary,
-parallel threads) resets and asserts `<= 1` while concurrent query tests increment the same counter: a
-latent flake the signature hides. Fix: a per-`Reader` counter field.
-`PANIC_AT_STREETS_WAY_IDX` in `pass3.rs` is the same pattern.
-
-Reported by: test harness, geocode index.
 
 ## BUG-061 - The `minimal` sweep runs CLI tests against a binary another sweep built
 
@@ -982,18 +963,26 @@ regression on Denmark reads as "data missing".
 
 Reported by: test harness.
 
-## BUG-066 - `parallel_writer` returns on the first panicked join and detaches the remaining workers
+## BUG-066 - `PbfWriter`'s rayon framing tasks can abort the process or deadlock `flush()`
 
-`write::parallel_writer` stops joining as soon as one pool worker's join reports
-a panic and returns the error, leaving the remaining pool workers running. They
-keep writing to the output and touching `POOL_OP_COUNT` after `merge()` has
-returned, so the caller sees a failed run while threads are still mutating the
-destination (and, under `test-hooks`, the process-global fault counter). This is
-why `fault_parallel_writer` cannot share a binary with other tests behind a
-lock. Fix: join every worker before returning, surfacing the first error, or
-signal the workers to stop and wait for them.
+The write pools now join every thread they start before returning (the
+parallel_writer detach is fixed), but `writer.rs` hands blob framing to three
+`rayon::spawn` sites that are not joined. They never touch the output file, so
+they cannot corrupt it, but: a panic inside a framing task goes to rayon's panic
+handler, which aborts the process by default; and a normal `flush()` can
+deadlock on a single-thread rayon pool, because the writer thread's channel only
+closes once the framing tasks finish and those tasks cannot run while the pool's
+one thread is blocked in `flush()`. Waiting for the tasks from `flush` or `Drop`
+is not the fix - it deadlocks the same way when the `PbfWriter` is driven from
+inside rayon. Needs cooperative scheduling or structured execution of framing
+work. Relevant to library use (bz pbfhogg#1): a caller choosing its own rayon
+pool size can hit it.
 
-Reported by: test harness, write path.
+Also in the write path: `uring_writer`'s `drain_best_effort` gives up after a
+fixed number of error rounds, and each `submit_and_wait(1)` can block
+indefinitely, so its shutdown is not guaranteed clean.
+
+Reported by: write path.
 
 ## BUG-067 - `eprintln!` panics when stderr's reader goes away
 

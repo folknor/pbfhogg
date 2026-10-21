@@ -1,5 +1,5 @@
 //! Inspect PBF file: comprehensive metadata, block breakdown, ordering analysis.
-//! Also provides `show_element` for displaying a single element by ID.
+//! Also provides `show_element_to` for displaying a single element by ID.
 
 mod format;
 #[cfg(feature = "commands")]
@@ -11,5 +11,5 @@ mod show_element;
 mod types;
 
 pub use scan::{InspectOptions, inspect};
-pub use show_element::{ShowElementType, show_element, show_element_to};
+pub use show_element::{ShowElementType, show_element_to};
 pub use types::InspectReport;

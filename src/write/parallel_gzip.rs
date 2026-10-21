@@ -18,22 +18,40 @@
 //! was the serial-tail ceiling on `-j 16` runs (32.8 s at planet, ~10%
 //! of the full run wall).
 
+//!
+//! ## Failure
+//!
+//! Every thread of one writer shares a
+//! [`FirstFailure`](crate::write::pool_failure::FirstFailure): a compress
+//! error, a worker or writer-thread panic (payload message kept), or an
+//! inner-writer I/O error is recorded there, first one wins, and that first
+//! failure is what `flush`, `write` and `finish` report. Recording also stops
+//! the pool: workers forward a [`Out::Dropped`] placeholder instead of
+//! compressing, and the writer thread stops writing to the inner writer, but
+//! every seq still reaches the writer thread so flush barriers are answered.
+//! `finish` and `Drop` join every thread before they return.
+
 use std::collections::BTreeMap;
 use std::io::{self, Write};
+use std::panic::AssertUnwindSafe;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use flate2::write::GzEncoder;
+
+use crate::write::pool_failure::FirstFailure;
 
 // Fault-injection hooks for tests. Gated behind the `test-hooks`
 // Cargo feature; release builds don't compile this module at all.
 // Same shape as `parallel_writer::test_hooks`: process-global
 // atomics rather than per-instance config because pool workers are
-// spawned deep inside `ParallelGzipWriter::new`. Tests serialize
-// access via `--test-threads=1`.
+// spawned deep inside `ParallelGzipWriter::new`. A test that arms them
+// owns its own `[[test]]` binary (see reference/testing.md).
 #[cfg(feature = "test-hooks")]
 pub mod test_hooks {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
 
     /// Pool op count at which the acting worker panics. `u64::MAX` =
     /// disarmed (default). Call [`reset`] at the start AND end of
@@ -46,10 +64,48 @@ pub mod test_hooks {
     /// `PANIC_AT_POOL_OP_COUNT`.
     pub static POOL_OP_COUNT: AtomicU64 = AtomicU64::new(0);
 
+    /// When set, the worker that is about to panic first waits (bounded)
+    /// until a flush barrier has been queued, so the failure provably lands
+    /// in front of an outstanding barrier rather than before `flush` starts.
+    pub static PANIC_WAITS_FOR_BARRIER: AtomicBool = AtomicBool::new(false);
+
+    /// Flush barriers accepted into the raw queue.
+    pub static BARRIERS_QUEUED: AtomicU64 = AtomicU64::new(0);
+
+    /// Set if a bounded hook wait expired - the handshake did not happen,
+    /// and a test relying on it proved nothing.
+    pub static HOOK_TIMED_OUT: AtomicBool = AtomicBool::new(false);
+
     /// Disarm and zero the counters.
     pub fn reset() {
-        PANIC_AT_POOL_OP_COUNT.store(u64::MAX, Ordering::Relaxed);
-        POOL_OP_COUNT.store(0, Ordering::Relaxed);
+        PANIC_AT_POOL_OP_COUNT.store(u64::MAX, Ordering::SeqCst);
+        POOL_OP_COUNT.store(0, Ordering::SeqCst);
+        PANIC_WAITS_FOR_BARRIER.store(false, Ordering::SeqCst);
+        BARRIERS_QUEUED.store(0, Ordering::SeqCst);
+        HOOK_TIMED_OUT.store(false, Ordering::SeqCst);
+    }
+
+    /// Called by a worker after it dequeues a chunk, before compressing it.
+    pub(super) fn on_compress(seq: u64) {
+        let n = POOL_OP_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+        if n == PANIC_AT_POOL_OP_COUNT.load(Ordering::SeqCst) {
+            if PANIC_WAITS_FOR_BARRIER.load(Ordering::SeqCst) {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while BARRIERS_QUEUED.load(Ordering::SeqCst) == 0 {
+                    if Instant::now() >= deadline {
+                        HOOK_TIMED_OUT.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            panic!("test-hooks: parallel_gzip pool op #{n} (seq {seq}) panicking");
+        }
+    }
+
+    /// Called by `flush` once its barrier is in the raw queue.
+    pub(super) fn on_barrier_queued() {
+        BARRIERS_QUEUED.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -89,36 +145,19 @@ enum Job {
 enum Out {
     Bytes(Vec<u8>),
     Barrier(SyncSender<io::Result<()>>),
-    /// A worker dequeued this seq and died before producing its bytes -
-    /// panic, or a `compress_one` error. Sent by [`DeathNotice`] so the seq
-    /// space has no permanent gap: without it, a mid-stream worker death
-    /// leaves the writer thread parked forever short of any barrier queued
-    /// behind the gap, and a producer blocked in [`ParallelGzipWriter::flush`]
-    /// hangs while the surviving workers keep the channel open. `finish()`
-    /// would have caught the death at join time; `flush` never joins, so the
-    /// gap has to be reported through the data path itself.
-    WorkerDied,
-}
-
-/// Fills a dead worker's seq slot; see [`Out::WorkerDied`].
-///
-/// Armed immediately after a `Compress` job is dequeued and disarmed just
-/// before its result is sent, so every exit in between - the unwind path of a
-/// worker panic, the `compress_one` error return - delivers the notice from
-/// `Drop`. A failed send means the writer thread is already gone, and with it
-/// everyone who could have waited on the gap.
-struct DeathNotice<'a> {
-    seq: u64,
-    tx: &'a SyncSender<(u64, Out)>,
-    armed: bool,
-}
-
-impl Drop for DeathNotice<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            drop(self.tx.send((self.seq, Out::WorkerDied)));
-        }
-    }
+    /// This seq produced no bytes: compressing it failed or panicked, or the
+    /// pool had already stopped and the worker skipped it. The failure is in
+    /// the shared [`FirstFailure`], recorded before this was sent.
+    ///
+    /// Every dequeued seq yields exactly one `Out`, so the seq space has no
+    /// gap: a gap would park the writer thread short of any flush barrier
+    /// queued behind it, and a producer blocked in
+    /// [`ParallelGzipWriter::flush`] would hang while the surviving workers
+    /// keep the channel open. This used to be a `Drop` guard firing on the
+    /// unwind of a panicking worker; the dequeue-to-send span now runs under
+    /// `catch_unwind` instead (see [`compress_job`]), so the placeholder is
+    /// sent on an ordinary path, after the panic is on record.
+    Dropped,
 }
 
 /// Writer that buffers bytes, dispatches chunks to a worker pool for
@@ -128,14 +167,16 @@ impl Drop for DeathNotice<'_> {
 /// Call [`finish`](Self::finish) to flush the final partial chunk,
 /// join the workers + writer thread, and recover the inner writer
 /// along with any deferred I/O error. Dropping without `finish` does
-/// a best-effort flush (errors can't propagate through `Drop`).
+/// a best-effort flush (errors can't propagate through `Drop`) and still
+/// joins every thread.
 pub struct ParallelGzipWriter<W: Write + Send + 'static> {
     chunk_size: usize,
     current: Vec<u8>,
     next_seq: u64,
     raw_tx: Option<SyncSender<(u64, Job)>>,
-    writer_handle: Option<JoinHandle<io::Result<W>>>,
+    writer_handle: Option<JoinHandle<Option<W>>>,
     worker_handles: Vec<JoinHandle<()>>,
+    failure: Arc<FirstFailure>,
 }
 
 impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
@@ -144,50 +185,144 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
     /// compressor threads; pick `std::thread::available_parallelism()`
     /// (or a value derived from it) for a CPU-bound workload. Falls
     /// back to 1 if `worker_count == 0`.
+    ///
+    /// A thread that fails to spawn does not panic out of here (which would
+    /// detach the threads already spawned, there being no `Self` yet whose
+    /// `Drop` could join them): the failure is recorded, the writer comes back
+    /// already stopped, and the first call that dispatches to the pool - a
+    /// `write` that fills a chunk, `flush`, or `finish` - reports it, while
+    /// `finish`/`Drop` join whatever did start. A `write` that only buffers
+    /// does not check: `write` is called per small fragment on the derive
+    /// path, and checking there would put a load on every call to report the
+    /// error at most one chunk sooner.
     pub fn new(inner: W, chunk_size: usize, worker_count: usize) -> Self {
         let worker_count = worker_count.max(1);
         let raw_cap = worker_count * QUEUE_SLOTS_PER_WORKER;
         let compressed_cap = worker_count * QUEUE_SLOTS_PER_WORKER;
         let (raw_tx, raw_rx) = sync_channel::<(u64, Job)>(raw_cap);
         let (compressed_tx, compressed_rx) = sync_channel::<(u64, Out)>(compressed_cap);
+        let failure = Arc::new(FirstFailure::new());
 
-        let raw_rx = std::sync::Arc::new(std::sync::Mutex::new(raw_rx));
+        let raw_rx = Arc::new(Mutex::new(raw_rx));
 
         let mut worker_handles = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
-            let raw_rx = std::sync::Arc::clone(&raw_rx);
+        for index in 0..worker_count {
+            let raw_rx = Arc::clone(&raw_rx);
             let compressed_tx = compressed_tx.clone();
-            worker_handles.push(std::thread::spawn(move || {
-                worker_loop(&raw_rx, &compressed_tx);
-            }));
+            let worker_failure = Arc::clone(&failure);
+            let spawned = std::thread::Builder::new().spawn(move || {
+                // Backstop only: `compress_job` already catches everything
+                // between dequeue and send. Recorded before `compressed_tx`
+                // drops, so the writer thread cannot see the disconnect first.
+                let caught = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    worker_loop(&raw_rx, &compressed_tx, &worker_failure);
+                }));
+                if let Err(payload) = caught {
+                    worker_failure.record_panic("parallel gzip worker", payload.as_ref());
+                }
+                drop(compressed_tx);
+            });
+            match spawned {
+                Ok(handle) => worker_handles.push(handle),
+                Err(e) => {
+                    failure.record(io::Error::new(
+                        e.kind(),
+                        format!("spawn parallel gzip worker {index}: {e}"),
+                    ));
+                    break;
+                }
+            }
         }
         // Drop the extra sender so the last worker closing their sender
         // actually closes the channel on the writer thread.
         drop(compressed_tx);
 
-        let writer_handle = std::thread::spawn(move || writer_loop(inner, compressed_rx));
+        let writer_failure = Arc::clone(&failure);
+        let spawned = std::thread::Builder::new().spawn(move || {
+            // Backstop as above: `writer_loop` runs every inner-writer call
+            // under `guarded`. The receiver is owned out here so it is only
+            // dropped after a panic has been recorded.
+            let caught = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                writer_loop(inner, &compressed_rx, &writer_failure)
+            }));
+            let out = caught.unwrap_or_else(|payload| {
+                writer_failure.record_panic("parallel gzip writer thread", payload.as_ref());
+                None
+            });
+            drop(compressed_rx);
+            out
+        });
+        let writer_handle = match spawned {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                failure.record(io::Error::new(
+                    e.kind(),
+                    format!("spawn parallel gzip writer thread: {e}"),
+                ));
+                None
+            }
+        };
 
         Self {
             chunk_size,
             current: Vec::with_capacity(chunk_size),
             next_seq: 0,
             raw_tx: Some(raw_tx),
-            writer_handle: Some(writer_handle),
+            writer_handle,
             worker_handles,
+            failure,
         }
     }
 
+    /// The recorded first failure, restated, or `fallback` if (impossibly)
+    /// nothing is on record. For producer-side calls that must report now;
+    /// `finish` surfaces the original.
+    fn pool_error(&self, fallback: &str) -> io::Error {
+        self.failure
+            .restate()
+            .unwrap_or_else(|| io::Error::other(format!("ParallelGzipWriter: {fallback}")))
+    }
+
     /// Send one job to the pool under the next sequence number.
+    ///
+    /// Fails fast once the pool has stopped, so a producer stops feeding a
+    /// pipeline that will discard everything it is given.
     fn dispatch(&mut self, job: Job) -> io::Result<()> {
+        if self.failure.stopped() {
+            return Err(self.pool_error("pool stopped"));
+        }
         let seq = self.next_seq;
         self.next_seq += 1;
         let tx = self
             .raw_tx
             .as_ref()
             .ok_or_else(|| io::Error::other("ParallelGzipWriter: already finished"))?;
-        tx.send((seq, job))
-            .map_err(|_| io::Error::other("ParallelGzipWriter: worker pool dropped"))?;
+        if tx.send((seq, job)).is_err() {
+            return Err(self.pool_error("worker pool dropped"));
+        }
         Ok(())
+    }
+
+    /// Close the raw channel and join every thread: workers first (they must
+    /// finish before the writer sees a closed compressed channel), then the
+    /// writer thread, whose inner writer is returned when it succeeded.
+    /// Never returns early, so no thread outlives the call.
+    fn shutdown(&mut self) -> Option<W> {
+        self.raw_tx = None;
+        for h in std::mem::take(&mut self.worker_handles) {
+            if let Err(payload) = h.join() {
+                self.failure
+                    .record_panic("parallel gzip worker", payload.as_ref());
+            }
+        }
+        match self.writer_handle.take()?.join() {
+            Ok(inner) => inner,
+            Err(payload) => {
+                self.failure
+                    .record_panic("parallel gzip writer thread", payload.as_ref());
+                None
+            }
+        }
     }
 
     /// Dispatch the current buffer as a raw chunk to the worker pool.
@@ -201,26 +336,23 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
 
     /// Flush any buffered bytes, drop the raw-send channel so workers
     /// drain, join everything, and return the inner writer.
+    ///
+    /// Every thread is joined before this returns, whatever failed, and the
+    /// error returned is the first failure any of them recorded. This used to
+    /// `?` out of the join loop on the first panicked worker, reporting a
+    /// fixed "worker panicked" with the payload discarded, and ranking
+    /// failures by join order rather than by which happened first.
     pub fn finish(mut self) -> io::Result<W> {
         // Ship the final partial chunk.
-        self.flush_current()?;
-        // Close the raw channel so workers exit once drained.
-        self.raw_tx = None;
-        // Join workers first (they must finish before the writer sees a
-        // closed compressed channel).
-        for h in std::mem::take(&mut self.worker_handles) {
-            h.join()
-                .map_err(|_| io::Error::other("parallel gzip worker panicked"))?;
+        let shipped = self.flush_current();
+        let inner = self.shutdown();
+        // Every thread is joined; the record is final.
+        if let Some(e) = self.failure.take() {
+            return Err(e);
         }
-        // Writer thread sees closed channel, drains remaining items,
-        // returns inner writer with any I/O error.
-        let handle = self
-            .writer_handle
-            .take()
-            .ok_or_else(|| io::Error::other("ParallelGzipWriter: writer handle missing"))?;
-        handle
-            .join()
-            .map_err(|_| io::Error::other("parallel gzip writer thread panicked"))?
+        shipped?;
+        inner
+            .ok_or_else(|| io::Error::other("ParallelGzipWriter: writer thread returned no writer"))
     }
 }
 
@@ -271,11 +403,11 @@ impl<W: Write + Send + 'static> Write for ParallelGzipWriter<W> {
     /// the pool drains the bounded raw queue, and the writer thread drains the
     /// bounded compressed queue, so there is no cycle. Ordering is by seq, not
     /// by which worker happened to pick the barrier up. The no-cycle argument
-    /// does not cover worker *death* - a worker that panics mid-chunk while
-    /// its siblings keep the channel open would leave a permanent seq gap in
-    /// front of the barrier - so a dying worker fills its slot with an
-    /// [`Out::WorkerDied`] notice and the barrier is answered with that error
-    /// instead of never being reached.
+    /// does not cover a worker *failure* - a worker that panics mid-chunk
+    /// while its siblings keep the channel open would leave a permanent seq
+    /// gap in front of the barrier - so a failed chunk fills its slot with an
+    /// [`Out::Dropped`] placeholder and the barrier is answered with the
+    /// first recorded failure instead of never being reached.
     ///
     /// `finish()` is still the call that closes the pipeline, joins every
     /// thread, and returns the inner writer, and it is what a caller who is
@@ -296,11 +428,14 @@ impl<W: Write + Send + 'static> Write for ParallelGzipWriter<W> {
         self.flush_current()?;
         let (ack_tx, ack_rx) = sync_channel::<io::Result<()>>(1);
         self.dispatch(Job::Barrier(ack_tx))?;
-        ack_rx.recv().map_err(|_| {
-            io::Error::other(
-                "ParallelGzipWriter: writer thread exited before the flush barrier was reached",
-            )
-        })?
+        #[cfg(feature = "test-hooks")]
+        test_hooks::on_barrier_queued();
+        match ack_rx.recv() {
+            Ok(reply) => reply,
+            Err(_) => {
+                Err(self.pool_error("writer thread exited before the flush barrier was reached"))
+            }
+        }
     }
 }
 
@@ -318,13 +453,7 @@ impl<W: Write + Send + 'static> Drop for ParallelGzipWriter<W> {
         //   - Panics.
         //   - Tests and throwaway code where durability doesn't matter.
         drop(self.flush_current());
-        self.raw_tx = None;
-        for h in std::mem::take(&mut self.worker_handles) {
-            drop(h.join());
-        }
-        if let Some(h) = self.writer_handle.take() {
-            drop(h.join());
-        }
+        drop(self.shutdown());
     }
 }
 
@@ -337,64 +466,85 @@ impl<W: Write + Send + 'static> Drop for ParallelGzipWriter<W> {
 /// `compressed_tx.send` both run after the guard is dropped, so a
 /// worker panic in either path cannot poison this mutex and take
 /// down the rest of the pool.
+///
+/// **Every dequeued seq is answered with exactly one `Out`.** The only code
+/// between `recv` and `send` is [`compress_job`], which cannot unwind (it
+/// runs the panicky part under `catch_unwind`); `recv`, `send` and the
+/// poison check return rather than panic. Keep it that way: an unwind
+/// between dequeue and send would lose the seq and hang any flush barrier
+/// queued behind it, and the outer catch in `new` only records such a panic,
+/// it cannot fill the gap.
 fn worker_loop(
-    raw_rx: &std::sync::Mutex<Receiver<(u64, Job)>>,
+    raw_rx: &Mutex<Receiver<(u64, Job)>>,
     compressed_tx: &SyncSender<(u64, Out)>,
+    failure: &FirstFailure,
 ) {
     loop {
         let item = {
             // Hold the lock only for the recv call.
-            let guard = match raw_rx.lock() {
-                Ok(g) => g,
-                Err(_) => return,
+            let Ok(guard) = raw_rx.lock() else {
+                failure.record(io::Error::other(
+                    "parallel gzip: the raw chunk queue lock was poisoned",
+                ));
+                return;
             };
             guard.recv()
         };
-        let (seq, job) = match item {
-            Ok(v) => v,
-            Err(_) => return, // channel closed, producer done
+        let Ok((seq, job)) = item else {
+            return; // channel closed, producer done
         };
 
         // A barrier carries no payload: forward it in place so the writer
         // thread sees it in seq order behind every earlier chunk. Compressing
-        // it would be meaningless and dropping it would hang `flush`.
-        let raw = match job {
-            Job::Compress(raw) => raw,
-            Job::Barrier(ack) => {
-                if compressed_tx.send((seq, Out::Barrier(ack))).is_err() {
-                    return;
-                }
-                continue;
-            }
+        // it would be meaningless and dropping it would hang `flush`. Still
+        // forwarded once the pool has stopped, for the same reason.
+        let out = match job {
+            Job::Barrier(ack) => Out::Barrier(ack),
+            Job::Compress(raw) => compress_job(seq, &raw, failure),
         };
+        if compressed_tx.send((seq, out)).is_err() {
+            return;
+        }
+    }
+}
 
-        // From here until the result send, any exit must fill this seq's slot
-        // or a barrier queued behind it waits forever. See `Out::WorkerDied`.
-        let mut notice = DeathNotice {
-            seq,
-            tx: compressed_tx,
-            armed: true,
-        };
-
+/// Compress one dequeued chunk into its `Out`, never unwinding.
+///
+/// Once the pool has stopped the chunk is skipped (`Out::Dropped`): its
+/// bytes could never be written. A compress error or panic is recorded in
+/// `failure` before the placeholder is returned, so the writer thread (and
+/// a flush barrier behind it) sees the cause, not just the gap.
+fn compress_job(seq: u64, raw: &[u8], failure: &FirstFailure) -> Out {
+    // One Acquire load per 2 MB chunk.
+    if failure.stopped() {
+        return Out::Dropped;
+    }
+    #[cfg(not(feature = "test-hooks"))]
+    let _ = seq;
+    let compressed = guarded(failure, "parallel gzip worker", || {
         // Test-only: arm via `test_hooks::PANIC_AT_POOL_OP_COUNT`.
         // Simulates an OOM or internal unwrap inside a compress
-        // worker. Release builds compile this block out entirely.
+        // worker. Release builds compile this out entirely.
         #[cfg(feature = "test-hooks")]
-        {
-            use std::sync::atomic::Ordering;
-            let n = test_hooks::POOL_OP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-            if n == test_hooks::PANIC_AT_POOL_OP_COUNT.load(Ordering::Relaxed) {
-                panic!("test-hooks: parallel_gzip pool op #{n} (seq {seq}) panicking");
-            }
-        }
+        test_hooks::on_compress(seq);
+        compress_one(raw)
+    });
+    compressed.map_or(Out::Dropped, Out::Bytes)
+}
 
-        let compressed = match compress_one(&raw) {
-            Ok(v) => v,
-            Err(_) => return, // DeathNotice reports the gap; writer_loop errors
-        };
-        notice.armed = false;
-        if compressed_tx.send((seq, Out::Bytes(compressed))).is_err() {
-            return;
+/// Run `f` with its panics caught; record an error or a panic (payload kept,
+/// attributed to `who`) in `failure` and return `None`, else `Some`.
+/// `catch_unwind` costs nothing on the non-panicking path.
+fn guarded<T>(failure: &FirstFailure, who: &str, f: impl FnOnce() -> io::Result<T>) -> Option<T> {
+    match std::panic::catch_unwind(AssertUnwindSafe(f)) {
+        Ok(Ok(v)) => Some(v),
+        Ok(Err(e)) => {
+            failure.record(e);
+            None
+        }
+        Err(payload) => {
+            failure.record_panic(who, payload.as_ref());
+            None
         }
     }
 }
@@ -415,76 +565,72 @@ fn compress_one(raw: &[u8]) -> io::Result<Vec<u8>> {
 }
 
 /// Writer: pull compressed chunks in arbitrary order, reorder by seq,
-/// write to inner in sequence. Takes `compressed_rx` by value so the
-/// receiver is dropped (and the channel released) on return.
+/// write to inner in sequence. Returns the inner writer on success; on
+/// failure returns `None` with the failure recorded in `failure`.
 ///
-/// A write error does **not** return early. It is recorded in `fatal` and the
-/// loop keeps draining, for one reason: a producer blocked on a flush barrier
-/// further down the stream would otherwise wait on an ack channel whose sender
-/// went out of scope with this function, and would learn only that the thread
-/// "exited" rather than why. Draining lets every outstanding barrier be
-/// answered with the real error. The error is still returned at the end, so
-/// `finish()` sees it too. Subsequent chunks are dropped rather than written,
-/// so a fatal error does not produce a file with a hole in it.
-#[allow(clippy::needless_pass_by_value)]
-fn writer_loop<W: Write>(mut inner: W, compressed_rx: Receiver<(u64, Out)>) -> io::Result<W> {
+/// A failure does **not** return early. Once `failure` has stopped the pool
+/// the loop keeps draining, for one reason: a producer blocked on a flush
+/// barrier further down the stream would otherwise wait on an ack channel
+/// whose sender went out of scope with this function, and would learn only
+/// that the thread "exited" rather than why. Draining lets every outstanding
+/// barrier be answered with the first recorded failure. Subsequent chunks are
+/// dropped rather than written, so a failure does not produce a file with a
+/// hole in it.
+///
+/// Every inner-writer call runs under [`guarded`], so a panicking sink is
+/// recorded on the spot - in particular before the barrier ack being
+/// answered could be dropped by an unwind.
+fn writer_loop<W: Write>(
+    mut inner: W,
+    compressed_rx: &Receiver<(u64, Out)>,
+    failure: &FirstFailure,
+) -> Option<W> {
+    const WHO: &str = "parallel gzip writer thread";
     let mut pending: BTreeMap<u64, Out> = BTreeMap::new();
     let mut expected: u64 = 0;
-    let mut fatal: Option<io::Error> = None;
     while let Ok((seq, out)) = compressed_rx.recv() {
         pending.insert(seq, out);
         while let Some(item) = pending.remove(&expected) {
-            let item_seq = expected;
             expected += 1;
             match item {
-                Out::WorkerDied => {
-                    if fatal.is_none() {
-                        fatal = Some(io::Error::other(format!(
-                            "parallel gzip: a compress worker died at chunk {item_seq}; \
-                             its bytes were never produced"
-                        )));
-                    }
-                }
+                // Its failure was recorded before it was sent.
+                Out::Dropped => {}
                 Out::Bytes(b) => {
-                    if fatal.is_none()
-                        && let Err(e) = inner.write_all(&b)
-                    {
-                        fatal = Some(e);
+                    if !failure.stopped() {
+                        guarded(failure, WHO, || inner.write_all(&b));
                     }
                 }
                 Out::Barrier(ack) => {
-                    if fatal.is_none()
-                        && let Err(e) = inner.flush()
-                    {
-                        fatal = Some(e);
+                    if !failure.stopped() {
+                        guarded(failure, WHO, || inner.flush());
                     }
                     // `io::Error` is not `Clone`; the ack carries a faithful
                     // restatement (same `ErrorKind`, same message) while the
                     // original goes on to `finish()`.
-                    let reply = fatal.as_ref().map_or(Ok(()), |e| {
-                        Err(io::Error::new(
-                            e.kind(),
-                            format!("parallel gzip writer: {e}"),
-                        ))
-                    });
+                    let reply = match failure.restate() {
+                        Some(e) => Err(e),
+                        None => Ok(()),
+                    };
                     drop(ack.send(reply));
                 }
             }
         }
     }
-    if let Some(e) = fatal {
-        return Err(e);
+    if failure.stopped() {
+        return None;
     }
     // Producer closed. `pending` should be empty if every seq arrived;
-    // if there is a gap, workers died mid-stream.
+    // a gap means a worker exited between dequeue and send, which
+    // `worker_loop` is structured never to do.
     if !pending.is_empty() {
-        return Err(io::Error::other(format!(
+        failure.record(io::Error::other(format!(
             "parallel gzip writer: {} chunks missing at seq {expected}",
             pending.len()
         )));
+        return None;
     }
-    inner.flush()?;
-    Ok(inner)
+    guarded(failure, WHO, || inner.flush())?;
+    Some(inner)
 }
 
 #[cfg(test)]

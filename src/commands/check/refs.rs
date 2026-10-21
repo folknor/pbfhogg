@@ -124,11 +124,12 @@ struct RelBlobResult {
 /// # Architecture
 ///
 /// Three-phase parallel scan following the renumber_external pattern.
-/// `mallopt(M_ARENA_MAX, 2)` caps glibc arenas at 2 to prevent cross-thread
-/// alloc/free fragmentation from the pread worker pool. Each phase builds
-/// a per-kind schedule via [`build_classify_schedule`] and dispatches
-/// through [`parallel_classify_phase`]: workers pread + decompress +
-/// decode + classify in parallel; the main thread merges per-blob results.
+/// [`crate::debug::cap_malloc_arenas`] caps glibc arenas to prevent
+/// cross-thread alloc/free fragmentation from the pread worker pool. Each
+/// phase builds a per-kind schedule via [`build_classify_schedule`] and
+/// dispatches through [`parallel_classify_phase`]: workers pread +
+/// decompress + decode + classify in parallel; the main thread merges
+/// per-blob results.
 ///
 /// Phase 1 (nodes) writes to `node_ids` via `IdSet::set_atomic`. Phase 2
 /// (ways) reads `node_ids` to check refs, optionally writes to `way_ids`.
@@ -179,12 +180,9 @@ pub fn check_refs(
 
     crate::debug::emit_marker("CHECKREFS_SCAN_START");
 
-    // Prelude: cap glibc arenas at 2 to prevent cross-thread alloc/free
-    // fragmentation from the pread worker pool. Scoped to this command.
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    unsafe {
-        libc::mallopt(libc::M_ARENA_MAX, 2);
-    }
+    // Pread worker pool allocates decoded blocks; the main thread frees
+    // them after the merge.
+    crate::debug::cap_malloc_arenas();
 
     let mut result = RefCheckResult {
         node_count: 0,

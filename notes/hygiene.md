@@ -509,8 +509,14 @@ Reported by: write path, change application, re-encoding, CLI and plumbing.
 
 ## HYG-019 - The library writes operator text to stderr and stdout directly
 
-About 40 library files call `eprintln!`, and `inspect` and `check` reports print
-with `println!` inside library methods (`print_report`, `print_human`):
+About 40 library files call `eprintln!`. The stdout half is closed: the
+library no longer owns stdout (the `inspect` and `check` report types render
+into a caller-supplied `io::Write`, the CLI writes through `cli/src/output.rs`,
+and `no-print-macro` / `no-stdout-handle` textlint rules in `brokkr.toml` keep
+it that way). Stderr is not: an `eprintln!` panics when stderr's reader goes
+away (`pbfhogg sort ... 2>&1 | head` exits 101), which is the same defect class
+the stdout rules closed; the library-use audit of stderr output is tracked in bz
+as pbfhogg#1. What remains:
 
 - Summaries: `print_summary` on every `*Stats` (`ExtractStats`,
   `TagsFilterStats`, `TagsFilterOscStats`, `GetidStats`, `GetparentsStats`,
@@ -556,8 +562,9 @@ Fix: the library returns stats and warnings as data (`warnings: Vec<Warning>`
 or a `Reporter` / diagnostics sink in the options) and never prints; the CLI
 owns formatting, levels and `--quiet`; developer diagnostics move to the
 counter channel, where the same numbers already go. Enforce with
-`clippy::print_stderr = "deny"` and `print_stdout = "deny"` on the library
-crate, allowed in `cli/` and the sink. Every hunter named that lint.
+`clippy::print_stderr = "deny"` on the library crate, allowed in `cli/` and the
+sink (the stdout counterpart is already a textlint rule). Every hunter named
+that lint.
 
 Reported by: all nine scopes.
 
@@ -805,8 +812,10 @@ Cleanup: `derive.rs` calls `sink.cleanup()` after a closure, no `Drop`, so a
 panic leaks three files; derive-parallel outer files use `PathGuard` (citing
 `decisions/0003`), then `commit()` and `remove_file` anyway; shard files are
 deleted by a sweep that recomputes every possible path on error and by
-`append_and_cleanup` on success, with no guard over a half-finished
-`append_and_cleanup`; altw deletes id shards and slot buckets mid-run with
+`append_and_cleanup`, which since the output-write-failure fix (parallel diff
+and `diff --format osc`) removes its temp file and every remaining shard's even
+when the write to the output fails, but still has no guard over a panic
+mid-append; altw deletes id shards and slot buckets mid-run with
 `drop(std::fs::remove_file(...))`, so a failed cleanup leaves 80+ GB while
 stages 3 and 4 allocate more, unlogged; `ScratchDir::drop` ignores
 `remove_dir_all` failure ("user can clean") without saying where; altw has a
@@ -913,23 +922,24 @@ Reported by: change application, altw and scanning, geocode index.
 
 ## HYG-033 - The library mutates the process allocator
 
-`unsafe { libc::mallopt(libc::M_ARENA_MAX, 2) }` is called inline in
-`check_refs`, `verify_ids` (twice), `cat` (`cat_filtered`), `repack`,
-`degrade` (`degrade_decode_path`), `renumber`, `time_filter` and the geocode
-builder, each with a comment saying it is scoped to this command. `mallopt` is
-process-global and never restored, so a library consumer that calls one of
-these once (a server that builds a geocode index then serves) keeps two arenas
-for life; in the CLI the setting depends on which command ran.
-`time_filter`'s comment documents a path that regresses under it. It is gated
-on `target_os = "linux"`, not glibc, so on musl or with jemalloc/mimalloc as
-the global allocator it silently does nothing and the documented RSS difference
-reappears; `debug.rs`'s `mallinfo2` will not link on musl. `debug.rs` offers an
-unused `set_mmap_threshold` wrapper and no `set_arena_max`. `brokkr.toml`
-captures `MALLOC*` env vars, suggesting `MALLOC_ARENA_MAX` was once the knob.
-Fix: allocator tuning belongs to `cli/src/main.rs`, per subcommand if needed,
-or to an explicit opt-in option; gate on `target_env = "gnu"`. Enforce with
-`disallowed-methods = ["libc::mallopt"]` for the library crate, and a
-`--target x86_64-unknown-linux-musl` build in a sweep.
+`crate::debug::cap_malloc_arenas()` (`mallopt(M_ARENA_MAX, 2)`) is called from
+`check_refs`, `verify_ids`, `cat` (`cat_filtered`), `repack`, `degrade`
+(`degrade_decode_path`), `renumber`, `time_filter` and the geocode builder, each
+with a comment saying it is scoped to this command. The call itself is now
+centralized in `src/debug.rs`, gated on `target_os = "linux"` plus
+`target_env = "gnu"` with a no-op fallback, and a textlint rule in `brokkr.toml`
+keeps raw `libc::mallopt` and friends out of every other file, so musl builds.
+What remains: `mallopt` is process-global and never restored, so a library
+consumer that calls one of these once (a server that builds a geocode index then
+serves) keeps two arenas for life; in the CLI the setting depends on which
+command ran. `time_filter`'s comment documents a path that regresses under it.
+With jemalloc/mimalloc as the global allocator it silently does nothing and the
+documented RSS difference reappears. `brokkr.toml` captures `MALLOC*` env vars,
+suggesting `MALLOC_ARENA_MAX` was once the knob. Fix: allocator tuning belongs
+to `cli/src/main.rs`, per subcommand if needed, or to an explicit opt-in option
+rather than a library call. A `--target x86_64-unknown-linux-musl` build in a
+sweep would pin the musl half, which is currently held only by the textlint
+rule.
 
 Reported by: re-encoding, geocode index, CLI and plumbing.
 
@@ -1521,12 +1531,14 @@ resets both sides, stage 3's `PANIC_AT_BUCKET_IDX` doc says reset "at the start
 AND end of any test". The comments in `parallel_writer.rs`, `parallel_gzip.rs`,
 `uring_writer.rs` and `diff/parallel.rs` say tests serialise via
 `--test-threads=1` enforced by `brokkr test`; that has not been true since the
-per-binary split, the sweeps run in parallel with no thread limit, and the real
-invariant (one test per `fault_*.rs` binary) is stated nowhere and already
-violated (BUG-059). `brokkr check` enables the hooks in sweeps that are not
-single-threaded, and the `Cargo.toml` `test-hooks` comment says it is turned on
-via `--all-features` while `brokkr.toml` uses an explicit feature list and says
-`--all-features` is not used. Apply-changes is the one seam with an injection
+per-binary split, and the sweeps run in parallel with no thread limit. The
+real invariant (each static-hook test owns its process) is now stated in
+`Cargo.toml`, where each static-hook `fault_*` file has its own `[[test]]`
+target with the hook it arms and `required-features = ["test-hooks"]`, but
+nothing enforces "one test per target" and several comments still describe the
+old serialisation story. The `read/pipeline.rs` test now arms through a guard
+that releases, joins and resets on every exit path; the other hooks still rely
+on manual reset at start and end. Apply-changes is the one seam with an injection
 point (`MergeOptions::panic_at_blob_seq`), and that field forces every struct
 literal to carry a `#[cfg(feature = "test-hooks")]` line and a hand-written
 `Default` with `#[allow(clippy::derivable_impls)]`. Fix: one `FaultPlan` type
@@ -1653,9 +1665,6 @@ Reported by: CLI and plumbing.
   live OSM counts; with the file-size ceiling in place the floors could be
   derived or dropped.
 - `idset.rs` doc hard-codes planet memory figures and an incomplete user list.
-- `reference/testing.md` cites `tests/merge.rs::merge_cross_validate_osmium`
-  and `tests/merge.rs:1271-1295`; the test lives in
-  `tests/cli_apply_changes.rs` and `tests/merge.rs` does not exist.
 
 Per the documentation rule, reword so the drifting number is no longer
 hard-coded, or point at `reference/performance.md`; write the auto rule once in
@@ -1675,8 +1684,8 @@ the same file states a different rule that never mentions
 resolves to `./pbfhogg` relative to the test's cwd and then asserts with a
 message blaming the sweep config. `cli/tests/cli.rs` uses
 `env!("CARGO_BIN_EXE_pbfhogg")`, cargo's own and always correct, but only
-inside the `pbfhogg-cli` package; that is the reason for the forced
-duplication. Fix: move every `cli_*.rs` into `cli/tests/`, where cargo builds
+inside the `pbfhogg-cli` package (its tests now run under the `cli` sweep); that
+is the reason for the forced duplication. Fix: move every `cli_*.rs` into `cli/tests/`, where cargo builds
 the binary with the test's features and hands its path, which removes
 `BROKKR_TEST_BIN_DIR`, the profile heuristic, the `build_packages`
 stale-binary class and BUG-061; `tests/common` becomes a shared path or dev-only
@@ -1773,15 +1782,18 @@ Reported by: test harness.
 
 ## HYG-076 - Durable source cites transient documents and line numbers
 
-`IdRecord`'s doc cites `.plans/merry-watching-lake.md`; `extract/common.rs`
-cites "TODO.md history 2026-04-19"; stage 1's fd comment cites "`stage1.rs`
-Pass B loop at lines 385-405"; `coord_payloads.rs` cites
-`coord_payloads.rs:398`; `sort` cites `drain.rs:408-410`. `decisions/` is a
-document folder not covered by the `reference/` / `docs/` / `notes/` table in
+The `notes/` and `.plans/` halves are closed: `scripts/check_doc_links.py`
+(the `doc-links` script_check in `brokkr.toml`) now fails on any durable file
+that cites `notes/` or the gitignored `.plans/`, or names a repository path
+that does not exist. Still open: `extract/common.rs` cites "TODO.md history
+2026-04-19" (the script does not claim root-level `TODO.md`); stage 1's fd
+comment cites "`stage1.rs` Pass B loop at lines 385-405"; `coord_payloads.rs`
+cites `coord_payloads.rs:398`; `sort` cites `drain.rs:408-410`. `decisions/` is
+a document folder not covered by the `reference/` / `docs/` / `notes/` table in
 AGENTS.md, and source cites it (`path_guard.rs`, `getid`'s ADR-0006,
 `derive_parallel.rs`'s `decisions/0003`); it needs a place in that table.
-Enforce with a text check in `brokkr check` for `\.plans/`, `notes/`, `TODO.md`
-and `\.rs:[0-9]+` inside `src/` comments.
+Enforce the remainder with a text check in `brokkr check` for `TODO.md` and
+`\.rs:[0-9]+` inside `src/` comments.
 
 Reported by: altw and scanning, filtering and spatial, re-encoding, CLI and
 plumbing.
@@ -2323,5 +2335,18 @@ Reported by: geocode index.
 - `tests/common/cli.rs::path_arg` is a one-line wrapper; the
   `pipeline_test_hooks` re-export of `REORDER_WINDOW_HIGH_WATER` has no reader
   in `tests/`; verify both before deleting.
+
+Reported by: CLI and plumbing, test harness.
+
+## HYG-107 - Two tests call the stdout-writing `show_element` and bypass libtest capture
+
+`tests/inspect.rs` and `tests/non_indexed_parity.rs` call
+`pbfhogg::inspect::show_element`, a convenience wrapper that still writes the
+element to the process stdout, so libtest's capture does not see it and the
+text leaks into the run output. `show_element_to` renders into any writer; the
+CLI already uses it. Fix: switch both tests to
+`show_element_to(.., &mut std::io::sink())`, then delete the `show_element`
+wrapper and the `src/commands/inspect/show_element.rs` entry in the
+`no-stdout-handle` textlint rule's `exclude` list in `brokkr.toml`.
 
 Reported by: CLI and plumbing, test harness.

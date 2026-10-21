@@ -180,16 +180,10 @@ pub fn renumber_external(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<RenumberStats> {
-    // Limit glibc malloc arenas to prevent cross-thread free
-    // fragmentation. Without this, OwnedBlock Vec<u8>s allocated on
-    // pass1/stage2d worker threads and freed on rayon compression
-    // threads cause glibc arena accumulation growing to ~26 GB anon
-    // RSS on planet. With 2 arenas the peak stays under 1 GB.
-    // Scoped to this command - other pbfhogg commands are unaffected.
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    unsafe {
-        libc::mallopt(libc::M_ARENA_MAX, 2);
-    }
+    // OwnedBlock Vec<u8>s are allocated on pass1/stage2d worker threads
+    // and freed on rayon compression threads. Uncapped, the arenas grow
+    // to ~26 GB anon RSS on planet; with 2 the peak stays under 1 GB.
+    crate::debug::cap_malloc_arenas();
 
     // ---- Header validation + output writer setup ----
     {

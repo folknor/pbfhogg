@@ -1,3 +1,6 @@
+mod output;
+
+use std::io::Write;
 use std::path::PathBuf;
 use std::process;
 
@@ -1714,17 +1717,17 @@ fn main() -> process::ExitCode {
                     io_uring: false,
                     force: force.force,
                 };
+                let options = pbfhogg::altw::AltwOptions {
+                    keep_untagged_nodes,
+                    compression: write.compression,
+                    direct_io: write.direct_io,
+                    force: write.force,
+                    index_type,
+                    inject_prepass,
+                    ignore_missing_nodes,
+                };
                 guarded_output(&output.output, |out| {
-                    run_add_locations_to_ways(
-                        &file,
-                        out,
-                        keep_untagged_nodes,
-                        index_type,
-                        inject_prepass,
-                        ignore_missing_nodes,
-                        &write,
-                        &overrides,
-                    )
+                    run_add_locations_to_ways(&file, out, &options, &overrides)
                 })
             }
             Command::TimeFilter {
@@ -1835,18 +1838,20 @@ fn main() -> process::ExitCode {
                     io_uring: uring.io_uring,
                     force: force.force,
                 };
+                let opts = pbfhogg::apply_changes::MergeOptions {
+                    compression: write.compression,
+                    direct_io: write.direct_io,
+                    io_uring: write.io_uring,
+                    force: write.force,
+                    locations_on_ways,
+                    ignore_missing_nodes,
+                    jobs: if jobs == 0 { None } else { Some(jobs) },
+                    allow_version_regression,
+                    #[cfg(feature = "test-hooks")]
+                    panic_at_blob_seq: None,
+                };
                 guarded_output(&output.output, |out| {
-                    run_apply_changes(
-                        &base,
-                        &changes,
-                        out,
-                        &write,
-                        locations_on_ways,
-                        ignore_missing_nodes,
-                        allow_version_regression,
-                        jobs,
-                        &overrides,
-                    )
+                    run_apply_changes(&base, &changes, out, &opts, &overrides)
                 })
             }
             Command::MergeChanges {
@@ -1944,6 +1949,13 @@ fn main() -> process::ExitCode {
                 // Silent exit with a specific code (e.g. `diff` found
                 // differences). Not an error worth printing.
                 process::ExitCode::from(exit.0.code())
+            } else if output::reader_gone() {
+                // Stdout's reader went away (`pbfhogg ... | head`) and the
+                // command stopped writing. Nobody is left to read a report
+                // and nothing failed, so end quietly with success - see
+                // `output` for why this is keyed on the recorded event
+                // rather than on the shape of `e`.
+                process::ExitCode::SUCCESS
             } else {
                 eprintln!("Error: {e}");
                 process::ExitCode::from(ExitStatus::Failed.code())
@@ -2089,132 +2101,155 @@ fn run_check(
         None
     };
 
-    // Output
-    if json {
-        let mut combined = serde_json::Map::new();
-        if let Some(ref report) = ids_report {
-            combined.insert("ids".to_string(), report.to_json_value(file_name));
-        }
-        if let Some(ref report) = index_report {
-            combined.insert("index".to_string(), report.to_json_value(file_name));
-        }
-        if let Some(ref result) = refs_result {
-            let mut refs_obj = serde_json::json!({
-                "node_count": result.node_count,
-                "way_count": result.way_count,
-                "relation_count": result.relation_count,
-                "missing_node_refs": result.missing_node_refs,
-                "missing_way_refs": result.missing_way_refs,
-                "missing_node_members": result.missing_node_members,
-                "missing_relation_members": result.missing_relation_members,
-                "missing_relation_member_occurrences": result.missing_relation_member_occurrences,
-                "untrackable_node_ids": result.untrackable_ids[0],
-                "untrackable_way_ids": result.untrackable_ids[1],
-                "untrackable_relation_ids": result.untrackable_ids[2],
-                "passed": result.is_valid(),
-            });
-            if show_ids {
-                let details: Vec<_> = result.missing_refs.iter().map(|mref| {
+    // Output. The verdict is decided above, before a byte is written, so a
+    // reader that stops early (`check x | head -1`) must not cost the exit
+    // status that carries it.
+    let printed = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let mut out = output::buffered();
+        if json {
+            let mut combined = serde_json::Map::new();
+            if let Some(ref report) = ids_report {
+                combined.insert("ids".to_string(), report.to_json_value(file_name));
+            }
+            if let Some(ref report) = index_report {
+                combined.insert("index".to_string(), report.to_json_value(file_name));
+            }
+            if let Some(ref result) = refs_result {
+                let mut refs_obj = serde_json::json!({
+                    "node_count": result.node_count,
+                    "way_count": result.way_count,
+                    "relation_count": result.relation_count,
+                    "missing_node_refs": result.missing_node_refs,
+                    "missing_way_refs": result.missing_way_refs,
+                    "missing_node_members": result.missing_node_members,
+                    "missing_relation_members": result.missing_relation_members,
+                    "missing_relation_member_occurrences": result.missing_relation_member_occurrences,
+                    "untrackable_node_ids": result.untrackable_ids[0],
+                    "untrackable_way_ids": result.untrackable_ids[1],
+                    "untrackable_relation_ids": result.untrackable_ids[2],
+                    "passed": result.is_valid(),
+                });
+                if show_ids {
+                    let details: Vec<_> = result.missing_refs.iter().map(|mref| {
                     serde_json::json!({
                         "missing": format!("{}{}", mref.missing_type, mref.missing_id),
                         "referenced_by": format!("{}{}", mref.referencing_type, mref.referencing_id),
                     })
                 }).collect();
-                if let Some(m) = refs_obj.as_object_mut() {
-                    m.insert(
-                        "missing_details".to_string(),
-                        serde_json::Value::Array(details),
-                    );
-                }
-            }
-            combined.insert("refs".to_string(), refs_obj);
-        }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::Value::Object(combined))?
-        );
-    } else if !quiet {
-        if let Some(ref report) = ids_report {
-            report.print_human(file_name);
-        }
-        if let Some(ref report) = index_report {
-            if ids_report.is_some() {
-                println!();
-                println!("---");
-                println!();
-            }
-            report.print_human(file_name);
-        }
-        if let Some(ref result) = refs_result {
-            if show_ids {
-                for mref in &result.missing_refs {
-                    println!(
-                        "{}{} in {}{}",
-                        mref.missing_type,
-                        mref.missing_id,
-                        mref.referencing_type,
-                        mref.referencing_id,
-                    );
-                }
-            }
-            if ids_report.is_some() || index_report.is_some() {
-                println!();
-                println!("---");
-                println!();
-            }
-            println!(
-                "Elements: {} nodes, {} ways, {} relations",
-                result.node_count, result.way_count, result.relation_count
-            );
-            if result.missing_node_refs > 0 {
-                println!("Missing node refs in ways: {}", result.missing_node_refs);
-            }
-            if check_relations {
-                if result.missing_way_refs > 0 {
-                    println!("Missing way refs in relations: {}", result.missing_way_refs);
-                }
-                if result.missing_node_members > 0 {
-                    println!(
-                        "Missing node members in relations: {}",
-                        result.missing_node_members
-                    );
-                }
-                if result.missing_relation_members > 0 {
-                    if result.missing_relation_member_occurrences > result.missing_relation_members
-                    {
-                        println!(
-                            "Missing relation members: {} ({} references)",
-                            result.missing_relation_members,
-                            result.missing_relation_member_occurrences,
-                        );
-                    } else {
-                        println!(
-                            "Missing relation members: {}",
-                            result.missing_relation_members
+                    if let Some(m) = refs_obj.as_object_mut() {
+                        m.insert(
+                            "missing_details".to_string(),
+                            serde_json::Value::Array(details),
                         );
                     }
                 }
+                combined.insert("refs".to_string(), refs_obj);
             }
-            // An untrackable ID is not itself a missing reference, but every
-            // reference to one is counted as missing above. Say so, or the
-            // over-report reads as a genuinely dangling ref.
-            if result.total_untrackable() > 0 {
-                println!(
-                    "Untrackable element IDs: {} nodes, {} ways, {} relations \
+            writeln!(
+                out,
+                "{}",
+                serde_json::to_string_pretty(&serde_json::Value::Object(combined))?
+            )?;
+        } else if !quiet {
+            if let Some(ref report) = ids_report {
+                report.write_human(&mut out, file_name)?;
+            }
+            if let Some(ref report) = index_report {
+                if ids_report.is_some() {
+                    writeln!(out, "\n---\n")?;
+                }
+                report.write_human(&mut out, file_name)?;
+            }
+            if let Some(ref result) = refs_result {
+                if show_ids {
+                    for mref in &result.missing_refs {
+                        writeln!(
+                            out,
+                            "{}{} in {}{}",
+                            mref.missing_type,
+                            mref.missing_id,
+                            mref.referencing_type,
+                            mref.referencing_id,
+                        )?;
+                    }
+                }
+                if ids_report.is_some() || index_report.is_some() {
+                    writeln!(out, "\n---\n")?;
+                }
+                writeln!(
+                    out,
+                    "Elements: {} nodes, {} ways, {} relations",
+                    result.node_count, result.way_count, result.relation_count
+                )?;
+                if result.missing_node_refs > 0 {
+                    writeln!(
+                        out,
+                        "Missing node refs in ways: {}",
+                        result.missing_node_refs
+                    )?;
+                }
+                if check_relations {
+                    if result.missing_way_refs > 0 {
+                        writeln!(
+                            out,
+                            "Missing way refs in relations: {}",
+                            result.missing_way_refs
+                        )?;
+                    }
+                    if result.missing_node_members > 0 {
+                        writeln!(
+                            out,
+                            "Missing node members in relations: {}",
+                            result.missing_node_members
+                        )?;
+                    }
+                    if result.missing_relation_members > 0 {
+                        if result.missing_relation_member_occurrences
+                            > result.missing_relation_members
+                        {
+                            writeln!(
+                                out,
+                                "Missing relation members: {} ({} references)",
+                                result.missing_relation_members,
+                                result.missing_relation_member_occurrences,
+                            )?;
+                        } else {
+                            writeln!(
+                                out,
+                                "Missing relation members: {}",
+                                result.missing_relation_members
+                            )?;
+                        }
+                    }
+                }
+                // An untrackable ID is not itself a missing reference, but every
+                // reference to one is counted as missing above. Say so, or the
+                // over-report reads as a genuinely dangling ref.
+                if result.total_untrackable() > 0 {
+                    writeln!(
+                        out,
+                        "Untrackable element IDs: {} nodes, {} ways, {} relations \
                      - references to these are counted as missing",
-                    result.untrackable_ids[0], result.untrackable_ids[1], result.untrackable_ids[2],
-                );
-            }
-            if result.is_valid() {
-                println!("Referential integrity: OK");
-            } else {
-                println!(
-                    "Referential integrity: FAILED ({} missing references)",
-                    result.total_missing()
-                );
+                        result.untrackable_ids[0],
+                        result.untrackable_ids[1],
+                        result.untrackable_ids[2],
+                    )?;
+                }
+                if result.is_valid() {
+                    writeln!(out, "Referential integrity: OK")?;
+                } else {
+                    writeln!(
+                        out,
+                        "Referential integrity: FAILED ({} missing references)",
+                        result.total_missing()
+                    )?;
+                }
             }
         }
-    }
+        out.flush()?;
+        Ok(())
+    })();
+    output::tolerate_reader_gone(printed)?;
 
     if failed {
         return Err(Box::new(ExitWithCode(ExitStatus::AnswerNegative)));
@@ -2248,9 +2283,11 @@ fn run_tags_count(
     };
     let results = pbfhogg::tags_count::tags_count(path, &opts)?;
 
+    let mut out = output::buffered();
     for entry in &results {
-        println!("{}\t{}\t{}", entry.count, entry.key, entry.value);
+        writeln!(out, "{}\t{}\t{}", entry.count, entry.key, entry.value)?;
     }
+    out.flush()?;
 
     eprintln!("{} distinct tag values", results.len());
     Ok(())
@@ -2700,8 +2737,9 @@ fn run_export(
         run_export_to(file, std::io::BufWriter::new(file_out), &options)?;
         out.commit()?;
     } else {
-        let stdout = std::io::stdout();
-        run_export_to(file, stdout.lock(), &options)?;
+        // `export` flushes its writer when it finishes, so a failed final
+        // flush surfaces as an error rather than vanishing in a drop.
+        run_export_to(file, output::buffered(), &options)?;
     }
     Ok(())
 }
@@ -2810,8 +2848,6 @@ fn run_diff(
     jobs: usize,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::Write;
-
     let DiffFlags {
         suppress_common,
         verbose,
@@ -2844,8 +2880,13 @@ fn run_diff(
         out.flush()?;
         stats
     } else {
-        let mut stdout = std::io::stdout().lock();
-        pbfhogg::diff::diff(old, new, &mut stdout, &options, direct_io)?
+        // A reader that leaves early stops the diff here, before its verdict
+        // exists, so the run ends with success rather than with the
+        // differences status `main` cannot know.
+        let mut out = output::buffered();
+        let stats = pbfhogg::diff::diff(old, new, &mut out, &options, direct_io)?;
+        out.flush()?;
+        stats
     };
     if !quiet {
         if osmium_summary {
@@ -3195,23 +3236,10 @@ fn run_extract_config(
 fn run_add_locations_to_ways(
     file: &std::path::Path,
     output: &std::path::Path,
-    keep_untagged_nodes: bool,
-    index_type: IndexType,
-    inject_prepass: bool,
-    ignore_missing_nodes: bool,
-    write: &WriteOpts,
+    options: &pbfhogg::altw::AltwOptions,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let options = pbfhogg::altw::AltwOptions {
-        keep_untagged_nodes,
-        compression: write.compression,
-        direct_io: write.direct_io,
-        force: write.force,
-        index_type,
-        inject_prepass,
-        ignore_missing_nodes,
-    };
-    let stats = pbfhogg::altw::add_locations_to_ways(file, output, &options, overrides)?;
+    let stats = pbfhogg::altw::add_locations_to_ways(file, output, options, overrides)?;
     stats.print_summary();
     Ok(())
 }
@@ -3249,7 +3277,9 @@ fn run_show_element(
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (elem_type, id) = parse_element_spec(spec)?;
-    let found = pbfhogg::inspect::show_element(path, elem_type, id, direct_io)?;
+    let mut out = output::buffered();
+    let found = pbfhogg::inspect::show_element_to(path, elem_type, id, direct_io, &mut out)?;
+    out.flush()?;
     if !found {
         eprintln!("Element not found: {spec}");
         return Err(Box::new(ExitWithCode(ExitStatus::AnswerNegative)));
@@ -3388,13 +3418,17 @@ fn run_inspect(
     match mode {
         InspectMode::IndexedOnly => {
             let has_index = pbfhogg::has_indexdata(path, direct_io)?;
-            if json {
-                println!("{}", serde_json::json!({"indexed": has_index}));
+            let mut out = output::buffered();
+            let printed = if json {
+                writeln!(out, "{}", serde_json::json!({"indexed": has_index}))
             } else if has_index {
-                println!("Indexed: yes");
+                writeln!(out, "Indexed: yes")
             } else {
-                println!("Indexed: no");
-            }
+                writeln!(out, "Indexed: no")
+            };
+            // The answer is the exit status; a reader that left early must
+            // not cost it.
+            output::tolerate_reader_gone(printed.and_then(|()| out.flush()))?;
             if !has_index {
                 return Err(Box::new(ExitWithCode(ExitStatus::AnswerNegative)));
             }
@@ -3402,7 +3436,9 @@ fn run_inspect(
         }
         InspectMode::NodesOnly => {
             let report = pbfhogg::inspect::node_stats::node_stats(path, direct_io, force, jobs)?;
-            report.print_report();
+            let mut out = output::buffered();
+            report.write_report(&mut out)?;
+            out.flush()?;
             return Ok(());
         }
         InspectMode::HeaderGet(key) => {
@@ -3436,10 +3472,12 @@ fn run_inspect(
                     .map(|t| t.to_string()),
                 _ => return Err(format!("unknown key: {key}").into()),
             };
-            match val {
-                Some(v) => println!("{v}"),
-                None => return Err(format!("key {key} has no value in this file").into()),
-            }
+            let Some(v) = val else {
+                return Err(format!("key {key} has no value in this file").into());
+            };
+            let mut out = output::buffered();
+            writeln!(out, "{v}")?;
+            out.flush()?;
             return Ok(());
         }
         InspectMode::Full => {}
@@ -3469,42 +3507,55 @@ fn run_inspect(
     )?;
 
     // --indexed combined with other flags: check and report, set exit code
-    let mut exit_not_indexed = false;
-    if indexed {
-        let has_index = pbfhogg::has_indexdata(path, direct_io)?;
-        if !has_index {
-            exit_not_indexed = true;
-        }
-        if !json {
-            println!("Indexed: {}", if has_index { "yes" } else { "no" });
-        }
-    }
+    let has_index = if indexed {
+        Some(pbfhogg::has_indexdata(path, direct_io)?)
+    } else {
+        None
+    };
+    let exit_not_indexed = has_index == Some(false);
 
-    // --nodes combined with other flags: run node stats and print
-    if nodes {
-        let node_report = pbfhogg::inspect::node_stats::node_stats(path, direct_io, force, jobs)?;
-        node_report.print_report();
-    }
+    // --nodes combined with other flags: run node stats, printed below
+    let node_report = if nodes {
+        Some(pbfhogg::inspect::node_stats::node_stats(
+            path, direct_io, force, jobs,
+        )?)
+    } else {
+        None
+    };
 
-    if let Some(key) = get {
-        match report.get_value(key) {
-            Some(val) => println!("{val}"),
-            None => return Err(format!("unknown key: {key}").into()),
+    // Everything is computed; only output remains. `--indexed` makes the
+    // exit status an answer, and a reader that left early must not cost it.
+    let printed = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let mut out = output::buffered();
+        if let Some(has_index) = has_index
+            && !json
+        {
+            writeln!(out, "Indexed: {}", if has_index { "yes" } else { "no" })?;
         }
-    } else if json {
-        let mut value = report.to_json_filtered(block_limit, anomalies);
-        if indexed {
-            if let serde_json::Value::Object(ref mut map) = value {
+        if let Some(ref node_report) = node_report {
+            node_report.write_report(&mut out)?;
+        }
+        if let Some(key) = get {
+            match report.get_value(key) {
+                Some(val) => writeln!(out, "{val}")?,
+                None => return Err(format!("unknown key: {key}").into()),
+            }
+        } else if json {
+            let mut value = report.to_json_filtered(block_limit, anomalies);
+            if indexed && let serde_json::Value::Object(ref mut map) = value {
                 map.insert(
                     "indexed".to_string(),
                     serde_json::Value::Bool(!exit_not_indexed),
                 );
             }
+            writeln!(out, "{value}")?;
+        } else {
+            report.write_report_filtered(&mut out, block_limit, anomalies)?;
         }
-        println!("{value}");
-    } else {
-        report.print_report_filtered(block_limit, anomalies);
-    }
+        out.flush()?;
+        Ok(())
+    })();
+    output::tolerate_reader_gone(printed)?;
 
     if exit_not_indexed {
         return Err(Box::new(ExitWithCode(ExitStatus::AnswerNegative)));
@@ -3516,26 +3567,10 @@ fn run_apply_changes(
     base: &std::path::Path,
     changes: &std::path::Path,
     output: &std::path::Path,
-    write: &WriteOpts,
-    locations_on_ways: bool,
-    ignore_missing_nodes: bool,
-    allow_version_regression: bool,
-    jobs: usize,
+    opts: &pbfhogg::apply_changes::MergeOptions,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let opts = pbfhogg::apply_changes::MergeOptions {
-        compression: write.compression,
-        direct_io: write.direct_io,
-        io_uring: write.io_uring,
-        force: write.force,
-        locations_on_ways,
-        ignore_missing_nodes,
-        jobs: if jobs == 0 { None } else { Some(jobs) },
-        allow_version_regression,
-        #[cfg(feature = "test-hooks")]
-        panic_at_blob_seq: None,
-    };
-    let stats = pbfhogg::apply_changes::merge(base, changes, output, &opts, overrides)?;
+    let stats = pbfhogg::apply_changes::merge(base, changes, output, opts, overrides)?;
     stats.print_summary();
     Ok(())
 }
@@ -3684,10 +3719,10 @@ fn bench_write_loop<W: std::io::Write>(
             for el in block.elements() {
                 match el {
                     pbfhogg::Element::DenseNode(dn) => {
-                        if !bb.can_add_node() {
-                            if let Some(bytes) = bb.take()? {
-                                writer.write_primitive_block(bytes)?;
-                            }
+                        if !bb.can_add_node()
+                            && let Some(bytes) = bb.take()?
+                        {
+                            writer.write_primitive_block(bytes)?;
                         }
                         bb.add_node(
                             dn.id(),
@@ -3699,29 +3734,29 @@ fn bench_write_loop<W: std::io::Write>(
                         nodes += 1;
                     }
                     pbfhogg::Element::Node(n) => {
-                        if !bb.can_add_node() {
-                            if let Some(bytes) = bb.take()? {
-                                writer.write_primitive_block(bytes)?;
-                            }
+                        if !bb.can_add_node()
+                            && let Some(bytes) = bb.take()?
+                        {
+                            writer.write_primitive_block(bytes)?;
                         }
                         bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), n.tags(), None);
                         nodes += 1;
                     }
                     pbfhogg::Element::Way(w) => {
-                        if !bb.can_add_way() {
-                            if let Some(bytes) = bb.take()? {
-                                writer.write_primitive_block(bytes)?;
-                            }
+                        if !bb.can_add_way()
+                            && let Some(bytes) = bb.take()?
+                        {
+                            writer.write_primitive_block(bytes)?;
                         }
                         let refs: Vec<_> = w.refs().collect();
                         bb.add_way(w.id(), w.tags(), &refs, None);
                         ways += 1;
                     }
                     pbfhogg::Element::Relation(r) => {
-                        if !bb.can_add_relation() {
-                            if let Some(bytes) = bb.take()? {
-                                writer.write_primitive_block(bytes)?;
-                            }
+                        if !bb.can_add_relation()
+                            && let Some(bytes) = bb.take()?
+                        {
+                            writer.write_primitive_block(bytes)?;
                         }
                         let members: Vec<_> = r
                             .members()

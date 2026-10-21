@@ -547,16 +547,12 @@ fn cat_filtered(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<CatStats> {
-    // Cap glibc arenas to prevent cross-thread alloc/free fragmentation
-    // in the per-blob worker pool. Same precedent as check --refs / verify_ids.
-    // The workers do BlockBuilder re-encode (allocation-heavy) but each blob's
-    // alloc/free cycle is confined to a single worker thread, so the pattern
-    // that regresses time-filter (cross-blob scratch reuse defeated by arena
-    // capping) doesn't apply.
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    unsafe {
-        libc::mallopt(libc::M_ARENA_MAX, 2);
-    }
+    // Per-blob worker pool; same precedent as check --refs / verify_ids.
+    // The workers do BlockBuilder re-encode (allocation-heavy) but each
+    // blob's alloc/free cycle is confined to a single worker thread, so
+    // the cross-blob scratch reuse that arena capping penalises (measured
+    // on the pre-migration time-filter snapshot path) doesn't apply.
+    crate::debug::cap_malloc_arenas();
 
     // -----------------------------------------------------------------------
     // Output header: reconciled across every input (see `cat_output_header_bytes`)

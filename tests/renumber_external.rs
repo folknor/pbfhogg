@@ -1,8 +1,6 @@
 //! End-to-end tests for renumber.
 
-mod common;
-
-use common::{
+use crate::common::{
     TestMember, TestNode, TestRelation, TestWay, assert_sorted_file, read_normalized,
     write_test_pbf_sorted,
 };

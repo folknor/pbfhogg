@@ -7,7 +7,12 @@
 //! Usage:
 //!     cargo run --release --example partition_stats -- <input.osm.pbf>
 //!
-//! See notes/altw-partitioned.md for context.
+//! Context: on Denmark and Japan, nearly every way blob touches nearly every
+//! partition for every N from 2 to 64 (Denmark N=64: median 62-63 of 64
+//! partitions touched; N=2: no single-partition blobs). Sorted PBFs group ways
+//! by way ID, so a blob's refs span the whole node-ID space. That disproved
+//! blob-level node-ID partitioning (selective way-blob skipping) and motivated
+//! the external radix join.
 
 #![allow(
     clippy::too_many_lines,

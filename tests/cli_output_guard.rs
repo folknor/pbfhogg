@@ -47,14 +47,11 @@
 //! scratch name changes what the writer produces (the `.gz` case), and a
 //! guard that leaks its scratch file.
 
-#![cfg(feature = "commands")]
 #![allow(clippy::unwrap_used)]
-
-mod common;
 
 use std::path::Path;
 
-use common::cli::CliInvoker;
+use crate::common::cli::CliInvoker;
 use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder};
 use pbfhogg::writer::{Compression, PbfWriter};
 use tempfile::TempDir;

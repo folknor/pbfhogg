@@ -94,27 +94,39 @@ pub struct NodeStatsReport {
 }
 
 impl NodeStatsReport {
-    pub fn print_report(&self) {
-        println!("Node count: {}", self.node_count);
-        println!();
-        println!("Coordinate ranges (e7):");
-        println!("  lat: {} .. {}", self.min_lat, self.max_lat);
-        println!("  lon: {} .. {}", self.min_lon, self.max_lon);
-        println!();
+    /// Write the human-readable node statistics report to `out`.
+    ///
+    /// Rendered into a caller-supplied writer rather than the process's
+    /// stdout so a write failure - the reader of a pipe going away - comes
+    /// back as an error instead of a `println!` panic.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error `out` reports.
+    pub fn write_report<W: std::io::Write>(&self, out: &mut W) -> std::io::Result<()> {
+        writeln!(out, "Node count: {}", self.node_count)?;
+        writeln!(out)?;
+        writeln!(out, "Coordinate ranges (e7):")?;
+        writeln!(out, "  lat: {} .. {}", self.min_lat, self.max_lat)?;
+        writeln!(out, "  lon: {} .. {}", self.min_lon, self.max_lon)?;
+        writeln!(out)?;
 
-        println!("FOR block bit-width distribution (block size = {BLOCK_SIZE}):");
-        println!();
-        print_histogram("lat", &self.lat_stats);
-        println!();
-        print_histogram("lon", &self.lon_stats);
-        println!();
+        writeln!(
+            out,
+            "FOR block bit-width distribution (block size = {BLOCK_SIZE}):"
+        )?;
+        writeln!(out)?;
+        write_histogram(out, "lat", &self.lat_stats)?;
+        writeln!(out)?;
+        write_histogram(out, "lon", &self.lon_stats)?;
+        writeln!(out)?;
 
         let lat_avg = self.lat_stats.avg_bits();
         let lon_avg = self.lon_stats.avg_bits();
-        println!("Weighted average bit-width:");
-        println!("  lat: {lat_avg:.2} bits");
-        println!("  lon: {lon_avg:.2} bits");
-        println!();
+        writeln!(out, "Weighted average bit-width:")?;
+        writeln!(out, "  lat: {lat_avg:.2} bits")?;
+        writeln!(out, "  lon: {lon_avg:.2} bits")?;
+        writeln!(out)?;
 
         let num_blocks = self.lat_stats.total_blocks;
         // per block: avg_bits * 128 / 8 bytes for packed values + 4 bytes for min_value
@@ -124,27 +136,38 @@ impl NodeStatsReport {
         let total_bytes = num_blocks as f64 * (lat_bytes_per_block + lon_bytes_per_block);
         let uncompressed_bytes = self.node_count as f64 * 8.0;
 
-        println!("Estimated compressed size:");
-        println!(
+        writeln!(out, "Estimated compressed size:")?;
+        writeln!(
+            out,
             "  {:.2} GB ({} blocks x ({:.1} + {:.1}) bytes/block)",
             total_bytes / 1_073_741_824.0,
             num_blocks,
             lat_bytes_per_block,
             lon_bytes_per_block,
-        );
-        println!(
+        )?;
+        writeln!(
+            out,
             "  vs {:.2} GB uncompressed ({} nodes x 8 bytes)",
             uncompressed_bytes / 1_073_741_824.0,
             self.node_count,
-        );
+        )?;
         if uncompressed_bytes > 0.0 {
-            println!("  ratio: {:.1}%", total_bytes / uncompressed_bytes * 100.0);
+            writeln!(
+                out,
+                "  ratio: {:.1}%",
+                total_bytes / uncompressed_bytes * 100.0
+            )?;
         }
+        Ok(())
     }
 }
 
-fn print_histogram(label: &str, stats: &CoordStats) {
-    println!("  {label}:");
+fn write_histogram(
+    out: &mut impl std::io::Write,
+    label: &str,
+    stats: &CoordStats,
+) -> std::io::Result<()> {
+    writeln!(out, "  {label}:")?;
     for (i, &(lo, hi)) in BUCKETS.iter().enumerate() {
         let count = stats.bucket_counts[i];
         let pct = if stats.total_blocks > 0 {
@@ -152,8 +175,12 @@ fn print_histogram(label: &str, stats: &CoordStats) {
         } else {
             0.0
         };
-        println!("    {lo:>2}-{hi:<2} bits: {count:>10} blocks ({pct:>5.1}%)");
+        writeln!(
+            out,
+            "    {lo:>2}-{hi:<2} bits: {count:>10} blocks ({pct:>5.1}%)"
+        )?;
     }
+    Ok(())
 }
 
 /// Per-worker state for [`node_stats`]. Held across all blobs a worker

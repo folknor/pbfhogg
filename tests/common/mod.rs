@@ -1,5 +1,7 @@
-// Each test binary includes this module but only uses a subset of helpers,
-// so unused warnings are expected and harmless.
+// Mounted once by `tests/all.rs` and once by each separate fault-test
+// binary. Every binary uses only a subset of helpers, and feature-gated
+// modules drop out of some sweeps, so unused warnings are expected and
+// harmless.
 #![allow(dead_code)]
 //! Shared test helpers used across integration tests.
 //!
@@ -266,6 +268,60 @@ pub fn write_multi_block_test_pbf(
 ) {
     assert!(block_size > 0, "block_size must be > 0");
     write_test_pbf_impl(path, nodes, ways, relations, true, Some(block_size));
+}
+
+/// Write `node_blocks` blocks of three nodes each, then one block of two
+/// ways and one block of one relation, through the sync writer. Small
+/// blocks and many of them, for exercising tiny pipelined-reader caps
+/// (`read_ahead(1)`, `decode_ahead(1)`) and the decode-admission hook.
+pub fn write_many_block_pbf(path: &Path, node_blocks: usize) {
+    let file = std::fs::File::create(path).expect("create pbf");
+    let mut writer = PbfWriter::new(file, Compression::default());
+
+    let header = block_builder::HeaderBuilder::new()
+        .bbox(9.0, 54.0, 13.0, 58.0)
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+    let mut node_id = 100_i64;
+    for _ in 0..node_blocks {
+        for offset in 0..3 {
+            bb.add_node(
+                node_id,
+                550_000_000 + offset * 10_000,
+                120_000_000 + offset * 10_000,
+                [("name", "node")],
+                None,
+            );
+            node_id += 100;
+        }
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("node block"))
+            .expect("write node block");
+    }
+
+    bb.add_way(1000, [("highway", "primary")], &[100, 200, 300], None);
+    bb.add_way(2000, [("building", "yes")], &[200, 300, 200], None);
+    writer
+        .write_primitive_block(bb.take().expect("take").expect("way block"))
+        .expect("write way block");
+
+    bb.add_relation(
+        5000,
+        [("type", "multipolygon")],
+        &[MemberData {
+            id: MemberId::Way(1000),
+            role: "outer",
+        }],
+        None,
+    );
+    writer
+        .write_primitive_block(bb.take().expect("take").expect("relation block"))
+        .expect("write relation block");
+
+    writer.flush().expect("flush");
 }
 
 /// Write a sorted PBF whose OsmData blobs carry `indexdata` in their

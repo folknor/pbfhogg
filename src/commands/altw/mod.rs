@@ -484,7 +484,9 @@ fn enforce_missing_locations_policy(stats: &Stats, ignore_missing_nodes: bool) -
 /// pinpointed: north-america's 18.75 GB store (~75 % of the measuring
 /// host's ~25 GB budget) ran linear while europe's 28.94 GB (~116 %)
 /// thrashed at 5.3x the per-ref cost, and 80 % is the
-/// bias-toward-external choice inside that gap (notes/altw.md P1).
+/// bias-toward-external choice inside that gap, not a measured optimum:
+/// routing a smallish input to external wastes seconds, routing an oversized
+/// one to sparse costs minutes.
 const AUTO_STORE_BUDGET_PCT: u64 = 80;
 
 /// Anon footprint a sparse run holds outside the mmap store (IdSet, decode
@@ -497,7 +499,7 @@ const AUTO_ANON_HEADROOM_BYTES: u64 = 3 << 30;
 // indexed) AND the estimated sparse store exceeds the page-cache budget.
 // The threshold is relative to runtime RAM, never a hardcoded byte
 // constant: the knee is defined by store-vs-cache, and a constant fitted
-// to one host misroutes every other machine (notes/altw.md P1).
+// to one host misroutes every other machine.
 fn auto_select_index_type(input: &Path, direct_io: bool) -> Result<IndexType> {
     let reader = crate::ElementReader::open(input, direct_io)?;
     let sorted = reader.header().is_sorted();
@@ -523,7 +525,8 @@ fn auto_select_index_type(input: &Path, direct_io: bool) -> Result<IndexType> {
     // other header walk (~50 us/blob cold, ~free warm) and self-amortizes:
     // whichever backend runs next starts with its own header walk, which
     // now rides warm on this one, so the command's total cold-walk count
-    // does not increase (the P4 arithmetic, notes/altw.md).
+    // does not increase: a walk only costs when something evicted the
+    // headers since the previous walk.
     crate::debug::emit_marker("ALTW_AUTO_ESTIMATE_WALK_START");
     let store = estimate_sparse_store_bytes(input)?;
     crate::debug::emit_marker("ALTW_AUTO_ESTIMATE_WALK_END");
@@ -1127,8 +1130,8 @@ mod tests {
 
     const GB: u64 = 1_000_000_000;
 
-    /// The measured grid this routing rule was fitted to (notes/altw.md
-    /// P1, all at `dcc445e`): north-america's 18.75 GB store against the
+    /// The measured grid this routing rule was fitted to (plantasjen, all
+    /// at `dcc445e`): north-america's 18.75 GB store against the
     /// measuring host's ~25 GB budget ran linear (sparse won by 26 %),
     /// europe's 28.94 GB thrashed (external won by 21 %).
     #[test]

@@ -1,6 +1,6 @@
 //! CLI-driven integration tests for `pbfhogg extract`.
 //!
-//! Replaces the library-API `tests/extract.rs`. Fixture PBFs are
+//! Replaces the removed library-API `extract.rs` test. Fixture PBFs are
 //! built with the stable-allowlist writers; `extract` runs through
 //! `CliInvoker`; output is verified by reading the resulting PBF
 //! with the stable-allowlist readers. No imports from
@@ -22,15 +22,12 @@
 //! pinning `nodes_from_relations > 0`, and the tags-preserved test)
 //! retain stderr substring assertions.
 
-#![cfg(feature = "commands")]
 #![allow(clippy::unwrap_used)]
-
-mod common;
 
 use std::path::Path;
 
-use common::cli::{CliInvoker, CliOutput};
-use common::{
+use crate::common::cli::{CliInvoker, CliOutput};
+use crate::common::{
     TestMember, TestNode, TestRelation, TestWay, node_ids_id_only as node_ids,
     read_all_elements_id_only as read_all_elements, read_all_elements_with_coords, read_header,
     relation_ids_id_only as relation_ids, way_ids_id_only as way_ids, write_multi_block_test_pbf,

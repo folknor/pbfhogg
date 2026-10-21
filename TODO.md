@@ -36,7 +36,16 @@ Picked 2026-07-30, right after the 0.5.0 release.
   Partially delivered already: exit codes now split into 0 success,
   1 semantic-negative answer, 2 failure, documented in
   `reference/cli-reference.md` and `docs/cli/commands.md`. The
-  stdout/stderr half of the audit is untouched.
+  stdout half is partly delivered: the CLI writes stdout through
+  `cli/src/output.rs` (a closed reader is a silent exit 0, not a panic), the
+  library's report types render into a caller-supplied `io::Write`, and
+  textlint rules in `brokkr.toml` ban `print!`/`println!` and raw stdout
+  handles outside that file. Still open: the per-command inventory table, the
+  `--json` purity check, and stderr (`eprintln!` panics when stderr's reader
+  goes away; the library-use audit is tracked in bz as pbfhogg#1). Known
+  trade-off: streaming `diff` exits 0 when stdout's reader goes away before the
+  verdict exists, so under `set -o pipefail` `pbfhogg diff a b | head` reads as
+  identical.
 
 - [ ] **Cross-repo: confirm brokkr does not read pbfhogg exit code 1 as
   failure.** pbfhogg's exit codes used to be 0 or 1, where 1 meant both
@@ -794,36 +803,33 @@ Measurement-first on every one: turn on `#[cfg(feature = "hotpath")]` counters (
 `roundtrip_denmark` in `tests/roundtrip_real.rs` is `#[ignore]` - it roundtrips the entire
 Denmark PBF (~54s) and is too slow for the normal edit-test cycle. **Must be run before any
 release and after completing major work** (especially changes to reader, writer, block_builder,
-or BlockBuilder/PbfWriter APIs):
+or BlockBuilder/PbfWriter APIs). It is over the 20 s check watchdog, so it runs by name:
 
-    brokkr check -- --ignored
+    brokkr test roundtrip_denmark --timeout 280
 
 `tests/geocode_index.rs` has 6 `#[ignore]` tests - they build a geocode index from the
-Denmark PBF and query it. ~154s in release mode. Run with:
+Denmark PBF and query it. ~154s in release mode. They are on the `full` profile's
+skip list (over the 20 s watchdog), so run each by name:
 
-    cargo test --release --test geocode_index -- --ignored
+    brokkr test <name> --timeout 280
 
 `sorted_flag_but_unsorted_nodes_panics` in `tests/read_paths.rs` is `#[ignore]` - it
 verifies the debug monotonicity assertion fires on unsorted nodes when `Sort.Type_then_ID`
 is declared. Requires `debug_assertions` to be enabled in the test profile. Nightly 1.95
 (2026-02-25) has a regression where `debug_assertions` is off in test builds.
 
-`fault_injection_parallel_writer_pool_panic_surfaces_error` in
-`tests/apply_changes_invariants.rs` and
-`fault_injection_parallel_gzip_worker_panic_surfaces_via_finish` /
-`fault_injection_uring_writer_dispatch_panic_surfaces_via_flush` /
-`fault_injection_diff_parallel_shard_panic_surfaces_and_sweeps_scratch` /
-`fault_injection_derive_parallel_shard_panic_surfaces_and_sweeps_scratch` /
-`fault_injection_altw_stage3_bucket_panic_surfaces_and_cleans_scratch` /
-`fault_injection_geocode_pass3_streets_panic_sweeps_bucket_dirs` in
-`tests/fault_injection.rs` are `#[ignore]`d because their fault-injection hooks are
-**process-global static atomics** that race with any concurrently-running test that
-uses the same pipeline (most apply-changes / derive-changes / diff tests do). They
-require single-threaded execution to be deterministic. Run via `brokkr test <name>`
-(which always adds `--test-threads=1`) or `cargo test -- --ignored --test-threads=1`.
-The canonical `fault_injection_worker_panic_surfaces_error_and_leaves_scratch_clean`
-test in the same file is **not** ignored because its hook is per-instance
-(`MergeOptions::panic_at_blob_seq`) and has no shared-state hazard.
+The fault-injection tests whose hooks are **process-global static atomics** are no
+longer `#[ignore]`d and no longer rely on `--test-threads=1`. Integration tests are
+folded into one `all` binary (`autotests = false`, `tests/all.rs`), and each
+static-hook test owns its process as a separate `[[test]]` target in `Cargo.toml`
+(`required-features = ["test-hooks"]`), one test per file: `tests/fault_parallel_writer.rs`,
+`fault_parallel_gzip.rs`, `fault_parallel_gzip_flush.rs`, `fault_uring_writer.rs`,
+`fault_diff_parallel.rs`, `fault_derive_parallel.rs`, `fault_altw_stage3.rs`,
+`fault_geocode_pass3.rs`, `fault_extract_grid.rs` and `fault_read_pipeline.rs`. The
+apply-changes fault test (`tests/fault_apply_changes.rs`) stays a module of `all`
+because its hook is per-instance (`MergeOptions::panic_at_blob_seq`) with no
+shared-state hazard. Run one with `brokkr test <name>`. A new `fault_*` file that is
+not declared in `Cargo.toml` is never compiled and nothing reports it.
 
 The uring fault-injection test additionally skips gracefully on hosts whose
 `RLIMIT_MEMLOCK` soft limit is below 16 MB (needed for io_uring's registered

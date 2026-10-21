@@ -8,8 +8,6 @@
     clippy::too_many_lines
 )]
 
-mod common;
-
 use std::io::SeekFrom;
 use std::io::{Cursor, Read};
 use std::path::Path;
@@ -17,8 +15,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::mpsc;
 use std::time::Duration;
-#[cfg(feature = "test-hooks")]
-use std::time::Instant;
 
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
@@ -27,6 +23,8 @@ use pbfhogg::{
     MemberId,
 };
 use tempfile::TempDir;
+
+use crate::common::write_many_block_pbf;
 
 /// Write a multi-block PBF to the given path.
 /// Contains: header + 3 data blocks (3 nodes, 2 ways, 1 relation).
@@ -298,57 +296,6 @@ fn collect_sequential_full(path: &Path) -> Vec<String> {
     result
 }
 
-/// Write a larger multi-block PBF to exercise tiny pipeline caps.
-fn write_many_block_pbf(path: &Path, node_blocks: usize) {
-    let file = std::fs::File::create(path).unwrap();
-    let mut writer = PbfWriter::new(file, Compression::default());
-
-    let header = block_builder::HeaderBuilder::new()
-        .bbox(9.0, 54.0, 13.0, 58.0)
-        .build()
-        .unwrap();
-    writer.write_header(&header).unwrap();
-
-    let mut bb = BlockBuilder::new();
-    let mut node_id = 100_i64;
-    for _ in 0..node_blocks {
-        for offset in 0..3 {
-            bb.add_node(
-                node_id,
-                550_000_000 + offset * 10_000,
-                120_000_000 + offset * 10_000,
-                [("name", "node")],
-                None,
-            );
-            node_id += 100;
-        }
-        writer
-            .write_primitive_block(bb.take().unwrap().unwrap())
-            .unwrap();
-    }
-
-    bb.add_way(1000, [("highway", "primary")], &[100, 200, 300], None);
-    bb.add_way(2000, [("building", "yes")], &[200, 300, 200], None);
-    writer
-        .write_primitive_block(bb.take().unwrap().unwrap())
-        .unwrap();
-
-    bb.add_relation(
-        5000,
-        [("type", "multipolygon")],
-        &[MemberData {
-            id: MemberId::Way(1000),
-            role: "outer",
-        }],
-        None,
-    );
-    writer
-        .write_primitive_block(bb.take().unwrap().unwrap())
-        .unwrap();
-
-    writer.flush().unwrap();
-}
-
 #[derive(Clone)]
 struct CountingRead {
     inner: Cursor<Vec<u8>>,
@@ -572,7 +519,7 @@ fn decode_error_surfaces_after_prior_blocks() {
     // block before returning the decode failure.
     std::fs::write(
         &broken,
-        common::adversarial::mutate_blob_payload(&bytes, 2, |payload| {
+        crate::common::adversarial::mutate_blob_payload(&bytes, 2, |payload| {
             payload.clear();
             payload.push(0xFF);
         }),
@@ -633,58 +580,6 @@ fn pipelined_block_iterator_matches_sequential_with_tiny_count_bounds() {
     }
 
     assert_eq!(sequential, pipelined);
-}
-
-#[cfg(feature = "test-hooks")]
-#[test]
-fn admission_high_water_bounded_under_slow_first_decode() {
-    use pbfhogg::read::pipeline_test_hooks::{
-        BLOCK_DECODE_SEQ, BLOCKED_DECODE_READY, RELEASE_BLOCKED_DECODE, REORDER_FILLED_HIGH_WATER,
-        reset,
-    };
-
-    reset();
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("many.osm.pbf");
-    write_many_block_pbf(&path, 16);
-
-    BLOCK_DECODE_SEQ.store(1, Relaxed);
-    let (done_tx, done_rx) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let result = ElementReader::from_path(&path)
-            .unwrap()
-            .read_ahead(1)
-            .decode_ahead(2)
-            .for_each_block_pipelined(|_| Ok(()));
-        done_tx.send(result).unwrap();
-    });
-
-    let start = Instant::now();
-    while !BLOCKED_DECODE_READY.load(Relaxed) {
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "decode hook was not reached"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
-
-    let start = Instant::now();
-    while REORDER_FILLED_HIGH_WATER.load(Relaxed) < 1 {
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "later decode did not reach the reorder buffer"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
-
-    RELEASE_BLOCKED_DECODE.store(true, Relaxed);
-    done_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("pipeline did not finish after releasing decode hook")
-        .unwrap();
-
-    assert!(REORDER_FILLED_HIGH_WATER.load(Relaxed) <= 2);
-    reset();
 }
 
 #[test]
@@ -1143,13 +1038,13 @@ fn sorted_flag_but_unsorted_nodes_panics() {
 fn blobfilter_only_ways_skips_node_blobs_on_indexed_input() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("indexed.osm.pbf");
-    common::write_test_pbf_sorted(
+    crate::common::write_test_pbf_sorted(
         &path,
-        &common::generate_nodes(10, 1),
-        &common::generate_ways(5, 1_000, 2, 1),
+        &crate::common::generate_nodes(10, 1),
+        &crate::common::generate_ways(5, 1_000, 2, 1),
         &[],
     );
-    common::assert_indexed(&path);
+    crate::common::assert_indexed(&path);
 
     let reader = ElementReader::from_path(&path)
         .unwrap()
@@ -1179,13 +1074,13 @@ fn blobfilter_only_ways_skips_node_blobs_on_indexed_input() {
 fn blobfilter_only_ways_passes_through_on_non_indexed_input() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("non_indexed.osm.pbf");
-    common::write_test_pbf_non_indexed(
+    crate::common::write_test_pbf_non_indexed(
         &path,
-        &common::generate_nodes(10, 1),
-        &common::generate_ways(5, 1_000, 2, 1),
+        &crate::common::generate_nodes(10, 1),
+        &crate::common::generate_ways(5, 1_000, 2, 1),
         &[],
     );
-    common::assert_non_indexed(&path);
+    crate::common::assert_non_indexed(&path);
 
     let reader = ElementReader::from_path(&path)
         .unwrap()
@@ -1232,18 +1127,18 @@ fn indexed_reader_output_matches_on_indexed_and_non_indexed_twins() {
     // 8 nodes + 4 ways; each way refs two consecutive nodes. "building"
     // tag on odd-numbered ways so read_ways_and_deps has a meaningful
     // filter and node-dependency resolution.
-    let nodes = common::generate_nodes(8, 1);
-    let mut ways = common::generate_ways(4, 1_000, 2, 1);
+    let nodes = crate::common::generate_nodes(8, 1);
+    let mut ways = crate::common::generate_ways(4, 1_000, 2, 1);
     for (i, w) in ways.iter_mut().enumerate() {
         if i % 2 == 0 {
             w.tags = vec![("building", "yes")];
         }
     }
 
-    common::write_test_pbf_sorted(&indexed, &nodes, &ways, &[]);
-    common::write_test_pbf_non_indexed(&non_indexed, &nodes, &ways, &[]);
-    common::assert_indexed(&indexed);
-    common::assert_non_indexed(&non_indexed);
+    crate::common::write_test_pbf_sorted(&indexed, &nodes, &ways, &[]);
+    crate::common::write_test_pbf_non_indexed(&non_indexed, &nodes, &ways, &[]);
+    crate::common::assert_indexed(&indexed);
+    crate::common::assert_non_indexed(&non_indexed);
 
     let collect = |path: &Path| -> (Vec<i64>, Vec<i64>) {
         let mut reader = IndexedReader::from_path(path).unwrap();

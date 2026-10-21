@@ -19,16 +19,10 @@
 //! no", exit 2 is "I could not run". A verifier that conflates them is useless
 //! in a script.
 
-// `serde_json` (used by the JSON-surface test) is a `commands`-feature
-// dependency, matching `cli_export.rs`.
-#![cfg(feature = "commands")]
-
-mod common;
-
 use std::path::Path;
 
-use common::cli::CliInvoker;
-use common::{
+use crate::common::cli::CliInvoker;
+use crate::common::{
     TestNode, TestRelation, TestWay, generate_nodes, generate_relations, generate_ways,
     write_multi_block_test_pbf,
 };
@@ -52,7 +46,7 @@ fn write_fixture(path: &Path) -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>
 /// Exit code the CLI uses for "ran fine, answer is negative".
 const EXIT_ANSWER_NEGATIVE: i32 = 1;
 
-fn check_index(path: &Path) -> common::cli::CliOutput {
+fn check_index(path: &Path) -> crate::common::cli::CliOutput {
     CliInvoker::new()
         .arg("check")
         .arg("--index")
@@ -274,7 +268,7 @@ fn indexdata_that_cannot_be_read_is_reported_rather_than_ignored() {
     let bad_version = dir.path().join("badversion.osm.pbf");
     std::fs::write(
         &bad_version,
-        common::adversarial::mutate_blob_header_indexdata(&pbf, 1, |ix| {
+        crate::common::adversarial::mutate_blob_header_indexdata(&pbf, 1, |ix| {
             assert!(!ix.is_empty(), "fixture blob 1 must carry indexdata");
             ix[0] = 0xEE;
         }),
@@ -301,7 +295,7 @@ fn indexdata_that_cannot_be_read_is_reported_rather_than_ignored() {
     let bad_len = dir.path().join("badlen.osm.pbf");
     std::fs::write(
         &bad_len,
-        common::adversarial::mutate_blob_header_indexdata(&pbf, 1, |ix| {
+        crate::common::adversarial::mutate_blob_header_indexdata(&pbf, 1, |ix| {
             ix.truncate(7);
         }),
     )
@@ -319,7 +313,7 @@ fn indexdata_that_cannot_be_read_is_reported_rather_than_ignored() {
     let untouched = dir.path().join("untouched.osm.pbf");
     std::fs::write(
         &untouched,
-        common::adversarial::mutate_blob_header_indexdata(&pbf, 1, |_ix| {}),
+        crate::common::adversarial::mutate_blob_header_indexdata(&pbf, 1, |_ix| {}),
     )
     .expect("write");
     let out = check_index(&untouched);
@@ -350,15 +344,15 @@ fn a_tag_index_over_an_unindexable_blob_is_reported() {
     let pbf = std::fs::read(&input).expect("read fixture");
     // The relation blob is last, and the fixture gives its first relation a
     // tag, so pbfhogg wrote it a real tag index.
-    let last = common::adversarial::locate_blobs(&pbf).len() - 1;
+    let last = crate::common::adversarial::locate_blobs(&pbf).len() - 1;
 
     // Replace the payload with a group holding both a Way and a Relation,
     // preserving the header's tagdata, then drop the indexdata so the tagdata
     // claim is the only one left standing.
-    let mixed = common::adversarial::mutate_blob_payload(&pbf, last, |payload| {
+    let mixed = crate::common::adversarial::mutate_blob_payload(&pbf, last, |payload| {
         *payload = mixed_kind_block();
     });
-    let mixed = common::adversarial::mutate_blob_header_indexdata(&mixed, last, Vec::clear);
+    let mixed = crate::common::adversarial::mutate_blob_header_indexdata(&mixed, last, Vec::clear);
     let mixed_path = dir.path().join("mixed.osm.pbf");
     std::fs::write(&mixed_path, &mixed).expect("write");
 
@@ -380,7 +374,7 @@ fn a_tag_index_over_an_unindexable_blob_is_reported() {
     // Paired counterpart: the identical rewrite path, with the payload left
     // alone, must verify clean. Dropping the indexdata is legal - it is what
     // every third-party PBF looks like - so nothing here should be reported.
-    let stripped = common::adversarial::mutate_blob_header_indexdata(&pbf, last, Vec::clear);
+    let stripped = crate::common::adversarial::mutate_blob_header_indexdata(&pbf, last, Vec::clear);
     let stripped_path = dir.path().join("stripped-index.osm.pbf");
     std::fs::write(&stripped_path, &stripped).expect("write");
     let out = check_index(&stripped_path);

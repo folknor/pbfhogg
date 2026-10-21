@@ -16,13 +16,11 @@
 
 #![allow(clippy::unwrap_used)]
 
-mod common;
-
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use common::cli::CliInvoker;
-use common::{
+use crate::common::cli::CliInvoker;
+use crate::common::{
     TestMember, TestMeta, TestNode, TestRelation, TestWay, read_header, write_indexed_pbf,
 };
 use pbfhogg::{BlobDecode, BlobReader, Element, MemberId};

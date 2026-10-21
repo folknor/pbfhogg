@@ -1,6 +1,6 @@
 //! CLI-driven integration tests for `pbfhogg apply-changes` (merge).
 //!
-//! Replaces `tests/merge.rs`. Fixture PBFs are written via the
+//! Replaces the removed library-API `merge.rs` test. Fixture PBFs are written via the
 //! stable-allowlist writers (`write_test_pbf_sorted`,
 //! `write_multi_block_test_pbf`, plus inline `BlockBuilder` helpers
 //! for tests that need explicit metadata / multi-block layouts /
@@ -12,9 +12,8 @@
 //! changes alone.
 //!
 //! Apply-changes is a high-traffic rewrite surface. The
-//! descriptor-first streaming rewrite documented in
-//! `notes/apply-changes-opportunities.md` moved large parts of the
-//! internal API around; the CLI surface (`pbfhogg apply-changes
+//! descriptor-first streaming rewrite (landed 2026-04) moved large
+//! parts of the internal API around; the CLI surface (`pbfhogg apply-changes
 //! <base> <changes> -o <output> [--locations-on-ways] [-j N]
 //! [--direct-io] [--io-uring] --force`) is the only thing this file
 //! pins.
@@ -26,22 +25,20 @@
 //!
 //! `merge_cross_validate_osmium` keeps `#[ignore = "external"]` per
 //! the in-tree escape-hatch convention (reference/testing.md >
-//! "External cross-validation"); it migrates to brokkr once
-//! `verify_merge` handles delete-set tolerance (request 4 in
-//! notes/testing-cli-feature-parity.md).
+//! "External cross-validation"). brokkr's `verify_merge` already
+//! applies the same delete-set tolerance, so it is a retirement
+//! candidate.
 
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::too_many_lines)]
-
-mod common;
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use common::cli::{CliInvoker, CliOutput};
-use common::{
+use crate::common::cli::{CliInvoker, CliOutput};
+use crate::common::{
     TestMember, TestNode, TestRelation, TestWay, node_ids_with_coords as node_ids,
     read_all_elements_with_coords as read_all_elements, relation_ids_with_coords as relation_ids,
     way_ids_with_coords as way_ids, write_test_pbf_sorted,
@@ -1333,7 +1330,7 @@ fn merge_locations_on_ways_basic() {
     assert!(stderr.contains("nodes needed"), "loc stats: {stderr}");
     assert!(stderr.contains("0 missing"), "loc stats: {stderr}");
 
-    let header = common::read_header(&output);
+    let header = crate::common::read_header(&output);
     assert!(
         header.has_locations_on_ways(),
         "output must have LocationsOnWays"
@@ -1853,7 +1850,7 @@ fn merge_refuses_a_version_regression_and_honours_the_escape_hatch() {
 /// non-indexed base PBF must reject the combination up front.
 #[test]
 fn merge_rejects_force_with_locations_on_ways_on_non_indexed() {
-    use common::write_test_pbf_non_indexed;
+    use crate::common::write_test_pbf_non_indexed;
 
     let dir = TempDir::new().expect("tempdir");
     let base = dir.path().join("base.osm.pbf");
@@ -2130,15 +2127,15 @@ mod platform {
 }
 
 // ---------------------------------------------------------------------------
-// External cross-validation (escape hatch; migrates to brokkr verify)
+// External cross-validation (escape hatch; redundant with brokkr verify)
 // ---------------------------------------------------------------------------
 //
-// See notes/testing-cli-feature-parity.md request 4: brokkr's
-// verify_merge needs delete-set tolerance for the
-// version-vs-unconditional delete divergence between osmium and
-// pbfhogg. Until then, this in-tree test is `#[ignore = "external"]`
-// per the convention and stays as the canonical place that knows
-// how to do the delete-set carve-out.
+// brokkr's verify_merge applies the same delete-set tolerance
+// (osmium-only IDs in the input OSC delete set are expected, because
+// osmium deletes version-conditionally while pbfhogg deletes
+// unconditionally), so this test is redundant with
+// `brokkr verify merge` and survives only as an
+// `#[ignore = "external"]` escape hatch.
 
 #[derive(Debug, PartialEq)]
 struct CmpNode {

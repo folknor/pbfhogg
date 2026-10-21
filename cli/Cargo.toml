@@ -10,10 +10,23 @@ rust-version = "1.96"
 authors = ["folknor <folk@folk.wtf>"]
 keywords = ["osm", "openstreetmap", "pbf", "cli", "gis"]
 categories = ["command-line-utilities", "science::geo"]
+# Integration tests are declared below rather than discovered, matching the
+# root crate: a new file in cli/tests/ is a module of an existing target, or
+# a [[test]] of its own with the reason beside it, never a silent extra
+# binary.
+autotests = false
 
+# No inline tests in cli/src, so no unit-test harness to link and start.
 [[bin]]
 name = "pbfhogg"
 path = "src/main.rs"
+test = false
+
+# Drives the binary through cargo's CARGO_BIN_EXE_pbfhogg, which only this
+# package's tests receive.
+[[test]]
+name = "cli"
+path = "tests/cli.rs"
 
 [features]
 default = []
@@ -42,7 +55,7 @@ clap = { version = "4.6.1", features = ["derive"] }
 # anyway when both crates build together; stating it here makes the
 # guarantee explicit rather than an artifact of the build graph.
 serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
-hotpath = "0.27.0"
+hotpath = "0.28.7"
 
 [dev-dependencies]
 tempfile = "3.27.0"

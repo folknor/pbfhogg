@@ -1,12 +1,9 @@
 //! `check` command coverage.
 //!
-//! `pbfhogg::check` lives behind the `commands` feature, so this file
-//! compiles out of the no-features sweep rather than breaking it.
-#![cfg(feature = "commands")]
+//! `pbfhogg::check` lives behind the `commands` feature, so `tests/all.rs`
+//! mounts this module only with that feature on.
 
-mod common;
-
-use common::{TestMember, TestNode, TestRelation, TestWay, write_test_pbf_sorted};
+use crate::common::{TestMember, TestNode, TestRelation, TestWay, write_test_pbf_sorted};
 use pbfhogg::MemberId;
 use tempfile::TempDir;
 

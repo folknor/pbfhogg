@@ -11,12 +11,10 @@
 
 #![allow(clippy::unwrap_used)]
 
-mod common;
-
 use std::path::Path;
 
-use common::cli::CliInvoker;
-use common::{
+use crate::common::cli::CliInvoker;
+use crate::common::{
     TestNode, TestRelation, TestWay, assert_has_tagdata, assert_indexed, assert_no_tagdata,
     assert_no_tagdata_all_blobs, assert_non_indexed, assert_sorted_file, count_tagdata_blobs,
     generate_nodes, generate_relations, generate_ways, read_header, read_normalized,
@@ -1950,7 +1948,7 @@ fn refs_field(stdout: &str, field: &str) -> u64 {
 /// reference dangles iff its target `(kind, id)` is absent from the output.
 /// Returns `(missing_node_refs, missing_way_refs, missing_node_members,
 /// missing_relation_members)`.
-fn expected_dangles(out: &common::NormalizedPbf) -> (u64, u64, u64, u64) {
+fn expected_dangles(out: &crate::common::NormalizedPbf) -> (u64, u64, u64, u64) {
     use std::collections::BTreeSet;
     let node_ids: BTreeSet<i64> = out.nodes.iter().map(|n| n.id).collect();
     let way_ids: BTreeSet<i64> = out.ways.iter().map(|w| w.id).collect();

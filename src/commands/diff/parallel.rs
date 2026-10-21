@@ -822,13 +822,7 @@ pub(crate) fn diff_block_pair_parallel(
 
         // All successful: emit shard outputs in shard order, streaming each
         // per-shard temp file to the caller's output and removing it.
-        for shard_out in outputs {
-            append_and_cleanup(output, &shard_out.text_path)?;
-            total.common += shard_out.stats.common;
-            total.created += shard_out.stats.created;
-            total.modified += shard_out.stats.modified;
-            total.deleted += shard_out.stats.deleted;
-        }
+        emit_shard_outputs(output, outputs, &mut total)?;
 
         crate::debug::emit_marker(&end_marker);
     }
@@ -836,12 +830,48 @@ pub(crate) fn diff_block_pair_parallel(
     Ok(total)
 }
 
-/// Copy a shard's scratch temp file to the caller's output writer and then
-/// remove it. Mirrors `derive_parallel::append_and_cleanup`.
-fn append_and_cleanup(out: &mut impl Write, src: &Path) -> Result<()> {
-    let mut f = std::fs::File::open(src).map_err(io_err)?;
-    io::copy(&mut f, out).map_err(io_err)?;
-    drop(f);
-    drop(std::fs::remove_file(src));
+/// Stream every shard's temp file to `output` in shard order, folding each
+/// shard's counts into `total`.
+///
+/// A failed write to `output` - the reader of a stdout pipe going away is
+/// the ordinary case (`diff a b | head`) - stops the emission, but every
+/// remaining shard's temp file is still removed before the error returns.
+/// Returning on the first error left them all in the scratch directory
+/// beside the old input, one per shard per run.
+fn emit_shard_outputs(
+    output: &mut impl Write,
+    outputs: Vec<ShardOutput>,
+    total: &mut DiffStats,
+) -> Result<()> {
+    let mut first_err = None;
+    for shard_out in outputs {
+        if first_err.is_some() {
+            drop(std::fs::remove_file(&shard_out.text_path));
+            continue;
+        }
+        if let Err(e) = append_and_cleanup(output, &shard_out.text_path) {
+            first_err = Some(e);
+            continue;
+        }
+        total.common += shard_out.stats.common;
+        total.created += shard_out.stats.created;
+        total.modified += shard_out.stats.modified;
+        total.deleted += shard_out.stats.deleted;
+    }
+    if let Some(e) = first_err {
+        return Err(e);
+    }
     Ok(())
+}
+
+/// Copy a shard's scratch temp file to the caller's output writer and then
+/// remove it - also when the copy fails, so a failed write does not leave
+/// the temp file behind. Mirrors `derive_parallel::append_and_cleanup`.
+fn append_and_cleanup(out: &mut impl Write, src: &Path) -> Result<()> {
+    let copied = std::fs::File::open(src).and_then(|mut f| io::copy(&mut f, out));
+    drop(std::fs::remove_file(src));
+    match copied {
+        Ok(_) => Ok(()),
+        Err(e) => Err(io_err(e)),
+    }
 }

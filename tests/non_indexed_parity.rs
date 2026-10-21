@@ -18,9 +18,7 @@
 //! layout, and metadata absence differences; it only compares the
 //! element-level content contract.
 
-mod common;
-
-use common::{
+use crate::common::{
     TestMember, TestNode, TestRelation, TestWay, assert_elements_equivalent, assert_indexed,
     assert_non_indexed, generate_nodes, generate_ways, write_test_pbf_non_indexed,
     write_test_pbf_sorted,

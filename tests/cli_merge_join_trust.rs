@@ -30,11 +30,9 @@
 
 #![allow(clippy::unwrap_used)]
 
-mod common;
-
 use std::path::Path;
 
-use common::cli::CliInvoker;
+use crate::common::cli::CliInvoker;
 use pbfhogg::MemberId;
 use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData};
 use pbfhogg::writer::{Compression, PbfWriter};
@@ -225,7 +223,7 @@ fn understated_max_id_is_rejected_not_silently_truncated() {
     // Blob 1 is the single OsmData blob (blob 0 is the OsmHeader). Claim its
     // last node is 5 while the payload still holds 1..=10.
     let bytes = std::fs::read(&honest_new).expect("read fixture");
-    let forged = common::adversarial::mutate_blob_header_indexdata(&bytes, 1, |ix| {
+    let forged = crate::common::adversarial::mutate_blob_header_indexdata(&bytes, 1, |ix| {
         assert_eq!(ix.len(), 42, "fixture blob must carry a v3 index");
         ix[10..18].copy_from_slice(&5i64.to_le_bytes());
     });

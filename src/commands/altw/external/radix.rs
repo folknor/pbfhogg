@@ -1,6 +1,6 @@
 //! Shared scaffolding for 256-bucket radix-partitioned external joins.
 //!
-//! Used by `external_join` (ALTW coordinate resolution).
+//! Used by the external ALTW backend (coordinate resolution).
 //!
 //! Provides a managed scratch directory (auto-cleanup on drop) and the
 //! shared bucket-count + per-bucket buffer-size constants. Callers do their
@@ -8,8 +8,8 @@
 //! ownership shapes (per-worker shards in stage 1, shared per-bucket
 //! mutexes in stage 2).
 //!
-//! Moved here from `src/commands/external_join.rs` during the renumber planet
-//! refactor (2026-04-11).
+//! Moved here from the former top-level `external_join` module during the
+//! renumber planet refactor (2026-04-11).
 
 use std::path::{Path, PathBuf};
 

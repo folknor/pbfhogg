@@ -9,9 +9,9 @@
 //! pre-allocated code paths or off-by-one errors in block-level
 //! bookkeeping.
 
-mod common;
-
-use common::{TestMember, TestNode, TestRelation, TestWay, read_normalized, write_test_pbf_sorted};
+use crate::common::{
+    TestMember, TestNode, TestRelation, TestWay, read_normalized, write_test_pbf_sorted,
+};
 use pbfhogg::block_builder;
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobReader, BlobType, ElementReader, MemberId};
@@ -330,7 +330,7 @@ fn large_positive_id_roundtrips() {
 fn block_builder_capacity_boundary() {
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("cap.osm.pbf");
-    let nodes = common::generate_nodes(8_001, 1);
+    let nodes = crate::common::generate_nodes(8_001, 1);
     write_test_pbf_sorted(&path, &nodes, &[], &[]);
 
     let c = read_normalized(&path);

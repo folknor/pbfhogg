@@ -8,9 +8,7 @@
 //! asymmetries, stable-sort guarantees, and operation commutativity
 //! without needing hand-specified expected outputs.
 
-mod common;
-
-use common::{
+use crate::common::{
     TestMember, TestNode, TestRelation, TestWay, assert_elements_equivalent, generate_nodes,
     generate_relations, generate_ways, write_multi_block_test_pbf, write_test_pbf_sorted,
 };
@@ -228,7 +226,7 @@ fn derive_then_apply_roundtrip() {
 /// entirely (every OSC-sourced element in merged output carried v0).
 #[test]
 fn derive_then_apply_preserves_metadata() {
-    use common::TestMeta;
+    use crate::common::TestMeta;
 
     let dir = TempDir::new().expect("tempdir");
     let base = dir.path().join("base.osm.pbf");

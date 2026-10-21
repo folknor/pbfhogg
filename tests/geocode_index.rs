@@ -2,15 +2,12 @@
 //! Denmark-scale integration tests.
 //!
 //! The index builder lives behind the `commands` feature (and the
-//! reader behind `geocode-reader`, which `commands` enables), so this
-//! file compiles out of the no-features sweep rather than breaking it.
-#![cfg(feature = "commands")]
-
-mod common;
+//! reader behind `geocode-reader`, which `commands` enables), so
+//! `tests/all.rs` mounts this module only with `commands` on.
 
 use std::path::Path;
 
-use common::{TestMember, TestNode, TestRelation, TestWay, write_test_pbf_sorted};
+use crate::common::{TestMember, TestNode, TestRelation, TestWay, write_test_pbf_sorted};
 use pbfhogg::MemberId;
 use tempfile::TempDir;
 

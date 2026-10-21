@@ -49,10 +49,11 @@ build_packages = ["pbfhogg-cli"]
 # parallelism the suite has seen; the per-test 20s watchdog is kept. Two-run
 # ritual to judge it: the first run weights by test count (always the slow
 # one), and `claims 1-1` on the second means the budget needs raising (see
-# brokkr man config parallel). New exposure to watch: the cli_*.rs tests spawn
-# the CLI concurrently across binaries now - the fault-injection split made
-# tests per-binary race-free, and cross-binary races over shared scratch are
-# the class to suspect first if a test starts flaking here.
+# brokkr man config parallel). Since the test fold (autotests = false) the
+# sweep's binaries are the lib unit tests, the one `all` binary, and the
+# static-hook fault_* targets that must own their process; the fan-out
+# therefore parallelizes mostly inside `all`, and shared scratch between
+# concurrent cli_* modules is the class to suspect first if a test flakes.
 parallel = {}
 
 [[check]]
@@ -83,10 +84,99 @@ no_default_features = true
 features = []
 parallel = {}
 
+# The CLI crate's own tests (cli/tests/cli.rs). Every other sweep selects only
+# the root package - `build_packages` builds pbfhogg-cli but never tests it -
+# so until this entry existed these tests ran under no sweep at all, and the
+# gate's coverage audit could not see them either. Default features on
+# purpose: the `cfg(not(feature = "linux-..."))` rejection tests only compile
+# in a CLI built without the platform features.
+[[check]]
+name = "cli"
+packages = ["pbfhogg-cli"]
+parallel = {}
+
+# Doctests live in cargo's `--doc` pseudo-target, which a `parallel` sweep
+# cannot carry, and `[test] doctests` is off by default - so until this entry
+# existed no doctest in the library ever ran, and a broken example in a doc
+# comment was invisible. Workspace-shaped (no `packages`) on purpose: a gate
+# needs at least one doctest carrier that spans the whole workspace. Run
+# through the gate profile only, to keep tier1 fast.
+# pbfhogg-cli is bin-only, and `cargo test --doc` fails outright on a bin-only
+# package, so it is excluded rather than the lane being package-scoped.
+[[check]]
+name = "doctests"
+doc_only = true
+test_exclude_packages = ["pbfhogg-cli"]
+
+# Compile each workspace member's lib and bins under its own package-mode
+# resolve - the boundary `cargo install pbfhogg-cli` and a downstream
+# `pbfhogg` dependency build at. Workspace feature unification can otherwise
+# hide a feature one crate only gets from the other. Gate-only.
+[member_check]
+when = "gate"
+targets = ["lib", "bins"]
+
+# AGENTS.md's document-folder rule, enforced rather than trusted: nothing
+# durable (reference/, docs/, code comments) may cite notes/, and durable
+# docs must not point at files that no longer exist. Reads tracked files
+# only, so data/ and research/ never count. pre-clippy: text only, no build.
+[[script_check]]
+name = "doc-links"
+command = "python3 scripts/check_doc_links.py"
+expect = "document conventions ok"
+match = "last-line"
+stage = "pre-clippy"
+
+# glibc-only allocator calls live in src/debug.rs, behind
+# `cfg(all(target_os = "linux", target_env = "gnu"))` with a no-op fallback.
+# A call gated on `target_os = "linux"` alone also compiles for musl, where
+# these symbols do not exist, and nothing here builds against musl - so the
+# one way to keep musl building is to keep every call in the one gated file.
+# Matches the `libc::` path, so callers of the `crate::debug` wrappers
+# (`cap_malloc_arenas`, `malloc_trim`, `emit_mallinfo2`) stay legal, and
+# `region = "code"` lets comments discuss the calls by name.
+[[textlint]]
+name = "glibc-allocator-calls-live-in-debug"
+pattern = '\blibc::(?:mallopt|mallinfo2?|malloc_trim|malloc_stats|malloc_info|M_[A-Z_]+)\b'
+paths = ["src/**/*.rs", "cli/src/**/*.rs", "tests/**/*.rs", "benches/**/*.rs"]
+exclude = ["src/debug.rs"]
+region = "code"
+message = "glibc-only allocator call outside src/debug.rs breaks the musl build; add a target_env gnu gated wrapper there and call it"
+
+# Stdout discipline. `print!`/`println!` panic when stdout's reader goes away,
+# so `pbfhogg inspect x.pbf | head` used to die with exit 101. The CLI writes
+# through cli/src/output.rs, whose writer turns EPIPE into a silent exit 0;
+# the library never owns its host's stdout and renders into a caller-supplied
+# `io::Write` instead. Rule two matches the bare identifier, not the call, so
+# `use std::io::stdout as out;` cannot rename its way past it.
+# `show_element.rs` keeps a stdout wrapper for the old `show_element`
+# signature that tests still call; retire it with its exclusion once they
+# use `show_element_to`. `region = "code"` keeps doc examples, comments and
+# clap help strings out of scope. `eprintln!` stays legal.
+[[textlint]]
+name = "no-print-macro"
+pattern = '\b(?:print|println)!\s*[\(\[\{]'
+paths = ["src/**/*.rs", "cli/src/**/*.rs"]
+region = "code"
+message = "print!/println! panic when stdout's reader goes away (pbfhogg ... | head); in the CLI write through output::buffered, in the library into a caller-supplied io::Write"
+
+[[textlint]]
+name = "no-stdout-handle"
+pattern = '\bstdout\b'
+paths = ["src/**/*.rs", "cli/src/**/*.rs"]
+exclude = ["cli/src/output.rs", "src/commands/inspect/show_element.rs"]
+region = "code"
+message = "only cli/src/output.rs acquires stdout; use output::buffered, or have the library take an io::Write"
+
+[bin]
+default = "pbfhogg"
+install = ["pbfhogg-cli"]
+
 [test]
 debug = true
 default_package = "pbfhogg"
 default_profile = "tier1"
+gate_profile = "gate"
 
 # Tier 1 - fast contracts. brokkr check's inner-loop signal during
 # refactor. Skips the tier2/tier3/platform/serial submodules; runs
@@ -95,7 +185,7 @@ default_profile = "tier1"
 # themselves out there.
 [test.profiles.tier1]
 description = "Fast edit loop used by brokkr check (tier 1)"
-sweeps = ["all", "consumer", "minimal"]
+sweeps = ["all", "consumer", "minimal", "cli"]
 skip = ["tier2::", "tier3::", "platform::", "serial::"]
 include_ignored = false
 
@@ -165,8 +255,28 @@ test_threads = 1
 [test.profiles.sort]
 description = "Tier 2: expanded sort command tests"
 extends = "tier1"
-tests = ["cli_sort"]
+tests = ["all"]
+only = ["cli_sort::"]
 skip = ["platform::", "serial::"]
+
+# `brokkr check --gate`: every sweep with no filters, plus doctests, plus the
+# coverage audit. Under `certifies = "complete"` every (build shape, test)
+# pair must run, be `#[ignore]`d at the source, or be justified by a
+# `[[quarantine]]` entry - otherwise the check fails as orphaned. That is the
+# failure the substring skips in `full` caused silently (see its comment):
+# a test that stops running cannot go unnoticed here.
+[test.profiles.gate-tests]
+description = "Every sweep, unfiltered"
+sweeps = ["all", "consumer", "minimal", "cli"]
+
+[test.profiles.doc-twin]
+description = "The doc-only carrier"
+sweeps = ["doctests"]
+
+[test.profiles.gate]
+description = "Every sweep unfiltered, doctests, and the coverage audit"
+lanes = ["gate-tests", "doc-twin"]
+certifies = "complete"
 
 # ---------------------------------------------------------------------------
 # Per-machine configuration, keyed by hostname.

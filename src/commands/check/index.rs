@@ -283,28 +283,43 @@ impl IndexReport {
         })
     }
 
-    /// Human-readable summary on stdout.
-    pub fn print_human(&self, file_name: &str) {
+    /// Write the human-readable summary to `out`.
+    ///
+    /// Rendered into a caller-supplied writer rather than the process's
+    /// stdout so a write failure - the reader of a pipe going away - comes
+    /// back as an error instead of a `println!` panic.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error `out` reports.
+    pub fn write_human<W: std::io::Write>(
+        &self,
+        out: &mut W,
+        file_name: &str,
+    ) -> std::io::Result<()> {
         for v in &self.violations {
-            println!("{v}");
+            writeln!(out, "{v}")?;
         }
         if self.total_violations > self.violations.len() as u64 {
-            println!(
+            writeln!(
+                out,
                 "... {} further violation(s) not shown (raise --max-errors)",
                 self.total_violations - self.violations.len() as u64
-            );
+            )?;
         }
-        println!(
+        writeln!(
+            out,
             "Blobs: {} ({} with indexdata, {} with tagdata, {} unindexable)",
             self.blobs, self.blobs_with_index, self.blobs_with_tagdata, self.blobs_unindexable
-        );
+        )?;
         if self.passed() {
-            println!("Blob metadata for {file_name}: OK");
+            writeln!(out, "Blob metadata for {file_name}: OK")
         } else {
-            println!(
+            writeln!(
+                out,
                 "Blob metadata for {file_name}: FAILED ({} violations)",
                 self.total_violations
-            );
+            )
         }
     }
 }

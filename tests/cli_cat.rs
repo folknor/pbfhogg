@@ -1,6 +1,6 @@
 //! CLI-driven integration tests for `pbfhogg cat`.
 //!
-//! Replaces the library-API `tests/cat.rs`. Fixture PBFs are
+//! Replaces the removed library-API `cat.rs` test. Fixture PBFs are
 //! written via the stable-allowlist writers; `cat` runs through
 //! `CliInvoker`; output is verified by reading the resulting
 //! PBF with the stable-allowlist readers, with stats inspected
@@ -10,12 +10,10 @@
 
 #![allow(clippy::unwrap_used)]
 
-mod common;
-
 use std::path::Path;
 
-use common::cli::CliInvoker;
-use common::{
+use crate::common::cli::CliInvoker;
+use crate::common::{
     NormalizedPbf, TestMember, TestMeta, TestNode, TestRelation, TestWay, generate_nodes,
     generate_ways, node_ids_with_coords as node_ids, read_all_elements_with_coords,
     read_normalized, relation_ids_with_coords as relation_ids, way_ids_with_coords as way_ids,
@@ -35,7 +33,7 @@ fn run_cat(
     type_filter: Option<&str>,
     clean_attrs: &[&str],
     direct_io: bool,
-) -> common::cli::CliOutput {
+) -> crate::common::cli::CliOutput {
     let mut cli = CliInvoker::new().arg("cat");
     for input in inputs {
         cli = cli.arg(*input);
@@ -431,7 +429,7 @@ fn cat_multi_file_unions_the_bbox_and_reconciles_replication() {
         out.stderr_str()
     );
 
-    let header = common::read_header(&output);
+    let header = crate::common::read_header(&output);
     let bbox = header
         .bbox()
         .expect("both inputs declare a bbox, so the output must declare their union");
@@ -486,7 +484,7 @@ fn cat_single_file_preserves_the_input_header() {
     let out = run_cat(&[&input], &output, None, &[], false);
     assert!(out.status.success(), "cat failed:\n{}", out.stderr_str());
 
-    let header = common::read_header(&output);
+    let header = crate::common::read_header(&output);
     let bbox = header.bbox().expect("bbox preserved");
     let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
     assert!(close(bbox.left, 1.0) && close(bbox.right, 2.0));
@@ -537,7 +535,7 @@ fn cat_reconciles_the_header_on_every_output_path() {
             out.stderr_str()
         );
 
-        let header = common::read_header(&output);
+        let header = crate::common::read_header(&output);
         let bbox = header
             .bbox()
             .unwrap_or_else(|| panic!("{label}: the union of two declared boxes is known"));
@@ -597,7 +595,7 @@ fn cat_multi_file_drops_the_bbox_when_an_input_declares_none() {
     let out = run_cat(&[&boxed, &unboxed], &output, None, &[], false);
     assert!(out.status.success(), "cat failed:\n{}", out.stderr_str());
 
-    let header = common::read_header(&output);
+    let header = crate::common::read_header(&output);
     assert!(
         header.bbox().is_none(),
         "an input of unknown extent makes the union unknown"

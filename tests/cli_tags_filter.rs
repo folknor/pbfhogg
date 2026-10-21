@@ -1,6 +1,6 @@
 //! CLI-driven integration tests for `pbfhogg tags-filter`.
 //!
-//! Replaces the library-API `tests/tags_filter.rs`. Fixture PBFs
+//! Replaces the removed library-API `tags_filter.rs` test. Fixture PBFs
 //! are built with the stable-allowlist writers; `tags-filter`
 //! runs through `CliInvoker`; output is verified by reading the
 //! resulting PBF with the stable-allowlist readers. No imports
@@ -18,12 +18,10 @@
 
 #![allow(clippy::unwrap_used)]
 
-mod common;
-
 use std::path::Path;
 
-use common::cli::CliInvoker;
-use common::{
+use crate::common::cli::CliInvoker;
+use crate::common::{
     PbfContentsIdOnly, TestMember, TestNode, TestRelation, TestWay, generate_nodes,
     generate_relations, generate_ways, node_ids_id_only as node_ids,
     read_all_elements_id_only as read_all_elements, relation_ids_id_only as relation_ids,
@@ -96,7 +94,7 @@ fn distrust_metadata_recovers_matches_a_lying_tag_index_would_hide() {
     let pristine = dir.path().join("pristine.osm.pbf");
     let corrupt = dir.path().join("corrupt.osm.pbf");
 
-    common::write_indexed_pbf(
+    crate::common::write_indexed_pbf(
         &pristine,
         &[
             TestNode {
@@ -191,7 +189,7 @@ fn distrust_metadata_holds_through_reference_expansion() {
     let pristine = dir.path().join("pristine.osm.pbf");
     let corrupt = dir.path().join("corrupt.osm.pbf");
 
-    common::write_indexed_pbf(
+    crate::common::write_indexed_pbf(
         &pristine,
         &[
             TestNode {
@@ -1202,7 +1200,7 @@ fn remove_tags_strips_tags_from_referenced_nodes() {
 
     // Use the with-coords reader (the id-only reader doesn't return tags),
     // brought in just for this assertion.
-    let c = common::read_all_elements_with_coords(&output);
+    let c = crate::common::read_all_elements_with_coords(&output);
 
     // Way 10 should keep its tags (directly matched)
     assert_eq!(c.ways.iter().map(|w| w.0).collect::<Vec<_>>(), vec![10]);

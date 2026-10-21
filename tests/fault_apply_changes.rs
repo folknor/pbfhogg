@@ -1,20 +1,16 @@
-//! Per-binary fault-injection test for `apply_changes::merge` worker
-//! panic recovery (per-instance hook).
+//! Fault-injection test for `apply_changes::merge` worker panic
+//! recovery (per-instance hook).
 //!
-//! Split out of `tests/apply_changes_invariants.rs` (2026-04-25).
 //! Uses the per-instance `MergeOptions::panic_at_blob_seq` hook
-//! (carried on the public config struct), so it does not race with
-//! sibling tests even when run in the same binary - but lives here
-//! as the canonical apply-changes fault test so the per-binary
-//! pattern is uniform across pipelines.
+//! (carried on the public config struct), so it cannot fire in a
+//! sibling test and lives in the shared `all` binary. The static-hook
+//! fault tests are the ones that need a process of their own.
 //!
 //! Companion: `fault_parallel_writer.rs` covers apply-changes'
 //! default output backend via the static atomic in
-//! `parallel_writer::test_hooks`.
+//! `parallel_writer::test_hooks`, in its own binary.
 
 #![allow(clippy::unwrap_used)]
-
-mod common;
 
 #[cfg(feature = "test-hooks")]
 mod apply_changes {

@@ -1,8 +1,6 @@
 //! getid / removeid correctness tests.
 
-mod common;
-
-use common::{
+use crate::common::{
     TestMeta, TestNode, TestRelation, TestWay, generate_nodes, generate_ways,
     node_ids_id_only as node_ids, read_all_elements_id_only as read_all_elements,
     relation_ids_id_only as relation_ids, way_ids_id_only as way_ids, write_multi_block_test_pbf,

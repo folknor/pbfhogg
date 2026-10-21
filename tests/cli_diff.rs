@@ -1,6 +1,6 @@
 //! CLI-driven integration tests for `pbfhogg diff` (text format).
 //!
-//! Replaces `tests/diff.rs`. The OSC variant of diff (which is the
+//! Replaces the removed library-API `diff.rs` test. The OSC variant of diff (which is the
 //! `derive_changes` operation) lives in `cli_derive_changes.rs`.
 //! This file covers the default text-format output. Output goes to
 //! stdout; the `--summary` flag prints `DiffStats::print_summary` to
@@ -16,12 +16,10 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::too_many_lines)]
 
-mod common;
-
 use std::path::Path;
 
-use common::cli::CliInvoker;
-use common::{
+use crate::common::cli::CliInvoker;
+use crate::common::{
     TestMember, TestMeta, TestNode, TestRelation, TestWay, assert_indexed, assert_non_indexed,
     generate_nodes, write_multi_block_test_pbf, write_test_pbf, write_test_pbf_non_indexed,
     write_test_pbf_sorted,
@@ -107,7 +105,7 @@ fn run_diff(old: &Path, new: &Path, opts: DiffOpts) -> (String, DiffStats) {
     (text, stats)
 }
 
-fn run_diff_failing(old: &Path, new: &Path) -> common::cli::CliOutput {
+fn run_diff_failing(old: &Path, new: &Path) -> crate::common::cli::CliOutput {
     CliInvoker::new()
         .arg("diff")
         .arg(old)

@@ -65,7 +65,6 @@ use stage4::stage4_assembly;
 /// the cast is lossless for any `node_id` inside `[0, max_node_id]`. At
 /// planet (max_node_id ~= 14e9, 256 buckets) `bucket_width ~= 55M`,
 /// six orders of magnitude under 2^32.
-#[allow(dead_code)] // exposed for testing; production callers use BucketLayout.
 pub(super) fn bucket_width(max_node_id: u64, num_buckets: usize) -> u64 {
     debug_assert!(num_buckets > 0, "num_buckets must be > 0");
     max_node_id.div_ceil(num_buckets as u64).max(1)
@@ -94,14 +93,12 @@ pub(super) fn bucket_width(max_node_id: u64, num_buckets: usize) -> u64 {
 /// aren't in the input - common with extracts and node-sparse
 /// fixtures. See `missing_node_refs_get_zero_coordinates` in
 /// `tests/cli_add_locations_to_ways.rs` for the contract canary.
-#[allow(dead_code)] // wired up in step 2 of A1 (pass-A IdRecord emission).
 pub(super) struct BucketLayout {
     pub(super) max_node_id: u64,
     pub(super) bucket_width: u64,
     pub(super) num_buckets: usize,
 }
 
-#[allow(dead_code)] // wired up in step 2 of A1 (pass-A IdRecord emission).
 impl BucketLayout {
     pub(super) fn new(max_node_id: u64, num_buckets: usize) -> Self {
         assert!(num_buckets > 0, "num_buckets must be > 0");
@@ -564,9 +561,9 @@ pub(super) struct NodeBlobInfo {
 /// decomposition of the audit's `(local_node_id, slot_pos)` form: stage
 /// 2 reconstructs `linear_slot_pos = blob_start_slot[blob_idx] +
 /// blob_local_slot` from the per-blob refcount prefix-sum that pass A
-/// produces in `ref_count_sidecar`. See `.plans/merry-watching-lake.md`
-/// for the rationale.
-#[allow(dead_code)] // wired up in step 2 (emission) and step 3 (consumption).
+/// produces in `ref_count_sidecar`. The stage-1 worker decoding a blob knows
+/// `blob_local_slot`; a global slot position would need every earlier blob's
+/// refcount first, serialising emission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct IdRecord {
     pub(super) local_node_id: u32,
@@ -579,7 +576,6 @@ pub(super) struct IdRecord {
 pub(super) const CLOSURE_FLAG: u32 = 0x8000_0000;
 pub(super) const LOCAL_ID_MASK: u32 = 0x7fff_ffff;
 
-#[allow(dead_code)] // wired up in step 2 (emission) and step 3 (consumption).
 impl IdRecord {
     pub(super) fn write_to(&self, buf: &mut [u8; ID_RECORD_SIZE]) {
         buf[..4].copy_from_slice(&self.local_node_id.to_le_bytes());

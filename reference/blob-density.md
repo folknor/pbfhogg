@@ -176,7 +176,8 @@ threshold-based dispatch here is new ground.
   `planet.osm.org`-packed blob layout. The table needs a one-liner
   caveat once measurements on the other layout land.
 - `reference/performance.md` planet sections: same.
-- `notes/*.md` "N seconds at planet scale" predictions: likewise.
+- "N seconds at planet scale" predictions in plan and work notes:
+  likewise.
 
 ### Decisions that need revisiting
 
@@ -247,7 +248,7 @@ below).
 
 ### The unbuilt batched-walker primitive (deferred; do not build speculatively)
 
-Consolidated from `notes/header-walk-batching.md` (retired 2026-07-16;
+Consolidated from the header-walk batching note (retired 2026-07-16;
 full text in git history). Every serial-schedule-walk cost in this
 document shares one physical term: `HeaderWalker::next_header` is a
 single-threaded QD=1 pread per blob, ~45-70 µs, linear in blob count -
@@ -276,7 +277,10 @@ input is already sorted: the lever only pays on high-blob-count or
 unsorted-at-scale workloads, neither configured nor real today. Build
 it the day one becomes real - it is one primitive, not four fixes.
 Estimating its payoff requires the eviction pattern, never the sum of
-per-phase walk durations (the P4 lesson, `notes/altw.md`).
+per-phase walk durations: a walk is only expensive if something evicted
+the headers since the previous one, so a command that walks N times
+pays roughly one cold walk per eviction, not N (measured on sparse
+ALTW, see the europe note below).
 
 ### getid include mode confirms, steeper (2026-07-10)
 
@@ -360,11 +364,28 @@ parallel classify phases.
 > times on a production dataset.
 >
 > This makes the "low production bite" disposition above planet-specific
-> rather than general. The fix for sparse is the one this section
-> already names - adopt the shared scanner - and it is tracked as P4 in
-> [`notes/altw.md`](../notes/altw.md). **Instrument-first vindicated a
-> fourth time:** the walk was assumed cheap because it is cheap at
-> planet, and nobody had looked at europe.
+> rather than general. **Instrument-first vindicated a fourth time:** the
+> walk was assumed cheap because it is cheap at planet, and nobody had
+> looked at europe.
+>
+> **The obvious fix - adopt the shared scanner - was built and reverted
+> (2026-07-14), and should not be re-attempted.** Both arrangements were
+> correct and measured against same-day north-america baselines: three
+> walks consolidated into one, and one walk serving all four phases.
+> Neither moved the wall beyond the baseline's own variance, because the
+> 107.4 s above is an overcount. **Per-phase walk durations cannot be
+> summed.** A walk is only expensive if something evicted the headers
+> since the previous one, and in sparse only pass 1's store write does;
+> whichever phase walks first after the eviction pays, the next rides
+> free. The saving therefore equals the baseline's cold-walk penalty and
+> nothing more. Where the store fits page cache (north-america) the extra
+> walks are already near-free; where it does not (europe) they really do
+> cost, but that is the regime where `--index-type auto` routes to
+> external (store estimate above 80 % of the page-cache budget, see
+> `reference/pipeline.md`). Consolidating some walks but not all is
+> worse than nothing (+3.8 %): it deleted pass 2's warm ride and left
+> pass 2 walking cold on the far side of pass 1's eviction (23.0 s at
+> north-america, `ALTW_PASS2_SCHEDULE_WALK`).
 
 ### Full shape-3 sweep (2026-07-12, all six callers, plantasjen `5dc07c4`)
 
@@ -423,17 +444,17 @@ in TODO.md.
 ## Cross-references
 
 - `repack` (`reference/cli-reference.md`) - the command that produces
-  the alternate-packing planet for measurements (its retired design
-  note lives in git history: `notes/repack.md`, deleted 2026-07-16).
+  the alternate-packing planet for measurements (its design note was
+  retired to git history 2026-07-16).
 - `degrade` (`reference/cli-reference.md`) - command for producing
   adversarial test PBFs; the `--unsort` mode exercises `sort`'s
   overlap-run path which is orthogonal to but motivated alongside
-  this work (retired note: `notes/degrade.md`, git history).
+  this work (its design note was retired to git history).
 - [`reference/performance-history.md`](performance-history.md) "Sort" -
   the `HeaderWalker` pass-1 trade-off that first surfaced the asymmetry.
 - getparents - second instance of the same asymmetry, larger
-  magnitude; its full measurement record (retired note:
-  `notes/getparents.md`, git history) is condensed into the matrix
+  magnitude; its full measurement record (a note since retired to git
+  history) is condensed into the matrix
   above and TODO.md's getparents entry.
 - [`reference/pipelined-reader-paths.md`](pipelined-reader-paths.md) -
   existing callers of `into_blocks_pipelined`, candidates for

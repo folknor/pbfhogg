@@ -1,6 +1,6 @@
 //! CLI-driven defensive-input regression tests.
 //!
-//! Replaces `tests/cluster2_defensive_input.rs`. The two tests in this
+//! Replaces the removed `cluster2_defensive_input.rs` test. The two tests in this
 //! file pin specific defensive-input contracts that span more than one
 //! command (renumber + apply-changes), so they live here rather than
 //! folded into `cli_apply_changes_invariants.rs` (apply-changes-only)
@@ -17,17 +17,15 @@
 
 #![allow(clippy::unwrap_used)]
 
-mod common;
-
 use std::io::Write;
 use std::path::Path;
 
-use common::adversarial::{
+use crate::common::adversarial::{
     locate_blobs, mutate_blob_header_indexdata, mutate_blob_payload,
     set_relation_memids_terminator_continuation,
 };
-use common::cli::CliInvoker;
-use common::{TestMember, TestNode, TestRelation, TestWay, write_test_pbf};
+use crate::common::cli::CliInvoker;
+use crate::common::{TestMember, TestNode, TestRelation, TestWay, write_test_pbf};
 use pbfhogg::MemberId;
 use pbfhogg::block_builder::{self, BlockBuilder};
 use pbfhogg::writer::{Compression, PbfWriter};

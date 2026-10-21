@@ -1,7 +1,7 @@
 //! Per-binary fault-injection test for ALTW external stage 3.
 //!
-//! Split out of `tests/fault_injection.rs` (2026-04-25). Each
-//! `tests/fault_*.rs` compiles to its own integration-test binary,
+//! Split out of the former `fault_injection.rs` (2026-04-25). This file is
+//! its own `[[test]]` target in `Cargo.toml`,
 //! so the static `PANIC_AT_BUCKET_IDX` is per-process and race-free
 //! without `#[ignore]` or `--test-threads=1`.
 

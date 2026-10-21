@@ -270,7 +270,14 @@ well under an hour.
 `--direct-io` provides no benefit for ALTW - workload is compute/memory-bound,
 not I/O-bound. Sequential I/O benefits from page cache prefetch.
 
-### Dense vs Sparse vs External index (plantasjen)
+### Dense vs Sparse vs External index (plantasjen, historical)
+
+The `dense` index type has since been removed (`b70dd8c`): the rank-indexed
+flat sparse index beat it at every measured scale and also works where dense
+could not. `--index-type dense` now errors. The Dense column below is the
+historical measurement from when it existed, kept as a record; the Sparse
+column is the pre-rank-flat sparse, so those numbers are also superseded.
+Current sparse and external figures are in the sections that follow.
 
 | Dataset | Dense | Sparse | External | Commit |
 |---------|-------|--------|----------|--------|
@@ -286,7 +293,7 @@ mmap thrashing dominates.
 
 *Planet with dense thrashes on 30 GB host (memory-latency-bound).
 
-Dense is fastest when the working set fits in RAM. External uses ~1.6 GB
+Dense was fastest when the working set fit in RAM. External uses ~1.6 GB
 anon RSS at Europe scale via 4-stage radix join pipeline (node-only wire
 scanner for stage 2, scatter buffer for stage 3, sequential reader for
 stage 4).
@@ -296,19 +303,22 @@ Current Europe external baseline on `main` (post-A1 commit `0dc8ae1`):
 node-ID bucketed stage 1+2, landed 2026-04-25) cut europe from
 291.6 s at `6d71053` (-7.1 %) by replacing the two-pass way scan +
 rank index with single-pass IdRecord emission and a streaming
-merge-walk. See `notes/altw-external.md` for the full A1 chain.
+merge-walk.
 
-**Crossover point**: between Japan (2.4 GB, dense 2x faster) and Europe
-(33.6 GB, external 7.4x faster). At Europe scale, dense's mmap working set
-(~16 GB) exceeds available RAM, causing thrashing. External's sequential
-I/O stays bounded.
+**Historical crossover point** (dense no longer exists): between Japan
+(2.4 GB, dense 2x faster) and Europe (33.6 GB, external 7.4x faster). At
+Europe scale, dense's mmap working set (~16 GB) exceeded available RAM,
+causing thrashing. External's sequential I/O stays bounded.
 
 ### Sparse `MADV_RANDOM` on the coord store (europe, plantasjen, 2026-07-16, commit `25cb0df`)
 
 Pass 2's random lookups no longer pay kernel readahead speculation: the
 store mapping is advised `MADV_RANDOM` once pass 1 has populated it.
 Adjudicated on the matched quiet pair (cells adjacent, same day,
-post-trim; full six-cell record in notes/altw.md P3):
+post-trim). Four further same-day cells (`53763e55`, `7027481c`,
+`9a72b914`, `6b9942e5`) ran under host load and adjudicate nothing
+arm-vs-arm on wall, though every probe cell, the memory-pressured one
+included, read fewer pass-2 bytes than the best baseline cell:
 
 | | probe `3027542f` (`25cb0df`) | baseline `c45b45ee` (`13910d2`) | delta |
 |---|---:|---:|---:|
@@ -517,8 +527,8 @@ suite; the rest still carry their older commit in the Notes column.
 > stage-4 payload readiness (`s4_readiness_wait_ms` 667.0 -> 1395.2 s
 > cum, ~63 s per decode thread of a 240 s phase) while `s4_send_ms`
 > collapses 705.2 -> 59.3 s cum; output grows 91.17 -> 95.20 GB. **The
-> europe -13.9 % zstd:1 result does not transfer to planet** - regime
-> transfer, exactly as `notes/altw-external.md` warns. Read the
+> europe -13.9 % zstd:1 result does not transfer to planet** - a
+> europe measurement is not evidence about planet's regime. Read the
 > direction, not the magnitude: total wall says zstd:1 is *worse*
 > (648.4 s vs 628.2 s) purely because +31.7 s of drive drift in the
 > codec-independent stages 1+2 swamped the streaming win, which is also
@@ -526,8 +536,9 @@ suite; the rest still carry their older commit in the Notes column.
 > total-wall comparisons cannot be trusted here. Consequence: the
 > ceiling-gated items (ALTW S2 DenseNodes wire filter, the
 > A2/output-executor family) lose their gating premise - freed stage-4
-> CPU has nowhere to go under *either* codec. See
-> `notes/altw-external.md` S2 + N3.
+> CPU has nowhere to go under *either* codec. The measured streaming
+> constraint is the stage-3 -> stage-4 payload handoff, which is where
+> any further planet streaming work has to aim.
 
 > **`cat --dedupe` planet 133-minute wall.** Single `MERGEPBF` phase,
 > peak anon RSS only 1.4 GB, avg cores 1.3 - the path is essentially

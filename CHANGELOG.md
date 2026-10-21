@@ -4,6 +4,21 @@
 
 ### Breaking
 
+- **Report types write into a caller-supplied `io::Write` instead of printing
+  to stdout.** A library does not own its host's stdout. Renamed, each now
+  returning `io::Result<()>`:
+  - `InspectReport::print_report` / `print_report_filtered` become
+    `write_report(&mut w, ..)` / `write_report_filtered(&mut w, ..)`;
+  - `NodeStatsReport::print_report` becomes `write_report(&mut w)`;
+  - `check::index::IndexReport::print_human` becomes
+    `write_human(&mut w, file_name)`;
+  - `VerifyIdsReport::print_human` becomes `write_human(&mut w, file_name)`.
+
+  `inspect::show_element_to(.., &mut w)` is new; `inspect::show_element`
+  keeps its signature, still writes to stdout, and now returns an error on
+  a failed write instead of panicking. Write errors in the inspect block
+  tables used to be silently discarded and are now returned.
+
 - **Geocode index format version 3 widens admin entry and vertex byte offsets
   to 64 bits.** Version 2 indexes are rejected at `Reader::open` with a message
   naming `build-geocode-index` as the remedy; there is no migration, and an
@@ -470,6 +485,21 @@
   must be left untouched.
 
 ### Fixed
+
+- **Piping CLI output into a reader that exits early no longer panics.**
+  `pbfhogg inspect x.pbf | head`, and the same with `check`, `diff`,
+  `export`, `tags-count` and `inspect --show`, used to die with "failed
+  printing to stdout: Broken pipe" and exit 101. The CLI now stops writing
+  and exits 0, as standard Unix tools do. `check` and `inspect --indexed`
+  work out their verdict before writing anything, so they keep their exit
+  code; streaming `diff` exits 0 when the pipe closes. Other stdout write
+  errors, such as a full disk behind `> file`, still exit 2. `export`, `diff`
+  and `tags-count` output to stdout is now block-buffered instead of
+  line-buffered.
+
+- **Parallel `diff` no longer leaves `diff-par-*.txt.tmp` files behind** when
+  writing its output fails, for example when the reader of a stdout pipe goes
+  away. The same leak in `diff --format osc` is fixed too.
 
 - **Geocode indexes now accept legal non-dense Node messages and retain way
   vertices at Null Island.** The coordinate store uses the same explicit

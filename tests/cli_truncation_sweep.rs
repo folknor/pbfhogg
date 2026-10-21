@@ -14,14 +14,13 @@
 //! Decompression failure (shape 5) is exercised separately by the
 //! `mutate_blob_payload`-based tests in `cli_defensive_input.rs`.
 
-#[path = "common/mod.rs"]
-mod common;
-
 use std::time::Duration;
 
-use common::adversarial::{BlobLocation, locate_blobs, truncate_to};
-use common::cli::CliInvoker;
-use common::{generate_nodes, generate_relations, generate_ways, write_multi_block_test_pbf};
+use crate::common::adversarial::{BlobLocation, locate_blobs, truncate_to};
+use crate::common::cli::CliInvoker;
+use crate::common::{
+    generate_nodes, generate_relations, generate_ways, write_multi_block_test_pbf,
+};
 use tempfile::TempDir;
 
 /// Wall clock cap per truncation × command invocation.

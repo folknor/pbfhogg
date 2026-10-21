@@ -129,81 +129,98 @@ impl VerifyIdsReport {
         )?)
     }
 
-    /// Print a human-readable summary to stdout.
-    pub fn print_human(&self, file_name: &str) {
-        println!("Verify IDs: {file_name}");
-        println!("  Header sorted: {}", yes_no(self.header_sorted));
-        println!("  Indexed: {}", yes_no(self.indexed));
-        print_mode_line(self.full);
-        println!();
+    /// Write the human-readable summary to `out`.
+    ///
+    /// Takes a writer rather than printing so a closed stdout pipe surfaces
+    /// as an `io::Error` the caller can handle instead of a `println!` panic.
+    pub fn write_human<W: std::io::Write>(
+        &self,
+        out: &mut W,
+        file_name: &str,
+    ) -> std::io::Result<()> {
+        writeln!(out, "Verify IDs: {file_name}")?;
+        writeln!(out, "  Header sorted: {}", yes_no(self.header_sorted))?;
+        writeln!(out, "  Indexed: {}", yes_no(self.indexed))?;
+        write_mode_line(out, self.full)?;
+        writeln!(out)?;
 
-        println!(
+        writeln!(
+            out,
             "Scanned {} nodes, {} ways, {} relations",
             fmt_count(self.node_count),
             fmt_count(self.way_count),
             fmt_count(self.relation_count),
-        );
-        println!();
+        )?;
+        writeln!(out)?;
 
         if self.passed {
-            println!("ID integrity: OK");
+            writeln!(out, "ID integrity: OK")?;
         } else {
-            print_violations(self);
+            write_violations(out, self)?;
         }
+        Ok(())
     }
 }
 
 // ---------------------------------------------------------------------------
-// Human-output helpers (keep cognitive complexity out of print_human)
+// Human-output helpers (keep cognitive complexity out of write_human)
 // ---------------------------------------------------------------------------
 
 fn yes_no(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
 }
 
-/// Print the mode line (streaming vs full).
-fn print_mode_line(full: bool) {
+/// Write the mode line (streaming vs full).
+fn write_mode_line(out: &mut impl std::io::Write, full: bool) -> std::io::Result<()> {
     if full {
-        println!("  Mode: full (duplicate detection)");
+        writeln!(out, "  Mode: full (duplicate detection)")
     } else {
-        println!("  Mode: streaming");
+        writeln!(out, "  Mode: streaming")
     }
 }
 
-/// Print the violation summary and individual violation lines.
-fn print_violations(report: &VerifyIdsReport) {
+/// Write the violation summary and individual violation lines.
+fn write_violations(
+    out: &mut impl std::io::Write,
+    report: &VerifyIdsReport,
+) -> std::io::Result<()> {
     let showing = report.violations.len();
     let total = report.total_violations;
 
-    println!("{total} violations (showing first {showing} of {total}):");
+    writeln!(
+        out,
+        "{total} violations (showing first {showing} of {total}):"
+    )?;
 
     for v in &report.violations {
-        print_single_violation(v);
+        write_single_violation(out, v)?;
     }
 
-    println!();
-    println!("ID integrity: FAILED");
+    writeln!(out)?;
+    writeln!(out, "ID integrity: FAILED")
 }
 
-/// Print one violation line.
-fn print_single_violation(v: &IdViolation) {
+/// Write one violation line.
+fn write_single_violation(out: &mut impl std::io::Write, v: &IdViolation) -> std::io::Result<()> {
     match v {
         IdViolation::NonMonotonic {
             elem_type,
             id,
             prev_id,
-        } => {
-            println!("  {elem_type} {id}: non-monotonic (previous: {prev_id})");
-        }
+        } => writeln!(
+            out,
+            "  {elem_type} {id}: non-monotonic (previous: {prev_id})"
+        ),
         IdViolation::Duplicate { elem_type, id } => {
-            println!("  {elem_type} {id}: duplicate");
+            writeln!(out, "  {elem_type} {id}: duplicate")
         }
         IdViolation::TypeOrder { found, after } => {
-            println!("  type order: {found} after {after}");
+            writeln!(out, "  type order: {found} after {after}")
         }
-        IdViolation::IdOutOfRange { elem_type, id } => {
-            println!("  {elem_type} {id}: outside the duplicate-detection ID range");
-        }
+        IdViolation::IdOutOfRange { elem_type, id } => writeln!(
+            out,
+            "  {elem_type} {id}: outside the duplicate-detection ID range"
+        ),
     }
 }
 
@@ -301,7 +318,6 @@ pub fn verify_ids(path: &Path, opts: &VerifyIdsOptions) -> Result<VerifyIdsRepor
 // `duplicate_ids` always empty; the serial merge skips the duplicate
 // translation step.
 
-#[allow(clippy::too_many_lines)]
 /// Warn that an unindexed input costs three decompression passes.
 ///
 /// `build_classify_schedules_split` cannot tell which kind an unindexed blob
@@ -332,12 +348,10 @@ fn verify_ids_streaming_parallel(path: &Path, opts: &VerifyIdsOptions) -> Result
 
     // Same arena cap as `--full`. The streaming workers do no per-element
     // allocation (just reads + push to a small per-blob within_violations
-    // Vec), so the regression measured on time-filter (where workers do
-    // allocation-heavy BlockBuilder re-encode) doesn't apply here.
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    unsafe {
-        libc::mallopt(libc::M_ARENA_MAX, 2);
-    }
+    // Vec), so the contention cost measured on the pre-migration
+    // time-filter snapshot path (allocation-heavy BlockBuilder scratch
+    // reused across blobs) doesn't apply here.
+    crate::debug::cap_malloc_arenas();
 
     let header_sorted = ElementReader::open(path, opts.direct_io)?
         .header()
@@ -577,13 +591,8 @@ fn verify_ids_full_parallel(path: &Path, opts: &VerifyIdsOptions) -> Result<Veri
 
     crate::debug::emit_marker("VERIFYIDS_SCAN_START");
 
-    // mallopt prelude - same motivation as check_refs step #2: cap glibc
-    // arenas at 2 to prevent cross-thread alloc/free fragmentation in the
-    // pread worker pool.
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    unsafe {
-        libc::mallopt(libc::M_ARENA_MAX, 2);
-    }
+    // Pread worker pool; same motivation as check_refs step #2.
+    crate::debug::cap_malloc_arenas();
 
     // Cheap: ElementReader::open reads the header and stops. Drop it
     // immediately; parallel_classify_phase reopens the file internally via

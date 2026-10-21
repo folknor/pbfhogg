@@ -302,9 +302,12 @@ pub(super) fn build_node_index_sparse(
     // Per-blob rank-span accounting: on sorted inputs each blob's
     // referenced nodes occupy one contiguous rank interval, so
     // sum(span) / stored is the write-amplification a per-blob
-    // buffered-pwrite pass 1 would pay before it starts (the P5 gate
-    // in notes/altw.md). Ratio near 1.0 = dense intervals; materially
-    // above 1.0 = hole-heavy, buffered rewrite disqualified.
+    // buffered-pwrite pass 1 would pay before it starts (the gate for a
+    // per-blob buffered-pwrite pass 1). Ratio near 1.0 = dense intervals;
+    // materially above 1.0 = hole-heavy, buffered rewrite disqualified. On
+    // sorted + indexed input it reads exactly 1.000 by construction - ranks
+    // are assigned in ascending id order over disjoint blob id ranges - so it
+    // only discriminates on unsorted input.
     let tuples_scanned = std::sync::atomic::AtomicU64::new(0);
     let coords_stored = std::sync::atomic::AtomicU64::new(0);
     let rank_span_slots = std::sync::atomic::AtomicU64::new(0);
@@ -390,7 +393,9 @@ pub(super) fn build_node_index_sparse(
 /// Counter-signal on file: external's stage-4 coord mmap measured
 /// MADV_RANDOM as a regression (killed useful readahead under 6
 /// workers streaming semi-ordered payloads); sparse pass 2 has no such
-/// ordering, which is exactly what this probe tests (notes/altw.md P3).
+/// ordering, and the matched europe pair confirmed the opposite sign here:
+/// pass-2 disk read -57 %, pass-2 work -11.3 % (2026-07-16, `25cb0df`;
+/// reference/performance.md).
 fn advise_random_store(mmap: &memmap2::MmapMut) {
     #[cfg(unix)]
     {

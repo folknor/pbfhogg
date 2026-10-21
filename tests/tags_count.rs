@@ -3,10 +3,8 @@
 //! coverage, so this file seeds a minimal test plus the parallel
 //! classify parity check called out in the testing-infra sprint.
 
-mod common;
-
-use common::cli::CliInvoker;
-use common::{generate_nodes, generate_ways, write_multi_block_test_pbf};
+use crate::common::cli::CliInvoker;
+use crate::common::{generate_nodes, generate_ways, write_multi_block_test_pbf};
 use pbfhogg::tags_count::{TagCount, TagCountOptions, TagCountSort, tags_count};
 use tempfile::TempDir;
 
@@ -147,7 +145,7 @@ fn expression_filtered_counts_are_identical_with_and_without_a_tag_index() {
 
     // Reference file: identical elements, no tag index, so no blob can be
     // skipped and every count comes from a full decode.
-    common::cli::CliInvoker::new()
+    crate::common::cli::CliInvoker::new()
         .arg("degrade")
         .arg(&indexed)
         .arg("-o")

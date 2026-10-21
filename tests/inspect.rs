@@ -1,13 +1,9 @@
-#![cfg(feature = "commands")]
-
-mod common;
-
-use common::{TestNode, TestRelation, TestWay, generate_nodes, write_multi_block_test_pbf};
+use crate::common::{TestNode, TestRelation, TestWay, generate_nodes, write_multi_block_test_pbf};
 use pbfhogg::block_builder::{self, BlockBuilder};
 use pbfhogg::writer::{Compression, PbfWriter};
 
 fn write_simple_pbf(path: &std::path::Path) {
-    common::write_test_pbf(
+    crate::common::write_test_pbf(
         path,
         &[
             TestNode {
@@ -148,7 +144,7 @@ fn inspect_distrust_metadata_measures_instead_of_quoting_the_index() {
 }
 
 fn write_indexed_simple_pbf(path: &std::path::Path) {
-    common::write_indexed_pbf(
+    crate::common::write_indexed_pbf(
         path,
         &[
             TestNode {
@@ -611,7 +607,7 @@ fn show_element_unsorted_pbf_finds_target_in_later_blob() {
             meta: None,
         },
     ];
-    common::write_test_pbf_impl(&input, &nodes, &[], &[], false, Some(2));
+    crate::common::write_test_pbf_impl(&input, &nodes, &[], &[], false, Some(2));
 
     use pbfhogg::inspect::{ShowElementType, show_element};
     let found = show_element(&input, ShowElementType::Node, 51, false).expect("show_element");

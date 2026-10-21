@@ -6,9 +6,7 @@
 //! a bug in the fixture layer fails here instead of showing up as a
 //! confusing unrelated test failure in a consumer.
 
-mod common;
-
-use common::{
+use crate::common::{
     TestMeta, TestNode, assert_indexed, generate_nodes, generate_relations, generate_ways,
     read_header, read_normalized, write_multi_block_test_pbf, write_test_pbf_sorted,
 };
@@ -166,8 +164,9 @@ fn test_meta_roundtrips_through_writer() {
 }
 
 /// Smoke-check that `assert_indexed` passes for a file written with the
-/// standard sorted writer. (`assert_non_indexed` is exercised in
-/// `tests/diff.rs` once the non-indexed writer helper lands.)
+/// standard sorted writer. (`assert_non_indexed` is exercised by
+/// `tests/non_indexed_parity.rs`, `tests/cli_diff.rs` and
+/// `tests/cli_sort.rs`.)
 #[test]
 fn assert_indexed_passes_for_standard_fixture() {
     let dir = TempDir::new().expect("tempdir");
@@ -204,7 +203,7 @@ fn assert_indexed_passes_for_standard_fixture() {
 /// `tests/common/cli.rs::pbfhogg_bin` for the recovery recipe.
 #[test]
 fn cli_invoker_runs_version_command() {
-    let out = common::cli::CliInvoker::new()
+    let out = crate::common::cli::CliInvoker::new()
         .arg("--version")
         .assert_success();
     out.assert_stdout_contains("pbfhogg");

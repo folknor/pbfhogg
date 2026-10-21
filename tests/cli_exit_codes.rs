@@ -19,12 +19,10 @@
 
 #![allow(clippy::unwrap_used)]
 
-mod common;
-
 use std::path::Path;
 
-use common::cli::CliInvoker;
-use common::{TestNode, write_test_pbf_sorted};
+use crate::common::cli::CliInvoker;
+use crate::common::{TestNode, write_test_pbf_sorted};
 use tempfile::TempDir;
 
 const EXIT_SUCCESS: i32 = 0;
@@ -55,7 +53,7 @@ fn write_two_nodes(path: &Path, second_lat: i32) {
     );
 }
 
-fn code(out: &common::cli::CliOutput) -> i32 {
+fn code(out: &crate::common::cli::CliOutput) -> i32 {
     out.status.code().expect("child exited with a code")
 }
 

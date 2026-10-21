@@ -33,8 +33,8 @@ that arc:
 Tainted DB rows were invalidated 2026-04-27 once each axis had either a
 post-fix replacement in `.brokkr/results.db` or was waived as no-longer-active
 (stage-isolation diagnostics, ALTW alt-compression study, sequential
-diff-snapshots osc, cat-from-raw-input planet). The audit script at the time
-was `notes/audit_tainted_runs.py` (now retired).
+diff-snapshots osc, cat-from-raw-input planet). The audit script used at the
+time was local working material, never committed, and is gone.
 
 ---
 
@@ -397,7 +397,7 @@ step, not a sort. The genuinely-unsorted path (osmosis output, hand-edited
 fixtures) is the only scenario exercising the decode-merge path and has no
 configured benchmark dataset.
 
-Optimization arc drafted 2026-04-23 in `notes/sort.md` (retired 2026-07-13;
+Optimization arc drafted 2026-04-23 in a sort plan note (retired 2026-07-13;
 this is its durable record). All measurements plantasjen, NVMe->NVMe on one
 ext4 partition (`/dev/nvme1n1p1`; the `target=hdd` label in `brokkr env` is
 the cargo `target/` dir, not the sort scratch path).
@@ -593,10 +593,9 @@ Full journey: 366.7s → 107.5s (3.4x total improvement).
 
 Durable landing record for the columnar decode prototype and the
 `parallel_classify_phase` / `parallel_classify_accumulate` accumulation
-model. Absorbed from `notes/columnar-integration.md` and
-`notes/hybrid-batching-research.md` on 2026-07-13 before those notes were
-deleted. The current per-command state lives in `performance.md`; this is
-the "how we got here" plus the do-not-reattempt pins.
+model. Absorbed from the columnar-integration and hybrid-batching research
+notes on 2026-07-13 before those notes were deleted. The current
+per-command state lives in `performance.md`; this is the "how we got here" plus the do-not-reattempt pins.
 
 ### Columnar dense-node decode (prototype `e0b0780`)
 
@@ -921,9 +920,8 @@ Five read-path follow-ups from the 2026-07-11 architecture reports
 `PBFHOGG_*` env gates and adjudicated in one overnight A/B run - one binary,
 one commit, gate-off IS the baseline, same-day A/B by construction. Host
 plantasjen (23 GB RAM this run; the reports' "26-30 GB" was swap-inclusive).
-Pre-registered noise floor +/-3%. Working read-out lived in
-`notes/env-gated-readpath-batch.md` (deleted on landing); this is the
-durable record.
+Pre-registered noise floor +/-3%. The working read-out lived in a plan
+note deleted on landing; this is the durable record.
 
 | Item | Gate | Verdict | Key numbers |
 |---|---|---|---|
@@ -991,48 +989,47 @@ durable record.
 
 ## Retired plan docs
 
-These docs lived in `notes/` while their work was active and were
-deleted on landing or on closure. Their durable findings are absorbed
-into the sections above (or the named durable home); the file names are
-preserved here as breadcrumbs for searching old commit messages and PR
-descriptions.
+Plan and research docs live in `notes/` while their work is active and
+are deleted on landing or on closure. Their durable findings are
+absorbed into the sections above (or the named durable home). Git holds
+the deleted files themselves:
+`git log --diff-filter=D --name-only -- notes` lists every retired note
+with the commit that removed it, which is the breadcrumb for searching
+old commit messages. By topic:
 
-- `notes/sort.md` (retired 2026-07-13; the `sort` optimization arc is
-  complete and its durable measurement record is the "Sort" section above).
-- `notes/diff-snapshots-opportunities.md` (Tier 1 items landed; sharded
-  parallel block-pair merge is the canonical implementation).
-- `notes/getid-include-optimization.md` (HeaderWalker + 1-pread probe
-  shape landed at `d263d76`).
-- `notes/scan-optimization-audit.md` (Tier 1 items landed; dense node
-  index Pattern 2, O(1) `check_sorted_and_indexed`/`has_indexdata`
-  probes, and unsorted extract paths remain intentional non-goals).
-- `notes/pipelined-reader-decode-backpressure.md` (admission gate landed
-  `a0a2e3b`, validated same day; findings in "Pipelined-reader
-  decode-admission bound" above; root cause + bound semantics live in
-  `run_pipeline`'s doc comment and `pipeline_metrics.rs`).
-- `notes/env-gated-readpath-batch.md`, `notes/fusion-spec.md`,
-  `notes/pipeline-rebuild-spec.md` (the 2026-07-12 env-gated batch:
-  plan of record plus the fusion and batched-pipeline specs; verdicts
-  in "Env-gated read-path batch" above, fusion kept as ADR-0009, the
-  batched engine and byte knobs reverted).
-- `notes/columnar-integration.md`, `notes/hybrid-batching-research.md`
-  (deleted 2026-07-13; measured findings absorbed into the "Parallel
-  classify" section above).
-- `notes/apply-changes-opportunities.md` (deleted 2026-07-13; all items
-  landed or absorbed into TODO.md's apply-changes entry - 80.9 s planet
-  best, deferred #11 splice-in-place and #13 exact-membership metadata
-  tracked there).
-- `notes/zlib-level-tuning.md` (deleted 2026-07-13; superseded by the
-  write-path plan's item-2 compression matrix; the zstd:1
-  internal-pipeline recommendation lives in README.md and
-  `reference/performance.md`).
-- `notes/streaming-pipeline-composition.md` (deleted 2026-07-13;
-  closed - the valuable composition, inline indexdata in all write
-  paths, already ships; multi-pass commands cannot consume streams).
-- `notes/reverse-geocoding-spec.md` (deleted 2026-07-13; original
+- The `sort` optimization plan (retired 2026-07-13; the arc is complete
+  and its durable measurement record is the "Sort" section above).
+- diff-snapshots opportunities (Tier 1 items landed; sharded parallel
+  block-pair merge is the canonical implementation).
+- getid include-mode optimization (HeaderWalker + 1-pread probe shape
+  landed at `d263d76`).
+- The scan optimization audit (Tier 1 items landed; dense node index
+  Pattern 2, O(1) `check_sorted_and_indexed`/`has_indexdata` probes, and
+  unsorted extract paths remain intentional non-goals).
+- Pipelined-reader decode backpressure (admission gate landed `a0a2e3b`,
+  validated same day; findings in "Pipelined-reader decode-admission
+  bound" above; root cause + bound semantics live in `run_pipeline`'s
+  doc comment and `pipeline_metrics.rs`).
+- The 2026-07-12 env-gated read-path batch: plan of record plus the
+  fusion and batched-pipeline-rebuild specs; verdicts in "Env-gated
+  read-path batch" above, fusion kept as ADR-0009, the batched engine
+  and byte knobs reverted.
+- Columnar integration and hybrid-batching research (deleted 2026-07-13;
+  measured findings absorbed into the "Parallel classify" section above).
+- apply-changes opportunities (deleted 2026-07-13; all items landed or
+  absorbed into TODO.md's apply-changes entry - 80.9 s planet best,
+  deferred #11 splice-in-place and #13 exact-membership metadata tracked
+  there).
+- zlib level tuning (deleted 2026-07-13; superseded by the write-path
+  plan's item-2 compression matrix; the zstd:1 internal-pipeline
+  recommendation lives in README.md and `reference/performance.md`).
+- Streaming-pipeline composition (deleted 2026-07-13; closed - the
+  valuable composition, inline indexdata in all write paths, already
+  ships; multi-pass commands cannot consume streams).
+- The reverse-geocoding spec (deleted 2026-07-13; original
   implementation spec for `build-geocode-index` - the shipped
-  implementation deviated, format truth is
-  `src/geocode_index/format.rs` doc comments).
-- `notes/spatial-index-in-pbf.md`, `notes/way-blob-bbox-speculation.md`
-  (deleted 2026-07-13; speculative research, no measurements;
-  conclusions retained in TODO.md's research / stretch list).
+  implementation deviated, format truth is `src/geocode_index/format.rs`
+  doc comments).
+- Spatial index in PBF and way-blob bbox speculation (deleted
+  2026-07-13; speculative research, no measurements; conclusions
+  retained in TODO.md's research / stretch list).

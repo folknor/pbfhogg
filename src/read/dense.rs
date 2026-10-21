@@ -252,7 +252,7 @@ impl<'a> Iterator for DenseNodeIter<'a> {
 /// changing to `Option` would add overhead to the tightest loop in the library.
 /// The -1 sentinel is instead normalized at write/conversion boundaries
 /// (see `dense_node_metadata`, `dense_node_raw_metadata`, sort's
-/// `read_dense_node`, and `stream_merge::convert_node`). Non-dense elements
+/// `read_dense_node`, and `osc::merge_join::convert_node`). Non-dense elements
 /// normalize -1 → None directly in `WireInfo::parse`. See CORRECTNESS.md.
 #[derive(Clone, Debug)]
 pub struct DenseNodeInfo<'a> {

@@ -1,14 +1,10 @@
 //! CLI-driven invariant tests for `pbfhogg apply-changes`.
 //!
-//! Replaces `tests/apply_changes_invariants.rs` (split out of
-//! priority 1; sibling to `cli_apply_changes.rs`). Pins specific
-//! correctness invariants that the descriptor-first streaming
-//! rewrite documented in `notes/apply-changes-opportunities.md`
-//! must preserve byte-for-byte. These tests MUST pass on current
-//! main before the rewrite starts and must still pass after.
-//!
-//! Each test pins down a specific invariant from the plan doc's
-//! "Correctness invariants" section:
+//! Sibling to `cli_apply_changes.rs`; replaces the removed
+//! library-API `apply_changes_invariants.rs` test. Pins correctness
+//! invariants the descriptor-first streaming rewrite had to preserve
+//! byte-for-byte, and any later rewrite must still preserve. Each
+//! test pins one invariant:
 //!
 //! - `cursor_rule_*`: Rewrite slots advance UpsertCursors past their blob's ID range; Passthrough/FalsePositive slots do NOT.
 //! - `empty_base_pbf_*`: `last_type == None` forever; trailing creates must flush all three kinds.
@@ -25,14 +21,12 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::too_many_lines)]
 
-mod common;
-
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use common::cli::{CliInvoker, CliOutput};
-use common::{
+use crate::common::cli::{CliInvoker, CliOutput};
+use crate::common::{
     TestNode, TestWay, assert_elements_equivalent, generate_nodes, generate_ways,
     read_all_elements_with_coords as read_all_elements, write_multi_block_test_pbf,
     write_test_pbf_sorted,

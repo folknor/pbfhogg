@@ -30,13 +30,10 @@
 //! [`DEVIATIONS.md`]: ../../DEVIATIONS.md
 //! [`decisions/0002-negative-ids-rejected-project-wide.md`]: ../../decisions/0002-negative-ids-rejected-project-wide.md
 
-#[path = "common/mod.rs"]
-mod common;
-
 use std::path::Path;
 
-use common::cli::CliInvoker;
-use common::{
+use crate::common::cli::CliInvoker;
+use crate::common::{
     generate_nodes_with_negatives, generate_relations_with_negatives, generate_ways_with_negatives,
     node_ids_id_only, read_all_elements_id_only, read_normalized, relation_ids_id_only,
     way_ids_id_only, write_test_pbf, write_test_pbf_sorted,
@@ -189,7 +186,7 @@ fn tags_filter_handles_mixed_sign_ids() {
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
-    use common::{TestRelation, TestWay};
+    use crate::common::{TestRelation, TestWay};
     let nodes = generate_nodes_with_negatives(N_NEG, N_POS);
     let mut ways: Vec<TestWay> = generate_ways_with_negatives(N_NEG, N_POS, 3);
     for w in &mut ways {

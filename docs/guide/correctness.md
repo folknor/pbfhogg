@@ -75,9 +75,9 @@ historical version.
    (~8 billion iterations for planet). Changing these to `Option` would add per-element
    overhead on a path where every nanosecond matters. Instead, the four conversion
    sites that bridge dense reads to writes guard against -1:
-   - `dense_node_metadata` and `dense_node_raw_metadata` in `src/commands/mod.rs`
-   - `read_dense_node` in `src/commands/sort.rs`
-   - `convert_node` in `src/commands/stream_merge.rs`
+   - `dense_node_metadata`, `dense_node_raw_metadata` and `read_dense_node` in
+     `src/owned.rs`
+   - `convert_node` in `src/osc/merge_join.rs`
 
 **Consequence for library users:** Code consuming the public `DenseNodeInfo` API
 directly (not through pbfhogg's commands) will still observe raw `-1` values from
@@ -125,4 +125,4 @@ writer meant.
 silent `(0, 0)` fill; pass `--ignore-missing-nodes` to accept the placeholders.
 That filler is still `(0, 0)`, but it is opt-in, counted, and gated by a
 post-write check, so it is a deliberate output rather than an ambiguous
-sentinel. See [Deviations](./deviations).
+sentinel. See [Deviations](/cli/deviations).

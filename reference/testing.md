@@ -17,14 +17,69 @@ Tests go where they couple least.
   only the stable allowlist below.
 - **CLI integration tests** in `tests/cli_*.rs` - drive the
   `pbfhogg` binary via `CliInvoker`; internal modules are invisible.
-- **Fault-injection tests** in `tests/fault_*.rs` (one per binary) -
-  own their `PANIC_AT_*` hooks per-process. Partially coupled to
-  internal hook surfaces by design.
+- **Fault-injection tests** in `tests/fault_*.rs` - the ones that arm
+  a process-global static hook each own a process (see "Test
+  binaries"). Partially coupled to internal hook surfaces by design.
 - **External cross-validation** in `brokkr verify`
   (`verify_<command>.rs` modules in brokkr) - compares pbfhogg
   output against osmium / osmosis / osmconvert.
 
 Placement and tiering are independent axes.
+
+## Test binaries
+
+Both crates set `autotests = false`; every integration-test target is
+declared in its `Cargo.toml`. One binary per file made every check
+sweep link and start one harness per file, and a focused `brokkr test
+NAME` list each harness in turn to find one test.
+
+- **`tests/all.rs`** mounts every integration test file that can share
+  a process as a module, and mounts `tests/common/` once. A test's full
+  libtest name is `<file>::<path in file>` (`cli_sort::platform::...`),
+  so tier filters (`tier2::`, `platform::`, ...) and leaf-name filters
+  keep matching; a brokkr profile that named a test *target*
+  (`tests = ["cli_sort"]`) now names `all` plus an `only` filter on
+  the module (`cli_sort::`). Files gated on a feature carry the
+  `#[cfg]` on their `mod` line in `all.rs`, so `all.rs` alone shows
+  what drops out of the `minimal` sweep.
+- **A new test file not declared in `tests/all.rs` (or as its own
+  `[[test]]`) is never compiled, and no test or coverage audit
+  reports it.** Add the `mod` line with the file.
+- **A test that must own its process** gets its own `[[test]]` target
+  in `Cargo.toml` with the reason written beside it. Today that is the
+  static-hook fault tests: `fault_parallel_writer`,
+  `fault_parallel_gzip`, `fault_parallel_gzip_flush`,
+  `fault_diff_parallel`, `fault_derive_parallel`, `fault_altw_stage3`,
+  `fault_geocode_pass3`, `fault_extract_grid`, `fault_uring_writer` and
+  `fault_read_pipeline`, one test each, each with `required-features`
+  so sweeps without `test-hooks` skip them instead of linking empty
+  harnesses. `fault_apply_changes` uses a per-instance hook and is a
+  module of `all`.
+- **What the shared binary shares.** Every module of `all` runs
+  concurrently in one process with: the global rayon pool; the glibc
+  arena cap the library's commands set (`debug::cap_malloc_arenas`);
+  `RLIMIT_NOFILE`, which altw's external backend raises; the
+  `geocode_index` reader's `ADMIN_PIP_CALLS` counter, one for every
+  `Reader` though `admin_pip_calls(&self)` reads like a per-reader
+  count; and every `test-hooks` static, which nothing in `all` may arm.
+  A test that needs any of this to itself, or arms a static hook,
+  takes a target of its own.
+- **Why the static-hook tests are not one lock-serialized binary.**
+  Mutual exclusion inside one process is only equivalent to a process
+  each if every thread that can read a hook has exited before the next
+  test arms one. `write::parallel_writer` returns on the first
+  panicked pool worker and detaches the rest, which keep draining
+  their queues and touching the hook counter; and the check watchdog
+  ages a test from its libtest start, so tests queued on a lock spend
+  their 20 s budget waiting. Per-instance hooks (one fault plan carried
+  in each command's options) would let these tests fold into `all`
+  with no lock at all.
+
+The `pbfhogg-cli` crate's own tests are `cli/tests/cli.rs`, declared as
+its `cli` target; the `pbfhogg` bin sets `test = false` (no inline
+tests). No check sweep in `brokkr.toml` selects `pbfhogg-cli` - the
+sweeps test the root package and only *build* the CLI - so that target
+runs only under an explicit `-p pbfhogg-cli`.
 
 ## Validation tiers
 
@@ -103,8 +158,8 @@ Each `tests/cli_<command>.rs` splits intent inside the file:
 - **`platform`**: `--direct-io`, `--io-uring`, MEMLOCK, feature
   surface - keep out of tier 1 unless cheap and reliable on the
   reference host.
-- **`serial`**: requires `--test-threads=1` or static
-  fault-injection state.
+- **`serial`**: requires `--test-threads=1`. Static fault-injection
+  state is not a `serial` case: it takes its own `[[test]]` target.
 
 `tests/cli_sort.rs` is the canonical template for new `cli_*.rs`
 files.
@@ -125,19 +180,21 @@ Lives in `brokkr verify`, not the in-tree test crate:
 
 **Two in-tree tests are migration candidates:**
 
-1. `tests/merge.rs::merge_cross_validate_osmium` - real Denmark
-   data, same inputs as `brokkr verify merge`. Retire once
-   `verify_merge.rs` handles the version-vs-unconditional-delete
-   tolerance that `tests/merge.rs:1271-1295` does explicitly
-   (osmium uses version-based deletes; pbfhogg/osmosis/osmconvert
-   delete unconditionally, so osmium-only elements that fall in
-   the OSC delete set are not real failures).
+1. `tests/cli_apply_changes.rs::merge_cross_validate_osmium` - real
+   Denmark data, same inputs as `brokkr verify merge`. Its
+   delete-set carve-out (osmium uses version-based deletes;
+   pbfhogg/osmosis/osmconvert delete unconditionally, so
+   osmium-only elements that fall in the OSC delete set are not
+   real failures) is also what brokkr's `verify_merge.rs` does, so
+   nothing blocks retiring it.
 2. `tests/cli_sort.rs::sort_cross_validate_osmium` - handcrafted
-   overlapping-blob fixture; `brokkr verify sort` runs against
-   real data only and doesn't exercise the streaming sweep merge's
-   overlap-run path. Migration requires `brokkr verify <command>
-   --input <path>` plus an `examples/overlapping_fixture.rs`
-   builder, then move the comparison into `verify_sort.rs`.
+   overlapping-blob fixture; `brokkr verify sort` on a configured
+   dataset runs against real data only and doesn't exercise the
+   streaming sweep merge's overlap-run path. `brokkr verify
+   <command> --input <path>` already accepts a handcrafted PBF; the
+   missing piece is an overlapping-fixture builder under
+   `examples/`, after which the comparison moves to
+   `brokkr verify sort --input`.
 
 **Escape hatch.** A contributor mid-PR can write an osmium check
 next to a fixture for the duration of that PR as
@@ -148,15 +205,17 @@ exception, not a tier - should not survive across many PRs.
 ## Conventions
 
 - **`test-hooks` Cargo feature.** Gates fault-injection hooks across
-  every parallel pipeline. Off by default; enabled under
-  `--all-features` (which `brokkr check` uses). Release builds
-  never see the hook code.
+  every parallel pipeline. Off by default; enabled by the `all`
+  check sweep's feature list in `brokkr.toml`, and required by the
+  `fault_*` test targets. Release builds never see the hook code.
 - **Two hook shapes.** Per-instance field on a public config struct
-  (race-free with sibling tests) vs. process-global static atomics.
-  Picker: per-instance when the pipeline has a public config struct
-  on its entry path, static atomics otherwise. Per-binary
-  isolation via the fault-injection split makes static-atomic hooks
-  race-free without `#[ignore]` or `--test-threads=1`.
+  (race-free with sibling tests, so the test lives in `all`) vs.
+  process-global static atomics. Picker: per-instance when the
+  pipeline has a public config struct on its entry path, static
+  atomics otherwise. A static-atomic hook's test gets its own
+  `[[test]]` target holding that one test (see "Test binaries"),
+  which makes it race-free without `#[ignore]` or
+  `--test-threads=1`.
 - **CliInvoker for CLI-driven tests.** `tests/common/cli.rs`. Every
   new `tests/cli_*.rs` goes through it. 60 s default wall-clock
   timeout, override via `.timeout(Duration)`. Platform-skip
@@ -181,9 +240,9 @@ exception, not a tier - should not survive across many PRs.
   case-specific reproducers.
 - **Hook consolidation (explicitly don't).** Static-atomic submodules
   across parallel_writer / parallel_gzip / uring_writer /
-  diff-parallel / derive-parallel / altw-stage3 / geocode-pass3
-  must stay per-module. Per-binary isolation depends on each binary
-  owning its own copy of the atomics.
+  diff-parallel / derive-parallel / altw-stage3 / geocode-pass3 /
+  read-pipeline / region-grid must stay per-module. Per-target
+  isolation depends on each fault binary arming only its own atomics.
 - **Policy proposal (not-yet-adopted).** Every new parallel pipeline
   should ship with three tests: a worker-panic test, a `-j N` vs
   `-j 2` parity test, and a scratch-leak test. Worth considering as

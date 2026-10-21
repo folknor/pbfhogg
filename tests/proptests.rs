@@ -20,14 +20,11 @@
 //! property-coverage benefit comes from 64 × 4 = 256 distinct shapes
 //! per `brokkr check` invocation.
 
-#[path = "common/mod.rs"]
-mod common;
-
 use std::io::Cursor;
 
 use std::collections::BTreeMap;
 
-use common::{
+use crate::common::{
     generate_nodes, generate_nodes_with_negatives, generate_relations, generate_ways,
     read_normalized, write_test_pbf_sorted,
 };
@@ -130,7 +127,7 @@ proptest! {
 
         // Build a lookup by id so we don't depend on internal sort
         // order matching input vector order.
-        let by_id: BTreeMap<i64, &common::NormalizedNode> =
+        let by_id: BTreeMap<i64, &crate::common::NormalizedNode> =
             n.nodes.iter().map(|x| (x.id, x)).collect();
         for input in &input_nodes {
             let output = by_id
@@ -169,7 +166,7 @@ proptest! {
         let n = read_normalized(&path);
         prop_assert_eq!(n.ways.len(), way_count);
 
-        let by_id: BTreeMap<i64, &common::NormalizedWay> =
+        let by_id: BTreeMap<i64, &crate::common::NormalizedWay> =
             n.ways.iter().map(|x| (x.id, x)).collect();
         for input in &ways {
             let output = by_id
@@ -202,7 +199,7 @@ proptest! {
         let n = read_normalized(&path);
         prop_assert_eq!(n.relations.len(), rel_count);
 
-        let by_id: BTreeMap<i64, &common::NormalizedRelation> =
+        let by_id: BTreeMap<i64, &crate::common::NormalizedRelation> =
             n.relations.iter().map(|x| (x.id, x)).collect();
         for input in &relations {
             let output = by_id
@@ -248,7 +245,7 @@ proptest! {
 
         let n = read_normalized(&path);
         prop_assert_eq!(n.nodes.len(), n_neg + n_pos);
-        let by_id: BTreeMap<i64, &common::NormalizedNode> =
+        let by_id: BTreeMap<i64, &crate::common::NormalizedNode> =
             n.nodes.iter().map(|x| (x.id, x)).collect();
         for input in &input_nodes {
             let output = by_id

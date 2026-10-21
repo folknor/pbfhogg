@@ -860,26 +860,21 @@ Reported by: CLI and plumbing.
 
 Reported by: CLI and plumbing.
 
-## BUG-059 - `read_paths.rs` arms a process-global decode hook while sibling tests run
+## BUG-059 - The decode hook's spin has no timeout and `reset()` cannot free a parked decode
 
-`admission_high_water_bounded_under_slow_first_decode` stores
-`BLOCK_DECODE_SEQ = 1` in `src/read/pipeline.rs` `test_hooks`; every pipelined
-read in the process consults it. `read_paths.rs` holds about 30 tests that
-libtest runs in parallel, most using the pipelined reader. A sibling reaching
-seq 1 while armed parks in `maybe_block_decode`; if this test fails its 5 s
-assertion first it panics without `reset()`, and the sibling spins forever
-(the 20 s watchdog then reports a hang in an unrelated test).
-`REORDER_FILLED_HIGH_WATER` is a CAS-max fed by every concurrent pipeline, so
-`<= 2` can fail because of a sibling, and the "later decode reached the
-reorder buffer" wait can be satisfied by one. `maybe_block_decode` spins on a
-`Relaxed` flag with `sleep(1ms)` and no timeout.
-
-The fault-injection split moved every other hook user into a one-test
-`fault_*.rs` binary; this one was left behind. Fix: move it to
-`tests/fault_read_pipeline.rs`, give the spin a bounded wait that panics with
-a named message, and see HYG-062 for removing the globals. Enforce with a
-check that `test_hooks` is used only in `tests/fault_*.rs` files and each
-holds one `#[test]`.
+Partly resolved: `admission_high_water_bounded_under_slow_first_decode` now
+lives alone in `tests/fault_read_pipeline.rs`, its own `[[test]]` target, so no
+sibling test shares its process, and it arms the hook through a guard that
+releases, joins and resets on every exit path. What is still open, in
+`src/read/pipeline.rs` `test_hooks`: `maybe_block_decode` spins on a `Relaxed`
+flag with `sleep(1ms)` and no timeout, so a test that fails to release it hangs
+until the check watchdog fires and reports an unrelated-looking futex wait; and
+`reset()` sets the release flag back to false, so it cannot free a decode that
+is already parked. Fix: give the spin a bounded wait that panics with a named
+message, and have `reset()` release before clearing. Enforce "one test per
+static-hook target" with a check that `test_hooks` is used only in
+`tests/fault_*.rs` files and each holds one `#[test]` (HYG-062 covers removing
+the globals).
 
 Reported by: test harness.
 
@@ -888,8 +883,8 @@ Reported by: test harness.
 `geocode_index/reader.rs` keeps `static ADMIN_PIP_CALLS` and exposes
 `Reader::reset_admin_pip_calls(&self)` and `admin_pip_calls(&self)`. The
 `&self` signature says "this reader's count"; the value is every reader's.
-`tests/geocode_index.rs` (many tests, one binary, parallel threads) resets
-and asserts `<= 1` while concurrent query tests increment the same counter: a
+`tests/geocode_index.rs` (many tests, a module of the shared `all` test binary,
+parallel threads) resets and asserts `<= 1` while concurrent query tests increment the same counter: a
 latent flake the signature hides. Fix: a per-`Reader` counter field.
 `PANIC_AT_STREETS_WAY_IDX` in `pass3.rs` is the same pattern.
 
@@ -986,3 +981,26 @@ into `None` via `.ok()?`, which callers treat as a skip, so a builder
 regression on Denmark reads as "data missing".
 
 Reported by: test harness.
+
+## BUG-066 - `parallel_writer` returns on the first panicked join and detaches the remaining workers
+
+`write::parallel_writer` stops joining as soon as one pool worker's join reports
+a panic and returns the error, leaving the remaining pool workers running. They
+keep writing to the output and touching `POOL_OP_COUNT` after `merge()` has
+returned, so the caller sees a failed run while threads are still mutating the
+destination (and, under `test-hooks`, the process-global fault counter). This is
+why `fault_parallel_writer` cannot share a binary with other tests behind a
+lock. Fix: join every worker before returning, surfacing the first error, or
+signal the workers to stop and wait for them.
+
+Reported by: test harness, write path.
+
+## BUG-067 - `eprintln!` panics when stderr's reader goes away
+
+`eprintln!` panics on a write error, so `pbfhogg sort ... 2>&1 | head` exits 101
+once `head` closes the pipe. The stdout half of this class is fixed (the CLI
+writes through `cli/src/output.rs`, where EPIPE becomes a silent exit 0); the
+library still calls `eprintln!` from about 40 files (see HYG-019). The audit of
+the library's stderr use for library consumers is tracked in bz as pbfhogg#1.
+
+Reported by: CLI and plumbing.

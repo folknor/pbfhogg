@@ -98,8 +98,11 @@ struct Pass2Counters {
 /// whether the preceding phase left the headers in page cache. Measured
 /// 2026-07-14 at north-america: ~1 s when the relation-member scan walked
 /// just before it, 23.0 s when it did not. Do not try to remove the
-/// redundant walks on the strength of their durations - see notes/altw.md
-/// P4, where that was measured and does not pay.
+/// redundant walks on the strength of their durations: unifying them was
+/// built twice and reverted (2026-07-14). The saving equals the baseline's
+/// cold-walk penalty only, near zero where the store fits page cache;
+/// consolidating the other walks but not this one left it walking cold after
+/// pass 1's eviction (+3.8 %). See reference/blob-density.md.
 #[hotpath::measure]
 fn build_schedule(
     input: &Path,

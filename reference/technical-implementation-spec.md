@@ -95,12 +95,12 @@ Specifications are saved to the ./notes folder.
    load-bearing work. A survey that prices a hot path traces the premise
    through the actual caller ordering at the priced call site - what the
    structure admits is not what the callers do. For optimization work the
-   survey includes the failure history: `notes/altw-optimization-history.md`
-   and the per-command optimization notes (the "Don't re-attempt" /
-   "Failed attempts" sections in `notes/*.md`) are the ledger of every tried
-   and rejected approach, with the measured numbers and physical floors that
-   sank them; a spec that re-proposes a logged failure without addressing
-   why it failed is refuted by its own survey. The survey also checks whether
+   survey includes the failure history: `reference/performance-history.md`
+   and whatever optimization notes are live in `notes/` at the time (their
+   "Don't re-attempt" / "Failed attempts" sections) are the ledger of every
+   tried and rejected approach, with the measured numbers and physical
+   floors that sank them; a spec that re-proposes a logged failure without
+   addressing why it failed is refuted by its own survey. The survey also checks whether
    the behavior the spec touches is already governed by a standing decision:
    `decisions/*` (the ADRs recording why pbfhogg is shaped as it is - e.g.
    negative IDs rejected project-wide, debug-assert invariants), `CORRECTNESS.md`
@@ -122,7 +122,7 @@ Specifications are saved to the ./notes folder.
 10. **The standing references.** Every spec MUST cite, by path: this document
     (`reference/technical-implementation-spec.md`) as the contract it is
     written against, AND the document the spec was spawned from (the item's
-    source naming the problem - e.g. the owning `notes/*.md` writeup),
+    source naming the problem - e.g. the owning writeup in `notes/`),
     if it exists.
     A spec that adds, moves, or reorganizes tests also cites
     `reference/testing.md`, the placement-and-tier contract those bricks must

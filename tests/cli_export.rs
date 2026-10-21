@@ -1,13 +1,10 @@
 //! CLI coverage for streaming GeoJSON export.
 
-#![cfg(feature = "commands")]
 #![allow(clippy::unwrap_used)]
-
-mod common;
 
 use std::path::Path;
 
-use common::cli::CliInvoker;
+use crate::common::cli::CliInvoker;
 use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
 use tempfile::TempDir;

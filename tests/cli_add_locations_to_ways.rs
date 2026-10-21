@@ -1,6 +1,6 @@
 //! CLI-driven integration tests for `pbfhogg add-locations-to-ways`.
 //!
-//! Replaces the library-API `tests/add_locations_to_ways.rs`. Fixture
+//! Replaces the removed library-API `add_locations_to_ways.rs` test. Fixture
 //! PBFs are built with the stable-allowlist writers (including
 //! `common::write_indexed_pbf`, which wraps `PbfWriter::to_path` for
 //! indexdata-bearing inputs); `add-locations-to-ways` runs through
@@ -13,19 +13,16 @@
 //! ALTW is the motivating example for the CLI-decoupled test layout
 //! (`reference/testing.md` > "Test placement"): the sparse / external /
 //! auto index backends are internal types that change shape during
-//! the join rewrite documented in `notes/altw-external.md`. This
-//! file's only knob into "which
-//! backend" is the `--index-type` CLI flag, so backend renames or
+//! ongoing external-join optimization work. This file's only knob
+//! into "which backend" is the `--index-type` CLI flag, so backend renames or
 //! splits don't ripple in.
 
 #![allow(clippy::unwrap_used)]
 
-mod common;
-
 use std::path::Path;
 
-use common::cli::{CliInvoker, CliOutput};
-use common::{
+use crate::common::cli::{CliInvoker, CliOutput};
+use crate::common::{
     TestMember, TestNode, TestRelation, TestWay, assert_elements_equivalent, generate_nodes,
     generate_ways, write_indexed_pbf, write_multi_block_test_pbf, write_test_pbf,
     write_test_pbf_non_indexed,
@@ -816,7 +813,7 @@ fn backend_parity_sparse_external_auto() {
     assert_elements_equivalent(&out_external, &out_auto);
 }
 
-/// Scale-aware auto routing (notes/altw.md P1): sorted + indexed no
+/// Scale-aware auto routing: sorted + indexed no
 /// longer implies external. A small input's estimated node store sits
 /// far below any real host's page-cache budget, so auto must route it
 /// to sparse and say why on stderr. Reads `/proc/meminfo`, hence

@@ -10,7 +10,7 @@
 //! Under the `test-hooks` feature a process-global
 //! `region_grid::FORCE_LINEAR` makes `RegionGrid::build` return `None`, so the
 //! at/above-threshold config that would normally build a grid instead runs the
-//! verbatim linear scan. Each `tests/fault_*.rs` compiles to its own binary,
+//! verbatim linear scan. This file is its own `[[test]]` target in `Cargo.toml`,
 //! so the static is per-process; the single test below toggles it serially.
 
 #![allow(clippy::unwrap_used)]

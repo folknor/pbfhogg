@@ -870,12 +870,8 @@ fn degrade_decode_path(
          per-kind blob schedules.",
     )?;
 
-    // Cap glibc arenas to prevent cross-thread alloc/free fragmentation in
-    // the per-blob worker pool. Same precedent as `cat --clean` and `repack`.
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    unsafe {
-        libc::mallopt(libc::M_ARENA_MAX, 2);
-    }
+    // Per-blob worker pool; same precedent as `cat --clean` and `repack`.
+    crate::debug::cap_malloc_arenas();
 
     let header = {
         let reader = ElementReader::open(input, direct_io)?;

@@ -56,6 +56,12 @@ readme = "LIBRARY.md"
 rust-version = "1.99"
 keywords = ["osm", "openstreetmap", "pbf", "protobuf", "gis"]
 categories = ["parser-implementations", "encoding", "science::geo"]
+# Integration tests are declared below rather than discovered: one binary
+# per file made every check sweep link ~50 harnesses and a focused
+# `brokkr test` list every one of them to find one test. A file in tests/
+# that is neither a module of tests/all.rs nor a [[test]] below is never
+# compiled, and nothing reports it.
+autotests = false
 
 [features]
 default = ["commands"]
@@ -68,7 +74,8 @@ linux-io-uring = ["dep:io-uring"]
 # Test-only fault-injection hooks for the parallel pipelines (worker
 # panic / IO error at a named blob seq). Release builds never enable
 # this; the hook fields and checks compile out entirely. Turned on by
-# `brokkr check` via `--all-features`.
+# the `all` check sweep's feature list in brokkr.toml, and required by the
+# fault_* test targets below.
 test-hooks = []
 
 [dependencies]
@@ -79,7 +86,7 @@ memmap2 = "0.9.11"
 rayon = "1.12.0"
 rustc-hash = "2.1.3"
 zstd = "0.14.0"
-hotpath = "0.27.0"
+hotpath = "0.28.7"
 quick-xml = "0.42.0"
 # float_roundtrip: serde_json's default float parse is best-effort and can
 # land 1 ULP off the correctly-rounded value std::str::FromStr produces.
@@ -96,6 +103,85 @@ libc = "0.2.186"
 [dev-dependencies]
 tempfile = "3.27.0"
 proptest = "1"
+
+# Every integration test that can share a process, as modules of one binary.
+[[test]]
+name = "all"
+path = "tests/all.rs"
+
+# The fault-injection tests below each arm a process-global static hook in
+# the library's `test-hooks` code. An armed static fires in any concurrent
+# test of the same process that reaches that code path, so each keeps a
+# process to itself; one test per target. A shared binary serialized by a
+# lock is not equivalent while a pipeline can return with hook-reading
+# threads still alive (parallel_writer detaches its remaining pool workers
+# after the first panicked join) and while queueing on a lock ages the
+# check watchdog's per-test clock. `required-features` keeps them out of
+# sweeps without `test-hooks`, where they would be empty harnesses.
+
+# PANIC_AT_POOL_OP_COUNT in write::parallel_writer, reached by every
+# parallel-writer output.
+[[test]]
+name = "fault_parallel_writer"
+path = "tests/fault_parallel_writer.rs"
+required-features = ["test-hooks"]
+
+# PANIC_AT_POOL_OP_COUNT in write::parallel_gzip, shared with the flush
+# variant below, so the two cannot share a binary either.
+[[test]]
+name = "fault_parallel_gzip"
+path = "tests/fault_parallel_gzip.rs"
+required-features = ["test-hooks"]
+
+[[test]]
+name = "fault_parallel_gzip_flush"
+path = "tests/fault_parallel_gzip_flush.rs"
+required-features = ["test-hooks"]
+
+# PANIC_AT_SHARD_IDX in diff::parallel.
+[[test]]
+name = "fault_diff_parallel"
+path = "tests/fault_diff_parallel.rs"
+required-features = ["test-hooks"]
+
+# PANIC_AT_SHARD_IDX in diff::derive_parallel.
+[[test]]
+name = "fault_derive_parallel"
+path = "tests/fault_derive_parallel.rs"
+required-features = ["test-hooks"]
+
+# PANIC_AT_BUCKET_IDX in altw external stage 3.
+[[test]]
+name = "fault_altw_stage3"
+path = "tests/fault_altw_stage3.rs"
+required-features = ["test-hooks"]
+
+# PANIC_AT_STREETS_WAY_IDX in the geocode builder's pass 3; the builder
+# itself needs `commands`.
+[[test]]
+name = "fault_geocode_pass3"
+path = "tests/fault_geocode_pass3.rs"
+required-features = ["test-hooks", "commands"]
+
+# FORCE_LINEAR in read::region_grid, which silently switches every
+# concurrent extract to the linear scan; extract needs `commands`.
+[[test]]
+name = "fault_extract_grid"
+path = "tests/fault_extract_grid.rs"
+required-features = ["test-hooks", "commands"]
+
+# PANIC_AT_DISPATCH_COUNT in write::uring_writer.
+[[test]]
+name = "fault_uring_writer"
+path = "tests/fault_uring_writer.rs"
+required-features = ["test-hooks", "linux-io-uring"]
+
+# BLOCK_DECODE_SEQ and the reorder high-water marks in read::pipeline,
+# consulted by every pipelined read in the process.
+[[test]]
+name = "fault_read_pipeline"
+path = "tests/fault_read_pipeline.rs"
+required-features = ["test-hooks"]
 
 [profile.release]
 opt-level = 3

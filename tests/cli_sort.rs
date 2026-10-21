@@ -9,12 +9,10 @@
 //! other internal module - a rewrite of `src/commands/sort/` cannot
 //! break these tests by type changes alone.
 
-mod common;
-
 use std::path::Path;
 
-use common::cli::CliInvoker;
-use common::{
+use crate::common::cli::CliInvoker;
+use crate::common::{
     PbfContentsWithCoords, TestNode, TestRelation, TestWay, assert_indexed, assert_non_indexed,
     assert_sorted_file, read_all_elements_with_coords, read_header, write_test_pbf,
     write_test_pbf_non_indexed,
@@ -499,7 +497,7 @@ fn sort_already_sorted() {
         }],
         &[TestRelation {
             id: 20,
-            members: vec![common::TestMember {
+            members: vec![crate::common::TestMember {
                 id: pbfhogg::MemberId::Way(10),
                 role: "outer",
             }],
@@ -541,8 +539,9 @@ fn sort_already_sorted() {
 /// `brokkr verify sort` already covers the real-dataset case;
 /// this fixture is the pathological overlap-run input that
 /// real Denmark data does not exercise. Migration target: when
-/// `brokkr verify sort` grows `--input <path>`, build the fixture
-/// in `examples/overlapping_fixture.rs` and retire this test.
+/// `brokkr verify sort --input <path>` already exists; once a fixture
+/// builder under `examples/` writes this fixture, move the comparison
+/// there and retire this test.
 /// Skip-on-missing-osmium kept so the test still passes if
 /// invoked via `--include-ignored` on a host without osmium.
 #[test]
@@ -930,7 +929,7 @@ fn sort_declared_sorted_indexed_input_skips_payload_verification() {
     let input = dir.path().join("declared_sorted.osm.pbf");
     let output = dir.path().join("sorted.osm.pbf");
 
-    common::write_test_pbf_sorted(
+    crate::common::write_test_pbf_sorted(
         &input,
         &[
             TestNode {
@@ -1017,7 +1016,7 @@ fn sort_sorted_non_indexed_input_stays_on_passthrough() {
         }],
         &[TestRelation {
             id: 20,
-            members: vec![common::TestMember {
+            members: vec![crate::common::TestMember {
                 id: pbfhogg::MemberId::Way(10),
                 role: "outer",
             }],
@@ -1060,10 +1059,10 @@ fn sort_sorted_non_indexed_input_stays_on_passthrough() {
 // profile (T11) can target them via `cargo test platform::` without
 // also pulling in the rest of the file. They run today under
 // `--all-features` because that builds both the library AND the CLI
-// binary with the features on; the binary/library feature-parity
-// issue in `notes/testing-cli-feature-parity.md` becomes
-// load-bearing once these are invoked via a profile that requests
-// them specifically.
+// binary with the features on. Each `[[check]]` sweep rebuilds the
+// CLI with the sweep's features (`build_packages` in brokkr.toml), so
+// the binary these tests invoke carries the flags the cfg gate
+// assumes.
 
 #[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
 mod platform {

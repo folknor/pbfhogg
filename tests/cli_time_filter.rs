@@ -1,6 +1,6 @@
 //! CLI-driven integration tests for `pbfhogg time-filter`.
 //!
-//! Replaces the library-API `tests/time_filter.rs`. Fixture PBFs
+//! Replaces the removed library-API `time_filter.rs` test. Fixture PBFs
 //! are built with the stable-allowlist writer helpers; the
 //! `time-filter` command runs via the compiled `pbfhogg` binary
 //! through `CliInvoker`; output is verified by reading the
@@ -12,12 +12,10 @@
 
 #![allow(clippy::unwrap_used)]
 
-mod common;
-
 use std::path::Path;
 
-use common::cli::CliInvoker;
-use common::read_header;
+use crate::common::cli::CliInvoker;
+use crate::common::read_header;
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element, MemberId};

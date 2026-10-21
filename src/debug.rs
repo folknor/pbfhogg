@@ -116,6 +116,39 @@ pub fn set_mmap_threshold(_bytes: i32) -> i32 {
     0
 }
 
+/// Cap glibc's malloc arena count at 2 (`mallopt(M_ARENA_MAX, 2)`).
+///
+/// glibc gives each thread its own arena on contention, up to 8 x cores.
+/// When buffers are allocated on one thread and freed on another (decode
+/// or pread workers allocate, the merge / compression / consumer thread
+/// frees), the freed chunks land back on the allocating thread's arena
+/// and accumulate there as fragmentation instead of being reused or
+/// returned to the OS. At planet scale that is the cross-thread
+/// `PrimitiveBlock` retention pattern (`src/read/pipeline.rs`), and it
+/// shows as anon RSS climbing into the tens of GB. Two arenas force
+/// the worker pool to share free lists, which keeps the peak bounded.
+///
+/// The cost is lock contention on the shared arenas, which hurts
+/// workers that keep allocation-heavy scratch alive across blobs on the
+/// same thread. Call sites document why their worker shape is safe.
+///
+/// The setting is process-global and is never reset: once a command
+/// calls this, every later allocation in the process sees the cap, so a
+/// library caller that runs several commands in one process inherits it.
+/// Call it once, early, before the worker pool spins up. On non-glibc /
+/// non-Linux this is a no-op.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn cap_malloc_arenas() {
+    // SAFETY: mallopt is glibc and safe to call from any thread; the
+    // return value only reports an invalid parameter, which 2 is not.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub fn cap_malloc_arenas() {}
+
 /// Read cumulative (minor, major) page faults from `/proc/self/stat`.
 /// Returns `(minflt, majflt)`. Returns `(0, 0)` on failure or non-Linux.
 #[cfg(target_os = "linux")]

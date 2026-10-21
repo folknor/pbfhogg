@@ -1,10 +1,10 @@
 //! CLI-driven integration tests for `pbfhogg diff --format osc`
 //! (the derive-changes operation).
 //!
-//! Replaces `tests/derive_changes.rs`. `derive_changes.rs` lives
-//! under `pbfhogg::diff::derive::derive_changes` but is logically
-//! tied to the apply-changes pipeline because most tests do a
-//! derive->apply roundtrip. The CLI surface is `pbfhogg diff
+//! Replaces the removed library-API `derive_changes.rs` test. The
+//! operation lives under `pbfhogg::diff::derive::derive_changes` but
+//! is logically tied to the apply-changes pipeline because most
+//! tests do a derive->apply roundtrip. The CLI surface is `pbfhogg diff
 //! --format osc -o <osc> [--increment-version] [--update-timestamp]
 //! [-j N] <old> <new>`.
 //!
@@ -15,13 +15,11 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::too_many_lines)]
 
-mod common;
-
 use std::io::Read;
 use std::path::Path;
 
-use common::cli::{CliInvoker, CliOutput};
-use common::{
+use crate::common::cli::{CliInvoker, CliOutput};
+use crate::common::{
     TestMember, TestNode, TestRelation, TestWay, assert_elements_equivalent, generate_nodes,
     generate_ways, node_ids_with_coords as node_ids,
     read_all_elements_with_coords as read_all_elements, relation_ids_with_coords as relation_ids,

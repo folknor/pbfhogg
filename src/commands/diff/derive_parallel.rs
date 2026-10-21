@@ -1001,14 +1001,13 @@ pub(crate) fn derive_changes_parallel(
         // All successful: concatenate this phase's per-shard outputs into
         // the three outer temp files in shard order, then delete the
         // per-shard files.
-        for shard_out in outputs {
-            append_and_cleanup(&mut outer_creates_w, &shard_out.creates_path)?;
-            append_and_cleanup(&mut outer_modifies_w, &shard_out.modifies_path)?;
-            append_and_cleanup(&mut outer_deletes_w, &shard_out.deletes_path)?;
-            totals.creates += shard_out.create_count;
-            totals.modifies += shard_out.modify_count;
-            totals.deletes += shard_out.delete_count;
-        }
+        append_shard_outputs(
+            &mut outer_creates_w,
+            &mut outer_modifies_w,
+            &mut outer_deletes_w,
+            outputs,
+            &mut totals,
+        )?;
 
         crate::debug::emit_marker(&end_marker);
     }
@@ -1053,11 +1052,50 @@ pub(crate) fn derive_changes_parallel(
     Ok(totals)
 }
 
+/// Concatenate every shard's three scratch files onto the outer temp files in
+/// shard order, folding each shard's counts into `totals`.
+///
+/// A failed append stops the emission, but every remaining scratch file is
+/// still removed before the error returns. Returning on the first error left
+/// the rest of the shards' files (three per shard) in the scratch directory.
+fn append_shard_outputs(
+    creates_w: &mut BufWriter<File>,
+    modifies_w: &mut BufWriter<File>,
+    deletes_w: &mut BufWriter<File>,
+    outputs: Vec<ShardOutput>,
+    totals: &mut DeriveChangesStats,
+) -> Result<()> {
+    let mut first_err = None;
+    for shard_out in outputs {
+        if first_err.is_some() {
+            drop(std::fs::remove_file(&shard_out.creates_path));
+            drop(std::fs::remove_file(&shard_out.modifies_path));
+            drop(std::fs::remove_file(&shard_out.deletes_path));
+            continue;
+        }
+        // `and` takes its argument eagerly, so all three calls run and each
+        // removes its own source file even when an earlier copy failed; the
+        // first error is the one kept.
+        let appended = append_and_cleanup(creates_w, &shard_out.creates_path)
+            .and(append_and_cleanup(modifies_w, &shard_out.modifies_path))
+            .and(append_and_cleanup(deletes_w, &shard_out.deletes_path));
+        if let Err(e) = appended {
+            first_err = Some(e);
+            continue;
+        }
+        totals.creates += shard_out.create_count;
+        totals.modifies += shard_out.modify_count;
+        totals.deletes += shard_out.delete_count;
+    }
+    first_err.map_or(Ok(()), Err)
+}
+
+/// Copy a shard's scratch file onto `out` and then remove it - also when the
+/// copy fails, so a failed write does not leave the temp file behind.
 fn append_and_cleanup(out: &mut BufWriter<File>, src: &Path) -> Result<()> {
-    let mut f =
-        File::open(src).map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
-    io::copy(&mut f, out).map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
-    drop(f);
+    let copied = File::open(src).and_then(|mut f| io::copy(&mut f, out));
     drop(std::fs::remove_file(src));
-    Ok(())
+    copied
+        .map(drop)
+        .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))
 }

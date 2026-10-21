@@ -9,19 +9,21 @@
 
 #![allow(clippy::unwrap_used)]
 
-mod common;
-
 use std::path::Path;
 
-use common::cli::CliInvoker;
-use common::{
+use crate::common::cli::CliInvoker;
+use crate::common::{
     TestNode, TestRelation, TestWay, generate_nodes, generate_relations, generate_ways,
     read_header, read_normalized, write_multi_block_test_pbf,
 };
 use pbfhogg::{BlobDecode, BlobReader, Element};
 
 /// Invoke `pbfhogg repack --elements-per-blob N -o <output> <input>`.
-fn run_repack(input: &Path, output: &Path, elements_per_blob: usize) -> common::cli::CliOutput {
+fn run_repack(
+    input: &Path,
+    output: &Path,
+    elements_per_blob: usize,
+) -> crate::common::cli::CliOutput {
     CliInvoker::new()
         .arg("repack")
         .arg(input)

@@ -77,9 +77,9 @@ pub fn time_filter(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<TimeFilterStats> {
-    // History path: keep the legacy mallopt rule (no M_ARENA_MAX=2).
-    // Snapshot path: opts into M_ARENA_MAX=2 internally, post-migration -
-    // see the in-function comment in time_filter_snapshot.
+    // History path: no arena cap. Snapshot path: calls
+    // `cap_malloc_arenas` internally, post-migration - see the
+    // in-function comment in time_filter_snapshot.
     let reader = ElementReader::open(input, direct_io)?;
     require_sorted(reader.header(), input, "Input history PBF")?;
     warn_locations_on_ways_loss(reader.header());
@@ -264,8 +264,7 @@ fn time_filter_snapshot(
     cutoff_timestamp: i64,
     compression: Compression,
 ) -> Result<TimeFilterStats> {
-    // Cap glibc arenas to prevent cross-thread alloc/free fragmentation
-    // in the per-blob worker pool. Same precedent as cat --clean and
+    // Per-blob worker pool; same precedent as cat --clean and
     // check --refs / verify_ids. Post-migration, each blob's BlockBuilder
     // alloc/free cycle is confined to a single worker thread, so the
     // pattern that regressed iter-3 (cross-blob scratch reuse defeated
@@ -273,10 +272,7 @@ fn time_filter_snapshot(
     // -24 % anon on the pre-migration code, but that pre-migration code
     // had thread-local BlockBuilder state surviving across blobs on the
     // same rayon worker. parallel_classify_phase has no such state.
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    unsafe {
-        libc::mallopt(libc::M_ARENA_MAX, 2);
-    }
+    crate::debug::cap_malloc_arenas();
 
     let mut stats = TimeFilterStats {
         versions_seen: 0,

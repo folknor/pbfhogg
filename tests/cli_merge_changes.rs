@@ -1,6 +1,6 @@
 //! CLI-driven integration tests for `pbfhogg merge-changes`.
 //!
-//! Replaces the library-API `tests/merge_changes.rs`. OSC inputs
+//! Replaces the removed library-API `merge_changes.rs` test. OSC inputs
 //! are written via `flate2::write::GzEncoder` (or plain file
 //! writes for `.osc`); the `merge-changes` command runs via the
 //! compiled `pbfhogg` binary through `CliInvoker`; output is
@@ -13,13 +13,11 @@
 
 #![allow(clippy::unwrap_used)]
 
-mod common;
-
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 
-use common::cli::CliInvoker;
+use crate::common::cli::CliInvoker;
 use flate2::Compression;
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;

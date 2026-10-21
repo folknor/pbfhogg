@@ -1,7 +1,13 @@
-//! Human-readable report output: `InspectReport::print_report` family plus
+//! Human-readable report output: `InspectReport::write_report` family plus
 //! `get_value` dot-path lookup.
+//!
+//! The report is rendered into a caller-supplied writer rather than straight
+//! to the process's stdout. A library does not own its host's stdout, and
+//! the CLI needs every write error back as a value: `println!` panics when
+//! the reader of a pipe has gone away (`pbfhogg inspect x | head -1`), and a
+//! returned `io::Error` is what lets the binary end quietly instead.
 
-use std::io::Write;
+use std::io::{self, Write};
 
 use super::format::{format_number, format_number_signed, format_size, format_timestamp, yes_no};
 use super::types::{
@@ -10,64 +16,85 @@ use super::types::{
 };
 
 impl InspectReport {
-    /// Print the full inspect report.
+    /// Write the full inspect report to `out`.
     ///
     /// `block_limit`: `None` = no block detail, `Some(0)` = distribution stats
     /// + full listing, `Some(N)` = distribution stats + first/last N blocks.
-    pub fn print_report(&mut self, block_limit: Option<usize>) {
-        self.print_report_filtered(block_limit, false);
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error `out` reports.
+    pub fn write_report<W: Write>(
+        &mut self,
+        out: &mut W,
+        block_limit: Option<usize>,
+    ) -> io::Result<()> {
+        self.write_report_filtered(out, block_limit, false)
     }
 
-    /// Print the inspect report with optional anomalies-only block detail.
-    pub fn print_report_filtered(&mut self, block_limit: Option<usize>, anomalies_only: bool) {
-        self.print_header();
-        println!();
-        self.print_blocks_summary();
-        println!();
-        self.print_elements();
-        println!();
-        self.print_ordering();
+    /// Write the inspect report to `out`, with optional anomalies-only block
+    /// detail.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error `out` reports.
+    pub fn write_report_filtered<W: Write>(
+        &mut self,
+        out: &mut W,
+        block_limit: Option<usize>,
+        anomalies_only: bool,
+    ) -> io::Result<()> {
+        self.write_header(out)?;
+        writeln!(out)?;
+        self.write_blocks_summary(out)?;
+        writeln!(out)?;
+        self.write_elements(out)?;
+        writeln!(out)?;
+        self.write_ordering(out)?;
 
         if let Some(ref infos) = self.accum.block_infos {
-            println!();
-            Self::print_block_distribution(infos);
-            println!();
+            writeln!(out)?;
+            Self::write_block_distribution(out, infos)?;
+            writeln!(out)?;
             if anomalies_only {
                 let selected = anomaly_blocks(infos);
-                println!(
+                writeln!(
+                    out,
                     "Block anomalies ({} of {} - <50% or >150% of per-type median):",
                     selected.len(),
                     infos.len()
-                );
-                Self::print_block_table_with_reason(&selected);
+                )?;
+                Self::write_block_table_with_reason(out, &selected)?;
             } else {
                 let selected: Vec<&BlockInfo> = infos.iter().collect();
                 let limit = block_limit.unwrap_or(0);
-                Self::print_block_table_refs(&selected, limit);
+                Self::write_block_table_refs(out, &selected, limit)?;
             }
         }
         if let Some((n, w, r)) = self.id_range_tuple() {
-            println!();
-            Self::print_id_ranges(n, w, r);
+            writeln!(out)?;
+            Self::write_id_ranges(out, n, w, r)?;
         }
         if let Some(ref ext) = self.state.extended {
-            println!();
-            Self::print_extended(ext);
+            writeln!(out)?;
+            Self::write_extended(out, ext)?;
         }
         if let Some(ref mut stats) = self.state.loc_stats {
-            println!();
-            Self::print_locations(stats);
+            writeln!(out)?;
+            Self::write_locations(out, stats)?;
         }
+        Ok(())
     }
 
-    fn print_header(&self) {
-        println!(
+    fn write_header(&self, out: &mut impl Write) -> io::Result<()> {
+        writeln!(
+            out,
             "File:     {} ({})",
             self.file_name,
             format_size(self.file_size)
-        );
+        )?;
         if let Some(ref prog) = self.header_meta.writing_program {
-            println!("Program:  {prog}");
+            writeln!(out, "Program:  {prog}")?;
         }
 
         // Combine features, skip boilerplate (OsmSchema-V0.6, DenseNodes)
@@ -80,11 +107,11 @@ impl InspectReport {
             .filter(|f| *f != "OsmSchema-V0.6" && *f != "DenseNodes")
             .collect();
         if !features.is_empty() {
-            println!("Features: {}", features.join(", "));
+            writeln!(out, "Features: {}", features.join(", "))?;
         }
 
         if let Some((left, bottom, right, top)) = self.header_meta.bbox {
-            println!("Bbox:     {left},{bottom},{right},{top}");
+            writeln!(out, "Bbox:     {left},{bottom},{right},{top}")?;
         }
 
         let hm = &self.header_meta;
@@ -99,14 +126,18 @@ impl InspectReport {
             if let Some(ref url) = hm.replication_url {
                 parts.push(url.clone());
             }
-            println!("Repl:     {}", parts.join(", "));
+            writeln!(out, "Repl:     {}", parts.join(", "))?;
         }
 
-        println!("Indexed:  {}", if self.is_indexed { "yes" } else { "no" });
+        writeln!(
+            out,
+            "Indexed:  {}",
+            if self.is_indexed { "yes" } else { "no" }
+        )
     }
 
-    fn print_blocks_summary(&self) {
-        println!("Blocks:   {} total", self.total_blocks);
+    fn write_blocks_summary(&self, out: &mut impl Write) -> io::Result<()> {
+        writeln!(out, "Blocks:   {} total", self.total_blocks)?;
         for (label, stats) in [
             (BlockKind::Nodes.label(), &self.accum.node_type),
             (BlockKind::Ways.label(), &self.accum.way_type),
@@ -114,42 +145,55 @@ impl InspectReport {
             (BlockKind::Mixed.label(), &self.accum.mixed_type),
         ] {
             if stats.block_count > 0 {
-                println!(
+                writeln!(
+                    out,
                     "  {:13}{:>6}  ({} compressed)",
                     label,
                     stats.block_count,
                     format_size(stats.frame_bytes)
-                );
+                )?;
             }
         }
+        Ok(())
     }
 
-    fn print_elements(&self) {
+    fn write_elements(&self, out: &mut impl Write) -> io::Result<()> {
         let total = self.state.node_count + self.state.way_count + self.state.relation_count;
-        println!("Elements: {} total", format_number(total));
+        writeln!(out, "Elements: {} total", format_number(total))?;
 
         if self.state.tagged_node_count > 0 {
-            println!(
+            writeln!(
+                out,
                 "  {:13}{}  ({} tagged)",
                 "Nodes:",
                 format_number(self.state.node_count),
                 format_number(self.state.tagged_node_count)
-            );
+            )?;
         } else {
-            println!("  {:13}{}", "Nodes:", format_number(self.state.node_count));
+            writeln!(
+                out,
+                "  {:13}{}",
+                "Nodes:",
+                format_number(self.state.node_count)
+            )?;
         }
-        println!("  {:13}{}", "Ways:", format_number(self.state.way_count));
-        println!(
+        writeln!(
+            out,
+            "  {:13}{}",
+            "Ways:",
+            format_number(self.state.way_count)
+        )?;
+        writeln!(
+            out,
             "  {:13}{}",
             "Relations:",
             format_number(self.state.relation_count)
-        );
+        )
     }
 
-    fn print_ordering(&self) {
+    fn write_ordering(&self, out: &mut impl Write) -> io::Result<()> {
         if self.accum.segments.is_empty() {
-            println!("Ordering: (empty file)");
-            return;
+            return writeln!(out, "Ordering: (empty file)");
         }
 
         let labels: Vec<&str> = self
@@ -161,9 +205,9 @@ impl InspectReport {
         let sequence = labels.join(" \u{2192} ");
 
         if is_standard_ordering(&self.accum.segments) {
-            println!("Ordering: {sequence} (strict)");
+            writeln!(out, "Ordering: {sequence} (strict)")?;
         } else {
-            println!("Ordering: {sequence} (NON-STANDARD)");
+            writeln!(out, "Ordering: {sequence} (NON-STANDARD)")?;
             let ranges: Vec<String> = self
                 .accum
                 .segments
@@ -176,14 +220,15 @@ impl InspectReport {
                     }
                 })
                 .collect();
-            println!("          {}", ranges.join("  "));
+            writeln!(out, "          {}", ranges.join("  "))?;
         }
+        Ok(())
     }
 
-    /// Print per-type distribution stats (min/max/median/p99) for block
+    /// Write per-type distribution stats (min/max/median/p99) for block
     /// element counts and compressed sizes.
-    fn print_block_distribution(infos: &[BlockInfo]) {
-        println!("Block distribution:");
+    fn write_block_distribution(out: &mut impl Write, infos: &[BlockInfo]) -> io::Result<()> {
+        writeln!(out, "Block distribution:")?;
         for kind in [
             BlockKind::Nodes,
             BlockKind::Ways,
@@ -206,68 +251,71 @@ impl InspectReport {
                 .collect();
             sizes.sort_unstable();
 
-            println!("  {}", kind.label());
-            print_distribution_line("    elements/block:", &elements, false);
-            print_distribution_line("    bytes/block:   ", &sizes, true);
+            writeln!(out, "  {}", kind.label())?;
+            write_distribution_line(out, "    elements/block:", &elements, false)?;
+            write_distribution_line(out, "    bytes/block:   ", &sizes, true)?;
         }
+        Ok(())
     }
 
-    /// Print the per-block table with optional head/tail limiting.
+    /// Write the per-block table with optional head/tail limiting.
     ///
     /// `limit`: 0 = show all blocks, N = show first N and last N blocks.
-    fn print_block_table_refs(infos: &[&BlockInfo], limit: usize) {
-        let stdout = std::io::stdout();
-        let mut out = std::io::BufWriter::new(stdout.lock());
-
+    fn write_block_table_refs(
+        out: &mut impl Write,
+        infos: &[&BlockInfo],
+        limit: usize,
+    ) -> io::Result<()> {
         let has_raw = infos.iter().any(|i| i.raw.is_some());
         let truncate = limit > 0 && limit * 2 < infos.len();
 
         if has_raw {
-            let _ok = writeln!(
+            writeln!(
                 out,
                 "{:>6}  {:12}{:>8}  {:>10}  {:>10}",
                 "Block", "Type", "Elements", "Compressed", "Raw"
-            );
+            )?;
             if truncate {
-                write_block_rows_raw(&mut out, &infos[..limit]);
+                write_block_rows_raw(out, &infos[..limit])?;
                 let omitted = infos.len() - limit * 2;
-                let _ok = writeln!(out, "   ...  ({omitted} blocks omitted)");
-                write_block_rows_raw(&mut out, &infos[infos.len() - limit..]);
+                writeln!(out, "   ...  ({omitted} blocks omitted)")?;
+                write_block_rows_raw(out, &infos[infos.len() - limit..])?;
             } else {
-                write_block_rows_raw(&mut out, infos);
+                write_block_rows_raw(out, infos)?;
             }
         } else {
-            let _ok = writeln!(
+            writeln!(
                 out,
                 "{:>6}  {:12}{:>8}  {:>10}",
                 "Block", "Type", "Elements", "Compressed"
-            );
+            )?;
             if truncate {
-                write_block_rows_compressed(&mut out, &infos[..limit]);
+                write_block_rows_compressed(out, &infos[..limit])?;
                 let omitted = infos.len() - limit * 2;
-                let _ok = writeln!(out, "   ...  ({omitted} blocks omitted)");
-                write_block_rows_compressed(&mut out, &infos[infos.len() - limit..]);
+                writeln!(out, "   ...  ({omitted} blocks omitted)")?;
+                write_block_rows_compressed(out, &infos[infos.len() - limit..])?;
             } else {
-                write_block_rows_compressed(&mut out, infos);
+                write_block_rows_compressed(out, infos)?;
             }
         }
+        Ok(())
     }
 
-    /// Print block table with an anomaly reason column (no truncation).
-    fn print_block_table_with_reason(infos: &[(&BlockInfo, &str)]) {
-        let stdout = std::io::stdout();
-        let mut out = std::io::BufWriter::new(stdout.lock());
-
+    /// Write the block table with an anomaly reason column (no truncation).
+    fn write_block_table_with_reason(
+        out: &mut impl Write,
+        infos: &[(&BlockInfo, &str)],
+    ) -> io::Result<()> {
         let has_raw = infos.iter().any(|(i, _)| i.raw.is_some());
 
         if has_raw {
-            let _ok = writeln!(
+            writeln!(
                 out,
                 "{:>6}  {:12}{:>8}  {:>10}  {:>10}  Reason",
                 "Block", "Type", "Elements", "Compressed", "Raw"
-            );
+            )?;
             for (info, reason) in infos {
-                let _ok = writeln!(
+                writeln!(
                     out,
                     "{:>6}  {:12}{:>8}  {:>10}  {:>10}  {}",
                     info.number,
@@ -276,16 +324,16 @@ impl InspectReport {
                     format_size(info.compressed as u64),
                     format_size(info.raw.unwrap_or(0) as u64),
                     reason
-                );
+                )?;
             }
         } else {
-            let _ok = writeln!(
+            writeln!(
                 out,
                 "{:>6}  {:12}{:>8}  {:>10}  Reason",
                 "Block", "Type", "Elements", "Compressed"
-            );
+            )?;
             for (info, reason) in infos {
-                let _ok = writeln!(
+                writeln!(
                     out,
                     "{:>6}  {:12}{:>8}  {:>10}  {}",
                     info.number,
@@ -293,57 +341,69 @@ impl InspectReport {
                     info.elements,
                     format_size(info.compressed as u64),
                     reason
-                );
+                )?;
             }
         }
+        Ok(())
     }
 
-    fn print_id_ranges(node_ids: &TypeIdRange, way_ids: &TypeIdRange, rel_ids: &TypeIdRange) {
+    fn write_id_ranges(
+        out: &mut impl Write,
+        node_ids: &TypeIdRange,
+        way_ids: &TypeIdRange,
+        rel_ids: &TypeIdRange,
+    ) -> io::Result<()> {
         for (label, ids) in [
             ("Nodes:", node_ids),
             ("Ways:", way_ids),
             ("Relations:", rel_ids),
         ] {
             if ids.has_data() {
-                println!(
+                writeln!(
+                    out,
                     "  {:13}{} .. {}   (monotonic: {})",
                     label,
                     format_number_signed(ids.min_id),
                     format_number_signed(ids.max_id),
                     if ids.monotonic { "yes" } else { "no" }
-                );
+                )?;
             }
         }
+        Ok(())
     }
 
     #[allow(clippy::cast_precision_loss)]
-    fn print_extended(ext: &ExtendedStats) {
-        println!(
+    fn write_extended(out: &mut impl Write, ext: &ExtendedStats) -> io::Result<()> {
+        writeln!(
+            out,
             "Ordered:  {}",
             if ext.objects_ordered { "yes" } else { "no" }
-        );
+        )?;
         if ext.has_timestamps() {
-            println!(
+            writeln!(
+                out,
                 "Timestamps: {} .. {}",
                 format_timestamp(ext.min_timestamp),
                 format_timestamp(ext.max_timestamp)
-            );
+            )?;
         }
         if ext.data_bbox.has_data() {
             let bb = &ext.data_bbox;
-            println!(
+            writeln!(
+                out,
                 "Data bbox:  {},{},{},{}",
                 bb.min_lon as f64 * 1e-9,
                 bb.min_lat as f64 * 1e-9,
                 bb.max_lon as f64 * 1e-9,
                 bb.max_lat as f64 * 1e-9
-            );
+            )?;
         }
         let m = &ext.metadata;
         if m.total > 0 {
-            print_metadata_line("All objects have:", m, true);
-            print_metadata_line("Some objects have:", m, false);
+            write_metadata_line(out, "All objects have:", m, true)?;
+            write_metadata_line(out, "Some objects have:", m, false)?;
         }
+        Ok(())
     }
 
     /// Retrieve a single value by dot-path key, for `--get` scripting.
@@ -454,26 +514,27 @@ impl InspectReport {
     }
 
     #[allow(clippy::cast_precision_loss)]
-    fn print_locations(stats: &mut LocationStats) {
+    fn write_locations(out: &mut impl Write, stats: &mut LocationStats) -> io::Result<()> {
         let total = stats.with_locations + stats.without_locations;
         if total == 0 {
-            println!("Locations: no ways in file");
-            return;
+            return writeln!(out, "Locations: no ways in file");
         }
 
         let with_pct = stats.with_locations as f64 / total as f64 * 100.0;
         let without_pct = stats.without_locations as f64 / total as f64 * 100.0;
 
-        println!(
+        writeln!(
+            out,
             "Ways with locations:    {} ({:.3}%)",
             format_number(stats.with_locations),
             with_pct
-        );
-        println!(
+        )?;
+        writeln!(
+            out,
             "Ways without locations: {} ({:.3}%)",
             format_number(stats.without_locations),
             without_pct
-        );
+        )?;
 
         if !stats.coord_counts.is_empty() {
             stats.coord_counts.sort_unstable();
@@ -484,8 +545,12 @@ impl InspectReport {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let p99_idx = ((len as f64 - 1.0) * 0.99) as usize;
             let p99 = stats.coord_counts[p99_idx.min(len - 1)];
-            println!("Coords per way:         min {min}, max {max}, median {median}, p99 {p99}");
+            writeln!(
+                out,
+                "Coords per way:         min {min}, max {max}, median {median}, p99 {p99}"
+            )?;
         }
+        Ok(())
     }
 
     fn id_range_tuple(&self) -> Option<(&TypeIdRange, &TypeIdRange, &TypeIdRange)> {
@@ -504,9 +569,9 @@ impl InspectReport {
 // Block table row helpers (free functions to avoid cognitive_complexity in methods)
 // ---------------------------------------------------------------------------
 
-fn write_block_rows_raw(out: &mut impl std::io::Write, infos: &[&BlockInfo]) {
+fn write_block_rows_raw(out: &mut impl Write, infos: &[&BlockInfo]) -> io::Result<()> {
     for info in infos {
-        let _ok = writeln!(
+        writeln!(
             out,
             "{:>6}  {:12}{:>8}  {:>10}  {:>10}",
             info.number,
@@ -514,51 +579,63 @@ fn write_block_rows_raw(out: &mut impl std::io::Write, infos: &[&BlockInfo]) {
             info.elements,
             format_size(info.compressed as u64),
             format_size(info.raw.unwrap_or(0) as u64)
-        );
+        )?;
     }
+    Ok(())
 }
 
-fn write_block_rows_compressed(out: &mut impl std::io::Write, infos: &[&BlockInfo]) {
+fn write_block_rows_compressed(out: &mut impl Write, infos: &[&BlockInfo]) -> io::Result<()> {
     for info in infos {
-        let _ok = writeln!(
+        writeln!(
             out,
             "{:>6}  {:12}{:>8}  {:>10}",
             info.number,
             info.kind.label(),
             info.elements,
             format_size(info.compressed as u64)
-        );
+        )?;
     }
+    Ok(())
 }
 
-/// Print a distribution line (min/max/median/p99) for a sorted slice of values.
+/// Write a distribution line (min/max/median/p99) for a sorted slice of values.
 ///
-/// `label` is printed as-is (should include leading whitespace and trailing colon).
+/// `label` is written as-is (should include leading whitespace and trailing colon).
 /// `is_bytes` controls formatting: `true` uses `format_size`, `false` uses `format_number`.
 #[allow(clippy::cast_precision_loss)]
-fn print_distribution_line(label: &str, sorted: &[u64], is_bytes: bool) {
+fn write_distribution_line(
+    out: &mut impl Write,
+    label: &str,
+    sorted: &[u64],
+    is_bytes: bool,
+) -> io::Result<()> {
     let fmt = if is_bytes { format_size } else { format_number };
     let len = sorted.len();
     let min = sorted[0];
     let max = sorted[len - 1];
     if len == 1 {
-        println!("{label} {}", fmt(min));
-        return;
+        return writeln!(out, "{label} {}", fmt(min));
     }
     let median = sorted[len / 2];
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let p99_idx = ((len as f64 - 1.0) * 0.99) as usize;
     let p99 = sorted[p99_idx.min(len - 1)];
-    println!(
+    writeln!(
+        out,
         "{label} min {}  max {}  median {}  p99 {}",
         fmt(min),
         fmt(max),
         fmt(median),
         fmt(p99),
-    );
+    )
 }
 
-fn print_metadata_line(label: &str, m: &MetadataCoverage, all: bool) {
+fn write_metadata_line(
+    out: &mut impl Write,
+    label: &str,
+    m: &MetadataCoverage,
+    all: bool,
+) -> io::Result<()> {
     let check = |count: u64| -> bool {
         if all {
             m.all_have(count)
@@ -583,8 +660,8 @@ fn print_metadata_line(label: &str, m: &MetadataCoverage, all: bool) {
         attrs.push("user");
     }
     if attrs.is_empty() {
-        println!("  {label} (none)");
+        writeln!(out, "  {label} (none)")
     } else {
-        println!("  {label} {}", attrs.join(", "));
+        writeln!(out, "  {label} {}", attrs.join(", "))
     }
 }

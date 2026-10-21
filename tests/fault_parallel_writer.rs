@@ -1,10 +1,9 @@
 //! Per-binary fault-injection test for `write::parallel_writer`
 //! (apply-changes' default output backend).
 //!
-//! Split out of `tests/apply_changes_invariants.rs` (2026-04-25).
-//! Each `tests/fault_*.rs` compiles to its own integration-test
-//! binary, so the static `PANIC_AT_POOL_OP_COUNT` is per-process
-//! and race-free without `#[ignore]` or `--test-threads=1`. The
+//! Split out of the former `apply_changes_invariants.rs` (2026-04-25).
+//! This file is its own `[[test]]` target in `Cargo.toml`, so the
+//! static `PANIC_AT_POOL_OP_COUNT` is per-process and race-free without `#[ignore]` or `--test-threads=1`. The
 //! hook shape was chosen over a per-instance `MergeOptions` field
 //! because pool workers are spawned deep inside
 //! `parallel_writer_thread_inner` - threading a config through

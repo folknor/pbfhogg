@@ -76,3 +76,6 @@ mod roundtrip_invariants;
 mod roundtrip_real;
 mod tags_count;
 mod tags_filter_osc;
+
+#[cfg(all(feature = "commands", target_os = "linux", target_env = "gnu"))]
+mod cli_host_identity;

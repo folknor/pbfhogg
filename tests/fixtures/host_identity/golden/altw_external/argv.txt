@@ -1,0 +1,6 @@
+add-locations-to-ways
+<DIR>/inputs/base.osm.pbf
+--index-type
+external
+-o
+<DIR>/output

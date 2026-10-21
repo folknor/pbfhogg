@@ -1,0 +1,4 @@
+check
+<DIR>/inputs/base.osm.pbf
+--index
+--refs

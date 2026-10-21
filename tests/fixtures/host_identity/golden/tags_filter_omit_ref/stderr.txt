@@ -1,0 +1,1 @@
+Wrote 20 elements: 0 nodes (0 direct + 0 from ways + 0 from relations), 20 ways (20 direct + 0 from relations), 0 relations (0 direct + 0 from relations)

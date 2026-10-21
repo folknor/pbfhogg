@@ -1,0 +1,2 @@
+check
+<DIR>/inputs/base.osm.pbf

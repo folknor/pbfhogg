@@ -41,7 +41,7 @@ capture_env = ["PBFHOGG*", "MALLOC*"]
 [[check]]
 name = "all"
 features = ["test-hooks", "linux-direct-io", "linux-io-uring"]
-build_packages = ["pbfhogg-cli"]
+build_packages = ["pbfhogg-cli", "process-trace-shim"]
 # `parallel = {}` runs the sweep's test binaries concurrently - prebuilt
 # binaries executed directly, budget = tests in flight, defaulting to the L3
 # cache domain (the right default for a compute-bound suite). Until 2026-09-02
@@ -106,7 +106,7 @@ parallel = {}
 [[check]]
 name = "doctests"
 doc_only = true
-test_exclude_packages = ["pbfhogg-cli"]
+test_exclude_packages = ["pbfhogg-cli", "process-trace-shim"]
 
 # Compile each workspace member's lib and bins under its own package-mode
 # resolve - the boundary `cargo install pbfhogg-cli` and a downstream
@@ -221,6 +221,8 @@ include_ignored = false
 description = "Full in-project correctness gate (tier 3, pre-merge); over-watchdog tests run individually via brokkr test"
 sweeps = ["all"]
 skip = [
+    "host_identity_",
+    "stderr_closed_aborts_like_baseline",
     "platform::",
     "merge_cross_validate_osmium",
     "sort_cross_validate_osmium",

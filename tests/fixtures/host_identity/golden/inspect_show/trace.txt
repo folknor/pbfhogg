@@ -1,0 +1,6 @@
+0 F <DIR>/inputs/base.osm.pbf 0 0 2 0
+0 F <DIR>/inputs/base.osm.pbf 0 86 4 0
+0 F <DIR>/inputs/base.osm.pbf 0 225 4 0
+0 F <DIR>/inputs/base.osm.pbf 0 369 4 0
+0 F <DIR>/inputs/base.osm.pbf 0 513 4 0
+0 F <DIR>/inputs/base.osm.pbf 0 744 4 0

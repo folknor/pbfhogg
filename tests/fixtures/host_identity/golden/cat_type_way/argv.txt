@@ -1,0 +1,6 @@
+cat
+<DIR>/inputs/base.osm.pbf
+--type
+way
+-o
+<DIR>/output

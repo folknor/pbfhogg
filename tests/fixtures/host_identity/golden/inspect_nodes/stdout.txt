@@ -1,0 +1,32 @@
+Node count: 300
+
+Coordinate ranges (e7):
+  lat: 1000 .. 300000
+  lon: 1000 .. 300000
+
+FOR block bit-width distribution (block size = 128):
+
+  lat:
+     0-8  bits:          0 blocks (  0.0%)
+     9-16 bits:          0 blocks (  0.0%)
+    17-20 bits:          3 blocks (100.0%)
+    21-24 bits:          0 blocks (  0.0%)
+    25-28 bits:          0 blocks (  0.0%)
+    29-32 bits:          0 blocks (  0.0%)
+
+  lon:
+     0-8  bits:          0 blocks (  0.0%)
+     9-16 bits:          0 blocks (  0.0%)
+    17-20 bits:          3 blocks (100.0%)
+    21-24 bits:          0 blocks (  0.0%)
+    25-28 bits:          0 blocks (  0.0%)
+    29-32 bits:          0 blocks (  0.0%)
+
+Weighted average bit-width:
+  lat: <BITS> bits
+  lon: <BITS> bits
+
+Estimated compressed size:
+  <SIZE> GB (<BLOCKS> blocks x (<SIZE> + <SIZE>) bytes/block)
+  vs 0.00 GB uncompressed (300 nodes x 8 bytes)
+  ratio: <RATIO>%

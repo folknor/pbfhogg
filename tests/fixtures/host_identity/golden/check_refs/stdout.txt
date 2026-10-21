@@ -1,0 +1,2 @@
+Elements: 300 nodes, 40 ways, 0 relations
+Referential integrity: OK

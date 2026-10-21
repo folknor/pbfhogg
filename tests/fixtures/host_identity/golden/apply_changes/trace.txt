@@ -1,0 +1,15 @@
+0 F <DIR>/inputs/apply-base.osm.pbf 0 0 2 0
+0 V BROKKR_MARKER_FIFO 0
+0 F <DIR>/inputs/apply-base.osm.pbf 0 0 2 0
+0 V RUST_MIN_STACK 0
+0 C 0.0 0
+0.0 C 0.0.0 16
+0.0.0 pool 16
+0 A 0 4
+0 C 0.1 2
+0.1 pool 2
+0.1 C <child> 0
+0.1 C <child> 0
+0.1 F <DIR>/inputs/apply-base.osm.pbf 0 0 1 0
+0 G
+global pool 4

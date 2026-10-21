@@ -1,0 +1,3 @@
+[getid --invert] 4 blobs passed through raw
+Wrote 99 elements: 99 nodes, 0 ways, 0 relations
+Plus 245 elements in raw-passthrough blobs, per their indexdata (unverified - run `pbfhogg check --index` to check it)

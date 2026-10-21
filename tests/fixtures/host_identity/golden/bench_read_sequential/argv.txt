@@ -1,0 +1,4 @@
+bench-read
+<DIR>/inputs/base.osm.pbf
+--mode
+sequential

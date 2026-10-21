@@ -1,5 +1,5 @@
 [workspace]
-members = ["cli"]
+members = ["cli", "tools/process-trace-shim"]
 exclude = ["bench/osmpbf-baseline"]
 dependencies = {}
 
@@ -101,6 +101,7 @@ libc = "0.2.186"
 
 
 [dev-dependencies]
+regex = "1"
 tempfile = "3.27.0"
 proptest = "1"
 

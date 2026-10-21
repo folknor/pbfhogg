@@ -1,0 +1,6 @@
+cat
+<DIR>/inputs/base.osm.pbf
+--clean
+version
+-o
+<DIR>/output

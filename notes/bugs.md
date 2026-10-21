@@ -994,3 +994,11 @@ library still calls `eprintln!` from about 40 files (see HYG-019). The audit of
 the library's stderr use for library consumers is tracked in bz as pbfhogg#1.
 
 Reported by: CLI and plumbing.
+
+## BUG-068 - apply-changes prints its summary twice
+
+`apply_changes::merge` prints the summary in `rewrite.rs`, and the CLI's
+`run_apply_changes` prints it again. Remove the latter print after a separate
+CLI output change is approved. bench-merge also gets the library summary.
+
+Reported by: library-use implementation survey.

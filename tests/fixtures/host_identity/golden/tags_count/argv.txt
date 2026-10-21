@@ -1,0 +1,3 @@
+inspect
+tags
+<DIR>/inputs/base.osm.pbf

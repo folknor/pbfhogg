@@ -1,0 +1,5 @@
+sort
+<DIR>/inputs/base.osm.pbf
+--direct-io
+-o
+<DIR>/output

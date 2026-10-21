@@ -2337,3 +2337,33 @@ Reported by: geocode index.
 
 Reported by: CLI and plumbing, test harness.
 
+
+## HYG-107 - Library-use survey follow-ups
+
+- `osc/merge_join.rs` describes a `rayon::join` that no longer exists.
+- `common::write_indexed_pbf` says the sync writer emits no indexdata,
+  but `write_primitive_block` now emits it on the sync path too. Fixtures
+  requiring its absence must remove it explicitly.
+- ltrace cannot observe pbfhogg's calls: BIND_NOW/full RELRO leaves no PLT
+  breakpoints. Use strace for syscall-backed calls and LD_PRELOAD for mallopt.
+- altw `inject_metrics`, `WRITER_METRICS` and `PIPELINE_METRICS` mix counters
+  across concurrent runs. `process_scratch_tag` is also process-global;
+  the planned per-run tokens make sharing that tag harmless.
+- `diff/parallel.rs` puts scratch beside the old input. Derive's gzip
+  workers ignore `-j`.
+- `emit_mallinfo2` does unconditional diagnostic work even without an armed
+  marker sink.
+- The panic-hook-swapping reader test can silence concurrent panic output.
+- Raising RLIMIT_NOFILE is inherited by children and can break select(2).
+- The static-hook textlint exempts every `tests/fault_*.rs`, but
+  `fault_apply_changes.rs` belongs to `all` and only uses per-instance hooks.
+  Narrow the exemption to the standalone targets or rename that file.
+- altw external sizes its fd budget from the soft limit alone, without
+  counting descriptors already open. Concurrent joins at low limits can
+  exhaust descriptors.
+
+The identity instrument blesses the unchanged product build itself: brokkr
+owns BROKKR_TEST_BIN_DIR and cannot be redirected to a baseline. Test filters
+match substrings, so bless and compare names must not contain each other.
+
+Reported by: library-use implementation survey.

@@ -1,0 +1,23 @@
+[package]
+name = "process-trace-shim"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[dependencies]
+libc = "0.2.186"
+
+# brokkr applies the all sweep's features to every build_packages member.
+[features]
+commands = []
+test-hooks = []
+linux-direct-io = []
+linux-io-uring = []
+
+[lints]
+workspace = true

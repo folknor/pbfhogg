@@ -1,0 +1,6 @@
+tags-filter
+<DIR>/inputs/base.osm.pbf
+-R
+highway
+-o
+<DIR>/output

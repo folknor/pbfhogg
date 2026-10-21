@@ -1,0 +1,2 @@
+inspect
+<DIR>/inputs/base.osm.pbf

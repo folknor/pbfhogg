@@ -1,0 +1,2 @@
+[altw external] RLIMIT_NOFILE: 300 (already at hard cap; no adjustment)
+Error: altw external: file descriptor limit too low (RLIMIT_NOFILE = 300, need >= 320 for even a single shard worker). Raise with `ulimit -n 320` (or higher) and retry.

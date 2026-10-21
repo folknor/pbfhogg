@@ -1,0 +1,6 @@
+merge-changes
+<DIR>/inputs/apply.osc.gz
+-j
+2
+-o
+<DIR>/output.osc.gz

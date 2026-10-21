@@ -11,7 +11,7 @@ use crate::common::{TestMember, TestNode, TestRelation, TestWay, write_test_pbf_
 use pbfhogg::MemberId;
 use tempfile::TempDir;
 
-fn write_synthetic_indexed_input(path: &Path) {
+pub(crate) fn write_synthetic_indexed_input(path: &Path) {
     write_test_pbf_sorted(
         path,
         &[

@@ -1,0 +1,5 @@
+degrade
+<DIR>/inputs/base.osm.pbf
+--strip-locations
+-o
+<DIR>/output

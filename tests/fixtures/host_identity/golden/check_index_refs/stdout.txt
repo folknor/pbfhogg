@@ -1,0 +1,7 @@
+Blobs: 5 (5 with indexdata, 5 with tagdata, 0 unindexable)
+Blob metadata for base.osm.pbf: OK
+
+---
+
+Elements: 300 nodes, 40 ways, 0 relations
+Referential integrity: OK

@@ -800,6 +800,15 @@ Measurement-first on every one: turn on `#[cfg(feature = "hotpath")]` counters (
 
 ## Important: ignored tests
 
+The CLI process-policy identity instrument has three ignored tests:
+`host_identity_bless_goldens`, `host_identity_matches_goldens` and
+`stderr_closed_aborts_like_baseline`. Run each explicitly with
+`brokkr test <name> --sweep all --timeout 280`. Bless only against the
+unchanged baseline product; compare after each library-use brick. The two
+`_uring` scenarios skip on this host for the same `RLIMIT_MEMLOCK` reason as
+every other uring test (see the release-gate entry below); both tests name
+the skipped scenarios on stderr.
+
 `roundtrip_denmark` in `tests/roundtrip_real.rs` is `#[ignore]` - it roundtrips the entire
 Denmark PBF (~54s) and is too slow for the normal edit-test cycle. **Must be run before any
 release and after completing major work** (especially changes to reader, writer, block_builder,

@@ -1,0 +1,7 @@
+diff
+<DIR>/inputs/base.osm.pbf
+<DIR>/inputs/changed.osm.pbf
+--format
+osc
+-o
+<DIR>/output.osc.gz

@@ -1,0 +1,1 @@
+Extract (smart): 150 nodes (150 in bbox, 0 from ways), 40 ways, 5 relations

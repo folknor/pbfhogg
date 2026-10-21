@@ -761,6 +761,10 @@ fn is_uring_init_unavailable(err: &std::io::Error) -> bool {
         || os == Some(libc::ENOMEM)
         || msg.contains("RLIMIT_MEMLOCK")
         || msg.contains("kernel does not support")
+        // `io_uring_setup` denied by a seccomp sandbox: the writer wraps
+        // the EPERM in a new error, so the raw os error is gone and only
+        // the message survives.
+        || msg.contains("io_uring creation failed")
 }
 
 /// Write a tiny PBF (single node) via io_uring, read back, verify content.

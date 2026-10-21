@@ -1,0 +1,7 @@
+extract
+<DIR>/inputs/base.osm.pbf
+-b
+0,0,0.015,0.015
+--simple
+-o
+<DIR>/output

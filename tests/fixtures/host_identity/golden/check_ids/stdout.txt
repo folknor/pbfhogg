@@ -1,0 +1,8 @@
+Verify IDs: base.osm.pbf
+  Header sorted: yes
+  Indexed: yes
+  Mode: streaming
+
+Scanned 300 nodes, 40 ways, 5 relations
+
+ID integrity: OK

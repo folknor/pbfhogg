@@ -225,7 +225,7 @@ fn snapshot_ways_and_relations() {
 // Fixture builders (allowlist-only)
 // ---------------------------------------------------------------------------
 
-fn write_history_input(path: &Path) {
+pub(crate) fn write_history_input(path: &Path) {
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
@@ -355,7 +355,7 @@ fn snapshot_meta(version: i32, timestamp: i64, visible: bool) -> Metadata<'stati
     }
 }
 
-fn write_snapshot_input(path: &Path) {
+pub(crate) fn write_snapshot_input(path: &Path) {
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());

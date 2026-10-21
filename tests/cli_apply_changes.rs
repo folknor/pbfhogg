@@ -53,11 +53,77 @@ use tempfile::TempDir;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn write_osc(path: &Path, xml: &str) {
+pub(crate) fn write_osc(path: &Path, xml: &str) {
     let file = File::create(path).expect("create osc file");
     let mut enc = GzEncoder::new(file, flate2::Compression::fast());
     enc.write_all(xml.as_bytes()).expect("write xml");
     enc.finish().expect("finish gz");
+}
+
+pub(crate) const CRUD_OSC: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <node id="4" lat="55.0" lon="12.0" version="1">
+      <tag k="name" v="four"/>
+    </node>
+  </create>
+  <modify>
+    <node id="2" lat="35.0" lon="45.0" version="2">
+      <tag k="name" v="two-modified"/>
+    </node>
+    <way id="10" version="2">
+      <nd ref="1"/>
+      <nd ref="2"/>
+      <tag k="highway" v="primary"/>
+    </way>
+  </modify>
+  <delete>
+    <node id="3" version="2"/>
+  </delete>
+</osmChange>"#;
+
+pub(crate) fn write_crud_base(path: &Path) {
+    write_test_pbf_sorted(
+        path,
+        &[
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("name", "one")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 300_000_000,
+                lon: 400_000_000,
+                tags: vec![("name", "two")],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 500_000_000,
+                lon: 600_000_000,
+                tags: vec![("name", "three")],
+                meta: None,
+            },
+        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2, 3],
+            tags: vec![("highway", "road")],
+            meta: None,
+        }],
+        &[TestRelation {
+            id: 100,
+            members: vec![TestMember {
+                id: MemberId::Way(10),
+                role: "outer",
+            }],
+            tags: vec![("type", "multipolygon")],
+            meta: None,
+        }],
+    );
 }
 
 #[derive(Default, Clone, Copy)]
@@ -115,72 +181,8 @@ fn merge_basic_create_modify_delete() {
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
 
-    write_test_pbf_sorted(
-        &base,
-        &[
-            TestNode {
-                id: 1,
-                lat: 100_000_000,
-                lon: 200_000_000,
-                tags: vec![("name", "one")],
-                meta: None,
-            },
-            TestNode {
-                id: 2,
-                lat: 300_000_000,
-                lon: 400_000_000,
-                tags: vec![("name", "two")],
-                meta: None,
-            },
-            TestNode {
-                id: 3,
-                lat: 500_000_000,
-                lon: 600_000_000,
-                tags: vec![("name", "three")],
-                meta: None,
-            },
-        ],
-        &[TestWay {
-            id: 10,
-            refs: vec![1, 2, 3],
-            tags: vec![("highway", "road")],
-            meta: None,
-        }],
-        &[TestRelation {
-            id: 100,
-            members: vec![TestMember {
-                id: MemberId::Way(10),
-                role: "outer",
-            }],
-            tags: vec![("type", "multipolygon")],
-            meta: None,
-        }],
-    );
-
-    write_osc(
-        &osc,
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<osmChange version="0.6">
-  <create>
-    <node id="4" lat="55.0" lon="12.0" version="1">
-      <tag k="name" v="four"/>
-    </node>
-  </create>
-  <modify>
-    <node id="2" lat="35.0" lon="45.0" version="2">
-      <tag k="name" v="two-modified"/>
-    </node>
-    <way id="10" version="2">
-      <nd ref="1"/>
-      <nd ref="2"/>
-      <tag k="highway" v="primary"/>
-    </way>
-  </modify>
-  <delete>
-    <node id="3" version="2"/>
-  </delete>
-</osmChange>"#,
-    );
+    write_crud_base(&base);
+    write_osc(&osc, CRUD_OSC);
 
     let out = run_apply_ok(&base, &osc, &output);
     let c = read_all_elements(&output);
@@ -1973,72 +1975,8 @@ mod platform {
     use super::*;
 
     fn basic_fixture(base: &Path, osc: &Path) {
-        write_test_pbf_sorted(
-            base,
-            &[
-                TestNode {
-                    id: 1,
-                    lat: 100_000_000,
-                    lon: 200_000_000,
-                    tags: vec![("name", "one")],
-                    meta: None,
-                },
-                TestNode {
-                    id: 2,
-                    lat: 300_000_000,
-                    lon: 400_000_000,
-                    tags: vec![("name", "two")],
-                    meta: None,
-                },
-                TestNode {
-                    id: 3,
-                    lat: 500_000_000,
-                    lon: 600_000_000,
-                    tags: vec![("name", "three")],
-                    meta: None,
-                },
-            ],
-            &[TestWay {
-                id: 10,
-                refs: vec![1, 2, 3],
-                tags: vec![("highway", "road")],
-                meta: None,
-            }],
-            &[TestRelation {
-                id: 100,
-                members: vec![TestMember {
-                    id: MemberId::Way(10),
-                    role: "outer",
-                }],
-                tags: vec![("type", "multipolygon")],
-                meta: None,
-            }],
-        );
-
-        write_osc(
-            osc,
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<osmChange version="0.6">
-  <create>
-    <node id="4" lat="55.0" lon="12.0" version="1">
-      <tag k="name" v="four"/>
-    </node>
-  </create>
-  <modify>
-    <node id="2" lat="35.0" lon="45.0" version="2">
-      <tag k="name" v="two-modified"/>
-    </node>
-    <way id="10" version="2">
-      <nd ref="1"/>
-      <nd ref="2"/>
-      <tag k="highway" v="primary"/>
-    </way>
-  </modify>
-  <delete>
-    <node id="3" version="2"/>
-  </delete>
-</osmChange>"#,
-        );
+        write_crud_base(base);
+        write_osc(osc, CRUD_OSC);
     }
 
     fn check_basic_output(output: &Path) {

@@ -1,0 +1,6 @@
+0 F <DIR>/inputs/base.osm.pbf 0 0 2 0
+0 V BROKKR_MARKER_FIFO 0
+0 F <DIR>/inputs/base.osm.pbf 0 0 2 0
+0 V RUST_MIN_STACK 0
+0 C 0.0 0
+0 F <DIR>/inputs/base.osm.pbf 0 0 2 0

@@ -1,0 +1,7 @@
+Error: input PBF has no blob-level indexdata. Without indexdata, --clean decompresses every blob three times - once per element kind - because an unindexed blob has to be scheduled as all three.
+
+Generate an indexed PBF first:
+
+  pbfhogg cat input.osm.pbf -o indexed.osm.pbf
+
+Or pass --force to proceed anyway.

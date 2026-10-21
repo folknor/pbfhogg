@@ -37,6 +37,9 @@ mod uring_writer {
             || os == Some(libc::ENOMEM)
             || msg.contains("RLIMIT_MEMLOCK")
             || msg.contains("kernel does not support")
+            // `io_uring_setup` denied by a seccomp sandbox: the writer
+            // wraps the EPERM in a new error, so only the message survives.
+            || msg.contains("io_uring creation failed")
     }
 
     /// A panic in the uring writer thread mid-stream must surface

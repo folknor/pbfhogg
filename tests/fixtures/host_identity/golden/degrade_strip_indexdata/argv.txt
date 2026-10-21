@@ -1,0 +1,5 @@
+degrade
+<DIR>/inputs/base.osm.pbf
+--strip-indexdata
+-o
+<DIR>/output

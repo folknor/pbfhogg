@@ -1,0 +1,16 @@
+File:     base.osm.pbf (897 B)
+Program:  pbfhogg
+Features: Sort.Type_then_ID
+Indexed:  yes
+
+Blocks:   5 total
+  DenseNodes:       3  (427 B compressed)
+  Ways:             1  (231 B compressed)
+  Relations:        1  (153 B compressed)
+
+Elements: 345 total
+  Nodes:       300
+  Ways:        40
+  Relations:   5
+
+Ordering: nodes → ways → relations (strict)

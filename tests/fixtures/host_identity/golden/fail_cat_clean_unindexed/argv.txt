@@ -1,0 +1,6 @@
+cat
+<DIR>/inputs/base-noindex.osm.pbf
+--clean
+version
+-o
+<DIR>/output

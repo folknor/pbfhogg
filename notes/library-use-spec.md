@@ -1,6 +1,23 @@
 # Library use: implementation spec (bz pbfhogg#1)
 
-Status: spec, not started. Nothing in this document has landed. Revised
+Status: B0 landed (all five gates green on bygg, 2026-10-21). B1 through
+B6 have not started. The product tree still equals `fa94c6c7`.
+
+B0 changed one rule of section 5 (I2): the two `_uring` scenarios are an
+environment skip, not a precondition panic. The spec assumed io_uring runs
+on bygg; it does not, and `TODO.md` ("Release gate: the io_uring writer is
+unexercised on real data") already said so: `RLIMIT_MEMLOCK` is 8 MB hard
+on bygg and the writer registers 16 MB of buffers, so every uring test in
+the suite skips here, and the identity instrument now does the same. The
+first bless therefore pinned 57 scenarios and skipped `apply_changes_uring`
+and `sort_uring`; both tests name every skipped scenario on stderr. The
+implementer's seccomp sandbox additionally denies `io_uring_setup` with
+`EPERM`, which `CliOutput::is_uring_unsupported` and the two inline
+`is_uring_init_unavailable` matchers now recognise (`io_uring creation
+failed`), so `brokkr check` is green in that sandbox too. Gate 5 agreed
+exactly (altw: GR 1, SR 0, F 11, C 108; history: GR 0, SR 0, F 3, C 65).
+
+Revised
 after review rounds r1 and r2 (`notes/library-use-spec-r1.md`,
 `notes/library-use-spec-r2.md`); every accepted finding is folded into the
 section it concerns, and the rejected ones are recorded in section 11.
@@ -866,9 +883,10 @@ and every way's refs (all ways reference nodes 1 to 5).
 Multi-blob on purpose: a one-blob-per-kind fixture collapses pool sizing by
 schedule length, reorder buffers and blob classification to degenerate
 cases. `common::write_multi_block_test_pbf(path, &nodes, &ways, &relations,
-100)` gives three node blobs, one way blob and one relation blob. It uses
-the sync writer, which emits no indexdata, so the indexed fixtures are
-made by running the baseline binary's passthrough `cat` over it
+100)` gives three node blobs, one way blob and one relation blob. The sync
+writer also emits indexdata, so B0 explicitly clears each data blob's
+indexdata before saving the unindexed fixture. The indexed fixtures are
+then made by running the baseline binary's passthrough `cat` over it
 (`CliInvoker`, no shim, cleared environment).
 
 - `base-noindex.osm.pbf`: `write_multi_block_test_pbf` of the base set,
@@ -967,10 +985,16 @@ A "setrlimit rejected" boundary cannot be induced unprivileged and is not
 in the matrix. `FdAdjustment::RaiseFailed`'s rendering is covered by the
 unit test on `Display`.
 
-The `--direct-io` and `--io-uring` scenarios need a host that supports
-them. If one fails and `CliOutput::is_o_direct_unsupported` or
-`is_uring_unsupported` is true, the bless test panics naming the scenario
-and the missing platform capability rather than blessing a failure.
+The `--direct-io` scenario needs a host that supports it. If it fails and
+`CliOutput::is_o_direct_unsupported` is true, the bless test panics naming
+the scenario and the missing platform capability rather than blessing a
+failure. The `--io-uring` scenarios follow the suite's standing uring
+convention instead: when one fails and `is_uring_unsupported` is true
+(bygg's 8 MB `RLIMIT_MEMLOCK` hard limit, a kernel without io_uring, or a
+seccomp sandbox denying `io_uring_setup`), both tests skip it, name it on
+stderr, and write or require no goldens for it. On a host where io_uring
+works the scenarios run and are compared like any other; blessing there
+is how they become pinned.
 
 `derive-changes` has no subcommand of its own; it is `diff --format osc`
 (`run_derive_changes`), so `diff_osc` covers derive's gzip-worker probe and
@@ -1055,6 +1079,14 @@ stderr and the trace alike:
 - In stderr lines starting `  Bytes:` or `  Blob sizes:`, numbers become
   `<N>`. These lines vary with scheduling; see
   `cli_apply_changes_invariants.rs` `stats_block`.
+
+B0 implementation found two additional scheduling masks (documented in the
+harness): `id-W<worker>-` in external-join scratch paths becomes
+`id-W<WORKER>-`, because a dispatcher can route the same blob to either
+worker. In `inspect --nodes`, per-worker 128-value grouping makes the
+weighted bit-width and derived compressed-size and ratio lines vary;
+those estimates are masked, retaining node counts, ranges and histogram
+buckets.
 
 **Canonical trace form.** What is compared is the causal structure the
 bricks must preserve, and nothing that depends on the schedule:
@@ -1334,7 +1366,11 @@ goldens the bless test writes (gate 2) are part of B0's commit.
    they would load the shim into strace too, and both processes would
    append to one trace, each with its own thread 0. The trace goes to
    `target/host-identity/xcheck-*.trace`, the strace log to
-   `target/host-identity/xcheck-*.strace`.
+   `target/host-identity/xcheck-*.strace`. Remove all four files before
+   running: the shim opens its trace `O_APPEND`, so a rerun stacks on the
+   previous run and every count doubles. strace splits a call that
+   another thread preempts into an `<unfinished ...>` line and a
+   `<... resumed>` line; count each such pair once.
    - `strace -f -qq -E LD_PRELOAD=target/debug/libprocess_trace_shim.so -E PROCESS_TRACE_PATH=target/host-identity/xcheck-altw.trace -e trace=prlimit64,fadvise64,clone,clone3 -o target/host-identity/xcheck-altw.strace target/debug/pbfhogg add-locations-to-ways tests/fixtures/host_identity/inputs/base.osm.pbf --index-type external -o target/host-identity/xcheck-altw.osm.pbf`
    - `strace -f -qq -E LD_PRELOAD=target/debug/libprocess_trace_shim.so -E PROCESS_TRACE_PATH=target/host-identity/xcheck-hist.trace -e trace=prlimit64,fadvise64,clone,clone3 -o target/host-identity/xcheck-hist.strace target/debug/pbfhogg time-filter tests/fixtures/host_identity/inputs/history.osm.pbf -o target/host-identity/xcheck-hist.osm.pbf 250`
 

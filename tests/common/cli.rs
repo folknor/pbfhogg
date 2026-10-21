@@ -59,6 +59,7 @@ pub struct CliInvoker {
     cmd: Command,
     stdin: Option<Vec<u8>>,
     timeout: Duration,
+    stderr_closed: bool,
 }
 
 impl CliInvoker {
@@ -69,6 +70,7 @@ impl CliInvoker {
             cmd: Command::new(pbfhogg_bin()),
             stdin: None,
             timeout: DEFAULT_TIMEOUT,
+            stderr_closed: false,
         }
     }
 
@@ -94,6 +96,57 @@ impl CliInvoker {
         self
     }
 
+    /// Start the child without inherited environment variables.
+    pub fn clean_env(mut self) -> Self {
+        self.cmd.env_clear();
+        self
+    }
+
+    /// Give stderr a pipe whose reader has already gone away.
+    pub fn stderr_closed(mut self) -> Self {
+        let (reader, writer) = std::io::pipe().expect("stderr pipe");
+        drop(reader);
+        self.cmd.stderr(writer);
+        self.stderr_closed = true;
+        self
+    }
+
+    /// Pin the child to the first CPUs in our mask and explicit fd limits.
+    #[cfg(target_os = "linux")]
+    pub fn child_limits(mut self, cpus: usize, nofile: (u64, u64)) -> Self {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            let mut available: libc::cpu_set_t = std::mem::zeroed();
+            assert_eq!(
+                libc::sched_getaffinity(0, std::mem::size_of_val(&available), &mut available),
+                0
+            );
+            let mut mask: libc::cpu_set_t = std::mem::zeroed();
+            let mut count = 0;
+            for cpu in 0..libc::CPU_SETSIZE as usize {
+                if count < cpus && libc::CPU_ISSET(cpu, &available) {
+                    libc::CPU_SET(cpu, &mut mask);
+                    count += 1;
+                }
+            }
+            assert_eq!(count, cpus, "child_limits needs at least {cpus} CPUs");
+            self.cmd.pre_exec(move || {
+                if libc::sched_setaffinity(0, std::mem::size_of_val(&mask), &mask) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let limit = libc::rlimit {
+                    rlim_cur: nofile.0,
+                    rlim_max: nofile.1,
+                };
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        self
+    }
+
     /// Set bytes to feed on the binary's stdin.
     pub fn stdin_bytes(mut self, bytes: impl Into<Vec<u8>>) -> Self {
         self.stdin = Some(bytes.into());
@@ -116,7 +169,9 @@ impl CliInvoker {
             self.cmd.stdin(Stdio::piped());
         }
         self.cmd.stdout(Stdio::piped());
-        self.cmd.stderr(Stdio::piped());
+        if !self.stderr_closed {
+            self.cmd.stderr(Stdio::piped());
+        }
 
         let mut child = self.cmd.spawn().expect("spawn pbfhogg binary");
 
@@ -134,17 +189,19 @@ impl CliInvoker {
         // we need to keep `child` available so the timeout path can
         // call `kill()`.
         let mut stdout = child.stdout.take().expect("stdout piped");
-        let mut stderr = child.stderr.take().expect("stderr piped");
+        let stderr = child.stderr.take();
 
         let stdout_thread = std::thread::spawn(move || {
             let mut buf = Vec::new();
             stdout.read_to_end(&mut buf).ok();
             buf
         });
-        let stderr_thread = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            stderr.read_to_end(&mut buf).ok();
-            buf
+        let stderr_thread = stderr.map(|mut stderr| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                stderr.read_to_end(&mut buf).ok();
+                buf
+            })
         });
 
         let start = Instant::now();
@@ -155,7 +212,9 @@ impl CliInvoker {
                     if start.elapsed() > self.timeout {
                         child.kill().ok();
                         child.wait().ok();
-                        let stderr_buf = stderr_thread.join().unwrap_or_default();
+                        let stderr_buf = stderr_thread
+                            .map(|thread| thread.join().unwrap_or_default())
+                            .unwrap_or_default();
                         panic!(
                             "pbfhogg timed out after {:?}; stderr:\n{}",
                             self.timeout,
@@ -169,7 +228,9 @@ impl CliInvoker {
         };
 
         let stdout_buf = stdout_thread.join().unwrap_or_default();
-        let stderr_buf = stderr_thread.join().unwrap_or_default();
+        let stderr_buf = stderr_thread
+            .map(|thread| thread.join().unwrap_or_default())
+            .unwrap_or_default();
 
         CliOutput {
             status,
@@ -263,7 +324,8 @@ impl CliOutput {
 
     /// True when the command failed with stderr matching the
     /// io_uring-unavailable pattern (low `RLIMIT_MEMLOCK`, kernel
-    /// without the required submission queue features, etc.).
+    /// without the required submission queue features, a seccomp
+    /// sandbox that denies `io_uring_setup` with `EPERM`, etc.).
     /// Pure check; the caller logs and returns when it sees true.
     pub fn is_uring_unsupported(&self) -> bool {
         if self.status.success() {
@@ -273,6 +335,7 @@ impl CliOutput {
         msg.contains("RLIMIT_MEMLOCK")
             || msg.contains("kernel does not support")
             || msg.contains("not supported")
+            || msg.contains("io_uring creation failed")
     }
 }
 

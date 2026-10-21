@@ -1,0 +1,4 @@
+build-geocode-index
+<DIR>/inputs/geocode.osm.pbf
+--output-dir
+<DIR>/output

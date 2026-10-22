@@ -539,6 +539,14 @@
 
 ### Fixed
 
+- **`PbfWriter::to_path` onto a FIFO, socket or character device no longer
+  fails `flush()`.** Every byte was written, then the final `fsync` returned
+  `EINVAL` because such targets cannot be synchronized, and `flush()` reported
+  that as a failed write. On Linux that one case now counts as success;
+  regular files and block devices still propagate every `fsync` error.
+  `bench-write` now flushes its writer and reports write errors instead of
+  dropping it.
+
 - **`diff` no longer calls a corrupt element identical.** A tag whose string
   index points past the block's string table used to end the tag list
   silently, and a bad role index read as an empty role, so two such elements

@@ -831,7 +831,9 @@ impl<W: Write> PbfWriter<W> {
     /// the output file". Calling `flush` twice is harmless.
     ///
     /// After successful writes, `flush` checks completion and reports deferred
-    /// errors. File-backed pipelines also sync the file; a synchronous writer
+    /// errors. File-backed pipelines also sync the file (on Linux, a buffered
+    /// target that does not support `fsync` - a FIFO, socket or character
+    /// device such as `/dev/null` - is not an error); a synchronous writer
     /// created with `new` only calls its underlying `Write::flush`, which does
     /// not guarantee durability. Dropping without flushing is cleanup only - it
     /// joins the writer thread but reports nothing, including a missing tail.

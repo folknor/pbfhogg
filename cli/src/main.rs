@@ -3934,6 +3934,10 @@ fn run_bench_write(
             writer.write_header(&header_bytes)?;
             let start = Instant::now();
             let (nodes, ways, rels) = bench_write_loop(path, &mut writer, host)?;
+            // Flush in the timed window: the tail of the BufWriter is part of
+            // the write, and its error is the run's error.
+            writer.flush()?;
+            drop(writer);
             let elapsed_ms = start.elapsed().as_millis();
             (elapsed_ms, nodes, ways, rels)
         }
@@ -3946,6 +3950,11 @@ fn run_bench_write(
             )?;
             let start = Instant::now();
             let (nodes, ways, rels) = bench_write_loop(path, &mut writer, host)?;
+            // `flush`, not just `drop`: Drop joins the writer thread too, but
+            // discards its result and skips the end-of-stream completeness
+            // check. The drop stays inside the window so tearing the writer
+            // down is still timed as it always was.
+            writer.flush()?;
             drop(writer);
             let elapsed_ms = start.elapsed().as_millis();
             (elapsed_ms, nodes, ways, rels)

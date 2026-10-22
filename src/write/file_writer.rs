@@ -53,17 +53,73 @@ impl FileWriter {
     /// full `fsync`. On a planet-scale write that is not a small surprise.
     ///
     /// Durability is now something a caller asks for by name. `flush` flushes.
+    ///
+    /// One exception, buffered variant only: a target that does not support
+    /// synchronization - a FIFO, a socket, or a character device such as
+    /// `/dev/null` - makes `fsync` fail with `EINVAL` after every byte has
+    /// already been handed over by `write(2)` and every write error already
+    /// returned. That is reported as success, not as a failed write. Regular
+    /// files and block devices propagate every
+    /// `fsync` error, `EINVAL` included.
     pub fn sync(&mut self) -> io::Result<()> {
         self.flush()?;
         let t_sync = std::time::Instant::now();
         let result = match self {
-            FileWriter::Buffered(w) => w.get_ref().sync_all(),
+            FileWriter::Buffered(w) => sync_file(w.get_ref()),
             #[cfg(feature = "linux-direct-io")]
             FileWriter::Direct(w) => w.sync_all(),
         };
         WRITER_METRICS.record_sync_all(t_sync);
         result
     }
+}
+
+/// `fsync` a buffered output, treating "this target does not support
+/// synchronization" as success. Only consulted after `sync_all` has already
+/// failed, so the regular-file success path is exactly one `fsync`.
+fn sync_file(file: &File) -> io::Result<()> {
+    match file.sync_all() {
+        Err(e)
+            if sync_unsupported(
+                e.raw_os_error(),
+                file.metadata().ok().map(|m| m.file_type()),
+            ) =>
+        {
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+/// Whether a failed `fsync` means the target cannot be synchronized at all,
+/// rather than that synchronization failed.
+///
+/// Linux returns `EINVAL` when the descriptor "is bound to a special file
+/// (e.g., a pipe, FIFO, or socket) which does not support synchronization".
+/// The exception is deliberately narrow:
+///
+/// * only `EINVAL` - `EIO`, `ENOSPC` and every other errno is a real failure;
+/// * only FIFOs, sockets and character devices - a block device implements
+///   `fsync`, so an `EINVAL` from one is not "unsupported", and a regular file
+///   never gets the benefit of the doubt;
+/// * if the file type cannot be read, the original error stands;
+/// * Linux only, the platform whose semantics this is verified against.
+///
+/// Before this, `PbfWriter::to_path` onto `/dev/null`, a FIFO or a pipe wrote
+/// every byte successfully and then failed `flush()` with `EINVAL`, and
+/// `bench-write` hid that by dropping its writer instead of flushing it.
+///
+/// `file_type` is `None` when `fstat` itself failed.
+#[cfg(target_os = "linux")]
+fn sync_unsupported(errno: Option<i32>, file_type: Option<std::fs::FileType>) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    errno == Some(libc::EINVAL)
+        && file_type.is_some_and(|t| t.is_fifo() || t.is_socket() || t.is_char_device())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sync_unsupported(_errno: Option<i32>, _file_type: Option<std::fs::FileType>) -> bool {
+    false
 }
 
 #[cfg(feature = "linux-direct-io")]
@@ -174,5 +230,78 @@ mod tests {
             WRITER_METRICS.sync_all_calls.load(Relaxed) > after_flushes,
             "sync() must fsync"
         );
+    }
+
+    /// `/dev/null` cannot be synchronized; the write to it succeeded, so
+    /// `sync()` must not report a failure. This is the target `bench-write`
+    /// writes to.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sync_on_dev_null_succeeds() {
+        let mut w = FileWriter::buffered(std::path::Path::new("/dev/null")).unwrap();
+        w.write_all(b"bytes").unwrap();
+        w.sync().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    mod unsupported {
+        use super::super::sync_unsupported;
+        use std::fs::File;
+        use std::os::fd::OwnedFd;
+
+        fn file_type_of(file: &File) -> Option<std::fs::FileType> {
+            Some(file.metadata().unwrap().file_type())
+        }
+
+        fn char_device() -> File {
+            File::create("/dev/null").unwrap()
+        }
+
+        fn fifo() -> File {
+            let (_reader, writer) = std::io::pipe().unwrap();
+            File::from(OwnedFd::from(writer))
+        }
+
+        fn socket() -> File {
+            let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+            File::from(OwnedFd::from(a))
+        }
+
+        #[test]
+        fn einval_on_targets_without_fsync_is_unsupported() {
+            for (name, file) in [
+                ("char device", char_device()),
+                ("fifo", fifo()),
+                ("socket", socket()),
+            ] {
+                assert!(
+                    sync_unsupported(Some(libc::EINVAL), file_type_of(&file)),
+                    "{name}: EINVAL means fsync is unsupported here"
+                );
+            }
+        }
+
+        #[test]
+        fn other_errnos_on_the_same_targets_stay_errors() {
+            for errno in [libc::EIO, libc::ENOSPC, libc::EBADF, libc::EROFS] {
+                assert!(
+                    !sync_unsupported(Some(errno), file_type_of(&char_device())),
+                    "errno {errno} is a real failure"
+                );
+            }
+            assert!(!sync_unsupported(None, file_type_of(&char_device())));
+        }
+
+        #[test]
+        fn einval_on_a_regular_file_stays_an_error() {
+            // Only the file type is consulted; any regular file will do.
+            let file = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+            assert!(!sync_unsupported(Some(libc::EINVAL), file_type_of(&file)));
+        }
+
+        #[test]
+        fn unreadable_file_type_keeps_the_original_error() {
+            assert!(!sync_unsupported(Some(libc::EINVAL), None));
+        }
     }
 }

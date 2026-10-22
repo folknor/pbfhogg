@@ -374,47 +374,20 @@ derivation (HYG-028). Pin with a CLI test using `current_dir` and a bare `-o`.
 
 Reported by: altw and scanning, re-encoding.
 
-## BUG-024 - Input-controlled IDs drive unbounded `IdSet` growth or panics
+## BUG-024 - `IdSet::pre_allocate` sizes from an unverified `max_id`
 
-`IdSet::set` grows `chunks` to `id >> 25` entries. Sparse altw pass 0
-(`collect_way_referenced_node_ids`) and the relation-member scans
-`referenced.set(id)` every non-negative ref, so one ref near `i64::MAX`
-allocates about 2^38 slots (around 2 TB of vector) and aborts. External is
-protected by `BucketLayout::locate` bounding IDs by indexdata `max_id`;
-sparse has no bound. A plausible but large ID still allocates a full 4 MB
-chunk per distinct 2^25 range, so memory is bounded by ID spread, not element
-count.
-
-Related panics on the same type:
-- `IdSet::rank` indexes `chunk_prefix[cid]` unchecked, so it panics for any ID
-  past the last chunk or any negative ID cast to `u64`; `count_below` guards
-  this, `rank` (which is `pub`) does not.
-- `IdSet::set_atomic` on a negative ID panics with a message blaming
-  `pre_allocate`, because `-1 as u64` lands in chunk 2^39.
-- Geocode pass 1.5: with `--force` on input whose node blobs lack indexdata,
-  `max_node_id` is under-reported (0 if none has indexdata), and the
-  comment in `run_pass1_5` says `set_atomic` "would panic via its
-  diagnostic path". A node ID above a lying or stale indexdata `max_id` does
-  the same. The negative-ID guard was added; the too-large guard was not. The
-  panic takes out a worker inside `thread::scope` and propagates out of the
-  library.
-
-Fix: an `IdSet` constructor taking a bound plus a fallible `try_set`, as
-`set_atomic_checked` already does; the untrusted-input callers get a set that
-cannot grow past its bound. For geocode, check `r <= max_node_id` and record
-an error, or refuse `--force` without indexdata for that command.
+`IdSet` memory now follows the number of distinct IDs rather than their
+size (small chunks are sorted arrays, IDs from 2^43 up live in an ordered
+map), so `set` on an input-controlled ID no longer aborts. `pre_allocate
+(max_id)` still allocates a 4 MiB bitmap per 2^25 IDs from 0 to `max_id`
+before anything is validated, so a caller passing an indexdata `max_id`
+that lies high allocates until it runs out of memory. `check` bounds its
+argument by the file size; renumber and the geocode builder (pass 1.5)
+pass indexdata's claim unbounded. Each should bound the argument by
+something the file itself supports, per CORRECTNESS.md's rule for
+allocations sized from indexdata.
 
 Reported by: altw and scanning, geocode index, re-encoding.
-
-## BUG-025 - `BucketLayout::new` panics on a large indexdata `max_id`
-
-`BucketLayout::new` asserts `bucket_width <= 1 << 30`. `max_node_id` comes
-from indexdata via `max_node_id_from_blob_meta`, which validates sign and
-order but not size, so a node blob advertising `max_id` above about 2.7e11
-(256 x 2^30) panics the process instead of returning an error. Return a
-`Result`.
-
-Reported by: altw and scanning.
 
 ## BUG-026 - Altw stage 3's empty-bucket error path reports a panic that did not happen
 

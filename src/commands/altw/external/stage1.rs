@@ -61,9 +61,8 @@ pub(super) struct WayBlobTask {
     pub(super) data_size: usize,
 }
 
-/// Stage 1 output handed to stage 2. Owns the `IdSet` (kept alive
-/// because stage 2 needs `rank_if_set` for inline node-blob coord
-/// resolution) and the per-blob rank mapping.
+/// Stage 1 output handed to stage 2: slot and id-bucket record counts,
+/// the shard worker count, and the per-node-blob mapping.
 pub(super) struct Stage1Output {
     pub total_slots: u64,
     /// Per-(id-bucket) IdRecord counts produced by pass A. Stage 2

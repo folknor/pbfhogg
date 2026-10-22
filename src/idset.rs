@@ -1,54 +1,502 @@
 //! Chunked sparse bitset for O(1) element ID membership testing.
 //!
-//! Shared across commands that need planet-scale ID sets (extract, tags_filter).
+//! Shared across commands that need planet-scale ID sets (extract,
+//! tags_filter, getid, renumber, check, add-locations-to-ways, the geocode
+//! builder).
+
+// The whole module is bit arithmetic between `i64` ids, `u64` chunk ids and
+// `u32` / `usize` in-chunk offsets. Every narrowing cast is bounded by
+// construction (an offset is masked to 25 bits, a direct chunk id is below
+// `DIRECT_CHUNKS`, an id is non-negative before it is reinterpreted), so the
+// cast lints are allowed module-wide instead of on every function.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// Chunked sparse bitset for O(1) element ID membership testing.
 ///
-/// Mirrors osmium's `IdSetDense`: a vector of on-demand 4MB byte-array chunks,
-/// each covering 33M IDs via bit-level addressing. Lookup and insertion are
-/// 3 instructions (chunk index + byte offset + bitmask), with no hashing or
-/// sorting overhead.
+/// Mirrors osmium's `IdSetDense`: the ID space is cut into chunks of 2^25 IDs,
+/// and a populated chunk is normally a 4 MiB bit array. Lookup and insertion
+/// on such a chunk are 3 instructions (chunk index + word offset + bitmask),
+/// with no hashing or sorting overhead.
 ///
-/// Memory: 1 bit per ID present in each allocated chunk, 4MB per chunk, zero
-/// for empty ranges. For Denmark's 52M nodes: 2 chunks = 8MB. For planet
-/// (12B node IDs): ~364 chunks = 1.5GB.
+/// # Representation
+///
+/// - **Directory.** Chunks below [`DIRECT_CHUNKS`] (IDs below 2^43, several
+///   hundred times the live OSM node ID range) live in a directly indexed
+///   `Vec`, so real data never pays more than an index for the chunk lookup.
+///   Chunks at or above it live in an ordered map. The directory therefore
+///   no longer grows with the largest ID ever inserted: one way ref near
+///   `i64::MAX` used to resize the `Vec` to ~2^38 entries (about 4 TB) and
+///   abort the process.
+/// - **Chunks.** A chunk starts as a sorted array of in-chunk offsets and is
+///   promoted to the 4 MiB bit array when it would exceed [`SPARSE_MAX`]
+///   members. Real OSM data promotes almost at once (a Denmark-sized extract
+///   already holds ~10^5 referenced IDs per chunk), so its steady state is the
+///   bit array; an isolated ID no longer costs a whole 4 MiB chunk.
+///
+/// # Memory
+///
+/// For a set populated by `set` / `set_if_new` and merges of such sets,
+/// memory is bounded by the number of distinct IDs, not by their spread or
+/// their maximum: at most 4 bytes (plus `Vec` slack) per ID in an array chunk,
+/// and a bit-array chunk holds more than [`SPARSE_MAX`] IDs, so the worst case
+/// is about 4 MiB / 4097 ~= 1 KiB per distinct ID at the promotion boundary,
+/// plus the direct directory (at most `DIRECT_CHUNKS` entries) and a transient
+/// array during each promotion. A planet node set is ~400 bit-array chunks,
+/// about 1.6 GB.
+///
+/// The exception is [`Self::pre_allocate`], which creates empty bit-array
+/// chunks for a whole ID range on request; its argument is the caller's
+/// responsibility (see its docs), and merging a pre-allocated set carries those
+/// chunks along.
 pub struct IdSet {
-    chunks: Vec<Option<Box<[std::sync::atomic::AtomicU64]>>>,
-    /// Rank index for O(1) rank queries. Built on demand via `build_rank_index()`.
-    /// `chunk_prefix[cid]` = total set bits in chunks 0..cid.
-    /// `block_prefix[cid][block]` = set bits in chunk `cid` before block `block`.
-    /// Block size = 64 bytes (512 bits, 8 u64 words). Max 7 words scanned per rank().
-    rank_chunk_prefix: Option<Vec<u64>>,
-    rank_block_prefix: Option<Vec<Option<Vec<u32>>>>,
+    /// Chunks with chunk id below `DIRECT_CHUNKS`, indexed by chunk id.
+    chunks: Vec<Option<Chunk>>,
+    /// Chunks with chunk id at or above `DIRECT_CHUNKS`, keyed by chunk id.
+    /// Every ID here is above every ID in `chunks`.
+    overflow: BTreeMap<u64, Chunk>,
+    /// Rank index for O(1) (direct) / O(log n) (overflow) rank queries. Built
+    /// on demand via `build_rank_index()`, dropped as one unit by every
+    /// mutation through `&mut self`.
+    rank: Option<RankIndex>,
 }
 
-const CHUNK_BITS: usize = 22;
-const CHUNK_SIZE: usize = 1 << CHUNK_BITS;
-const WORDS_PER_CHUNK: usize = CHUNK_SIZE / std::mem::size_of::<u64>();
+/// Bytes in one bit-array chunk (4 MiB).
+const CHUNK_BYTES: usize = 1 << 22;
+const WORDS_PER_CHUNK: usize = CHUNK_BYTES / std::mem::size_of::<u64>();
+/// IDs per chunk = bits per bit-array chunk = 2^25.
+const ID_SHIFT: u32 = 25;
+const OFFSET_MASK: u64 = (1 << ID_SHIFT) - 1;
 
-fn new_chunk() -> Box<[std::sync::atomic::AtomicU64]> {
-    std::iter::repeat_with(|| std::sync::atomic::AtomicU64::new(0))
+/// Chunk ids below this live in the directly indexed directory. 2^18 chunks
+/// cover IDs below 2^43 (~8.8e12); the directory a single high ID can force
+/// is therefore bounded by a few MiB instead of growing with the ID.
+const DIRECT_CHUNKS: u64 = 1 << 18;
+
+/// Largest member count of an array chunk. The insertion of member 4097
+/// promotes the chunk to a bit array. At 4096 the sorted-insert cost stays
+/// small (at most ~32 MiB moved per chunk, in the all-descending case), and
+/// real OSM chunks cross it almost immediately.
+const SPARSE_MAX: usize = 4096;
+
+/// Rank block: 64 bytes = 8 words = 512 bits. At most 7 words scanned per
+/// within-chunk rank.
+const WORDS_PER_BLOCK: usize = 8;
+const BITS_PER_BLOCK: u32 = 512;
+const BLOCKS_PER_CHUNK: usize = WORDS_PER_CHUNK / WORDS_PER_BLOCK;
+
+/// Split a non-negative ID into `(chunk id, in-chunk offset)`. `None` for a
+/// negative ID: an `IdSet` stores only non-negative IDs.
+#[inline]
+fn split(id: i64) -> Option<(u64, u32)> {
+    if id < 0 {
+        return None;
+    }
+    let id = id as u64;
+    Some((id >> ID_SHIFT, (id & OFFSET_MASK) as u32))
+}
+
+fn new_dense() -> Box<[AtomicU64]> {
+    std::iter::repeat_with(|| AtomicU64::new(0))
         .take(WORDS_PER_CHUNK)
         .collect()
+}
+
+#[inline]
+fn dense_insert(words: &mut [AtomicU64], off: u32) -> bool {
+    let bit = 1u64 << (off & 63);
+    let word = words[(off >> 6) as usize].get_mut();
+    let was_set = (*word & bit) != 0;
+    *word |= bit;
+    !was_set
+}
+
+fn dense_from_offsets(offsets: &[u32]) -> Box<[AtomicU64]> {
+    let mut words = new_dense();
+    for &off in offsets {
+        dense_insert(&mut words, off);
+    }
+    words
+}
+
+/// Union of two sorted, deduplicated offset arrays.
+fn union_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => {
+                out.push(a[i]);
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                out.push(b[j]);
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
+    out
+}
+
+/// One 2^25-ID chunk.
+enum Chunk {
+    /// 4 MiB bit array; the only form the atomic setters can write.
+    Dense(Box<[AtomicU64]>),
+    /// Sorted, deduplicated in-chunk offsets; at most `SPARSE_MAX` of them.
+    Sparse(Vec<u32>),
+}
+
+impl Chunk {
+    fn new_sparse() -> Self {
+        Chunk::Sparse(Vec::new())
+    }
+
+    #[inline]
+    fn contains(&self, off: u32) -> bool {
+        match self {
+            Chunk::Dense(words) => {
+                (words[(off >> 6) as usize].load(Relaxed) & (1u64 << (off & 63))) != 0
+            }
+            Chunk::Sparse(offsets) => offsets.binary_search(&off).is_ok(),
+        }
+    }
+
+    /// Insert `off`; `true` if it was not already a member.
+    #[inline]
+    fn insert(&mut self, off: u32) -> bool {
+        match self {
+            Chunk::Dense(words) => dense_insert(words, off),
+            Chunk::Sparse(offsets) => {
+                // Append fast path: ascending population (sorted input) never
+                // searches.
+                if offsets.last().is_none_or(|&last| last < off) {
+                    if offsets.len() < SPARSE_MAX {
+                        offsets.push(off);
+                        return true;
+                    }
+                } else {
+                    match offsets.binary_search(&off) {
+                        Ok(_) => return false,
+                        Err(pos) if offsets.len() < SPARSE_MAX => {
+                            offsets.insert(pos, off);
+                            return true;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                // A new member that would exceed SPARSE_MAX: promote. The
+                // membership test above ran first, so a duplicate never
+                // promotes.
+                let mut words = dense_from_offsets(offsets);
+                dense_insert(&mut words, off);
+                *self = Chunk::Dense(words);
+                true
+            }
+        }
+    }
+
+    /// Turn an array chunk into a bit array (no-op on a bit array).
+    fn promote(&mut self) {
+        if let Chunk::Sparse(offsets) = self {
+            let words = dense_from_offsets(offsets);
+            *self = Chunk::Dense(words);
+        }
+    }
+
+    fn clone_chunk(&self) -> Self {
+        match self {
+            Chunk::Dense(words) => Chunk::Dense(
+                words
+                    .iter()
+                    .map(|w| AtomicU64::new(w.load(Relaxed)))
+                    .collect(),
+            ),
+            Chunk::Sparse(offsets) => Chunk::Sparse(offsets.clone()),
+        }
+    }
+
+    /// Union `src` into `self`, borrowing `src`.
+    fn union_ref(&mut self, src: &Chunk) {
+        // An array destination meeting a bit-array source becomes a bit
+        // array first; after this, an array destination implies an array
+        // source.
+        if matches!(src, Chunk::Dense(_)) {
+            self.promote();
+        }
+        match self {
+            Chunk::Dense(dst) => match src {
+                Chunk::Dense(s) => or_words(dst, s),
+                Chunk::Sparse(s) => {
+                    for &off in s {
+                        dense_insert(dst, off);
+                    }
+                }
+            },
+            Chunk::Sparse(dst) => match src {
+                Chunk::Sparse(s) => {
+                    let merged = union_sorted(dst, s);
+                    *self = if merged.len() > SPARSE_MAX {
+                        Chunk::Dense(dense_from_offsets(&merged))
+                    } else {
+                        Chunk::Sparse(merged)
+                    };
+                }
+                // Not reachable: a bit-array source promoted `self` above.
+                Chunk::Dense(_) => {}
+            },
+        }
+    }
+
+    /// Union `src` into `self`, consuming `src`. An array destination takes
+    /// a bit-array source's allocation whole instead of copying 4 MiB.
+    fn union_owned(&mut self, src: Chunk) {
+        match src {
+            Chunk::Dense(mut s) if matches!(self, Chunk::Sparse(_)) => {
+                if let Chunk::Sparse(dst) = self {
+                    for &off in dst.iter() {
+                        dense_insert(&mut s, off);
+                    }
+                }
+                *self = Chunk::Dense(s);
+            }
+            src => self.union_ref(&src),
+        }
+    }
+
+    #[cfg(test)]
+    fn count(&self) -> u64 {
+        match self {
+            Chunk::Dense(words) => words
+                .iter()
+                .map(|w| u64::from(w.load(Relaxed).count_ones()))
+                .sum(),
+            Chunk::Sparse(offsets) => offsets.len() as u64,
+        }
+    }
+
+    /// Per-block prefix counts for a bit array (`None` for an array chunk,
+    /// whose rank is a binary search) and the chunk's member count.
+    fn rank_blocks(&self) -> (Option<Vec<u32>>, u64) {
+        match self {
+            Chunk::Dense(words) => {
+                let mut prefix = Vec::with_capacity(BLOCKS_PER_CHUNK);
+                let mut within: u32 = 0;
+                for block in words.as_chunks::<WORDS_PER_BLOCK>().0 {
+                    prefix.push(within);
+                    for w in block {
+                        within += w.load(Relaxed).count_ones();
+                    }
+                }
+                (Some(prefix), u64::from(within))
+            }
+            Chunk::Sparse(offsets) => (None, offsets.len() as u64),
+        }
+    }
+
+    /// Members of this chunk strictly below `off`. `blocks` is this chunk's
+    /// entry from the rank index.
+    #[inline]
+    fn rank_within(&self, off: u32, blocks: Option<&[u32]>) -> u64 {
+        match self {
+            Chunk::Dense(words) => {
+                let block_idx = (off / BITS_PER_BLOCK) as usize;
+                let mut r = blocks.map_or(0, |bp| u64::from(bp[block_idx]));
+                let target_word = (off >> 6) as usize;
+                for w in &words[block_idx * WORDS_PER_BLOCK..target_word] {
+                    r += u64::from(w.load(Relaxed).count_ones());
+                }
+                let bit = off & 63;
+                if bit > 0 {
+                    let mask = (1u64 << bit) - 1;
+                    r += u64::from((words[target_word].load(Relaxed) & mask).count_ones());
+                }
+                r
+            }
+            Chunk::Sparse(offsets) => offsets.partition_point(|&x| x < off) as u64,
+        }
+    }
+
+    /// Whether any member lies in the inclusive offset range `[lo, hi]`.
+    fn any_in(&self, lo: u32, hi: u32) -> bool {
+        match self {
+            Chunk::Dense(words) => {
+                let start_word = (lo >> 6) as usize;
+                let end_word = (hi >> 6) as usize;
+                for (i, word) in words[start_word..=end_word].iter().enumerate() {
+                    let idx = start_word + i;
+                    let mut value = word.load(Relaxed);
+                    if idx == start_word {
+                        value &= u64::MAX << (lo & 63);
+                    }
+                    if idx == end_word && (hi & 63) != 63 {
+                        value &= (1u64 << ((hi & 63) + 1)) - 1;
+                    }
+                    if value != 0 {
+                        return true;
+                    }
+                }
+                false
+            }
+            Chunk::Sparse(offsets) => {
+                let i = offsets.partition_point(|&x| x < lo);
+                i < offsets.len() && offsets[i] <= hi
+            }
+        }
+    }
+
+    fn offsets(&self) -> ChunkOffsets<'_> {
+        match self {
+            Chunk::Dense(words) => ChunkOffsets::Dense {
+                words: &words[..],
+                next: 0,
+                cur: 0,
+                cur_base: 0,
+            },
+            Chunk::Sparse(offsets) => ChunkOffsets::Sparse(offsets.iter()),
+        }
+    }
+}
+
+/// OR `src`'s words into `dst`.
+fn or_words(dst: &mut [AtomicU64], src: &[AtomicU64]) {
+    for (d, s) in dst.iter_mut().zip(src.iter()) {
+        *d.get_mut() |= s.load(Relaxed);
+    }
+}
+
+/// Ascending in-chunk offsets of one chunk's members.
+enum ChunkOffsets<'a> {
+    Dense {
+        words: &'a [AtomicU64],
+        /// Index of the next word to load.
+        next: usize,
+        /// Unvisited set bits of the current word.
+        cur: u64,
+        /// Bit offset of the current word.
+        cur_base: u32,
+    },
+    Sparse(std::slice::Iter<'a, u32>),
+}
+
+impl Iterator for ChunkOffsets<'_> {
+    type Item = u32;
+
+    #[inline]
+    fn next(&mut self) -> Option<u32> {
+        match self {
+            ChunkOffsets::Dense {
+                words,
+                next,
+                cur,
+                cur_base,
+            } => loop {
+                if *cur != 0 {
+                    let tz = cur.trailing_zeros();
+                    *cur &= *cur - 1;
+                    return Some(*cur_base + tz);
+                }
+                if *next >= words.len() {
+                    return None;
+                }
+                *cur = words[*next].load(Relaxed);
+                *cur_base = (*next as u32) * 64;
+                *next += 1;
+            },
+            ChunkOffsets::Sparse(it) => it.next().copied(),
+        }
+    }
+}
+
+/// Prefix-sum index behind `rank()` and friends. Built and dropped as one
+/// unit, so no component can outlive the chunks it describes.
+struct RankIndex {
+    /// `chunk_prefix[cid]` = members in direct chunks `0..cid`; the last
+    /// entry (index `chunks.len()`) is the direct total.
+    chunk_prefix: Vec<u64>,
+    /// Per direct chunk: block prefixes for a bit array, `None` otherwise.
+    block_prefix: Vec<Option<Vec<u32>>>,
+    /// Overflow chunk ids, ascending.
+    ov_keys: Vec<u64>,
+    /// `ov_prefix[i]` = direct total + members in overflow chunks before
+    /// `ov_keys[i]`. One longer than `ov_keys`; the last entry is the grand
+    /// total, so an empty set has `[0]`.
+    ov_prefix: Vec<u64>,
+    /// Per overflow chunk, parallel to `ov_keys`.
+    ov_block: Vec<Option<Vec<u32>>>,
+}
+
+impl RankIndex {
+    fn total(&self) -> u64 {
+        self.ov_prefix.last().copied().unwrap_or(0)
+    }
+}
+
+/// Where a present chunk lives, for rank lookups.
+#[derive(Clone, Copy)]
+enum Slot {
+    Direct(usize),
+    Overflow,
 }
 
 impl IdSet {
     pub fn new() -> Self {
         Self {
             chunks: Vec::new(),
-            rank_chunk_prefix: None,
-            rank_block_prefix: None,
+            overflow: BTreeMap::new(),
+            rank: None,
         }
     }
 
-    /// Returns `true` if any chunk has been allocated (at least one `set` call).
+    /// Returns `true` if any chunk has been allocated (at least one `set`
+    /// call, or a `pre_allocate`).
     pub fn has_any(&self) -> bool {
-        self.chunks.iter().any(std::option::Option::is_some)
+        self.chunks.iter().any(Option::is_some) || !self.overflow.is_empty()
     }
 
-    /// Returns the number of allocated 4 MB chunks backing this set.
+    /// Returns the number of allocated chunks backing this set, in either
+    /// form (sorted array or 4 MiB bit array).
     pub fn allocated_chunk_count(&self) -> usize {
-        self.chunks.iter().filter(|chunk| chunk.is_some()).count()
+        self.chunks.iter().filter(|chunk| chunk.is_some()).count() + self.overflow.len()
+    }
+
+    #[inline]
+    fn chunk(&self, cid: u64) -> Option<(Slot, &Chunk)> {
+        if cid < DIRECT_CHUNKS {
+            let i = cid as usize;
+            self.chunks
+                .get(i)?
+                .as_ref()
+                .map(|chunk| (Slot::Direct(i), chunk))
+        } else {
+            self.overflow.get(&cid).map(|chunk| (Slot::Overflow, chunk))
+        }
+    }
+
+    #[inline]
+    fn chunk_entry(&mut self, cid: u64) -> &mut Chunk {
+        if cid < DIRECT_CHUNKS {
+            let i = cid as usize;
+            if i >= self.chunks.len() {
+                self.chunks.resize_with(i + 1, || None);
+            }
+            self.chunks[i].get_or_insert_with(Chunk::new_sparse)
+        } else {
+            self.overflow.entry(cid).or_insert_with(Chunk::new_sparse)
+        }
     }
 
     /// Perf note: do not call this per element inside a dense classify
@@ -57,20 +505,14 @@ impl IdSet {
     /// and drain into the set afterwards; direct `set()` is fine on
     /// sparse paths. See `reference/performance-history.md`
     /// "IdSetDense accumulation".
-    #[allow(clippy::cast_sign_loss)]
+    ///
+    /// Negative IDs are a silent no-op: they are not valid OSM element IDs
+    /// here (see "Negative input IDs rejected project-wide" in
+    /// `DEVIATIONS.md`). Any non-negative ID is accepted, up to `i64::MAX`,
+    /// without an allocation proportional to the ID.
+    #[inline]
     pub fn set(&mut self, id: i64) {
-        if id < 0 {
-            return;
-        } // Negative IDs are not valid OSM element IDs
-        self.drop_rank_index();
-        let id = id as u64;
-        let cid = (id >> (CHUNK_BITS + 3)) as usize;
-        if cid >= self.chunks.len() {
-            self.chunks.resize_with(cid + 1, || None);
-        }
-        let chunk = self.chunks[cid].get_or_insert_with(new_chunk);
-        let word = ((id >> 6) & ((WORDS_PER_CHUNK as u64) - 1)) as usize;
-        *chunk[word].get_mut() |= 1u64 << (id & 63);
+        self.set_if_new(id);
     }
 
     /// Set a bit and report whether it was previously unset. Returns `true`
@@ -80,29 +522,25 @@ impl IdSet {
     /// Matches `RoaringTreemap::insert`'s semantics for duplicate-detection
     /// callers. `verify_ids --full` uses this; general monotonic-population
     /// callers should prefer the void-return [`set`].
-    #[allow(clippy::cast_sign_loss)]
+    #[inline]
     pub fn set_if_new(&mut self, id: i64) -> bool {
-        if id < 0 {
+        let Some((cid, off)) = split(id) else {
             return false;
-        }
-        self.drop_rank_index();
-        let id = id as u64;
-        let cid = (id >> (CHUNK_BITS + 3)) as usize;
-        if cid >= self.chunks.len() {
-            self.chunks.resize_with(cid + 1, || None);
-        }
-        let chunk = self.chunks[cid].get_or_insert_with(new_chunk);
-        let word = ((id >> 6) & ((WORDS_PER_CHUNK as u64) - 1)) as usize;
-        let bit = 1u64 << (id & 63);
-        let value = chunk[word].get_mut();
-        let was_set = (*value & bit) != 0;
-        *value |= bit;
-        !was_set
+        };
+        self.rank = None;
+        self.chunk_entry(cid).insert(off)
     }
 
-    /// Pre-allocate all chunks needed to hold IDs up to `max_id`.
+    /// Pre-allocate bit-array chunks for every ID in `0..=max_id`.
     /// Call before `set_atomic` to avoid dynamic resizing during
-    /// concurrent access.
+    /// concurrent access. Chunks that already hold array contents from
+    /// `set` are promoted in place, keeping their members. Chunks above
+    /// `max_id` are left as they are (the atomic setters cannot write an
+    /// array chunk there; nothing relies on that).
+    ///
+    /// This eagerly allocates 4 MiB per 2^25 IDs of range, so `max_id` sizes
+    /// the allocation directly: a caller deriving it from untrusted input
+    /// (indexdata) must bound it first, as `check`'s `id_alloc_bound` does.
     ///
     /// # Invariant for callers
     ///
@@ -117,24 +555,31 @@ impl IdSet {
     ///   `max_id` than the element IDs that actually appear once the blob is
     ///   decoded. `renumber_external` builds its schedule from indexdata and
     ///   uses `pass1_schedule.last().max_id`.
-    /// - Future planet growth past a hard-coded cap (see `verify_ids`,
-    ///   `check_refs` which cap at 14e9 nodes, 1.5e9 ways, 25e6 relations).
+    /// - Future planet growth past a hard-coded cap.
     ///
     /// The defensive option is to verify `max_id` during the schedule scan
-    /// against a sanity bound, or to widen the hard-coded caps.
-    #[allow(clippy::cast_sign_loss)]
+    /// against a sanity bound, or to use the `_checked` setters.
     pub fn pre_allocate(&mut self, max_id: i64) {
-        if max_id < 0 {
+        let Some((max_cid, _)) = split(max_id) else {
             return;
+        };
+        self.rank = None;
+        let direct_end = max_cid.min(DIRECT_CHUNKS - 1) as usize;
+        if direct_end >= self.chunks.len() {
+            self.chunks.resize_with(direct_end + 1, || None);
         }
-        self.drop_rank_index();
-        let max_cid = (max_id as u64 >> (CHUNK_BITS + 3)) as usize;
-        if max_cid >= self.chunks.len() {
-            self.chunks.resize_with(max_cid + 1, || None);
+        for slot in &mut self.chunks[..=direct_end] {
+            match slot {
+                Some(chunk) => chunk.promote(),
+                None => *slot = Some(Chunk::Dense(new_dense())),
+            }
         }
-        for slot in &mut self.chunks {
-            if slot.is_none() {
-                *slot = Some(new_chunk());
+        for cid in DIRECT_CHUNKS..=max_cid {
+            match self.overflow.entry(cid) {
+                Entry::Occupied(mut e) => e.get_mut().promote(),
+                Entry::Vacant(e) => {
+                    e.insert(Chunk::Dense(new_dense()));
+                }
             }
         }
     }
@@ -146,28 +591,22 @@ impl IdSet {
     ///
     /// # Panics
     ///
-    /// Panics if `id` falls outside the pre-allocated range. This usually
-    /// means the caller's `pre_allocate(max_id)` argument underestimated the
-    /// highest ID that would be seen - most commonly because the value was
-    /// derived from indexdata that understated the real maximum (see the
-    /// `pre_allocate` doc for the full list of failure modes). The panic
-    /// message includes the offending ID and the pre-allocated upper bound
-    /// so it's obvious whether this is an indexdata bug, a hard-coded cap
-    /// overshoot, or a missing `pre_allocate` call.
+    /// Panics if `id` is negative or falls outside the pre-allocated range.
+    /// The out-of-range case usually means the caller's `pre_allocate(max_id)`
+    /// argument underestimated the highest ID that would be seen - most
+    /// commonly because the value was derived from indexdata that understated
+    /// the real maximum (see the `pre_allocate` doc for the full list of
+    /// failure modes). The panic message includes the offending ID so it's
+    /// obvious whether this is an indexdata bug, a hard-coded cap overshoot,
+    /// an unfiltered negative ID, or a missing `pre_allocate` call.
     ///
     /// Do NOT "fix" this panic by replacing it with a silent no-op or by
-    /// resizing `self.chunks` here - both would be wrong. A silent no-op
-    /// loses data; a resize is unsound because `&self` methods cannot
-    /// safely grow the backing `Vec` while other threads hold pointers
-    /// into it.
-    #[allow(clippy::cast_sign_loss)]
+    /// growing the set here - both would be wrong. A silent no-op loses data;
+    /// growing is unsound because `&self` methods cannot safely grow the
+    /// backing storage while other threads hold pointers into it.
     pub fn set_atomic(&self, id: i64) {
-        let id = id as u64;
-        let cid = (id >> (CHUNK_BITS + 3)) as usize;
-        let chunk = self.chunk_for_atomic(cid, id, "set_atomic");
-        let word = ((id >> 6) & ((WORDS_PER_CHUNK as u64) - 1)) as usize;
-        let bit = 1u64 << (id & 63);
-        chunk[word].fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+        let (words, off) = self.chunk_for_atomic(id, "set_atomic");
+        words[(off >> 6) as usize].fetch_or(1u64 << (off & 63), Relaxed);
     }
 
     /// Atomic set + duplicate detection. Returns `true` the first time an
@@ -181,14 +620,10 @@ impl IdSet {
     /// # Panics
     ///
     /// See [`Self::set_atomic`] - same panic contract and diagnostics.
-    #[allow(clippy::cast_sign_loss)]
     pub fn set_atomic_if_new(&self, id: i64) -> bool {
-        let id = id as u64;
-        let cid = (id >> (CHUNK_BITS + 3)) as usize;
-        let chunk = self.chunk_for_atomic(cid, id, "set_atomic_if_new");
-        let word = ((id >> 6) & ((WORDS_PER_CHUNK as u64) - 1)) as usize;
-        let bit = 1u64 << (id & 63);
-        let prev = chunk[word].fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+        let (words, off) = self.chunk_for_atomic(id, "set_atomic_if_new");
+        let bit = 1u64 << (off & 63);
+        let prev = words[(off >> 6) as usize].fetch_or(bit, Relaxed);
         (prev & bit) == 0
     }
 
@@ -205,13 +640,11 @@ impl IdSet {
     /// Callers that genuinely control the ID range (their `pre_allocate`
     /// argument provably covers every ID they will pass) should keep using
     /// `set_atomic`, whose panic catches a real caller bug.
-    #[allow(clippy::cast_sign_loss)]
     pub fn set_atomic_checked(&self, id: i64) -> bool {
-        let Some((chunk, id)) = self.chunk_for_atomic_opt(id) else {
+        let Some((words, off)) = self.dense_for_atomic(id) else {
             return false;
         };
-        let word = ((id >> 6) & ((WORDS_PER_CHUNK as u64) - 1)) as usize;
-        chunk[word].fetch_or(1u64 << (id & 63), std::sync::atomic::Ordering::Relaxed);
+        words[(off >> 6) as usize].fetch_or(1u64 << (off & 63), Relaxed);
         true
     }
 
@@ -221,89 +654,76 @@ impl IdSet {
     /// the pre-allocated range. `Some(true)` / `Some(false)` carry the usual
     /// first-seen / already-seen answer. See [`Self::set_atomic_checked`] for
     /// why the out-of-range case is a return value here rather than a panic.
-    #[allow(clippy::cast_sign_loss)]
     pub fn set_atomic_if_new_checked(&self, id: i64) -> Option<bool> {
-        let (chunk, id) = self.chunk_for_atomic_opt(id)?;
-        let word = ((id >> 6) & ((WORDS_PER_CHUNK as u64) - 1)) as usize;
-        let bit = 1u64 << (id & 63);
-        let prev = chunk[word].fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+        let (words, off) = self.dense_for_atomic(id)?;
+        let bit = 1u64 << (off & 63);
+        let prev = words[(off >> 6) as usize].fetch_or(bit, Relaxed);
         Some((prev & bit) == 0)
     }
 
-    /// Chunk lookup that reports failure instead of panicking.
+    /// The bit-array chunk an atomic setter may write for `id`, or `None`.
     ///
-    /// The bounds check is `Vec::get` plus the `Option<chunk>` slot, so it
-    /// covers negative IDs too without a separate branch: `-1 as u64` is
-    /// `u64::MAX`, whose chunk index is 2^45, which no `pre_allocate` can ever
-    /// reach. Negative IDs are legal in an OSM file (JOSM editor-local staging
-    /// IDs), so landing here is an input property, not a corrupt-state signal
-    /// - which is precisely why the caller gets `None` rather than a panic.
+    /// `None` covers a negative ID, a chunk that does not exist, and a chunk
+    /// that only holds array contents from `set` (the atomic setters cannot
+    /// grow or convert a chunk under `&self`; `pre_allocate` is what makes a
+    /// range writable). Negative IDs are legal in an OSM file (JOSM
+    /// editor-local staging IDs), so landing here is an input property, not a
+    /// corrupt-state signal - which is precisely why the checked callers get
+    /// `None` rather than a panic.
     #[inline]
-    #[allow(clippy::cast_sign_loss)]
-    fn chunk_for_atomic_opt(&self, id: i64) -> Option<(&[std::sync::atomic::AtomicU64], u64)> {
-        let id = id as u64;
-        let cid = (id >> (CHUNK_BITS + 3)) as usize;
-        let chunk = self.chunks.get(cid)?.as_ref()?;
-        Some((chunk, id))
+    fn dense_for_atomic(&self, id: i64) -> Option<(&[AtomicU64], u32)> {
+        let (cid, off) = split(id)?;
+        match self.chunk(cid)? {
+            (_, Chunk::Dense(words)) => Some((&words[..], off)),
+            (_, Chunk::Sparse(_)) => None,
+        }
     }
 
-    /// Shared chunk-lookup helper for `set_atomic` / `set_atomic_if_new`.
-    /// Produces a detailed panic message when the caller's `pre_allocate`
-    /// budget was exceeded - callers see exactly which ID fell outside the
-    /// pre-allocated range, so indexdata/max-id bugs are diagnosable from
-    /// a single panic line rather than an opaque "not pre-allocated".
+    /// Panicking chunk lookup for `set_atomic` / `set_atomic_if_new`, with a
+    /// message that says which of the failure modes this is.
     #[inline]
-    fn chunk_for_atomic(
-        &self,
-        cid: usize,
-        id: u64,
-        fn_name: &'static str,
-    ) -> &[std::sync::atomic::AtomicU64] {
-        if cid >= self.chunks.len() {
-            let max_covered = if self.chunks.is_empty() {
-                "<none - pre_allocate was never called>".to_string()
-            } else {
-                format!(
-                    "chunk {} (~id {})",
-                    self.chunks.len() - 1,
-                    (self.chunks.len() as u64) << (CHUNK_BITS + 3)
-                )
-            };
+    fn chunk_for_atomic(&self, id: i64, fn_name: &'static str) -> (&[AtomicU64], u32) {
+        if let Some(found) = self.dense_for_atomic(id) {
+            return found;
+        }
+        if id < 0 {
             panic!(
-                "{fn_name}: id {id} lands in chunk {cid}, but pre_allocate only \
-                 covers up to {max_covered}. Most likely cause: the caller's \
-                 `pre_allocate(max_id)` argument was derived from indexdata that \
-                 understated the real maximum ID, or from a hard-coded cap that \
-                 planet growth has exceeded. See `IdSet::pre_allocate` docs."
+                "{fn_name}: negative id {id}. An IdSet stores only non-negative \
+                 IDs; the caller must reject or filter negative IDs before an \
+                 atomic insert, or use the `_checked` variant."
             );
         }
-        match self.chunks[cid].as_ref() {
-            Some(c) => c,
-            None => panic!(
-                "{fn_name}: id {id} lands in chunk {cid} (within Vec length {}), \
-                 but that chunk's slot is None. This means `pre_allocate()` was \
-                 never called on this IdSet - the `set_atomic*` methods \
-                 require explicit pre-allocation because they cannot grow under \
-                 a shared `&self` borrow.",
-                self.chunks.len(),
+        let last_cid = self.overflow.keys().next_back().copied().or_else(|| {
+            self.chunks
+                .iter()
+                .rposition(Option::is_some)
+                .map(|i| i as u64)
+        });
+        let max_covered = match last_cid {
+            None => "<none - pre_allocate was never called>".to_string(),
+            Some(cid) => format!(
+                "chunk {cid} (ids below {})",
+                (u128::from(cid) + 1) << ID_SHIFT
             ),
-        }
+        };
+        panic!(
+            "{fn_name}: id {id} lands in chunk {}, which pre_allocate did not \
+             cover (allocated chunks reach {max_covered}). Most likely cause: \
+             the caller's `pre_allocate(max_id)` argument was derived from \
+             indexdata that understated the real maximum ID, or from a \
+             hard-coded cap that planet growth has exceeded. See \
+             `IdSet::pre_allocate` docs.",
+            (id as u64) >> ID_SHIFT,
+        );
     }
 
-    #[allow(clippy::cast_sign_loss)]
+    #[inline]
     pub fn get(&self, id: i64) -> bool {
-        let id = id as u64;
-        let cid = (id >> (CHUNK_BITS + 3)) as usize;
-        if cid >= self.chunks.len() {
+        let Some((cid, off)) = split(id) else {
             return false;
-        }
-        match &self.chunks[cid] {
-            None => false,
-            Some(chunk) => {
-                let word = ((id >> 6) & ((WORDS_PER_CHUNK as u64) - 1)) as usize;
-                (chunk[word].load(std::sync::atomic::Ordering::Relaxed) & (1u64 << (id & 63))) != 0
-            }
-        }
+        };
+        self.chunk(cid)
+            .is_some_and(|(_, chunk)| chunk.contains(off))
     }
 
     /// Check if any ID in the range [min_id, max_id] is set.
@@ -323,45 +743,44 @@ impl IdSet {
     /// project stance and the call sites that depend on this behavior
     /// (`getid` blob-prefilter, `add-locations-to-ways --index-type external`
     /// stage 4).
-    #[allow(clippy::cast_sign_loss)]
     pub fn any_in_range(&self, min_id: i64, max_id: i64) -> bool {
         if min_id > max_id || max_id < 0 {
             return false;
         }
-        let min_id = min_id.max(0) as u64;
-        let max_id = max_id as u64;
-        let min_chunk = (min_id >> (CHUNK_BITS + 3)) as usize;
-        let max_chunk = (max_id >> (CHUNK_BITS + 3)) as usize;
+        let Some((min_cid, min_off)) = split(min_id.max(0)) else {
+            return false;
+        };
+        let Some((max_cid, max_off)) = split(max_id) else {
+            return false;
+        };
+        // Clip the query to one chunk's offsets. Offsets are within-chunk,
+        // so no bound is ever formed as `id + 1`.
+        let clip = |cid: u64| -> (u32, u32) {
+            let lo = if cid == min_cid { min_off } else { 0 };
+            let hi = if cid == max_cid {
+                max_off
+            } else {
+                OFFSET_MASK as u32
+            };
+            (lo, hi)
+        };
 
-        for cid in min_chunk..=max_chunk {
-            if cid >= self.chunks.len() {
-                return false;
-            }
-            if let Some(chunk) = &self.chunks[cid] {
-                // Determine the bit range within this chunk.
-                let chunk_base = (cid as u64) << (CHUNK_BITS + 3);
-                let range_start = min_id.saturating_sub(chunk_base);
-                let chunk_end = chunk_base + ((CHUNK_SIZE as u64) << 3);
-                let range_end = if max_id < chunk_end {
-                    max_id - chunk_base
-                } else {
-                    ((CHUNK_SIZE as u64) << 3) - 1
-                };
-
-                let start_word = (range_start >> 6) as usize;
-                let end_word = ((range_end >> 6) as usize).min(WORDS_PER_CHUNK - 1);
-                for (word_idx, word) in chunk[start_word..=end_word].iter().enumerate() {
-                    let absolute_word = start_word + word_idx;
-                    let mut value = word.load(std::sync::atomic::Ordering::Relaxed);
-                    if absolute_word == start_word {
-                        value &= u64::MAX << (range_start & 63);
-                    }
-                    if absolute_word == end_word && (range_end & 63) != 63 {
-                        value &= (1u64 << ((range_end & 63) + 1)) - 1;
-                    }
-                    if value != 0 {
+        if min_cid < DIRECT_CHUNKS && !self.chunks.is_empty() {
+            let last = max_cid.min(self.chunks.len() as u64 - 1);
+            for cid in min_cid..=last {
+                if let Some(chunk) = &self.chunks[cid as usize] {
+                    let (lo, hi) = clip(cid);
+                    if chunk.any_in(lo, hi) {
                         return true;
                     }
+                }
+            }
+        }
+        if max_cid >= DIRECT_CHUNKS {
+            for (&cid, chunk) in self.overflow.range(min_cid.max(DIRECT_CHUNKS)..=max_cid) {
+                let (lo, hi) = clip(cid);
+                if chunk.any_in(lo, hi) {
+                    return true;
                 }
             }
         }
@@ -370,273 +789,223 @@ impl IdSet {
 
     /// Iterate over all set IDs in ascending order.
     pub fn iter(&self) -> impl Iterator<Item = i64> + '_ {
-        self.chunks.iter().enumerate().flat_map(|(cid, chunk)| {
-            let chunk_base = (cid as u64) << (CHUNK_BITS + 3);
-            chunk.iter().flat_map(move |data| {
-                data.iter().enumerate().flat_map(move |(word_idx, word)| {
-                    let value = word.load(std::sync::atomic::Ordering::Relaxed);
-                    (0..64u8).filter_map(move |bit| {
-                        if value & (1 << bit) != 0 {
-                            #[allow(clippy::cast_possible_wrap)]
-                            Some((chunk_base + (word_idx as u64) * 64 + u64::from(bit)) as i64)
-                        } else {
-                            None
-                        }
-                    })
-                })
-            })
+        let direct = self
+            .chunks
+            .iter()
+            .enumerate()
+            .filter_map(|(cid, chunk)| chunk.as_ref().map(|chunk| (cid as u64, chunk)));
+        let overflow = self.overflow.iter().map(|(&cid, chunk)| (cid, chunk));
+        direct.chain(overflow).flat_map(|(cid, chunk)| {
+            let base = cid << ID_SHIFT;
+            chunk
+                .offsets()
+                .map(move |off| (base + u64::from(off)) as i64)
         })
     }
 
     /// Merge all set bits from `other` into `self` (union).
     pub fn merge_from(&mut self, other: &IdSet) {
-        self.prepare_merge(other.chunks.len());
+        self.rank = None;
+        if other.chunks.len() > self.chunks.len() {
+            self.chunks.resize_with(other.chunks.len(), || None);
+        }
         for (slot, src) in self.chunks.iter_mut().zip(other.chunks.iter()) {
-            if let Some(src_chunk) = src {
-                or_chunk_into(slot.get_or_insert_with(new_chunk), src_chunk);
+            if let Some(src) = src {
+                match slot {
+                    Some(dst) => dst.union_ref(src),
+                    None => *slot = Some(src.clone_chunk()),
+                }
+            }
+        }
+        for (&cid, src) in &other.overflow {
+            match self.overflow.entry(cid) {
+                Entry::Occupied(mut e) => e.get_mut().union_ref(src),
+                Entry::Vacant(e) => {
+                    e.insert(src.clone_chunk());
+                }
             }
         }
     }
 
-    /// Shared prologue of both merge forms: the rank index is derived from
-    /// the bits and cannot survive them changing, and `self` must be at
-    /// least as long as `other` before the two are zipped.
-    fn prepare_merge(&mut self, other_chunks: usize) {
-        self.drop_rank_index();
-        if other_chunks > self.chunks.len() {
-            self.chunks.resize_with(other_chunks, || None);
+    /// Merge another IdSet into this one (union).
+    ///
+    /// For non-overlapping chunks (common in sorted PBFs where each rayon thread
+    /// processes a contiguous ID range), chunks are moved with zero copying.
+    /// For overlapping chunks, the members are unioned.
+    pub fn merge(&mut self, other: Self) {
+        self.rank = None;
+        if other.chunks.len() > self.chunks.len() {
+            self.chunks.resize_with(other.chunks.len(), || None);
+        }
+        for (slot, src) in self.chunks.iter_mut().zip(other.chunks) {
+            if let Some(src) = src {
+                match slot {
+                    Some(dst) => dst.union_owned(src),
+                    // The reason the owned form exists: an absent
+                    // destination chunk takes the source allocation whole,
+                    // with no 4 MB copy and no word-by-word OR.
+                    None => *slot = Some(src),
+                }
+            }
+        }
+        for (cid, src) in other.overflow {
+            match self.overflow.entry(cid) {
+                Entry::Occupied(mut e) => e.get_mut().union_owned(src),
+                Entry::Vacant(e) => {
+                    e.insert(src);
+                }
+            }
         }
     }
 
-    /// Build the prefix-sum index for O(1) `rank()` queries.
+    /// Build the prefix-sum index for `rank()` queries (O(1) on the direct
+    /// range, O(log n) above it).
     /// Must be called after all `set()` calls are complete.
     /// Invalidated by subsequent `set()` or `merge()` calls.
     pub fn build_rank_index(&mut self) {
-        const BLOCK_BYTES: usize = 64; // 8 u64 words = 512 bits per block
-        const WORDS_PER_BLOCK: usize = BLOCK_BYTES / 8;
-        const BLOCKS_PER_CHUNK: usize = CHUNK_SIZE / BLOCK_BYTES;
+        // Free the previous index before building its replacement.
+        self.rank = None;
 
         let mut chunk_prefix = Vec::with_capacity(self.chunks.len() + 1);
         let mut block_prefix = Vec::with_capacity(self.chunks.len());
         let mut cumulative: u64 = 0;
-
         for chunk in &self.chunks {
             chunk_prefix.push(cumulative);
-            if let Some(data) = chunk {
-                let mut bp = Vec::with_capacity(BLOCKS_PER_CHUNK);
-                let mut within_chunk: u32 = 0;
-                for block_idx in 0..BLOCKS_PER_CHUNK {
-                    bp.push(within_chunk);
-                    let start = block_idx * WORDS_PER_BLOCK;
-                    for word in &data[start..start + WORDS_PER_BLOCK] {
-                        let w = word.load(std::sync::atomic::Ordering::Relaxed);
-                        within_chunk += w.count_ones();
-                    }
+            match chunk {
+                Some(chunk) => {
+                    let (blocks, count) = chunk.rank_blocks();
+                    block_prefix.push(blocks);
+                    cumulative += count;
                 }
-                cumulative += u64::from(within_chunk);
-                block_prefix.push(Some(bp));
-            } else {
-                block_prefix.push(None);
+                None => block_prefix.push(None),
             }
         }
-        chunk_prefix.push(cumulative); // sentinel for total count
+        chunk_prefix.push(cumulative);
 
-        self.rank_chunk_prefix = Some(chunk_prefix);
-        self.rank_block_prefix = Some(block_prefix);
-    }
-
-    /// Returns the rank (0-based position among all set IDs) of `id`.
-    /// Requires `build_rank_index()` to have been called first.
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    pub fn rank(&self, id: i64) -> u64 {
-        const BLOCK_BYTES: usize = 64;
-        const WORDS_PER_BLOCK: usize = BLOCK_BYTES / 8;
-
-        let chunk_prefix = self
-            .rank_chunk_prefix
-            .as_ref()
-            .expect("rank() called without build_rank_index()");
-        let block_prefix = self
-            .rank_block_prefix
-            .as_ref()
-            .expect("rank() called without build_rank_index()");
-
-        let id = id as u64;
-        let cid = (id >> (CHUNK_BITS + 3)) as usize;
-        let mut r = chunk_prefix[cid];
-
-        if let Some(chunk) = &self.chunks[cid] {
-            let bit_offset = (id & (((CHUNK_SIZE as u64) << 3) - 1)) as usize;
-            let target_byte = bit_offset >> 3;
-            let target_bit = bit_offset & 7;
-            let block_idx = target_byte / BLOCK_BYTES;
-
-            // Add pre-computed block prefix sum.
-            if let Some(bp) = &block_prefix[cid] {
-                r += u64::from(bp[block_idx]);
-            }
-
-            // Scan only the remaining words within the block (max 31 words).
-            let block_start_word = block_idx * WORDS_PER_BLOCK;
-            let target_word = target_byte / 8;
-            for word in &chunk[block_start_word..target_word] {
-                let w = word.load(std::sync::atomic::Ordering::Relaxed);
-                r += u64::from(w.count_ones());
-            }
-
-            // Count bits in the partial word up to (but not including) target bit.
-            let word = chunk[target_word].load(std::sync::atomic::Ordering::Relaxed);
-            let bit_in_word = ((target_byte & 7) << 3) + target_bit;
-            if bit_in_word > 0 {
-                let mask = (1u64 << bit_in_word) - 1;
-                r += u64::from((word & mask).count_ones());
-            }
+        let mut ov_keys = Vec::with_capacity(self.overflow.len());
+        let mut ov_prefix = Vec::with_capacity(self.overflow.len() + 1);
+        let mut ov_block = Vec::with_capacity(self.overflow.len());
+        for (&cid, chunk) in &self.overflow {
+            ov_keys.push(cid);
+            ov_prefix.push(cumulative);
+            let (blocks, count) = chunk.rank_blocks();
+            ov_block.push(blocks);
+            cumulative += count;
         }
+        ov_prefix.push(cumulative);
 
-        r
+        self.rank = Some(RankIndex {
+            chunk_prefix,
+            block_prefix,
+            ov_keys,
+            ov_prefix,
+            ov_block,
+        });
     }
 
-    /// Combined get + rank in a single lookup. Returns `start_id + rank(id)`
-    /// if `id` is set, or `id` unchanged if not (orphan passthrough).
-    /// Avoids the double chunk lookup + bounds check of separate `get()` + `rank()`.
-    /// Requires `build_rank_index()`.
+    /// Rank of member offset `off` in the present chunk `chunk` (chunk id
+    /// `cid`, found at `slot`): set IDs strictly below it.
     #[inline]
-    #[allow(
-        clippy::cast_sign_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap
-    )]
-    pub fn resolve(&self, id: i64, start_id: i64) -> i64 {
-        const BLOCK_BYTES: usize = 64;
-        const WORDS_PER_BLOCK: usize = BLOCK_BYTES / 8;
-
-        let uid = id as u64;
-        let cid = (uid >> (CHUNK_BITS + 3)) as usize;
-
-        // Fast path: chunk doesn't exist → orphan.
-        if cid >= self.chunks.len() {
-            return id;
+    fn rank_in_chunk(idx: &RankIndex, slot: Slot, cid: u64, chunk: &Chunk, off: u32) -> u64 {
+        match slot {
+            Slot::Direct(i) => {
+                idx.chunk_prefix[i] + chunk.rank_within(off, idx.block_prefix[i].as_deref())
+            }
+            Slot::Overflow => {
+                let i = idx.ov_keys.partition_point(|&k| k < cid);
+                idx.ov_prefix[i] + chunk.rank_within(off, idx.ov_block[i].as_deref())
+            }
         }
-        let chunk = match &self.chunks[cid] {
-            Some(c) => c,
-            None => return id,
-        };
-
-        // Check if the bit is set.
-        let bit_offset = (uid & (((CHUNK_SIZE as u64) << 3) - 1)) as usize;
-        let target_byte = bit_offset >> 3;
-        let target_bit = bit_offset & 7;
-        let target_word = target_byte / 8;
-        let word = chunk[target_word].load(std::sync::atomic::Ordering::Relaxed);
-        let bit_in_word = ((target_byte & 7) << 3) + target_bit;
-        if (word & (1u64 << bit_in_word)) == 0 {
-            return id; // not set → orphan
-        }
-
-        // Bit is set - compute rank.
-        let chunk_prefix = self
-            .rank_chunk_prefix
-            .as_ref()
-            .expect("resolve() called without build_rank_index()");
-        let block_prefix = self
-            .rank_block_prefix
-            .as_ref()
-            .expect("resolve() called without build_rank_index()");
-
-        let mut r = chunk_prefix[cid];
-        let block_idx = target_byte / BLOCK_BYTES;
-
-        if let Some(bp) = &block_prefix[cid] {
-            r += u64::from(bp[block_idx]);
-        }
-
-        let block_start_word = block_idx * WORDS_PER_BLOCK;
-        for item in &chunk[block_start_word..target_word] {
-            let w = item.load(std::sync::atomic::Ordering::Relaxed);
-            r += u64::from(w.count_ones());
-        }
-
-        if bit_in_word > 0 {
-            let mask = (1u64 << bit_in_word) - 1;
-            r += u64::from((word & mask).count_ones());
-        }
-
-        start_id + r as i64
     }
 
-    /// Combined get + rank in a single lookup. Returns `Some(rank)` if `id`
-    /// is set, `None` if not. Avoids the double chunk/bit lookup of separate
-    /// `get()` + `rank()` calls. Requires `build_rank_index()`.
-    #[inline]
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    pub fn rank_if_set(&self, id: i64) -> Option<u64> {
-        const BLOCK_BYTES: usize = 64;
-        const WORDS_PER_BLOCK: usize = BLOCK_BYTES / 8;
-
-        let uid = id as u64;
-        let cid = (uid >> (CHUNK_BITS + 3)) as usize;
-
-        if cid >= self.chunks.len() {
-            return None;
-        }
-        let chunk = self.chunks[cid].as_ref()?;
-
-        let bit_offset = (uid & (((CHUNK_SIZE as u64) << 3) - 1)) as usize;
-        let target_byte = bit_offset >> 3;
-        let target_bit = bit_offset & 7;
-        let target_word = target_byte / 8;
-        let word = chunk[target_word].load(std::sync::atomic::Ordering::Relaxed);
-        let bit_in_word = ((target_byte & 7) << 3) + target_bit;
-        if (word & (1u64 << bit_in_word)) == 0 {
-            return None;
-        }
-
-        let chunk_prefix = self.rank_chunk_prefix.as_ref()?;
-        let block_prefix = self.rank_block_prefix.as_ref()?;
-
-        let mut r = chunk_prefix[cid];
-        let block_idx = target_byte / BLOCK_BYTES;
-
-        if let Some(bp) = &block_prefix[cid] {
-            r += u64::from(bp[block_idx]);
-        }
-
-        let block_start_word = block_idx * WORDS_PER_BLOCK;
-        for item in &chunk[block_start_word..target_word] {
-            let w = item.load(std::sync::atomic::Ordering::Relaxed);
-            r += u64::from(w.count_ones());
-        }
-
-        if bit_in_word > 0 {
-            let mask = (1u64 << bit_in_word) - 1;
-            r += u64::from((word & mask).count_ones());
-        }
-
-        Some(r)
-    }
-
-    /// Count of set IDs strictly less than `id`. Safe for any `i64` -
-    /// arguments below zero return 0, arguments past the highest allocated
-    /// chunk return `total_count()`. Unlike `rank()`, never panics on
-    /// out-of-range inputs.
+    /// Returns the rank (0-based position among all set IDs) of `id`: the
+    /// number of set IDs strictly below it. Defined for every `i64`, whether
+    /// or not `id` is set: arguments at or below zero return 0, arguments
+    /// past the highest chunk return `total_count()`.
     ///
-    /// Requires `build_rank_index()`.
-    #[allow(clippy::cast_sign_loss)]
-    pub fn count_below(&self, id: i64) -> u64 {
+    /// Requires `build_rank_index()` to have been called first (panics
+    /// otherwise, except for `id <= 0`, which needs no index).
+    pub fn rank(&self, id: i64) -> u64 {
         if id <= 0 {
             return 0;
         }
-        let uid = id as u64;
-        let cid = (uid >> (CHUNK_BITS + 3)) as usize;
-        if cid >= self.chunks.len() {
-            return self.total_count();
+        let idx = self
+            .rank
+            .as_ref()
+            .expect("rank() called without build_rank_index()");
+        let Some((cid, off)) = split(id) else {
+            return 0;
+        };
+        if cid < DIRECT_CHUNKS {
+            let i = cid as usize;
+            if i >= self.chunks.len() {
+                // Past every direct chunk; every overflow ID is larger.
+                return idx.chunk_prefix[self.chunks.len()];
+            }
+            match &self.chunks[i] {
+                Some(chunk) => Self::rank_in_chunk(idx, Slot::Direct(i), cid, chunk, off),
+                None => idx.chunk_prefix[i],
+            }
+        } else {
+            let i = idx.ov_keys.partition_point(|&k| k < cid);
+            let mut r = idx.ov_prefix[i];
+            if idx.ov_keys.get(i) == Some(&cid)
+                && let Some(chunk) = self.overflow.get(&cid)
+            {
+                r += chunk.rank_within(off, idx.ov_block[i].as_deref());
+            }
+            r
         }
+    }
+
+    /// Combined get + rank in a single lookup. Returns `start_id + rank(id)`
+    /// if `id` is set, or `id` unchanged if not (orphan passthrough, which
+    /// includes every negative ID).
+    /// Requires `build_rank_index()` (panics without it when `id` is set).
+    #[inline]
+    pub fn resolve(&self, id: i64, start_id: i64) -> i64 {
+        let Some((cid, off)) = split(id) else {
+            return id;
+        };
+        let Some((slot, chunk)) = self.chunk(cid) else {
+            return id;
+        };
+        if !chunk.contains(off) {
+            return id; // not set -> orphan
+        }
+        let idx = self
+            .rank
+            .as_ref()
+            .expect("resolve() called without build_rank_index()");
+        start_id + Self::rank_in_chunk(idx, slot, cid, chunk, off) as i64
+    }
+
+    /// Combined get + rank in a single lookup. Returns `Some(rank)` if `id`
+    /// is set, `None` if not. Avoids the double chunk lookup of separate
+    /// `get()` + `rank()` calls. Returns `None` without `build_rank_index()`.
+    #[inline]
+    pub fn rank_if_set(&self, id: i64) -> Option<u64> {
+        let (cid, off) = split(id)?;
+        let (slot, chunk) = self.chunk(cid)?;
+        if !chunk.contains(off) {
+            return None;
+        }
+        let idx = self.rank.as_ref()?;
+        Some(Self::rank_in_chunk(idx, slot, cid, chunk, off))
+    }
+
+    /// Count of set IDs strictly less than `id`. Same as [`Self::rank`],
+    /// which is defined for every `i64`; kept as the name the range-count
+    /// callers read best with.
+    ///
+    /// Requires `build_rank_index()`.
+    pub fn count_below(&self, id: i64) -> u64 {
         self.rank(id)
     }
 
     /// Count of set IDs in the inclusive range `[min_id, max_id]`. Returns
     /// 0 for an empty range. Safe for arguments outside the allocated chunk
-    /// space (clamps via `count_below`).
+    /// space.
     ///
     /// Used by external join's stage 1 to compute per-node-blob referenced
     /// rank ranges from the blob's indexdata `(min_id, max_id)` without
@@ -654,58 +1023,34 @@ impl IdSet {
         after_max - self.count_below(min_id)
     }
 
-    /// Drop the rank-index prefix arrays built by `build_rank_index()`. After
-    /// this call, `rank()`, `rank_if_set()`, `resolve()`, `count_below()`,
-    /// `count_in_range()`, and `total_count()` all fail (panic or return
-    /// `None`). The bitmap itself (chunk storage) is retained - `get()`,
-    /// `set()`, and `has_any()` still work.
+    /// Drop the rank index built by `build_rank_index()`. After this call,
+    /// `rank()`, `resolve()`, `count_below()`, `count_in_range()` and
+    /// `total_count()` panic, and `rank_if_set()` returns `None`. The members
+    /// themselves are retained - `get()`, `set()`, and `has_any()` still work.
     ///
     /// Used by stage 2 of the external ALTW join to free ~100 MB of rank
     /// metadata once all rank consumers in stage 1 are finished.
     pub fn drop_rank_index(&mut self) {
-        self.rank_chunk_prefix = None;
-        self.rank_block_prefix = None;
+        self.rank = None;
     }
 
     /// Returns the total number of set IDs. Requires `build_rank_index()`.
     pub fn total_count(&self) -> u64 {
-        let prefix = self
-            .rank_chunk_prefix
+        self.rank
             .as_ref()
-            .expect("total_count() called without build_rank_index()");
-        prefix[self.chunks.len()]
+            .expect("total_count() called without build_rank_index()")
+            .total()
     }
 
-    /// Merge another IdSet into this one via bitwise OR.
-    ///
-    /// For non-overlapping chunks (common in sorted PBFs where each rayon thread
-    /// processes a contiguous ID range), chunks are moved with zero copying.
-    /// For overlapping chunks, byte-level OR is applied.
-    pub fn merge(&mut self, other: Self) {
-        self.prepare_merge(other.chunks.len());
-        for (slot, src) in self.chunks.iter_mut().zip(other.chunks) {
-            if let Some(src_chunk) = src {
-                match slot {
-                    Some(dst) => or_chunk_into(dst, &src_chunk),
-                    // The reason the owned form exists: an absent
-                    // destination chunk takes the source allocation whole,
-                    // with no 4 MB copy and no word-by-word OR.
-                    None => *slot = Some(src_chunk),
-                }
-            }
-        }
-    }
-}
-
-/// OR `src`'s words into `dst`. The one place the two merge forms agree on
-/// what merging a chunk means; they differ only in the owned form's ability
-/// to move a chunk instead of calling this.
-fn or_chunk_into(
-    dst: &mut Box<[std::sync::atomic::AtomicU64]>,
-    src: &[std::sync::atomic::AtomicU64],
-) {
-    for (d, s) in dst.iter_mut().zip(src.iter()) {
-        *d.get_mut() |= s.load(std::sync::atomic::Ordering::Relaxed);
+    /// Total number of set IDs without a rank index (walks every chunk).
+    #[cfg(test)]
+    fn count_slow(&self) -> u64 {
+        self.chunks
+            .iter()
+            .flatten()
+            .chain(self.overflow.values())
+            .map(Chunk::count)
+            .sum()
     }
 }
 
@@ -741,14 +1086,41 @@ mod tests {
         assert!(!s.set_atomic_checked(far));
 
         // Negative IDs are legal OSM (JOSM editor-local staging IDs) and must
-        // not panic either. Note this is a *contract* assertion, not a guard
-        // assertion: `-1 as u64` is u64::MAX, so the bounds check above
-        // already rejects it and no separate negative branch is needed. Said
-        // plainly so nobody later reads this as coverage for a guard that
-        // does not exist.
+        // not panic either.
         assert_eq!(s.set_atomic_if_new_checked(-1), None);
         assert!(!s.set_atomic_checked(-1));
         assert!(!s.get(-1));
+    }
+
+    #[test]
+    #[should_panic(expected = "negative id -7")]
+    fn set_atomic_names_a_negative_id_instead_of_blaming_pre_allocate() {
+        let mut s = IdSet::new();
+        s.pre_allocate(1_000);
+        s.set_atomic(-7);
+    }
+
+    #[test]
+    #[should_panic(expected = "which pre_allocate did not cover")]
+    fn set_atomic_past_the_pre_allocated_range_still_panics() {
+        let mut s = IdSet::new();
+        s.pre_allocate(1_000);
+        s.set_atomic(1_i64 << 40);
+    }
+
+    #[test]
+    fn atomic_setters_need_pre_allocate_not_a_prior_set() {
+        // A chunk populated by `set` alone is an array chunk, which the
+        // atomic setters cannot write under `&self`. The documented contract
+        // was always "requires pre_allocate"; this pins the consequence.
+        let mut s = IdSet::new();
+        s.set(42);
+        assert!(!s.set_atomic_checked(43));
+        // pre_allocate promotes it in place and keeps its member.
+        s.pre_allocate(100);
+        assert!(s.get(42));
+        assert!(s.set_atomic_checked(43));
+        assert!(s.get(43));
     }
 
     #[test]
@@ -775,8 +1147,7 @@ mod tests {
     #[test]
     fn chunk_boundary_ids() {
         let mut s = IdSet::new();
-        // Chunk size is 1 << 22 bytes = 4MB = 33_554_432 bits.
-        // IDs at and around the boundary cross chunks.
+        // A chunk covers 2^25 = 33_554_432 IDs.
         let boundary: i64 = 33_554_432;
         s.set(0);
         s.set(boundary - 1);
@@ -792,6 +1163,84 @@ mod tests {
     }
 
     #[test]
+    fn extreme_ids_cost_no_allocation_proportional_to_the_id() {
+        // BUG-024: one ID near i64::MAX used to resize the chunk directory to
+        // ~2^38 entries and abort. It now lands in one overflow array chunk.
+        let mut s = IdSet::new();
+        s.set(i64::MAX);
+        s.set(i64::MAX - 1);
+        s.set(1_i64 << 50);
+        s.set(7);
+        assert!(s.get(i64::MAX));
+        assert!(s.get(i64::MAX - 1));
+        assert!(s.get(1_i64 << 50));
+        assert!(!s.get(i64::MAX - 2));
+        assert_eq!(s.chunks.len(), 1, "direct directory must not grow");
+        assert_eq!(s.overflow.len(), 2);
+        assert!(
+            s.overflow.values().all(|c| matches!(c, Chunk::Sparse(_))),
+            "an isolated id must not cost a 4 MiB bit array"
+        );
+        assert_eq!(
+            s.iter().collect::<Vec<_>>(),
+            vec![7, 1_i64 << 50, i64::MAX - 1, i64::MAX]
+        );
+        s.build_rank_index();
+        assert_eq!(s.total_count(), 4);
+        assert_eq!(s.rank(i64::MAX), 3);
+        assert_eq!(s.rank_if_set(i64::MAX - 1), Some(2));
+        assert_eq!(s.count_in_range(0, i64::MAX), 4);
+        assert!(s.any_in_range(i64::MAX, i64::MAX));
+    }
+
+    #[test]
+    fn promotion_at_exactly_sparse_max_plus_one() {
+        let mut s = IdSet::new();
+        // Descending, so the append fast path never applies.
+        for k in (0..SPARSE_MAX as i64).rev() {
+            assert!(s.set_if_new(k * 3));
+        }
+        assert!(matches!(s.chunks[0], Some(Chunk::Sparse(_))));
+        // A duplicate at the boundary must not promote.
+        assert!(!s.set_if_new(0));
+        assert!(matches!(s.chunks[0], Some(Chunk::Sparse(_))));
+        // Member 4097 promotes and keeps every earlier member.
+        assert!(s.set_if_new(1));
+        assert!(matches!(s.chunks[0], Some(Chunk::Dense(_))));
+        for k in 0..SPARSE_MAX as i64 {
+            assert!(s.get(k * 3));
+        }
+        assert!(s.get(1));
+        assert!(!s.get(2));
+        s.build_rank_index();
+        assert_eq!(s.total_count(), SPARSE_MAX as u64 + 1);
+        assert_eq!(s.rank(3), 2); // 0 and 1 are below 3
+    }
+
+    #[test]
+    fn rank_is_total_over_every_i64() {
+        // BUG-024: `rank` indexed `chunk_prefix[cid]` unchecked and panicked
+        // past the last chunk or on a negative id.
+        let mut s = IdSet::new();
+        s.set(5);
+        s.set(10);
+        s.build_rank_index();
+        assert_eq!(s.rank(-1), 0);
+        assert_eq!(s.rank(i64::MIN), 0);
+        assert_eq!(s.rank(0), 0);
+        assert_eq!(s.rank(6), 1);
+        assert_eq!(s.rank(1_000_000_000_000), 2);
+        assert_eq!(s.rank(i64::MAX), 2);
+
+        let mut empty = IdSet::new();
+        empty.build_rank_index();
+        assert_eq!(empty.total_count(), 0);
+        assert_eq!(empty.rank(i64::MAX), 0);
+        assert_eq!(empty.rank(12_345), 0);
+        assert_eq!(empty.count_in_range(0, i64::MAX), 0);
+    }
+
+    #[test]
     fn any_in_range_hit_and_miss() {
         let mut s = IdSet::new();
         s.set(50);
@@ -802,15 +1251,29 @@ mod tests {
         assert!(s.any_in_range(50, 50));
         assert!(s.any_in_range(190, 210));
 
-        // Range that does not contain any set ID
-        // any_in_range masks the partial words at both ends, so these are
-        // exact and not merely word-granular over-approximations.
+        // Range that does not contain any set ID. Exact, not word-granular.
         assert!(!s.any_in_range(56, 199));
         assert!(!s.any_in_range(0, 47));
         assert!(!s.any_in_range(208, 300));
 
         // Inverted range returns false
         assert!(!s.any_in_range(100, 10));
+    }
+
+    #[test]
+    fn any_in_range_on_a_bit_array_chunk_is_exact() {
+        let mut s = IdSet::new();
+        s.pre_allocate(0);
+        s.set(50);
+        s.set(200);
+        assert!(matches!(s.chunks[0], Some(Chunk::Dense(_))));
+        assert!(s.any_in_range(40, 60));
+        assert!(s.any_in_range(50, 50));
+        assert!(!s.any_in_range(56, 199));
+        assert!(!s.any_in_range(0, 47));
+        assert!(!s.any_in_range(208, 300));
+        assert!(!s.any_in_range(51, 63));
+        assert!(s.any_in_range(0, i64::MAX));
     }
 
     #[test]
@@ -834,6 +1297,16 @@ mod tests {
         assert!(!s.any_in_range(0, 0));
         s.set(0);
         assert!(s.any_in_range(-5, 0));
+    }
+
+    #[test]
+    fn set_ignores_negative_ids() {
+        let mut s = IdSet::new();
+        s.set(-1);
+        s.set(i64::MIN);
+        assert!(!s.set_if_new(-5));
+        assert!(!s.has_any());
+        assert!(!s.get(-1));
     }
 
     #[test]
@@ -930,14 +1403,11 @@ mod tests {
         // path: a node blob's indexdata may report (min_id, max_id) where
         // max_id sits in a chunk past the highest allocated chunk in
         // IdSet (because no referenced node has an ID that high).
-        // rank() panics on chunks[cid] indexing in that case;
-        // count_below() / count_in_range() must clamp to total_count.
         let mut s = IdSet::new();
         s.set(100);
         s.set(200);
         s.build_rank_index();
 
-        // chunks.len() == 1 because both IDs fall in chunk 0.
         // Probe IDs many chunks past the end.
         let way_past_end: i64 = 1_000_000_000_000;
         assert_eq!(s.count_below(way_past_end), 2);
@@ -962,18 +1432,16 @@ mod tests {
     }
 
     #[test]
-    fn drop_rank_index_frees_metadata_but_keeps_bitmap() {
+    fn drop_rank_index_frees_metadata_but_keeps_members() {
         let mut s = IdSet::new();
         s.set(5);
         s.set(10);
         s.build_rank_index();
         assert_eq!(s.rank_if_set(5), Some(0));
         s.drop_rank_index();
-        // Bitmap still works.
         assert!(s.get(5));
         assert!(s.get(10));
         assert!(!s.get(7));
-        // Rank queries return None.
         assert_eq!(s.rank_if_set(5), None);
     }
 
@@ -981,8 +1449,6 @@ mod tests {
     fn rank_if_set_without_rank_index_returns_none() {
         let mut s = IdSet::new();
         s.set(42);
-        // No build_rank_index() - rank_if_set returns None because
-        // rank prefix arrays are None.
         assert_eq!(s.rank_if_set(42), None);
     }
 
@@ -1030,8 +1496,10 @@ mod tests {
     fn atomic_storage_is_u64_aligned_and_parallel_fill_survives_rank_build() {
         let mut s = IdSet::new();
         s.pre_allocate(10_000);
-        let chunk = s.chunks[0].as_ref().expect("allocated chunk");
-        assert_eq!((chunk.as_ptr() as usize) % std::mem::align_of::<u64>(), 0);
+        let Some(Chunk::Dense(words)) = s.chunks[0].as_ref() else {
+            panic!("pre_allocate must create a bit-array chunk");
+        };
+        assert_eq!((words.as_ptr() as usize) % std::mem::align_of::<u64>(), 0);
         std::thread::scope(|scope| {
             for offset in 0..8 {
                 let shared = &s;
@@ -1044,5 +1512,185 @@ mod tests {
         });
         s.build_rank_index();
         assert_eq!(s.total_count(), 10_000);
+    }
+
+    // --- Differential test against an ordered reference set --------------
+
+    /// Deterministic xorshift64* so the op sequence is reproducible.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// IDs concentrated where the representation has seams: chunk edges,
+    /// the direct/overflow boundary, `i64::MAX`, and negatives.
+    fn interesting_id(rng: &mut Rng) -> i64 {
+        let chunk = 1_i64 << ID_SHIFT;
+        let overflow_base = (DIRECT_CHUNKS as i64) << ID_SHIFT;
+        let jitter = rng.below(64) as i64;
+        match rng.below(9) {
+            0 => rng.below(4_000) as i64,
+            1 => chunk - 32 + jitter,
+            2 => 3 * chunk - 32 + jitter,
+            3 => overflow_base - 32 + jitter,
+            4 => overflow_base + 7 * chunk + jitter,
+            5 => overflow_base + 3 * chunk - 32 + jitter,
+            6 => i64::MAX - jitter,
+            7 => -1 - jitter,
+            _ => (rng.below(1 << 20) as i64) * 977,
+        }
+    }
+
+    fn assert_matches_reference(s: &mut IdSet, reference: &std::collections::BTreeSet<i64>) {
+        assert_eq!(
+            s.iter().collect::<Vec<_>>(),
+            reference.iter().copied().collect::<Vec<_>>(),
+            "iter order and contents"
+        );
+        assert_eq!(s.count_slow(), reference.len() as u64);
+        s.build_rank_index();
+        assert_eq!(s.total_count(), reference.len() as u64);
+
+        let sorted: Vec<i64> = reference.iter().copied().collect();
+        let below_of = |p: i64| sorted.partition_point(|&x| x < p) as u64;
+        let mut rng = Rng(0xDEAD_BEEF);
+        let mut probes: Vec<i64> = sorted.clone();
+        probes.extend((0..400).map(|_| interesting_id(&mut rng)));
+        probes.extend([i64::MIN, -1, 0, 1, i64::MAX]);
+        for &p in &probes {
+            let below = below_of(p);
+            assert_eq!(s.get(p), reference.contains(&p), "get({p})");
+            assert_eq!(s.rank(p), below, "rank({p})");
+            assert_eq!(s.count_below(p), below, "count_below({p})");
+            let expected_rank = reference.contains(&p).then_some(below);
+            assert_eq!(s.rank_if_set(p), expected_rank, "rank_if_set({p})");
+            let expected_resolve = expected_rank.map_or(p, |r| 1_000 + r as i64);
+            assert_eq!(s.resolve(p, 1_000), expected_resolve, "resolve({p})");
+        }
+        for _ in 0..400 {
+            let a = interesting_id(&mut rng);
+            let b = interesting_id(&mut rng);
+            let (lo, hi) = (a.min(b), a.max(b));
+            let hit = reference.range(lo..=hi).next().is_some();
+            assert_eq!(s.any_in_range(lo, hi), hit, "any_in_range({lo}, {hi})");
+            let count = sorted.partition_point(|&x| x <= hi) as u64 - below_of(lo);
+            assert_eq!(
+                s.count_in_range(lo, hi),
+                count,
+                "count_in_range({lo}, {hi})"
+            );
+        }
+    }
+
+    /// Push one direct and one overflow chunk over the promotion threshold.
+    fn fill_past_promotion(s: &mut IdSet, reference: &mut std::collections::BTreeSet<i64>) {
+        let overflow_base = (DIRECT_CHUNKS as i64) << ID_SHIFT;
+        for k in 0..(SPARSE_MAX as i64 + 10) {
+            for id in [5 * k, overflow_base + 11 * k] {
+                s.set(id);
+                reference.insert(id);
+            }
+        }
+    }
+
+    /// A second set of random ids, mirrored into the reference.
+    fn random_other(rng: &mut Rng, reference: &mut std::collections::BTreeSet<i64>) -> IdSet {
+        let mut other = IdSet::new();
+        for _ in 0..1_500 {
+            let id = interesting_id(rng);
+            other.set(id);
+            if id >= 0 {
+                reference.insert(id);
+            }
+        }
+        other
+    }
+
+    #[test]
+    fn differential_against_btreeset() {
+        use std::collections::BTreeSet;
+
+        let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+        let mut s = IdSet::new();
+        let mut reference = BTreeSet::new();
+
+        for round in 0..6 {
+            for _ in 0..3_000 {
+                let id = interesting_id(&mut rng);
+                let fresh = s.set_if_new(id);
+                assert_eq!(fresh, id >= 0 && reference.insert(id), "set_if_new({id})");
+            }
+            if round == 2 {
+                fill_past_promotion(&mut s, &mut reference);
+            }
+            // Merge in another set, alternating owned and borrowed forms.
+            let other = random_other(&mut rng, &mut reference);
+            if round % 2 == 0 {
+                s.merge(other);
+            } else {
+                s.merge_from(&other);
+            }
+            assert_matches_reference(&mut s, &reference);
+        }
+
+        // Duplicate-only merges change nothing.
+        let mut dup = IdSet::new();
+        for &id in reference.iter().take(5_000) {
+            dup.set(id);
+        }
+        s.merge_from(&dup);
+        s.merge(dup);
+        assert_matches_reference(&mut s, &reference);
+    }
+
+    #[test]
+    fn sparse_into_dense_merges_both_directions() {
+        let mut dense = IdSet::new();
+        for k in 0..(SPARSE_MAX as i64 + 1) {
+            dense.set(2 * k);
+        }
+        let mut sparse = IdSet::new();
+        sparse.set(1);
+        sparse.set(3);
+
+        // Array destination, bit-array source, owned: takes the allocation.
+        let mut a = IdSet::new();
+        a.set(1);
+        a.set(3);
+        let mut dense_copy = IdSet::new();
+        dense_copy.merge_from(&dense);
+        a.merge(dense_copy);
+        assert!(matches!(a.chunks[0], Some(Chunk::Dense(_))));
+        // Bit-array destination, array source.
+        dense.merge_from(&sparse);
+        assert_eq!(
+            a.iter().collect::<Vec<_>>(),
+            dense.iter().collect::<Vec<_>>()
+        );
+        // Two array chunks whose deduplicated union exceeds SPARSE_MAX.
+        let mut x = IdSet::new();
+        let mut y = IdSet::new();
+        for k in 0..SPARSE_MAX as i64 {
+            x.set(2 * k);
+        }
+        for k in 0..(SPARSE_MAX as i64 - 1) {
+            y.set(2 * k + 1);
+        }
+        y.set(0); // duplicate of x's first member; y stays an array chunk
+        assert!(matches!(y.chunks[0], Some(Chunk::Sparse(_))));
+        x.merge_from(&y);
+        assert!(matches!(x.chunks[0], Some(Chunk::Dense(_))));
+        x.build_rank_index();
+        assert_eq!(x.total_count(), 2 * SPARSE_MAX as u64 - 1);
     }
 }

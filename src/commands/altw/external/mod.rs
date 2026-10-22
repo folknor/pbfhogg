@@ -61,8 +61,9 @@ use stage4::stage4_assembly;
 /// `min(num_buckets - 1)` clamp inside [`BucketLayout::locate`].
 ///
 /// Stage-1 pass A computes `local_node_id = (node_id - bucket_lo) as
-/// u32`. [`BucketLayout::new`] asserts `bucket_width <= u32::MAX` so
-/// the cast is lossless for any `node_id` inside `[0, max_node_id]`. At
+/// u32`. [`BucketLayout::new`] refuses (with an error) any layout whose
+/// widest bucket-local id would not fit [`LOCAL_ID_MASK`], so the cast is
+/// lossless for any `node_id` inside `[0, max_node_id]`. At
 /// planet (max_node_id ~= 14e9, 256 buckets) `bucket_width ~= 55M`,
 /// six orders of magnitude under 2^32.
 pub(super) fn bucket_width(max_node_id: u64, num_buckets: usize) -> u64 {
@@ -99,21 +100,51 @@ pub(super) struct BucketLayout {
     pub(super) num_buckets: usize,
 }
 
+/// Widest bucket the record encoding accepts. A bucket-local id must fit in
+/// [`LOCAL_ID_MASK`] (31 bits; the top bit is [`CLOSURE_FLAG`]), and the last
+/// bucket can extend one full width past its nominal end, so a width of 2^30
+/// keeps every local id at or below 2^30 with margin to spare.
+const MAX_BUCKET_WIDTH: u64 = 1 << 30;
+
 impl BucketLayout {
-    pub(super) fn new(max_node_id: u64, num_buckets: usize) -> Self {
+    /// Build the layout for node ids `0..=max_node_id`.
+    ///
+    /// `max_node_id` comes from indexdata, which nothing verifies, so an
+    /// unrepresentable value is an error rather than a panic (CORRECTNESS.md,
+    /// "Blob sidecar metadata" residual: anything sized from indexdata must
+    /// cope with it being wrong). With 256 buckets the limit is a `max_id` of
+    /// 2^38 (~2.7e11, about 20x the live OSM node ID range). That is an
+    /// encoding limit of this backend, not an OSM validity limit: the claim
+    /// may be true, so the message says what to do either way. Clamping
+    /// instead would be wrong here - clamping an honest claim turns every
+    /// node above the clamp into a missing location.
+    pub(super) fn new(max_node_id: u64, num_buckets: usize) -> Result<Self> {
         assert!(num_buckets > 0, "num_buckets must be > 0");
         let bw = bucket_width(max_node_id, num_buckets);
-        assert!(
-            bw <= (1_u64 << 30),
-            "altw external: bucket_width {bw} exceeds 1<<30 \
-             (max_node_id={max_node_id}, num_buckets={num_buckets}); \
-             local_node_id would no longer fit in u32",
-        );
-        Self {
+        // Largest bucket-local id `locate` can produce: `bw - 1` in every
+        // bucket but the last, which absorbs the `div_ceil` remainder and
+        // reaches `max_node_id - last_lo`.
+        let last_lo = (num_buckets as u64 - 1).saturating_mul(bw);
+        let max_local = (bw - 1).max(max_node_id.saturating_sub(last_lo));
+        if bw > MAX_BUCKET_WIDTH || max_local > u64::from(LOCAL_ID_MASK) {
+            return Err(format!(
+                "add-locations-to-ways --index-type external: the input's node \
+                 indexdata advertises max_id {max_node_id}, above the {} this \
+                 backend can encode ({num_buckets} buckets of at most {} ids). \
+                 If the input really has node ids that large, use \
+                 --index-type sparse, which has no such limit; if it does not, \
+                 the indexdata is wrong, and `pbfhogg check --index` reports \
+                 which blobs disagree with their contents.",
+                (num_buckets as u64).saturating_mul(MAX_BUCKET_WIDTH),
+                MAX_BUCKET_WIDTH,
+            )
+            .into());
+        }
+        Ok(Self {
             max_node_id,
             bucket_width: bw,
             num_buckets,
-        }
+        })
     }
 
     /// Returns `(bucket_idx, local_node_id)` for `node_id`, or `None`
@@ -262,7 +293,7 @@ mod bucket_math_tests {
 
     #[test]
     fn locate_clamps_last_bucket_for_in_range_ids() {
-        let layout = BucketLayout::new(1000, 4);
+        let layout = BucketLayout::new(1000, 4).expect("layout");
         assert_eq!(layout.bucket_width, 250);
         assert_eq!(layout.locate(0), Some((0, 0)));
         assert_eq!(layout.locate(249), Some((0, 249)));
@@ -275,7 +306,7 @@ mod bucket_math_tests {
 
     #[test]
     fn locate_rejects_ids_beyond_max() {
-        let layout = BucketLayout::new(1000, 4);
+        let layout = BucketLayout::new(1000, 4).expect("layout");
         assert_eq!(layout.locate(1001), None);
         assert_eq!(layout.locate(u64::MAX), None);
     }
@@ -286,7 +317,7 @@ mod bucket_math_tests {
         // Pass A must not silently truncate it into the last bucket;
         // the layout returns None and pass A skips emission (treating
         // the slot as unresolved, same as a ref to an absent node).
-        let layout = BucketLayout::new(14_000_000_000, 256);
+        let layout = BucketLayout::new(14_000_000_000, 256).expect("layout");
         #[allow(clippy::cast_sign_loss)]
         let neg_as_u64 = (-1_i64) as u64;
         assert_eq!(layout.locate(neg_as_u64), None);
@@ -294,7 +325,7 @@ mod bucket_math_tests {
 
     #[test]
     fn locate_handles_zero_max() {
-        let layout = BucketLayout::new(0, 256);
+        let layout = BucketLayout::new(0, 256).expect("layout");
         // max_node_id=0 means only node id 0 is in range.
         assert!(matches!(layout.locate(0), Some((b, _)) if b < 256));
         assert_eq!(layout.locate(1), None);
@@ -303,7 +334,7 @@ mod bucket_math_tests {
     #[test]
     fn every_referenced_id_maps_to_one_bucket() {
         let max = 12_345_678u64;
-        let layout = BucketLayout::new(max, 256);
+        let layout = BucketLayout::new(max, 256).expect("layout");
         for id in (0..=max).step_by(50_000) {
             let (b, _) = layout.locate(id).unwrap_or_else(|| panic!("locate({id})"));
             assert!(b < 256, "id={id} -> bucket={b}");
@@ -315,7 +346,7 @@ mod bucket_math_tests {
 
     #[test]
     fn bucket_boundaries_are_exclusive_below_inclusive_above() {
-        let layout = BucketLayout::new(10_000, 10);
+        let layout = BucketLayout::new(10_000, 10).expect("layout");
         assert_eq!(layout.bucket_width, 1000);
         for k in 0u64..10 {
             let lo = k * 1000;
@@ -328,7 +359,7 @@ mod bucket_math_tests {
 
     #[test]
     fn local_node_id_round_trips_within_bucket() {
-        let layout = BucketLayout::new(10_000, 10);
+        let layout = BucketLayout::new(10_000, 10).expect("layout");
         for id in 0u64..=10_000 {
             let (bucket_idx, local) = layout.locate(id).expect("in range");
             let bucket_lo = (bucket_idx as u64) * layout.bucket_width;
@@ -342,11 +373,32 @@ mod bucket_math_tests {
 
     #[test]
     fn bucket_width_fits_in_u32_at_planet_scale() {
-        // BucketLayout::new asserts this; cross-check the bare fn and
+        // BucketLayout::new enforces this; cross-check the bare fn and
         // confirm the constructor accepts the planet config.
         let bw = bucket_width(14_000_000_000, 256);
         assert!(bw <= u64::from(u32::MAX));
-        let _ = BucketLayout::new(14_000_000_000, 256);
+        assert!(BucketLayout::new(14_000_000_000, 256).is_ok());
+    }
+
+    #[test]
+    fn oversized_indexdata_max_id_is_an_error_not_a_panic() {
+        // BUG-025: max_node_id comes from unverified indexdata. The largest
+        // encodable claim is accepted, one past it is refused with an
+        // error, and so is the adversarial extreme.
+        let limit = 256 * (1_u64 << 30);
+        let layout = BucketLayout::new(limit, 256).expect("2^38 is encodable");
+        let (bucket, local) = layout.locate(limit).expect("max in range");
+        assert_eq!(bucket, 255);
+        assert!(local <= super::LOCAL_ID_MASK);
+
+        let err = BucketLayout::new(limit + 1, 256)
+            .err()
+            .expect("2^38 + 1 must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("--index-type sparse"), "{msg}");
+        assert!(msg.contains("check --index"), "{msg}");
+        assert!(BucketLayout::new(u64::MAX, 256).is_err());
+        assert!(BucketLayout::new(u64::MAX >> 1, 256).is_err());
     }
 }
 
@@ -417,14 +469,11 @@ pub(super) const RESOLVED_ENTRY_SIZE: usize = 12;
 pub(super) const COORD_SLOT_SIZE: usize = 8;
 
 /// Stage 1 → stage 2 hand-off describing one node blob: where it lives in
-/// the input PBF and the half-open rank range `[ref_rank_start, ref_rank_end)`
-/// of referenced nodes it contains.
+/// the input PBF and the id range its indexdata advertises.
 ///
-/// Computed without decoding any blob - uses indexdata `(min_id, max_id)`
-/// plus `IdSet::rank` queries. Adjacent blobs' ranges are
-/// non-overlapping and monotonic in rank (because the input PBF is sorted
-/// by node ID and rank is monotonic in ID). Each rank bucket maps to a
-/// contiguous run of blobs in this vector via binary search.
+/// Computed without decoding any blob. On sorted input the blobs' ranges
+/// are ascending, so stage 2 finds the run of blobs intersecting each id
+/// bucket by binary search over this vector.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct NodeBlobInfo {
     pub data_offset: u64,
@@ -702,16 +751,15 @@ pub(crate) fn external_join_in(
     // the planet-wide constant - tighter buckets on smaller fixtures
     // and exact for any real input.
     let max_node_id = max_node_id_from_blob_meta(&blob_meta)?;
-    let bucket_layout = BucketLayout::new(max_node_id, NUM_BUCKETS);
+    let bucket_layout = BucketLayout::new(max_node_id, NUM_BUCKETS)?;
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("extjoin_bucket_max_node_id", max_node_id as i64);
         crate::debug::emit_counter("extjoin_bucket_width", bucket_layout.bucket_width as i64);
     }
 
-    // Stage 1: produces total_slots, unique_nodes, rank_bucket_counts,
-    // num_shard_workers, the live IdSet (kept alive through stage 2
-    // for inline coord resolution), and the per-blob rank mapping.
+    // Stage 1: produces total_slots, id_bucket_counts, num_shard_workers
+    // and the per-node-blob mapping (see `Stage1Output`).
     //
     // #9 layer 2: relation member-id scan runs concurrently with stage 1.
     // The scan reads relation blobs only (via blob_meta) and shares no

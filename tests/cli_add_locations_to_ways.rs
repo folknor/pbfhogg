@@ -1086,6 +1086,137 @@ fn null_island_real_node_is_not_reported_missing() {
     }
 }
 
+/// BUG-024: a way ref (and a relation node member) near `i64::MAX` used to
+/// make sparse pass 0 and the relation-member scan grow the ID set's chunk
+/// directory to ~2^38 entries and abort. It is now an ordinary reference to
+/// a node the file does not contain: refused by the missing-locations guard,
+/// and written as `(0, 0)` under `--ignore-missing-nodes`.
+///
+/// `keep_untagged_nodes = false` is what routes the relation through the
+/// relation-member scan, so both input-fed sets are exercised.
+#[test]
+fn way_ref_near_i64_max_is_a_missing_location_not_an_abort() {
+    let far = i64::MAX - 1;
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![1, far, 3],
+        tags: vec![("highway", "primary")],
+        meta: None,
+    }];
+    let relations = vec![TestRelation {
+        id: 300,
+        members: vec![TestMember {
+            id: MemberId::Node(far),
+            role: "label",
+        }],
+        tags: vec![("type", "multipolygon")],
+        meta: None,
+    }];
+
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_test_pbf(&input, &test_nodes(), &ways, &relations);
+
+    let refused = run_altw(&input, &output, false, IndexBackend::Sparse, false);
+    assert_refused_for_missing_nodes(&refused, "sparse, ref near i64::MAX");
+    assert!(
+        !output.exists(),
+        "a refused run must publish no output file"
+    );
+
+    let out = run_altw_ignoring_missing(&input, &output, false, IndexBackend::Sparse);
+    assert!(
+        out.status.success(),
+        "sparse with a ref near i64::MAX failed; stderr:\n{}",
+        out.stderr_str(),
+    );
+    assert!(
+        out.stderr_str().contains("1 missing locations"),
+        "expected '1 missing locations'; stderr:\n{}",
+        out.stderr_str(),
+    );
+    assert_eq!(
+        read_way_locations(&output),
+        vec![(
+            10,
+            vec![
+                (550_000_000, 120_000_000),
+                (0, 0),
+                (552_000_000, 122_000_000)
+            ]
+        )],
+    );
+}
+
+/// BUG-025: the external backend sizes its id buckets from the node blobs'
+/// indexdata `max_id`, and used to assert (panic) when that exceeded what its
+/// 31-bit bucket-local ids can encode (2^38 with 256 buckets). It is now an
+/// error that points at `--index-type sparse` - and that pointer must be
+/// true, so the same file has to succeed under sparse.
+#[test]
+fn node_id_beyond_external_encoding_limit_is_an_error_and_sparse_handles_it() {
+    let big = 1_i64 << 39;
+    let nodes = vec![
+        TestNode {
+            id: 1,
+            lat: 550_000_000,
+            lon: 120_000_000,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: big,
+            lat: 551_000_000,
+            lon: 121_000_000,
+            tags: vec![],
+            meta: None,
+        },
+    ];
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![1, big],
+        tags: vec![("highway", "primary")],
+        meta: None,
+    }];
+
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    write_indexed_pbf(&input, &nodes, &ways, &[]);
+
+    let external_out = dir.path().join("external.osm.pbf");
+    let out = run_altw(&input, &external_out, true, IndexBackend::External, false);
+    assert!(
+        !out.status.success(),
+        "external must refuse a node max_id it cannot encode; stderr:\n{}",
+        out.stderr_str(),
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("--index-type sparse") && !stderr.contains("panicked"),
+        "expected the encoding-limit error, not a panic; stderr:\n{stderr}",
+    );
+    assert!(
+        !external_out.exists(),
+        "a refused run must publish no output file"
+    );
+
+    let sparse_out = dir.path().join("sparse.osm.pbf");
+    let out = run_altw(&input, &sparse_out, true, IndexBackend::Sparse, false);
+    assert!(
+        out.status.success(),
+        "sparse must handle the node id external cannot; stderr:\n{}",
+        out.stderr_str(),
+    );
+    assert_eq!(
+        read_way_locations(&sparse_out),
+        vec![(
+            10,
+            vec![(550_000_000, 120_000_000), (551_000_000, 121_000_000)]
+        )],
+    );
+}
+
 /// B2 - missing-node handling for `--index-type external`.
 ///
 /// Missing refs are refused by default and substituted with `(0, 0)` under

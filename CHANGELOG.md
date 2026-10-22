@@ -552,6 +552,15 @@
   trusted, and an inverted ID range or a repeated indexdata or tagdata field
   now reads as no index.
 
+- **A huge element ID no longer aborts the process.** One way ref or
+  relation member near `i64::MAX` made the internal ID set try to allocate
+  terabytes in `add-locations-to-ways --index-type sparse`, and the same set
+  backs `tags-filter`, `getid` and `extract`. Memory now follows the number
+  of distinct IDs, so such a ref is an ordinary missing location. Under
+  `--index-type external`, a node blob whose indexdata claims a `max_id` the
+  bucket layout cannot encode is now an error naming the alternatives, not a
+  panic.
+
 - **`add-locations-to-ways --index-type external` counts descriptors the
   process already holds** before sizing its shard workers. It budgeted from
   the soft `RLIMIT_NOFILE` alone, so a library caller holding many files, or

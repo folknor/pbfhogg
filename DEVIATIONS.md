@@ -274,20 +274,19 @@ comparison instead (`src/commands/diff/shard.rs`).
   Negatives in the target PBF are still absent from output because
   `IdSet::set` is a silent no-op on negatives (no positive request
   id can match a negative element id).
-- `add-locations-to-ways --index-type external` - **silent**, by
-  inheritance from `IdSet`. Stage 4's relation-member-node retention
-  optimization
-  (`src/commands/altw/external/stage4.rs::P1b`) consults
+- `add-locations-to-ways` (both backends) - **silent**, by
+  inheritance from `IdSet`. Relation-member node IDs are collected
+  into an `IdSet` that decides which untagged nodes to keep; the
+  external backend's stage 4 also consults
   `relation_member_node_ids.any_in_range(min_id, max_id)` to skip
   node blobs that contain no relation-referenced nodes. The
   `any_in_range` clamp covers the straddling-blob case as for
   `getid` above; the per-id silent no-op on `IdSet::set` (and the
   matching abs-fold absence on the pbfhogg side) is the residual
-  divergence below. `--index-type dense|sparse` use mmap arrays
-  rather than `IdSet`, so they don't touch this path.
+  divergence below.
 
 **Residual divergence (tags-filter, add-locations-to-ways):**
-The shared root is `src/idset.rs:45` - `IdSet::set` is a silent
+The shared root is `IdSet::set` in `src/idset.rs`, a silent
 no-op on negative ids, where osmium's equivalent paths abs-fold via
 `object.positive_id()` to collapse `-N` and `+N` into a single bit.
 
@@ -295,10 +294,10 @@ no-op on negative ids, where osmium's equivalent paths abs-fold via
   negative-id ways from the output, where osmium's `tags-filter`
   silently **abs-converts** them. Pinned as the current state by
   `tests/cli_negative_id_invariants.rs::tags_filter_handles_mixed_sign_ids`.
-- `add-locations-to-ways --index-type external` silently **omits**
-  relation-member retention for any relation member whose id is
-  negative (the member id is dropped at `IdSet::set` time, so
-  stage 4 doesn't know to keep the corresponding untagged node).
+- `add-locations-to-ways` silently **omits** relation-member
+  retention for any relation member whose id is negative (the member
+  id is dropped at `IdSet::set` time, so the write pass doesn't know
+  to keep the corresponding untagged node).
   osmium's `add-locations-to-ways` abs-folds the member ref via
   `member.positive_ref()`, collapsing `-N` and `+N` member refs
   into the same retention decision.
@@ -324,10 +323,11 @@ for JOSM-staged input, and the canonical workflow for such data is
 **Migration path to osmium-style support.** If a consumer does need
 JOSM-interop, the work is:
 
-1. Introduce an `osm_id_cmp` (canonical `id_order`: 0 → negatives by
-   abs value → positives by abs value) used everywhere an ordering
-   decision is made; current uses of raw `<` / `>` / `!=` on `i64`
-   ids audited and switched.
+1. Route every ordering decision through `osm_id_cmp` in
+   `src/osm_id.rs` (canonical `id_order`: 0 → negatives by abs value
+   → positives by abs value), which sort, dedupe, merge-join and diff
+   already use; the remaining raw `<` / `>` / `!=` on `i64` ids
+   audited and switched.
 2. `IdSet` either split into `positives` / `negatives` sub-bitmaps
    routed by sign at every call site, or widened to a signed index
    with the capacity cost that implies.

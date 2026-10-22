@@ -191,6 +191,11 @@ output never contains ids for objects that aren't in the output.
 Users who need osmium-compatible orphan handling can add a followup
 `--orphan-policy {preserve,assign}` flag.
 
+**Start IDs below 1 are refused.** osmium accepts a negative start ID and
+counts downward from it; pbfhogg requires every `--start-id` value to be at
+least 1, since its outputs are positive-only like its inputs (see "Negative
+input IDs rejected project-wide" below), and refuses before reading the input.
+
 **Impact:** Downstream tools that assume output ids are contiguous in
 `[start_id, start_id + N)` must tolerate orphan refs outside that range.
 Tools that only chase live references don't hit the orphan ids at all
@@ -244,15 +249,12 @@ comparison instead (`src/commands/diff/shard.rs`).
 
 **Sites enforcing the invariant:**
 
-- `renumber` - **hard reject** at every entry point where a negative
-  id could flow into an unsigned `IdSet` operation. The node path
-  checks `old_id < 0` before `set_atomic`
-  (`src/commands/renumber/wire_rewrite.rs` `reframe_dense_with_new_ids`),
-  the way path checks `old_way_id < 0` before `set`
-  (`reframe_ways_with_new_ids`), and the relation-member-ref path
-  checks `old_abs_id < 0` before `resolve`
-  (`rewrite_relations_with_new_ids`). All three return an error
-  naming the offending id. The check is unconditional, not
+- `renumber` - **hard reject** of any negative node, way or relation
+  id, and of any negative way ref or relation member ref, in the
+  rewriters of `src/commands/renumber/wire_rewrite.rs`
+  (`reframe_dense_with_new_ids`, `reframe_ways_with_new_ids`,
+  `reframe_relations_with_new_ids`). Each returns an error naming
+  the offending id. The check is unconditional, not
   indexdata-gated: a PBF whose per-blob indexdata advertises
   `min_id >= 0` while the payload contains negatives still errors
   cleanly rather than panicking in `chunk_for_atomic` or silently

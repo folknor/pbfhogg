@@ -21,77 +21,6 @@ are marked "likely" by the hunter who found them.
 
 ---
 
-## BUG-001 - Renumber hangs instead of failing on any mid-stream error
-
-`renumber/pass1.rs`, `renumber/stage2.rs` and `renumber/relations.rs` share
-one shape: `sync_channel(32)` created outside `thread::scope`, workers
-`tx.send(...)` in a work-stealing loop, and a consumer inside the scope that
-returns early via `?` on the first `Err` popped from the reorder buffer. The
-receiver is borrowed, not moved, so it lives until after `thread::scope`
-returns, and `thread::scope` joins every worker first. There is no cancel
-flag, so the workers keep claiming tasks, fill the 32-slot channel and block
-in `send` forever.
-
-Any error with more than about 32 + worker-count blobs left in the phase
-becomes a hang: a corrupt blob mid-node-section, `ENOSPC` on the output, or
-the "indexdata understates its own contents" refusal in `wire_rewrite.rs`.
-`brokkr test` reports it as "did not finish within 20s" with a futex wchan.
-Fixture tests have far fewer than 32 blobs per kind, and truncation is caught
-in the header scan before workers start, so nothing covers this.
-
-Fix: move the receiver into the scope and drop it on the error path, plus an
-abort flag the workers check before claiming. The three loops are one
-function (see HYG-011) and should be written once with that property.
-Enforce with a fault test: more than 64 node blobs, one corrupt in the
-middle, assert an error exit and not a timeout.
-
-Reported by: re-encoding.
-
-## BUG-002 - Renumber writes wrong way refs when node IDs are not strictly increasing
-
-Pass 1 (`wire_rewrite.rs::reframe_dense_with_new_ids`) assigns each node its
-new ID by position (running count). Stage 2d and R2d resolve refs by rank in
-the bitset (`start_id + rank_if_set(old_id)`). The two agree only if node IDs
-are strictly increasing across the whole node section in schedule order with
-no duplicates. Nothing checks that: `require_sorted` trusts the header's
-`Sort.Type_then_ID`, the delta decode accepts zero and negative deltas (only
-`old_id < 0` is refused), and a duplicate sets the same bit twice. A file
-whose header falsely claims to be sorted, or that carries a duplicate node,
-gets ways pointing at the wrong nodes, exit 0. The same reasoning applies to
-way IDs in stage 2d versus relation member resolution.
-
-`degrade --unsort` output is not such a file: degrade clears the sorted claim
-whenever an unsort flag is set, so `require_sorted` already refuses it. The
-fixture has to be built by hand: a header claiming `Sort.Type_then_ID` over
-out-of-order or duplicated IDs.
-
-CORRECTNESS.md "`sort`: intra-blob disorder" accepts a false sorted claim as
-the input's own fault, but there the consequence is only that sort passes the
-input through unchanged. Here the same false claim produces wrong output, so
-that precedent does not cover it.
-
-The check is cheap: `delta > 0` per node inside a group, and per-blob
-`min_id > previous max_id` in the schedule, where indexdata is already in hand.
-Enforce with a test that runs a hand-built false-claim or duplicate-ID
-fixture through renumber and asserts refusal.
-
-Renumber's `--start-id` is also not range-checked: negative starts are
-accepted and can produce a renumbered ID 0.
-
-Reported by: re-encoding.
-
-## BUG-003 - Unchecked delta accumulation in the renumber wire rewriter
-
-`wire_rewrite.rs` accumulates sint64 deltas with plain `old_id += delta`, in
-the node, way-ref and memids decode loops. A crafted delta overflows: a panic
-in debug, a wrap in release, which may land negative (caught by the `< 0`
-check) or large positive (hits `set_atomic_checked`). The new-ID prefix sum
-next door uses `checked_add`. Fix: `checked_add` mapped to an input error.
-Enforce with `#![deny(clippy::arithmetic_side_effects)]` scoped to
-`wire_rewrite.rs`, the one file where every integer comes off the wire.
-
-Reported by: re-encoding.
-
 ## BUG-005 - Indexdata claims are folded into observed element counts
 
 `sort`, `getid` and `cat --dedupe` keep a separate `passthrough_claimed`
@@ -124,17 +53,6 @@ does not. The flag list is spelled at four sites (`any()`, `needs_decode()`,
 the error text, the `applied` list in `write_summary`) plus the CLI, and they
 have already diverged. Generate the text from one `(field, flag name)` table,
 or test that the error text names every field.
-
-Reported by: re-encoding.
-
-## BUG-008 - Renumber timing counters truncate to zero per blob
-
-Every `StageCounters` field accumulates `elapsed().as_millis() as u64` per
-blob. A planet node blob's pread is well under 1 ms, so `pass1_pread_ms` and
-its siblings sum truncated zeros and under-report by close to 100 %;
-`consumer_recv_ms` per message likewise. Same in `relations.rs` and
-`stage2.rs`. Accumulate nanoseconds and divide at emit, or follow the
-`<category>_wait_ns` convention so `--stalls` sees them.
 
 Reported by: re-encoding.
 
@@ -297,10 +215,10 @@ map), so `set` on an input-controlled ID no longer aborts. `pre_allocate
 (max_id)` still allocates a 4 MiB bitmap per 2^25 IDs from 0 to `max_id`
 before anything is validated, so a caller passing an indexdata `max_id`
 that lies high allocates until it runs out of memory. `check` bounds its
-argument by the file size; renumber and the geocode builder (pass 1.5)
-pass indexdata's claim unbounded. Each should bound the argument by
-something the file itself supports, per CORRECTNESS.md's rule for
-allocations sized from indexdata.
+argument by the file size, and renumber by `min(claim, file_len * 8)` with
+IDs above it routed through `set` after its parallel pass; the geocode
+builder (pass 1.5) still passes indexdata's claim unbounded and should do
+the same, per CORRECTNESS.md's rule for allocations sized from indexdata.
 
 Reported by: altw and scanning, geocode index, re-encoding.
 
@@ -564,6 +482,14 @@ why no fixture caught this; `osmium cat -f pbf,pbf_dense_nodes=false`
 produces the input.
 
 Reported by: the apply-changes and extract fixes.
+
+## BUG-078 - Renumber output carries no tagdata
+
+Renumber writes its re-framed blobs with tagdata `None`, so `tags-filter`
+and `tags-count` cannot skip blobs of a renumbered file by tag key, while
+indexdata is written. Its rewriters already walk every element's keys.
+
+Reported by: the renumber fix.
 
 ## BUG-075 - A repeated OSMHeader is skipped by some commands and refused by others
 

@@ -1086,7 +1086,7 @@ fn null_island_real_node_is_not_reported_missing() {
     }
 }
 
-/// BUG-024: a way ref (and a relation node member) near `i64::MAX` used to
+/// A way ref (and a relation node member) near `i64::MAX` used to
 /// make sparse pass 0 and the relation-member scan grow the ID set's chunk
 /// directory to ~2^38 entries and abort. It is now an ordinary reference to
 /// a node the file does not contain: refused by the missing-locations guard,
@@ -1149,7 +1149,7 @@ fn way_ref_near_i64_max_is_a_missing_location_not_an_abort() {
     );
 }
 
-/// BUG-025: the external backend sizes its id buckets from the node blobs'
+/// The external backend sizes its id buckets from the node blobs'
 /// indexdata `max_id`, and used to assert (panic) when that exceeded what its
 /// 31-bit bucket-local ids can encode (2^38 with 256 buckets). It is now an
 /// error that points at `--index-type sparse` - and that pointer must be

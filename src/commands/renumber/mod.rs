@@ -8,40 +8,54 @@
 //!
 //! ## Architecture
 //!
-//! - **Pass 1**: parallel wire-format node rewriter (4 work-stealing
-//!   workers). Each worker builds a per-shard `IdSet`; shards are
-//!   merged after pass 1 and a rank index built for O(1) new-id lookup.
-//! - **Stage 2d**: parallel wire-format way splice rewriter (6
-//!   work-stealing workers). Resolves way refs inline via
-//!   `node_id_set.rank()` during the splice - no intermediate files.
-//!   Per-worker `IdSet` for `way_id_set`, merged after stage 2d.
+//! - **Pass 1**: parallel wire-format node rewriter. Every worker records
+//!   old node IDs in one shared, pre-allocated `IdSet`; a rank index built
+//!   after the pass gives O(1) old-to-new lookup.
+//! - **Stage 2d**: parallel wire-format way splice rewriter. Resolves way
+//!   refs inline via `node_id_set.rank()` during the splice - no
+//!   intermediate files. Per-worker `IdSet` shards for `way_id_set`, merged
+//!   after stage 2d.
 //! - **R1**: sequential relation scan to collect all relation IDs into
-//!   a third `IdSet` bitset + rank index.
+//!   a third `IdSet` + rank index.
 //! - **R2d**: parallel wire-format splice rewriter for relations.
-//!   Resolves node/way/relation member refs inline via `resolve()`.
+//!   Resolves node/way/relation member refs inline.
+//!
+//! The three parallel stages run on one ordered pool (`pool.rs`), which ends
+//! the run promptly on any error and bounds the results in flight.
+//!
+//! ## Position and rank must agree
+//!
+//! An element's new ID is assigned by *position* (start plus the number of
+//! elements of its kind before it); a reference's new ID is computed by
+//! *rank* (start plus the number of input IDs below the referenced one).
+//! They name the same element only when input IDs strictly increase within
+//! each kind, so renumber verifies exactly that - per element inside every
+//! rewriter, and across blobs in schedule order - and refuses input that
+//! fails it, whatever its header claims about sorting.
 //!
 //! ## Orphan references
 //!
 //! Way refs and relation members whose old ID is not present in the
 //! corresponding `IdSet` (i.e. not seen in the input) pass through
 //! with their old ID unchanged, matching the in-memory path's
-//! `unwrap_or(old_id)` behavior and osmium's semantics. Consumers that
-//! assume new IDs are dense starting at `start_*_id` must tolerate
-//! mixed old/new ID spaces in the output.
-//!
-//! Planet: 194 s (3m14s), 3.3 GB peak anon (commit `cb99106`).
-//! Denmark cross-validated against in-memory mode on every commit.
+//! `unwrap_or(old_id)` behavior. Consumers that assume new IDs are dense
+//! starting at `start_*_id` must tolerate mixed old/new ID spaces in the
+//! output.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::time::Instant;
 
 use super::{HeaderOverrides, Result, require_sorted, writer_from_header};
 use crate::writer::Compression;
 
 // ---------------------------------------------------------------------------
-// Public types (moved from the former src/commands/renumber.rs)
+// Public types
 // ---------------------------------------------------------------------------
 
-/// Configuration for the renumber command.
+/// Configuration for the renumber command. Every start ID must be at least
+/// 1: a negative or zero start would hand out ID 0 or negative IDs, which
+/// the rest of the crate rejects as input.
 pub struct RenumberOptions {
     pub start_node_id: i64,
     pub start_way_id: i64,
@@ -62,7 +76,10 @@ pub struct RenumberStats {
 
 impl RenumberStats {
     pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
-        let total = self.nodes_written + self.ways_written + self.relations_written;
+        let total = self
+            .nodes_written
+            .saturating_add(self.ways_written)
+            .saturating_add(self.relations_written);
         writeln!(
             w,
             "Renumbered {total} elements: {} nodes, {} ways, {} relations",
@@ -82,6 +99,7 @@ impl RenumberStats {
 }
 
 mod pass1;
+mod pool;
 mod relations;
 mod schedule;
 mod stage2;
@@ -89,78 +107,207 @@ mod wire_rewrite;
 
 use pass1::pass1_parallel_scan;
 use relations::{relation_r1_collect_ids, relation_r2d_assembly};
-use schedule::build_all_blob_schedules;
+use schedule::{BlobTask, build_all_blob_schedules};
 use stage2::stage2d_parallel_way_assembly;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-pub(super) const PASS1_WORKERS: usize = 4;
-/// Parallel way-assembly workers in stage 2d. Must be >= 1; the per-worker
-/// `IdSet` merge at the R1 boundary calls `way_id_sets.remove(0)` which
-/// panics on an empty vec.
-pub(super) const STAGE2D_WORKERS: usize = 6;
+const PASS1_WORKERS: usize = 4;
+/// Parallel way-assembly workers in stage 2d, one `IdSet` shard each.
+const STAGE2D_WORKERS: usize = 6;
 
 // ---------------------------------------------------------------------------
 // Shared instrumentation counters
 // ---------------------------------------------------------------------------
 
-/// Shared instrumentation counters for parallel worker stages.
-/// All fields are AtomicU64 so workers can fetch_add concurrently.
-/// Emit all counters via `emit()` after the scope joins workers.
-pub(super) struct StageCounters {
-    pub(super) pread_ms: std::sync::atomic::AtomicU64,
-    pub(super) decompress_ms: std::sync::atomic::AtomicU64,
-    pub(super) reframe_ms: std::sync::atomic::AtomicU64,
-    pub(super) send_ms: std::sync::atomic::AtomicU64,
-    pub(super) consumer_recv_ms: std::sync::atomic::AtomicU64,
-    pub(super) consumer_write_ms: std::sync::atomic::AtomicU64,
-    pub(super) blobs: std::sync::atomic::AtomicU64,
+/// Add the nanoseconds since `since` to `counter`.
+///
+/// Nanoseconds, not milliseconds: these counters sum one span per blob, and
+/// a planet node blob's pread is well under a millisecond, so per-blob
+/// `as_millis()` summed truncated zeros.
+fn add_ns(counter: &AtomicU64, since: Instant) {
+    let ns = u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    counter.fetch_add(ns, Relaxed);
+}
+
+/// Per-stage timing counters, summed across workers and emitted once the
+/// stage ends. The two `*_wait_ns` fields follow brokkr's stall convention
+/// (`brokkr sidecar <uuid> --stalls`): `window_wait` is workers parked
+/// because the writer side is a full window behind, `consumer_recv_wait` is
+/// the writer side idle for want of a finished blob.
+struct StageCounters {
+    pread_ns: AtomicU64,
+    decompress_ns: AtomicU64,
+    reframe_ns: AtomicU64,
+    consumer_write_ns: AtomicU64,
+    window_wait_ns: AtomicU64,
+    consumer_recv_wait_ns: AtomicU64,
+    blobs: AtomicU64,
 }
 
 impl StageCounters {
-    pub(super) fn new() -> Self {
+    fn new() -> Self {
         Self {
-            pread_ms: std::sync::atomic::AtomicU64::new(0),
-            decompress_ms: std::sync::atomic::AtomicU64::new(0),
-            reframe_ms: std::sync::atomic::AtomicU64::new(0),
-            send_ms: std::sync::atomic::AtomicU64::new(0),
-            consumer_recv_ms: std::sync::atomic::AtomicU64::new(0),
-            consumer_write_ms: std::sync::atomic::AtomicU64::new(0),
-            blobs: std::sync::atomic::AtomicU64::new(0),
+            pread_ns: AtomicU64::new(0),
+            decompress_ns: AtomicU64::new(0),
+            reframe_ns: AtomicU64::new(0),
+            consumer_write_ns: AtomicU64::new(0),
+            window_wait_ns: AtomicU64::new(0),
+            consumer_recv_wait_ns: AtomicU64::new(0),
+            blobs: AtomicU64::new(0),
         }
     }
 
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    pub(super) fn emit(&self, prefix: &str) {
-        use std::sync::atomic::Ordering::Relaxed;
-        crate::debug::emit_counter(
-            &format!("{prefix}_pread_ms"),
-            self.pread_ms.load(Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            &format!("{prefix}_decompress_ms"),
-            self.decompress_ms.load(Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            &format!("{prefix}_reframe_ms"),
-            self.reframe_ms.load(Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            &format!("{prefix}_send_ms"),
-            self.send_ms.load(Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            &format!("{prefix}_consumer_recv_ms"),
-            self.consumer_recv_ms.load(Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            &format!("{prefix}_consumer_write_ms"),
-            self.consumer_write_ms.load(Relaxed) as i64,
-        );
-        crate::debug::emit_counter(&format!("{prefix}_blobs"), self.blobs.load(Relaxed) as i64);
+    fn bump_blobs(&self) {
+        self.blobs.fetch_add(1, Relaxed);
     }
+
+    fn emit(&self, prefix: &str) {
+        let fields: [(&str, &AtomicU64); 7] = [
+            ("pread_ns", &self.pread_ns),
+            ("decompress_ns", &self.decompress_ns),
+            ("reframe_ns", &self.reframe_ns),
+            ("consumer_write_ns", &self.consumer_write_ns),
+            ("window_wait_ns", &self.window_wait_ns),
+            ("consumer_recv_wait_ns", &self.consumer_recv_wait_ns),
+            ("blobs", &self.blobs),
+        ];
+        for (name, value) in fields {
+            let v = i64::try_from(value.load(Relaxed)).unwrap_or(i64::MAX);
+            crate::debug::emit_counter(&format!("{prefix}_{name}"), v);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared per-blob helpers
+// ---------------------------------------------------------------------------
+
+/// A worker's read and decompress buffers.
+#[derive(Default)]
+struct BlobBuffers {
+    raw: Vec<u8>,
+    decompressed: Vec<u8>,
+}
+
+impl BlobBuffers {
+    /// pread the blob `task` addresses and decompress it into
+    /// `self.decompressed`.
+    fn load(
+        &mut self,
+        file: &std::fs::File,
+        task: &BlobTask,
+        counters: &StageCounters,
+    ) -> std::result::Result<(), String> {
+        use std::os::unix::fs::FileExt as _;
+        let t = Instant::now();
+        self.raw.resize(task.data_size, 0);
+        file.read_exact_at(&mut self.raw, task.data_offset)
+            .map_err(|e| format!("pread failed at offset {}: {e}", task.data_offset))?;
+        add_ns(&counters.pread_ns, t);
+
+        let t = Instant::now();
+        crate::blob::decompress_blob_raw(&self.raw, &mut self.decompressed)
+            .map_err(|e| e.to_string())?;
+        add_ns(&counters.decompress_ns, t);
+        Ok(())
+    }
+}
+
+/// Per-blob base new IDs for a positionally numbered kind: blob `i` starts
+/// at `start` plus the declared element counts of blobs `0..i`.
+///
+/// The counts are indexdata claims, verified per blob after decode. What is
+/// checked here is that the *last* ID handed out, `start + total - 1`, fits
+/// an `i64`; the one-past-the-end cursor never has to. An empty blob's base
+/// is never used for an ID (an empty blob is not written, and a decoded
+/// count that disagrees with its claim of zero is an error), so it may
+/// saturate.
+fn positional_bases(start: i64, schedule: &[BlobTask], kind: &str) -> Result<Vec<i64>> {
+    let mut bases = Vec::with_capacity(schedule.len());
+    let mut cursor = i128::from(start);
+    for task in schedule {
+        let count = i128::from(task.element_count);
+        if count > 0 {
+            let last = cursor
+                .checked_add(count)
+                .and_then(|end| end.checked_sub(1))
+                .and_then(|last| i64::try_from(last).ok());
+            if last.is_none() {
+                return Err(format!(
+                    "renumber: {kind} start id {start} plus the input's {kind} count \
+                     runs past the largest 64-bit id"
+                )
+                .into());
+            }
+        }
+        bases.push(i64::try_from(cursor).unwrap_or(i64::MAX));
+        cursor = cursor.saturating_add(count);
+    }
+    Ok(bases)
+}
+
+/// The output `BlobIndex` for a non-empty, positionally numbered blob.
+fn blob_index(
+    kind: crate::blob_meta::ElemKind,
+    base: i64,
+    count: u64,
+    bbox: Option<crate::blob_meta::BlobBbox>,
+) -> std::result::Result<crate::blob_meta::BlobIndex, String> {
+    let max_id = count
+        .checked_sub(1)
+        .and_then(|span| i64::try_from(span).ok())
+        .and_then(|span| base.checked_add(span))
+        .ok_or_else(|| format!("renumber: blob of {count} elements from id {base} overflows"))?;
+    Ok(crate::blob_meta::BlobIndex {
+        kind,
+        min_id: base,
+        max_id,
+        count,
+        bbox,
+    })
+}
+
+/// Refuse a start ID below 1. A start of 0 hands out ID 0, a negative one
+/// hands out negative IDs and then 0 - IDs this crate refuses as input
+/// everywhere (DEVIATIONS.md, "Negative input IDs rejected project-wide").
+/// osmium counts *downwards* from a negative start instead; renumber does not
+/// offer that numbering.
+fn validate_start_ids(opts: &RenumberOptions) -> Result<()> {
+    for (kind, start) in [
+        ("node", opts.start_node_id),
+        ("way", opts.start_way_id),
+        ("relation", opts.start_relation_id),
+    ] {
+        if start < 1 {
+            return Err(
+                format!("renumber: the {kind} start id must be at least 1, got {start}").into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The `pre_allocate` argument for the pass 1 node set.
+///
+/// The highest node ID the schedule's indexdata claims, bounded by the
+/// input's size: `pre_allocate` eagerly allocates one bit per ID from 0 to
+/// its argument, indexdata is unverified, and a claim of `i64::MAX` would
+/// otherwise ask for an exabyte before a single blob is read (CORRECTNESS.md,
+/// the indexdata trust boundary). At one bit per ID, `file_len * 8` keeps the
+/// bitmap within the file's own size, plus one chunk of rounding.
+///
+/// Unlike `check`'s `id_alloc_bound` there is no live-OSM floor, because
+/// nothing depends on the bound covering every ID: pass 1 hands an ID
+/// outside the pre-allocation back as overflow and inserts it after the
+/// pass, where `IdSet` memory follows the number of distinct IDs. A small
+/// extract carrying real ~1e10 node IDs therefore costs memory in proportion
+/// to its nodes, not to its largest ID, and is not refused.
+fn node_prealloc_bound(claimed_max: i64, file_len: u64) -> i64 {
+    let by_size = i64::try_from(file_len.saturating_mul(8)).unwrap_or(i64::MAX);
+    claimed_max.min(by_size)
 }
 
 // ---------------------------------------------------------------------------
@@ -171,9 +318,12 @@ impl StageCounters {
 ///
 /// Four phases: pass 1 rewrites nodes (parallel wire-format rewriter),
 /// stage 2d rewrites ways with resolved refs (parallel wire-format
-/// splice), R1 collects relation IDs into IdSet, R2d rewrites
+/// splice), R1 collects relation IDs into an IdSet, R2d rewrites
 /// relations with resolved member refs (parallel wire-format splice).
-/// All ID lookups are O(1) via `IdSet::resolve()`. No temp files.
+/// No temp files.
+///
+/// Refuses input whose node, way or relation IDs do not strictly increase
+/// in file order (see the module docs), and start IDs below 1.
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]
 pub fn renumber_external(
@@ -185,22 +335,14 @@ pub fn renumber_external(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<RenumberStats> {
+    validate_start_ids(opts)?;
+
     // OwnedBlock Vec<u8>s are allocated on pass1/stage2d worker threads
     // and freed on rayon compression threads. Uncapped, the arenas grow
     // to ~26 GB anon RSS on planet; with 2 the peak stays under 1 GB.
     host.process.cross_thread_alloc_pool();
 
     // ---- Header validation + output writer setup ----
-    {
-        let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
-        let header_blob = header_reader
-            .next()
-            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-        let header = header_blob.to_headerblock()?;
-        require_sorted(&header, input, "Input PBF")?;
-        super::warn_locations_on_ways_loss(&header, host);
-    }
-    // Re-parse header for writer construction (the earlier reader is dropped).
     let header = {
         let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
         let header_blob = header_reader
@@ -208,6 +350,8 @@ pub fn renumber_external(
             .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
         header_blob.to_headerblock()?
     };
+    require_sorted(&header, input, "Input PBF")?;
+    super::warn_locations_on_ways_loss(&header, host);
     // Default to zlib:1 for external renumber - the compression pipeline
     // is on the critical path for pass 1 and stage 2d, and zlib:6 adds
     // ~22 s of backpressure at planet scale for ~15% smaller output.
@@ -235,103 +379,82 @@ pub fn renumber_external(
         false,
         host,
     )?;
-    let mut stats = RenumberStats {
-        nodes_written: 0,
-        ways_written: 0,
-        relations_written: 0,
-        orphan_refs: 0,
-    };
 
     // Single shared input fd for all phases - pread is concurrent-safe.
-    let shared_file = std::sync::Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
-    );
+    let shared_file = std::fs::File::open(input)
+        .map_err(|e| format!("failed to open {}: {e}", input.display()))?;
+    let file_len = shared_file
+        .metadata()
+        .map_err(|e| format!("failed to stat {}: {e}", input.display()))?
+        .len();
 
     crate::debug::emit_marker("RENUMBER_EXT_START");
 
     // ---- Blob schedule scan ----
-    let t_sched = std::time::Instant::now();
+    let t_sched = Instant::now();
     let (pass1_schedule, way_schedule, relation_schedule) = build_all_blob_schedules(input, host)?;
-    #[allow(clippy::cast_possible_truncation)]
-    crate::debug::emit_counter(
-        "renumber_ext_schedule_ms",
-        t_sched.elapsed().as_millis() as i64,
-    );
+    emit_elapsed_ms("renumber_ext_schedule_ms", t_sched);
 
+    // ---- Pass 1: parallel node rewrite ----
     crate::debug::emit_marker("RENUMBER_EXT_PASS1_START");
+    let pass1_total_nodes: u64 = pass1_schedule
+        .iter()
+        .fold(0_u64, |acc, t| acc.saturating_add(t.element_count));
 
-    // ---- Pass 1: parallel node scan ----
-    //
-    // Work-stealing dispatch: workers claim blobs via AtomicUsize,
-    // write into a shared IdSet via AtomicU8::fetch_or. Workers
-    // pread → decompress → wire-format reframe (replace only ID deltas,
-    // copy everything else verbatim) → send Vec<OwnedBlock> through a
-    // bounded channel. Main thread reorders by seq and writes output.
-    let pass1_total_nodes: u64 = pass1_schedule.iter().map(|t| t.element_count).sum();
-
-    // Single shared IdSet - pre-allocate all chunks for the max
-    // node ID so workers can use set_atomic(&self) concurrently.
-    //
-    // Scan the full schedule for max_id rather than trusting "last
-    // blob's max_id == global max" (which holds only for a truthful
-    // Sort.Type_then_ID header). A header that falsely advertises
-    // sorted with content that is not would otherwise let a later
-    // blob's id overshoot the pre-allocated bitset and panic in
-    // `IdSet::set_atomic` with an opaque "pre_allocate only covers..."
-    // message. O(N) in schedule length, called once at startup.
-    let max_node_id = pass1_schedule.iter().map(|t| t.max_id).max().unwrap_or(0);
+    // One shared IdSet, pre-allocated so workers can `set_atomic_checked`
+    // through `&self`. The whole schedule is scanned for the claimed max
+    // rather than trusting the last blob; the claim is then bounded by the
+    // file size (see `node_prealloc_bound`).
     let mut node_id_set = crate::idset::IdSet::new();
-    node_id_set.pre_allocate(max_node_id);
+    if let Some(claimed_max) = pass1_schedule.iter().map(|t| t.max_id).max() {
+        let bound = node_prealloc_bound(claimed_max, file_len);
+        if bound >= 0 {
+            node_id_set.pre_allocate(bound);
+        }
+    }
 
-    let nodes_written_atomic = std::sync::atomic::AtomicU64::new(0);
-
-    pass1_parallel_scan(
+    let pass1 = pass1_parallel_scan(
         &pass1_schedule,
         opts.start_node_id,
         &shared_file,
         &node_id_set,
-        &nodes_written_atomic,
         &mut writer,
     )?;
-
-    stats.nodes_written += nodes_written_atomic.load(std::sync::atomic::Ordering::Relaxed);
-    if stats.nodes_written != pass1_total_nodes {
+    if pass1.nodes_written != pass1_total_nodes {
         return Err(format!(
             "pass1 node count mismatch: schedule reported {pass1_total_nodes}, \
              workers wrote {}",
-            stats.nodes_written,
+            pass1.nodes_written,
         )
         .into());
     }
-
+    // IDs the pre-allocation did not cover, inserted now that no worker
+    // holds the set. Already checked non-negative and strictly increasing.
+    let mut overflow_ids: u64 = 0;
+    for ids in pass1.overflow {
+        overflow_ids = overflow_ids.saturating_add(u64::try_from(ids.len()).unwrap_or(u64::MAX));
+        for id in ids {
+            node_id_set.set(id);
+        }
+    }
+    crate::debug::emit_counter(
+        "renumber_ext_node_overflow_ids",
+        i64::try_from(overflow_ids).unwrap_or(i64::MAX),
+    );
     crate::debug::emit_marker("RENUMBER_EXT_PASS1_END");
 
-    // ---- Build rank index (no merge needed - single shared bitset) ----
-    let t_rank = std::time::Instant::now();
+    // ---- Build rank index ----
+    let t_rank = Instant::now();
     node_id_set.build_rank_index();
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    {
-        crate::debug::emit_counter(
-            "renumber_ext_node_rank_ms",
-            t_rank.elapsed().as_millis() as i64,
-        );
-        crate::debug::emit_counter(
-            "renumber_ext_node_map_entries",
-            node_id_set.total_count() as i64,
-        );
-    }
+    emit_elapsed_ms("renumber_ext_node_rank_ms", t_rank);
+    emit_count("renumber_ext_node_map_entries", node_id_set.total_count());
 
     // ---- Stage 2d: fused way resolve + rewrite (single pass) ----
-    // Resolves way refs inline via node_id_set.rank() during
-    // wire-format splice. No intermediate flat file or sidecar.
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2D_START");
     let mut way_id_sets: Vec<crate::idset::IdSet> = (0..STAGE2D_WORKERS)
         .map(|_| crate::idset::IdSet::new())
         .collect();
-    let stage2d_ways_atomic = std::sync::atomic::AtomicU64::new(0);
-    let orphan_refs_atomic = std::sync::atomic::AtomicU64::new(0);
-    stage2d_parallel_way_assembly(
+    let stage2d = stage2d_parallel_way_assembly(
         &shared_file,
         &mut writer,
         &mut way_id_sets,
@@ -339,71 +462,47 @@ pub fn renumber_external(
         &node_id_set,
         opts.start_node_id,
         opts.start_way_id,
-        &stage2d_ways_atomic,
-        &orphan_refs_atomic,
     )?;
-    stats.ways_written += stage2d_ways_atomic.load(std::sync::atomic::Ordering::Relaxed);
-    stats.orphan_refs += orphan_refs_atomic.load(std::sync::atomic::Ordering::Relaxed);
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2D_END");
 
     // ---- R1: collect relation IDs into IdSet ----
     crate::debug::emit_marker("RENUMBER_EXT_R1_START");
-
-    // Merge per-worker way_id_sets built during stage 2d.
-    let t_way_merge = std::time::Instant::now();
-    debug_assert!(
-        STAGE2D_WORKERS >= 1 && !way_id_sets.is_empty(),
-        "STAGE2D_WORKERS must be >= 1: way_id_sets.remove(0) panics on an empty vec"
-    );
-    let mut way_id_set = way_id_sets.remove(0);
+    let t_way_merge = Instant::now();
+    let mut way_id_set = crate::idset::IdSet::new();
     for other in way_id_sets {
         way_id_set.merge(other);
     }
     way_id_set.build_rank_index();
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    {
-        crate::debug::emit_counter(
-            "renumber_ext_way_merge_rank_ms",
-            t_way_merge.elapsed().as_millis() as i64,
-        );
-        crate::debug::emit_counter(
-            "renumber_ext_way_map_entries",
-            way_id_set.total_count() as i64,
-        );
-    }
+    emit_elapsed_ms("renumber_ext_way_merge_rank_ms", t_way_merge);
+    emit_count("renumber_ext_way_map_entries", way_id_set.total_count());
 
     let mut relation_id_set = crate::idset::IdSet::new();
     relation_r1_collect_ids(&shared_file, &relation_schedule, &mut relation_id_set)?;
-    let t_rel_rank = std::time::Instant::now();
+    let t_rel_rank = Instant::now();
     relation_id_set.build_rank_index();
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    {
-        crate::debug::emit_counter(
-            "renumber_ext_rel_rank_ms",
-            t_rel_rank.elapsed().as_millis() as i64,
-        );
-        crate::debug::emit_counter(
-            "renumber_ext_relation_map_entries",
-            relation_id_set.total_count() as i64,
-        );
+    emit_elapsed_ms("renumber_ext_rel_rank_ms", t_rel_rank);
+    let relation_count = relation_id_set.total_count();
+    emit_count("renumber_ext_relation_map_entries", relation_count);
+    // Relation IDs are `start + rank`; the largest rank is count - 1.
+    if relation_count > 0 {
+        positional_last_fits(opts.start_relation_id, relation_count, "relation")?;
     }
     crate::debug::emit_marker("RENUMBER_EXT_R1_END");
 
     // ---- R2d: parallel wire-format rewrite of relations ----
-    // Resolves node/way member refs inline via resolve().
-    // No flat files, no mmaps, no sidecar.
     crate::debug::emit_marker("RENUMBER_EXT_R2D_START");
-    relation_r2d_assembly(
+    let r2d = relation_r2d_assembly(
         &shared_file,
         &relation_schedule,
         &mut writer,
-        &node_id_set,
-        opts.start_node_id,
-        &way_id_set,
-        opts.start_way_id,
-        &relation_id_set,
-        opts.start_relation_id,
-        &mut stats,
+        &wire_rewrite::RelationIdSpaces {
+            relations: &relation_id_set,
+            start_relation_id: opts.start_relation_id,
+            nodes: &node_id_set,
+            start_node_id: opts.start_node_id,
+            ways: &way_id_set,
+            start_way_id: opts.start_way_id,
+        },
         host,
     )?;
     crate::debug::emit_marker("RENUMBER_EXT_R2D_END");
@@ -412,5 +511,91 @@ pub fn renumber_external(
 
     crate::debug::emit_marker("RENUMBER_EXT_END");
 
-    Ok(stats)
+    Ok(RenumberStats {
+        nodes_written: pass1.nodes_written,
+        ways_written: stage2d.ways_written,
+        relations_written: r2d.relations_written,
+        orphan_refs: stage2d.orphan_refs.saturating_add(r2d.orphan_refs),
+    })
+}
+
+fn positional_last_fits(start: i64, count: u64, kind: &str) -> Result<()> {
+    let fits = count
+        .checked_sub(1)
+        .and_then(|span| i64::try_from(span).ok())
+        .and_then(|span| start.checked_add(span))
+        .is_some();
+    if fits {
+        Ok(())
+    } else {
+        Err(format!(
+            "renumber: {kind} start id {start} plus the input's {count} {kind}s \
+             runs past the largest 64-bit id"
+        )
+        .into())
+    }
+}
+
+fn emit_elapsed_ms(name: &str, since: Instant) {
+    crate::debug::emit_counter(
+        name,
+        i64::try_from(since.elapsed().as_millis()).unwrap_or(i64::MAX),
+    );
+}
+
+fn emit_count(name: &str, count: u64) {
+    crate::debug::emit_counter(name, i64::try_from(count).unwrap_or(i64::MAX));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(count: u64) -> BlobTask {
+        BlobTask {
+            data_offset: 0,
+            data_size: 0,
+            element_count: count,
+            max_id: 0,
+            bbox: None,
+        }
+    }
+
+    #[test]
+    fn bases_are_a_prefix_sum_and_only_the_last_id_must_fit() {
+        let bases = positional_bases(10, &[task(3), task(0), task(2)], "node").expect("fits");
+        assert_eq!(bases, vec![10, 13, 13]);
+        // One node starting at i64::MAX: the only id handed out fits, though
+        // the one-past-the-end cursor does not. Trailing empty blob too.
+        assert!(positional_bases(i64::MAX, &[task(1), task(0)], "node").is_ok());
+        assert!(positional_bases(i64::MAX, &[task(2)], "node").is_err());
+    }
+
+    #[test]
+    fn start_ids_below_one_are_refused() {
+        for (n, w, r) in [(0, 1, 1), (1, -5, 1), (1, 1, 0)] {
+            let opts = RenumberOptions {
+                start_node_id: n,
+                start_way_id: w,
+                start_relation_id: r,
+            };
+            assert!(validate_start_ids(&opts).is_err(), "{n},{w},{r}");
+        }
+        let ok = RenumberOptions {
+            start_node_id: 1,
+            start_way_id: 5000,
+            start_relation_id: 1,
+        };
+        assert!(validate_start_ids(&ok).is_ok());
+    }
+
+    /// An indexdata claim of `i64::MAX` from a small file must not
+    /// size the pre-allocation; an honest planet-scale claim still does.
+    #[test]
+    fn the_node_preallocation_is_bounded_by_the_file() {
+        assert_eq!(node_prealloc_bound(i64::MAX, 4096), 32_768);
+        let planet = 80_u64 * 1024 * 1024 * 1024;
+        assert_eq!(node_prealloc_bound(13_000_000_000, planet), 13_000_000_000);
+        assert_eq!(node_prealloc_bound(i64::MAX, u64::MAX), i64::MAX);
+    }
 }

@@ -5,18 +5,17 @@ use std::path::Path;
 
 use super::super::Result;
 
-/// Per-blob task for the parallel pass pool. `seq` is the filtered-index
-/// position (monotonic within the per-kind blob list, used for writer
-/// reorder). `data_offset` / `data_size` address the compressed blob body
-/// for pread. `element_count` comes from the indexdata `BlobIndex.count`
-/// and lets the caller precompute base new_ids without racing decode.
+/// Per-blob task for the parallel pass pool; a task's index in its per-kind
+/// schedule is its sequence number for the ordered writer. `data_offset` /
+/// `data_size` address the compressed blob body for pread. `element_count`
+/// comes from the indexdata `BlobIndex.count` and lets the caller precompute
+/// base new_ids without racing decode; each blob verifies it after decode.
 pub(super) struct BlobTask {
-    pub(super) seq: usize,
     pub(super) data_offset: u64,
     pub(super) data_size: usize,
     pub(super) element_count: u64,
-    /// Source blob's max element ID from indexdata. Used to compute
-    /// per-stage id-space offsets before decode.
+    /// Source blob's max element ID from indexdata - a claim, used only as
+    /// one input to the node pre-allocation bound.
     pub(super) max_id: i64,
     /// Source blob's spatial bbox (node blobs only).
     pub(super) bbox: Option<crate::blob_meta::BlobBbox>,
@@ -47,9 +46,6 @@ pub(super) fn build_all_blob_schedules(
     let mut nodes: Vec<BlobTask> = Vec::new();
     let mut ways: Vec<BlobTask> = Vec::new();
     let mut relations: Vec<BlobTask> = Vec::new();
-    let mut node_seq: usize = 0;
-    let mut way_seq: usize = 0;
-    let mut rel_seq: usize = 0;
     while let Some(meta) = walker.next_header()? {
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
@@ -61,20 +57,18 @@ pub(super) fn build_all_blob_schedules(
                     .into(),
             );
         };
-        let (sched, seq) = match idx.kind {
-            crate::blob_meta::ElemKind::Node => (&mut nodes, &mut node_seq),
-            crate::blob_meta::ElemKind::Way => (&mut ways, &mut way_seq),
-            crate::blob_meta::ElemKind::Relation => (&mut relations, &mut rel_seq),
+        let sched = match idx.kind {
+            crate::blob_meta::ElemKind::Node => &mut nodes,
+            crate::blob_meta::ElemKind::Way => &mut ways,
+            crate::blob_meta::ElemKind::Relation => &mut relations,
         };
         sched.push(BlobTask {
-            seq: *seq,
             data_offset: meta.data_offset,
             data_size: meta.data_size,
             element_count: idx.count,
             max_id: idx.max_id,
             bbox: idx.bbox,
         });
-        *seq += 1;
     }
     Ok((nodes, ways, relations))
 }

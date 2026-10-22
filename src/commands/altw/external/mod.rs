@@ -382,7 +382,7 @@ mod bucket_math_tests {
 
     #[test]
     fn oversized_indexdata_max_id_is_an_error_not_a_panic() {
-        // BUG-025: max_node_id comes from unverified indexdata. The largest
+        // max_node_id comes from unverified indexdata. The largest
         // encodable claim is accepted, one past it is refused with an
         // error, and so is the adversarial extreme.
         let limit = 256 * (1_u64 << 30);

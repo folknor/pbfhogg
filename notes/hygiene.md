@@ -298,9 +298,9 @@ slot) is built in:
 - Altw: `external/stage1.rs` pass A (atomic-index dispatch, own reorder
   buffer), `stage2.rs`, `stage3.rs`, `stage4.rs` and `passthrough.rs`
   (`passthrough.rs`'s doc says it was "lifted from external/stage4.rs").
-- Renumber: `pass1.rs`, `stage2.rs`, `relations.rs`, each with
-  `sync_channel(32)`, `ReorderBuffer::with_capacity(64)`, an `AtomicUsize`
-  work-stealing index; the hang of BUG-001 is in all three.
+- Renumber: now one pool in `renumber/pool.rs` with cancellation and a
+  claim window ahead of the write head, the properties the shared engine
+  needs; a candidate to generalise rather than another copy.
 - `repack` and `degrade`: each defines `FRAME_BATCH`, `KindPayload`,
   `WorkerOutput`, `PhaseStats`, `run_kind_phase`, `frame_owned`,
   `frame_and_write_batch`; `cat/mod.rs::run_kind_phase` is a third member.

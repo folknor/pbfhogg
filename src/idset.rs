@@ -570,8 +570,9 @@ impl IdSet {
     ///
     /// - Corrupted or mismatched indexdata: a blob header reports a smaller
     ///   `max_id` than the element IDs that actually appear once the blob is
-    ///   decoded. `renumber_external` builds its schedule from indexdata and
-    ///   uses `pass1_schedule.last().max_id`.
+    ///   decoded. Callers that size from indexdata must route IDs above
+    ///   their bound elsewhere; renumber collects them per worker and
+    ///   inserts them with `set` after its parallel pass.
     /// - Future planet growth past a hard-coded cap.
     ///
     /// The defensive option is to verify `max_id` during the schedule scan
@@ -1181,7 +1182,7 @@ mod tests {
 
     #[test]
     fn extreme_ids_cost_no_allocation_proportional_to_the_id() {
-        // BUG-024: one ID near i64::MAX used to resize the chunk directory to
+        // One ID near i64::MAX used to resize the chunk directory to
         // ~2^38 entries and abort. It now lands in one overflow array chunk.
         let mut s = IdSet::new();
         s.set(i64::MAX);
@@ -1236,7 +1237,7 @@ mod tests {
 
     #[test]
     fn rank_is_total_over_every_i64() {
-        // BUG-024: `rank` indexed `chunk_prefix[cid]` unchecked and panicked
+        // `rank` used to index `chunk_prefix[cid]` unchecked and panicked
         // past the last chunk or on a negative id.
         let mut s = IdSet::new();
         s.set(5);

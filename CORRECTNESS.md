@@ -394,7 +394,9 @@ true, and it has consumers that act on it destructively:
 - `cat --type <kind>` copies a blob through **raw**, without decoding, when the
   declared kind matches - so a mislabelled blob leaks off-kind elements into the
   output, or vanishes from it entirely.
-- `renumber` assigns ID blocks from the declared `count`.
+- `renumber` assigns ID blocks from the declared `count`, then checks each
+  blob's decoded count against it, and checks that IDs strictly increase
+  rather than trusting the header's `Sort.Type_then_ID`.
 - `apply-changes` routes an indexed blob whose declared ID range does not
   overlap the diff to the splice fast path, copying it unchanged, so an
   understated range carries the blob past a modify or delete aimed at it.
@@ -469,5 +471,8 @@ range are exact, because every consumer above treats them as exact.
 being wrong. `check`'s `id_alloc_bound` bounds the ID bitset by the input file's
 own size rather than by the claimed `max_id`, and both `verify_ids` and
 `check_refs` report an out-of-range ID as an input property instead of panicking.
-`repack` bounds its `BlockBuilder` pre-allocation the same way. New code that
-sizes anything from `indexdata` must do likewise.
+`repack` bounds its `BlockBuilder` pre-allocation the same way. `renumber`
+pre-allocates its node set to the smaller of the claimed `max_id` and a bound
+from the file size, and inserts any decoded ID above that afterwards, so a
+false claim costs neither memory nor a refusal. New code that sizes anything
+from `indexdata` must do likewise.

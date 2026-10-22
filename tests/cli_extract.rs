@@ -1412,7 +1412,7 @@ fn simple_multi_blob_bbox_partitioning() {
 }
 
 // ---------------------------------------------------------------------------
-// Raw passthrough must not trust indexdata (BUG-005)
+// Raw passthrough must not trust indexdata
 // ---------------------------------------------------------------------------
 
 /// `nodes` inside `BBOX_STR`, ids starting at `start`.

@@ -609,7 +609,7 @@ mod tests {
         WireBlobHeader::parse(h, true, true, false).unwrap()
     }
 
-    /// BUG-033: a 26-byte field whose version byte says v3 used to be padded
+    /// A 26-byte field whose version byte says v3 used to be padded
     /// to 42 bytes and read back with the bbox `(0, 0, 0, 0)` - under v3 a
     /// real box at Null Island, so a spatial filter skipped the blob for any
     /// region away from (0, 0).

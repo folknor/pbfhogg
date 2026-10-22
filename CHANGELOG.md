@@ -552,6 +552,21 @@
   trusted, and an inverted ID range or a repeated indexdata or tagdata field
   now reads as no index.
 
+- **`renumber` refuses input it would renumber wrongly, and no longer hangs.**
+  New IDs are assigned by position but references resolved by rank, which
+  only agree when IDs strictly increase; a file whose header falsely claimed
+  to be sorted, or that carried a duplicate ID, got ways and relations
+  pointing at the wrong elements, exit 0. Renumber now checks the order
+  itself and refuses such input, and also refuses groups mixing element
+  kinds, repeated `DenseNodes` or `id` fields, and delta sums that overflow,
+  each of which used to drop, duplicate or wrap IDs silently. Any error
+  partway through used to hang the run once more than a channel's worth of
+  blobs remained; it now ends it with that error. `--start-id` values below
+  1 are refused (osmium counts downward from a negative start). A lying
+  indexdata `max_id` no longer drives the node set's pre-allocation, and
+  per-stage timing counters, which truncated each blob to whole
+  milliseconds, are now in nanoseconds.
+
 - **`merge-changes --allow-version-regression` without `--simplify` is a
   usage error.** It used to be accepted and do nothing, since only
   `--simplify` compares versions.

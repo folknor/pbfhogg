@@ -681,7 +681,7 @@ mod tests {
         f
     }
 
-    /// BUG-033: the length a version byte declares is binding. A 26-byte v3
+    /// The length a version byte declares is binding. A 26-byte v3
     /// slice would otherwise read past its end (or, in the padded carrier,
     /// read zeros) as the real Null Island bbox `(0, 0, 0, 0)`.
     #[test]

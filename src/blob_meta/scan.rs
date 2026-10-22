@@ -932,7 +932,7 @@ mod tests {
         assert!(try_scan_block_tags(&block).is_err());
     }
 
-    // --- BUG-036: a parse failure is an error, never a short result ------
+    // --- A parse failure is an error, never a short result ---------------
 
     /// A group that fails to parse used to vanish, and the blob was indexed
     /// from the remaining groups with an understated `count` and range.

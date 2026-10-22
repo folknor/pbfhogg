@@ -1,11 +1,17 @@
 //! End-to-end tests for renumber.
 
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crate::common::adversarial::{
+    mutate_blob_header_indexdata, mutate_blob_payload, set_relation_memids_terminator_continuation,
+};
 use crate::common::{
-    TestMember, TestNode, TestRelation, TestWay, assert_sorted_file, read_normalized,
-    write_test_pbf_sorted,
+    TestMember, TestNode, TestRelation, TestWay, assert_sorted_file, generate_nodes,
+    read_normalized, write_multi_block_test_pbf, write_test_pbf_sorted,
 };
 use pbfhogg::MemberId;
-use pbfhogg::renumber::{RenumberOptions, renumber_external};
+use pbfhogg::renumber::{RenumberOptions, RenumberStats, renumber_external};
 use pbfhogg::writer::Compression;
 use tempfile::TempDir;
 
@@ -1054,4 +1060,383 @@ fn renumber_rejects_negative_relation_member_ref() {
         msg.contains("-7"),
         "error must name the offending member ref id (-7); got: {msg}",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers for the defect tests below
+// ---------------------------------------------------------------------------
+
+fn run_renumber(
+    input: &Path,
+    output: &Path,
+    opts: &RenumberOptions,
+) -> Result<RenumberStats, String> {
+    renumber_external(
+        input,
+        output,
+        opts,
+        Compression::default(),
+        false,
+        &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Run renumber on its own thread and fail the test if it has not returned
+/// within ten seconds. The defect these tests pin was a hang, which should
+/// fail as one rather than run into the harness watchdog. The outer `Err`
+/// is the timeout.
+fn renumber_within_deadline(
+    input: PathBuf,
+    output: PathBuf,
+) -> Result<Result<RenumberStats, String>, std::sync::mpsc::RecvTimeoutError> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // The receiver is gone only if the deadline already failed.
+        tx.send(run_renumber(&input, &output, &default_opts())).ok();
+    });
+    rx.recv_timeout(Duration::from_secs(10))
+}
+
+const HUNG: &str = "renumber hung on a mid-stream error instead of failing";
+
+fn plain_node(id: i64) -> TestNode {
+    TestNode {
+        id,
+        lat: 100_000_000,
+        lon: 200_000_000,
+        tags: vec![],
+        meta: None,
+    }
+}
+
+fn plain_way(id: i64, refs: Vec<i64>) -> TestWay {
+    TestWay {
+        id,
+        refs,
+        tags: vec![],
+        meta: None,
+    }
+}
+
+fn plain_relation(id: i64, way: i64) -> TestRelation {
+    TestRelation {
+        id,
+        members: vec![TestMember {
+            id: MemberId::Way(way),
+            role: "outer",
+        }],
+        tags: vec![],
+        meta: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A mid-stream error ends the run instead of hanging it
+// ---------------------------------------------------------------------------
+
+/// Blobs per kind in the many-blob fixture. Far more than the old pools'
+/// 32-slot channel plus their workers, so a failure in the middle left
+/// enough work behind to park every worker in `send`.
+const MANY: i64 = 200;
+
+/// One element per blob: `MANY` node blobs, then `MANY` way blobs, then
+/// `MANY` relation blobs. Frame 0 is the header, so node blob `i` is frame
+/// `1 + i`, way blob `i` is `1 + MANY + i`, relation blob `i` is
+/// `1 + 2 * MANY + i`.
+fn write_many_blob_fixture(path: &Path) {
+    let nodes: Vec<TestNode> = (1..=MANY).map(plain_node).collect();
+    let ways: Vec<TestWay> = (1..=MANY).map(|id| plain_way(id, vec![1, 2])).collect();
+    let relations: Vec<TestRelation> = (1..=MANY).map(|id| plain_relation(id, 1)).collect();
+    write_multi_block_test_pbf(path, &nodes, &ways, &relations, 1);
+}
+
+fn frame(kind_offset: i64, i: i64) -> usize {
+    usize::try_from(1 + kind_offset * MANY + i).expect("frame index")
+}
+
+fn assert_fails_promptly(mutate: impl FnOnce(&[u8]) -> Vec<u8>, expect: &str) {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_many_blob_fixture(&input);
+
+    // Sanity: the unmutated fixture renumbers cleanly.
+    let stats = renumber_within_deadline(input.clone(), output.clone())
+        .expect(HUNG)
+        .expect("clean fixture");
+    assert_eq!(stats.nodes_written, 200);
+    assert_eq!(stats.ways_written, 200);
+    assert_eq!(stats.relations_written, 200);
+
+    let pbf = std::fs::read(&input).expect("read fixture");
+    std::fs::write(&input, mutate(&pbf)).expect("rewrite fixture");
+    let err = renumber_within_deadline(input, output)
+        .expect(HUNG)
+        .expect_err("a corrupt blob mid-stream must fail the run");
+    assert!(
+        err.contains(expect),
+        "expected an error naming {expect:?}; got: {err}"
+    );
+}
+
+fn garbage_payload(payload: &mut Vec<u8>) {
+    payload.clear();
+    // A varint that never terminates: no wire parser accepts it.
+    payload.extend_from_slice(&[0xFF; 12]);
+}
+
+#[test]
+fn a_corrupt_node_blob_mid_stream_fails_instead_of_hanging() {
+    assert_fails_promptly(
+        |pbf| mutate_blob_payload(pbf, frame(0, MANY / 2), garbage_payload),
+        "varint",
+    );
+}
+
+#[test]
+fn a_corrupt_way_blob_mid_stream_fails_instead_of_hanging() {
+    assert_fails_promptly(
+        |pbf| mutate_blob_payload(pbf, frame(1, MANY / 2), garbage_payload),
+        "varint",
+    );
+}
+
+/// R1 reads only relation ids, so a broken `memids` surfaces first in the
+/// parallel R2d pool - the third copy of the hanging shape.
+#[test]
+fn a_corrupt_relation_blob_mid_stream_fails_instead_of_hanging() {
+    assert_fails_promptly(
+        |pbf| set_relation_memids_terminator_continuation(pbf, frame(2, MANY / 2), 0),
+        "memids",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Input ids must strictly increase within each kind
+// ---------------------------------------------------------------------------
+
+/// Renumber a fixture whose header claims `Sort.Type_then_ID` but whose ids
+/// are not strictly increasing, and assert the refusal. Before the check,
+/// such input renumbered with exit 0 and ways pointing at the wrong nodes.
+fn assert_order_refused(
+    nodes: &[i64],
+    ways: &[(i64, Vec<i64>)],
+    relations: &[i64],
+    block_size: usize,
+    expect: &str,
+) {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    let nodes: Vec<TestNode> = nodes.iter().copied().map(plain_node).collect();
+    let ways: Vec<TestWay> = ways
+        .iter()
+        .map(|(id, refs)| plain_way(*id, refs.clone()))
+        .collect();
+    let relations: Vec<TestRelation> = relations.iter().map(|&id| plain_relation(id, 10)).collect();
+    write_multi_block_test_pbf(&input, &nodes, &ways, &relations, block_size);
+
+    let err = run_renumber(&input, &output, &default_opts())
+        .expect_err("non-increasing ids under a sorted header must be refused");
+    assert!(
+        err.contains("strictly increase") && err.contains(expect),
+        "expected the ordering refusal naming {expect:?}; got: {err}"
+    );
+}
+
+#[test]
+fn nodes_out_of_order_within_a_blob_are_refused() {
+    // Old behaviour: nodes renumbered by position (1->1, 3->2, 2->3) but way
+    // ref 2 resolved by rank to 2, i.e. to the node that had id 3.
+    assert_order_refused(
+        &[1, 3, 2],
+        &[(10, vec![2, 3])],
+        &[],
+        100,
+        "node 2 comes after a larger id",
+    );
+}
+
+#[test]
+fn a_duplicate_node_within_a_blob_is_refused() {
+    assert_order_refused(
+        &[1, 2, 2, 3],
+        &[(10, vec![3])],
+        &[],
+        100,
+        "node 2 appears twice",
+    );
+}
+
+#[test]
+fn nodes_out_of_order_across_blobs_are_refused() {
+    assert_order_refused(
+        &[1, 2, 5, 6, 3, 4],
+        &[(10, vec![4])],
+        &[],
+        2,
+        "node 3 comes after a larger id",
+    );
+}
+
+#[test]
+fn a_duplicate_node_across_blobs_is_refused() {
+    assert_order_refused(
+        &[1, 2, 2, 3],
+        &[(10, vec![3])],
+        &[],
+        2,
+        "node 2 appears twice",
+    );
+}
+
+#[test]
+fn ways_out_of_order_are_refused() {
+    // Old behaviour: relation member way 10 resolved by rank to the way
+    // that had id 20.
+    assert_order_refused(
+        &[1, 2],
+        &[(20, vec![1]), (10, vec![2])],
+        &[100],
+        1,
+        "way 10 comes after a larger id",
+    );
+}
+
+#[test]
+fn a_duplicate_relation_is_refused() {
+    assert_order_refused(
+        &[1],
+        &[(10, vec![1])],
+        &[100, 100],
+        1,
+        "relation 100 appears twice",
+    );
+}
+
+/// Passing counterpart: many small blobs with strictly increasing, gapped
+/// ids renumber with every reference landing on the right element.
+#[test]
+fn increasing_ids_across_many_blobs_renumber_consistently() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    let node_ids: Vec<i64> = (1..=40).map(|i| i * 7).collect();
+    let nodes: Vec<TestNode> = node_ids.iter().copied().map(plain_node).collect();
+    let small = |v: usize| i64::try_from(v).expect("small");
+    // Way `i` (id 3i) references node_ids[39 - i] and node_ids[i].
+    let ways: Vec<TestWay> = (1..=12_usize)
+        .map(|i| plain_way(small(i * 3), vec![node_ids[39 - i], node_ids[i]]))
+        .collect();
+    let relations: Vec<TestRelation> = (1..=5).map(|i| plain_relation(i * 11, 33)).collect();
+    write_multi_block_test_pbf(&input, &nodes, &ways, &relations, 3);
+
+    run_renumber(&input, &output, &default_opts()).expect("renumber");
+    let norm = read_normalized(&output);
+    for i in 1..=12_usize {
+        // Way id 3i is the i-th way; node_ids[k] is the (k+1)-th node.
+        let way = norm.ways.iter().find(|w| w.id == small(i)).expect("way");
+        assert_eq!(way.refs, vec![small(40 - i), small(i + 1)], "way {i}");
+    }
+    // Way 33 is the 11th way.
+    assert!(norm.relations.iter().all(|r| r.members[0].ref_id == 11));
+    assert_sorted_file(&output);
+}
+
+// ---------------------------------------------------------------------------
+// Indexdata may not size the node pre-allocation
+// ---------------------------------------------------------------------------
+
+/// A node blob whose indexdata claims `max_id = i64::MAX`. Sized from the
+/// claim, `IdSet::pre_allocate` asked for about a terabyte before reading a
+/// single blob and the process died. The bound now comes from the file, and
+/// the output must match the honest file's exactly.
+#[test]
+fn an_overstated_indexdata_max_id_does_not_size_the_node_set() {
+    let dir = TempDir::new().expect("tempdir");
+    let honest = dir.path().join("honest.osm.pbf");
+    let lying = dir.path().join("lying.osm.pbf");
+    let out_honest = dir.path().join("out_honest.osm.pbf");
+    let out_lying = dir.path().join("out_lying.osm.pbf");
+    write_test_pbf_sorted(
+        &honest,
+        &generate_nodes(20, 1),
+        &[plain_way(5, vec![3, 1, 20])],
+        &[],
+    );
+    let pbf = std::fs::read(&honest).expect("read");
+    // Frame 1 is the node blob. Indexdata bytes 10..18 hold max_id (LE).
+    let mutated = mutate_blob_header_indexdata(&pbf, 1, |ix| {
+        assert!(ix.len() >= 18, "fixture node blob must carry indexdata");
+        ix[10..18].copy_from_slice(&i64::MAX.to_le_bytes());
+    });
+    std::fs::write(&lying, mutated).expect("write");
+
+    run_renumber(&honest, &out_honest, &default_opts()).expect("honest");
+    run_renumber(&lying, &out_lying, &default_opts())
+        .expect("an overstated max_id must neither abort nor refuse");
+    let (a, b) = (read_normalized(&out_honest), read_normalized(&out_lying));
+    assert_eq!(a.nodes.len(), b.nodes.len());
+    assert_eq!(a.ways[0].refs, b.ways[0].refs);
+    assert_eq!(b.ways[0].refs, vec![3, 1, 20]);
+}
+
+/// A tiny file with node ids far above anything its size could justify
+/// pre-allocating - including one past the `IdSet` direct-chunk range. Those
+/// ids take the overflow path, and every reference still resolves. Refusing
+/// them would refuse every small extract of real OSM data.
+#[test]
+fn node_ids_far_above_the_file_size_bound_still_renumber() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    let (a, b, c) = (5_i64, 1_i64 << 40, 1_i64 << 50);
+    write_test_pbf_sorted(
+        &input,
+        &[plain_node(a), plain_node(b), plain_node(c)],
+        &[plain_way(9, vec![c, a, b])],
+        &[TestRelation {
+            id: 4,
+            members: vec![TestMember {
+                id: MemberId::Node(c),
+                role: "x",
+            }],
+            tags: vec![],
+            meta: None,
+        }],
+    );
+    run_renumber(&input, &output, &default_opts()).expect("renumber");
+    let norm = read_normalized(&output);
+    assert_eq!(
+        norm.nodes.iter().map(|n| n.id).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(norm.ways[0].refs, vec![3, 1, 2]);
+    assert_eq!(norm.relations[0].members[0].ref_id, 3);
+}
+
+// ---------------------------------------------------------------------------
+// Start ids: a start below 1 is refused
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_start_id_below_one_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_test_pbf_sorted(&input, &[plain_node(1), plain_node(2)], &[], &[]);
+    for start in [0, -5] {
+        let opts = RenumberOptions {
+            start_node_id: start,
+            start_way_id: 1,
+            start_relation_id: 1,
+        };
+        let err = run_renumber(&input, &output, &opts).expect_err("must be refused");
+        assert!(
+            err.contains("start id must be at least 1"),
+            "start {start}: got {err}"
+        );
+    }
 }

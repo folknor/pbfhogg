@@ -552,6 +552,16 @@
   trusted, and an inverted ID range or a repeated indexdata or tagdata field
   now reads as no index.
 
+- **`build-geocode-index` no longer races or panics on hostile input.** A
+  node duplicated across blobs made two workers write one coordinate slot
+  concurrently, which was undefined behaviour, and an out-of-range slot was
+  an out-of-bounds write in release builds. A node ID above its blob's
+  indexdata `max_id` panicked a worker; it is now an error naming the node.
+  Way refs above every node ID in the file are dropped as dangling, as they
+  always effectively were. With `--force` on input without indexdata, blob
+  kinds and the node-ID bound are now derived by decoding, instead of a
+  bound of 0.
+
 - **A huge element ID no longer aborts the process.** One way ref or
   relation member near `i64::MAX` made the internal ID set try to allocate
   terabytes in `add-locations-to-ways --index-type sparse`, and the same set

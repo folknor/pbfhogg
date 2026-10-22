@@ -633,23 +633,19 @@ builder just wrote. Those are builder bugs and should be errors or
 
 Reported by: geocode index.
 
-## BUG-047 - `CoordMmapShared` is a data race on input with a duplicated node
+## BUG-074 - Geocode builder output differs between runs of the same input
 
-The `unsafe impl Sync` and `write_coord` contract require that no two
-concurrent calls pass the same rank, justified by "sorted PBF guaranteeing
-every node ID appears in at most one blob". Nothing checks the input is sorted
-or deduplicated: `require_indexdata` checks indexdata, not
-`Sort.Type_then_ID`, and `--force` skips even that. A PBF with a node
-duplicated across two blobs (naive concatenation, un-deduped merge) makes two
-workers write one slot concurrently, which is UB. `write_coord`'s bounds check
-is `debug_assert!` only, so in release an out-of-range rank is an
-out-of-bounds write.
+`parallel_classify_phase` delivers results in worker-completion order and
+both Pass 2 merges ignore `seq`, so record order, string offsets, the
+smoke test's first address, and which duplicate admin geometry survives
+can change from build to build. A reorder buffer alone would not fix it
+safely: nothing bounds how far ahead workers run of the earliest unmerged
+blob (HYG-053), so the buffer could grow without limit. Separately, a node
+duplicated across blobs now resolves to one complete coordinate (the
+`CoordMmapShared` data race is gone, slots are atomic), but which copy wins
+is not deterministic either.
 
-Fix: `AtomicU64` slots with relaxed stores (same codegen on x86-64, no UB, no
-`unsafe impl`), or check `is_sorted()` at entry and refuse; make the bounds
-check a real check.
-
-Reported by: geocode index.
+Reported by: the geocode fix for the former coordinate-race entry.
 
 ## BUG-048 - Rebuilding a geocode index with `--force` truncates files under open readers
 

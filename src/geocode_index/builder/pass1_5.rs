@@ -27,12 +27,10 @@ pub(super) fn run_pass1_5(
     // because each worker allocated independent chunks across the full
     // planet ID range. Pattern follows `renumber_external/pass1.rs`.
     //
-    // `pre_allocate(max_node_id)` requires `max_node_id` to cover every ID
-    // the classify closure will call `set_atomic` on. We get it from
-    // `build_pass2_schedules` above, which reads indexdata from node blobs.
-    // If a node blob lacks indexdata (-- force path only), the upper bound
-    // is under-reported and `set_atomic` would panic via its diagnostic
-    // path.
+    // `pre_allocate(max_node_id)` covers every ID up to the node-ID bound
+    // from `build_pass2_schedules`, and the classify closure below only
+    // calls `set_atomic` on refs inside `0..=max_node_id`, so it cannot hit
+    // `set_atomic`'s out-of-range panic.
     let mut referenced_nodes = crate::idset::IdSet::new();
     referenced_nodes.pre_allocate(max_node_id);
 
@@ -105,19 +103,25 @@ pub(super) fn run_pass1_5(
                                         || is_admin
                                     {
                                         for &r in refs {
-                                            // Guard: `IdSet::set_atomic` casts
-                                            // `i64` to `u64` and indexes via
-                                            // `chunk_for_atomic`, which panics
-                                            // if the resulting chunk falls
-                                            // outside the pre-allocated range.
-                                            // A corrupt / hand-edited PBF
-                                            // containing a negative way ref
-                                            // would take out the whole parallel
-                                            // Pass 1.5 scan. Non-atomic
-                                            // `IdSet::set` silently skips
-                                            // negatives; match that here
-                                            // rather than panic.
-                                            if r < 0 {
+                                            // Only refs in `0..=max_node_id`
+                                            // can name a node Phase 2a will
+                                            // see. Negative refs are skipped
+                                            // as non-atomic `IdSet::set` does.
+                                            // A ref above the bound is a
+                                            // dangling ref on honest input (a
+                                            // simple-strategy extract keeps
+                                            // ways whose nodes lie outside it,
+                                            // with IDs that can exceed every
+                                            // node present): no coordinate can
+                                            // ever be written for it, so
+                                            // dropping it here changes nothing
+                                            // downstream. That holds only while
+                                            // the bound is true, which is why
+                                            // Phase 2a errors on any decoded
+                                            // node above it. Both checks also
+                                            // keep `set_atomic` inside the
+                                            // pre-allocated chunks.
+                                            if r < 0 || r > max_node_id {
                                                 continue;
                                             }
                                             referenced_ref.set_atomic(r);
@@ -156,9 +160,9 @@ pub(super) fn run_pass1_5(
 
 /// Single header pass that produces everything Pass 1.5 and Pass 2a need to
 /// start: the way-blob schedule (for Pass 1.5 + unused by Pass 2a), the
-/// node-blob schedule (for Pass 2a), the max node ID from indexdata (so
-/// Pass 1.5 can `pre_allocate` the shared `IdSet`), and a single
-/// shared file handle reused across both phases' `pread_at` workers.
+/// node-blob schedule (for Pass 2a), the node-ID bound (so Pass 1.5 can
+/// `pre_allocate` the shared `IdSet` and Phase 2a can verify it), and a
+/// single shared file handle reused across both phases' `pread_at` workers.
 ///
 /// Consolidates two previously-separate header walks (Pass 1.5's
 /// `build_way_schedule_and_max_node_id` and Pass 2a's
@@ -166,15 +170,16 @@ pub(super) fn run_pass1_5(
 /// costs ~16-17 s once, vs 16.6 s + 26.5 s = 43 s for the two-walk
 /// shape - measured 2026-04-18 on `bf8f2038`.
 ///
-/// Each schedule's `seq` is local to that schedule (node and way are
-/// separate `0..n` ranges, as `parallel_classify_phase`'s ReorderBuffer
-/// expects).
+/// Each schedule is in file order and its `seq` is local to that schedule
+/// (node and way are separate `0..n` ranges).
 ///
-/// Blobs without indexdata are added to both schedules (conservative
-/// fallback matching `build_classify_schedule`'s semantics) but cannot
-/// contribute to `max_node_id`. `require_indexdata` at the
-/// `build_geocode_index` entry rejects non-indexed input unless `--force`
-/// is set, so in practice every blob carries indexdata here.
+/// The node-ID bound is the largest indexdata `max_id` over node blobs,
+/// widened by the real maximum of every blob that carries no indexdata.
+/// `require_indexdata` at the `build_geocode_index` entry rejects
+/// non-indexed input unless `--force` is set; with `--force`, each
+/// unindexed blob is decoded once here (in parallel) to learn which kinds
+/// it holds and its largest node ID. Indexdata claims are trusted at this
+/// point and checked against the decoded nodes in Phase 2a.
 #[allow(clippy::type_complexity)]
 pub(super) fn build_pass2_schedules(
     input_path: &Path,
@@ -190,22 +195,20 @@ pub(super) fn build_pass2_schedules(
         .next_header()?
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
 
+    // Entries are `(seq, offset, size)`; `seq` is assigned once both
+    // schedules are complete (see `renumber` below).
     let mut node_schedule: Vec<(usize, u64, usize)> = Vec::new();
     let mut way_schedule: Vec<(usize, u64, usize)> = Vec::new();
-    let mut node_seq: usize = 0;
-    let mut way_seq: usize = 0;
+    // OsmData blobs without indexdata (a `--force` run). Their kinds and
+    // node-ID range are established by decoding them, below.
+    let mut unindexed: Vec<(usize, u64, usize)> = Vec::new();
     let mut max_node_id: i64 = 0;
     while let Some(meta) = walker.next_header()? {
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
         }
         let Some(idx) = meta.index.as_ref() else {
-            // No indexdata: conservatively include in both schedules so
-            // neither phase silently drops data from a --force run.
-            node_schedule.push((node_seq, meta.data_offset, meta.data_size));
-            node_seq += 1;
-            way_schedule.push((way_seq, meta.data_offset, meta.data_size));
-            way_seq += 1;
+            unindexed.push((unindexed.len(), meta.data_offset, meta.data_size));
             continue;
         };
         match idx.kind {
@@ -213,12 +216,10 @@ pub(super) fn build_pass2_schedules(
                 if idx.max_id > max_node_id {
                     max_node_id = idx.max_id;
                 }
-                node_schedule.push((node_seq, meta.data_offset, meta.data_size));
-                node_seq += 1;
+                node_schedule.push((0, meta.data_offset, meta.data_size));
             }
             crate::blob_meta::ElemKind::Way => {
-                way_schedule.push((way_seq, meta.data_offset, meta.data_size));
-                way_seq += 1;
+                way_schedule.push((0, meta.data_offset, meta.data_size));
             }
             crate::blob_meta::ElemKind::Relation => {}
         }
@@ -226,6 +227,61 @@ pub(super) fn build_pass2_schedules(
 
     let shared_file = std::sync::Arc::clone(walker.shared_file());
     drop(walker);
+
+    // `max_node_id` must bound every node ID Phase 2a will see: Pass 1.5
+    // drops refs above it as dangling, and Phase 2a turns a node above it
+    // into an error. For a blob with no indexdata there is no claim to read,
+    // so decode it and take the real answer - which also says exactly which
+    // phases need the blob, instead of feeding every unindexed blob to both.
+    // A blob holding both nodes and ways (legal, never indexed by pbfhogg)
+    // goes into both schedules; Phase 2a completes before Phase 2b starts,
+    // so the in-blob order of the two kinds does not matter.
+    if !unindexed.is_empty() {
+        let mut found: Vec<Option<UnindexedBlobKinds>> = vec![None; unindexed.len()];
+        crate::scan::classify::parallel_classify_phase(
+            &shared_file,
+            &unindexed,
+            None,
+            || (),
+            |block, _scratch: &mut ()| {
+                let mut kinds = UnindexedBlobKinds::default();
+                for element in block.elements_skip_metadata() {
+                    let node_id = match element {
+                        crate::Element::Node(node) => node.id(),
+                        crate::Element::DenseNode(node) => node.id(),
+                        crate::Element::Way(_) => {
+                            kinds.has_ways = true;
+                            continue;
+                        }
+                        crate::Element::Relation(_) => continue,
+                    };
+                    kinds.has_nodes = true;
+                    kinds.max_node_id = kinds.max_node_id.max(node_id);
+                }
+                kinds
+            },
+            |seq, kinds| {
+                if let Some(slot) = found.get_mut(seq) {
+                    *slot = Some(kinds);
+                }
+            },
+            &*host.resources,
+        )?;
+        for (&(seq, offset, size), kinds) in unindexed.iter().zip(found) {
+            let kinds = kinds.ok_or_else(|| {
+                format!("internal error: unindexed blob {seq} at offset {offset} was never decoded")
+            })?;
+            if kinds.has_nodes {
+                max_node_id = max_node_id.max(kinds.max_node_id);
+                node_schedule.push((0, offset, size));
+            }
+            if kinds.has_ways {
+                way_schedule.push((0, offset, size));
+            }
+        }
+    }
+    renumber(&mut node_schedule);
+    renumber(&mut way_schedule);
 
     #[allow(clippy::cast_possible_wrap)]
     {
@@ -235,4 +291,21 @@ pub(super) fn build_pass2_schedules(
     }
 
     Ok((node_schedule, way_schedule, max_node_id, shared_file))
+}
+
+/// What decoding an unindexed blob says about it: which of the two Pass 2
+/// phases need it, and the largest node ID it holds.
+#[derive(Clone, Copy, Default)]
+struct UnindexedBlobKinds {
+    has_nodes: bool,
+    has_ways: bool,
+    max_node_id: i64,
+}
+
+/// Put a schedule into file order and number it `0..len`.
+fn renumber(schedule: &mut [(usize, u64, usize)]) {
+    schedule.sort_unstable_by_key(|&(_, offset, _)| offset);
+    for (seq, entry) in schedule.iter_mut().enumerate() {
+        entry.0 = seq;
+    }
 }

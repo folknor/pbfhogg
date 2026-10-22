@@ -1001,6 +1001,158 @@ fn null_island_street_vertex_is_not_treated_as_absent() {
     );
 }
 
+/// A node ID far enough above the others to land in a different 4 MB
+/// `IdSet` chunk (2^25 IDs each), which is what made Pass 1.5's
+/// `set_atomic` panic when its pre-allocation bound understated it.
+const HIGH_NODE_ID: i64 = 50_000_000;
+
+fn street_nodes(ids: &[i64]) -> Vec<TestNode> {
+    ids.iter()
+        .zip(0i32..)
+        .map(|(&id, i)| TestNode {
+            id,
+            lat: 557_000_000,
+            lon: 125_000_000 + i * 5_000,
+            tags: vec![],
+            meta: None,
+        })
+        .collect()
+}
+
+fn street_way(refs: Vec<i64>) -> TestWay {
+    TestWay {
+        id: 10,
+        refs,
+        tags: vec![("highway", "residential"), ("name", "Main Street")],
+        meta: None,
+    }
+}
+
+/// Vertices written for all street ways of the index in `index_dir`.
+fn street_vertex_count(index_dir: &Path) -> u64 {
+    use pbfhogg::geocode_index::format::{FILE_STREET_NODES, NODE_COORD_SIZE};
+    let len = std::fs::metadata(index_dir.join(FILE_STREET_NODES))
+        .expect("stat street nodes")
+        .len();
+    len / u64::try_from(NODE_COORD_SIZE).expect("record size fits u64")
+}
+
+fn build_into(
+    input: std::path::PathBuf,
+    index_dir: &Path,
+    force: bool,
+) -> pbfhogg::geocode_index::builder::BuildStats {
+    pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir.to_path_buf(),
+            force,
+            ..Default::default()
+        },
+        &crate::common::test_host(),
+    )
+    .expect("build must succeed")
+}
+
+/// Indexdata whose node `max_id` understates the blob's real IDs. Pass 1.5
+/// sized its referenced-node set from that claim, so a way ref to the
+/// node above it used to panic inside the scan's `thread::scope` and take
+/// the library down with it. It has to be a reported error naming the
+/// metadata, not a panic and not a silently shortened street.
+#[test]
+fn understated_node_max_id_is_an_error_not_a_panic() {
+    let dir = TempDir::new().expect("tempdir");
+    let honest = dir.path().join("honest.osm.pbf");
+    let lying = dir.path().join("lying.osm.pbf");
+    write_test_pbf_sorted(
+        &honest,
+        &street_nodes(&[1, 2, HIGH_NODE_ID]),
+        &[street_way(vec![1, 2, HIGH_NODE_ID])],
+        &[],
+    );
+
+    // Non-regression first: the honest file builds, so the failure below is
+    // about the forged claim and not the fixture shape.
+    let honest_index = dir.path().join("honest-index");
+    let stats = build_into(honest.clone(), &honest_index, false);
+    assert_eq!(stats.street_ways, 1);
+    assert_eq!(street_vertex_count(&honest_index), 3);
+
+    // Blob 1 is the node blob (blob 0 is the OsmHeader). Claim its last node
+    // is 2 while the payload still holds HIGH_NODE_ID.
+    let bytes = std::fs::read(&honest).expect("read fixture");
+    let forged = crate::common::adversarial::mutate_blob_header_indexdata(&bytes, 1, |ix| {
+        assert_eq!(ix.len(), 42, "fixture blob must carry a v3 index");
+        ix[10..18].copy_from_slice(&2i64.to_le_bytes());
+    });
+    std::fs::write(&lying, forged).expect("write forged");
+
+    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: lying,
+            output_dir: dir.path().join("lying-index"),
+            force: false,
+            ..Default::default()
+        },
+        &crate::common::test_host(),
+    )
+    .expect_err("an understated node max_id must fail the build");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&format!("node {HIGH_NODE_ID} exceeds the node-ID bound 2")),
+        "error should name the node and the understated bound; got: {msg}"
+    );
+}
+
+/// A way ref above every node in the file is a dangling ref (a simple
+/// extract keeps ways whose nodes it cut away), not an error: the street
+/// keeps the vertices it has. This used to panic in Pass 1.5 for the same
+/// reason as the understated-indexdata case.
+#[test]
+fn dangling_ref_above_every_node_id_is_dropped_not_fatal() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+    write_test_pbf_sorted(
+        &input,
+        &street_nodes(&[1, 2]),
+        &[street_way(vec![1, 2, HIGH_NODE_ID])],
+        &[],
+    );
+    let stats = build_into(input, &index_dir, false);
+    assert_eq!(stats.street_ways, 1);
+    assert_eq!(
+        street_vertex_count(&index_dir),
+        2,
+        "the street keeps exactly its two present nodes"
+    );
+}
+
+/// `--force` on input without indexdata: there is no `max_id` to read, so
+/// the builder must learn the node-ID range from the blobs themselves. It
+/// used to take 0 as the bound and panic on the first ref past the first
+/// `IdSet` chunk.
+#[test]
+fn force_without_indexdata_bounds_node_ids_from_the_blobs() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+    crate::common::write_test_pbf_non_indexed(
+        &input,
+        &street_nodes(&[1, 2, HIGH_NODE_ID]),
+        &[street_way(vec![1, 2, HIGH_NODE_ID])],
+        &[],
+    );
+    crate::common::assert_non_indexed(&input);
+    let stats = build_into(input, &index_dir, true);
+    assert_eq!(stats.street_ways, 1);
+    assert_eq!(
+        street_vertex_count(&index_dir),
+        3,
+        "HIGH_NODE_ID's coordinate must be resolved, not dropped"
+    );
+}
+
 #[test]
 fn legal_non_dense_nodes_build_a_queryable_index() {
     let dir = TempDir::new().expect("tempdir");

@@ -145,8 +145,8 @@ non-standard encoding.
 
 ## Null Island ambiguity in coordinate indexes
 
-**Status:** Fixed in `add-locations-to-ways`. Still open in the geocode
-index builder.
+**Status:** Fixed in `add-locations-to-ways` and in the geocode index
+builder.
 
 **Context:** An index that stores node coordinates as `(lat: i32, lon: i32)`
 in a zero-initialized backing store is tempted to spell "unset" as `(0, 0)`.
@@ -169,19 +169,15 @@ Fixed sites:
   the coordinate it found was non-zero. Before this the two backends
   disagreed about the same input.
 
-Both are pinned by `null_island_real_node_is_not_reported_missing` in
-`tests/cli_add_locations_to_ways.rs`, which runs on both backends.
+- The geocode builder's Pass 2 coordinate store
+  (`src/geocode_index/builder/pass2.rs`) uses the same `coord_pack`
+  encoding as the sparse store, so a street vertex at Null Island is kept
+  rather than read as an unwritten slot.
 
-Remaining sites:
-
-- Geocode builder Pass 2 filters ways' `(lat, lon)` coords with
-  `if lat == 0 && lon == 0 { None }` inside the `way.refs()` filter_map
-  (`src/geocode_index/builder/pass2.rs`).
-
-**Impact of the remaining site:** a way vertex at exactly `0.0000000,
-0.0000000` - decimicrodegree precision, so within ~11 mm of the
-intersection of the prime meridian and the equator - is silently dropped
-from a geocode index's geometry. The nearest land is ~570 km away.
+The altw sites are pinned by `null_island_real_node_is_not_reported_missing`
+in `tests/cli_add_locations_to_ways.rs`, which runs on both backends; the
+geocode site by `null_island_street_vertex_is_not_treated_as_absent` in
+`tests/geocode_index.rs`.
 
 **Related:** unresolvable way node references are a hard error in both
 `add-locations-to-ways` and `apply-changes --locations-on-ways` rather
@@ -197,18 +193,20 @@ and the second added one - see `DEVIATIONS.md`.
 **Context:** `SlimInterpWay` (the in-memory staging struct that flushes to
 `interp_ways.bin` as `InterpWay`) stores resolved interpolation house
 numbers in `start_number: u32, end_number: u32`. The resolver
-(`resolve_interpolation_endpoints_mmap` in `src/geocode_index/builder.rs`)
+(`resolve_interpolation_endpoints_mmap` in `src/geocode_index/builder/interp.rs`)
 runs after Pass 2 and matches each endpoint against nearby addr points
 with the same street name; on a match, it overwrites `start_number` and
 `end_number` with the matched house numbers. On failure, both stay at
 their initial `0` - the same value a legitimate OSM interpolation way
 starting at house number 0 would carry.
 
-**Impact:** A reader distinguishing "unresolved interp way" from "interp
-way starting at house 0" sees identical bytes. "0" as a house number is
-rare but exists in some regions. Ambiguity affects only interpolation
-ways where at least one endpoint fails to match an addr point AND the
-legitimate range happens to begin at 0.
+**Impact:** "Unresolved interp way" and "interp way starting at house 0"
+are identical bytes, and the reader resolves the ambiguity one way: a 0 at
+either end means unresolved, so the way yields no interpolated number
+(`interpolation_resolvable` and `interpolated_number` in
+`src/geocode_index/reader.rs`). House number 0 is therefore unsupported as
+an interpolation endpoint. "0" as a house number is rare but exists in
+some regions.
 
 **Why not fix:** The clean fix is a `resolved: bool` field persisted into
 `InterpWay` and a `FORMAT_VERSION` bump. Unrecorded observations in
@@ -233,7 +231,7 @@ places:
 - Per-way node counts in `StreetWay.node_count` and
   `InterpWay.node_count` (`src/geocode_index/format.rs`).
 
-The builder (`src/geocode_index/builder.rs`) used to silently truncate
+The builder (`src/geocode_index/builder/`) used to silently truncate
 oversized cells/ways to `u16::MAX`, producing silently-incomplete output.
 It now hard-errors at the write site via `u16::try_from(...)`, naming the
 offending cell or way in the error message.

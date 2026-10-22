@@ -1453,7 +1453,8 @@ assumes node blobs are sorted and non-overlapping, checking monotonicity only
 under `debug_assertions`, so an unsorted file flagged sorted produces a
 misleading "missing locations" error instead of "input not sorted" (stage 1
 could check `prev.max_id < next.min_id` in `build_node_blob_mapping` for free);
-the geocode builder's `CoordMmapShared` rests on it (BUG-047). `CORRECTNESS.md`
+the geocode builder trusts indexdata kind to schedule node blobs, so a node
+in a blob labelled way or relation is never seen by Pass 2a. `CORRECTNESS.md`
 partly states this for sort. Fix: state the trust model once in `reference/`
 (indexdata is a hint; these properties are verified, these are believed, and
 this is the consequence) and have each command cite it.
@@ -1917,7 +1918,8 @@ Reported by: geocode index.
 
 `config.force` is passed to `require_indexdata` (skip the requirement) and also
 gates overwriting an existing index, so rebuilding in place also opts out of the
-indexdata check, which on unindexed input leads into BUG-024. Pass 2a aborts the
+indexdata check (which on unindexed input now costs a decode of every blob to
+derive kinds and the node-ID bound). Pass 2a aborts the
 whole build for one node outside the coordinate domain, while missing refs, bad
 roles and unparseable levels are skipped: the only data-quality rule that
 aborts. Fix: `overwrite` and `allow_unindexed` as two fields and two flags; one

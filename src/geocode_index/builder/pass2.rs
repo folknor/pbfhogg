@@ -5,24 +5,29 @@
 //! a way phase (Phase 2b). Both are parallel.
 //!
 //! - **Phase 2a** (parallel nodes). Workers decode node blobs via
-//!   [`parallel_classify_phase`]. Coord writes go directly into
-//!   `coord_mmap` from the worker (disjoint ranks, no atomics needed -
-//!   see [`CoordMmapShared`]). Pending `AddrPoint`s flow to the main
+//!   [`parallel_classify_phase`]. Coord writes go directly into the
+//!   coordinate store from the worker as relaxed atomic stores (see
+//!   [`coord_slots`]). Every decoded node is checked against the node-ID
+//!   bound Pass 1.5 trusted. Pending `AddrPoint`s flow to the main
 //!   thread via the merge channel; the main thread interns strings
-//!   into the shared `StringPool` and streams to `addr_points.bin` in
-//!   blob-sequence order.
+//!   into the shared `StringPool` and streams to `addr_points.bin`.
 //!
 //! - **Phase 2b** (parallel ways). Workers decode way blobs, classify
-//!   by tags, resolve coords from the mmap populated by Phase 2a, and
+//!   by tags, resolve coords from the store populated by Phase 2a, and
 //!   emit per-blob `WayBlobOut` records - `PendingStreet`,
 //!   `PendingAddrPoint` (for building centroids), `PendingInterp`, and
 //!   admin way geometry - with owned strings. Main-thread merge interns
 //!   strings, writes records to `street_ways.bin` / `street_nodes.bin`
 //!   / `addr_points.bin` / `interp_nodes.bin`, pushes `SlimInterpWay`
-//!   entries, and inserts into the `way_geom` map. The merge runs
-//!   blob-sequence ordered so output files stay byte-stable.
+//!   entries, and inserts into the `way_geom` map.
+//!
+//! Both merges run in worker-completion order, not blob order:
+//! `parallel_classify_phase` does no reordering and the merge closures
+//! ignore the sequence number. Record order and string offsets in the
+//! output files can therefore differ between two builds of the same input.
 
 use std::io::{BufWriter, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustc_hash::FxHashMap;
 
@@ -81,8 +86,8 @@ pub(super) struct SlimInterpWay {
 // ---------------------------------------------------------------------------
 
 /// Per-blob output from Phase 2a workers: pending `AddrPoint`s only -
-/// coord writes go straight to `coord_mmap` from the worker (see
-/// `CoordMmapShared` below), avoiding the 1.86 GB-on-Germany channel
+/// coord writes go straight to the coordinate store from the worker (see
+/// `coord_slots` below), avoiding the 1.86 GB-on-Germany channel
 /// traffic that the earlier "coord writes in NodeBlobOut" shape carried.
 /// Strings stay owned (`Box<str>`) so the main thread interns them into
 /// the shared `StringPool` at merge time - workers can't touch
@@ -104,26 +109,52 @@ struct PendingAddrPoint {
     pc: Option<Box<str>>,
 }
 
-/// Sync-safe wrapper around the `coord_mmap`'s raw pointer for Phase 2a
-/// workers. Workers write `(lat_e7, lon_e7)` pairs at disjoint rank
-/// offsets - the disjointness invariant follows from
-/// `IdSet::rank(id)` being a unique index per set ID, combined with
-/// sorted PBF guaranteeing every node ID appears in at most one blob.
-/// No atomics needed because no two workers ever touch the same byte.
+/// View the anonymous coordinate mmap as `slot_count` atomic slots, one per
+/// referenced-node rank.
 ///
-/// # Safety
+/// Phase 2a workers store into these slots concurrently and Phase 2b reads
+/// them, both with `Relaxed` ordering; `parallel_classify_phase` joins its
+/// workers before returning, which orders every 2a store before every 2b
+/// load. The slots are atomic rather than plain bytes because nothing
+/// guarantees two workers never write the same rank: that would need every
+/// node ID to appear in at most one blob, and neither `Sort.Type_then_ID`
+/// nor deduplication is checked on the way in (and `--force` skips even the
+/// indexdata check). A node duplicated across blobs therefore makes two
+/// workers store one slot; with atomics that is defined - one complete
+/// coordinate wins, in atomic modification order rather than file order -
+/// where plain writes were a data race.
 ///
-/// The caller must guarantee:
-/// - `ptr` remains valid and pointing at a `len`-byte allocation for
-///   the entire lifetime of the `CoordMmapShared` value (callers hold
-///   the owning `MmapMut` on the stack across the Phase 2a scope).
-/// - Every `rank` value passed to `write_coord` satisfies
-///   `rank * 8 + 8 <= len` - the per-blob `ref_rank_end` and
-///   `IdSet::total_count()` together bound this.
-/// - No two concurrent calls to `write_coord` pass the same `rank`.
-struct CoordMmapShared {
-    ptr: *mut u8,
-    len: usize,
+/// The returned borrow is tied to the `&mut` borrow of the mmap, so no
+/// other access to the mapping can overlap the view.
+fn coord_slots(mmap: &mut memmap2::MmapMut, slot_count: usize) -> Result<&[AtomicU64]> {
+    let needed = slot_count
+        .checked_mul(std::mem::size_of::<AtomicU64>())
+        .ok_or_else(|| format!("coordinate store of {slot_count} slots overflows usize"))?;
+    if needed > mmap.len() {
+        return Err(format!(
+            "coordinate store mapping is {} bytes, {needed} needed for {slot_count} slots",
+            mmap.len()
+        )
+        .into());
+    }
+    if slot_count == 0 {
+        return Ok(&[]);
+    }
+    let base = mmap.as_mut_ptr();
+    if base.align_offset(std::mem::align_of::<AtomicU64>()) != 0 {
+        return Err("coordinate store mapping is not aligned for AtomicU64".into());
+    }
+    // SAFETY: `base` is valid for reads and writes of `needed` bytes (checked
+    // above against the mapping's length) and aligned for `AtomicU64`
+    // (checked above; an mmap base is page-aligned). The bytes are
+    // initialized (an anonymous mapping is zero-filled) and every bit
+    // pattern is a valid `AtomicU64`, which has the size and bit validity of
+    // `u64`. The slice lives no longer than the `&mut` borrow of the mapping,
+    // so nothing else touches these bytes while it exists, and all access
+    // through it is atomic.
+    #[allow(clippy::cast_ptr_alignment)]
+    let slots = unsafe { std::slice::from_raw_parts(base.cast::<AtomicU64>(), slot_count) };
+    Ok(slots)
 }
 
 // The coordinate mmap spells absence with the crate's one slot encoding -
@@ -134,35 +165,11 @@ struct CoordMmapShared {
 // sparse store; see `crate::coord_pack` for the layout and its tests.
 use crate::coord_pack::{pack as pack_coord, unpack as unpack_coord};
 
-// SAFETY: `ptr` is only dereferenced through `write_coord`, which writes
-// 8 bytes at a disjoint offset per call. See the invariants on the
-// struct docs.
-unsafe impl Sync for CoordMmapShared {}
-unsafe impl Send for CoordMmapShared {}
-
-impl CoordMmapShared {
-    /// Write `(lat_e7, lon_e7)` at the 8-byte slot `rank * 8`.
-    ///
-    /// # Safety
-    ///
-    /// See struct-level docs. Caller must ensure no two workers pass the
-    /// same `rank` concurrently, and that `rank * 8 + 8 <= self.len`.
-    unsafe fn write_coord(&self, rank: u64, packed: u64) {
-        #[allow(clippy::cast_possible_truncation)]
-        let off = (rank as usize) * 8;
-        debug_assert!(
-            off + 8 <= self.len,
-            "CoordMmapShared: rank {rank} (offset {off}) out of bounds (len {})",
-            self.len
-        );
-        let bytes = packed.to_le_bytes();
-        // SAFETY: caller guarantees disjoint ranks and in-bounds `off`
-        // (debug_assert above catches regressions during testing).
-        unsafe {
-            let p = self.ptr.add(off);
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, 8);
-        }
-    }
+/// Slot for `rank`, or `None` when the rank falls outside the store. The
+/// store is sized from the same `IdSet` that produces the ranks, so `None`
+/// is a broken invariant; callers turn it into an error, never a write.
+fn coord_slot(slots: &[AtomicU64], rank: u64) -> Option<&AtomicU64> {
+    slots.get(usize::try_from(rank).ok()?)
 }
 
 // ---------------------------------------------------------------------------
@@ -200,15 +207,17 @@ struct PendingInterp {
 /// accumulation, no shared writes, no intern calls). Main thread handles
 /// file I/O and string interning at merge time.
 ///
-/// Coord resolution reads `coord_slice` (Phase 2a's populated
-/// `coord_mmap` as a `&[u8]`); the zero-sentinel semantics (nodes at
-/// lat==0 && lon==0 are dropped) match the previous sequential path.
+/// Coord resolution reads `coord_slots` (the store Phase 2a populated).
+/// A ref is dropped from the way's geometry when its node was never
+/// collected by Pass 1.5 or its slot was never written - the node is not in
+/// the file. Absence is the `coord_pack` presence flag, not an all-zero
+/// slot, so a node at Null Island (lat 0, lon 0) is kept like any other.
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 fn classify_way_into(
     way: &crate::elements::Way<'_>,
     state: &mut WayBlobOut,
     referenced_nodes: &crate::idset::IdSet,
-    coord_slice: &[u8],
+    coord_slots: &[AtomicU64],
     needed_admin_ways: &crate::idset::IdSet,
 ) {
     if state.error.is_some() {
@@ -250,19 +259,26 @@ fn classify_way_into(
         return;
     }
 
+    let mut rank_outside_store: Option<u64> = None;
     let coords: Vec<(i32, i32)> = way
         .refs()
         .filter_map(|nid| {
-            if !referenced_nodes.get(nid) {
+            let rank = referenced_nodes.rank_if_set(nid)?;
+            let Some(slot) = coord_slot(coord_slots, rank) else {
+                rank_outside_store = Some(rank);
                 return None;
-            }
-            #[allow(clippy::cast_possible_truncation)]
-            let r = referenced_nodes.rank(nid) as usize;
-            let off = r * 8;
-            let packed = u64::from_le_bytes(coord_slice.get(off..off + 8)?.try_into().ok()?);
-            unpack_coord(packed)
+            };
+            unpack_coord(slot.load(Ordering::Relaxed))
         })
         .collect();
+    if let Some(rank) = rank_outside_store {
+        state.error = Some(format!(
+            "internal error: way {way_id} resolves to coordinate rank {rank}, outside the \
+             {}-slot store built from the same referenced-node set",
+            coord_slots.len()
+        ));
+        return;
+    }
     if coords.is_empty() {
         return;
     }
@@ -372,6 +388,7 @@ pub(super) fn run_pass2(
     node_schedule: &[(usize, u64, usize)],
     way_schedule: &[(usize, u64, usize)],
     shared_file: &std::sync::Arc<std::fs::File>,
+    max_node_id: i64,
     needed_admin_ways: crate::idset::IdSet,
     mut referenced_nodes: crate::idset::IdSet,
     strings: &mut StringPool,
@@ -394,9 +411,16 @@ pub(super) fn run_pass2(
         "  {referenced_count} referenced nodes, compact index = {} MB",
         referenced_count * 8 / 1_000_000
     );
-    #[allow(clippy::cast_possible_truncation)]
-    let coord_array_len = referenced_count as usize * 8; // 8 bytes per (lat_e7: i32, lon_e7: i32)
+    // One packed 8-byte coordinate slot per referenced node.
+    let slot_count = usize::try_from(referenced_count)
+        .map_err(|_| format!("{referenced_count} referenced nodes exceed usize"))?;
+    let coord_array_len = slot_count
+        .checked_mul(std::mem::size_of::<AtomicU64>())
+        .ok_or_else(|| format!("coordinate store for {referenced_count} nodes overflows usize"))?;
+    // `map_anon` rejects a zero length; the view below still exposes zero
+    // slots when there are no referenced nodes.
     let mut coord_mmap = memmap2::MmapMut::map_anon(coord_array_len.max(1))?;
+    let coord_store: &[AtomicU64] = coord_slots(&mut coord_mmap, slot_count)?;
     let mut way_geom: rustc_hash::FxHashMap<i64, Vec<(i32, i32)>> =
         rustc_hash::FxHashMap::default();
 
@@ -422,17 +446,12 @@ pub(super) fn run_pass2(
 
     // ---------------- Phase 2a: parallel node scan ----------------
     //
-    // See module docs. Coord writes land in `coord_mmap` directly from
+    // See module docs. Coord writes land in `coord_slots` directly from
     // workers; pending addr points flow to main-thread merge for string
     // interning + `addr_points.bin` write.
     crate::debug::emit_marker("GEOCODE_PASS2A_START");
     {
         let referenced_ref = &referenced_nodes;
-        let coord_shared = CoordMmapShared {
-            ptr: coord_mmap.as_mut_ptr(),
-            len: coord_mmap.len(),
-        };
-        let coord_ref = &coord_shared;
         let mut merge_err: Option<std::io::Error> = None;
         let mut semantic_err: Option<String> = None;
         crate::scan::classify::parallel_classify_phase(
@@ -445,21 +464,41 @@ pub(super) fn run_pass2(
                     macro_rules! process_node {
                         ($node:expr) => {{
                             let node = $node;
+                            let node_id = node.id();
+                            // Pass 1.5 dropped every way ref above
+                            // `max_node_id` as dangling. That is only sound
+                            // if no node in the file is above it, so check
+                            // every decoded node - before any other test can
+                            // skip it - rather than trust the claim.
+                            if node_id > max_node_id {
+                                state.error = Some(format!(
+                                    "node {node_id} exceeds the node-ID bound {max_node_id} derived \
+                                     from the blob metadata (the largest indexdata max_id over node \
+                                     blobs, widened by any blob without indexdata). Some blob's \
+                                     indexdata understates its ID range; regenerate it with \
+                                     `pbfhogg cat`."
+                                ));
+                                continue;
+                            }
                             let lat_e7 = node.decimicro_lat();
                             let lon_e7 = node.decimicro_lon();
                             let Some(packed) = pack_coord(lat_e7, lon_e7) else {
                                 state.error = Some(format!(
-                                    "node {} has coordinates outside the geographic domain (lat {lat_e7}, lon {lon_e7} in decimicrodegrees)",
-                                    node.id()
+                                    "node {node_id} has coordinates outside the geographic domain (lat {lat_e7}, lon {lon_e7} in decimicrodegrees)"
                                 ));
                                 continue;
                             };
-                            if let Some(rank) = referenced_ref.rank_if_set(node.id()) {
-                                // SAFETY: disjoint ranks guaranteed by sorted PBF +
-                                // unique rank-per-id in IdSet. See CoordMmapShared docs.
-                                unsafe {
-                                    coord_ref.write_coord(rank, packed);
-                                }
+                            if let Some(rank) = referenced_ref.rank_if_set(node_id) {
+                                let Some(slot) = coord_slot(coord_store, rank) else {
+                                    state.error = Some(format!(
+                                        "internal error: node {node_id} has coordinate rank {rank}, \
+                                         outside the {}-slot store built from the same \
+                                         referenced-node set",
+                                        coord_store.len()
+                                    ));
+                                    continue;
+                                };
+                                slot.store(packed, Ordering::Relaxed);
                             }
                             let mut hn: Option<&str> = None;
                             let mut st: Option<&str> = None;
@@ -534,13 +573,12 @@ pub(super) fn run_pass2(
 
     // ---------------- Phase 2b: parallel way scan ----------------
     //
-    // Workers classify each way, resolve coords via the mmap populated
-    // by Phase 2a (read-only by this point), and emit a `WayBlobOut` per
-    // blob. The main-thread merge interns strings, writes records to the
-    // four output files, pushes `SlimInterpWay` entries, and inserts
-    // into the `way_geom` map. Merge runs in blob-sequence order via
-    // `parallel_classify_phase`'s internal ReorderBuffer so the output
-    // files stay byte-stable.
+    // Workers classify each way, resolve coords via the store populated
+    // by Phase 2a (only loaded from by this point; Phase 2a's workers have
+    // joined), and emit a `WayBlobOut` per blob. The main-thread merge
+    // interns strings, writes records to the four output files, pushes
+    // `SlimInterpWay` entries, and inserts into the `way_geom` map. Merge
+    // order is worker-completion order; see the module docs.
     let mut street_node_offset: u64 = 0;
     let mut interp_node_offset: u64 = 0;
     let mut street_way_count: u32 = 0;
@@ -548,7 +586,6 @@ pub(super) fn run_pass2(
     crate::debug::emit_marker("GEOCODE_PASS2B_START");
     {
         let referenced_ref = &referenced_nodes;
-        let coord_slice: &[u8] = &coord_mmap[..];
         let needed_admin_ways_ref = &needed_admin_ways;
         let mut merge_err: Option<String> = None;
 
@@ -564,7 +601,7 @@ pub(super) fn run_pass2(
                             &way,
                             state,
                             referenced_ref,
-                            coord_slice,
+                            coord_store,
                             needed_admin_ways_ref,
                         );
                     }

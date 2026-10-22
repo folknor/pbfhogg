@@ -31,6 +31,14 @@ apply it once per blob. Sequential, parallel, pipelined, raw passthrough
 and header-only command paths therefore inherit the same refusal. A caller
 that intentionally stops early need not inspect later frames.
 
+For `BlobReader::new_seekable`, the stream starts at the reader position
+when constructed, including a nonzero position containing an embedded PBF.
+An OSMHeader at that position counts as leading. Subsequent seeks do not
+redefine the start: revisiting that header is allowed, but seeking to a
+different OSMHeader is rejected. Byte offsets remain absolute within the
+underlying reader; a nonzero construction position leaves the absolute
+blob index unknown.
+
 This matches libosmium's `pbf_input_format.hpp`: its initial header parse
 expects OSMHeader, then its data loop expects OSMData. Ignoring a second
 header would discard its feature requirements and metadata, interpreting
@@ -41,7 +49,8 @@ separate command inputs instead of concatenating their bytes.
 
 Low-level blob APIs still permit reading a data frame alone, including by
 seeking to it, and retain their existing handling of unknown extension
-blobs. An OSMHeader is accepted again after rewinding to offset zero.
+blobs. An OSMHeader is accepted again after rewinding to the stream start
+(offset zero for readers opened from a path).
 
 `WireBlobHeader::parse` checks `datasize` as a signed int32 before narrowing.
 Out-of-range varints cannot alias a smaller frame length (for example,
@@ -378,8 +387,12 @@ Shape 5 is enforced during decompression, not after it:
   process has allocated the bomb. Inflation stops one byte past
   the cap and reports `MessageTooBig`; the true decompressed size
   is unknown by design.
+- Both Blob parsers validate `raw_size` as a signed int32 before narrowing,
+  once per envelope. Out-of-range varints cannot alias a small honest size
+  and bypass the decompressed-length comparison. Sign-extended negative
+  int32 values parse intact and fail that comparison.
 - The `Blob.raw_size` capacity hint is clamped to the same cap
-  before it reaches `Vec::reserve`. It is an unvalidated `int32`,
+  before it reaches `Vec::reserve`. It is a producer-declared `int32`,
   so a corrupt blob could otherwise declare 2 GiB of
   pre-decompression allocation from five bytes on the wire.
 - Once decompression has run, the same `Blob.raw_size` is

@@ -1311,3 +1311,70 @@ fn missing_node_refs_get_zero_coordinates_external() {
         )],
     );
 }
+
+#[test]
+fn plain_nodes_supply_coordinates_to_both_backends() {
+    fn varint(mut value: u64, out: &mut Vec<u8>) {
+        while value >= 128 {
+            out.push(u8::try_from(value & 127).expect("seven bits") | 128);
+            value >>= 7;
+        }
+        out.push(u8::try_from(value).expect("seven bits"));
+    }
+    fn message(field: u64, bytes: &[u8], out: &mut Vec<u8>) {
+        varint(field * 8 + 2, out);
+        varint(u64::try_from(bytes.len()).expect("message length"), out);
+        out.extend_from_slice(bytes);
+    }
+    let dir = tempfile::tempdir_in(".").expect("project tempdir");
+    let input = dir.path().join("plain.osm.pbf");
+    let mut writer = pbfhogg::writer::PbfWriter::new(
+        std::fs::File::create(&input).expect("create input"),
+        pbfhogg::writer::Compression::default(),
+    );
+    let header = pbfhogg::block_builder::HeaderBuilder::new()
+        .sorted()
+        .build()
+        .expect("header");
+    writer.write_header(&header).expect("write header");
+    let mut group = Vec::new();
+    for (id, lat, lon) in [
+        (1_u64, 550_000_000_u64, 120_000_000_u64),
+        (2, 551_000_000, 121_000_000),
+    ] {
+        let mut node = Vec::new();
+        for (field, value) in [(1, id), (8, lat), (9, lon)] {
+            varint(field * 8, &mut node);
+            varint(value * 2, &mut node);
+        }
+        message(1, &node, &mut group);
+    }
+    let mut block = Vec::new();
+    message(1, &[10, 0], &mut block); // StringTable with empty entry 0
+    message(2, &group, &mut block);
+    writer
+        .write_primitive_block(&block)
+        .expect("write plain nodes");
+    let mut builder = pbfhogg::block_builder::BlockBuilder::new();
+    builder.add_way(10, [("highway", "primary")], &[1, 2], None);
+    writer
+        .write_primitive_block(builder.take().expect("take").expect("way block"))
+        .expect("write way");
+    writer.flush().expect("flush");
+    drop(writer);
+    for backend in [IndexBackend::Sparse, IndexBackend::External] {
+        let output = dir.path().join(format!(
+            "{}.osm.pbf",
+            backend.flag().expect("explicit backend")
+        ));
+        let result = run_altw(&input, &output, true, backend, false);
+        assert!(result.status.success(), "{}", result.stderr_str());
+        assert_eq!(
+            read_way_locations(&output),
+            vec![(
+                10,
+                vec![(550_000_000, 120_000_000), (551_000_000, 121_000_000)]
+            )]
+        );
+    }
+}

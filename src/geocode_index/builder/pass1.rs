@@ -84,12 +84,12 @@ pub(super) fn run_pass1(
                         let admin_level = if is_admin {
                             let Some(ls) = level_str else { continue };
                             let Ok(l) = ls.parse::<u8>() else { continue };
-                            if !(2..=10).contains(&l) {
+                            if !(2..=super::super::format::MAX_ADMIN_LEVEL).contains(&l) {
                                 continue;
                             }
                             l
                         } else {
-                            11
+                            super::super::format::POSTAL_BOUNDARY_LEVEL
                         };
 
                         let name_str = if is_postal {

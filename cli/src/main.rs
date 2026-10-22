@@ -8,6 +8,7 @@ use std::process;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use pbfhogg::altw::IndexType;
 use pbfhogg::cat::CleanAttrs;
+use pbfhogg::geocode_index::builder::BuildConfig as GeocodeBuildConfig;
 use pbfhogg::getid::{ElemKindTag, ElementRef};
 use pbfhogg::tags_count::TagCountSort;
 use pbfhogg::writer::Compression;
@@ -190,10 +191,12 @@ struct HeaderOverrideArg {
     /// Override the writing program name in the output header
     #[arg(long)]
     generator: Option<String>,
-    /// Set output header fields (repeatable, format: key=value).
-    /// Supported keys: osmosis_replication_timestamp, osmosis_replication_sequence_number,
-    /// osmosis_replication_base_url
-    #[arg(long = "output-header", value_name = "KEY=VALUE")]
+    #[arg(
+        long = "output-header",
+        value_name = "KEY=VALUE",
+        help = "Set output header fields.",
+        long_help = pbfhogg::HeaderOverrides::output_header_help()
+    )]
     output_headers: Vec<String>,
 }
 
@@ -275,13 +278,9 @@ impl IndexTypeArg {
             Self::Auto => Ok(IndexType::Auto),
             Self::Sparse => Ok(IndexType::Sparse),
             Self::External => Ok(IndexType::External),
-            Self::Dense => Err(
-                "index type 'dense' was removed in favor of 'sparse'. Sparse \
-                 (rank-indexed flat) is faster than dense at every measured \
-                 scale and works in regimes dense doesn't. Use \
-                 --index-type sparse instead."
-                    .into(),
-            ),
+            Self::Dense => "dense".parse::<IndexType>().map_err(|error| {
+                format!("{error} For this command, pass --index-type sparse.").into()
+            }),
         }
     }
 }
@@ -892,8 +891,10 @@ enum Command {
         /// Show locations-on-ways diagnostics
         #[arg(long)]
         locations: bool,
-        /// Show only anomalous blocks (<50% or >150% of median, plus mixed blocks)
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Show blocks outside inspect's per-type median thresholds, plus mixed blocks"
+        )]
         anomalies: bool,
         /// Extended scan: timestamp range, data bbox, metadata coverage, ordering
         #[arg(short, long)]
@@ -914,7 +915,8 @@ enum Command {
             ],
         )]
         show: Option<ElementRef>,
-        /// Get a single value by key path (e.g. "header.bbox", "data.timestamp.first")
+        /// Get a single value by key path (e.g. "header.bbox", "data.timestamp.first").
+        /// Data and metadata paths enable extended stats automatically.
         #[arg(short, long, value_name = "KEY")]
         get: Option<String>,
         /// Machine-readable JSON output
@@ -1082,23 +1084,44 @@ enum Command {
         /// Output directory for index files
         #[arg(long)]
         output_dir: PathBuf,
-        /// S2 cell level for streets/addresses (0-19, must exceed --coarse-level)
-        #[arg(long, default_value = "17")]
+        /// S2 cell level for streets/addresses; must exceed --coarse-level
+        /// and fit the builder limit
+        #[arg(
+            long,
+            default_value_t = GeocodeBuildConfig::default().street_level
+        )]
         street_level: u8,
-        /// Fallback cell level for rural areas (0-19, must be below --street-level)
-        #[arg(long, default_value = "14")]
+        /// Fallback cell level for rural areas; must be below --street-level
+        /// and fit the builder limit
+        #[arg(
+            long,
+            default_value_t = GeocodeBuildConfig::default().coarse_level
+        )]
         coarse_level: u8,
-        /// S2 cell level for admin boundaries (0-10)
-        #[arg(long, default_value = "10")]
+        /// S2 cell level for admin boundaries; the builder enforces its work limit
+        #[arg(
+            long,
+            default_value_t = GeocodeBuildConfig::default().admin_level
+        )]
         admin_level: u8,
-        /// Douglas-Peucker cap for local admin polygons; levels 5, 4, 3, and 2 retain up to 2x, 4x, 8x, and 16x this value
-        #[arg(long, default_value = "500")]
+        /// Douglas-Peucker cap for local admin polygons; levels 5, 4, 3, and 2
+        /// retain up to 2x, 4x, 8x, and 16x this value
+        #[arg(
+            long,
+            default_value_t = GeocodeBuildConfig::default().max_admin_vertices
+        )]
         max_admin_vertices: u16,
         /// Fine-level max search distance in meters
-        #[arg(long, default_value = "75")]
+        #[arg(
+            long,
+            default_value_t = GeocodeBuildConfig::default().fine_search_radius_m
+        )]
         search_radius: f32,
         /// Coarse-level max search distance in meters
-        #[arg(long, default_value = "1000")]
+        #[arg(
+            long,
+            default_value_t = GeocodeBuildConfig::default().coarse_search_radius_m
+        )]
         coarse_search_radius: f32,
         #[command(flatten)]
         io: DirectIoArg,
@@ -2131,7 +2154,10 @@ fn run_build_geocode_index(
     allow_unindexed: bool,
     host: &pbfhogg::host::Host,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let config = pbfhogg::geocode_index::builder::BuildConfig {
+    // Exhaustive on purpose: a new `BuildConfig` field must be wired here
+    // rather than silently taking its default. The clap defaults already
+    // come from `BuildConfig::default()`.
+    let config = GeocodeBuildConfig {
         input_path: file.to_path_buf(),
         output_dir: output_dir.to_path_buf(),
         // The caller has already expanded the legacy `--force` into both
@@ -3527,13 +3553,21 @@ enum InspectMode<'a> {
     NodesOnly,
     /// `--get` with a header/file key and nothing else: read just the
     /// header blob.
-    HeaderGet(&'a str),
+    HeaderGet {
+        key: &'a str,
+        known: Option<pbfhogg::inspect::InspectGetKeyKind>,
+    },
     /// Everything else: full scan, with any requested extras folded in.
     Full,
 }
 
 impl<'a> InspectMode<'a> {
-    fn resolve(flags: &InspectFlags, blocks: Option<usize>, get: Option<&'a str>) -> Self {
+    fn resolve(
+        flags: &InspectFlags,
+        blocks: Option<usize>,
+        get: Option<&'a str>,
+        get_lookup: Option<pbfhogg::inspect::InspectGetLookup>,
+    ) -> Self {
         let scan_extras = flags.extended
             || flags.id_ranges
             || flags.locations
@@ -3545,15 +3579,17 @@ impl<'a> InspectMode<'a> {
         if flags.nodes && !scan_extras && !flags.indexed && get.is_none() {
             return Self::NodesOnly;
         }
-        if let Some(key) = get {
-            let needs_full_scan = key.starts_with("data.")
-                || key.starts_with("metadata.")
-                || key.starts_with("elements.")
-                || key.starts_with("blocks.")
-                || key == "indexed";
-            if !needs_full_scan && !scan_extras && !flags.nodes && !flags.indexed {
-                return Self::HeaderGet(key);
-            }
+        if let Some(key) = get
+            && get_lookup
+                .is_some_and(|lookup| lookup.need() == pbfhogg::inspect::InspectGetNeed::Header)
+            && !scan_extras
+            && !flags.nodes
+            && !flags.indexed
+        {
+            return Self::HeaderGet {
+                key,
+                known: get_lookup.and_then(pbfhogg::inspect::InspectGetLookup::kind),
+            };
         }
         Self::Full
     }
@@ -3569,7 +3605,8 @@ fn run_inspect(
     direct_io: bool,
     host: &pbfhogg::host::Host,
 ) -> Result<Outcome, Box<dyn std::error::Error>> {
-    let mode = InspectMode::resolve(&flags, blocks, get);
+    let get_lookup = get.map(pbfhogg::inspect::inspect_get_lookup);
+    let mode = InspectMode::resolve(&flags, blocks, get, get_lookup);
     let InspectFlags {
         indexed,
         nodes,
@@ -3585,11 +3622,12 @@ fn run_inspect(
     // `--distrust-metadata` only means something for the scanning report:
     // `--indexed` asks whether indexdata is present (distrusting its contents
     // does not change the answer), `--nodes` decodes every node already, and
-    // `--get header.*` reads the header blob directly. Rejecting says so
+    // Header and file get paths read without the inspect scan. Rejecting says so
     // rather than accepting a flag that would do nothing.
     if distrust_metadata && !matches!(mode, InspectMode::Full) {
         return Err(
-            "--distrust-metadata applies to the scanning report only, not to --indexed, --nodes or a header --get key"
+            "--distrust-metadata applies to the scanning report only, not to --indexed, --nodes \
+             or a header/file --get key"
                 .into(),
         );
     }
@@ -3633,7 +3671,7 @@ fn run_inspect(
             out.flush()?;
             return Ok(Outcome::Positive);
         }
-        InspectMode::HeaderGet(key) => {
+        InspectMode::HeaderGet { key, known } => {
             let mut reader = pbfhogg::BlobReader::open(path, direct_io)?
                 .evict_page_cache(true)
                 .diagnostics(host.diagnostics.clone());
@@ -3645,23 +3683,29 @@ fn run_inspect(
                 Some(Err(e)) => return Err(e.into()),
                 None => return Err("empty PBF file".into()),
             };
-            let val = match key {
-                "file.name" => Some(
+            let val = match known {
+                Some(pbfhogg::inspect::InspectGetKeyKind::FileName) => Some(
                     path.file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_else(|| path.display().to_string()),
                 ),
-                "file.size" => Some(std::fs::metadata(path)?.len().to_string()),
-                "file.format" => Some("PBF".to_string()),
-                "header.bbox" => header
+                Some(pbfhogg::inspect::InspectGetKeyKind::FileSize) => {
+                    Some(std::fs::metadata(path)?.len().to_string())
+                }
+                Some(pbfhogg::inspect::InspectGetKeyKind::FileFormat) => Some("PBF".to_string()),
+                Some(pbfhogg::inspect::InspectGetKeyKind::HeaderBbox) => header
                     .bbox()
                     .map(|bb| format!("{} {} {} {}", bb.left, bb.bottom, bb.right, bb.top)),
-                "header.writing_program" => header.writing_program().map(String::from),
-                "header.replication.url" => header.osmosis_replication_base_url().map(String::from),
-                "header.replication.sequence" => header
+                Some(pbfhogg::inspect::InspectGetKeyKind::HeaderWritingProgram) => {
+                    header.writing_program().map(String::from)
+                }
+                Some(pbfhogg::inspect::InspectGetKeyKind::HeaderReplicationUrl) => {
+                    header.osmosis_replication_base_url().map(String::from)
+                }
+                Some(pbfhogg::inspect::InspectGetKeyKind::HeaderReplicationSequence) => header
                     .osmosis_replication_sequence_number()
                     .map(|s| s.to_string()),
-                "header.replication.timestamp" => header
+                Some(pbfhogg::inspect::InspectGetKeyKind::HeaderReplicationTimestamp) => header
                     .osmosis_replication_timestamp()
                     .map(|t| t.to_string()),
                 _ => return Err(format!("unknown key: {key}").into()),
@@ -3677,11 +3721,10 @@ fn run_inspect(
         InspectMode::Full => {}
     }
 
-    // --get with data.* keys requires --extended
+    // The get-key table marks data and metadata paths as requiring extended stats.
     let extended = extended
-        || get
-            .as_ref()
-            .is_some_and(|k| k.starts_with("data.") || k.starts_with("metadata."));
+        || get_lookup
+            .is_some_and(|lookup| lookup.need() == pbfhogg::inspect::InspectGetNeed::Extended);
     let show_blocks = blocks.is_some() || anomalies;
     let block_limit = if anomalies && blocks.is_none() {
         Some(0)

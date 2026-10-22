@@ -679,3 +679,67 @@ fn duplicate_tagdata_is_reported_while_empty_and_single_claims_pass() {
         }
     }
 }
+
+// Full checks retain the production bitset floors, so keep these allocations
+// out of the concurrent fast-contract sweep.
+mod serial {
+    use super::*;
+
+    #[test]
+    fn sparse_global_ids_above_allocation_floors_are_checked_exactly() {
+        let dir = tempfile::tempdir_in(".").expect("project tempdir");
+        let input = dir.path().join("high-ids.osm.pbf");
+        let mut nodes = generate_nodes(2, 20_000_000_000);
+        let ways = generate_ways(1, 3_000_000_000, 2, nodes[0].id);
+        let relations = vec![
+            TestRelation {
+                id: 50_000_000,
+                members: vec![
+                    crate::common::TestMember {
+                        id: pbfhogg::MemberId::Node(nodes[0].id),
+                        role: "",
+                    },
+                    crate::common::TestMember {
+                        id: pbfhogg::MemberId::Way(ways[0].id),
+                        role: "",
+                    },
+                    crate::common::TestMember {
+                        id: pbfhogg::MemberId::Relation(50_000_001),
+                        role: "",
+                    },
+                ],
+                tags: vec![],
+                meta: None,
+            },
+            TestRelation {
+                id: 50_000_001,
+                members: vec![],
+                tags: vec![],
+                meta: None,
+            },
+        ];
+        write_multi_block_test_pbf(&input, &nodes, &ways, &relations, 1);
+        CliInvoker::new()
+            .args(["check", "--refs", "--check-relations"])
+            .arg(&input)
+            .assert_success();
+        CliInvoker::new()
+            .args(["check", "--ids", "--full"])
+            .arg(&input)
+            .assert_success();
+
+        // Repeats in separate blobs must still be found after the sparse
+        // overflow merge, even with detail retention capped.
+        nodes.push(generate_nodes(1, nodes[1].id).remove(0));
+        write_multi_block_test_pbf(&input, &nodes, &[], &[], 1);
+        let out = CliInvoker::new()
+            .args(["check", "--ids", "--full", "--json", "--max-errors", "2"])
+            .arg(&input)
+            .assert_failure();
+        assert!(
+            out.stdout_str().contains("duplicate"),
+            "{}",
+            out.stdout_str()
+        );
+    }
+}

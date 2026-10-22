@@ -12,10 +12,10 @@ use s2::cellid::CellID;
 use s2::latlng::LatLng;
 
 use super::format::{
-    self, ADDR_POINT_SIZE, ADMIN_CELL_SIZE, ADMIN_POLYGON_SIZE, AddrPoint, AdminCell, AdminPolygon,
-    GEO_CELL_SIZE, GeoCell, HEADER_SIZE, Header, INDEX_MASK, INTERIOR_FLAG, INTERP_WAY_SIZE,
-    InterpWay, NODE_COORD_SIZE, NodeCoord, SEGMENT_REF_SIZE, STREET_WAY_SIZE, SegmentRef,
-    StreetWay,
+    self, ADDR_POINT_SIZE, ADMIN_CELL_SIZE, ADMIN_LEVEL_SLOTS, ADMIN_POLYGON_SIZE, AddrPoint,
+    AdminCell, AdminPolygon, GEO_CELL_SIZE, GeoCell, HEADER_SIZE, Header, INDEX_MASK,
+    INTERIOR_FLAG, INTERP_WAY_SIZE, InterpWay, InterpolationType, NODE_COORD_SIZE, NodeCoord,
+    SEGMENT_REF_SIZE, STREET_WAY_SIZE, SegmentRef, StreetWay,
 };
 use crate::geo;
 
@@ -29,7 +29,8 @@ pub struct ReverseResult<'a> {
     pub address: Option<AddressMatch<'a>>,
     pub street: Option<StreetMatch<'a>>,
     pub interpolation: Option<InterpolationMatch<'a>>,
-    /// One entry per admin level (2-11), smallest-area polygon at each level.
+    /// One entry per administrative level (2-10) plus postal boundaries (11),
+    /// smallest-area polygon at each level.
     pub admin: Vec<AdminMatch<'a>>,
 }
 
@@ -153,10 +154,10 @@ impl<'a> Candidates<'a> {
             });
 
         // Collapse admin to smallest-area per level (matches query() semantics)
-        let mut best_by_level: [Option<AdminMatch<'a>>; 12] = Default::default();
+        let mut best_by_level: [Option<AdminMatch<'a>>; ADMIN_LEVEL_SLOTS] = Default::default();
         for m in self.admin {
             let level = m.admin_level as usize;
-            if level < 12 {
+            if level < ADMIN_LEVEL_SLOTS {
                 let dominated = best_by_level[level]
                     .as_ref()
                     .is_none_or(|existing| m.area < existing.area);
@@ -245,37 +246,7 @@ impl Reader {
                 .map_err(|_| "header size mismatch")?,
         )?;
 
-        let mmap = |name: &str| -> Result<Mmap> {
-            let path = dir.join(name);
-            let file = std::fs::File::open(&path)
-                .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-            let len = file
-                .metadata()
-                .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
-                .len();
-            if len == 0 {
-                // memmap2::Mmap::map() fails on zero-length files.
-                // Return an empty read-only anonymous mmap instead.
-                // All consumers check record bounds before reading,
-                // so an empty mmap (len=0) is handled correctly.
-                return Ok(memmap2::MmapOptions::new()
-                    .map_anon()
-                    .map_err(|e| {
-                        format!("failed to create empty mmap for {}: {e}", path.display())
-                    })?
-                    .make_read_only()
-                    .map_err(|e| {
-                        format!(
-                            "failed to make anon mmap read-only for {}: {e}",
-                            path.display()
-                        )
-                    })?);
-            }
-            // SAFETY: the file is read-only for the lifetime of the Reader.
-            let m = unsafe { Mmap::map(&file) }
-                .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
-            Ok(m)
-        };
+        let mmap = |name: &str| format::mmap_or_empty(&dir.join(name));
 
         let fine_radius_m = header.fine_search_radius_m as f64;
         let coarse_radius_m = header.coarse_search_radius_m as f64;
@@ -451,6 +422,7 @@ impl Reader {
             let rec = read_record::<INTERP_WAY_SIZE>(&self.interp_ways, index * INTERP_WAY_SIZE)
                 .ok_or("invalid interpolation way record")?;
             let way = InterpWay::from_bytes(rec);
+            InterpolationType::try_from(way.interpolation_type)?;
             validate_span(
                 way.node_offset,
                 u64::from(way.node_count),
@@ -494,6 +466,8 @@ impl Reader {
         Ok(())
     }
 
+    // These slices are roles, not filenames. Keep the pairing visible at
+    // the two call sites; a filename bundle cannot certify mmap provenance.
     fn validate_geo_tree(
         &self,
         cells: &[u8],
@@ -717,9 +691,13 @@ impl Reader {
         );
         let t = acc_len / total_len;
         let diff = iw.end_number as f64 - iw.start_number as f64;
-        let number = match iw.interpolation_type {
-            0 => iw.start_number as f64 + (t * diff).round(),
-            _ => iw.start_number as f64 + 2.0 * ((t * diff) / 2.0).round(),
+        // Even and odd both preserve start_number parity. Endpoint numbers
+        // remain authoritative, including imported ranges with mismatched tags.
+        let number = match InterpolationType::try_from(iw.interpolation_type).ok()? {
+            InterpolationType::All => iw.start_number as f64 + (t * diff).round(),
+            InterpolationType::Even | InterpolationType::Odd => {
+                iw.start_number as f64 + 2.0 * ((t * diff) / 2.0).round()
+            }
         };
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         Some(number.max(0.0) as u32)
@@ -1202,6 +1180,8 @@ impl Reader {
     /// Shared mmap traversal. The sink decides whether hits are ranked or
     /// materialized; `kinds` lets coarse fallback fill only missing classes.
     #[allow(clippy::too_many_arguments)]
+    // The fine/coarse call sites pair already-open mmaps with their levels
+    // and radii. A file-name descriptor alone cannot enforce that relationship.
     fn search_level<'a, S: SearchSink<'a>>(
         &'a self,
         ctx: &QueryContext,
@@ -1276,7 +1256,8 @@ impl Reader {
     fn search_admin_ranked<'a>(&'a self, ctx: &QueryContext) -> Vec<AdminMatch<'a>> {
         let (cells, count) = cell_neighborhood(ctx.lat, ctx.lon, self.header.admin_cell_level);
         let cell_count = self.admin_cells.len() / ADMIN_CELL_SIZE;
-        let mut best_by_level: [(Option<u32>, f32); 12] = [(None, f32::MAX); 12];
+        let mut best_by_level: [(Option<u32>, f32); ADMIN_LEVEL_SLOTS] =
+            [(None, f32::MAX); ADMIN_LEVEL_SLOTS];
 
         for &cell_id in &cells[..count] {
             let Some(ac) = binary_search_admin_cells(&self.admin_cells, cell_count, cell_id) else {
@@ -1290,7 +1271,7 @@ impl Reader {
                     continue;
                 };
                 let level = poly.admin_level as usize;
-                if level >= 12 || poly.area >= best_by_level[level].1 {
+                if level >= ADMIN_LEVEL_SLOTS || poly.area >= best_by_level[level].1 {
                     continue;
                 }
                 // The interior high bit is only a hint: the reader still runs the

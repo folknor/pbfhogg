@@ -10,6 +10,7 @@ use s2::cellid::CellID;
 use super::BuildConfig;
 use super::Result;
 use super::pass1::RawAdminRelation;
+use crate::geo::RingSearchBudgetExceeded;
 
 use super::super::format::*;
 
@@ -21,13 +22,21 @@ pub(super) struct AssembledPolygon {
     pub(super) vertices: Vec<NodeCoord>,
 }
 
+/// Relations that produced no polygon. `over_budget` is the subset refused
+/// because ring assembly exceeded its step budget; it is included in `total`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct DroppedAdminRelations {
+    pub(super) total: usize,
+    pub(super) over_budget: usize,
+}
+
 #[hotpath::measure]
 pub(super) fn assemble_admin_polygons(
     relations: &[RawAdminRelation],
     way_geom: &FxHashMap<i64, Vec<(i32, i32)>>,
     config: &BuildConfig,
     executor: &crate::host::Executor,
-) -> (Vec<AssembledPolygon>, usize) {
+) -> (Vec<AssembledPolygon>, DroppedAdminRelations) {
     use rayon::prelude::*;
 
     let max_verts = config.max_admin_vertices as usize;
@@ -38,19 +47,31 @@ pub(super) fn assemble_admin_polygons(
     // preserves input order so the output `Vec<AssembledPolygon>` is
     // byte-identical to the previous sequential path. Europe phase was
     // 50.6 s at UUID `bf8f2038` - expected ~5× on plantasjen's 12 cores.
-    let per_relation: Vec<Vec<AssembledPolygon>> = executor.install(|| {
-        relations
-            .par_iter()
-            .map(|rel| {
-                assemble_one_relation(rel, way_geom, admin_vertex_cap(rel.admin_level, max_verts))
-            })
-            .collect()
-    });
-    let dropped = per_relation
-        .iter()
-        .filter(|polygons| polygons.is_empty())
-        .count();
-    let polygons = per_relation.into_iter().flatten().collect();
+    let per_relation: Vec<std::result::Result<Vec<AssembledPolygon>, RingSearchBudgetExceeded>> =
+        executor.install(|| {
+            relations
+                .par_iter()
+                .map(|rel| {
+                    assemble_one_relation(
+                        rel,
+                        way_geom,
+                        admin_vertex_cap(rel.admin_level, max_verts),
+                    )
+                })
+                .collect()
+        });
+    let mut dropped = DroppedAdminRelations::default();
+    let mut polygons = Vec::new();
+    for relation in per_relation {
+        match relation {
+            Ok(assembled) if assembled.is_empty() => dropped.total += 1,
+            Ok(assembled) => polygons.extend(assembled),
+            Err(RingSearchBudgetExceeded) => {
+                dropped.total += 1;
+                dropped.over_budget += 1;
+            }
+        }
+    }
     (polygons, dropped)
 }
 
@@ -58,6 +79,8 @@ pub(super) fn assemble_admin_polygons(
 /// more detail for larger administrative levels. This reduces border
 /// displacement without making a country and a municipality share one
 /// arbitrary vertex budget.
+// Postal boundaries deliberately use the local cap. Their reserved level is
+// not an administrative hierarchy level and must not inherit country budgets.
 fn admin_vertex_cap(admin_level: u8, base: usize) -> usize {
     if base == 0 {
         return 0;
@@ -113,11 +136,16 @@ fn hole_inside_outer(hole: &[(i32, i32)], outer_f64: &[(f64, f64)]) -> bool {
 /// (one per outer ring, each carrying any inner rings that fall inside
 /// it). Pure function - no shared mutable state, safe to call from
 /// rayon workers.
+///
+/// Relation geometry is untrusted input, so ring assembly runs under its step
+/// budget. Exceeding it on either the outer or the inner rings refuses the
+/// whole relation: a polygon assembled without its holes, or from a partial
+/// ring set, would be a silently different boundary.
 fn assemble_one_relation(
     rel: &RawAdminRelation,
     way_geom: &FxHashMap<i64, Vec<(i32, i32)>>,
     max_verts: usize,
-) -> Vec<AssembledPolygon> {
+) -> std::result::Result<Vec<AssembledPolygon>, RingSearchBudgetExceeded> {
     // Extracts may contain a relation but omit one or more member ways. Only
     // member geometry present in this PBF can close an outer ring; missing
     // geometry is omitted, and the relation contributes no polygon if no
@@ -127,9 +155,9 @@ fn assemble_one_relation(
         .iter()
         .filter_map(|wid| way_geom.get(wid).map(Vec::as_slice))
         .collect();
-    let outer_rings = crate::geo::assemble_rings(&outer_segs);
+    let outer_rings = crate::geo::assemble_rings_bounded(&outer_segs)?;
     if outer_rings.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let inner_segs: Vec<&[(i32, i32)]> = rel
@@ -137,7 +165,7 @@ fn assemble_one_relation(
         .iter()
         .filter_map(|wid| way_geom.get(wid).map(Vec::as_slice))
         .collect();
-    let inner_rings = crate::geo::assemble_rings(&inner_segs);
+    let inner_rings = crate::geo::assemble_rings_bounded(&inner_segs)?;
 
     let mut result = Vec::with_capacity(outer_rings.len());
     for outer_ring in &outer_rings {
@@ -216,7 +244,7 @@ fn assemble_one_relation(
             vertices,
         });
     }
-    result
+    Ok(result)
 }
 
 #[hotpath::measure]
@@ -360,7 +388,9 @@ mod tests {
     use crate::coord_fmt::deg_to_e7;
     use rustc_hash::FxHashMap;
 
-    use super::{admin_vertex_cap, assemble_admin_polygons, hole_inside_outer};
+    use super::{
+        DroppedAdminRelations, admin_vertex_cap, assemble_admin_polygons, hole_inside_outer,
+    };
     use crate::geocode_index::builder::BuildConfig;
     use crate::geocode_index::builder::pass1::RawAdminRelation;
 
@@ -429,8 +459,73 @@ mod tests {
         assert_eq!(polygons.len(), 1, "the closed ring should assemble");
         assert_eq!(polygons[0].name_offset, 3);
         assert_eq!(
-            dropped, 2,
+            dropped,
+            DroppedAdminRelations {
+                total: 2,
+                over_budget: 0
+            },
             "only the two geometry-less relations are dropped"
+        );
+    }
+
+    /// A relation whose ring search exceeds the budget is refused as a whole
+    /// and counted separately, while an ordinary relation beside it still
+    /// assembles. The over-budget relation also carries a closed ring that an
+    /// unbounded search would have returned; it must not leak out alone.
+    #[test]
+    fn over_budget_relations_are_refused_and_counted() {
+        let mut way_geom: FxHashMap<i64, Vec<(i32, i32)>> = FxHashMap::default();
+        // Leaf way first, so the first search runs through the complete graph.
+        way_geom.insert(1, vec![(-1, -1), (0, 0)]);
+        let mut way_id = 2;
+        let mut complete_graph = vec![1];
+        for a in 0..12 {
+            for b in a + 1..12 {
+                way_geom.insert(way_id, vec![(a, a), (b, b)]);
+                complete_graph.push(way_id);
+                way_id += 1;
+            }
+        }
+        let square = vec![
+            (550_000_000, 120_000_000),
+            (550_000_000, 121_000_000),
+            (551_000_000, 121_000_000),
+            (551_000_000, 120_000_000),
+            (550_000_000, 120_000_000),
+        ];
+        way_geom.insert(1_000, square);
+        complete_graph.push(1_000);
+
+        let relations = vec![
+            RawAdminRelation {
+                admin_level: 8,
+                name_offset: 1,
+                country_code_offset: 0,
+                outer_way_ids: complete_graph,
+                inner_way_ids: Vec::new(),
+            },
+            RawAdminRelation {
+                admin_level: 8,
+                name_offset: 2,
+                country_code_offset: 0,
+                outer_way_ids: vec![1_000],
+                inner_way_ids: Vec::new(),
+            },
+        ];
+        let (polygons, dropped) = assemble_admin_polygons(
+            &relations,
+            &way_geom,
+            &BuildConfig::default(),
+            &crate::host::Executor::Ambient,
+        );
+        assert_eq!(polygons.len(), 1);
+        assert_eq!(polygons[0].name_offset, 2);
+        assert_eq!(
+            dropped,
+            DroppedAdminRelations {
+                total: 1,
+                over_budget: 1
+            }
         );
     }
 

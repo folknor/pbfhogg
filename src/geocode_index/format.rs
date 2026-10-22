@@ -17,6 +17,41 @@ pub const HEADER_MAGIC: [u8; 4] = *b"GIDX";
 /// older versions: existing indexes must be rebuilt.
 pub const FORMAT_VERSION: u32 = 3;
 
+/// S2's on-disk cell level limit, independent of build sampling budgets.
+pub const S2_MAX_LEVEL: u8 = 30;
+
+/// Version 3 reserves level 11 for postal boundaries. Real administrative
+/// levels above 10 are deliberately unsupported: widening acceptance requires
+/// a distinct boundary kind and a format migration, not reuse of this slot.
+pub const POSTAL_BOUNDARY_LEVEL: u8 = 11;
+pub const MAX_ADMIN_LEVEL: u8 = 10;
+pub const ADMIN_LEVEL_SLOTS: usize = POSTAL_BOUNDARY_LEVEL as usize + 1;
+const _: () = assert!(MAX_ADMIN_LEVEL < POSTAL_BOUNDARY_LEVEL);
+
+/// Wire values retained from version 3; naming them does not change bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum InterpolationType {
+    All = 0,
+    Even = 1,
+    Odd = 2,
+}
+
+impl TryFrom<u8> for InterpolationType {
+    type Error = FormatError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::All),
+            1 => Ok(Self::Even),
+            2 => Ok(Self::Odd),
+            _ => Err(FormatError::InvalidMetadata(format!(
+                "unknown interpolation type {value}"
+            ))),
+        }
+    }
+}
+
 /// Sentinel value for "no data" in u64 offset fields.
 ///
 /// Every optional offset in format v3 is u64. Admin offsets are mandatory, so
@@ -43,6 +78,9 @@ pub struct Header {
     pub street_cell_level: u8,
     pub coarse_cell_level: u8,
     pub admin_cell_level: u8,
+    /// Base local-boundary simplification budget, not a stored-record limit.
+    /// Country/region budgets are multiples of this value; readers need only
+    /// each polygon's actual vertex_count. Retained for v3 metadata compatibility.
     pub max_admin_vertices: u16,
     pub fine_search_radius_m: f32,
     pub coarse_search_radius_m: f32,
@@ -99,9 +137,9 @@ impl Header {
         // sampling budget - a cost of *writing* an index, not a property of
         // one - so an index written at a higher level by some other producer
         // stays readable. Reading does no cell covering.
-        if street > 30 || coarse > 30 || admin > 30 {
+        if street > S2_MAX_LEVEL || coarse > S2_MAX_LEVEL || admin > S2_MAX_LEVEL {
             return Err(FormatError::InvalidMetadata(format!(
-                "S2 cell levels must be in 0..=30, got street={street}, coarse={coarse}, admin={admin}"
+                "S2 cell levels must be in 0..={S2_MAX_LEVEL}, got street={street}, coarse={coarse}, admin={admin}"
             )));
         }
         if coarse >= street {
@@ -299,7 +337,7 @@ pub struct InterpWay {
     pub start_number: u32,
     pub end_number: u32,
     pub node_count: u16,
-    /// 0=all, 1=even, 2=odd
+    /// Serialized InterpolationType; checked when opening the index.
     pub interpolation_type: u8,
 }
 
@@ -383,7 +421,7 @@ pub struct AdminPolygon {
     /// Only populated for admin_level=2 boundaries. The builder interns
     /// the 2-char code (e.g., "DK") into the string pool.
     pub country_code_offset: u32,
-    /// Admin level 2-11.
+    /// Administrative level 2-10, or POSTAL_BOUNDARY_LEVEL for postal boundaries.
     pub admin_level: u8,
 }
 
@@ -515,6 +553,9 @@ pub fn read_nul_string(data: &[u8], offset: u32) -> Option<&str> {
 // File names
 // ---------------------------------------------------------------------------
 
+// Keep individual names: Reader::open binds each file to its typed field,
+// rather than iterating an untyped registry. An ALL_FILES list would be a
+// third owner requiring updates without proving any binding is correct.
 pub const FILE_HEADER: &str = "geocode_header.bin";
 pub const FILE_GEO_CELLS: &str = "geo_cells.bin";
 pub const FILE_STREET_ENTRIES: &str = "street_entries.bin";
@@ -534,6 +575,31 @@ pub const FILE_ADMIN_ENTRIES: &str = "admin_entries.bin";
 pub const FILE_ADMIN_POLYGONS: &str = "admin_polygons.bin";
 pub const FILE_ADMIN_VERTICES: &str = "admin_vertices.bin";
 pub const FILE_STRINGS: &str = "strings.bin";
+
+/// Map a read-only file, including valid empty record files.
+#[cfg(feature = "geocode-reader")]
+pub(crate) fn mmap_or_empty(path: &std::path::Path) -> crate::BoxResult<memmap2::Mmap> {
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    let len = file
+        .metadata()
+        .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
+        .len();
+    let mapped = if len == 0 {
+        // memmap2 refuses zero-length files; every consumer bounds-checks
+        // records, so an empty anonymous mapping reads as "no records".
+        memmap2::MmapOptions::new()
+            .map_anon()
+            .and_then(memmap2::MmapMut::make_read_only)
+            .map_err(|e| format!("failed to create empty mmap for {}: {e}", path.display()))?
+    } else {
+        // SAFETY: index files must remain unchanged while mapped, in both
+        // the builder's post-flush phase and the Reader's lifetime.
+        unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?
+    };
+    Ok(mapped)
+}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -718,6 +784,16 @@ mod tests {
         assert_eq!(parsed.geo_cell_count, 1_500_000);
         assert_eq!(parsed.coarse_cell_count, 200_000);
         assert_eq!(parsed.admin_cell_count, 50_000);
+    }
+
+    #[test]
+    fn interpolation_wire_values_are_closed() {
+        for value in 0..=u8::MAX {
+            assert_eq!(InterpolationType::try_from(value).is_ok(), value <= 2);
+        }
+        assert_eq!(InterpolationType::All as u8, 0);
+        assert_eq!(InterpolationType::Even as u8, 1);
+        assert_eq!(InterpolationType::Odd as u8, 2);
     }
 
     #[test]

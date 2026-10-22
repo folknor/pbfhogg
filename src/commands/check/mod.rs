@@ -63,13 +63,13 @@ pub(super) const RELATION_ID_FLOOR: i64 = 25_000_000;
 /// renumber measured a country extract's highest node ID at well over 8 per
 /// input byte. For those files it is the per-kind floor that covers the real
 /// ID range, so a floor that falls behind live OSM IDs makes this function
-/// clamp honest extracts. The arithmetic is `IdSet::file_bounded_max_id`'s,
-/// shared with renumber and the geocode builder.
+/// clamp preallocation for honest extracts. The arithmetic is shared with
+/// renumber and the geocode builder via `IdSet::file_bounded_max_id`.
 ///
-/// Clamping is safe rather than lossy: an ID above the chosen bound is not
-/// recorded, and both callers already treat that as a reportable input
-/// property (`IdViolation::IdOutOfRange` in `verify_ids`, an over-reported
-/// missing ref in `check_refs`) instead of a panic.
+/// This is an allocation bound, not an input validity bound. Both callers
+/// collect observed positive IDs refused by atomic setters and insert them
+/// with `IdSet::set` (or `set_if_new`) after workers join. Only those decoded
+/// IDs can allocate sparse overflow chunks; unverified indexdata cannot.
 pub(super) fn id_alloc_bound(indexdata_max: i64, floor: i64, file_len: u64) -> i64 {
     crate::idset::IdSet::file_bounded_max_id(indexdata_max, file_len, CHECK_IDS_PER_BYTE).max(floor)
 }

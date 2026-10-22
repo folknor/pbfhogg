@@ -651,9 +651,9 @@ Anger: 9 - scratch location, a new --tmp-dir, reaping old scratch.
 Fix: one `scratch_dir` resolved once by the CLI (explicit `--tmp-dir`, else the
 output's directory with `""` mapped to `.`), validated up front, passed into
 the library as a required `&ScratchDir` whose only constructor is in the CLI;
-`BuildConfig.scratch_dir` for geocode. With a fixed file set
-(HYG-084), geocode `validate_structure` could reject unexpected entries in the
-index dir.
+`BuildConfig.scratch_dir` for geocode. If the index file set were enumerated
+(it is not; `format.rs` records why), geocode `validate_structure` could
+reject unexpected entries in the index dir.
 
 Reported by: altw and scanning, re-encoding, geocode index.
 
@@ -1304,46 +1304,6 @@ range makes the whole kind.
 
 Reported by: re-encoding.
 
-## HYG-059 - `geo::assemble_rings` is an unbounded backtracking search
-
-Anger: 7 - geocode output.
-
-Each ring start runs a DFS over all endpoint candidates with full backtracking
-(`used[segment_idx] = false; ring.truncate(..)`), cloning a candidate `Vec` per
-frame (`endpoint_map.get(..).cloned()`). On a relation with many segments
-sharing endpoints (a grid-like admin boundary or adversarial data) the work is
-exponential in the branching endpoints. The input is OSM relations in the
-geocode builder, not under the operator's control. No step budget, counter or
-warning. Fix: a step cap with a logged give-up, or a deterministic
-non-backtracking assembler (osmium's, in `research/libosmium/`).
-
-Reported by: filtering and spatial.
-
-## HYG-060 - Spatial primitives live in three homes, and region properties are recomputed per query
-
-Anger: 8 - spatial floating point.
-
-`extract::Bbox` lives in the extract command, `commands/spatial.rs` (the
-declared shared owner) imports it from there, and `geo.rs` owns ring math.
-`extract::polygon_rings_contains` and `geo::point_in_polygon` are the same
-function with different hole-slice types, the copy existing to avoid a
-`&[&[..]]` allocation. `polygon_rings_contains` calls
-`point_in_ring_with_antimeridian` per candidate node, re-running
-`ring_crosses_antimeridian` (O(ring)) and, for crossing rings, allocating an
-unwrapped `Vec` per point; its comment says it avoids per-point allocation,
-true only for non-crossing rings. `bbox_from_polygons` widens to -180..180 for
-an antimeridian ring, which silently defeats blob-level spatial skip; a split
-pair of boxes keeps it. `parse_extract_geometry` reads four `f64`s, formats them
-into `"a,b,c,d"` and re-parses through `parse_bbox`, working only because float
-`Display` is shortest-round-trip and relabelling errors through the string.
-Fix: `Bbox`, `BboxInt`, the E7 conversions and a `PreparedRing { points,
-crosses, unwrapped }` built once at parse time, in `geo.rs` below the commands;
-`point_in_polygon` taking `impl IntoIterator<Item = &[(f64, f64)]>`;
-`Bbox::try_new` beside `parse_bbox_str`. The geocode reader benefits from the
-prepared rings too.
-
-Reported by: filtering and spatial.
-
 ## HYG-061 - The indexdata trust model is decided per command
 
 Anger: 9 - indexdata trust model.
@@ -1429,42 +1389,6 @@ numbers for brokkr, so one failed sample distorts a delta. Fix: carry the
 `Option` through those call sites and skip the counter when absent.
 
 Reported by: CLI and plumbing, altw and scanning.
-
-## HYG-065 - CLI defaults, help text and docs restate library constants
-
-Anger: 7 - CLI behaviour.
-
-- Geocode build defaults `17 / 14 / 10 / 500 / 75 / 1000` live in
-  `BuildConfig::default()`, clap `default_value = "..."` strings,
-  `reference/cli-reference.md`, `docs/cli/commands.md` and the generated
-  `docs/.vitepress/dist/` copies (checked in; if it is a build artifact it is a
-  fifth copy only regeneration keeps in step). The CLI never uses
-  `BuildConfig::default()`; it builds the struct field by field via a
-  `GeocodeLevels` struct that mirrors `BuildConfig`, so library and CLI
-  defaults agree by coincidence.
-- The level range "0-19" in clap help and `cli-reference.md` restates
-  `MAX_BUILD_S2_LEVEL`.
-- `inspect --anomalies` help says "<50% or >150% of median"; the numbers live in
-  the report code.
-- `--output-header` keys are spelled in `HeaderOverrides::parse`, the help text
-  and the error message.
-- `inspect --get` keys have three owners: the CLI's `HeaderGet` arm hard-codes
-  `file.*`, `header.*` keys, `InspectReport::get_value` owns the rest, and
-  `InspectMode::resolve` routes by prefix (`data.`, `metadata.`, `elements.`,
-  `blocks.`, `indexed`), so a report key outside those prefixes is routed to
-  the header path and errors as unknown; `run_inspect` adds a fourth check
-  (`data.` / `metadata.` forces `--extended`).
-- The "dense was removed" paragraph is in `IndexType::from_str` and
-  `IndexTypeArg::resolve` and has diverged ("Use 'sparse'" vs "Use --index-type
-  sparse"); nothing in-tree calls the library `FromStr`.
-
-Fix: `pub const` defaults read by clap `default_value_t`, or clap `Args`
-derived on the config struct; help strings built from the consts; a
-`ValueEnum` for header override keys; the inspect key table in `inspect` with
-per-key needs; a unit test asserting `BuildConfig::default()` equals the
-clap-parsed empty-args config.
-
-Reported by: geocode index, CLI and plumbing, altw and scanning.
 
 ## HYG-070 - CLI-driving tests live in the library crate, so binary resolution is restated and guessed
 
@@ -1616,58 +1540,6 @@ drain's last node item.
 
 Reported by: change application.
 
-## HYG-084 - Geocode format vocabulary is held in literals and argument order
-
-Anger: 7 - geocode format bump.
-
-- Admin level 11 means "postal code" (invented in `pass1.rs` as `else { 11 }`),
-  relied on by `reader.rs` (`best_by_level: [...; 12]` twice, `level < 12`
-  guards), `format.rs` and `ReverseResult.admin` docs ("2-11"), and
-  `admin::admin_vertex_cap` (postal boundaries take the local cap). If accepted
-  admin levels widen to `2..=11` (OSM does use 11), real level-11 boundaries
-  collide with postal codes and the smallest-area-per-level ranking mixes them.
-  Byte 25 of `AdminPolygon` is reserved and zero; a `kind` byte there (a format
-  bump) makes the collision unrepresentable.
-- Interpolation type `0/1/2` is a literal in `pass2.rs`, a comment in
-  `format.rs`, and `0 => ..., _ => ...` in `reader.rs`, which accepts any
-  nonzero byte and never distinguishes odd from even (both use step-2 rounding
-  relying on `start_number` parity). A `#[repr(u8)] enum` with `TryFrom<u8>`
-  validated in `validate_structure`.
-- The S2 format limit `30` is a literal in `Header::from_bytes` with "0..=30" in
-  the error; `pub const S2_MAX_LEVEL` beside `MAX_BUILD_S2_LEVEL` with a const
-  assert relating them.
-- `FusedCellAssignmentParams` takes eight file names as `&str` and `run_stage_b`
-  four more, always the `format::FILE_*` constants, so fine/coarse pairing is
-  argument order; the reader's `search_level` and `validate_geo_tree` take the
-  same mmap quadruple positionally. A `GeoTreeFiles` const pair
-  `FINE_TREE` / `COARSE_TREE` in `format.rs`.
-- Nothing enumerates the file set; the reader's `open` lists the `FILE_*`
-  constants a second time. `pub const ALL_FILES`.
-- The zero-length-file anonymous-mmap trick is in `Reader::open` and
-  `pass2.rs::mmap_file` ("same as Reader"); one `mmap_or_empty`.
-- `max_admin_vertices` is written to the header and never read, and since
-  per-level multipliers it no longer describes the stored polygons (a country
-  holds 16x it). Drop it or record the effective caps.
-
-Reported by: geocode index.
-
-## HYG-086 - Geocode street classification is defined twice
-
-Anger: 7 - geocode output.
-
-Pass 1.5 decides which ways' nodes to keep via
-`scan::way::GeocodeTagLiterals::standard()` (`is_street`, `is_building_addr`,
-`is_interp`); Pass 2 re-decides in `classify_way_into` with its own tag match
-and `EXCLUDED_HIGHWAYS`, in a different module and representation (byte
-literals vs `&str`). If Pass 1.5 is narrower, Pass 2 classifies a street whose
-nodes were never collected, `filter_map` drops them, and the street silently
-loses vertices or vanishes; if wider, memory is wasted. The hunter did not read
-`scan/way.rs` in full, so whether they have diverged is unverified. Fix: one
-classification consumed by both, plus a property test that Pass 2's set is a
-subset of Pass 1.5's over the same blobs.
-
-Reported by: geocode index.
-
 ## HYG-088 - Geocode build drops data silently and its smoke test cannot be acted on
 
 Anger: 7 - geocode output.
@@ -1782,17 +1654,6 @@ checked and is consistent across flood fill, reader and `hole_inside_outer`;
 recorded so the next pass does not re-check it.
 
 Reported by: geocode index.
-
-## HYG-102 - The library `IndexType::from_str` keeps a "dense" arm
-
-Anger: 5 - API decision.
-
-The library `IndexType::from_str` "dense" arm (an error explaining dense was
-removed) has no in-repo caller; it is public API, so whether it stays is a
-decision. Its wording has diverged from the CLI's `IndexTypeArg::resolve`
-copy (see HYG-065).
-
-Reported by: altw and scanning.
 
 ## HYG-105 - Geocode `BuildStats` repeats the header counts
 

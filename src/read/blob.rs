@@ -342,6 +342,8 @@ pub struct BlobReader<R: Read + Send> {
     reader: R,
     /// Current reader offset in bytes from the start of the stream.
     offset: Option<ByteOffset>,
+    /// Fixed construction offset of the PBF stream, independent of later seeks.
+    stream_start: u64,
     /// The file this reader was opened from, when it was opened from a
     /// path at all. Stamped onto every error the framing layer raises, so
     /// a failure on a multi-input command says *which* input failed.
@@ -419,6 +421,7 @@ impl<R: Read + Send> BlobReader<R> {
         BlobReader {
             reader,
             offset: None,
+            stream_start: 0,
             // No path exists for a bare `Read`. Absent, not guessed.
             source: None,
             blob_index: Some(0),
@@ -591,11 +594,12 @@ impl<R: Read + Send> BlobReader<R> {
             Ok(header) => header,
             Err(e) => return self.handle_error(e),
         };
-        // The existing sequential blob count also covers non-seekable Read
-        // inputs. After a seek it is unknown, but the byte offset still tells
-        // whether this is the leading frame (currently past its 4-byte prefix).
-        let at_start = self.blob_index == Some(0)
-            || (self.blob_index.is_none() && self.offset == Some(ByteOffset(4)));
+        // The construction position leads an embedded PBF too. Keep that
+        // origin fixed across seeks; the blob index is only a fallback for
+        // non-seekable inputs (currently past the 4-byte prefix).
+        let at_start = self.offset.map_or(self.blob_index == Some(0), |offset| {
+            offset.0.checked_sub(4) == Some(self.stream_start)
+        });
         if let Err(err) = crate::frame::check_header_position(&header.blob_type, at_start) {
             return self.handle_error(err);
         }
@@ -741,6 +745,7 @@ impl BlobReader<FileReader> {
         Ok(BlobReader {
             reader,
             offset: Some(ByteOffset(0)),
+            stream_start: 0,
             source: Some(std::sync::Arc::from(path.as_ref())),
             blob_index: Some(0),
             last_blob_ok: true,
@@ -766,6 +771,7 @@ impl BlobReader<FileReader> {
         Ok(BlobReader {
             reader,
             offset: Some(ByteOffset(0)),
+            stream_start: 0,
             source: Some(std::sync::Arc::from(path.as_ref())),
             blob_index: Some(0),
             last_blob_ok: true,
@@ -799,6 +805,7 @@ impl BlobReader<FileReader> {
         Ok(BlobReader {
             reader,
             offset: Some(ByteOffset(0)),
+            stream_start: 0,
             source: Some(std::sync::Arc::from(path.as_ref())),
             blob_index: Some(0),
             last_blob_ok: true,
@@ -917,7 +924,9 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
 
 impl<R: BlobReaderSource + Send> BlobReader<R> {
     /// Creates a new `BlobReader` from the given reader that is seekable and will be initialized
-    /// with a valid offset.
+    /// with a valid offset. The construction position is the PBF stream start:
+    /// an OSMHeader there is leading even at a nonzero absolute offset. Later
+    /// seeks do not redefine that start. Reported byte offsets remain absolute.
     ///
     /// # Example
     /// ```
@@ -941,6 +950,7 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
         Ok(BlobReader {
             reader,
             offset: Some(ByteOffset(pos)),
+            stream_start: pos,
             // `new_seekable` is generic over any seekable reader; the path
             // (if any) is the caller's, not something this can recover.
             source: None,
@@ -1016,8 +1026,11 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
                 // sequentially from the stream start. A rewind to 0
                 // restarts it; any other target invalidates it - a stale
                 // index stamped onto a later error would name the wrong
-                // blob, which is worse than naming none.
-                self.blob_index = (offset == 0).then_some(0);
+                // blob, which is worse than naming none. A reader built at
+                // a nonzero position (an embedded PBF) never knows its
+                // absolute blob index, and offset 0 there is outside its
+                // stream, so no seek restores the count.
+                self.blob_index = (offset == 0 && self.stream_start == 0).then_some(0);
                 Ok(())
             }
             Err(e) => {
@@ -1043,7 +1056,7 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
             Ok(offset) => {
                 self.offset = Some(ByteOffset(offset));
                 // Same invalidation rule as `seek`.
-                self.blob_index = (offset == 0).then_some(0);
+                self.blob_index = (offset == 0 && self.stream_start == 0).then_some(0);
                 self.last_blob_ok = true;
                 Ok(offset)
             }

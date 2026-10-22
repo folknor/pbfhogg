@@ -299,11 +299,12 @@ impl WireBlob {
                     });
                 }
                 blob::RAW_SIZE => {
-                    // raw_size: int32 (varint)
-                    #[allow(clippy::cast_possible_truncation)]
-                    {
-                        raw_size = Some(cursor.read_varint()? as i32);
-                    }
+                    // Validate before narrowing so 2^32 + N cannot alias N and
+                    // pass the decompressed-length check as an honest size.
+                    raw_size = Some(super::wire::read_int32(
+                        &mut cursor,
+                        "Blob.raw_size exceeds int32",
+                    )?);
                 }
                 _ => cursor.skip_field(wire_type)?,
             }
@@ -323,8 +324,8 @@ impl WireBlob {
     /// Returns the declared `raw_size` as a `usize` capacity hint for buffer
     /// pre-allocation, or 0 if absent or negative.
     ///
-    /// Clamped to [`MAX_BLOB_MESSAGE_SIZE`]. `raw_size` is an unvalidated
-    /// `int32` straight off the wire, so a corrupt or hostile blob can declare
+    /// Clamped to [`MAX_BLOB_MESSAGE_SIZE`]. `raw_size` is a producer-declared
+    /// `int32` from the wire, so a corrupt or hostile blob can declare
     /// up to 2 GiB and drive the pre-decompression `Vec::reserve` into an
     /// outsized allocation ahead of every guard that runs during inflation. No
     /// legitimate blob decompresses past the cap, so a larger hint is a lie and

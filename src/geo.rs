@@ -5,7 +5,157 @@
 
 use std::f64::consts::PI;
 
+#[cfg(feature = "commands")]
+use crate::coord_fmt::deg_to_e7;
 use crate::coord_fmt::e7_to_deg;
+
+/// A geographic bounding box in WGS84 degrees.
+pub struct Bbox {
+    pub min_lon: f64,
+    pub min_lat: f64,
+    pub max_lon: f64,
+    pub max_lat: f64,
+}
+
+impl Bbox {
+    /// Construct a finite, ordered bounding box within the WGS84 domain.
+    pub fn try_new(
+        min_lon: f64,
+        min_lat: f64,
+        max_lon: f64,
+        max_lat: f64,
+    ) -> crate::BoxResult<Self> {
+        // Domain checks precede ordering: ordered values outside WGS84 are still
+        // invalid, even when an integer conversion could clamp them into range.
+        for (name, value) in [("min_lat", min_lat), ("max_lat", max_lat)] {
+            crate::coord_pack::validate_lat(name, value)?;
+        }
+        for (name, value) in [("min_lon", min_lon), ("max_lon", max_lon)] {
+            crate::coord_pack::validate_lon(name, value)?;
+        }
+        if min_lon >= max_lon {
+            return Err(
+                format!("min_lon ({min_lon}) must be less than max_lon ({max_lon})").into(),
+            );
+        }
+        if min_lat >= max_lat {
+            return Err(
+                format!("min_lat ({min_lat}) must be less than max_lat ({max_lat})").into(),
+            );
+        }
+        Ok(Self {
+            min_lon,
+            min_lat,
+            max_lon,
+            max_lat,
+        })
+    }
+
+    /// Returns `true` if the point (lat, lon) in degrees falls within this bbox.
+    #[cfg(feature = "commands")]
+    pub(crate) fn contains(&self, lat: f64, lon: f64) -> bool {
+        lat >= self.min_lat && lat <= self.max_lat && lon >= self.min_lon && lon <= self.max_lon
+    }
+}
+
+// Spatial membership deliberately uses multiplication, matching reader geometry.
+// The text/OSC conversion divides for byte compatibility; sharing that function
+// would change which boundary nodes extraction includes.
+#[cfg(feature = "commands")]
+pub(crate) fn to_degrees(value: i32) -> f64 {
+    e7_to_deg(f64::from(value))
+}
+
+/// Smallest decimicrodegree value whose degree form is `>= limit`.
+///
+/// The guess comes from scaling, then walks until the *forward* conversion
+/// satisfies the comparison in both directions, so the result is exact
+/// regardless of which way the two conversions round.
+#[allow(clippy::cast_possible_truncation)]
+#[cfg(feature = "commands")]
+fn ceil_e7(limit: f64) -> i32 {
+    let mut v = deg_to_e7(limit).ceil().clamp(-2.1e9, 2.1e9) as i32;
+    while to_degrees(v) < limit {
+        match v.checked_add(1) {
+            Some(next) => v = next,
+            None => break,
+        }
+    }
+    while let Some(prev) = v.checked_sub(1) {
+        if to_degrees(prev) >= limit {
+            v = prev;
+        } else {
+            break;
+        }
+    }
+    v
+}
+
+/// Largest decimicrodegree value whose degree form is `<= limit`.
+#[allow(clippy::cast_possible_truncation)]
+#[cfg(feature = "commands")]
+fn floor_e7(limit: f64) -> i32 {
+    let mut v = deg_to_e7(limit).floor().clamp(-2.1e9, 2.1e9) as i32;
+    while to_degrees(v) > limit {
+        match v.checked_sub(1) {
+            Some(prev) => v = prev,
+            None => break,
+        }
+    }
+    while let Some(next) = v.checked_add(1) {
+        if to_degrees(next) <= limit {
+            v = next;
+        } else {
+            break;
+        }
+    }
+    v
+}
+
+/// Integer bounding box in decimicrodegrees.
+#[cfg(feature = "commands")]
+pub(crate) struct BboxInt {
+    pub(crate) min_lon: i32,
+    pub(crate) min_lat: i32,
+    pub(crate) max_lon: i32,
+    pub(crate) max_lat: i32,
+}
+
+#[cfg(feature = "commands")]
+impl BboxInt {
+    /// Conservative integer bounds: a strict superset of [`Self::inside_bbox`],
+    /// widened by one decimicrodegree on each side. Use for blob-level
+    /// candidate selection and as a polygon prefilter, where a false positive
+    /// costs work and a false negative loses data. Never for point membership.
+    pub(crate) fn from_bbox(bbox: &Bbox) -> Self {
+        let inside = Self::inside_bbox(bbox);
+        Self {
+            min_lon: inside.min_lon.saturating_sub(1),
+            min_lat: inside.min_lat.saturating_sub(1),
+            max_lon: inside.max_lon.saturating_add(1),
+            max_lat: inside.max_lat.saturating_add(1),
+        }
+    }
+
+    /// Exact integer bounds: `contains` on this box agrees, point for point,
+    /// with `bbox.contains(lat as f64 * 1e-7, lon as f64 * 1e-7)`. Use for
+    /// point membership, columnar classification, and for proving that a raw
+    /// blob can be passed through untouched.
+    pub(crate) fn inside_bbox(bbox: &Bbox) -> Self {
+        Self {
+            min_lon: ceil_e7(bbox.min_lon),
+            min_lat: ceil_e7(bbox.min_lat),
+            max_lon: floor_e7(bbox.max_lon),
+            max_lat: floor_e7(bbox.max_lat),
+        }
+    }
+
+    /// Return whether a decimicrodegree point is inside the box.
+    pub(crate) fn contains(&self, lat: i32, lon: i32) -> bool {
+        lat >= self.min_lat && lat <= self.max_lat && lon >= self.min_lon && lon <= self.max_lon
+    }
+}
+
 /// Mean Earth radius in meters (WGS84 volumetric mean).
 pub const EARTH_RADIUS_M: f64 = 6_371_008.8;
 
@@ -60,11 +210,24 @@ pub fn point_in_polygon(
     exterior: &[(f64, f64)],
     holes: &[&[(f64, f64)]],
 ) -> bool {
+    point_in_polygon_rings(px, py, exterior, holes.iter().copied())
+}
+
+/// The one implementation behind [`point_in_polygon`], taking holes as any
+/// iterator of borrowed slices so callers holding `Vec<Vec<_>>` holes need
+/// no temporary `Vec<&[_]>`. Crate-private so the public surface keeps one
+/// name for the operation.
+pub(crate) fn point_in_polygon_rings<'a>(
+    px: f64,
+    py: f64,
+    exterior: &[(f64, f64)],
+    holes: impl IntoIterator<Item = &'a [(f64, f64)]>,
+) -> bool {
     if !point_in_ring_with_antimeridian(px, py, exterior) {
         return false;
     }
     !holes
-        .iter()
+        .into_iter()
         .any(|hole| point_in_ring_with_antimeridian(px, py, hole))
 }
 
@@ -353,14 +516,76 @@ fn dp_mark(pts: &[(f64, f64)], start: usize, end: usize, epsilon: f64, keep: &mu
 ///
 /// Ambiguous endpoint graphs are explored with an explicit backtracking stack,
 /// so a dead-end branch neither loses its segments nor hides a valid ring.
+///
+/// The search is unbounded: on a relation where many segments share
+/// endpoints, full backtracking can take time exponential in the number of
+/// branching endpoints. Callers fed untrusted data (the geocode builder) use
+/// the crate's bounded variant, which runs this same search under a step
+/// budget and gives up on the whole input rather than returning a different
+/// ring set.
 pub fn assemble_rings(segments: &[&[(i32, i32)]]) -> Vec<Vec<(i32, i32)>> {
+    // No budget, so the search cannot report exhaustion.
+    assemble_rings_search(segments, None).unwrap_or_default()
+}
+
+/// Headroom, in segment placements, that [`ring_search_budget`] grants on top
+/// of its quadratic allowance. It is spent only at branching endpoints.
+#[cfg(feature = "commands")]
+pub(crate) const RING_SEARCH_EXTRA_STEPS: u64 = 1 << 20;
+
+/// Step budget for [`assemble_rings_bounded`] over `segment_count` segments.
+///
+/// When every endpoint is shared by at most two segment ends there is never
+/// a choice, so each start places at most `segment_count - 1` segments and
+/// the whole call fewer than `segment_count^2`; such inputs always finish
+/// within budget. Only branching endpoints (touching rings, duplicate
+/// members, grids) can spend more, and they get [`RING_SEARCH_EXTRA_STEPS`]
+/// of headroom. That turns the exponential worst case into a quadratic one
+/// without changing the result for any input that finishes within budget.
+// libosmium bounds its assembler differently (100 split locations, recursion
+// depth 20), but its depth counts candidate ring joins in a different
+// algorithm. Applied to this search, where depth is the number of member ways
+// in one ring, a depth of 20 would refuse ordinary country boundaries.
+#[cfg(feature = "commands")]
+pub(crate) fn ring_search_budget(segment_count: usize) -> u64 {
+    let count = u64::try_from(segment_count).unwrap_or(u64::MAX);
+    count
+        .saturating_mul(count)
+        .saturating_add(RING_SEARCH_EXTRA_STEPS)
+}
+
+/// The bounded ring search ran out of steps. No rings are returned: a partial
+/// ring set would silently differ from what the full search assembles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RingSearchBudgetExceeded;
+
+/// [`assemble_rings`] under [`ring_search_budget`]. Within budget the result
+/// is identical to the unbounded search, ring for ring and vertex for vertex.
+#[cfg(feature = "commands")]
+pub(crate) fn assemble_rings_bounded(
+    segments: &[&[(i32, i32)]],
+) -> Result<Vec<Vec<(i32, i32)>>, RingSearchBudgetExceeded> {
+    assemble_rings_search(segments, Some(ring_search_budget(segments.len())))
+}
+
+/// Shared search. `budget` caps the number of segment placements across all
+/// starts; `None` is unbounded. The search order is the contract: bounded and
+/// unbounded callers must assemble the same rings whenever the bound holds.
+fn assemble_rings_search(
+    segments: &[&[(i32, i32)]],
+    budget: Option<u64>,
+) -> Result<Vec<Vec<(i32, i32)>>, RingSearchBudgetExceeded> {
     if segments.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
+    let mut steps: u64 = 0;
 
     // Build endpoint map: quantized endpoint -> list of segment indices
     let mut endpoint_map: std::collections::HashMap<(i32, i32), Vec<usize>> =
         std::collections::HashMap::new();
+    // A one-point segment stays in the search: it is a zero-length link that
+    // can be placed (and start a ring) at its point, exactly as before the
+    // search was bounded. Dropping it would rotate or reorder output rings.
     for (idx, seg) in segments.iter().enumerate() {
         if seg.is_empty() {
             continue;
@@ -383,15 +608,21 @@ pub fn assemble_rings(segments: &[&[(i32, i32)]]) -> Vec<Vec<(i32, i32)>> {
         let mut ring: Vec<(i32, i32)> = segments[start_idx].to_vec();
         let ring_start = ring[0];
 
-        struct SearchFrame {
-            candidates: Vec<usize>,
+        // Full backtracking, deliberately: pruning revisited endpoints would
+        // still find a ring whenever one exists, but not always the same
+        // ring (a figure-eight trail through a touching point becomes two
+        // rings, or a different partition), which changes geocode admin
+        // polygons. The step budget, not pruning, bounds the work.
+        // Candidate lists are borrowed from the endpoint map, not cloned.
+        struct SearchFrame<'a> {
+            candidates: &'a [usize],
             next_candidate: usize,
             chosen_segment: Option<usize>,
             ring_len_before: usize,
         }
         let candidates = endpoint_map
             .get(ring.last().expect("nonempty ring"))
-            .cloned()
+            .map(Vec::as_slice)
             .unwrap_or_default();
         let mut search = vec![SearchFrame {
             candidates,
@@ -424,6 +655,15 @@ pub fn assemble_rings(segments: &[&[(i32, i32)]]) -> Vec<Vec<(i32, i32)>> {
             frame.next_candidate = candidate_pos + 1;
             let next_idx = frame.candidates[candidate_pos];
 
+            // One step per placement attempt. Checked before the placement,
+            // so an input that needs exactly `budget` steps still finishes.
+            if let Some(budget) = budget
+                && steps >= budget
+            {
+                return Err(RingSearchBudgetExceeded);
+            }
+            steps += 1;
+
             used[next_idx] = true;
             let ring_len_before = ring.len();
             let seg = segments[next_idx];
@@ -444,7 +684,7 @@ pub fn assemble_rings(segments: &[&[(i32, i32)]]) -> Vec<Vec<(i32, i32)>> {
             }
             let candidates = endpoint_map
                 .get(ring.last().expect("nonempty ring"))
-                .cloned()
+                .map(Vec::as_slice)
                 .unwrap_or_default();
             search.push(SearchFrame {
                 candidates,
@@ -462,7 +702,7 @@ pub fn assemble_rings(segments: &[&[(i32, i32)]]) -> Vec<Vec<(i32, i32)>> {
         }
     }
 
-    rings
+    Ok(rings)
 }
 
 /// Compute the signed area of a ring in decimicrodegree² units.
@@ -965,6 +1205,85 @@ mod tests {
     fn signed_area_degenerate() {
         assert!(signed_area(&[]).abs() < f64::EPSILON);
         assert!(signed_area(&[(0, 0), (1, 1)]).abs() < f64::EPSILON);
+    }
+
+    #[cfg(feature = "commands")]
+    #[test]
+    fn bounded_assembly_refuses_an_exponential_search() {
+        // Starting at a leaf forces a failed search through the complete
+        // graph, and enumerating its trails grows factorially. The bounded
+        // search gives up on the whole input instead of returning the
+        // disconnected triangle alone.
+        let mut segments = vec![vec![(-1, -1), (0, 0)]];
+        for a in 0..12 {
+            for b in a + 1..12 {
+                segments.push(vec![(a, a), (b, b)]);
+            }
+        }
+        segments.push(vec![(100, 100), (100, 101), (101, 100), (100, 100)]);
+        let slices: Vec<_> = segments.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            assemble_rings_bounded(&slices),
+            Err(RingSearchBudgetExceeded)
+        );
+    }
+
+    #[cfg(feature = "commands")]
+    #[test]
+    fn bounded_assembly_matches_unbounded_within_budget() {
+        // Two triangles touching at (5, 5). Full backtracking walks one
+        // figure-eight ring through the touching point; a search that
+        // pruned revisited endpoints would return two triangles instead.
+        // The bounded search must keep the unbounded answer.
+        let s0 = [(0, 0), (10, 0)];
+        let s1 = [(10, 0), (5, 5)];
+        let s2 = [(5, 5), (10, 10)];
+        let s3 = [(10, 10), (0, 10)];
+        let s4 = [(0, 10), (5, 5)];
+        let s5 = [(5, 5), (0, 0)];
+        let segments: [&[(i32, i32)]; 6] = [&s0, &s1, &s2, &s3, &s4, &s5];
+        let unbounded = assemble_rings(&segments);
+        assert_eq!(
+            unbounded,
+            vec![vec![
+                (0, 0),
+                (10, 0),
+                (5, 5),
+                (10, 10),
+                (0, 10),
+                (5, 5),
+                (0, 0)
+            ]]
+        );
+        assert_eq!(assemble_rings_bounded(&segments), Ok(unbounded));
+    }
+
+    #[cfg(feature = "commands")]
+    #[test]
+    fn ring_search_budget_covers_every_non_branching_input() {
+        // Without a branching endpoint each start places at most n - 1
+        // segments, so n^2 is an upper bound before the headroom.
+        assert_eq!(ring_search_budget(0), RING_SEARCH_EXTRA_STEPS);
+        assert_eq!(
+            ring_search_budget(1_000),
+            1_000_000 + RING_SEARCH_EXTRA_STEPS
+        );
+        assert_eq!(ring_search_budget(usize::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn bbox_constructor_validates_numeric_input() {
+        assert!(Bbox::try_new(-180.0, -90.0, 180.0, 90.0).is_ok());
+        for values in [
+            (f64::NAN, 0.0, 1.0, 1.0),
+            (0.0, 0.0, f64::INFINITY, 1.0),
+            (-181.0, 0.0, 1.0, 1.0),
+            (0.0, -91.0, 1.0, 1.0),
+            (1.0, 0.0, 1.0, 1.0),
+            (0.0, 1.0, 1.0, 0.0),
+        ] {
+            assert!(Bbox::try_new(values.0, values.1, values.2, values.3).is_err());
+        }
     }
 
     #[test]

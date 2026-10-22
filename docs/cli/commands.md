@@ -47,12 +47,12 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 | `--blocks [N]` | Show per-block distribution stats and optional block listing (N limits to first/last N blocks) |
 | `--id-ranges` | Show min/max element IDs per type and monotonicity |
 | `--locations` | Show locations-on-ways diagnostics |
-| `--anomalies` | Show only anomalous blocks (<50% or >150% of median, plus mixed blocks) |
+| `--anomalies` | Show blocks outside inspect's per-type median thresholds, plus mixed blocks |
 | `-e, --extended` | Extended scan: timestamp range, data bbox, metadata coverage, ordering |
-| `-g, --get <KEY>` | Get a single value by key path (e.g. `header.bbox`, `data.timestamp.first`) |
+| `-g, --get <KEY>` | Get a single value by key path (e.g. `header.bbox`, `data.timestamp.first`). Data and metadata paths enable extended stats automatically |
 | `--json` | Machine-readable JSON output |
 | `--show <TYPE_ID>` | Display a single element by ID (e.g. `n123` or `node/123`). Also accepts `w456` / `way/456` and `r789` / `relation/789`, including signed IDs. Uses indexdata to skip non-matching blobs, early exit on sorted PBFs. **A mode of its own**: mutually exclusive with every other `inspect` flag, which it used to accept and discard |
-| `--distrust-metadata` | Decode every blob instead of reporting counts, ID ranges and per-block stats out of the blobs' own indexdata. Nothing validates indexdata against the payload it describes, so on a file you are inspecting because you suspect it, the fast path reports the file's claims rather than its contents. Scanning report only: rejected with `--indexed`, `--nodes`, and a `header.*` `--get` key |
+| `--distrust-metadata` | Decode every blob instead of reporting counts, ID ranges and per-block stats out of the blobs' own indexdata. Nothing validates indexdata against the payload it describes, so on a file you are inspecting because you suspect it, the fast path reports the file's claims rather than its contents. Scanning report only: rejected with `--indexed`, `--nodes`, and a `file.*` or `header.*` `--get` key |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--force` | Proceed even if input lacks indexdata. **Requires `--nodes`**, the only mode that reads it |
 
@@ -145,8 +145,9 @@ treats them as exact.
 
 Exit 1 means mismatches were found; exit 2 means the check could not run.
 
-The ref check reports element IDs it could not track (negative IDs, or IDs above
-the range sized from the file's own indexdata) on their own
+The ref check reports element IDs it could not track (negative IDs; a positive
+ID above the range sized from the file's own indexdata is still tracked) on their
+own
 `Untrackable element IDs` line, and as `untrackable_node_ids` /
 `untrackable_way_ids` / `untrackable_relation_ids` under `--json`. References to
 such an element are counted as missing, so a non-zero count means the
@@ -605,12 +606,12 @@ pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
 | Flag | Description |
 |------|-------------|
 | `--output-dir <DIR>` | Output directory for index files |
-| `--street-level <N>` | S2 cell level for streets/addresses, 0-19 [default: 17] |
-| `--coarse-level <N>` | Fallback cell level for rural areas, 0-19 [default: 14] |
-| `--admin-level <N>` | S2 cell level for admin boundaries, 0-10 [default: 10] |
-| `--max-admin-vertices <N>` | Douglas-Peucker cap for local admin polygons; levels 5, 4, 3, and 2 retain up to 2x, 4x, 8x, and 16x this value [default: 500] |
-| `--search-radius <M>` | Fine-level max search distance in meters [default: 75] |
-| `--coarse-search-radius <M>` | Coarse-level max search distance in meters [default: 1000] |
+| `--street-level <N>` | S2 cell level for streets/addresses; must exceed `--coarse-level` and fit the builder limit. Default comes from the builder configuration |
+| `--coarse-level <N>` | Fallback cell level for rural areas; must be below `--street-level` and fit the builder limit. Default comes from the builder configuration |
+| `--admin-level <N>` | S2 cell level for admin boundaries, within the builder's work limit. Default comes from the builder configuration |
+| `--max-admin-vertices <N>` | Douglas-Peucker cap for local admin polygons; levels 5, 4, 3, and 2 retain up to 2x, 4x, 8x, and 16x this value. Default comes from the builder configuration |
+| `--search-radius <M>` | Fine-level max search distance in meters. Default comes from the builder configuration |
+| `--coarse-search-radius <M>` | Coarse-level max search distance in meters. Default comes from the builder configuration |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--overwrite` | Replace an existing index in `--output-dir` after the new build succeeds. Does not bypass the indexdata requirement |
 | `--allow-unindexed` | Accept input without blob-level indexdata (slower fallback path). Does not replace an existing index |
@@ -627,13 +628,12 @@ the u32 range fails the build rather than being wrapped to a different source
 version.
 
 The three cell levels are validated before any input is read; a violation exits
-2 with an explicit message. Street and coarse levels must be in `0..=19`
-because the per-segment cell-covering cost doubles with every level, and beyond
-19 a single long segment exceeds the builder's sampling budget. Admin level
-must be in `0..=10`: its interior flood fill can consider at most the whole
-sphere's 6,291,456 S2 cells for one polygon at level 10, with the bound
-quadrupling at each higher level. `--coarse-level` must be strictly below
-`--street-level`. Readers still accept indexes written at levels up to 30.
+2 with an explicit message containing the builder's current upper bound.
+Street and coarse levels are limited by the per-segment cell-covering budget,
+whose sample count doubles at each level. Admin level is limited by the
+polygon flood-fill budget, whose cell count grows by a factor of four at each
+level. `--coarse-level` must be strictly below `--street-level`. Readers still
+accept indexes written at levels up to the S2 format limit of 30.
 
 Every build writes a complete generation in a sibling staging directory and
 publishes it only after the build and smoke test succeed; `--overwrite` (or

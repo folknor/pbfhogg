@@ -110,24 +110,6 @@ assumption `pre_seed` relies on.
 
 Reported by: write path.
 
-## BUG-076 - Plain `Node` messages are refused or skipped instead of read
-
-Anger: 9 - plain nodes in the shared node scanner.
-
-`src/scan/node.rs` now walks the whole group and errors on a plain
-(non-dense) `Node` anywhere in it, so altw (both backends' node passes) and
-the external join refuse such input rather than reporting the coordinates
-missing; they still cannot read it. Multi-extract with all-bbox regions
-still silently leaves plain nodes out of the output through
-`decode_dense_columns`, while single-region simple extract errors on them.
-Apply-changes has a checked extractor for both encodings
-(`apply_changes/node_coords.rs`); the scanner should take it over and every
-node pass call it. pbfhogg's own writer emits only dense nodes, which is
-why no fixture caught this; `osmium cat -f pbf,pbf_dense_nodes=false`
-produces the input.
-
-Reported by: the apply-changes and extract fixes.
-
 ## BUG-079 - The version gate refuses identical repeats from overlapping diffs
 
 Anger: 10 - the version-gate contract.
@@ -242,47 +224,4 @@ fix is HYG-071's shared scratch.
 
 Reported by: change application, filtering and spatial, read path, test
 harness.
-
-## BUG-105 - `Blob.raw_size` narrows before the length comparison
-
-Anger: 9 - decoder refusals.
-
-`Blob.raw_size` is narrowed unchecked in `src/read/blob_wire.rs` and again
-in `src/read/decompress.rs`, so an oversized value can alias a small
-declared size and pass the decompressed-length comparison. The existing
-allocation caps still bound memory. Bound it where the blob is parsed, once
-per blob, as `datasize` now is through `read_int32`.
-
-Reported by: the wave-7 framing fixer.
-
-## BUG-106 - `check`'s node ID floor will start clamping honest extracts
-
-Anger: 8 - check aggregation.
-
-`check` sizes its ID bitset to `min(claim, file_len * 8)`, raised to
-`NODE_ID_FLOOR = 14_000_000_000`. Regional extracts keep global IDs and
-denmark's highest node ID is about 29 per input byte, so for any extract
-under roughly 1.75 GB the floor alone covers the real ID range. Once live
-OSM node IDs pass 14e9, `check --ids` reports `IdOutOfRange` and
-`check --refs` over-reports missing refs on honest files. Fix: renumber's
-overflow path (insert above-bound IDs with `set` after the parallel phase),
-or a floor that tracks reality. The `id_alloc_bound` doc now states the
-limit; behaviour is unchanged.
-
-Reported by: the wave-7 reconciler.
-
-## BUG-107 - `BlobReader::new_seekable` refuses a PBF that does not start at offset 0
-
-Anger: 9 - repeated-header policy.
-
-The leading-header rule treats a frame as first only when the stream is
-counted from its start. `BlobReader::new_seekable` on a reader positioned
-past 0 has no blob index and an offset other than 4, so the OSMHeader it
-starts with is refused as "a second OSMHeader blob". Reading a PBF embedded
-at a non-zero offset of a larger file through `new_seekable` used to work.
-`BlobReader::new` and `ElementReader` are unaffected. Decide whether a
-header at the construction position counts as leading, and say so in the
-CHANGELOG entry and `reference/truncation-handling.md`.
-
-Reported by: the wave-7 reviewer.
 

@@ -302,6 +302,20 @@ pub(super) fn try_extract_multi_single_pass(
                 }
                 None => columns.collect_matching_ids_multi_bbox(&bboxes, scratch),
             }
+            // Dense columns deliberately exclude plain Node messages. Visit
+            // only those messages here; keep dense classification batched.
+            for group in block.groups() {
+                for node in group.nodes() {
+                    let lat = node.decimicro_lat();
+                    let lon = node.decimicro_lon();
+                    for (region, &(min_lat, max_lat, min_lon, max_lon)) in bboxes.iter().enumerate()
+                    {
+                        if lat >= min_lat && lat <= max_lat && lon >= min_lon && lon <= max_lon {
+                            scratch[region].push(node.id());
+                        }
+                    }
+                }
+            }
             scratch.iter_mut().map(std::mem::take).collect::<Vec<_>>()
         };
         let worker_init = || {

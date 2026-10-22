@@ -1735,3 +1735,61 @@ fn a_lying_indexdata_bbox_does_not_smuggle_nodes_through() {
         "stderr:\n{stderr}"
     );
 }
+
+#[test]
+fn multi_bbox_classifies_plain_nodes_with_and_without_passthrough_candidates() {
+    let dir = tempfile::tempdir_in(".").expect("project tempdir");
+    let input = dir.path().join("plain.osm.pbf");
+    let mut writer = PbfWriter::new(
+        std::fs::File::create(&input).expect("create input"),
+        Compression::default(),
+    );
+    writer
+        .write_header(
+            &block_builder::HeaderBuilder::new()
+                .sorted()
+                .build()
+                .expect("header"),
+        )
+        .expect("write header");
+    // Empty string-table entry, then two plain Node messages:
+    // (id, lat, lon) = (1, 10, 20), (2, 30, 40), default granularity.
+    let block = [
+        10, 2, 10, 0, 18, 16, 10, 6, 8, 2, 64, 20, 72, 40, 10, 6, 8, 4, 64, 60, 72, 80,
+    ];
+    writer
+        .write_primitive_block(&block)
+        .expect("write plain nodes");
+    writer.flush().expect("flush");
+    drop(writer);
+    let single = dir.path().join("single.osm.pbf");
+    CliInvoker::new()
+        .args(["extract", "--simple", "--bbox=-1,-1,1,1", "--force"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&single)
+        .assert_success();
+    assert_eq!(node_ids(&read_all_elements(&single)), vec![1, 2]);
+    for (name, bbox, expected) in [
+        ("contained", "[-1,-1,1,1]", vec![1, 2]),
+        ("partial", "[0,0,0.0000025,0.0000025]", vec![1]),
+    ] {
+        let config = dir.path().join(format!("{name}.json"));
+        let a = format!("{name}-a.osm.pbf");
+        let b = format!("{name}-b.osm.pbf");
+        let json = format!(
+            r#"{{"directory":"{}","extracts":[{{"output":"{a}","bbox":{bbox}}},{{"output":"{b}","bbox":[-1,-1,1,1]}}]}}"#,
+            dir.path()
+                .canonicalize()
+                .expect("absolute directory")
+                .display(),
+        );
+        std::fs::write(&config, json).expect("config");
+        run_extract_multi(&input, &config, Strategy::Simple);
+        assert_eq!(node_ids(&read_all_elements(&dir.path().join(a))), expected);
+        assert_eq!(
+            node_ids(&read_all_elements(&dir.path().join(b))),
+            vec![1, 2]
+        );
+    }
+}

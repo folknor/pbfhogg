@@ -605,10 +605,10 @@ impl IdSet {
     /// plus one chunk of rounding.
     ///
     /// `ids_per_byte` is the caller's, because what happens to an ID above
-    /// the bound differs: renumber and the geocode builder insert it after
-    /// their parallel pass, so their factor trades serial overflow work
-    /// against memory; `check` reports it as an input property and adds a
-    /// per-kind floor on top. A negative claim is returned unchanged, and
+    /// the bound differs: renumber, the geocode builder and `check` insert
+    /// observed positive IDs after their parallel pass, so their factor trades
+    /// serial overflow work against memory; `check` also adds a per-kind
+    /// allocation floor. A negative claim is returned unchanged, and
     /// `pre_allocate` treats it as "nothing to allocate".
     pub(crate) fn file_bounded_max_id(claimed_max: i64, file_len: u64, ids_per_byte: u64) -> i64 {
         let by_size = i64::try_from(file_len.saturating_mul(ids_per_byte)).unwrap_or(i64::MAX);

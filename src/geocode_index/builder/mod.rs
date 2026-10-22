@@ -130,7 +130,8 @@ pub struct BuildStats {
     pub interp_ways: u64,
     pub admin_polygons: u64,
     /// Relations that produced no polygon because their boundary geometry was
-    /// missing, unclosed, or degenerated during simplification.
+    /// missing, unclosed, or degenerated during simplification, or because
+    /// ring assembly exceeded its search budget (reported as a warning).
     pub dropped_admin_relations: u64,
     pub fine_cells: u64,
     pub coarse_cells: u64,
@@ -482,8 +483,9 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
 
     // Ring assembly + simplification
     crate::debug::emit_marker("GEOCODE_PASS2_ADMIN_ASSEMBLY_START");
-    let (admin_polygons, dropped_admin_relations) =
+    let (admin_polygons, dropped_admin) =
         admin::assemble_admin_polygons(&admin_relations, &way_geom, config, &host.executor);
+    let dropped_admin_relations = dropped_admin.total;
     drop(way_geom);
     crate::host::diag!(
         host.diagnostics,
@@ -498,6 +500,16 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
         "geocode.pass2.admin_dropped",
         "  {dropped_admin_relations} admin relations dropped"
     );
+    if dropped_admin.over_budget > 0 {
+        crate::host::diag!(
+            host.diagnostics,
+            Warning,
+            "geocode.pass2.admin_ring_budget",
+            "  WARNING: {} admin relations refused: ring assembly exceeded its search budget \
+             (counted among the dropped relations above)",
+            dropped_admin.over_budget
+        );
+    }
     crate::debug::emit_marker("GEOCODE_PASS2_ADMIN_ASSEMBLY_END");
     // Deliberately a conjunction, not a disjunction. An admin-only index (a
     // boundaries extract with no addressable content) and an

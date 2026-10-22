@@ -389,11 +389,12 @@ pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<
                 payload = Some((field, slice));
             }
             blob_fields::RAW_SIZE => {
-                // raw_size: int32
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    raw_size = Some(cursor.read_varint()? as i32);
-                }
+                // Validate before narrowing so 2^32 + N cannot alias N and
+                // pass the decompressed-length check as an honest size.
+                raw_size = Some(super::wire::read_int32(
+                    &mut cursor,
+                    "Blob.raw_size exceeds int32",
+                )?);
             }
             _ => cursor.skip_field(wire_type)?,
         }
@@ -713,6 +714,71 @@ mod tests {
         let mut out = Vec::new();
         super::decompress_blob_raw(&single, &mut out).expect("a single-payload blob still decodes");
         assert_eq!(out, b"from-raw");
+    }
+
+    /// Pin int32 bounds in both envelope parsers, in either field order.
+    #[test]
+    #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+    fn raw_size_is_validated_before_narrowing() {
+        let payload = b"size";
+        let honest = payload.len() as u64;
+        for declared in [
+            honest,
+            0,
+            i32::MAX as u64,
+            i32::MAX as u64 + 1,
+            (1_u64 << 32) + honest,
+            (1_u64 << 32) + i32::MAX as u64,
+            u64::MAX, // Sign-extended -1 is a legal int32, but a wrong size.
+            i32::MIN as i64 as u64,
+        ] {
+            let in_range = i32::try_from(declared as i64).is_ok();
+            let mut size_field = vec![0x10];
+            let mut value = declared;
+            loop {
+                let byte = (value & 0x7f) as u8;
+                value >>= 7;
+                size_field.push(byte | if value == 0 { 0 } else { 0x80 });
+                if value == 0 {
+                    break;
+                }
+            }
+            for size_first in [false, true] {
+                let mut encoded = encode_blob(&[(1, payload)]);
+                if size_first {
+                    encoded.splice(0..0, size_field.iter().copied());
+                } else {
+                    encoded.extend_from_slice(&size_field);
+                }
+                let parsed = WireBlob::parse_slice(&encoded);
+                if in_range {
+                    assert_eq!(parsed.unwrap().raw_size, Some(declared as i32));
+                } else {
+                    assert!(
+                        parsed
+                            .unwrap_err()
+                            .to_string()
+                            .contains("Blob.raw_size exceeds int32")
+                    );
+                }
+                let mut out = Vec::new();
+                let decoded = super::decompress_blob_raw(&encoded, &mut out);
+                if declared == honest {
+                    decoded.unwrap();
+                    assert_eq!(out, payload);
+                    continue;
+                }
+                let expected = if in_range {
+                    "raw_size disagrees"
+                } else {
+                    "Blob.raw_size exceeds int32"
+                };
+                assert!(decoded.unwrap_err().to_string().contains(expected));
+                if !in_range {
+                    assert!(out.is_empty());
+                }
+            }
+        }
     }
 
     /// A `raw_size` that disagrees with the payload actually produced is

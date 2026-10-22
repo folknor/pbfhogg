@@ -223,12 +223,52 @@ pub struct HeaderOverrides {
     pub replication_base_url: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+enum HeaderOverrideKind {
+    Timestamp,
+    SequenceNumber,
+    BaseUrl,
+}
+
+#[derive(Clone, Copy)]
+struct HeaderOverrideKey {
+    kind: HeaderOverrideKind,
+    name: &'static str,
+}
+
+impl HeaderOverrideKey {
+    const ALL: [Self; 3] = [
+        Self {
+            kind: HeaderOverrideKind::Timestamp,
+            name: "osmosis_replication_timestamp",
+        },
+        Self {
+            kind: HeaderOverrideKind::SequenceNumber,
+            name: "osmosis_replication_sequence_number",
+        },
+        Self {
+            kind: HeaderOverrideKind::BaseUrl,
+            name: "osmosis_replication_base_url",
+        },
+    ];
+
+    fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|key| key.name == value)
+    }
+
+    fn help_list() -> String {
+        Self::ALL
+            .into_iter()
+            .map(|key| key.name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 impl HeaderOverrides {
     /// Parse CLI arguments into header overrides.
     ///
-    /// `output_headers` entries have the format `key=value`. Supported keys:
-    /// `osmosis_replication_timestamp`, `osmosis_replication_sequence_number`,
-    /// `osmosis_replication_base_url`.
+    /// `output_headers` entries have the format `key=value`.
     pub fn parse(generator: Option<String>, output_headers: &[String]) -> Result<Self> {
         let mut ov = HeaderOverrides {
             generator,
@@ -238,24 +278,39 @@ impl HeaderOverrides {
             let (key, value) = entry.split_once('=').ok_or_else(|| {
                 format!("invalid --output-header format: '{entry}' (expected key=value)")
             })?;
-            match key {
-                "osmosis_replication_timestamp" => {
-                    ov.replication_timestamp = Some(value.parse::<i64>().map_err(|_| {
-                        format!("invalid osmosis_replication_timestamp: '{value}'")
-                    })?);
+            let key = HeaderOverrideKey::parse(key)
+                .ok_or_else(|| format!("unknown --output-header key: '{key}'"))?;
+            match key.kind {
+                HeaderOverrideKind::Timestamp => {
+                    ov.replication_timestamp = Some(
+                        value
+                            .parse::<i64>()
+                            .map_err(|_| format!("invalid {}: '{value}'", key.name))?,
+                    );
                 }
-                "osmosis_replication_sequence_number" => {
-                    ov.replication_sequence_number = Some(value.parse::<i64>().map_err(|_| {
-                        format!("invalid osmosis_replication_sequence_number: '{value}'")
-                    })?);
+                HeaderOverrideKind::SequenceNumber => {
+                    ov.replication_sequence_number = Some(
+                        value
+                            .parse::<i64>()
+                            .map_err(|_| format!("invalid {}: '{value}'", key.name))?,
+                    );
                 }
-                "osmosis_replication_base_url" => {
+                HeaderOverrideKind::BaseUrl => {
                     ov.replication_base_url = Some(value.to_string());
                 }
-                _ => return Err(format!("unknown --output-header key: '{key}'").into()),
             }
         }
         Ok(ov)
+    }
+
+    /// Return the generated long help for the supported output-header keys.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn output_header_help() -> String {
+        format!(
+            "Set output header fields (repeatable, format: key=value). Supported keys: {}.",
+            HeaderOverrideKey::help_list()
+        )
     }
 
     /// Returns `true` when no header override was supplied, i.e. the user

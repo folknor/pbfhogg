@@ -70,12 +70,12 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 | `--blocks [N]` | Show per-block distribution stats and optional block listing (N limits to first/last N blocks) |
 | `--id-ranges` | Show min/max element IDs per type and monotonicity |
 | `--locations` | Show locations-on-ways diagnostics |
-| `--anomalies` | Show only anomalous blocks (<50% or >150% of median, plus mixed blocks) |
+| `--anomalies` | Show blocks outside inspect's per-type median thresholds, plus mixed blocks |
 | `-e, --extended` | Extended scan: timestamp range, data bbox, metadata coverage, ordering |
-| `-g, --get <KEY>` | Get a single value by key path (e.g. `header.bbox`, `data.timestamp.first`). Not combinable with `--json`. |
+| `-g, --get <KEY>` | Get a single value by key path (e.g. `header.bbox`, `data.timestamp.first`). Data and metadata paths enable extended stats automatically. Not combinable with `--json`. |
 | `--json` | Machine-readable JSON output. Not combinable with `--nodes` (node stats have no JSON form) or `--get`. |
 | `--show <TYPE_ID>` | Display a single element by ID (e.g. `n123` or `node/123`). Also accepts `w456` / `way/456` and `r789` / `relation/789`, including signed IDs. Uses indexdata to skip non-matching blobs, early exit on sorted PBFs. **A mode of its own**: mutually exclusive with every other `inspect` flag (`--indexed`, `--nodes`, `-j`, `--blocks`, `--id-ranges`, `--locations`, `--anomalies`, `-e`, `--get`, `--json`, `--force`), which it used to accept and discard. |
-| `--distrust-metadata` | Decode every blob instead of reporting counts, ID ranges and per-block stats out of the blobs' own `indexdata`. Nothing validates indexdata against the payload it describes, so on a file you are inspecting *because* you suspect it, the default fast path reports the file's claims rather than its contents. Applies to the scanning report only: rejected alongside `--indexed`, `--nodes` and a `header.*` `--get` key, none of which consult indexdata contents. |
+| `--distrust-metadata` | Decode every blob instead of reporting counts, ID ranges and per-block stats out of the blobs' own `indexdata`. Nothing validates indexdata against the payload it describes, so on a file you are inspecting *because* you suspect it, the default fast path reports the file's claims rather than its contents. Applies to the scanning report only: rejected alongside `--indexed`, `--nodes` and a `file.*` or `header.*` `--get` key, none of which consult indexdata contents. |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--force` | Proceed even if input lacks indexdata. **Requires `--nodes`**: it is threaded only into the node-stats scan, so passing it to another mode is an error rather than a no-op. |
 
@@ -198,8 +198,9 @@ Two checks are containment rather than equality:
 
 Exit `1` means mismatches were found, exit `2` that the check could not run.
 
-The ref check reports element IDs it could not track - negative IDs, or IDs
-above the range it sized from the file's own indexdata - as a separate
+The ref check reports element IDs it could not track - negative IDs; a
+positive ID above the range it sized from the file's own indexdata is still
+tracked, inserted after the parallel phase - as a separate
 `Untrackable element IDs` line and as `untrackable_node_ids` /
 `untrackable_way_ids` / `untrackable_relation_ids` under `--json`. References
 to such an element are counted as missing, so a non-zero count means the
@@ -677,12 +678,12 @@ pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
 | Flag | Description |
 |------|-------------|
 | `--output-dir <DIR>` | Output directory for index files |
-| `--street-level <N>` | S2 cell level for streets/addresses, 0-19 [default: 17] |
-| `--coarse-level <N>` | Fallback cell level for rural areas, 0-19 [default: 14] |
-| `--admin-level <N>` | S2 cell level for admin boundaries, 0-10 [default: 10] |
-| `--max-admin-vertices <N>` | Douglas-Peucker cap for local admin polygons; levels 5, 4, 3, and 2 retain up to 2x, 4x, 8x, and 16x this value [default: 500] |
-| `--search-radius <M>` | Fine-level max search distance in meters [default: 75] |
-| `--coarse-search-radius <M>` | Coarse-level max search distance in meters [default: 1000] |
+| `--street-level <N>` | S2 cell level for streets/addresses; must exceed `--coarse-level`, within the builder's segment-cover limit. Default comes from the builder configuration |
+| `--coarse-level <N>` | Fallback cell level for rural areas; must be below `--street-level`, within the builder's segment-cover limit. Default comes from the builder configuration |
+| `--admin-level <N>` | S2 cell level for admin boundaries, within the builder's work limit. Default comes from the builder configuration |
+| `--max-admin-vertices <N>` | Douglas-Peucker cap for local admin polygons; levels 5, 4, 3, and 2 retain up to 2x, 4x, 8x, and 16x this value. Default comes from the builder configuration |
+| `--search-radius <M>` | Fine-level max search distance in meters. Default comes from the builder configuration |
+| `--coarse-search-radius <M>` | Coarse-level max search distance in meters. Default comes from the builder configuration |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--overwrite` | Replace an existing index in `--output-dir` after the new build succeeds. Does not bypass the indexdata requirement |
 | `--allow-unindexed` | Accept input without blob-level indexdata (slower fallback path). Does not replace an existing index |
@@ -703,16 +704,14 @@ version.
 All three cell levels are validated before any input is read, and a violation
 exits 2 with an explicit message:
 
-- Street and coarse levels must be in `0..=19`. The upper bound is 19, not the
-  S2 format limit of 30, because cell covering samples each way segment at a
-  fraction of the cell width for the level: the per-segment sample count
-  doubles with every level, and past 19 a single long or antimeridian-crossing
-  segment exceeds the builder's per-segment budget of 2^24 samples.
-- Admin level must be in `0..=10`. Admin indexing flood-fills interior cells,
-  so its work and memory grow with the number of cells in a polygon. Level 10
-  caps the unique cells considered for one polygon at the whole sphere's
-  6,291,456 S2 cells; each higher level multiplies that bound by four. The
-  default remains at the maximum accepted admin level.
+- Street and coarse levels must remain within the builder's segment-cover
+  budget. Cell covering samples each way segment at a fraction of the cell
+  width, so the sample count doubles at each level. The builder's rejection
+  message reports its current upper bound and explains the budget.
+- Admin level must remain within the builder's polygon flood-fill budget.
+  The number of cells considered grows by a factor of four at each level. The
+  builder's rejection message reports its current upper bound and explains the
+  budget.
 - `--coarse-level` must be strictly less than `--street-level`. The coarse
   index is the fallback for rural queries and must be the coarser of the two.
 

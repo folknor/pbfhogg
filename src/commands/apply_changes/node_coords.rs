@@ -2,18 +2,18 @@
 //!
 //! Under `--locations-on-ways` every base node blob is decompressed so the
 //! worker pool can collect the coordinates OSC ways reference. This module
-//! is that extractor. It reads the decompressed `PrimitiveBlock` bytes
+//! is apply-changes' entry point to that extractor, which is the shared node
+//! scanner in `crate::scan::node`. It reads the decompressed `PrimitiveBlock` bytes
 //! directly (no string table, no `PrimitiveBlock` construction) and covers
 //! both node encodings the format allows:
 //!
-//! - **DenseNodes**: the DenseNodes message of each group, through
-//!   `WireGroup::dense` - the accessor the element iterator uses, which
-//!   refuses a group that repeats it.
+//! - **DenseNodes**: at most one message per group, with repeated messages
+//!   refused just as by `WireGroup::dense`.
 //! - **Plain `Node` messages**: every `Node` of each group, through
-//!   `WireGroup::nodes` - again the element iterator's accessor.
+//!   `WireGroup::nodes`.
 //!
-//! Using the iterator's own accessors, in its order (a group's dense nodes,
-//! then its plain nodes), makes the extracted node set the same set the
+//! Reading in the element iterator's order (a group's dense nodes, then its
+//! plain nodes) makes the extracted node set the same set the
 //! rewrite path sees and writes, and gives a duplicated id within one blob
 //! the same winner the iterator would.
 //!
@@ -30,128 +30,14 @@
 //! caught by the strict `PrimitiveBlock` parse that always follows this
 //! extraction on the same bytes.
 //!
-//! The wire scanner in `crate::scan::node` used to serve this role. It reads
-//! only DenseNodes and errors on plain `Node` messages; at the time it also
-//! stopped reading a group at its DenseNodes message, so a plain `Node` after
-//! it in the same group was skipped without an error, and apply-changes
-//! swallowed its errors, dropping every coordinate in such a blob without a
-//! word.
-
-use crate::error::{Error, Result, new_wire_error};
-use crate::read::wire::{
-    Cursor, PackedSint64Iter, WIRE_LEN, WIRE_VARINT, WireDenseNodes, WireGroup, WireNode,
-};
-
-/// Upper bound on `PrimitiveBlock.granularity`: one degree (1e9
-/// nanodegrees) per raw unit. Nothing real comes close, and the bound keeps
-/// `granularity * raw` inside `i64` for any plausible delta.
-const MAX_GRANULARITY: i64 = 1_000_000_000;
-
-fn overflow_err() -> Error {
-    new_wire_error(
-        "node coordinate arithmetic overflowed i64; the blob's granularity, \
-         offset, or coordinate values are corrupt",
-    )
-}
-
-/// `(offset + granularity * raw) / 100`, checked, narrowed to the
-/// decimicrodegree `i32` the rest of the codebase carries.
-fn decimicro(offset: i64, granularity: i64, raw: i64) -> Result<i32> {
-    let nano = granularity
-        .checked_mul(raw)
-        .and_then(|scaled| offset.checked_add(scaled))
-        .ok_or_else(overflow_err)?;
-    i32::try_from(nano / 100).map_err(|_| {
-        new_wire_error(
-            "node coordinate does not fit in an i32 decimicrodegree; the blob's \
-             granularity, offset, or coordinate values are corrupt",
-        )
-    })
-}
-
-fn checked_granularity(raw: u64) -> Result<i64> {
-    let granularity = i64::try_from(raw).ok().filter(|g| *g > 0).ok_or_else(|| {
-        new_wire_error(
-            "PrimitiveBlock.granularity must be a positive int32; got a value that \
-             is zero, negative, or too large",
-        )
-    })?;
-    if granularity > MAX_GRANULARITY {
-        return Err(new_wire_error(
-            "PrimitiveBlock.granularity exceeds one degree per unit (1e9 nanodegrees); \
-             refusing to decode coordinates from it",
-        ));
-    }
-    Ok(granularity)
-}
-
-/// Decode `(id, lat, lon)` for every node in a decompressed
-/// `PrimitiveBlock`, dense and plain, and hand each one to `sink`.
-///
-/// `groups` is caller-owned scratch reused across blobs. Top-level block
-/// fields may follow the groups on the wire, so the groups are located
-/// first and decoded once granularity and offsets are known.
+/// Use the shared scanner so all node passes accept both PBF encodings and
+/// apply the same checked coordinate scaling.
 pub(super) fn extract_node_coords<F: FnMut(i64, i32, i32)>(
     decompressed: &[u8],
     groups: &mut Vec<(usize, usize)>,
-    mut sink: F,
-) -> Result<()> {
-    let mut cursor = Cursor::new(decompressed);
-    let mut granularity: i64 = 100;
-    let mut lat_offset: i64 = 0;
-    let mut lon_offset: i64 = 0;
-    groups.clear();
-
-    while let Some((field, wire_type)) = cursor.read_tag()? {
-        match (field, wire_type) {
-            (2, WIRE_LEN) => {
-                let data = cursor.read_len_delimited()?;
-                let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
-                groups.push((offset, data.len()));
-            }
-            (17, WIRE_VARINT) => granularity = checked_granularity(cursor.read_varint()?)?,
-            (19, WIRE_VARINT) => lat_offset = cursor.read_varint_i64()?,
-            (20, WIRE_VARINT) => lon_offset = cursor.read_varint_i64()?,
-            _ => cursor.skip_field(wire_type)?,
-        }
-    }
-
-    for &(offset, len) in groups.as_slice() {
-        let group = WireGroup::new(&decompressed[offset..offset + len]);
-
-        if let Some(dense_data) = group.dense()? {
-            let dense = WireDenseNodes::parse(dense_data)?;
-            let mut ids = PackedSint64Iter::new(dense.id_data);
-            let mut lats = PackedSint64Iter::new(dense.lat_data);
-            let mut lons = PackedSint64Iter::new(dense.lon_data);
-            let mut id: i64 = 0;
-            let mut lat: i64 = 0;
-            let mut lon: i64 = 0;
-            while let (Some(did), Some(dlat), Some(dlon)) = (ids.next(), lats.next(), lons.next()) {
-                // Modulo 2^64, as the decoder and writer sum deltas; see the
-                // module docs for why a wrapped coordinate is still refused.
-                id = id.wrapping_add(did);
-                lat = lat.wrapping_add(dlat);
-                lon = lon.wrapping_add(dlon);
-                sink(
-                    id,
-                    decimicro(lat_offset, granularity, lat)?,
-                    decimicro(lon_offset, granularity, lon)?,
-                );
-            }
-        }
-
-        for data in group.nodes() {
-            let node = WireNode::parse(data)?;
-            sink(
-                node.id,
-                decimicro(lat_offset, granularity, node.lat)?,
-                decimicro(lon_offset, granularity, node.lon)?,
-            );
-        }
-    }
-
-    Ok(())
+    sink: F,
+) -> crate::error::Result<()> {
+    crate::scan::node::extract_node_coords(decompressed, groups, sink)
 }
 
 #[cfg(test)]

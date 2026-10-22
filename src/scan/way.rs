@@ -26,6 +26,40 @@ pub(crate) struct WayGeocodeFlags {
     pub(crate) is_interp: bool,
 }
 
+/// Shared vocabulary for the wire scanner and decoded-way classifier.
+pub(crate) const GEOCODE_EXCLUDED_HIGHWAYS: [&[u8]; 9] = [
+    b"footway",
+    b"path",
+    b"track",
+    b"steps",
+    b"cycleway",
+    b"service",
+    b"pedestrian",
+    b"bridleway",
+    b"construction",
+];
+
+impl WayGeocodeFlags {
+    /// Both passes supply presence bits; only the representation-specific
+    /// highway exclusion lookup differs (string bytes versus table indices).
+    #[allow(clippy::fn_params_excessive_bools)]
+    pub(crate) fn classify(
+        highway: bool,
+        name: bool,
+        excluded: bool,
+        building: bool,
+        housenumber: bool,
+        street: bool,
+        interpolation: bool,
+    ) -> Self {
+        Self {
+            is_street: highway && name && !excluded,
+            is_building_addr: building && housenumber && street,
+            is_interp: interpolation && street,
+        }
+    }
+}
+
 /// Geocode-relevant tag keys + the values that exclude a way from the
 /// street set. Pre-encode once per caller and reuse across blobs.
 pub(crate) struct GeocodeTagLiterals<'a> {
@@ -47,17 +81,7 @@ impl GeocodeTagLiterals<'_> {
             k_addr_street: b"addr:street",
             k_building: b"building",
             k_addr_interpolation: b"addr:interpolation",
-            excluded_highway_values: &[
-                b"footway",
-                b"path",
-                b"track",
-                b"steps",
-                b"cycleway",
-                b"service",
-                b"pedestrian",
-                b"bridleway",
-                b"construction",
-            ],
+            excluded_highway_values: &GEOCODE_EXCLUDED_HIGHWAYS,
         }
     }
 }
@@ -79,7 +103,7 @@ struct ResolvedTagIndices {
     // is excluded from streets. Small fixed size to avoid allocating
     // per-blob; ExcludedHighwaysMask has 9 slots matching
     // `GeocodeTagLiterals::excluded_highway_values`.
-    excluded_highway_indices: [Option<u32>; 9],
+    excluded_highway_indices: [Option<u32>; GEOCODE_EXCLUDED_HIGHWAYS.len()],
 }
 
 /// Extract way IDs and their node refs from decompressed PrimitiveBlock bytes.
@@ -389,17 +413,24 @@ fn parse_way_tagged_refs(
         }
     }
 
-    let is_street = has_highway && has_name && {
-        // Not in any excluded highway value's index set.
-        !resolved.excluded_highway_indices.iter().any(|&maybe_idx| {
+    let excluded = {
+        // Match an excluded highway value's string-table index.
+        resolved.excluded_highway_indices.iter().any(|&maybe_idx| {
             match (maybe_idx, highway_val_idx) {
                 (Some(excl), Some(val)) => excl == val,
                 _ => false,
             }
         })
     };
-    let is_building_addr = has_building && has_addr_hn && has_addr_st;
-    let is_interp = has_addr_interp && has_addr_st;
+    let flags = WayGeocodeFlags::classify(
+        has_highway,
+        has_name,
+        excluded,
+        has_building,
+        has_addr_hn,
+        has_addr_st,
+        has_addr_interp,
+    );
 
     // Always decode refs - the caller's admin-way membership test sits
     // outside this function and needs every way's refs when the id
@@ -410,15 +441,7 @@ fn parse_way_tagged_refs(
         accumulate_refs(rd, refs_buf);
     }
 
-    callback(
-        way_id,
-        WayGeocodeFlags {
-            is_street,
-            is_building_addr,
-            is_interp,
-        },
-        refs_buf,
-    );
+    callback(way_id, flags, refs_buf);
 
     Ok(())
 }
@@ -427,6 +450,63 @@ fn parse_way_tagged_refs(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn geocode_scanner_matches_decoded_tag_policy() {
+        // All presence combinations, all exclusions, and two admitted values.
+        // Build real blobs so string-table resolution is part of the check.
+        for highway in GEOCODE_EXCLUDED_HIGHWAYS
+            .into_iter()
+            .chain([b"residential".as_slice(), b"".as_slice()])
+        {
+            let highway = std::str::from_utf8(highway).expect("ASCII policy");
+            for bits in 0u8..64 {
+                let fields = [
+                    ("highway", highway),
+                    ("name", ""),
+                    ("building", "no"),
+                    ("addr:housenumber", ""),
+                    ("addr:street", ""),
+                    ("addr:interpolation", "even"),
+                ];
+                let tags: Vec<_> = fields
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(index, _)| bits & (1 << index) != 0)
+                    .map(|(_, tag)| tag)
+                    .collect();
+                let mut builder = crate::block_builder::BlockBuilder::new();
+                builder.add_way(1, tags.iter().copied(), &[7, 9], None);
+                let blob = builder.take().expect("encode").expect("way");
+                let expected = WayGeocodeFlags::classify(
+                    bits & 1 != 0,
+                    bits & 2 != 0,
+                    GEOCODE_EXCLUDED_HIGHWAYS.contains(&highway.as_bytes()),
+                    bits & 4 != 0,
+                    bits & 8 != 0,
+                    bits & 16 != 0,
+                    bits & 32 != 0,
+                );
+                let mut seen = 0;
+                scan_way_geocode_tagged_refs(
+                    blob,
+                    &GeocodeTagLiterals::standard(),
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                    |id, flags, refs| {
+                        seen += 1;
+                        assert_eq!(id, 1);
+                        assert_eq!(refs, [7, 9]);
+                        assert_eq!(flags.is_street, expected.is_street);
+                        assert_eq!(flags.is_building_addr, expected.is_building_addr);
+                        assert_eq!(flags.is_interp, expected.is_interp);
+                    },
+                )
+                .expect("scan");
+                assert_eq!(seen, 1);
+            }
+        }
+    }
 
     /// Deltas `MIN` then `-1` (zigzag `u64::MAX`, then 1): refs `MIN`, `MAX`.
     #[test]

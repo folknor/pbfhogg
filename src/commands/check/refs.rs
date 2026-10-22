@@ -36,18 +36,9 @@ pub struct RefCheckResult {
     /// Missing reference occurrences retained for display when `show_ids` is
     /// true. Limited by the shared `max_errors` value unless it is zero.
     pub missing_refs: Vec<MissingRef>,
-    /// Element IDs that could not be entered into the tracking `IdSet` at all -
-    /// negative, or above the bound `id_alloc_bound` allowed for the kind.
-    ///
-    /// These are *not* missing references, but every reference that points at
-    /// one is reported as missing, because the element was never recorded as
-    /// present. Without this counter that over-report is indistinguishable
-    /// from a genuinely dangling reference - the reader has no way to tell
-    /// "your file references a node it does not contain" from "your file
-    /// contains a node this check could not track". `verify_ids` reports the
-    /// identical situation as `IdViolation::IdOutOfRange`; the two commands
-    /// answer the same question, so they say the same thing.
-    ///
+    /// Negative element IDs that cannot be entered into the tracking set.
+    /// Positive IDs above the bounded parallel allocation are inserted after
+    /// workers join and are fully covered by reference checking.
     /// Indexed by kind: nodes, ways, relations.
     pub untrackable_ids: [u64; 3],
 }
@@ -83,8 +74,9 @@ impl RefCheckResult {
 #[derive(Default)]
 struct WayBlobResult {
     way_count: u64,
-    /// Way IDs `way_ids.set_atomic_checked` refused (see `untrackable_ids`).
+    /// Negative way IDs (see `untrackable_ids`).
     untrackable_way_ids: u64,
+    overflow_ids: Vec<i64>,
     way_refs_checked: u64,
     missing_node_refs: Vec<i64>,
     /// Populated only when `show_ids` is true.
@@ -95,8 +87,9 @@ struct WayBlobResult {
 #[derive(Default)]
 struct RelBlobResult {
     relation_count: u64,
-    /// Relation IDs `relation_ids.set_atomic_checked` refused.
+    /// Negative relation IDs.
     untrackable_relation_ids: u64,
+    overflow_ids: Vec<i64>,
     rel_node_members_checked: u64,
     rel_way_members_checked: u64,
     rel_rel_members_deferred: u64,
@@ -253,18 +246,9 @@ pub fn check_refs(
     let (node_schedule, way_schedule, rel_schedule, shared_file, max_ids) =
         build_classify_schedules_split(path, &host.diagnostics)?;
 
-    // IdSets sized from what the file itself reports, floored at the current
-    // OSM ID ceilings so a file whose indexdata understates its range (or
-    // carries none) still gets a sensible allocation. The floors used to be
-    // the whole story, which made the way ceiling of 1.5e9 a time bomb: live
-    // OSM way IDs are already ~1.4e9, and every ID past the ceiling panicked a
-    // worker in `set_atomic`. Population now goes through `set_atomic_checked`,
-    // so an ID outside the range is simply not recorded - refs to it are
-    // reported missing, which over-reports rather than aborting the check.
-    //
-    // `id_alloc_bound` caps the other direction: indexdata is unverified, so a
-    // blob claiming `max_id = i64::MAX` would otherwise turn this sizing hint
-    // into an unbounded allocation before any element is read.
+    // Bound indexdata-driven allocation, then insert observed positive IDs
+    // above that allocation after each parallel phase joins. A regional
+    // extract retains global IDs; its file size is not a validity ceiling.
     let file_len = std::fs::metadata(path).map_or(0, |m| m.len());
     let mut node_ids = IdSet::new();
     node_ids.pre_allocate(super::id_alloc_bound(max_ids[0], NODE_ID_FLOOR, file_len));
@@ -286,6 +270,7 @@ pub fn check_refs(
     // ------------------------------------------------------------------
     // Phase 1 - node scan. Workers populate `node_ids` via `set_atomic`.
     // ------------------------------------------------------------------
+    let mut overflow_ids = Vec::new();
     crate::debug::emit_marker("CHECKREFS_NODES_START");
     {
         let node_ids_ref = &node_ids;
@@ -294,13 +279,10 @@ pub fn check_refs(
             &node_schedule,
             None,
             || (),
-            // `set_atomic_checked` returning false means the ID is outside the
-            // range this IdSet can represent, so the node is never recorded as
-            // present and every way ref pointing at it will be reported
-            // missing. Counting those is what keeps that over-report legible.
-            |block, &mut ()| -> (u64, u64) {
+            |block, &mut ()| -> (u64, u64, Vec<i64>) {
                 let mut count: u64 = 0;
                 let mut untrackable: u64 = 0;
+                let mut overflow = Vec::new();
                 for el in block.elements_skip_metadata() {
                     let id = match el {
                         Element::DenseNode(dn) => dn.id(),
@@ -308,18 +290,26 @@ pub fn check_refs(
                         _ => continue,
                     };
                     if !node_ids_ref.set_atomic_checked(id) {
-                        untrackable += 1;
+                        if id < 0 {
+                            untrackable += 1;
+                        } else {
+                            overflow.push(id);
+                        }
                     }
                     count += 1;
                 }
-                (count, untrackable)
+                (count, untrackable, overflow)
             },
-            |_seq, (count, untrackable)| {
+            |_seq, (count, untrackable, overflow)| {
+                overflow_ids.extend(overflow);
                 result.node_count += count;
                 result.untrackable_ids[0] += untrackable;
             },
             &*host.resources,
         )?;
+    }
+    for id in overflow_ids.drain(..) {
+        node_ids.set(id);
     }
     crate::debug::emit_marker("CHECKREFS_NODES_END");
     // Brokkr stores named counters generically and reports changes in sidecar
@@ -346,7 +336,11 @@ pub fn check_refs(
                     if let Element::Way(w) = el {
                         let wid = w.id();
                         if check_relations && !way_ids_ref.set_atomic_checked(wid) {
-                            r.untrackable_way_ids += 1;
+                            if wid < 0 {
+                                r.untrackable_way_ids += 1;
+                            } else {
+                                r.overflow_ids.push(wid);
+                            }
                         }
                         r.way_count += 1;
                         for nref in w.refs() {
@@ -370,6 +364,7 @@ pub fn check_refs(
                 r
             },
             |_seq, r| {
+                overflow_ids.extend(r.overflow_ids);
                 result.way_count += r.way_count;
                 result.untrackable_ids[1] += r.untrackable_way_ids;
                 way_refs_checked += r.way_refs_checked;
@@ -380,6 +375,9 @@ pub fn check_refs(
             },
             &*host.resources,
         )?;
+    }
+    for id in overflow_ids.drain(..) {
+        way_ids.set(id);
     }
     crate::debug::emit_marker("CHECKREFS_WAYS_END");
     // Brokkr stores named counters generically and reports changes in sidecar
@@ -413,7 +411,11 @@ pub fn check_refs(
                         if let Element::Relation(rel) = el {
                             let rid = rel.id();
                             if !relation_ids_ref.set_atomic_checked(rid) {
-                                r.untrackable_relation_ids += 1;
+                                if rid < 0 {
+                                    r.untrackable_relation_ids += 1;
+                                } else {
+                                    r.overflow_ids.push(rid);
+                                }
                             }
                             r.relation_count += 1;
                             for mem in rel.members() {
@@ -474,6 +476,7 @@ pub fn check_refs(
                     r
                 },
                 |_seq, r| {
+                    overflow_ids.extend(r.overflow_ids);
                     result.relation_count += r.relation_count;
                     result.untrackable_ids[2] += r.untrackable_relation_ids;
                     rel_node_members_checked += r.rel_node_members_checked;
@@ -489,6 +492,9 @@ pub fn check_refs(
                 },
                 &*host.resources,
             )?;
+        }
+        for id in overflow_ids.drain(..) {
+            relation_ids.set(id);
         }
         crate::debug::emit_marker("CHECKREFS_RELATIONS_END");
         // Brokkr stores named counters generically and reports changes in sidecar

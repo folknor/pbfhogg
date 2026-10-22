@@ -18,20 +18,7 @@ mod smart;
 // Bounding box
 // ---------------------------------------------------------------------------
 
-/// A geographic bounding box in WGS84 degrees.
-pub struct Bbox {
-    pub min_lon: f64,
-    pub min_lat: f64,
-    pub max_lon: f64,
-    pub max_lat: f64,
-}
-
-impl Bbox {
-    /// Returns `true` if the point (lat, lon) in degrees falls within this bbox.
-    pub(crate) fn contains(&self, lat: f64, lon: f64) -> bool {
-        lat >= self.min_lat && lat <= self.max_lat && lon >= self.min_lon && lon <= self.max_lon
-    }
-}
+pub use crate::geo::Bbox;
 
 /// Parse a bbox string in osmium convention: `minlon,minlat,maxlon,maxlat`.
 // String errors are intentional for CLI arg parsing - the bad input value is more
@@ -62,38 +49,7 @@ pub fn parse_bbox(s: &str) -> Result<Bbox> {
         .parse()
         .map_err(|_| format!("invalid max_lat: {}", parts[3]))?;
 
-    // Domain check before the ordering check: 200,0,300,1 satisfies
-    // min < max on both axes and is still not a place. `BboxInt::from_bbox`
-    // used to multiply by 1e7 and cast to i32 (Rust float-to-int casts
-    // saturate rather than wrap), so an out-of-domain bbox reached the
-    // extract as `i32::MAX` bounds and produced an empty output with exit
-    // code 0 - a wrong answer reported as a successful run. Today the
-    // conversion clamps instead of saturating, but an out-of-domain bbox is
-    // still not a place and is still refused here.
-    //
-    // Latitude and longitude are checked separately, and separately from
-    // representability: they have different domains, and a value can be a
-    // perfectly good f64 while being no latitude at all.
-    for (name, value) in [("min_lat", min_lat), ("max_lat", max_lat)] {
-        crate::coord_pack::validate_lat(name, value)?;
-    }
-    for (name, value) in [("min_lon", min_lon), ("max_lon", max_lon)] {
-        crate::coord_pack::validate_lon(name, value)?;
-    }
-
-    if min_lon >= max_lon {
-        return Err(format!("min_lon ({min_lon}) must be less than max_lon ({max_lon})").into());
-    }
-    if min_lat >= max_lat {
-        return Err(format!("min_lat ({min_lat}) must be less than max_lat ({max_lat})").into());
-    }
-
-    Ok(Bbox {
-        min_lon,
-        min_lat,
-        max_lon,
-        max_lat,
-    })
+    Bbox::try_new(min_lon, min_lat, max_lon, max_lat)
 }
 
 // ---------------------------------------------------------------------------
@@ -176,15 +132,12 @@ fn polygon_contains(polygons: &[PolygonRings], px: f64, py: f64) -> bool {
 }
 
 /// Check if a single polygon (exterior + holes) contains the point.
-/// Calls geo primitives directly to avoid per-point allocation.
+/// Borrows hole slices without allocating a temporary list. Crossing rings
+/// still unwrap per query: these public vectors can be mutated by callers, so
+/// a parse-time cache would become stale. Prepared geometry needs an immutable
+/// owning API before it can safely replace this representation.
 fn polygon_rings_contains(poly: &PolygonRings, px: f64, py: f64) -> bool {
-    if !crate::geo::point_in_ring_with_antimeridian(px, py, &poly.exterior) {
-        return false;
-    }
-    !poly
-        .holes
-        .iter()
-        .any(|hole| crate::geo::point_in_ring_with_antimeridian(px, py, hole))
+    crate::geo::point_in_polygon_rings(px, py, &poly.exterior, poly.holes.iter().map(Vec::as_slice))
 }
 
 // Delegate to geo module; used by tests and bbox_from_polygons.
@@ -378,6 +331,10 @@ fn bbox_from_polygons(polygons: &[PolygonRings]) -> Result<Bbox> {
         return Err("no exterior ring vertices found for bounding box".into());
     }
 
+    // Region::bbox and blob scheduling accept one ordinary interval. A crossing
+    // polygon needs both longitude lobes; widening is conservative and loses
+    // skip efficiency, not points. Two boxes require a union-aware scheduling
+    // interface, including multi-extract, rather than narrowing this interval.
     if crosses_antimeridian {
         min_lon = -180.0;
         max_lon = 180.0;
@@ -565,7 +522,7 @@ fn parse_extract_geometry(
         let max_lat = arr[3]
             .as_f64()
             .ok_or_else(|| format!("extract[{index}] bbox[3] must be a number"))?;
-        return parse_bbox(&format!("{min_lon},{min_lat},{max_lon},{max_lat}"))
+        return Bbox::try_new(min_lon, min_lat, max_lon, max_lat)
             .map(Region::Bbox)
             .map_err(|e| format!("extract[{index}] bbox: {e}").into());
     }

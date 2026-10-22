@@ -169,8 +169,11 @@ impl FromStr for IndexType {
             "sparse" => Ok(Self::Sparse),
             "external" => Ok(Self::External),
             "auto" => Ok(Self::Auto),
-            // No CLI flag name here - this is a library parse error and
-            // the CLI carries its own copy of the advice.
+            // Keep this rejected spelling in the public parser. Removing it
+            // changes the observable error for downstream callers that still
+            // submit the old value. The diagnostic preserves the measured
+            // pointer to sparse, and the CLI delegates here so its advice stays
+            // aligned with the library parser.
             "dense" => Err(ParseIndexTypeError(
                 "index type 'dense' was removed in favor of 'sparse'. Sparse \
                  (rank-indexed flat) is faster than dense at every measured \

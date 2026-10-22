@@ -79,6 +79,19 @@ pub(super) struct OrderingSegment {
 // Per-block info (--blocks)
 // ---------------------------------------------------------------------------
 
+const ANOMALY_SMALL_NUMERATOR: u64 = 1;
+const ANOMALY_SMALL_DENOMINATOR: u64 = 2;
+const ANOMALY_LARGE_NUMERATOR: u64 = 3;
+const ANOMALY_LARGE_DENOMINATOR: u64 = 2;
+
+/// Describe the thresholds used by `inspect --anomalies`.
+#[must_use]
+pub(super) fn anomaly_threshold_description() -> String {
+    let small_percent = 100 * ANOMALY_SMALL_NUMERATOR / ANOMALY_SMALL_DENOMINATOR;
+    let large_percent = 100 * ANOMALY_LARGE_NUMERATOR / ANOMALY_LARGE_DENOMINATOR;
+    format!("<{small_percent}% or >{large_percent}% of per-type median")
+}
+
 pub(super) struct BlockInfo {
     pub(super) number: u32,
     pub(super) kind: BlockKind,
@@ -509,10 +522,15 @@ pub(super) fn anomaly_blocks(infos: &[BlockInfo]) -> Vec<(&BlockInfo, &'static s
                 BlockKind::Mixed => None,
             };
             let median = median?;
-            // Anomalous if block is <50% or >150% of the per-type median.
-            if info.elements.saturating_mul(2) < median {
+            // Keep the displayed threshold and these comparisons tied to the
+            // same ratios so CLI help and report output cannot drift.
+            if info.elements.saturating_mul(ANOMALY_SMALL_DENOMINATOR)
+                < median.saturating_mul(ANOMALY_SMALL_NUMERATOR)
+            {
                 Some((info, "small"))
-            } else if info.elements > median.saturating_mul(3) / 2 {
+            } else if info.elements
+                > median.saturating_mul(ANOMALY_LARGE_NUMERATOR) / ANOMALY_LARGE_DENOMINATOR
+            {
                 Some((info, "large"))
             } else {
                 None

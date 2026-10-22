@@ -87,14 +87,15 @@ pub(super) struct BlobDesc {
 ///
 /// Returns `Ok(true)` only when every `PrimitiveGroup` holds nothing but at
 /// most one DenseNodes message, and that message at most one DenseInfo -
-/// the shape `BlockBuilder` writes. Under that shape the dense scanners
-/// (`scan::node::extract_node_tuples`, `decode_dense_columns`) see every
-/// element the raw copy would carry, so comparing their in-region count to
-/// their total proves the whole blob is in the region. Anything else makes
-/// the blob ineligible (`Ok(false)`), not an error: plain `Node` messages
-/// (which the columnar classifier ignores), ways or relations in a blob
-/// whose indexdata says nodes, changesets and unknown group fields (which
-/// no element iterator reports), and a repeated DenseNodes or DenseInfo
+/// the shape `BlockBuilder` writes. Under that shape the dense column decoder
+/// (`decode_dense_columns`) sees every element the raw copy would carry, so
+/// comparing the in-region count to the column length proves the whole blob
+/// is in the region. Anything else makes the blob ineligible (`Ok(false)`),
+/// not an error: plain `Node` messages (classified beside the dense columns,
+/// so the column length that verification compares against cannot vouch for
+/// them), ways or relations in a blob whose indexdata says nodes,
+/// changesets and unknown group fields (which no element iterator reports),
+/// and a repeated DenseNodes or DenseInfo
 /// (the decoder refuses a repeated DenseNodes and keeps only the last
 /// DenseInfo, while the raw bytes would carry both).
 ///

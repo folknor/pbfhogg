@@ -42,22 +42,6 @@ use super::strings::StringPool;
 use super::super::format::*;
 
 // ---------------------------------------------------------------------------
-// Highway exclusion list
-// ---------------------------------------------------------------------------
-
-pub(super) const EXCLUDED_HIGHWAYS: &[&str] = &[
-    "footway",
-    "path",
-    "track",
-    "steps",
-    "cycleway",
-    "service",
-    "pedestrian",
-    "bridleway",
-    "construction",
-];
-
-// ---------------------------------------------------------------------------
 // Intermediate data
 // ---------------------------------------------------------------------------
 
@@ -267,10 +251,21 @@ fn classify_way_into(
         }
     }
 
-    let is_street =
-        highway.is_some() && name.is_some() && !EXCLUDED_HIGHWAYS.contains(&highway.unwrap_or(""));
-    let is_building_addr = building && hn.is_some() && addr_st.is_some();
-    let is_interp = interp.is_some() && addr_st.is_some();
+    let crate::scan::way::WayGeocodeFlags {
+        is_street,
+        is_building_addr,
+        is_interp,
+    } = crate::scan::way::WayGeocodeFlags::classify(
+        highway.is_some(),
+        name.is_some(),
+        highway.is_some_and(|value| {
+            crate::scan::way::GEOCODE_EXCLUDED_HIGHWAYS.contains(&value.as_bytes())
+        }),
+        building,
+        hn.is_some(),
+        addr_st.is_some(),
+        interp.is_some(),
+    );
 
     if !is_admin_way && !is_street && !is_building_addr && !is_interp {
         return;
@@ -320,9 +315,9 @@ fn classify_way_into(
     if is_interp {
         if coords.len() >= 2 {
             let itype = match interp.unwrap_or("") {
-                "even" => 1u8,
-                "odd" => 2,
-                _ => 0,
+                "even" => InterpolationType::Even as u8,
+                "odd" => InterpolationType::Odd as u8,
+                _ => InterpolationType::All as u8,
             };
             if u16::try_from(coords.len()).is_err() {
                 state.error = Some(format!(
@@ -805,16 +800,7 @@ pub(super) fn run_pass2(
     drop(coord_mmap);
 
     // Mmap output files for coordinate access in cell assignment + interpolation
-    // Mmap helper: handles empty files via anonymous read-only mmap (same as Reader).
-    let mmap_file = |name: &str| -> Result<memmap2::Mmap> {
-        let path = config.output_dir.join(name);
-        let file = std::fs::File::open(&path)?;
-        let len = file.metadata()?.len();
-        if len == 0 {
-            return Ok(memmap2::MmapOptions::new().map_anon()?.make_read_only()?);
-        }
-        Ok(unsafe { memmap2::Mmap::map(&file)? })
-    };
+    let mmap_file = |name: &str| mmap_or_empty(&config.output_dir.join(name));
     let street_ways_mmap = mmap_file(FILE_STREET_WAYS)?;
     let street_nodes_mmap = mmap_file(FILE_STREET_NODES)?;
     let addr_points_mmap = mmap_file(FILE_ADDR_POINTS)?;

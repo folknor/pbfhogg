@@ -10,9 +10,10 @@
 use std::io::{self, Write};
 
 use super::format::{format_number, format_number_signed, format_size, format_timestamp, yes_no};
+use super::keys::{InspectGetKey, InspectGetKeyKind};
 use super::types::{
     BlockInfo, BlockKind, ExtendedStats, InspectReport, LocationStats, MetadataCoverage,
-    TypeIdRange, anomaly_blocks, is_standard_ordering,
+    TypeIdRange, anomaly_blocks, anomaly_threshold_description, is_standard_ordering,
 };
 
 impl InspectReport {
@@ -60,9 +61,10 @@ impl InspectReport {
                 let selected = anomaly_blocks(infos);
                 writeln!(
                     out,
-                    "Block anomalies ({} of {} - <50% or >150% of per-type median):",
+                    "Block anomalies ({} of {} - {}):",
                     selected.len(),
-                    infos.len()
+                    infos.len(),
+                    anomaly_threshold_description()
                 )?;
                 Self::write_block_table_with_reason(out, &selected)?;
             } else {
@@ -412,34 +414,34 @@ impl InspectReport {
     ///
     /// Returns `None` for unknown keys.
     pub fn get_value(&self, key: &str) -> Option<String> {
-        self.get_value_inner(key)
+        self.get_value_inner(InspectGetKey::parse(key)?.kind())
     }
 
     #[allow(clippy::cast_precision_loss)]
-    fn get_value_inner(&self, key: &str) -> Option<String> {
+    fn get_value_inner(&self, key: InspectGetKeyKind) -> Option<String> {
         match key {
-            "file.name" => Some(self.file_name.clone()),
-            "file.size" => Some(self.file_size.to_string()),
-            "file.format" => Some("PBF".to_string()),
-            "header.bbox" => self
+            InspectGetKeyKind::FileName => Some(self.file_name.clone()),
+            InspectGetKeyKind::FileSize => Some(self.file_size.to_string()),
+            InspectGetKeyKind::FileFormat => Some("PBF".to_string()),
+            InspectGetKeyKind::HeaderBbox => self
                 .header_meta
                 .bbox
                 .map(|(l, b, r, t)| format!("{l} {b} {r} {t}")),
-            "header.writing_program" => self.header_meta.writing_program.clone(),
-            "header.replication.url" => self.header_meta.replication_url.clone(),
-            "header.replication.sequence" => {
+            InspectGetKeyKind::HeaderWritingProgram => self.header_meta.writing_program.clone(),
+            InspectGetKeyKind::HeaderReplicationUrl => self.header_meta.replication_url.clone(),
+            InspectGetKeyKind::HeaderReplicationSequence => {
                 self.header_meta.replication_sequence.map(|s| s.to_string())
             }
-            "header.replication.timestamp" => self
+            InspectGetKeyKind::HeaderReplicationTimestamp => self
                 .header_meta
                 .replication_timestamp
                 .map(|t| t.to_string()),
-            "indexed" => Some(self.is_indexed.to_string()),
-            "blocks.total" => Some(self.total_blocks.to_string()),
-            "elements.nodes" => Some(self.state.node_count.to_string()),
-            "elements.ways" => Some(self.state.way_count.to_string()),
-            "elements.relations" => Some(self.state.relation_count.to_string()),
-            "elements.total" => Some(
+            InspectGetKeyKind::Indexed => Some(self.is_indexed.to_string()),
+            InspectGetKeyKind::BlocksTotal => Some(self.total_blocks.to_string()),
+            InspectGetKeyKind::ElementsNodes => Some(self.state.node_count.to_string()),
+            InspectGetKeyKind::ElementsWays => Some(self.state.way_count.to_string()),
+            InspectGetKeyKind::ElementsRelations => Some(self.state.relation_count.to_string()),
+            InspectGetKeyKind::ElementsTotal => Some(
                 (self.state.node_count + self.state.way_count + self.state.relation_count)
                     .to_string(),
             ),
@@ -447,25 +449,25 @@ impl InspectReport {
         }
     }
 
-    fn get_extended_value(&self, key: &str) -> Option<String> {
+    fn get_extended_value(&self, key: InspectGetKeyKind) -> Option<String> {
         let ext = self.state.extended.as_ref()?;
         match key {
-            "data.objects_ordered" => Some(yes_no(ext.objects_ordered)),
-            "data.timestamp.first" => {
+            InspectGetKeyKind::DataObjectsOrdered => Some(yes_no(ext.objects_ordered)),
+            InspectGetKeyKind::DataTimestampFirst => {
                 if ext.has_timestamps() {
                     Some(format_timestamp(ext.min_timestamp))
                 } else {
                     Some(String::new())
                 }
             }
-            "data.timestamp.last" => {
+            InspectGetKeyKind::DataTimestampLast => {
                 if ext.has_timestamps() {
                     Some(format_timestamp(ext.max_timestamp))
                 } else {
                     Some(String::new())
                 }
             }
-            "data.bbox" => {
+            InspectGetKeyKind::DataBbox => {
                 if ext.data_bbox.has_data() {
                     let bb = &ext.data_bbox;
                     #[allow(clippy::cast_precision_loss)]
@@ -480,35 +482,37 @@ impl InspectReport {
                     Some(String::new())
                 }
             }
-            "data.count.nodes" => Some(self.state.node_count.to_string()),
-            "data.count.ways" => Some(self.state.way_count.to_string()),
-            "data.count.relations" => Some(self.state.relation_count.to_string()),
-            "metadata.all_objects.version" => {
+            InspectGetKeyKind::DataCountNodes => Some(self.state.node_count.to_string()),
+            InspectGetKeyKind::DataCountWays => Some(self.state.way_count.to_string()),
+            InspectGetKeyKind::DataCountRelations => Some(self.state.relation_count.to_string()),
+            InspectGetKeyKind::MetadataAllObjectsVersion => {
                 Some(yes_no(ext.metadata.all_have(ext.metadata.has_version)))
             }
-            "metadata.all_objects.timestamp" => {
+            InspectGetKeyKind::MetadataAllObjectsTimestamp => {
                 Some(yes_no(ext.metadata.all_have(ext.metadata.has_timestamp)))
             }
-            "metadata.all_objects.changeset" => {
+            InspectGetKeyKind::MetadataAllObjectsChangeset => {
                 Some(yes_no(ext.metadata.all_have(ext.metadata.has_changeset)))
             }
-            "metadata.all_objects.uid" => Some(yes_no(ext.metadata.all_have(ext.metadata.has_uid))),
-            "metadata.all_objects.user" => {
+            InspectGetKeyKind::MetadataAllObjectsUid => {
+                Some(yes_no(ext.metadata.all_have(ext.metadata.has_uid)))
+            }
+            InspectGetKeyKind::MetadataAllObjectsUser => {
                 Some(yes_no(ext.metadata.all_have(ext.metadata.has_user)))
             }
-            "metadata.some_objects.version" => {
+            InspectGetKeyKind::MetadataSomeObjectsVersion => {
                 Some(yes_no(ext.metadata.some_have(ext.metadata.has_version)))
             }
-            "metadata.some_objects.timestamp" => {
+            InspectGetKeyKind::MetadataSomeObjectsTimestamp => {
                 Some(yes_no(ext.metadata.some_have(ext.metadata.has_timestamp)))
             }
-            "metadata.some_objects.changeset" => {
+            InspectGetKeyKind::MetadataSomeObjectsChangeset => {
                 Some(yes_no(ext.metadata.some_have(ext.metadata.has_changeset)))
             }
-            "metadata.some_objects.uid" => {
+            InspectGetKeyKind::MetadataSomeObjectsUid => {
                 Some(yes_no(ext.metadata.some_have(ext.metadata.has_uid)))
             }
-            "metadata.some_objects.user" => {
+            InspectGetKeyKind::MetadataSomeObjectsUser => {
                 Some(yes_no(ext.metadata.some_have(ext.metadata.has_user)))
             }
             _ => None,

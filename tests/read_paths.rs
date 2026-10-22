@@ -1233,3 +1233,61 @@ fn non_leading_headers_are_refused_by_all_streaming_read_paths() {
         assert!(err.to_string().contains(expected));
     }
 }
+
+/// The construction position leads an embedded stream; later seeks retain it.
+#[test]
+fn seekable_reader_accepts_a_header_at_its_nonzero_construction_position() {
+    let dir = crate::common::test_scratch();
+    let good = dir.path().join("embedded.osm.pbf");
+    write_test_pbf(&good);
+    let bytes = std::fs::read(&good).unwrap();
+    let frames = crate::common::adversarial::locate_blobs(&bytes);
+    let header = &bytes[..frames[0].blob_end];
+    let origin = header.len() as u64;
+    let later_header = origin + bytes.len() as u64;
+    let mut embedded = header.to_vec();
+    embedded.extend_from_slice(&bytes);
+    embedded.extend_from_slice(header);
+
+    for header_only in [false, true] {
+        let mut cursor = Cursor::new(embedded.clone());
+        cursor.set_position(origin);
+        let mut reader = BlobReader::new_seekable(cursor).unwrap();
+        let mut count = 0;
+        loop {
+            let result = if header_only {
+                reader.next_header_skip_blob().map(|r| r.map(|_| ()))
+            } else {
+                reader.next().map(|r| {
+                    r.map(|blob| {
+                        if count == 0 {
+                            assert_eq!(blob.get_type(), BlobType::OsmHeader);
+                            assert_eq!(blob.offset(), Some(ByteOffset(origin)));
+                        }
+                    })
+                })
+            };
+            match result.unwrap() {
+                Ok(()) => count += 1,
+                Err(err) => {
+                    assert_eq!(count, frames.len());
+                    assert!(err.to_string().contains("a second OSMHeader blob"));
+                    break;
+                }
+            }
+        }
+        assert!(reader.next().is_none());
+        reader.seek_raw(SeekFrom::Start(origin)).unwrap();
+        assert_eq!(
+            reader.next().unwrap().unwrap().get_type(),
+            BlobType::OsmHeader
+        );
+        reader.seek_raw(SeekFrom::Start(later_header)).unwrap();
+        let err = reader.next_header_skip_blob().unwrap().unwrap_err();
+        assert!(err.to_string().contains("a second OSMHeader blob"));
+        // Even an earlier header at absolute zero is outside this PBF stream.
+        reader.seek_raw(SeekFrom::Start(0)).unwrap();
+        let err = reader.next().unwrap().unwrap_err();
+        assert!(err.to_string().contains("a second OSMHeader blob"));
+    }
+}

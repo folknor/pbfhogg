@@ -79,16 +79,8 @@ pub enum IdViolation {
         found: &'static str,
         after: &'static str,
     },
-    /// An element ID lies outside the range `--full` can track for duplicates:
-    /// negative, or above the pre-allocated ceiling for its type.
-    ///
-    /// Duplicate detection needs one bit per possible ID, and the bitset
-    /// cannot grow once the parallel phase has started. Rather than panicking
-    /// a worker - which is what used to happen, and which aborts exactly the
-    /// diagnosis `check` exists to produce - the ID is reported. Negative IDs
-    /// are legal OSM (JOSM editor-local staging IDs) but are not
-    /// duplicate-checkable here; an ID above the ceiling means the file
-    /// outgrew what the verifier sized from its own indexdata.
+    /// A negative element ID cannot be tracked for duplicates. Positive IDs
+    /// above the bounded parallel allocation are inserted after workers join.
     IdOutOfRange { elem_type: &'static str, id: i64 },
 }
 
@@ -604,8 +596,9 @@ struct BlobVerifyResult {
     /// distinct duplicate occurrences count separately, matching the
     /// pre-swap RoaringTreemap::insert-returns-false semantics).
     duplicate_ids: Vec<i64>,
-    /// IDs the shared IdSet could not represent at all - negative, or above
-    /// the pre-allocated ceiling. Reported as `IdOutOfRange` violations.
+    /// IDs outside the parallel allocation. Positive IDs are inserted during
+    /// the serial merge for exact duplicate detection; negatives are reported
+    /// as `IdOutOfRange` violations.
     out_of_range_ids: Vec<i64>,
 }
 
@@ -655,21 +648,9 @@ fn verify_ids_full_parallel(
     let (node_schedule, way_schedule, rel_schedule, shared_file, max_ids) =
         crate::scan::classify::build_classify_schedules_split(path, &host.diagnostics)?;
 
-    // Pre-allocate IdSets for the kinds we intend to verify, sized from the
-    // file's own indexdata and floored at the live OSM ID space. The floors
-    // were previously fixed ceilings, which is wrong in both directions on a
-    // command whose job is to diagnose bad files: a near-future planet
-    // (way IDs are already ~1.4e9 against the old 1.5e9 cap) or any
-    // out-of-range ID in a degraded file panicked a worker instead of
-    // producing the violation report the user asked for. Population now uses
-    // `set_atomic_if_new_checked`, which reports rather than panics - see
-    // `IdViolation::IdOutOfRange`.
-    //
-    // `id_alloc_bound` caps the opposite direction. Indexdata is unverified,
-    // so sizing straight from it let a blob claiming `max_id = i64::MAX` ask
-    // `pre_allocate` for an exabyte-scale bitset and take the process down
-    // before the checked setters could report anything - a denial of service
-    // introduced by the same change that removed the hard-coded ceilings.
+    // Indexdata only sizes the bounded parallel allocation. Decoded IDs
+    // outside it are retained and inserted serially after each phase, so
+    // regional files with sparse global IDs need no moving ID ceiling.
     let file_len = std::fs::metadata(path).map_or(0, |m| m.len());
     let mut node_ids = IdSet::new();
     let mut way_ids = IdSet::new();
@@ -733,7 +714,7 @@ fn verify_ids_full_parallel(
     // Phase 1 - nodes
     if type_filter.nodes {
         crate::debug::emit_marker("VERIFYIDS_NODES_START");
-        let node_ids_ref = &node_ids;
+        let node_ids_ref = &mut node_ids;
         let (count, phase_violations, phase_total) = verify_single_kind_parallel(
             &shared_file,
             &node_schedule,
@@ -756,7 +737,7 @@ fn verify_ids_full_parallel(
     // Phase 2 - ways
     if type_filter.ways {
         crate::debug::emit_marker("VERIFYIDS_WAYS_START");
-        let way_ids_ref = &way_ids;
+        let way_ids_ref = &mut way_ids;
         let (count, phase_violations, phase_total) = verify_single_kind_parallel(
             &shared_file,
             &way_schedule,
@@ -778,7 +759,7 @@ fn verify_ids_full_parallel(
     // Phase 3 - relations
     if type_filter.relations {
         crate::debug::emit_marker("VERIFYIDS_RELATIONS_START");
-        let relation_ids_ref = &relation_ids;
+        let relation_ids_ref = &mut relation_ids;
         let (count, phase_violations, phase_total) = verify_single_kind_parallel(
             &shared_file,
             &rel_schedule,
@@ -820,7 +801,7 @@ fn verify_ids_full_parallel(
 fn verify_single_kind_parallel(
     shared_file: &std::sync::Arc<std::fs::File>,
     schedule: &[(usize, u64, usize)],
-    id_set: &IdSet,
+    id_set: &mut IdSet,
     elem_type: &'static str,
     max_errors_remaining: Option<usize>,
     extract_id: impl Fn(&crate::Element) -> Option<i64> + Send + Sync,
@@ -832,6 +813,7 @@ fn verify_single_kind_parallel(
 
     let mut per_blob: Vec<Option<BlobVerifyResult>> = (0..schedule.len()).map(|_| None).collect();
     let extract_ref = &extract_id;
+    let atomic_ids = &*id_set;
 
     crate::scan::classify::parallel_classify_phase(
         shared_file,
@@ -858,13 +840,10 @@ fn verify_single_kind_parallel(
                         });
                     }
                     prev = Some(id);
-                    // `None` = the ID is negative or above the pre-allocated
-                    // ceiling, so duplicate detection cannot cover it. Report
-                    // it as its own violation instead of panicking the worker
-                    // (which is what `set_atomic_if_new` does, and which
-                    // aborts the whole check on exactly the malformed input
-                    // it exists to diagnose).
-                    match id_set.set_atomic_if_new_checked(id) {
+                    // Retain IDs the bounded atomic allocation cannot cover.
+                    // Positive IDs are inserted after workers join; negatives
+                    // remain invalid under the command's existing policy.
+                    match atomic_ids.set_atomic_if_new_checked(id) {
                         Some(true) => {}
                         Some(false) => r.duplicate_ids.push(id),
                         None => r.out_of_range_ids.push(id),
@@ -912,9 +891,18 @@ fn verify_single_kind_parallel(
             }
         }
         for id in r.out_of_range_ids {
-            total_violations += 1;
-            if should_store_violation(violations.len(), max_errors_remaining) {
-                violations.push(IdViolation::IdOutOfRange { elem_type, id });
+            let violation = if id < 0 {
+                Some(IdViolation::IdOutOfRange { elem_type, id })
+            } else if !id_set.set_if_new(id) {
+                Some(IdViolation::Duplicate { elem_type, id })
+            } else {
+                None
+            };
+            if let Some(violation) = violation {
+                total_violations += 1;
+                if should_store_violation(violations.len(), max_errors_remaining) {
+                    violations.push(violation);
+                }
             }
         }
         if r.last_id.is_some() {

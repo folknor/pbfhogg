@@ -112,6 +112,7 @@ const MAX_SEGMENT_SPAN_DEG: f64 = 405.0;
 /// the boundary - raising the constant without raising the budget fails the
 /// test rather than reintroducing the hang.
 pub(in crate::geocode_index) const MAX_BUILD_S2_LEVEL: u8 = 19;
+const _: () = assert!(MAX_BUILD_S2_LEVEL <= super::super::format::S2_MAX_LEVEL);
 
 /// Maximum number of S2 cells the admin flood fill may visit for one polygon.
 /// This is the full sphere's cell count at level 10: six faces times 4^10.
@@ -400,6 +401,9 @@ fn parse_bucket_file(data: &[u8]) -> std::io::Result<Vec<ParsedBucketEntry>> {
 /// at the fine level, deriving coarse-level cells via S2 parent on the
 /// fly and de-duplicating per-segment. Runs Stage B once per tree to
 /// produce the final cell + entry files.
+// Named fine/coarse fields keep the producer's role assignments explicit.
+// A second bundle of filename constants would not enforce matching levels,
+// bucket directories or the reader's mmap roles, so retain these bindings.
 pub(super) struct FusedCellAssignmentParams<'a> {
     pub(super) output_dir: &'a Path,
     pub(super) street_ways_mmap: &'a [u8],
@@ -822,6 +826,8 @@ pub(super) fn bucketed_cell_assignment_fused(
 /// `sorted_buckets` Vec, preserving the debug_assert on cross-bucket
 /// cell_id monotonicity.
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+// Filenames are output roles; the fine/coarse caller also owns the matching
+// bucket directory. Keep those assignments together at each call site.
 fn run_stage_b(
     output_dir: &Path,
     bucket_dir: &Path,

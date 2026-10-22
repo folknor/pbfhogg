@@ -502,8 +502,11 @@
   reader now refuses it, as `digest` and `cat --dedupe` already did and as
   osmium does. Pass the original files as separate inputs instead
   (`pbfhogg cat a.osm.pbf b.osm.pbf -o merged.osm.pbf`), which reconciles
-  their headers. Seeking a `BlobReader` back to offset 0 still reads the
-  leading header.
+  their headers.
+  For `BlobReader::new_seekable`, "first" means the construction position,
+  even at a nonzero offset containing an embedded PBF. Later seeks keep
+  that stream start; revisiting its header is allowed, while seeking to a
+  different header is rejected. Reported byte offsets remain absolute.
 
 ### Added
 
@@ -633,6 +636,18 @@
   makes the decision before the header is read.
 
 ### Fixed
+
+- **Plain (non-dense) `Node` messages are read by every node pass.**
+  `add-locations-to-ways` (both index backends), the external join and
+  single-region simple `extract` refused a node blob holding plain nodes
+  with a wire-format error, and `multi-extract` with only bbox regions
+  silently left such nodes out of every region. Both encodings are now
+  read. The wire-level node passes share the checked coordinate scaling
+  `apply-changes --locations-on-ways` already used; `multi-extract`
+  classifies plain nodes from the decoded block, as its element-by-element
+  path always has. pbfhogg itself writes
+  only dense nodes; `osmium cat -f pbf,pbf_dense_nodes=false` produces
+  such files.
 
 - **A block `granularity` or `date_granularity` outside `int32` is refused.**
   Both were narrowed with a bare cast, so a value such as `2^32 + 100` read
@@ -998,7 +1013,9 @@
   spans, and string-pool offsets. A truncated or hostile index file previously
   opened successfully and then returned silently incomplete results, since
   every read path stops at the end of the mapping and reports nothing rather
-  than an error.
+  than an error. An interpolation way whose type byte is not one of the
+  three values the format defines (all, even, odd) is refused the same way;
+  it used to be read silently as even/odd.
 
 - **`extract` and `multi-extract` no longer include points just outside a
   `--bbox`.** Point membership was decided against integer bounds widened by
@@ -1013,6 +1030,13 @@
 - **`assemble_rings` backtracks at ambiguous junctions.** The greedy
   assembler followed the first available continuation and could consume
   segments into a dead-end chain, losing a ring that was assemblable.
+  Backtracking can take exponential time on a relation whose member ways
+  share many endpoints, so `build-geocode-index` runs it under a step
+  budget that every relation without a branching endpoint fits by
+  construction. A relation that exceeds it is refused whole, counted among
+  the dropped admin relations, and reported in a warning; every relation
+  that fits assembles exactly as the unbounded search would. The public
+  `geo::assemble_rings` stays unbounded.
 
 - **`ring_crosses_antimeridian` checks the implicit closing edge.** An
   unclosed ring whose only crossing was between its last and first vertex
@@ -1236,18 +1260,21 @@
   elements silently escaped. Most likely to have been hit when merging
   geographic extracts, whose per-blob ID ranges are wide and sparse.
 
-- **`check --ids --full` and `check --refs` report out-of-range IDs
-  instead of panicking.** Both sized their duplicate-detection bitsets to
+- **`check --ids --full` and `check --refs` no longer panic on IDs past
+  their bitset ceilings.** Both sized their duplicate-detection bitsets to
   hard-coded ID ceilings and then crashed a worker on any ID past them -
   including every negative ID, which is legal OSM (JOSM editor-local
   staging IDs), and, before long, ordinary way IDs: the way ceiling was
   1.5e9 against a live OSM maximum already near 1.4e9. A crash on
   untrusted input is the worst outcome for the one command whose job is
-  to diagnose bad files. The bitsets are now sized from the file's own
-  indexdata, floored at the live OSM ID space, and an ID still outside
-  that range is reported - `check --ids --full` emits a new
-  `id_out_of_range` violation (`IdViolation::IdOutOfRange`) rather than
-  aborting the run.
+  to diagnose bad files. The parallel allocation is now sized from the
+  file's own indexdata, bounded by file size and floored at the live OSM
+  ID space; a positive ID above it is still tracked exactly, inserted
+  after the parallel phase, so honest extracts carrying global IDs are
+  never flagged. Only a negative ID, which the bitsets cannot represent,
+  is reported - `check --ids --full` emits a new `id_out_of_range`
+  violation (`IdViolation::IdOutOfRange`) and `check --refs` counts it as
+  untrackable - rather than aborting the run.
 
 - **A blob whose `PrimitiveGroup` mixes element kinds is no longer given
   false indexdata or a false tag index.** The scanners stop at the first

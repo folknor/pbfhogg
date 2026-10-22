@@ -68,6 +68,8 @@ pub(crate) fn check_header_len(header_len: u32) -> Result<usize> {
 /// its data under the first header. libosmium likewise expects OSMData after
 /// the leading OSMHeader (pbf_input_format.hpp). Unknown extension blobs keep
 /// their existing skip policy; low-level readers may still read data alone.
+/// For a seekable BlobReader, the stream starts at its construction position,
+/// which can be nonzero for an embedded PBF; later seeks keep that origin.
 /// Call once per frame, before reading or skipping its payload.
 pub(crate) fn check_header_position(blob_type: &BlobKind, at_start: bool) -> Result<()> {
     if matches!(blob_type, BlobKind::OsmHeader) && !at_start {

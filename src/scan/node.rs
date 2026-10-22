@@ -9,16 +9,11 @@
 //! - External join stage 2 (inline variant for interleaved merge-join)
 //! - ALTW sparse pass 1 (node index build)
 //!
-//! # Known limitations
+//! Dense and plain nodes share checked coordinate scaling. Dense-only groups
+//! retain their single group walk; a second walk is needed only when a group
+//! contains plain nodes, to preserve the element iterator's dense-first order.
 //!
-//! - **DenseNodes only.** Only parses PrimitiveGroup field 2 (DenseNodes). Non-dense
-//!   Node messages (field 1) cause a wire-format error rather than silent data loss:
-//!   all modern PBF writers (osmium, pbfhogg, Planetiler, osm2pgsql) use dense
-//!   encoding exclusively, so hitting field 1 indicates either a pre-2012 archival
-//!   file or a hand-crafted producer - cases better surfaced as loud failures than
-//!   silently incomplete coordinate tables. Full non-dense support would add a
-//!   parallel code path for a case not seen in practice; error out instead and let
-//!   the caller decide.
+//! # Known limitations
 //!
 //! - **Sorted PBF assumption.** The indexdata-based blob skip (`ElemKind::Node` check)
 //!   relies on each blob containing exactly one element type, which is guaranteed by
@@ -39,7 +34,7 @@ pub(crate) struct NodeTuple {
 /// `i64`.
 fn overflow_err() -> crate::error::Error {
     crate::error::new_wire_error(
-        "DenseNodes coordinate arithmetic overflowed i64; the blob's \
+        "node coordinate arithmetic overflowed i64; the blob's \
          granularity, offset, or coordinate deltas are corrupt",
     )
 }
@@ -58,7 +53,7 @@ fn decimicro(offset: i64, granularity: i64, raw: i64) -> Result<i32> {
         .ok_or_else(overflow_err)?;
     i32::try_from(nano / 100).map_err(|_| {
         crate::error::new_wire_error(
-            "DenseNodes coordinate does not fit in an i32 decimicrodegree; \
+            "node coordinate does not fit in an i32 decimicrodegree; \
              the blob's granularity, offset, or deltas are corrupt",
         )
     })
@@ -69,15 +64,27 @@ fn decimicro(offset: i64, granularity: i64, raw: i64) -> Result<i32> {
 /// Zero heap allocations per block - reads wire format inline, appends to caller's Vec.
 /// The caller owns the Vec and can clear+reuse it across blocks.
 ///
-/// Only parses DenseNodes (field 2 in PrimitiveGroup). Non-dense Node messages
-/// (PrimitiveGroup field 1) produce a wire-format error - see the module doc.
+/// Reads both node encodings, dense first within each group.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 pub(crate) fn extract_node_tuples(
     decompressed: &[u8],
     out: &mut Vec<NodeTuple>,
     group_starts: &mut Vec<(usize, usize)>,
 ) -> Result<()> {
-    use crate::read::wire::{Cursor, PackedSint64Iter, WIRE_LEN, WIRE_VARINT, WireDenseNodes};
+    extract_node_coords(decompressed, group_starts, |id, lat, lon| {
+        out.push(NodeTuple { id, lat, lon });
+    })
+}
+
+/// Shared checked coordinate scanner; caller-owned group scratch is reused.
+pub(crate) fn extract_node_coords(
+    decompressed: &[u8],
+    group_starts: &mut Vec<(usize, usize)>,
+    mut sink: impl FnMut(i64, i32, i32),
+) -> Result<()> {
+    use crate::read::wire::{
+        Cursor, PackedSint64Iter, WIRE_LEN, WIRE_VARINT, WireDenseNodes, WireGroup, WireNode,
+    };
 
     let buffer = decompressed;
     let mut cursor = Cursor::new(buffer);
@@ -106,8 +113,8 @@ pub(crate) fn extract_node_tuples(
                 // release. Bound it here, the way
                 // `blob_meta/scan_ids.rs::scan_dense_nodes` already does for
                 // the same three fields. The spec's unit is nanodegrees, so
-                // a full circle is 3.6e17 nanodegrees; anything at or above
-                // one degree per raw unit is not a real producer and the
+                // a full circle is 3.6e11 nanodegrees; anything above one
+                // degree per raw unit is not a real producer and the
                 // upper bound keeps `granularity * cum` inside i64 for any
                 // plausible delta.
                 let raw = cursor.read_varint()?;
@@ -140,18 +147,12 @@ pub(crate) fn extract_node_tuples(
         let group_data = &buffer[off..off + len];
         let mut gcursor = Cursor::new(group_data);
         let mut dense_data: Option<&[u8]> = None;
+        let mut has_plain = false;
         while let Some((field, wire_type)) = gcursor.read_tag()? {
             match (field, wire_type) {
                 (1, WIRE_LEN) => {
-                    // PrimitiveGroup field 1 is non-dense Node messages. This
-                    // scanner only reads DenseNodes (field 2). Silently
-                    // skipping would yield incomplete bbox_node_ids and
-                    // downstream incorrect extract output. Error instead;
-                    // see the module doc.
-                    return Err(crate::error::new_wire_error(
-                        "PrimitiveGroup contains non-dense Node messages (field 1); \
-                         scan::node only supports DenseNodes (field 2)",
-                    ));
+                    has_plain = true;
+                    gcursor.skip_field(wire_type)?;
                 }
                 (2, WIRE_LEN) => {
                     // A repeated DenseNodes would merge in protobuf; the
@@ -170,32 +171,43 @@ pub(crate) fn extract_node_tuples(
             }
         }
 
-        let Some(dd) = dense_data else { continue };
-        let dense = WireDenseNodes::parse(dd)?;
+        if let Some(dd) = dense_data {
+            let dense = WireDenseNodes::parse(dd)?;
 
-        let mut ids = PackedSint64Iter::new(dense.id_data);
-        let mut lats = PackedSint64Iter::new(dense.lat_data);
-        let mut lons = PackedSint64Iter::new(dense.lon_data);
-        let mut cum_id: i64 = 0;
-        let mut cum_lat: i64 = 0;
-        let mut cum_lon: i64 = 0;
+            let mut ids = PackedSint64Iter::new(dense.id_data);
+            let mut lats = PackedSint64Iter::new(dense.lat_data);
+            let mut lons = PackedSint64Iter::new(dense.lon_data);
+            let mut cum_id: i64 = 0;
+            let mut cum_lat: i64 = 0;
+            let mut cum_lon: i64 = 0;
 
-        // Deltas sum modulo 2^64, as the decoder and the writer do, so a
-        // block whose IDs wrap (the writer encodes `i64::MIN` then
-        // `i64::MAX` as deltas `MIN`, `-1`) scans to the IDs every reader
-        // yields. A wrapped coordinate cannot slip through: a sum that wraps
-        // lands at least 2^63 away from the previous, accepted coordinate,
-        // far outside the window `decimicro` accepts for any granularity and
-        // offset, so it is refused exactly where a checked sum was.
-        while let (Some(did), Some(dlat), Some(dlon)) = (ids.next(), lats.next(), lons.next()) {
-            cum_id = cum_id.wrapping_add(did);
-            cum_lat = cum_lat.wrapping_add(dlat);
-            cum_lon = cum_lon.wrapping_add(dlon);
-            out.push(NodeTuple {
-                id: cum_id,
-                lat: decimicro(lat_offset, granularity, cum_lat)?,
-                lon: decimicro(lon_offset, granularity, cum_lon)?,
-            });
+            // Deltas sum modulo 2^64, as the decoder and the writer do, so a
+            // block whose IDs wrap (the writer encodes `i64::MIN` then
+            // `i64::MAX` as deltas `MIN`, `-1`) scans to the IDs every reader
+            // yields. A wrapped coordinate cannot slip through: a sum that wraps
+            // lands at least 2^63 away from the previous, accepted coordinate,
+            // far outside the window `decimicro` accepts for any granularity and
+            // offset, so it is refused exactly where a checked sum was.
+            while let (Some(did), Some(dlat), Some(dlon)) = (ids.next(), lats.next(), lons.next()) {
+                cum_id = cum_id.wrapping_add(did);
+                cum_lat = cum_lat.wrapping_add(dlat);
+                cum_lon = cum_lon.wrapping_add(dlon);
+                sink(
+                    cum_id,
+                    decimicro(lat_offset, granularity, cum_lat)?,
+                    decimicro(lon_offset, granularity, cum_lon)?,
+                );
+            }
+        }
+        if has_plain {
+            for data in WireGroup::new(group_data).nodes() {
+                let node = WireNode::parse(data)?;
+                sink(
+                    node.id,
+                    decimicro(lat_offset, granularity, node.lat)?,
+                    decimicro(lon_offset, granularity, node.lon)?,
+                );
+            }
         }
     }
 
@@ -273,6 +285,38 @@ mod tests {
         let mut groups = Vec::new();
         extract_node_tuples(block, &mut out, &mut groups)?;
         Ok(out)
+    }
+
+    #[test]
+    fn plain_and_mixed_groups_use_checked_scaling_and_dense_first_order() {
+        let mut plain = Vec::new();
+        scalar(1, 14, &mut plain); // zigzag ID 7
+        scalar(8, 6, &mut plain); // raw latitude 3
+        scalar(9, 7, &mut plain); // raw longitude -4
+        let mut dense = Vec::new();
+        packed(1, &[1], &mut dense);
+        packed(8, &[2], &mut dense);
+        packed(9, &[5], &mut dense);
+        let mut group = Vec::new();
+        len_delimited(1, &plain, &mut group);
+        len_delimited(2, &dense, &mut group);
+        len_delimited(1, &plain, &mut group);
+        let mut block = Vec::new();
+        len_delimited(2, &group, &mut block);
+        scalar(17, 1000, &mut block);
+        scalar(19, 100, &mut block);
+        scalar(20, -100, &mut block);
+        let got = scan(&block).unwrap();
+        let coords: Vec<_> = got.iter().map(|n| (n.id, n.lat, n.lon)).collect();
+        assert_eq!(coords, [(1, 21, 49), (7, 31, -41), (7, 31, -41)]);
+
+        let mut plain_only = Vec::new();
+        len_delimited(1, &plain, &mut plain_only);
+        let mut block = Vec::new();
+        len_delimited(2, &plain_only, &mut block);
+        assert_eq!(scan(&block).unwrap()[0].id, 7);
+        scalar(19, i64::MAX, &mut block);
+        assert!(scan(&block).is_err());
     }
 
     /// Baseline: the default framing decodes to the decimicrodegrees the

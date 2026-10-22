@@ -23,15 +23,18 @@ pub struct MergeStats {
     /// Per-blob frame sizes in bytes for percentile computation.
     pub(super) blob_sizes: Vec<u32>,
     // -- locations-on-ways stats (only populated when flag is on) --
-    /// Total node IDs needed for OSC ways.
+    /// Unique node IDs referenced by OSC ways.
     pub loc_nodes_needed: u64,
     /// Node coordinates found in OSC (pre-seeded).
     pub loc_nodes_from_diff: u64,
     /// Node coordinates found in base PBF during merge.
     pub loc_nodes_from_base: u64,
-    /// Node coordinates not found anywhere (0,0 fallback).
+    /// Referenced nodes resolved nowhere, including nodes the diff
+    /// deletes. Non-zero fails the merge unless `--ignore-missing-nodes`
+    /// asked for the (0,0) fallback.
     pub loc_missing: u64,
-    /// Passthrough node blobs decompressed for coordinate extraction.
+    /// Base node blobs decompressed for coordinate extraction (every node
+    /// blob, whether it was then passed through or rewritten).
     pub loc_node_blobs_scanned: u64,
 }
 

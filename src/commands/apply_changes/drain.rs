@@ -57,6 +57,8 @@ use crate::writer::PbfWriter;
 
 use super::descriptor::DrainItem;
 use super::diff_ranges::{DiffRanges, UpsertCursors};
+use super::failure::FailureSlot;
+use super::loc_mode::LocMode;
 use super::stats::MergeStats;
 use super::stream_output::{
     emit_create_for_output, emit_gap_creates, flush_remaining_upserts, has_gap_creates,
@@ -113,6 +115,12 @@ pub(super) struct DrainConfig<'a> {
     /// barrier. Drain calls `set` once with the merged map. `None` when
     /// `locations_on_ways == false`.
     pub loc_map_out: Option<LocMapHandle>,
+    /// First worker-pool failure. Polled every loop iteration and once
+    /// after the drain channel disconnects; a published failure is
+    /// returned as the drain's own error. See `failure.rs` for the
+    /// publish-before-disconnect protocol that makes the final check
+    /// conclusive.
+    pub failure: Arc<FailureSlot>,
 }
 
 /// Drain channels.
@@ -268,6 +276,13 @@ pub(super) fn run_drain(
             }
         };
         let wait_ns = u64::try_from(recv_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+
+        // A failed worker never delivers its seq; waiting for it would
+        // stall the reorder buffer forever (and under LOW, the barrier).
+        if let Some(e) = cfg.failure.take() {
+            return Err(e);
+        }
+
         if state.buffer.is_empty() {
             counters
                 .reorder_gap_wait_ns
@@ -358,19 +373,26 @@ pub(super) fn run_drain(
         }
     }
 
-    // Channel closed. Reorder buffer should be empty.
+    // Channel closed. A worker that returned an error published it before
+    // releasing its sender (see `failure.rs`), so checking here, after the
+    // disconnect, cannot miss one.
+    if cfg.failure.has_failed() {
+        return Err(cfg.failure.take().unwrap_or_else(|| {
+            new_error(ErrorKind::Io(std::io::Error::other(
+                "drain: a worker failed and its error was already reported",
+            )))
+        }));
+    }
+
+    // Reorder buffer should be empty.
     //
     // Two root causes can reach this error. First, a genuine producer bug
     // (a worker dropped a seq) - the message points there. Second, a worker
     // thread panicked mid-stream; its `drain_tx` clone drops unwound, the
     // drain sees the channel close, and the reorder buffer still holds
-    // seqs from other workers. In that case the real panic surfaces
-    // separately through `thread::scope`'s join in
-    // `rewrite::merge_with_overrides`, which runs after the drain returns.
-    // The user sees two errors for one fault with the misleading one first;
-    // the real cause lands via the scope join. Accepted as diagnostic
-    // quality: the failure mode is rare (requires OOM or an internal
-    // `unwrap` in a worker) and both errors do surface.
+    // seqs from other workers. Panics bypass the failure slot, so this
+    // message is what the caller sees first; the panic itself only
+    // surfaces when the enclosing thread scope joins the worker pool.
     if !state.buffer.is_empty() {
         let first_remaining = state.buffer.keys().next().copied().unwrap_or(0);
         return Err(new_error(ErrorKind::Io(std::io::Error::other(format!(
@@ -400,7 +422,7 @@ pub(super) fn run_drain(
     // `&mut state` for the sortedness guard, so an outstanding `&state`
     // borrow across it would not compile. The clone is one Arc refcount.
     let loc_map_owned = state.loc_map.clone();
-    let loc_map_ref = loc_map_owned.as_deref();
+    let loc = LocMode::new(cfg.locations_on_ways, loc_map_owned.as_deref());
     for &kind in types_to_flush {
         loop {
             let (cursor, upserts) = state.cursors.get(kind, cfg.ranges);
@@ -416,16 +438,8 @@ pub(super) fn run_drain(
             // run of trailing creates never trips the guard on its own; a
             // create ordered before base output already emitted does.
             check_output_order(&mut state, kind, id, id)?;
-            emit_create_for_output(
-                id,
-                kind,
-                cfg.diff,
-                &mut state.bb,
-                writer,
-                &mut stats,
-                loc_map_ref,
-            )
-            .map_err(|e| new_error(ErrorKind::Io(std::io::Error::other(e.to_string()))))?;
+            emit_create_for_output(id, kind, cfg.diff, &mut state.bb, writer, &mut stats, loc)
+                .map_err(|e| new_error(ErrorKind::Io(std::io::Error::other(e.to_string()))))?;
             let (cursor, _) = state.cursors.get_mut(kind, cfg.ranges);
             *cursor += 1;
             counters
@@ -616,7 +630,7 @@ fn handle_type_transition(
         barrier_publish_loc_map(cfg, state, counters)?;
     }
 
-    let loc_map_ref = state.loc_map.as_deref();
+    let loc = LocMode::new(cfg.locations_on_ways, state.loc_map.as_deref());
     flush_remaining_upserts(
         prev,
         item_kind,
@@ -626,7 +640,7 @@ fn handle_type_transition(
         &mut state.bb,
         writer,
         stats,
-        loc_map_ref,
+        loc,
     )
     .map_err(io_err)
 }
@@ -647,7 +661,7 @@ fn handle_gap_creates(
     }
     flush_copy_range(state, cfg, writer, counters)?;
     flush_passthrough_buf(&mut state.passthrough_chunks, writer).map_err(io_err)?;
-    let loc_map_ref = state.loc_map.as_deref();
+    let loc = LocMode::new(cfg.locations_on_ways, state.loc_map.as_deref());
     emit_gap_creates(
         item_kind,
         osm_first,
@@ -657,7 +671,7 @@ fn handle_gap_creates(
         &mut state.bb,
         writer,
         stats,
-        loc_map_ref,
+        loc,
     )
     .map_err(io_err)?;
     flush_block(&mut state.bb, writer).map_err(io_err)?;

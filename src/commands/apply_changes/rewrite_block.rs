@@ -3,8 +3,6 @@
 //! their sorted positions, and flushes the results into owned blocks for the
 //! main thread to hand to the pipelined writer.
 
-use rustc_hash::FxHashMap;
-
 use crate::blob_meta::ElemKind;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::osc::CompactDiffOverlay;
@@ -17,6 +15,7 @@ use super::element_writes::{
     write_base_dense_node_local, write_base_node_local, write_base_relation_local,
     write_base_way_local, write_base_way_local_with_locations, write_osc_way_local,
 };
+use super::loc_mode::LocMode;
 use super::stats::MergeStats;
 
 /// Output from `rewrite_block_parallel`: serialized blocks + local stats.
@@ -34,7 +33,7 @@ fn emit_create_local(
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
     stats: &mut MergeStats,
-    loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
+    loc: LocMode<'_>,
 ) -> Result<()> {
     match kind {
         ElemKind::Node => {
@@ -52,7 +51,7 @@ fn emit_create_local(
         }
         ElemKind::Way => {
             if let Some(osc) = diff.get_way(id) {
-                write_osc_way_local(bb, output, &osc, loc_map, stats)?;
+                write_osc_way_local(bb, output, &osc, loc)?;
                 stats.diff_ways += 1;
             }
         }
@@ -79,6 +78,10 @@ fn emit_create_local(
 /// upserts at their sorted positions within the block - IDs that match base
 /// elements are modifications (handled by normal element processing); IDs that
 /// don't match are creates (emitted by the cursor).
+///
+/// `loc` governs every way written, base or OSC: see [`LocMode`]. Writing
+/// a way under `LocMode::Pending` is an error, never a silent refs-only
+/// write.
 #[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn rewrite_block_parallel(
@@ -87,7 +90,7 @@ pub(super) fn rewrite_block_parallel(
     bb: &mut BlockBuilder,
     inline_upserts: &[i64],
     kind: ElemKind,
-    loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
+    loc: LocMode<'_>,
 ) -> Result<RewriteOutput> {
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut stats = MergeStats::new();
@@ -116,7 +119,7 @@ pub(super) fn rewrite_block_parallel(
         {
             let cid = inline_upserts[upsert_cursor];
             upsert_cursor += 1;
-            emit_create_local(cid, kind, diff, bb, &mut output, &mut stats, loc_map)?;
+            emit_create_local(cid, kind, diff, bb, &mut output, &mut stats, loc)?;
         }
         // Skip modification IDs (handled below by normal element processing)
         if upsert_cursor < inline_upserts.len() && inline_upserts[upsert_cursor] == elem_id {
@@ -169,9 +172,9 @@ pub(super) fn rewrite_block_parallel(
                 if diff.deleted_ways.contains(&id) {
                     stats.deleted += 1;
                 } else if let Some(osc) = diff.get_way(id) {
-                    write_osc_way_local(bb, &mut output, &osc, loc_map, &mut stats)?;
+                    write_osc_way_local(bb, &mut output, &osc, loc)?;
                     stats.diff_ways += 1;
-                } else if loc_map.is_some() {
+                } else if loc.for_way(id)?.is_some() {
                     // Forward existing raw lat/lon data for LocationsOnWays
                     write_base_way_local_with_locations(bb, &mut output, w, block)?;
                     stats.base_ways += 1;
@@ -208,7 +211,7 @@ pub(super) fn rewrite_block_parallel(
     while upsert_cursor < inline_upserts.len() {
         let cid = inline_upserts[upsert_cursor];
         upsert_cursor += 1;
-        emit_create_local(cid, kind, diff, bb, &mut output, &mut stats, loc_map)?;
+        emit_create_local(cid, kind, diff, bb, &mut output, &mut stats, loc)?;
     }
 
     // Flush remaining elements in the BlockBuilder

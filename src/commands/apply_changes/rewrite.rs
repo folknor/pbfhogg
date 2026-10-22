@@ -21,6 +21,7 @@ use super::diff_ranges::DiffRanges;
 use super::drain::{
     self, DrainChannels, DrainConfig, DrainCounters, LocMapHandle, SeededLocations,
 };
+use super::failure::FailureSlot;
 use super::node_locations::NodeLocationIndex;
 use super::scanner::{self, ScannerChannels, ScannerConfig};
 use super::stats::MergeStats;
@@ -227,12 +228,11 @@ pub fn merge(
     // under --force the scanner tags every blob as a placeholder `Node`
     // (real kind is not known until decompress), which defeats the
     // Node->Way barrier that would otherwise gate the worker pool
-    // until the node-coord loc_map is published. The consequence is
-    // that way workers run without a loc_map and `rewrite_block_local`
-    // silently falls back to `write_base_way_local` (stripping
-    // LocationsOnWays from every base way). Reject the combination up
-    // front with a clear migration path rather than produce a silently
-    // lossy output.
+    // until the node-coord loc_map is published. Way blobs would then
+    // reach workers before the map exists. That used to strip
+    // LocationsOnWays from every base way silently; `LocMode::Pending`
+    // now turns it into a mid-run error, and this check rejects the
+    // combination up front with a clear migration path instead.
     if force && locations_on_ways && !has_base_indexdata {
         return Err(
             "apply-changes --force --locations-on-ways on a non-indexed PBF would \
@@ -301,7 +301,10 @@ pub fn merge(
     // ID set (`needed_set`).
     let (seeded_locations, needed_set, loc_stats_pre) = if locations_on_ways {
         let idx = NodeLocationIndex::build_from_diff(&diff);
-        let total_needed = idx.locations.len() + idx.needed_set.len();
+        // Counted separately from the two maps: a referenced node the diff
+        // deletes is in neither, and must still count as needed so that it
+        // shows up as missing.
+        let total_needed = idx.total_referenced;
         let seeded = idx.locations.len();
         let still_needed = idx.needed_set.len();
         crate::host::diag!(
@@ -313,7 +316,7 @@ pub fn merge(
         (
             Some(idx.locations),
             Some(Arc::new(idx.needed_set)),
-            (total_needed as u64, seeded as u64, still_needed as u64),
+            (total_needed, seeded as u64, still_needed as u64),
         )
     } else {
         (None, None, (0, 0, 0))
@@ -428,6 +431,7 @@ pub fn merge(
 
     let worker_counters = Arc::new(WorkerCounters::new());
     let drain_counters = Arc::new(DrainCounters::new());
+    let failure = Arc::new(FailureSlot::new());
 
     let scanner_cfg = ScannerConfig {
         base_pbf,
@@ -455,6 +459,7 @@ pub fn merge(
         needed_set: needed_set.as_ref().map(Arc::clone),
         compression,
         use_copy_range,
+        failure: Arc::clone(&failure),
         #[cfg(feature = "test-hooks")]
         panic_at_blob_seq,
     };
@@ -473,6 +478,7 @@ pub fn merge(
         barrier_tx: barrier_tx_opt,
         loc_map_out: loc_map_handle,
         seeded_locations: seeded_locations.map(|l| SeededLocations::new(Some(l))),
+        failure: Arc::clone(&failure),
     };
     let drain_channels = DrainChannels {
         drain_rx,
@@ -485,23 +491,22 @@ pub fn merge(
     // Drain runs in this (the merge() caller's) thread because it owns
     // `&mut writer`. Scanner and worker pool run in scoped threads.
     //
-    // Error ordering on a mid-stream fault: if the scanner errors out
-    // after sending some candidates but before all are dispatched, the
-    // drain will hit its "channel closed with N items in reorder buffer"
-    // path first and the `?` below surfaces *that* error before the
-    // scanner's real cause surfaces via `scanner_handle.join()` further
-    // down. A similar pattern applies to a worker-pool panic. The user
-    // sees two errors for one fault with the misleading one first; the
-    // true cause lands via the scope join. Accepted as diagnostic-quality
-    // - the failure mode is rare (corrupt PBF header mid-stream or an
-    // internal `unwrap` on the worker path), both errors surface, and
-    // plumbing a shared "first cause" slot is engineering we haven't
-    // needed in practice.
+    // Worker-pool errors travel through `failure` (see `failure.rs`): the
+    // drain returns the first one as its own error, so the `?` below
+    // surfaces the real cause, and returning drops the drain's channels,
+    // which unblocks the scanner and the surviving workers before the
+    // scope joins them.
+    //
+    // Still open: a scanner error after some candidates were dispatched
+    // can reach the drain as "channel closed with N items in reorder
+    // buffer", returned by the `?` below while the scanner's own error is
+    // dropped at the implicit scope join; and a worker panic bypasses the
+    // failure slot entirely.
     let stats = std::thread::scope(|scope| -> Result<MergeStats> {
         let scanner_handle = scope.spawn(move || scanner::run_scanner(scanner_cfg, host));
         let workers_counters_inner = Arc::clone(&worker_counters);
         let workers_handle = scope.spawn(move || {
-            streaming::run_workers(streaming_cfg, streaming_channels, &workers_counters_inner)
+            streaming::run_workers(streaming_cfg, streaming_channels, &workers_counters_inner);
         });
 
         let drain_stats =
@@ -513,8 +518,12 @@ pub fn merge(
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         workers_handle
             .join()
-            .map_err(|_| -> Box<dyn std::error::Error> { "worker pool thread panicked".into() })?
-            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            .map_err(|_| -> Box<dyn std::error::Error> { "worker pool thread panicked".into() })?;
+        // The drain's post-disconnect check makes this unreachable; kept so
+        // a published failure can never be dropped on a success path.
+        if let Some(e) = failure.take() {
+            return Err(e.into());
+        }
 
         Ok(drain_stats)
     })?;
@@ -544,7 +553,7 @@ pub fn merge(
         final_stats.loc_nodes_from_base = resolved.saturating_sub(loc_stats_pre.1);
         final_stats.loc_missing = loc_stats_pre.0.saturating_sub(resolved);
         final_stats.loc_node_blobs_scanned = worker_counters
-            .blobs_processed
+            .loc_node_blobs_scanned
             .load(std::sync::atomic::Ordering::Relaxed);
     }
 

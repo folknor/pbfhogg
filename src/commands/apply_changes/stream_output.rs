@@ -2,8 +2,6 @@
 //! creates at type transitions, and passthrough coalescing. These run on the
 //! main thread as slots are drained in file order.
 
-use rustc_hash::FxHashMap;
-
 use crate::blob_meta::ElemKind;
 use crate::block_builder::BlockBuilder;
 use crate::file_writer::FileWriter;
@@ -15,6 +13,7 @@ use crate::commands::{ensure_node_capacity, flush_block};
 use super::Result;
 use super::diff_ranges::{DiffRanges, UpsertCursors};
 use super::element_writes::{write_osc_relation, write_osc_way};
+use super::loc_mode::LocMode;
 use super::stats::MergeStats;
 
 /// Emit a single create element via PbfWriter (for gap creates and trailing creates).
@@ -26,7 +25,7 @@ pub(super) fn emit_create_for_output(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     stats: &mut MergeStats,
-    loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
+    loc: LocMode<'_>,
 ) -> Result<()> {
     match kind {
         ElemKind::Node => {
@@ -44,7 +43,7 @@ pub(super) fn emit_create_for_output(
         }
         ElemKind::Way => {
             if let Some(osc) = diff.get_way(id) {
-                write_osc_way(bb, writer, &osc, loc_map, stats)?;
+                write_osc_way(bb, writer, &osc, loc)?;
                 stats.diff_ways += 1;
             }
         }
@@ -71,12 +70,12 @@ pub(super) fn flush_remaining_upserts(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     stats: &mut MergeStats,
-    loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
+    loc: LocMode<'_>,
 ) -> Result<()> {
     // Flush remaining creates of the previous type
     let (cursor, upserts) = cursors.get_mut(prev, ranges);
     while *cursor < upserts.len() {
-        emit_create_for_output(upserts[*cursor], prev, diff, bb, writer, stats, loc_map)?;
+        emit_create_for_output(upserts[*cursor], prev, diff, bb, writer, stats, loc)?;
         *cursor += 1;
     }
     flush_block(bb, writer)?;
@@ -92,7 +91,7 @@ pub(super) fn flush_remaining_upserts(
                 bb,
                 writer,
                 stats,
-                loc_map,
+                loc,
             )?;
             *cursor += 1;
         }
@@ -113,19 +112,11 @@ pub(super) fn emit_gap_creates(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     stats: &mut MergeStats,
-    loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
+    loc: LocMode<'_>,
 ) -> Result<()> {
     let (cursor, upserts) = cursors.get_mut(blob_kind, ranges);
     while *cursor < upserts.len() && crate::osm_id::osm_id_cmp(upserts[*cursor], min_id).is_lt() {
-        emit_create_for_output(
-            upserts[*cursor],
-            blob_kind,
-            diff,
-            bb,
-            writer,
-            stats,
-            loc_map,
-        )?;
+        emit_create_for_output(upserts[*cursor], blob_kind, diff, bb, writer, stats, loc)?;
         *cursor += 1;
     }
     Ok(())

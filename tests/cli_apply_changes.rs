@@ -1331,6 +1331,13 @@ fn merge_locations_on_ways_basic() {
     let stderr = out.stderr_str();
     assert!(stderr.contains("nodes needed"), "loc stats: {stderr}");
     assert!(stderr.contains("0 missing"), "loc stats: {stderr}");
+    // One node blob and one (rewritten) way blob: only the node blob is
+    // scanned for coordinates. This counter used to report every blob a
+    // worker touched, of any kind.
+    assert!(
+        stderr.contains(" 1 node blobs scanned"),
+        "loc stats: {stderr}"
+    );
 
     let header = crate::common::read_header(&output);
     assert!(
@@ -1598,6 +1605,274 @@ fn merge_locations_on_ways_requires_base_feature() {
         "error should mention LocationsOnWays; stderr:\n{}",
         out.stderr_str(),
     );
+}
+
+fn pb_varint(mut v: u64, out: &mut Vec<u8>) {
+    loop {
+        #[allow(clippy::cast_possible_truncation)]
+        let mut b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            b |= 0x80;
+        }
+        out.push(b);
+        if v == 0 {
+            break;
+        }
+    }
+}
+
+fn pb_len_delimited(field: u32, payload: &[u8], out: &mut Vec<u8>) {
+    pb_varint(u64::from((field << 3) | 2), out);
+    pb_varint(payload.len() as u64, out);
+    out.extend_from_slice(payload);
+}
+
+#[allow(clippy::cast_sign_loss)]
+fn pb_sint(field: u32, value: i64, out: &mut Vec<u8>) {
+    pb_varint(u64::from(field << 3), out);
+    pb_varint(((value << 1) ^ (value >> 63)) as u64, out);
+}
+
+/// A serialized PrimitiveBlock holding one group of plain (non-dense)
+/// `Node` messages, `(id, lat, lon)` in decimicrodegrees (the default
+/// granularity of 100 nanodegrees makes the raw value the decimicro value).
+/// `BlockBuilder` only writes DenseNodes, so this is built by hand.
+fn plain_node_block(nodes: &[(i64, i64, i64)]) -> Vec<u8> {
+    let mut group = Vec::new();
+    for &(id, lat, lon) in nodes {
+        let mut node = Vec::new();
+        pb_sint(1, id, &mut node);
+        pb_sint(8, lat, &mut node);
+        pb_sint(9, lon, &mut node);
+        pb_len_delimited(1, &node, &mut group);
+    }
+    let mut block = Vec::new();
+    // String table with the mandatory empty entry 0.
+    pb_len_delimited(1, &[0x0A, 0x00], &mut block);
+    pb_len_delimited(2, &group, &mut block);
+    block
+}
+
+/// A sorted LocationsOnWays PBF whose node blob is `node_block` (raw
+/// PrimitiveBlock bytes) and whose ways are one BlockBuilder blob, written
+/// with or without indexdata.
+#[allow(clippy::type_complexity)]
+fn write_low_pbf_raw_nodes(
+    path: &Path,
+    node_block: &[u8],
+    ways: &[(i64, Vec<i64>, Vec<(i32, i32)>)],
+    index_way_blob: bool,
+) {
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .sorted()
+        .optional_feature("LocationsOnWays")
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+    writer.write_primitive_block(node_block).expect("node blob");
+
+    let mut bb = BlockBuilder::new();
+    for (id, refs, locations) in ways {
+        bb.add_way_with_locations(*id, std::iter::empty(), refs, locations, None);
+    }
+    let bytes = bb.take().expect("take").expect("way block");
+    if index_way_blob {
+        writer.write_primitive_block(bytes).expect("way blob");
+    } else {
+        writer
+            .write_primitive_block_no_indexdata(bytes)
+            .expect("way blob");
+    }
+    writer.flush().expect("flush");
+}
+
+const LOW_WAY_EDIT_OSC: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <way id="10" version="2"><nd ref="1"/><nd ref="3"/></way>
+  </modify>
+  <create>
+    <way id="30" version="1"><nd ref="2"/></way>
+  </create>
+</osmChange>"#;
+
+fn low_opts() -> ApplyOpts {
+    ApplyOpts {
+        locations_on_ways: true,
+        ..ApplyOpts::default()
+    }
+}
+
+/// Plain (non-dense) `Node` messages are a legal node encoding. Under
+/// --locations-on-ways their coordinates used to be dropped wholesale: the
+/// dense-only extractor rejected the blob and the error was swallowed, so
+/// the run failed later with a cause-less "N referenced node(s) could not
+/// be resolved".
+#[test]
+fn merge_locations_on_ways_resolves_plain_node_messages() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_low_pbf_raw_nodes(
+        &base,
+        &plain_node_block(&[
+            (1, 100_000_000, 200_000_000),
+            (2, 300_000_000, 400_000_000),
+            (3, 500_000_000, 600_000_000),
+        ]),
+        &[(
+            10,
+            vec![1, 2],
+            vec![(100_000_000, 200_000_000), (300_000_000, 400_000_000)],
+        )],
+        true,
+    );
+    write_osc(&osc, LOW_WAY_EDIT_OSC);
+
+    let out = run_apply_changes(&base, &osc, &output, low_opts());
+    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+    out.assert_stderr_contains("0 missing");
+
+    let locs = read_way_locations(&output);
+    let way10 = locs.iter().find(|(id, _)| *id == 10).expect("way 10");
+    assert_eq!(
+        way10.1,
+        vec![(100_000_000, 200_000_000), (500_000_000, 600_000_000)]
+    );
+    let way30 = locs.iter().find(|(id, _)| *id == 30).expect("way 30");
+    assert_eq!(way30.1, vec![(300_000_000, 400_000_000)]);
+}
+
+/// A node coordinate that cannot be decoded is a hard error naming the
+/// blob, not a silently empty coordinate table. It also must not hang:
+/// under --locations-on-ways a node blob that never reaches the drain
+/// used to leave the node-to-way barrier unfired forever.
+#[test]
+fn merge_locations_on_ways_fails_loudly_on_undecodable_node_coordinates() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_low_pbf_raw_nodes(
+        &base,
+        // Node 4 is referenced by no way: validation must not depend on
+        // whether a node is needed.
+        &plain_node_block(&[
+            (1, 100_000_000, 200_000_000),
+            (2, 300_000_000, 400_000_000),
+            (3, 500_000_000, 600_000_000),
+            (4, i64::from(i32::MAX) + 1, 0),
+        ]),
+        &[(10, vec![1, 3], vec![(0, 0), (0, 0)])],
+        true,
+    );
+    write_osc(&osc, LOW_WAY_EDIT_OSC);
+
+    let out = run_apply_changes(&base, &osc, &output, low_opts());
+    assert!(!out.status.success(), "stderr:\n{}", out.stderr_str());
+    out.assert_stderr_contains("base blob seq 0");
+    out.assert_stderr_contains("does not fit in an i32");
+    assert!(!output.exists(), "failed merge must leave no output");
+}
+
+/// A way reaching a worker before the node coordinate map exists must be
+/// an error. Here the way blob lacks indexdata, so the scanner routes it
+/// with the node blobs, ahead of the barrier; the rewrite used to fall
+/// back to writing every way in it without coordinates, under a header
+/// that still claims LocationsOnWays.
+#[test]
+fn merge_locations_on_ways_refuses_to_strip_ways_routed_before_the_barrier() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    let mut nodes = BlockBuilder::new();
+    nodes.add_node(1, 100_000_000, 200_000_000, std::iter::empty(), None);
+    nodes.add_node(2, 300_000_000, 400_000_000, std::iter::empty(), None);
+    nodes.add_node(3, 500_000_000, 600_000_000, std::iter::empty(), None);
+    let node_block = nodes.take().expect("take").expect("node block").to_vec();
+
+    write_low_pbf_raw_nodes(
+        &base,
+        &node_block,
+        &[
+            (
+                10,
+                vec![1, 2],
+                vec![(100_000_000, 200_000_000), (300_000_000, 400_000_000)],
+            ),
+            (
+                20,
+                vec![2, 3],
+                vec![(300_000_000, 400_000_000), (500_000_000, 600_000_000)],
+            ),
+        ],
+        false,
+    );
+    write_osc(&osc, LOW_WAY_EDIT_OSC);
+
+    let out = run_apply_changes(&base, &osc, &output, low_opts());
+    assert!(
+        !out.status.success(),
+        "ways must not be written without coordinates; stderr:\n{}",
+        out.stderr_str()
+    );
+    out.assert_stderr_contains("before the node coordinate map was published");
+    assert!(!output.exists(), "failed merge must leave no output");
+}
+
+/// A way referencing a node the same diff deletes has an unresolved
+/// reference: the node is gone from the output. Its pre-deletion base
+/// coordinates used to satisfy the missing-node guard.
+#[test]
+fn merge_locations_on_ways_counts_a_deleted_node_reference_as_missing() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_with_locations(
+        &base,
+        &[
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 300_000_000,
+                lon: 400_000_000,
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[(1, vec![1], vec![(100_000_000, 200_000_000)], vec![])],
+        &[],
+    );
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <delete><node id="2" version="2"/></delete>
+  <create><way id="10" version="1"><nd ref="1"/><nd ref="2"/></way></create>
+</osmChange>"#,
+    );
+
+    let out = run_apply_changes(&base, &osc, &output, low_opts());
+    assert_eq!(out.status.code(), Some(2), "stderr:\n{}", out.stderr_str());
+    out.assert_stderr_contains("1 referenced node(s) could not be resolved");
+    assert!(!output.exists(), "failed merge must leave no output");
 }
 
 // ---------------------------------------------------------------------------

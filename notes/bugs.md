@@ -160,44 +160,6 @@ a node referenced only by an untouched way.
 
 Reported by: change application.
 
-## BUG-010 - Under LocationsOnWays, a way rewrite with no loc map silently strips coordinates
-
-`handle_candidate` reads `loc_map_handle.and_then(|h| h.get().cloned())`. If
-that is `None` (barrier protocol broken, or a future routing change),
-`rewrite_block_parallel` falls through to `write_base_way_local` and drops
-inline coords from every base way in the blob. The `--force` guard in
-`rewrite.rs` exists because this silent strip was reachable once; the guard
-closes one route and leaves the fallback. With LOW on and a non-node kind, a
-missing map should be an error. Enforce with a `LocMode` enum
-(`Off` / `Required(&Map)`) instead of `Option<&Map>`.
-
-Reported by: change application.
-
-## BUG-011 - Node coordinate extraction failures are swallowed under LocationsOnWays
-
-`streaming.rs::handle_candidate` calls `extract_node_tuples(...).is_ok()`. On
-`Err`, which the comment says happens for non-dense `Node` messages, the whole
-blob's coordinates are dropped with no log. The fallout is a later
-"cannot write LocationsOnWays: N referenced node(s) could not be resolved",
-naming no blob, node or cause, and pointing at `--ignore-missing-nodes`, which
-then writes a silent `(0,0)`. The comment claims parity with
-`node_locations.rs` prefill semantics; that prefill no longer exists. Fix:
-handle plain `Node` groups, or fail with blob seq and offset. Pin with a test
-on a non-dense node blob under LOW.
-
-Reported by: change application.
-
-## BUG-012 - `loc_node_blobs_scanned` counts every blob, not node extractions
-
-`rewrite.rs` sets `final_stats.loc_node_blobs_scanned =
-worker_counters.blobs_processed`, which `handle_candidate` and
-`handle_owned_passthrough` bump for every candidate and owned passthrough of
-every kind. The stats doc says "Passthrough node blobs decompressed for
-coordinate extraction". Use a dedicated counter on the extraction branch and
-assert it in an existing LOW CLI test.
-
-Reported by: change application.
-
 ## BUG-013 - The apply-changes drain's "byte-budget reorder buffer" has no budget
 
 `descriptor.rs` ("merged into a byte-budget reorder buffer"),
@@ -285,21 +247,20 @@ would catch it.
 
 Reported by: change application.
 
-## BUG-020 - Apply-changes discards or escalates the real error when the drain fails
+## BUG-020 - Apply-changes discards or escalates a scanner error or worker panic when the drain fails
 
-Comments at three sites (`rewrite.rs`, `drain.rs`, `streaming.rs`) accept a
-"double error": the drain reports "Producer dropped a seq" first and the real
-cause surfaces at the scope join. But `drain::run_drain(...)?` returns early
-out of the scope closure, so the explicit `scanner_handle.join()` and
-`workers_handle.join()` never run; `std::thread::scope` joins implicitly. A
-scanner or worker that returned `Err` has its error dropped. A thread that
-panicked makes `scope` itself panic after the join, and the worker pool's
-inner scope turns any worker panic into exactly that. So the documented
-"both errors surface, real one second" is wrong both ways: the cause is
-discarded or becomes a process panic.
+Worker errors now reach the caller: workers publish into a shared
+first-error slot (`apply_changes/failure.rs`) before releasing their drain
+channel, and the drain returns that error. Two paths remain.
+`drain::run_drain(...)?` still returns early out of the scope closure, so
+the explicit `scanner_handle.join()` never runs and a scanner that returned
+`Err` has its error dropped. A worker that panics bypasses the slot; the
+worker pool's inner scope turns the panic into a `scope` panic after the
+join, so the cause becomes a process panic, and under `--locations-on-ways`
+a panicking node-blob worker can still hang the barrier.
 
-Fix: run the drain, always join both, then pick the root cause through the
-shared first-error slot the comment calls unneeded. The existing
+Fix: have the scanner publish into the same slot, catch worker panics into
+it, and always join both before picking the root cause. The existing
 `panic_at_blob_seq` hook test should assert which message the caller gets.
 
 Reported by: change application.
@@ -607,6 +568,23 @@ builder just wrote. Those are builder bugs and should be errors or
 `debug_assert!` plus error.
 
 Reported by: geocode index.
+
+## BUG-076 - The shared node scanner silently skips plain `Node` messages
+
+`src/scan/node.rs` reads only `DenseNodes` and stops reading a group at its
+dense nodes, so a plain (non-dense) `Node` is never seen, with no error, by
+its users: altw (both backends' node passes) and the external join. Their
+coordinates are then reported missing, or written as `(0, 0)` under
+`--ignore-missing-nodes`. Multi-extract with all-bbox regions has the same
+gap through `decode_dense_columns`, and silently leaves plain nodes out of
+the output, while single-region simple extract errors on them.
+Apply-changes now has a checked extractor for both encodings
+(`apply_changes/node_coords.rs`); the scanner should take it over and every
+node pass call it. pbfhogg's own writer emits only dense nodes, which is
+why no fixture caught this; `osmium cat -f pbf,pbf_dense_nodes=false`
+produces the input.
+
+Reported by: the apply-changes and extract fixes.
 
 ## BUG-075 - A repeated OSMHeader is skipped by some commands and refused by others
 

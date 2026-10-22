@@ -20,8 +20,14 @@ use crate::osc::CompactDiffOverlay;
 pub(super) struct NodeLocationIndex {
     /// Coordinates pre-seeded from OSC node creates/modifications.
     pub(super) locations: FxHashMap<i64, (i32, i32)>,
-    /// Node IDs still required from the base PBF (not present in OSC).
+    /// Node IDs still required from the base PBF (not present in OSC,
+    /// not deleted by it).
     pub(super) needed_set: FxHashSet<i64>,
+    /// Unique node IDs referenced by OSC ways. At least
+    /// `locations.len() + needed_set.len()`: a referenced node the diff
+    /// deletes is in neither map but still counts here, so it is reported
+    /// as unresolved rather than silently satisfied.
+    pub(super) total_referenced: u64,
 }
 
 impl NodeLocationIndex {
@@ -53,10 +59,16 @@ impl NodeLocationIndex {
         // would silently propagate stale base-PBF coords to the rewritten
         // ways. Any future tightening of the OSC node_index must preserve
         // "every diff node visible to this lookup" for the LoW path.
+        //
+        // A node the diff deletes is not taken from the base either: it is
+        // absent from the merged output, so an OSC way referencing it has
+        // an unresolved reference. Fetching its pre-deletion base coords
+        // would satisfy the missing-node guard with a node that no longer
+        // exists.
         for &node_id in &all_needed {
             if let Some(node) = diff.get_node(node_id) {
                 locations.insert(node_id, (node.decimicro_lat(), node.decimicro_lon()));
-            } else {
+            } else if !diff.deleted_nodes.contains(&node_id) {
                 still_needed.insert(node_id);
             }
         }
@@ -64,6 +76,7 @@ impl NodeLocationIndex {
         Self {
             locations,
             needed_set: still_needed,
+            total_referenced: all_needed.len() as u64,
         }
     }
 }

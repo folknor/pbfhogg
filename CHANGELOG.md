@@ -552,6 +552,18 @@
   trusted, and an inverted ID range or a repeated indexdata or tagdata field
   now reads as no index.
 
+- **`apply-changes --locations-on-ways` no longer loses coordinates
+  silently.** Node blobs of plain (non-dense) nodes had their coordinates
+  dropped, surfacing later as unexplained missing nodes; both encodings are
+  now read, and a corrupt coordinate is an error naming the blob's sequence
+  number and offset. A way written before node coordinates were available
+  (possible when some blobs lack indexdata) used to lose its inline
+  coordinates; it is now an error. A way referencing a node the same diff
+  deletes used the node's old position and counted it as found; it now
+  counts as missing, so the run fails unless `--ignore-missing-nodes` is
+  passed. A worker error on a node blob no longer hangs the run. The
+  `node blobs scanned` statistic now counts node blobs only.
+
 - **`cat --dedupe` reconciles the output header across every input**, as the
   other cat paths already did: it used to take the first input's header, so
   the output advertised that input's bounding box and replication fields

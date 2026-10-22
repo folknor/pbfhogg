@@ -1,9 +1,9 @@
 //! PBF merge: apply an OSC diff overlay to a base PBF, producing an updated PBF.
 //!
-//! Single-pass streaming batch pipeline:
-//!   Phase 1: Parallel classify              [rayon pool]
-//!   Phase 2: Sequential inline assign       [main thread, O(log n) per blob]
-//!   Phase 3+4: Parallel rewrite + streaming output [rayon pool + main thread]
+//! Descriptor-first streaming pipeline (see `rewrite::merge`): a scanner
+//! walks blob headers, a worker pool decompresses and rewrites the blobs
+//! that overlap the diff, and a single drain reorders the results by seq
+//! and writes the output.
 //!
 //! Key insight: we pass ALL upsert IDs in a blob's range to the rewrite function.
 //! IDs that match base elements are modifications (handled by normal element processing);
@@ -15,6 +15,9 @@ mod descriptor;
 mod diff_ranges;
 mod drain;
 mod element_writes;
+mod failure;
+mod loc_mode;
+mod node_coords;
 mod node_locations;
 mod rewrite;
 mod rewrite_block;

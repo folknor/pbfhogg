@@ -12,8 +12,9 @@
 //!
 //! - [`ScannedBlob::Candidate`]: pread the Blob protobuf body via
 //!   `(frame_start + blob_offset, data_size)`, decompress through the
-//!   thread-local scratch, opportunistically extract node coords if the
-//!   blob is a Node and `--locations-on-ways` is active, parse via
+//!   thread-local scratch, extract node coords (checked, dense and plain
+//!   encodings, see `node_coords.rs`) if the blob is a Node and
+//!   `--locations-on-ways` is active, parse via
 //!   [`PrimitiveBlock::from_vec_with_scratch`], precise-check via
 //!   [`block_overlaps_diff`]. False positives emit
 //!   [`WorkerOutput::FalsePositive`] (carrying the original descriptor so
@@ -27,6 +28,14 @@
 //!   Workers pread the **full framed bytes** via
 //!   `(frame_start, frame_len)` and emit
 //!   [`WorkerOutput::OwnedPassthrough`].
+//!
+//! ## Failure
+//!
+//! Every error the pool returns - setup or per-blob - is published into
+//! the shared [`FailureSlot`] while the failing thread still holds its
+//! drain sender. The drain returns it as its own error, which unblocks the
+//! scanner and the surviving workers. Per-blob errors carry the blob's
+//! seq and frame offset.
 
 use std::os::unix::fs::FileExt as _;
 use std::path::Path;
@@ -45,6 +54,9 @@ use super::classify::block_overlaps_diff;
 use super::descriptor::{BlobDescriptor, DrainItem, ScannedBlob, WorkerOutput};
 use super::diff_ranges::DiffRanges;
 use super::drain::LocMapHandle;
+use super::failure::FailureSlot;
+use super::loc_mode::LocMode;
+use super::node_coords::extract_node_coords;
 use super::rewrite_block::rewrite_block_parallel;
 
 use crate::osc::CompactDiffOverlay;
@@ -82,7 +94,7 @@ pub(super) struct StreamingConfig {
     /// dispatched.
     pub loc_map_handle: Option<LocMapHandle>,
     /// Set of node IDs the workers need to extract coords for. Workers
-    /// filter `extract_node_tuples` output against this so we don't
+    /// filter `extract_node_coords` output against this so we don't
     /// blow per-worker RSS by capturing every coord in the file.
     /// `None` when `locations_on_ways` is false.
     pub needed_set: Option<Arc<FxHashSet<i64>>>,
@@ -97,6 +109,8 @@ pub(super) struct StreamingConfig {
     /// routed through the owned-passthrough path instead - the drain
     /// rejects `CopyRange` items up front.
     pub use_copy_range: bool,
+    /// Shared with the drain; see the module doc's "Failure" section.
+    pub failure: Arc<FailureSlot>,
     /// Test-only: panic in the worker loop when the dequeued blob's
     /// `seq` matches. Only compiled under the `test-hooks` feature.
     #[cfg(feature = "test-hooks")]
@@ -134,6 +148,11 @@ pub(super) struct WorkerCounters {
     pub coord_extract_ns: AtomicU64,
     /// Node coord pairs extracted across all workers (LOW only).
     pub coord_pairs_extracted: AtomicU64,
+    /// Node blobs decompressed for coordinate extraction (LOW only).
+    /// Bumped once per blob on the extraction branch, unlike
+    /// `blobs_processed`, which counts every candidate and owned
+    /// passthrough of every kind.
+    pub loc_node_blobs_scanned: AtomicU64,
     /// In-line framing wall summed across all workers (P1.5: avoids
     /// the writer's rayon-spawn-per-block dispatch).
     pub frame_ns: AtomicU64,
@@ -152,6 +171,7 @@ impl WorkerCounters {
             rewrite_ns: AtomicU64::new(0),
             coord_extract_ns: AtomicU64::new(0),
             coord_pairs_extracted: AtomicU64::new(0),
+            loc_node_blobs_scanned: AtomicU64::new(0),
             frame_ns: AtomicU64::new(0),
         }
     }
@@ -186,6 +206,11 @@ impl WorkerCounters {
 /// Run the worker pool to completion. Returns once the candidate channel
 /// is closed and every worker has exited.
 ///
+/// Errors are not returned: every one, setup or per-blob, is published to
+/// `cfg.failure` while the failing thread still holds a drain sender (the
+/// drain's post-disconnect check relies on that ordering), and the drain
+/// returns it. Worker panics are not caught and unwind through the scope.
+///
 /// The `drain_tx` clone owned by this function is dropped on return;
 /// downstream drain sees `Disconnected` once every worker's clone is
 /// also dropped.
@@ -194,7 +219,7 @@ pub(super) fn run_workers(
     cfg: StreamingConfig,
     channels: StreamingChannels,
     counters: &WorkerCounters,
-) -> Result<()> {
+) {
     let StreamingConfig {
         base_pbf,
         ranges,
@@ -206,6 +231,7 @@ pub(super) fn run_workers(
         needed_set,
         compression,
         use_copy_range,
+        failure,
         #[cfg(feature = "test-hooks")]
         panic_at_blob_seq,
     } = cfg;
@@ -214,39 +240,36 @@ pub(super) fn run_workers(
         drain_tx,
     } = channels;
 
+    // Setup failures publish while `drain_tx` is still bound here; it is
+    // dropped by the return that follows.
     if locations_on_ways {
         let slots_len = coord_slots.as_ref().map_or(0, Vec::len);
         if slots_len != worker_count {
-            return Err(new_error(ErrorKind::Io(std::io::Error::other(format!(
+            failure.publish(new_error(ErrorKind::Io(std::io::Error::other(format!(
                 "streaming: locations_on_ways requires coord_slots.len()={worker_count}, got {slots_len}",
             )))));
+            return;
         }
     }
 
     crate::debug::emit_marker("MERGE_STREAMING_START");
 
-    let shared_file = std::fs::File::open(&*base_pbf).map_err(|e| {
-        new_error(ErrorKind::Io(std::io::Error::other(format!(
-            "streaming: failed to open {}: {e}",
-            base_pbf.display(),
-        ))))
-    })?;
+    let shared_file = match std::fs::File::open(&*base_pbf) {
+        Ok(file) => file,
+        Err(e) => {
+            failure.publish(new_error(ErrorKind::Io(std::io::Error::other(format!(
+                "streaming: failed to open {}: {e}",
+                base_pbf.display(),
+            )))));
+            return;
+        }
+    };
 
     // mpsc::Receiver isn't Sync, so workers serialize their `recv()` calls
     // through this Mutex. The lock is only held for the duration of one
     // `recv()` (microseconds); workers spend their time in pread +
     // decompress + parse, not queued on the receiver lock.
     let candidate_rx = Mutex::new(candidate_rx);
-
-    // `first_err` captures a worker's *returned* Err (e.g. a bubbled
-    // `Result::Err`). Worker *panics* unwind past the `if let Err(e) =
-    // result` arm without ever touching `first_err`; they surface through
-    // `scope.spawn(...).join()` in the calling `rewrite::merge_with_overrides`
-    // scope instead. A panicking worker's dropped `drain_tx` can cause the
-    // drain to trip its "channel closed with items" diagnostic before the
-    // outer scope joins and reports the real panic; see `drain.rs` for the
-    // deliberate acceptance of that double-error pattern.
-    let first_err: Mutex<Option<Error>> = Mutex::new(None);
 
     std::thread::scope(|scope| {
         for worker_id in 0..worker_count {
@@ -256,7 +279,7 @@ pub(super) fn run_workers(
             let needed_set = needed_set.as_ref().map(Arc::clone);
             let file = &shared_file;
             let candidate_rx = &candidate_rx;
-            let first_err = &first_err;
+            let failure = &*failure;
             let ranges = &*ranges;
             let diff = &*diff;
 
@@ -278,14 +301,12 @@ pub(super) fn run_workers(
                     #[cfg(feature = "test-hooks")]
                     panic_at_blob_seq,
                 );
+                // Publish before this closure returns: `drain_tx` (moved in
+                // above) is only dropped after it.
                 if let Err(e) = result {
-                    let mut slot = first_err
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if slot.is_none() {
-                        *slot = Some(e);
-                    }
+                    failure.publish(e);
                 }
+                drop(drain_tx);
             });
         }
     });
@@ -296,14 +317,6 @@ pub(super) fn run_workers(
 
     crate::debug::emit_marker("MERGE_STREAMING_END");
     counters.emit();
-
-    if let Some(e) = first_err
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-    {
-        return Err(e);
-    }
-    Ok(())
 }
 
 /// Per-worker hot loop. Pulls candidates until the channel closes; for
@@ -335,8 +348,7 @@ fn worker_loop(
     // shared slot in batches to amortise the mutex acquire. Empty when
     // `locations_on_ways` is false.
     let mut local_coords: FxHashMap<i64, (i32, i32)> = FxHashMap::default();
-    let mut tuples_scratch: Vec<crate::scan::node::NodeTuple> = Vec::new();
-    let mut group_starts_scratch: Vec<(usize, usize)> = Vec::new();
+    let mut node_groups_scratch: Vec<(usize, usize)> = Vec::new();
 
     loop {
         let item = {
@@ -379,14 +391,14 @@ fn worker_loop(
                     &mut gr_scratch,
                     locations_on_ways,
                     &mut local_coords,
-                    &mut tuples_scratch,
-                    &mut group_starts_scratch,
+                    &mut node_groups_scratch,
                     coord_slot,
                     loc_map_handle,
                     needed_set,
                     compression,
                     use_copy_range,
-                )?;
+                )
+                .map_err(|e| blob_err(&desc, &e))?;
             }
             ScannedBlob::Passthrough(desc) => {
                 // Only seen here under --direct-io output (scanner routes
@@ -404,7 +416,8 @@ fn worker_loop(
                     &mut read_buf,
                     count,
                     None,
-                )?;
+                )
+                .map_err(|e| blob_err(&desc, &e))?;
             }
         }
     }
@@ -423,13 +436,12 @@ fn worker_loop(
     Ok(())
 }
 
-/// Slow-path candidate: pread body, decompress, opportunistic coord
-/// extraction (Node + LOW), parse, precise check, false-positive or
-/// rewrite.
+/// Slow-path candidate: pread body, decompress, coord extraction
+/// (Node + LOW), parse, precise check, false-positive or rewrite.
 #[allow(clippy::too_many_arguments)]
 // Sequential slow-path handler - the stages (pread, decompress, coord
 // extract, parse, precise check, rewrite) share enough scratch state
-// (read_buf, decompress_buf, tuple scratches, local_coords) that a split
+// (read_buf, decompress_buf, group scratch, local_coords) that a split
 // would fragment the descriptor pipeline without clarifying it.
 #[allow(clippy::too_many_lines)]
 fn handle_candidate(
@@ -446,8 +458,7 @@ fn handle_candidate(
     gr_scratch: &mut Vec<(u32, u32)>,
     locations_on_ways: bool,
     local_coords: &mut FxHashMap<i64, (i32, i32)>,
-    tuples_scratch: &mut Vec<crate::scan::node::NodeTuple>,
-    group_starts_scratch: &mut Vec<(usize, usize)>,
+    node_groups_scratch: &mut Vec<(usize, usize)>,
     coord_slot: Option<&CoordSlot>,
     loc_map_handle: Option<&LocMapHandle>,
     needed_set: Option<&FxHashSet<i64>>,
@@ -467,34 +478,25 @@ fn handle_candidate(
 
     if locations_on_ways && desc.kind == ElemKind::Node {
         let t_extract = std::time::Instant::now();
-        tuples_scratch.clear();
-        group_starts_scratch.clear();
-        // Match node_locations.rs prefill semantics: errors on extraction
-        // are swallowed (some blobs may have non-dense Node messages,
-        // which the tuple extractor rejects).
-        if crate::scan::node::extract_node_tuples(
-            decompress_buf,
-            tuples_scratch,
-            group_starts_scratch,
-        )
-        .is_ok()
-        {
-            let mut hits = 0u64;
-            for t in tuples_scratch.iter() {
-                // Filter to needed_set so the per-worker map doesn't
-                // grow with the whole base PBF's coord population.
-                if let Some(ns) = needed_set
-                    && !ns.contains(&t.id)
-                {
-                    continue;
-                }
-                local_coords.insert(t.id, (t.lat, t.lon));
-                hits += 1;
+        let mut hits = 0u64;
+        // Every node is decoded and validated; only the ones an OSC way
+        // references are kept, so the per-worker map doesn't grow with
+        // the whole base PBF's coord population. An extraction error is
+        // fatal: dropping this blob's coordinates would surface later
+        // only as an unexplained count of unresolved references.
+        extract_node_coords(decompress_buf, node_groups_scratch, |id, lat, lon| {
+            if needed_set.is_some_and(|ns| !ns.contains(&id)) {
+                return;
             }
-            counters
-                .coord_pairs_extracted
-                .fetch_add(hits, Ordering::Relaxed);
-        }
+            local_coords.insert(id, (lat, lon));
+            hits += 1;
+        })?;
+        counters
+            .loc_node_blobs_scanned
+            .fetch_add(1, Ordering::Relaxed);
+        counters
+            .coord_pairs_extracted
+            .fetch_add(hits, Ordering::Relaxed);
         counters
             .coord_extract_ns
             .fetch_add(elapsed_ns(t_extract), Ordering::Relaxed);
@@ -593,19 +595,21 @@ fn handle_candidate(
         );
     }
 
-    // The drain publishes `loc_map` at the node→way barrier; for
-    // way/relation blobs after the barrier, read it via the shared
-    // OnceLock. The scanner barrier protocol guarantees the lock is
-    // set before any non-node descriptor is dispatched to workers.
-    let loc_arc = if locations_on_ways && effective_kind != ElemKind::Node {
+    // The drain publishes `loc_map` at the node→way barrier; the scanner
+    // barrier protocol guarantees it is set before any way/relation
+    // descriptor is dispatched to workers. Node blobs run before it, so
+    // they see `LocMode::Pending`, under which writing a way is an error:
+    // a way in a blob routed as nodes must never be written stripped of
+    // its coordinates under a LocationsOnWays header.
+    let loc_arc = if locations_on_ways {
         loc_map_handle.and_then(|h| h.get().cloned())
     } else {
         None
     };
-    let loc_map: Option<&FxHashMap<i64, (i32, i32)>> = loc_arc.as_deref();
+    let loc = LocMode::new(locations_on_ways, loc_arc.as_deref());
 
     let t_rewrite = std::time::Instant::now();
-    let output = rewrite_block_parallel(&block, diff, bb, inline_upserts, effective_kind, loc_map)
+    let output = rewrite_block_parallel(&block, diff, bb, inline_upserts, effective_kind, loc)
         .map_err(|e| new_error(ErrorKind::Io(std::io::Error::other(e.to_string()))))?;
     counters
         .rewrite_ns
@@ -822,6 +826,15 @@ fn send_drain(drain_tx: &mpsc::SyncSender<DrainItem>, item: DrainItem) -> Result
             "streaming: drain closed worker→drain channel",
         )))
     })
+}
+
+/// Prefix a per-blob error with the blob's seq and frame offset so the
+/// caller can find the blob that failed.
+fn blob_err(desc: &BlobDescriptor, e: &Error) -> Error {
+    new_error(ErrorKind::Io(std::io::Error::other(format!(
+        "apply-changes: base blob seq {} at byte offset {}: {e}",
+        desc.seq, desc.frame_start,
+    ))))
 }
 
 #[allow(clippy::needless_pass_by_value)]

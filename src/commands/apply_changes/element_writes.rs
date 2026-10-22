@@ -3,8 +3,6 @@
 //! for parallel rewrite tasks; the other pair writes through a `PbfWriter`
 //! directly for the sequential output path.
 
-use rustc_hash::FxHashMap;
-
 use crate::PrimitiveBlock;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_writer::FileWriter;
@@ -17,7 +15,7 @@ use crate::commands::{
 };
 
 use super::Result;
-use super::stats::MergeStats;
+use super::loc_mode::{LocMap, LocMode};
 
 // ---------------------------------------------------------------------------
 // Writing OSC elements (from diff, metadata carried from the OSC attributes)
@@ -27,25 +25,32 @@ pub(super) fn write_osc_way(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     way: &crate::osc::CompactWayRef<'_>,
-    loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
-    _stats: &mut MergeStats,
+    loc: LocMode<'_>,
 ) -> Result<()> {
+    let locs = loc.for_way(way.id())?;
     ensure_way_capacity(bb, writer)?;
+    add_osc_way(bb, way, locs);
+    Ok(())
+}
+
+/// Add an OSC way to `bb`, with inline locations when `locs` is present.
+///
+/// An id absent from `locs` gets `(0, 0)`. That is only reachable when the
+/// run allows it: `rewrite::merge` counts unresolved references against the
+/// merged map and fails the command unless `--ignore-missing-nodes` asked
+/// for this fallback.
+fn add_osc_way(bb: &mut BlockBuilder, way: &crate::osc::CompactWayRef<'_>, locs: Option<&LocMap>) {
     let refs: Vec<i64> = way.refs().collect();
     let meta = way.metadata();
-    if let Some(locs) = loc_map {
-        let mut locations: Vec<(i32, i32)> = Vec::with_capacity(refs.len());
-        for &node_id in &refs {
-            match locs.get(&node_id) {
-                Some(&loc) => locations.push(loc),
-                None => locations.push((0, 0)),
-            }
-        }
+    if let Some(locs) = locs {
+        let locations: Vec<(i32, i32)> = refs
+            .iter()
+            .map(|node_id| locs.get(node_id).copied().unwrap_or((0, 0)))
+            .collect();
         bb.add_way_with_locations(way.id(), way.tags(), &refs, &locations, meta.as_ref());
     } else {
         bb.add_way(way.id(), way.tags(), &refs, meta.as_ref());
     }
-    Ok(())
 }
 
 pub(super) fn write_osc_relation(
@@ -161,30 +166,16 @@ pub(super) fn write_base_way_local_with_locations(
     Ok(())
 }
 
-/// Write an OSC way with optional LocationsOnWays coordinate lookup.
+/// Write an OSC way, with LocationsOnWays coordinates when `loc` requires them.
 pub(super) fn write_osc_way_local(
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
     way: &crate::osc::CompactWayRef<'_>,
-    loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
-    _stats: &mut MergeStats,
+    loc: LocMode<'_>,
 ) -> Result<()> {
+    let locs = loc.for_way(way.id())?;
     ensure_way_capacity_local(bb, output)?;
-    let refs: Vec<i64> = way.refs().collect();
-    let meta = way.metadata();
-
-    if let Some(locs) = loc_map {
-        let mut locations: Vec<(i32, i32)> = Vec::with_capacity(refs.len());
-        for &node_id in &refs {
-            match locs.get(&node_id) {
-                Some(&loc) => locations.push(loc),
-                None => locations.push((0, 0)),
-            }
-        }
-        bb.add_way_with_locations(way.id(), way.tags(), &refs, &locations, meta.as_ref());
-    } else {
-        bb.add_way(way.id(), way.tags(), &refs, meta.as_ref());
-    }
+    add_osc_way(bb, way, locs);
     Ok(())
 }
 

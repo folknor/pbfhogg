@@ -366,8 +366,8 @@ what the inputs collectively support:
 - **bbox**: the union, and only when *every* input declares one. An input
   without a declared box has unknown extent, so the union is unknown and the
   field is omitted.
-- **replication timestamp / sequence number / base URL**: kept per field, and
-  only when every input agrees on that field's value.
+- **replication timestamp / sequence number / base URL, and `source`**: kept
+  per field, and only when every input agrees on that field's value.
 - **`HistoricalInformation`**: the logical OR, since it declares that history
   metadata *may* be present.
 
@@ -377,9 +377,12 @@ pbfhogg applies it per field. The practical difference is that a `cat` of two
 adjacent extracts from the same replication source keeps a usable bbox and base
 URL here and loses them under osmium.
 
+This holds for every cat path, `--dedupe` included, which also requires each
+input to carry exactly one OSMHeader, as its first blob.
+
 This is a deviation from *osmium*, not from pbfhogg's own prior behaviour,
-which was worse than either: all three cat paths built the output header from
-the first input alone, so the output advertised one input's bounding box over
+which was worse than either: the cat paths built the output header from the
+first input alone, so the output advertised one input's bounding box over
 data drawn from all of them.
 
 ## tags-filter: expression-syntax edge cases

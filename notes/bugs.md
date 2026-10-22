@@ -92,39 +92,14 @@ Enforce with `#![deny(clippy::arithmetic_side_effects)]` scoped to
 
 Reported by: re-encoding.
 
-## BUG-004 - `cat --dedupe` builds the output header from the first input only
-
-`cat/mod.rs::cat_output_header_bytes` documents that all cat paths used to
-build the header from `files[0]` alone (a bbox not covering the file's own
-contents, replication fields from whichever input came first) and now
-reconciles bbox, replication fields and `HistoricalInformation`.
-`cat/dedupe.rs::build_blob_index`, the fourth path, still does
-`if header.is_none() { header = Some(hdr) }`. The fix was applied per call
-site and missed the one in the same directory. Fix: `merge_pbf` calls
-`cat_output_header_bytes`. Enforce structurally: make a multi-input header
-constructor take `&[HeaderBlock]`, so a single-header call on a multi-input
-command does not type-check. The "only ever understate" rule deserves to be
-the crate-wide policy for any merged header (merge-changes included).
-
-Reported by: re-encoding.
-
 ## BUG-005 - Indexdata claims are folded into observed element counts
 
-`sort` separates `index_scanned` from `passthrough_claimed`, and `getid`
-separates `passthrough_claimed` from `*_written`, both explaining that
-folding an indexdata claim into an observed count reports hearsay as
-observation. Three sites do the folding anyway:
-
-- `cat/dedupe.rs::count_entry` adds `entry.index.count` from unverified
-  indexdata into "Merged N elements".
-- `extract/common.rs::pread_execute` adds the passthrough blob's indexdata
-  `count` to `stats.nodes_in_bbox`.
-- `extract/multi.rs` does the same on its passthrough path.
-
-A lying indexdata moves the headline number with no way to tell. Fix: adopt
-the getid/sort split in `ExtractStats` and the dedupe stats. Apply-changes has
-the same shape: `indexdata count` is trusted for stats on passthrough (see
-HYG-061 for the trust model).
+`sort`, `getid` and `cat --dedupe` keep a separate `passthrough_claimed`
+count, and extract verifies a passthrough blob by decoding it before
+copying it raw, so its counts are observed. Apply-changes still trusts
+indexdata `count` for its stats on passthrough blobs, so a lying indexdata
+moves its headline number with no way to tell (see HYG-061 for the trust
+model).
 
 Reported by: re-encoding, filtering and spatial, change application.
 
@@ -632,6 +607,16 @@ builder just wrote. Those are builder bugs and should be errors or
 `debug_assert!` plus error.
 
 Reported by: geocode index.
+
+## BUG-075 - A repeated OSMHeader is skipped by some commands and refused by others
+
+`sort` and plain `cat` silently skip an OSMHeader blob that is not the
+first; `digest` and `cat --dedupe` refuse one. A file with a second header
+(naive concatenation of two PBFs) is therefore accepted or rejected
+depending on the command. Decide once, in the reader, and have every
+command inherit it.
+
+Reported by: the cat-dedupe header fix.
 
 ## BUG-074 - Geocode builder output differs between runs of the same input
 

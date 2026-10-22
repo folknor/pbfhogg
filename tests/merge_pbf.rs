@@ -15,7 +15,7 @@ fn default_opts() -> MergePbfOptions {
         compression: Compression::default(),
         direct_io: false,
         io_uring: false,
-        force: true, // test PBFs lack indexdata
+        force: true,
     }
 }
 
@@ -85,7 +85,10 @@ fn merge_disjoint_node_files() {
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 2, 3, 4]);
-    assert_eq!(stats.nodes, 4);
+    // Disjoint indexed inputs are copied through undecoded: their counts are
+    // indexdata claims, not observations.
+    assert_eq!(stats.nodes, 0);
+    assert_eq!(stats.passthrough_claimed, 4);
     assert_eq!(stats.duplicates_removed, 0);
 }
 
@@ -249,9 +252,10 @@ fn merge_with_ways_and_relations() {
     assert_eq!(node_ids(&c), vec![1, 2, 3]);
     assert_eq!(way_ids(&c), vec![10, 20]);
     assert_eq!(relation_ids(&c), vec![100]);
-    assert_eq!(stats.nodes, 3);
-    assert_eq!(stats.ways, 2);
-    assert_eq!(stats.relations, 1);
+    assert_eq!(stats.nodes, 0);
+    assert_eq!(stats.ways, 0);
+    assert_eq!(stats.relations, 0);
+    assert_eq!(stats.passthrough_claimed, 6);
 }
 
 #[test]
@@ -294,7 +298,8 @@ fn merge_single_file() {
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 2]);
-    assert_eq!(stats.nodes, 2);
+    assert_eq!(stats.nodes, 0);
+    assert_eq!(stats.passthrough_claimed, 2);
     assert_eq!(stats.duplicates_removed, 0);
 }
 
@@ -355,7 +360,8 @@ fn merge_three_files() {
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 2, 3]);
-    assert_eq!(stats.nodes, 3);
+    assert_eq!(stats.nodes, 0);
+    assert_eq!(stats.passthrough_claimed, 3);
     assert_eq!(stats.duplicates_removed, 0);
 }
 

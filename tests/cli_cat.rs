@@ -946,6 +946,253 @@ fn clean_on_an_unindexed_input_refuses_without_force() {
 }
 
 // ---------------------------------------------------------------------------
+// --dedupe: header reconciliation, input framing, observed vs claimed counts
+// ---------------------------------------------------------------------------
+
+/// Write a sorted single-node PBF whose header is `configure(new().sorted())`.
+/// `--dedupe` refuses unsorted inputs, so its fixtures need the stamp.
+fn write_sorted_pbf_with(
+    path: &Path,
+    node_id: i64,
+    configure: impl FnOnce(
+        pbfhogg::block_builder::HeaderBuilder<'static>,
+    ) -> pbfhogg::block_builder::HeaderBuilder<'static>,
+) {
+    use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder};
+    use pbfhogg::writer::{Compression, PbfWriter};
+
+    let header = configure(HeaderBuilder::new().sorted())
+        .build()
+        .expect("build header");
+    let mut writer = PbfWriter::to_path(
+        path,
+        Compression::default(),
+        &header,
+        pbfhogg::host::Executor::Ambient,
+    )
+    .expect("create writer");
+    let mut bb = BlockBuilder::new();
+    bb.add_node(node_id, 0, 0, [("name", "x")], None);
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+    writer.flush().expect("flush");
+}
+
+fn run_dedupe(inputs: &[&Path], output: &Path) -> crate::common::cli::CliOutput {
+    let mut cli = CliInvoker::new().arg("cat");
+    for input in inputs {
+        cli = cli.arg(*input);
+    }
+    cli.arg("--dedupe")
+        .arg("-o")
+        .arg(output)
+        .arg("--force")
+        .run()
+}
+
+/// `cat --dedupe` must reconcile its output header across every input, like
+/// the other three cat paths. It used to keep the first OSMHeader its index
+/// pass met, so the merge advertised the first input's bbox over both
+/// inputs' data, carried the first input's replication state, and dropped
+/// `HistoricalInformation` declared only by a later input.
+#[test]
+fn cat_dedupe_reconciles_the_header_across_every_input() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let west = dir.path().join("west.osm.pbf");
+    let east = dir.path().join("east.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    let url = "https://example.invalid/replication";
+    write_sorted_pbf_with(&west, 1, |hb| {
+        hb.bbox(1.0, 10.0, 2.0, 20.0)
+            .replication_timestamp(1_700_000_000)
+            .replication_sequence_number(100)
+            .replication_base_url(url)
+            .source("shared-source")
+    });
+    write_sorted_pbf_with(&east, 2, |hb| {
+        hb.bbox(30.0, 40.0, 40.0, 50.0)
+            .replication_timestamp(1_800_000_000)
+            .replication_sequence_number(200)
+            .replication_base_url(url)
+            .source("shared-source")
+            .historical()
+    });
+
+    let out = run_dedupe(&[&west, &east], &output);
+    assert!(
+        out.status.success(),
+        "cat --dedupe failed:\n{}",
+        out.stderr_str()
+    );
+
+    let header = crate::common::read_header(&output);
+    let bbox = header
+        .bbox()
+        .expect("both inputs declare a bbox, so the merge must declare their union");
+    let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    assert!(
+        close(bbox.left, 1.0)
+            && close(bbox.bottom, 10.0)
+            && close(bbox.right, 40.0)
+            && close(bbox.top, 50.0),
+        "expected the union (1, 10, 40, 50), got ({}, {}, {}, {}) - the first \
+         input's box alone does not cover the second input's node",
+        bbox.left,
+        bbox.bottom,
+        bbox.right,
+        bbox.top,
+    );
+    assert_eq!(
+        header.osmosis_replication_timestamp(),
+        None,
+        "the inputs disagree on the replication timestamp, so it must be dropped"
+    );
+    assert_eq!(
+        header.osmosis_replication_sequence_number(),
+        None,
+        "and on the sequence number"
+    );
+    assert_eq!(
+        header.osmosis_replication_base_url(),
+        Some(url),
+        "the agreed base URL must survive"
+    );
+    assert_eq!(
+        header.source(),
+        Some("shared-source"),
+        "the agreed source must survive"
+    );
+    assert!(
+        header.has_historical_information(),
+        "one input declaring HistoricalInformation makes it true of the merge"
+    );
+    assert!(header.is_sorted(), "a dedupe merge is always sorted");
+
+    let c = read_all_elements_with_coords(&output);
+    assert_eq!(node_ids(&c), vec![1, 2]);
+}
+
+/// Every input must start with its own OSMHeader. When dedupe kept only the
+/// first header found across all inputs, a headerless input never met the
+/// sortedness check and was merged under the `Sort.Type_then_ID` stamp; a
+/// second header inside one input was silently ignored along with whatever it
+/// declared.
+#[test]
+fn cat_dedupe_refuses_an_input_without_exactly_one_leading_header() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let good = dir.path().join("good.osm.pbf");
+    let other = dir.path().join("other.osm.pbf");
+    write_sorted_pbf_with(&good, 1, |hb| hb);
+    write_sorted_pbf_with(&other, 2, |hb| hb);
+
+    let bytes = std::fs::read(&other).expect("read fixture");
+    let blobs = crate::common::adversarial::locate_blobs(&bytes);
+    assert!(
+        blobs.len() >= 2,
+        "fixture must hold a header and a data blob"
+    );
+    let header_frame = &bytes[blobs[0].frame_start..blobs[0].blob_end];
+    let data_frames = &bytes[blobs[1].frame_start..];
+
+    let headerless = dir.path().join("headerless.osm.pbf");
+    std::fs::write(&headerless, data_frames).expect("write headerless");
+    let twice = dir.path().join("twice.osm.pbf");
+    std::fs::write(&twice, [header_frame, &bytes[..]].concat()).expect("write twice");
+
+    for (label, bad, expected) in [
+        (
+            "headerless",
+            &headerless,
+            "the first blob is not an OSMHeader",
+        ),
+        ("two headers", &twice, "a second OSMHeader blob"),
+    ] {
+        let output = dir.path().join(format!("out-{label}.osm.pbf"));
+        let out = run_dedupe(&[&good, bad], &output);
+        assert!(
+            !out.status.success(),
+            "{label}: cat --dedupe must refuse the input; stderr:\n{}",
+            out.stderr_str()
+        );
+        assert!(
+            out.stderr_str().contains(expected),
+            "{label}: expected {expected:?} in stderr:\n{}",
+            out.stderr_str()
+        );
+    }
+}
+
+/// A blob copied through without decoding has only its indexdata's word for
+/// how many elements it holds. That claim must not reach the observed
+/// "Merged N elements" headline: `degrade --corrupt-indexdata` inflates every
+/// blob's count by 1 000 000 through a structurally valid index, and the
+/// headline used to report the inflated figure as fact.
+#[test]
+fn cat_dedupe_keeps_indexdata_claims_out_of_the_observed_count() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let honest = dir.path().join("honest.osm.pbf");
+    let lying = dir.path().join("lying.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    write_sorted_pbf_with(&honest, 1, |hb| hb);
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&honest)
+        .arg("-o")
+        .arg(&lying)
+        .arg("--corrupt-indexdata")
+        .assert_success();
+
+    let out = run_dedupe(&[&lying], &output);
+    assert!(
+        out.status.success(),
+        "cat --dedupe failed:\n{}",
+        out.stderr_str()
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("Merged 0 elements: 0 nodes, 0 ways, 0 relations"),
+        "the one blob was never decoded, so nothing was observed; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("plus 1000001 elements in blobs copied through without decoding"),
+        "the claim must still be reported, labelled as unverified; stderr:\n{stderr}"
+    );
+
+    let c = read_all_elements_with_coords(&output);
+    assert_eq!(node_ids(&c), vec![1], "the data itself is untouched");
+}
+
+/// The observed counterpart: elements the merge decoded are counted as
+/// observed, and an all-decoded run prints no claimed line.
+#[test]
+fn cat_dedupe_counts_decoded_overlap_runs_as_observed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let a = dir.path().join("a.osm.pbf");
+    let b = dir.path().join("b.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    write_sorted_pbf_with(&a, 1, |hb| hb);
+    write_sorted_pbf_with(&b, 1, |hb| hb);
+
+    let out = run_dedupe(&[&a, &b], &output);
+    assert!(
+        out.status.success(),
+        "cat --dedupe failed:\n{}",
+        out.stderr_str()
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("Merged 1 elements: 1 nodes") && stderr.contains("1 duplicates removed"),
+        "two copies of node 1 overlap, are decoded, and merge to one; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("copied through without decoding"),
+        "nothing was copied through on a claim; stderr:\n{stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Platform tier
 // ---------------------------------------------------------------------------
 //

@@ -6,7 +6,12 @@
 //!           decode + sweep merge with dedup for overlapping blobs.
 //!
 //! Exact duplicates (same type, ID, version) across input files are removed.
-//! Common when merging geographic extracts that share border elements.
+//! Common when merging geographic extracts that share border elements. Only
+//! blobs whose ID ranges overlap are ever decoded, so duplicates *within* one
+//! blob that overlaps nothing pass through untouched.
+//!
+//! The output header is reconciled across every input's header by the same
+//! constructor the other cat paths use (`super::output_header_bytes`).
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -27,8 +32,7 @@ use crate::writer::{Compression, PbfWriter, reframe_raw_with_index};
 
 use crate::BoxResult as Result;
 use crate::commands::{
-    HeaderOverrides, build_output_header, flush_block, require_indexdata, require_sorted,
-    writer_from_header_bytes,
+    HeaderOverrides, flush_block, require_indexdata, require_sorted, writer_from_header_bytes,
 };
 use crate::owned::{
     OwnedNode, OwnedRelation, OwnedWay, read_dense_node, read_node, read_relation, read_way,
@@ -36,10 +40,23 @@ use crate::owned::{
 };
 
 /// Statistics from a multi-PBF merge operation.
+///
+/// `nodes`, `ways` and `relations` are *observed* output counts: elements the
+/// merge decoded and emitted from an overlap run (duplicates it dropped are in
+/// `duplicates_removed`, not here), plus passthrough blobs without indexdata,
+/// whose count came from decompressing and scanning the payload.
 pub struct MergePbfStats {
     pub nodes: u64,
     pub ways: u64,
     pub relations: u64,
+    /// Elements in passthrough blobs whose count is the blob's own
+    /// `BlobHeader.indexdata` claim, copied through without a decode.
+    ///
+    /// Kept apart from the observed counts on purpose, as in `sort` and
+    /// `getid`: nothing verifies that claim (`check --index` exists to), so
+    /// folding it into "Merged N elements" reported hearsay as observation and
+    /// a lying indexdata moved N with no way for the reader to tell.
+    pub passthrough_claimed: u64,
     pub blobs_passthrough: u64,
     pub blobs_rewritten: u64,
     pub blobs_total: u64,
@@ -61,6 +78,14 @@ impl MergePbfStats {
             self.blobs_rewritten,
             self.duplicates_removed,
         )?;
+        if self.passthrough_claimed > 0 {
+            writeln!(
+                w,
+                "  plus {} elements in blobs copied through without decoding, per \
+                 their indexdata (unverified - `pbfhogg check --index` checks it)",
+                self.passthrough_claimed,
+            )?;
+        }
 
         Ok(())
     }
@@ -123,11 +148,14 @@ impl HasId for OwnedRelation {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Merge multiple sorted PBF files into one, deduplicating exact duplicates.
+/// Merge multiple sorted PBF files into one, removing exact duplicates
+/// (same type, ID and version) across inputs.
 ///
-/// All inputs must be sorted (Sort.Type_then_ID). Uses blob-level index for
-/// fast passthrough of non-overlapping blobs; overlapping blobs are decoded,
-/// merged, and deduped via a streaming sweep.
+/// All inputs must be sorted (Sort.Type_then_ID), and each must start with
+/// exactly one OSMHeader blob. Uses blob-level index for fast passthrough of
+/// non-overlapping blobs; overlapping blobs are decoded, merged, and deduped
+/// via a streaming sweep. A blob that overlaps no other is never decoded, so
+/// duplicates inside it survive.
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]
 pub fn merge_pbf(
@@ -161,8 +189,7 @@ pub fn merge_pbf(
         "cat.dedupe.pass1",
         "Pass 1: indexing blobs..."
     );
-    let (header, mut entries) = build_blob_index(inputs, opts.direct_io, host)?;
-    crate::commands::warn_locations_on_ways_loss(&header, host);
+    let (headers, mut entries) = build_blob_index(inputs, opts.direct_io, host)?;
     crate::host::diag!(
         host.diagnostics,
         Progress,
@@ -199,8 +226,10 @@ pub fn merge_pbf(
         "cat.dedupe.pass2",
         "Pass 2: writing merged output..."
     );
-    #[allow(clippy::redundant_closure_for_method_calls)]
-    let header_bytes = build_output_header(&header, false, overrides, |hb| hb.sorted())?;
+    // Reconciled across every input, not taken from the first: the merge's
+    // header has to describe the merge. Always stamped sorted - every input
+    // passed `require_sorted` and the sweep emits in type-then-ID order.
+    let header_bytes = super::output_header_bytes(&headers, true, overrides, host)?;
     let mut writer = writer_from_header_bytes(
         output,
         opts.compression,
@@ -217,6 +246,7 @@ pub fn merge_pbf(
         nodes: 0,
         ways: 0,
         relations: 0,
+        passthrough_claimed: 0,
         blobs_passthrough: 0,
         blobs_rewritten: 0,
         blobs_total: entries.len() as u64,
@@ -276,99 +306,149 @@ pub fn merge_pbf(
 // Pass 1: Build blob index from multiple files
 // ---------------------------------------------------------------------------
 
+/// Index every OSMData blob of every input, and collect each input's header.
+///
+/// Returns one header per input, in input order. Each input must carry
+/// exactly one OSMHeader, as its first blob (libosmium's
+/// `pbf_input_format` enforces the same). The per-input rule is what makes
+/// `require_sorted` cover every input: when only the first header found
+/// across all inputs was kept, an input with no OSMHeader at all never met
+/// the sortedness check, so an unsorted headerless input was merged under a
+/// `Sort.Type_then_ID` stamp as long as some other input had a header. A
+/// second header later in a file is refused rather than ignored, because
+/// whatever it declares (history, a bbox, enrichment) would otherwise be
+/// silently left out of the reconciled output header.
 fn build_blob_index(
     inputs: &[&Path],
     direct_io: bool,
     host: &crate::host::Host,
-) -> Result<(crate::HeaderBlock, Vec<BlobEntry>)> {
+) -> Result<(Vec<crate::HeaderBlock>, Vec<BlobEntry>)> {
     let mut entries = Vec::new();
-    let mut header: Option<crate::HeaderBlock> = None;
-    let mut decompress_buf: Vec<u8> = Vec::new();
-    let mut header_buf: Vec<u8> = Vec::new();
-    let mut blob_buf: Vec<u8> = Vec::new();
+    let mut headers: Vec<crate::HeaderBlock> = Vec::with_capacity(inputs.len());
+    let mut scratch = IndexScratch::default();
 
     for (file_idx, input) in inputs.iter().enumerate() {
-        let mut reader = FileReader::open(input, direct_io)?;
-        let mut file_offset: u64 = 0;
+        headers.push(index_input(
+            file_idx,
+            input,
+            direct_io,
+            host,
+            &mut scratch,
+            &mut entries,
+        )?);
+    }
 
-        loop {
-            let frame_start = file_offset;
+    Ok((headers, entries))
+}
 
-            // Prefix, EOF policy, the zero-length and MAX_BLOB_HEADER_SIZE
-            // guards, and the header parse all come from `read::frame`. This
-            // loop previously resized `header_buf` straight from the
-            // unvalidated 4-byte prefix, so four bytes of corrupt input asked
-            // for up to a 4 GiB allocation - the one frame decoder that had
-            // neither guard.
-            let Some(frame) = read_frame_header(&mut reader, &mut header_buf, &host.diagnostics)?
-            else {
-                break;
-            };
-            let index = frame
-                .raw_index
-                .as_ref()
-                .and_then(|d| BlobIndex::deserialize(d));
-            let has_indexdata = index.is_some();
-            let frame_len = (frame.payload_offset() + frame.data_size) as u64;
-            let blob_type = frame.blob_type;
-            let data_size = frame.data_size;
-            let tagdata = frame.tagdata;
+/// Buffers reused across every frame of every input in pass 1.
+#[derive(Default)]
+struct IndexScratch {
+    decompress_buf: Vec<u8>,
+    header_buf: Vec<u8>,
+    blob_buf: Vec<u8>,
+}
 
-            file_offset += frame_len;
+/// An input whose blob sequence is not "one OSMHeader, then data".
+fn frame_order_error(input: &Path, what: &str) -> Box<dyn std::error::Error> {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "input file {}: {what}; a PBF file carries exactly one OSMHeader blob, \
+             as its first blob",
+            input.display()
+        ),
+    )
+    .into()
+}
 
-            match &blob_type {
-                BlobKind::OsmHeader => {
-                    blob_buf.resize(data_size, 0);
-                    reader.read_exact(&mut blob_buf)?;
-                    let hdr = decode_blob_to_headerblock(&blob_buf)?;
-                    require_sorted(&hdr, input, &format!("Input file {}", input.display()))?;
-                    if header.is_none() {
-                        header = Some(hdr);
-                    }
-                }
-                BlobKind::OsmData if has_indexdata => {
+/// Pass 1 over one input: append its OSMData blobs to `entries` and return
+/// its header. See [`build_blob_index`] for the header rules.
+fn index_input(
+    file_idx: usize,
+    input: &Path,
+    direct_io: bool,
+    host: &crate::host::Host,
+    scratch: &mut IndexScratch,
+    entries: &mut Vec<BlobEntry>,
+) -> Result<crate::HeaderBlock> {
+    let IndexScratch {
+        decompress_buf,
+        header_buf,
+        blob_buf,
+    } = scratch;
+    let mut reader = FileReader::open(input, direct_io)?;
+    let mut file_offset: u64 = 0;
+    let mut header: Option<crate::HeaderBlock> = None;
+
+    loop {
+        let frame_start = file_offset;
+
+        // Prefix, EOF policy, the zero-length and MAX_BLOB_HEADER_SIZE guards,
+        // and the header parse all come from `read::frame`. This loop
+        // previously resized `header_buf` straight from the unvalidated 4-byte
+        // prefix, so four bytes of corrupt input asked for up to a 4 GiB
+        // allocation - the one frame decoder that had neither guard.
+        let Some(frame) = read_frame_header(&mut reader, header_buf, &host.diagnostics)? else {
+            break;
+        };
+        let raw_index = frame
+            .raw_index
+            .as_ref()
+            .and_then(|d| BlobIndex::deserialize(d));
+        let frame_len = (frame.payload_offset() + frame.data_size) as u64;
+        let data_size = frame.data_size;
+        file_offset += frame_len;
+
+        match (&frame.blob_type, header.is_some()) {
+            (BlobKind::OsmHeader, false) => {
+                blob_buf.resize(data_size, 0);
+                reader.read_exact(blob_buf)?;
+                let hdr = decode_blob_to_headerblock(blob_buf)?;
+                require_sorted(&hdr, input, &format!("Input file {}", input.display()))?;
+                header = Some(hdr);
+            }
+            (BlobKind::OsmHeader, true) => {
+                return Err(frame_order_error(
+                    input,
+                    &format!("a second OSMHeader blob at offset {frame_start}"),
+                ));
+            }
+            (_, false) => {
+                return Err(frame_order_error(
+                    input,
+                    "the first blob is not an OSMHeader",
+                ));
+            }
+            (BlobKind::OsmData, true) => {
+                let has_indexdata = raw_index.is_some();
+                let index = if let Some(index) = raw_index {
                     reader.skip(data_size as u64)?;
-                    #[allow(clippy::unwrap_used)]
-                    entries.push(BlobEntry {
-                        file_offset: frame_start,
-                        frame_len,
-                        index: index.unwrap(),
-                        has_indexdata,
-                        tagdata,
-                        file_index: file_idx,
-                    });
-                }
-                BlobKind::OsmData => {
+                    index
+                } else {
                     blob_buf.resize(data_size, 0);
-                    reader.read_exact(&mut blob_buf)?;
-                    decompress_blob_data_into(&blob_buf, &mut decompress_buf)?;
-                    let blob_index = scan_block_ids(&decompress_buf).ok_or_else(|| {
+                    reader.read_exact(blob_buf)?;
+                    decompress_blob_data_into(blob_buf, decompress_buf)?;
+                    scan_block_ids(decompress_buf).ok_or_else(|| {
                         io::Error::new(io::ErrorKind::InvalidData, "failed to scan block IDs")
-                    })?;
-                    entries.push(BlobEntry {
-                        file_offset: frame_start,
-                        frame_len,
-                        index: blob_index,
-                        has_indexdata,
-                        tagdata,
-                        file_index: file_idx,
-                    });
-                }
-                _ => {
-                    reader.skip(data_size as u64)?;
-                }
+                    })?
+                };
+                entries.push(BlobEntry {
+                    file_offset: frame_start,
+                    frame_len,
+                    index,
+                    has_indexdata,
+                    tagdata: frame.tagdata,
+                    file_index: file_idx,
+                });
+            }
+            (_, true) => {
+                reader.skip(data_size as u64)?;
             }
         }
     }
 
-    let header = header.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "no OSMHeader blob found in any input file",
-        )
-    })?;
-
-    Ok((header, entries))
+    header.ok_or_else(|| frame_order_error(input, "no OSMHeader blob found"))
 }
 
 // ---------------------------------------------------------------------------
@@ -478,7 +558,15 @@ fn extract_blob_bytes(frame: &[u8]) -> Result<&[u8]> {
     Ok(&frame[blob_start..])
 }
 
+/// Count a passthrough blob. Its payload was never decoded in pass 2, so the
+/// only count available is the index's - observed when pass 1 built that
+/// index by scanning the decompressed payload, a claim when it came from the
+/// file's own `BlobHeader.indexdata`.
 fn count_entry(entry: &BlobEntry, stats: &mut MergePbfStats) {
+    if entry.has_indexdata {
+        stats.passthrough_claimed += entry.index.count;
+        return;
+    }
     match entry.index.kind {
         ElemKind::Node => stats.nodes += entry.index.count,
         ElemKind::Way => stats.ways += entry.index.count,
@@ -714,6 +802,35 @@ mod tests {
             "handing a mixed-kind run to the kind-gated sweep silently drops \
              the off-kind elements"
         );
+    }
+
+    /// A passthrough blob's count is a claim when it came from indexdata and
+    /// an observation when pass 1 scanned the payload. Only the latter may
+    /// reach the observed per-kind totals.
+    #[test]
+    fn passthrough_counts_split_claimed_from_scanned() {
+        let mut stats = MergePbfStats {
+            nodes: 0,
+            ways: 0,
+            relations: 0,
+            passthrough_claimed: 0,
+            blobs_passthrough: 0,
+            blobs_rewritten: 0,
+            blobs_total: 0,
+            duplicates_removed: 0,
+        };
+        let mut claimed = entry(ElemKind::Node, 1, 10);
+        claimed.index.count = 1_000_000;
+        count_entry(&claimed, &mut stats);
+        assert_eq!(stats.nodes, 0, "an indexdata claim is not an observation");
+        assert_eq!(stats.passthrough_claimed, 1_000_000);
+
+        let mut scanned = entry(ElemKind::Way, 1, 10);
+        scanned.has_indexdata = false;
+        scanned.index.count = 7;
+        count_entry(&scanned, &mut stats);
+        assert_eq!(stats.ways, 7, "a pass-1 scan count is observed");
+        assert_eq!(stats.passthrough_claimed, 1_000_000);
     }
 
     #[test]

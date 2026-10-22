@@ -552,6 +552,17 @@
   trusted, and an inverted ID range or a repeated indexdata or tagdata field
   now reads as no index.
 
+- **`cat --dedupe` reconciles the output header across every input**, as the
+  other cat paths already did: it used to take the first input's header, so
+  the output advertised that input's bounding box and replication fields
+  over data from all of them. Every input must now carry exactly one
+  OSMHeader, as its first blob; a missing, late or repeated header is an
+  error (a headerless input also used to skip the sortedness check). The
+  summary no longer counts elements of blobs copied through undecoded as
+  merged; their indexdata claim is reported on a separate line. Multi-input
+  `cat` keeps the header's `source` when every input agrees on it, and the
+  library `cat` with no inputs returns an error instead of panicking.
+
 - **`build-geocode-index` no longer races or panics on hostile input.** A
   node duplicated across blobs made two workers write one coordinate slot
   concurrently, which was undefined behaviour, and an out-of-range slot was

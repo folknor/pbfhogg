@@ -1017,9 +1017,17 @@ fn merge_pbf_non_indexed_parity() {
     )
     .expect("merge_pbf non-indexed");
 
-    assert_eq!(stats_idx.nodes, stats_non.nodes, "nodes parity");
-    assert_eq!(stats_idx.ways, stats_non.ways, "ways parity");
-    assert_eq!(stats_idx.relations, stats_non.relations, "relations parity");
+    // The indexed side copies its disjoint blobs through undecoded, so its
+    // counts are indexdata claims; the non-indexed side scans every blob and
+    // observes them. Parity holds on the total, not on the split.
+    let total = |s: &pbfhogg::cat::dedupe::MergePbfStats| {
+        s.nodes + s.ways + s.relations + s.passthrough_claimed
+    };
+    assert_eq!(total(&stats_idx), total(&stats_non), "element total parity");
+    assert_eq!(
+        stats_non.passthrough_claimed, 0,
+        "non-indexed input claims nothing"
+    );
     assert_eq!(
         stats_idx.duplicates_removed, stats_non.duplicates_removed,
         "duplicates_removed parity"
@@ -1028,11 +1036,11 @@ fn merge_pbf_non_indexed_parity() {
 
     // Sanity: we produced an actual union (no silent passthrough bug).
     assert_eq!(
-        stats_idx.nodes, 10,
+        stats_non.nodes, 10,
         "union must contain both disjoint node sets"
     );
-    assert_eq!(stats_idx.ways, 2, "union must contain b's ways");
-    assert_eq!(stats_idx.relations, 1, "union must contain b's relation");
+    assert_eq!(stats_non.ways, 2, "union must contain b's ways");
+    assert_eq!(stats_non.relations, 1, "union must contain b's relation");
     assert_eq!(
         stats_idx.duplicates_removed, 0,
         "no overlap -> no duplicates"

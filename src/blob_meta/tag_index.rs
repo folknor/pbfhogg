@@ -4,8 +4,9 @@
 //! Used by the pipeline to skip decompression of blobs that provably
 //! lack required tag keys (e.g. a blob with no `highway` key can be
 //! skipped when filtering for `highway=primary`).
-
-use protohoggr::Cursor;
+//!
+//! The scanner that derives a key set from a block lives in `scan.rs`, shared
+//! with the ID scanner so both agree on what a malformed block is.
 
 /// Tag key index version.
 pub(crate) const TAG_INDEX_VERSION: u8 = 0x01;
@@ -113,6 +114,16 @@ impl TagIndex {
         Some(TagIndex { keys })
     }
 
+    /// Build from a key set the caller has already sorted and deduplicated.
+    /// The scanner in `scan.rs` is the only producer.
+    pub(super) fn from_sorted_keys(keys: Vec<Box<[u8]>>) -> Self {
+        debug_assert!(
+            keys.windows(2).all(|w| w[0] < w[1]),
+            "keys must be sorted and unique"
+        );
+        TagIndex { keys }
+    }
+
     /// Returns `true` if the tag index has no keys (blob contains no tagged elements).
     pub fn keys_empty(&self) -> bool {
         self.keys.is_empty()
@@ -143,206 +154,11 @@ impl TagIndex {
     }
 }
 
-/// Parse a StringTable message into byte slices for each entry.
-///
-/// StringTable is PrimitiveBlock field 1. Inside, each entry is field 1 (bytes).
-fn parse_string_table(raw: &[u8]) -> Option<Vec<&[u8]>> {
-    let mut cur = Cursor::new(raw);
-    let mut entries = Vec::new();
-    while let Some((tag, wire_type)) = cur.read_tag().ok()? {
-        if tag == 1 && wire_type == 2 {
-            entries.push(cur.read_len_delimited().ok()?);
-        } else {
-            cur.skip_field(wire_type).ok()?;
-        }
-    }
-    Some(entries)
-}
-
-/// Scan decompressed PrimitiveBlock bytes to extract the set of unique tag keys.
-///
-/// Walks the protobuf wire format, parsing the StringTable and tag key indices
-/// from all PrimitiveGroups. Returns a `TagIndex` with sorted unique keys.
-///
-/// Returns `None` if the block has no groups or cannot be parsed.
-#[hotpath::measure]
-#[allow(clippy::cast_possible_truncation)]
-pub(crate) fn scan_block_tags(raw: &[u8]) -> Option<TagIndex> {
-    let mut cur = Cursor::new(raw);
-    let mut string_table_data: Option<&[u8]> = None;
-    let mut groups: Vec<&[u8]> = Vec::new();
-
-    while let Some((tag, wire_type)) = cur.read_tag().ok()? {
-        match (tag, wire_type) {
-            (1, 2) => {
-                // StringTable (field 1, length-delimited)
-                string_table_data = Some(cur.read_len_delimited().ok()?);
-            }
-            (2, 2) => {
-                // PrimitiveGroup (field 2, length-delimited)
-                groups.push(cur.read_len_delimited().ok()?);
-            }
-            _ => {
-                cur.skip_field(wire_type).ok()?;
-            }
-        }
-    }
-
-    let string_table = parse_string_table(string_table_data?)?;
-    if groups.is_empty() {
-        return None;
-    }
-
-    let mut key_indices: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    for group_data in groups {
-        // A group carrying more than one element field is not something this
-        // scanner can index: it stops at the first element field it finds, so
-        // the off-kind elements' keys would be missing from the index while
-        // the index still looks complete. `tags_filter` skips whole blobs on
-        // that index, so an incomplete one silently drops matches. Refuse to
-        // emit a tag index at all for such a blob - no tagdata means "decode
-        // this blob", which is always correct, just slower.
-        if super::scan_ids::group_mixes_element_kinds(group_data) {
-            return None;
-        }
-        scan_group_tag_keys(group_data, &mut key_indices);
-    }
-
-    // Resolve indices to string table entries
-    let mut keys: Vec<Box<[u8]>> = key_indices
-        .into_iter()
-        .filter_map(|idx| {
-            let i = idx as usize;
-            if i < string_table.len() && !string_table[i].is_empty() {
-                Some(string_table[i].into())
-            } else {
-                None
-            }
-        })
-        .collect();
-    keys.sort();
-    keys.dedup();
-
-    Some(TagIndex { keys })
-}
-
-/// Scan a PrimitiveGroup for tag key string-table indices.
-fn scan_group_tag_keys(raw: &[u8], key_indices: &mut std::collections::HashSet<u32>) {
-    let mut cur = Cursor::new(raw);
-    while let Some((tag, wire_type)) = cur.read_tag().ok().flatten() {
-        match (tag, wire_type) {
-            (2, 2) => {
-                // DenseNodes (field 2)
-                if let Ok(data) = cur.read_len_delimited() {
-                    scan_dense_node_tag_keys(data, key_indices);
-                }
-                return;
-            }
-            (1, 2) | (3, 2) | (4, 2) => {
-                // Node (1), Way (3), Relation (4)
-                if let Ok(msg) = cur.read_len_delimited() {
-                    scan_element_tag_keys(msg, key_indices);
-                }
-                // Continue scanning remaining elements of same type
-                scan_remaining_element_tag_keys(&mut cur, tag, key_indices);
-                return;
-            }
-            _ => {
-                if cur.skip_field(wire_type).is_err() {
-                    return;
-                }
-            }
-        }
-    }
-}
-
-/// Scan DenseNodes keys_vals (field 10) for tag key indices.
-///
-/// Format: interleaved [key_sid, val_sid, key_sid, val_sid, ..., 0, ...]
-/// where 0 separates nodes. Keys are at even positions within each node's
-/// tag sequence (before the 0 delimiter).
-fn scan_dense_node_tag_keys(raw: &[u8], key_indices: &mut std::collections::HashSet<u32>) {
-    let mut cur = Cursor::new(raw);
-    while let Some((tag, wire_type)) = cur.read_tag().ok().flatten() {
-        if tag == 10 && wire_type == 2 {
-            // keys_vals packed field
-            if let Ok(data) = cur.read_len_delimited() {
-                let mut kv_cur = Cursor::new(data);
-                let mut is_key = true;
-                while !kv_cur.is_empty() {
-                    if let Ok(val) = kv_cur.read_varint() {
-                        #[allow(clippy::cast_possible_truncation)]
-                        let val = val as u32;
-                        if val == 0 {
-                            // Delimiter: next node's tags start
-                            is_key = true;
-                        } else if is_key {
-                            key_indices.insert(val);
-                            is_key = false;
-                        } else {
-                            // Value - skip
-                            is_key = true;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-            }
-            return;
-        }
-        if cur.skip_field(wire_type).is_err() {
-            return;
-        }
-    }
-}
-
-/// Scan a Way/Relation/Node message for tag key indices (field 2 = keys packed uint32).
-fn scan_element_tag_keys(msg: &[u8], key_indices: &mut std::collections::HashSet<u32>) {
-    let mut cur = Cursor::new(msg);
-    while let Some((tag, wire_type)) = cur.read_tag().ok().flatten() {
-        if tag == 2 && wire_type == 2 {
-            // keys: packed uint32
-            if let Ok(data) = cur.read_len_delimited() {
-                let mut k_cur = Cursor::new(data);
-                while !k_cur.is_empty() {
-                    if let Ok(val) = k_cur.read_varint() {
-                        #[allow(clippy::cast_possible_truncation)]
-                        key_indices.insert(val as u32);
-                    } else {
-                        break;
-                    }
-                }
-            }
-            return;
-        }
-        if cur.skip_field(wire_type).is_err() {
-            return;
-        }
-    }
-}
-
-/// Scan remaining element messages in a group after the first.
-fn scan_remaining_element_tag_keys(
-    cur: &mut Cursor<'_>,
-    expected_tag: u32,
-    key_indices: &mut std::collections::HashSet<u32>,
-) {
-    while let Some((tag, wire_type)) = cur.read_tag().ok().flatten() {
-        if tag == expected_tag && wire_type == 2 {
-            if let Ok(msg) = cur.read_len_delimited() {
-                scan_element_tag_keys(msg, key_indices);
-            }
-        } else if cur.skip_field(wire_type).is_err() {
-            return;
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::blob_meta::BlobFilter;
+    use crate::blob_meta::{BlobFilter, scan_block_tags};
 
     #[test]
     fn tag_index_roundtrip_empty() {

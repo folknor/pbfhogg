@@ -369,26 +369,21 @@ merge policy.
 
 Reported by: re-encoding.
 
-## HYG-013 - Diff and derive-changes share a parallel core in two copies, and "is modified" has three owners
+## HYG-013 - Diff and derive-changes share a parallel core in two copies
 
 `diff/parallel.rs` and `diff/derive_parallel.rs` each define `BlobDesc`,
 `WalkedFile`, `walk_file`, `Shard`, `plan_shards`, `build_shard`,
-`pread_decode`, `Side`, `element_merge`, `borrowed_elements_equal`,
-`borrowed_nodes_equal`, `borrowed_relations_equal`, `kind_type_char`,
-`append_and_cleanup` and the driver. The `borrowed_*_equal` trio is a third
-copy of `osc::merge_join`'s private functions (`parallel.rs` carries a TODO to
-lift them). The copies have drifted textually (merge_join uses
-`iter_tags_equal` for the dense/non-dense cases, the copies use `.eq`), look
-equivalent today, but the one predicate deciding what `diff` and
-`derive-changes` output has three owners and the sequential path uses a
-different one. `plan_shards` comments differ; `emit_merge_stats_counters` is
+`pread_decode`, `Side`, `element_merge`, `kind_type_char`,
+`append_and_cleanup` and the driver. The equality predicate is no longer
+copied: every diff path, merge-join and `digest` call
+`crate::content::content_equal` (CORRECTNESS.md "Tag iterators end early..."
+describes it). `plan_shards` comments differ; `emit_merge_stats_counters` is
 duplicated between `diff/mod.rs` and `derive.rs`; `extract_delete_info` and
 `write_delete_element` between `derive.rs` and `derive_parallel.rs`. Because
 the CLI defaults `-j 0` to all cores, the parallel path is the default for
 indexed inputs and the sequential paths run only under `--verbose` or `-j 1`.
-Fix: make `merge_join`'s equality `pub(crate)` and delete the copies; an
-equivalence test asserting byte-identical `-j1` and `-j8` output for diff and
-derive catches drift in any copy.
+Fix: one shared shard core; an equivalence test asserting byte-identical
+`-j1` and `-j8` output for diff and derive catches drift in any copy.
 
 Reported by: re-encoding.
 
@@ -655,8 +650,9 @@ Reported by: altw and scanning, write path.
 
 `drain::check_output_order` and `merge_join::BlobOrderGuard::observe` are the
 same transitive-watermark rule; `BlobOrderGuard` says "Same shape as the
-drain's output guard". They differ in what they keep (BUG-018) and in error
-wording, and the drain comment says `sort` and `cat --dedupe` "already use" the
+drain's output guard". They differ in what they keep (the drain stores the
+real ID beside the key, the guard recovers it with `osm_id_from_key`) and in
+error wording, and the drain comment says `sort` and `cat --dedupe` "already use" the
 same rule. Fix: one `OrderWatermark` type in `osm_id.rs`.
 
 Reported by: change application.
@@ -896,16 +892,21 @@ Reported by: re-encoding, geocode index, CLI and plumbing.
 - `block.rs::PrimitiveGroup::dense_nodes` and its twin: a `WireDenseNodes`
   parse error yields an empty iterator, so a corrupt dense group reads as "no
   nodes". `dense.rs::DenseNodeIter::new` drops all dense metadata on
-  corruption; the tag iterators end early on a bad varint.
-- `wire.rs` (`read_tag().ok()??`) ends on the first bad tag; `blob_meta` is in
-  BUG-036.
+  corruption.
+- `wire.rs` (`read_tag().ok()??`) ends on the first bad tag. The `blob_meta`
+  scanners no longer do this; their callers are in BUG-072.
+
+Already adjudicated, not to be re-reported: tag iterators ending early on an
+out-of-range string index, and roles collapsed to `""` by
+`role().unwrap_or("")` (the OSC writer, `bench_write_loop` and the owned
+conversions included), are accepted in CORRECTNESS.md "Tag iterators end
+early on an out-of-range string index". A tag array ending mid-varint is
+rejected up front by `validate_groups_strict`.
 - `owned.rs` `element_metadata` / `dense_node_metadata`: a `user()` string-table
   error becomes `""` and missing timestamps, changesets and uids become `0`,
   re-encoded by sort, `cat --dedupe`, degrade and time-filter. Documented, but
   opposite to decision 0004's defensive-input stance, and invisible.
-- `osc/write.rs`: `info.user().ok()` and `m.role().unwrap_or("")`, so
-  `diff --format osc` emits `role=""` for a broken role; `bench_write_loop`
-  does the same with `m.role().ok().unwrap_or_default()`.
+- `osc/write.rs`: `info.user().ok()`.
 - `StringInterner::resolve` and `CompactTagIter` return `""` on an
   out-of-range id or invalid UTF-8 ("keeps a read-side accessor from
   panicking"), turning arena corruption into silent empty tags.

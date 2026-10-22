@@ -13,12 +13,42 @@
 //!   box instead of zeros, so every real bbox is representable.
 //!
 //! All three versions are read. New indexdata is written as v3.
+//!
+//! A version byte fixes the field's length: v1 is exactly 26 bytes, v2 and v3
+//! exactly 42. A field whose length disagrees with its version byte is not an
+//! index of either shape and is refused - see [`classify_wire_indexdata`].
 
-mod scan_ids;
+mod scan;
 mod tag_index;
 
-pub(crate) use scan_ids::{scan_block_ids, scan_block_ids_checked};
-pub(crate) use tag_index::{TagIndex, encode_tag_index, scan_block_tags};
+pub(crate) use scan::{try_scan_block_ids_checked, try_scan_block_tags};
+pub(crate) use tag_index::{TagIndex, encode_tag_index};
+
+/// Scan a decompressed PrimitiveBlock for its [`BlobIndex`], or `None`.
+///
+/// `None` covers both "this blob cannot be described by one index" and "the
+/// block bytes are malformed" - see [`try_scan_block_ids_checked`], which keeps
+/// the two apart. Never a partial index: a parse failure anywhere in the block
+/// yields `None`, not an index built from the part that parsed.
+pub(crate) fn scan_block_ids(raw: &[u8]) -> Option<BlobIndex> {
+    scan_block_ids_checked(raw).map(|(index, _sorted)| index)
+}
+
+/// [`scan_block_ids`] plus the intra-blob sortedness flag. `None` collapses
+/// malformed bytes into "no index"; callers that build an index the output
+/// file will carry should use [`try_scan_block_ids_checked`] and treat its
+/// `Err` as an error.
+pub(crate) fn scan_block_ids_checked(raw: &[u8]) -> Option<(BlobIndex, bool)> {
+    try_scan_block_ids_checked(raw).ok().flatten()
+}
+
+/// Scan a decompressed PrimitiveBlock for its tag key set, or `None`.
+///
+/// Same collapse as [`scan_block_ids_checked`]; [`try_scan_block_tags`] keeps
+/// malformed bytes as an `Err`. Never a truncated key set.
+pub(crate) fn scan_block_tags(raw: &[u8]) -> Option<TagIndex> {
+    try_scan_block_tags(raw).ok().flatten()
+}
 
 /// Element type stored in a blob index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,10 +141,71 @@ const INDEX_VERSION: u8 = 0x03;
 const BBOX_ABSENT: [i32; 4] = [i32::MAX, i32::MIN, i32::MAX, i32::MIN];
 
 /// v1 serialized size: 1 version + 1 type + 8 min_id + 8 max_id + 8 count = 26 bytes.
-const INDEX_SIZE_V1: usize = 26;
+pub(crate) const INDEX_SIZE_V1: usize = 26;
 
 /// v2/v3 serialized size: v1 fields + 4×i32 bbox = 42 bytes.
 pub const INDEX_SIZE: usize = 42;
+
+/// The serialized size a version byte declares, or `None` for a version this
+/// crate does not read.
+///
+/// The single table both [`classify_wire_indexdata`] and
+/// [`BlobIndex::deserialize`] consult, so a new version cannot be readable by
+/// one and length-unchecked by the other.
+const fn version_size(version: u8) -> Option<usize> {
+    match version {
+        INDEX_VERSION_V1 => Some(INDEX_SIZE_V1),
+        INDEX_VERSION_V2 | INDEX_VERSION => Some(INDEX_SIZE),
+        _ => None,
+    }
+}
+
+/// What a non-empty `BlobHeader.indexdata` field (field 2) amounts to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WireIndexdata {
+    /// The field, stored in the fixed-size carrier every reader passes to
+    /// [`BlobIndex::deserialize`]. A 26-byte field is zero-padded.
+    Carrier([u8; INDEX_SIZE]),
+    /// A length that is neither 26 nor 42.
+    UnrecognisedLength(usize),
+    /// A recognised length whose version byte declares the other one: a
+    /// 26-byte field claiming v2/v3, or a 42-byte field claiming v1.
+    VersionLengthMismatch,
+}
+
+/// Classify the raw bytes of a non-empty indexdata field.
+///
+/// # Why the carrier needs this
+///
+/// Readers hold indexdata in a `[u8; INDEX_SIZE]`, so a 26-byte field arrives
+/// zero-padded and its original length is gone. `deserialize` must then read
+/// the version byte to know the layout - and a 26-byte field whose version
+/// byte says v3 would read four zero padding words as the bbox `(0, 0, 0, 0)`,
+/// which under v3 is a real box at Null Island (absence is [`BBOX_ABSENT`]).
+/// A spatial filter would then skip the blob for every region away from
+/// (0, 0): a wrong answer manufactured by the padding.
+///
+/// Refusing every known version whose declared size differs from the field's
+/// length makes the carrier lossless: for any carrier that holds a known
+/// version, the original length is the one that version declares, so
+/// deserialising the padded bytes reads exactly what the field said. A
+/// version this crate does not know passes into the carrier unchanged and is
+/// refused by `deserialize`, which is where unknown versions have always been
+/// rejected.
+pub(crate) fn classify_wire_indexdata(bytes: &[u8]) -> WireIndexdata {
+    let len = bytes.len();
+    if len != INDEX_SIZE_V1 && len != INDEX_SIZE {
+        return WireIndexdata::UnrecognisedLength(len);
+    }
+    if let Some(declared) = bytes.first().copied().and_then(version_size)
+        && declared != len
+    {
+        return WireIndexdata::VersionLengthMismatch;
+    }
+    let mut carrier = [0u8; INDEX_SIZE];
+    carrier[..len].copy_from_slice(bytes);
+    WireIndexdata::Carrier(carrier)
+}
 
 impl BlobIndex {
     /// Serialize to the 42-byte v3 indexdata format.
@@ -148,13 +239,21 @@ impl BlobIndex {
     /// Deserialize from indexdata bytes. Accepts v1 (26 bytes), v2 and v3
     /// (42 bytes).
     ///
-    /// Returns `None` if the data is invalid, too short, or has an unrecognized version.
+    /// `data` is either a field of exactly the length its version declares, or
+    /// the 42-byte reader carrier built by [`classify_wire_indexdata`]. The
+    /// second form is a carrier convention, not a raw-field rule: a 42-byte
+    /// slice holding a v1 index is accepted here because that is what a padded
+    /// 26-byte field looks like, and the classifier is the place a genuine
+    /// 42-byte v1 *field* is refused.
+    ///
+    /// Returns `None` for an unrecognised version, a length that fits neither
+    /// form, an unknown element kind, or an inverted ID range (`min_id >
+    /// max_id`). An inverted range cannot describe any set of elements, and
+    /// every range-based skip would act on it in the skipping direction.
     pub fn deserialize(data: &[u8]) -> Option<Self> {
-        if data.len() < INDEX_SIZE_V1 {
-            return None;
-        }
-        let version = data[0];
-        if version != INDEX_VERSION_V1 && version != INDEX_VERSION_V2 && version != INDEX_VERSION {
+        let version = *data.first()?;
+        let declared = version_size(version)?;
+        if data.len() != declared && data.len() != INDEX_SIZE {
             return None;
         }
         let kind = match data[1] {
@@ -166,35 +265,39 @@ impl BlobIndex {
         let min_id = i64::from_le_bytes(data[2..10].try_into().ok()?);
         let max_id = i64::from_le_bytes(data[10..18].try_into().ok()?);
         let count = u64::from_le_bytes(data[18..26].try_into().ok()?);
+        if min_id > max_id {
+            return None;
+        }
 
-        // v2/v3: parse the spatial bbox for node blobs.
-        let bbox =
-            if version != INDEX_VERSION_V1 && data.len() >= INDEX_SIZE && kind == ElemKind::Node {
-                let min_lat = i32::from_le_bytes(data[26..30].try_into().ok()?);
-                let max_lat = i32::from_le_bytes(data[30..34].try_into().ok()?);
-                let min_lon = i32::from_le_bytes(data[34..38].try_into().ok()?);
-                let max_lon = i32::from_le_bytes(data[38..42].try_into().ok()?);
-                let words = [min_lat, max_lat, min_lon, max_lon];
-                // v3 spells absence as the inverted box; v2 spelled it with zeros,
-                // so v2 files keep that reading - and keep the ambiguity their
-                // writer baked in. Any inverted box is absence under both versions,
-                // since no well-formed bbox can be inverted.
-                let absent = (version == INDEX_VERSION_V2 && words == [0, 0, 0, 0])
-                    || min_lat > max_lat
-                    || min_lon > max_lon;
-                if absent {
-                    None
-                } else {
-                    Some(BlobBbox {
-                        min_lat,
-                        max_lat,
-                        min_lon,
-                        max_lon,
-                    })
-                }
-            } else {
+        // v2/v3: parse the spatial bbox for node blobs. Keyed on the declared
+        // size, never on the slice length: a carrier holding a v1 index is 42
+        // bytes long and its last 16 are padding.
+        let bbox = if declared == INDEX_SIZE && kind == ElemKind::Node {
+            let min_lat = i32::from_le_bytes(data[26..30].try_into().ok()?);
+            let max_lat = i32::from_le_bytes(data[30..34].try_into().ok()?);
+            let min_lon = i32::from_le_bytes(data[34..38].try_into().ok()?);
+            let max_lon = i32::from_le_bytes(data[38..42].try_into().ok()?);
+            let words = [min_lat, max_lat, min_lon, max_lon];
+            // v3 spells absence as the inverted box; v2 spelled it with zeros,
+            // so v2 files keep that reading - and keep the ambiguity their
+            // writer baked in. Any inverted box is absence under both versions,
+            // since no well-formed bbox can be inverted.
+            let absent = (version == INDEX_VERSION_V2 && words == [0, 0, 0, 0])
+                || min_lat > max_lat
+                || min_lon > max_lon;
+            if absent {
                 None
-            };
+            } else {
+                Some(BlobBbox {
+                    min_lat,
+                    max_lat,
+                    min_lon,
+                    max_lon,
+                })
+            }
+        } else {
+            None
+        };
 
         Some(BlobIndex {
             kind,
@@ -555,6 +658,80 @@ mod tests {
         .serialize();
         bytes[1] = 5; // invalid element type
         assert!(BlobIndex::deserialize(&bytes).is_none());
+    }
+
+    fn node_index_bytes(version: u8, len: usize) -> Vec<u8> {
+        let mut f = vec![0u8; len];
+        f[0] = version;
+        f[1] = 0; // node
+        f[2..10].copy_from_slice(&1i64.to_le_bytes());
+        f[10..18].copy_from_slice(&5i64.to_le_bytes());
+        f[18..26].copy_from_slice(&5u64.to_le_bytes());
+        f
+    }
+
+    /// BUG-033: the length a version byte declares is binding. A 26-byte v3
+    /// slice would otherwise read past its end (or, in the padded carrier,
+    /// read zeros) as the real Null Island bbox `(0, 0, 0, 0)`.
+    #[test]
+    fn deserialize_rejects_a_length_its_version_does_not_declare() {
+        assert!(BlobIndex::deserialize(&node_index_bytes(INDEX_VERSION, INDEX_SIZE_V1)).is_none());
+        assert!(
+            BlobIndex::deserialize(&node_index_bytes(INDEX_VERSION_V2, INDEX_SIZE_V1)).is_none()
+        );
+        assert!(BlobIndex::deserialize(&node_index_bytes(INDEX_VERSION_V1, 30)).is_none());
+        // Counterparts: each version at its own length reads.
+        assert!(
+            BlobIndex::deserialize(&node_index_bytes(INDEX_VERSION_V1, INDEX_SIZE_V1)).is_some()
+        );
+        assert!(BlobIndex::deserialize(&node_index_bytes(INDEX_VERSION, INDEX_SIZE)).is_some());
+        // And the v1 carrier (a 26-byte field padded to 42) reads with no bbox.
+        let carrier = BlobIndex::deserialize(&node_index_bytes(INDEX_VERSION_V1, INDEX_SIZE))
+            .expect("the padded v1 carrier is accepted");
+        assert!(carrier.bbox.is_none());
+    }
+
+    #[test]
+    fn classifier_refuses_a_version_length_mismatch() {
+        for version in [INDEX_VERSION_V2, INDEX_VERSION] {
+            assert_eq!(
+                classify_wire_indexdata(&node_index_bytes(version, INDEX_SIZE_V1)),
+                WireIndexdata::VersionLengthMismatch
+            );
+        }
+        assert_eq!(
+            classify_wire_indexdata(&node_index_bytes(INDEX_VERSION_V1, INDEX_SIZE)),
+            WireIndexdata::VersionLengthMismatch
+        );
+        assert_eq!(
+            classify_wire_indexdata(&[0x03; 30]),
+            WireIndexdata::UnrecognisedLength(30)
+        );
+        // A v1 field is padded into the carrier, and the padding stays inert.
+        let WireIndexdata::Carrier(c) =
+            classify_wire_indexdata(&node_index_bytes(INDEX_VERSION_V1, INDEX_SIZE_V1))
+        else {
+            panic!("an honest v1 field must be accepted");
+        };
+        assert_eq!(BlobIndex::deserialize(&c).expect("v1 carrier").count, 5);
+        // An unknown version passes into the carrier; deserialize refuses it.
+        let WireIndexdata::Carrier(c) = classify_wire_indexdata(&[0xAB; INDEX_SIZE_V1]) else {
+            panic!("unknown versions are deserialize's to reject");
+        };
+        assert!(BlobIndex::deserialize(&c).is_none());
+    }
+
+    /// An inverted ID range describes no set of elements, and every
+    /// range-based skip would act on it in the skipping direction.
+    #[test]
+    fn deserialize_rejects_an_inverted_id_range() {
+        let mut bytes = node_index_bytes(INDEX_VERSION, INDEX_SIZE);
+        bytes[2..10].copy_from_slice(&9i64.to_le_bytes());
+        bytes[10..18].copy_from_slice(&3i64.to_le_bytes());
+        assert!(BlobIndex::deserialize(&bytes).is_none());
+        // A single-ID range is fine.
+        bytes[10..18].copy_from_slice(&9i64.to_le_bytes());
+        assert!(BlobIndex::deserialize(&bytes).is_some());
     }
 
     #[test]

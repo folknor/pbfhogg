@@ -242,12 +242,12 @@ fn write_three_kind_fixture(path: &Path) {
     writer.flush().expect("flush");
 }
 
-/// Cluster-2 fix: `altw external::stage1` rejects a node blob whose
-/// indexdata advertises `max_id < min_id`. Before the fix, stage 2's
-/// id-range partition would consume an empty range silently and emit
-/// no per-bucket assignments, causing later stages to drop all coords
-/// for the affected blob. After the fix, stage 1 hard-errors with a
-/// `reversed indexdata range` message.
+/// `altw external` must refuse a node blob whose indexdata advertises
+/// `max_id < min_id`. Accepted, stage 2's id-range partition would
+/// consume an empty range silently and drop every coordinate of the
+/// blob. `BlobIndex::deserialize` now rejects an inverted range as
+/// unreadable indexdata, so the input is refused up front as lacking
+/// indexdata, before stage 1's own reversed-range check is reached.
 #[test]
 fn altw_external_rejects_reversed_indexdata_range() {
     let dir = TempDir::new().expect("tempdir");
@@ -290,14 +290,10 @@ fn altw_external_rejects_reversed_indexdata_range() {
         out.stderr_str(),
     );
     let stderr = out.stderr_str();
-    // Pin the exact reversed-range hard error from
-    // `src/commands/altw/external/stage1.rs:412`. The original test
-    // OR'd this with `max_id` which the actual error always contains
-    // anyway, defeating the assertion (any unrelated error mentioning
-    // max_id would pass). Tier A1 follow-up.
+    // Pin the specific refusal, so an unrelated failure cannot pass.
     assert!(
-        stderr.contains("reversed indexdata range"),
-        "expected the stage1 reversed-range hard error; stderr:\n{stderr}",
+        stderr.contains("requires indexdata"),
+        "expected the unreadable-indexdata refusal; stderr:\n{stderr}",
     );
     assert!(
         !stderr.contains("panicked at"),

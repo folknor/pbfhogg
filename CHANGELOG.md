@@ -539,6 +539,19 @@
 
 ### Fixed
 
+- **Blob indexdata and tagdata are generated and read strictly.** The
+  scanners that derive a blob's index used to stop at the first bad tag and
+  skip groups they failed to parse, writing a tag index that omitted keys
+  (so `tags-filter` skipped blobs that matched) and ID ranges and counts that
+  understated the blob. They now parse every element with the decoder's own
+  parsers and produce an exact index or none. Non-dense node IDs were read
+  without zigzag decoding, so blobs of plain nodes were indexed with the
+  wrong ID range (node 3 recorded as 6); `cat` wrote those ranges into its
+  output. On the read side, a 26-byte indexdata whose version byte claims v2
+  or v3 is no longer zero-padded into a bbox at (0, 0) that spatial filters
+  trusted, and an inverted ID range or a repeated indexdata or tagdata field
+  now reads as no index.
+
 - **`add-locations-to-ways --index-type external` counts descriptors the
   process already holds** before sizing its shard workers. It budgeted from
   the soft `RLIMIT_NOFILE` alone, so a library caller holding many files, or

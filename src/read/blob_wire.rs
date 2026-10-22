@@ -5,6 +5,7 @@
 
 use bytes::Bytes;
 
+use crate::blob_meta::{INDEX_SIZE, INDEX_SIZE_V1, WireIndexdata};
 use crate::error::{BlobError, Result, new_blob_error, new_wire_error};
 
 /// Blob type parsed from BlobHeader, avoiding per-blob String allocation.
@@ -27,8 +28,12 @@ pub(crate) struct WireBlobHeader {
     pub blob_type: BlobKind,
     pub datasize: i32,
     pub unrecognised_indexdata_len: Option<usize>,
-    /// Blob-level index: 42 bytes (v2) or 26 bytes (v1, zero-padded), stored inline.
-    pub indexdata: Option<[u8; crate::blob_meta::INDEX_SIZE]>,
+    /// Blob-level index in the fixed-size reader carrier: a 42-byte v2/v3
+    /// field, or a 26-byte v1 field zero-padded. Built only by
+    /// [`crate::blob_meta::classify_wire_indexdata`], which refuses a field
+    /// whose length disagrees with its version byte, so the padding can never
+    /// be read as data. `None` also when the field occurred twice with data.
+    pub indexdata: Option<[u8; INDEX_SIZE]>,
     /// Whether field 2 was present and non-empty on the wire, *regardless* of
     /// whether its length was one this crate recognises.
     ///
@@ -67,10 +72,11 @@ impl WireBlobHeader {
         let mut cursor = Cursor::new(data);
         let mut blob_type = BlobKind::Unknown(String::new());
         let mut datasize: i32 = 0;
-        let mut indexdata: Option<[u8; crate::blob_meta::INDEX_SIZE]> = None;
+        let mut indexdata: Option<[u8; INDEX_SIZE]> = None;
         let mut indexdata_present = false;
         let mut unrecognised_indexdata_len = None;
         let mut tagdata: Option<Box<[u8]>> = None;
+        let mut tagdata_seen = false;
         let mut waymembers: Option<Box<[u8]>> = None;
 
         while let Some((field, wire_type)) = cursor.read_tag()? {
@@ -88,16 +94,34 @@ impl WireBlobHeader {
                     };
                 }
                 2 if parse_indexdata => {
-                    // indexdata: bytes (len-delimited) - accept v1 (26) or v2/v3 (42) sizes
+                    // indexdata: bytes (len-delimited). The length and version
+                    // checks live in `blob_meta`, next to the format.
+                    //
+                    // An empty occurrence contributes nothing. A second
+                    // non-empty occurrence is two claims about one blob;
+                    // protobuf would keep the last, a reader stopping early
+                    // the first, and no choice is safe for both, so the blob
+                    // gets none - sticky, so a third occurrence cannot
+                    // restore one. `indexdata_present` stays set, which is
+                    // how `check --index` sees the malformed claim.
                     let bytes = cursor.read_len_delimited()?;
-                    let len = bytes.len();
-                    indexdata_present |= len != 0;
-                    if len == crate::blob_meta::INDEX_SIZE || len == 26 {
-                        let mut buf = [0u8; crate::blob_meta::INDEX_SIZE];
-                        buf[..len].copy_from_slice(bytes);
-                        indexdata = Some(buf);
-                    } else if len != 0 {
-                        unrecognised_indexdata_len = Some(len);
+                    if !bytes.is_empty() {
+                        if indexdata_present {
+                            indexdata = None;
+                        } else {
+                            match crate::blob_meta::classify_wire_indexdata(bytes) {
+                                WireIndexdata::Carrier(carrier) => indexdata = Some(carrier),
+                                WireIndexdata::UnrecognisedLength(len) => {
+                                    unrecognised_indexdata_len = Some(len);
+                                }
+                                // A 26-byte field claiming the 42-byte layout
+                                // (or the reverse): zero padding would read as
+                                // a real bbox. Not an index; not a length
+                                // problem either, so no length warning.
+                                WireIndexdata::VersionLengthMismatch => {}
+                            }
+                        }
+                        indexdata_present = true;
                     }
                 }
                 3 => {
@@ -108,10 +132,25 @@ impl WireBlobHeader {
                     }
                 }
                 4 if parse_tagdata => {
-                    // tagdata: per-blob tag key index (len-delimited)
+                    // tagdata: per-blob tag key index (len-delimited). Same
+                    // duplicate rule as indexdata: a second non-empty
+                    // occurrence leaves the blob with no tag index, sticky.
+                    //
+                    // `None` rather than an invalid sentinel on purpose:
+                    // sort, cat --dedupe and apply-changes copy these bytes
+                    // into the headers they write, so a sentinel would
+                    // manufacture a malformed field in their output. The
+                    // cost is that `check --index` cannot see a duplicate
+                    // tagdata on its input (there is no tagdata presence
+                    // flag); no reader acts on it either way.
                     let bytes = cursor.read_len_delimited()?;
                     if !bytes.is_empty() {
-                        tagdata = Some(bytes.into());
+                        tagdata = if tagdata_seen {
+                            None
+                        } else {
+                            Some(bytes.into())
+                        };
+                        tagdata_seen = true;
                     }
                 }
                 5 if parse_waymembers => {
@@ -346,7 +385,7 @@ pub(crate) fn parse_blob_header_with_index(
 ) -> Result<(
     BlobKind,
     usize,
-    Option<[u8; crate::blob_meta::INDEX_SIZE]>,
+    Option<[u8; INDEX_SIZE]>,
     bool,
     Option<Box<[u8]>>,
 )> {
@@ -357,8 +396,8 @@ pub(crate) fn parse_blob_header_with_index(
             Warning,
             "indexdata.unrecognised_length",
             "warning: BlobHeader.indexdata has an unrecognised length ({len} bytes; \
-             expected 26 or 42) - blob index ignored, reads fall back to full decode. \
-             Further occurrences are not reported."
+             expected {INDEX_SIZE_V1} or {INDEX_SIZE}) - blob index ignored, reads fall back \
+             to full decode. Further occurrences are not reported."
         );
     }
 
@@ -400,7 +439,9 @@ pub(crate) fn parse_blob_header_with_index(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
 mod tests {
-    use super::{BlobError, BlobKind, MAX_BLOB_DATASIZE, parse_blob_header_with_index};
+    use super::{
+        BlobError, BlobKind, MAX_BLOB_DATASIZE, WireBlobHeader, parse_blob_header_with_index,
+    };
     use crate::error::ErrorKind;
 
     /// Hand-encode a minimal BlobHeader protobuf (`OSMData` type + a chosen
@@ -532,5 +573,110 @@ mod tests {
                 .expect("an unknown but named blob type must still parse");
         assert_eq!(blob_type, BlobKind::Unknown("OSMFoo".to_string()));
         assert_eq!(data_size, 100);
+    }
+
+    /// `OSMData` header carrying the given field-2 and field-4 occurrences.
+    fn header_with_fields(indexdata: &[Vec<u8>], tagdata: &[Vec<u8>]) -> Vec<u8> {
+        let mut h = vec![0x0A, 7];
+        h.extend_from_slice(b"OSMData");
+        for field in indexdata {
+            h.push(0x12);
+            h.push(field.len() as u8);
+            h.extend_from_slice(field);
+        }
+        for field in tagdata {
+            h.push(0x22);
+            h.push(field.len() as u8);
+            h.extend_from_slice(field);
+        }
+        h.extend_from_slice(&[0x18, 100]);
+        h
+    }
+
+    /// A node index of the given version in a field of `len` bytes, with an
+    /// honest ID range; bytes past 26 are zero.
+    fn node_index_field(version: u8, len: usize) -> Vec<u8> {
+        let mut f = vec![0u8; len];
+        f[0] = version;
+        f[1] = 0; // node
+        f[2..10].copy_from_slice(&1i64.to_le_bytes());
+        f[10..18].copy_from_slice(&5i64.to_le_bytes());
+        f[18..26].copy_from_slice(&5u64.to_le_bytes());
+        f
+    }
+
+    fn parse(h: &[u8]) -> WireBlobHeader {
+        WireBlobHeader::parse(h, true, true, false).unwrap()
+    }
+
+    /// BUG-033: a 26-byte field whose version byte says v3 used to be padded
+    /// to 42 bytes and read back with the bbox `(0, 0, 0, 0)` - under v3 a
+    /// real box at Null Island, so a spatial filter skipped the blob for any
+    /// region away from (0, 0).
+    #[test]
+    fn a_short_field_claiming_the_long_layout_is_not_an_index() {
+        for version in [0x02u8, 0x03] {
+            let h = parse(&header_with_fields(&[node_index_field(version, 26)], &[]));
+            assert!(
+                h.indexdata.is_none(),
+                "v{version} in 26 bytes must not be read"
+            );
+            assert!(
+                h.indexdata_present,
+                "but it is a claim check --index must see"
+            );
+            assert!(
+                h.unrecognised_indexdata_len.is_none(),
+                "26 is a known length"
+            );
+        }
+        // The reverse mismatch: a v1 index padded out to 42 bytes on the wire.
+        let h = parse(&header_with_fields(&[node_index_field(0x01, 42)], &[]));
+        assert!(h.indexdata.is_none());
+        assert!(h.indexdata_present);
+    }
+
+    /// Passing counterpart: honest v1 and v3 fields still read, and the v1
+    /// carrier's zero padding is never taken as a bbox.
+    #[test]
+    fn honest_v1_and_v3_fields_still_read() {
+        let h = parse(&header_with_fields(&[node_index_field(0x01, 26)], &[]));
+        let index = crate::blob_meta::BlobIndex::deserialize(&h.indexdata.unwrap()).unwrap();
+        assert_eq!((index.min_id, index.max_id, index.count), (1, 5, 5));
+        assert!(
+            index.bbox.is_none(),
+            "v1 has no bbox; the padding is not one"
+        );
+
+        let v3 = crate::blob_meta::BlobIndex::deserialize(&node_index_field(0x03, 42))
+            .unwrap()
+            .serialize();
+        let h = parse(&header_with_fields(&[v3.to_vec()], &[]));
+        assert!(h.indexdata.is_some());
+    }
+
+    /// Two non-empty indexdata occurrences are two claims; the blob gets
+    /// neither, and a third occurrence does not bring one back.
+    #[test]
+    fn duplicate_indexdata_is_no_index() {
+        let a = node_index_field(0x01, 26);
+        let h = parse(&header_with_fields(&[a.clone(), a.clone()], &[]));
+        assert!(h.indexdata.is_none());
+        assert!(h.indexdata_present);
+        let h = parse(&header_with_fields(&[a.clone(), a.clone(), a.clone()], &[]));
+        assert!(h.indexdata.is_none());
+
+        // An empty occurrence contributes nothing, in either position.
+        let h = parse(&header_with_fields(&[Vec::new(), a, Vec::new()], &[]));
+        assert!(h.indexdata.is_some());
+    }
+
+    #[test]
+    fn duplicate_tagdata_is_no_tagdata() {
+        let t = vec![0x01u8, 0x00, 0x00];
+        let h = parse(&header_with_fields(&[], &[t.clone(), t.clone(), t.clone()]));
+        assert!(h.tagdata.is_none());
+        let h = parse(&header_with_fields(&[], &[Vec::new(), t.clone()]));
+        assert_eq!(h.tagdata.as_deref(), Some(t.as_slice()));
     }
 }

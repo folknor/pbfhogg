@@ -415,7 +415,10 @@ caller asks, not on every read.
   the payload with `scan_block_ids` / `scan_block_tags`, and reports each
   disagreement. Those are the same two scanners the writer's *passthrough* path
   uses, so on a re-framed blob the check cannot catch a bug inside the scanner
-  itself - only metadata that has since diverged from its payload. Against the
+  itself - only metadata that has since diverged from its payload. The
+  scanners parse every element through the decoder's own `wire.rs` parsers
+  and never return a partial index: a block they cannot fully parse yields
+  an error or no index, never a shorter one. Against the
   ordinary write path it is independent: `BlockBuilder` derives its index
   incrementally as elements are added and never rescans what it emitted. It
   never routes on the metadata it is checking - no blob filter,
@@ -436,8 +439,10 @@ caller asks, not on every read.
 
 Absence is not the same as unreadability, and the difference is load-bearing.
 `BlobIndex::deserialize` returns `None` for an index of an unrecognised length,
-version or element kind, and every *reader* is right to treat that as "no index,
-decode the blob" - but a verifier that inherits the collapse passes the single
+version or element kind, for a field whose length disagrees with the size its
+version byte declares (26 bytes for v1, 42 for v2 and v3), for an inverted ID
+range, and when a blob header carries the field more than once. Every *reader*
+is right to treat that as "no index, decode the blob" - but a verifier that inherits the collapse passes the single
 most obviously broken input it can be handed. The verifier therefore carries the
 raw field's *presence* separately from its parsed value, and reports unreadable
 `indexdata`, unreadable `tagdata`, and a well-formed `tagdata` attached to a

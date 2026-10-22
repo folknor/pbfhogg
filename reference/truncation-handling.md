@@ -270,9 +270,10 @@ parser of its own, so the policy cannot drift again:
   matched `WIRE_LEN` only on `refs`, `keys` and `vals`; an unpacked
   `refs` invoked no callback at all and the caller concluded the way
   referenced no nodes - a silently short node index.
-- `src/blob_meta/scan_ids.rs` parses DenseNodes via
-  `WireDenseNodes::parse`. An unpacked `id` array read as empty, so
-  the blob silently got no indexdata.
+- `src/blob_meta/scan.rs` parses every element message (`Node`,
+  `DenseNodes`, `Way`, `Relation`) via the `wire.rs` parsers. Its
+  predecessor read an unpacked `id` array as empty, so the blob
+  silently got no indexdata.
 - `src/scan/node.rs` already routed through `WireDenseNodes::parse`
   and never had the defect; its own top-level matcher touches only
   submessages and scalar fields, neither of which can be packed.

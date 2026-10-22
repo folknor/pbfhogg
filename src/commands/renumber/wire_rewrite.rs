@@ -11,7 +11,7 @@ use crate::idset::IdSet;
 
 /// Error text for a packed field this rewriter cannot splice.
 ///
-/// Unlike `src/scan/*` and `src/blob_meta/scan_ids.rs`, these rewriters cannot
+/// Unlike `src/scan/*` and `src/blob_meta/scan.rs`, these rewriters cannot
 /// route through `src/read/wire.rs`. `wire.rs` yields a packed field's *value*
 /// as a borrowed slice; a byte-level splice needs the field's *byte range*
 /// inside the enclosing message - the tag start and the value end - so that

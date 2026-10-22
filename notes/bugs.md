@@ -55,15 +55,25 @@ the bitset (`start_id + rank_if_set(old_id)`). The two agree only if node IDs
 are strictly increasing across the whole node section in schedule order with
 no duplicates. Nothing checks that: `require_sorted` trusts the header's
 `Sort.Type_then_ID`, the delta decode accepts zero and negative deltas (only
-`old_id < 0` is refused), and a duplicate sets the same bit twice. A file that
-lies about being sorted (what `degrade --unsort` produces) or carries a
-duplicate node gets ways pointing at the wrong nodes, exit 0. The same
-reasoning applies to way IDs in stage 2d versus relation member resolution.
+`old_id < 0` is refused), and a duplicate sets the same bit twice. A file
+whose header falsely claims to be sorted, or that carries a duplicate node,
+gets ways pointing at the wrong nodes, exit 0. The same reasoning applies to
+way IDs in stage 2d versus relation member resolution.
+
+`degrade --unsort` output is not such a file: degrade clears the sorted claim
+whenever an unsort flag is set, so `require_sorted` already refuses it. The
+fixture has to be built by hand: a header claiming `Sort.Type_then_ID` over
+out-of-order or duplicated IDs.
+
+CORRECTNESS.md "`sort`: intra-blob disorder" accepts a false sorted claim as
+the input's own fault, but there the consequence is only that sort passes the
+input through unchanged. Here the same false claim produces wrong output, so
+that precedent does not cover it.
 
 The check is cheap: `delta > 0` per node inside a group, and per-blob
 `min_id > previous max_id` in the schedule, where indexdata is already in hand.
-Enforce with a test that runs `degrade --unsort` output, or a duplicate-ID
-fixture, through renumber and asserts refusal.
+Enforce with a test that runs a hand-built false-claim or duplicate-ID
+fixture through renumber and asserts refusal.
 
 Renumber's `--start-id` is also not range-checked: negative starts are
 accepted and can produce a renumbered ID 0.
@@ -287,17 +297,6 @@ commands.
 
 Reported by: change application.
 
-## BUG-018 - `BlobOrderGuard` reports the wrong ID for negative IDs
-
-`merge_join.rs::BlobOrderGuard::observe` formats `prev_last.1` as an ID, but
-`prev_last` is an `osm_id_key`, whose `.1` for a negative ID is
-`id.saturating_neg()`. A trip after blob `-5..-3` says "already reaching id
-5". The drain's twin guard (`check_output_order`) stores the real ID beside
-the key for exactly this reason. The two guards are one rule (HYG-025);
-merging them fixes this.
-
-Reported by: change application.
-
 ## BUG-019 - Negative timestamps become year 584 billion in OSC output
 
 `osc/write.rs::push_info_attrs` does
@@ -499,26 +498,6 @@ Move the increment after the read.
 
 Reported by: read path.
 
-## BUG-033 - Zero-padding a 26-byte indexdata can manufacture a real Null Island bbox
-
-`WireBlobHeader::parse` and the frame path copy a 26-byte (v1) indexdata into
-a zeroed 42-byte buffer. `BlobIndex::deserialize` trusts the version byte,
-not the original length: a 26-byte field whose version byte says v3 and kind
-Node reads bbox words `[0, 0, 0, 0]`, which under v3 is a real box at (0, 0)
-(`BBOX_ABSENT` is the inverted box). A spatial filter would then skip that
-blob for any region not containing (0, 0). No conforming writer produces this,
-but the padding undoes the reason v3 exists. `deserialize` also accepts
-`min_id > max_id`, which makes every range-based skip wrong in the skip
-direction.
-
-Related: the accepted-length check is `len == INDEX_SIZE || len == 26`, with
-"expected 26 or 42" in the warning, while `INDEX_SIZE_V1 = 26` exists in
-`blob_meta` but is private. Fix: carry the original length
-(`RawIndex { bytes, len }`, constructed only in `blob_meta`), reject a v2/v3
-version byte on a 26-byte field, reject inverted ranges. Unit-testable.
-
-Reported by: read path.
-
 ## BUG-034 - `DirectReader::skip` misses skip-past-EOF on an aligned target
 
 When `aligned == target`, `skip` seeks and clears the buffer with no EOF
@@ -538,18 +517,6 @@ Sequential `for_each` debug-asserts strictly increasing node IDs
 `>=` for history files. The sequential path therefore asserts on any sorted
 history file in debug builds. Extract one `check_sorted_order(header)` used by
 both; testable with a sorted history fixture in debug.
-
-Reported by: read path.
-
-## BUG-036 - A truncated tag index from `blob_meta` makes tag filters skip blobs
-
-`blob_meta/tag_index.rs` and `scan_ids.rs` loop on
-`read_tag().ok().flatten()` and end on the first bad tag, returning `None` or
-a truncated result. There is no upfront validation in `blob_meta`. A truncated
-tag index written by the write path is an under-claiming index, which a tag
-filter then uses to skip blobs: a wrong answer, not a degradation. A parse
-failure while building an index must be an error, never a short index. See
-HYG-034 for the general decode-to-default pattern.
 
 Reported by: read path.
 
@@ -803,16 +770,6 @@ empty stderr on every negative-answer path would hold it.
 
 Reported by: CLI and plumbing.
 
-## BUG-055 - `osm_id_key(i64::MIN)` collides with `-i64::MAX`
-
-`saturating_neg` maps `i64::MIN` to `(1, i64::MAX)`, the key of
-`-i64::MAX`. Two distinct IDs compare equal in canonical order, so dedupe or
-merge-join over a crafted file collapses them. The agreement test uses
-`i64::MIN + 1` and steps around it. Enforce with a proptest over full `i64`
-asserting injectivity.
-
-Reported by: CLI and plumbing.
-
 ## BUG-056 - `bench-merge` deletes the user-named output before running
 
 `run_bench_merge` does `drop(std::fs::remove_file(output))` up front and is
@@ -985,3 +942,53 @@ entry, whose deadlock half the library-use executor work fixed; this half is
 not a process-ownership question and was out of that scope.
 
 Reported by: write path.
+
+## BUG-071 - Renumber orphan refs can collide with new IDs
+
+DEVIATIONS.md "renumber: orphan-reference handling" says orphan refs (to
+objects absent from the input) pass through with their old ID, and claims
+"the output never contains ids for objects that aren't in the output" and
+that "a ref to old id X always means the thing that had id X in the input".
+Both are false. An orphan ref is by definition an ID for an object not in
+the output, and its old ID can equal a new ID assigned to a different
+object: with the default start ID, an orphan ref to old node 5 and the
+renumbered node 5 are the same number, so the way silently points at the
+wrong node. Derived from the documented behaviour, not reproduced.
+
+Options: assign orphans fresh IDs past the in-input range (osmium), refuse,
+or keep pass-through and document the collision. The DEVIATIONS rationale
+needs rewriting whichever is chosen.
+
+Reported by: cross-reference of the notes against DEVIATIONS.md.
+
+## BUG-072 - Index-generating callers turn a malformed block into "no index" instead of an error
+
+The `blob_meta` scanners now come in two forms: `try_scan_block_ids_checked`
+and `try_scan_block_tags` return `Err` for a block they cannot parse, while
+the old `scan_block_ids`, `scan_block_ids_checked` and `scan_block_tags`
+keep their signatures and map that `Err` to `None`. The writer's passthrough
+reframe (`src/write/writer.rs`) and plain `cat` (`src/commands/cat/mod.rs`)
+still call the old forms, so a malformed payload is written out without an
+index rather than refused. `check --index` likewise does not report a
+scanner `Err` as its own violation, so a malformed payload with no stored
+sidecar metadata passes. Switch these to the `try_` forms. `sort` and
+`cat --dedupe` already turn `None` into an error.
+
+Related: duplicate tagdata reads as `None` rather than a placeholder,
+because sort, dedupe and apply-changes copy those bytes through, so
+`check --index` cannot see duplicate tagdata on its input; a presence flag
+in `read/frame.rs` and `raw_frame.rs` would close it. The read-path warning
+in `src/read/blob.rs` still spells the accepted lengths as "26 or 42".
+
+Reported by: the blob_meta fix for the former strict-scanner entry.
+
+## BUG-073 - `BlockBuilder` leaves empty-string keys out of tagdata
+
+`src/write/block_builder.rs` drops the empty key from the tag index it
+writes, so a blob whose elements carry a tag with key `""` advertises a key
+set without it, and `tags-filter -e ',highway'` style expressions that
+require the empty key skip the blob: a wrong answer. The passthrough
+scanner now includes empty keys, so `check --index` flags such blobs as
+`TagKeysMissing`.
+
+Reported by: the blob_meta fix for the former strict-scanner entry.

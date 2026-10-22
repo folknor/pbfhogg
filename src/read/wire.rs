@@ -11,6 +11,20 @@ pub(crate) use protohoggr::{
     WIRE_LEN, WIRE_VARINT,
 };
 
+/// Read a protobuf `int32` varint, refusing a value outside `i32` with
+/// `overflow_msg` instead of narrowing it.
+///
+/// An `int32` is encoded sign-extended to 64 bits, so a negative value is a
+/// legal ten-byte varint and reads back exactly through `read_varint_i64`.
+/// Narrowing with `as i32` would alias an out-of-range value (`2^32 + 100`)
+/// to a different, plausible one (`100`). Shared by both PrimitiveBlock
+/// header scans (`WireBlock` here and `blob_meta`'s ID scan) so the two agree
+/// on which `granularity` and `date_granularity` values a block may carry.
+#[inline]
+pub(crate) fn read_int32(cursor: &mut Cursor<'_>, overflow_msg: &'static str) -> Result<i32> {
+    i32::try_from(cursor.read_varint_i64()?).map_err(|_| new_wire_error(overflow_msg))
+}
+
 /// Record one occurrence of a packed repeated field into `slot`.
 ///
 /// Protobuf permits a packed repeated field to be written in either wire form:
@@ -275,10 +289,8 @@ impl<'a> WireBlock<'a> {
                         group_entries.push((offset as u32, data.len() as u32));
                     }
                     (17, WIRE_VARINT) => {
-                        #[allow(clippy::cast_possible_wrap)]
-                        {
-                            granularity = cursor.read_varint()? as i32;
-                        }
+                        granularity =
+                            read_int32(&mut cursor, "PrimitiveBlock.granularity exceeds int32")?;
                     }
                     (19, WIRE_VARINT) => {
                         lat_offset = cursor.read_varint_i64()?;
@@ -287,10 +299,10 @@ impl<'a> WireBlock<'a> {
                         lon_offset = cursor.read_varint_i64()?;
                     }
                     (18, WIRE_VARINT) => {
-                        #[allow(clippy::cast_possible_wrap)]
-                        {
-                            date_granularity = cursor.read_varint()? as i32;
-                        }
+                        date_granularity = read_int32(
+                            &mut cursor,
+                            "PrimitiveBlock.date_granularity exceeds int32",
+                        )?;
                     }
                     _ => cursor.skip_field(wire_type)?,
                 }
@@ -828,6 +840,54 @@ impl WireInfo {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// int32 scales are checked once in the block header scan. Negative
+    /// scales are legal signed values; scaling itself remains modular.
+    #[test]
+    fn block_scales_require_signed_int32_without_aliasing() {
+        for field in [17_u64, 18] {
+            for value in [
+                i64::from(i32::MIN),
+                -1,
+                0,
+                1,
+                i64::from(i32::MAX),
+                i64::from(i32::MIN) - 1,
+                i64::from(i32::MAX) + 1,
+                (1_i64 << 32) + 100,
+                i64::MAX,
+                i64::MIN,
+            ] {
+                // Encode independently of the production writer, including
+                // the ten-byte sign extension required for negative int32.
+                let mut block = vec![0x0a, 2, 0x0a, 0];
+                for mut word in [field << 3, u64::from_ne_bytes(value.to_ne_bytes())] {
+                    while word >= 128 {
+                        block.push(u8::try_from(word & 127).unwrap() | 128);
+                        word >>= 7;
+                    }
+                    block.push(u8::try_from(word).unwrap());
+                }
+                let expected = i32::try_from(value).is_ok();
+                let decoded = crate::PrimitiveBlock::from_vec(block.clone());
+                assert_eq!(decoded.is_ok(), expected, "field {field}, value {value}");
+                let scanned = crate::blob_meta::try_scan_block_ids_checked(&block);
+                assert_eq!(
+                    scanned.is_ok(),
+                    expected,
+                    "scan field {field}, value {value}"
+                );
+                if let Err(err) = decoded {
+                    let name = if field == 17 {
+                        "granularity"
+                    } else {
+                        "date_granularity"
+                    };
+                    assert!(err.to_string().contains(name));
+                }
+            }
+        }
+    }
 
     /// Tag string indices wider than `u32` are refused when the block is
     /// built (the structural validation in `read/block.rs`), not by

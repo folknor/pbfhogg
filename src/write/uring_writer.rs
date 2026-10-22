@@ -415,17 +415,25 @@ impl UringState {
     /// pending when the state is dropped. This keeps reaping until the ring is
     /// quiet.
     ///
-    /// Termination is bounded twice over: every iteration reaps at least one
-    /// CQE (`submit_and_wait(1)`), and the loop gives up after more rounds
-    /// than there are buffers, so a kernel that stops producing completions
-    /// costs a leaked pin rather than a hung writer thread.
+    /// This is best-effort cleanup, not a wall-clock shutdown guarantee.
+    /// The round cap only limits retries after errors: `submit_and_wait(1)`
+    /// itself has no deadline, and a submit error need not consume a CQE.
+    /// Keep the blocking drain here because returning on a timer would not
+    /// establish that registered buffers are no longer in use. The io-uring
+    /// dependency's `IoUring::drop` unmaps the queues and closes the fd; it
+    /// does not expose a timed quiescence handshake. Cancellation is also a
+    /// request whose completion must be observed, not a deadline guarantee.
+    /// A bounded return therefore needs a separate ownership policy for an
+    /// abandoned ring and its allocation (leak them, or transfer them to a
+    /// reaper that may itself wait indefinitely). That changes resource and
+    /// shutdown semantics and is deliberately not hidden in a retry limit.
     fn drain_best_effort(&mut self) {
         let mut rounds = 0_u32;
         while self.in_flight > 0 && rounds < u32::from(NUM_BUFS) * 4 {
             rounds += 1;
             if self.reap_cqes(true).is_err() {
-                // The CQE carried an error; `in_flight` still went down.
-                // Keep going - the point is quiescence, not success.
+                // A failing CQE consumes one in-flight entry; a submit error
+                // may consume none. Retry either case up to the round cap.
             }
         }
     }
@@ -464,9 +472,10 @@ impl UringState {
 /// (the `ReadFixed` chain this writer used to submit for `CopyRange` was
 /// exactly that shape), and it is a pin leak either way.
 ///
-/// Draining first removes the window entirely, and is nearly free: on the
-/// error paths there are at most `NUM_BUFS` completions outstanding, and they
-/// have already been submitted.
+/// A successful drain removes the window. There are at most `NUM_BUFS`
+/// completions outstanding, but no time bound on obtaining them. If repeated
+/// submit errors exhaust the retry cap, cleanup remains best-effort and the
+/// field-order fallback above still applies; this is not guaranteed quiescence.
 impl Drop for UringState {
     fn drop(&mut self) {
         self.drain_best_effort();

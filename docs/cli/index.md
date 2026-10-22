@@ -38,6 +38,6 @@ Most write commands accept:
 - `-o, --output <FILE>` - output file
 - `--compression <SPEC>` - `none`, `zlib` (default), `zstd`, or with level (`zlib:9`, `zstd:19`)
 - `--direct-io` - bypass page cache (Linux, requires `linux-direct-io` feature)
-- `--force` - proceed without indexdata (slower)
+- `--force` - proceed without indexdata (slower) on commands that accept it; for `build-geocode-index`, it is a legacy shorthand for `--overwrite --allow-unindexed`
 
 See [Commands](./commands) for the full reference.

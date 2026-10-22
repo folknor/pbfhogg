@@ -319,6 +319,12 @@ fn parse_ring(ring: &serde_json::Value) -> Result<Vec<(f64, f64)>> {
         crate::coord_pack::validate_lat("polygon latitude", lat)?;
         result.push((lon, lat));
     }
+    // Self-intersections are deliberately not rejected here. osmium extract
+    // also accepts rings without a simplicity check and applies even-odd
+    // ray crossing when selecting points; rejecting crossings would diverge
+    // from that behavior and requires a separate geometry-validation pass.
+    // The signed-area check below still rejects rings whose algebraic area
+    // cancels to zero, including a symmetric bow-tie.
     // A ring can still collapse to a line or point (fewer than three distinct
     // positions, or all collinear) and so have no interior to select. Taking
     // the shoelace sum relative to the first position makes the closing

@@ -40,7 +40,7 @@ Most write commands accept:
 - `-o, --output <FILE>` - output file
 - `--compression <SPEC>` - `none`, `zlib` (default), `zstd`, or with level (`zlib:9`, `zstd:19`)
 - `--direct-io` - bypass page cache (Linux, requires `linux-direct-io` feature)
-- `--force` - proceed without indexdata (slower)
+- `--force` - proceed without indexdata (slower) on commands that accept it; for `build-geocode-index`, it is a legacy shorthand for `--overwrite --allow-unindexed`
 - `--generator <NAME>` - override writing program in output header
 - `--output-header <K=V>` - set replication metadata fields
 
@@ -52,7 +52,7 @@ pbfhogg embeds blob-level index metadata (element type, ID range, spatial bbox, 
 pbfhogg cat input.osm.pbf -o indexed.osm.pbf
 ```
 
-Commands that benefit from indexdata will error if it's missing. Pass `--force` to proceed anyway.
+Commands that benefit from indexdata will error if it's missing. Pass `--force` to proceed anyway. For `build-geocode-index`, use `--allow-unindexed` to opt into the slower fallback while keeping overwrite permission separate; its `--force` flag remains a shorthand for both `--overwrite` and `--allow-unindexed`.
 
 ## Performance
 

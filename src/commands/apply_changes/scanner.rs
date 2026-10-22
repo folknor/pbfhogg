@@ -170,6 +170,18 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
         // coord tuples for the barrier merge, even when the blob
         // doesn't overlap the diff. Way/Relation blobs are still
         // eligible for the splice fast-path under LOW.
+        //
+        // "Node" here is an indexdata claim, not an observed payload kind.
+        // A node blob mislabelled Way/Relation can bypass extraction (via
+        // CopyRange or owned passthrough) and is placed after the coordinate
+        // barrier. Pending location mode only guards rewritten ways; it
+        // cannot validate these routes. Checking just candidate workers
+        // would leave both passthrough routes unchecked. Rejecting dishonest
+        // kinds requires payload verification before scanner routing and
+        // barrier placement, including non-overlapping way/relation claims.
+        // Keep that a deliberate indexdata trust-policy change: the measured
+        // descriptor-first path avoids reading/decompressing those bodies,
+        // and kind verification alone would still trust forged ID ranges.
         let low_node_must_decompress = locations_on_ways && matches!(kind, ElemKind::Node);
         let is_fastpath = has_indexdata
             && use_copy_range

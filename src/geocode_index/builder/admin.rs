@@ -118,6 +118,10 @@ fn assemble_one_relation(
     way_geom: &FxHashMap<i64, Vec<(i32, i32)>>,
     max_verts: usize,
 ) -> Vec<AssembledPolygon> {
+    // Extracts may contain a relation but omit one or more member ways. Only
+    // member geometry present in this PBF can close an outer ring; missing
+    // geometry is omitted, and the relation contributes no polygon if no
+    // usable outer ring remains.
     let outer_segs: Vec<&[(i32, i32)]> = rel
         .outer_way_ids
         .iter()

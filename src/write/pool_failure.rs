@@ -30,6 +30,8 @@
 //! its stop check raced the publication. What the owner guarantees is that
 //! no thread it started outlives the call, not that work halts instantly.
 
+use crate::error::panic_error;
+
 use std::any::Any;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -98,24 +100,6 @@ impl FirstFailure {
             .as_ref()
             .map(|e| io::Error::new(e.kind(), e.to_string()))
     }
-}
-
-/// The text of a panic payload: the `&str` or `String` that `panic!` with a
-/// message produces, or a placeholder for a `panic_any` payload of another
-/// type.
-pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> &str {
-    if let Some(s) = payload.downcast_ref::<&'static str>() {
-        s
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.as_str()
-    } else {
-        "non-string panic payload"
-    }
-}
-
-/// `"<who> panicked: <payload>"` as an `io::Error`.
-pub(crate) fn panic_error(who: &str, payload: &(dyn Any + Send)) -> io::Error {
-    io::Error::other(format!("{who} panicked: {}", panic_message(payload)))
 }
 
 #[cfg(test)]

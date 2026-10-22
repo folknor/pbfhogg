@@ -1528,6 +1528,7 @@ mod tests {
                 indexdata_present: false,
                 unrecognised_indexdata_len: None,
                 tagdata: None,
+                tagdata_present: false,
                 waymembers: None,
             };
             let ff_blob = WireBlob {
@@ -1554,6 +1555,7 @@ mod tests {
             indexdata_present: false,
             unrecognised_indexdata_len: None,
             tagdata: None,
+            tagdata_present: false,
             waymembers: None,
         };
         let wire = WireBlob {
@@ -1576,6 +1578,7 @@ mod tests {
             indexdata_present: false,
             unrecognised_indexdata_len: None,
             tagdata: None,
+            tagdata_present: false,
             waymembers: None,
         };
         let wire = WireBlob {
@@ -1593,6 +1596,7 @@ mod tests {
             indexdata_present: false,
             unrecognised_indexdata_len: None,
             tagdata: None,
+            tagdata_present: false,
             waymembers: waymembers.map(Vec::into_boxed_slice),
         };
         let blob = WireBlob {

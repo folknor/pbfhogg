@@ -24,11 +24,21 @@
 - **`build-geocode-index` publishes a complete index or nothing.** Every
   build is written to a `.geocode-build-*` staging directory beside
   `--output-dir` and swapped into place only after it and its smoke test
-  succeed, so a failed `--force` rebuild leaves the old index intact and
+  succeed, so a failed `--overwrite` rebuild leaves the old index intact and
   readers already open keep working. The output directory is replaced as a
-  whole: it must be new, empty, or an existing index (with `--force`); a
+  whole: it must be new, empty, or an existing index (with `--overwrite`); a
   directory holding anything else is refused rather than deleted. Allow
   disk space for two generations during a rebuild.
+
+- **`build-geocode-index --force` is split into `--overwrite` and
+  `--allow-unindexed`.** Replacing an existing index no longer also waives
+  the indexdata requirement, and accepting unindexed input no longer grants
+  permission to replace an index. `--force` keeps working as shorthand for
+  both; `BuildConfig` gains the matching `overwrite` and `allow_unindexed`
+  fields. An `--output-dir` that is a symlink is now refused (publication
+  would have replaced the link with a real directory), and on Linux so is an
+  existing directory that is a mount point (the final rename would have
+  failed only after a full build).
 
 - **`build-geocode-index --admin-level` is capped at 10** (was 19). The
   admin flood fill grows 4x per level, and level 19 asked for billions of
@@ -610,6 +620,18 @@
   makes the decision before the header is read.
 
 ### Fixed
+
+- **A block `granularity` or `date_granularity` outside `int32` is refused.**
+  Both were narrowed with a bare cast, so a value such as `2^32 + 100` read
+  as `100` and every coordinate or timestamp in the block was scaled by a
+  different, plausible value with no error. The decoder and the blob-index
+  scanner now reject the block.
+
+- **`check --index` reports a duplicated `BlobHeader.tagdata` field.** A
+  blob carrying two non-empty tagdata fields has no usable tag index, but
+  `check --index` counted it as a blob without tagdata and passed it. It is
+  now reported as malformed tagdata and counted among the blobs with
+  tagdata.
 
 - **Blocks built by `BlockBuilder` list an empty-string tag key in their tag
   index.** The key was left out, so a blob whose elements carried a tag with

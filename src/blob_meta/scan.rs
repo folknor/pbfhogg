@@ -55,7 +55,9 @@ use protohoggr::Cursor;
 
 use super::{BlobBbox, BlobIndex, ElemKind, TagIndex};
 use crate::error::{ErrorKind, Result, new_error, new_wire_error};
-use crate::read::wire::{WIRE_LEN, WIRE_VARINT, WireDenseNodes, WireNode, WireRelation, WireWay};
+use crate::read::wire::{
+    WIRE_LEN, WIRE_VARINT, WireDenseNodes, WireNode, WireRelation, WireWay, read_int32,
+};
 
 /// Scan a PrimitiveBlock for its [`BlobIndex`] and whether its elements are
 /// internally sorted in canonical OSM ID order.
@@ -203,10 +205,13 @@ impl<'a> Walk<'a> {
                 (1, WIRE_LEN) => stringtable = cur.read_len_delimited()?,
                 (2, WIRE_LEN) => groups.push(cur.read_len_delimited()?),
                 (17, WIRE_VARINT) => {
-                    #[allow(clippy::cast_possible_truncation)]
-                    {
-                        self.granularity = cur.read_varint()? as i32;
-                    }
+                    self.granularity =
+                        read_int32(&mut cur, "PrimitiveBlock.granularity exceeds int32")?;
+                }
+                (18, WIRE_VARINT) => {
+                    // Unused by the ID scan, but checked so this scan refuses
+                    // exactly the blocks the decoder refuses.
+                    read_int32(&mut cur, "PrimitiveBlock.date_granularity exceeds int32")?;
                 }
                 (19, WIRE_VARINT) => self.lat_offset = cur.read_varint_i64()?,
                 (20, WIRE_VARINT) => self.lon_offset = cur.read_varint_i64()?,

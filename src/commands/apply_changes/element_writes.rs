@@ -104,6 +104,13 @@ pub(super) fn write_base_node_local(
     node: &crate::Node<'_>,
     block: &PrimitiveBlock,
 ) -> Result<()> {
+    // Preserve the block API's documented wrapping coordinate scaling and
+    // narrowing, just as write_base_dense_node_local does. This rewrite
+    // helper is not a coordinate validator. Under --locations-on-ways the
+    // worker's node_coords extractor checks scaling before rewriting a blob
+    // routed as Node; outside that mode base-node rewrites retain the block
+    // API policy. Adding checked scaling here alone would make plain nodes
+    // differ from dense nodes and would not validate passthrough blobs.
     ensure_node_capacity_local(bb, output)?;
     if !bb.is_pre_seeded() {
         flush_local(bb, output)?;

@@ -151,7 +151,7 @@ fn run_shard(
 ) -> Result<ShardOutput> {
     // Test-only: arm via `test_hooks::PANIC_AT_SHARD_IDX`. Simulates
     // a mid-phase shard crash; the caller's `scope.spawn(...).join()`
-    // turns the panic into an `Err("derive shard worker panicked")`
+    // turns the panic into an `Err("derive shard worker panicked: ..")`
     // and the post-join cleanup sweeps every possible per-shard
     // scratch file (creates / modifies / deletes). Release builds
     // compile this out entirely.
@@ -723,9 +723,9 @@ pub(crate) fn derive_changes_parallel(
                 handles.push(h);
             }
             for (idx, h) in handles.into_iter().enumerate() {
-                shard_outputs[idx] = Some(h.join().unwrap_or_else(|_| {
+                shard_outputs[idx] = Some(h.join().unwrap_or_else(|payload| {
                     Err(crate::error::new_error(crate::error::ErrorKind::Io(
-                        io::Error::other("derive shard worker panicked"),
+                        crate::error::panic_error("derive shard worker", payload.as_ref()),
                     )))
                 }));
             }

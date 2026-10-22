@@ -775,10 +775,13 @@ fn packed_uint32_count(data: &[u8]) -> Result<usize> {
 ///
 /// # What is deliberately not checked
 ///
-/// Coordinate and timestamp *values*. Delta reconstruction is modular, and so
-/// is the step after it: `offset + granularity * raw` for coordinates and
-/// `raw * date_granularity` for timestamps use wrapping `i64` arithmetic in
-/// every block-API accessor, so debug and release agree and nothing panics.
+/// Coordinate and timestamp *values*. The block header scan in `wire.rs`
+/// checks that both scales fit their declared signed int32 type, without
+/// imposing positivity or checking the scaled values. Delta reconstruction
+/// is modular, and so is the step after it: `offset + granularity * raw` for
+/// coordinates and `raw * date_granularity` for timestamps use wrapping `i64`
+/// arithmetic in every block-API accessor, so debug and release agree and
+/// nothing panics.
 /// A value whose scaling runs past `i64` is garbage in, garbage out, exactly
 /// like the far larger class of in-range but meaningless values (a latitude
 /// of 10^6 degrees) that no reader refuses, and like the `as i32` narrowing

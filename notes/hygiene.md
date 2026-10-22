@@ -580,20 +580,6 @@ error test asserting the path appears.
 Reported by: write path, CLI and plumbing, altw and scanning, geocode index,
 re-encoding, filtering and spatial, read path.
 
-## HYG-023 - Thread panic payloads are discarded
-
-Anger: 7 - message content.
-
-`parallel_writer_thread_inner` formats a worker join error with `{e:?}` on a
-`Box<dyn Any + Send>`, printing `Any { .. }`; the uring and gzip paths say
-"panicked" with no payload; diff and derive shard joins do
-`unwrap_or_else(|_| Err(io::Error::other("shard worker panicked")))`; the read
-pipeline's "decode task panicked" drops it; `PipelinedBlocks::drop` does
-`drop(h.join())`. Fix: one `panic_message(&Box<dyn Any>)` helper (downcast
-`&str` / `String`) used at every join, or `resume_unwind`.
-
-Reported by: write path, re-encoding, read path.
-
 ## HYG-024 - Counter declaration and emission is hand-written boilerplate
 
 Anger: 8 - counter machinery and semantics.
@@ -749,7 +735,10 @@ Anger: 9 - output .partial and rename for every command.
   and `multi.rs` `File::create` whatever they are given, so library callers get
   truncate-then-fail.
 - Altw's `DestinationGuard` cites the merge-changes precedent.
-- `OutputFile::commit` replacing an existing file is silent.
+- `OutputFile::commit` replacing an existing file is silent, and because it
+  renames over the destination, a user `--output` that is a symlink has the
+  link replaced by a regular file (the geocode builder now refuses a
+  symlinked output directory up front; no `OutputFile` user does).
 
 Fix: one policy in `PbfWriter` (write `<path>.partial` in the same directory,
 rename after `flush` succeeds, unlink on `Drop`) and an `Outputs` type owning
@@ -825,7 +814,7 @@ Anger: 9 - decode failures and aborts become errors: new refusals, Results on bu
   nodes". `dense.rs::DenseNodeIter::new` drops all dense metadata on
   corruption.
 - `wire.rs` (`read_tag().ok()??`) ends on the first bad tag. The `blob_meta`
-  scanners no longer do this; their callers are in BUG-072.
+  scanners no longer do this, and their callers now propagate the error.
 
 Already adjudicated, not to be re-reported: tag iterators ending early on an
 out-of-range string index, and roles collapsed to `""` by
@@ -1030,8 +1019,9 @@ pick an arm; `getid --add-referenced` calls `require_indexdata` and ignores the
 result; extract refuses for complete/smart only; renumber's schedule scan
 returns its own differently worded error and has no `--force` escape at all;
 sort, dedupe, cat (two variants) and repack each write their own "input PBF has
-no blob-level indexdata..." sentence (sort and dedupe identical); geocode's
-`--force` both skips the check and allows overwrite (HYG-087). The AGENTS.md
+no blob-level indexdata..." sentence (sort and dedupe identical); geocode has
+its own `--allow-unindexed` escape, with the legacy `--force` still meaning
+both that and `--overwrite`. The AGENTS.md
 list of commands requiring indexdata is a hand-maintained copy of these
 decisions. `has_indexdata` and `has_tagdata` in `commands/mod.rs` are the same
 header walk returning different fields, and both trust the first OsmData blob
@@ -1715,21 +1705,6 @@ subset of Pass 1.5's over the same blobs.
 
 Reported by: geocode index.
 
-## HYG-087 - Geocode `--force` means two things, and bad-element policy differs per rule
-
-Anger: 7 - geocode output.
-
-`config.force` is passed to `require_indexdata` (skip the requirement) and also
-gates overwriting an existing index, so rebuilding in place also opts out of the
-indexdata check (which on unindexed input now costs a decode of every blob to
-derive kinds and the node-ID bound). Pass 2a aborts the
-whole build for one node outside the coordinate domain, while missing refs, bad
-roles and unparseable levels are skipped: the only data-quality rule that
-aborts. Fix: `overwrite` and `allow_unindexed` as two fields and two flags; one
-`on_bad_element` policy (skip-and-count, or fail under `--strict`).
-
-Reported by: geocode index.
-
 ## HYG-088 - Geocode build drops data silently and its smoke test cannot be acted on
 
 Anger: 7 - geocode output.
@@ -2051,25 +2026,4 @@ Anger: 6 - needs brokkr changes.
 `PBFHOGG_TEST_MUST_RUN` for profiles that must run.
 
 Reported by: test harness.
-
-## HYG-111 - Two small inaccuracies in apply-changes instrumentation
-
-Anger: 6 - counter meaning.
-
-`open_osc_reader` times plain-file reads too, so the OSC decompress counter
-includes input-read time for uncompressed input. The drain watermark
-comment's `10..30, 5..8, 40..50` example is already rejected by the adjacent
-range-bound check, so it does not show the distinction it claims.
-
-Reported by: the wave-1a change fixer.
-
-## HYG-112 - Export compares nanodegree geometry against a decimicrodegree bbox
-
-Anger: 6 - export output.
-
-Export's way geometry uses nanodegree-derived coordinates while its node bbox
-checks use decimicrodegrees, so a way and its nodes can be judged against the
-bbox at different precision.
-
-Reported by: the wave-1a geo fixer.
 

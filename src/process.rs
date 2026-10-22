@@ -1,7 +1,10 @@
-//! Explicit caller-invoked process policy, and the procfs readers the CLI and
-//! the sidecar instrumentation sample. The readers return `Option`: a failed
-//! or unavailable sample is reported as absent, never as zero, and each
-//! caller decides what absence means for its output.
+//! Explicit caller-invoked process policy, and the procfs readers the library,
+//! the CLI and the sidecar instrumentation use. The metric readers return
+//! `Option`: a failed or unavailable sample is reported as absent, never as
+//! zero, and each caller decides what absence means for its output. The one
+//! precondition probe here, [`is_mount_point`], returns an I/O error instead,
+//! because its caller refuses work on the answer and must not mistake an
+//! unreadable mount table for "not a mount point".
 
 /// Read cumulative minor and major page faults from `/proc/self/stat`.
 ///
@@ -90,12 +93,88 @@ fn parse_peak_rss_kb(status: &str) -> Option<u64> {
     kb_str.parse::<u64>().ok()
 }
 
+/// Whether `path` is exactly a mount point in this process's mount namespace,
+/// read from `/proc/self/mountinfo`.
+///
+/// `path` is canonicalized first, so a symlink is judged by its target; a
+/// caller that cares about the link itself must check for it separately.
+/// Errors from canonicalization or from reading the mount table are returned,
+/// not folded into `false`. Non-Linux targets have no portable mount table
+/// and return `Ok(false)`; there an operation that cannot cross a mount (a
+/// rename) remains the authority.
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(feature = "commands"), allow(dead_code))]
+pub(crate) fn is_mount_point(path: &std::path::Path) -> std::io::Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let canonical = std::fs::canonicalize(path)?;
+    let mountinfo = std::fs::read("/proc/self/mountinfo").map_err(|e| {
+        std::io::Error::new(e.kind(), format!("cannot read /proc/self/mountinfo: {e}"))
+    })?;
+    for line in mountinfo.split(|byte| *byte == b'\n') {
+        // Fields: mount ID, parent ID, major:minor, root, mount point, ...
+        // The kernel octal-escapes whitespace inside a path, so splitting
+        // on whitespace cannot cut one.
+        let mut fields = line
+            .split(u8::is_ascii_whitespace)
+            .filter(|field| !field.is_empty());
+        let Some(mountpoint) = fields.nth(4) else {
+            continue;
+        };
+        let decoded = decode_mountinfo_path(mountpoint);
+        if std::path::Path::new(std::ffi::OsStr::from_bytes(&decoded)) == canonical.as_path() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[cfg_attr(not(feature = "commands"), allow(dead_code))]
+pub(crate) fn is_mount_point(_path: &std::path::Path) -> std::io::Result<bool> {
+    Ok(false)
+}
+
+/// Undo the kernel's `\ooo` octal escaping of a mountinfo path field.
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(feature = "commands"), allow(dead_code))]
+fn decode_mountinfo_path(path: &[u8]) -> Vec<u8> {
+    let mut decoded = Vec::with_capacity(path.len());
+    let mut offset = 0;
+    while offset < path.len() {
+        if path[offset] == b'\\'
+            && offset + 3 < path.len()
+            && path[offset + 1..offset + 4]
+                .iter()
+                .all(|byte| matches!(*byte, b'0'..=b'7'))
+        {
+            let high = path[offset + 1] - b'0';
+            let middle = path[offset + 2] - b'0';
+            let low = path[offset + 3] - b'0';
+            decoded.push((high << 6) | (middle << 3) | low);
+            offset += 4;
+        } else {
+            decoded.push(path[offset]);
+            offset += 1;
+        }
+    }
+    decoded
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod proc_metric_tests {
     #[test]
     fn page_fault_parser_handles_spaces_in_comm() {
         let stat = "123 (program name with spaces) R 1 2 3 4 5 6 101 102 103 104";
         assert_eq!(super::parse_page_faults(stat), Some((101, 103)));
+    }
+
+    #[test]
+    fn mountinfo_paths_decode_octal_escapes_only() {
+        assert_eq!(super::decode_mountinfo_path(br"/mnt/a\040b"), b"/mnt/a b");
+        assert_eq!(super::decode_mountinfo_path(br"/x\134y"), br"/x\y");
+        assert_eq!(super::decode_mountinfo_path(br"/x\09"), br"/x\09");
+        assert_eq!(super::decode_mountinfo_path(br"/x\04"), br"/x\04");
     }
 }
 

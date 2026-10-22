@@ -41,12 +41,10 @@ pub(crate) struct RawBlobFrame {
     /// Per-blob tag key data from BlobHeader field 4, if present. Retained
     /// so `check --index` can compare the stored claim with decoded tags.
     #[cfg_attr(not(feature = "commands"), allow(dead_code))]
-    // Duplicate non-empty tagdata is collapsed to None by WireBlobHeader
-    // before this layer sees it. Adding presence here alone cannot recover
-    // that fact. Verification needs a separate presence/duplicate signal from
-    // read/blob_wire.rs through parse_blob_header_with_index; keep it separate
-    // from copied bytes so passthrough does not emit an invalid sentinel.
     pub(crate) tagdata: Option<Box<[u8]>>,
+    /// Non-empty tagdata was present, including duplicate unreadable claims.
+    #[cfg_attr(not(feature = "commands"), allow(dead_code))]
+    pub(crate) tagdata_present: bool,
     /// Byte offset of this frame in the input file (for copy_file_range).
     #[cfg_attr(not(feature = "commands"), allow(dead_code))]
     pub(crate) file_offset: u64,
@@ -103,6 +101,7 @@ pub(crate) fn read_raw_frame<R: Read>(
         index,
         index_present: header.raw_index_present,
         tagdata: header.tagdata,
+        tagdata_present: header.tagdata_present,
         file_offset: frame_start,
     }))
 }

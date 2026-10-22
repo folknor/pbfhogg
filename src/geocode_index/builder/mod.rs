@@ -44,7 +44,12 @@ pub(super) type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub struct BuildConfig {
     pub input_path: PathBuf,
     pub output_dir: PathBuf,
+    /// Compatibility alias for `overwrite` and `allow_unindexed` together.
     pub force: bool,
+    /// Replace an existing geocode index after a successful build.
+    pub overwrite: bool,
+    /// Permit input PBFs that do not have blob-level indexdata.
+    pub allow_unindexed: bool,
     pub direct_io: bool,
     pub street_level: u8,
     pub coarse_level: u8,
@@ -60,6 +65,8 @@ impl Default for BuildConfig {
             input_path: PathBuf::new(),
             output_dir: PathBuf::new(),
             force: false,
+            overwrite: false,
+            allow_unindexed: false,
             street_level: 17,
             coarse_level: 14,
             admin_level: 10,
@@ -157,20 +164,55 @@ pub fn build_geocode_index(config: &BuildConfig, host: &crate::host::Host) -> Re
         )
         .into());
     }
+
+    let destination_metadata = match std::fs::symlink_metadata(destination) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if destination_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(format!(
+            "output path {} is a symlink; staged publication replaces the path itself. \
+             Choose a real directory.",
+            destination.display()
+        )
+        .into());
+    }
+    if destination_metadata
+        .as_ref()
+        .is_some_and(std::fs::Metadata::is_dir)
+        && is_mount_point(destination)?
+    {
+        return Err(format!(
+            "output directory {} is a mount point; staged publication renames the \
+             directory itself. Choose a regular directory.",
+            destination.display()
+        )
+        .into());
+    }
+
     let has_index = destination.join(FILE_HEADER).exists();
-    if has_index && !config.force {
+    let overwrite = config.force || config.overwrite;
+    if has_index && !overwrite {
         return Err(format!(
             "output directory {} already contains a geocode index. \
-             Use --force to replace it.",
+             Use --overwrite (or --force) to replace it.",
             destination.display()
         )
         .into());
     }
     // Publication replaces the whole directory, so anything that is not an
-    // index (or empty) would be deleted with it. `--force` replaces an index,
-    // never an arbitrary directory, so this refusal holds under it too.
-    if !has_index && destination.exists() {
-        let replaceable = destination.is_dir() && std::fs::read_dir(destination)?.next().is_none();
+    // index (or empty) would be deleted with it. `--overwrite` and its legacy
+    // `--force` alias replace an index, never an arbitrary directory, so this
+    // refusal holds under either flag.
+    if !has_index && destination_metadata.is_some() {
+        let replaceable = destination_metadata
+            .as_ref()
+            .is_some_and(std::fs::Metadata::is_dir)
+            && std::fs::read_dir(destination)?.next().is_none();
         if !replaceable {
             return Err(format!(
                 "output path {} exists and is not a geocode index directory; \
@@ -190,6 +232,22 @@ pub fn build_geocode_index(config: &BuildConfig, host: &crate::host::Host) -> Re
     Ok(stats)
 }
 
+// Check before spending a full build: rename of a mounted directory fails
+// with EBUSY or EXDEV only when publication is attempted. The symlink check
+// above is separate because the mount probe canonicalizes, which would hide
+// the fact that publication replaces the link itself. Off Linux the probe
+// answers false and the final rename remains authoritative.
+fn is_mount_point(path: &std::path::Path) -> Result<bool> {
+    crate::process::is_mount_point(path).map_err(|error| {
+        format!(
+            "cannot check whether output directory {} is a mount point before \
+             publication: {error}",
+            path.display()
+        )
+        .into()
+    })
+}
+
 struct StagedIndex {
     path: PathBuf,
 }
@@ -203,6 +261,11 @@ impl StagedIndex {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| std::path::Path::new("."));
         std::fs::create_dir_all(parent)?;
+        // Do not sweep old `.geocode-build-*` siblings here. Drop removes a
+        // stage after ordinary success or failure, but SIGKILL and power loss
+        // bypass Drop. A directory without a lock cannot be distinguished
+        // safely from a concurrent builder's live staging area, and it may
+        // contain the only recoverable old index after an interrupted publish.
         loop {
             let path = parent.join(format!(
                 ".geocode-build-{}",
@@ -225,7 +288,11 @@ impl StagedIndex {
         };
         // There is a short pathname gap between these two renames. Callers
         // must serialize publication with Reader::open and other builders;
-        // queries on already-open readers need no such coordination.
+        // queries on already-open readers need no such coordination. The
+        // earlier mount-point check can also race a mount-table change; a
+        // trial rename before the build would create another pathname gap and
+        // race those same readers/builders, so these final renames remain the
+        // authority if the filesystem topology changes during the build.
         if let Err(e) = std::fs::rename(self.path.join("new"), destination) {
             if had_old && let Err(restore) = std::fs::rename(&backup, destination) {
                 // Preserve the only old generation if rollback itself fails.
@@ -243,7 +310,11 @@ impl StagedIndex {
 
 impl Drop for StagedIndex {
     fn drop(&mut self) {
-        // A failed rollback leaves the backup here for manual recovery.
+        // A failed rollback leaves the backup here for manual recovery. This
+        // cleanup only runs on ordinary Rust unwinding; SIGKILL and power loss
+        // can leave a sibling staging directory. Startup does not sweep those
+        // directories because another process may still be building there or
+        // an `old` subdirectory may be the only recoverable previous index.
         if !self.path.join("old").exists() || !self.path.join("new").exists() {
             drop(std::fs::remove_dir_all(&self.path));
         }
@@ -267,15 +338,19 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
     crate::commands::require_indexdata(
         &config.input_path,
         config.direct_io,
-        config.force,
+        config.force || config.allow_unindexed,
         "input PBF has no blob-level indexdata. Without indexdata, \
-         every blob must be decompressed (significantly slower).",
+         every blob must be decompressed (significantly slower). \
+         --allow-unindexed accepts it without also granting --overwrite.",
         host,
     )?;
 
     // Read PBF header
     let reader = ElementReader::open_in(&config.input_path, config.direct_io, host)?;
     let pbf_header = reader.header();
+    // The geocode header stores replication sequence in a u32. Missing
+    // metadata is represented by zero, but wrapping a present larger value
+    // would publish a plausible, incorrect source version, so refuse it.
     let repl_seq = u32::try_from(
         pbf_header
             .osmosis_replication_sequence_number()

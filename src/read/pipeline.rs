@@ -383,8 +383,8 @@ fn spawn_decode_task(decode_pool: &rayon::ThreadPool, task: DecodeTask) {
         }));
         let item = match item {
             Ok(item) => item,
-            Err(_) => Some(Err(crate::error::new_error(crate::error::ErrorKind::Io(
-                std::io::Error::other("decode task panicked"),
+            Err(payload) => Some(Err(crate::error::new_error(crate::error::ErrorKind::Io(
+                crate::error::panic_error("decode task", payload.as_ref()),
             )))),
         };
         let t_send = Instant::now();
@@ -766,9 +766,10 @@ where
                                     }));
                                 let item = match item {
                                     Ok(item) => item,
-                                    Err(_) => Some(Err(crate::error::new_error(
-                                        crate::error::ErrorKind::Io(std::io::Error::other(
-                                            "decode task panicked",
+                                    Err(payload) => Some(Err(crate::error::new_error(
+                                        crate::error::ErrorKind::Io(crate::error::panic_error(
+                                            "decode task",
+                                            payload.as_ref(),
                                         )),
                                     ))),
                                 };
@@ -999,7 +1000,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("decode task panicked")
+                .contains("decode task panicked: test panic")
         );
     }
 

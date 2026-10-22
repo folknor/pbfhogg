@@ -831,15 +831,13 @@ pub(crate) fn external_join_in(
             // defensive-input checks in ADR-0004), and cancelling the
             // relation scan would require plumbing a shutdown signal we
             // don't otherwise need.
-            let s1_res = s1_handle
-                .join()
-                .map_err(|_| "stage 1 thread panicked".to_string())??;
+            let s1_res = s1_handle.join().map_err(|payload| {
+                crate::error::panic_error("stage 1 thread", payload.as_ref()).to_string()
+            })??;
             let rel_res = match rel_handle {
-                Some(handle) => Some(
-                    handle
-                        .join()
-                        .map_err(|_| "relation scan thread panicked".to_string())??,
-                ),
+                Some(handle) => Some(handle.join().map_err(|payload| {
+                    crate::error::panic_error("relation scan thread", payload.as_ref()).to_string()
+                })??),
                 None => None,
             };
             Ok((s1_res, rel_res))
@@ -1135,12 +1133,12 @@ pub(crate) fn external_join_in(
             .map_err(|e| e.to_string())
         });
 
-        let s3_res = s3_handle
-            .join()
-            .map_err(|_| "stage 3 thread panicked".to_string())?;
-        let s4_res = s4_handle
-            .join()
-            .map_err(|_| "stage 4 thread panicked".to_string())?;
+        let s3_res = s3_handle.join().map_err(|payload| {
+            crate::error::panic_error("stage 3 thread", payload.as_ref()).to_string()
+        })?;
+        let s4_res = s4_handle.join().map_err(|payload| {
+            crate::error::panic_error("stage 4 thread", payload.as_ref()).to_string()
+        })?;
 
         // Prefer the stage 3 error if both failed (it's usually the root
         // cause - stage 4 typically errors only because of an abort that

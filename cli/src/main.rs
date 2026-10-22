@@ -1100,9 +1100,13 @@ enum Command {
         coarse_search_radius: f32,
         #[command(flatten)]
         io: DirectIoArg,
-        /// Replace an existing index in --output-dir; the old index stays
-        /// in place until the new build has succeeded. Also accepts input
-        /// without indexdata (slower fallback path).
+        /// Replace an existing index in --output-dir after the new build succeeds.
+        #[arg(long)]
+        overwrite: bool,
+        /// Accept input without blob-level indexdata (slower fallback path).
+        #[arg(long)]
+        allow_unindexed: bool,
+        /// Legacy shorthand for both --overwrite and --allow-unindexed.
         #[arg(long)]
         force: bool,
     },
@@ -2045,6 +2049,8 @@ fn main() -> process::ExitCode {
                 search_radius,
                 coarse_search_radius,
                 io,
+                overwrite,
+                allow_unindexed,
                 force,
             } => run_build_geocode_index(
                 &file,
@@ -2058,7 +2064,8 @@ fn main() -> process::ExitCode {
                     coarse_search_radius,
                 },
                 io.direct_io,
-                force,
+                overwrite || force,
+                allow_unindexed || force,
                 &host,
             ),
             Command::BenchRead { file, mode } => run_bench_read(&file, mode, &host),
@@ -2118,13 +2125,18 @@ fn run_build_geocode_index(
     output_dir: &std::path::Path,
     levels: GeocodeLevels,
     direct_io: bool,
-    force: bool,
+    overwrite: bool,
+    allow_unindexed: bool,
     host: &pbfhogg::host::Host,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let config = pbfhogg::geocode_index::builder::BuildConfig {
         input_path: file.to_path_buf(),
         output_dir: output_dir.to_path_buf(),
-        force,
+        // The caller has already expanded the legacy `--force` into both
+        // permissions below.
+        force: false,
+        overwrite,
+        allow_unindexed,
         direct_io,
         street_level: levels.street_level,
         coarse_level: levels.coarse_level,

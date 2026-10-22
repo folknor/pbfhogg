@@ -25,6 +25,9 @@ enum BoundaryRole {
 }
 
 fn boundary_role(role: &str) -> BoundaryRole {
+    // Relation roles that do not describe ring geometry, such as `label` or
+    // `admin_centre`, are auxiliary members. Ignoring them must not discard a
+    // valid boundary relation or turn one unfamiliar role into a build error.
     match role {
         "inner" => BoundaryRole::Inner,
         "outer" | "" => BoundaryRole::Outer,
@@ -67,6 +70,11 @@ pub(super) fn run_pass1(
                             }
                         }
 
+                        // This scan selects candidate boundary records. A
+                        // missing or unparseable admin level, an unsupported
+                        // level, or a missing name makes this relation
+                        // ineligible; it does not make the source PBF unusable
+                        // for the other records that can still be indexed.
                         let Some(b) = boundary else { continue };
                         let (is_admin, is_postal) = (b == "administrative", b == "postal_code");
                         if !is_admin && !is_postal {

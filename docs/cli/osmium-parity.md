@@ -208,6 +208,11 @@ worth knowing about.
 | `--strategy simple\|complete_ways\|smart` | `--simple` / `--smart` (default: complete) | extract |
 | `-p, --polygon` (accepts `.poly`, GeoJSON, or OSM file) | `-p, --polygon` (GeoJSON only: bare Polygon/MultiPolygon geometry, Feature, or FeatureCollection - every feature, where osmium takes the first; Osmosis `.poly` files are not accepted. Each ring needs at least three positions and a non-zero area; an open ring is closed implicitly) | extract |
 
+For extract polygons, pbfhogg does not validate ring self-intersections.
+Accepted self-crossing rings use even-odd ray crossing, matching osmium's
+extractor. The non-zero-area check still rejects rings whose signed area
+cancels to zero, including a symmetric bow-tie.
+
 ### Flags pbfhogg doesn't have
 
 These osmium flags have no pbfhogg equivalent:

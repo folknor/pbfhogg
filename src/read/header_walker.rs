@@ -327,7 +327,7 @@ impl HeaderWalker {
         // (>= MAX_BLOB_DATASIZE) before returning, so the `data_size` below -
         // and every `pread_data(data_offset, data_size, ..)` a consumer later
         // issues against it - is bounded, never a hostile multi-GB size.
-        let (blob_type, data_size, raw_index, _index_present, tagdata) =
+        let (blob_type, data_size, raw_index, _index_present, tagdata, _tagdata_present) =
             parse_blob_header_with_index(&self.header_buf[4..header_end], &self.diagnostics)?;
         let index = raw_index.as_ref().and_then(|b| BlobIndex::deserialize(b));
 

@@ -112,7 +112,7 @@ fn run_shard(
 ) -> Result<ShardOutput> {
     // Test-only: arm via `test_hooks::PANIC_AT_SHARD_IDX`. Simulates a
     // mid-phase shard crash. The caller's `scope.spawn(...).join()`
-    // path turns the panic into an `Err("shard worker panicked")` and
+    // path turns the panic into an `Err("shard worker panicked: ..")` and
     // the surrounding cleanup pass sweeps every possible per-shard
     // scratch file. Release builds compile this out entirely.
     #[cfg(all(feature = "static-test-hooks", not(test)))]
@@ -561,9 +561,9 @@ pub(crate) fn diff_block_pair_parallel(
                 handles.push(h);
             }
             for (idx, h) in handles.into_iter().enumerate() {
-                shard_outputs[idx] = Some(h.join().unwrap_or_else(|_| {
+                shard_outputs[idx] = Some(h.join().unwrap_or_else(|payload| {
                     Err(crate::error::new_error(crate::error::ErrorKind::Io(
-                        std::io::Error::other("shard worker panicked"),
+                        crate::error::panic_error("shard worker", payload.as_ref()),
                     )))
                 }));
             }

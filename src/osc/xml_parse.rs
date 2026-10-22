@@ -268,8 +268,12 @@ where
 // ---------------------------------------------------------------------------
 
 /// Wraps an `io::Read` and accumulates wall time spent in `read()` calls,
-/// so the gzip-decompress portion of a parse can be attributed separately
-/// via a sidecar counter.
+/// for the `merge_changes_decompress_ns` sidecar counter. Despite that
+/// historical name, what it times is the input reader, not the codec: for
+/// gzip input it is file reads plus decompression, for plain XML it is file
+/// reads alone. It is neither isolated codec time nor the full parse wall
+/// (XML parsing and sink work happen outside these calls). The name and
+/// attribution are kept so the counter stays comparable with recorded runs.
 struct TimedRead<R: io::Read> {
     inner: R,
     total: Rc<Cell<Duration>>,
@@ -284,6 +288,8 @@ impl<R: io::Read> io::Read for TimedRead<R> {
     }
 }
 
+pub(crate) type OscReader = Reader<BufReader<Box<dyn io::Read>>>;
+
 /// Open an OSC file, transparently handling both gzip-compressed and
 /// plain XML.
 ///
@@ -292,9 +298,9 @@ impl<R: io::Read> io::Read for TimedRead<R> {
 /// while `merge-changes` sniffed the magic and handled both. The sniff
 /// belongs to the shared parser, not to one of its two callers.
 ///
-/// Returns the reader and the shared cell accumulating decompress time.
-pub(crate) type OscReader = Reader<BufReader<Box<dyn io::Read>>>;
-
+/// Returns the reader and the shared cell accumulating time spent in the
+/// input reader's `read()` calls (see `TimedRead`: file reads plus gzip
+/// decompression, or file reads alone for plain XML).
 pub(crate) fn open_osc_reader(path: &Path) -> ParseResult<(OscReader, Rc<Cell<Duration>>)> {
     let mut file = File::open(path)?;
     // A file shorter than two bytes cannot be gzip and cannot be XML
@@ -482,7 +488,8 @@ pub(crate) fn drive_osc<R: io::BufRead, S: OscSink>(
     Ok(())
 }
 
-/// Open `path`, drive it into `sink`, and emit the decompress counter.
+/// Open `path`, drive it into `sink`, and emit the input-read counter
+/// (historically named `merge_changes_decompress_ns`; see `TimedRead`).
 pub(crate) fn parse_osc_path<S: OscSink>(path: &Path, sink: &mut S) -> ParseResult<()> {
     let (mut reader, decompress_total) = open_osc_reader(path)?;
     let result = drive_osc(&mut reader, sink);

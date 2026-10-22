@@ -182,20 +182,6 @@ during decode.
 
 Reported by: the extract passthrough fix.
 
-## BUG-082 - Apply-changes LocationsOnWays gaps outside the fixed paths
-
-Anger: 9 - verifying indexdata costs a per-blob decode.
-
-Node blobs whose indexdata labels them way or relation skip coordinate
-extraction and can be spliced untouched; the `Pending` location mode protects
-only ways being rewritten, not routing that trusts a wrong kind. The
-plain-node rewrite path (`write_base_node_local`) goes through
-`Node::nano_lat`, whose scaling now wraps by documented policy, while the
-`node_coords.rs` extractor does checked scaling; whether that rewrite path
-should check the way the extractor does is open.
-
-Reported by: the apply-changes LocationsOnWays fix.
-
 ## BUG-083 - Measured figures in comments from the 2026-10-22 fixes
 
 Anger: 1 - nothing to do until the figures drift.
@@ -270,31 +256,6 @@ under `BROKKR_TEST_PLATFORM`. Left:
 
 Reported by: test harness, write path, CLI and plumbing.
 
-## BUG-070 - `uring_writer` shutdown is not guaranteed to finish
-
-Anger: 7 - CLI behaviour.
-
-`uring_writer`'s `drain_best_effort` gives up after a fixed number of error
-rounds, and each `submit_and_wait(1)` can block indefinitely, so its
-shutdown is not guaranteed clean. Split out of the former `PbfWriter` framing
-entry, whose deadlock half the library-use executor work fixed; this half is
-not a process-ownership question and was out of that scope.
-
-Reported by: write path.
-
-## BUG-072 - `check --index` cannot see duplicate tagdata on its input
-
-Anger: 9 - malformed blocks refused in cat and the writer.
-
-Plain `cat`, the writer's passthrough reframe and `check --index` now
-propagate scanner errors. Left: duplicate tagdata reads as `None` rather
-than a placeholder, because sort, dedupe and apply-changes copy those bytes
-through, so `check --index` cannot see duplicate tagdata on its input. The
-presence flag that would close it has to start in `src/read/blob_wire.rs`;
-comments in `read/frame.rs` and `raw_frame.rs` say so.
-
-Reported by: the blob_meta fix for the former strict-scanner entry.
-
 ## BUG-064 - Unit tests use fixed scratch names and collide across parallel sweeps
 
 Anger: 3 - unit-test scratch and test timeouts.
@@ -311,47 +272,14 @@ fix is HYG-071's shared scratch.
 Reported by: change application, filtering and spatial, read path, test
 harness.
 
-## BUG-096 - Extract polygon rings are not checked for self-intersection
-
-Anger: 7 - CLI behaviour.
-
-`extract::parse_ring` now refuses empty, short, open and zero-area rings,
-but a self-intersecting (bow-tie) ring passes and point-in-polygon then
-answers by crossing parity, which may not match what the user drew. Either
-refuse such rings or document the even-odd interpretation.
-
-Reported by: the wave-2 extract fixer.
-
-## BUG-099 - Staged geocode publication leaves edge cases open
-
-Anger: 7 - geocode output.
-
-`build-geocode-index` now builds into a sibling `.geocode-build-N`
-directory and publishes with two renames. Open:
-
-- A SIGKILL or power loss mid-build leaves the staging directory (many GB at
-  planet) and nothing sweeps it; the Pass 3 bucket sweep cannot, because the
-  buckets live inside it. A sibling sweep is unsafe while concurrent builders
-  are possible. Needs a PID or lock marker, or documented manual cleanup.
-- An `--output-dir` that is a mount point fails the rename with EBUSY or
-  EXDEV only after a full build; one that is a symlink to a directory gets
-  the symlink replaced by a real directory on the parent's filesystem. Both
-  worked with the old in-place build; neither is detected early.
-- An `osmosis_replication_sequence_number` outside u32 now aborts the whole
-  build, for an informational header field that used to wrap. Error, or
-  store 0 as for a missing value.
-
-Reported by: the wave-3 reviewer.
-
-## BUG-103 - Block granularities are narrowed to i32 unchecked
+## BUG-104 - `BlobHeader.datasize` narrows before the size check
 
 Anger: 9 - decoder refusals.
 
-`read/wire.rs` reads `granularity` and `date_granularity` with
-`read_varint() as i32`, so a value above `i32::MAX` narrows to a different,
-possibly valid, granularity and every coordinate or timestamp in the block
-scales by it silently. Refuse an out-of-range value where the block header
-is parsed (once per block), like the other construction-time bounds.
+`src/read/blob_wire.rs` reads `BlobHeader.datasize` and narrows it before
+any size validation, so a value such as `2^32 + 100` aliases to 100 and the
+frame is read at the wrong length rather than refused. Refuse a datasize
+outside the accepted range where the header is parsed (once per blob).
 
-Reported by: the wave-5 reviewer.
+Reported by: the wave-6 framing fixer.
 

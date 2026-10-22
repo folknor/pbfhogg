@@ -276,6 +276,11 @@ fn classify_way_into(
         return;
     }
 
+    // Extracts can omit referenced nodes at their clip boundary. Use the
+    // coordinates available in this PBF and shorten the way rather than
+    // inventing a location or rejecting every other usable record. This is a
+    // separate case from a decoded node whose coordinate is outside the legal
+    // geographic domain, which cannot safely participate in the index.
     let mut rank_outside_store: Option<u64> = None;
     let coords: Vec<(i32, i32)> = way
         .refs()
@@ -501,6 +506,11 @@ pub(super) fn run_pass2(
                             let lat_e7 = node.decimicro_lat();
                             let lon_e7 = node.decimicro_lon();
                             let Some(packed) = pack_coord(lat_e7, lon_e7) else {
+                                // An out-of-domain coordinate is decoded source
+                                // data, not an absent reference at an extract
+                                // edge. Silently skipping it could publish
+                                // plausible but incomplete geometry, so this
+                                // build remains fatal for that condition.
                                 state.error = Some(format!(
                                     "node {node_id} has coordinates outside the geographic domain (lat {lat_e7}, lon {lon_e7} in decimicrodegrees)"
                                 ));

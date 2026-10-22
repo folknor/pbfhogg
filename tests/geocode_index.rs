@@ -1564,6 +1564,109 @@ fn force_preserves_the_index_when_pass_two_fails() {
     );
 }
 
+/// `overwrite` and `allow_unindexed` grant one permission each; only the
+/// legacy `force` (or both fields) grants both. Each refusal must leave the
+/// existing index byte-identical.
+#[test]
+fn overwrite_and_allow_unindexed_are_independent_permissions() {
+    let dir = crate::common::test_scratch();
+    let indexed = dir.path().join("indexed.osm.pbf");
+    let unindexed = dir.path().join("unindexed.osm.pbf");
+    let index_dir = dir.path().join("index");
+    write_synthetic_indexed_input(&indexed);
+    crate::common::write_test_pbf_non_indexed(
+        &unindexed,
+        &street_nodes(&[1, 2, 3]),
+        &[street_way(vec![1, 2, 3])],
+        &[],
+    );
+    crate::common::assert_non_indexed(&unindexed);
+    let build = |overwrite: bool, allow_unindexed: bool| {
+        pbfhogg::geocode_index::builder::build_geocode_index(
+            &pbfhogg::geocode_index::builder::BuildConfig {
+                input_path: unindexed.clone(),
+                output_dir: index_dir.clone(),
+                overwrite,
+                allow_unindexed,
+                ..Default::default()
+            },
+            &crate::common::test_host(),
+        )
+    };
+    pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: indexed,
+            output_dir: index_dir.clone(),
+            ..Default::default()
+        },
+        &crate::common::test_host(),
+    )
+    .expect("initial build");
+    let before = std::fs::read(index_dir.join("geocode_header.bin")).expect("header exists");
+
+    let err = build(true, false).expect_err("overwrite alone must not waive indexdata");
+    assert!(
+        err.to_string().contains("no blob-level indexdata"),
+        "unexpected error: {err}"
+    );
+    let err = build(false, true).expect_err("allow_unindexed alone must not overwrite");
+    assert!(
+        err.to_string().contains("already contains a geocode index"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        std::fs::read(index_dir.join("geocode_header.bin")).expect("header survives"),
+        before,
+        "refused builds must leave the existing index untouched"
+    );
+
+    let stats = build(true, true).expect("both permissions together must rebuild");
+    assert_eq!(stats.street_ways, 1);
+}
+
+/// Publication renames the output path itself, so a symlinked output
+/// directory would be replaced by a real directory. It is refused before any
+/// input is read, and the link and its target are left alone.
+#[cfg(unix)]
+#[test]
+fn symlinked_output_dir_is_refused_before_the_build() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let target = dir.path().join("real-index");
+    let link = dir.path().join("index-link");
+    write_synthetic_indexed_input(&input);
+    std::fs::create_dir(&target).expect("create link target");
+    std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            output_dir: link.clone(),
+            force: true,
+            ..Default::default()
+        },
+        &crate::common::test_host(),
+    )
+    .expect_err("a symlinked output directory must be refused");
+    assert!(
+        err.to_string().contains("is a symlink"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .expect("link survives")
+            .file_type()
+            .is_symlink(),
+        "the link must not be replaced"
+    );
+    assert!(
+        std::fs::read_dir(&target)
+            .expect("target survives")
+            .next()
+            .is_none(),
+        "nothing may be written through the link"
+    );
+}
+
 /// The segment sampling budget is enforced at config validation, before any
 /// input is read, because that is the only place the work can be bounded
 /// without ever discarding coverage. This asserts the bound is enforced, not

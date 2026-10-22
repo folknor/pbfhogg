@@ -16,6 +16,9 @@ pub const EARTH_RADIUS_M: f64 = 6_371_008.8;
 /// Ray-casting point-in-polygon test.
 ///
 /// Coordinates are `(x, y)` = `(longitude, latitude)` in degrees.
+/// Each crossing toggles membership, so accepted self-intersecting rings use
+/// the even-odd interpretation. This matches osmium extract's polygon test;
+/// this function does not decide whether a ring is geometrically simple.
 /// Returns `false` for rings with fewer than 3 vertices.
 pub fn point_in_ring(px: f64, py: f64, ring: &[(f64, f64)]) -> bool {
     let n = ring.len();

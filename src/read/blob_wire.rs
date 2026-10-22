@@ -49,6 +49,14 @@ pub(crate) struct WireBlobHeader {
     pub indexdata_present: bool,
     /// Per-blob tag key index (BlobHeader field 4). Variable-length.
     pub tagdata: Option<Box<[u8]>>,
+    /// Whether field 4 was present and non-empty on the wire, even when a
+    /// duplicate occurrence left `tagdata` as `None`. The tagdata twin of
+    /// `indexdata_present`, for the same verifier-versus-reader reason:
+    /// passthrough consumers copy `tagdata` into the headers they write, so
+    /// a duplicate must reach them as `None` rather than placeholder bytes,
+    /// while `check --index` must still see the malformed claim. Only
+    /// `parse_tagdata` parses can set this.
+    pub tagdata_present: bool,
     /// Per-blob way-member bitmap (BlobHeader field 5). Variable-length.
     pub waymembers: Option<Box<[u8]>>,
 }
@@ -78,7 +86,7 @@ impl WireBlobHeader {
         let mut indexdata_present = false;
         let mut unrecognised_indexdata_len = None;
         let mut tagdata: Option<Box<[u8]>> = None;
-        let mut tagdata_seen = false;
+        let mut tagdata_present = false;
         let mut waymembers: Option<Box<[u8]>> = None;
 
         while let Some((field, wire_type)) = cursor.read_tag()? {
@@ -138,21 +146,17 @@ impl WireBlobHeader {
                     // duplicate rule as indexdata: a second non-empty
                     // occurrence leaves the blob with no tag index, sticky.
                     //
-                    // `None` rather than an invalid sentinel on purpose:
-                    // sort, cat --dedupe and apply-changes copy these bytes
-                    // into the headers they write, so a sentinel would
-                    // manufacture a malformed field in their output. The
-                    // cost is that `check --index` cannot see a duplicate
-                    // tagdata on its input (there is no tagdata presence
-                    // flag); no reader acts on it either way.
+                    // `tagdata_present` stays set, which is how `check --index`
+                    // sees the malformed claim; passthrough users still receive
+                    // None, never malformed placeholder bytes.
                     let bytes = cursor.read_len_delimited()?;
                     if !bytes.is_empty() {
-                        tagdata = if tagdata_seen {
+                        tagdata = if tagdata_present {
                             None
                         } else {
                             Some(bytes.into())
                         };
-                        tagdata_seen = true;
+                        tagdata_present = true;
                     }
                 }
                 blob_header::WAYMEMBERS if parse_waymembers => {
@@ -182,6 +186,7 @@ impl WireBlobHeader {
             indexdata_present,
             unrecognised_indexdata_len,
             tagdata,
+            tagdata_present,
             waymembers,
         })
     }
@@ -373,15 +378,17 @@ pub const MAX_BLOB_MESSAGE_SIZE: u64 = 32 * 1024 * 1024;
 pub const MAX_BLOB_DATASIZE: u64 = MAX_BLOB_MESSAGE_SIZE;
 
 /// Parse a blob header and extract type, datasize, indexdata, whether an
-/// indexdata field was present at all, and tagdata.
+/// indexdata field was present at all, tagdata, and whether a tagdata field
+/// was present at all.
 ///
 /// Used by the pread-from-workers pattern to classify and dispatch raw
 /// blobs without decompression. The tagdata contains per-blob tag key metadata.
 ///
-/// The fourth element is deliberately separate from the third: an indexdata of
-/// an unrecognised length parses to `None` here, and every reader is right to
-/// treat that as "no index". A verifier is not - see
-/// [`WireBlobHeader::indexdata_present`].
+/// The presence flags are deliberately separate from the values: an indexdata
+/// of an unrecognised length, or a duplicated indexdata or tagdata, parses to
+/// `None` here, and every reader is right to treat that as "no index". A
+/// verifier is not - see [`WireBlobHeader::indexdata_present`] and
+/// [`WireBlobHeader::tagdata_present`].
 #[allow(clippy::type_complexity)]
 pub(crate) fn parse_blob_header_with_index(
     header_bytes: &[u8],
@@ -392,6 +399,7 @@ pub(crate) fn parse_blob_header_with_index(
     Option<[u8; INDEX_SIZE]>,
     bool,
     Option<Box<[u8]>>,
+    bool,
 )> {
     let header = WireBlobHeader::parse(header_bytes, true, true, false)?;
     if let Some(len) = header.unrecognised_indexdata_len {
@@ -434,6 +442,7 @@ pub(crate) fn parse_blob_header_with_index(
         header.indexdata,
         header.indexdata_present,
         header.tagdata,
+        header.tagdata_present,
     ))
 }
 
@@ -485,7 +494,7 @@ mod tests {
     fn datasize_at_or_over_cap_is_rejected() {
         // One below the cap: accepted, size flows through unchanged.
         let max_legal = MAX_BLOB_DATASIZE - 1;
-        let (_, data_size, _, _, _) = parse_blob_header_with_index(
+        let (_, data_size, _, _, _, _) = parse_blob_header_with_index(
             &header_with_datasize(max_legal),
             &crate::host::Diagnostics::discard(),
         )
@@ -525,7 +534,7 @@ mod tests {
     /// cap, so well-formed blobs parse exactly as before.
     #[test]
     fn small_datasize_parses_normally() {
-        let (blob_type, data_size, _, _, _) = parse_blob_header_with_index(
+        let (blob_type, data_size, _, _, _, _) = parse_blob_header_with_index(
             &header_with_datasize(1234),
             &crate::host::Diagnostics::discard(),
         )
@@ -572,7 +581,7 @@ mod tests {
         // An unrecognised but non-empty type still parses, so the check has not
         // cost the format its forward compatibility.
         let future_type = vec![0x0A, 0x06, b'O', b'S', b'M', b'F', b'o', b'o', 0x18, 100];
-        let (blob_type, data_size, _, _, _) =
+        let (blob_type, data_size, _, _, _, _) =
             parse_blob_header_with_index(&future_type, &crate::host::Diagnostics::discard())
                 .expect("an unknown but named blob type must still parse");
         assert_eq!(blob_type, BlobKind::Unknown("OSMFoo".to_string()));
@@ -673,6 +682,27 @@ mod tests {
         // An empty occurrence contributes nothing, in either position.
         let h = parse(&header_with_fields(&[Vec::new(), a, Vec::new()], &[]));
         assert!(h.indexdata.is_some());
+    }
+
+    #[test]
+    fn tagdata_presence_survives_duplicates_but_not_empty_occurrences() {
+        let t = vec![1, 0, 0];
+        for (fields, present, usable) in [
+            (vec![], false, false),
+            (vec![vec![]], false, false),
+            (vec![vec![], t.clone(), vec![]], true, true),
+            (vec![t.clone(), t.clone()], true, false),
+            (vec![t.clone(), t.clone(), t.clone()], true, false),
+        ] {
+            let bytes = header_with_fields(&[], &fields);
+            let (_, _, _, _, tagdata, seen) =
+                parse_blob_header_with_index(&bytes, &crate::host::Diagnostics::discard()).unwrap();
+            assert_eq!(seen, present);
+            assert_eq!(tagdata.is_some(), usable);
+            let skipped = WireBlobHeader::parse(&bytes, false, true, false).unwrap();
+            assert!(!skipped.tagdata_present);
+            assert!(skipped.tagdata.is_none());
+        }
     }
 
     #[test]

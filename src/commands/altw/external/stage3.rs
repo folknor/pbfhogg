@@ -341,13 +341,8 @@ pub(super) fn stage3_slot_reorder(
                     }
                 }
                 Err(payload) => {
-                    let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-                        format!("worker thread panicked: {s}")
-                    } else if let Some(s) = payload.downcast_ref::<String>() {
-                        format!("worker thread panicked: {s}")
-                    } else {
-                        "worker thread panicked (unknown payload)".to_string()
-                    };
+                    let msg =
+                        crate::error::panic_error("worker thread", payload.as_ref()).to_string();
                     if first_err.is_none() {
                         first_err = Some(msg);
                     }

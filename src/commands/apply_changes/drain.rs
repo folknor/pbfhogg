@@ -548,11 +548,11 @@ fn kind_name(kind: ElemKind) -> &'static str {
 /// that claims an ordering it does not have, which every downstream
 /// consumer then trusts. So the drain checks what it actually emits.
 ///
-/// The comparison is against a running high-water mark, not against the
-/// immediately-previous item: a pairwise-adjacent check passes on the
-/// sequence `10..30, 5..8, 40..50` because each *adjacent* pair looks fine
-/// only if you forget 30. This mirrors the transitive overlap detection
-/// `sort` and `cat --dedupe` already use.
+/// The watermark retains the last accepted kind and its greatest end bound.
+/// Each incoming first bound must reach that bound: `10..30, 5..8` is
+/// rejected immediately at 5. For accepted same-kind ranges, comparing the
+/// previous end bound is sufficient too, since accepted bounds cannot move
+/// backwards. The shared watermark expresses this invariant directly.
 ///
 /// The bound compared is the blob's OSM-order *first* id, via
 /// `osm_id_key`, so negative IDs (0, -1, -2, ..., 1, 2, ...) order the

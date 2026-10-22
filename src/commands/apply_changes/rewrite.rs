@@ -271,6 +271,10 @@ pub fn merge(
     let diff = Arc::new({
         let mut overlay = crate::osc::CompactDiffOverlay::new();
         overlay.allow_version_regression(allow_version_regression);
+        // The shared parser also emits merge_changes_decompress_ns once per
+        // file: input-reader time (file reads, plus decompression for gzip),
+        // not the full parse wall measured by osc_start here. Its owner,
+        // TimedRead in osc/xml_parse.rs, documents the attribution.
         crate::osc::parse_osc_file_into(osc_file, &mut overlay)?;
         overlay
     });

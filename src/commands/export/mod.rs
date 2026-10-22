@@ -142,9 +142,10 @@ fn way_kind() -> TypeFilter {
     }
 }
 
-/// The exported geometry carries f64 degrees, and the user's bbox is f64
-/// degrees, so membership is decided in degrees. Round-tripping either side
-/// through decimicrodegrees introduces a boundary disagreement for no gain.
+/// Node and way source positions retain the PBF's nanodegree precision, and
+/// the user's bbox is in degrees. Keep membership in that same precision:
+/// truncating node coordinates to decimicrodegrees can put a node on the
+/// opposite side of a bbox boundary from the same coordinate on a way.
 fn way_hits_bbox(coords: &[(f64, f64)], bbox: &Bbox) -> bool {
     coords.iter().any(|&(lon, lat)| bbox.contains(lat, lon))
 }
@@ -182,12 +183,11 @@ pub fn export<W: Write>(
                     stats.skipped_untagged_nodes += 1;
                     return;
                 }
-                if opts.bbox.as_ref().is_some_and(|bbox| {
-                    !bbox.contains(
-                        crate::coord_fmt::from_decimicro(node.decimicro_lat()),
-                        crate::coord_fmt::from_decimicro(node.decimicro_lon()),
-                    )
-                }) || !matches_expressions(&opts.expressions, &tags, &node_kind())
+                if opts
+                    .bbox
+                    .as_ref()
+                    .is_some_and(|bbox| !bbox.contains(node.lat(), node.lon()))
+                    || !matches_expressions(&opts.expressions, &tags, &node_kind())
                 {
                     return;
                 }
@@ -208,12 +208,11 @@ pub fn export<W: Write>(
                     stats.skipped_untagged_nodes += 1;
                     return;
                 }
-                if opts.bbox.as_ref().is_some_and(|bbox| {
-                    !bbox.contains(
-                        crate::coord_fmt::from_decimicro(node.decimicro_lat()),
-                        crate::coord_fmt::from_decimicro(node.decimicro_lon()),
-                    )
-                }) || !matches_expressions(&opts.expressions, &tags, &node_kind())
+                if opts
+                    .bbox
+                    .as_ref()
+                    .is_some_and(|bbox| !bbox.contains(node.lat(), node.lon()))
+                    || !matches_expressions(&opts.expressions, &tags, &node_kind())
                 {
                     return;
                 }

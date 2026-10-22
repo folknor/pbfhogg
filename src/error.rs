@@ -7,6 +7,25 @@ use std::str::Utf8Error;
 
 use crate::read::blob::ByteOffset;
 
+/// The text of a panic payload: the `&str` or `String` that `panic!` with a
+/// message produces, or a placeholder for a `panic_any` payload of another
+/// type.
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "non-string panic payload"
+    }
+}
+
+/// `"<who> panicked: <payload>"` as an `io::Error`: the one wording every
+/// join and `catch_unwind` site uses to surface a caught panic as a failure.
+pub(crate) fn panic_error(who: &str, payload: &(dyn std::any::Any + Send)) -> io::Error {
+    io::Error::other(format!("{who} panicked: {}", panic_message(payload)))
+}
+
 // Error data structures are modeled on the `csv` crate by BurntSushi.
 // Manual Display/StdError impls are intentional - avoids a thiserror dependency
 // for a small, stable enum that rarely changes.
@@ -434,5 +453,18 @@ mod platform_tests {
         let plain = direct_io_open_error(io::Error::from_raw_os_error(libc::ENOENT));
         assert_eq!(carried_platform_feature(&plain), None);
         assert_eq!(plain.raw_os_error(), Some(libc::ENOENT));
+    }
+}
+
+#[cfg(test)]
+mod panic_message_tests {
+    #[test]
+    fn preserves_both_string_payloads_and_identifies_other_payloads() {
+        assert_eq!(super::panic_message(&"borrowed panic"), "borrowed panic");
+        assert_eq!(
+            super::panic_message(&String::from("owned panic")),
+            "owned panic"
+        );
+        assert_eq!(super::panic_message(&42_u32), "non-string panic payload");
     }
 }

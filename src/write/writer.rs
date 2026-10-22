@@ -11,11 +11,11 @@
 //! back into sequence order. Raw passthrough blobs bypass compression entirely.
 
 use crate::blob_meta;
+use crate::error::panic_error;
 #[cfg(feature = "linux-direct-io")]
 use crate::write::copy_range::copy_range;
 use crate::write::file_writer::FileWriter;
 use crate::write::metrics::WRITER_METRICS;
-use crate::write::pool_failure::panic_error;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::Ordering::Relaxed;

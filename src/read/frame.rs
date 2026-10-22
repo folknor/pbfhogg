@@ -89,11 +89,10 @@ pub(crate) struct FrameHeader {
     /// `WireBlobHeader::indexdata_present` for why a verifier needs the
     /// distinction every reader is right to collapse.
     pub(crate) raw_index_present: bool,
-    // Duplicate non-empty tagdata is collapsed to None by WireBlobHeader
-    // before this layer sees it. Adding presence here alone cannot recover
-    // that fact. Verification needs a separate presence/duplicate signal from
-    // read/blob_wire.rs through parse_blob_header_with_index; keep it separate
-    // from copied bytes so passthrough does not emit an invalid sentinel.
+    /// Whether the header carried a non-empty `tagdata` field at all, even
+    /// when a duplicate occurrence left `tagdata` as `None`. Only
+    /// `check --index` reads it; see `WireBlobHeader::tagdata_present`.
+    pub(crate) tagdata_present: bool,
     pub(crate) tagdata: Option<Box<[u8]>>,
 }
 
@@ -129,7 +128,7 @@ pub(crate) fn read_frame_header<R: Read>(
     // (>= MAX_BLOB_DATASIZE) before returning, so `data_size` is bounded here
     // and no caller can be driven into an outsized payload allocation by a
     // hostile `BlobHeader.datasize`.
-    let (blob_type, data_size, raw_index, raw_index_present, tagdata) =
+    let (blob_type, data_size, raw_index, raw_index_present, tagdata, tagdata_present) =
         parse_blob_header_with_index(header_buf, diagnostics)?;
     Ok(Some(FrameHeader {
         header_len,
@@ -138,6 +137,7 @@ pub(crate) fn read_frame_header<R: Read>(
         raw_index,
         raw_index_present,
         tagdata,
+        tagdata_present,
     }))
 }
 

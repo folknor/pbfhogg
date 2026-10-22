@@ -592,3 +592,90 @@ fn malformed_payload_without_metadata_is_an_error() {
     let out = check_index(&input);
     assert_eq!(out.status.code(), Some(2), "{}", out.stderr_str());
 }
+
+/// Duplicate claims are unreadable metadata, not absence. Construct headers
+/// independently of the production encoder so it cannot normalize them away.
+#[test]
+fn duplicate_tagdata_is_reported_while_empty_and_single_claims_pass() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("untagged.osm.pbf");
+    write_indexed_pbf(
+        &input,
+        &[TestNode {
+            id: 1,
+            lat: 0,
+            lon: 0,
+            tags: vec![],
+            meta: None,
+        }],
+        &[],
+        &[],
+    );
+    let pbf = std::fs::read(&input).expect("read fixture");
+    let locations = crate::common::adversarial::locate_blobs(&pbf);
+    assert_eq!(locations.len(), 2, "one header and one node blob");
+    let target = locations[1];
+    // Version 1, zero keys: an honest claim about the untagged node.
+    let index = vec![1_u8, 0, 0];
+    for (name, fields, malformed) in [
+        ("absent", vec![], false),
+        ("empty", vec![vec![]], false),
+        ("single", vec![index.clone()], false),
+        (
+            "empty-single-empty",
+            vec![vec![], index.clone(), vec![]],
+            false,
+        ),
+        ("double", vec![index.clone(), index.clone()], true),
+        (
+            "triple",
+            vec![index.clone(), vec![], index.clone(), index.clone()],
+            true,
+        ),
+    ] {
+        let mut header = b"\x0a\x07OSMData\x18".to_vec();
+        let mut size = u64::try_from(target.blob_end - target.blob_start).expect("size");
+        while size >= 128 {
+            header.push(u8::try_from(size & 127).expect("seven bits") | 128);
+            size >>= 7;
+        }
+        header.push(u8::try_from(size).expect("last byte"));
+        for field in fields {
+            header.push(0x22);
+            header.push(u8::try_from(field.len()).expect("small tag index"));
+            header.extend_from_slice(&field);
+        }
+        let mut changed = pbf[..target.frame_start].to_vec();
+        changed.extend_from_slice(
+            &u32::try_from(header.len())
+                .expect("header size")
+                .to_be_bytes(),
+        );
+        changed.extend_from_slice(&header);
+        changed.extend_from_slice(&pbf[target.blob_start..]);
+        let path = dir.path().join(format!("{name}.osm.pbf"));
+        std::fs::write(&path, changed).expect("write fixture");
+        let out = check_index(&path);
+        assert_eq!(
+            out.status.code(),
+            Some(i32::from(malformed)),
+            "{name}: stdout:\n{}\nstderr:\n{}",
+            out.stdout_str(),
+            out.stderr_str(),
+        );
+        assert_eq!(
+            out.stdout_str()
+                .contains("tagdata is present but is not a valid tag index"),
+            malformed,
+            "{name}: {}",
+            out.stdout_str(),
+        );
+        if malformed {
+            assert!(
+                out.stdout_str().contains("1 with tagdata"),
+                "{}",
+                out.stdout_str(),
+            );
+        }
+    }
+}

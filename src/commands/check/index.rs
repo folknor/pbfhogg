@@ -480,7 +480,7 @@ pub fn check_index(
         if frame.index.is_some() {
             report.blobs_with_index += 1;
         }
-        if frame.tagdata.is_some() {
+        if frame.tagdata_present {
             report.blobs_with_tagdata += 1;
         }
 
@@ -508,7 +508,11 @@ pub fn check_index(
             observed.as_ref(),
             &mut found,
         );
-        diff_tagdata(frame.tagdata.as_deref(), &block, &mut found);
+        if frame.tagdata_present && frame.tagdata.is_none() {
+            found.push(IndexViolationKind::MalformedTagdata);
+        } else {
+            diff_tagdata(frame.tagdata.as_deref(), &block, &mut found);
+        }
         block.clear();
 
         for kind in found.drain(..) {

@@ -1162,14 +1162,21 @@ impl Iterator for PipelinedBlocks {
                 // `completed` before dropping its sender, so this is
                 // end-of-iteration. On a panic it dropped the sender while
                 // unwinding with `completed` still false - and `Drop` below
-                // joins and discards that panic, so returning `None` here
+                // cannot return an error, so returning `None` here
                 // would report a crashed pipeline as a cleanly ended file.
                 self.rx = None;
                 if self.completed.load(std::sync::atomic::Ordering::Acquire) {
                     None
                 } else {
+                    let message = match self.handle.take().map(JoinHandle::join) {
+                        Some(Err(payload)) => format!(
+                            "pipeline thread terminated without completing (panicked): {}",
+                            crate::error::panic_message(payload.as_ref()),
+                        ),
+                        _ => "pipeline thread terminated without completing".to_owned(),
+                    };
                     Some(Err(new_error(ErrorKind::Io(std::io::Error::other(
-                        "pipeline thread terminated without completing (panicked)",
+                        message,
                     )))))
                 }
             }
@@ -1181,7 +1188,10 @@ impl Drop for PipelinedBlocks {
     fn drop(&mut self) {
         // Close the channel first - signals the pipeline to shut down.
         drop(self.rx.take());
-        // Join the background thread (waits for pipeline cleanup).
+        // Join the background thread (waits for pipeline cleanup). An early
+        // iterator drop has no error return channel. Do not resume its panic:
+        // this may already be cleanup during another unwind. Exhausting the
+        // iterator reports the payload through `next` instead.
         if let Some(h) = self.handle.take() {
             drop(h.join());
         }
@@ -1628,10 +1638,10 @@ mod tests {
     ///
     /// `PipelinedBlocks::next` receives from a channel whose only sender lives
     /// on the pipeline thread, so a panic there closes the channel exactly as
-    /// normal completion does - and `Drop` joins and discards the panic. Mapping
-    /// the receive failure straight to `None` therefore reported a crashed
-    /// pipeline as "the file ended", which is silent data loss with a zero exit
-    /// code. The `completed` flag is what tells the two apart.
+    /// normal completion does. Mapping the receive failure straight to `None`
+    /// therefore reported a crashed pipeline as "the file ended", which is
+    /// silent data loss with a zero exit code. The `completed` flag is what
+    /// tells the two apart.
     ///
     /// Both halves are asserted: a thread that completes normally must still
     /// end iteration with `None`, or this test would pass against an iterator
@@ -1671,7 +1681,7 @@ mod tests {
             .expect("a dead pipeline must yield an item, not end-of-iteration")
             .expect_err("and that item must be an error");
         assert!(
-            format!("{err}").contains("terminated without completing"),
+            format!("{err}").contains("panicked): pipeline thread died"),
             "expected the pipeline-death error, got: {err}"
         );
         assert!(

@@ -548,40 +548,36 @@ pub(super) fn stage1_way_pass(
 ) -> Result<Stage1Output> {
     let schedule = build_way_schedule(blob_meta)?;
 
-    // Cap num_workers against the file descriptor budget. Pass B below
-    // holds `num_workers * NUM_BUCKETS` rank-shard files open
+    // Cap num_workers against the file descriptor allowance. Pass A
+    // below holds `num_workers * NUM_BUCKETS` id-shard files open
     // concurrently. A default soft ulimit of 1024 cannot support four
-    // workers, so ask the caller's process actions for an allowance and
+    // workers, so ask the caller's process actions for an allowance - the
+    // descriptors this run may open on top of those already open - and
     // floor the worker count to what fits. The CLI raises the soft limit
     // to the hard cap; NoProcessActions only probes it. Report the outcome
     // through the caller's diagnostics.
     let cpu_cap = crate::host::sized_workers(&*host.resources, 2, 1, 4);
+    // Headroom for the descriptors this run opens beyond the shard fleet
+    // after the allowance is taken: the input PBF, the sidecars and
+    // whatever the reader and writer stages open.
+    const HEADROOM_FDS: u64 = 64;
     let fd_budget = host
         .process
-        .fd_allowance(cpu_cap as u64 * NUM_BUCKETS as u64 + 64);
+        .fd_allowance(cpu_cap as u64 * NUM_BUCKETS as u64 + HEADROOM_FDS);
     crate::host::diag!(
         host.diagnostics,
         Developer,
         "altw.external.nofile",
         "[altw external] {fd_budget}"
     );
-    let effective_soft = fd_budget.descriptors;
-    // Headroom for input PBF, scratch dir, sidecars, stdin/stdout/stderr,
-    // mpsc channel fds, rayon worker fds, page-cache probe fds, etc.
-    const HEADROOM_FDS: u64 = 64;
+    let available = fd_budget.descriptors;
     let buckets_per_worker = NUM_BUCKETS as u64;
-    if effective_soft < HEADROOM_FDS + buckets_per_worker {
-        let min_needed = HEADROOM_FDS + buckets_per_worker;
-        return Err(format!(
-            "altw external: file descriptor limit too low \
-             (RLIMIT_NOFILE = {effective_soft}, need >= {min_needed} \
-             for even a single shard worker). Raise with \
-             `ulimit -n {min_needed}` (or higher) and retry."
-        )
-        .into());
+    let min_needed = HEADROOM_FDS + buckets_per_worker;
+    if available < min_needed {
+        return Err(fd_allowance_too_low(&fd_budget, min_needed).into());
     }
     #[allow(clippy::cast_possible_truncation)]
-    let fd_cap = ((effective_soft - HEADROOM_FDS) / buckets_per_worker) as usize;
+    let fd_cap = ((available - HEADROOM_FDS) / buckets_per_worker) as usize;
     let num_workers = cpu_cap.min(fd_cap).max(1);
     if num_workers < cpu_cap {
         crate::host::diag!(
@@ -600,13 +596,12 @@ pub(super) fn stage1_way_pass(
              (cpu-bound; fd budget allows up to {fd_cap} workers)"
         );
     }
-    crate::debug::emit_counter(
-        "extjoin_nofile_soft_cap",
+    if let Some(probe) = fd_budget.probe {
         #[allow(clippy::cast_possible_wrap)]
-        {
-            effective_soft as i64
-        },
-    );
+        crate::debug::emit_counter("extjoin_nofile_soft_cap", probe.soft_limit as i64);
+    }
+    #[allow(clippy::cast_possible_wrap)]
+    crate::debug::emit_counter("extjoin_fd_available", available as i64);
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("extjoin_cpu_cap_workers", cpu_cap as i64);
     #[allow(clippy::cast_possible_wrap)]
@@ -632,4 +627,58 @@ pub(super) fn stage1_way_pass(
         num_shard_workers: num_workers,
         node_blob_mapping,
     })
+}
+
+/// The up-front error when the allowance cannot hold even one shard
+/// worker. It names what the allowance was derived from, and suggests a
+/// `ulimit` only where raising the process limit is the remedy.
+fn fd_allowance_too_low(allowance: &crate::process::FdAllowance, need: u64) -> String {
+    use crate::process::{FdAdjustment, FdCount};
+    let available = allowance.descriptors;
+    let Some(probe) = allowance.probe else {
+        return format!(
+            "altw external: the host granted {available} file descriptors, \
+             need >= {need} for even a single shard worker"
+        );
+    };
+    let soft = probe.soft_limit;
+    let assumed = matches!(probe.adjustment, Some(FdAdjustment::ProbeFailed));
+    let limit = if assumed {
+        format!("RLIMIT_NOFILE unreadable, assumed {soft}")
+    } else {
+        format!("RLIMIT_NOFILE = {soft}")
+    };
+    let estimate = if assumed {
+        " (an estimate: the limit could not be read)"
+    } else {
+        ""
+    };
+    match probe.open {
+        FdCount::Counted(open) => format!(
+            "altw external: file descriptor limit too low ({limit}, {open} already \
+             open, {available} available; need >= {need} free for even a single \
+             shard worker). Raise with `ulimit -n {}`{estimate} (or higher) and retry.",
+            open + need
+        ),
+        FdCount::Uncounted => format!(
+            "altw external: file descriptor limit too low ({limit}, need >= {need} \
+             for even a single shard worker). Raise with `ulimit -n {need}`{estimate} \
+             (or higher) and retry."
+        ),
+        FdCount::Failed(errno) => format!(
+            "altw external: counting the process's open file descriptors failed \
+             ({}), so no descriptor budget can be granted ({limit})",
+            std::io::Error::from_raw_os_error(errno)
+        ),
+        FdCount::Exhausted(errno) if errno == libc::ENFILE => format!(
+            "altw external: no file descriptor free ({}): the system-wide file table \
+             is full; raising {limit} will not help",
+            std::io::Error::from_raw_os_error(errno)
+        ),
+        FdCount::Exhausted(errno) => format!(
+            "altw external: no file descriptor free ({}): the process already holds \
+             every descriptor {limit} allows; close descriptors or raise the limit",
+            std::io::Error::from_raw_os_error(errno)
+        ),
+    }
 }

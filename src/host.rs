@@ -103,7 +103,19 @@ impl Executor {
 pub trait ProcessActions: Send + Sync {
     /// A pool will allocate and free buffers on different threads.
     fn cross_thread_alloc_pool(&self);
-    /// Request permission to hold `wanted` descriptors.
+    /// Request permission to hold `wanted` descriptors. The answer is how
+    /// many the run may open on top of those already open in the process.
+    ///
+    /// The built-in providers ([`NoProcessActions`], and
+    /// [`process::raise_nofile_to_hard_cap`](crate::process::raise_nofile_to_hard_cap))
+    /// subtract a snapshot count of open descriptors from the soft limit.
+    /// That is an estimate under stable descriptor use, not a reservation:
+    /// two calls probing at once both see the same free descriptors. A host
+    /// running descriptor-heavy calls concurrently returns
+    /// [`FdAllowance::host_grant`] with a share it reserves for the duration
+    /// of the call and releases when the call returns, computing free
+    /// capacity as the limit less the occupied descriptors less the
+    /// reservations not yet opened.
     fn fd_allowance(&self, wanted: u64) -> FdAllowance;
 }
 /// Leave process policy unchanged.
@@ -216,7 +228,7 @@ mod tests {
     }
     #[test]
     fn descriptor_allowance_narration() {
-        use crate::process::FdAdjustment::*;
+        use crate::process::{FdAdjustment::*, FdCount, FdProbe};
         for (adjustment, text) in [
             (None, "RLIMIT_NOFILE: 4096 (not adjusted)"),
             (
@@ -236,15 +248,47 @@ mod tests {
                 "RLIMIT_NOFILE: 4096 (raise to hard cap rejected; still at soft cap)",
             ),
         ] {
-            assert_eq!(
-                FdAllowance {
-                    descriptors: 4096,
-                    adjustment
-                }
-                .to_string(),
-                text
-            );
+            for (open, descriptors, suffix) in [
+                (
+                    FdCount::Counted(6),
+                    4090,
+                    "; 6 open, 4090 available".to_owned(),
+                ),
+                (
+                    FdCount::Uncounted,
+                    4096,
+                    "; open descriptors not counted".to_owned(),
+                ),
+                (
+                    FdCount::Exhausted(libc::EMFILE),
+                    0,
+                    format!(
+                        "; no descriptor free to count open ones ({})",
+                        std::io::Error::from_raw_os_error(libc::EMFILE)
+                    ),
+                ),
+                (
+                    FdCount::Failed(libc::EIO),
+                    0,
+                    format!(
+                        "; counting open descriptors failed ({})",
+                        std::io::Error::from_raw_os_error(libc::EIO)
+                    ),
+                ),
+            ] {
+                let allowance = FdAllowance::from_probe(FdProbe {
+                    soft_limit: 4096,
+                    adjustment,
+                    open,
+                });
+                assert_eq!(allowance.descriptors, descriptors);
+                assert_eq!(allowance.to_string(), format!("{text}{suffix}"));
+            }
         }
+        assert_eq!(
+            FdAllowance::host_grant(512).to_string(),
+            "descriptor allowance: 512 (host grant)"
+        );
     }
 }
 

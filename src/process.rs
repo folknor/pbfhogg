@@ -103,126 +103,246 @@ pub enum FdAdjustment {
     RaiseFailed,
 }
 
-/// Result of probing + raising `RLIMIT_NOFILE`. `Display` prints a
-/// compact one-line summary suitable for stderr narration.
-#[derive(Clone, Copy, Debug)]
-pub struct FdAllowance {
-    /// Effective soft limit after the raise attempt, clamped to a sane
-    /// ceiling if the kernel reports `RLIM_INFINITY`.
-    pub descriptors: u64,
+/// How many descriptors were already open when an allowance was probed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FdCount {
+    /// Open descriptors numbered below the soft limit. Includes the one
+    /// the count itself held open, so it is conservative by one.
+    Counted(u64),
+    /// The open descriptors cannot be counted here (no procfs, a non-Linux
+    /// target); nothing was subtracted.
+    Uncounted,
+    /// Enumerating the open descriptors started and then failed; carries
+    /// the errno. Nothing can be granted on a partial count.
+    Failed(i32),
+    /// Counting needed a descriptor and none was free; carries the errno
+    /// (`EMFILE` for the process limit, `ENFILE` for the system-wide table).
+    Exhausted(i32),
+}
+
+/// What a built-in provider derived an [`FdAllowance`] from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FdProbe {
+    /// Soft `RLIMIT_NOFILE` after any raise attempt, clamped to a sane
+    /// ceiling if the kernel reports `RLIM_INFINITY`. An assumption, not an
+    /// observation, when `adjustment` is `Some(FdAdjustment::ProbeFailed)`.
+    pub soft_limit: u64,
+    /// `None` when the provider did not try to adjust the limit.
     pub adjustment: Option<FdAdjustment>,
+    pub open: FdCount,
+}
+
+/// Descriptors a run may hold, as answered by
+/// [`ProcessActions::fd_allowance`](crate::host::ProcessActions::fd_allowance).
+/// `Display` prints a compact one-line summary suitable for narration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FdAllowance {
+    /// Descriptors the run may open on top of those already open.
+    pub descriptors: u64,
+    /// The limit and open count this was derived from; `None` for a
+    /// host-defined grant.
+    pub probe: Option<FdProbe>,
+}
+
+impl FdAllowance {
+    /// A host-defined grant of `descriptors`, for example a share the host
+    /// reserves for the duration of one call.
+    pub fn host_grant(descriptors: u64) -> Self {
+        Self {
+            descriptors,
+            probe: None,
+        }
+    }
+
+    /// The allowance a probe yields: the soft limit less the descriptors
+    /// already open, the whole soft limit where they cannot be counted, and
+    /// nothing when counting found none free or failed partway.
+    pub fn from_probe(probe: FdProbe) -> Self {
+        let descriptors = match probe.open {
+            FdCount::Counted(open) => probe.soft_limit.saturating_sub(open),
+            FdCount::Uncounted => probe.soft_limit,
+            FdCount::Exhausted(_) | FdCount::Failed(_) => 0,
+        };
+        Self {
+            descriptors,
+            probe: Some(probe),
+        }
+    }
 }
 
 impl std::fmt::Display for FdAllowance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.adjustment {
-            None => write!(f, "RLIMIT_NOFILE: {} (not adjusted)", self.descriptors),
-            Some(FdAdjustment::ProbeFailed) => write!(
-                f,
-                "RLIMIT_NOFILE: probe failed; assuming {}",
-                self.descriptors
-            ),
+        let Some(probe) = self.probe else {
+            return write!(f, "descriptor allowance: {} (host grant)", self.descriptors);
+        };
+        let soft = probe.soft_limit;
+        match probe.adjustment {
+            None => write!(f, "RLIMIT_NOFILE: {soft} (not adjusted)")?,
+            Some(FdAdjustment::ProbeFailed) => {
+                write!(f, "RLIMIT_NOFILE: probe failed; assuming {soft}")?;
+            }
             Some(FdAdjustment::AlreadyAtCap) => write!(
                 f,
-                "RLIMIT_NOFILE: {} (already at hard cap; no adjustment)",
-                self.descriptors
-            ),
+                "RLIMIT_NOFILE: {soft} (already at hard cap; no adjustment)"
+            )?,
             Some(FdAdjustment::Raised { from }) => write!(
                 f,
-                "RLIMIT_NOFILE: {from} -> {} (soft raised to hard cap)",
-                self.descriptors
-            ),
+                "RLIMIT_NOFILE: {from} -> {soft} (soft raised to hard cap)"
+            )?,
             Some(FdAdjustment::RaiseFailed) => write!(
                 f,
-                "RLIMIT_NOFILE: {} (raise to hard cap rejected; still at soft cap)",
-                self.descriptors
+                "RLIMIT_NOFILE: {soft} (raise to hard cap rejected; still at soft cap)"
+            )?,
+        }
+        match probe.open {
+            FdCount::Counted(open) => {
+                write!(f, "; {open} open, {} available", self.descriptors)
+            }
+            FdCount::Uncounted => f.write_str("; open descriptors not counted"),
+            FdCount::Exhausted(errno) => write!(
+                f,
+                "; no descriptor free to count open ones ({})",
+                std::io::Error::from_raw_os_error(errno)
+            ),
+            FdCount::Failed(errno) => write!(
+                f,
+                "; counting open descriptors failed ({})",
+                std::io::Error::from_raw_os_error(errno)
             ),
         }
     }
 }
 
-/// Self-raise `RLIMIT_NOFILE` soft limit to the current hard cap and
-/// report both the effective soft limit and the narrative of what
-/// happened.
+/// Count the process's open descriptors numbered below `limit`.
 ///
-/// External join's stage 1 pass B holds `num_workers * NUM_BUCKETS`
-/// (up to ~4096 on a 17-core host) rank-shard files open concurrently.
-/// Linux default soft ulimit is 1024 on many distros; some still cap
-/// hard at 4096. Without this raise, `add-locations-to-ways
-/// --index-type external` fails with EMFILE on a default-ulimit shell
-/// even though the hard cap is usually high enough. The unprivileged
+/// Only numbers below the soft limit compete for new descriptors: after a
+/// limit is lowered, descriptors already open above it do not take a slot
+/// below it.
+pub fn count_open_descriptors(limit: u64) -> FdCount {
+    #[cfg(target_os = "linux")]
+    {
+        let dir = match std::fs::read_dir("/proc/self/fd") {
+            Ok(dir) => dir,
+            Err(e) => {
+                return match e.raw_os_error() {
+                    Some(errno) if errno == libc::EMFILE || errno == libc::ENFILE => {
+                        FdCount::Exhausted(errno)
+                    }
+                    _ => FdCount::Uncounted,
+                };
+            }
+        };
+        let mut open: u64 = 0;
+        for entry in dir {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => return FdCount::Failed(e.raw_os_error().unwrap_or(libc::EIO)),
+            };
+            let Some(fd) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u64>().ok())
+            else {
+                return FdCount::Failed(libc::EINVAL);
+            };
+            if fd < limit {
+                open += 1;
+            }
+        }
+        FdCount::Counted(open)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = limit;
+        FdCount::Uncounted
+    }
+}
+
+/// Probe with the open descriptors counted against `soft_limit`.
+fn probed(soft_limit: u64, adjustment: Option<FdAdjustment>) -> FdAllowance {
+    FdAllowance::from_probe(FdProbe {
+        soft_limit,
+        adjustment,
+        open: count_open_descriptors(soft_limit),
+    })
+}
+
+/// Self-raise `RLIMIT_NOFILE` soft limit to the current hard cap and
+/// report the descriptors a run may open on top of those already open,
+/// with the narrative of what happened.
+///
+/// External join's stage 1 holds `num_workers * NUM_BUCKETS` id-shard
+/// files open concurrently, which on a many-core host is several
+/// thousand. Linux default soft ulimit is 1024 on many distros; some
+/// still cap hard at 4096. Without this raise, `add-locations-to-ways
+/// --index-type external` on a default-ulimit shell runs with fewer shard
+/// workers than the host has cores, or refuses to start, even though the
+/// hard cap is usually high enough. The unprivileged
 /// soft-raise up to hard cap is the standard pattern for servers
 /// (PostgreSQL, Redis, nginx).
 ///
-/// Returns 1024 as a conservative fallback `descriptors` if the
-/// probe itself fails, so callers can still compute a sensible cap.
+/// The open count is a snapshot, not a reservation: it is right while no
+/// other thread of the process opens descriptors concurrently.
+///
+/// Assumes a soft limit of 1024 if the probe itself fails, so callers can
+/// still compute a sensible cap.
 pub fn raise_nofile_to_hard_cap() -> FdAllowance {
     // SAFETY: `getrlimit`/`setrlimit` are pure-data FFI calls. The
     // rlimit struct is fully initialised before being passed as
     // `&mut`, and we don't share it across threads.
-    unsafe {
+    let (soft, adjustment) = unsafe {
         let mut rlim = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
         };
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
-            return FdAllowance {
-                descriptors: 1024,
-                adjustment: Some(FdAdjustment::ProbeFailed),
-            };
-        }
-        let soft_before: u64 = rlim.rlim_cur;
-        let hard: u64 = rlim.rlim_max;
-        if soft_before >= hard {
-            // `rlim_cur` can be `RLIM_INFINITY` (= `u64::MAX` on
-            // Linux); clamp so downstream arithmetic doesn't overflow.
-            return FdAllowance {
-                descriptors: soft_before.min(1 << 30),
-                adjustment: Some(FdAdjustment::AlreadyAtCap),
-            };
-        }
-        let target = libc::rlimit {
-            rlim_cur: hard,
-            rlim_max: hard,
-        };
-        let raise_ok = libc::setrlimit(libc::RLIMIT_NOFILE, &target) == 0;
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
-            return FdAllowance {
-                descriptors: 1024,
-                adjustment: Some(FdAdjustment::ProbeFailed),
-            };
-        }
-        let effective: u64 = rlim.rlim_cur.min(1 << 30);
-        if raise_ok {
-            FdAllowance {
-                descriptors: effective,
-                adjustment: Some(FdAdjustment::Raised { from: soft_before }),
-            }
+            (1024, FdAdjustment::ProbeFailed)
         } else {
-            FdAllowance {
-                descriptors: effective,
-                adjustment: Some(FdAdjustment::RaiseFailed),
+            let soft_before: u64 = rlim.rlim_cur;
+            let hard: u64 = rlim.rlim_max;
+            if soft_before >= hard {
+                // `rlim_cur` can be `RLIM_INFINITY` (= `u64::MAX` on
+                // Linux); clamp so downstream arithmetic doesn't overflow.
+                (soft_before.min(1 << 30), FdAdjustment::AlreadyAtCap)
+            } else {
+                let target = libc::rlimit {
+                    rlim_cur: hard,
+                    rlim_max: hard,
+                };
+                let raise_ok = libc::setrlimit(libc::RLIMIT_NOFILE, &target) == 0;
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
+                    (1024, FdAdjustment::ProbeFailed)
+                } else if raise_ok {
+                    (
+                        rlim.rlim_cur.min(1 << 30),
+                        FdAdjustment::Raised { from: soft_before },
+                    )
+                } else {
+                    (rlim.rlim_cur.min(1 << 30), FdAdjustment::RaiseFailed)
+                }
             }
         }
-    }
+    };
+    probed(soft, Some(adjustment))
 }
-/// Probe the current descriptor allowance without adjusting it.
+/// Probe the current descriptor allowance without adjusting the limit:
+/// the soft limit less the descriptors already open. Same snapshot caveat
+/// as [`raise_nofile_to_hard_cap`].
 pub fn current_nofile() -> FdAllowance {
     // SAFETY: the output structure is initialized and exclusively borrowed.
-    unsafe {
+    let soft = unsafe {
         let mut limit = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
         };
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
-            return FdAllowance {
-                descriptors: 1024,
-                adjustment: Some(FdAdjustment::ProbeFailed),
-            };
+            None
+        } else {
+            Some(limit.rlim_cur.min(1 << 30))
         }
-        FdAllowance {
-            descriptors: limit.rlim_cur.min(1 << 30),
-            adjustment: None,
-        }
+    };
+    match soft {
+        Some(soft) => probed(soft, None),
+        None => probed(1024, Some(FdAdjustment::ProbeFailed)),
     }
 }

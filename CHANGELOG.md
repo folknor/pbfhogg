@@ -539,6 +539,17 @@
 
 ### Fixed
 
+- **`add-locations-to-ways --index-type external` counts descriptors the
+  process already holds** before sizing its shard workers. It budgeted from
+  the soft `RLIMIT_NOFILE` alone, so a library caller holding many files, or
+  a CLI run that inherited them, could pass the up-front check and then fail
+  with `EMFILE` partway through stage 1. It now takes fewer workers or fails
+  up front, naming how many descriptors were open. Breaking for library
+  callers: `FdAllowance::descriptors` is now the count a run may open on top
+  of those already open, the limit and open count move to
+  `FdAllowance::probe`, and `FdAllowance::host_grant` lets a host running
+  concurrent joins hand out a share it reserves.
+
 - **`PbfWriter::to_path` onto a FIFO, socket or character device no longer
   fails `flush()`.** Every byte was written, then the final `fsync` returned
   `EINVAL` because such targets cannot be synchronized, and `flush()` reported

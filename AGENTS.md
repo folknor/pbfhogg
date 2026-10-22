@@ -147,6 +147,7 @@ Commands requiring indexdata: `apply-changes`, `sort`, `add-locations-to-ways`, 
 `dense` was removed - sparse rank-indexed flat is faster than the prior dense path at every measured scale and works in regimes dense didn't (europe survives at ~6 minutes on a 27 GB-RAM host). See `notes/altw.md` "Don't re-attempt" and "Status".
 
 ## Benchmarking Rules
+- **Ignore performance differences below 2-3 %.** They are noise for every decision here: not a regression to fix, not a win to claim, not a reason to run more cells. Do not chase them with extra benchmark runs or code-layout tweaks (`#[inline]` attributes and the like).
 - **NEVER run benchmark, profiling, or verify commands in parallel.** ONE AT A TIME. Always wait for each to fully complete before starting the next.
 - Multiple benchmark runs in an optimization workflow: run sequentially, report between runs.
 - **Read the phase split before calling any delta a regression.** `brokkr sidecar <uuid> --human` attributes per-phase disk read, majflt and cores. Planet wall deltas are routinely environmental; one sidecar read regularly saves a bisect.

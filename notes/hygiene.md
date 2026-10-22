@@ -2182,8 +2182,7 @@ Reported by: change application.
   docs describing the removed rank path; `drop_rank_index`'s doc cites a stage
   2 use with no external caller.
 - `NodeBlobInfo` documents rank-range fields that no longer exist; stage 1 and
-  `Stage1Output` docs say it owns an `IdSet` it does not; stage 1's fd comment
-  and `raise_nofile_to_hard_cap`'s doc cite the removed pass B;
+  `Stage1Output` docs say it owns an `IdSet` it does not;
   `relation_scan.rs` and `coord_payloads.rs` cite deleted functions and files;
   stage 4's comment points at `add_locations_to_ways.rs`, which no longer
   exists; `scan/node.rs` lists "ALTW dense pass 1" as a user.
@@ -2303,9 +2302,6 @@ Reported by: CLI and plumbing, test harness.
 - The static-hook textlint exempts every `tests/fault_*.rs`, but
   `fault_apply_changes.rs` belongs to `all` and only uses per-instance hooks.
   Narrow the exemption to the standalone targets or rename that file.
-- altw external sizes its fd budget from the soft limit alone, without
-  counting descriptors already open. Concurrent joins at low limits can
-  exhaust descriptors.
 
 The identity instrument blesses the unchanged product build itself: brokkr
 owns BROKKR_TEST_BIN_DIR and cannot be redirected to a baseline. Test filters

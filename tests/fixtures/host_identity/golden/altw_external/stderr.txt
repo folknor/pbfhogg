@@ -1,5 +1,5 @@
-[altw external] RLIMIT_NOFILE: 1024 -> 4096 (soft raised to hard cap)
-[altw external] num_workers = 2 (cpu-bound; fd budget allows up to 15 workers)
+[altw external] RLIMIT_NOFILE: 1024 -> 4096 (soft raised to hard cap); <FDS> open, <FDS> available
+[altw external] num_workers = 2 (cpu-bound; fd budget allows up to <FDS> workers)
 [coord_payloads] streaming router 1 way blobs (1 worker / 0 straddler / 0 empty), 0 MB in worker tmps + 0 KB straddler bytes in RAM
 add-locations-to-ways: 300 nodes read, 30 written, 270 dropped, 40 ways, 5 relations, 0 missing locations
   Blobs: 1 passthrough, 4 decoded

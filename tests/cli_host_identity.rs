@@ -8,8 +8,8 @@
 //! skipped scenario writes no goldens and is named on stderr by both tests,
 //! so a gate log never reads as full coverage; on a host where io_uring
 //! works, bless there and the scenarios become mandatory by themselves.
-//! Only the explicitly listed path, PID, inode, memory and timing fields are
-//! masked. The id-W<worker>- scratch routing component is also masked:
+//! Only the explicitly listed path, PID, inode, memory, timing and
+//! inherited-descriptor-count fields are masked. The id-W<worker>- scratch routing component is also masked:
 //! the dispatcher assigns the same blob to whichever worker is ready first.
 //! inspect --nodes weighted bit-widths and their derived size/ratio estimates
 //! are masked: each worker assembles its own 128-value groups, so assignment
@@ -395,6 +395,16 @@ fn normalise(text: &str, dir: &Path) -> String {
             "  <SIZE> GB (<BLOCKS> blocks x (<SIZE> + <SIZE>) bytes/block)",
         ),
         (r"(?m)^(  ratio: )[0-9.]+%$", "${1}<RATIO>%"),
+        // The descriptors a run inherits depend on whoever launched it.
+        (
+            r"\d+ (already )?open, \d+ available",
+            "<FDS> ${1}open, <FDS> available",
+        ),
+        (r"ulimit -n \d+", "ulimit -n <FDS>"),
+        (
+            r"fd budget allows up to \d+ workers",
+            "fd budget allows up to <FDS> workers",
+        ),
     ] {
         s = Regex::new(pattern)
             .unwrap()

@@ -14,6 +14,7 @@
 pub mod derive;
 pub(crate) mod derive_parallel;
 pub(crate) mod parallel;
+mod shard;
 
 // Under the `test-hooks` feature, expose the shard-panic hook so
 // integration tests can arm it. The rest of `parallel` stays
@@ -243,7 +244,7 @@ pub fn diff(
     // would be worse than the wall-time cost of a sequential verbose
     // diff. Verbose is a human-inspection mode; the parallel default
     // serves the common non-verbose case.
-    let stats = if both_indexed && options.jobs > 1 && !options.verbose {
+    let parallel_stats = if both_indexed && options.jobs > 1 && !options.verbose {
         parallel::diff_block_pair_parallel(
             old_path,
             new_path,
@@ -255,6 +256,11 @@ pub fn diff(
             host,
             &token,
         )?
+    } else {
+        None
+    };
+    let stats = if let Some(stats) = parallel_stats {
+        stats
     } else if both_indexed {
         diff_block_pair(
             old_path, new_path, output, options, direct_io, &filter, host,

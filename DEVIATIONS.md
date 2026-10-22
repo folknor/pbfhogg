@@ -234,6 +234,13 @@ feature, not a tolerated edge case.
 Production PBFs (planet, Geofabrik extracts, applied OSC streams) are
 positive-only, and several code paths rely on that invariant.
 
+`diff` and `diff --format osc` are not among the sites below: they
+accept negative IDs and order them by the canonical `id_order`. Their
+parallel shard planners compare thresholds as raw `i64`, which agrees
+with `id_order` only for non-negative IDs, so an indexed input holding
+any negative ID takes the sequential block-pair merge for the whole
+comparison instead (`src/commands/diff/shard.rs`).
+
 **Sites enforcing the invariant:**
 
 - `renumber` - **hard reject** at every entry point where a negative
@@ -249,16 +256,6 @@ positive-only, and several code paths rely on that invariant.
   `min_id >= 0` while the payload contains negatives still errors
   cleanly rather than panicking in `chunk_for_atomic` or silently
   dropping bits.
-- `diff` / `derive-changes` parallel shard planners
-  (`src/commands/diff/parallel.rs::plan_shards`,
-  `src/commands/diff/derive_parallel.rs::plan_shards`) -
-  **`debug_assert!` only**. Threshold comparisons inside the
-  planner and the shard hot path (`emit_side`, `merge_decoded`,
-  `merge_up_to`) are raw `i64` compares rather than `osm_id_cmp`.
-  For positive-only inputs the two agree; mixed-sign inputs would
-  silently mis-shard. Release builds rely on the upstream chain
-  (read → renumber/apply-changes → diff) never producing a
-  mixed-sign PBF; debug builds flag the violation at planner entry.
 - `getid` - **hard reject** at parse time. `parse_id_spec` in
   `src/commands/getid/mod.rs` rejects any negative id parsed from a
   CLI argument or `--id-file` text spec, returning an error naming
@@ -322,10 +319,7 @@ the bookkeeping, double the merge cost) or widening to a signed
 offset-mapped index (extra indirection on the hot path). Neither
 pays off against the actual demand, which is zero: no user has asked
 for JOSM-staged input, and the canonical workflow for such data is
-"upload to OSM, then re-extract." The shard-planner invariant
-piggy-backs on the same justification: production upstreams never
-introduce negatives, so the planners can use raw `i64` compare
-without a canonical-compare layer.
+"upload to OSM, then re-extract."
 
 **Migration path to osmium-style support.** If a consumer does need
 JOSM-interop, the work is:
@@ -339,9 +333,7 @@ JOSM-interop, the work is:
    with the capacity cost that implies.
 3. Renumber output numbering interleaves per `id_order` so the
    emitted sequence matches osmium's expectations.
-4. Shard planners drop their `debug_assert` and switch threshold
-   compares to `osm_id_cmp`.
-5. DEVIATIONS.md entry inverts: claim alignment with osmium instead
+4. DEVIATIONS.md entry inverts: claim alignment with osmium instead
    of deviation.
 
 This is ~several days of work plus thorough regression testing
@@ -352,9 +344,9 @@ ask.
 bug: after ordering-based merging by `operator<` (which is
 canonical), the "same id?" check uses raw `it1->id() != it2->id()`
 rather than the absolute-value comparator. Mixed-sign inputs can
-mis-trigger there too. Our debug_assert at least catches the
-violation loudly; osmium does not. The pbfhogg finding is not
-pbfhogg-unique - it's an ecosystem-wide gap.
+mis-trigger there. pbfhogg's diff routes negative-ID inputs away from
+its raw-compare shard planners instead; the gap is not pbfhogg-unique,
+it is ecosystem-wide.
 
 **Impact:** Users with JOSM-local staging data must resolve negative
 IDs before running pbfhogg commands that touch the invariant sites.

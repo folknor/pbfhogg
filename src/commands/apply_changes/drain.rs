@@ -477,7 +477,7 @@ struct DrainState {
     /// Running (kind, `osm_id_key`) high-water mark across every item
     /// already dispatched. Drives [`check_output_order`]; see there for
     /// why this is a running max rather than a pairwise-adjacent check.
-    order_watermark: Option<(ElemKind, (u8, i64), i64)>,
+    order_watermark: Option<(ElemKind, crate::osm_id::OsmIdKey, i64)>,
 }
 
 impl DrainState {

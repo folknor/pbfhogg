@@ -129,29 +129,6 @@ pub(crate) struct OwnedRelation {
 }
 
 // ---------------------------------------------------------------------------
-// Element comparison
-// ---------------------------------------------------------------------------
-
-pub(crate) fn nodes_equal(a: &OwnedNode, b: &OwnedNode) -> bool {
-    a.decimicro_lat == b.decimicro_lat && a.decimicro_lon == b.decimicro_lon && a.tags == b.tags
-}
-
-pub(crate) fn ways_equal(a: &OwnedWay, b: &OwnedWay) -> bool {
-    a.refs == b.refs && a.tags == b.tags
-}
-
-pub(crate) fn members_equal(a: &[OwnedMember], b: &[OwnedMember]) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b.iter())
-            .all(|(ma, mb)| ma.id == mb.id && ma.role == mb.role)
-}
-
-pub(crate) fn relations_equal(a: &OwnedRelation, b: &OwnedRelation) -> bool {
-    a.tags == b.tags && members_equal(&a.members, &b.members)
-}
-
-// ---------------------------------------------------------------------------
 // OSC XML element writing (shared by derive_changes and merge_changes)
 // ---------------------------------------------------------------------------
 

@@ -159,6 +159,7 @@ pbfhogg add-locations-to-ways <f> -o <o>  Embed node coordinates in ways
 pbfhogg apply-changes <base> <osc> -o <o> Apply OSC diff (--locations-on-ways)
 pbfhogg merge-changes <oscs...> -o <out>  Merge multiple OSC files (--simplify)
 pbfhogg diff <old> <new>                  Compare two PBFs (-v verbose, --format osc)
+pbfhogg digest <file>                     Encoding-independent digest of element content
 pbfhogg tags-filter <file> -o <out> <exp> Filter by tag expressions (PBF or OSC input)
 pbfhogg getid <file> -o <out> <ids>       Extract elements by ID (--invert to remove)
 pbfhogg getparents <file> -o <out> <ids>  Find ways/relations referencing given IDs

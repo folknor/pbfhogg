@@ -477,6 +477,41 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 
 With `--format osc`, produces a lossless roundtrip - applying the derived OSC to the old PBF reproduces the new PBF exactly (see [DEVIATIONS](../DEVIATIONS.md#derive-changes-lossless-delete-roundtrip)).
 
+Inputs holding any negative ID always take the sequential block-pair path, whatever `-j` says: the parallel planner's shard boundaries are raw numeric comparisons, which do not order negative IDs the way the merge does.
+
+### digest
+
+Print a digest of a PBF's element content. Two files the command accepts get the same digest exactly when `diff --suppress-common` reports them identical (barring a 128-bit hash collision), whatever their encoding: compression, blob boundaries, dense or plain nodes, string-table order, header fields and indexdata presence do not change it, and neither does metadata, which diff ignores. Element content is defined once, in `src/content.rs`, for both commands.
+
+```
+pbfhogg digest [OPTIONS] <FILE>
+```
+
+| Flag | Description |
+|------|-------------|
+| `--direct-io` | Use O_DIRECT to bypass page cache |
+
+Output, on stdout:
+
+```
+xxh128 v1 <32 hex digits>
+node <count> <32 hex digits>
+way <count> <32 hex digits>
+relation <count> <32 hex digits>
+```
+
+The first line names the algorithm and the canonical-form version; the version changes whenever the content definition or its serialization does, so a stored digest is only comparable with one of the same version. The per-kind lines digest each kind alone, so a mismatch shows which kind differs.
+
+The command refuses, exiting non-zero and printing no digest line, any input on which diff's answer is not a function of element content:
+
+- no `OsmHeader` as the first blob, a second `OsmHeader`, or a blob of unknown type;
+- a header that does not claim `Sort.Type_then_ID`;
+- a data block that is mixed-kind (or classified as one kind while holding another), kinds out of node, way, relation order, or IDs that do not strictly ascend within a kind (duplicates included);
+- indexdata on some data blobs and not others, or indexdata whose kind, minimum ID, maximum ID or count disagrees with its block, or on an empty block;
+- a tag, role or metadata user name whose string-table index does not resolve.
+
+A refusal is the safe answer for a cache keyed on the digest: fall back to the real comparison. The promise is "refuses input failing these checks", not "refuses every corrupt file": a file cut off exactly at a blob boundary is a valid shorter file.
+
 ### getid
 
 Extract or remove elements by ID. By default, keeps only the listed IDs. With `--invert`, removes the listed IDs and keeps everything else.

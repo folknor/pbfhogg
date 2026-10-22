@@ -151,6 +151,7 @@ writer.flush()?;
 pub(crate) mod blob_meta;
 #[doc(hidden)]
 pub mod commands;
+pub(crate) mod content;
 pub(crate) mod coord_fmt;
 pub(crate) mod coord_pack;
 pub mod debug;
@@ -202,11 +203,12 @@ pub use read::block::{
     HeaderBBox, HeaderBlock, PrimitiveBlock, PrimitiveGroup,
 };
 pub use read::dense::{
-    DenseNode, DenseNodeInfo, DenseNodeInfoIter, DenseNodeIter, DenseRawTagIter, DenseTagIter,
+    CheckedDenseTagIter, DenseNode, DenseNodeInfo, DenseNodeInfoIter, DenseNodeIter,
+    DenseRawTagIter, DenseTagIter,
 };
 pub use read::elements::{
-    Element, Info, MemberId, MemberType, Node, RawTagIter, RelMember, RelMemberIter, Relation,
-    TagIter, Way, WayNodeLocation, WayNodeLocationsIter, WayRefIter,
+    CheckedTagIter, Element, Info, MemberId, MemberType, Node, RawTagIter, RelMember,
+    RelMemberIter, Relation, TagIter, Way, WayNodeLocation, WayNodeLocationsIter, WayRefIter,
 };
 pub use read::indexed::{IdRanges, IndexedReader};
 pub use read::reader::{ElementReader, PipelinedBlocks};
@@ -217,8 +219,8 @@ pub use read::reader::{ElementReader, PipelinedBlocks};
 pub use commands::HeaderOverrides;
 #[doc(hidden)]
 pub use commands::{
-    altw, apply_changes, cat, degrade, diff, getid, getparents, inspect, merge_changes, renumber,
-    repack, sort, tags_count, tags_filter, time_filter,
+    altw, apply_changes, cat, degrade, diff, digest, getid, getparents, inspect, merge_changes,
+    renumber, repack, sort, tags_count, tags_filter, time_filter,
 };
 #[cfg(feature = "commands")]
 #[doc(hidden)]

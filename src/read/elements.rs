@@ -118,6 +118,12 @@ impl<'a> Node<'a> {
         }
     }
 
+    /// Like [`tags`](Self::tags), but yields `Err` for an out-of-range string
+    /// index instead of silently ending the tag list.
+    pub fn tags_checked(&self) -> CheckedTagIter<'a> {
+        CheckedTagIter::new(self.block, self.node.keys_data, self.node.vals_data)
+    }
+
     /// Returns additional metadata for this element.
     pub fn info(&self) -> Info<'a> {
         let wire_info = self
@@ -188,6 +194,12 @@ impl<'a> Way<'a> {
             key_indices: PackedUint32Iter::new(self.way.keys_data),
             val_indices: PackedUint32Iter::new(self.way.vals_data),
         }
+    }
+
+    /// Like [`tags`](Self::tags), but yields `Err` for an out-of-range string
+    /// index instead of silently ending the tag list.
+    pub fn tags_checked(&self) -> CheckedTagIter<'a> {
+        CheckedTagIter::new(self.block, self.way.keys_data, self.way.vals_data)
     }
 
     /// Returns additional metadata for this element.
@@ -295,6 +307,12 @@ impl<'a> Relation<'a> {
             key_indices: PackedUint32Iter::new(self.rel.keys_data),
             val_indices: PackedUint32Iter::new(self.rel.vals_data),
         }
+    }
+
+    /// Like [`tags`](Self::tags), but yields `Err` for an out-of-range string
+    /// index instead of silently ending the tag list.
+    pub fn tags_checked(&self) -> CheckedTagIter<'a> {
+        CheckedTagIter::new(self.block, self.rel.keys_data, self.rel.vals_data)
     }
 
     /// Returns additional metadata for this element.
@@ -586,6 +604,9 @@ impl<'a> Iterator for TagIter<'a> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
+        // wontfix(type-result-fallible): Iterator trait constrains return type;
+        // an out-of-range stringtable index ends iteration rather than
+        // propagating an error. See CORRECTNESS.md.
         get_stringtable_key_value(
             self.block,
             self.key_indices.next().map(|v| v as usize),
@@ -595,6 +616,56 @@ impl<'a> Iterator for TagIter<'a> {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.key_indices.size_hint()
+    }
+}
+
+/// The fallible sibling of [`TagIter`]: yields `Err` for a tag whose key or
+/// value index points past the block's string table, instead of ending
+/// iteration as `TagIter` does. Callers that must refuse corrupt input
+/// (rather than see a shortened tag list) use this. After an `Err` the
+/// iterator yields nothing more.
+#[derive(Clone)]
+pub struct CheckedTagIter<'a> {
+    block: &'a WireBlock<'static>,
+    key_indices: PackedUint32Iter<'a>,
+    val_indices: PackedUint32Iter<'a>,
+    failed: bool,
+}
+
+impl<'a> CheckedTagIter<'a> {
+    fn new(block: &'a WireBlock<'static>, keys_data: &'a [u8], vals_data: &'a [u8]) -> Self {
+        CheckedTagIter {
+            block,
+            key_indices: PackedUint32Iter::new(keys_data),
+            val_indices: PackedUint32Iter::new(vals_data),
+            failed: false,
+        }
+    }
+}
+
+impl<'a> Iterator for CheckedTagIter<'a> {
+    type Item = Result<(&'a str, &'a str)>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        let item = match (self.key_indices.next(), self.val_indices.next()) {
+            (None, None) => return None,
+            (Some(k), Some(v)) => str_from_stringtable(self.block, k as usize)
+                .and_then(|key| Ok((key, str_from_stringtable(self.block, v as usize)?))),
+            // Block construction rejects mismatched keys/vals arrays, so this
+            // is unreachable on a constructed block; report it rather than
+            // trusting that.
+            _ => Err(crate::error::new_error(
+                crate::error::ErrorKind::WireFormat {
+                    msg: "element has mismatched keys/vals tag array lengths",
+                },
+            )),
+        };
+        self.failed = item.is_err();
+        Some(item)
     }
 }
 

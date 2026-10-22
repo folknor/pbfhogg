@@ -498,11 +498,20 @@ impl PrimitiveBlock {
     /// [`Ways`](BlockType::Ways), or [`Relations`](BlockType::Relations).
     /// For unsorted files where groups contain different types, returns
     /// [`Mixed`](BlockType::Mixed).
+    ///
+    /// Empty groups carry no elements and are neutral: an empty group beside
+    /// a way group is a way block, not a mixed one. A block whose groups are
+    /// all empty (or that has none) is [`Empty`](BlockType::Empty). Counting
+    /// an empty group as a type of its own used to classify spec-valid
+    /// single-kind blocks as mixed, which the streaming merge-join rejects.
     pub fn block_type(&self) -> BlockType {
         let mut result: Option<BlockType> = None;
         for i in 0..self.block.group_count() {
             let group_data = self.block.group(i);
             let group_type = classify_group(group_data);
+            if group_type == BlockType::Empty {
+                continue;
+            }
             match result {
                 None => result = Some(group_type),
                 Some(prev) if prev == group_type => {} // same type, continue
@@ -1255,6 +1264,15 @@ pub(crate) fn str_from_stringtable<'a>(block: &'a WireBlock<'_>, index: usize) -
 }
 
 /// Construct a key-value tuple from key/value indexes, using the stringtable from a block.
+///
+/// Returns `None` both when either index is absent (end of the tag arrays) and
+/// when either lookup fails: the `StringtableIndexOutOfBounds` error from
+/// [`str_from_stringtable`] is discarded here, not propagated. The tag
+/// iterators that call this therefore end early on a bad index instead of
+/// erroring. See CORRECTNESS.md "Tag iterators end early on an out-of-range
+/// string index"; a caller that must reject such input uses the checked
+/// iterators (`tags_checked()`), which resolve through `str_from_stringtable`
+/// and keep the error.
 pub(crate) fn get_stringtable_key_value<'a>(
     block: &'a WireBlock<'_>,
     key_index: Option<usize>,

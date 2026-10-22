@@ -48,6 +48,7 @@ mod cli_defensive_input;
 mod cli_degrade;
 mod cli_derive_changes;
 mod cli_diff;
+mod cli_digest;
 mod cli_exit_codes;
 mod cli_inject_prepass;
 mod cli_merge_changes;

@@ -22,7 +22,6 @@ use crate::blob_meta::{BlobIndex, ElemKind};
 use crate::error::Result;
 use crate::osc::merge_join::{element_id, element_version};
 use crate::osc::write::{OwnedMetadata, write_element_xml};
-use crate::read::header_walker::HeaderWalker;
 use crate::{Element, PrimitiveBlock};
 
 use super::derive::DeriveChangesStats;
@@ -47,175 +46,7 @@ pub mod test_hooks {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Shard planning (duplicated from parallel.rs for now; will be unified in a
-// follow-up commit that hoists walk_file + plan_shards into a shared module)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy)]
-struct BlobDesc {
-    data_offset: u64,
-    data_size: usize,
-    index: BlobIndex,
-}
-
-struct WalkedFile {
-    nodes: Vec<BlobDesc>,
-    ways: Vec<BlobDesc>,
-    relations: Vec<BlobDesc>,
-    file: Arc<File>,
-}
-
-fn walk_file(path: &Path, host: &crate::host::Host) -> Result<WalkedFile> {
-    let mut walker = HeaderWalker::open(path, &host.diagnostics)?;
-    let mut nodes: Vec<BlobDesc> = Vec::new();
-    let mut ways: Vec<BlobDesc> = Vec::new();
-    let mut rels: Vec<BlobDesc> = Vec::new();
-    let mut first = true;
-    // See `diff::parallel::walk_file`: bucketing by kind discards file
-    // order, so the guard has to run before the bucketing does.
-    let mut order = crate::osc::merge_join::BlobOrderGuard::new();
-
-    while let Some(meta) = walker.next_header()? {
-        if first {
-            // Skip the leading OsmHeader blob; subsequent OsmData blobs
-            // must carry indexdata for this path.
-            first = false;
-            continue;
-        }
-        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
-            continue;
-        }
-        let Some(index) = meta.index else {
-            return Err(crate::error::new_error(crate::error::ErrorKind::Io(
-                io::Error::other(
-                    "derive_changes parallel path requires indexdata but a blob has none",
-                ),
-            )));
-        };
-        order.observe(&index).map_err(|msg| {
-            crate::error::new_error(crate::error::ErrorKind::Io(io::Error::other(msg)))
-        })?;
-        let desc = BlobDesc {
-            data_offset: meta.data_offset,
-            data_size: meta.data_size,
-            index,
-        };
-        match index.kind {
-            ElemKind::Node => nodes.push(desc),
-            ElemKind::Way => ways.push(desc),
-            ElemKind::Relation => rels.push(desc),
-        }
-    }
-
-    Ok(WalkedFile {
-        nodes,
-        ways,
-        relations: rels,
-        file: Arc::clone(walker.shared_file()),
-    })
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Shard {
-    /// IDs strictly greater than this belong to this shard.
-    /// `i64::MIN` for the first shard.
-    t_low: i64,
-    /// IDs less than or equal to this belong to this shard.
-    /// `i64::MAX` for the last shard.
-    t_high: i64,
-    /// Old-side blobs whose ID ranges intersect `(t_low, t_high]`.
-    /// A blob that straddles a shard boundary is included in both
-    /// adjacent shards; each one processes only the portion inside
-    /// its `(t_low, t_high]` window.
-    old_start: usize,
-    old_end: usize,
-    new_start: usize,
-    new_end: usize,
-}
-
-/// Plan N shards by ID range. Thresholds are placed at old-blob
-/// boundaries so correctness doesn't depend on new-side alignment;
-/// straddling new blobs are read by both adjacent shards and each
-/// shard's element merge filters to its `(t_low, t_high]` window.
-fn plan_shards(old_descs: &[BlobDesc], new_descs: &[BlobDesc], target_count: usize) -> Vec<Shard> {
-    // Positive-only input invariant (DEVIATIONS.md > renumber: negative
-    // input IDs rejected). Threshold comparisons in this planner and in
-    // the shard hot path are raw i64 compares rather than `osm_id_cmp`;
-    // mixed-sign inputs would mis-shard silently. Production PBFs are
-    // positive-only, but a debug-mode audit catches misuse in tests.
-    debug_assert!(
-        old_descs
-            .iter()
-            .chain(new_descs.iter())
-            .all(|d| d.index.min_id >= 0),
-        "plan_shards requires positive-only IDs",
-    );
-
-    if target_count <= 1 || old_descs.is_empty() {
-        return vec![Shard {
-            t_low: i64::MIN,
-            t_high: i64::MAX,
-            old_start: 0,
-            old_end: old_descs.len(),
-            new_start: 0,
-            new_end: new_descs.len(),
-        }];
-    }
-
-    // Place N-1 thresholds at evenly-spaced old-blob boundaries.
-    // Using old-blob max_ids guarantees the old side has clean breaks
-    // (no old blob straddles a threshold by construction). New blobs
-    // that do straddle are absorbed by both adjacent shards.
-    let n = target_count.min(old_descs.len()).max(1);
-    let mut thresholds: Vec<i64> = (1..n)
-        .map(|k| old_descs[(k * old_descs.len() / n) - 1].index.max_id)
-        .collect();
-    // Ensure strictly increasing (consecutive old blobs could share a
-    // fencepost if we rounded off the same blob index; in practice this
-    // can only happen for tiny inputs where n is overkill).
-    thresholds.dedup();
-
-    let mut shards: Vec<Shard> = Vec::with_capacity(thresholds.len() + 1);
-    let mut t_low = i64::MIN;
-    for &t_high in &thresholds {
-        shards.push(build_shard(old_descs, new_descs, t_low, t_high));
-        t_low = t_high;
-    }
-    shards.push(build_shard(old_descs, new_descs, t_low, i64::MAX));
-
-    shards
-}
-
-fn build_shard(old_descs: &[BlobDesc], new_descs: &[BlobDesc], t_low: i64, t_high: i64) -> Shard {
-    // A blob intersects (t_low, t_high] iff max_id > t_low and
-    // min_id <= t_high. Because blobs are sorted by (max_id, min_id)
-    // monotonically, the intersecting range is contiguous.
-    let old_start = old_descs
-        .iter()
-        .position(|b| b.index.max_id > t_low)
-        .unwrap_or(old_descs.len());
-    let old_end = old_descs
-        .iter()
-        .rposition(|b| b.index.min_id <= t_high)
-        .map_or(old_start, |i| i + 1);
-    let new_start = new_descs
-        .iter()
-        .position(|b| b.index.max_id > t_low)
-        .unwrap_or(new_descs.len());
-    let new_end = new_descs
-        .iter()
-        .rposition(|b| b.index.min_id <= t_high)
-        .map_or(new_start, |i| i + 1);
-    Shard {
-        t_low,
-        t_high,
-        old_start,
-        old_end: old_end.max(old_start),
-        new_start,
-        new_end: new_end.max(new_start),
-    }
-}
+use super::shard::{BlobDesc, Shard, plan_shards, walk_pair};
 
 // ---------------------------------------------------------------------------
 // Shard worker
@@ -639,7 +470,7 @@ fn element_merge<W: Write>(
                         let n = new_iter.next().expect("checked");
                         old_consumed += 1;
                         new_consumed += 1;
-                        if !borrowed_elements_equal(&o, &n) {
+                        if !crate::content::content_equal(&o, &n) {
                             emit_create(modifies_w, &n, coord_buf)?;
                             *modify_count += 1;
                         }
@@ -650,64 +481,6 @@ fn element_merge<W: Write>(
     }
 
     Ok((old_consumed, new_consumed))
-}
-
-fn borrowed_elements_equal(a: &Element<'_>, b: &Element<'_>) -> bool {
-    match (a, b) {
-        (Element::DenseNode(_) | Element::Node(_), Element::DenseNode(_) | Element::Node(_)) => {
-            borrowed_nodes_equal(a, b)
-        }
-        (Element::Way(wa), Element::Way(wb)) => wa.refs().eq(wb.refs()) && wa.tags().eq(wb.tags()),
-        (Element::Relation(ra), Element::Relation(rb)) => borrowed_relations_equal(ra, rb),
-        _ => false,
-    }
-}
-
-fn borrowed_nodes_equal(a: &Element<'_>, b: &Element<'_>) -> bool {
-    let (a_lat, a_lon) = match a {
-        Element::DenseNode(dn) => (dn.decimicro_lat(), dn.decimicro_lon()),
-        Element::Node(n) => (n.decimicro_lat(), n.decimicro_lon()),
-        _ => return false,
-    };
-    let (b_lat, b_lon) = match b {
-        Element::DenseNode(dn) => (dn.decimicro_lat(), dn.decimicro_lon()),
-        Element::Node(n) => (n.decimicro_lat(), n.decimicro_lon()),
-        _ => return false,
-    };
-    if a_lat != b_lat || a_lon != b_lon {
-        return false;
-    }
-    match (a, b) {
-        (Element::DenseNode(da), Element::DenseNode(db)) => da.tags().eq(db.tags()),
-        (Element::DenseNode(da), Element::Node(nb)) => da.tags().eq(nb.tags()),
-        (Element::Node(na), Element::DenseNode(db)) => na.tags().eq(db.tags()),
-        (Element::Node(na), Element::Node(nb)) => na.tags().eq(nb.tags()),
-        _ => false,
-    }
-}
-
-fn borrowed_relations_equal(a: &crate::Relation<'_>, b: &crate::Relation<'_>) -> bool {
-    if !a.tags().eq(b.tags()) {
-        return false;
-    }
-    let mut ai = a.members();
-    let mut bi = b.members();
-    loop {
-        match (ai.next(), bi.next()) {
-            (None, None) => return true,
-            (Some(am), Some(bm)) => {
-                if am.id != bm.id {
-                    return false;
-                }
-                let ar = am.role().unwrap_or("");
-                let br = bm.role().unwrap_or("");
-                if ar != br {
-                    return false;
-                }
-            }
-            _ => return false,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -824,6 +597,10 @@ fn write_delete_element<W: Write>(
 /// runs each shard on a worker thread emitting per-shard OSC XML temp
 /// files, then concatenates them into the three outer temp files that
 /// `assemble_osc` consumes.
+///
+/// Returns `Ok(None)`, having written nothing, when either input holds a
+/// negative ID: the caller must run the sequential path instead (see
+/// `shard`'s correctness contract).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn derive_changes_parallel(
     old_path: &Path,
@@ -835,9 +612,10 @@ pub(crate) fn derive_changes_parallel(
     update_timestamp: bool,
     host: &crate::host::Host,
     token: &crate::scratch::RunToken,
-) -> Result<DeriveChangesStats> {
-    let old = walk_file(old_path, host)?;
-    let new = walk_file(new_path, host)?;
+) -> Result<Option<DeriveChangesStats>> {
+    let Some((old, new)) = walk_pair(old_path, new_path, host)? else {
+        return Ok(None);
+    };
     let suffix = token.suffix();
     let suffix = suffix.as_str();
 
@@ -1062,7 +840,7 @@ pub(crate) fn derive_changes_parallel(
     drop(std::fs::remove_file(&outer_modifies));
     drop(std::fs::remove_file(&outer_deletes));
 
-    Ok(totals)
+    Ok(Some(totals))
 }
 
 /// Concatenate every shard's three scratch files onto the outer temp files in

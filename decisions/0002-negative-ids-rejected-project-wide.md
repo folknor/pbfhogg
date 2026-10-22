@@ -5,6 +5,10 @@ Amended: 2026-04-26 - getid hard-reject site added (`1cc7c2b`,
 osmium parity); `IdSet::any_in_range` straddling-blob clamp added
 (`16e3694`); `IdSet` silent-inheritance sites for tags-filter and
 altw-external documented.
+Amended: 2026-10-22 - the diff and derive-changes shard planners are
+no longer an enforcement site: an indexed input holding any negative
+ID takes the sequential block-pair merge, which orders by `osm_id_cmp`,
+instead of relying on a `debug_assert` and mis-sharding in release.
 Status: Accepted
 
 ## Decision
@@ -21,12 +25,13 @@ invariant. Enforcement is layered by site:
   whose man page documents the same restriction; it is the one
   enforcement site in this ADR that converges with osmium rather
   than diverging from it.
-- **`debug_assert!`** on descriptor `min_id >= 0` at planner entry
-  for the shard planners in `diff` and `derive-changes`. The
-  threshold compares inside the shard hot path are raw `i64`;
-  mixed-sign inputs would silently mis-shard. Release builds rely
-  on the upstream chain (read → renumber/apply-changes → diff)
-  never producing a mixed-sign PBF.
+- **Routing, not enforcement**, for the shard planners in `diff` and
+  `derive-changes` (amended 2026-10-22). Their threshold compares are
+  raw `i64`, which order negative IDs wrongly, so the blob walk
+  (`src/commands/diff/shard.rs`) sends any indexed input holding a
+  negative ID to the sequential block-pair merge instead. This
+  replaced a `debug_assert!` that left release builds to mis-shard
+  silently.
 - **Silent inheritance** through `IdSet::set`'s no-op-on-negative
   semantics for `tags-filter` (silently drops negative-id ways) and
   `add-locations-to-ways --index-type external` (silently omits
@@ -70,8 +75,7 @@ rejected project-wide"`.
   implementation and would unblock JOSM staging-file workflows. Real
   implementation cost: `IdSet` either split into `positives` /
   `negatives` sub-bitmaps with per-site routing, or widened to a
-  signed offset-mapped index; shard planners switched to
-  `osm_id_cmp`; renumber output numbering interleaved per `id_order`;
+  signed offset-mapped index; renumber output numbering interleaved per `id_order`;
   a second regression suite against JOSM sample files. No user has
   asked for it. Reverse the decision if a real ask surfaces.
 - **(c)** *[chosen]* - matches the existing `IdSet` design, ratifies

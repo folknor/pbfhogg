@@ -418,6 +418,23 @@
 
 ### Added
 
+- **`pbfhogg digest`: an encoding-independent digest of a PBF's element
+  content.** Two files get the same digest exactly when
+  `diff --suppress-common` reports them identical (barring a 128-bit hash
+  collision), whatever their compression, blob boundaries, dense or plain
+  nodes, string-table order, header or indexdata - so a stored digest of one
+  side can stand in for re-reading it. Output is `xxh128 v1 HEX` plus a
+  count and digest per element kind; the version changes whenever the
+  canonical form does. The command refuses, printing nothing, any input on
+  which diff's answer would not be a function of element content: unsorted
+  or duplicate IDs, mixed blocks, partial or inaccurate indexdata, a second
+  header, unresolvable string references. Library: `pbfhogg::digest::digest`.
+
+- **Fallible tag iterators.** `tags_checked()` on `Node`, `Way`, `Relation`
+  and `DenseNode` returns `CheckedTagIter` / `CheckedDenseTagIter`, which
+  yield an `Err` for a key or value index past the string table where
+  `tags()` silently ends the tag list.
+
 - **Builds against musl (`x86_64-unknown-linux-musl` and friends).** The
   glibc-only allocator tuning calls (`mallopt` arena caps, `malloc_trim`,
   `mallinfo2`) are now gated on `target_env = "gnu"` and become no-ops
@@ -521,6 +538,34 @@
   makes the decision before the header is read.
 
 ### Fixed
+
+- **`diff` no longer calls a corrupt element identical.** A tag whose string
+  index points past the block's string table used to end the tag list
+  silently, and a bad role index read as an empty role, so two such elements
+  could compare common. Diff and `diff --format osc` now resolve every
+  string strictly: the streaming path errors, the indexed paths report the
+  element modified.
+
+- **`diff` paired node `-9223372036854775808` with node
+  `-9223372036854775807`.** The canonical ID order folded `i64::MIN` onto
+  `-i64::MAX`, so the merge treated the two as one object and, comparing
+  content only, could report them common.
+
+- **`diff` rejected some spec-valid blocks as mixed.** An empty
+  `PrimitiveGroup` beside a group of ways made the block classify as mixed,
+  which the streaming merge refuses. Empty groups are now neutral.
+
+- **`diff` silently dropped the relations after an empty node block.** On
+  unindexed input, a block holding an empty `DenseNodes` message between the
+  ways and the relations ended the relation phase early, so every later
+  relation went unreported (same for `diff --format osc`). Blocks with no
+  elements are now skipped.
+
+- **`diff` with negative IDs at the default `-j`.** The parallel shard
+  planner compares IDs as raw numbers, which orders negative IDs wrongly;
+  release builds could mis-shard silently and the blob-order check could
+  refuse valid files. Indexed inputs holding any negative ID now take the
+  sequential block-pair merge.
 
 - **A `PbfWriter` driven from inside its own rayon pool no longer
   deadlocks.** Writing, flushing or dropping a writer from a worker of the
@@ -1281,6 +1326,7 @@
   `f64::next_up`/`next_down`, so the pin drops it; still
   `default-features = false`.
 - `zstd` 0.13 → 0.14.
+- New: `xxhash-rust` 0.8 (pure Rust, `xxh3` only), for `digest`.
 
 ## 0.5.0 - 2026-07-16
 

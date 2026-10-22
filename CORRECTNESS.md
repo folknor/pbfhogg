@@ -50,6 +50,63 @@ hot path is acceptable, or whether a fallback re-parse on finding nothing is bet
 - `WireDenseNodes::parse()` - fields 1 (ids), 8 (lats), 9 (lons), 10 (keys_vals)
 - `WireDenseInfo::parse()` - fields 1 (versions), 2 (timestamps), 3 (changesets), 4 (uids), 5 (user_sids), 6 (visibles)
 
+## Tag iterators end early on an out-of-range string index
+
+**Status:** Known, accepted for `TagIter` and `DenseTagIter`
+(`wontfix(type-result-fallible)` in source). Fallible siblings exist, and
+`diff`, `diff --format osc` and `digest` use them.
+
+**Context:** Tags and relation member roles are indices into the block's
+string table. `str_from_stringtable` (`src/read/block.rs`) bounds-checks every
+lookup and returns `StringtableIndexOutOfBounds` on a miss, but the infallible
+tag iterators cannot surface it: `TagIter` (`src/read/elements.rs`) and
+`DenseTagIter` (`src/read/dense.rs`) implement
+`Iterator<Item = (&str, &str)>`, and `get_stringtable_key_value` discards the
+error as `None`. A tag with an out-of-range key or value index therefore ends
+the element's tag list early, silently dropping it and every tag after it.
+
+`tags_checked()` on `Node`, `Way`, `Relation` and `DenseNode` returns the
+fallible sibling (`CheckedTagIter`, `CheckedDenseTagIter`), which yields an
+`Err` for the bad tag instead. Element content for `diff` and `digest` is
+defined once, in `src/content.rs`, on these checked iterators and on
+`RelMember::role`'s `Result`. A corrupt element there is never silently equal
+to anything: the block-pair paths compare it as unequal ("modified"), the
+streaming path's owned conversion errors, and `digest` refuses the file. The
+one exception is diff's byte-equal blob fast path, which reports two
+byte-identical blobs as common without decoding either.
+
+Member roles are different at the API level - `RelMember::role` returns a
+`Result` - but most command consumers outside diff collapse the error with
+`role().unwrap_or("")`: the owned-element conversions and the re-encoding
+paths (`cat`, `repack`, `extract`, `tags-filter`, `getid`, `getparents`,
+`time-filter`, `altw`, `degrade`, the OSC writer). A bad role index is
+rewritten there as an empty role. `inspect` shows it as `<invalid>`.
+
+`validate_groups_strict` (`src/read/block.rs`) does not close the gap: it is a
+structural pass that checks array framing and parallel-array lengths without
+resolving any string index, because resolving them would mean decoding every
+packed tag array up front. A tag array that ends mid-varint, or whose keys
+and values disagree in count, is rejected there; a well-formed index that
+points past the string table is not.
+
+**Not a performance trade:** the bounds check runs on every lookup either way.
+Only the error is thrown away. The constraint is the iterator's item type.
+
+**Impact:** Wrong output rather than an error, but only for input whose string
+indices point past the table - a producer bug, not something well-formed PBFs
+contain. Random corruption of a zlib blob fails the stream's checksum at
+decompression before any index is resolved.
+
+**Where it must not apply:** code that has to refuse corrupt input outright
+uses `tags_checked()` and matches on `RelMember::role`'s `Result`, rather than
+going through the infallible tag iterators or `role().unwrap_or("")`. Library
+users who need the same strictness should do likewise, and treat `tags()` as
+best-effort on untrusted input.
+
+**Fix approach for the remaining consumers (if ever needed):** move each
+re-encoding path to `tags_checked()` and a propagated role error; or resolve
+every index in `validate_groups_strict` behind an opt-in strictness flag.
+
 ## Osmosis -1 sentinel for absent metadata
 
 **Status:** Fixed. Normalization split across parse-time and write-time boundaries.

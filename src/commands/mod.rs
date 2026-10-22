@@ -5,6 +5,7 @@ pub mod cat;
 pub mod check;
 pub mod degrade;
 pub mod diff;
+pub mod digest;
 #[cfg(feature = "commands")]
 pub mod export;
 #[cfg(feature = "commands")]

@@ -18,12 +18,12 @@ use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::PrimitiveBlock;
 use crate::blob_meta::{BlobIndex, ElemKind};
 use crate::error::Result;
 use crate::owned::TypeFilter;
-use crate::read::header_walker::HeaderWalker;
-use crate::{Element, PrimitiveBlock};
 
+use super::shard::{BlobDesc, Shard, plan_shards, walk_pair};
 use super::{DiffOptions, DiffStats};
 
 // Fault-injection hooks for tests. Gated behind the `test-hooks`
@@ -49,182 +49,6 @@ pub mod test_hooks {
 
 fn io_err(e: io::Error) -> crate::error::Error {
     crate::error::new_error(crate::error::ErrorKind::Io(e))
-}
-
-// ---------------------------------------------------------------------------
-// Blob descriptor walker
-// ---------------------------------------------------------------------------
-
-/// One OsmData blob's location + index metadata, enough to pread and
-/// classify without decompression.
-#[derive(Debug, Clone, Copy)]
-struct BlobDesc {
-    data_offset: u64,
-    data_size: usize,
-    index: BlobIndex,
-}
-
-/// Three per-kind blob lists plus a shared `File` handle for pread.
-struct WalkedFile {
-    nodes: Vec<BlobDesc>,
-    ways: Vec<BlobDesc>,
-    relations: Vec<BlobDesc>,
-    file: Arc<std::fs::File>,
-}
-
-/// Walk a PBF file's blob headers via the shared `HeaderWalker` primitive,
-/// collecting per-kind `BlobDesc` lists. Requires each OsmData blob to
-/// carry indexdata; returns an error if any OsmData blob lacks it.
-fn walk_file(path: &Path, host: &crate::host::Host) -> Result<WalkedFile> {
-    let mut walker = HeaderWalker::open(path, &host.diagnostics)?;
-    let mut nodes: Vec<BlobDesc> = Vec::new();
-    let mut ways: Vec<BlobDesc> = Vec::new();
-    let mut rels: Vec<BlobDesc> = Vec::new();
-    let mut first = true;
-    // Blobs are bucketed by kind below, which throws file order away. The
-    // guard sees them in file order first, so this path refuses exactly what
-    // the sequential block-pair merge refuses instead of silently answering.
-    let mut order = crate::osc::merge_join::BlobOrderGuard::new();
-
-    while let Some(meta) = walker.next_header()? {
-        // Skip the required leading OsmHeader blob; subsequent OsmData
-        // blobs must carry indexdata for the parallel path.
-        if first {
-            first = false;
-            continue;
-        }
-        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
-            continue;
-        }
-        let index = meta.index.ok_or_else(|| {
-            crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
-                "block-pair merge requires indexdata but blob has none",
-            )))
-        })?;
-        order.observe(&index).map_err(|msg| {
-            crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(msg)))
-        })?;
-        let desc = BlobDesc {
-            data_offset: meta.data_offset,
-            data_size: meta.data_size,
-            index,
-        };
-        match index.kind {
-            ElemKind::Node => nodes.push(desc),
-            ElemKind::Way => ways.push(desc),
-            ElemKind::Relation => rels.push(desc),
-        }
-    }
-
-    Ok(WalkedFile {
-        nodes,
-        ways,
-        relations: rels,
-        file: Arc::clone(walker.shared_file()),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Shard planner
-// ---------------------------------------------------------------------------
-
-/// One shard: an ID range `(t_low, t_high]` plus the index ranges of
-/// old and new blobs whose content intersects that ID range. Straddling
-/// blobs (those whose range crosses the shard boundary) are read by
-/// both adjacent shards; each shard's element merge clips to its own
-/// ID window so every element is emitted exactly once.
-#[derive(Debug, Clone, Copy)]
-struct Shard {
-    t_low: i64,
-    t_high: i64,
-    old_start: usize,
-    old_end: usize,
-    new_start: usize,
-    new_end: usize,
-}
-
-/// Plan N shards by ID range. Thresholds are placed at old-blob
-/// boundaries (N-1 evenly spaced). Old is clean by construction;
-/// straddling new blobs are absorbed by both adjacent shards.
-///
-/// Threshold comparison is raw numeric (`i64`) while the element
-/// merge inside shards uses `osm_id_cmp` (canonical order:
-/// `0, -1, -2, ..., 1, 2, ...`). These disagree on mixed-sign
-/// inputs, but production PBFs are positive-only (see osm_id.rs
-/// commentary), so the raw compare is safe in practice. If
-/// negative IDs ever enter production, this planner and every
-/// `id > t_high`/`id <= t_low` clip in `emit_side` must be
-/// rewritten against `osm_id_cmp`.
-fn plan_shards(old_descs: &[BlobDesc], new_descs: &[BlobDesc], target_count: usize) -> Vec<Shard> {
-    // Positive-only input invariant (DEVIATIONS.md > renumber: negative
-    // input IDs rejected). Threshold comparisons in this planner and in
-    // the shard hot path are raw i64 compares rather than `osm_id_cmp`;
-    // mixed-sign inputs would mis-shard silently. Production PBFs are
-    // positive-only, but a debug-mode audit catches misuse in tests.
-    debug_assert!(
-        old_descs
-            .iter()
-            .chain(new_descs.iter())
-            .all(|d| d.index.min_id >= 0),
-        "plan_shards requires positive-only IDs",
-    );
-
-    if target_count <= 1 || old_descs.is_empty() {
-        return vec![Shard {
-            t_low: i64::MIN,
-            t_high: i64::MAX,
-            old_start: 0,
-            old_end: old_descs.len(),
-            new_start: 0,
-            new_end: new_descs.len(),
-        }];
-    }
-
-    let n = target_count.min(old_descs.len()).max(1);
-    // `old_descs` are sorted by id range (max_id monotone
-    // non-decreasing), so the mapped thresholds are monotone
-    // non-decreasing and duplicates only appear consecutively -
-    // consecutive-dedup is sufficient, no sort needed.
-    let mut thresholds: Vec<i64> = (1..n)
-        .map(|k| old_descs[(k * old_descs.len() / n) - 1].index.max_id)
-        .collect();
-    thresholds.dedup();
-
-    let mut shards: Vec<Shard> = Vec::with_capacity(thresholds.len() + 1);
-    let mut t_low = i64::MIN;
-    for &t_high in &thresholds {
-        shards.push(build_shard(old_descs, new_descs, t_low, t_high));
-        t_low = t_high;
-    }
-    shards.push(build_shard(old_descs, new_descs, t_low, i64::MAX));
-    shards
-}
-
-fn build_shard(old_descs: &[BlobDesc], new_descs: &[BlobDesc], t_low: i64, t_high: i64) -> Shard {
-    let old_start = old_descs
-        .iter()
-        .position(|b| b.index.max_id > t_low)
-        .unwrap_or(old_descs.len());
-    let old_end = old_descs
-        .iter()
-        .rposition(|b| b.index.min_id <= t_high)
-        .map_or(old_start, |i| i + 1);
-    let new_start = new_descs
-        .iter()
-        .position(|b| b.index.max_id > t_low)
-        .unwrap_or(new_descs.len());
-    let new_end = new_descs
-        .iter()
-        .rposition(|b| b.index.min_id <= t_high)
-        .map_or(new_start, |i| i + 1);
-    Shard {
-        t_low,
-        t_high,
-        old_start,
-        old_end: old_end.max(old_start),
-        new_start,
-        new_end: new_end.max(new_start),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -537,7 +361,7 @@ fn element_merge(
                         let n = new_iter.next().expect("checked");
                         old_consumed += 1;
                         new_consumed += 1;
-                        if borrowed_elements_equal(&o, &n) {
+                        if crate::content::content_equal(&o, &n) {
                             if !options.suppress_common {
                                 emit_element(out, ' ', type_char, o_id, element_version(&o))?;
                             }
@@ -560,67 +384,6 @@ fn element_merge(
     }
 
     Ok((old_consumed, new_consumed))
-}
-
-/// Shadow of `borrowed_elements_equal` from `osc::merge_join` (that function
-/// is not `pub(crate)`). TODO: lift the borrowed-equality helpers to a
-/// shared location instead of duplicating.
-fn borrowed_elements_equal(a: &Element<'_>, b: &Element<'_>) -> bool {
-    match (a, b) {
-        (Element::DenseNode(_) | Element::Node(_), Element::DenseNode(_) | Element::Node(_)) => {
-            borrowed_nodes_equal(a, b)
-        }
-        (Element::Way(wa), Element::Way(wb)) => wa.refs().eq(wb.refs()) && wa.tags().eq(wb.tags()),
-        (Element::Relation(ra), Element::Relation(rb)) => borrowed_relations_equal(ra, rb),
-        _ => false,
-    }
-}
-
-fn borrowed_nodes_equal(a: &Element<'_>, b: &Element<'_>) -> bool {
-    let (a_lat, a_lon) = match a {
-        Element::DenseNode(dn) => (dn.decimicro_lat(), dn.decimicro_lon()),
-        Element::Node(n) => (n.decimicro_lat(), n.decimicro_lon()),
-        _ => return false,
-    };
-    let (b_lat, b_lon) = match b {
-        Element::DenseNode(dn) => (dn.decimicro_lat(), dn.decimicro_lon()),
-        Element::Node(n) => (n.decimicro_lat(), n.decimicro_lon()),
-        _ => return false,
-    };
-    if a_lat != b_lat || a_lon != b_lon {
-        return false;
-    }
-    match (a, b) {
-        (Element::DenseNode(da), Element::DenseNode(db)) => da.tags().eq(db.tags()),
-        (Element::DenseNode(da), Element::Node(nb)) => da.tags().eq(nb.tags()),
-        (Element::Node(na), Element::DenseNode(db)) => na.tags().eq(db.tags()),
-        (Element::Node(na), Element::Node(nb)) => na.tags().eq(nb.tags()),
-        _ => false,
-    }
-}
-
-fn borrowed_relations_equal(a: &crate::Relation<'_>, b: &crate::Relation<'_>) -> bool {
-    if !a.tags().eq(b.tags()) {
-        return false;
-    }
-    let mut ai = a.members();
-    let mut bi = b.members();
-    loop {
-        match (ai.next(), bi.next()) {
-            (None, None) => return true,
-            (Some(am), Some(bm)) => {
-                if am.id != bm.id {
-                    return false;
-                }
-                let ar = am.role().unwrap_or("");
-                let br = bm.role().unwrap_or("");
-                if ar != br {
-                    return false;
-                }
-            }
-            _ => return false,
-        }
-    }
 }
 
 fn kind_type_char(kind: ElemKind) -> char {
@@ -688,6 +451,10 @@ fn emit_modified(
 /// Preserves diff semantics for the `-c` (suppress-common) and verbose
 /// cases; drops the v1 byte-equal fast path (always zero fires on
 /// `diff-snapshots`, where this path is intended to be used).
+///
+/// Returns `Ok(None)`, having written nothing, when either input holds a
+/// negative ID: the caller must run the sequential block-pair merge instead
+/// (see `shard`'s correctness contract).
 #[allow(clippy::too_many_lines)] // phase-orchestrator over 3 element kinds
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn diff_block_pair_parallel(
@@ -700,12 +467,13 @@ pub(crate) fn diff_block_pair_parallel(
     shard_count: usize,
     host: &crate::host::Host,
     token: &crate::scratch::RunToken,
-) -> Result<DiffStats> {
+) -> Result<Option<DiffStats>> {
     // DIFF_SCAN_START/END and diff_common/created/modified/deleted counters
     // are emitted by the calling `diff()` function in `mod.rs`; do not
     // re-emit here.
-    let old = walk_file(old_path, host)?;
-    let new = walk_file(new_path, host)?;
+    let Some((old, new)) = walk_pair(old_path, new_path, host)? else {
+        return Ok(None);
+    };
 
     // Scratch temp files live alongside the old input unless the host names
     // a scratch parent (the old input's parent is assumed to be on a
@@ -843,7 +611,7 @@ pub(crate) fn diff_block_pair_parallel(
         crate::debug::emit_marker(&end_marker);
     }
 
-    Ok(total)
+    Ok(Some(total))
 }
 
 /// Stream every shard's temp file to `output` in shard order, folding each

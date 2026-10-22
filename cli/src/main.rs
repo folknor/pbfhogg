@@ -612,6 +612,22 @@ enum Command {
         #[command(flatten)]
         io: DirectIoArg,
     },
+    /// Print a digest of a PBF's element content.
+    ///
+    /// Two files get the same digest exactly when `diff --suppress-common`
+    /// reports them identical, whatever their encoding (compression, blob
+    /// boundaries, dense or plain nodes, indexdata). Prints `xxh128 v1 HEX`,
+    /// then `node|way|relation COUNT HEX` per kind. Refuses, printing
+    /// nothing, any input on which diff's answer is not a function of
+    /// element content: unsorted, out-of-order or duplicate IDs, mixed
+    /// blocks, partial or inaccurate indexdata, unresolvable string
+    /// references.
+    Digest {
+        /// Input PBF file
+        file: PathBuf,
+        #[command(flatten)]
+        io: DirectIoArg,
+    },
     /// Extract or remove elements by ID
     ///
     /// By default, keeps only the listed IDs. With `--invert`, removes the
@@ -1569,6 +1585,13 @@ fn main() -> process::ExitCode {
                     }
                 }
             },
+            Command::Digest { file, io } => {
+                let digest = pbfhogg::digest::digest(&file, io.direct_io, &host)?;
+                let mut out = output::buffered();
+                digest.write_report(&mut out)?;
+                out.flush()?;
+                Ok(())
+            }
             Command::Getid {
                 file,
                 output,
@@ -2676,6 +2699,7 @@ fn validate_input_output_aliases(command: &Command) -> Result<(), Box<dyn std::e
         | Command::Diff { output: None, .. }
         | Command::Extract { output: None, .. }
         | Command::Inspect { .. }
+        | Command::Digest { .. }
         | Command::Check { .. }
         | Command::BenchRead { .. }
         | Command::BenchWrite { .. }

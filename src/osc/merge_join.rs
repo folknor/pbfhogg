@@ -93,18 +93,28 @@ impl StreamingBlocks {
 /// When a non-matching block is encountered, it is stashed for the next phase.
 /// Returns `true` if elements were added to the buffer, `false` if the phase
 /// is exhausted (EOF or only non-matching blocks remain).
+///
+/// A block with no elements is skipped before it is classified, whatever its
+/// groups' first field says. An empty `DenseNodes` message classifies as a
+/// node block, so after the node phase it used to be stashed as "a later
+/// phase's block" - and then end the relation phase when it turned up there,
+/// silently dropping every relation after it.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn fill_buffer<T>(
     source: &mut StreamingBlocks,
     buffer: &mut Vec<T>,
     is_phase_type: fn(BlockType) -> bool,
-    convert: fn(&Element<'_>) -> Option<T>,
+    convert: fn(&Element<'_>) -> ConvertResult<T>,
 ) -> BoxResult<bool> {
     loop {
         let block = match source.next_block()? {
             Some(b) => b,
             None => return Ok(false),
         };
+
+        if block.elements().next().is_none() {
+            continue;
+        }
 
         let bt = block.block_type();
 
@@ -119,7 +129,7 @@ fn fill_buffer<T>(
         buffer.clear();
         let mut wrong_type_seen = false;
         for element in block.elements() {
-            match convert(&element) {
+            match convert(&element)? {
                 Some(owned) => buffer.push(owned),
                 None => {
                     wrong_type_seen = true;
@@ -163,7 +173,7 @@ pub(crate) fn next_element<T>(
     source: &mut StreamingBlocks,
     buffer: &mut Vec<T>,
     is_phase_type: fn(BlockType) -> bool,
-    convert: fn(&Element<'_>) -> Option<T>,
+    convert: fn(&Element<'_>) -> ConvertResult<T>,
 ) -> BoxResult<Option<T>> {
     loop {
         if let Some(elem) = buffer.pop() {
@@ -195,16 +205,26 @@ pub(crate) fn is_relation_block(bt: BlockType) -> bool {
 // Conversion functions: Element -> Option<Owned*>
 // ---------------------------------------------------------------------------
 
-pub(crate) fn convert_node(element: &Element<'_>) -> Option<OwnedNode> {
-    match element {
+/// `Ok(None)` for an element of another kind; `Err` for a string-table
+/// lookup that fails. Conversion is strict so that a corrupt tag or role is
+/// an error here rather than a silently shortened owned element whose
+/// comparison then cannot see the corruption.
+pub(crate) type ConvertResult<T> = crate::error::Result<Option<T>>;
+
+fn owned_tags<'a>(
+    tags: impl Iterator<Item = crate::error::Result<(&'a str, &'a str)>>,
+) -> crate::error::Result<Vec<(String, String)>> {
+    tags.map(|tag| tag.map(|(k, v)| (k.to_owned(), v.to_owned())))
+        .collect()
+}
+
+pub(crate) fn convert_node(element: &Element<'_>) -> ConvertResult<OwnedNode> {
+    Ok(match element {
         Element::DenseNode(dn) => Some(OwnedNode {
             id: dn.id(),
             decimicro_lat: dn.decimicro_lat(),
             decimicro_lon: dn.decimicro_lon(),
-            tags: dn
-                .tags()
-                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                .collect(),
+            tags: owned_tags(dn.tags_checked())?,
             metadata: dn
                 .info()
                 .map(crate::dense::DenseNodeInfo::version)
@@ -215,61 +235,56 @@ pub(crate) fn convert_node(element: &Element<'_>) -> Option<OwnedNode> {
             id: n.id(),
             decimicro_lat: n.decimicro_lat(),
             decimicro_lon: n.decimicro_lon(),
-            tags: n
-                .tags()
-                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                .collect(),
+            tags: owned_tags(n.tags_checked())?,
             metadata: n.info().version().map(OwnedMetadata::version_only),
         }),
         _ => None,
-    }
+    })
 }
 
-pub(crate) fn convert_way(element: &Element<'_>) -> Option<OwnedWay> {
-    match element {
+pub(crate) fn convert_way(element: &Element<'_>) -> ConvertResult<OwnedWay> {
+    Ok(match element {
         Element::Way(w) => Some(OwnedWay {
             id: w.id(),
-            tags: w
-                .tags()
-                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                .collect(),
+            tags: owned_tags(w.tags_checked())?,
             refs: w.refs().collect(),
             metadata: w.info().version().map(OwnedMetadata::version_only),
         }),
         _ => None,
-    }
+    })
 }
 
-pub(crate) fn convert_relation(element: &Element<'_>) -> Option<OwnedRelation> {
-    match element {
+pub(crate) fn convert_relation(element: &Element<'_>) -> ConvertResult<OwnedRelation> {
+    Ok(match element {
         Element::Relation(r) => Some(OwnedRelation {
             id: r.id(),
-            tags: r
-                .tags()
-                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                .collect(),
+            tags: owned_tags(r.tags_checked())?,
             members: r
                 .members()
-                .map(|m| OwnedMember {
-                    id: m.id,
-                    role: m.role().unwrap_or("").to_owned(),
+                .map(|m| {
+                    Ok(OwnedMember {
+                        id: m.id,
+                        role: m.role()?.to_owned(),
+                    })
                 })
-                .collect(),
+                .collect::<crate::error::Result<_>>()?,
             metadata: r.info().version().map(OwnedMetadata::version_only),
         }),
         _ => None,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
 // MergeJoinElement trait - shared accessors for the generic merge-join
 // ---------------------------------------------------------------------------
 
-pub(crate) trait MergeJoinElement: Sized {
+/// Equality is not a member of this trait: every element type compares
+/// through [`crate::content::content_equal`], the one definition of element
+/// content.
+pub(crate) trait MergeJoinElement: Sized + crate::content::Content {
     fn id(&self) -> i64;
     fn is_block_type(bt: BlockType) -> bool;
-    fn equal(a: &Self, b: &Self) -> bool;
-    fn convert(element: &Element<'_>) -> Option<Self>;
+    fn convert(element: &Element<'_>) -> ConvertResult<Self>;
 }
 
 impl MergeJoinElement for OwnedNode {
@@ -279,10 +294,7 @@ impl MergeJoinElement for OwnedNode {
     fn is_block_type(bt: BlockType) -> bool {
         is_node_block(bt)
     }
-    fn equal(a: &Self, b: &Self) -> bool {
-        super::write::nodes_equal(a, b)
-    }
-    fn convert(element: &Element<'_>) -> Option<Self> {
+    fn convert(element: &Element<'_>) -> ConvertResult<Self> {
         convert_node(element)
     }
 }
@@ -294,10 +306,7 @@ impl MergeJoinElement for OwnedWay {
     fn is_block_type(bt: BlockType) -> bool {
         is_way_block(bt)
     }
-    fn equal(a: &Self, b: &Self) -> bool {
-        super::write::ways_equal(a, b)
-    }
-    fn convert(element: &Element<'_>) -> Option<Self> {
+    fn convert(element: &Element<'_>) -> ConvertResult<Self> {
         convert_way(element)
     }
 }
@@ -309,10 +318,7 @@ impl MergeJoinElement for OwnedRelation {
     fn is_block_type(bt: BlockType) -> bool {
         is_relation_block(bt)
     }
-    fn equal(a: &Self, b: &Self) -> bool {
-        super::write::relations_equal(a, b)
-    }
-    fn convert(element: &Element<'_>) -> Option<Self> {
+    fn convert(element: &Element<'_>) -> ConvertResult<Self> {
         convert_relation(element)
     }
 }
@@ -373,7 +379,7 @@ pub(crate) fn merge_join_phase<T: MergeJoinElement>(
                     new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
                 }
                 std::cmp::Ordering::Equal => {
-                    if T::equal(o, n) {
+                    if crate::content::content_equal(o, n) {
                         on_action(MergeJoinAction::Equal(o))?;
                     } else {
                         on_action(MergeJoinAction::Modified(o, n))?;
@@ -409,95 +415,6 @@ pub(crate) fn element_version(e: &Element<'_>) -> Option<i32> {
         Element::Node(n) => n.info().version(),
         Element::Way(w) => w.info().version(),
         Element::Relation(r) => r.info().version(),
-    }
-}
-
-/// Compare two node elements (DenseNode or Node) by coords + tags.
-/// Handles all 4 cross-match combinations. Matches `nodes_equal` semantics:
-/// compares decimicro_lat, decimicro_lon, tags - NOT id or metadata.
-fn borrowed_nodes_equal(a: &Element<'_>, b: &Element<'_>) -> bool {
-    let (a_lat, a_lon) = match a {
-        Element::DenseNode(dn) => (dn.decimicro_lat(), dn.decimicro_lon()),
-        Element::Node(n) => (n.decimicro_lat(), n.decimicro_lon()),
-        _ => return false,
-    };
-    let (b_lat, b_lon) = match b {
-        Element::DenseNode(dn) => (dn.decimicro_lat(), dn.decimicro_lon()),
-        Element::Node(n) => (n.decimicro_lat(), n.decimicro_lon()),
-        _ => return false,
-    };
-    if a_lat != b_lat || a_lon != b_lon {
-        return false;
-    }
-    // Tag comparison: DenseTagIter and TagIter are different types but both
-    // yield (&str, &str). Handle all 4 cross-match combinations explicitly.
-    match (a, b) {
-        (Element::DenseNode(da), Element::DenseNode(db)) => da.tags().eq(db.tags()),
-        (Element::DenseNode(da), Element::Node(nb)) => iter_tags_equal(da.tags(), nb.tags()),
-        (Element::Node(na), Element::DenseNode(db)) => iter_tags_equal(na.tags(), db.tags()),
-        (Element::Node(na), Element::Node(nb)) => na.tags().eq(nb.tags()),
-        _ => false,
-    }
-}
-
-/// Compare two tag iterators of different concrete types.
-/// Both must yield `(&str, &str)`.
-fn iter_tags_equal<'a>(
-    a: impl Iterator<Item = (&'a str, &'a str)>,
-    b: impl Iterator<Item = (&'a str, &'a str)>,
-) -> bool {
-    a.eq(b)
-}
-
-/// Compare two Way elements by refs + tags. Matches `ways_equal` semantics.
-fn borrowed_ways_equal(a: &crate::Way<'_>, b: &crate::Way<'_>) -> bool {
-    a.refs().eq(b.refs()) && a.tags().eq(b.tags())
-}
-
-/// Compare two Relation elements by tags + members. Matches `relations_equal` semantics.
-fn borrowed_relations_equal(a: &crate::Relation<'_>, b: &crate::Relation<'_>) -> bool {
-    if !a.tags().eq(b.tags()) {
-        return false;
-    }
-    borrowed_members_equal(a, b)
-}
-
-/// Compare relation members by (MemberId, role). Matches `members_equal` semantics.
-/// Role uses `unwrap_or("")` matching the owned conversion path.
-fn borrowed_members_equal(a: &crate::Relation<'_>, b: &crate::Relation<'_>) -> bool {
-    let mut a_iter = a.members();
-    let mut b_iter = b.members();
-    loop {
-        match (a_iter.next(), b_iter.next()) {
-            (None, None) => return true,
-            (Some(am), Some(bm)) => {
-                if am.id != bm.id {
-                    return false;
-                }
-                let a_role = am.role().unwrap_or("");
-                let b_role = bm.role().unwrap_or("");
-                if a_role != b_role {
-                    return false;
-                }
-            }
-            _ => return false, // different lengths
-        }
-    }
-}
-
-/// Compare two elements of the same type. Dispatches to type-specific comparison.
-fn borrowed_elements_equal(a: &Element<'_>, b: &Element<'_>) -> bool {
-    match (a, b) {
-        // Node phase: any combination of DenseNode/Node
-        (Element::DenseNode(_) | Element::Node(_), Element::DenseNode(_) | Element::Node(_)) => {
-            borrowed_nodes_equal(a, b)
-        }
-        // Way phase
-        (Element::Way(wa), Element::Way(wb)) => borrowed_ways_equal(wa, wb),
-        // Relation phase
-        (Element::Relation(ra), Element::Relation(rb)) => borrowed_relations_equal(ra, rb),
-        // Different types with same ID = Modified
-        _ => false,
     }
 }
 
@@ -678,7 +595,7 @@ fn kind_name(kind: ElemKind) -> &'static str {
 /// Both checks use `osm_id` blob-range keys, not raw `i64`, so negative IDs
 /// order the way `osm_id_cmp` orders them everywhere else.
 pub(crate) struct BlobOrderGuard {
-    prev: Option<(ElemKind, (u8, i64))>,
+    prev: Option<(ElemKind, crate::osm_id::OsmIdKey)>,
 }
 
 impl BlobOrderGuard {
@@ -716,7 +633,7 @@ impl BlobOrderGuard {
                     kind_name(index.kind),
                     crate::osm_id::blob_osm_first_id(index.min_id, index.max_id),
                     kind_name(prev_kind),
-                    prev_last.1,
+                    crate::osm_id::osm_id_from_key(prev_last),
                 ));
             }
             if this_ord == prev_ord {
@@ -1212,7 +1129,7 @@ fn element_merge_pair(
                         let n = new_iter.next().expect("checked");
                         old_consumed += 1;
                         new_consumed += 1;
-                        if borrowed_elements_equal(&o, &n) {
+                        if crate::content::content_equal(&o, &n) {
                             on_action(BlockMergeAction::ElementEqual {
                                 id: o_id,
                                 version: element_version(&o),

@@ -9,6 +9,10 @@
 //! Distinct from the membership/cardinality concerns in [`crate::idset`]:
 //! this module is pure value semantics, no data structure.
 
+/// Canonical-order sort key: `(class, magnitude)`, class 0 for zero, 1 for
+/// negative, 2 for positive.
+pub(crate) type OsmIdKey = (u8, u64);
+
 /// Sort key for OSM element IDs in canonical order.
 ///
 /// Order: 0, then negative IDs by ascending absolute value (-1, -2, -3, ...),
@@ -16,14 +20,32 @@
 ///
 /// For positive-only IDs (all production PBFs), this is equivalent to plain
 /// i64 comparison - the `(2, id)` tuple compares identically to raw `id`.
+///
+/// The magnitude is `unsigned_abs`, so the key is injective: every distinct
+/// ID gets a distinct key. A saturating negation used to map both
+/// `i64::MIN` and `-i64::MAX` to the same key, and a merge-join keyed on it
+/// paired two different elements as the same object.
 #[inline]
-pub(crate) fn osm_id_key(id: i64) -> (u8, i64) {
+pub(crate) fn osm_id_key(id: i64) -> OsmIdKey {
     if id > 0 {
-        (2, id)
+        (2, id.unsigned_abs())
     } else if id == 0 {
         (0, 0)
     } else {
-        (1, id.saturating_neg())
+        (1, id.unsigned_abs())
+    }
+}
+
+/// The ID a key was derived from. Inverse of [`osm_id_key`].
+#[inline]
+// The casts reverse `unsigned_abs`; magnitude 2^63 maps back to i64::MIN.
+#[allow(clippy::cast_possible_wrap)]
+pub(crate) fn osm_id_from_key(key: OsmIdKey) -> i64 {
+    match key.0 {
+        0 => 0,
+        // Magnitude 2^63 is i64::MIN, which wrapping_neg maps to itself.
+        1 => (key.1 as i64).wrapping_neg(),
+        _ => key.1 as i64,
     }
 }
 
@@ -38,7 +60,7 @@ pub(crate) fn osm_id_cmp(a: i64, b: i64) -> std::cmp::Ordering {
 /// Used by blob-level sort to determine blob ordering. Conservative for
 /// mixed-sign ranges (assumes 0 is present).
 #[inline]
-pub(crate) fn blob_osm_first_key(min_id: i64, max_id: i64) -> (u8, i64) {
+pub(crate) fn blob_osm_first_key(min_id: i64, max_id: i64) -> OsmIdKey {
     if min_id >= 0 {
         osm_id_key(min_id)
     } else if max_id <= 0 {
@@ -52,7 +74,7 @@ pub(crate) fn blob_osm_first_key(min_id: i64, max_id: i64) -> (u8, i64) {
 ///
 /// Used by blob-level overlap detection.
 #[inline]
-pub(crate) fn blob_osm_last_key(min_id: i64, max_id: i64) -> (u8, i64) {
+pub(crate) fn blob_osm_last_key(min_id: i64, max_id: i64) -> OsmIdKey {
     if min_id >= 0 {
         osm_id_key(max_id)
     } else if max_id <= 0 {
@@ -95,6 +117,23 @@ pub(crate) fn blob_osm_last_id(min_id: i64, max_id: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Distinct IDs must never share a key, including at the extremes where
+    /// a saturating negation used to fold `i64::MIN` onto `-i64::MAX`, and
+    /// the key must round-trip to the ID it came from.
+    #[test]
+    fn osm_id_key_is_injective_and_round_trips() {
+        let ids = [i64::MIN, -i64::MAX, -2, -1, 0, 1, 2, i64::MAX - 1, i64::MAX];
+        for (i, &a) in ids.iter().enumerate() {
+            assert_eq!(osm_id_from_key(osm_id_key(a)), a, "round trip of {a}");
+            for &b in &ids[i + 1..] {
+                assert_ne!(osm_id_key(a), osm_id_key(b), "{a} and {b} share a key");
+            }
+        }
+        assert_eq!(osm_id_cmp(-1, -i64::MAX), std::cmp::Ordering::Less);
+        assert_eq!(osm_id_cmp(-i64::MAX, i64::MIN), std::cmp::Ordering::Less);
+        assert_eq!(osm_id_cmp(i64::MIN, 1), std::cmp::Ordering::Less);
+    }
 
     /// The id-valued and key-valued blob-bound helpers must agree: callers
     /// mix them (an error message names the ID while the comparison uses the

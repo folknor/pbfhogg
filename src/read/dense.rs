@@ -64,6 +64,16 @@ impl<'a> DenseNode<'a> {
         }
     }
 
+    /// Like [`tags`](Self::tags), but yields `Err` for a malformed varint or
+    /// an out-of-range string index instead of silently ending the tag list.
+    pub fn tags_checked(&self) -> CheckedDenseTagIter<'a> {
+        CheckedDenseTagIter {
+            block: self.block,
+            cursor: Cursor::new(self.tag_bytes),
+            failed: false,
+        }
+    }
+
     /// Returns an iterator over the tags of this node as raw index pairs.
     pub fn raw_tags(&self) -> DenseRawTagIter<'a> {
         DenseRawTagIter {
@@ -417,6 +427,38 @@ impl<'a> Iterator for DenseTagIter<'a> {
         let key = self.cursor.read_varint().ok()? as usize;
         let val = self.cursor.read_varint().ok()? as usize;
         get_stringtable_key_value(self.block, Some(key), Some(val))
+    }
+}
+
+/// The fallible sibling of [`DenseTagIter`]: yields `Err` for a malformed
+/// varint or a key or value index past the string table, instead of ending
+/// iteration. After an `Err` the iterator yields nothing more.
+#[derive(Clone)]
+pub struct CheckedDenseTagIter<'a> {
+    block: &'a WireBlock<'static>,
+    cursor: Cursor<'a>,
+    failed: bool,
+}
+
+#[allow(clippy::cast_possible_truncation)]
+impl<'a> Iterator for CheckedDenseTagIter<'a> {
+    type Item = Result<(&'a str, &'a str)>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed || self.cursor.is_empty() {
+            return None;
+        }
+        let item = (|| {
+            let key = self.cursor.read_varint()? as usize;
+            let val = self.cursor.read_varint()? as usize;
+            Ok((
+                str_from_stringtable(self.block, key)?,
+                str_from_stringtable(self.block, val)?,
+            ))
+        })();
+        self.failed = item.is_err();
+        Some(item)
     }
 }
 

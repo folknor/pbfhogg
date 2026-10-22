@@ -90,10 +90,11 @@ pub fn derive_changes(
     crate::debug::emit_marker("DERIVECHANGES_SCAN_START");
 
     // Parallel shard-based path. Only valid when both inputs are indexed
-    // (same constraint as derive_changes_block_pair). Falls through to
-    // the sequential sink path otherwise.
-    if both_indexed && jobs > 1 {
-        let stats = super::derive_parallel::derive_changes_parallel(
+    // (same constraint as derive_changes_block_pair) and hold no negative
+    // IDs (the driver declines with `None`). Falls through to the
+    // sequential sink path otherwise.
+    let parallel_stats = if both_indexed && jobs > 1 {
+        super::derive_parallel::derive_changes_parallel(
             old_path,
             new_path,
             output,
@@ -104,7 +105,11 @@ pub fn derive_changes(
             host,
             &token,
         )
-        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?
+    } else {
+        None
+    };
+    if let Some(stats) = parallel_stats {
         crate::debug::emit_marker("DERIVECHANGES_SCAN_END");
         #[allow(clippy::cast_possible_wrap)]
         {

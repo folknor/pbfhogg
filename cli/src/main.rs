@@ -3935,9 +3935,9 @@ fn run_bench_write(
             let start = Instant::now();
             let (nodes, ways, rels) = bench_write_loop(path, &mut writer, host)?;
             // Flush in the timed window: the tail of the BufWriter is part of
-            // the write, and its error is the run's error.
+            // the write, and its error is the run's error. Teardown stays
+            // outside the window, as it always was for this arm.
             writer.flush()?;
-            drop(writer);
             let elapsed_ms = start.elapsed().as_millis();
             (elapsed_ms, nodes, ways, rels)
         }

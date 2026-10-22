@@ -79,16 +79,14 @@ impl FileWriter {
 /// failed, so the regular-file success path is exactly one `fsync`.
 fn sync_file(file: &File) -> io::Result<()> {
     match file.sync_all() {
-        Err(e)
-            if sync_unsupported(
-                e.raw_os_error(),
-                file.metadata().ok().map(|m| m.file_type()),
-            ) =>
-        {
-            Ok(())
-        }
+        Err(e) if sync_unsupported(e.raw_os_error(), || file_type(file)) => Ok(()),
         other => other,
     }
+}
+
+/// The file's type, or `None` if `fstat` itself failed.
+fn file_type(file: &File) -> Option<std::fs::FileType> {
+    file.metadata().ok().map(|m| m.file_type())
 }
 
 /// Whether a failed `fsync` means the target cannot be synchronized at all,
@@ -109,16 +107,24 @@ fn sync_file(file: &File) -> io::Result<()> {
 /// every byte successfully and then failed `flush()` with `EINVAL`, and
 /// `bench-write` hid that by dropping its writer instead of flushing it.
 ///
-/// `file_type` is `None` when `fstat` itself failed.
+/// `file_type` is only called once the errno is `EINVAL`, so every other
+/// failure propagates without an extra `fstat`; it returns `None` when `fstat`
+/// itself failed.
 #[cfg(target_os = "linux")]
-fn sync_unsupported(errno: Option<i32>, file_type: Option<std::fs::FileType>) -> bool {
+fn sync_unsupported(
+    errno: Option<i32>,
+    file_type: impl FnOnce() -> Option<std::fs::FileType>,
+) -> bool {
     use std::os::unix::fs::FileTypeExt;
     errno == Some(libc::EINVAL)
-        && file_type.is_some_and(|t| t.is_fifo() || t.is_socket() || t.is_char_device())
+        && file_type().is_some_and(|t| t.is_fifo() || t.is_socket() || t.is_char_device())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn sync_unsupported(_errno: Option<i32>, _file_type: Option<std::fs::FileType>) -> bool {
+fn sync_unsupported(
+    _errno: Option<i32>,
+    _file_type: impl FnOnce() -> Option<std::fs::FileType>,
+) -> bool {
     false
 }
 
@@ -275,33 +281,36 @@ mod tests {
                 ("socket", socket()),
             ] {
                 assert!(
-                    sync_unsupported(Some(libc::EINVAL), file_type_of(&file)),
+                    sync_unsupported(Some(libc::EINVAL), || file_type_of(&file)),
                     "{name}: EINVAL means fsync is unsupported here"
                 );
             }
         }
 
+        /// Any other errno is a real failure, and is decided without an
+        /// `fstat`: the file type is never asked for.
         #[test]
-        fn other_errnos_on_the_same_targets_stay_errors() {
-            for errno in [libc::EIO, libc::ENOSPC, libc::EBADF, libc::EROFS] {
+        fn other_errnos_stay_errors_without_an_fstat() {
+            for errno in [Some(libc::EIO), Some(libc::ENOSPC), Some(libc::EROFS), None] {
                 assert!(
-                    !sync_unsupported(Some(errno), file_type_of(&char_device())),
-                    "errno {errno} is a real failure"
+                    !sync_unsupported(errno, || panic!("fstat for errno {errno:?}")),
+                    "errno {errno:?} is a real failure"
                 );
             }
-            assert!(!sync_unsupported(None, file_type_of(&char_device())));
         }
 
         #[test]
         fn einval_on_a_regular_file_stays_an_error() {
             // Only the file type is consulted; any regular file will do.
             let file = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
-            assert!(!sync_unsupported(Some(libc::EINVAL), file_type_of(&file)));
+            assert!(!sync_unsupported(Some(libc::EINVAL), || file_type_of(
+                &file
+            )));
         }
 
         #[test]
         fn unreadable_file_type_keeps_the_original_error() {
-            assert!(!sync_unsupported(Some(libc::EINVAL), None));
+            assert!(!sync_unsupported(Some(libc::EINVAL), || None));
         }
     }
 }

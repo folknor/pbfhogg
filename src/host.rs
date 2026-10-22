@@ -8,6 +8,96 @@ pub struct Host {
     pub diagnostics: Diagnostics,
     pub process: Arc<dyn ProcessActions>,
     pub resources: Arc<dyn Resources>,
+    /// Whether the library's own file readers drop the input's pages from the
+    /// page cache behind the read head.
+    pub page_cache: PageCachePolicy,
+    /// Where the library's own data-parallel work and writer framing run.
+    pub executor: Executor,
+    /// Directory for scratch files the library would otherwise place beside
+    /// an input or output (add-locations-to-ways, diff, derive-changes).
+    /// `None` keeps that default. The directory must exist.
+    pub scratch_parent: Option<std::path::PathBuf>,
+}
+impl Host {
+    /// The scratch parent for a run whose default is `default`.
+    pub(crate) fn scratch_parent_or<'a>(
+        &'a self,
+        default: &'a std::path::Path,
+    ) -> &'a std::path::Path {
+        self.scratch_parent.as_deref().unwrap_or(default)
+    }
+}
+/// Page-cache policy for the input files a command reads.
+///
+/// The page cache is shared by every process on the host, so dropping an
+/// input's pages is host policy, not library behaviour: a second pass, a
+/// concurrent reader or a later run then reads cold. The library's own scratch
+/// files are not governed by this policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageCachePolicy {
+    /// Advise `POSIX_FADV_DONTNEED` over the consumed prefix after every blob
+    /// (buffered reads only), so a one-pass read of a file larger than RAM does
+    /// not displace everything else in the page cache.
+    Evict,
+    /// Leave the page cache alone.
+    Keep,
+}
+/// The rayon pool the library's parallel work runs on.
+///
+/// `Ambient` uses whatever pool the calling thread is in, or rayon's global
+/// pool off any pool, exactly as `rayon::spawn` and the par-iterators do.
+/// `Pool` confines the work to the caller's pool. Three things follow from
+/// handing the library a pool:
+///
+/// - Thread-local framing and decompression scratch persists on whichever
+///   pool's threads ran it, for as long as those threads live. Release every
+///   owner of the pool, including its writers, to let those workers exit and
+///   free that scratch; dropping a pool does not join its workers.
+/// - Disposition of a panic in a `PbfWriter`'s framing work is the pool's
+///   `panic_handler`. With no handler, rayon aborts the process; with one,
+///   the lost blob surfaces as an error from `PbfWriter::flush`.
+/// - A `PbfWriter` driven from a worker of the executor's pool waits for its
+///   framing work cooperatively, so even a one-thread pool cannot deadlock on
+///   it. A writer moved between pools mid-stream under `Ambient` is not
+///   covered by that wait.
+#[derive(Clone, Debug)]
+pub enum Executor {
+    /// The calling thread's rayon pool, or rayon's global pool off any pool.
+    Ambient,
+    /// The caller's own pool.
+    Pool(Arc<rayon::ThreadPool>),
+}
+impl Executor {
+    /// Run `op` inside the pool (`Ambient`: a direct call).
+    pub(crate) fn install<R: Send>(&self, op: impl FnOnce() -> R + Send) -> R {
+        match self {
+            Self::Ambient => op(),
+            Self::Pool(pool) => pool.install(op),
+        }
+    }
+    /// Queue `op` on the pool (`Ambient`: `rayon::spawn`).
+    pub(crate) fn spawn(&self, op: impl FnOnce() + Send + 'static) {
+        match self {
+            Self::Ambient => rayon::spawn(op),
+            Self::Pool(pool) => pool.spawn(op),
+        }
+    }
+    /// Whether the calling thread is a worker of this executor's pool
+    /// (`Ambient`: of any rayon pool).
+    pub(crate) fn on_worker(&self) -> bool {
+        match self {
+            Self::Ambient => rayon::current_thread_index().is_some(),
+            Self::Pool(pool) => pool.current_thread_index().is_some(),
+        }
+    }
+    /// Run one pending job of the calling worker's pool, if any. `None` off
+    /// the pool.
+    pub(crate) fn yield_now(&self) -> Option<rayon::Yield> {
+        match self {
+            Self::Ambient => rayon::yield_now(),
+            Self::Pool(pool) => pool.yield_now(),
+        }
+    }
 }
 /// Invocation count and position are part of the contract, never deduplicated or hoisted.
 pub trait ProcessActions: Send + Sync {
@@ -79,6 +169,9 @@ impl Host {
             diagnostics: Diagnostics::discard(),
             process: Arc::new(NoProcessActions),
             resources: Arc::new(MachineProbe),
+            page_cache: PageCachePolicy::Keep,
+            executor: Executor::Ambient,
+            scratch_parent: None,
         }
     }
 }
@@ -100,6 +193,26 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn executor_installs_and_knows_its_workers() {
+        assert_eq!(Executor::Ambient.install(|| 7), 7);
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let executor = Executor::Pool(Arc::clone(&pool));
+        assert!(
+            !executor.on_worker(),
+            "the test thread is not a pool worker"
+        );
+        assert!(executor.yield_now().is_none());
+        assert!(
+            executor.install(|| executor.on_worker()),
+            "install must run on a worker of the pool"
+        );
     }
     #[test]
     fn descriptor_allowance_narration() {

@@ -59,7 +59,12 @@ mod uring_writer {
         // insufficient MEMLOCK; treat that as "environment not
         // suitable for this test" and return early rather than
         // claiming a failure the environment caused.
-        let mut writer = match PbfWriter::to_path_uring(&path, Compression::default(), &header) {
+        let mut writer = match PbfWriter::to_path_uring(
+            &path,
+            Compression::default(),
+            &header,
+            pbfhogg::host::Executor::Ambient,
+        ) {
             Ok(w) => w,
             Err(e) if is_uring_init_unavailable(&e) => {
                 eprintln!("io_uring not available, skipping: {e}");

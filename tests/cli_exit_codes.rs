@@ -97,6 +97,76 @@ fn diff_separates_identical_differing_and_failure() {
     );
 }
 
+/// A closed stderr (`pbfhogg sort ... 2>&1 | head`) stops the diagnostics and
+/// nothing else. `eprintln!` used to panic on the broken pipe and abort the
+/// command with 101 halfway through; `sort` writes progress lines to stderr
+/// before and while it writes its output, so it is the case that used to die.
+#[test]
+fn a_closed_stderr_does_not_kill_the_run() {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("sorted.osm.pbf");
+    let nodes = crate::common::generate_nodes(50, 1);
+    crate::common::write_indexed_pbf(&input, &nodes, &[], &[]);
+
+    let out = CliInvoker::new()
+        .stderr_closed()
+        .args([
+            "sort",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .run();
+    assert_eq!(
+        code(&out),
+        EXIT_SUCCESS,
+        "a closed stderr must not fail sort"
+    );
+    let read = crate::common::read_all_elements_with_coords(&output);
+    assert_eq!(read.nodes.len(), nodes.len(), "the output must be complete");
+}
+
+/// The command's own answer survives a closed stderr: differences found is
+/// still 1.
+///
+/// Deliberately without `-q`: quiet mode writes nothing to stderr, so it
+/// would pass whether or not a closed stderr is survivable. Without it the
+/// summary goes to the closed stderr after the diff itself went to stdout.
+#[test]
+fn a_closed_stderr_keeps_the_differences_status() {
+    let dir = TempDir::new().unwrap();
+    let a = dir.path().join("a.osm.pbf");
+    let c = dir.path().join("c.osm.pbf");
+    write_two_nodes(&a, 110_000_000);
+    write_two_nodes(&c, 999_000_000);
+
+    let out = CliInvoker::new()
+        .stderr_closed()
+        .args(["diff", a.to_str().unwrap(), c.to_str().unwrap()])
+        .run();
+    assert_eq!(code(&out), EXIT_ANSWER_NEGATIVE);
+}
+
+/// A failure is still a failure when nobody can read its message.
+#[test]
+fn a_closed_stderr_keeps_the_failure_status() {
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("does-not-exist.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    let out = CliInvoker::new()
+        .stderr_closed()
+        .args([
+            "sort",
+            missing.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .run();
+    assert_eq!(code(&out), EXIT_FAILED);
+}
+
 /// `inspect --indexed` answers a yes/no question. "No" is 1; a broken
 /// invocation is 2.
 #[test]

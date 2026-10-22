@@ -329,7 +329,7 @@ pub fn build_geocode_index(config: &BuildConfig, host: &crate::host::Host) -> Re
     // Ring assembly + simplification
     crate::debug::emit_marker("GEOCODE_PASS2_ADMIN_ASSEMBLY_START");
     let (admin_polygons, dropped_admin_relations) =
-        admin::assemble_admin_polygons(&admin_relations, &way_geom, config);
+        admin::assemble_admin_polygons(&admin_relations, &way_geom, config, &host.executor);
     drop(way_geom);
     crate::host::diag!(
         host.diagnostics,
@@ -372,6 +372,7 @@ pub fn build_geocode_index(config: &BuildConfig, host: &crate::host::Host) -> Re
         &interp_nodes_mmap,
         &strings,
         config.street_level,
+        &host.executor,
     );
     crate::host::diag!(
         host.diagnostics,
@@ -431,7 +432,8 @@ pub fn build_geocode_index(config: &BuildConfig, host: &crate::host::Host) -> Re
 
     // Admin cells are small enough to stay in memory
     crate::debug::emit_marker("GEOCODE_PASS3_ADMIN_CELLS_START");
-    let admin_cell_entries = pass3::assign_admin_cells(&admin_polygons, config.admin_level);
+    let admin_cell_entries =
+        pass3::assign_admin_cells(&admin_polygons, config.admin_level, &host.executor);
     crate::debug::emit_marker("GEOCODE_PASS3_ADMIN_CELLS_END");
 
     // Fused fine + coarse cell assignment (plan item #4). Single Stage A
@@ -460,6 +462,7 @@ pub fn build_geocode_index(config: &BuildConfig, host: &crate::host::Host) -> Re
             coarse_street_entries_file: FILE_COARSE_STREET_ENTRIES,
             coarse_addr_entries_file: FILE_COARSE_ADDR_ENTRIES,
             coarse_interp_entries_file: FILE_COARSE_INTERP_ENTRIES,
+            executor: &host.executor,
         })?;
     crate::debug::emit_marker("GEOCODE_PASS3_CELLS_END");
     crate::debug::emit_marker("GEOCODE_PASS3_ADMIN_INDEX_START");

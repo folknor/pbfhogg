@@ -25,6 +25,7 @@ pub(super) fn assemble_admin_polygons(
     relations: &[RawAdminRelation],
     way_geom: &FxHashMap<i64, Vec<(i32, i32)>>,
     config: &BuildConfig,
+    executor: &crate::host::Executor,
 ) -> (Vec<AssembledPolygon>, usize) {
     use rayon::prelude::*;
 
@@ -36,12 +37,14 @@ pub(super) fn assemble_admin_polygons(
     // preserves input order so the output `Vec<AssembledPolygon>` is
     // byte-identical to the previous sequential path. Europe phase was
     // 50.6 s at UUID `bf8f2038` - expected ~5× on plantasjen's 12 cores.
-    let per_relation: Vec<Vec<AssembledPolygon>> = relations
-        .par_iter()
-        .map(|rel| {
-            assemble_one_relation(rel, way_geom, admin_vertex_cap(rel.admin_level, max_verts))
-        })
-        .collect();
+    let per_relation: Vec<Vec<AssembledPolygon>> = executor.install(|| {
+        relations
+            .par_iter()
+            .map(|rel| {
+                assemble_one_relation(rel, way_geom, admin_vertex_cap(rel.admin_level, max_verts))
+            })
+            .collect()
+    });
     let dropped = per_relation
         .iter()
         .filter(|polygons| polygons.is_empty())
@@ -415,8 +418,12 @@ mod tests {
                 inner_way_ids: Vec::new(),
             },
         ];
-        let (polygons, dropped) =
-            assemble_admin_polygons(&relations, &way_geom, &BuildConfig::default());
+        let (polygons, dropped) = assemble_admin_polygons(
+            &relations,
+            &way_geom,
+            &BuildConfig::default(),
+            &crate::host::Executor::Ambient,
+        );
         assert_eq!(polygons.len(), 1, "the closed ring should assemble");
         assert_eq!(polygons[0].name_offset, 3);
         assert_eq!(

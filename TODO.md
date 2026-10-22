@@ -40,9 +40,11 @@ Picked 2026-07-30, right after the 0.5.0 release.
   `cli/src/output.rs` (a closed reader is a silent exit 0, not a panic), the
   library's report types render into a caller-supplied `io::Write`, and
   textlint rules in `brokkr.toml` ban `print!`/`println!` and raw stdout
-  handles outside that file. Still open: the per-command inventory table, the
-  `--json` purity check, and stderr (`eprintln!` panics when stderr's reader
-  goes away; the library-use audit is tracked in bz as pbfhogg#1). Known
+  handles outside that file. The stderr half is delivered too: the library
+  writes no stderr (it reports through `host::Diagnostics`), and the CLI
+  writes stderr through `output::cli_eprintln!`, so a closed stderr stops the
+  diagnostics without ending the run. Still open: the per-command inventory
+  table and the `--json` purity check. Known
   trade-off: streaming `diff` exits 0 when stdout's reader goes away before the
   verdict exists, so under `set -o pipefail` `pbfhogg diff a b | head` reads as
   identical.
@@ -637,11 +639,12 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
 
 ### Read path
 
-- [ ] **`BlobReader::from_path` advises `POSIX_FADV_DONTNEED` over `0..offset`.**
-  The API half is closed - `BlobReader::evict_page_cache(bool)`,
-  `ElementReader::evict_page_cache(bool)` and
-  `ElementReader::from_path_with_eviction` give the public surface a whole-file
-  opt-out, default unchanged. What remains open is the syscall shape: the
+- [ ] **An evicting `BlobReader` advises `POSIX_FADV_DONTNEED` over `0..offset`.**
+  The API half is closed - eviction is opt-in on the public readers
+  (`BlobReader::evict_page_cache(bool)`, `ElementReader::evict_page_cache(bool)`,
+  `ElementReader::from_path_with_eviction`), and commands follow
+  `Host::page_cache`, which the CLI sets to `Evict`. What remains open is the
+  syscall shape: the
   advised range is the whole consumed prefix `0..current_offset`, re-issued per
   blob, so planet issues ~2.5 M `posix_fadvise` calls each nominally covering a
   growing prefix where `offset_prev..offset` would express the same intent over
@@ -800,11 +803,11 @@ Measurement-first on every one: turn on `#[cfg(feature = "hotpath")]` counters (
 
 ## Important: ignored tests
 
-The CLI process-policy identity instrument has three ignored tests:
-`host_identity_bless_goldens`, `host_identity_matches_goldens` and
-`stderr_closed_aborts_like_baseline`. Run each explicitly with
-`brokkr test <name> --sweep all --timeout 280`. Bless only against the
-unchanged baseline product; compare after each library-use brick. The two
+The CLI process-policy identity instrument's ignored tests are
+`host_identity_bless_goldens` and `host_identity_matches_goldens`. Run each
+explicitly with `brokkr test <name> --sweep all --timeout 280`. Bless only
+against an unchanged baseline product; compare after any change that could
+move a process mutation, probe, reader or stderr line. The two
 `_uring` scenarios skip on this host for the same `RLIMIT_MEMLOCK` reason as
 every other uring test (see the release-gate entry below); both tests name
 the skipped scenarios on stderr.

@@ -349,6 +349,7 @@ pub(crate) fn writer_from_header_bytes(
                 output,
                 compression,
                 header_bytes,
+                host.executor.clone(),
                 host.diagnostics.clone(),
             )?)
         }
@@ -363,6 +364,7 @@ pub(crate) fn writer_from_header_bytes(
                 output,
                 compression,
                 header_bytes,
+                host.executor.clone(),
                 host.diagnostics.clone(),
             )?)
         }
@@ -375,6 +377,7 @@ pub(crate) fn writer_from_header_bytes(
             output,
             compression,
             header_bytes,
+            host.executor.clone(),
             host.diagnostics.clone(),
         )?)
     }
@@ -406,6 +409,7 @@ pub(crate) fn writer_from_header_bytes_parallel(
                 output,
                 compression,
                 header_bytes,
+                host.executor.clone(),
                 host.diagnostics.clone(),
             )?)
         }
@@ -420,6 +424,7 @@ pub(crate) fn writer_from_header_bytes_parallel(
                 output,
                 compression,
                 header_bytes,
+                host.executor.clone(),
                 host.diagnostics.clone(),
             )?)
         }
@@ -432,6 +437,7 @@ pub(crate) fn writer_from_header_bytes_parallel(
             output,
             compression,
             header_bytes,
+            host.executor.clone(),
             host.diagnostics.clone(),
         )?)
     }

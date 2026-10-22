@@ -298,12 +298,14 @@ pub fn sort(
         Vec::new()
     } else {
         crate::debug::emit_marker("SORT_OVERLAP_PARALLEL_START");
-        let results: std::result::Result<Vec<_>, String> = overlap_runs
-            .par_iter()
-            .map(|(start, end, kind)| {
-                compute_overlap_run_local(&entries[*start..*end], *kind, input, host)
-            })
-            .collect();
+        let results: std::result::Result<Vec<_>, String> = host.executor.install(|| {
+            overlap_runs
+                .par_iter()
+                .map(|(start, end, kind)| {
+                    compute_overlap_run_local(&entries[*start..*end], *kind, input, host)
+                })
+                .collect()
+        });
         let out = results.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         crate::debug::emit_marker("SORT_OVERLAP_PARALLEL_END");
         out

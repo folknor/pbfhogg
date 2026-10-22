@@ -36,8 +36,9 @@ pub(crate) use super::framing::{
 // thread) lives in the sibling `pipeline` module.
 use super::pipeline::{
     FileOutputSink, OutputChunk, PermitGuard, PipelineItem, SeqTotal, WRITE_AHEAD, WritePipeline,
-    WriterGone, elapsed_ns_u64, new_permit_pool, record_send_wait, writer_thread,
+    drain_permits, elapsed_ns_u64, record_send_wait, recv_permit, writer_thread,
 };
+use crate::host::{Diagnostics, Executor};
 
 /// Returned when a write is attempted on a `PbfWriter` whose inner writer was
 /// moved into a pipeline writer thread (every pipelined constructor, and every
@@ -80,19 +81,33 @@ fn pipeline_send_error(pipeline: &mut WritePipeline) -> io::Error {
 /// closures build their [`PermitGuard`] inside the closure instead, because
 /// the permit has to outlive the spawn rather than the call.
 ///
-/// Holding a permit across *every* send is what makes the pipeline's liveness
-/// argument hold without any assumption about rayon's scheduling order; see
-/// [`WRITE_AHEAD`].
+/// Every send path participates in the dispatch bound, including raw writes;
+/// see [`WRITE_AHEAD`] for how channel backpressure differs from that bound.
 fn acquire_permit(pipeline: &WritePipeline) -> io::Result<PermitGuard> {
+    take_permit(pipeline)?;
+    Ok(PermitGuard::new(pipeline.permit_tx.clone()))
+}
+
+/// Take one dispatch permit through [`recv_permit`], timing the wait into
+/// `writer_permit_wait_ns`. The caller owns giving it back.
+fn take_permit(pipeline: &WritePipeline) -> io::Result<()> {
     let t_permit = std::time::Instant::now();
-    pipeline
-        .permit_rx
-        .recv()
+    recv_permit(&pipeline.permit_rx, &pipeline.executor)
         .map_err(|_| io::Error::other("pipelined writer permit pool disconnected"))?;
     WRITER_METRICS
         .permit_wait_ns
         .fetch_add(elapsed_ns_u64(t_permit), Relaxed);
-    Ok(PermitGuard::new(pipeline.permit_tx.clone()))
+    Ok(())
+}
+
+/// Test hook: whether the framing closure for `seq` should panic.
+#[cfg(feature = "test-hooks")]
+fn framing_panics_at(pipeline: &WritePipeline, seq: usize) -> bool {
+    pipeline.framing_panic_at == Some(seq)
+}
+#[cfg(not(feature = "test-hooks"))]
+fn framing_panics_at(_pipeline: &WritePipeline, _seq: usize) -> bool {
+    false
 }
 
 /// Writes PBF files as a sequence of framed, compressed blobs.
@@ -131,16 +146,22 @@ impl PbfWriter<FileWriter> {
     ///
     /// Call [`flush`](Self::flush) when done to join the writer thread and
     /// propagate any I/O errors.
+    ///
+    /// `executor` is where the framing work runs; [`Executor::Ambient`] is
+    /// rayon's ambient pool. See [`Executor`] for what handing the writer a
+    /// pool of your own means.
     pub fn to_path(
         path: &Path,
         compression: Compression,
         header_block_bytes: &[u8],
+        executor: Executor,
     ) -> io::Result<Self> {
         Self::to_path_in(
             path,
             compression,
             header_block_bytes,
-            crate::host::Diagnostics::discard(),
+            executor,
+            Diagnostics::discard(),
         )
     }
 
@@ -148,11 +169,13 @@ impl PbfWriter<FileWriter> {
         path: &Path,
         compression: Compression,
         header_block_bytes: &[u8],
-        diagnostics: crate::host::Diagnostics,
+        executor: Executor,
+        diagnostics: Diagnostics,
     ) -> io::Result<Self> {
+        // The buffered backend's writer thread reports nothing.
         drop(diagnostics);
         let writer = FileWriter::buffered(path)?;
-        Self::start_pipeline(writer, compression, header_block_bytes)
+        Self::start_pipeline(writer, compression, header_block_bytes, executor)
     }
 
     /// Create a pipelined `PbfWriter` with `O_DIRECT` for page-cache-free writes.
@@ -165,12 +188,14 @@ impl PbfWriter<FileWriter> {
         path: &Path,
         compression: Compression,
         header_block_bytes: &[u8],
+        executor: Executor,
     ) -> io::Result<Self> {
         Self::to_path_direct_in(
             path,
             compression,
             header_block_bytes,
-            crate::host::Diagnostics::discard(),
+            executor,
+            Diagnostics::discard(),
         )
     }
 
@@ -179,11 +204,13 @@ impl PbfWriter<FileWriter> {
         path: &Path,
         compression: Compression,
         header_block_bytes: &[u8],
-        diagnostics: crate::host::Diagnostics,
+        executor: Executor,
+        diagnostics: Diagnostics,
     ) -> io::Result<Self> {
+        // The O_DIRECT backend's writer thread reports nothing.
         drop(diagnostics);
         let writer = FileWriter::direct(path)?;
-        Self::start_pipeline(writer, compression, header_block_bytes)
+        Self::start_pipeline(writer, compression, header_block_bytes, executor)
     }
 
     /// Create a pipelined `PbfWriter` that uses io_uring for output I/O.
@@ -210,12 +237,14 @@ impl PbfWriter<FileWriter> {
         path: &Path,
         compression: Compression,
         header_block_bytes: &[u8],
+        executor: Executor,
     ) -> io::Result<Self> {
         Self::to_path_uring_in(
             path,
             compression,
             header_block_bytes,
-            crate::host::Diagnostics::discard(),
+            executor,
+            Diagnostics::discard(),
         )
     }
 
@@ -224,7 +253,8 @@ impl PbfWriter<FileWriter> {
         path: &Path,
         compression: Compression,
         header_block_bytes: &[u8],
-        diagnostics: crate::host::Diagnostics,
+        executor: Executor,
+        diagnostics: Diagnostics,
     ) -> io::Result<Self> {
         use crate::write::uring_writer;
 
@@ -269,19 +299,10 @@ impl PbfWriter<FileWriter> {
             }
         }
 
-        let (permit_tx, permit_rx) = new_permit_pool();
         Ok(PbfWriter {
             writer: None,
             compression,
-            pipeline: Some(WritePipeline {
-                tx,
-                seq: 0,
-                join_handle: Some(handle),
-                permit_tx,
-                permit_rx,
-                expected,
-                writer_gone: WriterGone::new(),
-            }),
+            pipeline: Some(WritePipeline::new(tx, handle, expected, executor)),
             scratch: FrameScratch::new(),
         })
     }
@@ -300,12 +321,14 @@ impl PbfWriter<FileWriter> {
         path: &Path,
         compression: Compression,
         header_block_bytes: &[u8],
+        executor: Executor,
     ) -> io::Result<Self> {
         Self::to_path_parallel_in(
             path,
             compression,
             header_block_bytes,
-            crate::host::Diagnostics::discard(),
+            executor,
+            Diagnostics::discard(),
         )
     }
 
@@ -313,7 +336,8 @@ impl PbfWriter<FileWriter> {
         path: &Path,
         compression: Compression,
         header_block_bytes: &[u8],
-        diagnostics: crate::host::Diagnostics,
+        executor: Executor,
+        diagnostics: Diagnostics,
     ) -> io::Result<Self> {
         use crate::write::parallel_writer;
 
@@ -357,19 +381,10 @@ impl PbfWriter<FileWriter> {
             }
         }
 
-        let (permit_tx, permit_rx) = new_permit_pool();
         Ok(PbfWriter {
             writer: None,
             compression,
-            pipeline: Some(WritePipeline {
-                tx,
-                seq: 0,
-                join_handle: Some(handle),
-                permit_tx,
-                permit_rx,
-                expected,
-                writer_gone: WriterGone::new(),
-            }),
+            pipeline: Some(WritePipeline::new(tx, handle, expected, executor)),
             scratch: FrameScratch::new(),
         })
     }
@@ -379,6 +394,7 @@ impl PbfWriter<FileWriter> {
         mut writer: FileWriter,
         compression: Compression,
         header_block_bytes: &[u8],
+        executor: Executor,
     ) -> io::Result<Self> {
         // Write header synchronously before starting the pipeline.
         let framed_header = frame_blob("OSMHeader", header_block_bytes, &compression, None)?;
@@ -392,19 +408,10 @@ impl PbfWriter<FileWriter> {
             writer_thread(rx, FileOutputSink::new(writer), &thread_expected)
         });
 
-        let (permit_tx, permit_rx) = new_permit_pool();
         Ok(PbfWriter {
             writer: None,
             compression,
-            pipeline: Some(WritePipeline {
-                tx,
-                seq: 0,
-                join_handle: Some(handle),
-                permit_tx,
-                permit_rx,
-                expected,
-                writer_gone: WriterGone::new(),
-            }),
+            pipeline: Some(WritePipeline::new(tx, handle, expected, executor)),
             scratch: FrameScratch::new(),
         })
     }
@@ -424,6 +431,18 @@ impl<W: Write> PbfWriter<W> {
             compression,
             pipeline: None,
             scratch: FrameScratch::new(),
+        }
+    }
+
+    /// Test hook: make the framing work for the `seq`-th data blob (0-based,
+    /// counting every blob sent through the pipeline) panic before it frames.
+    /// Per instance; a no-op on a sync [`PbfWriter::new`] writer, which has no
+    /// framing work.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn test_panic_in_framing_at(&mut self, seq: usize) {
+        if let Some(pipeline) = self.pipeline.as_mut() {
+            pipeline.framing_panic_at = Some(seq);
         }
     }
 
@@ -461,14 +480,7 @@ impl<W: Write> PbfWriter<W> {
             if pipeline.writer_gone.observed() {
                 return Err(pipeline_send_error(pipeline));
             }
-            let t_permit = std::time::Instant::now();
-            pipeline
-                .permit_rx
-                .recv()
-                .map_err(|_| io::Error::other("pipelined writer permit pool disconnected"))?;
-            WRITER_METRICS
-                .permit_wait_ns
-                .fetch_add(elapsed_ns_u64(t_permit), Relaxed);
+            take_permit(pipeline)?;
             let seq = pipeline.seq;
             pipeline.seq += 1;
             let compression = self.compression;
@@ -476,11 +488,13 @@ impl<W: Write> PbfWriter<W> {
             let tx = pipeline.tx.clone();
             let permit_tx = pipeline.permit_tx.clone();
             let writer_gone = pipeline.writer_gone.clone();
-            rayon::spawn(move || {
+            let panic_here = framing_panics_at(pipeline, seq);
+            pipeline.executor.spawn(move || {
                 // Constructed first so it drops last - the permit is released
                 // after `tx.send` below, and also on the unwind path if any
                 // of the framing work panics. See `PermitGuard`.
                 let _permit = PermitGuard::new(permit_tx);
+                assert!(!panic_here, "test hook: framing panic at seq {seq}");
                 let indexdata = blob_meta::scan_block_ids(&uncompressed).map(|idx| idx.serialize());
                 let tagdata =
                     blob_meta::scan_block_tags(&uncompressed).and_then(|ti| ti.serialize());
@@ -555,14 +569,7 @@ impl<W: Write> PbfWriter<W> {
             if pipeline.writer_gone.observed() {
                 return Err(pipeline_send_error(pipeline));
             }
-            let t_permit = std::time::Instant::now();
-            pipeline
-                .permit_rx
-                .recv()
-                .map_err(|_| io::Error::other("pipelined writer permit pool disconnected"))?;
-            WRITER_METRICS
-                .permit_wait_ns
-                .fetch_add(elapsed_ns_u64(t_permit), Relaxed);
+            take_permit(pipeline)?;
             let seq = pipeline.seq;
             pipeline.seq += 1;
             let compression = self.compression;
@@ -570,10 +577,12 @@ impl<W: Write> PbfWriter<W> {
             let tx = pipeline.tx.clone();
             let permit_tx = pipeline.permit_tx.clone();
             let writer_gone = pipeline.writer_gone.clone();
-            rayon::spawn(move || {
+            let panic_here = framing_panics_at(pipeline, seq);
+            pipeline.executor.spawn(move || {
                 // Drops last - releases the permit after `tx.send`, and on
                 // the unwind path too. See `PermitGuard`.
                 let _permit = PermitGuard::new(permit_tx);
+                assert!(!panic_here, "test hook: framing panic at seq {seq}");
                 let result = PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
                     frame_blob_into(
                         "OSMData",
@@ -644,14 +653,7 @@ impl<W: Write> PbfWriter<W> {
             if pipeline.writer_gone.observed() {
                 return Err(pipeline_send_error(pipeline));
             }
-            let t_permit = std::time::Instant::now();
-            pipeline
-                .permit_rx
-                .recv()
-                .map_err(|_| io::Error::other("pipelined writer permit pool disconnected"))?;
-            WRITER_METRICS
-                .permit_wait_ns
-                .fetch_add(elapsed_ns_u64(t_permit), Relaxed);
+            take_permit(pipeline)?;
             let seq = pipeline.seq;
             pipeline.seq += 1;
             let compression = self.compression;
@@ -660,10 +662,12 @@ impl<W: Write> PbfWriter<W> {
             let way_members_owned = way_members.map(<[u8]>::to_vec);
             let permit_tx = pipeline.permit_tx.clone();
             let writer_gone = pipeline.writer_gone.clone();
-            rayon::spawn(move || {
+            let panic_here = framing_panics_at(pipeline, seq);
+            pipeline.executor.spawn(move || {
                 // Drops last - releases the permit after `tx.send`, and on
                 // the unwind path too. See `PermitGuard`.
                 let _permit = PermitGuard::new(permit_tx);
+                assert!(!panic_here, "test hook: framing panic at seq {seq}");
                 let result = PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
                     frame_blob_into(
                         "OSMData",
@@ -719,9 +723,9 @@ impl<W: Write> PbfWriter<W> {
     /// (no rayon task needed since there is no compression work).
     pub fn write_raw(&mut self, raw_framed_bytes: &[u8]) -> io::Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
-            // Hold a dispatch permit across the send. This is what makes the
-            // "no send can block on a full channel" argument in `WRITE_AHEAD`
-            // cover the producer's own sends as well as the rayon framers'.
+            // Hold a dispatch permit across the send so raw writes share the
+            // dispatch bound with framing tasks. The send can still block;
+            // see `WRITE_AHEAD`.
             let _permit = acquire_permit(pipeline)?;
             let seq = pipeline.seq;
             pipeline.seq += 1;
@@ -752,9 +756,9 @@ impl<W: Write> PbfWriter<W> {
     /// with `std::mem::take`).
     pub fn write_raw_owned(&mut self, raw_framed_bytes: Vec<u8>) -> io::Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
-            // Hold a dispatch permit across the send. This is what makes the
-            // "no send can block on a full channel" argument in `WRITE_AHEAD`
-            // cover the producer's own sends as well as the rayon framers'.
+            // Hold a dispatch permit across the send so raw writes share the
+            // dispatch bound with framing tasks. The send can still block;
+            // see `WRITE_AHEAD`.
             let _permit = acquire_permit(pipeline)?;
             let seq = pipeline.seq;
             pipeline.seq += 1;
@@ -784,9 +788,9 @@ impl<W: Write> PbfWriter<W> {
     /// Used by passthrough coalescers to avoid `extend_from_slice` memcpy.
     pub fn write_raw_chunks(&mut self, chunks: Vec<Vec<u8>>) -> io::Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
-            // Hold a dispatch permit across the send. This is what makes the
-            // "no send can block on a full channel" argument in `WRITE_AHEAD`
-            // cover the producer's own sends as well as the rayon framers'.
+            // Hold a dispatch permit across the send so raw writes share the
+            // dispatch bound with framing tasks. The send can still block;
+            // see `WRITE_AHEAD`.
             let _permit = acquire_permit(pipeline)?;
             let seq = pipeline.seq;
             pipeline.seq += 1;
@@ -825,6 +829,12 @@ impl<W: Write> PbfWriter<W> {
     /// there is nothing for a later write to fall back to. Any write after
     /// `flush` on a pipelined writer fails with "the pipelined writer owns
     /// the output file". Calling `flush` twice is harmless.
+    ///
+    /// After successful writes, `flush` checks completion and reports deferred
+    /// errors. File-backed pipelines also sync the file; a synchronous writer
+    /// created with `new` only calls its underlying `Write::flush`, which does
+    /// not guarantee durability. Dropping without flushing is cleanup only - it
+    /// joins the writer thread but reports nothing, including a missing tail.
     #[hotpath::measure]
     pub fn flush(&mut self) -> io::Result<()> {
         let t_flush = std::time::Instant::now();
@@ -837,6 +847,12 @@ impl<W: Write> PbfWriter<W> {
             pipeline.expected.announce(pipeline.seq);
             // Drop sender to signal the writer thread that no more items are coming.
             drop(pipeline.tx);
+            // On a worker of the executor's pool, let the queued framing
+            // closures run before blocking in the join; see `drain_permits`.
+            // Off-worker (every CLI path) this is skipped.
+            if pipeline.executor.on_worker() {
+                drain_permits(&pipeline.permit_rx, &pipeline.executor);
+            }
             if let Some(handle) = pipeline.join_handle.take() {
                 handle
                     .join()
@@ -967,10 +983,18 @@ impl<W: Write> PbfWriter<W> {
     }
 }
 
+/// Cleanup only: joins the writer thread and reports nothing. A writer that
+/// was not [`flush`](PbfWriter::flush)ed may be missing its tail, and `Drop`
+/// cannot say so.
 impl<W: Write> Drop for PbfWriter<W> {
     fn drop(&mut self) {
         if let Some(mut pipeline) = self.pipeline.take() {
             drop(pipeline.tx);
+            // As in `flush`: on a worker of the executor's pool the queued
+            // framing closures must run before the join can return.
+            if pipeline.executor.on_worker() {
+                drain_permits(&pipeline.permit_rx, &pipeline.executor);
+            }
             if let Some(handle) = pipeline.join_handle.take() {
                 // Best-effort join. Any I/O error from the writer thread -
                 // including the deferred `sync_all` and (for uring)
@@ -1011,9 +1035,9 @@ impl PbfWriter<FileWriter> {
     ) -> io::Result<()> {
         use std::os::unix::io::AsRawFd;
         if let Some(ref mut pipeline) = self.pipeline {
-            // Hold a dispatch permit across the send. This is what makes the
-            // "no send can block on a full channel" argument in `WRITE_AHEAD`
-            // cover the producer's own sends as well as the rayon framers'.
+            // Hold a dispatch permit across the send so raw writes share the
+            // dispatch bound with framing tasks. The send can still block;
+            // see `WRITE_AHEAD`.
             let _permit = acquire_permit(pipeline)?;
             let seq = pipeline.seq;
             pipeline.seq += 1;
@@ -1057,9 +1081,9 @@ impl PbfWriter<FileWriter> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{Compression, PbfWriter, WritePipeline, WriterGone};
+    use super::{Compression, Executor, PbfWriter, WritePipeline};
     use crate::write::framing::FrameScratch;
-    use crate::write::pipeline::{PipelineItem, SeqTotal, new_permit_pool};
+    use crate::write::pipeline::{PipelineItem, SeqTotal};
     use std::io;
     use std::sync::mpsc::sync_channel;
 
@@ -1074,20 +1098,15 @@ mod tests {
         // guaranteed to fail without a race to synchronise against.
         drop(rx);
         let handle = std::thread::spawn(move || outcome);
-        let (permit_tx, permit_rx) = new_permit_pool();
-        let expected = SeqTotal::new();
         PbfWriter {
             writer: None,
             compression: Compression::None,
-            pipeline: Some(WritePipeline {
+            pipeline: Some(WritePipeline::new(
                 tx,
-                seq: 0,
-                join_handle: Some(handle),
-                permit_tx,
-                permit_rx,
-                expected,
-                writer_gone: WriterGone::new(),
-            }),
+                handle,
+                SeqTotal::new(),
+                Executor::Ambient,
+            )),
             scratch: FrameScratch::new(),
         }
     }
@@ -1140,7 +1159,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("post-flush.osm.pbf");
         let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
-        let mut w = PbfWriter::to_path(&path, Compression::None, &header).unwrap();
+        let mut w =
+            PbfWriter::to_path(&path, Compression::None, &header, Executor::Ambient).unwrap();
         w.flush().unwrap();
         let err = w
             .write_raw(b"anything")
@@ -1154,8 +1174,8 @@ mod tests {
     /// A dead writer thread must stop `write_primitive_block` too, not just
     /// the `write_raw*` family.
     ///
-    /// `write_primitive_block*` hands its framed result to a `rayon::spawn`
-    /// closure that used to end in `drop(tx.send(...))`, so a writer thread
+    /// `write_primitive_block*` hands its framing to a closure spawned on the
+    /// writer's `Executor` that used to end in `drop(tx.send(...))`, so a writer thread
     /// that died on ENOSPC was invisible until `flush()`. Nothing throttled
     /// the producer, because the permit pool releases on closure *completion*,
     /// not on delivery - a full disk let a whole planet-scale dataset be read,
@@ -1249,7 +1269,8 @@ mod tests {
         std::fs::write(&decoy_path, &decoy).unwrap();
 
         let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
-        let mut w = PbfWriter::to_path(&out_path, Compression::None, &header).unwrap();
+        let mut w =
+            PbfWriter::to_path(&out_path, Compression::None, &header, Executor::Ambient).unwrap();
 
         let input = Arc::new(std::fs::File::open(&input_path).unwrap());
         w.write_raw_copy(&input, 0, payload.len() as u64).unwrap();
@@ -1291,7 +1312,8 @@ mod tests {
         let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
 
         let before = WRITER_METRICS.sync_all_calls.load(Relaxed);
-        let mut w = PbfWriter::to_path(&path, Compression::None, &header).unwrap();
+        let mut w =
+            PbfWriter::to_path(&path, Compression::None, &header, Executor::Ambient).unwrap();
         w.write_primitive_block(&[0x12u8, 0x00]).unwrap();
         w.flush().unwrap();
         assert!(
@@ -1351,5 +1373,62 @@ mod tests {
             err.is_some_and(|e| e.to_string().contains("no-indexdata variant")),
             "write_primitive_block_no_indexdata must surface the writer thread's error"
         );
+    }
+
+    /// Cover the other framing entry points and the raw-send permit path on
+    /// the same sole worker. Every variant must also drain on unflushed drop.
+    #[test]
+    fn every_framing_variant_and_raw_send_completes_on_one_worker() {
+        let pool = std::sync::Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
+        let block = [0x12u8, 0x00];
+        let index = crate::blob_meta::BlobIndex {
+            kind: crate::blob_meta::ElemKind::Node,
+            min_id: 0,
+            max_id: 0,
+            count: 0,
+            bbox: None,
+        };
+        let raw = super::frame_blob("OSMData", &block, &Compression::None, None).unwrap();
+        for owned in [false, true] {
+            for flush in [false, true] {
+                let path = dir.path().join(format!("owned-{owned}-flush-{flush}.pbf"));
+                pool.install(|| {
+                    let mut writer = PbfWriter::to_path(
+                        &path,
+                        Compression::None,
+                        &header,
+                        Executor::Pool(std::sync::Arc::clone(&pool)),
+                    )
+                    .unwrap();
+                    for _ in 0..200 {
+                        if owned {
+                            writer.write_primitive_block_owned(block.to_vec(), index, None, None)
+                        } else {
+                            writer.write_primitive_block_no_indexdata(&block)
+                        }
+                        .unwrap();
+                    }
+                    writer.write_raw(&raw).unwrap();
+                    writer.write_raw_owned(raw.clone()).unwrap();
+                    writer.write_raw_chunks(vec![raw.clone()]).unwrap();
+                    if flush {
+                        writer.flush().unwrap();
+                    }
+                });
+                let blobs = crate::BlobReader::from_path(&path)
+                    .unwrap()
+                    .map(|blob| blob.unwrap())
+                    .filter(|blob| blob.get_type() == crate::BlobType::OsmData)
+                    .count();
+                assert_eq!(blobs, 203, "owned={owned}, flush={flush}");
+            }
+        }
     }
 }

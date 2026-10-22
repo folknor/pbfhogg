@@ -51,7 +51,7 @@ mod parallel_writer {
     /// a hard failure carrying the panic's message - and the writer must not
     /// return while any pool worker is still running.
     ///
-    /// The second half is BUG-066: the writer used to return on the first
+    /// The second half is a fixed defect: the writer used to return on the first
     /// panicked join and detach the rest of the pool, which kept writing
     /// into the output after `merge()` had already reported failure. The
     /// hooks make that deterministic: worker 0 gets the first op and

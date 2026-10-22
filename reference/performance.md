@@ -616,6 +616,66 @@ suite; the rest still carry their older commit in the Notes column.
 > stall-counter shape flip as mechanism until the same flip survives a
 > same-wall comparison.
 
+> **Library-use B4 (executor and cooperative permit wait) - neutral,
+> 2026-10-22 (bygg).** Question: does routing the writer's per-block
+> framing through `Executor::spawn` and the permit wait through
+> `recv_permit` cost anything on the CLI path? Germany indexed,
+> interleaved `--bench 1` pairs, both arms via `--commit` worktrees. The
+> B3 arm is `2416a0cb` (B1 and B2): B3 changes no code these two commands
+> run under the CLI host (its eviction stays on), and the bricks were not
+> yet committed, so the B4 arm is `cbce533a`, a snapshot commit of the
+> B3-plus-B4 working tree on `2416a0cb`. `sudo fstrim -av` could not run
+> (no passwordless sudo); germany's input stays page-cache resident, so
+> the pairs read CPU and synchronization cost.
+>
+> | command | pair | B3 cell (wall) | B4 cell (wall) | delta |
+> |---|---|---|---|---|
+> | renumber | 1 | `c5e5aa39` 12401 ms | `f56af7b9` 6601 ms | void, cold cache |
+> | renumber | 2 | `6ea722e2` 6301 ms | `30be229a` 6301 ms | +0.0 % |
+> | renumber | 3 | `ddf1b865` 6401 ms | `d69725c7` 6201 ms | -3.1 % |
+> | renumber | 1, rerun | `4f7c25bb` 6401 ms | `434a7cad` 6601 ms | +3.1 % |
+> | repack | 1 | `b619a6f8` 17401 ms | `87f88b51` 17801 ms | +2.3 % |
+> | repack | 2 | `1d9fd437` 17502 ms | `351ab291` 17701 ms | +1.1 % |
+> | repack | 3 | `b07798a3` 17601 ms | `6d58956e` 17401 ms | -1.1 % |
+>
+> Renumber's first B3 cell was the session's first germany read
+> (`brokkr sidecar --compare c5e5aa39 f56af7b9`: 482 MB, 2087 MB and
+> 1809 MB of disk read in its first three phases, none in the B4 cell),
+> so that pair was rerun once in the same order and the rerun replaces it.
+> Medians: renumber +0.0 % (B3 spread over its three warm cells 1.6 %),
+> repack +1.1 % (B3 spread 1.1 %); both within the +2.0 % keep bound.
+> `writer_coop_wait_ns` read 0 on `30be229a` and `351ab291`: no CLI path
+> drives a `PbfWriter` from a rayon worker. Every wall in the set sits
+> within a millisecond of a 100 ms step, so single-pair deltas on renumber
+> are one or two steps of that granularity; read the medians, not the
+> pairs.
+
+> **Library-use cumulative arc (B1 to B5) - neutral, 2026-10-22 (bygg).**
+> `fa94c6c7` (the baseline every library-use identity gate uses) against
+> `46675558`, a snapshot commit of the B1-to-B5 tree on `2416a0cb` (the
+> bricks were not yet committed). Germany indexed, interleaved `--bench 1` pairs in the same
+> cell order as the B4 pair, both arms via `--commit` worktrees, no
+> `fstrim` (no passwordless sudo), input page-cache resident.
+>
+> | command | pair | `fa94c6c7` cell (wall) | B5 cell (wall) | delta |
+> |---|---|---|---|---|
+> | renumber | 1 | `c5566af6` 6501 ms | `065a72db` 6301 ms | -3.1 % |
+> | renumber | 2 | `c815474b` 6501 ms | `3cc4753a` 6501 ms | +0.0 % |
+> | renumber | 3 | `44fb7775` 6401 ms | `66cdec33` 6301 ms | -1.6 % |
+> | repack | 1 | `1777f885` 17401 ms | `399f5526` 17501 ms | +0.6 % |
+> | repack | 2 | `106a67b2` 17601 ms | `2c4cccf9` 17501 ms | -0.6 % |
+> | repack | 3 | `28106592` 17701 ms | `f174c9f0` 17501 ms | -1.1 % |
+> | cat --clean | 1 | `00560867` 17301 ms | `888814c0` 16901 ms | -2.3 % |
+> | cat --clean | 2 | `69e935e1` 16601 ms | `8b073aad` 17401 ms | +4.8 % |
+> | cat --clean | 3 | `74188a34` 17401 ms | `759654b0` 17701 ms | +1.7 % |
+>
+> Medians: renumber -1.6 % (`fa94c6c7` spread 1.5 %), repack -0.6 %
+> (spread 1.7 %), cat --clean +1.7 % (spread 4.6 %). All three are within
+> the +2.0 % keep bound, so no brick needed bisecting. cat --clean's
+> baseline arm alone spans 16.6 to 17.4 s, wider than the bound, and two
+> of its three deltas are positive; it is the command to re-pair first if
+> a later change touches the classify or framing path.
+
 ### Blob-count threshold dispatch landing gates (ADR-0006, plantasjen, 2026-07-11)
 
 getparents and getid include mode dispatch between the pread header
@@ -839,8 +899,9 @@ R2d: parallel with inline rank() dispatch (relation_map replaced by
 `node_id_set.rank()` + `way_id_set.rank()` inline - no flat temp
 files. Zero scratch disk usage. Single shared input fd across all
 phases. Atomic index dispatch (no `Arc<Mutex<Receiver>>`). Output
-defaults to zlib:1. the arena cap requested at the start of `renumber_external()` through the
-caller's process actions (the CLI applies it) prevents glibc cross-thread arena fragmentation.
+defaults to zlib:1. The arena cap requested at the start of `renumber_external()` through
+the caller's process actions (the CLI applies it) prevents glibc cross-thread arena
+fragmentation.
 
 ### Planet (87.7 GB indexed, 11.6B elements, plantasjen)
 
@@ -852,8 +913,8 @@ Element counts: 10,447,738,627 nodes / 1,165,589,744 ways /
 Peak anon 3.3 GB (commit `cb99106`). Single shared `IdSetDense` with
 `AtomicU8::fetch_or` for concurrent pass 1 writes (~1.5 GB node bitset
 + rank index, ~200 MB way bitset + rank, ~20 MB relation bitset).
-Zero temp disk. the arena cap requested at the start of `renumber_external()` through the caller's process actions (the CLI applies it)
-caps glibc arena growth from cross-thread OwnedBlock `Vec<u8>` frees.
+Zero temp disk. The arena cap requested at the start of `renumber_external()` through the
+caller's process actions (the CLI applies it) caps glibc arena growth from cross-thread OwnedBlock `Vec<u8>` frees.
 
 ### Phase breakdown (commit `cb99106`, planet, `--bench 1`, UUID `f9098cab`)
 

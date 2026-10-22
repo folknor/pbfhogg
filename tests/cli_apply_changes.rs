@@ -19,7 +19,7 @@
 //! pins.
 //!
 //! Per-test stats assertions on `MergeStats` counters survive via
-//! stderr substring matching against `MergeStats::print_summary`.
+//! stderr substring matching against `MergeStats::write_summary`.
 //! Where a stats assertion is redundant with an element-set
 //! assertion it is dropped.
 //!

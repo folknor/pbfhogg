@@ -72,6 +72,7 @@ pub fn derive_changes(
     jobs: usize,
     host: &crate::host::Host,
 ) -> Result<DeriveChangesStats> {
+    let token = crate::scratch::RunToken::next()?;
     // Single-pass: check sorted headers + indexdata from one file open each.
     let (old_sorted, old_indexed) = super::check_sorted_and_indexed(old_path, direct_io, host)?;
     let (new_sorted, new_indexed) = super::check_sorted_and_indexed(new_path, direct_io, host)?;
@@ -84,7 +85,7 @@ pub fn derive_changes(
     let both_indexed = old_indexed && new_indexed;
 
     // Scratch directory for temp files (same as brokkr scratch).
-    let scratch_dir = output.parent().unwrap_or(Path::new("."));
+    let scratch_dir = host.scratch_parent_or(output.parent().unwrap_or(Path::new(".")));
 
     crate::debug::emit_marker("DERIVECHANGES_SCAN_START");
 
@@ -101,6 +102,7 @@ pub fn derive_changes(
             increment_version,
             update_timestamp,
             host,
+            &token,
         )
         .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
         crate::debug::emit_marker("DERIVECHANGES_SCAN_END");
@@ -113,7 +115,7 @@ pub fn derive_changes(
         return Ok(stats);
     }
 
-    let mut sink = ChangeSink::new(scratch_dir, increment_version, update_timestamp)?;
+    let mut sink = ChangeSink::new(scratch_dir, &token, increment_version, update_timestamp)?;
 
     let result = (|| -> Result<DeriveChangesStats> {
         if both_indexed {
@@ -132,8 +134,8 @@ pub fn derive_changes(
         crate::debug::emit_marker("DERIVECHANGES_WRITE_END");
         Ok(stats)
     })();
-    // Always clean up temp files, even on error
-    sink.cleanup();
+    // Remove fragments before returning, on errors and during unwinding too.
+    drop(sink);
     let stats = result?;
 
     #[allow(clippy::cast_possible_wrap)]
@@ -163,22 +165,34 @@ struct ChangeSink {
     increment_version: bool,
     update_timestamp: bool,
     coord_buf: String,
+    // Declared after the writers so files close before their paths are removed.
+    _scratch_guards: [crate::path_guard::PathGuard; 3],
 }
 
 impl ChangeSink {
     fn new(
         scratch_dir: &Path,
+        token: &crate::scratch::RunToken,
         increment_version: bool,
         update_timestamp: bool,
     ) -> io::Result<Self> {
         let pid = std::process::id();
-        let cp = scratch_dir.join(format!("derive-creates-{pid}.xml.tmp"));
-        let mp = scratch_dir.join(format!("derive-modifies-{pid}.xml.tmp"));
-        let dp = scratch_dir.join(format!("derive-deletes-{pid}.xml.tmp"));
+        let suffix = token.suffix();
+        let cp = scratch_dir.join(format!("derive-creates-{pid}{suffix}.xml.tmp"));
+        let mp = scratch_dir.join(format!("derive-modifies-{pid}{suffix}.xml.tmp"));
+        let dp = scratch_dir.join(format!("derive-deletes-{pid}{suffix}.xml.tmp"));
+        // Arm each guard as soon as its file exists. Constructing a later
+        // fragment can fail before there is a ChangeSink to drop.
+        let creates = Writer::new(io::BufWriter::new(crate::scratch::create_file(&cp)?));
+        let creates_guard = crate::path_guard::PathGuard::file(cp.clone());
+        let modifies = Writer::new(io::BufWriter::new(crate::scratch::create_file(&mp)?));
+        let modifies_guard = crate::path_guard::PathGuard::file(mp.clone());
+        let deletes = Writer::new(io::BufWriter::new(crate::scratch::create_file(&dp)?));
+        let deletes_guard = crate::path_guard::PathGuard::file(dp.clone());
         Ok(Self {
-            creates: Writer::new(io::BufWriter::new(File::create(&cp)?)),
-            modifies: Writer::new(io::BufWriter::new(File::create(&mp)?)),
-            deletes: Writer::new(io::BufWriter::new(File::create(&dp)?)),
+            creates,
+            modifies,
+            deletes,
             creates_path: cp,
             modifies_path: mp,
             deletes_path: dp,
@@ -188,6 +202,7 @@ impl ChangeSink {
             increment_version,
             update_timestamp,
             coord_buf: String::new(),
+            _scratch_guards: [creates_guard, modifies_guard, deletes_guard],
         })
     }
 
@@ -223,12 +238,6 @@ impl ChangeSink {
         self.modifies.get_mut().flush()?;
         self.deletes.get_mut().flush()?;
         Ok(())
-    }
-
-    fn cleanup(&self) {
-        drop(std::fs::remove_file(&self.creates_path));
-        drop(std::fs::remove_file(&self.modifies_path));
-        drop(std::fs::remove_file(&self.deletes_path));
     }
 
     fn stats(&self) -> DeriveChangesStats {
@@ -622,4 +631,43 @@ fn write_delete_element<W: Write>(
     }
     writer.write_event(Event::Empty(elem))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::ChangeSink;
+    use crate::scratch::RunToken;
+
+    #[test]
+    fn partial_sink_construction_removes_created_fragments() {
+        let dir = tempfile::tempdir().expect("directory");
+        let token = RunToken::next().expect("token");
+        let blocked = dir.path().join(format!(
+            "derive-modifies-{}{}.xml.tmp",
+            std::process::id(),
+            token.suffix()
+        ));
+        std::fs::create_dir(&blocked).expect("block second fragment");
+        let err = ChangeSink::new(dir.path(), &token, false, false)
+            .err()
+            .expect("second fragment must fail");
+        assert!(err.to_string().contains(&blocked.display().to_string()));
+        let remaining: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("scratch directory")
+            .map(|entry| entry.expect("entry").path())
+            .collect();
+        assert_eq!(remaining, [blocked], "the first fragment must be removed");
+    }
+
+    #[test]
+    fn unwinding_removes_all_sink_fragments() {
+        let dir = tempfile::tempdir().expect("directory");
+        let token = RunToken::next().expect("token");
+        let result = std::panic::catch_unwind(|| {
+            let _sink = ChangeSink::new(dir.path(), &token, false, false).expect("sink");
+            panic!("simulate a failed derive run");
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).expect("directory").count(), 0);
+    }
 }

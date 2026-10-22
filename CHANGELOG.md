@@ -17,13 +17,30 @@
 
 - **The library writes nothing to stderr.** Every former line is an event on
   the caller's `host::Diagnostics` handle (`Progress`, `Warning`, `Note`,
-  `Summary`, `Developer`), so two runs in one process cannot interleave
-  output. `print_summary` and `print_osmium_summary` are replaced by
+  `Summary`, `Developer`), so callers can capture or redirect each run's
+  output separately. `print_summary` and `print_osmium_summary` are replaced by
   `write_summary` and `write_osmium_summary` into an `io::Write`.
   `has_indexdata`, `has_tagdata` and `osc::parse::load_all_diffs` take
   `&Diagnostics`. The unrecognised-indexdata warning is once per
   `Diagnostics` handle (shareable through `OnceKeys`), not once per process.
   `BlobReader` and `ElementReader` gain a `.diagnostics(d)` builder.
+  CLI benchmark readers attach the same handle, retaining malformed-indexdata
+  warnings in modes that parse indexdata.
+
+- **Public file readers no longer evict the page cache by default.**
+  `BlobReader::from_path` and `open`, and `ElementReader::from_path` and
+  `open`, used to drop each input's pages behind the read head, which made
+  any second pass, concurrent reader or other process on the host read cold.
+  They now leave the page cache alone. Opt in for one-pass reads of files
+  larger than RAM with `.evict_page_cache(true)` or
+  `ElementReader::from_path_with_eviction(path, true)`. Commands follow the
+  new `Host::page_cache` field (`PageCachePolicy::Evict` or `Keep`); the CLI
+  keeps evicting as before.
+
+- **The `PbfWriter::to_path*` constructors take an `Executor`**
+  (`host::Executor::Ambient` for rayon's ambient pool, or
+  `Executor::Pool(Arc<rayon::ThreadPool>)` to confine framing to a pool of
+  your own). Commands run their parallel work on the new `Host::executor`.
 
 - **Report types write into a caller-supplied `io::Write` instead of printing
   to stdout.** A library does not own its host's stdout. Renamed, each now
@@ -495,17 +512,32 @@
   silently leaves the file cold for anything that reads it next: a
   two-pass command, a test suite, an `osmium` running alongside. There
   was no opt-out short of switching to O_DIRECT, which is a different I/O
-  mode entirely. The default is unchanged; pass `false` to leave the page
-  cache alone.
+  mode entirely. The default has since flipped to keeping the page cache
+  (see Breaking); pass `true` to evict.
 
   On `ElementReader` the builder can only govern the blobs it has not read
   yet: every file constructor decodes the header blob before returning, so
-  a post-hoc `evict_page_cache(false)` spares the element blobs but not
-  the header. `ElementReader::from_path_with_eviction(path, false)` makes
-  the decision up front and is the one to use when the whole file's cache
-  must be left untouched.
+  `ElementReader::from_path_with_eviction(path, enabled)` is the one that
+  makes the decision before the header is read.
 
 ### Fixed
+
+- **A `PbfWriter` driven from inside its own rayon pool no longer
+  deadlocks.** Writing, flushing or dropping a writer from a worker of the
+  pool its framing runs on - including a one-thread pool - used to block
+  that worker on work only it could run. The writer now waits
+  cooperatively there. A framing panic under the pool's non-aborting
+  `panic_handler` surfaces as an error from `flush`; with no handler, rayon
+  aborts the process, which is now the documented disposition.
+
+- **Concurrent library runs no longer share or delete each other's scratch.**
+  Two `add-locations-to-ways`, `diff` or `diff --format osc` runs in one
+  process named their scratch files by process id alone, so they wrote into
+  and cleaned up the same files. Each run now takes its own token; the first
+  run in a process keeps the old names. A `Host::scratch_parent` override
+  places that scratch in the named directory, which must exist. Scratch
+  creation errors name the path; sequential derive also removes fragments
+  after partial initialization or a panic.
 
 - **Piping CLI output into a reader that exits early no longer panics.**
   `pbfhogg inspect x.pbf | head`, and the same with `check`, `diff`,
@@ -871,6 +903,12 @@
   bitset message. It is now an input error naming the problem.
 
 ### Changed
+
+- **CLI: a closed stderr no longer aborts the command.** With stderr's
+  reader gone (`pbfhogg sort in.pbf -o out.pbf 2>&1 | head`), the first
+  progress line used to panic and end the run with status 101, leaving no
+  output. Diagnostics now stop, the command completes, and the exit status
+  is the command's own (0, 1 for a negative answer, 2 for a failure).
 
 - **`merge-changes` no longer strips element metadata from an element that
   omits `version`.** Its metadata parser began with

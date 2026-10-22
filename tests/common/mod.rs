@@ -341,8 +341,13 @@ pub fn write_indexed_pbf(
         .sorted()
         .build()
         .expect("build header");
-    let mut writer =
-        PbfWriter::to_path(path, Compression::default(), &header).expect("create writer");
+    let mut writer = PbfWriter::to_path(
+        path,
+        Compression::default(),
+        &header,
+        pbfhogg::host::Executor::Ambient,
+    )
+    .expect("create writer");
 
     let mut bb = BlockBuilder::new();
 
@@ -1533,5 +1538,8 @@ pub(crate) fn test_host() -> pbfhogg::host::Host {
         diagnostics: pbfhogg::host::Diagnostics::discard(),
         process: std::sync::Arc::new(pbfhogg::host::NoProcessActions),
         resources: std::sync::Arc::new(pbfhogg::host::MachineProbe),
+        page_cache: pbfhogg::host::PageCachePolicy::Keep,
+        executor: pbfhogg::host::Executor::Ambient,
+        scratch_parent: None,
     }
 }

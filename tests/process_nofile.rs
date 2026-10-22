@@ -18,6 +18,9 @@ fn no_process_actions_leave_rlimit_nofile_unchanged() {
             diagnostics: pbfhogg::host::Diagnostics::discard(),
             process: Arc::new(NoProcessActions),
             resources: Arc::new(MachineProbe),
+            page_cache: pbfhogg::host::PageCachePolicy::Keep,
+            executor: pbfhogg::host::Executor::Ambient,
+            scratch_parent: None,
         };
         pbfhogg::altw::external::external_join(
             std::path::Path::new("tests/fixtures/host_identity/inputs/base.osm.pbf"),

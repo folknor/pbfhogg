@@ -241,6 +241,9 @@ pub fn add_locations_to_ways(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<Stats> {
+    // One scratch token per run, whichever backend ends up placing scratch.
+    let token = crate::scratch::RunToken::next()?;
+
     // Auto-select: sparse unless the input qualifies for external AND the
     // estimated store exceeds the page-cache budget (see IndexType::Auto).
     let index_type = if options.index_type == IndexType::Auto {
@@ -252,7 +255,7 @@ pub fn add_locations_to_ways(
     // External join has its own pipeline - dispatch early.
     if index_type == IndexType::External {
         let dest = DestinationGuard::new(output)?;
-        let stats = external::external_join(
+        let stats = external::external_join_in(
             input,
             dest.path(),
             options.keep_untagged_nodes,
@@ -262,6 +265,7 @@ pub fn add_locations_to_ways(
             overrides,
             options.inject_prepass,
             host,
+            &token,
         )?;
         enforce_missing_locations_policy(&stats, options.ignore_missing_nodes)?;
         dest.commit()?;
@@ -297,7 +301,7 @@ pub fn add_locations_to_ways(
     }
 
     let dest = DestinationGuard::new(output)?;
-    let scratch_dir = output.parent().unwrap_or(Path::new("."));
+    let scratch_dir = host.scratch_parent_or(output.parent().unwrap_or(Path::new(".")));
 
     // Pass 0: collect the set of node IDs referenced by ways. Only these
     // nodes need coordinate lookups, so only these get indexed. At planet
@@ -331,6 +335,7 @@ pub fn add_locations_to_ways(
         referenced,
         index_type,
         host,
+        &token,
     )?;
     crate::debug::emit_marker("ALTW_PASS1_END");
 
@@ -713,6 +718,7 @@ fn build_node_index(
     referenced: IdSet,
     index_type: IndexType,
     host: &crate::host::Host,
+    token: &crate::scratch::RunToken,
 ) -> Result<NodeIndex> {
     match index_type {
         IndexType::Sparse => {
@@ -720,7 +726,7 @@ fn build_node_index(
             // builds rank index on the IdSet and carries it through to
             // SparseArrayIndex so pass 2 lookups can do
             // rank_if_set(node_id) -> mmap read at rank * 8.
-            build_node_index_sparse(input, direct_io, scratch_dir, referenced, host)
+            build_node_index_sparse(input, direct_io, scratch_dir, referenced, host, token)
                 .map(NodeIndex::Sparse)
         }
         IndexType::External | IndexType::Auto => unreachable!("resolved before build_node_index"),

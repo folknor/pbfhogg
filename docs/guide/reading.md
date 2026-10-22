@@ -35,6 +35,18 @@ let reader = ElementReader::new(buf_reader)?;
 # Ok::<(), std::io::Error>(())
 ```
 
+### Page cache
+
+Readers leave the page cache alone by default: a file you read stays warm for a second pass, for another reader, and for other processes on the host. For a one-pass read of a file larger than RAM, `evict_page_cache(true)` on a `BlobReader` or `ElementReader`, or `ElementReader::from_path_with_eviction(path, true)`, drops the file's pages behind the read head instead, so the read does not displace everything else in the cache. On `ElementReader` prefer `from_path_with_eviction`, which decides before the header blob is read. O_DIRECT readers have no cached pages to drop.
+
+```rust
+use pbfhogg::ElementReader;
+
+let reader = ElementReader::from_path_with_eviction("tests/test.osm.pbf", true)?;
+# drop(reader);
+# Ok::<(), std::io::Error>(())
+```
+
 ### Header access
 
 The PBF header is available immediately after construction:

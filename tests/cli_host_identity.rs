@@ -855,23 +855,4 @@ mod tier3 {
         }
         eprintln!("identity compare: scenarios skipped: {skipped:?}");
     }
-    #[test]
-    #[ignore]
-    fn stderr_closed_aborts_like_baseline() {
-        prerequisites();
-        let run = root().join("target/host-identity/closed");
-        std::fs::create_dir_all(&run).unwrap();
-        let output = run.join("output.osm.pbf");
-        std::fs::remove_file(&output).ok();
-        let out = CliInvoker::new()
-            .clean_env()
-            .stderr_closed()
-            .arg("sort")
-            .arg(fixtures().join("inputs/base.osm.pbf"))
-            .arg("-o")
-            .arg(&output)
-            .run();
-        assert_eq!(out.status.code(), Some(101));
-        assert!(!output.exists());
-    }
 }

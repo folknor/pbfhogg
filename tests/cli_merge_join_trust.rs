@@ -50,8 +50,13 @@ enum Blob {
 /// OsmData blob carries indexdata, which `block_pair_merge_phase` requires.
 fn write_blobs(path: &Path, blobs: &[Blob]) {
     let header = HeaderBuilder::new().sorted().build().expect("build header");
-    let mut writer =
-        PbfWriter::to_path(path, Compression::default(), &header).expect("create writer");
+    let mut writer = PbfWriter::to_path(
+        path,
+        Compression::default(),
+        &header,
+        pbfhogg::host::Executor::Ambient,
+    )
+    .expect("create writer");
     let mut bb = BlockBuilder::new();
 
     for blob in blobs {

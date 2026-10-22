@@ -446,3 +446,44 @@ fn getparents_rejects_zero_full_scan_min_blobs() {
         "argument validation must reject before touching the input; stderr:\n{stderr}",
     );
 }
+
+/// Public readers discard diagnostics unless the CLI explicitly attaches its
+/// handle. Benchmark commands must retain the same malformed-index warning as
+/// commands that construct their readers through the host.
+#[test]
+fn bench_commands_report_unrecognised_indexdata() {
+    let input = "tests/fixtures/host_identity/inputs/bad-indexdata.osm.pbf";
+    // Parallel map/reduce and the unfiltered pipeline have always skipped
+    // indexdata parsing. Keep that fast path, including its lack of a warning.
+    for (mode, warnings) in [
+        ("sequential", 1),
+        ("parallel", 0),
+        ("pipelined", 0),
+        ("blobreader", 1),
+    ] {
+        let out = CliInvoker::new()
+            .args(["bench-read", input, "--mode", mode])
+            .assert_success();
+        let stderr = out.stderr_str();
+        assert_eq!(
+            stderr
+                .matches("indexdata has an unrecognised length")
+                .count(),
+            warnings,
+            "bench-read {mode}: {stderr}"
+        );
+    }
+    for mode in ["sync", "pipelined"] {
+        let out = CliInvoker::new()
+            .args(["bench-write", input, "--writer", mode])
+            .assert_success();
+        let stderr = out.stderr_str();
+        assert_eq!(
+            stderr
+                .matches("indexdata has an unrecognised length")
+                .count(),
+            1,
+            "bench-write {mode}: {stderr}"
+        );
+    }
+}

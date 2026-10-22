@@ -33,7 +33,7 @@ use tempfile::TempDir;
 /// Invoke `pbfhogg tags-filter <input> -o <output> [-R] [-i] [-t]
 /// [-j N] <expressions...> --force` and assert success. Returns
 /// the captured stderr (which carries the
-/// `TagsFilterStats::print_summary` line).
+/// `TagsFilterStats::write_summary` line).
 fn run_filter_full(
     input: &Path,
     output: &Path,

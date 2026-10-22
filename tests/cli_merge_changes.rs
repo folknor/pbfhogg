@@ -6,7 +6,7 @@
 //! compiled `pbfhogg` binary through `CliInvoker`; output is
 //! verified by reading the resulting OSC text and substring
 //! matching, with stats inspected through stderr (the CLI emits
-//! them via `MergeChangesStats::print_summary`). No imports
+//! them via `MergeChangesStats::write_summary`). No imports
 //! from `pbfhogg::merge_changes::*` - a rewrite of
 //! `src/commands/merge_changes/` cannot break these tests by
 //! type changes alone.
@@ -52,7 +52,7 @@ fn read_osc_plain(path: &Path) -> String {
 
 /// Invoke `pbfhogg merge-changes <inputs...> -o <output> [--simplify]`
 /// and assert success. Returns captured stderr (which carries the
-/// `MergeChangesStats::print_summary` line) so the caller can pin
+/// `MergeChangesStats::write_summary` line) so the caller can pin
 /// counter values.
 fn run_merge_changes(inputs: &[&Path], output: &Path, simplify: bool) -> String {
     let mut cli = CliInvoker::new().arg("merge-changes");

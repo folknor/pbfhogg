@@ -72,12 +72,18 @@ println!("Number of ways: {ways}");
 ```rust
 use pbfhogg::write::block_builder::{HeaderBuilder, BlockBuilder};
 use pbfhogg::write::writer::{PbfWriter, Compression};
+use pbfhogg::host::Executor;
 
 let header_bytes = HeaderBuilder::new()
     .bbox(9.0, 54.0, 13.0, 58.0)
     .sorted()
     .build()?;
-let mut writer = PbfWriter::to_path("output.osm.pbf".as_ref(), Compression::default(), &header_bytes)?;
+let mut writer = PbfWriter::to_path(
+    "output.osm.pbf".as_ref(),
+    Compression::default(),
+    &header_bytes,
+    Executor::Ambient,
+)?;
 
 let mut bb = BlockBuilder::new();
 bb.add_node(1, 556_761_000, 125_683_000, [("name", "Copenhagen")], None);

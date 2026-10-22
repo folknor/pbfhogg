@@ -471,7 +471,12 @@ fn run_kind_phase(
                             pending.append(&mut output);
                             if !pending.is_empty() {
                                 let batch = std::mem::take(&mut pending);
-                                match frame_and_write_batch(batch, compression, writer) {
+                                match frame_and_write_batch(
+                                    batch,
+                                    compression,
+                                    writer,
+                                    &host.executor,
+                                ) {
                                     Ok(written) => blobs += written,
                                     Err(e) => {
                                         write_error = Some(e);
@@ -533,7 +538,8 @@ fn run_kind_phase(
                         pending.append(&mut output);
                         while pending.len() >= FRAME_BATCH {
                             let batch: Vec<OwnedBlock> = pending.drain(..FRAME_BATCH).collect();
-                            match frame_and_write_batch(batch, compression, writer) {
+                            match frame_and_write_batch(batch, compression, writer, &host.executor)
+                            {
                                 Ok(written) => blobs += written,
                                 Err(e) => {
                                     write_error = Some(e);
@@ -567,7 +573,7 @@ fn run_kind_phase(
     pending.append(&mut output);
     if !pending.is_empty() {
         let final_batch = std::mem::take(&mut pending);
-        let written = frame_and_write_batch(final_batch, compression, writer)?;
+        let written = frame_and_write_batch(final_batch, compression, writer, &host.executor)?;
         blobs += written;
     }
 
@@ -792,31 +798,34 @@ fn frame_and_write_batch(
     batch: Vec<OwnedBlock>,
     compression: Compression,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
+    executor: &crate::host::Executor,
 ) -> std::result::Result<u64, Box<dyn std::error::Error>> {
     use rayon::prelude::*;
 
-    let framed: Vec<std::io::Result<Vec<u8>>> = batch
-        .into_par_iter()
-        .map(
-            |OwnedBlock {
-                 bytes: block_bytes,
-                 index,
-                 tagdata,
-                 way_members,
-             }|
-             -> std::io::Result<Vec<u8>> {
-                let indexdata = index.serialize();
-                let blob = frame_blob_pipelined(
-                    &block_bytes,
-                    &compression,
-                    Some(indexdata.as_slice()),
-                    tagdata.as_deref(),
-                    way_members.as_deref(),
-                )?;
-                Ok(blob.into_vec())
-            },
-        )
-        .collect();
+    let framed: Vec<std::io::Result<Vec<u8>>> = executor.install(|| {
+        batch
+            .into_par_iter()
+            .map(
+                |OwnedBlock {
+                     bytes: block_bytes,
+                     index,
+                     tagdata,
+                     way_members,
+                 }|
+                 -> std::io::Result<Vec<u8>> {
+                    let indexdata = index.serialize();
+                    let blob = frame_blob_pipelined(
+                        &block_bytes,
+                        &compression,
+                        Some(indexdata.as_slice()),
+                        tagdata.as_deref(),
+                        way_members.as_deref(),
+                    )?;
+                    Ok(blob.into_vec())
+                },
+            )
+            .collect()
+    });
 
     let mut written: u64 = 0;
     for r in framed {

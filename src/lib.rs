@@ -67,21 +67,25 @@ Build blocks with [`BlockBuilder`] and write them with [`PbfWriter`]:
 ```rust,no_run
 use pbfhogg::write::block_builder::{BlockBuilder, HeaderBuilder};
 use pbfhogg::write::writer::{PbfWriter, Compression};
+use pbfhogg::host::Executor;
 
 let header_bytes = HeaderBuilder::new()
     .bbox(9.0, 54.0, 13.0, 58.0)
     .sorted()
     .build()?;
+// `Executor::Ambient` frames on rayon's ambient pool; pass
+// `Executor::Pool(pool)` to confine the work to a pool of your own.
 let mut writer = PbfWriter::to_path(
     "output.osm.pbf".as_ref(),
     Compression::default(),
     &header_bytes,
+    Executor::Ambient,
 )?;
 
 let mut bb = BlockBuilder::new();
 bb.add_node(1, 556_761_000, 125_683_000, [("name", "Copenhagen")], None);
 
-// Flush the block to the writer - compression dispatches to rayon
+// Flush the block to the writer - compression dispatches to the executor
 if let Some(block_bytes) = bb.take()? {
     writer.write_primitive_block(block_bytes)?;
 }
@@ -162,6 +166,7 @@ pub mod path_guard;
 pub mod read;
 pub(crate) mod reorder_buffer;
 pub(crate) mod scan;
+pub(crate) mod scratch;
 #[doc(hidden)]
 pub mod tag_expr;
 pub mod write;

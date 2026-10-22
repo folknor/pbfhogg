@@ -55,8 +55,13 @@ fn write_nodes_blocks(path: &std::path::Path, blocks: &[usize]) {
     let header = block_builder::HeaderBuilder::new()
         .build()
         .expect("build header");
-    let mut writer =
-        PbfWriter::to_path(path, Compression::default(), &header).expect("create writer");
+    let mut writer = PbfWriter::to_path(
+        path,
+        Compression::default(),
+        &header,
+        pbfhogg::host::Executor::Ambient,
+    )
+    .expect("create writer");
     let mut bb = BlockBuilder::new();
     let mut next_id: i64 = 1;
     for &count in blocks {

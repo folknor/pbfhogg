@@ -172,8 +172,8 @@ pub fn merge_changes(
 
     // Build a scoped rayon pool when the caller passed an explicit `jobs`.
     // Pool controls par_iter and par_chunks thread count for both the
-    // streaming and simplify paths. When `jobs` is None, the global rayon
-    // pool is used (current default behaviour).
+    // streaming and simplify paths. When `jobs` is None, the host's executor
+    // is used (rayon's ambient pool under `Executor::Ambient`).
     let pool = if jobs.is_some() {
         Some(
             rayon::ThreadPoolBuilder::new()
@@ -236,9 +236,15 @@ pub fn merge_changes(
             Some(crate::path_guard::PathGuard::file(output.to_path_buf()))
         };
 
+        // The one whole-body executor install in the library. Everywhere
+        // else `install` wraps only a parallel computation, so that no
+        // `PbfWriter` producer ends up on a pool worker; `do_work` writes
+        // OSC XML and drives no `PbfWriter`, so wrapping all of it puts no
+        // producer on a worker. Under `Executor::Ambient` (the CLI) this is a
+        // direct call, exactly as before.
         let result = match &pool {
             Some(p) => p.install(|| do_work(write_path)),
-            None => do_work(write_path),
+            None => host.executor.install(|| do_work(write_path)),
         }
         .map_err(|s| -> Box<dyn std::error::Error> { s.into() })?;
 

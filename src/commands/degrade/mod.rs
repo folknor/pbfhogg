@@ -1194,6 +1194,7 @@ fn run_kind_phase(
                             writer,
                             flags.strip_indexdata,
                             flags.strip_tagdata,
+                            &host.executor,
                         ) {
                             Ok(written) => blobs += written,
                             Err(e) => {
@@ -1238,6 +1239,7 @@ fn run_kind_phase(
                         writer,
                         flags.strip_indexdata,
                         flags.strip_tagdata,
+                        &host.executor,
                     ) {
                         Ok(written) => blobs += written,
                         Err(e) => {
@@ -1278,6 +1280,7 @@ fn run_kind_phase(
             writer,
             flags.strip_indexdata,
             flags.strip_tagdata,
+            &host.executor,
         )?;
         blobs += written;
     }
@@ -1578,41 +1581,44 @@ fn frame_and_write_batch(
     writer: &mut PbfWriter<FileWriter>,
     strip_indexdata: bool,
     strip_tagdata: bool,
+    executor: &crate::host::Executor,
 ) -> std::result::Result<u64, Box<dyn std::error::Error>> {
     use rayon::prelude::*;
 
-    let framed: Vec<std::io::Result<Vec<u8>>> = batch
-        .into_par_iter()
-        .map(
-            |OwnedBlock {
-                 bytes: block_bytes,
-                 index,
-                 tagdata,
-                 way_members,
-             }|
-             -> std::io::Result<Vec<u8>> {
-                let indexdata_buf = index.serialize();
-                let indexdata = if strip_indexdata {
-                    None
-                } else {
-                    Some(indexdata_buf.as_slice())
-                };
-                let tagdata = if strip_tagdata {
-                    None
-                } else {
-                    tagdata.as_deref()
-                };
-                let blob = frame_blob_pipelined(
-                    &block_bytes,
-                    &compression,
-                    indexdata,
-                    tagdata,
-                    way_members.as_deref(),
-                )?;
-                Ok(blob.into_vec())
-            },
-        )
-        .collect();
+    let framed: Vec<std::io::Result<Vec<u8>>> = executor.install(|| {
+        batch
+            .into_par_iter()
+            .map(
+                |OwnedBlock {
+                     bytes: block_bytes,
+                     index,
+                     tagdata,
+                     way_members,
+                 }|
+                 -> std::io::Result<Vec<u8>> {
+                    let indexdata_buf = index.serialize();
+                    let indexdata = if strip_indexdata {
+                        None
+                    } else {
+                        Some(indexdata_buf.as_slice())
+                    };
+                    let tagdata = if strip_tagdata {
+                        None
+                    } else {
+                        tagdata.as_deref()
+                    };
+                    let blob = frame_blob_pipelined(
+                        &block_bytes,
+                        &compression,
+                        indexdata,
+                        tagdata,
+                        way_members.as_deref(),
+                    )?;
+                    Ok(blob.into_vec())
+                },
+            )
+            .collect()
+    });
 
     let mut written: u64 = 0;
     for r in framed {

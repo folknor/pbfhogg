@@ -526,7 +526,7 @@ fn smart_includes_boundary_node_members() {
     );
     assert_eq!(relation_ids(&c), vec![301]);
 
-    // The smart-contribution branch of `ExtractStats::print_summary`
+    // The smart-contribution branch of `ExtractStats::write_summary`
     // fires precisely when at least one node or way came from a
     // relation. Confirm the summary used that branch.
     assert!(

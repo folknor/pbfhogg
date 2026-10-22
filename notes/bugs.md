@@ -136,7 +136,7 @@ Reported by: re-encoding.
 
 `DegradeFlags::any()` includes `drop_ids`; the error text listing the flags
 does not. The flag list is spelled at four sites (`any()`, `needs_decode()`,
-the error text, the `applied` list in `print_summary`) plus the CLI, and they
+the error text, the `applied` list in `write_summary`) plus the CLI, and they
 have already diverged. Generate the text from one `(field, flag name)` table,
 or test that the error text names every field.
 
@@ -618,9 +618,10 @@ scratch sibling (`.pbfhogg-tmp-<pid>-<seq>.<name>`) before calling
 ("`  [i] {name}: N elements`", single-pass) print `slot.output`. The operator
 sees dot-prefixed temporary names that no longer exist after commit; the CLI
 then prints a second, correct summary from `final_paths`, so single-pass runs
-report every region twice under two names. Falls out of HYG-019; short of
-that, carry a display name in `ExtractSlot`. Testable via a `CliInvoker`
-stderr assertion.
+report every region twice under two names. The library lines are now
+`Diagnostics` events (`extract.multi.slot`, `extract.multi.slot_counts`), but
+their text still carries the scratch name; carry a display name in
+`ExtractSlot`. Testable via a `CliInvoker` stderr assertion.
 
 Reported by: filtering and spatial.
 
@@ -964,37 +965,6 @@ regression on Denmark reads as "data missing".
 
 Reported by: test harness.
 
-## BUG-066 - `PbfWriter`'s rayon framing tasks can abort the process or deadlock `flush()`
-
-The write pools now join every thread they start before returning (the
-parallel_writer detach is fixed), but `writer.rs` hands blob framing to three
-`rayon::spawn` sites that are not joined. They never touch the output file, so
-they cannot corrupt it, but: a panic inside a framing task goes to rayon's panic
-handler, which aborts the process by default; and a normal `flush()` can
-deadlock on a single-thread rayon pool, because the writer thread's channel only
-closes once the framing tasks finish and those tasks cannot run while the pool's
-one thread is blocked in `flush()`. Waiting for the tasks from `flush` or `Drop`
-is not the fix - it deadlocks the same way when the `PbfWriter` is driven from
-inside rayon. Needs cooperative scheduling or structured execution of framing
-work. Relevant to library use (bz pbfhogg#1): a caller choosing its own rayon
-pool size can hit it.
-
-Also in the write path: `uring_writer`'s `drain_best_effort` gives up after a
-fixed number of error rounds, and each `submit_and_wait(1)` can block
-indefinitely, so its shutdown is not guaranteed clean.
-
-Reported by: write path.
-
-## BUG-067 - `eprintln!` panics when stderr's reader goes away
-
-`eprintln!` panics on a write error, so `pbfhogg sort ... 2>&1 | head` exits 101
-once `head` closes the pipe. The stdout half of this class is fixed (the CLI
-writes through `cli/src/output.rs`, where EPIPE becomes a silent exit 0); the
-library still calls `eprintln!` from about 40 files (see HYG-019). The audit of
-the library's stderr use for library consumers is tracked in bz as pbfhogg#1.
-
-Reported by: CLI and plumbing.
-
 ## BUG-068 - apply-changes prints its summary twice
 
 `apply_changes::merge` prints the summary in `rewrite.rs`, and the CLI's
@@ -1023,7 +993,18 @@ Reported by: library-use implementation survey.
   should sort or `--force` the osmium roundtrip) unless the refusal itself
   is judged wrong for files osmium just wrote in order.
 
-Neither arm is touched by the library-use bricks; the spec's verify gate
-for them is read as "same arms pass as at `fa94c6c7`".
+Neither arm is touched by the library-use bricks; their verify gate was read
+as "same arms pass as at `fa94c6c7`", and both arms failed with the same
+signatures at every brick through B5 (2026-10-22).
 
 Reported by: library-use adjudication, B1 and B2 gating.
+
+## BUG-070 - `uring_writer` shutdown is not guaranteed to finish
+
+`uring_writer`'s `drain_best_effort` gives up after a fixed number of error
+rounds, and each `submit_and_wait(1)` can block indefinitely, so its
+shutdown is not guaranteed clean. Split out of the former `PbfWriter` framing
+entry, whose deadlock half the library-use executor work fixed; this half is
+not a process-ownership question and was out of that scope.
+
+Reported by: write path.

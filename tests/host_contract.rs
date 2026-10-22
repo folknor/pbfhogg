@@ -210,6 +210,236 @@ fn unrecognised_indexdata_warning_is_per_handle() {
         assert_eq!(sink.0.lock().expect("sink").len(), expected);
     }
 }
+fn one_thread_pool() -> Arc<rayon::ThreadPool> {
+    Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("pool"),
+    )
+}
+/// A minimal but real PrimitiveBlock: one empty PrimitiveGroup (field 2).
+const EMPTY_BLOCK: [u8; 2] = [0x12, 0x00];
+fn empty_header() -> Vec<u8> {
+    pbfhogg::block_builder::HeaderBuilder::new()
+        .build()
+        .expect("header")
+}
+fn count_data_blobs(path: &std::path::Path) -> usize {
+    pbfhogg::BlobReader::from_path(path)
+        .expect("reader")
+        .filter(|blob| blob.as_ref().expect("blob").get_type() == pbfhogg::BlobType::OsmData)
+        .count()
+}
+/// More blocks than the writer has dispatch permits, so the producer must
+/// wait for framing work queued on its own (only) thread.
+const POOL_BLOCKS: usize = 200;
+#[test]
+fn writer_on_a_one_thread_pool_flushes() {
+    let dir = tempfile::tempdir().expect("directory");
+    let path = dir.path().join("pool.pbf");
+    let pool = one_thread_pool();
+    pool.install(|| -> std::io::Result<()> {
+        let mut writer = pbfhogg::writer::PbfWriter::to_path(
+            &path,
+            Default::default(),
+            &empty_header(),
+            pbfhogg::host::Executor::Pool(Arc::clone(&pool)),
+        )?;
+        for _ in 0..POOL_BLOCKS {
+            writer.write_primitive_block(&EMPTY_BLOCK)?;
+        }
+        writer.flush()
+    })
+    .expect("flush on a one-thread pool");
+    assert_eq!(count_data_blobs(&path), POOL_BLOCKS);
+}
+#[test]
+fn writer_on_a_one_thread_pool_drops_unflushed() {
+    let dir = tempfile::tempdir().expect("directory");
+    let path = dir.path().join("dropped.pbf");
+    let pool = one_thread_pool();
+    // Completing at all is the assertion: a blocking join from the pool's
+    // only thread would never let the queued framing work run.
+    pool.install(|| -> std::io::Result<()> {
+        let mut writer = pbfhogg::writer::PbfWriter::to_path(
+            &path,
+            Default::default(),
+            &empty_header(),
+            pbfhogg::host::Executor::Pool(Arc::clone(&pool)),
+        )?;
+        for _ in 0..POOL_BLOCKS {
+            writer.write_primitive_block(&EMPTY_BLOCK)?;
+        }
+        drop(writer);
+        Ok(())
+    })
+    .expect("writes on a one-thread pool");
+}
+#[test]
+fn ambient_writer_inside_a_foreign_pool_flushes() {
+    let dir = tempfile::tempdir().expect("directory");
+    let path = dir.path().join("ambient.pbf");
+    one_thread_pool()
+        .install(|| -> std::io::Result<()> {
+            let mut writer = pbfhogg::writer::PbfWriter::to_path(
+                &path,
+                Default::default(),
+                &empty_header(),
+                pbfhogg::host::Executor::Ambient,
+            )?;
+            for _ in 0..POOL_BLOCKS {
+                writer.write_primitive_block(&EMPTY_BLOCK)?;
+            }
+            writer.flush()
+        })
+        .expect("flush under Ambient inside a one-thread pool");
+    assert_eq!(count_data_blobs(&path), POOL_BLOCKS);
+}
+#[cfg(feature = "test-hooks")]
+#[test]
+fn swallowed_framing_panic_surfaces_at_flush() {
+    let dir = tempfile::tempdir().expect("directory");
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .panic_handler(|_| {})
+            .build()
+            .expect("pool"),
+    );
+    let mut writer = pbfhogg::writer::PbfWriter::to_path(
+        &dir.path().join("panic.pbf"),
+        Default::default(),
+        &empty_header(),
+        pbfhogg::host::Executor::Pool(pool),
+    )
+    .expect("writer");
+    writer.test_panic_in_framing_at(3);
+    for _ in 0..10 {
+        writer.write_primitive_block(&EMPTY_BLOCK).expect("write");
+    }
+    let err = writer
+        .flush()
+        .expect_err("a swallowed framing panic must not flush as a complete file");
+    assert!(
+        err.to_string()
+            .contains("an upstream framer dropped without sending an earlier seq"),
+        "got: {err}"
+    );
+}
+/// A swallowed panic must return its permit even when flush itself has to
+/// run the framing job on the pool's only worker. Cover an interior gap, a
+/// missing tail, and a stream whose only task panics.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn swallowed_framing_panics_on_one_worker_fail_flush() {
+    let dir = tempfile::tempdir().expect("directory");
+    let panics = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&panics);
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .panic_handler(move |_| {
+                seen.fetch_add(1, Relaxed);
+            })
+            .build()
+            .expect("pool"),
+    );
+    for (count, panic_at, message) in [
+        (10, 3, "earlier seq"),
+        (10, 9, "final seq"),
+        (1, 0, "final seq"),
+    ] {
+        pool.install(|| {
+            let mut writer = pbfhogg::writer::PbfWriter::to_path(
+                &dir.path().join(format!("panic-{count}-{panic_at}.pbf")),
+                Default::default(),
+                &empty_header(),
+                pbfhogg::host::Executor::Pool(Arc::clone(&pool)),
+            )
+            .expect("writer");
+            writer.test_panic_in_framing_at(panic_at);
+            for _ in 0..count {
+                writer.write_primitive_block(&EMPTY_BLOCK).expect("write");
+            }
+            let err = writer.flush().expect_err("the output is incomplete");
+            assert!(err.to_string().contains(message), "got: {err}");
+        });
+    }
+    assert_eq!(
+        panics.load(Relaxed),
+        3,
+        "every panic reaches the caller's handler"
+    );
+}
+fn run_external_join(output: &std::path::Path, host: &pbfhogg::host::Host) -> Result<(), String> {
+    pbfhogg::altw::external::external_join(
+        input(),
+        output,
+        true,
+        Default::default(),
+        false,
+        false,
+        &Default::default(),
+        false,
+        host,
+    )
+    .map(drop)
+    .map_err(|e| e.to_string())
+}
+#[test]
+fn concurrent_external_joins_use_distinct_scratch() {
+    let dir = tempfile::tempdir().expect("directory");
+    let host = crate::common::test_host();
+    let reference = dir.path().join("reference.pbf");
+    run_external_join(&reference, &host).expect("sequential external join");
+    // Both outputs share one parent, so both runs place their scratch
+    // directory beside each other under the same pid.
+    let outputs = [dir.path().join("a.pbf"), dir.path().join("b.pbf")];
+    struct Overlap(std::sync::Barrier);
+    impl ProcessActions for Overlap {
+        fn cross_thread_alloc_pool(&self) {}
+        fn fd_allowance(&self, _wanted: u64) -> FdAllowance {
+            self.0.wait();
+            pbfhogg::process::current_nofile()
+        }
+    }
+    let mut host = host;
+    host.process = Arc::new(Overlap(std::sync::Barrier::new(2)));
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = outputs
+            .iter()
+            .map(|output| scope.spawn(|| run_external_join(output, &host)))
+            .collect();
+        for handle in handles {
+            handle
+                .join()
+                .expect("external join thread")
+                .expect("concurrent external join");
+        }
+    });
+    let expected = crate::common::read_all_elements_with_coords(&reference);
+    for output in &outputs {
+        let got = crate::common::read_all_elements_with_coords(output);
+        assert_eq!(got.nodes, expected.nodes, "{}", output.display());
+        assert_eq!(got.ways, expected.ways, "{}", output.display());
+        assert_eq!(got.relations, expected.relations, "{}", output.display());
+    }
+}
+#[test]
+fn scratch_parent_override_is_honoured() {
+    let dir = tempfile::tempdir().expect("directory");
+    let missing = dir.path().join("missing");
+    let mut host = crate::common::test_host();
+    host.scratch_parent = Some(missing.clone());
+    let err = run_external_join(&dir.path().join("out.pbf"), &host)
+        .expect_err("a missing scratch parent must fail the run");
+    assert!(
+        err.contains(&missing.display().to_string()),
+        "the error must name the scratch parent, got: {err}"
+    );
+    assert!(!missing.exists(), "the scratch parent must not be created");
+}
 #[test]
 fn fixed_memory_routes_auto_to_external() {
     let dir = tempfile::tempdir().expect("directory");
@@ -247,4 +477,93 @@ fn fixed_memory_routes_auto_to_external() {
             .any(|(key, text)| key == "altw.auto_select"
                 && text.starts_with("auto-selected --index-type external"))
     );
+}
+
+/// The override must reach every scratch-producing backend, including both
+/// derive paths and text diff's shards, rather than only external altw.
+#[test]
+fn scratch_parent_override_reaches_sparse_diff_and_derive() {
+    let dir = tempfile::tempdir().expect("directory");
+    let scratch = dir.path().join("scratch");
+    let missing = dir.path().join("missing");
+    std::fs::create_dir(&scratch).expect("scratch directory");
+    for (command, jobs) in [("sparse", 1), ("text", 2), ("osc", 1), ("osc", 2)] {
+        let output = dir.path().join(format!("{command}-{jobs}.out"));
+        let mut host = crate::common::test_host();
+        for parent in [&missing, &scratch] {
+            host.scratch_parent = Some(parent.clone());
+            let result = run_scratch_backend(command, jobs, &output, &host);
+            if parent == &missing {
+                let err = result.expect_err("the scratch parent must exist");
+                assert!(
+                    err.contains(&missing.display().to_string()),
+                    "{command}: {err}"
+                );
+                assert!(!missing.exists());
+            } else {
+                result.expect("valid scratch override");
+                assert_eq!(
+                    std::fs::read_dir(&scratch).expect("scratch").count(),
+                    0,
+                    "{command} must remove its scratch fragments"
+                );
+            }
+        }
+    }
+}
+
+fn run_scratch_backend(
+    command: &str,
+    jobs: usize,
+    output: &std::path::Path,
+    host: &pbfhogg::host::Host,
+) -> Result<(), String> {
+    let changed = std::path::Path::new("tests/fixtures/host_identity/inputs/changed.osm.pbf");
+    match command {
+        "text" => {
+            let options = pbfhogg::diff::DiffOptions {
+                suppress_common: false,
+                verbose: false,
+                summary: false,
+                type_filter: None,
+                jobs,
+            };
+            pbfhogg::diff::diff(input(), changed, &mut Vec::new(), &options, false, host)
+                .map(drop)
+                .map_err(|e| e.to_string())
+        }
+        "osc" => pbfhogg::diff::derive::derive_changes(
+            input(),
+            changed,
+            output,
+            false,
+            false,
+            false,
+            jobs,
+            host,
+        )
+        .map(drop)
+        .map_err(|e| e.to_string()),
+        "sparse" => {
+            let options = pbfhogg::altw::AltwOptions {
+                keep_untagged_nodes: true,
+                compression: Default::default(),
+                direct_io: false,
+                force: false,
+                index_type: pbfhogg::altw::IndexType::Sparse,
+                inject_prepass: false,
+                ignore_missing_nodes: false,
+            };
+            pbfhogg::altw::add_locations_to_ways(
+                input(),
+                output,
+                &options,
+                &Default::default(),
+                host,
+            )
+            .map(drop)
+            .map_err(|e| e.to_string())
+        }
+        _ => unreachable!("test backend"),
+    }
 }

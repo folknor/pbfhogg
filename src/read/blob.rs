@@ -372,8 +372,10 @@ pub struct BlobReader<R: Read + Send> {
     parse_waymembers: bool,
     /// File descriptor for fadvise(DONTNEED) after each blob read. When set,
     /// the reader evicts page cache pages behind the read head, preventing
-    /// sequential reads from accumulating the entire file in RSS.
-    /// Only set for buffered FileReader - O_DIRECT has no pages to evict.
+    /// sequential reads from accumulating the entire file in the page cache.
+    /// Only set for buffered FileReader - O_DIRECT has no pages to evict - and
+    /// only when the caller opted in (`evict_page_cache(true)` or a host with
+    /// `PageCachePolicy::Evict`).
     #[cfg(target_os = "linux")]
     evict_fd: Option<std::os::unix::io::RawFd>,
     /// Count of `posix_fadvise(DONTNEED)` calls this reader has issued.
@@ -389,6 +391,13 @@ pub struct BlobReader<R: Read + Send> {
 }
 
 impl<R: Read + Send> BlobReader<R> {
+    /// Attach per-run diagnostics to this reader.
+    #[must_use]
+    pub fn diagnostics(mut self, diagnostics: crate::host::Diagnostics) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+
     /// Creates a new `BlobReader`.
     ///
     /// # Example
@@ -405,13 +414,6 @@ impl<R: Read + Send> BlobReader<R> {
     /// # }
     /// # foo().unwrap();
     /// ```
-    /// Attach per-run diagnostics to this reader.
-    #[must_use]
-    pub fn diagnostics(mut self, diagnostics: crate::host::Diagnostics) -> Self {
-        self.diagnostics = diagnostics;
-        self
-    }
-
     pub fn new(reader: R) -> BlobReader<R> {
         BlobReader {
             reader,
@@ -641,25 +643,25 @@ fn buffered_evict_fd(reader: &FileReader) -> Option<std::os::unix::io::RawFd> {
 impl BlobReader<FileReader> {
     /// Enable or disable page-cache eviction behind the read head.
     ///
-    /// The file-backed constructors advise `POSIX_FADV_DONTNEED` over the
-    /// consumed prefix after every blob, which is what keeps a sequential pass
-    /// over a 90 GB planet file from pulling the whole file into RSS. That
-    /// default is right for the streaming one-pass workloads this library is
-    /// built for, but it is a *global* effect: the page cache is shared, so a
-    /// second pass over the same file - a two-pass command, a test suite, an
-    /// `osmium` running alongside - is guaranteed to read cold. Until now there
-    /// was no way to say no short of switching to O_DIRECT, which is a
-    /// different I/O mode entirely.
+    /// When enabled, a buffered reader advises `POSIX_FADV_DONTNEED` over the
+    /// consumed prefix after every blob, which keeps a sequential pass over a
+    /// 90 GB planet file from pulling the whole file into the page cache and
+    /// displacing everything else there. It is a *global* effect: the page
+    /// cache is shared, so a second pass over the same file - a two-pass
+    /// command, a test suite, an `osmium` running alongside - then reads cold.
+    /// That is why the default is to keep: the file constructors leave the page
+    /// cache alone, and eviction is something the caller opts into for one-pass
+    /// reads of files larger than RAM.
     ///
-    /// Passing `false` leaves the page cache alone. Passing `true` restores the
-    /// default. Re-enabling has no effect on an O_DIRECT reader, which has no
-    /// cached pages to drop, and the whole method is a no-op off Linux.
+    /// Passing `true` enables eviction, `false` disables it again. Enabling has
+    /// no effect on an O_DIRECT reader, which has no cached pages to drop, and
+    /// the whole method is a no-op off Linux.
     ///
     /// ```
     /// # fn foo() -> pbfhogg::Result<()> {
-    /// // Keep the file warm for a second pass.
+    /// // A one-pass read of a file larger than RAM.
     /// let reader = pbfhogg::BlobReader::from_path("tests/test.osm.pbf")?
-    ///     .evict_page_cache(false);
+    ///     .evict_page_cache(true);
     /// # Ok(())
     /// # }
     /// # foo().unwrap();
@@ -687,10 +689,13 @@ impl BlobReader<FileReader> {
 
     /// How many `posix_fadvise(DONTNEED)` calls this reader has issued so far.
     ///
-    /// Crate-internal: lets a test distinguish a reader that never evicted from
-    /// one that evicted and was then switched off.
+    /// Crate-internal: lets a test tell what the kernel was actually asked to
+    /// drop, which the armed-or-not state of the reader cannot show.
     #[cfg(target_os = "linux")]
-    #[allow(dead_code, reason = "read only from the reader.rs eviction test")]
+    #[allow(
+        dead_code,
+        reason = "read only from the blob.rs and reader.rs eviction tests"
+    )]
     pub(crate) fn evict_call_count(&self) -> u64 {
         self.evict_calls
     }
@@ -713,8 +718,6 @@ impl BlobReader<FileReader> {
     /// ```
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let reader = FileReader::buffered(path.as_ref())?;
-        #[cfg(target_os = "linux")]
-        let evict_fd = buffered_evict_fd(&reader);
         Ok(BlobReader {
             reader,
             offset: Some(ByteOffset(0)),
@@ -727,7 +730,7 @@ impl BlobReader<FileReader> {
             parse_indexdata: true,
             parse_waymembers: false,
             #[cfg(target_os = "linux")]
-            evict_fd,
+            evict_fd: None,
             #[cfg(target_os = "linux")]
             evict_calls: 0,
         })
@@ -756,19 +759,23 @@ impl BlobReader<FileReader> {
         })
     }
 
-    /// Open a file, selecting buffered or O_DIRECT based on the `direct` flag.
+    /// Open a file for a command run under `host`: buffered or O_DIRECT per
+    /// `direct`, with the host's diagnostics and page-cache policy.
     pub(crate) fn open_in<P: AsRef<Path>>(
         path: P,
         direct: bool,
         host: &crate::host::Host,
     ) -> Result<Self> {
-        Self::open(path, direct).map(|r| r.diagnostics(host.diagnostics.clone()))
+        Self::open(path, direct).map(|r| {
+            r.diagnostics(host.diagnostics.clone())
+                .evict_page_cache(host.page_cache == crate::host::PageCachePolicy::Evict)
+        })
     }
 
+    /// Open a file, selecting buffered or O_DIRECT based on the `direct` flag.
+    /// The page cache is left alone; see [`BlobReader::evict_page_cache`].
     pub fn open<P: AsRef<Path>>(path: P, direct: bool) -> Result<Self> {
         let reader = FileReader::open(path.as_ref(), direct)?;
-        #[cfg(target_os = "linux")]
-        let evict_fd = buffered_evict_fd(&reader);
         Ok(BlobReader {
             reader,
             offset: Some(ByteOffset(0)),
@@ -781,7 +788,7 @@ impl BlobReader<FileReader> {
             parse_indexdata: true,
             parse_waymembers: false,
             #[cfg(target_os = "linux")]
-            evict_fd,
+            evict_fd: None,
             #[cfg(target_os = "linux")]
             evict_calls: 0,
         })
@@ -853,8 +860,10 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
         // copied into owned buffers (blob_data Vec above), the kernel's cached
         // pages for the consumed byte range are never accessed again. Advising
         // DONTNEED prevents sequential reads from accumulating the entire file
-        // in RSS - critical for 30+ GB PBFs on memory-constrained hosts.
-        // Opt out with `BlobReader::evict_page_cache(false)`.
+        // in the page cache - critical for 30+ GB PBFs on memory-constrained
+        // hosts. Off unless the caller opts in with
+        // `BlobReader::evict_page_cache(true)` or a host with
+        // `PageCachePolicy::Evict`.
         //
         // The advised range is the whole consumed prefix `0..offset`, re-issued
         // per blob, where `prev_offset..offset` would express the same intent
@@ -1361,40 +1370,45 @@ mod tests {
         }
     }
 
-    /// `evict_page_cache(false)` must actually disarm the eviction, and must
-    /// not change what the reader delivers.
+    /// Public file readers leave the page cache alone unless the caller asks,
+    /// and asking does not change what the reader delivers.
     ///
-    /// The default is on, so the opt-out is only worth having if it is
-    /// observable: the assertion is on the `evict_fd` the syscall reads, not on
-    /// the blob count alone, which would pass just as well against a method
-    /// that did nothing at all.
+    /// The assertion is on the fadvise call count the reader actually issued,
+    /// not on the element count alone, which would pass just as well against
+    /// a builder that did nothing at all.
     #[cfg(target_os = "linux")]
     #[test]
-    fn evict_page_cache_opt_out_disarms_eviction_without_changing_the_read() {
+    fn public_readers_keep_the_page_cache_unless_asked() {
+        fn element_count(reader: &mut BlobReader<FileReader>) -> usize {
+            reader
+                .map(|blob| match blob.unwrap().decode().unwrap() {
+                    BlobDecode::OsmData(block) => block.elements().count(),
+                    _ => 0,
+                })
+                .sum()
+        }
         let path = std::path::Path::new("tests/test.osm.pbf");
 
-        let default_on = BlobReader::from_path(path).unwrap();
-        assert!(
-            default_on.evict_fd.is_some(),
-            "buffered file reads must evict by default"
+        let mut kept = BlobReader::from_path(path).unwrap();
+        let kept_elements = element_count(&mut kept);
+        assert_eq!(
+            kept.evict_call_count(),
+            0,
+            "a public reader must not evict by default"
         );
 
-        let off = BlobReader::from_path(path).unwrap().evict_page_cache(false);
-        assert!(off.evict_fd.is_none(), "opting out must clear the fd");
-
-        let back_on = off.evict_page_cache(true);
+        let mut evicted = BlobReader::from_path(path).unwrap().evict_page_cache(true);
+        let evicted_elements = element_count(&mut evicted);
         assert!(
-            back_on.evict_fd.is_some(),
-            "re-enabling must restore the fd"
+            evicted.evict_call_count() > 0,
+            "evict_page_cache(true) must evict behind the read head"
         );
 
-        let with = BlobReader::from_path(path).unwrap().count();
-        let without = BlobReader::from_path(path)
-            .unwrap()
-            .evict_page_cache(false)
-            .count();
-        assert_eq!(with, without, "eviction must not change what is delivered");
-        assert!(with > 1, "the fixture must contain more than one blob");
+        assert_eq!(
+            kept_elements, evicted_elements,
+            "eviction must not change what is delivered"
+        );
+        assert!(kept_elements > 0, "the fixture must contain elements");
     }
 
     /// Hand-encode `[4-byte BE header_len][BlobHeader]` for an `OSMData` blob

@@ -18,38 +18,18 @@ use std::thread::JoinHandle;
 ///
 /// # Why this equals [`PIPELINE_DISPATCH_PERMITS`]
 ///
-/// This is a liveness bound, not a memory bound. Memory is already bounded by
-/// the permit pool, and a *second*, smaller bound here does not save anything -
-/// it only creates a deadlock.
+/// The channel has room for one full batch of dispatches. Permits bound tasks
+/// dispatched but not yet sent: each sender returns its permit after sending,
+/// even while its item is still buffered. They therefore do not bound channel
+/// occupancy together with active tasks, or items held in the reorder buffer.
 ///
-/// The shape of that deadlock: rayon framing closures block in `tx.send` while
-/// holding a rayon worker thread, and the writer thread pops strictly in seq
-/// order. Let the task for seq *k* still be sitting in rayon's injector queue
-/// while later-seq results fill the channel and every remaining rayon thread
-/// blocks in `send`. Nothing can progress - the writer waits for *k*, and *k*
-/// cannot be stolen, because every thread that could run it is parked inside a
-/// `send`. The old 32-slot channel made this reachable at a reorder distance of
-/// 33, and the only thing standing between the pipeline and a hung
-/// planet-scale write was that rayon's FIFO injector *tends* to start spawns in
-/// order. That is an observed habit of a third-party scheduler, not a
-/// documented guarantee, and "very unlikely" is not a liveness argument.
+/// A send can block on a full channel while the writer is inside `write_chunk`.
+/// This cannot create a scheduling deadlock with framing: the writer uses a
+/// dedicated OS thread and receives items into its `ReorderBuffer` without
+/// waiting for a particular seq. It can drain the channel even when all rayon
+/// workers are blocked in sends. Only writing ready items is ordered by seq.
 ///
-/// Sizing the channel to the permit count removes the possibility outright,
-/// with an argument that needs to know nothing about how rayon schedules:
-///
-/// * every send path holds a dispatch permit across its send, so the number of
-///   produced-but-not-yet-delivered items never exceeds
-///   `PIPELINE_DISPATCH_PERMITS`;
-/// * a sender that is *about* to send holds one of those permits itself, so at
-///   most `PIPELINE_DISPATCH_PERMITS - 1` items can already be buffered;
-/// * with `WRITE_AHEAD >= PIPELINE_DISPATCH_PERMITS` the channel therefore
-///   always has a free slot for it, so **no send can ever block on a full
-///   channel**, so no thread can be parked holding work the writer is waiting
-///   for.
-///
-/// Backpressure is unchanged: it now comes entirely from `permit_rx.recv()` on
-/// the producer thread, which is where it belonged. Peak memory is unchanged
-/// too, because the permits - not the channel - were always the real cap.
+/// Backpressure comes from both the producer's permit wait and channel sends.
 pub(crate) const WRITE_AHEAD: usize = PIPELINE_DISPATCH_PERMITS;
 
 /// Maximum number of in-flight rayon dispatches in the pipelined writer.
@@ -68,17 +48,12 @@ pub(crate) const WRITE_AHEAD: usize = PIPELINE_DISPATCH_PERMITS;
 /// compared to the 2.79 GB stage-2b peak.
 pub(crate) const PIPELINE_DISPATCH_PERMITS: usize = 64;
 
-/// The pipeline's liveness invariant, enforced at compile time.
-///
-/// A channel smaller than the permit pool lets a sender block on a full
-/// channel, and a blocked rayon worker cannot run the earlier-seq task the
-/// writer thread is waiting for. See [`WRITE_AHEAD`] for the full argument.
-/// Anyone who lowers `WRITE_AHEAD` or raises `PIPELINE_DISPATCH_PERMITS` in
-/// isolation gets a build failure rather than an intermittent hang.
+/// Keep room for a full batch of dispatches when changing either capacity.
+/// This is a buffering choice; liveness comes from the writer's independent,
+/// unordered receive loop, as described in [`WRITE_AHEAD`].
 const _: () = assert!(
     WRITE_AHEAD >= PIPELINE_DISPATCH_PERMITS,
-    "WRITE_AHEAD must be at least PIPELINE_DISPATCH_PERMITS or a full channel \
-     can deadlock the pipeline"
+    "WRITE_AHEAD must have room for a full batch of dispatches"
 );
 
 /// One unit of output the writer thread can consume, independent of backend.
@@ -257,8 +232,9 @@ pub(super) struct WritePipeline {
     pub(super) seq: usize,
     pub(super) join_handle: Option<JoinHandle<io::Result<()>>>,
     /// Counting-semaphore permit pool bounding in-flight rayon dispatches.
-    /// Main thread `recv()`s a permit before `rayon::spawn`; the rayon
-    /// closure `send()`s a permit back when its work completes. See
+    /// The producer takes a permit ([`recv_permit`]) before spawning on the
+    /// executor; the framing closure `send()`s it back when its work
+    /// completes. See
     /// [`PIPELINE_DISPATCH_PERMITS`] for the memory-bound rationale.
     pub(super) permit_tx: SyncSender<()>,
     pub(super) permit_rx: Receiver<()>,
@@ -267,12 +243,102 @@ pub(super) struct WritePipeline {
     pub(super) expected: SeqTotal,
     /// Death notice from the framing closures; see [`WriterGone`].
     pub(super) writer_gone: WriterGone,
+    /// Where the framing closures run, and whether the producer is on one of
+    /// its workers (see [`recv_permit`]).
+    pub(super) executor: crate::host::Executor,
+    /// Test hook: the framing closure for this seq panics before framing.
+    #[cfg(feature = "test-hooks")]
+    pub(super) framing_panic_at: Option<usize>,
+}
+
+impl WritePipeline {
+    /// A pipeline over a freshly spawned writer thread, with a full permit
+    /// pool and nothing sent yet.
+    pub(super) fn new(
+        tx: SyncSender<PipelineItem>,
+        join_handle: JoinHandle<io::Result<()>>,
+        expected: SeqTotal,
+        executor: crate::host::Executor,
+    ) -> Self {
+        let (permit_tx, permit_rx) = new_permit_pool();
+        Self {
+            tx,
+            seq: 0,
+            join_handle: Some(join_handle),
+            permit_tx,
+            permit_rx,
+            expected,
+            writer_gone: WriterGone::new(),
+            executor,
+            #[cfg(feature = "test-hooks")]
+            framing_panic_at: None,
+        }
+    }
+}
+
+/// Take one dispatch permit.
+///
+/// Off the executor's workers - every CLI path - this is a plain blocking
+/// `recv`, today's path byte for byte. On a worker of the executor's pool a
+/// blocking `recv` could park the only thread able to run the framing work
+/// that returns the permit (a one-thread pool deadlocks outright), so the wait
+/// is cooperative: run the pool's pending jobs while none is free, and nap for
+/// a millisecond at a time when there are none. The cooperative time is added
+/// to `writer_coop_wait_ns`, which is therefore zero unless a `PbfWriter` is
+/// driven from a rayon worker.
+pub(super) fn recv_permit(
+    rx: &Receiver<()>,
+    executor: &crate::host::Executor,
+) -> Result<(), std::sync::mpsc::RecvError> {
+    use std::sync::mpsc::{RecvError, RecvTimeoutError, TryRecvError};
+    if !executor.on_worker() {
+        return rx.recv();
+    }
+    let start = std::time::Instant::now();
+    let result = loop {
+        match rx.try_recv() {
+            Ok(()) => break Ok(()),
+            Err(TryRecvError::Disconnected) => break Err(RecvError),
+            Err(TryRecvError::Empty) => match executor.yield_now() {
+                Some(rayon::Yield::Executed) => {}
+                Some(rayon::Yield::Idle) => {
+                    match rx.recv_timeout(std::time::Duration::from_millis(1)) {
+                        Ok(()) => break Ok(()),
+                        Err(RecvTimeoutError::Timeout) => {}
+                        Err(RecvTimeoutError::Disconnected) => break Err(RecvError),
+                    }
+                }
+                None => break rx.recv(),
+            },
+        }
+    };
+    WRITER_METRICS
+        .coop_wait_ns
+        .fetch_add(elapsed_ns_u64(start), Relaxed);
+    result
+}
+
+/// Take back every one of the [`PIPELINE_DISPATCH_PERMITS`] tokens through
+/// [`recv_permit`], which means every framing closure has finished. Stops
+/// early if the pool disconnects.
+///
+/// `flush` and `Drop` call this before joining the writer thread when the
+/// producer is on a worker of the executor's pool: the writer thread is
+/// waiting for items that framing closures queued on that pool are still to
+/// produce, and joining from the pool's only free thread would never let them
+/// run.
+pub(super) fn drain_permits(rx: &Receiver<()>, executor: &crate::host::Executor) {
+    for _ in 0..PIPELINE_DISPATCH_PERMITS {
+        if recv_permit(rx, executor).is_err() {
+            break;
+        }
+    }
 }
 
 /// Build a fresh permit pool pre-filled with `PIPELINE_DISPATCH_PERMITS`
 /// tokens. Called during pipelined-writer construction to seed the
 /// counting semaphore.
-pub(super) fn new_permit_pool() -> (SyncSender<()>, Receiver<()>) {
+fn new_permit_pool() -> (SyncSender<()>, Receiver<()>) {
     let (permit_tx, permit_rx) = sync_channel::<()>(PIPELINE_DISPATCH_PERMITS);
     for _ in 0..PIPELINE_DISPATCH_PERMITS {
         // `send` on a fresh channel with capacity = N can't fail or block
@@ -322,7 +388,8 @@ impl Drop for PermitGuard {
 /// failed send is a `Result` they can return - and `pipeline_send_error` in
 /// `writer.rs` joins the dead writer thread and surfaces its real cause.
 /// `write_primitive_block*` cannot:
-/// the send happens inside a `rayon::spawn` closure whose return value goes
+/// the send happens inside a framing closure spawned on the writer's
+/// `Executor`, whose return value goes
 /// nowhere, so it ended in `drop(tx.send(...))` and a writer thread that died
 /// on ENOSPC stayed invisible until `flush()`. Nothing throttles the producer
 /// either - the permit pool keeps handing out permits because the closures

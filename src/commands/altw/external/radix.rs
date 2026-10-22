@@ -31,19 +31,36 @@ pub(crate) const BUCKET_BUF_SIZE: usize = 256 * 1024;
 
 /// Managed scratch directory for bucket files. Cleaned up on drop.
 ///
-/// The directory name is `<parent>/.pbfhogg-<name>-<pid>`. `name` identifies
-/// the command that owns the scratch dir so concurrent runs of different
-/// commands don't collide, and so stale directories left behind by a crash
-/// are attributable.
+/// The directory name is `<parent>/.pbfhogg-<name>-<pid><suffix>`, the suffix
+/// coming from the run's [`RunToken`](crate::scratch::RunToken). `name`
+/// identifies the command that owns the scratch dir so concurrent runs of
+/// different commands don't collide, and so stale directories left behind by
+/// a crash are attributable; the pid and token separate concurrent runs of the
+/// same command across and within processes.
+///
+/// `parent` must exist: scratch goes into a directory, it does not create one.
+/// A directory already at the path (a crashed run whose pid was reused) is
+/// reused, as before.
 pub(crate) struct ScratchDir {
     pub(crate) path: PathBuf,
 }
 
 impl ScratchDir {
-    pub(crate) fn new(parent: &Path, name: &str) -> Result<Self> {
-        let path = parent.join(format!(".pbfhogg-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&path)
-            .map_err(|e| format!("failed to create scratch directory {}: {e}", path.display()))?;
+    pub(crate) fn new(parent: &Path, name: &str, token: &crate::scratch::RunToken) -> Result<Self> {
+        let path = parent.join(format!(
+            ".pbfhogg-{name}-{}{}",
+            std::process::id(),
+            token.suffix()
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {}
+            Err(e) => {
+                return Err(
+                    format!("failed to create scratch directory {}: {e}", path.display()).into(),
+                );
+            }
+        }
         Ok(Self { path })
     }
 

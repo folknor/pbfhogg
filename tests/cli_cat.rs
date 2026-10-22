@@ -4,7 +4,7 @@
 //! written via the stable-allowlist writers; `cat` runs through
 //! `CliInvoker`; output is verified by reading the resulting
 //! PBF with the stable-allowlist readers, with stats inspected
-//! through stderr (`CatStats::print_summary`). No imports from
+//! through stderr (`CatStats::write_summary`). No imports from
 //! `pbfhogg::cat::*` - a rewrite of `src/commands/cat/` cannot
 //! break these tests by type changes alone.
 
@@ -385,8 +385,13 @@ fn write_pbf_with_header(
         .replication_base_url(url)
         .build()
         .expect("build header");
-    let mut writer =
-        PbfWriter::to_path(path, Compression::default(), &header).expect("create writer");
+    let mut writer = PbfWriter::to_path(
+        path,
+        Compression::default(),
+        &header,
+        pbfhogg::host::Executor::Ambient,
+    )
+    .expect("create writer");
     let mut bb = BlockBuilder::new();
     bb.add_node(node_id, 0, 0, [("name", "x")], None);
     if let Some(bytes) = bb.take().expect("take") {

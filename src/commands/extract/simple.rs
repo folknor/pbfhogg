@@ -770,15 +770,17 @@ fn process_extract_pass2_batch(
     host: &crate::host::Host,
 ) -> Result<()> {
     type BatchResult = std::result::Result<(Vec<OwnedBlock>, ExtractStats), String>;
-    let results: Vec<BatchResult> = batch
-        .par_iter()
-        .map_init(BlockBuilder::new, |bb, block| {
-            let mut output: Vec<OwnedBlock> = Vec::new();
-            let block_stats = extract_block_pass2(block, ids, clean, None, bb, &mut output)?;
-            flush_local(bb, &mut output)?;
-            Ok((output, block_stats))
-        })
-        .collect();
+    let results: Vec<BatchResult> = host.executor.install(|| {
+        batch
+            .par_iter()
+            .map_init(BlockBuilder::new, |bb, block| {
+                let mut output: Vec<OwnedBlock> = Vec::new();
+                let block_stats = extract_block_pass2(block, ids, clean, None, bb, &mut output)?;
+                flush_local(bb, &mut output)?;
+                Ok((output, block_stats))
+            })
+            .collect()
+    });
 
     drain_batch_results(results, writer, |s| merge_extract_stats(stats, &s), host)?;
     Ok(())

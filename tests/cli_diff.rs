@@ -3,7 +3,7 @@
 //! Replaces the removed library-API `diff.rs` test. The OSC variant of diff (which is the
 //! `derive_changes` operation) lives in `cli_derive_changes.rs`.
 //! This file covers the default text-format output. Output goes to
-//! stdout; the `--summary` flag prints `DiffStats::print_summary` to
+//! stdout; the `--summary` flag prints `DiffStats::write_summary` to
 //! stderr in pbfhogg format ("`{total} differences: {created}
 //! created, {modified} modified, {deleted} deleted ({common} common)`"
 //! or "`Files are identical ({common} common elements)`"). All tests
@@ -114,7 +114,7 @@ fn run_diff_failing(old: &Path, new: &Path) -> crate::common::cli::CliOutput {
         .run()
 }
 
-/// Parse the summary line emitted by `DiffStats::print_summary`:
+/// Parse the summary line emitted by `DiffStats::write_summary`:
 ///
 ///   "Files are identical ({common} common elements)"
 ///   "{total} differences: {created} created, {modified} modified, {deleted} deleted ({common} common)"

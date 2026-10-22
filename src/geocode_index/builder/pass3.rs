@@ -336,6 +336,7 @@ pub(super) struct FusedCellAssignmentParams<'a> {
     pub(super) coarse_street_entries_file: &'a str,
     pub(super) coarse_addr_entries_file: &'a str,
     pub(super) coarse_interp_entries_file: &'a str,
+    pub(super) executor: &'a crate::host::Executor,
 }
 
 /// Fused fine + coarse bucketed cell assignment. Returns
@@ -382,6 +383,7 @@ pub(super) fn bucketed_cell_assignment_fused(
         coarse_street_entries_file,
         coarse_addr_entries_file,
         coarse_interp_entries_file,
+        executor,
     } = p;
     let street_way_count = *street_way_count;
     let addr_point_count = *addr_point_count;
@@ -423,63 +425,72 @@ pub(super) fn bucketed_cell_assignment_fused(
     while chunk_start < street_way_count {
         let chunk_end = (chunk_start + STREET_CHUNK as u32).min(street_way_count);
         #[allow(clippy::type_complexity)]
-        let entries: Vec<(u64, Option<u64>, u32, u16)> = (chunk_start..chunk_end)
-            .into_par_iter()
-            .flat_map_iter(|way_idx| {
-                // Test-only: arm via
-                // `test_hooks::PANIC_AT_STREETS_WAY_IDX`. Simulates a
-                // mid-Stage-A crash inside a rayon worker. Rayon
-                // propagates the panic to the `.collect()` call site
-                // on the main thread; the `PathGuard::dir()` wrappers
-                // around `fine_bucket_dir` / `coarse_bucket_dir`
-                // (ADR-0003) sweep the scratch trees on the unwind.
-                // Release builds compile this out entirely.
-                #[cfg(feature = "test-hooks")]
-                if test_hooks::PANIC_AT_STREETS_WAY_IDX.load(std::sync::atomic::Ordering::Relaxed)
-                    == way_idx
-                {
-                    panic!("test-hooks: geocode pass3 stage A streets way {way_idx} panicking");
-                }
-                let offset = way_idx as usize * STREET_WAY_SIZE;
-                let rec = street_ways_mmap
-                    .get(offset..offset + STREET_WAY_SIZE)
-                    .and_then(|b| <&[u8; STREET_WAY_SIZE]>::try_from(b).ok())
-                    .map(StreetWay::from_bytes);
-                let mut out = Vec::new();
-                if let Some(rec) = rec {
-                    let nc = rec.node_count as usize;
-                    if nc >= 2 {
-                        out.reserve(nc * 2);
-                        for seg_idx in 0..nc - 1 {
-                            let off1 = rec.node_offset as usize + seg_idx * NODE_COORD_SIZE;
-                            let off2 = off1 + NODE_COORD_SIZE;
-                            if let (Some(n1), Some(n2)) = (
-                                read_node_at(street_nodes_mmap, off1 as u64),
-                                read_node_at(street_nodes_mmap, off2 as u64),
-                            ) {
-                                let mut coarse_seen = [0u64; 4];
-                                let mut coarse_n = 0usize;
-                                cover_segment(n1.0, n1.1, n2.0, n2.1, fine_level, |fine_cid| {
-                                    let coarse_cid = CellID(fine_cid).parent(coarse_level as u64).0;
-                                    let coarse_to_emit =
-                                        if coarse_seen[..coarse_n].contains(&coarse_cid) {
-                                            None
-                                        } else {
-                                            if coarse_n < coarse_seen.len() {
-                                                coarse_seen[coarse_n] = coarse_cid;
-                                                coarse_n += 1;
-                                            }
-                                            Some(coarse_cid)
-                                        };
-                                    out.push((fine_cid, coarse_to_emit, way_idx, seg_idx as u16));
-                                });
+        let entries: Vec<(u64, Option<u64>, u32, u16)> = executor.install(|| {
+            (chunk_start..chunk_end)
+                .into_par_iter()
+                .flat_map_iter(|way_idx| {
+                    // Test-only: arm via
+                    // `test_hooks::PANIC_AT_STREETS_WAY_IDX`. Simulates a
+                    // mid-Stage-A crash inside a rayon worker. Rayon
+                    // propagates the panic to the `.collect()` call site
+                    // on the main thread; the `PathGuard::dir()` wrappers
+                    // around `fine_bucket_dir` / `coarse_bucket_dir`
+                    // (ADR-0003) sweep the scratch trees on the unwind.
+                    // Release builds compile this out entirely.
+                    #[cfg(feature = "test-hooks")]
+                    if test_hooks::PANIC_AT_STREETS_WAY_IDX
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        == way_idx
+                    {
+                        panic!("test-hooks: geocode pass3 stage A streets way {way_idx} panicking");
+                    }
+                    let offset = way_idx as usize * STREET_WAY_SIZE;
+                    let rec = street_ways_mmap
+                        .get(offset..offset + STREET_WAY_SIZE)
+                        .and_then(|b| <&[u8; STREET_WAY_SIZE]>::try_from(b).ok())
+                        .map(StreetWay::from_bytes);
+                    let mut out = Vec::new();
+                    if let Some(rec) = rec {
+                        let nc = rec.node_count as usize;
+                        if nc >= 2 {
+                            out.reserve(nc * 2);
+                            for seg_idx in 0..nc - 1 {
+                                let off1 = rec.node_offset as usize + seg_idx * NODE_COORD_SIZE;
+                                let off2 = off1 + NODE_COORD_SIZE;
+                                if let (Some(n1), Some(n2)) = (
+                                    read_node_at(street_nodes_mmap, off1 as u64),
+                                    read_node_at(street_nodes_mmap, off2 as u64),
+                                ) {
+                                    let mut coarse_seen = [0u64; 4];
+                                    let mut coarse_n = 0usize;
+                                    cover_segment(n1.0, n1.1, n2.0, n2.1, fine_level, |fine_cid| {
+                                        let coarse_cid =
+                                            CellID(fine_cid).parent(coarse_level as u64).0;
+                                        let coarse_to_emit =
+                                            if coarse_seen[..coarse_n].contains(&coarse_cid) {
+                                                None
+                                            } else {
+                                                if coarse_n < coarse_seen.len() {
+                                                    coarse_seen[coarse_n] = coarse_cid;
+                                                    coarse_n += 1;
+                                                }
+                                                Some(coarse_cid)
+                                            };
+                                        out.push((
+                                            fine_cid,
+                                            coarse_to_emit,
+                                            way_idx,
+                                            seg_idx as u16,
+                                        ));
+                                    });
+                                }
                             }
                         }
                     }
-                }
-                out.into_iter()
-            })
-            .collect();
+                    out.into_iter()
+                })
+                .collect()
+        });
 
         for &(fine_cid, coarse_opt, wi, si) in &entries {
             let b = bucket_for_cell(fine_cid);
@@ -514,16 +525,18 @@ pub(super) fn bucketed_cell_assignment_fused(
     let mut chunk_start = 0usize;
     while chunk_start < addr_count {
         let chunk_end = (chunk_start + ADDR_CHUNK).min(addr_count);
-        let addr_entries: Vec<(u64, u64, u32)> = (chunk_start..chunk_end)
-            .into_par_iter()
-            .filter_map(|idx| {
-                let pt = read_addr_point_mmap(addr_points_mmap, idx as u32)?;
-                let ll = LatLng::from_degrees(pt.lat_e7 as f64 * 1e-7, pt.lon_e7 as f64 * 1e-7);
-                let fine_cid = CellID::from(ll).parent(fine_level as u64).0;
-                let coarse_cid = CellID(fine_cid).parent(coarse_level as u64).0;
-                Some((fine_cid, coarse_cid, idx as u32))
-            })
-            .collect();
+        let addr_entries: Vec<(u64, u64, u32)> = executor.install(|| {
+            (chunk_start..chunk_end)
+                .into_par_iter()
+                .filter_map(|idx| {
+                    let pt = read_addr_point_mmap(addr_points_mmap, idx as u32)?;
+                    let ll = LatLng::from_degrees(pt.lat_e7 as f64 * 1e-7, pt.lon_e7 as f64 * 1e-7);
+                    let fine_cid = CellID::from(ll).parent(fine_level as u64).0;
+                    let coarse_cid = CellID(fine_cid).parent(coarse_level as u64).0;
+                    Some((fine_cid, coarse_cid, idx as u32))
+                })
+                .collect()
+        });
         for &(fine_cid, coarse_cid, idx) in &addr_entries {
             let b = bucket_for_cell(fine_cid);
             ensure_bucket_writer(&mut fine_writers, b, &fine_bucket_dir)?;
@@ -554,49 +567,50 @@ pub(super) fn bucketed_cell_assignment_fused(
     while interp_chunk_start < interp_ways.len() {
         let interp_chunk_end = (interp_chunk_start + INTERP_CHUNK).min(interp_ways.len());
         #[allow(clippy::type_complexity)]
-        let interp_entries: Vec<(u64, Option<u64>, u32, u16)> = (interp_chunk_start
-            ..interp_chunk_end)
-            .into_par_iter()
-            .flat_map_iter(|way_idx| {
-                let iw = &interp_ways[way_idx];
-                let nc = iw.node_count as usize;
-                let mut out = Vec::new();
-                if nc >= 2 {
-                    out.reserve(nc * 2);
-                    for seg_idx in 0..nc - 1 {
-                        let off1 = iw.node_file_offset as usize + seg_idx * NODE_COORD_SIZE;
-                        let off2 = off1 + NODE_COORD_SIZE;
-                        if let (Some(n1), Some(n2)) = (
-                            read_node_at(interp_nodes_mmap, off1 as u64),
-                            read_node_at(interp_nodes_mmap, off2 as u64),
-                        ) {
-                            let mut coarse_seen = [0u64; 4];
-                            let mut coarse_n = 0usize;
-                            cover_segment(n1.0, n1.1, n2.0, n2.1, fine_level, |fine_cid| {
-                                let coarse_cid = CellID(fine_cid).parent(coarse_level as u64).0;
-                                let coarse_to_emit =
-                                    if coarse_seen[..coarse_n].contains(&coarse_cid) {
-                                        None
-                                    } else {
-                                        if coarse_n < coarse_seen.len() {
-                                            coarse_seen[coarse_n] = coarse_cid;
-                                            coarse_n += 1;
-                                        }
-                                        Some(coarse_cid)
-                                    };
-                                out.push((
-                                    fine_cid,
-                                    coarse_to_emit,
-                                    way_idx as u32,
-                                    seg_idx as u16,
-                                ));
-                            });
+        let interp_entries: Vec<(u64, Option<u64>, u32, u16)> = executor.install(|| {
+            (interp_chunk_start..interp_chunk_end)
+                .into_par_iter()
+                .flat_map_iter(|way_idx| {
+                    let iw = &interp_ways[way_idx];
+                    let nc = iw.node_count as usize;
+                    let mut out = Vec::new();
+                    if nc >= 2 {
+                        out.reserve(nc * 2);
+                        for seg_idx in 0..nc - 1 {
+                            let off1 = iw.node_file_offset as usize + seg_idx * NODE_COORD_SIZE;
+                            let off2 = off1 + NODE_COORD_SIZE;
+                            if let (Some(n1), Some(n2)) = (
+                                read_node_at(interp_nodes_mmap, off1 as u64),
+                                read_node_at(interp_nodes_mmap, off2 as u64),
+                            ) {
+                                let mut coarse_seen = [0u64; 4];
+                                let mut coarse_n = 0usize;
+                                cover_segment(n1.0, n1.1, n2.0, n2.1, fine_level, |fine_cid| {
+                                    let coarse_cid = CellID(fine_cid).parent(coarse_level as u64).0;
+                                    let coarse_to_emit =
+                                        if coarse_seen[..coarse_n].contains(&coarse_cid) {
+                                            None
+                                        } else {
+                                            if coarse_n < coarse_seen.len() {
+                                                coarse_seen[coarse_n] = coarse_cid;
+                                                coarse_n += 1;
+                                            }
+                                            Some(coarse_cid)
+                                        };
+                                    out.push((
+                                        fine_cid,
+                                        coarse_to_emit,
+                                        way_idx as u32,
+                                        seg_idx as u16,
+                                    ));
+                                });
+                            }
                         }
                     }
-                }
-                out.into_iter()
-            })
-            .collect();
+                    out.into_iter()
+                })
+                .collect()
+        });
         for &(fine_cid, coarse_opt, wi, si) in &interp_entries {
             let b = bucket_for_cell(fine_cid);
             ensure_bucket_writer(&mut fine_writers, b, &fine_bucket_dir)?;
@@ -645,6 +659,7 @@ pub(super) fn bucketed_cell_assignment_fused(
         fine_street_entries_file,
         fine_addr_entries_file,
         fine_interp_entries_file,
+        executor,
     )?;
     drop(fine_guard);
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEB_FINE_END");
@@ -657,6 +672,7 @@ pub(super) fn bucketed_cell_assignment_fused(
         coarse_street_entries_file,
         coarse_addr_entries_file,
         coarse_interp_entries_file,
+        executor,
     )?;
     drop(coarse_guard);
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEB_COARSE_END");
@@ -680,6 +696,7 @@ fn run_stage_b(
     street_entries_file: &str,
     addr_entries_file: &str,
     interp_entries_file: &str,
+    executor: &crate::host::Executor,
 ) -> Result<u32> {
     use rayon::prelude::*;
 
@@ -701,24 +718,26 @@ fn run_stage_b(
     // scratch records because ParsedBucketEntry is padded to 16 bytes.
     for window_start in (0..NUM_BUCKETS).step_by(STAGE_B_SORT_WINDOW) {
         let window_end = (window_start + STAGE_B_SORT_WINDOW).min(NUM_BUCKETS);
-        let sorted_buckets: Vec<Vec<ParsedBucketEntry>> = (window_start..window_end)
-            .into_par_iter()
-            .map(|bucket_idx| -> std::io::Result<Vec<ParsedBucketEntry>> {
-                let bucket_path = bucket_dir.join(format!("{bucket_idx:03}"));
-                if !bucket_path.exists() {
-                    return Ok(Vec::new());
-                }
-                let data = std::fs::read(&bucket_path)?;
-                std::fs::remove_file(&bucket_path)?;
-                if data.is_empty() {
-                    return Ok(Vec::new());
-                }
-                let mut entries = parse_bucket_file(&data)?;
-                drop(data);
-                entries.sort_unstable_by_key(|e| e.cell_id);
-                Ok(entries)
-            })
-            .collect::<std::io::Result<_>>()?;
+        let sorted_buckets: Vec<Vec<ParsedBucketEntry>> = executor.install(|| {
+            (window_start..window_end)
+                .into_par_iter()
+                .map(|bucket_idx| -> std::io::Result<Vec<ParsedBucketEntry>> {
+                    let bucket_path = bucket_dir.join(format!("{bucket_idx:03}"));
+                    if !bucket_path.exists() {
+                        return Ok(Vec::new());
+                    }
+                    let data = std::fs::read(&bucket_path)?;
+                    std::fs::remove_file(&bucket_path)?;
+                    if data.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    let mut entries = parse_bucket_file(&data)?;
+                    drop(data);
+                    entries.sort_unstable_by_key(|e| e.cell_id);
+                    Ok(entries)
+                })
+                .collect::<std::io::Result<_>>()
+        })?;
 
         for entries in &sorted_buckets {
             if entries.is_empty() {
@@ -876,6 +895,7 @@ fn run_stage_b(
 pub(super) fn assign_admin_cells(
     polygons: &[AssembledPolygon],
     admin_level: u8,
+    executor: &crate::host::Executor,
 ) -> Vec<AdminCellEntry> {
     use rayon::prelude::*;
 
@@ -886,13 +906,15 @@ pub(super) fn assign_admin_cells(
     // in `write_admin_index` gives a byte-identical result to the sequential
     // path. Plan item #6 - Europe admin flood-fill was 10.7 s sequential
     // (UUID bf8f2038); expected ~5× on 12 cores.
-    polygons
-        .par_iter()
-        .enumerate()
-        .flat_map_iter(|(poly_idx, poly)| {
-            admin_cells_for_polygon(poly_idx, poly, admin_level).into_iter()
-        })
-        .collect()
+    executor.install(|| {
+        polygons
+            .par_iter()
+            .enumerate()
+            .flat_map_iter(|(poly_idx, poly)| {
+                admin_cells_for_polygon(poly_idx, poly, admin_level).into_iter()
+            })
+            .collect()
+    })
 }
 
 #[allow(clippy::cast_possible_truncation)]

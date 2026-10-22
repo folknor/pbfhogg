@@ -1949,12 +1949,12 @@ fn main() -> process::ExitCode {
                 force.force,
                 &host,
             ),
-            Command::BenchRead { file, mode } => run_bench_read(&file, mode),
+            Command::BenchRead { file, mode } => run_bench_read(&file, mode, &host),
             Command::BenchWrite {
                 file,
                 compression,
                 writer,
-            } => run_bench_write(&file, compression, writer),
+            } => run_bench_write(&file, compression, writer, &host),
             Command::BenchMerge {
                 base,
                 changes,
@@ -1989,7 +1989,7 @@ fn main() -> process::ExitCode {
                 // rather than on the shape of `e`.
                 process::ExitCode::SUCCESS
             } else {
-                eprintln!("Error: {e}");
+                output::cli_eprintln!("Error: {e}");
                 process::ExitCode::from(ExitStatus::Failed.code())
             }
         }
@@ -2019,7 +2019,7 @@ fn run_build_geocode_index(
         coarse_search_radius_m: levels.coarse_search_radius,
     };
     let stats = pbfhogg::geocode_index::builder::build_geocode_index(&config, host)?;
-    eprintln!(
+    output::cli_eprintln!(
         "Index built: {} addr, {} streets, {} interp, {} admin ({} relations dropped), {} fine cells, {} coarse cells, {} admin cells",
         stats.addr_points,
         stats.street_ways,
@@ -2326,7 +2326,7 @@ fn run_tags_count(
     }
     out.flush()?;
 
-    eprintln!("{} distinct tag values", results.len());
+    output::cli_eprintln!("{} distinct tag values", results.len());
     Ok(())
 }
 
@@ -2503,7 +2503,7 @@ fn run_tags_filter(
         return Err("no filter expressions provided (use positional args or -e FILE)".into());
     }
     if remove_tags && omit_referenced {
-        eprintln!(
+        output::cli_eprintln!(
             "Warning! With -R/--omit-referenced use of -t/--remove-tags isn't doing anything."
         );
     }
@@ -2827,27 +2827,27 @@ fn resolve_ids(
 }
 
 fn print_requested_ids(ids: &pbfhogg::getid::ElementIds) {
-    eprintln!("Requested IDs:");
+    output::cli_eprintln!("Requested IDs:");
     if ids.node_ids.has_any() {
-        eprint!("  nodes:");
+        output::cli_eprint!("  nodes:");
         for id in ids.node_ids.iter() {
-            eprint!(" {id}");
+            output::cli_eprint!(" {id}");
         }
-        eprintln!();
+        output::cli_eprintln!();
     }
     if ids.way_ids.has_any() {
-        eprint!("  ways:");
+        output::cli_eprint!("  ways:");
         for id in ids.way_ids.iter() {
-            eprint!(" {id}");
+            output::cli_eprint!(" {id}");
         }
-        eprintln!();
+        output::cli_eprintln!();
     }
     if ids.relation_ids.has_any() {
-        eprint!("  relations:");
+        output::cli_eprint!("  relations:");
         for id in ids.relation_ids.iter() {
-            eprint!(" {id}");
+            output::cli_eprint!(" {id}");
         }
-        eprintln!();
+        output::cli_eprintln!();
     }
 }
 
@@ -2875,17 +2875,17 @@ fn print_missing_ids(requested: &pbfhogg::getid::ElementIds, found: &pbfhogg::ge
 
     let total_missing = missing_nodes.len() + missing_ways.len() + missing_rels.len();
     if total_missing == 0 {
-        eprintln!("Found all requested objects.");
+        output::cli_eprintln!("Found all requested objects.");
     } else {
-        eprintln!("Did not find {total_missing} object(s):");
+        output::cli_eprintln!("Did not find {total_missing} object(s):");
         for id in &missing_nodes {
-            eprintln!("  n{id}");
+            output::cli_eprintln!("  n{id}");
         }
         for id in &missing_ways {
-            eprintln!("  w{id}");
+            output::cli_eprintln!("  w{id}");
         }
         for id in &missing_rels {
-            eprintln!("  r{id}");
+            output::cli_eprintln!("  r{id}");
         }
     }
 }
@@ -3016,7 +3016,7 @@ fn run_getid(
     )?;
 
     if remove_tags && !add_referenced {
-        eprintln!(
+        output::cli_eprintln!(
             "Warning! Without -r/--add-referenced use of -t/--remove-tags isn't doing anything."
         );
     }
@@ -3286,7 +3286,7 @@ fn run_extract_config(
         slot.output = guard.path().to_path_buf();
     }
 
-    eprintln!("Multi-extract: {} extracts from config", slots.len());
+    output::cli_eprintln!("Multi-extract: {} extracts from config", slots.len());
     let all_stats = pbfhogg::extract::extract_multi(
         file,
         &slots,
@@ -3316,7 +3316,7 @@ fn run_extract_config(
         guard.commit()?;
     }
     for (i, stats) in all_stats.iter().enumerate() {
-        eprint!("  [{}] {} - ", i + 1, final_paths[i].display());
+        output::cli_eprint!("  [{}] {} - ", i + 1, final_paths[i].display());
         stats.write_summary(&mut host.diagnostics.summary_writer("extract.summary"))?;
     }
     Ok(())
@@ -3374,7 +3374,7 @@ fn run_show_element(
     let found = pbfhogg::inspect::show_element_to(path, elem_type, id, direct_io, &mut out, host)?;
     out.flush()?;
     if !found {
-        eprintln!("Element not found: {spec}");
+        output::cli_eprintln!("Element not found: {spec}");
         return Err(Box::new(ExitWithCode(ExitStatus::AnswerNegative)));
     }
     Ok(())
@@ -3537,8 +3537,9 @@ fn run_inspect(
             return Ok(());
         }
         InspectMode::HeaderGet(key) => {
-            let mut reader =
-                pbfhogg::BlobReader::open(path, direct_io)?.diagnostics(host.diagnostics.clone());
+            let mut reader = pbfhogg::BlobReader::open(path, direct_io)?
+                .evict_page_cache(true)
+                .diagnostics(host.diagnostics.clone());
             let header = match reader.next() {
                 Some(Ok(blob)) => match blob.decode()? {
                     pbfhogg::blob::BlobDecode::OsmHeader(h) => *h,
@@ -3717,12 +3718,14 @@ fn run_merge_changes(
 fn run_bench_read(
     path: &std::path::Path,
     mode: BenchReadMode,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::time::Instant;
 
     let (elapsed_ms, nodes, ways, rels): (u128, u64, u64, u64) = match mode {
         BenchReadMode::Sequential => {
-            let reader = pbfhogg::ElementReader::from_path(path)?;
+            let reader = pbfhogg::ElementReader::from_path_with_eviction(path, true)?
+                .diagnostics(host.diagnostics.clone());
             let mut nodes = 0u64;
             let mut ways = 0u64;
             let mut rels = 0u64;
@@ -3736,7 +3739,8 @@ fn run_bench_read(
             (start.elapsed().as_millis(), nodes, ways, rels)
         }
         BenchReadMode::Parallel => {
-            let reader = pbfhogg::ElementReader::from_path(path)?;
+            let reader = pbfhogg::ElementReader::from_path_with_eviction(path, true)?
+                .diagnostics(host.diagnostics.clone());
             let start = Instant::now();
             let (nodes, ways, rels) = reader.par_map_reduce(
                 |el| match el {
@@ -3753,7 +3757,8 @@ fn run_bench_read(
             (start.elapsed().as_millis(), nodes, ways, rels)
         }
         BenchReadMode::Pipelined => {
-            let reader = pbfhogg::ElementReader::from_path(path)?;
+            let reader = pbfhogg::ElementReader::from_path_with_eviction(path, true)?
+                .diagnostics(host.diagnostics.clone());
             let mut nodes = 0u64;
             let mut ways = 0u64;
             let mut rels = 0u64;
@@ -3770,7 +3775,9 @@ fn run_bench_read(
             // Route through the library's buffered path (256 KiB FileReader)
             // so this arm measures decode architecture, not the syscall
             // overhead of a default 8 KiB BufReader.
-            let reader = pbfhogg::BlobReader::from_path(path)?;
+            let reader = pbfhogg::BlobReader::from_path(path)?
+                .evict_page_cache(true)
+                .diagnostics(host.diagnostics.clone());
             let mut nodes = 0u64;
             let mut ways = 0u64;
             let mut rels = 0u64;
@@ -3794,21 +3801,23 @@ fn run_bench_read(
         }
     };
 
-    eprintln!("elapsed_ms={elapsed_ms}");
-    eprintln!("nodes={nodes}");
-    eprintln!("ways={ways}");
-    eprintln!("relations={rels}");
+    output::cli_eprintln!("elapsed_ms={elapsed_ms}");
+    output::cli_eprintln!("nodes={nodes}");
+    output::cli_eprintln!("ways={ways}");
+    output::cli_eprintln!("relations={rels}");
     Ok(())
 }
 
 fn bench_write_loop<W: std::io::Write>(
     path: &std::path::Path,
     writer: &mut pbfhogg::writer::PbfWriter<W>,
+    host: &pbfhogg::host::Host,
 ) -> Result<(u64, u64, u64), Box<dyn std::error::Error>> {
     use pbfhogg::block_builder::{BlockBuilder, MemberData};
     use std::io::BufReader;
 
-    let reader = pbfhogg::BlobReader::new(BufReader::new(std::fs::File::open(path)?));
+    let reader = pbfhogg::BlobReader::new(BufReader::new(std::fs::File::open(path)?))
+        .diagnostics(host.diagnostics.clone());
     let mut bb = BlockBuilder::new();
     let mut nodes = 0u64;
     let mut ways = 0u64;
@@ -3886,6 +3895,7 @@ fn run_bench_write(
     path: &std::path::Path,
     compression: Compression,
     writer_mode: BenchWriterMode,
+    host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use pbfhogg::block_builder::HeaderBuilder;
     use std::time::Instant;
@@ -3899,7 +3909,7 @@ fn run_bench_write(
             let mut writer = pbfhogg::writer::PbfWriter::new(buf, compression);
             writer.write_header(&header_bytes)?;
             let start = Instant::now();
-            let (nodes, ways, rels) = bench_write_loop(path, &mut writer)?;
+            let (nodes, ways, rels) = bench_write_loop(path, &mut writer, host)?;
             let elapsed_ms = start.elapsed().as_millis();
             (elapsed_ms, nodes, ways, rels)
         }
@@ -3908,19 +3918,20 @@ fn run_bench_write(
                 std::path::Path::new("/dev/null"),
                 compression,
                 &header_bytes,
+                pbfhogg::host::Executor::Ambient,
             )?;
             let start = Instant::now();
-            let (nodes, ways, rels) = bench_write_loop(path, &mut writer)?;
+            let (nodes, ways, rels) = bench_write_loop(path, &mut writer, host)?;
             drop(writer);
             let elapsed_ms = start.elapsed().as_millis();
             (elapsed_ms, nodes, ways, rels)
         }
     };
 
-    eprintln!("elapsed_ms={elapsed_ms}");
-    eprintln!("nodes={nodes}");
-    eprintln!("ways={ways}");
-    eprintln!("relations={rels}");
+    output::cli_eprintln!("elapsed_ms={elapsed_ms}");
+    output::cli_eprintln!("nodes={nodes}");
+    output::cli_eprintln!("ways={ways}");
+    output::cli_eprintln!("relations={rels}");
     Ok(())
 }
 
@@ -3986,21 +3997,21 @@ fn run_bench_merge(
         .map(|m| m.len() as f64 / 1_000_000.0)
         .unwrap_or(0.0);
 
-    eprintln!("elapsed_ms={elapsed_ms}");
-    eprintln!("base_nodes={}", stats.base_nodes);
-    eprintln!("base_ways={}", stats.base_ways);
-    eprintln!("base_relations={}", stats.base_relations);
-    eprintln!("diff_nodes={}", stats.diff_nodes);
-    eprintln!("diff_ways={}", stats.diff_ways);
-    eprintln!("diff_relations={}", stats.diff_relations);
-    eprintln!("blobs_passthrough={}", stats.blobs_passthrough);
-    eprintln!("blobs_rewritten={}", stats.blobs_rewritten);
-    eprintln!("bytes_passthrough={}", stats.bytes_passthrough);
-    eprintln!("bytes_rewritten={}", stats.bytes_rewritten);
-    eprintln!("diff_heap_bytes={}", stats.diff_heap_bytes);
-    eprintln!("output_mb={output_mb:.2}");
+    output::cli_eprintln!("elapsed_ms={elapsed_ms}");
+    output::cli_eprintln!("base_nodes={}", stats.base_nodes);
+    output::cli_eprintln!("base_ways={}", stats.base_ways);
+    output::cli_eprintln!("base_relations={}", stats.base_relations);
+    output::cli_eprintln!("diff_nodes={}", stats.diff_nodes);
+    output::cli_eprintln!("diff_ways={}", stats.diff_ways);
+    output::cli_eprintln!("diff_relations={}", stats.diff_relations);
+    output::cli_eprintln!("blobs_passthrough={}", stats.blobs_passthrough);
+    output::cli_eprintln!("blobs_rewritten={}", stats.blobs_rewritten);
+    output::cli_eprintln!("bytes_passthrough={}", stats.bytes_passthrough);
+    output::cli_eprintln!("bytes_rewritten={}", stats.bytes_rewritten);
+    output::cli_eprintln!("diff_heap_bytes={}", stats.diff_heap_bytes);
+    output::cli_eprintln!("output_mb={output_mb:.2}");
     if let Some(peak_kb) = read_peak_rss_kb() {
-        eprintln!("peak_rss_kb={peak_kb}");
+        output::cli_eprintln!("peak_rss_kb={peak_kb}");
     }
     Ok(())
 }

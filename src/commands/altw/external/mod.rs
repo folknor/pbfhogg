@@ -590,8 +590,7 @@ pub(super) fn slot_bucket_bounds(
 ///
 /// Bounded memory, all sequential I/O. Uses ~256 GB peak temp disk at
 /// planet scale. See module docs for the algorithm.
-#[hotpath::measure]
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn external_join(
     input: &Path,
     output: &Path,
@@ -602,6 +601,38 @@ pub fn external_join(
     overrides: &HeaderOverrides,
     inject_prepass: bool,
     host: &crate::host::Host,
+) -> Result<Stats> {
+    let token = crate::scratch::RunToken::next()?;
+    external_join_in(
+        input,
+        output,
+        keep_untagged_nodes,
+        compression,
+        direct_io,
+        force,
+        overrides,
+        inject_prepass,
+        host,
+        &token,
+    )
+}
+
+/// [`external_join`] under a scratch token the caller already took, so
+/// `add_locations_to_ways` names its scratch with the one token it allocated
+/// at its own entry.
+#[hotpath::measure]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub(crate) fn external_join_in(
+    input: &Path,
+    output: &Path,
+    keep_untagged_nodes: bool,
+    compression: Compression,
+    direct_io: bool,
+    force: bool,
+    overrides: &HeaderOverrides,
+    inject_prepass: bool,
+    host: &crate::host::Host,
+    token: &crate::scratch::RunToken,
 ) -> Result<Stats> {
     let has_indexdata = require_indexdata(
         input,
@@ -643,7 +674,11 @@ pub fn external_join(
         }
     }
 
-    let scratch_dir = ScratchDir::new(output.parent().unwrap_or(Path::new(".")), "external-join")?;
+    let scratch_dir = ScratchDir::new(
+        host.scratch_parent_or(output.parent().unwrap_or(Path::new("."))),
+        "external-join",
+        token,
+    )?;
 
     let ref_count_sidecar = scratch_dir.file_path("way-ref-counts");
     let per_way_refcount_sidecar = scratch_dir.file_path("per-way-refcounts");

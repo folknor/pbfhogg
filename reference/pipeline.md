@@ -62,6 +62,8 @@ Applied via `ElementReader::with_blob_filter()`. Used by `cat --type`, `tags-fil
 | 1. Frame + compress | Rayon pool | Per-thread `FrameScratch` (reusable buffers + lazy-init compressors). Zlib/zstd/none. |
 | 2. Reorder + write | Dedicated writer thread | `ReorderBuffer` (32-slot write-ahead), writes to `FileWriter` |
 
+Every `to_path*` constructor takes a `host::Executor` naming the rayon pool that runs stage 1 (`Ambient` or a caller-owned `Pool`); a writer driven from a worker of that pool waits for permits cooperatively instead of blocking.
+
 Output modes:
 - `PbfWriter::to_path()` - buffered I/O
 - `PbfWriter::to_path_direct()` - O_DIRECT (Linux, `linux-direct-io` feature)

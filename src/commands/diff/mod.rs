@@ -108,7 +108,8 @@ pub struct DiffOptions {
     pub suppress_common: bool,
     /// Show detailed changes for modified elements.
     pub verbose: bool,
-    /// Show summary on stderr (left/right/same/different counts).
+    /// Select the osmium-style summary (left/right/same/different counts).
+    /// The caller renders it with `DiffStats::write_osmium_summary`.
     pub summary: bool,
     /// Restrict the comparison to these element types. `None` = all.
     pub type_filter: Option<TypeFilter>,
@@ -220,6 +221,7 @@ pub fn diff(
     direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<DiffStats> {
+    let token = crate::scratch::RunToken::next()?;
     let filter = TypeFilter::or_all(options.type_filter);
 
     // Single-pass: check sorted headers + indexdata from one file open each.
@@ -251,6 +253,7 @@ pub fn diff(
             &filter,
             options.jobs,
             host,
+            &token,
         )?
     } else if both_indexed {
         diff_block_pair(

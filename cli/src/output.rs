@@ -21,6 +21,11 @@
 //!
 //! Any other stdout failure (a full disk behind `> file`, say) is not
 //! swallowed: it propagates like any error and fails the command.
+//!
+//! It is also the one place the binary writes stderr, through
+//! [`stderr_line`] and [`stderr_fragment`] (the `cli_eprintln!` and
+//! `cli_eprint!` macros), so that a closed stderr stops the diagnostics
+//! without ending the run. Its flag is kept apart from stdout's.
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,3 +113,64 @@ pub(crate) fn tolerate_reader_gone<E>(result: Result<(), E>) -> Result<(), E> {
         other => other,
     }
 }
+
+/// Set once a stderr write has failed with `BrokenPipe`. Never cleared, and
+/// deliberately separate from [`READER_GONE`]: losing the diagnostics reader
+/// (`pbfhogg sort ... 2>&1 | head`) must not change how stdout or the exit
+/// status are handled, so it never feeds [`reader_gone`] or
+/// [`tolerate_reader_gone`].
+static STDERR_READER_GONE: AtomicBool = AtomicBool::new(false);
+
+/// Write one diagnostic line to stderr: the `eprintln!` equivalent.
+///
+/// `eprintln!` panics when stderr's reader has gone away, which used to abort
+/// the whole command with status 101 halfway through its work. Here a closed
+/// stderr stops the diagnostics and nothing else: the command completes and
+/// its exit status is its own. Any other stderr failure still panics with
+/// std's own message, as `eprintln!` would.
+pub(crate) fn stderr_line(args: std::fmt::Arguments<'_>) {
+    write_stderr(args, true);
+}
+
+/// The `eprint!` equivalent of [`stderr_line`]: no line terminator.
+pub(crate) fn stderr_fragment(args: std::fmt::Arguments<'_>) {
+    write_stderr(args, false);
+}
+
+fn write_stderr(args: std::fmt::Arguments<'_>, newline: bool) {
+    let mut handle = io::stderr().lock();
+    if STDERR_READER_GONE.load(Ordering::Relaxed) {
+        return;
+    }
+    let result = if newline {
+        handle.write_fmt(format_args!("{args}\n"))
+    } else {
+        handle.write_fmt(args)
+    };
+    match result {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+            STDERR_READER_GONE.store(true, Ordering::Relaxed);
+        }
+        Err(e) => panic!("failed printing to stderr: {e}"),
+    }
+}
+
+/// `eprintln!` that survives a closed stderr; see [`stderr_line`].
+macro_rules! cli_eprintln {
+    () => {
+        $crate::output::stderr_line(format_args!(""))
+    };
+    ($($arg:tt)+) => {
+        $crate::output::stderr_line(format_args!($($arg)+))
+    };
+}
+
+/// `eprint!` that survives a closed stderr; see [`stderr_fragment`].
+macro_rules! cli_eprint {
+    ($($arg:tt)+) => {
+        $crate::output::stderr_fragment(format_args!($($arg)+))
+    };
+}
+
+pub(crate) use {cli_eprint, cli_eprintln};

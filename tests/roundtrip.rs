@@ -596,7 +596,12 @@ fn roundtrip_direct_io() {
         .bbox(9.0, 54.0, 13.0, 58.0)
         .build()
         .unwrap();
-    let write_result = PbfWriter::to_path_direct(&path, Compression::default(), &header);
+    let write_result = PbfWriter::to_path_direct(
+        &path,
+        Compression::default(),
+        &header,
+        pbfhogg::host::Executor::Ambient,
+    );
     let mut writer = match write_result {
         Ok(w) => w,
         Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
@@ -685,7 +690,12 @@ fn roundtrip_pipelined_direct_io() {
 
     let header = block_builder::HeaderBuilder::new().build().unwrap();
 
-    let write_result = PbfWriter::to_path_direct(&path, Compression::default(), &header);
+    let write_result = PbfWriter::to_path_direct(
+        &path,
+        Compression::default(),
+        &header,
+        pbfhogg::host::Executor::Ambient,
+    );
     let mut writer = match write_result {
         Ok(w) => w,
         Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
@@ -777,7 +787,12 @@ fn roundtrip_uring_tiny_output() {
     let path = dir.path().join("uring_tiny.osm.pbf");
 
     let header = block_builder::HeaderBuilder::new().build().unwrap();
-    let mut writer = match PbfWriter::to_path_uring(&path, Compression::default(), &header) {
+    let mut writer = match PbfWriter::to_path_uring(
+        &path,
+        Compression::default(),
+        &header,
+        pbfhogg::host::Executor::Ambient,
+    ) {
         Ok(w) => w,
         Err(e) if is_uring_init_unavailable(&e) => {
             eprintln!("io_uring not available, skipping: {e}");
@@ -841,7 +856,12 @@ fn roundtrip_uring_small_size_sweep() {
         let path = dir.path().join(format!("uring_sweep_{n}.osm.pbf"));
 
         let header = block_builder::HeaderBuilder::new().build().unwrap();
-        let mut writer = match PbfWriter::to_path_uring(&path, Compression::default(), &header) {
+        let mut writer = match PbfWriter::to_path_uring(
+            &path,
+            Compression::default(),
+            &header,
+            pbfhogg::host::Executor::Ambient,
+        ) {
             Ok(w) => w,
             Err(e) if is_uring_init_unavailable(&e) => {
                 eprintln!("io_uring not available, skipping: {e}");

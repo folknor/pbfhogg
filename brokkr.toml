@@ -127,14 +127,15 @@ expect = "document conventions ok"
 match = "last-line"
 stage = "pre-clippy"
 
-# glibc-only allocator calls live in src/debug.rs, behind
+# glibc-only allocator calls live in src/debug.rs and src/process.rs, behind
 # `cfg(all(target_os = "linux", target_env = "gnu"))` with a no-op fallback.
 # A call gated on `target_os = "linux"` alone also compiles for musl, where
 # these symbols do not exist, and nothing here builds against musl - so the
 # one way to keep musl building is to keep calls in gated debug/process wrappers.
-# Matches the `libc::` path, so callers of the `crate::debug` wrappers
-# (`cap_malloc_arenas`, `malloc_trim`, `emit_mallinfo2`) stay legal, and
-# `region = "code"` lets comments discuss the calls by name.
+# Matches the `libc::` path, so callers of the wrappers (`crate::debug`'s
+# `emit_mallinfo2`; `crate::process`'s `cap_malloc_arenas`, `malloc_trim` and
+# `set_mmap_threshold`) stay legal, and `region = "code"` lets comments
+# discuss the calls by name.
 [[textlint]]
 name = "glibc-allocator-calls-live-in-debug"
 pattern = '\blibc::(?:mallopt|mallinfo2?|malloc_trim|malloc_stats|malloc_info|M_[A-Z_]+)\b'
@@ -222,7 +223,6 @@ description = "Full in-project correctness gate (tier 3, pre-merge); over-watchd
 sweeps = ["all"]
 skip = [
     "host_identity_",
-    "stderr_closed_aborts_like_baseline",
     "platform::",
     "merge_cross_validate_osmium",
     "sort_cross_validate_osmium",
@@ -1105,9 +1105,21 @@ paths = ["src/commands/**/*.rs", "src/geocode_index/builder/**/*.rs", "src/scan/
 region = "code"
 message = "Command readers must inherit the caller's host"
 
+# The library's parallel work runs on the caller's `host::Executor`, never on
+# whatever pool happens to be ambient. Par-iterators cannot be matched by text;
+# each one is wrapped in `executor.install` and checked in review.
+[[textlint]]
+name = "no-ambient-rayon"
+pattern = '\brayon::(?:spawn|join|scope|in_place_scope|broadcast)\b|build_global'
+paths = ["src/**/*.rs"]
+exclude = ["src/host.rs"]
+region = "code"
+message = "Library parallel work must go through the caller's host::Executor"
+
 [[textlint]]
 name = "no-eprint-macro"
 pattern = '\beprint(?:ln)?!'
-paths = ["src/**/*.rs"]
+paths = ["src/**/*.rs", "cli/src/**/*.rs"]
+exclude = ["cli/src/output.rs"]
 region = "code"
-message = "Library diagnostics must use the caller's Diagnostics handle"
+message = "Library diagnostics must use the caller's Diagnostics handle; the CLI writes stderr through output::cli_eprintln! and cli_eprint!, which survive a closed stderr"

@@ -126,7 +126,7 @@ fn snapshot_path_filters_non_history_input() {
     let stderr = run_time_filter(&input, &output, 250);
 
     // The CLI emits the TimeFilterStats summary on stderr via
-    // `print_summary`. Pin the substrings for the five counters
+    // `write_summary`. Pin the substrings for the five counters
     // the library test pinned by direct field access.
     assert!(
         stderr.contains("8 versions scanned"),

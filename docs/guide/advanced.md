@@ -36,6 +36,23 @@ pbfhogg apply-changes base.osm.pbf changes.osc.gz -o output.osm.pbf --io-uring
 
 At North America scale (18.8 GB), io_uring + `--compression none` is 20% faster than buffered writes (11.9s vs 14.9s). Below ~4 GB input size, buffered writes keep up - io_uring overhead dominates when the page cache absorbs everything.
 
+## Embedding pbfhogg
+
+The library never mutates process state, reads the environment or writes to stderr on its own (ADR-0016). Every command entry point takes a `&pbfhogg::host::Host`, which has no default: the caller states each policy the CLI used to decide for itself. `Host`'s public fields, with the CLI's choice for each:
+
+| Field | What it decides | The CLI's choice |
+|-------|-----------------|------------------|
+| `process: Arc<dyn ProcessActions>` | Process-wide actions, invoked at the exact point a command needs them: `cross_thread_alloc_pool` before a pool that allocates on one thread and frees on another, `fd_allowance(wanted)` before a run that holds many descriptors | `cross_thread_alloc_pool` caps glibc's malloc arenas at 2 (`process::cap_malloc_arenas`); `fd_allowance` raises the soft `RLIMIT_NOFILE` to the hard cap (`process::raise_nofile_to_hard_cap`) |
+| `resources: Arc<dyn Resources>` | Thread counts and memory budgets, probed where each command sizes them | `MachineProbe` (`available_parallelism`, `MemAvailable` from `/proc/meminfo`) |
+| `diagnostics: Diagnostics` | Where progress lines, warnings, notes and summaries go, one event per line | A sink that prints each event as one stderr line |
+| `page_cache: PageCachePolicy` | Whether commands drop their input files' pages behind the read head | `Evict` |
+| `executor: Executor` | Which rayon pool runs the library's parallel work and writer framing | `Ambient` |
+| `scratch_parent: Option<PathBuf>` | Where `add-locations-to-ways`, `diff` and `diff --format osc` place their scratch files; the directory must exist | `None` (beside the output, or beside the old input for `diff`) |
+
+`NoProcessActions` leaves the process alone, `Fixed` supplies fixed resource values, `Diagnostics::discard()` drops every event, and `PageCachePolicy::Keep` leaves the page cache alone - the shape a long-running host process usually wants. Concurrent runs in one process can be kept apart: give each run its own `Diagnostics` and its events stay its own, and scratch names carry a per-run token as well as the process id, so two runs never share a scratch file. The diagnostic-only metric totals behind the sidecar counters (writer, reader pipeline, add-locations-to-ways) are process-wide and mix across concurrent runs.
+
+The CLI's arena cap is a `mallopt(M_ARENA_MAX, 2)` call, which overrides `GLIBC_TUNABLES=glibc.malloc.arena_max` for the rest of the process. An embedding caller that wants the tunable to stand should not call `cap_malloc_arenas`.
+
 ## Compression modes
 
 All write commands accept `--compression`:

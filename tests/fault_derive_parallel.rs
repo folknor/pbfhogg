@@ -42,8 +42,15 @@ mod derive_parallel {
         write_multi_block_test_pbf(&old, &old_nodes, &[], &[], 5);
         write_multi_block_test_pbf(&new, &new_nodes, &[], &[], 5);
 
-        // `scratch_dir` is inferred as `osc.parent()` by the derive
-        // driver, i.e. the tempdir.
+        // Use an explicit scratch parent and consume token 0 with a clean
+        // run first. The fault then exercises suffix-aware cleanup, rather
+        // than only the legacy names used by a process's first invocation.
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let mut host = crate::common::test_host();
+        host.scratch_parent = Some(scratch.clone());
+        derive_changes(&old, &new, &osc, false, false, false, 3, &host).unwrap();
+        assert!(snapshot_dir(&scratch).is_empty());
         let before = snapshot_dir(dir.path());
 
         // Arm middle shard.
@@ -51,14 +58,8 @@ mod derive_parallel {
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             derive_changes(
-                &old,
-                &new,
-                &osc,
-                /* direct_io */ false,
-                /* increment_version */ false,
-                /* update_timestamp */ false,
-                /* jobs */ 3,
-                &crate::common::test_host(),
+                &old, &new, &osc, /* direct_io */ false, /* increment_version */ false,
+                /* update_timestamp */ false, /* jobs */ 3, &host,
             )
         }));
 
@@ -73,6 +74,10 @@ mod derive_parallel {
         // Scratch cleanup: the driver must sweep every `derive-par-*`
         // (creates / modifies / deletes) after any shard errors.
         let after = snapshot_dir(dir.path());
+        assert!(
+            snapshot_dir(&scratch).is_empty(),
+            "scratch override leaked files"
+        );
         let leaked: Vec<_> = after
             .difference(&before)
             .filter(|p| p.to_string_lossy().contains("derive-par-"))

@@ -51,6 +51,12 @@ pub(crate) struct WriterMetrics {
     /// `encode_blob_header_into`.
     pub tagdata_dropped_oversize: AtomicU64,
 
+    /// Time a producer on a worker of the writer's executor pool spent in the
+    /// cooperative permit wait (`pipeline::recv_permit`). Zero on every CLI
+    /// path, which drives its writers off-worker; non-zero means a
+    /// `PbfWriter` is being driven from a rayon worker.
+    pub coop_wait_ns: AtomicU64,
+
     /// Latch for [`WriterMetrics::emit_once`], so a process emits the
     /// counter set exactly once no matter how many writers it flushes.
     emitted: AtomicBool,
@@ -89,6 +95,7 @@ impl WriterMetrics {
             uring_submit_and_wait_ns: AtomicU64::new(0),
             uring_cq_wait_ns: AtomicU64::new(0),
             tagdata_dropped_oversize: AtomicU64::new(0),
+            coop_wait_ns: AtomicU64::new(0),
             emitted: AtomicBool::new(false),
         }
     }
@@ -210,6 +217,7 @@ impl WriterMetrics {
         emit!("writer_uring_submit_and_wait_ns", uring_submit_and_wait_ns);
         emit!("writer_uring_cq_wait_ns", uring_cq_wait_ns);
         emit!("writer_tagdata_dropped_oversize", tagdata_dropped_oversize);
+        emit!("writer_coop_wait_ns", coop_wait_ns);
 
         // An all-zero set means no writer ever ran in this process. Say
         // nothing rather than publishing thirty zeroes for every `inspect`.

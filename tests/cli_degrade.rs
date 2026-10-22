@@ -159,8 +159,13 @@ fn write_bbox_fixture(path: &Path) -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRela
     let rels = generate_relations(6, 1, 2, 1);
 
     let header = rich_bbox_header_bytes();
-    let mut writer =
-        PbfWriter::to_path(path, Compression::default(), &header).expect("create writer");
+    let mut writer = PbfWriter::to_path(
+        path,
+        Compression::default(),
+        &header,
+        pbfhogg::host::Executor::Ambient,
+    )
+    .expect("create writer");
     write_fixture_elements(&mut writer, &nodes, &ways, &rels);
     writer.flush().expect("flush");
     (nodes, ways, rels)
@@ -355,8 +360,13 @@ fn write_low_fixture(path: &Path) -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelat
         .optional_feature("LocationsOnWays")
         .build()
         .expect("build header");
-    let mut writer =
-        PbfWriter::to_path(path, Compression::default(), &header).expect("create writer");
+    let mut writer = PbfWriter::to_path(
+        path,
+        Compression::default(),
+        &header,
+        pbfhogg::host::Executor::Ambient,
+    )
+    .expect("create writer");
 
     let no_meta: Option<&Metadata> = None;
     let mut bb = BlockBuilder::new();

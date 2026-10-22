@@ -988,18 +988,18 @@ impl ElementReader<FileReader> {
     /// Open a file, choosing page-cache eviction up front.
     ///
     /// Forwards to [`BlobReader::evict_page_cache`]; see that method for what
-    /// the default does and why you might not want it. Eviction is on by
-    /// default for the buffered file constructors.
+    /// eviction does and when you might want it. Eviction is off by default
+    /// for the file constructors.
     ///
-    /// This is the constructor to use when the point is to leave the *whole*
-    /// file's cache alone. [`ElementReader::from_path`] reads and decodes the
-    /// header blob before it returns, and the eviction decision has to be made
-    /// before that read - see [`ElementReader::evict_page_cache`].
+    /// This is the constructor to use when eviction should cover the *whole*
+    /// file. [`ElementReader::from_path`] reads and decodes the header blob
+    /// before it returns, and the eviction decision has to be made before that
+    /// read - see [`ElementReader::evict_page_cache`].
     ///
     /// ```
     /// # fn foo() -> pbfhogg::Result<()> {
-    /// // Keep the file warm for a second pass, header included.
-    /// let reader = pbfhogg::ElementReader::from_path_with_eviction("tests/test.osm.pbf", false)?;
+    /// // A one-pass read of a file larger than RAM, header included.
+    /// let reader = pbfhogg::ElementReader::from_path_with_eviction("tests/test.osm.pbf", true)?;
     /// # Ok(())
     /// # }
     /// # foo().unwrap();
@@ -1023,17 +1023,21 @@ impl ElementReader<FileReader> {
     /// Forwards to [`BlobReader::evict_page_cache`]. Note the "from the next
     /// blob onwards": every `ElementReader` file constructor reads and decodes
     /// the header blob before returning, so by the time this method can be
-    /// called the header's pages have already been advised away under the
-    /// default. Passing `false` here therefore spares the element blobs but not
-    /// the header. Use [`ElementReader::from_path_with_eviction`] when the
-    /// whole file must be left untouched.
+    /// called the header has already been read under the constructor's choice
+    /// (no eviction, for the public constructors). Passing `true` here
+    /// therefore evicts behind the element blobs, and the header's pages go
+    /// with the first of them, because the advised range is the whole consumed
+    /// prefix. Use [`ElementReader::from_path_with_eviction`] to fix the choice
+    /// before the header is read.
     #[must_use]
     pub fn evict_page_cache(mut self, enabled: bool) -> Self {
         self.blob_iter = self.blob_iter.evict_page_cache(enabled);
         self
     }
 
-    /// Open a file, selecting buffered or O_DIRECT based on the `direct` flag.
+    /// Open a file for a command run under `host`: buffered or O_DIRECT per
+    /// `direct`, with the host's diagnostics, resources and page-cache policy,
+    /// the latter applied before the header blob is read.
     pub(crate) fn open_in<P: AsRef<Path>>(
         path: P,
         direct: bool,
@@ -1053,6 +1057,8 @@ impl ElementReader<FileReader> {
         })
     }
 
+    /// Open a file, selecting buffered or O_DIRECT based on the `direct` flag.
+    /// The page cache is left alone; see [`ElementReader::evict_page_cache`].
     pub fn open<P: AsRef<Path>>(path: P, direct: bool) -> Result<Self> {
         let mut blob_iter = BlobReader::open(path, direct)?;
         let header = read_header_blob(&mut blob_iter)?;
@@ -1160,47 +1166,57 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    /// The eviction opt-out has to be supplied before the header blob is read,
-    /// or it cannot deliver what it promises.
+    /// Public file readers keep the page cache unless asked, and an eviction
+    /// request has to be supplied before the header blob is read to cover it.
     ///
-    /// The distinction this test exists to draw is "no eviction at all" versus
-    /// "eviction of the header only". A reader in either state has a cleared
-    /// `evict_fd`, so the fd cannot tell them apart; the fadvise call count can,
-    /// and it is what the kernel actually saw.
+    /// The distinction this test draws is "the header was read without
+    /// eviction" versus "the header was evicted". A reader in either state can
+    /// carry an armed `evict_fd` afterwards, so the fd cannot tell them apart;
+    /// the fadvise call count can, and it is what the kernel actually saw.
     #[test]
     #[cfg(target_os = "linux")]
-    fn eviction_opt_out_must_be_supplied_before_the_header_blob_is_read() {
+    fn public_readers_keep_the_page_cache_unless_asked() {
         let path = "tests/test.osm.pbf";
 
-        // Post-hoc opt-out: the header blob was read under the default, so one
-        // fadvise has already been issued by the time the caller can say no.
+        // The default keeps: the header blob is read and nothing is advised.
+        let default_keep = ElementReader::from_path(path).unwrap();
+        assert_eq!(
+            default_keep.blob_iter.evict_call_count(),
+            0,
+            "a public reader must not evict by default"
+        );
+
+        // Post-hoc opt-in: the header blob was already read under the default,
+        // so no fadvise has been issued for it yet.
         let late = ElementReader::from_path(path)
             .unwrap()
-            .evict_page_cache(false);
+            .evict_page_cache(true);
         assert_eq!(
             late.blob_iter.evict_call_count(),
-            1,
-            "from_path reads the header eagerly, so a post-hoc opt-out cannot \
-             un-advise the header blob - if this is 0 the constructor stopped \
-             reading the header and the doc comment on evict_page_cache is stale"
+            0,
+            "from_path reads the header eagerly, so a post-hoc opt-in cannot \
+             have advised the header blob - if this is 1 the constructor stopped \
+             honouring the default and the doc comment on evict_page_cache is stale"
         );
 
-        // Up-front opt-out: nothing is ever advised away.
-        let early = ElementReader::from_path_with_eviction(path, false).unwrap();
+        // Up-front opt-in: the header blob itself is advised away.
+        let early = ElementReader::from_path_with_eviction(path, true).unwrap();
         assert_eq!(
             early.blob_iter.evict_call_count(),
-            0,
-            "from_path_with_eviction(false) must leave the whole file's cache \
-             alone, header included"
+            1,
+            "from_path_with_eviction(true) must evict from the header blob on"
         );
 
-        // And the default still evicts, so the assertion above is not vacuous.
-        let default_on = ElementReader::from_path(path).unwrap();
-        assert_eq!(
-            default_on.blob_iter.evict_call_count(),
-            1,
-            "the buffered default must still evict the header blob"
-        );
+        // And the element stream is the same either way.
+        let count = |reader: ElementReader<crate::read::file_reader::FileReader>| {
+            let mut n = 0usize;
+            reader.for_each(|_| n += 1).unwrap();
+            n
+        };
+        let kept = count(ElementReader::from_path(path).unwrap());
+        let evicted = count(ElementReader::from_path_with_eviction(path, true).unwrap());
+        assert_eq!(kept, evicted, "eviction must not change what is delivered");
+        assert!(kept > 0, "the fixture must contain elements");
     }
 
     // The `par_map_reduce` frame pump admits blobs against `ByteBudget` before

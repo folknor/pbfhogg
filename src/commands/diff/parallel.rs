@@ -282,6 +282,7 @@ fn run_shard(
     kind: ElemKind,
     options: &DiffOptions,
     scratch_dir: &Path,
+    scratch_suffix: &str,
 ) -> Result<ShardOutput> {
     // Test-only: arm via `test_hooks::PANIC_AT_SHARD_IDX`. Simulates a
     // mid-phase shard crash. The caller's `scope.spawn(...).join()`
@@ -297,8 +298,8 @@ fn run_shard(
     }
 
     let type_char = kind_type_char(kind);
-    let text_path = shard_text_path(scratch_dir, kind, shard_idx);
-    let file = std::fs::File::create(&text_path).map_err(io_err)?;
+    let text_path = shard_text_path(scratch_dir, scratch_suffix, kind, shard_idx);
+    let file = crate::scratch::create_file(&text_path).map_err(io_err)?;
     let mut out = BufWriter::new(file);
 
     let mut stats = DiffStats::default();
@@ -630,14 +631,19 @@ fn kind_type_char(kind: ElemKind) -> char {
     }
 }
 
-fn shard_text_path(scratch_dir: &Path, kind: ElemKind, shard_idx: usize) -> PathBuf {
+/// A shard's scratch text file. `suffix` is the run token's
+/// ([`crate::scratch::RunToken::suffix`]), so two runs in one process name and
+/// clean up disjoint files.
+fn shard_text_path(scratch_dir: &Path, suffix: &str, kind: ElemKind, shard_idx: usize) -> PathBuf {
     let kind_tag = match kind {
         ElemKind::Node => "n",
         ElemKind::Way => "w",
         ElemKind::Relation => "r",
     };
     let pid = std::process::id();
-    scratch_dir.join(format!("diff-par-{pid}-{kind_tag}-{shard_idx}.txt.tmp"))
+    scratch_dir.join(format!(
+        "diff-par-{pid}{suffix}-{kind_tag}-{shard_idx}.txt.tmp"
+    ))
 }
 
 fn emit_element(
@@ -693,6 +699,7 @@ pub(crate) fn diff_block_pair_parallel(
     filter: &TypeFilter,
     shard_count: usize,
     host: &crate::host::Host,
+    token: &crate::scratch::RunToken,
 ) -> Result<DiffStats> {
     // DIFF_SCAN_START/END and diff_common/created/modified/deleted counters
     // are emitted by the calling `diff()` function in `mod.rs`; do not
@@ -700,10 +707,13 @@ pub(crate) fn diff_block_pair_parallel(
     let old = walk_file(old_path, host)?;
     let new = walk_file(new_path, host)?;
 
-    // Scratch temp files live alongside the old input (its parent is assumed
-    // to be on a writable, fast filesystem; this is the same assumption the
-    // `--format osc` sibling driver makes for its shard fragments).
-    let scratch_dir = old_path.parent().unwrap_or(Path::new("."));
+    // Scratch temp files live alongside the old input unless the host names
+    // a scratch parent (the old input's parent is assumed to be on a
+    // writable, fast filesystem; this is the same assumption the `--format
+    // osc` sibling driver makes for its shard fragments).
+    let scratch_dir = host.scratch_parent_or(old_path.parent().unwrap_or(Path::new(".")));
+    let suffix = token.suffix();
+    let suffix = suffix.as_str();
 
     let mut total = DiffStats::default();
 
@@ -775,6 +785,7 @@ pub(crate) fn diff_block_pair_parallel(
                         kind,
                         options,
                         scratch_dir,
+                        suffix,
                     )
                 });
                 handles.push(h);
@@ -792,8 +803,10 @@ pub(crate) fn diff_block_pair_parallel(
         // shard errored or panicked, clean up every possible per-shard
         // temp file - including ones that completed successfully as well
         // as any that a panicked worker left behind - before returning.
-        // Without this pass, `scratch_dir` accumulates `diff-par-*-{pid}-*`
-        // files on every failed run.
+        // Without this pass, `scratch_dir` accumulates
+        // `diff-par-{pid}{suffix}-*` files on every failed run. The names
+        // are recomputed from the same token, so a concurrent run in this
+        // process keeps its own files.
         let mut outputs: Vec<ShardOutput> = Vec::with_capacity(shard_outputs.len());
         let mut first_err: Option<crate::error::Error> = None;
         for slot in shard_outputs {
@@ -815,6 +828,7 @@ pub(crate) fn diff_block_pair_parallel(
             for shard_idx in 0..shards.len() {
                 drop(std::fs::remove_file(shard_text_path(
                     scratch_dir,
+                    suffix,
                     kind,
                     shard_idx,
                 )));

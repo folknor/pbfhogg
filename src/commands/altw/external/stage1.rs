@@ -550,12 +550,11 @@ pub(super) fn stage1_way_pass(
 
     // Cap num_workers against the file descriptor budget. Pass B below
     // holds `num_workers * NUM_BUCKETS` rank-shard files open
-    // concurrently (see `stage1.rs` Pass B loop at lines 385-405). On a
-    // host with default soft ulimit (1024) this blows past RLIMIT_NOFILE
-    // at ~4 workers, so we self-raise to the hard cap first and then
-    // floor the worker count to what actually fits. Narrate the outcome
-    // to stderr so the user sees what adjustments we made on their
-    // behalf.
+    // concurrently. A default soft ulimit of 1024 cannot support four
+    // workers, so ask the caller's process actions for an allowance and
+    // floor the worker count to what fits. The CLI raises the soft limit
+    // to the hard cap; NoProcessActions only probes it. Report the outcome
+    // through the caller's diagnostics.
     let cpu_cap = crate::host::sized_workers(&*host.resources, 2, 1, 4);
     let fd_budget = host
         .process

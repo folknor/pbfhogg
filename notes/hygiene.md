@@ -507,67 +507,6 @@ apply-changes.
 
 Reported by: write path, change application, re-encoding, CLI and plumbing.
 
-## HYG-019 - The library writes operator text to stderr and stdout directly
-
-About 40 library files call `eprintln!`. The stdout half is closed: the
-library no longer owns stdout (the `inspect` and `check` report types render
-into a caller-supplied `io::Write`, the CLI writes through `cli/src/output.rs`,
-and `no-print-macro` / `no-stdout-handle` textlint rules in `brokkr.toml` keep
-it that way). Stderr is not: an `eprintln!` panics when stderr's reader goes
-away (`pbfhogg sort ... 2>&1 | head` exits 101), which is the same defect class
-the stdout rules closed; the library-use audit of stderr output is tracked in bz
-as pbfhogg#1. What remains:
-
-- Summaries: `print_summary` on every `*Stats` (`ExtractStats`,
-  `TagsFilterStats`, `TagsFilterOscStats`, `GetidStats`, `GetparentsStats`,
-  `TimeFilterStats`, `ExportStats`, `RenumberStats`, altw `Stats`, apply-changes
-  `MergeStats`). Apply-changes `merge` calls its own `print_summary`;
-  merge-changes returns stats and leaves printing to the CLI, so the two
-  sibling commands follow opposite conventions.
-- Progress: sort's "Pass 1: indexing blobs...", `merge_pbf`, `osc/parse.rs`
-  "[1/3] Parsing diff..." and per-file lines from `load_all_diffs`,
-  apply-changes "Parsing OSC diff" / "Diff ID ranges", `[multi-extract]`,
-  `[getid]`, `[tags-filter]`, `[N/M] Extracting to ...`, about 15 lines from
-  `build_geocode_index` (plus a `hotpath` block printing `key=value` lines, a
-  third format on the stream; the CLI then prints the geocode counts again).
-- Warnings and hints: the `warn_*_loss` helpers (and an inline copy of the
-  way-level-metadata warning text in `repack/mod.rs`), repack's "never fired",
-  sort's sortedness note, the altw explicit-sparse "hint:" and three
-  "auto-selected --index-type ..." lines, `blob_wire.rs`'s
-  `warn_unrecognised_indexdata` (once per process via a global `Once`, no file
-  or offset, so on multi-input commands the degraded input is unnamed and a
-  second bad file is never reported).
-- Developer diagnostics on every run: `[coord_payloads] streaming router ... MB
-  in worker tmps`, `[altw external] num_workers = ...` (twice), `[altw external]
-  RLIMIT_NOFILE...`, `[uring_writer] error: {e}` and `[parallel_writer] thread
-  exit: {e}` (which also return the error, so the operator sees it twice in
-  different words, with no output path).
-
-A library consumer cannot silence, redirect or capture any of it; the CLI has
-no `--quiet` beyond `diff -q` and `check --quiet`. Prefixes for one class of
-event: `Warning:`, `warning:`, `Warning!`, `hint:`, `[tags-count]`,
-`[getid --invert]`, `[inspect]`, `time-filter:`, `add-locations-to-ways:`,
-`[altw external]`, `[coord_payloads]`, bare text. Lines: the apply-changes
-"Blobs:" summary is about 150 characters with two always-zero sub-counts; the
-`-j 1` refusal is ten lines and the version-regression errors about five each;
-`warn_locations_on_ways_loss` prints once per input in `cat` with no filename;
-sort's "verifying intra-blob order" line has no warning prefix though it means
-pass 1 decodes every blob. Events that matter to an operator (sort overlaps,
-repack's cap never firing, renumber orphan refs) go out as prose and as
-counters, spelled independently. The CLI already states the principle:
-`export_error` says "a Display impl in a library has no idea which front end is
-reading it".
-
-Fix: the library returns stats and warnings as data (`warnings: Vec<Warning>`
-or a `Reporter` / diagnostics sink in the options) and never prints; the CLI
-owns formatting, levels and `--quiet`; developer diagnostics move to the
-counter channel, where the same numbers already go. Enforce with
-`clippy::print_stderr = "deny"` on the library crate, allowed in `cli/` and the
-sink (the stdout counterpart is already a textlint rule). Every hunter named
-that lint.
-
-Reported by: all nine scopes.
-
 ## HYG-020 - Library error text names CLI flags and commands
 
 `require_indexdata` tells the user to run `pbfhogg cat input.osm.pbf -o
@@ -795,8 +734,11 @@ Reported by: altw and scanning, re-encoding, geocode index.
 
 ## HYG-029 - Scratch naming and cleanup use a different mechanism at every site, and nothing reaps crashed runs
 
-Naming: `diff-par-{pid}-{kind}-{shard}.txt.tmp`;
-`derive-{creates,modifies,deletes}-{pid}.xml.tmp`; derive-parallel shards add
+Naming: `diff-par-{pid}{run}-{kind}-{shard}.txt.tmp`;
+`derive-{creates,modifies,deletes}-{pid}{run}.xml.tmp`, where `{run}` is the
+per-run token suffix (`scratch::RunToken`, empty for a process's first run), so
+runs inside one process no longer collide and what remains here is the
+cross-process side; derive-parallel shards add
 a process-lifetime nanosecond tag "because PID alone collides across
 containers", while derive-parallel's outer files in the same function omit it;
 `process_scratch_tag` derives the tag from the low 32 bits of `SystemTime`
@@ -805,11 +747,12 @@ nanoseconds, so two processes in one tick or on a coarse clock collide; altw's
 (create), `stage2.rs` (open) and `external/mod.rs` (cleanup) while
 `ScratchDir::bucket_path` exists for `slot-NNN`, and if one copy changes stage 2
 skips missing shards (`NotFound => continue`), surfacing as missing locations.
-`std::process::id()` is the identity in `ScratchDir`, the sparse store and
-`OutputFile`.
+`std::process::id()` plus the run token is the identity in `ScratchDir` and the
+sparse store, and the pid plus a counter in `OutputFile`; none of them guards
+against a pid reused by a later process.
 
-Cleanup: `derive.rs` calls `sink.cleanup()` after a closure, no `Drop`, so a
-panic leaks three files; derive-parallel outer files use `PathGuard` (citing
+Cleanup: sequential derive fragments now use `PathGuard`, including partial
+sink construction and unwinding. Derive-parallel outer files use `PathGuard` (citing
 `decisions/0003`), then `commit()` and `remove_file` anyway; shard files are
 deleted by a sweep that recomputes every possible path on error and by
 `append_and_cleanup`, which since the output-write-failure fix (parallel diff
@@ -920,26 +863,27 @@ packed structs, so a layout mismatch is a type error; a generic
 
 Reported by: change application, altw and scanning, geocode index.
 
-## HYG-033 - The library mutates the process allocator
+## HYG-033 - The CLI's arena cap is process-global and depends on which command ran
 
-`crate::debug::cap_malloc_arenas()` (`mallopt(M_ARENA_MAX, 2)`) is called from
-`check_refs`, `verify_ids`, `cat` (`cat_filtered`), `repack`, `degrade`
-(`degrade_decode_path`), `renumber`, `time_filter` and the geocode builder, each
-with a comment saying it is scoped to this command. The call itself is now
-centralized in `src/debug.rs`, gated on `target_os = "linux"` plus
-`target_env = "gnu"` with a no-op fallback, and a textlint rule in `brokkr.toml`
-keeps raw `libc::mallopt` and friends out of every other file, so musl builds.
-What remains: `mallopt` is process-global and never restored, so a library
-consumer that calls one of these once (a server that builds a geocode index then
-serves) keeps two arenas for life; in the CLI the setting depends on which
-command ran. `time_filter`'s comment documents a path that regresses under it.
-With jemalloc/mimalloc as the global allocator it silently does nothing and the
-documented RSS difference reappears. `brokkr.toml` captures `MALLOC*` env vars,
-suggesting `MALLOC_ARENA_MAX` was once the knob. Fix: allocator tuning belongs
-to `cli/src/main.rs`, per subcommand if needed, or to an explicit opt-in option
-rather than a library call. A `--target x86_64-unknown-linux-musl` build in a
-sweep would pin the musl half, which is currently held only by the textlint
-rule.
+The library no longer calls `mallopt`: `check_refs`, `verify_ids`, `cat`
+(`cat_filtered`), `repack`, `degrade` (`degrade_decode_path`), `renumber`,
+`time_filter` and the geocode builder call the host's
+`ProcessActions::cross_thread_alloc_pool` hook, and only the CLI's hook
+(`process::cap_malloc_arenas`, `mallopt(M_ARENA_MAX, 2)`) does anything
+(ADR-0016). The glibc calls live in `src/process.rs` and `src/debug.rs`, gated
+on `target_os = "linux"` plus `target_env = "gnu"` with a no-op fallback, and a
+textlint rule in `brokkr.toml` keeps raw `libc::mallopt` and friends out of
+every other file, so musl builds.
+What remains: `mallopt` is process-global and never restored, so in the CLI the
+setting depends on which command ran (an embedding caller that installs the same
+hook keeps two arenas for life). `time_filter`'s comment documents a path that
+regresses under it. With jemalloc/mimalloc as the global allocator it silently
+does nothing and the documented RSS difference reappears. `brokkr.toml`
+captures `MALLOC*` env vars, suggesting `MALLOC_ARENA_MAX` was once the knob.
+Fix: allocator tuning belongs to `cli/src/main.rs`, per subcommand if needed,
+rather than a hook at command level. A `--target x86_64-unknown-linux-musl`
+build in a sweep would pin the musl half, which is currently held only by the
+textlint rule.
 
 Reported by: re-encoding, geocode index, CLI and plumbing.
 
@@ -1076,9 +1020,11 @@ plumbing.
   gate `libc`, which is unconditional.
 - `FileReader::buffered` issues `POSIX_FADV_SEQUENTIAL` only under
   `any(feature = "linux-direct-io", feature = "linux-io-uring")`, while
-  `blob.rs` issues `DONTNEED` under plain `target_os = "linux"`; so the default
-  library build reads without the readahead hint and the CLI with it, and any
-  benchmark comparing a library consumer to the CLI compares different I/O.
+  `blob.rs` issues `DONTNEED` (when eviction is on: the CLI's
+  `PageCachePolicy::Evict` or an explicit opt-in) under plain
+  `target_os = "linux"`; so the default library build reads without the
+  readahead hint and the CLI with it, and any benchmark comparing a library
+  consumer to the CLI compares different I/O.
 - Altw stage 2 and 3 `posix_fadvise(DONTNEED)` on slot buckets and id shards,
   and stage 2's dropped `sync_data`, run whenever the `linux-direct-io` feature
   is compiled, whether or not `--direct-io` was passed; the `consumer` sweep
@@ -2048,7 +1994,8 @@ Reported by: geocode index.
   upserts is counted nowhere; merge-changes' N>1 vs N<=1 strategy choice is
   unrecorded.
 
-Fix: route each through the diagnostics channel of HYG-019 and a counter.
+Fix: route each through the `host::Diagnostics` channel (an event with its own
+key) and a counter.
 
 Reported by: re-encoding, filtering and spatial, read path, write path, change
 application.
@@ -2311,9 +2258,9 @@ Reported by: geocode index.
 
 ## HYG-106 - Dead or stale code in the CLI, plumbing and brokkr configuration
 
-- `debug::malloc_trim` and `debug::set_mmap_threshold`: no caller in `src/`,
-  `cli/` or tests; their docs describe investigations. `debug` is `pub`, so an
-  external caller is possible in principle.
+- `process::malloc_trim` and `process::set_mmap_threshold`: no caller in
+  `src/`, `cli/` or tests; their docs describe investigations. `process` is
+  `pub`, so an external caller is possible in principle.
 - `debug::emit_mallinfo2` calls in `extract`, `check_refs` and `time_filter`
   carry "DIAGNOSTIC (2026-04-11 round 3)" provenance and fire on every run;
   whether brokkr still reads `MI_*` / `checkrefs_*_arena` needs a brokkr-side
@@ -2348,11 +2295,9 @@ Reported by: CLI and plumbing, test harness.
   breakpoints. Use strace for syscall-backed calls and LD_PRELOAD for mallopt.
 - altw `inject_metrics`, `WRITER_METRICS` and `PIPELINE_METRICS` mix counters
   across concurrent runs. `process_scratch_tag` is also process-global;
-  the planned per-run tokens make sharing that tag harmless.
-- `diff/parallel.rs` puts scratch beside the old input. Derive's gzip
-  workers ignore `-j`.
-- `emit_mallinfo2` does unconditional diagnostic work even without an armed
-  marker sink.
+  the per-run scratch tokens make sharing that tag harmless.
+- `diff/parallel.rs` puts scratch beside the old input unless
+  `Host::scratch_parent` says otherwise. Derive's gzip workers ignore `-j`.
 - The panic-hook-swapping reader test can silence concurrent panic output.
 - Raising RLIMIT_NOFILE is inherited by children and can break select(2).
 - The static-hook textlint exempts every `tests/fault_*.rs`, but
@@ -2367,3 +2312,34 @@ owns BROKKR_TEST_BIN_DIR and cannot be redirected to a baseline. Test filters
 match substrings, so bless and compare names must not contain each other.
 
 Reported by: library-use implementation survey.
+
+## HYG-108 - Diagnostic wording is inconsistent across commands
+
+The library now reports through keyed `host::Diagnostics` events and the CLI
+prints each as one stderr line, byte for byte as before; the wording itself
+was deliberately left alone. What remains is a CLI output change:
+
+- Prefixes for one class of event: `Warning:`, `warning:`, `Warning!`,
+  `hint:`, `[tags-count]`, `[getid --invert]`, `[inspect]`, `time-filter:`,
+  `add-locations-to-ways:`, `[altw external]`, `[coord_payloads]`, bare text.
+  The event kind (`Warning`, `Note`, `Progress`, `Developer`) now carries the
+  class, so the CLI sink could render the prefix uniformly.
+- The apply-changes "Blobs:" summary is about 150 characters with two
+  always-zero sub-counts; the `-j 1` refusal is ten lines and the
+  version-regression errors about five each.
+- `warn_locations_on_ways_loss` reports once per input in `cat` with no
+  filename; the unrecognised-indexdata warning names no file or offset.
+- sort's "verifying intra-blob order" line has no warning prefix though it
+  means pass 1 decodes every blob.
+- `[uring_writer] error: {e}` and `[parallel_writer] thread exit: {e}` are
+  also returned as the error, so the operator sees each twice in different
+  words; the CLI prints the geocode counts after the library's own `done`
+  line.
+- Events that matter to an operator (sort overlaps, repack's cap never
+  firing, renumber orphan refs) go out as prose and as counters, spelled
+  independently.
+- The CLI has no `--quiet` beyond `diff -q` and `check --quiet`; with keyed
+  events it could filter by kind.
+
+Reported by: all nine scopes (split out of the library stderr item when the
+library stopped writing stderr).

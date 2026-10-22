@@ -198,6 +198,7 @@ The production write path. Compresses blobs in parallel using rayon, with a dedi
 ```rust
 use pbfhogg::write::block_builder::{HeaderBuilder, BlockBuilder};
 use pbfhogg::write::writer::{PbfWriter, Compression};
+use pbfhogg::host::Executor;
 
 let header_bytes = HeaderBuilder::new()
     .bbox(9.0, 54.0, 13.0, 58.0)
@@ -208,6 +209,7 @@ let mut writer = PbfWriter::to_path(
     "output.osm.pbf".as_ref(),
     Compression::default(),  // zlib level 6
     &header_bytes,
+    Executor::Ambient,       // frame on rayon's ambient pool
 )?;
 
 let mut bb = BlockBuilder::new();
@@ -221,6 +223,37 @@ writer.flush()?;
 # Ok::<(), std::io::Error>(())
 ```
 
+After successful writes, `flush()` checks completion and reports deferred errors. The file-backed pipelines also sync the file. A synchronous `PbfWriter::new` only calls the underlying `Write::flush`, which does not guarantee durability. Dropping a writer without flushing is cleanup only and reports nothing, including a missing tail.
+
+### Executor
+
+Every `to_path*` constructor takes an `Executor` (`pbfhogg::host::Executor`) naming where the framing and compression work runs. `Executor::Ambient` uses whatever rayon pool the calling thread is in, or rayon's global pool off any pool. `Executor::Pool(Arc<rayon::ThreadPool>)` confines the work to a pool you own:
+
+```rust
+use std::sync::Arc;
+use pbfhogg::host::Executor;
+use pbfhogg::write::block_builder::HeaderBuilder;
+use pbfhogg::write::writer::{PbfWriter, Compression};
+
+let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(4).build()?);
+let header_bytes = HeaderBuilder::new().build()?;
+let mut writer = PbfWriter::to_path(
+    "output.osm.pbf".as_ref(),
+    Compression::default(),
+    &header_bytes,
+    Executor::Pool(Arc::clone(&pool)),
+)?;
+// ... write blocks, then flush
+writer.flush()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Three things follow from handing the writer a pool:
+
+- Thread-local framing and decompression scratch persists on whichever pool's threads ran it, for as long as those threads live. Release every owner of the pool, including its writers, to let its workers exit and free that scratch; dropping a pool does not join its workers.
+- A panic in the framing work is handled by the pool's `panic_handler`. With no handler, rayon aborts the process; with one, the lost blob surfaces as an error from `flush()`.
+- A writer driven from a worker of its executor's pool - even a one-thread pool - waits for its framing work cooperatively and cannot deadlock on it. A writer moved between pools mid-stream under `Ambient` is not covered by that wait.
+
 ### to_path_direct - O_DIRECT writes
 
 Bypasses the page cache. Prevents cache pollution at planet scale (80 GB+ output). Requires the `linux-direct-io` feature and a real filesystem (not tmpfs).
@@ -228,12 +261,14 @@ Bypasses the page cache. Prevents cache pollution at planet scale (80 GB+ output
 ```rust
 use pbfhogg::write::writer::{PbfWriter, Compression};
 use pbfhogg::write::block_builder::HeaderBuilder;
+use pbfhogg::host::Executor;
 
 let header_bytes = HeaderBuilder::new().build()?;
 let mut writer = PbfWriter::to_path_direct(
     "output.osm.pbf".as_ref(),
     Compression::default(),
     &header_bytes,
+    Executor::Ambient,
 )?;
 // ... write blocks, then flush
 writer.flush()?;
@@ -247,12 +282,14 @@ Uses io_uring `WriteFixed` with pre-registered page-aligned buffers. 20% faster 
 ```rust
 use pbfhogg::write::writer::{PbfWriter, Compression};
 use pbfhogg::write::block_builder::HeaderBuilder;
+use pbfhogg::host::Executor;
 
 let header_bytes = HeaderBuilder::new().build()?;
 let mut writer = PbfWriter::to_path_uring(
     "output.osm.pbf".as_ref(),
     Compression::None,
     &header_bytes,
+    Executor::Ambient,
 )?;
 // ... write blocks, then flush
 writer.flush()?;
@@ -323,6 +360,7 @@ Reading a PBF, filtering ways, and writing the result:
 use pbfhogg::{ElementReader, Element};
 use pbfhogg::write::block_builder::{HeaderBuilder, BlockBuilder};
 use pbfhogg::write::writer::{PbfWriter, Compression};
+use pbfhogg::host::Executor;
 
 let reader = ElementReader::from_path("tests/test.osm.pbf")?;
 
@@ -334,6 +372,7 @@ let mut writer = PbfWriter::to_path(
     "highways.osm.pbf".as_ref(),
     Compression::default(),
     &header_bytes,
+    Executor::Ambient,
 )?;
 
 let mut bb = BlockBuilder::new();

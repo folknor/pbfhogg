@@ -47,7 +47,8 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// memory is bounded by the number of distinct IDs, not by their spread or
 /// their maximum: at most 4 bytes (plus `Vec` slack) per ID in an array chunk,
 /// and a bit-array chunk holds more than [`SPARSE_MAX`] IDs, so the worst case
-/// is about 4 MiB / 4097 ~= 1 KiB per distinct ID at the promotion boundary,
+/// is about 4 MiB / (`SPARSE_MAX` + 1) ~= 4 KiB per distinct ID at the
+/// promotion boundary,
 /// plus the direct directory (at most `DIRECT_CHUNKS` entries) and a transient
 /// array during each promotion. A planet node set is ~400 bit-array chunks,
 /// about 1.6 GB.
@@ -80,11 +81,14 @@ const OFFSET_MASK: u64 = (1 << ID_SHIFT) - 1;
 /// is therefore bounded by a few MiB instead of growing with the ID.
 const DIRECT_CHUNKS: u64 = 1 << 18;
 
-/// Largest member count of an array chunk. The insertion of member 4097
-/// promotes the chunk to a bit array. At 4096 the sorted-insert cost stays
-/// small (at most ~32 MiB moved per chunk, in the all-descending case), and
-/// real OSM chunks cross it almost immediately.
-const SPARSE_MAX: usize = 4096;
+/// Largest member count of an array chunk. The insertion of member
+/// `SPARSE_MAX + 1` promotes the chunk to a bit array. Inserting in random
+/// order (way refs in way order) moves about `SPARSE_MAX^2` bytes per chunk
+/// before promotion, so the threshold is a speed/memory trade: at 4096 that
+/// was ~16 MiB per chunk, several GB on a country-sized pass 0 and a measured
+/// regression in its single-threaded merge; at 1024 it is ~1 MiB, while the
+/// worst-case memory per distinct ID stays a few KiB.
+const SPARSE_MAX: usize = 1024;
 
 /// Rank block: 64 bytes = 8 words = 512 bits. At most 7 words scanned per
 /// within-chunk rank.
@@ -1204,7 +1208,7 @@ mod tests {
         // A duplicate at the boundary must not promote.
         assert!(!s.set_if_new(0));
         assert!(matches!(s.chunks[0], Some(Chunk::Sparse(_))));
-        // Member 4097 promotes and keeps every earlier member.
+        // Member SPARSE_MAX + 1 promotes and keeps every earlier member.
         assert!(s.set_if_new(1));
         assert!(matches!(s.chunks[0], Some(Chunk::Dense(_))));
         for k in 0..SPARSE_MAX as i64 {

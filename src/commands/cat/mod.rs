@@ -865,7 +865,7 @@ mod tests {
                 .source("geofabrik.de")
                 .historical()
                 .sorted()
-                .optional_feature("LocationsOnWays")
+                .optional_feature(crate::read::block::Feature::LOCATIONS_ON_WAYS)
                 .writing_program("other-tool")
                 .build()
                 .unwrap(),

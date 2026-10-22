@@ -605,7 +605,7 @@ fn passthrough_header_bytes(
         build_output_header(&header, header.is_sorted(), overrides, |hb| {
             let mut hb = hb;
             if header.has_locations_on_ways() {
-                hb = hb.optional_feature("LocationsOnWays");
+                hb = hb.optional_feature(crate::read::block::Feature::LOCATIONS_ON_WAYS);
             }
             if flags.strip_bbox {
                 hb = hb.without_bbox();

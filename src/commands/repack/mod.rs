@@ -186,7 +186,7 @@ pub fn repack(
         overrides,
         |hb| {
             if preserve_locations {
-                hb.optional_feature("LocationsOnWays")
+                hb.optional_feature(crate::read::block::Feature::LOCATIONS_ON_WAYS)
             } else {
                 hb
             }

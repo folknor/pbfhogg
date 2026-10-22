@@ -104,7 +104,9 @@ impl InspectReport {
             .iter()
             .chain(self.header_meta.optional_features.iter())
             .map(String::as_str)
-            .filter(|f| *f != "OsmSchema-V0.6" && *f != "DenseNodes")
+            .filter(|f| {
+                *f != crate::HeaderBlock::OSM_SCHEMA_V06 && *f != crate::HeaderBlock::DENSE_NODES
+            })
             .collect();
         if !features.is_empty() {
             writeln!(out, "Features: {}", features.join(", "))?;

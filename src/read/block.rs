@@ -11,6 +11,52 @@ use crate::error::{ErrorKind, Result, new_error, new_wire_error};
 use bytes::Bytes;
 use std;
 
+/// A feature name declared in an `OSMHeader`.
+///
+/// The associated constants own the spellings used by this crate. Converting
+/// from `&str` remains available for callers that preserve extension features
+/// unknown to pbfhogg. Any literal check must be scoped to feature declarations:
+/// wire fixtures and element diagnostics also contain some of these words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Feature<'a>(&'a str);
+
+impl<'a> Feature<'a> {
+    /// Required feature identifying the OSM PBF schema version.
+    pub const OSM_SCHEMA_V06: Self = Self("OsmSchema-V0.6");
+
+    /// Required feature declaring dense node encoding.
+    pub const DENSE_NODES: Self = Self("DenseNodes");
+
+    /// Optional feature declaring `Sort.Type_then_ID` ordering.
+    pub const SORT_TYPE_THEN_ID: Self = Self("Sort.Type_then_ID");
+
+    /// Optional feature declaring inline way-node coordinates.
+    pub const LOCATIONS_ON_WAYS: Self = Self("LocationsOnWays");
+
+    /// Optional feature declaring BlobHeader field-5 way-member bitmaps.
+    pub const WAY_MEMBERS_V1: Self = Self("pbfhogg.WayMembers-v1");
+
+    /// Optional feature declaring Way field-20 shared-node pin bitmaps.
+    pub const SHARED_NODE_PINS_V1: Self = Self("pbfhogg.SharedNodePins-v1");
+
+    /// Required feature declaring element history metadata.
+    pub const HISTORICAL_INFORMATION: Self = Self("HistoricalInformation");
+
+    /// Return the feature name as it appears in an `OSMHeader`.
+    pub const fn as_str(self) -> &'a str {
+        self.0
+    }
+}
+
+impl<'a, 'b> From<&'b str> for Feature<'a>
+where
+    'b: 'a,
+{
+    fn from(value: &'b str) -> Self {
+        Self(value)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Wire-format protobuf message types for header parsing
 // ---------------------------------------------------------------------------
@@ -214,7 +260,7 @@ impl HeaderBlock {
     }
 
     /// PBF optional feature string indicating entities are sorted by type then ID.
-    pub const SORT_TYPE_THEN_ID: &str = "Sort.Type_then_ID";
+    pub const SORT_TYPE_THEN_ID: &str = Feature::SORT_TYPE_THEN_ID.as_str();
 
     /// Returns `true` if the header declares `Sort.Type_then_ID`.
     pub fn is_sorted(&self) -> bool {
@@ -225,17 +271,23 @@ impl HeaderBlock {
     }
 
     /// PBF optional feature string indicating ways contain inline node coordinates.
-    pub const LOCATIONS_ON_WAYS: &str = "LocationsOnWays";
+    pub const LOCATIONS_ON_WAYS: &str = Feature::LOCATIONS_ON_WAYS.as_str();
 
     /// Optional feature declaring BlobHeader field-5 way-member bitmaps.
-    pub const WAY_MEMBERS_V1: &str = "pbfhogg.WayMembers-v1";
+    pub const WAY_MEMBERS_V1: &str = Feature::WAY_MEMBERS_V1.as_str();
 
     /// Optional feature declaring Way field-20 shared-node pin bitmaps.
-    pub const SHARED_NODE_PINS_V1: &str = "pbfhogg.SharedNodePins-v1";
+    pub const SHARED_NODE_PINS_V1: &str = Feature::SHARED_NODE_PINS_V1.as_str();
+
+    /// PBF required feature identifying the OSM schema version.
+    pub const OSM_SCHEMA_V06: &str = Feature::OSM_SCHEMA_V06.as_str();
+
+    /// PBF required feature declaring dense node encoding.
+    pub const DENSE_NODES: &str = Feature::DENSE_NODES.as_str();
 
     /// PBF required feature string indicating history metadata (`visible`) may
     /// be present on elements.
-    pub const HISTORICAL_INFORMATION: &str = "HistoricalInformation";
+    pub const HISTORICAL_INFORMATION: &str = Feature::HISTORICAL_INFORMATION.as_str();
 
     /// Returns `true` if the header declares `LocationsOnWays`.
     pub fn has_locations_on_ways(&self) -> bool {
@@ -641,6 +693,52 @@ fn packed_varint_count(data: &[u8]) -> Result<usize> {
     Ok(count)
 }
 
+/// [`packed_varint_count`] for a `uint32` string-index array (`keys` / `vals`
+/// on Node, Way and Relation), refusing any value above `u32::MAX` in the
+/// same single byte scan.
+///
+/// `PackedUint32Iter` cannot report an error and narrows each varint to
+/// `u32`, so an index above `u32::MAX` would silently alias a different,
+/// possibly valid, string. The bound is checked here, once per block at
+/// construction, rather than in `WireNode` / `WireWay` / `WireRelation`
+/// parsing: those run again per element on every iteration and in the raw
+/// scanners (altw's way-ref scan never reads tags at all), so a check there
+/// is an extra traversal of both arrays on the decode hot path. Folding it
+/// into the count walk this validation already performs costs no extra pass.
+///
+/// Byte `i` of a varint carries value bits `7i..7i+7`, so a value fits `u32`
+/// iff byte 4 carries nothing above bit 31 (payload at most `0x0f`) and every
+/// later byte carries nothing at all. An overlong encoding of a small value
+/// (zero payload bytes past the fifth) therefore fits, as it does for a
+/// decoding reader.
+#[inline]
+fn packed_uint32_count(data: &[u8]) -> Result<usize> {
+    let mut count = 0usize;
+    // Index of the current byte within its varint, saturating past 5.
+    let mut pos = 0u8;
+    for &b in data {
+        let payload = b & 0x7f;
+        let too_wide = match pos {
+            0..=3 => false,
+            4 => payload > 0x0f,
+            _ => payload != 0,
+        };
+        if too_wide {
+            return Err(new_wire_error("tag string index exceeds uint32"));
+        }
+        if b & 0x80 == 0 {
+            count += 1;
+            pos = 0;
+        } else {
+            pos = pos.saturating_add(1).min(5);
+        }
+    }
+    if pos != 0 {
+        return Err(new_wire_error("packed varint array ends mid-varint"));
+    }
+    Ok(count)
+}
+
 /// Structural validation of every group in a block, run once at construction.
 ///
 /// # Why this exists
@@ -664,10 +762,11 @@ fn packed_varint_count(data: &[u8]) -> Result<usize> {
 /// Per group, in order: the group's own top-level field framing; each `Node`,
 /// `Way` and `Relation` sub-message parses; each element's `Info` sub-message
 /// parses; every packed array on those elements holds only complete, bounded
-/// varints; the parallel-array invariants the zipping iterators depend on hold
+/// varints, and every `keys` / `vals` string index fits `u32`; the
+/// parallel-array invariants the zipping iterators depend on hold
 /// (`keys`/`vals` on all three kinds, `lat`/`lon`/`refs` on ways,
 /// `roles_sid`/`memids`/`types` on relations); the `DenseNodes` sub-message
-/// parses; its packed `id`, `lat` and `lon` arrays are well-formed and of
+/// appears at most once (`WireGroup::dense`) and parses; its packed `id`, `lat` and `lon` arrays are well-formed and of
 /// equal length; its `keys_vals` array describes exactly as many per-node tag
 /// runs as there are ids; and every array in its optional `denseinfo`
 /// sub-message is either absent or exactly as long as the id array.
@@ -770,8 +869,8 @@ fn validate_groups_strict(block: &WireBlock<'_>) -> Result<()> {
 /// this function formatting one.
 #[inline]
 fn validate_tag_arrays(keys_data: &[u8], vals_data: &[u8], mismatch: &'static str) -> Result<()> {
-    let keys = packed_varint_count(keys_data)?;
-    let vals = packed_varint_count(vals_data)?;
+    let keys = packed_uint32_count(keys_data)?;
+    let vals = packed_uint32_count(vals_data)?;
     if keys != vals {
         return Err(new_wire_error(mismatch));
     }

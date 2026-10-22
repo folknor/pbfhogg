@@ -6,8 +6,9 @@
 //! directly (no string table, no `PrimitiveBlock` construction) and covers
 //! both node encodings the format allows:
 //!
-//! - **DenseNodes**: the first DenseNodes message of each group, through
-//!   `WireGroup::dense` - the accessor the element iterator uses.
+//! - **DenseNodes**: the DenseNodes message of each group, through
+//!   `WireGroup::dense` - the accessor the element iterator uses, which
+//!   refuses a group that repeats it.
 //! - **Plain `Node` messages**: every `Node` of each group, through
 //!   `WireGroup::nodes` - again the element iterator's accessor.
 //!
@@ -16,20 +17,25 @@
 //! rewrite path sees and writes, and gives a duplicated id within one blob
 //! the same winner the iterator would.
 //!
-//! All coordinate arithmetic is checked: granularity must be positive and at
-//! most one degree per unit, delta accumulation and `offset + granularity *
-//! raw` must not overflow `i64`, and the decimicrodegree result must fit in
-//! `i32`. Every decoded node is validated before the caller decides whether
-//! it needs it, so a corrupt coordinate is an error even on a node no OSC
-//! way references. Group framing errors that the sub-message iterator
-//! cannot report are caught by the strict `PrimitiveBlock` parse that
-//! always follows this extraction on the same bytes.
+//! All coordinate scaling is checked: granularity must be positive and at
+//! most one degree per unit, `offset + granularity * raw` must not overflow
+//! `i64`, and the decimicrodegree result must fit in `i32`. Dense delta
+//! accumulation is modular, as in the decoder and the writer, so IDs that
+//! wrap extract as the values every reader yields; a coordinate sum that
+//! wraps lands at least 2^63 from the previous, accepted one, outside the
+//! window the checked scaling accepts, so it is refused as before. Every
+//! decoded node is validated before the caller decides whether it needs it,
+//! so a corrupt coordinate is an error even on a node no OSC way references.
+//! Group framing errors that the sub-message iterator cannot report are
+//! caught by the strict `PrimitiveBlock` parse that always follows this
+//! extraction on the same bytes.
 //!
-//! The wire scanner in `crate::scan::node` used to serve this role. It only
-//! reads DenseNodes, errors on plain `Node` messages, and stops reading a
-//! group at its DenseNodes message, so a plain `Node` after it in the same
-//! group was skipped without an error; apply-changes swallowed its errors,
-//! dropping every coordinate in such a blob without a word.
+//! The wire scanner in `crate::scan::node` used to serve this role. It reads
+//! only DenseNodes and errors on plain `Node` messages; at the time it also
+//! stopped reading a group at its DenseNodes message, so a plain `Node` after
+//! it in the same group was skipped without an error, and apply-changes
+//! swallowed its errors, dropping every coordinate in such a blob without a
+//! word.
 
 use crate::error::{Error, Result, new_wire_error};
 use crate::read::wire::{
@@ -43,8 +49,8 @@ const MAX_GRANULARITY: i64 = 1_000_000_000;
 
 fn overflow_err() -> Error {
     new_wire_error(
-        "node coordinate arithmetic overflowed i64; the blob's id or coordinate \
-         values are corrupt",
+        "node coordinate arithmetic overflowed i64; the blob's granularity, \
+         offset, or coordinate values are corrupt",
     )
 }
 
@@ -122,9 +128,11 @@ pub(super) fn extract_node_coords<F: FnMut(i64, i32, i32)>(
             let mut lat: i64 = 0;
             let mut lon: i64 = 0;
             while let (Some(did), Some(dlat), Some(dlon)) = (ids.next(), lats.next(), lons.next()) {
-                id = id.checked_add(did).ok_or_else(overflow_err)?;
-                lat = lat.checked_add(dlat).ok_or_else(overflow_err)?;
-                lon = lon.checked_add(dlon).ok_or_else(overflow_err)?;
+                // Modulo 2^64, as the decoder and writer sum deltas; see the
+                // module docs for why a wrapped coordinate is still refused.
+                id = id.wrapping_add(did);
+                lat = lat.wrapping_add(dlat);
+                lon = lon.wrapping_add(dlon);
                 sink(
                     id,
                     decimicro(lat_offset, granularity, lat)?,
@@ -299,11 +307,23 @@ mod tests {
         assert!(extract(&block(&[group], None)).is_err());
     }
 
+    /// Dense deltas sum modulo 2^64, as the decoder does: IDs wrap to the
+    /// values every reader yields, and a coordinate far enough out to wrap is
+    /// refused by the checked scaling instead.
     #[test]
-    fn dense_delta_overflow_is_rejected() {
+    fn dense_id_deltas_wrap_and_wild_coordinates_are_rejected() {
         let mut body = Vec::new();
         packed_sint(1, &[i64::MAX, 1], &mut body);
         packed_sint(8, &[0, 0], &mut body);
+        packed_sint(9, &[0, 0], &mut body);
+        let mut group = Vec::new();
+        len_delimited(2, &body, &mut group);
+        let got = extract(&block(&[group], None)).unwrap();
+        assert_eq!(got, vec![(i64::MAX, 0, 0), (i64::MIN, 0, 0)]);
+
+        let mut body = Vec::new();
+        packed_sint(1, &[1, 1], &mut body);
+        packed_sint(8, &[i64::MAX, 1], &mut body);
         packed_sint(9, &[0, 0], &mut body);
         let mut group = Vec::new();
         len_delimited(2, &body, &mut group);

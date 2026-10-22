@@ -95,8 +95,8 @@ pub(super) struct BlobDesc {
 /// (which the columnar classifier ignores), ways or relations in a blob
 /// whose indexdata says nodes, changesets and unknown group fields (which
 /// no element iterator reports), and a repeated DenseNodes or DenseInfo
-/// (only one of which every reader here looks at, while the raw bytes
-/// would carry both).
+/// (the decoder refuses a repeated DenseNodes and keeps only the last
+/// DenseInfo, while the raw bytes would carry both).
 ///
 /// This is a structural walk only. Callers must also construct the payload
 /// as a [`PrimitiveBlock`] - what the decode path would do with it - and
@@ -759,7 +759,7 @@ mod tests {
         assert!(!dense_only_payload(&mixed).unwrap());
     }
 
-    /// Every reader here takes the first DenseNodes of a group; a raw copy
+    /// The decoder refuses a repeated DenseNodes in one group; a raw copy
     /// would carry the second one unchecked.
     #[test]
     fn a_second_dense_message_in_one_group_makes_the_blob_ineligible() {

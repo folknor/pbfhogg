@@ -403,10 +403,13 @@ mod bucket_math_tests {
 
 /// Depth-gated stall span shared by concurrent blockers.
 ///
-/// `brokkr sidecar --stalls` pairs `WAIT_<CATEGORY>_START/_END` markers
+/// `brokkr sidecar --durations` pairs `WAIT_<CATEGORY>_START/_END` markers
 /// by name, which breaks if N threads emit interleaved pairs for the
-/// same category. The gauge collapses concurrent blockers into one
-/// non-overlapping span per busy period: START when depth goes 0 -> 1,
+/// same category. (These spans do not feed `--stalls`, which reads
+/// `*_wait_ns` counters; a blocking point meant to show there needs a
+/// counter, and emitting both is fine.) The gauge collapses concurrent
+/// blockers into one non-overlapping span per busy period: START when depth
+/// goes 0 -> 1,
 /// END when it returns to 0. The mutex is held only across the depth
 /// transition + marker emit, and callers must gate `track()` behind a
 /// try_* fast path so unblocked operations never touch it.

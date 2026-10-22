@@ -132,6 +132,9 @@ pub struct PbfWriter<W: Write> {
     writer: Option<W>,
     compression: Compression,
     pipeline: Option<WritePipeline>,
+    #[cfg(test)]
+    /// Whether all successfully accepted writes have been explicitly flushed.
+    finished: bool,
     /// Scratch buffers for sync-mode blob framing (unused in pipelined mode).
     scratch: FrameScratch,
 }
@@ -303,6 +306,8 @@ impl PbfWriter<FileWriter> {
             writer: None,
             compression,
             pipeline: Some(WritePipeline::new(tx, handle, expected, executor)),
+            #[cfg(test)]
+            finished: false,
             scratch: FrameScratch::new(),
         })
     }
@@ -385,6 +390,8 @@ impl PbfWriter<FileWriter> {
             writer: None,
             compression,
             pipeline: Some(WritePipeline::new(tx, handle, expected, executor)),
+            #[cfg(test)]
+            finished: false,
             scratch: FrameScratch::new(),
         })
     }
@@ -412,6 +419,8 @@ impl PbfWriter<FileWriter> {
             writer: None,
             compression,
             pipeline: Some(WritePipeline::new(tx, handle, expected, executor)),
+            #[cfg(test)]
+            finished: false,
             scratch: FrameScratch::new(),
         })
     }
@@ -430,9 +439,31 @@ impl<W: Write> PbfWriter<W> {
             writer: Some(writer),
             compression,
             pipeline: None,
+            #[cfg(test)]
+            finished: true,
             scratch: FrameScratch::new(),
         }
     }
+
+    #[cfg(test)]
+    #[inline(always)]
+    fn mark_pending(&mut self) {
+        self.finished = false;
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn mark_pending(&mut self) {}
+
+    #[cfg(test)]
+    #[inline(always)]
+    fn mark_finished(&mut self) {
+        self.finished = true;
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn mark_finished(&mut self) {}
 
     /// Test hook: make the framing work for the `seq`-th data blob (0-based,
     /// counting every blob sent through the pipeline) panic before it frames.
@@ -454,7 +485,11 @@ impl<W: Write> PbfWriter<W> {
     /// `header_block_bytes` is a serialized `HeaderBlock` protobuf message,
     /// typically produced by [`HeaderBuilder::build`](crate::block_builder::HeaderBuilder::build).
     pub fn write_header(&mut self, header_block_bytes: &[u8]) -> io::Result<()> {
-        self.write_blob("OSMHeader", header_block_bytes)
+        let result = self.write_blob("OSMHeader", header_block_bytes);
+        if result.is_ok() {
+            self.mark_pending();
+        }
+        result
     }
 
     /// Write an `OSMData` blob from a serialized `PrimitiveBlock`.
@@ -535,18 +570,23 @@ impl<W: Write> PbfWriter<W> {
                 }
                 record_send_wait(t_send);
             });
+            self.mark_pending();
             Ok(())
         } else {
             let (index, tags) = blob_meta::scan_block_ids_and_tags(block_bytes)?;
             let indexdata = index.map(|idx| idx.serialize());
             let tagdata = tags.and_then(|ti| ti.serialize());
-            self.write_framed_blob(
+            let result = self.write_framed_blob(
                 "OSMData",
                 block_bytes,
                 indexdata.as_ref().map(<[u8; 42]>::as_slice),
                 tagdata.as_deref(),
                 None,
-            )
+            );
+            if result.is_ok() {
+                self.mark_pending();
+            }
+            result
         }
     }
 
@@ -623,9 +663,14 @@ impl<W: Write> PbfWriter<W> {
                 }
                 record_send_wait(t_send);
             });
+            self.mark_pending();
             Ok(())
         } else {
-            self.write_framed_blob("OSMData", block_bytes, None, None, None)
+            let result = self.write_framed_blob("OSMData", block_bytes, None, None, None);
+            if result.is_ok() {
+                self.mark_pending();
+            }
+            result
         }
     }
 
@@ -708,15 +753,20 @@ impl<W: Write> PbfWriter<W> {
                 }
                 record_send_wait(t_send);
             });
+            self.mark_pending();
             Ok(())
         } else {
-            self.write_framed_blob(
+            let result = self.write_framed_blob(
                 "OSMData",
                 &block_bytes,
                 Some(indexdata.as_slice()),
                 tagdata,
                 way_members,
-            )
+            );
+            if result.is_ok() {
+                self.mark_pending();
+            }
+            result
         }
     }
 
@@ -749,9 +799,14 @@ impl<W: Write> PbfWriter<W> {
                 return Err(pipeline_send_error(pipeline));
             }
             record_send_wait(t_send);
+            self.mark_pending();
             Ok(())
         } else {
-            self.writer_mut()?.write_all(raw_framed_bytes)
+            let result = self.writer_mut()?.write_all(raw_framed_bytes);
+            if result.is_ok() {
+                self.mark_pending();
+            }
+            result
         }
     }
 
@@ -782,9 +837,14 @@ impl<W: Write> PbfWriter<W> {
                 return Err(pipeline_send_error(pipeline));
             }
             record_send_wait(t_send);
+            self.mark_pending();
             Ok(())
         } else {
-            self.writer_mut()?.write_all(&raw_framed_bytes)
+            let result = self.writer_mut()?.write_all(&raw_framed_bytes);
+            if result.is_ok() {
+                self.mark_pending();
+            }
+            result
         }
     }
 
@@ -815,12 +875,14 @@ impl<W: Write> PbfWriter<W> {
                 return Err(pipeline_send_error(pipeline));
             }
             record_send_wait(t_send);
+            self.mark_pending();
             Ok(())
         } else {
             let w = self.writer_mut()?;
             for chunk in &chunks {
                 w.write_all(chunk)?;
             }
+            self.mark_pending();
             Ok(())
         }
     }
@@ -842,10 +904,11 @@ impl<W: Write> PbfWriter<W> {
     /// target that does not support `fsync` - a FIFO, socket or character
     /// device such as `/dev/null` - is not an error); a synchronous writer
     /// created with `new` only calls its underlying `Write::flush`, which does
-    /// not guarantee durability. Dropping without flushing is cleanup only - it
-    /// joins the writer thread but reports nothing, including a missing tail.
+    /// not guarantee durability. Dropping without flushing performs cleanup but
+    /// cannot report errors or a missing tail.
     #[hotpath::measure]
     pub fn flush(&mut self) -> io::Result<()> {
+        self.mark_finished();
         let t_flush = std::time::Instant::now();
         if let Some(mut pipeline) = self.pipeline.take() {
             // State the final item count BEFORE dropping the sender, so the
@@ -894,6 +957,7 @@ impl<W: Write> PbfWriter<W> {
     /// Panics if the writer was consumed by a pipeline. This is a programming
     /// error (misuse of the API), not a runtime condition.
     pub fn into_inner(mut self) -> W {
+        self.mark_finished();
         self.writer.take().expect("writer consumed by pipeline")
     }
 
@@ -994,9 +1058,20 @@ impl<W: Write> PbfWriter<W> {
 
 /// Cleanup only: joins the writer thread and reports nothing. A writer that
 /// was not [`flush`](PbfWriter::flush)ed may be missing its tail, and `Drop`
-/// cannot say so.
+/// cannot report the deferred error. Dropping unflushed on an error return is
+/// allowed: the caller's primary error dominates.
+///
+/// The crate's own unit-test builds assert after cleanup when accepted writes
+/// reach `Drop` without a flush on a non-panicking path, so a forgotten flush
+/// in those tests fails loudly. The check is deliberately not a plain
+/// `debug_assertions` one: `Drop` cannot tell a forgotten flush from an
+/// ordinary `?` bail-out, and in any debug build (the CLI under the test
+/// sweeps, a library consumer's debug build) it would replace the caller's
+/// real error with a panic on every error path.
 impl<W: Write> Drop for PbfWriter<W> {
     fn drop(&mut self) {
+        #[cfg(test)]
+        let finished = self.finished;
         if let Some(mut pipeline) = self.pipeline.take() {
             drop(pipeline.tx);
             // As in `flush`: on a worker of the executor's pool the queued
@@ -1009,13 +1084,19 @@ impl<W: Write> Drop for PbfWriter<W> {
                 // including the deferred `sync_all` and (for uring)
                 // `set_len` truncation - is silently discarded here;
                 // Drop can't surface errors. Callers that care about
-                // durability MUST call `flush()` on the success path so
-                // the join result is routed through `?`. Reaching Drop
-                // unflushed means either a panic or an earlier-error
-                // `?`-bailout; the primary error dominates.
+                // durability MUST call `flush()` so the join result is
+                // routed through `?`. Reaching Drop unflushed means a panic,
+                // an earlier-error `?` bail-out (the primary error
+                // dominates), or a forgotten flush, which only the unit-test
+                // assertion below catches.
                 drop(handle.join());
             }
         }
+        #[cfg(test)]
+        debug_assert!(
+            std::thread::panicking() || finished,
+            "PbfWriter dropped with unflushed output; call flush() to observe deferred errors"
+        );
     }
 }
 
@@ -1069,6 +1150,7 @@ impl PbfWriter<FileWriter> {
                 return Err(pipeline_send_error(pipeline));
             }
             record_send_wait(t_send);
+            self.mark_pending();
             Ok(())
         } else {
             // This is reachable through FileWriter::buffered plus the public
@@ -1084,7 +1166,11 @@ impl PbfWriter<FileWriter> {
                         "copy_file_range incompatible with O_DIRECT output",
                     )
                 })?;
-            copy_range(in_file.as_raw_fd(), out_fd, offset, len)
+            let result = copy_range(in_file.as_raw_fd(), out_fd, offset, len);
+            if result.is_ok() {
+                self.mark_pending();
+            }
+            result
         }
     }
 }
@@ -1105,6 +1191,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         // An empty block is unsupported by the index, but is not malformed.
         writer.write_primitive_block(&[]).unwrap();
+        writer.flush().unwrap();
     }
 
     #[test]
@@ -1116,7 +1203,8 @@ mod tests {
             PbfWriter::to_path(&path, Compression::None, &header, Executor::Ambient).unwrap();
         // The worker reports on the ordered channel; enqueue may succeed.
         let queued = writer.write_primitive_block(&[0x80]);
-        let result = queued.and_then(|()| writer.flush());
+        let flushed = writer.flush();
+        let result = queued.and(flushed);
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
@@ -1140,6 +1228,8 @@ mod tests {
                 SeqTotal::new(),
                 Executor::Ambient,
             )),
+            #[cfg(test)]
+            finished: false,
             scratch: FrameScratch::new(),
         }
     }
@@ -1168,6 +1258,7 @@ mod tests {
             err.to_string().contains("no space left on device"),
             "the thread's own message must reach the caller, got: {err}"
         );
+        w.flush().unwrap();
     }
 
     /// A writer thread that exited cleanly mid-stream is still a short file.
@@ -1179,6 +1270,7 @@ mod tests {
             err.to_string().contains("output is incomplete"),
             "got: {err}"
         );
+        w.flush().unwrap();
     }
 
     /// Writing after `flush` must be an error, not a panic.
@@ -1244,6 +1336,7 @@ mod tests {
             err.to_string().contains("no space left on device"),
             "the thread's own message must reach the caller, got: {err}"
         );
+        w.flush().unwrap();
     }
 
     /// The sync (non-pipelined) path must refuse an oversize blob body too.
@@ -1269,6 +1362,7 @@ mod tests {
             msg.contains("blob body for OSMHeader") && msg.contains("--elements-per-blob"),
             "the sync path must name the cap and the knob, got: {msg}"
         );
+        w.flush().unwrap();
     }
 
     /// A queued `CopyRange` must survive the caller dropping its input handle.
@@ -1389,6 +1483,7 @@ mod tests {
             err.is_some_and(|e| e.to_string().contains("owned variant")),
             "write_primitive_block_owned must surface the writer thread's error"
         );
+        w.flush().unwrap();
 
         let mut w = writer_with_dead_thread(Err(io::Error::new(
             io::ErrorKind::StorageFull,
@@ -1406,10 +1501,11 @@ mod tests {
             err.is_some_and(|e| e.to_string().contains("no-indexdata variant")),
             "write_primitive_block_no_indexdata must surface the writer thread's error"
         );
+        w.flush().unwrap();
     }
 
     /// Cover the other framing entry points and the raw-send permit path on
-    /// the same sole worker. Every variant must also drain on unflushed drop.
+    /// the same sole worker, both with flush and during panic cleanup.
     #[test]
     fn every_framing_variant_and_raw_send_completes_on_one_worker() {
         let pool = std::sync::Arc::new(
@@ -1432,29 +1528,39 @@ mod tests {
         for owned in [false, true] {
             for flush in [false, true] {
                 let path = dir.path().join(format!("owned-{owned}-flush-{flush}.pbf"));
-                pool.install(|| {
-                    let mut writer = PbfWriter::to_path(
-                        &path,
-                        Compression::None,
-                        &header,
-                        Executor::Pool(std::sync::Arc::clone(&pool)),
-                    )
-                    .unwrap();
-                    for _ in 0..200 {
-                        if owned {
-                            writer.write_primitive_block_owned(block.to_vec(), index, None, None)
-                        } else {
-                            writer.write_primitive_block_no_indexdata(&block)
-                        }
+                let completion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    pool.install(|| {
+                        let mut writer = PbfWriter::to_path(
+                            &path,
+                            Compression::None,
+                            &header,
+                            Executor::Pool(std::sync::Arc::clone(&pool)),
+                        )
                         .unwrap();
-                    }
-                    writer.write_raw(&raw).unwrap();
-                    writer.write_raw_owned(raw.clone()).unwrap();
-                    writer.write_raw_chunks(vec![raw.clone()]).unwrap();
-                    if flush {
-                        writer.flush().unwrap();
-                    }
-                });
+                        for _ in 0..200 {
+                            if owned {
+                                writer.write_primitive_block_owned(
+                                    block.to_vec(),
+                                    index,
+                                    None,
+                                    None,
+                                )
+                            } else {
+                                writer.write_primitive_block_no_indexdata(&block)
+                            }
+                            .unwrap();
+                        }
+                        writer.write_raw(&raw).unwrap();
+                        writer.write_raw_owned(raw.clone()).unwrap();
+                        writer.write_raw_chunks(vec![raw.clone()]).unwrap();
+                        if flush {
+                            writer.flush().unwrap();
+                        } else {
+                            panic!("exercise PbfWriter cleanup during unwind");
+                        }
+                    });
+                }));
+                assert_eq!(completion.is_err(), !flush);
                 let blobs = crate::BlobReader::from_path(&path)
                     .unwrap()
                     .map(|blob| blob.unwrap())

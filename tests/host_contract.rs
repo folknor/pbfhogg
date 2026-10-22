@@ -260,7 +260,10 @@ fn writer_on_a_one_thread_pool_drops_unflushed() {
     let path = dir.path().join("dropped.pbf");
     let pool = one_thread_pool();
     // Completing at all is the assertion: a blocking join from the pool's
-    // only thread would never let the queued framing work run.
+    // only thread would never let the queued framing work run. An unflushed
+    // drop on a non-panicking path is the error-bail-out shape, which the
+    // library allows (its unit-test-only flush assertion does not apply to
+    // integration tests).
     pool.install(|| -> std::io::Result<()> {
         let mut writer = pbfhogg::writer::PbfWriter::to_path(
             &path,
@@ -275,6 +278,7 @@ fn writer_on_a_one_thread_pool_drops_unflushed() {
         Ok(())
     })
     .expect("writes on a one-thread pool");
+    assert_eq!(count_data_blobs(&path), POOL_BLOCKS);
 }
 #[test]
 fn ambient_writer_inside_a_foreign_pool_flushes() {

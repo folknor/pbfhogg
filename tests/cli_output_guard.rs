@@ -67,6 +67,7 @@ fn write_fixture(path: &Path) {
     if let Some(bytes) = builder.take().unwrap() {
         writer.write_primitive_block(bytes).unwrap();
     }
+    writer.flush().unwrap();
 }
 
 /// A PBF truncated inside a blob. Framing is broken, so this fails in the
@@ -412,6 +413,7 @@ fn write_dangling_ref_fixture(path: &Path) {
     if let Some(bytes) = builder.take().unwrap() {
         writer.write_primitive_block(bytes).unwrap();
     }
+    writer.flush().unwrap();
 }
 
 /// The single-input, post-writer case: `add-locations-to-ways` produces a

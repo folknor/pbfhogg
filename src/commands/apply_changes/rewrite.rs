@@ -139,7 +139,8 @@ fn build_header_bytes(
             );
         }
         build_output_header(header, false, overrides, |hb| {
-            hb.sorted().optional_feature("LocationsOnWays")
+            hb.sorted()
+                .optional_feature(crate::read::block::Feature::LOCATIONS_ON_WAYS)
         })
     } else {
         crate::commands::warn_locations_on_ways_loss(header, host);

@@ -82,10 +82,12 @@ impl DenseNodeColumns {
     ) {
         let gran = i64::from(granularity);
 
+        // Reconstruct signed deltas modulo 2^64, as the dense iterator and
+        // writer do. This keeps columnar and element reads identical.
         // Decode IDs (delta-encoded sint64).
         let mut cumulative_id: i64 = 0;
         for delta in PackedSint64Iter::new(dense.id_data) {
-            cumulative_id += delta;
+            cumulative_id = cumulative_id.wrapping_add(delta);
             self.ids.push(cumulative_id);
         }
 
@@ -101,27 +103,27 @@ impl DenseNodeColumns {
 
             let mut cumulative_lat: i64 = 0;
             for delta in PackedSint64Iter::new(dense.lat_data) {
-                cumulative_lat += delta;
+                cumulative_lat = cumulative_lat.wrapping_add(delta);
                 self.lats.push(cumulative_lat as i32 + lat_off_e7);
             }
 
             let mut cumulative_lon: i64 = 0;
             for delta in PackedSint64Iter::new(dense.lon_data) {
-                cumulative_lon += delta;
+                cumulative_lon = cumulative_lon.wrapping_add(delta);
                 self.lons.push(cumulative_lon as i32 + lon_off_e7);
             }
         } else {
             // General path for non-standard granularity.
             let mut cumulative_lat: i64 = 0;
             for delta in PackedSint64Iter::new(dense.lat_data) {
-                cumulative_lat += delta;
+                cumulative_lat = cumulative_lat.wrapping_add(delta);
                 let nano = lat_offset + gran * cumulative_lat;
                 self.lats.push((nano / 100) as i32);
             }
 
             let mut cumulative_lon: i64 = 0;
             for delta in PackedSint64Iter::new(dense.lon_data) {
-                cumulative_lon += delta;
+                cumulative_lon = cumulative_lon.wrapping_add(delta);
                 let nano = lon_offset + gran * cumulative_lon;
                 self.lons.push((nano / 100) as i32);
             }
@@ -227,6 +229,27 @@ impl DenseNodeColumns {
 mod tests {
     use super::*;
     use crate::read::region_grid::RegionGrid;
+
+    #[test]
+    fn columnar_deltas_wrap_in_both_coordinate_paths() {
+        // Zigzag(MIN), zigzag(-1): absolute values MIN, MAX.
+        let deltas = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1, 1];
+        let dense = WireDenseNodes {
+            id_data: &deltas,
+            lat_data: &deltas,
+            lon_data: &deltas,
+            keys_vals_data: &[],
+            info_data: None,
+        };
+        for granularity in [100, 0] {
+            let mut columns = DenseNodeColumns::new();
+            columns.decode_append(&dense, granularity, 0, 0);
+            assert_eq!(columns.ids, [i64::MIN, i64::MAX]);
+            let coords = if granularity == 100 { [0, -1] } else { [0, 0] };
+            assert_eq!(columns.lats, coords);
+            assert_eq!(columns.lons, coords);
+        }
+    }
 
     fn next(state: &mut u64) -> u64 {
         *state ^= *state << 13;

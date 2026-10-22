@@ -371,7 +371,8 @@ impl<'a> Relation<'a> {
 
 /// An iterator over the references of a way.
 ///
-/// Each reference corresponds to a node id.
+/// Each reference corresponds to a node id. Signed wire deltas reconstruct
+/// modulo 2^64, matching the writer even across MIN/MAX boundaries.
 #[derive(Clone)]
 pub struct WayRefIter<'a> {
     deltas: PackedSint64Iter<'a>,
@@ -384,7 +385,7 @@ impl Iterator for WayRefIter<'_> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         self.deltas.next().map(|d| {
-            self.current += d;
+            self.current = self.current.wrapping_add(d);
             self.current
         })
     }
@@ -434,8 +435,8 @@ impl Iterator for WayNodeLocationsIter<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         match (self.dlats.next(), self.dlons.next()) {
             (Some(dlat), Some(dlon)) => {
-                self.clat += dlat;
-                self.clon += dlon;
+                self.clat = self.clat.wrapping_add(dlat);
+                self.clon = self.clon.wrapping_add(dlon);
                 Some(WayNodeLocation {
                     lat: self.lat_offset + self.granularity * self.clat,
                     lon: self.lon_offset + self.granularity * self.clon,
@@ -574,7 +575,7 @@ impl<'a> Iterator for RelMemberIter<'a> {
             self.member_types.next(),
         ) {
             (Some(role_sid), Some(mem_id_delta), Some(member_type)) => {
-                self.current_member_id += mem_id_delta;
+                self.current_member_id = self.current_member_id.wrapping_add(mem_id_delta);
                 let mt = MemberType::from(member_type);
                 Some(RelMember {
                     block: self.block,
@@ -766,5 +767,61 @@ impl<'a> Info<'a> {
     #[inline]
     pub fn deleted(&self) -> bool {
         !self.visible()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::write::block_builder::{BlockBuilder, MemberData};
+
+    #[test]
+    fn way_ref_and_location_accumulators_wrap_at_signed_boundaries() {
+        let deltas = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1, 1];
+        let refs = WayRefIter {
+            deltas: PackedSint64Iter::new(&deltas),
+            current: 0,
+        };
+        assert_eq!(refs.collect::<Vec<_>>(), [i64::MIN, i64::MAX]);
+        let locations = WayNodeLocationsIter {
+            dlats: PackedSint64Iter::new(&deltas),
+            dlons: PackedSint64Iter::new(&deltas),
+            clat: 0,
+            clon: 0,
+            granularity: 1,
+            lat_offset: 0,
+            lon_offset: 0,
+        };
+        let coords: Vec<_> = locations.map(|p| (p.nano_lat(), p.nano_lon())).collect();
+        assert_eq!(coords, [(i64::MIN, i64::MIN), (i64::MAX, i64::MAX)]);
+    }
+
+    #[test]
+    fn relation_member_ids_roundtrip_across_signed_boundaries() {
+        let mut builder = BlockBuilder::new();
+        let members = [
+            MemberData {
+                id: MemberId::Node(i64::MIN),
+                role: "",
+            },
+            MemberData {
+                id: MemberId::Way(i64::MAX),
+                role: "",
+            },
+        ];
+        builder.add_relation(1, [], &members, None);
+        let bytes = builder.take().unwrap().unwrap().to_vec();
+        let block = crate::PrimitiveBlock::from_vec(bytes).unwrap();
+        let ids: Vec<_> = block
+            .elements()
+            .flat_map(|element| match element {
+                Element::Relation(relation) => {
+                    relation.members().map(|m| m.id.id()).collect::<Vec<_>>()
+                }
+                _ => panic!("fixture contains only a relation"),
+            })
+            .collect();
+        assert_eq!(ids, [i64::MIN, i64::MAX]);
     }
 }

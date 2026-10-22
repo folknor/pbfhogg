@@ -29,7 +29,7 @@ use std::sync::Arc;
 use super::super::Result;
 #[cfg(feature = "linux-direct-io")]
 use super::radix::advise_dontneed_file;
-use super::radix::{NUM_BUCKETS, ScratchDir};
+use super::radix::{BUCKET_BUF_SIZE, NUM_BUCKETS, ScratchDir};
 use super::{
     BucketLayout, CLOSURE_FLAG, ID_RECORD_SIZE, IdRecord, LOCAL_ID_MASK, NodeBlobInfo,
     RESOLVED_ENTRY_SIZE, ResolvedEntry, slot_bucket_bounds,
@@ -165,8 +165,6 @@ pub(super) struct SharedSlotBuckets {
     writers: Vec<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>,
     entry_counts: Vec<std::sync::atomic::AtomicU64>,
 }
-
-const BUCKET_BUF_SIZE: usize = 256 * 1024;
 
 impl SharedSlotBuckets {
     pub(super) fn create(
@@ -332,6 +330,8 @@ pub(super) fn stage2_node_join(
 
                 // Per-slot-bucket local buffers. Flushed when any buffer
                 // exceeds FLUSH_THRESHOLD, and at the end of each id bucket.
+                // This worker-local batch size controls mutex/write batching;
+                // it is separate from the shared file BufWriter capacity.
                 const FLUSH_THRESHOLD: usize = 256 * 1024;
                 let mut slot_bufs: Vec<Vec<u8>> =
                     (0..slot_bucket_count).map(|_| Vec::new()).collect();

@@ -134,25 +134,17 @@ pub(crate) fn scan_way_refs(
 
 /// Delta-decode a packed `Way.refs` payload into `refs_buf`.
 ///
-/// The accumulator is checked. `refs_data` is untrusted wire content, and an
-/// unchecked `cum += delta` on a crafted or corrupt blob panics in debug and
-/// wraps to an arbitrary node id in release - a wrapped id then quietly
-/// resolves against the node index or quietly does not, which is a silent
-/// wrong answer rather than a rejected file.
-fn accumulate_refs(refs_data: &[u8], refs_buf: &mut Vec<i64>) -> Result<()> {
+/// Signed deltas reconstruct modulo 2^64, matching WayRefIter and the writer.
+/// For example, absolute refs MIN then MAX encode as MIN then -1; rejecting
+/// the second addition would refuse output our own writer can produce.
+fn accumulate_refs(refs_data: &[u8], refs_buf: &mut Vec<i64>) {
     use crate::read::wire::PackedSint64Iter;
 
     let mut cum: i64 = 0;
     for delta in PackedSint64Iter::new(refs_data) {
-        cum = cum.checked_add(delta).ok_or_else(|| {
-            crate::error::new_wire_error(
-                "Way.refs delta accumulator overflowed i64; the blob's node \
-                 references are corrupt",
-            )
-        })?;
+        cum = cum.wrapping_add(delta);
         refs_buf.push(cum);
     }
-    Ok(())
 }
 
 /// Parse a single Way message and extract id + refs.
@@ -177,7 +169,7 @@ fn parse_way_refs(
     // Emit every Way, including zero-ref ways: the external location join
     // records one refcount per callback and consumes one per Way at assembly.
     refs_buf.clear();
-    accumulate_refs(way.refs_data, refs_buf)?;
+    accumulate_refs(way.refs_data, refs_buf);
     callback(way.id, refs_buf);
 
     Ok(())
@@ -343,7 +335,7 @@ fn parse_way_tagged_refs(
     refs_buf: &mut Vec<i64>,
     callback: &mut impl FnMut(i64, WayGeocodeFlags, &[i64]),
 ) -> Result<()> {
-    use crate::read::wire::{PackedUint32Iter, WireWay};
+    use crate::read::wire::{Cursor, WireWay};
 
     // Same routing rationale as `parse_way_refs`: `WireWay::parse` accepts
     // both legal wire forms of a packed field, where this scanner's own
@@ -366,10 +358,20 @@ fn parse_way_tagged_refs(
     let mut has_addr_interp = false;
 
     if any_key_present && let (Some(kd), Some(vd)) = (keys_data, vals_data) {
-        let keys = PackedUint32Iter::new(kd);
-        let mut vals = PackedUint32Iter::new(vd);
-        for key_idx in keys {
-            let val_idx = vals.next();
+        // Fallible u32 reads in the walk this classifier already makes, not
+        // `PackedUint32Iter`: this raw scanner never builds a `PrimitiveBlock`,
+        // so the block-level string-index bound does not cover it, and the
+        // iterator would narrow an index above `u32::MAX` into a different,
+        // possibly matching, key. No extra pass over either array.
+        let mut keys = Cursor::new(kd);
+        let mut vals = Cursor::new(vd);
+        while !keys.is_empty() {
+            let key_idx = keys.read_varint_u32()?;
+            let val_idx = if vals.is_empty() {
+                None
+            } else {
+                Some(vals.read_varint_u32()?)
+            };
             if Some(key_idx) == resolved.k_highway {
                 has_highway = true;
                 highway_val_idx = val_idx;
@@ -405,7 +407,7 @@ fn parse_way_tagged_refs(
     // 2000-ref convention.
     refs_buf.clear();
     if let Some(rd) = refs_data {
-        accumulate_refs(rd, refs_buf)?;
+        accumulate_refs(rd, refs_buf);
     }
 
     callback(
@@ -425,6 +427,15 @@ fn parse_way_tagged_refs(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// Deltas `MIN` then `-1` (zigzag `u64::MAX`, then 1): refs `MIN`, `MAX`.
+    #[test]
+    fn scanned_refs_wrap_like_the_writer_and_element_iterator() {
+        let deltas = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1, 1];
+        let mut refs = Vec::new();
+        accumulate_refs(&deltas, &mut refs);
+        assert_eq!(refs, [i64::MIN, i64::MAX]);
+    }
 
     /// PrimitiveBlock holding one PrimitiveGroup holding one Way. `refs` is
     /// written packed when `packed`, unpacked (one varint-typed field 8 per
@@ -457,7 +468,7 @@ mod tests {
         let mut deltas = Vec::new();
         let mut prev = 0_i64;
         for &r in refs {
-            deltas.push(zigzag(r - prev));
+            deltas.push(zigzag(r.wrapping_sub(prev)));
             prev = r;
         }
         if packed {

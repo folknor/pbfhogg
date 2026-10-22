@@ -127,18 +127,17 @@ assumption `pre_seed` relies on.
 
 Reported by: write path.
 
-## BUG-076 - The shared node scanner silently skips plain `Node` messages
+## BUG-076 - Plain `Node` messages are refused or skipped instead of read
 
 Anger: 9 - plain nodes in the shared node scanner.
 
-`src/scan/node.rs` reads only `DenseNodes` and stops reading a group at its
-dense nodes, so a plain (non-dense) `Node` is never seen, with no error, by
-its users: altw (both backends' node passes) and the external join. Their
-coordinates are then reported missing, or written as `(0, 0)` under
-`--ignore-missing-nodes`. Multi-extract with all-bbox regions has the same
-gap through `decode_dense_columns`, and silently leaves plain nodes out of
-the output, while single-region simple extract errors on them.
-Apply-changes now has a checked extractor for both encodings
+`src/scan/node.rs` now walks the whole group and errors on a plain
+(non-dense) `Node` anywhere in it, so altw (both backends' node passes) and
+the external join refuse such input rather than reporting the coordinates
+missing; they still cannot read it. Multi-extract with all-bbox regions
+still silently leaves plain nodes out of the output through
+`decode_dense_columns`, while single-region simple extract errors on them.
+Apply-changes has a checked extractor for both encodings
 (`apply_changes/node_coords.rs`); the scanner should take it over and every
 node pass call it. pbfhogg's own writer emits only dense nodes, which is
 why no fixture caught this; `osmium cat -f pbf,pbf_dense_nodes=false`
@@ -168,19 +167,6 @@ call, since it changes a documented contract. Blocks benchmarking the
 merge-changes floor on real data.
 
 Reported by: the version-floor A/B on germany.
-
-## BUG-080 - The decoder accepts two block shapes the index scanner refuses
-
-Anger: 9 - decoder refusals.
-
-Found while making the `blob_meta` scanner strict, which now refuses both:
-`PackedUint32Iter` truncates a key sid above `u32::MAX` to a different,
-possibly valid, sid instead of failing, and `WireGroup::dense` reads only
-the first `DenseNodes` of a group where protobuf merge semantics would
-combine them, silently dropping the rest. Either way the decoder yields a
-different block from the one on the wire, with no error.
-
-Reported by: the blob_meta strict-scanner fix.
 
 ## BUG-081 - Extract still trusts indexdata on the paths verification does not cover
 
@@ -251,22 +237,6 @@ depending on the command. Decide once, in the reader, and have every
 command inherit it.
 
 Reported by: the cat-dedupe header fix.
-
-## BUG-074 - Geocode builder output differs between runs of the same input
-
-Anger: 7 - geocode output.
-
-`parallel_classify_phase` delivers results in worker-completion order and
-both Pass 2 merges ignore `seq`, so record order, string offsets, the
-smoke test's first address, and which duplicate admin geometry survives
-can change from build to build. A reorder buffer alone would not fix it
-safely: nothing bounds how far ahead workers run of the earliest unmerged
-blob (HYG-053), so the buffer could grow without limit. Separately, a node
-duplicated across blobs now resolves to one complete coordinate (the
-`CoordMmapShared` data race is gone, slots are atomic), but which copy wins
-is not deterministic either.
-
-Reported by: the geocode fix for the former coordinate-race entry.
 
 ## BUG-063 - Platform-skip residue: `src/` unit tests and pre-5.12 ring ENOMEM
 
@@ -352,30 +322,6 @@ from the drain's reorder map. Unverified beyond the fixer's reading.
 
 Reported by: the wave-1 drain fixer.
 
-## BUG-092 - Single-pass multi-extract still reports each region twice
-
-Anger: 7 - CLI behaviour.
-
-Multi-extract diagnostics now name the final output paths rather than the
-scratch siblings, but a single-pass run still prints each region twice: the
-library's `extract.multi.slot_counts` event and the CLI's own summary from
-`final_paths`. Drop one of them.
-
-Reported by: the wave-1 reviewer.
-
-## BUG-093 - Multi-extract config path resolution deviates from osmium, undocumented
-
-Anger: 7 - CLI behaviour.
-
-A relative `"directory"` in a multi-extract config now resolves against the
-config file's directory; osmium resolves it against the working directory.
-With `-d`, an absolute `output` in the config keeps only its file name under
-the override directory; osmium concatenates directory and output. Both are
-deliberate and tested, and DEVIATIONS.md mentions neither. Document them, or
-change the absolute-output rule if the maintainer prefers osmium's.
-
-Reported by: the wave-1 reviewer.
-
 ## BUG-094 - The apply-changes `-j 1` refusal may rest on a fixed hazard
 
 Anger: 7 - CLI behaviour.
@@ -411,41 +357,16 @@ refuse such rings or document the even-odd interpretation.
 
 Reported by: the wave-2 extract fixer.
 
-## BUG-097 - `Reader::interpolate` trusts a caller-built candidate's segment index
+## BUG-097 - The plain-`cat` scanner error carries no context and drops its source
 
-Anger: 7 - geocode output.
+Anger: 7 - message content.
 
-`InterpolationCandidate` has all-public fields, and `Reader::interpolate`
-passes its `segment_index` to `accumulated_length_radians` unchecked. A
-hand-built candidate with `segment_index >= node_count - 1` reads nodes past
-the owning way. Candidates a query produces are already filtered by the
-segment-distance bound check, so only library callers constructing one by
-hand can hit it. A one-line guard in `interpolated_number` closes it. The
-plain-`cat` scanner error likewise carries no file or blob context (it is
-the scanner's message only), and `scan_block_ids_and_tags` converts the
-scanner error with `io::Error::new(InvalidData, e.to_string())`, dropping
-its source chain.
+A malformed payload in plain `cat` now fails the run, but the error is the
+scanner's message only, with no file or blob, and
+`blob_meta::scan_block_ids_and_tags` converts the scanner error with
+`io::Error::new(InvalidData, e.to_string())`, dropping its source chain.
 
 Reported by: the wave-2 reviewer.
-
-## BUG-098 - Delta reconstruction has no single overflow policy
-
-Anger: 8 - decoder deltas.
-
-`BlockBuilder`, `write/encode.rs` and `read/dense.rs` now treat varint deltas
-as modular (explicit wrapping arithmetic), so debug and release agree.
-Still plain addition: four cumulative sums in `src/read/elements.rs`, five
-in `src/read/columnar.rs`, and `cum += delta` in
-`src/commands/altw/reframe.rs`. Meanwhile `src/scan/way.rs::accumulate_refs`
-deliberately uses `checked_add` and rejects overflow as a corrupt blob, so
-the writer can now produce a way (refs `i64::MIN` then `i64::MAX`) that its
-own scan path refuses; release builds always could. Pick one policy first:
-modular everywhere (drop the scanner's corruption check), or checked
-everywhere (reverse the wrapping in `dense.rs` and the encoders, and decide
-what the writer does with such input). Release has no overflow checks, so
-the wrapping form costs nothing on the hot iterators.
-
-Reported by: the wave-3 delta fixer.
 
 ## BUG-099 - Staged geocode publication leaves edge cases open
 
@@ -467,3 +388,31 @@ directory and publishes with two renames. Open:
   store 0 as for a missing value.
 
 Reported by: the wave-3 reviewer.
+
+## BUG-100 - Coordinate scaling and offset arithmetic is unchecked in the readers
+
+Anger: 8 - decoder arithmetic.
+
+Delta reconstruction is now modular everywhere, but the step after it is
+not covered by any policy: granularity scaling and lat/lon offset arithmetic
+in the dense, plain-node, way-location and columnar read paths uses plain
+`i64` multiplication and addition. Extreme but legal granularity or offset
+values overflow (a debug panic, a release wrap to a wrong coordinate).
+`block.rs` validates some header fields at construction; whether that bounds
+every product here is unverified.
+
+Reported by: the wave-4 delta fixer.
+
+## BUG-101 - Dense `keys_vals` string indices still narrow silently
+
+Anger: 9 - decoder refusals.
+
+Plain-element key/value indices above `u32::MAX` are now refused at block
+construction. The dense analogue is not: `read/dense.rs` `DenseRawTagIter`
+reads `keys_vals` sids with `read_varint() as i32`, so an index above
+`i32::MAX` narrows to a different, possibly valid, sid, and
+`validate_dense_keys_vals` in `read/block.rs` reads them with an unbounded
+`read_varint`. The bound belongs in the existing validation scan, as for
+plain elements, not in the per-element iterator.
+
+Reported by: the wave-4 reviewer.

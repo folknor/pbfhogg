@@ -5,12 +5,17 @@
 //! closure on the decoded `PrimitiveBlock`. The consumer thread merges
 //! per-blob results.
 //!
-//! Three modes:
+//! Four modes:
 //!
 //! - [`parallel_classify_phase`]: per-blob result `R` is sent to the
 //!   consumer for each blob (worker holds only persistent scratch state
 //!   `S`). Use for dense paths where per-worker accumulation would be
 //!   unbounded at planet scale.
+//!
+//! - [`parallel_classify_phase_ordered`]: the same, with `merge` called in
+//!   schedule order and dispatch held at most a fixed window ahead of the
+//!   earliest unmerged blob, which bounds the reorder memory. Use where the
+//!   merge's output must not depend on worker timing.
 //!
 //! - [`parallel_classify_accumulate`]: per-worker accumulator `S` is held
 //!   for the whole scan and merged once at completion. Use for sparse
@@ -577,6 +582,194 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
     Ok(())
 }
 
+/// Admission state of [`parallel_classify_phase_ordered`]: how many results
+/// the consumer has merged, and whether the scan is shutting down.
+type OrderedCredit = (std::sync::Mutex<(usize, bool)>, std::sync::Condvar);
+
+/// Marks the ordered scan closed on drop, waking a dispatcher parked on
+/// admission credit. The consumer holds one for its whole loop (an early
+/// `Err` return or a panicking merge must not leave the dispatcher parked,
+/// or the scope never joins); each worker holds one that fires only when the
+/// worker panics, because the result it was producing will never arrive and
+/// the window could otherwise never advance past it.
+struct CloseOnDrop<'a> {
+    credit: &'a OrderedCredit,
+    only_if_panicking: bool,
+}
+
+/// Park until schedule position `position` is admitted (`position < merged +
+/// window`). Returns `false` when the scan closed instead.
+fn wait_for_credit(credit: &OrderedCredit, position: usize, window: usize) -> bool {
+    let (lock, cvar) = credit;
+    let mut state = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while !state.1 && position >= state.0.saturating_add(window) {
+        state = cvar
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    !state.1
+}
+
+/// Publish the consumer's merged count and wake the dispatcher.
+fn publish_merged(credit: &OrderedCredit, merged: usize) {
+    let (lock, cvar) = credit;
+    lock.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .0 = merged;
+    cvar.notify_one();
+}
+
+impl Drop for CloseOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.only_if_panicking && !std::thread::panicking() {
+            return;
+        }
+        let (lock, cvar) = self.credit;
+        lock.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1 = true;
+        cvar.notify_all();
+    }
+}
+
+/// [`parallel_classify_phase`] whose `merge` runs in schedule order, with
+/// memory bounded by `window`.
+///
+/// Results still complete in worker order; the consumer parks each in a
+/// `window`-slot ring and merges the contiguous run from the earliest
+/// unmerged position. Ordering alone would not bound that ring - one slow
+/// blob at the head lets workers race arbitrarily far ahead - so dispatch
+/// carries an admission credit tied to the head: schedule position `k` is
+/// handed to a worker only once `k < merged + window`. At most `window`
+/// results are therefore alive between classify and merge, and workers only
+/// stall when the head blob is a full window behind the fastest one.
+///
+/// Unlike running fixed batches back to back, merge overlaps classification
+/// and the workers persist (with their `S` scratch and decompress pools)
+/// across the whole schedule; a batch barrier would idle every worker on the
+/// slowest blob of each batch and serialize the merge behind the workers,
+/// which matters on merge-heavy phases.
+///
+/// `merge` receives the entry's own `seq`, which may be sparse; ordering is
+/// by schedule position.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn parallel_classify_phase_ordered<S: Send, R: Send>(
+    shared_file: &std::sync::Arc<std::fs::File>,
+    schedule: &[ScheduleEntry],
+    threads: Option<usize>,
+    window: usize,
+    worker_init: impl Fn() -> S + Send + Sync,
+    classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> R + Send + Sync,
+    mut merge: impl FnMut(usize, R),
+    resources: &dyn crate::host::Resources,
+) -> Result<()> {
+    use std::os::unix::fs::FileExt as _;
+
+    let mut willneed = WillneedPrefetch::new(schedule);
+    if schedule.is_empty() {
+        return Ok(());
+    }
+    let window = window.max(1);
+    let decode_threads = resolve_thread_count(threads, resources);
+
+    let credit: OrderedCredit = (std::sync::Mutex::new((0, false)), std::sync::Condvar::new());
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, ScheduleEntry)>(16);
+    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
+    let (result_tx, result_rx) =
+        std::sync::mpsc::sync_channel::<(usize, usize, crate::error::Result<R>)>(32);
+
+    std::thread::scope(|scope| -> Result<()> {
+        let credit_ref = &credit;
+        scope.spawn(move || {
+            for (position, &item) in schedule.iter().enumerate() {
+                if !wait_for_credit(credit_ref, position, window) {
+                    break;
+                }
+                willneed.before_dispatch(shared_file, item);
+                if desc_tx.send((position, item)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        for _ in 0..decode_threads {
+            let rx = std::sync::Arc::clone(&desc_rx);
+            let tx = result_tx.clone();
+            let file = std::sync::Arc::clone(shared_file);
+            let classify_ref = &classify;
+            let worker_init_ref = &worker_init;
+            scope.spawn(move || {
+                let _close = CloseOnDrop {
+                    credit: credit_ref,
+                    only_if_panicking: true,
+                };
+                let mut read_buf: Vec<u8> = Vec::new();
+                let worker_pool = crate::blob::DecompressPool::new();
+                let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+                let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+                let mut state = worker_init_ref();
+
+                loop {
+                    let (position, (s, data_offset, data_size)) = {
+                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match guard.recv() {
+                            Ok(d) => d,
+                            Err(_) => break,
+                        }
+                    };
+
+                    let r: crate::error::Result<R> = (|| {
+                        read_buf.resize(data_size, 0);
+                        file.read_exact_at(&mut read_buf, data_offset)
+                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                        let mut buf = crate::blob::pool_get(Some(&worker_pool), data_size * 4);
+                        crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
+                        let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
+                            buf,
+                            &worker_pool,
+                            &mut st_scratch,
+                            &mut gr_scratch,
+                        )?;
+                        Ok(classify_ref(&block, &mut state))
+                    })();
+                    if tx.send((position, s, r)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(desc_rx);
+        drop(result_tx);
+
+        let _close = CloseOnDrop {
+            credit: credit_ref,
+            only_if_panicking: false,
+        };
+        // Position `k` is admitted only while `k < next + window`, so the
+        // live positions are distinct modulo the ring length.
+        let ring = window.min(schedule.len());
+        let mut pending: Vec<Option<(usize, R)>> = (0..ring).map(|_| None).collect();
+        let mut next = 0_usize;
+        for (position, seq, result) in result_rx {
+            pending[position % ring] = Some((seq, result?));
+            let before = next;
+            while let Some((seq, out)) = pending[next % ring].take() {
+                merge(seq, out);
+                next += 1;
+            }
+            if next != before {
+                publish_merged(credit_ref, next);
+            }
+        }
+        Ok(())
+    })?;
+
+    Ok(())
+}
+
 /// Per-blob streaming scan over decompressed blob bytes (no `PrimitiveBlock`
 /// construction).
 ///
@@ -924,6 +1117,54 @@ mod tests {
         )
         .unwrap();
         assert_eq!(all.into_inner(), BLOBS, "a non-breaking scan is exhaustive");
+    }
+
+    /// The ordered phase merges in schedule order whatever the completion
+    /// order, passes each entry's own (here sparse) `seq` through, and never
+    /// lets classification run more than `window` blobs past the earliest
+    /// unmerged one.
+    #[test]
+    fn ordered_phase_merges_in_schedule_order_within_its_window() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        const BLOBS: usize = 40;
+        const WINDOW: usize = 4;
+        let path = write_many_blob_pbf(dir.path(), BLOBS);
+        let (mut schedule, shared_file) =
+            super::build_classify_schedule(&path, None, &crate::host::Diagnostics::discard())
+                .unwrap();
+        assert_eq!(schedule.len(), BLOBS);
+        for entry in &mut schedule {
+            entry.0 *= 2;
+        }
+
+        let classified = AtomicUsize::new(0);
+        let mut merged = Vec::new();
+        super::parallel_classify_phase_ordered(
+            &shared_file,
+            &schedule,
+            Some(3),
+            WINDOW,
+            || (),
+            |_block, ()| {
+                classified.fetch_add(1, Ordering::Relaxed);
+            },
+            |seq, ()| {
+                // Every classified blob was admitted while fewer than
+                // `merged.len() + WINDOW` positions were open.
+                let seen = classified.load(Ordering::Relaxed);
+                assert!(
+                    seen <= merged.len() + WINDOW,
+                    "{seen} blobs classified with {} merged and a window of {WINDOW}",
+                    merged.len()
+                );
+                merged.push(seq);
+            },
+            &crate::host::MachineProbe,
+        )
+        .unwrap();
+        assert_eq!(merged, (0..BLOBS).map(|n| n * 2).collect::<Vec<_>>());
     }
 
     #[test]

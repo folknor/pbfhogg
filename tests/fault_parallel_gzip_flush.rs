@@ -81,8 +81,11 @@ mod parallel_gzip_flush {
             Err(_) => panic!("a compress-worker panic must not unwind into the caller"),
         }
 
-        // Teardown must not hang either: Drop's best-effort flush and joins
-        // run against the same half-dead pool.
-        drop(gz);
+        // Teardown must not hang either: finish joins the same half-dead pool
+        // and reports the recorded worker failure.
+        assert!(
+            gz.finish().is_err(),
+            "finish must report the recorded worker failure"
+        );
     }
 }

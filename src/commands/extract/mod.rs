@@ -445,6 +445,9 @@ pub fn parse_extract_config_with_output_directory(
 
     let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
 
+    // A relative config directory is anchored at the config file, by design.
+    // osmium extract uses a relative directory from the process working
+    // directory, so the same config can select different output roots there.
     let configured_output_dir = directory.as_deref().map(|dir| {
         if dir.is_absolute() {
             dir.to_path_buf()
@@ -486,6 +489,11 @@ pub fn parse_extract_config_with_output_directory(
 }
 
 fn rebase_config_output(output: &Path, old_root: &Path, new_root: &Path) -> PathBuf {
+    // osmium extract concatenates its output-directory string and configured
+    // output string, including when the latter is absolute. Under pbfhogg's
+    // -d override, absolute paths below the configured root keep their
+    // relative suffix, while paths outside that root are reduced to their
+    // filename so the result stays under the override directory.
     let relative = if output.is_absolute() {
         output
             .strip_prefix(old_root)

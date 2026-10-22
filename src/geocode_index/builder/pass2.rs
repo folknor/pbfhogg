@@ -5,9 +5,9 @@
 //! a way phase (Phase 2b). Both are parallel.
 //!
 //! - **Phase 2a** (parallel nodes). Workers decode node blobs via
-//!   [`parallel_classify_phase`]. Coord writes go directly into the
-//!   coordinate store from the worker as relaxed atomic stores (see
-//!   [`coord_slots`]). Every decoded node is checked against the node-ID
+//!   `parallel_classify_phase_ordered`. Coord writes go directly into the
+//!   coordinate store from the worker as relaxed compare-exchange installs
+//!   (see [`coord_slots`] and `install_coord`). Every decoded node is checked against the node-ID
 //!   bound Pass 1.5 trusted. Pending `AddrPoint`s flow to the main
 //!   thread via the merge channel; the main thread interns strings
 //!   into the shared `StringPool` and streams to `addr_points.bin`.
@@ -21,10 +21,12 @@
 //!   / `addr_points.bin` / `interp_nodes.bin`, pushes `SlimInterpWay`
 //!   entries, and inserts into the `way_geom` map.
 //!
-//! Both merges run in worker-completion order, not blob order:
-//! `parallel_classify_phase` does no reordering and the merge closures
-//! ignore the sequence number. Record order and string offsets in the
-//! output files can therefore differ between two builds of the same input.
+//! Both merges run in blob (file) order through
+//! `parallel_classify_phase_ordered`, which holds dispatch at most
+//! `MERGE_WINDOW_BLOBS` ahead of the earliest unmerged blob, so a slow head
+//! cannot grow the reorder buffer across the whole input, while merge still
+//! overlaps classification. Duplicate admin ways use the last file
+//! occurrence; conflicting coordinates for a referenced node fail the build.
 
 use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -109,17 +111,18 @@ struct PendingAddrPoint {
 /// View the anonymous coordinate mmap as `slot_count` atomic slots, one per
 /// referenced-node rank.
 ///
-/// Phase 2a workers store into these slots concurrently and Phase 2b reads
-/// them, both with `Relaxed` ordering; `parallel_classify_phase` joins its
-/// workers before returning, which orders every 2a store before every 2b
-/// load. The slots are atomic rather than plain bytes because nothing
+/// Phase 2a workers install into these slots concurrently and Phase 2b reads
+/// them, both with `Relaxed` ordering; `parallel_classify_phase_ordered`
+/// joins its workers before returning, which orders every 2a store before
+/// every 2b load. The slots are atomic rather than plain bytes because nothing
 /// guarantees two workers never write the same rank: that would need every
 /// node ID to appear in at most one blob, and neither `Sort.Type_then_ID`
 /// nor deduplication is checked on the way in (and `--force` skips even the
 /// indexdata check). A node duplicated across blobs therefore makes two
 /// workers store one slot; with atomics that is defined - one complete
-/// coordinate wins, in atomic modification order rather than file order -
-/// where plain writes were a data race.
+/// coordinate is installed with compare-exchange; identical repeats are
+/// accepted and conflicting repeats fail the build. Worker timing therefore
+/// cannot select the coordinate used by a successful build.
 ///
 /// The returned borrow is tied to the `&mut` borrow of the mmap, so no
 /// other access to the mapping can overlap the view.
@@ -168,6 +171,23 @@ use crate::coord_pack::{pack as pack_coord, unpack as unpack_coord};
 fn coord_slot(slots: &[AtomicU64], rank: u64) -> Option<&AtomicU64> {
     slots.get(usize::try_from(rank).ok()?)
 }
+
+/// Install a complete coordinate once. A successful build must not depend on
+/// which worker encountered a duplicate referenced node first.
+fn install_coord(slot: &AtomicU64, packed: u64) -> bool {
+    match slot.compare_exchange(0, packed, Ordering::Relaxed, Ordering::Relaxed) {
+        Ok(_) => true,
+        Err(previous) => previous == packed,
+    }
+}
+
+/// How far Pass 2 classification may run ahead of the earliest unmerged blob.
+/// Both merges must see blobs in file order (record order, string offsets and
+/// the surviving duplicate admin way depend on it), and this bounds the
+/// results held for reordering to this many per-blob outputs, each bounded by
+/// one input blob's contents. Wide enough that a slow blob at the head rarely
+/// parks the workers.
+const MERGE_WINDOW_BLOBS: usize = 256;
 
 // ---------------------------------------------------------------------------
 // Phase 2b: parallel way scan
@@ -451,10 +471,11 @@ pub(super) fn run_pass2(
         let referenced_ref = &referenced_nodes;
         let mut merge_err: Option<std::io::Error> = None;
         let mut semantic_err: Option<String> = None;
-        crate::scan::classify::parallel_classify_phase(
+        crate::scan::classify::parallel_classify_phase_ordered(
             shared_file,
             node_schedule,
             None,
+            MERGE_WINDOW_BLOBS,
             NodeBlobOut::default,
             |block, state: &mut NodeBlobOut| -> NodeBlobOut {
                 for element in block.elements_skip_metadata() {
@@ -495,7 +516,12 @@ pub(super) fn run_pass2(
                                     ));
                                     continue;
                                 };
-                                slot.store(packed, Ordering::Relaxed);
+                                if !install_coord(slot, packed) {
+                                    state.error = Some(format!(
+                                        "node {node_id} has conflicting coordinates across occurrences"
+                                    ));
+                                    continue;
+                                }
                             }
                             let mut hn: Option<&str> = None;
                             let mut st: Option<&str> = None;
@@ -581,7 +607,7 @@ pub(super) fn run_pass2(
     // joined), and emit a `WayBlobOut` per blob. The main-thread merge
     // interns strings, writes records to the four output files, pushes
     // `SlimInterpWay` entries, and inserts into the `way_geom` map. Merge
-    // order is worker-completion order; see the module docs.
+    // order is file order, through a bounded window; see the module docs.
     let mut street_node_offset: u64 = 0;
     let mut interp_node_offset: u64 = 0;
     let mut street_way_count: u32 = 0;
@@ -592,10 +618,11 @@ pub(super) fn run_pass2(
         let needed_admin_ways_ref = &needed_admin_ways;
         let mut merge_err: Option<String> = None;
 
-        crate::scan::classify::parallel_classify_phase(
+        crate::scan::classify::parallel_classify_phase_ordered(
             shared_file,
             way_schedule,
             None,
+            MERGE_WINDOW_BLOBS,
             WayBlobOut::default,
             |block, state: &mut WayBlobOut| -> WayBlobOut {
                 for element in block.elements_skip_metadata() {
@@ -796,4 +823,23 @@ pub(super) fn run_pass2(
         addr_points_mmap,
         interp_nodes_mmap,
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_coordinates_agree_or_fail_in_either_order() {
+        let a = pack_coord(0, 0).unwrap();
+        let b = pack_coord(1, 2).unwrap();
+        for (first, second) in [(a, b), (b, a)] {
+            let slot = AtomicU64::new(0);
+            assert!(install_coord(&slot, first));
+            assert!(install_coord(&slot, first));
+            assert!(!install_coord(&slot, second));
+            assert_eq!(slot.load(Ordering::Relaxed), first);
+        }
+    }
 }

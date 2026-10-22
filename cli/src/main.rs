@@ -2818,7 +2818,10 @@ fn run_export_to<W: std::io::Write>(
 /// reading it. Naming `--type node` is this binary's job, so the advice
 /// is attached here, where the flag actually exists.
 fn export_error(err: pbfhogg::Error) -> Box<dyn std::error::Error> {
-    if matches!(err.kind(), pbfhogg::ErrorKind::MissingFeature(f) if *f == "LocationsOnWays") {
+    if matches!(
+        err.kind(),
+        pbfhogg::ErrorKind::MissingFeature(f) if *f == pbfhogg::HeaderBlock::LOCATIONS_ON_WAYS
+    ) {
         return format!("{err}; use --type node to export nodes only").into();
     }
     Box::new(err)

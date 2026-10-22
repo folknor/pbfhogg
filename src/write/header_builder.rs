@@ -1,5 +1,6 @@
 //! Builder for the `OSMHeader` blob that starts every PBF file.
 
+use crate::read::block::Feature;
 use crate::read::wire_schema::{header_bbox, header_block};
 
 use std::io;
@@ -40,7 +41,7 @@ pub struct HeaderBuilder<'a> {
     replication_sequence_number: Option<i64>,
     replication_base_url: Option<&'a str>,
     source: Option<&'a str>,
-    optional_features: Vec<&'a str>,
+    optional_features: Vec<Feature<'a>>,
     historical_information: bool,
     sorted: bool,
     writing_program: &'a str,
@@ -176,13 +177,14 @@ impl<'a> HeaderBuilder<'a> {
         self
     }
 
-    /// Add an arbitrary optional feature string (e.g. `"LocationsOnWays"`).
+    /// Add a known feature with its [`Feature`] constant, or an arbitrary
+    /// extension feature string.
     ///
     /// For `Sort.Type_then_ID`, prefer the type-safe [`.sorted()`](Self::sorted)
     /// method instead.
     #[must_use]
-    pub fn optional_feature(mut self, feature: &'a str) -> Self {
-        self.optional_features.push(feature);
+    pub fn optional_feature(mut self, feature: impl Into<Feature<'a>>) -> Self {
+        self.optional_features.push(feature.into());
         self
     }
 
@@ -276,8 +278,16 @@ impl<'a> HeaderBuilder<'a> {
         }
 
         // Field 4: required_features (repeated string)
-        encode_bytes_field(&mut buf, header_block::REQUIRED_FEATURES, b"OsmSchema-V0.6");
-        encode_bytes_field(&mut buf, header_block::REQUIRED_FEATURES, b"DenseNodes");
+        encode_bytes_field(
+            &mut buf,
+            header_block::REQUIRED_FEATURES,
+            crate::HeaderBlock::OSM_SCHEMA_V06.as_bytes(),
+        );
+        encode_bytes_field(
+            &mut buf,
+            header_block::REQUIRED_FEATURES,
+            crate::HeaderBlock::DENSE_NODES.as_bytes(),
+        );
         if self.historical_information {
             encode_bytes_field(
                 &mut buf,
@@ -298,7 +308,7 @@ impl<'a> HeaderBuilder<'a> {
             encode_bytes_field(
                 &mut buf,
                 header_block::OPTIONAL_FEATURES,
-                feature.as_bytes(),
+                feature.as_str().as_bytes(),
             );
         }
 

@@ -4,6 +4,11 @@
 
 ### Breaking
 
+- **`HeaderBuilder::optional_feature` takes `impl Into<Feature>`** instead of
+  `&str`. `&str` and the new `pbfhogg::block::Feature` constants
+  (`HeaderBlock::LOCATIONS_ON_WAYS` and friends) work unchanged; a `&String`
+  argument no longer deref-coerces and needs `.as_str()`.
+
 - **Unavailable `--direct-io` / `--io-uring` now exits 3, not 2.** A
   filesystem that refuses `O_DIRECT` at open, or a host without usable
   io_uring (old kernel, sandboxed `io_uring_setup`, `RLIMIT_MEMLOCK` below
@@ -649,6 +654,31 @@
 
 - **Multi-extract progress lines name the final output files** instead of
   the hidden `.pbfhogg-tmp-*` scratch names.
+
+- **Single-pass multi-extract reports each region once.** The library's
+  per-region `extract.multi.slot_counts` progress event is gone; the CLI
+  summary is the one report, and library callers read the returned
+  `ExtractStats`.
+
+- **`build-geocode-index` output is reproducible.** Pass 2 merged blob
+  results in worker-completion order, so record order, string offsets and
+  which duplicate admin way survived could differ between two builds of the
+  same input. Results are now merged in file order. A node that appears
+  more than once with conflicting coordinates now fails the build instead
+  of an arbitrary copy winning; identical repeats are still accepted.
+
+- **The decoder refuses two block shapes it used to misread.** A
+  `PrimitiveGroup` carrying more than one `DenseNodes` message, where every
+  node after the first message was silently dropped, and a Node, Way or
+  Relation tag string index above `u32::MAX`, which was narrowed to a
+  different and possibly valid string. Both are now wire-format errors in
+  every reader, in indexdata generation and in the raw node and way scanners.
+
+- **Element IDs whose deltas wrap are read the same way everywhere.** A
+  block the writer produces for IDs `i64::MIN` then `i64::MAX` decodes to
+  those IDs; indexdata generation (so `PbfWriter` itself), the
+  add-locations-to-ways node and way scanners and the apply-changes node
+  extractor used to refuse it as an overflow.
 
 - **Geocode indexes no longer carry duplicate coarse-cell entries** for
   segments crossing more than four coarse cells.

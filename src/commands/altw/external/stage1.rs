@@ -21,6 +21,16 @@ use super::blob_meta::BlobMeta;
 use super::radix::{NUM_BUCKETS, ScratchDir};
 use super::{BucketLayout, ID_RECORD_SIZE, IdRecord, NodeBlobInfo};
 
+// Stage-1 blob-level count stream: one u64 per way blob plus the total. This
+// sidecar batching capacity is distinct from the PBF writer transfer size in
+// `crate::write::IO_BUF_BYTES`.
+const REF_COUNT_SIDECAR_BUF_BYTES: usize = 64 * 1024;
+
+// Stage-1 per-way stream: each blob's way count and each way's refcount as
+// varints. This sidecar batching capacity is distinct from the PBF writer
+// transfer size in `crate::write::IO_BUF_BYTES`, despite having the same value.
+const PER_WAY_REFCOUNT_SIDECAR_BUF_BYTES: usize = 256 * 1024;
+
 /// `io::Write` shim between the id-shard `BufWriter`s and their files
 /// that attributes real write calls (BufWriter buffer drains, 256 KB
 /// granularity). `s1a_id_emit_ms` times the whole emission loop -
@@ -360,12 +370,12 @@ pub(super) fn stage1_pass_a(
             drop(tx);
 
             let mut sidecar_writer = BufWriter::with_capacity(
-                64 * 1024,
+                REF_COUNT_SIDECAR_BUF_BYTES,
                 std::fs::File::create(ref_count_sidecar)
                     .map_err(|e| format!("create sidecar: {e}"))?,
             );
             let mut per_way_writer = BufWriter::with_capacity(
-                256 * 1024,
+                PER_WAY_REFCOUNT_SIDECAR_BUF_BYTES,
                 std::fs::File::create(per_way_refcount_sidecar)
                     .map_err(|e| format!("create per-way sidecar: {e}"))?,
             );

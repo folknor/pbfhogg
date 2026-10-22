@@ -221,9 +221,19 @@ impl Write for DirectWriter {
 
 impl Drop for DirectWriter {
     fn drop(&mut self) {
-        // Best-effort flush - errors can't be propagated from Drop.
-        // Callers should call flush() explicitly to get errors.
+        #[cfg(test)]
+        let flushed = self.flushed;
+        // Best-effort cleanup still finalizes the file, but only an explicit
+        // flush can report its I/O error. An error bail-out reaching here is
+        // expected (the primary error dominates). The crate's own unit-test
+        // builds assert when a non-panicking path skipped the explicit flush;
+        // see `PbfWriter`'s `Drop` for why it is not every debug build.
         drop(self.flush_final());
+        #[cfg(test)]
+        debug_assert!(
+            std::thread::panicking() || flushed,
+            "DirectWriter dropped before flush(); call flush() to observe deferred errors"
+        );
     }
 }
 

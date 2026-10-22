@@ -3066,3 +3066,115 @@ fn force_rebuild_preserves_open_reader_mappings() {
     );
     pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("new reader");
 }
+
+#[test]
+fn caller_built_interpolation_candidate_cannot_escape_its_way() {
+    use pbfhogg::geocode_index::{builder, reader::Reader};
+
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+    write_synthetic_interpolation_input(&input);
+    builder::build_geocode_index(
+        &builder::BuildConfig {
+            input_path: input,
+            output_dir: index_dir.clone(),
+            ..Default::default()
+        },
+        &crate::common::test_host(),
+    )
+    .expect("build interpolation fixture");
+    let reader = Reader::open(&index_dir).expect("open fixture");
+    let mut candidates = reader.candidates(55.7, 12.5030).expect("valid query");
+    let mut candidate = candidates.interpolations.pop().expect("interpolation hit");
+    assert!(reader.interpolate(&candidate).is_some());
+    // The fixture has two nodes: only segment zero belongs to the way.
+    for segment in [1, 2, u16::MAX] {
+        candidate.segment_index = segment;
+        assert_eq!(reader.interpolate(&candidate), None);
+    }
+    candidate.segment_index = 0;
+    candidate.way_index = u32::MAX;
+    assert_eq!(reader.interpolate(&candidate), None);
+}
+
+#[test]
+fn repeated_multiblob_geocode_builds_have_identical_files() {
+    use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder};
+    use pbfhogg::geocode_index::builder;
+    use pbfhogg::writer::{Compression, PbfWriter};
+
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let mut writer = PbfWriter::new(
+        std::io::BufWriter::new(std::fs::File::create(&input).expect("create input")),
+        Compression::None,
+    );
+    writer
+        .write_header(&HeaderBuilder::new().sorted().build().expect("header"))
+        .expect("write header");
+    // Cross the admission boundary in both phases, with distinct strings to
+    // expose any completion-order interning or record numbering.
+    for id in 1..=260 {
+        let mut block = BlockBuilder::new();
+        let number = id.to_string();
+        block.add_node(
+            id,
+            557_000_000,
+            125_000_000 + i32::try_from(id).expect("small fixture ID"),
+            [
+                ("addr:housenumber", number.as_str()),
+                ("addr:street", "Batch Street"),
+            ],
+            None,
+        );
+        writer
+            .write_primitive_block(block.take().expect("block").expect("node"))
+            .expect("write node");
+    }
+    for id in 1..=260 {
+        let mut block = BlockBuilder::new();
+        let name = format!("Street {id}");
+        block.add_way(
+            id,
+            [("highway", "residential"), ("name", name.as_str())],
+            &[1, 260],
+            None,
+        );
+        writer
+            .write_primitive_block(block.take().expect("block").expect("way"))
+            .expect("write way");
+    }
+    writer.flush().expect("flush input");
+    drop(writer);
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    for output_dir in [&a, &b] {
+        builder::build_geocode_index(
+            &builder::BuildConfig {
+                input_path: input.clone(),
+                output_dir: output_dir.clone(),
+                ..Default::default()
+            },
+            &crate::common::test_host(),
+        )
+        .expect("build fixture");
+    }
+    let mut compared = 0;
+    for entry in std::fs::read_dir(&a).expect("list output") {
+        let entry = entry.expect("directory entry");
+        assert!(entry.file_type().expect("type").is_file());
+        assert_eq!(
+            std::fs::read(entry.path()).expect("first build"),
+            std::fs::read(b.join(entry.file_name())).expect("second build"),
+            "different output: {:?}",
+            entry.file_name(),
+        );
+        compared += 1;
+    }
+    assert!(compared > 0);
+    assert_eq!(
+        compared,
+        std::fs::read_dir(&b).expect("list second build").count()
+    );
+}

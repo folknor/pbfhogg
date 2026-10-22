@@ -185,6 +185,27 @@ mode, pbfhogg includes more way-referenced nodes while osmium includes more rela
 near extract boundaries may see slightly different relation membership. The node/way
 coverage is effectively identical.
 
+## extract: multi-extract config path roots
+
+**osmium behavior:** A relative top-level `directory` is resolved from the
+process working directory. `--directory` is prepended to each configured
+`output` by string concatenation, including absolute output strings.
+
+**pbfhogg behavior:** A relative top-level `directory` is resolved from the
+config file's directory. With `-d`, relative outputs keep their configured
+subpaths. An absolute output under the configured directory keeps its relative
+subpath under the override; an absolute output outside that root is reduced to
+its filename under the override.
+
+**Impact:** The same config can write to different locations under the two
+tools. In pbfhogg, `-d` keeps absolute outputs below the override directory
+instead of treating the configured absolute path as a concatenated suffix.
+
+**Rationale:** The config file owns its relative resource and output paths.
+When `-d` is supplied, all configured outputs stay under the requested output
+root, while paths already below the configured root retain their useful
+subdirectory structure.
+
 ## renumber: orphan-reference handling
 
 **osmium behavior:** When a way ref or relation member points to an object not

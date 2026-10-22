@@ -1074,7 +1074,7 @@ fn write_output_decode_all(
         reader.header(),
         true,
         overrides,
-        |hb| hb.optional_feature("LocationsOnWays"),
+        |hb| hb.optional_feature(crate::read::block::Feature::LOCATIONS_ON_WAYS),
         direct_io,
         false,
         host,

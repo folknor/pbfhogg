@@ -158,7 +158,9 @@ pub fn export<W: Write>(
 ) -> crate::Result<ExportStats> {
     let reader = ElementReader::open_in(input, false, host)?;
     if admits_ways(opts.types) && !reader.header().has_locations_on_ways() {
-        return Err(new_error(ErrorKind::MissingFeature("LocationsOnWays")));
+        return Err(new_error(ErrorKind::MissingFeature(
+            crate::HeaderBlock::LOCATIONS_ON_WAYS,
+        )));
     }
 
     let mut writer = FeatureWriter::new(out, opts.format)?;

@@ -62,6 +62,12 @@ fn take_packed<'a>(
     Ok(())
 }
 
+/// Refusal of a `PrimitiveGroup` carrying more than one `DenseNodes` message.
+/// Shared by the decoder (`WireGroup::dense`) and the raw scanners that walk
+/// groups themselves (`blob_meta::scan`, `scan::node`), so all of them refuse
+/// the shape with one message.
+pub(crate) const DUP_GROUP_DENSE: &str = "PrimitiveGroup.dense appears twice";
+
 // Per-field duplicate-occurrence messages. Each names exactly one field of one
 // message, so a test asserting on one of these cannot be satisfied by any other
 // guard in the decoder.
@@ -414,13 +420,21 @@ impl<'a> WireGroup<'a> {
 
     pub fn dense(&self) -> Result<Option<&'a [u8]>> {
         let mut cursor = Cursor::new(self.data);
+        let mut dense = None;
         while let Some((field, wire_type)) = cursor.read_tag()? {
             if field == 2 && wire_type == WIRE_LEN {
-                return Ok(Some(cursor.read_len_delimited()?));
+                // Singular protobuf messages merge on repetition. A single
+                // borrowed slice cannot represent that merge, so refuse even
+                // an empty repeat rather than silently drop part of the group.
+                if dense.is_some() {
+                    return Err(new_wire_error(DUP_GROUP_DENSE));
+                }
+                dense = Some(cursor.read_len_delimited()?);
+            } else {
+                cursor.skip_field(wire_type)?;
             }
-            cursor.skip_field(wire_type)?;
         }
-        Ok(None)
+        Ok(dense)
     }
 
     #[inline]
@@ -814,6 +828,74 @@ impl WireInfo {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// Tag string indices wider than `u32` are refused when the block is
+    /// built (the structural validation in `read/block.rs`), not by
+    /// `WireWay::parse`, which also runs per element during iteration and in
+    /// the raw scanners and so must not walk the tag arrays again.
+    #[test]
+    fn tag_indices_must_fit_uint32_in_both_wire_forms() {
+        // u32::MAX; u32::MAX + 1, which used to alias string index zero in
+        // PackedUint32Iter; and zero in an overlong six-byte encoding, whose
+        // value fits and is therefore accepted.
+        let cases: [(&[u8], bool); 3] = [
+            (&[0xff, 0xff, 0xff, 0xff, 0x0f], true),
+            (&[0x80, 0x80, 0x80, 0x80, 0x10], false),
+            (&[0x80, 0x80, 0x80, 0x80, 0x80, 0x00], true),
+        ];
+        for (value, valid) in cases {
+            for field in [2_u8, 3] {
+                for packed in [false, true] {
+                    // One Way carrying `value` in `field` and 0 in the other
+                    // of keys/vals, so the two arrays stay parallel.
+                    let mut message = Vec::new();
+                    for f in [2_u8, 3] {
+                        let bytes: &[u8] = if f == field { value } else { &[0] };
+                        message.push((f << 3) | if packed { 2 } else { 0 });
+                        if packed {
+                            message.push(u8::try_from(bytes.len()).unwrap());
+                        }
+                        message.extend_from_slice(bytes);
+                    }
+                    assert!(WireWay::parse(&message).is_ok());
+                    let mut group = vec![0x1a, u8::try_from(message.len()).unwrap()];
+                    group.extend_from_slice(&message);
+                    let mut block = vec![0x0a, 2, 0x0a, 0, 0x12];
+                    block.push(u8::try_from(group.len()).unwrap());
+                    block.extend_from_slice(&group);
+                    let result = crate::PrimitiveBlock::from_vec(block);
+                    assert_eq!(result.is_ok(), valid, "{value:?} in field {field}");
+                    if let Err(err) = result {
+                        assert!(err.to_string().contains("tag string index exceeds uint32"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_dense_messages_are_refused_instead_of_dropped() {
+        let once = [0x12, 0];
+        assert_eq!(WireGroup::new(&once).dense().unwrap(), Some(&[][..]));
+        for repeated in [
+            &[0x12, 0, 0x12, 0][..],
+            // Two non-empty messages carrying disjoint fields would merge in
+            // protobuf, but cannot be represented by one borrowed slice.
+            &[0x12, 3, 0x0a, 1, 2, 0x12, 3, 0x42, 1, 0][..],
+        ] {
+            let err = WireGroup::new(repeated).dense().unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("PrimitiveGroup.dense appears twice")
+            );
+        }
+        let block = vec![0x0a, 2, 0x0a, 0, 0x12, 4, 0x12, 0, 0x12, 0];
+        let err = crate::PrimitiveBlock::from_vec(block).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("PrimitiveGroup.dense appears twice")
+        );
+    }
 
     #[test]
     fn wire_info_parse() {

@@ -326,7 +326,7 @@ impl Error {
             // file, so any caller can act on it.
             ErrorKind::MissingFeature(feature) => {
                 write!(f, "input PBF is missing required feature: {feature}")?;
-                if feature == "LocationsOnWays" {
+                if feature == crate::HeaderBlock::LOCATIONS_ON_WAYS {
                     write!(
                         f,
                         "; way geometry needs an input carrying inline way-node coordinates"

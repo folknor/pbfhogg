@@ -237,10 +237,11 @@ pub(super) fn stage4_assembly(
         true,
         overrides,
         |hb| {
-            let mut hb = hb.optional_feature("LocationsOnWays");
+            use crate::read::block::Feature;
+            let mut hb = hb.optional_feature(Feature::LOCATIONS_ON_WAYS);
             if inject_prepass {
-                hb = hb.optional_feature(crate::HeaderBlock::WAY_MEMBERS_V1);
-                hb = hb.optional_feature(crate::HeaderBlock::SHARED_NODE_PINS_V1);
+                hb = hb.optional_feature(Feature::WAY_MEMBERS_V1);
+                hb = hb.optional_feature(Feature::SHARED_NODE_PINS_V1);
             }
             hb
         },
@@ -335,8 +336,9 @@ pub(super) fn stage4_assembly(
     let way_reframe_cref = &way_reframe_counters;
 
     // Depth-gated WAIT span for decode workers blocked handing results
-    // to the consumer (writer backpressure); drives `brokkr sidecar
-    // --stalls` category S4_SEND. Entered only after a failed try_send,
+    // to the consumer (writer backpressure). Its marker pair appears in
+    // `brokkr sidecar --durations`; `--stalls` reads `*_wait_ns` counters,
+    // not these spans. Entered only after a failed try_send,
     // so unblocked sends never touch the gauge lock.
     let s4_send_stall = super::StallGauge::new("WAIT_S4_SEND_START", "WAIT_S4_SEND_END");
     let s4_send_stall_ref = &s4_send_stall;

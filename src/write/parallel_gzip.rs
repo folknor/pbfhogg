@@ -167,13 +167,19 @@ enum Out {
 ///
 /// Call [`finish`](Self::finish) to flush the final partial chunk,
 /// join the workers + writer thread, and recover the inner writer
-/// along with any deferred I/O error. Dropping without `finish` does
-/// a best-effort flush (errors can't propagate through `Drop`) and still
-/// joins every thread.
+/// along with any deferred I/O error. Dropping without `finish` does a
+/// best-effort flush (errors can't propagate through `Drop`) and still joins
+/// every thread; that is the expected path for an error bail-out, where the
+/// primary error dominates. The crate's own unit-test builds assert in `Drop`
+/// when a non-panicking path skipped `finish`; see `PbfWriter`'s `Drop` for
+/// why that check is not enabled in every debug build.
 pub struct ParallelGzipWriter<W: Write + Send + 'static> {
     chunk_size: usize,
     current: Vec<u8>,
     next_seq: u64,
+    #[cfg(test)]
+    /// Whether `finish` has joined the workers and writer thread.
+    finished: bool,
     raw_tx: Option<SyncSender<(u64, Job)>>,
     writer_handle: Option<JoinHandle<Option<W>>>,
     worker_handles: Vec<JoinHandle<()>>,
@@ -271,6 +277,8 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
             chunk_size,
             current: Vec::with_capacity(chunk_size),
             next_seq: 0,
+            #[cfg(test)]
+            finished: false,
             raw_tx: Some(raw_tx),
             writer_handle,
             worker_handles,
@@ -350,6 +358,10 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
         // Ship the final partial chunk.
         let shipped = self.flush_current();
         let inner = self.shutdown();
+        #[cfg(test)]
+        {
+            self.finished = true;
+        }
         // Every thread is joined; the record is final.
         if let Some(e) = self.failure.take() {
             return Err(e);
@@ -445,19 +457,21 @@ impl<W: Write + Send + 'static> Write for ParallelGzipWriter<W> {
 
 impl<W: Write + Send + 'static> Drop for ParallelGzipWriter<W> {
     fn drop(&mut self) {
-        // Best-effort: ship the final partial chunk if the writer was
-        // not explicitly finished. Errors are swallowed - any caller
-        // whose last writes matter (file sinks, network sinks) MUST
-        // call `finish()` on the success path to route the final
-        // chunk's I/O result and the writer thread's join result
-        // through `?`. This Drop only fires reliably for:
-        //   - Error bail-outs that propagate an earlier error via `?`
-        //     and drop the writer unfinished (primary error dominates;
-        //     missing final chunk is moot because the operation failed).
-        //   - Panics.
-        //   - Tests and throwaway code where durability doesn't matter.
+        #[cfg(test)]
+        let finished = self.finished;
+        // Best-effort cleanup still ships the final partial chunk and joins
+        // the threads. Callers that need the final chunk's I/O result must
+        // call `finish()` and route its result through `?`. An error bail-out
+        // reaching here is expected (the primary error dominates). The
+        // unit-test-only assertion below catches a forgotten `finish` in this
+        // crate's own tests; a panic unwind is exempt.
         drop(self.flush_current());
         drop(self.shutdown());
+        #[cfg(test)]
+        debug_assert!(
+            std::thread::panicking() || finished,
+            "ParallelGzipWriter dropped before finish(); call finish() to observe deferred errors"
+        );
     }
 }
 
@@ -849,6 +863,7 @@ mod tests {
             flushes.load(std::sync::atomic::Ordering::Relaxed) >= 1,
             "flush must also flush the inner writer"
         );
+        drop(gz.finish().unwrap());
     }
 
     /// `flush` must surface a destination-I/O error that happened downstream.
@@ -867,6 +882,10 @@ mod tests {
             err.to_string().contains("probe sink: ENOSPC"),
             "flush must report the underlying cause, got {err}"
         );
+        assert!(
+            gz.finish().is_err(),
+            "finish must join the failed writer and preserve its error"
+        );
     }
 
     /// A flush on an empty buffer is still a flush: it must reach the inner
@@ -882,6 +901,7 @@ mod tests {
             flushes.load(std::sync::atomic::Ordering::Relaxed) >= 1,
             "flush with an empty buffer must still flush the inner writer"
         );
+        let _inner = gz.finish().unwrap();
     }
 
     /// Flushing mid-stream must not corrupt the stream: the barrier rides the

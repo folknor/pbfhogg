@@ -657,10 +657,13 @@ impl Reader {
 
     /// Whether an interpolation way can ever yield a house number.
     ///
-    /// This is the resolvability half of [`Self::interpolated_number`]: every
-    /// reason that function returns `None` is a property of the way, never of
-    /// the snap point. Search sinks use it so that "no interpolation result"
-    /// and "no interpolation candidate" mean the same thing - otherwise a
+    /// This is the resolvability half of [`Self::interpolated_number`]: apart
+    /// from the segment bound, every reason that function returns `None` is a
+    /// property of the way, never of the snap point. The segment bound is not
+    /// repeated here because search only produces segments that belong to
+    /// their way; `interpolated_number` checks it for caller-built candidates,
+    /// whose fields are public. Search sinks use it so that "no interpolation
+    /// result" and "no interpolation candidate" mean the same thing - otherwise a
     /// nearby but unresolvable fine segment both fails to produce a house
     /// number and suppresses the coarse fallback that would have.
     fn interpolation_resolvable(&self, way_index: u32) -> bool {
@@ -681,6 +684,11 @@ impl Reader {
         snap_lon_e7: i32,
     ) -> Option<u32> {
         let iw = self.read_interp_way(way_index)?;
+        // Candidates have public fields and may be constructed by callers.
+        // Bound the segment to its owning way before walking node storage.
+        if u32::from(segment_index) + 1 >= u32::from(iw.node_count) {
+            return None;
+        }
         if iw.start_number == 0 || iw.end_number == 0 {
             return None;
         }

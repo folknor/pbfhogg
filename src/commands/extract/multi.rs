@@ -650,28 +650,6 @@ pub(super) fn try_extract_multi_single_pass(
             .map_err(|e| format!("failed to flush {}: {e}", display_path.display()))?;
     }
 
-    // Print per-region stats.
-    for (i, slot) in slots.iter().enumerate() {
-        let display_path = display_paths.map_or(&slot.output, |paths| &paths[i]);
-        let s = &stats[i];
-        let total = s.nodes_in_bbox + s.ways_written + s.relations_written;
-        crate::host::diag!(
-            host.diagnostics,
-            Progress,
-            "extract.multi.slot_counts",
-            "  [{}] {}: {} elements ({} nodes, {} ways, {} relations)",
-            i + 1,
-            display_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("?"),
-            total,
-            s.nodes_in_bbox,
-            s.ways_written,
-            s.relations_written,
-        );
-    }
-
     // Counters: schedule sizes + cross-region totals. Parallels the single-region
     // `extract()` wrapper at the bottom of `pub fn extract` - the single-pass
     // path bypasses that wrapper, so without this block `brokkr sidecar

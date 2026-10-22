@@ -1163,6 +1163,11 @@ fn multi_extract_diagnostics_use_final_output_paths() {
         simple_stderr.contains(simple_output.to_str().expect("UTF-8 output path")),
         "the summary should report the final simple output path; stderr:\n{simple_stderr}"
     );
+    assert_eq!(
+        simple_stderr.matches("simple.osm.pbf").count(),
+        1,
+        "single-pass multi-extract should report each output once; stderr:\n{simple_stderr}"
+    );
     assert!(
         !simple_stderr.contains(".pbfhogg-tmp-"),
         "single-pass diagnostics must not expose scratch paths; stderr:\n{simple_stderr}"

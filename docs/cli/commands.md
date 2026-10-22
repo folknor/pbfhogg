@@ -289,6 +289,9 @@ directory. Relative `output` paths resolve from `directory`, or from the config
 file's directory when it is omitted. `-d` rebases configured outputs under its
 directory, preserving paths below the configured output directory; an absolute
 output outside that root keeps only its filename.
+These rules intentionally differ from `osmium extract`: relative `directory`
+values use the config file's location here, and `-d` rebases absolute outputs
+under the override instead of concatenating the two path strings.
 
 ```
 pbfhogg extract [OPTIONS] <FILE>

@@ -9,8 +9,9 @@
 //! * `Err` - the bytes the scan reads are malformed. Never a partial result.
 //! * `Ok(None)` - the block is well-formed (as far as the scan reads it) but no
 //!   single index can describe it: no groups, no elements (ID scan only), a
-//!   group carrying more than one element field, a second `DenseNodes` in one
-//!   group, or (ID scan only) different element kinds across groups.
+//!   group carrying more than one element field, or (ID scan only) different
+//!   element kinds across groups. A second `DenseNodes` in one group is an
+//!   `Err`, as it is for the decoder (`WireGroup::dense`).
 //! * `Ok(Some(_))` - the exact metadata of the whole block.
 //!
 //! A scan never stops early. An unsupported shape is recorded and the walk
@@ -31,6 +32,13 @@
 //! repeated scalar keeps its last occurrence, an absent `id` is 0, and packed
 //! fields are accepted in both the packed and the unpacked wire form. Every
 //! packed array the scan reads is decoded with fallible varint reads.
+//! `DenseNodes` deltas are summed modulo 2^64, as the decoder and the writer
+//! do, so the ID range and raw coordinate extent are exactly the values a
+//! decode yields - including for a block the writer produced with deltas
+//! that wrap (IDs `i64::MIN` then `i64::MAX`). A checked sum here would make
+//! indexdata generation refuse, and the writer fail on, a block every reader
+//! accepts. Only the granularity/offset scaling of the bbox stays checked,
+//! and an overflow there means no bbox, never a refusal.
 //!
 //! Both scanners run the same walk, so they agree on what is an `Err`.
 //! What the walk validates is the index-relevant structure, not full decoder
@@ -82,8 +90,8 @@ pub(crate) fn try_scan_block_ids_and_tags(raw: &[u8]) -> Result<BlockScan> {
 /// expression can require one (`-e ',highway'` keeps the empty alternative),
 /// so leaving them out would make the index under-claim. Groups of different
 /// element kinds are fine here - each group is scanned in full - so only a
-/// group mixing element fields, or a second `DenseNodes` in one group, makes
-/// the result `Ok(None)`.
+/// group mixing element fields makes the result `Ok(None)` (a second
+/// `DenseNodes` in one group is an `Err`).
 #[hotpath::measure]
 pub(crate) fn try_scan_block_tags(raw: &[u8]) -> Result<Option<TagIndex>> {
     Ok(Walk::run(raw, true)?.tags())
@@ -119,12 +127,8 @@ struct Walk<'a> {
     prev_id: Option<i64>,
     sorted: bool,
 
-    /// `None` until the first node with a usable coordinate.
+    /// `None` until the first node.
     extent: Option<RawExtent>,
-    /// Set when any node's coordinate could not be determined (delta
-    /// accumulation overflowed). The blob then gets no bbox at all - a box
-    /// over the other nodes would exclude this one.
-    extent_unknown: bool,
 
     /// One flag per string-table entry, set when the entry is used as a key.
     /// Sized once the string table is read; empty unless `collect_keys`. A
@@ -154,7 +158,6 @@ impl<'a> Walk<'a> {
             prev_id: None,
             sorted: true,
             extent: None,
-            extent_unknown: false,
             key_seen: Vec::new(),
             max_key_sid: None,
         };
@@ -223,15 +226,16 @@ impl<'a> Walk<'a> {
                 (1, WIRE_LEN) => {
                     let node = WireNode::parse(cur.read_len_delimited()?)?;
                     self.packed_keys(node.keys_data, node.vals_data)?;
-                    self.coordinate(Some((node.lat, node.lon)));
+                    self.coordinate(node.lat, node.lon);
                     self.element(ElemKind::Node, node.id);
                 }
                 (2, WIRE_LEN) => {
-                    // The decoder reads only the first DenseNodes of a group
-                    // (`WireGroup::dense`); protobuf would merge them. No index
-                    // can be right for both readings, so describe neither.
+                    // Protobuf would merge a repeated DenseNodes; the decoder
+                    // cannot represent that merge and refuses the group
+                    // (`WireGroup::dense`), so the index refuses it too rather
+                    // than describe a block no reader yields.
                     if seen & (1 << 2) != 0 {
-                        self.unsupported_group = true;
+                        return Err(new_wire_error(crate::read::wire::DUP_GROUP_DENSE));
                     }
                     let dense = WireDenseNodes::parse(cur.read_len_delimited()?)?;
                     self.dense(&dense)?;
@@ -284,13 +288,8 @@ impl<'a> Walk<'a> {
         self.count += 1;
     }
 
-    /// Fold one node's raw coordinate into the extent; `None` means the
-    /// coordinate is unknown.
-    fn coordinate(&mut self, raw: Option<(i64, i64)>) {
-        let Some((lat, lon)) = raw else {
-            self.extent_unknown = true;
-            return;
-        };
+    /// Fold one node's raw coordinate into the extent.
+    fn coordinate(&mut self, lat: i64, lon: i64) {
         self.extent = Some(match self.extent {
             None => RawExtent {
                 min_lat: lat,
@@ -309,11 +308,11 @@ impl<'a> Walk<'a> {
 
     /// Validate a Node/Way/Relation `keys` and `vals` pair, recording keys.
     ///
-    /// Both arrays are decoded with fallible reads. A key above `u32::MAX` is
-    /// an error rather than truncated: the decoder's `PackedUint32Iter`
-    /// truncates it to a different, possibly valid, sid, so no key set can
-    /// be trusted to match what decoding yields. The two counts are not
-    /// compared - see the module docs.
+    /// Both arrays are decoded with fallible reads. A key or value index above
+    /// `u32::MAX` is an error, as it is for the decoder, whose block
+    /// validation refuses it (`packed_uint32_count` in `read/block.rs`) because
+    /// `PackedUint32Iter` would narrow it to a different, possibly valid, sid.
+    /// The two counts are not compared - see the module docs.
     fn packed_keys(&mut self, keys: &[u8], vals: &[u8]) -> Result<()> {
         let mut cur = Cursor::new(keys);
         while !cur.is_empty() {
@@ -322,7 +321,7 @@ impl<'a> Walk<'a> {
         }
         let mut cur = Cursor::new(vals);
         while !cur.is_empty() {
-            cur.read_varint()?;
+            cur.read_varint_u32()?;
         }
         Ok(())
     }
@@ -390,7 +389,6 @@ impl<'a> Walk<'a> {
         let mut id: i64 = 0;
         let mut lat: i64 = 0;
         let mut lon: i64 = 0;
-        let mut coords_known = true;
         let mut nodes: u64 = 0;
         while !ids.is_empty() {
             let did = ids.read_sint64()?;
@@ -399,19 +397,11 @@ impl<'a> Walk<'a> {
             }
             let dlat = lats.read_sint64()?;
             let dlon = lons.read_sint64()?;
-            id = id
-                .checked_add(did)
-                .ok_or_else(|| new_wire_error("dense node id delta overflows i64"))?;
-            if coords_known {
-                match (lat.checked_add(dlat), lon.checked_add(dlon)) {
-                    (Some(a), Some(b)) => {
-                        lat = a;
-                        lon = b;
-                    }
-                    _ => coords_known = false,
-                }
-            }
-            self.coordinate(coords_known.then_some((lat, lon)));
+            // Modulo 2^64, matching the decoder; see the module docs.
+            id = id.wrapping_add(did);
+            lat = lat.wrapping_add(dlat);
+            lon = lon.wrapping_add(dlon);
+            self.coordinate(lat, lon);
             self.element(ElemKind::Node, id);
             nodes += 1;
         }
@@ -459,10 +449,10 @@ impl<'a> Walk<'a> {
         Ok(())
     }
 
-    /// The blob's bbox in decimicrodegrees, or `None` when it has none or any
-    /// node's coordinate is unknown.
+    /// The blob's bbox in decimicrodegrees, or `None` when it has none or the
+    /// extent cannot be scaled into decimicrodegrees.
     fn bbox(&self, kind: ElemKind) -> Option<BlobBbox> {
-        if kind != ElemKind::Node || self.extent_unknown {
+        if kind != ElemKind::Node {
             return None;
         }
         let e = self.extent?;
@@ -561,7 +551,8 @@ mod tests {
         let mut packed = Vec::new();
         let mut prev = 0i64;
         for &v in values {
-            encode_varint(zigzag(v - prev), &mut packed);
+            // Modular, as the writer encodes.
+            encode_varint(zigzag(v.wrapping_sub(prev)), &mut packed);
             prev = v;
         }
         packed
@@ -911,13 +902,33 @@ mod tests {
     }
 
     #[test]
-    fn a_second_dense_in_one_group_is_not_described() {
+    fn a_second_dense_in_one_group_is_refused_like_the_decoder() {
         let mut g = Vec::new();
         write_len_delimited(2, &dense_msg(&[1], &[(0, 0)], &[]), &mut g);
         write_len_delimited(2, &dense_msg(&[2], &[(0, 0)], &[]), &mut g);
         let block = block_with_strings(&[b""], &[&g]);
-        assert!(matches!(try_scan_block_ids_checked(&block), Ok(None)));
-        assert!(matches!(try_scan_block_tags(&block), Ok(None)));
+        assert!(try_scan_block_ids_checked(&block).is_err());
+        assert!(try_scan_block_tags(&block).is_err());
+        assert!(crate::PrimitiveBlock::from_vec(block).is_err());
+    }
+
+    /// Deltas sum modulo 2^64 like the decoder's: a dense block the writer
+    /// produces for IDs `i64::MIN` then `i64::MAX` (second delta -1) indexes
+    /// with exactly that range instead of being refused.
+    #[test]
+    fn wrapping_dense_id_deltas_index_the_decoded_range() {
+        let mut dense = Vec::new();
+        write_len_delimited(1, &packed_delta_sint64(&[i64::MIN, i64::MAX]), &mut dense);
+        write_len_delimited(8, &packed_delta_sint64(&[0, 0]), &mut dense);
+        write_len_delimited(9, &packed_delta_sint64(&[0, 0]), &mut dense);
+        let mut g = Vec::new();
+        write_len_delimited(2, &dense, &mut g);
+        let block = block_from_groups(&[&g]);
+        let index = scan_block_ids(&block).unwrap();
+        assert_eq!(
+            (index.min_id, index.max_id, index.count),
+            (i64::MIN, i64::MAX, 2)
+        );
     }
 
     /// An unsupported shape must not end the walk: what follows it still has
@@ -1058,15 +1069,17 @@ mod tests {
 
     // --- bbox -----------------------------------------------------------
 
-    /// A node blob whose second group's coordinates cannot be determined must
-    /// not carry the first group's box alone: a query near the second group
-    /// would skip the blob.
+    /// A node blob whose second group's coordinates cannot be scaled into
+    /// decimicrodegrees must not carry the first group's box alone: a query
+    /// near the second group would skip the blob.
     #[test]
-    fn an_unknown_coordinate_drops_the_whole_bbox() {
+    fn an_unscalable_coordinate_drops_the_whole_bbox() {
         let a = dense_group_body(&[1]);
         let mut dense = Vec::new();
         write_len_delimited(1, &packed_delta_sint64(&[2, 3]), &mut dense);
-        // lat deltas: i64::MAX then 1 - the second accumulation overflows.
+        // lat deltas: i64::MAX then 1 - the second sum wraps to i64::MIN, as
+        // it does in the decoder, and neither extreme survives granularity
+        // scaling.
         let mut lats = Vec::new();
         encode_varint(zigzag(i64::MAX), &mut lats);
         encode_varint(zigzag(1), &mut lats);

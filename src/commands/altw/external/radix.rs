@@ -19,7 +19,11 @@ use super::Result;
 /// Number of buckets for radix partitioning. 256 = partition by high byte.
 pub(crate) const NUM_BUCKETS: usize = 256;
 
-/// Size of the write buffer per bucket file (256 KB).
+/// Size of the write buffer per ALTW bucket file (256 KB).
+///
+/// This is an ALTW-specific batching tunable, separate from
+/// `crate::write::IO_BUF_BYTES`. Bucket files have many independent buffered
+/// writers, so this capacity also determines ALTW's aggregate buffering.
 pub(crate) const BUCKET_BUF_SIZE: usize = 256 * 1024;
 
 // ---------------------------------------------------------------------------

@@ -918,8 +918,18 @@ mod tests {
         let unknown = [0x77u8, 0x88];
         let mut header = Vec::new();
         encode_bytes_field(&mut header, 1, &bbox); // field 1: bbox (submessage)
-        encode_bytes_field(&mut header, 4, b"OsmSchema-V0.6"); // field 4: required
-        encode_bytes_field(&mut header, 5, b"Sort.Type_then_ID"); // field 5: optional
+        // field 4: required
+        encode_bytes_field(
+            &mut header,
+            4,
+            crate::HeaderBlock::OSM_SCHEMA_V06.as_bytes(),
+        );
+        // field 5: optional
+        encode_bytes_field(
+            &mut header,
+            5,
+            crate::HeaderBlock::SORT_TYPE_THEN_ID.as_bytes(),
+        );
         encode_bytes_field(&mut header, 5, custom_feature); // field 5: custom optional
         encode_bytes_field(&mut header, 16, b"my-writer/2.0"); // field 16: writingprogram
         encode_bytes_field(&mut header, 17, source); // field 17: source
@@ -936,8 +946,16 @@ mod tests {
 
         // Strip the bbox (field 1) only: everything else survives byte-for-byte.
         let mut expect = Vec::new();
-        encode_bytes_field(&mut expect, 4, b"OsmSchema-V0.6");
-        encode_bytes_field(&mut expect, 5, b"Sort.Type_then_ID");
+        encode_bytes_field(
+            &mut expect,
+            4,
+            crate::HeaderBlock::OSM_SCHEMA_V06.as_bytes(),
+        );
+        encode_bytes_field(
+            &mut expect,
+            5,
+            crate::HeaderBlock::SORT_TYPE_THEN_ID.as_bytes(),
+        );
         encode_bytes_field(&mut expect, 5, custom_feature);
         encode_bytes_field(&mut expect, 16, b"my-writer/2.0");
         encode_bytes_field(&mut expect, 17, source);

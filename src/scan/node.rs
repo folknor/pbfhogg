@@ -35,11 +35,12 @@ pub(crate) struct NodeTuple {
     pub lon: i32,
 }
 
-/// Error for a delta accumulator that ran past `i64`.
+/// Error for coordinate scaling (`offset + granularity * raw`) that ran past
+/// `i64`.
 fn overflow_err() -> crate::error::Error {
     crate::error::new_wire_error(
-        "DenseNodes delta accumulator overflowed i64; the blob's id or \
-         coordinate deltas are corrupt",
+        "DenseNodes coordinate arithmetic overflowed i64; the blob's \
+         granularity, offset, or coordinate deltas are corrupt",
     )
 }
 
@@ -153,8 +154,15 @@ pub(crate) fn extract_node_tuples(
                     ));
                 }
                 (2, WIRE_LEN) => {
+                    // A repeated DenseNodes would merge in protobuf; the
+                    // decoder refuses it (`WireGroup::dense`), and reading
+                    // only the first would silently drop the rest.
+                    if dense_data.is_some() {
+                        return Err(crate::error::new_wire_error(
+                            crate::read::wire::DUP_GROUP_DENSE,
+                        ));
+                    }
                     dense_data = Some(gcursor.read_len_delimited()?);
-                    break;
                 }
                 _ => {
                     gcursor.skip_field(wire_type)?;
@@ -172,10 +180,17 @@ pub(crate) fn extract_node_tuples(
         let mut cum_lat: i64 = 0;
         let mut cum_lon: i64 = 0;
 
+        // Deltas sum modulo 2^64, as the decoder and the writer do, so a
+        // block whose IDs wrap (the writer encodes `i64::MIN` then
+        // `i64::MAX` as deltas `MIN`, `-1`) scans to the IDs every reader
+        // yields. A wrapped coordinate cannot slip through: a sum that wraps
+        // lands at least 2^63 away from the previous, accepted coordinate,
+        // far outside the window `decimicro` accepts for any granularity and
+        // offset, so it is refused exactly where a checked sum was.
         while let (Some(did), Some(dlat), Some(dlon)) = (ids.next(), lats.next(), lons.next()) {
-            cum_id = cum_id.checked_add(did).ok_or_else(overflow_err)?;
-            cum_lat = cum_lat.checked_add(dlat).ok_or_else(overflow_err)?;
-            cum_lon = cum_lon.checked_add(dlon).ok_or_else(overflow_err)?;
+            cum_id = cum_id.wrapping_add(did);
+            cum_lat = cum_lat.wrapping_add(dlat);
+            cum_lon = cum_lon.wrapping_add(dlon);
             out.push(NodeTuple {
                 id: cum_id,
                 lat: decimicro(lat_offset, granularity, cum_lat)?,
@@ -312,21 +327,19 @@ mod tests {
         assert_eq!((tuples[0].lat, tuples[0].lon), (550_000_000, 120_000_000));
     }
 
-    /// The delta accumulators are untrusted sums. Two deltas near `i64::MAX`
-    /// overflow, which used to panic in debug and silently wrap in release -
-    /// a wrapped node id then resolves against the index, or does not,
-    /// arbitrarily.
+    /// The delta accumulators sum modulo 2^64, like the decoder's and the
+    /// writer's: IDs that wrap scan to the same values every reader yields,
+    /// while a coordinate far enough out to wrap is still refused, by the
+    /// checked scaling.
     #[test]
-    fn overflowing_deltas_are_refused() {
-        let err = scan(&dense_block(&[i64::MAX, i64::MAX], &[0, 0], &[0, 0], &[]))
-            .expect_err("an overflowing id accumulator must be refused");
-        assert!(
-            err.to_string().contains("overflowed i64"),
-            "expected the accumulator-overflow guard. Got: {err}"
-        );
+    fn id_deltas_wrap_and_wild_coordinates_are_refused() {
+        // Deltas MIN then -1: the writer's encoding of IDs MIN then MAX.
+        let tuples = scan(&dense_block(&[i64::MIN, -1], &[0, 0], &[0, 0], &[])).unwrap();
+        let ids: Vec<i64> = tuples.iter().map(|t| t.id).collect();
+        assert_eq!(ids, [i64::MIN, i64::MAX]);
 
         let err = scan(&dense_block(&[1, 2], &[i64::MAX, i64::MAX], &[0, 0], &[]))
-            .expect_err("an overflowing coordinate accumulator must be refused");
+            .expect_err("a coordinate outside the scalable range must be refused");
         assert!(
             err.to_string().contains("overflow"),
             "expected an overflow guard. Got: {err}"

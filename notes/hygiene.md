@@ -163,21 +163,17 @@ rejecting `const` items declared inside `fn` bodies under `src/commands/`.
 
 Reported by: all nine scopes.
 
-## HYG-005 - Header feature-name strings are spelled as literals beside their constants
+## HYG-005 - Nothing stops a header feature name being spelled as a literal again
 
 Anger: 0 - constants, output bytes unchanged.
 
-`HeaderBlock::LOCATIONS_ON_WAYS` exists in `read/block.rs`, yet
-`"LocationsOnWays"` is spelled in `altw/external/stage4.rs`, `altw/mod.rs`,
-`altw/passthrough.rs`, `apply_changes/rewrite.rs`, `degrade/mod.rs`,
-`repack/mod.rs`, `export/mod.rs`, `error.rs` and `cli/src/main.rs`.
-`HeaderBuilder::build` spells `"OsmSchema-V0.6"` and `"DenseNodes"` as byte
-literals while using constants for `SORT_TYPE_THEN_ID` and
-`HISTORICAL_INFORMATION`; `inspect/report.rs` repeats both required-feature
-literals to filter them out. A typo produces a header advertising nothing.
-Fix: `HeaderBuilder::optional_feature` takes a `Feature` enum or a newtype with
-associated consts; add `OSM_SCHEMA_V06` and `DENSE_NODES`; text rule on the
-quoted literals outside `read/block.rs`.
+Every header feature name in `src/` and `cli/` now goes through the
+`Feature` newtype and `HeaderBlock` constants in `read/block.rs`. The text
+rule on quoted feature literals outside `read/block.rs` was not added: the
+existing textlint rules use `region = "code"`, which excludes string
+literals, so whether brokkr can match strings needs checking first, and
+`"DenseNodes"` legitimately appears as a field name in renumber's error
+strings and integration-test fixtures, which need an exclusion.
 
 Reported by: write path.
 
@@ -1173,20 +1169,6 @@ deltas).
 Reported by: write path, read path, CLI and plumbing, filtering and spatial,
 re-encoding, altw and scanning.
 
-## HYG-048 - Writer `Drop` discards errors and nothing enforces `flush`
-
-Anger: 0 - debug-only assertion.
-
-`PbfWriter::Drop`, `ParallelGzipWriter::Drop` and `DirectWriter::Drop` are
-best-effort and say callers MUST call `flush` / `finish`. There is no
-`#[must_use]` and no debug check that a pipelined writer reached `flush` on a
-non-panicking path; a `--bench` run that hits `Drop` on an error path loses the
-writer error by design with no record. Fix:
-`debug_assert!(std::thread::panicking() || self.finished)` in `Drop`, which
-turns every forgotten `flush` in tests into a failure.
-
-Reported by: write path.
-
 ## HYG-049 - Durability and buffering differ between the sync and pipelined writers
 
 Anger: 8 - sync writer fsync cost.
@@ -1273,7 +1255,10 @@ passthrough item before any worker result arrives, so ordering correctness
 rests on the buffer accepting an arbitrary number of out-of-window items; if
 the explicit-ceiling variant were used, inputs with more than 32 passthrough
 blobs would break. Fix: a credit scheme (a worker may not claim seq > head + K)
-in the shared engine of HYG-011.
+in the shared engine of HYG-011. A working precedent now exists:
+`scan::classify::parallel_classify_phase_ordered` (used by the geocode
+builder's Pass 2) hands out schedule positions only within a fixed window
+ahead of the merged head.
 
 Reported by: re-encoding, read path, filtering and spatial, altw and scanning.
 
@@ -1980,19 +1965,6 @@ was deliberately left alone. What remains is a CLI output change:
 Reported by: all nine scopes (split out of the library stderr item when the
 library stopped writing stderr).
 
-## HYG-003 - Altw keeps its own copies of the I/O buffer size
-
-Anger: 8 - altw buffer sizes.
-
-`write::IO_BUF_BYTES` now owns the 256 KiB read and write buffer size, with a
-source-scan test under `src/write/`. Altw still spells its own:
-`altw/external/radix.rs::BUCKET_BUF_SIZE`, the private shadowing
-`BUCKET_BUF_SIZE` and `FLUSH_THRESHOLD` in `stage2.rs`, and stage 1's
-`64 * 1024` / `256 * 1024` sidecar literals. Decide which are the same
-quantity as `IO_BUF_BYTES` and which are separate altw tunables.
-
-Reported by: write path, read path, altw and scanning.
-
 ## HYG-008 - Two coordinate conversions remain outside the shared pair, and one changed arithmetic is unproven
 
 Anger: 8 - OSC coordinate parse.
@@ -2151,14 +2123,3 @@ bbox at different precision.
 
 Reported by: the wave-1a geo fixer.
 
-## HYG-113 - The altw router's WAIT marker comment claims the spans feed `--stalls`
-
-Anger: 2 - comment correction.
-
-The comment on the `WAIT_*` marker pairs in
-`altw/external/coord_payloads.rs` says they feed `brokkr sidecar --stalls`.
-They do not: `--stalls` reads `*_wait_ns` counters, and marker pairs surface
-only in `--durations`. Reword the comment, or add a `*_wait_ns` counter if
-the router's blocking is meant to show in `--stalls`.
-
-Reported by: the wave-1 altw fixer.

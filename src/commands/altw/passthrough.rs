@@ -128,10 +128,11 @@ fn build_schedule(
                     .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
                 let header = crate::blob::decode_blob_to_headerblock(&data_buf)?;
                 let bytes = build_output_header(&header, true, overrides, |hb| {
-                    let mut hb = hb.optional_feature("LocationsOnWays");
+                    use crate::read::block::Feature;
+                    let mut hb = hb.optional_feature(Feature::LOCATIONS_ON_WAYS);
                     if inject_prepass {
-                        hb = hb.optional_feature(crate::HeaderBlock::WAY_MEMBERS_V1);
-                        hb = hb.optional_feature(crate::HeaderBlock::SHARED_NODE_PINS_V1);
+                        hb = hb.optional_feature(Feature::WAY_MEMBERS_V1);
+                        hb = hb.optional_feature(Feature::SHARED_NODE_PINS_V1);
                     }
                     hb
                 })?;
@@ -413,8 +414,9 @@ pub(super) fn write_output_passthrough(
     // Worker-side cumulative counters + the depth-gated WAIT span for
     // workers blocked handing results to the consumer (same StallGauge
     // rationale as external stage 4: N concurrent blockers collapse to
-    // one non-overlapping span per busy period so `--stalls` can pair
-    // the markers; entered only after a failed try_send).
+    // one non-overlapping span per busy period so `brokkr sidecar
+    // --durations` can pair the markers; `--stalls` reads `*_wait_ns`
+    // counters, not these spans; entered only after a failed try_send).
     let p2_counters = Pass2Counters::default();
     let p2_send_stall = super::external::StallGauge::new("WAIT_P2_SEND_START", "WAIT_P2_SEND_END");
     let p2_counters_ref = &p2_counters;

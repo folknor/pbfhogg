@@ -329,7 +329,7 @@ fn splice_way_locations(
                     have_refs = true;
                     let mut cum: i64 = 0;
                     for delta in PackedSint64Iter::new(refs_data) {
-                        cum += delta;
+                        cum = cum.wrapping_add(delta);
                         scratch.refs.push(cum);
                     }
                     encode_tag(&mut scratch.reframed_way, 8, WIRE_LEN);

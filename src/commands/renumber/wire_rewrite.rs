@@ -138,6 +138,13 @@ pub(super) fn order_error(kind: &str, prev: i64, id: i64) -> String {
     )
 }
 
+// The decoder reconstructs deltas modulo 2^64 (the writer encodes them that
+// way), while renumber's accumulators below stay checked. The two accept the
+// same inputs here: every accumulated id is refused when negative before the
+// next delta is added, so the running sum is non-negative, and a non-negative
+// sum that overflows on addition wraps to a negative id the modular form
+// would refuse anyway. Checked addition only gives that refusal a clearer
+// message.
 fn delta_overflow_error(field: &str) -> String {
     format!(
         "renumber: {field} delta sum overflows a 64-bit id; the input's delta \

@@ -40,6 +40,7 @@ use crate::commands::{
 };
 
 use super::Result;
+use super::inject_metrics::InjectMetrics;
 use super::reframe::{WayReframeScratch, reframe_way_blob_with_locations};
 use super::{NodeIndex, Stats, process_block};
 
@@ -218,6 +219,7 @@ fn decode_one(
     relation_member_way_ids: Option<&IdSet>,
     shared_node_ids: Option<&IdSet>,
     inject_prepass: bool,
+    inject_metrics: &InjectMetrics,
     scratch: &mut WorkerScratch,
     counters: &Pass2Counters,
 ) -> std::result::Result<(Vec<OwnedBlock>, Stats), String> {
@@ -268,7 +270,7 @@ fn decode_one(
                     stats.way_count,
                     &scratch.way_scratch.member_ways,
                 );
-                crate::commands::altw::inject_metrics::record_field5_bytes(payload.len());
+                inject_metrics.record_blob(scratch.way_scratch.pin_tally, payload.len());
                 payload
             }),
         });
@@ -357,6 +359,7 @@ pub(super) fn write_output_passthrough(
     relation_member_way_ids: Option<&IdSet>,
     shared_node_ids: Option<&IdSet>,
     inject_prepass: bool,
+    inject_metrics: &InjectMetrics,
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
@@ -468,6 +471,7 @@ pub(super) fn write_output_passthrough(
                         relation_member_way_ids,
                         shared_node_ids,
                         inject_prepass,
+                        inject_metrics,
                         &mut scratch,
                         p2_counters_ref,
                     );

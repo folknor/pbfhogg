@@ -1286,9 +1286,8 @@ dispatch (per-flush emission double-counted), so a library consumer or a test
 running two commands gets cumulative totals; the writer tests
 `end_of_stream_finalization_still_fsyncs` and
 `flush_pushes_bytes_onward_without_fsyncing` assert on deltas of a global that
-concurrent tests also bump, with bounds "loose enough to tolerate" it. Altw's
-`inject_metrics` statics accumulate across calls ("matches brokkr's
-one-process-per-run model"). `Instant::now()` is called directly at about 25
+concurrent tests also bump, with bounds "loose enough to tolerate" it.
+`Instant::now()` is called directly at about 25
 write-path and 60 altw sites for these, which is part of why none can be
 asserted deterministically. Fix: a metrics value owned by each run or writer
 (`Arc` handed to stages), emitted with a pass label or returned in stats.
@@ -2292,8 +2291,8 @@ Reported by: CLI and plumbing, test harness.
   requiring its absence must remove it explicitly.
 - ltrace cannot observe pbfhogg's calls: BIND_NOW/full RELRO leaves no PLT
   breakpoints. Use strace for syscall-backed calls and LD_PRELOAD for mallopt.
-- altw `inject_metrics`, `WRITER_METRICS` and `PIPELINE_METRICS` mix counters
-  across concurrent runs. `process_scratch_tag` is also process-global;
+- `WRITER_METRICS` and `PIPELINE_METRICS` mix counters across concurrent
+  runs. `process_scratch_tag` is also process-global;
   the per-run scratch tokens make sharing that tag harmless.
 - `diff/parallel.rs` puts scratch beside the old input unless
   `Host::scratch_parent` says otherwise. Derive's gzip workers ignore `-j`.

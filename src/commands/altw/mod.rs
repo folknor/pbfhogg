@@ -362,6 +362,7 @@ pub fn add_locations_to_ways(
         ids
     };
     crate::debug::emit_marker("ALTW_PASS2_START");
+    let inject_metrics = inject_metrics::InjectMetrics::default();
     let stats = write_output_checked(
         input,
         dest.path(),
@@ -371,6 +372,7 @@ pub fn add_locations_to_ways(
         relation_scan.1.as_ref(),
         shared.as_ref(),
         options.inject_prepass,
+        &inject_metrics,
         options.compression,
         options.direct_io,
         indexdata_present,
@@ -384,7 +386,7 @@ pub fn add_locations_to_ways(
             .1
             .as_ref()
             .map_or(0, |set| set.iter().count() as u64);
-        inject_metrics::emit(member_ways);
+        inject_metrics.emit(member_ways);
     }
     enforce_missing_locations_policy(&stats, options.ignore_missing_nodes)?;
     dest.commit()?;
@@ -651,47 +653,144 @@ fn page_cache_budget_bytes(host: &crate::host::Host) -> Option<u64> {
         .map(|b| b.saturating_sub(AUTO_ANON_HEADROOM_BYTES))
 }
 
-/// Process-global instrumentation for the injected-prepass producer.
+/// Per-run instrumentation for the injected-prepass producer.
 ///
 /// The values feed brokkr sidecar counters only (a no-op without the FIFO),
 /// so they are diagnostic and never surface in `Stats` or the CLI summary.
-/// Both the sparse and external backends fold into these accumulators during
-/// the parallel reframe and each emits once at the end of its run; the
-/// counters start at zero per process, which matches brokkr's one-process-per
-/// -run benchmark model.
+///
+/// Each run owns one [`InjectMetrics`], so two runs in one process - one
+/// after another or concurrently - never fold into each other's totals. The
+/// counting is two-level to keep it off the per-way hot path: each reframe
+/// worker tallies its current blob into a plain [`PinTally`] held in its
+/// reusable scratch, and publishes that tally into the run's atomics once
+/// per blob. This is the same blob-local pattern external stage 4 uses for
+/// its `WayReframeCounters`; the previous process-global statics took two
+/// contended atomic adds per pinned way (~535 M ways at planet).
 pub(super) mod inject_metrics {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-    static PINNED_REFS: AtomicU64 = AtomicU64::new(0);
-    static FIELD20_WAYS: AtomicU64 = AtomicU64::new(0);
-    static FIELD5_BYTES: AtomicU64 = AtomicU64::new(0);
+    /// One blob's field-20 tally, accumulated by a single worker without
+    /// atomics. Reset at the start of every way-blob reframe, so a blob
+    /// that fails part-way never leaks its partial count into the next.
+    #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct PinTally {
+        pinned_refs: u64,
+        field20_ways: u64,
+    }
 
-    /// Fold one way's field-20 pin bitmap: total set bits into `pinned_refs`,
-    /// and one into `field20_ways` when the way emits a (non-empty) bitmap.
-    pub(super) fn record_pins(pins: &[u8]) {
-        let popcount: u32 = pins.iter().map(|b| b.count_ones()).sum();
-        if popcount > 0 {
-            PINNED_REFS.fetch_add(u64::from(popcount), Relaxed);
-            FIELD20_WAYS.fetch_add(1, Relaxed);
+    impl PinTally {
+        /// Fold one way's field-20 pin bitmap: total set bits into
+        /// `pinned_refs`, and one into `field20_ways` when any bit is set.
+        /// A full-width all-zero bitmap is not emitted and counts nothing.
+        #[inline]
+        pub(super) fn record_way(&mut self, pins: &[u8]) {
+            let popcount: u32 = pins.iter().map(|b| b.count_ones()).sum();
+            if popcount > 0 {
+                self.pinned_refs += u64::from(popcount);
+                self.field20_ways += 1;
+            }
         }
     }
 
-    /// Fold one way blob's field-5 payload length.
-    pub(super) fn record_field5_bytes(len: usize) {
-        FIELD5_BYTES.fetch_add(len as u64, Relaxed);
+    /// One run's injected-prepass totals, shared by reference across that
+    /// run's reframe workers.
+    #[derive(Default, Debug)]
+    pub(super) struct InjectMetrics {
+        pinned_refs: AtomicU64,
+        field20_ways: AtomicU64,
+        field5_bytes: AtomicU64,
     }
 
-    /// Emit the four injected-prepass counters. `member_ways` is the size of
-    /// the relation member-way IdSet, computed by the caller.
-    #[allow(clippy::cast_possible_wrap)]
-    pub(super) fn emit(member_ways: u64) {
-        crate::debug::emit_counter("altw_member_ways", member_ways as i64);
-        crate::debug::emit_counter("altw_pinned_refs", PINNED_REFS.load(Relaxed) as i64);
-        crate::debug::emit_counter(
-            "altw_field20_ways_emitted",
-            FIELD20_WAYS.load(Relaxed) as i64,
-        );
-        crate::debug::emit_counter("altw_field5_bytes", FIELD5_BYTES.load(Relaxed) as i64);
+    impl InjectMetrics {
+        /// Publish one successfully reframed way blob: its pin tally and
+        /// the length of its field-5 payload. A blob with no pinned refs
+        /// touches only the field-5 total.
+        pub(super) fn record_blob(&self, pins: PinTally, field5_bytes: usize) {
+            if pins.pinned_refs > 0 {
+                self.pinned_refs.fetch_add(pins.pinned_refs, Relaxed);
+                self.field20_ways.fetch_add(pins.field20_ways, Relaxed);
+            }
+            self.field5_bytes.fetch_add(field5_bytes as u64, Relaxed);
+        }
+
+        /// Emit the four injected-prepass counters. `member_ways` is the
+        /// size of the relation member-way IdSet, computed by the caller.
+        #[allow(clippy::cast_possible_wrap)]
+        pub(super) fn emit(&self, member_ways: u64) {
+            crate::debug::emit_counter("altw_member_ways", member_ways as i64);
+            crate::debug::emit_counter("altw_pinned_refs", self.pinned_refs.load(Relaxed) as i64);
+            crate::debug::emit_counter(
+                "altw_field20_ways_emitted",
+                self.field20_ways.load(Relaxed) as i64,
+            );
+            crate::debug::emit_counter("altw_field5_bytes", self.field5_bytes.load(Relaxed) as i64);
+        }
+
+        #[cfg(test)]
+        fn totals(&self) -> (u64, u64, u64) {
+            (
+                self.pinned_refs.load(Relaxed),
+                self.field20_ways.load(Relaxed),
+                self.field5_bytes.load(Relaxed),
+            )
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{InjectMetrics, PinTally};
+
+        #[test]
+        fn tally_counts_set_bits_and_only_ways_with_a_pin() {
+            let mut tally = PinTally::default();
+            tally.record_way(&[0b1010_0001, 0b0000_0001]);
+            tally.record_way(&[0, 0, 0]);
+            tally.record_way(&[]);
+            tally.record_way(&[0b1000_0000]);
+            assert_eq!(
+                tally,
+                PinTally {
+                    pinned_refs: 5,
+                    field20_ways: 2,
+                }
+            );
+        }
+
+        #[test]
+        fn runs_do_not_share_totals() {
+            let mut tally = PinTally::default();
+            tally.record_way(&[0b11]);
+
+            let first = InjectMetrics::default();
+            first.record_blob(tally, 7);
+            first.record_blob(tally, 3);
+
+            let second = InjectMetrics::default();
+            second.record_blob(PinTally::default(), 4);
+
+            assert_eq!(first.totals(), (4, 2, 10));
+            assert_eq!(second.totals(), (0, 0, 4));
+        }
+
+        #[test]
+        fn concurrent_publishers_into_one_run_sum_exactly() {
+            let mut tally = PinTally::default();
+            tally.record_way(&[0b1]);
+            let run = InjectMetrics::default();
+            let other = InjectMetrics::default();
+            std::thread::scope(|s| {
+                for _ in 0..4 {
+                    s.spawn(|| {
+                        for _ in 0..1000 {
+                            run.record_blob(tally, 2);
+                            other.record_blob(tally, 1);
+                        }
+                    });
+                }
+            });
+            assert_eq!(run.totals(), (4000, 4000, 8000));
+            assert_eq!(other.totals(), (4000, 4000, 4000));
+        }
     }
 }
 
@@ -927,6 +1026,7 @@ fn write_output_checked(
     relation_member_way_ids: Option<&IdSet>,
     shared_node_ids: Option<&IdSet>,
     inject_prepass: bool,
+    inject_metrics: &inject_metrics::InjectMetrics,
     compression: Compression,
     direct_io: bool,
     indexdata_present: bool,
@@ -946,6 +1046,7 @@ fn write_output_checked(
             relation_member_way_ids,
             shared_node_ids,
             inject_prepass,
+            inject_metrics,
             compression,
             direct_io,
             overrides,

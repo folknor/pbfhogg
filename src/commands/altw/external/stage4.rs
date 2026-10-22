@@ -12,6 +12,7 @@ use crate::writer::Compression;
 use crate::{Element, PrimitiveBlock};
 
 use super::super::Stats;
+use super::super::inject_metrics::{InjectMetrics, PinTally};
 use super::super::{
     HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
     flush_local, writer_from_header,
@@ -113,6 +114,7 @@ pub(super) fn stage4_assembly(
     relation_member_node_ids: Option<&IdSet>,
     member_way_ids: Option<&IdSet>,
     inject_prepass: bool,
+    inject_metrics: &InjectMetrics,
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
@@ -488,9 +490,8 @@ pub(super) fn stage4_assembly(
                                             way_count,
                                             &way_reframe_scratch.member_ways,
                                         );
-                                    crate::commands::altw::inject_metrics::record_field5_bytes(
-                                        payload.len(),
-                                    );
+                                    inject_metrics
+                                        .record_blob(way_reframe_scratch.pin_tally, payload.len());
                                     payload
                                 }),
                             });
@@ -1128,6 +1129,9 @@ struct WayReframeScratch {
     pins: Vec<u8>,
     member_ways: Vec<bool>,
     group_out: Vec<u8>,
+    /// This blob's field-20 tally under `--inject-prepass`; reset at the
+    /// start of every reframe, read by the worker once it succeeds.
+    pin_tally: PinTally,
 }
 
 impl WayReframeScratch {
@@ -1141,6 +1145,7 @@ impl WayReframeScratch {
             pins: Vec::new(),
             member_ways: Vec::new(),
             group_out: Vec::new(),
+            pin_tally: PinTally::default(),
         }
     }
 }
@@ -1185,6 +1190,9 @@ fn reframe_way_blob_with_locations(
     scratch.group_ranges.clear();
     scratch.scalar_fields.clear();
     scratch.member_ways.clear();
+    if inject_prepass {
+        scratch.pin_tally = PinTally::default();
+    }
     let mut stringtable_range: Option<(usize, usize)> = None;
 
     // Level 1: PrimitiveBlock - find string table + groups.
@@ -1376,7 +1384,7 @@ fn reframe_way_blob_with_locations(
                         .pins
                         .extend_from_slice(&coord_payload[payload_pos..payload_pos + pin_bytes]);
                     payload_pos += pin_bytes;
-                    crate::commands::altw::inject_metrics::record_pins(&scratch.pins);
+                    scratch.pin_tally.record_way(&scratch.pins);
                 }
                 way_slot_pos += ref_count;
                 blob_refs_present += ref_count;

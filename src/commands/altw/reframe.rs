@@ -33,6 +33,9 @@ pub(super) struct WayReframeScratch {
     pub refs: Vec<i64>,
     pub member_ways: Vec<bool>,
     pub pins: Vec<u8>,
+    /// This blob's field-20 tally under `--inject-prepass`; reset at the
+    /// start of every reframe, read by the worker once it succeeds.
+    pub pin_tally: super::inject_metrics::PinTally,
 }
 
 /// Per-blob counters that the caller folds into `Stats` after the reframe.
@@ -62,6 +65,9 @@ pub(super) fn reframe_way_blob_with_locations(
     member_way_ids: Option<&crate::idset::IdSet>,
     inject_prepass: bool,
 ) -> std::result::Result<WayReframeStats, String> {
+    if inject_prepass {
+        scratch.pin_tally = super::inject_metrics::PinTally::default();
+    }
     let (st_offset, st_len) = parse_block_top(decompressed, scratch)?;
     let stringtable_bytes = &decompressed[st_offset..st_offset + st_len];
 
@@ -400,7 +406,7 @@ fn splice_way_locations(
     }
 
     if inject_prepass {
-        super::inject_metrics::record_pins(&scratch.pins);
+        scratch.pin_tally.record_way(&scratch.pins);
     }
     if !scratch.refs.is_empty() {
         encode_bytes_field(&mut scratch.reframed_way, 9, &scratch.packed_lats);

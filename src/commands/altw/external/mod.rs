@@ -1036,6 +1036,8 @@ pub(crate) fn external_join_in(
         .as_ref()
         .and_then(|scan| scan.member_way_ids.as_ref());
     let slot_bucket_ref_ref = &slot_bucket_ref;
+    let inject_metrics = super::inject_metrics::InjectMetrics::default();
+    let inject_metrics_ref = &inject_metrics;
 
     // Closures return Result<_, String> because BoxResult's error type
     // (Box<dyn Error>) is not Send and thread::scope requires Send
@@ -1077,6 +1079,7 @@ pub(crate) fn external_join_in(
                 rel_ids_ref,
                 member_way_ids_ref,
                 inject_prepass,
+                inject_metrics_ref,
                 compression,
                 direct_io,
                 overrides,
@@ -1163,7 +1166,7 @@ pub(crate) fn external_join_in(
 
     if inject_prepass {
         let member_ways = member_way_ids_ref.map_or(0, |set| set.iter().count() as u64);
-        super::inject_metrics::emit(member_ways);
+        inject_metrics.emit(member_ways);
     }
 
     drop(scratch_dir);

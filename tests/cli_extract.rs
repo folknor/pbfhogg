@@ -1410,3 +1410,176 @@ fn simple_multi_blob_bbox_partitioning() {
     let want: Vec<i64> = (1..=10).collect();
     assert_eq!(got, want, "wrong node set survived the per-blob classify");
 }
+
+// ---------------------------------------------------------------------------
+// Raw passthrough must not trust indexdata (BUG-005)
+// ---------------------------------------------------------------------------
+
+/// `nodes` inside `BBOX_STR`, ids starting at `start`.
+fn inside_nodes(count: i32, start: i64) -> Vec<TestNode> {
+    (0..count)
+        .map(|i| TestNode {
+            id: start + i64::from(i),
+            lat: 556_500_000 + i * 50_000,
+            lon: 125_000_000,
+            tags: vec![],
+            meta: None,
+        })
+        .collect()
+}
+
+/// The `BlobHeader.indexdata` bytes of frame `frame` (0 is the OSMHeader).
+fn indexdata_of(pbf: &[u8], frame: usize) -> Vec<u8> {
+    let mut captured = Vec::new();
+    let _ = crate::common::adversarial::mutate_blob_header_indexdata(pbf, frame, |ix| {
+        captured.clone_from(ix);
+    });
+    captured
+}
+
+fn single_region_config(dir: &Path) -> std::path::PathBuf {
+    let config = dir.join("config.json");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"directory":"{}","extracts":[{{"output":"m.osm.pbf","bbox":[12.4,55.6,12.7,55.8]}}]}}"#,
+            dir.display()
+        ),
+    )
+    .expect("write config");
+    config
+}
+
+/// A raw-passthrough blob used to add its indexdata `count` to "N in bbox":
+/// an unverified claim reported as an observation. `--corrupt-indexdata`
+/// inflates every count by 1 000 000 while leaving the bbox honest, so both
+/// node blobs still pass through - the output carries their headers
+/// verbatim - and the summary must still say 20.
+#[test]
+fn passthrough_counts_observed_nodes_not_the_indexdata_count() {
+    let dir = TempDir::new().expect("tempdir");
+    let honest = dir.path().join("honest.osm.pbf");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_multi_block_test_pbf(&honest, &inside_nodes(20, 1), &[], &[], 10);
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&honest)
+        .arg("-o")
+        .arg(&input)
+        .arg("--corrupt-indexdata")
+        .assert_success();
+
+    let out = run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
+    assert_eq!(
+        node_ids(&read_all_elements(&output)),
+        (1..=20).collect::<Vec<_>>()
+    );
+    assert!(
+        out.stderr_str()
+            .contains("Extract (simple): 20 nodes (20 in bbox, 0 from ways)"),
+        "the summary must count decoded nodes, not the inflated claim; stderr:\n{}",
+        out.stderr_str()
+    );
+    // The blobs really were copied raw, so this exercised the passthrough
+    // count rather than the decode path.
+    let input_bytes = std::fs::read(&input).expect("read input");
+    let output_bytes = std::fs::read(&output).expect("read output");
+    for frame in [1, 2] {
+        assert_eq!(
+            indexdata_of(&output_bytes, frame),
+            indexdata_of(&input_bytes, frame),
+            "node blob {frame} should have been passed through verbatim"
+        );
+    }
+
+    let config = single_region_config(dir.path());
+    let out = run_extract_multi(&input, &config, Strategy::Simple);
+    assert_eq!(
+        node_ids(&read_all_elements(&dir.path().join("m.osm.pbf"))),
+        (1..=20).collect::<Vec<_>>()
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("node blobs: 2 passthrough, 0 decoded"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Extract (simple): 20 nodes (20 in bbox, 0 from ways)"),
+        "multi-extract must count decoded nodes too; stderr:\n{stderr}"
+    );
+}
+
+/// A blob whose indexdata bbox claims containment while its nodes are
+/// outside used to be copied raw on the claim alone, putting out-of-region
+/// nodes in the extract. The classify phase now verifies every candidate
+/// against its decoded payload and filters the ones that fail.
+#[test]
+fn a_lying_indexdata_bbox_does_not_smuggle_nodes_through() {
+    let dir = TempDir::new().expect("tempdir");
+    let honest = dir.path().join("honest.osm.pbf");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let mut nodes = inside_nodes(10, 1);
+    nodes.extend((0_i64..10).map(|i| TestNode {
+        id: 100 + i,
+        lat: 400_000_000,
+        lon: 500_000_000,
+        tags: vec![],
+        meta: None,
+    }));
+    write_multi_block_test_pbf(&honest, &nodes, &[], &[], 10);
+    // Give the outside blob (frame 2) the inside blob's (frame 1) index,
+    // bbox included.
+    let pbf = std::fs::read(&honest).expect("read fixture");
+    let inside_index = indexdata_of(&pbf, 1);
+    let lying = crate::common::adversarial::mutate_blob_header_indexdata(&pbf, 2, |ix| {
+        ix.clone_from(&inside_index);
+    });
+    std::fs::write(&input, lying).expect("write lying fixture");
+
+    let want: Vec<i64> = (1..=10).collect();
+    let out = run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
+    assert_eq!(
+        node_ids(&read_all_elements(&output)),
+        want,
+        "the outside nodes must not ride in on the lying bbox"
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("Extract (simple): 10 nodes (10 in bbox, 0 from ways)"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("filtered instead of copied raw"),
+        "the failed verification must be reported; stderr:\n{stderr}"
+    );
+
+    let config = single_region_config(dir.path());
+    let out = run_extract_multi(&input, &config, Strategy::Simple);
+    assert_eq!(
+        node_ids(&read_all_elements(&dir.path().join("m.osm.pbf"))),
+        want,
+        "multi-extract must not trust the lying bbox either"
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("Extract (simple): 10 nodes (10 in bbox, 0 from ways)"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("filtered instead of copied raw"),
+        "stderr:\n{stderr}"
+    );
+}

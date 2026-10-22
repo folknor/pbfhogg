@@ -13,7 +13,10 @@ use super::super::{
 use crate::idset::IdSet;
 use crate::read::region_grid::RegionGrid;
 
-use super::common::{BboxInt, relation_has_matched_member, spatial_blob_filter};
+use super::common::{
+    BboxInt, Passthrough, dense_only_payload, relation_has_matched_member, spatial_blob_filter,
+    warn_passthrough_demotions,
+};
 use super::{ExtractSlot, ExtractStats, Region};
 
 use crate::owned::{dense_node_metadata, element_metadata};
@@ -175,26 +178,26 @@ pub(super) fn try_extract_multi_single_pass(
                 crate::blob_meta::ElemKind::Node => {
                     // Raw passthrough is only sound for bbox regions - polygon
                     // regions can exclude nodes inside the bbox but outside the
-                    // polygon boundary or inside holes.
-                    let mut contained_in: Vec<usize> = Vec::new();
-                    if let Some(ref blob_bbox) = idx.bbox {
-                        for (i, (bi, slot)) in inside_bbox_ints.iter().zip(slots.iter()).enumerate()
-                        {
-                            if matches!(slot.region, Region::Bbox(_)) {
-                                let region_bbox = crate::BlobBbox::new(
+                    // polygon boundary or inside holes - and only when the
+                    // blob goes to every region. This nominates on the
+                    // indexdata bbox claim; the node classify phase verifies.
+                    let candidate = idx.bbox.as_ref().is_some_and(|blob_bbox| {
+                        inside_bbox_ints.iter().zip(slots.iter()).all(|(bi, slot)| {
+                            matches!(slot.region, Region::Bbox(_))
+                                && crate::BlobBbox::new(
                                     bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon,
-                                );
-                                if region_bbox.contains(blob_bbox) {
-                                    contained_in.push(i);
-                                }
-                            }
-                        }
-                    }
+                                )
+                                .contains(blob_bbox)
+                        })
+                    });
                     node_blob_info.push(NodeBlobInfo {
-                        contained_in,
+                        passthrough: if candidate {
+                            Passthrough::Candidate
+                        } else {
+                            Passthrough::No
+                        },
                         frame_offset: meta.frame_start,
                         frame_size: meta.frame_size,
-                        count: idx.count,
                     });
                     node_schedule.push((seq, meta.data_offset, meta.data_size));
                 }
@@ -208,10 +211,9 @@ pub(super) fn try_extract_multi_single_pass(
         } else {
             // No indexdata - include in all schedules (conservative).
             node_blob_info.push(NodeBlobInfo {
-                contained_in: Vec::new(),
+                passthrough: Passthrough::No,
                 frame_offset: meta.frame_start,
                 frame_size: 0,
-                count: 0,
             });
             node_schedule.push((seq, meta.data_offset, meta.data_size));
             way_schedule.push((seq, meta.data_offset, meta.data_size));
@@ -277,37 +279,76 @@ pub(super) fn try_extract_multi_single_pass(
         .then(|| RegionGrid::build(&region_bboxes))
         .flatten();
     crate::debug::emit_marker("MULTI_NODE_CLASSIFY_START");
+    // Observed node count per node-schedule position, for passthrough
+    // candidates that verified. See `Passthrough`.
+    let mut verified_nodes: Vec<Option<u64>> = vec![None; node_schedule.len()];
     if all_bbox {
         let bboxes = region_bboxes;
+        // The one classifier for every node blob, candidate or not, so that
+        // verification can never change which nodes are selected.
+        let classify_columns = |block: &PrimitiveBlock,
+                                columns: &mut crate::read::columnar::DenseNodeColumns,
+                                scratch: &mut Vec<Vec<i64>>|
+         -> Vec<Vec<i64>> {
+            block.decode_dense_columns(columns);
+            for v in scratch.iter_mut() {
+                v.clear();
+            }
+            match &grid {
+                Some(grid) => {
+                    columns.collect_matching_ids_multi_bbox_grid(&bboxes, grid, scratch);
+                }
+                None => columns.collect_matching_ids_multi_bbox(&bboxes, scratch),
+            }
+            scratch.iter_mut().map(std::mem::take).collect::<Vec<_>>()
+        };
+        let worker_init = || {
+            (
+                crate::read::columnar::DenseNodeColumns::new(),
+                vec![Vec::<i64>::new(); n],
+            )
+        };
+
+        // Passthrough candidates are classified from the raw bytes, so the
+        // structural check in `dense_only_payload` can see them. Both
+        // subsets carry the node-schedule position as their sequence number;
+        // the write phase below keeps the original node_schedule order.
+        let (candidate_schedule, other_schedule): (Vec<_>, Vec<_>) = node_schedule
+            .iter()
+            .enumerate()
+            .map(|(pos, &(_seq, offset, size))| (pos, offset, size))
+            .partition(|&(pos, _, _)| node_blob_info[pos].passthrough == Passthrough::Candidate);
+
         crate::scan::classify::parallel_classify_phase(
             &shared_file,
-            &node_schedule,
+            &other_schedule,
             None,
-            || {
-                (
-                    crate::read::columnar::DenseNodeColumns::new(),
-                    vec![Vec::<i64>::new(); n],
-                )
+            worker_init,
+            |block, (columns, scratch)| classify_columns(block, columns, scratch),
+            |_pos, region_ids: Vec<Vec<i64>>| merge_region_ids(&mut bbox_node_ids, region_ids),
+            &*host.resources,
+        )?;
+        crate::scan::classify::parallel_scan_blobs_raw(
+            &shared_file,
+            &candidate_schedule,
+            None,
+            worker_init,
+            |bytes, (columns, scratch)| {
+                let eligible = dense_only_payload(bytes)?;
+                // What the decode path would do with this blob; a block it
+                // rejects must not be copied raw.
+                let block = PrimitiveBlock::from_vec(bytes.to_vec())?;
+                let region_ids = classify_columns(&block, columns, scratch);
+                // Occurrence counts, not set sizes: a duplicate id counts
+                // every time it is copied.
+                let observed = columns.len();
+                let verified = (eligible && region_ids.iter().all(|ids| ids.len() == observed))
+                    .then_some(observed as u64);
+                Ok((region_ids, verified))
             },
-            |block, (columns, scratch)| {
-                block.decode_dense_columns(columns);
-                for v in scratch.iter_mut() {
-                    v.clear();
-                }
-                match &grid {
-                    Some(grid) => {
-                        columns.collect_matching_ids_multi_bbox_grid(&bboxes, grid, scratch);
-                    }
-                    None => columns.collect_matching_ids_multi_bbox(&bboxes, scratch),
-                }
-                scratch.iter_mut().map(std::mem::take).collect::<Vec<_>>()
-            },
-            |_seq, region_ids: Vec<Vec<i64>>| {
-                for (i, ids) in region_ids.into_iter().enumerate() {
-                    for id in ids {
-                        bbox_node_ids[i].set(id);
-                    }
-                }
+            |pos, (region_ids, verified): (Vec<Vec<i64>>, Option<u64>)| {
+                merge_region_ids(&mut bbox_node_ids, region_ids);
+                verified_nodes[pos] = verified;
             },
             &*host.resources,
         )?;
@@ -359,17 +400,31 @@ pub(super) fn try_extract_multi_single_pass(
                 }
                 scratch.iter_mut().map(std::mem::take).collect::<Vec<_>>()
             },
-            |_seq, region_ids: Vec<Vec<i64>>| {
-                for (i, ids) in region_ids.into_iter().enumerate() {
-                    for id in ids {
-                        bbox_node_ids[i].set(id);
-                    }
-                }
-            },
+            |_seq, region_ids: Vec<Vec<i64>>| merge_region_ids(&mut bbox_node_ids, region_ids),
             &*host.resources,
         )?;
     }
     crate::debug::emit_marker("MULTI_NODE_CLASSIFY_END");
+
+    // Settle every candidate: verified ones pass through counted by what
+    // classify observed, the rest are decoded like any other blob.
+    let mut verified_blobs: u64 = 0;
+    let mut demoted_blobs: u64 = 0;
+    for (info, verified) in node_blob_info.iter_mut().zip(&verified_nodes) {
+        if info.passthrough == Passthrough::Candidate {
+            info.passthrough = match *verified {
+                Some(nodes) => {
+                    verified_blobs += 1;
+                    Passthrough::Verified { nodes }
+                }
+                None => {
+                    demoted_blobs += 1;
+                    Passthrough::No
+                }
+            };
+        }
+    }
+    warn_passthrough_demotions(verified_blobs, demoted_blobs, host);
 
     // Phase 1 write: parallel decode with raw passthrough for fully-contained node blobs.
     crate::debug::emit_marker("MULTI_NODE_WRITE_START");
@@ -642,20 +697,30 @@ pub(super) fn try_extract_multi_single_pass(
 // Parallel batch infrastructure
 // ---------------------------------------------------------------------------
 
-/// Node write phase with raw passthrough for fully-contained blobs.
-///
-/// Blobs fully contained in ALL N regions are written as raw frames to all
-/// N writers without decode. Other blobs go through parallel decode workers.
-/// Both streams are interleaved in sequence order via ReorderBuffer.
-#[allow(clippy::too_many_lines)]
-/// Per-node-blob passthrough metadata: (contained_regions, frame_offset, frame_size, count).
+/// Per-node-blob passthrough metadata, parallel to the node schedule.
 struct NodeBlobInfo {
-    contained_in: Vec<usize>,
+    /// `Candidate` when the indexdata bbox claims containment in every
+    /// region; settled to `Verified` or `No` after node classify.
+    passthrough: Passthrough,
     frame_offset: u64,
     frame_size: usize,
-    count: u64,
 }
 
+/// Merge one blob's per-region matching node ids into the region id sets.
+fn merge_region_ids(bbox_node_ids: &mut [IdSet], region_ids: Vec<Vec<i64>>) {
+    for (set, ids) in bbox_node_ids.iter_mut().zip(region_ids) {
+        for id in ids {
+            set.set(id);
+        }
+    }
+}
+
+/// Node write phase with raw passthrough for verified blobs.
+///
+/// Blobs verified as fully contained in ALL N regions are written as raw
+/// frames to all N writers without decode, counted by the node count
+/// classify observed. Other blobs go through parallel decode workers.
+/// Both streams are interleaved in sequence order via ReorderBuffer.
 #[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
@@ -685,15 +750,16 @@ where
         return Ok(());
     }
 
-    // Blobs fully contained in ALL N regions skip decode entirely - write raw
-    // frame to all N writers. Other blobs go through parallel decode workers.
+    // Blobs verified as fully contained in ALL N regions skip decode
+    // entirely - write raw frame to all N writers. Other blobs, including any
+    // unsettled candidate, go through parallel decode workers.
     let mut decode_items: Vec<(usize, u64, usize)> = Vec::new();
     let mut passthrough_items: Vec<(usize, u64, usize, u64)> = Vec::new();
     for (local_seq, ((_global_seq, data_offset, data_size), info)) in
         schedule.iter().zip(blob_info.iter()).enumerate()
     {
-        if info.contained_in.len() == n {
-            passthrough_items.push((local_seq, info.frame_offset, info.frame_size, info.count));
+        if let Passthrough::Verified { nodes } = info.passthrough {
+            passthrough_items.push((local_seq, info.frame_offset, info.frame_size, nodes));
         } else {
             decode_items.push((local_seq, *data_offset, *data_size));
         }

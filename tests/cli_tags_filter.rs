@@ -370,6 +370,97 @@ fn key_only_filter() {
     assert_eq!(node_ids(&c), vec![1, 3]);
 }
 
+/// `--expressions` files follow osmium's reader: inline `#` comments, CRLF
+/// tolerated, and a tab is part of the key rather than whitespace. The
+/// reader once ran `str::trim` over each line, so a tab-led key matched the
+/// plain key instead.
+#[test]
+fn expressions_file_keeps_a_tab_led_key_and_strips_inline_comments() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    let exprs = dir.path().join("exprs.txt");
+
+    write_test_pbf(
+        &input,
+        &[
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("highway", "primary")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![("\thighway", "primary")],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 120_000_000,
+                lon: 220_000_000,
+                tags: vec![("amenity", "bench")],
+                meta: None,
+            },
+        ],
+        &[],
+        &[],
+    );
+    std::fs::write(
+        &exprs,
+        "# header comment\r\n\thighway=primary # inline\r\n   \r\n  amenity=bench\r\n",
+    )
+    .expect("write expressions");
+
+    CliInvoker::new()
+        .arg("tags-filter")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("-R")
+        .arg("--force")
+        .arg("-e")
+        .arg(&exprs)
+        .assert_success();
+    let c = read_all_elements(&output);
+    assert_eq!(
+        node_ids(&c),
+        vec![2, 3],
+        "the tab-led key must match only the tab-led tag"
+    );
+}
+
+/// An indented type prefix is an error, as it is in osmium, rather than the
+/// silent zero-match literal key `w/highway`.
+#[test]
+fn expressions_file_rejects_an_indented_type_prefix() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    let exprs = dir.path().join("exprs.txt");
+    write_test_pbf(&input, &generate_nodes(3, 1), &[], &[]);
+    std::fs::write(&exprs, "  w/highway\n").expect("write expressions");
+
+    let out = CliInvoker::new()
+        .arg("tags-filter")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--force")
+        .arg("-e")
+        .arg(&exprs)
+        .run();
+    assert!(!out.status.success(), "an indented type prefix must fail");
+    assert!(
+        out.stderr_str().contains("contains spaces"),
+        "stderr: {}",
+        out.stderr_str()
+    );
+}
+
 #[test]
 fn exact_value_filter() {
     let dir = TempDir::new().expect("tempdir");

@@ -552,6 +552,20 @@
   trusted, and an inverted ID range or a repeated indexdata or tagdata field
   now reads as no index.
 
+- **List files now parse the way osmium's do.** In a tag-expressions file
+  (`--expressions`), a tab is kept as part of the key instead
+  of being trimmed, and a type prefix that is only valid once spaces are
+  removed (`  w/highway`) is an error rather than a literal key that
+  matches nothing. In a `getid` ID file, an inline comment or trailing text
+  after a space (`n123 # note`) is now accepted, and a tab is now an error.
+
+- **`extract` no longer trusts indexdata for raw-copied node blobs.** A blob
+  is copied through without re-encoding only after its decoded nodes are
+  all confirmed inside the region, so a blob whose indexdata bbox lied can
+  no longer leak out-of-region nodes into the output; such a blob is
+  filtered normally, with a warning. The node counts in the summary are
+  now always counted from decoded data, never from indexdata.
+
 - **`apply-changes --locations-on-ways` no longer loses coordinates
   silently.** Node blobs of plain (non-dense) nodes had their coordinates
   dropped, surfacing later as unexplained missing nodes; both encodings are

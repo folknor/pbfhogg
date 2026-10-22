@@ -171,24 +171,52 @@ pub fn parse_ids_with_default_type(
     Ok(set)
 }
 
-/// Parse ID specs from a file (one per line, blank lines and `#` comments skipped).
+/// Parse ID specs from a file, one per line. See
+/// [`parse_ids_from_file_with_default_type`] for the line rules.
 pub fn parse_ids_from_file(path: &Path) -> Result<ElementIds> {
     parse_ids_from_file_with_default_type(path, None)
 }
 
 /// Parse ID specs from file with optional default element type for bare IDs.
+///
+/// Each line is read the way osmium's `read_id_file` (`id_file.cpp`, shared
+/// by `getid` and `removeid`) reads it: spaces - only spaces - are stripped
+/// from both ends, then everything from the first space or `#` onward is
+/// dropped, and an empty remainder is skipped. So `n123 # note` and
+/// `n123 anything` both mean `n123`, and a tab is part of the token, which
+/// makes `\tn123` an error in both tools.
+///
+/// This is deliberately not the `--expressions` reader's rule: osmium cuts
+/// expressions at `#` alone and strips nothing at line level (see
+/// `tag_expr::read_expressions_file`), because a space is meaningful inside
+/// an expression and never inside an id.
+///
+/// One deliberate difference: a single trailing `\r` is removed first, so a
+/// CRLF file reads like an LF one. osmium keeps it, which rejects `n123\r`
+/// and `n123#c\r` as illegal ids while accepting `n123 #c\r` (the space cut
+/// removes the `\r`); a line ending should not decide that.
 pub fn parse_ids_from_file_with_default_type(
     path: &Path,
     default_type: Option<DefaultType>,
 ) -> Result<ElementIds> {
     let contents = std::fs::read_to_string(path)?;
     let specs: Vec<String> = contents
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .split('\n')
+        .filter_map(id_file_token)
         .map(ToString::to_string)
         .collect();
     parse_ids_with_default_type(&specs, default_type)
+}
+
+/// The id token on one raw line of an id file, or `None` to skip the line.
+/// See [`parse_ids_from_file_with_default_type`] for the rules.
+fn id_file_token(raw: &str) -> Option<&str> {
+    let line = raw.strip_suffix('\r').unwrap_or(raw).trim_matches(' ');
+    let token = match line.find([' ', '#']) {
+        Some(pos) => &line[..pos],
+        None => line,
+    };
+    (!token.is_empty()).then_some(token)
 }
 
 /// Collect all element IDs from a PBF file.
@@ -1246,6 +1274,53 @@ mod tests {
     fn parse_too_short() {
         assert!(parse_id_spec("n", None).is_err());
         assert!(parse_id_spec("", None).is_err());
+    }
+
+    /// osmium's `read_id_file`: strip spaces, cut at the first space or `#`,
+    /// skip empty. The previous reader honoured `#` only at line start, so
+    /// `n123 # note` was an error here and `n123` in osmium.
+    #[test]
+    fn id_file_token_follows_the_osmium_reader() {
+        assert_eq!(id_file_token("n123"), Some("n123"));
+        assert_eq!(id_file_token("  n123  "), Some("n123"));
+        assert_eq!(id_file_token("n123 # note"), Some("n123"));
+        assert_eq!(id_file_token("n123#note"), Some("n123"));
+        assert_eq!(id_file_token("n123 w456"), Some("n123"));
+        assert_eq!(id_file_token("# comment"), None);
+        assert_eq!(id_file_token("   # indented comment"), None);
+        assert_eq!(id_file_token(""), None);
+        assert_eq!(id_file_token("   "), None);
+        // CRLF line endings: one trailing CR is a line ending, not id text.
+        assert_eq!(id_file_token("n123\r"), Some("n123"));
+        assert_eq!(id_file_token("n123#c\r"), Some("n123"));
+        assert_eq!(id_file_token("\r"), None);
+        // Tabs are not whitespace here, as in osmium: the token keeps them
+        // and fails to parse.
+        assert_eq!(id_file_token("\tn123"), Some("\tn123"));
+        assert!(parse_id_spec("\tn123", None).is_err());
+        assert!(parse_id_spec("n123\t", None).is_err());
+    }
+
+    #[test]
+    fn id_file_inline_comments_and_crlf() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ids.txt");
+        std::fs::write(
+            &path,
+            "# header\r\nn1 # first\r\nw10#way\r\n\r\n  r7  extra\r\n",
+        )
+        .unwrap();
+        let ids = parse_ids_from_file(&path).unwrap();
+        assert!(ids.node_ids.get(1));
+        assert!(ids.way_ids.get(10));
+        assert!(ids.relation_ids.get(7));
+        assert!(!ids.node_ids.get(7));
+
+        std::fs::write(&path, "n1\n\tn2\n").unwrap();
+        assert!(
+            parse_ids_from_file(&path).is_err(),
+            "a tab-led id is an illegal id, as in osmium"
+        );
     }
 
     #[test]

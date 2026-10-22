@@ -391,8 +391,8 @@ The matcher is built to match `osmium-tool/src/util.cpp::get_string_matcher`
 and `get_tag_matcher` rule for rule, including the order in which the `!`
 inversion marker is tested relative to whitespace stripping - the marker counts
 only when it is the last character of the raw key, so `highway !=x` inverts
-while `highway ! = x` means the literal key `highway !`. Three edges deviate
-deliberately.
+while `highway ! = x` means the literal key `highway !`. The edges below
+deviate deliberately.
 
 **An empty key is an error, not an empty-string match.** `get_string_matcher`
 returns `equal{""}` for an empty key, so osmium accepts `=value` and matches
@@ -410,8 +410,28 @@ every character of it is one of `n`, `w`, `r`, and otherwise treats the whole
 string as the tag expression, so `addr:full/name` filters on that literal key.
 The empty prefix is part of the same rule: osmium reads `/name` as the key
 `name` applied to all types, while pbfhogg filters on the literal key `/name`.
+One case is an error instead: a prefix that is valid only once its spaces are
+stripped (`  w/highway`, `w /highway`) is refused, as osmium refuses it,
+rather than becoming a literal key that matches nothing.
+
+**A blank line in an expressions file is skipped.** Both tools cut a line at
+its first `#`, remove one trailing `\r`, and strip only spaces from each half
+of the expression, so a tab stays part of the key. osmium then turns a line
+left empty (or holding only spaces) into an empty-key matcher; pbfhogg skips
+it, consistent with refusing an empty key above.
 
 **There is no area (`a`) type.** osmium's `get_types` accepts `a` and routes
 matching expressions to a separate area filter. pbfhogg has no area concept in
 `tags-filter`, so `a` is not a recognised prefix character and an expression
 using it falls through to the key-literal rule above.
+
+## getid: ID files tolerate a trailing carriage return
+
+The ID-file reader follows `osmium-tool/src/id_file.cpp::read_id_file`: strip
+spaces from both ends, cut at the first space or `#` (so `n123 # note` and
+`n123 extra` are accepted), skip a line left empty, and reject anything else
+the ID parser does not accept, including a tab. One difference: pbfhogg
+removes one trailing `\r` before reading the line, so a CRLF file works.
+osmium sheds the `\r` only when a space or `#` cut happens to remove it, so it
+rejects `n123\r` and `n123#c\r` while accepting `n123 #c\r`, and rejects a
+line holding only `\r`, which pbfhogg skips.

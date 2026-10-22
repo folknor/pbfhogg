@@ -2,7 +2,6 @@
 //!
 //! Used by `tags_filter`, `tags_filter_osc`, and `tags_count`.
 
-use std::io::BufRead;
 use std::path::Path;
 
 use crate::BoxResult;
@@ -85,20 +84,41 @@ pub(crate) struct Expression {
 // Parser
 // ---------------------------------------------------------------------------
 
-fn parse_type_prefix(input: &str) -> (TypeFilter, &str) {
+fn is_type_prefix(prefix: &str) -> bool {
+    !prefix.is_empty() && prefix.chars().all(|c| matches!(c, 'n' | 'w' | 'r'))
+}
+
+/// Split off an `n`/`w`/`r` type prefix, as `osmium::get_filter_expression`
+/// does for the cases pbfhogg accepts.
+///
+/// A prefix that is a valid type list only once spaces are removed -
+/// `  w/highway`, `w /highway` - is an error. osmium hands the raw prefix to
+/// `get_types`, which throws on the space. Treating it as part of the key
+/// instead, the rule for any other unrecognised prefix, would turn an
+/// indented line in an `--expressions` file into the literal key
+/// `w/highway`: a filter that silently matches nothing.
+fn parse_type_prefix(input: &str) -> BoxResult<(TypeFilter, &str)> {
     if let Some(slash_pos) = input.find('/') {
         let prefix = &input[..slash_pos];
         let rest = &input[slash_pos + 1..];
-        if !prefix.is_empty() && prefix.chars().all(|c| matches!(c, 'n' | 'w' | 'r')) {
+        if is_type_prefix(prefix) {
             let tf = TypeFilter {
                 nodes: prefix.contains('n'),
                 ways: prefix.contains('w'),
                 relations: prefix.contains('r'),
             };
-            return (tf, rest);
+            return Ok((tf, rest));
+        }
+        if prefix.contains(' ') && is_type_prefix(strip_spaces(prefix)) {
+            return Err(format!(
+                "type prefix {prefix:?} in expression {input:?} contains spaces; \
+                 write it without them, e.g. \"{}/...\"",
+                strip_spaces(prefix)
+            )
+            .into());
         }
     }
-    (TypeFilter::all(), input)
+    Ok((TypeFilter::all(), input))
 }
 
 /// Strip leading and trailing spaces, as `osmium::strip_whitespace` does.
@@ -200,7 +220,7 @@ fn parse_tag_matcher(input: &str) -> BoxResult<TagMatcher> {
 }
 
 pub(crate) fn parse_expression(input: &str) -> BoxResult<Expression> {
-    let (type_filter, tag_part) = parse_type_prefix(input);
+    let (type_filter, tag_part) = parse_type_prefix(input)?;
     let matcher = parse_tag_matcher(tag_part)?;
     Ok(Expression {
         type_filter,
@@ -214,30 +234,48 @@ pub(crate) fn parse_expressions(inputs: &[String]) -> BoxResult<Vec<Expression>>
 
 /// Read expressions from a file, one per line.
 ///
-/// - Lines starting with `#` (after optional whitespace) are comments.
-/// - Inline `#` comments are supported (everything from first `#` onward is stripped).
-/// - Blank lines are ignored.
-/// - Windows line endings (`\r\n`) are handled.
+/// Mirrors `read_expressions_file` in osmium's `command_tags_filter.cpp` and
+/// `command_tags_count.cpp`, step for step:
+///
+/// 1. lines are split on `\n` only;
+/// 2. everything from the first `#` onward is a comment, wherever it sits;
+/// 3. then one trailing `\r` is removed, so a CRLF file reads like an LF one
+///    (a `\r` the comment cut already removed is not looked for again);
+/// 4. the line is otherwise handed to the expression parser **unmodified**.
+///
+/// Step 4 is the point. The parser strips spaces - and only spaces - around
+/// each half of an expression, as osmium's `strip_whitespace` does, so a tab
+/// stays part of the key in both tools. This reader previously called
+/// `str::trim`, which strips tabs too, so a key beginning with a tab was
+/// silently rewritten into a different key.
+///
+/// One deliberate difference: a line that is empty or spaces-only after
+/// steps 2 and 3 is skipped. osmium hands it to `get_tag_matcher` too, which
+/// builds a matcher for the empty key; pbfhogg rejects an empty key outright
+/// (see [`parse_expression`]), and erroring on a blank line would be hostile.
 pub fn read_expressions_file(path: &Path) -> BoxResult<Vec<String>> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| format!("could not open expressions file '{}': {e}", path.display()))?;
-    let reader = std::io::BufReader::new(file);
-    let mut expressions = Vec::new();
-    for line in reader.lines() {
-        let line =
-            line.map_err(|e| format!("error reading expressions file '{}': {e}", path.display()))?;
-        // Strip inline comments
-        let line = match line.find('#') {
-            Some(pos) => &line[..pos],
-            None => &line,
-        };
-        // Strip whitespace and trailing \r
-        let line = line.trim();
-        if !line.is_empty() {
-            expressions.push(line.to_string());
-        }
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| format!("could not read expressions file '{}': {e}", path.display()))?;
+    Ok(contents
+        .split('\n')
+        .filter_map(expression_line)
+        .map(ToString::to_string)
+        .collect())
+}
+
+/// Normalize one raw line of an expressions file; `None` means skip it. See
+/// [`read_expressions_file`] for the rules and their osmium source.
+fn expression_line(raw: &str) -> Option<&str> {
+    let line = match raw.find('#') {
+        Some(pos) => &raw[..pos],
+        None => raw,
+    };
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    if strip_spaces(line).is_empty() {
+        None
+    } else {
+        Some(line)
     }
-    Ok(expressions)
 }
 
 // ---------------------------------------------------------------------------
@@ -502,7 +540,71 @@ mod tests {
         )
         .expect("write");
         let exprs = read_expressions_file(&path).expect("read");
-        assert_eq!(exprs, vec!["highway=primary", "amenity", "w/building=yes"]);
+        // The space before the inline comment survives the reader, exactly as
+        // in osmium; the parser strips it from the key.
+        assert_eq!(exprs, vec!["highway=primary", "amenity ", "w/building=yes"]);
         std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// The comment rule is osmium's `read_expressions_file`: cut at the first
+    /// `#` wherever it sits, then drop one trailing `\r`, then hand the rest
+    /// over untouched. Blank and spaces-only remainders are skipped.
+    #[test]
+    fn expression_line_follows_the_osmium_reader() {
+        assert_eq!(expression_line("highway=primary"), Some("highway=primary"));
+        assert_eq!(
+            expression_line("highway=primary\r"),
+            Some("highway=primary")
+        );
+        assert_eq!(expression_line("highway # note"), Some("highway "));
+        assert_eq!(expression_line("name=a#b"), Some("name=a"));
+        // The comment cut removes the CR, so there is no second CR strip.
+        assert_eq!(expression_line("highway #c\r"), Some("highway "));
+        // A CR not at the end of the post-comment line stays.
+        assert_eq!(expression_line("key\r "), Some("key\r "));
+        assert_eq!(expression_line(""), None);
+        assert_eq!(expression_line("\r"), None);
+        assert_eq!(expression_line("   "), None);
+        assert_eq!(expression_line("# comment"), None);
+        assert_eq!(expression_line("   # indented comment\r"), None);
+        // Tabs are content, not whitespace to strip.
+        assert_eq!(expression_line("\t"), Some("\t"));
+        assert_eq!(expression_line("\thighway"), Some("\thighway"));
+    }
+
+    /// A tab-led key read from a file stays tab-led, as in osmium, whose
+    /// `strip_whitespace` removes spaces only. The reader used `str::trim`
+    /// and turned it into the plain key.
+    #[test]
+    fn a_tab_led_key_from_a_file_keeps_its_tab() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("exprs.txt");
+        std::fs::write(&path, "\thighway=primary\n  amenity  \r\n").expect("write");
+        let exprs = read_expressions_file(&path).expect("read");
+        assert_eq!(exprs, vec!["\thighway=primary", "  amenity  "]);
+
+        let parsed = parse_expressions(&exprs).expect("parse");
+        assert!(tag_matches(&parsed[0].matcher, "\thighway", "primary"));
+        assert!(!tag_matches(&parsed[0].matcher, "highway", "primary"));
+        // Spaces are still stripped, by the parser.
+        assert!(tag_matches(&parsed[1].matcher, "amenity", "bench"));
+    }
+
+    /// osmium's `get_types` throws on a type prefix carrying a space. Taking
+    /// it as part of the key - pbfhogg's rule for unrecognised prefixes -
+    /// would make `  w/highway` the literal key `w/highway` and match
+    /// nothing, so it is an error here too.
+    #[test]
+    fn a_type_prefix_with_spaces_is_an_error() {
+        for expr in ["  w/highway", "w /highway", " nw /name=x"] {
+            let err = parse_expression(expr).expect_err(expr).to_string();
+            assert!(err.contains("contains spaces"), "{expr}: {err}");
+        }
+        // Spaces after the slash belong to the key half and are stripped.
+        let expr = parse_expression("w/ highway").expect("parse");
+        assert!(expr.type_filter.ways && !expr.type_filter.nodes);
+        assert!(m("w/ highway", "highway", "primary"));
+        // An unrecognised prefix is still literal key text.
+        assert!(m("addr: full/name", "addr: full/name", "x"));
     }
 }

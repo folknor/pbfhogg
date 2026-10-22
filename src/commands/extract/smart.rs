@@ -14,7 +14,7 @@ use super::super::{
 use crate::idset::IdSet;
 
 use super::common::{
-    BboxInt, BlobDesc, pread_write_pass, pread_write_pass_with_schedule,
+    BboxInt, BlobDesc, Passthrough, pread_write_pass, pread_write_pass_with_schedule,
     relation_has_matched_member, spatial_blob_filter,
 };
 use super::{ExtractStats, Region};
@@ -270,10 +270,9 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         let idx = meta.index.as_ref();
         // Build pass3_blob_schedule unconditionally for all OsmData blobs.
         // Mirrors build_blob_schedule's behavior (no kind/spatial filter,
-        // raw_passthrough=false since smart/complete don't use the
-        // passthrough optimization).
+        // no passthrough since smart/complete don't use the passthrough
+        // optimization).
         let bbox = idx.and_then(|i| i.bbox);
-        let count = idx.map_or(0, |i| i.count);
         let kind_for_blob = idx.map(|i| i.kind);
         pass3_blob_schedule.push(BlobDesc {
             frame_offset: meta.frame_start,
@@ -282,8 +281,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             size: meta.data_size,
             kind: kind_for_blob,
             bbox,
-            count,
-            raw_passthrough: false,
+            passthrough: Passthrough::No,
         });
         if let Some(idx) = idx {
             // Build full_way_schedule unconditionally for way blobs.

@@ -515,19 +515,19 @@ relative `directory` onto `config_dir`, and pass the override into
 
 Reported by: filtering and spatial.
 
-## BUG-043 - The tags-filter expressions file strips tabs, contradicting the osmium parity claim
+## BUG-077 - Two osmium parity gaps not yet checked against DEVIATIONS.md
 
-`tag_expr::read_expressions_file` uses `trim()`, which strips tabs, while
-`tag_expr::strip_spaces` documents that osmium strips spaces only and "a tab
-stays part of the key there and stays part of the key here". A tab-led key
-from an expressions file is stripped. Separately, the two "one item per line
-with comments" readers disagree: `getid::parse_ids_from_file_with_default_type`
-treats `#` only at line start, `read_expressions_file` strips inline `#`
-anywhere. Fix: one `read_list_file` helper with the comment rule decided once,
-and `trim_matches(' ')` plus `\r` only in the expressions path. Testable
-against osmium in `brokkr verify tags-filter`.
+Found while fixing the list-file readers, not verified further:
 
-Reported by: filtering and spatial.
+- osmium's `tags-count` (`add_matcher`) has no type-prefix syntax, while
+  pbfhogg parses `w/highway` as typed in its tags-count expressions.
+- osmium `getid` treats a bare ID as a node (`--default-type` defaults to
+  node); pbfhogg rejects bare IDs unless `--default-type` is given.
+
+Each is either a bug or an undocumented deviation; DEVIATIONS.md mentions
+neither.
+
+Reported by: the list-file reader fix.
 
 ## BUG-044 - Degenerate polygon rings produce an empty extract with exit 0
 

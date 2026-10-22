@@ -607,7 +607,12 @@ pub enum ExtractStrategy {
     Smart,
 }
 
+/// Element counts for one extract. Every counter is observed - counted from
+/// elements this command decoded - never taken from `BlobHeader.indexdata`.
 pub struct ExtractStats {
+    /// Nodes inside the region. A blob copied through raw contributes the
+    /// node count its classify-phase decode observed, not its indexdata
+    /// `count`; see `common::Passthrough`.
     pub nodes_in_bbox: u64,
     pub nodes_from_ways: u64,
     pub nodes_from_relations: u64,

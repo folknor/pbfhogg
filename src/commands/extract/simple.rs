@@ -13,9 +13,9 @@ use super::super::{HeaderOverrides, Result, drain_batch_results, flush_local, wr
 use crate::idset::IdSet;
 
 use super::common::{
-    BboxInt, BlobDesc, ExtractPass2IdSets, build_blob_schedule_with_passthrough,
-    extract_block_pass2, merge_extract_stats, pread_execute, relation_has_matched_member,
-    spatial_blob_filter,
+    BboxInt, BlobDesc, ExtractPass2IdSets, Passthrough, build_blob_schedule_with_passthrough,
+    dense_only_payload, extract_block_pass2, merge_extract_stats, pread_execute,
+    relation_has_matched_member, spatial_blob_filter, warn_passthrough_demotions,
 };
 use super::{ExtractStats, Region};
 
@@ -419,6 +419,7 @@ fn extract_simple_single_pass(
     // check bbox (pure function), send matching IDs to consumer.
     // Consumer merges into bbox_node_ids. No shared mutable state in workers.
     crate::debug::emit_marker("SIMPLE_NODE_CLASSIFY_START");
+    let mut verified_nodes: Vec<Option<u64>> = vec![None; node_schedule.len()];
     {
         use std::os::unix::fs::FileExt as _;
 
@@ -431,17 +432,22 @@ fn extract_simple_single_pass(
 
         let decode_threads = crate::host::sized_workers(&*host.resources, 2, 1, 4);
 
-        type ClassifyResult = (usize, crate::error::Result<Vec<i64>>);
-        let (cls_tx, cls_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
+        // Per blob: the matching node ids, plus - for a passthrough candidate
+        // - the observed node count if the blob verified (see `Passthrough`).
+        type ClassifyResult = (usize, crate::error::Result<(Vec<i64>, Option<u64>)>);
+        let (cls_tx, cls_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize, bool)>(16);
         let cls_rx = std::sync::Arc::new(std::sync::Mutex::new(cls_rx));
         let (ids_tx, ids_rx) = std::sync::mpsc::sync_channel::<ClassifyResult>(32);
 
         std::thread::scope(|scope| -> Result<()> {
             // Dispatcher: send node blob descriptors.
-            let descs: Vec<(usize, u64, usize)> = node_schedule
+            let descs: Vec<(usize, u64, usize, bool)> = node_schedule
                 .iter()
                 .enumerate()
-                .map(|(i, d)| (i, d.offset, d.size))
+                .map(|(i, d)| {
+                    let candidate = d.passthrough == Passthrough::Candidate;
+                    (i, d.offset, d.size, candidate)
+                })
                 .collect();
             scope.spawn(move || {
                 for item in descs {
@@ -465,7 +471,7 @@ fn extract_simple_single_pass(
                     let mut group_starts: Vec<(usize, usize)> = Vec::new();
 
                     loop {
-                        let (seq, data_offset, data_size) = {
+                        let (seq, data_offset, data_size, candidate) = {
                             let guard =
                                 rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             match guard.recv() {
@@ -474,7 +480,7 @@ fn extract_simple_single_pass(
                             }
                         };
 
-                        let r: crate::error::Result<Vec<i64>> = (|| {
+                        let r: crate::error::Result<(Vec<i64>, Option<u64>)> = (|| {
                             read_buf.resize(data_size, 0);
                             file.read_exact_at(&mut read_buf, data_offset)
                                 .map_err(|e| {
@@ -492,6 +498,9 @@ fn extract_simple_single_pass(
                                     std::io::Error::other(e.to_string()),
                                 ))
                             })?;
+                            // Classification is the same for every blob,
+                            // candidate or not, so verification can never
+                            // change which nodes are selected.
                             let matching: Vec<i64> = tuples
                                 .iter()
                                 .filter(|t| {
@@ -499,8 +508,14 @@ fn extract_simple_single_pass(
                                 })
                                 .map(|t| t.id)
                                 .collect();
-                            Ok(matching)
-                        })();
+                            let verified = if candidate {
+                                verify_candidate(&decompress_buf, tuples.len(), matching.len())?
+                            } else {
+                                None
+                            };
+                            Ok((matching, verified))
+                        })(
+                        );
                         if tx.send((seq, r)).is_err() {
                             break;
                         }
@@ -510,12 +525,14 @@ fn extract_simple_single_pass(
             drop(cls_rx);
             drop(ids_tx);
 
-            // Consumer: merge matching IDs into bbox_node_ids.
-            for (_seq, result) in ids_rx {
-                let matching_ids = result?;
+            // Consumer: merge matching IDs into bbox_node_ids, and record
+            // which candidates verified, by node-schedule position.
+            for (seq, result) in ids_rx {
+                let (matching_ids, verified) = result?;
                 for id in matching_ids {
                     bbox_node_ids.set(id);
                 }
+                verified_nodes[seq] = verified;
             }
             Ok(())
         })?;
@@ -523,7 +540,7 @@ fn extract_simple_single_pass(
     crate::debug::emit_marker("SIMPLE_NODE_CLASSIFY_END");
     // bbox_node_ids frozen. Write matching nodes via pread-from-workers.
     crate::debug::emit_marker("SIMPLE_NODE_WRITE_START");
-    let node_descs: Vec<BlobDesc> = node_schedule.iter().map(|d| **d).collect();
+    let node_descs = settle_passthrough_candidates(&node_schedule, &verified_nodes, host);
     {
         let ids = ExtractPass2IdSets {
             bbox_node_ids: &bbox_node_ids,
@@ -654,7 +671,7 @@ fn extract_simple_single_pass(
     let way_descs: Vec<BlobDesc> = way_schedule
         .iter()
         .map(|d| BlobDesc {
-            raw_passthrough: false,
+            passthrough: Passthrough::No,
             ..**d
         })
         .collect();
@@ -722,7 +739,7 @@ fn extract_simple_single_pass(
     let rel_descs: Vec<BlobDesc> = relation_schedule
         .iter()
         .map(|d| BlobDesc {
-            raw_passthrough: false,
+            passthrough: Passthrough::No,
             ..**d
         })
         .collect();
@@ -758,6 +775,56 @@ fn extract_simple_single_pass(
     writer.flush()?;
     crate::debug::emit_marker("EXTRACT_SCAN_END");
     Ok(stats)
+}
+
+/// Verify one passthrough candidate from its classify-phase decode: the
+/// observed node count when every scanned node landed in the region and the
+/// payload has the dense-only shape that makes the scan complete, else
+/// `None`. Occurrence counts, not set sizes: a duplicate id counts every
+/// time it would be copied.
+fn verify_candidate(
+    decompressed: &[u8],
+    scanned: usize,
+    matching: usize,
+) -> crate::error::Result<Option<u64>> {
+    if matching != scanned || !dense_only_payload(decompressed)? {
+        return Ok(None);
+    }
+    // What the decode path would do with this blob; a block it rejects must
+    // not reach the output through a raw copy instead.
+    PrimitiveBlock::from_vec(decompressed.to_vec())?;
+    Ok(Some(scanned as u64))
+}
+
+/// Turn each passthrough candidate into `Verified` (with the node count the
+/// classify phase observed) or back into `No`, by node-schedule position.
+fn settle_passthrough_candidates(
+    node_schedule: &[&BlobDesc],
+    verified_nodes: &[Option<u64>],
+    host: &crate::host::Host,
+) -> Vec<BlobDesc> {
+    let mut verified_blobs: u64 = 0;
+    let mut demoted_blobs: u64 = 0;
+    let descs = node_schedule
+        .iter()
+        .zip(verified_nodes)
+        .map(|(d, verified)| {
+            let passthrough = match (d.passthrough, *verified) {
+                (Passthrough::Candidate, Some(nodes)) => {
+                    verified_blobs += 1;
+                    Passthrough::Verified { nodes }
+                }
+                (Passthrough::Candidate, None) => {
+                    demoted_blobs += 1;
+                    Passthrough::No
+                }
+                (other, _) => other,
+            };
+            BlobDesc { passthrough, ..**d }
+        })
+        .collect();
+    warn_passthrough_demotions(verified_blobs, demoted_blobs, host);
+    descs
 }
 
 /// Process a batch of blocks in parallel for Pass 2 of complete-ways extraction.

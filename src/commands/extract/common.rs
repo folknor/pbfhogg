@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::cat::CleanAttrs;
+use crate::read::wire::{Cursor, WIRE_LEN};
 use crate::writer::PbfWriter;
 use crate::{BlobFilter, Element, MemberId, PrimitiveBlock};
 
@@ -39,6 +40,32 @@ pub(super) fn spatial_blob_filter(bbox_int: &BboxInt) -> BlobFilter {
 // Blob schedule
 // ---------------------------------------------------------------------------
 
+/// Whether a node blob may be copied to the output as a raw frame.
+///
+/// Raw passthrough skips the decode/re-encode of a blob whose every node is
+/// inside the region. The schedule builder can only nominate a blob, from
+/// its indexdata bbox - an unverified claim (`check --index` exists to check
+/// it). Nothing may be copied or counted on that claim alone: a lying bbox
+/// used to put out-of-region nodes in the output, and a lying `count` used
+/// to land in the "N in bbox" headline as if it had been observed.
+///
+/// So the classify phase, which decodes every node blob anyway, upgrades a
+/// [`Candidate`](Passthrough::Candidate) to [`Verified`](Passthrough::Verified)
+/// only after [`dense_only_payload`] has proved the payload holds nothing
+/// but DenseNodes and every one of them landed in the region. The count
+/// carried by `Verified` is the number of nodes that classify decoded, so
+/// the stats stay observation. Only `Verified` is passed through; a
+/// `Candidate` that was never verified is decoded like any other blob.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Passthrough {
+    /// Decode and filter.
+    No,
+    /// The indexdata bbox claims containment; not yet checked.
+    Candidate,
+    /// Checked against the decoded payload: copy raw, count `nodes`.
+    Verified { nodes: u64 },
+}
+
 /// Blob descriptor for pread schedule.
 #[derive(Clone, Copy)]
 pub(super) struct BlobDesc {
@@ -51,11 +78,106 @@ pub(super) struct BlobDesc {
     pub(super) kind: Option<crate::blob_meta::ElemKind>,
     /// Spatial bbox from indexdata (node blobs only, v2 format).
     pub(super) bbox: Option<crate::BlobBbox>,
-    /// Element count from indexdata (for stats on raw passthrough blobs).
-    pub(super) count: u64,
-    /// True if this blob can be passed through raw (no decode/re-encode).
-    /// Set by the schedule builder based on blob bbox containment.
-    pub(super) raw_passthrough: bool,
+    /// Raw-passthrough state. See [`Passthrough`].
+    pub(super) passthrough: Passthrough,
+}
+
+/// Decide whether a passthrough candidate's decompressed payload is
+/// structurally eligible to be copied raw.
+///
+/// Returns `Ok(true)` only when every `PrimitiveGroup` holds nothing but at
+/// most one DenseNodes message, and that message at most one DenseInfo -
+/// the shape `BlockBuilder` writes. Under that shape the dense scanners
+/// (`scan::node::extract_node_tuples`, `decode_dense_columns`) see every
+/// element the raw copy would carry, so comparing their in-region count to
+/// their total proves the whole blob is in the region. Anything else makes
+/// the blob ineligible (`Ok(false)`), not an error: plain `Node` messages
+/// (which the columnar classifier ignores), ways or relations in a blob
+/// whose indexdata says nodes, changesets and unknown group fields (which
+/// no element iterator reports), and a repeated DenseNodes or DenseInfo
+/// (only one of which every reader here looks at, while the raw bytes
+/// would carry both).
+///
+/// This is a structural walk only. Callers must also construct the payload
+/// as a [`PrimitiveBlock`] - what the decode path would do with it - and
+/// propagate a construction error, so a blob the decoder rejects cannot slip
+/// into the output through a raw copy. That is constructor validation only;
+/// decode-time arithmetic on metadata (timestamp deltas and the like) is not
+/// exercised by either.
+///
+/// A framing error in the walk itself is returned as an error, distinct
+/// from ineligibility.
+pub(super) fn dense_only_payload(decompressed: &[u8]) -> crate::error::Result<bool> {
+    let mut cursor = Cursor::new(decompressed);
+    while let Some((field, wire_type)) = cursor.read_tag()? {
+        if field == 2 && wire_type == WIRE_LEN {
+            if !dense_only_group(cursor.read_len_delimited()?)? {
+                return Ok(false);
+            }
+        } else {
+            // Block-level fields: stringtable, granularity, offsets.
+            cursor.skip_field(wire_type)?;
+        }
+    }
+    Ok(true)
+}
+
+/// One `PrimitiveGroup` of [`dense_only_payload`]: zero or one DenseNodes
+/// (field 2) and nothing else.
+fn dense_only_group(group: &[u8]) -> crate::error::Result<bool> {
+    let mut cursor = Cursor::new(group);
+    let mut dense_seen = false;
+    while let Some((field, wire_type)) = cursor.read_tag()? {
+        if field != 2 || wire_type != WIRE_LEN || dense_seen {
+            return Ok(false);
+        }
+        dense_seen = true;
+        if !single_dense_info(cursor.read_len_delimited()?)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// A DenseNodes message carries at most one DenseInfo (field 5).
+/// `WireDenseNodes::parse` keeps only the last occurrence, while a raw copy
+/// carries all of them and a merging protobuf reader would combine them.
+fn single_dense_info(dense: &[u8]) -> crate::error::Result<bool> {
+    let mut cursor = Cursor::new(dense);
+    let mut info_seen = false;
+    while let Some((field, wire_type)) = cursor.read_tag()? {
+        if field == 5 {
+            if info_seen {
+                return Ok(false);
+            }
+            info_seen = true;
+        }
+        cursor.skip_field(wire_type)?;
+    }
+    Ok(true)
+}
+
+/// Report the outcome of passthrough verification: counters always, and a
+/// warning when a candidate failed: either its indexdata bbox claimed a
+/// containment its own payload contradicts, or the payload has a shape no
+/// raw copy can be proved safe for (see [`dense_only_payload`]).
+pub(super) fn warn_passthrough_demotions(verified: u64, demoted: u64, host: &crate::host::Host) {
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("extract_passthrough_verified_blobs", verified as i64);
+        crate::debug::emit_counter("extract_passthrough_demoted_blobs", demoted as i64);
+    }
+    if demoted > 0 {
+        crate::host::diag!(
+            host.diagnostics,
+            Warning,
+            "extract.passthrough_demoted",
+            "Warning: {demoted} node blob(s) whose indexdata bbox lies inside the region \
+             hold out-of-region nodes or content other than DenseNodes, so they were \
+             filtered instead of copied raw. The input's indexdata may be wrong \
+             (`pbfhogg check --index` checks it)."
+        );
+    }
 }
 
 /// Build a blob schedule from a header-only scan.
@@ -83,7 +205,7 @@ pub(super) fn build_blob_schedule_with_passthrough(
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
 
     let mut schedule = Vec::new();
-    let mut passthrough_node_blobs: u64 = 0;
+    let mut passthrough_candidates: u64 = 0;
     while let Some(meta) = walker.next_header()? {
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
@@ -91,19 +213,17 @@ pub(super) fn build_blob_schedule_with_passthrough(
         let idx = meta.index.as_ref();
         let kind = idx.map(|i| i.kind);
 
-        // Tag node blobs for raw passthrough if fully contained in extract bbox.
-        let raw_passthrough = extract_bbox.is_some_and(|ebbox| {
+        // Nominate node blobs whose indexdata bbox claims containment in the
+        // extract bbox. Only a nomination: see `Passthrough`.
+        let candidate = extract_bbox.is_some_and(|ebbox| {
             idx.is_some_and(|i| {
                 matches!(i.kind, crate::blob_meta::ElemKind::Node)
                     && i.bbox.as_ref().is_some_and(|bb| ebbox.contains(bb))
             })
         });
-        if raw_passthrough {
-            passthrough_node_blobs += 1;
+        if candidate {
+            passthrough_candidates += 1;
         }
-
-        let bbox = idx.and_then(|i| i.bbox);
-        let count = idx.map_or(0, |i| i.count);
 
         schedule.push(BlobDesc {
             frame_offset: meta.frame_start,
@@ -111,9 +231,12 @@ pub(super) fn build_blob_schedule_with_passthrough(
             offset: meta.data_offset,
             size: meta.data_size,
             kind,
-            bbox,
-            count,
-            raw_passthrough,
+            bbox: idx.and_then(|i| i.bbox),
+            passthrough: if candidate {
+                Passthrough::Candidate
+            } else {
+                Passthrough::No
+            },
         });
     }
     crate::debug::emit_marker("EXTRACT_SCHEDULE_SCAN_END");
@@ -122,8 +245,8 @@ pub(super) fn build_blob_schedule_with_passthrough(
     {
         crate::debug::emit_counter("extract_schedule_blobs", schedule.len() as i64);
         crate::debug::emit_counter(
-            "extract_schedule_passthrough_node_blobs",
-            passthrough_node_blobs as i64,
+            "extract_passthrough_candidate_blobs",
+            passthrough_candidates as i64,
         );
     }
     Ok(schedule)
@@ -190,10 +313,14 @@ where
     // Split schedule: decode blobs go to workers, passthrough blobs handled by consumer.
     // Both are re-sequenced for the reorder buffer.
     let mut decode_items: Vec<(usize, u64, usize)> = Vec::new(); // (global_seq, data_offset, data_size)
-    let mut passthrough_items: Vec<(usize, u64, usize, u64)> = Vec::new(); // (global_seq, frame_offset, frame_size, count)
+    // (global_seq, frame_offset, frame_size, observed node count)
+    let mut passthrough_items: Vec<(usize, u64, usize, u64)> = Vec::new();
     for (i, d) in schedule.iter().enumerate() {
-        if d.raw_passthrough {
-            passthrough_items.push((i, d.frame_offset, d.frame_size, d.count));
+        // Only a verified blob is copied raw. An unverified `Candidate` is
+        // decoded: its indexdata claim alone is not grounds to skip the
+        // filter.
+        if let Passthrough::Verified { nodes } = d.passthrough {
+            passthrough_items.push((i, d.frame_offset, d.frame_size, nodes));
         } else {
             decode_items.push((i, d.offset, d.size));
         }
@@ -282,7 +409,8 @@ where
 
         enum ConsumerItem {
             Decoded(crate::error::Result<(Vec<OwnedBlock>, ExtractStats)>),
-            Passthrough(u64, usize, u64), // (frame_offset, frame_size, element_count)
+            // (frame_offset, frame_size, node count observed by classify)
+            Passthrough(u64, usize, u64),
         }
 
         let _total_blobs = schedule.len();
@@ -566,4 +694,125 @@ pub(super) fn relation_has_matched_member(
         MemberId::Way(id) => way_ids.get(id),
         MemberId::Relation(_) | MemberId::Unknown(_, _) => false,
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn node_block() -> Vec<u8> {
+        let mut bb = BlockBuilder::new();
+        for id in 1..=3 {
+            bb.add_node(id, 556_500_000, 125_000_000, std::iter::empty(), None);
+        }
+        bb.take().unwrap().unwrap().to_vec()
+    }
+
+    fn way_block() -> Vec<u8> {
+        let mut bb = BlockBuilder::new();
+        bb.add_way(10, std::iter::empty(), &[1, 2], None);
+        bb.take().unwrap().unwrap().to_vec()
+    }
+
+    /// The first field-2 group's content, and the first DenseNodes message
+    /// inside it (empty if the group has none).
+    fn first_group_and_dense(block: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let mut cursor = Cursor::new(block);
+        while let Some((field, wire_type)) = cursor.read_tag().unwrap() {
+            if field == 2 && wire_type == WIRE_LEN {
+                let group = cursor.read_len_delimited().unwrap();
+                let mut g = Cursor::new(group);
+                let mut dense = Vec::new();
+                while let Some((gf, gw)) = g.read_tag().unwrap() {
+                    if gf == 2 && gw == WIRE_LEN {
+                        dense = g.read_len_delimited().unwrap().to_vec();
+                        break;
+                    }
+                    g.skip_field(gw).unwrap();
+                }
+                return (group.to_vec(), dense);
+            }
+            cursor.skip_field(wire_type).unwrap();
+        }
+        panic!("block has no group");
+    }
+
+    /// Append one more `PrimitiveGroup` with the given content.
+    fn with_extra_group(block: &[u8], group: &[u8]) -> Vec<u8> {
+        let mut out = block.to_vec();
+        protohoggr::encode_bytes_field_always(&mut out, 2, group);
+        out
+    }
+
+    #[test]
+    fn a_builder_node_block_is_eligible() {
+        let block = node_block();
+        assert!(dense_only_payload(&block).unwrap());
+        PrimitiveBlock::from_vec(block).unwrap();
+    }
+
+    /// Ways in a blob whose indexdata says nodes are invisible to the dense
+    /// scanners, so the in-region count cannot cover them.
+    #[test]
+    fn a_way_group_makes_the_blob_ineligible() {
+        let (way_group, _) = first_group_and_dense(&way_block());
+        let mixed = with_extra_group(&node_block(), &way_group);
+        assert!(!dense_only_payload(&mixed).unwrap());
+    }
+
+    /// Every reader here takes the first DenseNodes of a group; a raw copy
+    /// would carry the second one unchecked.
+    #[test]
+    fn a_second_dense_message_in_one_group_makes_the_blob_ineligible() {
+        let (_, dense) = first_group_and_dense(&node_block());
+        let mut group = Vec::new();
+        protohoggr::encode_bytes_field_always(&mut group, 2, &dense);
+        protohoggr::encode_bytes_field_always(&mut group, 2, &dense);
+        assert!(!dense_only_payload(&with_extra_group(&node_block(), &group)).unwrap());
+
+        // One per group, in several groups, is the normal shape.
+        let mut single = Vec::new();
+        protohoggr::encode_bytes_field_always(&mut single, 2, &dense);
+        assert!(dense_only_payload(&with_extra_group(&node_block(), &single)).unwrap());
+    }
+
+    #[test]
+    fn a_repeated_dense_info_makes_the_blob_ineligible() {
+        let (_, dense) = first_group_and_dense(&node_block());
+        let mut once = dense.clone();
+        protohoggr::encode_bytes_field_always(&mut once, 5, &[]);
+        let mut twice = once.clone();
+        protohoggr::encode_bytes_field_always(&mut twice, 5, &[]);
+        for (dense, eligible) in [(once, true), (twice, false)] {
+            let mut group = Vec::new();
+            protohoggr::encode_bytes_field_always(&mut group, 2, &dense);
+            assert_eq!(
+                dense_only_payload(&with_extra_group(&node_block(), &group)).unwrap(),
+                eligible
+            );
+        }
+    }
+
+    /// Plain `Node` messages and changeset groups are not dense nodes.
+    #[test]
+    fn non_dense_group_fields_make_the_blob_ineligible() {
+        for field in [1_u32, 5, 9] {
+            let mut group = Vec::new();
+            protohoggr::encode_bytes_field_always(&mut group, field, &[]);
+            assert!(
+                !dense_only_payload(&with_extra_group(&node_block(), &group)).unwrap(),
+                "group field {field}"
+            );
+        }
+        // An empty group carries nothing and stays eligible.
+        assert!(dense_only_payload(&with_extra_group(&node_block(), &[])).unwrap());
+    }
+
+    #[test]
+    fn broken_framing_is_an_error_not_ineligibility() {
+        let mut block = node_block();
+        block.extend_from_slice(&[0x12, 0x7f]); // a group claiming 127 bytes
+        assert!(dense_only_payload(&block).is_err());
+    }
 }

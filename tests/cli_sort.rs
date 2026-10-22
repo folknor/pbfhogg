@@ -561,7 +561,14 @@ fn sort_cross_validate_osmium() {
     let osmium_out = dir.path().join("osmium_sorted.osm.pbf");
 
     write_unsorted_overlapping_pbf(&input);
-    run_sort(&input, &pbfhogg_out);
+    CliInvoker::new()
+        .timeout(std::time::Duration::from_secs(110))
+        .arg("sort")
+        .arg(&input)
+        .arg("-o")
+        .arg(&pbfhogg_out)
+        .arg("--force")
+        .assert_success();
 
     let status = std::process::Command::new("osmium")
         .args(["sort", input.to_str().expect("path"), "-o"])

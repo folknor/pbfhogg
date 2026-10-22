@@ -226,15 +226,7 @@ pub(super) fn write_admin_data(dir: &Path, polygons: &[AssembledPolygon]) -> Res
     // separate closed exterior/hole rings; serialization preserves them verbatim.
     // No extra vertex validation pass is needed for these producer-owned values.
     for p in polygons {
-        let vertex_count =
-            u32::try_from(p.vertices.len()).map_err(|_| -> Box<dyn std::error::Error> {
-                format!(
-                    "write_admin_data: polygon has {} vertices, exceeds u32::MAX. \
-                 Widen AdminPolygon.vertex_count to u64 and increment FORMAT_VERSION.",
-                    p.vertices.len()
-                )
-                .into()
-            })?;
+        let vertex_count = super::checked_count(p.vertices.len(), "admin polygon vertex")?;
         let rec = AdminPolygon {
             area: p.area,
             vertex_offset: offset,
@@ -273,7 +265,6 @@ pub(super) fn write_admin_data(dir: &Path, polygons: &[AssembledPolygon]) -> Res
     Ok(())
 }
 
-#[allow(clippy::cast_possible_truncation)]
 #[hotpath::measure]
 pub(super) fn write_admin_index(
     dir: &Path,
@@ -356,7 +347,7 @@ pub(super) fn write_admin_index(
     }
     cells_out.flush()?;
     entries_out.flush()?;
-    Ok(cell_ids.len() as u32)
+    super::checked_count(cell_ids.len(), "admin cells")
 }
 
 #[cfg(test)]

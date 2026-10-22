@@ -40,6 +40,7 @@ pub(super) type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 // ---------------------------------------------------------------------------
 
 /// Configuration for the geocode index builder.
+#[derive(Clone)]
 pub struct BuildConfig {
     pub input_path: PathBuf,
     pub output_dir: PathBuf,
@@ -144,6 +145,114 @@ pub struct BuildStats {
 #[hotpath::measure]
 pub fn build_geocode_index(config: &BuildConfig, host: &crate::host::Host) -> Result<BuildStats> {
     config.validate()?;
+    let destination = &config.output_dir;
+    // Publication renames the directory itself, which `.`, `..` or a root
+    // cannot be (and `.` would hold its own staging directory). Refuse here,
+    // not after a full build has been spent on an unpublishable generation.
+    if destination.file_name().is_none() {
+        return Err(format!(
+            "output directory {} must name a directory, not '.', '..' or a root, \
+             because publication renames it",
+            destination.display()
+        )
+        .into());
+    }
+    let has_index = destination.join(FILE_HEADER).exists();
+    if has_index && !config.force {
+        return Err(format!(
+            "output directory {} already contains a geocode index. \
+             Use --force to replace it.",
+            destination.display()
+        )
+        .into());
+    }
+    // Publication replaces the whole directory, so anything that is not an
+    // index (or empty) would be deleted with it. `--force` replaces an index,
+    // never an arbitrary directory, so this refusal holds under it too.
+    if !has_index && destination.exists() {
+        let replaceable = destination.is_dir() && std::fs::read_dir(destination)?.next().is_none();
+        if !replaceable {
+            return Err(format!(
+                "output path {} exists and is not a geocode index directory; \
+                 publication would replace it wholesale. Choose a new or empty directory.",
+                destination.display()
+            )
+            .into());
+        }
+    }
+    // Build on separate inodes. Renaming a completed generation never truncates
+    // the files mapped by an already-open Reader, including on failed builds.
+    let staging = StagedIndex::new(destination)?;
+    let mut staged_config = config.clone();
+    staged_config.output_dir = staging.path.join("new");
+    let stats = build_generation(&staged_config, host)?;
+    staging.publish(destination)?;
+    Ok(stats)
+}
+
+struct StagedIndex {
+    path: PathBuf,
+}
+
+impl StagedIndex {
+    fn new(destination: &std::path::Path) -> Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = destination
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        loop {
+            let path = parent.join(format!(
+                ".geocode-build-{}",
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    fn publish(&self, destination: &std::path::Path) -> Result<()> {
+        let backup = self.path.join("old");
+        let had_old = match std::fs::rename(destination, &backup) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.into()),
+        };
+        // There is a short pathname gap between these two renames. Callers
+        // must serialize publication with Reader::open and other builders;
+        // queries on already-open readers need no such coordination.
+        if let Err(e) = std::fs::rename(self.path.join("new"), destination) {
+            if had_old && let Err(restore) = std::fs::rename(&backup, destination) {
+                // Preserve the only old generation if rollback itself fails.
+                return Err(format!(
+                    "publish failed: {e}; restore failed: {restore}; old index retained at {}",
+                    backup.display()
+                )
+                .into());
+            }
+            return Err(e.into());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StagedIndex {
+    fn drop(&mut self) {
+        // A failed rollback leaves the backup here for manual recovery.
+        if !self.path.join("old").exists() || !self.path.join("new").exists() {
+            drop(std::fs::remove_dir_all(&self.path));
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<BuildStats> {
+    config.validate()?;
     // Pass 2a pread worker pool: PrimitiveBlock Vec<u8>s allocated on
     // decode workers and freed on the main-thread merge path. Uncapped,
     // arenas grow to 25+ GB anon RSS at planet scale (documented
@@ -152,16 +261,6 @@ pub fn build_geocode_index(config: &BuildConfig, host: &crate::host::Host) -> Re
 
     let start_time = std::time::Instant::now();
 
-    // Guard against silently overwriting an existing index
-    let header_path = config.output_dir.join(FILE_HEADER);
-    if header_path.exists() && !config.force {
-        return Err(format!(
-            "output directory {} already contains a geocode index. \
-             Use --force to overwrite.",
-            config.output_dir.display()
-        )
-        .into());
-    }
     std::fs::create_dir_all(&config.output_dir)?;
 
     // Validate input
@@ -177,10 +276,14 @@ pub fn build_geocode_index(config: &BuildConfig, host: &crate::host::Host) -> Re
     // Read PBF header
     let reader = ElementReader::open_in(&config.input_path, config.direct_io, host)?;
     let pbf_header = reader.header();
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    let repl_seq = pbf_header
-        .osmosis_replication_sequence_number()
-        .unwrap_or(0) as u32;
+    let repl_seq = u32::try_from(
+        pbf_header
+            .osmosis_replication_sequence_number()
+            .unwrap_or(0),
+    )
+    .map_err(
+        |_| "replication sequence exceeds the geocode header u32 range; bump FORMAT_VERSION",
+    )?;
     #[allow(clippy::cast_sign_loss)]
     let repl_ts = pbf_header.osmosis_replication_timestamp().unwrap_or(0) as u64;
     drop(reader);
@@ -274,32 +377,6 @@ pub fn build_geocode_index(config: &BuildConfig, host: &crate::host::Host) -> Re
     #[cfg(feature = "hotpath")]
     let pass2_start = std::time::Instant::now();
 
-    // Invalidate the index we are about to overwrite.
-    //
-    // A geocode index is a directory of 19 files, not a single file, so the
-    // scratch-and-rename that `DestinationGuard` gives single-file commands
-    // does not transplant: atomically replacing a non-empty directory needs a
-    // directory-transaction mechanism we do not have. Invalidation is the
-    // honest substitute - remove the header first, so a build that dies
-    // partway leaves a directory that fails to open rather than one that opens
-    // and answers with a mixture of two vintages.
-    //
-    // It happens HERE, and not next to the `--force` check at the top,
-    // because everything above this point is read-only input validation:
-    // config, indexdata, the PBF header, Pass 1 and Pass 1.5. A typo in the
-    // input path, a missing file or a malformed PBF must leave the existing
-    // index exactly as it was. Pass 2 is the first thing that writes into the
-    // output directory, so this is the last moment at which failing is free.
-    if config.force {
-        match std::fs::remove_file(&header_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(format!("failed to invalidate existing geocode index: {e}").into());
-            }
-        }
-    }
-
     crate::debug::emit_marker("GEOCODE_PASS2_SCAN_START");
     let pass2::Pass2Output {
         addr_point_count,
@@ -368,6 +445,8 @@ pub fn build_geocode_index(config: &BuildConfig, host: &crate::host::Host) -> Re
     // Interpolation endpoint resolution (reads from mmap'd addr_points.bin)
     // -----------------------------------------------------------------------
     crate::debug::emit_marker("GEOCODE_PASS2_INTERP_RESOLVE_START");
+    strings.validate()?;
+    checked_count(interp_ways.len(), "interpolation ways")?;
     let resolved = interp::resolve_interpolation_endpoints_mmap(
         &mut interp_ways,
         &addr_points_mmap,
@@ -406,6 +485,13 @@ pub fn build_geocode_index(config: &BuildConfig, host: &crate::host::Host) -> Re
     }
 
     // Write admin + strings data files
+    let polygon_count = checked_count(admin_polygons.len(), "admin polygons")?;
+    if polygon_count > INTERIOR_FLAG {
+        return Err(
+            "admin polygon count exceeds the format interior-flag limit; bump FORMAT_VERSION"
+                .into(),
+        );
+    }
     admin::write_admin_data(&config.output_dir, &admin_polygons)?;
     std::fs::write(config.output_dir.join(FILE_STRINGS), &strings.data)?;
     crate::debug::emit_marker("GEOCODE_PASS2_WRITE_END");
@@ -479,7 +565,6 @@ pub fn build_geocode_index(config: &BuildConfig, host: &crate::host::Host) -> Re
     );
 
     // Write header
-    #[allow(clippy::cast_possible_truncation)]
     let header = Header {
         format_version: FORMAT_VERSION,
         street_cell_level: config.street_level,
@@ -492,8 +577,8 @@ pub fn build_geocode_index(config: &BuildConfig, host: &crate::host::Host) -> Re
         replication_timestamp: repl_ts,
         addr_point_count,
         street_way_count,
-        interp_way_count: interp_way_count as u32,
-        admin_polygon_count: admin_polygons.len() as u32,
+        interp_way_count: checked_count(interp_way_count, "interpolation ways")?,
+        admin_polygon_count: checked_count(admin_polygons.len(), "admin polygons")?,
         geo_cell_count: fine_count,
         coarse_cell_count: coarse_count,
         admin_cell_count: admin_count,
@@ -612,9 +697,25 @@ pub fn build_geocode_index(config: &BuildConfig, host: &crate::host::Host) -> Re
     })
 }
 
+fn checked_count(count: usize, kind: &str) -> Result<u32> {
+    u32::try_from(count).map_err(|_| {
+        format!("{kind} count exceeds u32::MAX; widen the on-disk count and bump FORMAT_VERSION")
+            .into()
+    })
+}
+
 #[cfg(test)]
 mod config_tests {
     use super::BuildConfig;
+
+    #[test]
+    fn count_limit_rejects_the_first_unrepresentable_record_count() {
+        assert_eq!(
+            super::checked_count(u32::MAX as usize, "test").expect("limit"),
+            u32::MAX
+        );
+        assert!(super::checked_count(u32::MAX as usize + 1, "test").is_err());
+    }
 
     #[test]
     #[allow(clippy::field_reassign_with_default)]

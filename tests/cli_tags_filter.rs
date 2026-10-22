@@ -79,6 +79,51 @@ fn run_filter(input: &Path, output: &Path, expressions: &[&str], omit_referenced
     )
 }
 
+/// Repack takes BlockBuilder's precomputed tagdata path. An empty key in a
+/// key-list expression must keep the blob eligible for decoding. One element
+/// per blob puts the empty-key node in a blob of its own: sharing a blob with
+/// the highway node would keep that blob eligible whatever its tag index said.
+#[test]
+fn repacked_empty_key_is_not_skipped_by_tag_filter() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let repacked = dir.path().join("repacked.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    let nodes = [
+        TestNode {
+            id: 1,
+            lat: 0,
+            lon: 0,
+            tags: vec![("", "blank-key")],
+            meta: None,
+        },
+        TestNode {
+            id: 2,
+            lat: 0,
+            lon: 0,
+            tags: vec![("highway", "residential")],
+            meta: None,
+        },
+    ];
+    crate::common::write_indexed_pbf(&input, &nodes, &[], &[]);
+
+    CliInvoker::new()
+        .arg("repack")
+        .arg(&input)
+        .arg("-o")
+        .arg(&repacked)
+        .arg("--elements-per-blob")
+        .arg("1")
+        .assert_success();
+    run_filter(&repacked, &output, &[",highway"], true);
+
+    assert_eq!(
+        node_ids(&read_all_elements(&output)),
+        vec![1, 2],
+        "the empty-key and highway alternatives must both match after repack"
+    );
+}
+
 /// Blob-level tag-index skipping is a trust boundary: nothing validates that a
 /// blob's `tagdata` describes its payload, so a file whose index lies makes
 /// `tags-filter` skip blobs whose elements match and emit a short answer

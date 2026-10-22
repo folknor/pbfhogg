@@ -315,6 +315,10 @@ comparison instead (`src/commands/diff/shard.rs`).
   matching abs-fold absence on the pbfhogg side) is the residual
   divergence below.
 
+`inspect --show` accepts signed query IDs. It is a read-only lookup into the
+PBF payload, not an ID set passed through `IdSet`; the shared typed-ID parser
+preserves the sign and `getid` applies its own rejection afterward.
+
 **Residual divergence (tags-filter, add-locations-to-ways):**
 The shared root is `IdSet::set` in `src/idset.rs`, a silent
 no-op on negative ids, where osmium's equivalent paths abs-fold via
@@ -382,6 +386,24 @@ it is ecosystem-wide.
 IDs before running pbfhogg commands that touch the invariant sites.
 This affects only hand-edited files that haven't been uploaded.
 
+## getid and getparents: bare numeric IDs require an explicit type
+
+osmium's `getid` and `getparents` default bare numeric IDs to nodes. In
+pbfhogg, `--default-type` is optional and has no implicit value: a bare number
+in command arguments or an ID text file is rejected unless the caller selects
+node, way or relation explicitly. This is deliberate. A bare number carries
+no element kind, and silently assigning it to node can select a different
+object than the caller intended. The same parser serves both commands.
+`parse_id_spec_inner` in `src/commands/getid/mod.rs` owns this rule; the CLI
+leaves `default_type` unset unless the user supplies `--default-type`.
+
+pbfhogg also accepts named typed forms such as `node/123`, `way/456` and
+`relation/789`, alongside osmium's compact `n123`, `w456` and `r789` forms.
+This is an additive spelling accepted by both commands and their text ID files.
+
+This does not affect IDs collected from `--id-osm-file`, where each element's
+kind is present in the PBF. The CLI reference documents the opt-in behavior.
+
 ## cat: multi-input header is reconciled, not blanked
 
 `osmium cat` writes a default-constructed `osmium::io::Header` whenever it is
@@ -415,7 +437,7 @@ which was worse than either: the cat paths built the output header from the
 first input alone, so the output advertised one input's bounding box over
 data drawn from all of them.
 
-## tags-filter: expression-syntax edge cases
+## tags-filter and inspect tags: expression-syntax edge cases
 
 The matcher is built to match `osmium-tool/src/util.cpp::get_string_matcher`
 and `get_tag_matcher` rule for rule, including the order in which the `!`
@@ -423,6 +445,16 @@ inversion marker is tested relative to whitespace stripping - the marker counts
 only when it is the last character of the raw key, so `highway !=x` inverts
 while `highway ! = x` means the literal key `highway !`. The edges below
 deviate deliberately.
+
+`inspect tags` and `tags-count` deliberately reuse the full tags-filter
+expression parser, including its `n/`, `w/` and `r/` element-type prefixes.
+Thus `w/highway` counts only `highway` tags on ways, subject to any additional
+`--type` filter. Osmium's `tags-count` `add_matcher` sends the entire expression
+to its tag matcher and has no type-prefix syntax; there, `w/highway` is treated
+as a tag-key pattern. Use `--type way` for the equivalent kind restriction in
+osmium. The pbfhogg parser is shared from `src/tag_expr.rs` by
+`src/commands/tags_count/mod.rs`; the behavior is described in the CLI
+reference.
 
 **An empty key is an error, not an empty-string match.** `get_string_matcher`
 returns `equal{""}` for an empty key, so osmium accepts `=value` and matches

@@ -82,6 +82,9 @@ pub fn tags_count(
         host,
     )?;
 
+    // Deliberately reuse tags-filter's expression grammar, including its
+    // n/w/r type prefixes. osmium tags-count treats these strings as tag
+    // matchers only, so `w/highway` has different meaning between the tools.
     let expressions = if opts.expressions.is_empty() {
         None
     } else {

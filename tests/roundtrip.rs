@@ -604,7 +604,7 @@ fn roundtrip_direct_io() {
     );
     let mut writer = match write_result {
         Ok(w) => w,
-        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+        Err(e) if crate::common::is_einval(&e) => {
             eprintln!("O_DIRECT not supported on this filesystem, skipping test");
             return;
         }
@@ -698,7 +698,7 @@ fn roundtrip_pipelined_direct_io() {
     );
     let mut writer = match write_result {
         Ok(w) => w,
-        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+        Err(e) if crate::common::is_einval(&e) => {
             eprintln!("O_DIRECT not supported on this filesystem, skipping test");
             return;
         }
@@ -759,24 +759,6 @@ fn roundtrip_pipelined_direct_io() {
     }
 }
 
-/// Distinguish "io_uring unavailable on this host" from real writer bugs.
-#[cfg(feature = "linux-io-uring")]
-fn is_uring_init_unavailable(err: &std::io::Error) -> bool {
-    let os = err.raw_os_error();
-    let kind = err.kind();
-    let msg = err.to_string();
-    matches!(kind, std::io::ErrorKind::Unsupported)
-        || os == Some(libc::ENOSYS)
-        || os == Some(libc::EPERM)
-        || os == Some(libc::ENOMEM)
-        || msg.contains("RLIMIT_MEMLOCK")
-        || msg.contains("kernel does not support")
-        // `io_uring_setup` denied by a seccomp sandbox: the writer wraps
-        // the EPERM in a new error, so the raw os error is gone and only
-        // the message survives.
-        || msg.contains("io_uring creation failed")
-}
-
 /// Write a tiny PBF (single node) via io_uring, read back, verify content.
 /// The file will be well under one PAGE_SIZE, so this exercises the
 /// `flush_final` padding + `set_len` truncation code path.
@@ -794,7 +776,7 @@ fn roundtrip_uring_tiny_output() {
         pbfhogg::host::Executor::Ambient,
     ) {
         Ok(w) => w,
-        Err(e) if is_uring_init_unavailable(&e) => {
+        Err(e) if crate::common::is_uring_unavailable(&e) => {
             eprintln!("io_uring not available, skipping: {e}");
             return;
         }
@@ -863,7 +845,7 @@ fn roundtrip_uring_small_size_sweep() {
             pbfhogg::host::Executor::Ambient,
         ) {
             Ok(w) => w,
-            Err(e) if is_uring_init_unavailable(&e) => {
+            Err(e) if crate::common::is_uring_unavailable(&e) => {
                 eprintln!("io_uring not available, skipping: {e}");
                 return;
             }

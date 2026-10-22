@@ -132,6 +132,7 @@ struct ApplyOpts {
     jobs: Option<usize>,
     direct_io: bool,
     io_uring: bool,
+    timeout: Option<std::time::Duration>,
 }
 
 fn run_apply_changes(base: &Path, osc: &Path, output: &Path, opts: ApplyOpts) -> CliOutput {
@@ -141,6 +142,9 @@ fn run_apply_changes(base: &Path, osc: &Path, output: &Path, opts: ApplyOpts) ->
         .arg(osc)
         .arg("-o")
         .arg(output);
+    if let Some(timeout) = opts.timeout {
+        cli = cli.timeout(timeout);
+    }
     if opts.locations_on_ways {
         cli = cli.arg("--locations-on-ways");
     }
@@ -2524,8 +2528,20 @@ fn merge_cross_validate_osmium() {
     let diff = pbfhogg::osc::parse_osc_file(&osc).expect("parse osc");
 
     eprintln!("Running pbfhogg apply-changes...");
-    let out = run_apply_ok(&base_pbf, &osc, &pbfhogg_out);
-    drop(out);
+    let out = run_apply_changes(
+        &base_pbf,
+        &osc,
+        &pbfhogg_out,
+        ApplyOpts {
+            timeout: Some(std::time::Duration::from_secs(110)),
+            ..ApplyOpts::default()
+        },
+    );
+    assert!(
+        out.status.success(),
+        "apply-changes failed: {}",
+        out.stderr_str()
+    );
 
     eprintln!("Running osmium apply-changes...");
     let osmium_result = std::process::Command::new("osmium")

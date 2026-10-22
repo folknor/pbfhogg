@@ -188,6 +188,9 @@ Anger: 8 - element kinds, expression semantics.
 - Two enums named `ElemKind`: `crate::blob_meta::ElemKind` (apply-changes,
   merge_join) and `crate::osc::xml_parse::ElemKind` (merge-changes, tags-filter
   OSC), same variants, not convertible.
+- `getid::ElemKindTag` (public), now also the kind of the shared
+  `getid::ElementRef`, whose `FromStr` accepts both `n123` and `node/123`
+  forms and is a ready seed for the single `ElementKind` `FromStr`.
 - `time_filter::ElementKind` (private), and `TypeFilter` used as an element
   kind in export.
 - CLI enums `ShowElementType`, `DefaultType`, `DefaultTypeArg`,
@@ -1512,19 +1515,6 @@ clap-parsed empty-args config.
 
 Reported by: geocode index, CLI and plumbing, altw and scanning.
 
-## HYG-066 - Two element-ID spec parsers for one syntax, already diverged
-
-Anger: 7 - CLI behaviour.
-
-`inspect --show` parses `n123` and `node/123` via `parse_element_spec` in
-`cli/src/main.rs`; `getid` and `getparents` parse via
-`getid::parse_id_spec_inner`. `node/123` works for `--show` and is rejected by
-getid; negative IDs are rejected by getid (ADR-0002) and accepted by `--show`.
-Fix: one `ElementRef` `FromStr` in the library beside `TypeFilter`, used by
-both through a clap `value_parser`.
-
-Reported by: CLI and plumbing.
-
 ## HYG-067 - The negative-answer exit travels as an error
 
 Anger: 7 - CLI behaviour.
@@ -1832,27 +1822,15 @@ key) and a counter.
 Reported by: re-encoding, filtering and spatial, read path, write path, change
 application.
 
-## HYG-093 - `PipelineConfig` clamping lives in the builder, not the type
-
-Anger: 5 - API.
-
-`ElementReader`'s `read_ahead` / `decode_ahead` setters clamp `n.max(1)`, and
-`AdmissionGate::new` clamps again with `cap.max(1)`. `sync_channel(0)` is a
-rendezvous channel, not an error, so a `PipelineConfig` built another way
-(crate-internal callers construct it directly) gets different semantics. Use
-`NonZeroUsize` fields.
-
-Reported by: read path.
-
-## HYG-094 - io_uring setup treats a failed probe as support and gives memlock advice that may be wrong
+## HYG-094 - io_uring setup treats a failed probe as support
 
 Anger: 7 - CLI behaviour.
 
 `uring_init_and_run` refuses only when the probe succeeds and says WriteFixed
-is unsupported; a failed `register_probe` proceeds. The `RLIMIT_MEMLOCK` advice
-printed for ENOMEM / EPERM can be wrong on kernels 5.12+, where registered
-buffers are charged to the memcg rather than memlock, which is exactly the
-hosts in use. 16 MB locked memory is assumed.
+is unsupported; a failed `register_probe` proceeds. The `RLIMIT_MEMLOCK`
+advice for a `register_buffers` failure is now given only when `getrlimit`
+shows the soft limit below the pool size; the pool size itself (16 MB of
+locked memory) is still assumed.
 
 Reported by: write path.
 
@@ -2092,7 +2070,8 @@ in `altw/mod.rs`; `<1 GB at every stage` and `~256 GB` in
 the planet on a 32 GB machine. The guides and CLI help call `auto`
 "recommended" while the default is `sparse`: whether that is intended needs
 the user's answer. `docs/.vitepress/dist/` is generated and still says 19
-files.
+files. The geocode builder's comment on planet-scale limits contradicts the
+planet builds on record in `reference/performance.md`.
 
 Reported by: altw and scanning, geocode index, CLI and plumbing, test harness.
 

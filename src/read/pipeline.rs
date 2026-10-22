@@ -11,6 +11,7 @@ use crate::error::Result;
 use crate::reorder_buffer::ReorderBuffer;
 use std::cell::RefCell;
 use std::io::Read;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -57,22 +58,22 @@ pub(crate) const DEFAULT_DECODE_AHEAD: usize = 32;
 struct AdmissionGate {
     count: Mutex<usize>,
     cond: Condvar,
-    cap: usize,
+    cap: NonZeroUsize,
 }
 
 impl AdmissionGate {
-    fn new(cap: usize) -> Self {
+    fn new(cap: NonZeroUsize) -> Self {
         Self {
             count: Mutex::new(0),
             cond: Condvar::new(),
-            cap: cap.max(1),
+            cap,
         }
     }
 
     fn acquire(&self) -> bool {
         let mut count = self.count.lock().unwrap_or_else(PoisonError::into_inner);
         let mut blocked = false;
-        while *count >= self.cap {
+        while *count >= self.cap.get() {
             blocked = true;
             count = self
                 .cond
@@ -278,17 +279,34 @@ pub(crate) mod test_hooks {
 }
 
 /// Runtime-tunable pipeline buffering configuration.
+///
+/// Depths stay nonzero because `sync_channel(0)` is a rendezvous channel, not
+/// an empty buffer.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PipelineConfig {
-    pub(crate) read_ahead: usize,
-    pub(crate) decode_ahead: usize,
+    read_ahead: NonZeroUsize,
+    decode_ahead: NonZeroUsize,
+}
+
+impl PipelineConfig {
+    fn depth(value: usize) -> NonZeroUsize {
+        NonZeroUsize::new(value).unwrap_or(NonZeroUsize::MIN)
+    }
+
+    pub(crate) fn set_read_ahead(&mut self, value: usize) {
+        self.read_ahead = Self::depth(value);
+    }
+
+    pub(crate) fn set_decode_ahead(&mut self, value: usize) {
+        self.decode_ahead = Self::depth(value);
+    }
 }
 
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
-            read_ahead: DEFAULT_READ_AHEAD,
-            decode_ahead: DEFAULT_DECODE_AHEAD,
+            read_ahead: Self::depth(DEFAULT_READ_AHEAD),
+            decode_ahead: Self::depth(DEFAULT_DECODE_AHEAD),
         }
     }
 }
@@ -477,8 +495,8 @@ where
     blob_reader.set_parse_tagdata(has_tag_filter);
     blob_reader.set_parse_indexdata(blob_filter.is_some());
     let blob_filter = blob_filter.map(Arc::new);
-    let (raw_tx, raw_rx) = sync_channel::<RawItem>(pipeline_config.read_ahead);
-    let (decoded_tx, decoded_rx) = sync_channel::<DecodedItem>(pipeline_config.decode_ahead);
+    let (raw_tx, raw_rx) = sync_channel::<RawItem>(pipeline_config.read_ahead.get());
+    let (decoded_tx, decoded_rx) = sync_channel::<DecodedItem>(pipeline_config.decode_ahead.get());
 
     std::thread::scope(|scope| {
         // Stage 1: Sequential I/O reader thread
@@ -599,7 +617,11 @@ where
         // Drop the original so the channel closes when all rayon task clones are done
         drop(decoded_tx);
 
-        let result = drain_decoded(decoded_rx, pipeline_config.decode_ahead, &mut block_fn);
+        let result = drain_decoded(
+            decoded_rx,
+            pipeline_config.decode_ahead.get(),
+            &mut block_fn,
+        );
 
         // Emit reader-pipeline counters before returning so that even
         // an error path produces sidecar data. Mirrors the writer's
@@ -636,10 +658,11 @@ where
     blob_reader.set_parse_tagdata(has_tag_filter);
     blob_reader.set_parse_indexdata(blob_filter.is_some());
     let blob_filter = blob_filter.map(Arc::new);
-    let (raw_tx, raw_rx) = sync_channel::<RawItem>(pipeline_config.read_ahead);
+    let (raw_tx, raw_rx) = sync_channel::<RawItem>(pipeline_config.read_ahead.get());
     type FusedPayload<T> = Option<crate::error::Result<T>>;
-    let (decoded_tx, decoded_rx) =
-        sync_channel::<(usize, FusedPayload<T>, Option<Permit>)>(pipeline_config.decode_ahead);
+    let (decoded_tx, decoded_rx) = sync_channel::<(usize, FusedPayload<T>, Option<Permit>)>(
+        pipeline_config.decode_ahead.get(),
+    );
 
     std::thread::scope(|scope| {
         scope.spawn(move || {
@@ -775,7 +798,7 @@ where
             });
         });
         drop(decoded_tx);
-        let result = drain_fused(decoded_rx, pipeline_config.decode_ahead, &mut consume);
+        let result = drain_fused(decoded_rx, pipeline_config.decode_ahead.get(), &mut consume);
         PIPELINE_METRICS.emit();
         result
     })
@@ -1089,7 +1112,7 @@ mod tests {
 
     #[test]
     fn gate_blocks_at_cap_and_release_unblocks() {
-        let gate = Arc::new(AdmissionGate::new(2));
+        let gate = Arc::new(AdmissionGate::new(NonZeroUsize::new(2).unwrap()));
         assert!(!gate.acquire());
         assert!(!gate.acquire());
 
@@ -1116,8 +1139,18 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_config_keeps_zero_depths_at_one() {
+        let mut config = PipelineConfig::default();
+        config.set_read_ahead(0);
+        config.set_decode_ahead(0);
+
+        assert_eq!(config.read_ahead.get(), 1);
+        assert_eq!(config.decode_ahead.get(), 1);
+    }
+
+    #[test]
     fn permit_drop_releases() {
-        let gate = Arc::new(AdmissionGate::new(1));
+        let gate = Arc::new(AdmissionGate::new(NonZeroUsize::new(1).unwrap()));
         {
             assert!(!gate.acquire());
             let _permit = Permit(Arc::clone(&gate));

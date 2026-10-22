@@ -62,9 +62,11 @@ impl FileReader {
     /// Open a file for O_DIRECT reading with page-aligned buffers.
     #[cfg(feature = "linux-direct-io")]
     pub fn direct(path: &Path) -> io::Result<Self> {
-        Ok(Self::Direct(
-            DirectReader::open(path).map_err(|e| open_error(path, &e))?,
-        ))
+        // `open_error` rebuilds the error from its message, so name the path
+        // on the carried source and keep a platform refusal typed.
+        Ok(Self::Direct(DirectReader::open(path).map_err(|e| {
+            crate::error::map_io_preserving_platform(e, |e| open_error(path, &e))
+        })?))
     }
 
     /// Open a file, selecting buffered or O_DIRECT based on the `direct` flag.

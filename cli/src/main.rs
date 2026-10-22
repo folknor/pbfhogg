@@ -8,6 +8,7 @@ use std::process;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use pbfhogg::altw::IndexType;
 use pbfhogg::cat::CleanAttrs;
+use pbfhogg::getid::{ElemKindTag, ElementRef};
 use pbfhogg::tags_count::TagCountSort;
 use pbfhogg::writer::Compression;
 use pbfhogg::{HeaderOverrides, TypeFilter};
@@ -31,6 +32,10 @@ static ALLOC: hotpath::CountingAllocator = hotpath::CountingAllocator::new();
 ///
 /// `2` also matches what clap already returns for a usage error, so the
 /// "the invocation did not work" band is contiguous.
+///
+/// `3` splits one cause out of that band: the host cannot provide a
+/// requested I/O feature (`--direct-io`, `--io-uring`) at setup. Retrying
+/// without the flag is the fix, which no other failure promises.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExitStatus {
     /// `1` - the command ran to completion and its answer is negative:
@@ -38,8 +43,12 @@ enum ExitStatus {
     /// `inspect --indexed` found no index, `inspect --show` found no
     /// element. Not an error; nothing is printed to stderr for it.
     AnswerNegative,
-    /// `2` - the command failed. Every error path lands here.
+    /// `2` - the command failed. Every error path but one lands here.
     Failed,
+    /// `3` - the command failed because a requested platform I/O feature
+    /// is unavailable at setup (`ErrorKind::PlatformUnsupported`). The
+    /// error, naming the feature, goes to stderr as for `2`.
+    PlatformUnsupported,
 }
 
 impl ExitStatus {
@@ -47,8 +56,31 @@ impl ExitStatus {
         match self {
             Self::AnswerNegative => 1,
             Self::Failed => 2,
+            Self::PlatformUnsupported => 3,
         }
     }
+}
+
+/// Whether `err` is, or wraps, a platform setup refusal. Walks
+/// `source()` chains and looks inside `io::Error` carriers, whose
+/// `source()` skips the wrapped error itself - the writers carry the typed
+/// refusal inside an `io::Error` to keep their `io::Result` signatures.
+fn is_platform_unsupported(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(error) = current {
+        if let Some(error) = error.downcast_ref::<pbfhogg::Error>()
+            && matches!(error.kind(), pbfhogg::ErrorKind::PlatformUnsupported { .. })
+        {
+            return true;
+        }
+        current = match error.downcast_ref::<std::io::Error>() {
+            Some(io) => io
+                .get_ref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static)),
+            None => error.source(),
+        };
+    }
+    false
 }
 
 /// Non-fatal exit code carrier. Subcommands that need to signal a
@@ -653,16 +685,16 @@ enum Command {
         /// Print requested IDs and report which were not found
         #[arg(long, conflicts_with = "invert")]
         verbose_ids: bool,
-        /// Read IDs from text file (one per line, e.g. n123)
+        /// Read IDs from text file (one per line, e.g. n123 or node/123)
         #[arg(short = 'i', long = "id-file")]
         id_file: Option<PathBuf>,
         /// Read IDs from an OSM/PBF file (all element IDs are collected)
         #[arg(short = 'I', long = "id-osm-file")]
         id_osm_file: Option<PathBuf>,
-        /// Default type for bare numeric IDs: node, way, relation
+        /// Type for bare numeric IDs. Without this, each ID must name its type.
         #[arg(long = "default-type", value_enum)]
         default_type: Option<DefaultTypeArg>,
-        /// Element IDs (e.g. n123 w456 r789)
+        /// Element IDs (e.g. n123 w456 r789, or node/123 way/456 relation/789)
         ids: Vec<String>,
         #[command(flatten)]
         compression: CompressionArg,
@@ -693,16 +725,16 @@ enum Command {
             value_parser = clap::value_parser!(u64).range(1..=1_000_000_000)
         )]
         full_scan_min_blobs: Option<u64>,
-        /// Read IDs from text file (one per line, e.g. n123)
+        /// Read IDs from text file (one per line, e.g. n123 or node/123)
         #[arg(short = 'i', long = "id-file")]
         id_file: Option<PathBuf>,
         /// Read IDs from an OSM/PBF file (all element IDs are collected)
         #[arg(short = 'I', long = "id-osm-file")]
         id_osm_file: Option<PathBuf>,
-        /// Default type for bare numeric IDs: node, way, relation
+        /// Type for bare numeric IDs. Without this, each ID must name its type.
         #[arg(long = "default-type", value_enum)]
         default_type: Option<DefaultTypeArg>,
-        /// Element IDs (e.g. n123 w456 r789)
+        /// Element IDs (e.g. n123 w456 r789, or node/123 way/456 relation/789)
         ids: Vec<String>,
         #[command(flatten)]
         compression: CompressionArg,
@@ -850,7 +882,7 @@ enum Command {
         /// Extended scan: timestamp range, data bbox, metadata coverage, ordering
         #[arg(short, long)]
         extended: bool,
-        /// Show a single element by type/ID (e.g. "n123", "w456", "r789").
+        /// Show a single element by type/ID (e.g. "n123" or "node/123").
         ///
         /// A mode of its own: it returns one element and nothing else, so
         /// every other inspect flag is rejected alongside it rather than
@@ -858,13 +890,14 @@ enum Command {
         #[arg(
             long,
             value_name = "TYPE_ID",
+            value_parser = clap::value_parser!(ElementRef),
             conflicts_with_all = [
                 "indexed", "nodes", "jobs", "blocks", "id_ranges", "locations",
                 "anomalies", "extended", "get", "json", "force",
                 "distrust_metadata",
             ],
         )]
-        show: Option<String>,
+        show: Option<ElementRef>,
         /// Get a single value by key path (e.g. "header.bbox", "data.timestamp.first")
         #[arg(short, long, value_name = "KEY")]
         get: Option<String>,
@@ -1050,8 +1083,11 @@ enum Command {
         coarse_search_radius: f32,
         #[command(flatten)]
         io: DirectIoArg,
-        #[command(flatten)]
-        force: ForceArg,
+        /// Replace an existing index in --output-dir; the old index stays
+        /// in place until the new build has succeeded. Also accepts input
+        /// without indexdata (slower fallback path).
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1862,7 +1898,7 @@ fn main() -> process::ExitCode {
                     )
                 } else {
                     let file = file.expect("clap requires a file without an inspect subcommand");
-                    if let Some(ref show_id) = show {
+                    if let Some(show_id) = show {
                         return run_show_element(&file, show_id, io.direct_io, &host);
                     }
                     run_inspect(
@@ -1992,7 +2028,7 @@ fn main() -> process::ExitCode {
                     coarse_search_radius,
                 },
                 io.direct_io,
-                force.force,
+                force,
                 &host,
             ),
             Command::BenchRead { file, mode } => run_bench_read(&file, mode, &host),
@@ -2038,7 +2074,12 @@ fn main() -> process::ExitCode {
                 process::ExitCode::SUCCESS
             } else {
                 output::cli_eprintln!("Error: {e}");
-                process::ExitCode::from(ExitStatus::Failed.code())
+                let status = if is_platform_unsupported(e.as_ref()) {
+                    ExitStatus::PlatformUnsupported
+                } else {
+                    ExitStatus::Failed
+                };
+                process::ExitCode::from(status.code())
             }
         }
     }
@@ -3408,54 +3449,29 @@ fn parse_timestamp(input: &str) -> Result<i64, Box<dyn std::error::Error>> {
 
 fn run_show_element(
     path: &std::path::Path,
-    spec: &str,
+    element_ref: ElementRef,
     direct_io: bool,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (elem_type, id) = parse_element_spec(spec)?;
+    let elem_type = match element_ref.kind {
+        ElemKindTag::Node => pbfhogg::inspect::ShowElementType::Node,
+        ElemKindTag::Way => pbfhogg::inspect::ShowElementType::Way,
+        ElemKindTag::Relation => pbfhogg::inspect::ShowElementType::Relation,
+    };
     let mut out = output::buffered();
-    let found = pbfhogg::inspect::show_element_to(path, elem_type, id, direct_io, &mut out, host)?;
+    let found = pbfhogg::inspect::show_element_to(
+        path,
+        elem_type,
+        element_ref.id,
+        direct_io,
+        &mut out,
+        host,
+    )?;
     out.flush()?;
     if !found {
         return Err(Box::new(ExitWithCode(ExitStatus::AnswerNegative)));
     }
     Ok(())
-}
-
-/// Parse "n123", "w456", "r789", "node/123", "way/456", "relation/789".
-fn parse_element_spec(
-    spec: &str,
-) -> Result<(pbfhogg::inspect::ShowElementType, i64), Box<dyn std::error::Error>> {
-    use pbfhogg::inspect::ShowElementType;
-
-    let (type_str, id_str) = if let Some(rest) = spec.strip_prefix("node/") {
-        ("n", rest)
-    } else if let Some(rest) = spec.strip_prefix("way/") {
-        ("w", rest)
-    } else if let Some(rest) = spec.strip_prefix("relation/") {
-        ("r", rest)
-    } else if spec.starts_with('n') || spec.starts_with('w') || spec.starts_with('r') {
-        spec.split_at(1)
-    } else {
-        return Err(format!(
-            "invalid element spec '{spec}': expected n<id>, w<id>, r<id>, \
-             node/<id>, way/<id>, or relation/<id>"
-        )
-        .into());
-    };
-
-    let id: i64 = id_str
-        .parse()
-        .map_err(|_| format!("invalid ID in '{spec}': '{id_str}' is not an integer"))?;
-
-    let elem_type = match type_str {
-        "n" => ShowElementType::Node,
-        "w" => ShowElementType::Way,
-        "r" => ShowElementType::Relation,
-        _ => unreachable!(),
-    };
-
-    Ok((elem_type, id))
 }
 
 /// Which of `run_inspect`'s four execution shapes a flag combination

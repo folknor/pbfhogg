@@ -1438,6 +1438,11 @@ impl Reader {
     }
 
     fn read_string(&self, offset: u32) -> &str {
+        // Open validates all referenced strings. The builder publishes separate
+        // inodes, so refreshes preserve this invariant for existing mappings.
+        // Rechecking here cannot make arbitrary in-place edits safe: truncation
+        // can SIGBUS while reading the mmap, before an error can be returned.
+        // External writers must likewise replace files instead of mutating them.
         format::read_nul_string(&self.strings, offset)
             .expect("Reader::open validated every referenced string")
     }

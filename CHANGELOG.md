@@ -4,6 +4,27 @@
 
 ### Breaking
 
+- **Unavailable `--direct-io` / `--io-uring` now exits 3, not 2.** A
+  filesystem that refuses `O_DIRECT` at open, or a host without usable
+  io_uring (old kernel, sandboxed `io_uring_setup`, `RLIMIT_MEMLOCK` below
+  the registered buffers), is reported as
+  `Error: platform feature direct-io|io-uring unavailable: ...` with exit
+  code 3, so scripts can retry without the flag. Every other failure still
+  exits 2. In the library the same refusals are the new
+  `ErrorKind::PlatformUnsupported { feature, source }`; `DirectReader::open`,
+  `PbfWriter::to_path_direct` and `to_path_uring` carry it inside their
+  `io::Error` (`raw_os_error()` is no longer `EINVAL` for an `O_DIRECT`
+  refusal), and converting to `pbfhogg::Error` restores the typed variant.
+
+- **`build-geocode-index` publishes a complete index or nothing.** Every
+  build is written to a `.geocode-build-*` staging directory beside
+  `--output-dir` and swapped into place only after it and its smoke test
+  succeed, so a failed `--force` rebuild leaves the old index intact and
+  readers already open keep working. The output directory is replaced as a
+  whole: it must be new, empty, or an existing index (with `--force`); a
+  directory holding anything else is refused rather than deleted. Allow
+  disk space for two generations during a rebuild.
+
 - **`build-geocode-index --admin-level` is capped at 10** (was 19). The
   admin flood fill grows 4x per level, and level 19 asked for billions of
   cells on a large country: a hang and an OOM rather than a refusal. Levels
@@ -127,15 +148,6 @@
   file lengths, and out-of-bounds entry lists.** These conditions previously
   produced an empty but apparently successful index, trusted corrupt metadata,
   or could panic while querying a hostile index.
-
-- **A forced geocode index rebuild invalidates the old header before rewriting
-  data files.** If the rebuild is interrupted, the directory is now visibly
-  incomplete and `Reader::open` fails instead of pairing the old header with
-  partial new data. Invalidation happens only after every read-only check on
-  the input has passed, so a bad input path, a missing file or a malformed PBF
-  leaves the existing index untouched. A geocode index is a directory of 19
-  files and has no atomic replace, which is why this is invalidation rather
-  than a scratch-and-rename swap.
 
 - **`build-geocode-index` now caps `--street-level`, `--coarse-level` and
   `--admin-level` at 19, down from the S2 limit of 30.** Cell covering samples
@@ -467,6 +479,12 @@
 
 ### Added
 
+- **`getid` and `getparents` accept named element IDs** (`node/123`,
+  `way/456`, `relation/789`) alongside `n123` / `w456` / `r789`, on the
+  command line and in `--id-file`, matching what `inspect --show` already
+  accepted. The library parser is `getid::ElementRef` (`FromStr`). Bare
+  numeric IDs still need `--default-type`; see DEVIATIONS.md.
+
 - **`pbfhogg digest`: an encoding-independent digest of a PBF's element
   content.** Two files get the same digest exactly when
   `diff --suppress-common` reports them identical (barring a 128-bit hash
@@ -587,6 +605,21 @@
   makes the decision before the header is read.
 
 ### Fixed
+
+- **Blocks built by `BlockBuilder` list an empty-string tag key in their tag
+  index.** The key was left out, so a blob whose elements carried a tag with
+  key `""` advertised a key set without it: `tags-filter` skipped that blob
+  for an expression needing the empty key (a wrong answer), and
+  `check --index` reported it as `TagKeysMissing`. Files written by
+  re-encoding commands such as `repack` before this fix keep the short tag
+  index until rewritten.
+
+- **`build-geocode-index` refuses an index its format cannot address instead
+  of writing a corrupt one.** Past 4 GiB of interned strings the string-pool
+  offsets wrapped and later names pointed at the wrong text; address-point,
+  street, interpolation, admin-polygon and cell counts, and the replication
+  sequence, were narrowed to `u32` the same way. Each now fails the build
+  with a message naming the limit.
 
 - **`extract --polygon` refuses a degenerate ring** (fewer than three
   positions, or zero area) instead of producing an empty extract and exiting

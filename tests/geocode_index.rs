@@ -1263,11 +1263,6 @@ fn reader_rejects_hostile_entry_offset_instead_of_panicking() {
     );
 }
 
-/// A forced rebuild whose *input* is bad must not touch the existing index.
-/// Invalidation is destructive and irreversible - a geocode index is a
-/// directory of 19 files with no atomic replace - so it may only happen after
-/// every read-only check on the input has passed. A typo in the input path is
-/// the commonest way to reach this code, and it must cost nothing.
 /// Reader open-time validation must cover every offset-into-a-file
 /// relationship in the format, not just the geo entry lists. Validating some
 /// of the kinds and not the others is how a truncated file opens successfully
@@ -1511,12 +1506,9 @@ fn force_with_bad_input_leaves_the_existing_index_intact() {
     );
 }
 
-/// The other half of the same contract: a forced rebuild that gets *past*
-/// input validation and then dies must leave a directory that fails to open,
-/// not one that opens and mixes two vintages. The header is removed before
-/// Pass 2 writes, so a mid-build death is detectable.
+/// A failed build after input validation preserves the entire old generation.
 #[test]
-fn force_invalidates_the_header_before_pass_two_writes() {
+fn force_preserves_the_index_when_pass_two_fails() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
@@ -1533,7 +1525,7 @@ fn force_invalidates_the_header_before_pass_two_writes() {
     .expect("initial build");
 
     // A second input that passes every read-only check but yields nothing
-    // indexable, so the build fails in Pass 2 - after invalidation.
+    // indexable, so the staged build fails after Pass 2.
     let empty = dir.path().join("empty.osm.pbf");
     write_test_pbf_sorted(
         &empty,
@@ -1558,13 +1550,17 @@ fn force_invalidates_the_header_before_pass_two_writes() {
     )
     .expect_err("a build with no queryable records must fail");
     assert!(
-        !index_dir.join("geocode_header.bin").exists(),
-        "a rebuild that died after invalidation must leave no valid-looking \
-         header; error: {err}"
+        index_dir.join("geocode_header.bin").exists(),
+        "failed staged build must retain the old header: {err}"
     );
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
+        .expect("the original generation must remain readable");
     assert!(
-        pbfhogg::geocode_index::reader::Reader::open(&index_dir).is_err(),
-        "the half-rewritten directory must not open"
+        reader
+            .query(55.70005, 12.5005)
+            .expect("query")
+            .address
+            .is_some()
     );
 }
 
@@ -3025,4 +3021,48 @@ fn segment_distance_respects_the_owning_way_node_count() {
             "a segment cannot use nodes outside its owning way"
         );
     }
+}
+
+#[test]
+fn force_rebuild_preserves_open_reader_mappings() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+    write_synthetic_indexed_input(&input);
+    let mut config = pbfhogg::geocode_index::builder::BuildConfig {
+        input_path: input,
+        output_dir: index_dir.clone(),
+        ..Default::default()
+    };
+    pbfhogg::geocode_index::builder::build_geocode_index(&config, &crate::common::test_host())
+        .expect("initial build");
+    let old = pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("old reader");
+    let before = old.query(55.70005, 12.5005).expect("before");
+    assert!(before.address.is_some());
+    #[cfg(unix)]
+    let old_inode = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(index_dir.join("strings.bin"))
+            .expect("old strings")
+            .ino()
+    };
+    config.force = true;
+    pbfhogg::geocode_index::builder::build_geocode_index(&config, &crate::common::test_host())
+        .expect("refresh");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let new_inode = std::fs::metadata(index_dir.join("strings.bin"))
+            .expect("new strings")
+            .ino();
+        assert_ne!(old_inode, new_inode, "refresh must replace mapped inodes");
+    }
+    let after = old
+        .query(55.70005, 12.5005)
+        .expect("old reader after refresh");
+    assert_eq!(
+        before.address.as_ref().map(|a| a.house_number),
+        after.address.as_ref().map(|a| a.house_number)
+    );
+    pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("new reader");
 }

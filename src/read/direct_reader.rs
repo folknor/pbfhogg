@@ -183,11 +183,16 @@ impl DirectReader {
     }
 
     /// Open a file for reading with `O_DIRECT`.
+    ///
+    /// A filesystem that refuses `O_DIRECT` at open fails with an error
+    /// carrying `ErrorKind::PlatformUnsupported` (feature `direct-io`);
+    /// converting it to [`crate::Error`] restores the typed variant.
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECT)
-            .open(path)?;
+            .open(path)
+            .map_err(crate::error::direct_io_open_error)?;
         let file_len = file.metadata()?.len();
         let buf = AlignedReadBuffer::new(IO_BUF_BYTES)?;
         Ok(Self {
@@ -276,7 +281,7 @@ mod tests {
                 reader.read_to_end(&mut buf).unwrap();
                 assert_eq!(buf, data);
             }
-            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
+            Err(e) if crate::error::carried_platform_feature(&e) == Some("direct-io") => {}
             Err(e) => panic!("unexpected error: {e}"),
         }
     }
@@ -301,7 +306,9 @@ mod tests {
 
             let mut reader = match DirectReader::open(&path) {
                 Ok(reader) => reader,
-                Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+                Err(error)
+                    if crate::error::carried_platform_feature(&error) == Some("direct-io") =>
+                {
                     drop(std::fs::remove_file(&path));
                     return;
                 }

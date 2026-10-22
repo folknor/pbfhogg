@@ -612,9 +612,20 @@ fn uring_init_and_run(
     // registered buffer without the submission queue stalling, plus slack
     // for bursty submission.
     let ring_depth = u32::from(NUM_BUFS) * 2;
-    let ring = builder
-        .build(ring_depth)
-        .map_err(|e| io::Error::new(e.kind(), format!("io_uring creation failed: {e}")))?;
+    let ring = builder.build(ring_depth).map_err(|e| {
+        // Only setup refusal is skippable. Resource exhaustion and runtime
+        // submission/completion errors remain ordinary I/O failures.
+        let refused = matches!(
+            e.raw_os_error(),
+            Some(libc::ENOSYS | libc::EPERM | libc::EACCES | libc::EOPNOTSUPP)
+        );
+        let e = io::Error::new(e.kind(), format!("io_uring creation failed: {e}"));
+        if refused {
+            crate::error::platform_unsupported("io-uring", e)
+        } else {
+            e
+        }
+    })?;
 
     // Step 2b: Probe supported opcodes for clear error messages on old kernels.
     // WriteFixed requires Linux 5.1+.
@@ -623,9 +634,12 @@ fn uring_init_and_run(
         if ring.submitter().register_probe(&mut probe).is_ok()
             && !probe.is_supported(opcode::WriteFixed::CODE)
         {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "kernel does not support io_uring WriteFixed (requires Linux 5.1+)",
+            return Err(crate::error::platform_unsupported(
+                "io-uring",
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "kernel does not support io_uring WriteFixed (requires Linux 5.1+)",
+                ),
             ));
         }
     }
@@ -636,7 +650,8 @@ fn uring_init_and_run(
         .create(true)
         .truncate(true)
         .custom_flags(libc::O_DIRECT)
-        .open(path)?;
+        .open(path)
+        .map_err(crate::error::direct_io_open_error)?;
 
     // Step 4: Register the output fd so `WriteFixed` can reference it by slot.
     ring.submitter()
@@ -647,14 +662,23 @@ fn uring_init_and_run(
     // Safety: iovecs point into the AlignedBufferPool allocation which
     // lives for the duration of this function.
     unsafe { ring.submitter().register_buffers(&iovecs) }.map_err(|e| {
-        let os_err = e.raw_os_error();
-        if os_err == Some(libc::ENOMEM) || os_err == Some(libc::EPERM) {
-            io::Error::new(
-                e.kind(),
-                format!(
-                    "register_buffers failed: RLIMIT_MEMLOCK too low \
-                     (need {} MB, try `ulimit -l unlimited`): {e}",
-                    (NUM_BUFS as usize * IO_BUF_BYTES) / (1024 * 1024)
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // Safety: limit is a valid writable rlimit for getrlimit.
+        let limited = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } == 0
+            && limit.rlim_cur < (u64::from(NUM_BUFS) * IO_BUF_BYTES as u64);
+        if limited && matches!(e.raw_os_error(), Some(libc::ENOMEM | libc::EPERM)) {
+            crate::error::platform_unsupported(
+                "io-uring",
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "register_buffers failed: RLIMIT_MEMLOCK too low \
+                         (need {} MB, try `ulimit -l unlimited`): {e}",
+                        (NUM_BUFS as usize * IO_BUF_BYTES) / (1024 * 1024)
+                    ),
                 ),
             )
         } else {

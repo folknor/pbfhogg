@@ -179,9 +179,11 @@ impl<'a> Iterator for DenseNodeIter<'a> {
             self.info_iter.as_mut().and_then(Iterator::next),
         ) {
             (Some(did), Some(dlat), Some(dlon), info) => {
-                self.cid += did;
-                self.clat += dlat;
-                self.clon += dlon;
+                // Dense PBF deltas are modular; wrapping matches their signed
+                // wire arithmetic in debug and release builds.
+                self.cid = self.cid.wrapping_add(did);
+                self.clat = self.clat.wrapping_add(dlat);
+                self.clon = self.clon.wrapping_add(dlon);
 
                 // Scan through packed int32 varints to find the 0 delimiter
                 // that separates this node's tags from the next node's.
@@ -388,10 +390,11 @@ impl<'a> Iterator for DenseNodeInfoIter<'a> {
         let duser_sid = self.duser_sids.next()?;
         let visible_opt = self.visible.next();
 
-        self.ctimestamp += dtimestamp;
-        self.cchangeset += dchangeset;
-        self.cuid += duid;
-        self.cuser_sid += duser_sid;
+        // DenseInfo deltas are modular too, including the signed int32 arrays.
+        self.ctimestamp = self.ctimestamp.wrapping_add(dtimestamp);
+        self.cchangeset = self.cchangeset.wrapping_add(dchangeset);
+        self.cuid = self.cuid.wrapping_add(duid);
+        self.cuser_sid = self.cuser_sid.wrapping_add(duser_sid);
 
         Some(DenseNodeInfo {
             block: self.block,
@@ -482,5 +485,59 @@ impl Iterator for DenseRawTagIter<'_> {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let val = self.cursor.read_varint().ok()? as i32;
         Some((key, val))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use crate::Element;
+    use crate::PrimitiveBlock;
+    use crate::write::block_builder::{BlockBuilder, Metadata};
+
+    // MIN then MAX makes every second delta -1, so each running sum (ID,
+    // timestamp, changeset, uid) has to wrap from MIN back to MAX.
+    #[test]
+    fn dense_node_deltas_decode_at_signed_boundaries() {
+        let mut builder = BlockBuilder::new();
+        let first = Metadata {
+            version: 1,
+            timestamp: i64::MIN,
+            changeset: i64::MIN,
+            uid: i32::MIN,
+            user: "first",
+            visible: true,
+        };
+        let next = Metadata {
+            version: 1,
+            timestamp: i64::MAX,
+            changeset: i64::MAX,
+            uid: i32::MAX,
+            user: "next",
+            visible: true,
+        };
+        builder.add_node(i64::MIN, 0, 0, [], Some(&first));
+        builder.add_node(i64::MAX, 0, 0, [], Some(&next));
+
+        let bytes = builder.take().unwrap().unwrap().to_vec();
+        let block = PrimitiveBlock::from_vec(bytes).unwrap();
+        let nodes: Vec<(i64, i64, i64, i32)> = block
+            .elements()
+            .map(|element| match element {
+                Element::DenseNode(node) => {
+                    let info = node.info().unwrap();
+                    (node.id(), info.timestamp, info.changeset, info.uid())
+                }
+                _ => panic!("the fixture contains dense nodes only"),
+            })
+            .collect();
+
+        assert_eq!(
+            nodes,
+            [
+                (i64::MIN, i64::MIN, i64::MIN, i32::MIN),
+                (i64::MAX, i64::MAX, i64::MAX, i32::MAX),
+            ],
+        );
     }
 }

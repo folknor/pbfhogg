@@ -24,7 +24,7 @@ use std::path::Path;
 use crate::common::cli::CliInvoker;
 use crate::common::{
     TestNode, TestRelation, TestWay, generate_nodes, generate_relations, generate_ways,
-    write_multi_block_test_pbf,
+    write_indexed_pbf, write_multi_block_test_pbf,
 };
 
 /// A multi-blob fixture carrying tags on several distinct blobs across all
@@ -103,6 +103,38 @@ fn an_honest_file_passes_and_exits_zero() {
     assert!(
         stdout.contains("with indexdata"),
         "the summary must report how many blobs carried indexdata: {stdout}"
+    );
+}
+
+/// Repack uses BlockBuilder's precomputed tagdata instead of the writer's
+/// fallback payload scan, so this verifies the producer path in question.
+#[test]
+fn repacked_empty_tag_key_passes_index_check() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let repacked = dir.path().join("repacked.osm.pbf");
+    let nodes = [TestNode {
+        id: 1,
+        lat: 0,
+        lon: 0,
+        tags: vec![("", "empty-key")],
+        meta: None,
+    }];
+    write_indexed_pbf(&input, &nodes, &[], &[]);
+
+    CliInvoker::new()
+        .arg("repack")
+        .arg(&input)
+        .arg("-o")
+        .arg(&repacked)
+        .assert_success();
+
+    let out = check_index(&repacked);
+    assert!(
+        out.status.success(),
+        "repack must retain the empty key in its precomputed tagdata; stdout:\n{}\nstderr:\n{}",
+        out.stdout_str(),
+        out.stderr_str(),
     );
 }
 

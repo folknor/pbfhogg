@@ -948,12 +948,9 @@ impl BlockBuilder {
             None
         } else {
             self.tag_key_scratch.clear();
-            self.tag_key_scratch.extend(
-                self.tag_key_indices
-                    .iter()
-                    .copied()
-                    .filter(|&idx| !self.string_table.strings[idx as usize].is_empty()),
-            );
+            // An empty string is still an explicit tag key; retain it.
+            self.tag_key_scratch
+                .extend(self.tag_key_indices.iter().copied());
             self.tag_key_scratch.sort_by(|&a, &b| {
                 self.string_table.strings[a as usize]
                     .as_bytes()
@@ -1382,6 +1379,22 @@ mod tests {
         assert!(
             !bb.should_flush(),
             "a fresh builder holds nothing regardless of its cap"
+        );
+    }
+
+    #[test]
+    fn tagdata_keeps_an_explicit_empty_tag_key() {
+        let mut bb = BlockBuilder::new();
+        bb.add_node(1, 0, 0, [("", "value")], None);
+
+        let block = bb.take_owned().unwrap().unwrap();
+        let tagdata = block.tagdata.as_deref().expect("tagged block has tagdata");
+        let tag_index = crate::blob_meta::TagIndex::deserialize(tagdata)
+            .expect("builder tagdata must be readable");
+        assert_eq!(tag_index.keys().len(), 1);
+        assert!(
+            tag_index.keys()[0].is_empty(),
+            "an empty string is a real tag key when a tag uses it"
         );
     }
 

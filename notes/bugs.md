@@ -120,23 +120,12 @@ rewrite command's `add` take strings decoded from input PBFs and OSC XML. The
 8000-element block bound may still make FxHash acceptable, but the stated
 reason is wrong.
 
+Also: the empty string sits at slot 0 of the output table but is not seeded
+into the lookup map, so the first `add("")` appends a second empty entry.
+Probably redundant rather than wrong today, but it is the same identity
+assumption `pre_seed` relies on.
+
 Reported by: write path.
-
-## BUG-077 - Two osmium parity gaps not yet checked against DEVIATIONS.md
-
-Anger: 7 - CLI behaviour.
-
-Found while fixing the list-file readers, not verified further:
-
-- osmium's `tags-count` (`add_matcher`) has no type-prefix syntax, while
-  pbfhogg parses `w/highway` as typed in its tags-count expressions.
-- osmium `getid` treats a bare ID as a node (`--default-type` defaults to
-  node); pbfhogg rejects bare IDs unless `--default-type` is given.
-
-Each is either a bug or an undocumented deviation; DEVIATIONS.md mentions
-neither.
-
-Reported by: the list-file reader fix.
 
 ## BUG-076 - The shared node scanner silently skips plain `Node` messages
 
@@ -279,63 +268,34 @@ is not deterministic either.
 
 Reported by: the geocode fix for the former coordinate-race entry.
 
-## BUG-048 - Rebuilding a geocode index with `--force` truncates files under open readers
-
-Anger: 7 - geocode output.
-
-`--force` removes the header and `File::create`s every data file in place.
-Any process with a `Reader` open on that directory has those files mmapped;
-truncation turns its next page access into `SIGBUS`, and a `read_string` on
-changed content hits the `expect("Reader::open validated every referenced
-string")` panic. Invalidation protects only readers that open later, not
-readers already open, which is the normal case for a geocoding server being
-refreshed. Fix: build into a sibling directory and rename (old aside, new in,
-delete old; readers keep their unlinked inodes), or write each file to
-`name.tmp` and rename over. The reader-side `expect` should become an error
-regardless. A failed `--force` build before Pass 2's creates also leaves the
-old data files beside an absent header.
-
-Reported by: geocode index.
-
-## BUG-052 - Geocode `StringPool` offsets wrap silently past 4 GiB
-
-Anger: 7 - geocode output.
-
-`StringPool::intern` uses `self.data.len() as u32`; past 4 GiB of strings,
-offsets wrap and every later string points at the wrong text, with no error.
-`name_offset`, `street_offset` and the rest are u32. Other counts wrap the
-same way in release: `addr_point_count += 1` and `street_way_count += 1` in
-Pass 2, `interp_way_count as u32` and `admin_polygons.len() as u32` in the
-header, `total_cells += 1` in Stage B, `cell_ids.len() as u32` in the admin
-index, and `chunk_start + STREET_CHUNK as u32` near `u32::MAX`. Other counts
-use checked conversion with a "bump FORMAT_VERSION" error. Narrow the
-function-level `cast_possible_truncation` allows across `pass3.rs`, `admin.rs`,
-`interp.rs` and `mod.rs` to expression level, and consider
-`arithmetic_side_effects` on the module, so each site has to choose.
-
-Reported by: geocode index.
-
-## BUG-063 - Platform-skip predicates turn real failures into passes
+## BUG-063 - Platform-skip residue: `src/` unit tests and pre-5.12 ring ENOMEM
 
 Anger: 7 - CLI behaviour.
 
-- `CliOutput::is_uring_unsupported` treats any stderr containing
-  `"not supported"` as io_uring unavailable, including unrelated refusals.
-- `CliOutput::is_o_direct_unsupported` matches `"Invalid argument"` anywhere,
-  including clap-style argument errors.
-- `tests/common/mod.rs::is_uring_unavailable` returns true for any
-  `std::io::Error` and any `pbfhogg::ErrorKind::Io`, so ENOSPC, EIO and real
-  bugs in io_uring library tests are skips.
-- The only `DirectWriter` test returns early (passes) when the open fails, so
-  on a tmpfs `TMPDIR` it is green without testing anything.
+Platform refusals are now typed (`ErrorKind::PlatformUnsupported`, CLI exit
+3) and the shared test predicates check that, failing rather than skipping
+under `BROKKR_TEST_PLATFORM`. Left:
 
-String matching for the CLI and type matching for the library disagree on what
-counts. The root cause is that production emits no machine-checkable "platform
-does not support this". Fix: `ErrorKind::PlatformUnsupported { feature,
-source }`, a distinct CLI exit code, and both predicates checking that.
-`BROKKR_TEST_PLATFORM = "1"` in the `platform` profile is set and read by
-nothing; wiring it so the predicates fail rather than skip under that profile
-would stop a platform run that skips everything from passing green.
+- The unit tests inside `src/read/direct_reader.rs` still skip on a refusal
+  whatever `BROKKR_TEST_PLATFORM` says: library code may not read the
+  environment, and the `no-env-read` textlint rule covers test code in
+  `src/` too (brokkr#10 is the open ticket for that blind spot). Moving those
+  tests out of `src/`, or brokkr scoping the rule, closes it.
+- io_uring ring creation failing with `ENOMEM` is now an ordinary I/O error.
+  Kernels before 5.12 charge ring memory to `RLIMIT_MEMLOCK`, so on such a
+  host with a low memlock limit the uring tests fail instead of skipping and
+  the CLI exits 2 instead of 3. `register_buffers` already handles this with
+  a getrlimit check; ring creation does not. No current host is affected.
+- CLI exit 3 depends on every command carrying the `io::Error` through `?`,
+  `From` or `map_io_preserving_platform`. No audit has checked that no
+  command stringifies it (`map_err(|e| format!(..))`), which would exit 2
+  and turn its platform test red rather than skipped.
+- Now that the `platform` profile refuses to skip, it needs at least 16 MB
+  of locked memory for the io_uring registered-buffer pool. On bygg the hard
+  limit is 8 MB (`ulimit -Hl`), so `cli_sort::platform::sort_overlapping_blobs_uring`
+  and `cli_apply_changes::platform::merge_basic_create_modify_delete_uring`
+  fail there with a correct exit-3 report (seen 2026-10-22). Raise the host
+  limit (LimitMEMLOCK or limits.conf); both used to pass by skipping.
 
 Reported by: test harness, write path, CLI and plumbing.
 
@@ -364,40 +324,6 @@ comments in `read/frame.rs` and `raw_frame.rs` say so.
 
 Reported by: the blob_meta fix for the former strict-scanner entry.
 
-## BUG-073 - `BlockBuilder` leaves empty-string keys out of tagdata
-
-Anger: 9 - tagdata change in the block builder.
-
-`src/write/block_builder.rs` drops the empty key from the tag index it
-writes, so a blob whose elements carry a tag with key `""` advertises a key
-set without it, and `tags-filter -e ',highway'` style expressions that
-require the empty key skip the blob: a wrong answer. The passthrough
-scanner now includes empty keys, so `check --index` flags such blobs as
-`TagKeysMissing`.
-
-Reported by: the blob_meta fix for the former strict-scanner entry.
-
-## BUG-086 - Decompression buffers under-reserve
-
-Anger: 9 - per-blob decompression reserve.
-
-`src/read/decompress.rs::pool_get` calls
-`buf.reserve(capacity.saturating_sub(buf.capacity()))` on a cleared
-(`len == 0`) pooled buffer. `reserve(n)` only guarantees
-`capacity >= len + n`, so a pooled 1 MiB buffer asked for 1.5 MiB reserves
-nothing and grows during decompression instead. `buf.reserve(capacity)` is
-the intended call. Other reservation calls in the same file subtract the
-existing capacity the same way. It is the only decompression-buffer path, so
-this is a performance change on every blob: measure before and after.
-
-Verified in wave 2 at four sites (`pool_get`, the parsed-blob zlib and zstd
-branches, the raw-wire path), which now carry comments saying the fix is
-pending measurement. The fix was declined only for want of a benchmark;
-benchmarks run after the resolution loop, so implement it and replace the
-comments.
-
-Reported by: the wave-0 reviews.
-
 ## BUG-064 - Unit tests use fixed scratch names and collide across parallel sweeps
 
 Anger: 3 - unit-test scratch and test timeouts.
@@ -414,19 +340,6 @@ fix is HYG-071's shared scratch.
 Reported by: change application, filtering and spatial, read path, test
 harness.
 
-## BUG-089 - The CliInvoker 10 s default can kill legitimately slow CLI tests
-
-Anger: 3 - unit-test scratch and test timeouts.
-
-`tests/common/cli.rs` now defaults `CliInvoker` to a 10 s timeout so it fires
-before the 20 s `brokkr check` watchdog. Tests run individually via
-`brokkr test --timeout N` (the denmark roundtrip, the osmium
-cross-validations) that drive a slow CLI command through the default would
-now fail at 10 s. They need explicit timeouts, or the default should follow
-the watchdog brokkr sets.
-
-Reported by: the wave-1a coordinator.
-
 ## BUG-090 - The apply-changes scanner can hold every post-node descriptor until EOF
 
 Anger: 8 - apply-changes internals.
@@ -438,20 +351,6 @@ buffer every descriptor after the node phase until end of file, separately
 from the drain's reorder map. Unverified beyond the fixer's reading.
 
 Reported by: the wave-1 drain fixer.
-
-## BUG-091 - Way, relation and dense-decode delta arithmetic still differs between debug and release
-
-Anger: 8 - builder and decoder deltas.
-
-`BlockBuilder`'s dense-node deltas now use explicit wrapping arithmetic. The
-same class remains elsewhere: `src/write/encode.rs` computes way-ref and
-relation-member deltas with plain subtraction, and `src/read/dense.rs`
-reconstructs dense IDs and metadata with plain addition. Release builds
-wrap, which is what modular varint deltas need; debug builds panic on the
-same extreme but legal input. Use `wrapping_sub` / `wrapping_add` and say
-why.
-
-Reported by: the wave-1 write-path fixer.
 
 ## BUG-092 - Single-pass multi-extract still reports each region twice
 
@@ -528,3 +427,43 @@ scanner error with `io::Error::new(InvalidData, e.to_string())`, dropping
 its source chain.
 
 Reported by: the wave-2 reviewer.
+
+## BUG-098 - Delta reconstruction has no single overflow policy
+
+Anger: 8 - decoder deltas.
+
+`BlockBuilder`, `write/encode.rs` and `read/dense.rs` now treat varint deltas
+as modular (explicit wrapping arithmetic), so debug and release agree.
+Still plain addition: four cumulative sums in `src/read/elements.rs`, five
+in `src/read/columnar.rs`, and `cum += delta` in
+`src/commands/altw/reframe.rs`. Meanwhile `src/scan/way.rs::accumulate_refs`
+deliberately uses `checked_add` and rejects overflow as a corrupt blob, so
+the writer can now produce a way (refs `i64::MIN` then `i64::MAX`) that its
+own scan path refuses; release builds always could. Pick one policy first:
+modular everywhere (drop the scanner's corruption check), or checked
+everywhere (reverse the wrapping in `dense.rs` and the encoders, and decide
+what the writer does with such input). Release has no overflow checks, so
+the wrapping form costs nothing on the hot iterators.
+
+Reported by: the wave-3 delta fixer.
+
+## BUG-099 - Staged geocode publication leaves edge cases open
+
+Anger: 7 - geocode output.
+
+`build-geocode-index` now builds into a sibling `.geocode-build-N`
+directory and publishes with two renames. Open:
+
+- A SIGKILL or power loss mid-build leaves the staging directory (many GB at
+  planet) and nothing sweeps it; the Pass 3 bucket sweep cannot, because the
+  buckets live inside it. A sibling sweep is unsafe while concurrent builders
+  are possible. Needs a PID or lock marker, or documented manual cleanup.
+- An `--output-dir` that is a mount point fails the rename with EBUSY or
+  EXDEV only after a full build; one that is a symlink to a directory gets
+  the symlink replaced by a real directory on the parent's filesystem. Both
+  worked with the old in-place build; neither is detected early.
+- An `osmosis_replication_sequence_number` outside u32 now aborts the whole
+  build, for an informational header field that used to wrap. Error, or
+  store 0 as for a missing value.
+
+Reported by: the wave-3 reviewer.

@@ -149,7 +149,9 @@ pub(super) fn encode_way<'t>(
         packed_keys.clear();
         let mut last_ref: i64 = 0;
         for &r in refs {
-            encode_varint(packed_keys, zigzag_encode_64(r - last_ref));
+            // PBF sint64 deltas are modular; keep signed-boundary inputs
+            // consistent between debug and release builds.
+            encode_varint(packed_keys, zigzag_encode_64(r.wrapping_sub(last_ref)));
             last_ref = r;
         }
         encode_bytes_field(elem, 8, packed_keys);
@@ -209,7 +211,9 @@ pub(super) fn encode_way_with_locations<'t>(
         packed_lons.clear();
 
         for (&r, &(loc_lat, loc_lon)) in refs.iter().zip(locations.iter()) {
-            encode_varint(packed_refs, zigzag_encode_64(r - last_ref));
+            // PBF sint64 deltas are modular; keep signed-boundary inputs
+            // consistent between debug and release builds.
+            encode_varint(packed_refs, zigzag_encode_64(r.wrapping_sub(last_ref)));
             last_ref = r;
             let lat = i64::from(loc_lat);
             encode_varint(packed_lats, zigzag_encode_64(lat - last_lat));
@@ -337,7 +341,9 @@ pub(super) fn encode_relation<'t>(
         packed.clear();
         let mut last_memid: i64 = 0;
         for m in members {
-            encode_varint(packed, zigzag_encode_64(m.id.id() - last_memid));
+            // PBF sint64 deltas are modular; keep signed-boundary inputs
+            // consistent between debug and release builds.
+            encode_varint(packed, zigzag_encode_64(m.id.id().wrapping_sub(last_memid)));
             last_memid = m.id.id();
         }
         encode_bytes_field(elem, 9, packed);
@@ -400,5 +406,132 @@ pub(super) fn collect_packed_varint_keys(data: &[u8], indices: &mut FxHashSet<u3
         } else {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::{encode_relation, encode_way, encode_way_with_locations};
+    use crate::MemberId;
+    use crate::read::wire::{Cursor, PackedSint64Iter, WireRelation, WireWay};
+    use crate::write::block_builder::MemberData;
+    use crate::write::string_table::StringTable;
+    use rustc_hash::FxHashSet;
+
+    fn first_message(group: &[u8], expected_field: u32) -> &[u8] {
+        let mut cursor = Cursor::new(group);
+        let (field, wire_type) = cursor.read_tag().unwrap().unwrap();
+        assert_eq!(field, expected_field);
+        assert_eq!(wire_type, crate::read::wire::WIRE_LEN);
+        cursor.read_len_delimited().unwrap()
+    }
+
+    #[test]
+    fn way_ref_deltas_wrap_at_signed_boundaries() {
+        let mut string_table = StringTable::new();
+        let mut group = Vec::new();
+        let mut elem = Vec::new();
+        let mut packed_keys = Vec::new();
+        let mut packed_vals = Vec::new();
+        let mut info = Vec::new();
+        let mut tag_key_indices = FxHashSet::default();
+
+        encode_way(
+            &mut string_table,
+            &mut group,
+            &mut elem,
+            &mut packed_keys,
+            &mut packed_vals,
+            &mut info,
+            &mut tag_key_indices,
+            1,
+            [],
+            &[i64::MIN, i64::MAX],
+            None,
+        );
+
+        let way = WireWay::parse(first_message(&group, 3)).unwrap();
+        assert_eq!(
+            PackedSint64Iter::new(way.refs_data).collect::<Vec<_>>(),
+            [i64::MIN, -1],
+        );
+    }
+
+    #[test]
+    fn way_ref_deltas_with_locations_wrap_at_signed_boundaries() {
+        let mut string_table = StringTable::new();
+        let mut group = Vec::new();
+        let mut elem = Vec::new();
+        let mut packed_refs = Vec::new();
+        let mut packed_vals = Vec::new();
+        let mut packed_lats = Vec::new();
+        let mut packed_lons = Vec::new();
+        let mut info = Vec::new();
+        let mut tag_key_indices = FxHashSet::default();
+
+        encode_way_with_locations(
+            &mut string_table,
+            &mut group,
+            &mut elem,
+            &mut packed_refs,
+            &mut packed_vals,
+            &mut packed_lats,
+            &mut packed_lons,
+            &mut info,
+            &mut tag_key_indices,
+            1,
+            [],
+            &[i64::MIN, i64::MAX],
+            &[(1, 2), (3, 4)],
+            None,
+        );
+
+        let way = WireWay::parse(first_message(&group, 3)).unwrap();
+        assert_eq!(
+            PackedSint64Iter::new(way.refs_data).collect::<Vec<_>>(),
+            [i64::MIN, -1],
+        );
+    }
+
+    #[test]
+    fn relation_member_deltas_wrap_at_signed_boundaries() {
+        let mut string_table = StringTable::new();
+        let mut group = Vec::new();
+        let mut elem = Vec::new();
+        let mut packed = Vec::new();
+        let mut packed_vals = Vec::new();
+        let mut info = Vec::new();
+        let mut tag_key_indices = FxHashSet::default();
+        let members = [
+            MemberData {
+                id: MemberId::Node(i64::MIN),
+                role: "",
+            },
+            MemberData {
+                id: MemberId::Way(i64::MAX),
+                role: "",
+            },
+        ];
+
+        encode_relation(
+            &mut string_table,
+            &mut group,
+            &mut elem,
+            &mut packed,
+            &mut packed_vals,
+            &mut info,
+            &mut tag_key_indices,
+            1,
+            [],
+            &members,
+            None,
+        );
+
+        let relation = WireRelation::parse(first_message(&group, 4)).unwrap();
+        assert_eq!(
+            PackedSint64Iter::new(relation.memids_data).collect::<Vec<_>>(),
+            [i64::MIN, -1],
+        );
     }
 }

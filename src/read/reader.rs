@@ -103,7 +103,7 @@ impl<R: Read + Send> ElementReader<R> {
     ///
     /// Defaults to 16. Values <1 are clamped to 1.
     pub fn read_ahead(mut self, n: usize) -> Self {
-        self.pipeline_config.read_ahead = n.max(1);
+        self.pipeline_config.set_read_ahead(n);
         self
     }
 
@@ -116,7 +116,7 @@ impl<R: Read + Send> ElementReader<R> {
     ///
     /// Defaults to 32. Values <1 are clamped to 1.
     pub fn decode_ahead(mut self, n: usize) -> Self {
-        self.pipeline_config.decode_ahead = n.max(1);
+        self.pipeline_config.set_decode_ahead(n);
         self
     }
 

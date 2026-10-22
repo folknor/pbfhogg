@@ -56,7 +56,6 @@ impl CellAddrCsr {
 }
 
 /// Build the endpoint lookup index without per-cell allocations or locks.
-#[allow(clippy::cast_possible_truncation)] // Existing address-point indices are u32.
 fn build_cell_addr_csr(
     addr_mmap: &[u8],
     street_level: u8,
@@ -84,7 +83,10 @@ fn build_cell_addr_csr(
                     e7_to_deg(point.lon_e7 as f64),
                 );
                 let cell_id = CellID::from(lat_lng).parent(street_level as u64).0;
-                (cell_id, index as u32)
+                (
+                    cell_id,
+                    u32::try_from(index).expect("address count checked during Pass 2"),
+                )
             })
             .collect()
     });
@@ -152,7 +154,6 @@ pub(super) fn read_node_at(mmap: &[u8], byte_offset: u64) -> Option<(i32, i32)> 
 /// Resolve start/end house numbers for interpolation ways by matching
 /// their endpoints against nearby address points with the same street name.
 /// Reads address points from mmap'd addr_points.bin.
-#[allow(clippy::cast_possible_truncation)]
 #[hotpath::measure]
 pub(super) fn resolve_interpolation_endpoints_mmap(
     interp_ways: &mut [SlimInterpWay],
@@ -235,7 +236,6 @@ fn resolve_one_way(
 }
 
 /// Find the house number of an address point near an interpolation endpoint.
-#[allow(clippy::cast_possible_truncation)]
 fn find_endpoint_house_number_mmap(
     endpoint: (i32, i32),
     street_offset: u32,

@@ -239,8 +239,9 @@ exception, not a tier - should not survive across many PRs.
   `--test-threads=1`. A new static hook must use the static gate; one
   put under `test-hooks` instead would reach `all`.
 - **CliInvoker for CLI-driven tests.** `tests/common/cli.rs`. Every
-  new `tests/cli_*.rs` goes through it. 60 s default wall-clock
-  timeout, override via `.timeout(Duration)`. Platform-skip
+  new `tests/cli_*.rs` goes through it. Default wall-clock timeout
+  set below `brokkr check`'s 20 s watchdog, override via
+  `.timeout(Duration)`. Platform-skip
   predicates `is_o_direct_unsupported`, `is_uring_unsupported`.
   Binary located via `BROKKR_TEST_BIN_DIR` (set per sweep) with
   fallback to `CARGO_TARGET_DIR + cfg!(debug_assertions)`.
@@ -273,3 +274,22 @@ exception, not a tier - should not survive across many PRs.
 `pbfhogg::host` and `pbfhogg::process` are stable test imports. Library tests
 use `NoProcessActions`; the CLI applies its arena cap in a child. The
 `process_nofile` target owns its process because it needs an unraised limit.
+
+Platform setup refusals use `ErrorKind::PlatformUnsupported { feature, source }`.
+Writers carry that error inside `io::Error` to preserve their `io::Result` API;
+conversion to the library error restores the typed variant. Every `O_DIRECT`
+open (reader, direct writer, io_uring writer) classifies its refusal through
+one helper, and path context added above it must keep the carrier typed. The
+CLI exits 3 for this variant (see the exit-code table in
+`reference/cli-reference.md`) and keeps its feature label in stderr; CLI skip
+predicates require both that code and label. Runtime I/O failures are never
+setup refusals, and raw `EINVAL` is never a sufficient reason to skip.
+`BROKKR_TEST_PLATFORM=1` turns recognized platform skips into failures.
+Library tests use `common::is_einval` (historical name; it requires the typed
+direct-I/O variant) and `common::is_uring_unavailable`, never their own errno
+or message matching.
+
+The default CLI timeout leaves diagnostics time before check's 20 s watchdog.
+The two external CLI cross-validations explicitly allow 110 s per invocation
+and must run with an outer timeout above that value. `roundtrip_denmark` uses
+the library directly and does not pass through `CliInvoker`.

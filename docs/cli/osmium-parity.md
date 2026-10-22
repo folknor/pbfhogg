@@ -14,8 +14,8 @@ command count.
 | `extract` | `extract` | `--strategy` replaced by `--simple` / `--smart` flags |
 | `tags-filter` | `tags-filter` | Also handles OSC input (see below) |
 | `export` | `export` | GeoJSON/GeoJSONSeq only; nodes and ways only (see below) |
-| `getid` | `getid` | Same |
-| `getparents` | `getparents` | Same |
+| `getid` | `getid` | pbfhogg also accepts named type/ID forms; bare IDs need `--default-type` |
+| `getparents` | `getparents` | Bare IDs need `--default-type` in pbfhogg |
 | `renumber` | `renumber` | Same |
 | `add-locations-to-ways` | `add-locations-to-ways` | Same |
 | `time-filter` | `time-filter` | Same |
@@ -73,6 +73,14 @@ All ID source flags (`-i`, `-I`, `--default-type`) work in both normal and
 inverted mode. The getid-only flags (`-r`, `-t`, `--verbose-ids`) are not
 available with `--invert`.
 
+### getid and getparents ID syntax
+
+Both pbfhogg commands accept the compact `n123`, `w456`, `r789` forms and the
+named `node/123`, `way/456`, `relation/789` forms. Osmium accepts the compact
+forms. Osmium defaults a bare numeric ID to a node; pbfhogg requires
+`--default-type` to assign a kind to a bare number. The same default rule
+applies to `--id-file` text input.
+
 ### derive-changes is now `diff --format osc`
 
 ```
@@ -121,6 +129,11 @@ osmium tags-count -t way -s count-desc --min-count 100 input.pbf
 pbfhogg inspect tags input.pbf highway
 pbfhogg inspect tags input.pbf -t way -s count-desc --min-count 100
 ```
+
+pbfhogg also accepts the tags-filter type-prefix syntax in these expressions.
+For example, `w/highway` counts the `highway` key on ways. Osmium's
+`tags-count` treats that full string as a tag matcher; use `-t way` there to
+restrict the element kind.
 
 ### tags-filter-osc is now `tags-filter --input-kind osc`
 

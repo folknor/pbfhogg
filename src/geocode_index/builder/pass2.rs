@@ -554,7 +554,13 @@ pub(super) fn run_pass2(
                         first_addr_lat_e7 = pap.lat_e7;
                         first_addr_lon_e7 = pap.lon_e7;
                     }
-                    addr_point_count += 1;
+                    let Some(next_count) = addr_point_count.checked_add(1) else {
+                        semantic_err = Some(
+                            "address point count exceeds u32::MAX; bump FORMAT_VERSION".into(),
+                        );
+                        return;
+                    };
+                    addr_point_count = next_count;
                 }
             },
             &*host.resources,
@@ -676,7 +682,13 @@ pub(super) fn run_pass2(
                         first_addr_lat_e7 = pap.lat_e7;
                         first_addr_lon_e7 = pap.lon_e7;
                     }
-                    addr_point_count += 1;
+                    let Some(next_count) = addr_point_count.checked_add(1) else {
+                        merge_err = Some(
+                            "address point count exceeds u32::MAX; bump FORMAT_VERSION".into(),
+                        );
+                        return;
+                    };
+                    addr_point_count = next_count;
                 }
 
                 // Streets
@@ -714,7 +726,12 @@ pub(super) fn run_pass2(
                         }
                     }
                     street_node_offset += (ps.coords.len() * NODE_COORD_SIZE) as u64;
-                    street_way_count += 1;
+                    let Some(next_count) = street_way_count.checked_add(1) else {
+                        merge_err =
+                            Some("street way count exceeds u32::MAX; bump FORMAT_VERSION".into());
+                        return;
+                    };
+                    street_way_count = next_count;
                 }
             },
             &*host.resources,

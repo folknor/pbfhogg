@@ -29,8 +29,8 @@
 //! ## Platform skips
 //!
 //! [`CliOutput::is_o_direct_unsupported`] and
-//! [`CliOutput::is_uring_unsupported`] match the CLI's error strings
-//! for the two platform-dependent flags pbfhogg exposes. Tests that
+//! [`CliOutput::is_uring_unsupported`] require exit code 3 and the typed
+//! setup error's feature label. The platform profile rejects such skips. Tests that
 //! exercise `--direct-io` or `--io-uring` should consult these
 //! before asserting success - tmpfs / overlayfs and hosts with low
 //! `RLIMIT_MEMLOCK` are common.
@@ -333,32 +333,30 @@ impl CliOutput {
         self
     }
 
-    /// True when the command failed with stderr matching the
-    /// O_DIRECT-unsupported pattern (typical on tmpfs / overlayfs /
-    /// some CI filesystems that reject `O_DIRECT` with `EINVAL`).
-    /// Pure check; the caller logs and returns when it sees true.
+    /// A structured platform setup refusal (CLI exit code 3).
     pub fn is_o_direct_unsupported(&self) -> bool {
-        if self.status.success() {
-            return false;
-        }
-        let msg = self.stderr_str();
-        msg.contains("Invalid argument") || msg.contains("EINVAL")
+        self.platform_unsupported("direct-io")
     }
 
-    /// True when the command failed with stderr matching the
-    /// io_uring-unavailable pattern (low `RLIMIT_MEMLOCK`, kernel
-    /// without the required submission queue features, a seccomp
-    /// sandbox that denies `io_uring_setup` with `EPERM`, etc.).
-    /// Pure check; the caller logs and returns when it sees true.
+    /// A structured io_uring setup refusal (CLI exit code 3).
     pub fn is_uring_unsupported(&self) -> bool {
-        if self.status.success() {
-            return false;
-        }
-        let msg = self.stderr_str();
-        msg.contains("RLIMIT_MEMLOCK")
-            || msg.contains("kernel does not support")
-            || msg.contains("not supported")
-            || msg.contains("io_uring creation failed")
+        // This writer also requires an O_DIRECT output file.
+        self.platform_unsupported("io-uring") || self.platform_unsupported("direct-io")
+    }
+
+    fn platform_unsupported(&self, feature: &str) -> bool {
+        let unavailable = self.status.code() == Some(3)
+            && self
+                .stderr_str()
+                .contains(&format!("platform feature {feature} unavailable:"));
+        assert!(
+            !unavailable
+                || std::env::var_os("BROKKR_TEST_PLATFORM").as_deref()
+                    != Some(std::ffi::OsStr::new("1")),
+            "platform profile requires this I/O feature to be available; stderr: {:?}",
+            self.stderr_str(),
+        );
+        unavailable
     }
 }
 
@@ -405,4 +403,27 @@ fn pbfhogg_bin() -> PathBuf {
         bin.display(),
     );
     bin
+}
+
+#[cfg(all(test, not(feature = "static-test-hooks")))]
+mod platform_predicate_tests {
+    #[cfg(unix)]
+    use super::*;
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+
+    #[cfg(unix)]
+    #[test]
+    fn unrelated_failures_are_never_platform_skips() {
+        for code in [1, 2, 3] {
+            let output = CliOutput {
+                status: ExitStatus::from_raw(code << 8),
+                stdout: Vec::new(),
+                stderr: b"Invalid argument EINVAL: not supported; io_uring creation failed"
+                    .to_vec(),
+            };
+            assert!(!output.is_o_direct_unsupported());
+            assert!(!output.is_uring_unsupported());
+        }
+    }
 }

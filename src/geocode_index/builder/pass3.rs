@@ -297,7 +297,7 @@ fn cover_segment_fused(
 // ---------------------------------------------------------------------------
 
 const NUM_BUCKETS: usize = 256;
-const STREET_CHUNK: usize = 100_000;
+const STREET_CHUNK: u32 = 100_000;
 const ADDR_CHUNK: usize = 500_000;
 const INTERP_CHUNK: usize = 100_000;
 const STAGE_B_SORT_WINDOW: usize = 8;
@@ -436,11 +436,7 @@ pub(super) struct FusedCellAssignmentParams<'a> {
 /// Stage B runs separately on each of the two bucket trees -
 /// parallelised per plan item #3 (256-bucket parallel parse+sort,
 /// serial group+write).
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity
-)]
+#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 #[hotpath::measure]
 pub(super) fn bucketed_cell_assignment_fused(
     p: &FusedCellAssignmentParams<'_>,
@@ -514,7 +510,9 @@ pub(super) fn bucketed_cell_assignment_fused(
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_STREETS_START");
     let mut chunk_start = 0u32;
     while chunk_start < street_way_count {
-        let chunk_end = (chunk_start + STREET_CHUNK as u32).min(street_way_count);
+        let chunk_end = chunk_start
+            .saturating_add(STREET_CHUNK)
+            .min(street_way_count);
         #[allow(clippy::type_complexity)]
         let entries: Vec<(u64, Option<u64>, u32, u16)> = executor.install(|| {
             (chunk_start..chunk_end)
@@ -555,7 +553,12 @@ pub(super) fn bucketed_cell_assignment_fused(
                     if nc >= 2 {
                         out.reserve(nc * 2);
                         for seg_idx in 0..nc - 1 {
-                            let off1 = rec.node_offset as usize + seg_idx * NODE_COORD_SIZE;
+                            // node_count is u16, so each segment index fits.
+                            #[allow(clippy::cast_possible_truncation)]
+                            let segment_index = seg_idx as u16;
+                            let off1 = usize::try_from(rec.node_offset)
+                                .expect("builder requires 64-bit pointers")
+                                + seg_idx * NODE_COORD_SIZE;
                             let off2 = off1 + NODE_COORD_SIZE;
                             let (Some(n1), Some(n2)) = (
                                 read_node_at(street_nodes_mmap, off1 as u64),
@@ -572,7 +575,7 @@ pub(super) fn bucketed_cell_assignment_fused(
                                 fine_level,
                                 coarse_level,
                                 |fine_cid, coarse_to_emit| {
-                                    out.push((fine_cid, coarse_to_emit, way_idx, seg_idx as u16));
+                                    out.push((fine_cid, coarse_to_emit, way_idx, segment_index));
                                 },
                             );
                         }
@@ -627,7 +630,10 @@ pub(super) fn bucketed_cell_assignment_fused(
                 .into_par_iter()
                 .filter_map(|idx| {
                     // Same producer-owned file rule as the streets above.
-                    let Some(pt) = read_addr_point_mmap(addr_points_mmap, idx as u32) else {
+                    let Some(pt) = read_addr_point_mmap(
+                        addr_points_mmap,
+                        u32::try_from(idx).expect("address index bounded by u32 count"),
+                    ) else {
                         first_missing_addr.fetch_min(idx, AtomicOrdering::Relaxed);
                         return None;
                     };
@@ -637,7 +643,11 @@ pub(super) fn bucketed_cell_assignment_fused(
                     );
                     let fine_cid = CellID::from(ll).parent(fine_level as u64).0;
                     let coarse_cid = CellID(fine_cid).parent(coarse_level as u64).0;
-                    Some((fine_cid, coarse_cid, idx as u32))
+                    Some((
+                        fine_cid,
+                        coarse_cid,
+                        u32::try_from(idx).expect("address index bounded by u32 count"),
+                    ))
                 })
                 .collect()
         });
@@ -688,7 +698,12 @@ pub(super) fn bucketed_cell_assignment_fused(
                     if nc >= 2 {
                         out.reserve(nc * 2);
                         for seg_idx in 0..nc - 1 {
-                            let off1 = iw.node_file_offset as usize + seg_idx * NODE_COORD_SIZE;
+                            // node_count is u16, so each segment index fits.
+                            #[allow(clippy::cast_possible_truncation)]
+                            let segment_index = seg_idx as u16;
+                            let off1 = usize::try_from(iw.node_file_offset)
+                                .expect("builder requires 64-bit pointers")
+                                + seg_idx * NODE_COORD_SIZE;
                             let off2 = off1 + NODE_COORD_SIZE;
                             // Same producer-owned file rule as the streets above.
                             let (Some(n1), Some(n2)) = (
@@ -709,8 +724,10 @@ pub(super) fn bucketed_cell_assignment_fused(
                                     out.push((
                                         fine_cid,
                                         coarse_to_emit,
-                                        way_idx as u32,
-                                        seg_idx as u16,
+                                        u32::try_from(way_idx).expect(
+                                            "interpolation count checked before cell assignment",
+                                        ),
+                                        segment_index,
                                     ));
                                 },
                             );
@@ -979,7 +996,9 @@ fn run_stage_b(
                     CellID(prev_cell_id),
                 );
                 prev_cell_id = cell_id;
-                total_cells += 1;
+                total_cells = total_cells
+                    .checked_add(1)
+                    .ok_or("geocode cell count exceeds u32::MAX; bump FORMAT_VERSION")?;
 
                 // The per-type `u16::try_from` above guarantees `X.len() <= u16::MAX`
                 // so these `* SIZE as u64` casts won't overflow.
@@ -1010,7 +1029,6 @@ fn run_stage_b(
     Ok(total_cells)
 }
 
-#[allow(clippy::cast_possible_truncation)]
 #[hotpath::measure]
 pub(super) fn assign_admin_cells(
     polygons: &[AssembledPolygon],
@@ -1037,7 +1055,6 @@ pub(super) fn assign_admin_cells(
     })
 }
 
-#[allow(clippy::cast_possible_truncation)]
 fn admin_cells_for_polygon(
     poly_idx: usize,
     poly: &AssembledPolygon,
@@ -1079,7 +1096,8 @@ fn admin_cells_for_polygon(
         .iter()
         .map(|&cid| AdminCellEntry {
             cell_id: cid,
-            poly_index: poly_idx as u32,
+            poly_index: u32::try_from(poly_idx)
+                .expect("admin count checked before cell assignment"),
             is_interior: false,
         })
         .collect();
@@ -1122,7 +1140,8 @@ fn admin_cells_for_polygon(
         ) {
             entries.push(AdminCellEntry {
                 cell_id: cell.0,
-                poly_index: poly_idx as u32,
+                poly_index: u32::try_from(poly_idx)
+                    .expect("admin count checked before cell assignment"),
                 is_interior: true,
             });
             for n in cell.all_neighbors(admin_level as u64) {

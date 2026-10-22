@@ -118,7 +118,8 @@ impl DirectWriter {
             .create(true)
             .truncate(true)
             .custom_flags(libc::O_DIRECT)
-            .open(path)?;
+            .open(path)
+            .map_err(crate::error::direct_io_open_error)?;
         let buf = AlignedBuffer::new(IO_BUF_BYTES)?;
         Ok(Self {
             file,
@@ -266,11 +267,11 @@ mod tests {
     fn write_after_flush_is_refused() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("direct.bin");
-        let mut w = match DirectWriter::create(&path) {
-            Ok(w) => w,
-            // tmpfs and some filesystems reject O_DIRECT outright; the guard
-            // under test is filesystem-independent, so skip rather than fail.
-            Err(_) => return,
+        let mut w = DirectWriter {
+            file: File::create(&path).unwrap(),
+            buf: AlignedBuffer::new(IO_BUF_BYTES).unwrap(),
+            logical_size: 0,
+            flushed: false,
         };
         w.write_all(b"first").unwrap();
         w.flush().unwrap();

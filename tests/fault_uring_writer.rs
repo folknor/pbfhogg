@@ -24,24 +24,6 @@ mod uring_writer {
     use pbfhogg::write::uring_writer_test_hooks as uring_hooks;
     use pbfhogg::writer::{Compression, PbfWriter};
 
-    /// Distinguish "uring unavailable on this host" (low
-    /// `RLIMIT_MEMLOCK`, old kernel, missing WriteFixed support)
-    /// from real writer bugs. Mirrors the pattern used by the
-    /// existing uring roundtrip tests.
-    fn is_uring_init_unavailable(err: &std::io::Error) -> bool {
-        let os = err.raw_os_error();
-        let msg = err.to_string();
-        matches!(err.kind(), std::io::ErrorKind::Unsupported)
-            || os == Some(libc::ENOSYS)
-            || os == Some(libc::EPERM)
-            || os == Some(libc::ENOMEM)
-            || msg.contains("RLIMIT_MEMLOCK")
-            || msg.contains("kernel does not support")
-            // `io_uring_setup` denied by a seccomp sandbox: the writer
-            // wraps the EPERM in a new error, so only the message survives.
-            || msg.contains("io_uring creation failed")
-    }
-
     /// A panic in the uring writer thread mid-stream must surface
     /// via `PbfWriter::flush()` (which joins the writer thread and
     /// routes the join result through `?`) as an `Err`, never a
@@ -66,7 +48,7 @@ mod uring_writer {
             pbfhogg::host::Executor::Ambient,
         ) {
             Ok(w) => w,
-            Err(e) if is_uring_init_unavailable(&e) => {
+            Err(e) if crate::common::is_uring_unavailable(&e) => {
                 eprintln!("io_uring not available, skipping: {e}");
                 uring_hooks::reset();
                 return;

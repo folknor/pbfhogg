@@ -55,7 +55,8 @@ impl ElementIds {
     }
 }
 
-/// Which of the three `ElementIds` sets a collected ID belongs to.
+/// An element kind as getid names it: which of the three `ElementIds` sets a
+/// collected ID belongs to, and the kind half of a parsed [`ElementRef`].
 ///
 /// `process_block` runs on decode-worker threads, so it cannot write
 /// into a shared `ElementIds`; it hands back a small owned list instead
@@ -97,6 +98,61 @@ impl DefaultType {
     }
 }
 
+impl ElemKindTag {
+    fn prefix(self) -> char {
+        match self {
+            Self::Node => 'n',
+            Self::Way => 'w',
+            Self::Relation => 'r',
+        }
+    }
+}
+
+/// A typed element reference accepted by `getid`, `getparents` and
+/// `inspect --show`.
+///
+/// The parser accepts both the compact form (`n123`) and the named form
+/// (`node/123`). It keeps signed IDs intact; `getid` applies its separate
+/// non-negative query rule, while `inspect --show` can inspect signed IDs in
+/// an input PBF.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ElementRef {
+    /// The referenced OSM element kind.
+    pub kind: ElemKindTag,
+    /// The signed OSM element ID.
+    pub id: i64,
+}
+
+impl std::str::FromStr for ElementRef {
+    type Err = String;
+
+    fn from_str(spec: &str) -> std::result::Result<Self, Self::Err> {
+        let (kind, id_str) = if let Some(id) = spec.strip_prefix("node/") {
+            (ElemKindTag::Node, id)
+        } else if let Some(id) = spec.strip_prefix("way/") {
+            (ElemKindTag::Way, id)
+        } else if let Some(id) = spec.strip_prefix("relation/") {
+            (ElemKindTag::Relation, id)
+        } else if let Some(id) = spec.strip_prefix('n') {
+            (ElemKindTag::Node, id)
+        } else if let Some(id) = spec.strip_prefix('w') {
+            (ElemKindTag::Way, id)
+        } else if let Some(id) = spec.strip_prefix('r') {
+            (ElemKindTag::Relation, id)
+        } else {
+            return Err(format!(
+                "invalid element spec '{spec}': expected n<id>, w<id>, r<id>, \
+                 node/<id>, way/<id>, or relation/<id>"
+            ));
+        };
+
+        let id = id_str
+            .parse()
+            .map_err(|_| format!("invalid ID in '{spec}': '{id_str}' is not an integer"))?;
+        Ok(Self { kind, id })
+    }
+}
+
 /// Parse an ID spec like "n123", "w456", "r789".
 // String errors are intentional - shows the bad input value, which is more helpful
 // for CLI users than the underlying ParseIntError.
@@ -121,6 +177,8 @@ fn parse_id_spec(spec: &str, default_type: Option<DefaultType>) -> Result<(char,
 }
 
 fn parse_id_spec_inner(spec: &str, default_type: Option<DefaultType>) -> Result<(char, i64)> {
+    // The optional default is deliberate: unlike osmium's implicit node
+    // default, pbfhogg requires an explicit --default-type for bare numbers.
     if spec.len() < 2 {
         if let Some(default) = default_type {
             let id: i64 = spec
@@ -131,21 +189,19 @@ fn parse_id_spec_inner(spec: &str, default_type: Option<DefaultType>) -> Result<
         return Err(format!("invalid ID spec: {spec:?} (expected n/w/r prefix + number)").into());
     }
     let prefix = spec.as_bytes()[0];
-    if !matches!(prefix, b'n' | b'w' | b'r')
-        && let Some(default) = default_type
-    {
+    if matches!(prefix, b'n' | b'w' | b'r') {
+        let element_ref: ElementRef = spec
+            .parse()
+            .map_err(|error| format!("invalid ID spec: {spec:?} ({error})"))?;
+        return Ok((element_ref.kind.prefix(), element_ref.id));
+    }
+    if let Some(default) = default_type {
         let id: i64 = spec
             .parse()
             .map_err(|_| format!("invalid ID spec: {spec:?} (bad number)"))?;
         return Ok((default.prefix(), id));
     }
-    if !matches!(prefix, b'n' | b'w' | b'r') {
-        return Err(format!("invalid ID spec: {spec:?} (expected prefix 'n', 'w', or 'r')").into());
-    }
-    let id: i64 = spec[1..]
-        .parse()
-        .map_err(|_| format!("invalid ID spec: {spec:?} (bad number)"))?;
-    Ok((prefix as char, id))
+    Err(format!("invalid ID spec: {spec:?} (expected prefix 'n', 'w', or 'r')").into())
 }
 
 /// Parse ID specs from command-line arguments.
@@ -1251,6 +1307,23 @@ mod tests {
     }
 
     #[test]
+    fn element_ref_parser_accepts_short_and_named_types() {
+        for (spec, kind, id) in [
+            ("n123", ElemKindTag::Node, 123),
+            ("node/123", ElemKindTag::Node, 123),
+            ("w456", ElemKindTag::Way, 456),
+            ("way/456", ElemKindTag::Way, 456),
+            ("r789", ElemKindTag::Relation, 789),
+            ("relation/789", ElemKindTag::Relation, 789),
+            ("node/-5", ElemKindTag::Node, -5),
+        ] {
+            let element_ref = spec.parse::<ElementRef>().unwrap();
+            assert_eq!(element_ref.kind, kind);
+            assert_eq!(element_ref.id, id);
+        }
+    }
+
+    #[test]
     fn parse_large_id() {
         let (prefix, id) = parse_id_spec("n9876543210", None).unwrap();
         assert_eq!(prefix, 'n');
@@ -1335,6 +1408,18 @@ mod tests {
         assert!(set.node_ids.get(1));
         assert!(set.node_ids.get(2));
         assert!(!set.node_ids.get(3));
+        assert!(set.way_ids.get(10));
+        assert!(set.relation_ids.get(100));
+    }
+
+    #[test]
+    fn parse_ids_accept_named_type_forms() {
+        let specs: Vec<String> = vec!["node/1", "way/10", "relation/100"]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect();
+        let set = parse_ids(&specs).unwrap();
+        assert!(set.node_ids.get(1));
         assert!(set.way_ids.get(10));
         assert!(set.relation_ids.get(100));
     }

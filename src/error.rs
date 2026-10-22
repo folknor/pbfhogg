@@ -141,6 +141,12 @@ impl Error {
 pub enum ErrorKind {
     /// An error for I/O operations.
     Io(io::Error),
+    /// A requested I/O feature is unavailable during platform setup.
+    /// Runtime I/O failures must remain `Io`, even when their errno matches.
+    PlatformUnsupported {
+        feature: &'static str,
+        source: io::Error,
+    },
     /// The stringtable contains an entry at `index` that could not be decoded to a valid UTF-8
     /// string.
     StringtableUtf8 { err: Utf8Error, index: usize },
@@ -191,7 +197,21 @@ pub enum BlobError {
 
 impl From<io::Error> for Error {
     fn from(err: io::Error) -> Error {
-        new_error(ErrorKind::Io(err))
+        // Preserve structured setup failures carried through the Write API.
+        if err
+            .get_ref()
+            .is_some_and(<dyn std::error::Error + Send + Sync>::is::<Error>)
+        {
+            match err
+                .into_inner()
+                .and_then(|inner| inner.downcast::<Error>().ok())
+            {
+                Some(inner) => *inner,
+                None => unreachable!("checked Error payload"),
+            }
+        } else {
+            new_error(ErrorKind::Io(err))
+        }
     }
 }
 
@@ -216,6 +236,7 @@ impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self.0.kind {
             ErrorKind::Io(ref err) => Some(err),
+            ErrorKind::PlatformUnsupported { ref source, .. } => Some(source),
             ErrorKind::StringtableUtf8 { ref err, .. } => Some(err),
             ErrorKind::StringtableIndexOutOfBounds { .. } => None,
             ErrorKind::Blob(_) => None,
@@ -254,6 +275,12 @@ impl Error {
     fn fmt_kind(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.0.kind {
             ErrorKind::Io(ref err) => fmt::Display::fmt(err, f),
+            ErrorKind::PlatformUnsupported {
+                feature,
+                ref source,
+            } => {
+                write!(f, "platform feature {feature} unavailable: {source}")
+            }
             ErrorKind::StringtableUtf8 { ref err, index } => {
                 write!(f, "invalid UTF-8 at string table index {index}: {err}")
             }
@@ -308,5 +335,104 @@ impl Error {
                 Ok(())
             }
         }
+    }
+}
+
+/// Carry a setup refusal through APIs whose public result is `io::Result`.
+#[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
+pub(crate) fn platform_unsupported(feature: &'static str, source: io::Error) -> io::Error {
+    io::Error::other(new_error(ErrorKind::PlatformUnsupported {
+        feature,
+        source,
+    }))
+}
+
+/// Classify a failed `open(2)` with `O_DIRECT`. `EINVAL` and `EOPNOTSUPP`
+/// at open are the filesystem refusing direct I/O (tmpfs, some overlay and
+/// network filesystems); every other errno stays an ordinary I/O failure.
+/// Only the open is classified this way: an `EINVAL` from a later read or
+/// write is an alignment bug, never a platform refusal.
+#[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
+pub(crate) fn direct_io_open_error(error: io::Error) -> io::Error {
+    if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)) {
+        platform_unsupported("direct-io", error)
+    } else {
+        error
+    }
+}
+
+/// The feature label of a setup refusal carried by `error`, if it carries one.
+#[cfg(feature = "linux-direct-io")]
+pub(crate) fn carried_platform_feature(error: &io::Error) -> Option<&'static str> {
+    match error.get_ref()?.downcast_ref::<Error>()?.kind() {
+        ErrorKind::PlatformUnsupported { feature, .. } => Some(*feature),
+        _ => None,
+    }
+}
+
+/// Apply `map` (typically adding context such as the path) to an I/O error
+/// without losing a carried setup refusal: a carrier has `map` applied to its
+/// source and is re-carried, anything else is mapped directly. Context that
+/// rebuilds the error from its message alone would otherwise turn a platform
+/// refusal back into a plain I/O failure.
+#[cfg(feature = "linux-direct-io")]
+pub(crate) fn map_io_preserving_platform(
+    error: io::Error,
+    map: impl FnOnce(io::Error) -> io::Error,
+) -> io::Error {
+    if carried_platform_feature(&error).is_none() {
+        return map(error);
+    }
+    match error
+        .into_inner()
+        .and_then(|inner| inner.downcast::<Error>().ok())
+        .map(|inner| (*inner).into_kind())
+    {
+        Some(ErrorKind::PlatformUnsupported { feature, source }) => {
+            platform_unsupported(feature, map(source))
+        }
+        _ => unreachable!("checked PlatformUnsupported payload"),
+    }
+}
+
+#[cfg(all(test, any(feature = "linux-direct-io", feature = "linux-io-uring")))]
+mod platform_tests {
+    use super::*;
+
+    #[test]
+    fn setup_error_survives_io_result_carrier() {
+        let error = Error::from(platform_unsupported(
+            "io-uring",
+            io::Error::from_raw_os_error(libc::EPERM),
+        ));
+        assert!(
+            matches!(error.kind(), ErrorKind::PlatformUnsupported { feature: "io-uring", source }
+            if source.raw_os_error() == Some(libc::EPERM))
+        );
+        assert!(error.source().is_some());
+    }
+
+    #[test]
+    fn raw_io_errors_are_not_platform_refusals() {
+        for errno in [libc::EINVAL, libc::ENOSPC, libc::EIO, libc::ENOMEM] {
+            let error = Error::from(io::Error::from_raw_os_error(errno));
+            assert!(matches!(error.kind(), ErrorKind::Io(source)
+                if source.raw_os_error() == Some(errno)));
+        }
+    }
+
+    #[cfg(feature = "linux-direct-io")]
+    #[test]
+    fn context_mapping_keeps_the_platform_refusal() {
+        let refused = direct_io_open_error(io::Error::from_raw_os_error(libc::EINVAL));
+        let named = map_io_preserving_platform(refused, |source| {
+            io::Error::new(source.kind(), format!("failed to open x: {source}"))
+        });
+        assert_eq!(carried_platform_feature(&named), Some("direct-io"));
+        assert!(named.to_string().contains("failed to open x"));
+
+        let plain = direct_io_open_error(io::Error::from_raw_os_error(libc::ENOENT));
+        assert_eq!(carried_platform_feature(&plain), None);
+        assert_eq!(plain.raw_os_error(), Some(libc::ENOENT));
     }
 }

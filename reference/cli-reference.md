@@ -14,16 +14,19 @@ All commands support `-h, --help` and `-V, --version`.
 
 ## Exit codes
 
-Every command uses the same three-band contract. `1` is reserved for a
-command that ran to completion and whose answer is negative; a command
-that could not run at all exits `2`, so a script can branch on the
-answer without swallowing failures.
+Every command uses the same contract. `1` is reserved for a command that
+ran to completion and whose answer is negative; a command that could not
+run at all exits `2`, so a script can branch on the answer without
+swallowing failures. `3` is the one failure split out of `2`: a
+requested platform I/O feature is unavailable, so the same invocation
+without that flag can succeed.
 
 | Code | Meaning |
 |------|---------|
 | `0` | Success. |
 | `1` | The command ran and its answer is negative. Only four commands can produce it: `diff` (differences found), `inspect --indexed` (no blob-level indexdata), `inspect --show` (element not in the file), and `check` (integrity violations). Nothing is printed to stderr for it beyond the command's normal output. |
 | `2` | The command failed: missing or unreadable input, an invalid argument combination, a malformed PBF, an I/O error. `Error: ...` goes to stderr. Argument-parsing errors from clap also land here. |
+| `3` | The command failed because the host refused a requested I/O feature at setup: `--direct-io` on a filesystem that rejects `O_DIRECT` at open (tmpfs, some overlay and network filesystems), or `--io-uring` where the kernel lacks io_uring or `WriteFixed`, a sandbox denies `io_uring_setup`, or `RLIMIT_MEMLOCK` is below the writer's registered buffers. stderr carries `Error: platform feature <feature> unavailable: ...` with `<feature>` `direct-io` or `io-uring` (an `--io-uring` output also opens with `O_DIRECT`, so it can report either). Failures after setup, including an `EINVAL` or `ENOSPC` mid-run, stay `2`. |
 
 Before 0.6.0 every one of these outcomes exited `1`, so "the files
 differ" and "the file does not exist" were indistinguishable. Callers
@@ -71,7 +74,7 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 | `-e, --extended` | Extended scan: timestamp range, data bbox, metadata coverage, ordering |
 | `-g, --get <KEY>` | Get a single value by key path (e.g. `header.bbox`, `data.timestamp.first`). Not combinable with `--json`. |
 | `--json` | Machine-readable JSON output. Not combinable with `--nodes` (node stats have no JSON form) or `--get`. |
-| `--show <TYPE_ID>` | Display a single element by ID (e.g. `n123`, `w456`, `r789`). Uses indexdata to skip non-matching blobs, early exit on sorted PBFs. **A mode of its own**: mutually exclusive with every other `inspect` flag (`--indexed`, `--nodes`, `-j`, `--blocks`, `--id-ranges`, `--locations`, `--anomalies`, `-e`, `--get`, `--json`, `--force`), which it used to accept and discard. |
+| `--show <TYPE_ID>` | Display a single element by ID (e.g. `n123` or `node/123`). Also accepts `w456` / `way/456` and `r789` / `relation/789`, including signed IDs. Uses indexdata to skip non-matching blobs, early exit on sorted PBFs. **A mode of its own**: mutually exclusive with every other `inspect` flag (`--indexed`, `--nodes`, `-j`, `--blocks`, `--id-ranges`, `--locations`, `--anomalies`, `-e`, `--get`, `--json`, `--force`), which it used to accept and discard. |
 | `--distrust-metadata` | Decode every blob instead of reporting counts, ID ranges and per-block stats out of the blobs' own `indexdata`. Nothing validates indexdata against the payload it describes, so on a file you are inspecting *because* you suspect it, the default fast path reports the file's claims rather than its contents. Applies to the scanning report only: rejected alongside `--indexed`, `--nodes` and a `header.*` `--get` key, none of which consult indexdata contents. |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--force` | Proceed even if input lacks indexdata. **Requires `--nodes`**: it is threaded only into the node-stats scan, so passing it to another mode is an error rather than a no-op. |
@@ -90,6 +93,10 @@ Count tag key=value frequencies (subcommand of `inspect`).
 | `-j, --jobs <N>` | Parallel worker count. `0` auto-picks from `available_parallelism()`, `1` forces sequential, higher values cap the pool. |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--force` | Proceed even if input lacks indexdata (slower fallback path) |
+
+`inspect tags` expressions use the same syntax as `tags-filter`, including
+element-type prefixes. For example, `w/highway=primary` counts that match only
+on ways; `--type` adds an overall element-type restriction.
 
 ### check
 
@@ -521,7 +528,10 @@ A refusal is the safe answer for a cache keyed on the digest: fall back to the r
 
 Extract or remove elements by ID. By default, keeps only the listed IDs. With `--invert`, removes the listed IDs and keeps everything else.
 
-IDs use type prefixes: `n123` (node), `w456` (way), `r789` (relation).
+Typed IDs accept `n123` or `node/123` (node), `w456` or `way/456` (way), and
+`r789` or `relation/789` (relation). Bare numeric IDs are accepted only when
+`--default-type` is supplied. Without it, a bare ID is an error. This also
+applies to IDs in `--id-file` text input.
 
 ```
 pbfhogg getid [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
@@ -536,7 +546,7 @@ pbfhogg getid [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 | `--verbose-ids` | Print requested IDs, then report which were not found (not with `--invert`). Both lists go to stderr. The found set is collected on the write path, so this costs no extra pass over the output. |
 | `-i, --id-file <FILE>` | Read IDs from text file (one per line) |
 | `-I, --id-osm-file <FILE>` | Read IDs from an OSM/PBF file (all element IDs are collected) |
-| `--default-type <TYPE>` | Default type for bare numeric IDs: node, way, relation |
+| `--default-type <TYPE>` | Type for bare numeric IDs: node, way, relation. No type is assumed when this option is omitted. |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--force` | Proceed even if input lacks indexdata |
@@ -546,6 +556,9 @@ pbfhogg getid [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 ### getparents
 
 Find ways/relations referencing given IDs (reverse lookup).
+
+ID syntax and the optional `--default-type` behavior are the same as for
+`getid`: bare numeric IDs require an explicit default type.
 
 ```
 pbfhogg getparents [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
@@ -557,7 +570,7 @@ pbfhogg getparents [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 | `-s, --add-self` | Also include the queried objects themselves in the output |
 | `-i, --id-file <FILE>` | Read IDs from text file (one per line) |
 | `-I, --id-osm-file <FILE>` | Read IDs from an OSM/PBF file (all element IDs are collected) |
-| `--default-type <TYPE>` | Default type for bare numeric IDs: node, way, relation |
+| `--default-type <TYPE>` | Type for bare numeric IDs: node, way, relation. No type is assumed when this option is omitted. |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--generator` | Override writing program name |
@@ -652,7 +665,7 @@ pbfhogg merge-changes [OPTIONS] --output <OUTPUT> <CHANGES>...
 
 Build a reverse geocoding index from a PBF file. Produces a set of binary files (S2 cell index, address points, street segments, admin boundaries, string pool) that can be memory-mapped for sub-millisecond reverse geocoding queries.
 
-Requires an indexed PBF (generated by `pbfhogg cat`). The output directory must not already exist unless `--force` is set.
+Requires an indexed PBF (generated by `pbfhogg cat`). The output directory must be new or empty, or hold an existing geocode index and `--force` must be set; any other existing path is refused, with or without `--force`, because publication replaces the whole directory.
 
 ```
 pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
@@ -668,7 +681,7 @@ pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
 | `--search-radius <M>` | Fine-level max search distance in meters [default: 75] |
 | `--coarse-search-radius <M>` | Coarse-level max search distance in meters [default: 1000] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
-| `--force` | Proceed without indexdata / overwrite existing index |
+| `--force` | Replace an existing index in `--output-dir`; the old index stays in place until the new build has succeeded. Also accepts input without indexdata (slower fallback path) |
 
 ### S2 level bounds
 
@@ -694,16 +707,21 @@ another producer stays readable.
 
 ### Overwriting an existing index
 
-A geocode index is a directory of files, and there is no atomic replace for
-a non-empty directory. `--force` therefore invalidates rather than swaps: it
-removes the header file so that a build which dies partway leaves a directory
-that fails to open, rather than one that opens and answers from a mixture of
-two vintages.
+Every build writes a complete generation in a sibling staging directory and
+publishes it only after the build and smoke test succeed; `--force` is what
+lets that publication replace an existing index. Failed builds leave
+the existing index intact. Publication moves the old directory aside, moves
+the new one into place, then removes the old files. Already-open readers keep
+their mapped inodes and remain usable. The entire output directory is replaced;
+use a dedicated directory for the index. Allow disk space for both generations.
 
-Invalidation happens only after every read-only check on the input has passed -
-config validation, the indexdata requirement, the PBF header, and the relation
-and referenced-node passes. A bad input path, a missing file or a malformed PBF
-leaves the existing index untouched.
+Publication uses two renames, so it is not crash-atomic and there is a short
+pathname gap. Serialize publication with new reader opens and other builds;
+queries on readers already open need no coordination. An interrupted publication
+may leave the old index in `.geocode-build-*/old` beside the output directory.
+External writers must also replace files rather than modify mapped inodes:
+reader open-time string validation cannot protect against truncation, which
+can fault before a string check can return an error.
 
 A build that finds nothing queryable at all - no address points, no streets, no
 interpolation ways and no admin polygons - fails rather than publishing an empty

@@ -1376,28 +1376,70 @@ pub fn assert_elements_equivalent(path_a: &Path, path_b: &Path) {
 // Error helpers for platform-specific I/O tests
 // ---------------------------------------------------------------------------
 
-/// Check if an error is EINVAL (used to skip O_DIRECT tests on unsupported filesystems).
+/// Historical name retained for callers; only typed direct-I/O setup refusals
+/// are skippable. A runtime EINVAL can indicate an alignment bug, so raw errno
+/// alone must never make an I/O correctness test pass without exercising it.
 #[cfg(feature = "linux-direct-io")]
 pub fn is_einval(err: &(dyn std::error::Error + 'static)) -> bool {
-    if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
-        return io_err.raw_os_error() == Some(libc::EINVAL);
-    }
-    if let Some(pbf_err) = err.downcast_ref::<pbfhogg::Error>()
-        && let pbfhogg::ErrorKind::Io(io_err) = pbf_err.kind()
-    {
-        return io_err.raw_os_error() == Some(libc::EINVAL);
+    let mut current = Some(err);
+    while let Some(error) = current {
+        if let Some(error) = error.downcast_ref::<pbfhogg::Error>()
+            && matches!(
+                error.kind(),
+                pbfhogg::ErrorKind::PlatformUnsupported {
+                    feature: "direct-io",
+                    ..
+                }
+            )
+        {
+            return allow_platform_skip(true);
+        }
+        if let Some(error) = error.downcast_ref::<std::io::Error>() {
+            current = error
+                .get_ref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static));
+        } else {
+            current = error.source();
+        }
     }
     false
 }
 
-/// Check if an error indicates io_uring is unavailable.
+/// Require platform tests to exercise the requested feature, rather than pass
+/// after skipping every unavailable setup. Ordinary profiles may skip setup.
+pub fn allow_platform_skip(unavailable: bool) -> bool {
+    assert!(
+        !unavailable
+            || std::env::var_os("BROKKR_TEST_PLATFORM").as_deref()
+                != Some(std::ffi::OsStr::new("1")),
+        "platform profile requires this I/O feature to be available",
+    );
+    unavailable
+}
+
+/// Check only typed io_uring setup errors, including their io::Error carrier.
 #[cfg(feature = "linux-io-uring")]
 pub fn is_uring_unavailable(err: &(dyn std::error::Error + 'static)) -> bool {
-    if err.downcast_ref::<std::io::Error>().is_some() {
-        return true;
-    }
-    if let Some(pbf_err) = err.downcast_ref::<pbfhogg::Error>() {
-        return matches!(pbf_err.kind(), pbfhogg::ErrorKind::Io(_));
+    let mut current = Some(err);
+    while let Some(error) = current {
+        if let Some(error) = error.downcast_ref::<pbfhogg::Error>()
+            && matches!(
+                error.kind(),
+                pbfhogg::ErrorKind::PlatformUnsupported {
+                    feature: "io-uring" | "direct-io",
+                    ..
+                }
+            )
+        {
+            return allow_platform_skip(true);
+        }
+        if let Some(error) = error.downcast_ref::<std::io::Error>() {
+            current = error
+                .get_ref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static));
+        } else {
+            current = error.source();
+        }
     }
     false
 }

@@ -361,9 +361,10 @@ geocode index.
 (pread plus `fadvise(RANDOM)`, justified by a planet measurement), dedupe
 through `FileReader` plus `read_frame_header`; sort has `intra_unsorted`
 detection, the counted-vs-claimed split, parallel overlap rewrite and the
-`copy_file_range` coalescer, dedupe has none; the kind-boundary run-splitting
-fix exists in both as a comment citing the other. BUG-004 and BUG-005 are
-missed ports. `HasId::version` maps absent to 0 in dedupe while `derive.rs`
+`copy_file_range` coalescer, and dedupe has only gained the counted-vs-claimed
+split; the kind-boundary run-splitting fix exists in both as a comment citing
+the other. The header reconciliation and claimed-count split were each fixed
+in one copy and later ported to the other by hand. `HasId::version` maps absent to 0 in dedupe while `derive.rs`
 says "absent is not zero". Fix: one module parameterised on input set and
 merge policy.
 

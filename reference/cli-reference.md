@@ -640,7 +640,7 @@ pbfhogg merge-changes [OPTIONS] --output <OUTPUT> <CHANGES>...
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `--simplify` | Keep only the last change per object (type + id) |
-| `--allow-version-regression` | Only meaningful with `--simplify`, which is the mode that resolves conflicts. Accepts a later change whose `version` does not advance past one seen earlier in input order. Off by default, so listing the inputs out of sequence order is an error rather than a silent downgrade. Default (non-simplify) mode preserves the full stream in input order and resolves nothing, so the flag has no effect there. See DEVIATIONS.md. |
+| `--allow-version-regression` | Requires `--simplify`, which is the mode that resolves conflicts; passing it alone is a usage error. Accepts a later change whose `version` does not advance past one seen earlier in input order. Off by default, so listing the inputs out of sequence order is an error rather than a silent downgrade. Default (non-simplify) mode preserves the full stream in input order and resolves nothing, so there is nothing for the flag to allow. See DEVIATIONS.md. |
 | `-j, --jobs <N>` | Parallel worker threads. `1` forces sequential, `0` (default) auto-picks from `available_parallelism()`, higher values cap the pool. Affects both the per-input parse fan-out (capped by input count) and the simplify path's chunk fan-out. |
 
 ### build-geocode-index

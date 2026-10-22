@@ -601,6 +601,34 @@ fn simplify_refuses_a_version_regression() {
     );
 }
 
+/// Without `--simplify` no version is ever compared, so
+/// `--allow-version-regression` used to be accepted and do nothing. It is
+/// a usage error instead, refused before any input is read.
+#[test]
+fn allow_version_regression_requires_simplify() {
+    let dir = TempDir::new().expect("tempdir");
+    let out = dir.path().join("out.osc.gz");
+    let result = CliInvoker::new()
+        .arg("merge-changes")
+        .arg(dir.path().join("missing.osc.gz"))
+        .arg("-o")
+        .arg(&out)
+        .arg("--allow-version-regression")
+        .run();
+    assert_eq!(
+        result.status.code(),
+        Some(2),
+        "expected a usage error; stderr:\n{}",
+        result.stderr_str()
+    );
+    assert!(
+        result.stderr_str().contains("--simplify"),
+        "the usage error must name the missing flag; stderr:\n{}",
+        result.stderr_str()
+    );
+    assert!(!out.exists(), "a usage error must not create the output");
+}
+
 /// The overlay parser's version gate had a hole at `<delete>`: a delete
 /// dropped the live index entry, taking the stored version with it, so
 /// the next stale change found nothing to be compared against and

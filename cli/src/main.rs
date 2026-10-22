@@ -923,8 +923,9 @@ enum Command {
         /// the one it replaces. Off by default: --simplify keeps the LAST
         /// change per object by input position, so inputs listed out of
         /// sequence order otherwise downgrade objects to older versions
-        /// and report success.
-        #[arg(long)]
+        /// and report success. Requires --simplify: without it every change
+        /// is kept in input order and no version is compared.
+        #[arg(long, requires = "simplify")]
         allow_version_regression: bool,
         /// Parallel worker threads. `1` forces sequential, `0` auto-picks
         /// from `available_parallelism()`, higher values cap the worker

@@ -650,9 +650,11 @@ pub fn has_tagdata(
 /// Format a Unix epoch timestamp (seconds) as ISO 8601 UTC string.
 ///
 /// Uses the civil-time algorithm from Howard Hinnant's `chrono`-compatible
-/// date library to convert days since epoch to (year, month, day).
-pub(crate) fn format_epoch_secs(secs: u64) -> String {
-    let secs = secs.cast_signed();
+/// date library to convert days since epoch to (year, month, day). Signed:
+/// a timestamp before 1970 formats as its real date (`-1` is
+/// `1969-12-31T23:59:59Z`) and [`parse_rfc3339_utc`] reads it back, for
+/// every year with four digits.
+pub(crate) fn format_epoch_secs(secs: i64) -> String {
     let day_secs = secs.rem_euclid(86400);
     let days = (secs - day_secs) / 86400;
 
@@ -758,19 +760,23 @@ mod tests {
         // Roundtrip across a spread of epochs (leap years, month ends,
         // century boundary).
         for secs in [
-            0_u64,
-            951_827_696,   // 2000-02-29 (leap century)
-            1_582_934_400, // 2020-02-29
-            1_771_622_445, // denmark replication timestamp in test data
-            4_102_444_799, // 2099-12-31T23:59:59Z
+            0_i64,
+            951_827_696,     // 2000-02-29 (leap century)
+            1_582_934_400,   // 2020-02-29
+            1_771_622_445,   // denmark replication timestamp in test data
+            4_102_444_799,   // 2099-12-31T23:59:59Z
+            -1,              // 1969-12-31T23:59:59Z
+            -2_208_988_800,  // 1900-01-01, a non-leap century
+            -62_167_219_200, // 0000-01-01, the first four-digit year
         ] {
             let formatted = format_epoch_secs(secs);
             assert_eq!(
                 parse_rfc3339_utc(&formatted)?,
-                secs.cast_signed(),
+                secs,
                 "roundtrip failed for {formatted}"
             );
         }
+        assert_eq!(format_epoch_secs(-1), "1969-12-31T23:59:59Z");
 
         // Rejections.
         assert!(parse_rfc3339_utc("2026-02-20 21:39:49").is_err()); // wrong shape

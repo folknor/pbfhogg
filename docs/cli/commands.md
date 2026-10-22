@@ -579,7 +579,7 @@ pbfhogg merge-changes [OPTIONS] --output <OUTPUT> <CHANGES>...
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `--simplify` | Keep only the last change per object (type + id) |
-| `--allow-version-regression` | Only meaningful with `--simplify`, the mode that resolves conflicts. Accepts a later change whose `version` does not advance past one seen earlier in input order. Off by default, so listing the input files out of sequence order is an error rather than a silent downgrade |
+| `--allow-version-regression` | Requires `--simplify`, the mode that resolves conflicts; passing it alone is a usage error. Accepts a later change whose `version` does not advance past one seen earlier in input order. Off by default, so listing the input files out of sequence order is an error rather than a silent downgrade |
 | `-j, --jobs <N>` | Parallel worker threads. `1` forces sequential, `0` (default) auto-picks from `available_parallelism()`, higher values cap the worker pool. Affects both the per-input parse fan-out and the simplify path's chunk fan-out |
 
 ### build-geocode-index

@@ -316,7 +316,9 @@ fn push_info_attrs(
         elem.push_attribute(("version", v_str.as_str()));
     }
     if let Some(milli_timestamp) = milli_timestamp {
-        let ts = crate::commands::format_epoch_secs((milli_timestamp / 1000).cast_unsigned());
+        // Floor, not truncate, so a pre-1970 millisecond timestamp lands in
+        // the right second; export formats the same way.
+        let ts = crate::commands::format_epoch_secs(milli_timestamp.div_euclid(1000));
         elem.push_attribute(("timestamp", ts.as_str()));
     }
     if let Some(changeset) = changeset {

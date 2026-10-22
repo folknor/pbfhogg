@@ -552,6 +552,10 @@
   trusted, and an inverted ID range or a repeated indexdata or tagdata field
   now reads as no index.
 
+- **`merge-changes --allow-version-regression` without `--simplify` is a
+  usage error.** It used to be accepted and do nothing, since only
+  `--simplify` compares versions.
+
 - **List files now parse the way osmium's do.** In a tag-expressions file
   (`--expressions`), a tab is kept as part of the key instead
   of being trimmed, and a type prefix that is only valid once spaces are

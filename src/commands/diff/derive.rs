@@ -631,7 +631,8 @@ fn write_delete_element<W: Write>(
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        let ts = crate::commands::format_epoch_secs(now.as_secs());
+        let ts =
+            crate::commands::format_epoch_secs(i64::try_from(now.as_secs()).unwrap_or(i64::MAX));
         elem.push_attribute(("timestamp", ts.as_str()));
     }
     writer.write_event(Event::Empty(elem))?;

@@ -115,7 +115,8 @@ nothing to regress.
 
 Opt back into osmium's behavior with
 `apply-changes --allow-version-regression`,
-`merge-changes --allow-version-regression`, or
+`merge-changes --simplify --allow-version-regression` (the flag requires
+`--simplify`, the only merge-changes mode that compares versions), or
 `CompactDiffOverlay::allow_version_regression(true)`.
 
 **Rationale:** Positional precedence is defensible when the operator

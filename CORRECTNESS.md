@@ -395,8 +395,17 @@ true, and it has consumers that act on it destructively:
   declared kind matches - so a mislabelled blob leaks off-kind elements into the
   output, or vanishes from it entirely.
 - `renumber` assigns ID blocks from the declared `count`.
-- `getid --invert` and `sort` report a blob's element count from `count` on
-  their passthrough paths.
+- `apply-changes` routes an indexed blob whose declared ID range does not
+  overlap the diff to the splice fast path, copying it unchanged, so an
+  understated range carries the blob past a modify or delete aimed at it.
+- `cat --dedupe` passes blobs through on their declared kind and range, so a
+  false one can put unsorted output under the sorted stamp.
+- `diff` plans its parallel shards from the declared ranges, so a file whose
+  indexdata lies about its ID range can diff identical against one copy of
+  the same elements and different against another.
+- `getid --invert`, `sort` and `cat --dedupe` take a passthrough blob's
+  element count from `count`, reported apart from the counts they observe
+  (`passthrough_claimed`); `extract` decodes a blob before copying it raw.
 - `tags-filter` and `tags-count` skip whole blobs whose tag index lacks every
   required key - so an index omitting a key its elements carry silently drops
   matches. This is a wrong answer, not a slow one.

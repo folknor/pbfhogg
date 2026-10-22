@@ -205,15 +205,6 @@ assert uniqueness.
 
 Reported by: change application.
 
-## BUG-016 - `merge-changes --allow-version-regression` is a silent no-op without `--simplify`
-
-The clap arg has no `requires = "simplify"`, and the flag reaches only
-`write_simplified`; the streaming path never checks versions. The help text
-mentions `--simplify` but does not stop the combination. Fix with clap
-`requires`, and a test expecting a usage error.
-
-Reported by: change application.
-
 ## BUG-017 - The version-advance rule differs between apply-changes and `merge-changes --simplify`
 
 `CompactDiffOverlay::check_version_advance` (apply-changes) compares against
@@ -234,18 +225,6 @@ commands.
 
 Reported by: change application.
 
-## BUG-019 - Negative timestamps become year 584 billion in OSC output
-
-`osc/write.rs::push_info_attrs` does
-`format_epoch_secs((milli_timestamp / 1000).cast_unsigned())`. A pre-1970 or
-corrupt negative timestamp formats as a nonsense date with no error. The
-parse side (`parse_rfc3339_utc`) refuses unparsable timestamps, so the two
-ends of the round trip disagree on validity. `cast_sign_loss` is denied but
-`cast_unsigned()` is a method, so the lint does not fire; a
-`disallowed-methods` entry for `i64::cast_unsigned` outside a vetted helper
-would catch it.
-
-Reported by: change application.
 
 ## BUG-020 - Apply-changes discards or escalates a scanner error or worker panic when the drain fails
 

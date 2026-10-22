@@ -92,7 +92,7 @@ where
             }
             if let Some(millis) = meta.timestamp_millis {
                 push_name(buf, &mut first, "@timestamp")?;
-                let seconds = millis.div_euclid(1000).cast_unsigned();
+                let seconds = millis.div_euclid(1000);
                 push_json_string(buf, &crate::commands::format_epoch_secs(seconds))?;
             }
             if let Some(value) = meta.changeset {
